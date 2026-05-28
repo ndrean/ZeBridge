@@ -218,9 +218,11 @@ pub const ReplicationStream = struct {
         std.mem.writeInt(u64, buffer[17..25], lsn, .big); // Last WAL byte + 1 applied
 
         // Timestamp (microseconds since 2000-01-01)
-        const now = std.time.microTimestamp();
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        const now_us: i64 = @as(i64, ts.tv_sec) * 1_000_000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000);
         const pg_epoch_offset: i64 = 946684800000000; // 2000-01-01 in microseconds since Unix epoch
-        const pg_timestamp = now - pg_epoch_offset;
+        const pg_timestamp = now_us - pg_epoch_offset;
         std.mem.writeInt(i64, buffer[25..33], pg_timestamp, .big);
 
         // Reply requested flag (0 = no immediate reply needed)

@@ -1,13 +1,13 @@
 const std = @import("std");
-const posix = std.posix;
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
 
-// std.posix.socket (and bind/listen/accept/setsockopt) were removed from std.posix in Zig 0.16.
-// Use C socket API directly.
+// std.posix socket/IO functions removed in Zig 0.16 — use C API directly.
 const sock_c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
+    @cInclude("unistd.h");
+    @cInclude("poll.h");
 });
 
 pub const log = std.log.scoped(.http_server);
@@ -63,8 +63,8 @@ pub const Server = struct {
     pub fn run(self: *Server) !void {
         const sock_raw = sock_c.socket(sock_c.AF_INET, sock_c.SOCK_STREAM, 0);
         if (sock_raw < 0) return error.SocketFailed;
-        const sock_fd: posix.fd_t = @intCast(sock_raw);
-        defer posix.close(sock_fd);
+        const sock_fd: c_int = sock_raw;
+        defer _ = sock_c.close(sock_fd);
 
         const optval: c_int = 1;
         _ = sock_c.setsockopt(sock_fd, sock_c.SOL_SOCKET, sock_c.SO_REUSEADDR,
@@ -90,20 +90,21 @@ pub const Server = struct {
 
         while (!self.should_stop.load(.seq_cst)) {
             // Poll with timeout to allow checking shutdown flag
-            var poll_fds = [_]posix.pollfd{
+            var poll_fds = [_]sock_c.struct_pollfd{
                 .{
                     .fd = sock_fd,
-                    .events = posix.POLL.IN,
+                    .events = @as(c_short, @intCast(sock_c.POLLIN)),
                     .revents = 0,
                 },
             };
 
             // Poll with 100ms timeout
-            const ready = posix.poll(&poll_fds, 100) catch |err| {
-                log.err("⚠️ Poll error: {}", .{err});
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+            const ready = sock_c.poll(&poll_fds[0], 1, 100);
+            if (ready < 0) {
+                log.err("⚠️ Poll error", .{});
+                std.time.sleep(100 * std.time.ns_per_ms);
                 continue;
-            };
+            }
 
             if (ready == 0) {
                 // Timeout - check shutdown flag again
@@ -115,8 +116,8 @@ pub const Server = struct {
                 log.err("🔴 Failed to accept connection: {d}", .{client_raw});
                 continue;
             }
-            const client_fd: posix.fd_t = @intCast(client_raw);
-            defer posix.close(client_fd);
+            const client_fd: c_int = client_raw;
+            defer _ = sock_c.close(client_fd);
 
             self.handleRequest(client_fd) catch |err| {
                 log.warn("⚠️ Error handling request: {}", .{err});
@@ -126,11 +127,12 @@ pub const Server = struct {
         log.info("👋 HTTP server stopped", .{});
     }
 
-    fn handleRequest(self: *Server, fd: posix.fd_t) !void {
+    fn handleRequest(self: *Server, fd: c_int) !void {
         var buffer: [2048]u8 = undefined;
 
-        const bytes_read = try posix.read(fd, &buffer);
-        if (bytes_read == 0) return;
+        const bytes_read_n = sock_c.read(fd, &buffer, buffer.len);
+        if (bytes_read_n <= 0) return;
+        const bytes_read: usize = @intCast(bytes_read_n);
 
         const request = buffer[0..bytes_read];
 
@@ -161,7 +163,7 @@ pub const Server = struct {
     }
 
     fn sendResponse(
-        fd: posix.fd_t,
+        fd: c_int,
         status: []const u8,
         content_type: []const u8,
         body: []const u8,
@@ -178,14 +180,14 @@ pub const Server = struct {
 
         var pos: usize = 0;
         while (pos < response.len) {
-            const n = try posix.write(fd, response[pos..]);
-            if (n == 0) return;
-            pos += n;
+            const n = sock_c.write(fd, response[pos..].ptr, response[pos..].len);
+            if (n <= 0) return;
+            pos += @intCast(n);
         }
     }
 
     // handlers ----------------------------------------------------
-    fn handleHealth(self: *Server, fd: posix.fd_t) !void {
+    fn handleHealth(self: *Server, fd: c_int) !void {
         _ = self;
         try sendResponse(
             fd,
@@ -195,7 +197,7 @@ pub const Server = struct {
         );
     }
 
-    fn handleStatus(self: *Server, fd: posix.fd_t) !void {
+    fn handleStatus(self: *Server, fd: c_int) !void {
         if (self.metrics) |m| {
             // Get metrics snapshot
             const snap = try m.snapshot(self.allocator);
@@ -250,7 +252,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleMetrics(self: *Server, fd: posix.fd_t) !void {
+    fn handleMetrics(self: *Server, fd: c_int) !void {
         if (self.metrics) |m| {
             // Get metrics snapshot
             const snap = try m.snapshot(self.allocator);
@@ -329,7 +331,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleShutdown(self: *Server, fd: posix.fd_t) !void {
+    fn handleShutdown(self: *Server, fd: c_int) !void {
         log.info("👋 Shutdown requested via HTTP", .{});
 
         // Set shutdown flag
@@ -343,7 +345,7 @@ pub const Server = struct {
         );
     }
 
-    fn handleNotFound(self: *Server, fd: posix.fd_t) !void {
+    fn handleNotFound(self: *Server, fd: c_int) !void {
         _ = self;
         try sendResponse(
             fd,
@@ -371,7 +373,7 @@ pub const Server = struct {
         return null;
     }
 
-    fn handleStreamInfo(self: *Server, fd: posix.fd_t, path: []const u8) !void {
+    fn handleStreamInfo(self: *Server, fd: c_int, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
             try sendResponse(
                 fd,
@@ -398,7 +400,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleStreamPurge(self: *Server, fd: posix.fd_t, path: []const u8) !void {
+    fn handleStreamPurge(self: *Server, fd: c_int, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
             try sendResponse(
                 fd,

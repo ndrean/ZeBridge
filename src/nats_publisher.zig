@@ -53,7 +53,7 @@ pub const Publisher = struct {
     nats_port: u16, // Parsed port for reconnection
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    reconnect_mutex: std.Thread.Mutex = .{}, // Protect reconnection logic
+    reconnect_mutex: std.Mutex = .{}, // Protect reconnection logic
     metrics: ?*Metrics = null, // Optional metrics tracking
 
     pub fn init(
@@ -185,7 +185,7 @@ pub const Publisher = struct {
                     if (max_attempts == std.math.maxInt(u32)) @as(i32, -1) else @as(i32, @intCast(max_attempts)),
                     wait_ms,
                 });
-                std.Thread.sleep(@intCast(wait_ms * std.time.ns_per_ms));
+                std.time.sleep(@intCast(wait_ms * std.time.ns_per_ms));
             }
 
             // Disconnect old connection if any

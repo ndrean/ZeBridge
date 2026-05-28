@@ -20,6 +20,8 @@ const schema_cache_mod = @import("schema_cache.zig");
 const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
 const encoder_mod = @import("encoder.zig");
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
 
 // Force test discovery for imported modules
 comptime {
@@ -364,7 +366,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{Config.Nats.cdc_subject_wildcard});
 
     // <--- Metrics setup
-    const present = @as(i64, @intCast(std.c.time(null)));
+    const present = @as(i64, @intCast(c.time(null)));
     var msg_count: u32 = 0;
     var cdc_events: u32 = 0;
     var last_lsn: u64 = 0;
@@ -427,7 +429,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         // PostgreSQL is requesting a reply - send status update immediately
                         const reply_lsn = if (last_ack_lsn > 0) last_ack_lsn else wal_msg.wal_end;
                         try pg_stream.sendStatusUpdate(reply_lsn);
-                        last_keepalive_time = @as(i64, @intCast(std.c.time(null)));
+                        last_keepalive_time = @as(i64, @intCast(c.time(null)));
                         log.debug("Replied to keepalive request (LSN: {x})", .{reply_lsn});
                     }
                     continue; // Don't process keepalives further
@@ -552,7 +554,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     // Only read atomic LSN when we're about to ACK
                     const confirmed_lsn = batch_pub.getLastConfirmedLsn();
                     if (confirmed_lsn > last_ack_lsn) {
-                        const now = @as(i64, @intCast(std.c.time(null))); // Get timestamp for update
+                        const now = @as(i64, @intCast(c.time(null))); // Get timestamp for update
                         try pg_stream.sendStatusUpdate(confirmed_lsn);
                         log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} bytes)", .{ confirmed_lsn, bytes_since_ack });
                         last_ack_lsn = confirmed_lsn;
@@ -564,14 +566,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             } else {
                 // No message available - idle path
                 // Sleep 10 ms first to avoid busy-waiting
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std.time.sleep(10 * std.time.ns_per_ms);
 
                 // Only check time-based conditions periodically
                 idle_iterations += 1;
                 if (idle_iterations >= idle_check_interval) {
                     idle_iterations = 0;
 
-                    const now = @as(i64, @intCast(std.c.time(null)));
+                    const now = @as(i64, @intCast(c.time(null)));
 
                     // Flush pending status updates if time threshold reached
                     if (now - last_status_update_time >= status_update_interval_seconds) {
@@ -631,12 +633,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             // Zero-allocation ring buffer: no reclaim needed
 
-            std.Thread.sleep(2000 * std.time.ns_per_ms); // 2 seconds
+            std.time.sleep(2000 * std.time.ns_per_ms); // 2 seconds
 
             // Get latest LSN and reconnect
             const reconnect_lsn = wal_monitor.getCurrentLSN(allocator, &pg_config) catch |lsn_err| {
                 log.err("Failed to get LSN for reconnect: {}", .{lsn_err});
-                std.Thread.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
+                std.time.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
             defer allocator.free(reconnect_lsn);
@@ -647,13 +649,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Reconnect to replication stream
             pg_stream.connect() catch |conn_err| {
                 log.err("Failed to reconnect: {}", .{conn_err});
-                std.Thread.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
+                std.time.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
 
             pg_stream.startStreaming(reconnect_lsn) catch |stream_err| {
                 log.err("Failed to restart streaming: {}", .{stream_err});
-                std.Thread.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
+                std.time.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
 
@@ -675,12 +677,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const shutdown_timeout_seconds = 30;
-    const start_time = @as(i64, @intCast(std.c.time(null)));
+    const start_time = @as(i64, @intCast(c.time(null)));
     var last_log_time: i64 = 0;
 
     // Wait for flush thread to complete (both queue empty AND final flush done)
     while (!batch_pub.isFlushComplete()) {
-        const elapsed = @as(i64, @intCast(std.c.time(null))) - start_time;
+        const elapsed = @as(i64, @intCast(c.time(null))) - start_time;
         if (elapsed > shutdown_timeout_seconds) {
             const remaining = batch_pub.pending_events.len();
             log.warn("⚠️ Shutdown timeout reached - {d} events may not have been published", .{remaining});
@@ -696,7 +698,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             last_log_time = elapsed;
         }
 
-        std.Thread.sleep(100 * std.time.ns_per_ms); // 100ms
+        std.time.sleep(100 * std.time.ns_per_ms); // 100ms
     }
 
     if (batch_pub.isFlushComplete()) {

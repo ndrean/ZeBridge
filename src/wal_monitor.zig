@@ -86,7 +86,7 @@ pub const WalMonitor = struct {
             // Sleep for check interval
             var remaining_seconds = self.config.check_interval_seconds;
             while (remaining_seconds > 0 and !self.should_stop.load(.seq_cst)) {
-                std.Thread.sleep(1 * std.time.ns_per_s);
+                std.time.sleep(1 * std.time.ns_per_s);
                 remaining_seconds -= 1;
             }
         }

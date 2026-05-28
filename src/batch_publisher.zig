@@ -700,7 +700,7 @@ pub const BatchPublisher = struct {
                     break;
                 }
                 // Sleep briefly to avoid busy-waiting
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                std.time.sleep(1 * std.time.ns_per_ms);
             } else {
                 // Have events but timeout not reached
                 if (self.should_stop.load(.seq_cst)) {
@@ -712,7 +712,7 @@ pub const BatchPublisher = struct {
                     break;
                 }
                 // Keep them and sleep briefly
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                std.time.sleep(1 * std.time.ns_per_ms);
             }
         }
 
@@ -953,7 +953,7 @@ pub const BatchPublisher = struct {
 
                 // Wait before retrying (exponential backoff)
                 log.warn("⏳ Retrying in {d}ms...", .{backoff_ms});
-                std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+                std.time.sleep(backoff_ms * std.time.ns_per_ms);
 
                 // Double the wait for next time, capped at 5 seconds
                 backoff_ms = @min(backoff_ms * 2, 5000);
