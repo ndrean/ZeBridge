@@ -14,32 +14,35 @@ pub const Args = struct {
 
     /// Parse command-line arguments and create RuntimeConfig
     /// Returns both the CLI args and the merged runtime configuration
-    /// argv is passed directly from main() — no allocation needed, strings live
-    /// for the program's lifetime (Zig guarantees argv outlives main).
-    pub fn parseArgs(allocator: std.mem.Allocator, argv: [][:0]u8) !struct { args: Args, runtime_config: config.RuntimeConfig } {
+    /// std.process.argsWithAllocator/argsAlloc were removed in Zig 0.16.
+    /// std.os.argv is the POSIX global set by the Zig runtime before main() runs;
+    /// each element is a [*:0]u8 (null-terminated C string).
+    pub fn parseArgs(allocator: std.mem.Allocator) !struct { args: Args, runtime_config: config.RuntimeConfig } {
+        const raw_argv = std.os.argv; // [][*:0]u8 — lives for the program lifetime
+
         var http_port: u16 = 6543; // default
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
         var publication_name: []const u8 = config.Postgres.default_publication_name; // default
         var encoding_format: encoder.Format = .msgpack; // default
         var enable_compression: bool = false; // default: disabled
 
-        var i: usize = 1; // argv[0] is the program name
-        while (i < argv.len) : (i += 1) {
-            const arg = argv[i];
+        var i: usize = 1; // raw_argv[0] is the program name
+        while (i < raw_argv.len) : (i += 1) {
+            const arg = std.mem.span(raw_argv[i]); // [*:0]u8 → []u8
             if (std.mem.eql(u8, arg, "--port")) {
                 i += 1;
-                if (i < argv.len) {
-                    http_port = std.fmt.parseInt(u16, argv[i], 10) catch {
+                if (i < raw_argv.len) {
+                    http_port = std.fmt.parseInt(u16, std.mem.span(raw_argv[i]), 10) catch {
                         log.err("--port requires a valid port number (1-65535)", .{});
                         return error.InvalidArguments;
                     };
                 }
             } else if (std.mem.eql(u8, arg, "--slot")) {
                 i += 1;
-                if (i < argv.len) slot_name = argv[i];
+                if (i < raw_argv.len) slot_name = std.mem.span(raw_argv[i]);
             } else if (std.mem.eql(u8, arg, "--pub")) {
                 i += 1;
-                if (i < argv.len) publication_name = argv[i];
+                if (i < raw_argv.len) publication_name = std.mem.span(raw_argv[i]);
             } else if (std.mem.eql(u8, arg, "--json")) {
                 encoding_format = .json;
             } else if (std.mem.eql(u8, arg, "--zstd")) {
