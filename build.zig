@@ -1,8 +1,15 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Link vendored or system libpq to an executable.
-/// Pass `-Dvendored-libpq=true` to use libs/libpq-install/ (local dev).
-/// Default (false) uses the system libpq (Docker / CI / package-installed).
+///
+/// Options:
+///   -Dvendored-libpq=true   Use pre-built libs/libpq-install/ (requires prior build of libpq)
+///   -Dlibpq-prefix=/path    Override the system libpq prefix (include/ and lib/ under it)
+///
+/// Auto-detection for system libpq:
+///   macOS  → /opt/homebrew/opt/libpq  (brew install libpq)
+///   Linux  → /usr                     (apt install libpq-dev)
 fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
     const use_vendored = b.option(bool, "vendored-libpq", "Use vendored libpq from libs/libpq-install/") orelse false;
 
@@ -14,10 +21,18 @@ fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
         exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
         std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
     } else {
-        // System libpq (Docker/Debian/Alpine: apt install libpq-dev)
-        exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
+        const default_prefix: []const u8 = if (builtin.os.tag == .macos)
+            "/opt/homebrew/opt/libpq"
+        else
+            "/usr";
+        const prefix = b.option([]const u8, "libpq-prefix", "System libpq prefix (default: /opt/homebrew/opt/libpq on macOS, /usr on Linux)") orelse default_prefix;
+
+        const include_path = b.pathJoin(&.{ prefix, "include" });
+        const lib_path = b.pathJoin(&.{ prefix, "lib" });
+        exe.root_module.addSystemIncludePath(.{ .cwd_relative = include_path });
+        exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
         exe.root_module.linkSystemLibrary("pq", .{});
-        std.debug.print("Using system libpq\n", .{});
+        std.debug.print("Using system libpq from {s}\n", .{prefix});
     }
 
     exe.root_module.link_libc = true;
