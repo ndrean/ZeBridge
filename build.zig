@@ -4,9 +4,14 @@ const std = @import("std");
 fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
     // Check if vendored libpq exists
     const vendored_libpq_exists = blk: {
-        _ = b.build_root.handle.statFile("libs/libpq-install/lib/libpq.a") catch {
-            break :blk false;
-        };
+        const root = b.build_root.path orelse break :blk false;
+        const check_path = std.fmt.allocPrintZ(
+            b.allocator,
+            "{s}/libs/libpq-install/lib/libpq.a",
+            .{root},
+        ) catch break :blk false;
+        defer b.allocator.free(check_path);
+        std.posix.access(check_path, 0) catch break :blk false; // 0 = F_OK (existence)
         break :blk true;
     };
 
