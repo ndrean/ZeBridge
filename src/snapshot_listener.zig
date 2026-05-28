@@ -781,7 +781,7 @@ pub const SnapshotListener = struct {
         // Process chunks using streaming encoder
         var batch: u32 = 0;
         var total_rows: u64 = 0;
-        var last_val: []const u8 = try allocator.dupe(u8, if (pk.is_numeric) "0" else "");
+        var last_val: []u8 = try allocator.dupe(u8, if (pk.is_numeric) "0" else "");
         defer allocator.free(last_val);
 
         // Pre-allocate encoding buffer (2MB for chunk data)
@@ -796,6 +796,8 @@ pub const SnapshotListener = struct {
             // Quote value if string type (UUID, varchar, etc.)
             const where_clause = if (pk.is_numeric)
                 try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > {s}", .{ pk.name, last_val })
+            else if (last_val.len == 0)
+                try std.fmt.allocPrint(chunk_alloc, "1=1", .{})
             else
                 try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
 
@@ -813,7 +815,7 @@ pub const SnapshotListener = struct {
             var parser = pg_copy_csv.CopyCsvParser.init(chunk_alloc, @ptrCast(conn));
             defer parser.deinit();
 
-            const num_rows = parser.streamToEncoder(copy_query, &encoder) catch |err| {
+            const num_rows = parser.streamToEncoder(copy_query, &encoder, pk.name) catch |err| {
                 log.err("Stream encoding failed: {}", .{err});
                 _ = c.PQexec(conn, "ROLLBACK");
                 return error.StreamEncodingFailed;
@@ -955,34 +957,15 @@ pub const SnapshotListener = struct {
 
             batch += 1;
 
-            // Update last_val from parser's last row
-            // For streaming encoder, we need to extract from the parsed header
-            if (num_rows > 0) {
-                const header_cols = parser.columnNames() orelse return error.NoHeader;
-                var pk_idx: ?usize = null;
-                for (header_cols, 0..) |name, i| {
-                    if (std.mem.eql(u8, name, pk.name)) {
-                        pk_idx = i;
-                        break;
-                    }
-                }
-
-                // Note: streaming encoder doesn't store rows, so we can't extract the last PK value
-                // For now, this is a limitation - we'd need to modify StreamingEncoder to track last row
-                // Fallback: assume sequential integer IDs and increment
-                if (pk.is_numeric and pk_idx != null) {
-                    const new_val = try std.fmt.allocPrint(
-                        allocator,
-                        "{d}",
-                        .{try std.fmt.parseInt(i64, last_val, 10) + @as(i64, @intCast(num_rows))},
-                    );
-                    allocator.free(last_val);
-                    last_val = new_val;
-                } else {
-                    // For non-numeric or when we can't determine, log warning
-                    log.warn("⚠️  Streaming encoder doesn't support non-sequential PK pagination yet", .{});
-                }
-            }
+            // Advance keyset cursor using the actual last PK value captured during streaming.
+            // This is correct for gaps, deletions, and non-sequential PKs (e.g. UUIDs).
+            const pk_val = parser.getLastPkValue() orelse {
+                log.err("⚠️  No PK value captured from chunk — aborting snapshot", .{});
+                _ = c.PQexec(conn, "ROLLBACK");
+                return error.PkValueMissing;
+            };
+            allocator.free(last_val);
+            last_val = try allocator.dupe(u8, pk_val);
 
             // Break if we got fewer rows than requested (end of table)
             if (num_rows < chunk_size) break;

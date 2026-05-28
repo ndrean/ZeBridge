@@ -95,6 +95,11 @@ pub const CopyCsvParser = struct {
     conn: ?*c.PGconn,
     header: ?[][]const u8 = null,
     buffer: std.ArrayList(u8),
+    // PK tracking for correct keyset pagination in the streaming path.
+    // Set via streamToEncoder's pk_col_name parameter; updated per row.
+    pk_col_idx: ?usize = null,
+    last_pk_buf: [256]u8 = undefined,
+    last_pk_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, conn: ?*c.PGconn) CopyCsvParser {
         return .{
@@ -336,6 +341,13 @@ pub const CopyCsvParser = struct {
         return self.header;
     }
 
+    /// Return the last primary-key value seen during streaming, or null if none.
+    /// Only valid after streamToEncoder returns with num_rows > 0.
+    pub fn getLastPkValue(self: *const CopyCsvParser) ?[]const u8 {
+        if (self.last_pk_len == 0) return null;
+        return self.last_pk_buf[0..self.last_pk_len];
+    }
+
     // ========================================================================
     // Streaming API (zero-copy, direct-to-buffer encoding)
     // ========================================================================
@@ -359,7 +371,9 @@ pub const CopyCsvParser = struct {
         log.debug("Streaming Parser initialized with {d} columns", .{self.header.?.len});
     }
 
-    /// Parse a CSV line and stream fields directly to the encoder
+    /// Parse a CSV line and stream fields directly to the encoder.
+    /// When pk_col_idx is set, saves the value at that column index into
+    /// last_pk_buf so callers can advance the keyset cursor after the chunk.
     fn parseCsvLineStreaming(
         self: *CopyCsvParser,
         line: []u8,
@@ -369,6 +383,7 @@ pub const CopyCsvParser = struct {
         try encoder.beginRow(expected_cols);
 
         var it = std.mem.splitScalar(u8, line, ',');
+        var col_idx: usize = 0;
 
         while (it.next()) |raw_field| {
             const trimmed = std.mem.trim(u8, raw_field, " \r");
@@ -376,21 +391,35 @@ pub const CopyCsvParser = struct {
             const field_value: ?[]const u8 = if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "\\N"))
                 null
             else if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
-                // In-place unescape
                 unescapeCsvInPlace(@constCast(trimmed[1 .. trimmed.len - 1]))
             else
                 trimmed;
 
+            // Capture PK value for keyset pagination
+            if (self.pk_col_idx) |pk_idx| {
+                if (col_idx == pk_idx) {
+                    if (field_value) |pk_val| {
+                        const copy_len = @min(pk_val.len, self.last_pk_buf.len);
+                        @memcpy(self.last_pk_buf[0..copy_len], pk_val[0..copy_len]);
+                        self.last_pk_len = copy_len;
+                    }
+                }
+            }
+
             try encoder.writeField(field_value);
+            col_idx += 1;
         }
     }
 
-    /// Stream PostgreSQL COPY data directly to MessagePack encoder
-    /// This is the main streaming entry point that replaces executeCopy + row iteration
+    /// Stream PostgreSQL COPY data directly to MessagePack encoder.
+    ///
+    /// pk_col_name: when non-null, the parser tracks the last value of that
+    /// column so callers can advance the keyset cursor via getLastPkValue().
     pub fn streamToEncoder(
         self: *CopyCsvParser,
         query: [:0]const u8,
         encoder: *StreamingEncoder,
+        pk_col_name: ?[]const u8,
     ) !usize {
         // 1. Start PostgreSQL COPY
         const result = c.PQexec(self.conn, query.ptr);
@@ -405,13 +434,12 @@ pub const CopyCsvParser = struct {
         // 2. We'll count rows as we stream them
         var row_count: usize = 0;
 
-        // Reserve space for array header (we'll write it at the end when we know the count)
-        // MessagePack array header can be 1, 3, or 5 bytes depending on count
-        // Reserve 5 bytes for safety (supports up to 4 billion rows)
+        // Reserve 5 bytes for the array header (max msgpack array32 header).
+        // We patch it in after we know the row count.
         const array_header_start = encoder.getPos();
         const max_header_size: usize = 5;
         for (0..max_header_size) |_| {
-            try encoder.writer.writeByte(0);
+            try encoder.writeByte(0);
         }
 
         // 3. Stream loop: Fetch -> Parse -> Encode
@@ -430,14 +458,28 @@ pub const CopyCsvParser = struct {
             const line = std.mem.trim(u8, buf_ptr[0..@intCast(len)], " \n\r");
             if (line.len == 0) continue;
 
-            // First line is the header
+            // First line is the CSV header
             if (self.header == null) {
                 try self.parseHeaderFromLine(line);
+                // Resolve PK column index now that we know the column names
+                if (pk_col_name) |pk_name| {
+                    if (self.header) |h| {
+                        for (h, 0..) |col, i| {
+                            if (std.mem.eql(u8, col, pk_name)) {
+                                self.pk_col_idx = i;
+                                self.last_pk_len = 0;
+                                break;
+                            }
+                        }
+                        if (self.pk_col_idx == null) {
+                            log.warn("PK column '{s}' not found in COPY header — pagination will not advance", .{pk_name});
+                        }
+                    }
+                }
                 continue;
             }
 
             // Subsequent lines are data rows
-            // Make line mutable for in-place unescaping
             const mutable_line = @constCast(line);
             try self.parseCsvLineStreaming(mutable_line, encoder);
             row_count += 1;
