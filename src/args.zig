@@ -15,31 +15,34 @@ pub const Args = struct {
     /// Parse command-line arguments and create RuntimeConfig
     /// Returns both the CLI args and the merged runtime configuration
     pub fn parseArgs(allocator: std.mem.Allocator) !struct { args: Args, runtime_config: config.RuntimeConfig } {
-        // Parse command-line arguments
-        var args = try std.process.argsWithAllocator(allocator);
-        _ = args.skip(); // Skip program name
+        // argsWithAllocator was removed in Zig 0.16; argsAlloc is the replacement.
+        // The returned slice is intentionally not freed — CLI arg strings live for the
+        // program's lifetime (same semantics as POSIX argv pointers).
+        const argv = try std.process.argsAlloc(allocator);
+
         var http_port: u16 = 6543; // default
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
         var publication_name: []const u8 = config.Postgres.default_publication_name; // default
         var encoding_format: encoder.Format = .msgpack; // default
         var enable_compression: bool = false; // default: disabled
 
-        while (args.next()) |arg| {
+        var i: usize = 1; // argv[0] is the program name
+        while (i < argv.len) : (i += 1) {
+            const arg = argv[i];
             if (std.mem.eql(u8, arg, "--port")) {
-                if (args.next()) |value| {
-                    http_port = std.fmt.parseInt(u16, value, 10) catch {
+                i += 1;
+                if (i < argv.len) {
+                    http_port = std.fmt.parseInt(u16, argv[i], 10) catch {
                         log.err("--port requires a valid port number (1-65535)", .{});
                         return error.InvalidArguments;
                     };
                 }
             } else if (std.mem.eql(u8, arg, "--slot")) {
-                if (args.next()) |value| {
-                    slot_name = value;
-                }
+                i += 1;
+                if (i < argv.len) slot_name = argv[i];
             } else if (std.mem.eql(u8, arg, "--pub")) {
-                if (args.next()) |value| {
-                    publication_name = value;
-                }
+                i += 1;
+                if (i < argv.len) publication_name = argv[i];
             } else if (std.mem.eql(u8, arg, "--json")) {
                 encoding_format = .json;
             } else if (std.mem.eql(u8, arg, "--zstd")) {
