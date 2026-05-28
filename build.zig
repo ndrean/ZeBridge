@@ -20,7 +20,7 @@ fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
         std.debug.print("Using system libpq\n", .{});
     }
 
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
 }
 
 pub fn build(b: *std.Build) void {
