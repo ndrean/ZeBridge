@@ -90,7 +90,7 @@ fn trystringify(frmtr: *Formatter, value: anytype, options: StringifyOptions) !v
 
 const std = @import("std");
 const json = std.json;
-const StringifyOptions = json.StringifyOptions;
+const StringifyOptions = json.Stringify.Options;
 
 const Appendable = @import("Appendable.zig");
 
