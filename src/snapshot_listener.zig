@@ -87,7 +87,8 @@ fn publishWithRetry(
 // Global dictionary cache for pre-trained zstd dictionaries
 // Initialized once on bridge startup and read-only afterwards (thread-safe)
 var global_dictionaries: ?*dictionaries_cache.DictionariesCache = null;
-var dictionaries_mutex: std.Thread.Mutex = .{};
+var dictionaries_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
+var g_snapshot_io: std.Io = undefined;
 var dictionaries_allocator: ?std.mem.Allocator = null;
 
 // Global dictionary manager for zstd compression with digested dictionaries
@@ -201,6 +202,7 @@ pub const SnapshotListener = struct {
     chunk_size: usize,
     enable_compression: bool,
     recipe: config.CompressionRecipe,
+    io: std.Io,
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -210,6 +212,7 @@ pub const SnapshotListener = struct {
         monitored_tables: []const []const u8,
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
+        io: std.Io,
     ) SnapshotListener {
         return .{
             .allocator = allocator,
@@ -221,6 +224,7 @@ pub const SnapshotListener = struct {
             .chunk_size = runtime_config.snapshot_chunk_size,
             .enable_compression = runtime_config.enable_compression,
             .recipe = runtime_config.recipe,
+            .io = io,
         };
     }
 
@@ -257,6 +261,7 @@ pub const SnapshotListener = struct {
             self.should_stop,
             self.monitored_tables,
             self.format,
+            self.io,
         });
 
         // Spawn snapshot request handler thread (pure g41797/nats - no nats.c dependency!)
@@ -270,6 +275,7 @@ pub const SnapshotListener = struct {
             self.chunk_size,
             self.enable_compression,
             self.recipe,
+            self.io,
         });
 
         // Keep main thread alive - just sleep until stop signal
@@ -302,6 +308,7 @@ pub const SnapshotListener = struct {
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
         format: encoder_mod.Format,
+        io: std.Io,
     ) void {
         const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
 
@@ -312,7 +319,7 @@ pub const SnapshotListener = struct {
             // Create Core NATS connection
             var core = nats.Core{};
             const connect_opts = nats.protocol.ConnectOpts{}; // Use defaults
-            core.CONNECT(allocator, connect_opts) catch |err| {
+            core.CONNECT(allocator, connect_opts, io) catch |err| {
                 log.err("📋 Schema listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
@@ -586,6 +593,7 @@ pub const SnapshotListener = struct {
         chunk_size: usize,
         enable_compression: bool,
         recipe: config.CompressionRecipe,
+        io: std.Io,
     ) void {
         const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
 
@@ -596,7 +604,7 @@ pub const SnapshotListener = struct {
             // Create Core NATS connection
             var core = nats.Core{};
             const connect_opts = nats.protocol.ConnectOpts{};
-            core.CONNECT(allocator, connect_opts) catch |err| {
+            core.CONNECT(allocator, connect_opts, io) catch |err| {
                 log.err("📸 Snapshot listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
@@ -674,6 +682,7 @@ pub const SnapshotListener = struct {
                         enable_compression,
                         recipe,
                         should_stop,
+                        io,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         // TODO: Implement publishSnapshotErrorZig if needed for error reporting
@@ -703,6 +712,7 @@ pub const SnapshotListener = struct {
         enable_compression: bool,
         recipe: config.CompressionRecipe,
         should_stop: *std.atomic.Value(bool),
+        io: std.Io,
     ) !void {
         log.info("📸 Generating snapshot for '{s}' (id={s}, compression={}, chunk_size={d})", .{
             table_name,
@@ -713,7 +723,7 @@ pub const SnapshotListener = struct {
 
         // Create JetStream connection for publishing snapshot data
         const connect_opts = nats.protocol.ConnectOpts{};
-        var js = nats.JS.CONNECT(allocator, connect_opts) catch |err| {
+        var js = nats.JS.CONNECT(allocator, connect_opts, io) catch |err| {
             log.err("📸 Failed to connect to JetStream: {}", .{err});
             return error.JetStreamConnectionFailed;
         };
@@ -843,13 +853,13 @@ pub const SnapshotListener = struct {
             // Get dictionary info for headers
             var dict_id_opt: ?[]const u8 = null;
             if (enable_compression and global_dict_manager != null) {
-                dictionaries_mutex.lock();
+                dictionaries_mutex.lockUncancelable(g_snapshot_io);
                 if (global_dictionaries) |cache| {
                     if (cache.getDictId(table_name)) |dict_id| {
                         dict_id_opt = dict_id;
                     }
                 }
-                dictionaries_mutex.unlock();
+                dictionaries_mutex.unlock(g_snapshot_io);
             }
 
             // Compress if enabled (with dictionary if available)
@@ -860,8 +870,8 @@ pub const SnapshotListener = struct {
 
                 // Try to use dictionary compression if available
                 if (global_dict_manager) |manager| {
-                    dictionaries_mutex.lock();
-                    defer dictionaries_mutex.unlock();
+                    dictionaries_mutex.lockUncancelable(g_snapshot_io);
+                    defer dictionaries_mutex.unlock(g_snapshot_io);
 
                     if (manager.getCDict(table_name)) |cdict| {
                         const result = try compressor.compress_using_cdict(allocator, encoded, cdict);
@@ -1375,7 +1385,8 @@ fn listenForSnapshotRequestsOld(
 
     // Create JetStream connection
     const connect_opts = nats.protocol.ConnectOpts{};
-    var js = nats.JS.CONNECT(allocator, connect_opts) catch |err| {
+    // listenForSnapshotRequestsOld is deprecated; io is not propagated here
+    var js = nats.JS.CONNECT(allocator, connect_opts, undefined) catch |err| {
         log.err("Failed to connect to JetStream: {}", .{err});
         return error.JetStreamConnectionFailed;
     };
@@ -1469,8 +1480,8 @@ fn generateIncrementalSnapshot(
 
     // Get dictionary ID from global cache if compression is enabled
     const dict_id_opt = if (enable_compression and global_dict_manager != null) blk: {
-        dictionaries_mutex.lock();
-        defer dictionaries_mutex.unlock();
+        dictionaries_mutex.lockUncancelable(g_snapshot_io);
+        defer dictionaries_mutex.unlock(g_snapshot_io);
         if (global_dictionaries) |cache| {
             if (cache.getDictId(table_name)) |dict_id| {
                 break :blk dict_id;
@@ -1619,8 +1630,8 @@ fn generateIncrementalSnapshot(
 
             // Try to use dictionary compression if available
             if (global_dict_manager) |manager| {
-                dictionaries_mutex.lock();
-                defer dictionaries_mutex.unlock();
+                dictionaries_mutex.lockUncancelable(g_snapshot_io);
+                defer dictionaries_mutex.unlock(g_snapshot_io);
 
                 if (manager.getCDict(table_name)) |cdict| {
                     const result = try compressor.compress_using_cdict(allocator, encoded, cdict);
@@ -2010,8 +2021,8 @@ fn publishDictionary(
     should_stop: *std.atomic.Value(bool),
 ) !bool {
     // Get dictionary from global cache
-    dictionaries_mutex.lock();
-    defer dictionaries_mutex.unlock();
+    dictionaries_mutex.lockUncancelable(g_snapshot_io);
+    defer dictionaries_mutex.unlock(g_snapshot_io);
 
     if (global_dictionaries) |cache| {
         if (cache.get(table_name)) |dict_entry| {
@@ -2058,8 +2069,9 @@ fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
 /// Cleanup global dictionaries cache
 /// Called on shutdown to free all dictionary memory
 pub fn deinitDictionaries() void {
-    dictionaries_mutex.lock();
-    defer dictionaries_mutex.unlock();
+    if (global_dictionaries == null and global_dict_manager == null) return;
+    dictionaries_mutex.lockUncancelable(g_snapshot_io);
+    defer dictionaries_mutex.unlock(g_snapshot_io);
 
     // Cleanup dictionary manager first (it depends on dictionaries cache)
     if (global_dict_manager) |manager| {
@@ -2090,12 +2102,14 @@ pub fn initializeDictionaries(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
     monitored_tables: []const []const u8,
+    io: std.Io,
 ) !void {
     log.info("📚 Training zstd dictionaries for {d} tables", .{monitored_tables.len});
+    g_snapshot_io = io;
 
     // Create global dictionaries cache
-    dictionaries_mutex.lock();
-    defer dictionaries_mutex.unlock();
+    dictionaries_mutex.lockUncancelable(g_snapshot_io);
+    defer dictionaries_mutex.unlock(g_snapshot_io);
 
     if (global_dictionaries == null) {
         const cache = try allocator.create(dictionaries_cache.DictionariesCache);

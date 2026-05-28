@@ -506,23 +506,49 @@ pub const Decompressor = struct {
 // === Context Pooling
 // -----------------------------------
 
+/// Semaphore replacement for std.Thread.Semaphore (removed in Zig 0.16).
+/// Uses std.Io.Mutex + std.Io.Condition for permit-based resource tracking.
+const PoolSemaphore = struct {
+    mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
+    cond: std.Io.Condition = .{},
+    permits: usize = 0,
+
+    pub fn wait(self: *PoolSemaphore, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        while (self.permits == 0) {
+            self.cond.waitUncancelable(io, &self.mutex);
+        }
+        self.permits -= 1;
+    }
+
+    pub fn post(self: *PoolSemaphore, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.permits += 1;
+        self.cond.signal(io);
+    }
+};
+
 pub fn ContextPool(comptime T: type) type {
     return struct {
         const Self = @This();
 
         allocator: std.mem.Allocator,
         contexts: std.ArrayList(*T),
-        mutex: std.Thread.Mutex = .{},
-        sem: std.Thread.Semaphore,
+        mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
+        sem: PoolSemaphore = .{},
+        io: std.Io = undefined,
 
-        pub fn init(allocator: std.mem.Allocator, capacity: usize, config: anytype) !*Self {
+        pub fn init(allocator: std.mem.Allocator, capacity: usize, config: anytype, io: std.Io) !*Self {
             _ = config; // for future configurability (e.g. tuning)
 
             const self = try allocator.create(Self);
             self.* = .{
                 .allocator = allocator,
                 .contexts = std.ArrayList(*T).init(allocator),
-                .sem = std.Thread.Semaphore{ .permits = capacity },
+                .sem = .{ .permits = capacity },
+                .io = io,
             };
             errdefer self.deinit();
 
@@ -548,17 +574,17 @@ pub fn ContextPool(comptime T: type) type {
         }
 
         pub fn acquire(self: *Self) *T {
-            self.sem.wait();
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.sem.wait(self.io);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             std.debug.assert(self.contexts.items.len > 0);
             return self.contexts.pop();
         }
 
         pub fn release(self: *Self, ctx: *T) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             if (T == ZSTD_CCtx) {
                 _ = ZSTD_CCtx_reset(@ptrCast(ctx), .ZSTD_reset_session_only);
@@ -567,7 +593,7 @@ pub fn ContextPool(comptime T: type) type {
             }
 
             self.contexts.append(ctx) catch unreachable;
-            self.sem.post();
+            self.sem.post(self.io);
         }
 
         pub fn deinit(self: *Self) void {

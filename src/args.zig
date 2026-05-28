@@ -14,10 +14,10 @@ pub const Args = struct {
 
     /// Parse command-line arguments and create RuntimeConfig.
     ///
-    /// Zig 0.16 "Juicy Main": args and environ are received via std.process.Init.Minimal
+    /// Zig 0.16 "Juicy Main": args and environ are received via std.process.Init
     /// passed from main(). init.args.iterate() replaces the removed argsWithAllocator/argsAlloc.
     /// init.environ.getPosix() replaces the removed std.process.getEnvVarOwned().
-    pub fn parseArgs(allocator: std.mem.Allocator, init: *const std.process.Init.Minimal) !struct { args: Args, runtime_config: config.RuntimeConfig } {
+    pub fn parseArgs(allocator: std.mem.Allocator, init: *const std.process.Init) !struct { args: Args, runtime_config: config.RuntimeConfig } {
         var args_iter = init.args.iterate();
         _ = args_iter.next(); // skip argv[0] (program name)
 
@@ -167,7 +167,7 @@ pub const Args = struct {
     ///
     /// Format: "table1:col1,col2;table2:col3,col4"
     /// Example: "users:status,kyc_level;orders:state,payment_status"
-    pub fn parseTransitionRules(allocator: std.mem.Allocator, init: *const std.process.Init.Minimal) !config.EventClassification.TransitionRules {
+    pub fn parseTransitionRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
         var rules = config.EventClassification.TransitionRules.init(allocator);
         errdefer rules.deinit();
 

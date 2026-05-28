@@ -265,8 +265,8 @@ pub const Messages = struct {
     }
 
     /// Closes the pool and frees all pooled messages.
-    pub fn deinit(msgs: *Messages) void {
-        var allocated = msgs.pool.close();
+    pub fn deinit(msgs: *Messages, io: std.Io) void {
+        var allocated = msgs.pool.close(io);
         while (allocated != null) {
             const next = allocated.?.next;
             free(allocated.?);
@@ -275,8 +275,8 @@ pub const Messages = struct {
     }
 
     /// Gets a message from the pool or allocates a new one if pool is empty.
-    pub fn get(msgs: *Messages, timeout_ns: u64) !*AllocatedMSG {
-        if (msgs.pool.receive(timeout_ns)) |amsg| {
+    pub fn get(msgs: *Messages, timeout_ns: u64, io: std.Io) !*AllocatedMSG {
+        if (msgs.pool.receive(timeout_ns, io)) |amsg| {
             amsg.*.letter.reset();
             //std.io.getStdOut().writer().print("Get message from the pool\r\n", .{}) catch unreachable;
             return amsg;
@@ -291,8 +291,8 @@ pub const Messages = struct {
     }
 
     /// Receives a message from the pool with timeout.
-    pub fn receive(msgs: *Messages, timeout_ns: u64) error{ Timeout, Closed, Interrupted }!*AllocatedMSG {
-        if (msgs.pool.receive(timeout_ns)) |amsg| {
+    pub fn receive(msgs: *Messages, timeout_ns: u64, io: std.Io) error{ Timeout, Closed, Interrupted }!*AllocatedMSG {
+        if (msgs.pool.receive(timeout_ns, io)) |amsg| {
             return amsg;
         } else |rer| {
             return rer;
@@ -300,15 +300,15 @@ pub const Messages = struct {
     }
 
     /// Returns a message to the pool for reuse.
-    pub fn put(msgs: *Messages, amsg: *AllocatedMSG) void {
-        msgs.pool.send(amsg) catch {
+    pub fn put(msgs: *Messages, amsg: *AllocatedMSG, io: std.Io) void {
+        msgs.pool.send(amsg, io) catch {
             free(amsg);
         };
     }
 
     /// Sends a message to the pool, freeing it if the pool is closed.
-    pub fn send(msgs: *Messages, amsg: *AllocatedMSG) !void {
-        msgs.pool.send(amsg) catch |serr| {
+    pub fn send(msgs: *Messages, amsg: *AllocatedMSG, io: std.Io) !void {
+        msgs.pool.send(amsg, io) catch |serr| {
             free(amsg);
             return serr;
         };

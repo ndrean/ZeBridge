@@ -5,7 +5,8 @@
 /// Supports both durable and ephemeral consumers.
 pub const Consumer = @This();
 
-mutex: Mutex = .{},
+mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
+io: std.Io = undefined,
 allocator: Allocator = undefined,
 co: protocol.ConnectOpts = undefined,
 connection: ?*Conn = null,
@@ -21,10 +22,11 @@ req_reply2: Formatter = .{},
 
 /// Creates and starts a new JetStream consumer.
 /// Returns a Consumer instance connected to the specified stream.
-pub fn START(allocator: Allocator, co: protocol.ConnectOpts, stream: []const u8, cscnf: *ConsumerConfig) !Consumer {
+pub fn START(allocator: Allocator, co: protocol.ConnectOpts, stream: []const u8, cscnf: *ConsumerConfig, io: std.Io) !Consumer {
     var cs: Consumer = .{ .allocator = allocator };
+    cs.io = io;
 
-    cs.connection = try JetStream.createConn(allocator, co);
+    cs.connection = try JetStream.createConn(allocator, co, io);
     errdefer cs.deinit();
 
     _ = try cs.stream.init(cs.allocator, stream.len, null);
@@ -44,8 +46,8 @@ pub fn START(allocator: Allocator, co: protocol.ConnectOpts, stream: []const u8,
 /// Fetches the next message from the consumer with the specified timeout.
 /// Returns null if no messages are available.
 pub fn CONSUME(cs: *Consumer, timeout_ns: u64) !?*AllocatedMSG {
-    cs.mutex.lock();
-    defer cs.mutex.unlock();
+    cs.mutex.lockUncancelable(cs.io);
+    defer cs.mutex.unlock(cs.io);
 
     if (cs.connection == null) {
         return error.NotConnected;
@@ -59,8 +61,8 @@ pub fn CONSUME(cs: *Consumer, timeout_ns: u64) !?*AllocatedMSG {
 /// Stops the consumer and optionally deletes it from the server.
 /// Releases all resources associated with the consumer.
 pub fn STOP(cs: *Consumer, delete: ?bool) void {
-    cs.mutex.lock();
-    defer cs.mutex.unlock();
+    cs.mutex.lockUncancelable(cs.io);
+    defer cs.mutex.unlock(cs.io);
 
     if (cs.connection == null) {
         return;
@@ -75,8 +77,8 @@ pub fn STOP(cs: *Consumer, delete: ?bool) void {
 /// Acknowledges a message, indicating successful processing.
 /// Optionally returns the message to the pool for reuse.
 pub fn ACK(cs: *Consumer, msg: *AllocatedMSG, reuseMsg: bool) !void {
-    cs.mutex.lock();
-    defer cs.mutex.unlock();
+    cs.mutex.lockUncancelable(cs.io);
+    defer cs.mutex.unlock(cs.io);
 
     if (cs.connection != null) {
         try cs.ack(msg);
@@ -90,8 +92,8 @@ pub fn ACK(cs: *Consumer, msg: *AllocatedMSG, reuseMsg: bool) !void {
 /// Negatively acknowledges a message, requesting redelivery.
 /// Optionally returns the message to the pool for reuse.
 pub fn NACK(cs: *Consumer, msg: *AllocatedMSG, reuseMsg: bool) !void {
-    cs.mutex.lock();
-    defer cs.mutex.unlock();
+    cs.mutex.lockUncancelable(cs.io);
+    defer cs.mutex.unlock(cs.io);
 
     if (cs.connection != null) {
         try cs.nack(msg);
@@ -104,16 +106,16 @@ pub fn NACK(cs: *Consumer, msg: *AllocatedMSG, reuseMsg: bool) !void {
 
 /// Returns a message to the pool for reuse.
 pub fn REUSE(cs: *Consumer, msg: *AllocatedMSG) void {
-    cs.mutex.lock();
-    defer cs.mutex.unlock();
+    cs.mutex.lockUncancelable(cs.io);
+    defer cs.mutex.unlock(cs.io);
 
     cs.reuse(msg);
 }
 
 /// Publishes a message to JetStream with optional headers and payload.
 pub fn PUBLISH(cs: *Consumer, subject: []const u8, headers: ?*Headers, payload: ?[]const u8) !void {
-    cs.mutex.lock();
-    defer cs.mutex.unlock();
+    cs.mutex.lockUncancelable(cs.io);
+    defer cs.mutex.unlock(cs.io);
 
     if (cs.connection == null) {
         return error.NotConnected;
@@ -475,7 +477,7 @@ const Appendable = @import("Appendable.zig");
 const utils = @import("utils.zig");
 
 const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 
 const Headers = messages.Headers;
 /// Re-export of the allocated message type.

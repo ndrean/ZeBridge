@@ -13,8 +13,8 @@ pub const Client = @This();
 stream: Stream = undefined,
 /// Indicates whether the client is connected.
 connected: bool = false,
-/// Semaphore for signaling attention/interrupts.
-attention: Sema = .{},
+/// Atomic bool for signaling attention/interrupts.
+attention: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 /// Connects to a NATS server at the specified address and port.
 pub fn connect(allocator: Allocator, co: protocol.ConnectOpts) !Client {
@@ -233,16 +233,12 @@ pub fn readAll(cl: *Client, buffer: []u8) !usize {
 
 /// Signals an attention event to interrupt blocking operations.
 pub fn raiseAttention(cl: *Client) void {
-    _ = cl.attention.post();
+    cl.attention.store(true, .release);
 }
 
 /// Checks if an attention event was raised.
 pub fn wasRaised(cl: *Client) bool {
-    if (cl.attention.timedWait(0)) |_| {
-        return true;
-    } else |_| {
-        return false;
-    }
+    return cl.attention.swap(false, .acq_rel);
 }
 
 /// Sets a socket to non-blocking mode.
@@ -288,7 +284,6 @@ const io = std.io;
 const Stream = net.Stream;
 const Socket = posix.socket_t;
 const Allocator = std.mem.Allocator;
-const Sema = std.Thread.Semaphore;
 const linux = std.os.linux;
 const windows = std.os.windows;
 const wasi = std.os.wasi;

@@ -16,7 +16,7 @@ pub fn MailBox(comptime Letter: type) type {
         last: ?*Envelope = null,
         len: usize = 0,
         closed: bool = false,
-        mutex: Mutex = .{},
+        mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
         cond: Condition = .{},
         interrupted: bool = false,
 
@@ -25,9 +25,9 @@ pub fn MailBox(comptime Letter: type) type {
         /// Arguments:
         ///     new_Envelope: Pointer to the new Envelope to append.
         /// If mailbox was closed - returns error.Closed
-        pub fn send(mbox: *Self, new_Envelope: *Envelope) error{Closed}!void {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn send(mbox: *Self, new_Envelope: *Envelope, io: std.Io) error{Closed}!void {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             if (mbox.closed) {
                 return error.Closed;
@@ -35,15 +35,15 @@ pub fn MailBox(comptime Letter: type) type {
 
             mbox.enqueue(new_Envelope);
 
-            mbox.cond.signal();
+            mbox.cond.signal(io);
         }
 
         /// Wake-up waiting on receive thread.
         /// If mailbox was closed - returns error.Closed
         /// If waiting was already interrupted -  - returns error.AlreadyInterrupted
-        pub fn interrupt(mbox: *Self) error{ Closed, AlreadyInterrupted }!void {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn interrupt(mbox: *Self, io: std.Io) error{ Closed, AlreadyInterrupted }!void {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             if (mbox.closed) {
                 return error.Closed;
@@ -55,7 +55,7 @@ pub fn MailBox(comptime Letter: type) type {
 
             mbox.interrupted = true;
 
-            mbox.cond.signal();
+            mbox.cond.signal(io);
         }
 
         /// Blocks thread  maximum timeout_ns till Envelope in head of FIFO will be available.
@@ -63,11 +63,11 @@ pub fn MailBox(comptime Letter: type) type {
         /// Otherwise removes Envelope from the head and returns it to the caller.
         /// If mailbox was closed - returns error.Closed
         /// If interrupt was issued - returns error.Interrupted
-        pub fn receive(mbox: *Self, timeout_ns: u64) error{ Timeout, Closed, Interrupted }!*Envelope {
+        pub fn receive(mbox: *Self, timeout_ns: u64, io: std.Io) error{ Timeout, Closed, Interrupted }!*Envelope {
             var timeout_timer = std.time.Timer.start() catch unreachable;
 
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             while (mbox.len == 0) {
                 if (mbox.closed) {
@@ -84,7 +84,9 @@ pub fn MailBox(comptime Letter: type) type {
                     return error.Timeout;
 
                 const local_timeout_ns = timeout_ns - elapsed;
-                try mbox.cond.timedWait(&mbox.mutex, local_timeout_ns);
+                mbox.mutex.unlock(io);
+                utils.sleep(@min(local_timeout_ns, std.time.ns_per_ms));
+                mbox.mutex.lockUncancelable(io);
             }
 
             if (mbox.closed) {
@@ -99,7 +101,7 @@ pub fn MailBox(comptime Letter: type) type {
             const first = mbox.dequeue();
 
             if (first) |firstEnvelope| {
-                defer mbox.cond.signal();
+                defer mbox.cond.signal(io);
                 return firstEnvelope;
             } else {
                 return error.Timeout;
@@ -108,18 +110,18 @@ pub fn MailBox(comptime Letter: type) type {
 
         /// # of letters in internal queue.
         /// May be called also on closed mailbox.
-        pub fn letters(mbox: *Self) usize {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn letters(mbox: *Self, io: std.Io) usize {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             return mbox.len;
         }
 
         /// First close disabled further client calls and returns head of Envelopes
         /// for de-allocation
-        pub fn close(mbox: *Self) ?*Envelope {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn close(mbox: *Self, io: std.Io) ?*Envelope {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             if (mbox.closed) return null;
 
@@ -130,7 +132,7 @@ pub fn MailBox(comptime Letter: type) type {
 
             mbox.first = null;
 
-            mbox.cond.signal();
+            mbox.cond.signal(io);
 
             return head;
         }
@@ -196,7 +198,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
         last: ?*Envelope = null,
         len: usize = 0,
         closed: bool = false,
-        mutex: Mutex = .{},
+        mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
         cond: Condition = .{},
         interrupted: bool = false,
 
@@ -205,9 +207,9 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
         /// Arguments:
         ///     new_Envelope: Pointer to the new Envelope to append.
         /// If mailbox was closed - returns error.Closed
-        pub fn send(mbox: *Self, new_Envelope: *Envelope) error{Closed}!void {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn send(mbox: *Self, new_Envelope: *Envelope, io: std.Io) error{Closed}!void {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             if (mbox.closed) {
                 return error.Closed;
@@ -215,15 +217,15 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
 
             mbox.enqueue(new_Envelope);
 
-            mbox.cond.signal();
+            mbox.cond.signal(io);
         }
 
         /// Wake-up waiting on receive thread.
         /// If mailbox was closed - returns error.Closed
         /// If waiting was already interrupted -  - returns error.AlreadyInterrupted
-        pub fn interrupt(mbox: *Self) error{ Closed, AlreadyInterrupted }!void {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn interrupt(mbox: *Self, io: std.Io) error{ Closed, AlreadyInterrupted }!void {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             if (mbox.closed) {
                 return error.Closed;
@@ -235,7 +237,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
 
             mbox.interrupted = true;
 
-            mbox.cond.signal();
+            mbox.cond.signal(io);
         }
 
         /// Blocks thread  maximum timeout_ns till Envelope in head of FIFO will be available.
@@ -243,11 +245,11 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
         /// Otherwise removes Envelope from the head and returns it to the caller.
         /// If mailbox was closed - returns error.Closed
         /// If interrupt was issued - returns error.Interrupted
-        pub fn receive(mbox: *Self, timeout_ns: u64) error{ Timeout, Closed, Interrupted }!*Envelope {
+        pub fn receive(mbox: *Self, timeout_ns: u64, io: std.Io) error{ Timeout, Closed, Interrupted }!*Envelope {
             var timeout_timer = std.time.Timer.start() catch unreachable;
 
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             while (mbox.len == 0) {
                 if (mbox.closed) {
@@ -264,7 +266,9 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
                     return error.Timeout;
 
                 const local_timeout_ns = timeout_ns - elapsed;
-                try mbox.cond.timedWait(&mbox.mutex, local_timeout_ns);
+                mbox.mutex.unlock(io);
+                utils.sleep(@min(local_timeout_ns, std.time.ns_per_ms));
+                mbox.mutex.lockUncancelable(io);
             }
 
             if (mbox.closed) {
@@ -279,7 +283,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
             const first = mbox.dequeue();
 
             if (first) |firstEnvelope| {
-                defer mbox.cond.signal();
+                defer mbox.cond.signal(io);
                 return firstEnvelope;
             } else {
                 return error.Timeout;
@@ -288,18 +292,18 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
 
         /// # of letters in internal queue.
         /// May be called also on closed mailbox.
-        pub fn letters(mbox: *Self) usize {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn letters(mbox: *Self, io: std.Io) usize {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             return mbox.len;
         }
 
         /// First close disabled further client calls and returns head of Envelopes
         /// for de-allocation
-        pub fn close(mbox: *Self) ?*Envelope {
-            mbox.mutex.lock();
-            defer mbox.mutex.unlock();
+        pub fn close(mbox: *Self, io: std.Io) ?*Envelope {
+            mbox.mutex.lockUncancelable(io);
+            defer mbox.mutex.unlock(io);
 
             if (mbox.closed) return null;
 
@@ -309,7 +313,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
 
             mbox.first = null;
 
-            mbox.cond.signal();
+            mbox.cond.signal(io);
 
             return head;
         }
@@ -381,14 +385,14 @@ pub const TypeErasedMailbox = struct {
     closed: bool = false,
     interrupted: bool = false,
 
-    mutex: Mutex = .{},
+    mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
     cond: Condition = .{},
 
     /// Append a node to the tail of the mailbox.
     /// Fails if mailbox is closed.
-    pub fn send(mbox: *Self, node: *Node) error{Closed}!void {
-        mbox.mutex.lock();
-        defer mbox.mutex.unlock();
+    pub fn send(mbox: *Self, node: *Node, io: std.Io) error{Closed}!void {
+        mbox.mutex.lockUncancelable(io);
+        defer mbox.mutex.unlock(io);
 
         if (mbox.closed)
             return error.Closed;
@@ -396,13 +400,13 @@ pub const TypeErasedMailbox = struct {
         mbox.list.append(node);
         mbox.len += 1;
 
-        mbox.cond.signal();
+        mbox.cond.signal(io);
     }
 
     /// Interrupt a waiting receiver.
-    pub fn interrupt(mbox: *Self) error{ Closed, AlreadyInterrupted }!void {
-        mbox.mutex.lock();
-        defer mbox.mutex.unlock();
+    pub fn interrupt(mbox: *Self, io: std.Io) error{ Closed, AlreadyInterrupted }!void {
+        mbox.mutex.lockUncancelable(io);
+        defer mbox.mutex.unlock(io);
 
         if (mbox.closed)
             return error.Closed;
@@ -411,7 +415,7 @@ pub const TypeErasedMailbox = struct {
             return error.AlreadyInterrupted;
 
         mbox.interrupted = true;
-        mbox.cond.signal();
+        mbox.cond.signal(io);
     }
 
     /// Receive a node from the head of the mailbox.
@@ -419,11 +423,12 @@ pub const TypeErasedMailbox = struct {
     pub fn receive(
         mbox: *Self,
         timeout_ns: u64,
+        io: std.Io,
     ) error{ Timeout, Closed, Interrupted }!*Node {
         var timer = std.time.Timer.start() catch unreachable;
 
-        mbox.mutex.lock();
-        defer mbox.mutex.unlock();
+        mbox.mutex.lockUncancelable(io);
+        defer mbox.mutex.unlock(io);
 
         while (mbox.len == 0) {
             if (mbox.closed)
@@ -438,10 +443,10 @@ pub const TypeErasedMailbox = struct {
             if (elapsed >= timeout_ns)
                 return error.Timeout;
 
-            try mbox.cond.timedWait(
-                &mbox.mutex,
-                timeout_ns - elapsed,
-            );
+            const local_timeout_ns = timeout_ns - elapsed;
+            mbox.mutex.unlock(io);
+            utils.sleep(@min(local_timeout_ns, std.time.ns_per_ms));
+            mbox.mutex.lockUncancelable(io);
         }
 
         if (mbox.closed) {
@@ -456,22 +461,22 @@ pub const TypeErasedMailbox = struct {
         const node = mbox.list.popFirst().?;
         mbox.len -= 1;
 
-        mbox.cond.signal();
+        mbox.cond.signal(io);
         return node;
     }
 
     /// Number of queued items.
-    pub fn letters(mbox: *Self) usize {
-        mbox.mutex.lock();
-        defer mbox.mutex.unlock();
+    pub fn letters(mbox: *Self, io: std.Io) usize {
+        mbox.mutex.lockUncancelable(io);
+        defer mbox.mutex.unlock(io);
         return mbox.len;
     }
 
     /// Close mailbox.
     /// Returns the head node of the remaining list (caller cleans).
-    pub fn close(mbox: *Self) ?*Node {
-        mbox.mutex.lock();
-        defer mbox.mutex.unlock();
+    pub fn close(mbox: *Self, io: std.Io) ?*Node {
+        mbox.mutex.lockUncancelable(io);
+        defer mbox.mutex.unlock(io);
 
         if (mbox.closed)
             return null;
@@ -483,11 +488,12 @@ pub const TypeErasedMailbox = struct {
         mbox.list = .{};
         mbox.len = 0;
 
-        mbox.cond.signal();
+        mbox.cond.signal(io);
         return head;
     }
 };
 
 const std = @import("std");
-const Mutex = std.Thread.Mutex;
-const Condition = std.Thread.Condition;
+const utils = @import("utils.zig");
+const Mutex = std.Io.Mutex;
+const Condition = std.Io.Condition;

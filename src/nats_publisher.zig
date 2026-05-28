@@ -54,12 +54,14 @@ pub const Publisher = struct {
     nats_port: u16, // Parsed port for reconnection
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    reconnect_mutex: std.Thread.Mutex = .{}, // Protect reconnection logic
+    reconnect_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
     metrics: ?*Metrics = null, // Optional metrics tracking
+    io: std.Io = undefined,
 
     pub fn init(
         allocator: std.mem.Allocator,
         config: PublisherConfig,
+        io: std.Io,
     ) !Publisher {
         // URL is provided by the caller (built from env vars in bridge.zig); dupe for ownership.
         const url = try allocator.dupe(u8, config.url);
@@ -71,6 +73,7 @@ pub const Publisher = struct {
             .nats_url = url,
             .nats_host = "",
             .nats_port = 4222,
+            .io = io,
         };
     }
 
@@ -111,7 +114,7 @@ pub const Publisher = struct {
         const js = try nats.JS.CONNECT(self.allocator, .{
             .addr = self.nats_host,
             .port = self.nats_port,
-        });
+        }, self.io);
         self.js = js;
 
         log.info("🟢 Connected to NATS at {s}", .{self.nats_url});
@@ -126,8 +129,8 @@ pub const Publisher = struct {
     /// Attempt to reconnect to NATS server
     /// Returns true if reconnection succeeded, false otherwise
     fn reconnect(self: *Publisher) bool {
-        self.reconnect_mutex.lock();
-        defer self.reconnect_mutex.unlock();
+        self.reconnect_mutex.lockUncancelable(self.io);
+        defer self.reconnect_mutex.unlock(self.io);
 
         // Double-check if already connected (another thread might have reconnected)
         if (self.is_connected.load(.seq_cst)) {
@@ -167,7 +170,7 @@ pub const Publisher = struct {
             const js = nats.JS.CONNECT(self.allocator, .{
                 .addr = self.nats_host,
                 .port = self.nats_port,
-            }) catch |err| {
+            }, self.io) catch |err| {
                 log.warn("Reconnect attempt {d} failed: {s}", .{ attempt + 1, @errorName(err) });
                 continue;
             };

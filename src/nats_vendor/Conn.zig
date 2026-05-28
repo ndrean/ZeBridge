@@ -5,7 +5,8 @@
 /// Manages TCP connection, message parsing, and request-reply patterns.
 pub const Conn = @This();
 
-mutex: Mutex = .{},
+mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
+io: std.Io = undefined,
 allocator: Allocator = undefined,
 client: ?*Client = null,
 line: Appendable = .{},
@@ -26,10 +27,11 @@ dump: Appendable = .{},
 
 /// Establishes a connection to the NATS server.
 /// Spawns a background thread for reading messages.
-pub fn connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
+pub fn connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts, io: std.Io) !void {
+    cn.io = io;
     {
-        cn.mutex.lock();
-        defer cn.mutex.unlock();
+        cn.mutex.lockUncancelable(cn.io);
+        defer cn.mutex.unlock(cn.io);
 
         try cn._connect(allocator, co);
     }
@@ -97,8 +99,8 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
 
 /// Disconnects from the NATS server and releases all resources.
 pub fn disconnect(cn: *Conn) void {
-    cn.mutex.lock();
-    defer cn.mutex.unlock();
+    cn.mutex.lockUncancelable(cn.io);
+    defer cn.mutex.unlock(cn.io);
 
     if (cn.client == null) {
         return;
@@ -109,8 +111,8 @@ pub fn disconnect(cn: *Conn) void {
     }
 
     cn.raiseAttention();
-    cn.pool.deinit();
-    cn.received.deinit();
+    cn.pool.deinit(cn.io);
+    cn.received.deinit(cn.io);
 
     cn.client.?.close();
 
@@ -134,9 +136,9 @@ pub fn disconnect(cn: *Conn) void {
 /// Fetches a received message from the queue with timeout.
 /// Returns Interrupted if an interrupt signal was received.
 pub fn fetch(cn: *Conn, timeout_ns: u64) error{ Interrupted, Timeout, Closed }!*AllocatedMSG {
-    if (cn.received.receive(timeout_ns)) |recvd| {
+    if (cn.received.receive(timeout_ns, cn.io)) |recvd| {
         if (recvd.*.letter.mt == .INTERRUPT) {
-            cn.pool.put(recvd);
+            cn.pool.put(recvd, cn.io);
             return error.Interrupted;
         }
         return recvd;
@@ -147,13 +149,13 @@ pub fn fetch(cn: *Conn, timeout_ns: u64) error{ Interrupted, Timeout, Closed }!*
 
 /// Sends an interrupt signal to wake up waiting operations.
 pub fn interrupt(cn: *Conn) !void {
-    const alm = try cn.pool.get(0);
+    const alm = try cn.pool.get(0, cn.io);
 
     alm.letter.prepare(.INTERRUPT);
 
     errdefer _free(alm);
 
-    try cn.received.send(alm);
+    try cn.received.send(alm, cn.io);
 }
 
 inline fn _free(alm: *AllocatedMSG) void {
@@ -162,7 +164,7 @@ inline fn _free(alm: *AllocatedMSG) void {
 
 /// Returns a message to the pool for reuse.
 pub fn reuse(cn: *Conn, msg: *AllocatedMSG) void {
-    cn.pool.put(msg);
+    cn.pool.put(msg, cn.io);
 }
 
 /// Publishes a message with optional headers.
@@ -177,8 +179,8 @@ pub fn publish(cn: *Conn, subject: []const u8, reply2: ?[]const u8, headers: ?*H
 
 /// Publishes a message without headers (PUB command).
 pub fn @"pub"(cn: *Conn, subject: []const u8, reply2: ?[]const u8, payload: ?[]const u8) !void {
-    cn.mutex.lock();
-    defer cn.mutex.unlock();
+    cn.mutex.lockUncancelable(cn.io);
+    defer cn.mutex.unlock(cn.io);
 
     var repl: []const u8 = undefined;
 
@@ -210,8 +212,8 @@ pub fn @"pub"(cn: *Conn, subject: []const u8, reply2: ?[]const u8, payload: ?[]c
 
 /// Publishes a message with headers (HPUB command).
 pub fn hpub(cn: *Conn, subject: []const u8, reply2: ?[]const u8, headers: *Headers, payload: ?[]const u8) !void {
-    cn.mutex.lock();
-    defer cn.mutex.unlock();
+    cn.mutex.lockUncancelable(cn.io);
+    defer cn.mutex.unlock(cn.io);
 
     var repl: []const u8 = undefined;
 
@@ -329,7 +331,7 @@ fn read_msg(cn: *Conn) !?*AllocatedMSG {
 // [Server=>Client].INFO .PING .PONG .OK .ERR
 // [Client=>Server].CONNECT .SUB .UNSUB .PING .PONG
 fn read_oneliner(cn: *Conn, mt: MT) !*AllocatedMSG {
-    const alm = try cn.pool.get(0);
+    const alm = try cn.pool.get(0, cn.io);
 
     alm.letter.prepare(mt);
 
@@ -365,8 +367,8 @@ fn read_MSG(cn: *Conn) !?*AllocatedMSG {
 
     const parsed = try parse.cut_tail_size(recvd);
 
-    const alm = try cn.pool.get(0);
-    errdefer cn.pool.put(alm);
+    const alm = try cn.pool.get(0, cn.io);
+    errdefer cn.pool.put(alm, cn.io);
 
     alm.letter.prepare(.MSG);
     try cn.read_buffer(&alm.letter.payload, parsed.size + 2); // ␍␊
@@ -425,8 +427,8 @@ fn read_HMSG(cn: *Conn) !?*AllocatedMSG {
 
     var parsed = try parse.cut_tail_size(recvd);
 
-    var alm = try cn.pool.get(0);
-    errdefer cn.pool.put(alm);
+    var alm = try cn.pool.get(0, cn.io);
+    errdefer cn.pool.put(alm, cn.io);
 
     alm.letter.prepare(.HMSG);
 
@@ -653,7 +655,7 @@ fn run(cn: *Conn) void {
             if (almsg == null) {
                 continue;
             }
-            if (cn.received.send(almsg.?)) |_| {
+            if (cn.received.send(almsg.?, cn.io)) |_| {
                 continue;
             } else |_| {
                 break;
@@ -684,8 +686,8 @@ fn sendHeartBit(cn: *Conn) void {
 
 /// Formats and writes a message to the connection (mutex-taking).
 pub fn printMT(cn: *Conn, comptime fmt: []const u8, args: anytype) !void {
-    cn.mutex.lock();
-    defer cn.mutex.unlock();
+    cn.mutex.lockUncancelable(cn.io);
+    defer cn.mutex.unlock(cn.io);
 
     try cn.printNMT(fmt, args);
 
@@ -694,8 +696,8 @@ pub fn printMT(cn: *Conn, comptime fmt: []const u8, args: anytype) !void {
 
 /// Writes bytes to the connection (mutex-taking).
 pub fn writeMT(cn: *Conn, buffer: []const u8) !void {
-    cn.mutex.lock();
-    defer cn.mutex.unlock();
+    cn.mutex.lockUncancelable(cn.io);
+    defer cn.mutex.unlock(cn.io);
 
     try cn.writeNMT(buffer);
     return;
@@ -703,8 +705,8 @@ pub fn writeMT(cn: *Conn, buffer: []const u8) !void {
 
 /// Writes multiple buffers using vectored I/O (mutex-taking).
 pub fn writevMT(cn: *Conn, iovecs: []posix.iovec_const) !void {
-    cn.mutex.lock();
-    defer cn.mutex.unlock();
+    cn.mutex.lockUncancelable(cn.io);
+    defer cn.mutex.unlock(cn.io);
 
     try cn.writevNMT(iovecs);
     return;
@@ -832,7 +834,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 
 const parse = @import("parse.zig");
 const protocol = @import("protocol.zig");

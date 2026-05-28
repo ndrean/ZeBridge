@@ -11,7 +11,8 @@ const PURGE_STREAM_T: []const u8 = "$JS.API.STREAM.PURGE.{s}";
 const DELETE_STREAM_T: []const u8 = "$JS.API.STREAM.DELETE.{s}";
 const INFO_STREAM_T: []const u8 = "$JS.API.STREAM.INFO.{s}";
 
-mutex: Mutex = .{},
+mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
+io: std.Io = undefined,
 allocator: Allocator = undefined,
 co: protocol.ConnectOpts = undefined,
 connection: ?*Conn = null,
@@ -20,10 +21,11 @@ jsn: Formatter = .{},
 
 /// Connects to a NATS server with JetStream support.
 /// Returns a JetStream client instance.
-pub fn CONNECT(allocator: Allocator, co: protocol.ConnectOpts) !JetStream {
+pub fn CONNECT(allocator: Allocator, co: protocol.ConnectOpts, io: std.Io) !JetStream {
     var js: JetStream = .{ .allocator = allocator };
+    js.io = io;
 
-    js.connection = try createConn(allocator, co);
+    js.connection = try createConn(allocator, co, io);
 
     js.cmd = try Formatter.init(js.allocator, 128);
     js.jsn = try Formatter.init(js.allocator, 256);
@@ -34,8 +36,8 @@ pub fn CONNECT(allocator: Allocator, co: protocol.ConnectOpts) !JetStream {
 
 /// Creates a new stream with the given configuration.
 pub fn CREATE(js: *JetStream, sc: *protocol.StreamConfig) !void {
-    js.mutex.lock();
-    defer js.mutex.unlock();
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
 
     if (js.connection == null) {
         return error.NotConnected;
@@ -53,8 +55,8 @@ pub fn CREATE(js: *JetStream, sc: *protocol.StreamConfig) !void {
 
 /// Updates an existing stream with the given configuration.
 pub fn UPDATE(js: *JetStream, sc: *protocol.StreamConfig) !void {
-    js.mutex.lock();
-    defer js.mutex.unlock();
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
 
     if (js.connection == null) {
         return error.NotConnected;
@@ -72,8 +74,8 @@ pub fn UPDATE(js: *JetStream, sc: *protocol.StreamConfig) !void {
 
 /// Purges all messages from the specified stream.
 pub fn PURGE(js: *JetStream, sname: []const u8) !void {
-    js.mutex.lock();
-    defer js.mutex.unlock();
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
 
     if (js.connection == null) {
         return error.NotConnected;
@@ -87,8 +89,8 @@ pub fn PURGE(js: *JetStream, sname: []const u8) !void {
 
 /// Deletes the specified stream.
 pub fn DELETE(js: *JetStream, sname: []const u8) !void {
-    js.mutex.lock();
-    defer js.mutex.unlock();
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
 
     if (js.connection == null) {
         return error.NotConnected;
@@ -161,8 +163,8 @@ pub const ClusterInfo = struct {
 /// Retrieves information about the specified stream.
 /// Returns parsed StreamInfoResponse with config and state details.
 pub fn INFO(js: *JetStream, sname: []const u8, request: *const StreamInfoRequest) !StreamInfoResponse {
-    js.mutex.lock();
-    defer js.mutex.unlock();
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
 
     if (js.connection == null) {
         return error.NotConnected;
@@ -226,8 +228,8 @@ pub fn jsRequest(js: *JetStream, comptime ResponseType: type, timeout_ns: u64) !
 
 /// Publishes a message to JetStream with optional headers and payload.
 pub fn PUBLISH(js: *JetStream, subject: []const u8, headers: ?*Headers, payload: ?[]const u8) !void {
-    js.mutex.lock();
-    defer js.mutex.unlock();
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
 
     if (js.connection == null) {
         return error.NotConnected;
@@ -249,8 +251,8 @@ pub fn PUBLISH(js: *JetStream, subject: []const u8, headers: ?*Headers, payload:
 
 /// Disconnects from the NATS server and releases all resources.
 pub fn DISCONNECT(js: *JetStream) void {
-    js.mutex.lock();
-    defer js.mutex.unlock();
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
 
     if (js.connection == null) {
         return;
@@ -282,12 +284,12 @@ fn process(js: *JetStream, timeout_ns: u64) !void {
 }
 
 /// Creates and connects a new connection to the NATS server.
-pub fn createConn(allocator: Allocator, co: protocol.ConnectOpts) !*Conn {
+pub fn createConn(allocator: Allocator, co: protocol.ConnectOpts, io: std.Io) !*Conn {
     const conn = try allocator.create(Conn);
     conn.* = .{};
     errdefer allocator.destroy(conn);
 
-    try conn.*.connect(allocator, co);
+    try conn.*.connect(allocator, co, io);
 
     return conn;
 }
@@ -300,7 +302,7 @@ const messages = @import("messages.zig");
 const parse = @import("parse.zig");
 
 const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 
 const Headers = messages.Headers;
 /// Re-export of the allocated message type.

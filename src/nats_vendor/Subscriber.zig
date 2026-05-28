@@ -9,7 +9,8 @@ const CREATE_SUBJECT_SUBSCRIBER: []const u8 = "$JS.API.CONSUMER.CREATE.{s}.{s}.{
 const CREATE_ALL_SUBSCRIBER: []const u8 = "$JS.API.CONSUMER.CREATE.{s}.{s}";
 const DELETE_SUBSCRIBER: []const u8 = "$JS.API.CONSUMER.DELETE.{s}.{s}";
 
-mutex: Mutex = .{},
+mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
+io: std.Io = undefined,
 allocator: Allocator = undefined,
 co: protocol.ConnectOpts = undefined,
 connection: ?*Conn = null,
@@ -23,10 +24,11 @@ subscribed: bool = false,
 
 /// Creates a subscriber for the specified stream and subject.
 /// Use ">" to subscribe to all subjects in the stream.
-pub fn SUBSCRIBE(allocator: Allocator, co: protocol.ConnectOpts, stream: []const u8, subject: []const u8) !Subscriber {
+pub fn SUBSCRIBE(allocator: Allocator, co: protocol.ConnectOpts, stream: []const u8, subject: []const u8, io: std.Io) !Subscriber {
     var sb: Subscriber = .{ .allocator = allocator };
+    sb.io = io;
 
-    sb.connection = try JetStream.createConn(allocator, co);
+    sb.connection = try JetStream.createConn(allocator, co, io);
     errdefer sb.deinit();
 
     _ = try sb.stream.init(sb.allocator, stream.len, null);
@@ -42,8 +44,8 @@ pub fn SUBSCRIBE(allocator: Allocator, co: protocol.ConnectOpts, stream: []const
 
 /// Waits for and returns the next pushed message with timeout.
 pub fn NEXT(sb: *Subscriber, timeout_ns: u64) error{ Interrupted, Closed, NotConnected, Timeout, CommunicationFailure }!*AllocatedMSG {
-    sb.mutex.lock();
-    defer sb.mutex.unlock();
+    sb.mutex.lockUncancelable(sb.io);
+    defer sb.mutex.unlock(sb.io);
 
     if (sb.connection == null) {
         return error.NotConnected;
@@ -54,8 +56,8 @@ pub fn NEXT(sb: *Subscriber, timeout_ns: u64) error{ Interrupted, Closed, NotCon
 
 /// Returns a message to the pool for reuse.
 pub fn REUSE(sb: *Subscriber, msg: *AllocatedMSG) void {
-    sb.mutex.lock();
-    defer sb.mutex.unlock();
+    sb.mutex.lockUncancelable(sb.io);
+    defer sb.mutex.unlock(sb.io);
 
     if (sb.connection == null) {
         messages.free(msg);
@@ -65,8 +67,8 @@ pub fn REUSE(sb: *Subscriber, msg: *AllocatedMSG) void {
 
 /// Unsubscribes and releases all resources.
 pub fn UNSUBSCRIBE(sb: *Subscriber) void {
-    sb.mutex.lock();
-    defer sb.mutex.unlock();
+    sb.mutex.lockUncancelable(sb.io);
+    defer sb.mutex.unlock(sb.io);
 
     if (sb.connection == null) {
         return;
@@ -224,7 +226,7 @@ const JetStream = @import("JetStream.zig");
 const Appendable = @import("Appendable.zig");
 
 const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 
 const Headers = messages.Headers;
 /// Re-export of the allocated message type.

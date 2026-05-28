@@ -77,7 +77,8 @@ fn initReplication(
 fn initNatsPublisher(
     allocator: std.mem.Allocator,
     metrics: *metrics_mod.Metrics,
-    init: *const std.process.Init.Minimal,
+    init: *const std.process.Init,
+    io: std.Io,
 ) !nats_publisher.Publisher {
     const nats_host = init.environ.getPosix("NATS_HOST") orelse blk: {
         log.info("NATS_HOST not set, using default 127.0.0.1", .{});
@@ -99,6 +100,7 @@ fn initNatsPublisher(
     var publisher = try nats_publisher.Publisher.init(
         allocator,
         .{ .url = url },
+        io,
     );
     errdefer publisher.deinit();
 
@@ -182,7 +184,8 @@ fn initReplicationStream(
     return pg_stream;
 }
 
-pub fn main(init: std.process.Init.Minimal) !void {
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
     const IS_DEBUG = builtin.mode == .Debug;
 
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -280,7 +283,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer wal_mon.deinit();
 
     // === Connect to NATS JetStream
-    var publisher = try initNatsPublisher(allocator, &metrics, &init);
+    var publisher = try initNatsPublisher(allocator, &metrics, &init, io);
     defer publisher.deinit();
 
     // Make publisher available to HTTP server for stream management
@@ -301,6 +304,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             allocator,
             &pg_config,
             monitored_tables,
+            io,
         ) catch |err| {
             log.warn("⚠️  Dictionary training failed: {} (compression will work without dictionaries)", .{err});
             // Continue without dictionaries - graceful degradation
@@ -316,6 +320,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         monitored_tables,
         parsed_args.encoding_format,
         &runtime_config,
+        io,
     );
     try snap_listener.start();
     defer snap_listener.join();
