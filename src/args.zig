@@ -18,7 +18,7 @@ pub const Args = struct {
     /// std.os.argv is the POSIX global set by the Zig runtime before main() runs;
     /// each element is a [*:0]u8 (null-terminated C string).
     pub fn parseArgs(allocator: std.mem.Allocator) !struct { args: Args, runtime_config: config.RuntimeConfig } {
-        const raw_argv = std.os.argv; // [][*:0]u8 — lives for the program lifetime
+        const raw_argv = std.posix.argv; // [][*:0]u8 — lives for the program lifetime
 
         var http_port: u16 = 6543; // default
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
