@@ -59,57 +59,21 @@ fn tryformat(frmtr: *Formatter, comptime fmt: []const u8, args: anytype) !void {
     try frmtr.formatbuf.change(frmtr.pos);
 }
 
-/// Converts a value to its JSON string representation.
-/// Automatically expands the buffer if needed.
+/// Converts a value to its JSON string representation using std.Io.Writer.Allocating.
 pub fn stringify(frmtr: *Formatter, value: anytype, options: StringifyOptions) !?[]const u8 {
-    while (true) {
-        if (frmtr.trystringify(value, options)) |_| {
-            return frmtr.formatbuf.body();
-        } else |ferr| switch (ferr) {
-            error.NoSpaceLeft => {
-                _ = try frmtr.formatbuf.alloc(frmtr.formatbuf.buffer.?.len + 256);
-                continue;
-            },
-            else => {
-                return ferr;
-            },
-        }
-    }
-}
-
-const BufWriter = struct {
-    buf: []u8,
-    pos: usize = 0,
-    const Error = error{NoSpaceLeft};
-    pub fn writeByte(self: *BufWriter, byte: u8) Error!void {
-        if (self.pos >= self.buf.len) return error.NoSpaceLeft;
-        self.buf[self.pos] = byte;
-        self.pos += 1;
-    }
-    pub fn writeAll(self: *BufWriter, bytes: []const u8) Error!void {
-        if (self.pos + bytes.len > self.buf.len) return error.NoSpaceLeft;
-        @memcpy(self.buf[self.pos..][0..bytes.len], bytes);
-        self.pos += bytes.len;
-    }
-    pub fn writeBytesNTimes(self: *BufWriter, bytes: []const u8, n: usize) Error!void {
-        for (0..n) |_| try self.writeAll(bytes);
-    }
-    pub fn print(self: *BufWriter, comptime fmt: []const u8, args: anytype) Error!void {
-        const result = std.fmt.bufPrint(self.buf[self.pos..], fmt, args) catch return error.NoSpaceLeft;
-        self.pos += result.len;
-    }
-};
-
-fn trystringify(frmtr: *Formatter, value: anytype, options: StringifyOptions) !void {
-    frmtr.pos = 0;
-    const buffer = frmtr.formatbuf.buffer.?;
-    var bw = BufWriter{ .buf = buffer };
-    json.stringify(value, options, &bw) catch |err| switch (err) {
-        error.NoSpaceLeft => return error.NoSpaceLeft,
-        else => return err,
+    const allocator = frmtr.formatbuf.allocator;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var write_stream: std.json.Stringify = .{
+        .writer = &out.writer,
+        .options = options,
     };
-    frmtr.pos = bw.pos;
-    try frmtr.formatbuf.change(frmtr.pos);
+    try write_stream.write(value);
+    const json_str = try out.toOwnedSlice();
+    defer allocator.free(json_str);
+    try frmtr.formatbuf.copy(json_str);
+    frmtr.pos = json_str.len;
+    return frmtr.formatbuf.body();
 }
 
 const std = @import("std");

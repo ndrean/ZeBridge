@@ -17,7 +17,7 @@ pub fn MailBox(comptime Letter: type) type {
         len: usize = 0,
         closed: bool = false,
         mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
-        cond: Condition = .{},
+        cond: Condition = .{ .state = 0, .epoch = 0 },
         interrupted: bool = false,
 
         /// Append a new Envelope to the tail
@@ -199,7 +199,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
         len: usize = 0,
         closed: bool = false,
         mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
-        cond: Condition = .{},
+        cond: Condition = .{ .state = 0, .epoch = 0 },
         interrupted: bool = false,
 
         /// Append a new Envelope to the tail
@@ -386,7 +386,7 @@ pub const TypeErasedMailbox = struct {
     interrupted: bool = false,
 
     mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
-    cond: Condition = .{},
+    cond: Condition = .{ .state = 0, .epoch = 0 },
 
     /// Append a node to the tail of the mailbox.
     /// Fails if mailbox is closed.
