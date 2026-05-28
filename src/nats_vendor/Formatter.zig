@@ -77,16 +77,38 @@ pub fn stringify(frmtr: *Formatter, value: anytype, options: StringifyOptions) !
     }
 }
 
+const BufWriter = struct {
+    buf: []u8,
+    pos: usize = 0,
+    const Error = error{NoSpaceLeft};
+    pub fn writeByte(self: *BufWriter, byte: u8) Error!void {
+        if (self.pos >= self.buf.len) return error.NoSpaceLeft;
+        self.buf[self.pos] = byte;
+        self.pos += 1;
+    }
+    pub fn writeAll(self: *BufWriter, bytes: []const u8) Error!void {
+        if (self.pos + bytes.len > self.buf.len) return error.NoSpaceLeft;
+        @memcpy(self.buf[self.pos..][0..bytes.len], bytes);
+        self.pos += bytes.len;
+    }
+    pub fn writeBytesNTimes(self: *BufWriter, bytes: []const u8, n: usize) Error!void {
+        for (0..n) |_| try self.writeAll(bytes);
+    }
+    pub fn print(self: *BufWriter, comptime fmt: []const u8, args: anytype) Error!void {
+        const result = std.fmt.bufPrint(self.buf[self.pos..], fmt, args) catch return error.NoSpaceLeft;
+        self.pos += result.len;
+    }
+};
+
 fn trystringify(frmtr: *Formatter, value: anytype, options: StringifyOptions) !void {
     frmtr.pos = 0;
     const buffer = frmtr.formatbuf.buffer.?;
-    const allocator = frmtr.formatbuf.allocator;
-    const json_str = try std.json.stringifyAlloc(allocator, value, options);
-    defer allocator.free(json_str);
-    if (json_str.len > buffer.len)
-        return error.NoSpaceLeft;
-    @memcpy(buffer[0..json_str.len], json_str);
-    frmtr.pos = json_str.len;
+    var bw = BufWriter{ .buf = buffer };
+    json.stringify(value, options, &bw) catch |err| switch (err) {
+        error.NoSpaceLeft => return error.NoSpaceLeft,
+        else => return err,
+    };
+    frmtr.pos = bw.pos;
     try frmtr.formatbuf.change(frmtr.pos);
 }
 

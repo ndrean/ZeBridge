@@ -20,7 +20,7 @@ subscribed: bool = false,
 next: u64 = 0,
 req_sid: u64 = 0,
 req_reply2: Formatter = .{},
-timeout_timer: std.time.Timer = undefined,
+heartbeat_ns: u64 = 0,
 allow_heartBit: bool = false,
 
 dump: Appendable = .{},
@@ -84,7 +84,7 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
     errdefer cn.disconnect();
 
     // Initialize timer before read_mt() since it calls sendHeartBit()
-    cn.timeout_timer = std.time.Timer.start() catch unreachable;
+    cn.heartbeat_ns = nanoNow();
 
     const mt = try cn.read_mt();
 
@@ -587,7 +587,7 @@ pub fn nextSidNMT(cn: *Conn) u64 {
 pub fn waitMessageNMT(cn: *Conn, timeout_ns: u64, subject: ?[]const u8) error{ CommunicationFailure, Interrupted, Closed, NotConnected, Timeout }!*AllocatedMSG {
     _ = subject;
 
-    var timeout_timer_local = std.time.Timer.start() catch unreachable;
+    const timeout_start = nanoNow();
 
     var local_timeout_ns = timeout_ns;
 
@@ -626,7 +626,7 @@ pub fn waitMessageNMT(cn: *Conn, timeout_ns: u64, subject: ?[]const u8) error{ C
             },
         }
 
-        const elapsed = timeout_timer_local.read();
+        const elapsed = nanoNow() - timeout_start;
 
         if (elapsed > timeout_ns)
             return error.Timeout;
@@ -671,12 +671,12 @@ fn run(cn: *Conn) void {
 const DefaultHeartBitTimeOut = 1 * protocol.SECNS;
 
 fn sendHeartBit(cn: *Conn) void {
-    const elapsed = cn.timeout_timer.read();
+    const elapsed = nanoNow() - cn.heartbeat_ns;
     if (elapsed > DefaultHeartBitTimeOut) {
         if (cn.allow_heartBit) {
             cn.ping() catch {};
         }
-        cn.timeout_timer.reset();
+        cn.heartbeat_ns = nanoNow();
     }
 }
 
@@ -832,6 +832,13 @@ pub fn newInbox() [36]u8 {
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const c_time = @cImport(@cInclude("time.h"));
+
+fn nanoNow() u64 {
+    var ts: c_time.struct_timespec = undefined;
+    _ = c_time.clock_gettime(c_time.CLOCK_MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+}
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
 const Mutex = std.Io.Mutex;
