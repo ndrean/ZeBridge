@@ -7,6 +7,7 @@ const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const Conf = @import("config.zig");
+const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.wal_stream);
 
@@ -66,7 +67,7 @@ pub const ReplicationStream = struct {
         const lsn = start_lsn orelse "0/0";
 
         // Build START_REPLICATION command
-        const query = try std.fmt.allocPrintZ(
+        const query = try utils.allocPrintZ(
             self.allocator,
             "START_REPLICATION SLOT {s} LOGICAL {s} (proto_version '1', publication_names '{s}', binary 'true')",
             .{ self.config.slot_name, lsn, self.config.publication_name },

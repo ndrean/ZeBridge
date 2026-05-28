@@ -19,6 +19,7 @@ const zstd = @import("zstd");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
 const dictionaries_cache = @import("dictionaries_cache.zig");
 const nats = @import("nats");
+const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.snapshot_listener);
 
@@ -120,7 +121,7 @@ fn getTablePrimaryKey(
     }
 
     // Query system catalogs for primary key column
-    const query = try std.fmt.allocPrintZ(
+    const query = try utils.allocPrintZ(
         allocator,
         \\SELECT a.attname, format_type(a.atttypid, a.atttypmod)
         \\FROM pg_index i
@@ -409,7 +410,7 @@ pub const SnapshotListener = struct {
         try in_clause.appendSlice(allocator, ")");
 
         // Query information_schema
-        const query = try std.fmt.allocPrintZ(
+        const query = try utils.allocPrintZ(
             allocator,
             \\SELECT
             \\    t.table_schema,
@@ -799,7 +800,7 @@ pub const SnapshotListener = struct {
             else
                 try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
 
-            const copy_query = try std.fmt.allocPrintZ(
+            const copy_query = try utils.allocPrintZ(
                 chunk_alloc,
                 "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
                 .{ table_name, where_clause, pk.name, chunk_size },
@@ -1557,7 +1558,7 @@ fn generateIncrementalSnapshot(
         else
             try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
 
-        const copy_query = try std.fmt.allocPrintZ(
+        const copy_query = try utils.allocPrintZ(
             chunk_alloc,
             "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
             .{ table_name, where_clause, pk.name, chunk_size },

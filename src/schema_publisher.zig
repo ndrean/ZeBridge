@@ -22,6 +22,7 @@ const encoder_mod = @import("encoder.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
+const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.schema_publisher);
 
@@ -59,7 +60,7 @@ pub fn publishSchema(
     });
 
     // Build subject: init.schema.{table_name} (matches INIT stream with init.> pattern)
-    const subject = try std.fmt.allocPrintZ(
+    const subject = try std.fmt.allocPrint(
         allocator,
         "init.schema.{s}",
         .{relation.name},
@@ -172,7 +173,7 @@ pub fn publishInitialSchemas(
     try in_clause.appendSlice(allocator, ")");
 
     // Query information_schema for monitored tables only
-    const query = try std.fmt.allocPrintZ(
+    const query = try utils.allocPrintZ(
         allocator,
         \\SELECT
         \\    t.table_schema,

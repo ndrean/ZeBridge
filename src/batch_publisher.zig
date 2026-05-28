@@ -872,7 +872,7 @@ pub const BatchPublisher = struct {
             );
             defer self.allocator.free(batch_msg_id);
 
-            const batch_subject = try std.fmt.allocPrintZ(
+            const batch_subject = try std.fmt.allocPrint(
                 flush_alloc,
                 "{s}.batch",
                 .{first_event.getSubject()},

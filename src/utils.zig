@@ -45,6 +45,17 @@ pub inline fn civilFromDays(z: i64) struct { year: i32, month: u8, day: u8 } {
     };
 }
 
+/// std.fmt.allocPrintZ was removed in Zig 0.16; this is a drop-in replacement
+/// that allocates a null-terminated C string from a format string.
+pub fn allocPrintZ(allocator: std.mem.Allocator, comptime fmt_str: []const u8, args: anytype) ![:0]u8 {
+    const s = try std.fmt.allocPrint(allocator, fmt_str, args);
+    defer allocator.free(s);
+    const buf = try allocator.alloc(u8, s.len + 1);
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return buf[0..s.len :0];
+}
+
 pub fn byteToHex(out: []u8, byte: u8) void {
     out[0] = toHexDigit(@as(u8, byte >> 4));
     out[1] = toHexDigit(@as(u8, byte & 0x0F));

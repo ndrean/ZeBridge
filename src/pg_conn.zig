@@ -5,6 +5,7 @@ const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const Config = @import("config.zig");
+const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.pg_conn);
 
@@ -36,15 +37,15 @@ pub const PgConf = struct {
     ///
     /// Caller is responsible for freeing the returned string
     pub fn connInfo(self: *const PgConf, allocator: std.mem.Allocator, replication: bool) ![:0]const u8 {
-        // allocPrintZ produces a null-terminated [:0]u8 slice suitable for C APIs
+        // null-terminated [:0]u8 slice suitable for C APIs (e.g. PQconnectdb)
         return if (replication)
-            try std.fmt.allocPrintZ(
+            try utils.allocPrintZ(
                 allocator,
                 "host={s} port={d} user={s} password={s} dbname={s} replication=database",
                 .{ self.host, self.port, self.user, self.password, self.database },
             )
         else
-            try std.fmt.allocPrintZ(
+            try utils.allocPrintZ(
                 allocator,
                 "host={s} port={d} user={s} password={s} dbname={s}",
                 .{ self.host, self.port, self.user, self.password, self.database },

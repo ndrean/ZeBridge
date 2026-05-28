@@ -11,6 +11,7 @@ const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
+const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.replication_setup);
 
@@ -70,7 +71,7 @@ pub const ReplicationSetup = struct {
         defer c.PQfinish(conn);
 
         // Check if slot exists
-        const check_query = try std.fmt.allocPrintZ(
+        const check_query = try utils.allocPrintZ(
             self.allocator,
             "SELECT slot_name FROM pg_replication_slots WHERE slot_name = '{s}'",
             .{slot_name},
@@ -92,7 +93,7 @@ pub const ReplicationSetup = struct {
         }
 
         // Try to create the slot
-        const create_query = try std.fmt.allocPrintZ(
+        const create_query = try utils.allocPrintZ(
             self.allocator,
             "SELECT pg_create_logical_replication_slot('{s}', 'pgoutput')",
             .{slot_name},
@@ -149,7 +150,7 @@ pub const ReplicationSetup = struct {
         defer c.PQfinish(conn);
 
         // Query publication and its tables
-        const check_query = try std.fmt.allocPrintZ(
+        const check_query = try utils.allocPrintZ(
             self.allocator,
             \\SELECT
             \\  p.pubname,
@@ -231,7 +232,7 @@ pub const ReplicationSetup = struct {
     pub fn dropSlot(self: *const ReplicationSetup, slot_name: []const u8) !void {
         log.info("Dropping replication slot '{s}'...", .{slot_name});
 
-        const query = try std.fmt.allocPrintZ(
+        const query = try utils.allocPrintZ(
             self.allocator,
             "SELECT pg_drop_replication_slot('{s}')",
             .{slot_name},

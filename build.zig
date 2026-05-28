@@ -5,7 +5,7 @@ fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
     // Check if vendored libpq exists
     const vendored_libpq_exists = blk: {
         const root = b.build_root.path orelse break :blk false;
-        const check_path = std.fmt.allocPrintZ(
+        const check_path = std.fmt.allocPrint(
             b.allocator,
             "{s}/libs/libpq-install/lib/libpq.a",
             .{root},
