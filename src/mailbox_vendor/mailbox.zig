@@ -85,7 +85,7 @@ pub fn MailBox(comptime Letter: type) type {
 
                 const local_timeout_ns = timeout_ns - elapsed;
                 mbox.mutex.unlock(io);
-                utils.sleep(@min(local_timeout_ns, std.time.ns_per_ms));
+                sleep(@min(local_timeout_ns, std.time.ns_per_ms));
                 mbox.mutex.lockUncancelable(io);
             }
 
@@ -267,7 +267,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
 
                 const local_timeout_ns = timeout_ns - elapsed;
                 mbox.mutex.unlock(io);
-                utils.sleep(@min(local_timeout_ns, std.time.ns_per_ms));
+                sleep(@min(local_timeout_ns, std.time.ns_per_ms));
                 mbox.mutex.lockUncancelable(io);
             }
 
@@ -445,7 +445,7 @@ pub const TypeErasedMailbox = struct {
 
             const local_timeout_ns = timeout_ns - elapsed;
             mbox.mutex.unlock(io);
-            utils.sleep(@min(local_timeout_ns, std.time.ns_per_ms));
+            sleep(@min(local_timeout_ns, std.time.ns_per_ms));
             mbox.mutex.lockUncancelable(io);
         }
 
@@ -494,6 +494,15 @@ pub const TypeErasedMailbox = struct {
 };
 
 const std = @import("std");
-const utils = @import("utils.zig");
 const Mutex = std.Io.Mutex;
 const Condition = std.Io.Condition;
+
+const c_time = @cImport(@cInclude("time.h"));
+
+fn sleep(ns: u64) void {
+    var ts = c_time.struct_timespec{
+        .tv_sec = @as(c_time.time_t, @intCast(ns / std.time.ns_per_s)),
+        .tv_nsec = @as(c_long, @intCast(ns % std.time.ns_per_s)),
+    };
+    _ = c_time.nanosleep(&ts, null);
+}
