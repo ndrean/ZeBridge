@@ -16,9 +16,9 @@ pub const Args = struct {
     ///
     /// Zig 0.16 "Juicy Main": args and environ are received via std.process.Init
     /// passed from main(). init.args.iterate() replaces the removed argsWithAllocator/argsAlloc.
-    /// init.environ.getPosix() replaces the removed std.process.getEnvVarOwned().
+    /// init.minimal.environ.getPosix() replaces the removed std.process.getEnvVarOwned().
     pub fn parseArgs(allocator: std.mem.Allocator, init: *const std.process.Init) !struct { args: Args, runtime_config: config.RuntimeConfig } {
-        var args_iter = init.args.iterate();
+        var args_iter = init.minimal.args.iterate();
         _ = args_iter.next(); // skip argv[0] (program name)
 
         var http_port: u16 = 6543; // default
@@ -64,14 +64,14 @@ pub const Args = struct {
         // Read PostgreSQL configuration from environment variables via Juicy Main environ.
         // getPosix() returns a slice into the environ block (valid for program lifetime).
         // We dupe strings that RuntimeConfig.deinit() will free, matching previous semantics.
-        runtime_config.pg_host = if (init.environ.getPosix("PG_HOST")) |val|
+        runtime_config.pg_host = if (init.minimal.environ.getPosix("PG_HOST")) |val|
             try allocator.dupe(u8, val)
         else blk: {
             log.info("PG_HOST not set, using default: {s}", .{runtime_config.pg_host});
             break :blk runtime_config.pg_host;
         };
 
-        if (init.environ.getPosix("PG_PORT")) |port_str| {
+        if (init.minimal.environ.getPosix("PG_PORT")) |port_str| {
             runtime_config.pg_port = std.fmt.parseInt(u16, port_str, 10) catch |err| blk: {
                 log.warn("Invalid PG_PORT value '{s}' ({any}), using default: {d}", .{ port_str, err, runtime_config.pg_port });
                 break :blk runtime_config.pg_port;
@@ -81,7 +81,7 @@ pub const Args = struct {
         }
 
         // Priority: POSTGRES_BRIDGE_USER > PG_USER > default
-        runtime_config.pg_user = if (init.environ.getPosix("POSTGRES_BRIDGE_USER") orelse init.environ.getPosix("PG_USER")) |val|
+        runtime_config.pg_user = if (init.minimal.environ.getPosix("POSTGRES_BRIDGE_USER") orelse init.minimal.environ.getPosix("PG_USER")) |val|
             try allocator.dupe(u8, val)
         else blk: {
             log.info("POSTGRES_BRIDGE_USER and PG_USER not set, using default: {s}", .{runtime_config.pg_user});
@@ -89,14 +89,14 @@ pub const Args = struct {
         };
 
         // Priority: POSTGRES_BRIDGE_PASSWORD > PG_PASSWORD > default
-        runtime_config.pg_password = if (init.environ.getPosix("POSTGRES_BRIDGE_PASSWORD") orelse init.environ.getPosix("PG_PASSWORD")) |val|
+        runtime_config.pg_password = if (init.minimal.environ.getPosix("POSTGRES_BRIDGE_PASSWORD") orelse init.minimal.environ.getPosix("PG_PASSWORD")) |val|
             try allocator.dupe(u8, val)
         else blk: {
             log.info("POSTGRES_BRIDGE_PASSWORD and PG_PASSWORD not set, using default", .{});
             break :blk runtime_config.pg_password;
         };
 
-        runtime_config.pg_database = if (init.environ.getPosix("PG_DB")) |val|
+        runtime_config.pg_database = if (init.minimal.environ.getPosix("PG_DB")) |val|
             try allocator.dupe(u8, val)
         else blk: {
             log.info("PG_DB not set, using default: {s}", .{runtime_config.pg_database});
@@ -104,7 +104,7 @@ pub const Args = struct {
         };
 
         // Parse BASE_BUF environment variable (log2 of buffer size)
-        if (init.environ.getPosix("BASE_BUF")) |buf_log2_str| {
+        if (init.minimal.environ.getPosix("BASE_BUF")) |buf_log2_str| {
             if (std.fmt.parseInt(u6, buf_log2_str, 10)) |buf_log2| {
                 if (buf_log2 >= 10 and buf_log2 <= 20) {
                     const buf_size = @as(usize, 1) << @intCast(buf_log2);
@@ -135,7 +135,7 @@ pub const Args = struct {
         }
 
         // Parse RING_BUFFER_COUNT environment variable
-        if (init.environ.getPosix("RING_BUFFER_COUNT")) |count_str| {
+        if (init.minimal.environ.getPosix("RING_BUFFER_COUNT")) |count_str| {
             if (std.fmt.parseInt(usize, count_str, 10)) |count| {
                 if (count >= 1024 and count <= 1024 * 1024) {
                     runtime_config.batch_ring_buffer_size = count;
@@ -171,7 +171,7 @@ pub const Args = struct {
         var rules = config.EventClassification.TransitionRules.init(allocator);
         errdefer rules.deinit();
 
-        const rules_str = init.environ.getPosix("TRANSITION_RULES") orelse return rules;
+        const rules_str = init.minimal.environ.getPosix("TRANSITION_RULES") orelse return rules;
 
         if (rules_str.len == 0) {
             log.info("TRANSITION_RULES is empty, no transition detection configured", .{});

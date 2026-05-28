@@ -80,12 +80,12 @@ fn initNatsPublisher(
     init: *const std.process.Init,
     io: std.Io,
 ) !nats_publisher.Publisher {
-    const nats_host = init.environ.getPosix("NATS_HOST") orelse blk: {
+    const nats_host = init.minimal.environ.getPosix("NATS_HOST") orelse blk: {
         log.info("NATS_HOST not set, using default 127.0.0.1", .{});
         break :blk "127.0.0.1";
     };
-    const nats_user = init.environ.getPosix("NATS_BRIDGE_USER");
-    const nats_password = init.environ.getPosix("NATS_BRIDGE_PASSWORD");
+    const nats_user = init.minimal.environ.getPosix("NATS_BRIDGE_USER");
+    const nats_password = init.minimal.environ.getPosix("NATS_BRIDGE_PASSWORD");
 
     const url = if (nats_user != null and nats_password != null) blk: {
         log.info("NATS authentication enabled for user: {s}", .{nats_user.?});
