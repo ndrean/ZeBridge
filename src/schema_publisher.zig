@@ -51,7 +51,7 @@ pub fn publishSchema(
     allocator: std.mem.Allocator,
     format: encoder_mod.Format,
 ) !void {
-    const schema_version = std.time.timestamp();
+    const schema_version = @divFloor(std.time.milliTimestamp(), 1000);
 
     log.info("📋 Publishing schema for table '{s}' (relation_id={d}, version={d})", .{
         relation.name,

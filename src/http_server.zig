@@ -1,6 +1,5 @@
 const std = @import("std");
-const c_imports = @import("c_imports.zig");
-const c = c_imports.c;
+const posix = std.posix;
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
 
@@ -9,7 +8,6 @@ pub const log = std.log.scoped(.http_server);
 /// Simple HTTP server for health checks and basic control
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    address: std.net.Address,
     port: u16,
     should_stop: *std.atomic.Value(bool),
     metrics: ?*metrics_mod.Metrics,
@@ -25,7 +23,6 @@ pub const Server = struct {
     ) !Server {
         return Server{
             .allocator = allocator,
-            .address = try std.net.Address.parseIp4("0.0.0.0", port),
             .port = port,
             .should_stop = should_stop,
             .metrics = metrics,
@@ -52,16 +49,24 @@ pub const Server = struct {
 
     /// Deinit - cleanup resources (call after join)
     pub fn deinit(self: *Server) void {
-        // No resources to clean up currently
         _ = self;
     }
 
     /// Run the HTTP server (in a separate thread)
     pub fn run(self: *Server) !void {
-        var server = try self.address.listen(.{
-            .reuse_address = true,
-        });
-        defer server.deinit();
+        const sock_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        defer posix.close(sock_fd);
+
+        const one: i32 = 1;
+        try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+
+        var addr = std.mem.zeroes(posix.sockaddr.in);
+        addr.family = posix.AF.INET;
+        addr.port = std.mem.nativeToBig(u16, self.port);
+        // addr.addr = 0 is INADDR_ANY (already zeroed)
+
+        try posix.bind(sock_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+        try posix.listen(sock_fd, 128);
 
         log.info("✅ HTTP server listening on http://0.0.0.0:{d}", .{self.port});
         log.info("ℹ️ Available endpoints:", .{});
@@ -73,16 +78,16 @@ pub const Server = struct {
 
         while (!self.should_stop.load(.seq_cst)) {
             // Poll with timeout to allow checking shutdown flag
-            var poll_fds = [_]std.posix.pollfd{
+            var poll_fds = [_]posix.pollfd{
                 .{
-                    .fd = server.stream.handle,
-                    .events = std.posix.POLL.IN,
+                    .fd = sock_fd,
+                    .events = posix.POLL.IN,
                     .revents = 0,
                 },
             };
 
             // Poll with 100ms timeout
-            const ready = std.posix.poll(&poll_fds, 100) catch |err| {
+            const ready = posix.poll(&poll_fds, 100) catch |err| {
                 log.err("⚠️ Poll error: {}", .{err});
                 std.Thread.sleep(100 * std.time.ns_per_ms);
                 continue;
@@ -93,27 +98,24 @@ pub const Server = struct {
                 continue;
             }
 
-            const conn = server.accept() catch |err| {
+            const client_fd = posix.accept(sock_fd, null, null) catch |err| {
                 log.err("🔴 Failed to accept connection: {}", .{err});
                 continue;
             };
-            defer conn.stream.close();
+            defer posix.close(client_fd);
 
-            self.handleRequest(conn.stream) catch |err| {
+            self.handleRequest(client_fd) catch |err| {
                 log.warn("⚠️ Error handling request: {}", .{err});
             };
         }
 
         log.info("👋 HTTP server stopped", .{});
-
-        // REMOVED: nats_ReleaseThreadMemory() no longer needed with pure Zig NATS
-        // Pure Zig NATS doesn't have thread-local storage that needs cleanup
     }
 
-    fn handleRequest(self: *Server, stream: std.net.Stream) !void {
+    fn handleRequest(self: *Server, fd: posix.fd_t) !void {
         var buffer: [2048]u8 = undefined;
 
-        const bytes_read = try stream.read(&buffer);
+        const bytes_read = try posix.read(fd, &buffer);
         if (bytes_read == 0) return;
 
         const request = buffer[0..bytes_read];
@@ -130,22 +132,22 @@ pub const Server = struct {
 
         // Route
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
-            try self.handleHealth(stream);
+            try self.handleHealth(fd);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/status")) {
-            try self.handleStatus(stream);
+            try self.handleStatus(fd);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
-            try self.handleMetrics(stream);
+            try self.handleMetrics(fd);
         } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/shutdown")) {
-            try self.handleShutdown(stream);
+            try self.handleShutdown(fd);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/streams/info")) {
-            try self.handleStreamInfo(stream, path);
+            try self.handleStreamInfo(fd, path);
         } else {
-            try self.handleNotFound(stream);
+            try self.handleNotFound(fd);
         }
     }
 
     fn sendResponse(
-        stream: std.net.Stream,
+        fd: posix.fd_t,
         status: []const u8,
         content_type: []const u8,
         body: []const u8,
@@ -160,21 +162,26 @@ pub const Server = struct {
             \\{s}
         , .{ status, content_type, body.len, body });
 
-        _ = try stream.writeAll(response);
+        var pos: usize = 0;
+        while (pos < response.len) {
+            const n = try posix.write(fd, response[pos..]);
+            if (n == 0) return;
+            pos += n;
+        }
     }
 
     // handlers ----------------------------------------------------
-    fn handleHealth(self: *Server, stream: std.net.Stream) !void {
+    fn handleHealth(self: *Server, fd: posix.fd_t) !void {
         _ = self;
         try sendResponse(
-            stream,
+            fd,
             "200 OK",
             "application/json",
             "{\"status\":\"ok\"}\n",
         );
     }
 
-    fn handleStatus(self: *Server, stream: std.net.Stream) !void {
+    fn handleStatus(self: *Server, fd: posix.fd_t) !void {
         if (self.metrics) |m| {
             // Get metrics snapshot
             const snap = try m.snapshot(self.allocator);
@@ -197,7 +204,6 @@ pub const Server = struct {
                 \\  "wal_lag_mb": {d},
                 \\  "queue_usage_percent": {d}
                 \\}}
-                \\
             , .{
                 if (snap.is_connected) "connected" else "disconnected",
                 snap.uptime_seconds,
@@ -214,7 +220,7 @@ pub const Server = struct {
             });
 
             try sendResponse(
-                stream,
+                fd,
                 "200 OK",
                 "application/json",
                 status_json,
@@ -222,7 +228,7 @@ pub const Server = struct {
         } else {
             // Fallback if no metrics available
             try sendResponse(
-                stream,
+                fd,
                 "200 OK",
                 "application/json",
                 "{\"status\":\"no_metrics\"}\n",
@@ -230,7 +236,7 @@ pub const Server = struct {
         }
     }
 
-    fn handleMetrics(self: *Server, stream: std.net.Stream) !void {
+    fn handleMetrics(self: *Server, fd: posix.fd_t) !void {
         if (self.metrics) |m| {
             // Get metrics snapshot
             const snap = try m.snapshot(self.allocator);
@@ -293,7 +299,7 @@ pub const Server = struct {
             });
 
             try sendResponse(
-                stream,
+                fd,
                 "200 OK",
                 "text/plain",
                 prom_metrics,
@@ -301,7 +307,7 @@ pub const Server = struct {
         } else {
             // Empty metrics if not available
             try sendResponse(
-                stream,
+                fd,
                 "200 OK",
                 "text/plain;",
                 "# ⚠️ No metrics available\n",
@@ -309,24 +315,24 @@ pub const Server = struct {
         }
     }
 
-    fn handleShutdown(self: *Server, stream: std.net.Stream) !void {
+    fn handleShutdown(self: *Server, fd: posix.fd_t) !void {
         log.info("👋 Shutdown requested via HTTP", .{});
 
         // Set shutdown flag
         self.should_stop.store(true, .seq_cst);
 
         try sendResponse(
-            stream,
+            fd,
             "200 OK",
             "text/plain",
             "Shutdown initiated\n",
         );
     }
 
-    fn handleNotFound(self: *Server, stream: std.net.Stream) !void {
+    fn handleNotFound(self: *Server, fd: posix.fd_t) !void {
         _ = self;
         try sendResponse(
-            stream,
+            fd,
             "404 Not Found",
             "text/plain",
             "Not Found\n",
@@ -351,10 +357,10 @@ pub const Server = struct {
         return null;
     }
 
-    fn handleStreamInfo(self: *Server, stream: std.net.Stream, path: []const u8) !void {
+    fn handleStreamInfo(self: *Server, fd: posix.fd_t, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
             try sendResponse(
-                stream,
+                fd,
                 "400 Bad Request",
                 "text/plain",
                 "⚠️ Missing 'stream' parameter\n",
@@ -367,21 +373,21 @@ pub const Server = struct {
             const info = publisher.getStreamInfo(stream_name) catch |err| {
                 var err_buf: [256]u8 = undefined;
                 const err_msg = try std.fmt.bufPrint(&err_buf, "Failed to get stream info: {}\n", .{err});
-                try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
+                try sendResponse(fd, "500 Internal Server Error", "text/plain", err_msg);
                 return;
             };
             defer self.allocator.free(info);
 
-            try sendResponse(stream, "200 OK", "application/json", info);
+            try sendResponse(fd, "200 OK", "application/json", info);
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
+            try sendResponse(fd, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
         }
     }
 
-    fn handleStreamPurge(self: *Server, stream: std.net.Stream, path: []const u8) !void {
+    fn handleStreamPurge(self: *Server, fd: posix.fd_t, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
             try sendResponse(
-                stream,
+                fd,
                 "400 Bad Request",
                 "text/plain",
                 "⚠️ Missing 'stream' parameter\n",
@@ -393,15 +399,15 @@ pub const Server = struct {
             publisher.purgeStream(stream_name) catch |err| {
                 var err_buf: [256]u8 = undefined;
                 const err_msg = try std.fmt.bufPrint(&err_buf, "⚠️ Failed to purge stream: {}\n", .{err});
-                try sendResponse(stream, "500 Internal Server Error", "text/plain", err_msg);
+                try sendResponse(fd, "500 Internal Server Error", "text/plain", err_msg);
                 return;
             };
 
             var response_buf: [256]u8 = undefined;
             const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' purged\n", .{stream_name});
-            try sendResponse(stream, "200 OK", "text/plain", response);
+            try sendResponse(fd, "200 OK", "text/plain", response);
         } else {
-            try sendResponse(stream, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
+            try sendResponse(fd, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
         }
     }
 };
