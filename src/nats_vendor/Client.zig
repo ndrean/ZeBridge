@@ -280,7 +280,6 @@ const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
 const net = std.net;
 const posix = std.posix;
-const io = std.io;
 const Stream = net.Stream;
 const Socket = posix.socket_t;
 const Allocator = std.mem.Allocator;

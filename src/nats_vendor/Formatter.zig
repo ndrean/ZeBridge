@@ -80,11 +80,13 @@ pub fn stringify(frmtr: *Formatter, value: anytype, options: StringifyOptions) !
 fn trystringify(frmtr: *Formatter, value: anytype, options: StringifyOptions) !void {
     frmtr.pos = 0;
     const buffer = frmtr.formatbuf.buffer.?;
-    var fbs = std.io.fixedBufferStream(buffer);
-    json.stringify(value, options, fbs.writer()) catch |err| switch (err) {
-        error.NoSpaceLeft => return error.NoSpaceLeft,
-    };
-    frmtr.pos = fbs.pos;
+    const allocator = frmtr.formatbuf.allocator;
+    const json_str = try std.json.stringifyAlloc(allocator, value, options);
+    defer allocator.free(json_str);
+    if (json_str.len > buffer.len)
+        return error.NoSpaceLeft;
+    @memcpy(buffer[0..json_str.len], json_str);
+    frmtr.pos = json_str.len;
     try frmtr.formatbuf.change(frmtr.pos);
 }
 

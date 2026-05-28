@@ -20,7 +20,7 @@ subscribed: bool = false,
 next: u64 = 0,
 req_sid: u64 = 0,
 req_reply2: Formatter = .{},
-heartbeat_start: std.time.Instant = undefined,
+timeout_timer: std.time.Timer = undefined,
 allow_heartBit: bool = false,
 
 dump: Appendable = .{},
@@ -84,7 +84,7 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
     errdefer cn.disconnect();
 
     // Initialize timer before read_mt() since it calls sendHeartBit()
-    cn.heartbeat_start = std.time.Instant.now() catch unreachable;
+    cn.timeout_timer = std.time.Timer.start() catch unreachable;
 
     const mt = try cn.read_mt();
 
@@ -587,7 +587,7 @@ pub fn nextSidNMT(cn: *Conn) u64 {
 pub fn waitMessageNMT(cn: *Conn, timeout_ns: u64, subject: ?[]const u8) error{ CommunicationFailure, Interrupted, Closed, NotConnected, Timeout }!*AllocatedMSG {
     _ = subject;
 
-    var timeout_start = std.time.Instant.now() catch unreachable;
+    var timeout_timer_local = std.time.Timer.start() catch unreachable;
 
     var local_timeout_ns = timeout_ns;
 
@@ -626,7 +626,7 @@ pub fn waitMessageNMT(cn: *Conn, timeout_ns: u64, subject: ?[]const u8) error{ C
             },
         }
 
-        const elapsed = (std.time.Instant.now() catch unreachable).since(timeout_start);
+        const elapsed = timeout_timer_local.read();
 
         if (elapsed > timeout_ns)
             return error.Timeout;
@@ -671,12 +671,12 @@ fn run(cn: *Conn) void {
 const DefaultHeartBitTimeOut = 1 * protocol.SECNS;
 
 fn sendHeartBit(cn: *Conn) void {
-    const elapsed = (std.time.Instant.now() catch unreachable).since(cn.heartbeat_start);
+    const elapsed = cn.timeout_timer.read();
     if (elapsed > DefaultHeartBitTimeOut) {
         if (cn.allow_heartBit) {
             cn.ping() catch {};
         }
-        cn.heartbeat_start = std.time.Instant.now() catch unreachable;
+        cn.timeout_timer.reset();
     }
 }
 
