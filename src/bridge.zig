@@ -151,7 +151,7 @@ fn initReplicationStream(
     return pg_stream;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const IS_DEBUG = builtin.mode == .Debug;
 
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -175,7 +175,7 @@ pub fn main() !void {
     const snap_base_alloc = if (IS_DEBUG) allocator else std.heap.c_allocator;
 
     // Parse command-line arguments and build runtime config
-    const parsed = try args.Args.parseArgs(allocator);
+    const parsed = try args.Args.parseArgs(allocator, &init);
     const parsed_args = parsed.args;
     var runtime_config = parsed.runtime_config;
     defer runtime_config.deinit(allocator);
@@ -310,7 +310,7 @@ pub fn main() !void {
     // === Parse transition rules from environment variable
     // Format: "table1:col1,col2;table2:col3,col4"
     // Example: "users:status,kyc_level;orders:state,payment_status"
-    var transition_rules = try args.Args.parseTransitionRules(allocator);
+    var transition_rules = try args.Args.parseTransitionRules(allocator, &init);
     defer args.Args.deinitTransitionRules(&transition_rules, allocator);
 
     // === Initialize EventProcessor (in this main thread, the CDC processing)

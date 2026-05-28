@@ -356,13 +356,7 @@ pub const RuntimeConfig = struct {
 
 /// Get default log level based on environment
 pub fn getDefaultLogLevel() std.log.Level {
-    const env_log = std.process.getEnvVarOwned(
-        std.heap.page_allocator,
-        "LOG_LEVEL",
-    ) catch null;
-    defer if (env_log) |e| std.heap.page_allocator.free(e);
-
-    if (env_log) |level_str| {
+    if (std.posix.getenv("LOG_LEVEL")) |level_str| {
         if (std.mem.eql(u8, level_str, "debug")) return .debug;
         if (std.mem.eql(u8, level_str, "info")) return .info;
         if (std.mem.eql(u8, level_str, "warn")) return .warn;

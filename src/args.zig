@@ -12,13 +12,14 @@ pub const Args = struct {
     encoding_format: encoder.Format,
     enable_compression: bool,
 
-    /// Parse command-line arguments and create RuntimeConfig
-    /// Returns both the CLI args and the merged runtime configuration
-    /// std.process.argsWithAllocator/argsAlloc were removed in Zig 0.16.
-    /// std.os.argv is the POSIX global set by the Zig runtime before main() runs;
-    /// each element is a [*:0]u8 (null-terminated C string).
-    pub fn parseArgs(allocator: std.mem.Allocator) !struct { args: Args, runtime_config: config.RuntimeConfig } {
-        const raw_argv = std.posix.argv; // [][*:0]u8 — lives for the program lifetime
+    /// Parse command-line arguments and create RuntimeConfig.
+    ///
+    /// Zig 0.16 "Juicy Main": args and environ are received via std.process.Init.Minimal
+    /// passed from main(). init.args.iterate() replaces the removed argsWithAllocator/argsAlloc.
+    /// init.environ.getPosix() replaces the removed std.process.getEnvVarOwned().
+    pub fn parseArgs(allocator: std.mem.Allocator, init: *const std.process.Init.Minimal) !struct { args: Args, runtime_config: config.RuntimeConfig } {
+        var args_iter = init.args.iterate();
+        _ = args_iter.next(); // skip argv[0] (program name)
 
         var http_port: u16 = 6543; // default
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
@@ -26,23 +27,18 @@ pub const Args = struct {
         var encoding_format: encoder.Format = .msgpack; // default
         var enable_compression: bool = false; // default: disabled
 
-        var i: usize = 1; // raw_argv[0] is the program name
-        while (i < raw_argv.len) : (i += 1) {
-            const arg = std.mem.span(raw_argv[i]); // [*:0]u8 → []u8
+        while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--port")) {
-                i += 1;
-                if (i < raw_argv.len) {
-                    http_port = std.fmt.parseInt(u16, std.mem.span(raw_argv[i]), 10) catch {
+                if (args_iter.next()) |value| {
+                    http_port = std.fmt.parseInt(u16, value, 10) catch {
                         log.err("--port requires a valid port number (1-65535)", .{});
                         return error.InvalidArguments;
                     };
                 }
             } else if (std.mem.eql(u8, arg, "--slot")) {
-                i += 1;
-                if (i < raw_argv.len) slot_name = std.mem.span(raw_argv[i]);
+                if (args_iter.next()) |value| slot_name = value;
             } else if (std.mem.eql(u8, arg, "--pub")) {
-                i += 1;
-                if (i < raw_argv.len) publication_name = std.mem.span(raw_argv[i]);
+                if (args_iter.next()) |value| publication_name = value;
             } else if (std.mem.eql(u8, arg, "--json")) {
                 encoding_format = .json;
             } else if (std.mem.eql(u8, arg, "--zstd")) {
@@ -65,51 +61,52 @@ pub const Args = struct {
         runtime_config.publication_name = publication_name;
         runtime_config.enable_compression = enable_compression;
 
-        // Read PostgreSQL configuration from environment variables
-        // Priority: POSTGRES_BRIDGE_* > PG_* > defaults
-        runtime_config.pg_host = std.process.getEnvVarOwned(allocator, "PG_HOST") catch |err| blk: {
-            log.info("PG_HOST not set ({any}), using default: {s}", .{ err, runtime_config.pg_host });
+        // Read PostgreSQL configuration from environment variables via Juicy Main environ.
+        // getPosix() returns a slice into the environ block (valid for program lifetime).
+        // We dupe strings that RuntimeConfig.deinit() will free, matching previous semantics.
+        runtime_config.pg_host = if (init.environ.getPosix("PG_HOST")) |val|
+            try allocator.dupe(u8, val)
+        else blk: {
+            log.info("PG_HOST not set, using default: {s}", .{runtime_config.pg_host});
             break :blk runtime_config.pg_host;
         };
 
-        if (std.process.getEnvVarOwned(allocator, "PG_PORT")) |port_str| {
-            defer allocator.free(port_str);
+        if (init.environ.getPosix("PG_PORT")) |port_str| {
             runtime_config.pg_port = std.fmt.parseInt(u16, port_str, 10) catch |err| blk: {
                 log.warn("Invalid PG_PORT value '{s}' ({any}), using default: {d}", .{ port_str, err, runtime_config.pg_port });
                 break :blk runtime_config.pg_port;
             };
-        } else |err| {
-            log.info("PG_PORT not set ({any}), using default: {d}", .{ err, runtime_config.pg_port });
+        } else {
+            log.info("PG_PORT not set, using default: {d}", .{runtime_config.pg_port});
         }
 
-        // Try POSTGRES_BRIDGE_USER first, fallback to PG_USER
-        runtime_config.pg_user = std.process.getEnvVarOwned(allocator, "POSTGRES_BRIDGE_USER") catch blk: {
-            const generic_user = std.process.getEnvVarOwned(allocator, "PG_USER") catch |err| blk2: {
-                log.info("POSTGRES_BRIDGE_USER and PG_USER not set ({any}), using default: {s}", .{ err, runtime_config.pg_user });
-                break :blk2 runtime_config.pg_user;
-            };
-            break :blk generic_user;
+        // Priority: POSTGRES_BRIDGE_USER > PG_USER > default
+        runtime_config.pg_user = if (init.environ.getPosix("POSTGRES_BRIDGE_USER") orelse init.environ.getPosix("PG_USER")) |val|
+            try allocator.dupe(u8, val)
+        else blk: {
+            log.info("POSTGRES_BRIDGE_USER and PG_USER not set, using default: {s}", .{runtime_config.pg_user});
+            break :blk runtime_config.pg_user;
         };
 
-        // Try POSTGRES_BRIDGE_PASSWORD first, fallback to PG_PASSWORD
-        runtime_config.pg_password = std.process.getEnvVarOwned(allocator, "POSTGRES_BRIDGE_PASSWORD") catch blk: {
-            const generic_password = std.process.getEnvVarOwned(allocator, "PG_PASSWORD") catch |err| blk2: {
-                log.info("POSTGRES_BRIDGE_PASSWORD and PG_PASSWORD not set ({any}), using default", .{err});
-                break :blk2 runtime_config.pg_password;
-            };
-            break :blk generic_password;
+        // Priority: POSTGRES_BRIDGE_PASSWORD > PG_PASSWORD > default
+        runtime_config.pg_password = if (init.environ.getPosix("POSTGRES_BRIDGE_PASSWORD") orelse init.environ.getPosix("PG_PASSWORD")) |val|
+            try allocator.dupe(u8, val)
+        else blk: {
+            log.info("POSTGRES_BRIDGE_PASSWORD and PG_PASSWORD not set, using default", .{});
+            break :blk runtime_config.pg_password;
         };
 
-        runtime_config.pg_database = std.process.getEnvVarOwned(allocator, "PG_DB") catch |err| blk: {
-            log.info("PG_DB not set ({any}), using default: {s}", .{ err, runtime_config.pg_database });
+        runtime_config.pg_database = if (init.environ.getPosix("PG_DB")) |val|
+            try allocator.dupe(u8, val)
+        else blk: {
+            log.info("PG_DB not set, using default: {s}", .{runtime_config.pg_database});
             break :blk runtime_config.pg_database;
         };
 
         // Parse BASE_BUF environment variable (log2 of buffer size)
-        if (std.process.getEnvVarOwned(allocator, "BASE_BUF")) |buf_log2_str| {
-            defer allocator.free(buf_log2_str);
+        if (init.environ.getPosix("BASE_BUF")) |buf_log2_str| {
             if (std.fmt.parseInt(u6, buf_log2_str, 10)) |buf_log2| {
-                if (buf_log2 >= 10 and buf_log2 <= 20) { // 1KB to 1MB range
+                if (buf_log2 >= 10 and buf_log2 <= 20) {
                     const buf_size = @as(usize, 1) << @intCast(buf_log2);
                     runtime_config.event_data_buffer_log2 = buf_log2;
                     log.info("BASE_BUF={d} → event buffer size: {d} bytes ({d}KB)", .{ buf_log2, buf_size, buf_size / 1024 });
@@ -128,10 +125,9 @@ pub const Args = struct {
                     (@as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2)) / 1024,
                 });
             }
-        } else |err| {
+        } else {
             const buf_size = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
-            log.info("BASE_BUF not set ({any}), using default: {d} → {d} bytes ({d}KB)", .{
-                err,
+            log.info("BASE_BUF not set, using default: {d} → {d} bytes ({d}KB)", .{
                 runtime_config.event_data_buffer_log2,
                 buf_size,
                 buf_size / 1024,
@@ -139,10 +135,9 @@ pub const Args = struct {
         }
 
         // Parse RING_BUFFER_COUNT environment variable
-        if (std.process.getEnvVarOwned(allocator, "RING_BUFFER_COUNT")) |count_str| {
-            defer allocator.free(count_str);
+        if (init.environ.getPosix("RING_BUFFER_COUNT")) |count_str| {
             if (std.fmt.parseInt(usize, count_str, 10)) |count| {
-                if (count >= 1024 and count <= 1024 * 1024) { // 1K to 1M events
+                if (count >= 1024 and count <= 1024 * 1024) {
                     runtime_config.batch_ring_buffer_size = count;
                     log.info("RING_BUFFER_COUNT={d} events", .{count});
                 } else {
@@ -158,11 +153,8 @@ pub const Args = struct {
                     runtime_config.batch_ring_buffer_size,
                 });
             }
-        } else |err| {
-            log.info("RING_BUFFER_COUNT not set ({any}), using default: {d} events", .{
-                err,
-                runtime_config.batch_ring_buffer_size,
-            });
+        } else {
+            log.info("RING_BUFFER_COUNT not set, using default: {d} events", .{runtime_config.batch_ring_buffer_size});
         }
 
         return .{
@@ -175,23 +167,11 @@ pub const Args = struct {
     ///
     /// Format: "table1:col1,col2;table2:col3,col4"
     /// Example: "users:status,kyc_level;orders:state,payment_status"
-    ///
-    /// Returns:
-    /// - HashMap mapping table names to arrays of column names
-    /// - Empty HashMap if TRANSITION_RULES is not set or invalid
-    ///
-    /// Caller must call deinit() on the returned HashMap to free memory
-    pub fn parseTransitionRules(allocator: std.mem.Allocator) !config.EventClassification.TransitionRules {
+    pub fn parseTransitionRules(allocator: std.mem.Allocator, init: *const std.process.Init.Minimal) !config.EventClassification.TransitionRules {
         var rules = config.EventClassification.TransitionRules.init(allocator);
         errdefer rules.deinit();
 
-        const rules_str = std.process.getEnvVarOwned(allocator, "TRANSITION_RULES") catch |err| {
-            if (err != error.EnvironmentVariableNotFound) {
-                log.warn("Failed to read TRANSITION_RULES: {}", .{err});
-            }
-            return rules; // Return empty map
-        };
-        defer allocator.free(rules_str);
+        const rules_str = init.environ.getPosix("TRANSITION_RULES") orelse return rules;
 
         if (rules_str.len == 0) {
             log.info("TRANSITION_RULES is empty, no transition detection configured", .{});
@@ -206,7 +186,6 @@ pub const Args = struct {
             const trimmed = std.mem.trim(u8, table_rule, " \t\n\r");
             if (trimmed.len == 0) continue;
 
-            // Split by colon to get table name and columns: "users:status,kyc_level"
             var colon_iter = std.mem.splitScalar(u8, trimmed, ':');
             const table_name = colon_iter.next() orelse {
                 log.warn("Invalid TRANSITION_RULES entry (missing ':'): {s}", .{trimmed});
@@ -217,7 +196,6 @@ pub const Args = struct {
                 continue;
             };
 
-            // Split columns by comma: "status,kyc_level"
             var col_list: std.ArrayList([]const u8) = .empty;
             errdefer col_list.deinit(allocator);
 
@@ -225,7 +203,6 @@ pub const Args = struct {
             while (col_iter.next()) |col| {
                 const col_trimmed = std.mem.trim(u8, col, " \t\n\r");
                 if (col_trimmed.len > 0) {
-                    // Duplicate the string so it outlives the rules_str buffer
                     const col_owned = try allocator.dupe(u8, col_trimmed);
                     try col_list.append(allocator, col_owned);
                 }
@@ -237,7 +214,6 @@ pub const Args = struct {
                 continue;
             }
 
-            // Duplicate table name and transfer ownership to HashMap
             const table_name_owned = try allocator.dupe(u8, std.mem.trim(u8, table_name, " \t\n\r"));
             const columns_slice = try col_list.toOwnedSlice(allocator);
 
@@ -262,9 +238,7 @@ pub const Args = struct {
     pub fn deinitTransitionRules(rules: *config.EventClassification.TransitionRules, allocator: std.mem.Allocator) void {
         var iter = rules.iterator();
         while (iter.next()) |entry| {
-            // Free table name
             allocator.free(entry.key_ptr.*);
-            // Free column names array
             for (entry.value_ptr.*) |col_name| {
                 allocator.free(col_name);
             }
