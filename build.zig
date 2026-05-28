@@ -9,9 +9,9 @@ fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
     if (use_vendored) {
         exe.root_module.addIncludePath(b.path("libs/libpq-install/include"));
         exe.root_module.addLibraryPath(b.path("libs/libpq-install/lib"));
-        exe.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
-        exe.addObjectFile(b.path("libs/libpq-install/lib/libpgport.a"));
-        exe.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
+        exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
+        exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpgport.a"));
+        exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
         std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
     } else {
         // System libpq (Docker/Debian/Alpine: apt install libpq-dev)
