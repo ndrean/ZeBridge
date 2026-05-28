@@ -541,27 +541,27 @@ pub const SnapshotListener = struct {
         var schema_map = encoder.createMap();
         defer schema_map.free(allocator);
 
-        try schema_map.put("table", try encoder.createString(table_only));
-        try schema_map.put("schema", try encoder.createString(table_name));
-        try schema_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
+        try schema_map.put(encoder.allocator, "table", try encoder.createString(table_only));
+        try schema_map.put(encoder.allocator, "schema", try encoder.createString(table_name));
+        try schema_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
 
         var columns_array = try encoder.createArray(columns.len);
         for (columns, 0..) |col, i| {
             var col_map = encoder.createMap();
-            try col_map.put("name", try encoder.createString(col.name));
-            try col_map.put("position", encoder.createInt(@intCast(col.position)));
-            try col_map.put("data_type", try encoder.createString(col.data_type));
-            try col_map.put("is_nullable", encoder.createBool(col.is_nullable));
+            try col_map.put(encoder.allocator, "name", try encoder.createString(col.name));
+            try col_map.put(encoder.allocator, "position", encoder.createInt(@intCast(col.position)));
+            try col_map.put(encoder.allocator, "data_type", try encoder.createString(col.data_type));
+            try col_map.put(encoder.allocator, "is_nullable", encoder.createBool(col.is_nullable));
 
             if (col.column_default) |default_val| {
-                try col_map.put("column_default", try encoder.createString(default_val));
+                try col_map.put(encoder.allocator, "column_default", try encoder.createString(default_val));
             } else {
-                try col_map.put("column_default", encoder.createNull());
+                try col_map.put(encoder.allocator, "column_default", encoder.createNull());
             }
 
             try columns_array.setIndex(i, col_map);
         }
-        try schema_map.put("columns", columns_array);
+        try schema_map.put(encoder.allocator, "columns", columns_array);
 
         const encoded = try encoder.encode(schema_map);
         defer allocator.free(encoded);
@@ -1033,16 +1033,16 @@ pub const SnapshotListener = struct {
         // Parse PostgreSQL LSN string to u64 integer
         const lsn_int = try parsePgLsn(lsn);
 
-        try start_map.put("snapshot_id", try encoder.createString(snapshot_id));
-        try start_map.put("table", try encoder.createString(table_name));
-        try start_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-        try start_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
-        try start_map.put("status", try encoder.createString("starting"));
-        try start_map.put("format", try encoder.createString(@tagName(format)));
-        try start_map.put("compression_enabled", encoder.createBool(compression_enabled));
+        try start_map.put(encoder.allocator, "snapshot_id", try encoder.createString(snapshot_id));
+        try start_map.put(encoder.allocator, "table", try encoder.createString(table_name));
+        try start_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
+        try start_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+        try start_map.put(encoder.allocator, "status", try encoder.createString("starting"));
+        try start_map.put(encoder.allocator, "format", try encoder.createString(@tagName(format)));
+        try start_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
 
         if (dictionary_id) |dict_id| {
-            try start_map.put("dictionary_id", try encoder.createString(dict_id));
+            try start_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
         }
 
         const encoded = try encoder.encode(start_map);
@@ -1084,16 +1084,16 @@ pub const SnapshotListener = struct {
         // Parse PostgreSQL LSN string to u64 integer
         const lsn_int = try parsePgLsn(lsn);
 
-        try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
-        try meta_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-        try meta_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
-        try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
-        try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));
-        try meta_map.put("table", try encoder.createString(table_name));
-        try meta_map.put("compression_enabled", encoder.createBool(compression_enabled));
+        try meta_map.put(encoder.allocator, "snapshot_id", try encoder.createString(snapshot_id));
+        try meta_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
+        try meta_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+        try meta_map.put(encoder.allocator, "batch_count", encoder.createInt(@intCast(batch_count)));
+        try meta_map.put(encoder.allocator, "row_count", encoder.createInt(@intCast(row_count)));
+        try meta_map.put(encoder.allocator, "table", try encoder.createString(table_name));
+        try meta_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
 
         if (dictionary_id) |dict_id| {
-            try meta_map.put("dictionary_id", try encoder.createString(dict_id));
+            try meta_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
         }
 
         const encoded = try encoder.encode(meta_map);
@@ -1213,17 +1213,17 @@ fn publishSnapshotError(
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("error_type", try encoder.createString(error_type));
-    try map.put("table", try encoder.createString(table_name));
-    try map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
-    try map.put("status", try encoder.createString("failed"));
+    try map.put(encoder.allocator, "error_type", try encoder.createString(error_type));
+    try map.put(encoder.allocator, "table", try encoder.createString(table_name));
+    try map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+    try map.put(encoder.allocator, "status", try encoder.createString("failed"));
 
     // Optional fields
     if (snapshot_id) |sid| {
-        try map.put("snapshot_id", try encoder.createString(sid));
+        try map.put(encoder.allocator, "snapshot_id", try encoder.createString(sid));
     }
     if (error_message) |msg| {
-        try map.put("error_message", try encoder.createString(msg));
+        try map.put(encoder.allocator, "error_message", try encoder.createString(msg));
     }
 
     // Create array for available_tables
@@ -1231,7 +1231,7 @@ fn publishSnapshotError(
     for (available_tables, 0..) |table, i| {
         try tables_array.setIndex(i, try encoder.createString(table));
     }
-    try map.put("available_tables", tables_array);
+    try map.put(encoder.allocator, "available_tables", tables_array);
 
     const payload = try encoder.encode(map);
     defer allocator.free(payload);
@@ -1816,10 +1816,10 @@ fn encodeCsvRows(
             const col_name = col_names[col_idx];
 
             if (csv_field.isNull()) {
-                try row_map.put(col_name, encoder.createNull());
+                try row_map.put(encoder.allocator, col_name, encoder.createNull());
             } else if (csv_field.value) |text_val| {
                 // CSV values are already text, just encode them
-                try row_map.put(col_name, try encoder.createString(text_val));
+                try row_map.put(encoder.allocator, col_name, try encoder.createString(text_val));
             }
         }
 
@@ -1833,12 +1833,12 @@ fn encodeCsvRows(
     // Parse PostgreSQL LSN string to u64 integer (same format as CDC events)
     const lsn_int = try parsePgLsn(lsn);
 
-    try wrapper_map.put("table", try encoder.createString(table_name));
-    try wrapper_map.put("operation", try encoder.createString("snapshot"));
-    try wrapper_map.put("snapshot_id", try encoder.createString(snapshot_id));
-    try wrapper_map.put("chunk", encoder.createInt(@intCast(chunk)));
-    try wrapper_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-    try wrapper_map.put("data", data_array);
+    try wrapper_map.put(encoder.allocator, "table", try encoder.createString(table_name));
+    try wrapper_map.put(encoder.allocator, "operation", try encoder.createString("snapshot"));
+    try wrapper_map.put(encoder.allocator, "snapshot_id", try encoder.createString(snapshot_id));
+    try wrapper_map.put(encoder.allocator, "chunk", encoder.createInt(@intCast(chunk)));
+    try wrapper_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
+    try wrapper_map.put(encoder.allocator, "data", data_array);
 
     return try encoder.encode(wrapper_map);
 }
@@ -1866,16 +1866,16 @@ fn publishSnapshotMetadata(
     // Parse PostgreSQL LSN string to u64 integer
     const lsn_int = try parsePgLsn(lsn);
 
-    try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
-    try meta_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-    try meta_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
-    try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
-    try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));
-    try meta_map.put("table", try encoder.createString(table_name));
-    try meta_map.put("compression_enabled", encoder.createBool(compression_enabled));
+    try meta_map.put(encoder.allocator, "snapshot_id", try encoder.createString(snapshot_id));
+    try meta_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
+    try meta_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+    try meta_map.put(encoder.allocator, "batch_count", encoder.createInt(@intCast(batch_count)));
+    try meta_map.put(encoder.allocator, "row_count", encoder.createInt(@intCast(row_count)));
+    try meta_map.put(encoder.allocator, "table", try encoder.createString(table_name));
+    try meta_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
 
     if (dictionary_id) |dict_id| {
-        try meta_map.put("dictionary_id", try encoder.createString(dict_id));
+        try meta_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
     }
 
     const encoded = try encoder.encode(meta_map);
@@ -1917,17 +1917,17 @@ fn publishSnapshotStart(
     // Parse PostgreSQL LSN string to u64 integer
     const lsn_int = try parsePgLsn(lsn);
 
-    try start_map.put("snapshot_id", try encoder.createString(snapshot_id));
-    try start_map.put("table", try encoder.createString(table_name));
-    try start_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-    try start_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
-    try start_map.put("status", try encoder.createString("starting"));
-    try start_map.put("format", try encoder.createString(@tagName(format)));
-    try start_map.put("compression_enabled", encoder.createBool(compression_enabled));
+    try start_map.put(encoder.allocator, "snapshot_id", try encoder.createString(snapshot_id));
+    try start_map.put(encoder.allocator, "table", try encoder.createString(table_name));
+    try start_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
+    try start_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+    try start_map.put(encoder.allocator, "status", try encoder.createString("starting"));
+    try start_map.put(encoder.allocator, "format", try encoder.createString(@tagName(format)));
+    try start_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
 
     // Add dictionary_id if compression is enabled
     if (dictionary_id) |dict_id| {
-        try start_map.put("dictionary_id", try encoder.createString(dict_id));
+        try start_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
     }
 
     const encoded = try encoder.encode(start_map);
@@ -1978,10 +1978,10 @@ fn publishSchemaZig(
         try schema_array.setIndex(idx, try encoder.createString(col_name));
     }
 
-    try schema_map.put("table", try encoder.createString(table_name));
-    try schema_map.put("snapshot_id", try encoder.createString(snapshot_id));
-    try schema_map.put("schema", schema_array);
-    try schema_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
+    try schema_map.put(encoder.allocator, "table", try encoder.createString(table_name));
+    try schema_map.put(encoder.allocator, "snapshot_id", try encoder.createString(snapshot_id));
+    try schema_map.put(encoder.allocator, "schema", schema_array);
+    try schema_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
 
     const encoded = try encoder.encode(schema_map);
     defer allocator.free(encoded);

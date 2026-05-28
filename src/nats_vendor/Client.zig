@@ -251,28 +251,20 @@ pub fn setSockNONBLOCK(sock: posix.socket_t) !void {
                 .WSANOTINITIALISED => unreachable,
                 .WSAENETDOWN => return error.NetworkSubsystemFailed,
                 .WSAENOTSOCK => return error.FileDescriptorNotASocket,
-                // !!! handle more errors !!!
                 else => |err| return windows.unexpectedWSAError(err),
             }
         }
     } else {
-        var fl_flags = posix.fcntl(sock, posix.F.GETFL, 0) catch |err| switch (err) {
-            error.FileBusy => unreachable,
-            error.Locked => unreachable,
-            error.PermissionDenied => unreachable,
-            error.DeadLock => unreachable,
-            error.LockedRegionLimitExceeded => unreachable,
-            else => |e| return e,
-        };
+        // Use the raw linux syscall (non-variadic) instead of the libc fcntl
+        // (which is variadic and harder to type-check in Zig).
+        const get_rc = std.os.linux.fcntl(sock, posix.F.GETFL, 0);
+        const get_signed: isize = @bitCast(get_rc);
+        if (get_signed < 0) return error.FcntlGetFailed;
+        var fl_flags: usize = get_rc;
         fl_flags |= 1 << @bitOffsetOf(system.O, "NONBLOCK");
-        _ = posix.fcntl(sock, posix.F.SETFL, fl_flags) catch |err| switch (err) {
-            error.FileBusy => unreachable,
-            error.Locked => unreachable,
-            error.PermissionDenied => unreachable,
-            error.DeadLock => unreachable,
-            error.LockedRegionLimitExceeded => unreachable,
-            else => |e| return e,
-        };
+        const set_rc = std.os.linux.fcntl(sock, posix.F.SETFL, fl_flags);
+        const set_signed: isize = @bitCast(set_rc);
+        if (set_signed < 0) return error.FcntlSetFailed;
     }
 }
 
@@ -294,11 +286,24 @@ const c_net = @cImport({
 });
 
 /// Thin wrapper around a TCP socket fd, providing read/write/writev/close.
+/// Uses raw linux syscalls (posix.system.*) since posix.write/writev/close
+/// were removed in Zig 0.16.
 pub const Stream = struct {
     handle: posix.socket_t,
 
     pub fn write(s: Stream, bytes: []const u8) !usize {
-        return posix.write(s.handle, bytes);
+        while (true) {
+            const rc = system.write(s.handle, bytes.ptr, bytes.len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.NotOpenForWriting,
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                else => |e| return posix.unexpectedErrno(e),
+            }
+        }
     }
 
     pub fn read(s: Stream, buf: []u8) !usize {
@@ -306,11 +311,22 @@ pub const Stream = struct {
     }
 
     pub fn writev(s: Stream, iovecs: []posix.iovec_const) !usize {
-        return posix.writev(s.handle, iovecs);
+        while (true) {
+            const rc = system.writev(s.handle, iovecs.ptr, @intCast(iovecs.len));
+            switch (posix.errno(rc)) {
+                .SUCCESS => return @intCast(rc),
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .BADF => return error.NotOpenForWriting,
+                .PIPE => return error.BrokenPipe,
+                .CONNRESET => return error.ConnectionResetByPeer,
+                else => |e| return posix.unexpectedErrno(e),
+            }
+        }
     }
 
     pub fn close(s: Stream) void {
-        posix.close(s.handle);
+        _ = system.close(s.handle);
     }
 };
 
@@ -337,15 +353,22 @@ fn tcpConnect(host: []const u8, port: u16) !Stream {
     var ai = res;
     while (ai) |info| : (ai = info.ai_next) {
         const addr = info.ai_addr orelse continue;
-        const sock = posix.socket(
+        // Use raw linux syscalls so we get *const anyopaque for addr and avoid
+        // libc's non-nullable sockaddr* type mismatch with cImport C pointers.
+        const sock_rc = std.os.linux.socket(
             @intCast(info.ai_family),
             @intCast(info.ai_socktype),
             @intCast(info.ai_protocol),
-        ) catch continue;
-        posix.connect(sock, @ptrCast(addr), @intCast(info.ai_addrlen)) catch {
-            posix.close(sock);
+        );
+        const sock_signed: isize = @bitCast(sock_rc);
+        if (sock_signed < 0) continue;
+        const sock: posix.socket_t = @intCast(sock_rc);
+        const conn_rc = std.os.linux.connect(sock, addr, @intCast(info.ai_addrlen));
+        const conn_signed: isize = @bitCast(conn_rc);
+        if (conn_signed < 0) {
+            _ = system.close(sock);
             continue;
-        };
+        }
         return .{ .handle = sock };
     }
     return error.ConnectionFailed;

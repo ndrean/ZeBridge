@@ -810,7 +810,7 @@ fn read_buffer(cn: *Conn, buffer: *Appendable, len: usize) !void {
 /// Returns a 36-character UUID v4 string (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx).
 pub fn newInbox() [36]u8 {
     var bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
 

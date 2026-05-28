@@ -10,6 +10,15 @@ const Config = @import("config.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
 
+const c_time = @cImport(@cInclude("time.h"));
+
+fn nanoNow() u64 {
+    var ts: c_time.struct_timespec = undefined;
+    _ = c_time.clock_gettime(c_time.CLOCK_MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(ts.tv_nsec));
+}
+
 pub const log = std.log.scoped(.event_processor);
 
 /// Format a DecodedValue for human-readable logging
@@ -305,7 +314,7 @@ pub const EventProcessor = struct {
         // Exit if flush thread has fatal error (NATS dead) to prevent infinite spinning
         var retry_count: usize = 0;
         const max_retries_before_fatal_check = 1000; // Check fatal error every 1000 retries
-        var timer = std.time.Timer.start() catch null; // Optional timer for watchdog
+        const timer_start: u64 = nanoNow();
         const watchdog_timeout_ns = std.time.ns_per_s * 30; // 30 second hard timeout
 
         const slot_idx = while (true) {
@@ -324,8 +333,8 @@ pub const EventProcessor = struct {
             }
 
             // 2. Watchdog: Hard timeout if flush thread is completely stuck (NATS client hung)
-            if (timer) |*t| {
-                if (t.read() > watchdog_timeout_ns) {
+            {
+                if (nanoNow() - timer_start > watchdog_timeout_ns) {
                     log.err("🔴 FATAL: Flush thread blocked for >30s without setting fatal_error", .{});
                     log.err("    This indicates NATS client library is hung. Forcing shutdown.", .{});
                     self.batch_publisher.fatal_error.store(true, .seq_cst);
@@ -389,7 +398,7 @@ pub const EventProcessor = struct {
         // Push slot index to pending queue with retry + watchdog
         // Exit if flush thread has fatal error to prevent infinite spinning
         retry_count = 0;
-        timer = std.time.Timer.start() catch null; // Reset timer for second wait phase
+        const timer_start2: u64 = nanoNow(); // Reset timer for second wait phase
         while (true) {
             self.batch_publisher.pending_events.push(slot_idx) catch |err| {
                 if (err == error.QueueFull) {
@@ -406,8 +415,8 @@ pub const EventProcessor = struct {
                     }
 
                     // 2. Watchdog: Hard timeout if flush thread is completely stuck
-                    if (timer) |*t| {
-                        if (t.read() > watchdog_timeout_ns) {
+                    {
+                        if (nanoNow() - timer_start2 > watchdog_timeout_ns) {
                             log.err("🔴 FATAL: Flush thread blocked for >30s during pending queue push", .{});
                             log.err("    NATS client library appears hung. Forcing shutdown.", .{});
                             event.reset();

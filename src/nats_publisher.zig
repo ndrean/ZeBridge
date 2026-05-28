@@ -313,73 +313,74 @@ pub const Publisher = struct {
         const info = try self.js.?.INFO(stream_name, &request);
 
         // Build JSON response from StreamInfoResponse
-        var json_buf: std.ArrayList(u8) = .empty;
-        errdefer json_buf.deinit(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
 
-        const writer = json_buf.writer(self.allocator);
-        try writer.writeAll("{");
+        try out.writer.writeAll("{");
 
         // Add stream name from config
         if (info.config) |config| {
-            try writer.print("\"name\":\"{s}\"", .{config.name});
+            try out.writer.print("\"name\":\"{s}\"", .{config.name});
 
             // Add config details
-            try writer.writeAll(",\"config\":{");
-            try writer.print("\"retention\":\"{s}\"", .{config.retention});
-            try writer.print(",\"storage\":\"{s}\"", .{config.storage});
-            try writer.print(",\"max_msgs\":{d}", .{config.max_msgs});
-            try writer.print(",\"max_bytes\":{d}", .{config.max_bytes});
-            try writer.print(",\"max_age\":{d}", .{config.max_age});
-            try writer.print(",\"max_msg_size\":{d}", .{config.max_msg_size});
+            try out.writer.writeAll(",\"config\":{");
+            try out.writer.print("\"retention\":\"{s}\"", .{config.retention});
+            try out.writer.print(",\"storage\":\"{s}\"", .{config.storage});
+            try out.writer.print(",\"max_msgs\":{d}", .{config.max_msgs});
+            try out.writer.print(",\"max_bytes\":{d}", .{config.max_bytes});
+            try out.writer.print(",\"max_age\":{d}", .{config.max_age});
+            try out.writer.print(",\"max_msg_size\":{d}", .{config.max_msg_size});
 
             // Add subjects array
             if (config.subjects) |subjects| {
-                try writer.writeAll(",\"subjects\":[");
+                try out.writer.writeAll(",\"subjects\":[");
                 for (subjects, 0..) |subject, i| {
-                    if (i > 0) try writer.writeAll(",");
-                    try writer.print("\"{s}\"", .{subject});
+                    if (i > 0) try out.writer.writeAll(",");
+                    try out.writer.print("\"{s}\"", .{subject});
                 }
-                try writer.writeAll("]");
+                try out.writer.writeAll("]");
             }
-            try writer.writeAll("}");
+            try out.writer.writeAll("}");
         }
 
         // Add state information
         if (info.state) |state| {
-            try writer.writeAll(",\"state\":{");
-            try writer.print("\"messages\":{d}", .{state.messages});
-            try writer.print(",\"bytes\":{d}", .{state.bytes});
-            try writer.print(",\"first_seq\":{d}", .{state.first_seq});
-            try writer.print(",\"last_seq\":{d}", .{state.last_seq});
-            try writer.print(",\"consumer_count\":{d}", .{state.consumer_count});
+            try out.writer.writeAll(",\"state\":{");
+            try out.writer.print("\"messages\":{d}", .{state.messages});
+            try out.writer.print(",\"bytes\":{d}", .{state.bytes});
+            try out.writer.print(",\"first_seq\":{d}", .{state.first_seq});
+            try out.writer.print(",\"last_seq\":{d}", .{state.last_seq});
+            try out.writer.print(",\"consumer_count\":{d}", .{state.consumer_count});
 
             // Add optional fields
             if (state.first_ts) |first_ts| {
-                try writer.print(",\"first_ts\":\"{s}\"", .{first_ts});
+                try out.writer.print(",\"first_ts\":\"{s}\"", .{first_ts});
             }
             if (state.last_ts) |last_ts| {
-                try writer.print(",\"last_ts\":\"{s}\"", .{last_ts});
+                try out.writer.print(",\"last_ts\":\"{s}\"", .{last_ts});
             }
             if (state.num_subjects) |num| {
-                try writer.print(",\"num_subjects\":{d}", .{num});
+                try out.writer.print(",\"num_subjects\":{d}", .{num});
             }
             if (state.num_deleted) |num| {
-                try writer.print(",\"num_deleted\":{d}", .{num});
+                try out.writer.print(",\"num_deleted\":{d}", .{num});
             }
-            try writer.writeAll("}");
+            try out.writer.writeAll("}");
         }
 
         // Add timestamps
         if (info.created) |created| {
-            try writer.print(",\"created\":\"{s}\"", .{created});
+            try out.writer.print(",\"created\":\"{s}\"", .{created});
         }
         if (info.ts) |ts| {
-            try writer.print(",\"ts\":\"{s}\"", .{ts});
+            try out.writer.print(",\"ts\":\"{s}\"", .{ts});
         }
 
-        try writer.writeAll("}");
+        try out.writer.writeAll("}");
 
-        return json_buf.toOwnedSlice(self.allocator);
+        var arr = out.toArrayList();
+        defer arr.deinit(self.allocator);
+        return try arr.toOwnedSlice(self.allocator);
     }
 
     /// Purge all messages from a stream

@@ -789,12 +789,12 @@ pub const BatchPublisher = struct {
             var event_map = encoder.createMap();
             defer event_map.free(flush_alloc);
 
-            try event_map.put("subject", try encoder.createString(event.getSubject()));
-            try event_map.put("table", try encoder.createString(event.getTable()));
-            try event_map.put("operation", try encoder.createString(event.getOperation()));
-            try event_map.put("msg_id", try encoder.createString(event.getMsgId()));
-            try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
-            try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
+            try event_map.put(encoder.allocator, "subject", try encoder.createString(event.getSubject()));
+            try event_map.put(encoder.allocator, "table", try encoder.createString(event.getTable()));
+            try event_map.put(encoder.allocator, "operation", try encoder.createString(event.getOperation()));
+            try event_map.put(encoder.allocator, "msg_id", try encoder.createString(event.getMsgId()));
+            try event_map.put(encoder.allocator, "relation_id", encoder.createInt(@intCast(event.relation_id)));
+            try event_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(event.lsn)));
 
             // Add column data from packed buffer
             if (event.column_count > 0) {
@@ -808,10 +808,10 @@ pub const BatchPublisher = struct {
 
                     // Decode value based on type tag
                     const value_enc = try decodePackedValue(&encoder, event, col_view);
-                    try data_map.put(col_name, value_enc);
+                    try data_map.put(encoder.allocator, col_name, value_enc);
                 }
 
-                try event_map.put("data", data_map);
+                try event_map.put(encoder.allocator, "data", data_map);
             }
 
             const encoded = try encoder.encode(event_map);
@@ -841,12 +841,12 @@ pub const BatchPublisher = struct {
 
                 var event_map = encoder.createMap();
 
-                try event_map.put("subject", try encoder.createString(event.getSubject()));
-                try event_map.put("table", try encoder.createString(event.getTable()));
-                try event_map.put("operation", try encoder.createString(event.getOperation()));
-                try event_map.put("msg_id", try encoder.createString(event.getMsgId()));
-                try event_map.put("relation_id", encoder.createInt(@intCast(event.relation_id)));
-                try event_map.put("lsn", encoder.createInt(@intCast(event.lsn)));
+                try event_map.put(encoder.allocator, "subject", try encoder.createString(event.getSubject()));
+                try event_map.put(encoder.allocator, "table", try encoder.createString(event.getTable()));
+                try event_map.put(encoder.allocator, "operation", try encoder.createString(event.getOperation()));
+                try event_map.put(encoder.allocator, "msg_id", try encoder.createString(event.getMsgId()));
+                try event_map.put(encoder.allocator, "relation_id", encoder.createInt(@intCast(event.relation_id)));
+                try event_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(event.lsn)));
 
                 // Add column data from packed buffer
                 if (event.column_count > 0) {
@@ -855,10 +855,10 @@ pub const BatchPublisher = struct {
                     for (event.columns[0..event.column_count]) |col_view| {
                         const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
                         const value_enc = try decodePackedValue(&encoder, event, col_view);
-                        try data_map.put(col_name, value_enc);
+                        try data_map.put(encoder.allocator, col_name, value_enc);
                     }
 
-                    try event_map.put("data", data_map);
+                    try event_map.put(encoder.allocator, "data", data_map);
                 }
 
                 try batch_array.setIndex(i, event_map);

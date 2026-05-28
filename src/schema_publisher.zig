@@ -75,23 +75,23 @@ pub fn publishSchema(
     defer schema_map.free(allocator);
 
     // Add schema fields
-    try schema_map.put("table", try encoder.createString(relation.name));
-    try schema_map.put("namespace", try encoder.createString(relation.namespace));
-    try schema_map.put("relation_id", encoder.createInt(@intCast(relation.relation_id)));
-    try schema_map.put("schema_version", encoder.createInt(schema_version));
-    try schema_map.put("replica_identity", encoder.createInt(@intCast(relation.replica_identity)));
+    try schema_map.put(encoder.allocator, "table", try encoder.createString(relation.name));
+    try schema_map.put(encoder.allocator, "namespace", try encoder.createString(relation.namespace));
+    try schema_map.put(encoder.allocator, "relation_id", encoder.createInt(@intCast(relation.relation_id)));
+    try schema_map.put(encoder.allocator, "schema_version", encoder.createInt(schema_version));
+    try schema_map.put(encoder.allocator, "replica_identity", encoder.createInt(@intCast(relation.replica_identity)));
 
     // Add columns array
     var columns_array = try encoder.createArray(relation.columns.len);
     for (relation.columns, 0..) |col, i| {
         var col_map = encoder.createMap();
-        try col_map.put("name", try encoder.createString(col.name));
-        try col_map.put("type_id", encoder.createInt(@intCast(col.type_id)));
-        try col_map.put("type_modifier", encoder.createInt(@intCast(col.type_modifier)));
-        try col_map.put("flags", encoder.createInt(@intCast(col.flags)));
+        try col_map.put(encoder.allocator, "name", try encoder.createString(col.name));
+        try col_map.put(encoder.allocator, "type_id", encoder.createInt(@intCast(col.type_id)));
+        try col_map.put(encoder.allocator, "type_modifier", encoder.createInt(@intCast(col.type_modifier)));
+        try col_map.put(encoder.allocator, "flags", encoder.createInt(@intCast(col.flags)));
         try columns_array.setIndex(i, col_map);
     }
-    try schema_map.put("columns", columns_array);
+    try schema_map.put(encoder.allocator, "columns", columns_array);
 
     const encoded = try encoder.encode(schema_map);
     defer allocator.free(encoded);

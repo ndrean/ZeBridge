@@ -17,7 +17,7 @@ pub fn MailBox(comptime Letter: type) type {
         len: usize = 0,
         closed: bool = false,
         mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
-        cond: Condition = .{ .state = std.atomic.Value(Condition.State).init(0), .epoch = 0 },
+        cond: Condition = Condition.init,
         interrupted: bool = false,
 
         /// Append a new Envelope to the tail
@@ -64,7 +64,7 @@ pub fn MailBox(comptime Letter: type) type {
         /// If mailbox was closed - returns error.Closed
         /// If interrupt was issued - returns error.Interrupted
         pub fn receive(mbox: *Self, timeout_ns: u64, io: std.Io) error{ Timeout, Closed, Interrupted }!*Envelope {
-            var timeout_timer = std.time.Timer.start() catch unreachable;
+            const timeout_start = nanoNow();
 
             mbox.mutex.lockUncancelable(io);
             defer mbox.mutex.unlock(io);
@@ -79,7 +79,7 @@ pub fn MailBox(comptime Letter: type) type {
                     return error.Interrupted;
                 }
 
-                const elapsed = timeout_timer.read();
+                const elapsed = nanoNow() - timeout_start;
                 if (elapsed > timeout_ns)
                     return error.Timeout;
 
@@ -199,7 +199,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
         len: usize = 0,
         closed: bool = false,
         mutex: Mutex = .{ .state = std.atomic.Value(Mutex.State).init(.unlocked) },
-        cond: Condition = .{ .state = std.atomic.Value(Condition.State).init(0), .epoch = 0 },
+        cond: Condition = Condition.init,
         interrupted: bool = false,
 
         /// Append a new Envelope to the tail
@@ -246,7 +246,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
         /// If mailbox was closed - returns error.Closed
         /// If interrupt was issued - returns error.Interrupted
         pub fn receive(mbox: *Self, timeout_ns: u64, io: std.Io) error{ Timeout, Closed, Interrupted }!*Envelope {
-            var timeout_timer = std.time.Timer.start() catch unreachable;
+            const timeout_start = nanoNow();
 
             mbox.mutex.lockUncancelable(io);
             defer mbox.mutex.unlock(io);
@@ -261,7 +261,7 @@ pub fn MailBoxIntrusive(comptime Envelope: type) type {
                     return error.Interrupted;
                 }
 
-                const elapsed = timeout_timer.read();
+                const elapsed = nanoNow() - timeout_start;
                 if (elapsed > timeout_ns)
                     return error.Timeout;
 
@@ -425,7 +425,7 @@ pub const TypeErasedMailbox = struct {
         timeout_ns: u64,
         io: std.Io,
     ) error{ Timeout, Closed, Interrupted }!*Node {
-        var timer = std.time.Timer.start() catch unreachable;
+        const timer_start = nanoNow();
 
         mbox.mutex.lockUncancelable(io);
         defer mbox.mutex.unlock(io);
@@ -439,7 +439,7 @@ pub const TypeErasedMailbox = struct {
                 return error.Interrupted;
             }
 
-            const elapsed = timer.read();
+            const elapsed = nanoNow() - timer_start;
             if (elapsed >= timeout_ns)
                 return error.Timeout;
 
@@ -505,4 +505,11 @@ fn sleep(ns: u64) void {
         .tv_nsec = @as(c_long, @intCast(ns % std.time.ns_per_s)),
     };
     _ = c_time.nanosleep(&ts, null);
+}
+
+fn nanoNow() u64 {
+    var ts: c_time.struct_timespec = undefined;
+    _ = c_time.clock_gettime(c_time.CLOCK_MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(ts.tv_nsec));
 }

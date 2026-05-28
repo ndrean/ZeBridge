@@ -8,7 +8,7 @@
 //!   defer encoder.deinit();
 //!
 //!   var map = try encoder.createMap();
-//!   try map.put("key", try encoder.createString("value"));
+//!   try map.put(allocator, "key", try encoder.createString("value"));
 //!   const bytes = try encoder.encode(map);
 
 const std = @import("std");
@@ -44,7 +44,7 @@ pub const Encoder = struct {
     pub fn createMap(self: *Encoder) Value {
         return switch (self.format) {
             .msgpack => .{ .msgpack = msgpack.Payload.mapPayload(self.allocator) },
-            .json => .{ .json = std.json.Value{ .object = std.json.ObjectMap.init(self.allocator) } },
+            .json => .{ .json = std.json.Value{ .object = std.json.ObjectMap.empty } },
         };
     }
 
@@ -137,7 +137,7 @@ pub const Encoder = struct {
             .msgpack => return error.FormatMismatch,
         };
 
-        var out: std.io.Writer.Allocating = .init(self.allocator);
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
         try std.json.Stringify.value(json_value, .{ .whitespace = .indent_2 }, &out.writer);
         var arr = out.toArrayList();
         defer arr.deinit(self.allocator);
@@ -151,7 +151,7 @@ pub const Value = union(Format) {
     json: std.json.Value,
 
     /// Put a key-value pair into a map
-    pub fn put(self: *Value, key: []const u8, value: Value) !void {
+    pub fn put(self: *Value, allocator: std.mem.Allocator, key: []const u8, value: Value) !void {
         switch (self.*) {
             .msgpack => |*mp| {
                 const val_mp = switch (value) {
@@ -169,7 +169,7 @@ pub const Value = union(Format) {
                     .msgpack => return error.FormatMismatch,
                 };
 
-                try js.object.put(key, val_js);
+                try js.object.put(allocator, key, val_js);
             },
         }
     }
@@ -217,7 +217,7 @@ pub const Value = union(Format) {
                 while (it.next()) |entry| {
                     jsonFree(entry.value_ptr, allocator);
                 }
-                obj.deinit();
+                obj.deinit(allocator);
             },
             .array => |*arr| {
                 // Recursively free all elements
@@ -242,9 +242,9 @@ test "encoder: create and encode simple msgpack map" {
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("name", try encoder.createString("Alice"));
-    try map.put("age", encoder.createInt(30));
-    try map.put("active", encoder.createBool(true));
+    try map.put(allocator, "name", try encoder.createString("Alice"));
+    try map.put(allocator, "age", encoder.createInt(30));
+    try map.put(allocator, "active", encoder.createBool(true));
 
     const encoded = try encoder.encode(map);
     defer allocator.free(encoded);
@@ -261,9 +261,9 @@ test "encoder: create and encode simple json map" {
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("name", try encoder.createString("Alice"));
-    try map.put("age", encoder.createInt(30));
-    try map.put("active", encoder.createBool(true));
+    try map.put(allocator, "name", try encoder.createString("Alice"));
+    try map.put(allocator, "age", encoder.createInt(30));
+    try map.put(allocator, "active", encoder.createBool(true));
 
     const encoded = try encoder.encode(map);
     defer allocator.free(encoded);
@@ -323,12 +323,12 @@ test "encoder: nested structures msgpack" {
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("name", try encoder.createString("Bob"));
+    try map.put(allocator, "name", try encoder.createString("Bob"));
 
     var nested = encoder.createMap();
-    try nested.put("city", try encoder.createString("NYC"));
-    try nested.put("zip", encoder.createInt(10001));
-    try map.put("address", nested);
+    try nested.put(allocator, "city", try encoder.createString("NYC"));
+    try nested.put(allocator, "zip", encoder.createInt(10001));
+    try map.put(allocator, "address", nested);
 
     const encoded = try encoder.encode(map);
     defer allocator.free(encoded);
@@ -345,12 +345,12 @@ test "encoder: nested structures json" {
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("name", try encoder.createString("Bob"));
+    try map.put(allocator, "name", try encoder.createString("Bob"));
 
     var nested = encoder.createMap();
-    try nested.put("city", try encoder.createString("NYC"));
-    try nested.put("zip", encoder.createInt(10001));
-    try map.put("address", nested);
+    try nested.put(allocator, "city", try encoder.createString("NYC"));
+    try nested.put(allocator, "zip", encoder.createInt(10001));
+    try map.put(allocator, "address", nested);
 
     const encoded = try encoder.encode(map);
     defer allocator.free(encoded);
@@ -369,12 +369,12 @@ test "encoder: all value types msgpack" {
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("string", try encoder.createString("test"));
-    try map.put("int", encoder.createInt(42));
-    try map.put("float", encoder.createFloat(3.14));
-    try map.put("bool_true", encoder.createBool(true));
-    try map.put("bool_false", encoder.createBool(false));
-    try map.put("null", encoder.createNull());
+    try map.put(allocator, "string", try encoder.createString("test"));
+    try map.put(allocator, "int", encoder.createInt(42));
+    try map.put(allocator, "float", encoder.createFloat(3.14));
+    try map.put(allocator, "bool_true", encoder.createBool(true));
+    try map.put(allocator, "bool_false", encoder.createBool(false));
+    try map.put(allocator, "null", encoder.createNull());
 
     const encoded = try encoder.encode(map);
     defer allocator.free(encoded);
@@ -391,12 +391,12 @@ test "encoder: all value types json" {
     var map = encoder.createMap();
     defer map.free(allocator);
 
-    try map.put("string", try encoder.createString("test"));
-    try map.put("int", encoder.createInt(42));
-    try map.put("float", encoder.createFloat(3.14));
-    try map.put("bool_true", encoder.createBool(true));
-    try map.put("bool_false", encoder.createBool(false));
-    try map.put("null", encoder.createNull());
+    try map.put(allocator, "string", try encoder.createString("test"));
+    try map.put(allocator, "int", encoder.createInt(42));
+    try map.put(allocator, "float", encoder.createFloat(3.14));
+    try map.put(allocator, "bool_true", encoder.createBool(true));
+    try map.put(allocator, "bool_false", encoder.createBool(false));
+    try map.put(allocator, "null", encoder.createNull());
 
     const encoded = try encoder.encode(map);
     defer allocator.free(encoded);
@@ -418,7 +418,7 @@ test "encoder: format selection from runtime value" {
 
     var map1 = encoder1.createMap();
     defer map1.free(allocator);
-    try map1.put("test", try encoder1.createString("msgpack"));
+    try map1.put(allocator, "test", try encoder1.createString("msgpack"));
     const encoded1 = try encoder1.encode(map1);
     defer allocator.free(encoded1);
 
@@ -433,7 +433,7 @@ test "encoder: format selection from runtime value" {
 
     var map2 = encoder2.createMap();
     defer map2.free(allocator);
-    try map2.put("test", try encoder2.createString("json"));
+    try map2.put(allocator, "test", try encoder2.createString("json"));
     const encoded2 = try encoder2.encode(map2);
     defer allocator.free(encoded2);
 
