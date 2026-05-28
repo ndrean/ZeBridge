@@ -18,6 +18,7 @@ attention: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 /// Connects to a NATS server at the specified address and port.
 pub fn connect(allocator: Allocator, co: protocol.ConnectOpts) !Client {
+    _ = allocator;
     var host: []const u8 = protocol.DefaultAddr;
 
     if (co.addr != null) {
@@ -31,7 +32,7 @@ pub fn connect(allocator: Allocator, co: protocol.ConnectOpts) !Client {
     }
     var client: Client = .{};
 
-    client.stream = try net.tcpConnectToHost(allocator, host, prt);
+    client.stream = try tcpConnect(host, prt);
     client.connected = true;
     errdefer client.close();
     try setSockNONBLOCK(client.stream.handle);
@@ -278,14 +279,74 @@ pub fn setSockNONBLOCK(sock: posix.socket_t) !void {
 const std = @import("std");
 const builtin = @import("builtin");
 const protocol = @import("protocol.zig");
-const net = std.net;
 const posix = std.posix;
-const Stream = net.Stream;
 const Socket = posix.socket_t;
 const Allocator = std.mem.Allocator;
-const linux = std.os.linux;
 const windows = std.os.windows;
-const wasi = std.os.wasi;
 const system = posix.system;
 const pollfd = posix.pollfd;
 const POLL = system.POLL;
+
+const c_net = @cImport({
+    @cInclude("sys/socket.h");
+    @cInclude("netdb.h");
+    @cInclude("netinet/in.h");
+});
+
+/// Thin wrapper around a TCP socket fd, providing read/write/writev/close.
+pub const Stream = struct {
+    handle: posix.socket_t,
+
+    pub fn write(s: Stream, bytes: []const u8) !usize {
+        return posix.write(s.handle, bytes);
+    }
+
+    pub fn read(s: Stream, buf: []u8) !usize {
+        return posix.read(s.handle, buf);
+    }
+
+    pub fn writev(s: Stream, iovecs: []posix.iovec_const) !usize {
+        return posix.writev(s.handle, iovecs);
+    }
+
+    pub fn close(s: Stream) void {
+        posix.close(s.handle);
+    }
+};
+
+/// Opens a TCP connection to host:port using getaddrinfo for name resolution.
+fn tcpConnect(host: []const u8, port: u16) !Stream {
+    var host_buf: [256]u8 = undefined;
+    if (host.len >= host_buf.len) return error.HostNameTooLong;
+    @memcpy(host_buf[0..host.len], host);
+    host_buf[host.len] = 0;
+
+    var port_buf: [8]u8 = undefined;
+    const port_slice = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+    port_buf[port_slice.len] = 0;
+
+    var hints = std.mem.zeroes(c_net.struct_addrinfo);
+    hints.ai_family = c_net.AF_UNSPEC;
+    hints.ai_socktype = c_net.SOCK_STREAM;
+
+    var res: ?*c_net.struct_addrinfo = null;
+    if (c_net.getaddrinfo(&host_buf, &port_buf, &hints, &res) != 0)
+        return error.HostResolutionFailed;
+    defer c_net.freeaddrinfo(res);
+
+    var ai = res;
+    while (ai) |info| : (ai = info.ai_next) {
+        const addr = info.ai_addr orelse continue;
+        const sock = posix.socket(
+            @intCast(info.ai_family),
+            @intCast(info.ai_socktype),
+            @intCast(info.ai_protocol),
+        ) catch continue;
+        posix.connect(sock, @ptrCast(addr), @intCast(info.ai_addrlen)) catch {
+            posix.close(sock);
+            continue;
+        };
+        return .{ .handle = sock };
+    }
+    return error.ConnectionFailed;
+}
