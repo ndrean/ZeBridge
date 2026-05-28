@@ -32,9 +32,9 @@ pub const log = std.log.scoped(.bridge);
 // Global flag for graceful shutdown (shared with HTTP server)
 var should_stop = std.atomic.Value(bool).init(false);
 
-// Signal handler for graceful shutdown
-fn handleShutdown(sig: c_int) callconv(.c) void {
-    _ = sig;
+// Signal handler for graceful shutdown.
+// macOS Zig 0.16: sigaction handler param is enum(u32), not c_int.
+fn handleShutdown(_: if (builtin.os.tag == .macos) std.c.SIG__enum_3329 else c_int) callconv(.c) void {
     should_stop.store(true, .seq_cst);
 }
 
