@@ -1,22 +1,12 @@
 const std = @import("std");
 
-/// Link vendored libpq static libraries to an executable
+/// Link vendored or system libpq to an executable.
+/// Pass `-Dvendored-libpq=true` to use libs/libpq-install/ (local dev).
+/// Default (false) uses the system libpq (Docker / CI / package-installed).
 fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
-    // Check if vendored libpq exists
-    const vendored_libpq_exists = blk: {
-        const root = b.build_root.path orelse break :blk false;
-        const check_path = std.fmt.allocPrint(
-            b.allocator,
-            "{s}/libs/libpq-install/lib/libpq.a",
-            .{root},
-        ) catch break :blk false;
-        defer b.allocator.free(check_path);
-        std.posix.access(check_path, 0) catch break :blk false; // 0 = F_OK (existence)
-        break :blk true;
-    };
+    const use_vendored = b.option(bool, "vendored-libpq", "Use vendored libpq from libs/libpq-install/") orelse false;
 
-    if (vendored_libpq_exists) {
-        // Use vendored libpq
+    if (use_vendored) {
         exe.root_module.addIncludePath(b.path("libs/libpq-install/include"));
         exe.root_module.addLibraryPath(b.path("libs/libpq-install/lib"));
         exe.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
@@ -24,13 +14,12 @@ fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
         exe.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
         std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
     } else {
-        // Use system libpq (e.g., in Docker/Debian/Alpine)
+        // System libpq (Docker/Debian/Alpine: apt install libpq-dev)
         exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
         exe.root_module.linkSystemLibrary("pq", .{});
         std.debug.print("Using system libpq\n", .{});
     }
 
-    // Link system dependencies that libpq needs
     exe.linkLibC();
 }
 
