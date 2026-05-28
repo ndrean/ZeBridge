@@ -151,7 +151,7 @@ fn initReplicationStream(
     return pg_stream;
 }
 
-pub fn main() !void {
+pub fn main(argv: [][:0]u8) !void {
     const IS_DEBUG = builtin.mode == .Debug;
 
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -175,7 +175,7 @@ pub fn main() !void {
     const snap_base_alloc = if (IS_DEBUG) allocator else std.heap.c_allocator;
 
     // Parse command-line arguments and build runtime config
-    const parsed = try args.Args.parseArgs(allocator);
+    const parsed = try args.Args.parseArgs(allocator, argv);
     const parsed_args = parsed.args;
     var runtime_config = parsed.runtime_config;
     defer runtime_config.deinit(allocator);

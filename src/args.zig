@@ -14,12 +14,9 @@ pub const Args = struct {
 
     /// Parse command-line arguments and create RuntimeConfig
     /// Returns both the CLI args and the merged runtime configuration
-    pub fn parseArgs(allocator: std.mem.Allocator) !struct { args: Args, runtime_config: config.RuntimeConfig } {
-        // argsWithAllocator was removed in Zig 0.16; argsAlloc is the replacement.
-        // The returned slice is intentionally not freed — CLI arg strings live for the
-        // program's lifetime (same semantics as POSIX argv pointers).
-        const argv = try std.process.argsAlloc(allocator);
-
+    /// argv is passed directly from main() — no allocation needed, strings live
+    /// for the program's lifetime (Zig guarantees argv outlives main).
+    pub fn parseArgs(allocator: std.mem.Allocator, argv: [][:0]u8) !struct { args: Args, runtime_config: config.RuntimeConfig } {
         var http_port: u16 = 6543; // default
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
         var publication_name: []const u8 = config.Postgres.default_publication_name; // default
