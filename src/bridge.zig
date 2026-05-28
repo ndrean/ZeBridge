@@ -161,13 +161,11 @@ pub fn main() !void {
         _ = gpa.detectLeaks();
     };
 
-    var tsa = std.heap.ThreadSafeAllocator{ .child_allocator = gpa.allocator() };
-
     // CDC event allocator
-    // Debug: Use ThreadSafeAllocator for leak detection
+    // Debug: DebugAllocator is thread-safe internally in Zig 0.16
     // Release: Use c_allocator directly (arena without reset was growing infinitely)
     const event_alloc = if (IS_DEBUG)
-        tsa.allocator()
+        gpa.allocator()
     else
         std.heap.c_allocator;
 
