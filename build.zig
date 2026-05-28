@@ -44,25 +44,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const mailbox_dep = b.dependency("mailbox", .{
+    // Vendored g41797/mailbox (no external deps)
+    const mailbox_mod = b.addModule("mailbox", .{
+        .root_source_file = b.path("src/mailbox_vendor/mailbox.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const zul_dep = b.dependency("zul", .{
+    // Vendored g41797/nats patched for Zig 0.16:
+    //   - Formatter.zig: std.Io.Writer.fixed → std.io.fixedBufferStream
+    //   - Conn.zig: zul UUID → std.crypto.random
+    const nats_mod = b.addModule("nats", .{
+        .root_source_file = b.path("src/nats_vendor/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mailbox", .module = mailbox_mod },
+        },
     });
-
-    const nats_dep = b.dependency("nats", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const nats_mod = nats_dep.module("nats");
-
-    nats_mod.addImport("mailbox", mailbox_dep.module("mailbox"));
-    nats_mod.addImport("zul", zul_dep.module("zul"));
 
     // Create local zstd module (links system libzstd)
     const zstd_mod = b.addModule("zstd", .{
@@ -82,11 +81,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "bridge", .module = mod },
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
                 .{ .name = "zstd", .module = zstd_mod },
-                // .{ .name = "nats", .module = nats_mod },
-
-                .{ .name = "nats", .module = nats_dep.module("nats") },
-
-                // .{ .name = "mailbox", .module = mailbox.module("mailbox") },
+                .{ .name = "nats", .module = nats_mod },
             },
         }),
     });
