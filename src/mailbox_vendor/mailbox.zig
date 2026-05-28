@@ -489,5 +489,5 @@ pub const TypeErasedMailbox = struct {
 };
 
 const std = @import("std");
-const Mutex = std.Thread.Mutex;
-const Condition = std.Thread.Condition;
+const Mutex = std.Io.Mutex;
+const Condition = std.Io.Condition;

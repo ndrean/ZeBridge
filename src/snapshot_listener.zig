@@ -69,7 +69,7 @@ fn publishWithRetry(
                     log.info("🛑 Shutdown requested during retry backoff - aborting", .{});
                     return error.ShutdownRequested;
                 }
-                std.time.sleep(sleep_increment_ms * std.time.ns_per_ms);
+                utils.sleep(sleep_increment_ms * std.time.ns_per_ms);
                 elapsed_ms += sleep_increment_ms;
             }
 
@@ -87,7 +87,7 @@ fn publishWithRetry(
 // Global dictionary cache for pre-trained zstd dictionaries
 // Initialized once on bridge startup and read-only afterwards (thread-safe)
 var global_dictionaries: ?*dictionaries_cache.DictionariesCache = null;
-var dictionaries_mutex: std.Mutex = .{};
+var dictionaries_mutex: std.Io.Mutex = .{};
 var dictionaries_allocator: ?std.mem.Allocator = null;
 
 // Global dictionary manager for zstd compression with digested dictionaries
@@ -274,7 +274,7 @@ pub const SnapshotListener = struct {
 
         // Keep main thread alive - just sleep until stop signal
         while (!self.should_stop.load(.seq_cst)) {
-            std.time.sleep(100 * std.time.ns_per_ms);
+            utils.sleep(100 * std.time.ns_per_ms);
         }
 
         // Wait for threads to finish
@@ -314,7 +314,7 @@ pub const SnapshotListener = struct {
             const connect_opts = nats.protocol.ConnectOpts{}; // Use defaults
             core.CONNECT(allocator, connect_opts) catch |err| {
                 log.err("📋 Schema listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
-                std.time.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
             defer core.DISCONNECT();
@@ -325,7 +325,7 @@ pub const SnapshotListener = struct {
             const sid = "schema-listener-1";
             core.SUB("init.schema", null, sid) catch |err| {
                 log.err("📋 Schema listener: Failed to subscribe: {} - reconnecting", .{err});
-                std.time.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
 
@@ -339,7 +339,7 @@ pub const SnapshotListener = struct {
                             continue; // Normal timeout, keep polling
                         }
                         log.err("📋 Schema listener: Error receiving: {} - reconnecting", .{err});
-                        std.time.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                        utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                         break; // Break inner loop to trigger reconnection
                     };
                     defer conn.reuse(msg);
@@ -598,7 +598,7 @@ pub const SnapshotListener = struct {
             const connect_opts = nats.protocol.ConnectOpts{};
             core.CONNECT(allocator, connect_opts) catch |err| {
                 log.err("📸 Snapshot listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
-                std.time.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
             defer core.DISCONNECT();
@@ -609,7 +609,7 @@ pub const SnapshotListener = struct {
             const sid = "snapshot-listener-1";
             core.SUB("init.snapshot.>", null, sid) catch |err| {
                 log.err("📸 Snapshot listener: Failed to subscribe: {} - reconnecting", .{err});
-                std.time.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
 
@@ -623,7 +623,7 @@ pub const SnapshotListener = struct {
                             continue; // Normal timeout, keep polling
                         }
                         log.err("📸 Snapshot listener: Error receiving: {} - reconnecting", .{err});
-                        std.time.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                        utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                         break; // Break inner loop to trigger reconnection
                     };
                     defer conn.reuse(msg);
@@ -1157,7 +1157,7 @@ pub const SnapshotListener = struct {
     //                     continue;
     //                 }
     //                 log.err("🧪 PoC: Error receiving: {}", .{err});
-    //                 std.time.sleep(1 * std.time.ns_per_s);
+    //                 utils.sleep(1 * std.time.ns_per_s);
     //                 continue;
     //             };
     //             defer conn.reuse(msg);
@@ -1436,7 +1436,7 @@ fn listenForSnapshotRequestsOld(
 
     // Keep thread alive until stop signal
     while (!should_stop.load(.seq_cst)) {
-        std.time.sleep(100 * std.time.ns_per_ms);
+        utils.sleep(100 * std.time.ns_per_ms);
     }
 
     log.info("🥁 Snapshot listener thread stopped", .{});

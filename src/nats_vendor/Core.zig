@@ -203,7 +203,7 @@ const protocol = @import("protocol.zig");
 const messages = @import("messages.zig");
 
 const Allocator = std.mem.Allocator;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
 
 const Headers = messages.Headers;
 /// Re-export of the allocated message type.

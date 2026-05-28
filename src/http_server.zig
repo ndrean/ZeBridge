@@ -1,6 +1,7 @@
 const std = @import("std");
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
+const utils = @import("utils.zig");
 
 // std.posix socket/IO functions removed in Zig 0.16 — use C API directly.
 const sock_c = @cImport({
@@ -102,7 +103,7 @@ pub const Server = struct {
             const ready = sock_c.poll(&poll_fds[0], 1, 100);
             if (ready < 0) {
                 log.err("⚠️ Poll error", .{});
-                std.time.sleep(100 * std.time.ns_per_ms);
+                utils.sleep(100 * std.time.ns_per_ms);
                 continue;
             }
 

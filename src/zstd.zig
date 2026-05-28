@@ -512,8 +512,8 @@ pub fn ContextPool(comptime T: type) type {
 
         allocator: std.mem.Allocator,
         contexts: std.ArrayList(*T),
-        mutex: std.Mutex = .{},
-        sem: std.Semaphore,
+        mutex: std.Io.Mutex = .{},
+        sem: std.Io.Semaphore,
 
         pub fn init(allocator: std.mem.Allocator, capacity: usize, config: anytype) !*Self {
             _ = config; // for future configurability (e.g. tuning)
@@ -522,7 +522,7 @@ pub fn ContextPool(comptime T: type) type {
             self.* = .{
                 .allocator = allocator,
                 .contexts = std.ArrayList(*T).init(allocator),
-                .sem = std.Semaphore{ .permits = capacity },
+                .sem = std.Io.Semaphore{ .permits = capacity },
             };
             errdefer self.deinit();
 

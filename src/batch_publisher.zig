@@ -6,6 +6,7 @@
 const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
+const utils = @import("utils.zig");
 const nats = @import("nats");
 const nats_publisher = @import("nats_publisher.zig");
 const msgpack = @import("msgpack");
@@ -700,7 +701,7 @@ pub const BatchPublisher = struct {
                     break;
                 }
                 // Sleep briefly to avoid busy-waiting
-                std.time.sleep(1 * std.time.ns_per_ms);
+                utils.sleep(1 * std.time.ns_per_ms);
             } else {
                 // Have events but timeout not reached
                 if (self.should_stop.load(.seq_cst)) {
@@ -712,7 +713,7 @@ pub const BatchPublisher = struct {
                     break;
                 }
                 // Keep them and sleep briefly
-                std.time.sleep(1 * std.time.ns_per_ms);
+                utils.sleep(1 * std.time.ns_per_ms);
             }
         }
 
@@ -953,7 +954,7 @@ pub const BatchPublisher = struct {
 
                 // Wait before retrying (exponential backoff)
                 log.warn("⏳ Retrying in {d}ms...", .{backoff_ms});
-                std.time.sleep(backoff_ms * std.time.ns_per_ms);
+                utils.sleep(backoff_ms * std.time.ns_per_ms);
 
                 // Double the wait for next time, capped at 5 seconds
                 backoff_ms = @min(backoff_ms * 2, 5000);

@@ -22,6 +22,7 @@ const snapshot_listener = @import("snapshot_listener.zig");
 const encoder_mod = @import("encoder.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
+const utils = @import("utils.zig");
 
 // Force test discovery for imported modules
 comptime {
@@ -566,7 +567,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             } else {
                 // No message available - idle path
                 // Sleep 10 ms first to avoid busy-waiting
-                std.time.sleep(10 * std.time.ns_per_ms);
+                utils.sleep(10 * std.time.ns_per_ms);
 
                 // Only check time-based conditions periodically
                 idle_iterations += 1;
@@ -633,12 +634,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             // Zero-allocation ring buffer: no reclaim needed
 
-            std.time.sleep(2000 * std.time.ns_per_ms); // 2 seconds
+            utils.sleep(2000 * std.time.ns_per_ms); // 2 seconds
 
             // Get latest LSN and reconnect
             const reconnect_lsn = wal_monitor.getCurrentLSN(allocator, &pg_config) catch |lsn_err| {
                 log.err("Failed to get LSN for reconnect: {}", .{lsn_err});
-                std.time.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
+                utils.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
             defer allocator.free(reconnect_lsn);
@@ -649,13 +650,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Reconnect to replication stream
             pg_stream.connect() catch |conn_err| {
                 log.err("Failed to reconnect: {}", .{conn_err});
-                std.time.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
+                utils.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
 
             pg_stream.startStreaming(reconnect_lsn) catch |stream_err| {
                 log.err("Failed to restart streaming: {}", .{stream_err});
-                std.time.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
+                utils.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
 
@@ -698,7 +699,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             last_log_time = elapsed;
         }
 
-        std.time.sleep(100 * std.time.ns_per_ms); // 100ms
+        utils.sleep(100 * std.time.ns_per_ms); // 100ms
     }
 
     if (batch_pub.isFlushComplete()) {
