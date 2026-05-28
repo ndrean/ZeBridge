@@ -12,17 +12,16 @@ fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
 
     if (vendored_libpq_exists) {
         // Use vendored libpq
-        exe.addIncludePath(b.path("libs/libpq-install/include"));
-        exe.addLibraryPath(b.path("libs/libpq-install/lib"));
+        exe.root_module.addIncludePath(b.path("libs/libpq-install/include"));
+        exe.root_module.addLibraryPath(b.path("libs/libpq-install/lib"));
         exe.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
         exe.addObjectFile(b.path("libs/libpq-install/lib/libpgport.a"));
         exe.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
         std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
     } else {
         // Use system libpq (e.g., in Docker/Debian/Alpine)
-        // Add system include paths for PostgreSQL headers
-        exe.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
-        exe.linkSystemLibrary("pq");
+        exe.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/postgresql" });
+        exe.root_module.linkSystemLibrary("pq", .{});
         std.debug.print("Using system libpq\n", .{});
     }
 
@@ -87,11 +86,11 @@ pub fn build(b: *std.Build) void {
     });
 
     // Link OpenSSL (required for pure Zig NATS TLS support)
-    exe.linkSystemLibrary("ssl");
-    exe.linkSystemLibrary("crypto");
+    exe.root_module.linkSystemLibrary("ssl", .{});
+    exe.root_module.linkSystemLibrary("crypto", .{});
 
     // Link system libzstd (for compression)
-    exe.linkSystemLibrary("zstd");
+    exe.root_module.linkSystemLibrary("zstd", .{});
 
     // Link vendored libpq
     linkLibpq(exe, b);
