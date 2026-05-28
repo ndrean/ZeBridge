@@ -832,7 +832,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
-const Mutex = std.Io.Mutex;
+const Mutex = std.Thread.Mutex;
 
 const parse = @import("parse.zig");
 const protocol = @import("protocol.zig");

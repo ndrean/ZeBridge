@@ -87,7 +87,7 @@ fn publishWithRetry(
 // Global dictionary cache for pre-trained zstd dictionaries
 // Initialized once on bridge startup and read-only afterwards (thread-safe)
 var global_dictionaries: ?*dictionaries_cache.DictionariesCache = null;
-var dictionaries_mutex: std.Io.Mutex = .{};
+var dictionaries_mutex: std.Thread.Mutex = .{};
 var dictionaries_allocator: ?std.mem.Allocator = null;
 
 // Global dictionary manager for zstd compression with digested dictionaries

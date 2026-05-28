@@ -54,54 +54,22 @@ pub const Publisher = struct {
     nats_port: u16, // Parsed port for reconnection
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    reconnect_mutex: std.Io.Mutex = .{}, // Protect reconnection logic
+    reconnect_mutex: std.Thread.Mutex = .{}, // Protect reconnection logic
     metrics: ?*Metrics = null, // Optional metrics tracking
 
     pub fn init(
         allocator: std.mem.Allocator,
         config: PublisherConfig,
     ) !Publisher {
-        // Read NATS host from environment
-        const nats_uri = std.process.getEnvVarOwned(allocator, "NATS_HOST") catch blk: {
-            log.info("NATS_HOST not set, using default 127.0.0.1", .{});
-            break :blk try allocator.dupe(u8, "127.0.0.1");
-        };
-        defer allocator.free(nats_uri);
-
-        // Read optional NATS authentication credentials
-        const nats_user = std.process.getEnvVarOwned(allocator, "NATS_BRIDGE_USER") catch null;
-        defer if (nats_user) |u| allocator.free(u);
-
-        const nats_password = std.process.getEnvVarOwned(allocator, "NATS_BRIDGE_PASSWORD") catch null;
-        defer if (nats_password) |p| allocator.free(p);
-
-        // Build NATS URL with optional authentication
-        const url: []const u8 = if (nats_user != null and nats_password != null)
-            try std.fmt.allocPrint(
-                allocator,
-                "nats://{s}:{s}@{s}:4222",
-                .{ nats_user.?, nats_password.?, nats_uri },
-            )
-        else
-            try std.fmt.allocPrint(
-                allocator,
-                "nats://{s}:4222",
-                .{nats_uri},
-            );
-
-        if (nats_user != null and nats_password != null) {
-            log.info("NATS authentication enabled for user: {s}", .{nats_user.?});
-        } else {
-            log.info("NATS authentication disabled (no credentials)", .{});
-        }
-
+        // URL is provided by the caller (built from env vars in bridge.zig); dupe for ownership.
+        const url = try allocator.dupe(u8, config.url);
         return Publisher{
             .allocator = allocator,
             .config = config,
             .nc = null,
             .js = null,
             .nats_url = url,
-            .nats_host = "", // Will be set in connect()
+            .nats_host = "",
             .nats_port = 4222,
         };
     }

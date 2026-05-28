@@ -475,7 +475,7 @@ const Appendable = @import("Appendable.zig");
 const utils = @import("utils.zig");
 
 const Allocator = std.mem.Allocator;
-const Mutex = std.Io.Mutex;
+const Mutex = std.Thread.Mutex;
 
 const Headers = messages.Headers;
 /// Re-export of the allocated message type.

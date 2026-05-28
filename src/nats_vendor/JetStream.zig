@@ -300,7 +300,7 @@ const messages = @import("messages.zig");
 const parse = @import("parse.zig");
 
 const Allocator = std.mem.Allocator;
-const Mutex = std.Io.Mutex;
+const Mutex = std.Thread.Mutex;
 
 const Headers = messages.Headers;
 /// Re-export of the allocated message type.
