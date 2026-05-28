@@ -32,7 +32,7 @@ pub const Metrics = struct {
     /// Initialize metrics struct with zeroed atomic counters
     pub fn init() Metrics {
         return .{
-            .start_time = @divFloor(std.time.milliTimestamp(), 1000),
+            .start_time = @as(i64, @intCast(std.c.time(null))),
             .wal_messages_received = std.atomic.Value(u64).init(0),
             .cdc_events_published = std.atomic.Value(u64).init(0),
             .last_ack_lsn = std.atomic.Value(u64).init(0),
@@ -71,21 +71,21 @@ pub const Metrics = struct {
     /// Lock-free reconnection tracking (PostgreSQL)
     pub fn recordReconnect(self: *Metrics) void {
         _ = self.reconnect_count.fetchAdd(1, .monotonic);
-        self.last_reconnect_time.store(@divFloor(std.time.milliTimestamp(), 1000), .monotonic);
+        self.last_reconnect_time.store(@as(i64, @intCast(std.c.time(null))), .monotonic);
         self.is_connected.store(true, .monotonic);
     }
 
     /// Lock-free NATS reconnection tracking
     pub fn recordNatsReconnect(self: *Metrics) void {
         _ = self.nats_reconnect_count.fetchAdd(1, .monotonic);
-        self.last_nats_reconnect_time.store(@divFloor(std.time.milliTimestamp(), 1000), .monotonic);
+        self.last_nats_reconnect_time.store(@as(i64, @intCast(std.c.time(null))), .monotonic);
     }
 
     /// Lock-free WAL lag update
     pub fn updateWalLag(self: *Metrics, slot_active: bool, lag_bytes: u64) void {
         self.slot_active.store(slot_active, .monotonic);
         self.wal_lag_bytes.store(lag_bytes, .monotonic);
-        self.last_wal_check_time.store(@divFloor(std.time.milliTimestamp(), 1000), .monotonic);
+        self.last_wal_check_time.store(@as(i64, @intCast(std.c.time(null))), .monotonic);
     }
 
     /// Lock-free queue usage update
@@ -97,7 +97,7 @@ pub const Metrics = struct {
 
     /// Get current uptime in seconds (lock-free read)
     pub fn getUptimeSeconds(self: *Metrics) i64 {
-        return @divFloor(std.time.milliTimestamp(), 1000) - self.start_time;
+        return @as(i64, @intCast(std.c.time(null))) - self.start_time;
     }
 
     /// Thread-safe snapshot of metrics for display
@@ -131,7 +131,7 @@ pub const Metrics = struct {
         const lsn_str_owned = try allocator.dupe(u8, lsn_str);
 
         return .{
-            .uptime_seconds = @divFloor(std.time.milliTimestamp(), 1000) - self.start_time,
+            .uptime_seconds = @as(i64, @intCast(std.c.time(null))) - self.start_time,
             .wal_messages_received = self.wal_messages_received.load(.monotonic),
             .cdc_events_published = self.cdc_events_published.load(.monotonic),
             .last_ack_lsn = lsn,

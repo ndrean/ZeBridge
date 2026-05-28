@@ -174,7 +174,7 @@ pub const CopyCsvParser = struct {
         const header_line = data[0..newline_pos];
 
         // Parse CSV header
-        var cols = std.ArrayList([]const u8){};
+        var cols = std.ArrayList([]const u8).empty;
         defer cols.deinit(self.allocator);
 
         var it = std.mem.splitScalar(u8, header_line, ',');
@@ -228,7 +228,7 @@ pub const CopyCsvParser = struct {
 
     /// Parse a single CSV line into fields (optimized with in-place unescaping)
     fn parseCsvLine(self: *CopyCsvParser, line: []const u8) !CsvRow {
-        var fields = std.ArrayList(CsvField){};
+        var fields = std.ArrayList(CsvField).empty;
         errdefer {
             for (fields.items) |field| {
                 if (field.value) |v| self.allocator.free(v);
@@ -270,7 +270,7 @@ pub const CopyCsvParser = struct {
     }
     /// [OLD] Parse a single CSV line into fields
     // fn parseCsvLine(self: *CopyCsvParser, line: []const u8) !CsvRow {
-    //     var fields = std.ArrayList(CsvField){};
+    //     var fields = std.ArrayList(CsvField).empty;
     //     errdefer {
     //         for (fields.items) |field| {
     //             if (field.value) |v| self.allocator.free(v);
@@ -354,7 +354,7 @@ pub const CopyCsvParser = struct {
 
     /// Parse header from a single line and store it
     fn parseHeaderFromLine(self: *CopyCsvParser, line: []const u8) !void {
-        var cols = std.ArrayList([]const u8){};
+        var cols = std.ArrayList([]const u8).empty;
         errdefer {
             for (cols.items) |col| self.allocator.free(col);
             cols.deinit(self.allocator);

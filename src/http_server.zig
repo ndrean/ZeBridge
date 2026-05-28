@@ -3,6 +3,13 @@ const posix = std.posix;
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
 
+// std.posix.socket (and bind/listen/accept/setsockopt) were removed from std.posix in Zig 0.16.
+// Use C socket API directly.
+const sock_c = @cImport({
+    @cInclude("sys/socket.h");
+    @cInclude("netinet/in.h");
+});
+
 pub const log = std.log.scoped(.http_server);
 
 /// Simple HTTP server for health checks and basic control
@@ -54,19 +61,24 @@ pub const Server = struct {
 
     /// Run the HTTP server (in a separate thread)
     pub fn run(self: *Server) !void {
-        const sock_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        const sock_raw = sock_c.socket(sock_c.AF_INET, sock_c.SOCK_STREAM, 0);
+        if (sock_raw < 0) return error.SocketFailed;
+        const sock_fd: posix.fd_t = @intCast(sock_raw);
         defer posix.close(sock_fd);
 
-        const one: i32 = 1;
-        try posix.setsockopt(sock_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+        const optval: c_int = 1;
+        _ = sock_c.setsockopt(sock_fd, sock_c.SOL_SOCKET, sock_c.SO_REUSEADDR,
+            @ptrCast(&optval), @as(c_uint, @sizeOf(c_int)));
 
-        var addr = std.mem.zeroes(posix.sockaddr.in);
-        addr.family = posix.AF.INET;
-        addr.port = std.mem.nativeToBig(u16, self.port);
-        // addr.addr = 0 is INADDR_ANY (already zeroed)
+        var addr = std.mem.zeroes(sock_c.struct_sockaddr_in);
+        addr.sin_family = @intCast(sock_c.AF_INET);
+        addr.sin_port = std.mem.nativeToBig(u16, self.port);
+        // addr.sin_addr.s_addr = 0 is INADDR_ANY (already zeroed)
 
-        try posix.bind(sock_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
-        try posix.listen(sock_fd, 128);
+        if (sock_c.bind(sock_fd, @ptrCast(&addr), @as(c_uint, @sizeOf(sock_c.struct_sockaddr_in))) < 0)
+            return error.BindFailed;
+        if (sock_c.listen(sock_fd, 128) < 0)
+            return error.ListenFailed;
 
         log.info("✅ HTTP server listening on http://0.0.0.0:{d}", .{self.port});
         log.info("ℹ️ Available endpoints:", .{});
@@ -98,10 +110,12 @@ pub const Server = struct {
                 continue;
             }
 
-            const client_fd = posix.accept(sock_fd, null, null) catch |err| {
-                log.err("🔴 Failed to accept connection: {}", .{err});
+            const client_raw = sock_c.accept(sock_fd, null, null);
+            if (client_raw < 0) {
+                log.err("🔴 Failed to accept connection: {d}", .{client_raw});
                 continue;
-            };
+            }
+            const client_fd: posix.fd_t = @intCast(client_raw);
             defer posix.close(client_fd);
 
             self.handleRequest(client_fd) catch |err| {

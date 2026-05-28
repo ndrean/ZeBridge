@@ -485,7 +485,7 @@ pub const SnapshotListener = struct {
 
             const entry = try table_schemas.getOrPut(full_table_name);
             if (!entry.found_existing) {
-                entry.value_ptr.* = std.ArrayList(SchemaColumnInfo){};
+                entry.value_ptr.* = std.ArrayList(SchemaColumnInfo).empty;
             } else {
                 allocator.free(full_table_name);
             }
@@ -536,7 +536,7 @@ pub const SnapshotListener = struct {
 
         try schema_map.put("table", try encoder.createString(table_only));
         try schema_map.put("schema", try encoder.createString(table_name));
-        try schema_map.put("timestamp", encoder.createInt(@divFloor(std.time.milliTimestamp(), 1000)));
+        try schema_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
 
         var columns_array = try encoder.createArray(columns.len);
         for (columns, 0..) |col, i| {
@@ -1026,7 +1026,7 @@ pub const SnapshotListener = struct {
         try start_map.put("snapshot_id", try encoder.createString(snapshot_id));
         try start_map.put("table", try encoder.createString(table_name));
         try start_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-        try start_map.put("timestamp", encoder.createInt(@divFloor(std.time.milliTimestamp(), 1000)));
+        try start_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
         try start_map.put("status", try encoder.createString("starting"));
         try start_map.put("format", try encoder.createString(@tagName(format)));
         try start_map.put("compression_enabled", encoder.createBool(compression_enabled));
@@ -1076,7 +1076,7 @@ pub const SnapshotListener = struct {
 
         try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
         try meta_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-        try meta_map.put("timestamp", encoder.createInt(@divFloor(std.time.milliTimestamp(), 1000)));
+        try meta_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
         try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
         try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));
         try meta_map.put("table", try encoder.createString(table_name));
@@ -1205,7 +1205,7 @@ fn publishSnapshotError(
 
     try map.put("error_type", try encoder.createString(error_type));
     try map.put("table", try encoder.createString(table_name));
-    try map.put("timestamp", encoder.createInt(@divFloor(std.time.milliTimestamp(), 1000)));
+    try map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
     try map.put("status", try encoder.createString("failed"));
 
     // Optional fields
@@ -1578,7 +1578,7 @@ fn generateIncrementalSnapshot(
         };
 
         // Collect rows into array using arena allocator
-        var rows_list: std.ArrayList(pg_copy_csv.CsvRow) = .{};
+        var rows_list: std.ArrayList(pg_copy_csv.CsvRow) = .empty;
         defer {
             for (rows_list.items) |*row| {
                 row.deinit();
@@ -1857,7 +1857,7 @@ fn publishSnapshotMetadata(
 
     try meta_map.put("snapshot_id", try encoder.createString(snapshot_id));
     try meta_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-    try meta_map.put("timestamp", encoder.createInt(@divFloor(std.time.milliTimestamp(), 1000)));
+    try meta_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
     try meta_map.put("batch_count", encoder.createInt(@intCast(batch_count)));
     try meta_map.put("row_count", encoder.createInt(@intCast(row_count)));
     try meta_map.put("table", try encoder.createString(table_name));
@@ -1909,7 +1909,7 @@ fn publishSnapshotStart(
     try start_map.put("snapshot_id", try encoder.createString(snapshot_id));
     try start_map.put("table", try encoder.createString(table_name));
     try start_map.put("lsn", encoder.createInt(@intCast(lsn_int)));
-    try start_map.put("timestamp", encoder.createInt(@divFloor(std.time.milliTimestamp(), 1000)));
+    try start_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
     try start_map.put("status", try encoder.createString("starting"));
     try start_map.put("format", try encoder.createString(@tagName(format)));
     try start_map.put("compression_enabled", encoder.createBool(compression_enabled));
@@ -1970,7 +1970,7 @@ fn publishSchemaZig(
     try schema_map.put("table", try encoder.createString(table_name));
     try schema_map.put("snapshot_id", try encoder.createString(snapshot_id));
     try schema_map.put("schema", schema_array);
-    try schema_map.put("timestamp", encoder.createInt(@divFloor(std.time.milliTimestamp(), 1000)));
+    try schema_map.put("timestamp", encoder.createInt(@as(i64, c.time(null))));
 
     const encoded = try encoder.encode(schema_map);
     defer allocator.free(encoded);
@@ -2048,7 +2048,7 @@ fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
     return try std.fmt.allocPrint(
         allocator,
         "snap-{d}-{x:0>4}",
-        .{ @divFloor(std.time.milliTimestamp(), 1000), random_suffix },
+        .{ @as(i64, c.time(null)), random_suffix },
     );
 }
 
@@ -2254,7 +2254,7 @@ fn collectSampleData(
         return try allocator.alloc([]const u8, 0);
     }
 
-    var samples = std.ArrayList([]const u8){};
+    var samples: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (samples.items) |sample| allocator.free(sample);
         samples.deinit(allocator);

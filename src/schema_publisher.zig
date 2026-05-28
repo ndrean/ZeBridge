@@ -51,7 +51,7 @@ pub fn publishSchema(
     allocator: std.mem.Allocator,
     format: encoder_mod.Format,
 ) !void {
-    const schema_version = @divFloor(std.time.milliTimestamp(), 1000);
+    const schema_version = @as(i64, c.time(null));
 
     log.info("📋 Publishing schema for table '{s}' (relation_id={d}, version={d})", .{
         relation.name,
@@ -249,7 +249,7 @@ pub fn publishInitialSchemas(
         // Get or create column list for this table
         const entry = try table_schemas.getOrPut(full_table_name);
         if (!entry.found_existing) {
-            entry.value_ptr.* = std.ArrayList(ColumnInfo){};
+            entry.value_ptr.* = std.ArrayList(ColumnInfo).empty;
         } else {
             allocator.free(full_table_name); // Already have this key
         }

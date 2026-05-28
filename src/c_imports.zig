@@ -6,4 +6,5 @@
 
 pub const c = @cImport({
     @cInclude("libpq-fe.h");
+    @cInclude("time.h");
 });

@@ -189,7 +189,7 @@ pub const ReplicationSetup = struct {
         const puballtables = std.mem.eql(u8, std.mem.span(puballtables_cstr), "t");
 
         // Parse comma-separated table list
-        var table_list = std.ArrayList([]const u8){};
+        var table_list: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (table_list.items) |table| {
                 self.allocator.free(table);

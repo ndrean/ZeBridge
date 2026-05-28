@@ -364,7 +364,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{Config.Nats.cdc_subject_wildcard});
 
     // <--- Metrics setup
-    const present = @divFloor(std.time.milliTimestamp(), 1000);
+    const present = @as(i64, @intCast(std.c.time(null)));
     var msg_count: u32 = 0;
     var cdc_events: u32 = 0;
     var last_lsn: u64 = 0;
@@ -427,7 +427,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                         // PostgreSQL is requesting a reply - send status update immediately
                         const reply_lsn = if (last_ack_lsn > 0) last_ack_lsn else wal_msg.wal_end;
                         try pg_stream.sendStatusUpdate(reply_lsn);
-                        last_keepalive_time = @divFloor(std.time.milliTimestamp(), 1000);
+                        last_keepalive_time = @as(i64, @intCast(std.c.time(null)));
                         log.debug("Replied to keepalive request (LSN: {x})", .{reply_lsn});
                     }
                     continue; // Don't process keepalives further
@@ -552,7 +552,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     // Only read atomic LSN when we're about to ACK
                     const confirmed_lsn = batch_pub.getLastConfirmedLsn();
                     if (confirmed_lsn > last_ack_lsn) {
-                        const now = @divFloor(std.time.milliTimestamp(), 1000); // Get timestamp for update
+                        const now = @as(i64, @intCast(std.c.time(null))); // Get timestamp for update
                         try pg_stream.sendStatusUpdate(confirmed_lsn);
                         log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} bytes)", .{ confirmed_lsn, bytes_since_ack });
                         last_ack_lsn = confirmed_lsn;
@@ -571,7 +571,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (idle_iterations >= idle_check_interval) {
                     idle_iterations = 0;
 
-                    const now = @divFloor(std.time.milliTimestamp(), 1000);
+                    const now = @as(i64, @intCast(std.c.time(null)));
 
                     // Flush pending status updates if time threshold reached
                     if (now - last_status_update_time >= status_update_interval_seconds) {
@@ -675,12 +675,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     const shutdown_timeout_seconds = 30;
-    const start_time = @divFloor(std.time.milliTimestamp(), 1000);
+    const start_time = @as(i64, @intCast(std.c.time(null)));
     var last_log_time: i64 = 0;
 
     // Wait for flush thread to complete (both queue empty AND final flush done)
     while (!batch_pub.isFlushComplete()) {
-        const elapsed = @divFloor(std.time.milliTimestamp(), 1000) - start_time;
+        const elapsed = @as(i64, @intCast(std.c.time(null))) - start_time;
         if (elapsed > shutdown_timeout_seconds) {
             const remaining = batch_pub.pending_events.len();
             log.warn("⚠️ Shutdown timeout reached - {d} events may not have been published", .{remaining});

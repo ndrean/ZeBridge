@@ -17,6 +17,13 @@ const Metrics = @import("metrics.zig").Metrics;
 
 pub const log = std.log.scoped(.batch_publisher);
 
+/// Monotonic millisecond timestamp (replacement for removed getMilliTimestamp())
+fn getMilliTimestamp() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+}
+
 /// Initialize memory slab for event ring buffer with optional memory locking
 /// Returns a contiguous block of memory sized for `slot_count` events of `slot_size` bytes each
 ///
@@ -611,10 +618,10 @@ pub const BatchPublisher = struct {
         log.info("ℹ️ Lock-free flush thread started", .{});
 
         var batches_processed: usize = 0;
-        var last_flush_time = std.time.milliTimestamp();
+        var last_flush_time = getMilliTimestamp();
 
         // Persistent batch that accumulates slot indices across iterations
-        var batch = std.ArrayList(usize){};
+        var batch: std.ArrayList(usize) = .empty;
         var current_payload_size: usize = 0; // Track approximate payload size
         defer {
             // Return slot indices to free queue on thread exit
@@ -648,7 +655,7 @@ pub const BatchPublisher = struct {
 
                 current_payload_size += event_size;
             }
-            const now = std.time.milliTimestamp();
+            const now = getMilliTimestamp();
             const time_elapsed = now - last_flush_time;
 
             // Flush if we have events AND (batch is full OR payload too large OR timeout reached)
@@ -826,7 +833,7 @@ pub const BatchPublisher = struct {
             var batch_array = try encoder.createArray(event_count);
             defer batch_array.free(flush_alloc);
 
-            const encode_start = std.time.milliTimestamp();
+            const encode_start = getMilliTimestamp();
 
             for (indices, 0..) |slot_idx, i| {
                 const event = &self.events[slot_idx];
@@ -859,10 +866,10 @@ pub const BatchPublisher = struct {
             const encoded = try encoder.encode(batch_array);
             defer self.allocator.free(encoded);
 
-            const encode_elapsed = std.time.milliTimestamp() - encode_start;
+            const encode_elapsed = getMilliTimestamp() - encode_start;
 
             // Publish the batch with a composite message ID
-            const publish_start = std.time.milliTimestamp();
+            const publish_start = getMilliTimestamp();
             const first_event = &self.events[indices[0]];
             const last_event = &self.events[indices[event_count - 1]];
             const batch_msg_id = try std.fmt.allocPrint(
@@ -885,7 +892,7 @@ pub const BatchPublisher = struct {
             try headers.append("Nats-Msg-Id", batch_msg_id);
 
             try self.publisher.publish(batch_subject, &headers, encoded);
-            const publish_elapsed = std.time.milliTimestamp() - publish_start;
+            const publish_elapsed = getMilliTimestamp() - publish_start;
 
             log.info("📤 Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
                 event_count,
@@ -907,7 +914,7 @@ pub const BatchPublisher = struct {
         const max_retries = 5;
         var backoff_ms: u64 = 100; // Start with 100ms
 
-        const flush_start = std.time.milliTimestamp();
+        const flush_start = getMilliTimestamp();
 
         log.info("📦 Starting flush of {d} events", .{batch.items.len});
 
@@ -921,7 +928,7 @@ pub const BatchPublisher = struct {
                 batch.clearRetainingCapacity();
 
                 // Log flush timing if it took longer than expected
-                const flush_elapsed = std.time.milliTimestamp() - flush_start;
+                const flush_elapsed = getMilliTimestamp() - flush_start;
                 if (flush_elapsed > 100) {
                     log.warn("⏱️  Slow flush: {d}ms for {d} events", .{
                         flush_elapsed,
