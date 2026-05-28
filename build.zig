@@ -4,7 +4,7 @@ const std = @import("std");
 fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
     // Check if vendored libpq exists
     const vendored_libpq_exists = blk: {
-        b.build_root.handle.access("libs/libpq-install/lib/libpq.a", .{}) catch {
+        _ = b.build_root.handle.statFile("libs/libpq-install/lib/libpq.a") catch {
             break :blk false;
         };
         break :blk true;
