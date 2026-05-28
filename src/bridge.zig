@@ -525,14 +525,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
                                     cdc_events += 1;
                                 }
                             },
-                            .commit => |c| {
+                            .commit => |commit| {
                                 // Track LSN progression
-                                if (c.commit_lsn != last_lsn) {
-                                    const lsn_diff = c.commit_lsn - last_lsn;
-                                    log.info("COMMIT: lsn={x} (delta: +{d})", .{ c.commit_lsn, lsn_diff });
-                                    last_lsn = c.commit_lsn;
+                                if (commit.commit_lsn != last_lsn) {
+                                    const lsn_diff = commit.commit_lsn - last_lsn;
+                                    log.info("COMMIT: lsn={x} (delta: +{d})", .{ commit.commit_lsn, lsn_diff });
+                                    last_lsn = commit.commit_lsn;
                                 } else {
-                                    log.info("COMMIT: lsn={x}", .{c.commit_lsn});
+                                    log.info("COMMIT: lsn={x}", .{commit.commit_lsn});
                                 }
                             },
                             else => {},
