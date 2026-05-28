@@ -32,9 +32,24 @@ pub const log = std.log.scoped(.bridge);
 // Global flag for graceful shutdown (shared with HTTP server)
 var should_stop = std.atomic.Value(bool).init(false);
 
-// Signal handler for graceful shutdown.
-// macOS Zig 0.16: sigaction handler param is enum(u32), not c_int.
-fn handleShutdown(_: if (builtin.os.tag == .macos) std.c.SIG__enum_3329 else c_int) callconv(.c) void {
+// Derive signal handler parameter type from posix.Sigaction.
+// On macOS Zig 0.16 the handler takes an anonymous enum(u32), not c_int.
+const sig_num_t = t: {
+    for (@typeInfo(posix.Sigaction).@"struct".fields) |f| {
+        if (std.mem.eql(u8, f.name, "handler")) {
+            for (@typeInfo(f.type).@"union".fields) |uf| {
+                if (std.mem.eql(u8, uf.name, "handler")) {
+                    const opt_ptr = @typeInfo(uf.type).optional.child;
+                    const params = @typeInfo(@typeInfo(opt_ptr).pointer.child).@"fn".params;
+                    break :t params[0].type.?;
+                }
+            }
+        }
+    }
+    break :t c_int;
+};
+
+fn handleShutdown(_: sig_num_t) callconv(.c) void {
     should_stop.store(true, .seq_cst);
 }
 
