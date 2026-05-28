@@ -59,11 +59,10 @@ pub fn publishSchema(
     });
 
     // Build subject: init.schema.{table_name} (matches INIT stream with init.> pattern)
-    const subject = try std.fmt.allocPrintSentinel(
+    const subject = try std.fmt.allocPrintZ(
         allocator,
         "init.schema.{s}",
         .{relation.name},
-        0,
     );
     defer allocator.free(subject);
 
@@ -173,7 +172,7 @@ pub fn publishInitialSchemas(
     try in_clause.appendSlice(allocator, ")");
 
     // Query information_schema for monitored tables only
-    const query = try std.fmt.allocPrintSentinel(
+    const query = try std.fmt.allocPrintZ(
         allocator,
         \\SELECT
         \\    t.table_schema,
@@ -193,7 +192,6 @@ pub fn publishInitialSchemas(
         \\ORDER BY t.table_name, c.ordinal_position
     ,
         .{in_clause.items},
-        0,
     );
     defer allocator.free(query);
 

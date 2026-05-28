@@ -36,21 +36,18 @@ pub const PgConf = struct {
     ///
     /// Caller is responsible for freeing the returned string
     pub fn connInfo(self: *const PgConf, allocator: std.mem.Allocator, replication: bool) ![:0]const u8 {
-        // Use allocPrintSentinel to directly create null-terminated string for C APIs
-        // Signature: allocPrintSentinel(allocator, comptime fmt, args, comptime sentinel)
+        // allocPrintZ produces a null-terminated [:0]u8 slice suitable for C APIs
         return if (replication)
-            try std.fmt.allocPrintSentinel(
+            try std.fmt.allocPrintZ(
                 allocator,
                 "host={s} port={d} user={s} password={s} dbname={s} replication=database",
                 .{ self.host, self.port, self.user, self.password, self.database },
-                0, // null terminator
             )
         else
-            try std.fmt.allocPrintSentinel(
+            try std.fmt.allocPrintZ(
                 allocator,
                 "host={s} port={d} user={s} password={s} dbname={s}",
                 .{ self.host, self.port, self.user, self.password, self.database },
-                0, // null terminator
             );
     }
 };

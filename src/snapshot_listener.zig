@@ -120,7 +120,7 @@ fn getTablePrimaryKey(
     }
 
     // Query system catalogs for primary key column
-    const query = try std.fmt.allocPrintSentinel(
+    const query = try std.fmt.allocPrintZ(
         allocator,
         \\SELECT a.attname, format_type(a.atttypid, a.atttypmod)
         \\FROM pg_index i
@@ -130,7 +130,6 @@ fn getTablePrimaryKey(
         \\  AND array_length(i.indkey, 1) = 1;
     ,
         .{ schema, table },
-        0,
     );
     defer allocator.free(query);
 
@@ -410,7 +409,7 @@ pub const SnapshotListener = struct {
         try in_clause.appendSlice(allocator, ")");
 
         // Query information_schema
-        const query = try std.fmt.allocPrintSentinel(
+        const query = try std.fmt.allocPrintZ(
             allocator,
             \\SELECT
             \\    t.table_schema,
@@ -430,7 +429,6 @@ pub const SnapshotListener = struct {
             \\ORDER BY t.table_name, c.ordinal_position
         ,
             .{in_clause.items},
-            0,
         );
         defer allocator.free(query);
 
@@ -801,11 +799,10 @@ pub const SnapshotListener = struct {
             else
                 try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
 
-            const copy_query = try std.fmt.allocPrintSentinel(
+            const copy_query = try std.fmt.allocPrintZ(
                 chunk_alloc,
                 "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
                 .{ table_name, where_clause, pk.name, chunk_size },
-                0,
             );
 
             // Initialize streaming encoder with fixed buffer
@@ -1560,11 +1557,10 @@ fn generateIncrementalSnapshot(
         else
             try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
 
-        const copy_query = try std.fmt.allocPrintSentinel(
+        const copy_query = try std.fmt.allocPrintZ(
             chunk_alloc,
             "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
             .{ table_name, where_clause, pk.name, chunk_size },
-            0,
         );
 
         // Parse CSV COPY data using arena allocator

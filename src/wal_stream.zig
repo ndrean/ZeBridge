@@ -66,11 +66,10 @@ pub const ReplicationStream = struct {
         const lsn = start_lsn orelse "0/0";
 
         // Build START_REPLICATION command
-        const query = try std.fmt.allocPrintSentinel(
+        const query = try std.fmt.allocPrintZ(
             self.allocator,
             "START_REPLICATION SLOT {s} LOGICAL {s} (proto_version '1', publication_names '{s}', binary 'true')",
             .{ self.config.slot_name, lsn, self.config.publication_name },
-            0,
         );
         defer self.allocator.free(query);
 
