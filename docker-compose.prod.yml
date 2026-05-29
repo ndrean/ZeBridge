@@ -1,3 +1,9 @@
+# Run with:
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up --build
+#
+# --env-file is required for ${VAR} substitution in this file (ports, slot names, etc.)
+# env_file inside each service handles runtime container environment separately.
+
 services:
   bridge-init:
     image: postgres:18
