@@ -3,6 +3,10 @@ zig-out/
 zig-cache/
 .zig-cache/
 .lexical/
+zig-pkg/
+
+# Downloaded packages
+*.deb
 
 # NATS data
 nats-data/
