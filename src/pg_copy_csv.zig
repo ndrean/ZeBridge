@@ -399,9 +399,12 @@ pub const CopyCsvParser = struct {
             if (self.pk_col_idx) |pk_idx| {
                 if (col_idx == pk_idx) {
                     if (field_value) |pk_val| {
-                        const copy_len = @min(pk_val.len, self.last_pk_buf.len);
-                        @memcpy(self.last_pk_buf[0..copy_len], pk_val[0..copy_len]);
-                        self.last_pk_len = copy_len;
+                        if (pk_val.len > self.last_pk_buf.len) {
+                            log.err("PK value length {d} exceeds buffer capacity {d} — aborting to prevent cursor corruption", .{ pk_val.len, self.last_pk_buf.len });
+                            return error.PkValueTooLong;
+                        }
+                        @memcpy(self.last_pk_buf[0..pk_val.len], pk_val);
+                        self.last_pk_len = pk_val.len;
                     }
                 }
             }
