@@ -273,6 +273,23 @@ pub const Buffers = struct {
     pub const default_ring_buffer_count: usize = 65536;
 };
 
+/// Memory-layout bounds used for compile-time pipeline safety checks.
+///
+/// The core invariant: ring_buffer_capacity > max_rows_per_transaction.
+/// If a single transaction could claim every ring buffer slot before its
+/// .commit arrives, acquireAndFillSlot would spin forever because the
+/// background flush thread cannot reclaim from an empty pending_events queue.
+/// A strict gap ensures at least one slot always remains free for the
+/// background thread, breaking any potential deadlock.
+///
+/// These are the DEFAULT values. RING_BUFFER_COUNT env-var overrides the
+/// runtime ring buffer; the bridge derives max_tx_rows = runtime_size - 1
+/// to maintain the invariant regardless of env-var value.
+pub const MemoryBounds = struct {
+    pub const ring_buffer_capacity: usize = Buffers.default_ring_buffer_count;
+    pub const max_rows_per_transaction: usize = ring_buffer_capacity - 1;
+};
+
 /// Runtime configuration combining compile-time defaults with CLI arguments and environment variables
 /// This struct should be passed to modules instead of having them import config.zig directly
 pub const RuntimeConfig = struct {

@@ -32,6 +32,16 @@ comptime {
 
 pub const log = std.log.scoped(.bridge);
 
+// Double-check the pipeline invariant before spinning up threads.
+// ring_buffer_capacity > max_rows_per_transaction must hold; if it doesn't,
+// a single large transaction can exhaust every free slot before .commit lands,
+// causing acquireAndFillSlot to spin forever (background thread starved).
+comptime {
+    if (Config.MemoryBounds.ring_buffer_capacity <= Config.MemoryBounds.max_rows_per_transaction) {
+        @compileError("Deadlock risk: ring_buffer_capacity must be strictly greater than max_rows_per_transaction.");
+    }
+}
+
 // Global flag for graceful shutdown (shared with HTTP server)
 var should_stop = std.atomic.Value(bool).init(false);
 
