@@ -3,7 +3,7 @@ const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const utils = @import("utils.zig");
 
-// std.posix socket/IO functions removed in Zig 0.16 — use C API directly.
+// std.net was removed in Zig 0.16 "Juicy Main". Use C POSIX sockets directly.
 const sock_c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
@@ -41,9 +41,7 @@ pub const Server = struct {
 
     /// Start the HTTP server thread
     pub fn start(self: *Server) !void {
-        if (self.thread != null) {
-            return error.AlreadyStarted;
-        }
+        if (self.thread != null) return error.AlreadyStarted;
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
@@ -74,7 +72,7 @@ pub const Server = struct {
         var addr = std.mem.zeroes(sock_c.struct_sockaddr_in);
         addr.sin_family = @intCast(sock_c.AF_INET);
         addr.sin_port = std.mem.nativeToBig(u16, self.port);
-        // addr.sin_addr.s_addr = 0 is INADDR_ANY (already zeroed)
+        // sin_addr.s_addr == 0 is INADDR_ANY (zeroed by zeroes())
 
         if (sock_c.bind(sock_fd, @ptrCast(&addr), @as(c_uint, @sizeOf(sock_c.struct_sockaddr_in))) < 0)
             return error.BindFailed;
@@ -90,7 +88,7 @@ pub const Server = struct {
         log.info("  GET  /streams/info?stream=NAME   - NATS stream info", .{});
 
         while (!self.should_stop.load(.seq_cst)) {
-            // Poll with timeout to allow checking shutdown flag
+            // Poll with 100 ms timeout so we can re-check should_stop without blocking.
             var poll_fds = [_]sock_c.struct_pollfd{
                 .{
                     .fd = sock_fd,
@@ -99,22 +97,17 @@ pub const Server = struct {
                 },
             };
 
-            // Poll with 100ms timeout
             const ready = sock_c.poll(&poll_fds[0], 1, 100);
             if (ready < 0) {
                 log.err("⚠️ Poll error", .{});
                 utils.sleep(100 * std.time.ns_per_ms);
                 continue;
             }
-
-            if (ready == 0) {
-                // Timeout - check shutdown flag again
-                continue;
-            }
+            if (ready == 0) continue;
 
             const client_raw = sock_c.accept(sock_fd, null, null);
             if (client_raw < 0) {
-                log.err("🔴 Failed to accept connection: {d}", .{client_raw});
+                log.err("🔴 Failed to accept connection", .{});
                 continue;
             }
             const client_fd: c_int = client_raw;
@@ -130,24 +123,20 @@ pub const Server = struct {
 
     fn handleRequest(self: *Server, fd: c_int) !void {
         var buffer: [2048]u8 = undefined;
-
         const bytes_read_n = sock_c.read(fd, &buffer, buffer.len);
         if (bytes_read_n <= 0) return;
         const bytes_read: usize = @intCast(bytes_read_n);
 
         const request = buffer[0..bytes_read];
 
-        // Parse method and path (simple HTTP parser)
         var lines = std.mem.splitScalar(u8, request, '\n');
         const first_line = lines.next() orelse return;
-
         var parts = std.mem.splitScalar(u8, first_line, ' ');
         const method = std.mem.trim(u8, parts.next() orelse return, &std.ascii.whitespace);
         const path = std.mem.trim(u8, parts.next() orelse return, &std.ascii.whitespace);
 
         log.debug("{s} {s}", .{ method, path });
 
-        // Route
         if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
             try self.handleHealth(fd);
         } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/status")) {
@@ -163,21 +152,18 @@ pub const Server = struct {
         }
     }
 
+    // HTTP/1.1 requires CRLF (\r\n) line endings in the response header.
     fn sendResponse(
         fd: c_int,
         status: []const u8,
         content_type: []const u8,
         body: []const u8,
     ) !void {
-        var response_buffer: [4096]u8 = undefined;
-        const response = try std.fmt.bufPrint(&response_buffer,
-            \\HTTP/1.1 {s}
-            \\Content-Type: {s}
-            \\Content-Length: {d}
-            \\Connection: close
-            \\
-            \\{s}
-        , .{ status, content_type, body.len, body });
+        var buf: [4096]u8 = undefined;
+        const response = try std.fmt.bufPrint(&buf,
+            "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+            .{ status, content_type, body.len, body },
+        );
 
         var pos: usize = 0;
         while (pos < response.len) {
@@ -187,26 +173,22 @@ pub const Server = struct {
         }
     }
 
-    // handlers ----------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Handlers
+    // -------------------------------------------------------------------------
+
     fn handleHealth(self: *Server, fd: c_int) !void {
         _ = self;
-        try sendResponse(
-            fd,
-            "200 OK",
-            "application/json",
-            "{\"status\":\"ok\"}\n",
-        );
+        try sendResponse(fd, "200 OK", "application/json", "{\"status\":\"ok\"}\n");
     }
 
     fn handleStatus(self: *Server, fd: c_int) !void {
         if (self.metrics) |m| {
-            // Get metrics snapshot
             const snap = try m.snapshot(self.allocator);
             defer self.allocator.free(snap.current_lsn_str);
 
-            // Format JSON with real metrics
-            var buffer: [4096]u8 = undefined;
-            const status_json = try std.fmt.bufPrint(&buffer,
+            var buf: [4096]u8 = undefined;
+            const body = try std.fmt.bufPrint(&buf,
                 \\{{
                 \\  "status": "{s}",
                 \\  "uptime_seconds": {d},
@@ -232,36 +214,23 @@ pub const Server = struct {
                 snap.nats_reconnect_count,
                 if (snap.slot_active) "true" else "false",
                 snap.wal_lag_bytes,
-                snap.wal_lag_bytes / (1024 * 1024), // Convert to MB
+                snap.wal_lag_bytes / (1024 * 1024),
                 snap.queue_usage_percent,
             });
 
-            try sendResponse(
-                fd,
-                "200 OK",
-                "application/json",
-                status_json,
-            );
+            try sendResponse(fd, "200 OK", "application/json", body);
         } else {
-            // Fallback if no metrics available
-            try sendResponse(
-                fd,
-                "200 OK",
-                "application/json",
-                "{\"status\":\"no_metrics\"}\n",
-            );
+            try sendResponse(fd, "200 OK", "application/json", "{\"status\":\"no_metrics\"}\n");
         }
     }
 
     fn handleMetrics(self: *Server, fd: c_int) !void {
         if (self.metrics) |m| {
-            // Get metrics snapshot
             const snap = try m.snapshot(self.allocator);
             defer self.allocator.free(snap.current_lsn_str);
 
-            // Format Prometheus text format
-            var buffer: [4096]u8 = undefined;
-            const prom_metrics = try std.fmt.bufPrint(&buffer,
+            var buf: [4096]u8 = undefined;
+            const body = try std.fmt.bufPrint(&buf,
                 \\# HELP bridge_uptime_seconds Time since bridge started
                 \\# TYPE bridge_uptime_seconds gauge
                 \\bridge_uptime_seconds {d}
@@ -315,59 +284,34 @@ pub const Server = struct {
                 snap.queue_usage_percent,
             });
 
-            try sendResponse(
-                fd,
-                "200 OK",
-                "text/plain",
-                prom_metrics,
-            );
+            try sendResponse(fd, "200 OK", "text/plain", body);
         } else {
-            // Empty metrics if not available
-            try sendResponse(
-                fd,
-                "200 OK",
-                "text/plain;",
-                "# ⚠️ No metrics available\n",
-            );
+            try sendResponse(fd, "200 OK", "text/plain", "# No metrics available\n");
         }
     }
 
     fn handleShutdown(self: *Server, fd: c_int) !void {
         log.info("👋 Shutdown requested via HTTP", .{});
-
-        // Set shutdown flag
         self.should_stop.store(true, .seq_cst);
-
-        try sendResponse(
-            fd,
-            "200 OK",
-            "text/plain",
-            "Shutdown initiated\n",
-        );
+        try sendResponse(fd, "200 OK", "text/plain", "Shutdown initiated\n");
     }
 
     fn handleNotFound(self: *Server, fd: c_int) !void {
         _ = self;
-        try sendResponse(
-            fd,
-            "404 Not Found",
-            "text/plain",
-            "Not Found\n",
-        );
+        try sendResponse(fd, "404 Not Found", "text/plain", "Not Found\n");
     }
 
-    // NATS Stream Management Endpoints. "path?key=value&..."
+    // -------------------------------------------------------------------------
+    // NATS stream management endpoints  (?stream=NAME query param)
+    // -------------------------------------------------------------------------
 
     fn parseQueryParam(path: []const u8, param_name: []const u8) ?[]const u8 {
         const query_start = std.mem.indexOf(u8, path, "?") orelse return null;
-
         var it = std.mem.splitScalar(u8, path[query_start + 1 ..], '&');
         while (it.next()) |param| {
             if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
-                const key = param[0..eq_pos];
-                const value = param[eq_pos + 1 ..];
-                if (std.mem.eql(u8, key, param_name)) {
-                    return value;
+                if (std.mem.eql(u8, param[0..eq_pos], param_name)) {
+                    return param[eq_pos + 1 ..];
                 }
             }
         }
@@ -376,55 +320,42 @@ pub const Server = struct {
 
     fn handleStreamInfo(self: *Server, fd: c_int, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(
-                fd,
-                "400 Bad Request",
-                "text/plain",
-                "⚠️ Missing 'stream' parameter\n",
-            );
+            try sendResponse(fd, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
             return;
         };
 
         if (self.nats_publisher) |publisher| {
-            // Get stream info from NATS
             const info = publisher.getStreamInfo(stream_name) catch |err| {
                 var err_buf: [256]u8 = undefined;
-                const err_msg = try std.fmt.bufPrint(&err_buf, "Failed to get stream info: {}\n", .{err});
-                try sendResponse(fd, "500 Internal Server Error", "text/plain", err_msg);
+                const msg = try std.fmt.bufPrint(&err_buf, "Failed to get stream info: {}\n", .{err});
+                try sendResponse(fd, "500 Internal Server Error", "text/plain", msg);
                 return;
             };
             defer self.allocator.free(info);
-
             try sendResponse(fd, "200 OK", "application/json", info);
         } else {
-            try sendResponse(fd, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
+            try sendResponse(fd, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
         }
     }
 
     fn handleStreamPurge(self: *Server, fd: c_int, path: []const u8) !void {
         const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(
-                fd,
-                "400 Bad Request",
-                "text/plain",
-                "⚠️ Missing 'stream' parameter\n",
-            );
+            try sendResponse(fd, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
             return;
         };
 
         if (self.nats_publisher) |publisher| {
             publisher.purgeStream(stream_name) catch |err| {
                 var err_buf: [256]u8 = undefined;
-                const err_msg = try std.fmt.bufPrint(&err_buf, "⚠️ Failed to purge stream: {}\n", .{err});
-                try sendResponse(fd, "500 Internal Server Error", "text/plain", err_msg);
+                const msg = try std.fmt.bufPrint(&err_buf, "Failed to purge stream: {}\n", .{err});
+                try sendResponse(fd, "500 Internal Server Error", "text/plain", msg);
                 return;
             };
-
-            var response_buf: [256]u8 = undefined;
-            const response = try std.fmt.bufPrint(&response_buf, "Stream '{s}' purged\n", .{stream_name});
-            try sendResponse(fd, "200 OK", "text/plain", response);
+            var resp_buf: [256]u8 = undefined;
+            const resp = try std.fmt.bufPrint(&resp_buf, "Stream '{s}' purged\n", .{stream_name});
+            try sendResponse(fd, "200 OK", "text/plain", resp);
         } else {
-            try sendResponse(fd, "503 Service Unavailable", "text/plain", "⚠️ NATS publisher not available\n");
+            try sendResponse(fd, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
         }
     }
 };
