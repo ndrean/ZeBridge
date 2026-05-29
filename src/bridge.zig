@@ -408,6 +408,12 @@ pub fn main(init: std.process.Init) !void {
     const idle_check_interval: u32 = 10; // Check time every 10 iterations (~100ms)
     // --->
 
+    // Per-transaction slot scratchpad: holds ring-buffer indices for the current
+    // in-flight transaction. Nothing is released to the background publisher until
+    // the matching .commit arrives. Pre-allocated to avoid hot-path reallocs.
+    var tx_slots: std.ArrayList(u32) = try std.ArrayList(u32).initCapacity(allocator, 8192);
+    defer tx_slots.deinit(allocator);
+
     // Track relation metadata (table info)
     var relation_map = std.AutoHashMap(u32, pgoutput.RelationMessage).init(allocator);
     defer {
@@ -502,53 +508,61 @@ pub fn main(init: std.process.Init) !void {
                                 log.debug("RELATION: {s}.{s} (id={d}, {d} columns)", .{ rel.namespace, rel.name, rel.relation_id, rel.columns.len });
                             },
                             .begin => |b| {
+                                // Defensive: discard any stale slots from a broken prior tx.
+                                for (tx_slots.items) |s| event_proc.discardSlot(s);
+                                tx_slots.clearRetainingCapacity();
                                 log.info("BEGIN: xid={d} lsn={x}", .{ b.xid, b.final_lsn });
                             },
                             .insert => |ins| {
-                                // tupleData contains the new row values
                                 if (relation_map.get(ins.relation_id)) |rel| {
-                                    try event_proc.processCdcEvent(
+                                    const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
                                         ins.tuple_data,
-                                        null, // No old tuple for INSERT
+                                        null,
                                         "INSERT",
                                         wal_msg.wal_end,
                                     );
+                                    try tx_slots.append(allocator, slot_idx);
                                     cdc_events += 1;
                                 }
                             },
                             .update => |upd| {
                                 if (relation_map.get(upd.relation_id)) |rel| {
-                                    try event_proc.processCdcEvent(
+                                    const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
                                         upd.new_tuple,
-                                        upd.old_tuple, // Pass old tuple for REPLICA IDENTITY FULL
+                                        upd.old_tuple,
                                         "UPDATE",
                                         wal_msg.wal_end,
                                     );
+                                    try tx_slots.append(allocator, slot_idx);
                                     cdc_events += 1;
                                 }
                             },
                             .delete => |del| {
                                 if (relation_map.get(del.relation_id)) |rel| {
-                                    try event_proc.processCdcEvent(
+                                    const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
-                                        del.old_tuple, // Delete passes the old tuple as the main data
-                                        null, // No secondary tuple for DELETE
+                                        del.old_tuple,
+                                        null,
                                         "DELETE",
                                         wal_msg.wal_end,
                                     );
+                                    try tx_slots.append(allocator, slot_idx);
                                     cdc_events += 1;
                                 }
                             },
                             .commit => |commit| {
-                                // Track LSN progression
+                                // Transaction confirmed — release all buffered slots to the publisher.
+                                for (tx_slots.items) |s| try event_proc.releaseSlotToQueue(s);
+                                tx_slots.clearRetainingCapacity();
+
                                 if (commit.commit_lsn != last_lsn) {
                                     const lsn_diff = commit.commit_lsn - last_lsn;
-                                    log.info("COMMIT: lsn={x} (delta: +{d})", .{ commit.commit_lsn, lsn_diff });
+                                    log.info("COMMIT: lsn={x} (delta: +{d}, {d} events released)", .{ commit.commit_lsn, lsn_diff, cdc_events });
                                     last_lsn = commit.commit_lsn;
                                 } else {
                                     log.info("COMMIT: lsn={x}", .{commit.commit_lsn});
@@ -648,6 +662,15 @@ pub fn main(init: std.process.Init) !void {
             // Handle connection errors by reconnecting
             log.warn("Connection lost: {}", .{err});
             metrics.setConnected(false);
+
+            // Discard any slots buffered for the in-flight transaction.
+            // The stream broke before .commit arrived — those rows must not reach NATS.
+            if (tx_slots.items.len > 0) {
+                log.warn("Discarding {d} unpublished slots from incomplete transaction", .{tx_slots.items.len});
+                for (tx_slots.items) |s| event_proc.discardSlot(s);
+                tx_slots.clearRetainingCapacity();
+            }
+
             log.info("Attempting to reconnect in 2 seconds...", .{});
 
             // Zero-allocation ring buffer: no reclaim needed

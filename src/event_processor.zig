@@ -92,14 +92,13 @@ pub const EventProcessor = struct {
         };
     }
 
-    /// Process CDC event from pgoutput format and enqueue for publishing
-    /// Handles REPLICA IDENTITY FULL by accepting optional old_tuple_data
+    /// Decode a WAL mutation, pack it into a ring-buffer slot, and return the slot index.
+    /// The slot is NOT yet visible to the background publisher — call releaseSlotToQueue
+    /// on .commit, or discardSlot on rollback / connection loss.
     ///
-    /// arena_allocator: Used for temporary allocations during tuple decoding.
-    ///                  The caller resets the arena after processing each WAL message.
-    /// tuple_data: Main data (New for Insert/Update, Old for Delete)
-    /// old_tuple_data: Extra Old data (Only for Update with REPLICA IDENTITY FULL)
-    pub fn processCdcEvent(
+    /// arena_allocator: Temporary arena used only during tuple decoding.
+    ///                  Safe to reset after this call returns.
+    pub fn packMutationToSlot(
         self: *EventProcessor,
         arena_allocator: std.mem.Allocator,
         rel: pgoutput.RelationMessage,
@@ -107,7 +106,7 @@ pub const EventProcessor = struct {
         old_tuple_data: ?pgoutput.TupleData,
         operation: []const u8,
         wal_end: u64,
-    ) !void {
+    ) !u32 {
         // We will collect ALL columns (Old + New) in this list
         var all_columns: std.ArrayList(pgoutput.Column) = .empty;
         // No defer deinit needed because we use the arena_allocator which is reset per message
@@ -123,13 +122,13 @@ pub const EventProcessor = struct {
             // Decode the raw WAL bytes for the old tuple
             const old_decoded = pgoutput.decodeTuple(arena_allocator, old_data, rel.columns) catch |err| {
                 log.warn("⚠️ Failed to decode old tuple: {}", .{err});
-                return;
+                return error.TupleDecodeFailed;
             };
 
             // 2. Decode "Main" Tuple (The standard New values)
             const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns) catch |err| {
                 log.warn("⚠️ Failed to decode tuple: {}", .{err});
-                return;
+                return error.TupleDecodeFailed;
             };
 
             // Check if this table has transition rules configured
@@ -181,7 +180,7 @@ pub const EventProcessor = struct {
             // No old tuple data - just process new/main tuple (INSERT or DELETE)
             const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns) catch |err| {
                 log.warn("⚠️ Failed to decode tuple: {}", .{err});
-                return;
+                return error.TupleDecodeFailed;
             };
             try all_columns.appendSlice(arena_allocator, main_decoded.items);
         }
@@ -245,8 +244,9 @@ pub const EventProcessor = struct {
             .{ wal_end, rel.name, operation_lower },
         );
 
-        // Enqueue event to ring buffer using the COMBINED list (zero-allocation!)
-        try self.addEvent(
+        // Pack decoded columns into the ring-buffer slab (zero heap allocation).
+        // Data is deep-copied from the transient arena into the long-lived slot.
+        const slot_idx = try self.acquireAndFillSlot(
             subject,
             rel.name,
             operation,
@@ -256,13 +256,10 @@ pub const EventProcessor = struct {
             wal_end,
         );
 
-        // Update metrics if available
         if (self.metrics) |m| {
             m.incrementCdcEvents();
         }
 
-        // Log single line with table, operation, and ID
-        // Include transition details when detected
         if (is_transition and transition_column_name != null) {
             if (id_str) |id| {
                 log.info("{s} {s}.{s} id={s} [{s}: {s} → {s}] → {s}", .{
@@ -288,17 +285,72 @@ pub const EventProcessor = struct {
             }
         } else {
             if (id_str) |id| {
-                log.info("{s} {s}.{s} id={s} → {s}", .{ operation, rel.namespace, rel.name, id, subject });
+                log.info("{s} {s}.{s} id={s} → {s} [slot={d}]", .{ operation, rel.namespace, rel.name, id, subject, slot_idx });
             } else {
-                log.info("{s} {s}.{s} → {s}", .{ operation, rel.namespace, rel.name, subject });
+                log.info("{s} {s}.{s} → {s} [slot={d}]", .{ operation, rel.namespace, rel.name, subject, slot_idx });
             }
         }
+
+        return slot_idx;
     }
 
-    /// Add an event to the pre-allocated ring buffer. Zero-allocation operation!
-    /// Copies column data into packed buffer - caller must free decoded_values after this returns.
-    /// Writes event data directly into a free slot from the ring buffer.
-    fn addEvent(
+    /// Push a packed slot onto the pending_events queue, making it visible to the
+    /// background publisher. Call this only after the matching .commit is confirmed.
+    pub fn releaseSlotToQueue(self: *EventProcessor, slot_idx: u32) !void {
+        var retry_count: usize = 0;
+        const max_retries_before_fatal_check = 1000;
+        const timer_start: u64 = nanoNow();
+        const watchdog_timeout_ns = std.time.ns_per_s * 30;
+
+        while (true) {
+            self.batch_publisher.pending_events.push(slot_idx) catch |err| {
+                if (err == error.QueueFull) {
+                    retry_count += 1;
+
+                    if (retry_count % max_retries_before_fatal_check == 0) {
+                        if (self.batch_publisher.hasFatalError()) {
+                            log.err("🔴 Flush thread fatal error during commit release", .{});
+                            self.batch_publisher.events[slot_idx].reset();
+                            self.batch_publisher.free_slots.push(slot_idx) catch {};
+                            return error.PublisherFatalError;
+                        }
+                    }
+
+                    if (nanoNow() - timer_start > watchdog_timeout_ns) {
+                        log.err("🔴 FATAL: Flush thread blocked >30s during commit release", .{});
+                        self.batch_publisher.events[slot_idx].reset();
+                        self.batch_publisher.free_slots.push(slot_idx) catch {};
+                        self.batch_publisher.fatal_error.store(true, .seq_cst);
+                        return error.FlushThreadStalled;
+                    }
+
+                    if (retry_count == 1 or retry_count % 100 == 0) {
+                        log.warn("⚠️ Pending queue full during commit release (retry #{d})", .{retry_count});
+                    }
+                    std.Thread.yield() catch {};
+                    continue;
+                }
+
+                self.batch_publisher.events[slot_idx].reset();
+                self.batch_publisher.free_slots.push(slot_idx) catch {};
+                return err;
+            };
+            break;
+        }
+
+        log.debug("Slot {d} released to publisher", .{slot_idx});
+    }
+
+    /// Return a packed slot to the free pool without publishing.
+    /// Call on connection loss or when discarding an incomplete transaction.
+    pub fn discardSlot(self: *EventProcessor, slot_idx: u32) void {
+        self.batch_publisher.events[slot_idx].reset();
+        self.batch_publisher.free_slots.push(slot_idx) catch {};
+    }
+
+    /// Acquire a free slot and pack event data into the ring-buffer slab.
+    /// Returns the slot index. Does NOT push to pending_events.
+    fn acquireAndFillSlot(
         self: *EventProcessor,
         subject: []const u8,
         table: []const u8,
@@ -307,8 +359,8 @@ pub const EventProcessor = struct {
         relation_id: u32,
         decoded_values: std.ArrayList(pgoutput.Column),
         lsn: u64,
-    ) !void {
-        log.debug("📥 Adding event to queue: {s} {s}", .{ operation, table });
+    ) !u32 {
+        log.debug("📥 Packing event into slot: {s} {s}", .{ operation, table });
 
         // Get a free slot from the ring buffer with backpressure retry + watchdog
         // Exit if flush thread has fatal error (NATS dead) to prevent infinite spinning
@@ -395,52 +447,7 @@ pub const EventProcessor = struct {
             };
         }
 
-        // Push slot index to pending queue with retry + watchdog
-        // Exit if flush thread has fatal error to prevent infinite spinning
-        retry_count = 0;
-        const timer_start2: u64 = nanoNow(); // Reset timer for second wait phase
-        while (true) {
-            self.batch_publisher.pending_events.push(slot_idx) catch |err| {
-                if (err == error.QueueFull) {
-                    retry_count += 1;
-
-                    // 1. Check if flush thread has encountered a fatal error
-                    if (retry_count % max_retries_before_fatal_check == 0) {
-                        if (self.batch_publisher.hasFatalError()) {
-                            log.err("🔴 Flush thread has fatal error - aborting event push", .{});
-                            event.reset();
-                            self.batch_publisher.free_slots.push(slot_idx) catch {};
-                            return error.PublisherFatalError;
-                        }
-                    }
-
-                    // 2. Watchdog: Hard timeout if flush thread is completely stuck
-                    {
-                        if (nanoNow() - timer_start2 > watchdog_timeout_ns) {
-                            log.err("🔴 FATAL: Flush thread blocked for >30s during pending queue push", .{});
-                            log.err("    NATS client library appears hung. Forcing shutdown.", .{});
-                            event.reset();
-                            self.batch_publisher.free_slots.push(slot_idx) catch {};
-                            self.batch_publisher.fatal_error.store(true, .seq_cst);
-                            return error.FlushThreadStalled;
-                        }
-                    }
-
-                    if (retry_count == 1 or retry_count % 100 == 0) {
-                        log.warn("⚠️ Pending queue full (retry #{d})", .{retry_count});
-                    }
-                    std.Thread.yield() catch {};
-                    continue;
-                }
-
-                // Unexpected error - return slot to free pool and propagate
-                event.reset();
-                self.batch_publisher.free_slots.push(slot_idx) catch {};
-                return err;
-            };
-            break;
-        }
-
-        log.debug("Event written to slot {d}, pushed to pending queue ({d} columns packed)", .{ slot_idx, event.column_count });
+        log.debug("Event packed into slot {d} ({d} columns)", .{ slot_idx, event.column_count });
+        return @intCast(slot_idx);
     }
 };
