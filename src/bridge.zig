@@ -410,9 +410,21 @@ pub fn main(init: std.process.Init) !void {
 
     // Per-transaction slot scratchpad: holds ring-buffer indices for the current
     // in-flight transaction. Nothing is released to the background publisher until
-    // the matching .commit arrives. Pre-allocated to avoid hot-path reallocs.
-    var tx_slots: std.ArrayList(u32) = try std.ArrayList(u32).initCapacity(allocator, 8192);
-    defer tx_slots.deinit(allocator);
+    // the matching .commit arrives.
+    //
+    // Safety invariant: tx_slots_buf.len < ring_buffer_capacity.
+    // If a single transaction claimed every ring buffer slot before .commit arrived,
+    // acquireAndFillSlot would spin forever because the background thread cannot free
+    // anything from an empty pending_events queue. By capping the tracker one below
+    // the ring buffer size the overflow guard always fires with at least one slot
+    // still free, keeping the background thread able to make progress.
+    const ring_buffer_capacity = runtime_config.batch_ring_buffer_size;
+    const max_tx_rows = ring_buffer_capacity - 1;
+    const tx_slots_buf: []u32 = try allocator.alloc(u32, max_tx_rows);
+    defer allocator.free(tx_slots_buf);
+    var tx_slots_count: usize = 0;
+    std.debug.assert(ring_buffer_capacity > tx_slots_buf.len); // invariant: never exhaust the pool
+    log.info("Ring buffer capacity: {d} slots, transaction row limit: {d}", .{ ring_buffer_capacity, max_tx_rows });
 
     // Track relation metadata (table info)
     var relation_map = std.AutoHashMap(u32, pgoutput.RelationMessage).init(allocator);
@@ -509,12 +521,18 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .begin => |b| {
                                 // Defensive: discard any stale slots from a broken prior tx.
-                                for (tx_slots.items) |s| event_proc.discardSlot(s);
-                                tx_slots.clearRetainingCapacity();
+                                for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
+                                tx_slots_count = 0;
                                 log.info("BEGIN: xid={d} lsn={x}", .{ b.xid, b.final_lsn });
                             },
                             .insert => |ins| {
                                 if (relation_map.get(ins.relation_id)) |rel| {
+                                    if (tx_slots_count >= tx_slots_buf.len) {
+                                        log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
+                                        for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
+                                        tx_slots_count = 0;
+                                        return error.TransactionOverflow;
+                                    }
                                     const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
@@ -523,12 +541,19 @@ pub fn main(init: std.process.Init) !void {
                                         "INSERT",
                                         wal_msg.wal_end,
                                     );
-                                    try tx_slots.append(allocator, slot_idx);
+                                    tx_slots_buf[tx_slots_count] = slot_idx;
+                                    tx_slots_count += 1;
                                     cdc_events += 1;
                                 }
                             },
                             .update => |upd| {
                                 if (relation_map.get(upd.relation_id)) |rel| {
+                                    if (tx_slots_count >= tx_slots_buf.len) {
+                                        log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
+                                        for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
+                                        tx_slots_count = 0;
+                                        return error.TransactionOverflow;
+                                    }
                                     const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
@@ -537,12 +562,19 @@ pub fn main(init: std.process.Init) !void {
                                         "UPDATE",
                                         wal_msg.wal_end,
                                     );
-                                    try tx_slots.append(allocator, slot_idx);
+                                    tx_slots_buf[tx_slots_count] = slot_idx;
+                                    tx_slots_count += 1;
                                     cdc_events += 1;
                                 }
                             },
                             .delete => |del| {
                                 if (relation_map.get(del.relation_id)) |rel| {
+                                    if (tx_slots_count >= tx_slots_buf.len) {
+                                        log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
+                                        for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
+                                        tx_slots_count = 0;
+                                        return error.TransactionOverflow;
+                                    }
                                     const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
@@ -551,14 +583,23 @@ pub fn main(init: std.process.Init) !void {
                                         "DELETE",
                                         wal_msg.wal_end,
                                     );
-                                    try tx_slots.append(allocator, slot_idx);
+                                    tx_slots_buf[tx_slots_count] = slot_idx;
+                                    tx_slots_count += 1;
                                     cdc_events += 1;
                                 }
                             },
                             .commit => |commit| {
                                 // Transaction confirmed — release all buffered slots to the publisher.
-                                for (tx_slots.items) |s| try event_proc.releaseSlotToQueue(s);
-                                tx_slots.clearRetainingCapacity();
+                                // On error, recycle remaining unreleased slots rather than leaking them.
+                                var released: usize = 0;
+                                while (released < tx_slots_count) : (released += 1) {
+                                    event_proc.releaseSlotToQueue(tx_slots_buf[released]) catch |err| {
+                                        log.err("Failed to release slot to publisher: {} — discarding {d} remaining slots", .{ err, tx_slots_count - released });
+                                        for (tx_slots_buf[released..tx_slots_count]) |s| event_proc.discardSlot(s);
+                                        break;
+                                    };
+                                }
+                                tx_slots_count = 0;
 
                                 if (commit.commit_lsn != last_lsn) {
                                     const lsn_diff = commit.commit_lsn - last_lsn;
@@ -665,10 +706,10 @@ pub fn main(init: std.process.Init) !void {
 
             // Discard any slots buffered for the in-flight transaction.
             // The stream broke before .commit arrived — those rows must not reach NATS.
-            if (tx_slots.items.len > 0) {
-                log.warn("Discarding {d} unpublished slots from incomplete transaction", .{tx_slots.items.len});
-                for (tx_slots.items) |s| event_proc.discardSlot(s);
-                tx_slots.clearRetainingCapacity();
+            if (tx_slots_count > 0) {
+                log.warn("Discarding {d} unpublished slots from incomplete transaction", .{tx_slots_count});
+                for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
+                tx_slots_count = 0;
             }
 
             log.info("Attempting to reconnect in 2 seconds...", .{});

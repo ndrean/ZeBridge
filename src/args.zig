@@ -60,6 +60,7 @@ pub const Args = struct {
         runtime_config.slot_name = slot_name;
         runtime_config.publication_name = publication_name;
         runtime_config.enable_compression = enable_compression;
+        runtime_config.encoding_format = encoding_format;
 
         // Read PostgreSQL configuration from environment variables via Juicy Main environ.
         // getPosix() returns a slice into the environ block (valid for program lifetime).

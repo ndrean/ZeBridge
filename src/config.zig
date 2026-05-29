@@ -4,6 +4,7 @@
 //! Instead of hardcoded values scattered across files, all tunables are defined here.
 
 const std = @import("std");
+const encoder = @import("encoder.zig");
 
 /// Compression recipe for zstd snapshots
 /// Defined here to avoid circular imports (config.zig ← → zstd.zig)
@@ -308,6 +309,9 @@ pub const RuntimeConfig = struct {
     // Buffer settings
     event_data_buffer_log2: u6,
 
+    // Encoding format
+    encoding_format: encoder.Format,
+
     /// Create default runtime configuration from compile-time constants
     /// Note: PostgreSQL connection fields are set to defaults that should be overridden from environment
     pub fn defaults() RuntimeConfig {
@@ -329,6 +333,7 @@ pub const RuntimeConfig = struct {
             .enable_compression = false, // disabled by default
             .recipe = .binary, // optimal balance for snapshots (94% compression, 6ms/MB)
             .event_data_buffer_log2 = Buffers.default_event_data_buffer_log2,
+            .encoding_format = .msgpack,
         };
     }
 
