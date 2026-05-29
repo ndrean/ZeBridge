@@ -763,7 +763,12 @@ pub const BatchPublisher = struct {
         for (batch_items) |slot_idx| {
             self.events[slot_idx].reset();
             self.free_slots.push(slot_idx) catch |err| {
-                log.err("Failed to push slot to free queue: {}", .{err});
+                // free_slots.push() cannot fail under correct operation: total slot indices
+                // are a conserved quantity equal to event_count, and queue capacity >= event_count+1.
+                // If we land here it's an invariant violation / programming bug. Without fatal_error
+                // the slot leaks permanently, the ring buffer starves, and the pipeline silently deadlocks.
+                log.err("🔴 Invariant violated: free_slots full on slot reclaim {d}: {} — shutting down", .{ slot_idx, err });
+                self.fatal_error.store(true, .seq_cst);
             };
         }
     }
