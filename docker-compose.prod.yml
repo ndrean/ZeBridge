@@ -64,7 +64,6 @@ services:
       - "${BRIDGE_CDC_PUBLICATION}"
       - "--port"
       - "${BRIDGE_PORT}"
-      - "--msgpack"
       - "--zstd"
 
     networks:
@@ -85,6 +84,34 @@ services:
     extends:
       file: docker-compose.yml
       service: nats-init
+
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: consumer
+    depends_on:
+      nats-init:
+        condition: service_completed_successfully
+      bridge:
+        condition: service_started
+    env_file:
+      - .env.prod
+    environment:
+      NATS_HOST: nats-server
+      NATS_PORT: "4222"
+      NATS_USER: ${NATS_BRIDGE_USER}
+      NATS_PASSWORD: ${NATS_BRIDGE_PASSWORD}
+      TABLES: ${BRIDGE_CDC_TABLES}
+      FORMAT: msgpack
+      PG_HOST: postgres
+      PG_PORT: ${PG_PORT}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DB: ${PG_DB}
+    networks:
+      - cdc-bridge
+    restart: unless-stopped
 
 volumes:
   postgres-data:

@@ -18,18 +18,18 @@ RUN apk add --no-cache \
     zstd-dev \
     zstd-static
 
-# Download and install Zig 0.15.2 (matching local development version)
+# Download and install Zig 0.16.0 (required by minimum_zig_version in build.zig.zon)
 # Detect architecture and download appropriate version
 RUN ARCH=$(uname -m) && \
     cd /tmp && \
     if [ "$ARCH" = "aarch64" ]; then \
-    curl -L https://ziglang.org/download/0.15.2/zig-aarch64-linux-0.15.2.tar.xz -o zig.tar.xz && \
+    curl -L https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz -o zig.tar.xz && \
     tar -xf zig.tar.xz && \
-    mv zig-aarch64-linux-0.15.2 /usr/local/zig; \
+    mv zig-aarch64-linux-0.16.0 /usr/local/zig; \
     else \
-    curl -L https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz -o zig.tar.xz && \
+    curl -L https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o zig.tar.xz && \
     tar -xf zig.tar.xz && \
-    mv zig-x86_64-linux-0.15.2 /usr/local/zig; \
+    mv zig-x86_64-linux-0.16.0 /usr/local/zig; \
     fi && \
     ln -s /usr/local/zig/zig /usr/local/bin/zig && \
     rm zig.tar.xz
