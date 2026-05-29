@@ -5,7 +5,7 @@ defmodule Consumer.MixProject do
     [
       app: :consumer,
       version: "0.1.0",
-      elixir: "~> 1.15",
+      elixir: "~> 1.19",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       aliases: aliases(),
@@ -35,13 +35,13 @@ defmodule Consumer.MixProject do
 
   defp deps do
     [
-      {:gnat, "~> 1.12"},
+      {:gnat, "~> 1.14"},
       {:jetstream, "~> 0.0.9"},
       {:msgpax, "~> 2.4"},
-      {:postgrex, "~> 0.21.1"},
-      {:ecto_sql, "~> 3.13"},
+      {:postgrex, "~> 0.22"},
+      {:ecto_sql, "~> 3.14"},
       {:req, "~> 0.5"},
-      {:protobuf, "~> 0.15.0"},
+      {:protobuf, "~> 0.16"},
       {:jason, "~> 1.4"},
       {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
