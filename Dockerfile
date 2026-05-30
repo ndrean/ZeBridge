@@ -15,6 +15,7 @@ RUN apk add --no-cache \
     musl-dev \
     postgresql-dev \
     openssl-dev \
+    openssl-libs-static \
     zstd-dev \
     zstd-static
 
@@ -40,16 +41,12 @@ COPY . .
 # Clean any existing builds
 RUN rm -rf libs/libpq-install zig-out zig-cache
 
-RUN zig build -Doptimize=ReleaseFast
+RUN zig build -Doptimize=ReleaseFast -Dstatic=true
 
 FROM ${BASE_IMAGE}
 
-# Install runtime libraries
-RUN apk add --no-cache \
-    libpq \
-    ca-certificates \
-    openssl-dev \
-    zstd-libs 
+# Static binary needs no runtime libraries — only ca-certificates for TLS trust store
+RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge
 

@@ -10,13 +10,11 @@ const Config = @import("config.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
 
-const c_time = @cImport(@cInclude("time.h"));
-
 fn nanoNow() u64 {
-    var ts: c_time.struct_timespec = undefined;
-    _ = c_time.clock_gettime(c_time.CLOCK_MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s +
-        @as(u64, @intCast(ts.tv_nsec));
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(ts.nsec));
 }
 
 pub const log = std.log.scoped(.event_processor);
