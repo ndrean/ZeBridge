@@ -158,6 +158,14 @@ pub const Args = struct {
             log.info("RING_BUFFER_COUNT not set, using default: {d} events", .{runtime_config.batch_ring_buffer_size});
         }
 
+        // NATS connection — slices into environ block, no allocation needed
+        runtime_config.nats_host = init.minimal.environ.getPosix("NATS_HOST") orelse blk: {
+            log.info("NATS_HOST not set, using default: {s}", .{runtime_config.nats_host});
+            break :blk runtime_config.nats_host;
+        };
+        runtime_config.nats_user = init.minimal.environ.getPosix("NATS_BRIDGE_USER");
+        runtime_config.nats_pass = init.minimal.environ.getPosix("NATS_BRIDGE_PASSWORD");
+
         return .{
             .args = cli_args,
             .runtime_config = runtime_config,

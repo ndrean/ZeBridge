@@ -92,7 +92,16 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
         return error.ProtocolError;
     }
 
-    try cn.writeAll(protocol.ConnectString);
+    if (co.user != null and co.pass != null) {
+        var buf: [512]u8 = undefined;
+        const connect_str = std.fmt.bufPrint(&buf,
+            "CONNECT {{\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"lang\":\"Zig\",\"version\":\"T.B.D\",\"protocol\":1,\"echo\":true,\"no_responders\":true,\"headers\":true,\"user\":\"{s}\",\"pass\":\"{s}\"}}\r\n",
+            .{ co.user.?, co.pass.? },
+        ) catch return error.ConnectStringTooLong;
+        try cn.writeAll(connect_str);
+    } else {
+        try cn.writeAll(protocol.ConnectString);
+    }
 
     return;
 }

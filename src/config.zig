@@ -309,6 +309,9 @@ pub const RuntimeConfig = struct {
 
     // NATS
     nats_url: []const u8,
+    nats_host: []const u8,
+    nats_user: ?[]const u8,
+    nats_pass: ?[]const u8,
 
     // Batch settings
     batch_max_events: usize,
@@ -342,6 +345,9 @@ pub const RuntimeConfig = struct {
             .slot_name = Postgres.default_slot_name,
             .publication_name = Postgres.default_publication_name,
             .nats_url = Nats.default_url,
+            .nats_host = "127.0.0.1",
+            .nats_user = null,
+            .nats_pass = null,
             .batch_max_events = Batch.max_events,
             .batch_max_wait_ms = Batch.max_age_ms,
             .batch_max_payload_bytes = Batch.max_payload_bytes,

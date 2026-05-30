@@ -203,6 +203,9 @@ pub const SnapshotListener = struct {
     enable_compression: bool,
     recipe: config.CompressionRecipe,
     io: std.Io,
+    nats_host: []const u8,
+    nats_user: ?[]const u8,
+    nats_pass: ?[]const u8,
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -225,6 +228,9 @@ pub const SnapshotListener = struct {
             .enable_compression = runtime_config.enable_compression,
             .recipe = runtime_config.recipe,
             .io = io,
+            .nats_host = runtime_config.nats_host,
+            .nats_user = runtime_config.nats_user,
+            .nats_pass = runtime_config.nats_pass,
         };
     }
 
@@ -262,6 +268,9 @@ pub const SnapshotListener = struct {
             self.monitored_tables,
             self.format,
             self.io,
+            self.nats_host,
+            self.nats_user,
+            self.nats_pass,
         });
 
         // Spawn snapshot request handler thread (pure g41797/nats - no nats.c dependency!)
@@ -276,6 +285,9 @@ pub const SnapshotListener = struct {
             self.enable_compression,
             self.recipe,
             self.io,
+            self.nats_host,
+            self.nats_user,
+            self.nats_pass,
         });
 
         // Keep main thread alive - just sleep until stop signal
@@ -309,6 +321,9 @@ pub const SnapshotListener = struct {
         monitored_tables: []const []const u8,
         format: encoder_mod.Format,
         io: std.Io,
+        nats_host: []const u8,
+        nats_user: ?[]const u8,
+        nats_pass: ?[]const u8,
     ) void {
         const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
 
@@ -318,7 +333,7 @@ pub const SnapshotListener = struct {
 
             // Create Core NATS connection
             var core = nats.Core{};
-            const connect_opts = nats.protocol.ConnectOpts{}; // Use defaults
+            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .user = nats_user, .pass = nats_pass };
             core.CONNECT(allocator, connect_opts, io) catch |err| {
                 log.err("📋 Schema listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
@@ -594,6 +609,9 @@ pub const SnapshotListener = struct {
         enable_compression: bool,
         recipe: config.CompressionRecipe,
         io: std.Io,
+        nats_host: []const u8,
+        nats_user: ?[]const u8,
+        nats_pass: ?[]const u8,
     ) void {
         const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
 
@@ -603,7 +621,7 @@ pub const SnapshotListener = struct {
 
             // Create Core NATS connection
             var core = nats.Core{};
-            const connect_opts = nats.protocol.ConnectOpts{};
+            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .user = nats_user, .pass = nats_pass };
             core.CONNECT(allocator, connect_opts, io) catch |err| {
                 log.err("📸 Snapshot listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
@@ -683,6 +701,9 @@ pub const SnapshotListener = struct {
                         recipe,
                         should_stop,
                         io,
+                        nats_host,
+                        nats_user,
+                        nats_pass,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         // TODO: Implement publishSnapshotErrorZig if needed for error reporting
@@ -713,6 +734,9 @@ pub const SnapshotListener = struct {
         recipe: config.CompressionRecipe,
         should_stop: *std.atomic.Value(bool),
         io: std.Io,
+        nats_host: []const u8,
+        nats_user: ?[]const u8,
+        nats_pass: ?[]const u8,
     ) !void {
         log.info("📸 Generating snapshot for '{s}' (id={s}, compression={}, chunk_size={d})", .{
             table_name,
@@ -722,7 +746,7 @@ pub const SnapshotListener = struct {
         });
 
         // Create JetStream connection for publishing snapshot data
-        const connect_opts = nats.protocol.ConnectOpts{};
+        const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .user = nats_user, .pass = nats_pass };
         var js = nats.JS.CONNECT(allocator, connect_opts, io) catch |err| {
             log.err("📸 Failed to connect to JetStream: {}", .{err});
             return error.JetStreamConnectionFailed;

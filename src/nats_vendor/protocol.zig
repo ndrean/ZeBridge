@@ -25,6 +25,10 @@ pub const ConnectOpts = struct {
     addr: ?[]const u8 = DefaultAddr,
     /// Server port.
     port: ?u16 = DefaultPort,
+    /// Optional username for NATS authentication.
+    user: ?[]const u8 = null,
+    /// Optional password for NATS authentication.
+    pass: ?[]const u8 = null,
 };
 
 const ClientOpts = struct {
