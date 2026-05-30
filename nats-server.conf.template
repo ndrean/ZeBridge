@@ -1,0 +1,15 @@
+# nats-server.conf — generated from nats-server.conf.template by nats-config-gen
+# Variables ${NATS_BRIDGE_USER} and ${NATS_BRIDGE_PASSWORD} are substituted at startup.
+
+port: 4222
+http_port: 8222
+
+authorization {
+  users: [
+    { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" }
+  ]
+}
+
+jetstream {
+  store_dir: "/data"
+}

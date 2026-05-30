@@ -1,8 +1,8 @@
 # Run with:
-#   docker compose -f docker-compose.prod.yml --env-file .env.prod up --build
+#   docker compose -f docker-compose.user.pwd.yml -f docker-compose.prod.yml --env-file .env.prod up --build
 #
-# --env-file is required for ${VAR} substitution in this file (ports, slot names, etc.)
-# env_file inside each service handles runtime container environment separately.
+# docker-compose.user.pwd.yml provides: postgres, nats-config-gen, nats-server, nats-init (with auth)
+# This file adds:                        bridge-init, bridge, consumer
 
 services:
   bridge-init:
@@ -71,25 +71,9 @@ services:
       - "--port"
       - "${BRIDGE_PORT}"
       - "--zstd"
-
     networks:
       - cdc-bridge
     restart: unless-stopped
-
-  postgres:
-    extends:
-      file: docker-compose.yml
-      service: postgres
-
-  nats-server:
-    extends:
-      file: docker-compose.yml
-      service: nats-server
-
-  nats-init:
-    extends:
-      file: docker-compose.yml
-      service: nats-init
 
   consumer:
     build:

@@ -90,7 +90,7 @@ services:
         echo 'Waiting for NATS server to start...'
         sleep 5
         echo 'Attempting to connect to NATS server...'
-        until nats server check connection --server=nats://bridge_user:bridge_secure_password@nats-server:4222 2>/dev/null; do
+        until nats server check connection --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 2>/dev/null; do
           echo 'NATS not ready yet, retrying in 2s...'
           sleep 2
         done
