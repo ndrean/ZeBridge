@@ -20,9 +20,9 @@ pub const log = std.log.scoped(.batch_publisher);
 
 /// Monotonic millisecond timestamp (replacement for removed getMilliTimestamp())
 fn getMilliTimestamp() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
 /// Initialize memory slab for event ring buffer with optional memory locking

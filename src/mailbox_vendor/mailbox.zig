@@ -497,19 +497,17 @@ const std = @import("std");
 const Mutex = std.Io.Mutex;
 const Condition = std.Io.Condition;
 
-const c_time = @cImport(@cInclude("time.h"));
-
 fn sleep(ns: u64) void {
-    var ts = c_time.struct_timespec{
-        .tv_sec = @as(c_time.time_t, @intCast(ns / std.time.ns_per_s)),
-        .tv_nsec = @as(c_long, @intCast(ns % std.time.ns_per_s)),
+    var ts = std.os.linux.timespec{
+        .sec = @as(isize, @intCast(ns / std.time.ns_per_s)),
+        .nsec = @as(isize, @intCast(ns % std.time.ns_per_s)),
     };
-    _ = c_time.nanosleep(&ts, null);
+    _ = std.os.linux.nanosleep(&ts, null);
 }
 
 fn nanoNow() u64 {
-    var ts: c_time.struct_timespec = undefined;
-    _ = c_time.clock_gettime(c_time.CLOCK_MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.tv_sec)) * std.time.ns_per_s +
-        @as(u64, @intCast(ts.tv_nsec));
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(ts.nsec));
 }

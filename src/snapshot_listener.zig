@@ -2053,9 +2053,9 @@ fn publishDictionary(
 }
 
 fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    const micro_seed = @as(u64, @intCast(ts.tv_sec)) * 1_000_000 + @as(u64, @intCast(ts.tv_nsec)) / 1_000;
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    const micro_seed = @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1_000;
     var prng = std.Random.DefaultPrng.init(micro_seed);
     const random_suffix = prng.random().int(u16);
 

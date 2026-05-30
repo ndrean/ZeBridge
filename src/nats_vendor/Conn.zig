@@ -832,12 +832,10 @@ pub fn newInbox() [36]u8 {
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
-const c_time = @cImport(@cInclude("time.h"));
-
 fn nanoNow() u64 {
-    var ts: c_time.struct_timespec = undefined;
-    _ = c_time.clock_gettime(c_time.CLOCK_MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 const Allocator = std.mem.Allocator;
 const Thread = std.Thread;
