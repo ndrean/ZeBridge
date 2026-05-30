@@ -308,19 +308,6 @@ pub fn main(init: std.process.Init) !void {
     // Store monitored tables for validation (used by schema changes and snapshot requests)
     const monitored_tables = replication_ctx.tables;
 
-    // Train dictionaries from sample data if compression is enabled
-    if (runtime_config.enable_compression) {
-        snapshot_listener.initializeDictionaries(
-            allocator,
-            &pg_config,
-            monitored_tables,
-            io,
-        ) catch |err| {
-            log.warn("⚠️  Dictionary training failed: {} (compression will work without dictionaries)", .{err});
-            // Continue without dictionaries - graceful degradation
-        };
-    }
-
     // === Start thread: snapshot listener
     log.info("Starting snapshot listener thread...", .{});
     var snap_listener = snapshot_listener.SnapshotListener.init(

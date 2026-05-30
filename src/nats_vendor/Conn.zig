@@ -625,11 +625,11 @@ pub fn waitMessageNMT(cn: *Conn, timeout_ns: u64, subject: ?[]const u8) error{ C
                     return error.CommunicationFailure;
                 };
             },
-            .PONG, .OK => {},
+            .PONG, .OK, .INFO => {},
             .INTERRUPT => {
                 return error.Interrupted;
             },
-            // .INFO .CONNECT .SUB .UNSUB .ERR
+            // .CONNECT .SUB .UNSUB .ERR
             else => {
                 return error.CommunicationFailure;
             },
