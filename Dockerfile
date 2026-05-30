@@ -41,12 +41,16 @@ COPY . .
 # Clean any existing builds
 RUN rm -rf libs/libpq-install zig-out zig-cache
 
-RUN zig build -Doptimize=ReleaseFast -Dstatic=true
+RUN zig build -Doptimize=ReleaseFast
 
 FROM ${BASE_IMAGE}
 
-# Static binary needs no runtime libraries — only ca-certificates for TLS trust store
-RUN apk add --no-cache ca-certificates
+# Runtime dependencies (dynamically linked)
+# libpq pulls in libssl3/libcrypto3 transitively on Alpine
+RUN apk add --no-cache \
+    libpq \
+    zstd-libs \
+    ca-certificates
 
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge
 

@@ -94,13 +94,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // -Dstatic=true: produce a fully static binary using .a archives from the
-    // system prefix.  Requires the builder to have installed the *-static or
-    // *-dev packages that ship libssl.a, libcrypto.a, libzstd.a, libpq.a
-    // (e.g. on Alpine: openssl-libs-static, zstd-static, postgresql-dev).
-    const static_build = b.option(bool, "static", "Produce a fully static binary (links .a archives, no .so at runtime)") orelse false;
-    if (static_build) exe.linkage = .static;
-
     // Link OpenSSL (required for pure Zig NATS TLS support)
     exe.root_module.linkSystemLibrary("ssl", .{});
     exe.root_module.linkSystemLibrary("crypto", .{});
