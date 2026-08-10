@@ -6,18 +6,6 @@
 const std = @import("std");
 const encoder = @import("encoder.zig");
 
-/// Compression recipe for zstd snapshots
-/// Defined here to avoid circular imports (config.zig ← → zstd.zig)
-/// The actual compression parameters (level, strategy) are interpreted by zstd.zig
-pub const CompressionRecipe = enum {
-    fast,            // level 1, fast strategy
-    balanced,        // level 3, dfast strategy
-    binary,          // level 6, lazy2 strategy (default for snapshots)
-    text,            // level 9, btopt strategy
-    structured_data, // level 9, btultra strategy (MessagePack/JSON)
-    maximum,         // level 22, btultra2 strategy
-};
-
 /// PostgreSQL connection and replication configuration
 pub const Postgres = struct {
     pub const default_slot_name = "cdc_slot";
@@ -176,9 +164,6 @@ pub const Snapshot = struct {
     /// NATS KV bucket name for schemas
     pub const kv_bucket_schemas = "schemas";
 
-    /// NATS KV bucket name for zstd dictionaries
-    pub const kv_bucket_dictionaries = "dictionaries";
-
     /// Message ID pattern for data chunks: "snap-<table>-<snapshot_id>-<chunk>"
     pub const data_msg_id_pattern = "snap-{s}-{s}-{d}";
 };
@@ -322,10 +307,6 @@ pub const RuntimeConfig = struct {
     // Snapshot settings
     snapshot_chunk_size: usize,
 
-    // Compression settings
-    enable_compression: bool,
-    recipe: CompressionRecipe,
-
     // Buffer settings
     event_data_buffer_log2: u6,
 
@@ -353,8 +334,6 @@ pub const RuntimeConfig = struct {
             .batch_max_payload_bytes = Batch.max_payload_bytes,
             .batch_ring_buffer_size = Buffers.default_ring_buffer_count,
             .snapshot_chunk_size = Snapshot.chunk_size,
-            .enable_compression = false, // disabled by default
-            .recipe = .binary, // optimal balance for snapshots (94% compression, 6ms/MB)
             .event_data_buffer_log2 = Buffers.default_event_data_buffer_log2,
             .encoding_format = .msgpack,
         };

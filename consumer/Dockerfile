@@ -1,4 +1,6 @@
-FROM elixir:1.17-otp-27-alpine AS builder
+ARG ELIXIR_IMAGE=elixir:1.17-otp-27-alpine
+
+FROM ${ELIXIR_IMAGE} AS builder
 
 RUN apk add --no-cache build-base git
 
@@ -16,7 +18,7 @@ COPY lib lib/
 
 RUN mix compile
 
-FROM elixir:1.17-otp-27-alpine
+FROM ${ELIXIR_IMAGE}
 
 RUN apk add --no-cache libstdc++ openssl ncurses-libs
 

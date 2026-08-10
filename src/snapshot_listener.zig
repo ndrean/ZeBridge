@@ -2,7 +2,7 @@
 //!
 //! Runs in a dedicated thread to:
 //! 1. Subscribe to NATS 'snapshot.request.>' subject
-//! 2. Generate incremental snapshots in chunks using COPY CSV
+//! 2. Generate incremental snapshots in chunks using COPY
 //! 3. Publish snapshot chunks to NATS INIT stream
 
 const std = @import("std");
@@ -15,9 +15,7 @@ const msgpack = @import("msgpack");
 const pg_copy_csv = @import("pg_copy_csv.zig");
 const encoder_mod = @import("encoder.zig");
 const streaming_encoder = @import("streaming_encoder.zig");
-const zstd = @import("zstd");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
-const dictionaries_cache = @import("dictionaries_cache.zig");
 const nats = @import("nats");
 const utils = @import("utils.zig");
 
@@ -83,16 +81,6 @@ fn publishWithRetry(
     log.info("🛑 Shutdown requested - aborting publish", .{});
     return error.ShutdownRequested;
 }
-
-// Global dictionary cache for pre-trained zstd dictionaries
-// Initialized once on bridge startup and read-only afterwards (thread-safe)
-var global_dictionaries: ?*dictionaries_cache.DictionariesCache = null;
-var dictionaries_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) };
-var g_snapshot_io: std.Io = undefined;
-var dictionaries_allocator: ?std.mem.Allocator = null;
-
-// Global dictionary manager for zstd compression with digested dictionaries
-var global_dict_manager: ?*zstd.DictionaryManager = null;
 
 /// Primary key metadata for a table (used for chunked snapshots)
 const PkMetadata = struct {
@@ -186,8 +174,6 @@ const SnapshotContext = struct {
     monitored_tables: []const []const u8,
     format: encoder_mod.Format,
     chunk_size: usize,
-    enable_compression: bool,
-    recipe: config.CompressionRecipe,
     // js_ctx: ?*anyopaque, // JetStream context for KV access (optional)
 };
 
@@ -200,8 +186,6 @@ pub const SnapshotListener = struct {
     thread: ?std.Thread = null,
     format: encoder_mod.Format,
     chunk_size: usize,
-    enable_compression: bool,
-    recipe: config.CompressionRecipe,
     io: std.Io,
     nats_host: []const u8,
     nats_user: ?[]const u8,
@@ -225,8 +209,6 @@ pub const SnapshotListener = struct {
             .thread = null,
             .format = format,
             .chunk_size = runtime_config.snapshot_chunk_size,
-            .enable_compression = runtime_config.enable_compression,
-            .recipe = runtime_config.recipe,
             .io = io,
             .nats_host = runtime_config.nats_host,
             .nats_user = runtime_config.nats_user,
@@ -253,8 +235,6 @@ pub const SnapshotListener = struct {
     /// Deinit - cleanup resources (call after join)
     pub fn deinit(self: *SnapshotListener) void {
         _ = self;
-        // Cleanup global dictionaries cache
-        deinitDictionaries();
     }
 
     /// Background listening loop (internal)
@@ -282,8 +262,6 @@ pub const SnapshotListener = struct {
             self.monitored_tables,
             self.format,
             self.chunk_size,
-            self.enable_compression,
-            self.recipe,
             self.io,
             self.nats_host,
             self.nats_user,
@@ -606,8 +584,6 @@ pub const SnapshotListener = struct {
         monitored_tables: []const []const u8,
         format: encoder_mod.Format,
         chunk_size: usize,
-        enable_compression: bool,
-        recipe: config.CompressionRecipe,
         io: std.Io,
         nats_host: []const u8,
         nats_user: ?[]const u8,
@@ -689,7 +665,7 @@ pub const SnapshotListener = struct {
 
                     log.info("📸 Generating snapshot for '{s}' (id={s})", .{ table_name, snapshot_id });
 
-                    // Generate snapshot (without KV/dictionary, using pure g41797/nats JetStream)
+                    // Generate snapshot using pure g41797/nats JetStream
                     generateIncrementalSnapshotZig(
                         allocator,
                         pg_config,
@@ -697,8 +673,6 @@ pub const SnapshotListener = struct {
                         snapshot_id,
                         format,
                         chunk_size,
-                        enable_compression,
-                        recipe,
                         should_stop,
                         io,
                         nats_host,
@@ -730,18 +704,15 @@ pub const SnapshotListener = struct {
         snapshot_id: []const u8,
         format: encoder_mod.Format,
         chunk_size: usize,
-        enable_compression: bool,
-        recipe: config.CompressionRecipe,
         should_stop: *std.atomic.Value(bool),
         io: std.Io,
         nats_host: []const u8,
         nats_user: ?[]const u8,
         nats_pass: ?[]const u8,
     ) !void {
-        log.info("📸 Generating snapshot for '{s}' (id={s}, compression={}, chunk_size={d})", .{
+        log.info("📸 Generating snapshot for '{s}' (id={s}, chunk_size={d})", .{
             table_name,
             snapshot_id,
-            enable_compression,
             chunk_size,
         });
 
@@ -788,7 +759,7 @@ pub const SnapshotListener = struct {
         const lsn_str: []const u8 = std.mem.span(c.PQgetvalue(lsn_result, 0, 0));
         log.info("📸 Snapshot started at LSN: {s}", .{lsn_str});
 
-        // Publish snapshot start notification (NO dictionary_id)
+        // Publish snapshot start notification
         publishSnapshotStartZig(
             allocator,
             &js,
@@ -796,8 +767,6 @@ pub const SnapshotListener = struct {
             snapshot_id,
             lsn_str,
             format,
-            null, // NO dictionary
-            enable_compression,
             should_stop,
         ) catch |err| {
             log.warn("Failed to publish snapshot start: {}", .{err});
@@ -874,52 +843,7 @@ pub const SnapshotListener = struct {
             // Get the encoded MessagePack data (no allocation - slice of encode_buffer)
             const encoded = encoder.getWritten();
 
-            // Get dictionary info for headers
-            var dict_id_opt: ?[]const u8 = null;
-            if (enable_compression and global_dict_manager != null) {
-                dictionaries_mutex.lockUncancelable(g_snapshot_io);
-                if (global_dictionaries) |cache| {
-                    if (cache.getDictId(table_name)) |dict_id| {
-                        dict_id_opt = dict_id;
-                    }
-                }
-                dictionaries_mutex.unlock(g_snapshot_io);
-            }
-
-            // Compress if enabled (with dictionary if available)
-            const payload = if (enable_compression) blk: {
-                const zstd_recipe: zstd.CompressionRecipe = @enumFromInt(@intFromEnum(recipe));
-                var compressor = try zstd.Compressor.init(.{ .recipe = zstd_recipe });
-                defer compressor.deinit();
-
-                // Try to use dictionary compression if available
-                if (global_dict_manager) |manager| {
-                    dictionaries_mutex.lockUncancelable(g_snapshot_io);
-                    defer dictionaries_mutex.unlock(g_snapshot_io);
-
-                    if (manager.getCDict(table_name)) |cdict| {
-                        const result = try compressor.compress_using_cdict(allocator, encoded, cdict);
-                        log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, with dictionary)", .{
-                            batch,
-                            encoded.len,
-                            result.len,
-                            @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
-                        });
-                        break :blk result;
-                    }
-                }
-
-                // No dictionary available - use standard compression
-                const result = try compressor.compress(allocator, encoded);
-                log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, no dictionary)", .{
-                    batch,
-                    encoded.len,
-                    result.len,
-                    @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
-                });
-                break :blk result;
-            } else encoded;
-            defer if (enable_compression) allocator.free(payload);
+            const payload = encoded;
 
             // Publish chunk to JetStream with Nats-Msg-Id header for deduplication
             // Use chunk_alloc (arena) for all per-chunk allocations
@@ -945,13 +869,6 @@ pub const SnapshotListener = struct {
 
             // Content metadata
             try headers.append("Content-Type", "application/msgpack");
-            if (enable_compression) {
-                try headers.append("Content-Encoding", "zstd");
-                // Add dictionary ID if compression used a dictionary
-                if (dict_id_opt) |dict_id| {
-                    try headers.append("X-Zstd-Dict-ID", dict_id);
-                }
-            }
 
             // Snapshot versioning
             try headers.append("X-Format", "array"); // Tells consumer: expect [[v1,v2,...]]
@@ -1014,7 +931,7 @@ pub const SnapshotListener = struct {
 
         log.info("✅ Transaction committed", .{});
 
-        // Publish metadata (NO dictionary_id)
+        // Publish metadata
         try publishSnapshotMetadataZig(
             allocator,
             &js,
@@ -1024,8 +941,6 @@ pub const SnapshotListener = struct {
             batch,
             total_rows,
             format,
-            null, // NO dictionary
-            enable_compression,
             should_stop,
         );
 
@@ -1044,8 +959,6 @@ pub const SnapshotListener = struct {
         snapshot_id: []const u8,
         lsn: []const u8,
         format: encoder_mod.Format,
-        dictionary_id: ?[]const u8,
-        compression_enabled: bool,
         should_stop: *std.atomic.Value(bool),
     ) !void {
         var encoder = encoder_mod.Encoder.init(allocator, format);
@@ -1063,11 +976,6 @@ pub const SnapshotListener = struct {
         try start_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
         try start_map.put(encoder.allocator, "status", try encoder.createString("starting"));
         try start_map.put(encoder.allocator, "format", try encoder.createString(@tagName(format)));
-        try start_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
-
-        if (dictionary_id) |dict_id| {
-            try start_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
-        }
 
         const encoded = try encoder.encode(start_map);
         defer allocator.free(encoded);
@@ -1095,8 +1003,6 @@ pub const SnapshotListener = struct {
         batch_count: u32,
         row_count: u64,
         format: encoder_mod.Format,
-        dictionary_id: ?[]const u8,
-        compression_enabled: bool,
         should_stop: *std.atomic.Value(bool),
     ) !void {
         var encoder = encoder_mod.Encoder.init(allocator, format);
@@ -1114,11 +1020,6 @@ pub const SnapshotListener = struct {
         try meta_map.put(encoder.allocator, "batch_count", encoder.createInt(@intCast(batch_count)));
         try meta_map.put(encoder.allocator, "row_count", encoder.createInt(@intCast(row_count)));
         try meta_map.put(encoder.allocator, "table", try encoder.createString(table_name));
-        try meta_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
-
-        if (dictionary_id) |dict_id| {
-            try meta_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
-        }
 
         const encoded = try encoder.encode(meta_map);
         defer allocator.free(encoded);
@@ -1333,12 +1234,6 @@ fn onSnapshotRequest(
         requested_by,
     });
 
-    // Publish dictionary before snapshot (if available)
-    _ = publishDictionary(ctx.allocator, ctx.js, table_name) catch |err| {
-        log.warn("⚠️  Dictionary publishing failed for table '{s}': {} (continuing without dictionary)", .{ table_name, err });
-        // Continue without dictionary - graceful degradation
-    };
-
     // Generate snapshot ID
     const snapshot_id = generateSnapshotId(ctx.allocator) catch |err| {
         log.err("Failed to generate snapshot ID: {}", .{err});
@@ -1356,9 +1251,7 @@ fn onSnapshotRequest(
         snapshot_id,
         ctx.format,
         ctx.chunk_size,
-        ctx.enable_compression,
-        ctx.recipe,
-        ctx.js_ctx, // Pass JetStream context for dictionary fetching
+        ctx.js_ctx,
     ) catch |err| {
         const error_message = std.fmt.allocPrint(
             ctx.allocator,
@@ -1401,9 +1294,7 @@ fn listenForSnapshotRequestsOld(
     monitored_tables: []const []const u8,
     format: encoder_mod.Format,
     chunk_size: usize,
-    enable_compression: bool,
-    recipe: config.CompressionRecipe,
-    js_ctx: ?*anyopaque, // JetStream context for dictionary fetching
+    js_ctx: ?*anyopaque,
 ) !void {
     log.info("🔔 Starting NATS snapshot listener thread", .{});
 
@@ -1424,8 +1315,6 @@ fn listenForSnapshotRequestsOld(
         .monitored_tables = monitored_tables,
         .format = format,
         .chunk_size = chunk_size,
-        .enable_compression = enable_compression,
-        .recipe = recipe,
         .js_ctx = js_ctx,
     };
 
@@ -1490,8 +1379,6 @@ fn generateIncrementalSnapshot(
     snapshot_id: []const u8,
     format: encoder_mod.Format,
     chunk_size: usize,
-    enable_compression: bool,
-    recipe: config.CompressionRecipe,
     js_ctx: ?*anyopaque, // JetStream context for KV access (optional)
     should_stop: *std.atomic.Value(bool),
 ) !void {
@@ -1500,19 +1387,7 @@ fn generateIncrementalSnapshot(
         snapshot_id,
     });
 
-    _ = js_ctx; // No longer using KV - dictionaries are pre-trained and in global cache
-
-    // Get dictionary ID from global cache if compression is enabled
-    const dict_id_opt = if (enable_compression and global_dict_manager != null) blk: {
-        dictionaries_mutex.lockUncancelable(g_snapshot_io);
-        defer dictionaries_mutex.unlock(g_snapshot_io);
-        if (global_dictionaries) |cache| {
-            if (cache.getDictId(table_name)) |dict_id| {
-                break :blk dict_id;
-            }
-        }
-        break :blk null;
-    } else null;
+    _ = js_ctx;
 
     // Create a separate connection for snapshot query
     const conninfo = try pg_config.connInfo(allocator, false);
@@ -1559,8 +1434,6 @@ fn generateIncrementalSnapshot(
         snapshot_id,
         lsn_str,
         format,
-        dict_id_opt,
-        enable_compression,
         should_stop,
     ) catch |err| {
         log.warn("Failed to publish snapshot start notification: {}", .{err});
@@ -1613,13 +1486,12 @@ fn generateIncrementalSnapshot(
         };
 
         // Collect rows into array using arena allocator
+        // chunk_alloc is the arena: every row and field was allocated from it, and the
+        // arena.reset(.retain_capacity) at the top of this loop reclaims all of it at once.
+        // Calling row.deinit() here would walk every field of every row (up to chunk_size
+        // rows) issuing frees the arena discards — pure work for no reclaimed bytes.
+        // CsvRow.deinit() stays meaningful for non-arena owners; see pg_copy_csv tests.
         var rows_list: std.ArrayList(pg_copy_csv.CsvRow) = .empty;
-        defer {
-            for (rows_list.items) |*row| {
-                row.deinit();
-            }
-            rows_list.deinit(chunk_alloc);
-        }
 
         var row_iterator = parser.rows();
         while (try row_iterator.next()) |row| {
@@ -1646,40 +1518,7 @@ fn generateIncrementalSnapshot(
             format,
         );
 
-        // Compress if enabled (with dictionary if available)
-        const payload = if (enable_compression) blk: {
-            const zstd_recipe: zstd.CompressionRecipe = @enumFromInt(@intFromEnum(recipe));
-            var compressor = try zstd.Compressor.init(.{ .recipe = zstd_recipe });
-            defer compressor.deinit();
-
-            // Try to use dictionary compression if available
-            if (global_dict_manager) |manager| {
-                dictionaries_mutex.lockUncancelable(g_snapshot_io);
-                defer dictionaries_mutex.unlock(g_snapshot_io);
-
-                if (manager.getCDict(table_name)) |cdict| {
-                    const result = try compressor.compress_using_cdict(allocator, encoded, cdict);
-                    log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, with dictionary)", .{
-                        batch,
-                        encoded.len,
-                        result.len,
-                        @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
-                    });
-                    break :blk result;
-                }
-            }
-
-            // No dictionary available - use standard compression
-            const result = try compressor.compress(allocator, encoded);
-            log.info("🗜️  Compressed chunk {d}: {d} → {d} bytes ({d:.1}% reduction, no dictionary)", .{
-                batch,
-                encoded.len,
-                result.len,
-                @as(f64, @floatFromInt(encoded.len - result.len)) / @as(f64, @floatFromInt(encoded.len)) * 100.0,
-            });
-            break :blk result;
-        } else encoded;
-        defer if (enable_compression) allocator.free(payload);
+        const payload = encoded;
 
         // Publish chunk to JetStream with Nats-Msg-Id header for deduplication
         const subject = try std.fmt.allocPrint(
@@ -1707,22 +1546,14 @@ fn generateIncrementalSnapshot(
 
         // Content metadata
         try headers.append("Content-Type", "application/msgpack");
-        if (enable_compression) {
-            try headers.append("Content-Encoding", "zstd");
-            // Add dictionary ID if compression used a dictionary
-            if (dict_id_opt) |dict_id| {
-                try headers.append("X-Zstd-Dict-ID", dict_id);
-            }
-        }
 
         // Publish to JetStream with headers and retry logic
         try publishWithRetry(js, subject, &headers, payload, should_stop);
 
-        log.info("📦 Published chunk {d} ({d} rows, {d} bytes {s}) → {s} (msg_id={s})", .{
+        log.info("📦 Published chunk {d} ({d} rows, {d} bytes) → {s} (msg_id={s})", .{
             batch,
             num_rows,
             payload.len,
-            if (enable_compression) "compressed" else "uncompressed",
             subject,
             msg_id_buf,
         });
@@ -1780,8 +1611,6 @@ fn generateIncrementalSnapshot(
         batch,
         total_rows,
         format,
-        dict_id_opt,
-        enable_compression,
         should_stop,
     );
 
@@ -1877,8 +1706,6 @@ fn publishSnapshotMetadata(
     batch_count: u32,
     row_count: u64,
     format: encoder_mod.Format,
-    dictionary_id: ?[]const u8,
-    compression_enabled: bool,
     should_stop: *std.atomic.Value(bool),
 ) !void {
     var encoder = encoder_mod.Encoder.init(allocator, format);
@@ -1896,11 +1723,6 @@ fn publishSnapshotMetadata(
     try meta_map.put(encoder.allocator, "batch_count", encoder.createInt(@intCast(batch_count)));
     try meta_map.put(encoder.allocator, "row_count", encoder.createInt(@intCast(row_count)));
     try meta_map.put(encoder.allocator, "table", try encoder.createString(table_name));
-    try meta_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
-
-    if (dictionary_id) |dict_id| {
-        try meta_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
-    }
 
     const encoded = try encoder.encode(meta_map);
     defer allocator.free(encoded);
@@ -1928,8 +1750,6 @@ fn publishSnapshotStart(
     snapshot_id: []const u8,
     lsn: []const u8,
     format: encoder_mod.Format,
-    dictionary_id: ?[]const u8,
-    compression_enabled: bool,
     should_stop: *std.atomic.Value(bool),
 ) !void {
     var encoder = encoder_mod.Encoder.init(allocator, format);
@@ -1947,12 +1767,6 @@ fn publishSnapshotStart(
     try start_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
     try start_map.put(encoder.allocator, "status", try encoder.createString("starting"));
     try start_map.put(encoder.allocator, "format", try encoder.createString(@tagName(format)));
-    try start_map.put(encoder.allocator, "compression_enabled", encoder.createBool(compression_enabled));
-
-    // Add dictionary_id if compression is enabled
-    if (dictionary_id) |dict_id| {
-        try start_map.put(encoder.allocator, "dictionary_id", try encoder.createString(dict_id));
-    }
 
     const encoded = try encoder.encode(start_map);
     defer allocator.free(encoded);
@@ -2035,47 +1849,6 @@ fn publishSchemaZig(
 /// Generate snapshot ID based on current timestamp with random entropy
 /// Format: snap-{timestamp}-{random_u16}
 /// Prevents collisions when multiple snapshots are requested in the same second
-/// Publish pre-trained dictionary to NATS for a specific table
-/// Subject: init.dict.{table_name}
-/// Returns true if dictionary was published, false if not available (graceful degradation)
-fn publishDictionary(
-    allocator: std.mem.Allocator,
-    js: *nats.JS,
-    table_name: []const u8,
-    should_stop: *std.atomic.Value(bool),
-) !bool {
-    // Get dictionary from global cache
-    dictionaries_mutex.lockUncancelable(g_snapshot_io);
-    defer dictionaries_mutex.unlock(g_snapshot_io);
-
-    if (global_dictionaries) |cache| {
-        if (cache.get(table_name)) |dict_entry| {
-            const subject = try std.fmt.allocPrint(
-                allocator,
-                "init.dict.{s}",
-                .{table_name},
-            );
-            defer allocator.free(subject);
-
-            // Publish dictionary binary data with retry logic
-            publishWithRetry(js, subject, null, dict_entry.data, should_stop) catch |err| {
-                log.warn("⚠️  Failed to publish dictionary for table '{s}' after retries: {}", .{ table_name, err });
-                return false;
-            };
-
-            log.info("📚 Published dictionary for table '{s}' (id={s}, size={d} bytes)", .{
-                table_name,
-                dict_entry.dict_id,
-                dict_entry.data.len,
-            });
-            return true;
-        }
-    }
-
-    log.debug("No dictionary available for table '{s}' (compression will work without it)", .{table_name});
-    return false;
-}
-
 fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
@@ -2088,259 +1861,4 @@ fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
         "snap-{d}-{x:0>4}",
         .{ @as(i64, c.time(null)), random_suffix },
     );
-}
-
-/// Cleanup global dictionaries cache
-/// Called on shutdown to free all dictionary memory
-pub fn deinitDictionaries() void {
-    if (global_dictionaries == null and global_dict_manager == null) return;
-    dictionaries_mutex.lockUncancelable(g_snapshot_io);
-    defer dictionaries_mutex.unlock(g_snapshot_io);
-
-    // Cleanup dictionary manager first (it depends on dictionaries cache)
-    if (global_dict_manager) |manager| {
-        if (dictionaries_allocator) |alloc| {
-            manager.deinit();
-            alloc.destroy(manager);
-            global_dict_manager = null;
-            log.debug("Dictionary manager cleaned up", .{});
-        }
-    }
-
-    // Cleanup dictionaries cache
-    if (global_dictionaries) |cache| {
-        if (dictionaries_allocator) |alloc| {
-            cache.deinit();
-            alloc.destroy(cache);
-            global_dictionaries = null;
-            dictionaries_allocator = null;
-            log.debug("Dictionaries cache cleaned up", .{});
-        }
-    }
-}
-
-/// Train and initialize dictionaries for monitored tables
-/// Called once at bridge startup to pre-train zstd dictionaries from sample data
-/// Dictionaries are stored in global_dictionaries HashMap
-pub fn initializeDictionaries(
-    allocator: std.mem.Allocator,
-    pg_config: *const pg_conn.PgConf,
-    monitored_tables: []const []const u8,
-    io: std.Io,
-) !void {
-    log.info("📚 Training zstd dictionaries for {d} tables", .{monitored_tables.len});
-    g_snapshot_io = io;
-
-    // Create global dictionaries cache
-    dictionaries_mutex.lockUncancelable(g_snapshot_io);
-    defer dictionaries_mutex.unlock(g_snapshot_io);
-
-    if (global_dictionaries == null) {
-        const cache = try allocator.create(dictionaries_cache.DictionariesCache);
-        cache.* = dictionaries_cache.DictionariesCache.init(allocator);
-        global_dictionaries = cache;
-        dictionaries_allocator = allocator;
-    }
-
-    var trained_count: usize = 0;
-    var failed_count: usize = 0;
-
-    for (monitored_tables) |table_name| {
-        log.info("🔨 Training dictionary for table '{s}'...", .{table_name});
-
-        // Collect sample data from table
-        const samples = collectSampleData(allocator, pg_config, table_name) catch |err| {
-            log.warn("⚠️  Failed to collect samples for table '{s}': {} (skipping)", .{ table_name, err });
-            failed_count += 1;
-            continue;
-        };
-        defer {
-            for (samples) |sample| allocator.free(sample);
-            allocator.free(samples);
-        }
-
-        if (samples.len == 0) {
-            log.warn("⚠️  No samples collected for table '{s}' (empty table?)", .{table_name});
-            failed_count += 1;
-            continue;
-        }
-
-        // Calculate total sample size
-        var total_sample_size: usize = 0;
-        for (samples) |sample| {
-            total_sample_size += sample.len;
-        }
-
-        log.debug("Collected {d} samples, total size: {d} bytes", .{ samples.len, total_sample_size });
-
-        // Dictionary training requires total sample size to be much larger than dict size
-        // Typical recommendation is 100x, but we'll use a minimum of 10x
-        const dict_size: usize = 8 * 1024; // Use smaller 8KB dictionary for better success rate
-        const min_sample_size = dict_size * 10; // At least 10x dict size
-
-        if (total_sample_size < min_sample_size) {
-            log.warn("⚠️  Insufficient sample data for table '{s}' ({d} bytes, need at least {d} bytes) - skipping dictionary training", .{
-                table_name,
-                total_sample_size,
-                min_sample_size,
-            });
-            failed_count += 1;
-            continue;
-        }
-
-        const dictionary = zstd.train_dictionary(allocator, samples, dict_size) catch |err| {
-            log.warn("⚠️  Dictionary training failed for table '{s}': {} (skipping)", .{ table_name, err });
-            failed_count += 1;
-            continue;
-        };
-        errdefer allocator.free(dictionary);
-
-        // Generate dictionary ID (version 1)
-        const dict_id = try std.fmt.allocPrint(allocator, "dict_{s}_v1", .{table_name});
-        errdefer allocator.free(dict_id);
-
-        // Store in cache
-        try global_dictionaries.?.put(table_name, dict_id, dictionary);
-
-        log.info("✅ Dictionary trained for table '{s}' (id={s}, size={d} bytes, {d} samples)", .{
-            table_name,
-            dict_id,
-            dictionary.len,
-            samples.len,
-        });
-        trained_count += 1;
-    }
-
-    if (trained_count == monitored_tables.len) {
-        log.info("✅ All {d} dictionaries trained successfully", .{trained_count});
-    } else if (trained_count > 0) {
-        log.warn("⚠️  {d}/{d} dictionaries trained ({d} failed)", .{
-            trained_count,
-            monitored_tables.len,
-            failed_count,
-        });
-    } else {
-        log.warn("⚠️  No dictionaries trained (compression will work without dictionaries)", .{});
-    }
-
-    // Initialize dictionary manager and load trained dictionaries
-    if (trained_count > 0) {
-        log.info("📦 Loading dictionaries into DictionaryManager...", .{});
-        const manager = try allocator.create(zstd.DictionaryManager);
-        manager.* = zstd.DictionaryManager.init(allocator);
-        global_dict_manager = manager;
-
-        // Load each trained dictionary into the manager (digest as CDict for compression)
-        const compression_level = 3; // Use level 3 (default)
-        var it = global_dictionaries.?.cache.iterator();
-        while (it.next()) |entry| {
-            const table_name_key = entry.key_ptr.*;
-            const dict_entry = entry.value_ptr.*;
-
-            manager.loadTableCDict(table_name_key, dict_entry.data, compression_level) catch |err| {
-                log.warn("⚠️  Failed to load CDict for table '{s}': {}", .{ table_name_key, err });
-                continue;
-            };
-
-            log.info("✅ Loaded CDict for table '{s}' (dict_id={s})", .{
-                table_name_key,
-                dict_entry.dict_id,
-            });
-        }
-
-        log.info("✅ DictionaryManager initialized with {d} compression dictionaries", .{trained_count});
-    }
-}
-
-/// Collect sample data from table for dictionary training
-/// Returns array of sample rows (caller owns the memory)
-fn collectSampleData(
-    allocator: std.mem.Allocator,
-    pg_config: *const pg_conn.PgConf,
-    table_name: []const u8,
-) ![][]const u8 {
-    const max_samples = 100; // Collect up to 100 sample rows
-    const max_sample_size = 10 * 1024; // Limit each sample to 10KB
-
-    // Connect to PostgreSQL
-    const conn = try pg_conn.connect(allocator, pg_config.*);
-    defer c.PQfinish(conn);
-
-    // Query to get sample rows (random sampling)
-    const query_str = try std.fmt.allocPrint(
-        allocator,
-        "SELECT * FROM {s} ORDER BY RANDOM() LIMIT {d}",
-        .{ table_name, max_samples },
-    );
-    defer allocator.free(query_str);
-
-    // Add null terminator for C API
-    const query = try allocator.dupeZ(u8, query_str);
-    defer allocator.free(query);
-
-    // Execute query
-    const result = c.PQexec(conn, query.ptr);
-    defer c.PQclear(result);
-
-    if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
-        const err_msg = c.PQresultErrorMessage(result);
-        log.err("Sample query failed for table '{s}': {s}", .{ table_name, err_msg });
-        return error.QueryFailed;
-    }
-
-    const nrows = c.PQntuples(result);
-    const ncols = c.PQnfields(result);
-
-    if (nrows == 0) {
-        return try allocator.alloc([]const u8, 0);
-    }
-
-    var samples: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (samples.items) |sample| allocator.free(sample);
-        samples.deinit(allocator);
-    }
-
-    // Convert each row to MessagePack array format (same as snapshot chunks)
-    var row_idx: usize = 0;
-    while (row_idx < nrows) : (row_idx += 1) {
-        var buffer: [10 * 1024]u8 = undefined; // 10KB buffer per sample
-        var encoder = streaming_encoder.StreamingEncoder.init(&buffer);
-
-        // Encode row as MessagePack array
-        try encoder.beginRow(@intCast(ncols));
-
-        var col_idx: usize = 0;
-        while (col_idx < ncols) : (col_idx += 1) {
-            if (c.PQgetisnull(result, @intCast(row_idx), @intCast(col_idx)) == 1) {
-                try encoder.writeNull();
-            } else {
-                const value_ptr = c.PQgetvalue(result, @intCast(row_idx), @intCast(col_idx));
-                const value_len = c.PQgetlength(result, @intCast(row_idx), @intCast(col_idx));
-                const value = value_ptr[0..@intCast(value_len)];
-                try encoder.writeString(value);
-            }
-        }
-
-        // Sync position from writer before getting written data
-        _ = encoder.getPos();
-        const written = encoder.getWritten();
-
-        if (written.len > max_sample_size) {
-            log.warn("Sample row {d} too large ({d} bytes), skipping", .{ row_idx, written.len });
-            continue;
-        }
-
-        // Copy sample to owned memory
-        const sample = try allocator.dupe(u8, written);
-        try samples.append(allocator, sample);
-    }
-
-    return samples.toOwnedSlice(allocator);
-}
-
-/// Generate dictionary ID from table name
-/// Format: {table}_dict
-fn generateDictionaryId(allocator: std.mem.Allocator, table_name: []const u8) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "{s}_dict", .{table_name});
 }

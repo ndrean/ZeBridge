@@ -10,29 +10,19 @@ const builtin = @import("builtin");
 /// Auto-detection for system libpq:
 ///   macOS  → /opt/homebrew/opt/libpq  (brew install libpq)
 ///   Linux  → /usr                     (apt install libpq-dev)
-fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
-    const use_vendored = b.option(bool, "vendored-libpq", "Use vendored libpq from libs/libpq-install/") orelse false;
-
+fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build, use_vendored: bool, prefix: []const u8) void {
     if (use_vendored) {
         exe.root_module.addIncludePath(b.path("libs/libpq-install/include"));
         exe.root_module.addLibraryPath(b.path("libs/libpq-install/lib"));
         exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
         exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpgport.a"));
         exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
-        std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
     } else {
-        const default_prefix: []const u8 = if (builtin.os.tag == .macos)
-            "/opt/homebrew/opt/libpq"
-        else
-            "/usr";
-        const prefix = b.option([]const u8, "libpq-prefix", "System libpq prefix (default: /opt/homebrew/opt/libpq on macOS, /usr on Linux)") orelse default_prefix;
-
         const include_path = b.pathJoin(&.{ prefix, "include" });
         const lib_path = b.pathJoin(&.{ prefix, "lib" });
         exe.root_module.addSystemIncludePath(.{ .cwd_relative = include_path });
         exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
         exe.root_module.linkSystemLibrary("pq", .{});
-        std.debug.print("Using system libpq from {s}\n", .{prefix});
     }
 
     exe.root_module.link_libc = true;
@@ -41,6 +31,19 @@ fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build) void {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const use_vendored = b.option(bool, "vendored-libpq", "Use vendored libpq from libs/libpq-install/") orelse false;
+    const default_prefix: []const u8 = if (builtin.os.tag == .macos)
+        "/opt/homebrew/opt/libpq"
+    else
+        "/usr";
+    const prefix = b.option([]const u8, "libpq-prefix", "System libpq prefix (default: /opt/homebrew/opt/libpq on macOS, /usr on Linux)") orelse default_prefix;
+
+    if (use_vendored) {
+        std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
+    } else {
+        std.debug.print("Using system libpq from {s}\n", .{prefix});
+    }
 
     const mod = b.addModule("bridge", .{
         .root_source_file = b.path("src/bridge.zig"),
@@ -71,11 +74,10 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Create local zstd module (links system libzstd)
-    const zstd_mod = b.addModule("zstd", .{
-        .root_source_file = b.path("src/zstd.zig"),
-        .target = target,
-    });
+    // The "bridge" module shares its root with the exe, so it needs the same imports —
+    // without these, `zig build test` cannot compile any module that uses msgpack/nats.
+    mod.addImport("msgpack", msgpack.module("msgpack"));
+    mod.addImport("nats", nats_mod);
 
     const exe = b.addExecutable(.{
         .name = "bridge",
@@ -88,7 +90,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "bridge", .module = mod },
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
-                .{ .name = "zstd", .module = zstd_mod },
                 .{ .name = "nats", .module = nats_mod },
             },
         }),
@@ -98,11 +99,8 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("ssl", .{});
     exe.root_module.linkSystemLibrary("crypto", .{});
 
-    // Link system libzstd (for compression)
-    exe.root_module.linkSystemLibrary("zstd", .{});
-
     // Link vendored libpq
-    linkLibpq(exe, b);
+    linkLibpq(exe, b, use_vendored, prefix);
 
     b.installArtifact(exe);
 
@@ -121,6 +119,9 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    linkLibpq(mod_tests, b, use_vendored, prefix);
+    mod_tests.root_module.linkSystemLibrary("ssl", .{});
+    mod_tests.root_module.linkSystemLibrary("crypto", .{});
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -131,6 +132,7 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    linkLibpq(exe_tests, b, use_vendored, prefix);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);

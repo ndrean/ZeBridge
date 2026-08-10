@@ -24,10 +24,19 @@ const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const utils = @import("utils.zig");
 
-// Force test discovery for imported modules
+// Force test discovery for imported modules.
+// Zig only collects tests from files the root actually references, so every module
+// carrying `test` blocks must be listed here or its tests silently never run.
 comptime {
+    _ = @import("array.zig");
+    _ = @import("encoder.zig");
+    _ = @import("numeric.zig");
     _ = @import("pg_copy_csv.zig");
-    _ = @import("dictionaries_cache.zig");
+    _ = @import("pgoutput.zig");
+    _ = @import("publication.zig");
+    _ = @import("schema_cache.zig");
+    _ = @import("spsc_queue.zig");
+    _ = @import("streaming_encoder.zig");
 }
 
 pub const log = std.log.scoped(.bridge);

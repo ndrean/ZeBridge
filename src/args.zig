@@ -10,7 +10,6 @@ pub const Args = struct {
     slot_name: []const u8,
     publication_name: []const u8,
     encoding_format: encoder.Format,
-    enable_compression: bool,
 
     /// Parse command-line arguments and create RuntimeConfig.
     ///
@@ -25,7 +24,6 @@ pub const Args = struct {
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
         var publication_name: []const u8 = config.Postgres.default_publication_name; // default
         var encoding_format: encoder.Format = .msgpack; // default
-        var enable_compression: bool = false; // default: disabled
 
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--port")) {
@@ -41,8 +39,6 @@ pub const Args = struct {
                 if (args_iter.next()) |value| publication_name = value;
             } else if (std.mem.eql(u8, arg, "--json")) {
                 encoding_format = .json;
-            } else if (std.mem.eql(u8, arg, "--zstd")) {
-                enable_compression = true;
             }
         }
 
@@ -51,7 +47,6 @@ pub const Args = struct {
             .slot_name = slot_name,
             .publication_name = publication_name,
             .encoding_format = encoding_format,
-            .enable_compression = enable_compression,
         };
 
         // Build runtime configuration by merging CLI args with compile-time defaults
@@ -59,7 +54,6 @@ pub const Args = struct {
         runtime_config.http_port = http_port;
         runtime_config.slot_name = slot_name;
         runtime_config.publication_name = publication_name;
-        runtime_config.enable_compression = enable_compression;
         runtime_config.encoding_format = encoding_format;
 
         // Read PostgreSQL configuration from environment variables via Juicy Main environ.

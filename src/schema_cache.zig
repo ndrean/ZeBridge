@@ -54,24 +54,27 @@ pub const SchemaCache = struct {
     /// Returns:
     ///   true if schema changed or is new, false if unchanged
     pub fn hasChanged(self: *SchemaCache, table_name: []const u8, relation_id: u32) !bool {
-        // Fast path: Check if value matches BEFORE allocating
-        // This avoids string duplication in the common case (no schema change)
-        if (self.cache.get(table_name)) |cached_id| {
-            if (cached_id == relation_id) {
-                return false; // No change - avoid allocation
-            }
+        // NOTE: do not reach for fetchPut here. As of Zig 0.16 it updates only the
+        // value and leaves the map's existing key pointer in place, so freeing the
+        // returned KV.key dangles the live key and leaks the replacement.
+        const gop = try self.cache.getOrPut(table_name);
+
+        if (gop.found_existing) {
+            // Key already owned by the map — only the version needs updating,
+            // so neither branch here allocates.
+            if (gop.value_ptr.* == relation_id) return false;
+            gop.value_ptr.* = relation_id;
+            return true;
         }
 
-        // Schema changed or new table - update cache
-        // Only allocate when we know we need to update
-        const owned_name = try self.allocator.dupe(u8, table_name);
-        errdefer self.allocator.free(owned_name);
-
-        // Free old key if exists (will exist if this was a schema change, not a new table)
-        const old_entry = try self.cache.fetchPut(owned_name, relation_id);
-        if (old_entry) |old| {
-            self.allocator.free(old.key);
-        }
+        // New table: getOrPut stored the caller's slice as the key, which we do not
+        // own. Replace it with a copy before returning, and unwind on failure.
+        const owned_name = self.allocator.dupe(u8, table_name) catch |err| {
+            _ = self.cache.remove(table_name);
+            return err;
+        };
+        gop.key_ptr.* = owned_name;
+        gop.value_ptr.* = relation_id;
 
         return true;
     }

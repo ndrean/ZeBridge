@@ -34,8 +34,8 @@ services:
       - cdc-bridge
 
   nats-server:
-    image: nats:2.11.11-alpine3.22
-    # image: nats:latest
+    # image: nats:2.11.11-alpine3.22
+    image: nats:latest
     container_name: nats-server
 
     ports:

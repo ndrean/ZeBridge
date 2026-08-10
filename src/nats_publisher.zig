@@ -378,9 +378,7 @@ pub const Publisher = struct {
 
         try out.writer.writeAll("}");
 
-        var arr = out.toArrayList();
-        defer arr.deinit(self.allocator);
-        return try arr.toOwnedSlice(self.allocator);
+        return try out.toOwnedSlice();
     }
 
     /// Purge all messages from a stream

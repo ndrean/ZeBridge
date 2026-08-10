@@ -117,17 +117,20 @@ pub const Encoder = struct {
             .json => return error.FormatMismatch,
         };
 
-        // Use Writer.Allocating for dynamic buffer
-        var buffer: [8192]u8 = undefined;
+        // Use Writer.Allocating for dynamic buffer.
+        // deinit covers the error path; toOwnedSlice moves the buffer out on success.
         var out: std.Io.Writer.Allocating = .init(self.allocator);
-        var reader = std.Io.Reader.fixed(&buffer);
+        defer out.deinit();
+
+        // PackerIO takes a reader by signature, but only `read` ever touches it —
+        // `write` does not. Hand it an empty reader rather than uninitialized stack.
+        var empty: [0]u8 = .{};
+        var reader = std.Io.Reader.fixed(&empty);
 
         var packer = msgpack.PackerIO.init(&reader, &out.writer);
         try packer.write(msgpack_value);
 
-        var arr = out.toArrayList();
-        defer arr.deinit(self.allocator);
-        return try arr.toOwnedSlice(self.allocator);
+        return try out.toOwnedSlice();
     }
 
     /// Encode as JSON
@@ -137,11 +140,12 @@ pub const Encoder = struct {
             .msgpack => return error.FormatMismatch,
         };
 
+        // deinit covers the error path; toOwnedSlice moves the buffer out on success.
         var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+
         try std.json.Stringify.value(json_value, .{ .whitespace = .indent_2 }, &out.writer);
-        var arr = out.toArrayList();
-        defer arr.deinit(self.allocator);
-        return try arr.toOwnedSlice(self.allocator);
+        return try out.toOwnedSlice();
     }
 };
 
