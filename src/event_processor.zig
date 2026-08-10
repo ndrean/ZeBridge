@@ -11,8 +11,8 @@ const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
 
 fn nanoNow() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
         @as(u64, @intCast(ts.nsec));
 }

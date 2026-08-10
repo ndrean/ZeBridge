@@ -40,7 +40,9 @@ pub const Args = struct {
     /// Zig 0.16 "Juicy Main": args and environ are received via std.process.Init
     /// passed from main(). init.args.iterate() replaces the removed argsWithAllocator/argsAlloc.
     /// init.minimal.environ.getPosix() replaces the removed std.process.getEnvVarOwned().
-    pub fn parseArgs(allocator: std.mem.Allocator, init: *const std.process.Init) !struct { args: Args, runtime_config: config.RuntimeConfig } {
+    /// Allocates nothing: every string in the returned config is either a compile-time
+    /// default or a slice borrowed from argv/environ, both of which outlive the process.
+    pub fn parseArgs(init: *const std.process.Init) !struct { args: Args, runtime_config: config.RuntimeConfig } {
         var args_iter = init.minimal.args.iterate();
         _ = args_iter.next(); // skip argv[0] (program name)
 
@@ -90,11 +92,11 @@ pub const Args = struct {
         runtime_config.encoding_format = encoding_format;
 
         // Read PostgreSQL configuration from environment variables via Juicy Main environ.
-        // getPosix() returns a slice into the environ block (valid for program lifetime).
-        // We dupe strings that RuntimeConfig.deinit() will free, matching previous semantics.
-        runtime_config.pg_host = if (init.minimal.environ.getPosix("PG_HOST")) |val|
-            try allocator.dupe(u8, val)
-        else blk: {
+        // getPosix() borrows from the environ block, which lives as long as the process,
+        // so these are assigned directly — no dupe, nothing to free. (0.15's
+        // getEnvVarOwned returned owned memory; 0.16 changed that.) Valid because
+        // nothing here calls setenv/putenv, which could reallocate the block.
+        runtime_config.pg_host = init.minimal.environ.getPosix("PG_HOST") orelse blk: {
             log.info("PG_HOST not set, using default: {s}", .{runtime_config.pg_host});
             break :blk runtime_config.pg_host;
         };
@@ -109,31 +111,23 @@ pub const Args = struct {
         }
 
         // Priority: POSTGRES_BRIDGE_USER > PG_USER > default
-        runtime_config.pg_user = if (init.minimal.environ.getPosix("POSTGRES_BRIDGE_USER") orelse init.minimal.environ.getPosix("PG_USER")) |val|
-            try allocator.dupe(u8, val)
-        else blk: {
+        runtime_config.pg_user = init.minimal.environ.getPosix("POSTGRES_BRIDGE_USER") orelse init.minimal.environ.getPosix("PG_USER") orelse blk: {
             log.info("POSTGRES_BRIDGE_USER and PG_USER not set, using default: {s}", .{runtime_config.pg_user});
             break :blk runtime_config.pg_user;
         };
 
         // Priority: POSTGRES_BRIDGE_PASSWORD > PG_PASSWORD > default
-        runtime_config.pg_password = if (init.minimal.environ.getPosix("POSTGRES_BRIDGE_PASSWORD") orelse init.minimal.environ.getPosix("PG_PASSWORD")) |val|
-            try allocator.dupe(u8, val)
-        else blk: {
+        runtime_config.pg_password = init.minimal.environ.getPosix("POSTGRES_BRIDGE_PASSWORD") orelse init.minimal.environ.getPosix("PG_PASSWORD") orelse blk: {
             log.info("POSTGRES_BRIDGE_PASSWORD and PG_PASSWORD not set, using default", .{});
             break :blk runtime_config.pg_password;
         };
 
-        runtime_config.pg_database = if (init.minimal.environ.getPosix("PG_DB")) |val|
-            try allocator.dupe(u8, val)
-        else blk: {
+        runtime_config.pg_database = init.minimal.environ.getPosix("PG_DB") orelse blk: {
             log.info("PG_DB not set, using default: {s}", .{runtime_config.pg_database});
             break :blk runtime_config.pg_database;
         };
 
-        runtime_config.pg_sslmode = if (init.minimal.environ.getPosix("PG_SSLMODE")) |val|
-            try allocator.dupe(u8, val)
-        else blk: {
+        runtime_config.pg_sslmode = init.minimal.environ.getPosix("PG_SSLMODE") orelse blk: {
             log.info("PG_SSLMODE not set, using default: {s}", .{runtime_config.pg_sslmode});
             break :blk runtime_config.pg_sslmode;
         };

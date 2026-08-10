@@ -3,11 +3,11 @@ const std = @import("std");
 
 /// Cross-platform sleep (std.Thread.sleep removed in Zig 0.16 Juicy Main).
 pub fn sleep(nanoseconds: u64) void {
-    var ts = std.os.linux.timespec{
+    var ts = std.c.timespec{
         .sec = @as(isize, @intCast(nanoseconds / std.time.ns_per_s)),
         .nsec = @as(isize, @intCast(nanoseconds % std.time.ns_per_s)),
     };
-    _ = std.os.linux.nanosleep(&ts, null);
+    _ = std.c.nanosleep(&ts, null);
 }
 
 /// Convert days since Unix epoch (1970-01-01) to civil calendar date (year, month, day)

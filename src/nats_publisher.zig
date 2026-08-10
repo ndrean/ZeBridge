@@ -52,6 +52,10 @@ pub const Publisher = struct {
     nats_url: []const u8,
     nats_host: []const u8, // Parsed host for reconnection
     nats_port: u16, // Parsed port for reconnection
+    // Credentials parsed out of nats_url. Slices into nats_url, which the Publisher
+    // owns for its lifetime — so no allocation and nothing to free.
+    nats_user: ?[]const u8 = null,
+    nats_pass: ?[]const u8 = null,
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     reconnect_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
@@ -78,8 +82,6 @@ pub const Publisher = struct {
     }
 
     pub fn connect(self: *Publisher) !void {
-        log.info("Connecting to NATS at {s}...", .{self.nats_url});
-
         // Parse URL to extract host (the pure Zig client needs host, not URL)
         // Format: nats://[user:pass@]host:port
         var host: []const u8 = "127.0.0.1";
@@ -88,11 +90,17 @@ pub const Publisher = struct {
         // Simple URL parsing (assumes nats://host:port or nats://user:pass@host:port)
         if (std.mem.indexOf(u8, self.nats_url, "nats://")) |idx| {
             const after_scheme = self.nats_url[idx + 7 ..];
-            // Check for authentication (user:pass@)
-            const host_port = if (std.mem.indexOf(u8, after_scheme, "@")) |at_idx|
-                after_scheme[at_idx + 1 ..]
-            else
-                after_scheme;
+            // Split off credentials. These must be forwarded to CONNECT — dropping
+            // them here leaves the client waiting forever on a server that requires
+            // authorization, with no error surfaced.
+            const host_port = if (std.mem.indexOf(u8, after_scheme, "@")) |at_idx| blk: {
+                const creds = after_scheme[0..at_idx];
+                if (std.mem.indexOf(u8, creds, ":")) |colon| {
+                    self.nats_user = creds[0..colon];
+                    self.nats_pass = creds[colon + 1 ..];
+                }
+                break :blk after_scheme[at_idx + 1 ..];
+            } else after_scheme;
 
             // Parse host:port
             if (std.mem.indexOf(u8, host_port, ":")) |colon_idx| {
@@ -108,16 +116,23 @@ pub const Publisher = struct {
         self.nats_host = try self.allocator.dupe(u8, host);
         self.nats_port = port;
 
-        log.info("Parsed NATS connection: host={s}, port={d}", .{ host, port });
+        // Never log nats_url — it embeds the password, and these logs ship to Loki.
+        log.info("Connecting to NATS at {s}:{d} (auth={s})", .{
+            host,
+            port,
+            if (self.nats_user != null) "yes" else "no",
+        });
 
         // Create JetStream context (includes NATS client connection)
         const js = try nats.JS.CONNECT(self.allocator, .{
             .addr = self.nats_host,
             .port = self.nats_port,
+            .user = self.nats_user,
+            .pass = self.nats_pass,
         }, self.io);
         self.js = js;
 
-        log.info("🟢 Connected to NATS at {s}", .{self.nats_url});
+        log.info("🟢 Connected to NATS at {s}:{d}", .{ self.nats_host, self.nats_port });
         log.info("✅ JetStream context acquired", .{});
         self.is_connected.store(true, .seq_cst);
 
@@ -170,6 +185,8 @@ pub const Publisher = struct {
             const js = nats.JS.CONNECT(self.allocator, .{
                 .addr = self.nats_host,
                 .port = self.nats_port,
+                .user = self.nats_user,
+                .pass = self.nats_pass,
             }, self.io) catch |err| {
                 log.warn("Reconnect attempt {d} failed: {s}", .{ attempt + 1, @errorName(err) });
                 continue;

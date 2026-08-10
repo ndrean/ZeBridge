@@ -346,29 +346,8 @@ pub const RuntimeConfig = struct {
         };
     }
 
-    /// Free owned strings in RuntimeConfig
-    /// Only frees PostgreSQL connection strings that were allocated from environment variables
-    /// Does not free slot_name/publication_name as they reference CLI args or compile-time constants
-    pub fn deinit(self: *RuntimeConfig, allocator: std.mem.Allocator) void {
-        // Only free if not pointing to compile-time constants
-        const default_config = RuntimeConfig.defaults();
-
-        if (self.pg_host.ptr != default_config.pg_host.ptr) {
-            allocator.free(self.pg_host);
-        }
-        if (self.pg_user.ptr != default_config.pg_user.ptr) {
-            allocator.free(self.pg_user);
-        }
-        if (self.pg_password.ptr != default_config.pg_password.ptr) {
-            allocator.free(self.pg_password);
-        }
-        if (self.pg_database.ptr != default_config.pg_database.ptr) {
-            allocator.free(self.pg_database);
-        }
-        if (self.pg_sslmode.ptr != default_config.pg_sslmode.ptr) {
-            allocator.free(self.pg_sslmode);
-        }
-    }
+    // No deinit: every string here is either a compile-time default or a slice
+    // borrowed from argv/environ, all of which outlive the process. See parseArgs.
 };
 
 /// Get default log level based on environment

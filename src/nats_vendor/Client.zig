@@ -255,16 +255,15 @@ pub fn setSockNONBLOCK(sock: posix.socket_t) !void {
             }
         }
     } else {
-        // Use the raw linux syscall (non-variadic) instead of the libc fcntl
-        // (which is variadic and harder to type-check in Zig).
-        const get_rc = std.os.linux.fcntl(sock, posix.F.GETFL, 0);
-        const get_signed: isize = @bitCast(get_rc);
-        if (get_signed < 0) return error.FcntlGetFailed;
-        var fl_flags: usize = get_rc;
+        // libc fcntl rather than a raw linux syscall: the syscall numbers are
+        // Linux-only and abort with SIGSYS on Darwin. libc is already linked, and
+        // std.c.fcntl is variadic but callable directly with the extra argument.
+        const get_rc = std.c.fcntl(sock, posix.F.GETFL, @as(c_int, 0));
+        if (get_rc < 0) return error.FcntlGetFailed;
+        var fl_flags: usize = @intCast(get_rc);
         fl_flags |= 1 << @bitOffsetOf(system.O, "NONBLOCK");
-        const set_rc = std.os.linux.fcntl(sock, posix.F.SETFL, fl_flags);
-        const set_signed: isize = @bitCast(set_rc);
-        if (set_signed < 0) return error.FcntlSetFailed;
+        const set_rc = std.c.fcntl(sock, posix.F.SETFL, @as(c_int, @intCast(fl_flags)));
+        if (set_rc < 0) return error.FcntlSetFailed;
     }
 }
 
@@ -353,19 +352,18 @@ fn tcpConnect(host: []const u8, port: u16) !Stream {
     var ai = res;
     while (ai) |info| : (ai = info.ai_next) {
         const addr = info.ai_addr orelse continue;
-        // Use raw linux syscalls so we get *const anyopaque for addr and avoid
-        // libc's non-nullable sockaddr* type mismatch with cImport C pointers.
-        const sock_rc = std.os.linux.socket(
+        // libc socket/connect rather than raw linux syscalls, which abort with
+        // SIGSYS on Darwin. addr comes from the local @cImport of <netdb.h>, so it
+        // is a distinct type from std.c.sockaddr and needs an explicit cast.
+        const sock_rc = std.c.socket(
             @intCast(info.ai_family),
             @intCast(info.ai_socktype),
             @intCast(info.ai_protocol),
         );
-        const sock_signed: isize = @bitCast(sock_rc);
-        if (sock_signed < 0) continue;
+        if (sock_rc < 0) continue;
         const sock: posix.socket_t = @intCast(sock_rc);
-        const conn_rc = std.os.linux.connect(sock, addr, @intCast(info.ai_addrlen));
-        const conn_signed: isize = @bitCast(conn_rc);
-        if (conn_signed < 0) {
+        const conn_rc = std.c.connect(sock, @ptrCast(@alignCast(addr)), @intCast(info.ai_addrlen));
+        if (conn_rc < 0) {
             _ = system.close(sock);
             continue;
         }

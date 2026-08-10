@@ -229,13 +229,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Parse command-line arguments and build runtime config.
     // --help prints usage and exits 0; anything unparseable exits non-zero.
-    const parsed = args.Args.parseArgs(allocator, &init) catch |err| switch (err) {
+    const parsed = args.Args.parseArgs(&init) catch |err| switch (err) {
         error.HelpRequested => return,
         else => return err,
     };
     const parsed_args = parsed.args;
     var runtime_config = parsed.runtime_config;
-    defer runtime_config.deinit(allocator);
 
     // Create null-terminated versions for C APIs (kept alive for entire program)
     const slot_name_z = try allocator.dupeZ(u8, parsed_args.slot_name);

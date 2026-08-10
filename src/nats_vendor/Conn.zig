@@ -817,9 +817,22 @@ fn read_buffer(cn: *Conn, buffer: *Appendable, len: usize) !void {
 
 /// Generates a unique inbox identifier for request-reply patterns.
 /// Returns a 36-character UUID v4 string (xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx).
+/// Fill `buf` with OS entropy.
+///
+/// Not std.os.linux.getrandom: a raw Linux syscall number is invalid on Darwin and
+/// the kernel kills the process with SIGSYS. std.crypto.random no longer exists in
+/// Zig 0.16, and no single libc entry point covers both targets — Darwin exposes
+/// arc4random_buf but not getrandom, musl exposes getrandom but not arc4random_buf.
+fn osRandomBytes(buf: []u8) void {
+    switch (builtin.os.tag) {
+        .linux => _ = std.c.getrandom(buf.ptr, buf.len, 0),
+        else => std.c.arc4random_buf(buf.ptr, buf.len),
+    }
+}
+
 pub fn newInbox() [36]u8 {
     var bytes: [16]u8 = undefined;
-    _ = std.os.linux.getrandom(&bytes, bytes.len, 0);
+    osRandomBytes(&bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
 
@@ -842,8 +855,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 fn nanoNow() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 const Allocator = std.mem.Allocator;

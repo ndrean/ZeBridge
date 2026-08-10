@@ -85,9 +85,9 @@ fn subscribe(sb: *Subscriber, subject: []const u8) !void {
         return error.EmptySubject;
     }
 
-    sb.deliver_subject = try Conn.newInbox();
+    sb.deliver_subject = Conn.newInbox();
     sb.subscr_sid = sb.connection.?.nextSidNMT();
-    sb.name = try Conn.newInbox();
+    sb.name = Conn.newInbox();
 
     try sb.connection.?.printMT("SUB {0s} {1d} \r\n", .{ sb.deliver_subject[0..36], sb.subscr_sid });
 

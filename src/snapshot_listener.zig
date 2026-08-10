@@ -1850,8 +1850,8 @@ fn publishSchemaZig(
 /// Format: snap-{timestamp}-{random_u16}
 /// Prevents collisions when multiple snapshots are requested in the same second
 fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     const micro_seed = @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1_000;
     var prng = std.Random.DefaultPrng.init(micro_seed);
     const random_suffix = prng.random().int(u16);

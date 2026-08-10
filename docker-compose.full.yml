@@ -10,9 +10,13 @@ services:
       POSTGRES_USER: ${PG_USER}
       POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
+      # Override PG_PUBLISH_PORT when a Postgres already listens on the host's 5432 —
+      # a loopback-bound host server shadows Docker's wildcard bind for localhost.
+      - "${PG_PUBLISH_PORT:-5432}:5432"
     volumes:
-      - postgres-primary-data:/var/lib/postgresql/data
+      # postgres:18+ wants the mount at /var/lib/postgresql, not .../data — it stores
+      # data in a version-specific subdirectory so pg_upgrade --link can work.
+      - postgres-primary-data:/var/lib/postgresql
     command:
       - "postgres"
       - "-c"
@@ -44,7 +48,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - postgres-replica-data:/var/lib/postgresql/data
+      - postgres-replica-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -88,11 +92,8 @@ services:
       - nats-data:/data
       - nats-config:/config:ro
     command: ["-js", "-m", "8222", "-c", "/config/nats-server.conf"]
-    healthcheck:
-      test: ["CMD-SHELL", "wget --spider -q http://localhost:8222/varz || exit 1"]
-      interval: 3s
-      timeout: 3s
-      retries: 5
+    # No healthcheck: the nats image is distroless (no sh, no wget), so CMD-SHELL
+    # probes can never pass. nats-init below polls for readiness itself.
     restart: unless-stopped
     networks:
       - cdc-net
@@ -105,7 +106,7 @@ services:
       - cdc-net
     depends_on:
       nats-server:
-        condition: service_healthy
+        condition: service_started
     env_file:
       - .env.prod
     environment:

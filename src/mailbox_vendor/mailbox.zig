@@ -498,16 +498,16 @@ const Mutex = std.Io.Mutex;
 const Condition = std.Io.Condition;
 
 fn sleep(ns: u64) void {
-    var ts = std.os.linux.timespec{
+    var ts = std.c.timespec{
         .sec = @as(isize, @intCast(ns / std.time.ns_per_s)),
         .nsec = @as(isize, @intCast(ns % std.time.ns_per_s)),
     };
-    _ = std.os.linux.nanosleep(&ts, null);
+    _ = std.c.nanosleep(&ts, null);
 }
 
 fn nanoNow() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s +
         @as(u64, @intCast(ts.nsec));
 }

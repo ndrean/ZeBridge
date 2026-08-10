@@ -148,6 +148,42 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // ===== Vendored NATS library's own test suite =====
+    // Ported from upstream g41797/nats 0.0.3. The upstream repo targets Zig 0.15 and
+    // does not build on 0.16, so src/nats_vendor/ is the only 0.16 copy — meaning its
+    // tests have to run here rather than upstream. Kept off `zig build test` because
+    // these exercise vendored third-party code, not the bridge.
+    const nats_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nats_vendor/root_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mailbox", .module = mailbox_mod },
+            },
+        }),
+    });
+    nats_tests.root_module.link_libc = true;
+
+    const nats_test_step = b.step("test-nats", "Run the vendored NATS library's unit tests");
+    nats_test_step.dependOn(&b.addRunArtifact(nats_tests).step);
+
+    // Integration tests need a live NATS server on 4222 (see docker-compose.full.yml).
+    const nats_int_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nats_vendor/integration_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mailbox", .module = mailbox_mod },
+            },
+        }),
+    });
+    nats_int_tests.root_module.link_libc = true;
+
+    const nats_int_step = b.step("test-nats-integration", "Run vendored NATS integration tests (requires a live server)");
+    nats_int_step.dependOn(&b.addRunArtifact(nats_int_tests).step);
+
     // ===== Test executables =====
     // Old lalinsky/nats.zig test files removed (obsolete trial code)
     // If needed, new tests for g41797/nats can be added here
