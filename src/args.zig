@@ -4,6 +4,30 @@ const config = @import("config.zig");
 const encoder = @import("encoder.zig");
 const log = std.log.scoped(.args);
 
+const usage =
+    \\Usage: bridge [OPTIONS]
+    \\
+    \\Streams PostgreSQL logical replication (pgoutput) to NATS JetStream.
+    \\
+    \\Options:
+    \\  --slot <NAME>   Replication slot name (created if absent)
+    \\  --pub <NAME>    PostgreSQL PUBLICATION to stream
+    \\  --port <PORT>   HTTP telemetry port
+    \\  --json          Encode as JSON (default: MessagePack)
+    \\  --help, -h      Show this message
+    \\
+    \\Environment:
+    \\  PG_HOST, PG_PORT, PG_DB          PostgreSQL connection
+    \\  POSTGRES_BRIDGE_USER/_PASSWORD   PostgreSQL credentials
+    \\  PG_SSLMODE                       libpq sslmode (default: disable)
+    \\  NATS_HOST                        NATS server host
+    \\  NATS_BRIDGE_USER/_PASSWORD       NATS credentials
+    \\
+;
+
+/// Signals that `--help` was handled and the process should exit cleanly.
+pub const HelpRequested = error{HelpRequested};
+
 /// Command-line arguments structure
 pub const Args = struct {
     http_port: u16,
@@ -39,6 +63,15 @@ pub const Args = struct {
                 if (args_iter.next()) |value| publication_name = value;
             } else if (std.mem.eql(u8, arg, "--json")) {
                 encoding_format = .json;
+            } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                std.debug.print("{s}", .{usage});
+                return error.HelpRequested;
+            } else {
+                // Reject rather than ignore: silently skipping unknown flags is how a
+                // stale --zstd survived in deployment configs after the flag was removed.
+                log.err("unknown argument: {s}", .{arg});
+                std.debug.print("{s}", .{usage});
+                return error.InvalidArguments;
             }
         }
 
@@ -96,6 +129,13 @@ pub const Args = struct {
         else blk: {
             log.info("PG_DB not set, using default: {s}", .{runtime_config.pg_database});
             break :blk runtime_config.pg_database;
+        };
+
+        runtime_config.pg_sslmode = if (init.minimal.environ.getPosix("PG_SSLMODE")) |val|
+            try allocator.dupe(u8, val)
+        else blk: {
+            log.info("PG_SSLMODE not set, using default: {s}", .{runtime_config.pg_sslmode});
+            break :blk runtime_config.pg_sslmode;
         };
 
         // Parse BASE_BUF environment variable (log2 of buffer size)

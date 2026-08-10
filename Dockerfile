@@ -4,6 +4,8 @@ ARG BASE_IMAGE=alpine:3.22
 
 FROM ${BASE_IMAGE} AS builder
 
+# postgresql-dev provides libpq-fe.h, which the translate-c step in build.zig
+# needs at build time (see src/c_includes.h).
 RUN apk add --no-cache \
     curl \
     xz \
@@ -15,9 +17,7 @@ RUN apk add --no-cache \
     musl-dev \
     postgresql-dev \
     openssl-dev \
-    openssl-libs-static \
-    zstd-dev \
-    zstd-static
+    openssl-libs-static
 
 # Download and install Zig 0.16.0 (required by minimum_zig_version in build.zig.zon)
 # Detect architecture and download appropriate version
@@ -38,9 +38,6 @@ RUN ARCH=$(uname -m) && \
 WORKDIR /build
 COPY . .
 
-# Clean any existing builds
-RUN rm -rf libs/libpq-install zig-out zig-cache
-
 RUN zig build -Doptimize=ReleaseFast
 
 FROM ${BASE_IMAGE}
@@ -49,7 +46,6 @@ FROM ${BASE_IMAGE}
 # libpq pulls in libssl3/libcrypto3 transitively on Alpine
 RUN apk add --no-cache \
     libpq \
-    zstd-libs \
     ca-certificates
 
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge

@@ -287,6 +287,12 @@ pub const RuntimeConfig = struct {
     pg_user: []const u8,
     pg_password: []const u8,
     pg_database: []const u8,
+    /// libpq sslmode. Set explicitly rather than letting libpq apply its default of
+    /// `prefer`, which negotiates TLS when offered, falls back to plaintext when not,
+    /// and validates the server in neither case — so you cannot tell what you got.
+    /// Use `disable` when Postgres and the bridge share a host, `verify-full` when the
+    /// connection crosses one. `require` encrypts but does not authenticate the server.
+    pg_sslmode: []const u8,
 
     // PostgreSQL replication
     slot_name: []const u8,
@@ -323,6 +329,7 @@ pub const RuntimeConfig = struct {
             .pg_user = "postgres",
             .pg_password = "postgres",
             .pg_database = "postgres",
+            .pg_sslmode = "disable",
             .slot_name = Postgres.default_slot_name,
             .publication_name = Postgres.default_publication_name,
             .nats_url = Nats.default_url,
@@ -357,6 +364,9 @@ pub const RuntimeConfig = struct {
         }
         if (self.pg_database.ptr != default_config.pg_database.ptr) {
             allocator.free(self.pg_database);
+        }
+        if (self.pg_sslmode.ptr != default_config.pg_sslmode.ptr) {
+            allocator.free(self.pg_sslmode);
         }
     }
 };

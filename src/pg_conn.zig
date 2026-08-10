@@ -17,6 +17,9 @@ pub const PgConf = struct {
     user: []const u8,
     password: []const u8,
     database: []const u8,
+    /// libpq sslmode — always sent explicitly so the transport is a stated decision
+    /// rather than whatever `prefer` happens to negotiate. See RuntimeConfig.pg_sslmode.
+    sslmode: []const u8 = "disable",
     /// Enable replication mode (adds replication=database to connection string)
     replication: bool = false,
 
@@ -29,6 +32,7 @@ pub const PgConf = struct {
             .user = runtime_config.pg_user,
             .password = runtime_config.pg_password,
             .database = runtime_config.pg_database,
+            .sslmode = runtime_config.pg_sslmode,
             .replication = false,
         };
     }
@@ -41,14 +45,14 @@ pub const PgConf = struct {
         return if (replication)
             try utils.allocPrintZ(
                 allocator,
-                "host={s} port={d} user={s} password={s} dbname={s} replication=database",
-                .{ self.host, self.port, self.user, self.password, self.database },
+                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s} replication=database",
+                .{ self.host, self.port, self.user, self.password, self.database, self.sslmode },
             )
         else
             try utils.allocPrintZ(
                 allocator,
-                "host={s} port={d} user={s} password={s} dbname={s}",
-                .{ self.host, self.port, self.user, self.password, self.database },
+                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s}",
+                .{ self.host, self.port, self.user, self.password, self.database, self.sslmode },
             );
     }
 };

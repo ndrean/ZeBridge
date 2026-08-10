@@ -227,8 +227,12 @@ pub fn main(init: std.process.Init) !void {
     // Release: Use c_allocator for better performance
     const snap_base_alloc = if (IS_DEBUG) allocator else std.heap.c_allocator;
 
-    // Parse command-line arguments and build runtime config
-    const parsed = try args.Args.parseArgs(allocator, &init);
+    // Parse command-line arguments and build runtime config.
+    // --help prints usage and exits 0; anything unparseable exits non-zero.
+    const parsed = args.Args.parseArgs(allocator, &init) catch |err| switch (err) {
+        error.HelpRequested => return,
+        else => return err,
+    };
     const parsed_args = parsed.args;
     var runtime_config = parsed.runtime_config;
     defer runtime_config.deinit(allocator);

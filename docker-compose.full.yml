@@ -195,7 +195,6 @@ services:
       - "${BRIDGE_CDC_PUBLICATION}"
       - "--port"
       - "${BRIDGE_PORT}"
-      - "--zstd"
     networks:
       - cdc-net
     restart: unless-stopped

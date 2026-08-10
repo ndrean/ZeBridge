@@ -1,49 +1,52 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Link vendored or system libpq to an executable.
+/// Link system libpq to a compile step.
 ///
-/// Options:
-///   -Dvendored-libpq=true   Use pre-built libs/libpq-install/ (requires prior build of libpq)
-///   -Dlibpq-prefix=/path    Override the system libpq prefix (include/ and lib/ under it)
+/// Headers are handled separately by the translate-c step; this only needs the
+/// library itself. The runtime is always a container we build (see Dockerfile),
+/// so the distro's libpq is the dependency pin and picks up its own CVE fixes.
 ///
-/// Auto-detection for system libpq:
+///   -Dlibpq-prefix=/path    Override the libpq prefix (include/ and lib/ under it)
+///
+/// Auto-detection:
 ///   macOS  → /opt/homebrew/opt/libpq  (brew install libpq)
-///   Linux  → /usr                     (apt install libpq-dev)
-fn linkLibpq(exe: *std.Build.Step.Compile, b: *std.Build, use_vendored: bool, prefix: []const u8) void {
-    if (use_vendored) {
-        exe.root_module.addIncludePath(b.path("libs/libpq-install/include"));
-        exe.root_module.addLibraryPath(b.path("libs/libpq-install/lib"));
-        exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpgcommon.a"));
-        exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpgport.a"));
-        exe.root_module.addObjectFile(b.path("libs/libpq-install/lib/libpq.a"));
-    } else {
-        const include_path = b.pathJoin(&.{ prefix, "include" });
-        const lib_path = b.pathJoin(&.{ prefix, "lib" });
-        exe.root_module.addSystemIncludePath(.{ .cwd_relative = include_path });
-        exe.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
-        exe.root_module.linkSystemLibrary("pq", .{});
-    }
-
-    exe.root_module.link_libc = true;
+///   Linux  → /usr                     (apk add postgresql-dev / apt install libpq-dev)
+fn linkLibpq(compile: *std.Build.Step.Compile, b: *std.Build, prefix: []const u8) void {
+    const lib_path = b.pathJoin(&.{ prefix, "lib" });
+    compile.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
+    compile.root_module.linkSystemLibrary("pq", .{});
+    compile.root_module.link_libc = true;
 }
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const use_vendored = b.option(bool, "vendored-libpq", "Use vendored libpq from libs/libpq-install/") orelse false;
     const default_prefix: []const u8 = if (builtin.os.tag == .macos)
         "/opt/homebrew/opt/libpq"
     else
         "/usr";
     const prefix = b.option([]const u8, "libpq-prefix", "System libpq prefix (default: /opt/homebrew/opt/libpq on macOS, /usr on Linux)") orelse default_prefix;
 
-    if (use_vendored) {
-        std.debug.print("Using vendored libpq from libs/libpq-install\n", .{});
-    } else {
-        std.debug.print("Using system libpq from {s}\n", .{prefix});
-    }
+    std.debug.print("Using system libpq from {s}\n", .{prefix});
+
+    // Translate the C headers once into a real module. Replaces @cImport, which
+    // gave every import site its own incompatible copy of the C types and does not
+    // work with incremental compilation.
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/c_includes.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // Header layout differs by packaging, so offer both and let the compiler pick:
+    //   Homebrew keg   → {prefix}/include/libpq-fe.h
+    //   Alpine/Debian  → {prefix}/include/postgresql/libpq-fe.h   (pg_config --includedir)
+    // A path that does not exist is simply ignored.
+    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include", "postgresql" }) });
+    const c_mod = translate_c.createModule();
 
     const mod = b.addModule("bridge", .{
         .root_source_file = b.path("src/bridge.zig"),
@@ -78,6 +81,7 @@ pub fn build(b: *std.Build) void {
     // without these, `zig build test` cannot compile any module that uses msgpack/nats.
     mod.addImport("msgpack", msgpack.module("msgpack"));
     mod.addImport("nats", nats_mod);
+    mod.addImport("c", c_mod);
 
     const exe = b.addExecutable(.{
         .name = "bridge",
@@ -91,6 +95,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "bridge", .module = mod },
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
                 .{ .name = "nats", .module = nats_mod },
+                .{ .name = "c", .module = c_mod },
             },
         }),
     });
@@ -99,8 +104,7 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("ssl", .{});
     exe.root_module.linkSystemLibrary("crypto", .{});
 
-    // Link vendored libpq
-    linkLibpq(exe, b, use_vendored, prefix);
+    linkLibpq(exe, b, prefix);
 
     b.installArtifact(exe);
 
@@ -119,7 +123,7 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
-    linkLibpq(mod_tests, b, use_vendored, prefix);
+    linkLibpq(mod_tests, b, prefix);
     mod_tests.root_module.linkSystemLibrary("ssl", .{});
     mod_tests.root_module.linkSystemLibrary("crypto", .{});
 
@@ -132,7 +136,7 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
-    linkLibpq(exe_tests, b, use_vendored, prefix);
+    linkLibpq(exe_tests, b, prefix);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);
@@ -143,11 +147,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-
-    // Clean nats build artifacts
-    const clean_nats_step = b.step("clean-nats", "Clean nats.c build artifacts");
-    const rm_nats_build = b.addSystemCommand(&.{ "rm", "-rf", "libs/nats.c/build", "libs/nats-install" });
-    clean_nats_step.dependOn(&rm_nats_build.step);
 
     // ===== Test executables =====
     // Old lalinsky/nats.zig test files removed (obsolete trial code)

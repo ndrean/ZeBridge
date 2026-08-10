@@ -70,7 +70,6 @@ services:
       - "${BRIDGE_CDC_PUBLICATION}"
       - "--port"
       - "${BRIDGE_PORT}"
-      - "--zstd"
     networks:
       - cdc-bridge
     restart: unless-stopped
