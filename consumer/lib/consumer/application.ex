@@ -91,8 +91,9 @@ defmodule Consumer.Application do
         %{
           host: System.get_env("NATS_HOST") || "localhost",
           port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
-          username: System.get_env("NATS_USER"),
-          password: System.get_env("NATS_PASSWORD")
+          username: System.get_env("NATS_USER", "bridge_user"),
+          password: System.get_env("NATS_PASSWORD", "bridge_secure_password"),
+          token: "bridge_user_bridge_secure_password"
           #   tls: %{
           #   required: true,
           #   verify: true,

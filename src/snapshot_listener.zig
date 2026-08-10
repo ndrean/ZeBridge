@@ -427,10 +427,11 @@ pub const SnapshotListener = struct {
             \\WHERE t.table_schema = 'public'
             \\    AND t.table_type = 'BASE TABLE'
             \\    AND t.table_name IN {s}
-            \\ORDER BY t.table_name, c.ordinal_position
+            \\ORDER BY t.table_name, c.ordinal_position;
         ,
             .{in_clause.items},
         );
+        // !! TODO handle empty tables. `if (length(in_clause.items)==0) {}
         defer allocator.free(query);
 
         const result = c.PQexec(conn, query.ptr);

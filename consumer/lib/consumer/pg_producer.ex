@@ -1,6 +1,5 @@
 defmodule PgProducer do
   use GenServer
-  require Logger
   alias Decimal
 
   def start_link(opts) do

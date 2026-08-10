@@ -194,6 +194,7 @@ pub fn publishInitialSchemas(
     ,
         .{in_clause.items},
     );
+    // !!TODO  if (length(in_clause.items)==0) {...}
     defer allocator.free(query);
 
     const result = c.PQexec(conn, query.ptr);
