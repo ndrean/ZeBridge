@@ -13,3 +13,9 @@ authorization {
 jetstream {
   store_dir: "/data"
 }
+
+websocket {
+  port: 8080
+  no_tls: true
+}
+

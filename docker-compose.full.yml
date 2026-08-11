@@ -88,6 +88,7 @@ services:
     ports:
       - "4222:4222" # Client TCP connections
       - "8222:8222" # HTTP monitoring
+      - "8080:8080" # WebSocket connections
     volumes:
       - nats-data:/data
       - nats-config:/config:ro
@@ -168,37 +169,37 @@ services:
       - cdc-net
     restart: "no"
 
-  # 7. ZeBridge (Zig CDC Bridge Server)
-  bridge:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: bridge
-    ports:
-      - "${BRIDGE_PORT}:${BRIDGE_PORT}"
-    depends_on:
-      bridge-init:
-        condition: service_completed_successfully
-      postgres-primary:
-        condition: service_healthy
-      nats-init:
-        condition: service_completed_successfully
-    env_file:
-      - .env.prod
-    environment:
-      PG_HOST: postgres-primary
-      PG_PORT: 5432
-      NATS_HOST: nats-server
-    command:
-      - "--slot"
-      - "${BRIDGE_CDC_SLOT}"
-      - "--pub"
-      - "${BRIDGE_CDC_PUBLICATION}"
-      - "--port"
-      - "${BRIDGE_PORT}"
-    networks:
-      - cdc-net
-    restart: unless-stopped
+  # 7. ZeBridge (Zig CDC Bridge Server) - Commented out for local host-based dev execution
+  # bridge:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: bridge
+  #   ports:
+  #     - "${BRIDGE_PORT}:${BRIDGE_PORT}"
+  #   depends_on:
+  #     bridge-init:
+  #       condition: service_completed_successfully
+  #     postgres-primary:
+  #       condition: service_healthy
+  #     nats-init:
+  #       condition: service_completed_successfully
+  #   env_file:
+  #     - .env.prod
+  #   environment:
+  #     PG_HOST: postgres-primary
+  #     PG_PORT: 5432
+  #     NATS_HOST: nats-server
+  #   command:
+  #     - "--slot"
+  #     - "${BRIDGE_CDC_SLOT}"
+  #     - "--pub"
+  #     - "${BRIDGE_CDC_PUBLICATION}"
+  #     - "--port"
+  #     - "${BRIDGE_PORT}"
+  #   networks:
+  #     - cdc-net
+  #   restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:latest
@@ -209,6 +210,8 @@ services:
       - "9091:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - cdc-net
 
   grafana:
     image: grafana/grafana:latest
@@ -217,8 +220,25 @@ services:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./telemetry/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./telemetry/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./telemetry/dashboard.json:/var/lib/grafana/dashboards/dashboard.json:ro
     depends_on:
       - prometheus
+    networks:
+      - cdc-net
+
+  nats-exporter:
+    image: natsio/prometheus-nats-exporter:latest
+    container_name: zebridge_nats_exporter
+    command: ["-jsz", "all", "-varz", "http://nats-server:8222"]
+    ports:
+      - "7777:7777"
+    depends_on:
+      - nats-server
+    networks:
+      - cdc-net
   # 8. Elixir Consumer App
   # consumer:
   #   build:
