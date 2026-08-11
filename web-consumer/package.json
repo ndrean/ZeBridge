@@ -1,0 +1,19 @@
+{
+  "name": "web-consumer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.0.0-beta.1",
+    "nats.ws": "^1.29.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vite": "^6.0.0"
+  }
+}

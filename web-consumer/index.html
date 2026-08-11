@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ZeBridge Web Consumer</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>ZeBridge CDC Web Consumer</h1>
+        <div class="status-bar">
+          <span id="status-badge" class="badge disconnected">DISCONNECTED</span>
+          <span id="server-url">ws://localhost:8080</span>
+        </div>
+      </header>
+
+      <div class="controls">
+        <button id="btn-fetch-schema">Fetch Schemas</button>
+        <button id="btn-request-snapshot">Request Snapshot</button>
+        <button id="btn-clear-logs">Clear Logs</button>
+      </div>
+
+      <main>
+        <h3>Live Event Logs</h3>
+        <div id="log-output" class="log-container"></div>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
