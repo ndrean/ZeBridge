@@ -78,3 +78,38 @@ button:hover {
 .log-entry .op-update { color: #ffb74d; }
 .log-entry .op-delete { color: #e57373; }
 .log-entry .op-init { color: #ba68c8; }
+
+.mutation-section {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border: 1px solid #333;
+  border-radius: 4px;
+  background: #1a1a1a;
+}
+
+.mutation-controls, .fields-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+  align-items: center;
+}
+
+.fields-group input[type="text"],
+.fields-group input[type="number"],
+.fields-group input[type="email"],
+.mutation-controls select {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  color: #fff;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+}
+
+#btn-publish-mutation {
+  background: #1565c0;
+}
+#btn-publish-mutation:hover {
+  background: #1e88e5;
+}
+

@@ -26,6 +26,44 @@
         <h3>Live Event Logs</h3>
         <div id="log-output" class="log-container"></div>
       </main>
+
+      <section class="mutation-section">
+        <h3>Publish Client Mutation (Fan-In Test)</h3>
+        <div class="mutation-controls">
+          <label>
+            Table:
+            <select id="select-table">
+              <option value="test_types">test_types</option>
+              <option value="users">users</option>
+            </select>
+          </label>
+
+          <label>
+            Operation:
+            <select id="select-op">
+              <option value="INSERT">INSERT</option>
+              <option value="UPDATE">UPDATE</option>
+              <option value="DELETE">DELETE</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="fields-users" class="fields-group" style="display: none;">
+          <input type="number" id="user-id" placeholder="ID (e.g. 1)" value="1" />
+          <input type="text" id="user-name" placeholder="Name" value="Alice Smith" />
+          <input type="email" id="user-email" placeholder="Email" value="alice@example.com" />
+        </div>
+
+        <div id="fields-test_types" class="fields-group">
+          <input type="number" id="tt-id" placeholder="ID (e.g. 12)" value="12" />
+          <input type="text" id="tt-text" placeholder="some_text" value="Sample text" />
+          <input type="number" id="tt-age" placeholder="age" value="30" />
+          <input type="text" id="tt-price" placeholder="price" value="123.45" />
+          <label><input type="checkbox" id="tt-is_true" checked /> is_true</label>
+        </div>
+
+        <button id="btn-publish-mutation">Publish Mutation</button>
+      </section>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

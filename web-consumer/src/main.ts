@@ -1,5 +1,5 @@
 import { connect, NatsConnection, StringCodec, KvEntry } from 'nats.ws';
-import { decode } from '@msgpack/msgpack';
+import { decode, encode } from '@msgpack/msgpack';
 
 const NATS_URL = 'ws://localhost:8080';
 const NATS_USER = 'bridge_user';
@@ -13,6 +13,12 @@ const logOutput = document.getElementById('log-output')!;
 const btnFetchSchema = document.getElementById('btn-fetch-schema')!;
 const btnRequestSnapshot = document.getElementById('btn-request-snapshot')!;
 const btnClearLogs = document.getElementById('btn-clear-logs')!;
+
+const selectTable = document.getElementById('select-table') as HTMLSelectElement;
+const selectOp = document.getElementById('select-op') as HTMLSelectElement;
+const fieldsUsers = document.getElementById('fields-users')!;
+const fieldsTestTypes = document.getElementById('fields-test_types')!;
+const btnPublishMutation = document.getElementById('btn-publish-mutation')!;
 
 function updateStatus(state: 'connected' | 'disconnected' | 'connecting') {
   statusBadge.className = `badge ${state}`;
@@ -95,6 +101,17 @@ async function subscribeStreams() {
   })();
 }
 
+// Table selection toggle
+selectTable.addEventListener('change', () => {
+  if (selectTable.value === 'users') {
+    fieldsUsers.style.display = 'flex';
+    fieldsTestTypes.style.display = 'none';
+  } else {
+    fieldsUsers.style.display = 'none';
+    fieldsTestTypes.style.display = 'flex';
+  }
+});
+
 // Button actions
 btnFetchSchema.addEventListener('click', async () => {
   if (!nc) return;
@@ -124,5 +141,52 @@ btnClearLogs.addEventListener('click', () => {
   logOutput.innerHTML = '';
 });
 
+btnPublishMutation.addEventListener('click', () => {
+  if (!nc) {
+    appendLog('SYS', 'Cannot publish mutation: NATS not connected');
+    return;
+  }
+
+  const table = selectTable.value;
+  const op = selectOp.value;
+
+  let idVal: string;
+  let dataFields: Record<string, any> = {};
+
+  if (table === 'users') {
+    idVal = (document.getElementById('user-id') as HTMLInputElement).value;
+    dataFields = {
+      name: (document.getElementById('user-name') as HTMLInputElement).value,
+      email: (document.getElementById('user-email') as HTMLInputElement).value,
+    };
+  } else {
+    idVal = (document.getElementById('tt-id') as HTMLInputElement).value;
+    const ageVal = (document.getElementById('tt-age') as HTMLInputElement).value;
+    const priceVal = (document.getElementById('tt-price') as HTMLInputElement).value;
+    dataFields = {
+      some_text: (document.getElementById('tt-text') as HTMLInputElement).value,
+      age: ageVal !== '' ? Number(ageVal) : 0,
+      price: priceVal !== '' ? Number(priceVal) : 0,
+      is_true: (document.getElementById('tt-is_true') as HTMLInputElement).checked,
+    };
+  }
+
+  const payload = {
+    table,
+    operation: op,
+    primary_key: { id: Number(idVal) },
+    data: dataFields,
+    hlc: `${Date.now()}-0001`,
+    msg_id: `mut-${Math.random().toString(36).substring(2, 9)}`
+  };
+
+  const subject = `mutation.${table}.${op.toLowerCase()}`;
+  const encoded = encode(payload);
+
+  nc.publish(subject, encoded);
+  appendLog(subject, payload, 'MUTATION OUT');
+});
+
 // Start connection
 initNats();
+
