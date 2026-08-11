@@ -1,4 +1,4 @@
-# **Bridge server** [PostgreSQL  → NATS] 
+# Bridge server PostgreSQL  → NATS
 
 <img width="755" height="433" alt="Screenshot 2025-12-26 at 02 37 57" src="https://github.com/user-attachments/assets/b3701ef4-2d58-497a-be21-52ad1b970644" />
 
@@ -7,20 +7,28 @@
 A lightweight, opinionated application to fan out PostgreSQL _proto-v1_ CDC streams and table bootstrapping (schemas and snapshots) to the message broker NATS/JetStream.
 It uses MessagePack encoding by default (JSON option).
 
-Built with Zig for minimal overhead.
+Built with Zig for speed and minimal overhead.
 
-⚠️ **Status**: Early stage, not yet battle-tested in production. Suitable for experimentation and non-critical workloads.
+⚠️ **Status**: Dev stage.
 
 ```mermaid
-flowchart LR
-    PG[PostgreSQL] --> Bridge[Bridge <br>Server]
-    Bridge --> NATS[NATS <br>JetStream]
+flowchart TD
+    subgraph VPS["VPS / Private Network"]
+        PG_W[("PostgreSQL<br>WRITE Master")]
+        PG_R[("PostgreSQL<br>READ Replica")]
+        Bridge["ZeBridge<br>Server"]
+        NATS[("NATS<br>JetStream")]
 
-    NATS --> Consumers
+        PG_R -- "SSL (opt)" --> Bridge
+        Bridge -- "SSL (opt)" --> PG_W
+        Bridge <--> |"TCP"| NATS
+    end
 
-    subgraph Consumers
-      App
-      Local_DB
+    NATS <--> |"WS / WSS"| Consumers
+
+    subgraph Consumers["Edge Clients"]
+        App["Web / Mobile App"]
+        Local_DB[("Local DB<br>SQLite / PGLite")]
     end
 ```
 
@@ -92,10 +100,10 @@ Consumers wanting to mirror PostgreSQL tables locally (SQLite, PGLite, etc.) and
 
 ## Design Philosophy
 
-
 ### 1. Encoding
 
 **Default: MessagePack**
+
 - Compact (~30% smaller than JSON)
 - Type-safe (_preserves_ int/float/binary distinctions) whilst JSON sends strings.
 - Fast encoding/decoding
@@ -107,6 +115,7 @@ Consumers wanting to mirror PostgreSQL tables locally (SQLite, PGLite, etc.) and
 **Design choice:** One bridge instance = one replication slot = sequential processing
 
 **Rationale:**
+
 - PostgreSQL WAL is inherently sequential
 - Simpler LSN acknowledgment logic
 - Scale horizontally (multiple bridges) instead of vertically
@@ -830,6 +839,7 @@ loki.process "extract_metrics" {
 **HTTP GET** `http://localhost:9090/health`
 
 Returns:
+
 ```json
 {"status":"ok"}
 ```
@@ -849,6 +859,7 @@ curl -X POST http://localhost:9090/shutdown
 ```
 
 Shutdown sequence:
+
 1. Sets global shutdown flag
 2. Drains internal event queue
 3. Sends final ACK to PostgreSQL
@@ -870,16 +881,19 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 ### At-Least-Once Delivery
 
 **The guarantee:**
+
 - Bridge only ACKs to PostgreSQL **after** NATS JetStream confirms receipt
 - PostgreSQL can safely prune WAL after ACK
 - No data loss between Postgres and NATS
 
 **If bridge crashes:**
+
 - PostgreSQL retains WAL from last ACK'd LSN
 - Bridge restarts from last ACK'd position
 - JetStream deduplication (Msg-ID) prevents duplicates
 
 **If NATS crashes:**
+
 - Bridge stops ACK'ing to PostgreSQL
 - WAL accumulates (up to `max_slot_wal_keep_size=10GB`)
 - NATS recovers → Bridge resumes publishing
@@ -888,33 +902,40 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 ### Idempotent Delivery
 
 **Message ID pattern:** `{lsn}-{table}-{operation}`
+
 - Example: `25cb3c8-users-insert`
 
 **NATS JetStream deduplication:**
+
 - Duplicate Msg-IDs are rejected
 - Ensures exactly-once semantics even with retries
 
 ### Durability
 
 **PostgreSQL side:**
+
 - Logical replication slot preserves WAL
 - `max_slot_wal_keep_size=10GB` prevents unbounded growth
 
 **NATS JetStream side:**
+
 - File storage (`.storage=file`) survives restarts
 - Durable consumers track position across restarts
 
 **Consumer side:**
+
 - Durable consumer name persists progress
 - Survives consumer restarts
 
 ### Schema Consistency
 
 **Snapshot consistency:**
+
 - Each snapshot includes LSN for consistency point
 - Consumer can reconstruct table state at that LSN
 
 **CDC event ordering:**
+
 - PostgreSQL WAL is sequential
 - Bridge preserves order (single-threaded SPSC queue)
 - NATS JetStream delivers in order
@@ -922,6 +943,7 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 ### Graceful Shutdown
 
 **Shutdown sequence:**
+
 1. Signal handler (SIGINT/SIGTERM) sets stop flag
 2. Main thread finishes processing current WAL message
 3. Batch publisher drains internal queue
@@ -929,6 +951,7 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 5. All threads join cleanly
 
 **Guarantees:**
+
 - No in-flight events lost
 - PostgreSQL knows exact resume point
 - Clean restart from last ACK'd LSN
@@ -981,6 +1004,7 @@ pub fn SPSCQueue(comptime T: type) type {
 We specialize it with `T = CDCEvent`, creating a buffer of `CDCEvent[]`.
 
 **Two indices:**
+
 - `write_index`: Producer's position (next empty slot for writing)
   - Only modified by producer thread
   - Read by consumer to know data availability
@@ -990,7 +1014,7 @@ We specialize it with `T = CDCEvent`, creating a buffer of `CDCEvent[]`.
 
 #### Why Atomic Operations?
 
-Both threads share the buffer. The producer is the _only_ thread updating `write_index`, and the consumer is the _only_ thread updating `read_index`. 
+Both threads share the buffer. The producer is the _only_ thread updating `write_index`, and the consumer is the _only_ thread updating `read_index`.
 
 So why do we still need atomics if each index has a single writer?
 
@@ -1205,6 +1229,7 @@ If we had multiple writers, we'd need CAS loops with retries (see the video for 
 #### Practical Performance
 
 **Producer-Consumer pattern:**
+
 - **Producer**: Main thread (reading WAL)
 - **Consumer**: Batch publisher thread
 - **Queue**: 65536 slots (2^16), ~4MB memory
@@ -1266,11 +1291,13 @@ PostgreSQL LSN ACK
 ### Memory Management
 
 **Arena allocator:**
+
 - Reused for each WAL message
 - Retains capacity across messages
 - Avoids allocator churn at high throughput
 
 **Ownership transfer:**
+
 - Decoded column values transferred via SPSC queue
 - Batch publisher thread frees after publishing
 - No shared state between threads
@@ -1278,27 +1305,32 @@ PostgreSQL LSN ACK
 ### Replication Slot Management
 
 **On startup:**
+
 1. Bridge creates replication slot (if not exists)
 2. Gets current LSN to skip historical data
 3. Starts streaming from current LSN
 
 **During operation:**
+
 - Bridge sends status updates every 1 second OR 1MB data
 - PostgreSQL prunes WAL up to last ACK'd LSN
 
 **On shutdown:**
+
 - Bridge sends final ACK with last confirmed LSN
 - Replication slot preserves position for restart
 
 ### Reconnection Handling
 
 **PostgreSQL reconnection:**
+
 - Connection lost → Bridge waits 5 seconds
 - Gets latest LSN
 - Reconnects and resumes streaming
 - Metrics track reconnection count
 
 **NATS reconnection:**
+
 - Automatic (handled by nats.c library)
 - Max attempts: -1 (infinite)
 - Wait between attempts: 1 second (aggressive for CDC)
@@ -1321,12 +1353,14 @@ PostgreSQL LSN ACK
 | **Enterprise Support** | ❌ None                          | ✅ Available                           |
 
 **When to use Debezium instead:**
+
 - You need proven reliability (battle-tested in thousands of deployments)
 - You're already running Kafka infrastructure
 - You need connectors for MySQL, MongoDB, Oracle, etc.
 - You need enterprise support contracts
 
 **When to try this bridge:**
+
 - You're using NATS (or evaluating it)
 - You value small footprint / simple deployment
 - You're comfortable with early-stage software
@@ -1335,17 +1369,20 @@ PostgreSQL LSN ACK
 ### vs. Benthos / pgstream
 
 **Benthos** (Redpanda):
+
 - General-purpose streaming (many sources/sinks)
 - ~20-30MB footprint
 - Flexible but less CDC-optimized
 
 **pgstream** (Xata):
+
 - Go-based CDC library
 - ~15-20MB footprint
 - Similar philosophy (lightweight)
 - Multiple destinations (Kafka, webhooks, etc.)
 
 **This bridge:**
+
 - NATS-specific (not general-purpose)
 - Built-in bootstrapping (not manual)
 - Zig-native (compiled, minimal overhead)
@@ -1412,28 +1449,33 @@ All configuration constants are centralized in `src/config.zig`.
 ### Key Settings
 
 **Snapshot configuration:**
+
 - Chunk size: `10_000` rows per batch
 - Subject pattern: `init.snap.{table}.{snapshot_id}.{chunk}`
 - Metadata subject: `init.meta.{table}`
 - Request subject: `snapshot.request.{table}`
 
 **CDC configuration:**
+
 - Batch size: `500` events OR `100ms` OR `256KB` (whichever first)
 - Subject pattern: `cdc.{table}.{operation}`
 - Message ID: `{lsn}-{table}-{operation}`
 
 **NATS configuration:**
+
 - Max reconnect attempts: `-1` (infinite)
 - Reconnect wait: `2000ms`
 - Flush timeout: `10_000ms` (10 seconds)
 - Status update interval: `1` second OR `1MB` data
 
 **WAL monitoring:**
+
 - Check interval: `30` seconds
 - Warning threshold: `512MB`
 - Critical threshold: `1GB`
 
 **Buffer sizes:**
+
 - SPSC queue: `65536` slots (2^16, ~1092ms buffer at 60K events/s)
 - Subject buffer: `128` bytes
 - Message ID buffer: `128` bytes
@@ -1523,7 +1565,7 @@ See `src/config.zig` for all tunables.
 **Terminal 1 - Start the bridge:**
 
 ```sh
-docker compose -f docker-compose.prod.yml up postgres nats-init nats-conf-gen nats-server
+docker compose -f docker-compose.prod.yml --env-file .env.prod up
 
 source .env.local
 
@@ -1541,28 +1583,6 @@ iex> PgProducer.bulk(10)
 # Parallel load test: 100 batches of 10 events each every 1ms
 iex> PgProducer.stream(100, 10, 1)
 ```
-
-### Browser Web Consumer Client Test (`/web-consumer`)
-
-To test real-time CDC & INIT event streaming and client mutation fan-in directly in a web browser:
-
-1. **Build web assets** (if code changed):
-   ```sh
-   cd web-consumer
-   pnpm run build
-   ```
-
-2. **Start the dev server**:
-   ```sh
-   pnpm dev
-   ```
-
-3. **Navigate to the web consumer**:
-   Open [http://localhost:5173](http://localhost:5173) in your browser.
-
-> [!NOTE]
-> The browser client connects over WebSockets (`ws://localhost:8080`) using standard NATS authentication (`bridge_user` / `bridge_secure_password`).
-> *Advanced authentication (NKEYs) and encrypted WebSockets (`wss://`) via an ngrok tunnel will be tested in future iterations.*
 
 ### HTTP Endpoint Tests
 
@@ -1615,6 +1635,7 @@ docker exec -it postgres psql -U postgres -c "
 ## License
 
 This project uses:
+
 - [nats.c](https://github.com/nats-io/nats.c) (Apache 2.0)
 - [zig-msgpack](https://github.com/zigcc/zig-msgpack) (MIT)
 
@@ -1628,6 +1649,7 @@ This project uses:
 - All C code is compiled with `-std=c11`
 
 **Kill zombie processes:**
+
 ```bash
 ps aux | grep bridge | grep -v grep | awk '{print $2}' | xargs kill
 ```
