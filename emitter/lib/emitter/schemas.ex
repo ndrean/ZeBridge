@@ -11,7 +11,7 @@ end
 
 defmodule TestType do
   use Ecto.Schema
-  import Ecto.Changeset
+  # import Ecto.Changeset
 
   schema "test_types" do
     field(:uid, Ecto.UUID, read_after_writes: true)

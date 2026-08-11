@@ -28,3 +28,4 @@ consumer-*.tar
 AGENTS.md
 
 .elixir_ls/
+/docs/

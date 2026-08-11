@@ -24,11 +24,11 @@
       "id": 1,
       "title": "Bridge Status",
       "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "expr": "bridge_connected",
           "legendFormat": "Connected",
@@ -65,11 +65,11 @@
       "id": 2,
       "title": "Replication Slot Status",
       "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "expr": "bridge_slot_active",
           "legendFormat": "Slot Active",
@@ -104,16 +104,16 @@
       "collapsed": false,
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
       "id": 3,
-      "title": "WAL Lag (MB)",
+      "title": "Postgres WAL Lag (MB)",
       "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "expr": "bridge_wal_lag_bytes / 1024 / 1024",
-          "legendFormat": "Lag MB",
+          "legendFormat": "WAL Lag MB",
           "range": false,
           "refId": "A"
         }
@@ -138,24 +138,32 @@
       "collapsed": false,
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
       "id": 4,
-      "title": "Bridge Uptime",
+      "title": "NATS JetStream CDC Buffer (MB)",
       "type": "stat",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "pluginVersion": "10.0.0",
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "bridge_uptime_seconds",
-          "legendFormat": "Uptime",
+          "expr": "gnat_stream_bytes{stream=\"CDC\"} / 1024 / 1024 or vector(0)",
+          "legendFormat": "CDC Stream MB",
           "range": false,
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s",
-          "color": { "mode": "fixed", "fixedColor": "blue" }
+          "unit": "decbytes",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 200 },
+              { "color": "red", "value": 800 }
+            ]
+          }
         },
         "overrides": []
       }
@@ -166,17 +174,17 @@
       "id": 5,
       "title": "Event Throughput (msg/sec)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "expr": "rate(bridge_wal_messages_received_total[1m])",
           "legendFormat": "WAL Messages In",
           "refId": "A"
         },
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "expr": "rate(bridge_cdc_events_published_total[1m])",
           "legendFormat": "NATS Events Out",
@@ -198,16 +206,30 @@
       "collapsed": false,
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "id": 6,
-      "title": "WAL Replication Lag (Bytes)",
+      "title": "Postgres WAL Lag vs NATS JetStream Storage (Bytes)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "expr": "bridge_wal_lag_bytes",
-          "legendFormat": "WAL Lag",
+          "legendFormat": "Postgres WAL Lag",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "expr": "gnat_stream_bytes{stream=\"CDC\"}",
+          "legendFormat": "NATS CDC Stream Bytes",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "expr": "gnat_stream_bytes{stream=\"INIT\"}",
+          "legendFormat": "NATS INIT Stream Bytes",
+          "refId": "C"
         }
       ],
       "fieldConfig": {
@@ -226,31 +248,26 @@
       "collapsed": false,
       "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 },
       "id": 7,
-      "title": "Connection Reconnects",
+      "title": "NATS Consumer Lag / Pending Messages",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "bridge_pg_reconnects_total",
-          "legendFormat": "Postgres Reconnects",
+          "expr": "gnat_consumer_num_pending",
+          "legendFormat": "Consumer {{consumer}} (Stream {{stream}})",
           "refId": "A"
-        },
-        {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "editorMode": "code",
-          "expr": "bridge_nats_reconnects_total",
-          "legendFormat": "NATS Reconnects",
-          "refId": "B"
         }
       ],
       "fieldConfig": {
         "defaults": {
           "custom": {
             "drawStyle": "line",
-            "lineInterpolation": "stepAfter"
-          }
+            "lineInterpolation": "smooth",
+            "fillOpacity": 10
+          },
+          "unit": "short"
         },
         "overrides": []
       }
@@ -261,10 +278,10 @@
       "id": 8,
       "title": "Internal Event Queue Usage (%)",
       "type": "timeseries",
-      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
-          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
           "expr": "bridge_queue_usage_percent",
           "legendFormat": "Ring Buffer Usage",
@@ -283,15 +300,76 @@
         },
         "overrides": []
       }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 18 },
+      "id": 9,
+      "title": "Connection Reconnects",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "expr": "bridge_pg_reconnects_total",
+          "legendFormat": "Postgres Reconnects",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "expr": "bridge_nats_reconnects_total",
+          "legendFormat": "NATS Reconnects",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "stepAfter"
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 18 },
+      "id": 10,
+      "title": "NATS Stream Message Counts",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "editorMode": "code",
+          "expr": "gnat_stream_messages",
+          "legendFormat": "Stream {{stream}} Messages",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      }
     }
   ],
   "refresh": "5s",
   "schemaVersion": 38,
   "style": "dark",
-  "tags": ["zebridge", "cdc", "nats", "postgres"],
+  "tags": ["zebridge", "cdc", "nats", "postgres", "jetstream"],
   "time": { "from": "now-15m", "to": "now" },
   "timepicker": {},
   "timezone": "browser",
   "title": "ZeBridge - Postgres CDC to NATS",
-  "uid": "zebridge-overview"
+  "uid": "zebridge-overview",
+  "version": 2
 }

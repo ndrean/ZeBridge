@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: 'ZeBridge Dashboards'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    editable: true
+    allowUiUpdates: true
+    updateIntervalSeconds: 5
+    options:
+      path: /var/lib/grafana/dashboards
