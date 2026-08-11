@@ -22,6 +22,40 @@
         <button id="btn-clear-logs">Clear Logs</button>
       </div>
 
+      <section class="auth-section">
+        <div class="auth-header">
+          <h4 style="margin: 0;">NATS WebSocket Connection & Auth Settings</h4>
+          <button id="btn-reconnect" style="background: #2e7d32;">Connect / Reconnect</button>
+        </div>
+        <div class="auth-controls" style="margin-top: 0.5rem;">
+          <label>
+            Auth Mode:
+            <select id="auth-mode">
+              <option value="userpass">User / Password</option>
+              <option value="nkey">NKEY Seed</option>
+              <option value="jwt">JWT + NKEY Seed</option>
+            </select>
+          </label>
+
+          <div id="auth-userpass-fields" class="auth-group">
+            <label>User: <input type="text" id="auth-user" value="bridge_user" style="width: 120px;" /></label>
+            <label>Pass: <input type="password" id="auth-pass" value="bridge_secure_password" style="width: 140px;" /></label>
+          </div>
+
+          <div id="auth-nkey-fields" class="auth-group" style="display: none;">
+            <label>NKEY Seed (SU...): <input type="password" id="auth-nkey-seed" placeholder="SUAA..." style="width: 280px;" /></label>
+          </div>
+
+          <div id="auth-jwt-fields" class="auth-group" style="display: none; width: 100%;">
+            <label style="width: 100%;">
+              User JWT (eyJ...):
+              <textarea id="auth-jwt-token" placeholder="Paste user JWT here..." rows="2" style="width: 100%; margin-top: 0.25rem; font-family: monospace; background: #2a2a2a; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 0.4rem;"></textarea>
+            </label>
+            <label style="margin-top: 0.5rem;">NKEY Seed (SU...): <input type="password" id="auth-jwt-seed" placeholder="SUAA..." style="width: 280px;" /></label>
+          </div>
+        </div>
+      </section>
+
       <main>
         <h3>Live Event Logs</h3>
         <div id="log-output" class="log-container"></div>

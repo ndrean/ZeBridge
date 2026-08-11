@@ -79,6 +79,35 @@ button:hover {
 .log-entry .op-delete { color: #e57373; }
 .log-entry .op-init { color: #ba68c8; }
 
+.auth-section {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid #333;
+  border-radius: 4px;
+  background: #181818;
+}
+
+.auth-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.auth-controls, .auth-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.auth-group label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: #ccc;
+}
+
 .mutation-section {
   margin-top: 1.5rem;
   padding: 1rem;

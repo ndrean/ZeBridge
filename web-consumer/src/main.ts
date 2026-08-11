@@ -1,9 +1,7 @@
-import { connect, NatsConnection, StringCodec, KvEntry } from 'nats.ws';
+import { connect, NatsConnection, StringCodec, KvEntry, jwtAuthenticator, nkeyAuthenticator } from 'nats.ws';
 import { decode, encode } from '@msgpack/msgpack';
 
 const NATS_URL = 'ws://localhost:8080';
-const NATS_USER = 'bridge_user';
-const NATS_PASS = 'bridge_secure_password';
 
 let nc: NatsConnection | null = null;
 const sc = StringCodec();
@@ -13,6 +11,12 @@ const logOutput = document.getElementById('log-output')!;
 const btnFetchSchema = document.getElementById('btn-fetch-schema')!;
 const btnRequestSnapshot = document.getElementById('btn-request-snapshot')!;
 const btnClearLogs = document.getElementById('btn-clear-logs')!;
+
+const authModeSelect = document.getElementById('auth-mode') as HTMLSelectElement;
+const authUserpassFields = document.getElementById('auth-userpass-fields')!;
+const authNkeyFields = document.getElementById('auth-nkey-fields')!;
+const authJwtFields = document.getElementById('auth-jwt-fields')!;
+const btnReconnect = document.getElementById('btn-reconnect')!;
 
 const selectTable = document.getElementById('select-table') as HTMLSelectElement;
 const selectOp = document.getElementById('select-op') as HTMLSelectElement;
@@ -45,21 +49,62 @@ function appendLog(topic: string, data: any, opType?: string) {
   logOutput.scrollTop = logOutput.scrollHeight;
 }
 
+// Auth UI Toggle
+authModeSelect.addEventListener('change', () => {
+  const mode = authModeSelect.value;
+  authUserpassFields.style.display = mode === 'userpass' ? 'flex' : 'none';
+  authNkeyFields.style.display = mode === 'nkey' ? 'flex' : 'none';
+  authJwtFields.style.display = mode === 'jwt' ? 'flex' : 'none';
+});
+
 async function initNats() {
+  if (nc) {
+    try {
+      await nc.close();
+    } catch { /* ignore */ }
+    nc = null;
+  }
+
   try {
     updateStatus('connecting');
-    appendLog('SYS', `Connecting to NATS at ${NATS_URL}...`);
+    const mode = authModeSelect.value;
+    appendLog('SYS', `Connecting to NATS at ${NATS_URL} (auth=${mode})...`);
 
-    nc = await connect({
-      servers: NATS_URL,
-      user: NATS_USER,
-      pass: NATS_PASS,
-      reconnect: true,
-      maxReconnectAttempts: -1
-    });
+    const encoder = new TextEncoder();
+
+    if (mode === 'nkey') {
+      const seedStr = (document.getElementById('auth-nkey-seed') as HTMLInputElement).value.trim();
+      if (!seedStr) throw new Error('NKEY Seed is required for NKEY auth mode');
+      nc = await connect({
+        servers: NATS_URL,
+        authenticator: nkeyAuthenticator(encoder.encode(seedStr)),
+        reconnect: true,
+        maxReconnectAttempts: -1
+      });
+    } else if (mode === 'jwt') {
+      const jwtStr = (document.getElementById('auth-jwt-token') as HTMLTextAreaElement).value.trim();
+      const seedStr = (document.getElementById('auth-jwt-seed') as HTMLInputElement).value.trim();
+      if (!jwtStr || !seedStr) throw new Error('Both JWT token and NKEY Seed are required for JWT auth mode');
+      nc = await connect({
+        servers: NATS_URL,
+        authenticator: jwtAuthenticator(jwtStr, encoder.encode(seedStr)),
+        reconnect: true,
+        maxReconnectAttempts: -1
+      });
+    } else {
+      const userStr = (document.getElementById('auth-user') as HTMLInputElement).value.trim();
+      const passStr = (document.getElementById('auth-pass') as HTMLInputElement).value.trim();
+      nc = await connect({
+        servers: NATS_URL,
+        user: userStr,
+        pass: passStr,
+        reconnect: true,
+        maxReconnectAttempts: -1
+      });
+    }
 
     updateStatus('connected');
-    appendLog('SYS', 'Connected to NATS over WebSockets!');
+    appendLog('SYS', `Connected to NATS over WebSockets using ${mode.toUpperCase()} authentication!`);
 
     subscribeStreams();
   } catch (err) {
@@ -67,6 +112,10 @@ async function initNats() {
     appendLog('SYS', `Connection failed: ${err}`);
   }
 }
+
+btnReconnect.addEventListener('click', () => {
+  initNats();
+});
 
 async function subscribeStreams() {
   if (!nc) return;
