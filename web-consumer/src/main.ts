@@ -178,8 +178,7 @@ btnPublishMutation.addEventListener('click', () => {
     try { parsedMetadata = JSON.parse(metaStr); } catch { /* keep raw */ }
 
     dataFields = {
-      id: Number(idVal),
-      uid: uidVal,
+      uid: uidVal || undefined,
       age: ageVal !== '' ? Number(ageVal) : 30,
       temperature: tempVal !== '' ? Number(tempVal) : 36.6,
       price: priceVal || '123.4500',
@@ -189,12 +188,20 @@ btnPublishMutation.addEventListener('click', () => {
       matrix: parsedMatrix,
       metadata: parsedMetadata,
     };
+    if (op !== 'INSERT' || idVal !== '') {
+      dataFields.id = Number(idVal);
+    }
+  }
+
+  const primaryKey: Record<string, any> = {};
+  if (idVal !== '') {
+    primaryKey.id = Number(idVal);
   }
 
   const payload = {
     table,
     operation: op,
-    primary_key: { id: Number(idVal) },
+    primary_key: primaryKey,
     data: dataFields,
     hlc: `${Date.now()}-0001`,
     msg_id: `mut-${Math.random().toString(36).substring(2, 9)}`
