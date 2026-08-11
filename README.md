@@ -1542,6 +1542,28 @@ iex> PgProducer.bulk(10)
 iex> PgProducer.stream(100, 10, 1)
 ```
 
+### Browser Web Consumer Client Test (`/web-consumer`)
+
+To test real-time CDC & INIT event streaming and client mutation fan-in directly in a web browser:
+
+1. **Build web assets** (if code changed):
+   ```sh
+   cd web-consumer
+   pnpm run build
+   ```
+
+2. **Start the dev server**:
+   ```sh
+   pnpm dev
+   ```
+
+3. **Navigate to the web consumer**:
+   Open [http://localhost:5173](http://localhost:5173) in your browser.
+
+> [!NOTE]
+> The browser client connects over WebSockets (`ws://localhost:8080`) using standard NATS authentication (`bridge_user` / `bridge_secure_password`).
+> *Advanced authentication (NKEYs) and encrypted WebSockets (`wss://`) via an ngrok tunnel will be tested in future iterations.*
+
 ### HTTP Endpoint Tests
 
 ```sh
