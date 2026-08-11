@@ -898,6 +898,18 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 - Bridge stops ACK'ing to PostgreSQL
 - WAL accumulates (up to `max_slot_wal_keep_size=10GB`)
 - NATS recovers → Bridge resumes publishing
+
+### Zero-Consumer Protection & Storage Bounds
+
+**What happens if PostgreSQL emits CDC events when NO NATS clients are connected?**
+
+ZeBridge uses a **NATS JetStream Limits Retention** policy (`--max-age=1m`, `--max-bytes=1G`) for the `CDC` stream to protect both storage systems:
+
+1. **PostgreSQL Disk Protection**: ZeBridge continues receiving WAL events from PostgreSQL and publishing them to NATS JetStream. Once JetStream confirms file persistence, ZeBridge ACKs the LSN back to PostgreSQL. PostgreSQL safely prunes its disk WAL, preventing PostgreSQL disk bloat.
+2. **NATS JetStream Storage Bounds**: Even if zero clients are connected, JetStream automatically purges `CDC` stream events older than 1 minute (or exceeding 1GB).
+
+> [!NOTE]
+> This strategy ensures that neither PostgreSQL nor NATS JetStream run out of disk space when consumers are offline. Clients that connect after an outage fetch a fresh table snapshot (`INIT` stream) and resume real-time updates from the `CDC` stream.
 - No data loss (WAL preserved)
 
 ### Idempotent Delivery
