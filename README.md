@@ -910,6 +910,7 @@ ZeBridge uses a **NATS JetStream Limits Retention** policy (`--max-age=1m`, `--m
 
 > [!NOTE]
 > This strategy ensures that neither PostgreSQL nor NATS JetStream run out of disk space when consumers are offline. Clients that connect after an outage fetch a fresh table snapshot (`INIT` stream) and resume real-time updates from the `CDC` stream.
+
 - No data loss (WAL preserved)
 
 ### Idempotent Delivery
