@@ -49,22 +49,25 @@
         </div>
 
         <div id="fields-users" class="fields-group" style="display: none;">
-          <input type="number" id="user-id" placeholder="ID (e.g. 1)" value="1" />
-          <input type="text" id="user-name" placeholder="Name" value="Alice Smith" />
-          <input type="email" id="user-email" placeholder="Email" value="alice@example.com" />
+          <label>ID: <input type="number" id="user-id" value="1" style="width: 80px;" /></label>
+          <label>Name: <input type="text" id="user-name" value="Alice Smith" /></label>
+          <label>Email: <input type="email" id="user-email" value="alice@example.com" /></label>
         </div>
 
         <div id="fields-test_types" class="fields-group">
-          <input type="number" id="tt-id" placeholder="ID (e.g. 12)" value="12" />
-          <input type="text" id="tt-uid" placeholder="uid (UUID)" value="f4b0611f-7258-47f8-bceb-0eba9ac5195a" />
-          <input type="number" id="tt-age" placeholder="age (30)" value="30" />
-          <input type="number" step="0.1" id="tt-temp" placeholder="temperature (36.6)" value="36.6" />
-          <input type="text" id="tt-price" placeholder="price (123.4500)" value="123.4500" />
+          <label>ID: <input type="number" id="tt-id" value="12" style="width: 80px;" /></label>
+          <label>UID: <input type="text" id="tt-uid" value="f4b0611f-7258-47f8-bceb-0eba9ac5195a" style="width: 270px;" /></label>
+          <label>Age: <input type="number" id="tt-age" value="30" style="width: 80px;" /></label>
+          <label>Temperature: <input type="number" step="0.1" id="tt-temp" value="36.6" style="width: 90px;" /></label>
+          <label>Price: <input type="text" id="tt-price" value="123.4500" style="width: 110px;" /></label>
           <label><input type="checkbox" id="tt-is_true" checked /> is_true</label>
-          <input type="text" id="tt-text" placeholder="some_text" value="Sample text" />
-          <input type="text" id="tt-tags" placeholder='tags (JSON array: ["tag1","tag2"])' value='["tag1", "tag2"]' style="width: 220px;" />
-          <input type="text" id="tt-matrix" placeholder='matrix (JSON array: [[1,2],[3,4]])' value='[[1, 2], [3, 4]]' style="width: 240px;" />
-          <textarea id="tt-metadata" placeholder="metadata (JSON object)" rows="3" style="width: 100%; margin-top: 0.5rem; background: #2a2a2a; color: #fff; border: 1px solid #444; border-radius: 4px; font-family: monospace; padding: 0.5rem;">{"key_1": "value_1", "key_2": [[1, 2], [3, 4], [5, 6]], "key_3": {"key_4": "value_4", "key_5": "value_5"}}</textarea>
+          <label>Some Text: <input type="text" id="tt-text" value="Sample text" /></label>
+          <label>Tags (JSON): <input type="text" id="tt-tags" value='["tag1", "tag2"]' style="width: 180px;" /></label>
+          <label>Matrix (JSON): <input type="text" id="tt-matrix" value='[[1, 2], [3, 4]]' style="width: 180px;" /></label>
+          <label class="full-width">
+            Metadata (JSON):
+            <textarea id="tt-metadata" rows="3" style="width: 100%; margin-top: 0.25rem; background: #2a2a2a; color: #fff; border: 1px solid #444; border-radius: 4px; font-family: monospace; padding: 0.5rem;">{"key_1": "value_1", "key_2": [[1, 2], [3, 4], [5, 6]], "key_3": {"key_4": "value_4", "key_5": "value_5"}}</textarea>
+          </label>
         </div>
 
         <button id="btn-publish-mutation">Publish Mutation</button>

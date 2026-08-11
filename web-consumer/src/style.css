@@ -95,6 +95,20 @@ button:hover {
   align-items: center;
 }
 
+.fields-group label {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: #ccc;
+}
+
+.fields-group label.full-width {
+  width: 100%;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
 .fields-group input[type="text"],
 .fields-group input[type="number"],
 .fields-group input[type="email"],
