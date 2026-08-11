@@ -18,11 +18,13 @@ const utils = @import("utils.zig");
 pub const log = std.log.scoped(.nats_pub);
 
 /// NATS Publisher Configuration
+// TODO URL
 pub const PublisherConfig = struct {
     url: []const u8 = "nats://127.0.0.1:4222",
     max_reconnect_attempts: i32 = -1, // -1 = infinite
     reconnect_wait_ms: i64 = 2000, // 2s between attempts
     max_backoff_ms: i64 = 30000, // 30s max backoff
+    nkey_seed: ?[]const u8 = null, // Optional NKEY private seed (SU...)
 };
 
 /// Pure Zig NATS/JetStream Publisher
@@ -56,6 +58,7 @@ pub const Publisher = struct {
     // owns for its lifetime — so no allocation and nothing to free.
     nats_user: ?[]const u8 = null,
     nats_pass: ?[]const u8 = null,
+    nats_nkey_seed: ?[]const u8 = null, // Prepared for NKEY authentication
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     reconnect_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
@@ -77,6 +80,7 @@ pub const Publisher = struct {
             .nats_url = url,
             .nats_host = "",
             .nats_port = 4222,
+            .nats_nkey_seed = config.nkey_seed,
             .io = io,
         };
     }
@@ -120,7 +124,7 @@ pub const Publisher = struct {
         log.info("Connecting to NATS at {s}:{d} (auth={s})", .{
             host,
             port,
-            if (self.nats_user != null) "yes" else "no",
+            if (self.nats_user != null or self.nats_nkey_seed != null) "yes" else "no",
         });
 
         // Create JetStream context (includes NATS client connection)
@@ -129,6 +133,7 @@ pub const Publisher = struct {
             .port = self.nats_port,
             .user = self.nats_user,
             .pass = self.nats_pass,
+            .nkey_seed = self.nats_nkey_seed,
         }, self.io);
         self.js = js;
 
@@ -187,6 +192,7 @@ pub const Publisher = struct {
                 .port = self.nats_port,
                 .user = self.nats_user,
                 .pass = self.nats_pass,
+                .nkey_seed = self.nats_nkey_seed,
             }, self.io) catch |err| {
                 log.warn("Reconnect attempt {d} failed: {s}", .{ attempt + 1, @errorName(err) });
                 continue;

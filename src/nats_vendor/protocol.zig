@@ -29,6 +29,8 @@ pub const ConnectOpts = struct {
     user: ?[]const u8 = null,
     /// Optional password for NATS authentication.
     pass: ?[]const u8 = null,
+    /// Optional NKEY private seed for Ed25519 authentication.
+    nkey_seed: ?[]const u8 = null,
 };
 
 const ClientOpts = struct {
