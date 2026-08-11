@@ -21,13 +21,14 @@ flowchart TD
 
         PG_R -- "SSL (opt)" --> Bridge
         Bridge -- "SSL (opt)" --> PG_W
-        Bridge <--> |"TCP"| NATS
+        Bridge <--> |"TCP (Plain)"| NATS
     end
 
-    NATS <--> |"WS / WSS"| Consumers
+    NATS <--> |"TLS TCP / WSS / HTTPS"| Consumers
 
-    subgraph Consumers["Edge Clients"]
-        App["Web / Mobile App"]
+    subgraph Consumers["Consumers & Clients"]
+        App["Native App / WebApp"]
+        Server_Worker["Server Microservice"]
         Local_DB[("Local DB<br>SQLite / PGLite")]
     end
 ```
