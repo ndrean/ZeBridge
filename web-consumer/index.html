@@ -56,10 +56,15 @@
 
         <div id="fields-test_types" class="fields-group">
           <input type="number" id="tt-id" placeholder="ID (e.g. 12)" value="12" />
-          <input type="text" id="tt-text" placeholder="some_text" value="Sample text" />
-          <input type="number" id="tt-age" placeholder="age" value="30" />
-          <input type="text" id="tt-price" placeholder="price" value="123.45" />
+          <input type="text" id="tt-uid" placeholder="uid (UUID)" value="f4b0611f-7258-47f8-bceb-0eba9ac5195a" />
+          <input type="number" id="tt-age" placeholder="age (30)" value="30" />
+          <input type="number" step="0.1" id="tt-temp" placeholder="temperature (36.6)" value="36.6" />
+          <input type="text" id="tt-price" placeholder="price (123.4500)" value="123.4500" />
           <label><input type="checkbox" id="tt-is_true" checked /> is_true</label>
+          <input type="text" id="tt-text" placeholder="some_text" value="Sample text" />
+          <input type="text" id="tt-tags" placeholder='tags (JSON array: ["tag1","tag2"])' value='["tag1", "tag2"]' style="width: 220px;" />
+          <input type="text" id="tt-matrix" placeholder='matrix (JSON array: [[1,2],[3,4]])' value='[[1, 2], [3, 4]]' style="width: 240px;" />
+          <textarea id="tt-metadata" placeholder="metadata (JSON object)" rows="3" style="width: 100%; margin-top: 0.5rem; background: #2a2a2a; color: #fff; border: 1px solid #444; border-radius: 4px; font-family: monospace; padding: 0.5rem;">{"key_1": "value_1", "key_2": [[1, 2], [3, 4], [5, 6]], "key_3": {"key_4": "value_4", "key_5": "value_5"}}</textarea>
         </div>
 
         <button id="btn-publish-mutation">Publish Mutation</button>

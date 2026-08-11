@@ -161,13 +161,33 @@ btnPublishMutation.addEventListener('click', () => {
     };
   } else {
     idVal = (document.getElementById('tt-id') as HTMLInputElement).value;
+    const uidVal = (document.getElementById('tt-uid') as HTMLInputElement).value;
     const ageVal = (document.getElementById('tt-age') as HTMLInputElement).value;
+    const tempVal = (document.getElementById('tt-temp') as HTMLInputElement).value;
     const priceVal = (document.getElementById('tt-price') as HTMLInputElement).value;
+    const tagsStr = (document.getElementById('tt-tags') as HTMLInputElement).value;
+    const matrixStr = (document.getElementById('tt-matrix') as HTMLInputElement).value;
+    const metaStr = (document.getElementById('tt-metadata') as HTMLTextAreaElement).value;
+
+    let parsedTags: any = tagsStr;
+    let parsedMatrix: any = matrixStr;
+    let parsedMetadata: any = metaStr;
+
+    try { parsedTags = JSON.parse(tagsStr); } catch { /* keep raw */ }
+    try { parsedMatrix = JSON.parse(matrixStr); } catch { /* keep raw */ }
+    try { parsedMetadata = JSON.parse(metaStr); } catch { /* keep raw */ }
+
     dataFields = {
-      some_text: (document.getElementById('tt-text') as HTMLInputElement).value,
-      age: ageVal !== '' ? Number(ageVal) : 0,
-      price: priceVal !== '' ? Number(priceVal) : 0,
+      id: Number(idVal),
+      uid: uidVal,
+      age: ageVal !== '' ? Number(ageVal) : 30,
+      temperature: tempVal !== '' ? Number(tempVal) : 36.6,
+      price: priceVal || '123.4500',
       is_true: (document.getElementById('tt-is_true') as HTMLInputElement).checked,
+      some_text: (document.getElementById('tt-text') as HTMLInputElement).value,
+      tags: parsedTags,
+      matrix: parsedMatrix,
+      metadata: parsedMetadata,
     };
   }
 
