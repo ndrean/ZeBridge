@@ -101,7 +101,39 @@ async function subscribeStreams() {
   })();
 }
 
-// Table selection toggle
+const userIdInput = document.getElementById('user-id') as HTMLInputElement;
+const ttIdInput = document.getElementById('tt-id') as HTMLInputElement;
+const ttUidInput = document.getElementById('tt-uid') as HTMLInputElement;
+
+function updateFieldStates() {
+  const op = selectOp.value;
+  const isInsert = op === 'INSERT';
+  const isDelete = op === 'DELETE';
+
+  // ID fields are disabled for INSERT (Postgres sequence assigns ID)
+  userIdInput.disabled = isInsert;
+  ttIdInput.disabled = isInsert;
+
+  if (isInsert) {
+    userIdInput.placeholder = 'Auto (PG)';
+    ttIdInput.placeholder = 'Auto (PG)';
+    ttUidInput.placeholder = 'Auto (PG)';
+  } else {
+    userIdInput.placeholder = 'ID (Required)';
+    ttIdInput.placeholder = 'ID (Required)';
+    ttUidInput.placeholder = 'uid (UUID)';
+    if (!userIdInput.value) userIdInput.value = '1';
+    if (!ttIdInput.value) ttIdInput.value = '12';
+  }
+
+  // Non-ID fields are disabled for DELETE (only PK required)
+  const usersInputs = fieldsUsers.querySelectorAll('input:not(#user-id)');
+  usersInputs.forEach((el) => { (el as HTMLInputElement).disabled = isDelete; });
+
+  const ttInputs = fieldsTestTypes.querySelectorAll('input:not(#tt-id), textarea');
+  ttInputs.forEach((el) => { (el as HTMLInputElement | HTMLTextAreaElement).disabled = isDelete; });
+}
+
 selectTable.addEventListener('change', () => {
   if (selectTable.value === 'users') {
     fieldsUsers.style.display = 'flex';
@@ -110,7 +142,13 @@ selectTable.addEventListener('change', () => {
     fieldsUsers.style.display = 'none';
     fieldsTestTypes.style.display = 'flex';
   }
+  updateFieldStates();
 });
+
+selectOp.addEventListener('change', updateFieldStates);
+
+// Initial state check
+updateFieldStates();
 
 // Button actions
 btnFetchSchema.addEventListener('click', async () => {

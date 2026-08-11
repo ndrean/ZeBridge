@@ -120,6 +120,14 @@ button:hover {
   border-radius: 4px;
 }
 
+.fields-group input:disabled,
+.fields-group textarea:disabled {
+  opacity: 0.4;
+  background: #1e1e1e;
+  border-color: #333;
+  cursor: not-allowed;
+}
+
 #btn-publish-mutation {
   background: #1565c0;
 }
