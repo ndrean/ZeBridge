@@ -28,9 +28,9 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
 
     flush()
 
-    # Set REPLICA IDENTITY FULL and attach to Publication
+    # Set REPLICA IDENTITY DEFAULT and attach to Publication
     for table <- @cdc_tables do
-      execute("ALTER TABLE public.#{table} REPLICA IDENTITY FULL;")
+      execute("ALTER TABLE public.#{table} REPLICA IDENTITY DEFAULT;")
 
       execute("""
       DO $$
