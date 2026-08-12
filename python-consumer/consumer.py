@@ -9,7 +9,7 @@ async def run():
     await nc.connect("nats://bridge_user:bridge_secure_password@localhost:4222")
     js = nc.jetstream()
 
-    table_name = "test_types"
+    table_name = "users"
 
     # 1. Fetch Schema
     try:
@@ -29,7 +29,7 @@ async def run():
         f"cdc.{table_name}.>", 
         stream="CDC",
         config=ConsumerConfig(
-            deliver_policy=DeliverPolicy.ALL # Delivers the last 15 minutes of CDCs
+            deliver_policy=DeliverPolicy.NEW
         )
     )
     
@@ -39,25 +39,26 @@ async def run():
     # Any CDC with LSN <= 1000 will be ignored.
     SIMULATED_SNAPSHOT_LSN = 0 
     
-    async for msg in sub:
+    while True:
         try:
+            msg = await sub.next_msg()
             # We attempt to unpack msgpack, fallback to JSON if you are testing with --json
             try:
                 payload = msgpack.unpackb(msg.data)
             except:
                 import json
                 payload = json.loads(msg.data.decode())
-                
-            lsn_str = payload.get('lsn')
-            
-            # Very basic LSN drop logic (Requires parsing PG LSNs to compare in reality, 
-            # but usually it's just string comparison or converting "X/Y" to integers)
-            # For logging, we just print everything.
-            print(f"[{payload.get('operation')}] LSN: {lsn_str} Data: {payload.get('data')}")
+            # ZeBridge publishes batches as an array of events
+            if not isinstance(payload, list):
+                payload = [payload]
+
+            for event in payload:
+                lsn_str = event.get('lsn')
+                print(f"[{event.get('operation')}] LSN: {lsn_str} Data: {event.get('data')}")
             
             await msg.ack()
         except Exception as e:
-            print("❌ Failed to decode CDC", e)
+            print("❌ Failed to decode CDC:", e)
 
 if __name__ == '__main__':
     asyncio.run(run())

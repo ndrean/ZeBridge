@@ -146,7 +146,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "gnat_stream_bytes{stream=\"CDC\"} / 1024 / 1024 or vector(0)",
+          "expr": "jetstream_stream_total_bytes{stream=\"CDC\"} / 1024 / 1024 or vector(0)",
           "legendFormat": "CDC Stream MB",
           "range": false,
           "refId": "A"
@@ -220,14 +220,14 @@
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "gnat_stream_bytes{stream=\"CDC\"}",
+          "expr": "jetstream_stream_total_bytes{stream=\"CDC\"}",
           "legendFormat": "NATS CDC Stream Bytes",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "gnat_stream_bytes{stream=\"INIT\"}",
+          "expr": "jetstream_stream_total_bytes{stream=\"INIT\"}",
           "legendFormat": "NATS INIT Stream Bytes",
           "refId": "C"
         }
@@ -255,7 +255,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "gnat_consumer_num_pending",
+          "expr": "jetstream_consumer_num_pending",
           "legendFormat": "Consumer {{consumer}} (Stream {{stream}})",
           "refId": "A"
         }
@@ -345,7 +345,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "prometheus" },
           "editorMode": "code",
-          "expr": "gnat_stream_messages",
+          "expr": "jetstream_stream_total_messages",
           "legendFormat": "Stream {{stream}} Messages",
           "refId": "A"
         }
