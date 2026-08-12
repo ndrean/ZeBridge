@@ -357,11 +357,15 @@ pub fn main(init: std.process.Init) !void {
     // === Initialize EventProcessor (in this main thread, the CDC processing)
     // EventProcessor enqueues to the SPSC queue that BatchPublisher consumes
     var event_proc = event_processor.EventProcessor.init(
-        event_alloc, // Use thread-safe allocator for cross-thread data
-        batch_pub, // Already a pointer - no need for &
+        event_alloc,
+        batch_pub,
         &metrics,
-        &transition_rules, // Pass transition rules for table-specific semantic routing
+        &transition_rules,
+        &pg_config,
     );
+
+    // Publish boot schemas to NATS KV for all monitored tables
+    try event_proc.publishBootSchemas(allocator, monitored_tables);
 
     const batch_config = batch_publisher.BatchConfig{
         .max_events = Config.Batch.max_events,
@@ -504,8 +508,10 @@ pub fn main(init: std.process.Init) !void {
                                 const schema_changed = try schema_cache.hasChanged(rel.name, rel.relation_id);
 
                                 if (schema_changed) {
-                                    log.info("🔔 Schema change detected for table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
-                                    try schema_publisher.publishSchema(&publisher, &rel, allocator, parsed_args.encoding_format);
+                                    log.info("🔔 Relation mapping updated for table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
+                                    // We no longer publish schemas synchronously here.
+                                    // Schemas are updated via DDL events intersecting the WAL stream
+                                    // and pushed through the SPSC ring buffer for strict ordering.
                                 }
 
                                 // Update the current relation map HashMap
@@ -538,17 +544,25 @@ pub fn main(init: std.process.Init) !void {
                                         tx_slots_count = 0;
                                         return error.TransactionOverflow;
                                     }
-                                    const slot_idx = try event_proc.packMutationToSlot(
-                                        arena_allocator,
-                                        rel,
-                                        ins.tuple_data,
-                                        null,
-                                        "INSERT",
-                                        wal_msg.wal_end,
-                                    );
-                                    tx_slots_buf[tx_slots_count] = slot_idx;
-                                    tx_slots_count += 1;
-                                    cdc_events += 1;
+                                    if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) {
+                                        if (try event_proc.packDdlToSlot(arena_allocator, rel, ins.tuple_data, wal_msg.wal_end)) |slot_idx| {
+                                            tx_slots_buf[tx_slots_count] = slot_idx;
+                                            tx_slots_count += 1;
+                                            cdc_events += 1;
+                                        }
+                                    } else {
+                                        const slot_idx = try event_proc.packMutationToSlot(
+                                            arena_allocator,
+                                            rel,
+                                            ins.tuple_data,
+                                            null,
+                                            "INSERT",
+                                            wal_msg.wal_end,
+                                        );
+                                        tx_slots_buf[tx_slots_count] = slot_idx;
+                                        tx_slots_count += 1;
+                                        cdc_events += 1;
+                                    }
                                 }
                             },
                             .update => |upd| {

@@ -42,28 +42,47 @@ defmodule Produce do
     end
   end
 
-  def bulk_insert_in(nb, i \\ 1, table \\ "users") do
+  def bulk_insert_in(nb, i, table \\ "users") do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     values =
-      for idx <- 1..nb do
-        %{
-          name: "User-#{i}-#{idx}",
-          email: "user-#{i}-#{idx}@example.com",
-          inserted_at: now,
-          updated_at: now
-        }
+      case table do
+        "users" ->
+          for idx <- 1..nb do
+            %{
+              name: "User-#{i}-#{idx}",
+              email: "user-#{i}-#{idx}@example.com",
+              inserted_at: now,
+              updated_at: now
+            }
+          end
+
+        "test_types" ->
+          for idx <- 1..nb do
+            %{
+              age: 30 + idx,
+              temperature: 39.0 + idx * 0.1,
+              is_true: Enum.random([true, false]),
+              some_text: "bulk-#{i}-#{idx}",
+              tags: ["a", "b", "c"],
+              matrix: [[1, 2], [3, 4]],
+              metadata: %{"batch" => i, "idx" => idx},
+              price: 10.5 * idx,
+              inserted_at: now,
+              updated_at: now
+            }
+          end
       end
 
     Repo.insert_all(table, values)
   end
 
-  def stream(every, take, nb \\ 1) do
+  def stream(every, take, nb, table \\ "users") do
     # Task.start(fn ->
     Stream.interval(every)
     |> Stream.take(take)
     |> Task.async_stream(
-      fn i -> bulk_insert_in(nb, i, "users") end,
+      fn i -> bulk_insert_in(nb, i, table) end,
       ordered: false
     )
     |> Stream.run()

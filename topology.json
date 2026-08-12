@@ -8,7 +8,12 @@
     "cdc_prefix": "cdc",
     "init_prefix": "init",
     "schema_prefix": "schema",
-    "snapshot_request": "snapshot.request.>"
+    "snapshot_request": "snapshot.request",
+    
+    "snapshot_data_pattern": "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
+    "snapshot_start_pattern": "init.snap.start.{[table]s}",
+    "snapshot_error_pattern": "init.snap.error.{[table]s}",
+    "snapshot_meta_pattern": "init.snap.meta.{[table]s}"
   },
   "kv": {
     "schemas": "schemas",

@@ -4,7 +4,7 @@ services:
     image: postgres:18
     container_name: postgres-primary
     env_file:
-      - .env.prod
+      - .env.docker
     environment:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_USER: ${PG_USER}
@@ -42,7 +42,7 @@ services:
     image: busybox:latest
     container_name: nats-config-gen
     env_file:
-      - .env.prod
+      - .env.docker
     volumes:
       - nats-config:/config
       - ./nats-server.conf.template:/nats-server.conf.template:ro
@@ -88,7 +88,7 @@ services:
       nats-server:
         condition: service_started
     env_file:
-      - .env.prod
+      - .env.docker
     environment:
       - NATS_NKEY_SEED=${NATS_NKEY_SEED}
     command:
@@ -97,22 +97,34 @@ services:
       - |
         set -e
         export NATS_URL=nats-server:4222
-        export NATS_SEED=$${NATS_NKEY_SEED}
+        echo $${NATS_NKEY_SEED} > /tmp/seed.txt
+        export NATS_NKEY=/tmp/seed.txt
         echo 'Waiting for NATS server...'
         until nats server check connection 2>/dev/null; do
           sleep 1
         done
-        echo 'Creating NATS JetStream stream: CDC'
-        nats stream add CDC --subjects='cdc.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
 
-        echo 'Creating NATS JetStream stream: INIT'
-        nats stream add INIT --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+        # nats-box contains `jq`!
 
-        echo 'Creating NATS KV bucket: schemas'
-        nats kv add schemas --history=10 --replicas=1 || true
+        echo 'Reading streams from topology.json...'
+        CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' /topology.json)
+        INIT_PREFIX=$(jq -r '.subjects.init_prefix' /topology.json)
+        SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
+
+        echo "Creating NATS JetStream stream: CDC (subject: $$CDC_PREFIX.>)"
+        nats stream add CDC --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+
+        echo "Creating NATS JetStream stream: INIT (subject: $$INIT_PREFIX.>)"
+        nats stream add INIT --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+
+        echo "Creating NATS KV bucket: $$SCHEMA_KV"
+        nats kv add $$SCHEMA_KV --history=10 --replicas=1 || true
+
         echo 'NATS initialization complete!'
         exit 0
     restart: "no"
+    volumes:
+      - ./topology.json:/topology.json:ro
 
   # 6. Primary Postgres Initialization (Creates publication, users, test tables)
   bridge-init:
@@ -124,25 +136,17 @@ services:
     volumes:
       - ./init.sql.template:/init.sql.template:ro
     env_file:
-      - .env.prod
-    environment:
-      PGHOST: postgres-primary
-      PGPORT: 5432
-      PGUSER: ${PG_USER}
-      PGPASSWORD: ${PG_PASSWORD}
-      PGDATABASE: ${PG_DB}
-      POSTGRES_BRIDGE_USER: ${POSTGRES_BRIDGE_USER}
-      POSTGRES_BRIDGE_PASSWORD: ${POSTGRES_BRIDGE_PASSWORD}
-      TARGET_DB: ${TARGET_DB}
-      BRIDGE_CDC_TABLES: ${BRIDGE_CDC_TABLES}
-      BRIDGE_CDC_PUBLICATION: ${BRIDGE_CDC_PUBLICATION}
+      - .env.docker
+
     command:
       - /bin/bash
       - -c
       - |
         set -ex
+        export PGPASSWORD="$${PG_PASSWORD}"
+        # bring in `envsubst` via gettext-base
         apt-get update && apt-get install -y gettext-base
-        envsubst < /init.sql.template | psql -v ON_ERROR_STOP=1 -h "$${PGHOST}" -p "$${PGPORT}" -U "$${PGUSER}" -d "$${PGDATABASE}"
+        envsubst < /init.sql.template | psql -v ON_ERROR_STOP=1 -h "$${PG_HOST}" -p "$${PG_PORT}" -U "$${PG_USER}" -d "$${PG_DB}"
         echo "[bridge-init] Postgres initialization complete!"
     networks:
       - cdc-net

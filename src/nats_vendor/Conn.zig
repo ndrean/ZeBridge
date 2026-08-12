@@ -65,6 +65,15 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
         prt = co.port.?;
     }
 
+    errdefer {
+        if (cn.req_reply2.formatbuf.buffer) |_| cn.req_reply2.deinit();
+        cn.received.deinit(cn.io);
+        cn.pool.deinit(cn.io);
+        if (cn.printbuf.formatbuf.buffer) |_| cn.printbuf.deinit();
+        if (cn.dump.buffer) |_| cn.dump.deinit();
+        if (cn.line.buffer) |_| cn.line.deinit();
+    }
+
     try cn.line.init(allocator, 128, 32);
     if (builtin.mode == .Debug) {
         try cn.dump.init(allocator, 4096, 32);
@@ -81,8 +90,6 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
         .port = prt,
     });
 
-    errdefer cn.disconnect();
-
     // Initialize timer before read_mt() since it calls sendHeartBit()
     cn.heartbeat_ns = nanoNow();
 
@@ -92,16 +99,37 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
         return error.ProtocolError;
     }
 
-    if (co.user != null and co.pass != null) {
-        var buf: [512]u8 = undefined;
-        const connect_str = std.fmt.bufPrint(&buf,
-            "CONNECT {{\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"lang\":\"Zig\",\"version\":\"T.B.D\",\"protocol\":1,\"echo\":true,\"no_responders\":true,\"headers\":true,\"user\":\"{s}\",\"pass\":\"{s}\"}}\r\n",
-            .{ co.user.?, co.pass.? },
-        ) catch return error.ConnectStringTooLong;
-        try cn.writeAll(connect_str);
-    } else {
-        try cn.writeAll(protocol.ConnectString);
+    const info_line = cn.line.body() orelse return error.ProtocolError;
+
+    var nkey_pubkey: ?[]const u8 = null;
+    var nkey_sig: ?[]const u8 = null;
+    defer {
+        if (nkey_pubkey) |pk| allocator.free(pk);
+        if (nkey_sig) |sig| allocator.free(sig);
     }
+
+    if (co.nkey_seed) |nkey_seed| {
+        const nonce = try protocol.parseInfoNonce(allocator, info_line);
+        defer if (nonce) |n| allocator.free(n);
+
+        if (nonce) |n| {
+            const signature_raw = try nkeys.signNonce(allocator, nkey_seed, n);
+            defer allocator.free(signature_raw);
+
+            nkey_sig = try nkeys.base64UrlEncode(allocator, signature_raw);
+            nkey_pubkey = try nkeys.extractPublicKey(allocator, nkey_seed);
+        }
+    }
+
+    const connect_str = try protocol.buildConnectString(
+        allocator,
+        co,
+        nkey_pubkey,
+        nkey_sig,
+    );
+    defer allocator.free(connect_str);
+
+    try cn.writeAll(connect_str);
 
     return;
 }
@@ -870,6 +898,7 @@ const messages = @import("messages.zig");
 const Appendable = @import("Appendable.zig");
 const Formatter = @import("Formatter.zig");
 const utils = @import("utils.zig");
+const nkeys = @import("nkeys.zig");
 
 const MT = messages.MessageType;
 const Header = messages.Header;

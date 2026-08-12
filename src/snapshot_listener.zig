@@ -562,8 +562,8 @@ pub const SnapshotListener = struct {
         const encoded = try encoder.encode(schema_map);
         defer allocator.free(encoded);
 
-        // Publish to schema.{table_name} subject
-        const subject = try std.fmt.allocPrint(allocator, "schema.{s}", .{table_only});
+        // Publish to $KV.schemas.{table_name} subject to populate the KV bucket!
+        const subject = try std.fmt.allocPrint(allocator, "$KV.schemas.{s}", .{table_only});
         defer allocator.free(subject);
 
         core.PUB(subject, null, encoded) catch |err| {
@@ -853,7 +853,7 @@ pub const SnapshotListener = struct {
             const subject = try std.fmt.allocPrint(
                 chunk_alloc,
                 config.Snapshot.data_subject_pattern,
-                .{ table_name, snapshot_id, batch },
+                .{ .table = table_name, .snapshot_id = snapshot_id, .chunk = batch },
             );
 
             const msg_id_buf = try std.fmt.allocPrint(
@@ -986,7 +986,7 @@ pub const SnapshotListener = struct {
         const subject = try std.fmt.allocPrint(
             allocator,
             config.Snapshot.start_subject_pattern,
-            .{table_name},
+            .{ .table = table_name },
         );
         defer allocator.free(subject);
 
@@ -1030,7 +1030,7 @@ pub const SnapshotListener = struct {
         const subject = try std.fmt.allocPrint(
             allocator,
             config.Snapshot.meta_subject_pattern,
-            .{table_name},
+            .{ .table = table_name },
         );
         defer allocator.free(subject);
 
@@ -1131,7 +1131,7 @@ fn publishSnapshotError(
     const subject = try std.fmt.allocPrint(
         allocator,
         config.Snapshot.error_subject_pattern,
-        .{table_name},
+        .{ .table = table_name },
     );
     defer allocator.free(subject);
 
@@ -1527,7 +1527,7 @@ fn generateIncrementalSnapshot(
         const subject = try std.fmt.allocPrint(
             allocator,
             config.Snapshot.data_subject_pattern,
-            .{ table_name, snapshot_id, batch },
+            .{ .table = table_name, .snapshot_id = snapshot_id, .chunk = batch },
         );
         defer allocator.free(subject);
 
@@ -1733,7 +1733,7 @@ fn publishSnapshotMetadata(
     const subject = try std.fmt.allocPrint(
         allocator,
         config.Snapshot.meta_subject_pattern,
-        .{table_name},
+        .{ .table = table_name },
     );
     defer allocator.free(subject);
 
@@ -1777,7 +1777,7 @@ fn publishSnapshotStart(
     const subject = try std.fmt.allocPrint(
         allocator,
         config.Snapshot.start_subject_pattern,
-        .{table_name},
+        .{ .table = table_name },
     );
     defer allocator.free(subject);
 

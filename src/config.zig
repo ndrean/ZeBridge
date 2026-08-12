@@ -128,14 +128,10 @@ pub const Bridge = struct {
 
 /// Snapshot generation configuration
 pub const Snapshot = struct {
-    /// PostgreSQL NOTIFY channel for snapshot requests (deprecated - using NATS now)
-    pub const notify_channel = "snapshot_request";
+    // Snapshot identifiers
 
     /// Rows per snapshot chunk
     pub const chunk_size = 10_000;
-
-    /// Snapshot ID prefix
-    pub const id_prefix = "snap";
 
     /// Maximum concurrent snapshot requests
     pub const max_concurrent_snapshots = 3;
@@ -150,17 +146,17 @@ pub const Snapshot = struct {
     /// NATS subject wildcard for subscribing to all snapshot requests
     pub const request_subject_wildcard = topology.snapshot_request ++ ".>";
 
-    /// NATS subject pattern for data chunks: "init.snap.<table>.<snapshot_id>.<chunk>"
-    pub const data_subject_pattern = topology.subject_init_prefix ++ ".snap.{s}.{s}.{d}";
+    /// NATS subject pattern for data chunks: "init.snap.{table}.{snapshot_id}.{chunk}"
+    pub const data_subject_pattern = topology.snapshot_data_pattern;
 
-    /// NATS subject pattern for snapshot start notification: "init.snap.start.<table>"
-    pub const start_subject_pattern = topology.subject_init_prefix ++ ".snap.start.{s}";
+    /// NATS subject pattern for snapshot start notification: "init.snap.start.{table}"
+    pub const start_subject_pattern = topology.snapshot_start_pattern;
 
-    /// NATS subject pattern for snapshot errors: "init.snap.error.<table>"
-    pub const error_subject_pattern = topology.subject_init_prefix ++ ".snap.error.{s}";
+    /// NATS subject pattern for snapshot errors: "init.snap.error.{table}"
+    pub const error_subject_pattern = topology.snapshot_error_pattern;
 
-    /// NATS subject pattern for metadata: "init.snap.meta.<table>"
-    pub const meta_subject_pattern = topology.subject_init_prefix ++ ".snap.meta.{s}";
+    /// NATS subject pattern for metadata: "init.snap.meta.{table}"
+    pub const meta_subject_pattern = topology.snapshot_meta_pattern;
 
     /// NATS KV bucket name for schemas
     pub const kv_bucket_schemas = topology.kv_schemas;

@@ -6,6 +6,11 @@
 const std = @import("std");
 const pgoutput = @import("pgoutput.zig");
 const SPSCQueue = @import("spsc_queue.zig").SPSCQueue;
+const msgpack = @import("msgpack");
+const c_imports = @import("c_imports.zig");
+const c = c_imports.c;
+const pg_conn = @import("pg_conn.zig");
+const utils = @import("utils.zig");
 const Config = @import("config.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
@@ -72,21 +77,24 @@ fn valuesEqual(a: pgoutput.DecodedValue, b: pgoutput.DecodedValue) bool {
 /// Decodes pgoutput tuples, creates CDC events, and enqueues them to the SPSC queue
 pub const EventProcessor = struct {
     allocator: std.mem.Allocator,
-    batch_publisher: *batch_publisher.BatchPublisher, // Reference to batch publisher for ring buffer access
-    metrics: ?*Metrics, // Optional metrics reference
-    transition_rules: *const Config.EventClassification.TransitionRules, // Per-table transition column rules
+    batch_publisher: *batch_publisher.BatchPublisher,
+    metrics: ?*Metrics,
+    transition_rules: *const Config.EventClassification.TransitionRules,
+    pg_config: *const pg_conn.PgConf,
 
     pub fn init(
         allocator: std.mem.Allocator,
         batch_pub: *batch_publisher.BatchPublisher,
         metrics: ?*Metrics,
         transition_rules: *const Config.EventClassification.TransitionRules,
+        pg_config: *const pg_conn.PgConf,
     ) EventProcessor {
         return .{
             .allocator = allocator,
             .batch_publisher = batch_pub,
             .metrics = metrics,
             .transition_rules = transition_rules,
+            .pg_config = pg_config,
         };
     }
 
@@ -447,5 +455,301 @@ pub const EventProcessor = struct {
 
         log.debug("Event packed into slot {d} ({d} columns)", .{ slot_idx, event.column_count });
         return @intCast(slot_idx);
+    }
+
+    /// Translates a PostgreSQL type to SQLite type for the schema cache
+    fn pgToSqliteType(pg_type: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, pg_type, "int") or
+            std.mem.startsWith(u8, pg_type, "bigint") or
+            std.mem.startsWith(u8, pg_type, "smallint") or
+            std.mem.startsWith(u8, pg_type, "serial") or
+            std.mem.startsWith(u8, pg_type, "bigserial") or
+            std.mem.eql(u8, pg_type, "boolean"))
+        {
+            return "INTEGER";
+        } else if (std.mem.startsWith(u8, pg_type, "real") or
+            std.mem.startsWith(u8, pg_type, "double precision") or
+            std.mem.startsWith(u8, pg_type, "numeric") or
+            std.mem.startsWith(u8, pg_type, "decimal"))
+        {
+            return "REAL";
+        } else {
+            // text, varchar, char, uuid, json, timestamp, date, etc. default to TEXT
+            return "TEXT";
+        }
+    }
+
+    /// Process a DDL event, query PostgreSQL for the new schema, perform SQLite transformation,
+    /// and pack it into the ring buffer directly to the KV schemas subject.
+    pub fn packDdlToSlot(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        rel: pgoutput.RelationMessage,
+        tuple_data: pgoutput.TupleData,
+        wal_end: u64,
+    ) !?u32 {
+        // Decode zebridge_ddl_events tuple
+        const decoded = try pgoutput.decodeTuple(arena, tuple_data, rel.columns);
+        
+        var target_table: ?[]const u8 = null;
+        for (decoded.items) |col| {
+            if (std.mem.eql(u8, col.name, "table_name")) {
+                if (col.value == .text) {
+                    target_table = col.value.text;
+                }
+                break;
+            }
+        }
+        
+        if (target_table == null) return null;
+        
+        // Trim optional quotes or public schema prefix
+        var clean_table = target_table.?;
+        if (std.mem.startsWith(u8, clean_table, "public.")) {
+            clean_table = clean_table[7..];
+        }
+
+        log.info("🔍 Processing DDL event for table '{s}'", .{clean_table});
+
+        // Query Postgres for schema - must use a non-replication connection!
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+        
+        const conn = pg_conn.connect(arena, standard_pg_config) catch |err| {
+            log.err("Failed to connect to Postgres for DDL fetch: {}", .{err});
+            return error.PgConnectionFailed;
+        };
+        defer c.PQfinish(conn);
+
+        const query = try utils.allocPrintZ(
+            arena,
+            \\SELECT
+            \\    c.column_name,
+            \\    c.data_type
+            \\FROM information_schema.tables t
+            \\JOIN information_schema.columns c
+            \\    ON t.table_schema = c.table_schema
+            \\    AND t.table_name = c.table_name
+            \\WHERE t.table_schema = 'public'
+            \\    AND t.table_type = 'BASE TABLE'
+            \\    AND t.table_name = '{s}'
+            \\ORDER BY c.ordinal_position;
+        ,
+            .{clean_table},
+        );
+
+        const result = c.PQexec(conn, query.ptr);
+        defer c.PQclear(result);
+
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            return error.QueryFailed;
+        }
+
+        const num_rows: usize = @intCast(c.PQntuples(result));
+        if (num_rows == 0) {
+            log.warn("⚠️ No schema found for table {s}. Skipping DDL publish. (Hint: check SELECT privileges for the bridge user)", .{clean_table});
+            return null;
+        }
+
+        // Build the `{ pg: [...], sqlite: [...] }` JSON payload
+        var json_str: std.ArrayList(u8) = .empty;
+        
+        try json_str.appendSlice(arena, "{\"pg\":{\"columns\":[");
+
+        var r: i32 = 0;
+        while (r < num_rows) : (r += 1) {
+            if (r > 0) try json_str.appendSlice(arena, ",");
+            const col_name_c = c.PQgetvalue(result, r, 0);
+            const data_type_c = c.PQgetvalue(result, r, 1);
+            
+            const col_name = std.mem.span(col_name_c);
+            const data_type = std.mem.span(data_type_c);
+            
+            const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, data_type});
+            try json_str.appendSlice(arena, col_json);
+        }
+        
+        try json_str.appendSlice(arena, "]},\"sqlite\":{\"columns\":[");
+        
+        r = 0;
+        while (r < num_rows) : (r += 1) {
+            if (r > 0) try json_str.appendSlice(arena, ",");
+            const col_name_c = c.PQgetvalue(result, r, 0);
+            const data_type_c = c.PQgetvalue(result, r, 1);
+            
+            const col_name = std.mem.span(col_name_c);
+            const data_type = std.mem.span(data_type_c);
+            
+            const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, pgToSqliteType(data_type)});
+            try json_str.appendSlice(arena, col_json);
+        }
+        try json_str.appendSlice(arena, "] ");
+
+        // Query the primary key
+        const pk_query = try utils.allocPrintZ(
+            arena,
+            \\SELECT a.attname
+            \\FROM pg_index i
+            \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
+            \\  AND i.indisprimary
+            \\  AND array_length(i.indkey, 1) = 1;
+        ,
+            .{ "public", clean_table },
+        );
+        const pk_result = c.PQexec(conn, pk_query.ptr);
+        defer c.PQclear(pk_result);
+
+        if (c.PQresultStatus(pk_result) == c.PGRES_TUPLES_OK and c.PQntuples(pk_result) > 0) {
+            const pk_name = std.mem.span(c.PQgetvalue(pk_result, 0, 0));
+            const pk_json = try std.fmt.allocPrint(arena, ",\"pk\":\"{s}\"", .{pk_name});
+            try json_str.appendSlice(arena, pk_json);
+        }
+
+        try json_str.appendSlice(arena, "}}");
+
+        // Create subject: $KV.schemas.{table}
+        const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
+        const msg_id = try std.fmt.allocPrint(arena, "schema-{s}-{d}", .{clean_table, wal_end});
+
+        var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
+        try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });
+
+        // Acquire slot and pack!
+        const slot_idx = try self.acquireAndFillSlot(
+            kv_subject,
+            clean_table,
+            "SCHEMA",
+            msg_id,
+            rel.relation_id,
+            dummy_cols,
+            wal_end,
+        );
+
+        log.info("✅ DDL schema mapped and published to KV for '{s}'", .{clean_table});
+        return slot_idx;
+    }
+
+    /// Publish schemas for all monitored tables on boot.
+    pub fn publishBootSchemas(
+        self: *EventProcessor,
+        allocator: std.mem.Allocator,
+        monitored_tables: []const []const u8,
+    ) !void {
+        if (monitored_tables.len == 0) return;
+        
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        
+        log.info("📋 Extracting and publishing schemas for {d} monitored tables on boot...", .{monitored_tables.len});
+        
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+        
+        const conn = pg_conn.connect(arena, standard_pg_config) catch |err| {
+            log.err("Failed to connect to Postgres for boot schema fetch: {}", .{err});
+            return error.PgConnectionFailed;
+        };
+        defer c.PQfinish(conn);
+        
+        for (monitored_tables) |target_table| {
+            var clean_table = target_table;
+            if (std.mem.startsWith(u8, clean_table, "public.")) {
+                clean_table = clean_table[7..];
+            }
+            
+            const query = try utils.allocPrintZ(
+                arena,
+                \\SELECT attname, format_type(atttypid, atttypmod) AS data_type
+                \\FROM pg_attribute
+                \\WHERE attrelid = '"{s}"."{s}"'::regclass
+                \\  AND attnum > 0
+                \\  AND NOT attisdropped
+                \\ORDER BY attnum;
+            ,
+                .{ "public", clean_table },
+            );
+            
+            const result = c.PQexec(conn, query.ptr);
+            defer c.PQclear(result);
+            
+            if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+                log.warn("⚠️ Failed to query schema for {s}: {s}", .{clean_table, c.PQerrorMessage(conn)});
+                continue;
+            }
+            
+            const num_rows: i32 = c.PQntuples(result);
+            if (num_rows == 0) {
+                log.warn("⚠️ No schema found for table {s}", .{clean_table});
+                continue;
+            }
+            
+            var json_str: std.ArrayList(u8) = .empty;
+            try json_str.appendSlice(arena, "{\"pg\":{\"columns\":[");
+            
+            var r: i32 = 0;
+            while (r < num_rows) : (r += 1) {
+                if (r > 0) try json_str.appendSlice(arena, ",");
+                const col_name = std.mem.span(c.PQgetvalue(result, r, 0));
+                const data_type = std.mem.span(c.PQgetvalue(result, r, 1));
+                
+                const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, data_type});
+                try json_str.appendSlice(arena, col_json);
+            }
+            
+            try json_str.appendSlice(arena, "]},\"sqlite\":{\"columns\":[");
+            
+            r = 0;
+            while (r < num_rows) : (r += 1) {
+                if (r > 0) try json_str.appendSlice(arena, ",");
+                const col_name = std.mem.span(c.PQgetvalue(result, r, 0));
+                const data_type = std.mem.span(c.PQgetvalue(result, r, 1));
+                
+                const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, pgToSqliteType(data_type)});
+                try json_str.appendSlice(arena, col_json);
+            }
+            try json_str.appendSlice(arena, "] ");
+            
+            const pk_query = try utils.allocPrintZ(
+                arena,
+                \\SELECT a.attname
+                \\FROM pg_index i
+                \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
+                \\  AND i.indisprimary
+                \\  AND array_length(i.indkey, 1) = 1;
+            ,
+                .{ "public", clean_table },
+            );
+            const pk_result = c.PQexec(conn, pk_query.ptr);
+            defer c.PQclear(pk_result);
+            
+            if (c.PQresultStatus(pk_result) == c.PGRES_TUPLES_OK and c.PQntuples(pk_result) > 0) {
+                const pk_name = std.mem.span(c.PQgetvalue(pk_result, 0, 0));
+                const pk_json = try std.fmt.allocPrint(arena, ",\"pk\":\"{s}\"", .{pk_name});
+                try json_str.appendSlice(arena, pk_json);
+            }
+            try json_str.appendSlice(arena, "}}");
+            
+            const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
+            const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}", .{clean_table});
+            
+            var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
+            try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });
+            
+            const slot_idx = try self.acquireAndFillSlot(
+                kv_subject,
+                clean_table,
+                "SCHEMA",
+                msg_id,
+                0, // Dummy relation_id
+                dummy_cols,
+                0, // Dummy LSN
+            );
+            
+            try self.releaseSlotToQueue(slot_idx);
+            log.info("✅ Boot schema published to KV for '{s}'", .{clean_table});
+        }
     }
 };

@@ -8,8 +8,8 @@ A lightweight opinionated daemon connecting PostgreSQL CDC streams
 to the message broker NATS/JetStream for Edge sync.
 
 Allows mobile, WASM (PGLite/SQLite), and web apps to mirror
-PostgreSQL tables over WebSockets or http wvia NATS/JetStream
-without ever touching PostgreSQL.
+PostgreSQL tables over WebSockets or http via NATS/JetStream
+without ever reaching for PostgreSQL.
 
 This _single threaded_ binary processes ~60K+ events/s (TODO: provide test example).
 
@@ -66,20 +66,19 @@ We use the plugin `pgoutput` to receive formatted data from Postgres. It will se
 
 **Two-phase data flow:**
 
-1. **Bootstrap** (INIT stream): Consumer requests schemas & table snapshot
-2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen
+1. **Bootstrap** (INIT stream): Consumer requests schemas & table snapshot via a NATS KV store,
+2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen via NATS/JetStream.
 
 **Key features**:
 
-- Streams PostgreSQL _proto-v1_ changes using logical replication (pgoutput format)
-- Publishes schemas to NATS KV store on startup
-- Generates table snapshots on-demand (10K row chunks) via NATS requests
-- Triggers message to NATS on schema change via Postgres DDL event triggers
-- schemas are available in two formats: PostgreSQL and PSQLite
-- MessagePack default encoding or JSON available with `--json`
-- At-least-once delivery with idempotent message IDs
-- Graceful shutdown with LSN acknowledgment
-- ~+60K events/s throughput (single-threaded)
+- Streams PostgreSQL _proto-v1_ changes using logical replication (pgoutput format),
+- Publishes schemas to NATS KV store on startup,
+- Generates table snapshots on-demand (10K row chunks) via NATS requests,
+- Triggers message to NATS on schema change via Postgres DDL event triggers,
+- schemas are available in two formats: PostgreSQL(eg for PQLite) and SQLite,
+- MessagePack default encoding or JSON available with `--json`,
+- At-least-once delivery with idempotent message IDs,
+- Graceful shutdown with LSN acknowledgment,
 - telemetry via HTTP `/metrics` (Prometheus format) and Logs structured metrics to stdout (Grafana Loki)
 
 **Key decisions**:

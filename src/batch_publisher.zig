@@ -773,8 +773,6 @@ pub const BatchPublisher = struct {
         }
     }
 
-    /// Perform the actual encoding and publishing to NATS
-    /// Separated from flushBatch to enable clean retry logic
     fn doPublish(self: *BatchPublisher, indices: []usize) !void {
         if (indices.len == 0) return;
 
@@ -782,6 +780,46 @@ pub const BatchPublisher = struct {
         const event_count = indices.len;
 
         log.debug("📦 Encoding {d} events for publish", .{event_count});
+
+        var cdc_indices: std.ArrayListUnmanaged(usize) = .empty;
+        defer cdc_indices.deinit(flush_alloc);
+
+        for (indices) |slot_idx| {
+            const event = &self.events[slot_idx];
+            if (std.mem.startsWith(u8, event.getSubject(), "$KV.")) {
+                // If there are pending CDC events, flush them first to preserve order
+                if (cdc_indices.items.len > 0) {
+                    try self.publishCDCSubBatch(cdc_indices.items);
+                    cdc_indices.clearRetainingCapacity();
+                }
+                
+                // Publish KV event directly as raw JSON
+                if (event.column_count > 0) {
+                    const col_view = event.columns[0];
+                    const raw_json = event.data_buffer[col_view.value_offset..][0..col_view.value_len];
+                    
+                    var headers = nats.pool.Headers{};
+                    try headers.init(flush_alloc, 256);
+                    defer headers.deinit();
+                    try headers.append("Nats-Msg-Id", event.getMsgId());
+                    
+                    try self.publisher.publish(event.getSubject(), &headers, raw_json);
+                    log.info("📤 Published KV schema: {d} bytes to {s}", .{raw_json.len, event.getSubject()});
+                }
+            } else {
+                try cdc_indices.append(flush_alloc, slot_idx);
+            }
+        }
+
+        // Flush any remaining CDC events
+        if (cdc_indices.items.len > 0) {
+            try self.publishCDCSubBatch(cdc_indices.items);
+        }
+    }
+
+    fn publishCDCSubBatch(self: *BatchPublisher, indices: []usize) !void {
+        const flush_alloc = self.allocator;
+        const event_count = indices.len;
 
         // For single event, encode and publish directly
         if (event_count == 1) {

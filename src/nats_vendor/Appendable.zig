@@ -66,7 +66,7 @@ pub fn append(apndbl: *Appendable, buff: []const u8) !void {
     const avail = apndbl.buffer.?.len - apndbl.actual_len;
 
     if (avail < buff.len) {
-        try apndbl.alloc(@max(apndbl.roundlen(buff.len), apndbl.buffer.?.len * 2));
+        try apndbl.alloc(@max(apndbl.roundlen(apndbl.actual_len + buff.len), apndbl.buffer.?.len * 2));
     }
 
     std.mem.copyForwards(u8, apndbl.*.buffer.?[apndbl.actual_len..], buff);

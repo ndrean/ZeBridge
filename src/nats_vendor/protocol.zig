@@ -1,6 +1,5 @@
 // Copyright (c) 2025 g41797
 // SPDX-License-Identifier: MIT
-
 /// Default CONNECT command sent to the NATS server.
 pub const ConnectString = "CONNECT {\"verbose\":false,\"pedantic\":false,\"tls_required\":false,\"lang\":\"Zig\",\"version\":\"T.B.D\",\"protocol\":1,\"echo\":true, \"no_responders\":true, \"headers\":true}\r\n";
 
@@ -42,12 +41,51 @@ const ClientOpts = struct {
     pass: ?[]const u8 = null,
     lang: []const u8 = "Zig",
     version: []const u8 = "TBD",
-    protocol: []const u8 = "0",
+    protocol: u8 = 1,
     echo: bool = false,
     sig: ?[]const u8 = null,
     headers: bool = true,
     nkey: ?[]const u8 = null,
 };
+
+pub fn buildConnectString(
+    allocator: std.mem.Allocator,
+    opts: ConnectOpts,
+    nkey_pubkey: ?[]const u8,
+    nkey_sig: ?[]const u8,
+) ![]const u8 {
+    const message = ClientOpts{
+        .nkey = nkey_pubkey,
+        .sig = nkey_sig,
+        .user = opts.user,
+        .pass = opts.pass,
+    };
+
+    const fmt = std.json.fmt(message, .{
+        .whitespace = .minified,
+        .emit_null_optional_fields = false,
+    });
+
+    var writer = std.Io.Writer.Allocating.init(allocator);
+    defer writer.deinit();
+
+    try writer.writer.writeAll("CONNECT ");
+    try fmt.format(&writer.writer);
+    try writer.writer.writeAll("\r\n");
+
+    return try writer.toOwnedSlice();
+}
+
+pub fn parseInfoNonce(allocator: std.mem.Allocator, info_payload: []const u8) !?[]const u8 {
+    const nonce_key = "\"nonce\":\"";
+    const start_idx = std.mem.indexOf(u8, info_payload, nonce_key) orelse return null;
+    const value_start = start_idx + nonce_key.len;
+    
+    const remaining = info_payload[value_start..];
+    const end_idx = std.mem.indexOf(u8, remaining, "\"") orelse return null;
+    
+    return try allocator.dupe(u8, remaining[0..end_idx]);
+}
 
 const Drain = fn (msg: *messages.MSG) void;
 
