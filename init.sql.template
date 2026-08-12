@@ -20,3 +20,51 @@ BEGIN
     END IF;
 END;
 $$;
+
+-- ---------------------------------------------------------
+-- ZeBridge DDL Event Tracking
+-- Guarantees strict ordering of schema changes with CDC data
+-- ---------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS public.zebridge_ddl_events (
+    id SERIAL PRIMARY KEY,
+    schema_name TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    command_tag TEXT NOT NULL,
+    emitted_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Full replica identity ensures ZeBridge gets all columns in the WAL
+ALTER TABLE public.zebridge_ddl_events REPLICA IDENTITY FULL;
+GRANT SELECT ON TABLE public.zebridge_ddl_events TO ${POSTGRES_BRIDGE_USER};
+
+CREATE OR REPLACE FUNCTION public.zebridge_ddl_trigger_fn()
+RETURNS event_trigger AS $$
+DECLARE
+    obj record;
+BEGIN
+    FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+    LOOP
+        -- Capture DDL events related to tables in the public schema
+        IF obj.object_type IN ('table', 'table column') AND obj.schema_name = 'public' THEN
+            INSERT INTO public.zebridge_ddl_events (schema_name, table_name, command_tag)
+            VALUES (obj.schema_name, obj.object_identity, obj.command_tag);
+        END IF;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP EVENT TRIGGER IF EXISTS zebridge_ddl_trigger;
+CREATE EVENT TRIGGER zebridge_ddl_trigger ON ddl_command_end
+EXECUTE FUNCTION public.zebridge_ddl_trigger_fn();
+
+-- Automatically add the tracking table to the ZeBridge publication
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_publication_tables 
+        WHERE pubname = '${BRIDGE_CDC_PUBLICATION}' AND tablename = 'zebridge_ddl_events'
+    ) THEN
+        ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE public.zebridge_ddl_events;
+    END IF;
+END $$;

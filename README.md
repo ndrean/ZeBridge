@@ -4,23 +4,28 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-A lightweight, opinionated application to fan out PostgreSQL _proto-v1_ CDC streams and table bootstrapping (schemas and snapshots) to the message broker NATS/JetStream.
-It uses MessagePack encoding by default (JSON option).
+A lightweight opinionated daemon connecting PostgreSQL CDC streams
+to the message broker NATS/JetStream for Edge sync.
 
-Built with Zig for speed and minimal overhead.
+Allows mobile, WASM (PGLite/SQLite), and web apps to mirror
+PostgreSQL tables over WebSockets or http wvia NATS/JetStream
+without ever touching PostgreSQL.
 
-⚠️ **Status**: Dev stage.
+This _single threaded_ binary processes ~60K+ events/s (TODO: provide test example).
+
+⚠️ **Status**: Dev stage, beaking changes, draft notes.
 
 ```mermaid
 flowchart TD
     subgraph VPS["VPS / Private Network"]
-        PG_W[("PostgreSQL<br>WRITE Master")]
-        PG_R[("PostgreSQL<br>READ Replica")]
-        Bridge["ZeBridge<br>Server"]
+        PG[("PostgreSQL Master")]
+        Bridge["ZeBridge<br>daemon"]
         NATS[("NATS<br>JetStream")]
+        Bridge -- Prometheus --> Grafana["Grafana <br> dashboard"]
+        NATS -- Prometheus --> Grafana
 
-        PG_R -- "SSL (opt)" --> Bridge
-        Bridge -- "SSL (opt)" --> PG_W
+        PG -- "SSL (opt)" --> Bridge
+        Bridge -- "SSL (opt)" --> PG
         Bridge <--> |"TCP (Plain)"| NATS
     end
 
@@ -52,86 +57,80 @@ flowchart TD
 
 ## Overview
 
-We use NATS JetStream to solve the problem of distributing PostgreSQL's logical replication as both solve the hard problems: ordering, durability, idempotency.
-
-The bridge just connects them correctly.
-
-This bridge is an **experiment in minimalism**: can PostgreSQL CDC be done with 16MB and 7MB RAM while preserving correctness?
-
-The design makes deliberate trade-offs for simplicity and efficiency.
+We use `NATS/JetStream` to solve the problem of distributing PostgreSQL's logical replication as both solve the hard problems: ordering, durability, idempotency. The bridge just connects them correctly.
 
 ### What It Does
 
 We have a _pull_ model subscribing to the WAL.
-We use the plugin `pgoutput` to receive formatted data from Postgres.
-
-**Uses Protocol v1**:
-
-The plugin `pgoutput` will send data after the transaction is commited.
-
-The upwards versions 2,3,4 are not implemented.
-Version 2 introduced _streaming transactions_.
-Version 3 introduced row filtering (eg only replicate rows where user_id > 1000) and column filtering.
+We use the plugin `pgoutput` to receive formatted data from Postgres. It will send data after the transaction is commited. We use Protocol **v1** only.
 
 **Two-phase data flow:**
 
-1. **Bootstrap** (INIT stream): Consumer requests table snapshot → receives data `MessagePack` or `JSON` encoded
-2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen MessagePack or JSON encoded
+1. **Bootstrap** (INIT stream): Consumer requests schemas & table snapshot
+2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen
 
-**Key features:**
+**Key features**:
 
-- Streams PostgreSQL changes using logical replication (pgoutput format)
+- Streams PostgreSQL _proto-v1_ changes using logical replication (pgoutput format)
 - Publishes schemas to NATS KV store on startup
 - Generates table snapshots on-demand (10K row chunks) via NATS requests
-- Triggers message to NATS on schema change
+- Triggers message to NATS on schema change via Postgres DDL event triggers
+- schemas are available in two formats: PostgreSQL and PSQLite
 - MessagePack default encoding or JSON available with `--json`
 - At-least-once delivery with idempotent message IDs
 - Graceful shutdown with LSN acknowledgment
-- 16MB Docker image, 7MB RAM usage
 - ~+60K events/s throughput (single-threaded)
 - telemetry via HTTP `/metrics` (Prometheus format) and Logs structured metrics to stdout (Grafana Loki)
 
-### Use Case
+**Key decisions**:
 
-Consumers wanting to mirror PostgreSQL tables locally (SQLite, PGLite, etc.) and stay synchronized with real-time changes.
-
-**Example:** Edge applications, mobile apps, or analytics workers that need a local replica of specific tables without querying the main database.
+- use only tables with _primary key ID_ (run a migration otherwise) => `DELETE id='42'`,
+- `REPLICA IDENTITY DEFAULT` (not FULL),
+- Guides: A _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
 
 ---
 
 ## Design Philosophy
 
-### 1. Encoding
+### 1. Single-Threaded per Bridge
 
-**Default: MessagePack**
+```txt
+One bridge instance = one replication slot = sequential processing
+```
+
+The rationale is:
+
+- PostgreSQL WAL is inherently sequential
+- Simpler LSN acknowledgment logic
+- To a slot can be attached one or several tables
+- Scale horizontally (multiple bridges) instead of vertically
+
+### 2. Horizontal scaling*
+
+The PostgreSQL admin creates the publication and scope (_pub_name_ for which tables).
+Run multiple bridge instances with different replication slots - limited
+to `max_replication_slots=XX` in master config - and reach PostgreSQL instances.
+You can divide the workload per PostgreSQL instance, and attach bridge instances
+to differents scopes (specific tables).
+The bridges are all connected to the NATS server (which also clusters).
+
+```bash
+# Bridge 1: 60K events/s for table "users" with publication "my_pub_1" on master
+PG_HOST=localhost ./bridge --slot slot_1 --pub my_pub_1 --port 9090
+
+# Bridge 2: Another 60K events/s for table "orders" with publication "my_pub_2" on replica_1
+PG_HOST=replica_1 ./bridge --slot slot_2 --pub my_pub_2 --port 9091
+```
+
+### 2. Encoding
+
+The default is **MessagePack**:
 
 - Compact (~30% smaller than JSON)
 - Type-safe (_preserves_ int/float/binary distinctions) whilst JSON sends strings.
 - Fast encoding/decoding
 
-**Alternative: JSON**: use flag `--json` for browser compatibility (NATS supports WebSocket connections) but slightly larger payload size and slower encoding/decoding.
-
-### 2. Single-Threaded per Bridge
-
-**Design choice:** One bridge instance = one replication slot = sequential processing
-
-**Rationale:**
-
-- PostgreSQL WAL is inherently sequential
-- Simpler LSN acknowledgment logic
-- Scale horizontally (multiple bridges) instead of vertically
-
-**To scale throughput:**: the PostgreSQL admin creates the publication and scope (_pub_name_ for which tables).
-
-```bash
-# Bridge 1: 60K events/s for table "users" with publication "my_pub_1"
-./bridge --slot slot_1 --pub my_pub_1 --port 9090
-
-# Bridge 2: Another 60K events/s for table "orders" with publication "my_pub_2"
-./bridge --slot slot_2 --pub my_pub_2 --port 9091
-```
-
-**Trade-off:** Multiple processes vs single multi-threaded process. This approach prioritizes operational simplicity.
+Use flag `--json` to receive a JSON format. Slightly larger payload size and slower encoding/decoding.
 
 ### 3. Bridge ACK Flow
 
@@ -166,9 +165,12 @@ NATS JetStream → Consumer
 4. JetStream tracks consumer position (durable consumer)
 5. JetStream can prune messages acknowledged by all consumers
 
-The Consumer controls replay (NAK → redeliver). Durable consumer name survives restarts. Multiple consumers can track independent positions
+The Consumer controls replay (NAK → redeliver).
+Durable consumer name survives restarts.
+Multiple consumers can track independent positions
 
-**Backpressure:**: Consumer slow → JetStream buffers → Consumer catches up at own pace. JetStream retention policies prevent unbounded growth
+**Backpressure:**: Consumer slow → JetStream buffers → Consumer catches up at own pace.
+JetStream retention policies prevent unbounded growth
 .
 
 ### 4. Two-Stream Architecture
@@ -326,6 +328,42 @@ See `docker-compose.yml` for a complete Docker setup with PostgreSQL + NATS.
 ---
 
 ## Consumer Integration Guide
+
+### Naming Conventions (The API Contract)
+
+Because ZeBridge avoids a thick, opinionated SDK, these naming conventions _are_ the API contract. Clients must use these exact names and subjects to correctly synchronize with the backend.
+
+#### 1. Schemas (NATS KV Store)
+
+- **Bucket Name:** `schemas`
+
+- **Key Convention:** `<table_name>` (e.g., `users`)
+- **Client Action:** `kv.get('users')` to fetch the MessagePack/JSON schema definition.
+
+#### 2. Snapshots (NATS JetStream)
+
+- **Stream Name:** `INIT`
+
+- **Subject Conventions:**
+  - **Request:** `snapshot.request.<table_name>` (Client publishes empty payload here)
+  - **Chunks:** `init.snap.<table_name>.<snapshot_id>.<chunk_index>` (Bridge publishes chunked data here)
+  - **Metadata:** `init.meta.<table_name>` (Contains `Snapshot-LSN` and `Snapshot-Time` metadata)
+
+#### 3. CDC Events (NATS JetStream)
+
+- **Stream Name:** `CDC`
+
+- **Subject Convention:** `cdc.<table_name>.<operation>`
+  _(e.g., `cdc.test_types.insert`, `cdc.test_types.update`, `cdc.test_types.delete`)_
+- **Client Action:** Subscribe to `cdc.<table_name>.>` starting from `opt_start_time = Snapshot-Time - 10s`. Filter out any messages where `msg.lsn <= Snapshot-LSN`.
+
+#### 4. Local Client Mutations (NATS JetStream)
+
+- **Stream Name:** `MUTATIONS`
+
+- **Subject Convention:** `mutation.<table_name>.<operation>`
+  _(e.g., `mutation.test_types.update`)_
+- **Client Action:** The client publishes its local edge changes to this stream for the backend to ingest and resolve.
 
 ### Bootstrap Flow (First-Time Setup)
 
@@ -1661,6 +1699,43 @@ This project uses:
 - The library is statically linked to avoid runtime dependencies
 - PostgreSQL logical replication requires `wal_level=logical`
 - All C code is compiled with `-std=c11`
+
+**Example how to generate nkey for NATS**:
+
+```sh
+brew install nats-io/nats-tools/nats
+nk -gen user -pubout
+
+# private: SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI
+# public: UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV
+```
+
+In _nats-server.conf_, set:
+
+```diff
+authorization {
+  users: [
+-    # { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" } <-- remove
++    { nkey: "UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV"}
+  ]
+}
+```
+
+Start the bridge daemon with the private nkey:
+
+```sh
+NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI  RING_BUFFER_COUNT=2048 \
+BASE_BUF=12 \
+PG_HOST=localhost \
+PG_PORT=55432 \
+PG_DB=postgres \
+POSTGRES_BRIDGE_USER=bridge_reader \
+POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme \
+NATS_HOST=localhost \
+NATS_BRIDGE_USER=bridge_user \
+NATS_BRIDGE_PASSWORD=bridge_secure_password \
+./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
+```
 
 **Kill zombie processes:**
 

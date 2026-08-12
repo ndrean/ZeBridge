@@ -12,7 +12,7 @@ services:
     ports:
       # Override PG_PUBLISH_PORT when a Postgres already listens on the host's 5432 —
       # a loopback-bound host server shadows Docker's wildcard bind for localhost.
-      - "${PG_PUBLISH_PORT:-5432}:5432"
+      - "${PG_PUBLISH_PORT:-55432}:5432"
     volumes:
       # postgres:18+ wants the mount at /var/lib/postgresql, not .../data — it stores
       # data in a version-specific subdirectory so pg_upgrade --link can work.
@@ -37,25 +37,6 @@ services:
     networks:
       - cdc-net
 
-  # 2. Replica PostgreSQL (Target DB for Elixir Consumer)
-  # postgres-replica:
-  #   image: postgres:18
-  #   container_name: postgres-replica
-  #   environment:
-  #     POSTGRES_PASSWORD: ${PG_PASSWORD}
-  #     POSTGRES_USER: ${PG_USER}
-  #     POSTGRES_DB: postgres
-  #   ports:
-  #     - "5433:5432"
-  #   volumes:
-  #     - postgres-replica-data:/var/lib/postgresql
-  #   healthcheck:
-  #     test: [ "CMD-SHELL", "pg_isready -U postgres" ]
-  #     interval: 3s
-  #     timeout: 3s
-  #     retries: 5
-  #   networks:
-  #     - cdc-net
 
   # 3. NATS Configuration Generator
   nats-config-gen:
@@ -232,7 +213,7 @@ services:
   nats-exporter:
     image: natsio/prometheus-nats-exporter:latest
     container_name: zebridge_nats_exporter
-    command: ["-jsz", "all", "-varz", "http://nats-server:8222"]
+    command: [ "-jsz", "all", "-varz", "http://nats-server:8222" ]
     ports:
       - "7777:7777"
     depends_on:
@@ -273,8 +254,7 @@ services:
 volumes:
   postgres-primary-data:
     driver: local
-  postgres-replica-data:
-    driver: local
+
   nats-data:
     driver: local
   nats-config:

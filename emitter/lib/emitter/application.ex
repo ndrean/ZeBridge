@@ -14,22 +14,24 @@ defmodule Emitter.Application do
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
         # Run migrations on the active Repo connection pool
-        path = Ecto.Migrator.migrations_path(Emitter.Producer.Repo) |> dbg()
-        Application.app_dir(:emitter, "priv/repo/migrations") |> dbg()
+        path = Ecto.Migrator.migrations_path(Emitter.Producer.Repo)
         Ecto.Migrator.run(Emitter.Producer.Repo, path, :up, all: true) |> dbg()
 
         # Notify the Zig bridge via NATS
-        {:ok, gnat} =
-          Gnat.start_link(%{
-            host: "127.0.0.1",
-            port: 4222,
-            username: "bridge_user",
-            password: "bridge_secure_password",
-            token: "bridge_user_bridge_secure_password"
-          })
+        {:ok, _gnat} =
+          Gnat.start_link(
+            %{
+              host: System.get_env("NATS_HOST") || "127.0.0.1",
+              port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
+              jwt: System.get_env("NATS_JWT"),
+              nkey_seed: System.get_env("NATS_NKEY_SEED")
+            }
+            |> Enum.reject(fn {_, v} -> is_nil(v) end)
+            |> Map.new()
+          )
 
-        Gnat.pub(gnat, "bridge.control.reload_schema", "{}")
-        IO.puts("✅ Migrations executed and Zig bridge notified on boot!")
+        # Gnat.pub(gnat, "bridge.control.reload_schema", "{}")
+        IO.puts("✅ Migrations executed and Zig bridge should be notified on boot")
 
         {:ok, pid}
 

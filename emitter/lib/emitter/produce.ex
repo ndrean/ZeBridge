@@ -42,39 +42,34 @@ defmodule Produce do
     end
   end
 
-  def bulk_insert_in(nb, i \\ 1, name \\ "users") do
+  def bulk_insert_in(nb, i \\ 1, table \\ "users") do
+    now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
+
     values =
       for idx <- 1..nb do
         %{
           name: "User-#{i}-#{idx}",
-          email: "user-#{i}-#{idx}@example.com"
+          email: "user-#{i}-#{idx}@example.com",
+          inserted_at: now,
+          updated_at: now
         }
       end
 
-    Repo.insert_all(name, values)
+    Repo.insert_all(table, values)
   end
 
-  # def crud() do
-  #   GenServer.call(__MODULE__, :crud)
-  # end
+  def stream(every, take, nb \\ 1) do
+    # Task.start(fn ->
+    Stream.interval(every)
+    |> Stream.take(take)
+    |> Task.async_stream(
+      fn i -> bulk_insert_in(nb, i, "users") end,
+      ordered: false
+    )
+    |> Stream.run()
 
-  # def stream(take, nb, int \\ 1) do
-  #   Task.start(fn ->
-  #     Stream.interval(int)
-  #     |> Stream.take(take)
-  #     |> Task.async_stream(
-  #       fn _ -> PgProducer.bulk_insert_in(nb, "users") end,
-  #       ordered: false
-  #     )
-  #     |> Stream.run()
-  #   end)
-  # end
-
-  # def snap_request(pid) do
-  #   Postgrex.query!(pid, """
-  #   INSERT INTO snapshot_requests (table_name, requested_by) VALUES ('users', 'elixir-consumer');
-  #   """)
-  # end
+    # end)
+  end
 
   defp crud_test(pid) do
     %Postgrex.Result{command: :insert, rows: [[inserted_id]]} =
@@ -124,5 +119,6 @@ defmodule Produce do
   end
 end
 
+# Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, Enum.random(["users", "orders"])) end, ordered: false) |> Stream.run()
 # Stream.interval(1) |> Stream.take(1_000) |> Task.async_stream(fn _ -> PgProducer.run(100, Enum.random(["users", "orders"])) end, ordered: false) |> Stream.run()
 # Stream.interval(1) |> Stream.take(10_000) |> Task.async_stream(fn _ -> PgProducer.run(140, "users") end, ordered: false) |> Stream.run()

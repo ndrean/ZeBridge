@@ -6,7 +6,8 @@ http_port: 8222
 
 authorization {
   users: [
-    { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" }
+    { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" },
+    { nkey: "UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV"}
   ]
 }
 

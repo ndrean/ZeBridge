@@ -91,9 +91,12 @@ defmodule Consumer.Application do
         %{
           host: System.get_env("NATS_HOST") || "localhost",
           port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
-          username: System.get_env("NATS_USER", "bridge_user"),
-          password: System.get_env("NATS_PASSWORD", "bridge_secure_password"),
-          token: "bridge_user_bridge_secure_password"
+          jwt: System.get_env("NATS_JWT"),
+          nkey_seed: System.get_env("NATS_NKEY_SEED")
+        }
+        |> Enum.reject(fn {_, v} -> is_nil(v) end)
+        |> Map.new()
+        |> Map.merge(%{
           #   tls: %{
           #   required: true,
           #   verify: true,
