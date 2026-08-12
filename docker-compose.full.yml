@@ -50,8 +50,7 @@ services:
       - sh
       - -c
       - |
-        sed -e "s/\$${NATS_BRIDGE_USER}/$${NATS_BRIDGE_USER}/g" \
-            -e "s/\$${NATS_BRIDGE_PASSWORD}/$${NATS_BRIDGE_PASSWORD}/g" \
+        sed -e "s/\$${NATS_BRIDGE_NKEY_PUB}/$${NATS_BRIDGE_NKEY_PUB}/g" \
             /nats-server.conf.template > /config/nats-server.conf
         echo "✓ Generated NATS config with credentials"
     networks:
@@ -91,25 +90,26 @@ services:
     env_file:
       - .env.prod
     environment:
-      - NATS_BRIDGE_USER=${NATS_BRIDGE_USER}
-      - NATS_BRIDGE_PASSWORD=${NATS_BRIDGE_PASSWORD}
+      - NATS_NKEY_SEED=${NATS_NKEY_SEED}
     command:
       - sh
       - -c
       - |
         set -e
+        export NATS_URL=nats-server:4222
+        export NATS_SEED=$${NATS_NKEY_SEED}
         echo 'Waiting for NATS server...'
-        until nats server check connection --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 2>/dev/null; do
+        until nats server check connection 2>/dev/null; do
           sleep 1
         done
         echo 'Creating NATS JetStream stream: CDC'
-        nats stream add CDC --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --subjects='cdc.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+        nats stream add CDC --subjects='cdc.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
 
         echo 'Creating NATS JetStream stream: INIT'
-        nats stream add INIT --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+        nats stream add INIT --subjects='init.>' --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
 
         echo 'Creating NATS KV bucket: schemas'
-        nats kv add schemas --server=nats://${NATS_BRIDGE_USER}:${NATS_BRIDGE_PASSWORD}@nats-server:4222 --history=10 --replicas=1 || true
+        nats kv add schemas --history=10 --replicas=1 || true
         echo 'NATS initialization complete!'
         exit 0
     restart: "no"

@@ -17,6 +17,7 @@ pub const PgConf = struct {
     user: []const u8,
     password: []const u8,
     database: []const u8,
+    db_url: ?[]const u8,
     /// libpq sslmode — always sent explicitly so the transport is a stated decision
     /// rather than whatever `prefer` happens to negotiate. See RuntimeConfig.pg_sslmode.
     sslmode: []const u8 = "disable",
@@ -33,6 +34,7 @@ pub const PgConf = struct {
             .password = runtime_config.pg_password,
             .database = runtime_config.pg_database,
             .sslmode = runtime_config.pg_sslmode,
+            .db_url = runtime_config.db_url,
             .replication = false,
         };
     }
@@ -41,6 +43,18 @@ pub const PgConf = struct {
     ///
     /// Caller is responsible for freeing the returned string
     pub fn connInfo(self: *const PgConf, allocator: std.mem.Allocator, replication: bool) ![:0]const u8 {
+        if (self.db_url) |url| {
+            if (replication) {
+                if (std.mem.indexOf(u8, url, "?") != null) {
+                    return try utils.allocPrintZ(allocator, "{s}&replication=database", .{url});
+                } else {
+                    return try utils.allocPrintZ(allocator, "{s}?replication=database", .{url});
+                }
+            } else {
+                return try utils.allocPrintZ(allocator, "{s}", .{url});
+            }
+        }
+
         // null-terminated [:0]u8 slice suitable for C APIs (e.g. PQconnectdb)
         return if (replication)
             try utils.allocPrintZ(

@@ -96,6 +96,7 @@ pub const Args = struct {
         // so these are assigned directly — no dupe, nothing to free. (0.15's
         // getEnvVarOwned returned owned memory; 0.16 changed that.) Valid because
         // nothing here calls setenv/putenv, which could reallocate the block.
+        runtime_config.db_url = init.minimal.environ.getPosix("DATABASE_URL");
         runtime_config.pg_host = init.minimal.environ.getPosix("PG_HOST") orelse blk: {
             log.info("PG_HOST not set, using default: {s}", .{runtime_config.pg_host});
             break :blk runtime_config.pg_host;
@@ -187,12 +188,12 @@ pub const Args = struct {
         }
 
         // NATS connection — slices into environ block, no allocation needed
+        runtime_config.nats_url = init.minimal.environ.getPosix("NATS_URL");
         runtime_config.nats_host = init.minimal.environ.getPosix("NATS_HOST") orelse blk: {
             log.info("NATS_HOST not set, using default: {s}", .{runtime_config.nats_host});
             break :blk runtime_config.nats_host;
         };
-        runtime_config.nats_user = init.minimal.environ.getPosix("NATS_BRIDGE_USER");
-        runtime_config.nats_pass = init.minimal.environ.getPosix("NATS_BRIDGE_PASSWORD");
+        runtime_config.nats_seed = init.minimal.environ.getPosix("NATS_NKEY_SEED");
 
         return .{
             .args = cli_args,

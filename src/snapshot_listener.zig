@@ -188,8 +188,8 @@ pub const SnapshotListener = struct {
     chunk_size: usize,
     io: std.Io,
     nats_host: []const u8,
-    nats_user: ?[]const u8,
-    nats_pass: ?[]const u8,
+    nats_port: u16,
+    nats_seed: ?[]const u8,
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -200,6 +200,8 @@ pub const SnapshotListener = struct {
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
         io: std.Io,
+        nats_host: []const u8,
+        nats_port: u16,
     ) SnapshotListener {
         return .{
             .allocator = allocator,
@@ -208,11 +210,11 @@ pub const SnapshotListener = struct {
             .monitored_tables = monitored_tables,
             .thread = null,
             .format = format,
-            .chunk_size = runtime_config.snapshot_chunk_size,
             .io = io,
-            .nats_host = runtime_config.nats_host,
-            .nats_user = runtime_config.nats_user,
-            .nats_pass = runtime_config.nats_pass,
+            .nats_host = nats_host,
+            .nats_port = nats_port,
+            .nats_seed = runtime_config.nats_seed,
+            .chunk_size = runtime_config.snapshot_chunk_size,
         };
     }
 
@@ -249,8 +251,8 @@ pub const SnapshotListener = struct {
             self.format,
             self.io,
             self.nats_host,
-            self.nats_user,
-            self.nats_pass,
+            self.nats_port,
+            self.nats_seed,
         });
 
         // Spawn snapshot request handler thread (pure g41797/nats - no nats.c dependency!)
@@ -264,8 +266,8 @@ pub const SnapshotListener = struct {
             self.chunk_size,
             self.io,
             self.nats_host,
-            self.nats_user,
-            self.nats_pass,
+            self.nats_port,
+            self.nats_seed,
         });
 
         // Keep main thread alive - just sleep until stop signal
@@ -300,8 +302,8 @@ pub const SnapshotListener = struct {
         format: encoder_mod.Format,
         io: std.Io,
         nats_host: []const u8,
-        nats_user: ?[]const u8,
-        nats_pass: ?[]const u8,
+        nats_port: u16,
+        nats_seed: ?[]const u8,
     ) void {
         const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
 
@@ -311,7 +313,7 @@ pub const SnapshotListener = struct {
 
             // Create Core NATS connection
             var core = nats.Core{};
-            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .user = nats_user, .pass = nats_pass };
+            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .port = nats_port, .nkey_seed = nats_seed };
             core.CONNECT(allocator, connect_opts, io) catch |err| {
                 log.err("📋 Schema listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
@@ -587,8 +589,8 @@ pub const SnapshotListener = struct {
         chunk_size: usize,
         io: std.Io,
         nats_host: []const u8,
-        nats_user: ?[]const u8,
-        nats_pass: ?[]const u8,
+        nats_port: u16,
+        nats_seed: ?[]const u8,
     ) void {
         const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
 
@@ -598,7 +600,7 @@ pub const SnapshotListener = struct {
 
             // Create Core NATS connection
             var core = nats.Core{};
-            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .user = nats_user, .pass = nats_pass };
+            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .port = nats_port, .nkey_seed = nats_seed };
             core.CONNECT(allocator, connect_opts, io) catch |err| {
                 log.err("📸 Snapshot listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
@@ -677,8 +679,8 @@ pub const SnapshotListener = struct {
                         should_stop,
                         io,
                         nats_host,
-                        nats_user,
-                        nats_pass,
+                        nats_port,
+                        nats_seed,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         // TODO: Implement publishSnapshotErrorZig if needed for error reporting
@@ -708,8 +710,8 @@ pub const SnapshotListener = struct {
         should_stop: *std.atomic.Value(bool),
         io: std.Io,
         nats_host: []const u8,
-        nats_user: ?[]const u8,
-        nats_pass: ?[]const u8,
+        nats_port: u16,
+        nats_seed: ?[]const u8,
     ) !void {
         log.info("📸 Generating snapshot for '{s}' (id={s}, chunk_size={d})", .{
             table_name,
@@ -718,7 +720,7 @@ pub const SnapshotListener = struct {
         });
 
         // Create JetStream connection for publishing snapshot data
-        const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .user = nats_user, .pass = nats_pass };
+        const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .port = nats_port, .nkey_seed = nats_seed };
         var js = nats.JS.CONNECT(allocator, connect_opts, io) catch |err| {
             log.err("📸 Failed to connect to JetStream: {}", .{err});
             return error.JetStreamConnectionFailed;

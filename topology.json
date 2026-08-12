@@ -1,0 +1,17 @@
+{
+  "streams": {
+    "cdc": "CDC",
+    "init": "INIT",
+    "schema": "SCHEMA"
+  },
+  "subjects": {
+    "cdc_prefix": "cdc",
+    "init_prefix": "init",
+    "schema_prefix": "schema",
+    "snapshot_request": "snapshot.request.>"
+  },
+  "kv": {
+    "schemas": "schemas",
+    "snapshots": "snapshots"
+  }
+}

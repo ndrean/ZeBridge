@@ -58,6 +58,30 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Parse topology.json and generate build options
+    const topology_file = @embedFile("topology.json");
+    var parsed_topology = std.json.parseFromSliceLeaky(std.json.Value, b.allocator, topology_file, .{}) catch |err| {
+        std.debug.panic("Failed to parse topology.json: {any}\n", .{err});
+    };
+    const topology_opts = b.addOptions();
+    
+    const streams = parsed_topology.object.get("streams").?.object;
+    topology_opts.addOption([]const u8, "stream_cdc", streams.get("cdc").?.string);
+    topology_opts.addOption([]const u8, "stream_init", streams.get("init").?.string);
+    topology_opts.addOption([]const u8, "stream_schema", streams.get("schema").?.string);
+    
+    const subjects = parsed_topology.object.get("subjects").?.object;
+    topology_opts.addOption([]const u8, "subject_cdc_prefix", subjects.get("cdc_prefix").?.string);
+    topology_opts.addOption([]const u8, "subject_init_prefix", subjects.get("init_prefix").?.string);
+    topology_opts.addOption([]const u8, "subject_schema_prefix", subjects.get("schema_prefix").?.string);
+    topology_opts.addOption([]const u8, "snapshot_request", subjects.get("snapshot_request").?.string);
+    
+    const kv = parsed_topology.object.get("kv").?.object;
+    topology_opts.addOption([]const u8, "kv_schemas", kv.get("schemas").?.string);
+    topology_opts.addOption([]const u8, "kv_snapshots", kv.get("snapshots").?.string);
+
+    const topology_mod = topology_opts.createModule();
+
     // Vendored g41797/mailbox (no external deps)
     const mailbox_mod = b.addModule("mailbox", .{
         .root_source_file = b.path("src/mailbox_vendor/mailbox.zig"),
@@ -82,6 +106,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("msgpack", msgpack.module("msgpack"));
     mod.addImport("nats", nats_mod);
     mod.addImport("c", c_mod);
+    mod.addImport("topology", topology_mod);
 
     const exe = b.addExecutable(.{
         .name = "bridge",
@@ -96,6 +121,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
                 .{ .name = "nats", .module = nats_mod },
                 .{ .name = "c", .module = c_mod },
+                .{ .name = "topology", .module = topology_mod },
             },
         }),
     });

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const encoder = @import("encoder.zig");
+const topology = @import("topology");
 
 /// PostgreSQL connection and replication configuration
 pub const Postgres = struct {
@@ -44,26 +45,26 @@ pub const Nats = struct {
     pub const status_update_byte_threshold: u64 = 1024 * 1024; // 1MB
 
     /// JetStream stream names
-    pub const stream_cdc = "CDC";
-    pub const stream_schema = "SCHEMA";
-    pub const stream_init = "INIT";
+    pub const stream_cdc = topology.stream_cdc;
+    pub const stream_schema = topology.stream_schema;
+    pub const stream_init = topology.stream_init;
 
     /// Default streams to verify on startup
     pub const default_streams = &[_][]const u8{ stream_cdc, stream_init };
 
     /// Subject prefixes
-    pub const subject_cdc_prefix = "cdc";
-    pub const subject_schema_prefix = "schema";
-    pub const subject_init_prefix = "init";
+    pub const subject_cdc_prefix = topology.subject_cdc_prefix;
+    pub const subject_schema_prefix = topology.subject_schema_prefix;
+    pub const subject_init_prefix = topology.subject_init_prefix;
 
     /// CDC subject patterns: "cdc.<table>.<operation>"
-    pub const cdc_subject_pattern = "cdc.{s}.{s}";
+    pub const cdc_subject_pattern = subject_cdc_prefix ++ ".{s}.{s}";
 
     /// CDC wildcard subject for subscribing to all CDC events
-    pub const cdc_subject_wildcard = "cdc.>";
+    pub const cdc_subject_wildcard = subject_cdc_prefix ++ ".>";
 
     /// Schema KV bucket name
-    pub const schema_kv_bucket = "schemas";
+    pub const schema_kv_bucket = topology.kv_schemas;
 
     pub const publisher_max_wait = 10_000; // 10 seconds
 
@@ -144,25 +145,25 @@ pub const Snapshot = struct {
     pub const poll_interval_ms = 100;
 
     /// NATS subject prefix for snapshot requests: "snapshot.request.<table>"
-    pub const request_subject_prefix = "snapshot.request.";
+    pub const request_subject_prefix = topology.snapshot_request ++ ".";
 
     /// NATS subject wildcard for subscribing to all snapshot requests
-    pub const request_subject_wildcard = "snapshot.request.>";
+    pub const request_subject_wildcard = topology.snapshot_request ++ ".>";
 
     /// NATS subject pattern for data chunks: "init.snap.<table>.<snapshot_id>.<chunk>"
-    pub const data_subject_pattern = "init.snap.{s}.{s}.{d}";
+    pub const data_subject_pattern = topology.subject_init_prefix ++ ".snap.{s}.{s}.{d}";
 
     /// NATS subject pattern for snapshot start notification: "init.snap.start.<table>"
-    pub const start_subject_pattern = "init.snap.start.{s}";
+    pub const start_subject_pattern = topology.subject_init_prefix ++ ".snap.start.{s}";
 
     /// NATS subject pattern for snapshot errors: "init.snap.error.<table>"
-    pub const error_subject_pattern = "init.snap.error.{s}";
+    pub const error_subject_pattern = topology.subject_init_prefix ++ ".snap.error.{s}";
 
     /// NATS subject pattern for metadata: "init.snap.meta.<table>"
-    pub const meta_subject_pattern = "init.snap.meta.{s}";
+    pub const meta_subject_pattern = topology.subject_init_prefix ++ ".snap.meta.{s}";
 
     /// NATS KV bucket name for schemas
-    pub const kv_bucket_schemas = "schemas";
+    pub const kv_bucket_schemas = topology.kv_schemas;
 
     /// Message ID pattern for data chunks: "snap-<table>-<snapshot_id>-<chunk>"
     pub const data_msg_id_pattern = "snap-{s}-{s}-{d}";
@@ -293,16 +294,16 @@ pub const RuntimeConfig = struct {
     /// Use `disable` when Postgres and the bridge share a host, `verify-full` when the
     /// connection crosses one. `require` encrypts but does not authenticate the server.
     pg_sslmode: []const u8,
+    db_url: ?[]const u8, // Optional unified connection URI
 
     // PostgreSQL replication
     slot_name: []const u8,
     publication_name: []const u8,
 
     // NATS
-    nats_url: []const u8,
+    nats_url: ?[]const u8, // Optional unified NATS URI
     nats_host: []const u8,
-    nats_user: ?[]const u8,
-    nats_pass: ?[]const u8,
+    nats_seed: ?[]const u8, // Optional NKey Seed
 
     // Batch settings
     batch_max_events: usize,
@@ -330,12 +331,12 @@ pub const RuntimeConfig = struct {
             .pg_password = "postgres",
             .pg_database = "postgres",
             .pg_sslmode = "disable",
+            .db_url = null,
             .slot_name = Postgres.default_slot_name,
             .publication_name = Postgres.default_publication_name,
-            .nats_url = Nats.default_url,
+            .nats_url = null,
             .nats_host = "127.0.0.1",
-            .nats_user = null,
-            .nats_pass = null,
+            .nats_seed = null,
             .batch_max_events = Batch.max_events,
             .batch_max_wait_ms = Batch.max_age_ms,
             .batch_max_payload_bytes = Batch.max_payload_bytes,

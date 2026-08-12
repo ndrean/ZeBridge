@@ -96,31 +96,25 @@ fn initReplication(
 fn initNatsPublisher(
     allocator: std.mem.Allocator,
     metrics: *metrics_mod.Metrics,
-    init: *const std.process.Init,
+    runtime_config: *const Config.RuntimeConfig,
     io: std.Io,
 ) !nats_publisher.Publisher {
-    const nats_host = init.minimal.environ.getPosix("NATS_HOST") orelse blk: {
-        log.info("NATS_HOST not set, using default 127.0.0.1", .{});
-        break :blk "127.0.0.1";
-    };
-    const nats_user = init.minimal.environ.getPosix("NATS_BRIDGE_USER");
-    const nats_password = init.minimal.environ.getPosix("NATS_BRIDGE_PASSWORD");
-
-    const url = if (nats_user != null and nats_password != null) blk: {
-        log.info("NATS authentication enabled for user: {s}", .{nats_user.?});
-        break :blk try std.fmt.allocPrint(allocator, "nats://{s}:{s}@{s}:4222", .{ nats_user.?, nats_password.?, nats_host });
+    // Use NATS_URL directly if provided, otherwise fallback to dissection
+    const nats_url_ptr = if (runtime_config.nats_url) |url| blk: {
+        break :blk try std.fmt.allocPrint(allocator, "{s}", .{url});
     } else blk: {
-        log.info("NATS authentication disabled (no credentials)", .{});
+        const nats_host = runtime_config.nats_host;
         break :blk try std.fmt.allocPrint(allocator, "nats://{s}:4222", .{nats_host});
     };
-    defer allocator.free(url);
+    defer allocator.free(nats_url_ptr);
 
     log.debug("Connecting to NATS JetStream...", .{});
     var publisher = try nats_publisher.Publisher.init(
         allocator,
-        .{ .url = url },
+        .{ .url = nats_url_ptr, .nkey_seed = runtime_config.nats_seed },
         io,
     );
+    publisher.metrics = metrics;
     errdefer publisher.deinit();
 
     publisher.metrics = metrics;
@@ -305,7 +299,7 @@ pub fn main(init: std.process.Init) !void {
     defer wal_mon.deinit();
 
     // === Connect to NATS JetStream
-    var publisher = try initNatsPublisher(allocator, &metrics, &init, io);
+    var publisher = try initNatsPublisher(allocator, &metrics, &runtime_config, io);
     defer publisher.deinit();
 
     // Make publisher available to HTTP server for stream management
@@ -330,6 +324,8 @@ pub fn main(init: std.process.Init) !void {
         parsed_args.encoding_format,
         &runtime_config,
         io,
+        publisher.nats_host,
+        publisher.nats_port,
     );
     try snap_listener.start();
     defer snap_listener.join();
