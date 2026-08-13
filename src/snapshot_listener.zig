@@ -32,8 +32,8 @@ fn publishWithRetry(
     should_stop: *std.atomic.Value(bool),
 ) !void {
     var retry_count: u32 = 0;
-    const max_retries = 5;
-    var backoff_ms: u64 = 100; // Start with 100ms
+    const max_retries = config.Retry.publish_max_retries;
+    var backoff_ms: u64 = config.Retry.publish_backoff_ms;
 
     while (!should_stop.load(.acquire)) {
         const result = js.PUBLISH(subject, headers, payload);
@@ -60,7 +60,7 @@ fn publishWithRetry(
             log.warn("⏳ Retrying in {d}ms...", .{backoff_ms});
 
             // Sleep in small increments to allow faster shutdown response
-            const sleep_increment_ms = 50; // Check every 50ms
+            const sleep_increment_ms = config.Retry.shutdown_poll_ms;
             var elapsed_ms: u64 = 0;
             while (elapsed_ms < backoff_ms) {
                 if (should_stop.load(.acquire)) {
@@ -72,7 +72,7 @@ fn publishWithRetry(
             }
 
             // Double the wait for next time, capped at 5 seconds
-            backoff_ms = @min(backoff_ms * 2, 5000);
+            backoff_ms = @min(backoff_ms * 2, config.Retry.publish_max_backoff_ms);
             retry_count += 1;
         }
     }
@@ -305,7 +305,7 @@ pub const SnapshotListener = struct {
         nats_port: u16,
         nats_seed: ?[]const u8,
     ) void {
-        const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
+        const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
@@ -592,7 +592,7 @@ pub const SnapshotListener = struct {
         nats_port: u16,
         nats_seed: ?[]const u8,
     ) void {
-        const reconnect_delay_ms = 2000; // 2 seconds between reconnect attempts
+        const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {

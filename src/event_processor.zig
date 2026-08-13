@@ -14,6 +14,7 @@ const utils = @import("utils.zig");
 const Config = @import("config.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
+const schema_mapper = @import("schema_mapper.zig");
 
 fn nanoNow() u64 {
     var ts: std.c.timespec = undefined;
@@ -23,6 +24,28 @@ fn nanoNow() u64 {
 }
 
 pub const log = std.log.scoped(.event_processor);
+
+/// Tables whose schema is infrastructure, not client data.
+///
+/// Mirrors zebridge_is_internal_table() in init.sql.template. The DDL triggers already
+/// skip these, but the boot pass iterates the publication's table list — which contains
+/// zebridge_ddl_events, since its INSERTs are how schema events travel. Without this the
+/// two paths disagree and clients build a local replica of our own bookkeeping.
+fn isInternalTable(name: []const u8) bool {
+    return std.mem.eql(u8, name, "zebridge_ddl_events") or
+        std.mem.eql(u8, name, "schema_migrations");
+}
+
+/// Parse a PostgreSQL LSN in its text form ("1A/2B3C4D5E") into a u64, matching the
+/// integer LSN the WAL path reports. Returns 0 when unparseable — 0 reads as "valid
+/// from the beginning of the stream", which is the permissive choice: a client will
+/// apply CDC rather than stall waiting for a schema it will never get.
+fn parsePgLsnText(text: []const u8) u64 {
+    const slash = std.mem.indexOfScalar(u8, text, '/') orelse return 0;
+    const hi = std.fmt.parseInt(u64, text[0..slash], 16) catch return 0;
+    const lo = std.fmt.parseInt(u64, text[slash + 1 ..], 16) catch return 0;
+    return (hi << 32) | lo;
+}
 
 /// Format a DecodedValue for human-readable logging
 /// Returns a string representation allocated in the provided arena
@@ -268,7 +291,7 @@ pub const EventProcessor = struct {
 
         if (is_transition and transition_column_name != null) {
             if (id_str) |id| {
-                log.info("{s} {s}.{s} id={s} [{s}: {s} → {s}] → {s}", .{
+                log.debug("{s} {s}.{s} id={s} [{s}: {s} → {s}] → {s}", .{
                     operation,
                     rel.namespace,
                     rel.name,
@@ -279,7 +302,7 @@ pub const EventProcessor = struct {
                     subject,
                 });
             } else {
-                log.info("{s} {s}.{s} [{s}: {s} → {s}] → {s}", .{
+                log.debug("{s} {s}.{s} [{s}: {s} → {s}] → {s}", .{
                     operation,
                     rel.namespace,
                     rel.name,
@@ -291,9 +314,9 @@ pub const EventProcessor = struct {
             }
         } else {
             if (id_str) |id| {
-                log.info("{s} {s}.{s} id={s} → {s} [slot={d}]", .{ operation, rel.namespace, rel.name, id, subject, slot_idx });
+                log.debug("{s} {s}.{s} id={s} → {s} [slot={d}]", .{ operation, rel.namespace, rel.name, id, subject, slot_idx });
             } else {
-                log.info("{s} {s}.{s} → {s} [slot={d}]", .{ operation, rel.namespace, rel.name, subject, slot_idx });
+                log.debug("{s} {s}.{s} → {s} [slot={d}]", .{ operation, rel.namespace, rel.name, subject, slot_idx });
             }
         }
 
@@ -304,7 +327,7 @@ pub const EventProcessor = struct {
     /// background publisher. Call this only after the matching .commit is confirmed.
     pub fn releaseSlotToQueue(self: *EventProcessor, slot_idx: u32) !void {
         var retry_count: usize = 0;
-        const max_retries_before_fatal_check = 1000;
+        const max_retries_before_fatal_check = Config.Retry.spins_before_fatal_check;
         const timer_start: u64 = nanoNow();
         const watchdog_timeout_ns = std.time.ns_per_s * 30;
 
@@ -371,7 +394,7 @@ pub const EventProcessor = struct {
         // Get a free slot from the ring buffer with backpressure retry + watchdog
         // Exit if flush thread has fatal error (NATS dead) to prevent infinite spinning
         var retry_count: usize = 0;
-        const max_retries_before_fatal_check = 1000; // Check fatal error every 1000 retries
+        const max_retries_before_fatal_check = Config.Retry.spins_before_fatal_check;
         const timer_start: u64 = nanoNow();
         const watchdog_timeout_ns = std.time.ns_per_s * 30; // 30 second hard timeout
 
@@ -457,28 +480,6 @@ pub const EventProcessor = struct {
         return @intCast(slot_idx);
     }
 
-    /// Translates a PostgreSQL type to SQLite type for the schema cache
-    fn pgToSqliteType(pg_type: []const u8) []const u8 {
-        if (std.mem.startsWith(u8, pg_type, "int") or
-            std.mem.startsWith(u8, pg_type, "bigint") or
-            std.mem.startsWith(u8, pg_type, "smallint") or
-            std.mem.startsWith(u8, pg_type, "serial") or
-            std.mem.startsWith(u8, pg_type, "bigserial") or
-            std.mem.eql(u8, pg_type, "boolean"))
-        {
-            return "INTEGER";
-        } else if (std.mem.startsWith(u8, pg_type, "real") or
-            std.mem.startsWith(u8, pg_type, "double precision") or
-            std.mem.startsWith(u8, pg_type, "numeric") or
-            std.mem.startsWith(u8, pg_type, "decimal"))
-        {
-            return "REAL";
-        } else {
-            // text, varchar, char, uuid, json, timestamp, date, etc. default to TEXT
-            return "TEXT";
-        }
-    }
-
     /// Process a DDL event, query PostgreSQL for the new schema, perform SQLite transformation,
     /// and pack it into the ring buffer directly to the KV schemas subject.
     pub fn packDdlToSlot(
@@ -490,123 +491,151 @@ pub const EventProcessor = struct {
     ) !?u32 {
         // Decode zebridge_ddl_events tuple
         const decoded = try pgoutput.decodeTuple(arena, tuple_data, rel.columns);
-        
+
         var target_table: ?[]const u8 = null;
+        var command_tag: ?[]const u8 = null;
+        var schema_def: ?[]const u8 = null;
         for (decoded.items) |col| {
             if (std.mem.eql(u8, col.name, "table_name")) {
-                if (col.value == .text) {
-                    target_table = col.value.text;
-                }
-                break;
+                if (col.value == .text) target_table = col.value.text;
+            } else if (std.mem.eql(u8, col.name, "command_tag")) {
+                if (col.value == .text) command_tag = col.value.text;
+            } else if (std.mem.eql(u8, col.name, "schema_def")) {
+                // JSONB decodes to .jsonb; tolerate .text in case the column type
+                // is ever changed to json/text.
+                schema_def = switch (col.value) {
+                    .jsonb => |j| j,
+                    .text => |t| t,
+                    else => null,
+                };
             }
         }
-        
+
         if (target_table == null) return null;
-        
+
         // Trim optional quotes or public schema prefix
         var clean_table = target_table.?;
         if (std.mem.startsWith(u8, clean_table, "public.")) {
             clean_table = clean_table[7..];
         }
 
-        log.info("🔍 Processing DDL event for table '{s}'", .{clean_table});
+        log.info("🔍 Processing DDL event for table '{s}' ({s})", .{
+            clean_table,
+            command_tag orelse "UNKNOWN",
+        });
 
-        // Query Postgres for schema - must use a non-replication connection!
-        var standard_pg_config = self.pg_config.*;
-        standard_pg_config.replication = false;
-        
-        const conn = pg_conn.connect(arena, standard_pg_config) catch |err| {
-            log.err("Failed to connect to Postgres for DDL fetch: {}", .{err});
-            return error.PgConnectionFailed;
-        };
-        defer c.PQfinish(conn);
+        // DROP TABLE carries no schema — the object is gone. Publish a tombstone
+        // rather than deleting the KV key: a client that reconnects after the drop
+        // must still learn the table went away so it can drop its local replica.
+        // A vanished key is indistinguishable from "never seen".
+        if (command_tag) |tag| {
+            if (std.mem.eql(u8, tag, "DROP TABLE")) {
+                const tombstone = try std.fmt.allocPrint(
+                    arena,
+                    "{{\"table\":\"{s}\",\"dropped\":true,\"lsn\":{d}}}",
+                    .{ clean_table, wal_end },
+                );
+                const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
+                const msg_id = try std.fmt.allocPrint(arena, "schema-drop-{s}-{d}", .{ clean_table, wal_end });
 
-        const query = try utils.allocPrintZ(
-            arena,
-            \\SELECT
-            \\    c.column_name,
-            \\    c.data_type
-            \\FROM information_schema.tables t
-            \\JOIN information_schema.columns c
-            \\    ON t.table_schema = c.table_schema
-            \\    AND t.table_name = c.table_name
-            \\WHERE t.table_schema = 'public'
-            \\    AND t.table_type = 'BASE TABLE'
-            \\    AND t.table_name = '{s}'
-            \\ORDER BY c.ordinal_position;
-        ,
-            .{clean_table},
-        );
+                var drop_cols: std.ArrayList(pgoutput.Column) = .empty;
+                try drop_cols.append(arena, .{ .name = "schema", .value = .{ .text = tombstone } });
 
-        const result = c.PQexec(conn, query.ptr);
-        defer c.PQclear(result);
-
-        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
-            return error.QueryFailed;
+                const slot_idx = try self.acquireAndFillSlot(
+                    kv_subject,
+                    clean_table,
+                    "SCHEMA",
+                    msg_id,
+                    rel.relation_id,
+                    drop_cols,
+                    wal_end,
+                );
+                log.info("🗑️  DROP TABLE tombstone published for '{s}'", .{clean_table});
+                return slot_idx;
+            }
         }
 
-        const num_rows: usize = @intCast(c.PQntuples(result));
-        if (num_rows == 0) {
-            log.warn("⚠️ No schema found for table {s}. Skipping DDL publish. (Hint: check SELECT privileges for the bridge user)", .{clean_table});
+        // The schema travels in the WAL row itself, captured by the event trigger
+        // inside the DDL transaction. Deliberately NOT re-queried here: querying at
+        // processing time reads the catalog as of "now", not as of this LSN, which
+        // mis-orders bursts of DDL and reports today's schema when replaying old WAL
+        // after a restart.
+        const raw = schema_def orelse {
+            log.warn("⚠️ DDL event for '{s}' has no schema_def — is the event trigger current? Skipping.", .{clean_table});
+            return null;
+        };
+
+        const parsed = std.json.parseFromSlice(std.json.Value, arena, raw, .{}) catch |err| {
+            log.err("Failed to parse schema_def for '{s}': {}", .{ clean_table, err });
+            return null;
+        };
+        defer parsed.deinit();
+
+        if (parsed.value != .object) {
+            log.warn("⚠️ schema_def for '{s}' is not an object — skipping", .{clean_table});
             return null;
         }
 
-        // Build the `{ pg: [...], sqlite: [...] }` JSON payload
-        var json_str: std.ArrayList(u8) = .empty;
-        
-        try json_str.appendSlice(arena, "{\"pg\":{\"columns\":[");
-
-        var r: i32 = 0;
-        while (r < num_rows) : (r += 1) {
-            if (r > 0) try json_str.appendSlice(arena, ",");
-            const col_name_c = c.PQgetvalue(result, r, 0);
-            const data_type_c = c.PQgetvalue(result, r, 1);
-            
-            const col_name = std.mem.span(col_name_c);
-            const data_type = std.mem.span(data_type_c);
-            
-            const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, data_type});
-            try json_str.appendSlice(arena, col_json);
+        const cols_val = parsed.value.object.get("columns") orelse {
+            log.warn("⚠️ schema_def for '{s}' has no columns — skipping", .{clean_table});
+            return null;
+        };
+        if (cols_val != .array or cols_val.array.items.len == 0) {
+            log.warn("⚠️ schema_def for '{s}' has an empty column list — skipping", .{clean_table});
+            return null;
         }
-        
+        const columns = cols_val.array.items;
+
+        // Re-emit as `{ pg: {...}, sqlite: {...}, pk }`. The Postgres shape is copied
+        // through as captured; the SQLite dialect is derived here so the mapping stays
+        // in one testable place (schema_mapper.zig) rather than in plpgsql.
+        var json_str: std.ArrayList(u8) = .empty;
+
+        try json_str.appendSlice(arena, "{\"pg\":{\"columns\":[");
+        for (columns, 0..) |col_val, i| {
+            const name = if (col_val == .object) col_val.object.get("name") else null;
+            const ty = if (col_val == .object) col_val.object.get("type") else null;
+            if (name == null or ty == null or name.? != .string or ty.? != .string) continue;
+
+            if (i > 0) try json_str.appendSlice(arena, ",");
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                arena,
+                "{{\"name\":\"{s}\",\"type\":\"{s}\"}}",
+                .{ name.?.string, ty.?.string },
+            ));
+        }
+
         try json_str.appendSlice(arena, "]},\"sqlite\":{\"columns\":[");
-        
-        r = 0;
-        while (r < num_rows) : (r += 1) {
-            if (r > 0) try json_str.appendSlice(arena, ",");
-            const col_name_c = c.PQgetvalue(result, r, 0);
-            const data_type_c = c.PQgetvalue(result, r, 1);
-            
-            const col_name = std.mem.span(col_name_c);
-            const data_type = std.mem.span(data_type_c);
-            
-            const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, pgToSqliteType(data_type)});
-            try json_str.appendSlice(arena, col_json);
+        for (columns, 0..) |col_val, i| {
+            const name = if (col_val == .object) col_val.object.get("name") else null;
+            const ty = if (col_val == .object) col_val.object.get("type") else null;
+            if (name == null or ty == null or name.? != .string or ty.? != .string) continue;
+
+            if (i > 0) try json_str.appendSlice(arena, ",");
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                arena,
+                "{{\"name\":\"{s}\",\"type\":\"{s}\"}}",
+                .{ name.?.string, schema_mapper.pgToSqliteType(ty.?.string) },
+            ));
         }
         try json_str.appendSlice(arena, "] ");
 
-        // Query the primary key
-        const pk_query = try utils.allocPrintZ(
-            arena,
-            \\SELECT a.attname
-            \\FROM pg_index i
-            \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-            \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
-            \\  AND i.indisprimary
-            \\  AND array_length(i.indkey, 1) = 1;
-        ,
-            .{ "public", clean_table },
-        );
-        const pk_result = c.PQexec(conn, pk_query.ptr);
-        defer c.PQclear(pk_result);
-
-        if (c.PQresultStatus(pk_result) == c.PGRES_TUPLES_OK and c.PQntuples(pk_result) > 0) {
-            const pk_name = std.mem.span(c.PQgetvalue(pk_result, 0, 0));
-            const pk_json = try std.fmt.allocPrint(arena, ",\"pk\":\"{s}\"", .{pk_name});
-            try json_str.appendSlice(arena, pk_json);
+        if (parsed.value.object.get("pk")) |pk_val| {
+            if (pk_val == .string) {
+                try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                    arena,
+                    ",\"pk\":\"{s}\"",
+                    .{pk_val.string},
+                ));
+            }
         }
 
-        try json_str.appendSlice(arena, "}}");
+        // Close the sqlite object, then attach the LSN at the root. Clients need the
+        // ordering key: KV and CDC are independent subscriptions, so without it a
+        // consumer cannot tell whether a CDC event precedes or follows this schema
+        // and the bridge's ordering guarantee stops at the wire.
+        try json_str.appendSlice(arena, "}");
+        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{wal_end}));
 
         // Create subject: $KV.schemas.{table}
         const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
@@ -652,11 +681,30 @@ pub const EventProcessor = struct {
             return error.PgConnectionFailed;
         };
         defer c.PQfinish(conn);
-        
+
+        // One WAL position for the whole boot pass, read before any schema is sent.
+        // Taking it once (rather than per table) keeps every boot schema on a single
+        // consistent watermark, and taking it *before* publishing means the stamp can
+        // only be older than reality — never claim to describe WAL we have not seen.
+        const boot_lsn = blk: {
+            const lsn_res = c.PQexec(conn, "SELECT pg_current_wal_lsn()::text");
+            defer c.PQclear(lsn_res);
+            if (c.PQresultStatus(lsn_res) != c.PGRES_TUPLES_OK or c.PQntuples(lsn_res) == 0) {
+                log.warn("Could not read current WAL LSN for boot schemas; stamping 0", .{});
+                break :blk 0;
+            }
+            break :blk parsePgLsnText(std.mem.span(c.PQgetvalue(lsn_res, 0, 0)));
+        };
+
         for (monitored_tables) |target_table| {
             var clean_table = target_table;
             if (std.mem.startsWith(u8, clean_table, "public.")) {
                 clean_table = clean_table[7..];
+            }
+
+            if (isInternalTable(clean_table)) {
+                log.debug("Skipping boot schema for internal table '{s}'", .{clean_table});
+                continue;
             }
             
             const query = try utils.allocPrintZ(
@@ -706,7 +754,7 @@ pub const EventProcessor = struct {
                 const col_name = std.mem.span(c.PQgetvalue(result, r, 0));
                 const data_type = std.mem.span(c.PQgetvalue(result, r, 1));
                 
-                const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, pgToSqliteType(data_type)});
+                const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, schema_mapper.pgToSqliteType(data_type)});
                 try json_str.appendSlice(arena, col_json);
             }
             try json_str.appendSlice(arena, "] ");
@@ -730,8 +778,13 @@ pub const EventProcessor = struct {
                 const pk_json = try std.fmt.allocPrint(arena, ",\"pk\":\"{s}\"", .{pk_name});
                 try json_str.appendSlice(arena, pk_json);
             }
-            try json_str.appendSlice(arena, "}}");
-            
+            // Boot schemas describe tables that emitted no DDL event, so there is no
+            // wal_end to inherit. Stamp the current WAL position: the schema is valid
+            // from here, which lets a client compare it against CDC lsns the same way
+            // it would a DDL-driven schema.
+            try json_str.appendSlice(arena, "}");
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{boot_lsn}));
+
             const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
             const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}", .{clean_table});
             

@@ -18,12 +18,7 @@ const Metrics = @import("metrics.zig").Metrics;
 
 pub const log = std.log.scoped(.batch_publisher);
 
-/// Monotonic millisecond timestamp (replacement for removed getMilliTimestamp())
-fn getMilliTimestamp() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-}
+
 
 /// Initialize memory slab for event ring buffer with optional memory locking
 /// Returns a contiguous block of memory sized for `slot_count` events of `slot_size` bytes each
@@ -146,6 +141,11 @@ pub const BatchConfig = struct {
     max_wait_ms: i64 = Config.Batch.max_age_ms,
     /// Maximum payload size in bytes
     max_payload_bytes: usize = 128 * 1024, // 128KB
+    /// Publish retry budget. Exhausting it is fatal — the bridge stops rather than
+    /// ACK an LSN whose data never reached NATS.
+    max_retries: u32 = Config.Retry.publish_max_retries,
+    backoff_ms: u64 = Config.Retry.publish_backoff_ms,
+    max_backoff_ms: u64 = Config.Retry.publish_max_backoff_ms,
 };
 
 /// Maximum packed buffer size for column data (1MB = 2^20)
@@ -399,6 +399,7 @@ pub const BatchPublisher = struct {
     last_confirmed_lsn: std.atomic.Value(u64), // Last LSN confirmed by NATS
     fatal_error: std.atomic.Value(bool), // Set when NATS reconnection fails
     flush_complete: std.atomic.Value(bool), // Set when flush thread finishes final flush
+    force_flush: std.atomic.Value(bool), // Set by WAL thread on COMMIT
 
     // Flush thread
     flush_thread: ?std.Thread,
@@ -518,6 +519,7 @@ pub const BatchPublisher = struct {
             .flush_complete = std.atomic.Value(bool).init(false),
             .flush_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
+            .force_flush = std.atomic.Value(bool).init(false),
         };
 
         return self;
@@ -599,6 +601,11 @@ pub const BatchPublisher = struct {
         return self.pending_events.isEmpty();
     }
 
+    /// Trigger an immediate flush of the current batch
+    pub fn forceFlush(self: *BatchPublisher) void {
+        self.force_flush.store(true, .seq_cst);
+    }
+
     /// Check if a fatal error occurred (e.g., NATS reconnection timeout)
     pub fn hasFatalError(self: *BatchPublisher) bool {
         return self.fatal_error.load(.seq_cst);
@@ -619,7 +626,7 @@ pub const BatchPublisher = struct {
         log.info("ℹ️ Lock-free flush thread started", .{});
 
         var batches_processed: usize = 0;
-        var last_flush_time = getMilliTimestamp();
+        var last_flush_time = utils.getMilliTimestamp();
 
         // Persistent batch that accumulates slot indices across iterations
         var batch: std.ArrayList(usize) = .empty;
@@ -656,18 +663,30 @@ pub const BatchPublisher = struct {
 
                 current_payload_size += event_size;
             }
-            const now = getMilliTimestamp();
+            const now = utils.getMilliTimestamp();
             const time_elapsed = now - last_flush_time;
+            const force = self.force_flush.swap(false, .seq_cst);
 
-            // Flush if we have events AND (batch is full OR payload too large OR timeout reached)
-            const should_flush = batch.items.len > 0 and
-                (batch.items.len >= self.config.max_events or
-                    current_payload_size >= self.config.max_payload_bytes or
-                    time_elapsed >= self.config.max_wait_ms);
+            // Flush if we have events AND (batch is full OR payload too large OR timeout reached OR forced)
+            const reason_max_events = batch.items.len >= self.config.max_events;
+            const reason_max_payload = current_payload_size >= self.config.max_payload_bytes;
+            const reason_timeout = time_elapsed >= self.config.max_wait_ms;
+
+            const should_flush = batch.items.len > 0 and (force or reason_max_events or reason_max_payload or reason_timeout);
 
             if (should_flush) {
                 batches_processed += 1;
-                log.info("Flush thread processing batch #{d} with {d} events", .{ batches_processed, batch.items.len });
+                if (batch.items.len < self.config.max_events) {
+                    log.debug("Flush triggered early! events={d}/{d}, payload={d}/{d}, time={d}/{d}ms. Reasons: forced={}, max_events={}, max_payload={}, timeout={}", .{
+                        batch.items.len, self.config.max_events,
+                        current_payload_size, self.config.max_payload_bytes,
+                        time_elapsed, self.config.max_wait_ms,
+                        force, reason_max_events, reason_max_payload, reason_timeout
+                    });
+                } else {
+                    log.debug("Flush thread processing batch #{d} with {d} events", .{ batches_processed, batch.items.len });
+                }
+
 
                 // Log the msg_ids of events being flushed
                 if (batch.items.len > 0) {
@@ -817,7 +836,63 @@ pub const BatchPublisher = struct {
         }
     }
 
+    /// Publish a run of CDC events, grouped by subject.
+    ///
+    /// A flush batch is drained from the ring buffer indiscriminately, so one run can
+    /// mix operations AND tables. This used to publish the whole run under the first
+    /// event's subject, which misrouted everything else in it: a DELETE batched behind
+    /// an INSERT landed on `cdc.<table>.insert.batch`, and a run spanning two tables
+    /// published one table's rows under the other's subject. Payloads still carried
+    /// the right per-event `subject`/`table`/`operation`, so nothing was lost — but
+    /// subject filtering, which is the documented consumer pattern, returned wrong
+    /// data and leaked rows across tables.
+    ///
+    /// Groups are emitted in first-appearance order, so a causal sequence on the same
+    /// row (INSERT then DELETE in one transaction) still reaches the stream in the
+    /// right order for a consumer reading `cdc.>`.
     fn publishCDCSubBatch(self: *BatchPublisher, indices: []usize) !void {
+        if (indices.len == 0) return;
+        if (indices.len == 1) return self.publishSubjectGroup(indices);
+
+        const flush_alloc = self.allocator;
+
+        // Subjects in first-appearance order; the map holds each subject's indices.
+        var order: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer order.deinit(flush_alloc);
+
+        var groups = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(flush_alloc);
+        defer {
+            var it = groups.valueIterator();
+            while (it.next()) |list| list.deinit(flush_alloc);
+            groups.deinit();
+        }
+
+        for (indices) |slot_idx| {
+            // Slices into the slot's inline subject_buf; slots are not reset until
+            // after publishing, so these stay valid for the life of this call.
+            const subject = self.events[slot_idx].getSubject();
+            const gop = try groups.getOrPut(subject);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+                try order.append(flush_alloc, subject);
+            }
+            try gop.value_ptr.append(flush_alloc, slot_idx);
+        }
+
+        // Homogeneous run: avoid the copy and publish it directly.
+        if (order.items.len == 1) return self.publishSubjectGroup(indices);
+
+        log.debug("📦 Flush run spans {d} subjects — publishing one message each", .{order.items.len});
+
+        for (order.items) |subject| {
+            const group = groups.get(subject).?;
+            try self.publishSubjectGroup(group.items);
+        }
+    }
+
+    /// Publish events that all share one subject. Callers must guarantee that;
+    /// publishCDCSubBatch is what establishes it.
+    fn publishSubjectGroup(self: *BatchPublisher, indices: []usize) !void {
         const flush_alloc = self.allocator;
         const event_count = indices.len;
 
@@ -877,7 +952,7 @@ pub const BatchPublisher = struct {
             var batch_array = try encoder.createArray(event_count);
             defer batch_array.free(flush_alloc);
 
-            const encode_start = getMilliTimestamp();
+            const encode_start = utils.getMilliTimestamp();
 
             for (indices, 0..) |slot_idx, i| {
                 const event = &self.events[slot_idx];
@@ -910,10 +985,10 @@ pub const BatchPublisher = struct {
             const encoded = try encoder.encode(batch_array);
             defer self.allocator.free(encoded);
 
-            const encode_elapsed = getMilliTimestamp() - encode_start;
+            const encode_elapsed = utils.getMilliTimestamp() - encode_start;
 
             // Publish the batch with a composite message ID
-            const publish_start = getMilliTimestamp();
+            const publish_start = utils.getMilliTimestamp();
             const first_event = &self.events[indices[0]];
             const last_event = &self.events[indices[event_count - 1]];
             const batch_msg_id = try std.fmt.allocPrint(
@@ -936,9 +1011,9 @@ pub const BatchPublisher = struct {
             try headers.append("Nats-Msg-Id", batch_msg_id);
 
             try self.publisher.publish(batch_subject, &headers, encoded);
-            const publish_elapsed = getMilliTimestamp() - publish_start;
+            const publish_elapsed = utils.getMilliTimestamp() - publish_start;
 
-            log.info("📤 Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
+            log.debug("📤 Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
                 event_count,
                 encoded.len,
                 batch_subject,
@@ -955,12 +1030,12 @@ pub const BatchPublisher = struct {
         if (batch.items.len == 0) return;
 
         var retry_count: u32 = 0;
-        const max_retries = 5;
-        var backoff_ms: u64 = 100; // Start with 100ms
+        const max_retries = self.config.max_retries;
+        var backoff_ms: u64 = self.config.backoff_ms;
 
-        const flush_start = getMilliTimestamp();
+        const flush_start = utils.getMilliTimestamp();
 
-        log.info("📦 Starting flush of {d} events", .{batch.items.len});
+        log.debug("📦 Starting flush of {d} events", .{batch.items.len});
 
         while (true) {
             // Attempt to encode and publish
@@ -972,7 +1047,7 @@ pub const BatchPublisher = struct {
                 batch.clearRetainingCapacity();
 
                 // Log flush timing if it took longer than expected
-                const flush_elapsed = getMilliTimestamp() - flush_start;
+                const flush_elapsed = utils.getMilliTimestamp() - flush_start;
                 if (flush_elapsed > 100) {
                     log.warn("⏱️  Slow flush: {d}ms for {d} events", .{
                         flush_elapsed,
@@ -1000,7 +1075,7 @@ pub const BatchPublisher = struct {
                 utils.sleep(backoff_ms * std.time.ns_per_ms);
 
                 // Double the wait for next time, capped at 5 seconds
-                backoff_ms = @min(backoff_ms * 2, 5000);
+                backoff_ms = @min(backoff_ms * 2, self.config.max_backoff_ms);
                 retry_count += 1;
             }
         }

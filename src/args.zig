@@ -20,13 +20,49 @@ const usage =
     \\  PG_HOST, PG_PORT, PG_DB          PostgreSQL connection
     \\  POSTGRES_BRIDGE_USER/_PASSWORD   PostgreSQL credentials
     \\  PG_SSLMODE                       libpq sslmode (default: disable)
-    \\  NATS_HOST                        NATS server host
-    \\  NATS_BRIDGE_USER/_PASSWORD       NATS credentials
+    \\  DATABASE_URL                     Unified PostgreSQL URI (overrides PG_* above)
+    \\  NATS_HOST, NATS_URL              NATS server host / unified URI
+    \\  NATS_NKEY_SEED                   NATS nkey seed
+    \\  BASE_BUF                         log2 of per-event data buffer (10-20)
+    \\  RING_BUFFER_COUNT                Ring buffer slots (1024-1048576)
+    \\  PUBLISH_MAX_RETRIES              Publish retries before fatal (default: 5)
+    \\  PUBLISH_BACKOFF_MS               First publish backoff (default: 100)
+    \\  PUBLISH_MAX_BACKOFF_MS           Publish backoff ceiling (default: 5000)
+    \\  TRANSITION_RULES                 e.g. users:status,kyc_level;orders:state
+    \\
+    \\Defaults for all of the above live in src/config.zig.
     \\
 ;
 
 /// Signals that `--help` was handled and the process should exit cleanly.
 pub const HelpRequested = error{HelpRequested};
+
+/// Read an unsigned integer from the environment, falling back to `default` when
+/// unset, unparseable, or outside [min, max]. Never fails: a bad tunable should
+/// warn and use the documented default, not stop the bridge from starting.
+fn envUint(
+    comptime T: type,
+    init: *const std.process.Init,
+    comptime name: []const u8,
+    default: T,
+    min: T,
+    max: T,
+) T {
+    const raw = init.minimal.environ.getPosix(name) orelse {
+        log.info(name ++ " not set, using default: {d}", .{default});
+        return default;
+    };
+    const parsed = std.fmt.parseInt(T, raw, 10) catch |err| {
+        log.warn("Invalid " ++ name ++ " value '{s}' ({any}), using default: {d}", .{ raw, err, default });
+        return default;
+    };
+    if (parsed < min or parsed > max) {
+        log.warn(name ++ "={d} out of range ({d}-{d}), using default: {d}", .{ parsed, min, max, default });
+        return default;
+    }
+    log.info(name ++ "={d}", .{parsed});
+    return parsed;
+}
 
 /// Command-line arguments structure
 pub const Args = struct {
@@ -186,6 +222,35 @@ pub const Args = struct {
         } else {
             log.info("RING_BUFFER_COUNT not set, using default: {d} events", .{runtime_config.batch_ring_buffer_size});
         }
+
+        // Publish retry budget. Defaults live in config.zig (Config.Retry); these
+        // env vars exist so the budget can be tuned per deployment without a rebuild.
+        // Exhausting the budget is fatal by design, so raising it trades faster
+        // failure detection for more tolerance of a flaky NATS link.
+        runtime_config.publish_max_retries = envUint(
+            u32,
+            init,
+            "PUBLISH_MAX_RETRIES",
+            runtime_config.publish_max_retries,
+            0,
+            100,
+        );
+        runtime_config.publish_backoff_ms = envUint(
+            u64,
+            init,
+            "PUBLISH_BACKOFF_MS",
+            runtime_config.publish_backoff_ms,
+            1,
+            60_000,
+        );
+        runtime_config.publish_max_backoff_ms = envUint(
+            u64,
+            init,
+            "PUBLISH_MAX_BACKOFF_MS",
+            runtime_config.publish_max_backoff_ms,
+            runtime_config.publish_backoff_ms,
+            300_000,
+        );
 
         // NATS connection — slices into environ block, no allocation needed
         runtime_config.nats_url = init.minimal.environ.getPosix("NATS_URL");

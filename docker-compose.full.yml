@@ -29,6 +29,16 @@ services:
       - "max_slot_wal_keep_size=10GB"
       - "-c"
       - "wal_sender_timeout=300s"
+      - "-c"
+      - "logical_decoding_work_mem=256MB"
+      - "-c"
+      - "wal_buffers=64MB"
+      - "-c"
+      - "commit_delay=1000"
+      - "-c"
+      - "commit_siblings=5"
+      # - "-c" 
+      # - "fsync=off" # <-- local testing+ speed
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 3s

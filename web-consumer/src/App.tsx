@@ -9,8 +9,29 @@ const NKEY_SEED = 'SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q';
 const { sql } = new SQLocal('zebridge.sqlite3');
 const sc = StringCodec();
 
+// Columns hidden from the *_view convenience views (still stored in the table).
+const EXCLUDE_FROM_VIEW = ['uid', 'inserted_at', 'updated_at', 'metadata'];
+
+type TableState = {
+  pk: string;
+  /** Column names the local table currently has. */
+  columns: string[];
+  /** WAL LSN this schema is valid from. Events at or below it predate the change. */
+  lsn: number;
+};
+
 // Non-reactive state for sync tracking
-const syncedTables = new Map<string, { pk: string }>();
+const syncedTables = new Map<string, TableState>();
+
+/**
+ * CDC events that arrived referencing columns the local schema does not have yet.
+ * The bridge publishes the schema before the dependent row, but KV and CDC are two
+ * independent subscriptions here, so the row can still win the race locally. Holding
+ * it until a newer schema lands is what turns the bridge's ordering guarantee into
+ * something this client actually honours.
+ */
+const pendingEvents: { table: string; ev: any }[] = [];
+
 let nc: NatsConnection | null = null;
 
 type LogEntry = {
@@ -24,6 +45,8 @@ type LogEntry = {
 export default function App() {
   const [status, setStatus] = createSignal<'connected' | 'disconnected' | 'connecting'>('disconnected');
   const [logs, setLogs] = createSignal<LogEntry[]>([]);
+  const [pendingCount, setPendingCount] = createSignal(0);
+  const [tableCount, setTableCount] = createSignal(0);
   let logIdCounter = 0;
 
   const appendLog = (topic: string, data: any, opType = '') => {
@@ -56,71 +79,207 @@ export default function App() {
       setStatus('connected');
       appendLog('SYS', 'Connected to NATS over WebSockets using NKEY!');
       subscribeStreams();
+      watchSchemas();
     } catch (err) {
       setStatus('disconnected');
       appendLog('SYS', `Connection failed: ${err}`);
     }
   };
 
+  // ---------------------------------------------------------------------------
+  // Schema handling
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Watch the schemas KV bucket for every table, not one table on a button press.
+   *
+   * The bridge pushes a schema whenever DDL runs, so migrations should be driven by
+   * that push. watch() also replays current values on start, which doubles as the
+   * initial bootstrap — one code path for "catch up" and "keep up".
+   */
+  const watchSchemas = async () => {
+    if (!nc) return;
+    try {
+      const js = nc.jetstream();
+      const kv = await js.views.kv(topology.kv.schemas);
+      const watcher = await kv.watch();
+      appendLog('SCHEMA', `Watching KV bucket "${topology.kv.schemas}" for all tables...`, 'WATCH');
+
+      (async () => {
+        for await (const entry of watcher) {
+          // A deleted/purged key means the table is gone upstream.
+          if (entry.operation === 'DEL' || entry.operation === 'PURGE') {
+            await dropLocalTable(entry.key, 'KV key removed');
+            continue;
+          }
+
+          let val: any;
+          try { val = decode(entry.value); } catch { val = JSON.parse(sc.decode(entry.value)); }
+          if (val?.schema && typeof val.schema === 'string') val = JSON.parse(val.schema);
+
+          // Tombstone: the bridge publishes {"dropped":true} rather than removing the
+          // key, so a client arriving after the DROP still learns the table is gone.
+          if (val?.dropped === true) {
+            await dropLocalTable(entry.key, `tombstone @ lsn ${val.lsn ?? '?'}`);
+            continue;
+          }
+
+          if (val?.sqlite?.columns) await applySchema(entry.key, val);
+        }
+      })();
+    } catch (err) {
+      appendLog('SCHEMA', `Watch failed: ${err}`, 'ERROR');
+    }
+  };
+
+  const dropLocalTable = async (table: string, reason: string) => {
+    try {
+      await sql(`DROP VIEW IF EXISTS ${table}_view;`);
+      await sql(`DROP TABLE IF EXISTS ${table};`);
+      syncedTables.delete(table);
+      setTableCount(syncedTables.size);
+      appendLog('SCHEMA', `Dropped local table "${table}" (${reason})`, 'DROP');
+    } catch (err) {
+      appendLog('SCHEMA', `Drop of ${table} failed: ${err}`, 'ERROR');
+    }
+  };
+
+  /**
+   * Apply a schema to the local database.
+   *
+   * Additive changes use ALTER TABLE ADD COLUMN so existing rows survive. That matters
+   * for the mid-stream evolution test: rebuilding the table on every schema push would
+   * wipe the local replica, making "the client survived" trivially true and hiding any
+   * data actually lost.
+   */
+  const applySchema = async (table: string, val: any) => {
+    const pkName: string = val.sqlite.pk;
+    const cols: { name: string; type: string }[] = val.sqlite.columns;
+    const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
+    const names = cols.map((c) => c.name);
+
+    const existing = syncedTables.get(table);
+    const added = existing ? names.filter((n) => !existing.columns.includes(n)) : [];
+    const removed = existing ? existing.columns.filter((n) => !names.includes(n)) : [];
+    const additiveOnly = !!existing && removed.length === 0 && added.length > 0;
+
+    try {
+      if (additiveOnly) {
+        for (const name of added) {
+          const type = cols.find((c) => c.name === name)!.type;
+          await sql(`ALTER TABLE ${table} ADD COLUMN "${name}" ${type};`);
+        }
+        appendLog('SCHEMA', `${table}: +[${added.join(', ')}] via ALTER (rows preserved), lsn=${lsn}`, 'MIGRATE');
+      } else if (existing && added.length === 0 && removed.length === 0) {
+        syncedTables.set(table, { pk: pkName, columns: names, lsn });
+        return; // identical schema, e.g. a boot republish
+      } else {
+        const columns = cols
+          .map((c) => `"${c.name}" ${c.type}${c.name === pkName ? ' PRIMARY KEY' : ''}`)
+          .join(', ');
+        await sql(`DROP TABLE IF EXISTS ${table};`);
+        await sql(`CREATE TABLE IF NOT EXISTS ${table} (${columns});`);
+        const why = existing ? `columns removed: [${removed.join(', ')}]` : 'first sight';
+        appendLog('SCHEMA', `${table}: rebuilt (${why}), lsn=${lsn}`, 'MIGRATE');
+      }
+
+      // (Re)build the convenience view against the current column set.
+      const viewCols = names.filter((n) => !EXCLUDE_FROM_VIEW.includes(n)).map((n) => `"${n}"`).join(', ');
+      await sql(`DROP VIEW IF EXISTS ${table}_view;`);
+      if (viewCols) await sql(`CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`);
+
+      syncedTables.set(table, { pk: pkName, columns: names, lsn });
+      setTableCount(syncedTables.size);
+
+      await drainPending(table);
+    } catch (err) {
+      appendLog('SCHEMA', `Applying schema for ${table} failed: ${err}`, 'ERROR');
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // CDC handling
+  // ---------------------------------------------------------------------------
+
+  /** Replay events that were held back waiting for this table's schema to catch up. */
+  const drainPending = async (table: string) => {
+    if (!pendingEvents.length) return;
+    const mine = pendingEvents.filter((p) => p.table === table);
+    if (!mine.length) return;
+
+    for (let i = pendingEvents.length - 1; i >= 0; i--) {
+      if (pendingEvents[i].table === table) pendingEvents.splice(i, 1);
+    }
+    setPendingCount(pendingEvents.length);
+    appendLog('CDC', `Replaying ${mine.length} held event(s) for ${table}`, 'DRAIN');
+    for (const p of mine) await applyEvent(p.table, p.ev);
+  };
+
+  const applyEvent = async (table: string, ev: any) => {
+    const state = syncedTables.get(table);
+    if (!state || !ev?.data) return;
+    const op = ev.operation;
+
+    if (op === 'INSERT' || op === 'UPDATE') {
+      const keys = Object.keys(ev.data);
+
+      // The row references a column we do not have yet: the schema push has not been
+      // processed. Hold it rather than dropping it or writing a partial row.
+      const unknown = keys.filter((k) => !state.columns.includes(k) && !k.startsWith('old.'));
+      if (unknown.length) {
+        pendingEvents.push({ table, ev });
+        setPendingCount(pendingEvents.length);
+        appendLog('CDC', `Holding ${op} on ${table}: unknown column(s) [${unknown.join(', ')}] — awaiting schema newer than lsn ${state.lsn}`, 'HOLD');
+        return;
+      }
+
+      const values = Object.values(ev.data).map((v) =>
+        v !== null && typeof v === 'object' ? JSON.stringify(v) : v
+      );
+      const columns = keys.map((k) => `"${k}"`).join(', ');
+      const placeholders = keys.map(() => '?').join(', ');
+      const updates = keys.filter((k) => k !== state.pk).map((k) => `"${k}" = excluded."${k}"`).join(', ');
+
+      let query = `INSERT INTO ${table} (${columns}) VALUES (${placeholders})`;
+      if (state.pk && updates) query += ` ON CONFLICT("${state.pk}") DO UPDATE SET ${updates}`;
+
+      try {
+        await sql(query, ...values);
+      } catch (err) {
+        appendLog('SQLITE', `UPSERT on ${table} failed: ${err}`, 'ERROR');
+      }
+    } else if (op === 'DELETE') {
+      // With REPLICA IDENTITY DEFAULT the delete carries the PK and nulls elsewhere,
+      // which is all a delete-by-key needs.
+      const pkVal = ev.data[state.pk];
+      if (pkVal !== undefined && pkVal !== null) {
+        try {
+          await sql(`DELETE FROM ${table} WHERE "${state.pk}" = ?`, pkVal);
+        } catch (err) {
+          appendLog('SQLITE', `DELETE on ${table} failed: ${err}`, 'ERROR');
+        }
+      }
+    }
+  };
+
   const subscribeStreams = () => {
     if (!nc) return;
 
-    // 1. Subscribe to CDC events
     const cdcSub = nc.subscribe(`${topology.subjects.cdc_prefix}.>`);
     (async () => {
       for await (const msg of cdcSub) {
         let decoded: any;
         try { decoded = decode(msg.data); } catch { decoded = sc.decode(msg.data); }
+        // A batch message is an array; a single event is an object.
         const events = Array.isArray(decoded) ? decoded : [decoded];
-        
+
         for (const ev of events) {
-          const op = ev?.operation || 'CDC';
-          
-          if (!Array.isArray(decoded)) {
-            // Only log if it wasn't a batch, to avoid double logging
-            // Or log each event individually
-          }
-
           const table = ev?.table || msg.subject.split('.')[1];
-          if (table && syncedTables.has(table) && ev?.data) {
-            const schema = syncedTables.get(table)!;
-            
-            if (op === 'INSERT' || op === 'UPDATE') {
-              const keys = Object.keys(ev.data);
-              const values = Object.values(ev.data).map(v => 
-                (v !== null && typeof v === 'object') ? JSON.stringify(v) : v
-              );
-              
-              const columns = keys.map(k => `"${k}"`).join(', ');
-              const placeholders = keys.map(() => '?').join(', ');
-              const updates = keys.filter(k => k !== schema.pk).map(k => `"${k}" = excluded."${k}"`).join(', ');
-
-              let query = `INSERT INTO ${table} (${columns}) VALUES (${placeholders})`;
-              if (schema.pk) {
-                query += ` ON CONFLICT("${schema.pk}") DO UPDATE SET ${updates}`;
-              }
-
-              try {
-                await sql(query, ...values);
-              } catch (err) {
-                appendLog('SQLITE', `UPSERT failed: ${err}`, 'ERROR');
-              }
-            } else if (op === 'DELETE') {
-              const pkVal = ev.data[schema.pk];
-              if (pkVal !== undefined) {
-                try {
-                  await sql(`DELETE FROM ${table} WHERE "${schema.pk}" = ?`, pkVal);
-                } catch (err) {
-                  appendLog('SQLITE', `DELETE failed: ${err}`, 'ERROR');
-                }
-              }
-            }
-          }
+          if (table) await applyEvent(table, ev);
         }
       }
     })();
 
-    // 2. Subscribe to INIT snapshot events
     const initSub = nc.subscribe(`${topology.subjects.init_prefix}.>`);
     (async () => {
       for await (const msg of initSub) {
@@ -131,75 +290,33 @@ export default function App() {
     })();
   };
 
-  const syncSqlite = async () => {
-    if (!nc) return;
-    try {
-      appendLog('SQLITE', 'Fetching schema from NATS KV...');
-      const js = nc.jetstream();
-      const kv = await js.views.kv(topology.kv.schemas);
-      
-      const table = 'test_types';
-      const entry = await kv.get(table);
-      if (!entry) {
-        appendLog('SQLITE', `Schema for ${table} not found in KV!`, 'ERROR');
-        return;
-      }
-
-      let val: any;
-      try { val = decode(entry.value); } catch { val = JSON.parse(entry.string()); }
-      
-      if (val?.schema && typeof val.schema === 'string') {
-        val = JSON.parse(val.schema);
-      }
-      
-      if (val?.sqlite?.columns) {
-        const pkName = val.sqlite.pk;
-        const columns = val.sqlite.columns.map((c: any) => {
-          const isPk = c.name === pkName ? ' PRIMARY KEY' : '';
-          return `"${c.name}" ${c.type}${isPk}`;
-        }).join(', ');
-        
-        const dropTableQuery = `DROP TABLE IF EXISTS ${table};`;
-        const createTableQuery = `CREATE TABLE IF NOT EXISTS ${table} (${columns});`;
-        appendLog('SQLITE', `Executing: ${dropTableQuery} then ${createTableQuery}`, 'MIGRATE');
-        
-        await sql(dropTableQuery);
-        await sql(createTableQuery);
-        syncedTables.set(table, { pk: pkName });
-        appendLog('SQLITE', `Table ${table} is now ready in local WASM SQLite!`, 'READY');
-      }
-    } catch (err) {
-      appendLog('SQLITE', `Sync failed: ${err}`, 'ERROR');
-    }
-  };
+  // ---------------------------------------------------------------------------
+  // UI actions
+  // ---------------------------------------------------------------------------
 
   const queryLocalDb = async () => {
-    try {
-      const table = 'test_types';
-      if (!syncedTables.has(table)) {
-        appendLog('SQLITE', `Table ${table} is not synced yet!`, 'ERROR');
-        return;
+    if (!syncedTables.size) {
+      appendLog('SQLITE', 'No tables synced yet — waiting for a schema push.', 'ERROR');
+      return;
+    }
+    for (const [table, state] of syncedTables) {
+      try {
+        const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}`);
+        const lastRes = await sql(`SELECT * FROM ${table} ORDER BY "${state.pk}" DESC LIMIT 1`);
+        appendLog(
+          'SQLITE',
+          JSON.stringify(
+            { table, schema_lsn: state.lsn, columns: state.columns, row_count: countRes[0]?.count ?? 0, last_row: lastRes[0] ?? null },
+            null,
+            2
+          ),
+          'QUERY'
+        );
+      } catch (err) {
+        appendLog('SQLITE', `Query on ${table} failed: ${err}`, 'ERROR');
       }
-      
-      // We use id DESC because it's the primary key we extracted earlier!
-      const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}`);
-      const count = countRes[0]?.count || 0;
-      
-      const lastRowRes = await sql(`SELECT * FROM ${table} ORDER BY id DESC LIMIT 1`);
-      const lastRow = lastRowRes[0] || null;
-      
-      appendLog('SQLITE', JSON.stringify({ row_count: count, last_inserted: lastRow }, null, 2), 'QUERY');
-    } catch (err) {
-      appendLog('SQLITE', `Query failed: ${err}`, 'ERROR');
     }
   };
-
-  // Mount effect
-  initNats();
-
-  onCleanup(() => {
-    if (nc) nc.close();
-  });
 
   const publishMutation = () => {
     if (!nc) return;
@@ -209,23 +326,26 @@ export default function App() {
       operation: 'INSERT',
       data: {
         id: Math.floor(Math.random() * 10000) + 1000,
-        some_text: "Manual Button Simulator!",
+        some_text: 'Manual Button Simulator!',
         age: 42,
         price: 99.99,
         is_true: 1,
-        tags: ["manual", "test"],
+        tags: ['manual', 'test'],
         matrix: [[1, 2], [3, 4]]
       },
       lsn: 9999999,
       msg_id: `sim-${Math.random().toString(36).substring(2, 9)}`
     };
 
-    const encoded = encode(payload);
-    // Publish directly to the CDC stream! 
-    // This bypasses PostgreSQL and bounces straight off NATS back into our subscriber loop!
-    nc.publish(`cdc.${table}.insert`, encoded);
+    nc.publish(`cdc.${table}.insert`, encode(payload));
     appendLog(`cdc.${table}.insert`, payload, 'SIMULATE');
   };
+
+  initNats();
+
+  onCleanup(() => {
+    if (nc) nc.close();
+  });
 
   return (
     <>
@@ -234,11 +354,11 @@ export default function App() {
         <div class="status-bar">
           <span class={`badge ${status()}`}>{status().toUpperCase()}</span>
           <span id="server-url">{NATS_URL}</span>
+          <span id="sync-state">tables: {tableCount()} · held events: {pendingCount()}</span>
         </div>
       </header>
 
       <div class="controls">
-        <button onClick={syncSqlite} style="background: #0277bd;">Sync SQLite</button>
         <button onClick={queryLocalDb} style="background: #2e7d32;">Query Local DB</button>
         <button onClick={publishMutation} style="background: #8e24aa;">Simulate CDC Event</button>
         <button onClick={() => setLogs([])}>Clear Logs</button>

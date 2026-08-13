@@ -34,7 +34,7 @@ flowchart TD
     subgraph Consumers["Consumers & Clients"]
         App["Native App / WebApp"]
         Server_Worker["Server Microservice"]
-        Local_DB[("Local DB<br>SQLite / PGLite")]
+        Local_DB[("Local DB <br> SQLite / PGLite")]
     end
 ```
 

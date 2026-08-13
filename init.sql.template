@@ -37,8 +37,47 @@ CREATE TABLE IF NOT EXISTS public.zebridge_ddl_events (
     schema_name TEXT NOT NULL,
     table_name TEXT NOT NULL,
     command_tag TEXT NOT NULL,
+    -- Schema captured INSIDE the DDL transaction, so it is the schema as of this
+    -- LSN. The bridge must not re-query the catalog at processing time: that reads
+    -- "now" rather than "then", which reorders bursts and corrupts WAL replay after
+    -- a restart. Shape: {"columns":[{"name":..,"type":..}], "pk":".."|null}
+    schema_def JSONB,
     emitted_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Backfill for databases initialised before schema_def existed
+ALTER TABLE public.zebridge_ddl_events ADD COLUMN IF NOT EXISTS schema_def JSONB;
+
+-- Tables whose DDL is infrastructure, not application data. Publishing their schemas
+-- would tell every client to build a local replica of bookkeeping it has no use for.
+-- Defined once and used by BOTH triggers: keeping two copies of this list in sync by
+-- hand is exactly how one of them ends up stale.
+--
+-- Add your migration tool's table here if it differs: flyway_schema_history,
+-- alembic_version, __diesel_schema_migrations, goose_db_version, ...
+CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
+RETURNS boolean AS $$
+    SELECT tbl = ANY (ARRAY[
+        'zebridge_ddl_events',  -- our own DDL tracker
+        'schema_migrations'     -- Ecto / ActiveRecord migration bookkeeping
+    ]);
+$$ LANGUAGE sql IMMUTABLE;
+
+-- Retention. The bridge reads these events from the WAL, never from the table, so
+-- rows are disposable the moment they are committed — pruning cannot cause a missed
+-- or mis-replayed schema event even if the bridge is down and later replays old WAL.
+-- The table is kept only as a human-readable audit trail, so a short window is
+-- plenty and unbounded growth is pure cost.
+--
+-- Pruning runs inside the DDL triggers rather than on a schedule: DDL is rare, so
+-- the cost is negligible and there is no external cron to deploy or forget.
+CREATE OR REPLACE FUNCTION public.zebridge_prune_ddl_events()
+RETURNS void AS $$
+BEGIN
+    DELETE FROM public.zebridge_ddl_events
+    WHERE emitted_at < NOW() - INTERVAL '7 days';
+END;
+$$ LANGUAGE plpgsql;
 
 -- Full replica identity ensures ZeBridge gets all columns in the WAL
 ALTER TABLE public.zebridge_ddl_events REPLICA IDENTITY FULL;
@@ -47,22 +86,110 @@ GRANT SELECT ON TABLE public.zebridge_ddl_events TO ${POSTGRES_BRIDGE_USER};
 CREATE OR REPLACE FUNCTION public.zebridge_ddl_trigger_fn()
 RETURNS event_trigger AS $$
 DECLARE
-    obj record;
+    obj         record;
+    tbl         text;
+    tables      text[] := '{}';
+    cmd_tag     text   := 'UNKNOWN';
+    schema_json jsonb;
 BEGIN
+    -- Pass 1: collect the distinct tables this command touched.
+    -- object_identity is 'public.users' for a table but 'public.users.email' for a
+    -- column, so split_part(..., 2) normalises both to the table name. ALTER TABLE
+    -- ADD COLUMN emits a 'table' row AND a 'table column' row; deduping here stops
+    -- the same schema being published twice.
     FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
     LOOP
-        -- Capture DDL events related to tables in the public schema
         IF obj.object_type IN ('table', 'table column') AND obj.schema_name = 'public' THEN
-            INSERT INTO public.zebridge_ddl_events (schema_name, table_name, command_tag)
-            VALUES (obj.schema_name, obj.object_identity, obj.command_tag);
+            tbl := split_part(obj.object_identity, '.', 2);
+            cmd_tag := obj.command_tag;
+
+            -- Skip infrastructure tables (our tracker, migration bookkeeping): their
+            -- schemas are meaningless to clients and would provoke pointless migrations.
+            IF NOT public.zebridge_is_internal_table(tbl) AND NOT (tbl = ANY(tables)) THEN
+                tables := array_append(tables, tbl);
+            END IF;
         END IF;
     END LOOP;
+
+    -- Pass 2: snapshot each table's schema while we are still inside the DDL
+    -- transaction, so catalog state and LSN are bound together atomically.
+    FOREACH tbl IN ARRAY tables
+    LOOP
+        SELECT jsonb_build_object(
+                 'columns', COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object(
+                              'name', c.column_name,
+                              'type', c.data_type
+                            ) ORDER BY c.ordinal_position)
+                     FROM information_schema.columns c
+                     WHERE c.table_schema = 'public'
+                       AND c.table_name   = tbl
+                 ), '[]'::jsonb),
+                 'pk', (
+                     SELECT a.attname
+                     FROM pg_index i
+                     JOIN pg_attribute a
+                       ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                     -- to_regclass, not ::regclass: returns NULL instead of raising
+                     -- if the table is gone (e.g. dropped later in the same tx)
+                     WHERE i.indrelid = to_regclass(format('%I.%I', 'public', tbl))
+                       AND i.indisprimary
+                       AND array_length(i.indkey, 1) = 1
+                     LIMIT 1
+                 )
+               )
+        INTO schema_json;
+
+        -- No columns means the table did not survive the transaction; nothing useful
+        -- to publish, and an empty schema would tell clients to drop every column.
+        IF schema_json -> 'columns' <> '[]'::jsonb THEN
+            INSERT INTO public.zebridge_ddl_events
+                   (schema_name, table_name, command_tag, schema_def)
+            VALUES ('public', tbl, cmd_tag, schema_json);
+        END IF;
+    END LOOP;
+
+    PERFORM public.zebridge_prune_ddl_events();
 END;
 $$ LANGUAGE plpgsql;
 
 DROP EVENT TRIGGER IF EXISTS zebridge_ddl_trigger;
 CREATE EVENT TRIGGER zebridge_ddl_trigger ON ddl_command_end
 EXECUTE FUNCTION public.zebridge_ddl_trigger_fn();
+
+-- DROP TABLE never reaches ddl_command_end — by the time it fires the object is
+-- gone and pg_event_trigger_ddl_commands() does not report it. Drops therefore
+-- need their own trigger on sql_drop, or clients never learn a table disappeared
+-- and keep a local replica of something that no longer exists upstream.
+CREATE OR REPLACE FUNCTION public.zebridge_drop_trigger_fn()
+RETURNS event_trigger AS $$
+DECLARE
+    obj record;
+    tbl text;
+BEGIN
+    FOR obj IN SELECT * FROM pg_event_trigger_dropped_objects()
+    LOOP
+        IF obj.object_type = 'table' AND obj.schema_name = 'public' THEN
+            tbl := split_part(obj.object_identity, '.', 2);
+
+            IF NOT public.zebridge_is_internal_table(tbl) THEN
+                -- schema_def is NULL rather than '{"columns":[]}': the table is gone,
+                -- so there is no schema to state. The bridge treats a DROP TABLE tag
+                -- as "forget this table" and never reads schema_def for it.
+                INSERT INTO public.zebridge_ddl_events
+                       (schema_name, table_name, command_tag, schema_def)
+                VALUES ('public', tbl, 'DROP TABLE', NULL);
+            END IF;
+        END IF;
+    END LOOP;
+
+    PERFORM public.zebridge_prune_ddl_events();
+END;
+$$ LANGUAGE plpgsql;
+
+DROP EVENT TRIGGER IF EXISTS zebridge_drop_trigger;
+CREATE EVENT TRIGGER zebridge_drop_trigger ON sql_drop
+EXECUTE FUNCTION public.zebridge_drop_trigger_fn();
 
 -- Automatically add the tracking table to the ZeBridge publication
 DO $$

@@ -22,8 +22,8 @@ pub const log = std.log.scoped(.nats_pub);
 pub const PublisherConfig = struct {
     url: []const u8 = "nats://127.0.0.1:4222",
     max_reconnect_attempts: i32 = -1, // -1 = infinite
-    reconnect_wait_ms: i64 = 2000, // 2s between attempts
-    max_backoff_ms: i64 = 30000, // 30s max backoff
+    reconnect_wait_ms: i64 = Conf.Nats.reconnect_wait_ms,
+    max_backoff_ms: i64 = Conf.Nats.max_backoff_ms,
     nkey_seed: ?[]const u8 = null, // Optional NKEY private seed (SU...)
 };
 
@@ -79,7 +79,7 @@ pub const Publisher = struct {
             .js = null,
             .nats_url = url,
             .nats_host = "",
-            .nats_port = 4222,
+            .nats_port = Conf.Nats.default_port,
             .nats_nkey_seed = config.nkey_seed,
             .io = io,
         };
@@ -88,8 +88,8 @@ pub const Publisher = struct {
     pub fn connect(self: *Publisher) !void {
         // Parse URL to extract host (the pure Zig client needs host, not URL)
         // Format: nats://[user:pass@]host:port
-        var host: []const u8 = "127.0.0.1";
-        var port: u16 = 4222;
+        var host: []const u8 = Conf.Nats.default_host;
+        var port: u16 = Conf.Nats.default_port;
 
         // Simple URL parsing (assumes nats://host:port or nats://user:pass@host:port)
         if (std.mem.indexOf(u8, self.nats_url, "nats://")) |idx| {

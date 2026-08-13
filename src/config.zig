@@ -27,21 +27,27 @@ pub const Postgres = struct {
 
 /// NATS JetStream configuration
 pub const Nats = struct {
+    pub const default_host = "127.0.0.1";
     pub const default_port = 4222;
     pub const default_url = "nats://127.0.0.1:4222";
 
     /// Maximum reconnection attempts (-1 = infinite)
     pub const max_reconnect_attempts = -1;
 
-    /// Wait time between reconnection attempts (milliseconds)
-    pub const reconnect_wait_ms = 1000; // 1s
+    /// Wait time between reconnection attempts (milliseconds).
+    /// Was 1000 here while nats_publisher used a hardcoded 2000; 2000 is the value
+    /// that was actually in effect and the one the README documents, so that wins.
+    pub const reconnect_wait_ms = 2000;
+
+    /// Ceiling for the publisher's exponential reconnect backoff (milliseconds)
+    pub const max_backoff_ms = 30_000;
     pub const storage_type = .file;
 
     /// Async publish flush timeout (milliseconds)
     /// Must be >= reconnect_wait_ms * max attempts
     pub const flush_timeout_ms = 10_000; // 10 seconds
     pub const nats_flush_interval_seconds = 5; // 5 seconds
-    pub const status_update_interval_seconds = 1; // 1 second
+    pub const status_update_interval_ms = 100; // 100 milliseconds
     pub const status_update_byte_threshold: u64 = 1024 * 1024; // 1MB
 
     /// JetStream stream names
@@ -91,21 +97,17 @@ pub const Http = struct {
 
 /// Batch publishing configuration
 pub const Batch = struct {
-    /// Maximum events per batch
-    pub const max_events = 500;
+    /// Maximum number of events to batch before flushing
+    pub const max_events = 5000;
 
-    /// Maximum batch age before force flush (milliseconds)
-    pub const max_age_ms = 100;
+    /// Maximum time to wait before flushing an incomplete batch
+    pub const max_age_ms = 500;
 
-    /// Size of the ring buffer (must be power of 2)
-    /// Sized for NATS/PostgreSQL reconnection resilience:
-    /// - 65536 slots = ~1092ms buffer at 60K events/s
-    /// - Absorbs jitter and provides meaningful buffer during reconnection
-    /// - NATS reconnect_wait_ms = 1000ms → covers retry interval
-    /// - PostgreSQL reconnect_delay = 5000ms
-    /// - Memory cost: ~2MB (negligible for production resilience)
-    pub const ring_buffer_size = 65536;
     pub const max_payload_bytes = 256 * 1024; // 256KB
+    // NOTE: the ring buffer size lives in Buffers.default_ring_buffer_count, which is
+    // what RuntimeConfig actually reads. A `Batch.ring_buffer_size` used to be
+    // declared here with the sizing rationale attached, but nothing referenced it —
+    // the reasoning has moved next to the live constant.
 };
 
 /// WAL monitoring configuration
@@ -198,17 +200,40 @@ pub const EventClassification = struct {
 };
 
 /// Reconnection and retry configuration
+/// Retry and backoff defaults.
+///
+/// These are the compile-time defaults; the operationally interesting ones are
+/// overridable at runtime via RuntimeConfig (see args.zig for the env names).
+/// Values here were previously duplicated as literals across batch_publisher,
+/// snapshot_listener and event_processor — identical by intention but free to
+/// drift, which is exactly the failure this section exists to prevent.
 pub const Retry = struct {
     /// PostgreSQL reconnection delay (seconds)
     pub const pg_reconnect_delay_seconds = 5;
 
-    /// NATS reconnection is handled by NATS client library
-    /// See Nats.reconnect_wait_ms and Nats.max_reconnect_attempts
-    /// Exponential backoff base (for future use)
-    pub const backoff_base_ms = 1000;
+    /// Publish retry budget, shared by the CDC batch publisher and the snapshot
+    /// publisher. Exhausting it is fatal: the bridge stops rather than ACK an LSN
+    /// whose data never reached NATS.
+    pub const publish_max_retries = 5;
 
-    /// Maximum backoff time (for future use)
-    pub const max_backoff_ms = 60_000; // 1 minute
+    /// First backoff after a failed publish; doubles each attempt up to the cap.
+    pub const publish_backoff_ms = 100;
+    pub const publish_max_backoff_ms = 5_000;
+
+    /// While backing off, wake this often to notice a shutdown request rather than
+    /// sleeping through the whole interval.
+    pub const shutdown_poll_ms = 50;
+
+    /// Delay between NATS reconnection attempts in the listener threads.
+    pub const nats_reconnect_delay_ms = 2_000;
+
+    /// How many spins on a full ring buffer before checking whether the flush
+    /// thread has died. Internal tuning, not worth exposing.
+    pub const spins_before_fatal_check = 1_000;
+
+    /// Hard ceiling on a stalled flush thread before declaring the NATS client
+    /// hung and forcing shutdown (nanoseconds).
+    pub const flush_stall_timeout_ns = 30 * std.time.ns_per_s;
 };
 
 /// Threading configuration
@@ -245,13 +270,28 @@ pub const Buffers = struct {
     /// Configurable via environment variable BASE_BUF (log2 of desired size)
     /// If a row exceeds this size, the bridge will panic to prevent data loss
     /// Example: BASE_BUF=16 → 64KB, BASE_BUF=14 → 16KB
-    pub const default_event_data_buffer_log2: u6 = 15; // 2^15 = 32KB
+    pub const default_event_data_buffer_log2: u6 = 12; // 2^12 = 4096KB
 
     /// Ring buffer event count (number of pre-allocated event slots)
     /// Default: 65536 events
     /// Configurable via environment variable RING_BUFFER_COUNT
     /// Total memory = event_count × event_buffer_size
     /// Example: 65536 slots × 32KB = 2GB slab
+    ///
+    /// Sizing rationale — the buffer is what absorbs a NATS outage before the
+    /// producer has to backpressure and let WAL accumulate:
+    ///   65536 slots ≈ 1092ms of headroom at 60K events/s
+    ///
+    /// That headroom used to exceed one NATS reconnect interval (then 1000ms).
+    /// Nats.reconnect_wait_ms is now 2000ms — the value that was actually in
+    /// effect and that the README documents — so the buffer covers roughly half
+    /// a reconnect interval, not a whole one.
+    ///
+    /// This is safe, not broken: a full ring makes acquireAndFillSlot backpressure
+    /// the WAL reader, so events are delayed, never dropped. But the old "one
+    /// reconnect fits entirely in RAM" property is gone. To restore it, raise
+    /// RING_BUFFER_COUNT to 131072 (≈2184ms, ~4MB slab) rather than shortening
+    /// the reconnect wait.
     pub const default_ring_buffer_count: usize = 65536;
 };
 
@@ -310,6 +350,11 @@ pub const RuntimeConfig = struct {
     // Snapshot settings
     snapshot_chunk_size: usize,
 
+    // Publish retry budget (see Retry section for the rationale)
+    publish_max_retries: u32,
+    publish_backoff_ms: u64,
+    publish_max_backoff_ms: u64,
+
     // Buffer settings
     event_data_buffer_log2: u6,
 
@@ -338,6 +383,9 @@ pub const RuntimeConfig = struct {
             .batch_max_payload_bytes = Batch.max_payload_bytes,
             .batch_ring_buffer_size = Buffers.default_ring_buffer_count,
             .snapshot_chunk_size = Snapshot.chunk_size,
+            .publish_max_retries = Retry.publish_max_retries,
+            .publish_backoff_ms = Retry.publish_backoff_ms,
+            .publish_max_backoff_ms = Retry.publish_max_backoff_ms,
             .event_data_buffer_log2 = Buffers.default_event_data_buffer_log2,
             .encoding_format = .msgpack,
         };

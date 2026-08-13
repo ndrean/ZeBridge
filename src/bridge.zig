@@ -23,6 +23,7 @@ const encoder_mod = @import("encoder.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const utils = @import("utils.zig");
+const preflight = @import("preflight.zig");
 
 // Force test discovery for imported modules.
 // Zig only collects tests from files the root actually references, so every module
@@ -34,7 +35,9 @@ comptime {
     _ = @import("pg_copy_csv.zig");
     _ = @import("pgoutput.zig");
     _ = @import("publication.zig");
+    _ = @import("preflight.zig");
     _ = @import("schema_cache.zig");
+    _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");
     _ = @import("streaming_encoder.zig");
 }
@@ -135,6 +138,9 @@ fn initBatchPublisher(
         .max_events = runtime_config.batch_max_events,
         .max_wait_ms = runtime_config.batch_max_wait_ms,
         .max_payload_bytes = runtime_config.batch_max_payload_bytes,
+        .max_retries = runtime_config.publish_max_retries,
+        .backoff_ms = runtime_config.publish_backoff_ms,
+        .max_backoff_ms = runtime_config.publish_max_backoff_ms,
     };
 
     return try batch_publisher.BatchPublisher.init(
@@ -354,6 +360,14 @@ pub fn main(init: std.process.Init) !void {
     var transition_rules = try args.Args.parseTransitionRules(allocator, &init);
     defer args.Args.deinitTransitionRules(&transition_rules, allocator);
 
+    // Validate the publication's tables now that transition rules are known. Reports
+    // only — a table the operator deliberately configured this way should not stop the
+    // bridge, but a silent failure should not stay silent either.
+    _ = preflight.run(allocator, &pg_config, parsed_args.publication_name, &transition_rules) catch |err| blk: {
+        log.warn("⚠️  Preflight check failed to run: {}", .{err});
+        break :blk preflight.Summary{};
+    };
+
     // === Initialize EventProcessor (in this main thread, the CDC processing)
     // EventProcessor enqueues to the SPSC queue that BatchPublisher consumes
     var event_proc = event_processor.EventProcessor.init(
@@ -400,21 +414,21 @@ pub fn main(init: std.process.Init) !void {
     var last_lsn: u64 = 0;
     var last_ack_lsn: u64 = 0; // Track last acknowledged LSN for keepalives
     var last_keepalive_time = present; // Track last keepalive sent
-    const keepalive_interval_seconds: i64 = Config.Bridge.keepalive_interval_seconds; // Send keepalive every 30 seconds
 
     // Status update batching to reduce PostgreSQL round trips
     var bytes_since_ack: u64 = 0; // Track bytes processed since last ack
-    var last_status_update_time = present;
-    const status_update_interval_seconds: i64 = Config.Nats.status_update_interval_seconds; // Send status update every 1 second (reduced for visibility)
+    // Read configuration values once
+    const status_update_interval_ms: i64 = Config.Nats.status_update_interval_ms;
+    const keepalive_interval_seconds: i64 = 10; // Send keepalives every 10s if idle
+    var last_status_update_time = utils.getMilliTimestamp();
     const status_update_byte_threshold: u64 = Config.Nats.status_update_byte_threshold; // Or after 1MB of data (better than message count)
 
     // Periodic structured metric logging for Grafana Alloy/Loki
     var last_metric_log_time = present;
     const metric_log_interval_seconds: i64 = Config.Metrics.metric_log_interval_seconds; // Log metrics every 15 seconds
 
-    // Idle loop optimization - avoid syscalls on every iteration
-    var idle_iterations: u32 = 0;
-    const idle_check_interval: u32 = 10; // Check time every 10 iterations (~100ms)
+    // Main loop iteration counter for periodic background tasks (e.g. time-based ACKs)
+    var loop_iterations: u32 = 0;
     // --->
 
     // Per-transaction slot scratchpad: holds ring-buffer indices for the current
@@ -452,6 +466,54 @@ pub fn main(init: std.process.Init) !void {
 
     // Run until graceful shutdown signal received
     while (!should_stop.load(.seq_cst)) {
+        loop_iterations +%= 1;
+        const now_s = @as(i64, @intCast(c.time(null)));
+        const now_ms = utils.getMilliTimestamp();
+        
+        // Flush pending status updates if time threshold reached
+        if (now_ms - last_status_update_time >= status_update_interval_ms) {
+            const confirmed_lsn = batch_pub.getLastConfirmedLsn();
+            if (confirmed_lsn > last_ack_lsn) {
+                try pg_stream.sendStatusUpdate(confirmed_lsn);
+                log.debug("✓ ACKed to PostgreSQL: LSN {x} (time-based)", .{confirmed_lsn});
+                last_ack_lsn = confirmed_lsn;
+                bytes_since_ack = 0;
+                last_keepalive_time = now_s;
+            }
+            last_status_update_time = now_ms;
+        }
+
+        // Send keepalive to prevent timeout
+        if (now_s - last_keepalive_time >= keepalive_interval_seconds) {
+            if (last_ack_lsn > 0) {
+                try pg_stream.sendStatusUpdate(last_ack_lsn);
+                last_keepalive_time = now_s;
+                log.debug("Sent keepalive (LSN: {x})", .{last_ack_lsn});
+            }
+        }
+
+        // Periodic structured metric logging for Alloy/Loki
+        if (now_s - last_metric_log_time >= metric_log_interval_seconds) {
+
+            const snap = try metrics.snapshot(allocator);
+            defer allocator.free(snap.current_lsn_str);
+
+            // Structured log format parseable by Grafana Alloy
+            log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} pg_reconnects={d} nats_reconnects={d} lag_bytes={d} slot_active={d}", .{
+                snap.uptime_seconds,
+                snap.wal_messages_received,
+                snap.cdc_events_published,
+                snap.current_lsn_str,
+                if (snap.is_connected) @as(u8, 1) else @as(u8, 0),
+                snap.reconnect_count,
+                snap.nats_reconnect_count,
+                snap.wal_lag_bytes,
+                if (snap.slot_active) @as(u8, 1) else @as(u8, 0),
+            });
+
+            last_metric_log_time = now_s;
+        }
+
         // Check for fatal NATS errors (e.g., reconnection timeout exceeded)
         if (batch_pub.hasFatalError()) {
             log.err("🔴 FATAL ERROR: NATS reconnection failed - shutting down bridge to prevent WAL overflow", .{});
@@ -534,7 +596,7 @@ pub fn main(init: std.process.Init) !void {
                                 // Defensive: discard any stale slots from a broken prior tx.
                                 for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
                                 tx_slots_count = 0;
-                                log.info("BEGIN: xid={d} lsn={x}", .{ b.xid, b.final_lsn });
+                                log.debug("BEGIN: xid={d} lsn={x}", .{ b.xid, b.final_lsn });
                             },
                             .insert => |ins| {
                                 if (relation_map.get(ins.relation_id)) |rel| {
@@ -565,8 +627,13 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                 }
                             },
-                            .update => |upd| {
+                            .update => |upd| blk_upd: {
                                 if (relation_map.get(upd.relation_id)) |rel| {
+                                    // Housekeeping on the DDL tracker is not client data: only its
+                                    // INSERTs carry schema events (handled in the .insert prong).
+                                    // Pruning old rows produces DELETEs that must never surface as
+                                    // cdc.zebridge_ddl_events.* to consumers.
+                                    if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_upd;
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
                                         for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
@@ -586,8 +653,13 @@ pub fn main(init: std.process.Init) !void {
                                     cdc_events += 1;
                                 }
                             },
-                            .delete => |del| {
+                            .delete => |del| blk_del: {
                                 if (relation_map.get(del.relation_id)) |rel| {
+                                    // Housekeeping on the DDL tracker is not client data: only its
+                                    // INSERTs carry schema events (handled in the .insert prong).
+                                    // Pruning old rows produces DELETEs that must never surface as
+                                    // cdc.zebridge_ddl_events.* to consumers.
+                                    if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_del;
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
                                         for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
@@ -618,15 +690,20 @@ pub fn main(init: std.process.Init) !void {
                                         break;
                                     };
                                 }
+                                
+                                const events_released_in_tx = tx_slots_count;
                                 tx_slots_count = 0;
 
                                 if (commit.commit_lsn != last_lsn) {
                                     const lsn_diff = commit.commit_lsn - last_lsn;
-                                    log.info("COMMIT: lsn={x} (delta: +{d}, {d} events released)", .{ commit.commit_lsn, lsn_diff, cdc_events });
+                                    log.debug("COMMIT: lsn={x} (delta: +{d}, {d} events released)", .{ commit.commit_lsn, lsn_diff, events_released_in_tx });
                                     last_lsn = commit.commit_lsn;
                                 } else {
-                                    log.info("COMMIT: lsn={x}", .{commit.commit_lsn});
+                                    log.debug("COMMIT: lsn={x}", .{commit.commit_lsn});
                                 }
+                                
+                                // Tell publisher to flush immediately rather than waiting for max_age_ms
+                                batch_pub.forceFlush();
                             },
                             else => {},
                         }
@@ -642,76 +719,22 @@ pub fn main(init: std.process.Init) !void {
                 }
 
                 // Send buffered status update if we hit byte threshold
-                // Time-based ACKs are handled in the idle path to avoid syscalls in hot path
                 if (bytes_since_ack >= status_update_byte_threshold) {
                     // Only read atomic LSN when we're about to ACK
                     const confirmed_lsn = batch_pub.getLastConfirmedLsn();
                     if (confirmed_lsn > last_ack_lsn) {
-                        const now = @as(i64, @intCast(c.time(null))); // Get timestamp for update
                         try pg_stream.sendStatusUpdate(confirmed_lsn);
-                        log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} bytes)", .{ confirmed_lsn, bytes_since_ack });
+                        log.debug("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} bytes)", .{ confirmed_lsn, bytes_since_ack });
                         last_ack_lsn = confirmed_lsn;
                         bytes_since_ack = 0;
-                        last_status_update_time = now;
-                        last_keepalive_time = now; // Reset keepalive timer
+                        last_status_update_time = now_ms;
+                        last_keepalive_time = now_s; // Reset keepalive timer
                     }
                 }
             } else {
                 // No message available - idle path
-                // Sleep 10 ms first to avoid busy-waiting
-                utils.sleep(10 * std.time.ns_per_ms);
-
-                // Only check time-based conditions periodically
-                idle_iterations += 1;
-                if (idle_iterations >= idle_check_interval) {
-                    idle_iterations = 0;
-
-                    const now = @as(i64, @intCast(c.time(null)));
-
-                    // Flush pending status updates if time threshold reached
-                    if (now - last_status_update_time >= status_update_interval_seconds) {
-                        const confirmed_lsn = batch_pub.getLastConfirmedLsn();
-                        if (confirmed_lsn > last_ack_lsn) {
-                            try pg_stream.sendStatusUpdate(confirmed_lsn);
-                            log.info("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed)", .{confirmed_lsn});
-                            last_ack_lsn = confirmed_lsn;
-                            bytes_since_ack = 0;
-                            last_keepalive_time = now;
-                        }
-                        // Always update last_status_update_time to avoid checking continuously
-                        last_status_update_time = now;
-                    }
-
-                    if (now - last_keepalive_time >= keepalive_interval_seconds) {
-                        // Send keepalive status update to prevent timeout
-                        if (last_ack_lsn > 0) {
-                            try pg_stream.sendStatusUpdate(last_ack_lsn);
-                            last_keepalive_time = now;
-                            log.debug("Sent keepalive (LSN: {x})", .{last_ack_lsn});
-                        }
-                    }
-
-                    // Periodic structured metric logging for Alloy/Loki
-                    if (now - last_metric_log_time >= metric_log_interval_seconds) {
-                        const snap = try metrics.snapshot(allocator);
-                        defer allocator.free(snap.current_lsn_str);
-
-                        // Structured log format parseable by Grafana Alloy
-                        log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} pg_reconnects={d} nats_reconnects={d} lag_bytes={d} slot_active={d}", .{
-                            snap.uptime_seconds,
-                            snap.wal_messages_received,
-                            snap.cdc_events_published,
-                            snap.current_lsn_str,
-                            if (snap.is_connected) @as(u8, 1) else @as(u8, 0),
-                            snap.reconnect_count,
-                            snap.nats_reconnect_count,
-                            snap.wal_lag_bytes,
-                            if (snap.slot_active) @as(u8, 1) else @as(u8, 0),
-                        });
-
-                        last_metric_log_time = now;
-                    }
-                }
+                // Sleep 1 ms first to avoid busy-waiting and increase throughput
+                utils.sleep(1 * std.time.ns_per_ms);
             }
         } else |err| {
             if (err == error.StreamEnded) {

@@ -28,7 +28,7 @@ pub const Encoder = struct {
     format: Format,
 
     pub fn init(allocator: std.mem.Allocator, format: Format) Encoder {
-        log.info("Format used: {}", .{format});
+        log.debug("Format used: {}", .{format});
         return .{
             .allocator = allocator,
             .format = format,

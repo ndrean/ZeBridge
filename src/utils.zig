@@ -10,6 +10,13 @@ pub fn sleep(nanoseconds: u64) void {
     _ = std.c.nanosleep(&ts, null);
 }
 
+/// Monotonic millisecond timestamp
+pub fn getMilliTimestamp() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
 /// Convert days since Unix epoch (1970-01-01) to civil calendar date (year, month, day)
 ///
 /// This uses the proleptic Gregorian calendar algorithm from Howard Hinnant's date library,
