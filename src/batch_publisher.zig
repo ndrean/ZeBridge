@@ -805,7 +805,7 @@ pub const BatchPublisher = struct {
 
         for (indices) |slot_idx| {
             const event = &self.events[slot_idx];
-            if (std.mem.startsWith(u8, event.getSubject(), "$KV.")) {
+            if (std.mem.startsWith(u8, event.getSubject(), Config.Nats.kv_subject_prefix)) {
                 // If there are pending CDC events, flush them first to preserve order
                 if (cdc_indices.items.len > 0) {
                     try self.publishCDCSubBatch(cdc_indices.items);

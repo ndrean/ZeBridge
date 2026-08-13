@@ -535,7 +535,7 @@ pub const EventProcessor = struct {
                     "{{\"table\":\"{s}\",\"dropped\":true,\"lsn\":{d}}}",
                     .{ clean_table, wal_end },
                 );
-                const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
+                const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
                 const msg_id = try std.fmt.allocPrint(arena, "schema-drop-{s}-{d}", .{ clean_table, wal_end });
 
                 var drop_cols: std.ArrayList(pgoutput.Column) = .empty;
@@ -638,7 +638,7 @@ pub const EventProcessor = struct {
         try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{wal_end}));
 
         // Create subject: $KV.schemas.{table}
-        const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
+        const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
         const msg_id = try std.fmt.allocPrint(arena, "schema-{s}-{d}", .{clean_table, wal_end});
 
         var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
@@ -785,7 +785,7 @@ pub const EventProcessor = struct {
             try json_str.appendSlice(arena, "}");
             try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{boot_lsn}));
 
-            const kv_subject = try std.fmt.allocPrint(arena, "$KV.schemas.{s}", .{clean_table});
+            const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
             const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}", .{clean_table});
             
             var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;

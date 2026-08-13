@@ -72,6 +72,14 @@ pub const Nats = struct {
     /// Schema KV bucket name
     pub const schema_kv_bucket = topology.kv_schemas;
 
+    /// JetStream exposes a KV bucket as the subject space $KV.<bucket>.<key>, so a
+    /// bucket is written by publishing to that subject. Single-sourced from topology:
+    /// these used to be hardcoded "$KV.schemas.{s}" literals in four places, which
+    /// meant renaming the bucket in topology.json changed the server and the config
+    /// constants but NOT what the bridge actually published.
+    pub const kv_subject_prefix = "$KV.";
+    pub const kv_schemas_subject_pattern = kv_subject_prefix ++ topology.kv_schemas ++ ".{s}";
+
     pub const publisher_max_wait = 10_000; // 10 seconds
 
     /// JetStream stream default configuration

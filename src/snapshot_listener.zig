@@ -563,7 +563,7 @@ pub const SnapshotListener = struct {
         defer allocator.free(encoded);
 
         // Publish to $KV.schemas.{table_name} subject to populate the KV bucket!
-        const subject = try std.fmt.allocPrint(allocator, "$KV.schemas.{s}", .{table_only});
+        const subject = try std.fmt.allocPrint(allocator, config.Nats.kv_schemas_subject_pattern, .{table_only});
         defer allocator.free(subject);
 
         core.PUB(subject, null, encoded) catch |err| {
