@@ -490,7 +490,6 @@ pub const SnapshotListener = struct {
     thread: ?std.Thread = null,
     format: encoder_mod.Format,
     chunk_size: usize,
-    snap_retention_seconds: i64,
     io: std.Io,
     nats_host: []const u8,
     nats_port: u16,
@@ -522,7 +521,6 @@ pub const SnapshotListener = struct {
             .nats_port = nats_port,
             .nats_seed = runtime_config.nats_seed,
             .chunk_size = runtime_config.snapshot_chunk_size,
-            .snap_retention_seconds = runtime_config.snapshot_retention_seconds,
         };
     }
 
@@ -574,7 +572,6 @@ pub const SnapshotListener = struct {
             self.refused,
             self.format,
             self.chunk_size,
-            self.snap_retention_seconds,
             self.io,
             self.nats_host,
             self.nats_port,
@@ -648,7 +645,7 @@ pub const SnapshotListener = struct {
             // Listen for schema requests
             while (!should_stop.load(.acquire)) {
                 if (core.connection) |conn| {
-                    const msg = conn.waitMessageNMT(nats.protocol.SECNS * 5, null) catch |err| {
+                    const msg = conn.waitMessageNMT(nats.protocol.SECNS / 2, null) catch |err| {
                         if (err == error.Timeout) {
                             continue; // Normal timeout, keep polling
                         }
@@ -914,18 +911,12 @@ pub const SnapshotListener = struct {
         refused: *const refused_tables.Registry,
         format: encoder_mod.Format,
         chunk_size: usize,
-        snap_retention_seconds: i64,
         io: std.Io,
         nats_host: []const u8,
         nats_port: u16,
         nats_seed: ?[]const u8,
     ) void {
         const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
-
-        // Declared outside the reconnect loop so a NATS blip does not throw away what
-        // we know about existing snapshots and trigger a fresh COPY storm.
-        var snapshot_cache = SnapshotCache.init(allocator);
-        defer snapshot_cache.deinit();
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
@@ -960,7 +951,7 @@ pub const SnapshotListener = struct {
             // Listen for snapshot requests
             while (!should_stop.load(.acquire)) {
                 if (core.connection) |conn| {
-                    const msg = conn.waitMessageNMT(nats.protocol.SECNS * 5, null) catch |err| {
+                    const msg = conn.waitMessageNMT(nats.protocol.SECNS / 2, null) catch |err| {
                         if (err == error.Timeout) {
                             continue; // Normal timeout, keep polling
                         }
@@ -1032,22 +1023,6 @@ pub const SnapshotListener = struct {
                     };
                     defer allocator.free(snapshot_id);
 
-                    // Is a recent snapshot already in the INIT stream? If so, answer with
-                    // its metadata rather than running another COPY. This is what makes a
-                    // hundred reconnecting clients cost one COPY instead of a hundred.
-                    if (snapshot_cache.fresh(table_name, snap_retention_seconds)) |entry| {
-                        log.info("📸 Reusing snapshot for '{s}' (id={s}, {d} rows) — within {d}s window", .{
-                            table_name,
-                            entry.snapshot_id,
-                            entry.row_count,
-                            snap_retention_seconds,
-                        });
-                        publishSnapshotMetaCore(allocator, &core, table_name, entry, format) catch |err| {
-                            log.err("📸 Failed to re-publish cached meta for '{s}': {}", .{ table_name, err });
-                        };
-                        continue;
-                    }
-
                     log.info("📸 Generating snapshot for '{s}' (id={s})", .{ table_name, snapshot_id });
 
                     // Generate snapshot using pure g41797/nats JetStream
@@ -1079,18 +1054,6 @@ pub const SnapshotListener = struct {
                         continue;
                     };
                     defer allocator.free(result.lsn_text);
-
-                    snapshot_cache.put(
-                        table_name,
-                        snapshot_id,
-                        result.lsn_text,
-                        result.batch_count,
-                        result.row_count,
-                    ) catch |err| {
-                        // Not fatal: the snapshot was published, we just will not be able
-                        // to reuse it and the next request regenerates.
-                        log.warn("📸 Could not cache snapshot for '{s}': {}", .{ table_name, err });
-                    };
 
                     log.info("📸 ✅ Snapshot completed for '{s}'", .{table_name});
                 } else {

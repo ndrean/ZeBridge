@@ -6,7 +6,7 @@ import { SQLocal } from 'sqlocal';
 
 const NATS_URL = 'ws://localhost:8080';
 const NKEY_SEED = 'SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q';
-const { sql } = new SQLocal('zebridge.sqlite3');
+const { sql } = new SQLocal(`zebridge_${Date.now()}.sqlite3`);
 const sc = StringCodec();
 
 // Columns hidden from the *_view convenience views (still stored in the table).
@@ -85,6 +85,7 @@ export default function App() {
   };
 
   const initNats = async () => {
+    console.log('App.tsx: initNats called!');
     await initSyncState();
 
     if (nc) {
@@ -426,10 +427,11 @@ export default function App() {
                    needsRequest = false;
 
                    // Create ephemeral JetStream consumer to pull chunks for THIS specific snapshot ID
-                   const replayConsumer = await js.consumers.get(topology.streams.init, {
-                     filterSubjects: `init.snap.${table}.${desc.snapshot_id}.>`,
-                     deliver_policy: DeliverPolicy.All, // DeliverPolicy.All (replay from beginning)
+                   const ci = await jsm.consumers.add(topology.streams.init, {
+                     filter_subject: `init.snap.${table}.${desc.snapshot_id}.>`,
+                     deliver_policy: DeliverPolicy.All,
                    });
+                   const replayConsumer = await js.consumers.get(topology.streams.init, ci.name);
                    
                    // Start asynchronous pull loop for this replay
                    (async () => {
@@ -485,23 +487,28 @@ export default function App() {
 
     // 2. Start JetStream Consumer
     try {
-      const consumer = await js.consumers.get(topology.streams.cdc, {
-        filterSubjects: `${topology.subjects.cdc_prefix}.>`,
+      console.log('App.tsx: Starting CDC consumer on subject:', `${topology.subjects.cdc_prefix}.>`);
+      const ci = await jsm.consumers.add(topology.streams.cdc, {
+        filter_subject: `${topology.subjects.cdc_prefix}.>`,
         deliver_policy: globalSyncState.seq > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
         opt_start_seq: globalSyncState.seq > 0 ? globalSyncState.seq + 1 : undefined,
       });
+      const consumer = await js.consumers.get(topology.streams.cdc, ci.name);
 
+      console.log('App.tsx: CDC Consumer started! Iterating messages...');
       const iter = await consumer.consume();
       (async () => {
         for await (const msg of iter) {
           let decoded: any;
           try { decoded = decode(msg.data); } catch { decoded = sc.decode(msg.data); }
+          console.log('App.tsx: Received CDC message!', msg.subject, decoded);
           const events = Array.isArray(decoded) ? decoded : [decoded];
 
           for (const ev of events) {
             // Embed sequence number so applyEvent can save it
             ev.seq = msg.seq;
             const table = ev?.table || msg.subject.split('.')[1];
+            appendLog(msg.subject, ev, ev?.operation || 'CDC');
             if (table) await applyEvent(table, ev);
           }
           msg.ack();
@@ -582,24 +589,25 @@ export default function App() {
   const publishMutation = () => {
     if (!nc) return;
     const table = 'test_types';
+    const op = 'INSERT';
+    const id = Math.floor(Math.random() * 10000) + 1000;
     const payload = {
       table,
-      operation: 'INSERT',
+      operation: op,
+      primary_key: { id },
       data: {
-        id: Math.floor(Math.random() * 10000) + 1000,
+        id,
         some_text: 'Manual Button Simulator!',
         age: 42,
         price: 99.99,
-        is_true: 1,
-        tags: ['manual', 'test'],
-        matrix: [[1, 2], [3, 4]]
+        is_true: true
       },
-      lsn: 9999999,
-      msg_id: `sim-${Math.random().toString(36).substring(2, 9)}`
+      hlc: `${Date.now()}-0001`,
+      msg_id: `mut-${Math.random().toString(36).substring(2, 9)}`
     };
 
-    nc.publish(`cdc.${table}.insert`, encode(payload));
-    appendLog(`cdc.${table}.insert`, payload, 'SIMULATE');
+    nc.publish(`mutation.${table}.${op.toLowerCase()}`, encode(payload));
+    appendLog(`mutation.${table}.${op.toLowerCase()}`, payload, 'MUTATION OUT');
   };
 
   initNats();
@@ -630,7 +638,7 @@ export default function App() {
 
       <div class="controls">
         <button onClick={queryLocalDb} style="background: #2e7d32;">Query Local DB</button>
-        <button onClick={publishMutation} style="background: #8e24aa;">Simulate CDC Event</button>
+        <button onClick={publishMutation} style="background: #e65100;">Push Mutation to Bridge</button>
         <button onClick={() => setLogs([])}>Clear Logs</button>
       </div>
 
