@@ -70,7 +70,7 @@
 - Consumes: User inputs for `users` and `test_types` tables
 - Produces: Encoded MessagePack mutation payload published to `mutation.<table_name>.<operation>` with HLC timestamp
 
-- [ ] **Step 1: Update `web-consumer/index.html` to add Mutation Form Panel**
+- [x] **Step 1: Update `web-consumer/index.html` to add Mutation Form Panel**
 
 Add a `<section class="mutation-panel">` containing:
 - Table selector (`users` vs `test_types`)
@@ -79,11 +79,11 @@ Add a `<section class="mutation-panel">` containing:
 - Form fields for `test_types` (`id`, `some_text`, `age`, `price`, `is_true`)
 - "Publish Mutation" button
 
-- [ ] **Step 2: Update `web-consumer/src/style.css` for form inputs**
+- [x] **Step 2: Update `web-consumer/src/style.css` for form inputs**
 
 Add simple, readable grid styling for form fields and mutation section.
 
-- [ ] **Step 3: Update `web-consumer/src/main.ts` to process & publish mutation payloads**
+- [x] **Step 3: Update `web-consumer/src/main.ts` to process & publish mutation payloads**
 
 1. Add event listeners for table selection change to toggle field visibility between `users` and `test_types`.
 2. On clicking "Publish Mutation":
@@ -94,12 +94,12 @@ Add simple, readable grid styling for form fields and mutation section.
    - Publish to subject `mutation.<table_name>.<op>`.
    - Append log entry `[MUTATION OUT]` to the log window.
 
-- [ ] **Step 4: Verify TypeScript build**
+- [x] **Step 4: Verify TypeScript build**
 
 Run: `cd web-consumer && pnpm run build`
 Expected: Passes clean with 0 errors.
 
-- [ ] **Step 5: Commit Mutation Panel**
+- [x] **Step 5: Commit Mutation Panel**
 
 ```bash
 git add web-consumer/
