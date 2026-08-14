@@ -28,7 +28,8 @@ postgres-data/
 src/test_files/
 /docs/
 /demo/
-
+.superpowers/
+.expert/
 .DS_Store
 
 examples/01-micro_vm-nodejs/node_modules/
