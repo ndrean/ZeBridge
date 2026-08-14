@@ -58,7 +58,7 @@ flowchart TD
     subgraph Consumers["Consumers & Clients"]
         App["Native App <br> WebApp"]
         Server_Worker["Microservice"]
-        App <--> Local_DB[("Local DB <br> SQLite / PGLite")]
+        App <--> Local_DB[("Local<br> WASM-SQLite <br> PGLite <br> PostgreSQL <br> SQLite")]
         Server_Worker <--> Local_DB
     end
 ```
@@ -92,16 +92,17 @@ Examples:  webapp (WASM-SQLite + OPFS), backend micrservice Elixir & Python, Flu
 
 ### What It Does
 
-**Three-step data flow:**
+**Three data flow:**
 
 1. **Bootstrap** (INIT stream): Consumer requests _schemas_ & table _snapshot_,
 2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen via NATS/JetStream.
-3. (TODO) Ingress flow: Consumer updates his local storage and sends intentions messages to NATS -> Zebridge -> Postgres master.
+3. **Real-time Ingress flow** (MUTATION stream): Consumer updates his local storage and sends intentions messages to NATS -> Zebridge -> Postgres master.
 
 | Stream   | Purpose             | Retention     | Consumer Pattern        |
 | -------- | ------------------- | ------------- | ----------------------- |
-| **CDC**  | Real-time changes   | Short (X min) | Continuous subscription |
+| **CDC**  | Real-time egress changes   | Short (X min) | Continuous subscription |
 | **INIT** | Bootstrap snapshots | Long (X days) | One-time replay         |
+| **MUTATION** | Real-time ingres changes| Short (X min) | Continuous subscription |
 
 Streams have different retention policies. The snapshot request is protected by maximum demand on 1 during `SNAP_RET`.
 The consumer will uses these streams to handle NATS state (the names are defined in _topolgy.json_).
