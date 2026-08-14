@@ -1,5 +1,5 @@
 import { createSignal, onCleanup, For } from 'solid-js';
-import { connect, NatsConnection, StringCodec, nkeyAuthenticator } from 'nats.ws';
+import { connect, NatsConnection, StringCodec, nkeyAuthenticator, DeliverPolicy } from 'nats.ws';
 import { decode, encode } from '@msgpack/msgpack';
 import topology from '../../topology.json';
 import { SQLocal } from 'sqlocal';
@@ -396,23 +396,58 @@ export default function App() {
     }
   };
 
-  const subscribeStreams = () => {
+  const subscribeStreams = async () => {
     if (!nc) return;
+    const js = nc.jetstream();
+    const jsm = await nc.jetstreamManager();
 
-    const cdcSub = nc.subscribe(`${topology.subjects.cdc_prefix}.>`);
-    (async () => {
-      for await (const msg of cdcSub) {
-        let decoded: any;
-        try { decoded = decode(msg.data); } catch { decoded = sc.decode(msg.data); }
-        // A batch message is an array; a single event is an object.
-        const events = Array.isArray(decoded) ? decoded : [decoded];
-
-        for (const ev of events) {
-          const table = ev?.table || msg.subject.split('.')[1];
-          if (table) await applyEvent(table, ev);
+    // 1. Gap Detection
+    try {
+      const streamInfo = await jsm.streams.info(topology.streams.cdc);
+      const firstSeq = streamInfo.state.first_seq;
+      if (firstSeq > 0) {
+        if (globalSyncState.seq > 0 && globalSyncState.seq < streamInfo.state.first_seq - 1) {
+          appendLog('SYS', `Gap detected! Local seq: ${globalSyncState.seq}, Stream first seq: ${streamInfo.state.first_seq}. Snapshots required!`, 'WARNING');
+          // Trigger snapshots for all synced tables
+          for (const table of syncedTables.keys()) {
+            const reqSubject = topology.subjects.snapshot_request.includes('{[table]s}')
+              ? topology.subjects.snapshot_request.replace('{[table]s}', table)
+              : `${topology.subjects.snapshot_request}.${table}`;
+            nc.publish(reqSubject, new Uint8Array(0));
+          }
         }
       }
-    })();
+    } catch (e) {
+      appendLog('SYS', `Failed to check stream gap: ${e}`, 'ERROR');
+    }
+
+    // 2. Start JetStream Consumer
+    try {
+      const consumer = await js.consumers.get(topology.streams.cdc, {
+        filterSubjects: `${topology.subjects.cdc_prefix}.>`,
+        deliver_policy: globalSyncState.seq > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
+        opt_start_seq: globalSyncState.seq > 0 ? globalSyncState.seq + 1 : undefined,
+      });
+
+      const iter = await consumer.consume();
+      (async () => {
+        for await (const msg of iter) {
+          let decoded: any;
+          try { decoded = decode(msg.data); } catch { decoded = sc.decode(msg.data); }
+          const events = Array.isArray(decoded) ? decoded : [decoded];
+
+          for (const ev of events) {
+            // Embed sequence number so applyEvent can save it
+            ev.seq = msg.seq;
+            const table = ev?.table || msg.subject.split('.')[1];
+            if (table) await applyEvent(table, ev);
+          }
+          msg.ack();
+        }
+      })();
+    } catch (e) {
+      appendLog('SYS', `Failed to start CDC consumer: ${e}`, 'ERROR');
+    }
 
     const initSub = nc.subscribe(`${topology.subjects.init_prefix}.>`);
     (async () => {
