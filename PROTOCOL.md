@@ -100,6 +100,7 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 
 ```json
 {
+  "table":  "users",
   "pg":     { "columns": [ { "name": "id", "type": "bigint" }, … ] },
   "sqlite": { "columns": [ { "name": "id", "type": "INTEGER" }, … ],
               "pk": "id" },
@@ -107,6 +108,13 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 }
 ```
 
+Root keys are exactly `table`, `pg`, `sqlite`, `lsn`.
+
+- `table` duplicates the KV key. The **key remains authoritative** — if they ever
+  disagree, trust the key. The field exists so the value is self-describing like every
+  other payload in the protocol (CDC events, snapshot chunks, and this schema's own
+  tombstone all carry `table`), which matters once a payload travels without its key:
+  logs, caches, forwarding.
 - `pg.columns[].type` is `information_schema.data_type` verbatim (`bigint`,
   `character varying`, `timestamp without time zone`, `numeric`, …).
 - `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
@@ -124,6 +132,23 @@ CDC path also delivers numerics as **strings**, so `REAL` would contradict the d
 `float4`/`float8`/`real`/`double precision` do map to `REAL` — those are genuine
 IEEE-754. Everything unrecognised falls back to `TEXT`.
 
+### Three states, and a client must distinguish all three
+
+A value in the `schemas` bucket is one of three things. They are distinguished by
+root-level flags, and a client that collapses them will either lose data or hang:
+
+| value | meaning | client action |
+| --- | --- | --- |
+| has `sqlite.columns` | live schema | create or migrate the local table |
+| `"dropped": true` | table is **gone** upstream | drop the local table |
+| `"suspended": true` | table **exists but is not replicating** | freeze: keep local rows, stop expecting events |
+
+⚠️ **`suspended` is not `dropped`.** Treating a suspension as a tombstone destroys the
+client's rows over what is usually a migration mistake that will be fixed in minutes —
+and the client cannot re-seed afterwards, since a suspended table serves no snapshot
+either. Treating it as a live schema is the opposite failure: the table looks healthy
+and silently never updates again.
+
 ### Tombstones
 
 ```json
@@ -135,6 +160,33 @@ deleted key is indistinguishable from "never seen", so a client that connects af
 the DROP would never learn the table is gone. On receiving this, drop the local
 table. (A client should *also* handle a genuine KV `DEL`/`PURGE` as a drop, since an
 operator may purge a key manually.)
+
+### Suspensions
+
+```json
+{ "table": "t_nopk", "suspended": true, "reason": "no_primary_key", "lsn": 25722184 }
+```
+
+Published when the bridge refuses a table — today, only for `no_primary_key` (§8).
+Like a tombstone it carries **no columns**, because a client must not build a table
+from it. Unlike a tombstone the table still exists in PostgreSQL, and the suspension
+lifts by itself the moment the shape is fixed.
+
+While a table is suspended:
+
+- its CDC events are **dropped at the bridge** — nothing reaches the `CDC` stream;
+- a `snapshot.request.<table>` is answered with `error_type: "table_refused"` (§6);
+- the previous live schema is **overwritten** by this value, so a client connecting
+  later cannot read a stale shape and build a table that will never receive rows.
+
+`lsn` is the position replication stopped at. A client already holding rows is
+internally consistent as of that LSN — its data and its schema agree, and nothing
+further will contradict them. That is why freezing is correct and dropping is not.
+
+**Recovery** needs no special signal: when a primary key is added, the DDL event
+produces an ordinary live schema on the same key. A client should treat "a schema with
+columns arrived for a suspended table" as resume, migrate normally, and re-seed if it
+needs to.
 
 ---
 
@@ -255,8 +307,8 @@ stateDiagram-v2
     Ready --> Ready: row, all columns known → apply
     Ready --> Holding: row has unknown column
     Holding --> Ready: newer schema arrives<br/>→ migrate → drain
-    Ready --> Rebuilding: schema removes a column
-    Rebuilding --> Ready: local table recreated<br/>(replica lost → re-seed)
+    Ready --> Rebuilding: change SQLite cannot do in place
+    Rebuilding --> Ready: recreate + copy common columns<br/>(data preserved)
     Ready --> [*]: tombstone → drop table
 ```
 
@@ -281,10 +333,33 @@ Prefer **additive** migrations (`ALTER TABLE ADD COLUMN`) so local rows survive.
 Rebuilding on every schema push wipes the replica, which both loses data and hides
 loss — "the client survived" becomes trivially true.
 
-A removed column forces a rebuild; the client then has no data and must re-seed
-(§6, 🚧). ⚠️ A **`RENAME COLUMN`** appears as one removed + one added and therefore
-forces a rebuild, even though PostgreSQL performed it in ~10 ms without touching a
-row. There is currently no rename hint in the payload (`NOTES.md` §1.2).
+⚠️ **A removed column does NOT require discarding local data.** SQLite has
+`ALTER TABLE DROP COLUMN` (3.35+) and `RENAME COLUMN` (3.25+); PostgreSQL supports
+considerably more. Most schema changes apply in place:
+
+| change | action | local rows |
+| --- | --- | --- |
+| column added | `ADD COLUMN` | preserved |
+| column removed (plain) | `DROP COLUMN` | preserved |
+| column removed (PK / UNIQUE / indexed) | SQLite refuses → rebuild | preserved, if you copy |
+| type change | SQLite cannot → rebuild | preserved, if you copy |
+
+And **"rebuild" must mean recreate-and-copy, not `DROP TABLE`**:
+
+```sql
+CREATE TABLE t_new (...);
+INSERT INTO t_new (common) SELECT common FROM t;
+DROP TABLE t;
+ALTER TABLE t_new RENAME TO t;
+```
+
+Everything the two schemas share survives. A schema change should therefore
+**never** trigger a re-seed — re-seeding is for a CDC gap (§6), not for DDL.
+
+⚠️ A **`RENAME COLUMN`** still appears as one removed + one added, because the
+payload carries no rename hint (`NOTES.md` §1.2). The other columns survive; the
+renamed column's values do not. That is the one avoidable loss in this table, and it
+is a protocol gap rather than a storage limitation.
 
 ---
 
@@ -318,7 +393,19 @@ KV is a **materialised view of the latest value per key**. That fits *state*
 | `init.snap.start.<table>` | `{snapshot_id, table, lsn, timestamp, status:"starting", format}` |
 | `init.snap.<table>.<snapshot_id>.<chunk>` | `{table, operation:"snapshot", snapshot_id, chunk, lsn, data:[…]}` |
 | `init.snap.meta.<table>` | `{snapshot_id, table, lsn, timestamp, batch_count, row_count}` |
-| `init.snap.error.<table>` | `{snapshot_id, table, timestamp, status:"failed", …}` |
+| `init.snap.error.<table>` | `{table, timestamp, status:"failed", error_type, error_message, available_tables}` |
+
+`error_type` is the machine-readable discriminator; branch on it, not on
+`error_message`:
+
+| `error_type` | meaning | client action |
+| --- | --- | --- |
+| `table_refused` | table has no primary key — replication suspended (§3, §8) | do not retry; wait for a live schema on the KV key |
+| `table_not_monitored` | table is not in the publication this bridge replicates | do not retry; check `available_tables` |
+| `generation_failed` | the `COPY` failed (permissions, lock, connection) | retry with backoff |
+
+⚠️ `table_refused` and `table_not_monitored` are **not** retryable — retrying either
+is a busy-loop against a condition only a migration or a config change will clear.
 
 Chunks default to 10 000 rows. `meta` arrives **after** all chunks and states how
 many to expect.
@@ -326,6 +413,74 @@ many to expect.
 Requires a **single-column primary key**: chunking uses keyset pagination
 (`WHERE pk > $last ORDER BY pk LIMIT n`). Composite or absent PKs cannot be
 snapshotted — the bridge warns about this at startup (§8).
+
+### The connection flow
+
+Run on every connect and reconnect. The **gap decides** whether a snapshot is needed;
+the snapshot's existence only decides whether one must be generated.
+
+```mermaid
+flowchart TD
+    A[connect] --> B["schema ← KV.get(table)<br/>migrate local in place"]
+    B --> C{"cl exists AND<br/>cl >= oldest_cdc_lsn ?"}
+    C -->|yes| Z["resume CDC from cl"]
+    C -->|"no — first run, or gap"| D{"snapshot exists AND<br/>s >= oldest_cdc_lsn ?"}
+    D -->|yes| E["truncate local<br/>apply chunks<br/>cl ← s"]
+    D -->|"no snapshot, or<br/>snapshot too old"| F["publish snapshot.request<br/>(coalesced) · wait"]
+    F --> E
+    E --> Z
+    Z --> Y["per-event rule (§5)"]
+```
+
+In pseudocode:
+
+```
+if cl exists and cl >= oldest_cdc_lsn:
+    accept CDC from cl                       # common path
+else:
+    if snapshot exists and s >= oldest_cdc_lsn:
+        seed from it
+    else:
+        request snapshot, wait, seed from it # no snapshot, OR a hole between it and CDC
+    accept CDC from cl (= s)
+```
+
+Where `cl` = client's last applied LSN, `s` = snapshot LSN, `oldest_cdc_lsn` = the
+oldest LSN the CDC stream still retains.
+
+**Notes that matter for a correct port:**
+
+- ⚠️ **`cl` may not exist.** First run has no value; test for its presence explicitly
+  rather than relying on a language's comparison semantics for null/undefined.
+- ⚠️ **`>=`, not `>`.** If `cl == oldest_cdc_lsn` you have applied the oldest retained
+  event and everything after it is present. Strict `>` forces a needless re-seed at
+  exactly that boundary.
+- ⚠️ **`s >= oldest_cdc_lsn` must be verified, not assumed.** A snapshot older than the
+  CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been
+  evicted. You land in a hole immediately, silently. This is the client-side check for
+  the `CDC_RET > SNAP_RET + T_apply` invariant.
+- ⚠️ **Truncate before applying a snapshot**, do not merge. A snapshot names only rows
+  that *exist*; rows deleted while you were away are never mentioned, so an upsert-only
+  apply leaves them behind forever.
+- A schema change **never** triggers this flow. Migrations apply in place (§5);
+  re-seeding is for a CDC gap only.
+
+### Resuming in practice
+
+LSNs are a PostgreSQL concept; JetStream indexes by **stream sequence**. So persist
+both:
+
+| stored | used for |
+| --- | --- |
+| `last_applied_lsn` | the gap check above, and the hold/strip rule in §5 |
+| `last_stream_seq` | resuming: `DeliverPolicy.ByStartSequence(last_stream_seq + 1)` |
+
+The gap check is then a cheap `stream info`: `last_stream_seq >= state.first_seq - 1`.
+
+Keeping the sequence client-side allows **ephemeral** consumers. A durable consumer
+would have NATS track the position server-side, but that is per-client state on the
+server — thousands of mobile clients means thousands of consumer objects to create,
+leak and expire. Client-stored position keeps the server stateless.
 
 ### Open before this is contractual
 
@@ -368,19 +523,38 @@ What it does **not** promise:
 
 ## 8. Table requirements
 
-Checked at bridge startup (`src/preflight.zig`), reported not enforced:
+Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 
 | table shape | consequence |
 | --- | --- |
 | single-column PK + `DEFAULT` | ✅ full support |
 | single-column PK + `FULL` | ✅ full support, plus `old.*` and transitions |
-| no PK + `DEFAULT`/`NOTHING` | 🔴 **PostgreSQL rejects UPDATE/DELETE outright** — INSERTs still work |
-| no PK + `FULL` | ⚠️ CDC works; snapshots impossible |
-| composite PK | ⚠️ CDC works; snapshots impossible |
+| composite PK | ✅ CDC fully supported; ⚠️ snapshots not yet implemented |
+| **no PK, any replica identity** | 🔴 **refused** — suspended, events dropped |
 | `TRANSITION_RULES` without `FULL` | ⚠️ transitions can never fire — silently inert |
 
+**A table with no primary key is refused, not warned about.** Without a key a row
+cannot be identified, so a DELETE could only be expressed as a full-row match — which
+removes *every* duplicate where PostgreSQL removed one — and under at-least-once
+delivery a redelivered INSERT has nothing to upsert on, so it duplicates. Neither is
+fixable on the client. The bridge therefore publishes a suspension (§3), drops the
+table's CDC events, and refuses its snapshots, while every other table keeps
+replicating. Fix it with a migration adding a primary key; recovery is automatic and
+needs no restart.
+
+`--strict-tables` inverts the default and refuses to *start* if any published table
+lacks a key. Useful as a CI or staging gate, wrong as a default: one keyless table
+would otherwise stop replication for every table, and a table created while the bridge
+runs would turn a schema mistake into an outage.
+
+**A composite primary key is never refused.** It identifies rows exactly, so CDC is
+fully correct; only snapshot pagination is unimplemented (it needs row-value keyset
+comparison). That is a gap on our side, not a broken schema.
+
 `REPLICA IDENTITY FULL` multiplies WAL volume on wide tables, so `DEFAULT` is a
-legitimate trade. The decision is **per table** and belongs in your migrations.
+legitimate trade. The decision is **per table** and belongs in your migrations. Note
+that `FULL` does *not* rescue a keyless table: it satisfies PostgreSQL's own
+UPDATE/DELETE check, but a replica still cannot identify a row.
 
 ---
 

@@ -9,6 +9,7 @@ const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
+const refused_tables = @import("refused_tables.zig");
 const publication_mod = @import("publication.zig");
 const config = @import("config.zig");
 const msgpack = @import("msgpack");
@@ -20,6 +21,196 @@ const nats = @import("nats");
 const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.snapshot_listener);
+
+
+
+/// What the bridge remembers about the most recent snapshot of one table.
+///
+/// This is what decouples database load from client count. Without it, every
+/// `snapshot.request` runs a fresh COPY, so a hundred clients reconnecting after a
+/// network blip means a hundred concurrent COPYs against the primary. With it they
+/// share one.
+///
+/// Note there is deliberately no `in_flight` flag: generation happens synchronously
+/// inside the request loop, so while one snapshot runs the listener is not reading
+/// new requests — they queue in NATS. By the time the second request is processed the
+/// entry is fresh, and the freshness check alone collapses the stampede.
+const SnapshotCacheEntry = struct {
+    snapshot_id: []const u8, // owned
+    lsn_text: []const u8, // owned; the LSN as published, e.g. "0/1816690"
+    batch_count: u32,
+    row_count: u64,
+    generated_at: i64, // unix seconds
+
+    fn deinit(self: *const SnapshotCacheEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.snapshot_id);
+        allocator.free(self.lsn_text);
+    }
+};
+
+/// What a completed snapshot reports back, so the cache can answer later requests
+/// without re-running the COPY. `lsn_text` is owned by the caller's allocator: inside
+/// the generator it points into a PGresult that is cleared on return.
+const SnapshotResult = struct {
+    lsn_text: []const u8,
+    batch_count: u32,
+    row_count: u64,
+};
+
+/// table name -> most recent snapshot. Owned keys.
+const SnapshotCache = struct {
+    map: std.StringHashMap(SnapshotCacheEntry),
+    allocator: std.mem.Allocator,
+
+    fn init(allocator: std.mem.Allocator) SnapshotCache {
+        return .{ .map = std.StringHashMap(SnapshotCacheEntry).init(allocator), .allocator = allocator };
+    }
+
+    fn deinit(self: *SnapshotCache) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit(self.allocator);
+        }
+        self.map.deinit();
+    }
+
+    /// Is there a snapshot for this table younger than `retention_seconds`?
+    fn fresh(self: *const SnapshotCache, table: []const u8, retention_seconds: i64) ?SnapshotCacheEntry {
+        const entry = self.map.get(table) orelse return null;
+        const age = @as(i64, @intCast(c.time(null))) - entry.generated_at;
+        if (age >= retention_seconds) return null;
+        return entry;
+    }
+
+    fn put(
+        self: *SnapshotCache,
+        table: []const u8,
+        snapshot_id: []const u8,
+        lsn_text: []const u8,
+        batch_count: u32,
+        row_count: u64,
+    ) !void {
+        const id_owned = try self.allocator.dupe(u8, snapshot_id);
+        errdefer self.allocator.free(id_owned);
+        const lsn_owned = try self.allocator.dupe(u8, lsn_text);
+        errdefer self.allocator.free(lsn_owned);
+
+        const gop = try self.map.getOrPut(table);
+        if (gop.found_existing) {
+            gop.value_ptr.deinit(self.allocator);
+        } else {
+            // getOrPut stored the caller's slice as the key; replace with a copy we own.
+            gop.key_ptr.* = self.allocator.dupe(u8, table) catch |err| {
+                _ = self.map.remove(table);
+                return err;
+            };
+        }
+        gop.value_ptr.* = .{
+            .snapshot_id = id_owned,
+            .lsn_text = lsn_owned,
+            .batch_count = batch_count,
+            .row_count = row_count,
+            .generated_at = @intCast(c.time(null)),
+        };
+    }
+};
+
+
+/// Re-publish an existing snapshot's metadata over a Core connection.
+///
+/// Used when a request arrives for a table whose snapshot is still fresh. The chunks
+/// are already in the INIT stream, so no COPY is needed — but the requester must still
+/// be told where they are, otherwise skipping regeneration means answering with
+/// silence and the client waits forever.
+fn publishSnapshotMetaCore(
+    allocator: std.mem.Allocator,
+    core: *nats.Core,
+    table_name: []const u8,
+    entry: SnapshotCacheEntry,
+    format: encoder_mod.Format,
+) !void {
+    const subject = try std.fmt.allocPrint(
+        allocator,
+        config.Snapshot.meta_subject_pattern,
+        .{ .table = table_name },
+    );
+    defer allocator.free(subject);
+
+    var encoder = encoder_mod.Encoder.init(allocator, format);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    const lsn_int = parsePgLsn(entry.lsn_text) catch 0;
+
+    try map.put(encoder.allocator, "snapshot_id", try encoder.createString(entry.snapshot_id));
+    try map.put(encoder.allocator, "table", try encoder.createString(table_name));
+    try map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
+    try map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+    try map.put(encoder.allocator, "batch_count", encoder.createInt(@intCast(entry.batch_count)));
+    try map.put(encoder.allocator, "row_count", encoder.createInt(@intCast(entry.row_count)));
+    // Distinguishes "here is the snapshot I just made" from "here is one I made earlier".
+    try map.put(encoder.allocator, "cached", encoder.createBool(true));
+
+    const payload = try encoder.encode(map);
+    defer allocator.free(payload);
+
+    try core.PUB(subject, null, payload);
+}
+
+/// Publish a snapshot error over a Core connection.
+///
+/// The live listener holds only a Core connection, but `init.snap.error.<table>` is a
+/// subject the INIT stream captures, so a core publish is stored exactly like a
+/// JetStream one — the only thing given up is the publish ack, which is acceptable for
+/// an error notification.
+///
+/// This exists because the alternative was `continue`: a client that published a
+/// request and got neither data nor error waits forever. Silence is the worst possible
+/// answer to a request.
+fn publishSnapshotErrorCore(
+    allocator: std.mem.Allocator,
+    core: *nats.Core,
+    table_name: []const u8,
+    error_type: []const u8,
+    error_message: []const u8,
+    available_tables: []const []const u8,
+    format: encoder_mod.Format,
+) !void {
+    const subject = try std.fmt.allocPrint(
+        allocator,
+        config.Snapshot.error_subject_pattern,
+        .{ .table = table_name },
+    );
+    defer allocator.free(subject);
+
+    var encoder = encoder_mod.Encoder.init(allocator, format);
+    defer encoder.deinit();
+
+    var map = encoder.createMap();
+    defer map.free(allocator);
+
+    try map.put(encoder.allocator, "table", try encoder.createString(table_name));
+    try map.put(encoder.allocator, "status", try encoder.createString("failed"));
+    try map.put(encoder.allocator, "error_type", try encoder.createString(error_type));
+    try map.put(encoder.allocator, "error_message", try encoder.createString(error_message));
+    try map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+
+    // Tell the client what it *could* have asked for — the usual cause is a typo or a
+    // table outside the publication.
+    var tables_array = try encoder.createArray(available_tables.len);
+    for (available_tables, 0..) |t, i| {
+        try tables_array.setIndex(i, try encoder.createString(t));
+    }
+    try map.put(encoder.allocator, "available_tables", tables_array);
+
+    const payload = try encoder.encode(map);
+    defer allocator.free(payload);
+
+    try core.PUB(subject, null, payload);
+}
 
 /// Publish to NATS JetStream with retry logic and exponential backoff
 /// Matches the retry strategy used in batch_publisher.zig for consistency
@@ -172,6 +363,7 @@ const SnapshotContext = struct {
     pg_config: *const pg_conn.PgConf,
     js: *nats.JS, // JetStream connection for publishing
     monitored_tables: []const []const u8,
+    refused: *const refused_tables.Registry,
     format: encoder_mod.Format,
     chunk_size: usize,
     // js_ctx: ?*anyopaque, // JetStream context for KV access (optional)
@@ -183,9 +375,11 @@ pub const SnapshotListener = struct {
     pg_config: *const pg_conn.PgConf,
     should_stop: *std.atomic.Value(bool),
     monitored_tables: []const []const u8,
+    refused: *const refused_tables.Registry,
     thread: ?std.Thread = null,
     format: encoder_mod.Format,
     chunk_size: usize,
+    snap_retention_seconds: i64,
     io: std.Io,
     nats_host: []const u8,
     nats_port: u16,
@@ -197,6 +391,7 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
+        refused: *const refused_tables.Registry,
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
         io: std.Io,
@@ -208,6 +403,7 @@ pub const SnapshotListener = struct {
             .pg_config = pg_config,
             .should_stop = should_stop,
             .monitored_tables = monitored_tables,
+            .refused = refused,
             .thread = null,
             .format = format,
             .io = io,
@@ -215,6 +411,7 @@ pub const SnapshotListener = struct {
             .nats_port = nats_port,
             .nats_seed = runtime_config.nats_seed,
             .chunk_size = runtime_config.snapshot_chunk_size,
+            .snap_retention_seconds = runtime_config.snapshot_retention_seconds,
         };
     }
 
@@ -248,6 +445,7 @@ pub const SnapshotListener = struct {
             self.pg_config,
             self.should_stop,
             self.monitored_tables,
+            self.refused,
             self.format,
             self.io,
             self.nats_host,
@@ -262,8 +460,10 @@ pub const SnapshotListener = struct {
             self.pg_config,
             self.should_stop,
             self.monitored_tables,
+            self.refused,
             self.format,
             self.chunk_size,
+            self.snap_retention_seconds,
             self.io,
             self.nats_host,
             self.nats_port,
@@ -299,6 +499,7 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
+        refused: *const refused_tables.Registry,
         format: encoder_mod.Format,
         io: std.Io,
         nats_host: []const u8,
@@ -355,6 +556,7 @@ pub const SnapshotListener = struct {
                         &core,
                         pg_config,
                         monitored_tables,
+                        refused,
                         format,
                     ) catch |err| {
                         log.err("📋 Failed to handle schema request: {}", .{err});
@@ -375,6 +577,7 @@ pub const SnapshotListener = struct {
         core: *nats.Core,
         pg_config: *const pg_conn.PgConf,
         monitored_tables: []const []const u8,
+        refused: *const refused_tables.Registry,
         format: encoder_mod.Format,
     ) !void {
         // Create PostgreSQL connection
@@ -394,9 +597,8 @@ pub const SnapshotListener = struct {
         defer in_clause.deinit(allocator);
 
         try in_clause.appendSlice(allocator, "(");
-        for (monitored_tables, 0..) |table, i| {
-            if (i > 0) try in_clause.appendSlice(allocator, ", ");
-
+        var listed: usize = 0;
+        for (monitored_tables) |table| {
             // Extract table name if it's "schema.table" format
             const table_name = blk: {
                 if (std.mem.indexOf(u8, table, ".")) |idx| {
@@ -404,6 +606,19 @@ pub const SnapshotListener = struct {
                 }
                 break :blk table;
             };
+
+            // Withhold refused tables here too. This is the third schema publisher
+            // (boot pass, DDL path, and this on-demand responder); a guard on two of
+            // three still leaks a live schema for a table that will never send rows.
+            if (refused.isRefused(table_name)) {
+                log.warn("📋 Withholding schema for refused table '{s}' (no primary key)", .{table_name});
+                continue;
+            }
+
+            // Counted separately from the loop index: skipping a table must not leave a
+            // dangling comma in the IN clause.
+            if (listed > 0) try in_clause.appendSlice(allocator, ", ");
+            listed += 1;
 
             try in_clause.appendSlice(allocator, "'");
             try in_clause.appendSlice(allocator, table_name);
@@ -585,14 +800,21 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
+        refused: *const refused_tables.Registry,
         format: encoder_mod.Format,
         chunk_size: usize,
+        snap_retention_seconds: i64,
         io: std.Io,
         nats_host: []const u8,
         nats_port: u16,
         nats_seed: ?[]const u8,
     ) void {
         const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
+
+        // Declared outside the reconnect loop so a NATS blip does not throw away what
+        // we know about existing snapshots and trigger a fresh COPY storm.
+        var snapshot_cache = SnapshotCache.init(allocator);
+        defer snapshot_cache.deinit();
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
@@ -608,11 +830,15 @@ pub const SnapshotListener = struct {
             };
             defer core.DISCONNECT();
 
-            log.info("📸 Snapshot listener: Connected! Subscribing to 'init.snapshot.>'...", .{});
+            log.info("📸 Snapshot listener: Connected! Subscribing to '{s}'...", .{config.Snapshot.request_subject_wildcard});
 
             // Subscribe to init.snapshot.> wildcard
             const sid = "snapshot-listener-1";
-            core.SUB("init.snapshot.>", null, sid) catch |err| {
+            // Subject comes from topology.json. This was hardcoded as "init.snapshot.>"
+            // while topology (and PROTOCOL.md) declare "snapshot.request.>", so a client
+            // following the documented contract published into a subject nothing was
+            // listening on — the request simply vanished.
+            core.SUB(config.Snapshot.request_subject_wildcard, null, sid) catch |err| {
                 log.err("📸 Snapshot listener: Failed to subscribe: {} - reconnecting", .{err});
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
@@ -640,7 +866,7 @@ pub const SnapshotListener = struct {
                     };
 
                     const table_name = blk: {
-                        const prefix = "init.snapshot.";
+                        const prefix = config.Snapshot.request_subject_prefix;
                         if (std.mem.startsWith(u8, subject, prefix)) {
                             break :blk subject[prefix.len..];
                         }
@@ -650,12 +876,41 @@ pub const SnapshotListener = struct {
 
                     log.info("📸 Snapshot request received for table: {s}", .{table_name});
 
+                    // A refused table is in the publication but has no schema in KV, so
+                    // seeding from it would populate a client table built from a shape
+                    // Postgres no longer has. Checked before monitoring, because
+                    // "refused" is the more specific and more actionable answer.
+                    if (refused.isRefused(table_name)) {
+                        log.warn("📸 Table '{s}' is refused (no primary key) — publishing error", .{table_name});
+                        publishSnapshotErrorCore(
+                            allocator,
+                            &core,
+                            table_name,
+                            "table_refused",
+                            "Table has no primary key: replication is suspended, so no snapshot can be served",
+                            monitored_tables,
+                            format,
+                        ) catch |err| {
+                            log.err("📸 Failed to publish snapshot error for '{s}': {}", .{ table_name, err });
+                        };
+                        continue;
+                    }
+
                     // Validate table is monitored
                     const is_monitored = publication_mod.isTableMonitored(table_name, monitored_tables);
                     if (!is_monitored) {
-                        log.warn("📸 Table '{s}' not in monitored tables", .{table_name});
-                        // TODO: Implement publishSnapshotErrorZig if needed for error reporting
-                        // For now, just log the error - consumers won't get notification
+                        log.warn("📸 Table '{s}' not in monitored tables — publishing error", .{table_name});
+                        publishSnapshotErrorCore(
+                            allocator,
+                            &core,
+                            table_name,
+                            "table_not_monitored",
+                            "Table is not in the publication this bridge replicates",
+                            monitored_tables,
+                            format,
+                        ) catch |err| {
+                            log.err("📸 Failed to publish snapshot error for '{s}': {}", .{ table_name, err });
+                        };
                         continue;
                     }
 
@@ -666,10 +921,26 @@ pub const SnapshotListener = struct {
                     };
                     defer allocator.free(snapshot_id);
 
+                    // Is a recent snapshot already in the INIT stream? If so, answer with
+                    // its metadata rather than running another COPY. This is what makes a
+                    // hundred reconnecting clients cost one COPY instead of a hundred.
+                    if (snapshot_cache.fresh(table_name, snap_retention_seconds)) |entry| {
+                        log.info("📸 Reusing snapshot for '{s}' (id={s}, {d} rows) — within {d}s window", .{
+                            table_name,
+                            entry.snapshot_id,
+                            entry.row_count,
+                            snap_retention_seconds,
+                        });
+                        publishSnapshotMetaCore(allocator, &core, table_name, entry, format) catch |err| {
+                            log.err("📸 Failed to re-publish cached meta for '{s}': {}", .{ table_name, err });
+                        };
+                        continue;
+                    }
+
                     log.info("📸 Generating snapshot for '{s}' (id={s})", .{ table_name, snapshot_id });
 
                     // Generate snapshot using pure g41797/nats JetStream
-                    generateIncrementalSnapshotZig(
+                    const result = generateIncrementalSnapshotZig(
                         allocator,
                         pg_config,
                         table_name,
@@ -683,9 +954,31 @@ pub const SnapshotListener = struct {
                         nats_seed,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
-                        // TODO: Implement publishSnapshotErrorZig if needed for error reporting
-                        // For now, just log the error - consumers won't get notification
+                        publishSnapshotErrorCore(
+                            allocator,
+                            &core,
+                            table_name,
+                            "generation_failed",
+                            @errorName(err),
+                            monitored_tables,
+                            format,
+                        ) catch |perr| {
+                            log.err("📸 Failed to publish generation error for '{s}': {}", .{ table_name, perr });
+                        };
                         continue;
+                    };
+                    defer allocator.free(result.lsn_text);
+
+                    snapshot_cache.put(
+                        table_name,
+                        snapshot_id,
+                        result.lsn_text,
+                        result.batch_count,
+                        result.row_count,
+                    ) catch |err| {
+                        // Not fatal: the snapshot was published, we just will not be able
+                        // to reuse it and the next request regenerates.
+                        log.warn("📸 Could not cache snapshot for '{s}': {}", .{ table_name, err });
                     };
 
                     log.info("📸 ✅ Snapshot completed for '{s}'", .{table_name});
@@ -712,7 +1005,7 @@ pub const SnapshotListener = struct {
         nats_host: []const u8,
         nats_port: u16,
         nats_seed: ?[]const u8,
-    ) !void {
+    ) !SnapshotResult {
         log.info("📸 Generating snapshot for '{s}' (id={s}, chunk_size={d})", .{
             table_name,
             snapshot_id,
@@ -952,6 +1245,13 @@ pub const SnapshotListener = struct {
             batch,
             total_rows,
         });
+
+        // lsn_str points into a PGresult cleared by a defer above — dupe before returning.
+        return SnapshotResult{
+            .lsn_text = try allocator.dupe(u8, lsn_str),
+            .batch_count = batch,
+            .row_count = total_rows,
+        };
     }
 
     /// Publish snapshot start notification using g41797/nats JetStream
@@ -1797,7 +2097,7 @@ fn publishSnapshotStart(
 }
 
 /// Publish schema (column names) to NATS so consumer knows the array field order
-/// Subject: snapshot.schema.{table_name}.{snapshot_id}
+/// Subject: config.Snapshot.schema_subject_pattern (under init.> so INIT stores it)
 fn publishSchemaZig(
     allocator: std.mem.Allocator,
     js: *nats.JS,
@@ -1829,8 +2129,8 @@ fn publishSchemaZig(
 
     const subject = try std.fmt.allocPrint(
         allocator,
-        "snapshot.schema.{s}.{s}",
-        .{ table_name, snapshot_id },
+        config.Snapshot.schema_subject_pattern,
+        .{ .table = table_name, .snapshot_id = snapshot_id },
     );
     defer allocator.free(subject);
 

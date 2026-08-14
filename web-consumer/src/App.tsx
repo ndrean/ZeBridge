@@ -13,7 +13,13 @@ const sc = StringCodec();
 const EXCLUDE_FROM_VIEW = ['uid', 'inserted_at', 'updated_at', 'metadata'];
 
 type TableState = {
-  pk: string;
+  /**
+   * The table's key columns. One entry for a normal table, several for a composite
+   * primary key. Stored as a list rather than a string because every use of it —
+   * PRIMARY KEY, ON CONFLICT, DELETE — generalises cleanly, whereas a string forces
+   * a second code path the moment a table has a two-column key.
+   */
+  pkCols: string[];
   /** Column names the local table currently has. */
   columns: string[];
   /** WAL LSN this schema is valid from. Events at or below it predate the change. */
@@ -47,6 +53,9 @@ export default function App() {
   const [logs, setLogs] = createSignal<LogEntry[]>([]);
   const [pendingCount, setPendingCount] = createSignal(0);
   const [tableCount, setTableCount] = createSignal(0);
+  // table -> reason. A suspended table is frozen, not gone: its local rows stay valid
+  // as of the suspension LSN, but nothing new will arrive for it.
+  const [suspended, setSuspended] = createSignal<Record<string, string>>({});
   let logIdCounter = 0;
 
   const appendLog = (topic: string, data: any, opType = '') => {
@@ -124,6 +133,32 @@ export default function App() {
             continue;
           }
 
+          // Suspension: the table still exists upstream, but the bridge refuses to
+          // replicate it (no primary key), so no CDC will arrive and no snapshot will
+          // be served. Deliberately NOT a tombstone — the table comes back the moment
+          // someone adds a key, so destroying local rows here would lose data over a
+          // migration mistake. Freeze instead: keep what we have, stop expecting more,
+          // and make the staleness visible rather than letting the table look live.
+          if (val?.suspended === true) {
+            setSuspended((prev) => ({ ...prev, [entry.key]: val.reason ?? 'unknown' }));
+            appendLog(
+              'SCHEMA',
+              `Table "${entry.key}" suspended upstream (${val.reason ?? 'unknown'}) — ` +
+                `local data frozen at lsn ${val.lsn ?? '?'}. No further rows until a primary key is added.`,
+              'HOLD',
+            );
+            continue;
+          }
+
+          // A normal schema after a suspension is the recovery signal: the admin added
+          // the key, so clear the flag and let applySchema migrate as usual.
+          setSuspended((prev) => {
+            if (!(entry.key in prev)) return prev;
+            appendLog('SCHEMA', `Table "${entry.key}" resumed upstream — replication restored`, 'MIGRATE');
+            const { [entry.key]: _removed, ...rest } = prev;
+            return rest;
+          });
+
           if (val?.sqlite?.columns) await applySchema(entry.key, val);
         }
       })();
@@ -153,7 +188,14 @@ export default function App() {
    * data actually lost.
    */
   const applySchema = async (table: string, val: any) => {
-    const pkName: string = val.sqlite.pk;
+    // `pk_columns` is authoritative and always present; `pk` is the legacy
+    // single-column form and is null for a composite key. Falling back keeps this
+    // working against a bridge that predates pk_columns.
+    const pkCols: string[] = Array.isArray(val.sqlite.pk_columns)
+      ? val.sqlite.pk_columns
+      : val.sqlite.pk
+        ? [val.sqlite.pk]
+        : [];
     const cols: { name: string; type: string }[] = val.sqlite.columns;
     const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
     const names = cols.map((c) => c.name);
@@ -161,26 +203,69 @@ export default function App() {
     const existing = syncedTables.get(table);
     const added = existing ? names.filter((n) => !existing.columns.includes(n)) : [];
     const removed = existing ? existing.columns.filter((n) => !names.includes(n)) : [];
-    const additiveOnly = !!existing && removed.length === 0 && added.length > 0;
+
+    // A single-column key can be declared inline; a composite one must be a
+    // table-level constraint, so the column DDL stays bare and the constraint is
+    // appended after the column list.
+    const inlinePk = pkCols.length === 1;
+    const ddl = (c: { name: string; type: string }) =>
+      `"${c.name}" ${c.type}${inlinePk && c.name === pkCols[0] ? ' PRIMARY KEY' : ''}`;
+    const tableConstraint =
+      pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '';
+
+    /**
+     * Recreate the table and carry over every column the two schemas share.
+     *
+     * Used only for changes SQLite cannot do in place (type changes, or dropping a
+     * PK/UNIQUE/indexed column, which SQLite refuses). It is NOT a data reset:
+     * dropping the table outright would discard rows the new schema can still hold,
+     * and would force a needless re-seed. Re-seeding is for a CDC gap, not for DDL.
+     */
+    const rebuildPreservingData = async (why: string) => {
+      const tmp = `${table}__migrating`;
+      await sql(`DROP TABLE IF EXISTS ${tmp};`);
+      await sql(`CREATE TABLE ${tmp} (${cols.map(ddl).join(', ')}${tableConstraint});`);
+
+      if (existing) {
+        const common = names.filter((n) => existing.columns.includes(n)).map((n) => `"${n}"`);
+        if (common.length) {
+          await sql(`INSERT INTO ${tmp} (${common.join(', ')}) SELECT ${common.join(', ')} FROM ${table};`);
+        }
+      }
+      await sql(`DROP TABLE IF EXISTS ${table};`);
+      await sql(`ALTER TABLE ${tmp} RENAME TO ${table};`);
+      appendLog('SCHEMA', `${table}: rebuilt preserving common columns (${why}), lsn=${lsn}`, 'MIGRATE');
+    };
 
     try {
-      if (additiveOnly) {
-        for (const name of added) {
-          const type = cols.find((c) => c.name === name)!.type;
-          await sql(`ALTER TABLE ${table} ADD COLUMN "${name}" ${type};`);
-        }
-        appendLog('SCHEMA', `${table}: +[${added.join(', ')}] via ALTER (rows preserved), lsn=${lsn}`, 'MIGRATE');
-      } else if (existing && added.length === 0 && removed.length === 0) {
-        syncedTables.set(table, { pk: pkName, columns: names, lsn });
+      if (!existing) {
+        await sql(`DROP TABLE IF EXISTS ${table};`);
+        await sql(`CREATE TABLE ${table} (${cols.map(ddl).join(', ')}${tableConstraint});`);
+        appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
+      } else if (added.length === 0 && removed.length === 0) {
+        syncedTables.set(table, { pkCols, columns: names, lsn });
         return; // identical schema, e.g. a boot republish
       } else {
-        const columns = cols
-          .map((c) => `"${c.name}" ${c.type}${c.name === pkName ? ' PRIMARY KEY' : ''}`)
-          .join(', ');
-        await sql(`DROP TABLE IF EXISTS ${table};`);
-        await sql(`CREATE TABLE IF NOT EXISTS ${table} (${columns});`);
-        const why = existing ? `columns removed: [${removed.join(', ')}]` : 'first sight';
-        appendLog('SCHEMA', `${table}: rebuilt (${why}), lsn=${lsn}`, 'MIGRATE');
+        // Apply in place where SQLite allows it. DROP COLUMN exists since 3.35 and
+        // preserves every remaining row — a removed column is not a reason to discard
+        // the replica. SQLite still refuses to drop a PK/UNIQUE/indexed column, so
+        // fall back to the copy-based rebuild rather than assuming it worked.
+        try {
+          for (const name of removed) {
+            await sql(`ALTER TABLE ${table} DROP COLUMN "${name}";`);
+          }
+          for (const name of added) {
+            const type = cols.find((c) => c.name === name)!.type;
+            await sql(`ALTER TABLE ${table} ADD COLUMN "${name}" ${type};`);
+          }
+          const parts = [
+            added.length ? `+[${added.join(', ')}]` : null,
+            removed.length ? `-[${removed.join(', ')}]` : null,
+          ].filter(Boolean).join(' ');
+          appendLog('SCHEMA', `${table}: ${parts} via ALTER (rows preserved), lsn=${lsn}`, 'MIGRATE');
+        } catch (alterErr) {
+          await rebuildPreservingData(`ALTER refused: ${alterErr}`);
+        }
       }
 
       // (Re)build the convenience view against the current column set.
@@ -188,7 +273,7 @@ export default function App() {
       await sql(`DROP VIEW IF EXISTS ${table}_view;`);
       if (viewCols) await sql(`CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`);
 
-      syncedTables.set(table, { pk: pkName, columns: names, lsn });
+      syncedTables.set(table, { pkCols, columns: names, lsn });
       setTableCount(syncedTables.size);
 
       await drainPending(table);
@@ -238,10 +323,16 @@ export default function App() {
       );
       const columns = keys.map((k) => `"${k}"`).join(', ');
       const placeholders = keys.map(() => '?').join(', ');
-      const updates = keys.filter((k) => k !== state.pk).map((k) => `"${k}" = excluded."${k}"`).join(', ');
+      const updates = keys
+        .filter((k) => !state.pkCols.includes(k))
+        .map((k) => `"${k}" = excluded."${k}"`)
+        .join(', ');
 
       let query = `INSERT INTO ${table} (${columns}) VALUES (${placeholders})`;
-      if (state.pk && updates) query += ` ON CONFLICT("${state.pk}") DO UPDATE SET ${updates}`;
+      if (state.pkCols.length && updates) {
+        const conflict = state.pkCols.map((c) => `"${c}"`).join(', ');
+        query += ` ON CONFLICT(${conflict}) DO UPDATE SET ${updates}`;
+      }
 
       try {
         await sql(query, ...values);
@@ -249,12 +340,15 @@ export default function App() {
         appendLog('SQLITE', `UPSERT on ${table} failed: ${err}`, 'ERROR');
       }
     } else if (op === 'DELETE') {
-      // With REPLICA IDENTITY DEFAULT the delete carries the PK and nulls elsewhere,
-      // which is all a delete-by-key needs.
-      const pkVal = ev.data[state.pk];
-      if (pkVal !== undefined && pkVal !== null) {
+      // With REPLICA IDENTITY DEFAULT the delete carries the key columns and nulls
+      // elsewhere, which is all a delete-by-key needs. Every key column must be
+      // present: deleting on a partial composite key would match more rows than
+      // PostgreSQL deleted.
+      const pkVals = state.pkCols.map((c) => ev.data[c]);
+      if (state.pkCols.length && pkVals.every((v) => v !== undefined && v !== null)) {
+        const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
         try {
-          await sql(`DELETE FROM ${table} WHERE "${state.pk}" = ?`, pkVal);
+          await sql(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
         } catch (err) {
           appendLog('SQLITE', `DELETE on ${table} failed: ${err}`, 'ERROR');
         }
@@ -302,7 +396,10 @@ export default function App() {
     for (const [table, state] of syncedTables) {
       try {
         const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}`);
-        const lastRes = await sql(`SELECT * FROM ${table} ORDER BY "${state.pk}" DESC LIMIT 1`);
+        const order = state.pkCols.length
+          ? state.pkCols.map((c) => `"${c}" DESC`).join(', ')
+          : 'rowid DESC';
+        const lastRes = await sql(`SELECT * FROM ${table} ORDER BY ${order} LIMIT 1`);
         appendLog(
           'SQLITE',
           JSON.stringify(
@@ -357,6 +454,15 @@ export default function App() {
           <span id="sync-state">tables: {tableCount()} · held events: {pendingCount()}</span>
         </div>
       </header>
+
+      <For each={Object.entries(suspended())}>
+        {([table, reason]) => (
+          <div class="suspended-banner">
+            ⏸ <strong>{table}</strong> is suspended upstream ({reason}). Local rows are frozen and
+            still valid, but no new events or snapshots will arrive until a primary key is added.
+          </div>
+        )}
+      </For>
 
       <div class="controls">
         <button onClick={queryLocalDb} style="background: #2e7d32;">Query Local DB</button>

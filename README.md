@@ -8,19 +8,20 @@ A lightweight opinionated daemon connecting PostgreSQL CDC streams
 to the message broker NATS/JetStream for Edge sync.
 
 Allows mobile, WASM (PGLite/SQLite), and web apps to mirror
-PostgreSQL tables over WebSockets or http via NATS/JetStream
+PostgreSQL tables over WebSockets or HTTP via NATS/JetStream
 without ever reaching for PostgreSQL.
 
-This _single threaded_ binary processes ~60K+ events/s (TODO: provide test example).
+This _single threaded_ binary processes ~100K+ events/s
+(TODO: provide test example on a Linux machine; limited 50k on OSX - PG_Docker).
 
 ⚠️ **Status**: Dev stage, beaking changes, draft notes.
 
 ```mermaid
 flowchart TD
     subgraph VPS["VPS / Private Network"]
-        PG[("PostgreSQL Master")]
-        Bridge["ZeBridge<br>daemon"]
-        NATS[("NATS<br>JetStream")]
+        PG[("PostgreSQL <br> Master")]
+        Bridge["ZeBridge <br> daemon"]
+        NATS[("NATS <br> JetStream")]
         Bridge -- Prometheus --> Grafana["Grafana <br> dashboard"]
         NATS -- Prometheus --> Grafana
 
@@ -57,22 +58,28 @@ flowchart TD
 
 ## Overview
 
-We use `NATS/JetStream` to solve the problem of distributing PostgreSQL's logical replication as both solve the hard problems: ordering, durability, idempotency. The bridge just connects them correctly.
+We use `NATS/JetStream` to solve the problem of distributing `PostgreSQL`'s logical replication.
+Both solve the hard problems: ordering, durability, idempotency.
+The bridge just connects them correctly and stays dumb, as stateless as possible. The consumer gets a state machine from NATS.
+
+In other words, the bridge should be as stateless as possible: NATS holds the state, so the consumer must build a state machine with this moving state.
+
+NATS have 40+ clients, so instead of an SDK, we propose a guide with the workflows and naming to be used to connect Clients to the NATS server to use the local-first synced database.
+
+Examples:  webapp (WASM-SQLite + OPFS), backend micrservice Elixir & Python, Flutter
 
 ### What It Does
 
-We have a _pull_ model subscribing to the WAL.
-We use the plugin `pgoutput` to receive formatted data from Postgres. It will send data after the transaction is commited. We use Protocol **v1** only.
-
 **Two-phase data flow:**
 
-1. **Bootstrap** (INIT stream): Consumer requests schemas & table snapshot via a NATS KV store,
+1. **Bootstrap** (INIT stream): Consumer requests schemas & table snapshot,
 2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen via NATS/JetStream.
+3. (TODO) Ingress flow: Consumer updates his local storage and sends data to the Postgres master.
 
 **Key features**:
 
-- Streams PostgreSQL _proto-v1_ changes using logical replication (pgoutput format),
-- Publishes schemas to NATS KV store on startup,
+- Streams PostgreSQL _proto-v1_ changes using logical replication (`pgoutput` format)
+- Publishes schemas from teh catalogue to NATS KV store on startup,
 - Generates table snapshots on-demand (10K row chunks) via NATS requests,
 - Triggers message to NATS on schema change via Postgres DDL event triggers,
 - schemas are available in two formats: PostgreSQL(eg for PQLite) and SQLite,
@@ -83,9 +90,8 @@ We use the plugin `pgoutput` to receive formatted data from Postgres. It will se
 
 **Key decisions**:
 
-- use only tables with _primary key ID_ (run a migration otherwise) => `DELETE id='42'`,
-- `REPLICA IDENTITY DEFAULT` (not FULL),
-- Guides: A _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
+- `REPLICA IDENTITY DEFAULT | FULL`. Preflight warning. Use only tables with _single column primary key ID_ (no single column PK + DEFAULT => PG error on UPDATE). Solution: run a migration to set a unique column PK ID => `DELETE id='42'`,
+- No SDK: A _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
 
 ---
 
@@ -182,16 +188,14 @@ JetStream retention policies prevent unbounded growth
 Both streams have different retention policies.
 Consumer requests snapshots on-demand (not auto-pushed)
 
-### 5. On-Demand Snapshots
+### 5. Snapshots
 
 1. Bridge starts → publishes schemas to KV store immediately
-2. Consumer fetches schemas when ready
-3. Consumer publishes: `snapshot.request.{table}`
-4. Bridge generates snapshot (COPY CSV, chunked)
-5. Consumer reconstructs table from INIT stream
-6. Consumer subscribes to CDC stream for updates
+2. NATS pushes schemas when Consumer connects
+3. ...
+4. Consumer subscribes to CDC stream for updates
 
-No unnecessary work (only snapshot tables consumers need). Consumer controls timing (e.g., off-peak hours) Non-blocking (bridge continues CDC while snapshotting)
+Non-blocking (bridge continues CDC while snapshotting)
 
 ---
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
+const refused_tables = @import("refused_tables.zig");
 const utils = @import("utils.zig");
 
 // std.net was removed in Zig 0.16 "Juicy Main". Use C POSIX sockets directly.
@@ -20,6 +21,9 @@ pub const Server = struct {
     should_stop: *std.atomic.Value(bool),
     metrics: ?*metrics_mod.Metrics,
     nats_publisher: ?*nats_publisher.Publisher,
+    /// Set after construction, like nats_publisher. Only its atomic summaries are read
+    /// here — the map belongs to the replication thread (see refused_tables.zig).
+    refused: ?*const refused_tables.Registry = null,
     thread: ?std.Thread = null,
 
     pub fn init(
@@ -201,7 +205,9 @@ pub const Server = struct {
                 \\  "slot_active": {s},
                 \\  "wal_lag_bytes": {d},
                 \\  "wal_lag_mb": {d},
-                \\  "queue_usage_percent": {d}
+                \\  "queue_usage_percent": {d},
+                \\  "refused_tables": {d},
+                \\  "refused_events_dropped": {d}
                 \\}}
             , .{
                 if (snap.is_connected) "connected" else "disconnected",
@@ -216,6 +222,8 @@ pub const Server = struct {
                 snap.wal_lag_bytes,
                 snap.wal_lag_bytes / (1024 * 1024),
                 snap.queue_usage_percent,
+                if (self.refused) |r| r.refused_count.load(.acquire) else 0,
+                if (self.refused) |r| r.dropped_total.load(.acquire) else 0,
             });
 
             try sendResponse(fd, "200 OK", "application/json", body);
@@ -229,7 +237,7 @@ pub const Server = struct {
             const snap = try m.snapshot(self.allocator);
             defer self.allocator.free(snap.current_lsn_str);
 
-            var buf: [4096]u8 = undefined;
+            var buf: [8192]u8 = undefined;
             const body = try std.fmt.bufPrint(&buf,
                 \\# HELP bridge_uptime_seconds Time since bridge started
                 \\# TYPE bridge_uptime_seconds gauge
@@ -284,7 +292,12 @@ pub const Server = struct {
                 snap.queue_usage_percent,
             });
 
-            try sendResponse(fd, "200 OK", "text/plain", body);
+            // Appended rather than folded into the format string: the registry owns its
+            // own exposition text so the metric names stay next to the thing counting.
+            var w = std.Io.Writer.fixed(buf[body.len..]);
+            if (self.refused) |r| try r.writePrometheus(&w);
+
+            try sendResponse(fd, "200 OK", "text/plain", buf[0 .. body.len + w.buffered().len]);
         } else {
             try sendResponse(fd, "200 OK", "text/plain", "# No metrics available\n");
         }

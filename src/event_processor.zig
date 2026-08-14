@@ -12,6 +12,7 @@ const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
+const RefusedTables = @import("refused_tables.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
 const schema_mapper = @import("schema_mapper.zig");
@@ -104,6 +105,7 @@ pub const EventProcessor = struct {
     metrics: ?*Metrics,
     transition_rules: *const Config.EventClassification.TransitionRules,
     pg_config: *const pg_conn.PgConf,
+    refused: *RefusedTables.Registry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -111,6 +113,7 @@ pub const EventProcessor = struct {
         metrics: ?*Metrics,
         transition_rules: *const Config.EventClassification.TransitionRules,
         pg_config: *const pg_conn.PgConf,
+        refused: *RefusedTables.Registry,
     ) EventProcessor {
         return .{
             .allocator = allocator,
@@ -118,6 +121,7 @@ pub const EventProcessor = struct {
             .metrics = metrics,
             .transition_rules = transition_rules,
             .pg_config = pg_config,
+            .refused = refused,
         };
     }
 
@@ -591,7 +595,16 @@ pub const EventProcessor = struct {
         // in one testable place (schema_mapper.zig) rather than in plpgsql.
         var json_str: std.ArrayList(u8) = .empty;
 
-        try json_str.appendSlice(arena, "{\"pg\":{\"columns\":[");
+        // Name the table in the payload as well as the KV key. The key stays
+        // authoritative, but every other payload in the protocol is self-describing
+        // (CDC events, snapshot chunks, and this schema's own tombstone all carry
+        // "table") — a schema value that does not name itself is the odd one out, and
+        // is useless once it travels without its key (logs, caches, forwarding).
+        try json_str.appendSlice(arena, try std.fmt.allocPrint(
+            arena,
+            "{{\"table\":\"{s}\",\"pg\":{{\"columns\":[",
+            .{clean_table},
+        ));
         for (columns, 0..) |col_val, i| {
             const name = if (col_val == .object) col_val.object.get("name") else null;
             const ty = if (col_val == .object) col_val.object.get("type") else null;
@@ -620,22 +633,102 @@ pub const EventProcessor = struct {
         }
         try json_str.appendSlice(arena, "] ");
 
-        if (parsed.value.object.get("pk")) |pk_val| {
-            if (pk_val == .string) {
-                try json_str.appendSlice(arena, try std.fmt.allocPrint(
-                    arena,
-                    ",\"pk\":\"{s}\"",
-                    .{pk_val.string},
-                ));
-            }
+        // Validate here, not only at boot. preflight.zig checks the publication at
+        // startup, but a table created *while the bridge runs* is never seen by it —
+        // and that is the common case, since migrations run after the bridge is up.
+        // The DDL event already carries the schema, so the same defect is detectable
+        // at exactly the moment it is introduced.
+        const identity: []const u8 = if (parsed.value.object.get("replica_identity")) |ri|
+            (if (ri == .string) ri.string else "unknown")
+        else
+            "unknown";
+
+        // `pk` is the full key, in key order: null/absent means genuinely no primary
+        // key; one element is fully supported; several is a composite key.
+        const pk_cols: []const std.json.Value = blk: {
+            const v = parsed.value.object.get("pk") orelse break :blk &.{};
+            if (v != .array) break :blk &.{};
+            break :blk v.array.items;
+        };
+
+        // Refuse tables with no primary key. Not a warning: without a key, DELETE can
+        // only be expressed as a full-row match, which removes *every* duplicate where
+        // PostgreSQL removed one — the replica diverges destructively and silently.
+        // A composite key has none of that ambiguity and is accepted; only snapshot
+        // pagination is unimplemented for it, which is our gap and not the user's.
+        if (pk_cols.len == 0) {
+            log.err(
+                "🔴 REFUSING '{s}': no primary key (REPLICA IDENTITY {s}). Rows cannot be identified, so DELETE would match on every column and could remove more rows than PostgreSQL did. No schema will be published and its CDC events will be dropped. Fix with a migration adding a primary key.",
+                .{ clean_table, identity },
+            );
+            self.refused.refuse(clean_table) catch |err| {
+                // The registry is full: we cannot track the drop, so say so and keep
+                // going rather than losing the DDL event entirely.
+                log.err("🔴 Could not record refusal for '{s}': {}", .{ clean_table, err });
+            };
+
+            const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-{s}-{d}", .{ clean_table, wal_end });
+            return try self.publishSuspension(
+                arena,
+                clean_table,
+                "no_primary_key",
+                msg_id,
+                rel.relation_id,
+                wal_end,
+            );
         }
+
+        // Reaching here means the table has a key. If it was refused before, this DDL
+        // event is the migration that fixed it — resume without a restart.
+        self.refused.clear(clean_table);
+
+        if (pk_cols.len > 1) {
+            log.warn(
+                "⚠️  '{s}' has a {d}-column primary key: CDC is fully supported, but snapshots are not yet implemented for composite keys (pagination needs row-value comparison).",
+                .{ clean_table, pk_cols.len },
+            );
+        }
+
+        if (self.transition_rules.contains(clean_table) and !std.mem.eql(u8, identity, "full")) {
+            log.warn(
+                "⚠️  '{s}' has TRANSITION_RULES but REPLICA IDENTITY {s}: no old tuple is sent for non-key updates, so transitions can NEVER fire",
+                .{ clean_table, identity },
+            );
+        }
+
+        // `pk` stays a single string for the common case (existing clients read it
+        // directly), and is null for a composite key — a client cannot identify rows
+        // from one column of a two-column key, so claiming one would be worse than
+        // admitting none. `pk_columns` always carries the whole key, so a client that
+        // understands composites has what it needs.
+        if (pk_cols.len == 1 and pk_cols[0] == .string) {
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                arena,
+                ",\"pk\":\"{s}\"",
+                .{pk_cols[0].string},
+            ));
+        } else {
+            try json_str.appendSlice(arena, ",\"pk\":null");
+        }
+
+        try json_str.appendSlice(arena, ",\"pk_columns\":[");
+        for (pk_cols, 0..) |col, i| {
+            if (col != .string) continue;
+            if (i > 0) try json_str.appendSlice(arena, ",");
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{col.string}));
+        }
+        try json_str.appendSlice(arena, "]");
 
         // Close the sqlite object, then attach the LSN at the root. Clients need the
         // ordering key: KV and CDC are independent subscriptions, so without it a
         // consumer cannot tell whether a CDC event precedes or follows this schema
         // and the bridge's ordering guarantee stops at the wire.
         try json_str.appendSlice(arena, "}");
-        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{wal_end}));
+        try json_str.appendSlice(arena, try std.fmt.allocPrint(
+            arena,
+            ",\"replica_identity\":\"{s}\",\"lsn\":{d}}}",
+            .{ identity, wal_end },
+        ));
 
         // Create subject: $KV.schemas.{table}
         const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
@@ -657,6 +750,40 @@ pub const EventProcessor = struct {
 
         log.info("✅ DDL schema mapped and published to KV for '{s}'", .{clean_table});
         return slot_idx;
+    }
+
+
+    /// Publish a suspension notice for a refused table.
+    ///
+    /// Shaped like the DROP TABLE tombstone, not like a schema: it carries no columns,
+    /// because a client must not build a table from it. But it is deliberately a
+    /// distinct state from `dropped` — the table still exists upstream and will come
+    /// back the moment someone adds a primary key, so a client must not destroy local
+    /// data over it the way it does for a tombstone.
+    ///
+    /// Withholding the schema silently was not enough: a client that already holds rows
+    /// has no way to learn its table went stale, and a fresh client would read the last
+    /// good schema, build the table, and wait forever for rows that are being dropped.
+    fn publishSuspension(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        clean_table: []const u8,
+        reason: []const u8,
+        msg_id: []const u8,
+        relation_id: u32,
+        lsn: u64,
+    ) !u32 {
+        const payload = try std.fmt.allocPrint(
+            arena,
+            "{{\"table\":\"{s}\",\"suspended\":true,\"reason\":\"{s}\",\"lsn\":{d}}}",
+            .{ clean_table, reason, lsn },
+        );
+        const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
+
+        var cols: std.ArrayList(pgoutput.Column) = .empty;
+        try cols.append(arena, .{ .name = "schema", .value = .{ .text = payload } });
+
+        return self.acquireAndFillSlot(kv_subject, clean_table, "SCHEMA", msg_id, relation_id, cols, lsn);
     }
 
     /// Publish schemas for all monitored tables on boot.
@@ -706,6 +833,27 @@ pub const EventProcessor = struct {
                 log.debug("Skipping boot schema for internal table '{s}'", .{clean_table});
                 continue;
             }
+
+            // preflight refused this table before any thread started, and a refusal
+            // means its schema is withheld — publishing it here would hand clients a
+            // table they can never receive rows for, and would contradict the refusal
+            // message. This pass builds its own schema JSON and so needs its own guard.
+            if (self.refused.isRefused(clean_table)) {
+                log.warn("⚠️  Withholding boot schema for refused table '{s}' — publishing suspension", .{clean_table});
+                // No column or PK queries: we are not describing a shape, only saying
+                // the table is not replicating.
+                const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-boot-{s}", .{clean_table});
+                const slot_idx = try self.publishSuspension(
+                    arena,
+                    clean_table,
+                    "no_primary_key",
+                    msg_id,
+                    0,
+                    boot_lsn,
+                );
+                try self.releaseSlotToQueue(slot_idx);
+                continue;
+            }
             
             const query = try utils.allocPrintZ(
                 arena,
@@ -734,7 +882,11 @@ pub const EventProcessor = struct {
             }
             
             var json_str: std.ArrayList(u8) = .empty;
-            try json_str.appendSlice(arena, "{\"pg\":{\"columns\":[");
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                arena,
+                "{{\"table\":\"{s}\",\"pg\":{{\"columns\":[",
+                .{clean_table},
+            ));
             
             var r: i32 = 0;
             while (r < num_rows) : (r += 1) {
@@ -773,17 +925,46 @@ pub const EventProcessor = struct {
             const pk_result = c.PQexec(conn, pk_query.ptr);
             defer c.PQclear(pk_result);
             
+            // Emit pk unconditionally — null when there is no single-column primary
+            // key. See the DDL path for why omission is not an acceptable encoding.
             if (c.PQresultStatus(pk_result) == c.PGRES_TUPLES_OK and c.PQntuples(pk_result) > 0) {
                 const pk_name = std.mem.span(c.PQgetvalue(pk_result, 0, 0));
                 const pk_json = try std.fmt.allocPrint(arena, ",\"pk\":\"{s}\"", .{pk_name});
                 try json_str.appendSlice(arena, pk_json);
+            } else {
+                try json_str.appendSlice(arena, ",\"pk\":null");
             }
+            // Replica identity, so a boot schema carries the same fields as a
+            // DDL-driven one. A client must not have to know which path produced its
+            // schema in order to know what UPDATE/DELETE will contain.
+            const ri_query = try utils.allocPrintZ(
+                arena,
+                \\SELECT CASE relreplident
+                \\         WHEN 'd' THEN 'default' WHEN 'f' THEN 'full'
+                \\         WHEN 'n' THEN 'nothing' WHEN 'i' THEN 'index'
+                \\       END
+                \\FROM pg_class WHERE oid = '"{s}"."{s}"'::regclass;
+            ,
+                .{ "public", clean_table },
+            );
+            const ri_result = c.PQexec(conn, ri_query.ptr);
+            defer c.PQclear(ri_result);
+            const identity: []const u8 = if (c.PQresultStatus(ri_result) == c.PGRES_TUPLES_OK and
+                c.PQntuples(ri_result) > 0)
+                std.mem.span(c.PQgetvalue(ri_result, 0, 0))
+            else
+                "unknown";
+
             // Boot schemas describe tables that emitted no DDL event, so there is no
             // wal_end to inherit. Stamp the current WAL position: the schema is valid
             // from here, which lets a client compare it against CDC lsns the same way
             // it would a DDL-driven schema.
             try json_str.appendSlice(arena, "}");
-            try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{boot_lsn}));
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                arena,
+                ",\"replica_identity\":\"{s}\",\"lsn\":{d}}}",
+                .{ identity, boot_lsn },
+            ));
 
             const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
             const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}", .{clean_table});

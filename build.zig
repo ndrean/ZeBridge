@@ -79,6 +79,7 @@ pub fn build(b: *std.Build) void {
     topology_opts.addOption([]const u8, "snapshot_start_pattern", subjects.get("snapshot_start_pattern").?.string);
     topology_opts.addOption([]const u8, "snapshot_error_pattern", subjects.get("snapshot_error_pattern").?.string);
     topology_opts.addOption([]const u8, "snapshot_meta_pattern", subjects.get("snapshot_meta_pattern").?.string);
+    topology_opts.addOption([]const u8, "snapshot_schema_pattern", subjects.get("snapshot_schema_pattern").?.string);
     
     const kv = parsed_topology.object.get("kv").?.object;
     topology_opts.addOption([]const u8, "kv_schemas", kv.get("schemas").?.string);

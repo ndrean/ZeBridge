@@ -91,6 +91,7 @@ DECLARE
     tables      text[] := '{}';
     cmd_tag     text   := 'UNKNOWN';
     schema_json jsonb;
+    last_def    jsonb;
 BEGIN
     -- Pass 1: collect the distinct tables this command touched.
     -- object_identity is 'public.users' for a table but 'public.users.email' for a
@@ -125,17 +126,39 @@ BEGIN
                      WHERE c.table_schema = 'public'
                        AND c.table_name   = tbl
                  ), '[]'::jsonb),
+                 -- Every primary key column, in key order — NOT just single-column
+                 -- keys. This used to filter on array_length(indkey,1) = 1, which made
+                 -- a composite key report NULL, indistinguishable from having no key at
+                 -- all. Those two cases need opposite treatment: a composite key
+                 -- identifies rows exactly (CDC is fine, only snapshot pagination is
+                 -- unimplemented), whereas no key at all makes DELETE ambiguous.
+                 -- NULL here now means genuinely no primary key.
                  'pk', (
-                     SELECT a.attname
+                     SELECT jsonb_agg(a.attname ORDER BY k.ord)
                      FROM pg_index i
+                     JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                       ON true
                      JOIN pg_attribute a
-                       ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                       ON a.attrelid = i.indrelid AND a.attnum = k.attnum
                      -- to_regclass, not ::regclass: returns NULL instead of raising
                      -- if the table is gone (e.g. dropped later in the same tx)
                      WHERE i.indrelid = to_regclass(format('%I.%I', 'public', tbl))
                        AND i.indisprimary
-                       AND array_length(i.indkey, 1) = 1
-                     LIMIT 1
+                 ),
+                 -- Replica identity governs what UPDATE/DELETE actually carry, so both
+                 -- the bridge and its clients need it: without a PK, DEFAULT means
+                 -- PostgreSQL rejects writes outright, and only FULL yields old.* values
+                 -- (and therefore working transition rules). Neither is discoverable
+                 -- from the column list alone.
+                 'replica_identity', (
+                     SELECT CASE c.relreplident
+                              WHEN 'd' THEN 'default'
+                              WHEN 'f' THEN 'full'
+                              WHEN 'n' THEN 'nothing'
+                              WHEN 'i' THEN 'index'
+                            END
+                     FROM pg_class c
+                     WHERE c.oid = to_regclass(format('%I.%I', 'public', tbl))
                  )
                )
         INTO schema_json;
@@ -143,9 +166,23 @@ BEGIN
         -- No columns means the table did not survive the transaction; nothing useful
         -- to publish, and an empty schema would tell clients to drop every column.
         IF schema_json -> 'columns' <> '[]'::jsonb THEN
-            INSERT INTO public.zebridge_ddl_events
-                   (schema_name, table_name, command_tag, schema_def)
-            VALUES ('public', tbl, cmd_tag, schema_json);
+            -- One migration commonly fires several ddl_command_end events for the same
+            -- table (CREATE TABLE, then ALTER TABLE ... REPLICA IDENTITY, then a GRANT).
+            -- Emitting an identical schema each time makes clients re-run a migration
+            -- that changes nothing. Compare against the newest row for this table and
+            -- skip if nothing actually changed — replica_identity is part of schema_def,
+            -- so a genuine identity change still produces an event.
+            SELECT e.schema_def INTO last_def
+            FROM public.zebridge_ddl_events e
+            WHERE e.table_name = tbl
+            ORDER BY e.id DESC
+            LIMIT 1;
+
+            IF last_def IS DISTINCT FROM schema_json THEN
+                INSERT INTO public.zebridge_ddl_events
+                       (schema_name, table_name, command_tag, schema_def)
+                VALUES ('public', tbl, cmd_tag, schema_json);
+            END IF;
         END IF;
     END LOOP;
 

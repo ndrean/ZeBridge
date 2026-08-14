@@ -4,9 +4,6 @@ Accumulated findings, decisions, and open questions. Companion to
 `COPY_BINARY_PLAN.md` (which holds the forward plan); this file holds *why things
 are the way they are* and *what is still undecided*.
 
-Each entry says what was observed, not just what was concluded — a conclusion
-without its evidence is the thing that gets silently reverted later.
-
 ---
 
 ## 1. Open — decisions deferred, mostly for lack of information
@@ -41,7 +38,7 @@ Verified against deliberately-broken tables: `t_nopk` (error + warning),
 `t_nopk_full` (warning only — FULL rescued writes), `t_composite`, and `users` with
 rules on a DEFAULT table.
 
-The migration is the right place to *make* these decisions (ndrean's emitter
+The migration is the right place to *make* these decisions (the Elixir emitter
 migration already sets `REPLICA IDENTITY` per table). Preflight is what makes a
 wrong decision visible rather than invisible.
 
@@ -68,9 +65,9 @@ a reconnect.
 
 Safe, not broken: a full ring backpressures the WAL reader, so events are delayed,
 never dropped. Restoring the old property means `RING_BUFFER_COUNT=131072`
-(≈2184 ms, ~4 MB slab) — a memory-doubling decision left to ndrean.
+(≈2184 ms, ~4 MB slab) — ⚠️ a memory-doubling decision left
 
-**But**: ndrean's metrics show PG reconnects dominate and NATS reconnects are rare.
+Metrics show PG reconnects dominate and NATS reconnects are rare.
 On a *Postgres* loss the producer stops, so the ring **drains** rather than fills —
 ring size does nothing for that failure mode. The slot and WAL retention cover it.
 So this sizing debate only ever mattered for the rarer failure.
@@ -107,7 +104,7 @@ client connecting after the fact gets schemas (KV keeps last value) but no histo
 ### 1.7 Deliberately not fixed
 
 - **`cdc_events_published` undercounts.** The counter increments only in the mutation
-  branches, so DDL/SCHEMA events are missing. ndrean's call: imprecise but rare
+  branches, so DDL/SCHEMA events are missing. I am ok: imprecise but rare
   enough not to matter.
 - **pk lives inside the `sqlite` object** in the schema payload
   (`{"sqlite":{"columns":[...],"pk":"id"}}`) rather than at the root. Arguably wrong
@@ -259,7 +256,7 @@ requests, so once an `AccessExclusiveLock` is waiting, everything behind it wait
 A 13 ms metadata-only migration stalled an unrelated writer for **8 seconds** purely
 because one slow transaction held the table.
 
-Practical consequence: set `lock_timeout` on migrations — not to protect the
+▶️ Practical consequence: set `lock_timeout` on migrations — not to protect the
 migration, but to stop it becoming a queue head that blocks every emitter.
 
 Consequence for CDC: **there is no such thing as an old-shape row arriving after the
@@ -348,7 +345,7 @@ Same missing PK, genuinely different severity.
 
 ### 3.5 Index creation locks
 
-`CREATE INDEX` takes a **SHARE** lock: blocks writes, allows reads — a long hold on a
+❇️ `CREATE INDEX` takes a **SHARE** lock: blocks writes, allows reads — a long hold on a
 big table. `CREATE INDEX CONCURRENTLY` does not block writes but **cannot run inside a
 transaction**, so Ecto needs `@disable_ddl_transaction true` (and
 `@disable_migration_lock true`). It does two table scans and can leave an INVALID
@@ -356,7 +353,7 @@ index on failure, requiring a manual drop.
 
 ### 3.6 Postgres 18 packaging
 
-The image expects the volume at `/var/lib/postgresql`, **not** `/var/lib/postgresql/data`
+❇️The image expects the volume at `/var/lib/postgresql`, **not** `/var/lib/postgresql/data`
 — it stores data in a version-specific subdirectory so `pg_upgrade --link` works.
 `docker-compose.full.yml` had the old path and failed to start.
 

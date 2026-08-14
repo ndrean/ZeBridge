@@ -143,6 +143,20 @@ pub const Snapshot = struct {
     /// Rows per snapshot chunk
     pub const chunk_size = 10_000;
 
+    /// How long a generated snapshot is considered current (seconds).
+    ///
+    /// A request for a table whose snapshot is younger than this does NOT run a new
+    /// COPY — the bridge re-publishes the existing snapshot's metadata instead. This
+    /// is what decouples database load from client count: a hundred clients
+    /// reconnecting inside the window cost one COPY, not a hundred.
+    ///
+    /// ⚠️ Bounded above by CDC retention: a client seeding from a snapshot at LSN L
+    /// must still find L in the CDC stream when it finishes applying, so
+    ///     CDC_RET > SNAP_RET + client apply time
+    /// Raising this without raising CDC retention silently strands slow clients.
+    /// Overridable with SNAP_RET_SECONDS.
+    pub const retention_seconds = 600; // 10 minutes
+
     /// Maximum concurrent snapshot requests
     pub const max_concurrent_snapshots = 3;
 
@@ -167,6 +181,13 @@ pub const Snapshot = struct {
 
     /// NATS subject pattern for metadata: "init.snap.meta.{table}"
     pub const meta_subject_pattern = topology.snapshot_meta_pattern;
+
+    /// Column order for a snapshot's chunks.
+    /// Was hardcoded as "snapshot.schema.{table}.{id}" — a subject NO stream captures,
+    /// so JetStream never acked it, the publish timed out through all its retries, and
+    /// the whole snapshot failed. It must live under init.> for the INIT stream to
+    /// store it.
+    pub const schema_subject_pattern = topology.snapshot_schema_pattern;
 
     /// NATS KV bucket name for schemas
     pub const kv_bucket_schemas = topology.kv_schemas;
@@ -357,6 +378,9 @@ pub const RuntimeConfig = struct {
 
     // Snapshot settings
     snapshot_chunk_size: usize,
+    snapshot_retention_seconds: i64,
+    /// Refuse to start when any published table has no primary key (STRICT_TABLES).
+    strict_tables: bool,
 
     // Publish retry budget (see Retry section for the rationale)
     publish_max_retries: u32,
@@ -391,6 +415,8 @@ pub const RuntimeConfig = struct {
             .batch_max_payload_bytes = Batch.max_payload_bytes,
             .batch_ring_buffer_size = Buffers.default_ring_buffer_count,
             .snapshot_chunk_size = Snapshot.chunk_size,
+            .snapshot_retention_seconds = Snapshot.retention_seconds,
+            .strict_tables = false,
             .publish_max_retries = Retry.publish_max_retries,
             .publish_backoff_ms = Retry.publish_backoff_ms,
             .publish_max_backoff_ms = Retry.publish_max_backoff_ms,

@@ -14,6 +14,8 @@ const usage =
     \\  --pub <NAME>    PostgreSQL PUBLICATION to stream
     \\  --port <PORT>   HTTP telemetry port
     \\  --json          Encode as JSON (default: MessagePack)
+    \\  --strict-tables Refuse to start if any published table lacks a primary key
+    \\                  (default: skip the table, keep replicating the rest)
     \\  --help, -h      Show this message
     \\
     \\Environment:
@@ -28,6 +30,7 @@ const usage =
     \\  PUBLISH_MAX_RETRIES              Publish retries before fatal (default: 5)
     \\  PUBLISH_BACKOFF_MS               First publish backoff (default: 100)
     \\  PUBLISH_MAX_BACKOFF_MS           Publish backoff ceiling (default: 5000)
+    \\  SNAP_RET_SECONDS                 Snapshot freshness window (default: 600)
     \\  TRANSITION_RULES                 e.g. users:status,kyc_level;orders:state
     \\
     \\Defaults for all of the above live in src/config.zig.
@@ -86,6 +89,9 @@ pub const Args = struct {
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
         var publication_name: []const u8 = config.Postgres.default_publication_name; // default
         var encoding_format: encoder.Format = .msgpack; // default
+        // Off by default: one keyless table should not stop every other table from
+        // replicating. See preflight.zig for the full argument.
+        var strict_tables: bool = false;
 
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--port")) {
@@ -101,6 +107,8 @@ pub const Args = struct {
                 if (args_iter.next()) |value| publication_name = value;
             } else if (std.mem.eql(u8, arg, "--json")) {
                 encoding_format = .json;
+            } else if (std.mem.eql(u8, arg, "--strict-tables")) {
+                strict_tables = true;
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
                 std.debug.print("{s}", .{usage});
                 return error.HelpRequested;
@@ -126,6 +134,7 @@ pub const Args = struct {
         runtime_config.slot_name = slot_name;
         runtime_config.publication_name = publication_name;
         runtime_config.encoding_format = encoding_format;
+        runtime_config.strict_tables = strict_tables;
 
         // Read PostgreSQL configuration from environment variables via Juicy Main environ.
         // getPosix() borrows from the environ block, which lives as long as the process,
@@ -251,6 +260,15 @@ pub const Args = struct {
             runtime_config.publish_backoff_ms,
             300_000,
         );
+
+        runtime_config.snapshot_retention_seconds = @intCast(envUint(
+            u32,
+            init,
+            "SNAP_RET_SECONDS",
+            @intCast(runtime_config.snapshot_retention_seconds),
+            1,
+            86_400,
+        ));
 
         // NATS connection — slices into environ block, no allocation needed
         runtime_config.nats_url = init.minimal.environ.getPosix("NATS_URL");

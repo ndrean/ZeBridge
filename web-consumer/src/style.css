@@ -164,3 +164,15 @@ button:hover {
   background: #1e88e5;
 }
 
+
+/* Suspended table: frozen upstream, not dropped. Amber rather than red — the data is
+   still valid, it just stopped moving. */
+.suspended-banner {
+  margin: 0.5rem 0;
+  padding: 0.6rem 0.8rem;
+  border-left: 3px solid #b7791f;
+  background: rgba(183, 121, 31, 0.12);
+  color: inherit;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}

@@ -24,6 +24,7 @@ const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const utils = @import("utils.zig");
 const preflight = @import("preflight.zig");
+const refused_tables = @import("refused_tables.zig");
 
 // Force test discovery for imported modules.
 // Zig only collects tests from files the root actually references, so every module
@@ -36,6 +37,7 @@ comptime {
     _ = @import("pgoutput.zig");
     _ = @import("publication.zig");
     _ = @import("preflight.zig");
+    _ = @import("refused_tables.zig");
     _ = @import("schema_cache.zig");
     _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");
@@ -288,6 +290,43 @@ pub fn main(init: std.process.Init) !void {
     );
     defer replication_ctx.deinit();
 
+    // === Parse transition rules from environment variable
+    // Format: "table1:col1,col2;table2:col3,col4"
+    // Example: "users:status,kyc_level;orders:state,payment_status"
+    var transition_rules = try args.Args.parseTransitionRules(allocator, &init);
+    defer args.Args.deinitTransitionRules(&transition_rules, allocator);
+
+    // Shared between preflight (boot) and the DDL path (runtime): both decide a table
+    // has no primary key, and the mutation path must honour either verdict.
+    var refused = refused_tables.Registry.init(allocator);
+    defer refused.deinit();
+
+    // Validate the publication before any thread exists. Preflight only needs Postgres,
+    // and under STRICT_TABLES it returns an error — bailing out after the worker threads
+    // start would unwind into `defer join()` on threads nobody signalled, hanging the
+    // process instead of exiting it.
+    _ = preflight.run(
+        allocator,
+        &pg_config,
+        parsed_args.publication_name,
+        &transition_rules,
+        runtime_config.strict_tables,
+        &refused,
+    ) catch |err| switch (err) {
+        // STRICT_TABLES asked us to stop; that verdict must reach main, not be
+        // swallowed as "the check could not run". Signal first: unwinding runs
+        // `defer http_srv.join()`, and that thread only leaves its accept loop when
+        // should_stop is set — returning without it exits into a hang, not an exit.
+        error.RefusedTables => {
+            should_stop.store(true, .seq_cst);
+            return err;
+        },
+        else => blk: {
+            log.warn("⚠️  Preflight check failed to run: {}", .{err});
+            break :blk preflight.Summary{};
+        },
+    };
+
     // === Start thread: WAL lag monitor
     const wal_monitor_config = wal_monitor.WalConfig{
         .pg_config = &pg_config,
@@ -310,6 +349,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
+    http_srv.refused = &refused;
 
     // Initialize schema cache for tracking relation_id changes
     var schema_cache = schema_cache_mod.SchemaCache.init(allocator);
@@ -327,6 +367,7 @@ pub fn main(init: std.process.Init) !void {
         &pg_config,
         &should_stop,
         monitored_tables,
+        &refused,
         parsed_args.encoding_format,
         &runtime_config,
         io,
@@ -354,20 +395,6 @@ pub fn main(init: std.process.Init) !void {
     defer batch_pub.join();
     defer batch_pub.deinit(); // Will free the heap-allocated BatchPublisher itself
 
-    // === Parse transition rules from environment variable
-    // Format: "table1:col1,col2;table2:col3,col4"
-    // Example: "users:status,kyc_level;orders:state,payment_status"
-    var transition_rules = try args.Args.parseTransitionRules(allocator, &init);
-    defer args.Args.deinitTransitionRules(&transition_rules, allocator);
-
-    // Validate the publication's tables now that transition rules are known. Reports
-    // only — a table the operator deliberately configured this way should not stop the
-    // bridge, but a silent failure should not stay silent either.
-    _ = preflight.run(allocator, &pg_config, parsed_args.publication_name, &transition_rules) catch |err| blk: {
-        log.warn("⚠️  Preflight check failed to run: {}", .{err});
-        break :blk preflight.Summary{};
-    };
-
     // === Initialize EventProcessor (in this main thread, the CDC processing)
     // EventProcessor enqueues to the SPSC queue that BatchPublisher consumes
     var event_proc = event_processor.EventProcessor.init(
@@ -376,6 +403,7 @@ pub fn main(init: std.process.Init) !void {
         &metrics,
         &transition_rules,
         &pg_config,
+        &refused,
     );
 
     // Publish boot schemas to NATS KV for all monitored tables
@@ -499,6 +527,10 @@ pub fn main(init: std.process.Init) !void {
             defer allocator.free(snap.current_lsn_str);
 
             // Structured log format parseable by Grafana Alloy
+            // A refusal logged once at boot has scrolled away by the time anyone
+            // wonders where the rows went. Repeat it with the running drop count.
+            refused.logStatus();
+
             log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} pg_reconnects={d} nats_reconnects={d} lag_bytes={d} slot_active={d}", .{
                 snap.uptime_seconds,
                 snap.wal_messages_received,
@@ -612,7 +644,9 @@ pub fn main(init: std.process.Init) !void {
                                             tx_slots_count += 1;
                                             cdc_events += 1;
                                         }
-                                    } else {
+                                    } else if (!event_proc.refused.shouldDrop(rel.name)) {
+                                        // Refused: no schema was published for this table, so a
+                                        // client receiving the row would have nowhere to put it.
                                         const slot_idx = try event_proc.packMutationToSlot(
                                             arena_allocator,
                                             rel,
@@ -634,6 +668,7 @@ pub fn main(init: std.process.Init) !void {
                                     // Pruning old rows produces DELETEs that must never surface as
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_upd;
+                                    if (event_proc.refused.shouldDrop(rel.name)) break :blk_upd;
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
                                         for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
@@ -660,6 +695,7 @@ pub fn main(init: std.process.Init) !void {
                                     // Pruning old rows produces DELETEs that must never surface as
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_del;
+                                    if (event_proc.refused.shouldDrop(rel.name)) break :blk_del;
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
                                         for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);

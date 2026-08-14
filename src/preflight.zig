@@ -32,6 +32,7 @@ const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
+const RefusedTables = @import("refused_tables.zig");
 
 pub const log = std.log.scoped(.preflight);
 
@@ -55,15 +56,24 @@ pub const ReplicaIdentity = enum(u8) {
 /// What preflight found wrong with one table. A table can hit several at once, so
 /// these are flags rather than a single verdict.
 pub const Findings = struct {
+    /// No primary key at all: the table is REFUSED. Rows cannot be identified, so a
+    /// DELETE could only be a full-row match — removing every duplicate where
+    /// PostgreSQL removed one — and with at-least-once delivery a redelivered INSERT
+    /// has nothing to upsert on, so it duplicates. Neither is fixable downstream,
+    /// which is why this is a refusal rather than a warning.
+    refused_no_pk: bool = false,
     /// PostgreSQL will reject UPDATE/DELETE on this table outright.
     writes_rejected: bool = false,
-    /// Snapshots cannot chunk this table (needs exactly one PK column).
-    snapshots_unavailable: bool = false,
+    /// Composite primary key: CDC is fully supported (the key identifies rows
+    /// exactly); only snapshot pagination is unimplemented. That is our gap, not a
+    /// broken schema — so it must never be a refusal.
+    snapshots_unimplemented: bool = false,
     /// TRANSITION_RULES names this table but it cannot produce transitions.
     transitions_inert: bool = false,
 
     pub fn any(self: Findings) bool {
-        return self.writes_rejected or self.snapshots_unavailable or self.transitions_inert;
+        return self.refused_no_pk or self.writes_rejected or
+            self.snapshots_unimplemented or self.transitions_inert;
     }
 };
 
@@ -74,9 +84,10 @@ pub const Findings = struct {
 pub fn classify(pk_columns: u32, identity: ReplicaIdentity, has_transition_rules: bool) Findings {
     var f = Findings{};
 
-    // Snapshots use keyset pagination over one PK column; zero or several is fatal
-    // to snapshotting regardless of replica identity.
-    f.snapshots_unavailable = pk_columns != 1;
+    // Three-way, not two. Conflating "no key" with "composite key" would refuse a
+    // valid schema over an unimplemented feature on our side.
+    f.refused_no_pk = pk_columns == 0;
+    f.snapshots_unimplemented = pk_columns > 1;
 
     // Without a PK, DEFAULT leaves the table with no replica identity at all, and
     // PostgreSQL refuses to publish updates for it. FULL rescues this (the whole row
@@ -101,6 +112,7 @@ fn isInternalTable(name: []const u8) bool {
 pub const Summary = struct {
     checked: usize = 0,
     with_findings: usize = 0,
+    refused: usize = 0,
 };
 
 /// Inspect every table in the publication and log anything that will not work.
@@ -112,6 +124,8 @@ pub fn run(
     pg_config: *const pg_conn.PgConf,
     publication_name: []const u8,
     transition_rules: *const Config.EventClassification.TransitionRules,
+    strict: bool,
+    refused: *RefusedTables.Registry,
 ) !Summary {
     var standard_config = pg_config.*;
     standard_config.replication = false;
@@ -186,18 +200,22 @@ pub fn run(
                 .{ table, identity.describe(), table },
             );
         }
-        if (f.snapshots_unavailable) {
-            if (pk_columns == 0) {
-                log.warn(
-                    "⚠️  '{s}' has no primary key: CDC may stream, but snapshots are unavailable (chunking needs one PK column)",
-                    .{table},
-                );
-            } else {
-                log.warn(
-                    "⚠️  '{s}' has a {d}-column primary key: snapshots are unavailable (chunking needs exactly one)",
-                    .{ table, pk_columns },
-                );
-            }
+        if (f.refused_no_pk) {
+            summary.refused += 1;
+            // Record it before the first WAL byte arrives, so the mutation path drops
+            // this table's events from the very first batch rather than after its
+            // first DDL event — which may never come.
+            try refused.refuse(table);
+            log.err(
+                "🔴 REFUSING '{s}': no primary key. Rows cannot be identified, so DELETE would match every column (removing more rows than PostgreSQL did) and a redelivered INSERT would duplicate. Its schema is withheld and its CDC events are dropped. Fix with a migration adding a primary key.",
+                .{table},
+            );
+        }
+        if (f.snapshots_unimplemented) {
+            log.warn(
+                "⚠️  '{s}' has a {d}-column primary key: CDC is fully supported, but snapshots are not yet implemented for composite keys (pagination needs row-value comparison)",
+                .{ table, pk_columns },
+            );
         }
         if (f.transitions_inert) {
             log.warn(
@@ -210,7 +228,22 @@ pub fn run(
     if (summary.with_findings == 0) {
         log.info("✅ Preflight: {d} table(s) checked, no issues", .{summary.checked});
     } else {
-        log.warn("⚠️  Preflight: {d}/{d} table(s) have issues (see above)", .{ summary.with_findings, summary.checked });
+        log.warn("⚠️  Preflight: {d}/{d} table(s) have issues, {d} refused (see above)", .{
+            summary.with_findings,
+            summary.checked,
+            summary.refused,
+        });
+    }
+
+    // Refusing to start is deliberately NOT the default: one PK-less table would stop
+    // replication for every other table, and a table created while the bridge runs
+    // would turn a schema mistake into an outage. Skipping keeps the same correctness
+    // property (no schema published, so no client builds it) without that blast
+    // radius. --strict-tables exists for CI and staging gates, where failing the deploy
+    // is the point.
+    if (strict and summary.refused > 0) {
+        log.err("🔴 --strict-tables was given and {d} table(s) were refused — refusing to start", .{summary.refused});
+        return error.RefusedTables;
     }
 
     return summary;
@@ -225,19 +258,19 @@ test "classify - single-column PK with DEFAULT is the happy path" {
     try std.testing.expect(!f.any());
 }
 
-test "classify - no PK with DEFAULT means PostgreSQL rejects writes" {
+test "classify - no PK is refused outright" {
     const f = classify(0, .default, false);
+    try std.testing.expect(f.refused_no_pk);
     try std.testing.expect(f.writes_rejected);
-    try std.testing.expect(f.snapshots_unavailable);
 }
 
-test "classify - REPLICA IDENTITY FULL rescues writes for a PK-less table" {
-    // Verified against PostgreSQL 18: no PK + DEFAULT errors on UPDATE, no PK + FULL
-    // succeeds. FULL makes the whole row the identity.
+test "classify - FULL rescues the write but not the identity" {
+    // Verified on PostgreSQL 18: no PK + DEFAULT errors on UPDATE, no PK + FULL
+    // succeeds. Enough for PostgreSQL, not enough for a replica — DELETE is still a
+    // full-row match and a redelivered INSERT still duplicates.
     const f = classify(0, .full, false);
     try std.testing.expect(!f.writes_rejected);
-    // ...but it does not rescue snapshots, which still need one PK column.
-    try std.testing.expect(f.snapshots_unavailable);
+    try std.testing.expect(f.refused_no_pk);
 }
 
 test "classify - REPLICA IDENTITY NOTHING is as bad as DEFAULT without a PK" {
@@ -245,10 +278,13 @@ test "classify - REPLICA IDENTITY NOTHING is as bad as DEFAULT without a PK" {
     try std.testing.expect(f.writes_rejected);
 }
 
-test "classify - composite PK blocks snapshots but not writes" {
+test "classify - a composite PK is valid, never refused" {
+    // It identifies rows exactly; only snapshot pagination is missing, and that is
+    // our gap. Refusing here would reject a correct schema.
     const f = classify(2, .default, false);
+    try std.testing.expect(!f.refused_no_pk);
     try std.testing.expect(!f.writes_rejected);
-    try std.testing.expect(f.snapshots_unavailable);
+    try std.testing.expect(f.snapshots_unimplemented);
 }
 
 test "classify - transition rules need FULL" {
@@ -261,9 +297,16 @@ test "classify - transition rules need FULL" {
 
 test "classify - findings combine" {
     const f = classify(0, .default, true);
+    try std.testing.expect(f.refused_no_pk);
     try std.testing.expect(f.writes_rejected);
-    try std.testing.expect(f.snapshots_unavailable);
     try std.testing.expect(f.transitions_inert);
+}
+
+test "classify - a single-column PK is never refused, whatever the identity" {
+    for ([_]ReplicaIdentity{ .default, .full, .index, .nothing }) |ri| {
+        try std.testing.expect(!classify(1, ri, false).refused_no_pk);
+        try std.testing.expect(!classify(1, ri, false).snapshots_unimplemented);
+    }
 }
 
 test "isInternalTable" {
