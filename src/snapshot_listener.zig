@@ -1501,7 +1501,12 @@ pub const SnapshotListener = struct {
         // Publish to JetStream with retry logic
         try publishWithRetry(js, subject, &headers, encoded, should_stop);
 
-        log.info("📋 Published snapshot metadata → {s}", .{subject});
+        // Also publish to KV bucket so clients can check for cached snapshots
+        const kv_subject = try std.fmt.allocPrint(allocator, "$KV.snapshots.{s}", .{ table_name });
+        defer allocator.free(kv_subject);
+        try publishWithRetry(js, kv_subject, null, encoded, should_stop);
+
+        log.info("📋 Published snapshot metadata → {s} (and KV)", .{subject});
     }
 
     // ========================================================================
