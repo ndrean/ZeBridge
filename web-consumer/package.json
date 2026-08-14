@@ -10,7 +10,6 @@
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0-beta.1",
-    "nats.ws": "^1.29.1",
     "solid-js": "^1.9.14",
     "sqlocal": "^0.18.0"
   },

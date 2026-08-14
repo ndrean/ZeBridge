@@ -363,30 +363,27 @@ is a protocol gap rather than a storage limitation.
 
 ---
 
-## 6. Snapshots — stream `INIT` 🚧
+## 6. Snapshots — stream `INIT` ✅
 
-⚠️ **Partly implemented and not yet part of the stable contract.** The bridge can
-generate and publish snapshots on request; the *client-facing dance* — retention
-windows, discovery, gap detection — is unresolved. Shapes below are what the bridge
-emits **today**; expect them to change.
+Snapshots seed the client with historical data. The bridge can generate and publish snapshots on request; the client uses them to recover from a stream gap.
 
-### Snapshot data lives in the INIT stream, never in KV
+### The Storage Architecture
 
-Stated plainly because it is easy to get backwards, and the choice is forced rather
-than stylistic:
+Snapshot data is megabytes-to-gigabytes of ordered chunks. It flows through three channels:
 
 | | where | why |
 | --- | --- | --- |
-| snapshot **rows** (chunks) | **INIT stream** | A snapshot is megabytes-to-gigabytes of ordered chunks. JetStream KV caps a value (1 MB by default) and keeps only the last one per key — it cannot hold this, and would discard all but the final chunk if it tried. |
-| snapshot **descriptor** (which snapshot is current, at what LSN) | INIT today, KV *optional* | A single small value that is overwritten each time. Last-value-per-key is exactly right for it — but see below, it is not required. |
+| **Requests** | `REQUESTS` stream | A dedicated stream with `max_msgs_per_subject=1`, `DiscardNew`, and `max_age=SNAP_RET`. This acts as a native NATS lock. It squashes 10 million concurrent client requests into exactly 1 message, shielding the bridge and Postgres from DDoS attacks. |
+| **Data (chunks)** | `INIT` stream | JetStream streams reliably hold ordered sequences of chunks for long retention periods. |
+| **Metadata** | `kv.snapshots` bucket | A single small descriptor (schema, snapshot ID, LSN, row count). Last-value-per-key makes it trivial for a client to discover the active snapshot without scanning streams. |
 
-KV is a **materialised view of the latest value per key**. That fits *state*
-(a schema, a pointer to the current snapshot). It does not fit a *sequence*
-(rows, changes). Snapshots are a sequence; they belong in a stream.
+**Requesting a snapshot:** 
 
-**Request:** publish to `snapshot.request.<table>` (empty body).
+1. A client checks `kv.snapshots.<table>`. If a valid snapshot exists (i.e., its LSN is within the `CDC` retention window), the client can replay it immediately.
+2. If no valid snapshot exists, the client publishes an empty message to `snapshot.request.<table>`.
+3. If NATS accepts the publish, the bridge generates the snapshot. If NATS rejects the publish (because a request is already running or cached within `SNAP_RET`), the client simply ignores the error, waits, and watches the KV bucket.
 
-**Responses:**
+**Responses (from bridge):**
 
 | subject | payload |
 | --- | --- |
@@ -395,8 +392,9 @@ KV is a **materialised view of the latest value per key**. That fits *state*
 | `init.snap.meta.<table>` | `{snapshot_id, table, lsn, timestamp, batch_count, row_count}` |
 | `init.snap.error.<table>` | `{table, timestamp, status:"failed", error_type, error_message, available_tables}` |
 
-`error_type` is the machine-readable discriminator; branch on it, not on
-`error_message`:
+*Note: Metadata is written to `kv.snapshots.<table>` upon completion, not broadcasted as an event.*
+
+`error_type` is the machine-readable discriminator; branch on it, not on `error_message`:
 
 | `error_type` | meaning | client action |
 | --- | --- | --- |
@@ -404,39 +402,34 @@ KV is a **materialised view of the latest value per key**. That fits *state*
 | `table_not_monitored` | table is not in the publication this bridge replicates | do not retry; check `available_tables` |
 | `generation_failed` | the `COPY` failed (permissions, lock, connection) | retry with backoff |
 
-⚠️ **Known gap:** two snapshot failures currently abort server-side without publishing
-anything to `init.snap.error.<table>`, so a client sees only silence and must rely on
-its own timeout:
+⚠️ `table_refused` and `table_not_monitored` are **not** retryable — retrying either is a busy-loop against a condition only a migration or a config change will clear.
 
-- a **composite primary key** — pagination needs row-value keyset comparison, which is
-  not implemented (§8). Paging on the first key column alone would be *wrong*, not
-  merely partial: that column is not unique, so a chunk boundary inside a run of equal
-  values silently skips the rest of the run.
-- an **unsupported column type** — see below.
+Chunks default to 10 000 rows.
+Requires a **single-column primary key**: chunking uses keyset pagination (`WHERE pk > $last ORDER BY pk LIMIT n`).
 
-⚠️ `table_refused` and `table_not_monitored` are **not** retryable — retrying either
-is a busy-loop against a condition only a migration or a config change will clear.
+### The Connection Flow (Resolving the Gap)
 
-Chunks default to 10 000 rows. `meta` arrives **after** all chunks and states how
-many to expect.
+Run on every connect and reconnect. The client must evaluate the **Gap Rule** to decide whether a snapshot is needed.
 
-Requires a **single-column primary key**: chunking uses keyset pagination
-(`WHERE pk > $last ORDER BY pk LIMIT n`). Composite or absent PKs cannot be
-snapshotted — the bridge warns about this at startup (§8).
+A naive client might track the last LSN per table. This causes the **"abandoned table paradox"**: if Table A changes rapidly but Table B never changes, Table B's local LSN falls far behind the stream's oldest available LSN. A per-table gap check would incorrectly assume Table B missed events and force a snapshot.
 
-### The connection flow
+To solve this, the client must track a **Global Sync State**:
+- `global_last_lsn`: The highest LSN the client has successfully processed from the CDC stream, across *all* tables.
+- `global_last_seq`: The JetStream sequence number corresponding to `global_last_lsn`.
 
-Run on every connect and reconnect. The **gap decides** whether a snapshot is needed;
-the snapshot's existence only decides whether one must be generated.
+**The Gap Rule:**
+Compare `global_last_lsn >= oldest_cdc_lsn`.
+- **If true:** The client has no gaps. Every table is safe, even those that haven't changed in months. Resume CDC from `global_last_seq + 1`.
+- **If false (or first run):** The client missed history. It must request a snapshot for *all* required tables, as it cannot prove which ones changed during the blackout.
 
 ```mermaid
 flowchart TD
     A[connect] --> B["schema ← KV.get(table)<br/>migrate local in place"]
-    B --> C{"cl exists AND<br/>cl >= oldest_cdc_lsn ?"}
-    C -->|yes| Z["resume CDC from cl"]
-    C -->|"no — first run, or gap"| D{"snapshot exists AND<br/>s >= oldest_cdc_lsn ?"}
-    D -->|yes| E["truncate local<br/>apply chunks<br/>cl ← s"]
-    D -->|"no snapshot, or<br/>snapshot too old"| F["publish snapshot.request<br/>(coalesced) · wait"]
+    B --> C{"global_last_lsn exists AND<br/>global_last_lsn >= oldest_cdc_lsn ?"}
+    C -->|yes| Z["resume CDC from global_last_seq + 1"]
+    C -->|"no — first run, or gap"| D{"valid snapshot exists in KV AND<br/>snapshot.lsn >= oldest_cdc_lsn ?"}
+    D -->|yes| E["truncate local<br/>apply chunks via JetStream Pull<br/>global_last_lsn ← max(snapshot LSNs)"]
+    D -->|"no snapshot, or<br/>snapshot too old"| F["publish snapshot.request<br/>(ignore NATS rejects) · wait"]
     F --> E
     E --> Z
     Z --> Y["per-event rule (§5)"]
@@ -444,67 +437,32 @@ flowchart TD
 
 In pseudocode:
 
-```
-if cl exists and cl >= oldest_cdc_lsn:
-    accept CDC from cl                       # common path
+```python
+if global_last_lsn exists and global_last_lsn >= oldest_cdc_lsn:
+    accept CDC from global_last_seq + 1
 else:
-    if snapshot exists and s >= oldest_cdc_lsn:
-        seed from it
-    else:
-        request snapshot, wait, seed from it # no snapshot, OR a hole between it and CDC
-    accept CDC from cl (= s)
+    for each table:
+        check kv.snapshots for a snapshot >= oldest_cdc_lsn
+        if none exists:
+            publish snapshot.request, wait for kv.snapshots to update
+        truncate local table
+        replay snapshot chunks from INIT stream using JetStream Pull Consumer
+    
+    global_last_lsn = max(snapshot LSNs)
+    accept CDC from now
 ```
-
-Where `cl` = client's last applied LSN, `s` = snapshot LSN, `oldest_cdc_lsn` = the
-oldest LSN the CDC stream still retains.
 
 **Notes that matter for a correct port:**
 
-- ⚠️ **`cl` may not exist.** First run has no value; test for its presence explicitly
-  rather than relying on a language's comparison semantics for null/undefined.
-- ⚠️ **`>=`, not `>`.** If `cl == oldest_cdc_lsn` you have applied the oldest retained
-  event and everything after it is present. Strict `>` forces a needless re-seed at
-  exactly that boundary.
-- ⚠️ **`s >= oldest_cdc_lsn` must be verified, not assumed.** A snapshot older than the
-  CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been
-  evicted. You land in a hole immediately, silently. This is the client-side check for
-  the `CDC_RET > SNAP_RET + T_apply` invariant.
-- ⚠️ **Truncate before applying a snapshot**, do not merge. A snapshot names only rows
-  that *exist*; rows deleted while you were away are never mentioned, so an upsert-only
-  apply leaves them behind forever.
-- A schema change **never** triggers this flow. Migrations apply in place (§5);
-  re-seeding is for a CDC gap only.
+- ⚠️ **`global_last_lsn` may not exist.** First run has no value; test for its presence explicitly.
+- ⚠️ **`>=`, not `>`.** If `global_last_lsn == oldest_cdc_lsn` you have applied the oldest retained event and everything after it is present. Strict `>` forces a needless re-seed.
+- ⚠️ **`snapshot_lsn >= oldest_cdc_lsn` must be verified.** A snapshot older than the CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been evicted. You land in a hole immediately.
+- ⚠️ **Truncate before applying a snapshot**, do not merge. A snapshot names only rows that *exist*; rows deleted while you were away are never mentioned, so an upsert-only apply leaves them behind forever.
+- A schema change **never** triggers this flow. Migrations apply in place (§5); re-seeding is for a CDC gap only.
 
 ### Resuming in practice
 
-LSNs are a PostgreSQL concept; JetStream indexes by **stream sequence**. So persist
-both:
-
-| stored | used for |
-| --- | --- |
-| `last_applied_lsn` | the gap check above, and the hold/strip rule in §5 |
-| `last_stream_seq` | resuming: `DeliverPolicy.ByStartSequence(last_stream_seq + 1)` |
-
-The gap check is then a cheap `stream info`: `last_stream_seq >= state.first_seq - 1`.
-
-Keeping the sequence client-side allows **ephemeral** consumers. A durable consumer
-would have NATS track the position server-side, but that is per-client state on the
-server — thousands of mobile clients means thousands of consumer objects to create,
-leak and expire. Client-stored position keeps the server stateless.
-
-### Open before this is contractual
-
-- **Whether a KV descriptor is needed at all.** `init.snap.meta.<table>` already
-  carries `{snapshot_id, lsn, batch_count, row_count}` on the INIT stream, so the
-  information exists. The only question is *discovery cost*: finding it on a stream
-  means a consumer with `deliver_last_per_subject`, whereas mirroring it to
-  `kv.snapshots` makes it a single `kv.get`. That is a convenience, **not** a
-  requirement — and it is the only thing `kv.snapshots` would ever hold. Decide before
-  reserving the bucket for real.
-- **The retention invariant fails silently.** Seeding at LSN *L* is only safe while
-  the CDC stream still holds *L*. `CDC_RET` must exceed `SNAP_RET` plus the client's
-  apply time, and the client must **detect** the gap — compare its seed LSN against
-  the stream's oldest available sequence — rather than quietly missing rows.
+Keeping the sequence client-side allows **ephemeral** consumers. A durable consumer would have NATS track the position server-side, but that is per-client state on the server — thousands of mobile clients means thousands of consumer objects to create, leak and expire. Client-stored position keeps the server stateless.
 
 ---
 

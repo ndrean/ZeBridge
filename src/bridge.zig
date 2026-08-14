@@ -19,6 +19,7 @@ const schema_publisher = @import("schema_publisher.zig");
 const schema_cache_mod = @import("schema_cache.zig");
 const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
+const mutation_listener = @import("mutation_listener.zig");
 const encoder_mod = @import("encoder.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
@@ -46,6 +47,23 @@ comptime {
 }
 
 pub const log = std.log.scoped(.bridge);
+
+var runtime_log_level: std.log.Level = .info;
+
+pub const std_options = std.Options{
+    .log_level = .debug, // Compile all logs, filter at runtime
+    .logFn = customLogFn,
+};
+
+pub fn customLogFn(
+    comptime message_level: std.log.Level,
+    comptime scope: @TypeOf(.EnumLiteral),
+    comptime format: []const u8,
+    fmt_args: anytype,
+) void {
+    if (@intFromEnum(message_level) > @intFromEnum(runtime_log_level)) return;
+    std.log.defaultLog(message_level, scope, format, fmt_args);
+}
 
 // Double-check the pipeline invariant before spinning up threads.
 // ring_buffer_capacity > max_rows_per_transaction must hold; if it doesn't,
@@ -207,6 +225,7 @@ fn initReplicationStream(
 }
 
 pub fn main(init: std.process.Init) !void {
+    runtime_log_level = Config.getDefaultLogLevel();
     const io = init.io;
     const IS_DEBUG = builtin.mode == .Debug;
 
@@ -379,6 +398,20 @@ pub fn main(init: std.process.Init) !void {
     defer snap_listener.join();
     defer snap_listener.deinit();
     log.info("✅ Snapshot listener thread started\n", .{});
+
+    // === Start thread: mutation listener
+    log.info("Starting mutation listener thread...", .{});
+    var mut_listener = try mutation_listener.MutationListener.init(
+        allocator,
+        runtime_config,
+        parsed_args,
+        io,
+        &should_stop,
+    );
+    try mut_listener.start();
+    defer mut_listener.join();
+    defer mut_listener.deinit();
+    log.info("✅ Mutation listener thread started\n", .{});
 
     // === Start thread: CDC async publisher (heap-allocated for stable address)
     // Use c_allocator (thread-safe) for cross-thread allocations:

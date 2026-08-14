@@ -7,6 +7,8 @@ const std = @import("std");
 const encoder = @import("encoder.zig");
 const topology = @import("topology");
 
+pub const log = std.log.scoped(.config);
+
 /// PostgreSQL connection and replication configuration
 pub const Postgres = struct {
     pub const default_slot_name = "cdc_slot";
@@ -378,7 +380,8 @@ pub const RuntimeConfig = struct {
 
     // Snapshot settings
     snapshot_chunk_size: usize,
-    snapshot_retention_seconds: i64,
+    // [Deprecated] Handled by JetStream max_age
+    // snapshot_retention_seconds: i64,
     /// Refuse to start when any published table has no primary key (STRICT_TABLES).
     strict_tables: bool,
 
@@ -415,7 +418,7 @@ pub const RuntimeConfig = struct {
             .batch_max_payload_bytes = Batch.max_payload_bytes,
             .batch_ring_buffer_size = Buffers.default_ring_buffer_count,
             .snapshot_chunk_size = Snapshot.chunk_size,
-            .snapshot_retention_seconds = Snapshot.retention_seconds,
+            // .snapshot_retention_seconds = Snapshot.retention_seconds,
             .strict_tables = false,
             .publish_max_retries = Retry.publish_max_retries,
             .publish_backoff_ms = Retry.publish_backoff_ms,
@@ -431,7 +434,9 @@ pub const RuntimeConfig = struct {
 
 /// Get default log level based on environment
 pub fn getDefaultLogLevel() std.log.Level {
-    if (std.posix.getenv("LOG_LEVEL")) |level_str| {
+    if (std.c.getenv("LOG_LEVEL")) |level_c_str| {
+        log.debug("Level----------> : {s}", .{level_c_str});
+        const level_str = std.mem.span(level_c_str);
         if (std.mem.eql(u8, level_str, "debug")) return .debug;
         if (std.mem.eql(u8, level_str, "info")) return .info;
         if (std.mem.eql(u8, level_str, "warn")) return .warn;

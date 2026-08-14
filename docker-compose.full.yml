@@ -119,6 +119,8 @@ services:
         echo 'Reading streams from topology.json...'
         CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' /topology.json)
         INIT_PREFIX=$(jq -r '.subjects.init_prefix' /topology.json)
+        REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' /topology.json)
+        MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' /topology.json)
         SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
 
         echo "Creating NATS JetStream stream: CDC (subject: $$CDC_PREFIX.>)"
@@ -126,6 +128,13 @@ services:
 
         echo "Creating NATS JetStream stream: INIT (subject: $$INIT_PREFIX.>)"
         nats stream add INIT --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+
+        SNAP_RET=$${SNAP_RET_SECONDS:-600}
+        echo "Creating NATS JetStream stream: REQUESTS (subject: $$REQUESTS_PREFIX.>)"
+        nats stream add REQUESTS --subjects="$$REQUESTS_PREFIX.>" --storage=file --retention=limits --max-msgs-per-subject=1 --discard=new --discard-per-subject --max-age=$${SNAP_RET}s --replicas=1 --defaults || true
+
+        echo "Creating NATS JetStream stream: MUTATIONS (subject: $$MUTATIONS_PREFIX.>)"
+        nats stream add MUTATIONS --subjects="$$MUTATIONS_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults || true
 
         echo "Creating NATS KV bucket: $$SCHEMA_KV"
         nats kv add $$SCHEMA_KV --history=10 --replicas=1 || true

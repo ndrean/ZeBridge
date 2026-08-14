@@ -135,15 +135,35 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkSystemLibrary("ssl", .{});
     exe.root_module.linkSystemLibrary("crypto", .{});
 
+    exe.root_module.link_libc = true;
     linkLibpq(exe, b, prefix);
 
     b.installArtifact(exe);
 
-    // A top-level step to build and run the application with `zig build run`
+    const gc_exe = b.addExecutable(.{
+        .name = "gc",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gc.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "c", .module = c_mod },
+            },
+        }),
+    });
+    gc_exe.root_module.link_libc = true;
+    linkLibpq(gc_exe, b, prefix);
+    b.installArtifact(gc_exe);
+
+    const gc_run_cmd = b.addRunArtifact(gc_exe);
+    gc_run_cmd.step.dependOn(b.getInstallStep());
+    const run_gc_step = b.step("run-gc", "Run the Garbage Collector Sidecar");
+    run_gc_step.dependOn(&gc_run_cmd.step);
+
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
+    run_step.dependOn(&run_cmd.step);
 
     if (b.args) |args| {
         run_cmd.addArgs(args);

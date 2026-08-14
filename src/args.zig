@@ -261,14 +261,15 @@ pub const Args = struct {
             300_000,
         );
 
-        runtime_config.snapshot_retention_seconds = @intCast(envUint(
-            u32,
-            init,
-            "SNAP_RET_SECONDS",
-            @intCast(runtime_config.snapshot_retention_seconds),
-            1,
-            86_400,
-        ));
+        // [Deprecated] Snapshot retention is now natively handled by JetStream max_age policy.
+        // runtime_config.snapshot_retention_seconds = @intCast(envUint(
+        //     u32,
+        //     init,
+        //     "SNAP_RET_SECONDS",
+        //     @intCast(runtime_config.snapshot_retention_seconds),
+        //     1,
+        //     86_400,
+        // ));
 
         // NATS connection — slices into environ block, no allocation needed
         runtime_config.nats_url = init.minimal.environ.getPosix("NATS_URL");

@@ -2,12 +2,15 @@
   "streams": {
     "cdc": "CDC",
     "init": "INIT",
-    "schema": "SCHEMA"
+    "schema": "SCHEMA",
+    "mutations": "MUTATIONS",
+    "requests": "REQUESTS"
   },
   "subjects": {
     "cdc_prefix": "cdc",
     "init_prefix": "init",
     "schema_prefix": "schema",
+    "mutations_prefix": "mutation",
     "snapshot_request": "snapshot.request",
     
     "snapshot_data_pattern": "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}",

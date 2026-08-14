@@ -26,5 +26,5 @@ config :emitter,
 config :emitter, Emitter.Producer.Repo,
   url:
     System.get_env("DATABASE_URL") ||
-      "postgres://postgres:postgres_password@localhost:55432/postgres",
+      "postgres://postgres:postgres_password@localhost:5432/postgres",
   pool_size: String.to_integer(System.get_env("POOL_SIZE") || "5")
