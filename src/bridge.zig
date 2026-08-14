@@ -38,6 +38,7 @@ comptime {
     _ = @import("publication.zig");
     _ = @import("preflight.zig");
     _ = @import("refused_tables.zig");
+    _ = @import("pg_copy_binary.zig");
     _ = @import("schema_cache.zig");
     _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");

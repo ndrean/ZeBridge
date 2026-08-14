@@ -10,6 +10,7 @@ const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const refused_tables = @import("refused_tables.zig");
+const pg_copy_binary = @import("pg_copy_binary.zig");
 const publication_mod = @import("publication.zig");
 const config = @import("config.zig");
 const msgpack = @import("msgpack");
@@ -282,6 +283,100 @@ const PkMetadata = struct {
         allocator.free(self.name);
     }
 };
+
+/// Column names and type OIDs in `SELECT *` order, for decoding binary COPY.
+///
+/// Binary COPY's header carries no names, types, or column count, so the layout has to
+/// arrive out-of-band. It must come from the **same connection inside the snapshot's
+/// REPEATABLE READ transaction**: a lookup taken elsewhere could observe a different
+/// schema than the COPY emits, and a wrong OID makes `decodeBinColumnData` produce
+/// plausible garbage rather than an error.
+///
+/// Two sources were rejected. `information_schema` stores type *names* (`"timestamp
+/// with time zone"`), which would need a hand-maintained name→OID table. And
+/// `pgoutput.RelationMessage` carries real OIDs but only after the first change to the
+/// table since the bridge connected — a snapshot can be requested before that.
+///
+/// Caller owns the returned slice and each name.
+fn getTableColumns(
+    allocator: std.mem.Allocator,
+    conn: *c.PGconn,
+    table_name: []const u8,
+) ![]pg_copy_binary.ColumnMeta {
+    var schema: []const u8 = "public";
+    var table: []const u8 = table_name;
+    if (std.mem.indexOf(u8, table_name, ".")) |dot_idx| {
+        schema = table_name[0..dot_idx];
+        table = table_name[dot_idx + 1 ..];
+    }
+
+    // `format_type` renders the declared type — `numeric(20,8)` — so Postgres owns the
+    // `atttypmod` decoding, whose bit layout changed in PG 15 to allow negative scales.
+    // Still one query and one round trip: a plain catalog function on the row we are
+    // already reading, not an information_schema view (which joins several catalogs and
+    // applies privilege filtering to answer the same question). `getTablePrimaryKey`
+    // uses the same function on the same connection.
+    const query = try utils.allocPrintZ(
+        allocator,
+        \\SELECT a.attname, a.atttypid, format_type(a.atttypid, a.atttypmod)
+        \\FROM pg_attribute a
+        \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
+        \\  AND a.attnum > 0 AND NOT a.attisdropped
+        \\ORDER BY a.attnum;
+    ,
+        .{ schema, table },
+    );
+    defer allocator.free(query);
+
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.err("📸 column lookup failed for '{s}': {s}", .{ table_name, c.PQerrorMessage(conn) });
+        return error.ColumnLookupFailed;
+    }
+
+    const n: usize = @intCast(c.PQntuples(res));
+    if (n == 0) return error.NoColumns;
+
+    const cols = try allocator.alloc(pg_copy_binary.ColumnMeta, n);
+    // Free the names already duped if a later one fails, so an error frees everything.
+    var filled: usize = 0;
+    errdefer {
+        for (cols[0..filled]) |col| allocator.free(col.name);
+        allocator.free(cols);
+    }
+
+    for (cols, 0..) |*col, i| {
+        const idx: c_int = @intCast(i);
+        const name = std.mem.span(c.PQgetvalue(res, idx, 0));
+        const oid_text = std.mem.span(c.PQgetvalue(res, idx, 1));
+        const oid = std.fmt.parseInt(u32, oid_text, 10) catch return error.BadTypeOid;
+
+        // Only NUMERIC gets padded — appending a decimal point to every integer in the
+        // snapshot would be a far louder bug than the one being fixed.
+        const type_text = std.mem.span(c.PQgetvalue(res, idx, 2));
+        const scale: ?u16 = if (oid == pg_copy_binary.numeric_oid)
+            pg_copy_binary.scaleFromFormatType(type_text)
+        else
+            null;
+
+        col.* = .{
+            .name = try allocator.dupe(u8, name),
+            .oid = oid,
+            .numeric_scale = scale,
+        };
+        filled += 1;
+    }
+    return cols;
+}
+
+/// Free what `getTableColumns` returned.
+fn freeTableColumns(allocator: std.mem.Allocator, cols: []pg_copy_binary.ColumnMeta) void {
+    for (cols) |col| allocator.free(col.name);
+    allocator.free(cols);
+}
+
 
 /// Query PostgreSQL system catalogs to discover the primary key of a table
 /// This is critical for chunked snapshots - we need to know which column to use for WHERE > last_value
@@ -1072,6 +1167,27 @@ pub const SnapshotListener = struct {
         const pk = try getTablePrimaryKey(allocator, conn.?, table_name);
         defer pk.deinit(allocator);
 
+        // Column layout for binary COPY. Taken here — after BEGIN ISOLATION LEVEL
+        // REPEATABLE READ, on this connection — so no ALTER TABLE can land between the
+        // lookup and any chunk's COPY. One lookup serves every chunk, since the schema
+        // cannot move inside the transaction.
+        const columns = try getTableColumns(allocator, conn.?, table_name);
+        defer freeTableColumns(allocator, columns);
+
+        // Which column carries the keyset cursor. Resolved once against the catalog
+        // rather than per chunk against a header, because binary COPY has no header to
+        // resolve against.
+        const pk_col_idx: ?usize = blk: {
+            for (columns, 0..) |col, i| {
+                if (std.mem.eql(u8, col.name, pk.name)) break :blk i;
+            }
+            log.err(
+                "📸 primary key '{s}' not found among the columns of '{s}' — pagination could not advance",
+                .{ pk.name, table_name },
+            );
+            break :blk null;
+        };
+
         // Create arena for snapshot processing
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -1101,19 +1217,21 @@ pub const SnapshotListener = struct {
 
             const copy_query = try utils.allocPrintZ(
                 chunk_alloc,
-                "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT csv, HEADER true)",
+                "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT binary)",
                 .{ table_name, where_clause, pk.name, chunk_size },
             );
 
             // Initialize streaming encoder with fixed buffer
             var encoder = streaming_encoder.StreamingEncoder.init(encode_buffer);
 
-            // Stream: PostgreSQL COPY → Parser → Encoder (zero intermediate allocations)
-            var parser = pg_copy_csv.CopyCsvParser.init(chunk_alloc, @ptrCast(conn));
+            // Stream: PostgreSQL binary COPY → framing → decoder → encoder.
+            // `columns` comes from the catalog inside this same REPEATABLE READ
+            // transaction, because the binary header carries no layout of its own.
+            var parser = pg_copy_binary.Streamer.init(chunk_alloc, @ptrCast(conn), columns);
             defer parser.deinit();
 
-            const num_rows = parser.streamToEncoder(copy_query, &encoder, pk.name) catch |err| {
-                log.err("Stream encoding failed: {}", .{err});
+            const num_rows = parser.streamToEncoder(copy_query, &encoder, pk_col_idx) catch |err| {
+                log.err("📸 binary COPY chunk failed for '{s}': {}", .{ table_name, err });
                 _ = c.PQexec(conn, "ROLLBACK");
                 return error.StreamEncodingFailed;
             };
@@ -1124,7 +1242,8 @@ pub const SnapshotListener = struct {
 
             // On first chunk, publish schema so consumer knows column order
             if (batch == 0) {
-                const col_names = parser.columnNames() orelse return error.NoHeader;
+                const col_names = try chunk_alloc.alloc([]const u8, columns.len);
+                for (columns, col_names) |col, *name| name.* = col.name;
                 try publishSchemaZig(
                     chunk_alloc,
                     &js,
