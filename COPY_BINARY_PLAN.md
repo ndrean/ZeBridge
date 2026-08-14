@@ -1,8 +1,46 @@
 # Working plan — snapshots via `COPY ... (FORMAT binary)`
 
-Carries the session state a fresh session would otherwise lose. Three parts:
-**A.** what already landed and must not be re-derived, **B.** open threads blocking
-COPY BINARY, **C.** the COPY BINARY plan itself (still not started).
+Carries the session state a fresh session would otherwise lose. Section letters are
+historical, not a running order — see **Start here** below.
+
+---
+
+## 🔜 Start here next session (written 2026-08-14)
+
+**Environment as left.** Postgres volume was wiped and re-initialised mid-session, then
+scenario steps 7–8 ran. `exotic_types` currently has **no `attrs` column** — G2 dropped
+it. To make TEST_SCENARIOS **G1** (the hstore refusal) reproducible, either:
+
+```sql
+ALTER TABLE public.exotic_types ADD COLUMN attrs hstore;
+```
+
+or `Emitter.Scenario.reset()` then `step7()` / `step8()`.
+
+Also note `users` carries the **composite** PK from step 5, and `users_no_pk` is
+suspended — both are useful fixtures, not leftovers to clean.
+
+**Work, in order:**
+
+1. **Composite keyset pagination** — the unblocked one, and the reason COPY BINARY went
+   first. `ColumnMeta.pk_ord` already carries the whole key from the catalog, on typed
+   values. This is a change to pagination alone: `WHERE (a,b) > (?,?)`, `ORDER BY a,b`,
+   capture N cursor values per chunk. Removes the `CompositePrimaryKeyUnsupported`
+   refusal and lets `users` snapshot.
+2. **CDC type guard** — §E below. Full design is written; the first move is the *check*
+   at the end of §E (does the tuple decoder branch on pgoutput's per-column format
+   byte?), because the answer changes the shape of the fix.
+3. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
+   snapshot application. Unblocks TEST_SCENARIOS **B**, **C3**, **C4**, **D2**, lets
+   **F6** end in a re-seed instead of a caveat, and is the gate on deleting the CSV path.
+
+**Small, independent, pick up any time** (§F): array quoting (`{"solo"}` vs `{solo}` —
+systematic, blocks a byte-equality golden test), snapshot failures that abort without
+publishing to `init.snap.error.<table>`, golden-value test per PG major (note
+`pgoutput`'s `binary` needs PG 14+, but `COPY ... FORMAT binary` goes back to 7.4).
+
+**Do not** prune `pg_copy_csv.zig` yet — the rollout gate is a consumer reconstructing a
+table from a binary snapshot, which item 3 unblocks.
 
 ---
 
