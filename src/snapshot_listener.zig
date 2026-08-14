@@ -318,8 +318,17 @@ fn getTableColumns(
     // uses the same function on the same connection.
     const query = try utils.allocPrintZ(
         allocator,
-        \\SELECT a.attname, a.atttypid, format_type(a.atttypid, a.atttypmod)
+        \\SELECT a.attname,
+        \\       a.atttypid,
+        \\       format_type(a.atttypid, a.atttypmod),
+        \\       COALESCE(k.ord, 0),
+        \\       t.typtype
         \\FROM pg_attribute a
+        \\JOIN pg_type t ON t.oid = a.atttypid
+        \\LEFT JOIN pg_index i
+        \\  ON i.indrelid = a.attrelid AND i.indisprimary
+        \\LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+        \\  ON k.attnum = a.attnum
         \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
         \\  AND a.attnum > 0 AND NOT a.attisdropped
         \\ORDER BY a.attnum;
@@ -361,10 +370,17 @@ fn getTableColumns(
         else
             null;
 
+        const pk_ord_text = std.mem.span(c.PQgetvalue(res, idx, 3));
+        const pk_ord = std.fmt.parseInt(u16, pk_ord_text, 10) catch 0;
+
+        const typtype_text = std.mem.span(c.PQgetvalue(res, idx, 4));
+
         col.* = .{
             .name = try allocator.dupe(u8, name),
             .oid = oid,
             .numeric_scale = scale,
+            .pk_ord = pk_ord,
+            .typtype = if (typtype_text.len > 0) typtype_text[0] else 'b',
         };
         filled += 1;
     }
@@ -1163,29 +1179,49 @@ pub const SnapshotListener = struct {
             log.warn("Failed to publish snapshot start: {}", .{err});
         };
 
-        // Discover primary key for this table
-        const pk = try getTablePrimaryKey(allocator, conn.?, table_name);
-        defer pk.deinit(allocator);
-
-        // Column layout for binary COPY. Taken here — after BEGIN ISOLATION LEVEL
-        // REPEATABLE READ, on this connection — so no ALTER TABLE can land between the
-        // lookup and any chunk's COPY. One lookup serves every chunk, since the schema
-        // cannot move inside the transaction.
+        // Column layout *and* primary key in one round trip. Taken here — after BEGIN
+        // ISOLATION LEVEL REPEATABLE READ, on this connection — so no ALTER TABLE can
+        // land between the lookup and any chunk's COPY. One lookup serves every chunk,
+        // since the schema cannot move inside the transaction, which is also why it
+        // must never be cached across snapshots: a stale layout decodes values into the
+        // wrong columns silently.
         const columns = try getTableColumns(allocator, conn.?, table_name);
         defer freeTableColumns(allocator, columns);
 
-        // Which column carries the keyset cursor. Resolved once against the catalog
-        // rather than per chunk against a header, because binary COPY has no header to
-        // resolve against.
-        const pk_col_idx: ?usize = blk: {
-            for (columns, 0..) |col, i| {
-                if (std.mem.eql(u8, col.name, pk.name)) break :blk i;
-            }
+        // The keyset cursor column, resolved from the same rows rather than a second
+        // query. Binary COPY has no header to resolve against, so this is the only
+        // source of truth for both layout and key.
+        var pk_col_count: usize = 0;
+        var pk_first: ?usize = null;
+        for (columns, 0..) |col, i| {
+            if (col.pk_ord == 0) continue;
+            pk_col_count += 1;
+            if (col.pk_ord == 1) pk_first = i;
+        }
+
+        if (pk_col_count == 0) {
+            log.err("📸 '{s}' has no primary key — cannot paginate a snapshot", .{table_name});
+            _ = c.PQexec(conn, "ROLLBACK");
+            return error.NoPrimaryKey;
+        }
+        if (pk_col_count > 1) {
+            // Paging on the first column alone would be wrong, not merely incomplete:
+            // it is not unique, so a chunk boundary landing inside a group of equal
+            // first-column values would skip the rest of that group. Refuse until
+            // pagination does row-value comparison over the whole key.
             log.err(
-                "📸 primary key '{s}' not found among the columns of '{s}' — pagination could not advance",
-                .{ pk.name, table_name },
+                "📸 '{s}' has a {d}-column primary key — snapshot pagination needs row-value keyset comparison, which is not implemented",
+                .{ table_name, pk_col_count },
             );
-            break :blk null;
+            _ = c.PQexec(conn, "ROLLBACK");
+            return error.CompositePrimaryKeyUnsupported;
+        }
+
+        const pk_col_idx: ?usize = pk_first;
+        const pk_column = columns[pk_first.?];
+        const pk = PkMetadata{
+            .name = pk_column.name,
+            .is_numeric = pg_copy_binary.isNumericOid(pk_column.oid),
         };
 
         // Create arena for snapshot processing

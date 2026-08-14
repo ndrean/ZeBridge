@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const pgoutput = @import("pgoutput.zig");
+const pg_constants = @import("pg_constants.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const streaming_encoder = @import("streaming_encoder.zig");
@@ -51,7 +52,28 @@ pub const ColumnMeta = struct {
     /// NUMERIC does not carry. Null for every other type, and for an unconstrained
     /// `numeric` — which has no declared scale, so its natural scale is already right.
     numeric_scale: ?u16 = null,
+    /// `pg_type.typtype`: 'b' base, 'e' enum, 'c' composite, 'd' domain, 'r' range.
+    /// The discriminator that separates "unknown but safely text" from "unknown and
+    /// structured" — see `decodeTuple`.
+    typtype: u8 = 'b',
+    /// 1-based position in the primary key, or 0 if this column is not part of it.
+    /// Carrying the whole key rather than a single column name is what lets the same
+    /// lookup serve composite keys when snapshot pagination learns to page on them.
+    pk_ord: u16 = 0,
 };
+
+/// Whether a keyset cursor of this type is written unquoted in SQL.
+///
+/// Only used to build the pagination `WHERE`; a wrong answer produces a syntax error
+/// at the next chunk, not silent corruption.
+pub fn isNumericOid(oid: u32) bool {
+    return switch (oid) {
+        20, 21, 23, 26 => true, // int8, int2, int4, oid
+        700, 701 => true, // float4, float8
+        numeric_oid => true,
+        else => false,
+    };
+}
 
 /// `pg_type.oid` for `numeric`. A fixed catalog constant, unlike extension types.
 pub const numeric_oid: u32 = 1700;
@@ -288,9 +310,24 @@ pub fn decodeTuple(
             slot.* = null;
             continue;
         }
+        // `decodeBinColumnData` falls through to "treat as text" for any OID it does
+        // not know. That is *correct* for an enum — Postgres sends enums as their label
+        // in binary — and silent corruption for anything else. Verified against a live
+        // hstore column, whose binary form (int32 count, then length-prefixed pairs)
+        // arrived as a string of embedded lengths and NUL bytes with only a log.warn.
+        //
+        // User-defined and extension types get per-database OIDs, so they can never be
+        // constants in the decoder's switch; `typtype` is what tells the two cases
+        // apart at runtime.
+        if (!pg_constants.isKnownOid(col.oid) and col.typtype != 'e') {
+            log.err(
+                "🔴 column '{s}' has unsupported type OID {d} (typtype '{c}') — refusing to snapshot rather than shipping its raw binary as text. Only enums are safe to pass through undecoded.",
+                .{ col.name, col.oid, col.typtype },
+            );
+            return error.UnsupportedColumnType;
+        }
+
         const decoded = pgoutput.decodeBinColumnData(arena, col.oid, raw.?) catch |err| {
-            // Loud, not lenient: an unknown OID decoded as bytes-as-text would ship
-            // garbage that looks like data. Composite and range types land here.
             log.err(
                 "🔴 cannot decode column '{s}' (OID {d}): {} — snapshot aborted rather than emitting unverified bytes",
                 .{ col.name, col.oid, err },
@@ -707,4 +744,20 @@ test "scaleFromFormatType - nothing to pad" {
     try testing.expectEqual(@as(?u16, null), scaleFromFormatType("numeric(10)"));
     try testing.expectEqual(@as(?u16, null), scaleFromFormatType("numeric(10,-2)"));
     try testing.expectEqual(@as(?u16, null), scaleFromFormatType("numeric(10,0)"));
+}
+
+test "isNumericOid - integer and decimal keys are unquoted, text keys are not" {
+    try testing.expect(isNumericOid(23)); // int4
+    try testing.expect(isNumericOid(numeric_oid));
+    try testing.expect(!isNumericOid(25)); // text
+    try testing.expect(!isNumericOid(2950)); // uuid
+}
+
+test "isKnownOid - built-in types are known, dynamic ones are not" {
+    // The OIDs observed live: hstore 16416 and the `mood` enum 16544 are assigned per
+    // database, so no switch can ever contain them.
+    try testing.expect(pg_constants.isKnownOid(23)); // int4
+    try testing.expect(pg_constants.isKnownOid(numeric_oid));
+    try testing.expect(!pg_constants.isKnownOid(16416));
+    try testing.expect(!pg_constants.isKnownOid(16544));
 }

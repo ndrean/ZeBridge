@@ -45,6 +45,16 @@ pub const PgOid = enum(u32) {
 
     _, // Placeholder for unsupported types
 };
+/// Whether this OID has a decoder. `PgOid` is non-exhaustive, so `@enumFromInt` accepts
+/// anything — which is what makes the unknown case silent unless it is asked about
+/// explicitly.
+pub fn isKnownOid(oid: u32) bool {
+    inline for (@typeInfo(PgOid).@"enum".fields) |field| {
+        if (field.value == oid) return true;
+    }
+    return false;
+}
+
 
 pub const NUMERIC_POS: u16 = 0x0000;
 pub const NUMERIC_NEG: u16 = 0x4000;

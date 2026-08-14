@@ -77,6 +77,47 @@ defmodule Emitter.Scenario do
   end
 
   @doc """
+  Step 7 — the exotic-types table: ENUM, HSTORE, NUMERIC(20,8), TEXT[].
+
+  Types whose binary COPY form the bridge has no compile-time OID for. Lives in its own
+  table so a decoding failure cannot take `test_types` with it.
+  """
+  def step7, do: migrate(20_260_810_170_000, Emitter.PgProducer.Repo.SetupExoticTypes)
+
+  @doc """
+  Step 8 — populate it, including the values that pin the known edges:
+  a NUMERIC needing trailing-zero padding, and an hstore with a comma in a value.
+  """
+  def step8 do
+    with_repo(fn repo ->
+      Ecto.Adapters.SQL.query!(repo, """
+      INSERT INTO public.exotic_types (feeling, attrs, price, tags) VALUES
+        ('happy', 'a=>1, b=>"has, comma"'::hstore, 0.1,        ARRAY['x','y,z']),
+        ('sad',   'k=>v'::hstore,                  12345.6789, ARRAY['solo']),
+        ('ok',    NULL,                            NULL,       NULL);
+      """)
+
+      IO.puts("✅ exotic_types populated")
+    end)
+
+    count_exotic()
+  end
+
+  @doc "What PostgreSQL itself renders, to diff the snapshot against."
+  def count_exotic do
+    with_repo(fn repo ->
+      %{rows: rows} =
+        Ecto.Adapters.SQL.query!(repo, """
+        SELECT id, feeling::text, attrs::text, price::text, tags::text
+        FROM public.exotic_types ORDER BY id;
+        """)
+
+      IO.puts("📊 exotic_types as PostgreSQL text:")
+      for r <- rows, do: IO.puts("   " <> inspect(r))
+    end)
+  end
+
+  @doc """
   Reset to nothing: drops every table this scenario touches and clears the migration
   log, so `step1` starts from a clean slate.
 
@@ -87,7 +128,7 @@ defmodule Emitter.Scenario do
     with_repo(fn repo ->
       # The t_* tables are hand-made fixtures from earlier manual testing, not
       # migrations. Dropped too, so the scenario starts against a clean publication.
-      for t <- ~w(users test_types users_no_pk t_nopk t_single t_composite) do
+      for t <- ~w(users test_types users_no_pk exotic_types t_nopk t_single t_composite) do
         Ecto.Adapters.SQL.query!(repo, "DROP TABLE IF EXISTS public.#{t} CASCADE;")
       end
 
