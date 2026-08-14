@@ -32,7 +32,8 @@ src/test_files/
 .expert/
 .DS_Store
 docs/
-zold/
+/zold/
+
 examples/01-micro_vm-nodejs/node_modules/
 examples/02-micro_vm-python/__pycache__/
 examples/03-browser-python-django/venv/
