@@ -480,7 +480,34 @@ export default function App() {
       for await (const msg of initSub) {
         let decoded: any;
         try { decoded = decode(msg.data); } catch { decoded = sc.decode(msg.data); }
-        appendLog(msg.subject, decoded, 'INIT');
+
+        if (msg.subject.includes('.start.')) {
+          // Truncate table
+          const table = decoded.table;
+          if (table) {
+            await sql(`DELETE FROM ${table}`); // Delete all to reseed
+            appendLog(msg.subject, `Truncated ${table} for snapshot re-seed`, 'INIT');
+          }
+        } else if (msg.subject.includes('.meta.')) {
+          // End of snapshot, update table LSN
+          const table = decoded.table;
+          const state = syncedTables.get(table);
+          if (state && table) {
+            state.lsn = decoded.lsn;
+            appendLog(msg.subject, `Snapshot for ${table} finished at LSN ${decoded.lsn}`, 'INIT');
+          }
+        } else if (decoded.operation === 'snapshot' && decoded.data) {
+          // Apply chunk rows
+          const table = decoded.table;
+          const state = syncedTables.get(table);
+          if (state && table) {
+            for (const row of decoded.data) {
+              await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: decoded.lsn });
+            }
+          }
+        } else {
+          appendLog(msg.subject, decoded, 'INIT');
+        }
       }
     })();
   };
