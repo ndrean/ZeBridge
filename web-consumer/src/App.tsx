@@ -322,6 +322,13 @@ export default function App() {
   const applyEvent = async (table: string, ev: any) => {
     const state = syncedTables.get(table);
     if (!state || !ev?.data) return;
+
+    // The LSN Gate: ignore stale events replayed from the stream if the table 
+    // has already advanced past them (e.g. via a recent snapshot).
+    if (ev.lsn <= state.lsn) {
+      return; 
+    }
+
     const op = ev.operation;
 
     if (op === 'INSERT' || op === 'UPDATE') {
