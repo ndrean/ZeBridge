@@ -22,6 +22,7 @@ resume, detect a gap, or seed from a snapshot.
 | **D** offline schema changes | ⚠️ partly — see notes |
 | **E** error paths | ✅ yes |
 | **F** suspension lifecycle | ✅ yes — verified end to end |
+| **G** binary COPY & exotic types | ✅ yes — verified end to end |
 
 Running a B scenario before D is done looks like success (no error appears) while
 nothing is actually verified. Do not tick those off early.
@@ -181,6 +182,56 @@ longer exist upstream. That is the suspension contract working as designed — l
 is frozen at the suspension LSN, not kept in sync — and it is why a client should
 re-seed from a snapshot after a suspension rather than trusting its frozen copy. Once
 snapshots support composite keys, F6 should end with a re-seed.
+
+---
+
+## G. Binary COPY and exotic types — runnable now ✅ verified
+
+Continues the `Emitter.Scenario` steps. Needs no client work: the assertions are the
+bridge log and the chunk payload read with the `nats` CLI.
+
+```bash
+cd emitter
+mix run --no-start -e 'Emitter.Scenario.step7()'   # ENUM + HSTORE + NUMERIC + TEXT[]
+mix run --no-start -e 'Emitter.Scenario.step8()'   # populate, and print PG's own text
+```
+
+`step8` prints exactly what PostgreSQL renders, which is the reference to diff against:
+
+```
+[1, "happy", "\"a\"=>\"1\", \"b\"=>\"has, comma\"", "0.10000000", "{x,\"y,z\"}"]
+[2, "sad",   "\"k\"=>\"v\"",                          "12345.67890000", "{solo}"]
+[3, "ok",    nil, nil, nil]
+```
+
+| # | action | expect |
+| --- | --- | --- |
+| G1 | `nats pub snapshot.request.exotic_types ''` | 🔴 **refused**: `column 'attrs' has unsupported type OID <n> (typtype 'b')`. ✅ verified |
+| G2 | Same, after `ALTER TABLE exotic_types DROP COLUMN attrs` | ✅ succeeds — the ENUM passes through as its label (`happy`/`sad`/`ok`, exact). ✅ verified |
+| G3 | Read the chunk, check `price` | `0.10000000` / `12345.67890000` — byte-identical to PG text. The `atttypmod` padding. ✅ verified |
+| G4 | Snapshot `users` (composite PK, after F5) | 🔴 `CompositePrimaryKeyUnsupported`. ✅ verified |
+| G5 | Snapshot a table with a comma or newline inside a `TEXT` value | Value intact. Under CSV this split the row and shifted every later column. ✅ verified on `test_types` |
+
+**G1 is the one that matters.** Before the `typtype` guard, this snapshot *succeeded*
+and shipped hstore's binary wire form as a string — `\0\0\0\1\0\0\0\1k\0\0\0\1v` —
+behind a single `log.warn`. A green log line was not evidence of a correct snapshot,
+which is the reason this group exists.
+
+### Not yet asserted here
+
+- **Array quoting.** Confirmed systematic across two tables: the bridge writes
+  `{"x","y,z"}` and `{"solo"}` where Postgres writes `{x,"y,z"}` and `{solo}`. Both are
+  valid array literals and parse identically, but a golden test asserting byte equality
+  with text `COPY` will fail until this is settled (`COPY_BINARY_PLAN.md` §F).
+- **Client-visible errors.** G1 and G4 abort server-side without publishing to
+  `init.snap.error.<table>` (`PROTOCOL.md` §6). The client sees silence, not a reason.
+- **CDC with an exotic column.** `exotic_types` is in the publication, so INSERTs into
+  it exercise the CDC path — which has no `typtype` guard, so hstore corrupts there
+  exactly as it did in snapshots. Worth adding as G6 once `COPY_BINARY_PLAN.md` §E lands.
+- **Cross-version.** The decoder deserves a golden-value run against several PG majors.
+  Note `pgoutput`'s `binary` option needs **PG 14+**, so the bridge will not start on
+  older servers — but `COPY ... FORMAT binary` works back to 7.4, so the decoder alone
+  can be exercised much further back.
 
 ---
 

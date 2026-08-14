@@ -404,6 +404,16 @@ KV is a **materialised view of the latest value per key**. That fits *state*
 | `table_not_monitored` | table is not in the publication this bridge replicates | do not retry; check `available_tables` |
 | `generation_failed` | the `COPY` failed (permissions, lock, connection) | retry with backoff |
 
+⚠️ **Known gap:** two snapshot failures currently abort server-side without publishing
+anything to `init.snap.error.<table>`, so a client sees only silence and must rely on
+its own timeout:
+
+- a **composite primary key** — pagination needs row-value keyset comparison, which is
+  not implemented (§8). Paging on the first key column alone would be *wrong*, not
+  merely partial: that column is not unique, so a chunk boundary inside a run of equal
+  values silently skips the rest of the run.
+- an **unsupported column type** — see below.
+
 ⚠️ `table_refused` and `table_not_monitored` are **not** retryable — retrying either
 is a busy-loop against a condition only a migration or a config change will clear.
 
@@ -498,6 +508,42 @@ leak and expire. Client-stored position keeps the server stateless.
 
 ---
 
+### Snapshot values come from the same decoder as CDC
+
+Snapshots use `COPY ... FORMAT binary` and decode through `pgoutput.decodeBinColumnData`
+— the decoder the CDC path already uses. A value is therefore identical whether it
+reached the client by seed or by stream; previously the two could differ and nothing
+would have said so.
+
+Two consequences worth knowing:
+
+- `NUMERIC` is padded to its **declared scale**, so `numeric(20,8)` holding `0.1`
+  arrives as `0.10000000`, matching what text `COPY` emitted. This matters because
+  NUMERIC maps to SQLite **TEXT** (§3), and in TEXT `'0.1000' = '0.10000000'` is false.
+- Arrays keep the Postgres literal form (`{x,"y,z"}`), not JSON. ⚠️ The bridge quotes
+  elements slightly more eagerly than Postgres does — `{"x","y,z"}` where Postgres
+  writes `{x,"y,z"}`. Both parse identically as array literals; they are not byte-equal.
+
+**Unsupported column types are refused, not guessed.** Extension and user-defined types
+get per-database OIDs, so they can never be constants in the decoder. `pg_type.typtype`
+decides what happens:
+
+| typtype | example | behaviour |
+| --- | --- | --- |
+| `e` (enum) | `CREATE TYPE mood AS ENUM (...)` | ✅ passes through — Postgres sends enum **labels as text** in binary |
+| anything else | `hstore`, composite, range, PostGIS | 🔴 snapshot refused, naming the column and OID |
+
+The refusal exists because the alternative was observed in practice: an `hstore` column
+was emitting its binary wire form — `\0\0\0\1\0\0\0\1k\0\0\0\1v` — as a string value
+behind nothing but a warning. Plausible-looking, entirely wrong, and undetectable
+downstream.
+
+⚠️ **The CDC path does not have this guard yet.** It decodes with OIDs from the
+`RELATION` message, which carries no `typtype`, so an `hstore` column in a published
+table still corrupts CDC events the same way. Planned fix in `COPY_BINARY_PLAN.md` §E.
+
+---
+
 ## 7. Ordering guarantees
 
 What the bridge promises:
@@ -532,6 +578,7 @@ Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 | composite PK | ✅ CDC fully supported; ⚠️ snapshots not yet implemented |
 | **no PK, any replica identity** | 🔴 **refused** — suspended, events dropped |
 | `TRANSITION_RULES` without `FULL` | ⚠️ transitions can never fire — silently inert |
+| column of an unsupported type | ⚠️ CDC flows (unguarded, see §6); snapshots refused |
 
 **A table with no primary key is refused, not warned about.** Without a key a row
 cannot be identified, so a DELETE could only be expressed as a full-row match — which

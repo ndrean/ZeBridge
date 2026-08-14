@@ -233,7 +233,7 @@ the type-namespace problem the main tree just removed via `addTranslateC`.
 
 ---
 
-# C. COPY BINARY — the actual plan (not started)
+# C. COPY BINARY — ✅ DONE (2026-08-14), verified live
 
 ## Why
 
@@ -333,7 +333,116 @@ reconstructing both.
 
 ---
 
-# D. After COPY BINARY — bi-directional write path (NATS → ZeBridge → Postgres)
+---
+
+# E. CDC type guard — carry `typtype` on the DDL event (not started)
+
+## The gap
+
+`decodeBinColumnData` ends in `else => { log.warn("Unknown type OID"); return .{ .text
+= raw_bytes }; }`. That is **correct for an enum** — Postgres sends enum labels as text
+in binary — and **silent corruption for anything else**. Observed live: an `hstore`
+column shipped its binary wire form, `\0\0\0\1\0\0\0\1k\0\0\0\1v`, as a string value.
+
+The snapshot path is now guarded: `getTableColumns` fetches `pg_type.typtype`, and
+`decodeTuple` refuses any unknown OID that is not `'e'` (§C, verified).
+
+**CDC is still open.** It decodes with OIDs from the `RELATION` message, which carries
+no `typtype`, so it hits the unguarded fallback.
+
+## Why not a catalog lookup on RELATION
+
+That was the first idea and it is worse: `RELATION` arrives on the replication hot path,
+and a blocking `pg_type` query there is exactly what we avoided elsewhere.
+
+**Better seam: the DDL event already runs inside Postgres.** The event trigger has full
+catalog access, so the type facts are free at the point they are produced. Add them to
+`schema_def` and the bridge never queries at runtime.
+
+## Design
+
+1. **`init.sql.template`** — add `oid` and `typtype` per column to the `schema_def`
+   JSON the event trigger builds.
+
+   Ship **facts, not policy**. Do *not* emit a `supported: true/false` flag: Postgres
+   has no idea which OIDs the Zig decoder implements, and encoding that judgement in SQL
+   puts the capability list in two places that will drift. The bridge has `isKnownOid`;
+   it only needs `typtype` to classify the unknowns.
+
+2. **Keep it off the client payload.** `schema_def` is bridge-facing; the KV value is
+   client-facing, and they are already different shapes. Consume `oid`/`typtype` when
+   building the KV payload and do not forward them — a client has no use for an OID.
+
+3. **Two populators, mirroring `refused_tables`.**
+   - `event_processor.packDdlToSlot` — everything that changes while the bridge runs.
+   - `publishBootSchemas` — tables that have had no DDL since startup. It already runs a
+     per-table catalog query; add `typtype` to it.
+
+4. **An OID → typtype cache**, consulted by the CDC decode path.
+
+   **It never needs invalidating.** A type's OID lives as long as the type does; drop
+   and recreate it and you get a *new* OID arriving on a *new* DDL event, so a stale
+   entry describes something that can no longer appear on the wire.
+
+5. **Fail closed.** An unknown OID with *no* cache entry must refuse, never fall back to
+   text. The current fallback is the open version of exactly this, and it is what
+   shipped hstore bytes as a string.
+
+6. **Failure action: suspend the table.** Reuse `refused_tables` — it already implements
+   freeze-don't-drop, and the client already handles the signal. Needs a second reason
+   string beside `no_primary_key`, e.g. `unsupported_column_type`, carrying the column
+   name so the operator knows what to change. "This table has a column I cannot decode"
+   is the same shape of problem as "this table has no key".
+
+## Check first
+
+Whether the tuple decoder branches on pgoutput's per-column format byte (`n` null,
+`u` unchanged-toast, `t` text, `b` binary) at all. If it assumes binary for everything,
+that is an independent bug underneath this one and changes what the fix looks like.
+
+Note the format byte is *not* the discriminator we need: `hstore` has `hstore_send` and
+`mood` has `enum_send`, so both arrive as `b`. It tells you the encoding, not whether we
+can decode it.
+
+---
+
+# F. Smaller items left from the COPY BINARY work
+
+- **Array quoting.** The bridge writes `{"x","y,z"}` where Postgres writes `{x,"y,z"}` —
+  both valid array literals, parsing identically, but not byte-equal. Blocks a golden
+  test that asserts byte equality with text `COPY`.
+- **Snapshot failures are silent to clients.** `CompositePrimaryKeyUnsupported` and
+  `UnsupportedColumnType` abort server-side without publishing to
+  `init.snap.error.<table>`. Both deserve an `error_type` (`PROTOCOL.md` §6).
+- **Fold the two catalog queries.** `getTablePrimaryKey` and `getTableColumns` are
+  already merged for the *binary* generator; the older CSV generator still calls
+  `getTablePrimaryKey`. Goes away with CSV.
+- **Golden-value test per PG major.** `pgoutput`'s `binary` option needs PG 14+, so the
+  bridge will not start on older servers — but `COPY ... FORMAT binary` works back to
+  7.4, so the decoder alone can be exercised much further back.
+- **Do not prune CSV yet.** The rollout gate — binary completes a full bootstrap with a
+  consumer reconstructing the table — is unreachable until client item **D** lands,
+  because the consumer cannot apply snapshots at all. Delete CSV with evidence, not on a
+  green log line.
+
+## Next up, in order
+
+1. **Composite keyset pagination** — now unblocked and sitting on typed values, which
+   was the reason for doing COPY BINARY first. `ColumnMeta.pk_ord` already carries the
+   whole key, so this is a change to pagination alone: `WHERE (a,b) > (?,?)`,
+   `ORDER BY a,b`, capture N cursor values.
+2. **§E above** — the CDC type guard.
+3. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
+   snapshot application. Unblocks TEST_SCENARIOS groups B, C3, C4, D2, lets F6 end in a
+   re-seed instead of a caveat, and opens the gate on deleting CSV.
+
+---
+
+# D. The headline feature — bi-directional write path (NATS → ZeBridge → Postgres)
+
+> Ordered last deliberately: sections E and F are the open work on the read path, and
+> this is the next *feature*. Section letters are historical, not a running order —
+> see "Next up, in order" at the end of §F.
 
 The headline feature. Design settled 2026-08-10; not started.
 
