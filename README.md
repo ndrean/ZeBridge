@@ -66,7 +66,6 @@ flowchart TD
 ## Table of Contents
 
 * [Overview](#overview)
-* [Design Philosophy](#design-philosophy)
 * [Prerequisites](#prerequisites)
 * [Consumer Integration Guide](#consumer-integration-guide)
 * [Running the Bridge](#running-the-bridge)
@@ -936,13 +935,361 @@ ZeBridge uses a **NATS JetStream Limits Retention** policy (`--max-age=1m`, `--m
 
 ## Architecture
 
-### Thread Model (5 Threads)
+### Thread Model (6 Threads)
 
 1. **Main thread**: Consumes PostgreSQL CDC, parses pgoutput format
 2. **Batch publisher thread**: Batches events, encodes MessagePack, publishes to NATS CDC stream
 3. **WAL monitor thread**: Tracks replication slot lag every 30 seconds
 4. **HTTP telemetry thread**: Serves `/metrics`, `/health`, `/status`, `/shutdown`
 5. **Snapshot listener thread**: Subscribes to `snapshot.request.>`, generates snapshots on-demand
+6. **Mutation thread**: Subscribes to `mutation.>`, receives pushes of new messages
+
+### Practical Performance of SPSC
+
+**Producer-Consumer pattern:**
+
+* **Producer**: Main thread (reading WAL)
+* **Consumer**: Batch publisher thread
+* **Queue**: 65536 slots (2^16), ~4MB memory
+
+**Dual purpose:**
+
+1. **Thread separation** (primary): Decouple WAL reading from NATS publishing
+2. **Resilience buffer** (critical): Absorb WAL events during NATS reconnection
+
+**How it handles NATS outages:**
+
+```txt
+NATS goes down at T=0
+├─ Main thread continues reading WAL → pushes to queue
+├─ Flush thread can't publish → queue fills up
+├─ Queue fills (65536 slots) → ~1s buffer at 60K events/s
+├─ Queue full → Main thread backs off (sleeps 1ms per attempt)
+├─ PostgreSQL WAL starts accumulating (controlled)
+│
+NATS reconnects at T=1000ms+ (reconnect_wait covered by queue buffer)
+├─ Flush thread resumes publishing
+├─ Queue drains rapidly (~1s of buffered events)
+└─ Bridge catches up, resumes ACK'ing PostgreSQL
+```
+
+**Backpressure cascade:**
+
+```txt
+NATS outage → Queue fills → Main thread slows → PostgreSQL WAL accumulates
+                                                         ↓
+                                           (up to max_slot_wal_keep_size=10GB)
+```
+
+**Graceful degradation:**
+
+* Queue absorbs microsecond-scale jitter (lock-free, wait-free)
+* PostgreSQL WAL absorbs second-scale outages (up to 1s queue buffer)
+* `max_slot_wal_keep_size=10GB` absorbs minute-scale outages
+* Beyond that → alerts fire (intentional)
+
+### Data Flow
+
+```txt
+PostgreSQL WAL
+    ↓
+Main Thread (parse pgoutput)
+    ↓
+SPSC Queue (lock-free)
+    ↓
+Batch Publisher Thread
+    ↓ (batch: 500 events OR 100ms OR 256KB)
+MessagePack Encoding
+    ↓
+NATS JetStream (async publish)
+    ↓ (JetStream ACK)
+PostgreSQL LSN ACK
+```
+
+### Memory Management
+
+**Arena allocator:**
+
+* Reused for each WAL message
+* Retains capacity across messages
+* Avoids allocator churn at high throughput
+
+**Ownership transfer:**
+
+* Decoded column values transferred via SPSC queue
+* Batch publisher thread frees after publishing
+* No shared state between threads
+
+### Replication Slot Management
+
+**On startup:**
+
+1. Bridge creates replication slot (if not exists)
+2. Gets current LSN to skip historical data
+3. Starts streaming from current LSN
+
+**During operation:**
+
+* Bridge sends status updates every 1 second OR 1MB data
+* PostgreSQL prunes WAL up to last ACK'd LSN
+
+**On shutdown:**
+
+* Bridge sends final ACK with last confirmed LSN
+* Replication slot preserves position for restart
+
+### Reconnection Handling
+
+**PostgreSQL reconnection:**
+
+* Connection lost → Bridge waits 5 seconds
+* Gets latest LSN
+* Reconnects and resumes streaming
+* Metrics track reconnection count
+
+**NATS reconnection:**
+
+* Automatic (handled by nats.c library)
+* Max attempts: -1 (infinite)
+* Wait between attempts: 1 second (aggressive for CDC)
+* Flush timeout: 10 seconds (allows ~10 retry attempts)
+
+## Build Instructions
+
+### Prerequisites
+
+* Zig 0.16.0 or later
+* Docker & Docker Compose (for PostgreSQL and NATS)
+* CMake (for building nats.c library)
+
+### 1. Build Vendored Libraries (One-Time Setup)
+
+```bash
+# Build nats.c v3.12.0
+./build_nats.sh
+
+# Build libpq for PostgreSQL 18.1
+./build_libpq.sh
+```
+
+This compiles:
+
+* `nats.c` → `libs/nats-install/`
+* `libpq` → `libs/libpq-install/`
+
+### 2. Start Infrastructure
+
+```bash
+# Start PostgreSQL with logical replication enabled
+docker compose up -d postgres
+
+# Start NATS server with JetStream enabled
+docker compose up -d nats-server nats-config-gen nats-init
+```
+
+### 3. Build the Bridge
+
+```bash
+zig build
+```
+
+Output: `./zig-out/bin/bridge`
+
+### 4. Run Tests
+
+```bash
+zig build test
+```
+
+---
+
+## Configuration
+
+All configuration constants are centralized in `src/config.zig`.
+
+### Key Settings
+
+**Snapshot configuration:**
+
+* Chunk size: `10_000` rows per batch
+* Subject pattern: `init.snap.{table}.{snapshot_id}.{chunk}`
+* Metadata subject: `init.meta.{table}`
+* Request subject: `snapshot.request.{table}`
+
+**CDC configuration:**
+
+* Batch size: `500` events OR `100ms` OR `256KB` (whichever first)
+* Subject pattern: `cdc.{table}.{operation}`
+* Message ID: `{lsn}-{table}-{operation}`
+
+**NATS configuration:**
+
+* Max reconnect attempts: `-1` (infinite)
+* Reconnect wait: `2000ms`
+* Flush timeout: `10_000ms` (10 seconds)
+* Status update interval: `1` second OR `1MB` data
+
+**WAL monitoring:**
+
+* Check interval: `30` seconds
+* Warning threshold: `512MB`
+* Critical threshold: `1GB`
+
+**Buffer sizes:**
+
+* SPSC queue: `65536` slots (2^16, ~1092ms buffer at 60K events/s)
+* Subject buffer: `128` bytes
+* Message ID buffer: `128` bytes
+
+See `src/config.zig` for all tunables.
+
+---
+
+## Dependencies
+
+**Managed via `build.zig.zon`:**
+
+* [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding
+
+**Vendored:**
+
+* [nats.c](https://github.com/nats-io/nats.c) v3.12.0 - NATS client (C library)
+* [libpq](https://www.postgresql.org/docs/current/libpq.html) PostgreSQL 18.1
+
+---
+
+## Testing
+
+### End-to-End CDC Pipeline Test
+
+**Terminal 1 - Start the bridge:**
+
+```sh
+docker compose -f docker-compose.prod.yml --env-file .env.prod up
+
+source .env.local
+
+./zig-out/bin/bridge --slot my_slot --pub cdc_slot
+```
+
+**Terminal 2 - Generate CDC events:**
+
+```sh
+cd consumer && iex -S mix
+
+# Generate 100 INSERT events
+iex> PgProducer.bulk(10)
+
+# Parallel load test: 100 batches of 10 events each every 1ms
+iex> PgProducer.stream(100, 10, 1)
+```
+
+### HTTP Endpoint Tests
+
+```sh
+# Health check
+curl http://localhost:9090/health
+
+# Bridge status
+curl http://localhost:9090/status | jq
+
+# Prometheus metrics
+curl http://localhost:9090/metrics
+
+# Stream management
+curl http://localhost:9090/streams/info?stream=CDC | jq
+
+# Graceful shutdown
+curl -X POST http://localhost:9090/shutdown
+```
+
+### Monitoring Replication Slot
+
+```bash
+docker exec -it postgres psql -U postgres -c "
+  SELECT slot_name, active,
+         pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
+  FROM pg_replication_slots
+  WHERE slot_name = 'cdc_slot';
+"
+```
+
+---
+
+## Roadmap
+
+**Planned enhancements:**:
+
+* [ ] Snapshot compression (zstd). Removed in favour of a smaller core; the earlier dictionary-based implementation is preserved on the `archive/zstd-compression` branch (cf <https://github.com/ndrean/zig-zstd>).
+* [ ] Metrics export to StatsD/InfluxDB
+* [ ] Integrate MySQL connector option?
+
+**Open questions:**:
+
+* Can we reach 100K+ events/s per instance with more CPU or further optimizations?
+
+**Contributions welcome!** This is a learning project as much as a tool. If you find it useful (or find gaps), feedback is valuable.
+
+---
+
+## License
+
+This project uses:
+
+* [nats.c](https://github.com/nats-io/nats.c) (Apache 2.0)
+* [zig-msgpack](https://github.com/zigcc/zig-msgpack) (MIT)
+
+---
+
+## Notes
+
+* The nats.c library is built with TLS enabled
+* The library is statically linked to avoid runtime dependencies
+* PostgreSQL logical replication requires `wal_level=logical`
+* All C code is compiled with `-std=c11`
+
+**Example how to generate nkey for NATS**:
+
+```sh
+brew install nats-io/nats-tools/nats
+nk -gen user -pubout
+
+# private: SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI
+# public: UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV
+```
+
+In _nats-server.conf_, set:
+
+```diff
+authorization {
+  users: [
+-    # { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" } <-- remove
++    { nkey: "UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV"}
+  ]
+}
+```
+
+Start the bridge daemon with the private nkey:
+
+```sh
+NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI  RING_BUFFER_COUNT=2048 \
+BASE_BUF=12 \
+PG_HOST=localhost \
+PG_PORT=55432 \
+PG_DB=postgres \
+POSTGRES_BRIDGE_USER=bridge_reader \
+POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme \
+NATS_HOST=localhost \
+NATS_BRIDGE_USER=bridge_user \
+NATS_BRIDGE_PASSWORD=bridge_secure_password \
+./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
+```
+
+**Kill zombie processes:**
+
+```bash
+ps aux | grep bridge | grep -v grep | awk '{print $2}' | xargs kill
+```
 
 ### Lock-Free Queue (SPSC): A nice Piece of Computer Art
 
@@ -1201,407 +1548,3 @@ This queue is **wait-free**, not just lock-free because:
 * each operation completes in a bounded number of steps, regardless of the other thread’s behavior.
 
 If we had multiple writers, we'd need CAS loops with retries (see the video for details).
-
-#### Practical Performance
-
-**Producer-Consumer pattern:**
-
-* **Producer**: Main thread (reading WAL)
-* **Consumer**: Batch publisher thread
-* **Queue**: 65536 slots (2^16), ~4MB memory
-
-**Dual purpose:**
-
-1. **Thread separation** (primary): Decouple WAL reading from NATS publishing
-2. **Resilience buffer** (critical): Absorb WAL events during NATS reconnection
-
-**How it handles NATS outages:**
-
-```txt
-NATS goes down at T=0
-├─ Main thread continues reading WAL → pushes to queue
-├─ Flush thread can't publish → queue fills up
-├─ Queue fills (65536 slots) → ~1s buffer at 60K events/s
-├─ Queue full → Main thread backs off (sleeps 1ms per attempt)
-├─ PostgreSQL WAL starts accumulating (controlled)
-│
-NATS reconnects at T=1000ms+ (reconnect_wait covered by queue buffer)
-├─ Flush thread resumes publishing
-├─ Queue drains rapidly (~1s of buffered events)
-└─ Bridge catches up, resumes ACK'ing PostgreSQL
-```
-
-**Backpressure cascade:**
-
-```txt
-NATS outage → Queue fills → Main thread slows → PostgreSQL WAL accumulates
-                                                         ↓
-                                           (up to max_slot_wal_keep_size=10GB)
-```
-
-**Graceful degradation:**
-
-* Queue absorbs microsecond-scale jitter (lock-free, wait-free)
-* PostgreSQL WAL absorbs second-scale outages (up to 1s queue buffer)
-* `max_slot_wal_keep_size=10GB` absorbs minute-scale outages
-* Beyond that → alerts fire (intentional)
-
-### Data Flow
-
-```txt
-PostgreSQL WAL
-    ↓
-Main Thread (parse pgoutput)
-    ↓
-SPSC Queue (lock-free)
-    ↓
-Batch Publisher Thread
-    ↓ (batch: 500 events OR 100ms OR 256KB)
-MessagePack Encoding
-    ↓
-NATS JetStream (async publish)
-    ↓ (JetStream ACK)
-PostgreSQL LSN ACK
-```
-
-### Memory Management
-
-**Arena allocator:**
-
-* Reused for each WAL message
-* Retains capacity across messages
-* Avoids allocator churn at high throughput
-
-**Ownership transfer:**
-
-* Decoded column values transferred via SPSC queue
-* Batch publisher thread frees after publishing
-* No shared state between threads
-
-### Replication Slot Management
-
-**On startup:**
-
-1. Bridge creates replication slot (if not exists)
-2. Gets current LSN to skip historical data
-3. Starts streaming from current LSN
-
-**During operation:**
-
-* Bridge sends status updates every 1 second OR 1MB data
-* PostgreSQL prunes WAL up to last ACK'd LSN
-
-**On shutdown:**
-
-* Bridge sends final ACK with last confirmed LSN
-* Replication slot preserves position for restart
-
-### Reconnection Handling
-
-**PostgreSQL reconnection:**
-
-* Connection lost → Bridge waits 5 seconds
-* Gets latest LSN
-* Reconnects and resumes streaming
-* Metrics track reconnection count
-
-**NATS reconnection:**
-
-* Automatic (handled by nats.c library)
-* Max attempts: -1 (infinite)
-* Wait between attempts: 1 second (aggressive for CDC)
-* Flush timeout: 10 seconds (allows ~10 retry attempts)
-
----
-
-## Comparison to Alternatives
-
-### vs. Debezium (The Proven Solution)
-
-|                        | This Bridge                     | Debezium                              |
-| ---------------------- | ------------------------------- | ------------------------------------- |
-| **Maturity**           | ⚠️ Experimental                  | ✅ Battle-tested (years in production) |
-| **Footprint**          | 15MB / 10MB RAM                 | 500MB+ / 512MB+ RAM                   |
-| **Architecture**       | NATS-native                     | Kafka-centric                         |
-| **Deployment**         | Single binary                   | Kafka Connect cluster                 |
-| **Throughput**         | ~60K events/s (single-threaded) | High (multi-threaded)                 |
-| **Connectors**         | PostgreSQL → NATS only          | 100+ sources/sinks                    |
-| **Enterprise Support** | ❌ None                          | ✅ Available                           |
-
-**When to use Debezium instead:**
-
-* You need proven reliability (battle-tested in thousands of deployments)
-* You're already running Kafka infrastructure
-* You need connectors for MySQL, MongoDB, Oracle, etc.
-* You need enterprise support contracts
-
-**When to try this bridge:**
-
-* You're using NATS (or evaluating it)
-* You value small footprint / simple deployment
-* You're comfortable with early-stage software
-* You only need PostgreSQL → NATS
-
-### vs. Benthos / pgstream
-
-**Benthos** (Redpanda):
-
-* General-purpose streaming (many sources/sinks)
-* ~20-30MB footprint
-* Flexible but less CDC-optimized
-
-**pgstream** (Xata):
-
-* Go-based CDC library
-* ~15-20MB footprint
-* Similar philosophy (lightweight)
-* Multiple destinations (Kafka, webhooks, etc.)
-
-**This bridge:**
-
-* NATS-specific (not general-purpose)
-* Built-in bootstrapping (not manual)
-* Zig-native (compiled, minimal overhead)
-
-### Honest Take
-
-If you're betting on mission-critical CDC, use Debezium. If you're exploring NATS and want a lightweight CDC solution, this is worth trying.
-
----
-
-## Build Instructions
-
-### Prerequisites
-
-* Zig 0.16.0 or later
-* Docker & Docker Compose (for PostgreSQL and NATS)
-* CMake (for building nats.c library)
-
-### 1. Build Vendored Libraries (One-Time Setup)
-
-```bash
-# Build nats.c v3.12.0
-./build_nats.sh
-
-# Build libpq for PostgreSQL 18.1
-./build_libpq.sh
-```
-
-This compiles:
-
-* `nats.c` → `libs/nats-install/`
-* `libpq` → `libs/libpq-install/`
-
-### 2. Start Infrastructure
-
-```bash
-# Start PostgreSQL with logical replication enabled
-docker compose up -d postgres
-
-# Start NATS server with JetStream enabled
-docker compose up -d nats-server nats-config-gen nats-init
-```
-
-### 3. Build the Bridge
-
-```bash
-zig build
-```
-
-Output: `./zig-out/bin/bridge`
-
-### 4. Run Tests
-
-```bash
-zig build test
-```
-
----
-
-## Configuration
-
-All configuration constants are centralized in `src/config.zig`.
-
-### Key Settings
-
-**Snapshot configuration:**
-
-* Chunk size: `10_000` rows per batch
-* Subject pattern: `init.snap.{table}.{snapshot_id}.{chunk}`
-* Metadata subject: `init.meta.{table}`
-* Request subject: `snapshot.request.{table}`
-
-**CDC configuration:**
-
-* Batch size: `500` events OR `100ms` OR `256KB` (whichever first)
-* Subject pattern: `cdc.{table}.{operation}`
-* Message ID: `{lsn}-{table}-{operation}`
-
-**NATS configuration:**
-
-* Max reconnect attempts: `-1` (infinite)
-* Reconnect wait: `2000ms`
-* Flush timeout: `10_000ms` (10 seconds)
-* Status update interval: `1` second OR `1MB` data
-
-**WAL monitoring:**
-
-* Check interval: `30` seconds
-* Warning threshold: `512MB`
-* Critical threshold: `1GB`
-
-**Buffer sizes:**
-
-* SPSC queue: `65536` slots (2^16, ~1092ms buffer at 60K events/s)
-* Subject buffer: `128` bytes
-* Message ID buffer: `128` bytes
-
-See `src/config.zig` for all tunables.
-
----
-
-## Dependencies
-
-**Managed via `build.zig.zon`:**
-
-* [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding
-
-**Vendored:**
-
-* [nats.c](https://github.com/nats-io/nats.c) v3.12.0 - NATS client (C library)
-* [libpq](https://www.postgresql.org/docs/current/libpq.html) PostgreSQL 18.1
-
----
-
-## Testing
-
-### End-to-End CDC Pipeline Test
-
-**Terminal 1 - Start the bridge:**
-
-```sh
-docker compose -f docker-compose.prod.yml --env-file .env.prod up
-
-source .env.local
-
-./zig-out/bin/bridge --slot my_slot --pub cdc_slot
-```
-
-**Terminal 2 - Generate CDC events:**
-
-```sh
-cd consumer && iex -S mix
-
-# Generate 100 INSERT events
-iex> PgProducer.bulk(10)
-
-# Parallel load test: 100 batches of 10 events each every 1ms
-iex> PgProducer.stream(100, 10, 1)
-```
-
-### HTTP Endpoint Tests
-
-```sh
-# Health check
-curl http://localhost:9090/health
-
-# Bridge status
-curl http://localhost:9090/status | jq
-
-# Prometheus metrics
-curl http://localhost:9090/metrics
-
-# Stream management
-curl http://localhost:9090/streams/info?stream=CDC | jq
-
-# Graceful shutdown
-curl -X POST http://localhost:9090/shutdown
-```
-
-### Monitoring Replication Slot
-
-```bash
-docker exec -it postgres psql -U postgres -c "
-  SELECT slot_name, active,
-         pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
-  FROM pg_replication_slots
-  WHERE slot_name = 'cdc_slot';
-"
-```
-
----
-
-## Roadmap
-
-**Planned enhancements:**:
-
-* [ ] Snapshot compression (zstd). Removed in favour of a smaller core; the earlier dictionary-based implementation is preserved on the `archive/zstd-compression` branch (cf <https://github.com/ndrean/zig-zstd>).
-* [ ] Metrics export to StatsD/InfluxDB
-* [ ] Integrate MySQL connector option?
-
-**Open questions:**:
-
-* Can we reach 100K+ events/s per instance with more CPU or further optimizations?
-
-**Contributions welcome!** This is a learning project as much as a tool. If you find it useful (or find gaps), feedback is valuable.
-
----
-
-## License
-
-This project uses:
-
-* [nats.c](https://github.com/nats-io/nats.c) (Apache 2.0)
-* [zig-msgpack](https://github.com/zigcc/zig-msgpack) (MIT)
-
----
-
-## Notes
-
-* The nats.c library is built with TLS enabled
-* The library is statically linked to avoid runtime dependencies
-* PostgreSQL logical replication requires `wal_level=logical`
-* All C code is compiled with `-std=c11`
-
-**Example how to generate nkey for NATS**:
-
-```sh
-brew install nats-io/nats-tools/nats
-nk -gen user -pubout
-
-# private: SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI
-# public: UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV
-```
-
-In _nats-server.conf_, set:
-
-```diff
-authorization {
-  users: [
--    # { user: "${NATS_BRIDGE_USER}", password: "${NATS_BRIDGE_PASSWORD}" } <-- remove
-+    { nkey: "UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV"}
-  ]
-}
-```
-
-Start the bridge daemon with the private nkey:
-
-```sh
-NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI  RING_BUFFER_COUNT=2048 \
-BASE_BUF=12 \
-PG_HOST=localhost \
-PG_PORT=55432 \
-PG_DB=postgres \
-POSTGRES_BRIDGE_USER=bridge_reader \
-POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme \
-NATS_HOST=localhost \
-NATS_BRIDGE_USER=bridge_user \
-NATS_BRIDGE_PASSWORD=bridge_secure_password \
-./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
-```
-
-**Kill zombie processes:**
-
-```bash
-ps aux | grep bridge | grep -v grep | awk '{print $2}' | xargs kill
-```
