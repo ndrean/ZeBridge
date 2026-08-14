@@ -422,13 +422,49 @@ export default function App() {
                  if (entry) {
                    let desc: any;
                    try { desc = decode(entry.value); } catch { desc = sc.decode(entry.value); }
-                   // Check if the cached snapshot LSN is new enough to bridge the CDC gap
-                   // For now, if a descriptor exists, we assume the chunks are in the INIT stream
-                   // and we don't need to hammer the server with a new snapshot request.
-                   // The client will just pick up the chunks from the INIT stream later via a replay.
-                   // (Detailed replay logic omitted for brevity, just avoid requesting if desc exists)
-                   appendLog('SYS', `Found existing snapshot descriptor for ${table} at LSN ${desc?.lsn}. Skipping request.`, 'INFO');
+                   appendLog('SYS', `Found existing snapshot descriptor for ${table} at LSN ${desc?.lsn}. Triggering historical replay...`, 'INFO');
                    needsRequest = false;
+
+                   // Create ephemeral JetStream consumer to pull chunks for THIS specific snapshot ID
+                   const replayConsumer = await js.consumers.get(topology.streams.init, {
+                     filterSubjects: `init.snap.${table}.${desc.snapshot_id}.>`,
+                     deliver_policy: DeliverPolicy.All, // DeliverPolicy.All (replay from beginning)
+                   });
+                   
+                   // Start asynchronous pull loop for this replay
+                   (async () => {
+                     const iter = await replayConsumer.consume();
+                     for await (const msg of iter) {
+                       let chunkDecoded: any;
+                       try { chunkDecoded = decode(msg.data); } catch { chunkDecoded = sc.decode(msg.data); }
+                       
+                       // Simulate exactly what the old Core NATS subscription did
+                       // (But now we are pulling historical chunks)
+                       // Truncate logic handles re-seeding cleanly for the frontend.
+                       if (chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
+                         const state = syncedTables.get(table);
+                         if (state) {
+                           for (const row of chunkDecoded.data) {
+                             await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: chunkDecoded.lsn });
+                           }
+                         }
+                       }
+                       msg.ack();
+                       
+                       // If we see the header indicating the final chunk, we can clean up
+                       if (msg.headers && msg.headers.get("X-Snapshot-Final-Chunk") === "true") {
+                           const state = syncedTables.get(table);
+                           if (state && desc?.lsn) {
+                             state.lsn = desc.lsn;
+                           }
+                           appendLog('SYS', `Replay finished for ${table} snapshot ${desc.snapshot_id}`, 'INFO');
+                           // We can stop the consumer loop
+                           break;
+                       }
+                     }
+                   })().catch(err => {
+                     appendLog('SYS', `Replay error for ${table}: ${err}`, 'ERROR');
+                   });
                  }
                } catch (e) { /* ignore */ }
             }
