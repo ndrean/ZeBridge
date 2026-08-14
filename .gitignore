@@ -31,6 +31,7 @@ src/test_files/
 .superpowers/
 .expert/
 .DS_Store
+docs/
 
 examples/01-micro_vm-nodejs/node_modules/
 examples/02-micro_vm-python/__pycache__/
