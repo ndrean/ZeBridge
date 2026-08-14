@@ -28,6 +28,7 @@ type TableState = {
 
 // Non-reactive state for sync tracking
 const syncedTables = new Map<string, TableState>();
+let globalSyncState = { lsn: 0, seq: 0 };
 
 /**
  * CDC events that arrived referencing columns the local schema does not have yet.
@@ -67,7 +68,25 @@ export default function App() {
     ]);
   };
 
+  const initSyncState = async () => {
+    await sql(`
+      CREATE TABLE IF NOT EXISTS _zebridge_sync (
+        id INTEGER PRIMARY KEY,
+        global_last_lsn INTEGER,
+        global_last_seq INTEGER
+      );
+    `);
+    await sql(`INSERT OR IGNORE INTO _zebridge_sync (id, global_last_lsn, global_last_seq) VALUES (1, 0, 0)`);
+    const res = await sql(`SELECT global_last_lsn, global_last_seq FROM _zebridge_sync WHERE id = 1`);
+    if (res.length > 0) {
+      globalSyncState.lsn = res[0].global_last_lsn ?? 0;
+      globalSyncState.seq = res[0].global_last_seq ?? 0;
+    }
+  };
+
   const initNats = async () => {
+    await initSyncState();
+
     if (nc) {
       try { await nc.close(); } catch {}
       nc = null;
@@ -352,6 +371,20 @@ export default function App() {
         } catch (err) {
           appendLog('SQLITE', `DELETE on ${table} failed: ${err}`, 'ERROR');
         }
+      }
+    }
+
+    if ((ev.lsn ?? 0) > globalSyncState.lsn || (ev.seq ?? 0) > globalSyncState.seq) {
+      globalSyncState.lsn = Math.max(globalSyncState.lsn, ev.lsn ?? 0);
+      globalSyncState.seq = Math.max(globalSyncState.seq, ev.seq ?? 0);
+      try {
+        await sql(
+          `UPDATE _zebridge_sync SET global_last_lsn = ?, global_last_seq = ? WHERE id = 1`,
+          globalSyncState.lsn,
+          globalSyncState.seq
+        );
+      } catch (e) {
+        appendLog('SQLITE', `Failed to update sync state: ${e}`, 'ERROR');
       }
     }
   };
