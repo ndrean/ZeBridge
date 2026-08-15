@@ -65,16 +65,21 @@ pub fn build(b: *std.Build) void {
     };
     const topology_opts = b.addOptions();
     
+    // Every name the bridge puts on the wire comes from here. `.?` on purpose: a key
+    // missing from topology.json must fail the build, not silently fall back to a
+    // literal — a literal is exactly how the bridge and nats-init drifted apart.
     const streams = parsed_topology.object.get("streams").?.object;
     topology_opts.addOption([]const u8, "stream_cdc", streams.get("cdc").?.string);
     topology_opts.addOption([]const u8, "stream_init", streams.get("init").?.string);
-    topology_opts.addOption([]const u8, "stream_schema", streams.get("schema").?.string);
-    
+    topology_opts.addOption([]const u8, "stream_mutations", streams.get("mutations").?.string);
+    topology_opts.addOption([]const u8, "stream_requests", streams.get("requests").?.string);
+
     const subjects = parsed_topology.object.get("subjects").?.object;
     topology_opts.addOption([]const u8, "subject_cdc_prefix", subjects.get("cdc_prefix").?.string);
     topology_opts.addOption([]const u8, "subject_init_prefix", subjects.get("init_prefix").?.string);
-    topology_opts.addOption([]const u8, "subject_schema_prefix", subjects.get("schema_prefix").?.string);
+    topology_opts.addOption([]const u8, "subject_mutations_prefix", subjects.get("mutations_prefix").?.string);
     topology_opts.addOption([]const u8, "snapshot_request", subjects.get("snapshot_request").?.string);
+    topology_opts.addOption([]const u8, "schema_request", subjects.get("schema_request").?.string);
     topology_opts.addOption([]const u8, "snapshot_data_pattern", subjects.get("snapshot_data_pattern").?.string);
     topology_opts.addOption([]const u8, "snapshot_start_pattern", subjects.get("snapshot_start_pattern").?.string);
     topology_opts.addOption([]const u8, "snapshot_error_pattern", subjects.get("snapshot_error_pattern").?.string);
@@ -131,10 +136,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link OpenSSL (required for pure Zig NATS TLS support)
-    exe.root_module.linkSystemLibrary("ssl", .{});
-    exe.root_module.linkSystemLibrary("crypto", .{});
-
     exe.root_module.link_libc = true;
     linkLibpq(exe, b, prefix);
 
@@ -175,8 +176,6 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     linkLibpq(mod_tests, b, prefix);
-    mod_tests.root_module.linkSystemLibrary("ssl", .{});
-    mod_tests.root_module.linkSystemLibrary("crypto", .{});
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
@@ -235,139 +234,4 @@ pub fn build(b: *std.Build) void {
     const nats_int_step = b.step("test-nats-integration", "Run vendored NATS integration tests (requires a live server)");
     nats_int_step.dependOn(&b.addRunArtifact(nats_int_tests).step);
 
-    // ===== Test executables =====
-    // Old lalinsky/nats.zig test files removed (obsolete trial code)
-    // If needed, new tests for g41797/nats can be added here
-
-    // ===== Commented out test executables - files moved to src/test_files/ =====
-    // Uncomment and update paths if needed for testing
-    //
-    // // NATS test executable
-    // const nats_test = b.addExecutable(.{
-    //     .name = "nats_test",
-    //     .root_module = b.createModule(.{
-    //         .root_source_file = b.path("src/nats_test.zig"),
-    //         .target = target,
-    //         .optimize = optimize,
-    //     }),
-    // });
-    // nats_test.addIncludePath(b.path("libs/nats-install/include"));
-    // nats_test.addLibraryPath(b.path("libs/nats-install/lib"));
-    // nats_test.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    // nats_test.linkLibC();
-    // b.installArtifact(nats_test);
-    //
-    // const nats_test_step = b.step("nats-test", "Test NATS connection");
-    // const nats_test_run = b.addRunArtifact(nats_test);
-    // nats_test_run.step.dependOn(b.getInstallStep());
-    // nats_test_step.dependOn(&nats_test_run.step);
-    //
-    // // PostgreSQL test executable
-    // const pg_test = b.addExecutable(.{
-    //     .name = "pg_test",
-    //     .root_module = b.createModule(.{
-    //         .root_source_file = b.path("src/pg_test.zig"),
-    //         .target = target,
-    //         .optimize = optimize,
-    //         .imports = &.{
-    //             .{ .name = "pg", .module = pg.module("pg") },
-    //         },
-    //     }),
-    // });
-    // b.installArtifact(pg_test);
-    //
-    // const pg_test_step = b.step("pg-test", "Test PostgreSQL connection");
-    // const pg_test_run = b.addRunArtifact(pg_test);
-    // pg_test_run.step.dependOn(b.getInstallStep());
-    // pg_test_step.dependOn(&pg_test_run.step);
-    //
-    // // CDC Demo executable
-    // const cdc_demo = b.addExecutable(.{
-    //     .name = "cdc_demo",
-    //     .root_module = b.createModule(.{
-    //         .root_source_file = b.path("src/cdc_demo.zig"),
-    //         .target = target,
-    //         .optimize = optimize,
-    //         .imports = &.{
-    //             .{ .name = "pg", .module = pg.module("pg") },
-    //             .{ .name = "msgpack", .module = msgpack.module("msgpack") },
-    //         },
-    //     }),
-    // });
-    // cdc_demo.addIncludePath(b.path("libs/nats-install/include"));
-    // cdc_demo.addLibraryPath(b.path("libs/nats-install/lib"));
-    // cdc_demo.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    // cdc_demo.linkLibC();
-    // b.installArtifact(cdc_demo);
-    //
-    // const cdc_demo_step = b.step("cdc-demo", "Run CDC bridge demo");
-    // const cdc_demo_run = b.addRunArtifact(cdc_demo);
-    // cdc_demo_run.step.dependOn(b.getInstallStep());
-    // cdc_demo_step.dependOn(&cdc_demo_run.step);
-    //
-    // // CDC Load Test executable
-    // const cdc_load_test = b.addExecutable(.{
-    //     .name = "cdc_load_test",
-    //     .root_module = b.createModule(.{
-    //         .root_source_file = b.path("src/cdc_load_test.zig"),
-    //         .target = target,
-    //         .optimize = optimize,
-    //         .imports = &.{
-    //             .{ .name = "pg", .module = pg.module("pg") },
-    //             .{ .name = "msgpack", .module = msgpack.module("msgpack") },
-    //         },
-    //     }),
-    // });
-    // // Link NATS
-    // cdc_load_test.addIncludePath(b.path("libs/nats-install/include"));
-    // cdc_load_test.addLibraryPath(b.path("libs/nats-install/lib"));
-    // cdc_load_test.addObjectFile(b.path("libs/nats-install/lib/libnats_static.a"));
-    // // Link vendored libpq
-    // linkLibpq(cdc_load_test, b);
-    // b.installArtifact(cdc_load_test);
-    //
-    // const cdc_load_test_step = b.step("load-test", "Run CDC load test");
-    // const cdc_load_test_run = b.addRunArtifact(cdc_load_test);
-    // cdc_load_test_run.step.dependOn(b.getInstallStep());
-    // cdc_load_test_step.dependOn(&cdc_load_test_run.step);
-    //
-    // // WAL Stream Test executable
-    // const wal_stream_test = b.addExecutable(.{
-    //     .name = "wal_stream_test",
-    //     .root_module = b.createModule(.{
-    //         .root_source_file = b.path("src/wal_stream_test.zig"),
-    //         .target = target,
-    //         .optimize = optimize,
-    //         .imports = &.{
-    //             .{ .name = "pg", .module = pg.module("pg") },
-    //         },
-    //     }),
-    // });
-    // // Link vendored libpq for replication protocol
-    // linkLibpq(wal_stream_test, b);
-    // b.installArtifact(wal_stream_test);
-    //
-    // const wal_stream_test_step = b.step("wal-stream-test", "Test WAL streaming with libpq");
-    // const wal_stream_test_run = b.addRunArtifact(wal_stream_test);
-    // wal_stream_test_run.step.dependOn(b.getInstallStep());
-    // wal_stream_test_step.dependOn(&wal_stream_test_run.step);
-
-    // // Connection State Test
-    // const conn_state_test = b.addExecutable(.{
-    //     .name = "connection_state_test",
-    //     .root_module = b.createModule(.{
-    //         .root_source_file = b.path("src/connection_state_test.zig"),
-    //         .target = target,
-    //         .optimize = optimize,
-    //         .imports = &.{
-    //             .{ .name = "pg", .module = pg.module("pg") },
-    //         },
-    //     }),
-    // });
-    // b.installArtifact(conn_state_test);
-    //
-    // const conn_state_test_step = b.step("conn-test", "Test connection state handling");
-    // const conn_state_test_run = b.addRunArtifact(conn_state_test);
-    // conn_state_test_run.step.dependOn(b.getInstallStep());
-    // conn_state_test_step.dependOn(&conn_state_test_run.step);
 }

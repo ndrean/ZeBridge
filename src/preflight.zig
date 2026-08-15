@@ -9,11 +9,9 @@
 //!         Writes fail upstream; the bridge never even sees them.
 //!
 //!   - no primary key (any identity)
-//!         Snapshots are impossible: chunking uses keyset pagination over a single
-//!         PK column. Fails late, at snapshot-request time, per table.
-//!
-//!   - composite primary key
-//!         Same: getTablePrimaryKey requires array_length(indkey,1) = 1.
+//!         Snapshots are impossible: chunking uses keyset pagination over the primary
+//!         key. Fails late, at snapshot-request time, per table. (A composite key is
+//!         fine — pagination compares the whole key as a row value.)
 //!
 //!   - TRANSITION_RULES on a table that is not REPLICA IDENTITY FULL
 //!         pgoutput only sends an old tuple for FULL (always) or DEFAULT when the key
@@ -64,16 +62,11 @@ pub const Findings = struct {
     refused_no_pk: bool = false,
     /// PostgreSQL will reject UPDATE/DELETE on this table outright.
     writes_rejected: bool = false,
-    /// Composite primary key: CDC is fully supported (the key identifies rows
-    /// exactly); only snapshot pagination is unimplemented. That is our gap, not a
-    /// broken schema — so it must never be a refusal.
-    snapshots_unimplemented: bool = false,
     /// TRANSITION_RULES names this table but it cannot produce transitions.
     transitions_inert: bool = false,
 
     pub fn any(self: Findings) bool {
-        return self.refused_no_pk or self.writes_rejected or
-            self.snapshots_unimplemented or self.transitions_inert;
+        return self.refused_no_pk or self.writes_rejected or self.transitions_inert;
     }
 };
 
@@ -84,10 +77,9 @@ pub const Findings = struct {
 pub fn classify(pk_columns: u32, identity: ReplicaIdentity, has_transition_rules: bool) Findings {
     var f = Findings{};
 
-    // Three-way, not two. Conflating "no key" with "composite key" would refuse a
-    // valid schema over an unimplemented feature on our side.
+    // Only "no key at all" is a problem. A composite key identifies rows exactly, and
+    // snapshot pagination compares it as a row value, so it needs no finding.
     f.refused_no_pk = pk_columns == 0;
-    f.snapshots_unimplemented = pk_columns > 1;
 
     // Without a PK, DEFAULT leaves the table with no replica identity at all, and
     // PostgreSQL refuses to publish updates for it. FULL rescues this (the whole row
@@ -211,12 +203,6 @@ pub fn run(
                 .{table},
             );
         }
-        if (f.snapshots_unimplemented) {
-            log.warn(
-                "⚠️  '{s}' has a {d}-column primary key: CDC is fully supported, but snapshots are not yet implemented for composite keys (pagination needs row-value comparison)",
-                .{ table, pk_columns },
-            );
-        }
         if (f.transitions_inert) {
             log.warn(
                 "⚠️  '{s}' has TRANSITION_RULES but REPLICA IDENTITY {s}: no old tuple is sent for non-key updates, so transitions can NEVER fire and every update routes to '.data'. Fix with: ALTER TABLE {s} REPLICA IDENTITY FULL;",
@@ -278,13 +264,11 @@ test "classify - REPLICA IDENTITY NOTHING is as bad as DEFAULT without a PK" {
     try std.testing.expect(f.writes_rejected);
 }
 
-test "classify - a composite PK is valid, never refused" {
-    // It identifies rows exactly; only snapshot pagination is missing, and that is
-    // our gap. Refusing here would reject a correct schema.
+test "classify - a composite PK is as ordinary as a single-column one" {
+    // It identifies rows exactly, and snapshot pagination compares the whole key as a
+    // row value, so there is nothing left to report about it.
     const f = classify(2, .default, false);
-    try std.testing.expect(!f.refused_no_pk);
-    try std.testing.expect(!f.writes_rejected);
-    try std.testing.expect(f.snapshots_unimplemented);
+    try std.testing.expect(!f.any());
 }
 
 test "classify - transition rules need FULL" {
@@ -305,7 +289,6 @@ test "classify - findings combine" {
 test "classify - a single-column PK is never refused, whatever the identity" {
     for ([_]ReplicaIdentity{ .default, .full, .index, .nothing }) |ri| {
         try std.testing.expect(!classify(1, ri, false).refused_no_pk);
-        try std.testing.expect(!classify(1, ri, false).snapshots_unimplemented);
     }
 }
 

@@ -27,16 +27,18 @@ consumed by the NATS init scripts and the reference clients.
 
 ```json
 {
-  "streams":  { "cdc": "CDC", "init": "INIT", "schema": "SCHEMA" },
+  "streams":  { "cdc": "CDC", "init": "INIT", "mutations": "MUTATIONS", "requests": "REQUESTS" },
   "subjects": {
     "cdc_prefix": "cdc",
     "init_prefix": "init",
-    "schema_prefix": "schema",
+    "mutations_prefix": "mutation",
     "snapshot_request": "snapshot.request",
+    "schema_request": "init.schema",
     "snapshot_data_pattern":  "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
     "snapshot_start_pattern": "init.snap.start.{[table]s}",
     "snapshot_error_pattern": "init.snap.error.{[table]s}",
-    "snapshot_meta_pattern":  "init.snap.meta.{[table]s}"
+    "snapshot_meta_pattern":  "init.snap.meta.{[table]s}",
+    "snapshot_schema_pattern": "init.snap.schema.{[table]s}.{[snapshot_id]s}"
   },
   "kv": { "schemas": "schemas", "snapshots": "snapshots" }
 }
@@ -47,15 +49,21 @@ NATS server.** The names are baked in at compile time; a change applied to only 
 side produces a bridge publishing into a subject space nobody reads, with no error on
 either side.
 
-### Keys currently unused
+Every key here is read by something. `streams.schema` and `subjects.schema_prefix`
+used to sit in this file unused — no SCHEMA stream was ever created, and schemas travel
+through the KV bucket — so they were removed rather than left as an invitation to
+implement against them.
 
-Being explicit so nobody implements against them:
-
-| key | status |
+| key | read by |
 | --- | --- |
-| `streams.schema`, `subjects.schema_prefix` | **unused.** Schemas travel through the KV bucket, not a stream. Reserved. |
-| `kv.snapshots` | **unused.** Reserved for the snapshot descriptor (§6, 🚧). |
-| `subjects.init_prefix` | redundant — the snapshot patterns embed `init.` literally rather than composing from it. |
+| `streams.*` | `nats-init` creates them; the bridge names `MUTATIONS` for its ingress consumer |
+| `subjects.cdc_prefix` | bridge (CDC subject), clients (subscription) |
+| `subjects.init_prefix` | `nats-init` (INIT stream subjects), clients. Note the snapshot patterns still embed `init.` literally rather than composing from it. |
+| `subjects.mutations_prefix` | bridge (consumer filter), `nats-init` (MUTATIONS subjects) |
+| `subjects.snapshot_request` | bridge (subscription), clients (request), `nats-init` (REQUESTS subjects) |
+| `subjects.schema_request` | bridge (subscription) and the subject prefix its schema replies are published under |
+| `kv.schemas` | bridge (`$KV.schemas.<table>`), clients |
+| `kv.snapshots` | bridge (`$KV.snapshots.<table>`), `nats-init`, clients |
 
 ---
 
@@ -533,7 +541,7 @@ Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 | --- | --- |
 | single-column PK + `DEFAULT` | ✅ full support |
 | single-column PK + `FULL` | ✅ full support, plus `old.*` and transitions |
-| composite PK | ✅ CDC fully supported; ⚠️ snapshots not yet implemented |
+| composite PK | ✅ full support — pagination compares the whole key as a row value |
 | **no PK, any replica identity** | 🔴 **refused** — suspended, events dropped |
 | `TRANSITION_RULES` without `FULL` | ⚠️ transitions can never fire — silently inert |
 | column of an unsupported type | ⚠️ CDC flows (unguarded, see §6); snapshots refused |
@@ -552,9 +560,10 @@ lacks a key. Useful as a CI or staging gate, wrong as a default: one keyless tab
 would otherwise stop replication for every table, and a table created while the bridge
 runs would turn a schema mistake into an outage.
 
-**A composite primary key is never refused.** It identifies rows exactly, so CDC is
-fully correct; only snapshot pagination is unimplemented (it needs row-value keyset
-comparison). That is a gap on our side, not a broken schema.
+**A composite primary key is ordinary.** It identifies rows exactly, so CDC is fully
+correct, and snapshot chunking pages on the whole key with a row-value comparison —
+`("a","b") > (…) ORDER BY "a","b"` — which is the same ordering Postgres compares
+against, so no chunk boundary can fall inside a run of equal leading values.
 
 `REPLICA IDENTITY FULL` multiplies WAL volume on wide tables, so `DEFAULT` is a
 legitimate trade. The decision is **per table** and belongs in your migrations. Note

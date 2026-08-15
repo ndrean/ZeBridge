@@ -349,10 +349,13 @@ fn getTableColumns(
     if (n == 0) return error.NoColumns;
 
     const cols = try allocator.alloc(pg_copy_binary.ColumnMeta, n);
-    // Free the names already duped if a later one fails, so an error frees everything.
+    // Free the strings already duped if a later one fails, so an error frees everything.
     var filled: usize = 0;
     errdefer {
-        for (cols[0..filled]) |col| allocator.free(col.name);
+        for (cols[0..filled]) |col| {
+            allocator.free(col.name);
+            allocator.free(col.type_text);
+        }
         allocator.free(cols);
     }
 
@@ -363,7 +366,9 @@ fn getTableColumns(
         const oid = std.fmt.parseInt(u32, oid_text, 10) catch return error.BadTypeOid;
 
         // Only NUMERIC gets padded — appending a decimal point to every integer in the
-        // snapshot would be a far louder bug than the one being fixed.
+        // snapshot would be a far louder bug than the one being fixed. The type text
+        // itself is kept for every column: keyset cursor literals are cast to it, and
+        // which columns are the key is not known here.
         const type_text = std.mem.span(c.PQgetvalue(res, idx, 2));
         const scale: ?u16 = if (oid == pg_copy_binary.numeric_oid)
             pg_copy_binary.scaleFromFormatType(type_text)
@@ -375,12 +380,16 @@ fn getTableColumns(
 
         const typtype_text = std.mem.span(c.PQgetvalue(res, idx, 4));
 
+        const name_owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_owned);
+
         col.* = .{
-            .name = try allocator.dupe(u8, name),
+            .name = name_owned,
             .oid = oid,
             .numeric_scale = scale,
             .pk_ord = pk_ord,
             .typtype = if (typtype_text.len > 0) typtype_text[0] else 'b',
+            .type_text = try allocator.dupe(u8, type_text),
         };
         filled += 1;
     }
@@ -389,9 +398,94 @@ fn getTableColumns(
 
 /// Free what `getTableColumns` returned.
 fn freeTableColumns(allocator: std.mem.Allocator, cols: []pg_copy_binary.ColumnMeta) void {
-    for (cols) |col| allocator.free(col.name);
+    for (cols) |col| {
+        allocator.free(col.name);
+        allocator.free(col.type_text);
+    }
     allocator.free(cols);
 }
+
+/// Indices into a column list, in primary-key order — what pagination pages on.
+///
+/// Resolved from `pk_ord` rather than a second catalog query, so the key and the layout
+/// can never disagree: they are the same rows, read inside the same transaction.
+const PrimaryKey = struct {
+    /// Indices into the caller's `columns`, `[0]` being the first key column.
+    idx: []usize,
+
+    fn deinit(self: PrimaryKey, allocator: std.mem.Allocator) void {
+        allocator.free(self.idx);
+    }
+};
+
+/// Collect the primary-key columns in key order.
+///
+/// Returns `error.NoPrimaryKey` when there is none — snapshots have nothing to paginate
+/// on — and `error.MalformedPrimaryKey` if the ordinals are not exactly `1..n`, which
+/// would leave a hole in the cursor.
+fn resolvePrimaryKey(
+    allocator: std.mem.Allocator,
+    columns: []const pg_copy_binary.ColumnMeta,
+) !PrimaryKey {
+    var count: usize = 0;
+    for (columns) |col| {
+        if (col.pk_ord > 0) count += 1;
+    }
+    if (count == 0) return error.NoPrimaryKey;
+
+    const idx = try allocator.alloc(usize, count);
+    errdefer allocator.free(idx);
+
+    // Sentinel rather than a parallel "seen" array: every slot must be written exactly
+    // once, and an unwritten slot is what a duplicate or out-of-range ordinal leaves.
+    @memset(idx, std.math.maxInt(usize));
+    for (columns, 0..) |col, i| {
+        if (col.pk_ord == 0) continue;
+        if (col.pk_ord > count) return error.MalformedPrimaryKey;
+        const slot = &idx[col.pk_ord - 1];
+        if (slot.* != std.math.maxInt(usize)) return error.MalformedPrimaryKey;
+        slot.* = i;
+    }
+    for (idx) |i| {
+        if (i == std.math.maxInt(usize)) return error.MalformedPrimaryKey;
+    }
+
+    return .{ .idx = idx };
+}
+
+/// The keyset cursor carried between chunks: the previous chunk's last row, one value
+/// per primary-key column.
+///
+/// Owned outside the chunk arena on purpose — the arena is reset before the next
+/// chunk's query is built, which is exactly when the cursor is read.
+const Cursor = struct {
+    allocator: std.mem.Allocator,
+    values: [][]const u8 = &.{},
+
+    /// Take a copy of `values`, replacing whatever was held. The old copy is freed only
+    /// once the new one is complete, so a failure part-way leaves the cursor intact.
+    fn set(self: *Cursor, values: []const []const u8) !void {
+        const copy = try self.allocator.alloc([]const u8, values.len);
+        var filled: usize = 0;
+        errdefer {
+            for (copy[0..filled]) |v| self.allocator.free(v);
+            self.allocator.free(copy);
+        }
+        for (values, copy) |src, *dst| {
+            dst.* = try self.allocator.dupe(u8, src);
+            filled += 1;
+        }
+
+        self.deinit();
+        self.values = copy;
+    }
+
+    fn deinit(self: *Cursor) void {
+        for (self.values) |v| self.allocator.free(v);
+        self.allocator.free(self.values);
+        self.values = &.{};
+    }
+};
 
 
 /// Query PostgreSQL system catalogs to discover the primary key of a table
@@ -547,9 +641,10 @@ pub const SnapshotListener = struct {
 
     /// Background listening loop (internal)
     fn listenLoop(self: *SnapshotListener) !void {
-        // Spawn schema request handler thread (nats.zig)
-        log.info("📋 Spawning schema request listener (nats.zig)...", .{});
-        const schema_thread = try std.Thread.spawn(.{}, listenForSchemaRequestsZig, .{
+        // Two independent subscribers, each with its own NATS connection: a schema
+        // request must not queue behind a snapshot's COPY, which can run for minutes.
+        log.info("📋 Spawning schema request listener...", .{});
+        const schema_thread = try std.Thread.spawn(.{}, listenForSchemaRequests, .{
             self.allocator,
             self.pg_config,
             self.should_stop,
@@ -562,9 +657,8 @@ pub const SnapshotListener = struct {
             self.nats_seed,
         });
 
-        // Spawn snapshot request handler thread (pure g41797/nats - no nats.c dependency!)
-        log.info("📸 Spawning snapshot request listener (pure g41797/nats)...", .{});
-        const snapshot_thread = try std.Thread.spawn(.{}, listenForSnapshotRequestsZig, .{
+        log.info("📸 Spawning snapshot request listener...", .{});
+        const snapshot_thread = try std.Thread.spawn(.{}, listenForSnapshotRequests, .{
             self.allocator,
             self.pg_config,
             self.should_stop,
@@ -588,8 +682,8 @@ pub const SnapshotListener = struct {
         snapshot_thread.join();
     }
 
-    // Listens for schema requests on "init.schema" subject and responds with
-    // fresh schema data queried from PostgreSQL information_schema.
+    // Listens for schema requests on config.Nats.schema_request_subject and responds
+    // with fresh schema data queried from PostgreSQL information_schema.
 
     /// Column information from information_schema
     const SchemaColumnInfo = struct {
@@ -600,9 +694,10 @@ pub const SnapshotListener = struct {
         column_default: ?[]const u8,
     };
 
-    /// Schema request handler - listens on "init.schema" and responds with table schemas
+    /// Schema request handler — subscribes to the topology's schema request subject and
+    /// responds with table schemas
     /// Note: Thread functions cannot return errors - all errors must be caught internally
-    fn listenForSchemaRequestsZig(
+    fn listenForSchemaRequests(
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
@@ -618,7 +713,7 @@ pub const SnapshotListener = struct {
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
-            log.info("📋 Schema listener: Connecting to NATS with g41797/nats...", .{});
+            log.info("📋 Schema listener: Connecting to NATS...", .{});
 
             // Create Core NATS connection
             var core = nats.Core{};
@@ -634,13 +729,13 @@ pub const SnapshotListener = struct {
 
             // Subscribe to init.schema
             const sid = "schema-listener-1";
-            core.SUB("init.schema", null, sid) catch |err| {
+            core.SUB(config.Nats.schema_request_subject, null, sid) catch |err| {
                 log.err("📋 Schema listener: Failed to subscribe: {} - reconnecting", .{err});
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
 
-            log.info("📋 Schema listener: ✅ Subscribed to 'init.schema'! Waiting for schema requests...", .{});
+            log.info("📋 Schema listener: ✅ Subscribed to '{s}'! Waiting for schema requests...", .{config.Nats.schema_request_subject});
 
             // Listen for schema requests
             while (!should_stop.load(.acquire)) {
@@ -837,7 +932,7 @@ pub const SnapshotListener = struct {
         log.info("📋 Published schemas for {d} tables", .{table_schemas.count()});
     }
 
-    /// Publish schema response to NATS using nats.zig
+    /// Publish schema response to NATS
     fn publishSchemaResponse(
         allocator: std.mem.Allocator,
         core: *nats.Core,
@@ -894,8 +989,10 @@ pub const SnapshotListener = struct {
             return err;
         };
 
-        log.info("📋 ✅ Published schema → schema.{s} ({d} columns, {d} bytes)", .{
-            table_only,
+        // Print the subject actually published to. It read "schema.{table}" before —
+        // a subject this code has not used since schemas moved into the KV bucket.
+        log.info("📋 ✅ Published schema → {s} ({d} columns, {d} bytes)", .{
+            subject,
             columns.len,
             encoded.len,
         });
@@ -903,7 +1000,7 @@ pub const SnapshotListener = struct {
 
     /// Snapshot request handler - listens on "snapshot.request.>" and generates snapshots
     /// Note: Thread functions cannot return errors - all errors must be caught internally
-    fn listenForSnapshotRequestsZig(
+    fn listenForSnapshotRequests(
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
@@ -920,7 +1017,7 @@ pub const SnapshotListener = struct {
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
-            log.info("📸 Snapshot listener (nats.zig): Connecting to NATS...", .{});
+            log.info("📸 Snapshot listener: Connecting to NATS...", .{});
 
             // Create Core NATS connection
             var core = nats.Core{};
@@ -1025,8 +1122,7 @@ pub const SnapshotListener = struct {
 
                     log.info("📸 Generating snapshot for '{s}' (id={s})", .{ table_name, snapshot_id });
 
-                    // Generate snapshot using pure g41797/nats JetStream
-                    const result = generateIncrementalSnapshotZig(
+                    const result = generateIncrementalSnapshot(
                         allocator,
                         pg_config,
                         table_name,
@@ -1067,7 +1163,7 @@ pub const SnapshotListener = struct {
     }
 
     /// Generate incremental snapshot
-    fn generateIncrementalSnapshotZig(
+    fn generateIncrementalSnapshot(
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
         table_name: []const u8,
@@ -1130,7 +1226,7 @@ pub const SnapshotListener = struct {
         log.info("📸 Snapshot started at LSN: {s}", .{lsn_str});
 
         // Publish snapshot start notification
-        publishSnapshotStartZig(
+        publishSnapshotStart(
             allocator,
             &js,
             table_name,
@@ -1151,41 +1247,48 @@ pub const SnapshotListener = struct {
         const columns = try getTableColumns(allocator, conn.?, table_name);
         defer freeTableColumns(allocator, columns);
 
-        // The keyset cursor column, resolved from the same rows rather than a second
+        // The keyset cursor columns, resolved from the same rows rather than a second
         // query. Binary COPY has no header to resolve against, so this is the only
         // source of truth for both layout and key.
-        var pk_col_count: usize = 0;
-        var pk_first: ?usize = null;
-        for (columns, 0..) |col, i| {
-            if (col.pk_ord == 0) continue;
-            pk_col_count += 1;
-            if (col.pk_ord == 1) pk_first = i;
-        }
-
-        if (pk_col_count == 0) {
-            log.err("📸 '{s}' has no primary key — cannot paginate a snapshot", .{table_name});
+        const pk = resolvePrimaryKey(allocator, columns) catch |err| {
+            switch (err) {
+                error.NoPrimaryKey => log.err(
+                    "📸 '{s}' has no primary key — nothing to paginate a snapshot on",
+                    .{table_name},
+                ),
+                error.MalformedPrimaryKey => log.err(
+                    "📸 '{s}': the catalog's primary key ordinals are not 1..n — refusing to paginate on a partial key",
+                    .{table_name},
+                ),
+                else => {},
+            }
             _ = c.PQexec(conn, "ROLLBACK");
-            return error.NoPrimaryKey;
-        }
-        if (pk_col_count > 1) {
-            // Paging on the first column alone would be wrong, not merely incomplete:
-            // it is not unique, so a chunk boundary landing inside a group of equal
-            // first-column values would skip the rest of that group. Refuse until
-            // pagination does row-value comparison over the whole key.
+            return err;
+        };
+        defer pk.deinit(allocator);
+
+        // Cursor literals are quoted by doubling `'` and leaving backslashes alone,
+        // which is only correct while a backslash is an ordinary character. libpq
+        // already knows the answer — the server reports this GUC at startup — so this
+        // costs no round trip, and a wrong cursor would skip or repeat rows silently.
+        const scs = c.PQparameterStatus(conn, "standard_conforming_strings");
+        if (scs == null or !std.mem.eql(u8, std.mem.span(scs), "on")) {
             log.err(
-                "📸 '{s}' has a {d}-column primary key — snapshot pagination needs row-value keyset comparison, which is not implemented",
-                .{ table_name, pk_col_count },
+                "📸 refusing to snapshot '{s}': standard_conforming_strings is off, so a backslash in a key value would be read as an escape and the pagination cursor could silently skip rows",
+                .{table_name},
             );
             _ = c.PQexec(conn, "ROLLBACK");
-            return error.CompositePrimaryKeyUnsupported;
+            return error.UnsafeStringLiterals;
         }
 
-        const pk_col_idx: ?usize = pk_first;
-        const pk_column = columns[pk_first.?];
-        const pk = PkMetadata{
-            .name = pk_column.name,
-            .is_numeric = pg_copy_binary.isNumericOid(pk_column.oid),
-        };
+        if (pk.idx.len > 1) {
+            log.info("📸 '{s}': paginating on a {d}-column primary key", .{ table_name, pk.idx.len });
+        }
+
+        // Fixed for the whole snapshot: the key cannot move under REPEATABLE READ, and
+        // every chunk must be ordered identically for the cursor to mean anything.
+        const order_by = try pg_copy_binary.orderByClause(allocator, columns, pk.idx);
+        defer allocator.free(order_by);
 
         // Create arena for snapshot processing
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -1194,8 +1297,8 @@ pub const SnapshotListener = struct {
         // Process chunks using streaming encoder
         var batch: u32 = 0;
         var total_rows: u64 = 0;
-        var last_val: []u8 = try allocator.dupe(u8, if (pk.is_numeric) "0" else "");
-        defer allocator.free(last_val);
+        var cursor = Cursor{ .allocator = allocator };
+        defer cursor.deinit();
 
         // Pre-allocate encoding buffer (2MB for chunk data)
         const encode_buffer = try allocator.alloc(u8, 2 * 1024 * 1024);
@@ -1205,19 +1308,18 @@ pub const SnapshotListener = struct {
             _ = arena.reset(.retain_capacity);
             const chunk_alloc = arena.allocator();
 
-            // Build COPY query with dynamic PK column
-            // Quote value if string type (UUID, varchar, etc.)
-            const where_clause = if (pk.is_numeric)
-                try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > {s}", .{ pk.name, last_val })
-            else if (last_val.len == 0)
-                try std.fmt.allocPrint(chunk_alloc, "1=1", .{})
+            // The first chunk has no cursor, so it takes the whole table rather than a
+            // sentinel value: `"id" > 0` would silently drop a row with a zero or
+            // negative key, and there is no sentinel at all for a text or uuid key.
+            const where_clause: []const u8 = if (cursor.values.len == 0)
+                "1=1"
             else
-                try std.fmt.allocPrint(chunk_alloc, "\"{s}\" > '{s}'", .{ pk.name, last_val });
+                try pg_copy_binary.keysetPredicate(chunk_alloc, columns, pk.idx, cursor.values);
 
             const copy_query = try utils.allocPrintZ(
                 chunk_alloc,
-                "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY \"{s}\" LIMIT {d}) TO STDOUT WITH (FORMAT binary)",
-                .{ table_name, where_clause, pk.name, chunk_size },
+                "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY {s} LIMIT {d}) TO STDOUT WITH (FORMAT binary)",
+                .{ table_name, where_clause, order_by, chunk_size },
             );
 
             // Initialize streaming encoder with fixed buffer
@@ -1229,7 +1331,7 @@ pub const SnapshotListener = struct {
             var parser = pg_copy_binary.Streamer.init(chunk_alloc, @ptrCast(conn), columns);
             defer parser.deinit();
 
-            const num_rows = parser.streamToEncoder(copy_query, &encoder, pk_col_idx) catch |err| {
+            const num_rows = parser.streamToEncoder(copy_query, &encoder, pk.idx) catch |err| {
                 log.err("📸 binary COPY chunk failed for '{s}': {}", .{ table_name, err });
                 _ = c.PQexec(conn, "ROLLBACK");
                 return error.StreamEncodingFailed;
@@ -1243,7 +1345,7 @@ pub const SnapshotListener = struct {
             if (batch == 0) {
                 const col_names = try chunk_alloc.alloc([]const u8, columns.len);
                 for (columns, col_names) |col, *name| name.* = col.name;
-                try publishSchemaZig(
+                try publishSchema(
                     chunk_alloc,
                     &js,
                     table_name,
@@ -1320,15 +1422,17 @@ pub const SnapshotListener = struct {
 
             batch += 1;
 
-            // Advance keyset cursor using the actual last PK value captured during streaming.
-            // This is correct for gaps, deletions, and non-sequential PKs (e.g. UUIDs).
-            const pk_val = parser.getLastPkValue() orelse {
-                log.err("⚠️  No PK value captured from chunk — aborting snapshot", .{});
+            // Advance the keyset cursor to the actual last row of this chunk, captured
+            // during streaming. Correct for gaps, deletions, and non-sequential keys
+            // (uuid, text) alike, because it never assumes what the next key would be.
+            const pk_values = parser.getLastPkValues() orelse {
+                log.err("⚠️  No PK values captured from chunk — aborting snapshot", .{});
                 _ = c.PQexec(conn, "ROLLBACK");
                 return error.PkValueMissing;
             };
-            allocator.free(last_val);
-            last_val = try allocator.dupe(u8, pk_val);
+            // Copied out of the chunk arena, which the next iteration resets before it
+            // builds the query that reads this.
+            try cursor.set(pk_values);
 
             // Break if we got fewer rows than requested (end of table)
             if (num_rows < chunk_size) break;
@@ -1346,7 +1450,7 @@ pub const SnapshotListener = struct {
         log.info("✅ Transaction committed", .{});
 
         // Publish metadata
-        try publishSnapshotMetadataZig(
+        try publishSnapshotMetadata(
             allocator,
             &js,
             table_name,
@@ -1372,8 +1476,8 @@ pub const SnapshotListener = struct {
         };
     }
 
-    /// Publish snapshot start notification using g41797/nats JetStream
-    fn publishSnapshotStartZig(
+    /// Publish snapshot start notification
+    fn publishSnapshotStart(
         allocator: std.mem.Allocator,
         js: *nats.JS,
         table_name: []const u8,
@@ -1414,8 +1518,8 @@ pub const SnapshotListener = struct {
         log.info("🚀 Published snapshot start → {s} (LSN watermark: {s})", .{ subject, lsn });
     }
 
-    /// Publish snapshot metadata using g41797/nats JetStream
-    fn publishSnapshotMetadataZig(
+    /// Publish snapshot metadata
+    fn publishSnapshotMetadata(
         allocator: std.mem.Allocator,
         js: *nats.JS,
         table_name: []const u8,
@@ -1464,79 +1568,20 @@ pub const SnapshotListener = struct {
         // Publish to JetStream with retry logic
         try publishWithRetry(js, subject, &headers, encoded, should_stop);
 
-        // Also publish to KV bucket so clients can check for cached snapshots
-        const kv_subject = try std.fmt.allocPrint(allocator, "$KV.snapshots.{s}", .{ table_name });
+        // Also publish to the KV bucket so clients can check for a cached snapshot
+        // before requesting a fresh one. Subject built from topology, not a literal:
+        // renaming the bucket there must move the bridge and `nats-init` together.
+        const kv_subject = try std.fmt.allocPrint(
+            allocator,
+            config.Nats.kv_snapshots_subject_pattern,
+            .{table_name},
+        );
         defer allocator.free(kv_subject);
         try publishWithRetry(js, kv_subject, null, encoded, should_stop);
 
-        log.info("📋 Published snapshot metadata → {s} (and KV)", .{subject});
+        log.info("📋 Published snapshot metadata → {s} (and KV {s})", .{ subject, config.Nats.snapshot_kv_bucket });
     }
 
-    // ========================================================================
-    // PoC: g41797/nats Core NATS subscriber (Testing Zig 0.15+ compatibility)
-    // ========================================================================
-    // This PoC demonstrates using the g41797/nats pure Zig library for Core NATS
-    // pub/sub instead of nats.c. Successfully vendored with:
-    // - mailbox.zig vendored into src/nats/src/mailbox.zig
-    // - zul dependency replaced with std.crypto for UUID generation
-    // ========================================================================
-
-    // / PoC: Core NATS subscriber (no JetStream, just pub/sub)
-    // / Note: Thread functions cannot return errors - all errors must be caught internally
-    // fn testCoreNatsSubscriber(
-    //     allocator: std.mem.Allocator,
-    //     should_stop: *std.atomic.Value(bool),
-    // ) void {
-    //     log.info("🧪 PoC: Connecting to Core NATS with g41797/nats...", .{});
-
-    //     // Create Core NATS connection
-    //     var core = nats.Core{};
-    //     const connect_opts = nats.protocol.ConnectOpts{}; // Use defaults
-    //     core.CONNECT(allocator, connect_opts) catch |err| {
-    //         log.err("🧪 PoC: Failed to connect: {}", .{err});
-    //         return; // Cannot propagate error from thread function
-    //     };
-    //     defer core.DISCONNECT();
-
-    //     log.info("🧪 PoC: Connected! Subscribing to 'init.schema' with Core NATS...", .{});
-
-    //     // Subscribe to init.schema
-    //     const sid = "1"; // Subscription ID
-    //     core.SUB("init.schema", null, sid) catch |err| {
-    //         log.err("🧪 PoC: Failed to subscribe: {}", .{err});
-    //         return; // Cannot propagate error from thread function
-    //     };
-
-    //     log.info("🧪 PoC: Subscribed! Waiting for messages from Elixir on 'init.schema'...", .{});
-
-    //     // Listen for messages (using internal connection)
-    //     while (!should_stop.load(.acquire)) {
-    //         if (core.connection) |conn| {
-    //             const msg = conn.waitMessageNMT(nats.protocol.SECNS * 5, null) catch |err| {
-    //                 if (err == error.Timeout) {
-    //                     log.debug("🧪 PoC: No message (5s timeout)", .{});
-    //                     continue;
-    //                 }
-    //                 log.err("🧪 PoC: Error receiving: {}", .{err});
-    //                 utils.sleep(1 * std.time.ns_per_s);
-    //                 continue;
-    //             };
-    //             defer conn.reuse(msg);
-
-    //             const payload = msg.letter.getPayload() orelse "(empty)";
-    //             const subject = msg.letter.subject.body() orelse "(no subject)";
-    //             log.info("🧪 PoC: ✅ Received from Elixir on '{s}': {s}", .{
-    //                 subject,
-    //                 payload,
-    //             });
-    //         } else {
-    //             log.err("🧪 PoC: Connection lost", .{});
-    //             break;
-    //         }
-    //     }
-
-    //     log.info("🧪 PoC: Subscriber stopping...", .{});
-    // }
 };
 
 
@@ -1572,7 +1617,7 @@ fn parsePgLsn(lsn_str: []const u8) !u64 {
 
 /// Publish schema (column names) to NATS so consumer knows the array field order
 /// Subject: config.Snapshot.schema_subject_pattern (under init.> so INIT stores it)
-fn publishSchemaZig(
+fn publishSchema(
     allocator: std.mem.Allocator,
     js: *nats.JS,
     table_name: []const u8,

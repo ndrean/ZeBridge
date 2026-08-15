@@ -225,7 +225,11 @@ fn initReplicationStream(
 }
 
 pub fn main(init: std.process.Init) !void {
-    runtime_log_level = Config.getDefaultLogLevel();
+    // Assign first, then report: customLogFn filters against runtime_log_level, so a
+    // line logged inside getDefaultLogLevel is judged by the level it is about to
+    // replace and disappears at exactly the setting that asked to see it.
+    runtime_log_level = Config.getDefaultLogLevel(&init);
+    log.debug("LOG_LEVEL → runtime log level: {s}", .{@tagName(runtime_log_level)});
     const io = init.io;
     const IS_DEBUG = builtin.mode == .Debug;
 
@@ -269,7 +273,14 @@ pub fn main(init: std.process.Init) !void {
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
     log.info("Encoding format: \x1b[1m {s} \x1b[0m", .{@tagName(parsed_args.encoding_format)});
-    log.info("Streams: \x1b[1m CDC, INIT \x1b[0m (hardcoded)", .{});
+    // Printed from the topology module, not spelled out: this line used to read
+    // "CDC, INIT (hardcoded)", which stopped being true and had no way of noticing.
+    log.info("Streams: \x1b[1m {s}, {s}, {s}, {s} \x1b[0m (from topology.json)", .{
+        Config.Nats.stream_cdc,
+        Config.Nats.stream_init,
+        Config.Nats.stream_requests,
+        Config.Nats.stream_mutations,
+    });
 
     // Register signal handlers for graceful shutdown
     const empty_mask = std.mem.zeroes(posix.sigset_t);
@@ -403,8 +414,8 @@ pub fn main(init: std.process.Init) !void {
     log.info("Starting mutation listener thread...", .{});
     var mut_listener = try mutation_listener.MutationListener.init(
         allocator,
-        runtime_config,
-        parsed_args,
+        &pg_config,
+        &runtime_config,
         io,
         &should_stop,
     );
@@ -466,8 +477,7 @@ pub fn main(init: std.process.Init) !void {
     // Mark as connected in metrics
     metrics.setConnected(true);
 
-    // CDC events are published to subjects like "cdc.table.operation"
-    // log.info("ℹ️ Subject pattern: \x1b[1m {s} \x1b[0m", .{Config.Nats.cdc_subject_wildcard});
+    log.info("ℹ️ CDC subject pattern: \x1b[1m {s}.<table>.<operation> \x1b[0m", .{Config.Nats.subject_cdc_prefix});
 
     // <--- Metrics setup
     const present = @as(i64, @intCast(c.time(null)));

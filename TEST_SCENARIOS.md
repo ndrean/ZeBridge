@@ -156,7 +156,7 @@ Then one step per command, checking the middle column before moving on:
 | F3 | `Emitter.Scenario.step3()` | `cdc_events_published` +15 | 15 rows in `users` |
 | F4 | `Emitter.Scenario.step4()` | 🔴 `REFUSING 'users'` mid-stream → suspension **overwrites** the live schema | ⭐ banner appears, **rows stay** — not dropped |
 | F5 | `Emitter.Scenario.step4b()` | `cdc_events_published` **unchanged**; `refused_events_dropped` +10 | ⭐ row count **does not move** while Postgres reaches 25 |
-| F6 | `Emitter.Scenario.step5()` | ✅ `no longer refused` + ⚠️ composite snapshot warning | banner clears; table rebuilt with `PRIMARY KEY ("name","email")` |
+| F6 | `Emitter.Scenario.step5()` | ✅ `no longer refused`; no composite warning — the key is ordinary now | banner clears; table rebuilt with `PRIMARY KEY ("name","email")` |
 | F7 | `Emitter.Scenario.step6()` | `cdc_events_published` +10 | rows flow again, keyed on `(name, email)` |
 
 Verified run: `cdc_published 15 → 15 → 25`, `refused_events_dropped 0 → 10 → 10`,
@@ -180,8 +180,9 @@ after the key exists.
 is still refused, so their events are dropped and the consumer keeps rows that no
 longer exist upstream. That is the suspension contract working as designed — local data
 is frozen at the suspension LSN, not kept in sync — and it is why a client should
-re-seed from a snapshot after a suspension rather than trusting its frozen copy. Once
-snapshots support composite keys, F6 should end with a re-seed.
+re-seed from a snapshot after a suspension rather than trusting its frozen copy. F6
+should end with a re-seed: snapshots page on composite keys now, so the only thing
+still missing is the client's ability to apply one.
 
 ---
 
@@ -209,8 +210,43 @@ mix run --no-start -e 'Emitter.Scenario.step8()'   # populate, and print PG's ow
 | G1 | `nats pub snapshot.request.exotic_types ''` | 🔴 **refused**: `column 'attrs' has unsupported type OID <n> (typtype 'b')`. ✅ verified |
 | G2 | Same, after `ALTER TABLE exotic_types DROP COLUMN attrs` | ✅ succeeds — the ENUM passes through as its label (`happy`/`sad`/`ok`, exact). ✅ verified |
 | G3 | Read the chunk, check `price` | `0.10000000` / `12345.67890000` — byte-identical to PG text. The `atttypmod` padding. ✅ verified |
-| G4 | Snapshot `users` (composite PK, after F5) | 🔴 `CompositePrimaryKeyUnsupported`. ✅ verified |
+| G4 | Snapshot `users` (composite PK, after F5) | ✅ succeeds — `paginating on a 2-column primary key`; the emitted key sequence is identical to `SELECT name,email FROM users ORDER BY name,email`. ✅ verified 2026-08-15 |
 | G5 | Snapshot a table with a comma or newline inside a `TEXT` value | Value intact. Under CSV this split the row and shifted every later column. ✅ verified on `test_types` |
+
+**G4 needs volume to mean anything.** As the scenario leaves it, `users` has 15 rows —
+one chunk, and pagination bugs only exist at chunk *boundaries*. Padding it to 12 515
+rows over 6 repeated `name` values puts the boundary inside a run of equal names, on a
+`varchar(255)` composite key under a non-C collation (`User-*` sorts *after* `n-*`
+there, so byte order is not the ordering being tested):
+
+```sql
+INSERT INTO public.users (name, email, inserted_at, updated_at)
+SELECT 'n-' || lpad(((i-1)/2000)::text, 3, '0'),
+       'e-' || lpad(i::text, 6, '0') || '@example.com', now(), now()
+FROM generate_series(1, 12000) i;
+```
+
+Chunk 0 ended at `(n-004, e-009500@…)` and chunk 1 resumed at `(n-004, e-009501@…)`,
+and the 12 515 emitted keys were **identical** to PostgreSQL's own
+`ORDER BY name, email` — the strongest form of this check, since it compares against
+the server's collation rather than the client's idea of ordering.
+
+The same was verified on a synthetic int+text key, which is where the numbers below
+come from: 25 000 rows over `PRIMARY KEY (tenant, name)` with 3 000 names repeated in
+every tenant, every name carrying a `'` so each cursor literal exercises quote
+escaping.
+
+```sql
+CREATE TABLE public.ck (tenant int NOT NULL, name text NOT NULL, payload text,
+                        PRIMARY KEY (tenant, name));
+INSERT INTO public.ck (tenant, name, payload)
+SELECT (i-1)/3000, 'u''-' || lpad(((i-1) % 3000)::text, 5, '0'), 'p' || i
+FROM generate_series(1, 25000) i;
+```
+
+Result: chunks of 10 000 / 10 000 / 5 000, chunk 0 ending at `(3, u'-00999)` and
+chunk 1 resuming at `(3, u'-01000)` — 25 000 rows, 25 000 distinct keys, globally
+ascending.
 
 **G1 is the one that matters.** Before the `typtype` guard, this snapshot *succeeded*
 and shipped hstore's binary wire form as a string — `\0\0\0\1\0\0\0\1k\0\0\0\1v` —

@@ -31,12 +31,12 @@ Severity is discriminated, which matters (mechanism in 3.3):
 | --- | --- |
 | no PK + DEFAULT/NOTHING | **error** — PostgreSQL rejects UPDATE/DELETE outright |
 | no PK + FULL | warning — writes work (whole row is the identity), snapshots do not |
-| composite PK | warning — snapshots need exactly one column |
 | `TRANSITION_RULES` + not FULL | warning — transitions can never fire |
 
 Verified against deliberately-broken tables: `t_nopk` (error + warning),
-`t_nopk_full` (warning only — FULL rescued writes), `t_composite`, and `users` with
-rules on a DEFAULT table.
+`t_nopk_full` (warning only — FULL rescued writes), and `users` with rules on a
+DEFAULT table. `t_composite` used to warn here; since pagination compares the whole
+key as a row value, a composite key is no longer a finding at all.
 
 The migration is the right place to *make* these decisions (the Elixir emitter
 migration already sets `REPLICA IDENTITY` per table). Preflight is what makes a
@@ -315,14 +315,14 @@ there is always something to identify the old tuple by.
 | single column | FULL | ✅ full old tuple | ✅ |
 | none | DEFAULT / NOTHING | ❌ **PostgreSQL rejects the write** | ❌ |
 | none | FULL | ✅ | ❌ |
-| composite | either | ✅ | ❌ |
+| composite | either | ✅ | ✅ |
 
 **The asymmetry is the point: FULL rescues CDC, it does not rescue snapshots.**
-Snapshot chunking uses keyset pagination (`WHERE pk > $last ORDER BY pk LIMIT n`),
-which needs exactly one ordered column — `getTablePrimaryKey` enforces
-`array_length(indkey,1) = 1` and returns `error.NoPrimaryKey` otherwise. No replica
-identity setting can substitute for that, because the constraint is about *ordering
-for pagination*, not about *identifying a row*.
+Snapshot chunking uses keyset pagination, so it needs an *ordering*, which only a key
+provides — no replica identity setting can substitute, because the constraint is about
+*ordering for pagination*, not about *identifying a row*. The number of key columns is
+not part of that constraint: pagination compares the whole key as a row value
+(`("a","b") > (…) ORDER BY "a","b"`), so composite keys page like any other.
 
 Hence preflight treats no-PK-plus-DEFAULT as an **error** (upstream writes are
 broken) but no-PK-plus-FULL as a **warning** (CDC works, bootstrapping does not).

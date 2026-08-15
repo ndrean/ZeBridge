@@ -116,28 +116,44 @@ services:
 
         # nats-box contains `jq`!
 
+        # Stream NAMES as well as subjects: the bridge compiles both from this same
+        # file (build.zig -> the "topology" module), so a rename here moves both ends
+        # together. Hardcoding the names here is what let them drift before.
         echo 'Reading streams from topology.json...'
+        CDC_STREAM=$(jq -r '.streams.cdc' /topology.json)
+        INIT_STREAM=$(jq -r '.streams.init' /topology.json)
+        REQUESTS_STREAM=$(jq -r '.streams.requests' /topology.json)
+        MUTATIONS_STREAM=$(jq -r '.streams.mutations' /topology.json)
         CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' /topology.json)
         INIT_PREFIX=$(jq -r '.subjects.init_prefix' /topology.json)
         REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' /topology.json)
         MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' /topology.json)
         SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
+        SNAPSHOT_KV=$(jq -r '.kv.snapshots' /topology.json)
 
-        echo "Creating NATS JetStream stream: CDC (subject: $$CDC_PREFIX.>)"
-        nats stream add CDC --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+        echo "Creating NATS JetStream stream: $$CDC_STREAM (subject: $$CDC_PREFIX.>)"
+        nats stream add $$CDC_STREAM --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
 
-        echo "Creating NATS JetStream stream: INIT (subject: $$INIT_PREFIX.>)"
-        nats stream add INIT --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+        echo "Creating NATS JetStream stream: $$INIT_STREAM (subject: $$INIT_PREFIX.>)"
+        nats stream add $$INIT_STREAM --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
 
         SNAP_RET=$${SNAP_RET_SECONDS:-600}
-        echo "Creating NATS JetStream stream: REQUESTS (subject: $$REQUESTS_PREFIX.>)"
-        nats stream add REQUESTS --subjects="$$REQUESTS_PREFIX.>" --storage=file --retention=limits --max-msgs-per-subject=1 --discard=new --discard-per-subject --max-age=$${SNAP_RET}s --replicas=1 --defaults || true
+        echo "Creating NATS JetStream stream: $$REQUESTS_STREAM (subject: $$REQUESTS_PREFIX.>)"
+        nats stream add $$REQUESTS_STREAM --subjects="$$REQUESTS_PREFIX.>" --storage=file --retention=limits --max-msgs-per-subject=1 --discard=new --discard-per-subject --max-age=$${SNAP_RET}s --replicas=1 --defaults || true
 
-        echo "Creating NATS JetStream stream: MUTATIONS (subject: $$MUTATIONS_PREFIX.>)"
-        nats stream add MUTATIONS --subjects="$$MUTATIONS_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults || true
+        echo "Creating NATS JetStream stream: $$MUTATIONS_STREAM (subject: $$MUTATIONS_PREFIX.>)"
+        nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults || true
 
         echo "Creating NATS KV bucket: $$SCHEMA_KV"
         nats kv add $$SCHEMA_KV --history=10 --replicas=1 || true
+
+        # The snapshot descriptor bucket: one entry per table, holding the metadata of
+        # the latest snapshot so a client can decide whether to request a new one.
+        # --history=1 because only the current descriptor is ever read, and no TTL: it
+        # must outlive nothing in particular, but it must not expire while the chunks it
+        # describes are still in INIT.
+        echo "Creating NATS KV bucket: $$SNAPSHOT_KV"
+        nats kv add $$SNAPSHOT_KV --history=1 --replicas=1 || true
 
         echo 'NATS initialization complete!'
         exit 0

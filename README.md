@@ -1049,10 +1049,10 @@ PostgreSQL LSN ACK
 
 **NATS reconnection:**
 
-* Automatic (handled by nats.c library)
+* Automatic (handled by the vendored Zig client in `src/nats_vendor/`)
 * Max attempts: -1 (infinite)
-* Wait between attempts: 1 second (aggressive for CDC)
-* Flush timeout: 10 seconds (allows ~10 retry attempts)
+* Wait between attempts: 2 seconds
+* Flush timeout: 10 seconds
 
 ## Build Instructions
 
@@ -1060,24 +1060,14 @@ PostgreSQL LSN ACK
 
 * Zig 0.16.0 or later
 * Docker & Docker Compose (for PostgreSQL and NATS)
-* CMake (for building nats.c library)
+* `libpq` — the only C dependency, linked from the system
+  (`brew install libpq` on macOS, `apk add postgresql-dev` / `apt install libpq-dev`
+  on Linux). Override its location with `zig build -Dlibpq-prefix=/path`.
 
-### 1. Build Vendored Libraries (One-Time Setup)
+There is no vendored-library build step: the NATS client is pure Zig and lives in
+`src/nats_vendor/`.
 
-```bash
-# Build nats.c v3.12.0
-./build_nats.sh
-
-# Build libpq for PostgreSQL 18.1
-./build_libpq.sh
-```
-
-This compiles:
-
-* `nats.c` → `libs/nats-install/`
-* `libpq` → `libs/libpq-install/`
-
-### 2. Start Infrastructure
+### 1. Start Infrastructure
 
 ```bash
 # Start PostgreSQL with logical replication enabled
@@ -1087,7 +1077,7 @@ docker compose up -d postgres
 docker compose up -d nats-server nats-config-gen nats-init
 ```
 
-### 3. Build the Bridge
+### 2. Build the Bridge
 
 ```bash
 zig build
@@ -1095,7 +1085,7 @@ zig build
 
 Output: `./zig-out/bin/bridge`
 
-### 4. Run Tests
+### 3. Run Tests
 
 ```bash
 zig build test
@@ -1105,7 +1095,7 @@ zig build test
 
 ## Configuration
 
-All configuration constants are centralized in `src/config.zig`.
+All configuration constants are centralized in `src/config.zig` and `topology.json`.
 
 ### Key Settings
 
@@ -1151,10 +1141,17 @@ See `src/config.zig` for all tunables.
 
 * [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding
 
-**Vendored:**
+**Vendored (in `src/`):**
 
-* [nats.c](https://github.com/nats-io/nats.c) v3.12.0 - NATS client (C library)
-* [libpq](https://www.postgresql.org/docs/current/libpq.html) PostgreSQL 18.1
+* [g41797/nats](https://github.com/g41797/nats) — pure-Zig NATS client, patched for
+  Zig 0.16 and extended with nkey authentication. `src/nats_vendor/` is the only
+  0.16 port of it, so its own test suite runs here: `zig build test-nats`.
+* [g41797/mailbox](https://github.com/g41797/mailbox) — `src/mailbox_vendor/`
+
+**System:**
+
+* [libpq](https://www.postgresql.org/docs/current/libpq.html) — dynamically linked, so
+  the distro's own CVE fixes apply
 
 ---
 
@@ -1162,26 +1159,44 @@ See `src/config.zig` for all tunables.
 
 ### End-to-End CDC Pipeline Test
 
-**Terminal 1 - Start the bridge:**
+**Terminal 1 - Start the bridge**:
+
+Start Postgres and NATS as containers:
 
 ```sh
 docker compose -f docker-compose.prod.yml --env-file .env.prod up
+```
 
-source .env.local
+Start the bridge:
 
+```sh
 ./zig-out/bin/bridge --slot my_slot --pub cdc_slot
 ```
 
-**Terminal 2 - Generate CDC events:**
+**Terminal 2 - Use th Elixir Admin app**:
+
+To migrate (on startup):
 
 ```sh
 cd consumer && iex -S mix
+```
 
+and generate events:
+
+```sh
 # Generate 100 INSERT events
-iex> PgProducer.bulk(10)
+iex> Producer.bulk(10)
 
-# Parallel load test: 100 batches of 10 events each every 1ms
-iex> PgProducer.stream(100, 10, 1)
+# Parallel load test: 100 batches of 10 events each every 5ms
+iex> Producer.stream(5, 100, 10, "teset_types")
+```
+
+**Terminal 3 - Use the Browser client app**:
+
+Start consumer (auto-connects to NATS server)
+
+```sh
+cd web-consumer && pnpm dev
 ```
 
 ### HTTP Endpoint Tests
@@ -1214,13 +1229,18 @@ docker exec -it postgres psql -U postgres -c "
 "
 ```
 
+### Clear the WAL
+
+```sh
+docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
+```
+
 ---
 
 ## Roadmap
 
-**Planned enhancements:**:
+**Possible enhancements:**:
 
-* [ ] Snapshot compression (zstd). Removed in favour of a smaller core; the earlier dictionary-based implementation is preserved on the `archive/zstd-compression` branch (cf <https://github.com/ndrean/zig-zstd>).
 * [ ] Metrics export to StatsD/InfluxDB
 * [ ] Integrate MySQL connector option?
 
@@ -1228,7 +1248,7 @@ docker exec -it postgres psql -U postgres -c "
 
 * Can we reach 100K+ events/s per instance with more CPU or further optimizations?
 
-**Contributions welcome!** This is a learning project as much as a tool. If you find it useful (or find gaps), feedback is valuable.
+**Contributions welcome!** If you find it useful (or find gaps), feedback is valuable.
 
 ---
 
@@ -1236,17 +1256,18 @@ docker exec -it postgres psql -U postgres -c "
 
 This project uses:
 
-* [nats.c](https://github.com/nats-io/nats.c) (Apache 2.0)
 * [zig-msgpack](https://github.com/zigcc/zig-msgpack) (MIT)
 
 ---
 
 ## Notes
 
-* The nats.c library is built with TLS enabled
-* The library is statically linked to avoid runtime dependencies
+* The vendored NATS client has **no TLS**: `protocol.zig` sends
+  `"tls_required":false`, so bridge ↔ nats-server must stay on a private network.
+  External clients reach nats-server over wss, which nats-server terminates itself.
+* Authentication to NATS uses **nkey**, signed with `std.crypto.sign.Ed25519` — pure
+  Zig, no OpenSSL linked.
 * PostgreSQL logical replication requires `wal_level=logical`
-* All C code is compiled with `-std=c11`
 
 **Example how to generate nkey for NATS**:
 
@@ -1272,7 +1293,8 @@ authorization {
 Start the bridge daemon with the private nkey:
 
 ```sh
-NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI  RING_BUFFER_COUNT=2048 \
+NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI  
+RING_BUFFER_COUNT=2048 \
 BASE_BUF=12 \
 PG_HOST=localhost \
 PG_PORT=55432 \
@@ -1284,267 +1306,3 @@ NATS_BRIDGE_USER=bridge_user \
 NATS_BRIDGE_PASSWORD=bridge_secure_password \
 ./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
 ```
-
-**Kill zombie processes:**
-
-```bash
-ps aux | grep bridge | grep -v grep | awk '{print $2}' | xargs kill
-```
-
-### Lock-Free Queue (SPSC): A nice Piece of Computer Art
-
-All the code below is taken from these two videos:
-
-_Watch: [Zig SHOWTIME talk on lock-free programming](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)_
-
-_Watch: [SPSC Queue Video](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)_
-
-We have a shared **ring buffer** between a unique producer/writer thread (main CDC decoder) and a unique consumer/reader thread (batch publisher).
-
-[![SPSC Queue Video](https://img.youtube.com/vi/K3P_Lmq6pw0/0.jpg)](https://www.youtube.com/watch?v=K3P_Lmq6pw0&t=408s)
-
-This is the perfect use case for a **wait-free** SPSC (Single Producer Single Consumer) ring buffer.
-
-This is a hot path in the code, so it must be efficient and fast. It uses three tricks: **empty last slot**, **bitmasking**, and **cache alignment** (as explained in the video above).
-
-#### Queue Structure
-
-```zig
-pub fn SPSCQueue(comptime T: type) type {
-    return struct {
-        buffer: []T,              // Ring buffer storage
-        capacity: usize,          // Power of 2 (e.g., 65536)
-        mask: usize,              // capacity - 1, for fast modulo via bitmasking
-
-        // Separate cache lines to avoid false sharing between producer/consumer
-        // On x86-64, cache lines are 64 bytes
-        write_index: std.atomic.Value(usize) align(64),  // Producer's position
-        read_index: std.atomic.Value(usize) align(64),   // Consumer's position
-    };
-}
-```
-
-We specialize it with `T = CDCEvent`, creating a buffer of `CDCEvent[]`.
-
-**Two indices:**
-
-* `write_index`: Producer's position (next empty slot for writing)
-  * Only modified by producer thread
-  * Read by consumer to know data availability
-* `read_index`: Consumer's position (next item to read)
-  * Only modified by consumer thread
-  * Read by producer to know space availability
-
-#### Why Atomic Operations?
-
-Both threads share the buffer. The producer is the _only_ thread updating `write_index`, and the consumer is the _only_ thread updating `read_index`.
-
-So why do we still need atomics if each index has a single writer?
-
-Not primarily for atomicity (no two threads write the same variable), but for two reasons:
-
-1. **Prevent compiler/CPU reordering** (the main reason)
-2. **Ensure visibility across CPU cores** (cache coherence)
-
-Without proper ordering, the CPU/compiler might reorder operations like this:
-
-```zig
-// What we write:
-self.buffer[5] = item;           // Step 1: Write data
-self.write_index.store(6, ...);  // Step 2: Publish index
-
-// What CPU might do WITHOUT .release:
-self.write_index.store(6, ...);  // Reordered! Consumer sees index 6...
-self.buffer[5] = item;           // ...but data isn't written yet!
-```
-
-**Memory ordering semantics:**
-
-* `.monotonic`: Guarantees atomicity and a single total order per variable, but does not establish ordering with other memory accesses
-* `.acquire`/`.release`: Solve cross-thread ordering and create "happens-before" relationships
-
-#### Trick #1: Empty Last Slot
-
-Consider: `read_index == write_index` means _empty_.
-
-=> we use this to control if we can `pop()` at `read_index` from the buffer.
-
-**Problem**: If we fill all slots, the queue appears empty!
-
-Consider 7 slots filled out of 8; we have `write_index=7, read_index=0`
-
-| A   | B   | C   | D   | E   | F   | G   |     |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-
-Fill the 8th slot:
-
-| A   | B   | C   | D   | E   | F   | G   | H   |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-
-Now `write_index=0` (wraps), so `read_index == write_index` but the queue is FULL, not empty!
-
-**Solution**: `push()` only if `next_write_index != read_index`. In pratice, the last slot will always be empty by excluding it with the test:
-
-```zig
-// Check if queue is full (in push)
-const next_write = (current_write + 1) % capacity;
-if (next_write == current_read) {
-    return error.QueueFull;
-}
-```
-
-This now gives us a way to distinguish between _full_ and _empty_.
-
-#### Trick #2: Replacae `modulo` with Bitmasking for Fast Modulo
-
-Since capacity is a power of 2 (e.g., 65536 = 2^16), we can use bitmasking instead of division:
-
-```zig
-// Slow (20-30 CPU cycles):
-index = (index + 1) % capacity;
-
-// Fast (1 CPU cycle):
-index = (index + 1) & mask;  // where mask = capacity - 1
-```
-
-Examples:
-
-```zig
-7 % 8 == 7  and  7 & 7 == 7
-8 % 8 == 0  and  8 & 7 == 0
-9 % 8 == 1  and  9 & 7 == 1
-```
-
-#### Trick #3: Cache Alignment
-
-CPU caches work in cache lines (64 bytes on x86-64). **Without alignment**, both indices share a cache line:
-
-```txt
-Cache Line 0: [write_index][read_index][other data...] <-- BAD! 
-```
-
-Problem: Producer updates `write_index` → invalidates consumer's cache → ping-pong between CPU cores!
-
-**With alignment**, each index owns its cache line: ✅
-
-```txt
-Cache Line 0: [write_index][padding...............]  ← Producer owns
-Cache Line 1: [read_index][padding................]  ← Consumer owns
-
-```
-
-This is achieved with:
-
-```zig
-write_index: std.atomic.Value(usize) align(64),
-read_index: std.atomic.Value(usize) align(64),
-```
-
-#### The Push Operation (Producer Only)
-
-```zig
-pub fn push(self: *Self, item: T) error{QueueFull}!void {
-    // 1. Load our own index (no sync needed - we're the only writer)
-    const current_write = self.write_index.load(.monotonic);
-
-    // 2. Load consumer's index (need to see their progress)
-    const current_read = self.read_index.load(.acquire);
-    //    ↑ .acquire: See all consumer's writes before they updated read_index
-
-    // 3. Check if full (using the empty-slot trick)
-    const next_write = (current_write + 1) & self.mask;
-    if (next_write == current_read) {
-        return error.QueueFull;
-    }
-
-    // 4. Write data to buffer (regular write, not atomic)
-    self.buffer[current_write] = item;
-
-    // 5. Publish availability with release
-    self.write_index.store(next_write, .release);
-    //    ↑ .release: Ensure data write (step 4) happens before this
-    //    Consumer will see data when they load write_index with .acquire
-}
-```
-
-#### The Pop Operation (Consumer Only)
-
-```zig
-pub fn pop(self: *Self) ?T {
-    // 1. Load our own index (no sync needed - we're the only reader)
-    const current_read = self.read_index.load(.monotonic);
-
-    // 2. Load producer's index (need to see their data)
-    const current_write = self.write_index.load(.acquire);
-    //    ↑ .acquire: See producer's data write before they updated write_index
-
-    // 3. Check if empty (both indices are equal)
-    if (current_read == current_write) {
-        return null;
-    }
-
-    // 4. Read data from buffer (regular read, not atomic)
-    const item = self.buffer[current_read];
-
-    // 5. Publish free space with release
-    const next_read = (current_read + 1) & self.mask;
-    self.read_index.store(next_read, .release);
-    //    ↑ .release: Ensure data read (step 4) happens before this
-    //    Producer will see space when they load read_index with .acquire
-
-    return item;
-}
-```
-
-#### Synchronization Pattern
-
-The `.release → .acquire` pairs create "happens-before" relationships:
-
-```txt
-Time →
-────────────────────────────────────────────────────────────────────
-
-Producer thread (CPU Core A)          Consumer thread (CPU Core B)
-────────────────────────────          ──────────────────────────────
-
-buffer[5] = item
-    │
-    │   (regular write)
-    │
-write_index.store(6, .release)
-    │
-    │   ───────────── happens-before ─────────────▶
-    │
-                                     write_index.load(.acquire)
-                                         │
-                                         │  sees write_index == 6
-                                         │  AND sees buffer[5] = item
-                                         │
-                                     item = buffer[5]
-                                         │
-                                     read_index.store(6, .release)
-                                         │
-             ◀──────────── happens-before ─────────────
-                                         │
-read_index.load(.acquire)
-    │
-    │  sees freed space safely
-```
-
-**Memory ordering summary:**
-
-* `.monotonic` on same-thread loads: No cross-thread ordering, just atomicity
-* `.acquire` ensures that if we observe the updated index, we also observe all
-memory operations that happened-before the corresponding .release.
-* `.release` when updating your own index: All previous writes visible before publishing
-
-#### Why This Is Wait-Free
-
-This queue is **wait-free**, not just lock-free because:
-
-* No mutex locks (`mutex.lock()`)
-* No CAS (Compare-And-Swap) retry loops
-* Single writer per index means no contention
-* each operation completes in a bounded number of steps, regardless of the other thread’s behavior.
-
-If we had multiple writers, we'd need CAS loops with retries (see the video for details).

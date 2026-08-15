@@ -1,9 +1,8 @@
 const std = @import("std");
 const nats = @import("nats");
 const log = std.log.scoped(.mutation_listener);
-const topology = @import("topology");
 const config = @import("config.zig");
-const args = @import("args.zig");
+const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
@@ -11,27 +10,29 @@ const c = c_imports.c;
 pub const MutationListener = struct {
     allocator: std.mem.Allocator,
     thread: ?std.Thread = null,
-    pg_host: []const u8,
-    pg_port: u16,
-    pg_db: []const u8,
-    pg_user: []const u8,
-    pg_pass: []const u8,
+    /// The one connection description every component shares. Held by pointer, like the
+    /// snapshot listener does: this used to copy `pg_host`/`pg_port`/… out of
+    /// RuntimeConfig and rebuild a conninfo string by hand, which silently ignored
+    /// `DATABASE_URL` (kept in `PgConf.db_url`) and `sslmode`. With a URL set, every
+    /// other component connected where it said and this thread dialled the PG_* defaults.
+    pg_config: *const pg_conn.PgConf,
     nats_host: []const u8,
     nats_seed: ?[]const u8,
     io: std.Io,
     should_stop: *std.atomic.Value(bool),
 
-    pub fn init(allocator: std.mem.Allocator, runtime_config: config.RuntimeConfig, cli_args: args.Args, io: std.Io, should_stop: *std.atomic.Value(bool)) !*MutationListener {
-        _ = cli_args;
+    pub fn init(
+        allocator: std.mem.Allocator,
+        pg_config: *const pg_conn.PgConf,
+        runtime_config: *const config.RuntimeConfig,
+        io: std.Io,
+        should_stop: *std.atomic.Value(bool),
+    ) !*MutationListener {
         const self = try allocator.create(MutationListener);
 
         self.* = .{
             .allocator = allocator,
-            .pg_host = runtime_config.pg_host,
-            .pg_port = runtime_config.pg_port,
-            .pg_db = runtime_config.pg_database,
-            .pg_user = runtime_config.pg_user,
-            .pg_pass = runtime_config.pg_password,
+            .pg_config = pg_config,
             .nats_host = runtime_config.nats_host,
             .nats_seed = runtime_config.nats_seed,
             .io = io,
@@ -58,29 +59,38 @@ pub const MutationListener = struct {
     fn listenLoop(self: *MutationListener) void {
         log.info("Mutation listener thread started. Connecting to NATS and PostgreSQL...", .{});
 
-        // 1. Connect to PostgreSQL (Dedicated connection for mutations)
-        const conninfo = std.fmt.allocPrint(
-            self.allocator,
-            "host={s} port={d} dbname={s} user={s} password={s}",
-            .{ self.pg_host, self.pg_port, self.pg_db, self.pg_user, self.pg_pass },
-        ) catch return;
+        // 1. Connect to PostgreSQL (dedicated connection for mutations — the WAL
+        //    stream's connection is in replication mode and cannot run ordinary SQL).
+        //    `connInfo` is the shared builder, so DATABASE_URL and sslmode apply here
+        //    exactly as they do everywhere else.
+        const conninfo = self.pg_config.connInfo(self.allocator, false) catch |err| {
+            log.err("Mutation listener: cannot build connection string: {}", .{err});
+            return;
+        };
         defer self.allocator.free(conninfo);
 
-        const pg_conn = c.PQconnectdb(conninfo.ptr);
-        if (c.PQstatus(pg_conn) != c.CONNECTION_OK) {
-            log.err("Mutation listener: Failed to connect to PostgreSQL: {s}", .{c.PQerrorMessage(pg_conn)});
-            c.PQfinish(pg_conn);
+        const conn = c.PQconnectdb(conninfo.ptr);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            log.err("Mutation listener: Failed to connect to PostgreSQL: {s}", .{c.PQerrorMessage(conn)});
+            c.PQfinish(conn);
             return;
         }
-        defer c.PQfinish(pg_conn);
-        log.info("Mutation listener: Connected to PostgreSQL.", .{});
+        defer c.PQfinish(conn);
+        // Asked of libpq rather than read back from the config fields: with
+        // DATABASE_URL set those fields hold the unused PG_* defaults, so printing them
+        // would report a host this connection never dialled.
+        log.info("Mutation listener: Connected to PostgreSQL at {s}:{s}.", .{
+            c.PQhost(conn), c.PQport(conn),
+        });
 
         // 2. Connect to NATS JetStream Pull Consumer
         var cscnf = nats.protocol.ConsumerConfig{
             .durable_name = "bridge_mutations_worker",
             .ack_policy = "explicit",
             .deliver_policy = "all",
-            .filter_subject = "mutation.>", // From topology.json prefix
+            // Not "mutation.>" spelled out: the comment used to say "from topology.json
+            // prefix", which is the shape of the drift this centralisation exists to stop.
+            .filter_subject = config.Nats.mutations_subject_wildcard,
         };
 
         const connect_opts = nats.protocol.ConnectOpts{
@@ -91,7 +101,7 @@ pub const MutationListener = struct {
         var consumer = nats.Consumer.START(
             self.allocator,
             connect_opts,
-            "MUTATIONS", // Stream name
+            config.Nats.stream_mutations,
             &cscnf,
             self.io,
         ) catch |err| {
@@ -105,11 +115,11 @@ pub const MutationListener = struct {
         // 3. Pull Loop
         while (!self.should_stop.load(.seq_cst)) {
             // Ensure PostgreSQL connection is alive
-            if (c.PQstatus(pg_conn) == c.CONNECTION_BAD) {
+            if (c.PQstatus(conn) == c.CONNECTION_BAD) {
                 log.warn("Mutation listener: PostgreSQL connection lost. Attempting to reconnect...", .{});
-                c.PQreset(pg_conn);
-                if (c.PQstatus(pg_conn) != c.CONNECTION_OK) {
-                    log.err("Mutation listener: Reconnection failed: {s}", .{c.PQerrorMessage(pg_conn)});
+                c.PQreset(conn);
+                if (c.PQstatus(conn) != c.CONNECTION_OK) {
+                    log.err("Mutation listener: Reconnection failed: {s}", .{c.PQerrorMessage(conn)});
                     utils.sleep(2 * std.time.ns_per_s);
                     continue; // Skip pulling until we reconnect
                 }
@@ -126,7 +136,7 @@ pub const MutationListener = struct {
                     continue;
                 };
                 
-                self.handleMutation(payload, pg_conn) catch |err| {
+                self.handleMutation(payload, conn) catch |err| {
                     log.err("Failed to handle mutation: {}", .{err});
                     // We NAck to let it retry immediately or according to backoff
                     consumer.NACK(msg, true) catch {
@@ -146,7 +156,7 @@ pub const MutationListener = struct {
         }
     }
 
-    fn handleMutation(self: *MutationListener, payload_bytes: []const u8, pg_conn: ?*c.PGconn) !void {
+    fn handleMutation(self: *MutationListener, payload_bytes: []const u8, conn: ?*c.PGconn) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -263,7 +273,7 @@ pub const MutationListener = struct {
         log.info("Executing UPSERT: {s}", .{sql});
 
         const res = c.PQexecParams(
-            pg_conn,
+            conn,
             sql.ptr,
             @intCast(param_vals.items.len),
             null, // paramTypes
@@ -275,7 +285,7 @@ pub const MutationListener = struct {
         defer c.PQclear(res);
 
         if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
-            log.err("Mutation failed: {s}", .{c.PQerrorMessage(pg_conn)});
+            log.err("Mutation failed: {s}", .{c.PQerrorMessage(conn)});
             return error.MutationFailed;
         }
 

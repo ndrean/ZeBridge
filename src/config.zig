@@ -52,27 +52,28 @@ pub const Nats = struct {
     pub const status_update_interval_ms = 100; // 100 milliseconds
     pub const status_update_byte_threshold: u64 = 1024 * 1024; // 1MB
 
-    /// JetStream stream names
+    /// JetStream stream names. Every one of these is a name `nats-init` creates from
+    /// the same topology.json, so the two ends cannot disagree.
     pub const stream_cdc = topology.stream_cdc;
-    pub const stream_schema = topology.stream_schema;
     pub const stream_init = topology.stream_init;
-
-    /// Default streams to verify on startup
-    pub const default_streams = &[_][]const u8{ stream_cdc, stream_init };
+    pub const stream_mutations = topology.stream_mutations;
+    pub const stream_requests = topology.stream_requests;
 
     /// Subject prefixes
     pub const subject_cdc_prefix = topology.subject_cdc_prefix;
-    pub const subject_schema_prefix = topology.subject_schema_prefix;
     pub const subject_init_prefix = topology.subject_init_prefix;
+    pub const subject_mutations_prefix = topology.subject_mutations_prefix;
 
-    /// CDC subject patterns: "cdc.<table>.<operation>"
-    pub const cdc_subject_pattern = subject_cdc_prefix ++ ".{s}.{s}";
+    /// Every mutation subject the ingress consumer filters on: "mutation.>"
+    pub const mutations_subject_wildcard = subject_mutations_prefix ++ ".>";
 
-    /// CDC wildcard subject for subscribing to all CDC events
-    pub const cdc_subject_wildcard = subject_cdc_prefix ++ ".>";
+    /// Subject a client publishes a schema request to, and the bridge subscribes to.
+    pub const schema_request_subject = topology.schema_request;
 
-    /// Schema KV bucket name
-    pub const schema_kv_bucket = topology.kv_schemas;
+    /// Where the bridge publishes a table's schema: "init.schema.<table>". Under the
+    /// init prefix so the INIT stream captures it — a subject outside every stream is
+    /// published, never acked, and fails after the full retry budget.
+    pub const schema_subject_pattern = topology.schema_request ++ ".{s}";
 
     /// JetStream exposes a KV bucket as the subject space $KV.<bucket>.<key>, so a
     /// bucket is written by publishing to that subject. Single-sourced from topology:
@@ -81,6 +82,14 @@ pub const Nats = struct {
     /// constants but NOT what the bridge actually published.
     pub const kv_subject_prefix = "$KV.";
     pub const kv_schemas_subject_pattern = kv_subject_prefix ++ topology.kv_schemas ++ ".{s}";
+
+    /// Snapshot descriptor bucket, same reasoning as above. This one was a live
+    /// instance of the bug rather than a hypothetical: `snapshot_listener` published to
+    /// a hardcoded "$KV.snapshots.{s}" while `nats-init` never created the bucket at
+    /// all (it read only `.kv.schemas` from topology.json), so every snapshot ended in
+    /// six failed publish retries against a bucket that did not exist.
+    pub const snapshot_kv_bucket = topology.kv_snapshots;
+    pub const kv_snapshots_subject_pattern = kv_subject_prefix ++ topology.kv_snapshots ++ ".{s}";
 
     pub const publisher_max_wait = 10_000; // 10 seconds
 
@@ -190,9 +199,6 @@ pub const Snapshot = struct {
     /// the whole snapshot failed. It must live under init.> for the INIT stream to
     /// store it.
     pub const schema_subject_pattern = topology.snapshot_schema_pattern;
-
-    /// NATS KV bucket name for schemas
-    pub const kv_bucket_schemas = topology.kv_schemas;
 
     /// Message ID pattern for data chunks: "snap-<table>-<snapshot_id>-<chunk>"
     pub const data_msg_id_pattern = "snap-{s}-{s}-{d}";
@@ -432,16 +438,26 @@ pub const RuntimeConfig = struct {
     // borrowed from argv/environ, all of which outlive the process. See parseArgs.
 };
 
-/// Get default log level based on environment
-pub fn getDefaultLogLevel() std.log.Level {
-    if (std.c.getenv("LOG_LEVEL")) |level_c_str| {
-        log.debug("Level----------> : {s}", .{level_c_str});
-        const level_str = std.mem.span(level_c_str);
-        if (std.mem.eql(u8, level_str, "debug")) return .debug;
-        if (std.mem.eql(u8, level_str, "info")) return .info;
-        if (std.mem.eql(u8, level_str, "warn")) return .warn;
-        if (std.mem.eql(u8, level_str, "err")) return .err;
-    }
+/// Resolve the runtime log level from `LOG_LEVEL`.
+///
+/// Takes the environ from `std.process.Init` rather than calling `std.c.getenv`, so it
+/// reads the same block as every other setting (see args.zig) instead of a second,
+/// libc-dependent path.
+///
+/// Deliberately silent: this runs *before* the caller has assigned the level it
+/// returns, so anything it logged at debug would be filtered by the level still in
+/// effect — which is exactly why the old "Level---------->" line never appeared. The
+/// caller logs the outcome after applying it. An unrecognised value is worth a warning
+/// though: `warn` passes the default filter, and silently running at info when you
+/// asked for debug is the confusing case.
+pub fn getDefaultLogLevel(init: *const std.process.Init) std.log.Level {
+    const raw = init.minimal.environ.getPosix("LOG_LEVEL") orelse return .info;
 
+    if (std.mem.eql(u8, raw, "debug")) return .debug;
+    if (std.mem.eql(u8, raw, "info")) return .info;
+    if (std.mem.eql(u8, raw, "warn")) return .warn;
+    if (std.mem.eql(u8, raw, "err")) return .err;
+
+    log.warn("LOG_LEVEL='{s}' is not one of debug|info|warn|err — using info", .{raw});
     return .info;
 }

@@ -58,25 +58,136 @@ pub const ColumnMeta = struct {
     typtype: u8 = 'b',
     /// 1-based position in the primary key, or 0 if this column is not part of it.
     /// Carrying the whole key rather than a single column name is what lets the same
-    /// lookup serve composite keys when snapshot pagination learns to page on them.
+    /// lookup serve composite keys, which is what pagination pages on.
     pk_ord: u16 = 0,
+    /// `format_type(atttypid, atttypmod)` — the declared type as Postgres spells it,
+    /// e.g. `numeric(20,8)`, `character varying(64)`, `public.mood`. Used to cast
+    /// keyset cursor literals back to the column's own type; see `keysetPredicate`.
+    type_text: []const u8 = "",
 };
-
-/// Whether a keyset cursor of this type is written unquoted in SQL.
-///
-/// Only used to build the pagination `WHERE`; a wrong answer produces a syntax error
-/// at the next chunk, not silent corruption.
-pub fn isNumericOid(oid: u32) bool {
-    return switch (oid) {
-        20, 21, 23, 26 => true, // int8, int2, int4, oid
-        700, 701 => true, // float4, float8
-        numeric_oid => true,
-        else => false,
-    };
-}
 
 /// `pg_type.oid` for `numeric`. A fixed catalog constant, unlike extension types.
 pub const numeric_oid: u32 = 1700;
+
+/// `pg_type.oid` for `bytea`. Its decoded form is raw bytes — the only rendered value
+/// that cannot be pasted into SQL text as-is.
+pub const bytea_oid: u32 = 17;
+
+// ---------------------------------------------------------------------------
+// Keyset pagination
+//
+// Chunking pages on the primary key rather than `OFFSET`, so each boundary costs an
+// index seek instead of re-reading everything before it. The key may have any number
+// of columns, so the predicate is a **row-value comparison** — `("a","b") > (…)` —
+// which Postgres compares lexicographically, exactly matching the order that
+// `ORDER BY "a","b"` produces.
+//
+// Paging on the first column alone would not merely be incomplete, it would be wrong:
+// that column is not unique on its own, so a chunk boundary landing inside a run of
+// equal first-column values would skip the rest of that run.
+// ---------------------------------------------------------------------------
+
+/// Write one cursor value as a SQL literal cast to the column's declared type:
+/// `'42'::integer`, `'2025-01-01T00:00:00Z'::timestamp with time zone`.
+///
+/// The cast is not decoration. Inside a row constructor an unquoted literal is
+/// `unknown`, and leaving type resolution to the planner is the kind of thing that
+/// works for `int` and surprises on a domain or an enum. Naming the type makes the
+/// comparison the same one `ORDER BY` uses, whatever the column is.
+///
+/// Quoting doubles `'`. Backslashes are left alone, which is correct only under
+/// `standard_conforming_strings = on` — the caller asserts that once per snapshot from
+/// `PQparameterStatus`, rather than trusting the server's default.
+fn appendSqlLiteral(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    col: ColumnMeta,
+    value: []const u8,
+) !void {
+    try out.append(allocator, '\'');
+    if (col.oid == bytea_oid) {
+        // Raw bytes: NULs and quotes would truncate or break the statement, so the
+        // hex input form is the only safe spelling.
+        try out.appendSlice(allocator, "\\x");
+        const hex = "0123456789abcdef";
+        for (value) |byte| {
+            try out.append(allocator, hex[byte >> 4]);
+            try out.append(allocator, hex[byte & 0x0f]);
+        }
+    } else {
+        for (value) |ch| {
+            if (ch == '\'') try out.append(allocator, '\'');
+            try out.append(allocator, ch);
+        }
+    }
+    try out.append(allocator, '\'');
+
+    // An empty `type_text` means the catalog lookup did not fill it in; casting to
+    // nothing at all is better than emitting `::`.
+    if (col.type_text.len > 0) {
+        try out.appendSlice(allocator, "::");
+        try out.appendSlice(allocator, col.type_text);
+    }
+}
+
+/// Build the keyset `WHERE` for the chunk after `cursor`: `("a","b") > ('1'::int4, …)`.
+///
+/// `pk_idx` holds indices into `columns` in primary-key order, and `cursor` the
+/// matching values from the last row of the previous chunk. A single-column key
+/// degenerates to `("a") > ('1'::int4)`, which Postgres reads as a plain scalar
+/// comparison — so there is one code path, not two.
+pub fn keysetPredicate(
+    allocator: std.mem.Allocator,
+    columns: []const ColumnMeta,
+    pk_idx: []const usize,
+    cursor: []const []const u8,
+) ![]u8 {
+    std.debug.assert(pk_idx.len == cursor.len);
+    std.debug.assert(pk_idx.len > 0);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.append(allocator, '(');
+    for (pk_idx, 0..) |idx, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.append(allocator, '"');
+        try out.appendSlice(allocator, columns[idx].name);
+        try out.append(allocator, '"');
+    }
+    try out.appendSlice(allocator, ") > (");
+    for (pk_idx, cursor, 0..) |idx, value, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try appendSqlLiteral(&out, allocator, columns[idx], value);
+    }
+    try out.append(allocator, ')');
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build `ORDER BY "a", "b"` over the primary key, in key order.
+///
+/// Must stay in lockstep with `keysetPredicate`: the row comparison is only a correct
+/// cursor if the rows arrive in the order it compares against.
+pub fn orderByClause(
+    allocator: std.mem.Allocator,
+    columns: []const ColumnMeta,
+    pk_idx: []const usize,
+) ![]u8 {
+    std.debug.assert(pk_idx.len > 0);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (pk_idx, 0..) |idx, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.append(allocator, '"');
+        try out.appendSlice(allocator, columns[idx].name);
+        try out.append(allocator, '"');
+    }
+
+    return out.toOwnedSlice(allocator);
+}
 
 pub const Error = error{
     /// The stream did not begin with the binary COPY signature. Usually means the
@@ -355,9 +466,10 @@ pub const Streamer = struct {
     conn: ?*c.PGconn,
     columns: []const ColumnMeta,
     buffer: std.ArrayListUnmanaged(u8) = .empty,
-    /// Rendered value of the PK column in the last row, for keyset pagination. Points
-    /// into the arena, so the caller must copy it before resetting.
-    last_pk: ?[]const u8 = null,
+    /// Rendered primary-key values of the last row, in key order — the next chunk's
+    /// keyset cursor. Points into the arena, so the caller must copy it before
+    /// resetting.
+    last_pk: ?[]const []const u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -371,16 +483,21 @@ pub const Streamer = struct {
         self.buffer.deinit(self.allocator);
     }
 
-    pub fn getLastPkValue(self: *const Streamer) ?[]const u8 {
+    /// The keyset cursor for the next chunk: one value per primary-key column, in key
+    /// order. Only valid until the caller's arena is reset.
+    pub fn getLastPkValues(self: *const Streamer) ?[]const []const u8 {
         return self.last_pk;
     }
 
     /// Run the COPY, decode every tuple, and encode the chunk. Returns the row count.
+    ///
+    /// `pk_idx` holds indices into `columns` in primary-key order; the values at those
+    /// indices in the final row become the next chunk's cursor.
     pub fn streamToEncoder(
         self: *Streamer,
         query: [:0]const u8,
         encoder: *streaming_encoder.StreamingEncoder,
-        pk_col_idx: ?usize,
+        pk_idx: []const usize,
     ) !usize {
         const result = c.PQexec(self.conn, query.ptr);
         defer c.PQclear(result);
@@ -438,13 +555,35 @@ pub const Streamer = struct {
         // Header first, count already known.
         try encoder.writeArrayHeader(rows.items.len);
 
+        // One cursor buffer for the whole chunk, overwritten per row: only the last
+        // row's values are ever read, and the arena would otherwise hold a discarded
+        // copy per row.
+        const cursor = if (pk_idx.len > 0)
+            try self.allocator.alloc([]const u8, pk_idx.len)
+        else
+            null;
+
         for (rows.items) |raw_fields| {
             const values = try decodeTuple(self.allocator, self.columns, raw_fields);
             try encoder.beginRow(values.len);
             for (values) |v| try encoder.writeField(v);
 
-            if (pk_col_idx) |idx| {
-                if (idx < values.len) self.last_pk = values[idx];
+            if (cursor) |slots| {
+                for (pk_idx, slots) |idx, *slot| {
+                    std.debug.assert(idx < values.len);
+                    // A primary key column is NOT NULL by definition, so a null here
+                    // means the layout is not the one this COPY emitted — the same
+                    // class of fault as a field-count mismatch, and not something to
+                    // page past.
+                    slot.* = values[idx] orelse {
+                        log.err(
+                            "🔴 primary key column '{s}' decoded as NULL — the catalog layout does not match this COPY, aborting rather than paginating on it",
+                            .{self.columns[idx].name},
+                        );
+                        return error.NullPrimaryKeyValue;
+                    };
+                }
+                self.last_pk = slots;
             }
         }
 
@@ -746,11 +885,66 @@ test "scaleFromFormatType - nothing to pad" {
     try testing.expectEqual(@as(?u16, null), scaleFromFormatType("numeric(10,0)"));
 }
 
-test "isNumericOid - integer and decimal keys are unquoted, text keys are not" {
-    try testing.expect(isNumericOid(23)); // int4
-    try testing.expect(isNumericOid(numeric_oid));
-    try testing.expect(!isNumericOid(25)); // text
-    try testing.expect(!isNumericOid(2950)); // uuid
+test "keysetPredicate - a single-column key is a plain scalar comparison" {
+    const alloc = testing.allocator;
+    const columns = [_]ColumnMeta{
+        .{ .name = "id", .oid = 23, .pk_ord = 1, .type_text = "integer" },
+        .{ .name = "email", .oid = 25, .type_text = "text" },
+    };
+    const sql = try keysetPredicate(alloc, &columns, &.{0}, &.{"41"});
+    defer alloc.free(sql);
+    try testing.expectEqualStrings("(\"id\") > ('41'::integer)", sql);
+}
+
+test "keysetPredicate - a composite key compares the whole row, in key order" {
+    const alloc = testing.allocator;
+    // Declaration order is (name, tenant); key order is (tenant, name). Paging must
+    // follow the key, so the caller's pk_idx — not the column order — decides.
+    const columns = [_]ColumnMeta{
+        .{ .name = "name", .oid = 25, .pk_ord = 2, .type_text = "text" },
+        .{ .name = "tenant", .oid = 23, .pk_ord = 1, .type_text = "integer" },
+    };
+    const sql = try keysetPredicate(alloc, &columns, &.{ 1, 0 }, &.{ "7", "carol" });
+    defer alloc.free(sql);
+    try testing.expectEqualStrings(
+        "(\"tenant\", \"name\") > ('7'::integer, 'carol'::text)",
+        sql,
+    );
+}
+
+test "keysetPredicate - a quote in a key value cannot end the literal" {
+    // O'Brien as a text key: the cursor comes straight from table data, so this is
+    // ordinary input, not an attack. Getting it wrong is a syntax error at best and a
+    // truncated predicate at worst.
+    const alloc = testing.allocator;
+    const columns = [_]ColumnMeta{
+        .{ .name = "name", .oid = 25, .pk_ord = 1, .type_text = "text" },
+    };
+    const sql = try keysetPredicate(alloc, &columns, &.{0}, &.{"O'Brien"});
+    defer alloc.free(sql);
+    try testing.expectEqualStrings("(\"name\") > ('O''Brien'::text)", sql);
+}
+
+test "keysetPredicate - a bytea key goes out as hex, not raw bytes" {
+    // Raw bytes would carry a NUL that truncates the statement at the libpq boundary.
+    const alloc = testing.allocator;
+    const columns = [_]ColumnMeta{
+        .{ .name = "digest", .oid = bytea_oid, .pk_ord = 1, .type_text = "bytea" },
+    };
+    const sql = try keysetPredicate(alloc, &columns, &.{0}, &.{&[_]u8{ 0x00, 0xff, 0x10 }});
+    defer alloc.free(sql);
+    try testing.expectEqualStrings("(\"digest\") > ('\\x00ff10'::bytea)", sql);
+}
+
+test "orderByClause - follows key order and stays in lockstep with the predicate" {
+    const alloc = testing.allocator;
+    const columns = [_]ColumnMeta{
+        .{ .name = "name", .oid = 25, .pk_ord = 2, .type_text = "text" },
+        .{ .name = "tenant", .oid = 23, .pk_ord = 1, .type_text = "integer" },
+    };
+    const sql = try orderByClause(alloc, &columns, &.{ 1, 0 });
+    defer alloc.free(sql);
+    try testing.expectEqualStrings("\"tenant\", \"name\"", sql);
 }
 
 test "isKnownOid - built-in types are known, dynamic ones are not" {

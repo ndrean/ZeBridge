@@ -5,34 +5,39 @@ historical, not a running order — see **Start here** below.
 
 ---
 
-## 🔜 Start here next session (written 2026-08-14)
+## 🔜 Start here next session (written 2026-08-15)
 
-**Environment as left.** Postgres volume was wiped and re-initialised mid-session, then
-scenario steps 7–8 ran. `exotic_types` currently has **no `attrs` column** — G2 dropped
-it. To make TEST_SCENARIOS **G1** (the hstore refusal) reproducible, either:
+**Environment as left.** The Postgres volume was recreated, then `Emitter.Scenario`
+steps 2 → 3 → 4 → 5 were run, so `users` exists with `PRIMARY KEY (name, email)` and
+**12 515 rows** (padded for the pagination test — the scenario itself leaves 15).
+`test_types` exists and is empty; `users_no_pk` and `exotic_types` were never created
+(steps 1, 7, 8 not run). Two hand-built fixtures are also present, both in `my_pub`,
+both granted to `bridge_reader`:
 
-```sql
-ALTER TABLE public.exotic_types ADD COLUMN attrs hstore;
-```
+- `public.ck` — 25 000 rows, `PRIMARY KEY (tenant, name)`, 3 000 names repeated per
+  tenant so chunk boundaries land inside a run of equal `tenant`; every name contains
+  a `'`.
+- `public.sk` — 15 002 rows, `PRIMARY KEY (id)` spanning **-1 to 15000**, which is what
+  pins the removed `"id" > 0` first-chunk sentinel.
 
-or `Emitter.Scenario.reset()` then `step7()` / `step8()`.
-
-Also note `users` carries the **composite** PK from step 5, and `users_no_pk` is
-suspended — both are useful fixtures, not leftovers to clean.
+`DROP TABLE public.ck, public.sk;` when they stop being useful, and
+`DELETE FROM public.users WHERE name LIKE 'n-%';` to put `users` back to its
+scenario size. Bring the stack up with
+`docker compose -f docker-compose.full.yml --env-file .env.docker up -d postgres-primary
+nats-config-gen nats-server nats-init bridge-init`, then run the bridge from the host
+with `.env` plus `PG_PORT=55432`.
 
 **Work, in order:**
 
-1. **Composite keyset pagination** — the unblocked one, and the reason COPY BINARY went
-   first. `ColumnMeta.pk_ord` already carries the whole key from the catalog, on typed
-   values. This is a change to pagination alone: `WHERE (a,b) > (?,?)`, `ORDER BY a,b`,
-   capture N cursor values per chunk. Removes the `CompositePrimaryKeyUnsupported`
-   refusal and lets `users` snapshot.
-2. **CDC type guard** — §E below. Full design is written; the first move is the *check*
+1. **CDC type guard** — §E below. Full design is written; the first move is the *check*
    at the end of §E (does the tuple decoder branch on pgoutput's per-column format
    byte?), because the answer changes the shape of the fix.
-3. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
+2. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
    snapshot application. Unblocks TEST_SCENARIOS **B**, **C3**, **C4**, **D2**, lets
    **F6** end in a re-seed instead of a caveat, and is the gate on deleting the CSV path.
+3. **The scenario migrations moved** from `emitter/priv/spec/` to
+   `emitter/priv/repo/migrations/` (2026-08-15, untracked at the new location — commit
+   them). `Emitter.Scenario` steps 1–8 run again from there.
 
 **Small, independent, pick up any time** (§F): array quoting (`{"solo"}` vs `{solo}` —
 systematic, blocks a byte-equality golden test), snapshot failures that abort without
@@ -40,7 +45,9 @@ publishing to `init.snap.error.<table>`, golden-value test per PG major (note
 `pgoutput`'s `binary` needs PG 14+, but `COPY ... FORMAT binary` goes back to 7.4).
 
 **Do not** prune `pg_copy_csv.zig` yet — the rollout gate is a consumer reconstructing a
-table from a binary snapshot, which item 3 unblocks.
+table from a binary snapshot, which item 2 unblocks. `getTablePrimaryKey` and
+`PkMetadata` in `snapshot_listener.zig` are now dead (pagination resolves the key from
+`getTableColumns`); they go out with CSV.
 
 ---
 
@@ -449,12 +456,13 @@ can decode it.
 - **Array quoting.** The bridge writes `{"x","y,z"}` where Postgres writes `{x,"y,z"}` —
   both valid array literals, parsing identically, but not byte-equal. Blocks a golden
   test that asserts byte equality with text `COPY`.
-- **Snapshot failures are silent to clients.** `CompositePrimaryKeyUnsupported` and
-  `UnsupportedColumnType` abort server-side without publishing to
-  `init.snap.error.<table>`. Both deserve an `error_type` (`PROTOCOL.md` §6).
-- **Fold the two catalog queries.** `getTablePrimaryKey` and `getTableColumns` are
-  already merged for the *binary* generator; the older CSV generator still calls
-  `getTablePrimaryKey`. Goes away with CSV.
+- **Snapshot failures are silent to clients.** `UnsupportedColumnType`,
+  `MalformedPrimaryKey` and `UnsafeStringLiterals` all abort server-side without
+  publishing to `init.snap.error.<table>`. Each deserves an `error_type`
+  (`PROTOCOL.md` §6).
+- **Fold the two catalog queries.** `getTableColumns` is now the only source of both
+  layout and key, so `getTablePrimaryKey` and `PkMetadata` are dead code. They go out
+  with CSV rather than in a separate change.
 - **Golden-value test per PG major.** `pgoutput`'s `binary` option needs PG 14+, so the
   bridge will not start on older servers — but `COPY ... FORMAT binary` works back to
   7.4, so the decoder alone can be exercised much further back.
@@ -465,14 +473,75 @@ can decode it.
 
 ## Next up, in order
 
-1. **Composite keyset pagination** — now unblocked and sitting on typed values, which
-   was the reason for doing COPY BINARY first. `ColumnMeta.pk_ord` already carries the
-   whole key, so this is a change to pagination alone: `WHERE (a,b) > (?,?)`,
-   `ORDER BY a,b`, capture N cursor values.
-2. **§E above** — the CDC type guard.
-3. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
+1. **§E above** — the CDC type guard.
+2. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
    snapshot application. Unblocks TEST_SCENARIOS groups B, C3, C4, D2, lets F6 end in a
    re-seed instead of a caveat, and opens the gate on deleting CSV.
+
+---
+
+---
+
+# G. Composite keyset pagination — ✅ DONE (2026-08-15), verified live
+
+The reason COPY BINARY went first: `ColumnMeta.pk_ord` already carried the whole key on
+typed values, so this was a change to pagination alone.
+
+## What changed
+
+- **`pg_copy_binary.keysetPredicate` / `orderByClause`** — build
+  `("a","b") > ('7'::integer, 'carol'::text)` and `ORDER BY "a","b"` from the catalog
+  rows. A single-column key degenerates to `("a") > (…)`, which Postgres reads as a
+  plain scalar comparison, so there is **one** code path rather than a special case.
+- **`Streamer` captures N cursor values**, not one: `last_pk` is now
+  `?[]const []const u8`, filled from `pk_idx` in key order. A NULL in a key column is
+  `error.NullPrimaryKeyValue` — a PK column is NOT NULL, so a null there means the
+  catalog layout is not the one this COPY emitted, the same class of fault as a field
+  count mismatch.
+- **`resolvePrimaryKey`** orders the key from `pk_ord` and rejects ordinals that are not
+  exactly `1..n` (`error.MalformedPrimaryKey`), which would otherwise leave a hole in
+  the cursor.
+- **`ColumnMeta.type_text`** now carries `format_type(...)` for every column, and every
+  cursor literal is cast to it. Inside a row constructor an untyped literal is
+  `unknown`; naming the type makes the comparison the same one `ORDER BY` uses, on
+  domains and enums as much as on `int`.
+- **Preflight's `snapshots_unimplemented` finding is gone** — a composite key is now an
+  ordinary table shape, not a warning.
+
+## Two bugs fixed on the way
+
+- **The first chunk used a sentinel.** `"id" > 0` for a numeric key silently dropped any
+  row with a zero or negative key, and `''` was not a real lower bound for text either.
+  The first chunk now takes the whole table (`1=1`) and only later chunks carry a
+  cursor.
+- **Cursor literals were interpolated unescaped.** A key value containing `'` produced a
+  syntax error at best. Quoting now doubles `'`, `bytea` goes out as `'\x…'` (raw bytes
+  would have carried a NUL that truncates the statement at the libpq boundary), and the
+  snapshot refuses to start if `standard_conforming_strings` is off — read from
+  `PQparameterStatus`, so it costs no round trip.
+
+## Verification
+
+Unit tests cover predicate shape, key order vs column order, quote escaping and bytea
+hex. Live, on the fixture described in TEST_SCENARIOS §G4 — 25 000 rows over
+`(tenant, name)` with 3 000 names per tenant, so both chunk boundaries fall inside a run
+of equal `tenant`:
+
+```
+📸 'ck': paginating on a 2-column primary key
+📦 chunk 0 (10000 rows) … 📦 chunk 1 (10000 rows) … 📦 chunk 2 (5000 rows)
+```
+
+Chunk 0 ends at `(3, u'-00999)` and chunk 1 resumes at `(3, u'-01000)` — paging on
+`tenant` alone would have skipped the remaining 2 000 rows of tenant 3. Decoded:
+25 000 rows, 25 000 distinct keys, globally ascending. The single-column fixture
+(`sk`, ids -1..15000) returns 15 002 rows including `-1` and `0`.
+
+Then on the real scenario table: `users` after step 5 (`PRIMARY KEY (name, email)`,
+both `varchar(255)`), padded to 12 515 rows so a boundary falls inside a run of equal
+names. The emitted key sequence was **identical to PostgreSQL's own
+`ORDER BY name, email`** — which also pins the collation question, since `User-*` sorts
+after `n-*` under the database's collation but before it in byte order.
 
 ---
 

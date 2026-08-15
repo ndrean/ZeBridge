@@ -11,11 +11,6 @@ const std = @import("std");
 const config = @import("config.zig");
 const nats = @import("nats");
 const nats_publisher = @import("nats_publisher.zig");
-// KV operations removed - not in use
-// const nats_kv = @import("nats_kv.zig");
-// Old lalinsky/nats.zig imports removed (obsolete trial code):
-// const nats_kv_zig = @import("nats_kv_zig.zig");
-// const nats_connection_zig = @import("nats_connection_zig.zig");
 const pgoutput = @import("pgoutput.zig");
 const msgpack = @import("msgpack");
 const encoder_mod = @import("encoder.zig");
@@ -59,10 +54,10 @@ pub fn publishSchema(
         schema_version,
     });
 
-    // Build subject: init.schema.{table_name} (matches INIT stream with init.> pattern)
+    // Subject from topology; it sits under the init prefix so the INIT stream captures it.
     const subject = try std.fmt.allocPrint(
         allocator,
-        "init.schema.{s}",
+        config.Nats.schema_subject_pattern,
         .{relation.name},
     );
     defer allocator.free(subject);
@@ -120,7 +115,7 @@ pub fn publishSchema(
 /// Args:
 ///   allocator: Memory allocator
 ///   pg_config: PostgreSQL connection configuration
-///   publisher: NATS publisher instance (nats.c - for fallback)
+///   publisher: unused — kept so the call site does not change (see below)
 ///   monitored_tables: List of tables from the publication to publish schemas for
 ///   format: Encoding format (.msgpack or .json)
 pub fn publishInitialSchemas(
@@ -278,20 +273,5 @@ pub fn publishInitialSchemas(
     log.info("✅ Queried schemas for {d} tables (schemas now published via snapshot_listener)", .{table_schemas.count()});
 }
 
-// REMOVED: KV-based schema publishing (not in use)
-// This function was used to publish schemas to NATS KV store using nats.c
-// Schema publishing is now done via snapshot_listener when handling schema requests
-//
-// /// Publish a single table's schema to NATS KV store (using nats.c)
-// ///
-// /// Internal helper function called by publishInitialSchemas.
-// /// Encodes column metadata and stores in KV with key: table_name
-// fn publishTableSchema(
-//     allocator: std.mem.Allocator,
-//     publisher: *nats_publisher.Publisher,
-//     table_name: []const u8,
-//     columns: []const ColumnInfo,
-//     format: encoder_mod.Format,
-// ) !void {
-//     ... (removed for brevity)
-// }
+// Schemas reach the KV store from `event_processor.publishBootSchemas` and from
+// `snapshot_listener`'s schema-request handler; this module only queries them.
