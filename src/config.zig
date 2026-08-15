@@ -309,18 +309,20 @@ pub const Buffers = struct {
     /// URL buffer size
     pub const url_buffer_size = 256;
 
-    /// Event data buffer size (per-event packed column storage)
-    /// Default: 15 → 2^15 = 32KB per event
-    /// Configurable via environment variable BASE_BUF (log2 of desired size)
-    /// If a row exceeds this size, the bridge will panic to prevent data loss
-    /// Example: BASE_BUF=16 → 64KB, BASE_BUF=14 → 16KB
-    pub const default_event_data_buffer_log2: u6 = 14; // 2^14 = 16.384KB
+    /// Event data buffer size (per-event packed column storage), as log2 bytes.
+    /// Configurable via BASE_BUF (range 10-20): BASE_BUF=16 → 64KB, 14 → 16KB.
+    ///
+    /// A row larger than this **suspends its table** (`reason: "row_too_large"`) and the
+    /// bridge keeps running — it used to `@panic`, which crash-looped under a supervisor
+    /// because the offending row precedes any later ACK and is re-read on restart.
+    /// See README "Sizing BASE_BUF and RING_BUFFER_COUNT" for the memory formula.
+    pub const default_event_data_buffer_log2: u6 = 14; // 2^14 = 16KB
 
     /// Ring buffer event count (number of pre-allocated event slots)
     /// Default: 65536 events
     /// Configurable via environment variable RING_BUFFER_COUNT
     /// Total memory = event_count × event_buffer_size
-    /// Example: 65536 slots × 32KB = 2GB slab
+    /// Example: 65536 slots × 16KB (BASE_BUF=14) = 1GB slab
     ///
     /// Sizing rationale — the buffer is what absorbs a NATS outage before the
     /// producer has to backpressure and let WAL accumulate:
@@ -460,11 +462,15 @@ pub const RuntimeConfig = struct {
 pub fn getDefaultLogLevel(init: *const std.process.Init) std.log.Level {
     const raw = init.minimal.environ.getPosix("LOG_LEVEL") orelse return .info;
 
+    // Both spellings of the two ambiguous levels are accepted on purpose. Zig names the
+    // enum tags `.warn` and `.err`, but `std.log` *prints* "warning" and "error" — so
+    // the obvious thing to type is whatever you last saw in the log, and being strict
+    // here would reject it. This is the one place the two vocabularies meet.
     if (std.mem.eql(u8, raw, "debug")) return .debug;
     if (std.mem.eql(u8, raw, "info")) return .info;
-    if (std.mem.eql(u8, raw, "warn")) return .warn;
-    if (std.mem.eql(u8, raw, "err")) return .err;
+    if (std.mem.eql(u8, raw, "warn") or std.mem.eql(u8, raw, "warning")) return .warn;
+    if (std.mem.eql(u8, raw, "err") or std.mem.eql(u8, raw, "error")) return .err;
 
-    log.warn("LOG_LEVEL='{s}' is not one of debug|info|warn|err — using info", .{raw});
+    log.warn("LOG_LEVEL='{s}' is not one of debug|info|warn(ing)|err(or) — using info", .{raw});
     return .info;
 }

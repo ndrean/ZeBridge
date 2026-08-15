@@ -152,7 +152,9 @@ pub const Registry = struct {
         const e = self.find(table) orelse return;
         if (e.active.swap(false, .acq_rel)) {
             _ = self.refused_count.fetchSub(1, .acq_rel);
-            log.info("✅ '{s}' is no longer refused ({s} resolved)", .{ e.name, e.reason.wireName() });
+            // "was", not "resolved": this is also the path a DROP TABLE takes, where
+            // nothing was fixed — the table simply stopped existing.
+            log.info("✅ '{s}' is no longer refused (was: {s})", .{ e.name, e.reason.wireName() });
         }
     }
 

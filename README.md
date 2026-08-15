@@ -116,7 +116,7 @@ The consumer will uses these streams to handle NATS state (the names are defined
 * MessagePack default encoding or JSON available with `--json`,
 * At-least-once delivery with idempotent message IDs,
 * Graceful shutdown with LSN acknowledgment,
-* telemetry via HTTP `/metrics` (Prometheus format) and Logs structured metrics to stdout (Grafana Loki)
+* telemetry via HTTP `/metrics` (Prometheus format) and structured logs on **stderr** (Grafana Loki)
 
 **Key decisions**:
 
@@ -703,9 +703,62 @@ The bridge provides telemetry through multiple channels:
 ```mermaid
 flowchart LR
     B[Bridge Server<br/>Telemetry] -->|GET /metrics<br/>Prometheus format| Prometheus
-    B -->|stdout<br/>Structured logfmt| Alloy/Loki
+    B -->|stderr<br/>Structured logfmt| Alloy/Loki
     B -->|GET /status<br/>JSON format| HTTP_Client
 ```
+
+### Metrics or logs? Both — they answer different questions
+
+They are not alternatives, and the suspension of a table shows why:
+
+| | Prometheus (`/metrics`) | Loki (log lines) |
+| --- | --- | --- |
+| stores | numbers over time | text with labels |
+| you get | `bridge_refused_tables 1` | `🔴 SUSPENDING 'orders': a row does not fit in the 4 KB per-event buffer (BASE_BUF=12)` |
+| answers | **is** something wrong, since when, how often | **what** is wrong: which table, which LSN, what to change |
+| good for | alerting, dashboards, trends | investigating after an alert fires |
+
+A gauge is a float: Prometheus physically cannot hold the table name or the fix. Loki
+can, but is poor at counting and alerting on rates. Alert on the metric, read the log
+for the detail.
+
+### Writing the log to a file
+
+**Every log line goes to stderr** — including the periodic `METRICS` line and any panic
+with its stack trace. Nothing is written to stdout, so `> logs.txt` captures an empty
+file. Redirect with `2>`:
+
+```bash
+./zig-out/bin/bridge --slot my_slot --pub my_pub 2>> bridge.log
+```
+
+`LOG_LEVEL` (`debug|info|warn|err`, default `info`) decides what reaches the file. At
+`info` the volume is small — the `METRICS` line every 15 s is ~5 700 lines/day — and
+everything worth keeping is included. **Do not point a file sink at `debug`.**
+
+⚠️ The level *names* differ between input and output: you set `LOG_LEVEL=warn` but the
+lines read `warning(scope):`. Both spellings are accepted for the variable; when
+grepping or writing alert rules, match what the lines actually print:
+
+```bash
+grep -E '^(warning|error)\(' bridge.log
+```
+
+Rotate it, or it grows forever:
+
+```conf
+# /etc/logrotate.d/zebridge
+/path/to/bridge.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    copytruncate      # the bridge holds the fd open; it has no reopen-on-SIGHUP
+}
+```
+
+Under systemd, skip the redirect entirely: journald captures stderr, and
+`journalctl -u zebridge -p warning` gives the severity filter for free.
 
 ### 1. Prometheus Metrics Endpoint
 
@@ -719,12 +772,36 @@ bridge_wal_messages_received_total 1797
 bridge_cdc_events_published_total 288
 bridge_last_ack_lsn 25509096
 bridge_connected 1
-bridge_reconnects_total 0
+bridge_pg_reconnects_total 0
 bridge_nats_reconnects_total 0
-bridge_last_processing_time_us 2
 bridge_slot_active 1
 bridge_wal_lag_bytes 51344
+bridge_wal_confirmed_lag_bytes 2048
+bridge_queue_usage_percent 0
+bridge_refused_tables 0
+bridge_refused_events_dropped_total 0
 ```
+
+Each is served with its own `# HELP` and `# TYPE` line. The four worth alerting on:
+
+| metric | fires when | what it means |
+| --- | --- | --- |
+| `bridge_refused_tables` | `> 0` | a table is **suspended** — no primary key, an undecodable column type, or a row larger than the event buffer. The log line names which and why. |
+| `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
+| `bridge_wal_confirmed_lag_bytes` | rising steadily | **the bridge is behind**: WAL it has not confirmed yet. This is the backlog number. |
+| `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is *retaining* on disk for the slot, until `max_slot_wal_keep_size` |
+| `bridge_connected` | `== 0` | the replication stream is down |
+
+⚠️ **The two lag metrics are not the same question.** `bridge_wal_lag_bytes` measures
+from the slot's `restart_lsn`, which PostgreSQL only advances at checkpoints — so it
+plateaus at a few MB on a perfectly healthy bridge and cannot tell you whether the
+bridge is keeping up. `bridge_wal_confirmed_lag_bytes` measures from
+`confirmed_flush_lsn`, which moves the moment the bridge ACKs. Alert on the confirmed
+one for "the bridge is stuck", on the retained one for "the disk will fill".
+
+`bridge_queue_usage_percent` is the ring buffer's fill level: sustained high values mean
+NATS is not draining as fast as PostgreSQL produces, and the bridge is about to
+back-pressure the WAL reader.
 
 Configure Prometheus to scrape this endpoint:
 
@@ -749,52 +826,68 @@ Returns bridge status as JSON:
   "cdc_events_published": 288,
   "current_lsn": "0/1832ce8",
   "is_connected": true,
-  "reconnect_count": 0,
+  "pg_reconnect_count": 0,
   "nats_reconnect_count": 0,
-  "last_processing_time_us": 2,
   "slot_active": true,
   "wal_lag_bytes": 51344,
-  "wal_lag_mb": 0
+  "wal_lag_mb": 0,
+  "wal_confirmed_lag_bytes": 2048,
+  "queue_usage_percent": 0,
+  "refused_tables": 0,
+  "refused_events_dropped": 0
 }
 ```
+
+The same numbers as `/metrics`, for a human or a shell script rather than a scraper.
 
 ### 3. Structured Log Metrics (for Grafana Alloy/Loki)
 
-The bridge emits structured metric logs to **stdout** every **15 seconds**:
+The bridge writes **every log line to stderr**, including the periodic metric line
+below (every 15 seconds) and any panic with its stack trace. Nothing is written to
+stdout — so redirect with `2>` or `2>&1`, not `>`:
 
-```log
-info(bridge): METRICS uptime=15 wal_messages=2 cdc_events=0 lsn=0/183f680 connected=1 reconnects=0 nats_reconnects=0 lag_bytes=51608 slot_active=1
+```bash
+./zig-out/bin/bridge --slot my_slot --pub my_pub 2>> /var/log/bridge/bridge.log
 ```
 
-Configure Grafana Alloy to parse these logs:
+```log
+info(bridge): METRICS uptime=376 wal_messages=67 cdc_events=6 lsn=0/217e280 connected=1 pg_reconnects=0 nats_reconnects=0 lag_bytes=17816 slot_active=1
+```
+
+⚠️ It is emitted from the WAL loop, so it starts once replication is running — not
+during startup.
+
+When you are ready to ship these to Loki, point Grafana Alloy at the file. Every line
+is `level(scope): message`, and both halves make useful labels:
 
 ```hcl
-loki.source.file "bridge_logs" {
-  targets = [
-    {__path__ = "/var/log/bridge/*.log"},
-  ]
-  forward_to = [loki.process.extract_metrics.receiver]
+loki.source.file "bridge" {
+  targets    = [{__path__ = "/var/log/bridge/*.log", job = "zebridge"}]
+  forward_to = [loki.process.bridge.receiver]
 }
 
-loki.process "extract_metrics" {
+loki.process "bridge" {
+  // "error(event_processor): 🔴 SUSPENDING 'orders': …"
   stage.regex {
-    expression = "METRICS uptime=(?P<uptime>\\d+) wal_messages=(?P<wal_msgs>\\d+) cdc_events=(?P<cdc_events>\\d+)"
+    expression = "^(?P<level>debug|info|warning|error)\\((?P<scope>[a-z_]+)\\):"
   }
-
-  stage.metrics {
-    metric.counter {
-      name   = "bridge_wal_messages_total"
-      source = "wal_msgs"
-    }
-    metric.counter {
-      name   = "bridge_cdc_events_total"
-      source = "cdc_events"
-    }
+  stage.labels {
+    values = { level = "", scope = "" }
   }
-
+  // A panic is one event spread over ~10 lines; keep it as one entry.
+  stage.multiline {
+    firstline = "^(debug|info|warning|error)\\("
+  }
   forward_to = [loki.write.default.receiver]
 }
 ```
+
+Then the queries that matter are `{job="zebridge", level="error"}` and
+`{job="zebridge", scope="refused"}` — every suspension the bridge has ever declared.
+
+⚠️ Do **not** use Alloy's `stage.metrics` to re-derive counters from the `METRICS` line.
+Prometheus already scrapes those numbers from `/metrics`; a second, lossier copy that
+only updates every 15 seconds is worse in every respect.
 
 ### 4. Health Check Endpoint
 
@@ -834,6 +927,16 @@ Shutdown sequence:
 
 ```bash
 curl "http://localhost:9090/streams/info?stream=CDC" | jq
+```
+
+⚠️ **Known broken** (2026-08-15): this returns
+`500 Failed to get stream info: error.JsonParseError`. The failure is in the vendored
+NATS client's parse of JetStream's `STREAM.INFO` response, not in the endpoint itself.
+Use the `nats` CLI meanwhile:
+
+```bash
+nats stream info CDC
+nats stream subjects CDC
 ```
 
 ---

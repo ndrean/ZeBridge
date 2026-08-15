@@ -132,6 +132,11 @@ defmodule Emitter.Scenario do
         Ecto.Adapters.SQL.query!(repo, "DROP TABLE IF EXISTS public.#{t} CASCADE;")
       end
 
+      # A type is not a table: it survives every DROP TABLE above, so without this the
+      # reset is partial and step7 fails on its second run with `duplicate_object`.
+      # CASCADE because any column still declared `mood` would otherwise block it.
+      Ecto.Adapters.SQL.query!(repo, "DROP TYPE IF EXISTS public.mood CASCADE;")
+
       # May not exist yet on a truly fresh database — reset must be safe to call first.
       Ecto.Adapters.SQL.query(repo, "DELETE FROM schema_migrations;")
       IO.puts("🧹 reset: tables dropped, migration log cleared")

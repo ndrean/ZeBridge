@@ -38,3 +38,8 @@ examples/01-micro_vm-nodejs/node_modules/
 examples/02-micro_vm-python/__pycache__/
 examples/03-browser-python-django/venv/
 examples/03-browser-python-django/mysite/__pycache__/
+
+# Local log sink (see README "Writing the log to a file")
+*.log
+logs.txt
+bridge.txt

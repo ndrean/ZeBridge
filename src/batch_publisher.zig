@@ -1046,6 +1046,12 @@ pub const BatchPublisher = struct {
             const result = self.doPublish(batch.items);
 
             if (result) |_| {
+                // Read the count BEFORE clearing. This log used to sit after
+                // `clearRetainingCapacity()` and report `batch.items.len`, so every slow
+                // flush claimed "0 events" no matter how many it had just published —
+                // which reads like a stalled pipeline and is nothing of the sort.
+                const event_count = batch.items.len;
+
                 // SUCCESS - Update LSN and return slots to free queue
                 self.updateConfirmedLsn(batch.items);
                 batch.clearRetainingCapacity();
@@ -1055,7 +1061,7 @@ pub const BatchPublisher = struct {
                 if (flush_elapsed > 100) {
                     log.warn("⏱️  Slow flush: {d}ms for {d} events", .{
                         flush_elapsed,
-                        batch.items.len,
+                        event_count,
                     });
                 }
                 return;

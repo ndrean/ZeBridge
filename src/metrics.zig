@@ -24,7 +24,12 @@ pub const Metrics = struct {
 
     // WAL lag metrics (atomics)
     slot_active: std.atomic.Value(bool),
+    /// WAL PostgreSQL retains for the slot (from restart_lsn). A disk-pressure number.
     wal_lag_bytes: std.atomic.Value(u64),
+    /// WAL the bridge has not confirmed yet (from confirmed_flush_lsn). THE backlog
+    /// number: restart_lsn only moves at checkpoints, so `wal_lag_bytes` plateaus at a
+    /// few MB on a perfectly healthy bridge and cannot answer "am I keeping up?".
+    wal_confirmed_lag_bytes: std.atomic.Value(u64),
     last_wal_check_time: std.atomic.Value(i64),
 
     // Queue metrics (atomic)
@@ -45,6 +50,7 @@ pub const Metrics = struct {
             .last_nats_reconnect_time = std.atomic.Value(i64).init(0),
             .slot_active = std.atomic.Value(bool).init(false),
             .wal_lag_bytes = std.atomic.Value(u64).init(0),
+            .wal_confirmed_lag_bytes = std.atomic.Value(u64).init(0),
             .last_wal_check_time = std.atomic.Value(i64).init(0),
             .queue_usage_percent = std.atomic.Value(u32).init(0),
         };
@@ -84,9 +90,10 @@ pub const Metrics = struct {
     }
 
     /// Lock-free WAL lag update
-    pub fn updateWalLag(self: *Metrics, slot_active: bool, lag_bytes: u64) void {
+    pub fn updateWalLag(self: *Metrics, slot_active: bool, lag_bytes: u64, confirmed_lag_bytes: u64) void {
         self.slot_active.store(slot_active, .monotonic);
         self.wal_lag_bytes.store(lag_bytes, .monotonic);
+        self.wal_confirmed_lag_bytes.store(confirmed_lag_bytes, .monotonic);
         self.last_wal_check_time.store(@as(i64, @intCast(c.time(null))), .monotonic);
     }
 
@@ -116,6 +123,7 @@ pub const Metrics = struct {
         last_nats_reconnect_time: i64,
         slot_active: bool,
         wal_lag_bytes: u64,
+        wal_confirmed_lag_bytes: u64,
         last_wal_check_time: i64,
         queue_usage_percent: u32, // 0-100
     };
@@ -145,6 +153,7 @@ pub const Metrics = struct {
             .last_nats_reconnect_time = self.last_nats_reconnect_time.load(.monotonic),
             .slot_active = self.slot_active.load(.monotonic),
             .wal_lag_bytes = self.wal_lag_bytes.load(.monotonic),
+            .wal_confirmed_lag_bytes = self.wal_confirmed_lag_bytes.load(.monotonic),
             .last_wal_check_time = self.last_wal_check_time.load(.monotonic),
             .queue_usage_percent = self.queue_usage_percent.load(.monotonic),
         };

@@ -32,6 +32,9 @@ const usage =
     \\  PUBLISH_MAX_BACKOFF_MS           Publish backoff ceiling (default: 5000)
     \\  SNAP_RET_SECONDS                 Snapshot freshness window (default: 600)
     \\  TRANSITION_RULES                 e.g. users:status,kyc_level;orders:state
+    \\  LOG_LEVEL                        debug|info|warn|err (default: info).
+    \\                                   Log lines print "warning"/"error"; both
+    \\                                   spellings are accepted here.
     \\
     \\Defaults for all of the above live in src/config.zig.
     \\

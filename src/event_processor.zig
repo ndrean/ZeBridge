@@ -690,6 +690,15 @@ pub const EventProcessor = struct {
                     drop_cols,
                     wal_end,
                 );
+
+                // A dropped table cannot be refused: there is nothing left to refuse.
+                // Without this the registry keeps announcing a table that no longer
+                // exists — `logStatus` repeats it every metrics interval forever, and
+                // `shouldDrop` would silently drop events for a *new* table that later
+                // reuses the name. Every other refusal lifts through a DDL event
+                // carrying a fixed schema; a DROP carries none, so it must lift here.
+                self.refused.clear(clean_table);
+
                 log.info("🗑️  DROP TABLE tombstone published for '{s}'", .{clean_table});
                 return slot_idx;
             }

@@ -166,7 +166,12 @@ fn checkWalLag(
         allocator,
         \\SELECT
         \\  active,
-        \\  COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) as lag_bytes
+        \\  -- WAL PostgreSQL must retain for this slot. Moves only at checkpoints, so it
+        \\  -- plateaus and is NOT a measure of how far behind the bridge is.
+        \\  COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) as lag_bytes,
+        \\  -- What the bridge has actually confirmed. This is the backlog: if it grows,
+        \\  -- the bridge is not keeping up or has stopped ACKing.
+        \\  COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0) as confirmed_lag_bytes
         \\FROM pg_replication_slots
         \\WHERE slot_name = '{s}'
     ,
@@ -190,16 +195,14 @@ fn checkWalLag(
             "🔴 Replication slot '{s}' not found",
             .{config.slot_name},
         );
-        metrics.updateWalLag(
-            false,
-            0,
-        );
+        metrics.updateWalLag(false, 0, 0);
         return;
     }
 
     // Parse result
     const active_str = c.PQgetvalue(result, 0, 0);
     const lag_bytes_str = c.PQgetvalue(result, 0, 1);
+    const confirmed_lag_str = c.PQgetvalue(result, 0, 2);
 
     const slot_active = std.mem.eql(
         u8,
@@ -211,11 +214,15 @@ fn checkWalLag(
         std.mem.span(lag_bytes_str),
         10,
     );
+    // Negative is possible in principle (confirmed ahead of the read position); clamp
+    // rather than fail the whole check on a transient.
+    const confirmed_lag_bytes = std.fmt.parseInt(u64, std.mem.span(confirmed_lag_str), 10) catch 0;
 
     // Update metrics
     metrics.updateWalLag(
         slot_active,
         lag_bytes,
+        confirmed_lag_bytes,
     );
 
     // Log warnings for concerning states

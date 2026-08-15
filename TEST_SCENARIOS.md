@@ -261,9 +261,11 @@ which is the reason this group exists.
   with text `COPY` will fail until this is settled (`COPY_BINARY_PLAN.md` §F).
 - **Client-visible errors.** G1 and G4 abort server-side without publishing to
   `init.snap.error.<table>` (`PROTOCOL.md` §6). The client sees silence, not a reason.
-- **CDC with an exotic column.** `exotic_types` is in the publication, so INSERTs into
-  it exercise the CDC path — which has no `typtype` guard, so hstore corrupts there
-  exactly as it did in snapshots. Worth adding as G6 once `COPY_BINARY_PLAN.md` §E lands.
+- **CDC with an exotic column.** ✅ Landed and verified 2026-08-15
+  (`COPY_BINARY_PLAN.md` §E): an INSERT into a table with an `hstore` column now
+  suspends it with `reason: "unsupported_column_type"` instead of shipping the binary
+  wire form as a string. Worth folding into this group as G6 with the enum control
+  (`feeling mood` decodes to its label, `attrs hstore` refuses).
 - **Cross-version.** The decoder deserves a golden-value run against several PG majors.
   Note `pgoutput`'s `binary` option needs **PG 14+**, so the bridge will not start on
   older servers — but `COPY ... FORMAT binary` works back to 7.4, so the decoder alone
@@ -271,9 +273,63 @@ which is the reason this group exists.
 
 ---
 
+## H. Registry invalidation — runnable now ✅ verified
+
+The bridge keeps caches of PostgreSQL catalog facts: `relation_map`, `schema_cache`,
+`refused_tables`, `type_registry`. None is durable — every one is rebuilt at boot — but
+each needs an explicit invalidation rule, and a missing rule shows up as the bridge
+reporting a world that no longer exists.
+
+This group exists because one rule *was* missing: a refused table that got **dropped**
+stayed in the registry. `logStatus` re-announced it every 15 s for the life of the
+process, and `bridge_refused_tables` never returned to 0 — so an alert on it could
+never clear, which is the failure that matters operationally.
+
+(A table recreated with the same name *and* a primary key does clear itself, because
+its `CREATE TABLE` DDL event carries a valid schema and takes the `refused.clear` path.
+The registry keys on name and names are reusable, so that recovery is luck of ordering
+rather than design — another reason the entry should not survive the drop.)
+
+Run with the bridge up throughout. Nothing here needs a client.
+
+| # | action | expect |
+| --- | --- | --- |
+| H1 | let the emitter run **all** migrations in version order on boot (`iex -S mix`) | `🔴 REFUSING 'users_no_pk'` at its CREATE; `users` refused by the drop-pk migration, still refused across the `REPLICA IDENTITY FULL` step, then `✅ 'users' is no longer refused (was: no_primary_key)` when the composite key lands |
+| H2 | wait two metrics intervals | the reminder repeats for `users_no_pk` — it still exists and still has no key |
+| H3 | `Emitter.Scenario.reset()` | `✅ 'users_no_pk' is no longer refused (was: no_primary_key)` + a tombstone for every dropped table. ⭐ **the reminder stops** |
+| H4 | `Emitter.Scenario.step1()` | `🔴 REFUSING 'users_no_pk'` again, reminder resumes — a recreated table is refused on its own merits, not remembered |
+| H5 | `Emitter.Scenario.reset()` | refusal lifts again |
+| H6 | `Emitter.Scenario.step2()` | `users` and `test_types` publish live schemas; **no refusals**, and none reappear |
+| H7 | `curl -s localhost:9090/metrics \| grep refused_tables` | `bridge_refused_tables 0` |
+
+**H3 is the one that matters.** Before the fix it failed silently — the log kept naming
+a table that `psql \dt` no longer showed, which is exactly how a stale cache announces
+itself. Verified 2026-08-15 across a full drop → recreate → drop → recreate cycle, with
+the bridge running the whole time and the steady state clean for 100 s afterwards.
+
+The KV payload sizes make the transitions readable without decoding anything:
+
+```txt
+📤 Published KV schema: 542 bytes to $KV.schemas.users        ← live schema
+📤 Published KV schema:  75 bytes to $KV.schemas.users        ← suspension
+📤 Published KV schema:  47 bytes to $KV.schemas.users        ← tombstone
+```
+
+### Not covered here
+
+- **A drop while the bridge is down.** Preflight rebuilds the registry from the
+  publication at boot, so a table dropped in the meantime is simply never refused. That
+  is correct by construction rather than by rule, and worth asserting once.
+- **`type_registry`.** Deliberately never invalidated — a type's OID lives as long as
+  the type, so a stale entry describes something that can no longer reach the wire.
+  Drop and recreate an enum and the new one arrives with a new OID on a new DDL event;
+  worth an H8 to pin that reasoning.
+
+---
+
 ## Order
 
-1. **A + E now** — they need no client work and cover the paths already built.
+1. **A + E + H now** — they need no client work and cover the paths already built.
 2. **C1, C2 now** via the CLI — bridge-side caching.
 3. **Then D (client)**, and B, C3, C4, D2 become runnable.
 

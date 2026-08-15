@@ -28,7 +28,25 @@ defmodule Emitter.PgProducer.Repo.SetupExoticTypes do
 
   def up do
     execute("CREATE EXTENSION IF NOT EXISTS hstore;")
-    execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');")
+
+    # PostgreSQL has no `CREATE TYPE IF NOT EXISTS` — unlike CREATE EXTENSION or
+    # CREATE TABLE, which is why only this statement needs the guard. Without it the
+    # migration is a one-shot: a type outlives `DROP TABLE`, so any re-run after a
+    # partial reset dies with `42710 duplicate_object`, and Ecto rolls the whole
+    # migration back leaving nothing created.
+    #
+    # Same DO-block shape as the publication guard below, for the same reason.
+    execute("""
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_type
+            WHERE typname = 'mood' AND typnamespace = 'public'::regnamespace
+        ) THEN
+            CREATE TYPE public.mood AS ENUM ('sad', 'ok', 'happy');
+        END IF;
+    END $$;
+    """)
 
     execute("""
     CREATE TABLE public.#{@cdc_table} (

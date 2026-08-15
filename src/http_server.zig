@@ -205,6 +205,7 @@ pub const Server = struct {
                 \\  "slot_active": {s},
                 \\  "wal_lag_bytes": {d},
                 \\  "wal_lag_mb": {d},
+                \\  "wal_confirmed_lag_bytes": {d},
                 \\  "queue_usage_percent": {d},
                 \\  "refused_tables": {d},
                 \\  "refused_events_dropped": {d}
@@ -221,6 +222,7 @@ pub const Server = struct {
                 if (snap.slot_active) "true" else "false",
                 snap.wal_lag_bytes,
                 snap.wal_lag_bytes / (1024 * 1024),
+                snap.wal_confirmed_lag_bytes,
                 snap.queue_usage_percent,
                 if (self.refused) |r| r.refused_count.load(.acquire) else 0,
                 if (self.refused) |r| r.dropped_total.load(.acquire) else 0,
@@ -271,9 +273,13 @@ pub const Server = struct {
                 \\# TYPE bridge_slot_active gauge
                 \\bridge_slot_active {d}
                 \\
-                \\# HELP bridge_wal_lag_bytes Bytes of WAL retained for replication slot
+                \\# HELP bridge_wal_lag_bytes Bytes of WAL PostgreSQL retains for the slot (from restart_lsn, moves at checkpoints)
                 \\# TYPE bridge_wal_lag_bytes gauge
                 \\bridge_wal_lag_bytes {d}
+                \\
+                \\# HELP bridge_wal_confirmed_lag_bytes Bytes of WAL the bridge has not yet confirmed (from confirmed_flush_lsn) - the real backlog
+                \\# TYPE bridge_wal_confirmed_lag_bytes gauge
+                \\bridge_wal_confirmed_lag_bytes {d}
                 \\
                 \\# HELP bridge_queue_usage_percent Event queue usage percentage (0-100)
                 \\# TYPE bridge_queue_usage_percent gauge
@@ -289,6 +295,7 @@ pub const Server = struct {
                 snap.nats_reconnect_count,
                 if (snap.slot_active) @as(u8, 1) else @as(u8, 0),
                 snap.wal_lag_bytes,
+                snap.wal_confirmed_lag_bytes,
                 snap.queue_usage_percent,
             });
 
