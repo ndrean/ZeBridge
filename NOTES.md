@@ -233,6 +233,47 @@ Adding pruning without fixing that would have published
 `cdc.zebridge_ddl_events.delete` to every client on each DDL, turning a slow disk leak
 into active noise. Both halves fixed together.
 
+### 2.9 One `PQconsumeInput` per message made bursts quadratic  ← biggest win
+
+`receiveMessage` called `PQconsumeInput` before **every** `PQgetCopyData`. That is the
+wrong side of a libpq detail: `PQconsumeInput` → `pqReadData` slides the *unread
+remainder* of `conn->inBuffer` back to the front of the buffer. During a burst that
+buffer holds megabytes of WAL, so the memmove cost is proportional to the backlog —
+O(backlog) per message, **O(n²) overall**.
+
+The libpq idiom is the opposite: consume once, then call `PQgetCopyData` repeatedly
+until it returns 0. One `needs_input` flag on the stream implements it.
+
+| same load, same build, only `wal_stream.zig` changed | before | after |
+| --- | --- | --- |
+| `recv_ms` of a 15 000 ms interval | 14 884 (99.2%) | 130 (0.9%) |
+| `proc_ms` (decode + pack) | 112 | 1 191 |
+| `idle` iterations | 0 | 10 790 |
+| throughput | ~1.2k msg/s | 1.44M events in one interval |
+| CPU | 100% of a core | 31% while draining |
+
+**Why it survived nine months** (the line dates from 2025-11-28) is the instructive
+part, and all three reasons are about measurement, not code:
+
+1. **It only bites once you are already behind, and then keeps you there.** Every load
+   test until 2026-08-15 used small transactions at a trickle
+   (`Produce.stream(5, 1000, 10)` = 10 rows/tx every 5 ms). A bridge that keeps up never
+   accumulates a backlog, so the quadratic term stayed numerically zero. The first
+   1000-rows-per-transaction burst made it appear instantly — and self-reinforcing:
+   behind → slower → further behind.
+2. **The one "is it backed up?" gauge pointed the wrong way.** `queue_usage_percent`
+   watches the *flush* side; it read 0% precisely **because** the starved main thread
+   never filled the queue. The healthiest-looking number was a symptom.
+3. **The WAL loop had no instrumentation at all.** The bug lived in the only path with
+   no metric on it, which is not a coincidence: unmeasured code is where bugs last
+   longest. Adding the `LOOP` line (4.4) turned a week of speculation into a five-minute
+   diagnosis — `recv_ms=14884 / proc_ms=112` is not a reading anyone argues with.
+
+The lesson that generalises: **a benchmark number without a method is worse than no
+number**. The README claimed "~50k evt/s" the whole time; nothing could fail against it
+because nothing said how it was obtained. It now ships with machine, build mode,
+transaction shape and row count, so the next regression has something to contradict.
+
 ---
 
 ## 3. PostgreSQL behaviours worth remembering
@@ -410,6 +451,42 @@ code that Zig's lazy analysis had hidden because the bridge never called it.
   `PG_PUBLISH_PORT` and using `127.0.0.1` explicitly.
 - The `nats:latest` image is **distroless** — no `sh`, no `wget`, so `CMD-SHELL`
   healthchecks can never pass.
+
+### 4.4 What each metric actually answers
+
+Added after 2.9, where three plausible-looking numbers all failed to locate a 300×
+regression. Each of these exists because a question could not be answered without it.
+
+| metric | question it answers |
+| --- | --- |
+| `bridge_wal_confirmed_lag_bytes` | **Is the bridge behind?** WAL past `confirmed_flush_lsn`, which moves on every ACK. |
+| `bridge_wal_lag_bytes` | **Will the disk fill?** WAL past `restart_lsn`, which PostgreSQL only advances at checkpoints — so it plateaus at a few MB on a perfectly healthy bridge and can never answer the first question. Confusing the two cost an afternoon. |
+| `bridge_queue_usage_percent` | Is the **flush** side backed up? Silent about the reader. |
+| `bridge_cpu_seconds_total` | How busy is the process, across all threads? `rate(...[1m])` = cores used. A single-threaded reader at `1.0` is *by definition* the bottleneck. |
+| `bridge_max_rss_bytes` | Is memory what was configured? Should sit near `2^BASE_BUF × RING_BUFFER_COUNT` + ~400 MB metadata, since the slab is pre-allocated, not grown. |
+| `bridge_refused_tables` | Is any table suspended — no PK, undecodable column, oversized row? Alert on `> 0`; the log line says which and why. |
+
+And the `LOOP` line next to `METRICS` every 15 s, which is the reader's profile:
+
+```txt
+LOOP iters=1407805 idle=10274 recv_ms=139 proc_ms=1494 cpu=31%
+```
+
+| field | reading |
+| --- | --- |
+| `iters` | WAL loop iterations in the interval |
+| `idle` | iterations that found nothing and slept 1 ms — **high `idle` is good**: the bridge is waiting on PostgreSQL, not struggling |
+| `recv_ms` | ms inside `receiveMessage` (libpq + framing) |
+| `proc_ms` | ms decoding tuples and packing them into the ring buffer |
+| `cpu` | process CPU over the interval, all threads |
+
+The failure signature to recognise: **`recv_ms` approaching the interval length with
+`idle=0` and `cpu≈100%`** — a reader that cannot drain its socket. The healthy shape is
+the opposite: `idle` in the thousands, `recv_ms` in the tens.
+
+CPU comes from `getrusage(RUSAGE_SELF)` rather than `/proc`, so it is one POSIX call on
+both platforms — but note `ru_maxrss` is **bytes on Darwin, kilobytes on Linux**, one of
+the few genuinely divergent POSIX fields (normalised in `utils.maxRssBytes`).
 
 ---
 

@@ -78,6 +78,7 @@ pub fn build(b: *std.Build) void {
     topology_opts.addOption([]const u8, "subject_cdc_prefix", subjects.get("cdc_prefix").?.string);
     topology_opts.addOption([]const u8, "subject_init_prefix", subjects.get("init_prefix").?.string);
     topology_opts.addOption([]const u8, "subject_mutations_prefix", subjects.get("mutations_prefix").?.string);
+    topology_opts.addOption([]const u8, "mutation_pattern", subjects.get("mutation_pattern").?.string);
     topology_opts.addOption([]const u8, "snapshot_request", subjects.get("snapshot_request").?.string);
     topology_opts.addOption([]const u8, "schema_request", subjects.get("schema_request").?.string);
     topology_opts.addOption([]const u8, "snapshot_data_pattern", subjects.get("snapshot_data_pattern").?.string);

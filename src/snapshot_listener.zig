@@ -14,7 +14,6 @@ const pg_copy_binary = @import("pg_copy_binary.zig");
 const publication_mod = @import("publication.zig");
 const config = @import("config.zig");
 const msgpack = @import("msgpack");
-const pg_copy_csv = @import("pg_copy_csv.zig");
 const encoder_mod = @import("encoder.zig");
 const streaming_encoder = @import("streaming_encoder.zig");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
@@ -274,16 +273,6 @@ fn publishWithRetry(
     return error.ShutdownRequested;
 }
 
-/// Primary key metadata for a table (used for chunked snapshots)
-const PkMetadata = struct {
-    name: []const u8,
-    is_numeric: bool,
-
-    pub fn deinit(self: PkMetadata, allocator: std.mem.Allocator) void {
-        allocator.free(self.name);
-    }
-};
-
 /// Column names and type OIDs in `SELECT *` order, for decoding binary COPY.
 ///
 /// Binary COPY's header carries no names, types, or column count, so the layout has to
@@ -314,8 +303,11 @@ fn getTableColumns(
     // `atttypmod` decoding, whose bit layout changed in PG 15 to allow negative scales.
     // Still one query and one round trip: a plain catalog function on the row we are
     // already reading, not an information_schema view (which joins several catalogs and
-    // applies privilege filtering to answer the same question). `getTablePrimaryKey`
-    // uses the same function on the same connection.
+    // applies privilege filtering to answer the same question).
+    //
+    // One query, not two: the primary key comes back with the layout, from the same
+    // rows, so the key and the column order cannot describe different states of the
+    // table. A separate PK lookup used to exist and could disagree with this one.
     const query = try utils.allocPrintZ(
         allocator,
         \\SELECT a.attname,
@@ -487,80 +479,6 @@ const Cursor = struct {
     }
 };
 
-
-/// Query PostgreSQL system catalogs to discover the primary key of a table
-/// This is critical for chunked snapshots - we need to know which column to use for WHERE > last_value
-/// Supports single-column primary keys (composite keys not yet supported)
-fn getTablePrimaryKey(
-    allocator: std.mem.Allocator,
-    conn: *c.PGconn,
-    table_name: []const u8,
-) !PkMetadata {
-    // Parse schema.table or default to public
-    var schema: []const u8 = "public";
-    var table: []const u8 = table_name;
-
-    if (std.mem.indexOf(u8, table_name, ".")) |dot_idx| {
-        schema = table_name[0..dot_idx];
-        table = table_name[dot_idx + 1 ..];
-    }
-
-    // Query system catalogs for primary key column
-    const query = try utils.allocPrintZ(
-        allocator,
-        \\SELECT a.attname, format_type(a.atttypid, a.atttypmod)
-        \\FROM pg_index i
-        \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
-        \\  AND i.indisprimary
-        \\  AND array_length(i.indkey, 1) = 1;
-    ,
-        .{ schema, table },
-    );
-    defer allocator.free(query);
-
-    const res = c.PQexec(conn, query.ptr);
-    defer c.PQclear(res);
-
-    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
-        log.err("Failed to query primary key for table '{s}': {s}", .{
-            table_name,
-            c.PQerrorMessage(conn),
-        });
-        return error.QueryFailed;
-    }
-
-    const ntuples = c.PQntuples(res);
-    if (ntuples == 0) {
-        log.err("❌ Table '{s}' has no single-column primary key. Chunked snapshots require a PK.", .{table_name});
-        return error.NoPrimaryKey;
-    }
-
-    if (ntuples > 1) {
-        log.err("❌ Table '{s}' has composite primary key. Only single-column PKs are currently supported.", .{table_name});
-        return error.CompositePrimaryKey;
-    }
-
-    const pk_name = std.mem.span(c.PQgetvalue(res, 0, 0));
-    const pk_type = std.mem.span(c.PQgetvalue(res, 0, 1));
-
-    // Determine if quotes are needed in WHERE clause (numeric types don't need quotes)
-    const is_numeric = std.mem.indexOf(u8, pk_type, "int") != null or
-        std.mem.indexOf(u8, pk_type, "serial") != null or
-        std.mem.indexOf(u8, pk_type, "bigserial") != null;
-
-    log.info("📋 Discovered primary key for '{s}': column='{s}', type='{s}', numeric={}", .{
-        table_name,
-        pk_name,
-        pk_type,
-        is_numeric,
-    });
-
-    return .{
-        .name = try allocator.dupe(u8, pk_name),
-        .is_numeric = is_numeric,
-    };
-}
 
 /// Snapshot request context passed to NATS callback
 const SnapshotContext = struct {
@@ -1337,11 +1255,7 @@ pub const SnapshotListener = struct {
                 return error.StreamEncodingFailed;
             };
 
-            if (num_rows == 0) break;
-
-            total_rows += num_rows;
-
-            // On first chunk, publish schema so consumer knows column order
+            // On first chunk (even if empty), publish schema so consumer knows column order
             if (batch == 0) {
                 const col_names = try chunk_alloc.alloc([]const u8, columns.len);
                 for (columns, col_names) |col, *name| name.* = col.name;
@@ -1355,6 +1269,10 @@ pub const SnapshotListener = struct {
                     should_stop,
                 );
             }
+
+            if (num_rows == 0) break;
+
+            total_rows += num_rows;
 
             // Get the encoded MessagePack data (no allocation - slice of encode_buffer)
             const encoded = encoder.getWritten();

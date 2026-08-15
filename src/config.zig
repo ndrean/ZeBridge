@@ -25,6 +25,18 @@ pub const Postgres = struct {
 
     /// Maximum WAL retention size (10GB)
     pub const max_wal_retention_gb = 10;
+
+    /// TCP keepalives on every libpq connection.
+    ///
+    /// PostgreSQL's `tcp_keepalives_*` default to 0, meaning "use the OS default" —
+    /// ~2 hours idle on Linux. That is fine for the replication connection, which has
+    /// its own application-level heartbeat, but the **snapshot and mutation connections
+    /// sit idle for long stretches**: if a NAT or a paused VM silently forgets the flow,
+    /// the next query *hangs* for hours instead of failing. libpq accepts these in the
+    /// conninfo, so a dead peer is detected in ~60s (30 + 3×10) rather than ~2h.
+    pub const tcp_keepalives_idle_s = 30;
+    pub const tcp_keepalives_interval_s = 10;
+    pub const tcp_keepalives_count = 3;
 };
 
 /// NATS JetStream configuration
@@ -66,6 +78,24 @@ pub const Nats = struct {
 
     /// Every mutation subject the ingress consumer filters on: "mutation.>"
     pub const mutations_subject_wildcard = subject_mutations_prefix ++ ".>";
+
+    /// `mutation.<principal>.<table>.<operation>` — the ingress subject grammar.
+    ///
+    /// The principal is a **subject token, not a payload field**, because NATS
+    /// authorizes subjects and not payloads: a client granted
+    /// `publish: ["mutation.alice.>"]` physically cannot write as anyone else, and the
+    /// bridge reading the principal off the subject is reading a claim the broker has
+    /// already vouched for. Principal first so a per-user grant is one wildcard rule.
+    ///
+    /// ⚠️ The principal must be a legal NATS token — no `.`, space, `*` or `>` — so an
+    /// email address cannot be one. Use an opaque id.
+    pub const mutation_subject_pattern = topology.mutation_pattern;
+
+    /// Token positions in the mutation subject, after splitting on '.'.
+    pub const mutation_token_principal = 1;
+    pub const mutation_token_table = 2;
+    pub const mutation_token_operation = 3;
+    pub const mutation_token_count = 4;
 
     /// Subject a client publishes a schema request to, and the bridge subscribes to.
     pub const schema_request_subject = topology.schema_request;

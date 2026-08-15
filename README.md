@@ -93,9 +93,11 @@ NATS have 40+ clients, so instead of an SDK, we propose a guide with the workflo
 
 Worked examples can be found for webapps (WASM-SQLite + OPFS), backend micrservice Elixir & Python, Flutter
 
-### What It Does
+### Data flow and security
 
-**Three data flow:**
+We have separate Read and Write flows between a Consumer facing NATS and the bridge.
+
+**Three data flow**:
 
 1. **Bootstrap** (INIT stream): Consumer requests _schemas_ & table _snapshot_,
 2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen via NATS/JetStream.
@@ -107,13 +109,28 @@ Worked examples can be found for webapps (WASM-SQLite + OPFS), backend micrservi
 | **INIT** | Bootstrap snapshots | Long (X days) | One-time replay         |
 | **MUTATION** | Real-time ingres changes| Short (X min) | Continuous subscription |
 
-Streams have different retention policies. The snapshot request is protected by maximum demand on 1 during `SNAP_RET`.
-The consumer will uses these streams to handle NATS state (the names are defined in _topolgy.json_).
+Streams have defined retention policies. The snapshot request is protected by maximum demand on 1 during `SNAP_RET`.
+The consumer will uses these streams to interact with the  NATS state (the names are defined in _topolgy.json_).
 
-**Key features**:
+**Two Postgres roles**:
 
-* Streams PostgreSQL _proto-v1_ changes using logical replication (`pgoutput` format)
-* Publishes schemas from teh catalogue to NATS KV store on startup,
+* `bridge_reader` for the read path (SELECT + REPLICATION, no writes possible),
+* `bridge_writer` for the write path (_no table privileges_, or a per-table minimum),
+* and authenticated principals above that for row-level access.
+
+**Principal authentication** (the user of a Consumer app):
+
+The principal is authenticated at the Consumer level, and used in the JWT/Operator protocole by NATS so that the bridge can pass it for Postgres RLS policies.
+
+|  |  subscribe  |   publish  | needs an account |
+|--|--|--|--|
+| read-only consumer  | cdc.>, init.>, KV.schemas.>, KV.snapshots.> | snapshot.request.>       | no |
+| read-write consumer | the same | + mutation.<principal>.> | yes |
+
+**Key features of the bridge**:
+
+* It streams PostgreSQL _proto-v1_ changes using logical replication (`pgoutput` binary format)
+* Publishes schemas from the catalogue to NATS KV store on startup,
 * Generates table snapshots on-demand (10K row chunks) via NATS requests,
 * Triggers message to NATS on schema change via Postgres DDL event triggers,
 * schemas are available in two formats: PostgreSQL(eg for PQLite) and SQLite,
@@ -740,7 +757,7 @@ file. Redirect with `2>`:
 `info` the volume is small — the `METRICS` line every 15 s is ~5 700 lines/day — and
 everything worth keeping is included. **Do not point a file sink at `debug`.**
 
-⚠️ The level *names* differ between input and output: you set `LOG_LEVEL=warn` but the
+⚠️ The level _names_ differ between input and output: you set `LOG_LEVEL=warn` but the
 lines read `warning(scope):`. Both spellings are accepted for the variable; when
 grepping or writing alert rules, match what the lines actually print:
 
@@ -795,7 +812,7 @@ Each is served with its own `# HELP` and `# TYPE` line. The four worth alerting 
 | `bridge_refused_tables` | `> 0` | a table is **suspended** — no primary key, an undecodable column type, or a row larger than the event buffer. The log line names which and why. |
 | `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
 | `bridge_wal_confirmed_lag_bytes` | rising steadily | **the bridge is behind**: WAL it has not confirmed yet. This is the backlog number. |
-| `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is *retaining* on disk for the slot, until `max_slot_wal_keep_size` |
+| `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is _retaining_ on disk for the slot, until `max_slot_wal_keep_size` |
 | `bridge_connected` | `== 0` | the replication stream is down |
 
 ⚠️ **The two lag metrics are not the same question.** `bridge_wal_lag_bytes` measures
@@ -1270,10 +1287,10 @@ data slab = 2^BASE_BUF  ×  RING_BUFFER_COUNT
 
 Each one answers a different question:
 
-* **`BASE_BUF`** (log2 bytes, range 10–20) is *how large a single row may be*. Size it
+* **`BASE_BUF`** (log2 bytes, range 10–20) is _how large a single row may be_. Size it
   to your widest row: a `jsonb` document, a long `text` column, a big array.
-* **`RING_BUFFER_COUNT`** (range 1024–1048576) is *how many events can queue while NATS
-  is unreachable*. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip
+* **`RING_BUFFER_COUNT`** (range 1024–1048576) is _how many events can queue while NATS
+  is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip
   starts back-pressuring the WAL reader sooner.
 
 Raising one and lowering the other keeps memory flat, at the cost of outage tolerance.

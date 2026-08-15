@@ -39,33 +39,47 @@ pub const PgConf = struct {
         };
     }
 
+    /// TCP keepalives, in libpq's two spellings. See Config.Postgres for why.
+    const keepalives_kw = std.fmt.comptimePrint(
+        " keepalives=1 keepalives_idle={d} keepalives_interval={d} keepalives_count={d}",
+        .{ Config.Postgres.tcp_keepalives_idle_s, Config.Postgres.tcp_keepalives_interval_s, Config.Postgres.tcp_keepalives_count },
+    );
+    const keepalives_uri = std.fmt.comptimePrint(
+        "keepalives=1&keepalives_idle={d}&keepalives_interval={d}&keepalives_count={d}",
+        .{ Config.Postgres.tcp_keepalives_idle_s, Config.Postgres.tcp_keepalives_interval_s, Config.Postgres.tcp_keepalives_count },
+    );
+
     /// Build a PostgreSQL connection string
     ///
     /// Caller is responsible for freeing the returned string
     pub fn connInfo(self: *const PgConf, allocator: std.mem.Allocator, replication: bool) ![:0]const u8 {
         if (self.db_url) |url| {
+            // A URL that already mentions keepalives was set deliberately; do not
+            // second-guess it, and do not append a duplicate parameter.
+            const ka: []const u8 = if (std.mem.indexOf(u8, url, "keepalives") != null) "" else keepalives_uri;
+            const sep: []const u8 = if (ka.len == 0)
+                ""
+            else if (std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
+
             if (replication) {
-                if (std.mem.indexOf(u8, url, "?") != null) {
-                    return try utils.allocPrintZ(allocator, "{s}&replication=database", .{url});
-                } else {
-                    return try utils.allocPrintZ(allocator, "{s}?replication=database", .{url});
-                }
-            } else {
-                return try utils.allocPrintZ(allocator, "{s}", .{url});
+                // Whatever came before, there is now a query string to extend.
+                const rep_sep: []const u8 = if (ka.len > 0 or std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
+                return try utils.allocPrintZ(allocator, "{s}{s}{s}{s}replication=database", .{ url, sep, ka, rep_sep });
             }
+            return try utils.allocPrintZ(allocator, "{s}{s}{s}", .{ url, sep, ka });
         }
 
         // null-terminated [:0]u8 slice suitable for C APIs (e.g. PQconnectdb)
         return if (replication)
             try utils.allocPrintZ(
                 allocator,
-                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s} replication=database",
+                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s} replication=database" ++ keepalives_kw,
                 .{ self.host, self.port, self.user, self.password, self.database, self.sslmode },
             )
         else
             try utils.allocPrintZ(
                 allocator,
-                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s}",
+                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s}" ++ keepalives_kw,
                 .{ self.host, self.port, self.user, self.password, self.database, self.sslmode },
             );
     }
@@ -98,4 +112,74 @@ pub fn connect(allocator: std.mem.Allocator, pg_conf: PgConf) !*c.PGconn {
     }
 
     return conn;
+}
+
+// ---------------------------------------------------------------------------
+// Tests — connInfo is pure string building, and every branch of it is a place a
+// connection can silently fail to carry the settings it was supposed to.
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn testConf(db_url: ?[]const u8) PgConf {
+    return .{
+        .host = "h", .port = 5432, .user = "u", .password = "p",
+        .database = "d", .sslmode = "disable", .db_url = db_url,
+    };
+}
+
+test "connInfo - keyword form carries keepalives, and replication when asked" {
+    const alloc = testing.allocator;
+    const conf = testConf(null);
+
+    const plain = try conf.connInfo(alloc, false);
+    defer alloc.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "keepalives=1") != null);
+    try testing.expect(std.mem.indexOf(u8, plain, "replication=database") == null);
+
+    const rep = try conf.connInfo(alloc, true);
+    defer alloc.free(rep);
+    try testing.expect(std.mem.indexOf(u8, rep, "keepalives_idle=30") != null);
+    try testing.expect(std.mem.indexOf(u8, rep, "replication=database") != null);
+}
+
+test "connInfo - a URL with no query gets '?', one with a query gets '&'" {
+    const alloc = testing.allocator;
+
+    const bare = try testConf("postgres://u:p@h/d").connInfo(alloc, false);
+    defer alloc.free(bare);
+    try testing.expectEqualStrings(
+        "postgres://u:p@h/d?keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3",
+        bare,
+    );
+
+    const with_query = try testConf("postgres://u:p@h/d?sslmode=require").connInfo(alloc, false);
+    defer alloc.free(with_query);
+    try testing.expect(std.mem.indexOf(u8, with_query, "?sslmode=require&keepalives=1") != null);
+}
+
+test "connInfo - replication is appended after the keepalives, still one query string" {
+    const alloc = testing.allocator;
+    const rep = try testConf("postgres://u:p@h/d").connInfo(alloc, true);
+    defer alloc.free(rep);
+    try testing.expectEqualStrings(
+        "postgres://u:p@h/d?keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3&replication=database",
+        rep,
+    );
+    // Exactly one '?' — a second would make libpq reject the URI.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rep, "?"));
+}
+
+test "connInfo - a URL that already sets keepalives is left alone" {
+    // Deliberate operator choice; appending a duplicate would silently override it.
+    const alloc = testing.allocator;
+    const url = "postgres://u:p@h/d?keepalives_idle=5";
+
+    const plain = try testConf(url).connInfo(alloc, false);
+    defer alloc.free(plain);
+    try testing.expectEqualStrings(url, plain);
+
+    const rep = try testConf(url).connInfo(alloc, true);
+    defer alloc.free(rep);
+    try testing.expectEqualStrings(url ++ "&replication=database", rep);
 }

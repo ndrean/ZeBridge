@@ -9,6 +9,7 @@
     "cdc_prefix": "cdc",
     "init_prefix": "init",
     "mutations_prefix": "mutation",
+    "mutation_pattern": "mutation.{[principal]s}.{[table]s}.{[operation]s}",
     "snapshot_request": "snapshot.request",
     "schema_request": "init.schema",
 

@@ -19,6 +19,70 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_BRIDGE_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${POSTGRES_BRIDGE_USER};
 
 
+-- ---------------------------------------------------------
+-- The WRITE role — separate from the read role on purpose
+-- ---------------------------------------------------------
+--
+-- ${POSTGRES_BRIDGE_USER} stays exactly what it is: SELECT + REPLICATION, physically
+-- unable to write. The ingress path (NATS -> bridge -> PostgreSQL) uses a *second*
+-- connection under this role, so adding the write feature never widens the privileges
+-- of the read path.
+--
+-- It is created with **no table privileges at all**. That is the backstop that makes
+-- "the bridge is a dumb dispatcher" safe rather than merely simple: even a bug in
+-- subject parsing cannot reach a table the DBA has not explicitly opened, because the
+-- role has no path to one. Grants are per table, via
+-- zebridge_grant_edge_writes() below — never ALL TABLES, and never by default.
+--
+-- Two attributes are spelled out even though they are the defaults, because each fails
+-- **open** if it is ever wrong:
+--   NOBYPASSRLS  - with BYPASSRLS every row-level policy becomes decorative
+--   NOREPLICATION- the write role must not be able to read the WAL
+--
+-- A third rule cannot be expressed here and belongs in review: this role must **not own
+-- any table**. Table owners are exempt from row-level security unless the table is set
+-- to FORCE ROW LEVEL SECURITY, so an owning writer silently bypasses every policy.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_WRITER_USER}') THEN
+        CREATE USER ${POSTGRES_WRITER_USER} WITH PASSWORD '${POSTGRES_WRITER_PASSWORD}'
+            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    END IF;
+END;
+$$;
+
+GRANT CONNECT ON DATABASE ${TARGET_DB} TO ${POSTGRES_WRITER_USER};
+GRANT USAGE ON SCHEMA public TO ${POSTGRES_WRITER_USER};
+
+-- Deliberately NOT granted: SELECT/INSERT/UPDATE on any table, and no ALTER DEFAULT
+-- PRIVILEGES. A new table is not edge-writable until someone says so.
+
+
+-- Open one table to edge writes. Idempotent; call it once per table.
+--
+-- SELECT is required alongside INSERT/UPDATE because the last-write-wins guard
+-- (`WHERE stored.version < EXCLUDED.version`) reads the existing row.
+--
+-- zebridge_ddl_events is refused by name: it is the bridge's own DDL tracker, and a
+-- client able to insert into it could forge a schema, a suspension or a tombstone for
+-- every other client. That is the one table where "can write my own rows" becomes
+-- "can control every replica".
+CREATE OR REPLACE FUNCTION public.zebridge_grant_edge_writes(tbl regclass)
+RETURNS void AS $$
+DECLARE
+    tbl_name text := tbl::text;
+BEGIN
+    IF tbl_name IN ('zebridge_ddl_events', 'public.zebridge_ddl_events') THEN
+        RAISE EXCEPTION 'refusing to grant edge writes on %: forging rows here would '
+                        'let a client publish a fabricated schema to every client', tbl_name;
+    END IF;
+
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE ON %s TO ${POSTGRES_WRITER_USER}', tbl);
+    RAISE NOTICE 'edge writes enabled on % for ${POSTGRES_WRITER_USER}', tbl;
+END;
+$$ LANGUAGE plpgsql;
+
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = '${BRIDGE_CDC_PUBLICATION}') THEN

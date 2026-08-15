@@ -1,5 +1,7 @@
 import { createSignal, onCleanup, For } from 'solid-js';
-import { connect, NatsConnection, StringCodec, nkeyAuthenticator, DeliverPolicy } from 'nats.ws';
+import { wsconnect, NatsConnection, nkeyAuthenticator } from '@nats-io/nats-core';
+import { jetstream, jetstreamManager, DeliverPolicy } from '@nats-io/jetstream';
+import { Kvm } from '@nats-io/kv';
 import { decode, encode } from '@msgpack/msgpack';
 import topology from '../../topology.json';
 import { SQLocal } from 'sqlocal';
@@ -7,7 +9,7 @@ import { SQLocal } from 'sqlocal';
 const NATS_URL = 'ws://localhost:8080';
 const NKEY_SEED = 'SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q';
 const { sql } = new SQLocal(`zebridge_${Date.now()}.sqlite3`);
-const sc = StringCodec();
+const td = new TextDecoder();
 
 // Columns hidden from the *_view convenience views (still stored in the table).
 const EXCLUDE_FROM_VIEW = ['uid', 'inserted_at', 'updated_at', 'metadata'];
@@ -41,32 +43,49 @@ const pendingEvents: { table: string; ev: any }[] = [];
 
 let nc: NatsConnection | null = null;
 
-type LogEntry = {
-  id: number;
-  timestamp: string;
-  topic: string;
-  opType: string;
-  bodyStr: string;
-};
+
 
 export default function App() {
   const [status, setStatus] = createSignal<'connected' | 'disconnected' | 'connecting'>('disconnected');
-  const [logs, setLogs] = createSignal<LogEntry[]>([]);
+  const [dbState, setDbState] = createSignal<Record<string, { columns: string[], rows: any[], count: number }>>({});
   const [pendingCount, setPendingCount] = createSignal(0);
   const [tableCount, setTableCount] = createSignal(0);
-  // table -> reason. A suspended table is frozen, not gone: its local rows stay valid
-  // as of the suspension LSN, but nothing new will arrive for it.
   const [suspended, setSuspended] = createSignal<Record<string, string>>({});
-  let logIdCounter = 0;
 
   const appendLog = (topic: string, data: any, opType = '') => {
+    if (['INSERT', 'UPDATE', 'DELETE', 'snapshot', 'CDC'].includes(opType)) {
+      return; // Skip high-volume CDC events to save the UI thread
+    }
     const timestamp = new Date().toLocaleTimeString();
     const bodyStr = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-    setLogs((prev) => [
-      ...prev,
-      { id: logIdCounter++, timestamp, topic, opType, bodyStr }
-    ]);
+    console.log(`[${timestamp}] ${topic} ${opType}:`, bodyStr);
   };
+
+  const refreshLocalDb = async () => {
+    if (!syncedTables.size) {
+      setDbState({});
+      return;
+    }
+    const newState: Record<string, { columns: string[], rows: any[], count: number }> = {};
+    for (const [table, state] of syncedTables) {
+      try {
+        const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}`);
+        const order = state.pkCols.length
+          ? state.pkCols.map((c) => `"${c}" ASC`).join(', ')
+          : 'rowid ASC';
+        const rows = await sql(`SELECT * FROM ${table} ORDER BY ${order} LIMIT 100`);
+        newState[table] = {
+          columns: state.columns,
+          rows: rows,
+          count: countRes[0]?.count ?? 0,
+        };
+      } catch (err) {
+        // ignore
+      }
+    }
+    setDbState(newState);
+  };
+
 
   const initSyncState = async () => {
     await sql(`
@@ -98,7 +117,7 @@ export default function App() {
       appendLog('SYS', `Connecting to NATS at ${NATS_URL}...`);
 
       const encoder = new TextEncoder();
-      nc = await connect({
+      nc = await wsconnect({
         servers: NATS_URL,
         authenticator: nkeyAuthenticator(encoder.encode(NKEY_SEED)),
         reconnect: true,
@@ -108,8 +127,6 @@ export default function App() {
       setStatus('connected');
       appendLog('SYS', 'Connected to NATS over WebSockets using NKEY!');
       await watchSchemas();
-      // Give KV watch a moment to yield initial schemas before gap check
-      await new Promise(r => setTimeout(r, 500));
       await subscribeStreams();
     } catch (err) {
       setStatus('disconnected');
@@ -131,59 +148,61 @@ export default function App() {
   const watchSchemas = async () => {
     if (!nc) return;
     try {
-      const js = nc.jetstream();
-      const kv = await js.views.kv(topology.kv.schemas);
+      const kvm = new Kvm(nc);
+      const kv = await kvm.open(topology.kv.schemas);
       const watcher = await kv.watch();
       appendLog('SCHEMA', `Watching KV bucket "${topology.kv.schemas}" for all tables...`, 'WATCH');
 
-      (async () => {
-        for await (const entry of watcher) {
-          // A deleted/purged key means the table is gone upstream.
-          if (entry.operation === 'DEL' || entry.operation === 'PURGE') {
-            await dropLocalTable(entry.key, 'KV key removed');
-            continue;
+      return new Promise<void>((resolve) => {
+        let initialized = false;
+
+        (async () => {
+          for await (const entry of watcher) {
+            if (!initialized && (!entry || entry.delta === 0)) {
+              initialized = true;
+              resolve();
+            }
+            
+            if (!entry || !entry.key) continue;
+
+            // A deleted/purged key means the table is gone upstream.
+            if (entry.operation === 'DEL' || entry.operation === 'PURGE') {
+              await dropLocalTable(entry.key, 'KV key removed');
+              continue;
+            }
+
+            let val: any;
+            try { val = decode(entry.value); } catch { val = JSON.parse(td.decode(entry.value)); }
+            if (val?.schema && typeof val.schema === 'string') val = JSON.parse(val.schema);
+
+            // Tombstone: the bridge publishes {"dropped":true} rather than removing the
+            // key, so a client arriving after the DROP still learns the table is gone.
+            if (val?.dropped === true) {
+              await dropLocalTable(entry.key, `tombstone @ lsn ${val.lsn ?? '?'}`);
+              continue;
+            }
+
+            // Suspension
+            if (val?.suspended === true) {
+              setSuspended((prev) => ({ ...prev, [entry.key]: val.reason ?? 'unknown' }));
+              continue;
+            }
+
+            // A normal schema after a suspension is the recovery signal
+            setSuspended((prev) => {
+              if (!(entry.key in prev)) return prev;
+              appendLog('SCHEMA', `Table "${entry.key}" resumed upstream — replication restored`, 'MIGRATE');
+              const { [entry.key]: _removed, ...rest } = prev;
+              return rest;
+            });
+
+            if (val?.sqlite?.columns) {
+              console.log(`[SCHEMA PAYLOAD] ${entry.key}:`, val);
+              await applySchema(entry.key, val);
+            }
           }
-
-          let val: any;
-          try { val = decode(entry.value); } catch { val = JSON.parse(sc.decode(entry.value)); }
-          if (val?.schema && typeof val.schema === 'string') val = JSON.parse(val.schema);
-
-          // Tombstone: the bridge publishes {"dropped":true} rather than removing the
-          // key, so a client arriving after the DROP still learns the table is gone.
-          if (val?.dropped === true) {
-            await dropLocalTable(entry.key, `tombstone @ lsn ${val.lsn ?? '?'}`);
-            continue;
-          }
-
-          // Suspension: the table still exists upstream, but the bridge refuses to
-          // replicate it (no primary key), so no CDC will arrive and no snapshot will
-          // be served. Deliberately NOT a tombstone — the table comes back the moment
-          // someone adds a key, so destroying local rows here would lose data over a
-          // migration mistake. Freeze instead: keep what we have, stop expecting more,
-          // and make the staleness visible rather than letting the table look live.
-          if (val?.suspended === true) {
-            setSuspended((prev) => ({ ...prev, [entry.key]: val.reason ?? 'unknown' }));
-            appendLog(
-              'SCHEMA',
-              `Table "${entry.key}" suspended upstream (${val.reason ?? 'unknown'}) — ` +
-                `local data frozen at lsn ${val.lsn ?? '?'}. No further rows until a primary key is added.`,
-              'HOLD',
-            );
-            continue;
-          }
-
-          // A normal schema after a suspension is the recovery signal: the admin added
-          // the key, so clear the flag and let applySchema migrate as usual.
-          setSuspended((prev) => {
-            if (!(entry.key in prev)) return prev;
-            appendLog('SCHEMA', `Table "${entry.key}" resumed upstream — replication restored`, 'MIGRATE');
-            const { [entry.key]: _removed, ...rest } = prev;
-            return rest;
-          });
-
-          if (val?.sqlite?.columns) await applySchema(entry.key, val);
-        }
-      })();
+        })();
+      });
     } catch (err) {
       appendLog('SCHEMA', `Watch failed: ${err}`, 'ERROR');
     }
@@ -401,91 +420,128 @@ export default function App() {
 
   const subscribeStreams = async () => {
     if (!nc) return;
-    const js = nc.jetstream();
-    const jsm = await nc.jetstreamManager();
+    const js = jetstream(nc);
+    const jsm = await jetstreamManager(nc);
 
     // 1. Gap Detection
     try {
       const streamInfo = await jsm.streams.info(topology.streams.cdc);
       const firstSeq = streamInfo.state.first_seq;
-      if (firstSeq > 0) {
-        if (globalSyncState.seq > 0 && globalSyncState.seq < streamInfo.state.first_seq - 1) {
-          appendLog('SYS', `Gap detected! Local seq: ${globalSyncState.seq}, Stream first seq: ${streamInfo.state.first_seq}. Snapshots required!`, 'WARNING');
+      if (globalSyncState.seq === 0 || (firstSeq > 0 && globalSyncState.seq < firstSeq - 1)) {
+        appendLog('SYS', `Gap detected or first run! Local seq: ${globalSyncState.seq}, Stream first seq: ${firstSeq}. Snapshots required!`, 'WARNING');
           
           let snapKv;
-          try { snapKv = await js.views.kv(topology.kv.snapshots); } catch { /* ignore */ }
+          try { 
+            const kvm = new Kvm(nc!);
+            snapKv = await kvm.open(topology.kv.snapshots); 
+          } catch { /* ignore */ }
 
-          for (const table of syncedTables.keys()) {
-            let needsRequest = true;
+          const tablesToSnap = new Set(syncedTables.keys());
+          const snapshotPromises = [];
+
+          for (const table of tablesToSnap) {
+            let desc: any = null;
             if (snapKv) {
-               try {
-                 const entry = await snapKv.get(table);
-                 if (entry) {
-                   let desc: any;
-                   try { desc = decode(entry.value); } catch { desc = sc.decode(entry.value); }
-                   appendLog('SYS', `Found existing snapshot descriptor for ${table} at LSN ${desc?.lsn}. Triggering historical replay...`, 'INFO');
-                   needsRequest = false;
-
-                   // Create ephemeral JetStream consumer to pull chunks for THIS specific snapshot ID
-                   const ci = await jsm.consumers.add(topology.streams.init, {
-                     filter_subject: `init.snap.${table}.${desc.snapshot_id}.>`,
-                     deliver_policy: DeliverPolicy.All,
-                   });
-                   const replayConsumer = await js.consumers.get(topology.streams.init, ci.name);
-                   
-                   // Start asynchronous pull loop for this replay
-                   (async () => {
-                     const iter = await replayConsumer.consume();
-                     for await (const msg of iter) {
-                       let chunkDecoded: any;
-                       try { chunkDecoded = decode(msg.data); } catch { chunkDecoded = sc.decode(msg.data); }
-                       
-                       // Simulate exactly what the old Core NATS subscription did
-                       // (But now we are pulling historical chunks)
-                       // Truncate logic handles re-seeding cleanly for the frontend.
-                       if (chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
-                         const state = syncedTables.get(table);
-                         if (state) {
-                           for (const row of chunkDecoded.data) {
-                             await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: chunkDecoded.lsn });
-                           }
-                         }
-                       }
-                       msg.ack();
-                       
-                       // If we see the header indicating the final chunk, we can clean up
-                       if (msg.headers && msg.headers.get("X-Snapshot-Final-Chunk") === "true") {
-                           const state = syncedTables.get(table);
-                           if (state && desc?.lsn) {
-                             state.lsn = desc.lsn;
-                           }
-                           appendLog('SYS', `Replay finished for ${table} snapshot ${desc.snapshot_id}`, 'INFO');
-                           // We can stop the consumer loop
-                           break;
-                       }
-                     }
-                   })().catch(err => {
-                     appendLog('SYS', `Replay error for ${table}: ${err}`, 'ERROR');
-                   });
-                 }
-               } catch (e) { /* ignore */ }
+              try {
+                const entry = await snapKv.get(table);
+                if (entry) {
+                  try { desc = decode(entry.value); } catch { desc = JSON.parse(td.decode(entry.value)); }
+                }
+              } catch (e) {}
             }
 
-            if (needsRequest) {
+            if (!desc) {
+              // Request snapshot and wait for KV descriptor
               const reqSubject = topology.subjects.snapshot_request.includes('{[table]s}')
                 ? topology.subjects.snapshot_request.replace('{[table]s}', table)
                 : `${topology.subjects.snapshot_request}.${table}`;
               nc.publish(reqSubject, new Uint8Array(0));
-              appendLog('SYS', `Published snapshot request for ${table}`, 'INFO');
+              appendLog('SYS', `Published snapshot request for ${table}. Waiting for generation...`, 'INFO');
+
+              if (snapKv) {
+                const watchP = new Promise<any>(async (resolve) => {
+                  const iter = await snapKv!.watch({ key: table });
+                  for await (const entry of iter) {
+                    if (entry.operation === "DEL" || entry.operation === "PURGE") continue;
+                    try { desc = decode(entry.value); } catch { desc = JSON.parse(td.decode(entry.value)); }
+                    resolve(desc);
+                    break;
+                  }
+                });
+                desc = await watchP;
+              }
+            }
+
+            if (desc) {
+              appendLog('SYS', `Snapshot metadata ready for ${table} (LSN ${desc.lsn}). Replaying...`, 'INFO');
+              
+              const pullPromise = (async () => {
+                await sql(`DELETE FROM ${table}`);
+                
+                const ci = await jsm.consumers.add(topology.streams.init, {
+                  filter_subject: `init.snap.${table}.${desc.snapshot_id}.>`,
+                  deliver_policy: DeliverPolicy.All,
+                });
+                const replayConsumer = await js.consumers.get(topology.streams.init, ci.name);
+                
+                // Use fetch to reliably pull all chunks currently in the stream for this snapshot
+                let done = false;
+                let snapshotColumns: string[] | null = null;
+
+                while (!done) {
+                  const batch = await replayConsumer.fetch({ max_messages: 100, expires: 1000 }).catch(() => null);
+                  if (!batch) break;
+                  
+                  let receivedCount = 0;
+                  for await (const msg of batch) {
+                    receivedCount++;
+                    let chunkDecoded: any;
+                    try { chunkDecoded = decode(msg.data); } catch { chunkDecoded = JSON.parse(td.decode(msg.data)); }
+                    
+                    const state = syncedTables.get(table);
+
+                    if (chunkDecoded && typeof chunkDecoded === 'object' && Array.isArray(chunkDecoded.schema)) {
+                      snapshotColumns = chunkDecoded.schema;
+                      appendLog('SYS', `Received snapshot schema for ${table}: ${snapshotColumns!.join(', ')}`, 'INFO');
+                    } else if (state && Array.isArray(chunkDecoded)) {
+                      // Array of row arrays
+                      const cols = snapshotColumns || state.columns;
+                      for (const rowVals of chunkDecoded) {
+                        const rowObj: any = {};
+                        cols.forEach((col: string, i: number) => { rowObj[col] = rowVals[i]; });
+                        await applyEvent(table, { table, operation: 'INSERT', data: rowObj, lsn: desc.lsn });
+                      }
+                    } else if (state && chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
+                      // Legacy JSON format fallback
+                      for (const row of chunkDecoded.data) {
+                        await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: desc.lsn });
+                      }
+                    }
+                    msg.ack();
+                  }
+                  
+                  // If we didn't receive any messages in this fetch window, the stream is exhausted
+                  if (receivedCount === 0) {
+                    done = true;
+                  }
+                }
+                
+                const state = syncedTables.get(table);
+                if (state) state.lsn = desc.lsn;
+                appendLog('SYS', `Replay finished for ${table} (Snapshot ID: ${desc.snapshot_id})`, 'INFO');
+              })();
+              snapshotPromises.push(pullPromise);
             }
           }
+
+          await Promise.all(snapshotPromises);
+          appendLog('SYS', `All required snapshots replayed successfully!`, 'INFO');
         }
-      }
     } catch (e) {
-      appendLog('SYS', `Failed to check stream gap: ${e}`, 'ERROR');
+      appendLog('SYS', `Failed to resolve gap and replay snapshots: ${e}`, 'ERROR');
     }
 
-    // 2. Start JetStream Consumer
+    // 2. Start JetStream Consumer ONLY AFTER snapshots are resolved!
     try {
       console.log('App.tsx: Starting CDC consumer on subject:', `${topology.subjects.cdc_prefix}.>`);
       const ci = await jsm.consumers.add(topology.streams.cdc, {
@@ -500,12 +556,10 @@ export default function App() {
       (async () => {
         for await (const msg of iter) {
           let decoded: any;
-          try { decoded = decode(msg.data); } catch { decoded = sc.decode(msg.data); }
-          console.log('App.tsx: Received CDC message!', msg.subject, decoded);
+          try { decoded = decode(msg.data); } catch { decoded = JSON.parse(td.decode(msg.data)); }
           const events = Array.isArray(decoded) ? decoded : [decoded];
 
           for (const ev of events) {
-            // Embed sequence number so applyEvent can save it
             ev.seq = msg.seq;
             const table = ev?.table || msg.subject.split('.')[1];
             appendLog(msg.subject, ev, ev?.operation || 'CDC');
@@ -518,73 +572,14 @@ export default function App() {
       appendLog('SYS', `Failed to start CDC consumer: ${e}`, 'ERROR');
     }
 
-    const initSub = nc.subscribe(`${topology.subjects.init_prefix}.>`);
-    (async () => {
-      for await (const msg of initSub) {
-        let decoded: any;
-        try { decoded = decode(msg.data); } catch { decoded = sc.decode(msg.data); }
 
-        if (msg.subject.includes('.start.')) {
-          // Truncate table
-          const table = decoded.table;
-          if (table) {
-            await sql(`DELETE FROM ${table}`); // Delete all to reseed
-            appendLog(msg.subject, `Truncated ${table} for snapshot re-seed`, 'INIT');
-          }
-        } else if (msg.subject.includes('.meta.')) {
-          // End of snapshot, update table LSN
-          const table = decoded.table;
-          const state = syncedTables.get(table);
-          if (state && table) {
-            state.lsn = decoded.lsn;
-            appendLog(msg.subject, `Snapshot for ${table} finished at LSN ${decoded.lsn}`, 'INIT');
-          }
-        } else if (decoded.operation === 'snapshot' && decoded.data) {
-          // Apply chunk rows
-          const table = decoded.table;
-          const state = syncedTables.get(table);
-          if (state && table) {
-            for (const row of decoded.data) {
-              await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: decoded.lsn });
-            }
-          }
-        } else {
-          appendLog(msg.subject, decoded, 'INIT');
-        }
-      }
-    })();
   };
 
   // ---------------------------------------------------------------------------
   // UI actions
   // ---------------------------------------------------------------------------
 
-  const queryLocalDb = async () => {
-    if (!syncedTables.size) {
-      appendLog('SQLITE', 'No tables synced yet — waiting for a schema push.', 'ERROR');
-      return;
-    }
-    for (const [table, state] of syncedTables) {
-      try {
-        const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}`);
-        const order = state.pkCols.length
-          ? state.pkCols.map((c) => `"${c}" DESC`).join(', ')
-          : 'rowid DESC';
-        const lastRes = await sql(`SELECT * FROM ${table} ORDER BY ${order} LIMIT 1`);
-        appendLog(
-          'SQLITE',
-          JSON.stringify(
-            { table, schema_lsn: state.lsn, columns: state.columns, row_count: countRes[0]?.count ?? 0, last_row: lastRes[0] ?? null },
-            null,
-            2
-          ),
-          'QUERY'
-        );
-      } catch (err) {
-        appendLog('SQLITE', `Query on ${table} failed: ${err}`, 'ERROR');
-      }
-    }
-  };
+
 
   const publishMutation = () => {
     if (!nc) return;
@@ -612,52 +607,74 @@ export default function App() {
 
   initNats();
 
-  onCleanup(() => {
-    if (nc) nc.close();
-  });
+    const intervalId = setInterval(refreshLocalDb, 1000);
 
-  return (
-    <>
-      <header>
-        <h1>ZeBridge CDC Web Consumer</h1>
-        <div class="status-bar">
-          <span class={`badge ${status()}`}>{status().toUpperCase()}</span>
-          <span id="server-url">{NATS_URL}</span>
-          <span id="sync-state">tables: {tableCount()} · held events: {pendingCount()}</span>
-        </div>
-      </header>
+    onCleanup(() => {
+      clearInterval(intervalId);
+      if (nc) nc.close();
+    });
 
-      <For each={Object.entries(suspended())}>
-        {([table, reason]) => (
-          <div class="suspended-banner">
-            ⏸ <strong>{table}</strong> is suspended upstream ({reason}). Local rows are frozen and
-            still valid, but no new events or snapshots will arrive until a primary key is added.
+    return (
+      <>
+        <header>
+          <h1>ZeBridge CDC Web Consumer</h1>
+          <div class="status-bar">
+            <span class={`badge ${status()}`}>{status().toUpperCase()}</span>
+            <span id="server-url">{NATS_URL}</span>
+            <span id="sync-state">tables: {tableCount()} · held events: {pendingCount()}</span>
           </div>
-        )}
-      </For>
+        </header>
 
-      <div class="controls">
-        <button onClick={queryLocalDb} style="background: #2e7d32;">Query Local DB</button>
-        <button onClick={publishMutation} style="background: #e65100;">Push Mutation to Bridge</button>
-        <button onClick={() => setLogs([])}>Clear Logs</button>
-      </div>
+        <For each={Object.entries(suspended())}>
+          {([table, reason]) => (
+            <div class="suspended-banner">
+              ⏸ <strong>{table}</strong> is suspended upstream ({reason}). Local rows are frozen and
+              still valid, but no new events or snapshots will arrive until a primary key is added.
+            </div>
+          )}
+        </For>
 
-      <main>
-        <h3>Live Event Logs ({logs().length})</h3>
-        <div class="log-container">
-          <For each={logs()}>
-            {(log) => (
-              <div class="log-entry">
-                <span class="time">[{log.timestamp}]</span>{' '}
-                <span class="topic">{log.topic}</span>{' '}
-                <span class={`op-${log.opType.toLowerCase()}`}>{log.opType}</span>
-                <br />
-                {log.bodyStr}
-              </div>
-            )}
-          </For>
+        <div class="controls">
+          <button onClick={refreshLocalDb} style="background: #2e7d32;">Refresh Local DB</button>
+          <button onClick={publishMutation} style="background: #e65100;">Push Mutation to Bridge</button>
         </div>
-      </main>
-    </>
-  );
+
+        <main>
+          <h3>Local Database State</h3>
+          <div class="tables-container">
+            <For each={Object.entries(dbState())}>
+              {([tableName, data]) => (
+                <div class="table-view">
+                  <h4>{tableName} <span class="row-count">({data.count} rows)</span></h4>
+                  {data.rows.length === 0 ? (
+                    <p>No rows in table.</p>
+                  ) : (
+                    <table>
+                      <thead>
+                        <tr>
+                          <For each={data.columns}>
+                            {(col) => <th>{col}</th>}
+                          </For>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <For each={data.rows}>
+                          {(row) => (
+                            <tr>
+                              <For each={data.columns}>
+                                {(col) => <td>{String(row[col])}</td>}
+                              </For>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              )}
+            </For>
+          </div>
+        </main>
+      </>
+    );
 }

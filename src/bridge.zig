@@ -35,7 +35,7 @@ comptime {
     _ = @import("array.zig");
     _ = @import("encoder.zig");
     _ = @import("numeric.zig");
-    _ = @import("pg_copy_csv.zig");
+    _ = @import("pg_conn.zig");
     _ = @import("pgoutput.zig");
     _ = @import("publication.zig");
     _ = @import("preflight.zig");
@@ -607,13 +607,22 @@ pub fn main(init: std.process.Init) !void {
             last_status_update_time = now_ms;
         }
 
-        // Send keepalive to prevent timeout
+        // Unconditional heartbeat. PostgreSQL terminates a walsender that stays silent
+        // for `wal_sender_timeout`, and it does NOT keep asking: during a burst it stops
+        // sending keepalives of its own and streams xlogdata continuously, so a receiver
+        // that only answers `reply_requested` can go quiet for minutes and be killed
+        // mid-stream.
+        //
+        // Sent even when `last_ack_lsn` is still 0 — an LSN of 0 means "I have confirmed
+        // nothing yet", which is true and harmless, and PostgreSQL prunes nothing on the
+        // strength of it. The previous `if (last_ack_lsn > 0)` guard meant a bridge that
+        // had not yet confirmed anything — NATS down at boot, or a long first
+        // transaction — sent no heartbeat at all, which is exactly when it most needs to
+        // say it is alive.
         if (now_s - last_keepalive_time >= keepalive_interval_seconds) {
-            if (last_ack_lsn > 0) {
-                try pg_stream.sendStatusUpdate(last_ack_lsn);
-                last_keepalive_time = now_s;
-                log.debug("Sent keepalive (LSN: {x})", .{last_ack_lsn});
-            }
+            try pg_stream.sendStatusUpdate(last_ack_lsn);
+            last_keepalive_time = now_s;
+            log.debug("Sent keepalive (LSN: {x})", .{last_ack_lsn});
         }
 
         // Periodic structured metric logging for Alloy/Loki

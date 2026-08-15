@@ -36,15 +36,27 @@ warns at boot if `BASE_BUF` cannot fit inside it. README has the sizing formula.
 
 **Work, in order:**
 
-1. **Delete the CSV path.** `pg_copy_csv.zig` now has no live caller — `snapshot_listener`
-   imports it without using it, and `bridge.zig` imports it only for test discovery. The
-   rollout gate (a consumer rebuilding a table from a binary snapshot) is met: the
-   web-consumer applies `init.snap.<table>.<id>.>` chunks. Confirm once live, then delete
-   it along with `getTablePrimaryKey` and `PkMetadata`, which have been dead since
-   pagination started resolving the key from `getTableColumns`.
-2. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
-   snapshot application. Unblocks TEST_SCENARIOS **B**, **C3**, **C4**, **D2**, lets
-   **F6** end in a re-seed instead of a caveat, and is the gate on deleting the CSV path.
+1. ~~**Delete the CSV path**~~ — ✅ **DONE 2026-08-15.** `src/pg_copy_csv.zig` (883 lines,
+   13 tests) deleted, along with `getTablePrimaryKey`, `PkMetadata`, the dead import in
+   `snapshot_listener.zig`, the test-discovery import in `bridge.zig`, and the stale
+   comment in `streaming_encoder.zig`. Test count 222 → 196; nothing else moved. The
+   gate, for the record: The rule was
+   "delete with evidence, not on a green log line", and the evidence now exists: a fresh
+   web-consumer bootstrapped from an empty SQLite, watched the schemas KV, detected the
+   gap, requested snapshots, and replayed a **binary** snapshot into local tables —
+   `📦 Published chunk 0 (250 rows, 45545 bytes)` on the bridge, `Replay finished for
+   test_types` on the client, rows queryable afterwards. The empty-table case (`users`,
+   `0 batches, 0 rows`) was handled correctly on both sides in the same run.
+
+   What to delete: `src/pg_copy_csv.zig` (and its 13 tests), the unused import at
+   `snapshot_listener.zig:17`, the test-discovery import at `bridge.zig:37`, the stale
+   reference in `streaming_encoder.zig:31`, and — dead since pagination started resolving
+   the key from `getTableColumns` — `getTablePrimaryKey` and `PkMetadata`.
+
+2. **Client item D — DONE.** LSN/sequence persistence (`_zebridge_sync`), a JetStream
+   consumer with `DeliverPolicy.StartSequence`, gap detection against
+   `stream.state.first_seq`, truncate-then-apply snapshot replay. Verified in the same
+   run. This was the gate on item 1 and on TEST_SCENARIOS **B**.
 3. **The scenario migrations moved** from `emitter/priv/spec/` to
    `emitter/priv/repo/migrations/` (2026-08-15, untracked at the new location — commit
    them). `Emitter.Scenario` steps 1–8 run again from there.
@@ -54,8 +66,8 @@ systematic, blocks a byte-equality golden test), snapshot failures that abort wi
 publishing to `init.snap.error.<table>`, golden-value test per PG major (note
 `pgoutput`'s `binary` needs PG 14+, but `COPY ... FORMAT binary` goes back to 7.4).
 
-**Do not** prune `pg_copy_csv.zig` yet — the rollout gate is a consumer reconstructing a
-table from a binary snapshot, which item 2 unblocks. `getTablePrimaryKey` and
+`pg_copy_csv.zig` is now **cleared for deletion** — the gate (a consumer reconstructing
+a table from a binary snapshot) was met live on 2026-08-15; see item 1 above. `getTablePrimaryKey` and
 `PkMetadata` in `snapshot_listener.zig` are now dead (pagination resolves the key from
 `getTableColumns`); they go out with CSV.
 
@@ -506,10 +518,10 @@ So `TupleData.cols` is now `[]ColumnValue`, a union of `null` / `unchanged` / `t
 - **Golden-value test per PG major.** `pgoutput`'s `binary` option needs PG 14+, so the
   bridge will not start on older servers — but `COPY ... FORMAT binary` works back to
   7.4, so the decoder alone can be exercised much further back.
-- **Do not prune CSV yet.** The rollout gate — binary completes a full bootstrap with a
-  consumer reconstructing the table — is unreachable until client item **D** lands,
-  because the consumer cannot apply snapshots at all. Delete CSV with evidence, not on a
-  green log line.
+- ~~**Do not prune CSV yet.**~~ ✅ The gate was "binary completes a full bootstrap with a
+  consumer reconstructing the table", and it was met on 2026-08-15 — a fresh
+  web-consumer seeded `test_types` from a binary snapshot and handled the empty `users`
+  correctly in the same run. Deleted with evidence, as intended, not on a green log line.
 
 ## Next up, in order
 
@@ -591,7 +603,119 @@ after `n-*` under the database's collation but before it in byte order.
 > this is the next *feature*. Section letters are historical, not a running order —
 > see "Next up, in order" at the end of §F.
 
-The headline feature. Design settled 2026-08-10; not started.
+The headline feature. Design settled 2026-08-10; **partially built and audited
+2026-08-15** — see the checklist below, which is the running order.
+
+## D0. Checklist (2026-08-15)
+
+Written after auditing `mutation_listener.zig` and comparing against PowerSync and
+Electric. Client-facing rules live in `PROTOCOL.md` §7; this is the bridge side.
+
+**Security — first, because "it works" and "it is correct" currently diverge silently**
+
+- [x] **subject grammar fixed 2026-08-15**: `mutation.<principal>.<table>.<operation>`,
+      in `topology.json` → `build.zig` → `Config.Nats.mutation_subject_pattern` plus the
+      token positions. Nothing parses it yet; the contract is pinned so the switch from
+      nkey to JWT/operator becomes a deployment change rather than a client migration.
+      Principal first because a per-user grant is then one wildcard (`mutation.<id>.>`)
+      and adding a table reissues no credentials
+- [ ] **principal, table and operation from the subject**, never the payload — NATS
+      authorizes subjects, so a payload-derived table means broker permissions constrain
+      nothing, and a payload-derived identity is worth nothing at all
+- [ ] reject subjects that do not have exactly `mutation_token_count` tokens, before
+      parsing any of them
+- [ ] identifiers validated against the catalog, never interpolated (today a table named
+      `x" ; DROP …` closes the quote)
+- [ ] `zebridge_ddl_events` explicitly excluded — writable today, which lets a client
+      forge a schema for every other client
+- [ ] `bridge_writer` role: `EXECUTE` on `app`, **zero** table privileges — the backstop
+      that makes a bug in the above non-fatal
+
+**Row-level authorization — the audit stopped at "can write any table" before reaching
+"can write any row". Without this, a client permitted to write a table can write *every
+row of it*.**
+
+- [ ] `SET LOCAL zebridge.principal = '<subject token>'` before each statement;
+      policies compare `current_setting('zebridge.principal')` against an ordinary
+      column. One database role, any number of principals — a PG role per mobile user is
+      unworkable
+- [ ] `bridge_writer` must **not own** the tables and must not have `BYPASSRLS`: owners
+      are exempt from RLS unless `FORCE ROW LEVEL SECURITY` is set, and that exemption
+      fails **open**
+- [ ] the principal is the application's **internal user id**, immutable for the life of
+      the account (it lands in the credential, every subject, the policy's column, and
+      any queued mutation simultaneously)
+- [ ] batching interaction: `SET LOCAL` is per transaction, so a batch mixing principals
+      re-issues it per statement. Safe **only** with the individual-retry fallback below,
+      since one row's constraint or RLS failure aborts the whole transaction
+
+**Correctness**
+
+- [ ] `max_deliver` + dead-letter subject — one malformed message currently loops
+      forever at one retry/second (reproduced: 24 redeliveries in 15 s)
+- [ ] reply on the reply-to subject: `accepted` / `stale` / `row_deleted` / error.
+      Both PowerSync's blocking FIFO queue and Electric's `awaitTxId` need it; without
+      it a client cannot dequeue, and `row_deleted` has nowhere to go
+- [ ] clamp future version values, and return the clamped value
+- [ ] keep the `IS NULL OR` guard — a NULL stored version otherwise rejects every write
+
+**Version column (LWW)**
+
+- [ ] `SYNC_RULES=table:version_col[,tombstone_col];…` + `SYNC_VERSION_COLUMN` default;
+      `-` = outbound-only, `-arrival` = writable with last-arrival-wins
+- [ ] preflight **checks the named column, never searches for one** — but *reports* the
+      table's timestamp columns as candidates so the operator knows what to configure
+- [ ] refuse `created%` / `inserted%` by name: set once at insert, so as a version they
+      either reject every update or corrupt the column's meaning
+- [ ] case-sensitive and always quoted — `updatedAt` is not `updatedat`
+- [ ] publish `"sync": {version, tombstone, writable}` in the schema KV so clients
+      discover it instead of hardcoding
+
+**Two triggers per edge-writable table**, generated by the bridge's init SQL — needed
+because **apps write to PostgreSQL directly**, which is the entire premise of CDC:
+
+- [ ] `BEFORE UPDATE` — stamp the version column when a writer did not. Raw SQL, cron
+      jobs and data fixes do not maintain it; the failure is silent and asymmetric (the
+      row changes, the version does not, so a stale phone overwrites a fresh backend write)
+- [ ] `BEFORE DELETE` — convert the delete into `UPDATE … SET deleted_at = now()` and
+      `RETURN NULL`. Without it a backend `DELETE` is physical, no tombstone exists, and
+      an offline client's queued edit resurrects the row immediately — not after
+      `GC_THRESHOLD_MS`, but at once. See "consequences for direct apps" below.
+
+**Deletes and GC**
+
+- [ ] `deleted_at` when the table has one; hard delete otherwise (stated weaker guarantee)
+- [ ] `GC_THRESHOLD_MS` = the stated maximum offline window, not a tuning knob
+- [ ] publish the GC watermark to KV after each sweep; clients compare their oldest
+      queued version against it **before flushing the outbox**
+- [ ] keep GC's own deletes off the wire — a sweep of a million tombstones is otherwise
+      a million CDC events about rows every client already knows are dead
+
+**Throughput — last, and only what is free**
+
+- [ ] batch N mutations per transaction (measured 8.6× locally)
+- [ ] **individual-retry fallback**: on batch failure, replay the batch one statement at
+      a time so a single row's constraint or RLS violation costs latency, not other
+      clients' writes. Required before batching mixed principals is safe, and it is the
+      same machinery the dead-letter path needs
+- [ ] ~~`synchronous_commit = off`~~ — dropped: batching already amortises the fsync, and
+      with a reply channel the bridge would be acking writes a crash can still lose
+- [ ] no libpq pipeline mode, no multi-row bucketing for now
+
+### Consequences for apps that write to PostgreSQL directly
+
+The `BEFORE DELETE` trigger changes semantics for every writer, not just the edge. These
+must be in the docs, because `<table>_live` only fixes the first one:
+
+| what changes | why | remedy |
+| --- | --- | --- |
+| `SELECT` returns tombstones | the row is still there | query `<table>_live`, or add `WHERE deleted_at IS NULL` |
+| **UNIQUE constraints still hold against deleted rows** | the tombstone occupies the key, so re-creating a "deleted" user fails | partial index: `CREATE UNIQUE INDEX … WHERE deleted_at IS NULL` |
+| **foreign keys stay valid** | children keep pointing at a deleted parent; `ON DELETE CASCADE` never fires | cascade in the trigger, or accept it |
+| `DELETE … RETURNING` returns nothing | the trigger returns NULL | use the UPDATE form |
+| **`DELETE` reports 0 rows affected** | ⚠️ `Repo.delete!/1` raises `Ecto.StaleEntryError`; ActiveRecord and others check the same count | app must delete via an update, or use `<table>_live` with a rule |
+
+The last row is the one that will bite first — your own emitter uses `Repo.delete!`.
 
 **Trust split: NATS is the policy engine, zebridge is a dumb dispatcher, Postgres
 holds the business rules.**

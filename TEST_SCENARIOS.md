@@ -82,7 +82,25 @@ Scenario C3 deliberately violates it — that is the point of C3.
 | A7 | `Emitter.Chaos.trigger_table_drop()` | Tombstone → local table dropped. |
 | A8 | `CREATE INDEX` on a published table | **Nothing** reaches the client — indexes are not schema. |
 
-## B. Bootstrap, resume, gap — needs client item D
+## B. Bootstrap, resume, gap — runnable now (client item D landed)
+
+**B1 and B2 verified 2026-08-15** on a fresh `web-consumer` against a fresh SQLite:
+
+```txt
+SCHEMA WATCH   : Watching KV bucket "schemas" for all tables...
+SCHEMA MIGRATE : users: created (first sight), lsn=25443456
+SCHEMA MIGRATE : test_types: created (first sight), lsn=25443456
+SYS WARNING    : Gap detected or first run! Local seq: 0, Stream first seq: 0
+SYS INFO       : Snapshot metadata ready for test_types (LSN 25443776). Replaying...
+SYS INFO       : Replay finished for test_types (Snapshot ID: snap-1786810474-2c61)
+```
+
+Bridge side, the same run: `📦 Published chunk 0 (250 rows, 45545 bytes)` for
+`test_types` and `✅ Snapshot complete: … (0 batches, 0 rows)` for the empty `users` —
+**B1 and B2 in one pass**, and the binary COPY path proven end to end, which is what
+released the CSV code for deletion.
+
+B3–B6 remain to be run.
 
 | # | setup | expect |
 | --- | --- | --- |

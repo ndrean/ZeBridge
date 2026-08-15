@@ -179,7 +179,7 @@ Published when the bridge refuses a table. Two reasons exist:
 
 | `reason` | meaning | fix |
 | --- | --- | --- |
-| `no_primary_key` | rows cannot be identified, so DELETE is ambiguous (§8) | add a primary key |
+| `no_primary_key` | rows cannot be identified, so DELETE is ambiguous (§9) | add a primary key |
 | `unsupported_column_type` | a column's type cannot be decoded and is not an enum (§4) | change or drop that column |
 | `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | restart the bridge with a larger buffer, or move the oversized column out of the table |
 
@@ -300,7 +300,16 @@ MessagePack by default, JSON with `--json`. Either way:
   verbatim — no type-specific decoding is applied or needed.
 - `jsonb` arrives as a nested object in MessagePack mode, a string in JSON mode.
 - arrays and `bytea` arrive as strings.
-- `timestamptz` arrives as an ISO-8601 string.
+- **`timestamptz` arrives as ISO-8601 with `Z`; `timestamp` arrives without it.** The
+  suffix is not decoration — `timestamptz` is stored as UTC, so `Z` states a recorded
+  fact, while `timestamp` is a naive wall-clock reading with no zone. A client must
+  **not** localise a value that has no suffix: `new Date("2025-10-26T10:00:00.000000")`
+  parses as *local* time in JavaScript, which shifts it. Treat it as the literal clock
+  reading the database holds.
+
+  ⚠️ Note most ORMs produce naive columns by default — Ecto's `timestamps()` and Rails'
+  `t.timestamps` both create `timestamp without time zone` — so this is the common case,
+  not the exotic one. Before 2026-08-16 both types were emitted with `Z`.
 
 ---
 
@@ -441,7 +450,7 @@ Snapshot data is megabytes-to-gigabytes of ordered chunks. It flows through thre
 
 | `error_type` | meaning | client action |
 | --- | --- | --- |
-| `table_refused` | table has no primary key — replication suspended (§3, §8) | do not retry; wait for a live schema on the KV key |
+| `table_refused` | table has no primary key — replication suspended (§3, §9) | do not retry; wait for a live schema on the KV key |
 | `table_not_monitored` | table is not in the publication this bridge replicates | do not retry; check `available_tables` |
 | `generation_failed` | the `COPY` failed (permissions, lock, connection) | retry with backoff |
 
@@ -556,7 +565,172 @@ table still corrupts CDC events the same way. Planned fix in `COPY_BINARY_PLAN.m
 
 ---
 
-## 7. Ordering guarantees
+## 7. Writing from the edge — stream `MUTATIONS` 🚧
+
+> 🚧 **Design, not yet implemented.** The bridge currently applies mutations without
+> authorization, without a reply, and without the guarantees below. Do not build a
+> client against this section until the 🚧 is gone.
+
+### 7.1 Subject grammar — the principal is a token, not a field
+
+```txt
+mutation.<principal>.<table>.<operation>      e.g. mutation.a3f9c1.users.insert
+```
+
+`<operation>` is `insert` | `update` | `delete` — the same verbs as `cdc.<table>.<op>`.
+Server-side `insert` and `update` are the same upsert, but the verb is a **subject
+token** so that "may create, may not delete" is expressible as a broker permission.
+
+**The principal is in the subject because NATS authorizes subjects, not payloads.** A
+client issued `publish: ["mutation.a3f9c1.>"]` physically cannot write as anyone else,
+and the bridge reading the principal off the subject is not trusting the client — it is
+reading a claim the broker already checked. An identity in the payload would be worth
+nothing, because the payload is whatever the client says it is.
+
+The principal comes first so that a per-user grant is a single wildcard rule rather than
+one rule per table.
+
+**The principal is the application's own internal user id** — the primary key of your
+users table, uuid or integer. ZeBridge neither issues nor validates it: authenticating a
+consumer and deciding what its id is are the application's business. The bridge only
+reads the token the broker already vouched for.
+
+⚠️ **It must be a legal NATS token** — no `.`, space, `*` or `>`. An email address is
+therefore not usable, and a hash of one is worse: unsalted it is brute-forceable, and it
+inherits the email's mutability.
+
+⚠️ **It must be immutable for the life of the account.** The same value ends up in four
+places at once — the NATS credential, every subject the client publishes, the row-level
+policy's column, and any mutation sitting in a client's outbox. Changing it orphans all
+four, silently and at different times.
+
+#### Two credential shapes, and only one needs an account
+
+A consequence of putting the principal in the subject: **your users table becomes the
+source of truth for NATS credentials.** Issuing a credential means minting one whose
+publish permission is `mutation.<that user's id>.>`, so account creation and credential
+issuance become a single flow, and the id must exist before the consumer can connect at
+all.
+
+But that is only true for consumers that *write*. The read path needs no identity:
+
+| | subscribe | publish | needs an account |
+| --- | --- | --- | --- |
+| **read-only consumer** | `cdc.>`, `init.>`, `$KV.schemas.>`, `$KV.snapshots.>` | `snapshot.request.>` | **no** |
+| **read-write consumer** | the same | + `mutation.<principal>.>` | yes |
+
+So a deployment can offer local-first *reading* — schemas, snapshots, live CDC into a
+local SQLite — with a single shared credential and no user system whatsoever. Identity
+is required only at the point where a client starts writing back, which is also the
+point where "who is allowed to change this row" first becomes a question worth asking.
+
+Worth designing for deliberately rather than discovering: it means the read path can
+ship, and be demonstrated, long before authentication exists.
+
+⚠️ **It is an application identity, not a PostgreSQL role.** The bridge issues
+`SET LOCAL zebridge.principal = '<token>'` and row-level policies compare
+`current_setting('zebridge.principal')` against an ordinary column. One database role,
+any number of principals.
+
+### The policy: last-write-wins on a version column
+
+Concurrent writes are resolved by comparing a **version** — a column the table already
+has (`updated_at` and friends), not one ZeBridge adds. The later *intent* wins, not the
+later arrival: an edit made offline at 09:00 loses to an edit made at 10:00 even if it
+reaches the server six hours later.
+
+Two things follow, and they are the whole reason this section is long:
+
+- **A client that does not implement the rules below does not get a weaker guarantee —
+  it gets lost writes.** A mutation published while disconnected is discarded by the
+  transport; a mutation whose reply is ignored is indistinguishable from one that was
+  rejected. Neither is a conflict outcome. Both are silent data loss.
+- **The version is the table's, not the message's.** A table without one is
+  **outbound-only**: it replicates to clients and refuses their writes (§9).
+
+### Client conformance
+
+**MUST**
+
+1. **Persist the outbox in the same database as the replica**, and write the optimistic
+   local change and the queue entry **in one transaction**. Split them and a crash
+   between the two leaves an edit the server will never hear about, or a queued intent
+   the user cannot see. This is the client-side twin of the bridge's own rule: never ACK
+   an LSN whose data has not reached NATS.
+
+   ```sql
+   BEGIN;
+     UPDATE users SET name = ? WHERE id = ?;              -- what the user sees
+     INSERT INTO _zebridge_outbox (…) VALUES (…);          -- the intent to send
+   COMMIT;
+   ```
+
+2. **Send in FIFO order, one outstanding at a time.** This is not about conflicts
+   between clients — it preserves *your own* causal order. Create-then-rename sent
+   concurrently can arrive rename-first.
+
+3. **Stamp every mutation** with a `version` (see below) and a stable `msg_id`, so a
+   retry is idempotent rather than a second write.
+
+4. **Pop the queue only on a definitive reply.** On timeout or transport error, retry —
+   never pop on send.
+
+   | reply | client |
+   | --- | --- |
+   | `accepted` | pop |
+   | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC |
+   | `row_deleted` | pop, and surface it: the row was deleted elsewhere |
+   | timeout / error | keep, retry (idempotent via `msg_id`) |
+
+5. **Treat the reply as a verdict, not as data.** State always arrives through CDC.
+   Keeping one path for state and another for verdicts is what stops a client having two
+   sources of truth.
+
+6. **Check the GC watermark before flushing after a long offline period.** A queued
+   mutation older than the watermark cannot be applied safely — the tombstone that would
+   have overruled it has been reaped (§7.3).
+
+**SHOULD**
+
+7. Apply optimistically, so the UI does not wait for a round trip through PostgreSQL.
+8. Surface `row_deleted` to the user rather than silently discarding their edit — this
+   is the one case where LWW cannot decide for them.
+9. Bound the outbox, and tell the user when it stops draining.
+
+### 7.2 The version value
+
+The client sends the value of the table's version column. For a **new** edit it must
+generate one that is greater than the value it holds — in practice "now", rendered
+exactly as the CDC payload renders that column, so no format is negotiated and no
+precision is lost.
+
+- ⚠️ **Microsecond precision or better.** Second precision means frequent ties, and a tie
+  is *rejected* by `<`, so a legitimate edit is dropped silently.
+- ⚠️ **Ties need a tiebreaker.** Equal versions otherwise let two replicas pick different
+  winners and stay divergent. The comparison is `(version, client_id)`.
+- ⚠️ **Do not send a future timestamp.** A skewed clock writes a row nobody can update
+  until the world catches up; the bridge clamps and tells you what it used.
+
+### 7.3 Deletes, tombstones, and the GC watermark
+
+A delete from the edge is a **soft delete**: the row survives with its tombstone column
+set, so that an offline client's later edit can be overruled instead of resurrecting the
+row. Tombstones are reaped after `GC_THRESHOLD_MS`, which is therefore **the maximum
+offline window with pending writes that this deployment supports**.
+
+The bridge publishes a watermark after each sweep. Before flushing an outbox that has
+been sitting, compare the oldest queued `version` against it:
+
+```txt
+oldest queued version < gc watermark  →  that write cannot be judged safely
+```
+
+What to do then is a product decision — discard, ask the user, or send with an explicit
+intent to resurrect — but the client must not send it blindly.
+
+---
+
+## 8. Ordering guarantees
 
 What the bridge promises:
 
@@ -579,7 +753,7 @@ What it does **not** promise:
 
 ---
 
-## 8. Table requirements
+## 9. Table requirements
 
 Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 
@@ -618,7 +792,7 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
 
 ---
 
-## 9. Reference implementations
+## 10. Reference implementations
 
 - `web-consumer/` — SolidJS + WASM SQLite (OPFS) over WebSocket with nkey auth.
   Implements §3, §4 and §5 in full. The browser is the *hardest* target; iOS and

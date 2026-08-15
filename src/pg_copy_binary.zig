@@ -2,11 +2,12 @@
 //!
 //! Replaces the CSV snapshot path. Two reasons, one of them a correctness fix:
 //!
-//! 1. **CSV parsing here was wrong.** `pg_copy_csv.parseCsvLineStreaming` splits rows
-//!    on `,` with `splitScalar`, which knows nothing about quoting — a `TEXT` value
-//!    containing a comma is silently split into two fields, shifting every column
-//!    after it. Binary framing is length-prefixed, so a value's bytes cannot be
-//!    confused with a delimiter.
+//! 1. **The CSV parser it replaced was wrong.** It split rows on `,` with
+//!    `splitScalar`, which knows nothing about quoting — a `TEXT` value containing a
+//!    comma was silently split into two fields, shifting every column after it. Binary
+//!    framing is length-prefixed, so a value's bytes cannot be confused with a
+//!    delimiter. (`src/pg_copy_csv.zig`, deleted 2026-08-15 once a consumer had
+//!    rebuilt a table from a binary snapshot.)
 //! 2. Postgres no longer renders every value to text for us to parse back, and
 //!    `pgoutput.decodeBinColumnData` — already used by the CDC path, which runs
 //!    `START_REPLICATION ... binary 'true'` — accepts exactly the per-value encodings
@@ -410,7 +411,7 @@ pub fn padNumeric(
 /// Decode one tuple's raw fields into rendered text values, using the catalog OIDs.
 ///
 /// Allocates from `arena`; there is no per-row cleanup because the arena is the only
-/// owner. This is why rows carry no `deinit`, unlike `CsvRow`.
+/// owner, which is why rows carry no `deinit` of their own.
 pub fn decodeTuple(
     arena: std.mem.Allocator,
     columns: []const ColumnMeta,

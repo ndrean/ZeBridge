@@ -176,3 +176,68 @@ button:hover {
   font-size: 0.9rem;
   line-height: 1.4;
 }
+
+.tables-container {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+  margin-top: 1rem;
+}
+
+.table-view {
+  background: #181818;
+  border: 1px solid #333;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.table-view h4 {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  background: #222;
+  border-bottom: 1px solid #333;
+  font-size: 1.1rem;
+  color: #fff;
+}
+
+.row-count {
+  font-size: 0.85rem;
+  color: #aaa;
+  font-weight: normal;
+  margin-left: 0.5rem;
+}
+
+.table-view p {
+  padding: 1rem;
+  color: #888;
+  margin: 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th, td {
+  padding: 0.5rem 1rem;
+  text-align: left;
+  border-bottom: 1px solid #2a2a2a;
+}
+
+th {
+  background: #1c1c1c;
+  color: #aaa;
+  font-weight: 600;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+}
+
+td {
+  font-family: monospace;
+  font-size: 0.9rem;
+  color: #e0e0e0;
+}
+
+tbody tr:hover {
+  background: #252525;
+}

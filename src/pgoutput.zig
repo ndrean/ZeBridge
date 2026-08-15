@@ -158,7 +158,19 @@ pub fn decodeBinColumnData(
             };
         },
 
-        // ISO 8601 format: 2025-10-26T10:00:00.000000Z
+        // ISO 8601. ⚠️ The suffix differs by type and that is not cosmetic:
+        //
+        //   TIMESTAMPTZ  is stored as UTC microseconds since 2000-01-01, so `Z` states
+        //                a fact PostgreSQL actually recorded.
+        //   TIMESTAMP    is a naive wall-clock reading with no zone at all. Appending
+        //                `Z` *asserts* it is UTC, which the database never said. It is
+        //                accidentally true when the writer happens to store UTC (Ecto's
+        //                `:utc_datetime_usec` does, and it produces a naive column), and
+        //                silently wrong for any writer that stores local time.
+        //
+        // Both types were formatted identically until 2026-08-16, so every naive column
+        // shipped with a `Z` it had not earned. Clients must not localise a value with
+        // no suffix — see PROTOCOL.md §4.
         .TIMESTAMP, .TIMESTAMPTZ => {
             if (raw_bytes.len != 8) return error.InvalidDataLength;
             const microseconds = std.mem.readInt(i64, raw_bytes[0..8], .big);
@@ -170,15 +182,19 @@ pub fn decodeBinColumnData(
             const unix_days = @divFloor(total_seconds, 86400);
             const date = utils.civilFromDays(unix_days);
 
-            // Convert to days for date calculation
             const day_seconds = @mod(total_seconds, 86400);
             const hour = @divFloor(day_seconds, 3600);
             const minute = @divFloor(@mod(day_seconds, 3600), 60);
             const second = @mod(day_seconds, 60);
 
-            return .{ .text = try std.fmt.allocPrint(
-                allocator,
-                "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z",
+            // Fixed width, so the buffer is a stack array and the only allocation is the
+            // final dupe: "YYYY-MM-DDTHH:MM:SS.ffffff" is 26 bytes, +1 for the optional
+            // `Z`. allocPrint here was the most repeated allocation in the decoder —
+            // most tables carry two timestamp columns per row.
+            var buf: [27]u8 = undefined;
+            const rendered = try std.fmt.bufPrint(
+                &buf,
+                "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}{s}",
                 .{
                     @as(u32, @intCast(date.year)),
                     date.month,
@@ -187,8 +203,10 @@ pub fn decodeBinColumnData(
                     @as(u8, @intCast(minute)),
                     @as(u8, @intCast(second)),
                     remaining_micros,
+                    if (type_id == @intFromEnum(PgOid.TIMESTAMPTZ)) "Z" else "",
                 },
-            ) };
+            );
+            return .{ .text = try allocator.dupe(u8, rendered) };
         },
 
         // --- UUID (Binary format - 16 bytes) ---
@@ -378,27 +396,35 @@ fn writeArrayRecursive(
 }
 
 // Array element decoding
+/// ⚠️ Every fixed-width branch checks its length first. `data[0..4]` on a shorter slice
+/// is a bounds check in Debug and an **out-of-bounds read in ReleaseFast**, which is the
+/// mode this runs in — so a truncated or unexpected array element would read past the
+/// buffer rather than fail.
 fn elementToText(allocator: std.mem.Allocator, pg_oid: PgOid, data: []const u8) ![]u8 {
-    // const pgiod: PgOid = @enumFromInt(oid_int);
     switch (pg_oid) {
         .INT2 => {
+            if (data.len != 2) return error.InvalidDataLength;
             const v = std.mem.readInt(i16, data[0..2], .big);
             return std.fmt.allocPrint(allocator, "{}", .{v});
         },
         .INT4 => {
+            if (data.len != 4) return error.InvalidDataLength;
             const v = std.mem.readInt(i32, data[0..4], .big);
             return std.fmt.allocPrint(allocator, "{}", .{v});
         },
         .INT8 => {
+            if (data.len != 8) return error.InvalidDataLength;
             const v = std.mem.readInt(i64, data[0..8], .big);
             return std.fmt.allocPrint(allocator, "{}", .{v});
         },
         .FLOAT4 => {
+            if (data.len != 4) return error.InvalidDataLength;
             const bits = std.mem.readInt(u32, data[0..4], .big);
             const v: f32 = @bitCast(bits);
             return std.fmt.allocPrint(allocator, "{}", .{v});
         },
         .FLOAT8 => {
+            if (data.len != 8) return error.InvalidDataLength;
             const bits = std.mem.readInt(u64, data[0..8], .big);
             const v: f64 = @bitCast(bits);
             return std.fmt.allocPrint(allocator, "{}", .{v});
@@ -409,6 +435,7 @@ fn elementToText(allocator: std.mem.Allocator, pg_oid: PgOid, data: []const u8) 
             return formatBYTEA(allocator, data);
         },
         .UUID => {
+            if (data.len != 16) return error.InvalidDataLength;
             return try formatUUID(allocator, data);
         },
         else => return allocator.dupe(u8, data),
@@ -870,20 +897,23 @@ pub const Parser = struct {
     fn parseTupleData(self: *Parser) !TupleData {
         const num_columns = try self.readU16();
         const ncols: usize = @intCast(num_columns);
-        var cols_ptr = try self.allocator.alloc(ColumnValue, ncols);
-        var clean_cols: bool = true;
+        const cols_ptr = try self.allocator.alloc(ColumnValue, ncols);
 
-        defer {
-            if (clean_cols) {
-                // free each owned val that was allocated
-                for (cols_ptr[0..ncols]) |col| {
-                    switch (col) {
-                        .text, .binary => |data| self.allocator.free(data),
-                        .null, .unchanged => {},
-                    }
+        // Initialise before the errdefer can observe it: an early error would otherwise
+        // walk undefined memory deciding what to free.
+        @memset(cols_ptr, .null);
+
+        // `errdefer`, not `defer` + a "should I clean up?" flag. The flag version had to
+        // be flipped by hand on the success path, which is one edit away from freeing
+        // the tuple it just returned.
+        errdefer {
+            for (cols_ptr) |col| {
+                switch (col) {
+                    .text, .binary => |data| self.allocator.free(data),
+                    .null, .unchanged => {},
                 }
-                self.allocator.free(cols_ptr);
             }
+            self.allocator.free(cols_ptr);
         }
 
         var i: usize = 0;
@@ -898,9 +928,7 @@ pub const Parser = struct {
                 else => return error.UnknownColumnType,
             };
         }
-        // success path, do not deallocate cols_ptr
-        clean_cols = false;
-        return TupleData{ .cols = cols_ptr[0..ncols] };
+        return TupleData{ .cols = cols_ptr };
     }
 
     /// Read a single byte
@@ -1389,4 +1417,30 @@ test "decodeTuple - text columns bypass the OID decoder" {
     try std.testing.expectEqualStrings("a=>1", decoded.items[0].value.text);
     try std.testing.expect(decoded.items[1].value == .unchanged);
     try std.testing.expect(decoded.items[2].value == .null);
+}
+
+test "TIMESTAMPTZ keeps its Z, TIMESTAMP does not" {
+    const alloc = std.testing.allocator;
+
+    // 2025-10-26T10:00:00.000000 as microseconds since the 2000 epoch.
+    var buf: [8]u8 = undefined;
+    const micros: i64 = (1761472800 - 946684800) * 1_000_000;
+    std.mem.writeInt(i64, &buf, micros, .big);
+
+    const tz = try decodeBinColumnData(alloc, @intFromEnum(PgOid.TIMESTAMPTZ), &buf);
+    defer alloc.free(tz.text);
+    const naive = try decodeBinColumnData(alloc, @intFromEnum(PgOid.TIMESTAMP), &buf);
+    defer alloc.free(naive.text);
+
+    try std.testing.expectEqualStrings("2025-10-26T10:00:00.000000Z", tz.text);
+    // No suffix: the column carries no zone, so claiming UTC would be inventing one.
+    try std.testing.expectEqualStrings("2025-10-26T10:00:00.000000", naive.text);
+}
+
+test "elementToText refuses a truncated fixed-width element" {
+    // In ReleaseFast an unchecked data[0..4] reads past the buffer instead of failing.
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .INT4, &[_]u8{ 0, 1 }));
+    try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .INT8, &[_]u8{ 0, 1, 2, 3 }));
+    try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .UUID, &[_]u8{ 0, 1, 2 }));
 }

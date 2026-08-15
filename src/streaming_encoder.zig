@@ -28,7 +28,7 @@ pub const StreamingEncoder = struct {
         self.pos = new_pos;
     }
 
-    // ---- low-level write helpers (pub so pg_copy_csv can call writeByte) ----
+    // ---- low-level write helpers ----
 
     pub fn writeByte(self: *StreamingEncoder, byte: u8) !void {
         if (self.pos >= self.buffer.len) return error.NoSpaceLeft;
