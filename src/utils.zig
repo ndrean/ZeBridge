@@ -1,5 +1,6 @@
 //! Various utility functions
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// Cross-platform sleep (std.Thread.sleep removed in Zig 0.16 Juicy Main).
 pub fn sleep(nanoseconds: u64) void {
@@ -11,6 +12,41 @@ pub fn sleep(nanoseconds: u64) void {
 }
 
 /// Monotonic millisecond timestamp
+/// Monotonic nanoseconds. Same clock as getMilliTimestamp, finer resolution — for
+/// measuring intervals inside the WAL loop, never for wall-clock time.
+pub fn nanoTimestamp() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// CPU time this process has consumed, in nanoseconds (user + system).
+///
+/// From `getrusage(RUSAGE_SELF)` — POSIX, so no `/proc` parsing and no platform split.
+/// Exposed because "how busy is the bridge?" was otherwise only answerable with `htop`,
+/// where a single process is hard to isolate from the noise; as a counter it turns into
+/// cores-used with `rate(bridge_cpu_seconds_total[1m])` in Prometheus.
+pub fn cpuTimeNanos() u64 {
+    var usage: std.c.rusage = undefined;
+    if (std.c.getrusage(std.c.rusage.SELF, &usage) != 0) return 0;
+
+    const user_ns = @as(u64, @intCast(usage.utime.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(usage.utime.usec)) * std.time.ns_per_us;
+    const sys_ns = @as(u64, @intCast(usage.stime.sec)) * std.time.ns_per_s +
+        @as(u64, @intCast(usage.stime.usec)) * std.time.ns_per_us;
+    return user_ns + sys_ns;
+}
+
+/// Peak resident set size in bytes. `ru_maxrss` is **bytes on Darwin and kilobytes on
+/// Linux** — one of the few genuinely divergent POSIX fields, so it is normalised here
+/// rather than at each call site.
+pub fn maxRssBytes() u64 {
+    var usage: std.c.rusage = undefined;
+    if (std.c.getrusage(std.c.rusage.SELF, &usage) != 0) return 0;
+    const raw: u64 = @intCast(@max(usage.maxrss, 0));
+    return if (builtin.os.tag == .linux) raw * 1024 else raw;
+}
+
 pub fn getMilliTimestamp() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);

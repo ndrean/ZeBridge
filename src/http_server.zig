@@ -187,6 +187,7 @@ pub const Server = struct {
     }
 
     fn handleStatus(self: *Server, fd: c_int) !void {
+        const status_cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
             const snap = try m.snapshot(self.allocator);
             defer self.allocator.free(snap.current_lsn_str);
@@ -206,6 +207,8 @@ pub const Server = struct {
                 \\  "wal_lag_bytes": {d},
                 \\  "wal_lag_mb": {d},
                 \\  "wal_confirmed_lag_bytes": {d},
+                \\  "cpu_seconds": {d}.{d:0>3},
+                \\  "max_rss_mb": {d},
                 \\  "queue_usage_percent": {d},
                 \\  "refused_tables": {d},
                 \\  "refused_events_dropped": {d}
@@ -223,6 +226,9 @@ pub const Server = struct {
                 snap.wal_lag_bytes,
                 snap.wal_lag_bytes / (1024 * 1024),
                 snap.wal_confirmed_lag_bytes,
+                status_cpu_ns / std.time.ns_per_s,
+                (status_cpu_ns % std.time.ns_per_s) / std.time.ns_per_ms,
+                utils.maxRssBytes() / (1024 * 1024),
                 snap.queue_usage_percent,
                 if (self.refused) |r| r.refused_count.load(.acquire) else 0,
                 if (self.refused) |r| r.dropped_total.load(.acquire) else 0,
@@ -235,6 +241,8 @@ pub const Server = struct {
     }
 
     fn handleMetrics(self: *Server, fd: c_int) !void {
+        // Read once: two getrusage calls would report two different instants.
+        const cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
             const snap = try m.snapshot(self.allocator);
             defer self.allocator.free(snap.current_lsn_str);
@@ -285,6 +293,14 @@ pub const Server = struct {
                 \\# TYPE bridge_queue_usage_percent gauge
                 \\bridge_queue_usage_percent {d}
                 \\
+                \\# HELP bridge_cpu_seconds_total CPU time consumed by the bridge process (user + system)
+                \\# TYPE bridge_cpu_seconds_total counter
+                \\bridge_cpu_seconds_total {d}.{d:0>3}
+                \\
+                \\# HELP bridge_max_rss_bytes Peak resident set size of the bridge process
+                \\# TYPE bridge_max_rss_bytes gauge
+                \\bridge_max_rss_bytes {d}
+                \\
             , .{
                 snap.uptime_seconds,
                 snap.wal_messages_received,
@@ -297,6 +313,9 @@ pub const Server = struct {
                 snap.wal_lag_bytes,
                 snap.wal_confirmed_lag_bytes,
                 snap.queue_usage_percent,
+                cpu_ns / std.time.ns_per_s,
+                (cpu_ns % std.time.ns_per_s) / std.time.ns_per_ms,
+                utils.maxRssBytes(),
             });
 
             // Appended rather than folded into the format string: the registry owns its

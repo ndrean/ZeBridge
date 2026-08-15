@@ -14,8 +14,8 @@ defmodule Emitter.Application do
     case Supervisor.start_link(children, opts) do
       {:ok, pid} ->
         # Run migrations on the active Repo connection pool
-        path = Ecto.Migrator.migrations_path(Emitter.Producer.Repo)
-        Ecto.Migrator.run(Emitter.Producer.Repo, path, :up, all: true) |> dbg()
+        # path = Ecto.Migrator.migrations_path(Emitter.Producer.Repo)
+        # Ecto.Migrator.run(Emitter.Producer.Repo, path, :up, all: true) |> dbg()
 
         # Notify the Zig bridge via NATS
         {:ok, _gnat} =

@@ -540,6 +540,19 @@ pub fn main(init: std.process.Init) !void {
 
     // Main loop iteration counter for periodic background tasks (e.g. time-based ACKs)
     var loop_iterations: u32 = 0;
+
+    // ---- WAL loop profile, reset every metrics interval -----------------------
+    // The queue-usage gauge tells you whether the *flush* side is backed up; nothing
+    // told you where the *reading* side spends its time. These four do, and they are
+    // what separates "CPU-bound decoding" from "sleeping between messages".
+    var prof_iters: u64 = 0; // outer loop iterations
+    var prof_idle: u64 = 0; // iterations where PQgetCopyData had nothing
+    var prof_recv_ns: u64 = 0; // time inside receiveMessage (libpq + parse)
+    var prof_proc_ns: u64 = 0; // time turning a message into ring-buffer slots
+    // Process CPU at the last report, so the log can print a percentage rather than a
+    // total. Covers every thread, not just this loop — `cpu=250%` means 2.5 cores busy.
+    var prof_cpu_ns: u64 = utils.cpuTimeNanos();
+    var prof_wall_ms: i64 = utils.getMilliTimestamp();
     // --->
 
     // Per-transaction slot scratchpad: holds ring-buffer indices for the current
@@ -614,6 +627,28 @@ pub fn main(init: std.process.Init) !void {
             // wonders where the rows went. Repeat it with the running drop count.
             refused.logStatus();
 
+            // Per-interval loop profile. `idle` counts iterations that found nothing and
+            // therefore slept 1ms: if it dominates `iters`, the reader is waiting, not
+            // working, and throughput is capped by the sleep rather than by decoding.
+            const cpu_now = utils.cpuTimeNanos();
+            const wall_now = utils.getMilliTimestamp();
+            const wall_delta_ms: u64 = @intCast(@max(wall_now - prof_wall_ms, 1));
+            const cpu_pct = (cpu_now -| prof_cpu_ns) / std.time.ns_per_ms * 100 / wall_delta_ms;
+
+            log.info("LOOP iters={d} idle={d} recv_ms={d} proc_ms={d} cpu={d}%", .{
+                prof_iters,
+                prof_idle,
+                prof_recv_ns / std.time.ns_per_ms,
+                prof_proc_ns / std.time.ns_per_ms,
+                cpu_pct,
+            });
+            prof_iters = 0;
+            prof_idle = 0;
+            prof_recv_ns = 0;
+            prof_proc_ns = 0;
+            prof_cpu_ns = cpu_now;
+            prof_wall_ms = wall_now;
+
             log.info("METRICS uptime={d} wal_messages={d} cdc_events={d} lsn={s} connected={d} pg_reconnects={d} nats_reconnects={d} lag_bytes={d} slot_active={d}", .{
                 snap.uptime_seconds,
                 snap.wal_messages_received,
@@ -638,8 +673,14 @@ pub fn main(init: std.process.Init) !void {
         // Zero-allocation ring buffer: no need to reclaim events!
         // Slots are automatically returned to free_slots queue by flush thread
 
+        prof_iters += 1;
+        const t_recv0 = utils.nanoTimestamp();
         if (pg_stream.receiveMessage()) |maybe_msg| {
+            prof_recv_ns += utils.nanoTimestamp() - t_recv0;
             if (maybe_msg) |wal_msg_val| {
+                const t_proc0 = utils.nanoTimestamp();
+                defer prof_proc_ns += utils.nanoTimestamp() - t_proc0;
+
                 var wal_msg = wal_msg_val;
                 defer wal_msg.deinit(allocator);
 
@@ -853,6 +894,7 @@ pub fn main(init: std.process.Init) !void {
             } else {
                 // No message available - idle path
                 // Sleep 1 ms first to avoid busy-waiting and increase throughput
+                prof_idle += 1;
                 utils.sleep(1 * std.time.ns_per_ms);
             }
         } else |err| {

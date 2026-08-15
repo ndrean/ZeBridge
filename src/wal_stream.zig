@@ -21,6 +21,11 @@ pub const ReplicationStream = struct {
     allocator: std.mem.Allocator,
     config: StreamConfig,
     conn: ?*c.PGconn = null,
+    /// Whether libpq's input buffer has been drained and needs a socket read.
+    ///
+    /// Starts true so the first call reads. See `receiveMessage` for why calling
+    /// PQconsumeInput per message is quadratic.
+    needs_input: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, config: StreamConfig) ReplicationStream {
         return .{
@@ -90,18 +95,32 @@ pub const ReplicationStream = struct {
         log.info("✅ Replication started successfully", .{});
     }
 
-    /// Receive one WAL message from the stream
+    /// Receive one WAL message from the stream.
+    ///
+    /// ⚠️ `PQconsumeInput` is called **only when libpq's buffer is empty**, not on every
+    /// message. This is the difference between linear and quadratic.
+    ///
+    /// `PQconsumeInput` → `pqReadData` slides the unread remainder of `conn->inBuffer`
+    /// back to the front of the buffer. During a burst that buffer holds megabytes of
+    /// WAL, so calling it once per message memmoves the whole backlog per message:
+    /// O(backlog) each, O(n²) overall. Measured on a 400k-row burst, the loop spent
+    /// **99.2% of its time here** (`recv_ms=14884` of 15000, `proc_ms=112`) and pinned a
+    /// core at 100% while decoding barely registered.
+    ///
+    /// The libpq idiom is: consume once, then call `PQgetCopyData` repeatedly until it
+    /// returns 0. `needs_input` implements exactly that across calls.
     pub fn receiveMessage(self: *ReplicationStream) !?WalMessage {
         if (self.conn == null) {
             return error.NotConnected;
         }
 
-        // First, consume any input waiting on the socket
-        // This reads data from the network into libpq's internal buffer
-        if (c.PQconsumeInput(self.conn) == 0) {
-            const err_msg = c.PQerrorMessage(self.conn);
-            log.err("🔴 PQconsumeInput error: {s}", .{err_msg});
-            return error.ConsumeInputFailed;
+        if (self.needs_input) {
+            if (c.PQconsumeInput(self.conn) == 0) {
+                const err_msg = c.PQerrorMessage(self.conn);
+                log.err("🔴 PQconsumeInput error: {s}", .{err_msg});
+                return error.ConsumeInputFailed;
+            }
+            self.needs_input = false;
         }
 
         var buffer: [*c]u8 = undefined;
@@ -119,7 +138,8 @@ pub const ReplicationStream = struct {
             // Parse the message
             return try self.parseWalData(data);
         } else if (result == 0) {
-            // No data available yet
+            // Buffer exhausted: the next call must read from the socket again.
+            self.needs_input = true;
             return null;
         } else if (result == -1) {
             // End of copy stream

@@ -327,9 +327,61 @@ The KV payload sizes make the transitions readable without decoding anything:
 
 ---
 
+## I. Burst throughput — runnable now ✅ verified
+
+**Not a trickle.** Every load test before 2026-08-15 paced small transactions
+(`Produce.stream(5, 1000, 10)` = 10 rows per transaction every 5 ms), and every one of
+them passed while a **quadratic bug in the WAL reader** capped bursts at ~1.2k msg/s.
+The bug was invisible at a trickle by construction: its cost is proportional to how many
+unread bytes sit in libpq's buffer, and a bridge that keeps up never accumulates any.
+
+So this group exists to test the property a CDC bridge is actually for: **surviving a
+burst it cannot keep up with**, and draining it afterwards.
+
+| # | action | expect |
+| --- | --- | --- |
+| I1 | build `ReleaseFast` (`zig build -Doptimize=ReleaseFast`) | a Debug build is several times slower and will muddy every number below |
+| I2 | 2000 × 1000-row `INSERT` in separate transactions (2M rows, see README "Measured throughput") | PostgreSQL absorbs it in ~6 s |
+| I3 | watch the `LOOP` line while it drains | `idle` **falls toward 0** and `recv_ms` stays *small*; `cpu` well under 100%. ⭐ `recv_ms` climbing toward the 15 000 ms interval with `idle=0` and `cpu≈100%` is the failure signature |
+| I4 | watch `cdc_events` in `METRICS` | reaches 2 000 000; on an M2 Pro, under 20 s from bridge start |
+| I5 | `nats stream info CDC` | message count consistent with the batches; no publish errors in the log |
+| I6 | after the drain | `idle` returns to ~11 900 per interval (the loop sleeps 1 ms when there is nothing to read) and `bridge_wal_confirmed_lag_bytes` falls back to ~0 |
+
+**I3 is the whole point.** The other rows can pass while the bridge is 300× too slow —
+`cdc_events` still climbs, `queue_usage_percent` still reads 0% (that gauge watches the
+*flush* side, and the flush side was never the problem), and nothing errors. Only the
+split between `recv_ms` and `proc_ms` distinguishes "reading is the bottleneck" from
+"decoding is the bottleneck", which is why the numbers exist.
+
+Reference figures from the run that fixed it — same machine, same load, only
+`wal_stream.zig` changed:
+
+| | before | after |
+| --- | --- | --- |
+| `recv_ms` / 15 000 | 14 884 (99.2%) | 130 (0.9%) |
+| `proc_ms` | 112 | 1 191 |
+| `idle` | 0 | 10 790 |
+| throughput | ~1.2k msg/s | ~1.44M events in the first interval |
+| bridge CPU (`cpu=` on the LOOP line) | 100% of a core | 31% while draining, 3% at rest |
+
+### Variants worth running once
+
+- **`REPLICA IDENTITY FULL`** on the burst table: every UPDATE then carries an old tuple
+  as well, roughly doubling decode volume. `proc_ms` should rise, `recv_ms` should not.
+- **Wide rows** — a `jsonb` document or a long `text` column per row, still under
+  `BASE_BUF`. This moves the load from framing into decoding and encoding.
+- **A row over `BASE_BUF`** mid-burst: the table must suspend (`row_too_large`, §H) and
+  every *other* table must keep draining.
+- **NATS stopped mid-burst**: the ring buffer fills, `queue_usage_percent` climbs to
+  100%, the WAL loop back-pressures, and PostgreSQL retains WAL. On restart it must
+  drain rather than lose events — this is the only test that exercises the buffer's
+  actual purpose.
+
+---
+
 ## Order
 
-1. **A + E + H now** — they need no client work and cover the paths already built.
+1. **A + E + H + I now** — they need no client work and cover the paths already built.
 2. **C1, C2 now** via the CLI — bridge-side caching.
 3. **Then D (client)**, and B, C3, C4, D2 become runnable.
 

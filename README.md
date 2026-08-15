@@ -8,7 +8,11 @@ A lightweight **stateless** opinionated bidirectional daemon connecting PostgreS
 
 Allows mobile, WASM (PGLite/SQLite), and web apps to mirror PostgreSQL tables over WSS or TLS via NATS/JetStream without ever reaching for PostgreSQL.
 
-This _single threaded_ binary processes ~50k+ evt/s.
+This _single threaded_ binary drained **2,000,000 CDC events in under 20 s** end to end
+(PostgreSQL → NATS JetStream) in the burst benchmark below — ~100k events/s including
+the time PostgreSQL itself needed to write them, and ~260k events/s while the WAL loop
+was actually busy. See [Measured throughput](#measured-throughput) for the method, and
+run it yourself before trusting it.
 
 By pushing all state, caching, and rate-limiting down into NATS JetStream, the ZeBridge binary has total amnesia.
 Furthermore, ZeBridge exposes a raw, standard protocol rather than requiring a proprietary SDK.
@@ -138,10 +142,10 @@ You can divide the workload per PostgreSQL instance, and attach bridge instances
 A bridge is connected by default to the NATS server (which also clusters).
 
 ```bash
-# Bridge 1: 60K events/s for table "users" with publication "my_pub_1" on master
+# Bridge 1: table "users" with publication "my_pub_1" on master
 PG_HOST=localhost ./bridge --slot slot_1 --pub my_pub_1 --port 9090
 
-# Bridge 2: Another 60K events/s for table "orders" with publication "my_pub_2" on replica_1
+# Bridge 2: table "orders" with publication "my_pub_2" on replica_1
 PG_HOST=replica_1 ./bridge --slot slot_2 --pub my_pub_2 --port 9091
 ```
 
@@ -778,6 +782,8 @@ bridge_slot_active 1
 bridge_wal_lag_bytes 51344
 bridge_wal_confirmed_lag_bytes 2048
 bridge_queue_usage_percent 0
+bridge_cpu_seconds_total 7.600
+bridge_max_rss_bytes 1526153216
 bridge_refused_tables 0
 bridge_refused_events_dropped_total 0
 ```
@@ -802,6 +808,15 @@ one for "the bridge is stuck", on the retained one for "the disk will fill".
 `bridge_queue_usage_percent` is the ring buffer's fill level: sustained high values mean
 NATS is not draining as fast as PostgreSQL produces, and the bridge is about to
 back-pressure the WAL reader.
+
+**How busy is the bridge?** `bridge_cpu_seconds_total` is a counter over all threads, so
+`rate(bridge_cpu_seconds_total[1m])` gives cores used — `0.31` is a third of a core,
+`1.0` is one core saturated, and a single-threaded reader that pins a whole core is
+telling you it is the bottleneck. The same figure appears in the log as `cpu=31%` on
+each `LOOP` line, which beats trying to isolate one process in `htop`.
+`bridge_max_rss_bytes` is peak RSS: expect it to sit near
+`2^BASE_BUF × RING_BUFFER_COUNT` plus ~400 MB of metadata, since the slab is
+pre-allocated at startup rather than grown.
 
 Configure Prometheus to scrape this endpoint:
 
@@ -832,6 +847,8 @@ Returns bridge status as JSON:
   "wal_lag_bytes": 51344,
   "wal_lag_mb": 0,
   "wal_confirmed_lag_bytes": 2048,
+  "cpu_seconds": 7.600,
+  "max_rss_mb": 1455,
   "queue_usage_percent": 0,
   "refused_tables": 0,
   "refused_events_dropped": 0
@@ -1066,7 +1083,7 @@ ZeBridge uses a **NATS JetStream Limits Retention** policy (`--max-age=1m`, `--m
 NATS goes down at T=0
 ├─ Main thread continues reading WAL → pushes to queue
 ├─ Flush thread can't publish → queue fills up
-├─ Queue fills (65536 slots) → ~1s buffer at 60K events/s
+├─ Queue fills (65536 slots) → ~1s buffer at 60K events/s (see Measured throughput)
 ├─ Queue full → Main thread backs off (sleeps 1ms per attempt)
 ├─ PostgreSQL WAL starts accumulating (controlled)
 │
@@ -1321,6 +1338,76 @@ of the replicated table and replicating a reference to it.
 
 ## Testing
 
+### Measured throughput
+
+⚠️ Every number here comes from one run on one laptop. It is published with its method
+so you can reproduce or refute it — an unmeasured benchmark figure is worse than none,
+which this project learned the hard way (a "~50k evt/s" line sat in this README for
+months while a quadratic bug in the WAL reader capped bursts at ~1.2k msg/s).
+
+**Method**
+
+| | |
+| --- | --- |
+| machine | Apple M2 Pro, 10 cores, macOS |
+| build | `zig build -Doptimize=ReleaseFast` — a Debug build is several times slower |
+| PostgreSQL | 18.4 in Docker on the same machine |
+| NATS | JetStream, file storage, in Docker on the same machine, **no consumers attached** |
+| bridge | one instance, `BASE_BUF=14` (16 KB/event), `RING_BUFFER_COUNT=65536`, MessagePack |
+| table | `users` — 4 small columns, single-column PK, `REPLICA IDENTITY DEFAULT` |
+| load | 2000 statements × a 1000-row `INSERT … SELECT … generate_series`, each its own transaction = **2,000,000 rows** |
+
+```bash
+python3 -c "
+for i in range(2000):
+    print(\"INSERT INTO public.users (name,email,inserted_at,updated_at) \"
+          \"SELECT 'User-%d-'||i, 'u%d-'||i||'@e.com', now(), now() \"
+          \"FROM generate_series(1,1000) i;\" % (i,i))
+" > load.sql
+docker exec -i postgres-primary psql -U postgres -q -f - < load.sql
+```
+
+**Result**
+
+```txt
+LOOP iters=1407805 idle=10274 recv_ms=139 proc_ms=1494 cpu=31%
+METRICS uptime=15 wal_messages=1443766 cdc_events=1440690 …
+LOOP iters=618169  idle=11431 recv_ms=90  proc_ms=616  cpu=16%
+METRICS uptime=30 wal_messages=2004279 cdc_events=2000000 …
+```
+
+| measure | value |
+| --- | --- |
+| PostgreSQL writing 2M rows | ~6 s |
+| all 2M events in JetStream | under 20 s from bridge start |
+| end-to-end, producer included | **~100k events/s** |
+| WAL loop busy time (`15 − idle`) | ~7.6 s → **~260k events/s** while draining |
+| time inside libpq (`recv_ms`) | 0.9% of the interval |
+| time decoding + packing (`proc_ms`) | 7.9% |
+| CPU while draining | **31% of one core** (`bridge_cpu_seconds_total` rose 7.6 s in total) |
+
+**This benchmark is producer-bound**: PostgreSQL needs 6 s to write what the bridge
+drains in 7.6 s of loop time, and the loop is idle ~72% of the first interval. The
+ceiling is higher than 260k; finding it needs a producer that is not the bottleneck.
+
+**What it does not measure**: wide rows, `jsonb`/array-heavy tables, `REPLICA IDENTITY
+FULL` (which doubles tuple volume), a remote PostgreSQL or NATS, consumers reading
+concurrently, or a NATS server under back-pressure. Each of those moves the number.
+
+**Reading the `LOOP` line.** It is emitted next to `METRICS` every 15 s and is what
+makes this diagnosable at all:
+
+| field | meaning |
+| --- | --- |
+| `iters` | WAL loop iterations in the interval |
+| `idle` | iterations that found nothing and slept 1 ms — high `idle` means the bridge is waiting for PostgreSQL, not struggling |
+| `recv_ms` | milliseconds inside `receiveMessage` (libpq + framing) |
+| `proc_ms` | milliseconds decoding tuples and packing them into the ring buffer |
+| `cpu` | process CPU over the interval, all threads — `100%` is one core saturated |
+
+`recv_ms` approaching the interval length with `idle=0` is the signature of a reader
+that cannot drain its socket — the exact shape of the bug fixed in `wal_stream.zig`.
+
 ### End-to-End CDC Pipeline Test
 
 **Terminal 1 - Start the bridge**:
@@ -1410,7 +1497,9 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 
 **Open questions:**:
 
-* Can we reach 100K+ events/s per instance with more CPU or further optimizations?
+* The burst benchmark is producer-bound: PostgreSQL needs ~6 s to write the 2M rows the
+  bridge then drains in ~7.6 s of loop time. Where is the ceiling when the producer is
+  not the limit — a pre-filled WAL, or several emitters?
 
 **Contributions welcome!** If you find it useful (or find gaps), feedback is valuable.
 
