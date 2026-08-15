@@ -27,11 +27,21 @@ scenario size. Bring the stack up with
 nats-config-gen nats-server nats-init bridge-init`, then run the bridge from the host
 with `.env` plus `PG_PORT=55432`.
 
+**Also landed 2026-08-15, after §E:** the oversized-row `@panic` is gone. A row that
+does not fit the per-event buffer now suspends its table (`reason: "row_too_large"`)
+instead of killing the process — panic was a poison pill, since the row precedes any
+later ACK, so a supervised restart re-read it and panicked again with every other table
+stopped. The bridge also now reads `max_payload` from the NATS server's INFO line and
+warns at boot if `BASE_BUF` cannot fit inside it. README has the sizing formula.
+
 **Work, in order:**
 
-1. **CDC type guard** — §E below. Full design is written; the first move is the *check*
-   at the end of §E (does the tuple decoder branch on pgoutput's per-column format
-   byte?), because the answer changes the shape of the fix.
+1. **Delete the CSV path.** `pg_copy_csv.zig` now has no live caller — `snapshot_listener`
+   imports it without using it, and `bridge.zig` imports it only for test discovery. The
+   rollout gate (a consumer rebuilding a table from a binary snapshot) is met: the
+   web-consumer applies `init.snap.<table>.<id>.>` chunks. Confirm once live, then delete
+   it along with `getTablePrimaryKey` and `PkMetadata`, which have been dead since
+   pagination started resolving the key from `getTableColumns`.
 2. **Client item D** — LSN persistence, JetStream consumer with `ByStartSequence`,
    snapshot application. Unblocks TEST_SCENARIOS **B**, **C3**, **C4**, **D2**, lets
    **F6** end in a re-seed instead of a caveat, and is the gate on deleting the CSV path.
@@ -380,7 +390,7 @@ reconstructing both.
 
 ---
 
-# E. CDC type guard — carry `typtype` on the DDL event (not started)
+# E. CDC type guard — ✅ DONE (2026-08-15), verified live
 
 ## The gap
 
@@ -404,7 +414,7 @@ and a blocking `pg_type` query there is exactly what we avoided elsewhere.
 catalog access, so the type facts are free at the point they are produced. Add them to
 `schema_def` and the bridge never queries at runtime.
 
-## Design
+## Design (as built)
 
 1. **`init.sql.template`** — add `oid` and `typtype` per column to the `schema_def`
    JSON the event trigger builds.
@@ -433,21 +443,51 @@ catalog access, so the type facts are free at the point they are produced. Add t
    text. The current fallback is the open version of exactly this, and it is what
    shipped hstore bytes as a string.
 
-6. **Failure action: suspend the table.** Reuse `refused_tables` — it already implements
-   freeze-don't-drop, and the client already handles the signal. Needs a second reason
-   string beside `no_primary_key`, e.g. `unsupported_column_type`, carrying the column
-   name so the operator knows what to change. "This table has a column I cannot decode"
-   is the same shape of problem as "this table has no key".
+6. **Failure action: suspend the table.** Reuses `refused_tables`. The reason is now a
+   `Reason` enum whose `@tagName` *is* the wire string, so the log line, the KV
+   suspension payload and the code cannot drift into three spellings; each carries a
+   `fixHint`. The suspension is published **in place of** the offending mutation, which
+   keeps stream ordering and tells the client the exact LSN where its data stops being
+   complete. Only the first event pays for this — after that `refused.shouldDrop`
+   filters the table before the decoder sees it.
 
-## Check first
+## Verified live
 
-Whether the tuple decoder branches on pgoutput's per-column format byte (`n` null,
-`u` unchanged-toast, `t` text, `b` binary) at all. If it assumes binary for everything,
-that is an independent bug underneath this one and changes what the fix looks like.
+- `enum_only(id, feeling mood)` → `cdc.enum_only.insert` with `feeling: "happy"`: an
+  enum passes through as its label.
+- `exotic(id, feeling mood, attrs hstore)` → no CDC event; instead
+  `$KV.schemas.exotic` =
+  `{"table":"exotic","suspended":true,"reason":"unsupported_column_type","lsn":…}`.
+- `ALTER TABLE exotic DROP COLUMN attrs` → `✅ 'exotic' is no longer refused
+  (unsupported_column_type resolved)` and a live schema republished, no restart.
+- TOAST: a 5 000-char `EXTERNAL` column, updated *around* → payload keys are `id, n`
+  only; updated *directly* → the full value; inserted as SQL NULL → `"big": null`. All
+  three distinguishable, which was the whole point.
 
-Note the format byte is *not* the discriminator we need: `hstore` has `hstore_send` and
-`mood` has `enum_send`, so both arrive as `b`. It tells you the encoding, not whether we
-can decode it.
+## What the check found — and it did change the fix
+
+`parseTupleData` **read** the format byte and threw it away: `'t'` and `'b'` took
+identical branches, and `'n'` and `'u'` both became `null`. Two independent bugs sat
+underneath the type guard:
+
+1. **Text-format columns were decoded as binary.** Postgres falls back to text per
+   column even under `binary 'true'` whenever a type has no `typsend`. Those bytes went
+   through `decodeBinColumnData` anyway.
+2. **Unchanged TOAST was delivered as NULL.** `'u'` means "this UPDATE did not touch a
+   TOASTed value, so no bytes were sent". Collapsed to `null`, every client applying the
+   event **erased a large column PostgreSQL never modified**. Live for any value past
+   the TOAST threshold — the bigger the column, the more certain the loss.
+
+So `TupleData.cols` is now `[]ColumnValue`, a union of `null` / `unchanged` / `text` /
+`binary`, and the distinction lives in the type rather than in a comment.
+
+- `.text` → passed through verbatim. Needs no OID knowledge, so it cannot be corrupted
+  by lacking any.
+- `.unchanged` → encoded by **omitting the column from the payload**, which is exactly
+  what Postgres is saying. The reference client already applies only the keys present
+  (`INSERT … ON CONFLICT DO UPDATE SET` over `Object.keys(data)`), so it was fixed by
+  the bridge telling the truth. Documented in PROTOCOL.md §4.
+- `.binary` → the type guard below.
 
 ---
 

@@ -328,6 +328,9 @@ pub fn renderValue(
 ) !?[]const u8 {
     return switch (value) {
         .null => null,
+        // Only logical replication can produce this: `COPY` reads the current row, so
+        // every value is present. Reaching here means a decoder was fed a CDC tuple.
+        .unchanged => error.UnchangedValueInSnapshot,
         // "t"/"f" matches what Postgres itself writes for a boolean in text output, so
         // consumers that already parse the CSV snapshots keep working.
         .boolean => |b| if (b) "t" else "f",

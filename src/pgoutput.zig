@@ -1,5 +1,6 @@
 //! Parser for PostgreSQL logical replication protocol
 const std = @import("std");
+const type_registry = @import("type_registry.zig");
 const array_mod = @import("array.zig");
 const ArrayResult = array_mod.ArrayResult;
 const ArrayElement = array_mod.ArrayElement;
@@ -44,6 +45,12 @@ pub const CommitMessage = struct {
 /// Decoded column value representation
 pub const DecodedValue = union(enum) {
     null,
+    /// pgoutput's `'u'`: a TOASTed value this UPDATE did not modify, so Postgres sent
+    /// no bytes for it. **Not a NULL** — the row still holds the old value. Conflating
+    /// the two (as this code did) tells a client to overwrite a large text/jsonb column
+    /// with NULL every time an unrelated column changes. Encoded by *omitting* the
+    /// column from the payload map, which is the same thing Postgres is saying.
+    unchanged,
     boolean: bool,
     int32: i32,
     int64: i64,
@@ -68,6 +75,7 @@ pub const ValueTag = enum(u8) {
     jsonb = 7,
     array = 8,
     bytea = 9,
+    unchanged = 10,
 };
 
 /// Decoded column (name + value pair)
@@ -440,23 +448,49 @@ fn formatUUID(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     return res;
 }
 
+/// One column as it arrived on the wire, keeping pgoutput's per-column format byte.
+///
+/// The parser used to collapse this to `?[]u8`: `'t'` and `'b'` took identical branches
+/// and `'n'`/`'u'` both became `null`. Both losses were silent corruption downstream —
+/// text bytes decoded as if binary, and unchanged TOAST values delivered as NULL — so
+/// the distinction is now in the type rather than in a comment.
+pub const ColumnValue = union(enum) {
+    /// `'n'` — SQL NULL.
+    null,
+    /// `'u'` — TOASTed and unmodified by this UPDATE; no bytes were sent.
+    unchanged,
+    /// `'t'` — text format. Postgres falls back to this per column even under
+    /// `binary 'true'` when the type has no `typsend`, so it is not a rare path.
+    text: []u8,
+    /// `'b'` — binary format, to be decoded against the column's type OID.
+    binary: []u8,
+};
+
 pub const TupleData = struct {
-    cols: []?[]u8,
+    cols: []ColumnValue,
 
     pub fn deinit(self: *TupleData, allocator: std.mem.Allocator) void {
         for (self.cols) |col| {
-            if (col) |data| {
-                allocator.free(data);
+            switch (col) {
+                .text, .binary => |data| allocator.free(data),
+                .null, .unchanged => {},
             }
         }
         allocator.free(self.cols);
     }
 };
 
+/// Decode one CDC tuple.
+///
+/// `type_guard` decides what to do with a type the decoder's OID switch does not cover.
+/// Passing null keeps the old "treat unknown as text" behaviour and is only for tests —
+/// the live path must supply a registry, because that fallback is silent corruption for
+/// anything that is not an enum (see type_registry.zig).
 pub fn decodeTuple(
     allocator: std.mem.Allocator,
     tuple: TupleData,
     columns: []const RelationMessage.ColumnInfo,
+    type_guard: ?*type_registry.Registry,
 ) !std.ArrayList(Column) {
     if (tuple.cols.len != columns.len) return error.ColumnMismatch;
 
@@ -467,28 +501,38 @@ pub fn decodeTuple(
     try decoded_columns.ensureTotalCapacity(allocator, columns.len);
 
     for (columns, tuple.cols) |col_info, col_data| {
-        if (col_data) |raw_bytes| {
-            // Log raw text value for debugging
-            log.debug("Column '{s}' (OID={d}): '{s}'", .{ col_info.name, col_info.type_id, raw_bytes });
+        // Column name points to RelationMessage which has stable lifetime
+        // No need to duplicate - it lives for the entire relation cache
+        const value: DecodedValue = switch (col_data) {
+            .null => .null,
+            .unchanged => .unchanged,
+            // Already text, whatever the type is. Postgres sends `'t'` when the type
+            // has no binary send function, and its text output is exactly what a
+            // consumer wants — so this needs no OID knowledge and cannot be corrupted
+            // by lacking it.
+            .text => |raw_bytes| .{ .text = try allocator.dupe(u8, raw_bytes) },
+            .binary => |raw_bytes| blk: {
+                if (type_guard) |guard| switch (guard.verdict(col_info.type_id)) {
+                    .decode => {},
+                    // Postgres sends an enum's label, so the bytes already are the text.
+                    .text_passthrough => break :blk DecodedValue{ .text = try allocator.dupe(u8, raw_bytes) },
+                    .refuse => {
+                        log.err(
+                            "🔴 column '{s}' has type OID {d}, which the decoder does not implement and is not an enum — refusing rather than shipping its raw binary as a string",
+                            .{ col_info.name, col_info.type_id },
+                        );
+                        return error.UnsupportedColumnType;
+                    },
+                };
 
-            const decoded_value = decodeBinColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
-                log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
-                return err;
-            };
-            // Column name points to RelationMessage which has stable lifetime
-            // No need to duplicate - it lives for the entire relation cache
-            decoded_columns.appendAssumeCapacity(Column{
-                .name = col_info.name,
-                .value = decoded_value,
-            });
-        } else {
-            // Handle NULL values
-            log.debug("Column '{s}' is NULL", .{col_info.name});
-            decoded_columns.appendAssumeCapacity(Column{
-                .name = col_info.name,
-                .value = .null,
-            });
-        }
+                break :blk decodeBinColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
+                    log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
+                    return err;
+                };
+            },
+        };
+
+        decoded_columns.appendAssumeCapacity(Column{ .name = col_info.name, .value = value });
     }
     return decoded_columns;
 }
@@ -826,15 +870,17 @@ pub const Parser = struct {
     fn parseTupleData(self: *Parser) !TupleData {
         const num_columns = try self.readU16();
         const ncols: usize = @intCast(num_columns);
-        var cols_ptr = try self.allocator.alloc(?[]u8, ncols);
-        // errdefer self.allocator.free(cols_ptr);
+        var cols_ptr = try self.allocator.alloc(ColumnValue, ncols);
         var clean_cols: bool = true;
 
         defer {
             if (clean_cols) {
                 // free each owned val that was allocated
                 for (cols_ptr[0..ncols]) |col| {
-                    if (col) |c| self.allocator.free(c);
+                    switch (col) {
+                        .text, .binary => |data| self.allocator.free(data),
+                        .null, .unchanged => {},
+                    }
                 }
                 self.allocator.free(cols_ptr);
             }
@@ -843,30 +889,14 @@ pub const Parser = struct {
         var i: usize = 0;
         while (i < ncols) : (i += 1) {
             const kind_byte = try self.readU8();
-            switch (kind_byte) {
-                'n' => {
-                    cols_ptr[i] = null;
-                },
-                'u' => {
-                    cols_ptr[i] = null;
-                },
-                't' => {
-                    // text format
-                    const len = try self.readU32();
-                    const owned = try self.readBytesOwned(len);
-                    cols_ptr[i] = owned;
-                },
-                'b' => {
-                    // binary format
-                    const len = try self.readU32();
-                    const owned = try self.readBytesOwned(len);
-                    cols_ptr[i] = owned;
-                },
-                else => {
-                    // unknown marker
-                    return error.UnknownColumnType;
-                },
-            }
+            cols_ptr[i] = switch (kind_byte) {
+                'n' => .null,
+                // Distinct from NULL: the value exists, Postgres just did not resend it.
+                'u' => .unchanged,
+                't' => .{ .text = try self.readBytesOwned(try self.readU32()) },
+                'b' => .{ .binary = try self.readBytesOwned(try self.readU32()) },
+                else => return error.UnknownColumnType,
+            };
         }
         // success path, do not deallocate cols_ptr
         clean_cols = false;
@@ -1256,4 +1286,107 @@ test "UUID array → {uuid1,uuid2}" {
         "{00010203-0405-0607-0809-aabbccddeeff,10203040-5060-7080-90a0-b0c0d0e0f0ff}",
         out,
     );
+}
+
+// ---------------------------------------------------------------------------
+// TupleData framing — the per-column format byte.
+//
+// These pin the two distinctions the parser used to drop on the floor: `'t'` vs `'b'`
+// (which decides whether the bytes go through the OID decoder at all) and `'u'` vs
+// `'n'` (which decides whether a client keeps or erases a TOASTed column).
+// ---------------------------------------------------------------------------
+
+/// Build a TupleData wire fragment: column count, then one entry per column.
+fn buildTuple(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, cols: []const ColumnValue) !void {
+    var count: [2]u8 = undefined;
+    std.mem.writeInt(u16, &count, @intCast(cols.len), .big);
+    try buf.appendSlice(alloc, &count);
+
+    for (cols) |col| {
+        switch (col) {
+            .null => try buf.append(alloc, 'n'),
+            .unchanged => try buf.append(alloc, 'u'),
+            .text, .binary => |data| {
+                try buf.append(alloc, if (col == .text) 't' else 'b');
+                var len: [4]u8 = undefined;
+                std.mem.writeInt(u32, &len, @intCast(data.len), .big);
+                try buf.appendSlice(alloc, &len);
+                try buf.appendSlice(alloc, data);
+            },
+        }
+    }
+}
+
+test "tuple - each format byte keeps its own meaning" {
+    const alloc = std.testing.allocator;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buildTuple(&buf, alloc, &.{
+        .null,
+        .unchanged,
+        .{ .text = @constCast("42") },
+        .{ .binary = @constCast(&[_]u8{ 0, 0, 0, 42 }) },
+    });
+
+    var parser = Parser.init(alloc, buf.items);
+    var tuple = try parser.parseTupleData();
+    defer tuple.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 4), tuple.cols.len);
+    try std.testing.expect(tuple.cols[0] == .null);
+    try std.testing.expect(tuple.cols[1] == .unchanged);
+    try std.testing.expectEqualStrings("42", tuple.cols[2].text);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 42 }, tuple.cols[3].binary);
+}
+
+test "tuple - an unchanged TOAST value is not a NULL" {
+    // The whole point: before this, both arrived as `null` and a client applying the
+    // UPDATE would erase a column PostgreSQL never touched.
+    const alloc = std.testing.allocator;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buildTuple(&buf, alloc, &.{ .null, .unchanged });
+
+    var parser = Parser.init(alloc, buf.items);
+    var tuple = try parser.parseTupleData();
+    defer tuple.deinit(alloc);
+
+    try std.testing.expect(tuple.cols[0] == .null);
+    try std.testing.expect(tuple.cols[1] == .unchanged);
+}
+
+test "decodeTuple - text columns bypass the OID decoder" {
+    // A `'t'` column is already Postgres's own text output, so it is correct without
+    // any knowledge of the type. The OID here is deliberately one the decoder does not
+    // know: under the old code these bytes went through decodeBinColumnData anyway.
+    const alloc = std.testing.allocator;
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+    try buildTuple(&buf, alloc, &.{ .{ .text = @constCast("a=>1") }, .unchanged, .null });
+
+    var parser = Parser.init(alloc, buf.items);
+    var tuple = try parser.parseTupleData();
+    defer tuple.deinit(alloc);
+
+    const columns = [_]RelationMessage.ColumnInfo{
+        .{ .flags = 0, .name = "attrs", .type_id = 16416, .type_modifier = -1 },
+        .{ .flags = 0, .name = "body", .type_id = 25, .type_modifier = -1 },
+        .{ .flags = 0, .name = "note", .type_id = 25, .type_modifier = -1 },
+    };
+
+    var decoded = try decodeTuple(alloc, tuple, &columns, null);
+    defer {
+        for (decoded.items) |col| switch (col.value) {
+            .text, .numeric, .jsonb, .array, .bytea => |v| alloc.free(v),
+            else => {},
+        };
+        decoded.deinit(alloc);
+    }
+
+    try std.testing.expectEqualStrings("a=>1", decoded.items[0].value.text);
+    try std.testing.expect(decoded.items[1].value == .unchanged);
+    try std.testing.expect(decoded.items[2].value == .null);
 }

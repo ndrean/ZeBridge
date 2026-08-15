@@ -91,6 +91,13 @@ pub const Nats = struct {
     pub const snapshot_kv_bucket = topology.kv_snapshots;
     pub const kv_snapshots_subject_pattern = kv_subject_prefix ++ topology.kv_snapshots ++ ".{s}";
 
+    /// Room a published message needs beyond the row's own bytes: the subject, the
+    /// `Nats-Msg-Id` and content headers, one MessagePack map key per column, and the
+    /// batch array framing when several events travel together. An event buffer sized
+    /// right up to `max_payload` therefore still produces messages the server rejects,
+    /// which is why the startup check leaves this much clearance.
+    pub const payload_envelope_margin_bytes: u64 = 16 * 1024;
+
     pub const publisher_max_wait = 10_000; // 10 seconds
 
     /// JetStream stream default configuration
@@ -307,7 +314,7 @@ pub const Buffers = struct {
     /// Configurable via environment variable BASE_BUF (log2 of desired size)
     /// If a row exceeds this size, the bridge will panic to prevent data loss
     /// Example: BASE_BUF=16 → 64KB, BASE_BUF=14 → 16KB
-    pub const default_event_data_buffer_log2: u6 = 12; // 2^12 = 4096KB
+    pub const default_event_data_buffer_log2: u6 = 14; // 2^14 = 16.384KB
 
     /// Ring buffer event count (number of pre-allocated event slots)
     /// Default: 65536 events

@@ -175,7 +175,14 @@ operator may purge a key manually.)
 { "table": "t_nopk", "suspended": true, "reason": "no_primary_key", "lsn": 25722184 }
 ```
 
-Published when the bridge refuses a table — today, only for `no_primary_key` (§8).
+Published when the bridge refuses a table. Two reasons exist:
+
+| `reason` | meaning | fix |
+| --- | --- | --- |
+| `no_primary_key` | rows cannot be identified, so DELETE is ambiguous (§8) | add a primary key |
+| `unsupported_column_type` | a column's type cannot be decoded and is not an enum (§4) | change or drop that column |
+| `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | restart the bridge with a larger buffer, or move the oversized column out of the table |
+
 Like a tombstone it carries **no columns**, because a client must not build a table
 from it. Unlike a tombstone the table still exists in PostgreSQL, and the suspension
 lifts by itself the moment the shape is fixed.
@@ -192,7 +199,9 @@ internally consistent as of that LSN — its data and its schema agree, and noth
 further will contradict them. That is why freezing is correct and dropping is not.
 
 **Recovery** needs no special signal: when a primary key is added, the DDL event
-produces an ordinary live schema on the same key. A client should treat "a schema with
+produces an ordinary live schema on the same key. `row_too_large` is the one reason that
+lifts on a bridge **restart** rather than on a migration, since it is a sizing verdict —
+but the client sees the same thing either way: a schema with columns arrives again. A client should treat "a schema with
 columns arrived for a suspended table" as resume, migrate normally, and re-seed if it
 needs to.
 
@@ -248,7 +257,7 @@ JetStream deduplicates retries. Batches use
 | operation | `data` |
 | --- | --- |
 | INSERT | all columns, new values |
-| UPDATE | all columns, new values — plus `old.<column>` entries **only if** the table is `REPLICA IDENTITY FULL` |
+| UPDATE | all columns the UPDATE could observe — see the omission rule below — plus `old.<column>` entries **only if** the table is `REPLICA IDENTITY FULL` |
 | DELETE | ⚠️ under `REPLICA IDENTITY DEFAULT`: **the primary key populated, every other column `null`** |
 
 ⚠️ A DELETE with nulls everywhere but the PK is **not** data loss — it is what
@@ -258,11 +267,37 @@ it as a malformed event.
 ⚠️ `old.*` keys are **absent entirely** on a DEFAULT table, and present on every
 UPDATE for a FULL table. A client must not assume they exist.
 
+#### An absent key on an UPDATE means "unchanged", never "null"
+
+PostgreSQL does not resend a **TOASTed** value (roughly: any value that did not fit
+inline, so large `text`, `jsonb`, `bytea`, arrays) when an UPDATE did not modify it. On
+the wire that column carries pgoutput's `'u'` marker and no bytes.
+
+ZeBridge encodes this by **omitting the column from `data`**. So on an UPDATE:
+
+| in `data` | meaning |
+| --- | --- |
+| key present, value `null` | the column **is** SQL NULL |
+| key present, any other value | the column has that value |
+| **key absent** | the column was not modified — **keep whatever you have** |
+
+**A client must apply only the keys present.** Building an UPDATE from
+`Object.keys(data)` does the right thing automatically; expanding to the full column
+list and defaulting the missing ones to null erases data PostgreSQL never touched. The
+reference client does the former (`INSERT … ON CONFLICT DO UPDATE SET` over the present
+keys only).
+
+Only UPDATE can omit a column: INSERT and snapshot rows always carry every column, and
+a DELETE carries the key (plus nulls under DEFAULT identity, as above).
+
 ### Value encoding
 
 MessagePack by default, JSON with `--json`. Either way:
 
 - `numeric` arrives as a **string** (`"123.45000000"`) to preserve precision.
+- a column PostgreSQL sent in **text format** (it does this per column, even under
+  `binary 'true'`, for any type with no binary send function) arrives as that text
+  verbatim — no type-specific decoding is applied or needed.
 - `jsonb` arrives as a nested object in MessagePack mode, a string in JSON mode.
 - arrays and `bytea` arrive as strings.
 - `timestamptz` arrives as an ISO-8601 string.
@@ -497,12 +532,23 @@ decides what happens:
 | typtype | example | behaviour |
 | --- | --- | --- |
 | `e` (enum) | `CREATE TYPE mood AS ENUM (...)` | ✅ passes through — Postgres sends enum **labels as text** in binary |
-| anything else | `hstore`, composite, range, PostGIS | 🔴 snapshot refused, naming the column and OID |
+| anything else | `hstore`, composite, range, PostGIS | 🔴 refused, naming the column and OID: the snapshot aborts, and CDC **suspends the table** (§3) |
 
 The refusal exists because the alternative was observed in practice: an `hstore` column
 was emitting its binary wire form — `\0\0\0\1\0\0\0\1k\0\0\0\1v` — as a string value
 behind nothing but a warning. Plausible-looking, entirely wrong, and undetectable
 downstream.
+
+Both paths reach the same verdict from different sources. A snapshot reads `typtype`
+from the catalog inside its own transaction; CDC cannot query the catalog on the
+replication hot path, so the **DDL event carries `oid` and `typtype` for every column**
+and the bridge keeps an OID → typtype registry. That registry needs no invalidation: a
+type's OID lives as long as the type, so dropping and recreating one yields a *new* OID
+on a *new* DDL event. Tables that have had no DDL since startup are covered by the boot
+schema pass.
+
+A column Postgres sends in **text format** is never affected: the bytes are already its
+text output, so no OID knowledge is needed and none is required.
 
 ⚠️ **The CDC path does not have this guard yet.** It decodes with OIDs from the
 `RELATION` message, which carries no `typtype`, so an `hstore` column in a published
@@ -544,7 +590,7 @@ Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 | composite PK | ✅ full support — pagination compares the whole key as a row value |
 | **no PK, any replica identity** | 🔴 **refused** — suspended, events dropped |
 | `TRANSITION_RULES` without `FULL` | ⚠️ transitions can never fire — silently inert |
-| column of an unsupported type | ⚠️ CDC flows (unguarded, see §6); snapshots refused |
+| column of an unsupported type | 🔴 **suspended** — CDC events dropped, snapshots refused (§6) |
 
 **A table with no primary key is refused, not warned about.** Without a key a row
 cannot be identified, so a DELETE could only be expressed as a full-row match — which

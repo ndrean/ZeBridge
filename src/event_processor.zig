@@ -13,6 +13,7 @@ const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
 const RefusedTables = @import("refused_tables.zig");
+const TypeRegistry = @import("type_registry.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
 const schema_mapper = @import("schema_mapper.zig");
@@ -53,6 +54,7 @@ fn parsePgLsnText(text: []const u8) u64 {
 fn formatValueForLog(arena: std.mem.Allocator, value: pgoutput.DecodedValue) ![]const u8 {
     return switch (value) {
         .null => "NULL",
+        .unchanged => "<unchanged TOAST>",
         .boolean => |v| if (v) "true" else "false",
         .int32 => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
         .int64 => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
@@ -85,6 +87,9 @@ fn valuesEqual(a: pgoutput.DecodedValue, b: pgoutput.DecodedValue) bool {
     // Compare based on type
     return switch (a) {
         .null => true, // Both are null
+        // Both sides unchanged means this UPDATE did not touch the column — which is
+        // precisely "equal" for transition detection.
+        .unchanged => true,
         .boolean => |av| av == b.boolean,
         .int32 => |av| av == b.int32,
         .int64 => |av| av == b.int64,
@@ -106,6 +111,9 @@ pub const EventProcessor = struct {
     transition_rules: *const Config.EventClassification.TransitionRules,
     pg_config: *const pg_conn.PgConf,
     refused: *RefusedTables.Registry,
+    /// OID → typtype, populated from DDL events and at boot. The CDC decoder consults
+    /// it for any type its switch does not cover; see type_registry.zig.
+    types: *TypeRegistry.Registry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -114,6 +122,7 @@ pub const EventProcessor = struct {
         transition_rules: *const Config.EventClassification.TransitionRules,
         pg_config: *const pg_conn.PgConf,
         refused: *RefusedTables.Registry,
+        types: *TypeRegistry.Registry,
     ) EventProcessor {
         return .{
             .allocator = allocator,
@@ -122,7 +131,112 @@ pub const EventProcessor = struct {
             .transition_rules = transition_rules,
             .pg_config = pg_config,
             .refused = refused,
+            .types = types,
         };
+    }
+
+    /// Record one `schema_def` column's `oid`/`typtype` in the type registry.
+    ///
+    /// Silently ignores a column that carries neither — a database initialised before
+    /// these fields existed simply leaves the registry empty for its types, and the
+    /// decoder then refuses anything exotic rather than guessing. Failing to record is
+    /// never fatal: the registry only ever widens what can be decoded.
+    fn recordColumnType(self: *EventProcessor, col_val: std.json.Value) void {
+        if (col_val != .object) return;
+        const oid_v = col_val.object.get("oid") orelse return;
+        const typtype_v = col_val.object.get("typtype") orelse return;
+        if (oid_v != .integer or typtype_v != .string or typtype_v.string.len == 0) return;
+        if (oid_v.integer <= 0) return;
+
+        self.types.record(@intCast(oid_v.integer), typtype_v.string[0]) catch |err| {
+            log.warn("could not record type OID {d}: {}", .{ oid_v.integer, err });
+        };
+    }
+
+    /// A column arrived whose type the decoder cannot handle: suspend the table.
+    ///
+    /// The alternative was letting `error.TupleDecodeFailed` propagate out of main,
+    /// which stops replication for *every* table over one exotic column — the blast
+    /// radius `refused_tables` exists to avoid. This publishes the suspension in place
+    /// of the mutation, so it keeps the stream's ordering and the client learns at the
+    /// exact LSN where its data stops being complete.
+    ///
+    /// Only the first such event pays this cost: afterwards `refused.shouldDrop` filters
+    /// the table before it ever reaches the decoder.
+    fn suspendForUnsupportedType(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        rel: pgoutput.RelationMessage,
+        wal_end: u64,
+    ) !u32 {
+        log.err(
+            "🔴 SUSPENDING '{s}': it has a column whose type the CDC decoder cannot handle (see the preceding line for which). Its events are dropped and its schema withheld until the column is changed to a supported type. Snapshots refuse it for the same reason.",
+            .{rel.name},
+        );
+
+        self.refused.refuse(rel.name, .unsupported_column_type) catch |err| {
+            log.err("🔴 Could not record refusal for '{s}': {}", .{ rel.name, err });
+        };
+
+        const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-type-{s}-{d}", .{ rel.name, wal_end });
+        return self.publishSuspension(
+            arena,
+            rel.name,
+            RefusedTables.Reason.unsupported_column_type.wireName(),
+            msg_id,
+            rel.relation_id,
+            wal_end,
+        );
+    }
+
+    /// A row did not fit in the pre-allocated event buffer: suspend the table.
+    ///
+    /// Sized by `BASE_BUF` (log2 bytes per event), so this is a configuration verdict,
+    /// not a schema one — but it is data-dependent and therefore not knowable when the
+    /// bridge is deployed. The row that overflows may arrive years later, when someone
+    /// pastes a large JSON document into a text column.
+    ///
+    /// The log is deliberately loud and arithmetic: the operator needs the value to set,
+    /// not an adjective. It is also the line to alert on in Loki/Prometheus —
+    /// `bridge_refused_tables` rises at the same moment.
+    fn suspendForRowTooLarge(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        rel: pgoutput.RelationMessage,
+        wal_end: u64,
+    ) !u32 {
+        const buffer_bytes = self.batch_publisher.events[0].data_buffer.len;
+
+        log.err(
+            "🔴 SUSPENDING '{s}': a row does not fit in the {d} KB per-event buffer (BASE_BUF={d}).",
+            .{ rel.name, buffer_bytes / 1024, std.math.log2_int(usize, buffer_bytes) },
+        );
+        log.err(
+            "    Fix: restart with a larger BASE_BUF (each +1 doubles it, max 20 = 1 MB). The data slab is 2^BASE_BUF x RING_BUFFER_COUNT, so raise BASE_BUF and lower RING_BUFFER_COUNT together to hold memory steady.",
+            .{},
+        );
+        log.err(
+            "    If the row exceeds 1 MB it cannot be replicated at any setting — NATS's default max_payload is 1 MB. Move the oversized column out of the replicated table (store a reference, not the blob).",
+            .{},
+        );
+        log.err(
+            "    Every other table keeps replicating. This one resumes automatically once the bridge restarts with a buffer that fits, and its clients re-seed from a snapshot.",
+            .{},
+        );
+
+        self.refused.refuse(rel.name, .row_too_large) catch |err| {
+            log.err("🔴 Could not record refusal for '{s}': {}", .{ rel.name, err });
+        };
+
+        const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-size-{s}-{d}", .{ rel.name, wal_end });
+        return self.publishSuspension(
+            arena,
+            rel.name,
+            RefusedTables.Reason.row_too_large.wireName(),
+            msg_id,
+            rel.relation_id,
+            wal_end,
+        );
     }
 
     /// Decode a WAL mutation, pack it into a ring-buffer slot, and return the slot index.
@@ -153,13 +267,15 @@ pub const EventProcessor = struct {
         // 1. Handle "Old" Tuple (REPLICA IDENTITY FULL Updates) + Transition Detection
         if (old_tuple_data) |old_data| {
             // Decode the raw WAL bytes for the old tuple
-            const old_decoded = pgoutput.decodeTuple(arena_allocator, old_data, rel.columns) catch |err| {
+            const old_decoded = pgoutput.decodeTuple(arena_allocator, old_data, rel.columns, self.types) catch |err| {
+                if (err == error.UnsupportedColumnType) return self.suspendForUnsupportedType(arena_allocator, rel, wal_end);
                 log.warn("⚠️ Failed to decode old tuple: {}", .{err});
                 return error.TupleDecodeFailed;
             };
 
             // 2. Decode "Main" Tuple (The standard New values)
-            const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns) catch |err| {
+            const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns, self.types) catch |err| {
+                if (err == error.UnsupportedColumnType) return self.suspendForUnsupportedType(arena_allocator, rel, wal_end);
                 log.warn("⚠️ Failed to decode tuple: {}", .{err});
                 return error.TupleDecodeFailed;
             };
@@ -211,7 +327,8 @@ pub const EventProcessor = struct {
             try all_columns.appendSlice(arena_allocator, main_decoded.items);
         } else {
             // No old tuple data - just process new/main tuple (INSERT or DELETE)
-            const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns) catch |err| {
+            const main_decoded = pgoutput.decodeTuple(arena_allocator, tuple_data, rel.columns, self.types) catch |err| {
+                if (err == error.UnsupportedColumnType) return self.suspendForUnsupportedType(arena_allocator, rel, wal_end);
                 log.warn("⚠️ Failed to decode tuple: {}", .{err});
                 return error.TupleDecodeFailed;
             };
@@ -279,7 +396,7 @@ pub const EventProcessor = struct {
 
         // Pack decoded columns into the ring-buffer slab (zero heap allocation).
         // Data is deep-copied from the transient arena into the long-lived slot.
-        const slot_idx = try self.acquireAndFillSlot(
+        const slot_idx = self.acquireAndFillSlot(
             subject,
             rel.name,
             operation,
@@ -287,7 +404,12 @@ pub const EventProcessor = struct {
             rel.relation_id,
             all_columns,
             wal_end,
-        );
+        ) catch |err| {
+            // The suspension takes this event's place in the stream, so ordering holds
+            // and the client learns at the exact LSN where its copy stops being current.
+            if (err == error.RowTooLarge) return self.suspendForRowTooLarge(arena_allocator, rel, wal_end);
+            return err;
+        };
 
         if (self.metrics) |m| {
             m.incrementCdcEvents();
@@ -464,13 +586,27 @@ pub const EventProcessor = struct {
         for (decoded_values.items) |column| {
             event.addColumn(column.name, column.value) catch |err| {
                 if (err == error.BufferOverflow) {
-                    // TERMINAL FAILURE: Do not return the slot, do not yield.
-                    // We must stop to prevent ACKing this LSN to PostgreSQL.
-                    // If we ACK'd, PostgreSQL would discard this WAL data and we'd lose the row permanently.
-                    log.err("🔴🔴🔴 FATAL: CDC Event too large for pre-allocated buffer 🔴🔴🔴", .{});
-                    log.err("This is a configuration error - the bridge is shutting down to prevent data loss.", .{});
-                    log.err("The current row will be replayed when the bridge restarts with a larger buffer.", .{});
-                    @panic("CDC Event too large for buffer. Increase BASE_BUF environment variable and restart.");
+                    // This used to `@panic`, on the reasoning that stopping was the only
+                    // way to avoid ACKing an LSN whose row never reached NATS. The
+                    // invariant was right; the mechanism was not:
+                    //
+                    //   * the row sits *before* any later ACK, so a restart re-reads it
+                    //     and panics again — under any supervisor that is a crash loop,
+                    //     with every other table stopped too;
+                    //   * "raise BASE_BUF" has a ceiling (2^20 = 1 MB, and NATS's
+                    //     default max_payload is 1 MB), so for a genuinely large row it
+                    //     is not a fix at all, just an infinite retry for the operator.
+                    //
+                    // Suspending the table instead is the same answer this bridge
+                    // already gives for a keyless table or an undecodable column type:
+                    // the client is told its data for THIS table is frozen at THIS LSN
+                    // and everything else keeps replicating. ACKing past the row is then
+                    // safe precisely because recovery is a snapshot re-seed, not WAL
+                    // replay — nothing is silently lost, it is explicitly withheld.
+                    log.err("🔴 Row too large for the event buffer on table '{s}' — column '{s}' did not fit", .{ table, column.name });
+                    event.reset();
+                    self.batch_publisher.free_slots.push(slot_idx) catch {};
+                    return error.RowTooLarge;
                 }
                 // Other errors - return slot and propagate
                 log.err("Failed to pack column '{s}': {}", .{ column.name, err });
@@ -494,7 +630,7 @@ pub const EventProcessor = struct {
         wal_end: u64,
     ) !?u32 {
         // Decode zebridge_ddl_events tuple
-        const decoded = try pgoutput.decodeTuple(arena, tuple_data, rel.columns);
+        const decoded = try pgoutput.decodeTuple(arena, tuple_data, rel.columns, self.types);
 
         var target_table: ?[]const u8 = null;
         var command_tag: ?[]const u8 = null;
@@ -610,6 +746,10 @@ pub const EventProcessor = struct {
             const ty = if (col_val == .object) col_val.object.get("type") else null;
             if (name == null or ty == null or name.? != .string or ty.? != .string) continue;
 
+            // Consume the bridge-facing facts here and do NOT forward them: the KV
+            // value is the client contract, and a client has no use for an OID.
+            self.recordColumnType(col_val);
+
             if (i > 0) try json_str.appendSlice(arena, ",");
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
@@ -654,14 +794,14 @@ pub const EventProcessor = struct {
         // Refuse tables with no primary key. Not a warning: without a key, DELETE can
         // only be expressed as a full-row match, which removes *every* duplicate where
         // PostgreSQL removed one — the replica diverges destructively and silently.
-        // A composite key has none of that ambiguity and is accepted; only snapshot
-        // pagination is unimplemented for it, which is our gap and not the user's.
+        // A composite key has none of that ambiguity and is fully supported, snapshots
+        // included — pagination compares the whole key as a row value.
         if (pk_cols.len == 0) {
             log.err(
                 "🔴 REFUSING '{s}': no primary key (REPLICA IDENTITY {s}). Rows cannot be identified, so DELETE would match on every column and could remove more rows than PostgreSQL did. No schema will be published and its CDC events will be dropped. Fix with a migration adding a primary key.",
                 .{ clean_table, identity },
             );
-            self.refused.refuse(clean_table) catch |err| {
+            self.refused.refuse(clean_table, .no_primary_key) catch |err| {
                 // The registry is full: we cannot track the drop, so say so and keep
                 // going rather than losing the DDL event entirely.
                 log.err("🔴 Could not record refusal for '{s}': {}", .{ clean_table, err });
@@ -671,7 +811,7 @@ pub const EventProcessor = struct {
             return try self.publishSuspension(
                 arena,
                 clean_table,
-                "no_primary_key",
+                RefusedTables.Reason.no_primary_key.wireName(),
                 msg_id,
                 rel.relation_id,
                 wal_end,
@@ -681,13 +821,6 @@ pub const EventProcessor = struct {
         // Reaching here means the table has a key. If it was refused before, this DDL
         // event is the migration that fixed it — resume without a restart.
         self.refused.clear(clean_table);
-
-        if (pk_cols.len > 1) {
-            log.warn(
-                "⚠️  '{s}' has a {d}-column primary key: CDC is fully supported, but snapshots are not yet implemented for composite keys (pagination needs row-value comparison).",
-                .{ clean_table, pk_cols.len },
-            );
-        }
 
         if (self.transition_rules.contains(clean_table) and !std.mem.eql(u8, identity, "full")) {
             log.warn(
@@ -846,7 +979,7 @@ pub const EventProcessor = struct {
                 const slot_idx = try self.publishSuspension(
                     arena,
                     clean_table,
-                    "no_primary_key",
+                    RefusedTables.Reason.no_primary_key.wireName(),
                     msg_id,
                     0,
                     boot_lsn,
@@ -857,12 +990,16 @@ pub const EventProcessor = struct {
             
             const query = try utils.allocPrintZ(
                 arena,
-                \\SELECT attname, format_type(atttypid, atttypmod) AS data_type
-                \\FROM pg_attribute
-                \\WHERE attrelid = '"{s}"."{s}"'::regclass
-                \\  AND attnum > 0
-                \\  AND NOT attisdropped
-                \\ORDER BY attnum;
+                \\SELECT a.attname,
+                \\       format_type(a.atttypid, a.atttypmod) AS data_type,
+                \\       a.atttypid,
+                \\       t.typtype
+                \\FROM pg_attribute a
+                \\JOIN pg_type t ON t.oid = a.atttypid
+                \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
+                \\  AND a.attnum > 0
+                \\  AND NOT a.attisdropped
+                \\ORDER BY a.attnum;
             ,
                 .{ "public", clean_table },
             );
@@ -893,7 +1030,21 @@ pub const EventProcessor = struct {
                 if (r > 0) try json_str.appendSlice(arena, ",");
                 const col_name = std.mem.span(c.PQgetvalue(result, r, 0));
                 const data_type = std.mem.span(c.PQgetvalue(result, r, 1));
-                
+
+                // Tables that have had no DDL since startup never produce a DDL event,
+                // so this pass is the only chance to learn their exotic types. Without
+                // it the decoder would refuse a perfectly good enum column until the
+                // next ALTER.
+                const oid_text = std.mem.span(c.PQgetvalue(result, r, 2));
+                const typtype_text = std.mem.span(c.PQgetvalue(result, r, 3));
+                if (std.fmt.parseInt(u32, oid_text, 10)) |oid| {
+                    if (typtype_text.len > 0) {
+                        self.types.record(oid, typtype_text[0]) catch |err| {
+                            log.warn("could not record type OID {d}: {}", .{ oid, err });
+                        };
+                    }
+                } else |_| {}
+
                 const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, data_type});
                 try json_str.appendSlice(arena, col_json);
             }

@@ -87,7 +87,7 @@ The bridge just connects them correctly and stays dumb, as stateless as possible
 
 NATS have 40+ clients, so instead of an SDK, we propose a guide with the workflows and naming to be used to connect Clients to the NATS server to use the local-first synced database.
 
-Examples:  webapp (WASM-SQLite + OPFS), backend micrservice Elixir & Python, Flutter
+Worked examples can be found for webapps (WASM-SQLite + OPFS), backend micrservice Elixir & Python, Flutter
 
 ### What It Does
 
@@ -121,7 +121,7 @@ The consumer will uses these streams to handle NATS state (the names are defined
 **Key decisions**:
 
 * `REPLICA IDENTITY DEFAULT | FULL`. Preflight warning. Use only tables with _single column primary key ID_ (no single column PK + DEFAULT => PG error on UPDATE). Solution: run a migration to set a unique column PK ID => `DELETE id='42'`,
-* No SDK: A _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
+* No SDK but a _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
 
 * Single-Threaded per Bridge. The rationale is:
 PostgreSQL WAL is inherently sequential. Simpler LSN acknowledgment logic. To a slot can be attached one or several tables. Scale horizontally (multiple bridges) instead of vertically
@@ -1132,6 +1132,67 @@ All configuration constants are centralized in `src/config.zig` and `topology.js
 * Message ID buffer: `128` bytes
 
 See `src/config.zig` for all tunables.
+
+### Sizing `BASE_BUF` and `RING_BUFFER_COUNT` ⚠️ read this one
+
+These two are not independent, and getting them wrong has a visible consequence rather
+than a silent one. The bridge pre-allocates one fixed-size buffer per event slot:
+
+```txt
+data slab = 2^BASE_BUF  ×  RING_BUFFER_COUNT
+             ^ max bytes    ^ number of events
+               for ONE row    buffered ahead of NATS
+
+  12 / 65536 = 256 MB   ← defaults: 4 KB rows, ~1s of outage tolerance at 60K evt/s
+  14 / 65536 =   1 GB   ← 16 KB rows
+  20 /  1024 =   1 GB   ← 1 MB rows, minimum ring (least outage tolerance)
+```
+
+Each one answers a different question:
+
+* **`BASE_BUF`** (log2 bytes, range 10–20) is *how large a single row may be*. Size it
+  to your widest row: a `jsonb` document, a long `text` column, a big array.
+* **`RING_BUFFER_COUNT`** (range 1024–1048576) is *how many events can queue while NATS
+  is unreachable*. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip
+  starts back-pressuring the WAL reader sooner.
+
+Raising one and lowering the other keeps memory flat, at the cost of outage tolerance.
+
+#### What happens when a row does not fit
+
+The table is **suspended**, and you will see this in the log:
+
+```txt
+🔴 SUSPENDING 'orders': a row does not fit in the 4 KB per-event buffer (BASE_BUF=12).
+    Fix: restart with a larger BASE_BUF (each +1 doubles it, max 20 = 1 MB) …
+```
+
+What this does **not** do is stop the bridge. Every other table keeps replicating,
+`bridge_refused_tables` rises, and clients of that one table receive a suspension on
+`$KV.schemas.<table>` (`"reason": "row_too_large"`) telling them their copy is frozen at
+a known LSN. Restart with a `BASE_BUF` that fits and the table resumes; its clients
+re-seed from a fresh snapshot.
+
+⚠️ **This is why the metrics endpoint matters.** The event that overflows may arrive
+years after deployment — someone pastes a large JSON document into a text column — so
+this is not something you can verify once at install time. Alert on
+`bridge_refused_tables > 0` (Prometheus) or on `SUSPENDING` in the logs (Loki).
+
+#### The ceiling is NATS, not the bridge
+
+`BASE_BUF=20` is 1 MB, which is also **nats-server's default `max_payload`**. A message
+also carries a subject, headers and MessagePack framing, so a row sized right up to the
+limit is still rejected at publish time. The bridge reads the server's advertised
+`max_payload` from its INFO line at connect and tells you where you stand:
+
+```txt
+info(bridge): NATS max_payload: 1024 KB (server-advertised); per-event buffer: 16 KB (BASE_BUF=14)
+```
+
+and warns if the two cannot coexist. Raising `max_payload` in `nats-server.conf` is
+possible but affects every client and every subject on that server, and JetStream's
+memory use scales with it — so for genuinely large values, prefer keeping the blob out
+of the replicated table and replicating a reference to it.
 
 ---
 

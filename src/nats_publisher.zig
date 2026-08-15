@@ -451,6 +451,12 @@ pub const Publisher = struct {
 ///
 /// Note: The pure Zig nats library doesn't expose stream INFO API yet.
 /// This function is a no-op placeholder. Streams must be created by infrastructure.
+/// `max_payload` as this connection's server advertised it, or null if unknown.
+pub fn serverMaxPayload(js: *nats.JS) ?u64 {
+    const conn = js.connection orelse return null;
+    return conn.server_max_payload;
+}
+
 pub fn ensureStream(js: *nats.JS, allocator: std.mem.Allocator, stream_name: []const u8) !void {
     _ = js;
     _ = allocator;

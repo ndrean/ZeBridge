@@ -26,6 +26,7 @@ const c = c_imports.c;
 const utils = @import("utils.zig");
 const preflight = @import("preflight.zig");
 const refused_tables = @import("refused_tables.zig");
+const type_registry = @import("type_registry.zig");
 
 // Force test discovery for imported modules.
 // Zig only collects tests from files the root actually references, so every module
@@ -39,6 +40,7 @@ comptime {
     _ = @import("publication.zig");
     _ = @import("preflight.zig");
     _ = @import("refused_tables.zig");
+    _ = @import("type_registry.zig");
     _ = @import("pg_copy_binary.zig");
     _ = @import("schema_cache.zig");
     _ = @import("schema_mapper.zig");
@@ -332,6 +334,12 @@ pub fn main(init: std.process.Init) !void {
     var refused = refused_tables.Registry.init(allocator);
     defer refused.deinit();
 
+    // OID → typtype for types the CDC decoder's switch does not cover. Populated from
+    // DDL events and from the boot schema pass, and never invalidated: an OID outlives
+    // nothing, so a stale entry describes a type that can no longer reach the wire.
+    var type_registry_inst = type_registry.Registry.init(allocator);
+    defer type_registry_inst.deinit();
+
     // Validate the publication before any thread exists. Preflight only needs Postgres,
     // and under STRICT_TABLES it returns an error — bailing out after the worker threads
     // start would unwind into `defer join()` on threads nobody signalled, hanging the
@@ -377,6 +385,36 @@ pub fn main(init: std.process.Init) !void {
     // === Connect to NATS JetStream
     var publisher = try initNatsPublisher(allocator, &metrics, &runtime_config, io);
     defer publisher.deinit();
+
+    // The per-event buffer must fit inside what the NATS server will accept, and the
+    // server states its limit in INFO on every connection — so this is a fact, not the
+    // 1 MB default assumed. Checked here rather than discovered on the first oversized
+    // row, which would suspend a table for a mismatch that was visible at boot.
+    if (publisher.js) |*js| {
+        if (nats_publisher.serverMaxPayload(js)) |max_payload| {
+            const event_buf_bytes = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
+            log.info("NATS max_payload: {d} KB (server-advertised); per-event buffer: {d} KB (BASE_BUF={d})", .{
+                max_payload / 1024,
+                event_buf_bytes / 1024,
+                runtime_config.event_data_buffer_log2,
+            });
+            // Not `>`: a row sized exactly to the limit still fails once the subject,
+            // headers and MessagePack framing are added around it.
+            if (event_buf_bytes + Config.Nats.payload_envelope_margin_bytes > max_payload) {
+                log.warn(
+                    "⚠️  BASE_BUF={d} allows a {d} KB row, but the NATS server accepts at most {d} KB per message and the envelope (subject, headers, column keys, batch framing) needs roughly {d} KB more. A row in that range packs successfully and is then REJECTED at publish time. Either lower BASE_BUF or raise max_payload in nats-server.conf.",
+                    .{
+                        runtime_config.event_data_buffer_log2,
+                        event_buf_bytes / 1024,
+                        max_payload / 1024,
+                        Config.Nats.payload_envelope_margin_bytes / 1024,
+                    },
+                );
+            }
+        } else {
+            log.debug("NATS server did not advertise max_payload; cannot check it against BASE_BUF", .{});
+        }
+    }
 
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
@@ -449,6 +487,7 @@ pub fn main(init: std.process.Init) !void {
         &transition_rules,
         &pg_config,
         &refused,
+        &type_registry_inst,
     );
 
     // Publish boot schemas to NATS KV for all monitored tables

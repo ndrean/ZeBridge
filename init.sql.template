@@ -117,12 +117,27 @@ BEGIN
     FOREACH tbl IN ARRAY tables
     LOOP
         SELECT jsonb_build_object(
+                 -- `oid` and `typtype` are for the BRIDGE, not for clients: its CDC
+                 -- decoder switches on numeric OIDs and cannot know a per-database one
+                 -- (extension and user-defined types), so it needs `typtype` to tell an
+                 -- enum (safe to pass through as text) from anything else (must refuse).
+                 -- Produced here because the event trigger already runs inside Postgres
+                 -- with the catalog open — the alternative was a blocking pg_type query
+                 -- on the replication hot path. `type` stays information_schema's
+                 -- data_type verbatim, which is what PROTOCOL.md promises clients.
                  'columns', COALESCE((
                      SELECT jsonb_agg(jsonb_build_object(
                               'name', c.column_name,
-                              'type', c.data_type
+                              'type', c.data_type,
+                              'oid', a.atttypid::int,
+                              'typtype', t.typtype
                             ) ORDER BY c.ordinal_position)
                      FROM information_schema.columns c
+                     JOIN pg_attribute a
+                       ON a.attrelid = to_regclass(format('%I.%I', 'public', tbl))
+                      AND a.attname = c.column_name
+                      AND NOT a.attisdropped
+                     JOIN pg_type t ON t.oid = a.atttypid
                      WHERE c.table_schema = 'public'
                        AND c.table_name   = tbl
                  ), '[]'::jsonb),

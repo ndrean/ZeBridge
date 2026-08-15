@@ -21,6 +21,10 @@ next: u64 = 0,
 req_sid: u64 = 0,
 req_reply2: Formatter = .{},
 heartbeat_ns: u64 = 0,
+/// `max_payload` as the server advertised it in INFO, or null if it did not say.
+/// A publisher larger than this is rejected by the server, so ZeBridge checks its
+/// per-event buffer against it at startup rather than discovering it on a large row.
+server_max_payload: ?u64 = null,
 allow_heartBit: bool = false,
 
 dump: Appendable = .{},
@@ -100,6 +104,8 @@ fn _connect(cn: *Conn, allocator: Allocator, co: protocol.ConnectOpts) !void {
     }
 
     const info_line = cn.line.body() orelse return error.ProtocolError;
+
+    cn.server_max_payload = protocol.parseInfoMaxPayload(info_line);
 
     var nkey_pubkey: ?[]const u8 = null;
     var nkey_sig: ?[]const u8 = null;

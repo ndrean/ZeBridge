@@ -277,6 +277,7 @@ pub const CDCEvent = struct {
         var val_len: u32 = 0;
         const value_tag: pgoutput.ValueTag = switch (value) {
             .null => .null,
+            .unchanged => .unchanged,
             .boolean => .boolean,
             .int32 => .int32,
             .int64 => .int64,
@@ -289,8 +290,9 @@ pub const CDCEvent = struct {
         };
 
         switch (value) {
-            .null => {
-                // No data to pack
+            // Neither carries bytes: NULL has none, and an unchanged TOAST value was
+            // never sent. They stay distinct through the tag, not the payload.
+            .null, .unchanged => {
                 val_len = 0;
             },
             .boolean => |v| {
@@ -924,8 +926,9 @@ pub const BatchPublisher = struct {
                     // Extract column name from packed buffer
                     const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
 
-                    // Decode value based on type tag
-                    const value_enc = try decodePackedValue(&encoder, event, col_view);
+                    // Decode value based on type tag. An absent key means "unchanged",
+                    // which is what Postgres said.
+                    const value_enc = try decodePackedValue(&encoder, event, col_view) orelse continue;
                     try data_map.put(encoder.allocator, col_name, value_enc);
                 }
 
@@ -972,7 +975,8 @@ pub const BatchPublisher = struct {
 
                     for (event.columns[0..event.column_count]) |col_view| {
                         const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
-                        const value_enc = try decodePackedValue(&encoder, event, col_view);
+                        // Absent key = "unchanged", which is what Postgres said.
+                        const value_enc = try decodePackedValue(&encoder, event, col_view) orelse continue;
                         try data_map.put(encoder.allocator, col_name, value_enc);
                     }
 
@@ -1082,12 +1086,19 @@ pub const BatchPublisher = struct {
     }
 
     /// Decode a value from the packed buffer and convert to encoder value
+    /// Decode one packed column into an encoder value.
+    ///
+    /// Returns `null` for an unchanged TOAST column, meaning **omit the key**. Making
+    /// omission the return value rather than a filter at each call site is deliberate:
+    /// there are two call sites, and one of them forgetting would silently reintroduce
+    /// "unchanged means NULL" — the bug this whole path exists to remove.
     fn decodePackedValue(
         encoder: *encoder_mod.Encoder,
         event: *const CDCEvent,
         col_view: CDCEvent.ColumnView,
-    ) !encoder_mod.Value {
+    ) !?encoder_mod.Value {
         return switch (col_view.value_tag) {
+            .unchanged => null,
             .null => encoder.createNull(),
             .boolean => blk: {
                 const val = event.data_buffer[col_view.value_offset] != 0;

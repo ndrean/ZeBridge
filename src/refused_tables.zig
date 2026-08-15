@@ -38,6 +38,37 @@ const log = std.log.scoped(.refused);
 /// than growable so a concurrent reader is never walking a reallocated array.
 pub const max_refused = 64;
 
+/// Why a table is refused.
+///
+/// The tag name *is* the wire string published in the suspension payload
+/// (`reason: "no_primary_key"`), so the operator-facing log, the client-facing KV value
+/// and this enum cannot drift into three different spellings.
+pub const Reason = enum {
+    /// No primary key: rows cannot be identified, so DELETE is ambiguous.
+    no_primary_key,
+    /// A column whose type the CDC decoder cannot handle, and which is not an enum.
+    /// Passing its bytes through as text is silent corruption, so the table stops.
+    unsupported_column_type,
+    /// A row larger than the per-event buffer (`BASE_BUF`). Unlike the other two this
+    /// is a sizing verdict rather than a schema one, and it lifts on restart rather
+    /// than on a migration.
+    row_too_large,
+
+    /// The string clients receive in a suspension payload.
+    pub fn wireName(self: Reason) []const u8 {
+        return @tagName(self);
+    }
+
+    /// What the operator has to change to lift the refusal.
+    pub fn fixHint(self: Reason) []const u8 {
+        return switch (self) {
+            .no_primary_key => "add a primary key to replicate this table",
+            .unsupported_column_type => "change the column to a type the bridge can decode (or drop it from the table)",
+            .row_too_large => "restart with a larger BASE_BUF, or move the oversized column out of the replicated table",
+        };
+    }
+};
+
 const Entry = struct {
     /// Owned. Freed only in `deinit`, so readers may hold it while writers work.
     name: []const u8,
@@ -45,6 +76,8 @@ const Entry = struct {
     dropped: u64 = 0,
     /// Whether the refusal currently stands. Read from any thread.
     active: std.atomic.Value(bool) = .init(false),
+    /// Why. Written only by the replication thread (or preflight, before it starts).
+    reason: Reason = .no_primary_key,
 };
 
 pub const Registry = struct {
@@ -79,8 +112,11 @@ pub const Registry = struct {
 
     /// Mark a table refused. Idempotent: re-refusing keeps the running drop count, so a
     /// re-announced DDL event does not reset the number the operator is watching.
-    pub fn refuse(self: *Registry, table: []const u8) !void {
+    pub fn refuse(self: *Registry, table: []const u8, reason: Reason) !void {
         if (self.find(table)) |e| {
+            // A table can fail a second check after passing the first (gain a key, then
+            // gain an hstore column), so the reason is refreshed even when already active.
+            e.reason = reason;
             if (!e.active.load(.acquire)) {
                 e.active.store(true, .release);
                 _ = self.refused_count.fetchAdd(1, .acq_rel);
@@ -104,19 +140,19 @@ pub const Registry = struct {
         // The caller's `table` usually points into an arena that is reset per message,
         // so the name must be owned by us.
         const owned = try self.allocator.dupe(u8, table);
-        self.entries[n] = .{ .name = owned, .dropped = 0, .active = .init(true) };
+        self.entries[n] = .{ .name = owned, .dropped = 0, .active = .init(true), .reason = reason };
         // Publish last: a reader sees a fully built entry or no entry at all.
         self.len.store(n + 1, .release);
         _ = self.refused_count.fetchAdd(1, .acq_rel);
     }
 
-    /// Lift a refusal — the table acquired a primary key. The entry stays (its name may
+    /// Lift a refusal — the table's shape was fixed. The entry stays (its name may
     /// be held by a reader, and its drop count is worth keeping); only the flag drops.
     pub fn clear(self: *Registry, table: []const u8) void {
         const e = self.find(table) orelse return;
         if (e.active.swap(false, .acq_rel)) {
             _ = self.refused_count.fetchSub(1, .acq_rel);
-            log.info("✅ '{s}' is no longer refused: it now has a primary key", .{e.name});
+            log.info("✅ '{s}' is no longer refused ({s} resolved)", .{ e.name, e.reason.wireName() });
         }
     }
 
@@ -164,8 +200,8 @@ pub const Registry = struct {
         for (self.entries[0..self.len.load(.acquire)]) |*e| {
             if (!e.active.load(.acquire)) continue;
             log.warn(
-                "🔴 REFUSED '{s}': {d} event(s) dropped — add a primary key to replicate this table",
-                .{ e.name, e.dropped },
+                "🔴 REFUSED '{s}' ({s}): {d} event(s) dropped — {s}",
+                .{ e.name, e.reason.wireName(), e.dropped, e.reason.fixHint() },
             );
         }
     }
@@ -173,7 +209,7 @@ pub const Registry = struct {
     /// Render as Prometheus exposition text. Reads only the atomics and the immortal
     /// names, so the HTTP thread may call it while the replication thread writes.
     pub fn writePrometheus(self: *const Registry, w: *std.Io.Writer) !void {
-        try w.print("# HELP bridge_refused_tables Tables refused for lacking a primary key\n", .{});
+        try w.print("# HELP bridge_refused_tables Tables refused (no primary key, undecodable column type, or a row too large for the event buffer)\n", .{});
         try w.print("# TYPE bridge_refused_tables gauge\n", .{});
         try w.print("bridge_refused_tables {d}\n", .{self.refused_count.load(.acquire)});
 
@@ -188,7 +224,7 @@ test "unrefused tables are never dropped" {
     defer r.deinit();
 
     try std.testing.expect(!r.shouldDrop("users"));
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
     try std.testing.expect(!r.shouldDrop("users"));
     try std.testing.expectEqual(@as(usize, 1), r.count());
 }
@@ -197,7 +233,7 @@ test "refused tables drop and count" {
     var r = Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
     try std.testing.expect(r.shouldDrop("t_nopk"));
     try std.testing.expect(r.shouldDrop("t_nopk"));
     try std.testing.expect(r.shouldDrop("t_nopk"));
@@ -215,10 +251,10 @@ test "re-refusing keeps the running count" {
     var r = Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
     _ = r.shouldDrop("t_nopk");
     _ = r.shouldDrop("t_nopk");
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
 
     try std.testing.expectEqual(@as(usize, 1), r.count());
     try std.testing.expect(r.shouldDrop("t_nopk"));
@@ -233,7 +269,7 @@ test "clearing a refusal resumes replication" {
     var r = Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
     try std.testing.expect(r.shouldDrop("t_nopk"));
 
     r.clear("t_nopk");
@@ -248,10 +284,10 @@ test "a re-refused table reuses its entry and keeps its history" {
     var r = Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
     _ = r.shouldDrop("t_nopk");
     r.clear("t_nopk");
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
     _ = r.shouldDrop("t_nopk");
 
     try std.testing.expectEqual(@as(usize, 1), r.count());
@@ -271,7 +307,7 @@ test "isRefused does not inflate the drop count" {
     var r = Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    try r.refuse("t_nopk");
+    try r.refuse("t_nopk", .no_primary_key);
     try std.testing.expect(r.isRefused("t_nopk"));
     try std.testing.expect(r.isRefused("t_nopk"));
     try std.testing.expect(!r.isRefused("users"));
@@ -286,7 +322,7 @@ test "names are owned, so callers may free their own" {
     var r = Registry.init(std.testing.allocator);
     defer r.deinit();
 
-    try r.refuse(scratch);
+    try r.refuse(scratch, .no_primary_key);
     @memset(&name_buf, 0); // simulate the arena being reset under us
 
     try std.testing.expect(r.shouldDrop("t_nopk"));
@@ -298,7 +334,7 @@ test "overflow is reported rather than silently ignored" {
 
     var buf: [32]u8 = undefined;
     for (0..max_refused) |i| {
-        try r.refuse(try std.fmt.bufPrint(&buf, "t{d}", .{i}));
+        try r.refuse(try std.fmt.bufPrint(&buf, "t{d}", .{i}), .no_primary_key);
     }
     try std.testing.expectEqual(@as(usize, max_refused), r.count());
 
@@ -306,6 +342,6 @@ test "overflow is reported rather than silently ignored" {
     // return, and letting the real log.err fire would have the test runner count this
     // deliberate case as a failed build.
     r.overflowed.store(true, .release);
-    try std.testing.expectError(error.RefusalRegistryFull, r.refuse("one_too_many"));
+    try std.testing.expectError(error.RefusalRegistryFull, r.refuse("one_too_many", .no_primary_key));
     try std.testing.expectEqual(@as(usize, max_refused), r.count());
 }

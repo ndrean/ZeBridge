@@ -197,7 +197,7 @@ pub fn run(
             // Record it before the first WAL byte arrives, so the mutation path drops
             // this table's events from the very first batch rather than after its
             // first DDL event — which may never come.
-            try refused.refuse(table);
+            try refused.refuse(table, .no_primary_key);
             log.err(
                 "🔴 REFUSING '{s}': no primary key. Rows cannot be identified, so DELETE would match every column (removing more rows than PostgreSQL did) and a redelivered INSERT would duplicate. Its schema is withheld and its CDC events are dropped. Fix with a migration adding a primary key.",
                 .{table},

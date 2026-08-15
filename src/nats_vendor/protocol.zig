@@ -87,6 +87,24 @@ pub fn parseInfoNonce(allocator: std.mem.Allocator, info_payload: []const u8) !?
     return try allocator.dupe(u8, remaining[0..end_idx]);
 }
 
+/// Read `max_payload` out of the server's INFO line.
+///
+/// The server advertises its hard limit on every connection, so a client never has to
+/// assume the 1 MB default — and ZeBridge's per-event buffer (`BASE_BUF`) is only safe
+/// if it stays under this number. Returns null if the field is absent or unparseable,
+/// which the caller must treat as "unknown", not as "unlimited".
+pub fn parseInfoMaxPayload(info_payload: []const u8) ?u64 {
+    const key = "\"max_payload\":";
+    const start_idx = std.mem.indexOf(u8, info_payload, key) orelse return null;
+    const remaining = info_payload[start_idx + key.len ..];
+
+    var end: usize = 0;
+    while (end < remaining.len and std.ascii.isDigit(remaining[end])) : (end += 1) {}
+    if (end == 0) return null;
+
+    return std.fmt.parseInt(u64, remaining[0..end], 10) catch null;
+}
+
 const Drain = fn (msg: *messages.MSG) void;
 
 // https://docs.nats.io/nats-concepts/jetstream/streams
