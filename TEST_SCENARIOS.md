@@ -69,6 +69,10 @@ nats kv get schemas users --raw | python3 -m json.tool
 ⚠️ Keep the invariant in view while tuning: **`CDC_RET > SNAP_RET + apply time`**.
 Scenario C3 deliberately violates it — that is the point of C3.
 
+If snapshots are ever served from a physical standby (v1.1, see `COPY_BINARY_PLAN.md`),
+the invariant gains a term — **`+ replica lag`** — and breaking *that* one is silent: the
+`first_seq` gap check still passes while the client quietly misses a window of changes.
+
 ---
 
 ## A. Schema and CDC — runnable now

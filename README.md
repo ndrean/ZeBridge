@@ -4,7 +4,7 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-A lightweight **stateless** opinionated bidirectional daemon connecting PostgreSQL to the message broker NATS/JetStream for Edge sync.
+A lightweight **stateless** opinionated bidirectional daemon connecting PostgreSQL (≧ 14) to the message broker NATS/JetStream (≧ 2) for Edge sync.
 
 Allows mobile, WASM (PGLite/SQLite), and web apps to mirror PostgreSQL tables over WSS or TLS via NATS/JetStream without ever reaching for PostgreSQL.
 
@@ -41,15 +41,20 @@ ZeBridge differs significantly from established tools:
 * **What it is:** A high-performance stream processor that connects almost any source to any sink with on-the-fly transformations.
 * **The ZeBridge Difference:** While you could theoretically wire up a CDC pipeline using Bento, you would have to invent the entire edge-sync protocol, snapshot logic, and schema transition management yourself.
 
-⚠️ **Status**: Dev stage, beaking changes, draft notes.
+## Architecture
 
-Bridge["ZeBridge <br> daemon"]
-NATS[("NATS <br> JetStream")]
+**Status**: Dev stage, beaking changes, draft notes.
+
+**v 0.1.14**: `NATS` and `Zebridge` communicate via **TCP only**, on localhost.
 
 ```mermaid
 flowchart TD
     subgraph VPS["VPS / Private Network"]
         PG[("PostgreSQL <br> Master")]
+        subgraph Localhost ["VPS - Localhost"]
+          Bridge["ZeBridge <br> daemon"]
+          NATS[("NATS <br> JetStream")]
+        end
         
         Bridge -- Prometheus --> Grafana["Grafana <br> dashboard"]
         NATS -- Prometheus --> Grafana
@@ -61,10 +66,6 @@ flowchart TD
 
     NATS <--> |"TLS TCP / WSS / HTTPS"| Consumers
 
-    subgraph Localhost ["A"]
-      Bridge["ZeBridge <br> daemon"]
-      NATS[("NATS <br> JetStream")]
-    end
 
     subgraph Consumers["Consumers & Clients"]
         App["Native App <br> WebApp"]
@@ -73,6 +74,11 @@ flowchart TD
         Server_Worker <--> Local_DB
     end
 ```
+
+**Roadmap**:
+
+* **v 0.1.16**: READ [CDC+bootstrap] on a **standby replica** (PG ≧ 16, shared WAL stream), WRITE on **master**.
+* **v 1.0**: `Zebridge` <- TLS -> `NATS` (remove the localhost constraint)
 
 ## Table of Contents
 
@@ -102,19 +108,21 @@ Worked examples can be found for webapps (WASM-SQLite + OPFS), backend micrservi
 
 ### Data flow and security
 
-We have separate Read and Write flows between a Consumer facing NATS and the bridge.
+The DBA is responsible to migrate the PUBLICATION and triggers needed by Zebridge.
+
+Zebridge uses two separate _Read_ and _Write_ limited roles for the bidirectional flows between a Consumer facing NATS and the bridge.
 
 **Three data flow**:
 
-1. **Bootstrap** (INIT stream): Consumer requests _schemas_ & table _snapshot_,
-2. **Real-time CDC** (CDC stream): Consumer receives INSERT/UPDATE/DELETE events as they happen via NATS/JetStream.
-3. **Real-time Ingress flow** (MUTATION stream): Consumer updates his local storage and sends intentions messages to NATS -> Zebridge -> Postgres master.
+1. **Bootstrap** (INIT stream): READ - Consumer requests _schemas_ & table _snapshot_ and Zebridge delivers: PG->Zebridge->NATS
+2. **Real-time CDC** (CDC stream): READ - consumer receives INSERT/UPDATE/DELETE events as they happen: PG -> Zebridge -> NATS/JetStream.
+3. **Real-time Ingress flow** (MUTATION stream): WRITE - Consumer updates his local storage and sends intentions messages to NATS -> Zebridge -> PG_master.
 
-| Stream   | Purpose             | Retention     | Consumer Pattern        |
-| -------- | ------------------- | ------------- | ----------------------- |
-| **CDC**  | Real-time egress changes   | Short (X min) | Continuous subscription |
-| **INIT** | Bootstrap snapshots | Long (X days) | One-time replay         |
-| **MUTATION** | Real-time ingres changes| Short (X min) | Continuous subscription |
+| Stream | Purpose | Retention | Consumer Pattern | Role |
+| -------- | ------------------- | ------------- | ----------------------- | -- |
+| **CDC** | Real-time egress changes | Short (X min) | Continuous subscription | READ |
+| **INIT** | Bootstrap snapshots | Long (X days) | One-time replay | READ |
+| **MUTATION** | Real-time ingres changes | Short (X min) | Continuous subscription | WRITE |
 
 Streams have defined retention policies. The snapshot request is protected by maximum demand on 1 during `SNAP_RET`.
 The consumer will uses these streams to interact with the  NATS state (the names are defined in _topolgy.json_).
@@ -510,6 +518,22 @@ NATS_NKEY_SEED=SU...
 
 BRIDGE_PORT=9090          # HTTP telemetry, when --port is absent
 ```
+
+#### Deployment requirement: the bridge sits with NATS
+
+**v1.0 requires the bridge and `nats-server` on the same host**, reached over loopback.
+The vendored pure-Zig NATS client has no TLS, so a bridge→NATS hop across a network
+would be plaintext; colocating removes the link rather than leaving it exposed.
+`NATS_URL` accepts only `nats://` and rejects `tls://` for the same reason — a URL
+promising transport security the client cannot provide is worse than a refusal.
+
+This constrains only that one hop. Clients still reach the broker from anywhere over its
+websocket port, and **Postgres may be remote**: `DATABASE_URL` carries `sslmode` in its
+query string and libpq does the work (untested as of 2026-08-16 — see
+`COPY_BINARY_PLAN.md`).
+
+Lifting the constraint is v1.1: migrating to `nats-io/nats.zig`, which has
+server-authenticated TLS and native nkey auth. Costed in `COPY_BINARY_PLAN.md`.
 
 #### Two families of credentials, two files
 

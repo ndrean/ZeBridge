@@ -104,22 +104,187 @@ with TLS.
   before claiming it — in particular that `verify-full` still works once `connInfo`
   appends its keepalives, and on the **replication** connection, which appends
   `replication=database` as well.
-- **NATS: a deployment constraint, arrived at the honest way (2026-08-16).** TLS was
+- **NATS: a shipping constraint of v1.0, not a bug (settled 2026-08-16).** TLS was
   attempted against the vendored pure-Zig client and not achieved — adding it looks like
   substantial work in the client itself, where nkey auth was already a local patch. So
-  the deployment removes the need instead: **the bridge and nats-server are colocated on
-  one VPS and talk over loopback**, and there is no link to encrypt.
+  the deployment removes the need instead: **v1.0 requires the bridge and nats-server on
+  the same host, talking over loopback**, where there is no link to encrypt.
 
-  Worth being clear that this is a mitigation, not a preference — it is sound (loopback
-  is not a network an attacker sits on), but it constrains the topology, and the
-  constraint should be re-examined if the client ever gains TLS. `Endpoint.parseUrl` accepts only `nats://` and rejects `tls://` with
-  `MissingScheme`, which matches the deployment rather than limiting it: a URL promising
-  transport security the client cannot provide is worse than a refusal.
+  State it as a requirement in the release notes rather than leaving it to be discovered.
+  It is sound — loopback is not a network an attacker sits on — but it is a constraint an
+  operator may refuse, and the answer to that is v1.1 below, not a redesign of v1.0.
 
-  What this rules out, and should be stated wherever the topology is described: a
-  *remote* NATS. Clients still reach the server from anywhere — that is the websocket
-  port and the broker's own concern — but the bridge→NATS hop is an intra-host one by
-  design. Revisit only if the client gains TLS.
+### v1.1: migrate to nats-io/nats.zig (evaluated 2026-08-16, deferred)
+
+**Not v1.0.** v1.0 ships on the vendored client, which works; this buys TLS and therefore
+a remote NATS, which is a capability, not a fix. Kept costed here so picking it up is a
+decision rather than a fresh investigation.
+
+`https://github.com/nats-io/nats.zig` — official org, Apache-2.0, 218★, last push
+2026-05-21, tag `v0.1.0`. **Pre-1.0 and says so** ("The API may change before 1.0"),
+which is the one real risk. Everything the bridge depends on is there, checked against
+the source rather than the README:
+
+| what the bridge needs | nats.zig |
+| --- | --- |
+| Zig 0.16, `std.Io` | yes — "`std.Io`-idiomatic", requires `std.Io.Threaded` as host runtime, which is what `init.io` already is |
+| **TLS** | server-authenticated: `tls_required`, `tls_ca_file`, `tls://` scheme, `tls_handshake_first`. mTLS is *not* implemented |
+| nkey seed auth | `nkey_seed` / `nkey_seed_file` — native, so the local patch disappears |
+| pull consumer tuning | `src/jetstream/types.zig`: `durable_name`, `deliver_policy`, `ack_policy`, `ack_wait`, `max_deliver`, `filter_subject` — every field this bridge sets |
+| dedup on publish | `Nats-Msg-Id` headers, PubAck with `seq`/`stream` |
+| KV | `createKeyValue`, `put`/`get`/`watch` — a real API instead of publishing to `$KV.<bucket>.<key>` by hand |
+| `max_payload` | `Client.max_payload`, cached from server INFO — public, instead of reaching into `js.connection.?.server_max_payload` |
+
+And it does not have the bug that panicked the snapshot listener. `src/jetstream/pull.zig`
+consumes status frames inside the library:
+
+```zig
+if (msg.status()) |code| {
+    msg.deinit();
+    switch (code) { 404, 408, 409 => break, 100 => continue, else => break }
+}
+```
+
+so a control frame can never reach caller code and be acked into a null `ReplyTo()`.
+
+**Migration surface is smaller than it looks.** Five files import `nats`
+(`nats_publisher`, `batch_publisher`, `schema_publisher`, `snapshot_listener`,
+`mutation_listener`) and between them make ~15 distinct calls: `JS.CONNECT/PUBLISH/
+DISCONNECT/PURGE`, `Consumer.START/STOP/CONSUME/ACK/NACK/REUSE/PUBLISH`, `Core.CONNECT/
+SUB/PUB/DISCONNECT`. `build.zig` names the module `"nats"` via `addModule`, so switching
+to `b.dependency("nats", …)` leaves every `@import("nats")` untouched. Against that:
+**5 443 lines of vendored client leave the tree**, along with the Linux-syscall porting
+notes in §A1 and the nkey patch.
+
+The work is in semantics, not call count: blocking `CONSUME` loops become `io.async`/
+futures, and `Endpoint.parseUrl` gains the `tls://` scheme it currently refuses. Do it as
+its own branch with the scenario probes as the gate — `faults.py` and `stampede.py`
+already pin the two behaviours most likely to regress.
+
+### v1.1: reads from a **physical streaming standby** (scoped 2026-08-16)
+
+> **Standby replica, never a logical replica.** The whole design rests on the standby
+> replaying the primary's WAL byte for byte, so both hosts share one LSN address space and
+> one timeline. A logical subscriber is a separate cluster with its own WAL and an
+> unrelated LSN space; pointing this at one makes `ev.lsn <= state.lsn` compare two
+> different number lines and produces duplicates or silent drops. "Replica" covers both
+> in casual speech — only the physical streaming standby is meant anywhere in this section.
+
+**Independent of the nats.zig item above** — different leg. Postgres reaches the bridge
+over libpq, which has TLS regardless of what the NATS client can do, so this lands whether
+or not that migration ever happens.
+
+Shape: **ingress → primary, reads → standby.** It moves the two heavy reads off the
+primary — the long `COPY` of a snapshot, and logical decoding itself, which runs on the
+walsender of whichever host owns the slot.
+
+**One standby or two?** One is the design. Two is worth knowing about, because the two
+reads want *opposite* settings from the same host:
+
+|  | snapshot reads | CDC reads |
+| --- | --- | --- |
+| needs a replication slot | **no** — just a consistent read + an LSN | yes |
+| minimum PostgreSQL | any (14+, as today) | **16** — logical decoding on standby |
+| slot invalidation on recovery conflict | not applicable | permanent, forces a full re-seed |
+| wants `max_standby_streaming_delay` | **large** — a long `COPY` must survive | small — replay should keep up |
+| effect of lagging | eats CDC retention (see invariant below) | is the lag |
+
+The conflict is concrete: a large `max_standby_streaming_delay` makes the standby *pause
+replay* while a snapshot runs, so on a single shared standby **a long snapshot stalls CDC**
+from that same host. `hot_standby_feedback=on` avoids the conflict at the source instead of
+delaying replay, which is what lets one standby serve both — at the cost of bloat and xid
+retention on the primary.
+
+So: one standby with `hot_standby_feedback=on`, or two standbys where the snapshot one is a
+plain read replica with no slot, no PG16 requirement, and permission to lag freely.
+
+**Config: nothing new.** `DATABASE_URL` = standby, `DATABASE_WRITER_URL` = primary. That
+is the whole configuration change, and it is the payoff of the 2026-08-16 URL split —
+before it, the read path was assembled from `PG_HOST`/`PG_USER` with no seam to point at
+a second host.
+
+**The read path is already read-only**, verified rather than assumed:
+
+- the publication is *verified, never created* — no `CREATE PUBLICATION` on a read-only host
+- slot creation uses `pg_create_logical_replication_slot()`, permitted on a standby from
+  PG16, and already degrades to "ask your DBA" when refused
+- `"DROP TABLE"` in `event_processor.zig:672` is a DDL **command-tag comparison** read out
+  of `zebridge_ddl_events`, not SQL the bridge executes
+- `dropSlot` exists but is never called
+
+**Code: five `pg_current_wal_lsn()` calls**, each of which errors outright with
+`recovery is in progress` on a standby:
+
+| site | purpose | if unfixed |
+| --- | --- | --- |
+| `snapshot_listener.zig:1167` | snapshot watermark | **load-bearing** — the LSN `web-consumer/src/App.tsx:350` compares every CDC event against |
+| `event_processor.zig:959` | one watermark for the boot-schema pass | has a "stamp 0" fallback, so it degrades *quietly* |
+| `wal_monitor.zig:120` | current LSN | monitoring |
+| `wal_monitor.zig:171,174` | `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` | monitoring |
+
+One helper fixes all five: resolve `pg_is_in_recovery()` once per connection, then use
+`pg_last_wal_replay_lsn()` or `pg_current_wal_lsn()`. ~20 lines plus threading.
+
+**LSNs are a property of the WAL stream, not of the machine.** A physical standby replays
+the primary's WAL byte for byte and shares its LSN address space and timeline, so a
+watermark taken as the standby's replay LSN is directly comparable with CDC LSNs from the
+primary — it is simply an earlier point on the same line. This is what keeps
+`if (ev.lsn <= state.lsn)` correct across two hosts.
+
+**The retention invariant grows a term, and violating it fails silently.** A snapshot from
+a standby lagging by *L* carries a watermark *L* older than the primary's position, and the
+client then needs every CDC event with `lsn > watermark` still present in the stream. So
+TEST_SCENARIOS' `CDC_RET > SNAP_RET + apply time` becomes:
+
+```
+CDC_RET > SNAP_RET + apply time + replica lag
+```
+
+Break it and nothing raises: the client applies what is in the stream, the `first_seq` gap
+check passes, and the table quietly ends up missing a window of changes. There is no way
+for a client to tell "event expired" from "event never existed".
+
+**Which makes one new metric load-bearing, not optional.** On a standby,
+`pg_wal_lsn_diff(replay_lsn, restart_lsn)` measures how far the *slot* trails the
+*standby's own replay* — it says nothing about how far the standby trails the primary. So
+today's `lag_bytes` would stay green while the standby falls arbitrarily far behind and the
+invariant above breaks. Add standby-vs-primary lag before, not after.
+
+**Operational requirements, and the risk that is actually accepted:**
+
+- **PG16+** — logical decoding on a standby did not exist before it. Raises the product's
+  floor from PG14 (where `pgoutput` binary starts) for anyone using this topology.
+- `max_standby_streaming_delay` — **30s by default**, measured on the current server. A
+  snapshot `COPY` running longer than that is cancelled by recovery conflict
+  (`canceling statement due to conflict with recovery`); the listener publishes
+  `generation_failed` and the client retries into the same wall. Needs a much larger value
+  on the snapshot standby, or `hot_standby_feedback=on`.
+- `hot_standby_feedback=on` pushes bloat back onto the primary, undoing part of what the
+  split moved.
+- **Slot invalidation on recovery conflict is permanent**, and forces a full re-seed for
+  every client. This is the real cost of CDC-from-standby, and the reason snapshots-only is
+  the safer first step.
+
+**If the motivation is surviving loss of the primary rather than offloading it**, PG17's
+`sync_replication_slots` + `synchronized_standby_slots` are the better tool — both present
+on the current server (18.4). The slot stays on the primary and is synced to standbys: no
+standby decoding, no invalidation-on-conflict.
+
+**Staging — snapshots first, and it is the cheaper half by a long way.** An earlier draft
+framed this as the *more* awkward option because it needs a third URL
+(`DATABASE_SNAPSHOT_URL`, defaulting to `DATABASE_URL`) where the full split needs none.
+That weighed the wrong thing. A snapshot standby:
+
+- needs **no replication slot**, so the invalidation risk does not exist
+- needs **no PG16** — logical decoding on standby is a CDC requirement, not a read one
+- may lag freely, bounded only by CDC retention
+- removes the single heaviest read from the primary
+
+against one extra env var and the `pg_is_in_recovery()` LSN branch, which is needed either
+way. CDC-from-standby is the bigger commitment: a slot on a host whose slots can be
+invalidated by recovery conflict, and a PG floor of 16.
+
+Do snapshots first. Decide CDC separately, with the standby-lag metric already in place.
 
 **Small, independent, pick up any time** (§F): array quoting (`{"solo"}` vs `{solo}` —
 systematic, blocks a byte-equality golden test), snapshot failures that abort without
