@@ -128,6 +128,7 @@ services:
         INIT_PREFIX=$(jq -r '.subjects.init_prefix' /topology.json)
         REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' /topology.json)
         MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' /topology.json)
+        MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' /topology.json)
         SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
         SNAPSHOT_KV=$(jq -r '.kv.snapshots' /topology.json)
 
@@ -142,7 +143,14 @@ services:
         nats stream add $$REQUESTS_STREAM --subjects="$$REQUESTS_PREFIX.>" --storage=file --retention=limits --max-msgs-per-subject=1 --discard=new --discard-per-subject --max-age=$${SNAP_RET}s --replicas=1 --defaults || true
 
         echo "Creating NATS JetStream stream: $$MUTATIONS_STREAM (subject: $$MUTATIONS_PREFIX.>)"
-        nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults || true
+        # Dead letters share the stream but NOT the subject space: the ingress consumer
+        # filters on "$$MUTATIONS_PREFIX.>", so a rejected mutation republished under that
+        # prefix would be consumed by the bridge again — a poison pill with a feedback
+        # loop. Hence a sibling prefix, captured here so failures are durable and a
+        # client can read why its write was refused.
+        nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults \
+          || nats stream edit $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>" -f \
+          || true
 
         echo "Creating NATS KV bucket: $$SCHEMA_KV"
         nats kv add $$SCHEMA_KV --history=10 --replicas=1 || true

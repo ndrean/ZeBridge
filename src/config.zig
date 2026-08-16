@@ -91,6 +91,21 @@ pub const Nats = struct {
     /// email address cannot be one. Use an opaque id.
     pub const mutation_subject_pattern = topology.mutation_pattern;
 
+    /// Where a mutation goes when it can never succeed: `mutation_error.<table>`.
+    ///
+    /// ⚠️ Deliberately **outside** the `mutation.>` space. A dead-letter subject under
+    /// the same prefix would be matched by the ingress consumer's own filter, so the
+    /// bridge would consume its own failures and republish them forever — a poison pill
+    /// with a feedback loop.
+    pub const mutation_error_prefix = topology.mutation_error_prefix;
+    pub const mutation_error_pattern = topology.mutation_error_pattern;
+
+    /// Redelivery budget for a mutation. Bounded so that a message the bridge
+    /// misclassifies as retryable still stops eventually, instead of pinning the worker
+    /// at one attempt per second for the life of the process (observed: 24 redeliveries
+    /// in 15 s before this existed).
+    pub const mutation_max_deliver: i32 = 5;
+
     /// Token positions in the mutation subject, after splitting on '.'.
     pub const mutation_token_principal = 1;
     pub const mutation_token_table = 2;
@@ -184,6 +199,26 @@ pub const Bridge = struct {
     pub const keepalive_interval_seconds = 30;
 };
 
+/// Edge-write (ingress) configuration.
+pub const Sync = struct {
+    /// The column compared for last-write-wins, when a table does not name its own in
+    /// SYNC_RULES. `updated_at` because that is what Ecto's `timestamps()` and Rails'
+    /// `t.timestamps` produce; Django and TypeORM differ, which is exactly why it is a
+    /// default rather than a rule.
+    pub const default_version_column = "updated_at";
+
+    /// Column-name prefixes that can never be a version column, whatever the operator
+    /// configures. Both are set once at insert and never touched again, so as a version
+    /// they either reject every update (`stored < incoming` is false forever) or, if the
+    /// bridge wrote to them, destroy the column's meaning for the application.
+    pub const creation_column_prefixes = [_][]const u8{ "created", "inserted" };
+
+    /// `atttypmod` for a timestamp is its fractional-second precision; -1 means the
+    /// default, which is 6. Below this, ties are common — and a tie is *rejected* by
+    /// `<`, so a legitimate edit is dropped in silence.
+    pub const min_timestamp_precision = 6;
+};
+
 /// Snapshot generation configuration
 pub const Snapshot = struct {
     // Snapshot identifiers
@@ -191,22 +226,22 @@ pub const Snapshot = struct {
     /// Rows per snapshot chunk
     pub const chunk_size = 10_000;
 
-    /// How long a generated snapshot is considered current (seconds).
-    ///
-    /// A request for a table whose snapshot is younger than this does NOT run a new
-    /// COPY — the bridge re-publishes the existing snapshot's metadata instead. This
-    /// is what decouples database load from client count: a hundred clients
-    /// reconnecting inside the window cost one COPY, not a hundred.
-    ///
-    /// ⚠️ Bounded above by CDC retention: a client seeding from a snapshot at LSN L
-    /// must still find L in the CDC stream when it finishes applying, so
-    ///     CDC_RET > SNAP_RET + client apply time
-    /// Raising this without raising CDC retention silently strands slow clients.
-    /// Overridable with SNAP_RET_SECONDS.
-    pub const retention_seconds = 600; // 10 minutes
+    // Snapshot freshness used to be a bridge-local cache (`SnapshotCache`), which
+    // could not coordinate across bridge instances and died on restart. It is now the
+    // REQUESTS stream's own policy — max-msgs-per-subject=1, discard=new, max-age —
+    // so the window is enforced by the broker for every client, and SNAP_RET_SECONDS
+    // configures nats-init rather than the bridge.
 
     /// Maximum concurrent snapshot requests
     pub const max_concurrent_snapshots = 3;
+
+    /// How long the broker waits for the snapshot worker's ack before redelivering.
+    /// Generous because generation is synchronous and a large table takes minutes; the
+    /// default 30s would redeliver a request whose COPY is still running.
+    pub const request_ack_wait_ns: u64 = 10 * 60 * std.time.ns_per_s;
+
+    /// A snapshot request that keeps failing must stop being redelivered.
+    pub const request_max_deliver: i32 = 3;
 
     /// Snapshot polling interval (milliseconds)
     /// How often to check for new snapshot requests via LISTEN/NOTIFY
@@ -408,6 +443,22 @@ pub const RuntimeConfig = struct {
     pg_sslmode: []const u8,
     db_url: ?[]const u8, // Optional unified connection URI
 
+    /// Credentials for the **ingress** connection, kept separate from the read path on
+    /// purpose. `pg_user` keeps SELECT + REPLICATION and stays physically unable to
+    /// write, whatever the write path grows into; this role has no table privileges
+    /// until a DBA opens one (`zebridge_grant_edge_writes`).
+    ///
+    /// Null means "no writer configured": the mutation listener does not start, rather
+    /// than quietly falling back to the read role. Falling back would mean the ingress
+    /// path silently runs with replication rights — the exact privilege the split
+    /// exists to avoid.
+    pg_writer_user: ?[]const u8,
+    pg_writer_password: ?[]const u8,
+    /// Unified ingress URI, the symmetric counterpart of `db_url`. Preferred when set:
+    /// `connInfo` passes a URL through natively, so it avoids rebuilding the keyword
+    /// form from six fields.
+    pg_writer_url: ?[]const u8,
+
     // PostgreSQL replication
     slot_name: []const u8,
     publication_name: []const u8,
@@ -453,6 +504,9 @@ pub const RuntimeConfig = struct {
             .pg_database = "postgres",
             .pg_sslmode = "disable",
             .db_url = null,
+            .pg_writer_user = null,
+            .pg_writer_password = null,
+            .pg_writer_url = null,
             .slot_name = Postgres.default_slot_name,
             .publication_name = Postgres.default_publication_name,
             .nats_url = null,

@@ -10,6 +10,8 @@
     "init_prefix": "init",
     "mutations_prefix": "mutation",
     "mutation_pattern": "mutation.{[principal]s}.{[table]s}.{[operation]s}",
+    "mutation_error_prefix": "mutation_error",
+    "mutation_error_pattern": "mutation_error.{[table]s}",
     "snapshot_request": "snapshot.request",
     "schema_request": "init.schema",
 

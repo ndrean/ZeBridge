@@ -20,9 +20,13 @@ const usage =
     \\
     \\Environment:
     \\  PG_HOST, PG_PORT, PG_DB          PostgreSQL connection
-    \\  POSTGRES_BRIDGE_USER/_PASSWORD   PostgreSQL credentials
+    \\  POSTGRES_BRIDGE_USER/_PASSWORD   PostgreSQL credentials (read path)
+    \\  POSTGRES_WRITER_USER/_PASSWORD   PostgreSQL credentials (ingress path);
+    \\                                   unset disables the mutation listener
     \\  PG_SSLMODE                       libpq sslmode (default: disable)
     \\  DATABASE_URL                     Unified PostgreSQL URI (overrides PG_* above)
+    \\  DATABASE_WRITER_URL              Unified ingress URI (preferred over
+    \\                                   POSTGRES_WRITER_USER/_PASSWORD)
     \\  NATS_HOST, NATS_URL              NATS server host / unified URI
     \\  NATS_NKEY_SEED                   NATS nkey seed
     \\  BASE_BUF                         log2 of per-event data buffer (10-20)
@@ -32,6 +36,9 @@ const usage =
     \\  PUBLISH_MAX_BACKOFF_MS           Publish backoff ceiling (default: 5000)
     \\  SNAP_RET_SECONDS                 Snapshot freshness window (default: 600)
     \\  TRANSITION_RULES                 e.g. users:status,kyc_level;orders:state
+    \\  SYNC_VERSION_COLUMN              default version column (default: updated_at)
+    \\  SYNC_RULES                       per-table override, same grammar:
+    \\                                   users:updated_at,deleted_at;orders:modified_at
     \\  LOG_LEVEL                        debug|info|warn|err (default: info).
     \\                                   Log lines print "warning"/"error"; both
     \\                                   spellings are accepted here.
@@ -181,6 +188,19 @@ pub const Args = struct {
             break :blk runtime_config.pg_sslmode;
         };
 
+        // Ingress credentials. Deliberately no fallback to POSTGRES_BRIDGE_USER: a
+        // missing writer means the mutation listener does not start, which is a visible
+        // "off" rather than an invisible "running with replication rights".
+        runtime_config.pg_writer_url = init.minimal.environ.getPosix("DATABASE_WRITER_URL");
+        runtime_config.pg_writer_user = init.minimal.environ.getPosix("POSTGRES_WRITER_USER");
+        runtime_config.pg_writer_password = init.minimal.environ.getPosix("POSTGRES_WRITER_PASSWORD");
+
+        const has_writer = runtime_config.pg_writer_url != null or
+            (runtime_config.pg_writer_user != null and runtime_config.pg_writer_password != null);
+        if (!has_writer) {
+            log.info("No DATABASE_WRITER_URL or POSTGRES_WRITER_USER/_PASSWORD — ingress (mutation) path disabled", .{});
+        }
+
         // Parse BASE_BUF environment variable (log2 of buffer size)
         if (init.minimal.environ.getPosix("BASE_BUF")) |buf_log2_str| {
             if (std.fmt.parseInt(u6, buf_log2_str, 10)) |buf_log2| {
@@ -293,17 +313,34 @@ pub const Args = struct {
     /// Format: "table1:col1,col2;table2:col3,col4"
     /// Example: "users:status,kyc_level;orders:state,payment_status"
     pub fn parseTransitionRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
+        return parseTableRules(allocator, init, "TRANSITION_RULES");
+    }
+
+    /// `SYNC_RULES=users:updated_at,deleted_at;orders:modified_at`
+    ///
+    /// Same grammar as TRANSITION_RULES on purpose — operators learn one format, and the
+    /// parser is literally the same code. First column is the version, optional second
+    /// is the tombstone.
+    pub fn parseSyncRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
+        return parseTableRules(allocator, init, "SYNC_RULES");
+    }
+
+    fn parseTableRules(
+        allocator: std.mem.Allocator,
+        init: *const std.process.Init,
+        comptime env_name: []const u8,
+    ) !config.EventClassification.TransitionRules {
         var rules = config.EventClassification.TransitionRules.init(allocator);
         errdefer rules.deinit();
 
-        const rules_str = init.minimal.environ.getPosix("TRANSITION_RULES") orelse return rules;
+        const rules_str = init.minimal.environ.getPosix(env_name) orelse return rules;
 
         if (rules_str.len == 0) {
-            log.info("TRANSITION_RULES is empty, no transition detection configured", .{});
+            log.info(env_name ++ " is empty", .{});
             return rules;
         }
 
-        log.info("Parsing TRANSITION_RULES: {s}", .{rules_str});
+        log.info("Parsing " ++ env_name ++ ": {s}", .{rules_str});
 
         // Split by semicolon to get table rules: "users:status,kyc_level;orders:state"
         var table_iter = std.mem.splitScalar(u8, rules_str, ';');
@@ -313,11 +350,11 @@ pub const Args = struct {
 
             var colon_iter = std.mem.splitScalar(u8, trimmed, ':');
             const table_name = colon_iter.next() orelse {
-                log.warn("Invalid TRANSITION_RULES entry (missing ':'): {s}", .{trimmed});
+                log.warn("Invalid " ++ env_name ++ " entry (missing ':'): {s}", .{trimmed});
                 continue;
             };
             const columns_str = colon_iter.next() orelse {
-                log.warn("Invalid TRANSITION_RULES entry (no columns after ':'): {s}", .{trimmed});
+                log.warn("Invalid " ++ env_name ++ " entry (no columns after ':'): {s}", .{trimmed});
                 continue;
             };
 
@@ -351,9 +388,9 @@ pub const Args = struct {
         }
 
         if (rules.count() == 0) {
-            log.info("No valid transition rules parsed, transition detection disabled", .{});
+            log.info("No valid " ++ env_name ++ " parsed", .{});
         } else {
-            log.info("Transition detection configured for {d} table(s)", .{rules.count()});
+            log.info(env_name ++ ": {d} table(s) configured", .{rules.count()});
         }
 
         return rules;

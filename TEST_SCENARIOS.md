@@ -106,20 +106,36 @@ B3–B6 remain to be run.
 | --- | --- | --- |
 | B1 | Fresh client, tables **empty**, no snapshot | Schema only. Nothing to seed. |
 | B2 | Tables have 1000 rows, fresh client, no snapshot | Client requests a snapshot, seeds, then follows CDC. Local count = 1000. |
-| B3 | As B2, but a **fresh snapshot already exists** | Client seeds from the cached one. Bridge logs *Reusing snapshot* — **no new COPY**. |
+| B3 | As B2, but a **fresh snapshot already exists** | Client reads the KV descriptor and seeds from the existing chunks — **it never publishes a request**. If it does publish one anyway, the broker rejects it (see I/C1): `maximum messages per subject exceeded`, and no new `COPY` runs. |
 | B4 | Client connected, disconnect ~5 s, reconnect | ⭐ **Resumes.** No snapshot request, no chunks, no truncate. The most important case: a phone blip must not redownload the table. |
 | B5 | Disconnect, `nats stream purge CDC`, reconnect | Gap detected → snapshot → truncate → seed. |
 | B6 | Disconnect, insert 100 rows, reconnect inside window | Resumes and applies exactly the 100 missed rows. No re-seed. |
 
-## C. Snapshot cache and retention windows
+## C. Snapshot stampede protection and retention windows
+
+**The protection is the broker's, not the bridge's** (changed 2026-08-16). The `REQUESTS`
+stream is created `--max-msgs-per-subject=1 --discard=new --discard-per-subject
+--max-age=SNAP_RET`, and the snapshot listener consumes *that stream* rather than
+subscribing to the subject with core NATS.
+
+That distinction is the entire test. A core subscriber is a **parallel** listener: the
+stream's limits govern what it stores, never what a core subscription receives. While the
+listener used `core.SUB`, a hundred reconnecting clients still produced a hundred
+requests and a hundred concurrent `COPY`s against the primary — the stream policy
+protected nothing, and the only thing standing between the database and a stampede was
+each client politely checking the KV descriptor first.
+
+An in-process `SnapshotCache` used to exist for this, and was deleted with the switch:
+bridge-local state cannot coordinate across bridge instances and does not survive a
+restart, whereas the stream window does both.
 
 C1–C2 are exercisable now with the `nats` CLI; C3 needs a client to observe the
 failure it is designed to prevent.
 
 | # | setup | expect |
 | --- | --- | --- |
-| C1 | Two `snapshot.request.users` within `SNAP_RET` | One `COPY`. Second logs *Reusing snapshot*, and `init.snap.meta.users` count increments (the requester is still answered). ✅ verified |
-| C2 | Request, wait past `SNAP_RET`, request again | Two `COPY`s, new `snapshot_id`. |
+| C1 | Five `snapshot.request.test_types` at once, inside `SNAP_RET` | ⭐ **one** accepted, the rest rejected by the broker with `503 … maximum messages per subject exceeded`; exactly **one `COPY`** runs. ✅ verified 2026-08-16 (5 published → `accepted=1 rejected=4` → 1 `Snapshot request received`) |
+| C2 | Request, wait past `SNAP_RET`, request again | Two `COPY`s, new `snapshot_id` — the stream's `max-age` is what expires the window. |
 | C3 | `SNAP_RET=60s`, `CDC max-age=30s`. Snapshot, wait 40 s, connect a fresh client | ⭐ Snapshot is *fresh* but **older than the CDC window**. Client must reject it and request a new one. Skipping this check is the silent-divergence bug. |
 | C4 | Two clients reconnect simultaneously, no snapshot | One `COPY`, both served. |
 

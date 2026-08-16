@@ -24,6 +24,39 @@ pub const PgConf = struct {
     /// Enable replication mode (adds replication=database to connection string)
     replication: bool = false,
 
+    /// The ingress connection description: the same host/database, a different role.
+    ///
+    /// Returns null when no writer is configured, which the caller must treat as "do not
+    /// start the mutation listener" — never as "use the read role instead".
+    ///
+    /// Two ways to configure it, mirroring the read path:
+    ///
+    /// - `DATABASE_WRITER_URL` — passed through natively by `connInfo`, so nothing is
+    ///   rebuilt from parts;
+    /// - `POSTGRES_WRITER_USER` + `_PASSWORD` — host and database inherited from the
+    ///   read config, role swapped.
+    ///
+    /// ⚠️ The read path's `db_url` is **never** inherited. `DATABASE_URL` embeds its own
+    /// credentials, so carrying it here would silently reconnect as the read role and
+    /// undo the split — with logs that look entirely healthy.
+    pub fn writer_from_runtime_config(runtime_config: *const Config.RuntimeConfig) ?PgConf {
+        var conf = from_runtime_config(runtime_config);
+        conf.db_url = null;
+        conf.replication = false;
+
+        if (runtime_config.pg_writer_url) |url| {
+            conf.db_url = url;
+            // Cosmetic only — the URL carries the real credentials — but it keeps logs
+            // and error messages from naming the read role on a writer connection.
+            conf.user = runtime_config.pg_writer_user orelse "(from DATABASE_WRITER_URL)";
+            return conf;
+        }
+
+        conf.user = runtime_config.pg_writer_user orelse return null;
+        conf.password = runtime_config.pg_writer_password orelse return null;
+        return conf;
+    }
+
     /// Create PgConf from RuntimeConfig
     /// Does not allocate - just references strings from RuntimeConfig
     pub fn from_runtime_config(runtime_config: *const Config.RuntimeConfig) PgConf {

@@ -79,8 +79,11 @@ pub const MutationListener = struct {
         // Asked of libpq rather than read back from the config fields: with
         // DATABASE_URL set those fields hold the unused PG_* defaults, so printing them
         // would report a host this connection never dialled.
-        log.info("Mutation listener: Connected to PostgreSQL at {s}:{s}.", .{
-            c.PQhost(conn), c.PQport(conn),
+        // Role included: the whole point of the ingress connection is that it is NOT
+        // the replication role, and a log line that cannot show which one connected
+        // cannot show that the split is working.
+        log.info("Mutation listener: connected to PostgreSQL {s}:{s} as '{s}'.", .{
+            c.PQhost(conn), c.PQport(conn), c.PQuser(conn),
         });
 
         // 2. Connect to NATS JetStream Pull Consumer
@@ -88,6 +91,9 @@ pub const MutationListener = struct {
             .durable_name = "bridge_mutations_worker",
             .ack_policy = "explicit",
             .deliver_policy = "all",
+            // The server-side half of the poison-pill guard: even a failure the bridge
+            // wrongly classifies as retryable stops after this many attempts.
+            .max_deliver = config.Nats.mutation_max_deliver,
             // Not "mutation.>" spelled out: the comment used to say "from topology.json
             // prefix", which is the shape of the drift this centralisation exists to stop.
             .filter_subject = config.Nats.mutations_subject_wildcard,
@@ -137,8 +143,18 @@ pub const MutationListener = struct {
                 };
                 
                 self.handleMutation(payload, conn) catch |err| {
-                    log.err("Failed to handle mutation: {}", .{err});
-                    // We NAck to let it retry immediately or according to backoff
+                    // Retrying a malformed payload cannot help: the bytes will not
+                    // improve. Before this split, one bad message NAK'd forever at one
+                    // attempt per second and the queue never advanced past it.
+                    if (isPermanent(err)) {
+                        log.err("🔴 Unprocessable mutation ({}): dead-lettering, not retrying", .{err});
+                        self.deadLetter(msg, payload, err);
+                        // ACK, not NACK: the message is handled — badly, but finally.
+                        consumer.ACK(msg, true) catch consumer.REUSE(msg);
+                        continue;
+                    }
+
+                    log.err("Failed to handle mutation, will retry: {}", .{err});
                     consumer.NACK(msg, true) catch {
                         consumer.REUSE(msg);
                     };
@@ -154,6 +170,83 @@ pub const MutationListener = struct {
                 utils.sleep(100 * std.time.ns_per_ms);
             }
         }
+
+        // Every other thread announces its exit — a shutdown where one thread goes
+        // quiet without saying so is indistinguishable from one that is stuck.
+        log.info("🛑 Mutation listener stopped", .{});
+    }
+
+
+    /// Errors a retry can never fix.
+    ///
+    /// The distinction is the whole poison-pill guard: a transient failure (PostgreSQL
+    /// restarting, a lock timeout) deserves redelivery, while a payload that does not
+    /// decode will fail identically forever. `max_deliver` bounds the mistake in either
+    /// direction, but classifying correctly is what keeps a healthy queue moving.
+    ///
+    /// `MutationFailed` — any SQL error — is deliberately treated as *transient*: it
+    /// covers both a lost connection and a constraint violation, and until the reply
+    /// channel exists there is no way to tell a client which one it hit. `max_deliver`
+    /// catches the permanent ones after five attempts.
+    fn isPermanent(err: anyerror) bool {
+        return switch (err) {
+            error.InvalidPayloadFormat,
+            error.MissingTable,
+            error.InvalidTableFormat,
+            error.MissingOperation,
+            error.InvalidOperationFormat,
+            error.MissingHLC,
+            error.InvalidHLCFormat,
+            error.MissingPrimaryKey,
+            error.InvalidPrimaryKeyFormat,
+            error.MissingData,
+            error.InvalidDataFormat,
+            error.UnsupportedPayloadType,
+            => true,
+            else => false,
+        };
+    }
+
+    /// Publish the rejected mutation to `mutation_error.<table>` so the failure is
+    /// visible to whoever sent it, rather than vanishing on ACK.
+    ///
+    /// Best effort by design: if this publish fails there is nothing useful left to do,
+    /// and refusing to ACK would restore the infinite loop it exists to prevent.
+    fn deadLetter(
+        self: *MutationListener,
+        msg: *nats.Conn.AllocatedMSG,
+        payload: []const u8,
+        err: anyerror,
+    ) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        // The table is parsed from the subject rather than the payload: the payload is
+        // exactly what failed to parse, so it cannot be trusted to name itself.
+        const subject = msg.letter.subject.body() orelse "";
+        var it = std.mem.splitScalar(u8, subject, '.');
+        var token: usize = 0;
+        var table: []const u8 = "unknown";
+        while (it.next()) |tok| : (token += 1) {
+            if (token == config.Nats.mutation_token_table) {
+                table = tok;
+                break;
+            }
+        }
+
+        // Named field, like the snapshot subject patterns: topology writes
+        // "{[table]s}", so the argument is a struct, not a tuple.
+        const err_subject = std.fmt.allocPrint(alloc, config.Nats.mutation_error_pattern, .{ .table = table }) catch return;
+        const body = std.fmt.allocPrint(
+            alloc,
+            "{{\"error\":\"{s}\",\"subject\":\"{s}\",\"bytes\":{d}}}",
+            .{ @errorName(err), subject, payload.len },
+        ) catch return;
+
+        log.warn("↩️  dead-letter → {s}: {s}", .{ err_subject, body });
+        // TODO: publish once the listener holds a publish-capable NATS handle; the
+        // consumer connection is pull-only today.
     }
 
     fn handleMutation(self: *MutationListener, payload_bytes: []const u8, conn: ?*c.PGconn) !void {

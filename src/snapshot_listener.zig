@@ -24,30 +24,6 @@ pub const log = std.log.scoped(.snapshot_listener);
 
 
 
-/// What the bridge remembers about the most recent snapshot of one table.
-///
-/// This is what decouples database load from client count. Without it, every
-/// `snapshot.request` runs a fresh COPY, so a hundred clients reconnecting after a
-/// network blip means a hundred concurrent COPYs against the primary. With it they
-/// share one.
-///
-/// Note there is deliberately no `in_flight` flag: generation happens synchronously
-/// inside the request loop, so while one snapshot runs the listener is not reading
-/// new requests — they queue in NATS. By the time the second request is processed the
-/// entry is fresh, and the freshness check alone collapses the stampede.
-const SnapshotCacheEntry = struct {
-    snapshot_id: []const u8, // owned
-    lsn_text: []const u8, // owned; the LSN as published, e.g. "0/1816690"
-    batch_count: u32,
-    row_count: u64,
-    generated_at: i64, // unix seconds
-
-    fn deinit(self: *const SnapshotCacheEntry, allocator: std.mem.Allocator) void {
-        allocator.free(self.snapshot_id);
-        allocator.free(self.lsn_text);
-    }
-};
-
 /// What a completed snapshot reports back, so the cache can answer later requests
 /// without re-running the COPY. `lsn_text` is owned by the caller's allocator: inside
 /// the generator it points into a PGresult that is cleared on return.
@@ -57,112 +33,10 @@ const SnapshotResult = struct {
     row_count: u64,
 };
 
-/// table name -> most recent snapshot. Owned keys.
-const SnapshotCache = struct {
-    map: std.StringHashMap(SnapshotCacheEntry),
-    allocator: std.mem.Allocator,
-
-    fn init(allocator: std.mem.Allocator) SnapshotCache {
-        return .{ .map = std.StringHashMap(SnapshotCacheEntry).init(allocator), .allocator = allocator };
-    }
-
-    fn deinit(self: *SnapshotCache) void {
-        var it = self.map.iterator();
-        while (it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
-            e.value_ptr.deinit(self.allocator);
-        }
-        self.map.deinit();
-    }
-
-    /// Is there a snapshot for this table younger than `retention_seconds`?
-    fn fresh(self: *const SnapshotCache, table: []const u8, retention_seconds: i64) ?SnapshotCacheEntry {
-        const entry = self.map.get(table) orelse return null;
-        const age = @as(i64, @intCast(c.time(null))) - entry.generated_at;
-        if (age >= retention_seconds) return null;
-        return entry;
-    }
-
-    fn put(
-        self: *SnapshotCache,
-        table: []const u8,
-        snapshot_id: []const u8,
-        lsn_text: []const u8,
-        batch_count: u32,
-        row_count: u64,
-    ) !void {
-        const id_owned = try self.allocator.dupe(u8, snapshot_id);
-        errdefer self.allocator.free(id_owned);
-        const lsn_owned = try self.allocator.dupe(u8, lsn_text);
-        errdefer self.allocator.free(lsn_owned);
-
-        const gop = try self.map.getOrPut(table);
-        if (gop.found_existing) {
-            gop.value_ptr.deinit(self.allocator);
-        } else {
-            // getOrPut stored the caller's slice as the key; replace with a copy we own.
-            gop.key_ptr.* = self.allocator.dupe(u8, table) catch |err| {
-                _ = self.map.remove(table);
-                return err;
-            };
-        }
-        gop.value_ptr.* = .{
-            .snapshot_id = id_owned,
-            .lsn_text = lsn_owned,
-            .batch_count = batch_count,
-            .row_count = row_count,
-            .generated_at = @intCast(c.time(null)),
-        };
-    }
-};
-
-
-/// Re-publish an existing snapshot's metadata over a Core connection.
+/// Publish a snapshot error.
 ///
-/// Used when a request arrives for a table whose snapshot is still fresh. The chunks
-/// are already in the INIT stream, so no COPY is needed — but the requester must still
-/// be told where they are, otherwise skipping regeneration means answering with
-/// silence and the client waits forever.
-fn publishSnapshotMetaCore(
-    allocator: std.mem.Allocator,
-    core: *nats.Core,
-    table_name: []const u8,
-    entry: SnapshotCacheEntry,
-    format: encoder_mod.Format,
-) !void {
-    const subject = try std.fmt.allocPrint(
-        allocator,
-        config.Snapshot.meta_subject_pattern,
-        .{ .table = table_name },
-    );
-    defer allocator.free(subject);
-
-    var encoder = encoder_mod.Encoder.init(allocator, format);
-    defer encoder.deinit();
-
-    var map = encoder.createMap();
-    defer map.free(allocator);
-
-    const lsn_int = parsePgLsn(entry.lsn_text) catch 0;
-
-    try map.put(encoder.allocator, "snapshot_id", try encoder.createString(entry.snapshot_id));
-    try map.put(encoder.allocator, "table", try encoder.createString(table_name));
-    try map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
-    try map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
-    try map.put(encoder.allocator, "batch_count", encoder.createInt(@intCast(entry.batch_count)));
-    try map.put(encoder.allocator, "row_count", encoder.createInt(@intCast(entry.row_count)));
-    // Distinguishes "here is the snapshot I just made" from "here is one I made earlier".
-    try map.put(encoder.allocator, "cached", encoder.createBool(true));
-
-    const payload = try encoder.encode(map);
-    defer allocator.free(payload);
-
-    try core.PUB(subject, null, payload);
-}
-
-/// Publish a snapshot error over a Core connection.
-///
-/// The live listener holds only a Core connection, but `init.snap.error.<table>` is a
+/// Uses the ingress consumer's own connection — one connection consumes requests and
+/// answers them. `init.snap.error.<table>` is a
 /// subject the INIT stream captures, so a core publish is stored exactly like a
 /// JetStream one — the only thing given up is the publish ack, which is acceptable for
 /// an error notification.
@@ -170,9 +44,9 @@ fn publishSnapshotMetaCore(
 /// This exists because the alternative was `continue`: a client that published a
 /// request and got neither data nor error waits forever. Silence is the worst possible
 /// answer to a request.
-fn publishSnapshotErrorCore(
+fn publishSnapshotError(
     allocator: std.mem.Allocator,
-    core: *nats.Core,
+    consumer: *nats.Consumer,
     table_name: []const u8,
     error_type: []const u8,
     error_message: []const u8,
@@ -209,7 +83,7 @@ fn publishSnapshotErrorCore(
     const payload = try encoder.encode(map);
     defer allocator.free(payload);
 
-    try core.PUB(subject, null, payload);
+    try consumer.PUBLISH(subject, null, payload);
 }
 
 /// Publish to NATS JetStream with retry logic and exponential backoff
@@ -689,7 +563,7 @@ pub const SnapshotListener = struct {
             }
         }
 
-        log.info("📋 Schema listener stopping...", .{});
+        log.info("📋 Schema listener stopped", .{});
     }
 
     /// Handle a single schema request by querying PostgreSQL and publishing response
@@ -937,44 +811,61 @@ pub const SnapshotListener = struct {
         while (!should_stop.load(.acquire)) {
             log.info("📸 Snapshot listener: Connecting to NATS...", .{});
 
-            // Create Core NATS connection
-            var core = nats.Core{};
+            // A JetStream consumer on REQUESTS, deliberately NOT a core subscription.
+            //
+            // The REQUESTS stream is configured `--max-msgs-per-subject=1 --discard=new
+            // --max-age=SNAP_RET`, which is the stampede protection: one snapshot request
+            // per table per window, enforced by the broker for every client. That only
+            // works if the bridge reads the *stream*. A core subscriber is a parallel
+            // listener — the stream's limits govern what it stores, never what a core
+            // subscription receives — so with `core.SUB` a hundred reconnecting clients
+            // still produced a hundred requests and a hundred COPYs, and the policy
+            // protected nothing.
+            //
+            // It also replaces trust with enforcement: previously the only thing standing
+            // between the primary and a stampede was each client politely checking the KV
+            // descriptor first.
+            var cscnf = nats.protocol.ConsumerConfig{
+                .durable_name = "bridge_snapshot_worker",
+                .ack_policy = "explicit",
+                .deliver_policy = "all",
+                .filter_subject = config.Snapshot.request_subject_wildcard,
+                // A snapshot runs synchronously in this loop and can take minutes on a
+                // large table. The default 30s ack_wait would redeliver the request while
+                // the first COPY is still running — duplicate snapshots for one request.
+                .ack_wait = config.Snapshot.request_ack_wait_ns,
+                // A request that keeps failing must not be retried forever.
+                .max_deliver = config.Snapshot.request_max_deliver,
+            };
+
             const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .port = nats_port, .nkey_seed = nats_seed };
-            core.CONNECT(allocator, connect_opts, io) catch |err| {
-                log.err("📸 Snapshot listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
+            var consumer = nats.Consumer.START(
+                allocator,
+                connect_opts,
+                config.Nats.stream_requests,
+                &cscnf,
+                io,
+            ) catch |err| {
+                log.err("📸 Snapshot listener: Failed to start consumer on '{s}': {} - retrying in {d}ms", .{ config.Nats.stream_requests, err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
-            defer core.DISCONNECT();
+            defer nats.Consumer.STOP(&consumer, false);
 
-            log.info("📸 Snapshot listener: Connected! Subscribing to '{s}'...", .{config.Snapshot.request_subject_wildcard});
-
-            // Subscribe to init.snapshot.> wildcard
-            const sid = "snapshot-listener-1";
-            // Subject comes from topology.json. This was hardcoded as "init.snapshot.>"
-            // while topology (and PROTOCOL.md) declare "snapshot.request.>", so a client
-            // following the documented contract published into a subject nothing was
-            // listening on — the request simply vanished.
-            core.SUB(config.Snapshot.request_subject_wildcard, null, sid) catch |err| {
-                log.err("📸 Snapshot listener: Failed to subscribe: {} - reconnecting", .{err});
-                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
-                continue;
-            };
-
-            log.info("📸 Snapshot listener: ✅ Subscribed! Waiting for snapshot requests...", .{});
+            log.info("📸 Snapshot listener: ✅ Consuming '{s}' from stream '{s}'", .{
+                config.Snapshot.request_subject_wildcard,
+                config.Nats.stream_requests,
+            });
 
             // Listen for snapshot requests
             while (!should_stop.load(.acquire)) {
-                if (core.connection) |conn| {
-                    const msg = conn.waitMessageNMT(nats.protocol.SECNS / 2, null) catch |err| {
-                        if (err == error.Timeout) {
-                            continue; // Normal timeout, keep polling
-                        }
-                        log.err("📸 Snapshot listener: Error receiving: {} - reconnecting", .{err});
-                        utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
-                        break; // Break inner loop to trigger reconnection
-                    };
-                    defer conn.reuse(msg);
+                if (consumer.CONSUME(nats.protocol.SECNS / 2) catch null) |msg| {
+                    // ACKed as soon as it is understood, not after the COPY finishes.
+                    // Holding the ack across a multi-minute snapshot only buys
+                    // redelivery-on-crash, and pays for it with duplicate snapshots
+                    // whenever generation outlives ack_wait. The stream's own
+                    // max-msgs-per-subject window is what stops a re-request anyway.
+                    defer consumer.ACK(msg, true) catch consumer.REUSE(msg);
 
                     // Extract table name from subject: init.snapshot.<table>
                     const subject = msg.letter.subject.body() orelse {
@@ -999,9 +890,9 @@ pub const SnapshotListener = struct {
                     // "refused" is the more specific and more actionable answer.
                     if (refused.isRefused(table_name)) {
                         log.warn("📸 Table '{s}' is refused (no primary key) — publishing error", .{table_name});
-                        publishSnapshotErrorCore(
+                        publishSnapshotError(
                             allocator,
-                            &core,
+                            &consumer,
                             table_name,
                             "table_refused",
                             "Table has no primary key: replication is suspended, so no snapshot can be served",
@@ -1017,9 +908,9 @@ pub const SnapshotListener = struct {
                     const is_monitored = publication_mod.isTableMonitored(table_name, monitored_tables);
                     if (!is_monitored) {
                         log.warn("📸 Table '{s}' not in monitored tables — publishing error", .{table_name});
-                        publishSnapshotErrorCore(
+                        publishSnapshotError(
                             allocator,
-                            &core,
+                            &consumer,
                             table_name,
                             "table_not_monitored",
                             "Table is not in the publication this bridge replicates",
@@ -1054,9 +945,9 @@ pub const SnapshotListener = struct {
                         nats_seed,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
-                        publishSnapshotErrorCore(
+                        publishSnapshotError(
                             allocator,
-                            &core,
+                            &consumer,
                             table_name,
                             "generation_failed",
                             @errorName(err),
@@ -1070,14 +961,11 @@ pub const SnapshotListener = struct {
                     defer allocator.free(result.lsn_text);
 
                     log.info("📸 ✅ Snapshot completed for '{s}'", .{table_name});
-                } else {
-                    log.err("📸 Snapshot listener: Connection lost - reconnecting", .{});
-                    break; // Break inner loop to trigger reconnection
                 }
             }
         }
 
-        log.info("📸 Snapshot listener stopping...", .{});
+        log.info("📸 Snapshot listener stopped", .{});
     }
 
     /// Generate incremental snapshot

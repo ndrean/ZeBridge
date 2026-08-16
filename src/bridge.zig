@@ -329,6 +329,12 @@ pub fn main(init: std.process.Init) !void {
     var transition_rules = try args.Args.parseTransitionRules(allocator, &init);
     defer args.Args.deinitTransitionRules(&transition_rules, allocator);
 
+    // Which column carries the version, per table. Same grammar as TRANSITION_RULES.
+    var sync_rules = try args.Args.parseSyncRules(allocator, &init);
+    defer args.Args.deinitTransitionRules(&sync_rules, allocator);
+    const default_version_column = init.minimal.environ.getPosix("SYNC_VERSION_COLUMN") orelse
+        Config.Sync.default_version_column;
+
     // Shared between preflight (boot) and the DDL path (runtime): both decide a table
     // has no primary key, and the mutation path must honour either verdict.
     var refused = refused_tables.Registry.init(allocator);
@@ -349,6 +355,8 @@ pub fn main(init: std.process.Init) !void {
         &pg_config,
         parsed_args.publication_name,
         &transition_rules,
+        &sync_rules,
+        default_version_column,
         runtime_config.strict_tables,
         &refused,
     ) catch |err| switch (err) {
@@ -448,19 +456,30 @@ pub fn main(init: std.process.Init) !void {
     defer snap_listener.deinit();
     log.info("✅ Snapshot listener thread started\n", .{});
 
-    // === Start thread: mutation listener
-    log.info("Starting mutation listener thread...", .{});
-    var mut_listener = try mutation_listener.MutationListener.init(
-        allocator,
-        &pg_config,
-        &runtime_config,
-        io,
-        &should_stop,
-    );
-    try mut_listener.start();
-    defer mut_listener.join();
-    defer mut_listener.deinit();
-    log.info("✅ Mutation listener thread started\n", .{});
+    // === Start thread: mutation listener (only if an ingress role is configured)
+    //
+    // The write path runs under its own role, so enabling it can never widen the read
+    // path's privileges. No writer configured means no listener — not a fallback to
+    // `bridge_reader`, which has REPLICATION and is exactly what must not be doing
+    // client-driven writes.
+    var writer_config = pg_conn.PgConf.writer_from_runtime_config(&runtime_config);
+    var mut_listener: ?*mutation_listener.MutationListener = null;
+    if (writer_config) |*wc| {
+        log.info("Starting mutation listener thread (role: {s})...", .{wc.user});
+        mut_listener = try mutation_listener.MutationListener.init(
+            allocator,
+            wc,
+            &runtime_config,
+            io,
+            &should_stop,
+        );
+        try mut_listener.?.start();
+        log.info("✅ Mutation listener thread started\n", .{});
+    } else {
+        log.info("ℹ️  Ingress disabled: no POSTGRES_WRITER_USER/_PASSWORD configured", .{});
+    }
+    defer if (mut_listener) |m| m.deinit();
+    defer if (mut_listener) |m| m.join();
 
     // === Start thread: CDC async publisher (heap-allocated for stable address)
     // Use c_allocator (thread-safe) for cross-thread allocations:
