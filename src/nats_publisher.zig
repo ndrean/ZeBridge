@@ -18,13 +18,16 @@ const utils = @import("utils.zig");
 pub const log = std.log.scoped(.nats_pub);
 
 /// NATS Publisher Configuration
-// TODO URL
 pub const PublisherConfig = struct {
-    url: []const u8 = "nats://127.0.0.1:4222",
-    max_reconnect_attempts: i32 = -1, // -1 = infinite
+    /// Where NATS is. Resolved once by `Conf.Nats.Endpoint.resolve` and handed to every
+    /// component, rather than each one re-deriving it: this field used to be a URL
+    /// string with a hardcoded `nats://127.0.0.1:4222` default that the publisher then
+    /// parsed itself, which is how the bridge ended up with two different opinions about
+    /// where the server was.
+    endpoint: Conf.Nats.Endpoint = .{},
+    max_reconnect_attempts: i32 = Conf.Nats.max_reconnect_attempts, // -1 = infinite
     reconnect_wait_ms: i64 = Conf.Nats.reconnect_wait_ms,
     max_backoff_ms: i64 = Conf.Nats.max_backoff_ms,
-    nkey_seed: ?[]const u8 = null, // Optional NKEY private seed (SU...)
 };
 
 /// Pure Zig NATS/JetStream Publisher
@@ -51,14 +54,6 @@ pub const Publisher = struct {
     config: PublisherConfig,
     nc: ?*nats.Client = null,
     js: ?nats.JS = null, // JS is a struct, not a pointer
-    nats_url: []const u8,
-    nats_host: []const u8, // Parsed host for reconnection
-    nats_port: u16, // Parsed port for reconnection
-    // Credentials parsed out of nats_url. Slices into nats_url, which the Publisher
-    // owns for its lifetime — so no allocation and nothing to free.
-    nats_user: ?[]const u8 = null,
-    nats_pass: ?[]const u8 = null,
-    nats_nkey_seed: ?[]const u8 = null, // Prepared for NKEY authentication
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     reconnect_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
@@ -70,74 +65,41 @@ pub const Publisher = struct {
         config: PublisherConfig,
         io: std.Io,
     ) !Publisher {
-        // URL is provided by the caller (built from env vars in bridge.zig); dupe for ownership.
-        const url = try allocator.dupe(u8, config.url);
         return Publisher{
             .allocator = allocator,
             .config = config,
             .nc = null,
             .js = null,
-            .nats_url = url,
-            .nats_host = "",
-            .nats_port = Conf.Nats.default_port,
-            .nats_nkey_seed = config.nkey_seed,
             .io = io,
         };
     }
 
+    /// The resolved address, for anything that needs to connect the same way.
+    pub fn endpoint(self: *const Publisher) Conf.Nats.Endpoint {
+        return self.config.endpoint;
+    }
+
     pub fn connect(self: *Publisher) !void {
-        // Parse URL to extract host (the pure Zig client needs host, not URL)
-        // Format: nats://[user:pass@]host:port
-        var host: []const u8 = Conf.Nats.default_host;
-        var port: u16 = Conf.Nats.default_port;
+        const ep = self.config.endpoint;
 
-        // Simple URL parsing (assumes nats://host:port or nats://user:pass@host:port)
-        if (std.mem.indexOf(u8, self.nats_url, "nats://")) |idx| {
-            const after_scheme = self.nats_url[idx + 7 ..];
-            // Split off credentials. These must be forwarded to CONNECT — dropping
-            // them here leaves the client waiting forever on a server that requires
-            // authorization, with no error surfaced.
-            const host_port = if (std.mem.indexOf(u8, after_scheme, "@")) |at_idx| blk: {
-                const creds = after_scheme[0..at_idx];
-                if (std.mem.indexOf(u8, creds, ":")) |colon| {
-                    self.nats_user = creds[0..colon];
-                    self.nats_pass = creds[colon + 1 ..];
-                }
-                break :blk after_scheme[at_idx + 1 ..];
-            } else after_scheme;
-
-            // Parse host:port
-            if (std.mem.indexOf(u8, host_port, ":")) |colon_idx| {
-                host = host_port[0..colon_idx];
-                const port_str = host_port[colon_idx + 1 ..];
-                port = try std.fmt.parseInt(u16, port_str, 10);
-            } else {
-                host = host_port;
-            }
-        }
-
-        // Save host and port for reconnection
-        self.nats_host = try self.allocator.dupe(u8, host);
-        self.nats_port = port;
-
-        // Never log nats_url — it embeds the password, and these logs ship to Loki.
+        // Never log the URL — it embeds the password, and these logs ship to Loki.
         log.info("Connecting to NATS at {s}:{d} (auth={s})", .{
-            host,
-            port,
-            if (self.nats_user != null or self.nats_nkey_seed != null) "yes" else "no",
+            ep.host,
+            ep.port,
+            if (ep.user != null or ep.seed != null) "yes" else "no",
         });
 
         // Create JetStream context (includes NATS client connection)
         const js = try nats.JS.CONNECT(self.allocator, .{
-            .addr = self.nats_host,
-            .port = self.nats_port,
-            .user = self.nats_user,
-            .pass = self.nats_pass,
-            .nkey_seed = self.nats_nkey_seed,
+            .addr = ep.host,
+            .port = ep.port,
+            .user = ep.user,
+            .pass = ep.pass,
+            .nkey_seed = ep.seed,
         }, self.io);
         self.js = js;
 
-        log.info("🟢 Connected to NATS at {s}:{d}", .{ self.nats_host, self.nats_port });
+        log.info("🟢 Connected to NATS at {s}:{d}", .{ ep.host, ep.port });
         log.info("✅ JetStream context acquired", .{});
         self.is_connected.store(true, .seq_cst);
 
@@ -186,13 +148,14 @@ pub const Publisher = struct {
                 self.js = null;
             }
 
-            // Attempt new connection
+            // Attempt new connection to the same resolved endpoint
+            const ep = self.config.endpoint;
             const js = nats.JS.CONNECT(self.allocator, .{
-                .addr = self.nats_host,
-                .port = self.nats_port,
-                .user = self.nats_user,
-                .pass = self.nats_pass,
-                .nkey_seed = self.nats_nkey_seed,
+                .addr = ep.host,
+                .port = ep.port,
+                .user = ep.user,
+                .pass = ep.pass,
+                .nkey_seed = ep.seed,
             }, self.io) catch |err| {
                 log.warn("Reconnect attempt {d} failed: {s}", .{ attempt + 1, @errorName(err) });
                 continue;
@@ -209,8 +172,8 @@ pub const Publisher = struct {
             }
 
             log.info("🟢 NATS reconnected to {s}:{d} (reconnect #{d})", .{
-                self.nats_host,
-                self.nats_port,
+                ep.host,
+                ep.port,
                 count,
             });
 
@@ -228,6 +191,10 @@ pub const Publisher = struct {
     }
 
     pub fn deinit(self: *Publisher) void {
+        // "Disconnected" is only true if we ever connected. Logging it unconditionally
+        // made a failed *first* connection read as a lost one — the misleading
+        // `🥁 Disconnected from NATS` that appeared when NATS_URL did not resolve.
+        const was_connected = self.js != null;
         self.is_connected.store(false, .seq_cst);
 
         if (self.js) |*js| {
@@ -235,18 +202,11 @@ pub const Publisher = struct {
             self.js = null;
         }
 
-        // No separate nc in pure Zig nats - JetStream includes the connection
+        // No separate nc in pure Zig nats - JetStream includes the connection.
+        // Nothing to free: the endpoint borrows from the environment block.
         self.nc = null;
 
-        if (self.nats_url.len > 0) {
-            self.allocator.free(self.nats_url);
-        }
-
-        if (self.nats_host.len > 0) {
-            self.allocator.free(self.nats_host);
-        }
-
-        log.info("🥁 Disconnected from NATS", .{});
+        if (was_connected) log.info("🥁 Disconnected from NATS", .{});
     }
 
     /// Check if NATS connection is alive

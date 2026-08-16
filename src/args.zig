@@ -19,31 +19,29 @@ const usage =
     \\  --help, -h      Show this message
     \\
     \\Environment:
-    \\  PG_HOST, PG_PORT, PG_DB          PostgreSQL connection
-    \\  POSTGRES_BRIDGE_USER/_PASSWORD   PostgreSQL credentials (read path)
-    \\  POSTGRES_WRITER_USER/_PASSWORD   PostgreSQL credentials (ingress path);
-    \\                                   unset disables the mutation listener
-    \\  PG_SSLMODE                       libpq sslmode (default: disable)
-    \\  DATABASE_URL                     Unified PostgreSQL URI (overrides PG_* above)
-    \\  DATABASE_WRITER_URL              Unified ingress URI (preferred over
-    \\                                   POSTGRES_WRITER_USER/_PASSWORD)
-    \\  NATS_HOST, NATS_URL              NATS server host / unified URI
-    \\  NATS_NKEY_SEED                   NATS nkey seed
-    \\  BASE_BUF                         log2 of per-event data buffer (10-20)
-    \\  RING_BUFFER_COUNT                Ring buffer slots (1024-1048576)
-    \\  PUBLISH_MAX_RETRIES              Publish retries before fatal (default: 5)
-    \\  PUBLISH_BACKOFF_MS               First publish backoff (default: 100)
-    \\  PUBLISH_MAX_BACKOFF_MS           Publish backoff ceiling (default: 5000)
-    \\  SNAP_RET_SECONDS                 Snapshot freshness window (default: 600)
-    \\  TRANSITION_RULES                 e.g. users:status,kyc_level;orders:state
-    \\  SYNC_VERSION_COLUMN              default version column (default: updated_at)
-    \\  SYNC_RULES                       per-table override, same grammar:
-    \\                                   users:updated_at,deleted_at;orders:modified_at
-    \\  LOG_LEVEL                        debug|info|warn|err (default: info).
-    \\                                   Log lines print "warning"/"error"; both
-    \\                                   spellings are accepted here.
+    \\  DATABASE_URL          REQUIRED. Read path, credentials included:
+    \\                        postgres://<role>:<pass>@<host>:<port>/<db>[?sslmode=…]
+    \\  DATABASE_WRITER_URL   Ingress path, same form. Unset disables the mutation
+    \\                        listener entirely — it never falls back to the read role.
+    \\  BRIDGE_PORT           HTTP telemetry port when --port is absent
+    \\  NATS_URL              nats://[user:pass@]host[:port] (default: localhost)
+    \\  NATS_NKEY_SEED        NATS nkey seed
+    \\  BASE_BUF              log2 of per-event data buffer (10-20)
+    \\  RING_BUFFER_COUNT     Ring buffer slots (1024-1048576)
+    \\  PUBLISH_MAX_RETRIES   Publish retries before fatal (default: 5)
+    \\  PUBLISH_BACKOFF_MS    First publish backoff (default: 100)
+    \\  PUBLISH_MAX_BACKOFF_MS  Publish backoff ceiling (default: 5000)
+    \\  TRANSITION_RULES      e.g. users:status,kyc_level;orders:state
+    \\  SYNC_VERSION_COLUMN   default version column (default: updated_at)
+    \\  SYNC_RULES            per-table override, same grammar:
+    \\                        users:updated_at,deleted_at;orders:modified_at
+    \\  LOG_LEVEL             debug|info|warn|err (default: info).
+    \\                        Log lines print "warning"/"error"; both
+    \\                        spellings are accepted here.
     \\
-    \\Defaults for all of the above live in src/config.zig.
+    \\Admin credentials (PG_HOST/PG_USER/PG_PASSWORD, POSTGRES_BRIDGE_*,
+    \\POSTGRES_WRITER_*) are NOT read by the bridge — they belong to init.sql and the
+    \\bridge-init container. Keep them in .env.admin. Defaults live in src/config.zig.
     \\
 ;
 
@@ -95,7 +93,11 @@ pub const Args = struct {
         var args_iter = init.minimal.args.iterate();
         _ = args_iter.next(); // skip argv[0] (program name)
 
-        var http_port: u16 = 6543; // default
+        // Sentinel, not a value: the env fallback must only apply when --port was
+        // absent, and 0 is not a usable port so it cannot be confused with one. The
+        // literal default used to be 6543 here while Config.Http.default_port said
+        // 9090 — two answers, and the one that won was the one nobody had written down.
+        var http_port: ?u16 = null;
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
         var publication_name: []const u8 = config.Postgres.default_publication_name; // default
         var encoding_format: encoder.Format = .msgpack; // default
@@ -131,8 +133,31 @@ pub const Args = struct {
             }
         }
 
+        // `--port` beats `BRIDGE_PORT` beats the compiled default. BRIDGE_PORT was
+        // declared in .env.bridge and read by nobody: setting it and omitting --port
+        // left telemetry on a port no curl was pointed at, with nothing in the log to
+        // say so — hence the resolved value and its source are printed below.
+        const resolved_port: u16 = http_port orelse envUint(
+            u16,
+            init,
+            "BRIDGE_PORT",
+            config.Http.default_port,
+            1,
+            65_535,
+        );
+
+        log.info("HTTP telemetry port {d} (from {s})", .{
+            resolved_port,
+            if (http_port != null)
+                "--port"
+            else if (init.minimal.environ.getPosix("BRIDGE_PORT") != null)
+                "BRIDGE_PORT"
+            else
+                "default",
+        });
+
         const cli_args = Args{
-            .http_port = http_port,
+            .http_port = resolved_port,
             .slot_name = slot_name,
             .publication_name = publication_name,
             .encoding_format = encoding_format,
@@ -140,7 +165,7 @@ pub const Args = struct {
 
         // Build runtime configuration by merging CLI args with compile-time defaults
         var runtime_config = config.RuntimeConfig.defaults();
-        runtime_config.http_port = http_port;
+        runtime_config.http_port = resolved_port;
         runtime_config.slot_name = slot_name;
         runtime_config.publication_name = publication_name;
         runtime_config.encoding_format = encoding_format;
@@ -151,54 +176,48 @@ pub const Args = struct {
         // so these are assigned directly — no dupe, nothing to free. (0.15's
         // getEnvVarOwned returned owned memory; 0.16 changed that.) Valid because
         // nothing here calls setenv/putenv, which could reallocate the block.
-        runtime_config.db_url = init.minimal.environ.getPosix("DATABASE_URL");
-        runtime_config.pg_host = init.minimal.environ.getPosix("PG_HOST") orelse blk: {
-            log.info("PG_HOST not set, using default: {s}", .{runtime_config.pg_host});
-            break :blk runtime_config.pg_host;
+        // The bridge connects with URLs and nothing else.
+        //
+        // PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB used to be a fallback here. They are
+        // the **superuser** credentials `bridge-init` interpolates into init.sql to
+        // create the bridge's roles, and they sit in the same environment — so a missing
+        // or misspelled DATABASE_URL silently connected as `postgres` instead of the
+        // read role, and the log looked fine. Convenient, and precisely the wrong thing
+        // to be convenient about: the read role is deliberately unable to write, and
+        // that guarantee is worth nothing if the process can connect as someone else.
+        //
+        // Failing here rather than defaulting is the whole point. `sslmode` goes in the
+        // URL's query string.
+        runtime_config.db_url = init.minimal.environ.getPosix("DATABASE_URL") orelse {
+            log.err(
+                "🔴 DATABASE_URL is required: postgres://<role>:<password>@<host>:<port>/<db>. " ++
+                    "There is no PG_HOST/PG_USER fallback — those are the admin credentials init.sql " ++
+                    "runs under, and the bridge must not be able to connect with them.",
+                .{},
+            );
+            return error.MissingDatabaseUrl;
         };
-
-        if (init.minimal.environ.getPosix("PG_PORT")) |port_str| {
-            runtime_config.pg_port = std.fmt.parseInt(u16, port_str, 10) catch |err| blk: {
-                log.warn("Invalid PG_PORT value '{s}' ({any}), using default: {d}", .{ port_str, err, runtime_config.pg_port });
-                break :blk runtime_config.pg_port;
-            };
-        } else {
-            log.info("PG_PORT not set, using default: {d}", .{runtime_config.pg_port});
+        // `debug`, not `warn`: on a correctly split environment these variables are simply
+        // absent, so warning would cry wolf at every start. It stays in the code — and
+        // matchable — because when someone *does* hit the old layout, this line is the
+        // difference between "why is it connecting as postgres" and a two-second answer.
+        if (init.minimal.environ.getPosix("PG_HOST") != null or
+            init.minimal.environ.getPosix("PG_USER") != null)
+        {
+            log.debug(
+                "PG_HOST/PG_USER/PG_PASSWORD/PG_DB are set but ignored — the bridge uses DATABASE_URL. " ++
+                    "Those belong in .env.admin, which only compose and bridge-init read.",
+                .{},
+            );
         }
 
-        // Priority: POSTGRES_BRIDGE_USER > PG_USER > default
-        runtime_config.pg_user = init.minimal.environ.getPosix("POSTGRES_BRIDGE_USER") orelse init.minimal.environ.getPosix("PG_USER") orelse blk: {
-            log.info("POSTGRES_BRIDGE_USER and PG_USER not set, using default: {s}", .{runtime_config.pg_user});
-            break :blk runtime_config.pg_user;
-        };
-
-        // Priority: POSTGRES_BRIDGE_PASSWORD > PG_PASSWORD > default
-        runtime_config.pg_password = init.minimal.environ.getPosix("POSTGRES_BRIDGE_PASSWORD") orelse init.minimal.environ.getPosix("PG_PASSWORD") orelse blk: {
-            log.info("POSTGRES_BRIDGE_PASSWORD and PG_PASSWORD not set, using default", .{});
-            break :blk runtime_config.pg_password;
-        };
-
-        runtime_config.pg_database = init.minimal.environ.getPosix("PG_DB") orelse blk: {
-            log.info("PG_DB not set, using default: {s}", .{runtime_config.pg_database});
-            break :blk runtime_config.pg_database;
-        };
-
-        runtime_config.pg_sslmode = init.minimal.environ.getPosix("PG_SSLMODE") orelse blk: {
-            log.info("PG_SSLMODE not set, using default: {s}", .{runtime_config.pg_sslmode});
-            break :blk runtime_config.pg_sslmode;
-        };
-
-        // Ingress credentials. Deliberately no fallback to POSTGRES_BRIDGE_USER: a
-        // missing writer means the mutation listener does not start, which is a visible
-        // "off" rather than an invisible "running with replication rights".
+        // Ingress. Same rule, and no fallback to the read URL: it carries REPLICATION.
         runtime_config.pg_writer_url = init.minimal.environ.getPosix("DATABASE_WRITER_URL");
-        runtime_config.pg_writer_user = init.minimal.environ.getPosix("POSTGRES_WRITER_USER");
-        runtime_config.pg_writer_password = init.minimal.environ.getPosix("POSTGRES_WRITER_PASSWORD");
-
-        const has_writer = runtime_config.pg_writer_url != null or
-            (runtime_config.pg_writer_user != null and runtime_config.pg_writer_password != null);
-        if (!has_writer) {
-            log.info("No DATABASE_WRITER_URL or POSTGRES_WRITER_USER/_PASSWORD — ingress (mutation) path disabled", .{});
+        if (runtime_config.pg_writer_url == null) {
+            log.info("No DATABASE_WRITER_URL — ingress (mutation) path disabled", .{});
+            if (init.minimal.environ.getPosix("POSTGRES_WRITER_USER") != null) {
+                log.warn("POSTGRES_WRITER_USER is set but ignored — set DATABASE_WRITER_URL to enable ingress", .{});
+            }
         }
 
         // Parse BASE_BUF environment variable (log2 of buffer size)
@@ -284,22 +303,21 @@ pub const Args = struct {
             300_000,
         );
 
-        // [Deprecated] Snapshot retention is now natively handled by JetStream max_age policy.
-        // runtime_config.snapshot_retention_seconds = @intCast(envUint(
-        //     u32,
-        //     init,
-        //     "SNAP_RET_SECONDS",
-        //     @intCast(runtime_config.snapshot_retention_seconds),
-        //     1,
-        //     86_400,
-        // ));
-
-        // NATS connection — slices into environ block, no allocation needed
-        runtime_config.nats_url = init.minimal.environ.getPosix("NATS_URL");
-        runtime_config.nats_host = init.minimal.environ.getPosix("NATS_HOST") orelse blk: {
-            log.info("NATS_HOST not set, using default: {s}", .{runtime_config.nats_host});
-            break :blk runtime_config.nats_host;
+        // NATS connection — slices into environ block, no allocation needed.
+        //
+        // `NATS_URL` is the only address input. `NATS_HOST` used to be a second one, and
+        // a second one is worse than none: it was read by the mutation listener alone,
+        // which then dialled `NATS_HOST:4222` while everything else went where the URL
+        // said. Warned rather than silently ignored, because a variable that is set,
+        // wrong, and inert is the hardest kind to debug.
+        runtime_config.nats_url = init.minimal.environ.getPosix("NATS_URL") orelse blk: {
+            log.info("NATS_URL not set, using default: {s}", .{config.Nats.default_url});
+            break :blk config.Nats.default_url;
         };
+        // Same reasoning as the PG_* line above: debug, not warn.
+        if (init.minimal.environ.getPosix("NATS_HOST")) |host| {
+            log.debug("NATS_HOST='{s}' is ignored — set NATS_URL (currently {s})", .{ host, runtime_config.nats_url.? });
+        }
         runtime_config.nats_seed = init.minimal.environ.getPosix("NATS_NKEY_SEED");
 
         return .{

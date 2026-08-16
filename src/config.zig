@@ -43,7 +43,84 @@ pub const Postgres = struct {
 pub const Nats = struct {
     pub const default_host = "127.0.0.1";
     pub const default_port = 4222;
-    pub const default_url = "nats://127.0.0.1:4222";
+
+    /// Derived, never written out again. Nothing in the live path builds a URL any more
+    /// — `Endpoint` below is the address, and a URL is only ever an *input* — but the
+    /// literal used to be spelled here, again in `nats_publisher.PublisherConfig`, and a
+    /// third time in `bridge.zig`, so changing the port here moved none of them.
+    /// (`nats_publisher.old.zig` is the last reader.)
+    pub const default_url = "nats://" ++ default_host ++ ":" ++ std.fmt.comptimePrint("{d}", .{default_port});
+
+    /// Where NATS is, resolved **once** for the whole process.
+    ///
+    /// This exists because three components used to answer that question differently:
+    /// the publisher parsed `NATS_URL`; the snapshot listener borrowed the publisher's
+    /// parsed result; and the mutation listener read `NATS_HOST` raw and passed **no
+    /// port at all**, so it silently used 4222 whatever `NATS_URL` said. Setting
+    /// `NATS_HOST=nats-server` (a name that resolves only inside compose) alongside a
+    /// working `NATS_URL` therefore produced a bridge where CDC and snapshots ran fine
+    /// and ingress alone failed with `HostResolutionFailed` — one process, two
+    /// destinations, and nothing in the logs saying so.
+    ///
+    /// Every field borrows from the URL string or the environment block, both of which
+    /// outlive the process (see `parseArgs`), so there is nothing to free.
+    pub const Endpoint = struct {
+        host: []const u8 = default_host,
+        port: u16 = default_port,
+        /// Parsed out of `nats://user:pass@host:port`. Dropping these leaves the client
+        /// waiting forever against a server that requires authorization.
+        user: ?[]const u8 = null,
+        pass: ?[]const u8 = null,
+        seed: ?[]const u8 = null,
+
+        pub const ParseError = error{ MissingScheme, BadPort };
+
+        /// Parse `nats://[user:pass@]host[:port]`.
+        pub fn parseUrl(url: []const u8) ParseError!Endpoint {
+            const scheme = "nats://";
+            if (!std.mem.startsWith(u8, url, scheme)) return error.MissingScheme;
+            var rest = url[scheme.len..];
+
+            // A trailing path is not part of the address. `nats://host:4222/` is a URL a
+            // person will reasonably type, and parsing "4222/" as a port fails.
+            if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+
+            var out = Endpoint{};
+
+            // Rightmost '@': a password may legally contain one.
+            if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| {
+                const creds = rest[0..at];
+                rest = rest[at + 1 ..];
+                if (std.mem.indexOfScalar(u8, creds, ':')) |colon| {
+                    out.user = creds[0..colon];
+                    out.pass = creds[colon + 1 ..];
+                } else if (creds.len > 0) {
+                    out.user = creds;
+                }
+            }
+
+            if (std.mem.lastIndexOfScalar(u8, rest, ':')) |colon| {
+                out.host = rest[0..colon];
+                out.port = std.fmt.parseInt(u16, rest[colon + 1 ..], 10) catch return error.BadPort;
+            } else {
+                out.host = rest;
+            }
+
+            if (out.host.len == 0) out.host = default_host;
+            return out;
+        }
+
+        /// One address input, one rule. `NATS_HOST` was the second input and is gone:
+        /// see `args.zig`, which now warns when it is set.
+        pub fn resolve(rc: *const RuntimeConfig) ParseError!Endpoint {
+            var out = if (rc.nats_url) |url| try parseUrl(url) else Endpoint{};
+
+            // Kept out of the URL deliberately: a seed is a private key and belongs in
+            // its own variable, not in a string that gets logged by accident.
+            out.seed = rc.nats_seed;
+            return out;
+        }
+    };
 
     /// Maximum reconnection attempts (-1 = infinite)
     pub const max_reconnect_attempts = -1;
@@ -336,6 +413,22 @@ pub const Retry = struct {
     /// Delay between NATS reconnection attempts in the listener threads.
     pub const nats_reconnect_delay_ms = 2_000;
 
+    /// How many times a listener thread may fail to establish its **first** NATS
+    /// connection before the bridge gives up and stops.
+    ///
+    /// Only the first one is bounded. A drop after the listener has worked once is a
+    /// real outage and must be retried forever — that is what the outer loop is for.
+    /// But a listener that has *never* connected is describing a configuration fault,
+    /// not an outage: the wrong host, a rejected nkey, or a `REQUESTS` stream that
+    /// `nats-init` never created. Left unbounded, the bridge logged one line every 2s
+    /// and otherwise looked healthy — `/health` green, CDC flowing — while no client
+    /// could ever bootstrap, because the thread that answers snapshot requests was
+    /// spinning on a connection it would never get.
+    ///
+    /// 5 × `nats_reconnect_delay_ms` ≈ 10s, enough to ride out a NATS container still
+    /// coming up beside the bridge, short enough to be an obvious startup failure.
+    pub const listener_boot_connect_attempts: u32 = 5;
+
     /// How many spins on a full ring buffer before checking whether the flush
     /// thread has died. Internal tuning, not worth exposing.
     pub const spins_before_fatal_check = 1_000;
@@ -429,34 +522,22 @@ pub const RuntimeConfig = struct {
     // HTTP
     http_port: u16,
 
-    // PostgreSQL connection
-    pg_host: []const u8,
-    pg_port: u16,
-    pg_user: []const u8,
-    pg_password: []const u8,
-    pg_database: []const u8,
-    /// libpq sslmode. Set explicitly rather than letting libpq apply its default of
-    /// `prefer`, which negotiates TLS when offered, falls back to plaintext when not,
-    /// and validates the server in neither case — so you cannot tell what you got.
-    /// Use `disable` when Postgres and the bridge share a host, `verify-full` when the
-    /// connection crosses one. `require` encrypts but does not authenticate the server.
-    pg_sslmode: []const u8,
-    db_url: ?[]const u8, // Optional unified connection URI
-
-    /// Credentials for the **ingress** connection, kept separate from the read path on
-    /// purpose. `pg_user` keeps SELECT + REPLICATION and stays physically unable to
-    /// write, whatever the write path grows into; this role has no table privileges
-    /// until a DBA opens one (`zebridge_grant_edge_writes`).
+    /// `DATABASE_URL` — the read/replication connection, credentials and all.
+    ///
+    /// Required, with **no fallback to PG_HOST/PG_USER/PG_PASSWORD**. Those name the
+    /// superuser `bridge-init` uses to create roles; they live in the same environment,
+    /// and while the bridge accepted them a missing or misspelled DATABASE_URL meant
+    /// connecting as `postgres` and looking perfectly healthy. `sslmode` belongs in the
+    /// URL's query string, where it stays a stated decision rather than whatever libpq's
+    /// `prefer` happens to negotiate.
+    db_url: []const u8,
+    /// `DATABASE_WRITER_URL` — the ingress connection, under its own role.
     ///
     /// Null means "no writer configured": the mutation listener does not start, rather
     /// than quietly falling back to the read role. Falling back would mean the ingress
     /// path silently runs with replication rights — the exact privilege the split
-    /// exists to avoid.
-    pg_writer_user: ?[]const u8,
-    pg_writer_password: ?[]const u8,
-    /// Unified ingress URI, the symmetric counterpart of `db_url`. Preferred when set:
-    /// `connInfo` passes a URL through natively, so it avoids rebuilding the keyword
-    /// form from six fields.
+    /// exists to avoid. That role also has no table privileges until a DBA opens one
+    /// (`zebridge_grant_edge_writes`).
     pg_writer_url: ?[]const u8,
 
     // PostgreSQL replication
@@ -464,8 +545,9 @@ pub const RuntimeConfig = struct {
     publication_name: []const u8,
 
     // NATS
-    nats_url: ?[]const u8, // Optional unified NATS URI
-    nats_host: []const u8,
+    /// `nats://[user:pass@]host[:port]` — the only address input. Optional here only
+    /// because `defaults()` predates parsing; `args.zig` always fills it in.
+    nats_url: ?[]const u8,
     nats_seed: ?[]const u8, // Optional NKey Seed
 
     // Batch settings
@@ -476,8 +558,6 @@ pub const RuntimeConfig = struct {
 
     // Snapshot settings
     snapshot_chunk_size: usize,
-    // [Deprecated] Handled by JetStream max_age
-    // snapshot_retention_seconds: i64,
     /// Refuse to start when any published table has no primary key (STRICT_TABLES).
     strict_tables: bool,
 
@@ -497,27 +577,19 @@ pub const RuntimeConfig = struct {
     pub fn defaults() RuntimeConfig {
         return .{
             .http_port = Http.default_port,
-            .pg_host = "127.0.0.1",
-            .pg_port = 5432,
-            .pg_user = "postgres",
-            .pg_password = "postgres",
-            .pg_database = "postgres",
-            .pg_sslmode = "disable",
-            .db_url = null,
-            .pg_writer_user = null,
-            .pg_writer_password = null,
+            // Not a usable connection on purpose: `parseArgs` requires DATABASE_URL and
+            // fails without it, so nothing should ever reach a default here.
+            .db_url = "",
             .pg_writer_url = null,
             .slot_name = Postgres.default_slot_name,
             .publication_name = Postgres.default_publication_name,
-            .nats_url = null,
-            .nats_host = "127.0.0.1",
+            .nats_url = Nats.default_url,
             .nats_seed = null,
             .batch_max_events = Batch.max_events,
             .batch_max_wait_ms = Batch.max_age_ms,
             .batch_max_payload_bytes = Batch.max_payload_bytes,
             .batch_ring_buffer_size = Buffers.default_ring_buffer_count,
             .snapshot_chunk_size = Snapshot.chunk_size,
-            // .snapshot_retention_seconds = Snapshot.retention_seconds,
             .strict_tables = false,
             .publish_max_retries = Retry.publish_max_retries,
             .publish_backoff_ms = Retry.publish_backoff_ms,
@@ -557,4 +629,82 @@ pub fn getDefaultLogLevel(init: *const std.process.Init) std.log.Level {
 
     log.warn("LOG_LEVEL='{s}' is not one of debug|info|warn(ing)|err(or) — using info", .{raw});
     return .info;
+}
+
+// ─── Nats.Endpoint ──────────────────────────────────────────────────────────────
+//
+// One resolution rule for the whole process. These are regression tests for a real
+// split-brain: NATS_HOST=nats-server beside a working NATS_URL made ingress dial a
+// name that resolves only inside compose while CDC and snapshots ran fine.
+
+test "Endpoint.parseUrl: host and port" {
+    const ep = try Nats.Endpoint.parseUrl("nats://10.0.0.4:5222");
+    try std.testing.expectEqualStrings("10.0.0.4", ep.host);
+    try std.testing.expectEqual(@as(u16, 5222), ep.port);
+    try std.testing.expect(ep.user == null);
+}
+
+test "Endpoint.parseUrl: no port falls back to the default" {
+    const ep = try Nats.Endpoint.parseUrl("nats://nats-server");
+    try std.testing.expectEqualStrings("nats-server", ep.host);
+    try std.testing.expectEqual(@as(u16, Nats.default_port), ep.port);
+}
+
+test "Endpoint.parseUrl: credentials are kept" {
+    // Dropping these leaves the client waiting forever against a server that requires
+    // authorization, with no error surfaced anywhere.
+    const ep = try Nats.Endpoint.parseUrl("nats://alice:s3cret@host:4222");
+    try std.testing.expectEqualStrings("alice", ep.user.?);
+    try std.testing.expectEqualStrings("s3cret", ep.pass.?);
+    try std.testing.expectEqualStrings("host", ep.host);
+    try std.testing.expectEqual(@as(u16, 4222), ep.port);
+}
+
+test "Endpoint.parseUrl: a password may contain '@'" {
+    // Split on the rightmost '@', or the host becomes a fragment of the password.
+    const ep = try Nats.Endpoint.parseUrl("nats://bob:p@ss@10.1.2.3:4222");
+    try std.testing.expectEqualStrings("bob", ep.user.?);
+    try std.testing.expectEqualStrings("p@ss", ep.pass.?);
+    try std.testing.expectEqualStrings("10.1.2.3", ep.host);
+}
+
+test "Endpoint.parseUrl: a trailing path is not part of the address" {
+    const ep = try Nats.Endpoint.parseUrl("nats://host:4222/");
+    try std.testing.expectEqualStrings("host", ep.host);
+    try std.testing.expectEqual(@as(u16, 4222), ep.port);
+}
+
+test "Endpoint.parseUrl: rejects what it cannot resolve" {
+    try std.testing.expectError(error.MissingScheme, Nats.Endpoint.parseUrl("127.0.0.1:4222"));
+    // `tls://` is refused rather than silently downgraded to plaintext: TLS was never
+    // made to work with the vendored client, so accepting the scheme would promise
+    // encryption the connection does not have. See COPY_BINARY_PLAN "encryption in
+    // transit".
+    try std.testing.expectError(error.MissingScheme, Nats.Endpoint.parseUrl("tls://host:4222"));
+    try std.testing.expectError(error.BadPort, Nats.Endpoint.parseUrl("nats://host:not-a-port"));
+}
+
+test "Endpoint.resolve: the URL is the address" {
+    var rc = RuntimeConfig.defaults();
+    rc.nats_url = "nats://10.9.8.7:5222";
+
+    const ep = try Nats.Endpoint.resolve(&rc);
+    try std.testing.expectEqualStrings("10.9.8.7", ep.host);
+    try std.testing.expectEqual(@as(u16, 5222), ep.port);
+}
+
+test "Endpoint.resolve: no URL falls back to the compiled default, not to a second variable" {
+    var rc = RuntimeConfig.defaults();
+    rc.nats_url = null;
+
+    const ep = try Nats.Endpoint.resolve(&rc);
+    try std.testing.expectEqualStrings(Nats.default_host, ep.host);
+    try std.testing.expectEqual(@as(u16, Nats.default_port), ep.port);
+}
+
+test "Endpoint.resolve: the seed rides along, never through the URL" {
+    var rc = RuntimeConfig.defaults();
+    rc.nats_seed = "SUAxxxx";
+    const ep = try Nats.Endpoint.resolve(&rc);
+    try std.testing.expectEqualStrings("SUAxxxx", ep.seed.?);
 }

@@ -8,25 +8,20 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("ZeBridge GC Sidecar Starting...\n", .{});
 
     // Read Env Vars
+    //
+    // A URL, like the bridge — and the *writer* one, because this sidecar DELETEs. It
+    // used to assemble `host=… user=… password=…` from PG_HOST/PG_USER/PG_PASSWORD,
+    // which are the superuser credentials init.sql runs under: a tombstone sweeper
+    // running as `postgres` can delete anything in the database, and nothing in its
+    // output would say so.
     const env = init.minimal.environ;
-    const pg_host = env.getPosix("PG_HOST") orelse {
-        std.debug.print("FATAL: Missing PG_HOST\n", .{});
-        return;
-    };
-    const pg_port_str = env.getPosix("PG_PORT") orelse {
-        std.debug.print("FATAL: Missing PG_PORT\n", .{});
-        return;
-    };
-    const pg_db = env.getPosix("PG_DB") orelse {
-        std.debug.print("FATAL: Missing PG_DB\n", .{});
-        return;
-    };
-    const pg_user = env.getPosix("PG_USER") orelse {
-        std.debug.print("FATAL: Missing PG_USER\n", .{});
-        return;
-    };
-    const pg_pass = env.getPosix("PG_PASSWORD") orelse {
-        std.debug.print("FATAL: Missing PG_PASSWORD\n", .{});
+    const db_url = env.getPosix("DATABASE_WRITER_URL") orelse {
+        std.debug.print(
+            "FATAL: DATABASE_WRITER_URL is required (postgres://bridge_writer:...@host:port/db). " ++
+                "There is no PG_HOST/PG_USER fallback: this process deletes rows, and must not be " ++
+                "able to do it as the admin.\n",
+            .{},
+        );
         return;
     };
 
@@ -35,11 +30,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    const interval_ms_str = env.getPosix("GC_INTERVAL_MS") orelse "60000";
-    const interval_ms = try std.fmt.parseInt(u64, interval_ms_str, 10);
-
     const threshold_ms_str = env.getPosix("GC_THRESHOLD_MS") orelse "3600000"; // 1 hour
     const threshold_ms = try std.fmt.parseInt(u64, threshold_ms_str, 10);
+
+    const interval_ms_str = env.getPosix("GC_INTERVAL_MS") orelse "60000";
+    const interval_ms = try std.fmt.parseInt(u64, interval_ms_str, 10);
 
     // Parse tables
     var tables = std.ArrayList([]const u8).empty;
@@ -50,11 +45,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Connect to PostgreSQL
-    const conninfo = try std.fmt.allocPrint(
-        allocator,
-        "host={s} port={s} dbname={s} user={s} password={s}",
-        .{ pg_host, pg_port_str, pg_db, pg_user, pg_pass },
-    );
+    const conninfo = try utils.allocPrintZ(allocator, "{s}", .{db_url});
     defer allocator.free(conninfo);
 
     const pg_conn = c.PQconnectdb(conninfo.ptr);

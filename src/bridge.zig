@@ -33,6 +33,7 @@ const type_registry = @import("type_registry.zig");
 // carrying `test` blocks must be listed here or its tests silently never run.
 comptime {
     _ = @import("array.zig");
+    _ = @import("config.zig");
     _ = @import("encoder.zig");
     _ = @import("numeric.zig");
     _ = @import("mutation_listener.zig");
@@ -43,6 +44,7 @@ comptime {
     _ = @import("refused_tables.zig");
     _ = @import("type_registry.zig");
     _ = @import("pg_copy_binary.zig");
+    _ = @import("snapshot_listener.zig");
     _ = @import("schema_cache.zig");
     _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");
@@ -80,6 +82,11 @@ comptime {
 
 // Global flag for graceful shutdown (shared with HTTP server)
 var should_stop = std.atomic.Value(bool).init(false);
+
+/// Raised when a worker thread stops the bridge because of a configuration fault, as
+/// opposed to Ctrl+C or /shutdown. Only the exit code distinguishes the two for whatever
+/// supervises this process, and "misconfigured" must not look like "finished".
+var boot_fatal = std.atomic.Value(bool).init(false);
 
 // Derive signal handler parameter type from posix.Sigaction.
 // On macOS Zig 0.16 the handler takes an anonymous enum(u32), not c_int.
@@ -123,29 +130,26 @@ fn initReplication(
 fn initNatsPublisher(
     allocator: std.mem.Allocator,
     metrics: *metrics_mod.Metrics,
-    runtime_config: *const Config.RuntimeConfig,
+    endpoint: Config.Nats.Endpoint,
     io: std.Io,
 ) !nats_publisher.Publisher {
-    // Use NATS_URL directly if provided, otherwise fallback to dissection
-    const nats_url_ptr = if (runtime_config.nats_url) |url| blk: {
-        break :blk try std.fmt.allocPrint(allocator, "{s}", .{url});
-    } else blk: {
-        const nats_host = runtime_config.nats_host;
-        break :blk try std.fmt.allocPrint(allocator, "nats://{s}:4222", .{nats_host});
-    };
-    defer allocator.free(nats_url_ptr);
-
     log.debug("Connecting to NATS JetStream...", .{});
     var publisher = try nats_publisher.Publisher.init(
         allocator,
-        .{ .url = nats_url_ptr, .nkey_seed = runtime_config.nats_seed },
+        .{ .endpoint = endpoint },
         io,
     );
     publisher.metrics = metrics;
     errdefer publisher.deinit();
 
     publisher.metrics = metrics;
-    try publisher.connect();
+    publisher.connect() catch |err| {
+        log.err(
+            "🔴 Cannot reach NATS at {s}:{d} ({s}) — check NATS_URL. The bridge needs NATS at startup; it does not run degraded.",
+            .{ endpoint.host, endpoint.port, @errorName(err) },
+        );
+        return err;
+    };
     return publisher;
 }
 
@@ -276,8 +280,6 @@ pub fn main(init: std.process.Init) !void {
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
     log.info("Encoding format: \x1b[1m {s} \x1b[0m", .{@tagName(parsed_args.encoding_format)});
-    // Printed from the topology module, not spelled out: this line used to read
-    // "CDC, INIT (hardcoded)", which stopped being true and had no way of noticing.
     log.info("Streams: \x1b[1m {s}, {s}, {s}, {s} \x1b[0m (from topology.json)", .{
         Config.Nats.stream_cdc,
         Config.Nats.stream_init,
@@ -311,6 +313,14 @@ pub fn main(init: std.process.Init) !void {
     try http_srv.start();
     defer http_srv.join();
     defer http_srv.deinit();
+
+    // Registered *after* the joins above so it runs *before* them when a later `try`
+    // fails: Zig unwinds defers in reverse registration order, and those threads only
+    // leave their loops when should_stop is set. Without this, a startup failure — a
+    // NATS_URL that does not resolve, say — exits into `join()` and hangs there until
+    // someone presses Ctrl-C, which then prints the original error as if the user had
+    // caused it. Idempotent, so one per started thread is fine.
+    errdefer should_stop.store(true, .seq_cst);
 
     // PostgreSQL connection configuration from RuntimeConfig
     var pg_config = pg_conn.PgConf.from_runtime_config(&runtime_config);
@@ -390,9 +400,24 @@ pub fn main(init: std.process.Init) !void {
     try wal_mon.start();
     defer wal_mon.join();
     defer wal_mon.deinit();
+    errdefer should_stop.store(true, .seq_cst);
 
     // === Connect to NATS JetStream
-    var publisher = try initNatsPublisher(allocator, &metrics, &runtime_config, io);
+    //
+    // Resolved once, here, and passed to the publisher, the snapshot listener and the
+    // mutation listener alike. They used to derive it independently — see
+    // `Config.Nats.Endpoint` for the split-brain that produced.
+    const nats_endpoint = Config.Nats.Endpoint.resolve(&runtime_config) catch |err| {
+        log.err("🔴 NATS_URL is not a usable address ({s}) — expected nats://[user:pass@]host[:port]", .{@errorName(err)});
+        return err;
+    };
+    log.info("NATS endpoint: {s}:{d} (from {s})", .{
+        nats_endpoint.host,
+        nats_endpoint.port,
+        if (runtime_config.nats_url != null) "NATS_URL" else "NATS_HOST",
+    });
+
+    var publisher = try initNatsPublisher(allocator, &metrics, nats_endpoint, io);
     defer publisher.deinit();
 
     // The per-event buffer must fit inside what the NATS server will accept, and the
@@ -449,12 +474,13 @@ pub fn main(init: std.process.Init) !void {
         parsed_args.encoding_format,
         &runtime_config,
         io,
-        publisher.nats_host,
-        publisher.nats_port,
+        nats_endpoint,
+        &boot_fatal,
     );
     try snap_listener.start();
     defer snap_listener.join();
     defer snap_listener.deinit();
+    errdefer should_stop.store(true, .seq_cst);
     log.info("✅ Snapshot listener thread started\n", .{});
 
     // === Start thread: mutation listener (only if an ingress role is configured)
@@ -466,11 +492,11 @@ pub fn main(init: std.process.Init) !void {
     var writer_config = pg_conn.PgConf.writer_from_runtime_config(&runtime_config);
     var mut_listener: ?*mutation_listener.MutationListener = null;
     if (writer_config) |*wc| {
-        log.info("Starting mutation listener thread (role: {s})...", .{wc.user});
+        log.info("Starting mutation listener thread (role: {s})...", .{wc.role});
         mut_listener = try mutation_listener.MutationListener.init(
             allocator,
             wc,
-            &runtime_config,
+            nats_endpoint,
             &sync_rules,
             default_version_column,
             io,
@@ -483,6 +509,7 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (mut_listener) |m| m.deinit();
     defer if (mut_listener) |m| m.join();
+    errdefer should_stop.store(true, .seq_cst);
 
     // === Start thread: CDC async publisher (heap-allocated for stable address)
     // Use c_allocator (thread-safe) for cross-thread allocations:
@@ -498,6 +525,7 @@ pub fn main(init: std.process.Init) !void {
     // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();
     defer batch_pub.join();
+    errdefer should_stop.store(true, .seq_cst);
     defer batch_pub.deinit(); // Will free the heap-allocated BatchPublisher itself
 
     // === Initialize EventProcessor (in this main thread, the CDC processing)
@@ -615,7 +643,7 @@ pub fn main(init: std.process.Init) !void {
         loop_iterations +%= 1;
         const now_s = @as(i64, @intCast(c.time(null)));
         const now_ms = utils.getMilliTimestamp();
-        
+
         // Flush pending status updates if time threshold reached
         if (now_ms - last_status_update_time >= status_update_interval_ms) {
             const confirmed_lsn = batch_pub.getLastConfirmedLsn();
@@ -649,7 +677,6 @@ pub fn main(init: std.process.Init) !void {
 
         // Periodic structured metric logging for Alloy/Loki
         if (now_s - last_metric_log_time >= metric_log_interval_seconds) {
-
             const snap = try metrics.snapshot(allocator);
             defer allocator.free(snap.current_lsn_str);
 
@@ -881,7 +908,7 @@ pub fn main(init: std.process.Init) !void {
                                         break;
                                     };
                                 }
-                                
+
                                 const events_released_in_tx = tx_slots_count;
                                 tx_slots_count = 0;
 
@@ -892,7 +919,7 @@ pub fn main(init: std.process.Init) !void {
                                 } else {
                                     log.debug("COMMIT: lsn={x}", .{commit.commit_lsn});
                                 }
-                                
+
                                 // Tell publisher to flush immediately rather than waiting for max_age_ms
                                 batch_pub.forceFlush();
                             },
@@ -1034,5 +1061,13 @@ pub fn main(init: std.process.Init) !void {
     log.info("\n=== Bridge Session Summary ------------------------------", .{});
     log.info("Total WAL messages received: {d}", .{msg_count});
     log.info("CDC events published to NATS: {d}", .{cdc_events});
+    if (boot_fatal.load(.acquire)) {
+        // Not "gracefully": a listener gave up on its first NATS connection. The FATAL
+        // line above says which and why; this is what makes the shell and the
+        // supervisor agree with it.
+        log.err("🔴 Bridge stopped because of a startup fault — see the FATAL line above", .{});
+        return error.StartupFault;
+    }
+
     log.info("Bridge stopped gracefully\n", .{});
 }

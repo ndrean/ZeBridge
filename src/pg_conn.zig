@@ -9,65 +9,50 @@ const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.pg_conn);
 
-/// PostgreSQL connection configuration
-/// Use RuntimeConfig as the source of truth for connection parameters
+/// How the bridge connects to PostgreSQL: a URL, and nothing else.
+///
+/// It used to carry `host`/`port`/`user`/`password`/`database`/`sslmode` as well, filled
+/// from `PG_HOST`/`PG_USER`/`PG_PASSWORD`/… — which are the **superuser** credentials
+/// `bridge-init` interpolates into `init.sql` to create roles. They sat in the same
+/// environment as everything else, so a bridge launched with `DATABASE_URL` unset, or
+/// misspelled, fell back to connecting as `postgres` and looked entirely healthy doing
+/// it. Convenient, and exactly the wrong thing to be convenient about: the read role is
+/// deliberately unable to write, and that guarantee is worth nothing if the process can
+/// silently connect as someone else.
+///
+/// So there is no fallback. `DATABASE_URL` is required (see `args.zig`), the ingress path
+/// needs its own `DATABASE_WRITER_URL`, and neither can be assembled out of parts.
 pub const PgConf = struct {
-    host: []const u8,
-    port: u16,
-    user: []const u8,
-    password: []const u8,
-    database: []const u8,
-    db_url: ?[]const u8,
-    /// libpq sslmode — always sent explicitly so the transport is a stated decision
-    /// rather than whatever `prefer` happens to negotiate. See RuntimeConfig.pg_sslmode.
-    sslmode: []const u8 = "disable",
+    /// `postgres://user:pass@host:port/db[?sslmode=…]`. Credentials included — this is
+    /// the whole connection, not a template. `sslmode` rides in the query string, so it
+    /// stays an explicit decision rather than whatever libpq's `prefer` negotiates.
+    url: []const u8,
     /// Enable replication mode (adds replication=database to connection string)
     replication: bool = false,
+    /// Which role this is, for logs only. Never used to connect — the URL carries the
+    /// real credentials — but it keeps a writer connection from being announced under
+    /// the reader's name.
+    role: []const u8 = "(from DATABASE_URL)",
 
-    /// The ingress connection description: the same host/database, a different role.
+    /// The ingress connection, or null when none is configured.
     ///
-    /// Returns null when no writer is configured, which the caller must treat as "do not
-    /// start the mutation listener" — never as "use the read role instead".
+    /// Null must be read as "do not start the mutation listener", never as "use the read
+    /// role instead": that role holds REPLICATION, which is precisely what must not be
+    /// executing client-driven writes.
     ///
-    /// Two ways to configure it, mirroring the read path:
-    ///
-    /// - `DATABASE_WRITER_URL` — passed through natively by `connInfo`, so nothing is
-    ///   rebuilt from parts;
-    /// - `POSTGRES_WRITER_USER` + `_PASSWORD` — host and database inherited from the
-    ///   read config, role swapped.
-    ///
-    /// ⚠️ The read path's `db_url` is **never** inherited. `DATABASE_URL` embeds its own
-    /// credentials, so carrying it here would silently reconnect as the read role and
-    /// undo the split — with logs that look entirely healthy.
+    /// ⚠️ The read path's URL is **never** inherited. It embeds its own credentials, so
+    /// falling back to it would silently reconnect as the read role and undo the split,
+    /// with logs that look healthy.
     pub fn writer_from_runtime_config(runtime_config: *const Config.RuntimeConfig) ?PgConf {
-        var conf = from_runtime_config(runtime_config);
-        conf.db_url = null;
-        conf.replication = false;
-
-        if (runtime_config.pg_writer_url) |url| {
-            conf.db_url = url;
-            // Cosmetic only — the URL carries the real credentials — but it keeps logs
-            // and error messages from naming the read role on a writer connection.
-            conf.user = runtime_config.pg_writer_user orelse "(from DATABASE_WRITER_URL)";
-            return conf;
-        }
-
-        conf.user = runtime_config.pg_writer_user orelse return null;
-        conf.password = runtime_config.pg_writer_password orelse return null;
-        return conf;
+        const url = runtime_config.pg_writer_url orelse return null;
+        return .{ .url = url, .replication = false, .role = "(from DATABASE_WRITER_URL)" };
     }
 
-    /// Create PgConf from RuntimeConfig
-    /// Does not allocate - just references strings from RuntimeConfig
+    /// The read/replication connection.
+    /// Does not allocate — just references strings from RuntimeConfig.
     pub fn from_runtime_config(runtime_config: *const Config.RuntimeConfig) PgConf {
         return .{
-            .host = runtime_config.pg_host,
-            .port = runtime_config.pg_port,
-            .user = runtime_config.pg_user,
-            .password = runtime_config.pg_password,
-            .database = runtime_config.pg_database,
-            .sslmode = runtime_config.pg_sslmode,
-            .db_url = runtime_config.db_url,
+            .url = runtime_config.db_url,
             .replication = false,
         };
     }
@@ -86,35 +71,21 @@ pub const PgConf = struct {
     ///
     /// Caller is responsible for freeing the returned string
     pub fn connInfo(self: *const PgConf, allocator: std.mem.Allocator, replication: bool) ![:0]const u8 {
-        if (self.db_url) |url| {
-            // A URL that already mentions keepalives was set deliberately; do not
-            // second-guess it, and do not append a duplicate parameter.
-            const ka: []const u8 = if (std.mem.indexOf(u8, url, "keepalives") != null) "" else keepalives_uri;
-            const sep: []const u8 = if (ka.len == 0)
-                ""
-            else if (std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
+        const url = self.url;
 
-            if (replication) {
-                // Whatever came before, there is now a query string to extend.
-                const rep_sep: []const u8 = if (ka.len > 0 or std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
-                return try utils.allocPrintZ(allocator, "{s}{s}{s}{s}replication=database", .{ url, sep, ka, rep_sep });
-            }
-            return try utils.allocPrintZ(allocator, "{s}{s}{s}", .{ url, sep, ka });
+        // A URL that already mentions keepalives was set deliberately; do not
+        // second-guess it, and do not append a duplicate parameter.
+        const ka: []const u8 = if (std.mem.indexOf(u8, url, "keepalives") != null) "" else keepalives_uri;
+        const sep: []const u8 = if (ka.len == 0)
+            ""
+        else if (std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
+
+        if (replication) {
+            // Whatever came before, there is now a query string to extend.
+            const rep_sep: []const u8 = if (ka.len > 0 or std.mem.indexOfScalar(u8, url, '?') != null) "&" else "?";
+            return try utils.allocPrintZ(allocator, "{s}{s}{s}{s}replication=database", .{ url, sep, ka, rep_sep });
         }
-
-        // null-terminated [:0]u8 slice suitable for C APIs (e.g. PQconnectdb)
-        return if (replication)
-            try utils.allocPrintZ(
-                allocator,
-                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s} replication=database" ++ keepalives_kw,
-                .{ self.host, self.port, self.user, self.password, self.database, self.sslmode },
-            )
-        else
-            try utils.allocPrintZ(
-                allocator,
-                "host={s} port={d} user={s} password={s} dbname={s} sslmode={s}" ++ keepalives_kw,
-                .{ self.host, self.port, self.user, self.password, self.database, self.sslmode },
-            );
+        return try utils.allocPrintZ(allocator, "{s}{s}{s}", .{ url, sep, ka });
     }
 };
 
@@ -154,26 +125,22 @@ pub fn connect(allocator: std.mem.Allocator, pg_conf: PgConf) !*c.PGconn {
 
 const testing = std.testing;
 
-fn testConf(db_url: ?[]const u8) PgConf {
-    return .{
-        .host = "h", .port = 5432, .user = "u", .password = "p",
-        .database = "d", .sslmode = "disable", .db_url = db_url,
-    };
+fn testConf(url: []const u8) PgConf {
+    return .{ .url = url };
 }
 
-test "connInfo - keyword form carries keepalives, and replication when asked" {
-    const alloc = testing.allocator;
-    const conf = testConf(null);
+test "writer_from_runtime_config: no writer URL means no ingress, never the read role" {
+    var rc = Config.RuntimeConfig.defaults();
+    rc.db_url = "postgres://reader:p@h/d";
+    rc.pg_writer_url = null;
 
-    const plain = try conf.connInfo(alloc, false);
-    defer alloc.free(plain);
-    try testing.expect(std.mem.indexOf(u8, plain, "keepalives=1") != null);
-    try testing.expect(std.mem.indexOf(u8, plain, "replication=database") == null);
+    // The read URL must not leak in as a fallback: it carries REPLICATION rights.
+    try testing.expect(PgConf.writer_from_runtime_config(&rc) == null);
 
-    const rep = try conf.connInfo(alloc, true);
-    defer alloc.free(rep);
-    try testing.expect(std.mem.indexOf(u8, rep, "keepalives_idle=30") != null);
-    try testing.expect(std.mem.indexOf(u8, rep, "replication=database") != null);
+    rc.pg_writer_url = "postgres://writer:w@h/d";
+    const writer = PgConf.writer_from_runtime_config(&rc).?;
+    try testing.expectEqualStrings("postgres://writer:w@h/d", writer.url);
+    try testing.expect(!writer.replication);
 }
 
 test "connInfo - a URL with no query gets '?', one with a query gets '&'" {

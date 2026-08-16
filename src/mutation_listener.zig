@@ -7,7 +7,6 @@ const utils = @import("utils.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 
-
 /// What the catalog says about one edge-writable table.
 ///
 /// **Every identifier the bridge puts into SQL comes from here, never from the client.**
@@ -81,8 +80,11 @@ pub const MutationListener = struct {
     /// `DATABASE_URL` (kept in `PgConf.db_url`) and `sslmode`. With a URL set, every
     /// other component connected where it said and this thread dialled the PG_* defaults.
     pg_config: *const pg_conn.PgConf,
-    nats_host: []const u8,
-    nats_seed: ?[]const u8,
+    /// Where NATS is, resolved once in `bridge.zig`. This used to be `nats_host` read
+    /// straight off RuntimeConfig **with no port at all**, so `NATS_URL` was ignored on
+    /// this path alone and ingress dialled `NATS_HOST:4222` while everything else went
+    /// where the URL said. See `Config.Nats.Endpoint`.
+    endpoint: config.Nats.Endpoint,
     io: std.Io,
     should_stop: *std.atomic.Value(bool),
     /// Per-table version/tombstone column overrides, `SYNC_RULES`.
@@ -94,7 +96,7 @@ pub const MutationListener = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
-        runtime_config: *const config.RuntimeConfig,
+        endpoint: config.Nats.Endpoint,
         sync_rules: *const config.EventClassification.TransitionRules,
         default_version_column: []const u8,
         io: std.Io,
@@ -105,8 +107,7 @@ pub const MutationListener = struct {
         self.* = .{
             .allocator = allocator,
             .pg_config = pg_config,
-            .nats_host = runtime_config.nats_host,
-            .nats_seed = runtime_config.nats_seed,
+            .endpoint = endpoint,
             .io = io,
             .should_stop = should_stop,
             .sync_rules = sync_rules,
@@ -181,8 +182,11 @@ pub const MutationListener = struct {
         };
 
         const connect_opts = nats.protocol.ConnectOpts{
-            .addr = self.nats_host,
-            .nkey_seed = self.nats_seed,
+            .addr = self.endpoint.host,
+            .port = self.endpoint.port,
+            .user = self.endpoint.user,
+            .pass = self.endpoint.pass,
+            .nkey_seed = self.endpoint.seed,
         };
 
         var consumer = nats.Consumer.START(
@@ -216,8 +220,17 @@ pub const MutationListener = struct {
             // Pull next message with a 500ms timeout for faster graceful shutdown
             const timeout_ns = nats.protocol.SECNS / 2;
             if (consumer.CONSUME(timeout_ns) catch null) |msg| {
-                // JetStream sends 408 Request Timeout when no messages are available.
-                // It has no payload. We MUST reuse the message envelope.
+                // JetStream status messages (408 Request Timeout, 409, idle heartbeats)
+                // arrive on the pull inbox with no reply-to. Recycle, never ack: the
+                // vendored `Consumer.ack` unwraps `ReplyTo()` and panics on null. The
+                // payload check below used to be the only guard, which held only because
+                // status messages happen to be empty too — reply-to is the actual
+                // distinction between a delivery and a control frame.
+                if (msg.letter.ReplyTo() == null) {
+                    consumer.REUSE(msg);
+                    continue;
+                }
+
                 const payload = msg.letter.getPayload() orelse {
                     consumer.REUSE(msg);
                     continue;
@@ -276,7 +289,6 @@ pub const MutationListener = struct {
         // quiet without saying so is indistinguishable from one that is stuck.
         log.info("🛑 Mutation listener stopped", .{});
     }
-
 
     /// Errors a retry can never fix.
     ///
@@ -360,7 +372,6 @@ pub const MutationListener = struct {
         // consumer connection is pull-only today.
     }
 
-
     /// Parse `mutation.<principal>.<table>.<operation>`.
     ///
     /// The subject is the **only** trusted source of these three: NATS authorizes
@@ -388,10 +399,7 @@ pub const MutationListener = struct {
         if (principal.len == 0 or table.len == 0) return error.MalformedSubject;
 
         const operation: Mutation.Operation =
-            if (std.mem.eql(u8, op_text, "insert")) .insert
-            else if (std.mem.eql(u8, op_text, "update")) .update
-            else if (std.mem.eql(u8, op_text, "delete")) .delete
-            else return error.UnknownOperation;
+            if (std.mem.eql(u8, op_text, "insert")) .insert else if (std.mem.eql(u8, op_text, "update")) .update else if (std.mem.eql(u8, op_text, "delete")) .delete else return error.UnknownOperation;
 
         return .{ .principal = principal, .table = table, .operation = operation };
     }

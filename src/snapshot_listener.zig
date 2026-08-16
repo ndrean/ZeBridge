@@ -354,6 +354,100 @@ const Cursor = struct {
 };
 
 
+/// Bounds a listener thread's **first** NATS connection, and only that one.
+///
+/// These threads cannot return an error — `std.Thread.spawn` on a `void` function
+/// swallows one — so before this existed, a listener that could not reach NATS logged an
+/// error every 2s and looped forever. Nothing else noticed: the CDC publisher has its own
+/// connection and had already succeeded, so `/health` stayed green and events kept
+/// flowing while no client could bootstrap. The bridge was *silently half-working*, which
+/// is the state worth refusing.
+///
+/// The asymmetry is the point. A drop after the listener has worked once is an outage —
+/// retry it forever. A first connection that never lands is a configuration fault, and
+/// the only useful response is to stop and say so loudly.
+///
+/// Stopping means setting the shared `should_stop`, the same flag Ctrl+C sets, so the
+/// bridge unwinds through its normal shutdown (flush thread drained, session summary
+/// printed) rather than dying inside a worker thread.
+const BootConnect = struct {
+    /// Log prefix identifying which listener this is.
+    who: []const u8,
+    should_stop: *std.atomic.Value(bool),
+    /// Raised alongside `should_stop` so `main` can exit non-zero. A supervisor reads
+    /// the exit code, not the log: stopping with 0 tells `restart: on-failure` the job
+    /// finished, and a misconfigured bridge then stays down and quiet.
+    fatal: *std.atomic.Value(bool),
+    attempts: u32 = 0,
+    connected_once: bool = false,
+
+    /// What a failure means, once counted.
+    const Verdict = enum {
+        /// Already worked once: this is an outage, retry without limit and without
+        /// touching the budget.
+        outage,
+        /// Still inside the boot budget.
+        retry,
+        /// Budget exhausted; `should_stop` has been set.
+        give_up,
+    };
+
+    /// Advance the state for one failure. Split from `failed` so the rule — and the
+    /// stop flag it sets — can be tested without a broker and without asserting on log
+    /// output, the same split `preflight.classifyVersionColumn` uses.
+    fn record(self: *BootConnect) Verdict {
+        if (self.connected_once) return .outage;
+
+        self.attempts += 1;
+        if (self.attempts < config.Retry.listener_boot_connect_attempts) return .retry;
+
+        // Fatal first: `main` reads it once it observes should_stop, so the two stores
+        // must not be visible in the other order.
+        self.fatal.store(true, .release);
+        self.should_stop.store(true, .release);
+        return .give_up;
+    }
+
+    /// Record a failure and report it. Returns true when the caller must give up and
+    /// return from the thread.
+    fn failed(self: *BootConnect, err: anyerror, host: []const u8, port: u16) bool {
+        switch (self.record()) {
+            .outage => return false,
+            .retry => {
+                log.warn("{s}: NATS unavailable at {s}:{d} ({s}) — attempt {d}/{d}", .{
+                    self.who,
+                    host,
+                    port,
+                    @errorName(err),
+                    self.attempts,
+                    config.Retry.listener_boot_connect_attempts,
+                });
+                return false;
+            },
+            .give_up => {
+                log.err(
+                    "🔴 FATAL: {s} never reached NATS at {s}:{d} after {d} attempts (last: {s}). This is a configuration fault, not an outage — check NATS_URL/NATS_HOST, the nkey seed, and that nats-init created the '{s}' stream. Stopping the bridge rather than running without a snapshot path.",
+                    .{
+                        self.who,
+                        host,
+                        port,
+                        self.attempts,
+                        @errorName(err),
+                        config.Nats.stream_requests,
+                    },
+                );
+                return true;
+            },
+        }
+    }
+
+    /// The connection is up; every later failure is an outage, retried without limit.
+    fn succeeded(self: *BootConnect) void {
+        self.connected_once = true;
+        self.attempts = 0;
+    }
+};
+
 /// Snapshot request context passed to NATS callback
 const SnapshotContext = struct {
     allocator: std.mem.Allocator,
@@ -377,9 +471,11 @@ pub const SnapshotListener = struct {
     format: encoder_mod.Format,
     chunk_size: usize,
     io: std.Io,
-    nats_host: []const u8,
-    nats_port: u16,
-    nats_seed: ?[]const u8,
+    /// Where NATS is, resolved once in `bridge.zig`. Not re-derived here: see
+    /// `Config.Nats.Endpoint`.
+    endpoint: config.Nats.Endpoint,
+    /// Set when a listener gives up on its first connection; see `BootConnect`.
+    boot_fatal: *std.atomic.Value(bool),
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -391,8 +487,8 @@ pub const SnapshotListener = struct {
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
         io: std.Io,
-        nats_host: []const u8,
-        nats_port: u16,
+        endpoint: config.Nats.Endpoint,
+        boot_fatal: *std.atomic.Value(bool),
     ) SnapshotListener {
         return .{
             .allocator = allocator,
@@ -403,9 +499,8 @@ pub const SnapshotListener = struct {
             .thread = null,
             .format = format,
             .io = io,
-            .nats_host = nats_host,
-            .nats_port = nats_port,
-            .nats_seed = runtime_config.nats_seed,
+            .endpoint = endpoint,
+            .boot_fatal = boot_fatal,
             .chunk_size = runtime_config.snapshot_chunk_size,
         };
     }
@@ -444,9 +539,8 @@ pub const SnapshotListener = struct {
             self.refused,
             self.format,
             self.io,
-            self.nats_host,
-            self.nats_port,
-            self.nats_seed,
+            self.endpoint,
+            self.boot_fatal,
         });
 
         log.info("📸 Spawning snapshot request listener...", .{});
@@ -459,9 +553,8 @@ pub const SnapshotListener = struct {
             self.format,
             self.chunk_size,
             self.io,
-            self.nats_host,
-            self.nats_port,
-            self.nats_seed,
+            self.endpoint,
+            self.boot_fatal,
         });
 
         // Keep main thread alive - just sleep until stop signal
@@ -497,11 +590,14 @@ pub const SnapshotListener = struct {
         refused: *const refused_tables.Registry,
         format: encoder_mod.Format,
         io: std.Io,
-        nats_host: []const u8,
-        nats_port: u16,
-        nats_seed: ?[]const u8,
+        endpoint: config.Nats.Endpoint,
+        boot_fatal: *std.atomic.Value(bool),
     ) void {
         const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
+
+        // See `Retry.listener_boot_connect_attempts`: the first connection is bounded
+        // because failing it means misconfiguration, every later one is not.
+        var boot = BootConnect{ .who = "📋 Schema listener", .should_stop = should_stop, .fatal = boot_fatal };
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
@@ -509,9 +605,15 @@ pub const SnapshotListener = struct {
 
             // Create Core NATS connection
             var core = nats.Core{};
-            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .port = nats_port, .nkey_seed = nats_seed };
+            const connect_opts = nats.protocol.ConnectOpts{
+                .addr = endpoint.host,
+                .port = endpoint.port,
+                .user = endpoint.user,
+                .pass = endpoint.pass,
+                .nkey_seed = endpoint.seed,
+            };
             core.CONNECT(allocator, connect_opts, io) catch |err| {
-                log.err("📋 Schema listener: Failed to connect: {} - retrying in {d}ms", .{ err, reconnect_delay_ms });
+                if (boot.failed(err, endpoint.host, endpoint.port)) return;
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
@@ -522,10 +624,15 @@ pub const SnapshotListener = struct {
             // Subscribe to init.schema
             const sid = "schema-listener-1";
             core.SUB(config.Nats.schema_request_subject, null, sid) catch |err| {
-                log.err("📋 Schema listener: Failed to subscribe: {} - reconnecting", .{err});
+                // Counted against the boot budget too: a subscription that never
+                // succeeds leaves the listener as useless as one that never connects,
+                // and the connect above will keep succeeding, so nothing else would
+                // ever stop the loop.
+                if (boot.failed(err, endpoint.host, endpoint.port)) return;
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
+            boot.succeeded();
 
             log.info("📋 Schema listener: ✅ Subscribed to '{s}'! Waiting for schema requests...", .{config.Nats.schema_request_subject});
 
@@ -801,11 +908,11 @@ pub const SnapshotListener = struct {
         format: encoder_mod.Format,
         chunk_size: usize,
         io: std.Io,
-        nats_host: []const u8,
-        nats_port: u16,
-        nats_seed: ?[]const u8,
+        endpoint: config.Nats.Endpoint,
+        boot_fatal: *std.atomic.Value(bool),
     ) void {
         const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
+        var boot = BootConnect{ .who = "📸 Snapshot listener", .should_stop = should_stop, .fatal = boot_fatal };
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
@@ -838,7 +945,13 @@ pub const SnapshotListener = struct {
                 .max_deliver = config.Snapshot.request_max_deliver,
             };
 
-            const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .port = nats_port, .nkey_seed = nats_seed };
+            const connect_opts = nats.protocol.ConnectOpts{
+                .addr = endpoint.host,
+                .port = endpoint.port,
+                .user = endpoint.user,
+                .pass = endpoint.pass,
+                .nkey_seed = endpoint.seed,
+            };
             var consumer = nats.Consumer.START(
                 allocator,
                 connect_opts,
@@ -846,11 +959,18 @@ pub const SnapshotListener = struct {
                 &cscnf,
                 io,
             ) catch |err| {
+                // Bounded on the first pass only. START covers both the connection and
+                // the consumer, so the common permanent failure here is not a bad host
+                // but a `REQUESTS` stream `nats-init` never created — which no amount
+                // of retrying fixes, and which used to be invisible behind one log line
+                // every 2s while the bridge otherwise looked healthy.
+                if (boot.failed(err, endpoint.host, endpoint.port)) return;
                 log.err("📸 Snapshot listener: Failed to start consumer on '{s}': {} - retrying in {d}ms", .{ config.Nats.stream_requests, err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
             defer nats.Consumer.STOP(&consumer, false);
+            boot.succeeded();
 
             log.info("📸 Snapshot listener: ✅ Consuming '{s}' from stream '{s}'", .{
                 config.Snapshot.request_subject_wildcard,
@@ -860,6 +980,28 @@ pub const SnapshotListener = struct {
             // Listen for snapshot requests
             while (!should_stop.load(.acquire)) {
                 if (consumer.CONSUME(nats.protocol.SECNS / 2) catch null) |msg| {
+                    // Not every message a pull consumer receives is a delivery. The
+                    // server also sends status messages on the pull inbox — `408 Request
+                    // Timeout`, `409`, idle heartbeats — whose subject is the inbox
+                    // itself (`<uuid>.<seq>`) and which carry **no reply-to**.
+                    //
+                    // They must be recycled, never acked: `Consumer.ack` publishes to
+                    // `msg.letter.ReplyTo().?`, so acking one panics the thread on a null
+                    // unwrap — observed as
+                    // `📸 Invalid snapshot request subject: 04b01ecd-….2196` followed
+                    // immediately by `attempt to use null value`, killing the snapshot
+                    // path for the life of the process.
+                    //
+                    // Reply-to is the right discriminator here, not an empty payload:
+                    // a snapshot request legitimately has no payload — the table name is
+                    // in the subject — so the emptiness test the mutation listener uses
+                    // would discard every real request.
+                    if (msg.letter.ReplyTo() == null) {
+                        log.debug("📸 JetStream status message (no reply-to), recycling", .{});
+                        consumer.REUSE(msg);
+                        continue;
+                    }
+
                     // ACKed as soon as it is understood, not after the COPY finishes.
                     // Holding the ack across a multi-minute snapshot only buys
                     // redelivery-on-crash, and pays for it with duplicate snapshots
@@ -940,9 +1082,7 @@ pub const SnapshotListener = struct {
                         chunk_size,
                         should_stop,
                         io,
-                        nats_host,
-                        nats_port,
-                        nats_seed,
+                        endpoint,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         publishSnapshotError(
@@ -978,9 +1118,7 @@ pub const SnapshotListener = struct {
         chunk_size: usize,
         should_stop: *std.atomic.Value(bool),
         io: std.Io,
-        nats_host: []const u8,
-        nats_port: u16,
-        nats_seed: ?[]const u8,
+        endpoint: config.Nats.Endpoint,
     ) !SnapshotResult {
         log.info("📸 Generating snapshot for '{s}' (id={s}, chunk_size={d})", .{
             table_name,
@@ -989,7 +1127,13 @@ pub const SnapshotListener = struct {
         });
 
         // Create JetStream connection for publishing snapshot data
-        const connect_opts = nats.protocol.ConnectOpts{ .addr = nats_host, .port = nats_port, .nkey_seed = nats_seed };
+        const connect_opts = nats.protocol.ConnectOpts{
+                .addr = endpoint.host,
+                .port = endpoint.port,
+                .user = endpoint.user,
+                .pass = endpoint.pass,
+                .nkey_seed = endpoint.seed,
+            };
         var js = nats.JS.CONNECT(allocator, connect_opts, io) catch |err| {
             log.err("📸 Failed to connect to JetStream: {}", .{err});
             return error.JetStreamConnectionFailed;
@@ -1489,4 +1633,59 @@ fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
         "snap-{d}-{x:0>4}",
         .{ @as(i64, c.time(null)), random_suffix },
     );
+}
+
+// ─── BootConnect ────────────────────────────────────────────────────────────────
+//
+// The behaviour under test is an asymmetry that is easy to get backwards: bounded
+// before the first success, unbounded after it. `record` is exercised rather than
+// `failed` so the fatal path can be asserted without the test runner treating its own
+// FATAL log line as a failure.
+
+test "BootConnect: gives up after the budget and stops the bridge" {
+    var stop = std.atomic.Value(bool).init(false);
+    var fatal = std.atomic.Value(bool).init(false);
+    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal };
+
+    for (1..config.Retry.listener_boot_connect_attempts) |_| {
+        try std.testing.expectEqual(BootConnect.Verdict.retry, boot.record());
+        try std.testing.expect(!stop.load(.acquire));
+    }
+
+    try std.testing.expectEqual(BootConnect.Verdict.give_up, boot.record());
+    try std.testing.expect(stop.load(.acquire));
+    // Both, and in that order: the exit code is what a supervisor acts on.
+    try std.testing.expect(fatal.load(.acquire));
+}
+
+test "BootConnect: a listener that connected once retries forever" {
+    var stop = std.atomic.Value(bool).init(false);
+    var fatal = std.atomic.Value(bool).init(false);
+    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal };
+
+    boot.succeeded();
+
+    // Ten times the boot budget: an outage after a working connection must never be
+    // the thing that stops the bridge.
+    for (0..config.Retry.listener_boot_connect_attempts * 10) |_| {
+        try std.testing.expectEqual(BootConnect.Verdict.outage, boot.record());
+    }
+    try std.testing.expect(!stop.load(.acquire));
+    try std.testing.expect(!fatal.load(.acquire));
+}
+
+test "BootConnect: a success part-way through the budget clears it" {
+    var stop = std.atomic.Value(bool).init(false);
+    var fatal = std.atomic.Value(bool).init(false);
+    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal };
+
+    // Two failures, then NATS comes up — the earlier attempts must not carry over, or a
+    // slow-starting broker would arm a trap that fires on the first later outage.
+    _ = boot.record();
+    _ = boot.record();
+    boot.succeeded();
+
+    try std.testing.expectEqual(@as(u32, 0), boot.attempts);
+    try std.testing.expectEqual(BootConnect.Verdict.outage, boot.record());
+    try std.testing.expect(!stop.load(.acquire));
 }

@@ -1,0 +1,5 @@
+# nats-py needs `nkeys` installed separately for seed authentication — it imports it
+# lazily and fails at connect time, not at install time, if it is missing.
+nats-py>=2.15
+nkeys>=0.2
+msgpack>=1.0

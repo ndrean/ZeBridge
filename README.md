@@ -43,12 +43,14 @@ ZeBridge differs significantly from established tools:
 
 ⚠️ **Status**: Dev stage, beaking changes, draft notes.
 
+Bridge["ZeBridge <br> daemon"]
+NATS[("NATS <br> JetStream")]
+
 ```mermaid
 flowchart TD
     subgraph VPS["VPS / Private Network"]
         PG[("PostgreSQL <br> Master")]
-        Bridge["ZeBridge <br> daemon"]
-        NATS[("NATS <br> JetStream")]
+        
         Bridge -- Prometheus --> Grafana["Grafana <br> dashboard"]
         NATS -- Prometheus --> Grafana
 
@@ -58,6 +60,11 @@ flowchart TD
     end
 
     NATS <--> |"TLS TCP / WSS / HTTPS"| Consumers
+
+    subgraph Localhost ["A"]
+      Bridge["ZeBridge <br> daemon"]
+      NATS[("NATS <br> JetStream")]
+    end
 
     subgraph Consumers["Consumers & Clients"]
         App["Native App <br> WebApp"]
@@ -160,10 +167,12 @@ A bridge is connected by default to the NATS server (which also clusters).
 
 ```bash
 # Bridge 1: table "users" with publication "my_pub_1" on master
-PG_HOST=localhost ./bridge --slot slot_1 --pub my_pub_1 --port 9090
+DATABASE_URL=postgres://bridge_reader:pw@localhost:5432/postgres \
+  ./bridge --slot slot_1 --pub my_pub_1 --port 9090
 
 # Bridge 2: table "orders" with publication "my_pub_2" on replica_1
-PG_HOST=replica_1 ./bridge --slot slot_2 --pub my_pub_2 --port 9091
+DATABASE_URL=postgres://bridge_reader:pw@replica_1:5432/postgres \
+  ./bridge --slot slot_2 --pub my_pub_2 --port 9091
 ```
 
 * Encoding. The default is **MessagePack**. Compact (~30% smaller than JSON). Type-safe (_preserves_ int/float/binary distinctions) whilst JSON sends strings. Fast encoding/decoding and available on many plateforms and languages.
@@ -480,34 +489,54 @@ zig build
 **Step 3**: Run the bridge with environment variables:
 
 ```bash
-PG_HOST=localhost \
-PG_DB=postgres \
-PG_PORT=5432 \
-POSTGRES_BRIDGE_USER=bridge_reader \
-POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme \
-NATS_BRIDGE_USER=bridge_user \
-NATS_BRIDGE_PASSWORD=bridge_secure_password \
-NATS_HOST=localhost \
+DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@localhost:5432/postgres \
+NATS_URL=nats://bridge_user:bridge_secure_password@localhost:4222 \
 ./zig-out/bin/bridge --slot my_slot --pub cdc_pub
 
 # With custom port and JSON encoding:
 ./zig-out/bin/bridge --slot my_slot --pub cdc_pub --port 9091 --json
 ```
 
-**Environment variables reference**:
+**Environment variables reference** — `bridge --help` is the full list:
 
 ```bash
-# PostgreSQL connection
-PG_HOST=localhost          # PostgreSQL host
-PG_PORT=5432              # PostgreSQL port
-POSTGRES_BRIDGE_USER=bridge_reader
-POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme
-PG_DB=postgres            # Database name
+# PostgreSQL. URLs only: there is no PG_HOST/PG_USER fallback, on purpose (below).
+DATABASE_URL=postgres://bridge_reader:pw@localhost:5432/postgres        # required
+DATABASE_WRITER_URL=postgres://bridge_writer:pw@localhost:5432/postgres # unset = no ingress
 
-# NATS connection
-NATS_HOST=localhost       # NATS server host
-NATS_BRIDGE_USER=bridge_user
-NATS_BRIDGE_PASSWORD=bridge_secure_password
+# NATS. One address input; NATS_HOST is ignored with a warning.
+NATS_URL=nats://[user:pass@]localhost:4222
+NATS_NKEY_SEED=SU...
+
+BRIDGE_PORT=9090          # HTTP telemetry, when --port is absent
+```
+
+#### Two families of credentials, two files
+
+The variables above are the bridge's. A second family — `PG_HOST`, `PG_PORT`, `PG_USER`,
+`PG_PASSWORD`, `PG_DB`, `POSTGRES_BRIDGE_*`, `POSTGRES_WRITER_*` — is the **admin** set:
+the superuser that `bridge-init` uses to run `init.sql` and the passwords it assigns to
+the roles it creates. The bridge does not read any of them.
+
+They used to be a fallback for the bridge's own connection, which made a missing or
+misspelled `DATABASE_URL` connect as `postgres` and look healthy doing it. That defeats
+the whole point of the split: `bridge_reader` holds SELECT + REPLICATION and is
+_physically_ unable to write, `bridge_writer` has no table privileges until a DBA opens
+one — and neither guarantee survives a process that can connect as someone else.
+
+So they live in `.env.admin` — together with `PG_PUBLISH_PORT`, `SNAP_RET_SECONDS` and
+the nkey's public half, all of which are read by compose or by the init containers and
+never by the bridge — while `.env.bridge` holds only what the bridge itself reads. The
+bridge refuses to start without `DATABASE_URL`:
+
+```bash
+# the stack — .env.admin only: every service compose starts is an admin task
+NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml \
+  --env-file .env.admin up -d
+
+# the bridge — .env.bridge only, so no superuser password enters this shell
+set -a && source .env.bridge && set +a
+NATS_NKEY_SEED="SU..." ./zig-out/bin/bridge --slot my_slot --pub my_pub
 ```
 
 ### Production Deployment (Full Container Stack)
@@ -1563,16 +1592,10 @@ authorization {
 Start the bridge daemon with the private nkey:
 
 ```sh
-NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI  
+NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI \
 RING_BUFFER_COUNT=2048 \
 BASE_BUF=12 \
-PG_HOST=localhost \
-PG_PORT=55432 \
-PG_DB=postgres \
-POSTGRES_BRIDGE_USER=bridge_reader \
-POSTGRES_BRIDGE_PASSWORD=bridge_password_changeme \
-NATS_HOST=localhost \
-NATS_BRIDGE_USER=bridge_user \
-NATS_BRIDGE_PASSWORD=bridge_secure_password \
+DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@localhost:55432/postgres \
+NATS_URL=nats://localhost:4222 \
 ./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
 ```

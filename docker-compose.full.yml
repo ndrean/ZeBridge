@@ -3,8 +3,9 @@ services:
   postgres-primary:
     image: postgres:18
     container_name: postgres-primary
+    # The server's own superuser bootstrap — admin territory, same as bridge-init.
     env_file:
-      - .env.docker
+      - .env.admin
     environment:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_USER: ${PG_USER}
@@ -51,8 +52,10 @@ services:
   nats-config-gen:
     image: busybox:latest
     container_name: nats-config-gen
+    # .env.admin: NATS_BRIDGE_NKEY_PUB is the key the *server* is told to trust, which
+    # is an authorization decision and not one of the bridge's own credentials.
     env_file:
-      - .env.docker
+      - .env.admin
     volumes:
       - nats-config:/config
       - ./nats-server.conf.template:/nats-server.conf.template:ro
@@ -98,7 +101,12 @@ services:
       nats-server:
         condition: service_started
     env_file:
-      - .env.docker
+      - .env.admin
+    # From the shell, not from a file — a private key belongs in neither env file.
+    # ⚠️ Unset means a blank seed: the server answers `Authorization Violation`, and the
+    # `until nats server check connection` loop below spins forever without ever
+    # creating a stream. Run compose as:
+    #   NATS_NKEY_SEED="SU..." docker compose ... up -d
     environment:
       - NATS_NKEY_SEED=${NATS_NKEY_SEED}
     command:
@@ -107,10 +115,40 @@ services:
       - |
         set -e
         export NATS_URL=nats-server:4222
+
+        # Fail here, not in the wait loop below. The server is configured with an nkey,
+        # so an unset seed means every command answers `Authorization Violation` — and
+        # `nats server check connection` reports that as "not up yet", so the loop spun
+        # forever and `up -d` looked like it had merely been slow. An empty seed is a
+        # missing argument, not a transient condition.
+        if [ -z "$${NATS_NKEY_SEED}" ]; then
+          echo '✗ NATS_NKEY_SEED is empty.' >&2
+          echo '  The server requires an nkey, and this container creates the streams,' >&2
+          echo '  so it needs the seed. It is deliberately in no env file — pass it in:' >&2
+          echo '    NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml \' >&2
+          echo '      --env-file .env.admin up -d' >&2
+          exit 1
+        fi
+
         echo $${NATS_NKEY_SEED} > /tmp/seed.txt
         export NATS_NKEY=/tmp/seed.txt
+
+        # Bounded: a wait that cannot end is indistinguishable from a hang. 60s is far
+        # more than nats-server needs, and reaching it means something is wrong that
+        # waiting will not fix — a rejected key, or a server that never came up.
         echo 'Waiting for NATS server...'
+        waited=0
         until nats server check connection 2>/dev/null; do
+          waited=$$((waited + 1))
+          if [ $$waited -ge 60 ]; then
+            echo '✗ NATS did not accept a connection within 60s.' >&2
+            echo '  Last attempt said:' >&2
+            nats server check connection >&2 || true
+            echo '  An Authorization Violation here means the seed does not match the' >&2
+            echo '  NATS_BRIDGE_NKEY_PUB in .env.admin that nats-config-gen wrote into' >&2
+            echo '  nats-server.conf.' >&2
+            exit 1
+          fi
           sleep 1
         done
 
@@ -178,8 +216,10 @@ services:
         condition: service_healthy
     volumes:
       - ./init.sql.template:/init.sql.template:ro
+    # .env.admin only: this is the one container that connects as the superuser, and
+    # the bridge's own DATABASE_URL has no business being in its environment.
     env_file:
-      - .env.docker
+      - .env.admin
 
     command:
       - /bin/bash

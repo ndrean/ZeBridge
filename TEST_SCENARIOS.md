@@ -3,10 +3,12 @@
 Exercises the `PROTOCOL.md` contract end to end: Postgres → bridge → NATS →
 `web-consumer` (WASM SQLite).
 
-**Roles.** The Elixir `emitter/` is the *admin*: it is the only component with a
-direct Postgres connection, so migrations and load generation both live there. The
-`web-consumer` is a pure protocol client — it touches nothing but NATS. That split is
-the privilege boundary, and keeping it honest is itself part of the test.
+**Roles.**
+
+- The Elixir `emitter/` is the *admin*: it is the only component with a
+direct Postgres connection, so migrations and load generation both live there.
+The
+- `web-consumer` is a pure protocol client — it touches nothing but NATS.
 
 ## ⚠️ Half of this is blocked on client work
 
@@ -33,17 +35,17 @@ nothing is actually verified. Do not tick those off early.
 
 ```bash
 # fresh everything
-docker compose -f docker-compose.full.yml down -v --remove-orphans
-docker compose -f docker-compose.full.yml up -d \
+docker compose -f docker-compose.full.yml --env-file .env.admin down -v --remove-orphans
+NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml --env-file .env.admin up -d \
   postgres-primary nats-config-gen nats-server nats-init bridge-init
 
 # admin: create tables + publication membership
 cd emitter && mix run --no-start -e 'path = Path.join([File.cwd!(),"priv","repo","migrations"]); \
   {:ok,_,_} = Ecto.Migrator.with_repo(Emitter.Producer.Repo, fn r -> Ecto.Migrator.run(r, path, :up, all: true) end)'
 
-# bridge
-set -a && source .env && set +a
-./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
+# bridge — .env.bridge only, so no admin credential enters this shell
+set -a && source .env.bridge && set +a
+NATS_NKEY_SEED="SU..." ./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
 
 # client
 cd web-consumer && npm run dev      # http://localhost:5173
@@ -101,6 +103,14 @@ Bridge side, the same run: `📦 Published chunk 0 (250 rows, 45545 bytes)` for
 released the CSV code for deletion.
 
 B3–B6 remain to be run.
+
+🔴 **B2 has a ceiling: `scripts/scenarios/snapshot.py` fails above ~9,400 rows on
+`test_types`.** Chunks are capped at `Snapshot.chunk_size` = 10,000 **rows** with no
+byte budget, so the first chunk of a wide-enough table exceeds the server's 1 MiB
+`max_payload` and the connection is closed instead. Measured: 9,000 rows = 996,789 bytes
+publishes; 10,000 rows never does, and all five retries die on `WriteAllHUPError`
+because the payload is unchanged. Keep seed data under that line until
+`COPY_BINARY_PLAN.md` item 4 lands, or the failure looks like a NATS problem.
 
 | # | setup | expect |
 | --- | --- | --- |

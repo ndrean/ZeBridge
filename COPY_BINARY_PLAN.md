@@ -23,9 +23,10 @@ both granted to `bridge_reader`:
 `DROP TABLE public.ck, public.sk;` when they stop being useful, and
 `DELETE FROM public.users WHERE name LIKE 'n-%';` to put `users` back to its
 scenario size. Bring the stack up with
-`docker compose -f docker-compose.full.yml --env-file .env.docker up -d postgres-primary
-nats-config-gen nats-server nats-init bridge-init`, then run the bridge from the host
-with `.env` plus `PG_PORT=55432`.
+`NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml --env-file .env.admin
+up -d postgres-primary nats-config-gen nats-server nats-init bridge-init`, then run the
+bridge from the host with `.env.bridge` (it needs DATABASE_URL; there is no PG_* fallback
+any more).
 
 **Also landed 2026-08-15, after §E:** the oversized-row `@panic` is gone. A row that
 does not fit the per-event buffer now suspends its table (`reason: "row_too_large"`)
@@ -70,6 +71,55 @@ report all exist; the subject is still parsed from the payload, there is no repl
 3. **The scenario migrations moved** from `emitter/priv/spec/` to
    `emitter/priv/repo/migrations/` (2026-08-15, untracked at the new location — commit
    them). `Emitter.Scenario` steps 1–8 run again from there.
+
+4. 🔴 **Snapshot chunks are capped in rows, not bytes — any table with rows averaging
+   more than ~104 bytes cannot be snapshotted at all.** Found 2026-08-16 by
+   `scripts/scenarios/snapshot.py`. `Snapshot.chunk_size` is a compile-time `10_000`
+   and `streamToEncoder` publishes whatever those rows encode to, with no reference to
+   the server's `max_payload`. Measured on `test_types` (12 columns): 9,000 rows =
+   996,789 bytes and publishes fine; 10,000 rows ≈ 1.11 MB and the server closes the
+   connection — `error.Timeout`, then `WriteAllHUPError` on all five retries, because
+   the payload never changes and the retry can only re-kill the connection. The snapshot
+   is lost, no `init.snap.error.<table>` is published, and the CDC publisher on the same
+   process reconnects in a loop.
+
+   `Config.Nats` already documents this hazard for the CDC path and `bridge.zig:403`
+   already reads `nats_publisher.serverMaxPayload(js)` at boot; the snapshot path is
+   simply the one that never got the guard.
+
+   The fix is a byte budget, but it touches the wire contract, so decide first: the
+   encoder writes its array header with the row count **up front**, so a chunk cannot be
+   truncated mid-encode — it has to be re-encoded as a prefix of the rows already
+   fetched (cheap, no re-query). That makes `num_rows < chunk_size` stop meaning "last
+   chunk", which is what `X-Snapshot-Final-Chunk` is derived from today and what both
+   consumers read. So `streamToEncoder` must report *fetched* and *encoded* row counts
+   separately, and final becomes `fetched < chunk_size and encoded == fetched`.
+
+**Untested, noted 2026-08-16: encryption in transit.** Neither leg has ever been run
+with TLS.
+
+- **Postgres.** Should be the easy one now: `sslmode` rides in `DATABASE_URL`'s query
+  string (`?sslmode=verify-full&sslrootcert=…`), libpq does the work, and `connInfo`
+  passes the URL through untouched. Worth an actual run against a TLS-enabled server
+  before claiming it — in particular that `verify-full` still works once `connInfo`
+  appends its keepalives, and on the **replication** connection, which appends
+  `replication=database` as well.
+- **NATS: a deployment constraint, arrived at the honest way (2026-08-16).** TLS was
+  attempted against the vendored pure-Zig client and not achieved — adding it looks like
+  substantial work in the client itself, where nkey auth was already a local patch. So
+  the deployment removes the need instead: **the bridge and nats-server are colocated on
+  one VPS and talk over loopback**, and there is no link to encrypt.
+
+  Worth being clear that this is a mitigation, not a preference — it is sound (loopback
+  is not a network an attacker sits on), but it constrains the topology, and the
+  constraint should be re-examined if the client ever gains TLS. `Endpoint.parseUrl` accepts only `nats://` and rejects `tls://` with
+  `MissingScheme`, which matches the deployment rather than limiting it: a URL promising
+  transport security the client cannot provide is worse than a refusal.
+
+  What this rules out, and should be stated wherever the topology is described: a
+  *remote* NATS. Clients still reach the server from anywhere — that is the websocket
+  port and the broker's own concern — but the bridge→NATS hop is an intra-host one by
+  design. Revisit only if the client gains TLS.
 
 **Small, independent, pick up any time** (§F): array quoting (`{"solo"}` vs `{solo}` —
 systematic, blocks a byte-equality golden test), snapshot failures that abort without
