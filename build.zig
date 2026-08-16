@@ -58,42 +58,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Parse topology.json and generate build options
-    const topology_file = @embedFile("topology.json");
-    var parsed_topology = std.json.parseFromSliceLeaky(std.json.Value, b.allocator, topology_file, .{}) catch |err| {
-        std.debug.panic("Failed to parse topology.json: {any}\n", .{err});
-    };
-    const topology_opts = b.addOptions();
-    
-    // Every name the bridge puts on the wire comes from here. `.?` on purpose: a key
-    // missing from topology.json must fail the build, not silently fall back to a
-    // literal — a literal is exactly how the bridge and nats-init drifted apart.
-    const streams = parsed_topology.object.get("streams").?.object;
-    topology_opts.addOption([]const u8, "stream_cdc", streams.get("cdc").?.string);
-    topology_opts.addOption([]const u8, "stream_init", streams.get("init").?.string);
-    topology_opts.addOption([]const u8, "stream_mutations", streams.get("mutations").?.string);
-    topology_opts.addOption([]const u8, "stream_requests", streams.get("requests").?.string);
+    // topology.json is no longer parsed here. It used to be @embedFile'd and turned into
+    // build options, which baked every stream and subject name into the binary — so a
+    // rename reached `nats-init` on `docker compose up` but not the bridge, which needed
+    // a rebuild while logging the names as though it had just read them. It is read at
+    // startup now; see src/topology.zig.
 
-    const subjects = parsed_topology.object.get("subjects").?.object;
-    topology_opts.addOption([]const u8, "subject_cdc_prefix", subjects.get("cdc_prefix").?.string);
-    topology_opts.addOption([]const u8, "subject_init_prefix", subjects.get("init_prefix").?.string);
-    topology_opts.addOption([]const u8, "subject_mutations_prefix", subjects.get("mutations_prefix").?.string);
-    topology_opts.addOption([]const u8, "mutation_pattern", subjects.get("mutation_pattern").?.string);
-    topology_opts.addOption([]const u8, "mutation_error_prefix", subjects.get("mutation_error_prefix").?.string);
-    topology_opts.addOption([]const u8, "mutation_error_pattern", subjects.get("mutation_error_pattern").?.string);
-    topology_opts.addOption([]const u8, "snapshot_request", subjects.get("snapshot_request").?.string);
-    topology_opts.addOption([]const u8, "schema_request", subjects.get("schema_request").?.string);
-    topology_opts.addOption([]const u8, "snapshot_data_pattern", subjects.get("snapshot_data_pattern").?.string);
-    topology_opts.addOption([]const u8, "snapshot_start_pattern", subjects.get("snapshot_start_pattern").?.string);
-    topology_opts.addOption([]const u8, "snapshot_error_pattern", subjects.get("snapshot_error_pattern").?.string);
-    topology_opts.addOption([]const u8, "snapshot_meta_pattern", subjects.get("snapshot_meta_pattern").?.string);
-    topology_opts.addOption([]const u8, "snapshot_schema_pattern", subjects.get("snapshot_schema_pattern").?.string);
-    
-    const kv = parsed_topology.object.get("kv").?.object;
-    topology_opts.addOption([]const u8, "kv_schemas", kv.get("schemas").?.string);
-    topology_opts.addOption([]const u8, "kv_snapshots", kv.get("snapshots").?.string);
-
-    const topology_mod = topology_opts.createModule();
 
     // Vendored g41797/mailbox (no external deps)
     const mailbox_mod = b.addModule("mailbox", .{
@@ -119,7 +89,6 @@ pub fn build(b: *std.Build) void {
     mod.addImport("msgpack", msgpack.module("msgpack"));
     mod.addImport("nats", nats_mod);
     mod.addImport("c", c_mod);
-    mod.addImport("topology", topology_mod);
 
     const exe = b.addExecutable(.{
         .name = "bridge",
@@ -134,7 +103,6 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "msgpack", .module = msgpack.module("msgpack") },
                 .{ .name = "nats", .module = nats_mod },
                 .{ .name = "c", .module = c_mod },
-                .{ .name = "topology", .module = topology_mod },
             },
         }),
     });

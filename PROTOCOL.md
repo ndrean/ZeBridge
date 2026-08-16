@@ -711,6 +711,28 @@ precision is lost.
 - ⚠️ **Do not send a future timestamp.** A skewed clock writes a row nobody can update
   until the world catches up; the bridge clamps and tells you what it used.
 
+#### The column's *type* decides whether last-write-wins is sound
+
+There are only a few type facts a client author has to know, and they all live here.
+Everything else about types is in §4 "Value encoding"; these are the ones that decide
+whether an edit survives.
+
+The bridge reports each of these at startup, and again when a table appears while it is
+running — but the log is the operator's, and the consequence is the client's, so:
+
+| the version column is | what happens | what the client must do |
+| --- | --- | --- |
+| `timestamptz` | ordering is sound — the value is UTC, and `Z` says so | nothing; send it back as received |
+| `timestamp` (no zone) | ⚠️ **a naive wall-clock reading.** LWW compares two clients' strings, so the moment one stores local time and another UTC, the *wrong* write wins — and nothing errors | send UTC, always, whatever the local zone. Never `new Date(v)` on a value with no `Z` (§4) |
+| `timestamp(0)` / second precision | ⚠️ concurrent edits inside one second **tie**, and a tie is rejected by `<` | nothing to do client-side; the column needs `(6)`. Ask the DBA |
+| nullable | ⚠️ a NULL stored version makes `stored < incoming` evaluate to NULL, which rejects the write | nothing client-side; the bridge keeps an `IS NULL OR` guard, but `NOT NULL` removes the question |
+| `bigint` / `int` | sound, and immune to clock skew | treat it as opaque and monotonic — increment, never derive from a clock |
+| `created_at` / `inserted_at` | **refused.** Set once at insert, so as a version it rejects every update forever | pick a column that changes on write |
+
+⚠️ `timestamp without time zone` is the **common** case, not the exotic one: Ecto's
+`timestamps()` and Rails' `t.timestamps` both produce it. If your table came from a
+standard migration, assume naive until you have checked.
+
 ### 7.3 Deletes, tombstones, and the GC watermark
 
 A delete from the edge is a **soft delete**: the row survives with its tombstone column

@@ -4,7 +4,7 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-A lightweight **stateless** opinionated bidirectional daemon connecting PostgreSQL (≧ 14) to the message broker NATS/JetStream (≧ 2) for Edge sync.
+A lightweight **stateless** opinionated bidirectional daemon connecting PostgreSQL (14+) to the message broker NATS/JetStream (2+) for Edge sync.
 
 Allows mobile, WASM (PGLite/SQLite), and web apps to mirror PostgreSQL tables over WSS or TLS via NATS/JetStream without ever reaching for PostgreSQL.
 
@@ -45,7 +45,7 @@ ZeBridge differs significantly from established tools:
 
 **Status**: Dev stage, beaking changes, draft notes.
 
-**v 0.1.14**: `NATS` and `Zebridge` communicate via **TCP only**, on localhost.
+**v 0.1.14**: Uses PostgreSQL 14+, with `NATS` and `Zebridge` communicate via **TCP only**, on localhost.
 
 ```mermaid
 flowchart TD
@@ -78,7 +78,7 @@ flowchart TD
 **Roadmap**:
 
 * **v 0.1.16**: READ [CDC+bootstrap] on a **standby replica** (PG ≧ 16, shared WAL stream), WRITE on **master**.
-* **v 1.0**: `Zebridge` <- TLS -> `NATS` (remove the localhost constraint)
+* **v 1.0**: `Zebridge` <- TLS -> `NATS` (remove the localhost constraint).
 
 ## Table of Contents
 
@@ -106,11 +106,30 @@ NATS have 40+ clients, so instead of an SDK, we propose a guide with the workflo
 
 Worked examples can be found for webapps (WASM-SQLite + OPFS), backend micrservice Elixir & Python, Flutter
 
-### Data flow and security
+### Setup
 
-The DBA is responsible to migrate the PUBLICATION and triggers needed by Zebridge.
+The DBA is responsible to migrate the PUBLICATION for the desired tables, the roles and triggers needed by a Zebridge instance.
 
 Zebridge uses two separate _Read_ and _Write_ limited roles for the bidirectional flows between a Consumer facing NATS and the bridge.
+Zebridge uses three streams and two KV buckets that enables the bidirectional communication flow Zebridge <-- NATS --> Consumer. The naming is **shared** and compiled.
+
+A Zebridge instance currently sits on the **same** localhost than the `NATS` server and is characterized by:
+
+* a unique `slot`,
+* a unique `port`
+* the _topology.json_  config (naming fo the shared streams and bucket) which is also used by NATS
+* an NKEY seed corresponding to the public NKEY passed to the NATS server
+* the different paths DATABASE_URL, NATS_URL.. to connect to PostgreSQL
+
+One instance is run with the command:
+
+```sh
+NATS_NKEY_SEED=SU... \
+NATS_URL=nats://127.0.0.1:4222 \
+DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:55432/postgres \
+DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:55432/postgres \
+./bridge --slot my_slot --pub my_pub --port 9090 --top topology.json
+```
 
 **Three data flow**:
 

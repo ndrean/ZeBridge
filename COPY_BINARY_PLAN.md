@@ -286,6 +286,92 @@ invalidated by recovery conflict, and a PG floor of 16.
 
 Do snapshots first. Decide CDC separately, with the standby-lag metric already in place.
 
+### Two flexibility claims, verified 2026-08-16
+
+**1. "A topology rename is a restart." — It is now. Fixed 2026-08-16.**
+
+topology.json is read at **startup** (`src/topology.zig`), not baked in by `build.zig`.
+`TOPOLOGY_PATH` overrides the location; a missing file or key stops the bridge before any
+thread exists, naming the key (`MissingKey at "subjects"."snapshot_meta_pattern"`), so the
+guarantee the compile-time version gave moved rather than disappeared. Verified: renaming
+`streams.cdc` and `subjects.cdc_prefix` and restarting — **no rebuild** — produced
+`Streams: CDC_RENAMED …` and `CDC subject pattern: changes.<table>.<operation>`.
+
+The one new piece is `topology.render`: `std.fmt.allocPrint` needs a comptime format
+string, so the `{[table]s}` patterns needed a runtime substituter. It checks both
+directions — an unknown placeholder *and* an unused argument are errors — because a wrong
+subject is silent: the message lands under a name nobody subscribes to, or under none at
+all if no stream captures it.
+
+*What follows is the finding that prompted the change.*
+
+**1a. Why it had to move — No: it was a rebuild.** `build.zig:62`
+`@embedFile("topology.json")` feeds `addOptions`, so every stream, subject and bucket name
+is *baked into the binary*. Tested: renaming `streams.cdc` and running `zig build` with no
+`.zig` file touched does pick the change up (the build system tracks the embed correctly),
+but the **already-built binary keeps the old name** — it logged
+`Streams: CDC_RENAMED …` while topology.json on disk said `CDC`. The log line said
+"(from topology.json)", which implied runtime reading; it now says "compiled in … rebuild
+to change".
+
+The asymmetry is the friction point: `nats-init` reads topology.json at *container run
+time* with `jq` (docker-compose.full.yml:161-164), so `docker compose up` applies a rename
+to the server immediately, while the bridge needs a rebuild and redeploy. A rename is
+therefore three coordinated moves — rebuild the bridge, re-run nats-init, update clients —
+not one restart.
+
+This is the price of the comptime design, and it was bought deliberately: a missing key
+fails the *build*, which is what stopped the bridge and nats-init drifting apart. Making it
+runtime would trade that guarantee for a startup error and would cost the comptime string
+concatenation (`mutations_subject_wildcard = prefix ++ ".>"`). Worth revisiting only if
+renames become frequent, which they should not.
+
+**2. "A DBA adds a table; the bridge has no constraint on it." — True of the code. The
+edge-writability report now follows it (fixed 2026-08-16); `monitored_tables` still does
+not.**
+
+`preflight.reportTable` runs from the DDL path, so a table created while the bridge is
+running gets the same ✍️/⚠️ lines it would have got at boot. Verified live: `CREATE TABLE
+zb_naive (id bigint PRIMARY KEY, updated_at timestamp)` against a running bridge produced
+`✍️ 'zb_naive': edge-writable on 'updated_at'` followed by the naive-timestamp and
+nullable warnings. One extra catalog query per `CREATE TABLE`, on a short-lived
+connection, and every failure is swallowed with a debug line — advice must not cost a DDL
+event.
+
+The client-facing half of that warning is now `PROTOCOL.md` §7.2, "The column's *type*
+decides whether last-write-wins is sound": the operator sees the log, the client author
+needs the consequence.
+
+What follows still stands. No table name is hardcoded anywhere. However
+`monitored_tables` is read **once at boot** from `pg_publication_tables`
+(`bridge.zig:464`), and it is consulted at runtime by the snapshot listener
+(`snapshot_listener.zig:1050`, `isTableMonitored`).
+
+So after `ALTER PUBLICATION … ADD TABLE` against a running bridge:
+
+- **CDC flows** — pgoutput sends the new relation, and the decoder works from
+  `RelationMessage.relation_id`, not from a name list;
+- **snapshots are refused** — `table_not_monitored`, until restart;
+- **no boot schema was published** for it (`publishBootSchemas` takes `monitored_tables`),
+  so unless a `CREATE TABLE` DDL event fires — which `ALTER PUBLICATION` on an *existing*
+  table does not — clients receive change events for a table they have no schema for and
+  cannot seed.
+
+That mixed state is the real gap, and it is worse than a clean "not supported": the bridge
+looks like it is working. Restarting the instance resolves it. Either make the refusal
+symmetric (drop CDC for tables absent from `monitored_tables`) or re-read the publication
+when a DDL event arrives — the second is the better behaviour and the more work.
+
+Prerequisites the DBA owns either way: the table needs a primary key (otherwise preflight
+refuses it — `refused_tables`), `bridge_reader` needs `SELECT` for the snapshot `COPY`, and
+edge writes need `SELECT zebridge_grant_edge_writes('public.<table>')`.
+
+**3. The slot is per-instance and architecture-neutral — correct.** It is that instance's
+pointer into the WAL, nothing more. Two consequences worth stating: a slot whose bridge has
+stopped **pins WAL forever** and will fill the primary's disk (`max_slot_wal_keep_size` is
+the guard, set to 10GB in compose), and `max_replication_slots` caps how many instances can
+exist at once.
+
 **Small, independent, pick up any time** (§F): array quoting (`{"solo"}` vs `{solo}` —
 systematic, blocks a byte-equality golden test), snapshot failures that abort without
 publishing to `init.snap.error.<table>`, golden-value test per PG major (note

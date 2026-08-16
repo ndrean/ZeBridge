@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const encoder = @import("encoder.zig");
-const topology = @import("topology");
+const Topo = @import("topology.zig");
 
 pub const log = std.log.scoped(.config);
 
@@ -141,41 +141,17 @@ pub const Nats = struct {
     pub const status_update_interval_ms = 100; // 100 milliseconds
     pub const status_update_byte_threshold: u64 = 1024 * 1024; // 1MB
 
-    /// JetStream stream names. Every one of these is a name `nats-init` creates from
-    /// the same topology.json, so the two ends cannot disagree.
-    pub const stream_cdc = topology.stream_cdc;
-    pub const stream_init = topology.stream_init;
-    pub const stream_mutations = topology.stream_mutations;
-    pub const stream_requests = topology.stream_requests;
+    /// JetStream's own mapping of a KV bucket into the subject space: `$KV.<bucket>.<key>`.
+    /// Not in topology.json, and not a name anyone is free to choose — it is the server's.
+    pub const kv_subject_prefix = "$KV.";
 
-    /// Subject prefixes
-    pub const subject_cdc_prefix = topology.subject_cdc_prefix;
-    pub const subject_init_prefix = topology.subject_init_prefix;
-    pub const subject_mutations_prefix = topology.subject_mutations_prefix;
-
-    /// Every mutation subject the ingress consumer filters on: "mutation.>"
-    pub const mutations_subject_wildcard = subject_mutations_prefix ++ ".>";
-
-    /// `mutation.<principal>.<table>.<operation>` — the ingress subject grammar.
-    ///
-    /// The principal is a **subject token, not a payload field**, because NATS
-    /// authorizes subjects and not payloads: a client granted
-    /// `publish: ["mutation.alice.>"]` physically cannot write as anyone else, and the
-    /// bridge reading the principal off the subject is reading a claim the broker has
-    /// already vouched for. Principal first so a per-user grant is one wildcard rule.
-    ///
-    /// ⚠️ The principal must be a legal NATS token — no `.`, space, `*` or `>` — so an
-    /// email address cannot be one. Use an opaque id.
-    pub const mutation_subject_pattern = topology.mutation_pattern;
-
-    /// Where a mutation goes when it can never succeed: `mutation_error.<table>`.
-    ///
-    /// ⚠️ Deliberately **outside** the `mutation.>` space. A dead-letter subject under
-    /// the same prefix would be matched by the ingress consumer's own filter, so the
-    /// bridge would consume its own failures and republish them forever — a poison pill
-    /// with a feedback loop.
-    pub const mutation_error_prefix = topology.mutation_error_prefix;
-    pub const mutation_error_pattern = topology.mutation_error_pattern;
+    // Stream names, subject prefixes, subject patterns and KV bucket names all used to
+    // live here as `pub const`s fed by build.zig's @embedFile of topology.json. They are
+    // now fields on `RuntimeConfig.topology`, read from that file at startup — see
+    // src/topology.zig for why the compile-time version had to go.
+    //
+    // What stays here is what topology.json does not describe: retry budgets, token
+    // positions, and the redelivery limits below.
 
     /// Redelivery budget for a mutation. Bounded so that a message the bridge
     /// misclassifies as retryable still stops eventually, instead of pinning the worker
@@ -183,35 +159,15 @@ pub const Nats = struct {
     /// in 15 s before this existed).
     pub const mutation_max_deliver: i32 = 5;
 
-    /// Token positions in the mutation subject, after splitting on '.'.
+    /// Token positions in the mutation subject, after splitting on '.'. The *shape* of
+    /// `mutation.<principal>.<table>.<operation>` is fixed here while the prefix itself
+    /// comes from topology.json: a deployment may rename the prefix, but moving the
+    /// principal to another position would change what the broker's authorization
+    /// wildcard covers, which is a protocol change and not a configuration one.
     pub const mutation_token_principal = 1;
     pub const mutation_token_table = 2;
     pub const mutation_token_operation = 3;
     pub const mutation_token_count = 4;
-
-    /// Subject a client publishes a schema request to, and the bridge subscribes to.
-    pub const schema_request_subject = topology.schema_request;
-
-    /// Where the bridge publishes a table's schema: "init.schema.<table>". Under the
-    /// init prefix so the INIT stream captures it — a subject outside every stream is
-    /// published, never acked, and fails after the full retry budget.
-    pub const schema_subject_pattern = topology.schema_request ++ ".{s}";
-
-    /// JetStream exposes a KV bucket as the subject space $KV.<bucket>.<key>, so a
-    /// bucket is written by publishing to that subject. Single-sourced from topology:
-    /// these used to be hardcoded "$KV.schemas.{s}" literals in four places, which
-    /// meant renaming the bucket in topology.json changed the server and the config
-    /// constants but NOT what the bridge actually published.
-    pub const kv_subject_prefix = "$KV.";
-    pub const kv_schemas_subject_pattern = kv_subject_prefix ++ topology.kv_schemas ++ ".{s}";
-
-    /// Snapshot descriptor bucket, same reasoning as above. This one was a live
-    /// instance of the bug rather than a hypothetical: `snapshot_listener` published to
-    /// a hardcoded "$KV.snapshots.{s}" while `nats-init` never created the bucket at
-    /// all (it read only `.kv.schemas` from topology.json), so every snapshot ended in
-    /// six failed publish retries against a bucket that did not exist.
-    pub const snapshot_kv_bucket = topology.kv_snapshots;
-    pub const kv_snapshots_subject_pattern = kv_subject_prefix ++ topology.kv_snapshots ++ ".{s}";
 
     /// Room a published message needs beyond the row's own bytes: the subject, the
     /// `Nats-Msg-Id` and content headers, one MessagePack map key per column, and the
@@ -324,30 +280,7 @@ pub const Snapshot = struct {
     /// How often to check for new snapshot requests via LISTEN/NOTIFY
     pub const poll_interval_ms = 100;
 
-    /// NATS subject prefix for snapshot requests: "snapshot.request.<table>"
-    pub const request_subject_prefix = topology.snapshot_request ++ ".";
-
-    /// NATS subject wildcard for subscribing to all snapshot requests
-    pub const request_subject_wildcard = topology.snapshot_request ++ ".>";
-
-    /// NATS subject pattern for data chunks: "init.snap.{table}.{snapshot_id}.{chunk}"
-    pub const data_subject_pattern = topology.snapshot_data_pattern;
-
-    /// NATS subject pattern for snapshot start notification: "init.snap.start.{table}"
-    pub const start_subject_pattern = topology.snapshot_start_pattern;
-
-    /// NATS subject pattern for snapshot errors: "init.snap.error.{table}"
-    pub const error_subject_pattern = topology.snapshot_error_pattern;
-
-    /// NATS subject pattern for metadata: "init.snap.meta.{table}"
-    pub const meta_subject_pattern = topology.snapshot_meta_pattern;
-
-    /// Column order for a snapshot's chunks.
-    /// Was hardcoded as "snapshot.schema.{table}.{id}" — a subject NO stream captures,
-    /// so JetStream never acked it, the publish timed out through all its retries, and
-    /// the whole snapshot failed. It must live under init.> for the INIT stream to
-    /// store it.
-    pub const schema_subject_pattern = topology.snapshot_schema_pattern;
+    // Snapshot subject patterns moved to `RuntimeConfig.topology` (src/topology.zig).
 
     /// Message ID pattern for data chunks: "snap-<table>-<snapshot_id>-<chunk>"
     pub const data_msg_id_pattern = "snap-{s}-{s}-{d}";
@@ -544,6 +477,12 @@ pub const RuntimeConfig = struct {
     slot_name: []const u8,
     publication_name: []const u8,
 
+    /// Every wire name, read from topology.json at startup. Carried on RuntimeConfig
+    /// because that is already threaded to each component that publishes or subscribes,
+    /// which is what keeps one file the single source for the bridge, `nats-init` and
+    /// the clients alike.
+    topology: Topo.Topology,
+
     // NATS
     /// `nats://[user:pass@]host[:port]` — the only address input. Optional here only
     /// because `defaults()` predates parsing; `args.zig` always fills it in.
@@ -583,6 +522,10 @@ pub const RuntimeConfig = struct {
             .pg_writer_url = null,
             .slot_name = Postgres.default_slot_name,
             .publication_name = Postgres.default_publication_name,
+            // Always replaced in `main` immediately after parseArgs. Safe as a default
+            // only because a test asserts `for_tests` equals the repository's own
+            // topology.json, so the two cannot drift.
+            .topology = Topo.Topology.for_tests,
             .nats_url = Nats.default_url,
             .nats_seed = null,
             .batch_max_events = Batch.max_events,

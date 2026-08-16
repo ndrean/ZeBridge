@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const config = @import("config.zig");
+const Topology = @import("topology.zig");
 const nats = @import("nats");
 const nats_publisher = @import("nats_publisher.zig");
 const pgoutput = @import("pgoutput.zig");
@@ -40,11 +41,17 @@ const ColumnInfo = struct {
 ///   relation: Relation message from pgoutput (contains column info)
 ///   allocator: Memory allocator
 ///   format: Encoding format (.msgpack or .json)
+///   topology: wire names, read from topology.json at startup
+///
+/// ⚠️ Nothing calls this today — the live schema path is `event_processor`'s DDL
+/// handling, which publishes to the KV bucket. Kept compiling rather than deleted on a
+/// hunch, but it should go out with the next sweep if it is still unreferenced.
 pub fn publishSchema(
     publisher: *nats_publisher.Publisher,
     relation: *const pgoutput.RelationMessage,
     allocator: std.mem.Allocator,
     format: encoder_mod.Format,
+    topology: *const Topology.Topology,
 ) !void {
     const schema_version = @as(i64, c.time(null));
 
@@ -55,10 +62,11 @@ pub fn publishSchema(
     });
 
     // Subject from topology; it sits under the init prefix so the INIT stream captures it.
-    const subject = try std.fmt.allocPrint(
+    const subject = try Topology.render(
         allocator,
-        config.Nats.schema_subject_pattern,
-        .{relation.name},
+        topology.schema_subject_pattern,
+        &.{.{ .name = "table", .value = relation.name }},
+        null,
     );
     defer allocator.free(subject);
 

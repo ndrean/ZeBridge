@@ -237,50 +237,131 @@ pub fn reportVersionColumns(
         }
         _ = table_start;
 
-        switch (verdict) {
-            .usable => |u| {
-                writable += 1;
-                log.info("✍️  '{s}': edge-writable on '{s}'", .{ table, wanted });
-                if (u.naive) log.warn(
-                    "⚠️  '{s}.{s}' is `timestamp` (no time zone): last-write-wins ordering breaks if any writer stores local time rather than UTC",
-                    .{ table, wanted },
-                );
-                if (u.coarse) log.warn(
-                    "⚠️  '{s}.{s}' has second precision: concurrent edits in the same second tie, and a tie is REJECTED — the later write is dropped with no error",
-                    .{ table, wanted },
-                );
-                if (u.nullable) log.warn(
-                    "⚠️  '{s}.{s}' is nullable: a NULL stored version makes the comparison NULL, which rejects the write",
-                    .{ table, wanted },
-                );
-            },
-            .creation_column => {
-                outbound_only += 1;
-                log.err(
-                    "🔴 '{s}': '{s}' is a creation stamp — set once at insert, never updated. As a version it rejects every update forever. Choose a column that changes on write.",
-                    .{ table, wanted },
-                );
-            },
-            .wrong_type => {
-                outbound_only += 1;
-                log.warn("⚠️  '{s}': '{s}' is not an orderable timestamp/integer — outbound-only", .{ table, wanted });
-            },
-            .absent => {
-                outbound_only += 1;
-                if (candidates.items.len == 0) {
-                    log.info("ℹ️  '{s}': outbound-only (no '{s}', and no orderable timestamp column to use)", .{ table, wanted });
-                } else {
-                    log.info("ℹ️  '{s}': outbound-only — no column '{s}'.", .{ table, wanted });
-                    for (candidates.items) |cand| {
-                        log.info("      candidate: {s}", .{cand});
-                    }
-                    log.info("      make it edge-writable with: SYNC_RULES={s}:<column>", .{table});
-                }
-            },
-        }
+        if (logVerdict(table, wanted, verdict, candidates.items)) writable += 1 else outbound_only += 1;
     }
 
     log.info("✅ Edge writes: {d} table(s) writable, {d} outbound-only", .{ writable, outbound_only });
+}
+
+/// Log one table's verdict. Returns true when the table is edge-writable.
+///
+/// Split out of `reportVersionColumns` so the identical lines appear for a table that
+/// arrives *after* boot via a DDL event. Before this, a table created while the bridge
+/// was running got its schema published and its no-PK refusal made, but never the ✍️/⚠️
+/// report — so the one warning that `updated_at` is naive, or coarse, or nullable, was
+/// shown only to whoever happened to restart. These fire once per table, not per event.
+fn logVerdict(
+    table: []const u8,
+    wanted: []const u8,
+    verdict: VersionVerdict,
+    candidates: []const []const u8,
+) bool {
+    switch (verdict) {
+        .usable => |u| {
+            log.info("✍️  '{s}': edge-writable on '{s}'", .{ table, wanted });
+            if (u.naive) log.warn(
+                "⚠️  '{s}.{s}' is `timestamp` (no time zone): last-write-wins ordering breaks if any writer stores local time rather than UTC",
+                .{ table, wanted },
+            );
+            if (u.coarse) log.warn(
+                "⚠️  '{s}.{s}' has second precision: concurrent edits in the same second tie, and a tie is REJECTED — the later write is dropped with no error",
+                .{ table, wanted },
+            );
+            if (u.nullable) log.warn(
+                "⚠️  '{s}.{s}' is nullable: a NULL stored version makes the comparison NULL, which rejects the write",
+                .{ table, wanted },
+            );
+            return true;
+        },
+        .creation_column => {
+            log.err(
+                "🔴 '{s}': '{s}' is a creation stamp — set once at insert, never updated. As a version it rejects every update forever. Choose a column that changes on write.",
+                .{ table, wanted },
+            );
+            return false;
+        },
+        .wrong_type => {
+            log.warn("⚠️  '{s}': '{s}' is not an orderable timestamp/integer — outbound-only", .{ table, wanted });
+            return false;
+        },
+        .absent => {
+            if (candidates.len == 0) {
+                log.info("ℹ️  '{s}': outbound-only (no '{s}', and no orderable timestamp column to use)", .{ table, wanted });
+            } else {
+                log.info("ℹ️  '{s}': outbound-only — no column '{s}'.", .{ table, wanted });
+                for (candidates) |cand| {
+                    log.info("      candidate: {s}", .{cand});
+                }
+                log.info("      make it edge-writable with: SYNC_RULES={s}:<column>", .{table});
+            }
+            return false;
+        },
+    }
+}
+
+/// The same report, for one table, on demand.
+///
+/// Called from the DDL path when a table appears while the bridge is running. One extra
+/// catalog query per `CREATE TABLE` — an event rare enough that the cost is irrelevant
+/// and the silence was not.
+pub fn reportTable(
+    allocator: std.mem.Allocator,
+    conn: *c.PGconn,
+    table: []const u8,
+    sync_rules: *const Config.EventClassification.TransitionRules,
+    default_version_column: []const u8,
+) !void {
+    if (isInternalTable(table)) return;
+
+    // Parameterised: the name arrives from a DDL event, and interpolating it would put a
+    // value the bridge did not choose into SQL.
+    const query =
+        \\SELECT a.attname, t.typname, a.atttypmod, a.attnotnull
+        \\FROM pg_class cl
+        \\JOIN pg_namespace ns ON ns.oid = cl.relnamespace AND ns.nspname = 'public'
+        \\JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum > 0 AND NOT a.attisdropped
+        \\JOIN pg_type t ON t.oid = a.atttypid
+        \\WHERE cl.relname = $1
+        \\  AND t.typname IN ('timestamp', 'timestamptz', 'int8', 'int4')
+        \\ORDER BY a.attnum;
+    ;
+
+    const table_z = try allocator.dupeZ(u8, table);
+    defer allocator.free(table_z);
+    const values = [_][*c]const u8{table_z.ptr};
+
+    const res = c.PQexecParams(conn, query, 1, null, &values, null, null, 0);
+    defer c.PQclear(res);
+
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.warn("⚠️  Version-column report skipped for '{s}': {s}", .{ table, c.PQerrorMessage(conn) });
+        return;
+    }
+
+    const wanted: []const u8 = if (sync_rules.get(table)) |cols|
+        (if (cols.len > 0) cols[0] else default_version_column)
+    else
+        default_version_column;
+
+    var verdict: VersionVerdict = .absent;
+    var candidates: std.ArrayList([]const u8) = .empty;
+    defer candidates.deinit(allocator);
+
+    const rows: usize = @intCast(c.PQntuples(res));
+    for (0..rows) |i| {
+        const col = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
+        const typname = std.mem.span(c.PQgetvalue(res, @intCast(i), 1));
+        const typmod = std.fmt.parseInt(i32, std.mem.span(c.PQgetvalue(res, @intCast(i), 2)), 10) catch -1;
+        const notnull = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 3)), "t");
+
+        if (std.mem.eql(u8, col, wanted)) {
+            verdict = classifyVersionColumn(col, typname, typmod, notnull);
+        } else if (!isCreationColumn(col)) {
+            try candidates.append(allocator, col);
+        }
+    }
+
+    _ = logVerdict(table, wanted, verdict, candidates.items);
 }
 
 /// Tables that are ours or the migration tool's — mirrors zebridge_is_internal_table()

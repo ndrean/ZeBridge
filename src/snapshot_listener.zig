@@ -18,6 +18,7 @@ const encoder_mod = @import("encoder.zig");
 const streaming_encoder = @import("streaming_encoder.zig");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
 const nats = @import("nats");
+const topology_mod = @import("topology.zig");
 const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.snapshot_listener);
@@ -52,11 +53,13 @@ fn publishSnapshotError(
     error_message: []const u8,
     available_tables: []const []const u8,
     format: encoder_mod.Format,
+    topo: *const topology_mod.Topology,
 ) !void {
-    const subject = try std.fmt.allocPrint(
+    const subject = try topology_mod.render(
         allocator,
-        config.Snapshot.error_subject_pattern,
-        .{ .table = table_name },
+        topo.snapshot_error_pattern,
+        &.{.{ .name = "table", .value = table_name }},
+        null,
     );
     defer allocator.free(subject);
 
@@ -373,6 +376,9 @@ const Cursor = struct {
 const BootConnect = struct {
     /// Log prefix identifying which listener this is.
     who: []const u8,
+    /// Named in the fatal message, because "the stream nats-init should have created" is
+    /// the most common cause and its name is now a per-deployment value.
+    requests_stream: []const u8,
     should_stop: *std.atomic.Value(bool),
     /// Raised alongside `should_stop` so `main` can exit non-zero. A supervisor reads
     /// the exit code, not the log: stopping with 0 tells `restart: on-failure` the job
@@ -433,7 +439,7 @@ const BootConnect = struct {
                         port,
                         self.attempts,
                         @errorName(err),
-                        config.Nats.stream_requests,
+                        self.requests_stream,
                     },
                 );
                 return true;
@@ -476,6 +482,8 @@ pub const SnapshotListener = struct {
     endpoint: config.Nats.Endpoint,
     /// Set when a listener gives up on its first connection; see `BootConnect`.
     boot_fatal: *std.atomic.Value(bool),
+    /// Wire names, read from topology.json at startup. See src/topology.zig.
+    topology: *const topology_mod.Topology,
 
     /// Initialize snapshot listener (does not start the thread)
     pub fn init(
@@ -501,6 +509,7 @@ pub const SnapshotListener = struct {
             .io = io,
             .endpoint = endpoint,
             .boot_fatal = boot_fatal,
+            .topology = &runtime_config.topology,
             .chunk_size = runtime_config.snapshot_chunk_size,
         };
     }
@@ -541,6 +550,7 @@ pub const SnapshotListener = struct {
             self.io,
             self.endpoint,
             self.boot_fatal,
+            self.topology,
         });
 
         log.info("📸 Spawning snapshot request listener...", .{});
@@ -555,6 +565,7 @@ pub const SnapshotListener = struct {
             self.io,
             self.endpoint,
             self.boot_fatal,
+            self.topology,
         });
 
         // Keep main thread alive - just sleep until stop signal
@@ -567,7 +578,7 @@ pub const SnapshotListener = struct {
         snapshot_thread.join();
     }
 
-    // Listens for schema requests on config.Nats.schema_request_subject and responds
+    // Listens for schema requests on topo.schema_request and responds
     // with fresh schema data queried from PostgreSQL information_schema.
 
     /// Column information from information_schema
@@ -592,12 +603,13 @@ pub const SnapshotListener = struct {
         io: std.Io,
         endpoint: config.Nats.Endpoint,
         boot_fatal: *std.atomic.Value(bool),
+        topo: *const topology_mod.Topology,
     ) void {
         const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
 
         // See `Retry.listener_boot_connect_attempts`: the first connection is bounded
         // because failing it means misconfiguration, every later one is not.
-        var boot = BootConnect{ .who = "📋 Schema listener", .should_stop = should_stop, .fatal = boot_fatal };
+        var boot = BootConnect{ .who = "📋 Schema listener", .should_stop = should_stop, .fatal = boot_fatal, .requests_stream = topo.stream_requests };
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
@@ -623,7 +635,7 @@ pub const SnapshotListener = struct {
 
             // Subscribe to init.schema
             const sid = "schema-listener-1";
-            core.SUB(config.Nats.schema_request_subject, null, sid) catch |err| {
+            core.SUB(topo.schema_request, null, sid) catch |err| {
                 // Counted against the boot budget too: a subscription that never
                 // succeeds leaves the listener as useless as one that never connects,
                 // and the connect above will keep succeeding, so nothing else would
@@ -634,7 +646,7 @@ pub const SnapshotListener = struct {
             };
             boot.succeeded();
 
-            log.info("📋 Schema listener: ✅ Subscribed to '{s}'! Waiting for schema requests...", .{config.Nats.schema_request_subject});
+            log.info("📋 Schema listener: ✅ Subscribed to '{s}'! Waiting for schema requests...", .{topo.schema_request});
 
             // Listen for schema requests
             while (!should_stop.load(.acquire)) {
@@ -660,6 +672,7 @@ pub const SnapshotListener = struct {
                         monitored_tables,
                         refused,
                         format,
+                        topo,
                     ) catch |err| {
                         log.err("📋 Failed to handle schema request: {}", .{err});
                     };
@@ -681,6 +694,7 @@ pub const SnapshotListener = struct {
         monitored_tables: []const []const u8,
         refused: *const refused_tables.Registry,
         format: encoder_mod.Format,
+        topo: *const topology_mod.Topology,
     ) !void {
         // Create PostgreSQL connection
         const conninfo = try pg_config.connInfo(allocator, false);
@@ -825,7 +839,7 @@ pub const SnapshotListener = struct {
             const table_name = entry.key_ptr.*;
             const columns = entry.value_ptr.items;
 
-            try publishSchemaResponse(allocator, core, table_name, columns, format);
+            try publishSchemaResponse(allocator, core, table_name, columns, format, topo);
         }
 
         log.info("📋 Published schemas for {d} tables", .{table_schemas.count()});
@@ -838,6 +852,7 @@ pub const SnapshotListener = struct {
         table_name: []const u8,
         columns: []const SchemaColumnInfo,
         format: encoder_mod.Format,
+        topo: *const topology_mod.Topology,
     ) !void {
         // Extract just table name (remove schema prefix)
         const table_only = blk: {
@@ -880,7 +895,12 @@ pub const SnapshotListener = struct {
         defer allocator.free(encoded);
 
         // Publish to $KV.schemas.{table_name} subject to populate the KV bucket!
-        const subject = try std.fmt.allocPrint(allocator, config.Nats.kv_schemas_subject_pattern, .{table_only});
+        const subject = try topology_mod.render(
+            allocator,
+            topo.kv_schemas_subject_pattern,
+            &.{.{ .name = "table", .value = table_only }},
+            null,
+        );
         defer allocator.free(subject);
 
         core.PUB(subject, null, encoded) catch |err| {
@@ -910,9 +930,10 @@ pub const SnapshotListener = struct {
         io: std.Io,
         endpoint: config.Nats.Endpoint,
         boot_fatal: *std.atomic.Value(bool),
+        topo: *const topology_mod.Topology,
     ) void {
         const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
-        var boot = BootConnect{ .who = "📸 Snapshot listener", .should_stop = should_stop, .fatal = boot_fatal };
+        var boot = BootConnect{ .who = "📸 Snapshot listener", .should_stop = should_stop, .fatal = boot_fatal, .requests_stream = topo.stream_requests };
 
         // Outer reconnection loop
         while (!should_stop.load(.acquire)) {
@@ -936,7 +957,7 @@ pub const SnapshotListener = struct {
                 .durable_name = "bridge_snapshot_worker",
                 .ack_policy = "explicit",
                 .deliver_policy = "all",
-                .filter_subject = config.Snapshot.request_subject_wildcard,
+                .filter_subject = topo.request_subject_wildcard,
                 // A snapshot runs synchronously in this loop and can take minutes on a
                 // large table. The default 30s ack_wait would redeliver the request while
                 // the first COPY is still running — duplicate snapshots for one request.
@@ -955,7 +976,7 @@ pub const SnapshotListener = struct {
             var consumer = nats.Consumer.START(
                 allocator,
                 connect_opts,
-                config.Nats.stream_requests,
+                topo.stream_requests,
                 &cscnf,
                 io,
             ) catch |err| {
@@ -965,7 +986,7 @@ pub const SnapshotListener = struct {
                 // of retrying fixes, and which used to be invisible behind one log line
                 // every 2s while the bridge otherwise looked healthy.
                 if (boot.failed(err, endpoint.host, endpoint.port)) return;
-                log.err("📸 Snapshot listener: Failed to start consumer on '{s}': {} - retrying in {d}ms", .{ config.Nats.stream_requests, err, reconnect_delay_ms });
+                log.err("📸 Snapshot listener: Failed to start consumer on '{s}': {} - retrying in {d}ms", .{ topo.stream_requests, err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
@@ -973,8 +994,8 @@ pub const SnapshotListener = struct {
             boot.succeeded();
 
             log.info("📸 Snapshot listener: ✅ Consuming '{s}' from stream '{s}'", .{
-                config.Snapshot.request_subject_wildcard,
-                config.Nats.stream_requests,
+                topo.request_subject_wildcard,
+                topo.stream_requests,
             });
 
             // Listen for snapshot requests
@@ -1016,7 +1037,7 @@ pub const SnapshotListener = struct {
                     };
 
                     const table_name = blk: {
-                        const prefix = config.Snapshot.request_subject_prefix;
+                        const prefix = topo.request_subject_prefix;
                         if (std.mem.startsWith(u8, subject, prefix)) {
                             break :blk subject[prefix.len..];
                         }
@@ -1040,6 +1061,7 @@ pub const SnapshotListener = struct {
                             "Table has no primary key: replication is suspended, so no snapshot can be served",
                             monitored_tables,
                             format,
+                            topo,
                         ) catch |err| {
                             log.err("📸 Failed to publish snapshot error for '{s}': {}", .{ table_name, err });
                         };
@@ -1058,6 +1080,7 @@ pub const SnapshotListener = struct {
                             "Table is not in the publication this bridge replicates",
                             monitored_tables,
                             format,
+                            topo,
                         ) catch |err| {
                             log.err("📸 Failed to publish snapshot error for '{s}': {}", .{ table_name, err });
                         };
@@ -1083,6 +1106,7 @@ pub const SnapshotListener = struct {
                         should_stop,
                         io,
                         endpoint,
+                        topo,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         publishSnapshotError(
@@ -1093,6 +1117,7 @@ pub const SnapshotListener = struct {
                             @errorName(err),
                             monitored_tables,
                             format,
+                            topo,
                         ) catch |perr| {
                             log.err("📸 Failed to publish generation error for '{s}': {}", .{ table_name, perr });
                         };
@@ -1119,6 +1144,7 @@ pub const SnapshotListener = struct {
         should_stop: *std.atomic.Value(bool),
         io: std.Io,
         endpoint: config.Nats.Endpoint,
+        topo: *const topology_mod.Topology,
     ) !SnapshotResult {
         log.info("📸 Generating snapshot for '{s}' (id={s}, chunk_size={d})", .{
             table_name,
@@ -1184,6 +1210,7 @@ pub const SnapshotListener = struct {
             lsn_str,
             format,
             should_stop,
+            topo,
         ) catch |err| {
             log.warn("Failed to publish snapshot start: {}", .{err});
         };
@@ -1299,6 +1326,7 @@ pub const SnapshotListener = struct {
                     col_names,
                     format,
                     should_stop,
+                    topo,
                 );
             }
 
@@ -1313,11 +1341,12 @@ pub const SnapshotListener = struct {
 
             // Publish chunk to JetStream with Nats-Msg-Id header for deduplication
             // Use chunk_alloc (arena) for all per-chunk allocations
-            const subject = try std.fmt.allocPrint(
-                chunk_alloc,
-                config.Snapshot.data_subject_pattern,
-                .{ .table = table_name, .snapshot_id = snapshot_id, .chunk = batch },
-            );
+            const chunk_text = try std.fmt.allocPrint(chunk_alloc, "{d}", .{batch});
+            const subject = try topology_mod.render(chunk_alloc, topo.snapshot_data_pattern, &.{
+                .{ .name = "table", .value = table_name },
+                .{ .name = "snapshot_id", .value = snapshot_id },
+                .{ .name = "chunk", .value = chunk_text },
+            }, null);
 
             const msg_id_buf = try std.fmt.allocPrint(
                 chunk_alloc,
@@ -1410,6 +1439,7 @@ pub const SnapshotListener = struct {
             total_rows,
             format,
             should_stop,
+            topo,
         );
 
         log.info("✅ Snapshot complete: {s} ({d} batches, {d} rows)", .{
@@ -1435,6 +1465,7 @@ pub const SnapshotListener = struct {
         lsn: []const u8,
         format: encoder_mod.Format,
         should_stop: *std.atomic.Value(bool),
+        topo: *const topology_mod.Topology,
     ) !void {
         var encoder = encoder_mod.Encoder.init(allocator, format);
         defer encoder.deinit();
@@ -1455,10 +1486,11 @@ pub const SnapshotListener = struct {
         const encoded = try encoder.encode(start_map);
         defer allocator.free(encoded);
 
-        const subject = try std.fmt.allocPrint(
+        const subject = try topology_mod.render(
             allocator,
-            config.Snapshot.start_subject_pattern,
-            .{ .table = table_name },
+            topo.snapshot_start_pattern,
+            &.{.{ .name = "table", .value = table_name }},
+            null,
         );
         defer allocator.free(subject);
 
@@ -1479,6 +1511,7 @@ pub const SnapshotListener = struct {
         row_count: u64,
         format: encoder_mod.Format,
         should_stop: *std.atomic.Value(bool),
+        topo: *const topology_mod.Topology,
     ) !void {
         var encoder = encoder_mod.Encoder.init(allocator, format);
         defer encoder.deinit();
@@ -1499,10 +1532,11 @@ pub const SnapshotListener = struct {
         const encoded = try encoder.encode(meta_map);
         defer allocator.free(encoded);
 
-        const subject = try std.fmt.allocPrint(
+        const subject = try topology_mod.render(
             allocator,
-            config.Snapshot.meta_subject_pattern,
-            .{ .table = table_name },
+            topo.snapshot_meta_pattern,
+            &.{.{ .name = "table", .value = table_name }},
+            null,
         );
         defer allocator.free(subject);
 
@@ -1521,15 +1555,16 @@ pub const SnapshotListener = struct {
         // Also publish to the KV bucket so clients can check for a cached snapshot
         // before requesting a fresh one. Subject built from topology, not a literal:
         // renaming the bucket there must move the bridge and `nats-init` together.
-        const kv_subject = try std.fmt.allocPrint(
+        const kv_subject = try topology_mod.render(
             allocator,
-            config.Nats.kv_snapshots_subject_pattern,
-            .{table_name},
+            topo.kv_snapshots_subject_pattern,
+            &.{.{ .name = "table", .value = table_name }},
+            null,
         );
         defer allocator.free(kv_subject);
         try publishWithRetry(js, kv_subject, null, encoded, should_stop);
 
-        log.info("📋 Published snapshot metadata → {s} (and KV {s})", .{ subject, config.Nats.snapshot_kv_bucket });
+        log.info("📋 Published snapshot metadata → {s} (and KV {s})", .{ subject, topo.kv_snapshots });
     }
 
 };
@@ -1575,6 +1610,7 @@ fn publishSchema(
     column_names: [][]const u8,
     format: encoder_mod.Format,
     should_stop: *std.atomic.Value(bool),
+    topo: *const topology_mod.Topology,
 ) !void {
     var encoder = encoder_mod.Encoder.init(allocator, format);
     defer encoder.deinit();
@@ -1596,11 +1632,10 @@ fn publishSchema(
     const encoded = try encoder.encode(schema_map);
     defer allocator.free(encoded);
 
-    const subject = try std.fmt.allocPrint(
-        allocator,
-        config.Snapshot.schema_subject_pattern,
-        .{ .table = table_name, .snapshot_id = snapshot_id },
-    );
+    const subject = try topology_mod.render(allocator, topo.snapshot_schema_pattern, &.{
+        .{ .name = "table", .value = table_name },
+        .{ .name = "snapshot_id", .value = snapshot_id },
+    }, null);
     defer allocator.free(subject);
 
     // Create headers for schema message
@@ -1645,7 +1680,7 @@ fn generateSnapshotId(allocator: std.mem.Allocator) ![]const u8 {
 test "BootConnect: gives up after the budget and stops the bridge" {
     var stop = std.atomic.Value(bool).init(false);
     var fatal = std.atomic.Value(bool).init(false);
-    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal };
+    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal, .requests_stream = "REQUESTS" };
 
     for (1..config.Retry.listener_boot_connect_attempts) |_| {
         try std.testing.expectEqual(BootConnect.Verdict.retry, boot.record());
@@ -1661,7 +1696,7 @@ test "BootConnect: gives up after the budget and stops the bridge" {
 test "BootConnect: a listener that connected once retries forever" {
     var stop = std.atomic.Value(bool).init(false);
     var fatal = std.atomic.Value(bool).init(false);
-    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal };
+    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal, .requests_stream = "REQUESTS" };
 
     boot.succeeded();
 
@@ -1677,7 +1712,7 @@ test "BootConnect: a listener that connected once retries forever" {
 test "BootConnect: a success part-way through the budget clears it" {
     var stop = std.atomic.Value(bool).init(false);
     var fatal = std.atomic.Value(bool).init(false);
-    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal };
+    var boot = BootConnect{ .who = "test", .should_stop = &stop, .fatal = &fatal, .requests_stream = "REQUESTS" };
 
     // Two failures, then NATS comes up — the earlier attempts must not carry over, or a
     // slow-starting broker would arm a trap that fires on the first later outage.

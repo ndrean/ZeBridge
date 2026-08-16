@@ -1,5 +1,6 @@
 const std = @import("std");
 const nats = @import("nats");
+const Topology = @import("topology.zig");
 const log = std.log.scoped(.mutation_listener);
 const config = @import("config.zig");
 const pg_conn = @import("pg_conn.zig");
@@ -80,6 +81,8 @@ pub const MutationListener = struct {
     /// `DATABASE_URL` (kept in `PgConf.db_url`) and `sslmode`. With a URL set, every
     /// other component connected where it said and this thread dialled the PG_* defaults.
     pg_config: *const pg_conn.PgConf,
+    /// Wire names, read from topology.json at startup. See src/topology.zig.
+    endpoint_topology: *const Topology.Topology,
     /// Where NATS is, resolved once in `bridge.zig`. This used to be `nats_host` read
     /// straight off RuntimeConfig **with no port at all**, so `NATS_URL` was ignored on
     /// this path alone and ingress dialled `NATS_HOST:4222` while everything else went
@@ -97,6 +100,7 @@ pub const MutationListener = struct {
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
         endpoint: config.Nats.Endpoint,
+        topology: *const Topology.Topology,
         sync_rules: *const config.EventClassification.TransitionRules,
         default_version_column: []const u8,
         io: std.Io,
@@ -108,6 +112,7 @@ pub const MutationListener = struct {
             .allocator = allocator,
             .pg_config = pg_config,
             .endpoint = endpoint,
+            .endpoint_topology = topology,
             .io = io,
             .should_stop = should_stop,
             .sync_rules = sync_rules,
@@ -178,7 +183,7 @@ pub const MutationListener = struct {
             .max_deliver = config.Nats.mutation_max_deliver,
             // Not "mutation.>" spelled out: the comment used to say "from topology.json
             // prefix", which is the shape of the drift this centralisation exists to stop.
-            .filter_subject = config.Nats.mutations_subject_wildcard,
+            .filter_subject = self.endpoint_topology.mutations_subject_wildcard,
         };
 
         const connect_opts = nats.protocol.ConnectOpts{
@@ -192,7 +197,7 @@ pub const MutationListener = struct {
         var consumer = nats.Consumer.START(
             self.allocator,
             connect_opts,
-            config.Nats.stream_mutations,
+            self.endpoint_topology.stream_mutations,
             &cscnf,
             self.io,
         ) catch |err| {
@@ -239,7 +244,7 @@ pub const MutationListener = struct {
                 // Subject first: it carries the identity, the table and the verb, and
                 // all three are refused before a byte of the payload is decoded.
                 const subject = msg.letter.subject.body() orelse "";
-                const mutation = parseSubject(subject) catch |err| {
+                const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
                     log.err("🔴 Malformed mutation subject '{s}' ({}): dead-lettering", .{ subject, err });
                     self.deadLetter(msg, payload, err);
                     consumer.ACK(msg, true) catch consumer.REUSE(msg);
@@ -360,7 +365,7 @@ pub const MutationListener = struct {
 
         // Named field, like the snapshot subject patterns: topology writes
         // "{[table]s}", so the argument is a struct, not a tuple.
-        const err_subject = std.fmt.allocPrint(alloc, config.Nats.mutation_error_pattern, .{ .table = table }) catch return;
+        const err_subject = Topology.render(alloc, self.endpoint_topology.mutation_error_pattern, &.{.{ .name = "table", .value = table }}, null) catch return;
         const body = std.fmt.allocPrint(
             alloc,
             "{{\"error\":\"{s}\",\"subject\":\"{s}\",\"bytes\":{d}}}",
@@ -379,7 +384,10 @@ pub const MutationListener = struct {
     /// physically cannot write as anyone else — while a `table` field in the body is
     /// simply whatever the client typed. Reading them here is not the bridge trusting
     /// the client; it is reading a claim the broker already checked.
-    fn parseSubject(subject: []const u8) !Mutation {
+    /// `mutations_prefix` is passed rather than read from a constant: the prefix is a
+    /// topology name now, and a parser that hardcoded "mutation" would accept subjects a
+    /// renamed deployment never issues — and reject the ones it does.
+    fn parseSubject(subject: []const u8, mutations_prefix: []const u8) !Mutation {
         var tokens: [config.Nats.mutation_token_count][]const u8 = undefined;
         var n: usize = 0;
         var it = std.mem.splitScalar(u8, subject, '.');
@@ -391,7 +399,7 @@ pub const MutationListener = struct {
             n += 1;
         }
         if (n != config.Nats.mutation_token_count) return error.MalformedSubject;
-        if (!std.mem.eql(u8, tokens[0], config.Nats.subject_mutations_prefix)) return error.MalformedSubject;
+        if (!std.mem.eql(u8, tokens[0], mutations_prefix)) return error.MalformedSubject;
 
         const principal = tokens[config.Nats.mutation_token_principal];
         const table = tokens[config.Nats.mutation_token_table];
@@ -793,7 +801,7 @@ pub const MutationListener = struct {
 const testing = std.testing;
 
 test "subject - the grammar is the authorization surface" {
-    const m = try MutationListener.parseSubject("mutation.a3f9c1.users.insert");
+    const m = try MutationListener.parseSubject("mutation.a3f9c1.users.insert", "mutation");
     try testing.expectEqualStrings("a3f9c1", m.principal);
     try testing.expectEqualStrings("users", m.table);
     try testing.expect(m.operation == .insert);
@@ -802,11 +810,11 @@ test "subject - the grammar is the authorization surface" {
 test "subject - wrong token count is refused, never truncated" {
     // Truncating a longer subject to the first four tokens would let
     // `mutation.alice.users.insert.extra` be read as a valid write.
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users"));
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users.insert.extra"));
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("cmd.alice.users.insert"));
-    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation..users.insert"));
-    try testing.expectError(error.UnknownOperation, MutationListener.parseSubject("mutation.alice.users.truncate"));
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users", "mutation"));
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation.alice.users.insert.extra", "mutation"));
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("cmd.alice.users.insert", "mutation"));
+    try testing.expectError(error.MalformedSubject, MutationListener.parseSubject("mutation..users.insert", "mutation"));
+    try testing.expectError(error.UnknownOperation, MutationListener.parseSubject("mutation.alice.users.truncate", "mutation"));
 }
 
 test "the bridge's own tables are never writable from the edge" {

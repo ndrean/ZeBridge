@@ -2,6 +2,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const encoder = @import("encoder.zig");
+const topology_mod = @import("topology.zig");
 const log = std.log.scoped(.args);
 
 const usage =
@@ -13,6 +14,8 @@ const usage =
     \\  --slot <NAME>   Replication slot name (created if absent)
     \\  --pub <NAME>    PostgreSQL PUBLICATION to stream
     \\  --port <PORT>   HTTP telemetry port
+    \\  --top <PATH>    topology.json to read (default: ./topology.json). Carries every
+    \\                  stream, subject and KV name; missing file or key is fatal.
     \\  --json          Encode as JSON (default: MessagePack)
     \\  --strict-tables Refuse to start if any published table lacks a primary key
     \\                  (default: skip the table, keep replicating the rest)
@@ -77,6 +80,8 @@ fn envUint(
 
 /// Command-line arguments structure
 pub const Args = struct {
+    /// Where topology.json is. See `--top`.
+    topology_path: []const u8,
     http_port: u16,
     slot_name: []const u8,
     publication_name: []const u8,
@@ -104,6 +109,8 @@ pub const Args = struct {
         // Off by default: one keyless table should not stop every other table from
         // replicating. See preflight.zig for the full argument.
         var strict_tables: bool = false;
+        // Null means "not given", so TOPOLOGY_PATH can still speak before the default.
+        var topology_path: ?[]const u8 = null;
 
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--port")) {
@@ -117,6 +124,8 @@ pub const Args = struct {
                 if (args_iter.next()) |value| slot_name = value;
             } else if (std.mem.eql(u8, arg, "--pub")) {
                 if (args_iter.next()) |value| publication_name = value;
+            } else if (std.mem.eql(u8, arg, "--top")) {
+                if (args_iter.next()) |value| topology_path = value;
             } else if (std.mem.eql(u8, arg, "--json")) {
                 encoding_format = .json;
             } else if (std.mem.eql(u8, arg, "--strict-tables")) {
@@ -156,7 +165,16 @@ pub const Args = struct {
                 "default",
         });
 
+        // `--top` beats TOPOLOGY_PATH beats ./topology.json — the same precedence as
+        // `--port` over BRIDGE_PORT. Only the *path* is resolved here; reading it is
+        // `main`'s job, because a failure there must stop the process with a message,
+        // not be folded into argument parsing.
+        const resolved_topology = topology_path orelse
+            init.minimal.environ.getPosix("TOPOLOGY_PATH") orelse
+            topology_mod.default_path;
+
         const cli_args = Args{
+            .topology_path = resolved_topology,
             .http_port = resolved_port,
             .slot_name = slot_name,
             .publication_name = publication_name,

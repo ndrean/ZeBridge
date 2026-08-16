@@ -27,6 +27,7 @@ const utils = @import("utils.zig");
 const preflight = @import("preflight.zig");
 const refused_tables = @import("refused_tables.zig");
 const type_registry = @import("type_registry.zig");
+const topology_mod = @import("topology.zig");
 
 // Force test discovery for imported modules.
 // Zig only collects tests from files the root actually references, so every module
@@ -49,6 +50,7 @@ comptime {
     _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");
     _ = @import("streaming_encoder.zig");
+    _ = @import("topology.zig");
 }
 
 pub const log = std.log.scoped(.bridge);
@@ -269,6 +271,16 @@ pub fn main(init: std.process.Init) !void {
     const parsed_args = parsed.args;
     var runtime_config = parsed.runtime_config;
 
+    // Every wire name, read from disk before anything connects. A missing key stops the
+    // bridge here, with the key named — the same guarantee the compile-time version gave,
+    // moved to where an operator error belongs. TOPOLOGY_PATH overrides the location for
+    // a deployment that does not run from the directory holding the file.
+    const topology_path = parsed_args.topology_path;
+    var topology_owned = try topology_mod.load(allocator, io, topology_path);
+    defer topology_owned.deinit();
+    runtime_config.topology = topology_owned.topology;
+    log.info("Topology: \x1b[1m {s} \x1b[0m (read at startup)", .{topology_path});
+
     // Create null-terminated versions for C APIs (kept alive for entire program)
     const slot_name_z = try allocator.dupeZ(u8, parsed_args.slot_name);
     defer allocator.free(slot_name_z);
@@ -280,11 +292,12 @@ pub fn main(init: std.process.Init) !void {
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
     log.info("Encoding format: \x1b[1m {s} \x1b[0m", .{@tagName(parsed_args.encoding_format)});
-    log.info("Streams: \x1b[1m {s}, {s}, {s}, {s} \x1b[0m (from topology.json)", .{
-        Config.Nats.stream_cdc,
-        Config.Nats.stream_init,
-        Config.Nats.stream_requests,
-        Config.Nats.stream_mutations,
+    log.info("Streams: \x1b[1m {s}, {s}, {s}, {s} \x1b[0m (from {s})", .{
+        runtime_config.topology.stream_cdc,
+        runtime_config.topology.stream_init,
+        runtime_config.topology.stream_requests,
+        runtime_config.topology.stream_mutations,
+        topology_path,
     });
 
     // Register signal handlers for graceful shutdown
@@ -497,6 +510,7 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             wc,
             nats_endpoint,
+            &runtime_config.topology,
             &sync_rules,
             default_version_column,
             io,
@@ -538,6 +552,9 @@ pub fn main(init: std.process.Init) !void {
         &pg_config,
         &refused,
         &type_registry_inst,
+        &runtime_config.topology,
+        &sync_rules,
+        default_version_column,
     );
 
     // Publish boot schemas to NATS KV for all monitored tables
@@ -566,7 +583,7 @@ pub fn main(init: std.process.Init) !void {
     // Mark as connected in metrics
     metrics.setConnected(true);
 
-    log.info("ℹ️ CDC subject pattern: \x1b[1m {s}.<table>.<operation> \x1b[0m", .{Config.Nats.subject_cdc_prefix});
+    log.info("ℹ️ CDC subject pattern: \x1b[1m {s}.<table>.<operation> \x1b[0m", .{runtime_config.topology.subject_cdc_prefix});
 
     // <--- Metrics setup
     const present = @as(i64, @intCast(c.time(null)));

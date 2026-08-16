@@ -92,10 +92,33 @@ async def main():
     if missing:
         print(f"  ⓘ  not set in .env.admin: {', '.join(missing)}")
 
-    for name in ("DATABASE_URL", "DATABASE_WRITER_URL", "NATS_URL"):
-        if name in admin:
-            zb.bad(f".env.admin defines {name} — that is the bridge's, and compose hands "
-                   "this file to containers that have no business holding it")
+    # Name collisions across the two files. This is the general form of the hazard: a
+    # shell that has sourced both — or a compose run given both — ends up with whichever
+    # was read last, and neither file shows which one won.
+    #
+    # `DATABASE_URL` is the sharp case. The admin legitimately needs a superuser
+    # connection (init.sql, the Elixir emitter), but naming it `DATABASE_URL` means
+    # sourcing .env.admin hands the *bridge's* variable a superuser — the exact fallback
+    # that was deliberately removed from the code. Give the admin's its own name.
+    BRIDGE_OWNED = ("DATABASE_URL", "DATABASE_WRITER_URL", "NATS_URL", "BRIDGE_PORT")
+    for name in sorted(set(admin) & set(bridge)):
+        same = admin[name] == bridge[name]
+        if name in BRIDGE_OWNED:
+            zb.bad(f"{name} is defined in BOTH files — it is the bridge's name; "
+                   f"rename the admin one (ADMIN_{name})")
+            print(f"     .env.admin  {admin[name]}")
+            print(f"     .env.bridge {bridge[name]}")
+            failed = 1
+        elif not same:
+            zb.bad(f"{name} is defined in both files with different values")
+            failed = 1
+        else:
+            print(f"  ⓘ  {name} duplicated in both files (same value) — pick one home")
+
+    for name in BRIDGE_OWNED:
+        if name in admin and name not in bridge:
+            zb.bad(f".env.admin defines {name}, which is the bridge's variable — "
+                   f"rename it (ADMIN_{name}) so sourcing .env.admin cannot reconfigure the bridge")
             failed = 1
 
     return failed

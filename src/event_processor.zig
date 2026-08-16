@@ -14,6 +14,8 @@ const utils = @import("utils.zig");
 const Config = @import("config.zig");
 const RefusedTables = @import("refused_tables.zig");
 const TypeRegistry = @import("type_registry.zig");
+const Topology = @import("topology.zig");
+const Preflight = @import("preflight.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
 const schema_mapper = @import("schema_mapper.zig");
@@ -114,6 +116,12 @@ pub const EventProcessor = struct {
     /// OID → typtype, populated from DDL events and at boot. The CDC decoder consults
     /// it for any type its switch does not cover; see type_registry.zig.
     types: *TypeRegistry.Registry,
+    /// Wire names, read from topology.json at startup. See src/topology.zig.
+    topology: *const Topology.Topology,
+    /// Per-table version-column overrides and the global default, for the edge-writability
+    /// report a table gets when it appears after boot. Same two values preflight uses.
+    sync_rules: *const Config.EventClassification.TransitionRules,
+    default_version_column: []const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -123,6 +131,9 @@ pub const EventProcessor = struct {
         pg_config: *const pg_conn.PgConf,
         refused: *RefusedTables.Registry,
         types: *TypeRegistry.Registry,
+        topology: *const Topology.Topology,
+        sync_rules: *const Config.EventClassification.TransitionRules,
+        default_version_column: []const u8,
     ) EventProcessor {
         return .{
             .allocator = allocator,
@@ -132,6 +143,36 @@ pub const EventProcessor = struct {
             .pg_config = pg_config,
             .refused = refused,
             .types = types,
+            .topology = topology,
+            .sync_rules = sync_rules,
+            .default_version_column = default_version_column,
+        };
+    }
+
+    /// Run preflight's version-column report for one table, on its own connection.
+    ///
+    /// Short-lived by design: this fires on `CREATE TABLE`, which is rare, and holding an
+    /// idle connection for it would be a worse trade than opening one. Every failure is
+    /// swallowed with a line — the report is advice, and advice must not break CDC.
+    fn reportEdgeWritability(self: *EventProcessor, table: []const u8) void {
+        const conninfo = self.pg_config.connInfo(self.allocator, false) catch return;
+        defer self.allocator.free(conninfo);
+
+        const conn = c.PQconnectdb(conninfo.ptr);
+        defer c.PQfinish(conn);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            log.debug("edge-writability report for '{s}' skipped: no connection", .{table});
+            return;
+        }
+
+        Preflight.reportTable(
+            self.allocator,
+            conn.?,
+            table,
+            self.sync_rules,
+            self.default_version_column,
+        ) catch |err| {
+            log.debug("edge-writability report for '{s}' skipped: {}", .{ table, err });
         };
     }
 
@@ -377,13 +418,13 @@ pub const EventProcessor = struct {
             try std.fmt.bufPrintZ(
                 &subject_buf,
                 "{s}.{s}.{s}.{s}",
-                .{ Config.Nats.subject_cdc_prefix, rel.name, operation_lower, s },
+                .{ self.topology.subject_cdc_prefix, rel.name, operation_lower, s },
             )
         else
             try std.fmt.bufPrintZ(
                 &subject_buf,
                 "{s}.{s}.{s}",
-                .{ Config.Nats.subject_cdc_prefix, rel.name, operation_lower },
+                .{ self.topology.subject_cdc_prefix, rel.name, operation_lower },
             );
 
         // Generate message ID from WAL LSN for idempotent delivery
@@ -675,7 +716,7 @@ pub const EventProcessor = struct {
                     "{{\"table\":\"{s}\",\"dropped\":true,\"lsn\":{d}}}",
                     .{ clean_table, wal_end },
                 );
-                const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
+                const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
                 const msg_id = try std.fmt.allocPrint(arena, "schema-drop-{s}-{d}", .{ clean_table, wal_end });
 
                 var drop_cols: std.ArrayList(pgoutput.Column) = .empty;
@@ -873,7 +914,7 @@ pub const EventProcessor = struct {
         ));
 
         // Create subject: $KV.schemas.{table}
-        const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
+        const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
         const msg_id = try std.fmt.allocPrint(arena, "schema-{s}-{d}", .{clean_table, wal_end});
 
         var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
@@ -891,6 +932,13 @@ pub const EventProcessor = struct {
         );
 
         log.info("✅ DDL schema mapped and published to KV for '{s}'", .{clean_table});
+
+        // The edge-writability report, for a table that appeared after boot. Preflight
+        // runs once and only sees what the publication held then, so without this the
+        // ✍️/⚠️ lines — the sole warning that the version column is naive, coarse or
+        // nullable — were shown only to whoever restarted the bridge afterwards.
+        // Best-effort: a failed report must never cost the DDL event.
+        self.reportEdgeWritability(clean_table);
         return slot_idx;
     }
 
@@ -920,7 +968,7 @@ pub const EventProcessor = struct {
             "{{\"table\":\"{s}\",\"suspended\":true,\"reason\":\"{s}\",\"lsn\":{d}}}",
             .{ clean_table, reason, lsn },
         );
-        const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
+        const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
 
         var cols: std.ArrayList(pgoutput.Column) = .empty;
         try cols.append(arena, .{ .name = "schema", .value = .{ .text = payload } });
@@ -1126,7 +1174,7 @@ pub const EventProcessor = struct {
                 .{ identity, boot_lsn },
             ));
 
-            const kv_subject = try std.fmt.allocPrint(arena, Config.Nats.kv_schemas_subject_pattern, .{clean_table});
+            const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
             const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}", .{clean_table});
             
             var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
