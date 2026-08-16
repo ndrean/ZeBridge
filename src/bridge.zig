@@ -35,6 +35,7 @@ comptime {
     _ = @import("array.zig");
     _ = @import("encoder.zig");
     _ = @import("numeric.zig");
+    _ = @import("mutation_listener.zig");
     _ = @import("pg_conn.zig");
     _ = @import("pgoutput.zig");
     _ = @import("publication.zig");
@@ -470,6 +471,8 @@ pub fn main(init: std.process.Init) !void {
             allocator,
             wc,
             &runtime_config,
+            &sync_rules,
+            default_version_column,
             io,
             &should_stop,
         );

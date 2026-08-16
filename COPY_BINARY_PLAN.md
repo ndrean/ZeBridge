@@ -34,6 +34,16 @@ later ACK, so a supervised restart re-read it and panicked again with every othe
 stopped. The bridge also now reads `max_payload` from the NATS server's INFO line and
 warns at boot if `BASE_BUF` cannot fit inside it. README has the sizing formula.
 
+**Read path: complete.** Snapshots (binary COPY, composite keys), CDC (type-guarded,
+TOAST-correct), schemas, suspensions, gap detection and client re-seed have all run end
+to end, and a fresh web-consumer bootstrapped from empty on 2026-08-15. What is left on
+the read side is polish (§F), not mechanism.
+
+**Write path: security scaffolding in place, no mutation has ever been applied.** The
+ingress role, its separate connection, the poison-pill guard and the version-column
+report all exist; the subject is still parsed from the payload, there is no reply, and
+`mutation_listener` still expects the deleted `_hlc`/`_deleted` columns. See §D0.
+
 **Work, in order:**
 
 1. ~~**Delete the CSV path**~~ — ✅ **DONE 2026-08-15.** `src/pg_copy_csv.zig` (883 lines,
@@ -628,8 +638,14 @@ Electric. Client-facing rules live in `PROTOCOL.md` §7; this is the bridge side
       `x" ; DROP …` closes the quote)
 - [ ] `zebridge_ddl_events` explicitly excluded — writable today, which lets a client
       forge a schema for every other client
-- [ ] `bridge_writer` role: `EXECUTE` on `app`, **zero** table privileges — the backstop
-      that makes a bug in the above non-fatal
+- [x] **`bridge_writer` role — DONE 2026-08-16.** Created by `init.sql.template` with
+      `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` and **zero table
+      privileges**; `zebridge_grant_edge_writes(regclass)` opens one table at a time and
+      refuses `zebridge_ddl_events` by name. The bridge connects through it on a separate
+      connection (`DATABASE_WRITER_URL` or `POSTGRES_WRITER_USER/_PASSWORD`); no writer
+      configured means the mutation listener does not start, rather than falling back to
+      the read role. Verified: `permission denied` before a grant, `INSERT 0 1` after,
+      `bridge_reader` unchanged at SELECT + REPLICATION.
 
 **Row-level authorization — the audit stopped at "can write any table" before reaching
 "can write any row". Without this, a client permitted to write a table can write *every
@@ -651,8 +667,12 @@ row of it*.**
 
 **Correctness**
 
-- [ ] `max_deliver` + dead-letter subject — one malformed message currently loops
-      forever at one retry/second (reproduced: 24 redeliveries in 15 s)
+- [x] **poison-pill guard — DONE 2026-08-16.** `max_deliver = 5` on the ingress
+      consumer, plus `isPermanent(err)`: a payload that cannot decode is dead-lettered to
+      `mutation_error.<table>` and **ACKed**, while a transient failure still NAKs.
+      Verified against the same reproduction: 24 redeliveries in 15 s → **1**, with
+      `Outstanding Acks: 0`. ⚠️ The dead letter is currently **logged, not published** —
+      the listener's handle is pull-only, so the publish lands with the reply channel.
 - [ ] reply on the reply-to subject: `accepted` / `stale` / `row_deleted` / error.
       Both PowerSync's blocking FIFO queue and Electric's `awaitTxId` need it; without
       it a client cannot dequeue, and `row_deleted` has nowhere to go
@@ -661,12 +681,16 @@ row of it*.**
 
 **Version column (LWW)**
 
-- [ ] `SYNC_RULES=table:version_col[,tombstone_col];…` + `SYNC_VERSION_COLUMN` default;
-      `-` = outbound-only, `-arrival` = writable with last-arrival-wins
-- [ ] preflight **checks the named column, never searches for one** — but *reports* the
-      table's timestamp columns as candidates so the operator knows what to configure
-- [ ] refuse `created%` / `inserted%` by name: set once at insert, so as a version they
-      either reject every update or corrupt the column's meaning
+- [x] **`SYNC_RULES` + `SYNC_VERSION_COLUMN` — DONE 2026-08-16.** Same grammar as
+      `TRANSITION_RULES`, same parser (`parseTableRules`). `-arrival` (writable with
+      last-arrival-wins) is **not** implemented yet.
+- [x] **preflight reporting — DONE 2026-08-16.** Checks the *named* column, never
+      searches; lists the table's orderable columns as candidates with the exact
+      `SYNC_RULES=` line to set. Warns on naive-vs-tz, second precision and nullability
+      without refusing any of them — Ecto's `timestamps()` produces naive columns, so
+      refusing would exclude the reference schema. `classifyVersionColumn` is pure and
+      unit-tested on all four verdicts.
+- [x] **refuse `created%` / `inserted%` — DONE 2026-08-16**, however configured.
 - [ ] case-sensitive and always quoted — `updatedAt` is not `updatedat`
 - [ ] publish `"sync": {version, tombstone, writable}` in the schema KV so clients
       discover it instead of hardcoding
@@ -692,6 +716,8 @@ because **apps write to PostgreSQL directly**, which is the entire premise of CD
       a million CDC events about rows every client already knows are dead
 
 **Throughput — last, and only what is free**
+
+> Nothing here is started. Ordering still holds: correctness first.
 
 - [ ] batch N mutations per transaction (measured 8.6× locally)
 - [ ] **individual-retry fallback**: on batch failure, replay the batch one statement at

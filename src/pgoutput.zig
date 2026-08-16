@@ -312,6 +312,16 @@ pub fn decodeBinColumnData(
 
 /// Convert ArrayResult to PostgreSQL array style text format '{{1,2}, {3,4}}'
 pub fn arrayToText(allocator: std.mem.Allocator, arr: ArrayResult) ![]u8 {
+    // An empty array — `'{}'::text[]` — has **ndim = 0**, so `dimensions` is empty and
+    // there is no dimension 0 to read. `writeArrayRecursive` indexed `dims[0]`
+    // unconditionally, which panicked in Debug and read out of bounds in ReleaseFast,
+    // taking the whole bridge down: observed as a process that vanished mid-stream with
+    // nothing in the log. Any table with an array column an application ever leaves
+    // empty was one INSERT away from this.
+    if (arr.ndim == 0 or arr.dimensions.len == 0) {
+        return allocator.dupe(u8, "{}");
+    }
+
     var res: std.ArrayList(u8) = .empty;
     _ = try writeArrayRecursive(&res, allocator, arr, 0, 0);
     return res.toOwnedSlice(allocator);
@@ -1443,4 +1453,23 @@ test "elementToText refuses a truncated fixed-width element" {
     try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .INT4, &[_]u8{ 0, 1 }));
     try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .INT8, &[_]u8{ 0, 1, 2, 3 }));
     try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .UUID, &[_]u8{ 0, 1, 2 }));
+}
+
+test "empty array renders as {} instead of crashing" {
+    // `'{}'::int4[]` on the wire: ndim = 0, so there is no dimension to walk. This
+    // panicked in Debug and read out of bounds in ReleaseFast — the bridge simply
+    // disappeared, with the last log line being whatever preceded the row.
+    const alloc = std.testing.allocator;
+
+    var buf: [12]u8 = undefined;
+    std.mem.writeInt(i32, buf[0..4], 0, .big); // ndim = 0
+    std.mem.writeInt(i32, buf[4..8], 0, .big); // flags
+    std.mem.writeInt(i32, buf[8..12], 23, .big); // element oid = int4
+
+    var arr = try parseArray(alloc, &buf);
+    defer arr.deinit(alloc);
+
+    const txt = try arrayToText(alloc, arr);
+    defer alloc.free(txt);
+    try std.testing.expectEqualStrings("{}", txt);
 }
