@@ -20,7 +20,9 @@
 //!
 //! So entries are appended and never removed, and their names are freed only at
 //! `deinit`. A reader can therefore hold a name slice with no risk that a writer frees
-//! it. `clear` flips an atomic `active` flag rather than removing the entry, which also
+//! it. Writers reserve their slot with an atomic `fetchAdd` and publish `len` in
+//! reservation order, so two of them — the replication thread and the snapshot listener —
+//! cannot claim the same index. `clear` flips an atomic `active` flag rather than removing the entry, which also
 //! preserves the drop count across a refuse → fix → refuse cycle. `len` is published
 //! with release ordering *after* an entry is fully built, so a reader either does not
 //! see the entry at all or sees it complete.
@@ -84,7 +86,14 @@ pub const Registry = struct {
     allocator: std.mem.Allocator,
     entries: [max_refused]Entry = undefined,
     /// Published with release ordering once an entry is fully initialised. Only grows.
+    /// A reader walking `entries[0..len]` therefore never sees a half-built entry.
     len: std.atomic.Value(usize) = .init(0),
+    /// Slots handed out. Separate from `len` so two writers cannot claim the same index:
+    /// a writer reserves with `fetchAdd`, builds its entry, then advances `len` only once
+    /// every earlier reservation has published. Before this, `refuse` did
+    /// `n = len.load()` … `len.store(n + 1)`, which is correct for exactly one writer —
+    /// the replication thread — and the snapshot listener is now a second one.
+    reserved: std.atomic.Value(usize) = .init(0),
     /// How many entries are currently active. The cheap "is anything refused?" test.
     refused_count: std.atomic.Value(usize) = .init(0),
     dropped_total: std.atomic.Value(u64) = .init(0),
@@ -124,10 +133,20 @@ pub const Registry = struct {
             return;
         }
 
-        const n = self.len.load(.acquire);
+        // Duped *before* the slot is reserved, deliberately. Nothing between the
+        // reservation and the publish below may fail: a writer that claimed slot n and
+        // then returned early would leave `len` unable to reach n + 1, and every later
+        // writer would spin on it forever. Allocating first means the only path that can
+        // fail does so while holding nothing.
+        const owned = try self.allocator.dupe(u8, table);
+        errdefer self.allocator.free(owned);
+
+        const n = self.reserved.fetchAdd(1, .acq_rel);
         if (n >= max_refused) {
             // Not silent: an unrecorded refusal means the table keeps publishing rows
             // that no client can apply, which is the exact failure this guards against.
+            // Safe to return without publishing: every writer at or past the ceiling
+            // returns here too, so nobody is left waiting on this index.
             if (!self.overflowed.swap(true, .acq_rel)) {
                 log.err(
                     "🔴 Refusal registry is full ({d} tables) — '{s}' cannot be tracked and its events will NOT be dropped. Fix the keyless tables.",
@@ -137,12 +156,15 @@ pub const Registry = struct {
             return error.RefusalRegistryFull;
         }
 
-        // The caller's `table` usually points into an arena that is reset per message,
-        // so the name must be owned by us.
-        const owned = try self.allocator.dupe(u8, table);
         self.entries[n] = .{ .name = owned, .dropped = 0, .active = .init(true), .reason = reason };
-        // Publish last: a reader sees a fully built entry or no entry at all.
-        self.len.store(n + 1, .release);
+
+        // Publish last, and in reservation order: `len` may only advance to n + 1 once
+        // every slot below n has published, or a reader walking `entries[0..len]` would
+        // step over one that is still `undefined`. Refusals are rare and the window is a
+        // few instructions, so a spin costs less than any alternative would.
+        while (self.len.cmpxchgWeak(n, n + 1, .release, .acquire) != null) {
+            std.atomic.spinLoopHint();
+        }
         _ = self.refused_count.fetchAdd(1, .acq_rel);
     }
 
@@ -346,4 +368,38 @@ test "overflow is reported rather than silently ignored" {
     r.overflowed.store(true, .release);
     try std.testing.expectError(error.RefusalRegistryFull, r.refuse("one_too_many", .no_primary_key));
     try std.testing.expectEqual(@as(usize, max_refused), r.count());
+}
+
+test "refuse: concurrent writers each get their own slot" {
+    // The replication thread and the snapshot listener both refuse tables now. Under the
+    // old `len.load()` … `len.store(n + 1)` these would collide: two writers read the same
+    // index, both wrote it, one entry was lost and its name leaked.
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    const Worker = struct {
+        fn run(reg: *Registry, base: usize) void {
+            var buf: [32]u8 = undefined;
+            for (0..8) |i| {
+                const name = std.fmt.bufPrint(&buf, "t{d}", .{base + i}) catch return;
+                reg.refuse(name, .no_primary_key) catch return;
+            }
+        }
+    };
+
+    var a = try std.Thread.spawn(.{}, Worker.run, .{ &r, 0 });
+    var b = try std.Thread.spawn(.{}, Worker.run, .{ &r, 100 });
+    a.join();
+    b.join();
+
+    try std.testing.expectEqual(@as(usize, 16), r.len.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 16), r.refused_count.load(.acquire));
+
+    // Every name must be present exactly once, and none may be the empty slot a lost
+    // publish would leave behind.
+    for (0..8) |i| {
+        var buf: [32]u8 = undefined;
+        try std.testing.expect(r.isRefused(try std.fmt.bufPrint(&buf, "t{d}", .{i})));
+        try std.testing.expect(r.isRefused(try std.fmt.bufPrint(&buf, "t{d}", .{100 + i})));
+    }
 }

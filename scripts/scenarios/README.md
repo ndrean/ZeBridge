@@ -47,7 +47,7 @@ move the bridge, `nats-init` and this harness together.
 
 | script | scenario | asserts |
 | --- | --- | --- |
-| `snapshot.py [table]` | B, C | chunks replay, no duplicate keys, and the key sequence is **identical to PostgreSQL's own `ORDER BY`** — which is what proves composite keyset pagination |
+| `snapshot.py [table] [seed_rows]` | B, C | chunks replay, no duplicate keys, every chunk fits `max_payload`, and the key sequence is **identical to PostgreSQL's own `ORDER BY`** — which is what proves composite keyset pagination. Pass `25000` to force ~3 chunks and exercise a real boundary |
 | `stampede.py [table] [n]` | C1 | N concurrent requests → exactly **one** enters the window; the rest are refused by the broker |
 | `burst.py [table] [stmts] [rows]` | I | generates a burst large enough to build a backlog, then names the LOOP numbers that mean healthy versus "the reader cannot drain its socket" |
 | `mutate.py [table] [id]` | ingress | the last-write-wins round trip: a stale version must lose even when it arrives last |
@@ -66,11 +66,6 @@ this harness does not read.
 and **diffs the result** so a silent restore failure is a test failure rather than a
 surprise next week. If it ever aborts between the two, it prints the exact
 `nats stream add … --config` line to run.
-
-🔴 `snapshot.py` currently fails above ~9,400 rows on `test_types`, and the failure is
-the bridge's, not the script's: chunks are capped in rows, not bytes, so the first chunk
-overruns the NATS 1 MiB `max_payload` and the connection is closed. See
-`COPY_BINARY_PLAN.md` item 4. Keep seed data under that line meanwhile.
 
 ## Prerequisites for the ingress scripts
 

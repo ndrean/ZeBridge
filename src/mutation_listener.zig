@@ -246,7 +246,7 @@ pub const MutationListener = struct {
                 const subject = msg.letter.subject.body() orelse "";
                 const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
                     log.err("🔴 Malformed mutation subject '{s}' ({}): dead-lettering", .{ subject, err });
-                    self.deadLetter(msg, payload, err);
+                    self.deadLetter(&consumer, msg, payload, err);
                     consumer.ACK(msg, true) catch consumer.REUSE(msg);
                     continue;
                 };
@@ -256,7 +256,7 @@ pub const MutationListener = struct {
                         "🔴 '{s}' refused writes to '{s}': that table is the bridge's own, and a forged row in it would publish a fabricated schema to every client",
                         .{ mutation.principal, mutation.table },
                     );
-                    self.deadLetter(msg, payload, error.ForbiddenTable);
+                    self.deadLetter(&consumer, msg, payload, error.ForbiddenTable);
                     consumer.ACK(msg, true) catch consumer.REUSE(msg);
                     continue;
                 }
@@ -267,7 +267,7 @@ pub const MutationListener = struct {
                     // attempt per second and the queue never advanced past it.
                     if (isPermanent(err)) {
                         log.err("🔴 Unprocessable mutation ({}): dead-lettering, not retrying", .{err});
-                        self.deadLetter(msg, payload, err);
+                        self.deadLetter(&consumer, msg, payload, err);
                         // ACK, not NACK: the message is handled — badly, but finally.
                         consumer.ACK(msg, true) catch consumer.REUSE(msg);
                         continue;
@@ -342,6 +342,7 @@ pub const MutationListener = struct {
     /// and refusing to ACK would restore the infinite loop it exists to prevent.
     fn deadLetter(
         self: *MutationListener,
+        consumer: *nats.Consumer,
         msg: *nats.Conn.AllocatedMSG,
         payload: []const u8,
         err: anyerror,
@@ -372,9 +373,20 @@ pub const MutationListener = struct {
             .{ @errorName(err), subject, payload.len },
         ) catch return;
 
+        // Published on the consumer's own connection — the same trick the snapshot
+        // listener uses for `init.snap.error.<table>`. An earlier note here claimed the
+        // pull consumer could not publish; it can (`nats.Consumer.PUBLISH`), and
+        // `mutation_error.>` is one of the MUTATIONS stream's subjects, so the message
+        // is stored rather than dropped for want of a stream.
+        //
+        // ⚠️ The subject sits deliberately *outside* `mutation.>`, which is what the
+        // ingress consumer filters on. Republishing a failure under that prefix would
+        // feed it straight back to this loop — a poison pill with a feedback loop.
+        consumer.PUBLISH(err_subject, null, body) catch |perr| {
+            log.err("↩️  dead-letter publish to {s} failed ({}): {s}", .{ err_subject, perr, body });
+            return;
+        };
         log.warn("↩️  dead-letter → {s}: {s}", .{ err_subject, body });
-        // TODO: publish once the listener holds a publish-capable NATS handle; the
-        // consumer connection is pull-only today.
     }
 
     /// Parse `mutation.<principal>.<table>.<operation>`.

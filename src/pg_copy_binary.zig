@@ -190,6 +190,97 @@ pub fn orderByClause(
     return out.toOwnedSlice(allocator);
 }
 
+/// `"a", "b", "c"` — every column, quoted, in catalog order.
+///
+/// The chunk query cannot use `SELECT *`: its subquery adds a running-total column, and
+/// binary COPY carries no names, so the decoder would match that extra column
+/// positionally against the catalog and shift every value after it.
+///
+/// Caller owns the returned string.
+pub fn columnList(allocator: std.mem.Allocator, columns: []const ColumnMeta) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    for (columns, 0..) |col, i| {
+        if (i > 0) try out.appendSlice(allocator, ", ");
+        try out.append(allocator, '"');
+        try out.appendSlice(allocator, col.name);
+        try out.append(allocator, '"');
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Bytes a fixed-width column contributes, plus MessagePack's per-field framing.
+///
+/// Deliberately generous. The sum only has to be an *upper-ish* bound good enough to keep
+/// a chunk under budget; the encoder's own overflow check is what guarantees the message
+/// actually fits, so erring high costs a slightly emptier chunk and erring low costs a
+/// re-encode. Neither is a correctness problem.
+const fixed_column_bytes: usize = 24;
+
+/// SQL that evaluates to roughly the wire size of one row.
+///
+/// Used two ways, and both need the same expression or they disagree about what a row
+/// costs: `max()` before the snapshot starts, to reject a row no NATS message can carry,
+/// and a running `sum()` per chunk, to stop transferring once the budget is reached.
+///
+/// `octet_length` on `text`/`bytea` is the reason this is affordable: PostgreSQL reads the
+/// length out of the TOAST pointer without fetching the out-of-line data. Measured on a
+/// 200-row table of 256 KiB blobs — `max(octet_length(blob))` touched **2 buffers**,
+/// against **430** for an expression that must actually read the value. A `::text` cast
+/// (jsonb, arrays) gets no such break and does materialise the value.
+///
+/// Caller owns the returned string.
+pub fn sizeExpression(allocator: std.mem.Allocator, columns: []const ColumnMeta) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var fixed: usize = 0;
+    for (columns) |col| {
+        const direct = switch (col.oid) {
+            @intFromEnum(pg_constants.PgOid.TEXT),
+            @intFromEnum(pg_constants.PgOid.VARCHAR),
+            @intFromEnum(pg_constants.PgOid.BPCHAR),
+            bytea_oid,
+            => true,
+            else => false,
+        };
+        const castable = !direct and isVariableWidth(col);
+
+        if (!direct and !castable) {
+            fixed += fixed_column_bytes;
+            continue;
+        }
+
+        if (out.items.len > 0) try out.appendSlice(allocator, " + ");
+        try out.appendSlice(allocator, "coalesce(octet_length(\"");
+        try out.appendSlice(allocator, col.name);
+        try out.appendSlice(allocator, if (direct) "\"),0)" else "\"::text),0)");
+    }
+
+    if (out.items.len > 0) try out.appendSlice(allocator, " + ");
+    var num_buf: [24]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{fixed + fixed_column_bytes}));
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Whether a column can hold an arbitrarily large value, and therefore has to be measured
+/// rather than assumed. Arrays (any `oid` with an element type) and the document types
+/// qualify; everything else is bounded by a small constant.
+fn isVariableWidth(col: ColumnMeta) bool {
+    return switch (col.oid) {
+        @intFromEnum(pg_constants.PgOid.JSON),
+        @intFromEnum(pg_constants.PgOid.JSONB),
+        => true,
+        // Arrays and anything else declared with a trailing `[]`. Matched on the rendered
+        // type rather than an OID list because a domain or a user-defined array type has
+        // an OID this file cannot know, and `format_type` renders all of them the same way.
+        else => std.mem.endsWith(u8, col.type_text, "[]"),
+    };
+}
+
 pub const Error = error{
     /// The stream did not begin with the binary COPY signature. Usually means the
     /// query said `FORMAT csv`, or an error response was read as data.
@@ -203,6 +294,12 @@ pub const Error = error{
     FieldCountMismatch,
     /// A field length that is neither -1 (NULL) nor a plausible size.
     BadFieldLength,
+    /// The COPY stopped early because the *server* failed — reported by `PQgetResult`
+    /// after the data ends, not by `PQgetCopyData`, which returns a perfectly ordinary
+    /// -1. Distinct from `UnexpectedEnd` (a malformed frame) because the bytes received
+    /// are well-formed; there are simply fewer of them than the query asked for, which
+    /// is otherwise indistinguishable from reaching the end of the table.
+    CopyIncomplete,
 };
 
 /// Reads big-endian integers out of a byte slice, tracking position.
@@ -497,13 +594,85 @@ pub const Streamer = struct {
     ///
     /// `pk_idx` holds indices into `columns` in primary-key order; the values at those
     /// indices in the final row become the next chunk's cursor.
+    /// What one chunk actually produced.
+    ///
+    /// Two counts, not one, because they stop being the same number the moment a chunk is
+    /// capped by size: `fetched` is what the COPY returned and answers "is this the end of
+    /// the table", while `encoded` is what fits in one message and answers "where does the
+    /// cursor go next". Collapsing them is what made `num_rows < chunk_size` mean "last
+    /// chunk", which a byte-capped chunk would have claimed falsely — truncating the
+    /// snapshot in silence.
+    pub const ChunkResult = struct {
+        fetched: usize,
+        encoded: usize,
+        /// Bytes the encoded prefix occupies — the number the shrink loop used to compute
+        /// and discard. Reported so the caller can log it and size what comes next.
+        encoded_bytes: usize,
+        /// The LIMIT this chunk's COPY actually ran with.
+        ///
+        /// Carried on the result rather than supplied at judgement time, because the limit
+        /// varies per chunk now: comparing `fetched` against a constant `chunk_size` would
+        /// call a deliberately small chunk "final" and end the snapshot mid-table.
+        limit: usize,
+
+        /// True when this chunk *might* be the last: the COPY returned fewer rows than
+        /// asked for, and every one of them fitted in the message.
+        ///
+        /// ⚠️ **"Might" is the whole point — this is not sufficient on its own.** Since the
+        /// chunk query caps itself by a running byte sum, a short result has two possible
+        /// causes: the table ended, or the sum trimmed the rows. They are indistinguishable
+        /// from here, and guessing wrong ends the snapshot mid-table. Measured: a chunk
+        /// with `limit=7506 fetched=4670 encoded=4670` was trimmed by the sum, looked
+        /// final, and truncated a 25 000-row table at 8 389.
+        ///
+        /// The caller must confirm with a lookahead past the cursor. This exists to answer
+        /// the cheap half — a full chunk, or one the encoder trimmed, needs no query at all.
+        pub fn mayBeFinal(self: ChunkResult) bool {
+            return self.fetched < self.limit and self.encoded == self.fetched;
+        }
+    };
+
+    /// One chunk's worth of instructions.
+    ///
+    /// A struct rather than positional parameters because `limit` and `max_bytes` are both
+    /// `usize` and adjacent: swapping them at a call site would compile, and would make
+    /// every chunk report itself final.
+    pub const ChunkRequest = struct {
+        query: [:0]const u8,
+        pk_idx: []const usize,
+        /// The LIMIT already baked into `query`. Passed rather than parsed back out of it.
+        limit: usize,
+        /// Encoded byte budget. Must equal the encoder's buffer length, so that "the
+        /// encoder ran out of room" and "this prefix exceeds a NATS message" are the same
+        /// event with one handling path instead of two that can disagree.
+        max_bytes: usize,
+        /// Hint for reserving the raw COPY buffer in one allocation instead of a doubling
+        /// series — on an arena every growth strands the previous copy.
+        expected_raw_bytes: usize = 0,
+    };
+
+    /// Stream one chunk into `encoder`, capped by both row count and **bytes**.
+    ///
+    /// `max_bytes` is the real limit: NATS rejects a message over the server's
+    /// `max_payload`, and the row cap alone cannot know how wide a row is. Measured on a
+    /// 12-column table, 10 000 rows encoded to ~1.11 MB against a 1 MiB limit — the
+    /// server closed the connection, every retry re-sent the identical payload and closed
+    /// it again, and the snapshot was lost with no error published.
+    ///
+    /// When the encoding overflows, the rows already fetched are re-encoded as a prefix.
+    /// No re-query: the COPY result is in hand, and the array header carries a row count
+    /// that has to be written before the rows, so a chunk cannot be truncated in place.
     pub fn streamToEncoder(
         self: *Streamer,
-        query: [:0]const u8,
+        req: ChunkRequest,
         encoder: *streaming_encoder.StreamingEncoder,
-        pk_idx: []const usize,
-    ) !usize {
-        const result = c.PQexec(self.conn, query.ptr);
+    ) !ChunkResult {
+        std.debug.assert(req.max_bytes == encoder.buffer.len);
+        if (req.expected_raw_bytes > 0) {
+            try self.buffer.ensureTotalCapacity(self.allocator, req.expected_raw_bytes);
+        }
+
+        const result = c.PQexec(self.conn, req.query.ptr);
         defer c.PQclear(result);
 
         if (c.PQresultStatus(result) != c.PGRES_COPY_OUT) {
@@ -514,7 +683,6 @@ pub const Streamer = struct {
         // Binary COPY hands back arbitrary buffers, not one per row as text COPY does,
         // so a tuple can straddle two calls. Accumulating first sidesteps partial-frame
         // bookkeeping entirely.
-        self.buffer.clearRetainingCapacity();
         while (true) {
             var buf_ptr: [*c]u8 = undefined;
             const len = c.PQgetCopyData(self.conn, &buf_ptr, 0);
@@ -529,17 +697,39 @@ pub const Streamer = struct {
             }
         }
 
+        // ⚠️ `-1` means "no more data", NOT "the COPY succeeded".
+        //
+        // A server-side failure *during* COPY OUT — statement timeout, a cancelled
+        // backend, an unreadable TOAST chunk — also stops the data, and libpq reports it
+        // only from the PQgetResult that follows. Without this check the caller receives
+        // a short, well-formed buffer that is indistinguishable from a small final chunk:
+        // `fetched < limit and encoded == fetched` → `isFinal()` → the snapshot ends
+        // mid-table and is published as complete. Nothing else notices, because the next
+        // chunk's PQexec silently clears the pending result.
+        const tail = c.PQgetResult(self.conn);
+        defer c.PQclear(tail);
+        if (c.PQresultStatus(tail) != c.PGRES_COMMAND_OK) {
+            log.err("🔴 binary COPY aborted mid-stream: {s}", .{c.PQerrorMessage(self.conn)});
+            return error.CopyIncomplete;
+        }
+
         // An empty result still carries the 19-byte header and a trailer; a genuinely
         // empty body means the COPY produced nothing at all.
-        if (self.buffer.items.len == 0) return 0;
+        if (self.buffer.items.len == 0) {
+            return .{ .fetched = 0, .encoded = 0, .encoded_bytes = 0, .limit = req.limit };
+        }
 
         var r = Reader.init(self.buffer.items);
         readHeader(&r) catch |err| {
-            log.err("binary COPY header rejected: {} — query was: {s}", .{ err, query });
+            log.err("binary COPY header rejected: {} — query was: {s}", .{ err, req.query });
             return err;
         };
 
-        var rows: std.ArrayListUnmanaged([]const ?[]const u8) = .empty;
+        // Decode every row **once**, before any encoding. This used to live inside the
+        // shrink loop, so each retry allocated a fresh decoded copy of every row into the
+        // chunk arena with nothing freed — the retries, not the data, were the memory
+        // amplifier. Now a retry re-runs encoder writes over values already in hand.
+        var decoded: std.ArrayListUnmanaged([]const ?[]const u8) = .empty;
         while (true) {
             const res = readTuple(&r, self.allocator, self.columns.len) catch |err| {
                 if (err == Error.FieldCountMismatch) {
@@ -552,48 +742,117 @@ pub const Streamer = struct {
             };
             switch (res) {
                 .trailer => break,
-                .tuple => |t| try rows.append(self.allocator, t),
+                .tuple => |t| try decoded.append(self.allocator, try decodeTuple(self.allocator, self.columns, t)),
             }
         }
 
-        // Header first, count already known.
-        try encoder.writeArrayHeader(rows.items.len);
-
-        // One cursor buffer for the whole chunk, overwritten per row: only the last
-        // row's values are ever read, and the arena would otherwise hold a discarded
-        // copy per row.
-        const cursor = if (pk_idx.len > 0)
-            try self.allocator.alloc([]const u8, pk_idx.len)
+        // One cursor buffer for the whole chunk, overwritten per row: only the last row's
+        // values are ever read, and the arena would otherwise hold a discarded copy per row.
+        const cursor = if (req.pk_idx.len > 0)
+            try self.allocator.alloc([]const u8, req.pk_idx.len)
         else
             null;
 
-        for (rows.items) |raw_fields| {
-            const values = try decodeTuple(self.allocator, self.columns, raw_fields);
-            try encoder.beginRow(values.len);
-            for (values) |v| try encoder.writeField(v);
+        // Encode a prefix, shrinking until it fits. The first attempt is every row, so a
+        // chunk already within budget — the overwhelming majority — pays one pass.
+        var take = decoded.items.len;
+        while (true) {
+            encoder.reset();
+            try encoder.writeArrayHeader(take);
 
-            if (cursor) |slots| {
-                for (pk_idx, slots) |idx, *slot| {
-                    std.debug.assert(idx < values.len);
-                    // A primary key column is NOT NULL by definition, so a null here
-                    // means the layout is not the one this COPY emitted — the same
-                    // class of fault as a field-count mismatch, and not something to
-                    // page past.
-                    slot.* = values[idx] orelse {
-                        log.err(
-                            "🔴 primary key column '{s}' decoded as NULL — the catalog layout does not match this COPY, aborting rather than paginating on it",
-                            .{self.columns[idx].name},
-                        );
-                        return error.NullPrimaryKeyValue;
-                    };
-                }
-                self.last_pk = slots;
+            var done: usize = 0;
+            var overflowed = false;
+            for (decoded.items[0..take]) |values| {
+                // Checkpoint, so a row that does not fit leaves nothing half-written
+                // behind. `NoSpaceLeft` is a *shrink signal*, not a failure: the buffer is
+                // the budget. Before this it escaped as StreamEncodingFailed and killed
+                // the snapshot the first time a chunk exceeded the buffer — which is every
+                // table averaging more than ~210 bytes a row.
+                const mark = encoder.getPos();
+                encodeRow(encoder, values, req.pk_idx, cursor, self.columns) catch |err| switch (err) {
+                    error.NoSpaceLeft => {
+                        encoder.setPos(mark);
+                        overflowed = true;
+                        break;
+                    },
+                    else => return err,
+                };
+                done += 1;
             }
-        }
 
-        return rows.items.len;
+            const written = encoder.getWritten().len;
+            if (!overflowed and written <= req.max_bytes) {
+                // Only now: a discarded attempt must never leave the cursor pointing past
+                // the rows that actually shipped.
+                if (cursor) |slots| self.last_pk = slots;
+                return .{
+                    .fetched = decoded.items.len,
+                    .encoded = take,
+                    .encoded_bytes = written,
+                    .limit = req.limit,
+                };
+            }
+
+            if (done == 0) {
+                // A single row over the budget cannot be split, and dividing by `done`
+                // below would be a division by zero.
+                log.err(
+                    "🔴 one row does not fit the {d}-byte message budget — a snapshot cannot split a row",
+                    .{req.max_bytes},
+                );
+                return error.RowTooLargeForMessage;
+            }
+
+            take = shrinkTake(written, done, req.max_bytes, take);
+            log.debug("chunk of {d} rows overflowed ({d} bytes, budget {d}); retrying with {d}", .{
+                decoded.items.len, written, req.max_bytes, take,
+            });
+        }
     }
 };
+
+/// Encode one decoded row, and record its primary key into `cursor`.
+///
+/// Split out so the encode loop can checkpoint around it: every write it makes is between
+/// one `getPos` and the next, so rolling back to the mark undoes the whole row.
+fn encodeRow(
+    encoder: *streaming_encoder.StreamingEncoder,
+    values: []const ?[]const u8,
+    pk_idx: []const usize,
+    cursor: ?[][]const u8,
+    columns: []const ColumnMeta,
+) !void {
+    try encoder.beginRow(values.len);
+    for (values) |v| try encoder.writeField(v);
+
+    if (cursor) |slots| {
+        for (pk_idx, slots) |idx, *slot| {
+            std.debug.assert(idx < values.len);
+            // A primary key column is NOT NULL by definition, so a null here means the
+            // layout is not the one this COPY emitted — the same class of fault as a field
+            // count mismatch, and not something to page past.
+            slot.* = values[idx] orelse {
+                log.err(
+                    "🔴 primary key column '{s}' decoded as NULL — the catalog layout does not match this COPY, aborting rather than paginating on it",
+                    .{columns[idx].name},
+                );
+                return error.NullPrimaryKeyValue;
+            };
+        }
+    }
+}
+
+/// How many rows to retry with after a prefix overflowed.
+///
+/// Bounded twice: never more than `rows_done` (the rows that demonstrably fit) and never
+/// more than `current - 1` (so the loop strictly decreases and cannot stall). The 9/10 is
+/// headroom — `written / rows_done` is a mean, and the rows that did not fit were, by
+/// definition, the wider ones.
+fn shrinkTake(written: usize, rows_done: usize, budget: usize, current: usize) usize {
+    const per_row = @max(written / rows_done, 1);
+    const fit = (budget / per_row) * 9 / 10;
+    return @max(@min(@min(fit, rows_done), current - 1), 1);
+}
 
 // ---------------------------------------------------------------------------
 // Tests — synthetic buffers, no database required. The framing is the part that
@@ -958,4 +1217,138 @@ test "isKnownOid - built-in types are known, dynamic ones are not" {
     try testing.expect(pg_constants.isKnownOid(numeric_oid));
     try testing.expect(!pg_constants.isKnownOid(16416));
     try testing.expect(!pg_constants.isKnownOid(16544));
+}
+
+// ─── ChunkResult ────────────────────────────────────────────────────────────────
+//
+// The distinction these encode is the whole reason the type has two counts: "the table
+// ended" and "the message filled up" both produce fewer rows than asked for, and only the
+// first may end a snapshot. Judged against the limit *that chunk* ran with, because the
+// limit now varies per chunk.
+
+test "ChunkResult.mayBeFinal - a chunk that filled its own limit cannot be the last" {
+    // No query needed: the table clearly has more.
+    const r = Streamer.ChunkResult{ .fetched = 3, .encoded = 3, .encoded_bytes = 900_000, .limit = 3 };
+    try testing.expect(!r.mayBeFinal());
+}
+
+test "ChunkResult.mayBeFinal - judged against its own limit, not the row ceiling" {
+    // A 256 KiB-row table paginates three rows at a time. Compared against
+    // `Snapshot.chunk_size` (10 000) this reads as `3 < 10_000 and 3 == 3` → "maybe
+    // final", and a caller that trusted it would stop after three rows of a 200-row table.
+    const r = Streamer.ChunkResult{ .fetched = 3, .encoded = 3, .encoded_bytes = 786_432, .limit = 3 };
+    try testing.expect(!r.mayBeFinal());
+    try testing.expect(r.fetched < 10_000 and r.encoded == r.fetched); // the old, wrong test
+}
+
+test "ChunkResult.mayBeFinal - a chunk the ENCODER trimmed is never the last" {
+    // encoded < fetched: rows were left behind, so there is certainly more to send. This
+    // one needs no lookahead either.
+    const r = Streamer.ChunkResult{ .fetched = 800, .encoded = 640, .encoded_bytes = 1_000_000, .limit = 800 };
+    try testing.expect(!r.mayBeFinal());
+    const tail = Streamer.ChunkResult{ .fetched = 500, .encoded = 300, .encoded_bytes = 1_000_000, .limit = 800 };
+    try testing.expect(!tail.mayBeFinal());
+}
+
+test "ChunkResult.mayBeFinal - a short, fully-encoded chunk is only a MAYBE" {
+    // ⚠️ The regression this name exists to prevent. Observed live:
+    // `limit=7506 fetched=4670 encoded=4670` — trimmed by the running byte sum, not by
+    // the end of the table. Treated as final it truncated 25 000 rows at 8 389.
+    // The caller must confirm with a lookahead past the cursor.
+    const r = Streamer.ChunkResult{ .fetched = 4670, .encoded = 4670, .encoded_bytes = 518_373, .limit = 7506 };
+    try testing.expect(r.mayBeFinal());
+}
+
+// ─── shrinkTake ─────────────────────────────────────────────────────────────────
+
+test "shrinkTake - retries with no more rows than actually fit" {
+    // 500 rows encoded to 2 MB against a 1 MB budget: the retry must not exceed 500, and
+    // should land near half of it.
+    const next = shrinkTake(2_000_000, 500, 1_000_000, 800);
+    try testing.expect(next <= 500);
+    try testing.expect(next >= 1);
+}
+
+test "shrinkTake - strictly decreases, so the loop cannot stall" {
+    // Even when the arithmetic suggests keeping every row — a fat first row followed by
+    // thin ones — the result is bounded by current - 1.
+    try testing.expectEqual(@as(usize, 9), shrinkTake(100, 10, 1_000_000, 10));
+    try testing.expectEqual(@as(usize, 1), shrinkTake(100, 2, 1_000_000, 2));
+}
+
+test "shrinkTake - never returns zero" {
+    // The caller checks `done == 0` before dividing, so this only guards the arithmetic:
+    // one enormous row still yields a retry count of 1, not 0.
+    try testing.expectEqual(@as(usize, 1), shrinkTake(50_000_000, 1, 1024, 1));
+    try testing.expectEqual(@as(usize, 1), shrinkTake(50_000_000, 2, 1024, 2));
+}
+
+// ─── sizeExpression / columnList ────────────────────────────────────────────────
+
+fn metaFor(name: []const u8, oid: u32, type_text: []const u8) ColumnMeta {
+    return .{ .name = name, .oid = oid, .type_text = type_text };
+}
+
+test "sizeExpression - text and bytea are measured without a cast" {
+    // The cast is what costs: `octet_length(text)` reads the TOAST pointer's length,
+    // `octet_length(x::text)` materialises the value.
+    const alloc = testing.allocator;
+    const cols = [_]ColumnMeta{
+        metaFor("blob", @intFromEnum(pg_constants.PgOid.TEXT), "text"),
+        metaFor("raw", bytea_oid, "bytea"),
+    };
+    const expr = try sizeExpression(alloc, &cols);
+    defer alloc.free(expr);
+
+    try testing.expect(std.mem.indexOf(u8, expr, "octet_length(\"blob\")") != null);
+    try testing.expect(std.mem.indexOf(u8, expr, "octet_length(\"raw\")") != null);
+    try testing.expect(std.mem.indexOf(u8, expr, "::text") == null);
+}
+
+test "sizeExpression - jsonb and arrays need the cast" {
+    const alloc = testing.allocator;
+    const cols = [_]ColumnMeta{
+        metaFor("doc", @intFromEnum(pg_constants.PgOid.JSONB), "jsonb"),
+        metaFor("tags", 1009, "character varying(255)[]"),
+    };
+    const expr = try sizeExpression(alloc, &cols);
+    defer alloc.free(expr);
+
+    try testing.expect(std.mem.indexOf(u8, expr, "octet_length(\"doc\"::text)") != null);
+    try testing.expect(std.mem.indexOf(u8, expr, "octet_length(\"tags\"::text)") != null);
+}
+
+test "sizeExpression - fixed-width columns become a constant, not a per-column call" {
+    // Measuring an int8 would cost a function call per row for a value that cannot vary.
+    const alloc = testing.allocator;
+    const cols = [_]ColumnMeta{
+        metaFor("id", 20, "bigint"),
+        metaFor("at", 1114, "timestamp without time zone"),
+    };
+    const expr = try sizeExpression(alloc, &cols);
+    defer alloc.free(expr);
+
+    try testing.expect(std.mem.indexOf(u8, expr, "octet_length") == null);
+    // Two fixed columns plus the per-row envelope.
+    try testing.expectEqualStrings("72", expr);
+}
+
+test "sizeExpression - a table of only fixed columns still yields valid SQL" {
+    const alloc = testing.allocator;
+    const cols = [_]ColumnMeta{metaFor("id", 20, "bigint")};
+    const expr = try sizeExpression(alloc, &cols);
+    defer alloc.free(expr);
+    // Must be a bare number, never an empty string or a dangling `+`.
+    _ = try std.fmt.parseInt(usize, expr, 10);
+}
+
+test "columnList - quotes every column in catalog order" {
+    const alloc = testing.allocator;
+    const cols = [_]ColumnMeta{
+        metaFor("id", 20, "bigint"),
+        metaFor("order", 25, "text"), // a reserved word: the quoting is load-bearing
+    };
+    const list = try columnList(alloc, &cols);
+    defer alloc.free(list);
+    try testing.expectEqualStrings("\"id\", \"order\"", list);
 }

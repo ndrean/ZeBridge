@@ -34,6 +34,7 @@ const topology_mod = @import("topology.zig");
 // carrying `test` blocks must be listed here or its tests silently never run.
 comptime {
     _ = @import("array.zig");
+    _ = @import("batch_publisher.zig");
     _ = @import("config.zig");
     _ = @import("encoder.zig");
     _ = @import("numeric.zig");
@@ -433,31 +434,15 @@ pub fn main(init: std.process.Init) !void {
     var publisher = try initNatsPublisher(allocator, &metrics, nats_endpoint, io);
     defer publisher.deinit();
 
-    // The per-event buffer must fit inside what the NATS server will accept, and the
-    // server states its limit in INFO on every connection — so this is a fact, not the
-    // 1 MB default assumed. Checked here rather than discovered on the first oversized
-    // row, which would suspend a table for a mismatch that was visible at boot.
+    // What the server will accept, logged once. The check that acts on it runs below,
+    // just before the slab is allocated — this is the observation, that is the decision.
     if (publisher.js) |*js| {
         if (nats_publisher.serverMaxPayload(js)) |max_payload| {
-            const event_buf_bytes = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
             log.info("NATS max_payload: {d} KB (server-advertised); per-event buffer: {d} KB (BASE_BUF={d})", .{
                 max_payload / 1024,
-                event_buf_bytes / 1024,
+                (@as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2)) / 1024,
                 runtime_config.event_data_buffer_log2,
             });
-            // Not `>`: a row sized exactly to the limit still fails once the subject,
-            // headers and MessagePack framing are added around it.
-            if (event_buf_bytes + Config.Nats.payload_envelope_margin_bytes > max_payload) {
-                log.warn(
-                    "⚠️  BASE_BUF={d} allows a {d} KB row, but the NATS server accepts at most {d} KB per message and the envelope (subject, headers, column keys, batch framing) needs roughly {d} KB more. A row in that range packs successfully and is then REJECTED at publish time. Either lower BASE_BUF or raise max_payload in nats-server.conf.",
-                    .{
-                        runtime_config.event_data_buffer_log2,
-                        event_buf_bytes / 1024,
-                        max_payload / 1024,
-                        Config.Nats.payload_envelope_margin_bytes / 1024,
-                    },
-                );
-            }
         } else {
             log.debug("NATS server did not advertise max_payload; cannot check it against BASE_BUF", .{});
         }
@@ -524,6 +509,60 @@ pub fn main(init: std.process.Init) !void {
     defer if (mut_listener) |m| m.deinit();
     defer if (mut_listener) |m| m.join();
     errdefer should_stop.store(true, .seq_cst);
+
+    // ─── two startup checks on the ring buffer, before a byte of it is allocated ─────
+    //
+    // Both exist because their failure modes are silent and late: an OOM kill under load,
+    // and a row that packs successfully and is then refused by the server forever.
+    {
+        const event_buf_bytes = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
+        const slab_bytes = event_buf_bytes * runtime_config.batch_ring_buffer_size;
+
+        // #1 — will the slab fit in the memory this process actually has?
+        const limit = utils.memoryLimitBytes();
+        if (limit == 0) {
+            log.debug("Cannot determine the memory limit; skipping the slab sizing check", .{});
+        } else if (slab_bytes * 2 > limit) {
+            // Half the limit is the line: the slab is not the only thing resident — libpq
+            // buffers, the NATS client, the snapshot encode buffer and the arenas all sit
+            // beside it — and a slab past half leaves no room for the work it exists to do.
+            log.err(
+                "🔴 The event slab would be {d} MB (BASE_BUF={d} → {d} KB × RING_BUFFER_COUNT={d}), against a {d} MB memory limit. It is pre-allocated at startup, so this is an OOM kill under load rather than a slow degradation. Halve RING_BUFFER_COUNT for each step you raise BASE_BUF; see README 'Sizing BASE_BUF and RING_BUFFER_COUNT'.",
+                .{ slab_bytes / 1024 / 1024, runtime_config.event_data_buffer_log2, event_buf_bytes / 1024, runtime_config.batch_ring_buffer_size, limit / 1024 / 1024 },
+            );
+            return error.SlabExceedsMemory;
+        } else {
+            log.info("Event slab: {d} MB of a {d} MB limit ({d}%)", .{
+                slab_bytes / 1024 / 1024,
+                limit / 1024 / 1024,
+                slab_bytes * 100 / limit,
+            });
+        }
+
+        // #2 — can a row that fills the buffer ever be published?
+        //
+        // Was a warning. It is an error now because the failure it describes is the same
+        // shape as the two size-cap bugs found on 2026-08-16: the row packs, the publish is
+        // refused, and nothing in the data path says why. A buffer larger than the server
+        // will accept is not a tuning choice, it is a configuration that cannot work.
+        if (publisher.js) |*js| {
+            if (nats_publisher.serverMaxPayload(js)) |max_payload| {
+                if (event_buf_bytes + Config.Nats.payload_envelope_margin_bytes > max_payload) {
+                    log.err(
+                        "🔴 BASE_BUF={d} allows a {d} KB row, but this NATS server accepts at most {d} KB per message and the envelope (subject, headers, column keys, batch framing) needs roughly {d} KB more. A row in that range packs successfully and is then REJECTED at publish time. Lower BASE_BUF to {d} or raise max_payload in nats-server.conf.",
+                        .{
+                            runtime_config.event_data_buffer_log2,
+                            event_buf_bytes / 1024,
+                            max_payload / 1024,
+                            Config.Nats.payload_envelope_margin_bytes / 1024,
+                            std.math.log2_int(u64, max_payload - Config.Nats.payload_envelope_margin_bytes),
+                        },
+                    );
+                    return error.EventBufferExceedsMaxPayload;
+                }
+            }
+        }
+    }
 
     // === Start thread: CDC async publisher (heap-allocated for stable address)
     // Use c_allocator (thread-safe) for cross-thread allocations:

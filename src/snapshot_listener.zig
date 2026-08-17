@@ -18,6 +18,7 @@ const encoder_mod = @import("encoder.zig");
 const streaming_encoder = @import("streaming_encoder.zig");
 const RuntimeConfig = @import("config.zig").RuntimeConfig;
 const nats = @import("nats");
+const nats_publisher = @import("nats_publisher.zig");
 const topology_mod = @import("topology.zig");
 const utils = @import("utils.zig");
 
@@ -54,6 +55,11 @@ fn publishSnapshotError(
     available_tables: []const []const u8,
     format: encoder_mod.Format,
     topo: *const topology_mod.Topology,
+    /// The snapshot that failed, when one had been started. Null for a request rejected
+    /// before generation began (unknown table, refused table). Present so an operator can
+    /// tie the failure to the chunks it wrote — without it, an aborted snapshot and its
+    /// orphans could only be correlated by timestamp.
+    snapshot_id: ?[]const u8,
 ) !void {
     const subject = try topology_mod.render(
         allocator,
@@ -74,6 +80,9 @@ fn publishSnapshotError(
     try map.put(encoder.allocator, "error_type", try encoder.createString(error_type));
     try map.put(encoder.allocator, "error_message", try encoder.createString(error_message));
     try map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
+    if (snapshot_id) |sid| {
+        try map.put(encoder.allocator, "snapshot_id", try encoder.createString(sid));
+    }
 
     // Tell the client what it *could* have asked for — the usual cause is a typo or a
     // table outside the publication.
@@ -87,6 +96,201 @@ fn publishSnapshotError(
     defer allocator.free(payload);
 
     try consumer.PUBLISH(subject, null, payload);
+}
+
+/// How long the REQUESTS stream keeps an unread request, in seconds. 0 = unknown.
+///
+/// Read from the server rather than from config, because the value belongs to `nats-init`
+/// (`SNAP_RET_SECONDS` in .env.admin) and the bridge is never told it. Asking is the only
+/// way to know what window the requests it is serving actually have.
+fn requestWindowSeconds(js: *nats.JS, stream: []const u8) u64 {
+    const request: nats.JS.StreamInfoRequest = .{};
+    const info = js.INFO(stream, &request) catch |err| {
+        log.debug("could not read '{s}' max_age ({}); queue-expiry warning disabled", .{ stream, err });
+        return 0;
+    };
+    const cfg = info.config orelse return 0;
+    if (cfg.max_age <= 0) return 0; // 0 means "never expires"
+    return @intCast(@divTrunc(cfg.max_age, std.time.ns_per_s));
+}
+
+/// Is there any row after the cursor?
+///
+/// The end-of-table test. A short chunk is ambiguous — the running byte sum trims chunks
+/// routinely, and a trimmed chunk is indistinguishable from the last one by row count
+/// alone — so the only honest answer comes from asking. One indexed lookup against the
+/// same keyset predicate the next chunk would use, run only when a chunk *looks* final.
+fn hasRowsBeyond(
+    allocator: std.mem.Allocator,
+    conn: *c.PGconn,
+    table_name: []const u8,
+    columns: []const pg_copy_binary.ColumnMeta,
+    pk_idx: []const usize,
+    cursor_values: []const []const u8,
+) !bool {
+    if (cursor_values.len == 0) return true;
+
+    const predicate = try pg_copy_binary.keysetPredicate(allocator, columns, pk_idx, cursor_values);
+    defer allocator.free(predicate);
+
+    const query = try utils.allocPrintZ(
+        allocator,
+        "SELECT 1 FROM \"{s}\" WHERE {s} LIMIT 1",
+        .{ table_name, predicate },
+    );
+    defer allocator.free(query);
+
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        // Cannot prove the table ended, so assume it has not: another chunk that turns out
+        // empty costs one round trip, while a wrong "final" costs the rest of the table.
+        log.warn("📸 end-of-table check failed for '{s}': {s}", .{ table_name, c.PQerrorMessage(conn) });
+        return true;
+    }
+    return c.PQntuples(res) > 0;
+}
+
+/// Rows that should fit one message, given what a row costs.
+///
+/// Aims at 4/5 of the budget rather than all of it: the input is a *mean*, and a run of
+/// above-average rows still has to fit. The running sum in the chunk query enforces the
+/// budget exactly — this only decides how often the encoder has to re-encode a prefix.
+fn rowsPerChunk(bytes_per_row: usize, budget: usize, ceiling: usize) usize {
+    const per_row = @max(bytes_per_row, 1);
+    const target = budget / config.Snapshot.chunk_fill_den * config.Snapshot.chunk_fill_num;
+    return std.math.clamp(target / per_row, 1, ceiling);
+}
+
+/// Publish the same suspension the CDC path publishes, from the snapshot thread.
+///
+/// `event_processor.publishSuspension` cannot be reused: it goes through the ring buffer
+/// via `acquireAndFillSlot`, which only the replication thread owns. The payload shape is
+/// copied deliberately — a client cannot be asked to understand two spellings of "this
+/// table is suspended", and the reason string comes from the same `RefusedTables.Reason`
+/// enum, so the wire word cannot drift between the two producers.
+fn publishSuspension(
+    allocator: std.mem.Allocator,
+    js: *nats.JS,
+    topo: *const topology_mod.Topology,
+    table_name: []const u8,
+    reason: []const u8,
+    lsn: u64,
+    should_stop: *std.atomic.Value(bool),
+) !void {
+    const payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"table\":\"{s}\",\"suspended\":true,\"reason\":\"{s}\",\"lsn\":{d}}}",
+        .{ table_name, reason, lsn },
+    );
+    defer allocator.free(payload);
+
+    const subject = try topology_mod.render(
+        allocator,
+        topo.kv_schemas_subject_pattern,
+        &.{.{ .name = "table", .value = table_name }},
+        null,
+    );
+    defer allocator.free(subject);
+
+    try publishWithRetry(js, subject, null, payload, should_stop);
+    log.warn("🚫 Published suspension for '{s}' (reason: {s}) → {s}", .{ table_name, reason, subject });
+}
+
+/// What one scan says about a table's row widths.
+const RowWidths = struct {
+    /// The widest row. A row at or above the message budget makes the table
+    /// unsnapshottable — and unreplicable by CDC too, which is why it suspends rather
+    /// than merely failing this request.
+    max_bytes: usize,
+    /// The mean, for sizing chunks. Only a hint: the running sum is what enforces the
+    /// budget.
+    avg_bytes: usize,
+};
+
+/// Measure the table's rows before transferring any of them.
+///
+/// Runs inside the snapshot's REPEATABLE READ transaction, so what it measures is exactly
+/// what the COPYs will later read — no row can grow in between.
+///
+/// Cheap for the types that matter: `octet_length` on `text`/`bytea` reads the length from
+/// the TOAST pointer without fetching the value. Measured on 200 rows of 256 KiB blobs,
+/// this touched 2 shared buffers against 430 for an expression that must read the data.
+fn measureWidestRow(
+    allocator: std.mem.Allocator,
+    conn: *c.PGconn,
+    table_name: []const u8,
+    size_expr: []const u8,
+) !RowWidths {
+    const query = try utils.allocPrintZ(
+        allocator,
+        "SELECT coalesce(max({s}),0)::bigint, coalesce(avg({s}),0)::bigint FROM \"{s}\"",
+        .{ size_expr, size_expr, table_name },
+    );
+    defer allocator.free(query);
+
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.err("📸 row-width scan failed for '{s}': {s}", .{ table_name, c.PQerrorMessage(conn) });
+        return error.RowWidthScanFailed;
+    }
+    if (c.PQntuples(res) == 0) return .{ .max_bytes = 0, .avg_bytes = 0 };
+
+    const max_text = std.mem.span(c.PQgetvalue(res, 0, 0));
+    const avg_text = std.mem.span(c.PQgetvalue(res, 0, 1));
+    return .{
+        .max_bytes = std.fmt.parseInt(usize, max_text, 10) catch 0,
+        .avg_bytes = std.fmt.parseInt(usize, avg_text, 10) catch 0,
+    };
+}
+
+/// Delete an aborted snapshot's chunks from the INIT stream.
+///
+/// A snapshot that dies after publishing chunk 0 leaves those chunks behind under a
+/// `snapshot_id` no descriptor will ever reference — the descriptor is written only after
+/// COMMIT, so no client can find them. They are invisible, not harmless: `INIT` is
+/// 8 GiB with **discard = old**, so a wide table failing repeatedly evicts *other*
+/// tables' snapshot chunks and schema messages. A table that is broken takes down tables
+/// that are not.
+///
+/// Best effort. If the purge fails the data still ages out at the stream's max-age, and
+/// the descriptor gate still protects every client — this reclaims space, it does not
+/// protect correctness, and it must never turn a failed snapshot into a failed thread.
+fn purgeOrphanChunks(
+    allocator: std.mem.Allocator,
+    js: *nats.JS,
+    topo: *const topology_mod.Topology,
+    stream: []const u8,
+    table_name: []const u8,
+    snapshot_id: []const u8,
+) void {
+    // `>` in the chunk position turns the publish pattern into a subject filter covering
+    // every chunk of exactly this snapshot. Built from the same topology pattern the
+    // chunks were published with, so a renamed subject space cannot leave the purge
+    // pointing at the old one.
+    const chunk_filter = topology_mod.render(allocator, topo.snapshot_data_pattern, &.{
+        .{ .name = "table", .value = table_name },
+        .{ .name = "snapshot_id", .value = snapshot_id },
+        .{ .name = "chunk", .value = ">" },
+    }, null) catch return;
+    defer allocator.free(chunk_filter);
+
+    const schema_subject = topology_mod.render(allocator, topo.snapshot_schema_pattern, &.{
+        .{ .name = "table", .value = table_name },
+        .{ .name = "snapshot_id", .value = snapshot_id },
+    }, null) catch return;
+    defer allocator.free(schema_subject);
+
+    for ([_][]const u8{ chunk_filter, schema_subject }) |filter| {
+        js.PURGE_FILTER(stream, filter) catch |err| {
+            log.warn("🧹 could not purge orphaned '{s}' ({}); it will age out with the stream", .{ filter, err });
+            continue;
+        };
+        log.info("🧹 purged orphaned snapshot data: {s}", .{filter});
+    }
 }
 
 /// Publish to NATS JetStream with retry logic and exponential backoff
@@ -460,7 +664,7 @@ const SnapshotContext = struct {
     pg_config: *const pg_conn.PgConf,
     js: *nats.JS, // JetStream connection for publishing
     monitored_tables: []const []const u8,
-    refused: *const refused_tables.Registry,
+    refused: *refused_tables.Registry,
     format: encoder_mod.Format,
     chunk_size: usize,
     // js_ctx: ?*anyopaque, // JetStream context for KV access (optional)
@@ -472,7 +676,7 @@ pub const SnapshotListener = struct {
     pg_config: *const pg_conn.PgConf,
     should_stop: *std.atomic.Value(bool),
     monitored_tables: []const []const u8,
-    refused: *const refused_tables.Registry,
+    refused: *refused_tables.Registry,
     thread: ?std.Thread = null,
     format: encoder_mod.Format,
     chunk_size: usize,
@@ -491,7 +695,7 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
-        refused: *const refused_tables.Registry,
+        refused: *refused_tables.Registry,
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
         io: std.Io,
@@ -598,7 +802,7 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
-        refused: *const refused_tables.Registry,
+        refused: *refused_tables.Registry,
         format: encoder_mod.Format,
         io: std.Io,
         endpoint: config.Nats.Endpoint,
@@ -692,7 +896,7 @@ pub const SnapshotListener = struct {
         core: *nats.Core,
         pg_config: *const pg_conn.PgConf,
         monitored_tables: []const []const u8,
-        refused: *const refused_tables.Registry,
+        refused: *refused_tables.Registry,
         format: encoder_mod.Format,
         topo: *const topology_mod.Topology,
     ) !void {
@@ -924,7 +1128,7 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
-        refused: *const refused_tables.Registry,
+        refused: *refused_tables.Registry,
         format: encoder_mod.Format,
         chunk_size: usize,
         io: std.Io,
@@ -998,6 +1202,7 @@ pub const SnapshotListener = struct {
                 topo.stream_requests,
             });
 
+
             // Listen for snapshot requests
             while (!should_stop.load(.acquire)) {
                 if (consumer.CONSUME(nats.protocol.SECNS / 2) catch null) |msg| {
@@ -1023,12 +1228,22 @@ pub const SnapshotListener = struct {
                         continue;
                     }
 
-                    // ACKed as soon as it is understood, not after the COPY finishes.
-                    // Holding the ack across a multi-minute snapshot only buys
-                    // redelivery-on-crash, and pays for it with duplicate snapshots
-                    // whenever generation outlives ack_wait. The stream's own
-                    // max-msgs-per-subject window is what stops a re-request anyway.
-                    defer consumer.ACK(msg, true) catch consumer.REUSE(msg);
+                    // ACKed **now**, before the COPY, not at scope exit.
+                    //
+                    // This was `defer consumer.ACK(msg, true)`, whose comment claimed an
+                    // immediate ack while `defer` in fact held it for the whole snapshot —
+                    // so a table taking longer than `ack_wait` was redelivered and
+                    // snapshotted twice, which is precisely what the comment said it was
+                    // avoiding. Holding the ack buys only redelivery-on-crash, and pays
+                    // for it with duplicate work on exactly the tables least able to
+                    // afford it. The stream's own max-msgs-per-subject window is what
+                    // stops a re-request in the meantime.
+                    //
+                    // `reuse = false`: recycling the envelope here would invalidate
+                    // `msg.letter.subject`, which the table name is read from below. The
+                    // envelope goes back at scope exit instead.
+                    consumer.ACK(msg, false) catch {};
+                    defer consumer.REUSE(msg);
 
                     // Extract table name from subject: init.snapshot.<table>
                     const subject = msg.letter.subject.body() orelse {
@@ -1062,6 +1277,7 @@ pub const SnapshotListener = struct {
                             monitored_tables,
                             format,
                             topo,
+                            null,
                         ) catch |err| {
                             log.err("📸 Failed to publish snapshot error for '{s}': {}", .{ table_name, err });
                         };
@@ -1081,6 +1297,7 @@ pub const SnapshotListener = struct {
                             monitored_tables,
                             format,
                             topo,
+                            null,
                         ) catch |err| {
                             log.err("📸 Failed to publish snapshot error for '{s}': {}", .{ table_name, err });
                         };
@@ -1107,6 +1324,7 @@ pub const SnapshotListener = struct {
                         io,
                         endpoint,
                         topo,
+                        refused,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         publishSnapshotError(
@@ -1118,6 +1336,7 @@ pub const SnapshotListener = struct {
                             monitored_tables,
                             format,
                             topo,
+                            snapshot_id,
                         ) catch |perr| {
                             log.err("📸 Failed to publish generation error for '{s}': {}", .{ table_name, perr });
                         };
@@ -1125,7 +1344,7 @@ pub const SnapshotListener = struct {
                     };
                     defer allocator.free(result.lsn_text);
 
-                    log.info("📸 ✅ Snapshot completed for '{s}'", .{table_name});
+                                log.info("📸 ✅ Snapshot completed for '{s}'", .{table_name});
                 }
             }
         }
@@ -1145,8 +1364,12 @@ pub const SnapshotListener = struct {
         io: std.Io,
         endpoint: config.Nats.Endpoint,
         topo: *const topology_mod.Topology,
+        /// Shared with preflight and the CDC path. A row too wide to publish is refused
+        /// here on the same terms, so the two paths cannot disagree about one table.
+        refused: *refused_tables.Registry,
     ) !SnapshotResult {
-        log.info("📸 Generating snapshot for '{s}' (id={s}, chunk_size={d})", .{
+        const started_at = @as(i64, c.time(null));
+        log.info("📸 Generating snapshot for '{s}' (id={s}, row ceiling {d})", .{
             table_name,
             snapshot_id,
             chunk_size,
@@ -1167,6 +1390,21 @@ pub const SnapshotListener = struct {
         defer js.DISCONNECT();
 
         log.info("📸 Connected to JetStream for snapshot publishing", .{});
+
+        // Chunks already on the wire when this function returns an error are orphans: the
+        // KV descriptor is written only after COMMIT, so no client will ever learn the id
+        // they were published under. Registered after `js.DISCONNECT` so it runs *before*
+        // it — errdefers unwind in reverse — and guarded on the counter so a snapshot that
+        // failed before publishing anything does not issue a pointless purge.
+        var chunks_published: u32 = 0;
+        errdefer if (chunks_published > 0) purgeOrphanChunks(
+            allocator,
+            &js,
+            topo,
+            topo.stream_init,
+            table_name,
+            snapshot_id,
+        );
 
         // Create PostgreSQL connection
         const conninfo = try pg_config.connInfo(allocator, false);
@@ -1274,12 +1512,89 @@ pub const SnapshotListener = struct {
         // Process chunks using streaming encoder
         var batch: u32 = 0;
         var total_rows: u64 = 0;
+        // Where a snapshot's time actually goes. Split because the two halves have
+        // completely different remedies: `copy_encode` is Postgres and this process, while
+        // `publish` is one synchronous ack per chunk against a file-backed stream — and if
+        // that dominates, the fix is to pipeline publishes, which touches neither.
+        var copy_encode_ns: u64 = 0;
+        var publish_ns: u64 = 0;
         var cursor = Cursor{ .allocator = allocator };
         defer cursor.deinit();
 
-        // Pre-allocate encoding buffer (2MB for chunk data)
-        const encode_buffer = try allocator.alloc(u8, 2 * 1024 * 1024);
+        // What one chunk may encode to. The server states its limit in INFO on every
+        // connection, so this is a fact rather than an assumption; the margin covers the
+        // subject, the headers and the msg-id that travel with the payload.
+        //
+        // Computed *before* the buffer is allocated, so the buffer can be exactly this
+        // size — then "the encoder ran out of room" and "this prefix exceeds a NATS
+        // message" are one event with one handling path, instead of two that can disagree.
+        const max_chunk_bytes = blk: {
+            const advertised = nats_publisher.serverMaxPayload(&js) orelse {
+                log.warn("📸 NATS did not advertise max_payload; capping chunks at 1 MiB", .{});
+                break :blk 1024 * 1024 - config.Nats.payload_envelope_margin_bytes;
+            };
+            const budget = if (advertised > config.Nats.payload_envelope_margin_bytes)
+                advertised - config.Nats.payload_envelope_margin_bytes
+            else
+                advertised / 2;
+            break :blk @min(@as(usize, @intCast(budget)), config.Snapshot.encode_buffer_max_bytes);
+        };
+        const encode_buffer = try allocator.alloc(u8, max_chunk_bytes);
         defer allocator.free(encode_buffer);
+
+        // ─── the widest row, before a single byte is transferred ──────────────────────
+        //
+        // One scan answers both questions the chunk loop needs. `max` says whether any row
+        // is unpublishable — a row larger than a NATS message can never be sent, by this
+        // path or by CDC, so the table is refused here rather than discovered halfway
+        // through a COPY that already pulled it into memory. `avg` sizes the chunks.
+        //
+        // It also buys the loop its central guarantee: with `max < budget`, the running
+        // sum below can never return zero rows, so the cursor always advances and the
+        // "first row alone exceeds the budget" deadlock cannot occur.
+        const size_expr = try pg_copy_binary.sizeExpression(allocator, columns);
+        defer allocator.free(size_expr);
+
+        const column_list = try pg_copy_binary.columnList(allocator, columns);
+        defer allocator.free(column_list);
+
+        const t_scan = utils.nanoTimestamp();
+        const widest = try measureWidestRow(allocator, conn.?, table_name, size_expr);
+        const scan_ms: u64 = @intCast(@divTrunc(utils.nanoTimestamp() - t_scan, std.time.ns_per_ms));
+        if (widest.max_bytes >= max_chunk_bytes) {
+            log.err(
+                "🔴 SUSPENDING '{s}': its widest row is {d} bytes, over the {d}-byte message budget. A snapshot cannot split a row, and CDC cannot carry it either. Fix: move the oversized column out of the replicated table (store a reference, not the blob).",
+                .{ table_name, widest.max_bytes, max_chunk_bytes },
+            );
+            _ = c.PQexec(conn, "ROLLBACK");
+
+            // Same verdict CDC reaches when the row is written, reached here before a byte
+            // moves. Registering it stops this bridge serving snapshots for the table and
+            // drops its CDC events; the suspension tells clients to drop their copy.
+            refused.refuse(table_name, refused_tables.Reason.row_too_large) catch |err| {
+                log.err("🔴 Could not record refusal for '{s}': {}", .{ table_name, err });
+            };
+            publishSuspension(
+                allocator,
+                &js,
+                topo,
+                table_name,
+                refused_tables.Reason.row_too_large.wireName(),
+                parsePgLsn(lsn_str) catch 0,
+                should_stop,
+            ) catch |err| {
+                log.err("🔴 Could not publish suspension for '{s}': {}", .{ table_name, err });
+            };
+            return error.RowTooLargeForMessage;
+        }
+
+        // 4/5 of the budget: `avg` is a mean, and a run of above-average rows still has to
+        // fit. The running sum enforces the budget exactly; this only decides how full a
+        // typical chunk gets, and aiming at 100% would just cause re-encodes.
+        var rows_per_chunk = rowsPerChunk(widest.avg_bytes, max_chunk_bytes, chunk_size);
+        log.debug("📸 chunk budget {d} bytes; widest row {d}, average {d} → {d} rows/chunk (ceiling {d})", .{
+            max_chunk_bytes, widest.max_bytes, widest.avg_bytes, rows_per_chunk, chunk_size,
+        });
 
         while (true) {
             _ = arena.reset(.retain_capacity);
@@ -1293,10 +1608,19 @@ pub const SnapshotListener = struct {
             else
                 try pg_copy_binary.keysetPredicate(chunk_alloc, columns, pk.idx, cursor.values);
 
+            // Two nested bounds. The inner LIMIT caps how many rows Postgres *measures*;
+            // the outer running sum caps how many it *sends*, so the bridge receives at
+            // most one message's worth however wide the rows turn out to be.
+            //
+            // The column list is spelled out rather than `SELECT *`: the subquery carries
+            // `zb_running`, and `SELECT *` would hand that extra column to a binary COPY
+            // decoder that matches columns positionally against the catalog.
             const copy_query = try utils.allocPrintZ(
                 chunk_alloc,
-                "COPY (SELECT * FROM \"{s}\" WHERE {s} ORDER BY {s} LIMIT {d}) TO STDOUT WITH (FORMAT binary)",
-                .{ table_name, where_clause, order_by, chunk_size },
+                "COPY (SELECT {s} FROM (SELECT {s}, sum({s}) OVER (ORDER BY {s}) AS zb_running" ++
+                    " FROM \"{s}\" WHERE {s} ORDER BY {s} LIMIT {d}) s WHERE s.zb_running <= {d})" ++
+                    " TO STDOUT WITH (FORMAT binary)",
+                .{ column_list, column_list, size_expr, order_by, table_name, where_clause, order_by, rows_per_chunk, max_chunk_bytes },
             );
 
             // Initialize streaming encoder with fixed buffer
@@ -1308,11 +1632,65 @@ pub const SnapshotListener = struct {
             var parser = pg_copy_binary.Streamer.init(chunk_alloc, @ptrCast(conn), columns);
             defer parser.deinit();
 
-            const num_rows = parser.streamToEncoder(copy_query, &encoder, pk.idx) catch |err| {
+            const t_copy = utils.nanoTimestamp();
+            const chunk = parser.streamToEncoder(.{
+                .query = copy_query,
+                .pk_idx = pk.idx,
+                .limit = rows_per_chunk,
+                .max_bytes = max_chunk_bytes,
+                .expected_raw_bytes = max_chunk_bytes,
+            }, &encoder) catch |err| {
                 log.err("📸 binary COPY chunk failed for '{s}': {}", .{ table_name, err });
                 _ = c.PQexec(conn, "ROLLBACK");
-                return error.StreamEncodingFailed;
+                return err;
             };
+            copy_encode_ns += @intCast(utils.nanoTimestamp() - t_copy);
+            const num_rows = chunk.encoded;
+
+            log.debug("📸 chunk {d}: limit={d} fetched={d} encoded={d} bytes={d}", .{
+                batch, chunk.limit, chunk.fetched, chunk.encoded, chunk.encoded_bytes,
+            });
+
+            // Correct the estimate with what the rows actually encoded to. The SQL size
+            // expression is deliberately conservative — it sums `octet_length` plus a flat
+            // per-column allowance, while MessagePack packs a small int into one byte — so
+            // on a narrow table it can overstate by 2x and halve the chunk size for no
+            // reason. One measurement fixes that from chunk 1 onward.
+            //
+            // Only ever *raises* the row count: the pre-scan's `max` is what guarantees
+            // safety, and the running sum still trims any chunk that overshoots, so a
+            // larger limit cannot produce an oversized message.
+            if (chunk.encoded > 0) {
+                const measured = @max(chunk.encoded_bytes / chunk.encoded, 1);
+                rows_per_chunk = @max(rows_per_chunk, rowsPerChunk(measured, max_chunk_bytes, chunk_size));
+            }
+
+            // Advance the keyset cursor to the actual last row of this chunk, captured
+            // during streaming. Correct for gaps, deletions, and non-sequential keys
+            // (uuid, text) alike, because it never assumes what the next key would be.
+            //
+            // Done here rather than after publishing because the end-of-table check below
+            // needs it: it asks whether any row exists past this cursor.
+            if (num_rows > 0) {
+                const pk_values = parser.getLastPkValues() orelse {
+                    log.err("⚠️  No PK values captured from chunk — aborting snapshot", .{});
+                    _ = c.PQexec(conn, "ROLLBACK");
+                    return error.PkValueMissing;
+                };
+                // Copied out of the chunk arena, which the next iteration resets before it
+                // builds the query that reads this.
+                try cursor.set(pk_values);
+            }
+
+            // A short chunk is ambiguous — the running byte sum trims chunks routinely —
+            // so `mayBeFinal` only decides whether the question is worth asking. The
+            // answer costs one indexed lookup, and only on chunks that look like the last.
+            //
+            // `num_rows == 0` short-circuits it, which is also what makes the loop
+            // terminate unconditionally: an empty chunk always ends the snapshot, so no
+            // disagreement between the size estimate and the COPY can spin it forever.
+            const is_final = num_rows == 0 or (chunk.mayBeFinal() and
+                !(try hasRowsBeyond(chunk_alloc, conn.?, table_name, columns, pk.idx, cursor.values)));
 
             // On first chunk (even if empty), publish schema so consumer knows column order
             if (batch == 0) {
@@ -1383,14 +1761,16 @@ pub const SnapshotListener = struct {
             const total_rows_str = try std.fmt.allocPrint(chunk_alloc, "{d}", .{total_rows});
             try headers.append("X-Snapshot-Total-Rows-So-Far", total_rows_str);
 
-            // Flag final chunk when we receive fewer rows than chunk_size
-            if (num_rows < chunk_size) {
+            if (is_final) {
                 try headers.append("X-Snapshot-Final-Chunk", "true");
             }
 
             // Publish to JetStream with headers and retry logic
+            const t_pub = utils.nanoTimestamp();
             try publishWithRetry(&js, subject, &headers, payload, should_stop);
+            publish_ns += @intCast(utils.nanoTimestamp() - t_pub);
 
+            chunks_published += 1;
             log.info("📦 Published chunk {d} ({d} rows, {d} bytes) → {s} (msg_id={s})", .{
                 batch,
                 num_rows,
@@ -1401,20 +1781,7 @@ pub const SnapshotListener = struct {
 
             batch += 1;
 
-            // Advance the keyset cursor to the actual last row of this chunk, captured
-            // during streaming. Correct for gaps, deletions, and non-sequential keys
-            // (uuid, text) alike, because it never assumes what the next key would be.
-            const pk_values = parser.getLastPkValues() orelse {
-                log.err("⚠️  No PK values captured from chunk — aborting snapshot", .{});
-                _ = c.PQexec(conn, "ROLLBACK");
-                return error.PkValueMissing;
-            };
-            // Copied out of the chunk arena, which the next iteration resets before it
-            // builds the query that reads this.
-            try cursor.set(pk_values);
-
-            // Break if we got fewer rows than requested (end of table)
-            if (num_rows < chunk_size) break;
+            if (is_final) break;
         }
 
         // Commit transaction
@@ -1442,11 +1809,33 @@ pub const SnapshotListener = struct {
             topo,
         );
 
-        log.info("✅ Snapshot complete: {s} ({d} batches, {d} rows)", .{
+        const elapsed: u64 = @intCast(@max(@as(i64, c.time(null)) - started_at, 0));
+        log.info("✅ Snapshot complete: {s} ({d} batches, {d} rows, {d}s) — prescan {d}ms, copy+encode {d}ms, publish {d}ms", .{
             snapshot_id,
             batch,
             total_rows,
+            elapsed,
+            scan_ms,
+            copy_encode_ns / std.time.ns_per_ms,
+            publish_ns / std.time.ns_per_ms,
         });
+
+        // Snapshots are served one at a time, and a request waiting its turn ages against
+        // the REQUESTS stream's own max_age. So once a snapshot takes a large fraction of
+        // that window, a request queued behind it is dropped by the broker before the
+        // worker ever polls for it: the client gets no chunks, no error, and nothing to
+        // retry against until the window clears.
+        //
+        // Warned rather than fixed: the window belongs to nats-init (SNAP_RET_SECONDS),
+        // and the real remedies are a larger window or concurrent workers.
+        const window_seconds = requestWindowSeconds(&js, topo.stream_requests);
+        log.debug("📸 request window for '{s}': {d}s (0 = unknown)", .{ topo.stream_requests, window_seconds });
+        if (window_seconds > 0 and elapsed * 2 > window_seconds) {
+            log.warn(
+                "⏳ '{s}' took {d}s against a {d}s request window. Snapshots run one at a time, so a request queued behind one this long expires unread. Raise SNAP_RET_SECONDS above the worst-case snapshot time, multiplied by how many tables may request at once.",
+                .{ table_name, elapsed, window_seconds },
+            );
+        }
 
         // lsn_str points into a PGresult cleared by a defer above — dupe before returning.
         return SnapshotResult{

@@ -87,6 +87,33 @@ pub fn PURGE(js: *JetStream, sname: []const u8) !void {
     return js.process(protocol.SECNS * 5);
 }
 
+/// Purge only the messages matching a subject filter.
+///
+/// The same API call as `PURGE`, with a `{"filter": "..."}` body — upstream omitted the
+/// body entirely, so the only purge available was "delete the whole stream's contents".
+/// ZeBridge needs the narrow form to drop one aborted snapshot's chunks
+/// (`init.snap.<table>.<id>.>`) without touching every other table's data.
+///
+/// The filter is written into the JSON buffer directly rather than via `stringify`,
+/// because a NATS subject cannot contain a character JSON would need to escape: the
+/// token separators are `.`, `*` and `>`, and whitespace and quotes are already illegal
+/// in a subject. A subject arriving here with a `"` in it would be a bug upstream, not
+/// input to sanitise.
+pub fn PURGE_FILTER(js: *JetStream, sname: []const u8, filter: []const u8) !void {
+    js.mutex.lockUncancelable(js.io);
+    defer js.mutex.unlock(js.io);
+
+    if (js.connection == null) {
+        return error.NotConnected;
+    }
+
+    _ = try js.cmd.sprintf(PURGE_STREAM_T, .{sname});
+    js.jsn.reset();
+    _ = try js.jsn.sprintf("{{\"filter\":\"{s}\"}}", .{filter});
+
+    return js.process(protocol.SECNS * 5);
+}
+
 /// Deletes the specified stream.
 pub fn DELETE(js: *JetStream, sname: []const u8) !void {
     js.mutex.lockUncancelable(js.io);

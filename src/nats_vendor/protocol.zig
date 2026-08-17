@@ -137,10 +137,14 @@ pub const StreamConfig = struct {
     subjects: ?Strings = null,
     retention: []const u8 = RETENTION_LIMITS,
     max_consumers: i32 = -1,
-    max_msgs: i32 = -1,
-    max_bytes: i32 = -1,
-    max_age: i32 = 0,
-    max_msgs_per_subject: i32 = -1,
+    // ⚠️ These four were `i32` upstream, which cannot hold the values JetStream reports.
+    // `max_age` is **nanoseconds**: i32 caps at 2 147 483 647 ns ≈ 2.1 *seconds*, so any
+    // stream with a retention above that — every stream this bridge creates — made the
+    // JSON parse fail or truncate. `max_msgs`/`max_bytes` overflow just as easily (2 GiB).
+    max_msgs: i64 = -1,
+    max_bytes: i64 = -1,
+    max_age: i64 = 0,
+    max_msgs_per_subject: i64 = -1,
     max_msg_size: i32 = -1,
     discard: String = DISCARD_OLD,
     storage: String = STORAGE_FILE,

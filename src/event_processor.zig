@@ -452,9 +452,9 @@ pub const EventProcessor = struct {
             return err;
         };
 
-        if (self.metrics) |m| {
-            m.incrementCdcEvents();
-        }
+        // NOT counted here any more: this point is "packed into a ring-buffer slot",
+        // which is a different event from "NATS accepted it". The counter moved to the
+        // batch publisher's post-ack path — see the note there.
 
         if (is_transition and transition_column_name != null) {
             if (id_str) |id| {

@@ -47,6 +47,64 @@ pub fn maxRssBytes() u64 {
     return if (builtin.os.tag == .linux) raw * 1024 else raw;
 }
 
+/// The memory limit this process actually has, in bytes, or 0 when unknown.
+///
+/// Prefers the **cgroup v2 / v1 limit** over physical RAM, because the deployment that
+/// most needs this check is a container: there `hw.memsize` and `_SC_PHYS_PAGES` report
+/// the *host's* memory, so a 1 GB slab looks comfortable on a 64 GB host right up until
+/// the 512 MB cgroup kills it.
+pub fn memoryLimitBytes() u64 {
+    if (builtin.os.tag == .linux) {
+        // cgroup v2 first; "max" means unlimited, in which case fall through to physical.
+        const paths = [_][]const u8{
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        };
+        for (paths) |p| {
+            var buf: [64]u8 = undefined;
+            const f = std.fs.openFileAbsolute(p, .{}) catch continue;
+            defer f.close();
+            const n = f.readAll(&buf) catch continue;
+            const text = std.mem.trim(u8, buf[0..n], " \n\r\t");
+            if (std.mem.eql(u8, text, "max")) continue;
+            const v = std.fmt.parseInt(u64, text, 10) catch continue;
+            // cgroup v1 writes a sentinel near u64 max for "no limit".
+            if (v > 0 and v < (1 << 62)) return v;
+        }
+    }
+    return systemMemoryBytes();
+}
+
+/// Total physical RAM in bytes, or 0 when it cannot be determined.
+///
+/// The bridge pre-allocates its whole event slab at startup — `2^BASE_BUF ×
+/// RING_BUFFER_COUNT` — so "does this machine have that much memory?" is answerable
+/// *before* the allocation rather than discovered as an OOM kill under load, which is when
+/// it would otherwise surface.
+///
+/// Returns 0 rather than guessing when the platform will not say: a check that cannot run
+/// must not become a check that fails.
+pub fn systemMemoryBytes() u64 {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => {
+            // sysctl hw.memsize — the only reliable source on Darwin; _SC_PHYS_PAGES is
+            // not defined there.
+            var mem: u64 = 0;
+            var len: usize = @sizeOf(u64);
+            const name = "hw.memsize";
+            if (std.c.sysctlbyname(name, &mem, &len, null, 0) != 0) return 0;
+            return mem;
+        },
+        .linux => {
+            const pages = std.c.sysconf(@intFromEnum(std.c._SC.PHYS_PAGES));
+            const page_size = std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE));
+            if (pages <= 0 or page_size <= 0) return 0;
+            return @as(u64, @intCast(pages)) * @as(u64, @intCast(page_size));
+        },
+        else => return 0,
+    }
+}
+
 pub fn getMilliTimestamp() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);

@@ -1,21 +1,97 @@
-# Bridge server PostgreSQL  → NATS
+# ZeBridge server PostgreSQL  ↔ NATS
 
 <img width="755" height="433" alt="Screenshot 2025-12-26 at 02 37 57" src="https://github.com/user-attachments/assets/b3701ef4-2d58-497a-be21-52ad1b970644" />
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-A lightweight **stateless** opinionated bidirectional daemon connecting PostgreSQL (14+) to the message broker NATS/JetStream (2+) for Edge sync.
+ZeBridge is an opinionated bidirectional daemon connecting `PostgreSQL` (14+) to the message broker `NATS/JetStream` (2.14+) for Edge sync.
 
-Allows mobile, WASM (PGLite/SQLite), and web apps to mirror PostgreSQL tables over WSS or TLS via NATS/JetStream without ever reaching for PostgreSQL.
+Allows mobile, WASM ([PGLite](https://github.com/electric-sql/pglite), [SQLite](https://sqlite.org/wasm/doc/trunk/index.md)) web apps or microservices to mirror locally Postgres tables via NATS/JS without ever reaching for Postgres.
 
-This _single threaded_ binary drained **2,000,000 CDC events in under 20 s** end to end
-(PostgreSQL → NATS JetStream) in the burst benchmark below — ~100k events/s including
-the time PostgreSQL itself needed to write them, and ~260k events/s while the WAL loop
-was actually busy. See [Measured throughput](#measured-throughput) for the method, and
-run it yourself before trusting it.
+It is bidirectional: it transferts Postgres CDCs and table snapshots to a NATS/JS server, and propagates Consumer local optimistic writes back to Postgres via NATS/JS.
 
-By pushing all state, caching, and rate-limiting down into NATS JetStream, the ZeBridge binary has total amnesia.
-Furthermore, ZeBridge exposes a raw, standard protocol rather than requiring a proprietary SDK.
+By pushing all state, caching, and rate-limiting down into NATS/JS, the ZeBridge binary is stateless toward consumers.
+
+This is **not** a file transfer tool. Large blobs (>1 MB) is the domain of object storage.
+
+ZeBridge exposes a raw, standard protocol for NATS/JS rather than requiring a proprietary SDK. See [PROTOCOLE.md].
+
+**Performance**: this single threaded binary drained 2,000,000 CDC events in under 20 s end to end (PG → NATS) in the burst benchmark below — ~100k events/s including the time PostgreSQL itself needed to write them, and ~260k events/s while the WAL loop was actually busy. See [An example of a measured throughput](#an-example-of-a-measured-throughput) for the method, and run it yourself before trusting it.
+
+**Status**: Dev stage, draft notes.
+
+## Table of Contents
+
+* [Architecture](#architecture)
+* [How ZeBridge compares](#how-zebridge-compares)
+* [Understanding the app](#understanding-the-app)
+  * [The PG roles](#the-pg-roles)
+  * [The NATS streams and buckets](#the-nats-streams-and-buckets)
+  * [The memory setting](#the-memory-setting)
+  * [How to start an instance](#how-to-start-an-instance)
+* [Design overview](#design-overview)
+  * [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages)
+  * [Snapshots](#snapshots)
+* [Local setup](#local-setup)
+* [Consumer Integration Guide](#consumer-integration-guide)
+* [Running the Bridge](#running-the-bridge)
+* [Message Formats](#message-formats)
+* [Monitoring & Telemetry](#monitoring--telemetry)
+* [Safety & Guarantees](#safety--guarantees)
+* [Architecture](#architecture)
+* [Build Instructions](#build-instructions)
+* [Configuration](#configuration)
+
+---
+
+## Architecture
+
+We use `NATS/JetStream` to solve the problem of distributing `PostgreSQL`'s logical replication and snapshot tables.
+Both solve the hard problems: ordering, durability, idempotency.
+
+Zebridge connects PG ↔ NATS and stays as stateless as possible.
+
+NATS/JS holds the state, and a consumer - any connected client to NATS/JS - just needs to handle a state machine.
+NATS have 40+ clients, so instead of an SDK, we propose a  [PROTOCOLE.md](#protocole.md). It details the workflows to be used to connect consumers to the NATS server to use the local-first synced database.
+
+**Worked examples** can be found in [PROTOCOLE.md](#protocole.md) for Flutter (_TODO_), webapps (WASM-SQLite + OPFS), backend microservice in Node, Python & Elixir (all _TODO_).
+
+```mermaid
+flowchart TD
+    subgraph VPS["VPS / Private Network"]
+        PG[("PostgreSQL <br> Master")]
+        subgraph Localhost ["VPS - Localhost"]
+          Bridge["ZeBridge <br> daemon"]
+          NATS[("NATS <br> JetStream")]
+        end
+        
+        Bridge -- Prometheus --> Grafana["Grafana <br> dashboard"]
+        NATS -- Prometheus --> Grafana
+
+        PG -- "SSL (opt)" --> Bridge
+        Bridge -- "SSL (opt)" --> PG
+        Bridge <--> |"TCP (Plain)" <br> only| NATS
+    end
+
+    NATS <--> |"TLS / WSS"| Consumers
+
+
+    subgraph Consumers["Consumers"]
+        NativeApp["Native App"]
+        WebApp["WebApp"]
+        Worker["Microservice"]
+        NativeApp <--> Local_DB[("Local<br> SQLite <br> PGLite <br> PostgreSQL")]
+        WebApp <--> Local_DB
+        Worker <--> Local_DB
+    end
+```
+
+Current **v 0.1.14**: uses PostgreSQL 14+, with `NATS` 2.14+ and `Zebridge` on localhost only (communicate via **TCP only**).
+
+**Roadmap**:
+
+* [ ] **v 0.1.16**: Separate READ [CDC+bootstrap] on a **standby replica** (PG ≧ 16, shared WAL stream), from WRITE on **master** and enable async snapshotting on the replica.
+* [ ] **v 1.0**: Remove the colocation constraint with `Zebridge` ← TLS → `NATS`.
 
 ## How ZeBridge compares
 
@@ -24,7 +100,7 @@ ZeBridge differs significantly from established tools:
 **[PowerSync](https://github.com/powersync-ja)**
 
 * **What it is:** PowerSync elegantly solves the "Postgres to local SQLite" problem for offline-first apps and features a robust bucketing system.
-* **The ZeBridge Difference:** PowerSync requires a stateful backend sync engine. ZeBridge is radically **stateless and pure**.
+* **The ZeBridge Difference:** PowerSync requires a stateful backend sync engine. ZeBridge does not require a companion state.
 
 **[Debezium](https://github.com/debezium/debezium)**
 
@@ -41,95 +117,28 @@ ZeBridge differs significantly from established tools:
 * **What it is:** A high-performance stream processor that connects almost any source to any sink with on-the-fly transformations.
 * **The ZeBridge Difference:** While you could theoretically wire up a CDC pipeline using Bento, you would have to invent the entire edge-sync protocol, snapshot logic, and schema transition management yourself.
 
-## Architecture
+## Understanding the app
 
-**Status**: Dev stage, beaking changes, draft notes.
+ZeBridge is designed as a companion to the NATS/JS broker to enable Local-first sync of a Postgres database.
 
-**v 0.1.14**: Uses PostgreSQL 14+, with `NATS` and `Zebridge` communicate via **TCP only**, on localhost.
+### The PG roles
 
-```mermaid
-flowchart TD
-    subgraph VPS["VPS / Private Network"]
-        PG[("PostgreSQL <br> Master")]
-        subgraph Localhost ["VPS - Localhost"]
-          Bridge["ZeBridge <br> daemon"]
-          NATS[("NATS <br> JetStream")]
-        end
-        
-        Bridge -- Prometheus --> Grafana["Grafana <br> dashboard"]
-        NATS -- Prometheus --> Grafana
+The DBA is responsible onfigured to emit CDCs, to migrate the PUBLICATION for the desired tables, the roles and triggers needed by a Zebridge instance.
 
-        PG -- "SSL (opt)" --> Bridge
-        Bridge -- "SSL (opt)" --> PG
-        Bridge <--> |"TCP (Plain)"| NATS
-    end
+**Two Postgres roles required by ZeBridge**:
 
-    NATS <--> |"TLS TCP / WSS / HTTPS"| Consumers
+* `bridge_reader` for the read path (SELECT + REPLICATION, no writes possible),
+* `bridge_writer` for the write path (_no table privileges_, or a per-table minimum),
+* and authenticated principals above that for row-level access.
 
+### The NATS streams and buckets
 
-    subgraph Consumers["Consumers & Clients"]
-        App["Native App <br> WebApp"]
-        Server_Worker["Microservice"]
-        App <--> Local_DB[("Local<br> WASM-SQLite <br> PGLite <br> PostgreSQL <br> SQLite")]
-        Server_Worker <--> Local_DB
-    end
-```
+ZeBridge uses the NKEY protocole to join the NATS server.
 
-**Roadmap**:
+Zebridge uses three streams and two KV buckets that enables the bidirectional communication flow ZeBridge ← NATS → consumer. The naming is **shared** and declared in [topology.json].
 
-* **v 0.1.16**: READ [CDC+bootstrap] on a **standby replica** (PG ≧ 16, shared WAL stream), WRITE on **master**.
-* **v 1.0**: `Zebridge` <- TLS -> `NATS` (remove the localhost constraint).
-
-## Table of Contents
-
-* [Overview](#overview)
-* [Prerequisites](#prerequisites)
-* [Consumer Integration Guide](#consumer-integration-guide)
-* [Running the Bridge](#running-the-bridge)
-* [Message Formats](#message-formats)
-* [Monitoring & Telemetry](#monitoring--telemetry)
-* [Safety & Guarantees](#safety--guarantees)
-* [Architecture](#architecture)
-* [Comparison to Alternatives](#comparison-to-alternatives)
-* [Build Instructions](#build-instructions)
-* [Configuration](#configuration)
-
----
-
-## Overview
-
-We use `NATS/JetStream` to solve the problem of distributing `PostgreSQL`'s logical replication.
-Both solve the hard problems: ordering, durability, idempotency.
-The bridge just connects them correctly and stays dumb, as stateless as possible. NATS holds the state, and the consumer just needs to handle a state machine based on NATS.
-
-NATS have 40+ clients, so instead of an SDK, we propose a guide with the workflows and naming to be used to connect Clients to the NATS server to use the local-first synced database.
-
-Worked examples can be found for webapps (WASM-SQLite + OPFS), backend micrservice Elixir & Python, Flutter
-
-### Setup
-
-The DBA is responsible to migrate the PUBLICATION for the desired tables, the roles and triggers needed by a Zebridge instance.
-
-Zebridge uses two separate _Read_ and _Write_ limited roles for the bidirectional flows between a Consumer facing NATS and the bridge.
-Zebridge uses three streams and two KV buckets that enables the bidirectional communication flow Zebridge <-- NATS --> Consumer. The naming is **shared** and compiled.
-
-A Zebridge instance currently sits on the **same** localhost than the `NATS` server and is characterized by:
-
-* a unique `slot`,
-* a unique `port`
-* the _topology.json_  config (naming fo the shared streams and bucket) which is also used by NATS
-* an NKEY seed corresponding to the public NKEY passed to the NATS server
-* the different paths DATABASE_URL, NATS_URL.. to connect to PostgreSQL
-
-One instance is run with the command:
-
-```sh
-NATS_NKEY_SEED=SU... \
-NATS_URL=nats://127.0.0.1:4222 \
-DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:55432/postgres \
-DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:55432/postgres \
-./bridge --slot my_slot --pub my_pub --port 9090 --top topology.json
-```
+A ZeBridge instance is started with one config.
+The DBA starts the NATS server  with one config, but he can adjust the NATS server's streams and buckets catalogue on the fly. He uses the same NKEY protocole as ZeBridge.
 
 **Three data flow**:
 
@@ -146,11 +155,71 @@ DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:
 Streams have defined retention policies. The snapshot request is protected by maximum demand on 1 during `SNAP_RET`.
 The consumer will uses these streams to interact with the  NATS state (the names are defined in _topolgy.json_).
 
-**Two Postgres roles**:
+### The memory setting
 
-* `bridge_reader` for the read path (SELECT + REPLICATION, no writes possible),
-* `bridge_writer` for the write path (_no table privileges_, or a per-table minimum),
-* and authenticated principals above that for row-level access.
+NATS comes with a `max_payload=1M` default.
+
+**Snapshot**: Zebridge will suspend a table whose rows are wider than the NATS message limit (<1 MB). The NATS cap also means a consumer cannot push a large row to NATS. Above this limit, we are in the domain of Object storage for large blobs, and URLs should be saved in the database instead.
+
+**CDC**: Zebridge is designed to be fast, with a **fixed memory** which caps the event size, suspends a table and drives the total memory used.  
+> Total Memory = 2 x
+> (`BASE_BUF` = size/row, 16kB default ) x
+> (`RING_BUFFER_COUNT` = nb_slots, default 8184 )
+
+Zebridge  suspends a table when events size are larger than $2^{\mathtt{BASE\_BUF}}$ which itself is capped at `BASE_BUF=20` (1MB). This matches `max_payload=1M` used by NATS.
+
+The `RING_BUFFER_COUNT` is designed to buffer the received events during a NATS restart ~1s. Its count depends naturally upon the emitting rate.
+
+**Examples**: if you expect to follow a table(s) with row size below 100 KB with say 500 evt/s, increase to `BASE_BUF=17` (136 KB per row) and buffer less `RING_BUFFER_COUNT=1000` (total mem footprint: ~ 262 MB).
+If you expect a table(s) with smaller rows  < 1 KB/row which emits 50k evt/s, decrease `BASE_BUF=10` (1kB) and increase the ring size to `RING_BUFFER_COUNT=60000` (mem footprint: ~ 130 MB).
+
+Ceiling is NATS/JS, the host capactiy, not ZeBridge.
+❇️ Read [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count)
+
+❇️ Read [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages)
+
+### How to start an instance
+
+```txt
+One bridge instance 
+= one replication slot 
+= sequential processing
+```
+
+Once:
+
+* Postgres has played the needed migrations and has a PUBLICATION and confiured with WAL enabled,
+* NATS configured with the streams and buckets,
+
+the ZeBridge can be started with the following settings:
+
+* a fixed memory buffer definition: `BASE_BUF` (default 2^14=16KB) and `RING_BUFFER_COUNT` (default 65565) adjusted depending upon the tables the instance is supposed to handle. Remember the memory footprint: $$2^{\mathtt{BASE\_BUF}} \times \small{\text{RING\_BUFFER\_COUNT}}$$
+* a unique `--slot` (the unique pointer to the WAL that PostgreSQL keeps for this PUBLICATION). If you have several instances running, each has its own `SLOT`.
+* a unique `--port` (for the instance, for the telemetry, served by a webserver). If you have several instances running, each has its own `PORT`,
+* the `--top` config, defaults to _topology.json_ (_./topology.json_), shared naming of streams and bucket between ZeBridge, NATS and consumers,
+* the mandatory private seed `NATS_NKEY_SEED` env var corresponding to the public NKEY passed to the NATS server,
+* the different paths DATABASE_URL, DATABASE_WRITER_URL, NATS_URL to connect to PostgreSQL and to NATS.
+
+For example, one instance using the declared PUBLICATION 'my_pub' - created by the DBA -  with (unique) slot named 'my_slot' is run with the command:
+
+```sh
+# has defaults
+BASE_BUF=10 \                     # <- default 14
+RING_BUFFER_COUNT=4092 \          #<-- default 16K
+NATS_URL=nats://127.0.0.1:4222 \  #<-- default value
+PORT=9090 \                       #<-- default port
+# ⚠️ mandatory -->
+NATS_NKEY_SEED=SU... \            
+DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:55432/postgres \
+DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:55432/postgres \
+./bridge --slot my_slot --pub my_pub --top topology.json
+```
+
+❌ Refuse startup on checks:
+
+> TODO: #1 system_memory > 2^(BASE-1) x RING
+
+> TODO: #2 BASE_BUF < MAX_BASE_BUF==max_payload (nats.conf)
 
 **Principal authentication** (the user of a Consumer app):
 
@@ -161,11 +230,13 @@ The principal is authenticated at the Consumer level, and used in the JWT/Operat
 | read-only consumer  | cdc.>, init.>, KV.schemas.>, KV.snapshots.> | snapshot.request.>       | no |
 | read-write consumer | the same | + mutation.<principal>.> | yes |
 
+## Design overview
+
 **Key features of the bridge**:
 
 * It streams PostgreSQL _proto-v1_ changes using logical replication (`pgoutput` binary format)
 * Publishes schemas from the catalogue to NATS KV store on startup,
-* Generates table snapshots on-demand (10K row chunks) via NATS requests,
+* Generates table snapshots on-demand, chunked by **bytes** to fit one NATS message (10 000 rows is only a ceiling), via NATS requests,
 * Triggers message to NATS on schema change via Postgres DDL event triggers,
 * schemas are available in two formats: PostgreSQL(eg for PQLite) and SQLite,
 * MessagePack default encoding or JSON available with `--json`,
@@ -178,19 +249,9 @@ The principal is authenticated at the Consumer level, and used in the JWT/Operat
 * `REPLICA IDENTITY DEFAULT | FULL`. Preflight warning. Use only tables with _single column primary key ID_ (no single column PK + DEFAULT => PG error on UPDATE). Solution: run a migration to set a unique column PK ID => `DELETE id='42'`,
 * No SDK but a _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
 
-* Single-Threaded per Bridge. The rationale is:
-PostgreSQL WAL is inherently sequential. Simpler LSN acknowledgment logic. To a slot can be attached one or several tables. Scale horizontally (multiple bridges) instead of vertically
-
-```txt
-One bridge instance 
-= one replication slot 
-= sequential processing
-```
-
-* Horizontal scaling. The PostgreSQL admin creates the publication and scope (_pub_name_ for which tables). Run multiple bridge instances with different replication slots - limited
-to `max_replication_slots=XX` in master config - and reach PostgreSQL instances.
+* Single-Threaded per Bridge. The rationale is PostgreSQL WAL is inherently sequential. Simpler LSN acknowledgment logic. To a slot can be attached one or several tables.
+* ➡️ Scale horizontally (multiple bridges) instead of vertically. The PostgreSQL admin creates the publication and scope (_pub_name_ for which tables). Run multiple bridge instances with different replication slots - limited to `max_replication_slots=XX` in master config - and reach PostgreSQL instances.
 You can divide the workload per PostgreSQL instance, and attach bridge instances to differents scopes (specific tables). Each bridge instance can scale its builtin buffer taylored to the needs of the table(s) with `BASE_BUF` and `RING_BUFFER_COUNT`.
-A bridge is connected by default to the NATS server (which also clusters).
 
 ```bash
 # Bridge 1: table "users" with publication "my_pub_1" on master
@@ -206,7 +267,7 @@ DATABASE_URL=postgres://bridge_reader:pw@replica_1:5432/postgres \
 
 * Use flag `--json` to receive a JSON format. Slightly larger payload size and slower encoding/decoding.
 
-### 3. Bridge ACK Flow
+### Bridge ACK Flow and NATS outages
 
 ```txt
 PostgreSQL WAL → Bridge → NATS JetStream
@@ -247,7 +308,7 @@ Multiple consumers can track independent positions
 JetStream retention policies prevent unbounded growth
 .
 
-### 5. Snapshots
+### Snapshots
 
 1. Bridge starts → publishes schemas to KV store immediately
 2. NATS pushes schemas when Consumer connects
@@ -258,7 +319,7 @@ Non-blocking (bridge continues CDC while snapshotting)
 
 ---
 
-## Prerequisites
+## Local setup
 
 ### PostgreSQL Setup (by admin/DBA Task eg `postgres` user)
 
@@ -399,7 +460,7 @@ accounts {
 
 See `docker-compose.yml` for a complete Docker setup with PostgreSQL + NATS.
 
-#### 5. configure Authnetication NATS <-> Consumer
+#### 5. configure Authentication NATS ↔ Consumer
 
 Prefer the JWT mechanism. Transport over TLS/WSS.
 The flow: [TODO]
@@ -446,36 +507,93 @@ Source: `topology.json`
   _(e.g., `mutation.test_types.update`)_
 * **Client Action:** The client publishes its local edge changes to this stream for the backend to ingest and resolve.
 
-## Bootstrap Flow (First-Time Setup)
+## Writing a consumer — the short version
 
-```txt
-1. Consumer starts
-2. Fetches schemas from NATS KV store
-   GET kv://schemas/{table_name} → MessagePack schema
-3. Checks if local DB needs bootstrap
-4. If yes, publishes snapshot request
-   PUBLISH snapshot.request.{table_name} (empty payload)
-5. Bridge snapshot_listener receives request
-6. Bridge generates snapshot in 10K row chunks
-   → Publishes to init.snap.{table}.{snapshot_id}.{chunk}
-7. Consumer receives chunks, reconstructs table
-8. Consumer receives metadata on init.meta.{table}
-9. Consumer subscribes to CDC stream for real-time updates
+`PROTOCOL.md` is the contract; this is the shape of it. Four things, in order.
+
+### 1. Schemas arrive by subscription, not by asking
+
+Watch the `schemas` KV bucket. The bridge writes every monitored table's schema at startup
+and again on each DDL event, so the bucket is already current when you connect — a fresh
+watch replays it. Create or migrate your local tables from what arrives; you never poll.
+
+### 2. Decide whether you need a snapshot — using `seq`, not `lsn`
+
+Persist **two** positions, because they are in different coordinate systems:
+
+| stored | compared against | answers |
+| --- | --- | --- |
+| `seq` — JetStream stream sequence | the CDC stream's `state.first_seq` | _has the history I need fallen off the back of the stream?_ |
+| `lsn` — PostgreSQL WAL position | a snapshot's `lsn`, per event | _have I already got this row?_ |
+
+```js
+const firstSeq = (await jsm.streams.info('CDC')).state.first_seq;
+if (mySeq === 0 || (firstSeq > 0 && mySeq < firstSeq - 1)) {
+  // fresh client, or my position expired → snapshot required
+}
 ```
 
-## Implementation Examples
+`first_seq` is JetStream's numbering, your LSN is PostgreSQL's; **there is no conversion
+between them**, so the "did I fall behind?" question has to be asked in the stream's own
+coordinates. (`- 1`, not `firstSeq`: if the oldest held is 100 and you hold 99, the next
+message you need is 100 and it is still there.)
 
-### Microservice (Elixir + Postgres)
+### 3. If you need one: request, replay, then dedup by `lsn`
 
-### Microservice (Go + SQLite)
+`PUBLISH snapshot.request.<table>` with an empty payload — the table is in the subject.
+Then read the descriptor from the `snapshots` KV bucket and pull
+`init.snap.<table>.<snapshot_id>.>`. Two things to know:
 
-### Pur wewbapp (client only + WASM-SQLite)
+* **One request per table per window.** The broker enforces it: a second request inside
+  `SNAP_RET` is rejected with `503 … maximum messages per subject exceeded`. That is not an
+  error to retry through — check the KV descriptor first and seed from the existing snapshot.
+* **Snapshots are served one at a time**, so a request for a small table can wait behind a
+  large one.
 
-### Mobile (Flutter)
+After replaying a snapshot taken at LSN X, set the table's `lsn = X` and **discard every CDC
+event with `event.lsn <= X`** — those rows are already in what you just seeded.
+
+### 4. Follow CDC, and gate on columns
+
+Resume the CDC consumer from your stored `seq`. Apply rows whose columns you know; **hold**
+a row that carries a column your local table lacks until a newer schema arrives (§5 of
+`PROTOCOL.md`). Gate on the _column set_, never on the LSN — most rows legitimately carry an
+LSN newer than the last DDL, so an LSN gate stalls forever during quiet periods.
+
+### Writing back (ingress)
+
+Publish to `mutation.<principal>.<table>.<operation>`. Three things make this different from
+a normal API call:
+
+* **The principal is a subject token, not a payload field.** NATS authorises subjects, so a
+  client granted `publish: ["mutation.alice.>"]` physically cannot write as anyone else. A
+  `user_id` in the body would just be a claim.
+* **Last write wins on a version column** — usually `updated_at`. Send the value you hold;
+  the bridge applies the row only if yours is newer. A stale write is _rejected, silently by
+  design_ — which is why §7.2's type table matters: a `timestamp` without time zone, or one
+  with second precision, makes "newer" ambiguous and drops real edits.
+* **Your write comes back as CDC**, like anyone else's. That echo is the confirmation.
+
+⚠️ A mutation larger than the server's `max_payload` is rejected by NATS client-side, so the
+write path is capped by construction — but the bridge's own per-event buffer (`BASE_BUF`,
+16 KB by default) is _smaller_ than that ceiling. A 500 KB row can be accepted by Postgres
+and then suspend the table when the CDC echo does not fit. Match `BASE_BUF` to what you
+intend to write.
+
+### The flow, end to end
+
+```txt
+1. Consumer starts, watches kv://schemas/  → local tables created/migrated
+2. Compares stored seq against CDC first_seq
+3. Gap or fresh → PUBLISH snapshot.request.<table>   (one per table per window)
+4. Bridge serves requests sequentially, chunking by BYTES to fit one NATS message
+   → init.snap.<table>.<snapshot_id>.<chunk>
+5. Consumer replays chunks, sets table lsn = snapshot lsn
+6. Consumer follows cdc.<table>.<op>, discarding events with lsn <= snapshot lsn
+7. Consumer writes back on mutation.<principal>.<table>.<op>; the echo returns as CDC
+```
 
 ## Running the Bridge
-
-> [!NOTE] We hardcoded the stream names "CDC" and "INIT".
 
 The user of the bridge defines a `REPLICATION_SLOT` with the flag `--slot my_slot`. The bridge will create it.
 
@@ -540,19 +658,20 @@ BRIDGE_PORT=9090          # HTTP telemetry, when --port is absent
 
 #### Deployment requirement: the bridge sits with NATS
 
-**v1.0 requires the bridge and `nats-server` on the same host**, reached over loopback.
-The vendored pure-Zig NATS client has no TLS, so a bridge→NATS hop across a network
-would be plaintext; colocating removes the link rather than leaving it exposed.
-`NATS_URL` accepts only `nats://` and rejects `tls://` for the same reason — a URL
-promising transport security the client cannot provide is worse than a refusal.
+**v0.14** requires the bridge and `nats-server` on the same host, reached over loopback.
 
-This constrains only that one hop. Clients still reach the broker from anywhere over its
-websocket port, and **Postgres may be remote**: `DATABASE_URL` carries `sslmode` in its
-query string and libpq does the work (untested as of 2026-08-16 — see
-`COPY_BINARY_PLAN.md`).
+The vendored pure-Zig NATS client has no TLS, so a bridge→NATS hop across a network is plaintext; colocating removes the link rather than leaving it exposed.
 
-Lifting the constraint is v1.1: migrating to `nats-io/nats.zig`, which has
-server-authenticated TLS and native nkey auth. Costed in `COPY_BINARY_PLAN.md`.
+`NATS_URL` accepts only `nats://` and rejects `tls://` for the same reason — a URL promising transport security the client cannot provide is worse than a refusal.
+
+This constrains only that one hop. Clients still reach the broker from anywhere over its websocket port, and **Postgres may be remote**: `DATABASE_URL` carries `sslmode` in its query string and libpq does the work (untested as of 2026-08-16 — see `COPY_BINARY_PLAN.md`).
+
+Lifting the constraint is **v1.0**: migrating to `nats-io/nats.zig`, which has
+server-authenticated TLS and native nkey auth.
+
+The minor version tracks the **PostgreSQL floor**: `v0.14` needs PG 14+ (where `pgoutput`'s
+binary mode begins), `v0.16` needs PG 16+ (where logical decoding on a standby begins), and
+`v1.0` is the NATS client swap. See `COPY_BINARY_PLAN.md` for what each buys.
 
 #### Two families of credentials, two files
 
@@ -663,7 +782,11 @@ Published after all chunks. Tells consumer how many chunks to expect.
 
 ### Snapshot Chunk (INIT Stream: `init.snap.{table}.{snapshot_id}.{chunk}`)
 
-10,000 rows per chunk (configurable in `config.zig`).
+Chunked by **bytes**, not rows: the bridge asks Postgres for the longest prefix of rows
+whose cumulative size fits one NATS message (`max_payload` minus envelope). `chunk_size`
+in `config.zig` is only a row _ceiling_ — a narrow table hits it, a table of 256 KiB rows
+gets three rows a chunk. A row too large to publish at all suspends the table rather than
+being split.
 
 ```json
 {
@@ -685,7 +808,7 @@ Published after all chunks. Tells consumer how many chunks to expect.
       "email": "user3002@example.com",
       "created_at": "2025-12-08 13:45:22.123456+00"
     }
-    // ... up to 10,000 rows
+    // ... as many rows as fit one message
   ]
 }
 ```
@@ -1144,14 +1267,47 @@ ZeBridge uses a **NATS JetStream Limits Retention** policy (`--max-age=1m`, `--m
 
 ## Architecture
 
-### Thread Model (6 Threads)
+### Thread Model (8 threads)
 
-1. **Main thread**: Consumes PostgreSQL CDC, parses pgoutput format
-2. **Batch publisher thread**: Batches events, encodes MessagePack, publishes to NATS CDC stream
-3. **WAL monitor thread**: Tracks replication slot lag every 30 seconds
-4. **HTTP telemetry thread**: Serves `/metrics`, `/health`, `/status`, `/shutdown`
-5. **Snapshot listener thread**: Subscribes to `snapshot.request.>`, generates snapshots on-demand
-6. **Mutation thread**: Subscribes to `mutation.>`, receives pushes of new messages
+Every one is spawned once at startup and lives until shutdown. Nothing is spawned per
+request, per table or per connection.
+
+| # | thread | spawned at | does |
+| --- | --- | --- | --- |
+| 1 | **Main** | — | consumes the WAL stream, parses pgoutput, packs rows into the ring buffer. `EventProcessor` runs _inline_ here, so "the CDC path" and "the main thread" are the same thread |
+| 2 | **Batch publisher** | `batch_publisher.zig:534` | drains the ring buffer, encodes MessagePack, publishes to the `CDC` stream |
+| 3 | **WAL monitor** | `wal_monitor.zig:50` | replication-slot lag, every 30 s |
+| 4 | **HTTP telemetry** | `http_server.zig:49` | `/metrics`, `/health`, `/status`, `/shutdown`. Accepts and serves inline — no thread per connection |
+| 5 | **Snapshot supervisor** | `snapshot_listener.zig:710` | spawns 6 and 7, then sleeps until shutdown and joins them. Does no work of its own |
+| 6 | **Schema requests** | `snapshot_listener.zig:731` | answers `init.schema` on its own connection, so a schema request never queues behind a multi-minute `COPY` |
+| 7 | **Snapshot requests** | `snapshot_listener.zig:745` | consumes `snapshot.request.>` and generates snapshots **inline** — one at a time, in arrival order |
+| 8 | **Mutation listener** | `mutation_listener.zig:137` | consumes `mutation.>`, applies writes under the ingress role. Only started when `DATABASE_WRITER_URL` is set |
+
+Two things this table is meant to stop people assuming:
+
+* **Snapshots are not concurrent.** Thread 7 calls `generateIncrementalSnapshot` inline, so
+  a large table blocks every other table's request behind it in the stream. Requests are
+  durable so nothing is lost, and the ack happens on receipt rather than on completion —
+  but a small table waits for a big one. (`Config.Snapshot.max_concurrent_snapshots`
+  states an intent that was never built; it is read by nothing.)
+* **Preflight is not a thread.** It is an inline call in `main` (`bridge.zig:377`) that runs
+  _before_ threads 5–8 exist, which is why it can write the refusal registry without
+  synchronising with anyone.
+
+#### Who touches the refusal registry
+
+`refused_tables.Registry` is shared by the CDC, snapshot and schema paths — one table must
+not be refused by one and served by another. Three roles reach it:
+
+| | role |
+| --- | --- |
+| main thread (1) | writes (DDL path) **and** reads (`shouldDrop` per event) |
+| snapshot requests (7) | writes (a row too wide to publish) **and** reads (rejects requests) |
+| HTTP telemetry (4) | reads only, for `/metrics` and `/status` |
+
+Two concurrent _writers_ and a concurrent _reader_ is why the registry is an append-only
+array with atomic publication rather than a hash map with a lock — see the header of
+`src/refused_tables.zig`.
 
 ### Practical Performance of SPSC
 
@@ -1342,10 +1498,11 @@ All configuration constants are centralized in `src/config.zig` and `topology.js
 
 See `src/config.zig` for all tunables.
 
-### Sizing `BASE_BUF` and `RING_BUFFER_COUNT` ⚠️ read this one
+### Sizing `BASE_BUF` and `RING_BUFFER_COUNT`
 
-These two are not independent, and getting them wrong has a visible consequence rather
-than a silent one. The bridge pre-allocates one fixed-size buffer per event slot:
+⚠️ read this one
+
+These two are not independent, and getting them wrong has a visible consequence rather than a silent one. The bridge pre-allocates one fixed-size buffer per event slot:
 
 ```txt
 data slab = 2^BASE_BUF  ×  RING_BUFFER_COUNT
@@ -1361,11 +1518,35 @@ Each one answers a different question:
 
 * **`BASE_BUF`** (log2 bytes, range 10–20) is _how large a single row may be_. Size it
   to your widest row: a `jsonb` document, a long `text` column, a big array.
-* **`RING_BUFFER_COUNT`** (range 1024–1048576) is _how many events can queue while NATS
-  is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip
-  starts back-pressuring the WAL reader sooner.
+* **`RING_BUFFER_COUNT`** (range 1024–1048576) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
 
 Raising one and lowering the other keeps memory flat, at the cost of outage tolerance.
+
+#### Two things checked at startup, before a byte is allocated
+
+Both failures are silent and late if left to runtime, so the bridge refuses to start:
+
+| check | refuses when | why not a warning |
+| --- | --- | --- |
+| **slab vs memory** | `2^BASE_BUF × RING_BUFFER_COUNT` exceeds half the process's memory limit | the slab is pre-allocated, so the alternative is an OOM kill under load. In a container the **cgroup limit** is read, not the host's RAM — otherwise a 1 GB slab looks fine on a 64 GB host until the 512 MB cgroup kills it |
+| **`BASE_BUF` vs `max_payload`** | `2^BASE_BUF + envelope` exceeds what the NATS server advertises | a row that size packs successfully and is then **rejected at publish time**, with nothing in the data path saying why. That is not a tuning choice, it is a configuration that cannot work |
+
+```txt
+🔴 The event slab would be 65536 MB (BASE_BUF=20 → 1024 KB × RING_BUFFER_COUNT=65536),
+   against a 16384 MB memory limit. … Halve RING_BUFFER_COUNT for each step you raise
+   BASE_BUF.
+
+🔴 BASE_BUF=20 allows a 1024 KB row, but this NATS server accepts at most 1024 KB per
+   message and the envelope needs roughly 16 KB more. … Lower BASE_BUF to 19 or raise
+   max_payload in nats-server.conf.
+```
+
+On a healthy start you get the same arithmetic as a fact rather than a complaint:
+
+```txt
+NATS max_payload: 1024 KB (server-advertised); per-event buffer: 16 KB (BASE_BUF=14)
+Event slab: 1024 MB of a 16384 MB limit (6%)
+```
 
 #### What happens when a row does not fit
 
@@ -1377,31 +1558,23 @@ The table is **suspended**, and you will see this in the log:
 ```
 
 What this does **not** do is stop the bridge. Every other table keeps replicating,
-`bridge_refused_tables` rises, and clients of that one table receive a suspension on
-`$KV.schemas.<table>` (`"reason": "row_too_large"`) telling them their copy is frozen at
-a known LSN. Restart with a `BASE_BUF` that fits and the table resumes; its clients
+`bridge_refused_tables` rises, and clients of that one table receive a suspension on `$KV.schemas.<table>` (`"reason": "row_too_large"`) telling them their copy is frozen at a known LSN.
+➡️ Restart with a `BASE_BUF` that fits and the table resumes; its clients
 re-seed from a fresh snapshot.
 
-⚠️ **This is why the metrics endpoint matters.** The event that overflows may arrive
-years after deployment — someone pastes a large JSON document into a text column — so
-this is not something you can verify once at install time. Alert on
-`bridge_refused_tables > 0` (Prometheus) or on `SUSPENDING` in the logs (Loki).
+⚠️ **This is why the metrics endpoint matters.** The event that overflows may arrive years after deployment — someone pastes a large JSON document into a text column — so this is not something you can verify once at install time.
+🔔 Alert on `bridge_refused_tables > 0` (Prometheus) or on `SUSPENDING` in the logs (Loki).
 
 #### The ceiling is NATS, not the bridge
 
-`BASE_BUF=20` is 1 MB, which is also **nats-server's default `max_payload`**. A message
-also carries a subject, headers and MessagePack framing, so a row sized right up to the
-limit is still rejected at publish time. The bridge reads the server's advertised
-`max_payload` from its INFO line at connect and tells you where you stand:
+`BASE_BUF=20` is 1 MB, which is also **nats-server's default `max_payload`**. A message also carries a subject, headers and MessagePack framing, so a row sized right up to the limit is still rejected at publish time. The bridge reads the server's advertised `max_payload` from its INFO line at connect and tells you where you stand:
 
 ```txt
 info(bridge): NATS max_payload: 1024 KB (server-advertised); per-event buffer: 16 KB (BASE_BUF=14)
 ```
 
-and warns if the two cannot coexist. Raising `max_payload` in `nats-server.conf` is
-possible but affects every client and every subject on that server, and JetStream's
-memory use scales with it — so for genuinely large values, prefer keeping the blob out
-of the replicated table and replicating a reference to it.
+and warns if the two cannot coexist.
+Raising `max_payload` in `nats-server.conf` is possible but affects every client and every subject on that server. JetStream's memory use scales with it — so for genuinely large values, prefer keeping the blob out of the replicated table and replicating a reference to it.
 
 ---
 
@@ -1420,21 +1593,15 @@ of the replicated table and replicating a reference to it.
 
 **System:**
 
-* [libpq](https://www.postgresql.org/docs/current/libpq.html) — dynamically linked, so
-  the distro's own CVE fixes apply
+* [libpq](https://www.postgresql.org/docs/current/libpq.html) — dynamically linked, so the distro's own CVE fixes apply
 
 ---
 
 ## Testing
 
-### Measured throughput
+### An example of a measured throughput
 
-⚠️ Every number here comes from one run on one laptop. It is published with its method
-so you can reproduce or refute it — an unmeasured benchmark figure is worse than none,
-which this project learned the hard way (a "~50k evt/s" line sat in this README for
-months while a quadratic bug in the WAL reader capped bursts at ~1.2k msg/s).
-
-**Method**
+**Method**:
 
 | | |
 | --- | --- |
@@ -1456,7 +1623,7 @@ for i in range(2000):
 docker exec -i postgres-primary psql -U postgres -q -f - < load.sql
 ```
 
-**Result**
+**Result**:
 
 ```txt
 LOOP iters=1407805 idle=10274 recv_ms=139 proc_ms=1494 cpu=31%
@@ -1475,13 +1642,11 @@ METRICS uptime=30 wal_messages=2004279 cdc_events=2000000 …
 | time decoding + packing (`proc_ms`) | 7.9% |
 | CPU while draining | **31% of one core** (`bridge_cpu_seconds_total` rose 7.6 s in total) |
 
-**This benchmark is producer-bound**: PostgreSQL needs 6 s to write what the bridge
-drains in 7.6 s of loop time, and the loop is idle ~72% of the first interval. The
+**This benchmark is producer-bound**: PostgreSQL needs 6 s to write what the bridge drains in 7.6 s of loop time, and the loop is idle ~72% of the first interval. The
 ceiling is higher than 260k; finding it needs a producer that is not the bottleneck.
 
 **What it does not measure**: wide rows, `jsonb`/array-heavy tables, `REPLICA IDENTITY
-FULL` (which doubles tuple volume), a remote PostgreSQL or NATS, consumers reading
-concurrently, or a NATS server under back-pressure. Each of those moves the number.
+FULL` (which doubles tuple volume), a remote PostgreSQL or NATS, consumers reading concurrently, or a NATS server under back-pressure. Each of those moves the number.
 
 **Reading the `LOOP` line.** It is emitted next to `METRICS` every 15 s and is what
 makes this diagnosable at all:

@@ -256,8 +256,28 @@ pub const Sync = struct {
 pub const Snapshot = struct {
     // Snapshot identifiers
 
-    /// Rows per snapshot chunk
+    /// **Ceiling** on rows per snapshot chunk, not the row count.
+    ///
+    /// The real limit is bytes: the chunk query asks Postgres for the longest prefix whose
+    /// cumulative row size fits one NATS message, and this only stops a table of tiny rows
+    /// from asking for a million of them at once. A chunk of 10 000 rows is what a narrow
+    /// table gets; a table of 256 KiB blobs gets three.
     pub const chunk_size = 10_000;
+
+    /// How full a chunk aims to be: 4/5 of the message budget.
+    ///
+    /// The row count is derived from the *average* row size, and a run of above-average
+    /// rows still has to fit. The running sum in the chunk query enforces the budget
+    /// exactly — this only decides how often the encoder has to re-encode a prefix, and
+    /// aiming at 100% would guarantee it.
+    pub const chunk_fill_num = 4;
+    pub const chunk_fill_den = 5;
+
+    /// Ceiling on the encode buffer, which is otherwise sized to the server's
+    /// `max_payload`. A NATS server advertising 8 MiB should not turn into an 8 MiB
+    /// resident buffer. One buffer exists at a time — snapshots run sequentially on a
+    /// single thread — so this is a ceiling on the bridge, not per request.
+    pub const encode_buffer_max_bytes = 2 * 1024 * 1024;
 
     // Snapshot freshness used to be a bridge-local cache (`SnapshotCache`), which
     // could not coordinate across bridge instances and died on restart. It is now the
@@ -265,7 +285,11 @@ pub const Snapshot = struct {
     // so the window is enforced by the broker for every client, and SNAP_RET_SECONDS
     // configures nats-init rather than the bridge.
 
-    /// Maximum concurrent snapshot requests
+    /// ⚠️ **Declared, never read.** Snapshots are not concurrent: `listenForSnapshotRequests`
+    /// calls `generateIncrementalSnapshot` inline, so requests are served strictly one at a
+    /// time in arrival order, and a large table blocks the queue behind it. Left here
+    /// because the number states an intent — a worker pool — that was never built. Delete
+    /// it or implement it, but do not read it as describing current behaviour.
     pub const max_concurrent_snapshots = 3;
 
     /// How long the broker waits for the snapshot worker's ack before redelivering.

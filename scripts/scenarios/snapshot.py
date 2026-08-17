@@ -10,12 +10,17 @@ This is what proves composite keyset pagination. A chunk boundary must be able t
 *inside* a run of equal leading-column values — paging on the first column alone would
 silently skip the rest of that run, and every row count would still look plausible.
 
-That only bites once there is more than one chunk, and the chunk size is compile-time
-(`config.zig: Snapshot.chunk_size`, 10_000). Below that the run is still worth having —
-it checks the descriptor, the framing and the ordering — but it is not exercising the
-boundary. Load more than 10k rows to make it do so.
+That only bites once there is more than one chunk, so pass a row count and the script
+seeds enough to force several. Chunks are capped by **bytes** as well as rows — the byte
+cap is the one that fires first on any realistic table — and each published chunk is
+checked against the server's `max_payload`, because exceeding it does not raise: the
+server closes the connection, every retry re-sends the identical payload, and the
+snapshot is lost.
 
-Usage:  python scripts/scenarios/snapshot.py [table]
+Usage:  python scripts/scenarios/snapshot.py [table] [seed_rows]
+
+  snapshot.py test_types           # whatever is already there
+  snapshot.py test_types 25000     # seed 25k first — forces ~3 chunks
 """
 
 import asyncio
@@ -27,6 +32,17 @@ from nats.js.api import ConsumerConfig, DeliverPolicy
 
 async def main():
     table = sys.argv[1] if len(sys.argv) > 1 else "test_types"
+    seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+    if seed:
+        # Idempotent, so re-running the probe does not multiply the table. Column names
+        # match the emitter's test_types migration; adjust for another table.
+        print(f"seeding {table} to {seed} rows...")
+        zb.psql(
+            f"INSERT INTO public.{table} (id, some_text, inserted_at, updated_at) "
+            f"SELECT i, 'r'||i, now(), now() FROM generate_series(1,{seed}) i "
+            "ON CONFLICT DO NOTHING"
+        )
 
     pk = zb.psql(
         "SELECT a.attname FROM pg_index i "
@@ -87,7 +103,8 @@ async def main():
     ).splitlines()
     pk_idx = [columns.index(c) for c in pk]
 
-    rows, chunks = [], 0
+    max_payload = nc.max_payload
+    rows, chunks, sizes = [], 0, []
     while True:
         try:
             batch = await sub.fetch(100, timeout=2)
@@ -97,6 +114,7 @@ async def main():
             break
         for msg in batch:
             chunks += 1
+            sizes.append(len(msg.data))
             decoded = zb.decode(msg.data)
             if isinstance(decoded, list):
                 rows.extend(decoded)
@@ -113,7 +131,23 @@ async def main():
     ]
 
     print(f"\n{chunks} chunk(s), {len(rows)} rows, {len(set(keys))} distinct keys")
+    if sizes:
+        print(f"  chunk bytes: {', '.join(f'{n:,}' for n in sizes)}  (max_payload {max_payload:,})")
+
     failed = 0
+    over = [n for n in sizes if n > max_payload]
+    if over:
+        # Not a soft limit: the server closes the connection on an oversized message, and
+        # the publisher's retries re-send the same bytes and get closed again.
+        zb.bad(f"{len(over)} chunk(s) exceed max_payload — the server would close the connection")
+        failed = 1
+    elif sizes:
+        zb.ok(f"every chunk fits max_payload (largest {max(sizes):,})")
+
+    if chunks > 1:
+        zb.ok(f"{chunks} chunks — pagination crossed a real chunk boundary")
+    elif len(rows) > 0:
+        print("  ⓘ  single chunk: the boundary was not exercised. Pass a larger seed count.")
     if len(set(keys)) != len(keys):
         zb.bad("duplicate keys — pagination replayed a boundary")
         failed = 1

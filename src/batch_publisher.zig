@@ -155,6 +155,28 @@ const MAX_EVENT_DATA_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 
 /// A single CDC event to be batched
 /// Zero-allocation design: all data stored in packed inline buffers
+/// What one event will occupy in a published batch.
+///
+/// ⚠️ Extracted and tested because the version that lived inline in `flushLoop` was
+/// **wrong for eighteen months of row shapes and nothing noticed**: it summed
+/// `table_len + operation_len + subject_len` — the metadata — and omitted `data_len`, the
+/// row itself. On a table with an 11 KB jsonb column that is ~29 bytes against ~11 000,
+/// so the batch's byte budget was never reached and batches ran to `max_events` instead:
+/// 5 000 events in one 55 MB message against a 1 MiB server limit. Every publish was
+/// refused, every retry re-sent the same bytes, and the events counter still climbed.
+///
+/// The lesson is the same one the snapshot path learned: **a size cap must measure the
+/// thing it caps**, and arithmetic buried in a loop is arithmetic nobody can test.
+pub fn wireSize(event: *const CDCEvent) usize {
+    return event.data_len + event.table_len + event.operation_len +
+        event.subject_len + per_event_envelope_bytes;
+}
+
+/// Per-event overhead beyond the packed column data: the MessagePack map framing, the
+/// column-name keys, and the batch array entry. Deliberately generous — over-estimating
+/// costs a slightly emptier batch, under-estimating costs a message the server refuses.
+pub const per_event_envelope_bytes: usize = 256;
+
 pub const CDCEvent = struct {
     // Fixed-size buffers for metadata (inline storage, no heap allocation)
     subject_buf: [128]u8 = undefined,
@@ -632,7 +654,7 @@ pub const BatchPublisher = struct {
 
         // Persistent batch that accumulates slot indices across iterations
         var batch: std.ArrayList(usize) = .empty;
-        var current_payload_size: usize = 0; // Track approximate payload size
+        var current_payload_size: usize = 0; // Bytes this batch will occupy on the wire
         defer {
             // Return slot indices to free queue on thread exit
             for (batch.items) |slot_idx| {
@@ -652,9 +674,7 @@ pub const BatchPublisher = struct {
                 const slot_idx = self.pending_events.pop() orelse break;
 
                 const event = &self.events[slot_idx];
-                // Approximate payload size (table + operation + subject strings)
-                const event_size = event.table_len + event.operation_len + event.subject_len;
-
+                const event_size = wireSize(event);
                 addToBatch(&batch, slot_idx, self.allocator) catch |err| {
                     log.err("⚠️ Failed to append to batch: {}", .{err});
                     // Return slot to free queue on error
@@ -1017,6 +1037,19 @@ pub const BatchPublisher = struct {
             try self.publisher.publish(batch_subject, &headers, encoded);
             const publish_elapsed = utils.getMilliTimestamp() - publish_start;
 
+            // Counted **here**, on a publish the server acknowledged — not when the event
+            // was packed into a ring-buffer slot, which is where this used to live.
+            //
+            // That placement made `bridge_cdc_events_published_total` count events the
+            // bridge had *produced*, under a name promising events it had *delivered*.
+            // When oversized batches were being refused by the server, the metric read
+            // 50 000 published against a stream holding zero — the dashboard's "NATS
+            // Events Out" line was green throughout total data loss. A counter that
+            // cannot distinguish those two states cannot be alerted on.
+            if (self.metrics) |m| {
+                for (0..event_count) |_| m.incrementCdcEvents();
+            }
+
             log.debug("📤 Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
                 event_count,
                 encoded.len,
@@ -1153,3 +1186,58 @@ pub const BatchPublisher = struct {
         };
     }
 };
+
+// ─── wireSize ───────────────────────────────────────────────────────────────────
+//
+// The regression these pin: a batch's byte budget is only a budget if the per-event
+// figure it accumulates is dominated by the row, not by the table name.
+
+const testing = std.testing;
+
+fn sizedEvent(data_len: usize) CDCEvent {
+    var e = CDCEvent{};
+    e.data_len = data_len;
+    e.table_len = 5; // "mixed"
+    e.operation_len = 6; // "INSERT"
+    e.subject_len = 18; // "cdc.mixed.insert"
+    return e;
+}
+
+test "wireSize - the row dominates, not the metadata" {
+    // The bug: 11 KB of jsonb reported as ~29 bytes, so `max_payload_bytes` was
+    // unreachable and every batch ran to max_events instead.
+    const wide = sizedEvent(11_000);
+    try testing.expect(wireSize(&wide) > 11_000);
+
+    const metadata_only = 5 + 6 + 18;
+    try testing.expect(wireSize(&wide) > metadata_only * 100);
+}
+
+test "wireSize - a batch of wide rows reaches the byte budget before the event count" {
+    // 256 KB budget, 5 000 event ceiling. With 11 KB rows the budget must bind first —
+    // roughly 22 events — or a batch becomes a 55 MB message the server refuses.
+    const budget: usize = 256 * 1024;
+    const max_events: usize = 5000;
+
+    var total: usize = 0;
+    var count: usize = 0;
+    const e = sizedEvent(11_000);
+    while (total < budget and count < max_events) : (count += 1) total += wireSize(&e);
+
+    try testing.expect(count < 30);
+    try testing.expect(total <= budget + wireSize(&e)); // overshoots by at most one event
+}
+
+test "wireSize - narrow rows still fill a batch by count, not bytes" {
+    // The other direction: 100-byte rows should reach 5 000 events long before 256 KB…
+    // except the envelope allowance dominates there, which is the correct conservative
+    // behaviour — an emptier batch costs a round trip, an oversized one costs everything.
+    const e = sizedEvent(100);
+    try testing.expect(wireSize(&e) >= per_event_envelope_bytes);
+    try testing.expect(wireSize(&e) < 1024);
+}
+
+test "wireSize - an empty event is still charged its envelope" {
+    const e = sizedEvent(0);
+    try testing.expect(wireSize(&e) >= per_event_envelope_bytes);
+}

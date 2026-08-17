@@ -364,6 +364,42 @@ stateDiagram-v2
     Ready --> [*]: tombstone → drop table
 ```
 
+### Two positions, and they are not interchangeable
+
+A client persists **two** numbers, not one. They live in different coordinate systems and
+answer different questions, and using one for the other's job is a silent bug.
+
+| stored | compared against | answers |
+| --- | --- | --- |
+| **`seq`** — the JetStream stream sequence of the last CDC message applied | the CDC stream's `state.first_seq` | *"has the history I still need fallen off the back of the stream?"* |
+| **`lsn`** — the PostgreSQL WAL position of the last row applied | a snapshot descriptor's `lsn`, per event | *"have I already got this row from the snapshot?"* |
+
+**Gap detection uses `seq`, never `lsn`:**
+
+```js
+const firstSeq = streamInfo.state.first_seq;
+if (mySeq === 0 || (firstSeq > 0 && mySeq < firstSeq - 1)) {
+    // a snapshot is required
+}
+```
+
+`first_seq` is JetStream's own numbering — "the oldest message I still hold is #4711". Your
+LSN is PostgreSQL's numbering. **There is no conversion between them.** To ask whether your
+position has fallen off the back of the stream, you have to ask in the stream's coordinates,
+which is what `seq` is for.
+
+Two details that look like off-by-ones and are not:
+
+- `mySeq === 0` is the fresh-client case: no history at all, so seed from a snapshot.
+- `< firstSeq - 1`, not `< firstSeq`: if the stream's oldest is 100 and you hold 99, the very
+  next message you need is 100 and it is still there — no gap. Only at 98 or below is
+  message 99 genuinely lost.
+
+**`lsn` then does the other job, after a snapshot.** Having replayed a snapshot taken at LSN
+X, set the table's `lsn = X` and discard every CDC event with `event.lsn <= X`: those rows
+are already in the data you just seeded. Without that test a client re-applies them —
+harmless for an idempotent upsert, wrong for anything counting.
+
 ⚠️ **Gate on the column set, not on the LSN.** The LSN tells you *where you are*; the
 column set tells you *whether you can proceed*. Blocking whenever
 `event.lsn > schema.lsn` would stall permanently during quiet periods, because most
@@ -456,8 +492,42 @@ Snapshot data is megabytes-to-gigabytes of ordered chunks. It flows through thre
 
 ⚠️ `table_refused` and `table_not_monitored` are **not** retryable — retrying either is a busy-loop against a condition only a migration or a config change will clear.
 
-Chunks default to 10 000 rows.
-Requires a **single-column primary key**: chunking uses keyset pagination (`WHERE pk > $last ORDER BY pk LIMIT n`).
+#### The fourth case: no answer at all
+
+**A client MUST bound its wait for the descriptor and re-request.** Every row above assumes
+a message arrives; the case with no message is the one that hangs.
+
+Snapshots are served one at a time, and a request waits **in the `REQUESTS` stream** until
+the worker polls for it. That stream has a `max_age`. If the wait exceeds it — the wait being
+the *sum of the work ahead of it*, not one long snapshot — the broker drops the request
+unread. No chunks, no error, nothing: the bridge never saw it.
+
+Retrying is safe and self-correcting, because the two outcomes are exactly the two you want:
+
+| state when you retry | broker's answer | meaning |
+| --- | --- | --- |
+| your request expired | **accepted** | it was lost; this one takes its place |
+| your request is still queued | `503 … maximum messages per subject exceeded` | still pending — keep waiting |
+
+So a bounded wait plus backoff cannot cause a stampede (the broker refuses the duplicate)
+and cannot hang (an expired request is replaced). An unbounded `await` on the KV watch can
+do neither — it simply stops.
+
+⚠️ Sizing `SNAP_RET` larger is a *mitigation*, not the fix. It is a guess at
+`worst-case snapshot × tables requesting at once`, both of which grow with the database, and
+it is capped from above by `CDC_RET > SNAP_RET + apply time` — so raising it eats the margin
+that keeps a seeding client from falling off the CDC stream. The client-side timeout is what
+makes the system correct at any setting.
+
+#### Chunking
+
+Chunked by **bytes**, not rows: the bridge asks Postgres for the longest prefix of rows whose
+cumulative size fits one NATS message. `chunk_size` is a row *ceiling* (10 000), which a
+narrow table reaches and a table of 256 KiB rows does not — it gets three rows a chunk. A row
+too large to publish at all suspends the table rather than being split or skipped.
+
+Any primary key works, including a **composite** one: pagination compares the whole key as a
+row value (`("a","b") > (…)`), which matches the `ORDER BY` exactly.
 
 ### The Connection Flow (Resolving the Gap)
 

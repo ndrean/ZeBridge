@@ -108,13 +108,18 @@ released the CSV code for deletion.
 
 B3–B6 remain to be run.
 
-🔴 **B2 has a ceiling: `scripts/scenarios/snapshot.py` fails above ~9,400 rows on
-`test_types`.** Chunks are capped at `Snapshot.chunk_size` = 10,000 **rows** with no
-byte budget, so the first chunk of a wide-enough table exceeds the server's 1 MiB
-`max_payload` and the connection is closed instead. Measured: 9,000 rows = 996,789 bytes
-publishes; 10,000 rows never does, and all five retries die on `WriteAllHUPError`
-because the payload is unchanged. Keep seed data under that line until
-`COPY_BINARY_PLAN.md` item 4 lands, or the failure looks like a NATS problem.
+✅ **B2 has no row ceiling and no memory ceiling (2026-08-16).** Postgres is asked for the
+widest row before any COPY runs, then for the longest prefix of rows whose cumulative size
+fits one NATS message. Verified two ways:
+
+- narrow — `snapshot.py test_types 25000` → 6 chunks, no duplicate keys, key sequence
+  identical to PostgreSQL's own `ORDER BY`;
+- wide — 2 000 rows × 256 KiB (500 MB) → 667 chunks with the bridge's **RSS moving
+  436,896 → 442,432 KB, +5.4 MB**. Residency is a function of the message budget, not of
+  the table.
+
+A row too large to publish at all suspends the table (`row_too_large`) exactly as CDC
+would, before a byte is transferred.
 
 | # | setup | expect |
 | --- | --- | --- |

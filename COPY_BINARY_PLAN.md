@@ -72,28 +72,44 @@ report all exist; the subject is still parsed from the payload, there is no repl
    `emitter/priv/repo/migrations/` (2026-08-15, untracked at the new location — commit
    them). `Emitter.Scenario` steps 1–8 run again from there.
 
-4. 🔴 **Snapshot chunks are capped in rows, not bytes — any table with rows averaging
-   more than ~104 bytes cannot be snapshotted at all.** Found 2026-08-16 by
-   `scripts/scenarios/snapshot.py`. `Snapshot.chunk_size` is a compile-time `10_000`
-   and `streamToEncoder` publishes whatever those rows encode to, with no reference to
-   the server's `max_payload`. Measured on `test_types` (12 columns): 9,000 rows =
-   996,789 bytes and publishes fine; 10,000 rows ≈ 1.11 MB and the server closes the
-   connection — `error.Timeout`, then `WriteAllHUPError` on all five retries, because
-   the payload never changes and the retry can only re-kill the connection. The snapshot
-   is lost, no `init.snap.error.<table>` is published, and the CDC publisher on the same
-   process reconnects in a loop.
+4. ~~**Snapshot memory unbounded; chunks capped in rows, not bytes**~~ — ✅ **DONE
+   2026-08-16.** The fetch is now bounded server-side, so residency no longer depends on
+   the table.
 
-   `Config.Nats` already documents this hazard for the CDC path and `bridge.zig:403`
-   already reads `nats_publisher.serverMaxPayload(js)` at boot; the snapshot path is
-   simply the one that never got the guard.
+   **Ask the widest row first.** One scan per snapshot, inside the REPEATABLE READ
+   transaction: `SELECT max(<size expr>), avg(<size expr>) FROM t`. A row at or above the
+   message budget **suspends the table** (`row_too_large`, the same verdict and wire word
+   CDC reaches) before a byte moves — no COPY runs at all. Below it, `max < budget`
+   guarantees every chunk contains at least one row, which is what removes the zero-row
+   deadlock by construction rather than by a guard.
 
-   The fix is a byte budget, but it touches the wire contract, so decide first: the
-   encoder writes its array header with the row count **up front**, so a chunk cannot be
-   truncated mid-encode — it has to be re-encoded as a prefix of the rows already
-   fetched (cheap, no re-query). That makes `num_rows < chunk_size` stop meaning "last
-   chunk", which is what `X-Snapshot-Final-Chunk` is derived from today and what both
-   consumers read. So `streamToEncoder` must report *fetched* and *encoded* row counts
-   separately, and final becomes `fetched < chunk_size and encoded == fetched`.
+   The scan is affordable because `octet_length` on `text`/`bytea` reads the length out of
+   the TOAST pointer. Measured on 200 rows of 256 KiB blobs: **2 shared buffers**, against
+   **430** for an expression that must actually read the value.
+
+   **Chunks are bounded by a running sum.** `COPY (SELECT <cols> FROM (SELECT <cols>,
+   sum(<size expr>) OVER (ORDER BY <pk>) AS zb_running … LIMIT <n>) s WHERE zb_running <=
+   <budget>)`. Explicit column list, never `SELECT *` — the subquery carries `zb_running`,
+   and binary COPY matches columns positionally. The encode buffer is now sized *to* the
+   budget, so encoder overflow and over-budget are one event.
+
+   ⚠️ **The running sum broke `isFinal`, and that had to be fixed properly.** Once chunks
+   are trimmed by bytes, a short result no longer means "the table ended" — observed live
+   as `limit=7506 fetched=4670 encoded=4670`, which looked final and truncated a
+   25 000-row table at 8 389. `isFinal` is now `mayBeFinal`, answering only the cheap half
+   (a full chunk, or one the encoder trimmed, is certainly not last), and the caller
+   confirms with one indexed lookahead past the cursor.
+
+   Also fixed here: `NoSpaceLeft` is a shrink signal rather than a fatal error; rows are
+   decoded **once** instead of per shrink attempt; and `PQgetCopyData == -1` is no longer
+   read as success — a server error mid-COPY reports itself only from `PQgetResult`, and
+   without that check a truncated COPY was indistinguishable from a short final chunk.
+
+   **Verified:** narrow table (25 000 rows) 6 chunks, ordering identical to PostgreSQL's
+   `ORDER BY`; wide table (2 000 × 256 KiB = 500 MB) 667 chunks with **RSS 436,896 →
+   442,432 KB, +5.4 MB** — flat, independent of table size; a 2 MiB row rejected by the
+   pre-scan with **zero chunks published** and a suspension on the schemas KV; and a COPY
+   killed mid-snapshot leaving no orphans (below). 298 tests.
 
 **Untested, noted 2026-08-16: encryption in transit.** Neither leg has ever been run
 with TLS.
@@ -114,11 +130,16 @@ with TLS.
   It is sound — loopback is not a network an attacker sits on — but it is a constraint an
   operator may refuse, and the answer to that is v1.1 below, not a redesign of v1.0.
 
-### v1.1: migrate to nats-io/nats.zig (evaluated 2026-08-16, deferred)
+### v1.0: migrate to nats-io/nats.zig (evaluated 2026-08-16, deferred)
 
-**Not v1.0.** v1.0 ships on the vendored client, which works; this buys TLS and therefore
-a remote NATS, which is a capability, not a fix. Kept costed here so picking it up is a
-decision rather than a fresh investigation.
+**Not v0.14.** The current release ships on the vendored client, which works; this buys TLS
+and therefore a remote NATS, which is a capability, not a fix. Kept costed here so picking
+it up is a decision rather than a fresh investigation.
+
+**Versioning, for the record:** the minor tracks the **PostgreSQL floor**. `v0.14` = PG 14+,
+today's release. `v0.16` = PG 16+, the standby work below (logical decoding on a standby did
+not exist before 16). `v1.0` = this — a NATS client with TLS, which is what lifts the
+colocation constraint.
 
 `https://github.com/nats-io/nats.zig` — official org, Apache-2.0, 218★, last push
 2026-05-21, tag `v0.1.0`. **Pre-1.0 and says so** ("The API may change before 1.0"),
@@ -161,7 +182,7 @@ futures, and `Endpoint.parseUrl` gains the `tls://` scheme it currently refuses.
 its own branch with the scenario probes as the gate — `faults.py` and `stampede.py`
 already pin the two behaviours most likely to regress.
 
-### v1.1: reads from a **physical streaming standby** (scoped 2026-08-16)
+### v0.16: reads from a **physical streaming standby** (scoped 2026-08-16)
 
 > **Standby replica, never a logical replica.** The whole design rests on the standby
 > replaying the primary's WAL byte for byte, so both hosts share one LSN address space and
@@ -173,6 +194,62 @@ already pin the two behaviours most likely to regress.
 **Independent of the nats.zig item above** — different leg. Postgres reaches the bridge
 over libpq, which has TLS regardless of what the NATS client can do, so this lands whether
 or not that migration ever happens.
+
+**Named for its floor, and usable without a standby.** `v0.16` raises the PostgreSQL
+minimum to 16 because that is where logical decoding on a standby begins. The *release* is
+still usable against a lone primary, or against logical replicas — those deployments simply
+point `DATABASE_URL` somewhere else and leave the new switch off. What actually changes per
+deployment is two things: a genuinely different reader URL, and a flag along the lines of
+`--conc true`.
+
+### …and it is what unblocks concurrent snapshots
+
+Worth stating plainly, because it is a stronger argument for the standby than read
+offloading alone.
+
+Snapshots are served **one at a time** (thread 7 calls `generateIncrementalSnapshot`
+inline). That is not an oversight — it is the only thing keeping N concurrent `COPY`s off
+the primary, which is the same load the `REQUESTS` stampede window exists to prevent. So
+concurrency and primary-protection are in direct conflict *as long as snapshots read the
+primary*.
+
+Move the reads to a standby and the conflict dissolves: protecting the primary was the
+entire reason to serialise, so a standby makes concurrency nearly free. Each snapshot
+already opens its **own** PG and NATS connections (`snapshot_listener.zig:1358`, `:1385`,
+both torn down per request), so workers would not contend on anything shared — the pieces
+that scale with N are the encode buffer (~1 MB each) and the refusal registry (already safe
+for multiple writers).
+
+That also fixes the queue-expiry hole below, from the other end: a shorter queue is a queue
+whose requests do not age out.
+
+**So the switch is one mechanism with two effects** — `--conc true` means "snapshots may run
+in parallel", and it is only safe to turn on when the reads are pointed at a standby. Keep
+them as one decision rather than two knobs that can be set inconsistently.
+
+### The queue-expiry hole this exposes (v0.14, live today)
+
+Requests wait **in the `REQUESTS` stream**, not in the bridge — the consumer is a *pull*
+consumer (`$JS.API.CONSUMER.MSG.NEXT`, `batch = 1`, `no_wait = true`, no `deliver_subject`),
+and during a snapshot it does not poll at all, because the loop is blocked inside the COPY.
+
+So a queued request ages against the stream's `max_age` with nothing attending to it. Once
+its wait exceeds that window — the wait being the **sum of the work ahead of it**, not one
+long snapshot — the broker drops it unread. The client gets no chunks, no error, and nothing
+to retry against until the window clears.
+
+Mitigated 2026-08-16 rather than fixed: every snapshot logs its duration, the bridge reads
+the stream's real `max_age` from the server (`SNAP_RET_SECONDS` is nats-init's, so asking is
+the only way to know it), and it warns when a snapshot exceeds half the window. The
+invariant nobody had written down:
+
+```
+SNAP_RET  >  worst-case snapshot  ×  tables that may request at once
+```
+
+Finding it required fixing the vendored `StreamConfig`: `max_age`, `max_msgs`, `max_bytes`
+and `max_msgs_per_subject` were `i32`, and a nanosecond duration in an `i32` caps at **2.1
+seconds** — so reading any real stream's retention was impossible.
 
 Shape: **ingress → primary, reads → standby.** It moves the two heavy reads off the
 primary — the long `COPY` of a snapshot, and logical decoding itself, which runs on the
@@ -371,6 +448,26 @@ pointer into the WAL, nothing more. Two consequences worth stating: a slot whose
 stopped **pins WAL forever** and will fill the primary's disk (`max_slot_wal_keep_size` is
 the guard, set to 10GB in compose), and `max_replication_slots` caps how many instances can
 exist at once.
+
+### The pattern behind every bug found on 2026-08-16
+
+All four were **a size cap measuring the wrong quantity**, and all four were silent:
+
+| where | the cap counted | what it should have counted | symptom |
+| --- | --- | --- | --- |
+| snapshot chunks | rows (10 000) | encoded bytes vs `max_payload` | connection closed, snapshot lost |
+| CDC batches | `table_len + operation_len + subject_len` — the metadata | `data_len` too — the row | 5 000 events in one 55 MB message; **50 000 events counted as published, zero delivered** |
+| `StreamConfig.max_age` | an `i32` | `i64` — it is nanoseconds | any retention over 2.1 s unreadable |
+| `cdc_events_published_total` | events *packed into a slot* | events NATS *acknowledged* | dashboard green throughout total data loss |
+
+Worth a rule: **whenever a limit is enforced against a budget, the quantity accumulated
+must be the same quantity the budget is denominated in** — and the arithmetic must live in
+a named function, not inline in a loop, or nothing can test it. `wireSize`, `shrinkTake`
+and `rowsPerChunk` all exist because of this.
+
+Two startup checks now catch the configured version of the same class before any
+allocation: slab-vs-memory (cgroup-aware) and `BASE_BUF`-vs-`max_payload`. Both refuse to
+start rather than warn.
 
 **Small, independent, pick up any time** (§F): array quoting (`{"solo"}` vs `{solo}` —
 systematic, blocks a byte-equality golden test), snapshot failures that abort without
@@ -974,6 +1071,22 @@ row of it*.**
       Verified against the same reproduction: 24 redeliveries in 15 s → **1**, with
       `Outstanding Acks: 0`. ⚠️ The dead letter is currently **logged, not published** —
       the listener's handle is pull-only, so the publish lands with the reply channel.
+- [x] **orphaned snapshot chunks purged on abort — DONE 2026-08-16.** A snapshot that
+      dies after publishing chunk 0 left its chunks in `INIT` under an id no descriptor
+      references. Invisible to clients — the descriptor is written only after COMMIT — but
+      not harmless: `INIT` is 8 GiB with **discard = old**, so a wide table failing
+      repeatedly evicted *other* tables' snapshot chunks and schemas. They are now purged
+      by subject, and `init.snap.error.<table>` carries the `snapshot_id`. Needed a
+      `PURGE_FILTER` on the vendored client, which only had whole-stream purge. Verified:
+      COPY killed mid-run → 670 subjects down to 2, KV descriptor still pointing at the
+      previous *successful* snapshot.
+- [x] **dead-letter *publish* — DONE 2026-08-16.** It logged and stopped, on the note
+      that "the consumer connection is pull-only". That was wrong: `nats.Consumer.PUBLISH`
+      exists — the snapshot listener already answers `init.snap.error.<table>` the same
+      way — and `mutation_error.>` is one of the MUTATIONS stream's subjects, so the
+      message is stored rather than dropped for want of a stream. Still best-effort: a
+      failed publish logs and returns, because refusing to ACK would restore the infinite
+      loop the dead-letter path exists to end.
 - [ ] reply on the reply-to subject: `accepted` / `stale` / `row_deleted` / error.
       Both PowerSync's blocking FIFO queue and Electric's `awaitTxId` need it; without
       it a client cannot dequeue, and `row_deleted` has nowhere to go
