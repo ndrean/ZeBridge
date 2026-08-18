@@ -501,6 +501,17 @@ BEGIN
                      SELECT jsonb_agg(jsonb_build_object(
                               'name', c.column_name,
                               'type', c.data_type,
+                              -- Required-ness, so a client can build a valid INSERT.
+                              -- Without these the descriptor said which columns exist and
+                              -- not which ones a write must carry: an omitted NOT NULL
+                              -- column with no DEFAULT is refused by PostgreSQL (23502),
+                              -- and the only way a client could learn that was the
+                              -- rejection. `required` is the single fact it needs —
+                              -- `nullable`/`has_default` are kept because "why" matters
+                              -- when a DBA is reading the descriptor.
+                              'nullable', (c.is_nullable = 'YES'),
+                              'has_default', (c.column_default IS NOT NULL),
+                              'required', (c.is_nullable = 'NO' AND c.column_default IS NULL),
                               'oid', a.atttypid::int,
                               'typtype', t.typtype
                             ) ORDER BY c.ordinal_position)

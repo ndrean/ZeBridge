@@ -88,6 +88,7 @@ constrains it:
 | primary key | rows must be identifiable; DELETE is otherwise ambiguous | table refused outright |
 | key is `uuid`, minted by the client | a `bigserial` cannot be minted offline — two clients pick the same id and one row is silently overwritten | delayed duplicate-key collisions |
 | version column that changes on every write | last-write-wins compares it | every mutation fails `NoVersionColumn` |
+| tiebreak column (3rd `SYNC_RULES` field), if equal versions are possible | equal versions are otherwise **refused**, so two replicas holding different rows refuse each other forever | silent permanent divergence, no error anywhere |
 | `timestamptz`, not `timestamp` | naive columns record no zone; a client writing local time wins or loses on its offset, silently | wrong write wins, no error |
 | tombstone column (soft delete) | an offline client's queued edit is overruled instead of resurrecting the row | deletes are physical; offline edits resurrect rows |
 | every `NOT NULL` column has a `DEFAULT`, or the client sends it | the schema descriptor carries no nullability | writes fail; the client learns only from the rejection |

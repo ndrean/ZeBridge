@@ -22,6 +22,10 @@ const TableMeta = struct {
     columns: [][]const u8,
     /// The column compared for last-write-wins.
     version_col: []const u8,
+    /// Optional third `SYNC_RULES` column: where the winning writer's id is stored, so
+    /// equal versions can be broken instead of rejected. Null means no tiebreak — a tie
+    /// is refused, which is the safe default and the behaviour before this existed.
+    client_col: ?[]const u8 = null,
     /// The tombstone column, when the table has one. Null means a delete is physical.
     tombstone_col: ?[]const u8,
 
@@ -31,6 +35,7 @@ const TableMeta = struct {
         for (self.columns) |col| allocator.free(col);
         allocator.free(self.columns);
         allocator.free(self.version_col);
+        if (self.client_col) |cc| allocator.free(cc);
         if (self.tombstone_col) |t| allocator.free(t);
     }
 
@@ -864,15 +869,21 @@ pub const MutationListener = struct {
         // column. Absent means deletes are physical for this table.
         var version_name: []const u8 = self.default_version_column;
         var tombstone_name: ?[]const u8 = null;
+        var client_name: ?[]const u8 = null;
         if (self.sync_rules.get(table)) |cols| {
             if (cols.len > 0) version_name = cols[0];
             if (cols.len > 1) tombstone_name = cols[1];
+            // `table:updated_at,deleted_at,last_writer` — the third column is where the
+            // winner's client_id is kept. Opt-in per table because it costs a column, and
+            // a table that never sees concurrent equal versions does not need one.
+            if (cols.len > 2) client_name = cols[2];
         }
 
         var meta = TableMeta{
             .pk_cols = try pk.toOwnedSlice(alloc),
             .columns = try columns.toOwnedSlice(alloc),
             .version_col = try alloc.dupe(u8, version_name),
+            .client_col = if (client_name) |cn| try alloc.dupe(u8, cn) else null,
             .tombstone_col = if (tombstone_name) |t| try alloc.dupe(u8, t) else null,
         };
         errdefer meta.deinit(alloc);
@@ -988,6 +999,11 @@ pub const MutationListener = struct {
                 return error.UnknownColumn;
             }
             if (std.mem.eql(u8, name, meta.version_col)) continue; // set from `version`
+            // Set from the envelope's `client_id`. Letting `data` carry it would let a
+            // client claim any identity for tiebreaking purposes.
+            if (meta.client_col) |cc| {
+                if (std.mem.eql(u8, name, cc)) continue;
+            }
             try cols.append(alloc, name);
             try vals.append(alloc, try self.payloadToString(alloc, entry.value_ptr.*));
         }
@@ -996,6 +1012,25 @@ pub const MutationListener = struct {
         // never from `data`, so a client cannot claim one value and stamp another.
         try cols.append(alloc, meta.version_col);
         try vals.append(alloc, version_text);
+
+        // Same for the tiebreak column: stamped from the envelope's `client_id`, never
+        // from `data`. Written on every upsert, because a row whose stored id is stale
+        // would break ties against the wrong writer — and a NULL one loses every tie
+        // (coalesced to '' in the guard), which would silently favour whoever wrote last
+        // rather than whoever the rule says.
+        //
+        // ⚠️ Only when the table declares the column. `data` may not name it either: it is
+        // in `meta.columns`, so a client *could* set it directly and choose which id it
+        // appears to be — the same forgery the version column is protected from. Filtered
+        // out of the data loop above for that reason.
+        if (meta.client_col) |client_col| {
+            const cid = if (map.getByString("client_id")) |v|
+                try self.payloadToString(alloc, v)
+            else
+                null;
+            try cols.append(alloc, client_col);
+            try vals.append(alloc, cid);
+        }
 
         var sql: std.ArrayListUnmanaged(u8) = .empty;
         try sql.appendSlice(alloc, "INSERT INTO ");
@@ -1037,6 +1072,42 @@ pub const MutationListener = struct {
         try appendIdent(&sql, alloc, meta.version_col);
         try sql.appendSlice(alloc, " < EXCLUDED.");
         try appendIdent(&sql, alloc, meta.version_col);
+
+        // ── The tie ────────────────────────────────────────────────────────────────
+        //
+        // `<` alone **rejects** equal versions, which is not a resolution: two replicas
+        // holding different rows both refuse the other's write and stay divergent forever,
+        // with no error anywhere. PROTOCOL.md §7.3 says the comparison is
+        // `(version, client_id)` for exactly this reason.
+        //
+        // A tie is not exotic. It is the *normal* case for an integer version column
+        // (`stored + 1` from two clients that read the same value), and it happens with
+        // timestamps whenever two writes land in the same microsecond.
+        //
+        // The rule is arbitrary but must be **total and identical everywhere**: the higher
+        // client_id wins. Any deterministic order works; what matters is that two replicas
+        // given the same pair of writes reach the same row, which a rejection does not
+        // guarantee and a coin flip actively breaks.
+        //
+        // ⚠️ Only when the table declares a column to store the winner's id (the third
+        // `SYNC_RULES` field). Without one there is nothing to compare against — the
+        // stored id has to be *on the row* — so a tie is refused exactly as before, which
+        // is the safe default rather than a silent coin flip.
+        if (meta.client_col) |client_col| {
+            try sql.appendSlice(alloc, " OR (");
+            try appendIdent(&sql, alloc, mutation.table);
+            try sql.appendSlice(alloc, ".");
+            try appendIdent(&sql, alloc, meta.version_col);
+            try sql.appendSlice(alloc, " = EXCLUDED.");
+            try appendIdent(&sql, alloc, meta.version_col);
+            try sql.appendSlice(alloc, " AND coalesce(");
+            try appendIdent(&sql, alloc, mutation.table);
+            try sql.appendSlice(alloc, ".");
+            try appendIdent(&sql, alloc, client_col);
+            try sql.appendSlice(alloc, ", '') < coalesce(EXCLUDED.");
+            try appendIdent(&sql, alloc, client_col);
+            try sql.appendSlice(alloc, ", ''))");
+        }
 
         try self.exec(alloc, conn, mutation, sql.items, vals.items);
     }

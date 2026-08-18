@@ -799,6 +799,25 @@ pub const EventProcessor = struct {
             }
         }.f;
 
+        // How long a client should wait before calling a write unconfirmed.
+        //
+        // Derived from the bridge's own retry budget, because the client cannot see it:
+        // `mutation_max_deliver` attempts, one second apart, plus the CDC batch window,
+        // plus slack for the round trip. Published so a client stops guessing — raising
+        // `max_deliver` used to silently make every client's timeout wrong, and the
+        // symptom was writes reported "unconfirmed" seconds before their echo arrived.
+        //
+        // ⚠️ A floor, not a promise: a genuinely transient failure that recovers on the
+        // last attempt lands right at this number. A client should treat expiry as "not
+        // yet confirmed", never as "refused" — the verdict channel is what says refused.
+        const timeout_ms: u64 = @as(u64, @intCast(Config.Nats.mutation_max_deliver)) * 1000 +
+            @as(u64, @intCast(Config.Batch.max_age_ms)) + 2000;
+        try json_str.appendSlice(arena, try std.fmt.allocPrint(
+            arena,
+            ",\"mutation_timeout_ms\":{d}",
+            .{timeout_ms},
+        ));
+
         if (has(column_names, version_name)) {
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
@@ -962,12 +981,19 @@ pub const EventProcessor = struct {
             // value is the client contract, and a client has no use for an OID.
             self.recordColumnType(col_val);
 
+            // `required` = NOT NULL with no DEFAULT: the columns a write must carry.
+            // Forwarded, not derived, so the descriptor and PostgreSQL cannot disagree.
+            // Absent on a database whose trigger predates the field, which reads as
+            // "not required" — the same answer the descriptor gave before it existed.
+            const required = if (col_val == .object) col_val.object.get("required") else null;
+            const is_required = required != null and required.? == .bool and required.?.bool;
+
             if (i > 0) try json_str.appendSlice(arena, ",");
             try column_names.append(arena, name.?.string);
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
-                "{{\"name\":\"{s}\",\"type\":\"{s}\"}}",
-                .{ name.?.string, ty.?.string },
+                "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                .{ name.?.string, ty.?.string, if (is_required) "true" else "false" },
             ));
         }
 
@@ -1215,7 +1241,8 @@ pub const EventProcessor = struct {
                 \\SELECT a.attname,
                 \\       format_type(a.atttypid, a.atttypmod) AS data_type,
                 \\       a.atttypid,
-                \\       t.typtype
+                \\       t.typtype,
+                \\       (a.attnotnull AND NOT a.atthasdef) AS required
                 \\FROM pg_attribute a
                 \\JOIN pg_type t ON t.oid = a.atttypid
                 \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
@@ -1269,7 +1296,15 @@ pub const EventProcessor = struct {
                 } else |_| {}
 
                 try column_names.append(arena, col_name);
-                const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, data_type});
+                // `attnotnull AND NOT atthasdef` — the catalog form of "NOT NULL with no
+                // DEFAULT", matching what the DDL trigger computes from information_schema.
+                const required_txt = std.mem.span(c.PQgetvalue(result, r, 4));
+                const is_required = std.mem.eql(u8, required_txt, "t");
+                const col_json = try std.fmt.allocPrint(
+                    arena,
+                    "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                    .{ col_name, data_type, if (is_required) "true" else "false" },
+                );
                 try json_str.appendSlice(arena, col_json);
             }
             

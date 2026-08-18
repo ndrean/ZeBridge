@@ -1123,9 +1123,47 @@ allocates instead (§7.2).
   conflict target, delete-by-key, and the snapshot's keyset pagination — and are the right
   choice for read-only tables. For *writable* ones, prefer a surrogate; see below.
 
+#### `SYNC_RULES` names your columns; the wire names never change
+
+One recurring confusion, worth stating once: `SYNC_RULES` maps protocol concepts onto
+*your* schema. Every column name in it is yours to choose. Every payload field name is
+fixed by this protocol.
+
+```
+SYNC_RULES=orders:updated_at,deleted_at,last_writer
+                  ^^^^^^^^^^ ^^^^^^^^^^ ^^^^^^^^^^^
+                  version    tombstone  tiebreak     — your column names
+```
+
+| protocol concept | payload field | column | who writes it |
+| --- | --- | --- | --- |
+| version | `version` | 1st in `SYNC_RULES` (default `updated_at`) | the bridge, from the field |
+| tombstone | *(none)* | 2nd, optional | the bridge, on a delete |
+| tiebreak | `client_id` | 3rd, optional | the bridge, from the field |
+| primary key | `key` | from the catalog | the client, in `data` |
+
+⚠️ The bridge stamps the version and tiebreak columns **from the envelope**, and ignores
+them in `data`. A client that sets `last_writer` directly is not honoured — otherwise it
+could claim any identity when a tie is broken, which is the same forgery the version column
+is protected from.
+
 **2. A version column that changes on every write.** `updated_at` by default; override per
 table with `SYNC_RULES`. Its *type* decides whether LWW is sound — see §7.3, and note the
 common case (`timestamp without time zone`) is the one with caveats.
+
+**2b. A tiebreak column, if equal versions are possible.** ✅ Third field in `SYNC_RULES`.
+Without one, two writes carrying the *same* version are both **refused** — which is not a
+resolution: two replicas each holding the other's row refuse each other forever, silently.
+With one, the higher `client_id` wins, and the winner's id is stored so the comparison is
+`(version, client_id)` as §7.3 describes.
+
+⚠️ Ties are the **normal** case for an integer version column — two clients that read the
+same value both send `stored + 1` — and happen with timestamps whenever two writes land in
+the same microsecond. A `timestamptz(6)` table with one writer may never need this; a
+counter-versioned table needs it immediately.
+
+Verified order-independent: the higher id wins whether it arrives first or second, which is
+the property that makes replicas converge rather than race.
 
 **3. A tombstone column, if deletes must survive offline clients.** Without one a delete is
 physical, and an offline client's queued edit **resurrects the row** — there is no "row not
