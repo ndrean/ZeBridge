@@ -371,6 +371,20 @@ pub const Server = struct {
         }
     }
 
+    /// ⚠️ Keep every value `{d}` on an unsigned integer. Never `{d:.2}` on a float.
+    ///
+    /// Prometheus drops the **entire scrape** on one unparseable line — the failure shows
+    /// up as dashboards going quiet, not as an error anywhere. Integer formatting cannot
+    /// produce `nan` or `inf`, so the document is well-formed by construction rather than
+    /// by care.
+    ///
+    /// `bridge_cpu_seconds_total` looks like an exception and is not: it is written as
+    /// `{d}.{d:0>3}` from two integer divisions of a nanosecond counter, so both halves
+    /// are always digits. A float would reintroduce the risk for cosmetic gain.
+    ///
+    /// (Truncation was the other way to break the document — the pre-`std.http` version
+    /// built responses in a 4096-byte buffer and cut mid-line above that, with /metrics
+    /// already past 2 KB. The body streams now.)
     fn handleMetrics(self: *Server, req: *std.http.Server.Request) !void {
         // Read once: two getrusage calls would report two different instants.
         const cpu_ns = utils.cpuTimeNanos();
