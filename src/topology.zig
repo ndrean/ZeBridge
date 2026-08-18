@@ -65,6 +65,14 @@ pub const Topology = struct {
     mutation_pattern: []const u8,
     mutation_error_prefix: []const u8,
     mutation_error_pattern: []const u8,
+    /// Where a per-write verdict is published: `mutation_ack.<principal>.<msg_id>`.
+    ///
+    /// Keyed by the client's own `Nats-Msg-Id` rather than by table, because the client
+    /// needs to match a verdict to *the entry in its queue*, and by principal because
+    /// that makes `mutation_ack.alice.>` authorizable with the same allow-list that
+    /// already governs `mutation.alice.>`.
+    mutation_ack_prefix: []const u8,
+    mutation_ack_pattern: []const u8,
 
     // ─── requests ───────────────────────────────────────────────────────────────
     snapshot_request: []const u8,
@@ -114,6 +122,8 @@ pub const Topology = struct {
         .mutation_pattern = "mutation.{[principal]s}.{[table]s}.{[operation]s}",
         .mutation_error_prefix = "mutation_error",
         .mutation_error_pattern = "mutation_error.{[table]s}",
+        .mutation_ack_prefix = "mutation_ack",
+        .mutation_ack_pattern = "mutation_ack.{[principal]s}.{[msg_id]s}",
         .snapshot_request = "snapshot.request",
         .schema_request = "init.schema",
         .snapshot_data_pattern = "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
@@ -201,6 +211,8 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.mutation_pattern = try str(a, subjects, "subjects", "mutation_pattern", diag);
     t.mutation_error_prefix = try str(a, subjects, "subjects", "mutation_error_prefix", diag);
     t.mutation_error_pattern = try str(a, subjects, "subjects", "mutation_error_pattern", diag);
+    t.mutation_ack_prefix = try str(a, subjects, "subjects", "mutation_ack_prefix", diag);
+    t.mutation_ack_pattern = try str(a, subjects, "subjects", "mutation_ack_pattern", diag);
 
     t.snapshot_request = try str(a, subjects, "subjects", "snapshot_request", diag);
     t.schema_request = try str(a, subjects, "subjects", "schema_request", diag);
@@ -431,6 +443,7 @@ test "parse: reads every name and derives the composites" {
         \\    "cdc_prefix":"cdc","init_prefix":"init","mutations_prefix":"mut",
         \\    "mutation_pattern":"mut.{[principal]s}.{[table]s}.{[operation]s}",
         \\    "mutation_error_prefix":"mut_err","mutation_error_pattern":"mut_err.{[table]s}",
+        \\    "mutation_ack_prefix":"mut_ack","mutation_ack_pattern":"mut_ack.{[principal]s}.{[msg_id]s}",
         \\    "snapshot_request":"snap.req","schema_request":"init.schema",
         \\    "snapshot_data_pattern":"d","snapshot_start_pattern":"s",
         \\    "snapshot_error_pattern":"e","snapshot_meta_pattern":"m",

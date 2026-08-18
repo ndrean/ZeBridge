@@ -157,6 +157,31 @@ pub fn classifyVersionColumn(
 }
 
 
+/// The role name out of a PostgreSQL connection URL.
+///
+/// The writer's *grants* are the only authoritative statement of which tables are meant
+/// to accept edge writes — `SYNC_RULES` says how to write a table, never whether it may
+/// be written — so the report needs the role those grants were made to. It is already in
+/// `DATABASE_WRITER_URL`; nothing else has to be configured.
+///
+/// Pure and separately tested: a URL with no userinfo, or one whose password contains an
+/// `@` or a `:`, must not silently yield a wrong role name and turn every grant check
+/// into a false negative.
+pub fn roleFromUrl(url: []const u8) ?[]const u8 {
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
+    var rest = url[scheme_end + 3 ..];
+
+    // Authority ends at the first '/', and the password may legally contain '@', so the
+    // split is on the *last* '@' before that.
+    if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
+    const at = std.mem.lastIndexOfScalar(u8, rest, '@') orelse return null;
+    const userinfo = rest[0..at];
+    if (userinfo.len == 0) return null;
+
+    const colon = std.mem.indexOfScalar(u8, userinfo, ':') orelse return userinfo;
+    return if (colon == 0) null else userinfo[0..colon];
+}
+
 /// Report, per published table, whether it can be written from the edge.
 ///
 /// **Checks the named column; never searches for one.** Silently picking `created_at`
@@ -172,12 +197,23 @@ pub fn reportVersionColumns(
     publication_name: []const u8,
     sync_rules: *const Config.EventClassification.TransitionRules,
     default_version_column: []const u8,
+    writer_role: ?[]const u8,
 ) !void {
     // Every orderable column of every published table, in one round trip. Ordering by
     // table then attnum makes the grouping a single pass.
     const query = try utils.allocPrintZ(
         allocator,
-        \\SELECT pt.tablename, a.attname, t.typname, a.atttypmod, a.attnotnull
+        \\SELECT pt.tablename, a.attname, t.typname, a.atttypmod, a.attnotnull,
+        \\       CASE WHEN '{s}' <> '' AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{s}')
+        \\            THEN has_table_privilege('{s}', cl.oid, 'INSERT') ELSE false END AS granted,
+        \\       coalesce((
+        \\         SELECT bool_or(pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%'
+        \\                        OR pk.attidentity <> '')
+        \\         FROM pg_index i
+        \\         JOIN pg_attribute pk ON pk.attrelid = i.indrelid AND pk.attnum = ANY(i.indkey)
+        \\         LEFT JOIN pg_attrdef ad ON ad.adrelid = pk.attrelid AND ad.adnum = pk.attnum
+        \\         WHERE i.indrelid = cl.oid AND i.indisprimary
+        \\       ), false) AS key_db_allocated
         \\FROM pg_publication_tables pt
         \\JOIN pg_namespace ns ON ns.nspname = pt.schemaname
         \\JOIN pg_class cl ON cl.relname = pt.tablename AND cl.relnamespace = ns.oid
@@ -187,7 +223,7 @@ pub fn reportVersionColumns(
         \\  AND t.typname IN ('timestamp', 'timestamptz', 'int8', 'int4')
         \\ORDER BY pt.tablename, a.attnum;
     ,
-        .{publication_name},
+        .{ writer_role orelse "", writer_role orelse "", writer_role orelse "", publication_name },
     );
     defer allocator.free(query);
 
@@ -202,6 +238,7 @@ pub fn reportVersionColumns(
     const rows: usize = @intCast(c.PQntuples(res));
     var writable: usize = 0;
     var outbound_only: usize = 0;
+    var mismatched: usize = 0;
 
     var r: usize = 0;
     while (r < rows) {
@@ -219,6 +256,8 @@ pub fn reportVersionColumns(
 
         // One pass over this table's rows: find the wanted column, remember the rest.
         var verdict: VersionVerdict = .absent;
+        var granted = false;
+        var key_db_allocated = false;
         var candidates: std.ArrayList([]const u8) = .empty;
         defer candidates.deinit(allocator);
 
@@ -229,6 +268,10 @@ pub fn reportVersionColumns(
             const typmod = std.fmt.parseInt(i32, std.mem.span(c.PQgetvalue(res, @intCast(r), 3)), 10) catch -1;
             const notnull = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(r), 4)), "t");
 
+            // Same for every row of the table; read once per row rather than tracked.
+            granted = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(r), 5)), "t");
+            key_db_allocated = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(r), 6)), "t");
+
             if (std.mem.eql(u8, col, wanted)) {
                 verdict = classifyVersionColumn(col, typname, typmod, notnull);
             } else if (!isCreationColumn(col)) {
@@ -237,10 +280,68 @@ pub fn reportVersionColumns(
         }
         _ = table_start;
 
-        if (logVerdict(table, wanted, verdict, candidates.items)) writable += 1 else outbound_only += 1;
+        if (logVerdict(table, wanted, verdict, candidates.items, granted)) writable += 1 else outbound_only += 1;
+        if (reportWriteIntent(table, verdict, granted, key_db_allocated, sync_rules.get(table) != null)) mismatched += 1;
     }
 
     log.info("✅ Edge writes: {d} table(s) writable, {d} outbound-only", .{ writable, outbound_only });
+    if (mismatched > 0) {
+        log.warn(
+            "⚠️  {d} table(s) where the write grant and the schema disagree — see above. Each one fails at runtime, not here.",
+            .{mismatched},
+        );
+    }
+}
+
+/// Cross-check **intent** against **capability**, and report where they disagree.
+///
+/// `SYNC_RULES` teaches the bridge *how* to write a table; nothing in it says a table
+/// *may* be written, so nothing validates it against the schema. The missing declaration
+/// was already there and unread: `GRANT INSERT ... TO bridge_writer` is explicit,
+/// per-table, made deliberately by a DBA, and — unlike any config file — cannot drift
+/// from what is enforced, because it *is* what PostgreSQL enforces.
+///
+/// Every case below fails at runtime today, and two of them fail *silently*: the bridge
+/// classifies a SQL error as transient (it cannot tell `permission denied` from a dropped
+/// connection), so the write is retried to `max_deliver` and the client sees no error, no
+/// row, and no CDC echo. Saying it at boot costs one catalog query.
+///
+/// Returns true when something was reported.
+fn reportWriteIntent(
+    table: []const u8,
+    verdict: VersionVerdict,
+    granted: bool,
+    key_db_allocated: bool,
+    named_in_sync_rules: bool,
+) bool {
+    if (granted) {
+        if (verdict == .absent or verdict == .creation_column or verdict == .wrong_type) {
+            log.err(
+                "🔴 '{s}': granted INSERT to the writer, but it has no usable version column. Every mutation will fail NoVersionColumn. Grant is intent; the schema cannot honour it.",
+                .{table},
+            );
+            return true;
+        }
+        if (key_db_allocated) {
+            log.err(
+                "🔴 '{s}': granted INSERT to the writer, but its primary key is database-allocated (serial/identity). A client cannot mint one — an explicit key does not advance the sequence, so edge writes plant duplicate-key collisions the application hits later, and two offline clients creating rows collide by construction. Use a uuid key.",
+                .{table},
+            );
+            return true;
+        }
+        return false;
+    }
+
+    // Not granted. Silence is right for an ordinary read-only table — most of a schema —
+    // but configuring one for writes it can never perform is worth saying out loud.
+    if (named_in_sync_rules) {
+        log.warn(
+            "⚠️  '{s}': SYNC_RULES configures it for edge writes, but the writer has no INSERT privilege. Mutations will be retried to max_deliver and dead-lettered, with nothing explaining why. Either GRANT it or drop the rule.",
+            .{table},
+        );
+        return true;
+    }
+    return false;
 }
 
 /// Log one table's verdict. Returns true when the table is edge-writable.
@@ -255,9 +356,24 @@ fn logVerdict(
     wanted: []const u8,
     verdict: VersionVerdict,
     candidates: []const []const u8,
+    /// Whether the writer actually holds INSERT. A usable version column makes a table
+    /// *capable* of edge writes; only the grant makes it **open** to them.
+    ///
+    /// ⚠️ Reported ✍️ on the column alone until this argument existed, so `users` — no
+    /// grant, and refusing every write with `permission denied` — was announced as
+    /// edge-writable at every boot. Two reports in the same output disagreeing about the
+    /// same table is worse than either being wrong alone.
+    granted: bool,
 ) bool {
     switch (verdict) {
         .usable => |u| {
+            if (!granted) {
+                log.info(
+                    "📖 '{s}': outbound-only — '{s}' would serve as a version column, but the writer has no INSERT privilege. Open it with SELECT zebridge_grant_edge_writes('public.{s}').",
+                    .{ table, wanted, table },
+                );
+                return false;
+            }
             log.info("✍️  '{s}': edge-writable on '{s}'", .{ table, wanted });
             if (u.naive) log.warn(
                 "⚠️  '{s}.{s}' is `timestamp` (no time zone): last-write-wins ordering breaks if any writer stores local time rather than UTC",
@@ -361,7 +477,10 @@ pub fn reportTable(
         }
     }
 
-    _ = logVerdict(table, wanted, verdict, candidates.items);
+    // The post-boot path has no privilege lookup in hand, so it reports on capability
+    // only. Passing `true` keeps the wording it always had rather than inventing a
+    // grant claim it cannot check.
+    _ = logVerdict(table, wanted, verdict, candidates.items, true);
 }
 
 /// Tables that are ours or the migration tool's — mirrors zebridge_is_internal_table()
@@ -390,6 +509,9 @@ pub fn run(
     default_version_column: []const u8,
     strict: bool,
     refused: *RefusedTables.Registry,
+    /// Role the write grants were made to, from `DATABASE_WRITER_URL`. Null when ingress
+    /// is not configured, in which case no table is expected to be writable.
+    writer_role: ?[]const u8,
 ) !Summary {
     var standard_config = pg_config.*;
     standard_config.replication = false;
@@ -495,7 +617,7 @@ pub fn run(
 
     // Reported after the table shapes, because "can this table be edited from the edge"
     // only matters for tables that replicate at all.
-    reportVersionColumns(allocator, conn, publication_name, sync_rules, default_version_column) catch |err| {
+    reportVersionColumns(allocator, conn, publication_name, sync_rules, default_version_column, writer_role) catch |err| {
         log.warn("⚠️  Version-column report failed: {}", .{err});
     };
 
@@ -607,4 +729,52 @@ test "version column - absent and wrong-type leave the table outbound-only" {
     try std.testing.expect(classifyVersionColumn("updated_at", "text", -1, true) == .wrong_type);
     // An integer version (microseconds in a bigint) is legitimate.
     try std.testing.expect(classifyVersionColumn("version", "int8", -1, true) == .usable);
+}
+
+test "roleFromUrl: the ordinary case" {
+    try std.testing.expectEqualStrings(
+        "bridge_writer",
+        preflightRole("postgres://bridge_writer:pw@127.0.0.1:55432/postgres").?,
+    );
+}
+
+test "roleFromUrl: a password containing '@' does not move the split" {
+    // The authority is split on the LAST '@'. Splitting on the first would yield the
+    // role "bridge_writer:pw" and every has_table_privilege check would come back false
+    // — reporting every writable table as unwritable, which reads like a real finding.
+    try std.testing.expectEqualStrings(
+        "bridge_writer",
+        preflightRole("postgres://bridge_writer:p@ss@host/db").?,
+    );
+}
+
+test "roleFromUrl: a password containing ':' does not move the split" {
+    try std.testing.expectEqualStrings(
+        "bridge_writer",
+        preflightRole("postgres://bridge_writer:a:b:c@host/db").?,
+    );
+}
+
+test "roleFromUrl: no userinfo yields null rather than a host name" {
+    // Returning "host" here would check privileges for a role that does not exist, and
+    // the query's pg_roles guard would then report every table as ungranted.
+    try std.testing.expect(preflightRole("postgres://host:5432/db") == null);
+    try std.testing.expect(preflightRole("postgres://@host/db") == null);
+    try std.testing.expect(preflightRole("postgres://:pw@host/db") == null);
+}
+
+test "roleFromUrl: a role with no password" {
+    try std.testing.expectEqualStrings("writer", preflightRole("postgres://writer@host/db").?);
+}
+
+test "roleFromUrl: an '@' in the path is not authority" {
+    try std.testing.expectEqualStrings("w", preflightRole("postgres://w:p@host/db@name").?);
+}
+
+test "roleFromUrl: not a URL" {
+    try std.testing.expect(preflightRole("bridge_writer") == null);
+}
+
+fn preflightRole(url: []const u8) ?[]const u8 {
+    return roleFromUrl(url);
 }

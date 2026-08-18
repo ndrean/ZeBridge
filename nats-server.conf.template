@@ -1,13 +1,177 @@
-# nats-server.conf — generated from nats-server.conf.template by nats-config-gen
-# Variables ${NATS_BRIDGE_USER} and ${NATS_BRIDGE_PASSWORD} are substituted at startup.
+# nats-server.conf — generated from nats-server.conf.template by nats-config-gen.
+# ${NATS_BRIDGE_NKEY_PUB} and ${NATS_ALICE_PASSWORD} are substituted at startup.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# This file is where PROTOCOL.md §7.1 stops being a claim and becomes a fact.
+#
+# The protocol says a mutation's principal is trustworthy because it is a *subject
+# token*, and NATS authorises subjects: a client granted `publish: ["mutation.alice.>"]`
+# cannot write as bob no matter what it puts in its payload. That guarantee lives
+# entirely in this file. Delete the permissions blocks below and the principal
+# degrades to a self-asserted string — the "trust me, I am alice" the design exists
+# to replace. The bridge cannot detect the difference and does not try to.
+#
+# Two credential shapes, on purpose:
+#
+#   the bridge  — nkey, seed passed on the command line, never written to any env
+#                 file. It is the trusted writer: it holds PostgreSQL replication
+#                 rights already, so restricting its subjects buys little, while a
+#                 wrong entry breaks every table at once and silently.
+#   a client    — user/password, one per principal, allow-listed to its own
+#                 mutation subtree and to read-only access on everything else.
+#
+# ⚠️ A password shipped to a *browser* is not a secret. Anyone with devtools reads
+# it out of the bundle, and can then write as that principal from curl. This block
+# makes identity **enforced** (NATS checks it) without making it **secret** (the
+# holder is not proven to be the person). For server-side consumers — the Go and
+# Python clients — that gap does not exist and user/password is the right answer.
+# For browsers the endpoint is short-lived credentials minted per session by your
+# own auth server; the permissions below are the same either way, so this is the
+# right shape to build against now.
+#
+# ── The migration path, so this file is not a dead end ───────────────────────
+#
+# A user entry per principal does not scale, and it is not meant to: the endpoint
+# is operator/JWT mode with a **scoped signing key**, where the permission shape
+# below is written *once* and every user inherits it.
+#
+#   nsc edit signing-key --account APP --role client --sk A… \
+#     --allow-pub "mutation.{{name()}}.>" \
+#     --allow-sub "cdc.>" --allow-sub "init.>" --allow-sub "_INBOX.>"
+#
+# `{{name()}}` expands at user-creation time, so the login ID your auth server
+# already has *becomes* the principal — which is the whole trick. After login it
+# mints a short-lived user JWT named with that ID, signed by the signing key, and
+# hands it to the browser with an ephemeral user nkey whose seed never leaves the
+# page. No server config changes when a user is added, ever.
+#
+# Two properties worth knowing before that day:
+#
+#  - Permissions come from the **signing key's scope**, not from the user JWT, so
+#    a compromised minting service cannot widen them — only name a user.
+#  - Editing the scope propagates to every connected user immediately.
+#
+# The subject grammar is what makes this work: because the principal is a token
+# (§7.1) and not a payload field, one wildcard covers a user for all tables and
+# adding a table reissues no credentials. The allow-lists below are the same
+# lists, so nothing here is throwaway.
+# ─────────────────────────────────────────────────────────────────────────────
 
 port: 4222
 http_port: 8222
 
+# Every client's read side is identical — they all follow the same replica — so it
+# is named once. Only the *write* side differs per principal, which is the point.
+#
+# `_INBOX.>` is not optional and its absence is a nasty failure: JetStream requests
+# (publishing to a stream, creating a consumer, fetching a batch) are request/reply,
+# and without an inbox subscription the reply is dropped by the server and the client
+# hangs until its own timeout with no error saying why.
+# ⚠️ Spelled out **per principal**, not shared, because one entry is per-principal:
+# `mutation_ack.alice.>` is alice's own write verdicts, and pointing every client at
+# `mutation_ack.>` would let each read the others' failures — including the SQL detail of
+# rows they never wrote.
+#
+# The shared part therefore has to be repeated for every user added here. That is not an
+# oversight: NATS config will not splice a variable into a list (`allow: [$BASE, "x"]`
+# fails with *"Subject in permissions array cannot be cast to string"*), so static config
+# has no way to express "the common set, plus this". It is exactly the duplication that
+# `--allow-sub "…{{name()}}…"` on a scoped signing key removes — see the migration note
+# at the top of this file.
+ALICE_READ = [
+  "cdc.>"                      # the change feed
+  "init.>"                     # snapshot chunks, schemas, snapshot errors
+  "mutation_ack.alice.>"       # her own write verdicts, keyed by her Nats-Msg-Id
+  "$KV.schemas.>"              # schema descriptors
+  "$KV.snapshots.>"            # snapshot descriptors
+  "_INBOX.>"                   # JetStream replies — omit this and everything hangs
+]
+
 authorization {
+
+  # No `default_permissions`: an unlisted user should be able to do nothing, and a
+  # default here would silently grant reach to a user whose permissions block was
+  # mistyped or forgotten.
+
+  BRIDGE = { publish = ">", subscribe = ">" }
+
   users: [
-    { nkey: "${NATS_BRIDGE_NKEY_PUB}" }
+    { nkey: "${NATS_BRIDGE_NKEY_PUB}", permissions: $BRIDGE }
+
+    # ── one entry per principal ────────────────────────────────────────────────
+    # Store the password bcrypted rather than in clear: `nats server passwd`
+    # prints a `$2a$…` hash that goes here verbatim.
+    { user: "alice", password: "${NATS_ALICE_PASSWORD}", permissions: {
+        publish = { allow: [
+          # The only line that differs between principals, and the only line that
+          # matters for integrity: alice's writes are confined to her own subtree.
+          "mutation.alice.>"
+
+          # Read-side requests. Both `snapshot.request` and `init.schema` are
+          # captured by the REQUESTS stream, so a client may ask for any table's
+          # snapshot — asking is not reading, and the reply lands on init.> which
+          # it may already see.
+          "snapshot.request.>"
+          "init.schema.>"
+
+          # The account-info probe. `jetstreamManager(nc)` issues this before anything
+          # else, so omitting it does not fail one feature — it fails the connection,
+          # with `Permissions Violation for Publish to "$JS.API.INFO"` arriving *after*
+          # a successful "Connected" line. It reveals limits and usage for the account,
+          # nothing about other principals' data.
+          "$JS.API.INFO"
+
+          # JetStream plumbing, scoped to the streams a client is allowed to read.
+          # `CREATE.INIT` and `CREATE.INIT.>` are both needed: in NATS `INIT.>`
+          # does not match `INIT` itself, and an ephemeral consumer is created on
+          # the bare form.
+          #
+          # Scoping to named streams is what stops alice creating a consumer on
+          # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
+          # would hand her exactly that, which is why it is not used here.
+          "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
+          "$JS.API.CONSUMER.CREATE.CDC",            "$JS.API.CONSUMER.CREATE.CDC.>"
+          "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
+          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          # `js.consumers.get(stream, name)` reads the consumer back before binding, so
+          # this is needed on every stream the client pulls from. Read-only metadata on
+          # a stream it may already read.
+          "$JS.API.CONSUMER.INFO.INIT.>"
+          "$JS.API.CONSUMER.INFO.CDC.>"
+          "$JS.API.CONSUMER.INFO.KV_schemas.>"
+          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
+
+          # ⚠️ `$JS.API.CONSUMER.DELETE.*` is deliberately absent. The client never
+          # deletes a consumer (its ephemerals expire on their inactivity threshold),
+          # and granting it on INIT/CDC would let alice delete *bob's* in-flight
+          # consumer mid-replay — static config has no name templating, so the grant
+          # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
+          # and REQUESTS, which no client can reach at all.
+
+          "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
+          "$JS.API.STREAM.INFO.INIT"
+          "$JS.API.STREAM.INFO.CDC"
+          "$JS.API.STREAM.INFO.KV_schemas"
+          "$JS.API.STREAM.INFO.KV_snapshots"
+          "$JS.API.DIRECT.GET.KV_schemas.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.>"
+          "$JS.API.STREAM.MSG.GET.KV_schemas"
+          "$JS.API.STREAM.MSG.GET.KV_snapshots"
+          "$JS.ACK.>"
+        ] }
+        subscribe = { allow: $ALICE_READ }
+    } }
   ]
+
+  # Nothing grants a client publish on `cdc.>`, `init.>` or `$KV.>`. That is the
+  # second half of the model and it is load-bearing: these are allow-lists, so a
+  # client cannot forge a change event, overwrite a schema descriptor, or publish a
+  # snapshot chunk. Only the bridge speaks on the read side. Keep it that way when
+  # adding users — it is easy to widen a publish list while debugging and never
+  # narrow it again.
 }
 
 jetstream {
@@ -19,3 +183,25 @@ websocket {
   no_tls: true
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ `mutation_error.>` is deliberately **not** granted to clients any more.
+#
+# It is the older of two failure channels and the two are shaped for different readers:
+#
+#   mutation_error.<table>            operator-facing. "something on this table failed",
+#                                     which is what a dashboard or an alert wants.
+#   mutation_ack.<principal>.<msg_id> client-facing. *which write* failed and why, with
+#                                     the SQLSTATE and message.
+#
+# A client cannot use the first: it is keyed by table, so two concurrent writes produce
+# indistinguishable messages; the body carries the failing subject rather than the client's
+# msg_id, so it cannot be matched to a queued write; and it has one subject for everyone,
+# so alice reading `mutation_error.test_types` sees bob's failures — including the subject
+# that names him. Granting it was the leak this comment used to describe; verdicts made it
+# unnecessary rather than merely narrower.
+#
+# The bridge still publishes both. That is not redundancy to remove blindly: dropping the
+# dead letter would leave an operator with only logs for a per-table failure view, and
+# logs are not a subscribable feed.
+# ─────────────────────────────────────────────────────────────────────────────

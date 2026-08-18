@@ -54,11 +54,11 @@ async def main():
         zb.bad(f"expected 1 accepted / {n - 1} rejected — the window is not holding")
         failed = 1
 
-    print(f"\n{n} core publishes (what the reference web client does)")
+    print(f"\n{n} core publishes (what a client gets WRONG)")
     for _ in range(n):
         await nc.publish(req, b"")
     await nc.flush()
-    zb.ok("published; the stream drops them silently, so the bridge never sees them")
+    zb.ok("published; the stream drops them silently, so the bridge never sees them\n     → this is why a client must use a JetStream publish: only that surfaces the 503")
     print("  → confirm in the bridge log: no new 'Snapshot request received'")
 
     await nc.close()

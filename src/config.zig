@@ -157,7 +157,19 @@ pub const Nats = struct {
     /// misclassifies as retryable still stops eventually, instead of pinning the worker
     /// at one attempt per second for the life of the process (observed: 24 redeliveries
     /// in 15 s before this existed).
-    pub const mutation_max_deliver: i32 = 5;
+    ///
+    /// Raised from 5 once `sqlstateIsPermanent` began ending the hopeless cases early.
+    /// At 5 the budget was wrong in both directions at once: a privilege error burned all
+    /// five attempts before the client heard anything, while five attempts a second apart
+    /// could not outlast a single `Retry.pg_reconnect_delay_seconds` (5 s), so a genuine
+    /// Postgres restart dead-lettered writes that would have succeeded.
+    ///
+    /// Now the budget is spent only on failures that might actually recover, so it can
+    /// cover a few reconnects. ⚠️ The cost is paid by *unrecognised* permanent errors —
+    /// they now take ~15 s to be reported rather than ~4 s. That is the right trade only
+    /// while the classifier stays conservative: widen `sqlstateIsPermanent` before
+    /// raising this further.
+    pub const mutation_max_deliver: i32 = 15;
 
     /// Token positions in the mutation subject, after splitting on '.'. The *shape* of
     /// `mutation.<principal>.<table>.<operation>` is fixed here while the prefix itself

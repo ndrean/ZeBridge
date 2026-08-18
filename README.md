@@ -560,6 +560,23 @@ a row that carries a column your local table lacks until a newer schema arrives 
 `PROTOCOL.md`). Gate on the _column set_, never on the LSN — most rows legitimately carry an
 LSN newer than the last DDL, so an LSN gate stalls forever during quiet periods.
 
+### Inspecting the local replica
+
+The client's SQLite lives in the browser's OPFS under a per-session name, so there is no
+file for the `sqlite3` CLI. `web-consumer` exposes a console handle instead:
+
+```js
+await zb.q('SELECT id, name FROM users ORDER BY id')  // any SQL
+await zb.count('users')                               // { n: 15 }
+await zb.ids('users')                                 // [1,2,3,…] — diff against Postgres
+zb.state()                                            // stored seq/lsn, per-table lsn, failed tables
+```
+
+`zb.ids()` is the one that matters when chasing a sync bug: compare it against
+`SELECT id FROM users ORDER BY id` in psql. A row count alone will not find a **missing
+middle** — and the LSN-boundary bug fixed on 2026-08-17 dropped exactly one row per
+snapshot, which no count would have made obvious.
+
 ### Writing back (ingress)
 
 Publish to `mutation.<principal>.<table>.<operation>`. Three things make this different from
@@ -570,7 +587,7 @@ a normal API call:
   `user_id` in the body would just be a claim.
 * **Last write wins on a version column** — usually `updated_at`. Send the value you hold;
   the bridge applies the row only if yours is newer. A stale write is _rejected, silently by
-  design_ — which is why §7.2's type table matters: a `timestamp` without time zone, or one
+  design_ — which is why §7.3's type table matters: a `timestamp` without time zone, or one
   with second precision, makes "newer" ambiguous and drops real edits.
 * **Your write comes back as CDC**, like anyone else's. That echo is the confirmation.
 

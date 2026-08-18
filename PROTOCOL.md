@@ -264,8 +264,17 @@ JetStream deduplicates retries. Batches use
 `REPLICA IDENTITY DEFAULT` sends, and it is sufficient to delete by key. Do not treat
 it as a malformed event.
 
-⚠️ `old.*` keys are **absent entirely** on a DEFAULT table, and present on every
-UPDATE for a FULL table. A client must not assume they exist.
+⚠️ `old.*` keys are present on every UPDATE for a FULL table. On a DEFAULT table they
+are **usually** absent — but they **do** appear when the UPDATE changes the primary key,
+because the old key is the only way to locate the row. A client must not assume they
+exist, and must not assume they don't.
+
+⚠️ **A changed primary key arrives as one UPDATE, not as a DELETE plus an INSERT.** A
+client that upserts on the new key alone inserts a second row and keeps the old one
+forever — measured: `UPDATE test_types SET id = 888001 WHERE id = 777006` left
+PostgreSQL with one row and an unpatched replica with two. Delete `old.<pk>` before
+applying the row, and see §7.2 on why an editable primary key is a poor choice in the
+first place.
 
 #### An absent key on an UPDATE means "unchanged", never "null"
 
@@ -364,6 +373,21 @@ stateDiagram-v2
     Ready --> [*]: tombstone → drop table
 ```
 
+### ⚠️ Run the gap check only after every initial schema is applied
+
+The KV watch replays existing schemas on connect and marks the last one with `delta === 0`.
+That marker means *"this is the final entry"*, *not* *"this entry has been applied"* — the
+migration for it is still ahead, and it is asynchronous.
+
+A client that treats the marker as "initialisation complete" starts its gap check while the
+last table is still being created, reads a table list that does not contain it, and **never
+requests a snapshot for it**. Observed in a live run: two tables, `users` snapshotted,
+`test_types` silently skipped, and the client still reporting all snapshots replayed. It
+had rows only because the CDC stream happened to still hold every insert from `first_seq`;
+after any rotation that table would have been quietly empty.
+
+Apply the entry first, *then* signal that initialisation is done.
+
 ### Two positions, and they are not interchangeable
 
 A client persists **two** numbers, not one. They live in different coordinate systems and
@@ -396,9 +420,18 @@ Two details that look like off-by-ones and are not:
   message 99 genuinely lost.
 
 **`lsn` then does the other job, after a snapshot.** Having replayed a snapshot taken at LSN
-X, set the table's `lsn = X` and discard every CDC event with `event.lsn <= X`: those rows
-are already in the data you just seeded. Without that test a client re-applies them —
-harmless for an idempotent upsert, wrong for anything counting.
+X, set the table's `lsn = X` and discard every CDC event with **`event.lsn < X`** — those
+rows are already in the data you just seeded.
+
+⚠️ **Strictly less-than. `<=` loses exactly one row per snapshot.** The watermark is
+`pg_current_wal_lsn()` taken at the snapshot's BEGIN, and the next commit is stamped with
+*that same LSN* — measured: watermark `25472600`, first post-snapshot event `25472600`. A
+`<=` gate discards it even though the snapshot never contained it, and the loss is silent:
+the table simply misses the first row written after seeding.
+
+The boundary is genuinely ambiguous, so break the tie by cost. Re-applying a row that *was*
+in the snapshot is free — the apply is an upsert and converges to the same value. Dropping
+a row that was *not* in it is permanent.
 
 ⚠️ **Gate on the column set, not on the LSN.** The LSN tells you *where you are*; the
 column set tells you *whether you can proceed*. Blocking whenever
@@ -501,6 +534,11 @@ Snapshots are served one at a time, and a request waits **in the `REQUESTS` stre
 the worker polls for it. That stream has a `max_age`. If the wait exceeds it — the wait being
 the *sum of the work ahead of it*, not one long snapshot — the broker drops the request
 unread. No chunks, no error, nothing: the bridge never saw it.
+
+⚠️ **Request with a JetStream publish, never a core publish.** A core `publish` is
+fire-and-forget: when the one-per-table window is occupied the broker drops the message and
+tells the client nothing, so it cannot distinguish "queued" from "discarded" and has
+nothing to retry against. Only a JetStream publish returns the 503 below.
 
 Retrying is safe and self-correcting, because the two outcomes are exactly the two you want:
 
@@ -641,6 +679,41 @@ table still corrupts CDC events the same way. Planned fix in `COPY_BINARY_PLAN.m
 > authorization, without a reply, and without the guarantees below. Do not build a
 > client against this section until the 🚧 is gone.
 
+### 7.0 The rule everything else follows from
+
+> **A client never writes. It asks, and state arrives through CDC.**
+
+The write path carries a *request*. The replica is a projection of what PostgreSQL
+actually did, and the only thing that writes to it is the CDC applier. Nothing else
+should ever write to a synced table — not the UI, not a migration, not a repair script.
+
+That single constraint is what makes the edge safe, and it is worth being explicit about
+why, because it removes a class of work rather than adding one:
+
+- **A forbidden write cannot produce forbidden state.** Authorization is enforced where
+  the data lives. A refused mutation writes nothing, so it emits no CDC event, so the
+  replica simply never changes. There is no phantom row to detect and no undo to apply —
+  measured: a mutation to a table the writer has no grant on leaves the client with no
+  row, no error, and no echo.
+- **It holds against a hostile client, not just a buggy one.** A tampered payload, a
+  forged `data` map, a client written by someone else — none of them can put a row into a
+  replica that PostgreSQL did not emit. So the bridge does not have to defend the client
+  from itself, and a client author cannot get this wrong by accident.
+- **Two independent layers, each doing what it is good at.** NATS subject permissions
+  decide *who may ask* (§7.1); PostgreSQL grants, constraints and the version guard decide
+  *what actually happens*. Neither has to model the other, and a gap in one is not a
+  breach of the other.
+
+⚠️ **Optimistic apply is the one thing that can break it.** Writing an unconfirmed row
+straight into a synced table puts state there that PostgreSQL never emitted — exactly what
+the rule forbids — and does it silently, because the row looks like every other row. Keep
+optimistic writes in a separate table and union them in a view, so "is this confirmed?"
+stays answerable by *where the row is* rather than by remembering how it got there.
+
+⚠️ **This is a guarantee about writes only.** Its mirror image is not free: every client
+subscribed to `cdc.>` sees every published table's changes. Read authorization — which
+rows a principal may *receive* — is a separate problem this rule does not touch.
+
 ### 7.1 Subject grammar — the principal is a token, not a field
 
 ```txt
@@ -758,7 +831,7 @@ Two things follow, and they are the whole reason this section is long:
 
 6. **Check the GC watermark before flushing after a long offline period.** A queued
    mutation older than the watermark cannot be applied safely — the tombstone that would
-   have overruled it has been reaped (§7.3).
+   have overruled it has been reaped (§7.5).
 
 **SHOULD**
 
@@ -767,12 +840,175 @@ Two things follow, and they are the whole reason this section is long:
    is the one case where LWW cannot decide for them.
 9. Bound the outbox, and tell the user when it stops draining.
 
-### 7.2 The version value
+### 7.2 The mutation envelope
+
+The subject says *who*, *which table* and *what operation*. The payload says *which row*
+and *what values*. Nothing is carried twice — a payload that repeats `table` or
+`operation` is not merged and does not override; those fields are read from the subject
+and the payload copies are ignored.
+
+```json
+{
+  "key":       { "id": 42 },
+  "data":      { "id": 42, "some_text": "hello", "updated_at": "2026-08-17 17:02:09.151330" },
+  "version":   "2026-08-17 17:02:09.151330",
+  "client_id": "c-8f3a"
+}
+```
+
+MessagePack, as everywhere else on the wire (§4).
+
+| field | required | what it is |
+| --- | --- | --- |
+| `key` | always | Every primary key column, by name. A **partial** key is refused rather than guessed: `ON CONFLICT` would otherwise match a different row than the client meant, and a DELETE would remove more rows than it asked for |
+| `data` | insert, update | The full row. Column names are checked against the catalog, which is the allowlist — an unknown name is refused and never reaches SQL. Ignored for `delete` |
+| `version` | always | The value of *this table's* version column, as text, rendered exactly as CDC renders it (§7.3). Not a timestamp of your choosing, and not a field name you pick |
+| `client_id` | should | Tiebreaker for equal versions (§7.3). Must be **stable across restarts** — a value regenerated per page load also changes `Nats-Msg-Id`, so a mutation retried after a crash is deduplicated against nothing and applies twice. ⚠️ **Accepted but not yet compared** — the bridge resolves on `version` alone today, so equal versions are rejected rather than broken by `client_id` |
+
+**`msg_id` is a header, not a field.** Set `Nats-Msg-Id` on the message and JetStream
+deduplicates retries for you; a payload field named `msg_id` is ignored.
+
+#### Who allocates the key
+
+The client does — `key` is required, and an INSERT from the edge names the row it is
+creating. Which raises the question the rest of this protocol does not answer: **where does
+that value come from when the column is a `serial`/`bigserial`?**
+
+⚠️ **Not from the sequence.** An explicit `id` does not advance `nextval`, so every
+edge-written key is a landmine the sequence will eventually step on. The failure is
+delayed and asymmetric:
+
+- the **application's** next `INSERT` at that value fails with a duplicate key violation,
+  possibly months later, for no reason visible in the app's own history;
+- the same collision arriving **through the bridge** does not fail at all — the upsert's
+  `ON CONFLICT DO UPDATE` silently overwrites whichever row was there first, and LWW
+  decides the winner on a version the two rows never meant to share.
+
+So a table that is written from the edge should not have a database-allocated primary key.
+In order of preference:
+
+| key | why |
+| --- | --- |
+| `uuid` (v4/v7) or ULID | the client mints it alone, with no coordination and no collision. **The default choice for an edge-writable table**; v7/ULID also sort by creation time |
+| a per-client range or prefix | works with integers, but every client needs an assigned band and the bands must be tracked forever |
+| database-allocated | ✅ fine for read-only tables. ⚠️ For edge-writable ones it requires a temp-key-to-real-key mapping and a reply channel to carry it — the bridge has neither today |
+
+#### The key must also be immutable
+
+Client allocation is necessary but not sufficient. A **natural key** — an email address, a
+slug, an ISBN — passes the allocation test easily: the client already has the value, so it
+can name the row with no coordination at all. It fails a second test that UUIDs pass for
+free.
+
+**A primary key that can be edited is not an identity.** Change it and the row's identity
+changes with it, and every mechanism here is keyed on identity:
+
+- The change arrives as **one UPDATE carrying `old.<pk>`**, not as a delete plus an
+  insert. A client that upserts on the new key gains a row and never loses the old one.
+- There is no atomic rename on the wire. The old-key delete and the new-key insert are one
+  event that a client must decompose correctly, and a client that reconnects mid-stream may
+  see the result of one and not the other.
+- **Tombstones are keyed on the primary key** (§7.5), so a tombstone written for the old
+  key does not cover the new one.
+- ⚠️ **An offline client holds the old key.** It edits a row whose key changed while it was
+  away, and its mutation names a key that no longer exists — so the upsert *inserts*,
+  resurrecting a row that was renamed away. The tombstone that would normally overrule an
+  offline write is on the wrong key to help.
+
+And the conflict semantics differ in kind. Two clients that mint the same UUID have hit a
+bug of vanishing probability. Two clients that create `alice@example.com` offline have made
+a **legitimate business conflict** — two independent creations of what the schema says is
+one entity — and LWW will silently merge them, keeping one user's row and discarding the
+other's, exactly as it did for the auto-increment collision above.
+
+So: **primary keys should be immutable and meaningless.** An email belongs under a `UNIQUE`
+constraint, with a surrogate `uuid` as the primary key. That is ordinary schema advice
+elsewhere; here it is a requirement, because the protocol assumes identity is stable and
+gives no way to express that it wasn't.
+
+If an existing `bigserial` table must accept edge writes before it can be migrated, keep
+edge keys in a band the sequence cannot reach and set the sequence explicitly:
+
+```sql
+SELECT setval('<table>_id_seq', (SELECT max(id) FROM <table> WHERE id < <band_start>));
+```
+
+⚠️ **These are the field names.** `primary_key` instead of `key`, or `hlc` instead of
+`version`, is refused as `MissingPrimaryKey` / `MissingVersion` — the names are not
+sniffed or aliased.
+
+#### When it is refused
+
+Every error below is **permanent**: the same bytes fail identically every time, so the
+message is dead-lettered to `mutation_error.<table>` immediately and never retried.
+Transient failures (a lost connection, a constraint violation) are retried instead, up to
+`max_deliver`.
+
+| error | cause |
+| --- | --- |
+| `MissingVersion` | no `version` field, or it is not stringable |
+| `MissingPrimaryKey` | no `key` map, or a key column is absent from it |
+| `MissingData` | `insert`/`update` with no `data` map |
+| `UnknownColumn` | `data` names a column the table does not have |
+| `MalformedSubject` | the subject is not four tokens (§7.1) |
+| `ForbiddenTable` | the table is not writable from the edge |
+| `NoVersionColumn` | the *table* has no version column configured — outbound-only, not a payload problem |
+
+⚠️ Until the reply channel lands (🚧), a dead letter is the **only** signal a write
+failed. A client that does not subscribe to `mutation_error.>` cannot tell a rejected
+write from a slow one.
+
+#### Two failures that look like nothing happening
+
+Both of these are SQL errors, and every SQL error is classified **transient** — the bridge
+cannot tell a lost connection from a constraint violation until the reply channel exists.
+So neither dead-letters immediately: the write is retried to `max_deliver` and the client
+sees no error, no row, and no CDC echo. Check these two first when a well-formed mutation
+vanishes.
+
+**1. The table has not been opened for ingress.** `bridge_writer` is created with *no
+table privileges* on purpose — ingress is closed until a DBA opens a table explicitly, so
+a new table is never silently writable from the edge. The bridge reports
+`permission denied for table <t>`, but the client just sees silence:
+
+```sql
+GRANT SELECT, INSERT, UPDATE ON public.<table> TO bridge_writer;  -- + DELETE if the
+                                                                  -- table has no
+                                                                  -- tombstone column
+```
+
+`SELECT` is required as well as `INSERT`/`UPDATE`: the upsert's `WHERE` reads the stored
+version to decide the conflict.
+
+**2. `data` omits a NOT NULL column that has no DEFAULT.** The INSERT fails, forever, on
+every retry. ⚠️ A client **cannot discover this from the protocol** — the schema
+descriptor in the `schemas` KV carries only column `name` and `type`, never nullability
+or defaults. Until it does, the writable column set is out-of-band knowledge, and
+`inserted_at`-style columns (NOT NULL, no default, set by the application rather than the
+database) are the usual casualty.
+
+### 7.3 The version value
 
 The client sends the value of the table's version column. For a **new** edit it must
 generate one that is greater than the value it holds — in practice "now", rendered
 exactly as the CDC payload renders that column, so no format is negotiated and no
 precision is lost.
+
+For a timestamp column that rendering is **ISO 8601 with `T` and six fractional digits**,
+and the zone suffix follows the column type — both verified against a live echo:
+
+| column type | what CDC emits |
+| --- | --- |
+| `timestamptz` | `2026-08-18T04:57:10.827000Z` — with `Z` |
+| `timestamp` | `2026-08-17T18:10:27.818000` — no suffix |
+
+⚠️ **Migrating the column changes the wire format of every value in it.** A client that
+hardcoded one shape keeps working against PostgreSQL, which parses both — so nothing
+fails, while that client's own string comparisons quietly stop agreeing with the feed.
+
+⚠️ Neither shape is how PostgreSQL *prints* the column: `psql` shows
+`2026-08-18 04:57:10.827+00`, space-separated. A client that matches the database's own
+output rather than the wire produces a value the bridge never emits.
 
 - ⚠️ **Microsecond precision or better.** Second precision means frequent ties, and a tie
   is *rejected* by `<`, so a legitimate edit is dropped silently.
@@ -796,14 +1032,152 @@ running — but the log is the operator's, and the consequence is the client's, 
 | `timestamp` (no zone) | ⚠️ **a naive wall-clock reading.** LWW compares two clients' strings, so the moment one stores local time and another UTC, the *wrong* write wins — and nothing errors | send UTC, always, whatever the local zone. Never `new Date(v)` on a value with no `Z` (§4) |
 | `timestamp(0)` / second precision | ⚠️ concurrent edits inside one second **tie**, and a tie is rejected by `<` | nothing to do client-side; the column needs `(6)`. Ask the DBA |
 | nullable | ⚠️ a NULL stored version makes `stored < incoming` evaluate to NULL, which rejects the write | nothing client-side; the bridge keeps an `IS NULL OR` guard, but `NOT NULL` removes the question |
-| `bigint` / `int` | sound, and immune to clock skew | treat it as opaque and monotonic — increment, never derive from a clock |
+| `bigint` / `int` | sound, and immune to clock skew — but **nothing maintains it for you** (see below) | treat it as opaque and monotonic — increment, never derive from a clock |
 | `created_at` / `inserted_at` | **refused.** Set once at insert, so as a version it rejects every update forever | pick a column that changes on write |
 
 ⚠️ `timestamp without time zone` is the **common** case, not the exotic one: Ecto's
 `timestamps()` and Rails' `t.timestamps` both produce it. If your table came from a
 standard migration, assume naive until you have checked.
 
-### 7.3 Deletes, tombstones, and the GC watermark
+⚠️ **Asking for UTC in Ecto does not get you a UTC column.** `timestamps(type:
+:utc_datetime_usec)` maps to plain `timestamp` — measured, not assumed. The `utc_` is a
+promise Ecto keeps *in Elixir*, coercing on the way in and out; the database stores digits
+with no zone attached. That promise does not extend to this protocol, because the bridge
+applies edge writes with raw SQL and never passes through Ecto. A client sending local
+time is accepted, compared against other clients' UTC values, and silently wins or loses
+on the offset.
+
+`timestamps(type: :timestamptz)` removes the whole question for the same eight bytes and
+the same precision, and Ecto still reads it back as a `DateTime`. For a table that accepts
+edge writes it is worth the migration.
+
+#### Why the sound type is not the default
+
+An integer version is better arithmetic — no clock, no skew, no precision question, no
+ties from a coarse timer. It loses on something else entirely: **who keeps it current.**
+
+`updated_at` is maintained by the framework on every write, for free and everywhere —
+that is what `timestamps()` and `t.timestamps` *are*. An integer version is maintained by
+nobody unless you arrange it, and every write path that forgets leaves the column stale.
+A stale version is not a visible error: the row simply stops being updatable from the
+edge, or the next edge write wins against a newer database write. LWW keeps comparing;
+it just compares the wrong thing.
+
+The frameworks do offer an integer counter, and it is worth knowing why it does not
+simply drop in:
+
+- **Ecto** `Ecto.Changeset.optimistic_lock(:lock_version)` and **Rails**
+  `lock_version` both increment an integer automatically on update.
+- But they are **opt-in per changeset**, not global like `timestamps()` — one update path
+  built without it silently stops maintaining the column.
+- And their conflict policy is the **opposite** of this protocol's: a version mismatch
+  *raises* (`Ecto.StaleEntryError`) rather than letting the later write win. Pointing the
+  bridge at that column puts two policies on one value — the application rejecting
+  conflicts, the edge resolving them — and the bridge's upsert increments it from SQL
+  without the ORM's knowledge.
+
+So: `bigint` is the right choice when you own every writer and can guarantee the
+increment. Otherwise a `timestamptz` the framework already maintains is worth more than
+the better type, and the ⚠️ rows above are the price of that.
+
+### 7.4 Making a table writable from the edge
+
+Everything a table needs before it can accept writes, in one place. Reading is unaffected —
+a table failing any of these still replicates outward normally.
+
+**1. A primary key that the client can mint and will never edit.**
+
+```sql
+CREATE TABLE public.notes (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),  -- see note on the default
+  body        text NOT NULL,
+  deleted_at  timestamptz,                    -- tombstone (item 3)
+  inserted_at timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now()   -- version (item 2)
+);
+GRANT SELECT, INSERT, UPDATE ON public.notes TO bridge_writer;   -- item 4
+ALTER PUBLICATION <pub> ADD TABLE public.notes;
+-- and SYNC_RULES=notes:updated_at,deleted_at
+```
+
+⚠️ `timestamptz` for the version column, not `timestamp` — it sidesteps every caveat in
+§7.3. `NOT NULL DEFAULT now()` on both timestamps means a client that omits them still
+inserts successfully (item 5).
+
+**Keep the `DEFAULT` on the key**, even though the client always supplies it. It is not a
+fallback for a forgetful client — a mutation missing `key` is rejected as
+`MissingPrimaryKey` before any SQL runs, so the default cannot fire on the edge path. It is
+there so the *application's own* server-side inserts keep working unchanged. Unlike a
+sequence, `gen_random_uuid()` holds no state, so nothing falls out of step when the client
+allocates instead (§7.2).
+
+
+- Type `uuid`. **v7 is preferred over v4**: both are collision-safe, but v7 embeds a
+  timestamp, so keys sort by creation time and index inserts stay append-only instead of
+  scattering across the B-tree. PostgreSQL 18 has `uuidv7()`; before that, mint it client
+  side — which the client is doing anyway.
+- **The name does not matter.** The bridge reads the key from the catalog
+  (`pg_index.indisprimary`), so it can be called anything.
+- Never `serial`/`bigserial` (§7.2), never a natural key such as an email (§7.2).
+- **Single column.** Composite keys are supported everywhere — local DDL, the upsert's
+  conflict target, delete-by-key, and the snapshot's keyset pagination — and are the right
+  choice for read-only tables. For *writable* ones, prefer a surrogate; see below.
+
+**2. A version column that changes on every write.** `updated_at` by default; override per
+table with `SYNC_RULES`. Its *type* decides whether LWW is sound — see §7.3, and note the
+common case (`timestamp without time zone`) is the one with caveats.
+
+**3. A tombstone column, if deletes must survive offline clients.** Without one a delete is
+physical, and an offline client's queued edit **resurrects the row** — there is no "row not
+found" on this path (see below). With one, the delete is a soft delete that LWW can
+overrule. Configured as the second column in that table's `SYNC_RULES` entry (§7.5).
+
+**4. A grant.** `bridge_writer` starts with no table privileges, deliberately:
+
+```sql
+GRANT SELECT, INSERT, UPDATE ON public.<table> TO bridge_writer;   -- + DELETE if no
+                                                                   -- tombstone column
+```
+
+**5. Every `NOT NULL` column either has a `DEFAULT` or is sent in `data`.** The schema
+descriptor carries only names and types, so a client cannot discover which is which —
+today this is out-of-band knowledge (§7.2).
+
+#### Composite keys: the arity is not the problem
+
+A composite key fails for the same reason a single natural key does, when it fails at all.
+`(phone, email)` is unusable because both columns are **editable**, not because there are
+two of them — it would fail identically as one column. Meanwhile a link table keyed
+`(user_id, role_id)` passes every test above: both columns are foreign keys to UUIDs the
+client already holds, both are immutable, and changing one does not edit the relationship,
+it names a *different* one.
+
+So the rule is unchanged — immutable and meaningless, per column. But for an edge-writable
+table there is a second, subtler reason to prefer a surrogate anyway:
+
+⚠️ **Re-creating a soft-deleted row reuses its tombstone.** The upsert sets only the
+columns present in `data`, so a row that was tombstoned and is then re-inserted under the
+same key keeps its `deleted_at` — it comes back *still deleted*. That is easy to hit on
+exactly the tables composite keys suit: remove a role, re-add the same role, and the
+relationship is recreated on top of its own deletion. A client can work around it by
+sending `deleted_at: null` explicitly, but it has to know to.
+
+With a surrogate `uuid`, re-adding is a new row with no history to fight, and
+`(user_id, role_id)` becomes a `UNIQUE` constraint. Natural uniqueness is a constraint;
+identity is a key. The same split as email, one level up.
+
+#### ⚠️ There is no "row not found"
+
+`insert` and `update` are the **same operation**: an upsert on the primary key. The subject
+token distinguishes them for authorization and logging, not for behaviour. So an `update`
+naming a key that does not exist does not fail — **it creates that row.**
+
+That makes UPDATE and DELETE safe in the sense that matters here (neither invents a key, so
+neither can collide), but it means the client's key is load-bearing in both directions: a
+wrong key is not rejected, it is a new row. And it is why item 3 exists — without a
+tombstone, an offline edit to a row deleted elsewhere silently brings it back.
+
+### 7.5 Deletes, tombstones, and the GC watermark
 
 A delete from the edge is a **soft delete**: the row survives with its tombstone column
 set, so that an offline client's later edit can be overruled instead of resurrecting the

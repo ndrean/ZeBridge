@@ -384,6 +384,10 @@ pub fn main(init: std.process.Init) !void {
         default_version_column,
         runtime_config.strict_tables,
         &refused,
+        // The writer's grants are the authoritative statement of which tables are meant
+        // to accept edge writes; preflight needs the role they were made to. Null when
+        // ingress is unconfigured, which makes every grant check a correct false.
+        if (runtime_config.pg_writer_url) |url| preflight.roleFromUrl(url) else null,
     ) catch |err| switch (err) {
         // STRICT_TABLES asked us to stop; that verdict must reach main, not be
         // swallowed as "the check could not run". Signal first: unwinding runs
@@ -468,6 +472,7 @@ pub fn main(init: std.process.Init) !void {
         &pg_config,
         &should_stop,
         monitored_tables,
+        parsed_args.publication_name,
         &refused,
         parsed_args.encoding_format,
         &runtime_config,

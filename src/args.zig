@@ -38,6 +38,10 @@ const usage =
     \\  SYNC_VERSION_COLUMN   default version column (default: updated_at)
     \\  SYNC_RULES            per-table override, same grammar:
     \\                        users:updated_at,deleted_at;orders:modified_at
+    \\  TENANT_RULES          which column carries the tenant, per table:
+    \\                        orders:tenant_id;invoices:tenant_id
+    \\                        A listed table gets its tenant appended to every CDC
+    \\                        subject, so reads can be scoped per principal.
     \\  LOG_LEVEL             debug|info|warn|err (default: info).
     \\                        Log lines print "warning"/"error"; both
     \\                        spellings are accepted here.
@@ -359,6 +363,24 @@ pub const Args = struct {
     /// is the tombstone.
     pub fn parseSyncRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
         return parseTableRules(allocator, init, "SYNC_RULES");
+    }
+
+    /// `TENANT_RULES=orders:tenant_id;invoices:tenant_id`
+    ///
+    /// Which column carries the tenant, per table. A table listed here has its tenant
+    /// appended to every CDC subject (`cdc.<table>.<op>.<tenant>`), so NATS subject
+    /// permissions can scope reads the way they already scope writes.
+    ///
+    /// Deliberately a **separate variable** from SYNC_RULES rather than a third positional
+    /// field. SYNC_RULES is `table:version[,tombstone]` with an optional second column, so
+    /// a third could not be told apart from a tombstone by position — and confusing a
+    /// tombstone column with a tenant column would route every row of the table to a
+    /// subject named after a timestamp.
+    ///
+    /// The same list-of-columns type as the other two, so the parser is shared; only the
+    /// first column is read.
+    pub fn parseTenantRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
+        return parseTableRules(allocator, init, "TENANT_RULES");
     }
 
     fn parseTableRules(

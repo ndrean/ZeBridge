@@ -34,8 +34,30 @@ def subject(*parts: str) -> str:
 
 
 async def connect():
+    """Connect with whichever credential the server is configured for.
+
+    Two shapes now, because the server carries per-principal permissions:
+
+      nkey            `NATS_NKEY_SEED` — the bridge's own key, authorised for everything.
+                      Right for scenarios that inspect streams or act as the bridge.
+      user/password   userinfo in `NATS_URL`, e.g.
+                      `NATS_URL=nats://alice:s3cret@127.0.0.1:4222`. Right for anything
+                      testing what a *client* can do, because it is confined to
+                      `mutation.alice.>` exactly as a real client is.
+
+    ⚠️ Prefer the URL when it carries credentials: a scenario that means to exercise a
+    client's permissions but silently connects as the bridge would pass while proving
+    nothing — every permissions violation it exists to catch is one the bridge is allowed
+    to perform.
+    """
+    if "@" in NATS_URL.split("://", 1)[-1]:
+        return await nats.connect(NATS_URL)
     if not NKEY_SEED:
-        sys.exit("NATS_NKEY_SEED is not set.\n  set -a && . ./.env && set +a")
+        sys.exit(
+            "No NATS credentials.\n"
+            "  set -a && . ./.env && set +a          # bridge nkey, full access\n"
+            "  NATS_URL=nats://alice:s3cret@127.0.0.1:4222   # as a client principal"
+        )
     return await nats.connect(NATS_URL, nkeys_seed_str=NKEY_SEED)
 
 

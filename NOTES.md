@@ -276,6 +276,183 @@ transaction shape and row count, so the next regression has something to contrad
 
 ---
 
+### 1.8 Read authorization — what the publication can and cannot filter
+
+Writes are authorized by the DBA's grants and RLS, and the bridge enforces nothing (§7.0)
+— **per table, per column and per row, all available today** with no schema change, because
+a write is a statement and the DBA's rules apply to statements. Reads have no equivalent:
+every client subscribed to `cdc.>` receives every published table's changes.
+
+That asymmetry is the same property seen from two sides. The write path is safe *because*
+it goes through the database; the read path is unscoped *because* it does not. Two PostgreSQL features look like the answer and each rules the other out.
+
+**RLS is not one of them.** It is evaluated against `current_user` at query time, and
+logical decoding has no query and no user. Measured: a table with `USING (owner='alice')`
+returned **1 row** to a `SELECT` by `bridge_reader` and emitted **2 INSERT records** to the
+WAL, bob's included. So RLS filters the snapshot and is bypassed by CDC — the two paths
+describe different tables, and the snapshot is the one that obeys.
+
+What pgoutput *does* honour is the publication's **column list** and **row filter**. Both
+are DBA-authored, both live in the database, and the snapshot path now applies them too
+(`getTableColumns` reads `prattrs`; the chunk loop ANDs in `pg_get_expr(prqual, prrelid)`).
+Before that the snapshot shipped rows the change feed would never mention again — no
+update, no delete, no tombstone — so they sat in the replica permanently, uncorrectable.
+
+⚠️ **But the two filters exclude each other on any table that is written to**, and
+PostgreSQL enforces it at the source rather than leaving the bridge to cope:
+
+| configuration | UPDATE / DELETE |
+| --- | --- |
+| RI `DEFAULT` + row filter on a non-key column | **refused** — *"Column used in the publication WHERE expression is not part of the replica identity"* |
+| RI `FULL` + column list omitting any column | **refused** — *"Column list used by the publication does not cover the replica identity"* |
+| RI `FULL` + row filter, no column list | permitted |
+
+So hiding a column forces `DEFAULT`, which restricts row filters to key columns; filtering
+by an owner column forces `FULL`, which forbids hiding anything. And the failure is loud in
+the worst way — adding a publication filter can stop the *application's* own writes, not
+merely the bridge's.
+
+#### ✅ Unless the tenant column is part of the key — then all of it works
+
+The exclusion above is a consequence of the filter column sitting *outside* the replica
+identity. Put it inside and every constraint dissolves at once. Measured, with
+`PRIMARY KEY (tenant_id, uid)` and RI `DEFAULT`:
+
+| | result |
+| --- | --- |
+| `WHERE (tenant_id = 'a')` on the publication | UPDATE and DELETE **permitted** — the column is in the replica identity |
+| column list `(tenant_id, uid, note)`, omitting `secret` | **accepted** — it covers the replica identity |
+| DELETE payload | **carries `tenant_id`** — it carries the key, so the delete is routable |
+| moving a row between tenants | a **key change**, so CDC emits `old.tenant_id` as well |
+
+That last row matters more than it looks: the "row leaves the bucket" case — where one WAL
+record has to become a removal for the old owner and an insert for the new — needs the old
+owner's identity, and a key change is the one UPDATE shape that supplies it under
+`DEFAULT`. A tenant column outside the key gets none of this.
+
+**So the schema rule is one line: for a table that needs per-tenant reads, the tenant
+column belongs in the replica identity.** No `FULL`, no write amplification, no choosing
+between hiding a column and filtering rows.
+
+⚠️ **In the replica identity — not necessarily in the primary key.** Changing a key is
+expensive: every referencing foreign key follows it, and clients key their local replicas
+on it. `REPLICA IDENTITY USING INDEX` gets the same result for two statements and no key
+change (measured — DELETE carried the tenant, the column list still hid `secret`, and the
+published `pk_columns` were unchanged because the bridge reads `indisprimary`, not the
+replica identity):
+
+```sql
+CREATE UNIQUE INDEX t_ri ON t (tenant_id, uid);   -- NOT NULL columns, unique, not partial
+ALTER TABLE t REPLICA IDENTITY USING INDEX t_ri;
+```
+
+The primary key stays `uid`, so **no client changes** and no FK churn. The cost is one
+index per table and remembering that dropping it silently drops the replica identity with
+it.
+
+Two ways to use it, and they trade differently:
+
+- **A publication (and slot) per tenant.** PostgreSQL does the filtering, so a bridge bug
+  cannot leak across tenants — the rows never enter the process. ⚠️ Bounded by
+  `max_replication_slots` / `max_wal_senders`, both **10** in this compose, so it fits "a
+  small number of tenants" literally and stops there.
+- **One slot, and the bridge appends the tenant to the subject**
+  (`cdc.<table>.<op>.<tenant>`), with NATS allow-lists enforcing who may subscribe. No slot
+  ceiling, and it reuses the mechanism that already authorizes writes — but the rows do
+  pass through the bridge, so isolation is the bridge's correctness rather than the
+  database's.
+
+The second scales; the first is defence in depth. They compose: filter per tenant *and*
+tag the subject, if the tenant count stays small enough to afford the slots.
+
+`FULL` also has a standing cost: every UPDATE and DELETE writes the entire old row to WAL,
+and every CDC event carries `old.*` for every column, which is per-event buffer pressure
+(`BASE_BUF`) as well as write amplification.
+
+**Why `FULL` is nonetheless the only basis for per-row routing.** Under `DEFAULT` the
+bridge cannot evaluate an ownership rule on the events that matter:
+
+| event | payload under `DEFAULT` | can the bridge route it? |
+| --- | --- | --- |
+| INSERT | full new tuple | yes |
+| UPDATE, key unchanged | new tuple only | new owner yes; **old owner unknown** |
+| UPDATE, key changed | new tuple + old key | same, plus the old key |
+| DELETE | **old key only** | **no** — zero owner attributes |
+
+A delete carries no tenant column at all, so it cannot be addressed to the principal who
+held the row. `FULL` supplies the old tuple and closes both gaps.
+
+⚠️ Even then, an UPDATE that *moves* a row between owners needs the bridge to emit two
+events — a removal to the old owner, an insert to the new — because one WAL record has to
+become two subjects. Nothing in PostgreSQL does that; it is bridge work, and it is the
+same "row leaves the bucket" problem PowerSync solves with bucket membership.
+
+#### If RLS is enabled, `bridge_reader` needs a policy — not `BYPASSRLS`
+
+RLS applies to the snapshot (it is a `SELECT`) and the reader has **one session for all
+tenants**, with no principal to resolve — so every RLS-protected table snapshots as **0
+rows** while CDC ships everything. The reader therefore has to be exempted somehow, and the
+two ways are not equivalent:
+
+| | `shop` (should replicate) | `payroll` (should never be read) |
+| --- | --- | --- |
+| `ALTER ROLE bridge_reader BYPASSRLS` | 2 rows ✓ | **1 row ✗** |
+| `CREATE POLICY reader_all ON shop FOR SELECT TO bridge_reader USING (true)` | 2 rows ✓ | **0 rows ✓** |
+
+`BYPASSRLS` is a *role attribute*: it applies to every table in the database. Combined with
+the blanket `GRANT SELECT ON ALL TABLES IN SCHEMA public` this file already issues — plus
+the matching `ALTER DEFAULT PRIVILEGES` — it means the bridge process can read every table
+that exists or ever will. A per-table permissive policy is the same capability scoped to
+the tables actually replicated, and it **fails closed** for anything nobody considered.
+
+⚠️ Either way the reader ends up able to see every *row* of the tables it replicates, so
+read confidentiality becomes the bridge's correctness (does the snapshot apply `prqual`?)
+rather than the database's. The write path keeps the opposite property: `bridge_writer`
+must never hold `BYPASSRLS`, and with RLS in place a fully compromised bridge still cannot
+write outside a principal's tenant. **A bridge bug can leak reads; it cannot forge writes.**
+
+⚠️ And RLS guards only the snapshot door. A table accidentally added to the publication is
+shipped by pgoutput whatever its policies say — *not publishing it* is the only control
+that reaches CDC.
+
+#### The cost of per-tenant snapshots — measured, and it hinges on clustering
+
+A tenant-scoped read path means one snapshot per (table, tenant) rather than per table.
+That sounds like N× the work and mostly is not: each row belongs to exactly one tenant, so
+the N snapshots *partition* the table — summed, they carry one snapshot's worth of rows.
+It is also demand-driven, so N is the number of tenants that actually connect.
+
+⚠️ **The I/O, though, depends entirely on physical layout.** Measured on 200k rows across
+20 tenants, 6,250 blocks total:
+
+| | heap blocks read for one tenant |
+| --- | --- |
+| rows interleaved (the natural insert order) | **6,250** — the whole table |
+| after `CLUSTER t USING t_zb_ri` | **313** — its own 1/20th |
+
+Unclustered, every tenant's snapshot scans nearly the entire heap, so N tenants really do
+cost N full scans. Clustered on the tenant-leading index, the N snapshots together cost
+about *one* scan — which is what a single shared snapshot would have cost anyway.
+
+The index required for the replica identity (`(tenant_id, <pk>)`) is exactly the right
+cluster key, so it is one more line in the same migration. ⚠️ `CLUSTER` takes an
+`ACCESS EXCLUSIVE` lock and is **not maintained** — new rows land wherever there is space,
+so the locality decays and the command has to be repeated. Declarative partitioning by
+tenant gives the same locality permanently, with no lock and no repetition, and is the
+better answer once tenant counts grow.
+
+**And the multiplication lands on the right side.** A single shared snapshot sends every
+tenant's rows to every client — the leak this whole section exists to close, and N× the
+bandwidth per client. Per-tenant snapshots invert that: bridge-side total work stays flat,
+client-side work drops by a factor of N.
+
+**Where this leaves the design.** Per-table secrecy (a column that never leaves the
+database) is a publication column list, and it works today. Per-principal routing is a
+bridge concern regardless — Postgres has one slot and no notion of who is subscribing — so
+it means a DBA-declared owner column becoming a subject token (`cdc.<table>.<op>.<owner>`)
+with NATS allow-lists enforcing it, exactly as `mutation.<principal>.…` works for writes.
+That path requires `REPLICA IDENTITY FULL` on any table it applies to.
+
 ## 3. PostgreSQL behaviours worth remembering
 
 ### 3.1 `ALTER TABLE` serialises against writers — demonstrated

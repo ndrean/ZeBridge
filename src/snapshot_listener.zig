@@ -114,6 +114,47 @@ fn requestWindowSeconds(js: *nats.JS, stream: []const u8) u64 {
     return @intCast(@divTrunc(cfg.max_age, std.time.ns_per_s));
 }
 
+/// Is this table in the publication *now*?
+///
+/// `monitored_tables` is read once at boot, and a publication changes without restarting
+/// the bridge: `ALTER PUBLICATION … ADD TABLE` after startup left the snapshot listener
+/// refusing a table the DDL path had *already published a schema for* — the client built a
+/// local table it could never seed, and the only remedy was a restart nothing told the
+/// operator to perform.
+///
+/// So the boot list is treated as a cache, not as truth: when it says no, ask Postgres
+/// before refusing. One query, on a path that only runs when a request would otherwise be
+/// rejected.
+fn isTableInPublication(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    publication: []const u8,
+    table: []const u8,
+) bool {
+    const conninfo = pg_config.connInfo(allocator, false) catch return false;
+    defer allocator.free(conninfo);
+
+    const conn = c.PQconnectdb(conninfo.ptr);
+    defer c.PQfinish(conn);
+    if (c.PQstatus(conn) != c.CONNECTION_OK) return false;
+
+    const query =
+        \\SELECT 1 FROM pg_publication_tables
+        \\WHERE pubname = $1 AND schemaname = 'public' AND tablename = $2
+    ;
+    const pub_z = allocator.dupeZ(u8, publication) catch return false;
+    defer allocator.free(pub_z);
+    const tbl_z = allocator.dupeZ(u8, table) catch return false;
+    defer allocator.free(tbl_z);
+
+    const values = [_][*c]const u8{ pub_z.ptr, tbl_z.ptr };
+    const res = c.PQexecParams(conn, query, 2, null, &values, null, null, 0);
+    defer c.PQclear(res);
+
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return false;
+    return c.PQntuples(res) > 0;
+}
+
 /// Is there any row after the cursor?
 ///
 /// The end-of-table test. A short chunk is ambiguous — the running byte sum trims chunks
@@ -368,10 +409,63 @@ fn publishWithRetry(
 /// table since the bridge connected — a snapshot can be requested before that.
 ///
 /// Caller owns the returned slice and each name.
+/// The publication's row filter for this table, or null when it publishes every row.
+///
+/// pgoutput evaluates `prqual` on every change, so a filtered publication ships only the
+/// matching rows — while a snapshot is a plain `SELECT` and ships all of them. Left
+/// unhandled, the two paths describe different tables: a client seeds with rows the change
+/// feed will never mention again, and they sit in the replica forever because no delete
+/// ever arrives for them.
+///
+/// ⚠️ The expression is taken from `pg_get_expr`, i.e. PostgreSQL's own rendering of a
+/// parsed node tree — not from user text. It cannot carry an injection: the DBA already
+/// had to run `ALTER PUBLICATION` to put it there, and what comes back is the planner's
+/// deparse of what was stored.
+///
+/// Returns null on any failure, which keeps a snapshot possible on a database whose
+/// catalog this cannot read — at the cost of the filter, which is the safer direction to
+/// fail only because the alternative is no snapshot at all. It is logged loudly.
+fn publicationRowFilter(
+    allocator: std.mem.Allocator,
+    conn: *c.PGconn,
+    table_name: []const u8,
+    publication: []const u8,
+) ?[]const u8 {
+    var schema: []const u8 = "public";
+    var table: []const u8 = table_name;
+    if (std.mem.indexOfScalar(u8, table_name, '.')) |dot| {
+        schema = table_name[0..dot];
+        table = table_name[dot + 1 ..];
+    }
+
+    const query = utils.allocPrintZ(
+        allocator,
+        \\SELECT pg_get_expr(pr.prqual, pr.prrelid)
+        \\FROM pg_publication_rel pr
+        \\JOIN pg_publication p ON p.oid = pr.prpubid
+        \\WHERE p.pubname = '{s}' AND pr.prrelid = '"{s}"."{s}"'::regclass;
+    ,
+        .{ publication, schema, table },
+    ) catch return null;
+    defer allocator.free(query);
+
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) return null;
+    if (c.PQgetisnull(res, 0, 0) == 1) return null; // published whole — the common case
+
+    const expr = std.mem.span(c.PQgetvalue(res, 0, 0));
+    if (expr.len == 0) return null;
+    return allocator.dupe(u8, expr) catch null;
+}
+
 fn getTableColumns(
     allocator: std.mem.Allocator,
     conn: *c.PGconn,
     table_name: []const u8,
+    /// The publication whose column list bounds the snapshot. A table published whole
+    /// has `prattrs IS NULL` and every column is taken, which is the common case.
+    publication: []const u8,
 ) ![]pg_copy_binary.ColumnMeta {
     var schema: []const u8 = "public";
     var table: []const u8 = table_name;
@@ -402,11 +496,15 @@ fn getTableColumns(
         \\  ON i.indrelid = a.attrelid AND i.indisprimary
         \\LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
         \\  ON k.attnum = a.attnum
+        \\LEFT JOIN pg_publication_rel pr
+        \\  ON pr.prrelid = a.attrelid
+        \\ AND pr.prpubid = (SELECT oid FROM pg_publication WHERE pubname = '{s}')
         \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
         \\  AND a.attnum > 0 AND NOT a.attisdropped
+        \\  AND (pr.prattrs IS NULL OR a.attnum = ANY(pr.prattrs))
         \\ORDER BY a.attnum;
     ,
-        .{ schema, table },
+        .{ publication, schema, table },
     );
     defer allocator.free(query);
 
@@ -676,6 +774,9 @@ pub const SnapshotListener = struct {
     pg_config: *const pg_conn.PgConf,
     should_stop: *std.atomic.Value(bool),
     monitored_tables: []const []const u8,
+    /// The publication this bridge streams. Kept so the snapshot thread can re-check
+    /// membership against Postgres when its boot-time list says a table is unknown.
+    publication_name: []const u8,
     refused: *refused_tables.Registry,
     thread: ?std.Thread = null,
     format: encoder_mod.Format,
@@ -695,6 +796,7 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
+        publication_name: []const u8,
         refused: *refused_tables.Registry,
         format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
@@ -707,6 +809,7 @@ pub const SnapshotListener = struct {
             .pg_config = pg_config,
             .should_stop = should_stop,
             .monitored_tables = monitored_tables,
+            .publication_name = publication_name,
             .refused = refused,
             .thread = null,
             .format = format,
@@ -763,6 +866,7 @@ pub const SnapshotListener = struct {
             self.pg_config,
             self.should_stop,
             self.monitored_tables,
+            self.publication_name,
             self.refused,
             self.format,
             self.chunk_size,
@@ -1128,6 +1232,7 @@ pub const SnapshotListener = struct {
         pg_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         monitored_tables: []const []const u8,
+        publication_name: []const u8,
         refused: *refused_tables.Registry,
         format: encoder_mod.Format,
         chunk_size: usize,
@@ -1284,8 +1389,11 @@ pub const SnapshotListener = struct {
                         continue;
                     }
 
-                    // Validate table is monitored
-                    const is_monitored = publication_mod.isTableMonitored(table_name, monitored_tables);
+                    // Validate table is monitored. The boot list first — one string
+                    // comparison — and Postgres only when that says no, because a
+                    // publication can grow while the bridge runs.
+                    const is_monitored = publication_mod.isTableMonitored(table_name, monitored_tables) or
+                        isTableInPublication(allocator, pg_config, publication_name, table_name);
                     if (!is_monitored) {
                         log.warn("📸 Table '{s}' not in monitored tables — publishing error", .{table_name});
                         publishSnapshotError(
@@ -1325,6 +1433,7 @@ pub const SnapshotListener = struct {
                         endpoint,
                         topo,
                         refused,
+                        publication_name,
                     ) catch |err| {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         publishSnapshotError(
@@ -1367,6 +1476,10 @@ pub const SnapshotListener = struct {
         /// Shared with preflight and the CDC path. A row too wide to publish is refused
         /// here on the same terms, so the two paths cannot disagree about one table.
         refused: *refused_tables.Registry,
+        /// The publication, so the snapshot can be bounded by the same column list and
+        /// row filter that bound CDC. Without it the two paths describe different tables:
+        /// pgoutput honours `prattrs`/`prqual`, a plain `SELECT` does not.
+        publication_name: []const u8,
     ) !SnapshotResult {
         const started_at = @as(i64, c.time(null));
         log.info("📸 Generating snapshot for '{s}' (id={s}, row ceiling {d})", .{
@@ -1459,8 +1572,16 @@ pub const SnapshotListener = struct {
         // since the schema cannot move inside the transaction, which is also why it
         // must never be cached across snapshots: a stale layout decodes values into the
         // wrong columns silently.
-        const columns = try getTableColumns(allocator, conn.?, table_name);
+        const columns = try getTableColumns(allocator, conn.?, table_name, publication_name);
         defer freeTableColumns(allocator, columns);
+
+        // Inside the same transaction as the layout, for the same reason: a publication
+        // altered mid-snapshot must not change which rows the later chunks carry.
+        const row_filter = publicationRowFilter(allocator, conn.?, table_name, publication_name);
+        defer if (row_filter) |f| allocator.free(f);
+        if (row_filter) |f| {
+            log.info("📸 '{s}': publication row filter applies — {s}", .{ table_name, f });
+        }
 
         // The keyset cursor columns, resolved from the same rows rather than a second
         // query. Binary COPY has no header to resolve against, so this is the only
@@ -1603,10 +1724,18 @@ pub const SnapshotListener = struct {
             // The first chunk has no cursor, so it takes the whole table rather than a
             // sentinel value: `"id" > 0` would silently drop a row with a zero or
             // negative key, and there is no sentinel at all for a text or uuid key.
-            const where_clause: []const u8 = if (cursor.values.len == 0)
+            const keyset: []const u8 = if (cursor.values.len == 0)
                 "1=1"
             else
                 try pg_copy_binary.keysetPredicate(chunk_alloc, columns, pk.idx, cursor.values);
+
+            // The publication's row filter, ANDed in so the snapshot ships exactly the
+            // rows CDC would. Resolved once per snapshot, above the loop, because it
+            // cannot change inside the REPEATABLE READ transaction.
+            const where_clause: []const u8 = if (row_filter) |f|
+                try std.fmt.allocPrint(chunk_alloc, "({s}) AND ({s})", .{ keyset, f })
+            else
+                keyset;
 
             // Two nested bounds. The inner LIMIT caps how many rows Postgres *measures*;
             // the outer running sum caps how many it *sends*, so the bridge receives at

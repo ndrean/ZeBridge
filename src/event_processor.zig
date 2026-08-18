@@ -663,6 +663,64 @@ pub const EventProcessor = struct {
 
     /// Process a DDL event, query PostgreSQL for the new schema, perform SQLite transformation,
     /// and pack it into the ring buffer directly to the KV schemas subject.
+
+    /// Append `"version_column"` and `"tombstone_column"` to a schema descriptor.
+    ///
+    /// The bridge resolves both from `SYNC_RULES` (falling back to the global default
+    /// version column), and until now kept the answer to itself — a descriptor carried
+    /// `pk_columns` but never said *which* column a client must send as `version`, nor
+    /// whether deletes on this table are soft. Both are required to write to the table
+    /// (PROTOCOL.md §7.4), so leaving them out meant the write contract could not be
+    /// derived from the wire at all: it lived in the bridge operator's env file.
+    ///
+    /// `version_column` is **null when the named column does not exist on the table**,
+    /// which is the honest way to say "outbound-only" — the mutation path would reject
+    /// every write with `NoVersionColumn`, and a client is better off knowing before it
+    /// queues an edit than after.
+    fn appendWriteContract(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        json_str: *std.ArrayListUnmanaged(u8),
+        table: []const u8,
+        column_names: []const []const u8,
+    ) !void {
+        var version_name: []const u8 = self.default_version_column;
+        var tombstone_name: ?[]const u8 = null;
+        if (self.sync_rules.get(table)) |cols| {
+            if (cols.len > 0) version_name = cols[0];
+            if (cols.len > 1) tombstone_name = cols[1];
+        }
+
+        const has = struct {
+            fn f(names: []const []const u8, want: []const u8) bool {
+                for (names) |n| if (std.mem.eql(u8, n, want)) return true;
+                return false;
+            }
+        }.f;
+
+        if (has(column_names, version_name)) {
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                arena,
+                ",\"version_column\":\"{s}\"",
+                .{version_name},
+            ));
+        } else {
+            try json_str.appendSlice(arena, ",\"version_column\":null");
+        }
+
+        if (tombstone_name) |t| {
+            if (has(column_names, t)) {
+                try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                    arena,
+                    ",\"tombstone_column\":\"{s}\"",
+                    .{t},
+                ));
+                return;
+            }
+        }
+        try json_str.appendSlice(arena, ",\"tombstone_column\":null");
+    }
+
     pub fn packDdlToSlot(
         self: *EventProcessor,
         arena: std.mem.Allocator,
@@ -791,6 +849,9 @@ pub const EventProcessor = struct {
             "{{\"table\":\"{s}\",\"pg\":{{\"columns\":[",
             .{clean_table},
         ));
+        // Column names, kept so the write contract can say whether the configured
+        // version/tombstone columns actually exist on this table.
+        var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
         for (columns, 0..) |col_val, i| {
             const name = if (col_val == .object) col_val.object.get("name") else null;
             const ty = if (col_val == .object) col_val.object.get("type") else null;
@@ -801,6 +862,7 @@ pub const EventProcessor = struct {
             self.recordColumnType(col_val);
 
             if (i > 0) try json_str.appendSlice(arena, ",");
+            try column_names.append(arena, name.?.string);
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
                 "{{\"name\":\"{s}\",\"type\":\"{s}\"}}",
@@ -909,9 +971,11 @@ pub const EventProcessor = struct {
         try json_str.appendSlice(arena, "}");
         try json_str.appendSlice(arena, try std.fmt.allocPrint(
             arena,
-            ",\"replica_identity\":\"{s}\",\"lsn\":{d}}}",
-            .{ identity, wal_end },
+            ",\"replica_identity\":\"{s}\"",
+            .{identity},
         ));
+        try self.appendWriteContract(arena, &json_str, clean_table, column_names.items);
+        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{wal_end}));
 
         // Create subject: $KV.schemas.{table}
         const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
@@ -1082,6 +1146,7 @@ pub const EventProcessor = struct {
                 .{clean_table},
             ));
             
+            var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
             var r: i32 = 0;
             while (r < num_rows) : (r += 1) {
                 if (r > 0) try json_str.appendSlice(arena, ",");
@@ -1102,6 +1167,7 @@ pub const EventProcessor = struct {
                     }
                 } else |_| {}
 
+                try column_names.append(arena, col_name);
                 const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, data_type});
                 try json_str.appendSlice(arena, col_json);
             }
@@ -1170,9 +1236,11 @@ pub const EventProcessor = struct {
             try json_str.appendSlice(arena, "}");
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
-                ",\"replica_identity\":\"{s}\",\"lsn\":{d}}}",
-                .{ identity, boot_lsn },
+                ",\"replica_identity\":\"{s}\"",
+                .{identity},
             ));
+            try self.appendWriteContract(arena, &json_str, clean_table, column_names.items);
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{boot_lsn}));
 
             const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
             const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}", .{clean_table});

@@ -83,6 +83,236 @@ END;
 $$ LANGUAGE plpgsql;
 
 
+-- ---------------------------------------------------------
+-- Per-tenant scoping — ONE entry point, on purpose
+-- ---------------------------------------------------------
+--
+-- ⚠️ **Use `zebridge_publish_tenant_table()` and nothing else** to put a tenant-scoped
+-- table into a publication. A bare `ALTER PUBLICATION ... ADD TABLE` is the failure this
+-- exists to prevent: it publishes the table with no row filter and no policy, and every
+-- subscriber of that publication then receives every tenant's rows. Nothing errors, and
+-- nothing in the bridge can detect it — the bridge is a pass-through and is meant to stay
+-- one.
+--
+-- The function does the four things that must not drift apart, in the order they must
+-- happen:
+--
+--   1. refuses a nullable or absent tenant column (a NULL tenant belongs to nobody, and a
+--      nullable column cannot carry a replica identity)
+--   2. moves the REPLICA IDENTITY to (tenant_col, <pk>) if the tenant is not already in it
+--      — without this PostgreSQL refuses every UPDATE and DELETE on the table once the
+--      publication carries a filter, including the application's own
+--   3. enables RLS and creates two policies: writes bounded by the principal→tenant
+--      mapping, reads left wide for `bridge_reader` (one session serves all tenants, so it
+--      has no principal to resolve — read scoping is the publication's job)
+--   4. only then adds the table to the publication, with the filter
+--
+-- Called once per (table, tenant): the per-table work is idempotent, the publication entry
+-- is per-tenant. Each publication needs its own replication slot and its own bridge
+-- instance.
+--
+-- ⚠️ `bridge_reader` must NOT be given BYPASSRLS to make step 3 work. That is a *role*
+-- attribute covering every table in the database, and this file already grants the reader
+-- SELECT on all of them — including tables added later by someone who never heard of the
+-- bridge. The per-table `zb_reader_all` policy is the same capability, scoped, and it
+-- fails closed for anything nobody considered.
+
+-- Which principal may act for which tenant. Referenced by the write policy above; the
+-- bridge never reads it and never learns what a tenant is — it sets `zb.principal` from
+-- the subject token it already trusts, and PostgreSQL resolves the rest.
+CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
+    principal text NOT NULL,
+    tenant_id text NOT NULL,
+    PRIMARY KEY (principal, tenant_id)
+);
+GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_BRIDGE_USER}, ${POSTGRES_WRITER_USER};
+
+-- ⚠️ Dollar-quote with a bare double-dollar ONLY — never a named tag (dollar, letters,
+-- dollar). This file is rendered by `envsubst`, which reads such a tag as a variable
+-- reference and substitutes it away, breaking the quoting and truncating every definition
+-- after it. Measured: the whole file rendered down to one surviving function, and psql
+-- reported no error. A bare double-dollar is not a valid identifier, so it survives.
+--
+-- The same rule forces the nested DDL below to use doubled single quotes rather than a
+-- second dollar-quoted string — this comment cannot even show you the syntax to avoid.
+CREATE OR REPLACE FUNCTION public.zebridge_publish_tenant_table(
+    tbl          regclass,
+    tenant_col   name,
+    tenant_value text,
+    publication  name
+) RETURNS void AS $$
+DECLARE
+    ri_kind  "char";
+    covered  boolean;
+    pk_cols  name[];
+    idx_name name;
+    col_list text;
+BEGIN
+    IF tbl::text IN ('zebridge_ddl_events','public.zebridge_ddl_events') THEN
+        RAISE EXCEPTION 'refusing to publish %: it is the bridge''s own DDL tracker', tbl;
+    END IF;
+
+    -- 1. A NULL tenant belongs to nobody, and a nullable column cannot carry a replica
+    --    identity.
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = tbl AND attname = tenant_col
+                     AND attnum > 0 AND NOT attisdropped AND attnotnull) THEN
+        RAISE EXCEPTION 'tenant column %.% must exist and be NOT NULL', tbl, tenant_col;
+    END IF;
+
+    -- 2. The tenant must be inside the replica identity, or PostgreSQL refuses every
+    --    UPDATE and DELETE once the publication carries a filter on it — including the
+    --    application's own writes.
+    SELECT relreplident INTO ri_kind FROM pg_class WHERE oid = tbl;
+    IF ri_kind = 'f' THEN
+        covered := true;
+    ELSE
+        SELECT coalesce(bool_or(a.attname = tenant_col), false) INTO covered
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+        WHERE i.indrelid = tbl
+          AND ((ri_kind = 'd' AND i.indisprimary) OR (ri_kind = 'i' AND i.indisreplident));
+    END IF;
+
+    IF NOT covered THEN
+        SELECT array_agg(a.attname ORDER BY k.ord) INTO pk_cols
+        FROM pg_index i
+        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+        WHERE i.indrelid = tbl AND i.indisprimary;
+        IF pk_cols IS NULL THEN
+            RAISE EXCEPTION '% has no primary key; the bridge refuses such a table anyway', tbl;
+        END IF;
+        idx_name := (SELECT relname FROM pg_class WHERE oid = tbl) || '_zb_ri';
+        col_list := quote_ident(tenant_col) || ', ' ||
+                    (SELECT string_agg(quote_ident(c), ', ') FROM unnest(pk_cols) c);
+        EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (%s)', idx_name, tbl, col_list);
+        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', tbl, idx_name);
+        RAISE NOTICE 'replica identity of % moved to (%) so the tenant filter is legal', tbl, col_list;
+    END IF;
+
+    -- 3. Per-TABLE, idempotent: this runs once per (table, tenant) and the policies do not
+    --    vary by tenant — the mapping table does.
+    EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
+
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = tbl AND polname = 'zb_tenant_write') THEN
+        EXECUTE format(
+            'CREATE POLICY zb_tenant_write ON %s FOR ALL TO %I'
+            ' USING (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
+            '   WHERE principal = current_setting(''zb.principal'', true)))'
+            ' WITH CHECK (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
+            '   WHERE principal = current_setting(''zb.principal'', true)))',
+            tbl, 'bridge_writer', tenant_col, tenant_col);
+    END IF;
+
+    -- The reader sees every row of the tables it replicates: one session serves all
+    -- tenants and has no principal to resolve. Read scoping is the publication's job.
+    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = tbl AND polname = 'zb_reader_all') THEN
+        EXECUTE format('CREATE POLICY zb_reader_all ON %s FOR SELECT TO %I USING (true)',
+                       tbl, 'bridge_reader');
+    END IF;
+
+    -- 4. Per-TENANT, and only now: the publication entry is what makes it a tenant stream.
+    IF EXISTS (SELECT 1 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid
+               WHERE pr.prrelid = tbl AND p.pubname = publication) THEN
+        EXECUTE format('ALTER PUBLICATION %I SET TABLE %s WHERE (%I = %L)',
+                       publication, tbl, tenant_col, tenant_value);
+    ELSE
+        EXECUTE format('ALTER PUBLICATION %I ADD TABLE %s WHERE (%I = %L)',
+                       publication, tbl, tenant_col, tenant_value);
+    END IF;
+
+    RAISE NOTICE 'published % to % for tenant %', tbl, publication, tenant_value;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Tables deliberately published to everyone. The escape hatch has to exist — a currency
+-- list or a product catalogue is identical for every tenant — but it is recorded, with a
+-- reason and an author, so "open bar" is a decision someone made rather than a default
+-- nobody noticed.
+CREATE TABLE IF NOT EXISTS public.zebridge_public_tables (
+    tbl      regclass PRIMARY KEY,
+    reason   text NOT NULL,
+    added_by text NOT NULL DEFAULT current_user,
+    added_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Refuses `ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped nor
+-- recorded as public. The bridge cannot check this for itself — it is a pass-through, and
+-- an unscoped table looks exactly like a scoped one from the WAL — so the check belongs
+-- here, where the mistake is actually made.
+--
+-- ⚠️ Only the table the command touched is checked. Validating the whole publication would
+-- make a pre-existing unscoped table block every unrelated change, and a guard that blocks
+-- unrelated work is a guard people drop.
+--
+-- `zebridge_publish_tenant_table()` passes this because it creates the policies and the
+-- row filter *before* adding to the publication. That ordering is load-bearing, not
+-- incidental.
+CREATE OR REPLACE FUNCTION public.zebridge_publication_guard()
+ RETURNS event_trigger
+ LANGUAGE plpgsql
+AS $$
+DECLARE
+    r       record;
+    relid   oid;
+    scoped  boolean;
+    rls     boolean;
+BEGIN
+    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands()
+             WHERE command_tag = 'ALTER PUBLICATION' AND object_type = 'publication relation'
+    LOOP
+        -- Only the table this command touched: a pre-existing unscoped table must not
+        -- block an unrelated change, or the guard becomes something people disable.
+        SELECT pr.prrelid, pr.prqual IS NOT NULL, c.relrowsecurity
+          INTO relid, scoped, rls
+        FROM pg_publication_rel pr JOIN pg_class c ON c.oid = pr.prrelid
+        WHERE pr.oid = r.objid;
+
+        CONTINUE WHEN relid IS NULL;
+        CONTINUE WHEN relid::regclass::text LIKE '%zebridge_ddl_events';
+        CONTINUE WHEN EXISTS (SELECT 1 FROM public.zebridge_public_tables WHERE tbl = relid);
+        CONTINUE WHEN scoped AND rls;
+
+        RAISE EXCEPTION
+            'refusing to publish % unscoped: row filter=%, RLS=%',
+            relid::regclass, scoped, rls
+        USING HINT =
+            'Use SELECT zebridge_publish_tenant_table(''' || relid::regclass ||
+            ''', ''<tenant_col>'', ''<tenant>'', ''<publication>''), or record the decision '
+            'with INSERT INTO zebridge_public_tables (tbl, reason) VALUES (''' ||
+            relid::regclass || ''', ''why everyone may read this'').';
+    END LOOP;
+END $$;
+
+DROP EVENT TRIGGER IF EXISTS zebridge_publication_guard_t;
+CREATE EVENT TRIGGER zebridge_publication_guard_t ON ddl_command_end
+    WHEN TAG IN ('ALTER PUBLICATION') EXECUTE FUNCTION public.zebridge_publication_guard();
+
+-- Answers "is anything published without being scoped?" — the invariant a pass-through
+-- bridge cannot check for itself. Run it after any publication change.
+CREATE OR REPLACE FUNCTION public.zebridge_audit_publications()
+RETURNS TABLE (publication name, tbl text, row_filter text, rls boolean, verdict text) AS $$
+    SELECT p.pubname,
+           pr.prrelid::regclass::text,
+           coalesce(pg_get_expr(pr.prqual, pr.prrelid), '(none)'),
+           c.relrowsecurity,
+           CASE
+             WHEN pr.prrelid::regclass::text LIKE '%zebridge_ddl_events' THEN 'internal — expected'
+             WHEN pr.prqual IS NULL AND NOT c.relrowsecurity THEN
+               'PASS-THROUGH — every row reaches every subscriber of this publication'
+             WHEN pr.prqual IS NULL AND c.relrowsecurity THEN
+               'CDC UNSCOPED — RLS bounds the snapshot, pgoutput ignores it'
+             WHEN pr.prqual IS NOT NULL AND NOT c.relrowsecurity THEN
+               'reads scoped, WRITES UNSCOPED — no policy bounds what a principal may write'
+             ELSE 'scoped'
+           END
+    FROM pg_publication_rel pr
+    JOIN pg_publication p ON p.oid = pr.prpubid
+    JOIN pg_class c ON c.oid = pr.prrelid
+    ORDER BY p.pubname, 2;
+$$ LANGUAGE sql;
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = '${BRIDGE_CDC_PUBLICATION}') THEN
@@ -135,6 +365,11 @@ $$ LANGUAGE sql IMMUTABLE;
 --
 -- Pruning runs inside the DDL triggers rather than on a schedule: DDL is rare, so
 -- the cost is negligible and there is no external cron to deploy or forget.
+-- Deliberately a constant, not a setting. PostgreSQL has no table-level TTL, so a
+-- function is the only way to express this at all — but the *value* governs nothing
+-- beyond disk: the bridge never reads this table, it reads the WAL, so a row is
+-- disposable the moment it commits. Nothing about correctness, ordering or client
+-- catch-up depends on it, unlike the NATS stream retentions.
 CREATE OR REPLACE FUNCTION public.zebridge_prune_ddl_events()
 RETURNS void AS $$
 BEGIN

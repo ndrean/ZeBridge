@@ -106,6 +106,33 @@ Bridge side, the same run: `📦 Published chunk 0 (250 rows, 45545 bytes)` for
 **B1 and B2 in one pass**, and the binary COPY path proven end to end, which is what
 released the CSV code for deletion.
 
+**The known-good bootstrap trace (2026-08-17).** Verified against a fresh Postgres + NATS,
+migration first, then bridge, then the client:
+
+```txt
+SCHEMA MIGRATE : users: created (first sight), lsn=24984192
+SCHEMA MIGRATE : test_types: created (first sight), lsn=24984192
+SYS WARNING    : Gap detected or first run! Local seq: 0, Stream first seq: 1
+SYS INFO       : Snapshot requested for users (attempt 1/5)
+SYS INFO       : Snapshot requested for test_types (attempt 1/5)
+SYS INFO       : Replay finished for users (snap-1786980088-48b6)
+SYS INFO       : Replay finished for test_types (snap-1786980089-db91)
+SYS INFO       : All required snapshots replayed successfully!
+→ Starting CDC consumer on subject: cdc.>
+```
+
+⚠️ **Read the ordering, not the row counts.** Two properties make this trace correct, and
+neither is visible in the UI:
+
+1. **Both `SCHEMA MIGRATE` lines appear before `Gap detected`.** If a table's schema is
+   applied *after* the gap check, it is never added to the snapshot set — the client
+   resolves initialisation on the KV watch's `delta === 0` marker, which means "last entry",
+   not "entry applied".
+2. **One `Snapshot requested` line per table.** A missing one is the failure, and it is
+   silent: the table can still fill up by CDC replay when nothing has rotated out of the
+   stream yet, so the rows appear and the client reports success. Observed exactly that on
+   2026-08-17 — `test_types` had all its rows and had never been snapshotted.
+
 B3–B6 remain to be run.
 
 ✅ **B2 has no row ceiling and no memory ceiling (2026-08-16).** Postgres is asked for the

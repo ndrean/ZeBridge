@@ -63,7 +63,21 @@ services:
       - sh
       - -c
       - |
-        sed -e "s/\$${NATS_BRIDGE_NKEY_PUB}/$${NATS_BRIDGE_NKEY_PUB}/g" \
+        # Fail loudly rather than substituting an empty string. `password: ""` is a
+        # valid config that the server accepts, so an unset variable would silently
+        # publish an account anyone can log into as `alice` with no password.
+        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD; do
+          eval "val=\$$$$v"
+          if [ -z "$$val" ]; then
+            echo "✗ $$v is unset — refusing to generate a config with an empty credential" >&2
+            exit 1
+          fi
+        done
+        # '|' as the delimiter, not '/': a bcrypted password (`nats server passwd`)
+        # is base64 over ./A-Za-z0-9 and contains slashes, which would end the sed
+        # expression early and emit a corrupt config.
+        sed -e "s|\$${NATS_BRIDGE_NKEY_PUB}|$${NATS_BRIDGE_NKEY_PUB}|g" \
+            -e "s|\$${NATS_ALICE_PASSWORD}|$${NATS_ALICE_PASSWORD}|g" \
             /nats-server.conf.template > /config/nats-server.conf
         echo "✓ Generated NATS config with credentials"
     networks:
@@ -167,6 +181,7 @@ services:
         REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' /topology.json)
         MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' /topology.json)
         MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' /topology.json)
+        MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' /topology.json)
         SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
         SNAPSHOT_KV=$(jq -r '.kv.snapshots' /topology.json)
 
@@ -186,8 +201,13 @@ services:
         # prefix would be consumed by the bridge again — a poison pill with a feedback
         # loop. Hence a sibling prefix, captured here so failures are durable and a
         # client can read why its write was refused.
-        nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults \
-          || nats stream edit $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>" -f \
+        # Verdicts (mutation_ack.<principal>.<msg_id>) share the stream for the same
+        # reason dead letters do, and gain the property that makes them worth having: they
+        # are durable for as long as the stream keeps them, so a client that was offline
+        # when its write failed collects the verdict on reconnect. A NAK or a JetStream
+        # advisory is ephemeral and would be gone.
+        nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>,$$MUTATION_ACK_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults \
+          || nats stream edit $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>,$$MUTATION_ACK_PREFIX.>" -f \
           || true
 
         echo "Creating NATS KV bucket: $$SCHEMA_KV"

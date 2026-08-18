@@ -403,9 +403,20 @@ runtime would trade that guarantee for a startup error and would cost the compti
 concatenation (`mutations_subject_wildcard = prefix ++ ".>"`). Worth revisiting only if
 renames become frequent, which they should not.
 
-**2. "A DBA adds a table; the bridge has no constraint on it." — True of the code. The
-edge-writability report now follows it (fixed 2026-08-16); `monitored_tables` still does
-not.**
+**2. "A DBA adds a table; the bridge has no constraint on it." — True, and now true at
+runtime too (fixed 2026-08-16 and 2026-08-17).**
+
+**Hit in a live run**, which is how the last piece was found: the bridge was started, *then*
+a migration created `users`/`test_types` and added them to the publication. The DDL path
+published their schemas, so a client built local tables — and every snapshot request came
+back `table_not_monitored`, because `monitored_tables` was the boot-time list. The client
+had a table it could never seed, and nothing said "restart the bridge".
+
+The boot list is now a **cache, not truth**: when it says a table is unknown, the snapshot
+listener asks `pg_publication_tables` before refusing (`isTableInPublication`). One query,
+only on the path that would otherwise reject the request. Verified by reproducing the
+sequence exactly — bridge up with 2 tables, `ALTER PUBLICATION … ADD TABLE users` while
+running, snapshot served without a restart.
 
 `preflight.reportTable` runs from the DDL path, so a table created while the bridge is
 running gets the same ✍️/⚠️ lines it would have got at boot. Verified live: `CREATE TABLE
@@ -448,6 +459,28 @@ pointer into the WAL, nothing more. Two consequences worth stating: a slot whose
 stopped **pins WAL forever** and will fill the primary's disk (`max_slot_wal_keep_size` is
 the guard, set to 10GB in compose), and `max_replication_slots` caps how many instances can
 exist at once.
+
+### Client retry — DONE 2026-08-16
+
+`PROTOCOL.md` §6 said a client MUST bound its wait and re-request; `web-consumer` did
+`await watchP` with no timeout, so the contract and the reference implementation
+contradicted each other. Both halves are now fixed in `web-consumer/src/App.tsx`:
+
+- **`js.publish`, not `nc.publish`.** A core publish is fire-and-forget — when the
+  one-per-table window is occupied the broker drops the message and says nothing, so the
+  client could not tell "queued" from "discarded". `stampede.py` demonstrates exactly this:
+  3 JetStream publishes → `accepted=1 rejected=2` with a visible 503, while 3 core
+  publishes vanish silently.
+- **`waitForDescriptor(kv, table, 60s)`** returning null on timeout instead of hanging, up
+  to 5 attempts, with the watch torn down in a `finally` — an abandoned KV watch leaks a
+  subscription per attempt, and this is the retry path.
+
+A 503 is logged as *"a snapshot is already pending, waiting for it"*, not as a failure:
+another client's request produces a descriptor that serves everyone.
+
+Verified: `tsc --noEmit` clean, `npm run build` clean, and the broker behaviour the fix
+relies on re-confirmed by `stampede.py`. **Not** verified in a browser against a live
+bridge — that needs a manual run.
 
 ### The pattern behind every bug found on 2026-08-16
 
@@ -1044,6 +1077,36 @@ Electric. Client-facing rules live in `PROTOCOL.md` §7; this is the bridge side
       configured means the mutation listener does not start, rather than falling back to
       the read role. Verified: `permission denied` before a grant, `INSERT 0 1` after,
       `bridge_reader` unchanged at SELECT + REPLICATION.
+
+**✅ The identity model is now enforced (verified live 2026-08-17).**
+
+§7.1's guarantee — the principal is trustworthy because NATS authorises subjects — had no
+backing until now: the web client connected with **the bridge's own nkey** and the server
+carried no `permissions` block, so one identity did everything. Both are fixed in
+`nats-server.conf.template`: the bridge keeps its nkey with `>`/`>`, and each client
+principal is a user/password entry allow-listed to its own `mutation.<principal>.>`.
+
+Verified against a live server, not just parsed — as `alice`: writing `mutation.bob.…`,
+forging `cdc.>`, overwriting `$KV.schemas.>`, consuming `MUTATIONS`, and purging or
+deleting `INIT` are all refused; her own writes, KV reads, durable pull + ack on `INIT`,
+and JetStream-published snapshot requests all succeed.
+
+Two things this does **not** buy, recorded so they are not assumed:
+
+- **A browser password is enforced, not secret.** It authenticates the bundle, not the
+  person; anyone with devtools can write as `alice` from curl. Short-lived per-session
+  JWTs are the endpoint — same permission shape, so nothing above changes.
+- **JS API denials surface as client timeouts, not permission errors.** The server drops
+  the denied publish and the caller waits out its own deadline. Budget for that when
+  debugging a too-narrow allow-list.
+
+⚠️ **Gap this exposed:** `mutation_error_pattern` is `mutation_error.{[table]s}` — no
+principal token. A client can only hear its own rejection by subscribing to every
+principal's rejections for that table, and the dead-letter body quotes the payload that
+failed, so alice reads bob's rejected rows. Fix is
+`mutation_error.{[principal]s}.{[table]s}`, after which the client's subscribe narrows to
+`mutation_error.alice.>`. Not done: it changes the wire contract, so it belongs with the
+reply-channel work rather than being slipped in here.
 
 **Row-level authorization — the audit stopped at "can write any table" before reaching
 "can write any row". Without this, a client permitted to write a table can write *every

@@ -210,9 +210,15 @@ pub const MSG = struct {
     }
 
     /// Returns the headers if this message type supports them.
+    ///
+    /// ⚠️ Returned `msg.headers` — a value where a pointer is declared — until the first
+    /// caller appeared. Zig analyses a function only when something calls it, so this had
+    /// never been compiled; the vendored client shipped an accessor that could not build.
+    /// Worth remembering when reading the rest of this directory: "it compiles" says
+    /// nothing about the parts nobody uses.
     pub fn getHeaders(msg: *MSG) ?*Headers {
         if (msg.mt.has_header()) {
-            return msg.headers;
+            return &msg.headers;
         }
         return null;
     }

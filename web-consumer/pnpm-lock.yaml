@@ -26,6 +26,9 @@ importers:
       sqlocal:
         specifier: ^0.18.0
         version: 0.18.0(vite@8.2.1)
+      uuid:
+        specifier: ^14.0.1
+        version: 14.0.1
     devDependencies:
       typescript:
         specifier: ^5.7.2
@@ -558,6 +561,10 @@ packages:
     peerDependencies:
       browserslist: '>= 4.21.0'
 
+  uuid@14.0.1:
+    resolution: {integrity: sha512-6ZxzVpzDXDa3bJWaHilVayA+BH/1zmxCJoVgvmqJnid/gPoKHxUrS/aC/T6LGQtNHT+XHG9fXPJB4d+IrU30Ew==}
+    hasBin: true
+
   vite-plugin-solid@2.11.14:
     resolution: {integrity: sha512-7ZVBt8rpoyqmlwin2kRIUveaHoF6/kulY7gsnD+qFh4nS29V4OPAnw+ojoAspXIjObiL9o1xh9a/nTuYHm02Rw==}
     peerDependencies:
@@ -1086,6 +1093,8 @@ snapshots:
       browserslist: 4.28.8
       escalade: 3.2.0
       picocolors: 1.1.1
+
+  uuid@14.0.1: {}
 
   vite-plugin-solid@2.11.14(solid-js@1.9.14)(vite@8.2.1):
     dependencies:
