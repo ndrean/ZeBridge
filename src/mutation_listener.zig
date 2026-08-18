@@ -516,6 +516,22 @@ pub const MutationListener = struct {
             return;
         };
 
+        // ⚠️ Client-supplied, and it becomes the last token of a subject. A value carrying
+        // a dot silently adds tokens; `*` and `>` publish as literals but match broadly
+        // when someone subscribes with them. The principal comes first in the pattern, so
+        // a crafted id cannot climb above `alice` — but it can reshape what follows, and a
+        // verdict on a subject nobody expects is a verdict nobody receives.
+        //
+        // No verdict rather than a sanitised one: the client matches on the id it chose,
+        // so a rewritten id would arrive unmatchable. Its own id, its own problem.
+        if (!utils.isSubjectToken(msg_id)) {
+            log.warn(
+                "⚠️  Nats-Msg-Id is not a valid subject token ('{s}'): no verdict can be addressed for this write",
+                .{msg_id},
+            );
+            return;
+        }
+
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();

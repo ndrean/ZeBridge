@@ -357,6 +357,12 @@ pub fn main(init: std.process.Init) !void {
     // Which column carries the version, per table. Same grammar as TRANSITION_RULES.
     var sync_rules = try args.Args.parseSyncRules(allocator, &init);
     defer args.Args.deinitTransitionRules(&sync_rules, allocator);
+
+    // Which column carries the tenant, per table. Empty by default: reads are unscoped
+    // unless an operator says otherwise, and preflight reports that plainly rather than
+    // letting it be assumed.
+    var tenant_rules = try args.Args.parseTenantRules(allocator, &init);
+    defer args.Args.deinitTransitionRules(&tenant_rules, allocator);
     const default_version_column = init.minimal.environ.getPosix("SYNC_VERSION_COLUMN") orelse
         Config.Sync.default_version_column;
 
@@ -388,6 +394,7 @@ pub fn main(init: std.process.Init) !void {
         // to accept edge writes; preflight needs the role they were made to. Null when
         // ingress is unconfigured, which makes every grant check a correct false.
         if (runtime_config.pg_writer_url) |url| preflight.roleFromUrl(url) else null,
+        &tenant_rules,
     ) catch |err| switch (err) {
         // STRICT_TABLES asked us to stop; that verdict must reach main, not be
         // swallowed as "the check could not run". Signal first: unwinding runs
@@ -599,6 +606,7 @@ pub fn main(init: std.process.Init) !void {
         &runtime_config.topology,
         &sync_rules,
         default_version_column,
+        &tenant_rules,
     );
 
     // Publish boot schemas to NATS KV for all monitored tables

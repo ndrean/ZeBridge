@@ -55,6 +55,15 @@ pub const Reason = enum {
     /// is a sizing verdict rather than a schema one, and it lifts on restart rather
     /// than on a migration.
     row_too_large,
+    /// `TENANT_RULES` names a column the table does not have. Routing every row to a
+    /// subject derived from a column that is not there would send them all to the same
+    /// place — which is the opposite of scoping.
+    no_tenant_column,
+    /// The tenant column exists but sits outside the replica identity, so a DELETE
+    /// carries the key and nothing else. Inserts and updates would route correctly and
+    /// deletes could not route at all: rows would stay in every replica that held them,
+    /// with no later event able to remove them.
+    tenant_not_in_replica_identity,
 
     /// The string clients receive in a suspension payload.
     pub fn wireName(self: Reason) []const u8 {
@@ -67,6 +76,8 @@ pub const Reason = enum {
             .no_primary_key => "add a primary key to replicate this table",
             .unsupported_column_type => "change the column to a type the bridge can decode (or drop it from the table)",
             .row_too_large => "restart with a larger BASE_BUF, or move the oversized column out of the replicated table",
+            .no_tenant_column => "add the column named in TENANT_RULES, or correct the rule",
+            .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
         };
     }
 };

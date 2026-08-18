@@ -157,6 +157,95 @@ pub fn classifyVersionColumn(
 }
 
 
+/// Report, per tenant-scoped table, whether its tenant column can actually reach the
+/// subject — and refuse the table if it cannot.
+///
+/// A tenant column routes CDC only if it is present on **every** event, and the one that
+/// bites is DELETE: under `REPLICA IDENTITY DEFAULT` a delete carries the key columns and
+/// nothing else. So a tenant outside the replica identity produces inserts and updates
+/// that route correctly and deletes that cannot route at all — the worst shape of bug,
+/// because it looks like it works.
+///
+/// ⚠️ PostgreSQL enforces the same rule from the other side: a *publication* row filter on
+/// a column outside the replica identity makes the table unwritable (`cannot update table
+/// … not part of the replica identity`). This check exists because model B uses no
+/// publication filter, so nothing in the database would raise — the bridge has to.
+///
+/// Refusal, not a warning: a table whose deletes cannot be addressed would leave rows in
+/// every replica that ever held them, and no later event could remove them.
+pub fn reportTenantColumns(
+    allocator: std.mem.Allocator,
+    conn: *c.PGconn,
+    publication_name: []const u8,
+    tenant_rules: *const Config.EventClassification.TransitionRules,
+    refused: *RefusedTables.Registry,
+) !void {
+    if (tenant_rules.count() == 0) return;
+
+    var it = tenant_rules.iterator();
+    var scoped: usize = 0;
+    while (it.next()) |entry| {
+        const table = entry.key_ptr.*;
+        const cols = entry.value_ptr.*;
+        if (cols.len == 0) continue;
+        const tenant_col = cols[0];
+
+        // One query answers both halves: does the column exist, and is it inside whatever
+        // this table uses as its replica identity (the PK for 'd', the marked index for
+        // 'i', every column for 'f').
+        const query = try utils.allocPrintZ(
+            allocator,
+            \\SELECT
+            \\  EXISTS (SELECT 1 FROM pg_attribute
+            \\          WHERE attrelid = '"public"."{s}"'::regclass AND attname = '{s}'
+            \\            AND attnum > 0 AND NOT attisdropped),
+            \\  (SELECT relreplident FROM pg_class WHERE oid = '"public"."{s}"'::regclass),
+            \\  COALESCE((SELECT bool_or(a.attname = '{s}')
+            \\            FROM pg_class cl
+            \\            JOIN pg_index i ON i.indrelid = cl.oid
+            \\            JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum = ANY(i.indkey)
+            \\            WHERE cl.oid = '"public"."{s}"'::regclass
+            \\              AND ((cl.relreplident = 'd' AND i.indisprimary)
+            \\                OR (cl.relreplident = 'i' AND i.indisreplident))), false);
+        ,
+            .{ table, tenant_col, table, tenant_col, table },
+        );
+        defer allocator.free(query);
+
+        const res = c.PQexec(conn, query.ptr);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) {
+            log.warn("⚠️  Tenant check skipped for '{s}': {s}", .{ table, c.PQerrorMessage(conn) });
+            continue;
+        }
+
+        const exists = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "t");
+        const ri = std.mem.span(c.PQgetvalue(res, 0, 1));
+        const in_ri = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 2)), "t") or
+            (ri.len > 0 and ri[0] == 'f');
+
+        if (!exists) {
+            log.err("🔴 REFUSING '{s}': TENANT_RULES names column '{s}', which the table does not have.", .{ table, tenant_col });
+            refused.refuse(table, .no_tenant_column) catch {};
+            continue;
+        }
+        if (!in_ri) {
+            log.err(
+                "🔴 REFUSING '{s}': tenant column '{s}' is outside the replica identity, so a DELETE carries the key and nothing else — inserts and updates would route to the right subject and deletes could not route at all, leaving rows in every replica that held them. Fix: CREATE UNIQUE INDEX {s}_zb_ri ON {s} ({s}, <pk>); ALTER TABLE {s} REPLICA IDENTITY USING INDEX {s}_zb_ri;",
+                .{ table, tenant_col, table, table, tenant_col, table, table },
+            );
+            refused.refuse(table, .tenant_not_in_replica_identity) catch {};
+            continue;
+        }
+
+        log.info("🏷️  '{s}': reads scoped by '{s}' → cdc.<tenant>.{s}.<op> (grant: cdc.<tenant>.>)", .{ table, tenant_col, table });
+        scoped += 1;
+    }
+
+    log.info("✅ Tenant scoping: {d} table(s) route reads by tenant", .{scoped});
+    _ = publication_name;
+}
+
 /// The role name out of a PostgreSQL connection URL.
 ///
 /// The writer's *grants* are the only authoritative statement of which tables are meant
@@ -512,6 +601,9 @@ pub fn run(
     /// Role the write grants were made to, from `DATABASE_WRITER_URL`. Null when ingress
     /// is not configured, in which case no table is expected to be writable.
     writer_role: ?[]const u8,
+    /// `TENANT_RULES`: which column carries the tenant, per table. Empty when reads are
+    /// unscoped, which is the default and is reported as such.
+    tenant_rules: *const Config.EventClassification.TransitionRules,
 ) !Summary {
     var standard_config = pg_config.*;
     standard_config.replication = false;
@@ -619,6 +711,13 @@ pub fn run(
     // only matters for tables that replicate at all.
     reportVersionColumns(allocator, conn, publication_name, sync_rules, default_version_column, writer_role) catch |err| {
         log.warn("⚠️  Version-column report failed: {}", .{err});
+    };
+
+    // Last, because a table that cannot replicate at all does not need its read scoping
+    // checked — and because this one *refuses* tables, so it must run after the shape
+    // checks that might already have refused them for a better reason.
+    reportTenantColumns(allocator, conn, publication_name, tenant_rules, refused) catch |err| {
+        log.warn("⚠️  Tenant-column report failed: {}", .{err});
     };
 
     // Refusing to start is deliberately NOT the default: one PK-less table would stop

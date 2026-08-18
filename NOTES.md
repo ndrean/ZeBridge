@@ -415,6 +415,56 @@ write outside a principal's tenant. **A bridge bug can leak reads; it cannot for
 shipped by pgoutput whatever its policies say — *not publishing it* is the only control
 that reaches CDC.
 
+#### The subject invariant: `<stream>.<identity>.<everything that varies>`
+
+Every subject that carries data should put the identity token **immediately after the
+stream prefix**, before the table, the operation, and any suffix.
+
+⚠️ **The reason is not that the subject is hard to guess.** A client can name
+`cdc.globex.orders.insert` perfectly and still get `Permissions Violation` — the allow-list
+is checked on every subscribe, and knowing the name buys nothing. Publishing the grammar in
+PROTOCOL.md is therefore safe, and opaque tenant ids buy no security.
+
+The reason is that **grants stay stable under schema change**. One grant, `cdc.acme.>`,
+covers every table, every operation, and every suffix — including ones that do not exist
+yet. Measured the hard way: with the identity *last*, batching appended `.batch`
+(`batch_publisher.zig`) and turned `cdc.orders.insert.acme` into
+`cdc.orders.insert.acme.batch`, which no tenant grant matched. A tenant's rows arrived
+under light load and stopped under heavy load — a leak-adjacent bug whose trigger is
+*volume*. Identity-first absorbed the new suffix with no permission change.
+
+So the property is: **adding a table, an operation or a suffix can never widen or break a
+grant.** That is what makes it a safety guard rather than a naming convention.
+
+Where the invariant holds today — 3 of 10:
+
+| pattern | identity-first |
+| --- | --- |
+| `cdc.<tenant>.<table>.<op>` (when TENANT_RULES is set) | ✅ tenant |
+| `mutation.<principal>.<table>.<operation>` | ✅ principal |
+| `mutation_ack.<principal>.<msg_id>` | ✅ principal |
+| `cdc.<table>.<op>` (unscoped) | ❌ no identity at all |
+| `mutation_error.<table>` | ❌ keyed by table |
+| `init.snap.<table>.<snapshot_id>.<chunk>` | ❌ keyed by table |
+| `snapshot.request.<table>` | ❌ no identity |
+| `init.schema` | ❌ no identity |
+| `$KV.schemas.<table>` | ❌ every client reads every table's columns |
+| `$KV.snapshots.<table>` | ❌ no identity |
+
+The snapshot rows are what increment 2 must change: `init.snap.<tenant>.<table>.…` and
+`snapshot.request.<principal>.<table>`.
+
+**What the invariant does not cover**, and should not be claimed to:
+
+- **A stolen credential.** Full access to that identity; subject shape is irrelevant. This
+  is JWT's job — not obscurity, but *binding* (a scoped signing key derives the grant from
+  the identity with `{{name()}}`, so the two cannot drift apart) and *expiry* (a leak has a
+  bounded window).
+- **A publisher bug.** NATS enforces who may subscribe; nothing verifies that the bridge
+  tagged a row with the right tenant. That is model B's residual risk and no grammar closes
+  it.
+- **Anything not behind an identity token** — seven of the ten patterns above.
+
 #### The cost of per-tenant snapshots — measured, and it hinges on clustering
 
 A tenant-scoped read path means one snapshot per (table, tenant) rather than per table.

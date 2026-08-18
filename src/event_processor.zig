@@ -122,6 +122,10 @@ pub const EventProcessor = struct {
     /// report a table gets when it appears after boot. Same two values preflight uses.
     sync_rules: *const Config.EventClassification.TransitionRules,
     default_version_column: []const u8,
+    /// `TENANT_RULES`: which column carries the tenant, per table. Empty means reads are
+    /// unscoped — every subscriber of `cdc.>` receives every row, which is the default and
+    /// is reported as such at boot.
+    tenant_rules: *const Config.EventClassification.TransitionRules,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -134,6 +138,7 @@ pub const EventProcessor = struct {
         topology: *const Topology.Topology,
         sync_rules: *const Config.EventClassification.TransitionRules,
         default_version_column: []const u8,
+        tenant_rules: *const Config.EventClassification.TransitionRules,
     ) EventProcessor {
         return .{
             .allocator = allocator,
@@ -146,6 +151,7 @@ pub const EventProcessor = struct {
             .topology = topology,
             .sync_rules = sync_rules,
             .default_version_column = default_version_column,
+            .tenant_rules = tenant_rules,
         };
     }
 
@@ -378,6 +384,7 @@ pub const EventProcessor = struct {
 
         // Extract ID value for logging (scan for "id" column in the combined list)
         var id_buf: [64]u8 = undefined;
+        var tenant_buf: [64]u8 = undefined;
         const id_str = blk: {
             for (all_columns.items) |column| {
                 // Quick rejection: check length first (avoid memcmp for wrong-length names)
@@ -412,9 +419,103 @@ pub const EventProcessor = struct {
         else
             null;
 
+        // ── Tenant token ────────────────────────────────────────────────────────────
+        //
+        // Appended last so a subscriber can be granted `cdc.*.*.<tenant>` and receive
+        // exactly its own rows — the same subject-authorization mechanism that already
+        // scopes writes (§7.1), applied to reads.
+        //
+        // The value comes from **the row itself**, never from configuration: config says
+        // *which column*, the row says *which tenant*. That is what makes a mis-routing
+        // bug require misreading a value that is right there in the decoded tuple, rather
+        // than a mismatched file.
+        //
+        // ⚠️ A table listed in TENANT_RULES whose tenant value is missing here is dropped,
+        // not published unscoped. Preflight already refuses tables whose tenant is outside
+        // the replica identity — the case that would make DELETEs arrive bare — so
+        // reaching this branch means something changed underneath a running bridge. The
+        // safe failure is silence: publishing to `cdc.<table>.<op>` with no tenant token
+        // would deliver the row to a subject no tenant grant covers, but an operator
+        // subscribed to `cdc.>` would receive it.
+        const tenant: ?[]const u8 = blk: {
+            const rule = self.tenant_rules.get(rel.name) orelse break :blk null;
+            if (rule.len == 0) break :blk null;
+            for (all_columns.items) |column| {
+                if (!std.mem.eql(u8, column.name, rule[0])) continue;
+                const raw: ?[]const u8 = switch (column.value) {
+                    .text => |v| v,
+                    .int32 => |v| std.fmt.bufPrint(&tenant_buf, "{d}", .{v}) catch null,
+                    .int64 => |v| std.fmt.bufPrint(&tenant_buf, "{d}", .{v}) catch null,
+                    else => null,
+                };
+                // ⚠️ The tenant is **row data**, so it can contain anything the schema
+                // allows. A dot would split it into two tokens and the row would vanish
+                // from its own tenant's feed (measured: `cdc.t.insert.evil.acme` is not
+                // received by `cdc.*.*.acme`) while still existing in PostgreSQL — a
+                // divergence with no event able to correct it. A `*` or `>` publishes as a
+                // literal and matches broadly on the subscribe side.
+                //
+                // Quarantined rather than sanitised: rewriting the value would route the
+                // row to a tenant that does not exist, which is worse than not routing it.
+                break :blk if (raw) |v| (if (utils.isSubjectToken(v)) v else null) else null;
+            }
+            break :blk null;
+        };
+
+        // A configured table whose event carries no tenant value is **quarantined, not
+        // dropped and not published bare**.
+        //
+        // Preflight refuses tables whose tenant sits outside the replica identity — the
+        // case that makes DELETEs arrive without it — so reaching here means something
+        // changed under a running bridge. Dropping would lose data silently; publishing to
+        // `cdc.<table>.<op>` would put it on a three-token subject that no tenant grant
+        // covers but a wildcard operator subscription does.
+        //
+        // `unrouted` keeps the four-token shape, so `cdc.*.*.<tenant>` cannot match it and
+        // no tenant-scoped client receives it, while an operator can subscribe to
+        // `cdc.*.*.unrouted` on purpose and see exactly what failed to route.
+        const routed: ?[]const u8 = if (tenant) |t| t else if (self.tenant_rules.contains(rel.name)) blk: {
+            const named: []const u8 = if (self.tenant_rules.get(rel.name)) |r|
+                (if (r.len > 0) r[0] else "?")
+            else
+                "?";
+            log.err(
+                "🔴 Quarantining {s} on '{s}' to '.unrouted': TENANT_RULES names '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
+                .{ operation_lower, rel.name, named },
+            );
+            break :blk "unrouted";
+        } else null;
+
         // Create NATS subject
         var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;
-        const subject = if (suffix) |s|
+        // ⚠️ The tenant goes **immediately after the prefix**, not at the end:
+        //
+        //     cdc.<tenant>.<table>.<operation>[.<suffix>]
+        //
+        // so one grant — `cdc.acme.>` — covers every table, every operation, and every
+        // suffix this subject may ever grow. With the tenant last it did not: batches
+        // publish to `<subject>.batch` (batch_publisher.zig), so a single event landed on
+        // `cdc.orders.insert.acme` (four tokens, matched by `cdc.*.*.acme`) while a
+        // batched one landed on `cdc.orders.insert.acme.batch` (five, matched by nothing
+        // the tenant holds). A tenant's rows would arrive under light load and silently
+        // stop under heavy load — the worst possible shape for a bug, because the trigger
+        // is *volume*.
+        //
+        // This is the same reason `mutation.<principal>.<table>.<operation>` puts the
+        // principal first (§7.1): an identity token is only a useful grant if everything
+        // that can vary sits after it.
+        const subject = if (routed) |t| (if (suffix) |s|
+            try std.fmt.bufPrintZ(
+                &subject_buf,
+                "{s}.{s}.{s}.{s}.{s}",
+                .{ self.topology.subject_cdc_prefix, t, rel.name, operation_lower, s },
+            )
+        else
+            try std.fmt.bufPrintZ(
+                &subject_buf,
+                "{s}.{s}.{s}.{s}",
+                .{ self.topology.subject_cdc_prefix, t, rel.name, operation_lower },
+            )) else if (suffix) |s|
             try std.fmt.bufPrintZ(
                 &subject_buf,
                 "{s}.{s}.{s}.{s}",

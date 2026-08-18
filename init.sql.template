@@ -272,7 +272,14 @@ BEGIN
         CONTINUE WHEN relid IS NULL;
         CONTINUE WHEN relid::regclass::text LIKE '%zebridge_ddl_events';
         CONTINUE WHEN EXISTS (SELECT 1 FROM public.zebridge_public_tables WHERE tbl = relid);
-        CONTINUE WHEN scoped AND rls;
+        -- Either model counts as scoped:
+        --   A  a publication row filter  → PostgreSQL bounds CDC itself
+        --   B  RLS enabled               → RLS bounds writes and snapshots, and the
+        --                                  bridge bounds CDC via TENANT_RULES, which is
+        --                                  not visible from here
+        -- Requiring both would refuse every model-B table; requiring neither would let an
+        -- unscoped table through. So: at least one deliberate act of scoping.
+        CONTINUE WHEN scoped OR rls;
 
         RAISE EXCEPTION
             'refusing to publish % unscoped: row filter=%, RLS=%',

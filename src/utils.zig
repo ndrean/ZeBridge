@@ -174,3 +174,85 @@ pub fn byteToHex(out: []u8, byte: u8) void {
 fn toHexDigit(d: u8) u8 {
     return if (d < 10) '0' + d else 'a' + (d - 10);
 }
+
+
+/// Is this string safe to use as a **single** NATS subject token?
+///
+/// The bridge interpolates values it did not choose into subjects: a table name from the
+/// catalog, a tenant value from row data, a `msg_id` from a client header. Any of them can
+/// carry a character that changes the subject's *shape*, and NATS routes on shape.
+///
+/// Measured against a live server, publishing as a fully-authorised client:
+///
+/// ```txt
+/// cdc.orders.insert.acme        → received by a subscriber on cdc.*.*.acme
+/// cdc.orders.insert.evil.acme   → NOT received: five tokens, the wildcard wants four
+/// cdc.orders.insert.*           → published happily, as a literal token
+/// cdc.orders.insert.            → rejected by the server
+/// ```
+///
+/// So a dot in a tenant value does not leak the row to another tenant — it **deletes the
+/// row from its own tenant's feed**, silently, while the row still exists in PostgreSQL.
+/// The replica diverges and nothing reports it. That is the failure this guards.
+///
+/// ⚠️ Whether a bad token can *leak* rather than lose depends on the grant landscape, not
+/// on the bridge: a subscriber holding `cdc.orders.insert.>` would receive the five-token
+/// message. Under tenant scoping nobody holds that, but the bridge should not be relying
+/// on a permission file to make its own subjects well-formed.
+///
+/// Rejects: empty, `.` (splits the token), `*` and `>` (wildcards, which are literal on
+/// publish but match broadly on subscribe), whitespace and control characters (a space
+/// ends the subject in the wire protocol), and anything over `max_subject_token_len`.
+pub fn isSubjectToken(s: []const u8) bool {
+    if (s.len == 0 or s.len > max_subject_token_len) return false;
+    for (s) |ch| {
+        switch (ch) {
+            '.', '*', '>' => return false,
+            0...0x20, 0x7f => return false, // space, tab, CR, LF, NUL and other controls
+            else => {},
+        }
+    }
+    return true;
+}
+
+/// Bounded so one hostile value cannot push a subject past what the subject buffer or the
+/// server will accept. Generous next to a tenant id or a uuid-based msg_id.
+pub const max_subject_token_len: usize = 128;
+
+test "isSubjectToken: the values the bridge actually interpolates" {
+    try std.testing.expect(isSubjectToken("acme"));
+    try std.testing.expect(isSubjectToken("tenant_42"));
+    try std.testing.expect(isSubjectToken("01a0138f-3e62-70b0-a2ca-a0f936923665"));
+    try std.testing.expect(isSubjectToken("c-1234567890123456-orders-1787034564"));
+}
+
+test "isSubjectToken: a dot silently reshapes the subject" {
+    // The measured case: `cdc.orders.insert.evil.acme` is five tokens, so a subscriber on
+    // `cdc.*.*.acme` never receives it and the row vanishes from its own tenant's feed.
+    try std.testing.expect(!isSubjectToken("evil.acme"));
+    try std.testing.expect(!isSubjectToken("a.b"));
+    try std.testing.expect(!isSubjectToken("."));
+}
+
+test "isSubjectToken: wildcards publish as literals and must not be accepted" {
+    try std.testing.expect(!isSubjectToken("*"));
+    try std.testing.expect(!isSubjectToken(">"));
+    try std.testing.expect(!isSubjectToken("acme>"));
+    try std.testing.expect(!isSubjectToken("*acme"));
+}
+
+test "isSubjectToken: whitespace and control characters end the subject on the wire" {
+    try std.testing.expect(!isSubjectToken("two words"));
+    try std.testing.expect(!isSubjectToken("acme\n"));
+    try std.testing.expect(!isSubjectToken("acme\r"));
+    try std.testing.expect(!isSubjectToken("acme\t"));
+    try std.testing.expect(!isSubjectToken("acme\x00"));
+}
+
+test "isSubjectToken: empty and over-long are refused" {
+    try std.testing.expect(!isSubjectToken(""));
+    const long = "a" ** (max_subject_token_len + 1);
+    try std.testing.expect(!isSubjectToken(long));
+    const at_limit = "a" ** max_subject_token_len;
+    try std.testing.expect(isSubjectToken(at_limit));
+}
