@@ -222,6 +222,8 @@ pub fn main(init: std.process.Init) !void {
         defer arena.deinit();
         const aa = arena.allocator();
 
+        var reaped_this_pass: u64 = 0;
+
         for (sweeps.items) |sw| {
             // The cutoff is computed by PostgreSQL, not here: `now()` on the server is the
             // only clock both sides agree on, and a sweeper whose host clock has drifted
@@ -273,12 +275,74 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("ERROR: GC failed for table {s}: {s}\n", .{ sw.table, c.PQerrorMessage(pg_conn) });
             } else {
                 const rows_deleted = c.PQcmdTuples(res);
+                reaped_this_pass += std.fmt.parseInt(u64, std.mem.span(rows_deleted), 10) catch 0;
                 if (rows_deleted[0] != 0 and rows_deleted[0] != '0') {
                     std.debug.print(
                         "GC: reaped {s} tombstone(s) from {s} older than {d}ms\n",
                         .{ rows_deleted, sw.table, threshold_ms },
                     );
                 }
+            }
+        }
+
+        // ── Publish the watermark ───────────────────────────────────────────────
+        //
+        // The point of the whole sweep, from a client's perspective. `GC_THRESHOLD_MS` is
+        // the maximum offline window this deployment supports, and until this row existed
+        // a client had no way to locate that line — it could only assume the sweeper was
+        // keeping up. A client whose oldest queued write predates `watermark` must
+        // re-snapshot instead of flushing, or it resurrects rows deleted while it was away.
+        //
+        // ⚠️ Written **after** the deletes, never before. The guarantee is "nothing older
+        // than this survives", so publishing first would advertise a line the sweep had
+        // not yet reached — and a client trusting it would discard writes that were still
+        // safe.
+        //
+        // `now()` is the server's, not this process's: the sweep's cutoff was computed
+        // server-side for the same reason (a drifted host clock must not move the line).
+        //
+        // No NATS here. The row is replicated by CDC like any other, so every client that
+        // is already consuming changes receives it with no new subscription — and the
+        // sweeper stays a PostgreSQL client with no broker identity to compromise.
+        //
+        // A failure is logged and the loop continues: an unpublished watermark leaves
+        // clients on the previous, *older* value, which is conservative. Stopping the
+        // sweep over it would let tombstones accumulate instead, which is not.
+        {
+            const wm_secs = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
+            const wm_ms = try utils.allocPrintZ(aa, "{d}", .{threshold_ms});
+            const wm_reaped = try utils.allocPrintZ(aa, "{d}", .{reaped_this_pass});
+            const wm_params = [_]?[*:0]const u8{ wm_secs.ptr, wm_ms.ptr, wm_reaped.ptr };
+
+            const wm_res = c.PQexecParams(
+                pg_conn,
+                "UPDATE public.zebridge_gc_watermark SET" ++
+                    " watermark = now() - make_interval(secs => $1::double precision)," ++
+                    " threshold_ms = $2::bigint," ++
+                    " reaped = $3::bigint," ++
+                    " swept_at = now()," ++
+                    " updated_at = now()" ++
+                    " WHERE id = 1",
+                3,
+                null,
+                &wm_params[0],
+                null,
+                null,
+                0,
+            );
+            defer c.PQclear(wm_res);
+
+            if (c.PQresultStatus(wm_res) != c.PGRES_COMMAND_OK) {
+                std.debug.print(
+                    "GC: WARNING could not publish the watermark: {s}\n",
+                    .{c.PQerrorMessage(pg_conn)},
+                );
+            } else if (std.mem.eql(u8, std.mem.span(c.PQcmdTuples(wm_res)), "0")) {
+                std.debug.print(
+                    "GC: WARNING the watermark row is missing (zebridge_gc_watermark id=1)." ++
+                        " Clients cannot tell how far back tombstones survive. Re-run init.sql.\n",
+                    .{},
+                );
             }
         }
 

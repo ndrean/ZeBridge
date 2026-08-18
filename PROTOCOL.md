@@ -829,7 +829,8 @@ Two things follow, and they are the whole reason this section is long:
    Keeping one path for state and another for verdicts is what stops a client having two
    sources of truth.
 
-6. **Check the GC watermark before flushing after a long offline period.** A queued
+6. **Check the GC watermark before flushing after a long offline period** — the one row of
+   `zebridge_gc_watermark`, which arrives over CDC like any other table (§7.5). A queued
    mutation older than the watermark cannot be applied safely — the tombstone that would
    have overruled it has been reaped (§7.5).
 
@@ -1222,15 +1223,67 @@ set, so that an offline client's later edit can be overruled instead of resurrec
 row. Tombstones are reaped after `GC_THRESHOLD_MS`, which is therefore **the maximum
 offline window with pending writes that this deployment supports**.
 
-The bridge publishes a watermark after each sweep. Before flushing an outbox that has
-been sitting, compare the oldest queued `version` against it:
+> ### 🔴 **DBA — a table is created for this**
+>
+> **`public.zebridge_gc_watermark`** is created by `init.sql.template`, added to the
+> publication there, and written by the tombstone sweeper (`zig-out/bin/bridge_sweeper`).
+> It is not an application table and no migration creates it.
+>
+> | | |
+> | --- | --- |
+> | **created by** | `init.sql.template`, at bootstrap — before any migration runs |
+> | **written by** | `bridge_sweeper`, once per pass, as principal `zb_sweeper` |
+> | **read by** | every client, through CDC |
+> | **grants** | `SELECT` to the reader, `SELECT/INSERT/UPDATE` to the writer, no `DELETE` |
+> | **rows** | exactly one, `id = 1`, CHECKed |
+>
+> ⚠️ **Do not drop it, and do not remove it from the publication.** The row reaches clients
+> through CDC and nothing else, so an unpublished watermark is one nobody can read — and
+> §7.1 tells clients to consult it before flushing an outbox. Dropping it does not fail the
+> bridge; it silently removes a guarantee.
+>
+> ⚠️ **If no sweeper runs, nothing is reaped and the watermark never moves.** That is
+> correct rather than broken, but it means this table records what the sweeper last did,
+> not that it is running. `SELECT * FROM zebridge_audit_sweeper();` lists tenants whose
+> tombstones will never be reaped because the sweeper is not mapped to them.
+
+#### Where the watermark is: `zebridge_gc_watermark`
+
+✅ A **replicated table with one row**, arriving through CDC like any other. A client reads
+it from its own replica — no extra subscription, no request, and it is already there after
+an offline period rather than needing a fetch at the moment it matters most.
+
+```
+cdc.zebridge_gc_watermark.update
+{"id":1,
+ "watermark":    "2026-08-18T19:30:04.706571Z",   ← nothing soft-deleted before this survives
+ "threshold_ms": 1800000,                          ← what the sweeper is configured with
+ "swept_at":     "2026-08-18T20:00:04.706571Z",   ← when it last ran
+ "reaped":       0}                                ← rows removed in that pass
+```
+
+Before flushing an outbox that has been sitting, compare the oldest queued `version`
+against it:
 
 ```txt
-oldest queued version < gc watermark  →  that write cannot be judged safely
+oldest queued version < watermark  →  that write cannot be judged safely
 ```
 
 What to do then is a product decision — discard, ask the user, or send with an explicit
 intent to resurrect — but the client must not send it blindly.
+
+⚠️ **Check `swept_at`, not just `watermark`.** A stopped sweeper leaves a watermark that
+looks perfectly valid and is frozen: `swept_at` far in the past means the line has not
+moved, and tombstones older than it may *also* be gone if the sweeper ran, died, and left
+no trace. Treat a stale `swept_at` as "cannot judge" rather than as "nothing was reaped".
+
+⚠️ It is written **after** the deletes, never before — the guarantee is "nothing older than
+this survives", so publishing first would advertise a line the sweep had not yet reached
+and a client trusting it would discard writes that were still safe.
+
+⚠️ **A deployment with no sweeper running never reaps anything**, so the watermark stays
+where it was and every queued write looks safe. That is correct — nothing was deleted — but
+it means the table is not evidence the sweeper works, only evidence of what it last did.
 
 ---
 
@@ -1254,6 +1307,35 @@ What it does **not** promise:
    in separate messages.
 3. **Exactly-once application.** Dedup covers retries; the client must be idempotent
    (upsert on PK, delete by PK).
+
+---
+
+## 8b. What the bridge creates in your database
+
+🔴 **DBA reference.** Everything here is created by `init.sql.template` at bootstrap —
+before any migration runs — and is owned by the bridge rather than by your application.
+The reverse links live in that file: every object carries a `-- <what it is> — see <doc>`
+line above it, so the two directions answer each other.
+
+| object | kind | what it is | why it matters |
+| --- | --- | --- | --- |
+| `zebridge_ddl_events` | table | DDL transport — the **INSERT** is what reaches the bridge over the WAL | drop it and schema changes stop reaching clients |
+| `zebridge_gc_watermark` | table | one row; the GC watermark clients read before flushing an outbox (§7.5) | unpublish it and clients cannot tell whether a queued write is safe |
+| `zebridge_user_tenants` | table | principal → tenant, the mapping RLS resolves against (§7.4) | the reach of every principal, including the sweeper, is defined here |
+| `zebridge_public_tables` | table | tables deliberately readable by everyone | the record of who decided a table is public, and why |
+| `zebridge_grant_edge_writes(regclass)` | function | opens one table to edge writes (§7.4) | the only supported way; refuses `zebridge_ddl_events` by name |
+| `zebridge_publish_tenant_table(...)` | function | publishes a tenant-scoped table, policies first | ordering is load-bearing — it creates RLS *before* publishing |
+| `zebridge_publication_guard` | event trigger | refuses a bare `ALTER PUBLICATION ... ADD TABLE` | an unscoped publish sends every row to every subscriber, silently |
+| `zebridge_audit_publications()` | function | *is anything published without being scoped?* | the invariant a pass-through bridge cannot check for itself |
+| `zebridge_audit_sweeper()` | function | tenants whose tombstones will never be reaped (§7.5) | the sweeper cannot report its own blind spot — RLS hides it from itself |
+| `zebridge_ddl_trigger` / `zebridge_drop_trigger` | event triggers | capture DDL and drops | `DROP TABLE` never reaches `ddl_command_end`, hence two |
+| `zebridge_prune_ddl_events()` | function | retention for the DDL audit trail | pure housekeeping; the bridge reads the WAL, never this table |
+| `zebridge_is_internal_table(text)` | function | keeps the tracker's own rows out of the DDL feed | ⚠️ `zebridge_gc_watermark` is deliberately **not** internal — clients need it |
+
+⚠️ **None of these are optional**, and none fail loudly if removed. Dropping the guard does
+not break the bridge — it removes a refusal. Unpublishing the watermark does not error — it
+removes a guarantee. That is why they are listed here rather than left to be discovered in
+a SQL file.
 
 ---
 

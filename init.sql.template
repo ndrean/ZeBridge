@@ -1,4 +1,24 @@
 -- init.sql.template
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Every object below carries a `-- <what it is> — see <doc> §<n>` line above it.
+--
+-- The reference points at the section that explains *why* the object exists, because this
+-- file is where someone is standing when they need that: reading a trigger and wondering
+-- whether it can be dropped. The docs describe behaviour a DBA has to preserve;
+-- `zebridge_gc_watermark` in particular carries a 🔴 DBA callout in PROTOCOL.md §7.5,
+-- because dropping it or unpublishing it removes a client guarantee without failing
+-- anything.
+--
+-- Keep the reference when moving or rewriting an object. A comment that says what the code
+-- already says is noise; one that says where the reasoning lives is the only link between
+-- the two files.
+--
+-- The link runs both ways: **PROTOCOL.md §8b** lists every object created here, what it is,
+-- and what breaks if it is removed. Read this file and you can find the reasoning; read the
+-- docs and you can find the code. Adding an object means adding a row there too — a
+-- one-directional link is the one that goes stale.
+-- ─────────────────────────────────────────────────────────────────────────────
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_BRIDGE_USER}') THEN
@@ -67,6 +87,7 @@ GRANT USAGE ON SCHEMA public TO ${POSTGRES_WRITER_USER};
 -- client able to insert into it could forge a schema, a suspension or a tombstone for
 -- every other client. That is the one table where "can write my own rows" becomes
 -- "can control every replica".
+-- opens one table to edge writes — see PROTOCOL.md §7.4
 CREATE OR REPLACE FUNCTION public.zebridge_grant_edge_writes(tbl regclass)
 RETURNS void AS $$
 DECLARE
@@ -130,6 +151,7 @@ $$ LANGUAGE plpgsql;
 -- Which principal may act for which tenant. Referenced by the write policy above; the
 -- bridge never reads it and never learns what a tenant is — it sets `zb.principal` from
 -- the subject token it already trusts, and PostgreSQL resolves the rest.
+-- principal → tenant, the mapping RLS resolves against — see PROTOCOL.md §7.4
 CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
     principal text NOT NULL,
     tenant_id text NOT NULL,
@@ -145,6 +167,7 @@ GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_BRIDGE_USER}, ${POSTG
 --
 -- The same rule forces the nested DDL below to use doubled single quotes rather than a
 -- second dollar-quoted string — this comment cannot even show you the syntax to avoid.
+-- the only supported way to publish a tenant-scoped table — see PROTOCOL.md §7.4, NOTES.md §1.8
 CREATE OR REPLACE FUNCTION public.zebridge_publish_tenant_table(
     tbl          regclass,
     tenant_col   name,
@@ -240,6 +263,7 @@ $$ LANGUAGE plpgsql;
 -- list or a product catalogue is identical for every tenant — but it is recorded, with a
 -- reason and an author, so "open bar" is a decision someone made rather than a default
 -- nobody noticed.
+-- tables deliberately readable by everyone — see NOTES.md §1.8
 CREATE TABLE IF NOT EXISTS public.zebridge_public_tables (
     tbl      regclass PRIMARY KEY,
     reason   text NOT NULL,
@@ -259,6 +283,7 @@ CREATE TABLE IF NOT EXISTS public.zebridge_public_tables (
 -- `zebridge_publish_tenant_table()` passes this because it creates the policies and the
 -- row filter *before* adding to the publication. That ordering is load-bearing, not
 -- incidental.
+-- refuses an unscoped ALTER PUBLICATION — see NOTES.md §1.8
 CREATE OR REPLACE FUNCTION public.zebridge_publication_guard()
  RETURNS event_trigger
  LANGUAGE plpgsql
@@ -321,6 +346,7 @@ CREATE EVENT TRIGGER zebridge_publication_guard_t ON ddl_command_end
 -- here, with the grant.
 --
 --     INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('zb_sweeper', '<tenant>');
+-- tenants whose tombstones will never be reaped — see PROTOCOL.md §7.5
 CREATE OR REPLACE FUNCTION public.zebridge_audit_sweeper(sweeper_principal text DEFAULT 'zb_sweeper'::text)
  RETURNS TABLE(tbl text, tenant_id text, verdict text)
  LANGUAGE plpgsql
@@ -355,6 +381,7 @@ END $$;
 
 -- Answers "is anything published without being scoped?" — the invariant a pass-through
 -- bridge cannot check for itself. Run it after any publication change.
+-- is anything published without being scoped? — see NOTES.md §1.8
 CREATE OR REPLACE FUNCTION public.zebridge_audit_publications()
 RETURNS TABLE (publication name, tbl text, row_filter text, rls boolean, verdict text) AS $$
     SELECT p.pubname,
@@ -390,6 +417,7 @@ $$;
 -- Guarantees strict ordering of schema changes with CDC data
 -- ---------------------------------------------------------
 
+-- DDL transport: the INSERT is what reaches the bridge — see PROTOCOL.md §5
 CREATE TABLE IF NOT EXISTS public.zebridge_ddl_events (
     id SERIAL PRIMARY KEY,
     schema_name TEXT NOT NULL,
@@ -413,6 +441,91 @@ ALTER TABLE public.zebridge_ddl_events ADD COLUMN IF NOT EXISTS schema_def JSONB
 --
 -- Add your migration tool's table here if it differs: flyway_schema_history,
 -- alembic_version, __diesel_schema_migrations, goose_db_version, ...
+-- ---------------------------------------------------------
+-- GC watermark — the oldest tombstone still standing
+-- ---------------------------------------------------------
+--
+-- `GC_THRESHOLD_MS` is a promise to clients: the maximum offline window this deployment
+-- supports. A client offline for longer can resurrect a deleted row, because the tombstone
+-- that would have overruled its queued edit has been reaped. Until now a client had no way
+-- to know where that line sits — it could only assume the sweeper was running on schedule.
+--
+-- ⚠️ Carried as a **replicated table**, not published to KV by the sweeper. The sweeper is
+-- a PostgreSQL client and nothing else: giving it a NATS identity would widen what a
+-- compromised sweeper can reach, in order to publish one number the existing CDC pipeline
+-- already carries for free. It writes a row; every client that consumes CDC gets it.
+--
+-- A singleton (`id = 1`, CHECKed), because there is one watermark per deployment and a
+-- table that can grow to two rows will eventually have two disagreeing answers.
+--
+-- ⚠️ Deliberately NOT in `zebridge_is_internal_table`: internal tables are hidden from
+-- clients, and this one exists precisely to reach them.
+-- the GC watermark clients read before flushing an outbox — see PROTOCOL.md §7.5
+CREATE TABLE IF NOT EXISTS public.zebridge_gc_watermark (
+    id            smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    -- Nothing soft-deleted before this is guaranteed to still exist. A client whose oldest
+    -- queued write predates it must re-snapshot rather than flush.
+    watermark     timestamptz NOT NULL,
+    -- What the sweeper was configured with, so a client can tell a *moving* watermark from
+    -- a sweeper that has stopped: if `swept_at` is old, the watermark is stale whatever it
+    -- says.
+    threshold_ms  bigint NOT NULL,
+    swept_at      timestamptz NOT NULL DEFAULT now(),
+    -- Rows removed in the last pass. Zero is the normal steady state; a large number after
+    -- a long quiet period usually means the sweeper was down.
+    reaped        bigint NOT NULL DEFAULT 0,
+    -- The version column, so this table satisfies the same contract as any other CDC
+    -- table. It is never written from the edge — see the grant below.
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+-- The sweeper writes it; everyone else reads it through CDC. ⚠️ SELECT for the reader is
+-- what puts it in snapshots; UPDATE/INSERT for the writer is what lets the sweeper stamp
+-- it. No DELETE: a singleton is never removed, and the row must survive a sweeper bug.
+GRANT SELECT ON public.zebridge_gc_watermark TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT, INSERT, UPDATE ON public.zebridge_gc_watermark TO ${POSTGRES_WRITER_USER};
+
+INSERT INTO public.zebridge_gc_watermark (id, watermark, threshold_ms)
+VALUES (1, now(), 0)
+ON CONFLICT (id) DO NOTHING;
+
+-- ⚠️ Published, or the whole design is inert: the row reaches clients through CDC and
+-- nothing else, so a table nobody publishes is a watermark nobody can read.
+--
+-- Published **here**, hardcoded, rather than through `zebridge_publish_tenant_table()`.
+-- That is the rule for bridge-owned tables and it is worth stating, because there are now
+-- two publication paths and the difference is not obvious:
+--
+--   this file          the bridge's own tables (zebridge_ddl_events, zebridge_gc_watermark).
+--                      They exist before any migration runs, they have no tenant, and their
+--                      shape is fixed by the bridge rather than chosen by a DBA. Publishing
+--                      them anywhere else would mean the bridge could boot without them.
+--   a migration        application tables. Tenant-scoped ones go through
+--                      `zebridge_publish_tenant_table()`; genuinely public ones are recorded
+--                      in `zebridge_public_tables` and added directly.
+--
+-- Both paths still pass through `zebridge_publication_guard`, which is why the registration
+-- below is not optional even here: the guard refuses an unscoped ADD TABLE regardless of who
+-- issues it, and this table genuinely is public — one row, no tenant, identical for every
+-- consumer.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'zebridge_public_tables') THEN
+        INSERT INTO public.zebridge_public_tables (tbl, reason)
+        VALUES ('public.zebridge_gc_watermark'::regclass,
+                'GC watermark: one row, no tenant, every client needs it')
+        ON CONFLICT (tbl) DO NOTHING;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_publication_tables
+        WHERE pubname = '${BRIDGE_CDC_PUBLICATION}' AND tablename = 'zebridge_gc_watermark'
+    ) THEN
+        ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE public.zebridge_gc_watermark;
+    END IF;
+END $$;
+
+-- keeps the tracker's own rows out of the DDL feed — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
 RETURNS boolean AS $$
     SELECT tbl = ANY (ARRAY[
@@ -443,6 +556,7 @@ $$ LANGUAGE sql IMMUTABLE;
 -- noticed within two days is one the audit trail was not going to explain anyway, and the
 -- table grows with every DDL forever otherwise. Raise it freely — nothing breaks either
 -- way, which is exactly why it is not a tuneable.
+-- retention for the DDL audit trail — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_prune_ddl_events()
 RETURNS void AS $$
 BEGIN
@@ -455,6 +569,7 @@ $$ LANGUAGE plpgsql;
 ALTER TABLE public.zebridge_ddl_events REPLICA IDENTITY FULL;
 GRANT SELECT ON TABLE public.zebridge_ddl_events TO ${POSTGRES_BRIDGE_USER};
 
+-- on ddl_command_end: writes the schema-change row — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_ddl_trigger_fn()
 RETURNS event_trigger AS $$
 DECLARE
@@ -596,6 +711,7 @@ EXECUTE FUNCTION public.zebridge_ddl_trigger_fn();
 -- gone and pg_event_trigger_ddl_commands() does not report it. Drops therefore
 -- need their own trigger on sql_drop, or clients never learn a table disappeared
 -- and keep a local replica of something that no longer exists upstream.
+-- on sql_drop: drops never reach ddl_command_end — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_drop_trigger_fn()
 RETURNS event_trigger AS $$
 DECLARE

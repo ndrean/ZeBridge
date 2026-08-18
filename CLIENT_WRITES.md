@@ -149,38 +149,65 @@ Suggested wire format (fills your "xxxx")
 - I'd name it version, not hlc — it isn't a hybrid logical clock, and calling it one invites people to assume causality guarantees it doesn't have. If you later add a logical component, the field still fits.
 - msg_id should move to the Nats-Msg-Id header if you want JetStream dedup; in the body it does nothing.
 
-Checklist to walk through once
+Checklist — reconciled against the code, 2026-08-18
 
-Config and discovery
+⚠️ Every line was `[ ]` until this pass, including eleven that had been built. A plan that
+disagrees with the code is worse than no plan: it hides what is left. Each item below was
+checked by grepping for the thing that implements it, not from memory.
 
-- [ ] SYNC_RULES=table:version_col[,tombstone_col];… + SYNC_VERSION_COLUMN default, - = outbound-only
-- [ ] preflight validates: exists / orderable type / precision ≥ µs / NOT NULL / naive-vs-tz warning
-- [ ] publish "sync": {version, tombstone, writable} in the schema KV, so clients discover it instead of hardcoding
+**Config and discovery**
 
-Security (before 1 and 2)
+- [x] `SYNC_RULES=table:version[,tombstone[,client_id]]` + `SYNC_VERSION_COLUMN` default —
+      `args.parseSyncRules`. Gained a **third** field since this was written: the tiebreak
+      column (PROTOCOL.md §7.4).
+- [x] preflight validates the version column: exists, orderable, precision, NOT NULL,
+      naive-vs-timestamptz — `preflight.classifyVersionColumn`, and it now also refuses a
+      tenant column outside the replica identity.
+- [x] the schema KV publishes what a client must discover — `version_column`,
+      `tombstone_column`, `mutation_timeout_ms`, and `required` per column. The last one
+      closed a real gap: a client previously learned that `inserted_at` was NOT NULL from
+      a `23502` rejection.
 
-- [ ] table + op from the subject, not the payload
-- [ ] identifiers validated against the catalog — never interpolated
-- [ ] zebridge_ddl_events explicitly excluded
-- [ ] bridge_writer role with no table privileges
+**Security**
 
-Correctness
+- [x] table, operation **and principal** from the subject, never the payload —
+      `mutation_listener.parseSubject`, enforced by NATS subject permissions (§7.1)
+- [x] identifiers validated against the catalog, never interpolated — `meta.hasColumn`
+- [x] `zebridge_ddl_events` excluded — `isForbiddenTable`, and
+      `zebridge_grant_edge_writes` refuses it too
+- [x] `bridge_writer` created with no table privileges — `init.sql.template`; tables are
+      opened one at a time
 
-- [ ] reply on the reply-to subject (ok / stale / rejected + txid or LSN) — both PowerSync and Electric need this; you have nothing today
-- [ ] max_deliver + dead-letter, so a bad message dies instead of looping
-- [ ] clamp future timestamps
-- [ ] keep the IS NULL OR guard
+**Correctness**
 
-Deletes
+- [x] a reply per write — `mutation_ack.<principal>.<msg_id>` carries
+      `{status, reason, sqlstate, detail, seq}`. Not on a reply-to inbox, deliberately: an
+      inbox dies with the page, and an outbox needs to collect verdicts after a crash.
+- [x] `max_deliver` + dead-letter — plus SQLSTATE classification, so a privilege error is
+      reported in milliseconds instead of consuming a retry budget meant for outages
+- [x] the `IS NULL OR` guard, and now `(version, client_id)` when the table declares a
+      tiebreak column — `scripts/scenarios/tiebreak.py`
+- [ ] **clamp future timestamps.** Not built. A client with a skewed clock writes a version
+      nobody can beat until the world catches up, and every later write is silently
+      rejected as stale. ⚠️ §7.2 already *promises* this ("the bridge clamps and tells you
+      what it used"), so the protocol currently overstates the implementation.
 
-- [ ] deleted_at when present, hard delete otherwise
-- [ ] GC_THRESHOLD_MS = your stated maximum offline window (1 h is a placeholder)
-- [ ] publish the GC watermark; clients drop queued writes older than it
-- [ ] keep GC's own deletes off the wire (separate publication with publish='insert,update')
+**Deletes**
 
-Then throughput
+- [x] `deleted_at` when configured, physical delete otherwise — `applyDelete`
+- [x] `GC_THRESHOLD_MS` is the stated maximum offline window, with a 60s floor so a units
+      mistake (`3600` reads as an hour, means 3.6 seconds) refuses to start
+- [ ] **publish the GC watermark**, so a client can drop queued writes older than it. Not
+      built: a client returning from a long offline period has no way to know its queued
+      edits are unsafe to flush.
+- [ ] **keep the sweeper's deletes off the wire.** Not done, and it is not free: `my_pub`
+      publishes `iud`, so every reaped tombstone ships a `cdc.<table>.delete` to every
+      client for a row they already know is gone. Needs a separate publication with
+      `publish='insert,update'` for swept tables, or a filter.
 
-- [ ] batch commits, synchronous_commit=off — after the above, not before
+**Then throughput**
+
+- [ ] batch commits, `synchronous_commit=off` — still last, and still after the above
 
 The three things, separated
 
