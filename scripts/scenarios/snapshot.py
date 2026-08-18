@@ -69,6 +69,7 @@ async def main():
 
     before = await descriptor()
     stale_id = before["snapshot_id"] if before else None
+    fell_back = False
 
     req = zb.subject(zb.TOPOLOGY["subjects"]["snapshot_request"], table)
     try:
@@ -78,6 +79,11 @@ async def main():
         # Not a failure: the window is occupied, so a snapshot is already in flight (C1).
         # Then the descriptor we want *is* the existing one — stop waiting for a new id.
         print(f"request refused ({exc}) — reading the existing descriptor")
+        # ⚠️ That descriptor may predate writes made since. The comparison below is against
+        # the table *now*, so any scenario that changed rows in between (mutate.py,
+        # sweeper.py) makes the sequences differ for a reason that is not a bug. Recorded
+        # so the verdict can be downgraded rather than reported as a failure.
+        fell_back = True
         stale_id = None
 
     desc = None
@@ -154,7 +160,14 @@ async def main():
     else:
         zb.ok("no duplicate keys")
 
-    if expected and keys != expected:
+    if expected and keys != expected and fell_back:
+        print(
+            f"  ⚠️  sequence differs ({len(keys)} snapshot rows vs {len(expected)} in the table),"
+            " but this run reused an existing snapshot because the request window was\n"
+            "     occupied. Rows written since it was taken are not in it. Not a failure —"
+            " purge REQUESTS and re-run for a real verdict."
+        )
+    elif expected and keys != expected:
         zb.bad(f"sequence differs from PostgreSQL's ORDER BY ({len(expected)} rows there)")
         for i, (a, b) in enumerate(zip(keys, expected)):
             if a != b:

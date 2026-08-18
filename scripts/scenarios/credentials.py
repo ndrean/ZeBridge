@@ -111,8 +111,58 @@ def main_sync() -> int:
     return failed
 
 
+async def principal_is_enforced() -> int:
+    """The subject's principal must be the authenticated user, and nothing else.
+
+    PROTOCOL.md §7.1 rests entirely on this: the principal is trustworthy *because* NATS
+    authorises subjects, so a client granted `mutation.alice.>` cannot write as anyone
+    else. That is a claim about the server's permission block, and it was only ever
+    checked by hand.
+
+    ⚠️ The failure mode is the reason this is worth a test rather than a paragraph. A
+    denied JetStream publish is never acked, so it surfaces as **`nats: timeout`** — not
+    as a permission error. A real scenario (`mutate.py`) hardcoded a principal that did
+    not match its credential and hung for ten seconds, which reads like a broker fault
+    rather than the guard working exactly as designed.
+    """
+    import msgpack
+
+    nc = await zb.connect()
+    js = nc.jetstream()
+    me = zb.NATS_URL.split("://", 1)[-1].rsplit("@", 1)[0].split(":", 1)[0] if "@" in zb.NATS_URL else None
+    if not me:
+        print("  (skipped: NATS_URL carries no user, so there is no principal to compare)")
+        await nc.close()
+        return 0
+
+    body = msgpack.packb({"key": {"uid": "x"}, "version": "2026-01-01T00:00:00.000000Z"})
+    failed = 0
+
+    try:
+        await js.publish(f"mutation.{me}.test_types.insert", body, timeout=3)
+        zb.ok(f"'{me}' may publish under its own principal")
+    except Exception as exc:  # noqa: BLE001
+        zb.bad(f"'{me}' could not publish as itself: {exc}")
+        failed += 1
+
+    for impostor in ("bob", f"{me}x", "admin"):
+        try:
+            await js.publish(f"mutation.{impostor}.test_types.insert", body, timeout=3)
+            zb.bad(f"'{me}' published as '{impostor}' — the principal is not enforced")
+            failed += 1
+        except Exception:  # noqa: BLE001
+            # Timeout or permissions violation — both mean the server refused it. The
+            # distinction does not matter here; the write not landing does.
+            zb.ok(f"'{me}' refused when claiming to be '{impostor}'")
+
+    await nc.close()
+    return failed
+
+
 async def main():
-    return main_sync()
+    rc = main_sync() or 0
+    print("\nD. the subject's principal is the authenticated user")
+    return rc + await principal_is_enforced()
 
 
 zb.run(main)

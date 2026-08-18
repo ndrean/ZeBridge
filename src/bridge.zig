@@ -188,6 +188,8 @@ fn initBatchPublisher(
 /// The thread MUST be started after the server is at its final memory location
 fn initHttpServer(
     allocator: std.mem.Allocator,
+    io: std.Io,
+    bind: []const u8,
     port: u16,
     should_stop_flag: *std.atomic.Value(bool),
     metrics: *metrics_mod.Metrics,
@@ -195,6 +197,8 @@ fn initHttpServer(
 ) !http_server.Server {
     return try http_server.Server.init(
         allocator,
+        io,
+        bind,
         port,
         should_stop_flag,
         metrics,
@@ -318,6 +322,8 @@ pub fn main(init: std.process.Init) !void {
     // === Start thread: HTTP server (at final memory location)
     var http_srv = try initHttpServer(
         allocator,
+        io,
+        parsed_args.http_bind,
         parsed_args.http_port,
         &should_stop,
         &metrics,

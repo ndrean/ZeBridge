@@ -21,6 +21,7 @@ Usage:  python scripts/scenarios/faults.py
 """
 
 import json
+import signal
 import pathlib
 import sys
 
@@ -29,6 +30,29 @@ import zb
 STREAM = zb.TOPOLOGY["streams"]["requests"]
 CONSUMER = "bridge_snapshot_worker"
 TMP = pathlib.Path("/tmp")
+
+
+def _die_on_signal(signum, _frame):
+    """Turn a termination signal into an exception, so `finally` still runs.
+
+    ⚠️ This scenario is **destructive**: it deletes REQUESTS and puts it back in a
+    `finally`. But Python does not run `finally` when the process is terminated by a
+    signal — and `timeout`, Ctrl-C in a pipeline, and CI job cancellation all send one.
+
+    Measured: a suite run wrapped in `timeout 130` was killed between the delete and the
+    restore. The stream stayed gone, and the next bridge start died with
+    `StartupFault: Snapshot listener never reached NATS … check that nats-init created the
+    'REQUESTS' stream` — a message that points at nats-init, which was innocent. Recovery
+    needed a hand-written `nats stream add`.
+
+    Raising here converts SIGTERM/SIGINT into a normal unwind, so the restore runs and the
+    stack is left bootable whatever kills the run.
+    """
+    raise KeyboardInterrupt(f"terminated by signal {signum}")
+
+
+signal.signal(signal.SIGTERM, _die_on_signal)
+signal.signal(signal.SIGINT, _die_on_signal)
 
 
 def phase_a() -> int:
@@ -48,6 +72,9 @@ def phase_a() -> int:
         return 1
     print(f"  {STREAM} deleted (config saved to {cfg_file})")
 
+    # ⚠️ From here to the `finally`, the stack is UNBOOTABLE. Everything that can raise —
+    # including the signal handler above — must unwind through the restore. The `try` used
+    # to start after this point, which was correct for exceptions and useless for signals.
     failed = 0
     try:
         with zb.Bridge("/tmp/zb_faults_a.log") as br:
@@ -131,7 +158,13 @@ def phase_b() -> int:
 async def main():
     if not zb.NKEY_SEED:
         sys.exit("NATS_NKEY_SEED is not set.\n  set -a && . ./.env && set +a")
-    return phase_a() + phase_b()
+    try:
+        return phase_a() + phase_b()
+    except KeyboardInterrupt as stop:
+        # The restore already ran on the way out — this only replaces a traceback, which
+        # reads like the scenario crashed, with a line saying the stack is intact.
+        print(f"\n  ⏹️  {stop} — unwound through the restore; {STREAM} is back.")
+        return 1
 
 
 zb.run(main)

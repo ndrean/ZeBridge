@@ -8,8 +8,11 @@
             .url = "https://github.com/zigcc/zig-msgpack/archive/main.tar.gz",
             .hash = "zig_msgpack-0.0.14-evvueL5SBQACmim6j6klQ9wWIIG_UxGlPvVYdiNy0KT8",
         },
-        // nats + mailbox + zul removed: vendored into src/nats_vendor/ and
-        // src/mailbox_vendor/ with a minimal Zig 0.16 patch applied (see build.zig).
+        // lalinsky/nats.zig, cloned locally so a local fix can be applied and reviewed
+        // before it goes upstream (see nats.zig/NOTES.md). std.Io transport, JetStream,
+        // KV, nkey/creds auth — replacing the vendored g41797 client and its private
+        // @cImport of sys/socket.h.
+        .nats = .{ .path = "nats.zig" },
     },
 
     .paths = .{

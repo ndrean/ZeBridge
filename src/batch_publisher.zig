@@ -839,12 +839,9 @@ pub const BatchPublisher = struct {
                     const col_view = event.columns[0];
                     const raw_json = event.data_buffer[col_view.value_offset..][0..col_view.value_len];
                     
-                    var headers = nats.pool.Headers{};
-                    try headers.init(flush_alloc, 256);
-                    defer headers.deinit();
-                    try headers.append("Nats-Msg-Id", event.getMsgId());
+                    const msg_id = event.getMsgId();
                     
-                    try self.publisher.publish(event.getSubject(), &headers, raw_json);
+                    try self.publisher.publish(event.getSubject(), msg_id, raw_json);
                     log.info("📤 Published KV schema: {d} bytes to {s}", .{raw_json.len, event.getSubject()});
                 }
             } else {
@@ -959,12 +956,9 @@ pub const BatchPublisher = struct {
             defer self.allocator.free(encoded);
 
             // Create headers with message ID for deduplication
-            var headers = nats.pool.Headers{};
-            try headers.init(flush_alloc, 256);
-            defer headers.deinit();
-            try headers.append("Nats-Msg-Id", event.getMsgId());
+                    const msg_id = event.getMsgId();
 
-            try self.publisher.publish(event.getSubject(), &headers, encoded);
+            try self.publisher.publish(event.getSubject(), msg_id, encoded);
 
             log.debug("Published single event: {s}", .{event.getSubject()});
         } else {
@@ -1029,12 +1023,9 @@ pub const BatchPublisher = struct {
             );
             defer self.allocator.free(batch_subject);
 
-            var headers = nats.pool.Headers{};
-            try headers.init(flush_alloc, 256);
-            defer headers.deinit();
-            try headers.append("Nats-Msg-Id", batch_msg_id);
+            const msg_id = batch_msg_id;
 
-            try self.publisher.publish(batch_subject, &headers, encoded);
+            try self.publisher.publish(batch_subject, msg_id, encoded);
             const publish_elapsed = utils.getMilliTimestamp() - publish_start;
 
             // Counted **here**, on a publish the server acknowledged — not when the event

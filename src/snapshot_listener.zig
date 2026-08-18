@@ -48,7 +48,7 @@ const SnapshotResult = struct {
 /// answer to a request.
 fn publishSnapshotError(
     allocator: std.mem.Allocator,
-    consumer: *nats.Consumer,
+    conn_nats: *nats.Connection,
     table_name: []const u8,
     error_type: []const u8,
     error_message: []const u8,
@@ -95,7 +95,7 @@ fn publishSnapshotError(
     const payload = try encoder.encode(map);
     defer allocator.free(payload);
 
-    try consumer.PUBLISH(subject, null, payload);
+    try conn_nats.publish(subject, payload);
 }
 
 /// How long the REQUESTS stream keeps an unread request, in seconds. 0 = unknown.
@@ -103,15 +103,15 @@ fn publishSnapshotError(
 /// Read from the server rather than from config, because the value belongs to `nats-init`
 /// (`SNAP_RET_SECONDS` in .env.admin) and the bridge is never told it. Asking is the only
 /// way to know what window the requests it is serving actually have.
-fn requestWindowSeconds(js: *nats.JS, stream: []const u8) u64 {
-    const request: nats.JS.StreamInfoRequest = .{};
-    const info = js.INFO(stream, &request) catch |err| {
+fn requestWindowSeconds(js: *nats.JetStream, stream: []const u8) u64 {
+    var res = js.getStreamInfo(stream) catch |err| {
         log.debug("could not read '{s}' max_age ({}); queue-expiry warning disabled", .{ stream, err });
         return 0;
     };
-    const cfg = info.config orelse return 0;
-    if (cfg.max_age <= 0) return 0; // 0 means "never expires"
-    return @intCast(@divTrunc(cfg.max_age, std.time.ns_per_s));
+    defer res.deinit();
+    const max_age = res.value.config.max_age;
+    if (max_age <= 0) return 0; // 0 means "never expires"
+    return @intCast(@divTrunc(max_age, std.time.ns_per_s));
 }
 
 /// Is this table in the publication *now*?
@@ -213,7 +213,7 @@ fn rowsPerChunk(bytes_per_row: usize, budget: usize, ceiling: usize) usize {
 /// enum, so the wire word cannot drift between the two producers.
 fn publishSuspension(
     allocator: std.mem.Allocator,
-    js: *nats.JS,
+    js: *nats.JetStream,
     topo: *const topology_mod.Topology,
     table_name: []const u8,
     reason: []const u8,
@@ -302,7 +302,7 @@ fn measureWidestRow(
 /// protect correctness, and it must never turn a failed snapshot into a failed thread.
 fn purgeOrphanChunks(
     allocator: std.mem.Allocator,
-    js: *nats.JS,
+    js: *nats.JetStream,
     topo: *const topology_mod.Topology,
     stream: []const u8,
     table_name: []const u8,
@@ -326,10 +326,13 @@ fn purgeOrphanChunks(
     defer allocator.free(schema_subject);
 
     for ([_][]const u8{ chunk_filter, schema_subject }) |filter| {
-        js.PURGE_FILTER(stream, filter) catch |err| {
+        // Native here; the vendored client had no purge-by-filter, so this used to call
+        // a `PURGE_FILTER` added to it by hand.
+        var res = js.purgeStream(stream, .{ .filter = filter }) catch |err| {
             log.warn("🧹 could not purge orphaned '{s}' ({}); it will age out with the stream", .{ filter, err });
             continue;
         };
+        res.deinit();
         log.info("🧹 purged orphaned snapshot data: {s}", .{filter});
     }
 }
@@ -338,9 +341,9 @@ fn purgeOrphanChunks(
 /// Matches the retry strategy used in batch_publisher.zig for consistency
 /// Checks should_stop flag during retries to allow graceful shutdown
 fn publishWithRetry(
-    js: *nats.JS,
+    js: *nats.JetStream,
     subject: []const u8,
-    headers: ?*nats.pool.Headers,
+    msg_id: ?[]const u8,
     payload: []const u8,
     should_stop: *std.atomic.Value(bool),
 ) !void {
@@ -349,10 +352,11 @@ fn publishWithRetry(
     var backoff_ms: u64 = config.Retry.publish_backoff_ms;
 
     while (!should_stop.load(.acquire)) {
-        const result = js.PUBLISH(subject, headers, payload);
+        const result = js.publish(subject, payload, .{ .msg_id = msg_id });
 
-        if (result) |_| {
-            // SUCCESS
+        if (result) |ok| {
+            var ack = ok;
+            ack.deinit();
             return;
         } else |err| {
             // FAILURE
@@ -760,7 +764,7 @@ const BootConnect = struct {
 const SnapshotContext = struct {
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
-    js: *nats.JS, // JetStream connection for publishing
+    js: *nats.JetStream, // JetStream connection for publishing
     monitored_tables: []const []const u8,
     refused: *refused_tables.Registry,
     format: encoder_mod.Format,
@@ -923,71 +927,57 @@ pub const SnapshotListener = struct {
         while (!should_stop.load(.acquire)) {
             log.info("📋 Schema listener: Connecting to NATS...", .{});
 
-            // Create Core NATS connection
-            var core = nats.Core{};
-            const connect_opts = nats.protocol.ConnectOpts{
-                .addr = endpoint.host,
-                .port = endpoint.port,
+            // Core NATS: schema requests are a plain subject, not a stream.
+            var core = nats.Connection.init(allocator, io, .{
                 .user = endpoint.user,
-                .pass = endpoint.pass,
+                .password = endpoint.pass,
                 .nkey_seed = endpoint.seed,
-            };
-            core.CONNECT(allocator, connect_opts, io) catch |err| {
+            });
+            defer core.deinit();
+
+            const core_url = std.fmt.allocPrint(allocator, "nats://{s}:{d}", .{ endpoint.host, endpoint.port }) catch continue;
+            defer allocator.free(core_url);
+            core.connect(core_url) catch |err| {
                 if (boot.failed(err, endpoint.host, endpoint.port)) return;
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
-            defer core.DISCONNECT();
 
             log.info("📋 Schema listener: Connected! Subscribing to 'init.schema'...", .{});
 
             // Subscribe to init.schema
-            const sid = "schema-listener-1";
-            core.SUB(topo.schema_request, null, sid) catch |err| {
-                // Counted against the boot budget too: a subscription that never
-                // succeeds leaves the listener as useless as one that never connects,
-                // and the connect above will keep succeeding, so nothing else would
-                // ever stop the loop.
-                if (boot.failed(err, endpoint.host, endpoint.port)) return;
+            const sub = core.subscribeSync(topo.schema_request) catch |err| {
+                log.err("📋 Schema listener: Failed to subscribe: {} - reconnecting", .{err});
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
-            boot.succeeded();
-
-            log.info("📋 Schema listener: ✅ Subscribed to '{s}'! Waiting for schema requests...", .{topo.schema_request});
+            defer sub.deinit();
 
             // Listen for schema requests
             while (!should_stop.load(.acquire)) {
-                if (core.connection) |conn| {
-                    const msg = conn.waitMessageNMT(nats.protocol.SECNS / 2, null) catch |err| {
-                        if (err == error.Timeout) {
-                            continue; // Normal timeout, keep polling
-                        }
-                        log.err("📋 Schema listener: Error receiving: {} - reconnecting", .{err});
-                        utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
-                        break; // Break inner loop to trigger reconnection
-                    };
-                    defer conn.reuse(msg);
+                // Short timeout so shutdown stays responsive: this loop is the only thing
+                // between a Ctrl-C and the thread's join.
+                const msg = sub.nextMsgTimeout(.{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } }) catch |err| {
+                    if (err == error.Timeout) continue;
+                    log.err("📋 Schema listener: Error receiving: {} - reconnecting", .{err});
+                    utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                    break;
+                };
+                defer msg.deinit();
 
-                    const payload = msg.letter.getPayload() orelse "(empty)";
-                    log.info("📋 Schema request received: {s}", .{payload});
+                log.info("📋 Schema request received: {s}", .{msg.data});
 
-                    // Query PostgreSQL for schemas and publish response
-                    handleSchemaRequest(
-                        allocator,
-                        &core,
-                        pg_config,
-                        monitored_tables,
-                        refused,
-                        format,
-                        topo,
-                    ) catch |err| {
-                        log.err("📋 Failed to handle schema request: {}", .{err});
-                    };
-                } else {
-                    log.err("📋 Schema listener: Connection lost - reconnecting", .{});
-                    break; // Break inner loop to trigger reconnection
-                }
+                handleSchemaRequest(
+                    allocator,
+                    &core,
+                    pg_config,
+                    monitored_tables,
+                    refused,
+                    format,
+                    topo,
+                ) catch |err| {
+                    log.err("📋 Failed to handle schema request: {}", .{err});
+                };
             }
         }
 
@@ -997,7 +987,7 @@ pub const SnapshotListener = struct {
     /// Handle a single schema request by querying PostgreSQL and publishing response
     fn handleSchemaRequest(
         allocator: std.mem.Allocator,
-        core: *nats.Core,
+        core: *nats.Connection,
         pg_config: *const pg_conn.PgConf,
         monitored_tables: []const []const u8,
         refused: *refused_tables.Registry,
@@ -1156,7 +1146,7 @@ pub const SnapshotListener = struct {
     /// Publish schema response to NATS
     fn publishSchemaResponse(
         allocator: std.mem.Allocator,
-        core: *nats.Core,
+        core: *nats.Connection,
         table_name: []const u8,
         columns: []const SchemaColumnInfo,
         format: encoder_mod.Format,
@@ -1211,7 +1201,7 @@ pub const SnapshotListener = struct {
         );
         defer allocator.free(subject);
 
-        core.PUB(subject, null, encoded) catch |err| {
+        core.publish(subject, encoded) catch |err| {
             log.err("📋 Failed to publish schema for {s}: {}", .{ table_only, err });
             return err;
         };
@@ -1262,45 +1252,53 @@ pub const SnapshotListener = struct {
             // It also replaces trust with enforcement: previously the only thing standing
             // between the primary and a stampede was each client politely checking the KV
             // descriptor first.
-            var cscnf = nats.protocol.ConsumerConfig{
-                .durable_name = "bridge_snapshot_worker",
-                .ack_policy = "explicit",
-                .deliver_policy = "all",
-                .filter_subject = topo.request_subject_wildcard,
-                // A snapshot runs synchronously in this loop and can take minutes on a
-                // large table. The default 30s ack_wait would redeliver the request while
-                // the first COPY is still running — duplicate snapshots for one request.
-                .ack_wait = config.Snapshot.request_ack_wait_ns,
-                // A request that keeps failing must not be retried forever.
-                .max_deliver = config.Snapshot.request_max_deliver,
+            var snap_conn = nats.Connection.init(allocator, io, .{
+                .user = endpoint.user,
+                .password = endpoint.pass,
+                .nkey_seed = endpoint.seed,
+            });
+            defer snap_conn.deinit();
+
+            const snap_url = std.fmt.allocPrint(allocator, "nats://{s}:{d}", .{ endpoint.host, endpoint.port }) catch continue;
+            defer allocator.free(snap_url);
+            snap_conn.connect(snap_url) catch |err| {
+                if (boot.failed(err, endpoint.host, endpoint.port)) return;
+                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
+                continue;
             };
 
-            const connect_opts = nats.protocol.ConnectOpts{
-                .addr = endpoint.host,
-                .port = endpoint.port,
-                .user = endpoint.user,
-                .pass = endpoint.pass,
-                .nkey_seed = endpoint.seed,
-            };
-            var consumer = nats.Consumer.START(
-                allocator,
-                connect_opts,
-                topo.stream_requests,
-                &cscnf,
-                io,
+            var snap_js = nats.JetStream.init(&snap_conn, .{});
+
+            const consumer = snap_js.pullSubscribe(
+                topo.request_subject_wildcard,
+                "bridge_snapshot_worker",
+                .{
+                    .stream = topo.stream_requests,
+                    .config = .{
+                        .ack_policy = .explicit,
+                        .deliver_policy = .all,
+                        .filter_subject = topo.request_subject_wildcard,
+                        // A snapshot runs synchronously in this loop and can take minutes
+                        // on a large table. The default 30s ack_wait would redeliver the
+                        // request while the first COPY is still running — duplicate
+                        // snapshots for one request.
+                        .ack_wait = config.Snapshot.request_ack_wait_ns,
+                        // A request that keeps failing must not be retried forever.
+                        .max_deliver = config.Snapshot.request_max_deliver,
+                    },
+                },
             ) catch |err| {
-                // Bounded on the first pass only. START covers both the connection and
-                // the consumer, so the common permanent failure here is not a bad host
-                // but a `REQUESTS` stream `nats-init` never created — which no amount
-                // of retrying fixes, and which used to be invisible behind one log line
-                // every 2s while the bridge otherwise looked healthy.
+                // Bounded on the first pass only. The common permanent failure here is
+                // not a bad host but a `REQUESTS` stream `nats-init` never created —
+                // which no amount of retrying fixes, and which used to be invisible
+                // behind one log line every 2s while the bridge otherwise looked healthy.
                 if (boot.failed(err, endpoint.host, endpoint.port)) return;
                 log.err("📸 Snapshot listener: Failed to start consumer on '{s}': {} - retrying in {d}ms", .{ topo.stream_requests, err, reconnect_delay_ms });
                 utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
                 continue;
             };
-            defer nats.Consumer.STOP(&consumer, false);
-            boot.succeeded();
+            defer consumer.deinit();
+                        boot.succeeded();
 
             log.info("📸 Snapshot listener: ✅ Consuming '{s}' from stream '{s}'", .{
                 topo.request_subject_wildcard,
@@ -1310,51 +1308,31 @@ pub const SnapshotListener = struct {
 
             // Listen for snapshot requests
             while (!should_stop.load(.acquire)) {
-                if (consumer.CONSUME(nats.protocol.SECNS / 2) catch null) |msg| {
-                    // Not every message a pull consumer receives is a delivery. The
-                    // server also sends status messages on the pull inbox — `408 Request
-                    // Timeout`, `409`, idle heartbeats — whose subject is the inbox
-                    // itself (`<uuid>.<seq>`) and which carry **no reply-to**.
-                    //
-                    // They must be recycled, never acked: `Consumer.ack` publishes to
-                    // `msg.letter.ReplyTo().?`, so acking one panics the thread on a null
-                    // unwrap — observed as
-                    // `📸 Invalid snapshot request subject: 04b01ecd-….2196` followed
-                    // immediately by `attempt to use null value`, killing the snapshot
-                    // path for the life of the process.
-                    //
-                    // Reply-to is the right discriminator here, not an empty payload:
-                    // a snapshot request legitimately has no payload — the table name is
-                    // in the subject — so the emptiness test the mutation listener uses
-                    // would discard every real request.
-                    if (msg.letter.ReplyTo() == null) {
-                        log.debug("📸 JetStream status message (no reply-to), recycling", .{});
-                        consumer.REUSE(msg);
-                        continue;
-                    }
+                var batch = consumer.fetch(1, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } }) catch {
+                    continue;
+                };
+                defer batch.deinit();
+
+                for (batch.messages) |msg| {
+                    // ⚠️ Status frames (408, 409, idle heartbeats) no longer reach here —
+                    // the library recognises them. With the vendored client they arrived
+                    // as ordinary messages with no reply-to, and acking one panicked on a
+                    // null unwrap, killing the snapshot path for the life of the process.
+                    // The guard for that lived here and is now the library's job.
 
                     // ACKed **now**, before the COPY, not at scope exit.
                     //
-                    // This was `defer consumer.ACK(msg, true)`, whose comment claimed an
-                    // immediate ack while `defer` in fact held it for the whole snapshot —
-                    // so a table taking longer than `ack_wait` was redelivered and
-                    // snapshotted twice, which is precisely what the comment said it was
-                    // avoiding. Holding the ack buys only redelivery-on-crash, and pays
-                    // for it with duplicate work on exactly the tables least able to
-                    // afford it. The stream's own max-msgs-per-subject window is what
-                    // stops a re-request in the meantime.
-                    //
-                    // `reuse = false`: recycling the envelope here would invalidate
-                    // `msg.letter.subject`, which the table name is read from below. The
-                    // envelope goes back at scope exit instead.
-                    consumer.ACK(msg, false) catch {};
-                    defer consumer.REUSE(msg);
+                    // This was `defer ACK`, whose comment claimed an immediate ack while
+                    // `defer` in fact held it for the whole snapshot — so a table taking
+                    // longer than `ack_wait` was redelivered and snapshotted twice, which
+                    // is precisely what the comment said it was avoiding. Holding the ack
+                    // buys only redelivery-on-crash, and pays for it with duplicate work
+                    // on exactly the tables least able to afford it. The stream's own
+                    // max-msgs-per-subject window is what stops a re-request meanwhile.
+                    msg.ack() catch {};
 
                     // Extract table name from subject: init.snapshot.<table>
-                    const subject = msg.letter.subject.body() orelse {
-                        log.err("📸 No subject in message", .{});
-                        continue;
-                    };
+                    const subject = msg.msg.subject;
 
                     const table_name = blk: {
                         const prefix = topo.request_subject_prefix;
@@ -1375,7 +1353,7 @@ pub const SnapshotListener = struct {
                         log.warn("📸 Table '{s}' is refused (no primary key) — publishing error", .{table_name});
                         publishSnapshotError(
                             allocator,
-                            &consumer,
+                            &snap_conn,
                             table_name,
                             "table_refused",
                             "Table has no primary key: replication is suspended, so no snapshot can be served",
@@ -1398,7 +1376,7 @@ pub const SnapshotListener = struct {
                         log.warn("📸 Table '{s}' not in monitored tables — publishing error", .{table_name});
                         publishSnapshotError(
                             allocator,
-                            &consumer,
+                            &snap_conn,
                             table_name,
                             "table_not_monitored",
                             "Table is not in the publication this bridge replicates",
@@ -1438,7 +1416,7 @@ pub const SnapshotListener = struct {
                         log.err("📸 Snapshot generation failed for '{s}': {}", .{ table_name, err });
                         publishSnapshotError(
                             allocator,
-                            &consumer,
+                            &snap_conn,
                             table_name,
                             "generation_failed",
                             @errorName(err),
@@ -1488,19 +1466,26 @@ pub const SnapshotListener = struct {
             chunk_size,
         });
 
-        // Create JetStream connection for publishing snapshot data
-        const connect_opts = nats.protocol.ConnectOpts{
-                .addr = endpoint.host,
-                .port = endpoint.port,
-                .user = endpoint.user,
-                .pass = endpoint.pass,
-                .nkey_seed = endpoint.seed,
-            };
-        var js = nats.JS.CONNECT(allocator, connect_opts, io) catch |err| {
+        // A connection of its own for publishing chunks: a snapshot can run for minutes,
+        // and sharing the request consumer's connection would tie chunk publishing to the
+        // lifetime of whatever that loop is doing.
+        const pub_conn = try allocator.create(nats.Connection);
+        defer allocator.destroy(pub_conn);
+        pub_conn.* = nats.Connection.init(allocator, io, .{
+            .user = endpoint.user,
+            .password = endpoint.pass,
+            .nkey_seed = endpoint.seed,
+        });
+        defer pub_conn.deinit();
+
+        const pub_url = try std.fmt.allocPrint(allocator, "nats://{s}:{d}", .{ endpoint.host, endpoint.port });
+        defer allocator.free(pub_url);
+        pub_conn.connect(pub_url) catch |err| {
             log.err("📸 Failed to connect to JetStream: {}", .{err});
             return error.JetStreamConnectionFailed;
         };
-        defer js.DISCONNECT();
+
+        var js = nats.JetStream.init(pub_conn, .{});
 
         log.info("📸 Connected to JetStream for snapshot publishing", .{});
 
@@ -1861,42 +1846,18 @@ pub const SnapshotListener = struct {
                 .{ table_name, snapshot_id, batch },
             );
 
-            // Create headers with metadata for versioning and deduplication
-            var headers = nats.pool.Headers{};
-            try headers.init(chunk_alloc, 512);
-            defer headers.deinit();
-
-            // Deduplication
-            try headers.append("Nats-Msg-Id", msg_id_buf);
-
-            // Content metadata
-            try headers.append("Content-Type", "application/msgpack");
-
-            // Snapshot versioning
-            try headers.append("X-Format", "array"); // Tells consumer: expect [[v1,v2,...]]
-            try headers.append("X-Snapshot-Version", "1.0");
-
-            // Schema reference (will be published separately)
-            const schema_ref = try std.fmt.allocPrint(chunk_alloc, "{s}.{s}", .{ table_name, snapshot_id });
-            try headers.append("X-Schema-Ref", schema_ref);
-
-            // Progress tracking for consumers
-            const chunk_num_str = try std.fmt.allocPrint(chunk_alloc, "{d}", .{batch});
-            try headers.append("X-Snapshot-Chunk-Num", chunk_num_str);
-
-            const rows_in_chunk_str = try std.fmt.allocPrint(chunk_alloc, "{d}", .{num_rows});
-            try headers.append("X-Snapshot-Rows-In-Chunk", rows_in_chunk_str);
-
-            const total_rows_str = try std.fmt.allocPrint(chunk_alloc, "{d}", .{total_rows});
-            try headers.append("X-Snapshot-Total-Rows-So-Far", total_rows_str);
-
-            if (is_final) {
-                try headers.append("X-Snapshot-Final-Chunk", "true");
-            }
-
+            // Only the msg_id survives the migration.
+            //
+            // The vendored path also wrote Content-Type, X-Format, X-Snapshot-Version,
+            // X-Schema-Ref, X-Snapshot-Chunk-Num, X-Snapshot-Rows-In-Chunk,
+            // X-Snapshot-Total-Rows-So-Far and X-Snapshot-Final-Chunk — none of which any
+            // consumer in the tree reads, and none of which PROTOCOL.md documents. The
+            // chunk subject already carries the table, snapshot id and chunk number, and
+            // the descriptor in KV carries the totals. Porting them would have asserted a
+            // contract that never existed.
             // Publish to JetStream with headers and retry logic
             const t_pub = utils.nanoTimestamp();
-            try publishWithRetry(&js, subject, &headers, payload, should_stop);
+            try publishWithRetry(&js, subject, msg_id_buf, payload, should_stop);
             publish_ns += @intCast(utils.nanoTimestamp() - t_pub);
 
             chunks_published += 1;
@@ -1977,7 +1938,7 @@ pub const SnapshotListener = struct {
     /// Publish snapshot start notification
     fn publishSnapshotStart(
         allocator: std.mem.Allocator,
-        js: *nats.JS,
+        js: *nats.JetStream,
         table_name: []const u8,
         snapshot_id: []const u8,
         lsn: []const u8,
@@ -2021,7 +1982,7 @@ pub const SnapshotListener = struct {
     /// Publish snapshot metadata
     fn publishSnapshotMetadata(
         allocator: std.mem.Allocator,
-        js: *nats.JS,
+        js: *nats.JetStream,
         table_name: []const u8,
         snapshot_id: []const u8,
         lsn: []const u8,
@@ -2058,17 +2019,13 @@ pub const SnapshotListener = struct {
         );
         defer allocator.free(subject);
 
-        // Create headers for metadata message
-        var headers = nats.pool.Headers{};
-        try headers.init(allocator, 256);
-        defer headers.deinit();
-
-        try headers.append("Content-Type", "application/msgpack");
-        try headers.append("X-Snapshot-Version", "1.0");
-        try headers.append("X-Message-Type", "snapshot-complete");
+        // No headers: `Content-Type`/`X-Snapshot-Version`/`X-Message-Type` were written
+        // here and read by nothing — the payload is self-describing MessagePack, and no
+        // consumer in the tree looks at them. Dropped with the migration rather than
+        // ported, since porting them would have implied someone depended on them.
 
         // Publish to JetStream with retry logic
-        try publishWithRetry(js, subject, &headers, encoded, should_stop);
+        try publishWithRetry(js, subject, null, encoded, should_stop);
 
         // Also publish to the KV bucket so clients can check for a cached snapshot
         // before requesting a fresh one. Subject built from topology, not a literal:
@@ -2122,7 +2079,7 @@ fn parsePgLsn(lsn_str: []const u8) !u64 {
 /// Subject: config.Snapshot.schema_subject_pattern (under init.> so INIT stores it)
 fn publishSchema(
     allocator: std.mem.Allocator,
-    js: *nats.JS,
+    js: *nats.JetStream,
     table_name: []const u8,
     snapshot_id: []const u8,
     column_names: [][]const u8,
@@ -2156,17 +2113,10 @@ fn publishSchema(
     }, null);
     defer allocator.free(subject);
 
-    // Create headers for schema message
-    var headers = nats.pool.Headers{};
-    try headers.init(allocator, 256);
-    defer headers.deinit();
-
-    try headers.append("Content-Type", "application/msgpack");
-    try headers.append("X-Schema-Version", "1.0");
-    try headers.append("X-Column-Count", try std.fmt.allocPrint(allocator, "{d}", .{column_names.len}));
+    // No headers — see the note in the metadata publisher above.
 
     // Publish to JetStream with retry logic
-    try publishWithRetry(js, subject, &headers, encoded, should_stop);
+    try publishWithRetry(js, subject, null, encoded, should_stop);
 
     log.info("📋 Published schema → {s} ({d} columns)", .{ subject, column_names.len });
 }

@@ -27,6 +27,9 @@ const usage =
     \\  DATABASE_WRITER_URL   Ingress path, same form. Unset disables the mutation
     \\                        listener entirely — it never falls back to the read role.
     \\  BRIDGE_PORT           HTTP telemetry port when --port is absent
+    \\  BRIDGE_BIND           telemetry bind address (default 127.0.0.1). Every
+    \\                        endpoint is unauthenticated, so 0.0.0.0 exposes table
+    \\                        names, lag and throughput to anything that can reach it.
     \\  NATS_URL              nats://[user:pass@]host[:port] (default: localhost)
     \\  NATS_NKEY_SEED        NATS nkey seed
     \\  BASE_BUF              log2 of per-event data buffer (10-20)
@@ -87,6 +90,7 @@ pub const Args = struct {
     /// Where topology.json is. See `--top`.
     topology_path: []const u8,
     http_port: u16,
+    http_bind: []const u8,
     slot_name: []const u8,
     publication_name: []const u8,
     encoding_format: encoder.Format,
@@ -159,6 +163,15 @@ pub const Args = struct {
             65_535,
         );
 
+        // Borrowed from the environment block, which outlives the process.
+        const resolved_bind: []const u8 = init.minimal.environ.getPosix("BRIDGE_BIND") orelse
+            config.Http.default_bind;
+
+        log.info("HTTP telemetry bind {s} (from {s})", .{
+            resolved_bind,
+            if (init.minimal.environ.getPosix("BRIDGE_BIND") != null) "BRIDGE_BIND" else "default",
+        });
+
         log.info("HTTP telemetry port {d} (from {s})", .{
             resolved_port,
             if (http_port != null)
@@ -180,6 +193,7 @@ pub const Args = struct {
         const cli_args = Args{
             .topology_path = resolved_topology,
             .http_port = resolved_port,
+            .http_bind = resolved_bind,
             .slot_name = slot_name,
             .publication_name = publication_name,
             .encoding_format = encoding_format,

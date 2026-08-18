@@ -181,8 +181,17 @@ def nats_cli(*args, seed_file=None) -> subprocess.CompletedProcess:
     if seed_file is None:
         seed_file = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_seed.nk"
         seed_file.write_text(NKEY_SEED or "")
+    # ⚠️ Strip credentials from the URL. This passes `--nkey`, so the seed *is* the
+    # credential — but if NATS_URL also carries `user:pass@` (which it does whenever a
+    # scenario is run as a client principal), those win and every administrative command
+    # is denied. The failure is opaque: `could not pick a Stream to operate on: context
+    # deadline exceeded`, because a denied JetStream API publish never answers.
+    scheme, _, rest = NATS_URL.partition("://")
+    address = rest.rsplit("@", 1)[-1] if "@" in rest else rest
+    server = f"{scheme}://{address}" if scheme else address
+
     return subprocess.run(
-        ["nats", "--server", NATS_URL, "--nkey", str(seed_file), *args],
+        ["nats", "--server", server, "--nkey", str(seed_file), *args],
         capture_output=True,
         text=True,
     )

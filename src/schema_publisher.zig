@@ -103,13 +103,7 @@ pub fn publishSchema(
     var msg_id_buf: [64]u8 = undefined;
     const msg_id = try std.fmt.bufPrint(&msg_id_buf, "schema-{s}-{d}", .{ relation.name, relation.relation_id });
 
-    // Create headers with message ID for deduplication
-    var headers = nats.pool.Headers{};
-    try headers.init(allocator, 256);
-    defer headers.deinit();
-    try headers.append("Nats-Msg-Id", msg_id);
-
-    try publisher.publish(subject, &headers, encoded);
+    try publisher.publish(subject, msg_id, encoded);
 
     log.info("✅ Schema published: {s} ({d} columns)", .{ relation.name, relation.columns.len });
 }

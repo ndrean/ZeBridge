@@ -3,21 +3,38 @@ const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
 const refused_tables = @import("refused_tables.zig");
 const utils = @import("utils.zig");
+const Config = @import("config.zig");
 
 // std.net was removed in Zig 0.16 "Juicy Main". Use C POSIX sockets directly.
-const sock_c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("netinet/in.h");
-    @cInclude("unistd.h");
-    @cInclude("poll.h");
-});
+// No @cImport here any more.
+//
+// This file used to reach for `sys/socket.h` + `poll.h` and hand-roll socket/bind/accept/
+// read. It bought exactly one thing — a *cancellable* accept, via a 100ms `poll` that let
+// the loop check `should_stop` — and paid for it with everything else: `INADDR_ANY` as the
+// accidental default (a zeroed `sockaddr_in` leaves `s_addr == 0`), a `sin_addr` byte
+// order to get wrong by hand, and request parsing over a fixed 2048-byte buffer.
+//
+// `std.Io` gives the same cancellation for free: `AcceptError.SocketNotListening` is
+// documented as the shutdown mechanism — closing the listener wakes a blocked `accept`.
 
 pub const log = std.log.scoped(.http_server);
 
-/// Simple HTTP server for health checks and basic control
+// `parseIp4` and its two tests lived here. `std.Io.net.IpAddress.parse` does it, and does
+// not offer the byte-order mistake the hand-rolled version made: `readInt(u32, .big)`
+// returns the numeric value, which lays down reversed on a little-endian host, so
+// `127.0.0.1` bound as `1.0.0.127` and the server failed with `BindFailed`. The unit tests
+// missed it because they asserted against the same wrong expression.
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     port: u16,
+    bind: []const u8 = "127.0.0.1",
+    io: std.Io,
+    /// The live listener, so `stop()` can close it and wake a blocked `accept`. Valid only
+    /// while `run` is on the stack.
+    server: ?*std.Io.net.Server = null,
+    /// Connections currently being served. Bounded by `Config.Http.max_connections`.
+    open_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     should_stop: *std.atomic.Value(bool),
     metrics: ?*metrics_mod.Metrics,
     nats_publisher: ?*nats_publisher.Publisher,
@@ -28,6 +45,12 @@ pub const Server = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
+        io: std.Io,
+        /// Address to bind. Defaults to loopback (see `Config.Http.default_bind`):
+        /// telemetry discloses table names, lag and throughput, and every endpoint is
+        /// unauthenticated, so reaching it should require being on the host — or a reverse
+        /// proxy the operator put there deliberately.
+        bind: []const u8,
         port: u16,
         should_stop: *std.atomic.Value(bool),
         metrics: ?*metrics_mod.Metrics,
@@ -35,6 +58,8 @@ pub const Server = struct {
     ) !Server {
         return Server{
             .allocator = allocator,
+            .io = io,
+            .bind = bind,
             .port = port,
             .should_stop = should_stop,
             .metrics = metrics,
@@ -49,8 +74,30 @@ pub const Server = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Join the HTTP server thread (waits for completion)
+    /// Wake a blocked `accept`, so `join` can return.
+    ///
+    /// ⚠️ Setting `should_stop` is not enough on its own. The loop checks it between
+    /// accepts, and `accept` blocks indefinitely — the old C implementation only got away
+    /// with a flag because it wrapped every accept in a 100ms `poll`. Closing the listener
+    /// is the documented replacement: std says `SocketNotListening` is returned when
+    /// "shutdown was called (possibly while this call was blocking). This allows shutdown
+    /// to be used as a concurrent cancellation mechanism."
+    ///
+    /// Safe to call when `run` is not on the stack, and safe to call twice.
+    pub fn stop(self: *Server) void {
+        self.should_stop.store(true, .seq_cst);
+        if (self.server) |srv| {
+            self.server = null;
+            srv.deinit(self.io);
+        }
+    }
+
+    /// Join the HTTP server thread (waits for completion).
+    ///
+    /// Calls `stop` first: a `join` that does not wake the accept loop is a hang, and the
+    /// one place that hurts most is `defer http_srv.join()` on the shutdown path.
     pub fn join(self: *Server) void {
+        self.stop();
         if (self.thread) |thread| {
             thread.join();
             self.thread = null;
@@ -64,129 +111,213 @@ pub const Server = struct {
 
     /// Run the HTTP server (in a separate thread)
     pub fn run(self: *Server) !void {
-        const sock_raw = sock_c.socket(sock_c.AF_INET, sock_c.SOCK_STREAM, 0);
-        if (sock_raw < 0) return error.SocketFailed;
-        const sock_fd: c_int = sock_raw;
-        defer _ = sock_c.close(sock_fd);
+        const addr = std.Io.net.IpAddress.parse(self.bind, self.port) catch {
+            log.err("🔴 BRIDGE_BIND '{s}' is not an IP address (e.g. 127.0.0.1 or 0.0.0.0)", .{self.bind});
+            return error.InvalidBindAddress;
+        };
 
-        const optval: c_int = 1;
-        _ = sock_c.setsockopt(sock_fd, sock_c.SOL_SOCKET, sock_c.SO_REUSEADDR,
-            @ptrCast(&optval), @as(c_uint, @sizeOf(c_int)));
-
-        var addr = std.mem.zeroes(sock_c.struct_sockaddr_in);
-        addr.sin_family = @intCast(sock_c.AF_INET);
-        addr.sin_port = std.mem.nativeToBig(u16, self.port);
-        // sin_addr.s_addr == 0 is INADDR_ANY (zeroed by zeroes())
-
-        if (sock_c.bind(sock_fd, @ptrCast(&addr), @as(c_uint, @sizeOf(sock_c.struct_sockaddr_in))) < 0)
+        var server = addr.listen(self.io, .{ .reuse_address = true }) catch |err| {
+            log.err("🔴 Could not listen on {s}:{d}: {s}", .{ self.bind, self.port, @errorName(err) });
             return error.BindFailed;
-        if (sock_c.listen(sock_fd, 128) < 0)
-            return error.ListenFailed;
+        };
+        self.server = &server;
+        // `stop()` may have closed and cleared it already; only clean up if it did not.
+        defer if (self.server != null) {
+            self.server = null;
+            server.deinit(self.io);
+        };
 
-        log.info("✅ HTTP server listening on http://0.0.0.0:{d}", .{self.port});
+        log.info("✅ HTTP server listening on http://{s}:{d}", .{ self.bind, self.port });
+        if (std.mem.eql(u8, self.bind, "0.0.0.0")) {
+            log.warn("⚠️  Telemetry is bound to every interface and every endpoint is unauthenticated — table names, lag and throughput are readable by anyone who can reach this port.", .{});
+        }
         log.info("ℹ️ Available endpoints:", .{});
         log.info("  GET  /health         - Health check", .{});
         log.info("  GET  /status         - Bridge status (JSON)", .{});
         log.info("  GET  /metrics        - Prometheus metrics", .{});
-        log.info("  POST /shutdown       - Graceful shutdown", .{});
-        log.info("  GET  /streams/info?stream=NAME   - NATS stream info", .{});
+
+        // No poll timer. `accept` blocks until a client arrives *or* the listener is
+        // closed — std documents `SocketNotListening` as exactly that: "shutdown was
+        // called (possibly while this call was blocking). This allows shutdown to be used
+        // as a concurrent cancellation mechanism." `stop()` closes it.
+        // Tasks serving connections. Awaited on the way out, so a response in flight is
+        // not cut off by shutdown.
+        var conns: std.Io.Group = .init;
+        defer conns.cancel(self.io);
 
         while (!self.should_stop.load(.seq_cst)) {
-            // Poll with 100 ms timeout so we can re-check should_stop without blocking.
-            var poll_fds = [_]sock_c.struct_pollfd{
-                .{
-                    .fd = sock_fd,
-                    .events = @as(c_short, @intCast(sock_c.POLLIN)),
-                    .revents = 0,
+            const stream = server.accept(self.io) catch |err| switch (err) {
+                error.SocketNotListening, error.Canceled => break,
+                // Transient: a peer that hung up between the SYN and the accept, or a
+                // momentary fd shortage. Losing the loop over either would take telemetry
+                // down for the life of the process.
+                error.ConnectionAborted,
+                error.WouldBlock,
+                error.ProcessFdQuotaExceeded,
+                error.SystemFdQuotaExceeded,
+                error.SystemResources,
+                => continue,
+                else => {
+                    log.err("🔴 accept failed: {s}", .{@errorName(err)});
+                    break;
                 },
             };
 
-            const ready = sock_c.poll(&poll_fds[0], 1, 100);
-            if (ready < 0) {
-                log.err("⚠️ Poll error", .{});
-                utils.sleep(100 * std.time.ns_per_ms);
+            // The cap. Checked before spawning, so a flood costs one accept and one close
+            // rather than a thread — and the counter is decremented by `serviceStream`
+            // itself, so a task that dies still releases its slot.
+            //
+            // Closing immediately, not queueing: a Prometheus scraper retries on its own
+            // schedule, and a queue nobody drains is just a slower outage.
+            if (self.open_conns.load(.monotonic) >= Config.Http.max_connections) {
+                log.warn("⚠️  {d} connections already open — refusing another", .{Config.Http.max_connections});
+                stream.close(self.io);
                 continue;
             }
-            if (ready == 0) continue;
+            _ = self.open_conns.fetchAdd(1, .monotonic);
 
-            const client_raw = sock_c.accept(sock_fd, null, null);
-            if (client_raw < 0) {
-                log.err("🔴 Failed to accept connection", .{});
-                continue;
-            }
-            const client_fd: c_int = client_raw;
-            defer _ = sock_c.close(client_fd);
-
-            self.handleRequest(client_fd) catch |err| {
-                log.warn("⚠️ Error handling request: {}", .{err});
+            // ⚠️ `concurrent`, not `async`, and the difference is the whole point.
+            //
+            // `Io.async` is *allowed to run the task inline*: std says of the thread pool
+            // limit, "after this limit, calls to `Io.async` when all threads are busy run
+            // the task immediately". Measured — with `async` a single client that opened
+            // a socket and sent **zero bytes** still wedged the server: three consecutive
+            // `GET /metrics` returned `000`, exactly as with the old inline C loop.
+            // `Io.concurrent` guarantees a separate thread, so a stalled connection can
+            // never occupy the accept loop.
+            //
+            // A rate limiter would not have helped either version: one connection, zero
+            // requests, nothing to count.
+            //
+            // Into a `Group` so shutdown can wait for in-flight responses instead of
+            // abandoning them. `ConcurrentDeadlock` is the one refusal worth handling: it
+            // means the runtime cannot promise a thread, and serving inline then is better
+            // than dropping the request — a stall is possible but a lost response is
+            // certain.
+            conns.concurrent(self.io, serviceStream, .{ self, stream }) catch {
+                // The runtime cannot promise a thread. Serving inline risks a stall;
+                // dropping guarantees a lost response, so this takes the risk.
+                serviceStream(self, stream);
             };
         }
 
         log.info("👋 HTTP server stopped", .{});
     }
 
-    fn handleRequest(self: *Server, fd: c_int) !void {
-        var buffer: [2048]u8 = undefined;
-        const bytes_read_n = sock_c.read(fd, &buffer, buffer.len);
-        if (bytes_read_n <= 0) return;
-        const bytes_read: usize = @intCast(bytes_read_n);
+    /// Serve one connection, then close it.
+    ///
+    /// ⚠️ Still missing a receive deadline. A client that connects and never sends now
+    /// parks one task instead of the accept loop — a leak rather than an outage, which is
+    /// the right direction but not a resolution. A bounded read timeout (and a cap on
+    /// concurrent connections) is the remaining hardening; both belong here, not in the
+    /// accept loop.
+    fn serviceStream(self: *Server, stream: std.Io.net.Stream) void {
+        defer stream.close(self.io);
+        defer _ = self.open_conns.fetchSub(1, .monotonic);
 
-        const request = buffer[0..bytes_read];
+        // A watchdog, because the reader has no per-read deadline: it sleeps, then shuts
+        // down the receive side if the request has not been parsed yet. `shutdown` is what
+        // unblocks a read that is waiting on a client saying nothing — the same mechanism
+        // std documents for cancelling `accept`.
+        //
+        // `concurrent` for the same reason as above: an `async` watchdog is allowed to run
+        // inline, which would mean sleeping *before* serving the request — turning every
+        // scrape into a 3-second wait.
+        var done = std.atomic.Value(bool).init(false);
+        var watchdog: std.Io.Group = .init;
+        defer watchdog.cancel(self.io);
+        watchdog.concurrent(self.io, receiveWatchdog, .{ self, stream, &done }) catch {};
 
-        var lines = std.mem.splitScalar(u8, request, '\n');
-        const first_line = lines.next() orelse return;
-        var parts = std.mem.splitScalar(u8, first_line, ' ');
-        const method = std.mem.trim(u8, parts.next() orelse return, &std.ascii.whitespace);
-        const path = std.mem.trim(u8, parts.next() orelse return, &std.ascii.whitespace);
+        // Sized for what actually crosses this socket, because these are per-connection
+        // and now multiplied by `max_connections`.
+        //
+        //   read  — a request head. `GET /metrics HTTP/1.1` plus Prometheus' headers is
+        //           ~200 bytes; 1 KiB leaves room for a browser's, and a head that does
+        //           not fit is refused rather than served, which is the right answer for
+        //           an endpoint with no long URLs.
+        //   write — the largest response. `/metrics` measured 2,296 bytes and grows with
+        //           the table count, so 8 KiB is headroom rather than a limit. ⚠️ Unlike
+        //           the old hand-built response buffer this is not a truncation point:
+        //           `std.http` streams a body larger than the buffer.
+        var read_buffer: [1024]u8 = undefined;
+        var write_buffer: [8192]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        var writer = stream.writer(self.io, &write_buffer);
 
-        log.debug("{s} {s}", .{ method, path });
+        var http = std.http.Server.init(&reader.interface, &writer.interface);
 
-        if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
-            try self.handleHealth(fd);
-        } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/status")) {
-            try self.handleStatus(fd);
-        } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
-            try self.handleMetrics(fd);
-        } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/shutdown")) {
-            try self.handleShutdown(fd);
-        } else if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/streams/info")) {
-            try self.handleStreamInfo(fd, path);
+        // One request per connection: every response says `Connection: close`, and
+        // telemetry scrapes are not hot enough for keep-alive to matter.
+        var req = http.receiveHead() catch |err| {
+            done.store(true, .release);
+            // Includes a client that connected and sent nothing, or sent garbage. Debug,
+            // not error: it is neither the operator's problem nor unusual on an open port.
+            log.debug("no usable request: {s}", .{@errorName(err)});
+            return;
+        };
+
+        done.store(true, .release);
+
+        self.dispatch(&req) catch |err| {
+            log.debug("failed to respond: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Shut down a connection that has not sent a parseable request in time.
+    ///
+    /// Runs alongside `serviceStream`; `done` is set the moment the head is parsed, so a
+    /// normal request never sees this fire.
+    fn receiveWatchdog(self: *Server, stream: std.Io.net.Stream, done: *std.atomic.Value(bool)) void {
+        std.Io.Timeout.sleep(
+            .{ .duration = .{ .raw = .fromNanoseconds(Config.Http.receive_timeout_ns), .clock = .awake } },
+            self.io,
+        ) catch return;
+        if (done.load(.acquire)) return;
+        log.debug("no request within {d}ms — closing", .{Config.Http.receive_timeout_ns / std.time.ns_per_ms});
+        stream.shutdown(self.io, .recv) catch {};
+    }
+
+    /// Route one parsed request.
+    ///
+    /// Parsing is `std.http`'s job now — this used to split the raw bytes on '\n' and
+    /// take the first two space-separated tokens, over a fixed 2048-byte buffer.
+    fn dispatch(self: *Server, req: *std.http.Server.Request) !void {
+        const target = req.head.target;
+        const method = req.head.method;
+        log.debug("{s} {s}", .{ @tagName(method), target });
+
+        if (method == .GET and std.mem.eql(u8, target, "/health")) {
+            try self.handleHealth(req);
+        } else if (method == .GET and std.mem.eql(u8, target, "/status")) {
+            try self.handleStatus(req);
+        } else if (method == .GET and std.mem.eql(u8, target, "/metrics")) {
+            try self.handleMetrics(req);
         } else {
-            try self.handleNotFound(fd);
+            try req.respond("Not Found\n", .{ .status = .not_found });
         }
     }
 
-    // HTTP/1.1 requires CRLF (\r\n) line endings in the response header.
-    fn sendResponse(
-        fd: c_int,
-        status: []const u8,
-        content_type: []const u8,
-        body: []const u8,
-    ) !void {
-        var buf: [4096]u8 = undefined;
-        const response = try std.fmt.bufPrint(&buf,
-            "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-            .{ status, content_type, body.len, body },
-        );
-
-        var pos: usize = 0;
-        while (pos < response.len) {
-            const n = sock_c.write(fd, response[pos..].ptr, response[pos..].len);
-            if (n <= 0) return;
-            pos += @intCast(n);
-        }
+    /// `std.http` writes the status line, headers and framing; this only picks the type.
+    ///
+    /// Replaces a hand-built response string over a 4096-byte buffer that silently
+    /// truncated anything larger — `/metrics` was already close to it.
+    fn respond(req: *std.http.Server.Request, status: std.http.Status, content_type: []const u8, body: []const u8) !void {
+        try req.respond(body, .{
+            .status = status,
+            .extra_headers = &.{.{ .name = "content-type", .value = content_type }},
+        });
     }
 
     // -------------------------------------------------------------------------
     // Handlers
     // -------------------------------------------------------------------------
 
-    fn handleHealth(self: *Server, fd: c_int) !void {
+    fn handleHealth(self: *Server, req: *std.http.Server.Request) !void {
         _ = self;
-        try sendResponse(fd, "200 OK", "application/json", "{\"status\":\"ok\"}\n");
+        try respond(req, .ok, "application/json", "{\"status\":\"ok\"}\n");
     }
 
-    fn handleStatus(self: *Server, fd: c_int) !void {
+    fn handleStatus(self: *Server, req: *std.http.Server.Request) !void {
         const status_cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
             const snap = try m.snapshot(self.allocator);
@@ -234,13 +365,13 @@ pub const Server = struct {
                 if (self.refused) |r| r.dropped_total.load(.acquire) else 0,
             });
 
-            try sendResponse(fd, "200 OK", "application/json", body);
+            try respond(req, .ok, "application/json", body);
         } else {
-            try sendResponse(fd, "200 OK", "application/json", "{\"status\":\"no_metrics\"}\n");
+            try respond(req, .ok, "application/json", "{\"status\":\"no_metrics\"}\n");
         }
     }
 
-    fn handleMetrics(self: *Server, fd: c_int) !void {
+    fn handleMetrics(self: *Server, req: *std.http.Server.Request) !void {
         // Read once: two getrusage calls would report two different instants.
         const cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
@@ -323,21 +454,26 @@ pub const Server = struct {
             var w = std.Io.Writer.fixed(buf[body.len..]);
             if (self.refused) |r| try r.writePrometheus(&w);
 
-            try sendResponse(fd, "200 OK", "text/plain", buf[0 .. body.len + w.buffered().len]);
+            try respond(req, .ok, "text/plain", buf[0 .. body.len + w.buffered().len]);
         } else {
-            try sendResponse(fd, "200 OK", "text/plain", "# No metrics available\n");
+            try respond(req, .ok, "text/plain", "# No metrics available\n");
         }
     }
 
-    fn handleShutdown(self: *Server, fd: c_int) !void {
-        log.info("👋 Shutdown requested via HTTP", .{});
-        self.should_stop.store(true, .seq_cst);
-        try sendResponse(fd, "200 OK", "text/plain", "Shutdown initiated\n");
-    }
+    // `POST /shutdown` was removed.
+    //
+    // It stopped CDC in one unauthenticated request, from any interface, and it duplicated
+    // a capability the process already has: SIGTERM reaches the same graceful path
+    // (`bridge.zig` registers the handlers). The difference is who can use it — SIGTERM
+    // needs ownership of the process, an HTTP route needs only a socket.
+    //
+    // ⚠️ Rate limiting would not have helped: the first request wins, and stopping the
+    // bridge once is the whole attack. Removing the route is the fix; `kill -TERM <pid>`
+    // or `docker stop` is the replacement.
 
-    fn handleNotFound(self: *Server, fd: c_int) !void {
+    fn handleNotFound(self: *Server, req: *std.http.Server.Request) !void {
         _ = self;
-        try sendResponse(fd, "404 Not Found", "text/plain", "Not Found\n");
+        try respond(req, .not_found, "text/plain", "Not Found\n");
     }
 
     // -------------------------------------------------------------------------
@@ -357,44 +493,22 @@ pub const Server = struct {
         return null;
     }
 
-    fn handleStreamInfo(self: *Server, fd: c_int, path: []const u8) !void {
-        const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(fd, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
-            return;
-        };
+    // `GET /streams/info?stream=` was removed.
+    //
+    // It made a **NATS round trip per HTTP request** — an unauthenticated caller turning
+    // a cheap request into broker work — and disclosed stream names and configuration.
+    // It was also redundant: NATS publishes the same facts on its own monitoring port
+    // (`/jsz`, `/varz` on 8222), which is what the nats exporter and Prometheus already
+    // scrape. The bridge was proxying a service that answers for itself.
+    //
+    // This is the endpoint a rate limiter would genuinely have helped, which is the
+    // argument for deleting it rather than limiting it: the cheapest request is the one
+    // that is never served.
 
-        if (self.nats_publisher) |publisher| {
-            const info = publisher.getStreamInfo(stream_name) catch |err| {
-                var err_buf: [256]u8 = undefined;
-                const msg = try std.fmt.bufPrint(&err_buf, "Failed to get stream info: {}\n", .{err});
-                try sendResponse(fd, "500 Internal Server Error", "text/plain", msg);
-                return;
-            };
-            defer self.allocator.free(info);
-            try sendResponse(fd, "200 OK", "application/json", info);
-        } else {
-            try sendResponse(fd, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
-        }
-    }
-
-    fn handleStreamPurge(self: *Server, fd: c_int, path: []const u8) !void {
-        const stream_name = parseQueryParam(path, "stream") orelse {
-            try sendResponse(fd, "400 Bad Request", "text/plain", "Missing 'stream' parameter\n");
-            return;
-        };
-
-        if (self.nats_publisher) |publisher| {
-            publisher.purgeStream(stream_name) catch |err| {
-                var err_buf: [256]u8 = undefined;
-                const msg = try std.fmt.bufPrint(&err_buf, "Failed to purge stream: {}\n", .{err});
-                try sendResponse(fd, "500 Internal Server Error", "text/plain", msg);
-                return;
-            };
-            var resp_buf: [256]u8 = undefined;
-            const resp = try std.fmt.bufPrint(&resp_buf, "Stream '{s}' purged\n", .{stream_name});
-            try sendResponse(fd, "200 OK", "text/plain", resp);
-        } else {
-            try sendResponse(fd, "503 Service Unavailable", "text/plain", "NATS publisher not available\n");
-        }
-    }
+    // `POST /streams/purge` was removed along with its handler.
+    //
+    // It deleted stream data on an unauthenticated request. Its route had already gone
+    // with `/streams/info`, leaving it reachable by nobody — but still wired to
+    // `purgeStream`, one `else if` away from being live again. Dead code that deletes
+    // data is worth removing rather than leaving for someone to rediscover.
 };

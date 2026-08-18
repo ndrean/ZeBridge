@@ -183,38 +183,56 @@ pub const MutationListener = struct {
             c.PQhost(conn), c.PQport(conn), c.PQuser(conn),
         });
 
-        // 2. Connect to NATS JetStream Pull Consumer
-        var cscnf = nats.protocol.ConsumerConfig{
-            .durable_name = "bridge_mutations_worker",
-            .ack_policy = "explicit",
-            .deliver_policy = "all",
-            // The server-side half of the poison-pill guard: even a failure the bridge
-            // wrongly classifies as retryable stops after this many attempts.
-            .max_deliver = config.Nats.mutation_max_deliver,
-            // Not "mutation.>" spelled out: the comment used to say "from topology.json
-            // prefix", which is the shape of the drift this centralisation exists to stop.
-            .filter_subject = self.endpoint_topology.mutations_subject_wildcard,
+        // 2. Connect to NATS, and bind a durable pull consumer.
+        //
+        // Pull, not push: the bridge fetches when it is ready, so a burst cannot outrun
+        // the PostgreSQL apply loop, and the position lives in the durable so a restart
+        // resumes where it stopped.
+        const conn_nats = self.allocator.create(nats.Connection) catch |err| {
+            log.err("Mutation listener: out of memory: {}", .{err});
+            return;
         };
+        defer self.allocator.destroy(conn_nats);
 
-        const connect_opts = nats.protocol.ConnectOpts{
-            .addr = self.endpoint.host,
-            .port = self.endpoint.port,
+        conn_nats.* = nats.Connection.init(self.allocator, self.io, .{
             .user = self.endpoint.user,
-            .pass = self.endpoint.pass,
+            .password = self.endpoint.pass,
             .nkey_seed = self.endpoint.seed,
+        });
+        defer conn_nats.deinit();
+
+        const url = std.fmt.allocPrint(self.allocator, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port }) catch return;
+        defer self.allocator.free(url);
+        conn_nats.connect(url) catch |err| {
+            log.err("Mutation listener: Failed to connect to NATS: {}", .{err});
+            return;
         };
 
-        var consumer = nats.Consumer.START(
-            self.allocator,
-            connect_opts,
-            self.endpoint_topology.stream_mutations,
-            &cscnf,
-            self.io,
+        var js = nats.JetStream.init(conn_nats, .{});
+
+        // `.stream` given explicitly rather than derived from the subject: topology.json
+        // names it, and the lookup path allocates a name the subscription then owns (see
+        // nats.zig/NOTES.md #1).
+        const consumer = js.pullSubscribe(
+            self.endpoint_topology.mutations_subject_wildcard,
+            "bridge_mutations_worker",
+            .{
+                .stream = self.endpoint_topology.stream_mutations,
+                .config = .{
+                    .ack_policy = .explicit,
+                    .deliver_policy = .all,
+                    // The server-side half of the poison-pill guard: even a failure the
+                    // bridge wrongly classifies as retryable stops after this many
+                    // attempts.
+                    .max_deliver = config.Nats.mutation_max_deliver,
+                    .filter_subject = self.endpoint_topology.mutations_subject_wildcard,
+                },
+            },
         ) catch |err| {
             log.err("Mutation listener: Failed to start NATS consumer: {}", .{err});
             return;
         };
-        defer nats.Consumer.STOP(&consumer, false);
+        defer consumer.deinit();
 
         log.info("Mutation listener: ✅ Ready! Pulling mutations from JetStream...", .{});
 
@@ -232,28 +250,23 @@ pub const MutationListener = struct {
                 log.info("Mutation listener: Reconnected to PostgreSQL.", .{});
             }
 
-            // Pull next message with a 500ms timeout for faster graceful shutdown
-            const timeout_ns = nats.protocol.SECNS / 2;
-            if (consumer.CONSUME(timeout_ns) catch null) |msg| {
-                // JetStream status messages (408 Request Timeout, 409, idle heartbeats)
-                // arrive on the pull inbox with no reply-to. Recycle, never ack: the
-                // vendored `Consumer.ack` unwraps `ReplyTo()` and panics on null. The
-                // payload check below used to be the only guard, which held only because
-                // status messages happen to be empty too — reply-to is the actual
-                // distinction between a delivery and a control frame.
-                if (msg.letter.ReplyTo() == null) {
-                    consumer.REUSE(msg);
-                    continue;
-                }
+            // One message at a time, with a short timeout so shutdown is responsive.
+            //
+            // ⚠️ Status frames (408, 409, idle heartbeats) are handled by the library now
+            // — it recognises them and does not surface them as messages. The vendored
+            // client did not, and acking one panicked because `Consumer.ack` unwrapped a
+            // null ReplyTo; the guard for that lived here.
+            var batch = consumer.fetch(1, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } }) catch {
+                continue;
+            };
+            defer batch.deinit();
 
-                const payload = msg.letter.getPayload() orelse {
-                    consumer.REUSE(msg);
-                    continue;
-                };
+            for (batch.messages) |msg| {
+                const payload = msg.msg.data;
 
                 // Subject first: it carries the identity, the table and the verb, and
                 // all three are refused before a byte of the payload is decoded.
-                const subject = msg.letter.subject.body() orelse "";
+                const subject = msg.msg.subject;
                 const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
                     // `warn`, not `err` — and not `info` either. Client-caused like the
                     // refusals below, so it is not the operator's to fix. But it is the
@@ -262,8 +275,8 @@ pub const MutationListener = struct {
                     // no address to send a verdict to. Worth keeping visible for exactly
                     // that reason.
                     log.warn("⚠️  Malformed mutation subject '{s}' ({}): dead-lettering, and no verdict is addressable", .{ subject, err });
-                    self.deadLetter(&consumer, msg, payload, err);
-                    consumer.ACK(msg, true) catch consumer.REUSE(msg);
+                    self.deadLetter(conn_nats, msg, payload, err);
+                    msg.ack() catch {};
                     continue;
                 };
 
@@ -275,8 +288,8 @@ pub const MutationListener = struct {
                         "⛔ '{s}' refused writes to '{s}': the bridge's own table, where a forged row would publish a fabricated schema to every client",
                         .{ mutation.principal, mutation.table },
                     );
-                    self.deadLetter(&consumer, msg, payload, error.ForbiddenTable);
-                    consumer.ACK(msg, true) catch consumer.REUSE(msg);
+                    self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
+                    msg.ack() catch {};
                     continue;
                 }
 
@@ -298,10 +311,10 @@ pub const MutationListener = struct {
                             // payload, and the verdict below is how they are told.
                             log.info("⛔ Mutation refused [{s}] on '{s}': {} (not retrying)", .{ mutation.principal, mutation.table, err });
                         }
-                        self.deadLetter(&consumer, msg, payload, err);
-                        self.publishVerdict(&consumer, msg, mutation.principal, "rejected", @errorName(err));
+                        self.deadLetter(conn_nats, msg, payload, err);
+                        self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", @errorName(err));
                         // ACK, not NACK: the message is handled — badly, but finally.
-                        consumer.ACK(msg, true) catch consumer.REUSE(msg);
+                        msg.ack() catch {};
                         continue;
                     }
 
@@ -315,8 +328,10 @@ pub const MutationListener = struct {
                     // bridge can tell when it is out of attempts. On that last one, stop
                     // pretending it is transient: say why, and ACK. A genuinely transient
                     // failure still gets all five tries first.
-                    const meta = parseAckMeta(msg.letter.ReplyTo() orelse "");
-                    const out_of_attempts = if (meta) |m| m.delivered >= config.Nats.mutation_max_deliver else false;
+                    // The library parses this off the ack subject for us, including the
+                    // JetStream-domain form where every token shifts by two — the case
+                    // the bridge's own parser had to special-case.
+                    const out_of_attempts = msg.metadata.num_delivered >= config.Nats.mutation_max_deliver;
                     // A SQLSTATE the server returned and we recognise as permanent ends
                     // the retries now: waiting cannot change a privilege or a constraint.
                     const hopeless = sqlstateIsPermanent(self.lastSqlstate());
@@ -339,23 +354,19 @@ pub const MutationListener = struct {
                                 .{ config.Nats.mutation_max_deliver, mutation.principal, mutation.table, err, self.lastSqlstate() },
                             );
                         }
-                        self.deadLetter(&consumer, msg, payload, err);
-                        self.publishVerdict(&consumer, msg, mutation.principal, if (hopeless) "rejected" else "failed", @errorName(err));
-                        consumer.ACK(msg, true) catch consumer.REUSE(msg);
+                        self.deadLetter(conn_nats, msg, payload, err);
+                        self.publishVerdict(conn_nats, msg, mutation.principal, if (hopeless) "rejected" else "failed", @errorName(err));
+                        msg.ack() catch {};
                         continue;
                     }
 
                     log.err("Failed to handle mutation, will retry: {}", .{err});
-                    consumer.NACK(msg, true) catch {
-                        consumer.REUSE(msg);
-                    };
+                    msg.nak() catch {};
                     utils.sleep(1 * std.time.ns_per_s);
                     continue;
                 };
 
-                consumer.ACK(msg, true) catch {
-                    consumer.REUSE(msg);
-                };
+                msg.ack() catch {};
             } else {
                 // Timeout, just loop again
                 utils.sleep(100 * std.time.ns_per_ms);
@@ -414,8 +425,8 @@ pub const MutationListener = struct {
     /// and refusing to ACK would restore the infinite loop it exists to prevent.
     fn deadLetter(
         self: *MutationListener,
-        consumer: *nats.Consumer,
-        msg: *nats.Conn.AllocatedMSG,
+        conn_nats: *nats.Connection,
+        msg: *nats.JetStreamMessage,
         payload: []const u8,
         err: anyerror,
     ) void {
@@ -434,7 +445,7 @@ pub const MutationListener = struct {
         //
         // So the token count is checked first, and an unparseable subject is routed to
         // `unknown` — honest, and at least a subject an operator can subscribe to.
-        const subject = msg.letter.subject.body() orelse "";
+        const subject = msg.msg.subject;
         var table: []const u8 = "unknown";
         var count: usize = 0;
         var counter = std.mem.splitScalar(u8, subject, '.');
@@ -468,7 +479,7 @@ pub const MutationListener = struct {
         // ⚠️ The subject sits deliberately *outside* `mutation.>`, which is what the
         // ingress consumer filters on. Republishing a failure under that prefix would
         // feed it straight back to this loop — a poison pill with a feedback loop.
-        consumer.PUBLISH(err_subject, null, body) catch |perr| {
+        conn_nats.publish(err_subject, body) catch |perr| {
             log.err("↩️  dead-letter publish to {s} failed ({}): {s}", .{ err_subject, perr, body });
             return;
         };
@@ -505,8 +516,8 @@ pub const MutationListener = struct {
     /// worse: it would look addressed while reaching no one.
     fn publishVerdict(
         self: *MutationListener,
-        consumer: *nats.Consumer,
-        msg: *nats.Conn.AllocatedMSG,
+        conn_nats: *nats.Connection,
+        msg: *nats.JetStreamMessage,
         principal: []const u8,
         status: []const u8,
         reason: []const u8,
@@ -545,10 +556,7 @@ pub const MutationListener = struct {
         // the number the client got back in its PubAck, so it lets a client correlate
         // without having stored the msg_id it chose — and it is what an operator greps
         // for when reconciling against `nats stream view MUTATIONS`.
-        const seq: u64 = if (msg.letter.ReplyTo()) |r| blk: {
-            const meta = parseAckMeta(r) orelse break :blk 0;
-            break :blk meta.stream_seq;
-        } else 0;
+        const seq: u64 = msg.metadata.sequence.stream;
 
         const body = std.fmt.allocPrint(
             alloc,
@@ -560,7 +568,7 @@ pub const MutationListener = struct {
         // the ingress consumer filters on that prefix, so a verdict published under it
         // would be consumed by this loop as if it were a write — a feedback loop that
         // ends in a poison pill.
-        consumer.PUBLISH(subject, null, body) catch |perr| {
+        conn_nats.publish(subject, body) catch |perr| {
             log.err("verdict publish to {s} failed ({}): {s}", .{ subject, perr, body });
             return;
         };
@@ -717,52 +725,11 @@ pub const MutationListener = struct {
         return self.last_error_buf[0..self.last_error_len];
     }
 
-    /// What JetStream tells the consumer about *this delivery*, read out of the
-    /// message's own reply subject.
-    ///
-    /// ```txt
-    /// $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm>.<pending>
-    /// $JS.ACK.<domain>.<acct>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<tm>.<pending>
-    /// ```
-    ///
-    /// ⚠️ **Counted from the end, never from the start.** The two forms differ by two
-    /// leading tokens, so a fixed index reads `<consumer>` as the delivery count on one
-    /// deployment and works on another — and the bug only appears once someone enables a
-    /// JetStream domain, which is exactly when nobody is looking at this function. The
-    /// trailing five are stable in both.
-    ///
-    /// Returns null rather than guessing when the shape is unrecognised: acting on a
-    /// wrong delivery count means either giving up on the first attempt or never giving
-    /// up at all.
-    const AckMeta = struct {
-        /// 1 on first delivery. Equal to `max_deliver` on the last attempt the server
-        /// will ever make — after which the message is dropped and nobody is told.
-        delivered: u64,
-        /// The stream sequence — the same number the client received in its PubAck, and
-        /// therefore the one identifier both ends already hold.
-        stream_seq: u64,
-    };
-
-    fn parseAckMeta(reply_to: []const u8) ?AckMeta {
-        if (!std.mem.startsWith(u8, reply_to, "$JS.ACK.")) return null;
-
-        var count: usize = 0;
-        var counter = std.mem.splitScalar(u8, reply_to, '.');
-        while (counter.next()) |_| count += 1;
-        // 9 tokens without a domain, 11 with one. Anything else is a shape this was not
-        // written against, and a wrong parse is worse than no parse.
-        if (count != 9 and count != 11) return null;
-
-        var delivered: ?u64 = null;
-        var stream_seq: ?u64 = null;
-        var it = std.mem.splitScalar(u8, reply_to, '.');
-        var i: usize = 0;
-        while (it.next()) |tok| : (i += 1) {
-            if (i == count - 5) delivered = std.fmt.parseInt(u64, tok, 10) catch return null;
-            if (i == count - 4) stream_seq = std.fmt.parseInt(u64, tok, 10) catch return null;
-        }
-        return .{ .delivered = delivered orelse return null, .stream_seq = stream_seq orelse return null };
-    }
+    // `parseAckMeta` and `AckMeta` lived here: they read the delivery count and stream
+    // sequence out of the `$JS.ACK.…` reply subject, counting tokens from the end because
+    // the layout shifts by two when a JetStream domain is configured. nats.zig parses
+    // both into `msg.metadata` (and handles the domain form, with tests), so the hand
+    // parser and its four tests are gone.
 
     /// The client's own `Nats-Msg-Id`, which is the only correlation token it chose
     /// itself — and therefore the only one it can match against a queued write without
@@ -770,39 +737,14 @@ pub const MutationListener = struct {
     ///
     /// JetStream consumes this header for deduplication; nothing surfaced it to the
     /// bridge before, so a verdict had no way to name the write it was about.
-    fn msgIdOf(msg: *nats.Conn.AllocatedMSG) ?[]const u8 {
-        const hdrs = msg.letter.getHeaders() orelse return null;
-        const raw = hdrs.buffer.body() orelse return null;
-        return headerValue(raw, "Nats-Msg-Id");
+    fn msgIdOf(msg: *nats.JetStreamMessage) ?[]const u8 {
+        return msg.msg.headerGet("Nats-Msg-Id");
     }
 
-    /// Find one header in a raw NATS header block.
-    ///
-    /// ```txt
-    /// NATS/1.0␍␊Nats-Msg-Id: abc␍␊Other: x
-    /// ```
-    ///
-    /// ⚠️ Hand-rolled rather than `Headers.hiter()`, which yields **nothing** here. That
-    /// iterator is `std.http.HeaderIterator`, which needs every header line to end in
-    /// ␍␊ — but `Conn.read_HMSG` strips the block's trailing ␍␊␍␊ before storing it, so
-    /// the last (and in our case only) header has no terminator and is never emitted.
-    /// The failure is silent: a message that plainly carries `Nats-Msg-Id` reads as
-    /// having no headers at all, so a verdict is simply never published and nothing
-    /// says why.
-    ///
-    /// Tolerates a present or absent trailing terminator, any spacing after the colon,
-    /// and matches the name case-insensitively as the protocol requires.
-    fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
-        var lines = std.mem.splitSequence(u8, raw, "\r\n");
-        _ = lines.next(); // the "NATS/1.0" version line is not a header
-        while (lines.next()) |line| {
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            const key = std.mem.trim(u8, line[0..colon], " \t");
-            if (!std.ascii.eqlIgnoreCase(key, name)) continue;
-            return std.mem.trim(u8, line[colon + 1 ..], " \t");
-        }
-        return null;
-    }
+    // `headerValue` lived here: a hand-rolled parse of the raw header block, written
+    // because the vendored client's `Headers.hiter()` silently yielded nothing (it is
+    // `std.http.HeaderIterator`, which needs a trailing CRLF that `read_HMSG` had already
+    // stripped). `msg.headerGet(name)` replaces it.
 
     /// Parse `mutation.<principal>.<table>.<operation>`.
     ///
@@ -1166,6 +1108,53 @@ pub const MutationListener = struct {
         const sql_z = try alloc.dupeZ(u8, sql);
         log.debug("mutation [{s}] {s}", .{ mutation.principal, sql_z });
 
+        // ── The principal, handed to PostgreSQL so its policies can use it ──────────
+        //
+        // Row-level security is what bounds *which rows* a principal may write, and a
+        // policy can only reason about an identity the session carries. Without this the
+        // whole write-scoping design is inert — and worse than inert: a policy reading
+        // `current_setting('zb.principal', true)` gets NULL, the predicate evaluates to
+        // NULL, and **every** write is refused with `new row violates row-level security
+        // policy`. Enabling RLS would look like it broke the bridge.
+        //
+        // ⚠️ `SET LOCAL` is transaction-scoped, and outside a transaction PostgreSQL warns
+        // and does nothing — so the statement must be wrapped. One mutation, one
+        // transaction: a batch sharing a transaction would share the setting, and the
+        // second principal's rows would be written under the first one's identity.
+        //
+        // `set_config(..., is_local => true)` rather than `SET LOCAL zb.principal = '…'`
+        // because it takes the value as a **parameter**. The principal comes from the
+        // subject and is vouched for by NATS, but building SQL by concatenation is how a
+        // trusted value becomes an injection the day the trust assumption changes.
+        {
+            const begin = c.PQexec(conn, "BEGIN");
+            defer c.PQclear(begin);
+            if (c.PQresultStatus(begin) != c.PGRES_COMMAND_OK) {
+                const msg_ptr = c.PQerrorMessage(conn);
+                self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+                log.err("🔴 Could not open a transaction for [{s}]: {s}", .{ mutation.principal, c.PQerrorMessage(conn) });
+                return error.MutationFailed;
+            }
+        }
+        errdefer {
+            const rb = c.PQexec(conn, "ROLLBACK");
+            c.PQclear(rb);
+        }
+
+        {
+            const principal_z = try alloc.dupeZ(u8, mutation.principal);
+            const set_params = [_]?[*:0]const u8{principal_z.ptr};
+            const set_sql = "SELECT set_config('" ++ config.Sync.principal_setting ++ "', $1, true)";
+            const set_res = c.PQexecParams(conn, set_sql, 1, null, &set_params[0], null, null, 0);
+            defer c.PQclear(set_res);
+            if (c.PQresultStatus(set_res) != c.PGRES_TUPLES_OK) {
+                const msg_ptr = c.PQerrorMessage(conn);
+                self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+                log.err("🔴 Could not set the principal for [{s}]: {s}", .{ mutation.principal, c.PQerrorMessage(conn) });
+                return error.MutationFailed;
+            }
+        }
+
         const res = c.PQexecParams(
             conn,
             sql_z.ptr,
@@ -1206,6 +1195,20 @@ pub const MutationListener = struct {
                 log.err("🔴 Mutation failed [{s}] on '{s}': {s}", .{ mutation.principal, mutation.table, c.PQerrorMessage(conn) });
             }
             return error.MutationFailed;
+        }
+
+        // Committed before the result is interpreted: a stale write (0 rows) is a
+        // successful transaction that changed nothing, not a failure to roll back. The
+        // `errdefer` above covers every path that returns an error from here up.
+        {
+            const commit = c.PQexec(conn, "COMMIT");
+            defer c.PQclear(commit);
+            if (c.PQresultStatus(commit) != c.PGRES_COMMAND_OK) {
+                const msg_ptr = c.PQerrorMessage(conn);
+                self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+                log.err("🔴 Commit failed for [{s}] on '{s}': {s}", .{ mutation.principal, mutation.table, c.PQerrorMessage(conn) });
+                return error.MutationFailed;
+            }
         }
 
         // 0 rows means the guard rejected it: the stored version is newer, so this write
@@ -1282,100 +1285,6 @@ test "identifiers are quoted, and an embedded quote cannot escape" {
     out.clearRetainingCapacity();
     try appendIdent(&out, alloc, "x\" ; DROP TABLE users; --");
     try testing.expectEqualStrings("\"x\"\" ; DROP TABLE users; --\"", out.items);
-}
-
-test "parseAckMeta: the plain form" {
-    const m = MutationListener.parseAckMeta(
-        "$JS.ACK.MUTATIONS.bridge_mutations_worker.1.16.31.1787001231697045182.0",
-    ).?;
-    try std.testing.expectEqual(@as(u64, 1), m.delivered);
-    try std.testing.expectEqual(@as(u64, 16), m.stream_seq);
-}
-
-test "parseAckMeta: the domain form shifts every index by two" {
-    // The whole reason the parse counts from the end. Reading fixed positions here
-    // would take "acct" as the delivery count and fail to parse — or worse, succeed
-    // against a numeric account hash.
-    const m = MutationListener.parseAckMeta(
-        "$JS.ACK.hub.ACCTHASH.MUTATIONS.bridge_mutations_worker.5.17.42.1787001231697045182.0",
-    ).?;
-    try std.testing.expectEqual(@as(u64, 5), m.delivered);
-    try std.testing.expectEqual(@as(u64, 17), m.stream_seq);
-}
-
-test "parseAckMeta: the last attempt is recognisable" {
-    // What the whole feature turns on: delivered == max_deliver means the server will not
-    // try again, so this is the only moment a verdict can still be published.
-    //
-    // Built from the constant rather than hardcoding it — this test failed the moment the
-    // budget moved from 5 to 15, which is the correct behaviour for an assertion about
-    // "the last attempt" but a poor reason to edit a subject literal.
-    var buf: [128]u8 = undefined;
-    const subject = try std.fmt.bufPrint(
-        &buf,
-        "$JS.ACK.MUTATIONS.w.{d}.99.100.1787001231697045182.0",
-        .{config.Nats.mutation_max_deliver},
-    );
-    const m = MutationListener.parseAckMeta(subject).?;
-    try std.testing.expect(m.delivered == config.Nats.mutation_max_deliver);
-
-    // And one attempt short of it must not be mistaken for the last.
-    const earlier = try std.fmt.bufPrint(
-        &buf,
-        "$JS.ACK.MUTATIONS.w.{d}.99.100.1787001231697045182.0",
-        .{config.Nats.mutation_max_deliver - 1},
-    );
-    try std.testing.expect(MutationListener.parseAckMeta(earlier).?.delivered < config.Nats.mutation_max_deliver);
-}
-
-test "parseAckMeta: refuses shapes it was not written against" {
-    // Null, never a guess: a wrong delivery count means either giving up on the first
-    // attempt or never giving up at all.
-    try std.testing.expect(MutationListener.parseAckMeta("") == null);
-    try std.testing.expect(MutationListener.parseAckMeta("$JS.ACK.TOO.FEW.TOKENS") == null);
-    try std.testing.expect(MutationListener.parseAckMeta("cdc.users.insert") == null);
-    try std.testing.expect(MutationListener.parseAckMeta(
-        "$JS.ACK.MUTATIONS.w.notanumber.16.31.1787001231697045182.0",
-    ) == null);
-    // A core-NATS reply inbox, which is what arrives if the consumer is misconfigured.
-    try std.testing.expect(MutationListener.parseAckMeta("_INBOX.abc.def") == null);
-}
-
-test "headerValue: the shape NATS actually delivers (no trailing CRLF)" {
-    // `Conn.read_HMSG` strips the block's trailing ␍␊␍␊, so the last header ends the
-    // buffer. This is the exact case `std.http.HeaderIterator` drops on the floor.
-    const raw = "NATS/1.0\r\nNats-Msg-Id: c-1-users-42";
-    try std.testing.expectEqualStrings(
-        "c-1-users-42",
-        MutationListener.headerValue(raw, "Nats-Msg-Id").?,
-    );
-}
-
-test "headerValue: with a trailing CRLF, and among several headers" {
-    const raw = "NATS/1.0\r\nNats-Expected-Stream: MUTATIONS\r\nNats-Msg-Id: abc\r\n";
-    try std.testing.expectEqualStrings("abc", MutationListener.headerValue(raw, "Nats-Msg-Id").?);
-    try std.testing.expectEqualStrings(
-        "MUTATIONS",
-        MutationListener.headerValue(raw, "Nats-Expected-Stream").?,
-    );
-}
-
-test "headerValue: name match is case-insensitive, value keeps its inner colons" {
-    // The msg_id embeds an ISO timestamp, so colons in the value are the normal case —
-    // splitting on the first colon is what makes that safe.
-    const raw = "NATS/1.0\r\nNATS-MSG-ID: c-1-t-2026-08-18T04:25:19.801000";
-    try std.testing.expectEqualStrings(
-        "c-1-t-2026-08-18T04:25:19.801000",
-        MutationListener.headerValue(raw, "Nats-Msg-Id").?,
-    );
-}
-
-test "headerValue: absent, malformed, and empty blocks yield null" {
-    try std.testing.expect(MutationListener.headerValue("NATS/1.0\r\nOther: x", "Nats-Msg-Id") == null);
-    try std.testing.expect(MutationListener.headerValue("NATS/1.0", "Nats-Msg-Id") == null);
-    try std.testing.expect(MutationListener.headerValue("", "Nats-Msg-Id") == null);
-    // A line with no colon must be skipped, not mistaken for a header.
-    try std.testing.expect(MutationListener.headerValue("NATS/1.0\r\ngarbage", "Nats-Msg-Id") == null);
 }
 
 test "clearFailure: a verdict cannot inherit the previous message's reason" {

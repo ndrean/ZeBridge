@@ -77,7 +77,17 @@ BEGIN
                         'let a client publish a fabricated schema to every client', tbl_name;
     END IF;
 
-    EXECUTE format('GRANT SELECT, INSERT, UPDATE ON %s TO ${POSTGRES_WRITER_USER}', tbl);
+    -- DELETE as well as SELECT/INSERT/UPDATE, for two paths that both need it:
+    --
+    --   * a table with **no tombstone column** deletes physically — that is the documented
+    --     weaker guarantee, and it is an actual DELETE;
+    --   * the **tombstone sweeper** (src/gc.zig) reaps soft-deleted rows past
+    --     GC_THRESHOLD_MS, and runs as this role precisely so it is not the admin.
+    --
+    -- Marginal risk is small: this role can already UPDATE any row it may write, and RLS
+    -- bounds which rows those are. Withholding DELETE did not prevent data loss, it only
+    -- made the sweeper fail with `permission denied` — silently, in a sidecar nobody reads.
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO ${POSTGRES_WRITER_USER}', tbl);
     RAISE NOTICE 'edge writes enabled on % for ${POSTGRES_WRITER_USER}', tbl;
 END;
 $$ LANGUAGE plpgsql;
@@ -296,6 +306,53 @@ DROP EVENT TRIGGER IF EXISTS zebridge_publication_guard_t;
 CREATE EVENT TRIGGER zebridge_publication_guard_t ON ddl_command_end
     WHEN TAG IN ('ALTER PUBLICATION') EXECUTE FUNCTION public.zebridge_publication_guard();
 
+-- Answers "which tenants will never have their tombstones reaped?"
+--
+-- The sweeper acts as a named principal (`zb_sweeper` by default) and is therefore bounded
+-- by `zebridge_user_tenants` like any other writer — which is the point: forgetting to map
+-- a tenant fails **closed**, and its reach is auditable in the same table as everyone
+-- else's. The earlier design gave it a policy exempting principal-less sessions, which
+-- opened the whole table to anything that reached that connection without setting a
+-- principal. Failing open on an omission is the wrong default for a process that deletes.
+--
+-- ⚠️ The sweeper cannot run this check itself. RLS hides the unmapped rows from a warning
+-- query exactly as it hides them from the DELETE — measured, the same query returns 0 as
+-- the sweeper and 1 as the admin. A blind spot cannot survey itself, so the audit lives
+-- here, with the grant.
+--
+--     INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('zb_sweeper', '<tenant>');
+CREATE OR REPLACE FUNCTION public.zebridge_audit_sweeper(sweeper_principal text DEFAULT 'zb_sweeper'::text)
+ RETURNS TABLE(tbl text, tenant_id text, verdict text)
+ LANGUAGE plpgsql
+AS $$
+DECLARE
+    r record;
+BEGIN
+    -- Every published table that has BOTH a tenant column and a tombstone column: those
+    -- are the ones the sweeper is expected to reach. A table with no tombstone is never
+    -- swept (its deletes are physical), so an unmapped tenant there costs nothing.
+    FOR r IN
+        SELECT c.oid::regclass::text AS relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+        WHERE c.relkind = 'r'
+          AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
+                        AND a.attname = 'tenant_id' AND a.attnum > 0 AND NOT a.attisdropped)
+          AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
+                        AND a.attname = 'deleted_at' AND a.attnum > 0 AND NOT a.attisdropped)
+    LOOP
+        -- WARNING: doubled quotes, not a nested dollar-quote. A `$q` + `$` tag here is
+        -- eaten by envsubst (it reads it as a variable) and truncates every definition
+        -- after this point — caught by scripts/scenarios/render.py, which reported only
+        -- 3 of 9 functions surviving the render.
+        RETURN QUERY EXECUTE format(
+            'SELECT %L::text, t.tenant_id::text, ''UNREAPED - tombstones for this tenant' || ' accumulate; %I is not mapped to it'' FROM (SELECT DISTINCT tenant_id FROM %s'
+            || ' WHERE deleted_at IS NOT NULL) t WHERE NOT EXISTS (SELECT 1 FROM'
+            || ' public.zebridge_user_tenants m WHERE m.principal = %L AND m.tenant_id = t.tenant_id)',
+            r.relname, sweeper_principal, r.relname, sweeper_principal);
+    END LOOP;
+END $$;
+
 -- Answers "is anything published without being scoped?" — the invariant a pass-through
 -- bridge cannot check for itself. Run it after any publication change.
 CREATE OR REPLACE FUNCTION public.zebridge_audit_publications()
@@ -374,14 +431,23 @@ $$ LANGUAGE sql IMMUTABLE;
 -- the cost is negligible and there is no external cron to deploy or forget.
 -- Deliberately a constant, not a setting. PostgreSQL has no table-level TTL, so a
 -- function is the only way to express this at all — but the *value* governs nothing
--- beyond disk: the bridge never reads this table, it reads the WAL, so a row is
--- disposable the moment it commits. Nothing about correctness, ordering or client
--- catch-up depends on it, unlike the NATS stream retentions.
+-- beyond disk.
+--
+-- What bounds it: **nothing functional.** The bridge never reads this table, it reads the
+-- WAL, so a row is disposable the moment it commits. The pruning DELETE even runs in the
+-- same transaction as the INSERT that carried the schema, so no consumer can be waiting on
+-- a row this removes. The only reader is a human answering "what changed on Tuesday"
+-- during an incident.
+--
+-- 7 days was arbitrary. 2 days is arbitrary too, and smaller: a schema change nobody
+-- noticed within two days is one the audit trail was not going to explain anyway, and the
+-- table grows with every DDL forever otherwise. Raise it freely — nothing breaks either
+-- way, which is exactly why it is not a tuneable.
 CREATE OR REPLACE FUNCTION public.zebridge_prune_ddl_events()
 RETURNS void AS $$
 BEGIN
     DELETE FROM public.zebridge_ddl_events
-    WHERE emitted_at < NOW() - INTERVAL '7 days';
+    WHERE emitted_at < NOW() - INTERVAL '2 days';
 END;
 $$ LANGUAGE plpgsql;
 

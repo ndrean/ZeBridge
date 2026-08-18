@@ -8,21 +8,23 @@ ZeBridge is an opinionated bidirectional daemon connecting `PostgreSQL` (14+) to
 
 Allows mobile, WASM ([PGLite](https://github.com/electric-sql/pglite), [SQLite](https://sqlite.org/wasm/doc/trunk/index.md)) web apps or microservices to mirror locally Postgres tables via NATS/JS without ever reaching for Postgres.
 
-It is bidirectional: it transferts Postgres CDCs and table snapshots to a NATS/JS server, and propagates Consumer local optimistic writes back to Postgres via NATS/JS.
+It is bidirectional and the **state always arrives through CDC**. It transferts Postgres CDCs and table snapshots to a NATS/JS server, and propagates Consumer local writes back to Postgres via NATS/JS, which in turn sends a CDC so that the consumer updates his local state.
 
 By pushing all state, caching, and rate-limiting down into NATS/JS, the ZeBridge binary is stateless toward consumers.
 
 This is **not** a file transfer tool. Large blobs (>1 MB) is the domain of object storage.
 
-ZeBridge exposes a raw, standard protocol for NATS/JS rather than requiring a proprietary SDK. See [PROTOCOLE.md].
+ZeBridge exposes a raw, standard protocol for NATS/JS rather than requiring a proprietary SDK. See [PROTOCOLE.md](protocole.md).
 
 **Performance**: this single threaded binary drained 2,000,000 CDC events in under 20 s end to end (PG → NATS) in the burst benchmark below — ~100k events/s including the time PostgreSQL itself needed to write them, and ~260k events/s while the WAL loop was actually busy. See [An example of a measured throughput](#an-example-of-a-measured-throughput) for the method, and run it yourself before trusting it.
+
+**Security**: read [SECURIY.md](security.md)
 
 **Status**: Dev stage, draft notes.
 
 ## Table of Contents
 
-* [Architecture](#architecture)
+* [Overview](#overview)
 * [How ZeBridge compares](#how-zebridge-compares)
 * [Understanding the app](#understanding-the-app)
   * [The PG roles](#the-pg-roles)
@@ -44,17 +46,22 @@ ZeBridge exposes a raw, standard protocol for NATS/JS rather than requiring a pr
 
 ---
 
-## Architecture
+## Overview
 
 We use `NATS/JetStream` to solve the problem of distributing `PostgreSQL`'s logical replication and snapshot tables.
 Both solve the hard problems: ordering, durability, idempotency.
 
-Zebridge connects PG ↔ NATS and stays as stateless as possible.
+Zebridge connects PG ↔ NATS and stays as stateless as possible. NATS/JS holds the state, and a consumer - any connected client to NATS/JS - just needs to handle a state machine.
 
-NATS/JS holds the state, and a consumer - any connected client to NATS/JS - just needs to handle a state machine.
-NATS have 40+ clients, so instead of an SDK, we propose a  [PROTOCOLE.md](#protocole.md). It details the workflows to be used to connect consumers to the NATS server to use the local-first synced database.
+> [!NOTE] v0.14: NATS and ZeBridge needs to be colocated (same host) since the communication between them is TCP, plain text.
 
-**Worked examples** can be found in [PROTOCOLE.md](#protocole.md) for Flutter (_TODO_), webapps (WASM-SQLite + OPFS), backend microservice in Node, Python & Elixir (all _TODO_).
+The DBA needs to run special migrations where we define grants, roles, policies and triggers in Postgres and push the schemas.
+The NATS server also needs to be configured with streams, buckets and retention policies.
+The consumers need to follow a strict workflow and a grammar. Since NATS have 40+ clients, instead of an SDK, we propose a  [PROTOCOLE.md](#protocole.md). It details the workflows to be used to connect consumers to the NATS server to use the local-first synced database.
+
+Worked examples can be found in [PROTOCOLE.md](#protocole.md) for Flutter (_TODO_), webapps (WASM-SQLite + OPFS), backend microservice in Node, Python & Elixir (all _TODO_).
+
+**What does the architecture look like?**:
 
 ```mermaid
 flowchart TD
@@ -86,12 +93,17 @@ flowchart TD
     end
 ```
 
-Current **v 0.1.14**: uses PostgreSQL 14+, with `NATS` 2.14+ and `Zebridge` on localhost only (communicate via **TCP only**).
-
 **Roadmap**:
 
+* [x] **v 0.1.14**: Current.
+  * Uses PostgreSQL 14+, with `NATS` 2.14+ and `Zebridge` on localhost only (communicate via **TCP only**).
+  * per ZeBridge instance, memory usage can be adjusted for the table profil (size of rows, frequency of CDCs),
+  * preflight schema analysis,
+  * Authorized & Writable tables: RLS, GRANT, enforced by Postgres, `SYNC_RULES`, PK, UUID and tombstone (LWW),
+  * Scoped Reads with full dump PG safety with tenant and Zebridge safety: N tenants, 1 ZeBridge instance,
+  * Optional Read with full Postgres RLS safety with _! unique_ tenant, one slot: N tenants, N ZeBridge instances.
 * [ ] **v 0.1.16**: Separate READ [CDC+bootstrap] on a **standby replica** (PG ≧ 16, shared WAL stream), from WRITE on **master** and enable async snapshotting on the replica.
-* [ ] **v 1.0**: Remove the colocation constraint with `Zebridge` ← TLS → `NATS`.
+* [ ] **v 1.0**: Remove the colocation constraint with `Zebridge` ← TLS → `NATS` (zig-nats upgrade).
 
 ## How ZeBridge compares
 
@@ -121,30 +133,31 @@ ZeBridge differs significantly from established tools:
 
 ZeBridge is designed as a companion to the NATS/JS broker to enable Local-first sync of a Postgres database.
 
-### The PG roles
+### Roles and privileges
 
-The DBA is responsible onfigured to emit CDCs, to migrate the PUBLICATION for the desired tables, the roles and triggers needed by a Zebridge instance.
+The DBA configures PostgreSQL to emit CDC, migrates the publication, and creates the roles, grants and triggers a ZeBridge instance needs. ZeBridge uses two roles:
 
-**Two Postgres roles required by ZeBridge**:
+* `bridge_reader` (SELECT + REPLICATION, physically unable to write),
+* `bridge_writer` (no table privileges until a table is opened one at a time).
 
-* `bridge_reader` for the read path (SELECT + REPLICATION, no writes possible),
-* `bridge_writer` for the write path (_no table privileges_, or a per-table minimum),
-* and authenticated principals above that for row-level access.
+📖 **[SECURITY.md](SECURITY.md) is the reference**: what each role holds, what the schema must satisfy to be writable or tenant-scoped, what to do after a migration, and what is _not_ protected — with a table of where every claim is tested.
 
 ### The NATS streams and buckets
 
 ZeBridge uses the NKEY protocole to join the NATS server.
 
-Zebridge uses three streams and two KV buckets that enables the bidirectional communication flow ZeBridge ← NATS → consumer. The naming is **shared** and declared in [topology.json].
+Zebridge uses three streams and two KV buckets that enables the bidirectional communication flow ZeBridge ← NATS → consumer.
+The naming is **shared** and declared in [topology.json](topology.json).
 
 A ZeBridge instance is started with one config.
-The DBA starts the NATS server  with one config, but he can adjust the NATS server's streams and buckets catalogue on the fly. He uses the same NKEY protocole as ZeBridge.
+The DBA starts the NATS server  with one config, but he can adjust the NATS server's streams and buckets catalogue on the fly.
+He uses the same NKEY protocole as ZeBridge.
 
 **Three data flow**:
 
-1. **Bootstrap** (INIT stream): READ - Consumer requests _schemas_ & table _snapshot_ and Zebridge delivers: PG->Zebridge->NATS
-2. **Real-time CDC** (CDC stream): READ - consumer receives INSERT/UPDATE/DELETE events as they happen: PG -> Zebridge -> NATS/JetStream.
-3. **Real-time Ingress flow** (MUTATION stream): WRITE - Consumer updates his local storage and sends intentions messages to NATS -> Zebridge -> PG_master.
+1. **Bootstrap** (INIT stream): READ - Consumer requests _schemas_ & table _snapshot_ and Zebridge delivers: PG → Zebridge → NATS.JS
+2. **Real-time CDC** (CDC stream): READ - consumer receives INSERT/UPDATE/DELETE events as they happen: PG → Zebridge → NATS/JS.
+3. **Real-time Ingress flow** (MUTATION stream): WRITE - Consumer updates his local storage and sends intentions messages to NATS/JS → Zebridge → PG_master.
 
 | Stream | Purpose | Retention | Consumer Pattern | Role |
 | -------- | ------------------- | ------------- | ----------------------- | -- |
@@ -181,9 +194,20 @@ Ceiling is NATS/JS, the host capactiy, not ZeBridge.
 ### How to start an instance
 
 ```txt
-One bridge instance 
-= one replication slot 
-= sequential processing
+One bridge instance = one replication slot 
+  = sequential processing
+```
+
+**Strategy**:
+
+```txt
+Multi-tenant instance
+```
+
+or
+
+```txt
+Single tenant instance
 ```
 
 Once:
@@ -191,9 +215,12 @@ Once:
 * Postgres has played the needed migrations and has a PUBLICATION and confiured with WAL enabled,
 * NATS configured with the streams and buckets,
 
-the ZeBridge can be started with the following settings:
+The ZeBridge can be started with the following settings:
 
 * a fixed memory buffer definition: `BASE_BUF` (default 2^14=16KB) and `RING_BUFFER_COUNT` (default 65565) adjusted depending upon the tables the instance is supposed to handle. Remember the memory footprint: $$2^{\mathtt{BASE\_BUF}} \times \small{\text{RING\_BUFFER\_COUNT}}$$
+* ❌ Refuse startup on checks:
+  * Sys_mem $< 2^\mathtt{BASE\_BUF} \times$ RING
+  * BASE_BUF < max_payload (nats.conf)
 * a unique `--slot` (the unique pointer to the WAL that PostgreSQL keeps for this PUBLICATION). If you have several instances running, each has its own `SLOT`.
 * a unique `--port` (for the instance, for the telemetry, served by a webserver). If you have several instances running, each has its own `PORT`,
 * the `--top` config, defaults to _topology.json_ (_./topology.json_), shared naming of streams and bucket between ZeBridge, NATS and consumers,
@@ -215,12 +242,6 @@ DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:
 ./bridge --slot my_slot --pub my_pub --top topology.json
 ```
 
-❌ Refuse startup on checks:
-
-> TODO: #1 system_memory > 2^(BASE-1) x RING
-
-> TODO: #2 BASE_BUF < MAX_BASE_BUF==max_payload (nats.conf)
-
 **Principal authentication** (the user of a Consumer app):
 
 The principal is authenticated at the Consumer level, and used in the JWT/Operator protocole by NATS so that the bridge can pass it for Postgres RLS policies.
@@ -228,30 +249,31 @@ The principal is authenticated at the Consumer level, and used in the JWT/Operat
 |  |  subscribe  |   publish  | needs an account |
 |--|--|--|--|
 | read-only consumer  | cdc.>, init.>, KV.schemas.>, KV.snapshots.> | snapshot.request.>       | no |
-| read-write consumer | the same | + mutation.<principal>.> | yes |
+| read-write consumer | the same | + mutation.`<principal>`.> | yes |
 
 ## Design overview
 
 **Key features of the bridge**:
 
-* It streams PostgreSQL _proto-v1_ changes using logical replication (`pgoutput` binary format)
+* PostgreSQL _proto-v1_ streams using logical replication (`pgoutput` binary format)
 * Publishes schemas from the catalogue to NATS KV store on startup,
 * Generates table snapshots on-demand, chunked by **bytes** to fit one NATS message (10 000 rows is only a ceiling), via NATS requests,
 * Triggers message to NATS on schema change via Postgres DDL event triggers,
 * schemas are available in two formats: PostgreSQL(eg for PQLite) and SQLite,
-* MessagePack default encoding or JSON available with `--json`,
+* MessagePack default encoding (JSON available with `--json`),
 * At-least-once delivery with idempotent message IDs,
 * Graceful shutdown with LSN acknowledgment,
 * telemetry via HTTP `/metrics` (Prometheus format) and structured logs on **stderr** (Grafana Loki)
 
 **Key decisions**:
 
-* `REPLICA IDENTITY DEFAULT | FULL`. Preflight warning. Use only tables with _single column primary key ID_ (no single column PK + DEFAULT => PG error on UPDATE). Solution: run a migration to set a unique column PK ID => `DELETE id='42'`,
-* No SDK but a _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
-
+* `REPLICA IDENTITY DEFAULT`,
+* Preflight warning. Use only tables with _single column primary key ID_ (no single column PK + DEFAULT => PG error on UPDATE). Solution: run a migration to set a unique column PK ID => `DELETE id='42'`,
 * Single-Threaded per Bridge. The rationale is PostgreSQL WAL is inherently sequential. Simpler LSN acknowledgment logic. To a slot can be attached one or several tables.
+* Tenant, RLS policies.
 * ➡️ Scale horizontally (multiple bridges) instead of vertically. The PostgreSQL admin creates the publication and scope (_pub_name_ for which tables). Run multiple bridge instances with different replication slots - limited to `max_replication_slots=XX` in master config - and reach PostgreSQL instances.
 You can divide the workload per PostgreSQL instance, and attach bridge instances to differents scopes (specific tables). Each bridge instance can scale its builtin buffer taylored to the needs of the table(s) with `BASE_BUF` and `RING_BUFFER_COUNT`.
+* No SDK but a _HOW TO SYNC_ workflow and _NAMING CONVENTIONS_ to follow client side: demanding schema, running migration, seeding from the snapshot, playing the CDCs. Snippets are proposed in JS, Elixir, Python, NodeJS, Go.
 
 ```bash
 # Bridge 1: table "users" with publication "my_pub_1" on master
@@ -736,196 +758,6 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up --build -d
 ```
 
 This uses `docker-compose.prod.yml` which includes the bridge container alongside PostgreSQL and NATS. See that file for complete configuration.
-
----
-
-## Message Formats
-
-Payloads use `MessagePack` binary encoding by default.
-
-JSON can be enabled with the flag `--json`.
-
-The examples below show the logical structure for illustration.
-
-### Schema (KV Store: `schemas.{table}`)
-
-Published at bridge startup. Consumers fetch before requesting snapshots.
-
-```json
-{
-  "table": "users",
-  "schema": "public.users",
-  "timestamp": 1765201228,
-  "columns": [
-    {
-      "name": "id",
-      "position": 1,
-      "data_type": "integer",
-      "is_nullable": false,
-      "column_default": "nextval('users_id_seq'::regclass)"
-    },
-    {
-      "name": "name",
-      "position": 2,
-      "data_type": "text",
-      "is_nullable": false,
-      "column_default": null
-    },
-    {
-      "name": "email",
-      "position": 3,
-      "data_type": "text",
-      "is_nullable": true,
-      "column_default": null
-    }
-  ]
-}
-```
-
-### Snapshot Metadata (INIT Stream: `init.meta.{table}`)
-
-Published after all chunks. Tells consumer how many chunks to expect.
-
-```json
-{
-  "snapshot_id": "snap-1765208480",
-  "lsn": "0/191BFD0",
-  "timestamp": 1765208480,
-  "batch_count": 4,
-  "row_count": 4000,
-  "table": "users"
-}
-```
-
-### Snapshot Chunk (INIT Stream: `init.snap.{table}.{snapshot_id}.{chunk}`)
-
-Chunked by **bytes**, not rows: the bridge asks Postgres for the longest prefix of rows
-whose cumulative size fits one NATS message (`max_payload` minus envelope). `chunk_size`
-in `config.zig` is only a row _ceiling_ — a narrow table hits it, a table of 256 KiB rows
-gets three rows a chunk. A row too large to publish at all suspends the table rather than
-being split.
-
-```json
-{
-  "table": "users",
-  "operation": "snapshot",
-  "snapshot_id": "snap-1765208480",
-  "chunk": 3,
-  "lsn": "0/191BFD0",
-  "data": [
-    {
-      "id": "3001",
-      "name": "User-3001",
-      "email": "user3001@example.com",
-      "created_at": "2025-12-08 13:45:21.719719+00"
-    },
-    {
-      "id": "3002",
-      "name": "User-3002",
-      "email": "user3002@example.com",
-      "created_at": "2025-12-08 13:45:22.123456+00"
-    }
-    // ... as many rows as fit one message
-  ]
-}
-```
-
-### CDC Event (CDC Stream: `cdc.{table}.{operation}.{batch}`)
-
-Real-time INSERT/UPDATE/DELETE events.
-
-**Subject pattern:** `cdc.{table}.{operation}` with the test table 'test_types':
-
-* `cdc.test_types.insert`
-* `cdc.test_types.update`
-* `cdc.test_types.delete`
-
-**Message ID (for deduplication):** `{lsn}-{table}-{operation}`
-
-Example: `"1851208-test_types-insert"`
-
-**INSERT event:**
-
-```json
-{
-  "data" => {
-    "age" => 30,
-    "created_at" => "2025-12-12T12:00:34.338547Z",
-    "id" => 12,
-    "is_true" => true,
-    "matrix" => "{{1,2},{3,4}}",
-    "metadata" => {
-      "key_1" => "value_1",
-      "key_2" => [[1, 2], [3, 4], [5, 6]],
-      "key_3" => {"key_4" => "value_4", "key_5" => "value_5"}
-    },
-    "price" => "123.4500",
-    "some_text" => "Sample text",
-    "tags" => "{\"tag1\",\"tag2\"}",
-    "temperature" => 36.6,
-    "uid" => "f4b0611f-7258-47f8-bceb-0eba9ac5195a"
-  },
-  "msg_id" => "1851208-test_types-insert",
-  "operation" => "INSERT",
-  "relation_id" => 16392,
-  "subject" => "cdc.test_types.insert",
-  "table" => "test_types"
-}
-```
-
-**UPDATE event:**
-
-```json
-{
-  "data" => {
-    "age" => 31,
-    "created_at" => "2025-12-12T12:00:34.338547Z",
-    "id" => 12,
-    "is_true" => false,
-    "matrix" => "{{1,2},{3,4}}",
-    "metadata" => {
-      "key_1" => "value_1",
-      "key_2" => [[1, 2], [3, 4], [5, 6]],
-      "key_3" => {"key_4" => "value_4", "key_5" => "value_5"}
-    },
-    "price" => "122.9905",
-    "some_text" => "Sample text",
-    "tags" => "{\"tag1\",\"tag2\"}",
-    "temperature" => 37,
-    "uid" => "f4b0611f-7258-47f8-bceb-0eba9ac5195a"
-  },
-  "msg_id" => "18513a8-test_types-update",
-  "operation" => "UPDATE",
-  "relation_id" => 16392,
-  "subject" => "cdc.test_types.update",
-  "table" => "test_types"
-}
-```
-
-**DELETE event:**
-
-```json
-{
-  "data" => {
-    "age" => nil,
-    "created_at" => nil,
-    "id" => 12,
-    "is_true" => nil,
-    "matrix" => nil,
-    "metadata" => nil,
-    "price" => nil,
-    "some_text" => nil,
-    "tags" => nil,
-    "temperature" => nil,
-    "uid" => nil
-  },
-  "msg_id" => "1851518-test_types-delete",
-  "operation" => "DELETE",
-  "relation_id" => 16392,
-  "subject" => "cdc.test_types.delete",
-  "table" => "test_types"
-}
-```
 
 ---
 

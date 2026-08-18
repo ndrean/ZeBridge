@@ -48,6 +48,29 @@ async def main():
         print(f"  broker said: {first_error}")
 
     failed = 0
+    # ⚠️ Three outcomes, and two of them are not failures:
+    #
+    #   accepted == 1   the window held — what this scenario is for
+    #   accepted == 0   the window was ALREADY occupied by an earlier request (snapshot.py
+    #                   makes one seconds before, if the suite runs in order). Every
+    #                   publish is refused, which is the window *working* on a dirty
+    #                   fixture — not a broken one. Reported as a skip.
+    #   accepted > 1    the real failure: the window let more than one through.
+    #
+    # Inferred from the result rather than probed beforehand, because probing needs
+    # `$JS.API.STREAM.NAMES`, which a client principal is deliberately not granted — the
+    # precondition check would have needed more privilege than the thing it checks.
+    if accepted == 0 and rejected == n:
+        print(
+            f"\n⚠️  every request refused, including the first: the window for {req} was\n"
+            f"    already occupied when this started. That is the window working, on a\n"
+            f"    fixture another scenario left behind. Clear it and re-run:\n"
+            f"      nats stream purge REQUESTS --subject '{req}' -f\n"
+            f"    or wait out SNAP_RET."
+        )
+        await nc.close()
+        return 0
+
     if accepted == 1 and rejected == n - 1:
         zb.ok("exactly one request entered the window")
     else:

@@ -1,13 +1,18 @@
-//! NATS/JetStream Publisher Module (Pure Zig - g41797/nats)
+//! NATS/JetStream publishing, on lalinsky/nats.zig.
 //!
-//! Provides NATS connectivity and JetStream publishing using the pure Zig nats library.
-//! Replaces the old C-based implementation with a cleaner, native Zig solution.
+//! Migrated off the vendored g41797 client, which carried its own `@cImport` of
+//! `sys/socket.h` + `netdb.h` — reintroducing the C type-identity problem the project had
+//! already eliminated for libpq (see src/c_includes.h), and working around it with a cast
+//! its own comment apologised for. Two of its functions had also never compiled: Zig only
+//! analyses what is called, and `getHeaders()` returned a value where a pointer was
+//! declared.
 //!
-//! Key features:
-//! - Pure Zig implementation (no C dependencies)
-//! - Synchronous publishing for reliable LSN tracking
-//! - Automatic stream verification on startup
-//! - Clean error handling and reconnection
+//! What the library brings that is load-bearing here:
+//!
+//! - `std.Io` transport, so no C sockets
+//! - reconnection with a pending buffer that replays publishes, tested upstream
+//! - `PubAck` carrying `seq` and `duplicate`
+//! - headers readable on *received* messages, which the verdict path depends on
 
 const std = @import("std");
 const nats = @import("nats");
@@ -52,8 +57,10 @@ pub const PublisherConfig = struct {
 pub const Publisher = struct {
     allocator: std.mem.Allocator,
     config: PublisherConfig,
-    nc: ?*nats.Client = null,
-    js: ?nats.JS = null, // JS is a struct, not a pointer
+    /// Heap-allocated: `nats.Connection` registers internal pointers to itself, so it
+    /// cannot be copied after `init` — and `Publisher` is returned by value from `init`.
+    conn: ?*nats.Connection = null,
+    js: ?nats.JetStream = null,
     is_connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     reconnect_mutex: std.Io.Mutex = .{ .state = std.atomic.Value(std.Io.Mutex.State).init(.unlocked) },
@@ -68,7 +75,7 @@ pub const Publisher = struct {
         return Publisher{
             .allocator = allocator,
             .config = config,
-            .nc = null,
+            .conn = null,
             .js = null,
             .io = io,
         };
@@ -89,23 +96,36 @@ pub const Publisher = struct {
             if (ep.user != null or ep.seed != null) "yes" else "no",
         });
 
-        // Create JetStream context (includes NATS client connection)
-        const js = try nats.JS.CONNECT(self.allocator, .{
-            .addr = ep.host,
-            .port = ep.port,
+        const conn = try self.allocator.create(nats.Connection);
+        errdefer self.allocator.destroy(conn);
+
+        conn.* = nats.Connection.init(self.allocator, self.io, .{
             .user = ep.user,
-            .pass = ep.pass,
+            .password = ep.pass,
             .nkey_seed = ep.seed,
-        }, self.io);
-        self.js = js;
+            // The library reconnects on its own and buffers publishes while it does. The
+            // hand-rolled reconnect below stays as the outer guard for the case it gives
+            // up on, but it is no longer the first line of defence.
+            .reconnect = .{
+                .allow_reconnect = true,
+                .max_reconnect = if (self.config.max_reconnect_attempts < 0)
+                    std.math.maxInt(u32)
+                else
+                    @intCast(self.config.max_reconnect_attempts),
+            },
+        });
+        errdefer conn.deinit();
+
+        const url = try std.fmt.allocPrint(self.allocator, "nats://{s}:{d}", .{ ep.host, ep.port });
+        defer self.allocator.free(url);
+        try conn.connect(url);
+
+        self.conn = conn;
+        self.js = nats.JetStream.init(conn, .{});
 
         log.info("🟢 Connected to NATS at {s}:{d}", .{ ep.host, ep.port });
         log.info("✅ JetStream context acquired", .{});
         self.is_connected.store(true, .seq_cst);
-
-        // Note: Stream verification is not available in pure Zig nats library
-        // Streams must be created by infrastructure (nats-init)
-        log.info("✅ NATS/JetStream ready (stream verification skipped - ensure streams exist)", .{});
     }
 
     /// Attempt to reconnect to NATS server
@@ -142,27 +162,17 @@ pub const Publisher = struct {
                 utils.sleep(@intCast(wait_ms * std.time.ns_per_ms));
             }
 
-            // Disconnect old connection if any
-            if (self.js) |*js| {
-                js.DISCONNECT();
-                self.js = null;
-            }
+            // Tear the old one down first. `Connection.deinit` stops the reader, flusher
+            // and manager fibers; leaking it would leave them running against a socket
+            // nobody reads.
+            self.teardown();
 
-            // Attempt new connection to the same resolved endpoint
-            const ep = self.config.endpoint;
-            const js = nats.JS.CONNECT(self.allocator, .{
-                .addr = ep.host,
-                .port = ep.port,
-                .user = ep.user,
-                .pass = ep.pass,
-                .nkey_seed = ep.seed,
-            }, self.io) catch |err| {
+            // The library reconnects internally, so reaching here means it gave up — a
+            // fresh connection is the only thing left to try.
+            self.connect() catch |err| {
                 log.warn("Reconnect attempt {d} failed: {s}", .{ attempt + 1, @errorName(err) });
                 continue;
             };
-
-            // Success!
-            self.js = js;
             self.is_connected.store(true, .seq_cst);
             const count = self.reconnect_count.fetchAdd(1, .monotonic) + 1;
 
@@ -172,8 +182,8 @@ pub const Publisher = struct {
             }
 
             log.info("🟢 NATS reconnected to {s}:{d} (reconnect #{d})", .{
-                ep.host,
-                ep.port,
+                self.config.endpoint.host,
+                self.config.endpoint.port,
                 count,
             });
 
@@ -194,19 +204,23 @@ pub const Publisher = struct {
         // "Disconnected" is only true if we ever connected. Logging it unconditionally
         // made a failed *first* connection read as a lost one — the misleading
         // `🥁 Disconnected from NATS` that appeared when NATS_URL did not resolve.
-        const was_connected = self.js != null;
+        const was_connected = self.conn != null;
         self.is_connected.store(false, .seq_cst);
-
-        if (self.js) |*js| {
-            js.DISCONNECT();
-            self.js = null;
-        }
-
-        // No separate nc in pure Zig nats - JetStream includes the connection.
-        // Nothing to free: the endpoint borrows from the environment block.
-        self.nc = null;
-
+        self.teardown();
         if (was_connected) log.info("🥁 Disconnected from NATS", .{});
+    }
+
+    /// Close the connection and free it. Safe to call when there is none.
+    ///
+    /// Separate from `deinit` because `reconnect` needs exactly this and nothing else —
+    /// no logging, no "was_connected" bookkeeping.
+    fn teardown(self: *Publisher) void {
+        self.js = null; // borrows the connection; drop it first
+        if (self.conn) |conn| {
+            conn.deinit();
+            self.allocator.destroy(conn);
+            self.conn = null;
+        }
     }
 
     /// Check if NATS connection is alive
@@ -224,43 +238,48 @@ pub const Publisher = struct {
     /// - subject: Full subject name
     /// - headers: NATS message headers (includes Nats-Msg-Id for deduplication)
     /// - data: Message payload
+    /// Publish to JetStream with a `Nats-Msg-Id`, and wait for the PubAck.
+    ///
+    /// The msg_id is passed as a value rather than a prepared header block: every caller
+    /// wanted exactly one header, and each was allocating a 256-byte pool structure to
+    /// carry it. `PublishOptions.msg_id` does the same thing with no allocation.
+    ///
+    /// ⚠️ Synchronous by design. The PubAck is what proves the message is *stored*, and
+    /// the CDC path advances its LSN watermark on that proof — a fire-and-forget publish
+    /// would let the bridge report progress past data the stream never accepted.
+    ///
+    /// `ack.duplicate` is not an error: it means JetStream recognised this msg_id inside
+    /// the stream's dedup window and collapsed a retry into the original write, which is
+    /// exactly what an idempotent republish should do.
     pub fn publish(
         self: *Publisher,
         subject: []const u8,
-        headers: *nats.pool.Headers,
+        msg_id: ?[]const u8,
         data: []const u8,
     ) !void {
-        // Fast path: try publish if connected
         if (self.js) |*js| {
-            js.PUBLISH(subject, headers, data) catch |err| {
-                // Connection might be lost, mark as disconnected
+            var res = js.publish(subject, data, .{ .msg_id = msg_id }) catch |err| {
                 log.warn("NATS publish failed: {s} - attempting reconnection", .{@errorName(err)});
                 self.is_connected.store(false, .seq_cst);
 
-                // Attempt reconnection
-                if (!self.reconnect()) {
-                    return error.ReconnectionFailed;
-                }
+                if (!self.reconnect()) return error.ReconnectionFailed;
 
-                // Retry publish after reconnection
                 if (self.js) |*js_retry| {
-                    try js_retry.PUBLISH(subject, headers, data);
+                    var retry = try js_retry.publish(subject, data, .{ .msg_id = msg_id });
+                    retry.deinit();
                     return;
                 }
-
                 return error.NotConnected;
             };
+            res.deinit();
             return;
         }
 
-        // Not connected, try to reconnect first
-        if (!self.reconnect()) {
-            return error.NotConnected;
-        }
+        if (!self.reconnect()) return error.NotConnected;
 
-        // Retry after reconnection
         if (self.js) |*js| {
-            try js.PUBLISH(subject, headers, data);
+            var res = try js.publish(subject, data, .{ .msg_id = msg_id });
+            res.deinit();
         } else {
             return error.NotConnected;
         }
@@ -273,13 +292,7 @@ pub const Publisher = struct {
         subject: []const u8,
         data: []const u8,
     ) !void {
-        // Create headers (needed even for simple publish)
-        var headers = nats.pool.Headers{};
-        try headers.init(self.allocator, 64);
-        defer headers.deinit();
-
-        // Use the main publish function which handles reconnection
-        try self.publish(subject, &headers, data);
+        try self.publish(subject, null, data);
     }
 
     /// Get stream information (for HTTP endpoints)
@@ -409,20 +422,29 @@ pub const Publisher = struct {
 
 /// Ensure a JetStream stream exists (check-or-fail-fast)
 ///
-/// Note: The pure Zig nats library doesn't expose stream INFO API yet.
-/// This function is a no-op placeholder. Streams must be created by infrastructure.
 /// `max_payload` as this connection's server advertised it, or null if unknown.
-pub fn serverMaxPayload(js: *nats.JS) ?u64 {
-    const conn = js.connection orelse return null;
-    return conn.server_max_payload;
+///
+/// Load-bearing rather than informational: `BASE_BUF` must stay under it, and the snapshot
+/// chunker sizes every COPY against it. A message over the limit is not rejected with an
+/// error — the server closes the connection, and every retry re-sends the same bytes.
+pub fn serverMaxPayload(js: *nats.JetStream) ?u64 {
+    const mp = js.nc.server_info.max_payload;
+    return if (mp > 0) @intCast(mp) else null;
 }
 
-pub fn ensureStream(js: *nats.JS, allocator: std.mem.Allocator, stream_name: []const u8) !void {
-    _ = js;
+/// Verify a stream exists, by asking JetStream.
+///
+/// ⚠️ Was a no-op — the vendored client exposed no INFO API, so "verified" meant nothing
+/// and a missing stream surfaced later as publishes that silently went nowhere. It now
+/// actually checks, which is the difference between the startup log being a claim and
+/// being a fact.
+pub fn ensureStream(js: *nats.JetStream, allocator: std.mem.Allocator, stream_name: []const u8) !void {
     _ = allocator;
-    _ = stream_name;
-    // No-op: pure Zig nats doesn't expose INFO API
-    // Streams must be created by infrastructure (nats-init)
+    var res = js.getStreamInfo(stream_name) catch |err| {
+        log.err("🔴 Stream '{s}' is not reachable: {s}", .{ stream_name, @errorName(err) });
+        return error.StreamNotFound;
+    };
+    defer res.deinit();
 }
 
 /// Check multiple JetStream streams exist

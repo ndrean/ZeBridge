@@ -201,8 +201,35 @@ pub const Http = struct {
     /// Default HTTP port for metrics endpoint
     pub const default_port = 9090;
 
-    /// HTTP server bind address
-    pub const bind_address = "0.0.0.0";
+    /// How long a connection may take to send its request line and headers.
+    ///
+    /// Sized for the expected traffic and nothing more: a Prometheus scrape every ~10s
+    /// and the occasional `curl /status`. Both send a complete request immediately, so
+    /// three seconds is already generous — this is a deadline for *silence*, not for a
+    /// slow client.
+    ///
+    /// ⚠️ Without it a client that connects and never sends parks a task forever. That is
+    /// no longer an outage (each connection runs on its own thread), but it is still an
+    /// unbounded leak, and it is free to open sockets.
+    pub const receive_timeout_ns: u64 = 3 * std.time.ns_per_s;
+
+    /// Maximum connections being served at once.
+    ///
+    /// One scraper plus a human is two. Sixteen leaves room for a second scraper, a
+    /// dashboard and a handful of stragglers still winding down, while bounding what an
+    /// abusive client can allocate. Past this, connections are accepted and closed
+    /// immediately rather than queued — a scraper retries in 10s, and refusing fast beats
+    /// a queue nobody drains.
+    pub const max_connections: u32 = 16;
+
+    /// HTTP server bind address, overridable with `BRIDGE_BIND`.
+    ///
+    /// ⚠️ Loopback by default. Every endpoint is unauthenticated and they disclose table
+    /// names, replication lag and throughput — so reaching them should require being on
+    /// the host, or going through a reverse proxy an operator put there on purpose.
+    /// This constant said "0.0.0.0" and was read by nobody: the server hardcoded
+    /// INADDR_ANY, so the declared default and the actual bind disagreed silently.
+    pub const default_bind = "127.0.0.1";
 
     /// Metrics endpoint path
     pub const metrics_path = "/metrics";
@@ -251,6 +278,16 @@ pub const Sync = struct {
     /// `t.timestamps` produce; Django and TypeORM differ, which is exactly why it is a
     /// default rather than a rule.
     pub const default_version_column = "updated_at";
+
+    /// The session setting the bridge stamps with the authenticated principal before every
+    /// mutation, and that row-level policies read back.
+    ///
+    /// ⚠️ **This name exists in two places and they must match**: here, and in the policies
+    /// `zebridge_publish_tenant_table()` creates in `init.sql.template`. A mismatch is
+    /// silent in the worst way — `current_setting(..., true)` returns NULL for an unknown
+    /// setting, every policy predicate evaluates to NULL, and **every write is refused**
+    /// with `new row violates row-level security policy`. Nothing names the real cause.
+    pub const principal_setting = "zb.principal";
 
     /// Column-name prefixes that can never be a version column, whatever the operator
     /// configures. Both are set once at insert and never touched again, so as a version

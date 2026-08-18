@@ -65,24 +65,13 @@ pub fn build(b: *std.Build) void {
     // startup now; see src/topology.zig.
 
 
-    // Vendored g41797/mailbox (no external deps)
-    const mailbox_mod = b.addModule("mailbox", .{
-        .root_source_file = b.path("src/mailbox_vendor/mailbox.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // src/mailbox_vendor/ removed with src/nats_vendor/: it existed only to back that
+    // client's message pool, and nothing in the bridge imported it directly.
 
-    // Vendored g41797/nats patched for Zig 0.16:
-    //   - Formatter.zig: std.Io.Writer.fixed → std.io.fixedBufferStream
-    //   - Conn.zig: zul UUID → std.crypto.random
-    const nats_mod = b.addModule("nats", .{
-        .root_source_file = b.path("src/nats_vendor/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "mailbox", .module = mailbox_mod },
-        },
-    });
+    // lalinsky/nats.zig — std.Io transport, no C sockets. Replaces the vendored
+    // g41797 client; see nats.zig/NOTES.md for the one local fix carried against it.
+    const nats_dep = b.dependency("nats", .{ .target = target, .optimize = optimize });
+    const nats_mod = nats_dep.module("nats");
 
     // The "bridge" module shares its root with the exe, so it needs the same imports —
     // without these, `zig build test` cannot compile any module that uses msgpack/nats.
@@ -112,10 +101,12 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // `bridge_sweeper`, not `gc`: a two-letter binary on PATH is asking to collide with
+    // something else (git's `gc`, among others), and the name should say what it sweeps.
     const gc_exe = b.addExecutable(.{
-        .name = "gc",
+        .name = "bridge_sweeper",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/gc.zig"),
+            .root_source_file = b.path("src/bridge_sweeper.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -169,40 +160,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
-    // ===== Vendored NATS library's own test suite =====
-    // Ported from upstream g41797/nats 0.0.3. The upstream repo targets Zig 0.15 and
-    // does not build on 0.16, so src/nats_vendor/ is the only 0.16 copy — meaning its
-    // tests have to run here rather than upstream. Kept off `zig build test` because
-    // these exercise vendored third-party code, not the bridge.
-    const nats_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/nats_vendor/root_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "mailbox", .module = mailbox_mod },
-            },
-        }),
-    });
-    nats_tests.root_module.link_libc = true;
-
-    const nats_test_step = b.step("test-nats", "Run the vendored NATS library's unit tests");
-    nats_test_step.dependOn(&b.addRunArtifact(nats_tests).step);
-
-    // Integration tests need a live NATS server on 4222 (see docker-compose.full.yml).
-    const nats_int_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/nats_vendor/integration_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "mailbox", .module = mailbox_mod },
-            },
-        }),
-    });
-    nats_int_tests.root_module.link_libc = true;
-
-    const nats_int_step = b.step("test-nats-integration", "Run vendored NATS integration tests (requires a live server)");
-    nats_int_step.dependOn(&b.addRunArtifact(nats_int_tests).step);
+    // The vendored NATS test steps (`test-nats`, `test-nats-integration`) are gone with
+    // src/nats_vendor/. The library is a dependency now and carries its own suite:
+    //
+    //     cd nats.zig && zig build test        # 104 + 167 tests
+    //     cd spike    && ./zig-out/bin/spike   # the five capabilities the bridge needs
 
 }
