@@ -38,11 +38,54 @@ async def main():
         # Idempotent, so re-running the probe does not multiply the table. Column names
         # match the emitter's test_types migration; adjust for another table.
         print(f"seeding {table} to {seed} rows...")
-        zb.psql(
-            f"INSERT INTO public.{table} (id, some_text, inserted_at, updated_at) "
-            f"SELECT i, 'r'||i, now(), now() FROM generate_series(1,{seed}) i "
+        # ⚠️ Built from the catalog, not hardcoded. This used to insert `(id, some_text,
+        # inserted_at, updated_at)`, which stopped existing when the table moved to a uuid
+        # primary key — so the seed silently failed and the scenario went on asserting
+        # against whatever rows other scenarios happened to leave behind. It passed, on
+        # incidental data, for as long as some data was incidentally there.
+        pk_cols = [c for c in zb.psql(
+            "SELECT a.attname FROM pg_index i "
+            "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true "
+            "JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum "
+            f"WHERE i.indrelid='public.{table}'::regclass AND i.indisprimary ORDER BY k.ord"
+        ).splitlines() if c]
+        required = [c for c in zb.psql(
+            "SELECT column_name FROM information_schema.columns "
+            f"WHERE table_name='{table}' AND is_nullable='NO' AND column_default IS NULL"
+        ).splitlines() if c]
+
+        cols, vals = [], []
+        for c in pk_cols + [r for r in required if r not in pk_cols]:
+            t = zb.psql(
+                "SELECT data_type FROM information_schema.columns "
+                f"WHERE table_name='{table}' AND column_name='{c}'"
+            ).strip()
+            cols.append(c)
+            if t == "uuid":
+                # Deterministic from the series, so re-running tops up rather than duplicating.
+                vals.append("md5(i::text)::uuid")
+            elif "timestamp" in t:
+                vals.append("now()")
+            elif t in ("bigint", "integer", "smallint"):
+                vals.append("i")
+            else:
+                vals.append("'seed-'||i")
+        if "some_text" not in cols:
+            cols.append("some_text")
+            vals.append("'r'||i")
+
+        out = zb.psql(
+            f"INSERT INTO public.{table} ({', '.join(cols)}) "
+            f"SELECT {', '.join(vals)} FROM generate_series(1,{seed}) i "
             "ON CONFLICT DO NOTHING"
         )
+        have = zb.psql(f"SELECT count(*) FROM public.{table}").strip()
+        print(f"  {have} rows present after seeding")
+        if int(have or 0) < seed // 2:
+            sys.exit(
+                f"seeding produced only {have} rows of {seed} — the assertions below would "
+                "run against incidental data rather than the fixture they describe"
+            )
 
     pk = zb.psql(
         "SELECT a.attname FROM pg_index i "

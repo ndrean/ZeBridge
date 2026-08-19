@@ -1103,6 +1103,42 @@ on the offset.
 the same precision, and Ecto still reads it back as a `DateTime`. For a table that accepts
 edge writes it is worth the migration.
 
+#### Making the version true for writers that are not the bridge
+
+⚠️ **The bridge stamps the version on every write it applies, and the bridge is not the
+only writer.** A cron job, a `psql` session, another service, or an ORM path that forgets
+can change a row without touching its version. The stored value then no longer describes
+the row, and a client's **older** edit beats a **newer** server write — silently, and
+correctly by the rule.
+
+Two triggers close it, installed per table by the DBA. They change no shape and break no
+query, which is what makes them usable on a database you do not control:
+
+```sql
+SELECT zebridge_install_write_guards('public.users', 'updated_at', 'deleted_at');
+--                                                    ^version      ^tombstone (optional)
+```
+
+| trigger | what it does |
+| --- | --- |
+| `BEFORE UPDATE` | stamps the version **only if the statement did not set it** — so the bridge's own value, and a well-behaved ORM's, are left alone |
+| `BEFORE DELETE` | writes the tombstone and suppresses the physical delete, so §7.5's resurrection guard applies to *every* writer |
+
+⚠️ **Once the delete guard is on, only the sweeper can physically delete from that table.**
+An admin running `DELETE FROM t WHERE …` gets a tombstone. That is the intent, and it is
+also a real surprise during a cleanup. The sweeper is recognised by `zb.principal`, the
+same setting the RLS policies read — so:
+
+```sql
+SELECT set_config('zb.principal', 'zb_sweeper', false);  -- this session only
+SELECT zebridge_remove_write_guards('public.users');     -- permanently
+```
+
+⚠️ **The column names are a second copy of `SYNC_RULES`, and nothing cross-checks them.**
+Name a different column here and the bridge and the database disagree about what "version"
+means, with no error anywhere. `zebridge_audit_write_guards()` lists what is actually
+attached so the two can be compared. Tested by `scripts/scenarios/guards.py`.
+
 #### Why the sound type is not the default
 
 An integer version is better arithmetic — no clock, no skew, no precision question, no

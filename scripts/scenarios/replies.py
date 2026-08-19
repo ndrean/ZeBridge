@@ -180,6 +180,49 @@ async def main():
     failed += 0 if v else 1
     zb.psql(f"DELETE FROM public.{TABLE} WHERE uid='{gone}'", quiet=True)
 
+    # ── a run of writes must ALL be answered ───────────────────────────────────
+    #
+    # ⚠️ The regression test for NOTES §2.12. A pipelined connection that fails to leave
+    # pipeline mode wedges the listener: it keeps logging, stays "connected", and answers
+    # nothing. One write cannot tell the difference between that and a slow bridge — a run
+    # of them can, because a wedged connection stops answering partway and never resumes.
+    print("\nsoak: every write in a run is answered")
+    n = 12
+    ids = []
+    for i in range(n):
+        uid = str(uuid.uuid4())
+        msg_id = f"soak-{uuid.uuid4().hex[:12]}"
+        v = iso(pg_now())
+        data = {"uid": uid, "some_text": f"soak {i}", version_col: v, "inserted_at": v}
+        for c in required:
+            if c == "tenant_id" and tenant:
+                data[c] = tenant
+            elif c not in data:
+                data[c] = v
+        await js.publish(
+            zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], who, TABLE, "insert"),
+            msgpack.packb({"key": {"uid": uid}, "data": data, "version": v, "client_id": "c-soak"}),
+            headers={"Nats-Msg-Id": msg_id},
+        )
+        ids.append((msg_id, uid))
+
+    for _ in range(40):
+        if all(m in verdicts for m, _ in ids):
+            break
+        await asyncio.sleep(1)
+
+    answered = [m for m, _ in ids if m in verdicts]
+    if len(answered) == n:
+        zb.ok(f"all {n} writes answered")
+    else:
+        zb.bad(
+            f"only {len(answered)} of {n} writes were answered — ingress stalls partway, "
+            "which is what a connection stuck in pipeline mode looks like from outside"
+        )
+        failed += 1
+    for _, uid in ids:
+        zb.psql(f"DELETE FROM public.{TABLE} WHERE uid='{uid}'", quiet=True)
+
     task.cancel()
     await nc.close()
     return 1 if failed else 0

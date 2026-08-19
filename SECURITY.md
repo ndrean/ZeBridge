@@ -366,6 +366,7 @@ refactor, or a migration — and most of the defects found while building this w
 | grant vs schema disagreement; refusal reports SQLSTATE 42501 | ✅ `scripts/scenarios/writable.py` |
 | a future-dated version is clamped to `now()` + tolerance, and the client is told what was stored | ✅ `scripts/scenarios/clamp.py` — asserts the cap, that the row unfreezes once the window passes, the verdict's wire format, and that a within-tolerance version is left untouched |
 | every accepted write gets one definitive reply, and `stale` is distinguished from `row_deleted` | ✅ `scripts/scenarios/replies.py` — both zero-row outcomes produced deliberately, plus the first-write case that must not be mistaken for a grave |
+| a writer that bypasses the bridge still stamps the version and still soft-deletes; the sweeper alone may reap | ✅ `scripts/scenarios/guards.py` — 6 assertions, including both halves of the sweeper bypass |
 | mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `web-consumer/zb-mutate.mjs` |
 | the principal reaches RLS: `set_config` and the upsert share one transaction, now the pipeline's implicit one | ✅ `scripts/scenarios/writable.py`, `tiebreak.py`, `invalidate.py` — every RLS-scoped write would be refused if it did not |
 | client's JetStream permission set is complete | ✅ `web-consumer/zb-probe.mjs` |
@@ -376,6 +377,7 @@ refactor, or a migration — and most of the defects found while building this w
 | a malformed mutation dead-letters and does not block the queue | ✅ `scripts/scenarios/poison.py` |
 | credentials and endpoint resolution | ✅ `scripts/scenarios/credentials.py`, `endpoint.py` |
 | cross-file config coherence | ✅ `scripts/scenarios/envcheck.py` |
+| the ring is refused when it cannot fit memory or a message, and out-of-range tunables clamp rather than silently becoming larger | ✅ `scripts/scenarios/sizing.py` — 7 assertions, including that the guard and the allocator report the same total |
 | reconnect and fault behaviour | ✅ `scripts/scenarios/faults.py`, `burst.py` |
 | subject-token validation (dot, `*`, `>`, whitespace, length) | ✅ `src/utils.zig`, 6 tests |
 | ack-subject parsing, both JetStream forms | ✅ `src/mutation_listener.zig`, 4 tests |

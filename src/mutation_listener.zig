@@ -1643,7 +1643,22 @@ pub const MutationListener = struct {
         }
         // Leaving the connection in pipeline mode would break every later statement on
         // it, so this unwinds on every path out — including the error returns below.
-        defer _ = c.PQexitPipelineMode(conn);
+        //
+        // ⚠️ Checked, not discarded. It fails when results are still unconsumed, and a
+        // silent failure here is how the write path wedges: the connection stays in
+        // pipeline mode and every subsequent mutation misaligns against it. Saying so is
+        // the difference between a diagnosable stall and ingress simply going quiet.
+        defer {
+            if (c.PQexitPipelineMode(conn) != 1) {
+                log.err(
+                    "🔴 Could not leave pipeline mode ({s}) — the connection is unusable for further mutations and will be reset",
+                    .{c.PQerrorMessage(conn)},
+                );
+                // Force the next iteration to notice: a reset is cheaper than a listener
+                // that appears alive and accepts nothing.
+                c.PQreset(conn);
+            }
+        }
 
         const principal_z = try alloc.dupeZ(u8, mutation.principal);
         const set_params = [_]?[*:0]const u8{principal_z.ptr};
@@ -1707,7 +1722,26 @@ pub const MutationListener = struct {
             defer c.PQclear(r);
 
             const st = c.PQresultStatus(r);
-            if (st == c.PGRES_PIPELINE_SYNC) break;
+            if (st == c.PGRES_PIPELINE_SYNC) {
+                // ⚠️ The sync is not the last thing to read. libpq emits a trailing null
+                // after it, and `PQexitPipelineMode` **fails while any result is
+                // unconsumed** — leaving the connection in pipeline mode. The next
+                // mutation then enters a pipeline that is already open, its results
+                // misalign with the statements that produced them, and the listener
+                // eventually blocks in `PQgetResult` waiting for a result the server has
+                // already sent.
+                //
+                // Measured: PostgreSQL showed the session `idle` in `Client/ClientRead`
+                // with the classify statement as its last query — the server finished and
+                // was waiting, while the bridge waited for it. Ingress stopped, mutations
+                // piled up unacked, and nothing logged an error.
+                while (true) {
+                    const trailing = c.PQgetResult(conn);
+                    if (trailing == null) break;
+                    c.PQclear(trailing);
+                }
+                break;
+            }
 
             // Queued behind a statement that failed, so it never ran. The error was
             // already recorded from the statement that actually failed.

@@ -188,17 +188,15 @@ NATS comes with a `max_payload=1M` default.
 
 **Snapshot**: Zebridge will suspend a table whose rows are wider than the NATS message limit (<1 MB). The NATS cap also means a consumer cannot push a large row to NATS. Above this limit, we are in the domain of Object storage for large blobs, and URLs should be saved in the database instead.
 
-**CDC**: Zebridge is designed to be fast, with a **fixed memory** which caps the event size, suspends a table and drives the total memory used.  
-> Total Memory = 2 x
-> (`BASE_BUF` = size/row, 16kB default ) x
-> (`RING_BUFFER_COUNT` = nb_slots, default 8184 )
+**CDC**: ZeBridge is designed to be fast, with a **fixed memory** defined at runtime.
 
-Zebridge  suspends a table when events size are larger than $2^{\mathtt{BASE\_BUF}}$ which itself is capped at `BASE_BUF=20` (1MB). This matches `max_payload=1M` used by NATS.
+The `RING_BUFFER_COUNT` is designed to buffer the received events during potential NATS jitters. Its count depends naturally upon the emitting rate.
+The `BASE_BUF` is the max payload size, capped at 1MB.
+The `MAX_COLUMNS` is the maximum number of possible columns per table.
 
-The `RING_BUFFER_COUNT` is designed to buffer the received events during a NATS restart ~1s. Its count depends naturally upon the emitting rate.
+It caps the event size, suspends a table and drives the total memory used.
 
-**Examples**: if you expect to follow a table(s) with row size below 100 KB with say 500 evt/s, increase to `BASE_BUF=17` (136 KB per row) and buffer less `RING_BUFFER_COUNT=1000` (total mem footprint: ~ 262 MB).
-If you expect a table(s) with smaller rows  < 1 KB/row which emits 50k evt/s, decrease `BASE_BUF=10` (1kB) and increase the ring size to `RING_BUFFER_COUNT=60000` (mem footprint: ~ 130 MB).
+The defaults, ring=60.000, a payload=2kB, max_cols=128, ZeBridge consumes 215 MB. With this, it can buffer CDC events during 2s if produced at 30 kevt/s.
 
 Ceiling is NATS/JS, the host capactiy, not ZeBridge.
 ❇️ Read [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count)
@@ -1384,7 +1382,7 @@ Each one answers a different question:
 
 * **`BASE_BUF`** (log2 bytes, range 10–20) is _how large a single row may be_. Size it
   to your widest row: a `jsonb` document, a long `text` column, a big array.
-* **`RING_BUFFER_COUNT`** (range 1024–1048576, **clamped** to the nearest bound if you go outside it — an out-of-range value used to fall back to the *default*, so asking for 64 got you 65536) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
+* **`RING_BUFFER_COUNT`** (range 1024–1048576, **clamped** to the nearest bound if you go outside it — an out-of-range value used to fall back to the _default_, so asking for 64 got you 65536) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
 
 > Raising one and lowering the other keeps memory flat, at the cost of outage tolerance.
 

@@ -233,6 +233,45 @@ Adding pruning without fixing that would have published
 `cdc.zebridge_ddl_events.delete` to every client on each DDL, turning a slow disk leak
 into active noise. Both halves fixed together.
 
+### 2.12 Pipeline mode wedged ingress, silently and only after a while
+
+Introduced by the pipelining work itself. The drain loop broke out of the result loop as
+soon as it saw `PGRES_PIPELINE_SYNC`:
+
+```zig
+if (st == c.PGRES_PIPELINE_SYNC) break;
+```
+
+⚠️ **The sync is not the last thing libpq emits** — a trailing null follows it, and
+`PQexitPipelineMode` **fails while any result is unconsumed**. The `defer` discarded that
+failure (`defer _ = c.PQexitPipelineMode(conn)`), so the connection stayed in pipeline
+mode. The next mutation entered a pipeline that was already open, its results misaligned
+against the statements that produced them, and the listener eventually blocked in
+`PQgetResult` waiting for something the server had already sent.
+
+**Nothing reported it.** The bridge logged its usual `LOOP`/`METRICS` lines, `connected=1`,
+`slot_active=1`; CDC kept flowing. Only ingress stopped. Mutations piled up unacked with
+`Outstanding Acks: 1` and an acknowledgement floor frozen tens of seconds behind the
+stream, and clients saw "no verdict at all" — indistinguishable from a slow bridge.
+
+Diagnosed from PostgreSQL rather than from the bridge: `pg_stat_activity` showed the
+`bridge_writer` session **idle in `Client/ClientRead`** with the classify statement as its
+last query. The server had finished and was waiting for the client; the client was waiting
+for the server.
+
+⚠️ **It is not deterministic, which is why it survived several green suite runs.** The
+misalignment only becomes a block once a particular sequence of statement shapes lines up,
+so a short scenario can pass with the connection already in a bad state. That is the
+lesson: a passing write-path scenario says nothing about whether the *connection* is still
+usable afterwards.
+
+Fixed by draining to null after the sync, and by checking `PQexitPipelineMode` — logging
+and `PQreset`ing on failure, since a connection that cannot leave pipeline mode is unusable
+and a reset is cheaper than a listener that looks alive and accepts nothing.
+
+Guarded by a soak in `scripts/scenarios/replies.py`: a run of mutations must produce a
+verdict for **every** one, which is what a wedged connection cannot do.
+
 ### 2.10 A `u16` column offset silently corrupted wide rows  ← worst failure mode
 
 `CDCEvent.ColumnView.name_offset` was `u16`, and it indexes into `data_buffer`, whose size
@@ -318,6 +357,42 @@ because nothing said how it was obtained. It now ships with machine, build mode,
 transaction shape and row count, so the next regression has something to contradict.
 
 ---
+
+### 1.10 `ColumnView` could store lengths only — 12 B → 8 B
+
+`CDCEvent.ColumnView` is replicated `max_columns × RING_BUFFER_COUNT` times, so its width
+is a direct multiplier on startup memory. It currently holds
+`{name_len: u8, name_offset: u32, value_tag, value_len: u32}` = **12 bytes**.
+
+⚠️ **Narrowing the field does not help, and this was measured rather than assumed.**
+Unpacked, every integer from `u17` to `u32` occupies 4 bytes — `@sizeOf(u21) == @sizeOf(u32)`
+— so `u21` is free *and* pointless. The only smaller step is `u16` at 2 bytes, which caps
+the offset at 65535 and is exactly the wrap bug of §2.10. A `packed struct` does reach 8
+bytes, but puts a shift+mask on every column access in the hottest loop.
+
+The saving is available by storing **less**, not narrower. `addColumn` lays each column
+down contiguously, so the whole offset chain is derivable from the lengths:
+
+```
+name_offset[0] = 0
+name_offset[i] = name_offset[i-1] + name_len[i-1] + value_len[i-1]
+```
+
+Dropping `name_offset` gives `{name_len, value_tag, value_len}` = **8 bytes**, measured —
+the packed struct's saving with no bit manipulation. (`value_offset` was already removed
+on the same reasoning, §2.10.) All three production readers already iterate
+`columns[0..column_count]` or take `columns[0]`, so a running offset drops straight in.
+
+⚠️ **The catch is that it makes the array sequential-only.** `columns[i]` stops being
+meaningful standalone, and a later random access would silently read the wrong bytes —
+the same failure class as the `u16` wrap. So it should ship as an **iterator** yielding
+`(name, value)` slices, with no offset accessor at all, making the contract structural
+instead of a comment.
+
+**Not done because the ratio is poor.** Sizing `max_columns` to reality (512 → 128) took
+metadata from 1614 MB to 462 MB on a 262,144-slot ring; this would take it to 334 MB. An
+order of magnitude less win, for a refactor of the decode path. Worth doing only if the
+bridge is being pushed into a genuinely memory-tight deployment.
 
 ### 1.9 A durable client outbox — deferred to the final pass
 

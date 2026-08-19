@@ -115,6 +115,165 @@ $$ LANGUAGE plpgsql;
 
 
 -- ---------------------------------------------------------
+-- Write guards — making the version column true for EVERY writer
+-- ---------------------------------------------------------
+--
+-- Last-write-wins compares `stored.version < incoming.version`, and the bridge stamps the
+-- version on every write it applies. The bridge is not the only writer. A cron job, a psql
+-- session, another service, or an ORM path that forgets can run
+--
+--     UPDATE users SET name = 'x' WHERE id = 1;      -- updated_at untouched
+--
+-- and the row changes while the version does not. The stored version then no longer
+-- describes the row, so a client's OLDER edit beats a NEWER server write — silently, and
+-- "correctly" by the rule. See PROTOCOL.md §7.3.
+--
+-- A trigger fixes it without a migration: it changes no shape and breaks no query, which
+-- is what makes it usable on a database you do not control.
+
+-- Stamp the version column when the statement did not — see PROTOCOL.md §7.3
+CREATE OR REPLACE FUNCTION public.zebridge_bump_version()
+RETURNS trigger AS $$
+DECLARE
+    col text := TG_ARGV[0];
+BEGIN
+    -- Only when this statement left the version alone. A writer that DID set it — the
+    -- bridge, which sends the client's value and clamps it (§7.3), or a well-behaved ORM —
+    -- keeps what it wrote. Overwriting unconditionally would make the version
+    -- server-assigned and quietly discard the value the client was told to send back.
+    IF (to_jsonb(OLD) -> col) IS NOT DISTINCT FROM (to_jsonb(NEW) -> col) THEN
+        -- jsonb round trip because plpgsql cannot assign to a column named at runtime.
+        -- One conversion per updated row, on tables the operator opted in.
+        NEW := jsonb_populate_record(NEW, jsonb_build_object(col, now()));
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Turn a physical DELETE into a tombstone — see PROTOCOL.md §7.5
+CREATE OR REPLACE FUNCTION public.zebridge_soft_delete()
+RETURNS trigger AS $$
+DECLARE
+    tombstone text := TG_ARGV[0];
+    version   text := TG_ARGV[1];
+BEGIN
+    -- The sweeper MUST get through, or tombstones accumulate forever and the reaping this
+    -- whole design depends on can never happen. It identifies itself the same way every
+    -- other writer does — `zb.principal`, the setting the RLS policies read — so no new
+    -- mechanism is needed here.
+    IF coalesce(current_setting('zb.principal', true), '') = 'zb_sweeper' THEN
+        RETURN OLD;
+    END IF;
+
+    -- Located by `ctid`, not by primary key: the key columns are not known here without a
+    -- catalog lookup per row, and the tuple's physical address is stable for the statement
+    -- that is deleting it.
+    --
+    -- The version is stamped too, not just the tombstone. A soft delete that did not move
+    -- the version would be refused by the next edge write's LWW guard — the row would read
+    -- as deleted while still accepting edits.
+    EXECUTE format(
+        'UPDATE %I.%I SET %I = now(), %I = now() WHERE ctid = $1',
+        TG_TABLE_SCHEMA, TG_TABLE_NAME, tombstone, version
+    ) USING OLD.ctid;
+
+    -- Suppress the DELETE. The UPDATE above is what reaches CDC, so clients see the
+    -- tombstone rather than a physical removal they cannot overrule.
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach both to one table — see PROTOCOL.md §7.3
+--
+-- The column names must match this table's SYNC_RULES entry in the bridge's environment.
+-- They are the same contract stated in two places and nothing cross-checks them: name a
+-- different column here and the bridge and the database disagree about what "version"
+-- means, with no error. `zebridge_audit_write_guards()` reports what is actually attached
+-- so the two can be compared.
+CREATE OR REPLACE FUNCTION public.zebridge_install_write_guards(
+    tbl regclass,
+    version_col text,
+    tombstone_col text DEFAULT NULL
+)
+RETURNS void AS $$
+DECLARE
+    t text := tbl::text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = tbl
+                   AND attname = version_col AND attnum > 0 AND NOT attisdropped) THEN
+        RAISE EXCEPTION '% has no column %', t, version_col;
+    END IF;
+
+    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_bump_version_t ON %s', t);
+    EXECUTE format(
+        'CREATE TRIGGER zebridge_bump_version_t BEFORE UPDATE ON %s '
+        'FOR EACH ROW EXECUTE FUNCTION public.zebridge_bump_version(%L)', t, version_col
+    );
+    RAISE NOTICE 'version guard on %: % is stamped even when a writer forgets', t, version_col;
+
+    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_soft_delete_t ON %s', t);
+    IF tombstone_col IS NOT NULL THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = tbl
+                       AND attname = tombstone_col AND attnum > 0 AND NOT attisdropped) THEN
+            RAISE EXCEPTION '% has no column %', t, tombstone_col;
+        END IF;
+        EXECUTE format(
+            'CREATE TRIGGER zebridge_soft_delete_t BEFORE DELETE ON %s '
+            'FOR EACH ROW EXECUTE FUNCTION public.zebridge_soft_delete(%L, %L)',
+            t, tombstone_col, version_col
+        );
+        RAISE NOTICE 'delete guard on %: DELETE writes % instead of removing the row', t, tombstone_col;
+    ELSE
+        -- No tombstone column means deletes are physical for this table — the documented
+        -- weaker guarantee, not an oversight. Saying so beats silence.
+        RAISE NOTICE 'no tombstone for %: deletes stay physical, so an offline client can resurrect a row', t;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Take the guards off again — the counterpart, and needed more often than it looks
+--
+-- ⚠️ Once the delete guard is on, **nobody but the sweeper can physically delete from this
+-- table**. An admin running `DELETE FROM t WHERE …` in psql gets a tombstone, not a
+-- removal. That is the whole point, and it is also a genuine surprise the first time it
+-- happens during a cleanup. Two ways out, in order of preference:
+--
+--   SELECT set_config('zb.principal', 'zb_sweeper', false);   -- for this session only
+--   SELECT zebridge_remove_write_guards('public.t');          -- permanently
+CREATE OR REPLACE FUNCTION public.zebridge_remove_write_guards(tbl regclass)
+RETURNS void AS $$
+DECLARE
+    t text := tbl::text;
+BEGIN
+    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_bump_version_t ON %s', t);
+    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_soft_delete_t ON %s', t);
+    RAISE NOTICE 'write guards removed from %: versions are only as true as their writers again', t;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Answers "which tables are guarded, and on which columns?" — compare against SYNC_RULES
+CREATE OR REPLACE FUNCTION public.zebridge_audit_write_guards()
+RETURNS TABLE (tbl text, version_guard boolean, delete_guard boolean, detail text) AS $$
+    SELECT c.relname::text,
+           EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid
+                   AND g.tgname = 'zebridge_bump_version_t'),
+           EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid
+                   AND g.tgname = 'zebridge_soft_delete_t'),
+           coalesce((SELECT string_agg(pg_get_triggerdef(g.oid), ' | ')
+                     FROM pg_trigger g WHERE g.tgrelid = c.oid
+                       AND g.tgname LIKE 'zebridge_%'), '')
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r'
+      -- Prefix test rather than `zebridge_is_internal_table()`: a LANGUAGE sql body is
+      -- validated when it is CREATEd, so calling a function declared later in this file
+      -- fails the whole script. Caught by scripts/scenarios/render.py, which applies the
+      -- rendered SQL to a scratch database rather than trusting that it parses.
+      AND c.relname NOT LIKE 'zebridge%'
+    ORDER BY c.relname;
+$$ LANGUAGE sql STABLE;
+
+
+-- ---------------------------------------------------------
 -- Per-tenant scoping — ONE entry point, on purpose
 -- ---------------------------------------------------------
 --
