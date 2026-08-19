@@ -1025,7 +1025,10 @@ pub const SnapshotListener = struct {
             // (boot pass, DDL path, and this on-demand responder); a guard on two of
             // three still leaks a live schema for a table that will never send rows.
             if (refused.isRefused(table_name)) {
-                log.warn("📋 Withholding schema for refused table '{s}' (no primary key)", .{table_name});
+                log.warn(
+                    "📋 Withholding schema for refused table '{s}' ({s})",
+                    .{ table_name, if (refused.reasonFor(table_name)) |r| r.wireName() else "refused" },
+                );
                 continue;
             }
 
@@ -1349,14 +1352,30 @@ pub const SnapshotListener = struct {
                     // seeding from it would populate a client table built from a shape
                     // Postgres no longer has. Checked before monitoring, because
                     // "refused" is the more specific and more actionable answer.
-                    if (refused.isRefused(table_name)) {
-                        log.warn("📸 Table '{s}' is refused (no primary key) — publishing error", .{table_name});
+                    if (refused.reasonFor(table_name)) |reason| {
+                        // ⚠️ The *actual* reason, not a guess. This used to say "no primary
+                        // key" for every refusal, which sent operators to fix the one thing
+                        // that was not wrong: a table suspended for `row_too_large` has a
+                        // perfectly good key.
+                        log.warn(
+                            "📸 Table '{s}' is refused ({s}) — publishing error. Fix: {s}",
+                            .{ table_name, reason.wireName(), reason.fixHint() },
+                        );
+                        // Stack, not allocator: the longest reason and hint together are
+                        // well under this, and a fallible allocation on an error path is
+                        // how an error report becomes a second error.
+                        var detail_buf: [512]u8 = undefined;
+                        const detail = std.fmt.bufPrint(
+                            &detail_buf,
+                            "Table is refused ({s}): replication is suspended, so no snapshot can be served. {s}",
+                            .{ reason.wireName(), reason.fixHint() },
+                        ) catch "Table is refused: replication is suspended, so no snapshot can be served";
                         publishSnapshotError(
                             allocator,
                             &snap_conn,
                             table_name,
                             "table_refused",
-                            "Table has no primary key: replication is suspended, so no snapshot can be served",
+                            detail,
                             monitored_tables,
                             format,
                             topo,

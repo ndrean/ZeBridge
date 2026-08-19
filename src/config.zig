@@ -247,6 +247,28 @@ pub const Batch = struct {
     pub const max_age_ms = 500;
 
     pub const max_payload_bytes = 256 * 1024; // 256KB
+
+    /// Columns one CDC event can carry.
+    ///
+    /// ⚠️ **This is the dominant term in the bridge's memory**, and not obviously so.
+    /// Every event in the ring carries a fixed `[max_columns]ColumnView` array — the same
+    /// size whether the table has three columns or all of them — so the cost is
+    /// `RING_BUFFER_COUNT × max_columns × 12 bytes`, paid at startup, regardless of the
+    /// tables actually replicated.
+    ///
+    /// At 512 (where this sat after a refactor bumped it from 64 without costing it) a
+    /// ring of 262,144 events spent **1.6 GB** on column descriptors against 512 MB of
+    /// actual row data. At 128 the same ring spends 400 MB.
+    ///
+    /// ⚠️ It is a **budget, not a format limit**. PostgreSQL allows 1600 columns; a table
+    /// past this one is refused with `TooManyColumns` — loudly, with its events dropped
+    /// and its clients told a reason — rather than truncated. Raise it if you replicate
+    /// genuinely wide tables, and re-read the startup line reporting the ring's size:
+    /// the sizing guard counts this term, so it will refuse a combination that does not
+    /// fit rather than let the process be OOM-killed later.
+    ///
+    /// 128 because a table that wide is already unusual, and the widest here is 14.
+    pub const max_columns = 128;
     // NOTE: the ring buffer size lives in Buffers.default_ring_buffer_count, which is
     // what RuntimeConfig actually reads. A `Batch.ring_buffer_size` used to be
     // declared here with the sizing rationale attached, but nothing referenced it —
@@ -299,6 +321,26 @@ pub const Sync = struct {
     /// default, which is 6. Below this, ties are common — and a tie is *rejected* by
     /// `<`, so a legitimate edit is dropped in silence.
     pub const min_timestamp_precision = 6;
+
+    /// How far ahead of the database's clock a client's version may be before the bridge
+    /// caps it — PROTOCOL.md §7.2.
+    ///
+    /// A timestamp version from a skewed client is not merely wrong, it is **sticky**:
+    /// stored a year ahead, the row rejects every subsequent write (`stored < incoming`
+    /// stays false) until wall-clock time catches up, and nothing reports it. Clamping
+    /// keeps the write — the client's data is not the problem, its clock is — while
+    /// bounding how long the row can be frozen to this window.
+    ///
+    /// ⚠️ Not zero. Benign skew of a few seconds is normal between a browser and a
+    /// server, and clamping every write to `now()` would quietly relabel writes that
+    /// arrived in a legitimate order, turning a clock question into an ordering one.
+    ///
+    /// ⚠️ Compared against the **database's** `now()`, never the bridge's clock: it is
+    /// the same clock every other writer's `updated_at` comes from, and it costs nothing
+    /// because the comparison happens inside the statement.
+    ///
+    /// Applies only to timestamp version columns. An integer version has no future.
+    pub const version_future_tolerance = "5 seconds";
 };
 
 /// Snapshot generation configuration

@@ -16,6 +16,114 @@ const c = c_imports.c;
 /// broker vouched for; and the column and key names are read from `pg_attribute` /
 /// `pg_index`. Before this, `INSERT INTO "{s}"` interpolated a client-supplied string,
 /// so a table named `x" ; DROP TABLE …` closed the quote.
+/// What became of a write that PostgreSQL accepted without error — PROTOCOL.md §7.1.
+///
+/// ⚠️ All three are *successes* at the SQL level. A client cannot tell them apart from the
+/// row count alone, and the difference decides what it does with the edit still sitting in
+/// its outbox: drop it quietly, or tell the user their row is gone.
+const WriteOutcome = enum {
+    /// Rows changed. The client pops and forgets.
+    applied,
+    /// Zero rows, and the row is still there, undeleted — the last-write-wins guard
+    /// refused because a newer version is stored. The client pops **without reverting**:
+    /// the winning row arrives over CDC.
+    stale,
+    /// Zero rows because the row is not there to write: physically gone, or carrying a
+    /// tombstone. The one case LWW cannot decide for the user, so the client surfaces it.
+    row_deleted,
+
+    fn wireName(self: WriteOutcome) []const u8 {
+        return switch (self) {
+            .applied => "accepted",
+            .stale => "stale",
+            .row_deleted => "row_deleted",
+        };
+    }
+};
+
+/// Which clamp expression a version column needs, if any — PROTOCOL.md §7.2.
+///
+/// Read from `pg_attribute.atttypid` rather than guessed from the column name: the same
+/// `updated_at` is `timestamptz` in one schema and naive `timestamp` in the next, and
+/// Ecto's `timestamps(type: :utc_datetime_usec)` produces the naive one despite the name.
+const VersionType = enum {
+    /// `timestamptz` (oid 1184) — an absolute instant, comparable to `now()` directly.
+    timestamptz,
+    /// `timestamp` (oid 1114) — no zone. Compared against `now() AT TIME ZONE 'UTC'`,
+    /// because the protocol requires clients to send UTC for this column (§7.2) and
+    /// comparing against local `now()` would clamp by the server's offset.
+    timestamp_naive,
+    /// Integer, or anything else. Not clamped: "future" is meaningless for a counter, and
+    /// silently capping one would corrupt a perfectly sound version scheme.
+    other,
+
+    fn fromOid(oid: u32) VersionType {
+        return switch (oid) {
+            1184 => .timestamptz,
+            1114 => .timestamp_naive,
+            else => .other,
+        };
+    }
+
+    /// How to render the stored value so it matches what CDC puts on the wire.
+    ///
+    /// ⚠️ Not the column itself. `RETURNING "updated_at"` hands back libpq's text output —
+    /// `2026-08-19 05:54:11.363299+00`, space-separated — which is precisely the shape
+    /// PROTOCOL.md §7.2 warns clients never to match, because the bridge does not emit it
+    /// anywhere else. A client that stored a verdict's version verbatim would hold a
+    /// string that disagrees with the CDC rendering of the very same column, and its own
+    /// comparisons would quietly stop lining up with the feed.
+    ///
+    /// So the verdict is rendered here, in the same ISO 8601 shape §7.2 documents:
+    /// `T` separator, six fractional digits, and a zone suffix that follows the column
+    /// type — `Z` for `timestamptz`, nothing for naive `timestamp`.
+    fn wireFormat(self: VersionType) ?struct { prefix: []const u8, suffix: []const u8 } {
+        return switch (self) {
+            .timestamptz => .{
+                .prefix = "to_char(",
+                .suffix = " AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || 'Z'",
+            },
+            .timestamp_naive => .{
+                .prefix = "to_char(",
+                .suffix = ", 'YYYY-MM-DD\"T\"HH24:MI:SS.US')",
+            },
+            // An integer version has no notation question: it is already its own text.
+            .other => null,
+        };
+    }
+
+    /// The cast a raw parameter needs to be comparable with the stored column.
+    fn castSuffix(self: VersionType) ?[]const u8 {
+        return switch (self) {
+            .timestamptz => "::timestamptz",
+            .timestamp_naive => "::timestamp",
+            .other => null,
+        };
+    }
+
+    /// The SQL that caps a client's value at the database's clock plus the tolerance,
+    /// as the two halves that wrap the parameter placeholder. Null when the type has no
+    /// meaningful future.
+    ///
+    /// Split rather than formatted because the placeholder index is only known at
+    /// runtime, and a format string must be comptime-known.
+    fn clampExpr(self: VersionType) ?struct { prefix: []const u8, suffix: []const u8 } {
+        return switch (self) {
+            .timestamptz => .{
+                .prefix = "LEAST(",
+                .suffix = "::timestamptz, now() + interval '" ++
+                    config.Sync.version_future_tolerance ++ "')",
+            },
+            .timestamp_naive => .{
+                .prefix = "LEAST(",
+                .suffix = "::timestamp, (now() AT TIME ZONE 'UTC') + interval '" ++
+                    config.Sync.version_future_tolerance ++ "')",
+            },
+            .other => null,
+        };
+    }
+};
+
 const TableMeta = struct {
     /// Primary key columns in key order — the `ON CONFLICT` target.
     pk_cols: [][]const u8,
@@ -29,6 +137,9 @@ const TableMeta = struct {
     client_col: ?[]const u8 = null,
     /// The tombstone column, when the table has one. Null means a delete is physical.
     tombstone_col: ?[]const u8,
+    /// What the version column actually is, read from the catalog. Decides whether a
+    /// future-dated version can be clamped — an integer version has no future.
+    version_type: VersionType = .other,
     /// The catalog epoch these facts were read at. Not equal to the current epoch means
     /// DDL has crossed the replication stream since, so they are re-read rather than
     /// trusted. See `catalog_epoch.zig`.
@@ -118,6 +229,17 @@ pub const MutationListener = struct {
     last_sqlstate_len: usize = 0,
     last_error_buf: [220]u8 = undefined,
     last_error_len: usize = 0,
+    /// The version PostgreSQL actually stored, read back via `RETURNING`. Differs from
+    /// what the client sent exactly when the clamp fired, which is the case PROTOCOL.md
+    /// §7.2 promises to report. Sticky like the buffers above, and cleared with them.
+    last_version_buf: [64]u8 = undefined,
+    last_version_len: usize = 0,
+    /// True when PostgreSQL stored something other than what the client sent, which for a
+    /// successful write means the future-version clamp fired.
+    last_clamped: bool = false,
+    /// What actually became of the last successfully-executed write — the three outcomes
+    /// PROTOCOL.md §7.1 tells clients to key their outbox on.
+    last_outcome: WriteOutcome = .applied,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -381,6 +503,33 @@ pub const MutationListener = struct {
                     continue;
                 };
 
+                // ⚠️ A verdict on **every** write that PostgreSQL accepted, not only the
+                // ones that changed something. PROTOCOL.md §7.1 makes a client's outbox
+                // rule "pop only on a definitive reply", and the three definitive replies
+                // are all successes at the SQL level — `accepted`, `stale`, `row_deleted`.
+                // Publishing only on failure, which is what this did before, left a
+                // correct client unable to ever pop a successful write: it would retry
+                // forever, idempotently and invisibly.
+                //
+                // This is the one place the bridge speaks per-message rather than
+                // per-table, so it doubles ingress message count by construction. That is
+                // the cost of the outbox protocol, not an accident of this
+                // implementation — the alternative is a client that cannot distinguish
+                // "applied" from "lost in transit".
+                if (self.last_clamped) {
+                    log.info(
+                        "🕒 clamped a future version [{s}] on '{s}' → {s}",
+                        .{ mutation.principal, mutation.table, self.lastVersion() },
+                    );
+                }
+                self.publishVerdict(
+                    conn_nats,
+                    msg,
+                    mutation.principal,
+                    self.last_outcome.wireName(),
+                    if (self.last_clamped) "version_clamped" else "",
+                );
+
                 msg.ack() catch {};
             } else {
                 // Timeout, just loop again
@@ -575,8 +724,8 @@ pub const MutationListener = struct {
 
         const body = std.fmt.allocPrint(
             alloc,
-            "{{\"status\":\"{s}\",\"reason\":\"{s}\",\"sqlstate\":\"{s}\",\"detail\":\"{s}\",\"seq\":{d}}}",
-            .{ status, reason, self.lastSqlstate(), self.lastError(), seq },
+            "{{\"status\":\"{s}\",\"reason\":\"{s}\",\"sqlstate\":\"{s}\",\"detail\":\"{s}\",\"seq\":{d},\"version\":\"{s}\"}}",
+            .{ status, reason, self.lastSqlstate(), self.lastError(), seq, self.lastVersion() },
         ) catch return;
 
         // ⚠️ Outside `mutation.>`, like the dead-letter subject and for the same reason:
@@ -730,10 +879,24 @@ pub const MutationListener = struct {
     fn clearFailure(self: *MutationListener) void {
         self.last_sqlstate_len = 0;
         self.last_error_len = 0;
+        // ⚠️ The stored version is sticky for the same reason and must be cleared for the
+        // same reason: without this a write whose guard rejected it (no RETURNING row)
+        // would report the *previous* message's version as its own, which is the bug that
+        // once made a verdict quote another table's SQLSTATE.
+        self.last_version_len = 0;
+        self.last_clamped = false;
+        // Sticky like the rest: without this a write whose statement never ran
+        // would report the previous message's outcome as its own.
+        self.last_outcome = .applied;
     }
 
     fn lastSqlstate(self: *const MutationListener) []const u8 {
         return self.last_sqlstate_buf[0..self.last_sqlstate_len];
+    }
+
+    /// The version PostgreSQL stored, or empty when nothing was stored.
+    fn lastVersion(self: *const MutationListener) []const u8 {
+        return self.last_version_buf[0..self.last_version_len];
     }
 
     fn lastError(self: *const MutationListener) []const u8 {
@@ -835,7 +998,8 @@ pub const MutationListener = struct {
         // by string matching here.
         const query =
             \\SELECT a.attname,
-            \\       COALESCE(k.ord, 0) AS pk_ord
+            \\       COALESCE(k.ord, 0) AS pk_ord,
+            \\       a.atttypid::int AS type_oid
             \\FROM pg_attribute a
             \\LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
             \\LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
@@ -873,12 +1037,18 @@ pub const MutationListener = struct {
         // Key order, not column order: `ON CONFLICT (a,b)` and `(b,a)` name the same
         // index, but the cursor and every error message read better in key order.
         var ordered: [64]?[]const u8 = @splat(null);
+        // Collected in the same pass so the version column's type is known without a
+        // second query; matched by name below, once SYNC_RULES has said which it is.
+        var type_oids: std.ArrayList(u32) = .empty;
+        defer type_oids.deinit(alloc);
         var r: usize = 0;
         while (r < rows) : (r += 1) {
             const name = std.mem.span(c.PQgetvalue(res, @intCast(r), 0));
             const ord = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, @intCast(r), 1)), 10) catch 0;
+            const oid = std.fmt.parseInt(u32, std.mem.span(c.PQgetvalue(res, @intCast(r), 2)), 10) catch 0;
             const owned = try alloc.dupe(u8, name);
             try columns.append(alloc, owned);
+            try type_oids.append(alloc, oid);
             if (ord > 0 and ord <= ordered.len) ordered[ord - 1] = owned;
         }
         for (ordered) |maybe| {
@@ -901,10 +1071,19 @@ pub const MutationListener = struct {
             if (cols.len > 2) client_name = cols[2];
         }
 
+        var version_type: VersionType = .other;
+        for (columns.items, 0..) |col, i| {
+            if (std.mem.eql(u8, col, version_name)) {
+                version_type = VersionType.fromOid(type_oids.items[i]);
+                break;
+            }
+        }
+
         var meta = TableMeta{
             .pk_cols = try pk.toOwnedSlice(alloc),
             .columns = try columns.toOwnedSlice(alloc),
             .version_col = try alloc.dupe(u8, version_name),
+            .version_type = version_type,
             .client_col = if (client_name) |cn| try alloc.dupe(u8, cn) else null,
             .tombstone_col = if (tombstone_name) |t| try alloc.dupe(u8, t) else null,
         };
@@ -1033,8 +1212,112 @@ pub const MutationListener = struct {
 
         switch (mutation.operation) {
             .delete => try self.applyDelete(alloc, conn, meta, mutation, key_values.items, version_text),
-            .insert, .update => try self.applyUpsert(alloc, conn, meta, mutation, map, version_text),
+            .insert, .update => try self.applyUpsert(alloc, conn, meta, mutation, map, version_text, key_values.items),
         }
+    }
+
+    /// "Is the row there, and is it deleted?" — asked of the same transaction, so its
+    /// answer describes the state the write left behind.
+    ///
+    /// ⚠️ This exists because **`stale` and `row_deleted` are indistinguishable from the
+    /// row count**: both are zero. Without it the bridge can only say "nothing changed",
+    /// and a client cannot tell "someone else edited this, drop your copy" from "the row
+    /// you are editing no longer exists, tell the user" — which PROTOCOL.md §7.1 makes it
+    /// responsible for surfacing.
+    ///
+    /// Costs no round trip: it rides the same pipeline as the write, so the whole exchange
+    /// is still one network turn. It does cost a primary-key lookup on every mutation,
+    /// including the ones that succeeded, which is the price of being able to answer
+    /// without a second exchange in the cases that did not.
+    fn buildClassify(alloc: std.mem.Allocator, meta: *const TableMeta, table: []const u8) ![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.appendSlice(alloc, "SELECT ");
+        if (meta.tombstone_col) |tombstone| {
+            try appendIdent(&out, alloc, tombstone);
+            try out.appendSlice(alloc, " IS NOT NULL");
+        } else {
+            // No tombstone column, so the only kind of "deleted" this table has is the
+            // row being absent — which the empty result already says.
+            try out.appendSlice(alloc, "false");
+        }
+        try out.appendSlice(alloc, " AS zb_deleted FROM ");
+        try appendIdent(&out, alloc, table);
+        try out.appendSlice(alloc, " WHERE ");
+        for (meta.pk_cols, 0..) |col, i| {
+            if (i > 0) try out.appendSlice(alloc, " AND ");
+            try appendIdent(&out, alloc, col);
+            try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " = ${d}", .{i + 1}));
+        }
+        return out.items;
+    }
+
+    /// `RETURNING "version"` — plus, when the column can be clamped, a boolean saying
+    /// whether it *was*.
+    ///
+    /// ⚠️ The comparison is made by PostgreSQL against the raw parameter, not in Zig
+    /// against the returned text. The two are the same instant in different notations
+    /// (`2026-08-19T05:12:33.123456Z` from the client, `2026-08-19 05:12:33.123456+00`
+    /// back from libpq), so a string comparison would report every single write as
+    /// clamped.
+    fn buildReturning(
+        alloc: std.mem.Allocator,
+        meta: *const TableMeta,
+        version_param: usize,
+    ) ![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.appendSlice(alloc, " RETURNING ");
+        if (meta.version_type.wireFormat()) |wire| {
+            try out.appendSlice(alloc, wire.prefix);
+            try appendIdent(&out, alloc, meta.version_col);
+            try out.appendSlice(alloc, wire.suffix);
+        } else {
+            try appendIdent(&out, alloc, meta.version_col);
+        }
+        if (meta.version_type.castSuffix()) |cast| {
+            try out.appendSlice(alloc, ", (");
+            try appendIdent(&out, alloc, meta.version_col);
+            try out.appendSlice(alloc, try std.fmt.allocPrint(
+                alloc,
+                " IS DISTINCT FROM ${d}{s}) AS zb_clamped",
+                .{ version_param, cast },
+            ));
+        }
+        return out.items;
+    }
+
+    /// `$n`, or the clamped form when this is a timestamp version column.
+    ///
+    /// PROTOCOL.md §7.2 tells clients "do not send a future timestamp… the bridge clamps
+    /// and tells you what it used", and until this existed the bridge did neither. The
+    /// consequence of not clamping is not a bad value, it is a **frozen row**: a version
+    /// stored a year ahead makes `stored < incoming` false for every later write, from
+    /// every client, with no error anywhere — the row simply stops accepting edits until
+    /// wall-clock time passes it.
+    ///
+    /// ⚠️ Clamped in SQL rather than in Zig, deliberately. The comparison must be against
+    /// the **database's** clock, because that is the clock every other writer's version
+    /// comes from; a bridge-side check would compare against a third clock and could
+    /// itself be skewed. It also costs no round trip, being part of the statement.
+    ///
+    /// ⚠️ The value is still a parameter. Only the *expression around* it is generated,
+    /// so nothing client-supplied is ever concatenated into SQL.
+    fn renderValuePlaceholder(
+        alloc: std.mem.Allocator,
+        meta: *const TableMeta,
+        col: []const u8,
+        n: usize,
+    ) ![]const u8 {
+        if (!std.mem.eql(u8, col, meta.version_col)) {
+            return try std.fmt.allocPrint(alloc, "${d}", .{n});
+        }
+        return renderVersionExpr(alloc, meta, n);
+    }
+
+    /// `$n` wrapped in this table's clamp, or bare when the version type has no future.
+    fn renderVersionExpr(alloc: std.mem.Allocator, meta: *const TableMeta, n: usize) ![]const u8 {
+        const placeholder = try std.fmt.allocPrint(alloc, "${d}", .{n});
+        const clamp = meta.version_type.clampExpr() orelse return placeholder;
+        return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ clamp.prefix, placeholder, clamp.suffix });
     }
 
     /// INSERT … ON CONFLICT (<catalog pk>) DO UPDATE … WHERE stored.version < incoming.
@@ -1050,6 +1333,7 @@ pub const MutationListener = struct {
         mutation: Mutation,
         map: anytype,
         version_text: [*:0]const u8,
+        key_values: []const ?[*:0]const u8,
     ) !void {
         const data_val = map.getByString("data") orelse return error.MissingData;
         if (data_val != .map) return error.InvalidDataFormat;
@@ -1112,9 +1396,9 @@ pub const MutationListener = struct {
             try appendIdent(&sql, alloc, col);
         }
         try sql.appendSlice(alloc, ") VALUES (");
-        for (cols.items, 0..) |_, i| {
+        for (cols.items, 0..) |col, i| {
             if (i > 0) try sql.appendSlice(alloc, ", ");
-            try sql.appendSlice(alloc, try std.fmt.allocPrint(alloc, "${d}", .{i + 1}));
+            try sql.appendSlice(alloc, try renderValuePlaceholder(alloc, meta, col, i + 1));
         }
         try sql.appendSlice(alloc, ") ON CONFLICT (");
         for (meta.pk_cols, 0..) |col, i| {
@@ -1180,7 +1464,23 @@ pub const MutationListener = struct {
             try sql.appendSlice(alloc, ", ''))");
         }
 
-        try self.exec(alloc, conn, mutation, sql.items, vals.items);
+        var version_param: usize = 0;
+        for (cols.items, 0..) |col, i| {
+            if (std.mem.eql(u8, col, meta.version_col)) {
+                version_param = i + 1;
+                break;
+            }
+        }
+        try self.exec(
+            alloc,
+            conn,
+            mutation,
+            sql.items,
+            vals.items,
+            try buildReturning(alloc, meta, version_param),
+            try buildClassify(alloc, meta, mutation.table),
+            key_values,
+        );
     }
 
     /// A delete from the edge is an **UPDATE**, not a DELETE and not an upsert.
@@ -1206,14 +1506,27 @@ pub const MutationListener = struct {
         var sql: std.ArrayListUnmanaged(u8) = .empty;
         var params: std.ArrayList(?[*:0]const u8) = .empty;
 
+        // `$1` capped at the database's clock, exactly as the upsert caps it — see
+        // `renderValuePlaceholder`. Used for the guard too, so the value a delete is
+        // *compared* by is the value it would *store*; clamping only one of the two
+        // would let a skewed client win a comparison it then does not record.
+        //
+        // ⚠️ The tombstone gets the same clamped expression. A future `deleted_at` is not
+        // cosmetic: the sweeper reaps on `deleted_at < now() - threshold`, so a row
+        // tombstoned a year ahead is never reaped and the soft delete never completes.
+        const version_expr = try renderVersionExpr(alloc, meta, 1);
+
         if (meta.tombstone_col) |tombstone| {
             try sql.appendSlice(alloc, "UPDATE ");
             try appendIdent(&sql, alloc, mutation.table);
             try sql.appendSlice(alloc, " SET ");
             try appendIdent(&sql, alloc, tombstone);
-            try sql.appendSlice(alloc, " = $1, ");
+            try sql.appendSlice(alloc, " = ");
+            try sql.appendSlice(alloc, version_expr);
+            try sql.appendSlice(alloc, ", ");
             try appendIdent(&sql, alloc, meta.version_col);
-            try sql.appendSlice(alloc, " = $1");
+            try sql.appendSlice(alloc, " = ");
+            try sql.appendSlice(alloc, version_expr);
             try params.append(alloc, version_text);
         } else {
             try sql.appendSlice(alloc, "DELETE FROM ");
@@ -1233,9 +1546,20 @@ pub const MutationListener = struct {
         try appendIdent(&sql, alloc, meta.version_col);
         try sql.appendSlice(alloc, " IS NULL OR ");
         try appendIdent(&sql, alloc, meta.version_col);
-        try sql.appendSlice(alloc, " < $1)");
+        try sql.appendSlice(alloc, " < ");
+        try sql.appendSlice(alloc, version_expr);
+        try sql.appendSlice(alloc, ")");
 
-        try self.exec(alloc, conn, mutation, sql.items, params.items);
+        try self.exec(
+            alloc,
+            conn,
+            mutation,
+            sql.items,
+            params.items,
+            try buildReturning(alloc, meta, 1),
+            try buildClassify(alloc, meta, mutation.table),
+            key_values,
+        );
     }
 
     /// Run the statement, and heal the catalog cache when the schema has moved.
@@ -1246,8 +1570,26 @@ pub const MutationListener = struct {
         mutation: Mutation,
         sql: []const u8,
         params: []const ?[*:0]const u8,
+        /// Already-built `RETURNING …`, because only the caller knows which parameter
+        /// index carries the version.
+        returning: []const u8,
+        /// Third statement in the pipeline: what state the row is in afterwards. See
+        /// `buildClassify` — it is what separates `stale` from `row_deleted`.
+        classify_sql: []const u8,
+        classify_params: []const ?[*:0]const u8,
     ) !void {
-        const sql_z = try alloc.dupeZ(u8, sql);
+        // ⚠️ `RETURNING` the version is not decoration: PROTOCOL.md §7.2 promises the
+        // bridge "tells you what it used", and after a clamp the value the client sent is
+        // not the value stored. Reading it back from the statement is the only account
+        // that cannot drift — a bridge-side calculation would be guessing at what
+        // PostgreSQL's `now()` was at the moment it evaluated.
+        //
+        // Returns no row when the last-write-wins guard rejects the write, which is the
+        // same signal as the zero row count already handled below.
+        var full: std.ArrayListUnmanaged(u8) = .empty;
+        try full.appendSlice(alloc, sql);
+        try full.appendSlice(alloc, returning);
+        const sql_z = try alloc.dupeZ(u8, full.items);
         log.debug("mutation [{s}] {s}", .{ mutation.principal, sql_z });
 
         // ── The principal, handed to PostgreSQL so its policies can use it ──────────
@@ -1318,6 +1660,16 @@ pub const MutationListener = struct {
                 null,
                 0,
             ) != 1 or
+            c.PQsendQueryParams(
+                conn,
+                (alloc.dupeZ(u8, classify_sql) catch return error.MutationFailed).ptr,
+                @intCast(classify_params.len),
+                null,
+                if (classify_params.len > 0) &classify_params[0] else null,
+                null,
+                null,
+                0,
+            ) != 1 or
             c.PQpipelineSync(conn) != 1)
         {
             const msg_ptr = c.PQerrorMessage(conn);
@@ -1334,6 +1686,8 @@ pub const MutationListener = struct {
         var failed = false;
         var affected_buf: [24]u8 = undefined;
         var affected_len: usize = 0;
+        var row_exists = false;
+        var row_tombstoned = false;
 
         while (true) {
             const r = c.PQgetResult(conn);
@@ -1341,8 +1695,8 @@ pub const MutationListener = struct {
                 stmt_idx += 1;
                 // Defensive: a connection that dies mid-drain returns null forever, and
                 // the loop must not become the way the listener thread stops responding.
-                // Two statements plus the sync means an honest run never reaches 4.
-                if (stmt_idx > 4) {
+                // Three statements plus the sync means an honest run never reaches 5.
+                if (stmt_idx > 5) {
                     failed = true;
                     self.rememberFailure("", "connection closed while reading pipeline results");
                     log.err("🔴 Pipeline drained without a sync point for [{s}] — connection lost?", .{mutation.principal});
@@ -1398,12 +1752,36 @@ pub const MutationListener = struct {
                 continue;
             }
 
+            // The third statement answers "is the row there, and is it deleted".
+            if (stmt_idx == 2) {
+                row_exists = c.PQntuples(r) > 0;
+                if (row_exists and c.PQgetisnull(r, 0, 0) == 0) {
+                    row_tombstoned = std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 0)), "t");
+                }
+                continue;
+            }
+
             // The upsert is the second statement, and its tag carries the row count.
             // Copied out now because the result is cleared at the end of this iteration.
             if (stmt_idx == 1) {
                 const tuples = std.mem.span(c.PQcmdTuples(r));
                 affected_len = @min(tuples.len, affected_buf.len);
                 @memcpy(affected_buf[0..affected_len], tuples[0..affected_len]);
+
+                // The version PostgreSQL settled on, from `RETURNING`. Absent when the
+                // guard rejected the write, in which case nothing was stored and there is
+                // nothing to report.
+                if (c.PQntuples(r) > 0 and c.PQgetisnull(r, 0, 0) == 0) {
+                    const stored = std.mem.span(c.PQgetvalue(r, 0, 0));
+                    self.last_version_len = @min(stored.len, self.last_version_buf.len);
+                    @memcpy(self.last_version_buf[0..self.last_version_len], stored[0..self.last_version_len]);
+
+                    // Second column, present only for clampable types: PostgreSQL's own
+                    // verdict on whether it changed the client's value.
+                    if (c.PQnfields(r) > 1 and c.PQgetisnull(r, 0, 1) == 0) {
+                        self.last_clamped = std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 1)), "t");
+                    }
+                }
             }
         }
 
@@ -1412,11 +1790,22 @@ pub const MutationListener = struct {
         // 0 rows means the guard rejected it: the stored version is newer, so this write
         // lost. Not an error — it is last-write-wins working — but invisible to the
         // client until the reply channel exists.
+        // Zero rows is not a failure — it is last-write-wins working — but *which* of the
+        // two zero-row outcomes it is decides what the client does with the edit still in
+        // its outbox, and only the row's state can say. PROTOCOL.md §7.1.
         const affected = affected_buf[0..affected_len];
-        if (std.mem.eql(u8, affected, "0")) {
-            log.info("↩️  stale mutation [{s}] on '{s}': a newer version is stored", .{ mutation.principal, mutation.table });
-        } else {
+        if (!std.mem.eql(u8, affected, "0")) {
+            self.last_outcome = .applied;
             log.info("✅ mutation applied [{s}] on '{s}' ({s} row)", .{ mutation.principal, mutation.table, affected });
+        } else if (!row_exists or row_tombstoned) {
+            self.last_outcome = .row_deleted;
+            log.info(
+                "🪦 mutation on a deleted row [{s}] on '{s}': {s}",
+                .{ mutation.principal, mutation.table, if (row_exists) "tombstoned" else "row is gone" },
+            );
+        } else {
+            self.last_outcome = .stale;
+            log.info("↩️  stale mutation [{s}] on '{s}': a newer version is stored", .{ mutation.principal, mutation.table });
         }
     }
 

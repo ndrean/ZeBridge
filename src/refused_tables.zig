@@ -191,6 +191,18 @@ pub const Registry = struct {
         }
     }
 
+    /// Why this table is refused, or null if it is not.
+    ///
+    /// ⚠️ Exists because reporting the wrong reason is worse than reporting none. The
+    /// snapshot path used to announce every refusal as "no primary key", so a table
+    /// suspended for `row_too_large` sent its operator to add a key it already had —
+    /// measured on a 256 KiB-per-row fixture whose snapshot was refused with a message
+    /// naming the one thing that was not wrong with it.
+    pub fn reasonFor(self: *const Registry, table: []const u8) ?Reason {
+        const e = self.find(table) orelse return null;
+        return if (e.active.load(.acquire)) e.reason else null;
+    }
+
     /// True if this table is refused; also counts the event as dropped.
     ///
     /// Combining the test and the count is deliberate: a caller that asks the question

@@ -58,9 +58,19 @@ const usage =
 /// Signals that `--help` was handled and the process should exit cleanly.
 pub const HelpRequested = error{HelpRequested};
 
-/// Read an unsigned integer from the environment, falling back to `default` when
-/// unset, unparseable, or outside [min, max]. Never fails: a bad tunable should
-/// warn and use the documented default, not stop the bridge from starting.
+/// Read an unsigned integer from the environment. Never fails: a bad tunable should warn
+/// and carry on, not stop the bridge from starting.
+///
+/// ⚠️ **Unset or unparseable falls back to the default; out-of-range CLAMPS.** They are
+/// different signals and used to be treated alike. `banana` carries no intent, so the
+/// default is the only sensible answer — but `RING_BUFFER_COUNT=64` carries a *direction*:
+/// "less memory". Substituting the default gave 65536, a thousand times **more** than was
+/// asked for, which at BASE_BUF=19 is a 32 GB ring that the sizing check then refuses
+/// outright. The leniency produced both a fatal error and an unrecognisable one — the
+/// operator sees a number they never typed.
+///
+/// Clamping keeps the never-fail property and moves toward the intent instead of away
+/// from it.
 fn envUint(
     comptime T: type,
     init: *const std.process.Init,
@@ -78,8 +88,9 @@ fn envUint(
         return default;
     };
     if (parsed < min or parsed > max) {
-        log.warn(name ++ "={d} out of range ({d}-{d}), using default: {d}", .{ parsed, min, max, default });
-        return default;
+        const clamped = @min(@max(parsed, min), max);
+        log.warn(name ++ "={d} out of range ({d}-{d}), clamped to {d}", .{ parsed, min, max, clamped });
+        return clamped;
     }
     log.info(name ++ "={d}", .{parsed});
     return parsed;
@@ -264,10 +275,15 @@ pub const Args = struct {
                     runtime_config.event_data_buffer_log2 = buf_log2;
                     log.info("BASE_BUF={d} → event buffer size: {d} bytes ({d}KB)", .{ buf_log2, buf_size, buf_size / 1024 });
                 } else {
-                    log.warn("BASE_BUF={d} out of range (10-20), using default: {d} ({}KB)", .{
+                    // Clamped, not defaulted — see `envUint`. Asking for 25 means "as big
+                    // as you can", and 8 means "as small as you can"; the default answers
+                    // neither.
+                    const clamped: u6 = @min(@max(buf_log2, 10), 20);
+                    runtime_config.event_data_buffer_log2 = clamped;
+                    log.warn("BASE_BUF={d} out of range (10-20), clamped to {d} ({}KB)", .{
                         buf_log2,
-                        runtime_config.event_data_buffer_log2,
-                        (@as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2)) / 1024,
+                        clamped,
+                        (@as(usize, 1) << @intCast(clamped)) / 1024,
                     });
                 }
             } else |err| {
@@ -294,9 +310,11 @@ pub const Args = struct {
                     runtime_config.batch_ring_buffer_size = count;
                     log.info("RING_BUFFER_COUNT={d} events", .{count});
                 } else {
-                    log.warn("RING_BUFFER_COUNT={d} out of range (1024-1048576), using default: {d}", .{
+                    const clamped = @min(@max(count, 1024), 1024 * 1024);
+                    runtime_config.batch_ring_buffer_size = clamped;
+                    log.warn("RING_BUFFER_COUNT={d} out of range (1024-1048576), clamped to {d}", .{
                         count,
-                        runtime_config.batch_ring_buffer_size,
+                        clamped,
                     });
                 }
             } else |err| {

@@ -202,18 +202,43 @@ pub const CDCEvent = struct {
     // Note: data_buffer.len is the limit (no separate field needed)
 
     // Fixed array of column descriptors (indices into data_buffer)
-    // Maximum 64 columns per event
-    // columns: [64]ColumnView = undefined,
-    columns: [512]ColumnView = undefined, // UPDATE to 512 columns
-    column_count: u8 = 0,
+    columns: [max_columns]ColumnView = undefined,
+    /// ⚠️ `u16`, not `u8`. The array holds 512 and the guard in `addColumn` tests against
+    /// 512, but a `u8` counter panics on increment at 255 — so the guard could never fire
+    /// and a wide table crashed before reaching the error it was written to return.
+    column_count: u16 = 0,
+
+    /// Columns one event can carry — see `config.Batch.max_columns`, which explains why
+    /// this is the dominant term in the bridge's startup memory.
+    pub const max_columns = Config.Batch.max_columns;
 
     /// Column descriptor - "fat pointer" into packed data_buffer
     pub const ColumnView = struct {
         name_len: u8,
-        name_offset: u16,
+        /// ⚠️ `u32`, not `u16`. This indexes into `data_buffer`, whose size is
+        /// `2^BASE_BUF` — 512 KB at BASE_BUF=19, far past a `u16`. It used to be `u16`,
+        /// which meant any row whose columns pushed the write offset past 65535 bytes
+        /// **panicked in Debug and was undefined behaviour in ReleaseFast**: the cast
+        /// would wrap and every later column would be read from the wrong offset, so the
+        /// event decoded as garbage with nothing reporting an error.
+        ///
+        /// Found by snapshotting a table of 256 KiB rows at BASE_BUF=19 — a configuration
+        /// the sizing guards accept as valid, which is what made it reachable.
+        name_offset: u32,
         value_tag: pgoutput.ValueTag,
         value_len: u32,
-        value_offset: u32,
+
+        /// Where this column's value starts.
+        ///
+        /// ⚠️ Derived, not stored. `addColumn` writes the name and then the value
+        /// immediately after it, so this is always `name_offset + name_len` — and storing
+        /// it cost 4 bytes in a struct that is replicated `RING_BUFFER_COUNT` times.
+        /// Widening `name_offset` to `u32` had pushed this struct from 12 to 16 bytes,
+        /// which at the default ring size is +134 MB of metadata for a field that can be
+        /// computed. Dropping it pays that back and keeps the correct offsets.
+        pub inline fn valueOffset(self: ColumnView) u32 {
+            return self.name_offset + self.name_len;
+        }
     };
 
     /// Set subject string (copies into inline buffer)
@@ -275,12 +300,13 @@ pub const CDCEvent = struct {
     /// Add column to packed buffer (zero-allocation)
     /// Packs column name and value contiguously into data_buffer
     pub fn addColumn(self: *CDCEvent, name: []const u8, value: pgoutput.DecodedValue) !void {
-        if (self.column_count >= 512) { // CHANGED FORM 64->512
+        if (self.column_count >= max_columns) {
             return error.TooManyColumns;
         }
 
-        // Pack column name
-        const name_off = @as(u16, @intCast(self.data_len));
+        // ⚠️ Bounds first, cast second. The offset used to be computed *before* this
+        // check, so an oversized row tripped the narrowing cast on the way to the error
+        // that would have described it.
         const required_size = self.data_len + name.len;
         if (required_size > self.data_buffer.len) {
             log.err("🔴 FATAL: Row size exceeds configured buffer capacity!", .{});
@@ -291,11 +317,16 @@ pub const CDCEvent = struct {
             log.err("    Solution: Increase BASE_BUF environment variable (e.g., BASE_BUF=16 for 64KB)", .{});
             return error.BufferOverflow;
         }
+        const name_off: u32 = @intCast(self.data_len);
         @memcpy(self.data_buffer[self.data_len..][0..name.len], name);
         self.data_len += name.len;
 
-        // Pack value based on type and determine value tag
-        const val_off = @as(u32, @intCast(self.data_len));
+        // Pack value based on type and determine value tag.
+        //
+        // ⚠️ The value goes immediately after the name, which is exactly what makes
+        // `ColumnView.valueOffset()` derivable. Any change that inserts padding or
+        // reorders these two writes breaks that identity silently — the decode side would
+        // read from the wrong place with no error.
         var val_len: u32 = 0;
         const value_tag: pgoutput.ValueTag = switch (value) {
             .null => .null,
@@ -372,7 +403,6 @@ pub const CDCEvent = struct {
             .name_offset = name_off,
             .value_tag = value_tag,
             .value_len = val_len,
-            .value_offset = val_off,
         };
         self.column_count += 1;
     }
@@ -837,7 +867,7 @@ pub const BatchPublisher = struct {
                 // Publish KV event directly as raw JSON
                 if (event.column_count > 0) {
                     const col_view = event.columns[0];
-                    const raw_json = event.data_buffer[col_view.value_offset..][0..col_view.value_len];
+                    const raw_json = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
                     
                     const msg_id = event.getMsgId();
                     
@@ -1131,30 +1161,30 @@ pub const BatchPublisher = struct {
             .unchanged => null,
             .null => encoder.createNull(),
             .boolean => blk: {
-                const val = event.data_buffer[col_view.value_offset] != 0;
+                const val = event.data_buffer[col_view.valueOffset()] != 0;
                 break :blk encoder.createBool(val);
             },
             .int32 => blk: {
-                const bytes = event.data_buffer[col_view.value_offset..][0..4];
+                const bytes = event.data_buffer[col_view.valueOffset()..][0..4];
                 const val = std.mem.readInt(i32, bytes, .little);
                 break :blk encoder.createInt(@intCast(val));
             },
             .int64 => blk: {
-                const bytes = event.data_buffer[col_view.value_offset..][0..8];
+                const bytes = event.data_buffer[col_view.valueOffset()..][0..8];
                 const val = std.mem.readInt(i64, bytes, .little);
                 break :blk encoder.createInt(val);
             },
             .float64 => blk: {
-                const bytes = event.data_buffer[col_view.value_offset..][0..8];
+                const bytes = event.data_buffer[col_view.valueOffset()..][0..8];
                 const val: f64 = @bitCast(bytes.*);
                 break :blk encoder.createFloat(val);
             },
             .text, .numeric, .array, .bytea, .jsonb => blk: {
-                const str = event.data_buffer[col_view.value_offset..][0..col_view.value_len];
+                const str = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
                 break :blk try encoder.createString(str);
             },
             // .jsonb => blk: {
-            //     const json_str = event.data_buffer[col_view.value_offset..][0..col_view.value_len];
+            //     const json_str = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
             //     // For JSONB columns in MessagePack mode, parse and convert to native types
             //     break :blk switch (encoder.format) {
             //         .msgpack => blk2: {
@@ -1232,3 +1262,58 @@ test "wireSize - an empty event is still charged its envelope" {
     const e = sizedEvent(0);
     try testing.expect(wireSize(&e) >= per_event_envelope_bytes);
 }
+
+test "addColumn: a column past 64 KB into the buffer keeps its offset" {
+    // ⚠️ The regression this exists for: `ColumnView.name_offset` was `u16`, so the first
+    // column written past byte 65535 of the event buffer panicked in Debug and silently
+    // wrapped in ReleaseFast — every later column then read from the wrong offset and the
+    // event decoded as garbage with no error anywhere.
+    //
+    // Only reachable at BASE_BUF >= 17, which the sizing guards accept as valid: it took a
+    // table of 256 KiB rows to reach it, and it killed the bridge outright.
+    const allocator = std.testing.allocator;
+    const buf_len = 256 * 1024;
+    const data = try allocator.alloc(u8, buf_len);
+    defer allocator.free(data);
+
+    var ev = CDCEvent{ .data_buffer = data };
+    ev.reset();
+
+    // One fat value to push the write offset well past a u16, then a normal column after
+    // it — the one whose offset used to wrap.
+    const big = try allocator.alloc(u8, 100 * 1024);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    try ev.addColumn("blob", .{ .text = big });
+    try std.testing.expect(ev.data_len > 65535);
+
+    try ev.addColumn("after", .{ .int64 = 42 });
+
+    const last = ev.columns[ev.column_count - 1];
+    try std.testing.expect(last.name_offset > 65535);
+    try std.testing.expectEqualStrings(
+        "after",
+        data[last.name_offset..][0..last.name_len],
+    );
+}
+
+test "addColumn: the column ceiling is reported, not crashed into" {
+    // `column_count` was a `u8` while the guard tested against 512, so the counter
+    // panicked on increment at 255 and `TooManyColumns` was unreachable.
+    const allocator = std.testing.allocator;
+    const data = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(data);
+
+    var ev = CDCEvent{ .data_buffer = data };
+    ev.reset();
+
+    var i: usize = 0;
+    while (i < CDCEvent.max_columns) : (i += 1) {
+        try ev.addColumn("c", .{ .int64 = 1 });
+    }
+    try std.testing.expectEqual(@as(u16, CDCEvent.max_columns), ev.column_count);
+    try std.testing.expectError(error.TooManyColumns, ev.addColumn("one_too_many", .{ .int64 = 1 }));
+}
+
+
+

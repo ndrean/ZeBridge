@@ -364,9 +364,12 @@ refactor, or a migration — and most of the defects found while building this w
 | claim | where |
 | --- | --- |
 | grant vs schema disagreement; refusal reports SQLSTATE 42501 | ✅ `scripts/scenarios/writable.py` |
-| mutation envelope round trip | ✅ `scripts/scenarios/mutate.py`, `web-consumer/zb-mutate.mjs` |
+| a future-dated version is clamped to `now()` + tolerance, and the client is told what was stored | ✅ `scripts/scenarios/clamp.py` — asserts the cap, that the row unfreezes once the window passes, the verdict's wire format, and that a within-tolerance version is left untouched |
+| every accepted write gets one definitive reply, and `stale` is distinguished from `row_deleted` | ✅ `scripts/scenarios/replies.py` — both zero-row outcomes produced deliberately, plus the first-write case that must not be mistaken for a grave |
+| mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `web-consumer/zb-mutate.mjs` |
 | the principal reaches RLS: `set_config` and the upsert share one transaction, now the pipeline's implicit one | ✅ `scripts/scenarios/writable.py`, `tiebreak.py`, `invalidate.py` — every RLS-scoped write would be refused if it did not |
 | client's JetStream permission set is complete | ✅ `web-consumer/zb-probe.mjs` |
+| snapshot memory is bounded by the message budget rather than the table; an unpublishable row is refused before transfer; an aborted snapshot leaves nothing reachable | ✅ `scripts/scenarios/wide.py` — 9 assertions. 52 MB of table cost +6.8 MB RSS and 522 MB cost +12.0 MB, measured against one shared baseline |
 | snapshot key order matches PostgreSQL's `ORDER BY`; chunks fit `max_payload` | ✅ `scripts/scenarios/snapshot.py` |
 | one snapshot request per table per window | ✅ `scripts/scenarios/stampede.py` |
 | a schema change reaches every cache: KV schema, relation decode, refusal registry, write-path catalog | ✅ `scripts/scenarios/invalidate.py` — found the added-column half unwritable until restart, and verified to *fail* before the fix |

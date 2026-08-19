@@ -1,26 +1,35 @@
 # ZeBridge server PostgreSQL  ↔ NATS
 
-<img width="755" height="433" alt="Screenshot 2025-12-26 at 02 37 57" src="https://github.com/user-attachments/assets/b3701ef4-2d58-497a-be21-52ad1b970644" />
+<p align="center"><img  width="355" height="233" alt="Screenshot 2025-12-26 at 02 37 57" src="https://github.com/user-attachments/assets/b3701ef4-2d58-497a-be21-52ad1b970644" /></p>
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-ZeBridge is an opinionated bidirectional daemon connecting `PostgreSQL` (14+) to the message broker `NATS/JetStream` (2.14+) for Edge sync.
+**What is it?**: ZeBridge is an opinionated bidirectional daemon connecting `PostgreSQL` (14+, `pgoutput` binary mode) to the message broker `NATS/JetStream` (2.14+) for Edge sync.
 
-Allows mobile, WASM ([PGLite](https://github.com/electric-sql/pglite), [SQLite](https://sqlite.org/wasm/doc/trunk/index.md)) web apps or microservices to mirror locally Postgres tables via NATS/JS without ever reaching for Postgres.
+**What can it do?**: Allows mobile, WASM ([PGLite](https://github.com/electric-sql/pglite), [SQLite](https://sqlite.org/wasm/doc/trunk/index.md)) web apps or microservices to mirror locally Postgres tables via NATS/JS without ever reaching for Postgres.
 
-It is bidirectional and the **state always arrives through CDC**. It transferts Postgres CDCs and table snapshots to a NATS/JS server, and propagates Consumer local writes back to Postgres via NATS/JS, which in turn sends a CDC so that the consumer updates his local state.
+**What is it not**: a file transfer tool. Large blobs (>1 MB) is the domain of object storage.
 
-By pushing all state, caching, and rate-limiting down into NATS/JS, the ZeBridge binary is stateless toward consumers.
+It is **bidirectional**:
 
-This is **not** a file transfer tool. Large blobs (>1 MB) is the domain of object storage.
+**READ**: it transferts Postgres CDCs and table snapshots to a NATS/JS server to which your consumer is connected.
+**WRITE**: it propagates the consumer's local writes back to Postgres via NATS/JS, which in turn sends a CDC so that the consumer updates his local state.
 
-ZeBridge exposes a raw, standard protocol for NATS/JS rather than requiring a proprietary SDK. See [PROTOCOLE.md](protocole.md).
+PostgreSQL is the **source of truth for anything about the catalogue**.
+NATS is the source of truth for consumers.
+ZeBridge projects PG onto NATS, and **never reads its own output back**.
+**Consumer state always arrives through CDCs**. No optimistic WRITE.
 
-**Performance**: this single threaded binary drained 2,000,000 CDC events in under 20 s end to end (PG → NATS) in the burst benchmark below — ~100k events/s including the time PostgreSQL itself needed to write them, and ~260k events/s while the WAL loop was actually busy. See [An example of a measured throughput](#an-example-of-a-measured-throughput) for the method, and run it yourself before trusting it.
+By pushing all consumer state, caching, and rate-limiting down into NATS/JS, the ZeBridge binary is stateless toward consumers. A consumer connected to the NATS/JS server will in substance implement a state machine.
+
+**Brief description of Usage**: the DBA must prepare PostgreSQL with some mirgations, prepare your NATS/JS server. The consumer (connected to NATS/JS) must **follow a standard protocol**. It is detailled in [PROTOCOLE.md](protocole.md). Examples implementing it  - in particular for testing in a pure brwoser - are available (webapp, Python, Elixir, Go, Flutter). No proprietary SDK.
+
+**Performance**: this single threaded binary drained on localhost 2,000,000 CDC events in under 20 s end to end (PG → NATS on localhost) in the burst benchmark below — ~100k events/s including the time PostgreSQL itself needed to write them, and ~260k events/s while the WAL loop was actually busy.
+See [An example of a measured throughput](#an-example-of-a-measured-throughput) for the method, and run it yourself before trusting it.
 
 **Security**: read [SECURIY.md](security.md)
 
-**Status**: Dev stage, draft notes.
+**Status**: Dev stage, draft notes, everywhere.
 
 ## Table of Contents
 
@@ -40,9 +49,10 @@ ZeBridge exposes a raw, standard protocol for NATS/JS rather than requiring a pr
 * [Message Formats](#message-formats)
 * [Monitoring & Telemetry](#monitoring--telemetry)
 * [Safety & Guarantees](#safety--guarantees)
-* [Architecture](#architecture)
+* [Inside](#inside)
 * [Build Instructions](#build-instructions)
 * [Configuration](#configuration)
+* [Notes on nkeys](#notes-on-nkeys)
 
 ---
 
@@ -93,16 +103,20 @@ flowchart TD
     end
 ```
 
-**Roadmap**:
-
 * [x] **v 0.1.14**: Current.
-  * Uses PostgreSQL 14+, with `NATS` 2.14+ and `Zebridge` on localhost only (communicate via **TCP only**).
+  * **PG ≧ 14** (`pgoutput` binary mode starts)
+  * **`libpq` 14+ at build time** (pipeline mode). The **server** only has to speak the v3 extended query protocol, so PostgreSQL itself may be older — see Prerequisites.
+  * `NATS` 2.14+ and `Zebridge` on localhost only as plain TCP only.
   * per ZeBridge instance, memory usage can be adjusted for the table profil (size of rows, frequency of CDCs),
   * preflight schema analysis,
-  * Authorized & Writable tables: RLS, GRANT, enforced by Postgres, `SYNC_RULES`, PK, UUID and tombstone (LWW),
+  * Authorized & Writable tables: RLS, GRANT, enforced by Postgres, `SYNC_RULES`, PK, UUID, tombstone, last_writer (LWW),
   * Scoped Reads with full dump PG safety with tenant and Zebridge safety: N tenants, 1 ZeBridge instance,
   * Optional Read with full Postgres RLS safety with _! unique_ tenant, one slot: N tenants, N ZeBridge instances.
-* [ ] **v 0.1.16**: Separate READ [CDC+bootstrap] on a **standby replica** (PG ≧ 16, shared WAL stream), from WRITE on **master** and enable async snapshotting on the replica.
+  * Telemetry webserver /metrics for Prometheus
+
+**Roadmap**:
+
+* [ ] **v 0.1.16**: Separate READ [CDC+bootstrap] on a **standby replica** (PG ≧ 16, logical decoding on a standby begins, shared WAL stream), from WRITE on **master** and enable async snapshotting on the replica.
 * [ ] **v 1.0**: Remove the colocation constraint with `Zebridge` ← TLS → `NATS` (zig-nats upgrade).
 
 ## How ZeBridge compares
@@ -191,7 +205,7 @@ Ceiling is NATS/JS, the host capactiy, not ZeBridge.
 
 ❇️ Read [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages)
 
-### How to start an instance
+A ZeBridge instance is:
 
 ```txt
 One bridge instance = one replication slot 
@@ -341,13 +355,17 @@ Non-blocking (bridge continues CDC while snapshotting)
 
 ---
 
-## Local setup
+## Quick review of PG & NATS setup
 
-### PostgreSQL Setup (by admin/DBA Task eg `postgres` user)
+This paragraph is only a rough oveview of the operations needed to setup PostgreSQL and NATS/JetStream.
+In short:
 
-#### 1. Enable Logical Replication
+* you enable PG logical replication, run migrations to creates users, grants, and publication. The database itself is another separate migration from these admin setup,
+* you configure NATS to run JetStream, setup the authentication based on NKEY between ZeBridge and NATS, create streams and buckets.
 
-Add to `postgresql.conf` or Docker command:
+The exact setup is contained in [init.sql.template](#init.sql.template) and [docker-compose.full.yml](#docker-compose-full-yml) and [nats-server.conf.template](#ntas-server-conf-template).
+
+**Enable PG Logical Replication**: on host, `postgresql.conf` or in Docker command:
 
 ```sh
 wal_level = logical
@@ -357,9 +375,9 @@ max_slot_wal_keep_size = 10GB
 wal_sender_timeout = 300s  # 5 minutes
 ```
 
-#### 2. Create Publication
+Via `psql` (`psql -h localhost -p 55432 -U postgres -d postgres`) or a command in Docker:
 
-The BDA create a publication say `my_pub` on **specific tables** or **all**.
+**CREATE Publication**: the DBA creates a publication say `my_pub` on **specific tables** (or **all**).
 
 ```sql
 CREATE PUBLICATION my_pub FOR TABLE users, orders;
@@ -372,11 +390,12 @@ Or for all tables:
 CREATE PUBLICATION my_pub FOR ALL TABLES;
 ```
 
-#### 3. Create Bridge User
+**CREATE the two ZeBridge USER and GRANT**:
 
-> [!NOTE] The bridge uses a restricted "bridge_reader" user for security.
+> [!NOTE] Zebridge has restricted USERs  "bridge_reader" and "bridge_writer" for security.
 
-It should be restricted to SELECT on given tables + REPLICATION (least privilege).
+The Reader is restricted to SELECT on given tables + REPLICATION (least privilege).
+The Writer has no table operation rights.
 
 The DBA creates:
 
@@ -392,39 +411,20 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT ON TABLES TO bridge_reader;
 ```
 
-See `init.sh` for a complete setup script.
+See `init.sql.template` for a complete setup script.
 
----
-
-### NATS JetStream Setup (Admin Task)
-
-The NATS admin must enable JetStream, create two streams 'CDC' and 'INIT' and a KV store 'schemas'.
-
-#### 1. Enable JetStream
+**Enable NATS/JetStream**: The NATS admin must enable JetStream:
 
 ```sh
 nats-server -js -m 8222
-```
 
-Or via Docker:
-
-```bash
+#via Docker:
 docker run -p 4222:4222 -p 8222:8222 nats:latest -js -m 8222
 ```
 
-#### 2. Create Streams
+**ADD Streams**: create streams eg 'INIT'
 
 ```sh
-# CDC stream: Short retention for real-time events
-nats stream add CDC \
-  --subjects='cdc.>' \
-  --storage=file \
-  --retention=limits \
-  --max-age=1m \
-  --max-msgs=1000000 \
-  --max-bytes=1G \
-  --replicas=1
-
 # INIT stream: Long retention for bootstrap data
 nats stream add INIT \
   --subjects='init.>' \
@@ -436,27 +436,22 @@ nats stream add INIT \
   --replicas=1
 ```
 
-#### 3. Create KV Bucket for Schemas
+**ADD KV Bucket**: for example Schemas
 
 ```sh
 nats kv add schemas --history=10 --replicas=1
 ```
 
-#### 4. Configure Authentication NATS <-> Zebridge
-
-> The authentication between NATS and Zebridge uses NKEY. You must generate one.
-
-**Generate nkey**: use `nk -gen user -pubout`
+**Configure Authentication NATS ↔ Zebridge**: The authentication between NATS and Zebridge uses NKEY. One test pair is already provivded. You can [generate one](#notes-on-nkeys).
 
 ```txt
-# seed: private key
-UACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY
-
 # user public key:
-NATS_BRIDGE_NKEY_PUB=UDXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4
+NATS_BRIDGE_NKEY_PUB=DXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4
 ```
 
 ```yml
+# nats.conf
+
 port: 4222
 
 jetstream {
@@ -480,12 +475,7 @@ accounts {
 }
 ```
 
-See `docker-compose.yml` for a complete Docker setup with PostgreSQL + NATS.
-
-#### 5. configure Authentication NATS ↔ Consumer
-
-Prefer the JWT mechanism. Transport over TLS/WSS.
-The flow: [TODO]
+**Configure Authentication NATS ↔ Consumer**: Prefer the JWT/Operator mechanism. Transport only over TLS/WSS in production.
 
 ---
 
@@ -714,21 +704,11 @@ binary mode begins), `v0.16` needs PG 16+ (where logical decoding on a standby b
 
 #### Two families of credentials, two files
 
-The variables above are the bridge's. A second family — `PG_HOST`, `PG_PORT`, `PG_USER`,
-`PG_PASSWORD`, `PG_DB`, `POSTGRES_BRIDGE_*`, `POSTGRES_WRITER_*` — is the **admin** set:
-the superuser that `bridge-init` uses to run `init.sql` and the passwords it assigns to
-the roles it creates. The bridge does not read any of them.
-
-They used to be a fallback for the bridge's own connection, which made a missing or
-misspelled `DATABASE_URL` connect as `postgres` and look healthy doing it. That defeats
-the whole point of the split: `bridge_reader` holds SELECT + REPLICATION and is
-_physically_ unable to write, `bridge_writer` has no table privileges until a DBA opens
-one — and neither guarantee survives a process that can connect as someone else.
-
-So they live in `.env.admin` — together with `PG_PUBLISH_PORT`, `SNAP_RET_SECONDS` and
+The variables above are the bridge's. A second family — `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DB` `POSTGRES_BRIDGE_*`, `POSTGRES_WRITER_*` — is the **admin** set: the superuser that `bridge-init` uses to run `init.sql` and the passwords it assigns to the roles it creates.
+They live in `.env.admin` — together with `PG_PUBLISH_PORT`, `SNAP_RET_SECONDS` and
 the nkey's public half, all of which are read by compose or by the init containers and
-never by the bridge — while `.env.bridge` holds only what the bridge itself reads. The
-bridge refuses to start without `DATABASE_URL`:
+
+The bridge does not read any of them. The bridge reads `.env.bridge`. The bridge refuses to start without `DATABASE_URL`:
 
 ```bash
 # the stack — .env.admin only: every service compose starts is an admin task
@@ -1114,7 +1094,7 @@ ZeBridge uses a **NATS JetStream Limits Retention** policy (`--max-age=1m`, `--m
 
 ---
 
-## Architecture
+## Inside
 
 ### Thread Model (8 threads)
 
@@ -1268,50 +1248,65 @@ PostgreSQL LSN ACK
 * Wait between attempts: 2 seconds
 * Flush timeout: 10 seconds
 
-## Build Instructions
+## Local Build Instructions
 
-### Prerequisites
+### Quick first run
 
 * Zig 0.16.0 or later
 * Docker & Docker Compose (for PostgreSQL and NATS)
 * `libpq` **14 or later** — the only C dependency, linked from the system
-  (`brew install libpq` on macOS, `apk add postgresql-dev` / `apt install libpq-dev`
-  on Linux). Override its location with `zig build -Dlibpq-prefix=/path`.
+  (`brew install libpq` on macOS, `apk add postgresql-dev` / `apt install libpq-dev` on Linux). Override its location with `zig build -Dlibpq-prefix=/path`.
 
-  ⚠️ The version floor is on **libpq at build time, not on the PostgreSQL server**. The
-  write path uses pipeline mode (`PQenterPipelineMode`, libpq 14+), which the libpq
-  documentation describes as *"client-side and compatible with any server supporting the
-  v3 extended query protocol"* — so the database itself can be far older. It buys a
-  mutation costing **one** network round trip instead of four, which is the difference
-  between ~20 ms and ~80 ms per row against a remote database and is invisible when
-  PostgreSQL is on the same host.
+  ⚠️ The version floor is on **libpq at build time, not on the PostgreSQL server**.
+  The write path uses pipeline mode (`PQenterPipelineMode`, libpq 14+), which the libpq documentation describes as _"client-side and compatible with any server supporting the v3 extended query protocol"_ — so the database itself can be older (Postgres ≧ 14).
+  It buys a mutation costing **one** network round trip instead of four, which is the difference between ~20 ms and ~80 ms per row against a remote database and is invisible when PostgreSQL is on the same host.
 
-There is no vendored-library build step: the NATS client is pure Zig and lives in
-`src/nats_vendor/`.
+There is no vendored-library build step: the NATS client is pure Zig and lives in `/nats.zig`. [TODO]: mv build.zig.zon
 
-### 1. Start Infrastructure
+**NKEY**: A test public key is already supplied in _env.admin_  and its corresponding seed is used below. See [Notes on nkeys](#notes-on-nkeys) to generate your own.
+
+**Start Docker Infrastructure**: (PG, NATS, Prometheus, Grafana)
 
 ```bash
 # Start PostgreSQL with logical replication enabled
-docker compose up -d postgres
-
-# Start NATS server with JetStream enabled
-docker compose up -d nats-server nats-config-gen nats-init
+docker compose -f docker.compose.full.yml --env-file .env.admin up -d postgres
 ```
 
-### 2. Build the Bridge
+**Build and run ZeBridge on host**:
 
 ```bash
-zig build
+zig build (-Doptimize=ReleaseFast)
+#output -> ./zig-out/bin/bridge
 ```
 
-Output: `./zig-out/bin/bridge`
+```sh
+set -a && source .env.bridge && set +a && \
+NATS_NKEY_SEED="SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q" \
+LOG_LEVEL=info \
+./zig-out/bin/bridge --slot my_slot --pub my_pub
+```
 
-### 3. Run Tests
+**Run the test consumer webapp**:
+
+```sh
+cd web-consumer
+pnpm run dev
+# localhost:5173
+```
+
+**Monitoring**:
+
+Open localhost:3000
+
+( _admin|admin_, then set the password of your choice)
+
+**Run Tests**:
 
 ```bash
 zig build test
 ```
+
+`Python` and `envsubt` on host to play _/scripts/scenarios_
 
 ---
 
@@ -1359,25 +1354,39 @@ See `src/config.zig` for all tunables.
 
 ⚠️ read this one
 
-These two are not independent, and getting them wrong has a visible consequence rather than a silent one. The bridge pre-allocates one fixed-size buffer per event slot:
+These two are not independent, and getting them wrong has a visible consequence rather than a silent one. The bridge pre-allocates the ring at startup, in **two parts**:
 
 ```txt
-data slab = 2^BASE_BUF  ×  RING_BUFFER_COUNT
-             ^ max bytes    ^ number of events
-               for ONE row    buffered ahead of NATS
+ring = ( 2^BASE_BUF  +  sizeof(CDCEvent) )  ×  RING_BUFFER_COUNT
+         ^ data:         ^ metadata:            ^ number of events
+           max bytes       column descriptors,    buffered ahead
+           for ONE row     ~1.8 KB, FIXED         of NATS
 
-  12 / 65536 = 256 MB   ← defaults: 4 KB rows, ~1s of outage tolerance at 60K evt/s
-  14 / 65536 =   1 GB   ← 16 KB rows
-  20 /  1024 =   1 GB   ← 1 MB rows, minimum ring (least outage tolerance)
+  14 / 65536 = 1024 MB data +  115 MB meta = 1139 MB  ← defaults, 16 KB rows
+  12 / 65536 =  256 MB data +  115 MB meta =  371 MB  ← 4 KB rows
+  11 / 262144 = 512 MB data +  462 MB meta =  974 MB  ← many small events, ~1s at 200K evt/s
+  20 /  1024 = 1024 MB data +    1 MB meta = 1025 MB  ← 1 MB rows, minimum ring
 ```
+
+⚠️ **The metadata term does not shrink with `BASE_BUF`.** Every event carries a fixed
+`[128]ColumnView` array (`config.Batch.max_columns`) — the same size whether the table has
+three columns or a hundred. So the smaller you make the event buffer, the more the
+descriptors dominate: at `BASE_BUF=11` they are close to the data itself, and the
+temptation to buy outage tolerance by lowering `BASE_BUF` and raising the ring costs more
+than the arithmetic on the data slab suggests.
+
+⚠️ Sizing this array is the biggest single lever on the bridge's footprint. It sat at 512
+for a while, which cost **1.6 GB** of descriptors on a 262,144-slot ring against 512 MB of
+actual row data. Raise `config.Batch.max_columns` only for genuinely wide tables — a table
+past it is refused with `TooManyColumns`, loudly, rather than truncated.
 
 Each one answers a different question:
 
 * **`BASE_BUF`** (log2 bytes, range 10–20) is _how large a single row may be_. Size it
   to your widest row: a `jsonb` document, a long `text` column, a big array.
-* **`RING_BUFFER_COUNT`** (range 1024–1048576) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
+* **`RING_BUFFER_COUNT`** (range 1024–1048576, **clamped** to the nearest bound if you go outside it — an out-of-range value used to fall back to the *default*, so asking for 64 got you 65536) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
 
-Raising one and lowering the other keeps memory flat, at the cost of outage tolerance.
+> Raising one and lowering the other keeps memory flat, at the cost of outage tolerance.
 
 #### Two things checked at startup, before a byte is allocated
 
@@ -1385,20 +1394,20 @@ Both failures are silent and late if left to runtime, so the bridge refuses to s
 
 | check | refuses when | why not a warning |
 | --- | --- | --- |
-| **slab vs memory** | `2^BASE_BUF × RING_BUFFER_COUNT` exceeds half the process's memory limit | the slab is pre-allocated, so the alternative is an OOM kill under load. In a container the **cgroup limit** is read, not the host's RAM — otherwise a 1 GB slab looks fine on a 64 GB host until the 512 MB cgroup kills it |
+| **ring vs memory** | `(2^BASE_BUF + sizeof(CDCEvent)) × RING_BUFFER_COUNT` exceeds half the process's memory limit. ⚠️ This check counted only the data slab until 2026-08-19, so it under-reported by 40% at the defaults and by ~5× at low `BASE_BUF` — it would wave through a config the machine could not run | the slab is pre-allocated, so the alternative is an OOM kill under load. In a container the **cgroup limit** is read, not the host's RAM — otherwise a 1 GB slab looks fine on a 64 GB host until the 512 MB cgroup kills it |
 | **`BASE_BUF` vs `max_payload`** | `2^BASE_BUF + envelope` exceeds what the NATS server advertises | a row that size packs successfully and is then **rejected at publish time**, with nothing in the data path saying why. That is not a tuning choice, it is a configuration that cannot work |
 
 ```txt
-🔴 The event slab would be 65536 MB (BASE_BUF=20 → 1024 KB × RING_BUFFER_COUNT=65536),
-   against a 16384 MB memory limit. … Halve RING_BUFFER_COUNT for each step you raise
-   BASE_BUF.
+🔴 The ring would be 8504 MB — 2048 MB of data (BASE_BUF=11 → 2 KB × RING_BUFFER_COUNT=
+   1048576) plus 6456 MB of per-event metadata (6456 B each) — against a 16384 MB memory
+   limit. … Halve RING_BUFFER_COUNT for each step you raise BASE_BUF.
 
 🔴 BASE_BUF=20 allows a 1024 KB row, but this NATS server accepts at most 1024 KB per
    message and the envelope needs roughly 16 KB more. … Lower BASE_BUF to 19 or raise
    max_payload in nats-server.conf.
 ```
 
-On a healthy start you get the same arithmetic as a fact rather than a complaint:
+On a healthy start you get the same arithmetic as a fact:
 
 ```txt
 NATS max_payload: 1024 KB (server-advertised); per-event buffer: 16 KB (BASE_BUF=14)
@@ -1424,33 +1433,14 @@ re-seed from a fresh snapshot.
 
 #### The ceiling is NATS, not the bridge
 
-`BASE_BUF=20` is 1 MB, which is also **nats-server's default `max_payload`**. A message also carries a subject, headers and MessagePack framing, so a row sized right up to the limit is still rejected at publish time. The bridge reads the server's advertised `max_payload` from its INFO line at connect and tells you where you stand:
+`BASE_BUF=20` is 1 MB, which is also **nats-server's default** `max_payload`. A message also carries a subject, headers and MessagePack framing, so a row sized right up to the limit is still rejected at publish time. The bridge reads the server's advertised `max_payload` from its INFO line at connect and tells you where you stand:
 
 ```txt
 info(bridge): NATS max_payload: 1024 KB (server-advertised); per-event buffer: 16 KB (BASE_BUF=14)
 ```
 
 and warns if the two cannot coexist.
-Raising `max_payload` in `nats-server.conf` is possible but affects every client and every subject on that server. JetStream's memory use scales with it — so for genuinely large values, prefer keeping the blob out of the replicated table and replicating a reference to it.
-
----
-
-## Dependencies
-
-**Managed via `build.zig.zon`:**
-
-* [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding
-
-**Vendored (in `src/`):**
-
-* [g41797/nats](https://github.com/g41797/nats) — pure-Zig NATS client, patched for
-  Zig 0.16 and extended with nkey authentication. `src/nats_vendor/` is the only
-  0.16 port of it, so its own test suite runs here: `zig build test-nats`.
-* [g41797/mailbox](https://github.com/g41797/mailbox) — `src/mailbox_vendor/`
-
-**System:**
-
-* [libpq](https://www.postgresql.org/docs/current/libpq.html) — dynamically linked, so the distro's own CVE fixes apply
+Raising `max_payload` in `nats-server.conf` is possible but affects every client and every subject on that server. JetStream's memory use scales with it — so for genuinely large values, prefer **keeping the blob out of the replicated table** and replicating a reference to it (URL object storage).
 
 ---
 
@@ -1519,48 +1509,6 @@ makes this diagnosable at all:
 `recv_ms` approaching the interval length with `idle=0` is the signature of a reader
 that cannot drain its socket — the exact shape of the bug fixed in `wal_stream.zig`.
 
-### End-to-End CDC Pipeline Test
-
-**Terminal 1 - Start the bridge**:
-
-Start Postgres and NATS as containers:
-
-```sh
-docker compose -f docker-compose.prod.yml --env-file .env.prod up
-```
-
-Start the bridge:
-
-```sh
-./zig-out/bin/bridge --slot my_slot --pub cdc_slot
-```
-
-**Terminal 2 - Use th Elixir Admin app**:
-
-To migrate (on startup):
-
-```sh
-cd consumer && iex -S mix
-```
-
-and generate events:
-
-```sh
-# Generate 100 INSERT events
-iex> Producer.bulk(10)
-
-# Parallel load test: 100 batches of 10 events each every 5ms
-iex> Producer.stream(5, 100, 10, "teset_types")
-```
-
-**Terminal 3 - Use the Browser client app**:
-
-Start consumer (auto-connects to NATS server)
-
-```sh
-cd web-consumer && pnpm dev
-```
-
 ### HTTP Endpoint Tests
 
 ```sh
@@ -1599,41 +1547,14 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 
 ---
 
-## Roadmap
+## Notes on nkeys
 
-**Possible enhancements:**:
-
-* [ ] Metrics export to StatsD/InfluxDB
-* [ ] Integrate MySQL connector option?
-
-**Open questions:**:
-
-* The burst benchmark is producer-bound: PostgreSQL needs ~6 s to write the 2M rows the
-  bridge then drains in ~7.6 s of loop time. Where is the ceiling when the producer is
-  not the limit — a pre-filled WAL, or several emitters?
-
-**Contributions welcome!** If you find it useful (or find gaps), feedback is valuable.
-
----
-
-## License
-
-This project uses:
-
-* [zig-msgpack](https://github.com/zigcc/zig-msgpack) (MIT)
-
----
-
-## Notes
-
-* The vendored NATS client has **no TLS**: `protocol.zig` sends
-  `"tls_required":false`, so bridge ↔ nats-server must stay on a private network.
+* The NATS client has **no TLS**: `protocol.zig` sends `"tls_required":false`, so [bridge ↔ nats-server] must stay on a private network.
   External clients reach nats-server over wss, which nats-server terminates itself.
-* Authentication to NATS uses **nkey**, signed with `std.crypto.sign.Ed25519` — pure
-  Zig, no OpenSSL linked.
+* Authentication to NATS uses **nkey**, signed with `std.crypto.sign.Ed25519` — pure Zig, no OpenSSL linked.
 * PostgreSQL logical replication requires `wal_level=logical`
 
-**Example how to generate nkey for NATS**:
+**How to generate nkey for NATS**:
 
 ```sh
 brew install nats-io/nats-tools/nats
@@ -1643,7 +1564,7 @@ nk -gen user -pubout
 # public: UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV
 ```
 
-In _nats-server.conf_, set:
+In _nats-server.conf_, set the **public** key:
 
 ```diff
 authorization {
@@ -1654,7 +1575,7 @@ authorization {
 }
 ```
 
-Start the bridge daemon with the private nkey:
+Use the **private** nkey to start ZeBridge daemon:
 
 ```sh
 NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI \
@@ -1662,5 +1583,36 @@ RING_BUFFER_COUNT=2048 \
 BASE_BUF=12 \
 DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@localhost:55432/postgres \
 NATS_URL=nats://localhost:4222 \
-./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
+./zig-out/bin/bridge --slot my_slot --pub my_pub
 ```
+
+---
+
+## Dependencies & Licenses
+
+**Managed via `build.zig.zon`:**
+
+* [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding. License MIT
+
+**Currently vendored (in `/`):**
+
+* [nats.zig](https://github.com/lalinsky/nats.zig). License Apache 2.
+
+**System:**
+
+* [libpq](https://www.postgresql.org/docs/current/libpq.html) ≧ 14. License MIT
+
+---
+
+## Roadmap
+
+**Possible enhancements:**:
+
+* [ ] Metrics export to StatsD/InfluxDB
+
+**Open questions:**:
+
+* The burst benchmark is producer-bound: PostgreSQL needs ~6 s to write the 2M rows the
+  bridge then drains in ~7.6 s of loop time. Where is the ceiling when the producer is not the limit — a pre-filled WAL, or several emitters?
+
+**Contributions welcome!** If you find it useful (or find gaps), feedback is valuable.

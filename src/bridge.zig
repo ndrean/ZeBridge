@@ -538,7 +538,22 @@ pub fn main(init: std.process.Init) !void {
     // and a row that packs successfully and is then refused by the server forever.
     {
         const event_buf_bytes = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
-        const slab_bytes = event_buf_bytes * runtime_config.batch_ring_buffer_size;
+        const count = runtime_config.batch_ring_buffer_size;
+        const data_bytes = event_buf_bytes * count;
+
+        // ⚠️ The ring is **two** allocations, and this check used to count only one of
+        // them. Each event also carries a fixed `CDCEvent` descriptor — dominated by its
+        // `[512]ColumnView` array, which is the same size whether the table has three
+        // columns or five hundred — and that term does **not** shrink with BASE_BUF.
+        //
+        // So the smaller the event buffer, the more the metadata dominates, and the
+        // further this check drifted from the truth in exactly the configuration that
+        // makes sense for many small events. Measured: BASE_BUF=11 with
+        // RING_BUFFER_COUNT=262144 is 512 MiB of data and 2.08 GiB of metadata — the old
+        // check saw the 512 MiB, waved it through against a 4 GB machine, and the process
+        // then wanted 2.6 GB.
+        const meta_bytes = @sizeOf(batch_publisher.CDCEvent) * count;
+        const slab_bytes = data_bytes + meta_bytes;
 
         // #1 — will the slab fit in the memory this process actually has?
         const limit = utils.memoryLimitBytes();
@@ -549,15 +564,28 @@ pub fn main(init: std.process.Init) !void {
             // buffers, the NATS client, the snapshot encode buffer and the arenas all sit
             // beside it — and a slab past half leaves no room for the work it exists to do.
             log.err(
-                "🔴 The event slab would be {d} MB (BASE_BUF={d} → {d} KB × RING_BUFFER_COUNT={d}), against a {d} MB memory limit. It is pre-allocated at startup, so this is an OOM kill under load rather than a slow degradation. Halve RING_BUFFER_COUNT for each step you raise BASE_BUF; see README 'Sizing BASE_BUF and RING_BUFFER_COUNT'.",
-                .{ slab_bytes / 1024 / 1024, runtime_config.event_data_buffer_log2, event_buf_bytes / 1024, runtime_config.batch_ring_buffer_size, limit / 1024 / 1024 },
+                "🔴 The ring would be {d} MB — {d} MB of data (BASE_BUF={d} → {d} KB × RING_BUFFER_COUNT={d}) plus {d} MB of per-event metadata ({d} B each) — against a {d} MB memory limit. It is pre-allocated at startup, so this is an OOM kill under load rather than a slow degradation. Halve RING_BUFFER_COUNT for each step you raise BASE_BUF; see README 'Sizing BASE_BUF and RING_BUFFER_COUNT'.",
+                .{
+                    slab_bytes / 1024 / 1024,
+                    data_bytes / 1024 / 1024,
+                    runtime_config.event_data_buffer_log2,
+                    event_buf_bytes / 1024,
+                    count,
+                    meta_bytes / 1024 / 1024,
+                    @sizeOf(batch_publisher.CDCEvent),
+                    limit / 1024 / 1024,
+                },
             );
             return error.SlabExceedsMemory;
         } else {
-            log.info("Event slab: {d} MB of a {d} MB limit ({d}%)", .{
+            // Both terms, always: an operator reading "512 MB" while the process takes
+            // 2.6 GB has no way to discover the difference short of watching it die.
+            log.info("Event ring: {d} MB of a {d} MB limit ({d}%) — {d} MB data + {d} MB metadata", .{
                 slab_bytes / 1024 / 1024,
                 limit / 1024 / 1024,
                 slab_bytes * 100 / limit,
+                data_bytes / 1024 / 1024,
+                meta_bytes / 1024 / 1024,
             });
         }
 

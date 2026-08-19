@@ -288,13 +288,19 @@ export default function App() {
   /// with optimistic apply, not before it.
   const pendingWrites = new Map<string, { table: string; id: number | string; at: number }>();
 
-  /// Subscribe to this principal's write verdicts.
+  /// Subscribe to this principal's write verdicts, and apply PROTOCOL.md §7.1.
   ///
-  /// ⚠️ Absence is the normal case. A verdict is published only when a write **fails** —
-  /// success needs no signal, because the row itself arrives over CDC and carries the key
-  /// the client minted. So this reports refusals; the timeout below covers everything
-  /// else, including the one case nothing can report: a bridge that dies before it says
-  /// anything.
+  /// **Every** write the bridge reaches a conclusion about is answered here — that is
+  /// §7.4b, and it is what makes "pop the queue only on a definitive reply" implementable.
+  /// It was not always so: the bridge once published a verdict *only on failure*, and a
+  /// client obeying §7.1 literally could therefore never pop a **successful** write. It
+  /// would resend forever — idempotently, thanks to `Nats-Msg-Id`, and so invisibly: no
+  /// error, no duplicate row, just an outbox that never drained.
+  ///
+  /// ⚠️ The three success statuses are not interchangeable, and the row count cannot tell
+  /// them apart — two of the three are *zero rows affected*. The bridge classifies them by
+  /// reading the row's state in the same transaction as the write; a client must not try
+  /// to re-derive them.
   const watchVerdicts = async () => {
     if (!nc) return;
     const sub = nc.subscribe(`mutation_ack.${PRINCIPAL}.>`);
@@ -306,17 +312,93 @@ export default function App() {
         const msgId = m.subject.startsWith(prefix) ? m.subject.slice(prefix.length) : m.subject;
         const verdict = JSON.parse(new TextDecoder().decode(m.data));
         const pending = pendingWrites.get(msgId);
-        pendingWrites.delete(msgId);
-        appendLog(
-          m.subject,
-          { ...verdict, write: pending ?? '(not from this session)' },
-          'VERDICT',
-        );
+        const where = pending ? `${pending.table}#${pending.id}` : '(not from this session)';
+
+        // `failed` is the ONE status that is not definitive: the bridge exhausted its
+        // deliveries for a reason that may not recur. §7.1 says keep it and retry, so the
+        // entry stays and `sweepPendingWrites` decides when to give up. Everything else
+        // pops — including `stale` and `rejected`, where resending cannot change anything.
+        const definitive = verdict.status !== 'failed';
+        if (definitive) pendingWrites.delete(msgId);
+
+        switch (verdict.status) {
+          case 'accepted':
+            // ⚠️ Nothing is applied here. State arrives over CDC, never from a verdict
+            // (§7.1: "treat the reply as a verdict, not as data") — keeping one path for
+            // state is what stops this client having two sources of truth.
+            if (verdict.reason === 'version_clamped') {
+              // The version sent was ahead of the database's clock and was capped, so the
+              // value this client believes it wrote does not exist anywhere. §7.3 says
+              // adopt what came back. Nothing to adopt *into* here — every local row comes
+              // from CDC — but a client keeping optimistic rows must overwrite its own.
+              appendLog(
+                m.subject,
+                `${where}: accepted, but the version was clamped to ${verdict.version} — this client's clock is ahead of the database`,
+                'WARNING',
+              );
+            } else {
+              appendLog(m.subject, { ...verdict, write: where }, 'VERDICT');
+            }
+            break;
+
+          case 'stale':
+            // ⚠️ Pop, and do **not** hand-revert. A newer version won; the winning row is
+            // already on its way over CDC, and reverting locally would fight the feed and
+            // briefly show the user a row the database does not have.
+            appendLog(
+              m.subject,
+              `${where}: a newer version won — dropping this edit, the winning row arrives via CDC`,
+              'INFO',
+            );
+            break;
+
+          case 'row_deleted':
+            // The one case last-write-wins cannot decide for the user: their edit targeted
+            // a row someone else deleted. §7.1 SHOULD-2 — surface it rather than silently
+            // discarding it.
+            appendLog(
+              m.subject,
+              `${where}: the row was deleted elsewhere, so this edit cannot be applied. Surface this to the user rather than dropping it.`,
+              'ERROR',
+            );
+            break;
+
+          case 'rejected':
+            // PostgreSQL refused, and would refuse the same bytes again — a constraint, a
+            // missing grant, a bad type. Retrying is not a strategy; the fix is a schema
+            // change, a grant, or different data.
+            appendLog(
+              m.subject,
+              `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'}`,
+              'ERROR',
+            );
+            break;
+
+          case 'failed':
+            appendLog(
+              m.subject,
+              `${where}: failed after the bridge's delivery limit (${verdict.reason}) — kept for retry`,
+              'WARNING',
+            );
+            break;
+
+          default:
+            // An unknown status is not something to guess at: keep the entry so the
+            // timeout reports it rather than popping on a reply this client cannot read.
+            pendingWrites.set(msgId, pending ?? { table: '?', id: '?', at: Date.now() });
+            appendLog(m.subject, { ...verdict, write: where, note: 'unknown status — kept pending' }, 'ERROR');
+        }
       }
     })();
   };
 
-  /// Anything still pending after this long is treated as failed.
+  /// Anything still pending after this long is treated as unconfirmed.
+  ///
+  /// Now that every write is answered (§7.4b), reaching this timeout means something is
+  /// genuinely wrong rather than merely unremarkable: the bridge died before publishing,
+  /// the verdict was undeliverable, or ingress is not running. Before the reply channel
+  /// covered successes, silence was the *normal* outcome and this timeout was the only
+  /// thing that ever closed a pending entry.
   ///
   /// Derived, not chosen: `max_deliver` (5) × the bridge's 1s retry sleep, plus the CDC
   /// batch window (500ms), plus slack. ⚠️ Every term is bridge-side configuration this
@@ -1216,10 +1298,14 @@ const CLIENT_ID = '1234567890123456';
     // timeout was correctly collapsed into the original write, which is exactly the signal
     // an idempotent outbox needs to pop without writing the row twice.
     //
-    // ⚠️ It acknowledges **persistence, not application**. The row may still be rejected
-    // by PostgreSQL afterwards (a missing grant, a stale version), and today that verdict
-    // never reaches the client. A PubAck means "the bridge will see this", not "this was
-    // written".
+    // ⚠️ It acknowledges **persistence, not application**. A PubAck means "the bridge will
+    // see this", not "this was written" — the row may still be refused by PostgreSQL for a
+    // missing grant, or lose to a newer version, or find no row at all.
+    //
+    // Which is why the PubAck is *not* what pops the outbox. The verdict on
+    // `mutation_ack.<principal>.<msg_id>` is (§7.4b), and `watchVerdicts` above is what
+    // reads it. The PubAck only proves the write is durable enough to be worth waiting for
+    // a verdict about.
     try {
       // Cheap wrapper over the connection, not a second connection — the `js` inside
       // subscribeStreams is scoped there, and sharing it would mean hoisting a mutable

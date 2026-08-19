@@ -21,24 +21,24 @@ row. They are marked ⚠️.
 
 ## 0. Two sources of truth, and one direction
 
-**PostgreSQL is the source of truth for anything about the catalogue. NATS is the source
-of truth for consumers. The bridge projects one onto the other, and never reads its own
-output back.**
+**PostgreSQL is the source of truth for anything about the catalogue.
+NATS is the source of truth for consumers.
+The bridge projects one onto the other, and never reads its own output back.**
 
 Everything else in this document assumes it, and it settles a whole class of design
 questions at once rather than one at a time. Three that look reasonable and are not:
 
 * **Decoding WAL tuples against the published schema.** A `RELATION` message is protocol,
-  not cache: it arrives inline at the LSN where the shape changed and describes the tuples
-  that immediately follow, which are decoded **positionally**. On replay the correct shape
-  is the one that was live at that LSN, not the one the catalogue holds now.
+not cache: it arrives inline at the LSN where the shape changed and describes the tuples
+that immediately follow, which are decoded **positionally**. On replay the correct shape
+is the one that was live at that LSN, not the one the catalogue holds now.
 * **Building SQL from the published schema.** The write path is about to execute against
-  the catalogue, in a transaction. If the two disagree the catalogue wins by definition —
-  the statement either runs or it does not.
+the catalogue, in a transaction. If the two disagree the catalogue wins by definition —
+the statement either runs or it does not.
 * **Invalidating a bridge-side cache by watching the KV.** The `schemas` bucket is
-  *behind* the catalogue by the ring buffer plus the flush window, and it is produced by
-  the bridge itself: a failed publish would become a correctness bug, and an empty bucket
-  could not bootstrap.
+*behind* the catalogue by the ring buffer plus the flush window, and it is produced by
+the bridge itself: a failed publish would become a correctness bug, and an empty bucket
+could not bootstrap.
 
 So invalidation signals travel the **WAL**, like the data: the DDL event trigger writes a
 row to `zebridge_ddl_events`, that row reaches the bridge in stream order, and the bridge
@@ -154,17 +154,17 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 
 Root keys are exactly `table`, `pg`, `sqlite`, `lsn`.
 
-- `table` duplicates the KV key. The **key remains authoritative** — if they ever
+* `table` duplicates the KV key. The **key remains authoritative** — if they ever
   disagree, trust the key. The field exists so the value is self-describing like every
   other payload in the protocol (CDC events, snapshot chunks, and this schema's own
   tombstone all carry `table`), which matters once a payload travels without its key:
   logs, caches, forwarding.
-- `pg.columns[].type` is `information_schema.data_type` verbatim (`bigint`,
+* `pg.columns[].type` is `information_schema.data_type` verbatim (`bigint`,
   `character varying`, `timestamp without time zone`, `numeric`, …).
-- `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
-- ⚠️ `pk` sits **inside `sqlite`**, not at the root. Historical, and the reference
+* `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
+* ⚠️ `pk` sits **inside `sqlite`**, not at the root. Historical, and the reference
   client depends on it; treat it as part of the contract.
-- `lsn` is the WAL position this schema is valid from. For DDL-driven schemas it is
+* `lsn` is the WAL position this schema is valid from. For DDL-driven schemas it is
   the exact position of the DDL event; for boot-time schemas it is the WAL position
   read once at bridge startup.
 
@@ -225,9 +225,9 @@ lifts by itself the moment the shape is fixed.
 
 While a table is suspended:
 
-- its CDC events are **dropped at the bridge** — nothing reaches the `CDC` stream;
-- a `snapshot.request.<table>` is answered with `error_type: "table_refused"` (§6);
-- the previous live schema is **overwritten** by this value, so a client connecting
+* its CDC events are **dropped at the bridge** — nothing reaches the `CDC` stream;
+* a `snapshot.request.<table>` is answered with `error_type: "table_refused"` (§6);
+* the previous live schema is **overwritten** by this value, so a client connecting
   later cannot read a stale shape and build a table that will never receive rows.
 
 `lsn` is the position replication stopped at. A client already holding rows is
@@ -250,8 +250,8 @@ needs to.
 
 Two suffixes exist:
 
-- `cdc.<table>.<op>.batch` — the message body is an **array** of events.
-- `cdc.<table>.update.transition` / `.data` — only when `TRANSITION_RULES` is
+* `cdc.<table>.<op>.batch` — the message body is an **array** of events.
+* `cdc.<table>.update.transition` / `.data` — only when `TRANSITION_RULES` is
   configured for that table, and only for UPDATE.
 
 ⚠️ **A message body is either a single event object or an array of them**, on
@@ -339,13 +339,13 @@ a DELETE carries the key (plus nulls under DEFAULT identity, as above).
 
 MessagePack by default, JSON with `--json`. Either way:
 
-- `numeric` arrives as a **string** (`"123.45000000"`) to preserve precision.
-- a column PostgreSQL sent in **text format** (it does this per column, even under
+* `numeric` arrives as a **string** (`"123.45000000"`) to preserve precision.
+* a column PostgreSQL sent in **text format** (it does this per column, even under
   `binary 'true'`, for any type with no binary send function) arrives as that text
   verbatim — no type-specific decoding is applied or needed.
-- `jsonb` arrives as a nested object in MessagePack mode, a string in JSON mode.
-- arrays and `bytea` arrive as strings.
-- **`timestamptz` arrives as ISO-8601 with `Z`; `timestamp` arrives without it.** The
+* `jsonb` arrives as a nested object in MessagePack mode, a string in JSON mode.
+* arrays and `bytea` arrive as strings.
+* **`timestamptz` arrives as ISO-8601 with `Z`; `timestamp` arrives without it.** The
   suffix is not decoration — `timestamptz` is stored as UTC, so `Z` states a recorded
   fact, while `timestamp` is a naive wall-clock reading with no zone. A client must
   **not** localise a value that has no suffix: `new Date("2025-10-26T10:00:00.000000")`
@@ -450,8 +450,8 @@ which is what `seq` is for.
 
 Two details that look like off-by-ones and are not:
 
-- `mySeq === 0` is the fresh-client case: no history at all, so seed from a snapshot.
-- `< firstSeq - 1`, not `< firstSeq`: if the stream's oldest is 100 and you hold 99, the very
+* `mySeq === 0` is the fresh-client case: no history at all, so seed from a snapshot.
+* `< firstSeq - 1`, not `< firstSeq`: if the stream's oldest is 100 and you hold 99, the very
   next message you need is 100 and it is still there — no gap. Only at 98 or below is
   message 99 genuinely lost.
 
@@ -534,7 +534,7 @@ Snapshot data is megabytes-to-gigabytes of ordered chunks. It flows through thre
 | **Data (chunks)** | `INIT` stream | JetStream streams reliably hold ordered sequences of chunks for long retention periods. |
 | **Metadata** | `kv.snapshots` bucket | A single small descriptor (schema, snapshot ID, LSN, row count). Last-value-per-key makes it trivial for a client to discover the active snapshot without scanning streams. |
 
-**Requesting a snapshot:** 
+**Requesting a snapshot:**
 
 1. A client checks `kv.snapshots.<table>`. If a valid snapshot exists (i.e., its LSN is within the `CDC` retention window), the client can replay it immediately.
 2. If no valid snapshot exists, the client publishes an empty message to `snapshot.request.<table>`.
@@ -610,13 +610,13 @@ Run on every connect and reconnect. The client must evaluate the **Gap Rule** to
 A naive client might track the last LSN per table. This causes the **"abandoned table paradox"**: if Table A changes rapidly but Table B never changes, Table B's local LSN falls far behind the stream's oldest available LSN. A per-table gap check would incorrectly assume Table B missed events and force a snapshot.
 
 To solve this, the client must track a **Global Sync State**:
-- `global_last_lsn`: The highest LSN the client has successfully processed from the CDC stream, across *all* tables.
-- `global_last_seq`: The JetStream sequence number corresponding to `global_last_lsn`.
+* `global_last_lsn`: The highest LSN the client has successfully processed from the CDC stream, across *all* tables.
+* `global_last_seq`: The JetStream sequence number corresponding to `global_last_lsn`.
 
 **The Gap Rule:**
 Compare `global_last_lsn >= oldest_cdc_lsn`.
-- **If true:** The client has no gaps. Every table is safe, even those that haven't changed in months. Resume CDC from `global_last_seq + 1`.
-- **If false (or first run):** The client missed history. It must request a snapshot for *all* required tables, as it cannot prove which ones changed during the blackout.
+* **If true:** The client has no gaps. Every table is safe, even those that haven't changed in months. Resume CDC from `global_last_seq + 1`.
+* **If false (or first run):** The client missed history. It must request a snapshot for *all* required tables, as it cannot prove which ones changed during the blackout.
 
 ```mermaid
 flowchart TD
@@ -650,11 +650,11 @@ else:
 
 **Notes that matter for a correct port:**
 
-- ⚠️ **`global_last_lsn` may not exist.** First run has no value; test for its presence explicitly.
-- ⚠️ **`>=`, not `>`.** If `global_last_lsn == oldest_cdc_lsn` you have applied the oldest retained event and everything after it is present. Strict `>` forces a needless re-seed.
-- ⚠️ **`snapshot_lsn >= oldest_cdc_lsn` must be verified.** A snapshot older than the CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been evicted. You land in a hole immediately.
-- ⚠️ **Truncate before applying a snapshot**, do not merge. A snapshot names only rows that *exist*; rows deleted while you were away are never mentioned, so an upsert-only apply leaves them behind forever.
-- A schema change **never** triggers this flow. Migrations apply in place (§5); re-seeding is for a CDC gap only.
+* ⚠️ **`global_last_lsn` may not exist.** First run has no value; test for its presence explicitly.
+* ⚠️ **`>=`, not `>`.** If `global_last_lsn == oldest_cdc_lsn` you have applied the oldest retained event and everything after it is present. Strict `>` forces a needless re-seed.
+* ⚠️ **`snapshot_lsn >= oldest_cdc_lsn` must be verified.** A snapshot older than the CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been evicted. You land in a hole immediately.
+* ⚠️ **Truncate before applying a snapshot**, do not merge. A snapshot names only rows that *exist*; rows deleted while you were away are never mentioned, so an upsert-only apply leaves them behind forever.
+* A schema change **never** triggers this flow. Migrations apply in place (§5); re-seeding is for a CDC gap only.
 
 ### Resuming in practice
 
@@ -671,10 +671,10 @@ would have said so.
 
 Two consequences worth knowing:
 
-- `NUMERIC` is padded to its **declared scale**, so `numeric(20,8)` holding `0.1`
+* `NUMERIC` is padded to its **declared scale**, so `numeric(20,8)` holding `0.1`
   arrives as `0.10000000`, matching what text `COPY` emitted. This matters because
   NUMERIC maps to SQLite **TEXT** (§3), and in TEXT `'0.1000' = '0.10000000'` is false.
-- Arrays keep the Postgres literal form (`{x,"y,z"}`), not JSON. ⚠️ The bridge quotes
+* Arrays keep the Postgres literal form (`{x,"y,z"}`), not JSON. ⚠️ The bridge quotes
   elements slightly more eagerly than Postgres does — `{"x","y,z"}` where Postgres
   writes `{x,"y,z"}`. Both parse identically as array literals; they are not byte-equal.
 
@@ -726,16 +726,16 @@ should ever write to a synced table — not the UI, not a migration, not a repai
 That single constraint is what makes the edge safe, and it is worth being explicit about
 why, because it removes a class of work rather than adding one:
 
-- **A forbidden write cannot produce forbidden state.** Authorization is enforced where
+* **A forbidden write cannot produce forbidden state.** Authorization is enforced where
   the data lives. A refused mutation writes nothing, so it emits no CDC event, so the
   replica simply never changes. There is no phantom row to detect and no undo to apply —
   measured: a mutation to a table the writer has no grant on leaves the client with no
   row, no error, and no echo.
-- **It holds against a hostile client, not just a buggy one.** A tampered payload, a
+* **It holds against a hostile client, not just a buggy one.** A tampered payload, a
   forged `data` map, a client written by someone else — none of them can put a row into a
   replica that PostgreSQL did not emit. So the bridge does not have to defend the client
   from itself, and a client author cannot get this wrong by accident.
-- **Two independent layers, each doing what it is good at.** NATS subject permissions
+* **Two independent layers, each doing what it is good at.** NATS subject permissions
   decide *who may ask* (§7.1); PostgreSQL grants, constraints and the version guard decide
   *what actually happens*. Neither has to model the other, and a gap in one is not a
   breach of the other.
@@ -820,11 +820,11 @@ reaches the server six hours later.
 
 Two things follow, and they are the whole reason this section is long:
 
-- **A client that does not implement the rules below does not get a weaker guarantee —
+* **A client that does not implement the rules below does not get a weaker guarantee —
   it gets lost writes.** A mutation published while disconnected is discarded by the
   transport; a mutation whose reply is ignored is indistinguishable from one that was
   rejected. Neither is a conflict outcome. Both are silent data loss.
-- **The version is the table's, not the message's.** A table without one is
+* **The version is the table's, not the message's.** A table without one is
   **outbound-only**: it replicates to clients and refuses their writes (§9).
 
 ### Client conformance
@@ -872,10 +872,10 @@ Two things follow, and they are the whole reason this section is long:
 
 **SHOULD**
 
-7. Apply optimistically, so the UI does not wait for a round trip through PostgreSQL.
-8. Surface `row_deleted` to the user rather than silently discarding their edit — this
+1. Apply optimistically, so the UI does not wait for a round trip through PostgreSQL.
+2. Surface `row_deleted` to the user rather than silently discarding their edit — this
    is the one case where LWW cannot decide for them.
-9. Bound the outbox, and tell the user when it stops draining.
+3. Bound the outbox, and tell the user when it stops draining.
 
 ### 7.2 The mutation envelope
 
@@ -915,9 +915,9 @@ that value come from when the column is a `serial`/`bigserial`?**
 edge-written key is a landmine the sequence will eventually step on. The failure is
 delayed and asymmetric:
 
-- the **application's** next `INSERT` at that value fails with a duplicate key violation,
+* the **application's** next `INSERT` at that value fails with a duplicate key violation,
   possibly months later, for no reason visible in the app's own history;
-- the same collision arriving **through the bridge** does not fail at all — the upsert's
+* the same collision arriving **through the bridge** does not fail at all — the upsert's
   `ON CONFLICT DO UPDATE` silently overwrites whichever row was there first, and LWW
   decides the winner on a version the two rows never meant to share.
 
@@ -940,14 +940,14 @@ free.
 **A primary key that can be edited is not an identity.** Change it and the row's identity
 changes with it, and every mechanism here is keyed on identity:
 
-- The change arrives as **one UPDATE carrying `old.<pk>`**, not as a delete plus an
+* The change arrives as **one UPDATE carrying `old.<pk>`**, not as a delete plus an
   insert. A client that upserts on the new key gains a row and never loses the old one.
-- There is no atomic rename on the wire. The old-key delete and the new-key insert are one
+* There is no atomic rename on the wire. The old-key delete and the new-key insert are one
   event that a client must decompose correctly, and a client that reconnects mid-stream may
   see the result of one and not the other.
-- **Tombstones are keyed on the primary key** (§7.5), so a tombstone written for the old
+* **Tombstones are keyed on the primary key** (§7.5), so a tombstone written for the old
   key does not cover the new one.
-- ⚠️ **An offline client holds the old key.** It edits a row whose key changed while it was
+* ⚠️ **An offline client holds the old key.** It edits a row whose key changed while it was
   away, and its mutation names a key that no longer exists — so the upsert *inserts*,
   resurrecting a row that was renamed away. The tombstone that would normally overrule an
   offline write is on the wrong key to help.
@@ -1047,12 +1047,27 @@ fails, while that client's own string comparisons quietly stop agreeing with the
 `2026-08-18 04:57:10.827+00`, space-separated. A client that matches the database's own
 output rather than the wire produces a value the bridge never emits.
 
-- ⚠️ **Microsecond precision or better.** Second precision means frequent ties, and a tie
+* ⚠️ **Microsecond precision or better.** Second precision means frequent ties, and a tie
   is *rejected* by `<`, so a legitimate edit is dropped silently.
-- ⚠️ **Ties need a tiebreaker.** Equal versions otherwise let two replicas pick different
+* ⚠️ **Ties need a tiebreaker.** Equal versions otherwise let two replicas pick different
   winners and stay divergent. The comparison is `(version, client_id)`.
-- ⚠️ **Do not send a future timestamp.** A skewed clock writes a row nobody can update
-  until the world catches up; the bridge clamps and tells you what it used.
+* ⚠️ **Do not send a future timestamp.** A skewed clock does not write a bad *value*, it
+  writes a **sticky** one: nothing compares greater, so the row rejects every later write
+  from every client, silently, until wall-clock time passes it.
+
+  The bridge caps it at the database's `now()` plus a tolerance (**5 seconds**,
+  `config.Sync.version_future_tolerance`), so the freeze is bounded by that window instead
+  of by the size of your clock error. Clamping rather than rejecting, because your *data*
+  was never the problem — your clock was.
+
+  When it fires you get a verdict on `mutation_ack.<principal>.<msg_id>` with
+  `status: "accepted"`, `reason: "version_clamped"`, and `version` carrying the value
+  actually stored, in the wire format above. **Adopt it**: the version you hold is one
+  PostgreSQL does not have, and every comparison you make with it will be against a value
+  that exists nowhere.
+
+  ⚠️ Timestamp version columns only. An integer version has no future, and capping one
+  would corrupt a sound scheme. Tested by `scripts/scenarios/clamp.py`.
 
 #### The column's *type* decides whether last-write-wins is sound
 
@@ -1103,11 +1118,11 @@ it just compares the wrong thing.
 The frameworks do offer an integer counter, and it is worth knowing why it does not
 simply drop in:
 
-- **Ecto** `Ecto.Changeset.optimistic_lock(:lock_version)` and **Rails**
+* **Ecto** `Ecto.Changeset.optimistic_lock(:lock_version)` and **Rails**
   `lock_version` both increment an integer automatically on update.
-- But they are **opt-in per changeset**, not global like `timestamps()` — one update path
+* But they are **opt-in per changeset**, not global like `timestamps()` — one update path
   built without it silently stops maintaining the column.
-- And their conflict policy is the **opposite** of this protocol's: a version mismatch
+* And their conflict policy is the **opposite** of this protocol's: a version mismatch
   *raises* (`Ecto.StaleEntryError`) rather than letting the later write win. Pointing the
   bridge at that column puts two policies on one value — the application rejecting
   conflicts, the edge resolving them — and the bridge's upsert increments it from SQL
@@ -1148,15 +1163,14 @@ there so the *application's own* server-side inserts keep working unchanged. Unl
 sequence, `gen_random_uuid()` holds no state, so nothing falls out of step when the client
 allocates instead (§7.2).
 
-
-- Type `uuid`. **v7 is preferred over v4**: both are collision-safe, but v7 embeds a
+* Type `uuid`. **v7 is preferred over v4**: both are collision-safe, but v7 embeds a
   timestamp, so keys sort by creation time and index inserts stay append-only instead of
   scattering across the B-tree. PostgreSQL 18 has `uuidv7()`; before that, mint it client
   side — which the client is doing anyway.
-- **The name does not matter.** The bridge reads the key from the catalog
+* **The name does not matter.** The bridge reads the key from the catalog
   (`pg_index.indisprimary`), so it can be called anything.
-- Never `serial`/`bigserial` (§7.2), never a natural key such as an email (§7.2).
-- **Single column.** Composite keys are supported everywhere — local DDL, the upsert's
+* Never `serial`/`bigserial` (§7.2), never a natural key such as an email (§7.2).
+* **Single column.** Composite keys are supported everywhere — local DDL, the upsert's
   conflict target, delete-by-key, and the snapshot's keyset pagination — and are the right
   choice for read-only tables. For *writable* ones, prefer a surrogate; see below.
 
@@ -1251,6 +1265,66 @@ That makes UPDATE and DELETE safe in the sense that matters here (neither invent
 neither can collide), but it means the client's key is load-bearing in both directions: a
 wrong key is not rejected, it is a new row. And it is why item 3 exists — without a
 tombstone, an offline edit to a row deleted elsewhere silently brings it back.
+
+### 7.4b The reply channel — `mutation_ack.<principal>.<msg_id>` ✅
+
+Every mutation the bridge reaches a conclusion about gets exactly one reply, on a subject
+built from the principal that wrote it and the `Nats-Msg-Id` the client chose:
+
+```
+mutation_ack.<principal>.<msg_id>
+```
+
+⚠️ **The `msg_id` becomes a subject token**, so it must not contain `.`, `*`, `>` or
+whitespace — a dot silently adds a token and the reply lands somewhere the client is not
+listening. Use a UUID or a hex string.
+
+⚠️ **Deliberately outside `mutation.>`.** The ingress consumer filters on that prefix, so a
+reply published under it would be read back by the bridge as if it were a write.
+
+**Payload**
+
+```json
+{
+  "status":   "accepted" | "stale" | "row_deleted" | "rejected" | "failed",
+  "reason":   "",
+  "sqlstate": "",
+  "detail":   "",
+  "seq":      186,
+  "version":  "2026-08-19T05:55:40.495972Z"
+}
+```
+
+| field | meaning |
+| --- | --- |
+| `status` | what to do with the outbox entry — the table in §7.1 |
+| `reason` | machine-readable qualifier; `version_clamped` on an accepted write whose version was capped (§7.3), the error name otherwise |
+| `sqlstate` | PostgreSQL's code when it refused; empty on success |
+| `detail` | **first line only** of the server's message. Its `DETAIL` can quote rows written by other tenants, so the rest is kept to the operator's log |
+| `seq` | the `MUTATIONS` stream sequence — the number the client already got in its `PubAck`, so it can correlate without having stored its own `msg_id` |
+| `version` | the version **actually stored**, in the wire format of §7.3. Authoritative: after a clamp it is not what you sent |
+
+**The five statuses**
+
+| status | it means | client |
+| --- | --- | --- |
+| `accepted` | rows changed | pop |
+| `stale` | zero rows; the row is present and undeleted, and a newer version won | pop, do **not** hand-revert — the winning row arrives via CDC |
+| `row_deleted` | zero rows; the row is gone or tombstoned | pop, and surface it |
+| `rejected` | PostgreSQL refused, and will refuse the same bytes again — constraint, privilege, bad type | pop; retrying cannot help |
+| `failed` | the attempt failed for a reason that may not recur, after the delivery limit | keep, or resend under the same `msg_id` |
+
+⚠️ **`accepted`, `stale` and `row_deleted` are all successes at the SQL level**, and two of
+them are *zero rows affected*. The bridge tells them apart by reading the row's state in
+the same transaction as the write; a client cannot derive them and must not try.
+
+⚠️ **This is one reply per mutation**, so a write-heavy deployment carries roughly twice
+the ingress message count. That is the price of §7.1's "pop only on a definitive reply" —
+without it a correct client cannot distinguish an applied write from one lost in transit,
+and retries forever, idempotently and silently.
+
+Tested by `scripts/scenarios/replies.py` (all three success outcomes) and
+`scripts/scenarios/clamp.py` (the `version` field and `version_clamped`).
 
 ### 7.5 Deletes, tombstones, and the GC watermark
 
@@ -1416,11 +1490,21 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
 
 ## 10. Reference implementations
 
-- `web-consumer/` — SolidJS + WASM SQLite (OPFS) over WebSocket with nkey auth.
-  Implements §3, §4 and §5 in full. The browser is the *hardest* target; iOS and
-  Android both ship SQLite natively, so a mobile port is largely a storage-adapter
-  swap.
-- `emitter/` — Elixir producer used to generate load and drive chaos tests.
+* `web-consumer/` — SolidJS + WASM SQLite (OPFS) over WebSocket with nkey auth.
+  Implements §3, §4 and §5 in full, and §7.1's reply handling over the §7.4b channel: it
+  pops on `accepted` / `stale` / `row_deleted` / `rejected`, keeps on `failed`, and
+  surfaces `row_deleted` rather than discarding the edit. The browser is the *hardest*
+  target; iOS and Android both ship SQLite natively, so a mobile port is largely a
+  storage-adapter swap.
+
+  ⚠️ **Its outbox is in memory**, so it does not survive a reload — the replica is rebuilt
+  from snapshot + CDC on every load. A durable outbox, written in the same transaction as
+  the optimistic row, is what §7.1 actually asks for and is the piece a production client
+  must add.
+* `web-consumer/zb-mutate.mjs` — the smallest end-to-end write: one envelope, and the
+  verdict it produced. Useful as a first check that ingress is alive at all, since a
+  verdict distinguishes "refused" from "never arrived", which silence does not.
+* `emitter/` — Elixir producer used to generate load and drive chaos tests.
 
 A server-side reference client (Elixir) replicating into SQLite or PostgreSQL is
 planned, and is the real test of whether this document is sufficient: it exercises

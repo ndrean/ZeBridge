@@ -233,6 +233,49 @@ Adding pruning without fixing that would have published
 `cdc.zebridge_ddl_events.delete` to every client on each DDL, turning a slow disk leak
 into active noise. Both halves fixed together.
 
+### 2.10 A `u16` column offset silently corrupted wide rows  ← worst failure mode
+
+`CDCEvent.ColumnView.name_offset` was `u16`, and it indexes into `data_buffer`, whose size
+is `2^BASE_BUF`. At the 16 KB default that is unreachable. At `BASE_BUF=19` the buffer is
+512 KB, so the first column written past byte **65535** tripped
+`@as(u16, @intCast(self.data_len))`.
+
+⚠️ **The Debug crash is the lucky case.** In Debug it panics — "integer does not fit in
+destination type" — and the bridge dies loudly, which is how this was found. In
+**ReleaseFast the cast is undefined behaviour**: it wraps, every later column is read from
+the wrong offset, and the event decodes as garbage with nothing reporting an error. A
+release build would have shipped corrupt rows to every client.
+
+Two things made it reachable rather than theoretical:
+
+* the sizing guards **accept** `BASE_BUF=19` — it is a valid configuration, refused only
+  against `max_payload` (needs ≤ 19 here) and against RAM (needs `RING_BUFFER_COUNT`
+  halved per step). Nothing connected buffer size to the offset type;
+* the offset was computed **before** the bounds check that would have described the
+  problem, so an oversized row hit the narrowing cast on its way to the error meant to
+  catch it.
+
+Found by verification B of the snapshot-memory plan: a table of 200 × 256 KiB rows,
+snapshotted at `BASE_BUF=19`. It never fires on the narrow tables the suite otherwise uses.
+
+Fixed by widening to `u32` (matching `value_offset`, which was always `u32`), moving the
+bounds check ahead of the cast, and adding two unit tests in `batch_publisher.zig` —
+**both verified to fail** with the old types reinjected.
+
+⚠️ The same review turned up `column_count: u8` guarded by `if (column_count >= 512)`, a
+check that could never fire: the counter panics on increment at 255 first. A 256-column
+table would have crashed instead of receiving `TooManyColumns`. Widened to `u16`.
+
+### 2.11 A refused snapshot always blamed the primary key
+
+`snapshot_listener` reported every refusal as `(no primary key)` — in the log and in the
+`init.snap.error` payload — regardless of the registry's actual reason. A table suspended
+for `row_too_large` therefore sent its operator to add a key it already had. Found while
+snapshotting the same wide fixture, which has a perfectly good `bigint PRIMARY KEY`.
+
+The registry knew the reason and simply had no getter; `refused_tables.reasonFor()` now
+exposes it, and both the log and the payload carry the real reason plus its `fixHint()`.
+
 ### 2.9 One `PQconsumeInput` per message made bursts quadratic  ← biggest win
 
 `receiveMessage` called `PQconsumeInput` before **every** `PQgetCopyData`. That is the
@@ -275,6 +318,56 @@ because nothing said how it was obtained. It now ships with machine, build mode,
 transaction shape and row count, so the next regression has something to contradict.
 
 ---
+
+### 1.9 A durable client outbox — deferred to the final pass
+
+The bridge now holds up its end of §7.1: every write gets a definitive reply on
+`mutation_ack.<principal>.<msg_id>` (§7.4b), and `web-consumer` pops, keeps or surfaces on
+each status. What the reference client still lacks is the *durable* half — §7.1's actual
+requirement, which is that the optimistic row and the intent-to-send commit **together**:
+
+```sql
+BEGIN;
+  UPDATE users SET name = ? WHERE id = ?;      -- what the user sees
+  INSERT INTO _zebridge_outbox (…) VALUES (…); -- the intent to send
+COMMIT;
+```
+
+⚠️ **`localStorage` cannot be either statement, and speed is not the reason.** SQLocal runs
+SQLite in a Worker (`sqlocal/dist/client.js`), and `localStorage` is defined on `Window` —
+workers get IndexedDB and Cache, never Web Storage. So the outbox write would happen on the
+main thread while the row write happens in the worker: two stores, no shared commit, and
+the gap between them is exactly the window that loses writes. A non-atomic outbox is a
+queue that can disagree with its own data, which is the failure the pattern exists to
+prevent. (It is also synchronous and main-thread-blocking, which is a second reason and a
+smaller one.)
+
+The outbox therefore belongs in the same SQLite file, which is what §7.1 shows and what
+SQLocal's `transaction` API already supports.
+
+⚠️ **The prerequisite is a stable `DB_NAME`, and today's per-load name is deliberate.**
+`web-consumer/src/App.tsx` opens `zebridge_${Date.now()}.sqlite3`, a new OPFS file per page
+load, and the client is run **exclusively in incognito** precisely so every session
+rebuilds from scratch and exercises the whole chain — schema, snapshot, CDC — against a
+fresh database, with no cache or leftover state to explain a result away. That is a good
+dev loop and should not be traded for durability.
+
+So this is two modes, not a bug to fix: the throwaway replica stays the way the reference
+client is *tested*, and durability is what a production client adds. Whoever picks this up
+should make the stable name opt-in rather than replacing the current behaviour.
+
+Sequence, when this is picked up:
+
+1. stable `DB_NAME`;
+2. `_zebridge_outbox` table in the replica;
+3. optimistic apply wrapped in `sql.transaction` with the outbox insert;
+4. pop on the verdicts, which already arrive.
+
+⚠️ Step 1 has a consequence worth planning for rather than discovering: a durable replica
+can boot **stale**, so the client must decide whether queued writes are older than the GC
+watermark (§7.1 MUST-6) — the tombstone that would have overruled them may already be
+reaped. Today the replica is rebuilt from snapshot + CDC on every load, which makes that
+question impossible to ask and therefore invisible.
 
 ### 1.8 Read authorization — what the publication can and cannot filter
 
