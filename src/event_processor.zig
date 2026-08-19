@@ -765,6 +765,24 @@ pub const EventProcessor = struct {
     /// Process a DDL event, query PostgreSQL for the new schema, perform SQLite transformation,
     /// and pack it into the ring buffer directly to the KV schemas subject.
 
+    /// Does this table declare a tombstone column?
+    ///
+    /// Read from `SYNC_RULES`, the same source `mutation_listener` uses to decide whether a
+    /// client's delete becomes an UPDATE — so the two cannot disagree about whether a
+    /// table soft-deletes.
+    ///
+    /// Used to suppress the sweeper's reaps on the CDC path: a table that soft-deletes
+    /// only ever produces a physical DELETE from the sweeper, and clients removed that row
+    /// when the tombstone update arrived.
+    ///
+    /// ⚠️ Deliberately *not* "does the table have a column called deleted_at". A column
+    /// nobody configured is an ordinary nullable timestamp, deletes on that table are
+    /// physical and real, and suppressing them would strand rows in every replica.
+    pub fn hasTombstone(self: *const EventProcessor, table: []const u8) bool {
+        const cols = self.sync_rules.get(table) orelse return false;
+        return cols.len > 1 and cols[1].len > 0;
+    }
+
     /// Append `"version_column"` and `"tombstone_column"` to a schema descriptor.
     ///
     /// The bridge resolves both from `SYNC_RULES` (falling back to the global default

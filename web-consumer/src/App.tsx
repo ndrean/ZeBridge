@@ -80,8 +80,9 @@ if (typeof window !== 'undefined') {
     /**
      * Mint a UUID v7 — the key an edge-writable table wants (PROTOCOL.md §7.4).
      *
-     * ⚠️ Not usable against `users` or `test_types`: both have `bigint` primary keys, so
+     * ⚠️ Not usable against `users`: it has  `bigint` primary keys, 
      * the column type rejects it. It needs a table keyed `uuid` — migration in §7.4.
+     * on the contrary, `test_types` has.
      */
     uuid: () => uuidv7(),
     /**
@@ -146,6 +147,15 @@ type TableState = {
   pkCols: string[];
   /** Column names the local table currently has. */
   columns: string[];
+  /**
+   * The table's tombstone column, from the schema descriptor, or null when deletes on this
+   * table are physical.
+   *
+   * Published by the bridge (`tombstone_column`) precisely so a client does not have to
+   * guess: the same table may soft-delete in one deployment and not in another, since it
+   * is a `SYNC_RULES` decision rather than a schema one.
+   */
+  tombstoneColumn: string | null;
   /** WAL LSN this schema is valid from. Events at or below it predate the change. */
   lsn: number;
 };
@@ -231,11 +241,31 @@ export default function App() {
     const newState: Record<string, { columns: string[], rows: any[], count: number }> = {};
     for (const [table, state] of syncedTables) {
       try {
-        const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}`);
+        // ⚠️ Soft-deleted rows are still **here**, and must be filtered out.
+        //
+        // A delete on a tombstoned table arrives as `cdc.<table>.update` with the tombstone
+        // set — because that is literally what happened in PostgreSQL — so the applier
+        // takes the UPSERT branch and the row stays in the local replica carrying its
+        // `deleted_at`. That is correct and deliberate: the row has to survive locally for
+        // an offline edit to be overruled rather than resurrecting it (§7.5). But a query
+        // that does not filter shows the user rows they deleted.
+        //
+        // The bridge does not send a later `delete` for these — the sweeper's reap is
+        // suppressed, since the client already acted on the tombstone update. So this
+        // filter is not an optimisation; without it a deleted row is visible forever.
+        //
+        // Discovered from the tombstone column in the schema descriptor, not hardcoded:
+        // a table without one deletes physically, its rows are gone from SQLite, and
+        // adding `WHERE deleted_at IS NULL` to it would fail on a column that does not
+        // exist.
+        const tombstone = state.tombstoneColumn;
+        const liveOnly = tombstone ? ` WHERE "${tombstone}" IS NULL` : '';
+
+        const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}${liveOnly}`);
         const order = state.pkCols.length
           ? state.pkCols.map((c) => `"${c}" ASC`).join(', ')
           : 'rowid ASC';
-        const rows = await sql(`SELECT * FROM ${table} ORDER BY ${order} LIMIT 100`);
+        const rows = await sql(`SELECT * FROM ${table}${liveOnly} ORDER BY ${order} LIMIT 100`);
         newState[table] = {
           columns: state.columns,
           rows: rows,
@@ -484,6 +514,13 @@ export default function App() {
         : [];
     const cols: { name: string; type: string }[] = val.sqlite.columns;
     const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
+
+    // Which column marks a row deleted, or null when this table deletes physically. The
+    // bridge publishes it because it is a SYNC_RULES decision, not a schema one — the same
+    // table can soft-delete in one deployment and not in another, so a client that guessed
+    // from the column list would be wrong half the time.
+    const tombstoneColumn: string | null =
+      typeof val.tombstone_column === 'string' ? val.tombstone_column : null;
     const names = cols.map((c) => c.name);
 
     const existing = syncedTables.get(table);
@@ -547,7 +584,7 @@ export default function App() {
         await sql(`CREATE TABLE ${table} (${cols.map(ddl).join(', ')}${tableConstraint});`);
         appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
       } else if (added.length === 0 && removed.length === 0) {
-        syncedTables.set(table, { pkCols, columns: names, lsn });
+        syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn });
         return; // identical schema, e.g. a boot republish
       } else {
         // Apply in place where SQLite allows it. DROP COLUMN exists since 3.35 and
@@ -577,7 +614,7 @@ export default function App() {
       await sql(`DROP VIEW IF EXISTS ${table}_view;`);
       if (viewCols) await sql(`CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`);
 
-      syncedTables.set(table, { pkCols, columns: names, lsn });
+      syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn });
       setTableCount(syncedTables.size);
 
       await drainPending(table);

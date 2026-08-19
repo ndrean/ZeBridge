@@ -110,8 +110,16 @@ pub fn main(init: std.process.Init) !void {
         const table = std.mem.trim(u8, trimmed[0..colon], " ");
         const cols = trimmed[colon + 1 ..];
         // First column is the version, the optional second is the tombstone.
-        const comma = std.mem.indexOfScalar(u8, cols, ',') orelse continue;
-        const tombstone = std.mem.trim(u8, cols[comma + 1 ..], " ");
+        // ⚠️ The SECOND field, bounded on both sides. This took everything after the first
+        // comma, which was correct while `SYNC_RULES` had at most two columns and broke
+        // silently the day a third (the tiebreak column) was added: it parsed
+        // `updated_at,deleted_at,last_writer` into a tombstone called
+        // "deleted_at,last_writer" and every sweep failed with
+        // `column "deleted_at,last_writer" does not exist` — visible only in the sidecar's
+        // own output, while the bridge looked healthy.
+        var field_it = std.mem.splitScalar(u8, cols, ',');
+        _ = field_it.next(); // the version column
+        const tombstone = std.mem.trim(u8, field_it.next() orelse continue, " ");
         if (table.len == 0 or tombstone.len == 0) continue;
         try sweeps.append(allocator, .{ .table = table, .tombstone = tombstone });
     }

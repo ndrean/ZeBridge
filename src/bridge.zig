@@ -953,6 +953,38 @@ pub fn main(init: std.process.Init) !void {
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_del;
                                     if (event_proc.refused.shouldDrop(rel.name)) break :blk_del;
+
+                                    // ── The sweeper's reaps are not client data ──────────
+                                    //
+                                    // A table with a tombstone column never deletes from the
+                                    // edge: `applyDelete` turns a client's delete into an
+                                    // UPDATE that sets the tombstone, and clients act on that.
+                                    // The only DELETEs such a table ever produces are the
+                                    // sweeper reaping rows whose tombstones have aged out —
+                                    // rows every client already removed when the soft delete
+                                    // arrived.
+                                    //
+                                    // Forwarding them costs a message per reaped row per
+                                    // client, for a row they know is gone, and a sweep of a
+                                    // million tombstones is a million such messages.
+                                    //
+                                    // ⚠️ Suppressed **here**, not in PostgreSQL, because
+                                    // PostgreSQL cannot express it. Measured: `publish` is a
+                                    // publication-level option, so it cannot be set per table;
+                                    // publications *union*, so a second one with
+                                    // `publish='insert,update'` still emits the delete when
+                                    // both are named on the slot; and a row filter
+                                    // (`WHERE deleted_at IS NULL`) makes the table unwritable,
+                                    // because the filter column is not in the replica identity.
+                                    //
+                                    // ⚠️ Only for tables that HAVE a tombstone. A table
+                                    // without one deletes physically, those deletes are the
+                                    // real thing, and dropping them would leave the row in
+                                    // every replica forever with no later event to remove it.
+                                    if (event_proc.hasTombstone(rel.name)) {
+                                        log.debug("🧹 suppressed reap DELETE on '{s}': soft-deleted rows already reached clients as an update", .{rel.name});
+                                        break :blk_del;
+                                    }
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
                                         for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
