@@ -241,3 +241,62 @@ td {
 tbody tr:hover {
   background: #252525;
 }
+
+/* ── the startup state machine ─────────────────────────────────────────────
+   Each cell greens once and stays green. The question a reader has is never
+   "what is happening now" but "how far did it get" — a client stuck between
+   `migrated` and `snapshot` looks identical to a healthy one in a log tail. */
+.phases {
+  display: flex;
+  gap: 0;
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0;
+  font-size: 0.8rem;
+}
+.phases li {
+  flex: 1;
+  padding: 0.35rem 0.6rem;
+  text-align: center;
+  background: #2b2b2b;
+  color: #888;
+  border: 1px solid #3a3a3a;
+  border-right: none;
+  transition: background 200ms, color 200ms;
+}
+.phases li:last-child { border-right: 1px solid #3a3a3a; }
+.phases li.done { background: #1b5e20; color: #d7ffd9; }
+
+/* ── the replica summary ───────────────────────────────────────────────────
+   Counts, not rows. The grid this replaced queried 100 rows per table per
+   second and rendered them, which is most of what made the UI thread the
+   bottleneck during a burst. */
+.tables-summary { width: 100%; border-collapse: collapse; margin-bottom: 1rem; }
+.tables-summary th, .tables-summary td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #333;
+  text-align: left;
+}
+.tables-summary th { font-size: 0.75rem; text-transform: uppercase; color: #888; }
+.tables-summary td.count { font-variant-numeric: tabular-nums; font-size: 1.1rem; }
+.tables-summary .readonly { color: #777; font-size: 0.8rem; }
+.row-actions button { margin-right: 0.3rem; padding: 0.15rem 0.5rem; font-size: 0.75rem; }
+
+/* The last CDC verb, held until the next event. Fixed width so the row does not reflow
+   when the verb changes length (INS/DEL vs UP) — a table that jumps on every event is
+   unreadable during a burst. */
+.verb {
+  display: inline-block;
+  width: 3.2rem;
+  padding: 0.1rem 0;
+  text-align: center;
+  font-weight: 700;
+  font-size: 0.75rem;
+  border-radius: 3px;
+  color: #fff;
+  background: transparent;
+  transition: background 120ms ease-out;
+}
+.verb-INS { background: #2e7d32; }
+.verb-UP  { background: #ef6c00; }
+.verb-DEL { background: #c62828; }

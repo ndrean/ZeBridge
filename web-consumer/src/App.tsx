@@ -27,8 +27,39 @@ const NATS_URL = 'ws://localhost:8080';
 /// the server in `nats-server.conf.template`: publishing `mutation.bob.…` as alice is
 /// refused by NATS before the bridge ever sees it, so the bridge can trust the token
 /// without checking anything.
-const PRINCIPAL = 'alice';
-const PASSWORD = 's3cret';
+///
+/// ⚠️ Read from the environment so two dev servers can run as two different principals:
+///
+///     VITE_PRINCIPAL=alice VITE_PASSWORD=s3cret pnpm dev --port 5173
+///     VITE_PRINCIPAL=bob   VITE_PASSWORD=s3cret pnpm dev --port 5174
+///
+/// The name must exist as a NATS user with a matching `mutation.<principal>.>` grant, or
+/// the connection is refused at authentication — before any of this code runs.
+const PRINCIPAL = (import.meta.env.VITE_PRINCIPAL as string | undefined) ?? 'alice';
+const PASSWORD = (import.meta.env.VITE_PASSWORD as string | undefined) ?? 's3cret';
+
+/// The tenant subtree this client reads, when the deployment routes CDC by tenant.
+///
+/// ⚠️ **RLS does not bound reads.** It bounds what a principal may write and what a
+/// snapshot may select; what stops one tenant *reading* another's rows is this subject
+/// plus the matching NATS permission. A client granted `cdc.>` sees every tenant however
+/// perfect the policies are — which is why this is set alongside the principal, not
+/// derived from it.
+///
+/// Unset means the deployment is not tenant-routed and CDC arrives on `cdc.<table>.<op>`.
+///
+///     VITE_PRINCIPAL=alice VITE_TENANT=acme   pnpm dev --port 5173
+///     VITE_PRINCIPAL=bob   VITE_TENANT=globex pnpm dev --port 5174
+const TENANT = (import.meta.env.VITE_TENANT as string | undefined) ?? '';
+
+/// Tables the bridge publishes on the **bare** `cdc.<table>.<op>` subject because they
+/// carry no tenant column (nothing names them in the bridge's `TENANT_RULES`).
+///
+/// ⚠️ These are invisible to a `cdc.<tenant>.>` filter, and invisible in the worst way:
+/// a filtered consumer does not merely lag on them, it never counts them as pending, so
+/// it reports `num_pending: 0` and looks fully caught up while the rows sit unread in the
+/// stream. That reads exactly like an idle database. Mirrors `zebridge_public_tables`.
+const PUBLIC_TABLES = (topology as any).public_tables as string[] ?? [];
 
 /// ⚠️ A password in a browser bundle is **enforced, not secret**. Anyone with devtools
 /// reads it and can then write as `alice` from curl. What this buys is real and worth
@@ -202,6 +233,17 @@ const failedTables = new Set<string>();
 
 // Non-reactive state for sync tracking
 const syncedTables = new Map<string, TableState>();
+
+/// ⚠️ `syncedTables` is a plain Map, so Solid cannot track it. `<For each={[...keys()]}>`
+/// read it once at mount — when it is still empty, because tables are discovered
+/// asynchronously from the KV schema watch — and never re-ran, so the Replica table
+/// rendered no rows at all.
+///
+/// This signal mirrors the key set and is what the view iterates. Every `set`/`delete`
+/// on the map must be followed by `refreshTableNames()`; the map stays the source of
+/// truth for state, this is only the render order.
+const [syncedTableNames, setSyncedTableNames] = createSignal<string[]>([]);
+const refreshTableNames = () => setSyncedTableNames([...syncedTables.keys()].sort());
 let globalSyncState = { lsn: 0, seq: 0 };
 
 /**
@@ -219,10 +261,34 @@ let nc: NatsConnection | null = null;
 
 export default function App() {
   const [status, setStatus] = createSignal<'connected' | 'disconnected' | 'connecting'>('disconnected');
-  const [dbState, setDbState] = createSignal<Record<string, { columns: string[], rows: any[], count: number }>>({});
   const [pendingCount, setPendingCount] = createSignal(0);
-  const [tableCount, setTableCount] = createSignal(0);
   const [suspended, setSuspended] = createSignal<Record<string, string>>({});
+
+  /// The four things that must happen before a replica is trustworthy, in order.
+  ///
+  /// Shown as a strip rather than a log line because the interesting question is never
+  /// "what is happening now" but "how far did it get" — a client stuck between `migrated`
+  /// and `snapshot` looks identical to a healthy one in a log tail.
+  const [phase, setPhase] = createSignal<Record<string, boolean>>({
+    connected: false, migrated: false, snapshot: false, cdc: false,
+  });
+  const reach = (p: string) => setPhase((prev) => ({ ...prev, [p]: true }));
+
+  /// The bridge's own view of itself, polled through the Vite proxy (see vite.config.ts —
+  /// it cannot be fetched directly under COEP).
+  const [health, setHealth] = createSignal<'up' | 'down' | 'unknown'>('unknown');
+
+  /// The tenant this client can see. ⚠️ Not configured anywhere client-side and not in the
+  /// schema — it is *discovered*: RLS only ever showed us rows for our own tenant, so
+  /// whatever `tenant_id` is in the local replica is, by construction, ours.
+  const [tenant, setTenant] = createSignal<string>('—');
+
+  /// Per-table row counts, and the last CDC verb, for the flash.
+  const [counts, setCounts] = createSignal<Record<string, number>>({});
+  const [lastVerb, setLastVerb] = createSignal<Record<string, string>>({});
+  /// Which tables log their events to the console. Off by default: a burst from the
+  /// emitter is noisy enough to hide everything else.
+  const [logging, setLogging] = createSignal<Record<string, boolean>>({});
 
   const appendLog = (topic: string, data: any, opType = '') => {
     if (['INSERT', 'UPDATE', 'DELETE', 'snapshot', 'CDC'].includes(opType)) {
@@ -233,50 +299,42 @@ export default function App() {
     console.log(`[${timestamp}] ${topic} ${opType}:`, bodyStr);
   };
 
-  const refreshLocalDb = async () => {
-    if (!syncedTables.size) {
-      setDbState({});
-      return;
-    }
-    const newState: Record<string, { columns: string[], rows: any[], count: number }> = {};
+  /// Recount every synced table. Counts only — the row grid it replaced queried 100 rows
+  /// per table per second and rendered them, which is most of what made the UI thread the
+  /// bottleneck during a burst.
+  const recount = async () => {
+    const next: Record<string, number> = {};
     for (const [table, state] of syncedTables) {
       try {
-        // ⚠️ Soft-deleted rows are still **here**, and must be filtered out.
-        //
-        // A delete on a tombstoned table arrives as `cdc.<table>.update` with the tombstone
-        // set — because that is literally what happened in PostgreSQL — so the applier
-        // takes the UPSERT branch and the row stays in the local replica carrying its
-        // `deleted_at`. That is correct and deliberate: the row has to survive locally for
-        // an offline edit to be overruled rather than resurrecting it (§7.5). But a query
-        // that does not filter shows the user rows they deleted.
-        //
-        // The bridge does not send a later `delete` for these — the sweeper's reap is
-        // suppressed, since the client already acted on the tombstone update. So this
-        // filter is not an optimisation; without it a deleted row is visible forever.
-        //
-        // Discovered from the tombstone column in the schema descriptor, not hardcoded:
-        // a table without one deletes physically, its rows are gone from SQLite, and
-        // adding `WHERE deleted_at IS NULL` to it would fail on a column that does not
-        // exist.
-        const tombstone = state.tombstoneColumn;
-        const liveOnly = tombstone ? ` WHERE "${tombstone}" IS NULL` : '';
-
-        const countRes = await sql(`SELECT COUNT(*) as count FROM ${table}${liveOnly}`);
-        const order = state.pkCols.length
-          ? state.pkCols.map((c) => `"${c}" ASC`).join(', ')
-          : 'rowid ASC';
-        const rows = await sql(`SELECT * FROM ${table}${liveOnly} ORDER BY ${order} LIMIT 100`);
-        newState[table] = {
-          columns: state.columns,
-          rows: rows,
-          count: countRes[0]?.count ?? 0,
-        };
-      } catch (err) {
-        // ignore
-      }
+        // Soft-deleted rows are still present locally and must not be counted — same rule
+        // the row query used, and for the same reason (§7.5).
+        const liveOnly = state.tombstoneColumn ? ` WHERE "${state.tombstoneColumn}" IS NULL` : '';
+        const r = await sql(`SELECT COUNT(*) as count FROM ${table}${liveOnly}`);
+        next[table] = r[0]?.count ?? 0;
+      } catch { /* table not ready yet */ }
     }
-    setDbState(newState);
+    setCounts(next);
+
+    // The tenant, read back out of whatever RLS let us have.
+    try {
+      const t = await sql(`SELECT tenant_id FROM test_types WHERE tenant_id IS NOT NULL LIMIT 1`);
+      if (t[0]?.tenant_id) setTenant(t[0].tenant_id);
+    } catch { /* table may not exist in this deployment */ }
   };
+
+  /// ⚠️ Debounced, and triggered by CDC — **not** by the click that sent a mutation.
+  ///
+  /// A write travels client → NATS → bridge → PostgreSQL → CDC → here, so the local row
+  /// appears when the event is *applied*, not when the PubAck returns. Counting in a
+  /// `.finally` on the publish would read the number from before the write, every time.
+  /// Recounting on apply is also what makes the emitter's writes — which this client never
+  /// clicked — show up at all.
+  let recountTimer: number | undefined;
+  const scheduleRecount = () => {
+    clearTimeout(recountTimer);
+    recountTimer = setTimeout(recount, 250) as unknown as number;
+  };
+
 
 
   /// Writes published but not yet accounted for, keyed by the `Nats-Msg-Id` sent with
@@ -462,10 +520,12 @@ export default function App() {
       });
 
       setStatus('connected');
+      reach('connected');
       appendLog('SYS', `Connected to NATS over WebSockets as '${PRINCIPAL}'`);
       await watchSchemas();
       await watchVerdicts();
       await subscribeStreams();
+      reach('cdc');
     } catch (err) {
       setStatus('disconnected');
       appendLog('SYS', `Connection failed: ${err}`);
@@ -570,7 +630,7 @@ export default function App() {
       await sql(`DROP VIEW IF EXISTS ${table}_view;`);
       await sql(`DROP TABLE IF EXISTS ${table};`);
       syncedTables.delete(table);
-      setTableCount(syncedTables.size);
+      refreshTableNames();
       appendLog('SCHEMA', `Dropped local table "${table}" (${reason})`, 'DROP');
     } catch (err) {
       appendLog('SCHEMA', `Drop of ${table} failed: ${err}`, 'ERROR');
@@ -667,6 +727,8 @@ export default function App() {
         appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
       } else if (added.length === 0 && removed.length === 0) {
         syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn });
+        refreshTableNames();
+        reach('migrated');
         return; // identical schema, e.g. a boot republish
       } else {
         // Apply in place where SQLite allows it. DROP COLUMN exists since 3.35 and
@@ -697,7 +759,11 @@ export default function App() {
       if (viewCols) await sql(`CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`);
 
       syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn });
-      setTableCount(syncedTables.size);
+      refreshTableNames();
+      // ⚠️ Both registration paths mark the phase. Marking only one left `migrated`
+      // grey on a client that took the other, while `snapshot` went green after it —
+      // a strip that lies is worse than no strip.
+      reach('migrated');
 
       await drainPending(table);
     } catch (err) {
@@ -723,9 +789,33 @@ export default function App() {
     for (const p of mine) await applyEvent(p.table, p.ev);
   };
 
+  /// INS green, UP orange, DEL red — held for 500ms, then cleared.
+  ///
+  /// ⚠️ A soft delete arrives as an **UPDATE** with the tombstone set (§7.5), so it is
+  /// shown as DEL rather than UP: the verb a user cares about is the intent, not the SQL.
+  /// The last CDC verb for a table, held until the next event replaces it.
+  ///
+  /// ⚠️ Deliberately persistent, not a flash. It used to clear after 500 ms, which meant
+  /// the column was blank almost all the time: on a quiet table you had to be looking at
+  /// the exact half-second an event landed to see anything at all. Holding the last verb
+  /// makes the row answer "what happened here, and what kind of change was it?" at any
+  /// moment, which is the question it exists to answer.
+  const markVerb = (table: string, ev: any) => {
+    const state = syncedTables.get(table);
+    const tombstoned = state?.tombstoneColumn && ev?.data?.[state.tombstoneColumn] != null;
+    const verb = tombstoned ? 'DEL'
+      : ev.operation === 'INSERT' ? 'INS'
+      : ev.operation === 'DELETE' ? 'DEL'
+      : 'UP';
+    setLastVerb((prev) => ({ ...prev, [table]: verb }));
+    if (logging()[table]) console.log(`[${table}] ${verb}`, ev.data);
+  };
+
   const applyEvent = async (table: string, ev: any) => {
     const state = syncedTables.get(table);
     if (!state || !ev?.data) return;
+    markVerb(table, ev);
+    scheduleRecount();
 
     // The LSN gate: skip events the snapshot already contains.
     //
@@ -952,6 +1042,7 @@ export default function App() {
                 // boot, so a table added to the publication after the bridge started is
                 // refused a snapshot until it restarts.
                 syncedTables.delete(table);
+                refreshTableNames();
                 failedTables.add(table);
                 appendLog('SYS', `Giving up on ${table} after ${SNAPSHOT_REQUEST_ATTEMPTS} attempts — NOT following CDC for it, the local copy would silently diverge. If the table was added to the publication after the bridge started, restart the bridge.`, 'ERROR');
               }
@@ -959,6 +1050,7 @@ export default function App() {
 
             if (desc) {
               appendLog('SYS', `Snapshot metadata ready for ${table} (LSN ${desc.lsn}). Replaying...`, 'INFO');
+              reach('snapshot');
               
               const pullPromise = (async () => {
                 await sql(`DELETE FROM ${table}`);
@@ -1036,7 +1128,25 @@ export default function App() {
     try {
       console.log('App.tsx: Starting CDC consumer on subject:', `${topology.subjects.cdc_prefix}.>`);
       const ci = await jsm.consumers.add(topology.streams.cdc, {
-        filter_subject: `${topology.subjects.cdc_prefix}.>`,
+        // ⚠️ Two subject shapes reach a tenant client, and one filter cannot cover both:
+        //
+        //     cdc.<tenant>.<table>.<op>   tables named in the bridge's TENANT_RULES
+        //     cdc.<table>.<op>            public tables — no tenant column (PUBLIC_TABLES)
+        //
+        // `filter_subjects` (plural, NATS 2.10+) is **exclusive of** `filter_subject`:
+        // set one or the other, never both, or the server rejects the consumer.
+        //
+        // Subscribing to a subject this principal is not granted fails **silently** — the
+        // subscription is created, the connection stays up, and no message ever arrives —
+        // so a wrong tenant here looks exactly like an idle database.
+        ...(TENANT
+          ? {
+              filter_subjects: [
+                `${topology.subjects.cdc_prefix}.${TENANT}.>`,
+                ...PUBLIC_TABLES.map((t) => `${topology.subjects.cdc_prefix}.${t}.>`),
+              ],
+            }
+          : { filter_subject: `${topology.subjects.cdc_prefix}.>` }),
         deliver_policy: globalSyncState.seq > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
         opt_start_seq: globalSyncState.seq > 0 ? globalSyncState.seq + 1 : undefined,
       });
@@ -1052,7 +1162,11 @@ export default function App() {
 
           for (const ev of events) {
             ev.seq = msg.seq;
-            const table = ev?.table || msg.subject.split('.')[1];
+            // cdc.<tenant>.<table>.<op> has the table at [2]; the bare
+            // cdc.<table>.<op> has it at [1]. Taking [1] unconditionally yielded the
+            // *tenant* for routed subjects — harmless only while ev.table is present.
+            const parts = msg.subject.split('.');
+            const table = ev?.table || (parts.length >= 4 ? parts[2] : parts[1]);
             appendLog(msg.subject, ev, ev?.operation || 'CDC');
             if (table) await applyEvent(table, ev);
           }
@@ -1089,7 +1203,16 @@ export default function App() {
 ///    outlive the identity and the retry would write the row twice.
 ///  - **`client_id` becoming a real tiebreaker.** Then every client sharing this constant
 ///    means ties cannot be broken between them, and two replicas can stay divergent.
-const CLIENT_ID = '1234567890123456';
+const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
+// ⚠️ Per **tab**, not per user. `PRINCIPAL` is the account NATS authenticated; this is the
+// writer, and last-write-wins breaks an equal-version tie on it (§7.3). Two tabs sharing
+// one constant — which is what this was — cannot have a tie broken between them, so two
+// replicas of the same row can stay divergent forever with no error. That is exactly the
+// two-window demo.
+//
+// Per-load is consistent with the replica, which is also per-load (see DB_NAME). The
+// moment the replica becomes durable this has to move into it — see NOTES.md §1.9, which
+// explains why `localStorage` is the wrong home.
 
   /// Render "now" as a value for the table's version column.
   ///
@@ -1130,58 +1253,72 @@ const CLIENT_ID = '1234567890123456';
     return candidate;
   };
 
-  const publishMutation = async () => {
+
+  /// The three buttons on `test_types`. Each sends one mutation and returns immediately —
+  /// ⚠️ **the count does not update here**. It updates when the CDC echo is applied
+  /// (`scheduleRecount`), because that is when the row actually exists locally. Counting
+  /// in a `.finally` on the publish would read the number from before the write.
+  const insertRandom = async () => {
     if (!nc) return;
-    const table = 'test_types';
-    const op = 'INSERT';
-    // The client mints the key. `test_types.uid` is `uuid` with no sequence behind it, so
-    // there is no shared allocator to contend over: a client-chosen key and a
-    // server-chosen one coexist with no bookkeeping (PROTOCOL.md §7.2).
-    //
-    // v7 rather than `crypto.randomUUID()`'s v4 — same collision safety, but the leading
-    // 48-bit timestamp keeps index inserts append-only instead of scattering them across
-    // the B-tree.
-    //
-    // This replaces a `9_000_000_000 + random` band, which was a workaround for the table's
-    // former `bigserial` key: an explicit id does not advance the sequence, so every edge
-    // write planted a duplicate-key collision the application would hit later.
     const id = uuidv7();
-
     const version = versionNow();
-
-    // The envelope is PROTOCOL.md §7.2. `table` and `operation` are deliberately absent:
-    // they come from the subject, and a payload copy is ignored rather than merged — so
-    // including them would only invite the two to disagree.
-    //
-    // This previously sent `primary_key` and `hlc`, which the bridge refused as
-    // MissingPrimaryKey / MissingVersion. The names are not sniffed or aliased.
-    const payload = {
+    await sendMutation('test_types', 'INSERT', id, version, {
       key: { uid: id },
       data: {
         uid: id,
-        some_text: 'Manual Button Simulator!',
-        age: 42,
-        price: 99.99,
-        is_true: true,
-        // The version column is part of the row, so it must carry the same value as
-        // `version` — that is the value LWW will store and compare against next time.
+        some_text: `random ${Math.floor(Math.random() * 10_000)}`,
+        age: Math.floor(Math.random() * 90),
+        is_true: Math.random() > 0.5,
+        tenant_id: tenant() === '—' ? undefined : tenant(),
         updated_at: version,
-        // ⚠️ Required, and nothing in the protocol says so. `inserted_at` is NOT NULL
-        // with no DEFAULT, so an INSERT omitting it fails — and the schema descriptor
-        // published to KV carries only column *names and types*, never nullability or
-        // defaults, so a client cannot discover this. Worse, the failure is classified
-        // transient: it is retried to max_deliver and only then dead-lettered, so the
-        // symptom is a write that silently never lands rather than a clear rejection.
-        //
-        // Sending it on every upsert also rewrites the creation time on an update, which
-        // is wrong in general — a real client would send it only on insert.
-        inserted_at: version
+        inserted_at: version,
       },
       version,
-      client_id: CLIENT_ID
-    };
+      client_id: CLIENT_ID,
+    });
+  };
 
-    await sendMutation(table, op, id, version, payload);
+  /// The most recently touched live row, read from the local replica.
+  ///
+  /// ⚠️ `deleted_at IS NULL` — a soft-deleted row is still here (§7.5), and updating one
+  /// would be writing to something the user already deleted.
+  const lastLiveUid = async (): Promise<string | null> => {
+    try {
+      const r = await sql(
+        `SELECT uid FROM test_types WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1`,
+      );
+      return r[0]?.uid ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const updateLast = async () => {
+    if (!nc) return;
+    const uid = await lastLiveUid();
+    if (!uid) return appendLog('SYS', 'nothing live to update', 'WARNING');
+    const version = versionNow();
+    await sendMutation('test_types', 'UPDATE', uid, version, {
+      key: { uid },
+      data: { uid, some_text: `updated ${new Date().toLocaleTimeString()}`, updated_at: version },
+      version,
+      client_id: CLIENT_ID,
+    });
+  };
+
+  /// ⚠️ A delete from the edge is a **soft** delete (§7.5): it arrives back as an UPDATE
+  /// setting the tombstone, not as a CDC delete. That is why the verb reads the
+  /// tombstone rather than the operation.
+  const deleteLast = async () => {
+    if (!nc) return;
+    const uid = await lastLiveUid();
+    if (!uid) return appendLog('SYS', 'nothing live to delete', 'WARNING');
+    const version = versionNow();
+    await sendMutation('test_types', 'DELETE', uid, version, {
+      key: { uid },
+      version,
+      client_id: CLIENT_ID,
+    });
   };
 
   /// Write to `users`, which is **outbound-only**: it has no `bridge_writer` grant.
@@ -1322,7 +1459,37 @@ const CLIENT_ID = '1234567890123456';
 
   initNats();
 
-    const intervalId = setInterval(refreshLocalDb, 1000);
+    // ⚠️ No longer a 1-second poll of every row. Counts are recomputed when CDC lands
+    // (`scheduleRecount`), so an idle client does no work at all; this interval only asks
+    // the bridge how it is doing.
+    void recount();
+
+    /// ⚠️ Fetched through the Vite proxy (`/bridge/*`), never at `127.0.0.1:9090` directly.
+    /// This page sets `Cross-Origin-Embedder-Policy: require-corp` for OPFS, and under COEP
+    /// a cross-origin response needs CORS *and* CORP headers — which the bridge does not
+    /// send, and should not, since the same server exposes an unauthenticated `/metrics`.
+    let healthWarned = false;
+    const pollHealth = async () => {
+      try {
+        const r = await fetch('/bridge/health', { signal: AbortSignal.timeout(3000) });
+        setHealth(r.ok ? 'up' : 'down');
+        healthWarned = false;
+      } catch (err: any) {
+        // The bridge being unreachable is not the same as NATS being down — they fail
+        // independently, which is the point of showing both badges.
+        setHealth('down');
+        // Once per outage, not once per poll: the reason matters and the repetition does
+        // not. `ERR_INTERNET_DISCONNECTED` here while NATS stays connected is almost always
+        // DevTools' Network tab set to Offline — it blocks fetch but leaves an open
+        // WebSocket alive, which is exactly that combination.
+        if (!healthWarned) {
+          healthWarned = true;
+          appendLog('SYS', `bridge /health unreachable: ${err?.message ?? err}`, 'WARNING');
+        }
+      }
+    };
+    void pollHealth();                                   // immediately, not in 10s
+    const intervalId = setInterval(pollHealth, 10_000);
     const sweepId = setInterval(sweepPendingWrites, 1000);
 
     onCleanup(() => {
@@ -1338,60 +1505,90 @@ const CLIENT_ID = '1234567890123456';
           <div class="status-bar">
             <span class={`badge ${status()}`}>{status().toUpperCase()}</span>
             <span id="server-url">{NATS_URL}</span>
-            <span id="sync-state">tables: {tableCount()} · held events: {pendingCount()}</span>
+            <span class={`badge ${health() === 'up' ? 'connected' : 'disconnected'}`}>
+              bridge {health()}
+            </span>
+            <span id="sync-state">
+              principal <strong>{PRINCIPAL}</strong> · client <strong>{CLIENT_ID}</strong>
+              {' '}· tenant <strong>{TENANT || tenant()}</strong>
+              {TENANT ? '' : ' (from data)'}
+              {' '}· held {pendingCount()}
+            </span>
           </div>
+
+          {/* The startup state machine. Each cell greens once and stays green — the useful
+              signal is how FAR it got, which a log tail cannot show at a glance. */}
+          <ul class="phases">
+            <For each={[
+              ['connected', 'NATS connected'],
+              ['migrated', 'schema migrated'],
+              ['snapshot', 'snapshot replayed'],
+              ['cdc', 'CDC active'],
+            ]}>
+              {([key, label]) => (
+                <li classList={{ done: phase()[key] }}>{label}</li>
+              )}
+            </For>
+          </ul>
         </header>
 
         <For each={Object.entries(suspended())}>
           {([table, reason]) => (
             <div class="suspended-banner">
               ⏸ <strong>{table}</strong> is suspended upstream ({reason}). Local rows are frozen and
-              still valid, but no new events or snapshots will arrive until a primary key is added.
+              still valid, but no new events or snapshots will arrive until the shape is fixed.
             </div>
           )}
         </For>
 
-        <div class="controls">
-          <button onClick={refreshLocalDb} style="background: #2e7d32;">Refresh Local DB</button>
-          <button onClick={publishMutation} style="background: #e65100;">Push Mutation (test_types)</button>
-          <button onClick={publishToReadOnlyTable} style="background: #6a1b9a;">Push to users — no grant (verdict in ~4s)</button>
-          <button onClick={publishMalformed} style="background: #b71c1c;">Push malformed — no key (verdict now)</button>
-        </div>
-
         <main>
-          <h3>Local Database State</h3>
-          <div class="tables-container">
-            <For each={Object.entries(dbState())}>
-              {([tableName, data]) => (
-                <div class="table-view">
-                  <h4>{tableName} <span class="row-count">({data.count} rows)</span></h4>
-                  {data.rows.length === 0 ? (
-                    <p>No rows in table.</p>
-                  ) : (
-                    <table>
-                      <thead>
-                        <tr>
-                          <For each={data.columns}>
-                            {(col) => <th>{col}</th>}
-                          </For>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={data.rows}>
-                          {(row) => (
-                            <tr>
-                              <For each={data.columns}>
-                                {(col) => <td>{String(row[col])}</td>}
-                              </For>
-                            </tr>
-                          )}
-                        </For>
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              )}
-            </For>
+          <h3>Replica</h3>
+          <table class="tables-summary">
+            <thead>
+              <tr><th>table</th><th>rows</th><th>last CDC</th><th>log</th><th>actions</th></tr>
+            </thead>
+            <tbody>
+              <For each={syncedTableNames()}>
+                {(t) => (
+                  <tr>
+                    <td><strong>{t}</strong></td>
+                    <td class="count">{counts()[t] ?? 0}</td>
+                    {/* Last CDC verb, held until the next: green INS, orange UP, red DEL. */}
+                    <td>
+                      <span class={`verb ${lastVerb()[t] ? 'verb-' + lastVerb()[t] : ''}`}>
+                        {lastVerb()[t] || ''}
+                      </span>
+                    </td>
+                    <td>
+                      <input
+                        type="checkbox"
+                        checked={!!logging()[t]}
+                        onChange={(e) =>
+                          setLogging((prev) => ({ ...prev, [t]: e.currentTarget.checked }))
+                        }
+                      />
+                    </td>
+                    <td>
+                      {t === 'test_types' ? (
+                        <span class="row-actions">
+                          <button onClick={() => void insertRandom()}>INS</button>
+                          <button onClick={() => void updateLast()}>UP</button>
+                          <button onClick={() => void deleteLast()}>DEL</button>
+                        </span>
+                      ) : (
+                        <em class="readonly">read-only</em>
+                      )}
+                    </td>
+                  </tr>
+                )}
+              </For>
+            </tbody>
+          </table>
+
+          <div class="controls">
+            <button onClick={recount} style="background: #2e7d32;">Recount</button>
+            <button onClick={publishToReadOnlyTable} style="background: #6a1b9a;">Push to users — refused</button>
+            <button onClick={publishMalformed} style="background: #b71c1c;">Push malformed — verdict now</button>
           </div>
         </main>
       </>
