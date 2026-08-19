@@ -19,6 +19,42 @@ row. They are marked ⚠️.
 
 ---
 
+## 0. Two sources of truth, and one direction
+
+**PostgreSQL is the source of truth for anything about the catalogue. NATS is the source
+of truth for consumers. The bridge projects one onto the other, and never reads its own
+output back.**
+
+Everything else in this document assumes it, and it settles a whole class of design
+questions at once rather than one at a time. Three that look reasonable and are not:
+
+* **Decoding WAL tuples against the published schema.** A `RELATION` message is protocol,
+  not cache: it arrives inline at the LSN where the shape changed and describes the tuples
+  that immediately follow, which are decoded **positionally**. On replay the correct shape
+  is the one that was live at that LSN, not the one the catalogue holds now.
+* **Building SQL from the published schema.** The write path is about to execute against
+  the catalogue, in a transaction. If the two disagree the catalogue wins by definition —
+  the statement either runs or it does not.
+* **Invalidating a bridge-side cache by watching the KV.** The `schemas` bucket is
+  *behind* the catalogue by the ring buffer plus the flush window, and it is produced by
+  the bridge itself: a failed publish would become a correctness bug, and an empty bucket
+  could not bootstrap.
+
+So invalidation signals travel the **WAL**, like the data: the DDL event trigger writes a
+row to `zebridge_ddl_events`, that row reaches the bridge in stream order, and the bridge
+bumps a catalog epoch (`src/catalog_epoch.zig`) that its caches compare against.
+
+⚠️ **`zebridge_ddl_events` must stay in the publication**, or this entire mechanism goes
+quiet without failing: the trigger still fires, the row is still written, CDC keeps
+flowing for every other table, and the bridge simply never hears about a migration again.
+Preflight checks it at boot and says so loudly (`src/preflight.zig`, `checkDdlPipeline`).
+
+⚠️ **A cache that needs a bridge restart to be correct is a bug, not a limitation.** That
+is process state the database can silently contradict with no path back. Tested end to end
+by `scripts/scenarios/invalidate.py`, which covers all four caches a migration must reach.
+
+---
+
 ## 1. Vocabulary — `topology.json` is the single source
 
 Every stream, subject and bucket name comes from `topology.json` at the repository

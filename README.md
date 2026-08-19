@@ -1274,9 +1274,17 @@ PostgreSQL LSN ACK
 
 * Zig 0.16.0 or later
 * Docker & Docker Compose (for PostgreSQL and NATS)
-* `libpq` — the only C dependency, linked from the system
+* `libpq` **14 or later** — the only C dependency, linked from the system
   (`brew install libpq` on macOS, `apk add postgresql-dev` / `apt install libpq-dev`
   on Linux). Override its location with `zig build -Dlibpq-prefix=/path`.
+
+  ⚠️ The version floor is on **libpq at build time, not on the PostgreSQL server**. The
+  write path uses pipeline mode (`PQenterPipelineMode`, libpq 14+), which the libpq
+  documentation describes as *"client-side and compatible with any server supporting the
+  v3 extended query protocol"* — so the database itself can be far older. It buys a
+  mutation costing **one** network round trip instead of four, which is the difference
+  between ~20 ms and ~80 ms per row against a remote database and is invisible when
+  PostgreSQL is on the same host.
 
 There is no vendored-library build step: the NATS client is pure Zig and lives in
 `src/nats_vendor/`.

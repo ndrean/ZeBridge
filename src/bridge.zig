@@ -16,10 +16,10 @@ const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const schema_publisher = @import("schema_publisher.zig");
-const schema_cache_mod = @import("schema_cache.zig");
 const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
 const mutation_listener = @import("mutation_listener.zig");
+const catalog_epoch_mod = @import("catalog_epoch.zig");
 const encoder_mod = @import("encoder.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
@@ -44,10 +44,10 @@ comptime {
     _ = @import("publication.zig");
     _ = @import("preflight.zig");
     _ = @import("refused_tables.zig");
+    _ = @import("catalog_epoch.zig");
     _ = @import("type_registry.zig");
     _ = @import("pg_copy_binary.zig");
     _ = @import("snapshot_listener.zig");
-    _ = @import("schema_cache.zig");
     _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");
     _ = @import("streaming_encoder.zig");
@@ -470,8 +470,6 @@ pub fn main(init: std.process.Init) !void {
     http_srv.refused = &refused;
 
     // Initialize schema cache for tracking relation_id changes
-    var schema_cache = schema_cache_mod.SchemaCache.init(allocator);
-    defer schema_cache.deinit();
     log.debug("Schema cache initialized\n", .{});
 
     // Publish initial schemas to INIT stream (only for monitored tables)
@@ -505,6 +503,11 @@ pub fn main(init: std.process.Init) !void {
     // path's privileges. No writer configured means no listener — not a fallback to
     // `bridge_reader`, which has REPLICATION and is exactly what must not be doing
     // client-driven writes.
+    // Shared between the replication thread (which bumps it on DDL) and the write path
+    // (which stamps its catalog cache with it). See catalog_epoch.zig for why the signal
+    // comes from the WAL rather than from the schemas KV.
+    var catalog_epoch: catalog_epoch_mod.CatalogEpoch = .{};
+
     var writer_config = pg_conn.PgConf.writer_from_runtime_config(&runtime_config);
     var mut_listener: ?*mutation_listener.MutationListener = null;
     if (writer_config) |*wc| {
@@ -518,6 +521,7 @@ pub fn main(init: std.process.Init) !void {
             default_version_column,
             io,
             &should_stop,
+            &catalog_epoch,
         );
         try mut_listener.?.start();
         log.info("✅ Mutation listener thread started\n", .{});
@@ -855,15 +859,19 @@ pub fn main(init: std.process.Init) !void {
                                 // 1. Replacement by new relation (old_rel.deinit below)
                                 // 2. Program exit (relation_map cleanup at line 385-391)
 
-                                // Check if schema changed for a monitored table
-                                const schema_changed = try schema_cache.hasChanged(rel.name, rel.relation_id);
-
-                                if (schema_changed) {
-                                    log.info("🔔 Relation mapping updated for table '{s}' (relation_id={d})", .{ rel.name, rel.relation_id });
-                                    // We no longer publish schemas synchronously here.
-                                    // Schemas are updated via DDL events intersecting the WAL stream
-                                    // and pushed through the SPSC ring buffer for strict ordering.
-                                }
+                                // ⚠️ Nothing is compared here, deliberately. A `SchemaCache`
+                                // used to sit at this point, keyed on `relation_id` — which
+                                // is the table's OID and does NOT change on ALTER TABLE, so
+                                // it could only ever fire on a drop-and-recreate, never on
+                                // the migration people actually run. It published nothing,
+                                // and it was a standing invitation to put "republish the
+                                // schema" inside a branch that never runs. Removed.
+                                //
+                                // Schema changes reach clients through DDL events captured
+                                // by the event trigger, which travel this same WAL stream as
+                                // ordinary rows and keep their order relative to the data.
+                                // This RELATION message has one job: describe the tuples
+                                // that follow, which are decoded positionally against it.
 
                                 // Update the current relation map HashMap
                                 const result = try relation_map.fetchPut(
@@ -896,6 +904,12 @@ pub fn main(init: std.process.Init) !void {
                                         return error.TransactionOverflow;
                                     }
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) {
+                                        // Before packing, and unconditionally: the write
+                                        // path's catalog cache is stale whether or not
+                                        // this row produces something to publish. A
+                                        // de-duplicated schema and a refused table both
+                                        // still mean the catalogue moved.
+                                        catalog_epoch.bump();
                                         if (try event_proc.packDdlToSlot(arena_allocator, rel, ins.tuple_data, wal_msg.wal_end)) |slot_idx| {
                                             tx_slots_buf[tx_slots_count] = slot_idx;
                                             tx_slots_count += 1;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const nats = @import("nats");
 const Topology = @import("topology.zig");
+const CatalogEpoch = @import("catalog_epoch.zig").CatalogEpoch;
 const log = std.log.scoped(.mutation_listener);
 const config = @import("config.zig");
 const pg_conn = @import("pg_conn.zig");
@@ -28,6 +29,10 @@ const TableMeta = struct {
     client_col: ?[]const u8 = null,
     /// The tombstone column, when the table has one. Null means a delete is physical.
     tombstone_col: ?[]const u8,
+    /// The catalog epoch these facts were read at. Not equal to the current epoch means
+    /// DDL has crossed the replication stream since, so they are re-read rather than
+    /// trusted. See `catalog_epoch.zig`.
+    epoch: u64 = 0,
 
     fn deinit(self: *TableMeta, allocator: std.mem.Allocator) void {
         for (self.pk_cols) |col| allocator.free(col);
@@ -100,6 +105,9 @@ pub const MutationListener = struct {
     default_version_column: []const u8,
     /// table -> catalog facts, resolved on first use. See `TableMeta`.
     meta_cache: std.StringHashMap(TableMeta),
+    /// Bumped by the replication thread on every DDL event, so a cached `TableMeta` can
+    /// be recognised as stale without first failing a statement.
+    catalog_epoch: *const CatalogEpoch,
     /// Why the last `exec` failed, kept so the verdict can say more than "it failed".
     ///
     /// Fixed buffers rather than allocations: this is written on an error path that must
@@ -120,6 +128,7 @@ pub const MutationListener = struct {
         default_version_column: []const u8,
         io: std.Io,
         should_stop: *std.atomic.Value(bool),
+        catalog_epoch: *const CatalogEpoch,
     ) !*MutationListener {
         const self = try allocator.create(MutationListener);
 
@@ -133,6 +142,7 @@ pub const MutationListener = struct {
             .sync_rules = sync_rules,
             .default_version_column = default_version_column,
             .meta_cache = std.StringHashMap(TableMeta).init(allocator),
+            .catalog_epoch = catalog_epoch,
         };
 
         return self;
@@ -800,11 +810,23 @@ pub const MutationListener = struct {
     /// Read a table's identifiers from the catalog, once, and remember them.
     ///
     /// Cached because a mutation is already one synchronous round trip and this would
-    /// double it. The cache is dropped for a table whenever a statement fails with
-    /// `42703 undefined_column` or `42P01 undefined_table`, so a DDL change heals on the
-    /// next attempt instead of requiring a restart.
+    /// double it. Two signals drop it, and it takes both to cover a DDL change:
+    ///
+    ///   * a statement failing with `42703 undefined_column` / `42P01 undefined_table` —
+    ///     the *removal* case, where the cached list still names something gone;
+    ///   * a payload refused as `UnknownColumn` / `MissingPrimaryKey` (`handleMutation`) —
+    ///     the *addition* case, which never reaches PostgreSQL and so produces no
+    ///     SQLSTATE to react to.
+    ///
+    /// Neither is a timer: nothing here polls the catalog.
     fn tableMeta(self: *MutationListener, conn: ?*c.PGconn, table: []const u8) !*const TableMeta {
-        if (self.meta_cache.getPtr(table)) |cached| return cached;
+        const epoch = self.catalog_epoch.current();
+        if (self.meta_cache.getPtr(table)) |cached| {
+            if (cached.epoch == epoch) return cached;
+            // DDL crossed the stream since these were read. Cheaper to re-read one
+            // catalog than to build a statement from a shape that has moved.
+            self.invalidate(table);
+        }
 
         const alloc = self.allocator;
 
@@ -901,6 +923,7 @@ pub const MutationListener = struct {
 
         const key_owned = try alloc.dupe(u8, table);
         errdefer alloc.free(key_owned);
+        meta.epoch = epoch;
         try self.meta_cache.put(key_owned, meta);
         return self.meta_cache.getPtr(table).?;
     }
@@ -933,6 +956,13 @@ pub const MutationListener = struct {
         defer arena.deinit();
         const alloc = arena.allocator();
 
+        // Was this served from cache? It decides whether a schema-shaped refusal below is
+        // worth a second look: a meta just read from the catalog cannot be stale, so a
+        // cold-cache payload that is simply wrong pays nothing extra.
+        const meta_was_cached = if (self.meta_cache.getPtr(mutation.table)) |m|
+            m.epoch == self.catalog_epoch.current()
+        else
+            false;
         const meta = try self.tableMeta(conn, mutation.table);
 
         var reader = std.Io.Reader.fixed(payload_bytes);
@@ -950,12 +980,53 @@ pub const MutationListener = struct {
         const key_val = map.getByString("key") orelse return error.MissingPrimaryKey;
         if (key_val != .map) return error.InvalidPrimaryKeyFormat;
 
+        self.applyWithMeta(alloc, conn, meta, mutation, map, key_val.map, version_text) catch |err| {
+            // ⚠️ These two are raised by comparing the payload against the *cached*
+            // catalog, before any SQL runs — so PostgreSQL never sees the statement and
+            // never answers `42703 undefined_column`, which is the only signal that
+            // drops the cache. Without this second look the cache has no way to learn
+            // about a column or a key that appeared after it was filled, and the refusal
+            // is permanent: `ALTER TABLE … ADD COLUMN` publishes a schema saying the
+            // column exists, every client migrates to it, and every write naming it is
+            // refused until the bridge is restarted. Measured — see
+            // scripts/scenarios/invalidate.py §1.
+            //
+            // The reverse case heals on its own: a *dropped* column is still in the
+            // cached list, so the statement is built, PostgreSQL answers 42703, and the
+            // existing invalidation fires.
+            if (!meta_was_cached) return err;
+            if (err != error.UnknownColumn and err != error.MissingPrimaryKey) return err;
+
+            self.invalidate(mutation.table);
+            const fresh = try self.tableMeta(conn, mutation.table);
+            log.info(
+                "Mutation listener: '{s}' re-read from the catalog after {s}; retrying once",
+                .{ mutation.table, @errorName(err) },
+            );
+            // Once. If the fresh catalog refuses it too, the payload is wrong rather than
+            // the cache, and the verdict says so.
+            return self.applyWithMeta(alloc, conn, fresh, mutation, map, key_val.map, version_text);
+        };
+    }
+
+    /// The part of a mutation that depends on the table's shape, so it can be run twice
+    /// against two different `meta` values without re-parsing the payload.
+    fn applyWithMeta(
+        self: *MutationListener,
+        alloc: std.mem.Allocator,
+        conn: ?*c.PGconn,
+        meta: *const TableMeta,
+        mutation: Mutation,
+        map: anytype,
+        key_map: anytype,
+        version_text: [*:0]const u8,
+    ) !void {
         // Every key column must be present. A partial key would let `ON CONFLICT` match
         // a different row than the client meant, or a DELETE remove more rows than it
         // asked for.
         var key_values: std.ArrayList(?[*:0]const u8) = .empty;
         for (meta.pk_cols) |col| {
-            const v = key_val.map.getByString(col) orelse return error.MissingPrimaryKey;
+            const v = key_map.getByString(col) orelse return error.MissingPrimaryKey;
             const as_text = try self.payloadToString(alloc, v) orelse return error.MissingPrimaryKey;
             try key_values.append(alloc, as_text);
         }
@@ -1197,95 +1268,151 @@ pub const MutationListener = struct {
         // because it takes the value as a **parameter**. The principal comes from the
         // subject and is vouched for by NATS, but building SQL by concatenation is how a
         // trusted value becomes an injection the day the trust assumption changes.
-        {
-            const begin = c.PQexec(conn, "BEGIN");
-            defer c.PQclear(begin);
-            if (c.PQresultStatus(begin) != c.PGRES_COMMAND_OK) {
-                const msg_ptr = c.PQerrorMessage(conn);
-                self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
-                log.err("🔴 Could not open a transaction for [{s}]: {s}", .{ mutation.principal, c.PQerrorMessage(conn) });
-                return error.MutationFailed;
-            }
-        }
-        errdefer {
-            const rb = c.PQexec(conn, "ROLLBACK");
-            c.PQclear(rb);
-        }
-
-        {
-            const principal_z = try alloc.dupeZ(u8, mutation.principal);
-            const set_params = [_]?[*:0]const u8{principal_z.ptr};
-            const set_sql = "SELECT set_config('" ++ config.Sync.principal_setting ++ "', $1, true)";
-            const set_res = c.PQexecParams(conn, set_sql, 1, null, &set_params[0], null, null, 0);
-            defer c.PQclear(set_res);
-            if (c.PQresultStatus(set_res) != c.PGRES_TUPLES_OK) {
-                const msg_ptr = c.PQerrorMessage(conn);
-                self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
-                log.err("🔴 Could not set the principal for [{s}]: {s}", .{ mutation.principal, c.PQerrorMessage(conn) });
-                return error.MutationFailed;
-            }
-        }
-
-        const res = c.PQexecParams(
-            conn,
-            sql_z.ptr,
-            @intCast(params.len),
-            null,
-            if (params.len > 0) &params[0] else null,
-            null,
-            null,
-            0,
-        );
-        defer c.PQclear(res);
-
-        if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
-            const state = c.PQresultErrorField(res, c.PG_DIAG_SQLSTATE);
-            const sqlstate: []const u8 = if (state != null) std.mem.span(state) else "";
-            // 42703 undefined_column / 42P01 undefined_table: the cached layout is stale,
-            // so drop it and let the retry re-read the catalog rather than failing until
-            // the next restart.
-            if (std.mem.eql(u8, sqlstate, "42703") or std.mem.eql(u8, sqlstate, "42P01")) {
-                self.invalidate(mutation.table);
-            }
+        // ── One network exchange, not four ──────────────────────────────────────
+        //
+        // ⚠️ These two statements MUST share a transaction. `set_config(…, is_local =>
+        // true)` lasts until the transaction ends, and the RLS policies on the target
+        // table read `zb.principal` back; sent as two transactions the setting would be
+        // gone by the time the row is checked and **every** RLS-protected write would be
+        // refused.
+        //
+        // The transaction is the pipeline's own: statements queued between two sync
+        // points form one **implicit** transaction. That is stronger than the explicit
+        // BEGIN/COMMIT this replaces — on error an implicit transaction rolls back what
+        // ran and skips what was queued, whereas an explicit one leaves the session in a
+        // failed-transaction state that needs a ROLLBACK before the connection is usable
+        // again.
+        //
+        // Why at all: BEGIN, set_config, upsert, COMMIT were four separate round trips,
+        // and on a remote PostgreSQL **round trips are the cost** — 4×RTT per row no
+        // matter how fast the server is. Measured colocated, the catalog read looked like
+        // 9% of a mutation; counted in round trips it is 25%, and that ratio is what
+        // survives the move to a real network. Pipelining sends everything before reading
+        // anything, so the same work costs one RTT.
+        //
+        // ⚠️ Client-side only: libpq ≥ 14 to **build**, and works against any server
+        // speaking the v3 extended query protocol. It does not raise the PostgreSQL
+        // version floor.
+        if (c.PQenterPipelineMode(conn) != 1) {
             const msg_ptr = c.PQerrorMessage(conn);
-            const msg_text: []const u8 = if (msg_ptr != null) std.mem.span(msg_ptr) else "";
-            self.rememberFailure(sqlstate, msg_text);
+            self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+            log.err("🔴 Could not enter pipeline mode for [{s}]: {s}", .{ mutation.principal, c.PQerrorMessage(conn) });
+            return error.MutationFailed;
+        }
+        // Leaving the connection in pipeline mode would break every later statement on
+        // it, so this unwinds on every path out — including the error returns below.
+        defer _ = c.PQexitPipelineMode(conn);
 
-            // Level by fault, like the caller: a SQLSTATE the server returned and we know
-            // is permanent describes the client's row or the operator's policy, and the
-            // client is told directly by the verdict — so it is traced, not raised. A
-            // transient one means PostgreSQL is unhealthy or unreachable, which nobody
-            // but the operator can act on, and which has no other channel.
-            //
-            // ⚠️ Kept at full detail either way. This is the only place the *whole*
-            // message survives: the verdict carries the first line alone, because its
-            // DETAIL can quote rows the client never wrote.
-            if (sqlstateIsPermanent(sqlstate)) {
-                log.info("⛔ Mutation refused [{s}] on '{s}': {s}", .{ mutation.principal, mutation.table, c.PQerrorMessage(conn) });
-            } else {
-                log.err("🔴 Mutation failed [{s}] on '{s}': {s}", .{ mutation.principal, mutation.table, c.PQerrorMessage(conn) });
-            }
+        const principal_z = try alloc.dupeZ(u8, mutation.principal);
+        const set_params = [_]?[*:0]const u8{principal_z.ptr};
+        const set_sql = "SELECT set_config('" ++ config.Sync.principal_setting ++ "', $1, true)";
+
+        if (c.PQsendQueryParams(conn, set_sql, 1, null, &set_params[0], null, null, 0) != 1 or
+            c.PQsendQueryParams(
+                conn,
+                sql_z.ptr,
+                @intCast(params.len),
+                null,
+                if (params.len > 0) &params[0] else null,
+                null,
+                null,
+                0,
+            ) != 1 or
+            c.PQpipelineSync(conn) != 1)
+        {
+            const msg_ptr = c.PQerrorMessage(conn);
+            self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+            log.err("🔴 Could not dispatch the mutation for [{s}]: {s}", .{ mutation.principal, c.PQerrorMessage(conn) });
             return error.MutationFailed;
         }
 
-        // Committed before the result is interpreted: a stale write (0 rows) is a
-        // successful transaction that changed nothing, not a failure to roll back. The
-        // `errdefer` above covers every path that returns an error from here up.
-        {
-            const commit = c.PQexec(conn, "COMMIT");
-            defer c.PQclear(commit);
-            if (c.PQresultStatus(commit) != c.PGRES_COMMAND_OK) {
-                const msg_ptr = c.PQerrorMessage(conn);
-                self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
-                log.err("🔴 Commit failed for [{s}] on '{s}': {s}", .{ mutation.principal, mutation.table, c.PQerrorMessage(conn) });
-                return error.MutationFailed;
+        // Results arrive in the order the statements were queued, each terminated by a
+        // null, with `PGRES_PIPELINE_SYNC` closing the whole exchange. Everything up to
+        // that sync must be consumed or the connection cannot be reused — so this drains
+        // even when the first statement already failed.
+        var stmt_idx: usize = 0;
+        var failed = false;
+        var affected_buf: [24]u8 = undefined;
+        var affected_len: usize = 0;
+
+        while (true) {
+            const r = c.PQgetResult(conn);
+            if (r == null) {
+                stmt_idx += 1;
+                // Defensive: a connection that dies mid-drain returns null forever, and
+                // the loop must not become the way the listener thread stops responding.
+                // Two statements plus the sync means an honest run never reaches 4.
+                if (stmt_idx > 4) {
+                    failed = true;
+                    self.rememberFailure("", "connection closed while reading pipeline results");
+                    log.err("🔴 Pipeline drained without a sync point for [{s}] — connection lost?", .{mutation.principal});
+                    break;
+                }
+                continue;
+            }
+            defer c.PQclear(r);
+
+            const st = c.PQresultStatus(r);
+            if (st == c.PGRES_PIPELINE_SYNC) break;
+
+            // Queued behind a statement that failed, so it never ran. The error was
+            // already recorded from the statement that actually failed.
+            if (st == c.PGRES_PIPELINE_ABORTED) {
+                failed = true;
+                continue;
+            }
+
+            if (st != c.PGRES_COMMAND_OK and st != c.PGRES_TUPLES_OK) {
+                failed = true;
+                const state = c.PQresultErrorField(r, c.PG_DIAG_SQLSTATE);
+                const sqlstate: []const u8 = if (state != null) std.mem.span(state) else "";
+                // 42703 undefined_column / 42P01 undefined_table: the cached layout is
+                // stale, so drop it and let the retry re-read the catalog rather than
+                // failing until the next restart.
+                if (std.mem.eql(u8, sqlstate, "42703") or std.mem.eql(u8, sqlstate, "42P01")) {
+                    self.invalidate(mutation.table);
+                }
+                // ⚠️ `PQresultErrorMessage`, not `PQerrorMessage`: in a pipeline the
+                // connection-level message belongs to whichever statement failed last,
+                // and the per-result message is the only one guaranteed to describe THIS
+                // statement.
+                const msg_ptr = c.PQresultErrorMessage(r);
+                const msg_text: []const u8 = if (msg_ptr != null) std.mem.span(msg_ptr) else "";
+                self.rememberFailure(sqlstate, msg_text);
+
+                // Level by fault, like the caller: a SQLSTATE the server returned and we
+                // know is permanent describes the client's row or the operator's policy,
+                // and the client is told directly by the verdict — so it is traced, not
+                // raised. A transient one means PostgreSQL is unhealthy or unreachable,
+                // which nobody but the operator can act on, and which has no other
+                // channel.
+                //
+                // ⚠️ Kept at full detail either way. This is the only place the *whole*
+                // message survives: the verdict carries the first line alone, because its
+                // DETAIL can quote rows the client never wrote.
+                if (sqlstateIsPermanent(sqlstate)) {
+                    log.info("⛔ Mutation refused [{s}] on '{s}': {s}", .{ mutation.principal, mutation.table, msg_text });
+                } else {
+                    log.err("🔴 Mutation failed [{s}] on '{s}': {s}", .{ mutation.principal, mutation.table, msg_text });
+                }
+                continue;
+            }
+
+            // The upsert is the second statement, and its tag carries the row count.
+            // Copied out now because the result is cleared at the end of this iteration.
+            if (stmt_idx == 1) {
+                const tuples = std.mem.span(c.PQcmdTuples(r));
+                affected_len = @min(tuples.len, affected_buf.len);
+                @memcpy(affected_buf[0..affected_len], tuples[0..affected_len]);
             }
         }
+
+        if (failed) return error.MutationFailed;
 
         // 0 rows means the guard rejected it: the stored version is newer, so this write
         // lost. Not an error — it is last-write-wins working — but invisible to the
         // client until the reply channel exists.
-        const affected = std.mem.span(c.PQcmdTuples(res));
+        const affected = affected_buf[0..affected_len];
         if (std.mem.eql(u8, affected, "0")) {
             log.info("↩️  stale mutation [{s}] on '{s}': a newer version is stored", .{ mutation.principal, mutation.table });
         } else {

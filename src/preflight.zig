@@ -589,6 +589,60 @@ pub const Summary = struct {
 ///
 /// Opens its own non-replication connection: the caller's is either the replication
 /// stream (which cannot run ordinary queries) or not yet established at this point.
+/// Is the DDL pipeline actually wired up? — see PROTOCOL.md §0
+///
+/// ⚠️ **Single point of failure for every schema change.** `zebridge_ddl_events` is an
+/// ordinary published table: the event trigger writes a row, and that row reaches the
+/// bridge only because the publication carries it. Take it out of the publication and
+/// **nothing fails** — the trigger still fires, the row is still written, CDC keeps
+/// flowing for every other table, and the bridge simply never hears about a migration
+/// again. Clients keep the schema they last received, and the write path keeps the
+/// catalog facts it last read.
+///
+/// This is not hypothetical: `ALTER PUBLICATION … SET TABLE x` **replaces** the table
+/// list rather than adding to it, which silently unpublished this table once already.
+///
+/// Warned, not refused: a bridge that will not start is worse than one that says its
+/// schema pipeline is deaf. `strict` is deliberately not consulted — an operator who
+/// asked for lenient checks did not ask to lose migrations silently.
+fn checkDdlPipeline(allocator: std.mem.Allocator, conn: ?*c.PGconn, publication_name: []const u8) void {
+    const query = utils.allocPrintZ(
+        allocator,
+        \\SELECT
+        \\  EXISTS (SELECT 1 FROM pg_publication_tables
+        \\          WHERE pubname = '{s}' AND schemaname = 'public'
+        \\            AND tablename = 'zebridge_ddl_events'),
+        \\  EXISTS (SELECT 1 FROM pg_event_trigger
+        \\          WHERE evtname = 'zebridge_ddl_trigger' AND evtenabled <> 'D');
+    ,
+        .{publication_name},
+    ) catch return;
+    defer allocator.free(query);
+
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) return;
+
+    const published = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "t");
+    const trigger_on = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 1)), "t");
+
+    if (!published) {
+        log.err(
+            "🔴 'zebridge_ddl_events' is NOT in publication '{s}'. Schema changes will never reach the bridge: clients keep the schema they last received and the write path keeps the catalog facts it last read, both silently and both until a restart. Fix: ALTER PUBLICATION {s} ADD TABLE public.zebridge_ddl_events;",
+            .{ publication_name, publication_name },
+        );
+    }
+    if (!trigger_on) {
+        log.err(
+            "🔴 Event trigger 'zebridge_ddl_trigger' is missing or disabled, so no DDL is captured at all. Re-apply init.sql, or: ALTER EVENT TRIGGER zebridge_ddl_trigger ENABLE;",
+            .{},
+        );
+    }
+    if (published and trigger_on) {
+        log.info("🔧 DDL pipeline: trigger enabled and 'zebridge_ddl_events' published", .{});
+    }
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
@@ -613,6 +667,8 @@ pub fn run(
         return Summary{};
     };
     defer c.PQfinish(conn);
+
+    checkDdlPipeline(allocator, conn, publication_name);
 
     // array_length(indkey,1) counts the PK's columns; 0 rows means no PK at all.
     const query = try utils.allocPrintZ(

@@ -703,6 +703,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- ⚠️ This trigger is the ONLY way a schema change reaches a client — PROTOCOL.md §0: the bridge never
+-- polls the catalog for shape, so a table whose DDL does not land here keeps serving its
+-- old schema forever. Tested end to end by scripts/scenarios/invalidate.py §1-2.
 DROP EVENT TRIGGER IF EXISTS zebridge_ddl_trigger;
 CREATE EVENT TRIGGER zebridge_ddl_trigger ON ddl_command_end
 EXECUTE FUNCTION public.zebridge_ddl_trigger_fn();
