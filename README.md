@@ -30,11 +30,11 @@ By pushing all consumer state, caching, and rate-limiting down into NATS/JS, the
 While the readOnly flow stays simple, enabling writes brings in naturally more constraints to guarantee the sync using LWW.
 Examples are available.
 
-**How to configure ZeBridge?**: we expect ZeBridge to be fast and implemented a fixed memory model.  Check [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count). The main settings are the dimension of this memory to match NATS max_message size (default 1MB) and the incoming data and buffer potential NATS jitters.
+**How to configure ZeBridge?**: we expect ZeBridge to be fast and we implemented a fixed memory model.  Check [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count). The main settings are the dimension of this memory to match NATS max-msg size (default 1MB) and the incoming data and buffer potential NATS jitters.
 
-**What is it not**: This tool is oriented to serve a large number of small to medium consumers via the message broker NATS. It is NOT a file transfer tool. Large blobs (>1 MB) is the domain of object storage.
+**What is it not**: This tool is designed to serve a large number of small to medium consumers via the message broker NATS. It is NOT a file transfer tool. A large blob (>1 MB) is the domain of object storage.
 
-**Does this scale?**: you can run on the same PostgreSQL publication several instances dedicated to certain tables with their own memory configuration, slot and port.
+**How to scale?**: you can run on the same PostgreSQL publication several instances dedicated to certain tables with their own memory configuration, slot and port.
 
 **Performance**: this single threaded binary (3 MB) drained _on localhost_ 2,000,000 CDC INSERT events in under 10 s end to end (PG → NATS) in the burst benchmark below: [An example of a measured throughput](#an-example-of-a-measured-throughput). Run it yourself before trusting it.
 
@@ -75,7 +75,7 @@ Examples are available.
 
 A consumer connects to a NATS server facing ZeBridge.
 
-**Architecture**:
+**Example of Architecture**:
 
 ```mermaid
 flowchart TD
@@ -89,15 +89,17 @@ flowchart TD
         
         
         Grafana["Grafana <br> dashboard"]
-        Bridge -- Prometheus <br> → Reverse Proxy → --> Grafana
-        NATS -- Prometheus <br> → Reverse Proxy→ --> Grafana
+        Bridge -- Prometheus --> RevProx
+        NATS --WS --> RevProx
+        NATS -- Prometheus --> RevProx
 
         PG -- "SSL (opt)" --> Bridge
         Bridge -- "SSL (opt)" --> PG
         Bridge <--> |"TCP (Plain)" <br> only| NATS
     end
-
-    NATS <--> |"TLS / WSS"| Consumers
+    NATS <-- TLS --> Worker
+    RevProx <--WSS--> NativeApp
+    RevProx <-- WSS --> WebApp
 
 
     subgraph Consumers["Consumers"]
@@ -108,6 +110,7 @@ flowchart TD
         WebApp <--> Local_DB
         Worker <--> Local_DB
     end
+    style RevProx stroke-dasharray: 5 5
 ```
 
 > [!NOTE] v0.14: NATS and ZeBridge needs to be colocated (same host) since the communication between them is only plain text.
@@ -228,13 +231,15 @@ One bridge instance = one replication slot
 **Strategy**:
 
 ```txt
-Multi-tenant instance
+Multi-tenant instance:
+
 ```
 
 or
 
 ```txt
-Single tenant instance
+Single tenant instance: 
+  one bridge per tenant, enforced at PostgreSQL level
 ```
 
 Once:
@@ -911,6 +916,15 @@ Returns bridge status as JSON:
 }
 ```
 
+| metric | question it answers |
+| --- | --- |
+| `bridge_wal_confirmed_lag_bytes` | **Is the bridge behind?** WAL past `confirmed_flush_lsn`, which moves on every ACK. |
+| `bridge_wal_lag_bytes` | **Will the disk fill?** WAL past `restart_lsn`, which PostgreSQL only advances at checkpoints — so it plateaus at a few MB on a perfectly healthy bridge and can never answer the first question. Confusing the two cost an afternoon. |
+| `bridge_queue_usage_percent` | Is the **flush** side backed up? Silent about the reader. |
+| `bridge_cpu_seconds_total` | How busy is the process, across all threads? `rate(...[1m])` = cores used. A single-threaded reader at `1.0` is _by definition_ the bottleneck. |
+| `bridge_max_rss_bytes` | Is memory what was configured? Should sit near `2^BASE_BUF × RING_BUFFER_COUNT` + ~400 MB metadata, since the slab is pre-allocated, not grown. |
+| `bridge_refused_tables` | Is any table suspended — no PK, undecodable column, oversized row? Alert on `> 0`; the log line says which and why. |
+
 The same numbers as `/metrics`, for a human or a shell script rather than a scraper.
 
 ### 3. Structured Log Metrics (for Grafana Alloy/Loki)
@@ -926,6 +940,20 @@ stdout — so redirect with `2>` or `2>&1`, not `>`:
 ```log
 info(bridge): METRICS uptime=376 wal_messages=67 cdc_events=6 lsn=0/217e280 connected=1 pg_reconnects=0 nats_reconnects=0 lag_bytes=17816 slot_active=1
 ```
+
+The `LOOP` line next to `METRICS` every 15 s, which is the reader's profile:
+
+```txt
+LOOP iters=1407805 idle=10274 recv_ms=139 proc_ms=1494 cpu=31%
+```
+
+ field | reading |
+| --- | --- |
+| `iters` | WAL loop iterations in the interval |
+| `idle` | iterations that found nothing and slept 1 ms — **high `idle` is good**: the bridge is waiting on PostgreSQL, not struggling |
+| `recv_ms` | ms inside `receiveMessage` (libpq + framing) |
+| `proc_ms` | ms decoding tuples and packing them into the ring buffer |
+| `cpu` | process CPU over the interval, all threads |
 
 ⚠️ It is emitted from the WAL loop, so it starts once replication is running — not
 during startup.

@@ -287,10 +287,10 @@ release build would have shipped corrupt rows to every client.
 
 Two things made it reachable rather than theoretical:
 
-* the sizing guards **accept** `BASE_BUF=19` — it is a valid configuration, refused only
+- the sizing guards **accept** `BASE_BUF=19` — it is a valid configuration, refused only
   against `max_payload` (needs ≤ 19 here) and against RAM (needs `RING_BUFFER_COUNT`
   halved per step). Nothing connected buffer size to the offset type;
-* the offset was computed **before** the bounds check that would have described the
+- the offset was computed **before** the bounds check that would have described the
   problem, so an oversized row hit the narrowing cast on its way to the error meant to
   catch it.
 
@@ -729,11 +729,32 @@ decoded, so this is not a verified row-level leak; the **request-and-delivery pa
 unscoped**, which is what `snapshot_listener.zig` already says by containing no reference to
 `tenant` anywhere in its 2093 lines.
 
-#### The design, in two orthogonal halves
+#### Where enforcement actually lives, per shape
 
-They are not alternatives. Postgres decides the **contents**; the subject decides the
-**audience**. Doing only the first gives correctly-filtered dumps published where the wrong
-tenant can read them.
+The cleanest statement of L2. Note the last column: it is the one that decides how much
+discipline the deployment needs.
+
+| | CDC | SNAP | coherence |
+| --- | --- | --- | --- |
+| **T2L2-single** | PG — publication row filter | PG — the same filter, read back via `pg_get_expr(prqual)` | **structural**: one predicate serves both paths, so they cannot disagree |
+| **T2L2-multi** | bridge routes by subject + NATS grants | PG — RLS via `zb.principal` | **conventional**: two different subsystems that must be kept saying the same thing |
+
+⚠️ In the multi shape PostgreSQL enforces **nothing** on the CDC path — the WAL carries every
+tenant's rows and the split happens in the subject. So the two paths are enforced by a NATS
+grant and a Postgres policy respectively, and **nothing checks that they agree**. Grant alice
+`cdc.acme.>` while `zebridge_user_tenants` maps her to `globex` and her feed and her dump
+describe different tenants, silently, with no error anywhere. In the single shape that class
+of bug cannot exist, because there is only one predicate.
+
+That asymmetry is the argument for a drift checker: in the multi shape,
+snapshot-reach-equals-subscribe-reach is not enforced by anything and has to be *verified*.
+
+#### The design, in three parts
+
+The first two are not alternatives. Postgres decides the **contents**; the subject decides
+the **audience**. Doing only the first gives correctly-filtered dumps published where the
+wrong tenant can read them. The third makes the client's own tenant authoritative instead of
+guessed.
 
 1. **Contents — in PostgreSQL, not in the bridge.** The snapshot opens its *own* connection
    (`snapshot_listener.zig:1530`), separate from replication (`:137`). Set `zb.principal` on
@@ -758,6 +779,52 @@ tenant can read them.
    **subject token** rather than a payload field the client asserts — the same rule
    `mutation.<principal>.…` already follows (§7.1). This is three changes, not a conf edit:
    the NATS grants, the client's publish subject, and the worker's filter plus subject parsing.
+
+3. **Identity — a `tenants` bucket, so the client stops guessing.** `$KV.tenants.<principal>`
+   → the tenant, published by a trigger on `zebridge_user_tenants` and propagated exactly as
+   schemas already are (trigger → WAL → KV). No new mechanism.
+
+   Today the client has **two** answers and neither is authoritative. `VITE_TENANT`
+   (`App.tsx:53`) is a build-time env var that decides the consumer's `filter_subject`; the
+   tenant it *displays* is inferred from data that already arrived —
+   `SELECT tenant_id FROM … LIMIT 1`, on the reasoning that "RLS only ever showed us rows for
+   our own tenant, so whatever is in the local replica is ours". They can disagree silently:
+   set `VITE_TENANT=globex` for alice and she subscribes to a feed she has no grant on, which
+   presents as a client that connects, authenticates, and then looks like an idle database.
+
+   With the bucket she connects as `alice` and *asks*. One source of truth, in PostgreSQL,
+   and a principal moved between tenants takes effect live rather than at the next rebuild.
+
+   ⚠️ **Granted per principal — `$KV.tenants.alice`, never `$KV.tenants.>`.** The wholesale
+   grant would hand every client the full principal→tenant map, which is a roster of who else
+   exists. Same rule as `mutation_ack.<principal>.>`, and for the same reason.
+
+   ⚠️ **Key order is `principal` → `tenant`, not the inverse, and that is a security
+   decision rather than a naming one.** `$KV.tenants.<principal>` is an exact key: the grant
+   `$KV.tenants.alice` has nothing to wildcard into. Invert it to
+   `$KV.tenants.<tenant>.<principal>` and the *natural* grant becomes `$KV.tenants.acme.>`,
+   which enumerates every principal in the tenant — a membership roster handed out by
+   convenience rather than by decision. Same rule the conf already states for
+   `mutation_ack.<principal>.<msg_id>`: an identity token is only a useful grant if
+   everything that can vary sits after it.
+
+   The argument is **blast radius, not forgeability**. A principal cannot be forged inside
+   the model — that is what makes it a subject token rather than a payload claim; NATS
+   refuses `mutation.bob.>` from alice. But if one principal's credentials leak,
+   principal-first means the attacker learns that principal's tenant and nothing more, where
+   tenant-first would hand them the full membership list as a target list for the next
+   credential. Note also that the tenant id is already semi-public — it is in the CDC
+   subject, in row data, and on screen — so what is worth protecting is the **map**, not the
+   tenant.
+
+   🔶 **To be challenged.** This is reasoned, not measured. Worth attacking specifically:
+   whether a per-principal key defeats KV `keys()` enumeration for a client granted only its
+   own key, and whether the trigger's publish path can leak the roster even when the grants
+   cannot.
+
+   ⚠️ It also settles part 2's open question cheaply: if the bridge resolves principal→tenant
+   to build `init.snap.<tenant>.…`, that lookup and this bucket publish the *same fact*. Build
+   the bucket and the routing token is already computed.
 
 #### The cost, which is real and bounded
 
@@ -794,7 +861,6 @@ dumps shareable again.
   (row absent, verdict present, right SQLSTATE); `probe.py` covers its **cardinality** and the
   disclosure premise itself — measured: `alice` reads all 5 columns of `users`, writes to it,
   and is refused once as `DbAllocatedKey` with nothing following.
-
 
 ### 2.13 A wildcard inbox made every pull request spawn another
 
@@ -1156,7 +1222,6 @@ Three things it enforces that a remembered sequence did not:
 NOTICE` used `%s` where PL/pgSQL's placeholder is `%`, so it printed
 `TENANT_RULES=orderss:tenant_id` — the value followed by a literal `s`. A DBA copying that
 line would have configured a table that does not exist. Fixed.
-
 
 ## 5. Client-side protocol (browser / WASM SQLite)
 

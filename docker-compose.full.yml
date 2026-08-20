@@ -369,7 +369,6 @@ services:
   #     NATS_PORT: "4222"
   #     NATS_USER: ${NATS_BRIDGE_USER}
   #     NATS_PASSWORD: ${NATS_BRIDGE_PASSWORD}
-  #     TABLES: ${BRIDGE_CDC_TABLES}
   #     FORMAT: msgpack
   #     PG_HOST: postgres-replica
   #     PG_PORT: 5432
