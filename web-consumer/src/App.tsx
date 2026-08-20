@@ -85,6 +85,59 @@ const PUBLIC_TABLES = (topology as any).public_tables as string[] ?? [];
 const DB_NAME = `zebridge_${Date.now()}.sqlite3`;
 const { sql, deleteDatabaseFile } = new SQLocal(DB_NAME);
 
+/// The write outbox — mutations sent but not yet confirmed — in its **own** database.
+///
+/// ⚠️ It cannot live in the replica DB above: `DB_NAME` is stamped with `Date.now()`, so
+/// every page load gets a fresh file and anything stored there is gone on reload. That is
+/// deliberate for the replica (a clean room per test run) and fatal for an outbox, whose
+/// entire job is to survive the reload. Hence a second, stable-named database.
+///
+/// ⚠️ Keyed by principal: two dev servers on different ports are different OPFS origins
+/// today, but the name should not be the only thing preventing alice from replaying bob's
+/// writes if that ever changes.
+const OUTBOX_DB = `zebridge_outbox_${PRINCIPAL}.sqlite3`;
+const { sql: outboxSql } = new SQLocal(OUTBOX_DB);
+
+/// `payload` is stored as JSON, not as the MessagePack bytes actually published. The
+/// payload is plain JSON-safe data (`{data, version, client_id}`), so the round trip is
+/// lossless, and JSON is inspectable from `zb.outbox()` — which matters for a queue whose
+/// contents you only look at when something has already gone wrong.
+const outboxInit = outboxSql`
+  CREATE TABLE IF NOT EXISTS outbox (
+    msg_id     TEXT PRIMARY KEY,
+    subject    TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    tbl        TEXT NOT NULL,
+    row_id     TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    attempts   INTEGER NOT NULL DEFAULT 0
+  )
+`;
+
+const outboxPut = async (r: {
+  msgId: string; subject: string; payload: unknown; table: string; id: string | number;
+}) => {
+  await outboxInit;
+  await outboxSql`
+    INSERT INTO outbox (msg_id, subject, payload, tbl, row_id, created_at, attempts)
+    VALUES (${r.msgId}, ${r.subject}, ${JSON.stringify(r.payload)}, ${r.table}, ${String(r.id)}, ${Date.now()}, 0)
+    ON CONFLICT(msg_id) DO UPDATE SET attempts = outbox.attempts + 1
+  `;
+};
+
+/// Remove a write from the outbox. Called only on a **definitive** outcome — a verdict, or
+/// the CDC echo — never on a publish timeout: §7.1 pops the queue on a definitive reply,
+/// and "no answer yet" is not one.
+const outboxDrop = async (msgId: string) => {
+  await outboxInit;
+  await outboxSql`DELETE FROM outbox WHERE msg_id = ${msgId}`;
+};
+
+const outboxAll = async (): Promise<any[]> => {
+  await outboxInit;
+  return outboxSql`SELECT * FROM outbox ORDER BY created_at`;
+};
+
 
 const td = new TextDecoder();
 
@@ -377,7 +430,10 @@ export default function App() {
         // entry stays and `sweepPendingWrites` decides when to give up. Everything else
         // pops — including `stale` and `rejected`, where resending cannot change anything.
         const definitive = verdict.status !== 'failed';
-        if (definitive) pendingWrites.delete(msgId);
+        if (definitive) {
+          pendingWrites.delete(msgId);
+          void outboxDrop(msgId);
+        }
 
         switch (verdict.status) {
           case 'accepted':
@@ -526,6 +582,29 @@ export default function App() {
       await watchVerdicts();
       await subscribeStreams();
       reach('cdc');
+
+      // Anything queued while disconnected goes out now — including writes made in a
+      // previous page load, which is the whole point of persisting them.
+      void flushOutbox();
+
+      // ⚠️ `reconnect: true` means the library restores the connection without coming back
+      // through this function, so a flush placed only above would run once per page load
+      // and never after a network blip. Watching the status is what covers the case the
+      // outbox exists for.
+      void (async () => {
+        try {
+          for await (const st of nc!.status()) {
+            const t = String((st as any).type);
+            if (t === 'reconnect') {
+              setStatus('connected');
+              appendLog('SYS', 'NATS reconnected — flushing outbox', 'INFO');
+              void flushOutbox();
+            } else if (t === 'disconnect') {
+              setStatus('disconnected');
+            }
+          }
+        } catch { /* connection closed; nothing to watch */ }
+      })();
     } catch (err) {
       setStatus('disconnected');
       appendLog('SYS', `Connection failed: ${err}`);
@@ -937,6 +1016,7 @@ export default function App() {
       for (const [msgId, w] of pendingWrites) {
         if (w.table !== table || String(w.id) !== echoedKey) continue;
         pendingWrites.delete(msgId);
+        void outboxDrop(msgId);
         appendLog(table, `confirmed by CDC echo after ${Date.now() - w.at}ms`, 'CONFIRMED');
       }
     }
@@ -1269,7 +1349,12 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
         some_text: `random ${Math.floor(Math.random() * 10_000)}`,
         age: Math.floor(Math.random() * 90),
         is_true: Math.random() > 0.5,
-        tenant_id: tenant() === '—' ? undefined : tenant(),
+        // ⚠️ Falls back to the **configured** tenant. `tenant()` is discovered by reading
+        // it back out of the local replica, which is empty on a cold start — so without
+        // this the very first write of a fresh client sends `tenant_id: undefined` and is
+        // refused by RLS, which reads as "writes are broken" on first encounter rather
+        // than "there was nothing to discover yet".
+        tenant_id: tenant() !== '—' ? tenant() : (TENANT || undefined),
         updated_at: version,
         inserted_at: version,
       },
@@ -1421,6 +1506,13 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
     h.set('Nats-Msg-Id', msgId);
     pendingWrites.set(msgId, { table, id, at: Date.now() });
 
+    // ⚠️ Persisted **before** the publish, not after. If the tab dies between the two, a
+    // stored write that never reached JetStream is replayed harmlessly on the next load
+    // (the msg_id makes it idempotent); a write that reached JetStream but was never
+    // stored is simply lost. Ordering it this way trades a possible duplicate — which
+    // dedup collapses — for a possible loss, which nothing can recover.
+    await outboxPut({ msgId, subject, payload, table, id });
+
     // **JetStream publish, not core** — the same rule the snapshot request above already
     // follows, and the write path needs it more.
     //
@@ -1456,6 +1548,50 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
       appendLog(subject, `not accepted by JetStream: ${err}`, 'ERROR');
     }
   };
+
+  /// Republish everything still in the outbox.
+  ///
+  /// This is what makes the queue an outbox rather than a log: writes made while the
+  /// connection was down — or made and then abandoned when the tab closed — are sent when
+  /// there is somewhere to send them.
+  ///
+  /// ⚠️ Safe to run repeatedly, and that is load-bearing. Each entry keeps its **original
+  /// `Nats-Msg-Id`**, so JetStream dedup collapses a replay of a write that did land into
+  /// the original (`duplicate: true` on the PubAck, which is a success). Minting a fresh
+  /// id per attempt would defeat that and write the row twice.
+  ///
+  /// Entries are not dropped on failure — only a verdict or a CDC echo pops the queue
+  /// (§7.1). A write that cannot be sent stays for the next connection.
+  const flushOutbox = async () => {
+    let rows: any[] = [];
+    try {
+      rows = await outboxAll();
+    } catch (err) {
+      appendLog('OUTBOX', `could not be read: ${err}`, 'ERROR');
+      return;
+    }
+    if (!rows.length) return;
+    appendLog('OUTBOX', `replaying ${rows.length} unconfirmed write(s)`, 'INFO');
+    for (const r of rows) {
+      if (!nc) return;
+      try {
+        const h = headers();
+        h.set('Nats-Msg-Id', r.msg_id);
+        // Re-track it so the verdict and echo handlers can still pop it by msg_id; without
+        // this a replayed write would be confirmed by nothing and swept as unconfirmed.
+        pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now() });
+        const ack = await jetstream(nc).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
+        appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
+      } catch (err) {
+        appendLog('OUTBOX', `replay of ${r.msg_id} failed, kept for next connection: ${err}`, 'ERROR');
+      }
+    }
+  };
+
+  if (typeof window !== 'undefined') {
+    window.zb.outbox = outboxAll;
+    window.zb.flushOutbox = () => flushOutbox();
+  }
 
   initNats();
 
@@ -1586,7 +1722,11 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
           </table>
 
           <div class="controls">
-            <button onClick={recount} style="background: #2e7d32;">Recount</button>
+            <button onClick={recount} style="background: #37474f;">Recount</button>
+            {/* The three push buttons are a set: one write that is accepted, one refused
+                by grant, one refused by shape. Without the first, the panel demonstrated
+                only the ways writing fails. */}
+            <button onClick={() => void insertRandom()} style="background: #2e7d32;">Push to test_types — accepted</button>
             <button onClick={publishToReadOnlyTable} style="background: #6a1b9a;">Push to users — refused</button>
             <button onClick={publishMalformed} style="background: #b71c1c;">Push malformed — verdict now</button>
           </div>
