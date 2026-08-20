@@ -88,10 +88,9 @@ flowchart TD
         end
         
         
-        Bridge -- Prometheus --> RevProx
         Grafana["Grafana <br> dashboard"]
-        RevProx -->Grafana
-        NATS -- Prometheus --> RevProx
+        Bridge -- Prometheus <br> → Reverse Proxy → --> Grafana
+        NATS -- Prometheus <br> → Reverse Proxy→ --> Grafana
 
         PG -- "SSL (opt)" --> Bridge
         Bridge -- "SSL (opt)" --> PG
