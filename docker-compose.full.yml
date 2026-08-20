@@ -267,11 +267,13 @@ services:
         # The read-only profile is the core file *unmodified* — appended to, never edited
         # — so the two profiles cannot drift apart. Verified by object-for-object
         # comparison against the single file this replaced.
+        # ⚠️ The banners go to **stderr**. This block's stdout is the SQL stream piped into
+        # psql, so an echo here is not a log line, it is a syntax error on line 1.
         if [ "$${ZB_PROFILE}" = "readonly" ]; then
-          echo "[bridge-init] profile: readonly (CDC + snapshots)"
+          echo "[bridge-init] profile: readonly (CDC + snapshots)" >&2
           cat /init.core.template.sql
         else
-          echo "[bridge-init] profile: write-enabled (CDC + snapshots + ingress)"
+          echo "[bridge-init] profile: write-enabled (CDC + snapshots + ingress)" >&2
           cat /init.core.template.sql /init.write.template.sql
         fi | envsubst | psql -v ON_ERROR_STOP=1 -h "$${PG_HOST}" -p "$${PG_PORT}" -U "$${PG_USER}" -d "$${PG_DB}"
         echo "[bridge-init] Postgres initialization complete!"

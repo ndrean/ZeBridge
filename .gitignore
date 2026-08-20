@@ -5,6 +5,8 @@ zig-cache/
 .lexical/
 zig-pkg/
 
+/spike/.zig-cache/
+/spike/zig-pkg/
 # Downloaded packages
 *.deb
 

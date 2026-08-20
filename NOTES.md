@@ -737,17 +737,19 @@ discipline the deployment needs.
 | | CDC | SNAP | coherence |
 | --- | --- | --- | --- |
 | **T2L2-single** | PG — publication row filter | PG — the same filter, read back via `pg_get_expr(prqual)` | **structural**: one predicate serves both paths, so they cannot disagree |
-| **T2L2-multi** | bridge routes by subject + NATS grants | PG — RLS via `zb.principal` | **conventional**: two different subsystems that must be kept saying the same thing |
+| **T2L2-multi** | bridge routes by subject + NATS grants | PG — RLS via `zb.tenant`, taken from that same subject | **structural**, once one token drives both: the tenant is granted by NATS, routed on, and filtered by — see part 2 |
 
 ⚠️ In the multi shape PostgreSQL enforces **nothing** on the CDC path — the WAL carries every
-tenant's rows and the split happens in the subject. So the two paths are enforced by a NATS
-grant and a Postgres policy respectively, and **nothing checks that they agree**. Grant alice
-`cdc.acme.>` while `zebridge_user_tenants` maps her to `globex` and her feed and her dump
-describe different tenants, silently, with no error anywhere. In the single shape that class
-of bug cannot exist, because there is only one predicate.
+tenant's rows and the split happens in the subject. The snapshot path is still a Postgres
+policy, so the two paths are enforced by different subsystems; what keeps them coherent is
+that both are keyed on the **same NATS-granted tenant token**, not on two derivations of it.
+Filter the snapshot by `zb.principal` resolved through `zebridge_user_tenants` instead, and
+the coherence drops to conventional: subject says `acme`, mapping says `globex`, and globex
+rows are published where acme's clients read them.
 
-That asymmetry is the argument for a drift checker: in the multi shape,
-snapshot-reach-equals-subscribe-reach is not enforced by anything and has to be *verified*.
+What remains for a drift checker is narrower and no longer a leak: the NATS conf defines read
+scope while `zebridge_user_tenants` defines write scope, and under N-1 they should name the
+same tenant for a given principal. Disagreement gives inconsistent read/write reach.
 
 #### The design, in three parts
 
@@ -757,28 +759,65 @@ wrong tenant can read them. The third makes the client's own tenant authoritativ
 guessed.
 
 1. **Contents — in PostgreSQL, not in the bridge.** The snapshot opens its *own* connection
-   (`snapshot_listener.zig:1530`), separate from replication (`:137`). Set `zb.principal` on
-   it from the request subject — the same `set_config(…, is_local => true)` the mutation
-   listener already makes — and add a reader `SELECT` policy resolving through
-   `zebridge_user_tenants`, the shape `zebridge_scope_writes_by_tenant` already creates for
-   the writer. §1.8 measured that **RLS filters the snapshot** and is bypassed by CDC; that
-   asymmetry is exactly what makes this work, because CDC is scoped by subject instead. The
-   bridge builds no predicate and learns no tenant — statelessness preserved.
+   (`snapshot_listener.zig:1530`), separate from replication (`:137`). Set **`zb.tenant`** on
+   it from the authenticated request subject — the same `set_config(…, is_local => true)` the
+   mutation listener already uses for `zb.principal` — and add a reader `SELECT` policy
+   filtering on `current_setting('zb.tenant', true)`.
+
+   §1.8 measured that **RLS filters the snapshot** and is bypassed by CDC. That asymmetry is
+   exactly what makes this work: the snapshot obeys the policy, and CDC is scoped by the
+   subject instead. The bridge builds no predicate — it relays a token and PostgreSQL decides
+   the rows.
+
+   ⚠️ **`zb.tenant`, not `zb.principal` resolved through `zebridge_user_tenants`.** Both would
+   filter correctly in isolation, but only one cannot disagree with the subject the chunks are
+   published on — see part 2. Resolving the principal through the mapping table is a *second*
+   derivation of the tenant, and two derivations of one fact eventually differ. The read path
+   therefore never touches `zebridge_user_tenants`; that table is the write path's.
 
    ⚠️ This does **not** touch `zb_reader_all USING (true)`. That policy exists so the
    *replication* connection sees every tenant; a change feed bounded by RLS goes silently
    incomplete rather than correctly partitioned. Different connection, different policy.
 
-2. **Audience — in the subject and the KV key.** `init.snap.<tenant>.<table>.…`, and
-   `$KV.snapshots` keyed per (tenant, table). Without the first, `init.>` lets any principal
-   read any dump. Without the second there is a genuine overwrite: that bucket is
-   `max_msgs_per_subject=1` keyed by table alone, so one tenant's descriptor replaces the
-   other's and a client resolves the wrong `snapshot_id` and `lsn`.
+   ⚠️ If `zb.tenant` is unset the predicate is NULL and **every** row is excluded — the same
+   fail-closed shape the write path has, where a missing `zb.principal` refuses every write.
+   Silent emptiness is the correct failure here, but it looks exactly like an empty table, so
+   it needs to be distinguishable in the descriptor (see the closed filter-vs-refuse question).
 
-   ⚠️ Requires `snapshot.request.<principal>.<table>`, so the principal is a NATS-authenticated
-   **subject token** rather than a payload field the client asserts — the same rule
-   `mutation.<principal>.…` already follows (§7.1). This is three changes, not a conf edit:
-   the NATS grants, the client's publish subject, and the worker's filter plus subject parsing.
+2. **Audience — tenant-keyed, filtered by the same token it is routed by.** DECIDED:
+
+       snapshot.request.<tenant>.<table>        grant: snapshot.request.acme.>
+       init.snap.<tenant>.<table>.<id>.<chunk>  grant: init.snap.acme.>
+       $KV.snapshots.<tenant>.<table>           grant: $KV.snapshots.acme.>
+       cdc.<tenant>.>                           grant: cdc.acme.>      (already exists)
+
+   ⚠️ **The tenant in the subject is granted, not asserted.** A client cannot name a tenant
+   it does not hold, because NATS refuses the subject — the same thing that makes
+   `mutation.<principal>.…` trustworthy. This is why it is safe to route on it.
+
+   ⚠️ **The predicate uses the SAME token.** The bridge sets `zb.tenant` from the
+   authenticated subject and the read policy filters on `current_setting('zb.tenant')` —
+   *not* on `zb.principal` resolved through `zebridge_user_tenants`. That distinction is the
+   whole design. Two derivations of one fact can disagree: subject says `acme`, mapping says
+   `globex`, and globex rows are published on acme's subject. One token cannot disagree with
+   itself, so the coherence is **structural** rather than conventional — the property that
+   made the single-tenant shape safe, obtained here without a bridge per tenant.
+
+   ⚠️ **The descriptor must be keyed too, not just the chunks.** `$KV.snapshots` is
+   `max_msgs_per_subject=1`; keyed by table alone the second requester's descriptor
+   overwrites the first's and a client resolves someone else's `snapshot_id` and `lsn`.
+
+   Chosen over principal-keyed (`init.snap.<principal>.…`) because dumps are **shared across
+   a tenant's principals**. Principal-keyed makes the serialized snapshot worker run once per
+   principal per table — a connection storm every time a fleet restarts — for no correctness
+   gain once N-1 removes the ambiguity argument. The read path needs no mapping lookup either
+   way; `zebridge_user_tenants` is left to the write path.
+
+   Residual drift, for `zbctl check` rather than for the design: the NATS conf defines read
+   scope and `zebridge_user_tenants` defines write scope, and under N-1 they should name the
+   same tenant. A disagreement gives a principal inconsistent read/write reach — worth
+   catching, but **not** a cross-tenant leak, because reads are filtered by the token they
+   are routed by.
 
 3. **Identity — a `tenants` bucket, so the client stops guessing.** `$KV.tenants.<principal>`
    → the tenant, published by a trigger on `zebridge_user_tenants` and propagated exactly as
@@ -826,6 +865,36 @@ guessed.
    to build `init.snap.<tenant>.…`, that lookup and this bucket publish the *same fact*. Build
    the bucket and the routing token is already computed.
 
+#### Cardinality: N-1 for clients, N for infrastructure
+
+`zebridge_user_tenants` is `PRIMARY KEY (principal, tenant_id)` — **N-N by schema**. Adding a
+tenant to a principal is therefore an `INSERT` (`ON CONFLICT (principal, tenant_id) DO
+NOTHING`), never an `UPDATE`.
+
+**The rule is that client principals hold exactly one tenant.** Broadening someone's access
+means moving them to a tenant with wider scope, not accumulating tenants against their name.
+Everything downstream depends on this: `$KV.tenants.<principal>` can carry a single value
+rather than a list, `init.snap.<principal>.<table>` is unambiguous, and there are no merged
+`acme ∪ globex` dumps that silently go stale when one mapping is removed.
+
+⚠️ **But the schema must stay N-capable, and the exception is not an oversight.**
+`zb_sweeper` is mapped to every tenant it may reap, and that N-ness *is* the audit
+mechanism — `zebridge_audit_sweeper()` answers "which tenants will never have their
+tombstones reaped?" by reading exactly those rows. `bridge_sweeper.zig` records that the
+alternative was tried and rejected: a policy exempting principal-less sessions
+(`USING (current_setting('zb.principal', true) IS NULL)`) made *forgetting* to set a
+principal the unsafe default — backwards — and made the sweeper's reach invisible to
+`SELECT * FROM zebridge_user_tenants`. A named principal fails closed on omission (0 rows)
+and stays auditable in the same table as every other writer.
+
+So N-1 is **a checked rule, not a constraint**, and deliberately so: the constraint one
+actually wants — "no *client* principal has more than one tenant" — cannot be expressed as a
+primary key, because a key cannot know which principals are clients and which are
+infrastructure. Making it a `zbctl check` assertion renders it visible instead of implicit.
+
+Note the browser client already assumes N-1 and could not express anything else: it builds
+`cdc.${TENANT}.>` from a single `VITE_TENANT`.
+
 #### The cost, which is real and bounded
 
 Filtered dumps cannot be shared: different contents, different messages. The multiplier is
@@ -847,11 +916,17 @@ dumps shareable again.
 
 #### Still open
 
-- Should a tenant-scoped client asking for a table it can partly see get a **filtered**
-  snapshot or a **refusal**? Filtering matches CDC's behaviour and is friendlier; refusing is
-  easier to audit, because a snapshot that silently returns a subset is indistinguishable
-  from a table that happens to be small — the same silent-incompleteness `zb_reader_all`
-  exists to avoid. Current lean: filter.
+- ~~Filtered snapshot or refusal?~~ **CLOSED: filtered.** Not merely because it mirrors CDC,
+  but because the invariant forces it. A client whose *feed* is filtered and whose *dump* is
+  refused can never bootstrap the rows it is entitled to see, so it holds a permanently
+  incomplete replica while receiving updates for rows it does not have — worse than either
+  extreme, and undetectable from inside the client.
+
+  The auditability objection stands and is answered rather than dismissed: a filtered
+  snapshot *is* indistinguishable from a small table, so make the filtering **visible**. The
+  descriptor already carries `row_count`; it should also record the principal the filter was
+  applied for, so "did this client get a subset, and whose?" is answerable from the
+  descriptor alone instead of by inference.
 - Schema disclosure stays wholesale. Defensible — knowing `orders` has a `price` column is a
   far smaller disclosure than its rows — but it is currently a default, not a decision, and
   it invites targeted probing. What must then be **proved** is not that a probe is denied but

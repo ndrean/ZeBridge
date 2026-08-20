@@ -1,0 +1,90 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 786bacd..f10aaad 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -414,6 +414,10 @@ pub const PullSubscription = struct {
+     js: JetStream,
+     /// Stream name
+     stream_name: []const u8,
++    /// Whether `stream_name` was allocated by `pullSubscribe` (because it was looked up
++    /// from the subject) and must be freed in `deinit`. When the caller passed `.stream`
++    /// the memory is theirs and outlives us.
++    owns_stream_name: bool = false,
+     /// Consumer name
+     consumer_name: []const u8,
+     /// Consumer information
+@@ -428,6 +432,7 @@ pub const PullSubscription = struct {
+     mutex: xsync.Mutex = .init,
+ 
+     pub fn deinit(self: *PullSubscription) void {
++        if (self.owns_stream_name) self.js.nc.allocator.free(self.stream_name);
+         self.consumer_info.deinit();
+         self.inbox_subscription.deinit(); // This will unsubscribe and release the user reference
+         self.js.nc.allocator.free(self.inbox_prefix);
+@@ -483,9 +488,28 @@ pub const PullSubscription = struct {
+         while (!batch_complete and messages.items.len < request.batch) {
+             if (self.inbox_subscription.nextMsgTimeout(receive_deadline)) |raw_msg| {
+                 log.debug("Message: subject={s}, reply={s}, data='{s}'", .{ raw_msg.subject, raw_msg.reply orelse "none", raw_msg.data });
+-                // JetStream messages arrive with original subjects and ACK reply subjects
+-                // The timestamp in the ACK subject ensures messages belong to this fetch request
+-                // (timestamps are monotonically increasing and unique per message delivery)
++
++                // ⚠️ `inbox_subscription` is a WILDCARD (`<prefix>.*`), so it also receives
++                // replies addressed to *earlier* fetches. A fetch that returns before its
++                // `expires` leaves its request parked on the server until the server times
++                // it out, and that late 408 then lands here while a newer fetch is waiting.
++                //
++                // Accepting it ends the new fetch early, the caller re-fetches at once, and
++                // that leaves another parked request behind — self-sustaining, settling at
++                // `expires / period` parked pulls. Measured against an idle stream: 500 ms
++                // expiry, a new fetch every 48 ms, num_waiting=10, ~21 pull requests/sec
++                // with nothing to deliver.
++                //
++                // ⚠️ Applies to STATUS frames only. JetStream delivers a *data* message
++                // with its original subject (`test.foo`), routed to us by subscription id,
++                // so matching those against the inbox would drop every real message — the
++                // e2e suite catches exactly that. Status frames are addressed to the inbox
++                // (`HMSG _INBOX.<prefix>.<fetch_id>`), so they can be attributed, and they
++                // are the only ones this loop treats as terminal.
++                if (raw_msg.status_code > 0 and !std.mem.eql(u8, raw_msg.subject, reply_subject)) {
++                    raw_msg.deinit();
++                    continue;
++                }
+ 
+                 if (raw_msg.status_code == STATUS_NOT_FOUND) {
+                     // No messages available
+@@ -1309,6 +1333,8 @@ pub const JetStream = struct {
+         else
+             return error.StreamOrSubjectRequired;
+ 
++        // Correct here: `subscribe` (push) uses `stream_name` only inside this function.
++        // Contrast `pullSubscribe`, which stores it in a struct that outlives the call.
+         defer if (options.stream == null and subject != null) self.nc.allocator.free(stream_name);
+ 
+         // Prepare consumer config, generating deliver_subject if needed
+@@ -1532,7 +1558,16 @@ pub const JetStream = struct {
+         else
+             return error.StreamOrSubjectRequired;
+ 
+-        defer if (options.stream == null and subject != null) self.nc.allocator.free(stream_name);
++        // ⚠️ NOT a `defer free`. The PullSubscription created below stores `stream_name`
++        // and outlives this function: freeing it here left `fetch` building
++        // `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>` from freed memory, which failed
++        // as `error.InvalidSubject` — the subject validator catching whatever the
++        // allocator had put back, not a malformed subject.
++        //
++        // Ownership moves to the subscription; `errdefer` still covers the failure paths
++        // before it is handed over.
++        const owns_stream_name = options.stream == null and subject != null;
++        errdefer if (owns_stream_name) self.nc.allocator.free(stream_name);
+ 
+         // Create or get consumer (pull consumers require a name)
+         var consumer_info = try self.getOrCreateConsumer(stream_name, subject, durable, options.config, true, null);
+@@ -1565,6 +1600,7 @@ pub const JetStream = struct {
+         pull_subscription.* = PullSubscription{
+             .js = self,
+             .stream_name = stream_name,
++            .owns_stream_name = owns_stream_name,
+             .consumer_name = consumer_name,
+             .consumer_info = consumer_info,
+             .inbox_subscription = inbox_subscription,

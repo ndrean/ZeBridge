@@ -1,0 +1,38 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index cd4f9c1..5129a44 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -911,15 +911,24 @@ pub const Connection = struct {
+         // Try to send UNSUB command. Even if it fails internally,
+         // processMsg will keep sending UNSUB commands once
+         // it receives a message with unknown sid.
+-        self.unsubscribeInternal(sub.sid, null) catch |err| {
+-            if (err == error.Canceled) {
+-                // This is a void-returning cleanup path; re-arm the
+-                // cancelation so the caller's next cancelation point
+-                // still observes it.
+-                self.io.recancel();
+-            } else {
+-                log.err("Failed to send UNSUB for sid {d}: {}", .{ sub.sid, err });
+-            }
++        self.unsubscribeInternal(sub.sid, null) catch |err| switch (err) {
++            // This is a void-returning cleanup path; re-arm the cancelation so the
++            // caller's next cancelation point still observes it.
++            error.Canceled => self.io.recancel(),
++
++            // Expected during shutdown, and not a failure: UNSUB on a closed socket
++            // cannot succeed and does not need to — the server drops every subscription
++            // when the connection goes. Reported at error level, this printed once per
++            // subscription on every clean exit ("Failed to send UNSUB for sid 1:
++            // error.Closed", three times for a bridge with three subscribers), *after*
++            // the connection had already been logged as closed. An expected condition
++            // logged as an error trains operators to ignore the level.
++            error.Closed => log.debug(
++                "connection already closed; UNSUB for sid {d} not sent (the server drops it anyway)",
++                .{sub.sid},
++            ),
++
++            else => log.err("Failed to send UNSUB for sid {d}: {}", .{ sub.sid, err }),
+         };
+ 
+         log.debug("Unsubscribed from {s} with sid {d}", .{ sub.subject, sub.sid });
