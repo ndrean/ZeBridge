@@ -299,82 +299,20 @@ pub const Publisher = struct {
     ///
     /// Calls JetStream INFO API and returns JSON response.
     /// Returns detailed stream configuration and state information.
-    pub fn getStreamInfo(self: *Publisher, stream_name: []const u8) ![]const u8 {
-        if (self.js == null) {
-            return error.NotConnected;
+    /// Does a stream exist? Used by the boot preflight to fail loudly when a declared
+    /// tenant has no `CDC_<TENANT>` stream, rather than FATAL'ing mid-publish under load.
+    ///
+    /// ⚠️ Replaces a `getStreamInfo` that returned a hand-built JSON blob and referenced
+    /// `nats.JS.StreamInfoRequest`, a type that does not exist — it was dead code Zig never
+    /// analysed because nothing called it. The library's own `js.getStreamInfo` (used in
+    /// snapshot_listener.zig and below) is the real API; this wraps it for a bool.
+    pub fn streamExists(self: *Publisher, stream_name: []const u8) bool {
+        if (self.js) |*js| {
+            var res = js.getStreamInfo(stream_name) catch return false;
+            res.deinit();
+            return true;
         }
-
-        // Call JetStream INFO API with empty request (basic info)
-        const request: nats.JS.StreamInfoRequest = .{};
-        const info = try self.js.?.INFO(stream_name, &request);
-
-        // Build JSON response from StreamInfoResponse
-        var out: std.Io.Writer.Allocating = .init(self.allocator);
-        defer out.deinit();
-
-        try out.writer.writeAll("{");
-
-        // Add stream name from config
-        if (info.config) |config| {
-            try out.writer.print("\"name\":\"{s}\"", .{config.name});
-
-            // Add config details
-            try out.writer.writeAll(",\"config\":{");
-            try out.writer.print("\"retention\":\"{s}\"", .{config.retention});
-            try out.writer.print(",\"storage\":\"{s}\"", .{config.storage});
-            try out.writer.print(",\"max_msgs\":{d}", .{config.max_msgs});
-            try out.writer.print(",\"max_bytes\":{d}", .{config.max_bytes});
-            try out.writer.print(",\"max_age\":{d}", .{config.max_age});
-            try out.writer.print(",\"max_msg_size\":{d}", .{config.max_msg_size});
-
-            // Add subjects array
-            if (config.subjects) |subjects| {
-                try out.writer.writeAll(",\"subjects\":[");
-                for (subjects, 0..) |subject, i| {
-                    if (i > 0) try out.writer.writeAll(",");
-                    try out.writer.print("\"{s}\"", .{subject});
-                }
-                try out.writer.writeAll("]");
-            }
-            try out.writer.writeAll("}");
-        }
-
-        // Add state information
-        if (info.state) |state| {
-            try out.writer.writeAll(",\"state\":{");
-            try out.writer.print("\"messages\":{d}", .{state.messages});
-            try out.writer.print(",\"bytes\":{d}", .{state.bytes});
-            try out.writer.print(",\"first_seq\":{d}", .{state.first_seq});
-            try out.writer.print(",\"last_seq\":{d}", .{state.last_seq});
-            try out.writer.print(",\"consumer_count\":{d}", .{state.consumer_count});
-
-            // Add optional fields
-            if (state.first_ts) |first_ts| {
-                try out.writer.print(",\"first_ts\":\"{s}\"", .{first_ts});
-            }
-            if (state.last_ts) |last_ts| {
-                try out.writer.print(",\"last_ts\":\"{s}\"", .{last_ts});
-            }
-            if (state.num_subjects) |num| {
-                try out.writer.print(",\"num_subjects\":{d}", .{num});
-            }
-            if (state.num_deleted) |num| {
-                try out.writer.print(",\"num_deleted\":{d}", .{num});
-            }
-            try out.writer.writeAll("}");
-        }
-
-        // Add timestamps
-        if (info.created) |created| {
-            try out.writer.print(",\"created\":\"{s}\"", .{created});
-        }
-        if (info.ts) |ts| {
-            try out.writer.print(",\"ts\":\"{s}\"", .{ts});
-        }
-
-        try out.writer.writeAll("}");
-
-        return try out.toOwnedSlice();
+        return false;
     }
 
     /// Purge all messages from a stream

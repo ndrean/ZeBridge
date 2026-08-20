@@ -15,12 +15,19 @@ defmodule Emitter.PgProducer.Repo.AddTenantLastWriter do
       # tenant is a row no policy matches and no subject can carry.
       #
       # ⚠️ The value becomes a NATS subject token — `cdc.<tenant>.<table>.<op>` — so it must
-      # be a legal one: no `.`, space, `*` or `>`. A dot splits it into two tokens and the
-      # events route somewhere nobody is subscribed to, silently.
+      # be a legal one: no `.`, space, `*` or `>`.
       #
-      # ⚠️ No default, deliberately: a default would make an omitted tenant silently become
-      # someone's, which for a tenant column is the wrong kind of forgiving. Every writer
-      # states it — the scenarios read theirs from `zebridge_user_tenants`.
+      # No column DEFAULT here on purpose, but NOT for the reason a bare `null: false`
+      # suggests: the invariant is enforced by `zebridge_guard_tenant_<table>()`, a BEFORE
+      # trigger `zebridge_install_write_guards` attaches. It fires before the NOT NULL check
+      # (Postgres runs BEFORE-row triggers first), so an omitted / NULL / empty tenant is
+      # coalesced to the OPEN tenant — `OPEN_TENANT` in `.env.admin`, `_default` by default,
+      # whose subject every principal may read via the CDC_PUBLIC stream — while a
+      # malformed real value (containing a subject metacharacter) is REJECTED rather than
+      # silently rerouted. This deployment classifies by opting *sensitive* rows into a real
+      # tenant; the safe-by-omission value is therefore the shared one (fail-open, and
+      # `check.py` is what asserts a sensitive table did not forget). Putting the rule in the
+      # trigger keeps it in one place instead of a DEFAULT clause per table.
       add(:tenant_id, :string, null: false)
 
       # LWW tiebreak (SYNC_RULES field 3). Holds a client_id like `c-3f9a21b7`; the bridge

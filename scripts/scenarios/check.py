@@ -235,6 +235,163 @@ def main():
         else:
             zb.ok(f"SYNC_RULES {tbl}: every named column exists")
 
+    # ── 8. replication slots: orphans retain WAL for everyone ─────────────────
+    #
+    # A permanent slot outlives the connection, the process and the reboot — that is the
+    # point, it holds the LSN so a restart can resume. The cost is that a slot nobody
+    # consumes still pins WAL, invisibly: `bridge_slot_active` and `bridge_wal_lag_bytes`
+    # describe the bridge's OWN slot, so an abandoned one is reported by nothing.
+    #
+    # Left alone it grows to `max_slot_wal_keep_size` and is then INVALIDATED, at which
+    # point it cannot resume at all and whatever it fed needs a full resnapshot. So the
+    # window between "orphaned" and "unrecoverable" is exactly that setting.
+    declared_slot = os.environ.get("BRIDGE_CDC_SLOT", "").strip()
+    rows = [r for r in zb.psql(
+        "SELECT slot_name || '|' || active::text || '|' || coalesce(wal_status,'?') || '|' || "
+        "coalesce(invalidation_reason,'') || '|' || "
+        "pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) || '|' || "
+        "coalesce(date_trunc('second', now() - inactive_since)::text,'') "
+        "FROM pg_replication_slots"
+    ).splitlines() if r]
+
+    if not declared_slot:
+        print("  \u24d8  BRIDGE_CDC_SLOT unset — cannot tell a bridge's slot from an orphan")
+    for row in rows:
+        name, active, wal_status, invalid, retained, idle = (row.split("|") + [""] * 6)[:6]
+        # ⚠️ Second time this file has been bitten by it: `bool::text` in a `||` expression
+        # renders 'true'/'false', not psql's bare 't'/'f'. Comparing to "t" reported a
+        # healthy, attached bridge as INACTIVE — a checker's worst failure, since the fix
+        # you would reach for is restarting something that was never broken.
+        live = active in ("t", "true")
+        if invalid:
+            bad(f"slot '{name}' is INVALIDATED ({invalid})",
+                "It can no longer resume. Whatever it fed needs a full resnapshot; the slot "
+                "itself is now only holding a name.")
+        elif not live and declared_slot and name != declared_slot:
+            bad(f"orphaned slot '{name}': inactive, retaining {retained}"
+                + (f", idle for {idle}" if idle else ""),
+                f"Not the declared slot ('{declared_slot}') and nothing is consuming it, but it "
+                f"pins WAL for the whole cluster until max_slot_wal_keep_size invalidates it.\n"
+                f"  SELECT pg_drop_replication_slot('{name}');")
+        elif not live:
+            bad(f"declared slot '{name}' is INACTIVE, retaining {retained}"
+                + (f", idle for {idle}" if idle else ""),
+                "The bridge is not attached. WAL accumulates until it reconnects.")
+        elif wal_status != "reserved":
+            bad(f"slot '{name}' wal_status={wal_status} (retaining {retained})",
+                "Past 'reserved' the retained WAL is no longer safely within limits; "
+                "'lost' means it is already unrecoverable.")
+        else:
+            zb.ok(f"slot '{name}': active, wal_status=reserved, retaining {retained}")
+
+    # ── 9. the open tenant: one env, three places ────────────────────────────
+    #
+    # `OPEN_TENANT` names the shared/open tenant. It is NOT what the guard writes any more —
+    # the guard derives a missing tenant from the WRITER'S identity, so the open tenant is
+    # simply what a principal *mapped to it* carries (e.g. `(pub, _default)`). But the name
+    # still has to agree in two rendered places plus the mapping: the CDC_PUBLIC stream's
+    # subjects (nats-init) and every principal's read grant (nats-config-gen), each rendered
+    # from whatever .env.admin said at ITS run. Change the value, re-run one container, and
+    # rows carrying the old open tenant land on a subject no stream captures — no PubAck,
+    # the bridge FATALs. This checks the two renders agree with the env.
+    open_tenant = os.environ.get("OPEN_TENANT", "").strip()
+    if not open_tenant:
+        print("  ⓘ  OPEN_TENANT unset — comparing against '_default', the .env.admin default")
+        open_tenant = "_default"
+    tenants = set(zb.TOPOLOGY.get("tenants") or [])
+    open_subject = f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{open_tenant}.>"
+
+    if re.search(r"[.*> ]", open_tenant):
+        bad(f"OPEN_TENANT={open_tenant!r} is not a legal NATS subject token",
+            "It becomes `cdc.<OPEN_TENANT>.<table>.<op>`; a dot splits it into two tokens.")
+    if open_tenant in tenants:
+        bad(f"OPEN_TENANT={open_tenant!r} is also a declared tenant in topology.json",
+            "nats-init would bind the same subject into two streams, and NATS refuses\n"
+            "overlapping streams — whichever is created second silently does not exist.")
+
+    if tenants:
+        # what NATS actually stores: the public stream's bound subjects
+        public_stream = (zb.TOPOLOGY.get("cdc_streams") or {}).get("public", "CDC_PUBLIC")
+        info = zb.nats_cli("stream", "info", public_stream, "--json")
+        if info.returncode != 0:
+            print(f"  ⓘ  could not read stream {public_stream} ({info.stderr.strip()[:60]}) — stream check skipped")
+        else:
+            bound = json.loads(info.stdout).get("config", {}).get("subjects", [])
+            if open_subject not in bound:
+                bad(f"stream {public_stream} does not bind {open_subject} (bound: {bound})",
+                    "Rows that opted into no tenant publish there and NO stream captures them.\n"
+                    "Re-run nats-init; it rebuilds the public stream from topology.json + OPEN_TENANT.")
+            else:
+                zb.ok(f"stream {public_stream} binds {open_subject}")
+
+        # what the principals may READ: the rendered conf
+        if grants:
+            lacking = sorted(
+                p for p, subs in grants.items()
+                if p in mapping and open_subject not in subs
+                and not any(s in ("cdc.>", "cdc.*.>") for s in subs))
+            if lacking:
+                bad(f"principal(s) not granted the open tenant {open_subject}: {lacking}",
+                    "They hold CDC_PUBLIC, so a JetStream consumer still delivers those rows —\n"
+                    "but a core subscription is refused, and the conf no longer says what it\n"
+                    "means. Add the line to each <NAME>_READ list and reload NATS.")
+            else:
+                zb.ok(f"every mapped principal is granted {open_subject}")
+
+    # ── 10. tenant-CAPABLE tables are fully wired, not just configured ────────
+    #
+    # ⚠️ NOT "sensitive". There is no table-level sensitivity: a `tenant_id` column makes a
+    # table tenant-*capable*, and such a table legitimately holds BOTH real-tenant (sensitive)
+    # and _default (open) rows — sensitivity is a per-row property, not a per-table one. So
+    # this does not assert "these rows are private"; it asserts that every table which CAN
+    # route by tenant has the machinery to do it correctly. A tenant-capable table with a
+    # broken chain silently exposes or fails to route whatever tenant data it does hold.
+    #
+    # The signal is the column, independent of TENANT_RULES (which is what we are checking
+    # got set). ⚠️ Heuristic: a column named tenant_id for an unrelated reason is swept in;
+    # in this schema that does not happen.
+    sensitive = [r for r in zb.psql(
+        "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace "
+        "WHERE n.nspname='public' AND c.relkind='r' AND NOT c.relname LIKE 'zebridge_%' "
+        "AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid=c.oid "
+        "  AND a.attname='tenant_id' AND a.attnum>0 AND NOT a.attisdropped)"
+    ).splitlines() if r]
+
+    for tbl in sensitive:
+        problems = []
+        # (a) routed by the bridge — else events publish bare, invisible to tenant consumers
+        if tbl not in tenant_rules:
+            problems.append(f"no TENANT_RULES entry (set TENANT_RULES={tbl}:tenant_id)")
+        # (b) the guard trigger — else omission/malformed is not corrected at the source
+        if zb.psql("SELECT count(*) FROM pg_trigger WHERE tgname='zebridge_guard_tenant_t' "
+                   f"AND tgrelid='public.{tbl}'::regclass").strip() == "0":
+            problems.append("no tenant guard (run zebridge_install_write_guards with tenant_col, "
+                            "or zebridge_enable — a forgotten or malformed tenant is not caught)")
+        # (c) RLS on + the write policy — else a client can forge rows into another tenant
+        if zb.psql(f"SELECT relrowsecurity::text FROM pg_class WHERE oid='public.{tbl}'::regclass").strip() not in ("t","true"):
+            problems.append("row-level security is OFF (a writer can forge another tenant's rows)")
+        elif zb.psql("SELECT count(*) FROM pg_policy p JOIN pg_class c ON c.oid=p.polrelid "
+                     f"WHERE c.relname='{tbl}' AND p.polname='zb_tenant_write'").strip() == "0":
+            problems.append("no zb_tenant_write policy (run zebridge_scope_writes_by_tenant)")
+        # (d) tenant in the replica identity — else a DELETE arrives with no tenant to route by
+        in_ri = zb.psql(
+            "SELECT count(*) FROM pg_index i JOIN pg_attribute a "
+            "  ON a.attrelid=i.indrelid AND a.attnum=ANY(i.indkey) "
+            f"WHERE i.indrelid='public.{tbl}'::regclass AND a.attname='tenant_id' "
+            "  AND ((SELECT relreplident FROM pg_class WHERE oid=i.indrelid)='d' AND i.indisprimary "
+            "    OR (SELECT relreplident FROM pg_class WHERE oid=i.indrelid)='i' AND i.indisreplident)"
+        ).strip()
+        full_ri = zb.psql(f"SELECT (relreplident='f')::text FROM pg_class WHERE oid='public.{tbl}'::regclass").strip() in ("t","true")
+        if in_ri == "0" and not full_ri:
+            problems.append("tenant_id is not in the replica identity (a DELETE arrives without "
+                            "it and cannot be routed — REPLICA IDENTITY USING INDEX (tenant_id, pk))")
+
+        if problems:
+            bad(f"tenant-capable table '{tbl}' (has tenant_id) is not fully wired",
+                "\n".join(f"- {x}" for x in problems))
+        else:
+            zb.ok(f"tenant-capable table '{tbl}': routed, guarded, RLS-scoped, tenant in replica identity")
+
     print()
     if findings:
         print(f"\033[31m{len(findings)} disagreement(s)\033[0m — declared and actual differ\n")

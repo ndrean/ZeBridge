@@ -9,6 +9,16 @@
     "users"
   ],
 
+  "tenants": [
+    "acme",
+    "globex"
+  ],
+
+  "cdc_streams": {
+    "tenant_prefix": "CDC_",
+    "public": "CDC_PUBLIC"
+  },
+
   "subjects": {
     "cdc_prefix": "cdc",
     "init_prefix": "init",

@@ -52,6 +52,9 @@ REQUIRED_VARS = [
     "POSTGRES_WRITER_PASSWORD",
     "TARGET_DB",
     "BRIDGE_CDC_PUBLICATION",
+    # The tenant guard's default. Empty renders `hstore(col, '')` — a row routed to
+    # `cdc..<table>.<op>`, an illegal subject no stream captures.
+    "OPEN_TENANT",
 ]
 
 ADMIN_URL = os.environ.get(

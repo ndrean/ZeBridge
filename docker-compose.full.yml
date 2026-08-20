@@ -66,10 +66,13 @@ services:
         # Fail loudly rather than substituting an empty string. `password: ""` is a
         # valid config that the server accepts, so an unset variable would silently
         # publish an account anyone can log into as `alice` with no password.
-        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD; do
+        # OPEN_TENANT is not a credential but fails the same way: empty renders `cdc..>`,
+        # an illegal subject the server refuses at startup — with every login failing
+        # for a reason that reads like a credential problem.
+        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD OPEN_TENANT; do
           eval "val=\$$$$v"
           if [ -z "$$val" ]; then
-            echo "✗ $$v is unset — refusing to generate a config with an empty credential" >&2
+            echo "✗ $$v is unset — refusing to generate a config with an empty value" >&2
             exit 1
           fi
         done
@@ -79,6 +82,7 @@ services:
         sed -e "s|\$${NATS_BRIDGE_NKEY_PUB}|$${NATS_BRIDGE_NKEY_PUB}|g" \
             -e "s|\$${NATS_ALICE_PASSWORD}|$${NATS_ALICE_PASSWORD}|g" \
             -e "s|\$${NATS_BOB_PASSWORD}|$${NATS_BOB_PASSWORD}|g" \
+            -e "s|\$${OPEN_TENANT}|$${OPEN_TENANT}|g" \
             /nats-server.conf.template > /config/nats-server.conf
         # ⚠️ Every $${...} must be gone. An unsubstituted one is not a config error — NATS
         # accepts it as a literal password, so the account exists with a password nobody
@@ -243,8 +247,89 @@ services:
         SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
         SNAPSHOT_KV=$(jq -r '.kv.snapshots' /topology.json)
 
-        echo "Creating NATS JetStream stream: $$CDC_STREAM (subject: $$CDC_PREFIX.>)"
-        nats stream add $$CDC_STREAM --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+        # ── CDC is SPLIT PER TENANT, and that is a security boundary, not tidiness ──
+        #
+        # ⚠️ A subject permission governs core SUBSCRIBE and nothing else. A JetStream
+        # consumer never subscribes to the subject it filters on — the server delivers to
+        # the reader's own _INBOX and `filter_subject` is a stream-side selector the READER
+        # chooses. So `cdc.acme.>` in a subscribe allow-list cannot stop a client creating a
+        # consumer on a shared stream filtered at `cdc.globex.>`.
+        #
+        # Measured on one wide CDC stream: alice (tenant acme) was refused a core
+        # subscription to `cdc.globex.>` and then pulled `cdc.globex.test_types.insert`
+        # through a JetStream consumer, same credentials, same session.
+        # `scripts/scenarios/crosstenant.py` is that test.
+        #
+        # The enforcement unit for JetStream reads is the STREAM. So one stream per tenant,
+        # granted per stream (`$$JS.API.*.CDC_ACME`), and naming another tenant's stream is
+        # refused by the broker rather than discouraged by convention.
+        #
+        # The bridge does not change: JetStream binds streams to subjects and the bridge
+        # already publishes `cdc.<tenant>.<table>.<op>`. Each message lands in exactly one
+        # stream — no duplication.
+        TENANT_PREFIX=$(jq -r '.cdc_streams.tenant_prefix' /topology.json)
+        PUBLIC_STREAM=$(jq -r '.cdc_streams.public' /topology.json)
+
+        # ⚠️ Only split when tenants are declared. An untenanted deployment has no
+        # `cdc.<tenant>.…` subjects at all, so per-tenant streams would capture nothing and
+        # removing the wide stream would leave the change feed with nowhere to land.
+        TENANT_COUNT=$(jq -r '(.tenants // []) | length' /topology.json)
+        if [ "$$TENANT_COUNT" = "0" ]; then
+          echo "No tenants declared in topology.json — keeping the single wide stream $$CDC_STREAM"
+          nats stream add $$CDC_STREAM --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+        else
+
+        # ⚠️ The legacy wide stream must go first. Its `cdc.>` overlaps every per-tenant
+        # subject, and NATS refuses overlapping subjects across streams in one account — so
+        # leaving it would silently keep the hole open AND block the fix.
+        if nats stream info $$CDC_STREAM --json >/dev/null 2>&1; then
+          echo "Removing legacy wide stream $$CDC_STREAM (subjects overlap the per-tenant split)"
+          nats stream rm $$CDC_STREAM -f || true
+        fi
+
+        for T in $(jq -r '.tenants[]' /topology.json); do
+          UPPER=$(echo "$$T" | tr '[:lower:]' '[:upper:]')
+          echo "Creating per-tenant CDC stream: $$TENANT_PREFIX$$UPPER (subject: $$CDC_PREFIX.$$T.>)"
+          nats stream add $$TENANT_PREFIX$$UPPER --subjects="$$CDC_PREFIX.$$T.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+        done
+
+        # Tables with no tenant column publish on the bare `cdc.<table>.<op>` subject, so
+        # they belong to no tenant stream. One shared stream carries them, granted to every
+        # principal — which is what `zebridge_public_tables` already declares them to be.
+        #
+        # ⚠️ Plus `cdc.<OPEN_TENANT>.>`: the open tenant, the token `zebridge_guard_tenant()`
+        # writes when a tenant column arrives NULL or empty. It is a tenant no declared
+        # stream owns, so without this binding those rows publish to a subject NO stream
+        # captures — no PubAck, retries exhaust, the bridge FATALs mid-WAL. The value comes
+        # from .env.admin, the same copy bridge-init renders into the guard.
+        if [ -z "$${OPEN_TENANT}" ]; then
+          echo '✗ OPEN_TENANT is empty — the open tenant needs a subject in CDC_PUBLIC (set it in .env.admin)' >&2
+          exit 1
+        fi
+        case "$${OPEN_TENANT}" in *.*|*' '*|*'*'*|*'>'*)
+          echo "✗ OPEN_TENANT='$${OPEN_TENANT}' is not a legal NATS subject token" >&2; exit 1;;
+        esac
+        # A declared tenant with the same name would get its own stream on the same subject,
+        # and NATS refuses overlapping streams — leaving whichever came second uncreated.
+        if jq -e --arg o "$$OPEN_TENANT" '(.tenants // []) | index($$o) != null' /topology.json >/dev/null; then
+          echo "✗ OPEN_TENANT='$${OPEN_TENANT}' is also a declared tenant in topology.json — pick one" >&2
+          exit 1
+        fi
+        PUBLIC_SUBJECTS=$(jq -r --arg p "$$CDC_PREFIX" --arg o "$$OPEN_TENANT" '[.public_tables[] | $$p + "." + . + ".>"] + [$$p + "." + $$o + ".>"] | join(",")' /topology.json)
+        # ⚠️ EDIT when it already exists. Every other `stream add … || true` here is idempotent
+        # because the stream's config never changes; this one's subject list is DERIVED —
+        # from public_tables and OPEN_TENANT — and `add` on an existing stream with a
+        # different config is an error the `|| true` would swallow, leaving the old binding
+        # in place and check.py §9 red after every re-run. Subjects only: limits are left
+        # as they are.
+        if nats stream info $$PUBLIC_STREAM --json >/dev/null 2>&1; then
+          echo "Updating public CDC stream: $$PUBLIC_STREAM (subjects: $$PUBLIC_SUBJECTS)"
+          nats stream edit $$PUBLIC_STREAM --subjects="$$PUBLIC_SUBJECTS" -f || true
+        else
+          echo "Creating public CDC stream: $$PUBLIC_STREAM (subjects: $$PUBLIC_SUBJECTS)"
+          nats stream add $$PUBLIC_STREAM --subjects="$$PUBLIC_SUBJECTS" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+        fi
+        fi
 
         echo "Creating NATS JetStream stream: $$INIT_STREAM (subject: $$INIT_PREFIX.>)"
         nats stream add $$INIT_STREAM --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true

@@ -56,6 +56,16 @@ pub const Topology = struct {
     stream_mutations: []const u8,
     stream_requests: []const u8,
 
+    // ─── per-tenant CDC streams (empty when the deployment is not tenant-routed) ──
+    //
+    // The tenant list is what the boot preflight checks NATS against: every name here
+    // must have a `<cdc_stream_prefix><TENANT>` stream, or the bridge refuses to start.
+    // A row whose tenant is not in this list has no destination — the whole reason the
+    // check exists (NOTES.md §1.12, §4.5).
+    tenants: []const []const u8,
+    cdc_stream_prefix: []const u8,
+    cdc_stream_public: []const u8,
+
     // ─── subject prefixes ───────────────────────────────────────────────────────
     subject_cdc_prefix: []const u8,
     subject_init_prefix: []const u8,
@@ -116,6 +126,9 @@ pub const Topology = struct {
         .stream_init = "INIT",
         .stream_mutations = "MUTATIONS",
         .stream_requests = "REQUESTS",
+        .tenants = &.{},
+        .cdc_stream_prefix = "CDC_",
+        .cdc_stream_public = "CDC_PUBLIC",
         .subject_cdc_prefix = "cdc",
         .subject_init_prefix = "init",
         .subject_mutations_prefix = "mutation",
@@ -204,6 +217,29 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.stream_mutations = try str(a, streams, "streams", "mutations", diag);
     t.stream_requests = try str(a, streams, "streams", "requests", diag);
 
+    // Optional: a deployment with no `tenants` is not tenant-routed, and that is a valid
+    // shape (the single wide CDC stream). Absent means an empty list, never an error.
+    t.tenants = try optStrArray(a, root, "tenants");
+    if (root.get("cdc_streams")) |cs| switch (cs) {
+        .object => |o| {
+            t.cdc_stream_prefix = if (o.get("tenant_prefix")) |v| (switch (v) {
+                .string => |x| try a.dupe(u8, x),
+                else => "CDC_",
+            }) else "CDC_";
+            t.cdc_stream_public = if (o.get("public")) |v| (switch (v) {
+                .string => |x| try a.dupe(u8, x),
+                else => "CDC_PUBLIC",
+            }) else "CDC_PUBLIC";
+        },
+        else => {
+            t.cdc_stream_prefix = "CDC_";
+            t.cdc_stream_public = "CDC_PUBLIC";
+        },
+    } else {
+        t.cdc_stream_prefix = "CDC_";
+        t.cdc_stream_public = "CDC_PUBLIC";
+    }
+
     t.subject_cdc_prefix = try str(a, subjects, "subjects", "cdc_prefix", diag);
     t.subject_init_prefix = try str(a, subjects, "subjects", "init_prefix", diag);
     t.subject_mutations_prefix = try str(a, subjects, "subjects", "mutations_prefix", diag);
@@ -236,6 +272,24 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.request_subject_wildcard = try std.fmt.allocPrint(a, "{s}.>", .{t.snapshot_request});
 
     return .{ .arena = arena, .topology = t };
+}
+
+/// An optional array of strings. Absent, wrong-typed, or containing a non-string element
+/// all yield an **empty** slice rather than an error: these fields are optional by design,
+/// and a deployment that omits `tenants` is choosing the untenanted shape, not making a
+/// mistake. Every element is duped into the arena.
+fn optStrArray(a: std.mem.Allocator, root: std.json.ObjectMap, key: []const u8) ![]const []const u8 {
+    const v = root.get(key) orelse return &.{};
+    const arr = switch (v) {
+        .array => |x| x,
+        else => return &.{},
+    };
+    var out: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (arr.items) |item| switch (item) {
+        .string => |sv| try out.append(a, try a.dupe(u8, sv)),
+        else => {},
+    };
+    return try out.toOwnedSlice(a);
 }
 
 fn section(root: std.json.ObjectMap, name: []const u8, diag: ?*Diagnostic) !std.json.ObjectMap {

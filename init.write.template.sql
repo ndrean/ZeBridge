@@ -176,10 +176,88 @@ $$ LANGUAGE plpgsql;
 -- different column here and the bridge and the database disagree about what "version"
 -- means, with no error. `zebridge_audit_write_guards()` reports what is actually attached
 -- so the two can be compared.
+-- Tenant guard: every row leaves with a legal tenant token, or the write is refused.
+--
+-- Attached per table by `zebridge_install_write_guards`, which passes the column name as a
+-- trigger argument. It fills in a missing tenant and refuses an unusable one — because the
+-- bridge copies the column straight into `cdc.<tenant>.<table>.<op>` without interpreting it.
+--
+--   1. **absence** — omitted, NULL, or empty → **the writer's own tenant**, looked up from
+--      `zebridge_user_tenants` by `zb.principal`. This is the correction that matters: a
+--      tenanted client that forgets the column must NOT have its (sensitive) row silently
+--      published to everyone. Omission means "mine", never "open". N-1 (one tenant per
+--      client principal) makes the lookup unambiguous.
+--
+--      ⚠️ **Fail-CLOSED on no derivable tenant.** If `zb.principal` is unset or unmapped,
+--      there is no tenant to stamp and the write is REJECTED — a row on a tenant-routed
+--      table with no tenant cannot be routed, so producing one is worse than refusing. An
+--      admin seeding such a table must state the tenant, exactly as a client does.
+--
+--      The OPEN tenant (`${OPEN_TENANT}`) is no longer a coalesce target — it is simply the
+--      tenant a principal *mapped to it* carries, so its rows land in `CDC_PUBLIC` and are
+--      read by everyone. "Open" is a mapping, not a default: to write open data you are a
+--      member of the open tenant, audited in the one table like every other writer.
+--
+--   2. **malformed** — a real value with a NATS subject metacharacter (`.`, space, `*`, `>`)
+--      → RAISES. A dot splits the token and the row routes to a subject no consumer
+--      receives. Not corrected: a caller that sent `evil.acme` meant something, and
+--      rerouting it silently is worse than refusing.
+--
+--   3. **valid** — passed through untouched; `zb_tenant_write` (RLS `WITH CHECK`) is what
+--      confirms the writer may actually write that tenant, so a supplied value is validated,
+--      not trusted.
+--
+-- ⚠️ `set_config('zb.principal', …, true)` MUST share the write's transaction (the bridge's
+-- pipeline does). In autocommit each statement is its own transaction and the setting is
+-- gone by the INSERT — the lookup then finds nothing and this fails closed.
+--
+-- ⚠️ Runs BEFORE the NOT NULL check (Postgres fires BEFORE-row triggers first), so the
+-- column stays NOT NULL with no DEFAULT and this still satisfies it.
+--
+-- ⚠️ The jsonb round trip is how a dynamically-named column is written — plain plpgsql
+-- cannot assign `NEW.<variable>`. Same trick as `zebridge_bump_version()`; no extension, and
+-- a generated per-table function would need nested dollar-quoting, which `envsubst`
+-- (the bridge-init pipe) destroys.
+CREATE OR REPLACE FUNCTION public.zebridge_guard_tenant()
+RETURNS trigger AS $$
+DECLARE
+    col  text := TG_ARGV[0];
+    val  text;
+    mine text;
+    who  text := current_setting('zb.principal', true);
+BEGIN
+    EXECUTE format('SELECT ($1).%I::text', col) USING NEW INTO val;
+
+    IF val IS NULL OR val = '' THEN
+        -- Derive from identity. N-1: one tenant per client principal, so LIMIT 1 is exact.
+        SELECT tenant_id INTO mine FROM public.zebridge_user_tenants
+            WHERE principal = who LIMIT 1;
+        IF mine IS NULL THEN
+            RAISE EXCEPTION 'no tenant for a write to %: principal % is unset or not in '
+                'zebridge_user_tenants, and a tenant-routed row cannot be left unrouted. '
+                'Set zb.principal in the transaction, or supply % explicitly.',
+                TG_TABLE_NAME, coalesce(quote_literal(who), 'NULL'), col
+                USING ERRCODE = 'check_violation';
+        END IF;
+        NEW := jsonb_populate_record(NEW, jsonb_build_object(col, mine));
+        RETURN NEW;
+    END IF;
+
+    IF val ~ '[.*> ]' THEN
+        RAISE EXCEPTION 'tenant %=% on % contains a NATS subject metacharacter '
+            '(. * > or space); it would route to a subject no consumer receives',
+            col, quote_literal(val), TG_TABLE_NAME USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+
 CREATE OR REPLACE FUNCTION public.zebridge_install_write_guards(
     tbl regclass,
     version_col text,
-    tombstone_col text DEFAULT NULL
+    tombstone_col text DEFAULT NULL,
+    tenant_col text DEFAULT NULL
 )
 RETURNS void AS $$
 DECLARE
@@ -213,6 +291,21 @@ BEGIN
         -- No tombstone column means deletes are physical for this table — the documented
         -- weaker guarantee, not an oversight. Saying so beats silence.
         RAISE NOTICE 'no tombstone for %: deletes stay physical, so an offline client can resurrect a row', t;
+    END IF;
+
+    -- The tenant guard, when the table is tenant-routed. One shared function,
+    -- `zebridge_guard_tenant()`, with the column name passed as a trigger argument.
+    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_guard_tenant_t ON %s', t);
+    IF tenant_col IS NOT NULL THEN
+        IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = tbl
+                       AND attname = tenant_col AND attnum > 0 AND NOT attisdropped) THEN
+            RAISE EXCEPTION '% has no column %', t, tenant_col;
+        END IF;
+        EXECUTE format(
+            'CREATE TRIGGER zebridge_guard_tenant_t BEFORE INSERT OR UPDATE ON %s '
+            'FOR EACH ROW EXECUTE FUNCTION public.zebridge_guard_tenant(%L)', t, tenant_col
+        );
+        RAISE NOTICE 'tenant guard on %: %  filled from the writer''s tenant when omitted (fail-closed if unmapped), malformed refused', t, tenant_col;
     END IF;
 END;
 $$ LANGUAGE plpgsql;
@@ -309,14 +402,27 @@ BEGIN
     -- The writer may touch only rows whose tenant is mapped to the principal it declared.
     -- `USING` bounds what it can see and change; `WITH CHECK` bounds what it can leave
     -- behind — both are needed, or a writer can move a row into another tenant.
+    --
+    -- ⚠️ **Open bar on the OPEN tenant (`${OPEN_TENANT}`): every principal may write it**, in
+    -- both clauses, even one mapped to no tenant but its own. This is the write half of the
+    -- open-data model — the open tenant is a shared pool anyone may post to and anyone may
+    -- edit (it is also read by everyone via CDC_PUBLIC). Integrity on *private* tenants is
+    -- untouched: alice still cannot write or delete a `globex` row. The carve-out only widens
+    -- reach to the tenant that is public by definition, so it grants nothing that reading the
+    -- open feed did not already expose.
+    --
+    -- ⚠️ It is in USING as well as WITH CHECK on purpose. Edge writes are upserts
+    -- (INSERT … ON CONFLICT DO UPDATE); updating an existing open row needs USING to see it,
+    -- so a WITH-CHECK-only carve-out would let a restricted user CREATE an open row but fail
+    -- to UPDATE one — a half-open state worse than either choice.
     EXECUTE format('DROP POLICY IF EXISTS zb_tenant_write ON %s', tbl);
     EXECUTE format(
         'CREATE POLICY zb_tenant_write ON %s FOR ALL TO %I'
         ' USING (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-        '   WHERE principal = current_setting(''zb.principal'', true)))'
+        '   WHERE principal = current_setting(''zb.principal'', true)) OR %I = ''${OPEN_TENANT}'')'
         ' WITH CHECK (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-        '   WHERE principal = current_setting(''zb.principal'', true)))',
-        tbl, '${POSTGRES_WRITER_USER}', tenant_col, tenant_col);
+        '   WHERE principal = current_setting(''zb.principal'', true)) OR %I = ''${OPEN_TENANT}'')',
+        tbl, '${POSTGRES_WRITER_USER}', tenant_col, tenant_col, tenant_col, tenant_col);
 
     -- ⚠️ The reader sees everything, deliberately. It feeds CDC and snapshots for *all*
     -- tenants, and the split happens on the subject — a reader bounded by RLS would make

@@ -683,11 +683,13 @@ BEGIN
                 'the version is not corrected, and a direct DELETE is not tombstoned';
         ELSE
             IF NOT dry_run THEN
-                EXECUTE format('SELECT public.zebridge_install_write_guards(%L::regclass, %L, %L)',
-                               tbl, version_col, tombstone_col);
+                -- tenant_col passed through: when the table is tenant-routed, the same call
+                -- installs the tenant guard (absent -> the open tenant, OPEN_TENANT; malformed -> rejected).
+                EXECUTE format('SELECT public.zebridge_install_write_guards(%L::regclass, %L, %L, %L)',
+                               tbl, version_col, tombstone_col, tenant_col);
             END IF;
             RETURN QUERY SELECT 'guards', verb,
-                format('zebridge_install_write_guards(%L, %L, %L)', tbl::text, version_col, tombstone_col);
+                format('zebridge_install_write_guards(%L, %L, %L, %L)', tbl::text, version_col, tombstone_col, tenant_col);
         END IF;
 
         IF tenant_col IS NOT NULL THEN

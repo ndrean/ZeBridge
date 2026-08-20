@@ -466,6 +466,53 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // === Boot preflight: every declared tenant must have its CDC stream ===
+    //
+    // CDC is routed by subject and stored per tenant (NOTES.md §1.12). A row whose tenant
+    // is in the WAL but whose `CDC_<TENANT>` stream does not exist has nowhere to land: the
+    // publish never gets a PubAck, retries exhaust, and the bridge FATALs mid-stream —
+    // stranding whatever was queued behind it and leaving the slot to retain WAL. That is a
+    // runtime failure for a condition knowable at boot.
+    //
+    // ⚠️ This does NOT prevent the *undeclared*-tenant case (a row whose tenant is in no
+    // stream and no `topology.tenants`) — nothing at boot can, because that tenant is data
+    // that has not arrived yet. It closes the DECLARED case: `topology.json` says a tenant
+    // exists, so its stream must too, and disagreeing is a deployment error worth refusing
+    // to start over rather than discovering under load.
+    if (runtime_config.topology.tenants.len > 0) {
+        var missing: usize = 0;
+        // Each tenant's own stream, then the shared public stream.
+        for (runtime_config.topology.tenants) |tenant| {
+            // CDC_<TENANT> — upper-cased to match nats-init's `tr '[:lower:]' '[:upper:]'`.
+            var name_buf: [256]u8 = undefined;
+            const upper = std.ascii.upperString(name_buf[runtime_config.topology.cdc_stream_prefix.len..], tenant);
+            @memcpy(name_buf[0..runtime_config.topology.cdc_stream_prefix.len], runtime_config.topology.cdc_stream_prefix);
+            const stream_name = name_buf[0 .. runtime_config.topology.cdc_stream_prefix.len + upper.len];
+            if (publisher.streamExists(stream_name)) {
+                log.info("✅ tenant '{s}' → stream {s}", .{ tenant, stream_name });
+            } else {
+                log.err("🔴 tenant '{s}' is declared but stream {s} does not exist. " ++
+                    "Create it (nats-init reads topology.json) or remove the tenant.", .{ tenant, stream_name });
+                missing += 1;
+            }
+        }
+        // The public stream: tables with no tenant column publish here, so its absence is
+        // the same class of hole for a different set of tables.
+        if (publisher.streamExists(runtime_config.topology.cdc_stream_public)) {
+            log.info("✅ public tables → stream {s}", .{runtime_config.topology.cdc_stream_public});
+        } else {
+            log.err("🔴 public stream {s} does not exist. Public-table CDC has nowhere to land.", .{runtime_config.topology.cdc_stream_public});
+            missing += 1;
+        }
+
+        if (missing > 0) {
+            log.err("🔴 FATAL: {d} declared CDC stream(s) missing — refusing to start rather than FATAL under load.", .{missing});
+            should_stop.store(true, .seq_cst);
+            return error.MissingTenantStreams;
+        }
+        log.info("✅ Tenant-stream preflight: {d} tenant(s) + public stream all present", .{runtime_config.topology.tenants.len});
+    }
+
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
     http_srv.refused = &refused;

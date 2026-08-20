@@ -52,14 +52,11 @@ const PASSWORD = (import.meta.env.VITE_PASSWORD as string | undefined) ?? 's3cre
 ///     VITE_PRINCIPAL=bob   VITE_TENANT=globex pnpm dev --port 5174
 const TENANT = (import.meta.env.VITE_TENANT as string | undefined) ?? '';
 
-/// Tables the bridge publishes on the **bare** `cdc.<table>.<op>` subject because they
-/// carry no tenant column (nothing names them in the bridge's `TENANT_RULES`).
-///
-/// ⚠️ These are invisible to a `cdc.<tenant>.>` filter, and invisible in the worst way:
-/// a filtered consumer does not merely lag on them, it never counts them as pending, so
-/// it reports `num_pending: 0` and looks fully caught up while the rows sit unread in the
-/// stream. That reads exactly like an idle database. Mirrors `zebridge_public_tables`.
-const PUBLIC_TABLES = (topology as any).public_tables as string[] ?? [];
+/// ⚠️ There is deliberately no PUBLIC_TABLES list here any more. Tables with no tenant
+/// column are carried by the CDC_PUBLIC *stream*, whose subject list is declared in
+/// topology.json and applied by nats-init — server-side, where a grant can bound it. The
+/// client used to name them in a `filter_subjects` array, which worked and was not safe:
+/// a reader-chosen filter cannot be a security boundary (see cdcStreams()).
 
 /// ⚠️ A password in a browser bundle is **enforced, not secret**. Anyone with devtools
 /// reads it and can then write as `alice` from curl. What this buys is real and worth
@@ -297,7 +294,21 @@ const syncedTables = new Map<string, TableState>();
 /// truth for state, this is only the render order.
 const [syncedTableNames, setSyncedTableNames] = createSignal<string[]>([]);
 const refreshTableNames = () => setSyncedTableNames([...syncedTables.keys()].sort());
-let globalSyncState = { lsn: 0, seq: 0 };
+/// ⚠️ `seq` is **per stream**, not global. CDC is split into one stream per tenant plus a
+/// shared public one, and JetStream sequences are per stream — `CDC_ACME` seq 5 and
+/// `CDC_PUBLIC` seq 3 are unrelated numbers. A single `seq` with `Math.max` over both would
+/// corrupt each: resuming one stream from the other's position silently skips or replays.
+/// `lsn` stays global — it is PostgreSQL's WAL position and means the same thing everywhere.
+let globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, seq: {} };
+
+/// Which CDC streams this client reads. One per tenant plus the shared public stream — the
+/// stream name is the read boundary, because a `filter_subject` is chosen by the reader and
+/// is not a permission (see nats-server.conf.template).
+const cdcStreams = (): string[] => {
+  const cfg = (topology as any).cdc_streams;
+  if (!TENANT || !cfg) return [topology.streams.cdc];      // untenanted deployment
+  return [`${cfg.tenant_prefix}${TENANT.toUpperCase()}`, cfg.public];
+};
 
 /**
  * CDC events that arrived referencing columns the local schema does not have yet.
@@ -546,11 +557,22 @@ export default function App() {
         global_last_seq INTEGER
       );
     `);
+    // One row per stream. The legacy single `global_last_seq` column is left in place and
+    // unused: it cannot express two streams, and dropping it would break a replica written
+    // by an older client.
+    await sql(`
+      CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (
+        stream TEXT PRIMARY KEY,
+        last_seq INTEGER NOT NULL
+      );
+    `);
     await sql(`INSERT OR IGNORE INTO _zebridge_sync (id, global_last_lsn, global_last_seq) VALUES (1, 0, 0)`);
     const res = await sql(`SELECT global_last_lsn, global_last_seq FROM _zebridge_sync WHERE id = 1`);
     if (res.length > 0) {
       globalSyncState.lsn = res[0].global_last_lsn ?? 0;
-      globalSyncState.seq = res[0].global_last_seq ?? 0;
+    }
+    for (const r of await sql(`SELECT stream, last_seq FROM _zebridge_stream_seq`)) {
+      globalSyncState.seq[(r as any).stream] = (r as any).last_seq ?? 0;
     }
   };
 
@@ -1021,15 +1043,20 @@ export default function App() {
       }
     }
 
-    if ((ev.lsn ?? 0) > globalSyncState.lsn || (ev.seq ?? 0) > globalSyncState.seq) {
+    const stream: string = ev.stream ?? "";
+    const streamSeq = stream ? (globalSyncState.seq[stream] ?? 0) : 0;
+    if ((ev.lsn ?? 0) > globalSyncState.lsn || (ev.seq ?? 0) > streamSeq) {
       globalSyncState.lsn = Math.max(globalSyncState.lsn, ev.lsn ?? 0);
-      globalSyncState.seq = Math.max(globalSyncState.seq, ev.seq ?? 0);
+      if (stream) globalSyncState.seq[stream] = Math.max(streamSeq, ev.seq ?? 0);
       try {
-        await sql(
-          `UPDATE _zebridge_sync SET global_last_lsn = ?, global_last_seq = ? WHERE id = 1`,
-          globalSyncState.lsn,
-          globalSyncState.seq
-        );
+        await sql(`UPDATE _zebridge_sync SET global_last_lsn = ? WHERE id = 1`, globalSyncState.lsn);
+        if (stream) {
+          await sql(
+            `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
+             ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
+            stream, globalSyncState.seq[stream]
+          );
+        }
       } catch (e) {
         appendLog('SQLITE', `Failed to update sync state: ${e}`, 'ERROR');
       }
@@ -1043,10 +1070,22 @@ export default function App() {
 
     // 1. Gap Detection
     try {
-      const streamInfo = await jsm.streams.info(topology.streams.cdc);
-      const firstSeq = streamInfo.state.first_seq;
-      if (globalSyncState.seq === 0 || (firstSeq > 0 && globalSyncState.seq < firstSeq - 1)) {
-        appendLog('SYS', `Gap detected or first run! Local seq: ${globalSyncState.seq}, Stream first seq: ${firstSeq}. Snapshots required!`, 'WARNING');
+      // ⚠️ Asked of EVERY stream this client reads, not one. A gap in any of them means the
+      // replica is missing rows, and checking only the tenant stream would miss a public
+      // table that aged out — the failure would look like a table that is simply empty.
+      let gap = false;
+      const gapDetail: string[] = [];
+      for (const streamName of cdcStreams()) {
+        const info = await jsm.streams.info(streamName);
+        const firstSeq = info.state.first_seq;
+        const local = globalSyncState.seq[streamName] ?? 0;
+        if (local === 0 || (firstSeq > 0 && local < firstSeq - 1)) {
+          gap = true;
+          gapDetail.push(`${streamName}: local ${local}, stream first ${firstSeq}`);
+        }
+      }
+      if (gap) {
+        appendLog('SYS', `Gap detected or first run! ${gapDetail.join('; ')}. Snapshots required!`, 'WARNING');
           
           let snapKv;
           try { 
@@ -1207,52 +1246,56 @@ export default function App() {
     // 2. Start JetStream Consumer ONLY AFTER snapshots are resolved!
     try {
       console.log('App.tsx: Starting CDC consumer on subject:', `${topology.subjects.cdc_prefix}.>`);
-      const ci = await jsm.consumers.add(topology.streams.cdc, {
-        // ⚠️ Two subject shapes reach a tenant client, and one filter cannot cover both:
-        //
-        //     cdc.<tenant>.<table>.<op>   tables named in the bridge's TENANT_RULES
-        //     cdc.<table>.<op>            public tables — no tenant column (PUBLIC_TABLES)
-        //
-        // `filter_subjects` (plural, NATS 2.10+) is **exclusive of** `filter_subject`:
-        // set one or the other, never both, or the server rejects the consumer.
-        //
-        // Subscribing to a subject this principal is not granted fails **silently** — the
-        // subscription is created, the connection stays up, and no message ever arrives —
-        // so a wrong tenant here looks exactly like an idle database.
-        ...(TENANT
-          ? {
-              filter_subjects: [
-                `${topology.subjects.cdc_prefix}.${TENANT}.>`,
-                ...PUBLIC_TABLES.map((t) => `${topology.subjects.cdc_prefix}.${t}.>`),
-              ],
+      // ⚠️ **One consumer per stream, because a consumer belongs to exactly one stream.**
+      // CDC is split per tenant (CDC_ACME, CDC_GLOBEX) plus a shared CDC_PUBLIC for tables
+      // with no tenant column. That split is a security boundary, not organisation: a
+      // subject permission governs core SUBSCRIBE only — a JetStream consumer never
+      // subscribes to the subject it filters on, so `cdc.acme.>` in the allow-list could not
+      // stop a client creating a consumer on a shared stream filtered at another tenant.
+      // Measured before the split: alice pulled `cdc.globex.test_types.insert` with her own
+      // credentials (`scripts/scenarios/crosstenant.py`).
+      //
+      // ⚠️ This replaces a single `filter_subjects: [cdc.<tenant>.>, cdc.users.>]` consumer.
+      // That worked and was not safe — the filter was doing the job a grant should do.
+      //
+      // ⚠️ No ordering guarantee ACROSS streams, and none is needed: they carry disjoint
+      // tables, so no row is described by both. Ordering *within* a table still comes from
+      // its own stream.
+      for (const streamName of cdcStreams()) {
+        const last = globalSyncState.seq[streamName] ?? 0;
+        const ci = await jsm.consumers.add(streamName, {
+          // No filter: the stream itself is now the filter. Narrowing further here would
+          // only re-introduce a reader-chosen boundary.
+          deliver_policy: last > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
+          opt_start_seq: last > 0 ? last + 1 : undefined,
+        });
+        const consumer = await js.consumers.get(streamName, ci.name);
+        appendLog('SYS', `CDC consumer on ${streamName} (from seq ${last || 'all'})`, 'INFO');
+
+        const iter = await consumer.consume();
+        void (async () => {
+          for await (const msg of iter) {
+            let decoded: any;
+            try { decoded = decode(msg.data); } catch { decoded = JSON.parse(td.decode(msg.data)); }
+            const events = Array.isArray(decoded) ? decoded : [decoded];
+
+            for (const ev of events) {
+              ev.seq = msg.seq;
+              // Which stream this came from — sequences are per stream, so advancing the
+              // wrong one silently skips or replays.
+              ev.stream = streamName;
+              // cdc.<tenant>.<table>.<op> has the table at [2]; the bare
+              // cdc.<table>.<op> has it at [1]. Taking [1] unconditionally yielded the
+              // *tenant* for routed subjects — harmless only while ev.table is present.
+              const parts = msg.subject.split('.');
+              const table = ev?.table || (parts.length >= 4 ? parts[2] : parts[1]);
+              appendLog(msg.subject, ev, ev?.operation || 'CDC');
+              if (table) await applyEvent(table, ev);
             }
-          : { filter_subject: `${topology.subjects.cdc_prefix}.>` }),
-        deliver_policy: globalSyncState.seq > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
-        opt_start_seq: globalSyncState.seq > 0 ? globalSyncState.seq + 1 : undefined,
-      });
-      const consumer = await js.consumers.get(topology.streams.cdc, ci.name);
-
-      console.log('App.tsx: CDC Consumer started! Iterating messages...');
-      const iter = await consumer.consume();
-      (async () => {
-        for await (const msg of iter) {
-          let decoded: any;
-          try { decoded = decode(msg.data); } catch { decoded = JSON.parse(td.decode(msg.data)); }
-          const events = Array.isArray(decoded) ? decoded : [decoded];
-
-          for (const ev of events) {
-            ev.seq = msg.seq;
-            // cdc.<tenant>.<table>.<op> has the table at [2]; the bare
-            // cdc.<table>.<op> has it at [1]. Taking [1] unconditionally yielded the
-            // *tenant* for routed subjects — harmless only while ev.table is present.
-            const parts = msg.subject.split('.');
-            const table = ev?.table || (parts.length >= 4 ? parts[2] : parts[1]);
-            appendLog(msg.subject, ev, ev?.operation || 'CDC');
-            if (table) await applyEvent(table, ev);
+            msg.ack();
           }
-          msg.ack();
-        }
-      })();
+        })();
+      }
     } catch (e) {
       appendLog('SYS', `Failed to start CDC consumer: ${e}`, 'ERROR');
     }

@@ -1,5 +1,6 @@
 # nats-server.conf — generated from nats-server.conf.template by nats-config-gen.
-# ${NATS_BRIDGE_NKEY_PUB} and ${NATS_ALICE_PASSWORD} are substituted at startup.
+# ${NATS_BRIDGE_NKEY_PUB}, ${NATS_ALICE_PASSWORD}, ${NATS_BOB_PASSWORD} and ${OPEN_TENANT}
+# are substituted at startup (nats-config-gen, from .env.admin).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # This file is where PROTOCOL.md §7.1 stops being a claim and becomes a fact.
@@ -78,8 +79,27 @@ http_port: 8222
 # has no way to express "the common set, plus this". It is exactly the duplication that
 # `--allow-sub "…{{name()}}…"` on a scoped signing key removes — see the migration note
 # at the top of this file.
+# ⚠️ `cdc.acme.>`, NOT `cdc.>`. A principal granted the whole feed is separated from other
+# tenants only by the `filter_subject` its own client chooses — which is not enforcement, it
+# is etiquette. Measured before this changed: alice, tenant `acme`, subscribed to
+# `cdc.globex.>` with these very credentials and received `cdc.globex.test_types.insert`.
+#
+# ⚠️ `cdc.users.>` is a SECOND entry and not an oversight. Tables with no tenant column
+# publish on the bare `cdc.<table>.<op>` subject (they are recorded in
+# `zebridge_public_tables`, mirrored to `topology.json:public_tables`), so a tenant grant
+# alone cannot reach them. Add a public table, add a line here — and to the matching
+# `filter_subjects` in the client, or it subscribes to something it is not granted and looks
+# idle rather than refused.
+#
+# ⚠️ `cdc.${OPEN_TENANT}.>` is the THIRD: the open tenant, the value a tenant column takes
+# when a writer left it NULL or empty (`zebridge_guard_tenant()`). Those rows are nobody's
+# and everybody's — they publish under a token no declared tenant owns, and `nats-init`
+# binds that token into the CDC_PUBLIC stream alongside the public tables. Same value,
+# one env (`OPEN_TENANT` in .env.admin) rendered into the guard, the stream and here.
 ALICE_READ = [
-  "cdc.>"                      # the change feed
+  "cdc.acme.>"                 # her tenant's change feed — and nobody else's
+  "cdc.users.>"                # public tables, which carry no tenant token
+  "cdc.${OPEN_TENANT}.>"       # the open tenant: rows that opted into no tenant
   "init.>"                     # snapshot chunks, schemas, snapshot errors
   "mutation_ack.alice.>"       # her own write verdicts, keyed by her Nats-Msg-Id
   "$KV.schemas.>"              # schema descriptors
@@ -97,7 +117,9 @@ ALICE_READ = [
 #
 # It is a leak and a hang from a single copy-paste. Add a principal, add a list.
 BOB_READ = [
-  "cdc.>"
+  "cdc.globex.>"               # HIS tenant — the same one-line difference as mutation_ack
+  "cdc.users.>"                # public tables
+  "cdc.${OPEN_TENANT}.>"       # the open tenant — same subject as alice's, by design
   "init.>"
   "mutation_ack.bob.>"         # HIS own verdicts — not alice's
   "$KV.schemas.>"
@@ -148,14 +170,25 @@ authorization {
           # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
           # would hand her exactly that, which is why it is not used here.
           "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
-          "$JS.API.CONSUMER.CREATE.CDC",            "$JS.API.CONSUMER.CREATE.CDC.>"
+          # ⚠️ **The stream name is the read boundary, not the subject.** A JetStream
+          # consumer never subscribes to the subject it filters on, so `cdc.acme.>` in the
+          # subscribe list below cannot stop a client creating a consumer on a shared stream
+          # filtered at another tenant. Measured: alice was refused a core SUB to
+          # `cdc.globex.>` and then pulled globex rows through a consumer on the wide CDC
+          # stream, same credentials. `scripts/scenarios/crosstenant.py` pins it.
+          #
+          # Naming the streams here is therefore what actually enforces the tenant split.
+          # CDC_PUBLIC carries tables with no tenant column and is granted to everyone.
+          "$JS.API.CONSUMER.CREATE.CDC_ACME",     "$JS.API.CONSUMER.CREATE.CDC_ACME.>"
+          "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
           "$JS.API.CONSUMER.INFO.INIT.>"
-          "$JS.API.CONSUMER.INFO.CDC.>"
+          "$JS.API.CONSUMER.INFO.CDC_ACME.>"
+          "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
           "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
@@ -167,11 +200,13 @@ authorization {
           # and REQUESTS, which no client can reach at all.
 
           "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
-          "$JS.API.CONSUMER.MSG.NEXT.CDC.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_ACME.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
           "$JS.API.STREAM.INFO.INIT"
-          "$JS.API.STREAM.INFO.CDC"
+          "$JS.API.STREAM.INFO.CDC_ACME"
+          "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.DIRECT.GET.KV_schemas.>"
@@ -224,14 +259,25 @@ authorization {
           # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
           # would hand her exactly that, which is why it is not used here.
           "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
-          "$JS.API.CONSUMER.CREATE.CDC",            "$JS.API.CONSUMER.CREATE.CDC.>"
+          # ⚠️ **The stream name is the read boundary, not the subject.** A JetStream
+          # consumer never subscribes to the subject it filters on, so `cdc.acme.>` in the
+          # subscribe list below cannot stop a client creating a consumer on a shared stream
+          # filtered at another tenant. Measured: alice was refused a core SUB to
+          # `cdc.globex.>` and then pulled globex rows through a consumer on the wide CDC
+          # stream, same credentials. `scripts/scenarios/crosstenant.py` pins it.
+          #
+          # Naming the streams here is therefore what actually enforces the tenant split.
+          # CDC_PUBLIC carries tables with no tenant column and is granted to everyone.
+          "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
           "$JS.API.CONSUMER.INFO.INIT.>"
-          "$JS.API.CONSUMER.INFO.CDC.>"
+          "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
           "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
@@ -243,11 +289,13 @@ authorization {
           # and REQUESTS, which no client can reach at all.
 
           "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
-          "$JS.API.CONSUMER.MSG.NEXT.CDC.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
           "$JS.API.STREAM.INFO.INIT"
-          "$JS.API.STREAM.INFO.CDC"
+          "$JS.API.STREAM.INFO.CDC_GLOBEX"
+          "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.DIRECT.GET.KV_schemas.>"
