@@ -8,9 +8,7 @@
 
 **What can it do?**: Allows mobile, WASM ([PGLite](https://github.com/electric-sql/pglite), [SQLite](https://sqlite.org/wasm/doc/trunk/index.md)) web apps or microservices to sync with a Postgres database via NATS/JS without ever reaching for Postgres.
 
-**What is it not**: a file transfer tool. Large blobs (>1 MB) is the domain of object storage.
-
-**Design**: ZeBridge projects PostgreSQL onto NATS/JS, and never reads its own output back. PostgreSQL is the source of truth of ZeBridge for anything about the catalogue. NATS is the source of truth for consumers. Lastly, consumer state always arrives through CDCs: no optimistic WRITE.
+**Design**: This tool is oriented to serve a large number of small to medium consumers via the message broker NATS.JS, so designed to be fast and safe. It projects PostgreSQL onto NATS/JS which in turn is connected to consumers with there local database to keep synced.
 
 By pushing all consumer state, caching, and rate-limiting down into NATS/JS, the ZeBridge binary is stateless toward consumers.
 
@@ -28,17 +26,23 @@ By pushing all consumer state, caching, and rate-limiting down into NATS/JS, the
 
 **How to configure Postgres/NATS?**: the DBA will push migrations to PostgreSQL, and configure NATS/JS. Examples in [docker-compose.full.yml]()
 
-**How to implement a consumer?**: A consumer will implement a **standard protocol** to interact this NATS. No proprietary SDK. This is detailled in [PROTOCOLE.md](): a set of rules and workflows.
-While the readOnly way stays simple, enabling writes demand more work in terms of
-Examples implementing it  - in particular testing in a browser - are available: webapp, Python, Elixir, Go, Flutter.
+**How to implement a consumer?**: A consumer will implement a **standard protocol** to interact this NATS. No proprietary SDK. This is detailled in [PROTOCOLE.md](): a set of rules and workflows to match those used by ZeBridge.
+While the readOnly flow stays simple, enabling writes brings in naturally more constraints to guarantee the sync using LWW.
+Examples are available.
 
-**How to configure ZeBridge?**: we expect ZeBridge to be fast and implemented a fixed memory model.  The main settings are the dimension this memory to match NATS max_message size (default 1MB) and the incoming data and buffer NATS potential jitters.
+**How to configure ZeBridge?**: we expect ZeBridge to be fast and implemented a fixed memory model.  Check [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count). The main settings are the dimension of this memory to match NATS max_message size (default 1MB) and the incoming data and buffer potential NATS jitters.
+
+**What is it not**: This tool is oriented to serve a large number of small to medium consumers via the message broker NATS. It is NOT a file transfer tool. Large blobs (>1 MB) is the domain of object storage.
+
+**Does this scale?**: you can run on the same PostgreSQL publication several instances dedicated to certain tables with their own memory configuration, slot and port.
 
 **Performance**: this single threaded binary (3 MB) drained _on localhost_ 2,000,000 CDC INSERT events in under 10 s end to end (PG → NATS) in the burst benchmark below: [An example of a measured throughput](#an-example-of-a-measured-throughput). Run it yourself before trusting it.
 
 **Telemetry**: ZeBridge includes a webserver and emits Prometheus metrics on port 9090 (default).
 
 **Security**: read [SECURIY.md](security.md)
+
+**How to evaluate it?**: you need `Zig` on your machine to build the binary. The _docker-compose.full.yml_ mounts the infrastructure. You run the bridge, one or two consumers - instances of the webapp _/web-consumer_ - and optionally a direct emitter to Postgres (Python based) app.
 
 **Status**: Dev stage, draft notes, everywhere.
 
@@ -71,11 +75,7 @@ Examples implementing it  - in particular testing in a browser - are available: 
 
 A consumer connects to a NATS server facing ZeBridge.
 
-Since NATS have 40+ clients, instead of an SDK, we propose a  [PROTOCOLE.md](#protocole.md). It details the workflows to be used to connect consumers to the NATS server to use the local-first synced database.
-
-Worked examples can be found in [PROTOCOLE.md](#protocole.md) for Flutter, webapps (WASM-SQLite + OPFS), backend microservice in Node, Python & Elixir (all _TODO_).
-
-**What does the architecture look like?**:
+**Architecture**:
 
 ```mermaid
 flowchart TD
@@ -83,11 +83,15 @@ flowchart TD
         PG[("PostgreSQL <br> Master")]
         subgraph Localhost ["VPS - Localhost"]
           Bridge["ZeBridge <br> daemon"]
-          NATS[("NATS <br> JetStream")]
+          NATS[("NATS/JS")]
+          RevProx["Reverse <br>Proxy"]
         end
         
-        Bridge -- Prometheus --> Grafana["Grafana <br> dashboard"]
-        NATS -- Prometheus --> Grafana
+        
+        Bridge -- Prometheus --> RevProx
+        Grafana["Grafana <br> dashboard"]
+        RevProx -->Grafana
+        NATS -- Prometheus --> RevProx
 
         PG -- "SSL (opt)" --> Bridge
         Bridge -- "SSL (opt)" --> PG
@@ -109,6 +113,10 @@ flowchart TD
 
 > [!NOTE] v0.14: NATS and ZeBridge needs to be colocated (same host) since the communication between them is only plain text.
 
+Since NATS have 40+ clients, instead of an SDK, we propose a  [PROTOCOLE.md](#protocole.md). It details the workflows and rules to be used to connect consumers to the NATS server adn sync the local-first database.
+
+Worked examples can be found in [PROTOCOLE.md](#protocole.md) for Flutter, webapps (WASM-SQLite + OPFS), backend microservice in Node, Python & Elixir (_TODO_).
+
 * [x] **v 0.14**: Current.
   * **PG ≧ 14** (`pgoutput` binary mode starts)
   * **`libpq` 14+ at build time** (pipeline mode). The **server** only has to speak the v3 extended query protocol, so PostgreSQL itself may be older — see Prerequisites.
@@ -127,7 +135,7 @@ flowchart TD
 
 ## How ZeBridge compares
 
-ZeBridge differs significantly from established tools firstly by using NATS to solve the distribution problem and by proposing a protocole, a set of rules and workflows
+ZeBridge differs significantly from established tools firstly by using NATS to solve the distribution problem and by proposing a protocole, a set of rules and workflows to match those used by ZeBridge.
 
 **[PowerSync](https://github.com/powersync-ja)**
 
@@ -155,7 +163,9 @@ ZeBridge is designed as a companion to the NATS/JS broker to enable Local-first 
 
 ### Roles and privileges
 
-The DBA configures PostgreSQL to emit CDC, migrates the publication, and creates the roles, grants and triggers a ZeBridge instance needs. ZeBridge uses two roles:
+The DBA configures PostgreSQL to emit CDC, migrates the publication, and creates the roles, grants and triggers a ZeBridge instance needs.
+
+ZeBridge uses two (Postgres) USER:
 
 * `bridge_reader` (SELECT + REPLICATION, physically unable to write),
 * `bridge_writer` (no table privileges until a table is opened one at a time).
@@ -235,10 +245,7 @@ Once:
 
 The ZeBridge can be started with the following settings:
 
-* a fixed memory buffer definition: `BASE_BUF` (default 2^14=16KB) and `RING_BUFFER_COUNT` (default 65565) adjusted depending upon the tables the instance is supposed to handle. Remember the memory footprint: $$2^{\mathtt{BASE\_BUF}} \times \small{\text{RING\_BUFFER\_COUNT}}$$
-* ❌ Refuse startup on checks:
-  * Sys_mem $< 2^\mathtt{BASE\_BUF} \times$ RING
-  * BASE_BUF < max_payload (nats.conf)
+* a fixed memory buffer definition: `BASE_BUF` (default 2^14=16KB) and `RING_BUFFER_COUNT` (default 65565) adjusted depending upon the tables the instance is supposed to handle.
 * a unique `--slot` (the unique pointer to the WAL that PostgreSQL keeps for this PUBLICATION). If you have several instances running, each has its own `SLOT`.
 * a unique `--port` (for the instance, for the telemetry, served by a webserver). If you have several instances running, each has its own `PORT`,
 * the `--top` config, defaults to _topology.json_ (_./topology.json_), shared naming of streams and bucket between ZeBridge, NATS and consumers,
@@ -271,6 +278,11 @@ The principal is authenticated at the Consumer level, and used in the JWT/Operat
 
 ## Design overview
 
+It projects PostgreSQL onto NATS/JS, and never reads its own output back.
+PostgreSQL is the source of truth of ZeBridge for anything about the catalogue.
+NATS is the source of truth for consumers.
+Lastly, consumer state always arrives through CDCs: no optimistic WRITE.
+
 **Key features of the bridge**:
 
 * PostgreSQL _proto-v1_ streams using logical replication (`pgoutput` binary format)
@@ -278,7 +290,7 @@ The principal is authenticated at the Consumer level, and used in the JWT/Operat
 * Generates table snapshots on-demand, chunked by **bytes** to fit one NATS message (10 000 rows is only a ceiling), via NATS requests,
 * Triggers message to NATS on schema change via Postgres DDL event triggers,
 * schemas are available in two formats: PostgreSQL(eg for PQLite) and SQLite,
-* MessagePack default encoding (JSON available with `--json`),
+* `MessagePack` default encoding (JSON available with `--json`),
 * At-least-once delivery with idempotent message IDs,
 * Graceful shutdown with LSN acknowledgment,
 * telemetry via HTTP `/metrics` (Prometheus format) and structured logs on **stderr** (Grafana Loki)
