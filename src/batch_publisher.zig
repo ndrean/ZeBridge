@@ -56,83 +56,6 @@ pub fn initSlab(allocator: std.mem.Allocator, slot_count: usize, slot_size: usiz
     return slab;
 }
 
-/// Convert pgoutput.Column value to encoder.Value
-fn columnValueToEncoderValue(
-    encoder: *encoder_mod.Encoder,
-    column_value: pgoutput.DecodedValue,
-) !encoder_mod.Value {
-    return switch (column_value) {
-        .int32 => |v| encoder.createInt(@intCast(v)),
-        .int64 => |v| encoder.createInt(v),
-        .float64 => |v| encoder.createFloat(v),
-        .boolean => |v| encoder.createBool(v),
-        .text, .bytea, .array, .numeric => |v| try encoder.createString(v),
-        .jsonb => |v| blk: {
-            // For JSONB columns in MessagePack mode, parse and convert to native types
-            // For JSON mode, just treat as a string (simpler and avoids ownership issues)
-            break :blk switch (encoder.format) {
-                .msgpack => blk2: {
-                    // Parse JSON and convert to MessagePack native types
-                    const parsed = std.json.parseFromSlice(
-                        std.json.Value,
-                        encoder.allocator,
-                        v,
-                        .{},
-                    ) catch {
-                        // If parsing fails, fall back to string
-                        break :blk2 try encoder.createString(v);
-                    };
-                    defer parsed.deinit();
-
-                    const mp = try jsonValueToMsgpack(parsed.value, encoder.allocator);
-                    break :blk2 encoder_mod.Value{ .msgpack = mp };
-                },
-                .json => try encoder.createString(v), // Keep JSONB as JSON string
-            };
-        },
-        .null => encoder.createNull(),
-    };
-}
-
-/// Convert std.json.Value to msgpack.Payload recursively (for JSONB columns in MessagePack mode)
-fn jsonValueToMsgpack(value: std.json.Value, allocator: std.mem.Allocator) !msgpack.Payload {
-    return switch (value) {
-        .null => msgpack.Payload{ .nil = {} },
-        .bool => |b| msgpack.Payload{ .bool = b },
-        .integer => |i| msgpack.Payload{ .int = i },
-        .float => |f| msgpack.Payload{ .float = f },
-        .number_string => |s| blk: {
-            // Try to parse as number, fallback to string
-            if (std.fmt.parseInt(i64, s, 10)) |int_val| {
-                break :blk msgpack.Payload{ .int = int_val };
-            } else |_| {
-                if (std.fmt.parseFloat(f64, s)) |float_val| {
-                    break :blk msgpack.Payload{ .float = float_val };
-                } else |_| {
-                    break :blk try msgpack.Payload.strToPayload(s, allocator);
-                }
-            }
-        },
-        .string => |s| try msgpack.Payload.strToPayload(s, allocator),
-        .array => |arr| blk: {
-            var msgpack_arr = try allocator.alloc(msgpack.Payload, arr.items.len);
-            for (arr.items, 0..) |item, i| {
-                msgpack_arr[i] = try jsonValueToMsgpack(item, allocator);
-            }
-            break :blk msgpack.Payload{ .arr = msgpack_arr };
-        },
-        .object => |obj| blk: {
-            var map_payload = msgpack.Payload.mapPayload(allocator);
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                const val = try jsonValueToMsgpack(entry.value_ptr.*, allocator);
-                try map_payload.mapPut(entry.key_ptr.*, val);
-            }
-            break :blk map_payload;
-        },
-    };
-}
-
 /// Configuration for batch publishing
 pub const BatchConfig = struct {
     /// Maximum number of events per batch
@@ -459,6 +382,16 @@ pub const BatchPublisher = struct {
     flush_thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
 
+    // Backing allocator for one flush's worth of encoding work: the msgpack/JSON value
+    // trees built in publishSubjectGroup and the byte buffers doPublish/publishSubjectGroup
+    // hand to the NATS client. Reset (not deinit'd) after every doPublish call, so its
+    // pages settle at the flush thread's steady-state peak instead of being torn down and
+    // rebuilt on `self.allocator` (c_allocator/DebugAllocator) once per column per event —
+    // the same "packed into the ring buffer with zero heap allocation, then unpacked back
+    // into a fresh malloc per string" pattern this arena exists to remove. Owned only by
+    // the flush thread, so it needs no locking.
+    encode_arena: std.heap.ArenaAllocator,
+
     pub fn init(
         allocator: std.mem.Allocator,
         publisher: *nats_publisher.Publisher,
@@ -574,6 +507,7 @@ pub const BatchPublisher = struct {
             .flush_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
             .force_flush = std.atomic.Value(bool).init(false),
+            .encode_arena = std.heap.ArenaAllocator.init(allocator),
         };
 
         return self;
@@ -607,6 +541,9 @@ pub const BatchPublisher = struct {
         self.join();
 
         const allocator = self.allocator;
+
+        // The flush thread is joined above, so nothing can still be allocating from it.
+        self.encode_arena.deinit();
 
         // 2. Unlock the data slab from RAM (symmetric with mlock in init)
         if (@hasDecl(std.posix, "munlock")) {
@@ -847,7 +784,14 @@ pub const BatchPublisher = struct {
     fn doPublish(self: *BatchPublisher, indices: []usize) !void {
         if (indices.len == 0) return;
 
-        const flush_alloc = self.allocator;
+        // Every allocation this flush needs — the msgpack/JSON value trees and the
+        // encoded byte buffers handed to the NATS client — comes from this arena instead
+        // of `self.allocator` directly, and none of it needs to survive past this
+        // function returning (the publish calls below are synchronous). Reset rather
+        // than a fresh init/deinit per flush: capacity settles at this flush thread's
+        // steady-state peak instead of being torn down and grown again every batch.
+        defer _ = self.encode_arena.reset(.retain_capacity);
+        const flush_alloc = self.encode_arena.allocator();
         const event_count = indices.len;
 
         log.debug("📦 Encoding {d} events for publish", .{event_count});
@@ -903,7 +847,9 @@ pub const BatchPublisher = struct {
         if (indices.len == 0) return;
         if (indices.len == 1) return self.publishSubjectGroup(indices);
 
-        const flush_alloc = self.allocator;
+        // Same arena as doPublish, which called this and reset it fresh — grouping
+        // bookkeeping and the encode work below share one lifetime.
+        const flush_alloc = self.encode_arena.allocator();
 
         // Subjects in first-appearance order; the map holds each subject's indices.
         var order: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -941,8 +887,15 @@ pub const BatchPublisher = struct {
 
     /// Publish events that all share one subject. Callers must guarantee that;
     /// publishCDCSubBatch is what establishes it.
+    ///
+    /// Every allocation here — the msgpack/JSON value tree, the encoded bytes, the
+    /// batch subject/msg-id — comes from `doPublish`'s arena and needs no individual
+    /// `.free()`: the caller resets the whole arena once this flush's publish calls
+    /// return, which is the same "arena.deinit() handles everything" pattern the WAL
+    /// parse loop uses. Freeing any of it here would be freeing arena memory through
+    /// `self.allocator` (c_allocator/DebugAllocator), which does not own it.
     fn publishSubjectGroup(self: *BatchPublisher, indices: []usize) !void {
-        const flush_alloc = self.allocator;
+        const flush_alloc = self.encode_arena.allocator();
         const event_count = indices.len;
 
         // For single event, encode and publish directly
@@ -951,10 +904,8 @@ pub const BatchPublisher = struct {
             const event = &self.events[slot_idx];
 
             var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
-            defer encoder.deinit();
 
             var event_map = encoder.createMap();
-            defer event_map.free(flush_alloc);
 
             try event_map.put(encoder.allocator, "subject", try encoder.createString(event.getSubject()));
             try event_map.put(encoder.allocator, "table", try encoder.createString(event.getTable()));
@@ -983,7 +934,6 @@ pub const BatchPublisher = struct {
             }
 
             const encoded = try encoder.encode(event_map);
-            defer self.allocator.free(encoded);
 
             // Create headers with message ID for deduplication
                     const msg_id = event.getMsgId();
@@ -1004,10 +954,8 @@ pub const BatchPublisher = struct {
         } else {
             // Batch publishing
             var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
-            defer encoder.deinit();
 
             var batch_array = try encoder.createArray(event_count);
-            defer batch_array.free(flush_alloc);
 
             const encode_start = utils.getMilliTimestamp();
 
@@ -1041,7 +989,6 @@ pub const BatchPublisher = struct {
             }
 
             const encoded = try encoder.encode(batch_array);
-            defer self.allocator.free(encoded);
 
             const encode_elapsed = utils.getMilliTimestamp() - encode_start;
 
@@ -1054,14 +1001,12 @@ pub const BatchPublisher = struct {
                 "batch-{s}-to-{s}",
                 .{ first_event.getMsgId(), last_event.getMsgId() },
             );
-            defer self.allocator.free(batch_msg_id);
 
             const batch_subject = try std.fmt.allocPrint(
                 flush_alloc,
                 "{s}.batch",
                 .{first_event.getSubject()},
             );
-            defer self.allocator.free(batch_subject);
 
             const msg_id = batch_msg_id;
 
@@ -1193,27 +1138,6 @@ pub const BatchPublisher = struct {
                 const str = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
                 break :blk try encoder.createString(str);
             },
-            // .jsonb => blk: {
-            //     const json_str = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
-            //     // For JSONB columns in MessagePack mode, parse and convert to native types
-            //     break :blk switch (encoder.format) {
-            //         .msgpack => blk2: {
-            //             const parsed = std.json.parseFromSlice(
-            //                 std.json.Value,
-            //                 encoder.allocator,
-            //                 json_str,
-            //                 .{},
-            //             ) catch {
-            //                 break :blk2 try encoder.createString(json_str);
-            //             };
-            //             defer parsed.deinit();
-
-            //             const mp = try jsonValueToMsgpack(parsed.value, encoder.allocator);
-            //             break :blk2 encoder_mod.Value{ .msgpack = mp };
-            //         },
-            //         .json => try encoder.createString(json_str),
-            //     };
-            // },
         };
     }
 };

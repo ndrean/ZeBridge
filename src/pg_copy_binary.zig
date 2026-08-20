@@ -539,7 +539,15 @@ pub fn decodeTuple(
             return error.UnsupportedColumnType;
         }
 
-        const decoded = pgoutput.decodeBinColumnData(arena, col.oid, raw.?) catch |err| {
+        // `true`: `raw.?` is `Reader.take()` into `Streamer.buffer` (see readTuple's doc
+        // comment — "Slices point into the reader's buffer... and are not copied"), and
+        // `Streamer.buffer` is itself allocated with this same `arena` (the caller's
+        // per-chunk arena — see Streamer's doc comment) and fully populated before any
+        // tuple is parsed. So the same alias-instead-of-copy optimization applies here as
+        // in the CDC path: nothing resets `arena` until snapshot_listener's chunk loop
+        // starts its next iteration, well after this row's decoded value has been
+        // consumed into the chunk's encoded bytes.
+        const decoded = pgoutput.decodeBinColumnData(arena, col.oid, raw.?, true) catch |err| {
             log.err(
                 "🔴 cannot decode column '{s}' (OID {d}): {} — snapshot aborted rather than emitting unverified bytes",
                 .{ col.name, col.oid, err },

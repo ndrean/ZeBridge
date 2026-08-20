@@ -89,10 +89,17 @@ pub const Column = struct {
 ///
 /// Decodes binary-encoded column data from PostgreSQL when using
 /// START_REPLICATION with binary 'true'.
+///
+/// `owns_bytes`: true when the caller guarantees `raw_bytes` is already owned by
+/// `allocator` and will outlive the returned `DecodedValue` (decodeTuple's case: both
+/// come from the same arena, reclaimed together). The passthrough branches then return
+/// slices of `raw_bytes` directly instead of copying it — false keeps the defensive
+/// copy, for a caller like a test that hands in a stack buffer.
 pub fn decodeBinColumnData(
     allocator: std.mem.Allocator,
     type_id: u32,
     raw_bytes: []const u8,
+    owns_bytes: bool,
 ) !DecodedValue {
     const oid: PgOid = @enumFromInt(type_id);
 
@@ -221,25 +228,25 @@ pub fn decodeBinColumnData(
         .BPCHAR,
         .JSON,
         => {
-            // raw_bytes is from readBytes() which uses arena_allocator
-            // We need to dupe with main_allocator so it survives arena cleanup
-            const owned = try allocator.dupe(u8, raw_bytes);
-            return .{ .text = owned };
+            // Already Postgres's text output verbatim — nothing to transform, so when
+            // the caller already owns it (decodeTuple's arena) there is nothing to copy.
+            return .{ .text = if (owns_bytes) raw_bytes else try allocator.dupe(u8, raw_bytes) };
         },
         .BYTEA => {
-            // raw_bytes is from readBytes() which uses arena_allocator
-            // We need to dupe with main_allocator so it survives arena cleanup
-            const owned = try allocator.dupe(u8, raw_bytes);
-            return .{ .bytea = owned };
+            return .{ .bytea = if (owns_bytes) raw_bytes else try allocator.dupe(u8, raw_bytes) };
         },
 
         // --- NUMERIC (Binary format - use numeric.zig) ---
         .NUMERIC => {
             const result = try numeric_mod.parseNumeric(allocator, raw_bytes);
             // parseNumeric returns NumericResult { .slice, .allocated }
-            // where .slice is a sub-slice of .allocated pointing to the actual data
+            // where .slice is a sub-slice of .allocated pointing to the actual data.
             //
-            // We dupe the slice and free the original buffer
+            // `result.allocated` is fresh either way — the shrink-and-free below only
+            // reclaims the unused padding, which is a real win for a long-lived
+            // allocator and pure overhead against an arena that reclaims everything at
+            // once on the next reset.
+            if (owns_bytes) return .{ .numeric = result.slice };
             const owned = try allocator.dupe(u8, result.slice);
             allocator.free(result.allocated);
             return .{ .numeric = owned };
@@ -266,10 +273,10 @@ pub fn decodeBinColumnData(
                 // Strip surrounding quotes: "{"key":"value"}" -> {"key":"value"}
                 // Find the closing quote (should be at the end)
                 if (raw_bytes[raw_bytes.len - 1] == '"') {
-                    // Extract the JSON between quotes
+                    // Extract the JSON between quotes — a subslice, so when the caller
+                    // already owns raw_bytes there is nothing left to copy.
                     const json_text = raw_bytes[1 .. raw_bytes.len - 1];
-                    const owned = try allocator.dupe(u8, json_text);
-                    return .{ .jsonb = owned };
+                    return .{ .jsonb = if (owns_bytes) json_text else try allocator.dupe(u8, json_text) };
                 } else {
                     log.warn("JSONB starts with quote but doesn't end with quote", .{});
                     // Fall through to version byte handling
@@ -280,13 +287,11 @@ pub fn decodeBinColumnData(
             if (first_byte != 1) {
                 log.warn("Unexpected JSONB first byte: 0x{x:0>2} (expected 0x01 or '\"')", .{first_byte});
                 // Try to use it anyway, might be valid JSON
-                const owned = try allocator.dupe(u8, raw_bytes);
-                return .{ .jsonb = owned };
+                return .{ .jsonb = if (owns_bytes) raw_bytes else try allocator.dupe(u8, raw_bytes) };
             }
 
-            // Skip version byte, return JSON text
-            const owned = try allocator.dupe(u8, raw_bytes[1..]);
-            return .{ .jsonb = owned };
+            // Skip version byte, return JSON text — again a subslice of owned memory.
+            return .{ .jsonb = if (owns_bytes) raw_bytes[1..] else try allocator.dupe(u8, raw_bytes[1..]) };
         },
 
         // --- Array Types (Binary format - use array.zig) ---
@@ -304,6 +309,7 @@ pub fn decodeBinColumnData(
             // ENUMs and other user-defined types are sent as text in binary format
             // Treat them as TEXT and log a warning for visibility
             log.warn("Unknown type OID {d}, treating as text", .{type_id});
+            if (owns_bytes) return .{ .text = raw_bytes };
             const owned = try allocator.dupe(u8, raw_bytes);
             return .{ .text = owned };
         },
@@ -523,6 +529,13 @@ pub const TupleData = struct {
 /// Passing null keeps the old "treat unknown as text" behaviour and is only for tests —
 /// the live path must supply a registry, because that fallback is silent corruption for
 /// anything that is not an enum (see type_registry.zig).
+///
+/// ⚠️ `tuple`'s byte buffers (`.text`/`.binary`) are always populated by
+/// `Parser.readBytesOwned` using the *same* `allocator` passed here — every real
+/// caller parses and decodes with one arena, reset together after the WAL message that
+/// produced `tuple` is done with. Passthrough values below therefore alias `tuple`'s
+/// buffers instead of copying them: do not call `tuple.deinit()` after decoding if you
+/// are relying on the decoded values, since some of them may be the same memory.
 pub fn decodeTuple(
     allocator: std.mem.Allocator,
     tuple: TupleData,
@@ -547,12 +560,16 @@ pub fn decodeTuple(
             // has no binary send function, and its text output is exactly what a
             // consumer wants — so this needs no OID knowledge and cannot be corrupted
             // by lacking it.
-            .text => |raw_bytes| .{ .text = try allocator.dupe(u8, raw_bytes) },
+            //
+            // No copy: `raw_bytes` is already owned by `allocator` (see the doc comment
+            // above), so duplicating it here was copying arena data into the same arena
+            // a second time for every text-format column.
+            .text => |raw_bytes| .{ .text = raw_bytes },
             .binary => |raw_bytes| blk: {
                 if (type_guard) |guard| switch (guard.verdict(col_info.type_id)) {
                     .decode => {},
                     // Postgres sends an enum's label, so the bytes already are the text.
-                    .text_passthrough => break :blk DecodedValue{ .text = try allocator.dupe(u8, raw_bytes) },
+                    .text_passthrough => break :blk DecodedValue{ .text = raw_bytes },
                     .refuse => {
                         log.err(
                             "🔴 column '{s}' has type OID {d}, which the decoder does not implement and is not an enum — refusing rather than shipping its raw binary as a string",
@@ -562,7 +579,10 @@ pub fn decodeTuple(
                     },
                 };
 
-                break :blk decodeBinColumnData(allocator, col_info.type_id, raw_bytes) catch |err| {
+                // `owns_bytes = true`: same reasoning as `.text` above — `raw_bytes` is
+                // already arena-owned, so the passthrough branches inside can alias it
+                // instead of copying it.
+                break :blk decodeBinColumnData(allocator, col_info.type_id, raw_bytes, true) catch |err| {
                     log.err("Failed to decode column '{s}' (type_id={d}, bytes={d}): {}", .{ col_info.name, col_info.type_id, raw_bytes.len, err });
                     return err;
                 };
@@ -1415,14 +1435,11 @@ test "decodeTuple - text columns bypass the OID decoder" {
         .{ .flags = 0, .name = "note", .type_id = 25, .type_modifier = -1 },
     };
 
+    // decodeTuple no longer copies the text-format column: decoded.items[0].value.text
+    // aliases tuple.cols[0]'s buffer, so `tuple.deinit` above is what frees it — freeing
+    // it again here would be a double free.
     var decoded = try decodeTuple(alloc, tuple, &columns, null);
-    defer {
-        for (decoded.items) |col| switch (col.value) {
-            .text, .numeric, .jsonb, .array, .bytea => |v| alloc.free(v),
-            else => {},
-        };
-        decoded.deinit(alloc);
-    }
+    defer decoded.deinit(alloc);
 
     try std.testing.expectEqualStrings("a=>1", decoded.items[0].value.text);
     try std.testing.expect(decoded.items[1].value == .unchanged);
@@ -1437,9 +1454,9 @@ test "TIMESTAMPTZ keeps its Z, TIMESTAMP does not" {
     const micros: i64 = (1761472800 - 946684800) * 1_000_000;
     std.mem.writeInt(i64, &buf, micros, .big);
 
-    const tz = try decodeBinColumnData(alloc, @intFromEnum(PgOid.TIMESTAMPTZ), &buf);
+    const tz = try decodeBinColumnData(alloc, @intFromEnum(PgOid.TIMESTAMPTZ), &buf, false);
     defer alloc.free(tz.text);
-    const naive = try decodeBinColumnData(alloc, @intFromEnum(PgOid.TIMESTAMP), &buf);
+    const naive = try decodeBinColumnData(alloc, @intFromEnum(PgOid.TIMESTAMP), &buf, false);
     defer alloc.free(naive.text);
 
     try std.testing.expectEqualStrings("2025-10-26T10:00:00.000000Z", tz.text);
