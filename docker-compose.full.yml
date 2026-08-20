@@ -116,6 +116,53 @@ services:
     networks:
       - cdc-net
 
+  # 4b. Drift check — advisory, and deliberately nothing depends on it
+  #
+  # ⚠️ **Nothing may `depends_on` this service.** It exits non-zero on drift so the verdict
+  # travels (visible as `exited (1)` in `docker compose ps`, and adoptable by CI later), but
+  # blocking a deploy on it would be wrong today: the declaration is often legitimately ahead
+  # of reality — add a table, migrate, set TENANT_RULES, reload NATS — and findings inside
+  # that window are correct without being bugs. Promote individual checks to gating by adding
+  # a `depends_on` here, not by editing the script.
+  #
+  #     docker compose -f docker-compose.full.yml --env-file .env.admin run --rm zb-check
+  zb-check:
+    image: python:3.12-slim
+    container_name: zb-check
+    profiles: ["check"]          # never starts with a plain `up`; ask for it by name
+    depends_on:
+      postgres-primary:
+        condition: service_healthy
+    env_file:
+      - .env.admin
+      - .env.bridge
+    environment:
+      # zb.py shells out to psql. Inside a container there is no docker socket, so it
+      # connects over the network instead of `docker exec`.
+      - ZB_PSQL=psql -h postgres-primary -p 5432 -U ${PG_USER} -d ${PG_DB}
+      - PGPASSWORD=${PG_PASSWORD}
+      - NATS_URL=nats://nats-server:4222
+      - NATS_NKEY_SEED=${NATS_NKEY_SEED}
+      # The LIVE rendered conf, mounted read-only — not the template. Their disagreement is
+      # itself a finding.
+      - ZB_NATS_CONF=/config/nats-server.conf
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./topology.json:/topology.json:ro
+      - nats-config:/config:ro
+    working_dir: /scripts/scenarios
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+        pip install --quiet --no-cache-dir -r requirements.txt
+        python check.py
+    networks:
+      - cdc-net
+    restart: "no"
+
   # 5. NATS Stream & KV Bucket Initializer
   nats-init:
     image: natsio/nats-box:latest
