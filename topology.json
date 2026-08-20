@@ -5,6 +5,10 @@
     "mutations": "MUTATIONS",
     "requests": "REQUESTS"
   },
+  "public_tables": [
+    "users"
+  ],
+
   "subjects": {
     "cdc_prefix": "cdc",
     "init_prefix": "init",

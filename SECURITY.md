@@ -39,6 +39,18 @@ PostgreSQL resolves it to a tenant through `zebridge_user_tenants`, and a row be
 another tenant is refused — `42501 new row violates row-level security policy` — with the
 verdict reaching the client immediately, since that SQLSTATE is classified permanent.
 
+**Granting a principal a tenant needs no restart.** The mapping is resolved *inside the
+policy*, as a subquery evaluated per statement, against a `zb.principal` the bridge sets
+per transaction. No Zig code reads `zebridge_user_tenants` and nothing caches it, so
+
+    INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('carol', 'acme');
+
+takes effect on the very next mutation. Restarting the bridge for it is harmless and
+pointless. What *does* need a restart is a different axis, and confusing the two is easy:
+adding a NATS **principal** means regenerating `nats-server.conf` and reloading **NATS**
+(not the bridge), while `TENANT_RULES` and `SYNC_RULES` are bridge environment read at
+boot, so changing *which tables* are tenant-routed does need the bridge to come back.
+
 ⚠️ Before this the bridge never set the session variable, so any policy reading it saw
 NULL and refused **every** write. The design was validated in psql and inert in the
 bridge — enabling RLS would have looked like the bridge breaking.
@@ -55,7 +67,7 @@ table, so a new table is never silently writable.
 
 ```sql
 SELECT zebridge_grant_edge_writes('public.orders');            -- writable from the edge
-SELECT zebridge_publish_tenant_table('public.orders',
+SELECT zebridge_scope_publication_to_one_tenant('public.orders',
          'tenant_id', 'acme', 'my_pub');                       -- 🚧 tenant-scoped reads
 ```
 
@@ -106,7 +118,7 @@ with an error naming something else entirely.
 
 ### 1.4 PostgreSQL: after every migration
 
-1. **Open new tables explicitly** — `zebridge_grant_edge_writes` / `zebridge_publish_tenant_table`. A
+1. **Open new tables explicitly** — `zebridge_grant_edge_writes` / `zebridge_scope_publication_to_one_tenant`. A
    bare publication add is refused, which is the reminder.
 2. **Re-run the audit** — `SELECT * FROM zebridge_audit_publications();`
 3. 🚧 **Re-`CLUSTER` tenant-scoped tables.** Locality decays: new rows land wherever there
@@ -354,6 +366,22 @@ written down.
 
 ---
 
+## Why there are so many rules on the write path
+
+Reading asks a client for about five rules; writing asks for most of `PROTOCOL.md`. The
+asymmetry is not accidental and it is not complexity for its own sake: **every write rule
+buys back something an ordinary database connection gives away free** — serialisation,
+key allocation, exactly-once, a return value, session identity. A client writes across an
+asynchronous broker with no transaction spanning it and no connection to answer on, so each
+of those has to be reconstructed. PROTOCOL.md §7 opens with the full mapping.
+
+The bill is opt-in: a deployment that never grants edge writes stays in the five-rule
+world, and §7 does not apply to it. The rules arrive with the capability.
+
+For the memory side of the same trade — a fixed pre-allocated ring, sized by two knobs that
+multiply — see README, "Sizing `BASE_BUF` and `RING_BUFFER_COUNT`", which now carries the
+full double-entry table.
+
 ## Where each claim is tested
 
 ⚠️ **Nine of the claims below have no automated test.** They were verified once, by hand,
@@ -367,6 +395,9 @@ refactor, or a migration — and most of the defects found while building this w
 | a future-dated version is clamped to `now()` + tolerance, and the client is told what was stored | ✅ `scripts/scenarios/clamp.py` — asserts the cap, that the row unfreezes once the window passes, the verdict's wire format, and that a within-tolerance version is left untouched |
 | every accepted write gets one definitive reply, and `stale` is distinguished from `row_deleted` | ✅ `scripts/scenarios/replies.py` — both zero-row outcomes produced deliberately, plus the first-write case that must not be mistaken for a grave |
 | a writer that bypasses the bridge still stamps the version and still soft-deletes; the sweeper alone may reap | ✅ `scripts/scenarios/guards.py` — 6 assertions, including both halves of the sweeper bypass |
+| a sequence-backed primary key on an edge-writable table is **refused** on the write path (`DbAllocatedKey`), not merely warned about — the one hazard whose damage is invisible when it happens | ✅ `scripts/scenarios/keys.py` |
+| a refused write costs the client **one message, not its subscription**: the same connection still receives CDC for the table it was refused on, no `suspended` schema is published, the shared registry is untouched, and other tables are unaffected | ✅ `scripts/scenarios/keys.py` — asserted on the refused client's own connection |
+| a client cannot suspend a table for everyone with one oversized write; the limit is discoverable as `max_row_bytes` | ✅ `scripts/scenarios/rowsize.py` — the DoS was measured before the guard existed |
 | mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `web-consumer/zb-mutate.mjs` |
 | the principal reaches RLS: `set_config` and the upsert share one transaction, now the pipeline's implicit one | ✅ `scripts/scenarios/writable.py`, `tiebreak.py`, `invalidate.py` — every RLS-scoped write would be refused if it did not |
 | client's JetStream permission set is complete | ✅ `web-consumer/zb-probe.mjs` |
@@ -385,9 +416,11 @@ refactor, or a migration — and most of the defects found while building this w
 | a verdict never inherits the previous write's SQLSTATE | ✅ `src/mutation_listener.zig`, 3 tests |
 | permanent vs transient SQLSTATE classification | ✅ `src/mutation_listener.zig`, 5 tests |
 | writer role parsed from the connection URL | ✅ `src/preflight.zig`, 7 tests |
-| `init.sql.template` renders to what it says: no eaten dollar tags, no dropped definitions, every function and event trigger present in a fresh database | ✅ `scripts/scenarios/render.py` — verified to *fail* when the bug is reinjected (2 of 8 functions, 0 of 3 triggers) |
+| `init.{core,write}.template.sql` renders to what it says: no eaten dollar tags, no dropped definitions, every function and event trigger present in a fresh database | ✅ `scripts/scenarios/render.py` — verified to *fail* when the bug is reinjected (2 of 8 functions, 0 of 3 triggers) |
 | tombstone GC reaps past the threshold and keeps rows inside it | ✅ `scripts/scenarios/sweeper.py` — seeds ±1 minute either side of the boundary, and verified to *fail* on a too-early reap |
 | the subject's principal **is** the authenticated user (`bob`, `alicex`, `admin` all refused) | ✅ `scripts/scenarios/credentials.py` §D |
+| a client cannot **forge a verdict** — to itself, or to another principal — nor a dead letter on `mutation_error.>`, which is what makes PROTOCOL §7.1's outbox rules safe to follow | ✅ `scripts/scenarios/credentials.py` §D |
+| the dead-letter channel `mutation_error.>` is **operator-only**: readable by the bridge's own credentials and granted to no client, because its payload carries the server's full message and a `DETAIL` can quote another tenant's rows. ⚠️ Deliberately absent from PROTOCOL.md — a client has no use for it, and naming a forbidden subject in the client's document only advertises it | ✅ `nats-server.conf.template` (not in any client's allow-list) |
 | other NATS refusals (`cdc.>`, `$KV.>`, `MUTATIONS`, purge, verdict forging) | ⚠️ manual — NOTES §1.8 |
 | **publication guard refuses a bare `ALTER PUBLICATION`** | ⚠️ manual |
 | **tenant CDC routing, including DELETE carrying its tenant** | ⚠️ manual |

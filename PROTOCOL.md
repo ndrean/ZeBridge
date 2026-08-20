@@ -105,26 +105,78 @@ implement against them.
 
 ## 2. Channels
 
-Three, with different durability characteristics — chosen deliberately, not
-incidentally.
+**Five** — one KV bucket and four streams — with different durability characteristics,
+chosen deliberately rather than incidentally. Three carry the bridge's output; two carry
+the client's input.
 
 ```mermaid
-flowchart LR
-  PG[(PostgreSQL)] -->|logical replication<br/>pgoutput, binary| B[ZeBridge]
-  B -->|"$KV.schemas.&lt;table&gt;"| KV[["KV: schemas<br/>last value per key"]]
+flowchart TD
+  B[ZeBridge]-->|"$KV.schemas.&lt;table&gt;"| KV[["KV: schemas<br/>last value per key"]]
   B -->|"cdc.&lt;table&gt;.&lt;op&gt;"| CDC[["Stream: CDC<br/>time-bounded"]]
   B -->|"init.snap.*"| INIT[["Stream: INIT<br/>longer retention"]]
   KV --> C[Client]
   CDC --> C
   INIT --> C
+  C -->|"mutation.&lt;principal&gt;.&lt;table&gt;.&lt;op&gt;"| MUT[["Stream: MUTATIONS<br/>writes + verdicts"]]
+  C -->|"snapshot.request.&lt;table&gt;"| REQ[["Stream: REQUESTS<br/>one per table at a time"]]
+  MUT --> B
+  REQ --> B
+  MUT -->|"mutation_ack.&lt;principal&gt;.&lt;msg_id&gt;"| C
   C --> L[(Local store<br/>SQLite / PG / …)]
 ```
 
-| channel | kind | why |
+| channel | kind | direction | why |
+| --- | --- | --- | --- |
+| `schemas` | **KV bucket** | bridge → client | Last-value-per-key. A client connecting at any time gets the current schema without replay. Schema is *state*, not an event. |
+| `CDC` | **stream** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*. |
+| `INIT` | **stream** | bridge → client | Longer retention than CDC — snapshot chunks must outlive the CDC window a client is catching up across. |
+| `MUTATIONS` | **stream** | client → bridge → client | Edge writes (§7), and the verdicts answering them. |
+| `REQUESTS` | **stream** | client → bridge | Snapshot requests (§6), with a deliberately unusual policy — see below. |
+
+### `MUTATIONS` carries both directions
+
+```
+mutation.>          the writes        client → bridge
+mutation_ack.>      verdicts (§7.4b)  bridge → client
+```
+
+⚠️ **They share a stream so the verdicts are durable.** A verdict is an ordinary retained
+message, which is what lets a client that was offline collect the answers it missed —
+something a core-NATS reply, a `-NAK` or a JetStream advisory could not do (§7.4b).
+Confirmed against a running stack: `mutation_ack.*` subjects are stored in `MUTATIONS`
+alongside the writes.
+
+⚠️ **They are separate subject spaces on purpose.** The bridge's ingress consumer filters
+on `mutation.>`, so publishing a verdict under that prefix would feed it back in as if it
+were a write — a loop ending in a poison pill.
+
+### `REQUESTS` is the odd one, and its policy is the feature
+
+| | `CDC` / `INIT` / `MUTATIONS` | `REQUESTS` |
 | --- | --- | --- |
-| `schemas` | **KV bucket** | Last-value-per-key. A client connecting at any time gets the current schema without replay. Schema is *state*, not an event. |
-| `CDC` | **stream** | Ordered, replayable, time-bounded. Changes are *events*. |
-| `INIT` | **stream** | Longer retention than CDC — snapshot chunks must outlive the CDC window a client is catching up across. |
+| discard | old | **new, per subject** |
+| max age | 7 days | **1 minute** |
+
+⚠️ **`discard: new per subject` with one message per subject is what makes a snapshot
+stampede impossible**: while a request for `orders` is outstanding, a second one is
+*refused by the broker* rather than queued, and the refusal is the `503` §6 documents. The
+bridge does not deduplicate requests — the stream does, before the bridge ever sees them.
+
+⚠️ **The 1-minute age is a timeout, not housekeeping.** A request nobody served expires and
+vanishes, so a client that gets no chunks and no error was not ignored — its request aged
+out unread (§6, "The fourth case: no answer at all").
+
+### One number that changes what "idempotent" means
+
+Every stream here runs a **duplicate window of 2 minutes** (1 minute for `REQUESTS`).
+`Nats-Msg-Id` deduplication only holds *inside* that window.
+
+⚠️ So "a retry is idempotent rather than a second write" (§7.1) is true for a prompt retry
+and **false for a resumed outbox**: a client returning after ten minutes and re-sending a
+queued write gets a genuinely new stream message, with `duplicate: false` in its PubAck.
+The row is still protected — last-write-wins compares the same version and refuses the
+repeat (§7.3) — but the *transport* no longer collapses it, so a client must not treat the
+absence of `duplicate: true` as proof the write is new.
 
 ⚠️ **KV and CDC are independent subscriptions.** The bridge publishes schema before
 the row that depends on it, but a client receives them over two separate flows and
@@ -152,15 +204,51 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 }
 ```
 
-Root keys are exactly `table`, `pg`, `sqlite`, `lsn`.
+Root keys are `table`, `pg`, `sqlite`, `lsn`, plus the **write contract**:
+`version_column`, `tombstone_column`, `mutation_timeout_ms` and `replica_identity`.
+
+`version_column` is the column to send back as `version` (§7.3); `tombstone_column` is
+`null` when the table deletes physically rather than softly (§7.5).
+
+Each entry in `pg.columns[]` also carries `required` — `true` when the column is `NOT NULL`
+with no default, so a mutation omitting it is refused (§7.2).
+
+⚠️ **`max_row_bytes` is the widest row this deployment can carry** — check a write against
+it before sending. A mutation above it is refused with `RowTooLargeToReplicate`, because
+storing it would produce a row CDC cannot pack, which suspends the table for every client
+(§9).
+
+It is published rather than documented as a constant because it is a **deployment**
+setting: it differs between installations and an operator may raise it, so a client that
+hardcoded the number would be wrong the day that happened — and a consumer author has no
+way to read the bridge's environment. Treat it as an upper bound to stay under, not a
+budget to fill: the encoded CDC event carries every column plus its name, so it is always
+larger than the payload you send.
+
+⚠️ **The schema does not say whether a table accepts edge writes, and a non-null
+`version_column` does not mean it does.** Writability is a *grant*, granted separately with
+`zebridge_grant_edge_writes` (§7.4), and grants are not in this payload. Measured: `users`
+publishes `version_column: "updated_at"` and refuses every write with SQLSTATE `42501`,
+because the writer role has no `INSERT` on it — the column exists and would serve, but the
+privilege was never given.
+
+So a client that offers editing wherever `version_column` is non-null will offer it on
+tables that reject everything. Until a `writable` flag exists here, the only reliable
+signals are the operator telling you, or a `rejected` verdict carrying `42501` (§7.4b).
 
 * `table` duplicates the KV key. The **key remains authoritative** — if they ever
   disagree, trust the key. The field exists so the value is self-describing like every
   other payload in the protocol (CDC events, snapshot chunks, and this schema's own
   tombstone all carry `table`), which matters once a payload travels without its key:
   logs, caches, forwarding.
-* `pg.columns[].type` is `information_schema.data_type` verbatim (`bigint`,
-  `character varying`, `timestamp without time zone`, `numeric`, …).
+* `pg.columns[].type` is **`format_type(atttypid, atttypmod)`** — the type as PostgreSQL
+  spells it, *with* modifiers: `bigint`, `character varying(255)`, `numeric(20,8)`,
+  `timestamp with time zone`, `integer[]`.
+
+  ⚠️ **Not `information_schema.data_type`**, which this document claimed for a long time
+  and which differs materially: it reports `numeric` for `numeric(20,8)` and — the one that
+  breaks clients — a bare **`ARRAY`** for every array type, losing the element type
+  entirely. A client written against the old description mis-maps every array column.
 * `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
 * ⚠️ `pk` sits **inside `sqlite`**, not at the root. Historical, and the reference
   client depends on it; treat it as part of the contract.
@@ -218,6 +306,10 @@ Published when the bridge refuses a table. Two reasons exist:
 | `no_primary_key` | rows cannot be identified, so DELETE is ambiguous (§9) | add a primary key |
 | `unsupported_column_type` | a column's type cannot be decoded and is not an enum (§4) | change or drop that column |
 | `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | restart the bridge with a larger buffer, or move the oversized column out of the table |
+| `no_tenant_column` | `TENANT_RULES` names a column this table does not have | add the column, or correct the rule |
+| `tenant_not_in_replica_identity` | the tenant column is outside the replica identity, so a DELETE could not be routed to a tenant at all | add a unique index covering `(tenant, pk)` and point `REPLICA IDENTITY` at it |
+
+⚠️ **Treat an unrecognised `reason` as "suspended, cause unknown" rather than a parse error** — the set grows, and a client that throws on a new value stops replicating a table it could have simply left alone.
 
 Like a tombstone it carries **no columns**, because a client must not build a table
 from it. Unlike a tombstone the table still exists in PostgreSQL, and the suspension
@@ -295,6 +387,19 @@ JetStream deduplicates retries. Batches use
 | INSERT | all columns, new values |
 | UPDATE | all columns the UPDATE could observe — see the omission rule below — plus `old.<column>` entries **only if** the table is `REPLICA IDENTITY FULL` |
 | DELETE | ⚠️ under `REPLICA IDENTITY DEFAULT`: **the primary key populated, every other column `null`** |
+
+⚠️ **A table with a tombstone column emits no `cdc.<table>.delete` at all.** If its
+`SYNC_RULES` entry names a tombstone (§7.5), the bridge **drops every physical DELETE** for
+that table — not only the sweeper's reaps. Deletes reach clients as an `update` setting the
+tombstone, and the physical removal that follows once the tombstone ages out is
+deliberately not forwarded: the client already removed the row when the soft delete
+arrived, and re-sending it would cost one message per reaped row per client for a row they
+know is gone.
+
+So a `cdc.test_types.delete` handler on such a table is a handler that never fires. Verified
+by `scripts/scenarios/reaps.py`, which also asserts the converse — a table **without** a
+tombstone still emits real deletes, since suppressing those would strand rows in every
+replica with no later event able to remove them.
 
 ⚠️ A DELETE with nulls everywhere but the PK is **not** data loss — it is what
 `REPLICA IDENTITY DEFAULT` sends, and it is sufficient to delete by key. Do not treat
@@ -436,6 +541,14 @@ answer different questions, and using one for the other's job is a silent bug.
 
 **Gap detection uses `seq`, never `lsn`:**
 
+⚠️ **Get this one wrong and nothing complains.** An `lsn` is a WAL byte offset in the
+billions; a `seq` is a message count in the thousands. Compare a stored `lsn` against
+`state.first_seq` and the test `mySeq < firstSeq` is false **every time** — so the client
+concludes it has no gap, skips the re-seed it needed, and carries on applying CDC to a
+replica that is missing everything which expired from the stream. No error, no retry, no
+symptom until someone reads a row that was never written. This is the one bug in §5 that
+produces permanent silent divergence rather than a stall.
+
 ```js
 const firstSeq = streamInfo.state.first_seq;
 if (mySeq === 0 || (firstSeq > 0 && mySeq < firstSeq - 1)) {
@@ -513,6 +626,11 @@ ALTER TABLE t_new RENAME TO t;
 Everything the two schemas share survives. A schema change should therefore
 **never** trigger a re-seed — re-seeding is for a CDC gap (§6), not for DDL.
 
+⚠️ Re-seeding here is wasteful rather than dangerous, and that is worth knowing before you
+optimise: it costs a full snapshot of the table and occupies the one-request-per-table
+window (§6), so a migration touching ten tables can lock every other client out of
+snapshots while it runs. The data would be correct — just paid for twice.
+
 ⚠️ A **`RENAME COLUMN`** still appears as one removed + one added, because the
 payload carries no rename hint (`NOTES.md` §1.2). The other columns survive; the
 renamed column's values do not. That is the one avoidable loss in this table, and it
@@ -555,7 +673,7 @@ Snapshot data is megabytes-to-gigabytes of ordered chunks. It flows through thre
 
 | `error_type` | meaning | client action |
 | --- | --- | --- |
-| `table_refused` | table has no primary key — replication suspended (§3, §9) | do not retry; wait for a live schema on the KV key |
+| `table_refused` | the table is suspended — `error_message` names **which** of the reasons in §9 applies (it is not always a missing primary key; `row_too_large` is common on wide tables) | do not retry; wait for a live schema on the KV key |
 | `table_not_monitored` | table is not in the publication this bridge replicates | do not retry; check `available_tables` |
 | `generation_failed` | the `COPY` failed (permissions, lock, connection) | retry with backoff |
 
@@ -610,11 +728,13 @@ Run on every connect and reconnect. The client must evaluate the **Gap Rule** to
 A naive client might track the last LSN per table. This causes the **"abandoned table paradox"**: if Table A changes rapidly but Table B never changes, Table B's local LSN falls far behind the stream's oldest available LSN. A per-table gap check would incorrectly assume Table B missed events and force a snapshot.
 
 To solve this, the client must track a **Global Sync State**:
+
 * `global_last_lsn`: The highest LSN the client has successfully processed from the CDC stream, across *all* tables.
 * `global_last_seq`: The JetStream sequence number corresponding to `global_last_lsn`.
 
 **The Gap Rule:**
 Compare `global_last_lsn >= oldest_cdc_lsn`.
+
 * **If true:** The client has no gaps. Every table is safe, even those that haven't changed in months. Resume CDC from `global_last_seq + 1`.
 * **If false (or first run):** The client missed history. It must request a snapshot for *all* required tables, as it cannot prove which ones changed during the blackout.
 
@@ -709,11 +829,65 @@ table still corrupts CDC events the same way. Planned fix in `COPY_BINARY_PLAN.m
 
 ---
 
-## 7. Writing from the edge — stream `MUTATIONS` 🚧
+## 7. Writing from the edge — stream `MUTATIONS` ✅
 
-> 🚧 **Design, not yet implemented.** The bridge currently applies mutations without
-> authorization, without a reply, and without the guarantees below. Do not build a
-> client against this section until the 🚧 is gone.
+> ✅ **Implemented and verified against a running stack.** All three caveats that stood
+> here — no authorization, no reply, none of the guarantees below — are gone:
+> the principal is a subject token the broker vouches for and RLS resolves
+> (`scripts/scenarios/credentials.py`), every write receives a definitive reply (§7.4b,
+> `replies.py`), and last-write-wins, version clamping and tombstones are each covered by
+> a scenario (`mutate.py`, `clamp.py`, `reaps.py`, `guards.py`, `writable.py`).
+
+### Why reading is nearly free and writing is not
+
+Reading this protocol, the asymmetry is the first thing to explain. §3–§6 ask a client for
+perhaps five rules. §7 asks for most of the rest of this document. That looks like the
+write path is badly designed. It is not — the two sides are solving different problems.
+
+**Reading, PostgreSQL has already decided.** Every event is a fact that happened, in an
+order that is already fixed, delivered by a broker that keeps order and retention. The
+client applies it. The only rules that remain are the ones NATS itself imposes: the
+history is finite (so detect a gap, §5), and delivery is at-least-once (so be idempotent,
+§8).
+
+**Writing, nothing has been decided yet.** A client is *proposing* a change to a database
+that is the source of truth, shared with other writers, enforcing its own constraints — and
+it is proposing it across an asynchronous broker, with no transaction spanning the two and
+no connection to answer on.
+
+⚠️ **So every rule in §7 buys back one thing an ordinary database connection gives you for
+free.** That is the whole list, and it is why it is as long as it is:
+
+| what a DB connection gives you | what replaces it here |
+| --- | --- |
+| a transaction that serialises concurrent writers | a version column and last-write-wins (§7.3) |
+| a sequence you can reach to allocate a key | a key the client mints alone (§7.2) |
+| exactly-once execution | `Nats-Msg-Id` dedup **plus** an idempotent upsert, because the dedup window is finite (§2) |
+| a return value | the verdict channel (§7.4b) |
+| seeing a row deleted while you were away | tombstones and the GC watermark (§7.5) |
+| a session identity the server already knows | the principal as a subject token the broker vouched for (§7.1) |
+| a server that knows your schema | `SYNC_RULES` and the write contract in the schema (§3) |
+
+None of these is a preference. Remove any one and the failure is not an error — it is a
+replica that quietly stops matching the database, which is the failure this whole protocol
+exists to prevent.
+
+**And the bill is opt-in.** A deployment that never grants edge writes never leaves the
+five-rule world: no `SYNC_RULES`, no version column, no tombstones, no principal
+mapping — outbound replication only, and §7 does not apply to it. The rules arrive with the
+capability, and they are the price of *offline-capable writes onto an ordinary PostgreSQL
+schema*. Give up either half of that and most of them disappear:
+
+* a synchronous API in front of PostgreSQL needs none of this — and cannot accept a write
+  from a client that is offline;
+* CRDTs need no version column — and cannot replicate an ordinary schema, because every
+  column has to become a CRDT type.
+
+⚠️ The rigidity elsewhere has the same shape. The event ring is a **fixed** pre-allocated
+buffer because a dynamic one would allocate on the hot path; the cost is that a row wider
+than `BASE_BUF` cannot be carried at all, and the knob is memory (README, "Sizing
+`BASE_BUF` and `RING_BUFFER_COUNT`"). Nothing here adapts to what arrives. That is the
+trade taken deliberately, and it is worth knowing which side of it you are on.
 
 ### 7.0 The rule everything else follows from
 
@@ -777,6 +951,27 @@ reads the token the broker already vouched for.
 ⚠️ **It must be a legal NATS token** — no `.`, space, `*` or `>`. An email address is
 therefore not usable, and a hash of one is worse: unsalted it is brute-forceable, and it
 inherits the email's mutability.
+
+⚠️ **This is a provisioning rule, not a client one.** A client cannot choose its principal
+at runtime — the broker's allow-list pins it (`publish: ["mutation.alice.>"]`), so the value
+is fixed when the account is created. Which means a bad one is a *deployment* mistake, and
+it fails at the far end where nobody is looking. Measured, publishing each as the principal:
+
+| principal | what happens |
+| --- | --- |
+| `a b` (space) | the **publish is refused** — no PubAck. The only one the broker catches, and the only one the client learns about |
+| `a.b` (dot) | publish **succeeds**. The subject now has five tokens, so the bridge reads it as `MalformedSubject`, dead-letters it, and logs *"no verdict is addressable"* — the reply subject is unusable too |
+| `a*` / `a>` | publish **succeeds** and the write is attempted under that principal. But the reply subject `mutation_ack.a*.…` contains a wildcard, which is illegal to publish to, so the verdict fails with `InvalidSubject` |
+
+In three of the four cases the write leaves the client, is correctly refused, and **the
+client is never told** — the reply channel is broken by the same character that broke the
+write. §7.1's outbox says "pop only on a definitive reply", so such a client retries
+forever against an account that can never answer it.
+
+⚠️ Note what the last row implies: if that principal *were* mapped in
+`zebridge_user_tenants`, the write would **succeed** and the client still get no verdict —
+so this is not "invalid identities are rejected", it is "the reply channel silently stops
+working". Validate principals when you create the account.
 
 ⚠️ **It must be immutable for the life of the account.** The same value ends up in four
 places at once — the NATS credential, every subject the client publishes, the row-level
@@ -849,17 +1044,21 @@ Two things follow, and they are the whole reason this section is long:
    concurrently can arrive rename-first.
 
 3. **Stamp every mutation** with a `version` (see below) and a stable `msg_id`, so a
-   retry is idempotent rather than a second write.
+   retry is idempotent rather than a second write — ⚠️ **inside the stream's 2-minute
+   duplicate window** (§2). A retry later than that is a new stream message with
+   `duplicate: false`; only last-write-wins still protects the row.
 
 4. **Pop the queue only on a definitive reply.** On timeout or transport error, retry —
-   never pop on send.
+   never pop on send. ⚠️ Popping on send loses the user's edit outright: if the publish
+   did not reach the stream there is nothing left that remembers it, and no verdict will
+   ever arrive to say so. The row simply stays as it was, and the client believes it wrote.
 
    | reply | client |
    | --- | --- |
    | `accepted` | pop |
    | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC |
    | `row_deleted` | pop, and surface it: the row was deleted elsewhere |
-   | timeout / error | keep, retry (idempotent via `msg_id`) |
+   | timeout / error | keep, retry (idempotent via `msg_id` for 2 minutes — §2) |
 
 5. **Treat the reply as a verdict, not as data.** State always arrives through CDC.
    Keeping one path for state and another for verdicts is what stops a client having two
@@ -921,8 +1120,24 @@ delayed and asymmetric:
   `ON CONFLICT DO UPDATE` silently overwrites whichever row was there first, and LWW
   decides the winner on a version the two rows never meant to share.
 
-So a table that is written from the edge should not have a database-allocated primary key.
-In order of preference:
+⚠️ **The bridge refuses these writes rather than allowing them.** A mutation for a table
+whose primary key is sequence-backed is rejected with `DbAllocatedKey` and no row is
+written — the client is told, and nothing is corrupted. Silent cross-row data loss is not
+a tuning choice.
+
+⚠️ **The refusal is scoped to the write path, not the table.** Such a table replicates
+outbound perfectly well and its readers are not at risk, so it keeps its CDC and its
+snapshots; only mutations are refused. Preflight also reports it at boot, so a table
+granted INSERT and shaped this way is named before any client tries.
+
+⚠️ **A refused client is not a blocked client.** A rejected mutation costs you that one
+message and nothing else — you keep receiving CDC for the table you were refused on, and
+every other table is untouched. There is no per-client penalty anywhere in the bridge: a
+verdict is an answer, not a sanction.
+
+⚠️ **This does not close off integer keys** — it closes off *sequence-backed* ones. Drop
+the column `DEFAULT` and assign each client a disjoint range and the check no longer fires,
+because the sequence is what makes a client-minted value dangerous. In order of preference:
 
 | key | why |
 | --- | --- |
@@ -976,10 +1191,17 @@ sniffed or aliased.
 
 #### When it is refused
 
-Every error below is **permanent**: the same bytes fail identically every time, so the
-message is dead-lettered to `mutation_error.<table>` immediately and never retried.
-Transient failures (a lost connection, a constraint violation) are retried instead, up to
-`max_deliver`.
+Every error below is **permanent**: the same bytes fail identically every time. The client
+is told so by a `rejected` verdict (§7.4b), and the operator gets its own record.
+
+⚠️ **A constraint violation is permanent too**, and is refused rather than retried — a
+`NOT NULL`, foreign key, unique or check violation is the client's row being wrong, and
+five more attempts will not change that. PostgreSQL's SQLSTATE classes `23` (integrity),
+`22` (data exception), `42` (privilege / undefined object), `3F` and `0A` are all treated
+this way, and the offending code is returned in the verdict's `sqlstate`.
+
+Genuinely transient failures — a lost connection, a server that is not answering, anything
+with no SQLSTATE at all — are retried up to `max_deliver` and then reported as `failed`.
 
 | error | cause |
 | --- | --- |
@@ -991,17 +1213,27 @@ Transient failures (a lost connection, a constraint violation) are retried inste
 | `ForbiddenTable` | the table is not writable from the edge |
 | `NoVersionColumn` | the *table* has no version column configured — outbound-only, not a payload problem |
 
-⚠️ Until the reply channel lands (🚧), a dead letter is the **only** signal a write
-failed. A client that does not subscribe to `mutation_error.>` cannot tell a rejected
-write from a slow one.
+⚠️ **A verdict can only have come from the bridge.** A client may publish under its own
+`mutation.<principal>.>` and nowhere else — it cannot publish a verdict, to itself or to
+anyone else. That is what §7.1's outbox rules rest on: without it a client could fabricate
+its own `accepted` and pop an entry for a write that never reached PostgreSQL, or publish
+on another principal's reply subject and lie to their client.
+
+⚠️ **The refusal is a missing PubAck, not an exception**, which is why §7.1 requires a
+JetStream publish: a core `nc.publish` to a subject you may not write is dropped with no
+signal at all. Asserted by `scripts/scenarios/credentials.py` §D.
 
 #### Two failures that look like nothing happening
 
-Both of these are SQL errors, and every SQL error is classified **transient** — the bridge
-cannot tell a lost connection from a constraint violation until the reply channel exists.
-So neither dead-letters immediately: the write is retried to `max_deliver` and the client
-sees no error, no row, and no CDC echo. Check these two first when a well-formed mutation
-vanishes.
+Both are SQL errors the bridge classifies as **permanent** (`42501 insufficient_privilege`
+is class `42`), so each is refused at once and answered with a `rejected` verdict carrying
+that SQLSTATE — no retry, no waiting.
+
+⚠️ They are listed here because they *used* to be the hardest failures to diagnose: before
+the classifier and the reply channel, every SQL error was treated as transient, so the
+write was retried to `max_deliver` and the client saw no error, no row and no CDC echo.
+That silence is gone, but the two causes are still the most common, and the verdict names
+the SQLSTATE rather than the cause — so this is how to read one.
 
 **1. The table has not been opened for ingress.** `bridge_writer` is created with *no
 table privileges* on purpose — ingress is closed until a DBA opens a table explicitly, so
@@ -1371,13 +1603,13 @@ offline window with pending writes that this deployment supports**.
 
 > ### 🔴 **DBA — a table is created for this**
 >
-> **`public.zebridge_gc_watermark`** is created by `init.sql.template`, added to the
+> **`public.zebridge_gc_watermark`** is created by `init.{core,write}.template.sql`, added to the
 > publication there, and written by the tombstone sweeper (`zig-out/bin/bridge_sweeper`).
 > It is not an application table and no migration creates it.
 >
 > | | |
 > | --- | --- |
-> | **created by** | `init.sql.template`, at bootstrap — before any migration runs |
+> | **created by** | `init.{core,write}.template.sql`, at bootstrap — before any migration runs |
 > | **written by** | `bridge_sweeper`, once per pass, as principal `zb_sweeper` |
 > | **read by** | every client, through CDC |
 > | **grants** | `SELECT` to the reader, `SELECT/INSERT/UPDATE` to the writer, no `DELETE` |
@@ -1452,13 +1684,16 @@ What it does **not** promise:
    transaction-based, so two tables changed in one PostgreSQL transaction may arrive
    in separate messages.
 3. **Exactly-once application.** Dedup covers retries; the client must be idempotent
-   (upsert on PK, delete by PK).
+   (upsert on PK, delete by PK). ⚠️ Delivery is **at-least-once**, so a client that
+   applies an INSERT as a plain `INSERT` will duplicate rows on any redelivery — a
+   reconnect at the wrong moment is enough. Duplicates on the client are not repairable
+   from the feed: nothing later says "that row was a copy".
 
 ---
 
 ## 8b. What the bridge creates in your database
 
-🔴 **DBA reference.** Everything here is created by `init.sql.template` at bootstrap —
+🔴 **DBA reference.** Everything here is created by `init.{core,write}.template.sql` at bootstrap —
 before any migration runs — and is owned by the bridge rather than by your application.
 The reverse links live in that file: every object carries a `-- <what it is> — see <doc>`
 line above it, so the two directions answer each other.
@@ -1470,13 +1705,17 @@ line above it, so the two directions answer each other.
 | `zebridge_user_tenants` | table | principal → tenant, the mapping RLS resolves against (§7.4) | the reach of every principal, including the sweeper, is defined here |
 | `zebridge_public_tables` | table | tables deliberately readable by everyone | the record of who decided a table is public, and why |
 | `zebridge_grant_edge_writes(regclass)` | function | opens one table to edge writes (§7.4) | the only supported way; refuses `zebridge_ddl_events` by name |
-| `zebridge_publish_tenant_table(...)` | function | publishes a tenant-scoped table, policies first | ordering is load-bearing — it creates RLS *before* publishing |
+| `zebridge_scope_publication_to_one_tenant(...)` | function | publishes a tenant-scoped table, policies first | ordering is load-bearing — it creates RLS *before* publishing |
 | `zebridge_publication_guard` | event trigger | refuses a bare `ALTER PUBLICATION ... ADD TABLE` | an unscoped publish sends every row to every subscriber, silently |
 | `zebridge_audit_publications()` | function | *is anything published without being scoped?* | the invariant a pass-through bridge cannot check for itself |
 | `zebridge_audit_sweeper()` | function | tenants whose tombstones will never be reaped (§7.5) | the sweeper cannot report its own blind spot — RLS hides it from itself |
 | `zebridge_ddl_trigger` / `zebridge_drop_trigger` | event triggers | capture DDL and drops | `DROP TABLE` never reaches `ddl_command_end`, hence two |
 | `zebridge_prune_ddl_events()` | function | retention for the DDL audit trail | pure housekeeping; the bridge reads the WAL, never this table |
 | `zebridge_is_internal_table(text)` | function | keeps the tracker's own rows out of the DDL feed | ⚠️ `zebridge_gc_watermark` is deliberately **not** internal — clients need it |
+| `zebridge_install_write_guards(regclass, text, text)` | function | attaches the `BEFORE UPDATE` / `BEFORE DELETE` guards to one table (§7.3) | the version is only true if *every* writer stamps it, not just the bridge |
+| `zebridge_remove_write_guards(regclass)` | function | takes them off again | ⚠️ needed more often than it looks — with the delete guard on, only the sweeper can physically delete |
+| `zebridge_bump_version()` / `zebridge_soft_delete()` | trigger functions | the guards themselves | attached per table, never globally; the column names must match that table's `SYNC_RULES` |
+| `zebridge_audit_write_guards()` | function | *which tables are guarded, on which columns?* | the guard columns duplicate `SYNC_RULES` and nothing cross-checks them — this is how you compare |
 
 ⚠️ **None of these are optional**, and none fail loudly if removed. Dropping the guard does
 not break the bridge — it removes a refusal. Unpublishing the watermark does not error — it
@@ -1494,9 +1733,46 @@ Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 | single-column PK + `DEFAULT` | ✅ full support |
 | single-column PK + `FULL` | ✅ full support, plus `old.*` and transitions |
 | composite PK | ✅ full support — pagination compares the whole key as a row value |
-| **no PK, any replica identity** | 🔴 **refused** — suspended, events dropped |
+| **no PK, any replica identity** | 🔴 **refused** (`no_primary_key`) — suspended, events dropped |
 | `TRANSITION_RULES` without `FULL` | ⚠️ transitions can never fire — silently inert |
-| column of an unsupported type | 🔴 **suspended** — CDC events dropped, snapshots refused (§6) |
+| column of an unsupported type | 🔴 **suspended** (`unsupported_column_type`) — CDC dropped, snapshots refused (§6) |
+| a row wider than the per-event buffer | 🔴 **suspended** (`row_too_large`) — the row fits no NATS message, so neither CDC nor a snapshot can carry it. Fix by moving the oversized column out of the replicated table, or by raising `BASE_BUF` within what `max_payload` allows |
+| `TENANT_RULES` names a column the table lacks | 🔴 **suspended** (`no_tenant_column`) |
+| the tenant column is outside the replica identity | 🔴 **suspended** (`tenant_not_in_replica_identity`) — a DELETE would carry the key and nothing else, so it could not be routed to a tenant at all and rows would stay in every replica that held them |
+
+⚠️ These five strings are the `reason` field of the suspension payload (§3). A client
+switching on it should treat an unrecognised value as "suspended, cause unknown" rather
+than as a parse error — the set can grow.
+
+#### ⚠️ `BASE_BUF` is a one-way door
+
+Four of the five reasons above describe a **migration**: the table's shape is wrong, no
+client caused it, and quarantining the table is the right answer. `row_too_large` is the
+exception — it is about a *row*, and rows arrive continuously.
+
+**Raising `BASE_BUF` is free. Lowering it is not.** A row accepted under the old size stays
+in the table, and nothing notices until somebody *touches* it — at which point CDC cannot
+pack it and the table is suspended for every client. A configuration change today, an
+outage weeks later, with nothing connecting the two.
+
+Three layers guard it, because no single one can:
+
+| layer | catches | misses |
+| --- | --- | --- |
+| **ingress size check** — the mutation payload against the buffer | a client sending an oversized row; the only DoS an ordinary writer could mount | rows the database itself expands |
+| **preflight: widest stored row** | data written around the bridge, data predating it, and a `BASE_BUF` lowered below what is stored | a hazard with no rows yet |
+| **preflight: oversized column `DEFAULT`** | the table that measures safe and breaks on its *first* insert | triggers and generated columns |
+
+⚠️ The ingress check measures **what NATS delivered**, never a size the sender declares —
+the sender is who it guards against. And it is a lower bound: the CDC event carries every
+column plus its name, so a payload that already exceeds the buffer certainly will not fit,
+and no legitimate write is refused.
+
+⚠️ **A row can still become oversized without any mutation**, and that residue is
+deliberately left to the reactive path — a `BEFORE` trigger or a generated column that
+expands the row is a schema decision, and a bridge cannot police writes it never saw. What
+it can do is name the problem at boot rather than at 3am, which is what the two preflight
+checks are for.
 
 **A table with no primary key is refused, not warned about.** Without a key a row
 cannot be identified, so a DELETE could only be expressed as a full-row match — which

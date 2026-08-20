@@ -69,7 +69,8 @@ defmodule Produce do
               metadata: %{"batch" => i, "idx" => idx},
               price: 10.5 * idx,
               inserted_at: now,
-              updated_at: now
+              updated_at: now,
+              tenant_id: "acme"
             }
           end
       end

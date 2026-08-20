@@ -87,6 +87,24 @@ ALICE_READ = [
   "_INBOX.>"                   # JetStream replies — omit this and everything hangs
 ]
 
+# ⚠️ A separate list, and the ONE line that differs is the one that matters.
+#
+# Copying a principal's block and reusing the original's read variable is the trap this
+# whole comment exists for: bob would then be granted `mutation_ack.alice.>` — able to read
+# **her** verdicts, including SQL detail for rows he never wrote — while his own verdicts
+# land on a subject he may not subscribe to. Writes still succeed, so nothing looks broken;
+# the client simply never receives an answer and, following §7.1, retries forever.
+#
+# It is a leak and a hang from a single copy-paste. Add a principal, add a list.
+BOB_READ = [
+  "cdc.>"
+  "init.>"
+  "mutation_ack.bob.>"         # HIS own verdicts — not alice's
+  "$KV.schemas.>"
+  "$KV.snapshots.>"
+  "_INBOX.>"
+]
+
 authorization {
 
   # No `default_permissions`: an unlisted user should be able to do nothing, and a
@@ -163,6 +181,82 @@ authorization {
           "$JS.ACK.>"
         ] }
         subscribe = { allow: $ALICE_READ }
+    } }
+
+    # ── a second principal, for two-client demos and tenant isolation ──────────
+    #
+    # ⚠️ Duplicated rather than factored. NATS will not splice a variable into a
+    # permissions list (`allow: [$BASE, "extra"]` is not valid), which is noted above —
+    # so every principal repeats the whole block, and exactly two lines differ:
+    #
+    #     publish   "mutation.bob.>"       its own writes, and no one else's
+    #     subscribe "mutation_ack.bob.>"   its own verdicts, keyed by its Nats-Msg-Id
+    #
+    # ⚠️ Getting the SUBSCRIBE line wrong is the quiet failure: writes still work, and
+    # every verdict silently goes to a subject this user may not read — so a client
+    # following §7.1 can never pop its outbox and retries forever.
+    { user: "bob", password: "${NATS_BOB_PASSWORD}", permissions: {
+        publish = { allow: [
+          # The only line that differs between principals, and the only line that
+          # matters for integrity: bob's writes are confined to her own subtree.
+          "mutation.bob.>"
+
+          # Read-side requests. Both `snapshot.request` and `init.schema` are
+          # captured by the REQUESTS stream, so a client may ask for any table's
+          # snapshot — asking is not reading, and the reply lands on init.> which
+          # it may already see.
+          "snapshot.request.>"
+          "init.schema.>"
+
+          # The account-info probe. `jetstreamManager(nc)` issues this before anything
+          # else, so omitting it does not fail one feature — it fails the connection,
+          # with `Permissions Violation for Publish to "$JS.API.INFO"` arriving *after*
+          # a successful "Connected" line. It reveals limits and usage for the account,
+          # nothing about other principals' data.
+          "$JS.API.INFO"
+
+          # JetStream plumbing, scoped to the streams a client is allowed to read.
+          # `CREATE.INIT` and `CREATE.INIT.>` are both needed: in NATS `INIT.>`
+          # does not match `INIT` itself, and an ephemeral consumer is created on
+          # the bare form.
+          #
+          # Scoping to named streams is what stops bob creating a consumer on
+          # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
+          # would hand her exactly that, which is why it is not used here.
+          "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
+          "$JS.API.CONSUMER.CREATE.CDC",            "$JS.API.CONSUMER.CREATE.CDC.>"
+          "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
+          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          # `js.consumers.get(stream, name)` reads the consumer back before binding, so
+          # this is needed on every stream the client pulls from. Read-only metadata on
+          # a stream it may already read.
+          "$JS.API.CONSUMER.INFO.INIT.>"
+          "$JS.API.CONSUMER.INFO.CDC.>"
+          "$JS.API.CONSUMER.INFO.KV_schemas.>"
+          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
+
+          # ⚠️ `$JS.API.CONSUMER.DELETE.*` is deliberately absent. The client never
+          # deletes a consumer (its ephemerals expire on their inactivity threshold),
+          # and granting it on INIT/CDC would let bob delete *bob's* in-flight
+          # consumer mid-replay — static config has no name templating, so the grant
+          # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
+          # and REQUESTS, which no client can reach at all.
+
+          "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
+          "$JS.API.STREAM.INFO.INIT"
+          "$JS.API.STREAM.INFO.CDC"
+          "$JS.API.STREAM.INFO.KV_schemas"
+          "$JS.API.STREAM.INFO.KV_snapshots"
+          "$JS.API.DIRECT.GET.KV_schemas.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.>"
+          "$JS.API.STREAM.MSG.GET.KV_schemas"
+          "$JS.API.STREAM.MSG.GET.KV_snapshots"
+          "$JS.ACK.>"
+        ] }
+        subscribe = { allow: $BOB_READ }
     } }
   ]
 

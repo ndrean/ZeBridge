@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""init.sql.template — does `envsubst` produce what the file says?
+"""init.{core,write}.template.sql — does `envsubst` produce what the file says?
 
-`init.sql.template` creates every role, grant, trigger and guard the security model rests
+`init.{core,write}.template.sql` creates every role, grant, trigger and guard the security model rests
 on, and it is rendered by `envsubst` before psql ever sees it. That render step is a second
 language between the author and the database, and it fails **silently in both directions**:
 
@@ -23,7 +23,7 @@ and count what survived, which is what this does:
 
 Usage:  python scripts/scenarios/render.py
 
-Needs `envsubst` (gettext) and the variables `init.sql.template` interpolates — source
+Needs `envsubst` (gettext) and the variables `init.{core,write}.template.sql` interpolates — source
 `.env.admin` first:
 
     set -a && . ./.env.admin && set +a
@@ -38,7 +38,9 @@ import tempfile
 import zb
 
 ROOT = zb.ROOT
-TEMPLATE = ROOT / "init.sql.template"
+# Both halves, concatenated exactly as `bridge-init` feeds them to envsubst — checking
+# only one would leave the other free to grow an unrendered variable.
+TEMPLATES = [ROOT / "init.core.template.sql", ROOT / "init.write.template.sql"]
 SCRATCH_DB = "zb_render_check"
 
 # The variables the template interpolates. Unset ones render as "" and produce SQL that
@@ -69,7 +71,7 @@ async def main():
     # Async only because `zb.run` drives the scenarios through asyncio; nothing here
     # awaits — this scenario talks to psql and envsubst, not to NATS.
     failed = 0
-    src = TEMPLATE.read_text()
+    src = "\n".join(t.read_text() for t in TEMPLATES)
 
     # ── 0. every variable is set ────────────────────────────────────────────────
     missing = [v for v in REQUIRED_VARS if not os.environ.get(v)]

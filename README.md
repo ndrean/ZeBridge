@@ -361,7 +361,7 @@ In short:
 * you enable PG logical replication, run migrations to creates users, grants, and publication. The database itself is another separate migration from these admin setup,
 * you configure NATS to run JetStream, setup the authentication based on NKEY between ZeBridge and NATS, create streams and buckets.
 
-The exact setup is contained in [init.sql.template](#init.sql.template) and [docker-compose.full.yml](#docker-compose-full-yml) and [nats-server.conf.template](#ntas-server-conf-template).
+The exact setup is contained in [init.{core,write}.template.sql](#init.{core,write}.template.sql) and [docker-compose.full.yml](#docker-compose-full-yml) and [nats-server.conf.template](#ntas-server-conf-template).
 
 **Enable PG Logical Replication**: on host, `postgresql.conf` or in Docker command:
 
@@ -409,7 +409,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public
     GRANT SELECT ON TABLES TO bridge_reader;
 ```
 
-See `init.sql.template` for a complete setup script.
+See `init.{core,write}.template.sql` for a complete setup script.
 
 **Enable NATS/JetStream**: The NATS admin must enable JetStream:
 
@@ -1386,6 +1386,34 @@ Each one answers a different question:
 
 > Raising one and lowering the other keeps memory flat, at the cost of outage tolerance.
 
+#### Total memory, both knobs at once
+
+Bold cells exceed half of a 16 GB machine, which is where the startup check refuses to
+start (it reads the **cgroup** limit in a container, not the host's RAM).
+
+| `BASE_BUF` | row cap | ring 1,024 | ring 8,192 | ring 65,536 | ring 262,144 | ring 1,048,576 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 11 | 2 KB | 4 MB | 30 MB | 244 MB | 974 MB | 3,896 MB |
+| 12 | 4 KB | 6 MB | 46 MB | 372 MB | 1,486 MB | 5,944 MB |
+| 14 | 16 KB | 18 MB | 142 MB | **1,140 MB** ← default | 4,558 MB | **17.8 GB** |
+| 16 | 64 KB | 66 MB | 526 MB | 4,212 MB | **16.5 GB** | **65.8 GB** |
+| 18 | 256 KB | 258 MB | 2,062 MB | **16.1 GB** | **64.5 GB** | **257.8 GB** |
+| 19 | 512 KB | 514 MB | 4,110 MB | **32.1 GB** | **128.5 GB** | **513.8 GB** |
+| 20 | 1 MB | 1,026 MB | **8.0 GB** | **64.1 GB** | **256.5 GB** | **1,025.8 GB** |
+
+`(2^BASE_BUF + 1,848) × RING_BUFFER_COUNT`. Spot-checked against the bridge's own startup
+report: 14/65536 → 1139 MB, 11/262144 → 974 MB, 12/8192 → 46 MB.
+
+⚠️ **The 1,848 bytes are the fixed per-event descriptor**, and they do not shrink with
+`BASE_BUF`. At 11 they are almost half the cost per slot — which is why the bottom-left of
+this table is flatter than the arithmetic on the row cap alone suggests. Most of it is the
+`[128]ColumnView` array (`config.Batch.max_columns`), sized for the widest table you
+replicate whether or not you have one.
+
+⚠️ **`BASE_BUF` is a one-way door.** Raising it is free. Lowering it below rows already
+stored means the next write that touches such a row suspends the table for every client —
+preflight checks this at boot and refuses to let it pass silently (PROTOCOL.md §9).
+
 #### Two things checked at startup, before a byte is allocated
 
 Both failures are silent and late if left to runtime, so the bridge refuses to start:
@@ -1468,6 +1496,36 @@ for i in range(2000):
 docker exec -i postgres-primary psql -U postgres -q -f - < load.sql
 ```
 
+`generate_series(1,1000)` is PostgreSQL's set-returning function: it produces a thousand
+rows, and `INSERT … SELECT … FROM generate_series` inserts one row per value — so each
+statement writes 1000 rows in **one** transaction rather than 1000 round trips. That is
+deliberate: the point is to saturate the WAL, and a client sending 2,000,000 separate
+`INSERT`s would be measuring the client, not the bridge. 2000 statements × 1000 rows is
+also 2000 *transactions*, so the WAL carries 2000 BEGIN/COMMIT pairs — visible as the gap
+between `wal_messages` and `cdc_events` below.
+
+**How to measure it.** The `METRICS` line is a 15 s sampler with no timestamp, so it
+cannot answer "how long did this take" — poll the counter instead, which updates the
+moment the batch publisher acks:
+
+```bash
+# in another shell, before starting the load
+while :; do
+  printf '%s %s\n' "$(date +%s.%N)" \
+    "$(curl -s localhost:9090/metrics | awk '/^bridge_cdc_events_published_total /{print $2}')"
+  sleep 0.5
+done | tee drain.log
+```
+
+End-to-end rate is `2000000 / (t_at_2M − t_at_start)`. PostgreSQL's own write time is the
+wall clock of the `psql` command above (`time docker exec …`). CPU is
+`bridge_cpu_seconds_total` sampled the same way — subtract the endpoints rather than
+reading the `cpu=%` field, which is a per-interval average.
+
+⚠️ **Detach every CDC consumer first.** The figures below were taken with none attached,
+and a browser client replaying 2M events into OPFS changes both the number and, usually,
+the browser. Check with `nats consumer ls CDC`.
+
 **Result**:
 
 ```txt
@@ -1486,6 +1544,19 @@ METRICS uptime=30 wal_messages=2004279 cdc_events=2000000 …
 | time inside libpq (`recv_ms`) | 0.9% of the interval |
 | time decoding + packing (`proc_ms`) | 7.9% |
 | CPU while draining | **31% of one core** (`bridge_cpu_seconds_total` rose 7.6 s in total) |
+
+**Where these figures come from.** One run on the machine in the table above, read from
+`/metrics` by the polling loop just described — not from the `METRICS` log lines, which
+carry no timestamp and therefore cannot be turned back into a rate. Treat them as a
+reference point, not a spec: absolute throughput moves with machine, build mode and
+PostgreSQL version, so a rerun that differs is not automatically a regression.
+
+The number that *is* comparable across machines is `iters` for a fixed event count. The
+WAL loop runs roughly one iteration per WAL message, so 2M events should cost ~2M
+iterations wherever it runs; a rerun within a few percent means the hot path is unchanged
+even when the wall-clock figures differ. A second run recorded after the pull-loop and
+idle-poll fixes gave `iters` 2,049,337 against 2,025,974 here — +1% for identical work,
+which is what "no drift" looks like.
 
 **This benchmark is producer-bound**: PostgreSQL needs 6 s to write what the bridge drains in 7.6 s of loop time, and the loop is idle ~72% of the first interval. The
 ceiling is higher than 260k; finding it needs a producer that is not the bottleneck.

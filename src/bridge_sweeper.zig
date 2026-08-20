@@ -207,7 +207,7 @@ pub fn main(init: std.process.Init) !void {
     // sweeper and "1" as the admin. A blind spot cannot survey itself.
     //
     // So the audit lives where the reach is granted, not where it is used —
-    // `zebridge_audit_publications()`'s neighbour in init.sql.template, run by a DBA:
+    // `zebridge_audit_publications()`'s neighbour in init.{core,write}.template.sql, run by a DBA:
     //
     //     SELECT DISTINCT t.tenant_id FROM <table> t
     //     WHERE NOT EXISTS (SELECT 1 FROM zebridge_user_tenants m

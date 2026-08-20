@@ -219,6 +219,9 @@ pub const MutationListener = struct {
     /// Bumped by the replication thread on every DDL event, so a cached `TableMeta` can
     /// be recognised as stale without first failing a statement.
     catalog_epoch: *const CatalogEpoch,
+    /// The CDC per-event buffer, `2^BASE_BUF`. A mutation larger than this describes a row
+    /// the change feed could never carry back out — see `handleMutation`.
+    event_buf_bytes: usize,
     /// Why the last `exec` failed, kept so the verdict can say more than "it failed".
     ///
     /// Fixed buffers rather than allocations: this is written on an error path that must
@@ -251,6 +254,7 @@ pub const MutationListener = struct {
         io: std.Io,
         should_stop: *std.atomic.Value(bool),
         catalog_epoch: *const CatalogEpoch,
+        event_buf_bytes: usize,
     ) !*MutationListener {
         const self = try allocator.create(MutationListener);
 
@@ -265,6 +269,7 @@ pub const MutationListener = struct {
             .default_version_column = default_version_column,
             .meta_cache = std.StringHashMap(TableMeta).init(allocator),
             .catalog_epoch = catalog_epoch,
+            .event_buf_bytes = event_buf_bytes,
         };
 
         return self;
@@ -573,10 +578,14 @@ pub const MutationListener = struct {
             error.UnknownOperation,
             error.ForbiddenTable,
             error.UnknownColumn,
+            error.RowTooLargeToReplicate,
             error.MissingVersion,
             error.NoVersionColumn,
             error.NoTombstoneColumn,
             error.NoPrimaryKey,
+            // The client did nothing wrong: the table's key shape makes edge writes
+            // unsafe, and only a migration can change that.
+            error.DbAllocatedKey,
             => true,
             else => false,
         };
@@ -816,6 +825,9 @@ pub const MutationListener = struct {
             error.NoVersionColumn,
             error.NoTombstoneColumn,
             error.NoPrimaryKey,
+            // The client did nothing wrong: the table's key shape makes edge writes
+            // unsafe, and only a migration can change that.
+            error.DbAllocatedKey,
             => true,
             else => false,
         };
@@ -999,7 +1011,10 @@ pub const MutationListener = struct {
         const query =
             \\SELECT a.attname,
             \\       COALESCE(k.ord, 0) AS pk_ord,
-            \\       a.atttypid::int AS type_oid
+            \\       a.atttypid::int AS type_oid,
+            \\       (k.ord IS NOT NULL
+            \\        AND pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) IS NOT NULL)
+            \\         AS key_from_sequence
             \\FROM pg_attribute a
             \\LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
             \\LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
@@ -1041,11 +1056,13 @@ pub const MutationListener = struct {
         // second query; matched by name below, once SYNC_RULES has said which it is.
         var type_oids: std.ArrayList(u32) = .empty;
         defer type_oids.deinit(alloc);
+        var key_from_sequence = false;
         var r: usize = 0;
         while (r < rows) : (r += 1) {
             const name = std.mem.span(c.PQgetvalue(res, @intCast(r), 0));
             const ord = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, @intCast(r), 1)), 10) catch 0;
             const oid = std.fmt.parseInt(u32, std.mem.span(c.PQgetvalue(res, @intCast(r), 2)), 10) catch 0;
+            if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(r), 3)), "t")) key_from_sequence = true;
             const owned = try alloc.dupe(u8, name);
             try columns.append(alloc, owned);
             try type_oids.append(alloc, oid);
@@ -1088,6 +1105,31 @@ pub const MutationListener = struct {
             .tombstone_col = if (tombstone_name) |t| try alloc.dupe(u8, t) else null,
         };
         errdefer meta.deinit(alloc);
+
+        // ⚠️ **Refused, not warned.** A client mints its own key (§7.2), and an explicit
+        // value does not advance `nextval` — so every edge write to a sequence-backed key
+        // plants a value the application's own next INSERT will collide with, and two
+        // offline clients minting from the same small integers collide by construction.
+        //
+        // What makes it worse than the other refusals is that nothing fails: the upsert's
+        // `ON CONFLICT DO UPDATE` overwrites whichever row was there first, and
+        // last-write-wins picks between two rows that were never related. Silent
+        // cross-row data loss, surfacing in the application months later.
+        //
+        // ⚠️ Scoped to the WRITE path on purpose. The table replicates outbound perfectly
+        // well and its readers are not at risk, so refusing it in the shared registry
+        // would drop CDC and snapshots for a hazard that only exists on ingress.
+        //
+        // The escape is a migration, not a flag: use a uuid key, or drop the DEFAULT and
+        // assign each client a disjoint range (§7.2) — that turns the sequence off, which
+        // is what this detects.
+        if (key_from_sequence) {
+            log.err(
+                "🔴 '{s}': primary key is database-allocated (serial/identity), so edge writes are refused. A client-supplied key does not advance the sequence: writes would SUCCEED and then collide with the application's own inserts, overwriting unrelated rows through ON CONFLICT. Use a uuid key, or drop the column DEFAULT and assign clients disjoint ranges.",
+                .{table},
+            );
+            return error.DbAllocatedKey;
+        }
 
         if (!meta.hasColumn(meta.version_col)) {
             log.err(
@@ -1134,6 +1176,39 @@ pub const MutationListener = struct {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
+
+        // ── the ingress counterpart of the egress size guard ────────────────────
+        //
+        // ⚠️ A write the change feed cannot carry back out must not be applied. CDC packs
+        // each row into a fixed `2^BASE_BUF` buffer; a row that overflows it suspends the
+        // **whole table** for **every** client (`row_too_large`). So without this check a
+        // single authorised writer could send one legal 50 KB row — under `max_payload`,
+        // accepted by PostgreSQL, answered `accepted` — and quarantine a table everybody
+        // else was reading. Measured before this existed.
+        //
+        // That is the wrong shape of failure: a bad write should cost its sender a
+        // verdict, not cost every reader a table. Suspension is for a table whose *shape*
+        // is wrong — a migration — which no client can cause.
+        //
+        // ⚠️ The size is **measured, never declared**. `payload_bytes` is what NATS
+        // delivered; a `size` field in the envelope would be a number the sender chooses,
+        // and the sender is exactly who this is guarding against. Same rule as `client_id`
+        // (stamped from the envelope, not read from `data`) and the principal (a subject
+        // token the broker vouched for).
+        //
+        // ⚠️ Deliberately a lower bound, not an estimate. The CDC event carries every
+        // column plus its name, so it is always **larger** than this payload — meaning a
+        // payload that already exceeds the buffer certainly will not fit, and no
+        // legitimate write is refused. A row that is oversized for some *other* reason
+        // (columns this mutation never touched) is not caught here and still suspends the
+        // table, which is correct: that row was not created by this write.
+        if (payload_bytes.len >= self.event_buf_bytes) {
+            log.info(
+                "⛔ Mutation refused [{s}] on '{s}': {d} bytes exceeds the {d}-byte CDC event buffer (BASE_BUF). Applying it would suspend the table for every reader.",
+                .{ mutation.principal, mutation.table, payload_bytes.len, self.event_buf_bytes },
+            );
+            return error.RowTooLargeToReplicate;
+        }
 
         // Was this served from cache? It decides whether a schema-shaped refusal below is
         // worth a second look: a meta just read from the catalog cannot be stale, so a

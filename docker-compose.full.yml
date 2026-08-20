@@ -66,7 +66,7 @@ services:
         # Fail loudly rather than substituting an empty string. `password: ""` is a
         # valid config that the server accepts, so an unset variable would silently
         # publish an account anyone can log into as `alice` with no password.
-        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD; do
+        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD; do
           eval "val=\$$$$v"
           if [ -z "$$val" ]; then
             echo "✗ $$v is unset — refusing to generate a config with an empty credential" >&2
@@ -78,7 +78,18 @@ services:
         # expression early and emit a corrupt config.
         sed -e "s|\$${NATS_BRIDGE_NKEY_PUB}|$${NATS_BRIDGE_NKEY_PUB}|g" \
             -e "s|\$${NATS_ALICE_PASSWORD}|$${NATS_ALICE_PASSWORD}|g" \
+            -e "s|\$${NATS_BOB_PASSWORD}|$${NATS_BOB_PASSWORD}|g" \
             /nats-server.conf.template > /config/nats-server.conf
+        # ⚠️ Every $${...} must be gone. An unsubstituted one is not a config error — NATS
+        # accepts it as a literal password, so the account exists with a password nobody
+        # can type and every login fails with `Authorization Violation`, which reads like
+        # a wrong credential rather than a broken render. This is what adding `bob` to the
+        # template without adding it here produced.
+        if grep -q '\$${' /config/nats-server.conf; then
+          echo "✗ unsubstituted variable left in the config:" >&2
+          grep -n '\$${' /config/nats-server.conf >&2
+          exit 1
+        fi
         echo "✓ Generated NATS config with credentials"
     networks:
       - cdc-net
@@ -235,7 +246,8 @@ services:
       postgres-primary:
         condition: service_healthy
     volumes:
-      - ./init.sql.template:/init.sql.template:ro
+      - ./init.core.template.sql:/init.core.template.sql:ro
+      - ./init.write.template.sql:/init.write.template.sql:ro
     # .env.admin only: this is the one container that connects as the superuser, and
     # the bridge's own DATABASE_URL has no business being in its environment.
     env_file:
@@ -249,7 +261,19 @@ services:
         export PGPASSWORD="$${PG_PASSWORD}"
         # bring in `envsubst` via gettext-base
         apt-get update && apt-get install -y gettext-base
-        envsubst < /init.sql.template | psql -v ON_ERROR_STOP=1 -h "$${PG_HOST}" -p "$${PG_PORT}" -U "$${PG_USER}" -d "$${PG_DB}"
+        # ZB_PROFILE=readonly installs the CDC/snapshot half only: no writer role, no
+        # RLS, no tombstone guards. Anything else (and unset) installs both halves.
+        #
+        # The read-only profile is the core file *unmodified* — appended to, never edited
+        # — so the two profiles cannot drift apart. Verified by object-for-object
+        # comparison against the single file this replaced.
+        if [ "$${ZB_PROFILE}" = "readonly" ]; then
+          echo "[bridge-init] profile: readonly (CDC + snapshots)"
+          cat /init.core.template.sql
+        else
+          echo "[bridge-init] profile: write-enabled (CDC + snapshots + ingress)"
+          cat /init.core.template.sql /init.write.template.sql
+        fi | envsubst | psql -v ON_ERROR_STOP=1 -h "$${PG_HOST}" -p "$${PG_PORT}" -U "$${PG_USER}" -d "$${PG_DB}"
         echo "[bridge-init] Postgres initialization complete!"
     networks:
       - cdc-net

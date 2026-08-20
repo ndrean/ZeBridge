@@ -401,6 +401,7 @@ pub fn main(init: std.process.Init) !void {
         // ingress is unconfigured, which makes every grant check a correct false.
         if (runtime_config.pg_writer_url) |url| preflight.roleFromUrl(url) else null,
         &tenant_rules,
+        @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
     ) catch |err| switch (err) {
         // STRICT_TABLES asked us to stop; that verdict must reach main, not be
         // swallowed as "the check could not run". Signal first: unwinding runs
@@ -522,6 +523,7 @@ pub fn main(init: std.process.Init) !void {
             io,
             &should_stop,
             &catalog_epoch,
+            @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
         );
         try mut_listener.?.start();
         log.info("✅ Mutation listener thread started\n", .{});
@@ -645,6 +647,7 @@ pub fn main(init: std.process.Init) !void {
         &sync_rules,
         default_version_column,
         &tenant_rules,
+        @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
     );
 
     // Publish boot schemas to NATS KV for all monitored tables
@@ -688,6 +691,8 @@ pub fn main(init: std.process.Init) !void {
     // Read configuration values once
     const status_update_interval_ms: i64 = Config.Nats.status_update_interval_ms;
     const keepalive_interval_seconds: i64 = 10; // Send keepalives every 10s if idle
+    // Upper bound on an idle wait; the poll returns early the moment WAL arrives.
+    const idle_poll_timeout_ms: i32 = 100;
     var last_status_update_time = utils.getMilliTimestamp();
     const status_update_byte_threshold: u64 = Config.Nats.status_update_byte_threshold; // Or after 1MB of data (better than message count)
 
@@ -1099,10 +1104,30 @@ pub fn main(init: std.process.Init) !void {
                     }
                 }
             } else {
-                // No message available - idle path
-                // Sleep 1 ms first to avoid busy-waiting and increase throughput
+                // No message available - idle path.
+                //
+                // ⚠️ Block on the socket, do not sleep on a timer. `PQgetCopyData` returns
+                // 0 as soon as libpq's buffer is drained, so a 1 ms sleep here woke this
+                // loop ~1000×/s to find nothing: measured `iters=11617 idle=11616` per 15 s
+                // window and ~4% CPU on a completely idle database.
+                //
+                // `poll()` wakes the instant PostgreSQL writes, so latency is unchanged or
+                // better; the timeout only bounds how long we wait before re-checking the
+                // keepalive and status-update deadlines below.
                 prof_idle += 1;
-                utils.sleep(1 * std.time.ns_per_ms);
+                const wal_fd = pg_stream.socketFd();
+                if (wal_fd >= 0) {
+                    var pfd = [_]std.posix.pollfd{.{
+                        .fd = wal_fd,
+                        .events = std.posix.POLL.IN,
+                        .revents = 0,
+                    }};
+                    _ = std.posix.poll(&pfd, idle_poll_timeout_ms) catch {
+                        utils.sleep(1 * std.time.ns_per_ms);
+                    };
+                } else {
+                    utils.sleep(1 * std.time.ns_per_ms);
+                }
             }
         } else |err| {
             if (err == error.StreamEnded) {

@@ -109,6 +109,16 @@ pub const ReplicationStream = struct {
     ///
     /// The libpq idiom is: consume once, then call `PQgetCopyData` repeatedly until it
     /// returns 0. `needs_input` implements exactly that across calls.
+    /// The replication socket, so callers can *block* on readability rather than poll.
+    ///
+    /// `PQgetCopyData` in async mode returns 0 the moment libpq's buffer is drained, so a
+    /// caller that sleeps between calls wakes only to find nothing. Returns -1 when there
+    /// is no connection; the caller should fall back to sleeping then.
+    pub fn socketFd(self: *ReplicationStream) i32 {
+        if (self.conn == null) return -1;
+        return c.PQsocket(self.conn);
+    }
+
     pub fn receiveMessage(self: *ReplicationStream) !?WalMessage {
         if (self.conn == null) {
             return error.NotConnected;

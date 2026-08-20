@@ -175,7 +175,7 @@ checked by grepping for the thing that implements it, not from memory.
 - [x] identifiers validated against the catalog, never interpolated — `meta.hasColumn`
 - [x] `zebridge_ddl_events` excluded — `isForbiddenTable`, and
       `zebridge_grant_edge_writes` refuses it too
-- [x] `bridge_writer` created with no table privileges — `init.sql.template`; tables are
+- [x] `bridge_writer` created with no table privileges — `init.{core,write}.template.sql`; tables are
       opened one at a time
 
 **Correctness**

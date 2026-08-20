@@ -22,7 +22,13 @@ Three phases, all with a live admin account in the environment:
 Usage:  python scripts/scenarios/credentials.py
 """
 
+import asyncio
 import os
+
+import uuid
+
+import msgpack
+from datetime import datetime, timezone
 
 import zb
 
@@ -155,6 +161,96 @@ async def principal_is_enforced() -> int:
             # distinction does not matter here; the write not landing does.
             zb.ok(f"'{me}' refused when claiming to be '{impostor}'")
 
+    # ── the reply channel cannot be forged ─────────────────────────────────────
+    #
+    # ⚠️ This is the assumption PROTOCOL.md §7.1's outbox rules rest on: a verdict can
+    # only have come from the bridge. Without it a client could fabricate its own
+    # `accepted` and pop an outbox entry for a write that never reached PostgreSQL — or
+    # publish a verdict on *another* principal's subject and lie to their client.
+    #
+    # The dead-letter space is included for the same reason: it is the operator's record
+    # of refused writes, and a client that could write to it could hide its own.
+    for subject, what in (
+        (f"mutation_ack.{me}.forged", "a verdict to itself"),
+        ("mutation_ack.bob.forged", "a verdict to another principal"),
+        ("mutation_error.test_types", "a dead letter"),
+    ):
+        try:
+            await js.publish(subject, b"forged", timeout=3)
+            zb.bad(f"'{me}' forged {what} on '{subject}' — the reply channel is not trustworthy")
+            failed += 1
+        except Exception:  # noqa: BLE001
+            # No PubAck. The violation itself arrives asynchronously, which is why a
+            # JetStream publish is required: a core publish here is dropped in silence.
+            zb.ok(f"'{me}' cannot forge {what}")
+
+    await nc.close()
+    return failed
+
+
+async def malformed_principal_is_visible():
+    """A principal that is not a legal NATS token breaks the REPLY channel, not just the write.
+
+    ⚠️ This is a **provisioning** rule, and that is what makes it dangerous. A client cannot
+    choose its principal — the broker's allow-list pins it — so a bad value is baked in when
+    the account is created, and every symptom appears at the far end where nobody is
+    watching. PROTOCOL.md §7.1.
+
+    Published with the operator seed, because a correctly-confined client *cannot* reach
+    these subjects — which is exactly why the mistake survives to production.
+    """
+    import os
+
+    import nats
+
+    seed = zb.NKEY_SEED
+    if not seed:
+        print("  (skipped: no NATS_NKEY_SEED, so these subjects cannot be published at all)")
+        return 0
+
+    bare = zb.NATS_URL.split("://", 1)
+    url = f"{bare[0]}://{bare[-1].rsplit('@', 1)[-1]}"
+    nc = await nats.connect(url, nkeys_seed_str=seed)
+    js = nc.jetstream()
+    v = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+    failed = 0
+
+    def body():
+        u = str(uuid.uuid4())
+        return msgpack.packb({
+            "key": {"uid": u},
+            "data": {"uid": u, "some_text": "badprincipal", "updated_at": v,
+                     "inserted_at": v, "tenant_id": "acme"},
+            "version": v, "client_id": "c-bad",
+        })
+
+    for principal, note in (("a.b", "a dot"), ("a*", "a wildcard"), ("a>", "a `>`")):
+        try:
+            await asyncio.wait_for(
+                js.publish(f"mutation.{principal}.test_types.insert", body(),
+                           headers={"Nats-Msg-Id": f"bad-{uuid.uuid4().hex[:8]}"}),
+                timeout=4,
+            )
+        except Exception:  # noqa: BLE001
+            pass  # refused at publish is the *good* outcome; the assertion is below
+
+    await asyncio.sleep(4)
+    # The one thing that must never happen: a write under a principal whose reply subject
+    # cannot be addressed must not land. Silently applying it would leave the client
+    # retrying forever against a row that already exists.
+    landed = zb.psql(
+        "SELECT count(*) FROM public.test_types WHERE some_text = 'badprincipal'"
+    ).strip()
+    if landed == "0":
+        zb.ok("a principal that is not a legal NATS token never lands a write")
+    else:
+        zb.bad(
+            f"{landed} row(s) were written under a principal whose verdict subject is "
+            "unusable — the client can never be told, and §7.1 tells it to retry forever"
+        )
+        failed += 1
+        zb.psql("DELETE FROM public.test_types WHERE some_text = 'badprincipal'", quiet=True)
+
     await nc.close()
     return failed
 
@@ -162,7 +258,9 @@ async def principal_is_enforced() -> int:
 async def main():
     rc = main_sync() or 0
     print("\nD. the subject's principal is the authenticated user")
-    return rc + await principal_is_enforced()
+    rc += await principal_is_enforced()
+    print("\nE. a principal that is not a legal NATS token")
+    return rc + await malformed_principal_is_visible()
 
 
 zb.run(main)

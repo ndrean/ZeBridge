@@ -1,4 +1,23 @@
--- init.sql.template
+-- ─────────────────────────────────────────────────────────────────────────────
+-- init.core.sql — the read-only half: CDC and snapshots, and nothing that writes.
+--
+-- Runnable on its own. That is the point: a deployment that only *reads* PostgreSQL
+-- should never meet RLS, tombstone guards or tenant scoping, and a newcomer reading this
+-- file should not have to skip past them to find out how a change becomes an event.
+--
+--     envsubst < init.core.template.sql | psql -v ON_ERROR_STOP=1 …
+--
+-- The write path is `init.write.template.sql`, appended after this one:
+--
+--     cat init.core.template.sql init.write.template.sql | envsubst | psql …
+--
+-- ⚠️ It is appended, never merged. The read-only setup is this file *unmodified*, so the
+-- two profiles cannot drift: there is no commented-out block here that the other profile
+-- uncomments, and no second copy of the publication or the DDL triggers.
+--
+-- ⚠️ Nothing here may reference ${POSTGRES_WRITER_USER}. That role is created by the
+-- write half, so a reference from this file breaks the read-only profile — which is the
+-- one invariant that keeps the split honest.
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Every object below carries a `-- <what it is> — see <doc> §<n>` line above it.
 --
@@ -39,384 +58,89 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_BRIDGE_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${POSTGRES_BRIDGE_USER};
 
 
--- ---------------------------------------------------------
--- The WRITE role — separate from the read role on purpose
--- ---------------------------------------------------------
+-- The widest row actually stored, in the units CDC packs — see PROTOCOL.md §9
 --
--- ${POSTGRES_BRIDGE_USER} stays exactly what it is: SELECT + REPLICATION, physically
--- unable to write. The ingress path (NATS -> bridge -> PostgreSQL) uses a *second*
--- connection under this role, so adding the write feature never widens the privileges
--- of the read path.
+-- ⚠️ `octet_length`, never `pg_column_size`. The latter reports the *stored, compressed*
+-- size: a 40 KB run of one character compresses to almost nothing, so a check built on it
+-- reports a table as safe while CDC cannot carry its widest row. Wrong direction for a
+-- safety bound.
 --
--- It is created with **no table privileges at all**. That is the backstop that makes
--- "the bridge is a dumb dispatcher" safe rather than merely simple: even a bug in
--- subject parsing cannot reach a table the DBA has not explicitly opened, because the
--- role has no path to one. Grants are per table, via
--- zebridge_grant_edge_writes() below — never ALL TABLES, and never by default.
---
--- Two attributes are spelled out even though they are the defaults, because each fails
--- **open** if it is ever wrong:
---   NOBYPASSRLS  - with BYPASSRLS every row-level policy becomes decorative
---   NOREPLICATION- the write role must not be able to read the WAL
---
--- A third rule cannot be expressed here and belongs in review: this role must **not own
--- any table**. Table owners are exempt from row-level security unless the table is set
--- to FORCE ROW LEVEL SECURITY, so an owning writer silently bypasses every policy.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_WRITER_USER}') THEN
-        CREATE USER ${POSTGRES_WRITER_USER} WITH PASSWORD '${POSTGRES_WRITER_PASSWORD}'
-            NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
-    END IF;
-END;
-$$;
-
-GRANT CONNECT ON DATABASE ${TARGET_DB} TO ${POSTGRES_WRITER_USER};
-GRANT USAGE ON SCHEMA public TO ${POSTGRES_WRITER_USER};
-
--- Deliberately NOT granted: SELECT/INSERT/UPDATE on any table, and no ALTER DEFAULT
--- PRIVILEGES. A new table is not edge-writable until someone says so.
-
-
--- Open one table to edge writes. Idempotent; call it once per table.
---
--- SELECT is required alongside INSERT/UPDATE because the last-write-wins guard
--- (`WHERE stored.version < EXCLUDED.version`) reads the existing row.
---
--- zebridge_ddl_events is refused by name: it is the bridge's own DDL tracker, and a
--- client able to insert into it could forge a schema, a suspension or a tombstone for
--- every other client. That is the one table where "can write my own rows" becomes
--- "can control every replica".
--- opens one table to edge writes — see PROTOCOL.md §7.4
-CREATE OR REPLACE FUNCTION public.zebridge_grant_edge_writes(tbl regclass)
-RETURNS void AS $$
+-- ⚠️ Cheap for the types that matter: `octet_length` on text/varchar/bytea reads the length
+-- out of the TOAST pointer without fetching the value — measured at 2 shared buffers for a
+-- 50 MB table. `jsonb`/arrays need `::text`, which does materialise; they are usually small.
+CREATE OR REPLACE FUNCTION public.zebridge_widest_row(tbl regclass)
+RETURNS bigint AS $$
 DECLARE
-    tbl_name text := tbl::text;
+    expr   text;
+    result bigint;
 BEGIN
-    IF tbl_name IN ('zebridge_ddl_events', 'public.zebridge_ddl_events') THEN
-        RAISE EXCEPTION 'refusing to grant edge writes on %: forging rows here would '
-                        'let a client publish a fabricated schema to every client', tbl_name;
-    END IF;
+    SELECT coalesce(string_agg(
+        CASE
+            WHEN a.atttypid IN ('text'::regtype, 'bytea'::regtype, 'varchar'::regtype)
+                THEN format('coalesce(octet_length(%I),0)', a.attname)
+            WHEN t.typcategory = 'A'
+              OR a.atttypid IN ('json'::regtype, 'jsonb'::regtype, 'xml'::regtype)
+                THEN format('coalesce(octet_length(%I::text),0)', a.attname)
+            -- Fixed-width columns: a flat allowance rather than a per-type table. The
+            -- result is a floor on the row's size, which is what a guard wants.
+            ELSE '8'
+        END, ' + '), '0')
+    INTO expr
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped;
 
-    -- DELETE as well as SELECT/INSERT/UPDATE, for two paths that both need it:
-    --
-    --   * a table with **no tombstone column** deletes physically — that is the documented
-    --     weaker guarantee, and it is an actual DELETE;
-    --   * the **tombstone sweeper** (src/gc.zig) reaps soft-deleted rows past
-    --     GC_THRESHOLD_MS, and runs as this role precisely so it is not the admin.
-    --
-    -- Marginal risk is small: this role can already UPDATE any row it may write, and RLS
-    -- bounds which rows those are. Withholding DELETE did not prevent data loss, it only
-    -- made the sweeper fail with `permission denied` — silently, in a sidecar nobody reads.
-    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO ${POSTGRES_WRITER_USER}', tbl);
-    RAISE NOTICE 'edge writes enabled on % for ${POSTGRES_WRITER_USER}', tbl;
+    EXECUTE format('SELECT coalesce(max(%s),0)::bigint FROM %s', expr, tbl) INTO result;
+    RETURN result;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql STABLE;
 
-
--- ---------------------------------------------------------
--- Write guards — making the version column true for EVERY writer
--- ---------------------------------------------------------
+-- Column DEFAULTs that alone exceed a byte budget — see PROTOCOL.md §9
 --
--- Last-write-wins compares `stored.version < incoming.version`, and the bridge stamps the
--- version on every write it applies. The bridge is not the only writer. A cron job, a psql
--- session, another service, or an ORM path that forgets can run
+-- ⚠️ The case `zebridge_widest_row` cannot see: a table with a huge column DEFAULT and no
+-- rows yet measures as perfectly safe, and then the *first* insert — a 258-byte mutation
+-- that passed every ingress guard — stores a 50 KB row and suspends the table for every
+-- client. Measured. The default is the hazard; the row is only where it shows up.
 --
---     UPDATE users SET name = 'x' WHERE id = 1;      -- updated_at untouched
+-- ⚠️ Two guards make evaluating a default safe:
 --
--- and the row changes while the version does not. The stored version then no longer
--- describes the row, so a client's OLDER edit beats a NEWER server write — silently, and
--- "correctly" by the rule. See PROTOCOL.md §7.3.
---
--- A trigger fixes it without a migration: it changes no shape and breaks no query, which
--- is what makes it usable on a database you do not control.
-
--- Stamp the version column when the statement did not — see PROTOCOL.md §7.3
-CREATE OR REPLACE FUNCTION public.zebridge_bump_version()
-RETURNS trigger AS $$
+--   * only **variable-width** columns are evaluated. A `nextval()` default lives on an
+--     integer column, so it is never reached and no sequence is burned;
+--   * the function is **STABLE**, which makes PostgreSQL refuse any write the expression
+--     attempts — a side-effecting default raises, and the handler below skips it rather
+--     than failing the check.
+CREATE OR REPLACE FUNCTION public.zebridge_oversized_defaults(tbl regclass, budget bigint)
+RETURNS TABLE(col text, bytes bigint) AS $$
 DECLARE
-    col text := TG_ARGV[0];
+    r record;
+    n bigint;
 BEGIN
-    -- Only when this statement left the version alone. A writer that DID set it — the
-    -- bridge, which sends the client's value and clamps it (§7.3), or a well-behaved ORM —
-    -- keeps what it wrote. Overwriting unconditionally would make the version
-    -- server-assigned and quietly discard the value the client was told to send back.
-    IF (to_jsonb(OLD) -> col) IS NOT DISTINCT FROM (to_jsonb(NEW) -> col) THEN
-        -- jsonb round trip because plpgsql cannot assign to a column named at runtime.
-        -- One conversion per updated row, on tables the operator opted in.
-        NEW := jsonb_populate_record(NEW, jsonb_build_object(col, now()));
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
--- Turn a physical DELETE into a tombstone — see PROTOCOL.md §7.5
-CREATE OR REPLACE FUNCTION public.zebridge_soft_delete()
-RETURNS trigger AS $$
-DECLARE
-    tombstone text := TG_ARGV[0];
-    version   text := TG_ARGV[1];
-BEGIN
-    -- The sweeper MUST get through, or tombstones accumulate forever and the reaping this
-    -- whole design depends on can never happen. It identifies itself the same way every
-    -- other writer does — `zb.principal`, the setting the RLS policies read — so no new
-    -- mechanism is needed here.
-    IF coalesce(current_setting('zb.principal', true), '') = 'zb_sweeper' THEN
-        RETURN OLD;
-    END IF;
-
-    -- Located by `ctid`, not by primary key: the key columns are not known here without a
-    -- catalog lookup per row, and the tuple's physical address is stable for the statement
-    -- that is deleting it.
-    --
-    -- The version is stamped too, not just the tombstone. A soft delete that did not move
-    -- the version would be refused by the next edge write's LWW guard — the row would read
-    -- as deleted while still accepting edits.
-    EXECUTE format(
-        'UPDATE %I.%I SET %I = now(), %I = now() WHERE ctid = $1',
-        TG_TABLE_SCHEMA, TG_TABLE_NAME, tombstone, version
-    ) USING OLD.ctid;
-
-    -- Suppress the DELETE. The UPDATE above is what reaches CDC, so clients see the
-    -- tombstone rather than a physical removal they cannot overrule.
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
--- Attach both to one table — see PROTOCOL.md §7.3
---
--- The column names must match this table's SYNC_RULES entry in the bridge's environment.
--- They are the same contract stated in two places and nothing cross-checks them: name a
--- different column here and the bridge and the database disagree about what "version"
--- means, with no error. `zebridge_audit_write_guards()` reports what is actually attached
--- so the two can be compared.
-CREATE OR REPLACE FUNCTION public.zebridge_install_write_guards(
-    tbl regclass,
-    version_col text,
-    tombstone_col text DEFAULT NULL
-)
-RETURNS void AS $$
-DECLARE
-    t text := tbl::text;
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = tbl
-                   AND attname = version_col AND attnum > 0 AND NOT attisdropped) THEN
-        RAISE EXCEPTION '% has no column %', t, version_col;
-    END IF;
-
-    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_bump_version_t ON %s', t);
-    EXECUTE format(
-        'CREATE TRIGGER zebridge_bump_version_t BEFORE UPDATE ON %s '
-        'FOR EACH ROW EXECUTE FUNCTION public.zebridge_bump_version(%L)', t, version_col
-    );
-    RAISE NOTICE 'version guard on %: % is stamped even when a writer forgets', t, version_col;
-
-    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_soft_delete_t ON %s', t);
-    IF tombstone_col IS NOT NULL THEN
-        IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = tbl
-                       AND attname = tombstone_col AND attnum > 0 AND NOT attisdropped) THEN
-            RAISE EXCEPTION '% has no column %', t, tombstone_col;
+    FOR r IN
+        SELECT a.attname AS name, pg_get_expr(ad.adbin, ad.adrelid) AS expr
+        FROM pg_attribute a
+        JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+        JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+          AND (a.atttypid IN ('text'::regtype, 'bytea'::regtype, 'varchar'::regtype)
+               OR t.typcategory = 'A'
+               OR a.atttypid IN ('json'::regtype, 'jsonb'::regtype, 'xml'::regtype))
+    LOOP
+        BEGIN
+            EXECUTE format('SELECT coalesce(octet_length((%s)::text),0)::bigint', r.expr) INTO n;
+        EXCEPTION WHEN OTHERS THEN
+            -- A default that cannot be evaluated read-only is not a finding. Saying
+            -- nothing beats refusing to start over an expression we declined to run.
+            CONTINUE;
+        END;
+        IF n >= budget THEN
+            col := r.name;
+            bytes := n;
+            RETURN NEXT;
         END IF;
-        EXECUTE format(
-            'CREATE TRIGGER zebridge_soft_delete_t BEFORE DELETE ON %s '
-            'FOR EACH ROW EXECUTE FUNCTION public.zebridge_soft_delete(%L, %L)',
-            t, tombstone_col, version_col
-        );
-        RAISE NOTICE 'delete guard on %: DELETE writes % instead of removing the row', t, tombstone_col;
-    ELSE
-        -- No tombstone column means deletes are physical for this table — the documented
-        -- weaker guarantee, not an oversight. Saying so beats silence.
-        RAISE NOTICE 'no tombstone for %: deletes stay physical, so an offline client can resurrect a row', t;
-    END IF;
+    END LOOP;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql STABLE;
 
--- Take the guards off again — the counterpart, and needed more often than it looks
---
--- ⚠️ Once the delete guard is on, **nobody but the sweeper can physically delete from this
--- table**. An admin running `DELETE FROM t WHERE …` in psql gets a tombstone, not a
--- removal. That is the whole point, and it is also a genuine surprise the first time it
--- happens during a cleanup. Two ways out, in order of preference:
---
---   SELECT set_config('zb.principal', 'zb_sweeper', false);   -- for this session only
---   SELECT zebridge_remove_write_guards('public.t');          -- permanently
-CREATE OR REPLACE FUNCTION public.zebridge_remove_write_guards(tbl regclass)
-RETURNS void AS $$
-DECLARE
-    t text := tbl::text;
-BEGIN
-    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_bump_version_t ON %s', t);
-    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_soft_delete_t ON %s', t);
-    RAISE NOTICE 'write guards removed from %: versions are only as true as their writers again', t;
-END;
-$$ LANGUAGE plpgsql;
-
--- Answers "which tables are guarded, and on which columns?" — compare against SYNC_RULES
-CREATE OR REPLACE FUNCTION public.zebridge_audit_write_guards()
-RETURNS TABLE (tbl text, version_guard boolean, delete_guard boolean, detail text) AS $$
-    SELECT c.relname::text,
-           EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid
-                   AND g.tgname = 'zebridge_bump_version_t'),
-           EXISTS (SELECT 1 FROM pg_trigger g WHERE g.tgrelid = c.oid
-                   AND g.tgname = 'zebridge_soft_delete_t'),
-           coalesce((SELECT string_agg(pg_get_triggerdef(g.oid), ' | ')
-                     FROM pg_trigger g WHERE g.tgrelid = c.oid
-                       AND g.tgname LIKE 'zebridge_%'), '')
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = 'public' AND c.relkind = 'r'
-      -- Prefix test rather than `zebridge_is_internal_table()`: a LANGUAGE sql body is
-      -- validated when it is CREATEd, so calling a function declared later in this file
-      -- fails the whole script. Caught by scripts/scenarios/render.py, which applies the
-      -- rendered SQL to a scratch database rather than trusting that it parses.
-      AND c.relname NOT LIKE 'zebridge%'
-    ORDER BY c.relname;
-$$ LANGUAGE sql STABLE;
-
-
--- ---------------------------------------------------------
--- Per-tenant scoping — ONE entry point, on purpose
--- ---------------------------------------------------------
---
--- ⚠️ **Use `zebridge_publish_tenant_table()` and nothing else** to put a tenant-scoped
--- table into a publication. A bare `ALTER PUBLICATION ... ADD TABLE` is the failure this
--- exists to prevent: it publishes the table with no row filter and no policy, and every
--- subscriber of that publication then receives every tenant's rows. Nothing errors, and
--- nothing in the bridge can detect it — the bridge is a pass-through and is meant to stay
--- one.
---
--- The function does the four things that must not drift apart, in the order they must
--- happen:
---
---   1. refuses a nullable or absent tenant column (a NULL tenant belongs to nobody, and a
---      nullable column cannot carry a replica identity)
---   2. moves the REPLICA IDENTITY to (tenant_col, <pk>) if the tenant is not already in it
---      — without this PostgreSQL refuses every UPDATE and DELETE on the table once the
---      publication carries a filter, including the application's own
---   3. enables RLS and creates two policies: writes bounded by the principal→tenant
---      mapping, reads left wide for `bridge_reader` (one session serves all tenants, so it
---      has no principal to resolve — read scoping is the publication's job)
---   4. only then adds the table to the publication, with the filter
---
--- Called once per (table, tenant): the per-table work is idempotent, the publication entry
--- is per-tenant. Each publication needs its own replication slot and its own bridge
--- instance.
---
--- ⚠️ `bridge_reader` must NOT be given BYPASSRLS to make step 3 work. That is a *role*
--- attribute covering every table in the database, and this file already grants the reader
--- SELECT on all of them — including tables added later by someone who never heard of the
--- bridge. The per-table `zb_reader_all` policy is the same capability, scoped, and it
--- fails closed for anything nobody considered.
-
--- Which principal may act for which tenant. Referenced by the write policy above; the
--- bridge never reads it and never learns what a tenant is — it sets `zb.principal` from
--- the subject token it already trusts, and PostgreSQL resolves the rest.
--- principal → tenant, the mapping RLS resolves against — see PROTOCOL.md §7.4
-CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
-    principal text NOT NULL,
-    tenant_id text NOT NULL,
-    PRIMARY KEY (principal, tenant_id)
-);
-GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_BRIDGE_USER}, ${POSTGRES_WRITER_USER};
-
--- ⚠️ Dollar-quote with a bare double-dollar ONLY — never a named tag (dollar, letters,
--- dollar). This file is rendered by `envsubst`, which reads such a tag as a variable
--- reference and substitutes it away, breaking the quoting and truncating every definition
--- after it. Measured: the whole file rendered down to one surviving function, and psql
--- reported no error. A bare double-dollar is not a valid identifier, so it survives.
---
--- The same rule forces the nested DDL below to use doubled single quotes rather than a
--- second dollar-quoted string — this comment cannot even show you the syntax to avoid.
--- the only supported way to publish a tenant-scoped table — see PROTOCOL.md §7.4, NOTES.md §1.8
-CREATE OR REPLACE FUNCTION public.zebridge_publish_tenant_table(
-    tbl          regclass,
-    tenant_col   name,
-    tenant_value text,
-    publication  name
-) RETURNS void AS $$
-DECLARE
-    ri_kind  "char";
-    covered  boolean;
-    pk_cols  name[];
-    idx_name name;
-    col_list text;
-BEGIN
-    IF tbl::text IN ('zebridge_ddl_events','public.zebridge_ddl_events') THEN
-        RAISE EXCEPTION 'refusing to publish %: it is the bridge''s own DDL tracker', tbl;
-    END IF;
-
-    -- 1. A NULL tenant belongs to nobody, and a nullable column cannot carry a replica
-    --    identity.
-    IF NOT EXISTS (SELECT 1 FROM pg_attribute
-                   WHERE attrelid = tbl AND attname = tenant_col
-                     AND attnum > 0 AND NOT attisdropped AND attnotnull) THEN
-        RAISE EXCEPTION 'tenant column %.% must exist and be NOT NULL', tbl, tenant_col;
-    END IF;
-
-    -- 2. The tenant must be inside the replica identity, or PostgreSQL refuses every
-    --    UPDATE and DELETE once the publication carries a filter on it — including the
-    --    application's own writes.
-    SELECT relreplident INTO ri_kind FROM pg_class WHERE oid = tbl;
-    IF ri_kind = 'f' THEN
-        covered := true;
-    ELSE
-        SELECT coalesce(bool_or(a.attname = tenant_col), false) INTO covered
-        FROM pg_index i
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        WHERE i.indrelid = tbl
-          AND ((ri_kind = 'd' AND i.indisprimary) OR (ri_kind = 'i' AND i.indisreplident));
-    END IF;
-
-    IF NOT covered THEN
-        SELECT array_agg(a.attname ORDER BY k.ord) INTO pk_cols
-        FROM pg_index i
-        JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
-        WHERE i.indrelid = tbl AND i.indisprimary;
-        IF pk_cols IS NULL THEN
-            RAISE EXCEPTION '% has no primary key; the bridge refuses such a table anyway', tbl;
-        END IF;
-        idx_name := (SELECT relname FROM pg_class WHERE oid = tbl) || '_zb_ri';
-        col_list := quote_ident(tenant_col) || ', ' ||
-                    (SELECT string_agg(quote_ident(c), ', ') FROM unnest(pk_cols) c);
-        EXECUTE format('CREATE UNIQUE INDEX IF NOT EXISTS %I ON %s (%s)', idx_name, tbl, col_list);
-        EXECUTE format('ALTER TABLE %s REPLICA IDENTITY USING INDEX %I', tbl, idx_name);
-        RAISE NOTICE 'replica identity of % moved to (%) so the tenant filter is legal', tbl, col_list;
-    END IF;
-
-    -- 3. Per-TABLE, idempotent: this runs once per (table, tenant) and the policies do not
-    --    vary by tenant — the mapping table does.
-    EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
-
-    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = tbl AND polname = 'zb_tenant_write') THEN
-        EXECUTE format(
-            'CREATE POLICY zb_tenant_write ON %s FOR ALL TO %I'
-            ' USING (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-            '   WHERE principal = current_setting(''zb.principal'', true)))'
-            ' WITH CHECK (%I IN (SELECT tenant_id FROM public.zebridge_user_tenants'
-            '   WHERE principal = current_setting(''zb.principal'', true)))',
-            tbl, 'bridge_writer', tenant_col, tenant_col);
-    END IF;
-
-    -- The reader sees every row of the tables it replicates: one session serves all
-    -- tenants and has no principal to resolve. Read scoping is the publication's job.
-    IF NOT EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = tbl AND polname = 'zb_reader_all') THEN
-        EXECUTE format('CREATE POLICY zb_reader_all ON %s FOR SELECT TO %I USING (true)',
-                       tbl, 'bridge_reader');
-    END IF;
-
-    -- 4. Per-TENANT, and only now: the publication entry is what makes it a tenant stream.
-    IF EXISTS (SELECT 1 FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid
-               WHERE pr.prrelid = tbl AND p.pubname = publication) THEN
-        EXECUTE format('ALTER PUBLICATION %I SET TABLE %s WHERE (%I = %L)',
-                       publication, tbl, tenant_col, tenant_value);
-    ELSE
-        EXECUTE format('ALTER PUBLICATION %I ADD TABLE %s WHERE (%I = %L)',
-                       publication, tbl, tenant_col, tenant_value);
-    END IF;
-
-    RAISE NOTICE 'published % to % for tenant %', tbl, publication, tenant_value;
-END;
-$$ LANGUAGE plpgsql;
 
 -- Tables deliberately published to everyone. The escape hatch has to exist — a currency
 -- list or a product catalogue is identical for every tenant — but it is recorded, with a
@@ -439,7 +163,7 @@ CREATE TABLE IF NOT EXISTS public.zebridge_public_tables (
 -- make a pre-existing unscoped table block every unrelated change, and a guard that blocks
 -- unrelated work is a guard people drop.
 --
--- `zebridge_publish_tenant_table()` passes this because it creates the policies and the
+-- `zebridge_scope_publication_to_one_tenant()` passes this because it creates the policies and the
 -- row filter *before* adding to the publication. That ordering is load-bearing, not
 -- incidental.
 -- refuses an unscoped ALTER PUBLICATION — see NOTES.md §1.8
@@ -479,7 +203,7 @@ BEGIN
             'refusing to publish % unscoped: row filter=%, RLS=%',
             relid::regclass, scoped, rls
         USING HINT =
-            'Use SELECT zebridge_publish_tenant_table(''' || relid::regclass ||
+            'Use SELECT zebridge_scope_publication_to_one_tenant(''' || relid::regclass ||
             ''', ''<tenant_col>'', ''<tenant>'', ''<publication>''), or record the decision '
             'with INSERT INTO zebridge_public_tables (tbl, reason) VALUES (''' ||
             relid::regclass || ''', ''why everyone may read this'').';
@@ -489,55 +213,6 @@ END $$;
 DROP EVENT TRIGGER IF EXISTS zebridge_publication_guard_t;
 CREATE EVENT TRIGGER zebridge_publication_guard_t ON ddl_command_end
     WHEN TAG IN ('ALTER PUBLICATION') EXECUTE FUNCTION public.zebridge_publication_guard();
-
--- Answers "which tenants will never have their tombstones reaped?"
---
--- The sweeper acts as a named principal (`zb_sweeper` by default) and is therefore bounded
--- by `zebridge_user_tenants` like any other writer — which is the point: forgetting to map
--- a tenant fails **closed**, and its reach is auditable in the same table as everyone
--- else's. The earlier design gave it a policy exempting principal-less sessions, which
--- opened the whole table to anything that reached that connection without setting a
--- principal. Failing open on an omission is the wrong default for a process that deletes.
---
--- ⚠️ The sweeper cannot run this check itself. RLS hides the unmapped rows from a warning
--- query exactly as it hides them from the DELETE — measured, the same query returns 0 as
--- the sweeper and 1 as the admin. A blind spot cannot survey itself, so the audit lives
--- here, with the grant.
---
---     INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('zb_sweeper', '<tenant>');
--- tenants whose tombstones will never be reaped — see PROTOCOL.md §7.5
-CREATE OR REPLACE FUNCTION public.zebridge_audit_sweeper(sweeper_principal text DEFAULT 'zb_sweeper'::text)
- RETURNS TABLE(tbl text, tenant_id text, verdict text)
- LANGUAGE plpgsql
-AS $$
-DECLARE
-    r record;
-BEGIN
-    -- Every published table that has BOTH a tenant column and a tombstone column: those
-    -- are the ones the sweeper is expected to reach. A table with no tombstone is never
-    -- swept (its deletes are physical), so an unmapped tenant there costs nothing.
-    FOR r IN
-        SELECT c.oid::regclass::text AS relname
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
-        WHERE c.relkind = 'r'
-          AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
-                        AND a.attname = 'tenant_id' AND a.attnum > 0 AND NOT a.attisdropped)
-          AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid
-                        AND a.attname = 'deleted_at' AND a.attnum > 0 AND NOT a.attisdropped)
-    LOOP
-        -- WARNING: doubled quotes, not a nested dollar-quote. A `$q` + `$` tag here is
-        -- eaten by envsubst (it reads it as a variable) and truncates every definition
-        -- after this point — caught by scripts/scenarios/render.py, which reported only
-        -- 3 of 9 functions surviving the render.
-        RETURN QUERY EXECUTE format(
-            'SELECT %L::text, t.tenant_id::text, ''UNREAPED - tombstones for this tenant' || ' accumulate; %I is not mapped to it'' FROM (SELECT DISTINCT tenant_id FROM %s'
-            || ' WHERE deleted_at IS NOT NULL) t WHERE NOT EXISTS (SELECT 1 FROM'
-            || ' public.zebridge_user_tenants m WHERE m.principal = %L AND m.tenant_id = t.tenant_id)',
-            r.relname, sweeper_principal, r.relname, sweeper_principal);
-    END LOOP;
-END $$;
-
 -- Answers "is anything published without being scoped?" — the invariant a pass-through
 -- bridge cannot check for itself. Run it after any publication change.
 -- is anything published without being scoped? — see NOTES.md §1.8
@@ -642,7 +317,6 @@ CREATE TABLE IF NOT EXISTS public.zebridge_gc_watermark (
 -- what puts it in snapshots; UPDATE/INSERT for the writer is what lets the sweeper stamp
 -- it. No DELETE: a singleton is never removed, and the row must survive a sweeper bug.
 GRANT SELECT ON public.zebridge_gc_watermark TO ${POSTGRES_BRIDGE_USER};
-GRANT SELECT, INSERT, UPDATE ON public.zebridge_gc_watermark TO ${POSTGRES_WRITER_USER};
 
 INSERT INTO public.zebridge_gc_watermark (id, watermark, threshold_ms)
 VALUES (1, now(), 0)
@@ -651,7 +325,7 @@ ON CONFLICT (id) DO NOTHING;
 -- ⚠️ Published, or the whole design is inert: the row reaches clients through CDC and
 -- nothing else, so a table nobody publishes is a watermark nobody can read.
 --
--- Published **here**, hardcoded, rather than through `zebridge_publish_tenant_table()`.
+-- Published **here**, hardcoded, rather than through `zebridge_scope_publication_to_one_tenant()`.
 -- That is the rule for bridge-owned tables and it is worth stating, because there are now
 -- two publication paths and the difference is not obvious:
 --
@@ -660,7 +334,7 @@ ON CONFLICT (id) DO NOTHING;
 --                      shape is fixed by the bridge rather than chosen by a DBA. Publishing
 --                      them anywhere else would mean the bridge could boot without them.
 --   a migration        application tables. Tenant-scoped ones go through
---                      `zebridge_publish_tenant_table()`; genuinely public ones are recorded
+--                      `zebridge_scope_publication_to_one_tenant()`; genuinely public ones are recorded
 --                      in `zebridge_public_tables` and added directly.
 --
 -- Both paths still pass through `zebridge_publication_guard`, which is why the registration
@@ -914,3 +588,173 @@ BEGIN
         ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE public.zebridge_ddl_events;
     END IF;
 END $$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The T2 entry point — one call instead of six remembered ones (NOTES.md §4.5)
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- Activation is spread over four places and two times: the templates *define* functions
+-- at bootstrap, the DBA *invokes* them per table after the application's migrations, and
+-- two more settings live outside the database entirely. Nothing here can set those last
+-- two — so this composes what it can and **prints the rest**, which is the difference
+-- between a workflow you can follow and one you have to remember.
+--
+-- ⚠️ `dry_run` defaults to TRUE. This grants, guards and enables RLS in one statement;
+-- showing the plan first is the cheap half of that trade. Pass `dry_run => false` to apply.
+--
+--     SELECT * FROM zebridge_enable('public.orders');                       -- plan only
+--     SELECT * FROM zebridge_enable('public.orders',
+--                                   tenant_col => 'tenant_id',
+--                                   writable   => true,
+--                                   version_col => 'updated_at',
+--                                   tombstone_col => 'deleted_at',
+--                                   dry_run    => false);
+--
+-- ⚠️ Lives in the core half but dispatches the write-path calls through EXECUTE, so a
+-- read-only install can still use it for the one step it needs (publishing a table) and
+-- fails with a *named* reason rather than "function does not exist" if asked for writes.
+CREATE OR REPLACE FUNCTION public.zebridge_enable(
+    tbl           regclass,
+    tenant_col    name    DEFAULT NULL,
+    writable      boolean DEFAULT false,
+    columns       name[]  DEFAULT NULL,
+    version_col   name    DEFAULT NULL,
+    tombstone_col name    DEFAULT NULL,
+    public_reason text    DEFAULT NULL,
+    publication   name    DEFAULT '${BRIDGE_CDC_PUBLICATION}',
+    dry_run       boolean DEFAULT true
+) RETURNS TABLE (step text, status text, detail text) AS $$
+DECLARE
+    short      text := (SELECT relname FROM pg_class WHERE oid = tbl);
+    have_write boolean := to_regprocedure('public.zebridge_grant_edge_writes(regclass)') IS NOT NULL;
+    published  boolean;
+    scoped     boolean;
+    col_list   text;
+    verb       text := CASE WHEN dry_run THEN 'would' ELSE 'done' END;
+BEGIN
+    IF writable AND NOT have_write THEN
+        RETURN QUERY SELECT 'preflight', 'ERROR',
+            'writable => true, but the write half is not installed — this database was '
+            'initialised with ZB_PROFILE=readonly (init.core.template.sql alone).';
+        RETURN;
+    END IF;
+
+    IF tenant_col IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM pg_attribute WHERE attrelid = tbl AND attname = tenant_col
+          AND attnum > 0 AND NOT attisdropped
+    ) THEN
+        RETURN QUERY SELECT 'preflight', 'ERROR', format('%s has no column %I', tbl, tenant_col);
+        RETURN;
+    END IF;
+
+    -- ⚠️ **Scoping must exist BEFORE the table is published**, and that ordering is not a
+    -- preference — `zebridge_publication_guard` is an event trigger that refuses
+    -- `ALTER PUBLICATION ... ADD TABLE` for a table with neither a row filter nor RLS.
+    -- Publishing first and scoping second leaves a window in which the change feed carries
+    -- every tenant's rows, so the guard closes it at the source. Predicted here rather than
+    -- discovered halfway through: an ERROR row costs nothing, a half-applied activation does.
+    scoped := (SELECT relrowsecurity FROM pg_class WHERE oid = tbl)
+              OR EXISTS (SELECT 1 FROM pg_publication_rel WHERE prrelid = tbl AND prqual IS NOT NULL)
+              -- ⚠️ Aliased and qualified: the parameter is also named `tbl`, and this
+              -- table has a column of that name, so the unqualified form is ambiguous.
+              OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relname = 'zebridge_public_tables'
+                         AND EXISTS (SELECT 1 FROM public.zebridge_public_tables pt
+                                     WHERE pt.tbl = zebridge_enable.tbl))
+              OR public_reason IS NOT NULL
+              OR (writable AND tenant_col IS NOT NULL);   -- scope_writes_by_tenant enables RLS
+    IF NOT scoped THEN
+        RETURN QUERY SELECT 'preflight', 'ERROR',
+            format('%s would be published unscoped, which zebridge_publication_guard refuses. '
+                   'Pick one: (a) writable => true with tenant_col, which enables RLS; '
+                   '(b) public_reason => ''why everyone may read this'', recorded in '
+                   'zebridge_public_tables; (c) call zebridge_scope_publication_to_one_tenant() '
+                   'first for a one-bridge-per-tenant deployment.', tbl);
+        RETURN;
+    END IF;
+
+    -- ── writes, guards and RLS come FIRST, because the guard demands it ───────
+    IF writable THEN
+        IF NOT dry_run THEN EXECUTE format('SELECT public.zebridge_grant_edge_writes(%L::regclass)', tbl); END IF;
+        RETURN QUERY SELECT 'grants', verb, format('zebridge_grant_edge_writes(%L)', tbl::text);
+
+        IF version_col IS NULL THEN
+            RETURN QUERY SELECT 'guards', 'skipped',
+                'no version_col given — writes are granted but unguarded: a client that omits '
+                'the version is not corrected, and a direct DELETE is not tombstoned';
+        ELSE
+            IF NOT dry_run THEN
+                EXECUTE format('SELECT public.zebridge_install_write_guards(%L::regclass, %L, %L)',
+                               tbl, version_col, tombstone_col);
+            END IF;
+            RETURN QUERY SELECT 'guards', verb,
+                format('zebridge_install_write_guards(%L, %L, %L)', tbl::text, version_col, tombstone_col);
+        END IF;
+
+        IF tenant_col IS NOT NULL THEN
+            IF NOT dry_run THEN
+                EXECUTE format('SELECT public.zebridge_scope_writes_by_tenant(%L::regclass, %L)', tbl, tenant_col);
+            END IF;
+            RETURN QUERY SELECT 'rls', verb,
+                format('zebridge_scope_writes_by_tenant(%L, %L) — writes scoped, reads deliberately NOT',
+                       tbl::text, tenant_col);
+        END IF;
+    ELSIF tenant_col IS NOT NULL THEN
+        RETURN QUERY SELECT 'rls', 'skipped',
+            'writable => false: nothing to scope in PostgreSQL. Tenant-scoped *reads* are '
+            'enforced by the subject and the NATS grant, not by RLS';
+    END IF;
+
+    IF public_reason IS NOT NULL THEN
+        IF NOT dry_run THEN
+            EXECUTE format('INSERT INTO public.zebridge_public_tables (tbl, reason) VALUES (%L::regclass, %L) '
+                           'ON CONFLICT (tbl) DO NOTHING', tbl, public_reason);
+        END IF;
+        RETURN QUERY SELECT 'public', verb,
+            format('recorded in zebridge_public_tables: %L', public_reason);
+    END IF;
+
+    -- ── publication LAST ──────────────────────────────────────────────────────
+    SELECT EXISTS (SELECT 1 FROM pg_publication_tables
+                   WHERE pubname = publication AND tablename = short) INTO published;
+    IF published THEN
+        RETURN QUERY SELECT 'publication', 'already', format('%I already carries %s', publication, tbl);
+    ELSE
+        col_list := CASE WHEN columns IS NULL THEN ''
+                    ELSE ' (' || array_to_string(
+                         ARRAY(SELECT quote_ident(c) FROM unnest(columns) c), ', ') || ')' END;
+        IF NOT dry_run THEN
+            EXECUTE format('ALTER PUBLICATION %I ADD TABLE %s%s', publication, tbl, col_list);
+        END IF;
+        RETURN QUERY SELECT 'publication', verb,
+            format('ALTER PUBLICATION %I ADD TABLE %s%s', publication, tbl, col_list);
+    END IF;
+
+    IF columns IS NOT NULL AND tenant_col IS NOT NULL THEN
+        RETURN QUERY SELECT 'publication', 'NOTE',
+            format('column list + tenant scoping: put %I inside the replica identity, or '
+                   'UPDATE/DELETE are refused at the source (NOTES.md §1.8)', tenant_col);
+    END IF;
+
+    -- ── T3 and T4 live outside the database and always will ───────────────────
+    IF tenant_col IS NOT NULL THEN
+        RETURN QUERY SELECT 'T3 bridge env', 'MANUAL',
+            format('TENANT_RULES=%s:%s   — restart the bridge; without it events publish to '
+                   'cdc.%s.<op> with no tenant token and no client can scope them', short, tenant_col, short);
+    END IF;
+    IF writable AND version_col IS NOT NULL THEN
+        RETURN QUERY SELECT 'T3 bridge env', 'MANUAL',
+            format('SYNC_RULES=%s:%s%s   — restart the bridge', short, version_col,
+                   CASE WHEN tombstone_col IS NULL THEN '' ELSE ',' || tombstone_col END);
+    END IF;
+    RETURN QUERY SELECT 'T4 nats conf', 'MANUAL',
+        CASE WHEN tenant_col IS NULL
+             THEN format('grant subscribe on cdc.%s.> — and init.snap.%s.> to match, because a '
+                         'client must not be able to dump what it cannot subscribe to', short, short)
+             ELSE 'grant subscribe on cdc.<tenant>.> per principal; reload NATS, not the bridge. '
+                  'The snapshot path is NOT tenant-scoped (NOTES.md §1.12)' END;
+
+    IF dry_run THEN
+        RETURN QUERY SELECT 'summary', 'DRY RUN', 'nothing was applied — re-run with dry_run => false';
+    END IF;
+END;
+$$ LANGUAGE plpgsql;

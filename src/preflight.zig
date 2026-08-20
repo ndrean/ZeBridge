@@ -375,8 +375,12 @@ pub fn reportVersionColumns(
 
     log.info("✅ Edge writes: {d} table(s) writable, {d} outbound-only", .{ writable, outbound_only });
     if (mismatched > 0) {
+        // ⚠️ Deliberately does NOT say "each one fails at runtime". That was true when the
+        // only finding here was a missing version column, and it is false for a
+        // database-allocated key — those writes succeed. Telling an operator to expect a
+        // runtime failure that never comes is worse than saying nothing.
         log.warn(
-            "⚠️  {d} table(s) where the write grant and the schema disagree — see above. Each one fails at runtime, not here.",
+            "⚠️  {d} table(s) where the write grant and the schema disagree — see above. Every mutation for them is refused at the write path; reads are unaffected.",
             .{mismatched},
         );
     }
@@ -412,8 +416,13 @@ fn reportWriteIntent(
             return true;
         }
         if (key_db_allocated) {
+            // ⚠️ Worded to say that these writes SUCCEED. That is the whole danger, and it
+            // is the opposite of every other finding here: nothing fails, nothing is
+            // logged later, and the damage surfaces in the application months on as a
+            // duplicate key it cannot explain — or, through the bridge, as one row
+            // silently overwriting another that was never related to it.
             log.err(
-                "🔴 '{s}': granted INSERT to the writer, but its primary key is database-allocated (serial/identity). A client cannot mint one — an explicit key does not advance the sequence, so edge writes plant duplicate-key collisions the application hits later, and two offline clients creating rows collide by construction. Use a uuid key.",
+                "🔴 '{s}': granted INSERT to the writer, but its primary key is database-allocated (serial/identity), so the write path REFUSES every mutation for it (DbAllocatedKey). Allowing them would corrupt quietly — a client-supplied key does not advance the sequence, so each edge write plants a value the application's own INSERT later collides with, and through the bridge that collision does not even error: ON CONFLICT DO UPDATE overwrites whichever row was there first. The table still replicates outbound. Use a uuid key, or drop the column DEFAULT and assign clients disjoint ranges.",
                 .{table},
             );
             return true;
@@ -573,7 +582,7 @@ pub fn reportTable(
 }
 
 /// Tables that are ours or the migration tool's — mirrors zebridge_is_internal_table()
-/// in init.sql.template and isInternalTable() in event_processor.zig.
+/// in init.{core,write}.template.sql and isInternalTable() in event_processor.zig.
 fn isInternalTable(name: []const u8) bool {
     return std.mem.eql(u8, name, "zebridge_ddl_events") or
         std.mem.eql(u8, name, "schema_migrations");
@@ -589,6 +598,111 @@ pub const Summary = struct {
 ///
 /// Opens its own non-replication connection: the caller's is either the replication
 /// stream (which cannot run ordinary queries) or not yet established at this point.
+/// Does the data already in these tables still fit the buffer we are about to run with?
+///
+/// ⚠️ **`BASE_BUF` is a one-way door.** Raising it is free; lowering it retroactively
+/// invalidates rows that were accepted under the old size, and nothing notices until
+/// somebody *touches* one of them — at which point CDC cannot pack the row and the whole
+/// table is suspended for every client. A configuration change today, an outage weeks
+/// later, with nothing connecting the two.
+///
+/// The same query also catches the cases the ingress size guard cannot see, because they
+/// were never mutations at all:
+///
+///   * rows written **directly to PostgreSQL** by the application, a cron job or a backfill;
+///   * rows the database **expanded itself** — a large column `DEFAULT`, a `BEFORE` trigger,
+///     a generated column — so that a 258-byte mutation stores a 50 KB row;
+///   * data that predates the table's addition to the publication.
+///
+/// None of those can be prevented. All of them can be *named at boot* instead of
+/// discovered at runtime, which is the whole difference between a migration you plan and
+/// an incident you page for.
+///
+/// ⚠️ Cheap despite appearances: `octet_length` on `text`/`bytea` reads the length out of
+/// the TOAST pointer without fetching the value — measured at 2 shared buffers and 0.07 ms
+/// for a 50 MB table. Reported, never refused: the rows already exist, and refusing to
+/// start would turn a warning into the outage it is trying to prevent.
+fn checkStoredRowsFit(
+    allocator: std.mem.Allocator,
+    conn: ?*c.PGconn,
+    publication_name: []const u8,
+    event_buf_bytes: usize,
+) void {
+    // ⚠️ Asked per table rather than in one statement: reaching a table's own columns
+    // needs its name in the query text, and the published list is normally a handful.
+    const list_q = utils.allocPrintZ(
+        allocator,
+        "SELECT tablename FROM pg_publication_tables WHERE pubname = '{s}' AND schemaname = 'public'",
+        .{publication_name},
+    ) catch return;
+    defer allocator.free(list_q);
+
+    const list = c.PQexec(conn, list_q.ptr);
+    defer c.PQclear(list);
+    if (c.PQresultStatus(list) != c.PGRES_TUPLES_OK) return;
+
+    var flagged: usize = 0;
+    var r: c_int = 0;
+    while (r < c.PQntuples(list)) : (r += 1) {
+        const table = std.mem.span(c.PQgetvalue(list, r, 0));
+        // ⚠️ `zebridge_widest_row`, not `pg_column_size`. The latter reports the *stored,
+        // compressed* size — a 40 KB run of one character compresses to almost nothing, so
+        // a check built on it called the table safe while CDC could not carry its widest
+        // row. Measured: pg_column_size saw a fitting table; octet_length saw 40068 bytes.
+        //
+        // If the function is missing (init.sql not re-applied) the query errors and the
+        // table is skipped, which is the right failure: a boot check that cannot run must
+        // not stop a bridge from starting.
+        const q = utils.allocPrintZ(
+            allocator,
+            "SELECT public.zebridge_widest_row('public.\"{s}\"'::regclass)",
+            .{table},
+        ) catch continue;
+        defer allocator.free(q);
+
+        const res = c.PQexec(conn, q.ptr);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) continue;
+
+        const widest = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch continue;
+        if (widest >= event_buf_bytes) {
+            flagged += 1;
+            log.err(
+                "🔴 '{s}': a row already stored is {d} bytes, at or over the {d}-byte CDC event buffer. Touching that row suspends the table for every client. Raise BASE_BUF, or move the oversized column out of the replicated table — do NOT lower BASE_BUF below what is already stored.",
+                .{ table, widest, event_buf_bytes },
+            );
+        }
+
+        // ⚠️ And the hazard that has not happened yet. A table with an oversized column
+        // DEFAULT and no rows measures as safe above, then the FIRST insert — a small
+        // mutation that passed every ingress guard — stores an unsendable row. The default
+        // is the fault; the row is only where it surfaces.
+        const dq = utils.allocPrintZ(
+            allocator,
+            "SELECT col, bytes FROM public.zebridge_oversized_defaults('public.\"{s}\"'::regclass, {d})",
+            .{ table, event_buf_bytes },
+        ) catch continue;
+        defer allocator.free(dq);
+
+        const dres = c.PQexec(conn, dq.ptr);
+        defer c.PQclear(dres);
+        if (c.PQresultStatus(dres) != c.PGRES_TUPLES_OK) continue;
+
+        var d: c_int = 0;
+        while (d < c.PQntuples(dres)) : (d += 1) {
+            flagged += 1;
+            log.err(
+                "🔴 '{s}.{s}': its column DEFAULT alone produces {s} bytes, at or over the {d}-byte CDC event buffer. No row need exist yet — the first INSERT that omits this column stores a row the change feed cannot carry, and the table is suspended for every client. Change the default, or move the column out of the replicated table.",
+                .{ table, c.PQgetvalue(dres, d, 0), c.PQgetvalue(dres, d, 1), event_buf_bytes },
+            );
+        }
+    }
+
+    if (flagged == 0) {
+        log.info("📏 Stored rows and column defaults fit the {d}-byte event buffer", .{event_buf_bytes});
+    }
+}
+
 /// Is the DDL pipeline actually wired up? — see PROTOCOL.md §0
 ///
 /// ⚠️ **Single point of failure for every schema change.** `zebridge_ddl_events` is an
@@ -658,6 +772,9 @@ pub fn run(
     /// `TENANT_RULES`: which column carries the tenant, per table. Empty when reads are
     /// unscoped, which is the default and is reported as such.
     tenant_rules: *const Config.EventClassification.TransitionRules,
+    /// The CDC per-event buffer, `2^BASE_BUF`. Compared against the widest row already
+    /// stored — see `checkStoredRowsFit`.
+    event_buf_bytes: usize,
 ) !Summary {
     var standard_config = pg_config.*;
     standard_config.replication = false;
@@ -669,6 +786,7 @@ pub fn run(
     defer c.PQfinish(conn);
 
     checkDdlPipeline(allocator, conn, publication_name);
+    checkStoredRowsFit(allocator, conn, publication_name, event_buf_bytes);
 
     // array_length(indkey,1) counts the PK's columns; 0 rows means no PK at all.
     const query = try utils.allocPrintZ(

@@ -115,6 +115,31 @@ async def main():
         else:
             print(f"  ⓘ  {name} duplicated in both files (same value) — pick one home")
 
+    # ── BASE_BUF against what the broker will accept ───────────────────────────
+    #
+    # ⚠️ This gap is what made a client-reachable denial of service possible. NATS accepts
+    # up to `max_payload` (1 MiB by default); CDC packs a row into `2^BASE_BUF` (16 KiB by
+    # default). Between the two sits every row a client may legally write but the change
+    # feed cannot carry — and before the ingress size check existed, one such write
+    # suspended the table for **every** client while its sender was told `accepted`.
+    #
+    # The ingress check now refuses those writes, so this is no longer a hazard — it is a
+    # capability limit, and the point of saying it out loud is that an operator cannot see
+    # it anywhere else: `BASE_BUF` lives in .env.bridge and `max_payload` in the NATS
+    # server config, and nothing compares them.
+    base_buf = int(bridge.get("BASE_BUF") or 14)
+    row_limit = 1 << base_buf
+    nats_max = 1024 * 1024  # nats-server.conf default; the bridge reads the advertised value
+    if row_limit < nats_max:
+        print(
+            f"  ⓘ  BASE_BUF={base_buf} caps a row at {row_limit:,} bytes while NATS accepts "
+            f"{nats_max:,}. Rows between the two are refused at ingress (RowTooLargeToReplicate) —\n"
+            f"     intended, but it means clients cannot write rows larger than {row_limit:,} bytes. "
+            "Published to them as `max_row_bytes` in the schema."
+        )
+    else:
+        zb.ok(f"BASE_BUF={base_buf} covers everything NATS will accept ({row_limit:,} bytes)")
+
     for name in BRIDGE_OWNED:
         if name in admin and name not in bridge:
             zb.bad(f".env.admin defines {name}, which is the bridge's variable — "

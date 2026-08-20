@@ -358,6 +358,28 @@ transaction shape and row count, so the next regression has something to contrad
 
 ---
 
+### 1.11 The schema payload cannot express "writable"
+
+`CLIENT_WRITES.md` designed the schema's write contract as
+`"sync": { "version": …, "tombstone": …, "writable": true }`, and the `writable` half was
+never built. What ships is flat — `version_column`, `tombstone_column`,
+`mutation_timeout_ms`, `replica_identity` — with **no writability signal at all**.
+
+⚠️ **A non-null `version_column` does not mean the table accepts writes.** Measured:
+`users` publishes `version_column: "updated_at"` and refuses every mutation with SQLSTATE
+`42501`, because writability is a **grant** (`zebridge_grant_edge_writes`) and grants are
+not in the payload. A client that offers editing wherever a version column exists will
+offer it on tables that reject everything, and only find out per-write.
+
+The bridge already knows: preflight computes exactly this and logs
+`'users': outbound-only — the writer has no INSERT privilege`. It simply is not published.
+
+Not done yet because it needs a decision rather than code: the grant is per **role**, and
+the schema is published once for all clients — so `writable` would mean "writable by the
+bridge's writer role", which is true for every client or none. That is the right answer
+for the current single-writer-role model, and would have to change if per-principal write
+grants ever arrive (§7.1). Worth doing with that in mind rather than before it.
+
 ### 1.10 `ColumnView` could store lengths only — 12 B → 8 B
 
 `CDCEvent.ColumnView` is replicated `max_columns × RING_BUFFER_COUNT` times, so its width
@@ -671,6 +693,144 @@ it means a DBA-declared owner column becoming a subject token (`cdc.<table>.<op>
 with NATS allow-lists enforcing it, exactly as `mutation.<principal>.…` works for writes.
 That path requires `REPLICA IDENTITY FULL` on any table it applies to.
 
+### 1.12 Snapshot reach must equal subscribe reach — the tenant axis is half-built
+
+§1.8 answers "what can the *publication* filter". This is the other half: what each
+**transport path** can be restricted to, and where they disagree.
+
+The rule worth adopting: **a client must not be able to dump what it cannot subscribe to.**
+A snapshot obtainable for a feed you have no grant on is not a convenience, it is the CDC
+authorization bypassed with extra steps.
+
+| axis | discloses | CDC path | snapshot path |
+| --- | --- | --- | --- |
+| schema | the *shape* of a table | `$KV.schemas.>` — wholesale | same bucket, same grant |
+| table | that rows exist, and their content | grant `cdc.*.<t>.>` instead of `cdc.>` | grant `init.snap.<t>.>` + `snapshot.request.<t>` |
+| column | which columns | publication column list (§1.8) | same list — `snapshot_listener.zig:470` |
+| row / tenant | which rows | tenant is a **subject token**: `cdc.<tenant>.>` | ❌ **nothing to match on** |
+
+Two of these are already solved and simply unused. **Column** scoping works on both paths
+through the publication column list. **Table** scoping is expressible on both paths today —
+every subject carries the table — and is a *configuration* gap, not an architecture one:
+the shipped conf grants `cdc.>`, `init.>` and `snapshot.request.>` wholesale. Tightening it
+is a conf edit and no code, and the invariant above is what makes it checkable: for every
+table, the `init.snap.<t>.>` grant must match the `cdc.*.<t>.>` grant.
+
+**Row scoping is the architecture gap**, and no amount of NATS configuration reaches it:
+`init.snap.<table>.<snapshot_id>.<chunk>` has no tenant token, and `snapshot.request.<table>`
+carries no principal, so the bridge has nothing trustworthy to filter *by*. The conf records
+the reasoning that led here — *"asking is not reading, and the reply lands on `init.>` which
+it may already see"* — which is sound given universal `init.>`, and circular as a
+justification for scoping it.
+
+Measured: `bob` (tenant `globex`) published `snapshot.request.test_types` — a table whose
+rows are all `acme` — and the bridge answered him with a data chunk. The row payload was not
+decoded, so this is not a verified row-level leak; the **request-and-delivery path is
+unscoped**, which is what `snapshot_listener.zig` already says by containing no reference to
+`tenant` anywhere in its 2093 lines.
+
+#### The design, in two orthogonal halves
+
+They are not alternatives. Postgres decides the **contents**; the subject decides the
+**audience**. Doing only the first gives correctly-filtered dumps published where the wrong
+tenant can read them.
+
+1. **Contents — in PostgreSQL, not in the bridge.** The snapshot opens its *own* connection
+   (`snapshot_listener.zig:1530`), separate from replication (`:137`). Set `zb.principal` on
+   it from the request subject — the same `set_config(…, is_local => true)` the mutation
+   listener already makes — and add a reader `SELECT` policy resolving through
+   `zebridge_user_tenants`, the shape `zebridge_scope_writes_by_tenant` already creates for
+   the writer. §1.8 measured that **RLS filters the snapshot** and is bypassed by CDC; that
+   asymmetry is exactly what makes this work, because CDC is scoped by subject instead. The
+   bridge builds no predicate and learns no tenant — statelessness preserved.
+
+   ⚠️ This does **not** touch `zb_reader_all USING (true)`. That policy exists so the
+   *replication* connection sees every tenant; a change feed bounded by RLS goes silently
+   incomplete rather than correctly partitioned. Different connection, different policy.
+
+2. **Audience — in the subject and the KV key.** `init.snap.<tenant>.<table>.…`, and
+   `$KV.snapshots` keyed per (tenant, table). Without the first, `init.>` lets any principal
+   read any dump. Without the second there is a genuine overwrite: that bucket is
+   `max_msgs_per_subject=1` keyed by table alone, so one tenant's descriptor replaces the
+   other's and a client resolves the wrong `snapshot_id` and `lsn`.
+
+   ⚠️ Requires `snapshot.request.<principal>.<table>`, so the principal is a NATS-authenticated
+   **subject token** rather than a payload field the client asserts — the same rule
+   `mutation.<principal>.…` already follows (§7.1). This is three changes, not a conf edit:
+   the NATS grants, the client's publish subject, and the worker's filter plus subject parsing.
+
+#### The cost, which is real and bounded
+
+Filtered dumps cannot be shared: different contents, different messages. The multiplier is
+the **tenant** count, not the principal count — principals sharing a tenant share a dump.
+
+| stream | limit today | effect |
+| --- | --- | --- |
+| `INIT` | `max_age=604800s`, `max_msgs_per_subject=-1` | chunk bytes × tenants, hard 7-day ceiling |
+| `KV_snapshots` | `max_msgs_per_subject=1`, `max_age=0` | one descriptor per (table, tenant) — stays tiny |
+| `REQUESTS` | `max_msgs_per_subject=1`, `max_age=60s` | window becomes per-principal-per-table |
+
+Storage is bounded by time and small. The sharper pressure is that **snapshots run one at a
+time**: N tenants means N sequential dumps of the same table, so `SNAP_RET_SECONDS` stops
+being optional — a request queued behind a long snapshot expires unread at 60s.
+
+⚠️ Note the multiplication is a consequence of *filtering at all*, not of where the rule
+lives. Putting the filter in PostgreSQL keeps the bridge stateless; it does not make the
+dumps shareable again.
+
+#### Still open
+
+- Should a tenant-scoped client asking for a table it can partly see get a **filtered**
+  snapshot or a **refusal**? Filtering matches CDC's behaviour and is friendlier; refusing is
+  easier to audit, because a snapshot that silently returns a subset is indistinguishable
+  from a table that happens to be small — the same silent-incompleteness `zb_reader_all`
+  exists to avoid. Current lean: filter.
+- Schema disclosure stays wholesale. Defensible — knowing `orders` has a `price` column is a
+  far smaller disclosure than its rows — but it is currently a default, not a decision, and
+  it invites targeted probing. What must then be **proved** is not that a probe is denied but
+  that it is denied *definitively and once*: silence means the client retries forever (§7.1),
+  which turns ingress into a treadmill at no cost to the prober, while *repetition* makes the
+  broker amplify one probe into many. `writable.py` already covers the refusal's **reason**
+  (row absent, verdict present, right SQLSTATE); `probe.py` covers its **cardinality** and the
+  disclosure premise itself — measured: `alice` reads all 5 columns of `users`, writes to it,
+  and is refused once as `DbAllocatedKey` with nothing following.
+
+
+### 2.13 A wildcard inbox made every pull request spawn another
+
+`jetstream.zig` `fetch` mints a unique reply subject per request but reads from a
+**wildcard** subscription (`<prefix>.*`), so it also receives replies to *earlier*
+fetches still parked on the server until their `expires`.
+
+A late 408 therefore ended the *current* fetch. The caller re-fetched at once, leaving
+another request parked, which produced another late 408 — self-sustaining, settling at
+`expires / period` parked pulls.
+
+Measured on a completely idle stream: 500 ms expiry, a new fetch every 48 ms,
+`num_waiting=10`, ~21 pull requests/sec. Two consumers made ~17 msg/s in *and* out with
+nothing to deliver. Unchanged by log level, which is what ruled out debug output.
+
+Fix: ignore any **status frame** whose subject is not this fetch's reply subject, and keep
+waiting. Status frames only — JetStream delivers a *data* message with its original subject
+(routed by subscription id), so matching those against the inbox drops every real message.
+`test-e2e` caught exactly that (`jetstream_pull_test`, "basic fetch": expected 2, got 0).
+
+Callers could not have caught it: `fetch` reports 408 in `batch.err`, not as an error
+return, so `catch { continue; }` never fires and an empty `batch.messages` looks normal.
+
+### 2.14 The WAL idle path slept on a timer instead of the socket
+
+`PQgetCopyData` in async mode returns 0 the moment libpq's buffer is drained, so the
+1 ms sleep woke the loop ~1000×/s to find nothing: `iters=11617 idle=11616` per 15 s
+window, ~4% CPU against an idle database.
+
+Fix: `poll()` on `PQsocket`, with the timeout only bounding the keepalive check. Wakes
+the instant PostgreSQL writes, so latency is unchanged.
+
+⚠️ Not a latency bug — publish latency measured 8.6–13.8 ms (median 10.4) commit→NATS
+both before and after. An early 41 ms reading was a measurement artifact: the harness
+spawned a Python interpreter per message.
+
 ## 3. PostgreSQL behaviours worth remembering
 
 ### 3.1 `ALTER TABLE` serialises against writers — demonstrated
@@ -884,6 +1044,119 @@ both platforms — but note `ru_maxrss` is **bytes on Darwin, kilobytes on Linux
 the few genuinely divergent POSIX fields (normalised in `utils.maxRssBytes`).
 
 ---
+
+### 4.5 The setup, in two times and four places
+
+The layers do not live in the SQL files. That is the single thing that makes this hard to
+hold in your head, so it is worth stating plainly before the tables: **a layer is a
+capability assembled from four places, and half of it is not SQL at all.**
+
+#### Two times, because a function cannot scope a table that does not exist
+
+The templates *define* functions. The DBA *invokes* them — afterwards, once the
+application's own migrations have created the tables. Nothing in
+`init.{core,write}.template.sql` applies itself to anything: every mention of
+`zebridge_grant_edge_writes`, `zebridge_install_write_guards`,
+`zebridge_scope_writes_by_tenant` or `zebridge_scope_publication_to_one_tenant` outside its
+own `CREATE OR REPLACE` is a comment.
+
+```
+T0  init.core.template.sql [+ init.write.template.sql]
+        roles, functions, DDL triggers, an EMPTY publication
+T1  your application's migrations
+        the tables themselves
+T2  DBA activation, per table
+        the function calls above + ALTER PUBLICATION … ADD TABLE
+T3  bridge environment  + restart
+        TENANT_RULES, SYNC_RULES
+T4  NATS conf + reload  (reload NATS, not the bridge)
+        per-principal subject grants
+```
+
+#### Four places, per layer
+
+| layer | SQL @T0 | SQL @T2, per table | bridge env @T3 | NATS conf @T4 |
+| --- | --- | --- | --- | --- |
+| **1** full read | core: reader role, publication, DDL triggers | `ALTER PUBLICATION … ADD TABLE t` | — | `cdc.>`, `init.>` |
+| **2** scoped read | + `zebridge_user_tenants` | tenant column exists; `ALTER PUBLICATION … (cols)` for column rights | `TENANT_RULES=t:col` ⟵ **restart** | `cdc.<tenant>.>` per principal |
+| **3** write | write file: writer role, guards | `grant_edge_writes(t)`, `install_write_guards(t,…)`, `scope_writes_by_tenant(t,col)` | `SYNC_RULES=t:…` ⟵ **restart** | `mutation.<principal>.>`, `mutation_ack.<principal>.>` |
+
+⚠️ **Only the env vars need a bridge restart.** Granting a principal a tenant
+(`INSERT INTO zebridge_user_tenants`) is resolved per statement inside the RLS policy and
+takes effect on the next mutation; adding a NATS principal reloads **NATS**, not the bridge.
+Conflating these three is what makes the workflow feel clumsier than it is (SECURITY.md).
+
+#### Multi vs single tenant are alternatives, not a nesting
+
+This is the distinction that keeps collapsing. They are two different ways to *be* layer 2,
+and they exclude each other:
+
+| | scoped by | shape | CDC | snapshot |
+| --- | --- | --- | --- | --- |
+| **multi-tenant** | the **subject** — `TENANT_RULES` + per-tenant NATS grants | one bridge, N tenants | ✅ | ❌ (§1.12) |
+| **single-tenant** | the **publication row filter** — `zebridge_scope_publication_to_one_tenant(t, col, value, pub)` at T2 | one bridge **per tenant** | ✅ | ✅ |
+
+The single-tenant shape is coherent across both paths for one reason: the filter lives in
+the publication, and *both* CDC and the snapshot read the publication
+(`snapshot_listener.zig:1584`). The multi-tenant shape scopes CDC by subject, which the
+snapshot has no equivalent of — that is §1.12.
+
+#### Layer 2 is barely SQL
+
+Its CDC half needs nothing from the write file: no writer role, no RLS, no mapping table.
+The principal→tenant decision is enforced by NATS grants (`alice` holds `cdc.acme.>`), not
+by PostgreSQL. Tenant-scoped **read-only** CDC is therefore reachable with the core file
+alone, plus a tenant column, `TENANT_RULES`, and conf.
+
+Only layer 2's *snapshot* half needs `zebridge_user_tenants`, for the reader RLS policy —
+which is why that table belongs in **core** rather than the write file if §1.12 is ever
+built. The split boundary is read-vs-write **capability**, not which tables are involved.
+
+Column rights are orthogonal to all of it and also live at T2:
+`ALTER PUBLICATION my_pub SET TABLE orders (id, total)` bounds both paths with no bridge
+involvement — subject to §1.8's exclusion, which dissolves only when the tenant column is
+inside the replica identity.
+
+#### The entry point — BUILT (`zebridge_enable`, core template)
+
+T2 used to be a sequence of remembered calls, which is why the whole refused to come into
+focus. One statement now composes it and **prints what it cannot reach**:
+
+```sql
+SELECT * FROM zebridge_enable('public.orders',
+                              tenant_col    => 'tenant_id',
+                              writable      => true,
+                              version_col   => 'updated_at',
+                              tombstone_col => 'deleted_at');   -- dry run by default
+```
+
+⚠️ **`dry_run` defaults to TRUE.** It grants, guards and enables RLS in one statement;
+showing the plan first is the cheap half of that trade.
+
+It returns a `(step, status, detail)` plan covering T2 *and* the T3/T4 lines it can never
+set — `TENANT_RULES=…`, `SYNC_RULES=…`, and the NATS grants — because those live outside the
+database and always will.
+
+Three things it enforces that a remembered sequence did not:
+
+- **Scoping before publication.** `zebridge_publication_guard` refuses
+  `ALTER PUBLICATION … ADD TABLE` on a table with neither a row filter nor RLS, so grants,
+  guards and RLS run *first* and the publication last. Discovered by writing it in the wrong
+  order and being refused mid-apply — which is exactly the half-applied activation the
+  preflight now predicts with an ERROR row instead.
+- **A scoping decision is mandatory.** Publishing unscoped is refused up front, naming the
+  three ways out: `writable => true` with a `tenant_col` (enables RLS), `public_reason => …`
+  (records the decision in `zebridge_public_tables`), or
+  `zebridge_scope_publication_to_one_tenant()` for the one-bridge-per-tenant shape.
+- **Profile awareness.** `writable => true` against a `ZB_PROFILE=readonly` database fails
+  with that named reason rather than `function does not exist`. It lives in the core half and
+  dispatches write-path calls through `EXECUTE` precisely so this stays possible.
+
+⚠️ Writing it also surfaced a live bug in `zebridge_scope_writes_by_tenant`: its `RAISE
+NOTICE` used `%s` where PL/pgSQL's placeholder is `%`, so it printed
+`TENANT_RULES=orderss:tenant_id` — the value followed by a literal `s`. A DBA copying that
+line would have configured a table that does not exist. Fixed.
+
 
 ## 5. Client-side protocol (browser / WASM SQLite)
 

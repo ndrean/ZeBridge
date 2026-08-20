@@ -869,7 +869,7 @@ catalog access, so the type facts are free at the point they are produced. Add t
 
 ## Design (as built)
 
-1. **`init.sql.template`** — add `oid` and `typtype` per column to the `schema_def`
+1. **`init.{core,write}.template.sql`** — add `oid` and `typtype` per column to the `schema_def`
    JSON the event trigger builds.
 
    Ship **facts, not policy**. Do *not* emit a `supported: true/false` flag: Postgres
@@ -1069,7 +1069,7 @@ Electric. Client-facing rules live in `PROTOCOL.md` §7; this is the bridge side
       `x" ; DROP …` closes the quote)
 - [x] `zebridge_ddl_events` explicitly excluded — writable today, which lets a client
       forge a schema for every other client
-- [x] **`bridge_writer` role — DONE 2026-08-16.** Created by `init.sql.template` with
+- [x] **`bridge_writer` role — DONE 2026-08-16.** Created by `init.{core,write}.template.sql` with
       `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS` and **zero table
       privileges**; `zebridge_grant_edge_writes(regclass)` opens one table at a time and
       refuses `zebridge_ddl_events` by name. The bridge connects through it on a separate

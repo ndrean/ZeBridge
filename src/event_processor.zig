@@ -31,7 +31,7 @@ pub const log = std.log.scoped(.event_processor);
 
 /// Tables whose schema is infrastructure, not client data.
 ///
-/// Mirrors zebridge_is_internal_table() in init.sql.template. The DDL triggers already
+/// Mirrors zebridge_is_internal_table() in init.{core,write}.template.sql. The DDL triggers already
 /// skip these, but the boot pass iterates the publication's table list — which contains
 /// zebridge_ddl_events, since its INSERTs are how schema events travel. Without this the
 /// two paths disagree and clients build a local replica of our own bookkeeping.
@@ -126,6 +126,11 @@ pub const EventProcessor = struct {
     /// unscoped — every subscriber of `cdc.>` receives every row, which is the default and
     /// is reported as such at boot.
     tenant_rules: *const Config.EventClassification.TransitionRules,
+    /// `2^BASE_BUF` — the widest row CDC can carry, and therefore the widest a client may
+    /// write. Published in the write contract because it is a **deployment** setting, not
+    /// a protocol constant: a client that hardcoded it would be wrong the moment an
+    /// operator raised it.
+    event_buf_bytes: usize,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -139,6 +144,8 @@ pub const EventProcessor = struct {
         sync_rules: *const Config.EventClassification.TransitionRules,
         default_version_column: []const u8,
         tenant_rules: *const Config.EventClassification.TransitionRules,
+        /// `2^BASE_BUF`. Published so a client can size a write before sending it.
+        event_buf_bytes: usize,
     ) EventProcessor {
         return .{
             .allocator = allocator,
@@ -152,6 +159,7 @@ pub const EventProcessor = struct {
             .sync_rules = sync_rules,
             .default_version_column = default_version_column,
             .tenant_rules = tenant_rules,
+            .event_buf_bytes = event_buf_bytes,
         };
     }
 
@@ -834,6 +842,25 @@ pub const EventProcessor = struct {
             arena,
             ",\"mutation_timeout_ms\":{d}",
             .{timeout_ms},
+        ));
+
+        // ⚠️ The widest row this deployment can carry, published so a client can check
+        // **before** sending rather than discovering by rejection. A mutation above this
+        // is refused (`RowTooLargeToReplicate`) — the write would store a row CDC cannot
+        // pack, which suspends the table for every client.
+        //
+        // Published rather than documented because it is a deployment setting: `BASE_BUF`
+        // differs between installations and an operator may raise it. A client that
+        // hardcoded the number would be wrong the day that happened, and a consumer author
+        // has no way to read the bridge's environment.
+        //
+        // ⚠️ A ceiling on the *encoded row*, which is larger than the payload a client
+        // sends — the CDC event carries every column plus its name. Treat it as an upper
+        // bound to stay under, not a budget to fill.
+        try json_str.appendSlice(arena, try std.fmt.allocPrint(
+            arena,
+            ",\"max_row_bytes\":{d}",
+            .{self.event_buf_bytes},
         ));
 
         if (has(column_names, version_name)) {

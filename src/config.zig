@@ -305,7 +305,7 @@ pub const Sync = struct {
     /// mutation, and that row-level policies read back.
     ///
     /// ⚠️ **This name exists in two places and they must match**: here, and in the policies
-    /// `zebridge_publish_tenant_table()` creates in `init.sql.template`. A mismatch is
+    /// `zebridge_scope_publication_to_one_tenant()` creates in `init.{core,write}.template.sql`. A mismatch is
     /// silent in the worst way — `current_setting(..., true)` returns NULL for an unknown
     /// setting, every policy predicate evaluates to NULL, and **every write is refused**
     /// with `new row violates row-level security policy`. Nothing names the real cause.

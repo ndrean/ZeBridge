@@ -198,9 +198,30 @@ async def main():
             f"'{readonly}' refused the write and said so: status={v.get('status')} "
             f"sqlstate={v.get('sqlstate')} — {v.get('detail','').strip()}"
         )
-        # 42501 is insufficient_privilege. Asserting on it rather than on "some verdict"
-        # keeps this honest: a verdict naming the wrong reason would otherwise pass.
-        if v.get("sqlstate") != "42501":
+        # Asserting on the *reason* rather than on "some verdict" keeps this honest: a
+        # verdict naming the wrong cause would otherwise pass.
+        #
+        # ⚠️ Two refusals are correct here, and which one you get depends on the table's
+        # key. A missing grant surfaces as PostgreSQL's `42501 insufficient_privilege`,
+        # but a **sequence-backed primary key is refused first**, before any SQL runs,
+        # because granting INSERT would not fix it — the client still could not mint a
+        # key. So `DbAllocatedKey` superseding `42501` is the bridge reporting the deeper
+        # problem, not losing the shallower one; `scripts/scenarios/keys.py` covers it.
+        seq_key = zb.psql(
+            "SELECT coalesce(pg_get_serial_sequence('public.%s', a.attname), '') "
+            "FROM pg_index i JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=ANY(i.indkey) "
+            "WHERE i.indrelid='public.%s'::regclass AND i.indisprimary LIMIT 1" % (readonly, readonly)
+        ).strip()
+        if seq_key:
+            if v.get("reason") == "DbAllocatedKey":
+                zb.ok(f"and refused on the key shape first ('{readonly}' is backed by {seq_key})")
+            else:
+                zb.bad(
+                    f"'{readonly}' has a sequence-backed key, so the write should be refused as "
+                    f"DbAllocatedKey before the privilege check; got {v.get('reason')!r}"
+                )
+                failed += 1
+        elif v.get("sqlstate") != "42501":
             zb.bad(f"expected SQLSTATE 42501 (insufficient_privilege), got {v.get('sqlstate')!r}")
             failed += 1
 

@@ -81,7 +81,7 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
       #
       # These two fixtures genuinely are public: they carry no tenant column and exist to
       # exercise CDC, not to model a real schema. A multi-tenant table would instead be
-      # opened with zebridge_publish_tenant_table/4, which creates the policies and the row
+      # opened with zebridge_scope_publication_to_one_tenant/4, which creates the policies and the row
       # filter first and then publishes.
       execute("""
       DO $$

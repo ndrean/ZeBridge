@@ -25,6 +25,8 @@ defmodule Emitter.Scenario do
   @doc "Step 2 — well-formed tables (`users`, `test_types`) replicate normally."
   def step2, do: migrate(20_260_810_120_000, Emitter.PgProducer.Repo.SetupCdcTables)
 
+  def step21, do: migrate(20_260_810_130_000, Emitter.PgProducer.Repo.AddTenantLastWriter)
+
   @doc """
   Step 3 — produce a little traffic on a healthy table.
 

@@ -43,6 +43,8 @@ examples/03-browser-python-django/mysite/__pycache__/
 *.log
 logs.txt
 bridge.txt
+skills-lock.json
+/.agents/
 
 # Scenario harness venv
 scripts/scenarios/.venv/

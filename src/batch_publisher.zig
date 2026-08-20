@@ -990,6 +990,16 @@ pub const BatchPublisher = struct {
 
             try self.publisher.publish(event.getSubject(), msg_id, encoded);
 
+            // ⚠️ Counted here too, not only in the batch path below.
+            //
+            // It was missing, and the omission was invisible at load and glaring at idle:
+            // a burst goes through the batch path and increments, while a demo doing one
+            // insert at a time goes through *this* path and never did — so
+            // `bridge_cdc_events_published_total` read **0** while `cdc.users.insert`
+            // was demonstrably on the wire. The metric said the bridge was dead when it
+            // was working, which is the worst direction for a counter to be wrong in.
+            if (self.metrics) |m| m.incrementCdcEvents();
+
             log.debug("Published single event: {s}", .{event.getSubject()});
         } else {
             // Batch publishing
