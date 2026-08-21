@@ -454,13 +454,31 @@ pub fn main(init: std.process.Init) !void {
 
     // What the server will accept, logged once. The check that acts on it runs below,
     // just before the slab is allocated — this is the observation, that is the decision.
+    //
+    // Both CDC's per-event buffer and the snapshot path's per-chunk buffer answer to
+    // the same live fact (this server's advertised max_payload) but scale completely
+    // differently — CDC's is claimed once per ring slot and held for the process's
+    // life, the snapshot's is claimed once, period, per request. Logging what each one
+    // resolves to, from the one number they both actually depend on, is what makes that
+    // coherent rather than two independent guesses an operator has to reconcile by hand.
     if (publisher.js) |*js| {
         if (nats_publisher.serverMaxPayload(js)) |max_payload| {
-            log.info("NATS max_payload: {d} KB (server-advertised); per-event buffer: {d} KB (BASE_BUF={d})", .{
-                max_payload / 1024,
-                (@as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2)) / 1024,
-                runtime_config.event_data_buffer_log2,
-            });
+            const snapshot_budget: usize = if (max_payload > Config.Nats.payload_envelope_margin_bytes)
+                @intCast(max_payload - Config.Nats.payload_envelope_margin_bytes)
+            else
+                @intCast(max_payload / 2);
+            const snapshot_chunk_bytes = @min(snapshot_budget, Config.Snapshot.encode_buffer_max_bytes);
+            log.info(
+                "NATS max_payload: {d} KB (server-advertised) → CDC per-event buffer: {d} KB (BASE_BUF={d}, ceiling {d}) | snapshot per-chunk buffer: {d} KB (ceiling {d})",
+                .{
+                    max_payload / 1024,
+                    (@as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2)) / 1024,
+                    runtime_config.event_data_buffer_log2,
+                    runtime_config.event_data_buffer_max_log2,
+                    snapshot_chunk_bytes / 1024,
+                    Config.Snapshot.encode_buffer_max_bytes / 1024,
+                },
+            );
         } else {
             log.debug("NATS server did not advertise max_payload; cannot check it against BASE_BUF", .{});
         }

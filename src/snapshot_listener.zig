@@ -1655,8 +1655,13 @@ pub const SnapshotListener = struct {
         // message" are one event with one handling path, instead of two that can disagree.
         const max_chunk_bytes = blk: {
             const advertised = nats_publisher.serverMaxPayload(&js) orelse {
-                log.warn("📸 NATS did not advertise max_payload; capping chunks at 1 MiB", .{});
-                break :blk 1024 * 1024 - config.Nats.payload_envelope_margin_bytes;
+                // Same guess CDC falls back on when it cannot ask the server either
+                // (Buffers.default_max_event_data_buffer_log2) — NATS's own
+                // out-of-the-box max_payload, not a value chosen for snapshots
+                // specifically.
+                const assumed: usize = @as(usize, 1) << @intCast(config.Buffers.default_max_event_data_buffer_log2);
+                log.warn("📸 NATS did not advertise max_payload; capping chunks at {d} KB", .{assumed / 1024});
+                break :blk assumed - config.Nats.payload_envelope_margin_bytes;
             };
             const budget = if (advertised > config.Nats.payload_envelope_margin_bytes)
                 advertised - config.Nats.payload_envelope_margin_bytes

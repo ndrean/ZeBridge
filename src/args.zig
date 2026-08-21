@@ -32,7 +32,10 @@ const usage =
     \\                        names, lag and throughput to anything that can reach it.
     \\  NATS_URL              nats://[user:pass@]host[:port] (default: localhost)
     \\  NATS_NKEY_SEED        NATS nkey seed
-    \\  BASE_BUF              log2 of per-event data buffer (10-20)
+    \\  BASE_BUF              log2 of per-event data buffer (10-20 by default)
+    \\  BASE_BUF_MAX          Raise BASE_BUF's ceiling past 20 (to at most 24), for a
+    \\                        deployment that has also raised NATS's own max_payload.
+    \\                        Per instance, like BASE_BUF itself — no rebuild needed.
     \\  RING_BUFFER_COUNT     Ring buffer slots (1024-1048576)
     \\  PUBLISH_MAX_RETRIES   Publish retries before fatal (default: 5)
     \\  PUBLISH_BACKOFF_MS    First publish backoff (default: 100)
@@ -267,66 +270,56 @@ pub const Args = struct {
             }
         }
 
-        // Parse BASE_BUF environment variable (log2 of buffer size)
-        if (init.minimal.environ.getPosix("BASE_BUF")) |buf_log2_str| {
-            if (std.fmt.parseInt(u6, buf_log2_str, 10)) |buf_log2| {
-                if (buf_log2 >= 10 and buf_log2 <= 20) {
-                    const buf_size = @as(usize, 1) << @intCast(buf_log2);
-                    runtime_config.event_data_buffer_log2 = buf_log2;
-                    log.info("BASE_BUF={d} → event buffer size: {d} bytes ({d}KB)", .{ buf_log2, buf_size, buf_size / 1024 });
-                } else {
-                    // Clamped, not defaulted — see `envUint`. Asking for 25 means "as big
-                    // as you can", and 8 means "as small as you can"; the default answers
-                    // neither.
-                    const clamped: u6 = @min(@max(buf_log2, 10), 20);
-                    runtime_config.event_data_buffer_log2 = clamped;
-                    log.warn("BASE_BUF={d} out of range (10-20), clamped to {d} ({}KB)", .{
-                        buf_log2,
-                        clamped,
-                        (@as(usize, 1) << @intCast(clamped)) / 1024,
-                    });
-                }
-            } else |err| {
-                log.warn("Invalid BASE_BUF value '{s}' ({any}), using default: {d} ({}KB)", .{
-                    buf_log2_str,
-                    err,
-                    runtime_config.event_data_buffer_log2,
-                    (@as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2)) / 1024,
-                });
-            }
-        } else {
+        // `BASE_BUF_MAX` first: it sets the ceiling `BASE_BUF` itself is about to be
+        // clamped against, so it has to be resolved before BASE_BUF is parsed. Unset
+        // means "the compiled-in default", which is NATS's own out-of-the-box
+        // max_payload (1 MiB) — see Buffers.default_max_event_data_buffer_log2 for why.
+        // Raising it is for a deployment that has *also* raised its NATS server's
+        // max_payload and wants BASE_BUF allowed to follow — per instance, without a
+        // rebuild, the same reason BASE_BUF itself is an env var rather than a compile
+        // constant: one host can run several bridges against tables of very different
+        // shapes on the same WAL.
+        runtime_config.event_data_buffer_max_log2 = envUint(
+            u6,
+            init,
+            "BASE_BUF_MAX",
+            config.Buffers.default_max_event_data_buffer_log2,
+            config.Buffers.min_event_data_buffer_log2,
+            config.Buffers.absolute_max_event_data_buffer_log2,
+        );
+
+        // BASE_BUF: log2 of the per-event data buffer, clamped to
+        // [min_event_data_buffer_log2, event_data_buffer_max_log2] — the second bound is
+        // the value just resolved above, not a second, independently-hardcoded ceiling.
+        runtime_config.event_data_buffer_log2 = envUint(
+            u6,
+            init,
+            "BASE_BUF",
+            config.Buffers.default_event_data_buffer_log2,
+            config.Buffers.min_event_data_buffer_log2,
+            runtime_config.event_data_buffer_max_log2,
+        );
+        {
             const buf_size = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
-            log.info("BASE_BUF not set, using default: {d} → {d} bytes ({d}KB)", .{
-                runtime_config.event_data_buffer_log2,
+            log.info("Event buffer: {d} bytes ({d}KB) — BASE_BUF={d}, ceiling BASE_BUF_MAX={d}", .{
                 buf_size,
                 buf_size / 1024,
+                runtime_config.event_data_buffer_log2,
+                runtime_config.event_data_buffer_max_log2,
             });
         }
 
-        // Parse RING_BUFFER_COUNT environment variable
-        if (init.minimal.environ.getPosix("RING_BUFFER_COUNT")) |count_str| {
-            if (std.fmt.parseInt(usize, count_str, 10)) |count| {
-                if (count >= 1024 and count <= 1024 * 1024) {
-                    runtime_config.batch_ring_buffer_size = count;
-                    log.info("RING_BUFFER_COUNT={d} events", .{count});
-                } else {
-                    const clamped = @min(@max(count, 1024), 1024 * 1024);
-                    runtime_config.batch_ring_buffer_size = clamped;
-                    log.warn("RING_BUFFER_COUNT={d} out of range (1024-1048576), clamped to {d}", .{
-                        count,
-                        clamped,
-                    });
-                }
-            } else |err| {
-                log.warn("Invalid RING_BUFFER_COUNT value '{s}' ({any}), using default: {d}", .{
-                    count_str,
-                    err,
-                    runtime_config.batch_ring_buffer_size,
-                });
-            }
-        } else {
-            log.info("RING_BUFFER_COUNT not set, using default: {d} events", .{runtime_config.batch_ring_buffer_size});
-        }
+        // RING_BUFFER_COUNT: same clamp-not-default policy as BASE_BUF (see `envUint`'s
+        // doc comment — this is the setting that motivated it, now actually wired to it
+        // instead of restating the same bounds and the same clamp-vs-default logic by hand).
+        runtime_config.batch_ring_buffer_size = envUint(
+            usize,
+            init,
+            "RING_BUFFER_COUNT",
+            config.Buffers.default_ring_buffer_count,
+            config.Buffers.min_ring_buffer_count,
+            config.Buffers.max_ring_buffer_count,
+        );
 
         // Publish retry budget. Defaults live in config.zig (Config.Retry); these
         // env vars exist so the budget can be tuned per deployment without a rebuild.

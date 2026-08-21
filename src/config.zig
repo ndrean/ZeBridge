@@ -288,8 +288,6 @@ pub const WalMonitor = struct {
 };
 
 pub const Bridge = struct {
-    /// Maximum size of a single CDC message (bytes)
-    pub const max_cdc_message_size_bytes = 900 * 1024; // 900KB
     pub const keepalive_interval_seconds = 30;
 };
 
@@ -368,6 +366,17 @@ pub const Snapshot = struct {
     /// `max_payload`. A NATS server advertising 8 MiB should not turn into an 8 MiB
     /// resident buffer. One buffer exists at a time — snapshots run sequentially on a
     /// single thread — so this is a ceiling on the bridge, not per request.
+    ///
+    /// ⚠️ Deliberately **not** the same constant as `Buffers.default_max_event_data_buffer_log2`
+    /// (CDC's ceiling), even though both ultimately bound "how big can one NATS message
+    /// be": the two allocations have completely different multiplication factors. CDC's
+    /// per-event buffer is claimed once and held for the process's entire life, ×
+    /// `RING_BUFFER_COUNT` (tens of thousands) — raising it multiplies. This buffer is
+    /// claimed once, full stop, freed when the snapshot request finishes — raising it
+    /// costs exactly its own size. That is why this can afford to sit above CDC's 1 MiB
+    /// default without the same blast radius, not because snapshots and CDC disagree
+    /// about what NATS will accept — they both still clamp to whatever the *live*
+    /// server actually advertises (`serverMaxPayload`), same as CDC's own startup check.
     pub const encode_buffer_max_bytes = 2 * 1024 * 1024;
 
     // Snapshot freshness used to be a bridge-local cache (`SnapshotCache`), which
@@ -516,13 +525,50 @@ pub const Buffers = struct {
     pub const url_buffer_size = 256;
 
     /// Event data buffer size (per-event packed column storage), as log2 bytes.
-    /// Configurable via BASE_BUF (range 10-20): BASE_BUF=16 → 64KB, 14 → 16KB.
+    /// Configurable via BASE_BUF: BASE_BUF=16 → 64KB, 14 → 16KB.
     ///
     /// A row larger than this **suspends its table** (`reason: "row_too_large"`) and the
     /// bridge keeps running — it used to `@panic`, which crash-looped under a supervisor
     /// because the offending row precedes any later ACK and is re-read on restart.
     /// See README "Sizing BASE_BUF and RING_BUFFER_COUNT" for the memory formula.
     pub const default_event_data_buffer_log2: u6 = 14; // 2^14 = 16KB
+
+    /// `BASE_BUF`'s floor. Nothing structural sits at 2^10 — it is just small enough
+    /// that going lower is almost certainly a units mistake, not a deployment that
+    /// genuinely wants a 512-byte event buffer.
+    pub const min_event_data_buffer_log2: u6 = 10; // 2^10 = 1KB
+
+    /// `BASE_BUF`'s **default** ceiling — the value every one of the three places that
+    /// used to restate "1 MiB" independently (a bare `20` in args.zig's clamp, a bare
+    /// `1024*1024` in batch_publisher.zig's startup validation, and prose in a doc
+    /// comment nothing actually referenced) now reads instead. Raising the ceiling used
+    /// to mean remembering all three; forgetting one left two different ceilings
+    /// silently enforced against the same setting.
+    ///
+    /// 1 MiB is not structural — `CDCEvent.ColumnView`'s offsets are `u32`, room for far
+    /// more — it is NATS's own out-of-the-box `max_payload`. A deployment that has
+    /// raised its server's `max_payload` can raise this too, **per instance**, via
+    /// `BASE_BUF_MAX` (see args.zig) — without a rebuild, the same way `BASE_BUF` itself
+    /// is already tuned per instance, because one host can run several bridges against
+    /// tables of very different shapes on the same WAL (see `RuntimeConfig
+    /// .event_buffer_ceiling_log2`, the resolved per-instance value; this constant is
+    /// only the compiled-in default when `BASE_BUF_MAX` is unset).
+    ///
+    /// ⚠️ This ceiling does not, by itself, prove a row can be published — a buffer
+    /// sized right up to it can still exceed what *this* server actually advertises.
+    /// That is checked separately, at connect time, against the live value
+    /// (`nats_publisher.serverMaxPayload`, enforced in bridge.zig as
+    /// `EventBufferExceedsMaxPayload`). This constant only bounds how far
+    /// `BASE_BUF`/`BASE_BUF_MAX` can be pushed before that live check gets to run —
+    /// think of it as "the largest value worth trying," not "the largest value that
+    /// will work."
+    pub const default_max_event_data_buffer_log2: u6 = 20; // 2^20 = 1MiB
+
+    /// Hard outer bound on `BASE_BUF_MAX` itself, so a typo (`BASE_BUF_MAX=200`) cannot
+    /// ask for a multi-exabyte per-slot buffer, silently multiplied by RING_BUFFER_COUNT
+    /// on top. 24 = 16 MiB is already far past any NATS max_payload this project has
+    /// been run against.
+    pub const absolute_max_event_data_buffer_log2: u6 = 24;
 
     /// Ring buffer event count (number of pre-allocated event slots)
     /// Default: 65536 events
@@ -545,6 +591,12 @@ pub const Buffers = struct {
     /// RING_BUFFER_COUNT to 131072 (≈2184ms, ~4MB slab) rather than shortening
     /// the reconnect wait.
     pub const default_ring_buffer_count: usize = 65536;
+
+    /// `RING_BUFFER_COUNT`'s clamp range. Named here rather than left as bare literals
+    /// in args.zig so the `--help` usage string can be generated from the same numbers
+    /// it describes, instead of restating them as prose that can drift.
+    pub const min_ring_buffer_count: usize = 1024;
+    pub const max_ring_buffer_count: usize = 1024 * 1024;
 };
 
 /// Memory-layout bounds used for compile-time pipeline safety checks.
@@ -622,6 +674,12 @@ pub const RuntimeConfig = struct {
 
     // Buffer settings
     event_data_buffer_log2: u6,
+    /// The ceiling `event_data_buffer_log2` (`BASE_BUF`) may not exceed for *this*
+    /// instance — `Buffers.default_max_event_data_buffer_log2` unless `BASE_BUF_MAX`
+    /// raised it. Threaded through so batch_publisher.zig's startup validation checks
+    /// against the same number args.zig's clamp already enforced, rather than a second,
+    /// independently-hardcoded ceiling that could disagree with it.
+    event_data_buffer_max_log2: u6,
 
     // Encoding format
     encoding_format: encoder.Format,
@@ -653,6 +711,7 @@ pub const RuntimeConfig = struct {
             .publish_backoff_ms = Retry.publish_backoff_ms,
             .publish_max_backoff_ms = Retry.publish_max_backoff_ms,
             .event_data_buffer_log2 = Buffers.default_event_data_buffer_log2,
+            .event_data_buffer_max_log2 = Buffers.default_max_event_data_buffer_log2,
             .encoding_format = .msgpack,
         };
     }

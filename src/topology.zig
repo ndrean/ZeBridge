@@ -564,6 +564,16 @@ test "the test fixture matches the repository's own topology.json" {
     const fixture = Topology.for_tests;
 
     inline for (@typeInfo(Topology).@"struct".fields) |f| {
+        // `tenants` is the one field that is not a name or a pattern — it is data
+        // (whichever tenants a deployment happens to declare), so it is `[]const
+        // []const u8`, not `[]const u8`, and `expectEqualStrings` does not even
+        // typecheck against it. It is also deliberately excluded from "matches the
+        // repository's own topology.json" on purpose: `for_tests` carries no tenants
+        // so unit tests default to untenanted behaviour, while the real file declares
+        // some for the multi-tenant scenarios — that difference is intentional, not
+        // drift, and this test exists to catch drift in the *names*, not to assert the
+        // fixture is a byte-for-byte copy of the file.
+        if (comptime std.mem.eql(u8, f.name, "tenants")) continue;
         try testing.expectEqualStrings(@field(fixture, f.name), @field(real, f.name));
     }
 }

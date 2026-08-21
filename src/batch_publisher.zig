@@ -71,11 +71,6 @@ pub const BatchConfig = struct {
     max_backoff_ms: u64 = Config.Retry.publish_max_backoff_ms,
 };
 
-/// Maximum packed buffer size for column data (1MB = 2^20)
-/// Actual size used is determined by runtime config (event_data_buffer_log2)
-/// This is the compile-time maximum - runtime config must not exceed this
-const MAX_EVENT_DATA_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
-
 /// A single CDC event to be batched
 /// Zero-allocation design: all data stored in packed inline buffers
 /// What one event will occupy in a published batch.
@@ -136,31 +131,64 @@ pub const CDCEvent = struct {
     pub const max_columns = Config.Batch.max_columns;
 
     /// Column descriptor - "fat pointer" into packed data_buffer
-    pub const ColumnView = struct {
+    ///
+    /// `packed`, not the plain `struct` this used to be — and deliberately in *this*
+    /// field order and these *exact* widths (u8 + u24 + u8-backed-enum + u24 = 64 bits).
+    /// Every field lands on a byte boundary (bit offsets 0, 8, 32, 40, all multiples of
+    /// 8), so despite being packed there is nothing to shift-and-mask across: reading a
+    /// field compiles to a load plus one register shift, writing to a load, one
+    /// hardware bitfield-insert (`bfi` on ARM64), and a store — verified by
+    /// disassembly, not assumed. Reordering these fields or changing a width such that a
+    /// field no longer starts on a byte boundary loses that property silently — the
+    /// code keeps compiling, it just gets slower.
+    ///
+    /// 8 bytes against the previous 12 — a third off `RING_BUFFER_COUNT × max_columns`,
+    /// the dominant term in the bridge's memory (`Config.Batch.max_columns`'s doc
+    /// comment).
+    pub const ColumnView = packed struct {
         name_len: u8,
-        /// ⚠️ `u32`, not `u16`. This indexes into `data_buffer`, whose size is
-        /// `2^BASE_BUF` — 512 KB at BASE_BUF=19, far past a `u16`. It used to be `u16`,
-        /// which meant any row whose columns pushed the write offset past 65535 bytes
-        /// **panicked in Debug and was undefined behaviour in ReleaseFast**: the cast
-        /// would wrap and every later column would be read from the wrong offset, so the
-        /// event decoded as garbage with nothing reporting an error.
+        /// ⚠️ `u24`, not `u16`, not `u32`. This indexes into `data_buffer`, whose size
+        /// is `2^BASE_BUF`. It used to be `u16`, which meant any row whose columns
+        /// pushed the write offset past 65535 bytes **panicked in Debug and was
+        /// undefined behaviour in ReleaseFast**: the cast would wrap and every later
+        /// column would be read from the wrong offset, so the event decoded as garbage
+        /// with nothing reporting an error. Found by snapshotting a table of 256 KiB
+        /// rows at BASE_BUF=19, a configuration the sizing guards accept as valid.
         ///
-        /// Found by snapshotting a table of 256 KiB rows at BASE_BUF=19 — a configuration
-        /// the sizing guards accept as valid, which is what made it reachable.
-        name_offset: u32,
+        /// `u24`'s range (0..16,777,215) is not a smaller version of that same risk: it
+        /// is exactly `Buffers.absolute_max_event_data_buffer_log2` (24, i.e. 16 MiB) —
+        /// the hard ceiling `BASE_BUF`/`BASE_BUF_MAX` can never exceed. A name can never
+        /// start at the very last byte of the buffer with nothing before it *and* fill
+        /// it (a column name is never zero-length), so `name_offset` never needs to
+        /// reach `data_buffer.len` itself, only up to `data_buffer.len - 1` — which
+        /// tops out at exactly `u24`'s max at the absolute ceiling. `addColumn`'s
+        /// `@intCast` to this type is therefore expected to always succeed, not a place
+        /// that is trusted to silently truncate: if the bounds check above it is ever
+        /// wrong, this panics loudly (Debug/ReleaseSafe) instead of wrapping quietly,
+        /// which is the whole lesson `u16` taught here the first time.
+        name_offset: u24,
         value_tag: pgoutput.ValueTag,
-        value_len: u32,
+        /// Same width, same reasoning as `name_offset` — and the same invariant that
+        /// keeps it in range: `addColumn` always writes a column's name before its
+        /// value, and a name is never zero-length, so a value can never occupy the
+        /// buffer's very last byte *and* everything before it — `value_len` therefore
+        /// never needs to reach `data_buffer.len`, only `data_buffer.len - 1` at most.
+        value_len: u24,
 
         /// Where this column's value starts.
         ///
-        /// ⚠️ Derived, not stored. `addColumn` writes the name and then the value
-        /// immediately after it, so this is always `name_offset + name_len` — and storing
-        /// it cost 4 bytes in a struct that is replicated `RING_BUFFER_COUNT` times.
-        /// Widening `name_offset` to `u32` had pushed this struct from 12 to 16 bytes,
-        /// which at the default ring size is +134 MB of metadata for a field that can be
-        /// computed. Dropping it pays that back and keeps the correct offsets.
+        /// ⚠️ Derived, not stored — same reasoning as before packing existed: `addColumn`
+        /// writes the name and then the value immediately after it, so this is always
+        /// `name_offset + name_len`.
+        ///
+        /// ⚠️ Returns `u32`, wider than either operand. `name_offset` alone can reach
+        /// `data_buffer.len - 1`; adding `name_len` for a value that starts at the very
+        /// end of a full buffer can therefore reach `data_buffer.len` exactly — one past
+        /// `u24`'s own max at the absolute ceiling. Harmless (that value is never
+        /// dereferenced — it only occurs when `value_len` is 0, i.e. NULL/unchanged) but
+        /// it must not be narrowed back to `u24` to "match" the fields it is built from.
         pub inline fn valueOffset(self: ColumnView) u32 {
-            return self.name_offset + self.name_len;
+            return @as(u32, self.name_offset) + self.name_len;
         }
     };
 
@@ -240,7 +268,11 @@ pub const CDCEvent = struct {
             log.err("    Solution: Increase BASE_BUF environment variable (e.g., BASE_BUF=16 for 64KB)", .{});
             return error.BufferOverflow;
         }
-        const name_off: u32 = @intCast(self.data_len);
+        // Safe to narrow: the check above already proved data_len + name.len <=
+        // data_buffer.len <= 2^24 (Buffers.absolute_max_event_data_buffer_log2), and
+        // data_len itself is strictly less than data_buffer.len whenever name.len >= 1
+        // (always true — a column name is never empty) — so this never exceeds u24's max.
+        const name_off: u24 = @intCast(self.data_len);
         @memcpy(self.data_buffer[self.data_len..][0..name.len], name);
         self.data_len += name.len;
 
@@ -309,23 +341,37 @@ pub const CDCEvent = struct {
                 @memcpy(self.data_buffer[self.data_len..][0..8], bytes);
             },
             .text, .numeric, .jsonb, .array, .bytea => |v| {
-                val_len = @intCast(v.len);
-                if (self.data_len + val_len > self.data_buffer.len) {
+                // ⚠️ Bounds first, cast second — v.len comes from a decoded Postgres
+                // value (a jsonb/text column can be far larger than this event's
+                // buffer) and is checked here as a `usize` before it is ever narrowed
+                // to fit `value_len: u24`. Casting first, as this used to, would panic
+                // in Debug/ReleaseSafe or wrap in ReleaseFast for any value over 16 MiB
+                // — the same failure shape `name_offset`'s `u16` bug had, on a
+                // different field.
+                if (self.data_len + v.len > self.data_buffer.len) {
                     log.err("🔴 FATAL: Row size exceeds configured buffer capacity (string/blob value)!", .{});
-                    log.err("    Value size: {d} bytes, Total required: {d} bytes, Available: {d} bytes", .{ val_len, self.data_len + val_len, self.data_buffer.len });
+                    log.err("    Value size: {d} bytes, Total required: {d} bytes, Available: {d} bytes", .{ v.len, self.data_len + v.len, self.data_buffer.len });
                     return error.BufferOverflow;
                 }
+                // Safe now: v.len <= data_buffer.len - data_len <= data_buffer.len - 1
+                // (data_len >= 1 here — the name was already written), which tops out
+                // at u24's own max at the absolute ceiling.
+                val_len = @intCast(v.len);
                 @memcpy(self.data_buffer[self.data_len..][0..v.len], v);
             },
         }
         self.data_len += val_len;
 
-        // Store column descriptor
+        // Store column descriptor. val_len stays a `u32` local above so every branch's
+        // arithmetic reads naturally; this is the one place it narrows to the field's
+        // actual `u24` — safe because every branch above already proved its own value
+        // fits (the fixed-width branches trivially, the variable-length one by the
+        // bounds check just above it).
         self.columns[self.column_count] = .{
             .name_len = @intCast(name.len),
             .name_offset = name_off,
             .value_tag = value_tag,
-            .value_len = val_len,
+            .value_len = @intCast(val_len),
         };
         self.column_count += 1;
     }
@@ -358,7 +404,9 @@ pub const BatchPublisher = struct {
     events: []CDCEvent,
 
     // Data slab - backing storage for all event data_buffers
-    // Allocated separately to avoid wasting memory on MAX_EVENT_DATA_BUFFER_SIZE
+    // Allocated separately, sized to the resolved per-instance buffer size rather than
+    // the compiled-in ceiling, so a small BASE_BUF does not reserve the ceiling's worth
+    // of memory per slot.
     data_slab: []u8,
 
     // Lock-free queue of INDICES into events array (SPSC)
@@ -411,15 +459,22 @@ pub const BatchPublisher = struct {
         // bit shifting equivalent to td.math.pow(2, N)
         const buffer_limit = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
 
-        // Validate buffer limit doesn't exceed compile-time maximum
-        if (buffer_limit > MAX_EVENT_DATA_BUFFER_SIZE) {
-            log.err("🔴 FATAL: Configured buffer size ({d} bytes) exceeds compile-time maximum ({d} bytes)", .{
+        // Defensive: args.zig already clamps event_data_buffer_log2 to at most
+        // event_data_buffer_max_log2 before this ever runs, so this should be
+        // unreachable in the live path — but BatchPublisher.init has no other caller to
+        // enforce that, and checking against the *resolved* per-instance ceiling here
+        // (rather than a second, independently-hardcoded one) is what makes it
+        // impossible for this check and args.zig's clamp to disagree about what the
+        // limit for this instance actually is.
+        const max_event_data_buffer_size: usize = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_max_log2);
+        if (buffer_limit > max_event_data_buffer_size) {
+            log.err("🔴 FATAL: Configured buffer size ({d} bytes) exceeds this instance's ceiling ({d} bytes)", .{
                 buffer_limit,
-                MAX_EVENT_DATA_BUFFER_SIZE,
+                max_event_data_buffer_size,
             });
-            log.err("    BASE_BUF={d} is too large. Maximum allowed: {d}", .{
+            log.err("    BASE_BUF={d} is too large. Maximum allowed: {d} (raise with BASE_BUF_MAX)", .{
                 runtime_config.event_data_buffer_log2,
-                std.math.log2_int(usize, MAX_EVENT_DATA_BUFFER_SIZE),
+                runtime_config.event_data_buffer_max_log2,
             });
             return error.BufferSizeTooLarge;
         }
