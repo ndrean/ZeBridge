@@ -69,7 +69,7 @@ services:
         # OPEN_TENANT is not a credential but fails the same way: empty renders `cdc..>`,
         # an illegal subject the server refuses at startup — with every login failing
         # for a reason that reads like a credential problem.
-        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD OPEN_TENANT; do
+        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD NATS_JOHN_PASSWORD OPEN_TENANT; do
           eval "val=\$$$$v"
           if [ -z "$$val" ]; then
             echo "✗ $$v is unset — refusing to generate a config with an empty value" >&2
@@ -82,6 +82,7 @@ services:
         sed -e "s|\$${NATS_BRIDGE_NKEY_PUB}|$${NATS_BRIDGE_NKEY_PUB}|g" \
             -e "s|\$${NATS_ALICE_PASSWORD}|$${NATS_ALICE_PASSWORD}|g" \
             -e "s|\$${NATS_BOB_PASSWORD}|$${NATS_BOB_PASSWORD}|g" \
+            -e "s|\$${NATS_JOHN_PASSWORD}|$${NATS_JOHN_PASSWORD}|g" \
             -e "s|\$${OPEN_TENANT}|$${OPEN_TENANT}|g" \
             /nats-server.conf.template > /config/nats-server.conf
         # ⚠️ Every $${...} must be gone. An unsubstituted one is not a config error — NATS
@@ -246,6 +247,7 @@ services:
         MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' /topology.json)
         SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
         SNAPSHOT_KV=$(jq -r '.kv.snapshots' /topology.json)
+        TENANTS_KV=$(jq -r '.kv.tenants' /topology.json)
 
         # ── CDC is SPLIT PER TENANT, and that is a security boundary, not tidiness ──
         #
@@ -276,7 +278,7 @@ services:
         TENANT_COUNT=$(jq -r '(.tenants // []) | length' /topology.json)
         if [ "$$TENANT_COUNT" = "0" ]; then
           echo "No tenants declared in topology.json — keeping the single wide stream $$CDC_STREAM"
-          nats stream add $$CDC_STREAM --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+          nats stream add $$CDC_STREAM --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=8d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
         else
 
         # ⚠️ The legacy wide stream must go first. Its `cdc.>` overlaps every per-tenant
@@ -290,7 +292,7 @@ services:
         for T in $(jq -r '.tenants[]' /topology.json); do
           UPPER=$(echo "$$T" | tr '[:lower:]' '[:upper:]')
           echo "Creating per-tenant CDC stream: $$TENANT_PREFIX$$UPPER (subject: $$CDC_PREFIX.$$T.>)"
-          nats stream add $$TENANT_PREFIX$$UPPER --subjects="$$CDC_PREFIX.$$T.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+          nats stream add $$TENANT_PREFIX$$UPPER --subjects="$$CDC_PREFIX.$$T.>" --storage=file --retention=limits --max-age=8d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
         done
 
         # Tables with no tenant column publish on the bare `cdc.<table>.<op>` subject, so
@@ -327,14 +329,23 @@ services:
           nats stream edit $$PUBLIC_STREAM --subjects="$$PUBLIC_SUBJECTS" -f || true
         else
           echo "Creating public CDC stream: $$PUBLIC_STREAM (subjects: $$PUBLIC_SUBJECTS)"
-          nats stream add $$PUBLIC_STREAM --subjects="$$PUBLIC_SUBJECTS" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
+          nats stream add $$PUBLIC_STREAM --subjects="$$PUBLIC_SUBJECTS" --storage=file --retention=limits --max-age=8d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
         fi
         fi
 
         echo "Creating NATS JetStream stream: $$INIT_STREAM (subject: $$INIT_PREFIX.>)"
         nats stream add $$INIT_STREAM --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
 
-        SNAP_RET=$${SNAP_RET_SECONDS:-600}
+        # Default: INIT's own 7-day retention minus a 30-minute safety margin, not a
+        # short anti-thundering-herd debounce. A snapshot already in INIT is good for
+        # the whole 7 days — the KV descriptor's "no TTL" is what lets a client reuse
+        # it, and a client should always check that before requesting a new one. So
+        # SNAP_RET's real job is to *forbid* a redundant re-dump of a table that
+        # already has a perfectly usable snapshot, and only let a fresh request
+        # through once the existing one is close enough to expiring that a client
+        # legitimately needs a new one. Override for local dev, where waiting days to
+        # exercise the "existing snapshot has expired" path isn't practical.
+        SNAP_RET=$${SNAP_RET_SECONDS:-603000}
         echo "Creating NATS JetStream stream: $$REQUESTS_STREAM (subject: $$REQUESTS_PREFIX.>)"
         nats stream add $$REQUESTS_STREAM --subjects="$$REQUESTS_PREFIX.>" --storage=file --retention=limits --max-msgs-per-subject=1 --discard=new --discard-per-subject --max-age=$${SNAP_RET}s --replicas=1 --defaults || true
 
@@ -363,6 +374,19 @@ services:
         # describes are still in INIT.
         echo "Creating NATS KV bucket: $$SNAPSHOT_KV"
         nats kv add $$SNAPSHOT_KV --history=1 --replicas=1 || true
+
+        # PROTOCOL.md "The Connection Flow" §Step 0: `$KV.tenants.<principal>` → tenant,
+        # so a client holding only a principal ID can learn its own tenant without
+        # guessing or a build-time constant. --history=1: only the current mapping is
+        # ever read, same reasoning as SNAPSHOT_KV above.
+        #
+        # Not yet fed by a PG trigger on `zebridge_user_tenants` (NOTES.md §1.12 part 3)
+        # — that lands with the rest of the Zig changes. Until then, seed it by hand to
+        # exercise the NATS side alone, e.g.:
+        #   nats kv put $$TENANTS_KV alice acme
+        #   nats kv put $$TENANTS_KV bob   globex
+        echo "Creating NATS KV bucket: $$TENANTS_KV"
+        nats kv add $$TENANTS_KV --history=1 --replicas=1 || true
 
         echo 'NATS initialization complete!'
         exit 0

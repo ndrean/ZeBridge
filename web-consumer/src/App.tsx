@@ -43,14 +43,19 @@ const PASSWORD = (import.meta.env.VITE_PASSWORD as string | undefined) ?? 's3cre
 /// ⚠️ **RLS does not bound reads.** It bounds what a principal may write and what a
 /// snapshot may select; what stops one tenant *reading* another's rows is this subject
 /// plus the matching NATS permission. A client granted `cdc.>` sees every tenant however
-/// perfect the policies are — which is why this is set alongside the principal, not
-/// derived from it.
+/// perfect the policies are — which is why this is asked of NATS, not guessed.
 ///
-/// Unset means the deployment is not tenant-routed and CDC arrives on `cdc.<table>.<op>`.
+/// Resolved live in `resolveTenant()` from `$KV.tenants.<principal>`
+/// (PROTOCOL.md "The Connection Flow", Step 0) rather than a build-time constant.
+/// A build-time `VITE_TENANT` used to sit here — the failure mode NOTES.md §1.12 part 3
+/// describes: nothing catches `VITE_TENANT=globex` on alice's dev server, and she
+/// connects, authenticates, and looks like an idle database. The KV bucket is asked
+/// fresh on every connect instead, so a reassignment in `zebridge_user_tenants` takes
+/// effect on the next connect with no client rebuild.
 ///
-///     VITE_PRINCIPAL=alice VITE_TENANT=acme   pnpm dev --port 5173
-///     VITE_PRINCIPAL=bob   VITE_TENANT=globex pnpm dev --port 5174
-const TENANT = (import.meta.env.VITE_TENANT as string | undefined) ?? '';
+/// Empty means either an untenanted deployment (`cdc_streams` absent from
+/// topology.json) or a principal with no tenant-scoped tables — public-only reads.
+let TENANT = '';
 
 /// ⚠️ There is deliberately no PUBLIC_TABLES list here any more. Tables with no tenant
 /// column are carried by the CDC_PUBLIC *stream*, whose subject list is declared in
@@ -306,7 +311,8 @@ let globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, se
 /// is not a permission (see nats-server.conf.template).
 const cdcStreams = (): string[] => {
   const cfg = (topology as any).cdc_streams;
-  if (!TENANT || !cfg) return [topology.streams.cdc];      // untenanted deployment
+  if (!cfg) return [topology.streams.cdc];                  // untenanted deployment
+  if (!TENANT) return [cfg.public];                          // public-only reads
   return [`${cfg.tenant_prefix}${TENANT.toUpperCase()}`, cfg.public];
 };
 
@@ -342,9 +348,10 @@ export default function App() {
   /// it cannot be fetched directly under COEP).
   const [health, setHealth] = createSignal<'up' | 'down' | 'unknown'>('unknown');
 
-  /// The tenant this client can see. ⚠️ Not configured anywhere client-side and not in the
-  /// schema — it is *discovered*: RLS only ever showed us rows for our own tenant, so
-  /// whatever `tenant_id` is in the local replica is, by construction, ours.
+  /// The tenant this client reads, mirroring `TENANT` for the UI. Set once, by
+  /// `resolveTenant()` — not inferred from local rows, which would need a row to
+  /// already have arrived and so could never help decide what to subscribe to in the
+  /// first place.
   const [tenant, setTenant] = createSignal<string>('—');
 
   /// Per-table row counts, and the last CDC verb, for the flash.
@@ -378,12 +385,6 @@ export default function App() {
       } catch { /* table not ready yet */ }
     }
     setCounts(next);
-
-    // The tenant, read back out of whatever RLS let us have.
-    try {
-      const t = await sql(`SELECT tenant_id FROM test_types WHERE tenant_id IS NOT NULL LIMIT 1`);
-      if (t[0]?.tenant_id) setTenant(t[0].tenant_id);
-    } catch { /* table may not exist in this deployment */ }
   };
 
   /// ⚠️ Debounced, and triggered by CDC — **not** by the click that sent a mutation.
@@ -576,6 +577,47 @@ export default function App() {
     }
   };
 
+  /// PROTOCOL.md "The Connection Flow", Step 0: ask NATS who this principal's tenant
+  /// is, rather than trusting a build-time constant. `$KV.tenants.<principal>` holds a
+  /// single value, kept current by a trigger on `zebridge_user_tenants` — resolved
+  /// fresh here on every connect, never cached across page loads or reconnects, which
+  /// is what lets a tenant reassignment take effect without rebuilding this client.
+  ///
+  /// No entry is a normal outcome, not an error: a public-only principal, or an
+  /// untenanted deployment. `TENANT` stays empty and `cdcStreams()` falls back
+  /// accordingly.
+  const resolveTenant = async () => {
+    if (!nc) return;
+    try {
+      const kvm = new Kvm(nc);
+      // ⚠️ `allow_direct` must be passed explicitly. `Kvm.open()` binds to an existing
+      // bucket without ever asking the server whether its stream actually has
+      // `allow_direct` set — `Bucket.bind()` just trusts this option, defaulting to
+      // `false` when omitted. Omitting it here sent `get()` down the non-direct
+      // `$JS.API.STREAM.MSG.GET.KV_tenants` path, selecting the key from the request
+      // BODY — which is exactly the path `nats-server.conf.template` deliberately does
+      // NOT grant, because it cannot be scoped per key. Measured: a Permissions
+      // Violation on that exact subject, even though the stream itself already has
+      // `allow_direct: true` (confirmed via `nats stream info KV_tenants`).
+      const kv = await kvm.open(topology.kv.tenants, { allow_direct: true });
+      const entry = await kv.get(PRINCIPAL);
+      if (entry) {
+        // A bare tenant name, not a JSON/msgpack payload like the schema and snapshot
+        // buckets — `decode()` is tried first only so a future bridge-side encoding
+        // change is not a silent break here too.
+        let val: string;
+        try { val = decode(entry.value) as string; } catch { val = td.decode(entry.value); }
+        TENANT = val;
+        setTenant(TENANT);
+        appendLog('SYS', `Resolved tenant for '${PRINCIPAL}': ${TENANT}`, 'INFO');
+      } else {
+        appendLog('SYS', `No tenant mapping for '${PRINCIPAL}' — public-only reads`, 'INFO');
+      }
+    } catch (err) {
+      appendLog('SYS', `Tenant resolution failed: ${err}`, 'ERROR');
+    }
+  };
+
   const initNats = async () => {
     console.log('App.tsx: initNats called!');
     await initSyncState();
@@ -602,6 +644,7 @@ export default function App() {
       appendLog('SYS', `Connected to NATS over WebSockets as '${PRINCIPAL}'`);
       await watchSchemas();
       await watchVerdicts();
+      await resolveTenant();
       await subscribeStreams();
       reach('cdc');
 
@@ -1172,59 +1215,83 @@ export default function App() {
               reach('snapshot');
               
               const pullPromise = (async () => {
-                await sql(`DELETE FROM ${table}`);
-                
-                const ci = await jsm.consumers.add(topology.streams.init, {
-                  filter_subject: `init.snap.${table}.${desc.snapshot_id}.>`,
-                  deliver_policy: DeliverPolicy.All,
-                });
-                const replayConsumer = await js.consumers.get(topology.streams.init, ci.name);
-                
-                // Use fetch to reliably pull all chunks currently in the stream for this snapshot
-                let done = false;
-                let snapshotColumns: string[] | null = null;
+                // ⚠️ The whole body is wrapped, not just the `fetch()` calls below.
+                // `fetch()`'s own `.catch()` only guards *starting* a pull — the
+                // `for await (const msg of batch)` iteration is a separate async
+                // iterator that can itself throw mid-stream (`JetStreamError:
+                // heartbeats missed`) if the pull's internal heartbeat is missed even
+                // once, which a short `expires` window makes more likely on the very
+                // first pull against a freshly-created consumer. Uncaught, that throw
+                // used to propagate out of this IIFE, reject the whole
+                // `Promise.all(snapshotPromises)` below, and abandon every *other*
+                // table's replay too — not just the one that hit the hiccup.
+                try {
+                  await sql(`DELETE FROM ${table}`);
 
-                while (!done) {
-                  const batch = await replayConsumer.fetch({ max_messages: 100, expires: 1000 }).catch(() => null);
-                  if (!batch) break;
-                  
-                  let receivedCount = 0;
-                  for await (const msg of batch) {
-                    receivedCount++;
-                    let chunkDecoded: any;
-                    try { chunkDecoded = decode(msg.data); } catch { chunkDecoded = JSON.parse(td.decode(msg.data)); }
-                    
-                    const state = syncedTables.get(table);
+                  const ci = await jsm.consumers.add(topology.streams.init, {
+                    filter_subject: `init.snap.${table}.${desc.snapshot_id}.>`,
+                    deliver_policy: DeliverPolicy.All,
+                  });
+                  const replayConsumer = await js.consumers.get(topology.streams.init, ci.name);
 
-                    if (chunkDecoded && typeof chunkDecoded === 'object' && Array.isArray(chunkDecoded.schema)) {
-                      snapshotColumns = chunkDecoded.schema;
-                      appendLog('SYS', `Received snapshot schema for ${table}: ${snapshotColumns!.join(', ')}`, 'INFO');
-                    } else if (state && Array.isArray(chunkDecoded)) {
-                      // Array of row arrays
-                      const cols = snapshotColumns || state.columns;
-                      for (const rowVals of chunkDecoded) {
-                        const rowObj: any = {};
-                        cols.forEach((col: string, i: number) => { rowObj[col] = rowVals[i]; });
-                        await applyEvent(table, { table, operation: 'INSERT', data: rowObj, lsn: desc.lsn });
+                  // Use fetch to reliably pull all chunks currently in the stream for this snapshot
+                  let done = false;
+                  let snapshotColumns: string[] | null = null;
+
+                  while (!done) {
+                    // ⚠️ 5s, not 1s. A 1s window left too little margin for the first
+                    // pull's heartbeat on a consumer that had just been created —
+                    // measured: `JetStreamError: heartbeats missed` on an otherwise
+                    // healthy connection, purely from the timing being tight.
+                    const batch = await replayConsumer.fetch({ max_messages: 100, expires: 5000 }).catch(() => null);
+                    if (!batch) break;
+
+                    let receivedCount = 0;
+                    for await (const msg of batch) {
+                      receivedCount++;
+                      let chunkDecoded: any;
+                      try { chunkDecoded = decode(msg.data); } catch { chunkDecoded = JSON.parse(td.decode(msg.data)); }
+
+                      const state = syncedTables.get(table);
+
+                      if (chunkDecoded && typeof chunkDecoded === 'object' && Array.isArray(chunkDecoded.schema)) {
+                        snapshotColumns = chunkDecoded.schema;
+                        appendLog('SYS', `Received snapshot schema for ${table}: ${snapshotColumns!.join(', ')}`, 'INFO');
+                      } else if (state && Array.isArray(chunkDecoded)) {
+                        // Array of row arrays
+                        const cols = snapshotColumns || state.columns;
+                        for (const rowVals of chunkDecoded) {
+                          const rowObj: any = {};
+                          cols.forEach((col: string, i: number) => { rowObj[col] = rowVals[i]; });
+                          await applyEvent(table, { table, operation: 'INSERT', data: rowObj, lsn: desc.lsn });
+                        }
+                      } else if (state && chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
+                        // Legacy JSON format fallback
+                        for (const row of chunkDecoded.data) {
+                          await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: desc.lsn });
+                        }
                       }
-                    } else if (state && chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
-                      // Legacy JSON format fallback
-                      for (const row of chunkDecoded.data) {
-                        await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: desc.lsn });
-                      }
+                      msg.ack();
                     }
-                    msg.ack();
+
+                    // If we didn't receive any messages in this fetch window, the stream is exhausted
+                    if (receivedCount === 0) {
+                      done = true;
+                    }
                   }
-                  
-                  // If we didn't receive any messages in this fetch window, the stream is exhausted
-                  if (receivedCount === 0) {
-                    done = true;
-                  }
+
+                  const state = syncedTables.get(table);
+                  if (state) state.lsn = desc.lsn;
+                  appendLog('SYS', `Replay finished for ${table} (Snapshot ID: ${desc.snapshot_id})`, 'INFO');
+                } catch (err) {
+                  // Same "unseeded is not the same as synced" rule as the no-descriptor
+                  // case above: a table that failed mid-replay must not go on receiving
+                  // CDC against a partial or absent local copy.
+                  syncedTables.delete(table);
+                  refreshTableNames();
+                  failedTables.add(table);
+                  appendLog('SYS', `Replay of ${table} failed: ${err} — NOT following CDC for it, the local copy would silently diverge.`, 'ERROR');
                 }
-                
-                const state = syncedTables.get(table);
-                if (state) state.lsn = desc.lsn;
-                appendLog('SYS', `Replay finished for ${table} (Snapshot ID: ${desc.snapshot_id})`, 'INFO');
               })();
               snapshotPromises.push(pullPromise);
             }
@@ -1392,12 +1459,10 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
         some_text: `random ${Math.floor(Math.random() * 10_000)}`,
         age: Math.floor(Math.random() * 90),
         is_true: Math.random() > 0.5,
-        // ⚠️ Falls back to the **configured** tenant. `tenant()` is discovered by reading
-        // it back out of the local replica, which is empty on a cold start — so without
-        // this the very first write of a fresh client sends `tenant_id: undefined` and is
-        // refused by RLS, which reads as "writes are broken" on first encounter rather
-        // than "there was nothing to discover yet".
-        tenant_id: tenant() !== '—' ? tenant() : (TENANT || undefined),
+        // `TENANT` is resolved in `resolveTenant()` before this client subscribes to
+        // anything (PROTOCOL.md Step 0), so it is already known by the time a write can
+        // happen — unlike the old row-inferred value, there is no cold-start gap here.
+        tenant_id: TENANT || undefined,
         updated_at: version,
         inserted_at: version,
       },
@@ -1689,8 +1754,7 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
             </span>
             <span id="sync-state">
               principal <strong>{PRINCIPAL}</strong> · client <strong>{CLIENT_ID}</strong>
-              {' '}· tenant <strong>{TENANT || tenant()}</strong>
-              {TENANT ? '' : ' (from data)'}
+              {' '}· tenant <strong>{tenant()}</strong>
               {' '}· held {pendingCount()}
             </span>
           </div>

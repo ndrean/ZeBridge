@@ -17,13 +17,14 @@ defmodule Emitter.Scenario do
 
   alias Emitter.Producer.Repo
 
+  # @repo Emitter.Producer.Repo
   @migrations_path Path.join(["priv", "repo", "migrations"])
 
   @doc "Step 1 — a keyless table is refused before it ever replicates."
   def step1, do: migrate(20_260_810_140_000, Emitter.PgProducer.Repo.SetupNoPkTable)
 
   @doc "Step 2 — well-formed tables (`users`, `test_types`) replicate normally."
-  def step2, do: migrate(20_260_810_120_000, Emitter.PgProducer.Repo.SetupCdcTables)
+  def step2, do: migrate(2026_08_10_12_0000, Emitter.PgProducer.Repo.SetupCdcTables)
 
   def step21, do: migrate(20_260_810_130_000, Emitter.PgProducer.Repo.AddTenantLastWriter)
 

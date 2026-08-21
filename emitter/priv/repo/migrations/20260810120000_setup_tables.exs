@@ -1,7 +1,7 @@
 defmodule Emitter.PgProducer.Repo.SetupCdcTables do
   use Ecto.Migration
 
-  @publication_name System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub")
+  @publication_name System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub") |> dbg()
   # The two fixtures are a deliberate contrast, and every scenario reads better for it:
   #
   #   users      — bigserial PK, no tombstone, no write grant. **Outbound only.** A client
@@ -24,8 +24,21 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
   # The difference is visible in the published schema descriptor: `pk` is `id`/INTEGER
   # versus `uid`/TEXT, and `tombstone_column` is null versus `deleted_at`.
   @cdc_tables ["users", "test_types"]
-  @bridge_user System.get_env("POSTGRES_BRIDGE_USER", "bridge_reader")
-  @bridge_writer System.get_env("POSTGRES_BRIDGE_WRITER", "bridge_writer")
+  # `GRANT ... TO` needs a bare role name, not a connection string — interpolating
+  # `DATABASE_URL` whole produced a SQL syntax error (`GRANT SELECT ON TABLE
+  # public.users TO postgres://bridge_reader:...@127.0.0.1:5432/postgres;`). The
+  # role is the URL's userinfo, up to the first `:` — parsed out here rather than
+  # read from a second env var, since `DATABASE_URL` is the one this migration is
+  # actually launched with.
+  @bridge_user (
+                 System.get_env("DATABASE_URL")
+                 |> URI.parse()
+                 |> Map.fetch!(:userinfo)
+                 |> String.split(":", parts: 2)
+                 |> List.first()
+               )
+               |> dbg()
+  @bridge_writer System.get_env("DATABASE_WRITER_URL")
 
   # Tables that accept writes from the edge. Reading needs only the SELECT granted to
   # every CDC table below; writing needs an explicit grant, because `bridge_writer` is
@@ -40,13 +53,13 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
   @writable_tables ["test_types"]
 
   def up do
-    create table(:users) do
+    create_if_not_exists table(:users) do
       add(:name, :string, null: false)
       add(:email, :string)
       timestamps(type: :timestamptz)
     end
 
-    create table(:test_types, primary_key: false) do
+    create_if_not_exists table(:test_types, primary_key: false) do
       add(:uid, :uuid, primary_key: true, default: fragment("gen_random_uuid()"))
       add(:age, :integer)
       add(:temperature, :float)
@@ -70,6 +83,8 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
     end
 
     flush()
+
+    @cdc_tables |> dbg()
 
     # Set REPLICA IDENTITY DEFAULT and attach to Publication
     for table <- @cdc_tables do

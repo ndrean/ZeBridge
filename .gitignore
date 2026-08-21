@@ -51,3 +51,9 @@ skills-lock.json
 # Scenario harness venv
 scripts/scenarios/.venv/
 scripts/scenarios/__pycache__/
+
+# Native (no-Docker) stack runtime artifacts — see scripts/native/
+# (postgres-data/ and nats-data/ are already covered above)
+scripts/native/*.log
+scripts/native/*.pid
+scripts/native/seed.txt

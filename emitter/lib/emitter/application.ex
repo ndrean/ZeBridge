@@ -18,20 +18,20 @@ defmodule Emitter.Application do
         # Ecto.Migrator.run(Emitter.Producer.Repo, path, :up, all: true) |> dbg()
 
         # Notify the Zig bridge via NATS
-        {:ok, _gnat} =
-          Gnat.start_link(
-            %{
-              host: System.get_env("NATS_HOST") || "127.0.0.1",
-              port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
-              jwt: System.get_env("NATS_JWT"),
-              nkey_seed: System.get_env("NATS_NKEY_SEED")
-            }
-            |> Enum.reject(fn {_, v} -> is_nil(v) end)
-            |> Map.new()
-          )
+        # {:ok, _gnat} =
+        #   Gnat.start_link(
+        #     %{
+        #       host: System.get_env("NATS_HOST") || "127.0.0.1",
+        #       port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
+        #       jwt: System.get_env("NATS_JWT"),
+        #       nkey_seed: System.get_env("NATS_NKEY_SEED")
+        #     }
+        #     |> Enum.reject(fn {_, v} -> is_nil(v) end)
+        #     |> Map.new()
+        #   )
 
         # Gnat.pub(gnat, "bridge.control.reload_schema", "{}")
-        IO.puts("✅ Migrations executed and Zig bridge should be notified on boot")
+        # IO.puts("✅ Migrations executed and Zig bridge should be notified on boot")
 
         {:ok, pid}
 

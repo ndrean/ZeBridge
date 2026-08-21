@@ -248,27 +248,40 @@ pub const Batch = struct {
 
     pub const max_payload_bytes = 256 * 1024; // 256KB
 
-    /// Columns one CDC event can carry.
+    /// Columns one CDC event can carry — now a **per-instance runtime value**, not a
+    /// compile constant. `CDCEvent.columns` is a slice into a separately-allocated
+    /// "columns slab" (mirroring `data_buffer`/`data_slab`), sized once at boot for
+    /// `RuntimeConfig.max_columns`, so the cost is `RING_BUFFER_COUNT × max_columns ×
+    /// 8 bytes` — paid for what the actual monitored tables need, not a fixed guess.
     ///
-    /// ⚠️ **This is the dominant term in the bridge's memory**, and not obviously so.
-    /// Every event in the ring carries a fixed `[max_columns]ColumnView` array — the same
-    /// size whether the table has three columns or all of them — so the cost is
-    /// `RING_BUFFER_COUNT × max_columns × 12 bytes`, paid at startup, regardless of the
-    /// tables actually replicated.
+    /// `max_columns` itself is resolved at boot (see `bridge.zig`'s `resolveMaxColumns`):
+    /// `MAX_COLUMNS` if set, otherwise auto-detected as the widest monitored table's
+    /// live column count, rounded up by `column_headroom_rounding` for migration
+    /// headroom. It is a **budget, not a format limit** — PostgreSQL allows 1600
+    /// columns; a table past this one is refused with `TooManyColumns` — loudly, with
+    /// its events dropped and its clients told a reason — rather than truncated.
     ///
-    /// At 512 (where this sat after a refactor bumped it from 64 without costing it) a
-    /// ring of 262,144 events spent **1.6 GB** on column descriptors against 512 MB of
-    /// actual row data. At 128 the same ring spends 400 MB.
-    ///
-    /// ⚠️ It is a **budget, not a format limit**. PostgreSQL allows 1600 columns; a table
-    /// past this one is refused with `TooManyColumns` — loudly, with its events dropped
-    /// and its clients told a reason — rather than truncated. Raise it if you replicate
-    /// genuinely wide tables, and re-read the startup line reporting the ring's size:
-    /// the sizing guard counts this term, so it will refuse a combination that does not
-    /// fit rather than let the process be OOM-killed later.
-    ///
-    /// 128 because a table that wide is already unusual, and the widest here is 14.
-    pub const max_columns = 128;
+    /// These four constants only bound that resolution:
+    /// `MAX_COLUMNS`'s floor. A table narrower than this is implausible enough that
+    /// going lower is almost certainly a units mistake, not a real deployment —
+    /// mirrors `Buffers.min_event_data_buffer_log2`'s reasoning.
+    pub const min_columns: u16 = 8;
+
+    /// The fallback when auto-detection cannot run (no PG connection at resolution
+    /// time) and `MAX_COLUMNS` is unset. 128 because a table that wide is already
+    /// unusual, and the widest table in this repo's own fixtures is 14.
+    pub const default_max_columns: u16 = 128;
+
+    /// Hard outer bound — PostgreSQL's own column ceiling (`MaxHeapAttributeNumber`).
+    /// Nothing, auto-detected or `MAX_COLUMNS`-overridden, can ask for more than this;
+    /// a typo (`MAX_COLUMNS=99999`) clamps here rather than sizing a slab for it.
+    pub const absolute_max_columns: u16 = 1600;
+
+    /// Auto-detection rounds the widest monitored table's column count UP to the next
+    /// multiple of this, so a routine `ALTER TABLE ADD COLUMN` has headroom to land
+    /// without immediately hitting `TooManyColumns` and forcing a bridge reboot to
+    /// re-detect. Reasonable slack without meaningfully inflating the slab.
+    pub const column_headroom_rounding: u16 = 8;
     // NOTE: the ring buffer size lives in Buffers.default_ring_buffer_count, which is
     // what RuntimeConfig actually reads. A `Batch.ring_buffer_size` used to be
     // declared here with the sizing rationale attached, but nothing referenced it —
@@ -681,6 +694,19 @@ pub const RuntimeConfig = struct {
     /// independently-hardcoded ceiling that could disagree with it.
     event_data_buffer_max_log2: u6,
 
+    /// `MAX_COLUMNS`, as parsed by args.zig — `null` means "not set, auto-detect at
+    /// boot from the publication's actual tables" (see `bridge.zig`'s
+    /// `resolveMaxColumns`, which needs a PG connection args.zig doesn't have).
+    /// Non-null is an explicit operator override, already clamped to
+    /// `[Batch.min_columns, Batch.absolute_max_columns]`.
+    ///
+    /// This field is never mutated after `parseArgs` — the value `BatchPublisher.init`
+    /// actually allocates for is `main`'s locally-resolved `resolved_max_columns`,
+    /// threaded through as its own parameter rather than written back here, so a
+    /// reader never has to wonder whether this field means "what was configured" or
+    /// "what got decided."
+    max_columns_override: ?u16,
+
     // Encoding format
     encoding_format: encoder.Format,
 
@@ -712,6 +738,7 @@ pub const RuntimeConfig = struct {
             .publish_max_backoff_ms = Retry.publish_max_backoff_ms,
             .event_data_buffer_log2 = Buffers.default_event_data_buffer_log2,
             .event_data_buffer_max_log2 = Buffers.default_max_event_data_buffer_log2,
+            .max_columns_override = null,
             .encoding_format = .msgpack,
         };
     }

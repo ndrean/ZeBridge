@@ -5,7 +5,6 @@
 interface ImportMetaEnv {
   readonly VITE_PRINCIPAL?: string;
   readonly VITE_PASSWORD?: string;
-  readonly VITE_TENANT?: string;
 }
 
 interface ImportMeta {

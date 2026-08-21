@@ -37,6 +37,9 @@ const usage =
     \\                        deployment that has also raised NATS's own max_payload.
     \\                        Per instance, like BASE_BUF itself — no rebuild needed.
     \\  RING_BUFFER_COUNT     Ring buffer slots (1024-1048576)
+    \\  MAX_COLUMNS           Columns one CDC event can carry (8-1600). Unset (default):
+    \\                        auto-detected at boot from the widest monitored table,
+    \\                        rounded up for migration headroom. Set only to override.
     \\  PUBLISH_MAX_RETRIES   Publish retries before fatal (default: 5)
     \\  PUBLISH_BACKOFF_MS    First publish backoff (default: 100)
     \\  PUBLISH_MAX_BACKOFF_MS  Publish backoff ceiling (default: 5000)
@@ -320,6 +323,32 @@ pub const Args = struct {
             config.Buffers.min_ring_buffer_count,
             config.Buffers.max_ring_buffer_count,
         );
+
+        // MAX_COLUMNS: explicit override for the per-instance column-descriptor slab
+        // width. Deliberately NOT `envUint` — that helper's "unset → default" policy is
+        // wrong here, because unset means "auto-detect at boot from the publication's
+        // actual tables" (bridge.zig's `resolveMaxColumns`, which needs a PG connection
+        // this function doesn't have), not "fall back to Batch.default_max_columns".
+        // Substituting the default here would silently skip auto-detection for every
+        // deployment that never touched this variable, which is the common case.
+        runtime_config.max_columns_override = if (init.minimal.environ.getPosix("MAX_COLUMNS")) |raw| blk: {
+            const parsed = std.fmt.parseInt(u16, raw, 10) catch |err| {
+                log.warn("Invalid MAX_COLUMNS value '{s}' ({any}), ignoring — will auto-detect at boot", .{ raw, err });
+                break :blk null;
+            };
+            const clamped = std.math.clamp(parsed, config.Batch.min_columns, config.Batch.absolute_max_columns);
+            if (clamped != parsed) {
+                log.warn("MAX_COLUMNS={d} out of range ({d}-{d}), clamped to {d}", .{
+                    parsed,
+                    config.Batch.min_columns,
+                    config.Batch.absolute_max_columns,
+                    clamped,
+                });
+            } else {
+                log.info("MAX_COLUMNS={d} (explicit override — auto-detection skipped)", .{clamped});
+            }
+            break :blk clamped;
+        } else null;
 
         // Publish retry budget. Defaults live in config.zig (Config.Retry); these
         // env vars exist so the budget can be tuned per deployment without a rebuild.

@@ -119,16 +119,17 @@ pub const CDCEvent = struct {
     data_len: usize = 0,
     // Note: data_buffer.len is the limit (no separate field needed)
 
-    // Fixed array of column descriptors (indices into data_buffer)
-    columns: [max_columns]ColumnView = undefined,
-    /// ⚠️ `u16`, not `u8`. The array holds 512 and the guard in `addColumn` tests against
-    /// 512, but a `u8` counter panics on increment at 255 — so the guard could never fire
-    /// and a wide table crashed before reaching the error it was written to return.
+    // Column descriptors (indices into data_buffer). A slice into a separately-
+    // allocated "columns slab" (mirroring data_buffer/data_slab), sized once at boot
+    // for this instance's resolved `max_columns` — see `config.Batch`'s doc comment.
+    // The slice's own `.len` IS the per-event ceiling; there is no separate constant,
+    // the same reason `data_buffer.len` needs no companion "buffer_limit" field.
+    columns: []ColumnView = &[_]ColumnView{},
+    /// ⚠️ `u16`, not `u8`. `addColumn`'s guard tests against `columns.len`, which can
+    /// be in the hundreds, but a `u8` counter panics on increment at 255 — so the guard
+    /// could never fire and a wide table crashed before reaching the error it was
+    /// written to return.
     column_count: u16 = 0,
-
-    /// Columns one event can carry — see `config.Batch.max_columns`, which explains why
-    /// this is the dominant term in the bridge's startup memory.
-    pub const max_columns = Config.Batch.max_columns;
 
     /// Column descriptor - "fat pointer" into packed data_buffer
     ///
@@ -143,8 +144,7 @@ pub const CDCEvent = struct {
     /// code keeps compiling, it just gets slower.
     ///
     /// 8 bytes against the previous 12 — a third off `RING_BUFFER_COUNT × max_columns`,
-    /// the dominant term in the bridge's memory (`Config.Batch.max_columns`'s doc
-    /// comment).
+    /// the dominant term in the bridge's memory (`Config.Batch`'s doc comment).
     pub const ColumnView = packed struct {
         name_len: u8,
         /// ⚠️ `u24`, not `u16`, not `u32`. This indexes into `data_buffer`, whose size
@@ -251,7 +251,7 @@ pub const CDCEvent = struct {
     /// Add column to packed buffer (zero-allocation)
     /// Packs column name and value contiguously into data_buffer
     pub fn addColumn(self: *CDCEvent, name: []const u8, value: pgoutput.DecodedValue) !void {
-        if (self.column_count >= max_columns) {
+        if (self.column_count >= self.columns.len) {
             return error.TooManyColumns;
         }
 
@@ -409,6 +409,11 @@ pub const BatchPublisher = struct {
     // of memory per slot.
     data_slab: []u8,
 
+    // Columns slab - backing storage for all events' column-descriptor slices.
+    // Same rationale as data_slab: sized to this instance's resolved max_columns
+    // (auto-detected or MAX_COLUMNS), not a compiled-in ceiling.
+    columns_slab: []CDCEvent.ColumnView,
+
     // Lock-free queue of INDICES into events array (SPSC)
     // Producer: Main thread (via EventProcessor) - pushes event slot indices
     // Consumer: Flush thread - pops indices to read events
@@ -430,6 +435,30 @@ pub const BatchPublisher = struct {
     flush_thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
 
+    // ⚠️ A self-pipe, not a sleep timer. `flushLoop` used to idle-wait with a flat
+    // `sleep(1ms)` — the exact bug class the WAL receive loop had before it moved to
+    // `poll()` on the replication socket (see bridge.zig's idle path): sleep time isn't
+    // CPU time, so it doesn't show up in `bridge_cpu_seconds_total` at all, yet it is
+    // real wall-clock latency paid on every idle cycle. Measured on a 2M-row burst: the
+    // flush thread's own CPU cost (encode+publish) totalled well under a second, but the
+    // observed wall-clock gap between "active work" and the real end-to-end time was
+    // several seconds — consistent with thousands of 1ms sleeps across many small
+    // batches (this bridge force-flushes on every COMMIT, so a busy multi-transaction
+    // burst produces many small batches, each with its own idle-wait in between).
+    //
+    // `poll()` needs a file descriptor, and there is no natural one for "an SPSC queue
+    // gained an item" — hence the self-pipe: the producer (event_processor.zig's
+    // `releaseSlotToQueue`, and `forceFlush`) writes one byte when it transitions the
+    // queue from empty to non-empty (or forces a flush); the flush thread polls the read
+    // end instead of sleeping, waking the instant there is real work rather than up to
+    // 1ms late every single time. `wake_pending` caps the pipe at one outstanding byte —
+    // a producer only writes when it flips the flag false→true, so the pipe (default
+    // buffer far larger than 1 byte on every real OS) never fills, and no O_NONBLOCK
+    // dance is needed on the write side.
+    wake_read_fd: std.c.fd_t,
+    wake_write_fd: std.c.fd_t,
+    wake_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     // Backing allocator for one flush's worth of encoding work: the msgpack/JSON value
     // trees built in publishSubjectGroup and the byte buffers doPublish/publishSubjectGroup
     // hand to the NATS client. Reset (not deinit'd) after every doPublish call, so its
@@ -447,6 +476,12 @@ pub const BatchPublisher = struct {
         format: encoder_mod.Format,
         metrics: ?*Metrics,
         runtime_config: *const Config.RuntimeConfig,
+        /// This instance's resolved column-descriptor ceiling — auto-detected from the
+        /// monitored tables or `MAX_COLUMNS`, already resolved by `main` before this is
+        /// called (see `bridge.zig`'s `resolveMaxColumns`). Passed explicitly rather
+        /// than read off `runtime_config.max_columns_override` because that field can
+        /// be null (auto-detect); this parameter never is.
+        max_columns: u16,
     ) !*BatchPublisher {
         // 1. The actual number of events the user wants
         const event_count = runtime_config.batch_ring_buffer_size;
@@ -496,25 +531,38 @@ pub const BatchPublisher = struct {
             };
         }
 
-        // 2e. Link: Point each event's data_buffer into its slice of the slab
+        // 2e'. Allocate COLUMNS SLAB — same two-stage pattern as the data slab, so a
+        // narrow table (or an instance with a small auto-detected max_columns) doesn't
+        // pay for the compiled-in ceiling per event.
+        const columns_slab_size = event_count * @as(usize, max_columns);
+        const columns_slab = try allocator.alloc(CDCEvent.ColumnView, columns_slab_size);
+        errdefer allocator.free(columns_slab);
+
+        // 2f. Link: Point each event's data_buffer and columns into their slice of
+        // their respective slabs.
         for (events, 0..) |*event, i| {
             const offset = i * buffer_limit;
+            const col_offset = i * @as(usize, max_columns);
             event.* = CDCEvent{
                 .data_buffer = data_slab[offset .. offset + buffer_limit],
+                .columns = columns_slab[col_offset .. col_offset + max_columns],
             };
         }
 
-        // Calculate actual memory usage (metadata + data)
+        // Calculate actual memory usage (metadata + data + columns)
         const metadata_bytes = @sizeOf(CDCEvent) * event_count;
         const data_bytes = data_slab_size;
-        const total_bytes = metadata_bytes + data_bytes;
+        const columns_bytes = columns_slab_size * @sizeOf(CDCEvent.ColumnView);
+        const total_bytes = metadata_bytes + data_bytes + columns_bytes;
         const total_mb = total_bytes / (1024 * 1024);
 
-        log.info("📦 Ring buffer allocation (two-stage):", .{});
+        log.info("📦 Ring buffer allocation (three-stage):", .{});
         log.info("   • Event count: {d}", .{event_count});
         log.info("   • Buffer per event: {d} bytes (BASE_BUF={d})", .{ buffer_limit, runtime_config.event_data_buffer_log2 });
+        log.info("   • Columns per event: {d} (MAX_COLUMNS)", .{max_columns});
         log.info("   • Metadata: {d} KB ({d} bytes/event)", .{ metadata_bytes / 1024, @sizeOf(CDCEvent) });
         log.info("   • Data slab: {d} MB (mlock={s})", .{ data_bytes / (1024 * 1024), if (@hasDecl(std.posix, "mlock")) "yes" else "no" });
+        log.info("   • Columns slab: {d} MB ({d} bytes/event)", .{ columns_bytes / (1024 * 1024), max_columns * @sizeOf(CDCEvent.ColumnView) });
         log.info("   • Total: {d} MB", .{total_mb});
 
         // 3. Queue Capacity: SPSC math requires:
@@ -541,6 +589,14 @@ pub const BatchPublisher = struct {
             queue_cap,
         });
 
+        // Wake pipe for the flush thread's idle wait — see the field doc comment.
+        var wake_fds: [2]std.c.fd_t = undefined;
+        if (std.c.pipe(&wake_fds) != 0) return error.WakePipeFailed;
+        errdefer {
+            _ = std.c.close(wake_fds[0]);
+            _ = std.c.close(wake_fds[1]);
+        }
+
         // Allocate BatchPublisher on heap for stable memory address
         // This is critical because flush_thread holds references to pending_events/free_slots
         const self = try allocator.create(BatchPublisher);
@@ -554,6 +610,7 @@ pub const BatchPublisher = struct {
             .metrics = metrics,
             .events = events,
             .data_slab = data_slab,
+            .columns_slab = columns_slab,
             .pending_events = pending_events,
             .free_slots = free_slots,
             .last_confirmed_lsn = std.atomic.Value(u64).init(0),
@@ -562,6 +619,8 @@ pub const BatchPublisher = struct {
             .flush_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
             .force_flush = std.atomic.Value(bool).init(false),
+            .wake_read_fd = wake_fds[0],
+            .wake_write_fd = wake_fds[1],
             .encode_arena = std.heap.ArenaAllocator.init(allocator),
         };
 
@@ -609,9 +668,12 @@ pub const BatchPublisher = struct {
 
         // 3. Now safe to free memory - no other thread is accessing it
         allocator.free(self.data_slab); // Free data slab first
+        allocator.free(self.columns_slab); // Then columns slab
         allocator.free(self.events); // Then metadata structs
         self.pending_events.deinit();
         self.free_slots.deinit();
+        _ = std.c.close(self.wake_read_fd);
+        _ = std.c.close(self.wake_write_fd);
 
         log.info("🛑 Batch publisher stopped cleanly", .{});
 
@@ -650,6 +712,37 @@ pub const BatchPublisher = struct {
     /// Trigger an immediate flush of the current batch
     pub fn forceFlush(self: *BatchPublisher) void {
         self.force_flush.store(true, .seq_cst);
+        self.signalNewWork();
+    }
+
+    /// Wake the flush thread out of its idle wait, if it's waiting. Call whenever the
+    /// producer changes something the flush thread should notice sooner than its next
+    /// poll timeout: a new event pushed to `pending_events`, or `forceFlush` above.
+    ///
+    /// `wake_pending` caps the self-pipe at one outstanding byte: only the caller that
+    /// flips it false→true actually writes, so a burst of pushes between two flush-thread
+    /// wakeups costs one write, not one per push.
+    pub fn signalNewWork(self: *BatchPublisher) void {
+        if (self.wake_pending.cmpxchgStrong(false, true, .release, .monotonic) == null) {
+            _ = std.c.write(self.wake_write_fd, &[_]u8{1}, 1);
+        }
+    }
+
+    /// Block until `signalNewWork` fires or `timeout_ms` elapses, whichever is first.
+    /// The flush thread's only idle wait — see `wake_read_fd`'s doc comment for why this
+    /// exists instead of a fixed-interval sleep.
+    fn waitForWork(self: *BatchPublisher, timeout_ms: i32) void {
+        var pfd = [_]std.posix.pollfd{.{
+            .fd = self.wake_read_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        _ = std.posix.poll(&pfd, @max(0, timeout_ms)) catch return;
+        if (pfd[0].revents & std.posix.POLL.IN != 0) {
+            var drain: [64]u8 = undefined;
+            _ = std.c.read(self.wake_read_fd, &drain, drain.len);
+            self.wake_pending.store(false, .release);
+        }
     }
 
     /// Check if a fatal error occurred (e.g., NATS reconnection timeout)
@@ -763,8 +856,11 @@ pub const BatchPublisher = struct {
                 if (self.should_stop.load(.seq_cst)) {
                     break;
                 }
-                // Sleep briefly to avoid busy-waiting
-                utils.sleep(1 * std.time.ns_per_ms);
+                // Block until the producer signals new work (see wake_read_fd's doc
+                // comment) rather than sleeping on a fixed timer. This bound is a
+                // should_stop-responsiveness safety net, not a pacing mechanism — real
+                // work wakes this immediately.
+                self.waitForWork(200);
             } else {
                 // Have events but timeout not reached
                 if (self.should_stop.load(.seq_cst)) {
@@ -775,8 +871,11 @@ pub const BatchPublisher = struct {
                     current_payload_size = 0;
                     break;
                 }
-                // Keep them and sleep briefly
-                utils.sleep(1 * std.time.ns_per_ms);
+                // Keep them, and wait only as long as remains before the timeout-based
+                // flush (reason_timeout, above) is actually due — new work or a
+                // force-flush wakes this early via the pipe instead.
+                const remaining_ms: i32 = @intCast(@max(0, self.config.max_wait_ms - time_elapsed));
+                self.waitForWork(remaining_ms);
             }
         }
 
@@ -1264,8 +1363,10 @@ test "addColumn: a column past 64 KB into the buffer keeps its offset" {
     const buf_len = 256 * 1024;
     const data = try allocator.alloc(u8, buf_len);
     defer allocator.free(data);
+    const cols = try allocator.alloc(CDCEvent.ColumnView, 8);
+    defer allocator.free(cols);
 
-    var ev = CDCEvent{ .data_buffer = data };
+    var ev = CDCEvent{ .data_buffer = data, .columns = cols };
     ev.reset();
 
     // One fat value to push the write offset well past a u16, then a normal column after
@@ -1292,15 +1393,21 @@ test "addColumn: the column ceiling is reported, not crashed into" {
     const allocator = std.testing.allocator;
     const data = try allocator.alloc(u8, 64 * 1024);
     defer allocator.free(data);
+    // A deliberately small ceiling — the test exercises the guard's behavior, not any
+    // particular width, and column count is now a per-instance runtime value (the
+    // slice's own `.len`), not a compiled-in constant.
+    const test_max_columns = 8;
+    const cols = try allocator.alloc(CDCEvent.ColumnView, test_max_columns);
+    defer allocator.free(cols);
 
-    var ev = CDCEvent{ .data_buffer = data };
+    var ev = CDCEvent{ .data_buffer = data, .columns = cols };
     ev.reset();
 
     var i: usize = 0;
-    while (i < CDCEvent.max_columns) : (i += 1) {
+    while (i < test_max_columns) : (i += 1) {
         try ev.addColumn("c", .{ .int64 = 1 });
     }
-    try std.testing.expectEqual(@as(u16, CDCEvent.max_columns), ev.column_count);
+    try std.testing.expectEqual(@as(u16, test_max_columns), ev.column_count);
     try std.testing.expectError(error.TooManyColumns, ev.addColumn("one_too_many", .{ .int64 = 1 }));
 }
 

@@ -723,29 +723,42 @@ row value (`("a","b") > (…)`), which matches the `ORDER BY` exactly.
 
 ### The Connection Flow (Resolving the Gap)
 
-Run on every connect and reconnect. The client must evaluate the **Gap Rule** to decide whether a snapshot is needed.
+Run on every connect and reconnect. The client must evaluate the **Gap Rule** to decide whether a snapshot is needed — once **per stream** it reads, not once overall. A consumer's tenant-scoped tables live on `CDC_<tenant>`; its public tables (no tenant column) live on `CDC_PUBLIC`. These are two independent streams with unrelated sequence numbers — a consumer reading both tracks two independent gap decisions, not one.
+
+#### Step 0: know your tenant
+
+Everything below needs a tenant token to build subject names. A client holds only its principal ID (issuing that ID is a separate, out-of-scope bootstrap problem — assume the client already has it), and resolves its tenant by asking NATS, not by guessing or embedding a build-time constant:
+
+```
+tenant ← KV.tenants.get(<principal>)
+```
+
+This reads `$KV.tenants.<principal>` — a single value, populated live by a trigger on `zebridge_user_tenants` (mirroring exactly how `$KV.schemas` is kept current from DDL, §1). **Resolved fresh on every connect, never cached client-side across sessions**: the bucket is what lets a tenant reassignment take effect without restarting anything, and a locally-cached value would defeat that the moment it goes stale. The NATS grant on this key is scoped to the client's own principal (`$KV.tenants.alice`, never a wildcard) — a leaked credential discloses only that principal's own tenant, never the membership roster.
+
+A client with no tenant-scoped tables skips this step: its reach is `CDC_PUBLIC` only, and every `<tenant>` placeholder below is the fixed `OPEN_TENANT` value for that traffic, never a resolved one.
 
 A naive client might track the last LSN per table. This causes the **"abandoned table paradox"**: if Table A changes rapidly but Table B never changes, Table B's local LSN falls far behind the stream's oldest available LSN. A per-table gap check would incorrectly assume Table B missed events and force a snapshot.
 
-To solve this, the client must track a **Global Sync State**:
+To solve this, the client must track a **Global Sync State per stream**:
 
-* `global_last_lsn`: The highest LSN the client has successfully processed from the CDC stream, across *all* tables.
-* `global_last_seq`: The JetStream sequence number corresponding to `global_last_lsn`.
+* `global_last_lsn[stream]`: The highest LSN the client has successfully processed from that stream, across every table the stream carries.
+* `global_last_seq[stream]`: The JetStream sequence number corresponding to `global_last_lsn[stream]`.
 
-**The Gap Rule:**
-Compare `global_last_lsn >= oldest_cdc_lsn`.
+**The Gap Rule**, evaluated independently for each stream the client reads:
+Compare `global_last_lsn[stream] >= oldest_cdc_lsn(stream)`.
 
-* **If true:** The client has no gaps. Every table is safe, even those that haven't changed in months. Resume CDC from `global_last_seq + 1`.
-* **If false (or first run):** The client missed history. It must request a snapshot for *all* required tables, as it cannot prove which ones changed during the blackout.
+* **If true:** The client has no gaps on that stream. Every table it carries is safe, even those that haven't changed in months. Resume that stream from `global_last_seq[stream] + 1`.
+* **If false (or first run):** The client missed history on that stream. It must request a snapshot for every table *that stream* carries, as it cannot prove which ones changed during the blackout. (The other stream, if any, is unaffected — a gap on `CDC_<tenant>` says nothing about `CDC_PUBLIC`.)
 
 ```mermaid
 flowchart TD
-    A[connect] --> B["schema ← KV.get(table)<br/>migrate local in place"]
-    B --> C{"global_last_lsn exists AND<br/>global_last_lsn >= oldest_cdc_lsn ?"}
-    C -->|yes| Z["resume CDC from global_last_seq + 1"]
-    C -->|"no — first run, or gap"| D{"valid snapshot exists in KV AND<br/>snapshot.lsn >= oldest_cdc_lsn ?"}
-    D -->|yes| E["truncate local<br/>apply chunks via JetStream Pull<br/>global_last_lsn ← max(snapshot LSNs)"]
-    D -->|"no snapshot, or<br/>snapshot too old"| F["publish snapshot.request<br/>(ignore NATS rejects) · wait"]
+    T["tenant ← KV.tenants.get(principal)<br/>(skip — use OPEN_TENANT — if public-only)"] --> A[connect]
+    A --> B["schema ← KV.get(table)<br/>migrate local in place"]
+    B --> C{"per stream (CDC_&lt;tenant&gt;, CDC_PUBLIC):<br/>global_last_lsn[stream] exists AND<br/>&gt;= oldest_cdc_lsn(stream) ?"}
+    C -->|yes| Z["resume that stream from<br/>global_last_seq[stream] + 1"]
+    C -->|"no — first run, or gap"| D{"valid snapshot in<br/>KV.snapshots.&lt;tenant&gt;.&lt;table&gt; AND<br/>snapshot.lsn &gt;= oldest_cdc_lsn(stream) ?"}
+    D -->|yes| E["truncate local<br/>apply chunks via JetStream Pull<br/>from init.snap.&lt;tenant&gt;.&lt;table&gt;.…<br/>global_last_lsn[stream] ← max(snapshot LSNs)"]
+    D -->|"no snapshot, or<br/>snapshot too old"| F["publish snapshot.request.&lt;tenant&gt;.&lt;table&gt;<br/>(ignore NATS rejects) · wait on<br/>KV.snapshots.&lt;tenant&gt;.&lt;table&gt;"]
     F --> E
     E --> Z
     Z --> Y["per-event rule (§5)"]
@@ -754,25 +767,31 @@ flowchart TD
 In pseudocode:
 
 ```python
-if global_last_lsn exists and global_last_lsn >= oldest_cdc_lsn:
-    accept CDC from global_last_seq + 1
-else:
-    for each table:
-        check kv.snapshots for a snapshot >= oldest_cdc_lsn
+tenant = kv.tenants.get(principal) if reads_tenant_scoped_tables else OPEN_TENANT
+
+for stream in streams_this_client_reads:  # CDC_<tenant>, and/or CDC_PUBLIC
+    if global_last_lsn[stream] exists and global_last_lsn[stream] >= oldest_cdc_lsn(stream):
+        accept stream from global_last_seq[stream] + 1
+        continue
+
+    for each table carried by stream:
+        check kv.snapshots[tenant][table] for a snapshot >= oldest_cdc_lsn(stream)
         if none exists:
-            publish snapshot.request, wait for kv.snapshots to update
+            publish snapshot.request.<tenant>.<table>, wait for kv.snapshots[tenant][table] to update
         truncate local table
-        replay snapshot chunks from INIT stream using JetStream Pull Consumer
-    
-    global_last_lsn = max(snapshot LSNs)
-    accept CDC from now
+        replay chunks from init.snap.<tenant>.<table>.… using JetStream Pull Consumer
+
+    global_last_lsn[stream] = max(snapshot LSNs for that stream's tables)
+    accept stream from now
 ```
 
 **Notes that matter for a correct port:**
 
-* ⚠️ **`global_last_lsn` may not exist.** First run has no value; test for its presence explicitly.
-* ⚠️ **`>=`, not `>`.** If `global_last_lsn == oldest_cdc_lsn` you have applied the oldest retained event and everything after it is present. Strict `>` forces a needless re-seed.
-* ⚠️ **`snapshot_lsn >= oldest_cdc_lsn` must be verified.** A snapshot older than the CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been evicted. You land in a hole immediately.
+* ⚠️ **Resolve tenant before constructing any subject below.** Every `<tenant>` token in `cdc.<tenant>.>`, `snapshot.request.<tenant>.<table>`, `init.snap.<tenant>.<table>.…` and `$KV.snapshots.<tenant>.<table>` is the value from Step 0 — never a guess, never a build-time config value, and never derived from data already in the local replica (that reasoning is circular: it assumes the thing being verified).
+* ⚠️ **`snapshot.request` and `init.snap` are tenant-keyed, not principal-keyed.** A dump is shared by every principal in a tenant; keying it by principal instead would make a fleet restart spawn one serialized snapshot run per principal per table — a connection storm — for no correctness gain once one principal holds exactly one tenant.
+* ⚠️ **`global_last_lsn` may not exist**, per stream. First run has no value for that stream; test for its presence explicitly.
+* ⚠️ **`>=`, not `>`.** If `global_last_lsn[stream] == oldest_cdc_lsn(stream)` you have applied the oldest retained event on that stream and everything after it is present. Strict `>` forces a needless re-seed.
+* ⚠️ **`snapshot_lsn >= oldest_cdc_lsn(stream)` must be verified**, against the LSN horizon of the stream that table belongs to. A snapshot older than that stream's CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been evicted. You land in a hole immediately.
 * ⚠️ **Truncate before applying a snapshot**, do not merge. A snapshot names only rows that *exist*; rows deleted while you were away are never mentioned, so an upsert-only apply leaves them behind forever.
 * A schema change **never** triggers this flow. Migrations apply in place (§5); re-seeding is for a CDC gap only.
 

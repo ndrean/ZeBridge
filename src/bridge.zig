@@ -129,6 +129,99 @@ fn initReplication(
     );
 }
 
+/// Resolve this instance's per-event column-descriptor ceiling.
+///
+/// `MAX_COLUMNS` (already clamped by args.zig) wins outright — set it and
+/// auto-detection never runs. Otherwise: one catalog query finds the widest table
+/// actually in the publication, and the result is rounded up by
+/// `Config.Batch.column_headroom_rounding` so a routine `ALTER TABLE ADD COLUMN`
+/// doesn't immediately need a reboot to avoid `TooManyColumns`. Anything past
+/// `Config.Batch.absolute_max_columns` (PostgreSQL's own ceiling) is refused by the
+/// query's own JOINs long before it could matter.
+///
+/// Must run after the publication exists (this queries it directly, not
+/// `monitored_tables`, so it needs no "schema.table" string parsing) and before
+/// `initBatchPublisher`, which allocates the columns slab this value sizes.
+fn resolveMaxColumns(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    publication_name: []const u8,
+    override: ?u16,
+) u16 {
+    if (override) |v| {
+        log.info("MAX_COLUMNS={d} (explicit override)", .{v});
+        return v;
+    }
+
+    var standard_config = pg_config.*;
+    standard_config.replication = false;
+
+    const conn = pg_conn.connect(allocator, standard_config) catch |err| {
+        log.warn("⚠️  MAX_COLUMNS auto-detection skipped: could not connect to PostgreSQL ({any}); falling back to {d}", .{
+            err,
+            Config.Batch.default_max_columns,
+        });
+        return Config.Batch.default_max_columns;
+    };
+    defer c.PQfinish(conn);
+
+    // One query, not one per table: join the publication's tables straight through
+    // to pg_attribute and group by relation, so the widest table's live column count
+    // comes back as a single row regardless of how many tables are published.
+    const query = utils.allocPrintZ(
+        allocator,
+        \\SELECT COALESCE(MAX(col_count), 0) FROM (
+        \\  SELECT count(*) AS col_count
+        \\  FROM pg_publication_tables pt
+        \\  JOIN pg_namespace ns ON ns.nspname = pt.schemaname
+        \\  JOIN pg_class cl ON cl.relname = pt.tablename AND cl.relnamespace = ns.oid
+        \\  JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum > 0 AND NOT a.attisdropped
+        \\  WHERE pt.pubname = '{s}'
+        \\  GROUP BY pt.tablename
+        \\) widest;
+    ,
+        .{publication_name},
+    ) catch {
+        log.warn("⚠️  MAX_COLUMNS auto-detection skipped: out of memory building the query; falling back to {d}", .{Config.Batch.default_max_columns});
+        return Config.Batch.default_max_columns;
+    };
+    defer allocator.free(query);
+
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) {
+        log.warn("⚠️  MAX_COLUMNS auto-detection skipped: catalog query failed ({s}); falling back to {d}", .{
+            c.PQerrorMessage(conn),
+            Config.Batch.default_max_columns,
+        });
+        return Config.Batch.default_max_columns;
+    }
+
+    const raw = std.mem.span(c.PQgetvalue(res, 0, 0));
+    const widest = std.fmt.parseInt(u32, raw, 10) catch 0;
+
+    if (widest == 0) {
+        log.warn("⚠️  MAX_COLUMNS auto-detection found no published tables; falling back to {d}", .{Config.Batch.default_max_columns});
+        return Config.Batch.default_max_columns;
+    }
+
+    const chunks = std.math.divCeil(u32, widest, Config.Batch.column_headroom_rounding) catch widest;
+    const headroomed: u32 = chunks * Config.Batch.column_headroom_rounding;
+    const clamped: u16 = @intCast(std.math.clamp(
+        headroomed,
+        @as(u32, Config.Batch.min_columns),
+        @as(u32, Config.Batch.absolute_max_columns),
+    ));
+
+    log.info("MAX_COLUMNS={d} (auto-detected: widest monitored table has {d} columns, rounded up to a multiple of {d})", .{
+        clamped,
+        widest,
+        Config.Batch.column_headroom_rounding,
+    });
+    return clamped;
+}
+
 /// Initialize and connect NATS publisher with metrics tracking
 fn initNatsPublisher(
     allocator: std.mem.Allocator,
@@ -164,6 +257,7 @@ fn initBatchPublisher(
     format: encoder_mod.Format,
     metrics: *metrics_mod.Metrics,
     runtime_config: *const Config.RuntimeConfig,
+    max_columns: u16,
 ) !*batch_publisher.BatchPublisher {
     const batch_config = batch_publisher.BatchConfig{
         .max_events = runtime_config.batch_max_events,
@@ -181,6 +275,7 @@ fn initBatchPublisher(
         format,
         metrics,
         runtime_config,
+        max_columns,
     );
 }
 
@@ -542,6 +637,17 @@ pub fn main(init: std.process.Init) !void {
     // Store monitored tables for validation (used by schema changes and snapshot requests)
     const monitored_tables = replication_ctx.tables;
 
+    // Resolve this instance's column-descriptor ceiling now — after the publication
+    // exists (auto-detection queries it) and before the ring buffer's sizing check and
+    // `initBatchPublisher`, both of which need the final number, not a compile-time
+    // guess. See `resolveMaxColumns`'s doc comment for MAX_COLUMNS vs auto-detect.
+    const resolved_max_columns = resolveMaxColumns(
+        allocator,
+        &pg_config,
+        parsed_args.publication_name,
+        runtime_config.max_columns_override,
+    );
+
     // === Start thread: snapshot listener
     log.info("Starting snapshot listener thread...", .{});
     var snap_listener = snapshot_listener.SnapshotListener.init(
@@ -608,19 +714,21 @@ pub fn main(init: std.process.Init) !void {
         const count = runtime_config.batch_ring_buffer_size;
         const data_bytes = event_buf_bytes * count;
 
-        // ⚠️ The ring is **two** allocations, and this check used to count only one of
-        // them. Each event also carries a fixed `CDCEvent` descriptor — dominated by its
-        // `[512]ColumnView` array, which is the same size whether the table has three
-        // columns or five hundred — and that term does **not** shrink with BASE_BUF.
+        // ⚠️ The ring is **three** allocations, and this check used to count only one of
+        // them. Each event also carries a fixed `CDCEvent` descriptor (small, now that
+        // `columns` is a slice rather than an inline array) PLUS its own slice of a
+        // separate columns slab (`resolved_max_columns × 8 bytes`) — and neither term
+        // shrinks with BASE_BUF.
         //
-        // So the smaller the event buffer, the more the metadata dominates, and the
+        // So the smaller the event buffer, the more metadata+columns dominate, and the
         // further this check drifted from the truth in exactly the configuration that
-        // makes sense for many small events. Measured: BASE_BUF=11 with
-        // RING_BUFFER_COUNT=262144 is 512 MiB of data and 2.08 GiB of metadata — the old
-        // check saw the 512 MiB, waved it through against a 4 GB machine, and the process
-        // then wanted 2.6 GB.
+        // makes sense for many small events. Measured (pre-slab, `[512]ColumnView`
+        // inline): BASE_BUF=11 with RING_BUFFER_COUNT=262144 was 512 MiB of data and
+        // 2.08 GiB of metadata — the old check saw the 512 MiB, waved it through against
+        // a 4 GB machine, and the process then wanted 2.6 GB.
         const meta_bytes = @sizeOf(batch_publisher.CDCEvent) * count;
-        const slab_bytes = data_bytes + meta_bytes;
+        const columns_bytes = @as(usize, resolved_max_columns) * @sizeOf(batch_publisher.CDCEvent.ColumnView) * count;
+        const slab_bytes = data_bytes + meta_bytes + columns_bytes;
 
         // #1 — will the slab fit in the memory this process actually has?
         const limit = utils.memoryLimitBytes();
@@ -631,7 +739,7 @@ pub fn main(init: std.process.Init) !void {
             // buffers, the NATS client, the snapshot encode buffer and the arenas all sit
             // beside it — and a slab past half leaves no room for the work it exists to do.
             log.err(
-                "🔴 The ring would be {d} MB — {d} MB of data (BASE_BUF={d} → {d} KB × RING_BUFFER_COUNT={d}) plus {d} MB of per-event metadata ({d} B each) — against a {d} MB memory limit. It is pre-allocated at startup, so this is an OOM kill under load rather than a slow degradation. Halve RING_BUFFER_COUNT for each step you raise BASE_BUF; see README 'Sizing BASE_BUF and RING_BUFFER_COUNT'.",
+                "🔴 The ring would be {d} MB — {d} MB of data (BASE_BUF={d} → {d} KB × RING_BUFFER_COUNT={d}) plus {d} MB of per-event metadata ({d} B each) plus {d} MB of column descriptors (MAX_COLUMNS={d} × {d} B × RING_BUFFER_COUNT) — against a {d} MB memory limit. It is pre-allocated at startup, so this is an OOM kill under load rather than a slow degradation. Halve RING_BUFFER_COUNT for each step you raise BASE_BUF; see README 'Sizing BASE_BUF and RING_BUFFER_COUNT'.",
                 .{
                     slab_bytes / 1024 / 1024,
                     data_bytes / 1024 / 1024,
@@ -640,19 +748,23 @@ pub fn main(init: std.process.Init) !void {
                     count,
                     meta_bytes / 1024 / 1024,
                     @sizeOf(batch_publisher.CDCEvent),
+                    columns_bytes / 1024 / 1024,
+                    resolved_max_columns,
+                    @sizeOf(batch_publisher.CDCEvent.ColumnView),
                     limit / 1024 / 1024,
                 },
             );
             return error.SlabExceedsMemory;
         } else {
-            // Both terms, always: an operator reading "512 MB" while the process takes
-            // 2.6 GB has no way to discover the difference short of watching it die.
-            log.info("Event ring: {d} MB of a {d} MB limit ({d}%) — {d} MB data + {d} MB metadata", .{
+            // All three terms, always: an operator reading "512 MB" while the process
+            // takes 2.6 GB has no way to discover the difference short of watching it die.
+            log.info("Event ring: {d} MB of a {d} MB limit ({d}%) — {d} MB data + {d} MB metadata + {d} MB columns", .{
                 slab_bytes / 1024 / 1024,
                 limit / 1024 / 1024,
                 slab_bytes * 100 / limit,
                 data_bytes / 1024 / 1024,
                 meta_bytes / 1024 / 1024,
+                columns_bytes / 1024 / 1024,
             });
         }
 
@@ -691,6 +803,7 @@ pub fn main(init: std.process.Init) !void {
         parsed_args.encoding_format,
         &metrics,
         &runtime_config,
+        resolved_max_columns,
     );
     // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();

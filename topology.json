@@ -39,6 +39,7 @@
   },
   "kv": {
     "schemas": "schemas",
-    "snapshots": "snapshots"
+    "snapshots": "snapshots",
+    "tenants": "tenants"
   }
 }

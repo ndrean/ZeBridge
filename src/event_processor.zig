@@ -607,6 +607,17 @@ pub const EventProcessor = struct {
         const timer_start: u64 = nanoNow();
         const watchdog_timeout_ns = std.time.ns_per_s * 30;
 
+        // ⚠️ Checked BEFORE the push, not after every push — signalling on every single
+        // event turned the flush thread's idle wait from a latency problem into a
+        // throughput one. It went from ~2-3k wake calls for a 2M-event burst to ~15.5k,
+        // because it woke on nearly every individual push, drained whatever few events
+        // had landed by then, and went straight back to waiting — thrashing instead of
+        // letting the natural accumulation a busy producer provides do its job. Only the
+        // transition from empty to non-empty needs to interrupt a genuinely idle flush
+        // thread; once it's awake, its own inner drain loop picks up everything a fast
+        // producer piles on without needing to be told again.
+        const queue_was_empty = self.batch_publisher.pending_events.isEmpty();
+
         while (true) {
             self.batch_publisher.pending_events.push(slot_idx) catch |err| {
                 if (err == error.QueueFull) {
@@ -641,6 +652,13 @@ pub const EventProcessor = struct {
                 return err;
             };
             break;
+        }
+
+        // Only the empty→non-empty transition wakes the flush thread — see this
+        // function's opening comment for why signalling on every push was worse, not
+        // better.
+        if (queue_was_empty) {
+            self.batch_publisher.signalNewWork();
         }
 
         log.debug("Slot {d} released to publisher", .{slot_idx});

@@ -63,32 +63,94 @@ visible at runtime; both are visible in `pg_roles`.
 ### 1.2 PostgreSQL: opening a table, and the only supported way
 
 `bridge_writer` starts with **no table privileges**. Ingress is closed until a DBA opens a
-table, so a new table is never silently writable.
+table, so a new table is never silently writable. Three shapes, each a fixed sequence of
+calls — not one function each, because the calls compose (a writable table is also
+tenant-scoped; a public table is neither) and skipping one leaves a table that *looks*
+finished but silently isn't. Every function referenced below is defined once, in
+`init.write.template.sql` (or `init.core.template.sql` for `zebridge_public_tables`) —
+`grep` for the name rather than a line number, which drifts.
+
+**Readable via CDC (public — every tenant, every subscriber sees it).**
 
 ```sql
-SELECT zebridge_grant_edge_writes('public.orders');            -- writable from the edge
-SELECT zebridge_scope_publication_to_one_tenant('public.orders',
-         'tenant_id', 'acme', 'my_pub');                       -- 🚧 tenant-scoped reads
+INSERT INTO zebridge_public_tables (tbl, reason)
+VALUES ('public.currencies', 'ISO list — identical for every tenant');
+
+ALTER PUBLICATION my_pub ADD TABLE public.currencies;
 ```
 
-⚠️ **Do not use a bare `ALTER PUBLICATION ... ADD TABLE`.** An event trigger refuses it
-for a table that is neither scoped nor recorded in `zebridge_public_tables`. Publishing a
-table with no row filter and no RLS sends every row to every subscriber, and nothing in the
-bridge can detect that — it is a pass-through by design.
+⚠️ **Order matters.** The event trigger refuses `ALTER PUBLICATION ... ADD TABLE` for a
+table that is neither tenant-scoped nor recorded in `zebridge_public_tables` — register the
+table first, or the second statement is refused. Deliberately: a bare `ALTER PUBLICATION`
+publishes with no row filter and no RLS, sending every row to every subscriber, and nothing
+in the bridge can detect that — it is a pass-through by design.
 
 ✅ Manual for the refusal itself (NOTES §1.8); ✅ `scripts/scenarios/render.py` proves the
 guard **exists** after a render, which is the failure that actually happened — the trigger
 vanished along with six functions when `envsubst` ate a dollar tag.
 
-Deliberately public tables are recorded, with a reason and an author:
-
-```sql
-INSERT INTO zebridge_public_tables (tbl, reason)
-VALUES ('public.currencies', 'ISO list — identical for every tenant');
-```
-
 `SELECT * FROM zebridge_audit_publications();` answers *is anything published without being
 scoped?* — the invariant a pass-through bridge cannot check for itself.
+
+**Writable from the edge.**
+
+```sql
+SELECT zebridge_grant_edge_writes('public.orders');
+SELECT zebridge_install_write_guards('public.orders', 'updated_at', 'deleted_at');
+```
+
+Then, in the bridge's own environment — boot-read, needs a restart:
+
+```
+SYNC_RULES=orders:updated_at,deleted_at[,last_writer]
+```
+
+`zebridge_grant_edge_writes` opens the table (`SELECT, INSERT, UPDATE, DELETE`, and refuses
+`zebridge_ddl_events` by name — see §1.7). `zebridge_install_write_guards` attaches the
+triggers that make the columns named in `SYNC_RULES` true for *every* writer, not just the
+bridge: `zebridge_bump_version_t` stamps the version column when a statement leaves it
+alone, `zebridge_soft_delete_t` turns a DELETE into a tombstoning UPDATE when a tombstone
+column is given. Skip it and both guarantees are fiction — the columns exist, but nothing
+enforces what they're supposed to mean, and it produces no error: writes still succeed,
+deletes still "work". `zebridge_audit_write_guards()` reports what is actually attached, to
+compare against `SYNC_RULES`.
+
+**Tenant-scoped (multi-tenant, routed per row — many tenants share one bridge, one
+publication, one stream family).**
+
+```sql
+-- The table needs a NOT NULL tenant column, and every writer needs to be in this table —
+-- N-1: exactly one tenant per client principal.
+INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
+
+-- Same call as "writable from the edge" above, plus a 4th argument: fills an omitted
+-- tenant from zebridge_user_tenants (fail-closed if the principal is unmapped), refuses a
+-- malformed one outright.
+SELECT zebridge_install_write_guards('public.orders', 'updated_at', 'deleted_at', 'tenant_id');
+
+-- ONE call, not three: moves the tenant column into the replica identity (so a DELETE can
+-- be routed by tenant), ENABLEs ROW LEVEL SECURITY, and installs both the
+-- zb_tenant_write and zb_reader_all policies.
+SELECT zebridge_scope_writes_by_tenant('public.orders', 'tenant_id');
+```
+
+Then, in the bridge's own environment — boot-read, needs a restart:
+
+```
+TENANT_RULES=orders:tenant_id
+```
+
+⚠️ **Measured, not hypothetical.** A table on this project's own dev stack had
+`TENANT_RULES` set and CDC reads correctly tenant-routed for a full session before this was
+checked — and had **zero** triggers, RLS disabled, and no policies at all: writes from any
+principal could touch any tenant's rows, silently, because `zebridge_install_write_guards`
+and `zebridge_scope_writes_by_tenant` had simply never been called for it. Reads looking
+correct is not evidence writes are scoped; they are two different mechanisms, on two
+different sides of the bridge, and neither implies the other.
+
+⚠️ `zebridge_scope_publication_to_one_tenant()` is a different shape entirely — it pins a
+publication (and therefore the bridge) to **one** tenant value, for one-bridge-per-tenant
+deployments. It is not the multi-tenant, per-row path above, and does not compose with it.
 
 ### 1.3 PostgreSQL: what the schema must satisfy
 
@@ -104,23 +166,33 @@ constrains it:
 | `timestamptz`, not `timestamp` | naive columns record no zone; a client writing local time wins or loses on its offset, silently | wrong write wins, no error |
 | tombstone column (soft delete) | an offline client's queued edit is overruled instead of resurrecting the row | deletes are physical; offline edits resurrect rows |
 | every `NOT NULL` column has a `DEFAULT`, or the client sends it | the schema descriptor carries no nullability | writes fail; the client learns only from the rejection |
-| 🚧 tenant column inside the **replica identity** | a DELETE carries only the replica identity — a tenant outside it means deletes cannot be routed | ✅ preflight refuses the table |
+| ✅ tenant column inside the **replica identity** | a DELETE carries only the replica identity — a tenant outside it means deletes cannot be routed | ✅ preflight refuses the table (`tenant_not_in_replica_identity`) |
 
-The tenant requirement is two statements, and does **not** need a primary-key change:
-
-```sql
-CREATE UNIQUE INDEX orders_zb_ri ON orders (tenant_id, uid);
-ALTER TABLE orders REPLICA IDENTITY USING INDEX orders_zb_ri;
-```
+Call `zebridge_scope_writes_by_tenant('public.orders', 'tenant_id')` (§1.2) — **not** the
+raw SQL directly. It performs exactly this fix when the tenant column isn't already covered
+(`CREATE UNIQUE INDEX ... (tenant_id, <pk>)`, `ALTER TABLE ... REPLICA IDENTITY USING INDEX
+...`, no primary-key change needed), idempotently, but also enables RLS and installs the
+write-scoping policies in the same call — the part a hand-written version of just the index
+and identity statements leaves silently missing. That composition is the whole reason this
+is a function and not a snippet: the two-statement fix alone was tried and left a table with
+correct CDC routing and an entirely unscoped write path.
 
 ⚠️ Dropping that index drops the replica identity with it, and `UPDATE`/`DELETE` then fail
 with an error naming something else entirely.
 
 ### 1.4 PostgreSQL: after every migration
 
-1. **Open new tables explicitly** — `zebridge_grant_edge_writes` / `zebridge_scope_publication_to_one_tenant`. A
-   bare publication add is refused, which is the reminder.
-2. **Re-run the audit** — `SELECT * FROM zebridge_audit_publications();`
+1. **Open new tables explicitly** — the full sequence for the shape the table needs (§1.2:
+   readable, writable, or tenant-scoped). A bare publication add is refused, which is the
+   reminder for the *publication* half — nothing equivalent refuses a table that is
+   writable with no guards, or tenant-routed with no RLS, which is why the next step
+   matters as much as this one.
+2. **Re-run both audits** — `SELECT * FROM zebridge_audit_publications();` (is anything
+   published without being scoped?) and `SELECT * FROM zebridge_audit_write_guards();` (is
+   anything writable without the version/tombstone/tenant triggers it claims to have?). The
+   first catches an unscoped read path; the second is the one that would have caught
+   today's gap — a table with correct CDC routing and zero write guards reports clean on
+   the first and not on the second.
 3. 🚧 **Re-`CLUSTER` tenant-scoped tables.** Locality decays: new rows land wherever there
    is space, so tenants interleave again. ✅ Measured on 200k rows / 20 tenants: one
    tenant's snapshot read **6,250 blocks** interleaved versus **313** after

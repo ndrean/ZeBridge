@@ -769,70 +769,76 @@ guessed.
    subject instead. The bridge builds no predicate — it relays a token and PostgreSQL decides
    the rows.
 
-   ⚠️ **`zb.tenant`, not `zb.principal` resolved through `zebridge_user_tenants`.** Both would
-   filter correctly in isolation, but only one cannot disagree with the subject the chunks are
-   published on — see part 2. Resolving the principal through the mapping table is a *second*
-   derivation of the tenant, and two derivations of one fact eventually differ. The read path
-   therefore never touches `zebridge_user_tenants`; that table is the write path's.
+   ⚠️ **`zb.tenant`, not `zb.principal` resolved through `zebridge_user_tenants`.** Both would filter correctly in isolation, but only one cannot disagree with the subject the chunks are published on — see part 2. Resolving the principal through the mapping table is a *second* derivation of the tenant, and two derivations of one fact eventually differ. The read path therefore never touches `zebridge_user_tenants`; that table is the write path's.
 
-   ⚠️ This does **not** touch `zb_reader_all USING (true)`. That policy exists so the
-   *replication* connection sees every tenant; a change feed bounded by RLS goes silently
-   incomplete rather than correctly partitioned. Different connection, different policy.
+   ⚠️ This does **not** touch `zb_reader_all USING (true)`. That policy exists so the *replication* connection sees every tenant; a change feed bounded by RLS goes silently incomplete rather than correctly partitioned. Different connection, different policy.
 
-   ⚠️ If `zb.tenant` is unset the predicate is NULL and **every** row is excluded — the same
-   fail-closed shape the write path has, where a missing `zb.principal` refuses every write.
-   Silent emptiness is the correct failure here, but it looks exactly like an empty table, so
-   it needs to be distinguishable in the descriptor (see the closed filter-vs-refuse question).
+   ⚠️ If `zb.tenant` is unset the predicate is NULL and **every** row is excluded — the same fail-closed shape the write path has, where a missing `zb.principal` refuses every write.
+   Silent emptiness is the correct failure here, but it looks exactly like an empty table, so it needs to be distinguishable in the descriptor (see the closed filter-vs-refuse question).
 
-2. **Audience — tenant-keyed, filtered by the same token it is routed by.** DECIDED:
+1. **Audience — tenant-keyed, filtered by the same token it is routed by.** DECIDED:
 
        snapshot.request.<tenant>.<table>        grant: snapshot.request.acme.>
        init.snap.<tenant>.<table>.<id>.<chunk>  grant: init.snap.acme.>
        $KV.snapshots.<tenant>.<table>           grant: $KV.snapshots.acme.>
        cdc.<tenant>.>                           grant: cdc.acme.>      (already exists)
 
-   ⚠️ **The tenant in the subject is granted, not asserted.** A client cannot name a tenant
-   it does not hold, because NATS refuses the subject — the same thing that makes
-   `mutation.<principal>.…` trustworthy. This is why it is safe to route on it.
+   ⚠️ **The tenant in the subject is granted, not asserted.** A client cannot name a tenant it does not hold, because NATS refuses the subject — the same thing that makes `mutation.<principal>.…` trustworthy. This is why it is safe to route on it.
 
-   ⚠️ **The predicate uses the SAME token.** The bridge sets `zb.tenant` from the
-   authenticated subject and the read policy filters on `current_setting('zb.tenant')` —
-   *not* on `zb.principal` resolved through `zebridge_user_tenants`. That distinction is the
-   whole design. Two derivations of one fact can disagree: subject says `acme`, mapping says
-   `globex`, and globex rows are published on acme's subject. One token cannot disagree with
-   itself, so the coherence is **structural** rather than conventional — the property that
+   ⚠️ **The predicate uses the SAME token.** The bridge sets `zb.tenant` from the authenticated subject and the read policy filters on `current_setting('zb.tenant')` — *not* on `zb.principal` resolved through `zebridge_user_tenants`. That distinction is the whole design. Two derivations of one fact can disagree: subject says `acme`, mapping says `globex`, and globex rows are published on acme's subject. One token cannot disagree with itself, so the coherence is **structural** rather than conventional — the property that
    made the single-tenant shape safe, obtained here without a bridge per tenant.
 
-   ⚠️ **The descriptor must be keyed too, not just the chunks.** `$KV.snapshots` is
-   `max_msgs_per_subject=1`; keyed by table alone the second requester's descriptor
-   overwrites the first's and a client resolves someone else's `snapshot_id` and `lsn`.
+   ⚠️ **The descriptor must be keyed too, not just the chunks.** `$KV.snapshots` is `max_msgs_per_subject=1`; keyed by table alone the second requester's descriptor overwrites the first's and a client resolves someone else's `snapshot_id` and `lsn`.
 
-   Chosen over principal-keyed (`init.snap.<principal>.…`) because dumps are **shared across
-   a tenant's principals**. Principal-keyed makes the serialized snapshot worker run once per
-   principal per table — a connection storm every time a fleet restarts — for no correctness
-   gain once N-1 removes the ambiguity argument. The read path needs no mapping lookup either
-   way; `zebridge_user_tenants` is left to the write path.
+   Chosen over principal-keyed (`init.snap.<principal>.…`) because dumps are **shared across a tenant's principals**. Principal-keyed makes the serialized snapshot worker run once per principal per table — a connection storm every time a fleet restarts — for no correctness gain once N-1 removes the ambiguity argument. The read path needs no mapping lookup either way; `zebridge_user_tenants` is left to the write path.
 
-   Residual drift, for `zbctl check` rather than for the design: the NATS conf defines read
-   scope and `zebridge_user_tenants` defines write scope, and under N-1 they should name the
-   same tenant. A disagreement gives a principal inconsistent read/write reach — worth
-   catching, but **not** a cross-tenant leak, because reads are filtered by the token they
+   Residual drift, for `zbctl check` rather than for the design: the NATS conf defines read scope and `zebridge_user_tenants` defines write scope, and under N-1 they should name the
+   same tenant. A disagreement gives a principal inconsistent read/write reach — worth catching, but **not** a cross-tenant leak, because reads are filtered by the token they
    are routed by.
 
-3. **Identity — a `tenants` bucket, so the client stops guessing.** `$KV.tenants.<principal>`
+1. **Identity — a `tenants` bucket, so the client stops guessing.** `$KV.tenants.<principal>`
    → the tenant, published by a trigger on `zebridge_user_tenants` and propagated exactly as
    schemas already are (trigger → WAL → KV). No new mechanism.
 
-   Today the client has **two** answers and neither is authoritative. `VITE_TENANT`
-   (`App.tsx:53`) is a build-time env var that decides the consumer's `filter_subject`; the
-   tenant it *displays* is inferred from data that already arrived —
-   `SELECT tenant_id FROM … LIMIT 1`, on the reasoning that "RLS only ever showed us rows for
-   our own tenant, so whatever is in the local replica is ours". They can disagree silently:
-   set `VITE_TENANT=globex` for alice and she subscribes to a feed she has no grant on, which
-   presents as a client that connects, authenticates, and then looks like an idle database.
+   ✅ **Client side shipped.** `App.tsx` used to have **two** answers and neither was
+   authoritative: `VITE_TENANT`, a build-time env var deciding the consumer's
+   `filter_subject`, and a displayed tenant inferred from data that had already arrived
+   (`SELECT tenant_id FROM … LIMIT 1`, reasoning "RLS only ever showed us rows for our own
+   tenant"). They could disagree silently — `VITE_TENANT=globex` on alice's dev server
+   authenticated fine and then looked like an idle database, nothing catching the mismatch.
+   Both are gone; `resolveTenant()` now asks `$KV.tenants.<principal>` fresh on every
+   connect, before `subscribeStreams()` builds the stream list, and the displayed tenant is
+   the same value rather than a second, independently-inferred one.
 
-   With the bucket she connects as `alice` and *asks*. One source of truth, in PostgreSQL,
-   and a principal moved between tenants takes effect live rather than at the next rebuild.
+   ⚠️ **The subject is not the bare key.** Direct Get's scopable subject is
+   `$JS.API.DIRECT.GET.KV_tenants.$KV.tenants.<key>` — the bucket's own internal
+   `$KV.<bucket>.<key>` subject as the suffix — not `$JS.API.DIRECT.GET.KV_tenants.<key>`
+   as first guessed. Measured against a live `nats-server`: the wrong grant produced a
+   `Publish Violation` naming the actual subject, which is what fixed it.
+   `nats-server.conf.template` carries the corrected grant, exact-key per principal, and
+   `CONSUMER.*` is correctly absent — no consumer path exists for a plain `get()` in
+   either client tested.
+
+   ⚠️ **But "does it use Direct Get" is a client-library question, not just a protocol
+   one — first checked against the wrong client.** The `nats` Go CLI (`nats kv get`)
+   stayed on Direct Get with no fallback, which is what the claim above was based on.
+   The actual consumer — `@nats-io/kv`'s `Kvm.open()`, used by `App.tsx` — does not:
+   `Bucket.bind()` (the code path `open()` uses to attach to an *existing* bucket) never
+   asks the server whether the stream has `allow_direct` set; it trusts whatever
+   `opts.allow_direct` was passed and **defaults to `false`** when omitted.
+   `resolveTenant()` calling `kvm.open(topology.kv.tenants)` with no options therefore
+   went straight to `$JS.API.STREAM.MSG.GET.KV_tenants` — the unscopable, body-selects-
+   the-key path this design deliberately does not grant — and was refused, even though
+   `nats stream info KV_tenants` shows `allow_direct: true` server-side. Fixed by passing
+   `{ allow_direct: true }` explicitly to `kvm.open()`. The lesson generalizes: a claim
+   like "this client stays on Direct Get" has to be checked against the specific client
+   library actually shipping, not against whichever tool was on hand to test with.
+
+   ⚠️ **Not yet fed live.** The bucket itself is created (`nats-init`, native `up.sh`) and
+   the client reads it, but nothing populates `$KV.tenants.<principal>` from
+   `zebridge_user_tenants` yet — that is the trigger → WAL → KV pipeline described above,
+   still pending in the bridge. Seeded by hand (`nats kv put tenants alice acme`) until
+   then.
 
    ⚠️ **Granted per principal — `$KV.tenants.alice`, never `$KV.tenants.>`.** The wholesale
    grant would hand every client the full principal→tenant map, which is a roster of who else
@@ -893,7 +899,8 @@ primary key, because a key cannot know which principals are clients and which ar
 infrastructure. Making it a `zbctl check` assertion renders it visible instead of implicit.
 
 Note the browser client already assumes N-1 and could not express anything else: it builds
-`cdc.${TENANT}.>` from a single `VITE_TENANT`.
+`cdc.${TENANT}.>` from the single tenant `resolveTenant()` resolves — a single string, not a
+list, mirroring the bucket it reads.
 
 #### The cost, which is real and bounded
 
