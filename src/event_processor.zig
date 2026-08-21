@@ -1230,6 +1230,141 @@ pub const EventProcessor = struct {
         return self.acquireAndFillSlot(kv_subject, clean_table, "SCHEMA", msg_id, relation_id, cols, lsn);
     }
 
+    /// `zebridge_user_tenants` (principal, tenant_id) → `$KV.tenants.<principal>`, a bare
+    /// tenant string, never a JSON payload. Mirrors `packDdlToSlot`, with two
+    /// differences: the value is a plain string a client reads directly (no JSON
+    /// wrapping — `$KV.tenants` is not a schema-shaped bucket), and there is no
+    /// tombstone case, because a DELETE from this table is not handled here at all
+    /// (see the caller in bridge.zig) — a revoked mapping leaves a stale KV entry
+    /// rather than a fresh one, a known, deliberately deferred gap.
+    ///
+    /// Called only for INSERT and UPDATE (the caller passes the NEW row's tuple data
+    /// either way) — both mean "this principal's tenant is now this value", which is
+    /// exactly what the KV bucket should hold, so one function serves both operations.
+    ///
+    /// ⚠️ Not validated for NATS subject legality the way `zebridge_guard_tenant()`
+    /// validates an application table's tenant column on write. That trigger is
+    /// attached per tenant-scoped *application* table, not to `zebridge_user_tenants`
+    /// itself — a malformed `tenant_id` here (a dot, a space) would currently reach
+    /// this KV bucket unchecked. Not a routing hazard the way it would be for CDC (this
+    /// bucket is a lookup, not a subject a row is published on), but still worth
+    /// guarding if this table ever gets a DBA-facing insert path less careful than a
+    /// manual `INSERT`.
+    pub fn packTenantToKvSlot(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        rel: pgoutput.RelationMessage,
+        tuple_data: pgoutput.TupleData,
+        wal_end: u64,
+    ) !?u32 {
+        const decoded = try pgoutput.decodeTuple(arena, tuple_data, rel.columns, self.types);
+
+        var principal: ?[]const u8 = null;
+        var tenant_id: ?[]const u8 = null;
+        for (decoded.items) |col| {
+            if (std.mem.eql(u8, col.name, "principal")) {
+                if (col.value == .text) principal = col.value.text;
+            } else if (std.mem.eql(u8, col.name, "tenant_id")) {
+                if (col.value == .text) tenant_id = col.value.text;
+            }
+        }
+
+        if (principal == null or tenant_id == null) return null;
+
+        const kv_subject = try Topology.render(
+            arena,
+            self.topology.kv_tenants_subject_pattern,
+            &.{.{ .name = "principal", .value = principal.? }},
+            null,
+        );
+        const msg_id = try std.fmt.allocPrint(arena, "tenant-{s}-{d}", .{ principal.?, wal_end });
+
+        var cols: std.ArrayList(pgoutput.Column) = .empty;
+        try cols.append(arena, .{ .name = "tenant_id", .value = .{ .text = tenant_id.? } });
+
+        const slot_idx = try self.acquireAndFillSlot(
+            kv_subject,
+            principal.?,
+            "TENANT",
+            msg_id,
+            rel.relation_id,
+            cols,
+            wal_end,
+        );
+
+        log.info("✅ tenant mapping published to KV: '{s}' → '{s}'", .{ principal.?, tenant_id.? });
+        return slot_idx;
+    }
+
+    /// One-shot boot backfill of `$KV.tenants.*` from every row already in
+    /// `zebridge_user_tenants` — replication only carries *changes*, so a mapping
+    /// inserted before this boot needs its own pass, mirroring `publishBootSchemas`.
+    ///
+    /// Guarded on the table existing: a readonly-profile deployment (`init.core` only,
+    /// no `init.write`) never creates `zebridge_user_tenants`, and that is a valid
+    /// shape, not a misconfiguration — skip rather than fail the whole boot on
+    /// something this deployment does not need.
+    pub fn publishBootTenants(self: *EventProcessor, allocator: std.mem.Allocator) !void {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+
+        const conn = pg_conn.connect(arena, standard_pg_config) catch |err| {
+            log.err("Failed to connect to Postgres for boot tenant fetch: {}", .{err});
+            return error.PgConnectionFailed;
+        };
+        defer c.PQfinish(conn);
+
+        const exists_res = c.PQexec(conn, "SELECT to_regclass('public.zebridge_user_tenants') IS NOT NULL");
+        defer c.PQclear(exists_res);
+        if (c.PQresultStatus(exists_res) != c.PGRES_TUPLES_OK or c.PQntuples(exists_res) == 0) {
+            log.warn("Could not check for zebridge_user_tenants; skipping boot tenant backfill", .{});
+            return;
+        }
+        if (!std.mem.eql(u8, std.mem.span(c.PQgetvalue(exists_res, 0, 0)), "t")) {
+            log.info("zebridge_user_tenants not present — skipping boot tenant backfill (readonly profile, or write half not installed)", .{});
+            return;
+        }
+
+        const result = c.PQexec(conn, "SELECT principal, tenant_id FROM public.zebridge_user_tenants ORDER BY principal");
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            log.warn("⚠️ Failed to query zebridge_user_tenants for boot backfill: {s}", .{c.PQerrorMessage(conn)});
+            return;
+        }
+
+        const num_rows: i32 = c.PQntuples(result);
+        if (num_rows == 0) {
+            log.info("zebridge_user_tenants is empty — nothing to backfill", .{});
+            return;
+        }
+
+        var r: i32 = 0;
+        while (r < num_rows) : (r += 1) {
+            const principal = std.mem.span(c.PQgetvalue(result, r, 0));
+            const tenant_id = std.mem.span(c.PQgetvalue(result, r, 1));
+
+            const kv_subject = try Topology.render(
+                arena,
+                self.topology.kv_tenants_subject_pattern,
+                &.{.{ .name = "principal", .value = principal }},
+                null,
+            );
+            const msg_id = try std.fmt.allocPrint(arena, "tenant-boot-{s}", .{principal});
+
+            var cols: std.ArrayList(pgoutput.Column) = .empty;
+            try cols.append(arena, .{ .name = "tenant_id", .value = .{ .text = tenant_id } });
+
+            const slot_idx = try self.acquireAndFillSlot(kv_subject, principal, "TENANT", msg_id, 0, cols, 0);
+            try self.releaseSlotToQueue(slot_idx);
+        }
+
+        log.info("✅ Boot tenant backfill published to KV for {d} principal(s)", .{num_rows});
+    }
+
     /// Publish schemas for all monitored tables on boot.
     pub fn publishBootSchemas(
         self: *EventProcessor,

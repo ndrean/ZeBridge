@@ -1,7 +1,7 @@
 # nats-server.conf — generated from nats-server.conf.template by nats-config-gen.
 # ${NATS_BRIDGE_NKEY_PUB}, ${NATS_ALICE_PASSWORD}, ${NATS_BOB_PASSWORD},
-# ${NATS_JOHN_PASSWORD} and ${OPEN_TENANT} are substituted at startup (nats-config-gen,
-# from .env.admin).
+# ${NATS_JOHN_PASSWORD}, ${NATS_MARY_PASSWORD} and ${OPEN_TENANT} are substituted at
+# startup (nats-config-gen, from .env.admin).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # This file is where PROTOCOL.md §7.1 stops being a claim and becomes a fact.
@@ -137,6 +137,20 @@ JOHN_READ = [
                                 # alice's and bob's open-tenant reads, by design
   "init.>"
   "mutation_ack.john.>"        # HIS own verdicts
+  "$KV.schemas.>"
+  "$KV.snapshots.>"
+  "_INBOX.>"
+]
+
+# ⚠️ Also `globex`, like bob. Two principals, one tenant — exercises the KV.tenants
+# bucket resolving the same value from two independent zebridge_user_tenants rows,
+# not a shared credential.
+MARY_READ = [
+  "cdc.globex.>"
+  "cdc.users.>"
+  "cdc.${OPEN_TENANT}.>"
+  "init.>"
+  "mutation_ack.mary.>"        # HER own verdicts — not bob's
   "$KV.schemas.>"
   "$KV.snapshots.>"
   "_INBOX.>"
@@ -411,6 +425,56 @@ authorization {
           "$JS.ACK.>"
         ] }
         subscribe = { allow: $JOHN_READ }
+    } }
+
+    # ── a fourth principal, second on globex — tests KV.tenants with two rows ──
+    #
+    # Same tenant as bob, different principal: `$KV.tenants.mary` and
+    # `$KV.tenants.bob` are two independent keys that happen to resolve to the same
+    # value, from two independent `zebridge_user_tenants` rows — not one credential
+    # shared, and not a special case in the bucket's own design (NOTES.md §1.12 part 3
+    # never assumed a 1:1 tenant→principal mapping, only 1:1 principal→tenant).
+    { user: "mary", password: "${NATS_MARY_PASSWORD}", permissions: {
+        publish = { allow: [
+          "mutation.mary.>"
+
+          "snapshot.request.>"
+          "init.schema.>"
+
+          "$JS.API.INFO"
+
+          "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
+          "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
+          "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
+          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          "$JS.API.CONSUMER.INFO.INIT.>"
+          "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
+          "$JS.API.CONSUMER.INFO.KV_schemas.>"
+          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
+
+          "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
+          "$JS.API.STREAM.INFO.INIT"
+          "$JS.API.STREAM.INFO.CDC_GLOBEX"
+          "$JS.API.STREAM.INFO.CDC_PUBLIC"
+          "$JS.API.STREAM.INFO.KV_schemas"
+          "$JS.API.STREAM.INFO.KV_snapshots"
+          "$JS.API.STREAM.INFO.KV_tenants"
+          "$JS.API.DIRECT.GET.KV_schemas.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.>"
+          "$JS.API.STREAM.MSG.GET.KV_schemas"
+          "$JS.API.STREAM.MSG.GET.KV_snapshots"
+
+          # See alice's block above for why this is the exact key and not a wildcard.
+          "$JS.API.DIRECT.GET.KV_tenants.$KV.tenants.mary"
+          "$JS.ACK.>"
+        ] }
+        subscribe = { allow: $MARY_READ }
     } }
   ]
 

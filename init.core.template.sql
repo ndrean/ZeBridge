@@ -189,6 +189,14 @@ BEGIN
 
         CONTINUE WHEN relid IS NULL;
         CONTINUE WHEN relid::regclass::text LIKE '%zebridge_ddl_events';
+        -- Same reasoning as zebridge_ddl_events: this table's rows are never published as
+        -- ordinary CDC (the bridge special-cases its relation name and diverts every row
+        -- into $KV.tenants.<principal> instead — NOTES.md §1.12 part 3). It carries the
+        -- full principal→tenant roster, which the whole point of that KV bucket's
+        -- principal-first key order is to avoid ever exposing wholesale; publishing it as
+        -- `cdc.zebridge_user_tenants.*` would hand every client with a broad CDC grant
+        -- exactly that roster.
+        CONTINUE WHEN relid::regclass::text LIKE '%zebridge_user_tenants';
         CONTINUE WHEN EXISTS (SELECT 1 FROM public.zebridge_public_tables WHERE tbl = relid);
         -- Either model counts as scoped:
         --   A  a publication row filter  → PostgreSQL bounds CDC itself

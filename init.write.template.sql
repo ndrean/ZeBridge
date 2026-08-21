@@ -492,9 +492,18 @@ $$ LANGUAGE sql STABLE;
 -- bridge. The per-table `zb_reader_all` policy is the same capability, scoped, and it
 -- fails closed for anything nobody considered.
 
--- Which principal may act for which tenant. Referenced by the write policy above; the
--- bridge never reads it and never learns what a tenant is — it sets `zb.principal` from
--- the subject token it already trusts, and PostgreSQL resolves the rest.
+-- Which principal may act for which tenant. Referenced by the write policy above; for
+-- *writes* the bridge never reads it and never learns what a tenant is — it sets
+-- `zb.principal` from the subject token it already trusts, and PostgreSQL resolves the
+-- rest.
+--
+-- For *reads* it is a second source: this table is replicated (below) so the bridge can
+-- mirror it live into `$KV.tenants.<principal>`, letting a fresh consumer holding only a
+-- principal ID ask NATS for its own tenant (PROTOCOL.md "The Connection Flow", Step 0;
+-- NOTES.md §1.12 part 3) instead of guessing or hardcoding it. The bridge still never
+-- resolves a tenant *for routing purposes* from this table — that stays the subject
+-- token's job — this is purely a client-facing lookup, mirrored from the same source of
+-- truth as the write policy above so the two cannot drift apart.
 -- principal → tenant, the mapping RLS resolves against — see PROTOCOL.md §7.4
 CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
     principal text NOT NULL,
@@ -502,6 +511,23 @@ CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
     PRIMARY KEY (principal, tenant_id)
 );
 GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_BRIDGE_USER}, ${POSTGRES_WRITER_USER};
+
+-- ⚠️ Never published as ordinary CDC — see the matching exemption in
+-- `zebridge_publication_guard()` (init.core.template.sql). The bridge special-cases this
+-- relation's name in its WAL loop and diverts every row into a `$KV.tenants.<principal>`
+-- put instead, exactly as it already does for `zebridge_ddl_events` → `$KV.schemas.*`.
+-- Publishing it as `cdc.zebridge_user_tenants.*` would hand every client with a broad CDC
+-- grant the full principal→tenant roster — the disclosure the KV bucket's principal-first
+-- key order exists to prevent.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_publication_tables
+        WHERE pubname = '${BRIDGE_CDC_PUBLICATION}' AND tablename = 'zebridge_user_tenants'
+    ) THEN
+        ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE public.zebridge_user_tenants;
+    END IF;
+END $$;
 
 -- ⚠️ Dollar-quote with a bare double-dollar ONLY — never a named tag (dollar, letters,
 -- dollar). This file is rendered by `envsubst`, which reads such a tag as a variable

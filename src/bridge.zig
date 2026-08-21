@@ -831,6 +831,10 @@ pub fn main(init: std.process.Init) !void {
     // Publish boot schemas to NATS KV for all monitored tables
     try event_proc.publishBootSchemas(allocator, monitored_tables);
 
+    // Backfill $KV.tenants.* from zebridge_user_tenants — replication only carries
+    // changes from here on; this catches mappings that existed before this boot.
+    try event_proc.publishBootTenants(allocator);
+
     const batch_config = batch_publisher.BatchConfig{
         .max_events = Config.Batch.max_events,
         .max_wait_ms = Config.Batch.max_age_ms,
@@ -1126,6 +1130,17 @@ pub fn main(init: std.process.Init) !void {
                                             tx_slots_count += 1;
                                             cdc_events += 1;
                                         }
+                                    } else if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) {
+                                        // Never a cdc.zebridge_user_tenants.* event — see
+                                        // the matching exemption in
+                                        // zebridge_publication_guard() and NOTES.md §1.12
+                                        // part 3. Diverted into $KV.tenants.<principal>
+                                        // only, same shape as the DDL branch above.
+                                        if (try event_proc.packTenantToKvSlot(arena_allocator, rel, ins.tuple_data, wal_msg.wal_end)) |slot_idx| {
+                                            tx_slots_buf[tx_slots_count] = slot_idx;
+                                            tx_slots_count += 1;
+                                            cdc_events += 1;
+                                        }
                                     } else if (!event_proc.refused.shouldDrop(rel.name)) {
                                         // Refused: no schema was published for this table, so a
                                         // client receiving the row would have nowhere to put it.
@@ -1150,6 +1165,24 @@ pub fn main(init: std.process.Init) !void {
                                     // Pruning old rows produces DELETEs that must never surface as
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_upd;
+                                    if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) {
+                                        // A reassignment (`UPDATE ... SET tenant_id = ...`)
+                                        // arrives here, not as .insert — the NEW row is
+                                        // what the KV bucket should hold, same helper as
+                                        // the insert branch above.
+                                        if (tx_slots_count >= tx_slots_buf.len) {
+                                            log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
+                                            for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
+                                            tx_slots_count = 0;
+                                            return error.TransactionOverflow;
+                                        }
+                                        if (try event_proc.packTenantToKvSlot(arena_allocator, rel, upd.new_tuple, wal_msg.wal_end)) |slot_idx| {
+                                            tx_slots_buf[tx_slots_count] = slot_idx;
+                                            tx_slots_count += 1;
+                                            cdc_events += 1;
+                                        }
+                                        break :blk_upd;
+                                    }
                                     if (event_proc.refused.shouldDrop(rel.name)) break :blk_upd;
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
@@ -1177,6 +1210,17 @@ pub fn main(init: std.process.Init) !void {
                                     // Pruning old rows produces DELETEs that must never surface as
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_del;
+                                    // ⚠️ A revoked mapping (DELETE FROM zebridge_user_tenants)
+                                    // is a known, deliberately deferred gap: this leaves
+                                    // the principal's $KV.tenants entry stale rather than
+                                    // purging or tombstoning it, so a revoked principal
+                                    // keeps resolving its old tenant until something else
+                                    // overwrites that key. Handling it correctly needs a
+                                    // tombstone convention on this bucket (mirroring
+                                    // packDdlToSlot's DROP TABLE case) plus matching
+                                    // client-side handling in resolveTenant() — deferred,
+                                    // not silently ignored.
+                                    if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) break :blk_del;
                                     if (event_proc.refused.shouldDrop(rel.name)) break :blk_del;
 
                                     // ── The sweeper's reaps are not client data ──────────

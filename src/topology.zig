@@ -98,6 +98,7 @@ pub const Topology = struct {
     // ─── KV buckets ─────────────────────────────────────────────────────────────
     kv_schemas: []const u8,
     kv_snapshots: []const u8,
+    kv_tenants: []const u8,
 
     // ─── derived, built once at load ────────────────────────────────────────────
     //
@@ -112,6 +113,8 @@ pub const Topology = struct {
     /// JetStream exposes a KV bucket as `$KV.<bucket>.<key>`.
     kv_schemas_subject_pattern: []const u8,
     kv_snapshots_subject_pattern: []const u8,
+    /// `$KV.tenants.{[principal]s}` — PROTOCOL.md "The Connection Flow", Step 0.
+    kv_tenants_subject_pattern: []const u8,
     /// `snapshot.request.` — a request's subject minus the table.
     request_subject_prefix: []const u8,
     /// `snapshot.request.>` — what the snapshot consumer filters on.
@@ -146,10 +149,12 @@ pub const Topology = struct {
         .snapshot_schema_pattern = "init.snap.schema.{[table]s}.{[snapshot_id]s}",
         .kv_schemas = "schemas",
         .kv_snapshots = "snapshots",
+        .kv_tenants = "tenants",
         .mutations_subject_wildcard = "mutation.>",
         .schema_subject_pattern = "init.schema.{[table]s}",
         .kv_schemas_subject_pattern = "$KV.schemas.{[table]s}",
         .kv_snapshots_subject_pattern = "$KV.snapshots.{[table]s}",
+        .kv_tenants_subject_pattern = "$KV.tenants.{[principal]s}",
         .request_subject_prefix = "snapshot.request.",
         .request_subject_wildcard = "snapshot.request.>",
     };
@@ -261,6 +266,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
 
     t.kv_schemas = try str(a, kv, "kv", "schemas", diag);
     t.kv_snapshots = try str(a, kv, "kv", "snapshots", diag);
+    t.kv_tenants = try str(a, kv, "kv", "tenants", diag);
 
     // Derived. `$KV.` is not in topology.json on purpose: it is JetStream's own subject
     // mapping for a bucket, not a name anyone is free to choose.
@@ -268,6 +274,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.schema_subject_pattern = try std.fmt.allocPrint(a, "{s}.{{[table]s}}", .{t.schema_request});
     t.kv_schemas_subject_pattern = try std.fmt.allocPrint(a, "$KV.{s}.{{[table]s}}", .{t.kv_schemas});
     t.kv_snapshots_subject_pattern = try std.fmt.allocPrint(a, "$KV.{s}.{{[table]s}}", .{t.kv_snapshots});
+    t.kv_tenants_subject_pattern = try std.fmt.allocPrint(a, "$KV.{s}.{{[principal]s}}", .{t.kv_tenants});
     t.request_subject_prefix = try std.fmt.allocPrint(a, "{s}.", .{t.snapshot_request});
     t.request_subject_wildcard = try std.fmt.allocPrint(a, "{s}.>", .{t.snapshot_request});
 
@@ -503,7 +510,7 @@ test "parse: reads every name and derives the composites" {
         \\    "snapshot_error_pattern":"e","snapshot_meta_pattern":"m",
         \\    "snapshot_schema_pattern":"sc"
         \\  },
-        \\  "kv": {"schemas":"sch","snapshots":"snp"}
+        \\  "kv": {"schemas":"sch","snapshots":"snp","tenants":"ten"}
         \\}
     ;
     var owned = try parse(testing.allocator, json, null);
@@ -520,6 +527,7 @@ test "parse: reads every name and derives the composites" {
     try testing.expectEqualStrings("init.schema.{[table]s}", t.schema_subject_pattern);
     try testing.expectEqualStrings("$KV.sch.{[table]s}", t.kv_schemas_subject_pattern);
     try testing.expectEqualStrings("$KV.snp.{[table]s}", t.kv_snapshots_subject_pattern);
+    try testing.expectEqualStrings("$KV.ten.{[principal]s}", t.kv_tenants_subject_pattern);
 }
 
 test "parse: a missing key fails at load, naming it" {

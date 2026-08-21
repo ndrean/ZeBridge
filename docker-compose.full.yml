@@ -69,7 +69,7 @@ services:
         # OPEN_TENANT is not a credential but fails the same way: empty renders `cdc..>`,
         # an illegal subject the server refuses at startup — with every login failing
         # for a reason that reads like a credential problem.
-        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD NATS_JOHN_PASSWORD OPEN_TENANT; do
+        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD NATS_JOHN_PASSWORD NATS_MARY_PASSWORD OPEN_TENANT; do
           eval "val=\$$$$v"
           if [ -z "$$val" ]; then
             echo "✗ $$v is unset — refusing to generate a config with an empty value" >&2
@@ -83,6 +83,7 @@ services:
             -e "s|\$${NATS_ALICE_PASSWORD}|$${NATS_ALICE_PASSWORD}|g" \
             -e "s|\$${NATS_BOB_PASSWORD}|$${NATS_BOB_PASSWORD}|g" \
             -e "s|\$${NATS_JOHN_PASSWORD}|$${NATS_JOHN_PASSWORD}|g" \
+            -e "s|\$${NATS_MARY_PASSWORD}|$${NATS_MARY_PASSWORD}|g" \
             -e "s|\$${OPEN_TENANT}|$${OPEN_TENANT}|g" \
             /nats-server.conf.template > /config/nats-server.conf
         # ⚠️ Every $${...} must be gone. An unsubstituted one is not a config error — NATS
