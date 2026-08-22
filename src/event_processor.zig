@@ -898,10 +898,33 @@ pub const EventProcessor = struct {
                     ",\"tombstone_column\":\"{s}\"",
                     .{t},
                 ));
-                return;
+            } else {
+                try json_str.appendSlice(arena, ",\"tombstone_column\":null");
             }
+        } else {
+            try json_str.appendSlice(arena, ",\"tombstone_column\":null");
         }
-        try json_str.appendSlice(arena, ",\"tombstone_column\":null");
+
+        // `TENANT_RULES`: which column scopes this table's rows by tenant, or `null` for
+        // a table every principal reads and writes the same content of (system tables,
+        // genuinely public business tables alike). Published so a client can tell the two
+        // apart per table instead of assuming its own tenant everywhere — before this, a
+        // client's snapshot key for a tenant-agnostic table like `users` used its own
+        // tenant unconditionally, so five principals ended up caching five redundant
+        // snapshots of identical content instead of sharing one.
+        if (self.tenant_rules.get(table)) |rule| {
+            if (rule.len > 0 and has(column_names, rule[0])) {
+                try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                    arena,
+                    ",\"tenant_column\":\"{s}\"",
+                    .{rule[0]},
+                ));
+            } else {
+                try json_str.appendSlice(arena, ",\"tenant_column\":null");
+            }
+        } else {
+            try json_str.appendSlice(arena, ",\"tenant_column\":null");
+        }
     }
 
     pub fn packDdlToSlot(

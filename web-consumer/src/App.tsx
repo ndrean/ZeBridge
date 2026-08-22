@@ -242,6 +242,20 @@ type TableState = {
    * is a `SYNC_RULES` decision rather than a schema one.
    */
   tombstoneColumn: string | null;
+  /**
+   * The table's tenant column, from the schema descriptor (`tenant_column`), or null for
+   * a table every principal reads and writes the same content of — system tables and
+   * genuinely public business tables alike, not just `topology.json`'s `public_tables`
+   * list, which only names user-schema tables.
+   *
+   * Drives which token a snapshot request/descriptor/stream lookup uses for this specific
+   * table: the client's own `TENANT` when set, `topology.open_tenant` when null. Without
+   * this, every table used the client's own tenant unconditionally, so a tenant-agnostic
+   * table like `users` ended up with one redundant cached snapshot per principal instead
+   * of every principal converging on the one the bridge already stores under
+   * `topology.open_tenant`.
+   */
+  tenantColumn: string | null;
   /** WAL LSN this schema is valid from. Events at or below it predate the change. */
   lsn: number;
 };
@@ -323,17 +337,92 @@ const cdcStreams = (): string[] => {
   return [`${cfg.tenant_prefix}${TENANT.toUpperCase()}`, cfg.public];
 };
 
+/// The ONE CDC stream that would carry a given tenant token's writes — not the two-stream
+/// watch list `cdcStreams()` returns, but the single stream a cached snapshot descriptor's
+/// own writes actually land on. Takes the tenant explicitly rather than reading the global
+/// `TENANT`, because the *table* decides which token its own descriptor uses (see
+/// `effectiveTenantFor`) — a tenant-agnostic table's descriptor lives under
+/// `topology.open_tenant`, not necessarily this client's own tenant.
+const cdcStreamForTenant = (tenant: string): string => {
+  const cfg = (topology as any).cdc_streams;
+  if (!cfg) return topology.streams.cdc;
+  const tenants: string[] = (topology as any).tenants || [];
+  if (!tenant || !tenants.includes(tenant)) return cfg.public;
+  return `${cfg.tenant_prefix}${tenant.toUpperCase()}`;
+};
+
+/// Is a cached snapshot descriptor still safe to trust, or does the CDC stream that would
+/// carry this tenant's writes no longer reach back to (or before) the descriptor's own LSN
+/// watermark?
+///
+/// ⚠️ Nothing currently checks this. A client accepts ANY existing `$KV.snapshots` entry
+/// unconditionally, however old — the only trigger for a fresh generation is *no*
+/// descriptor existing at all. Measured live: `users`' descriptor sat at a 1-row watermark
+/// while Postgres held 4, because nothing ever re-requested it, and a since-purged CDC
+/// history meant the gap between that watermark and "now" was unrecoverable — the client
+/// would silently stay wrong forever. This is what should have caught it: if the CDC
+/// stream's own oldest still-available message postdates the descriptor's LSN, some
+/// writes between the snapshot and "now" are already gone, and the descriptor must be
+/// treated as if it did not exist.
+///
+/// An unverifiable case (the stream has 0 messages right now, with an existing descriptor)
+/// is treated as unsafe rather than assumed fine — the only two explanations for that
+/// combination are "nothing written since boot" (retrying costs one harmless
+/// regeneration) and "everything aged out from under this exact descriptor" (the failure
+/// this exists to catch) — the empty stream alone cannot tell them apart, and a wrong wrong
+/// answer here is a silently incomplete replica, not an error anywhere.
+const descriptorStillFresh = async (js: any, tenant: string, desc: any): Promise<boolean> => {
+  if (desc?.lsn == null) return true; // nothing to compare against — accept as before
+  const streamName = cdcStreamForTenant(tenant); // handles the untenanted-deployment case itself
+  try {
+    const jsm = await js.jetstreamManager();
+    const info = await jsm.streams.info(streamName);
+    if (info.state.messages === 0) return false; // can't verify — see doc comment above
+    if (info.state.first_seq <= 1) return true; // full history intact, nothing could age out
+    const ci = await jsm.consumers.add(streamName, {
+      deliver_policy: DeliverPolicy.StartSequence,
+      opt_start_seq: info.state.first_seq,
+    });
+    const consumer = await js.consumers.get(streamName, ci.name);
+    const batch = await consumer.fetch({ max_messages: 1, expires: 3000 });
+    let oldestLsn: number | null = null;
+    for await (const m of batch) {
+      try {
+        const decoded = decode(m.data);
+        const ev = Array.isArray(decoded) ? decoded[0] : decoded;
+        oldestLsn = ev?.lsn ?? null;
+      } catch { /* leave null — see the "can't read it" fallback below */ }
+    }
+    if (oldestLsn == null) return true; // couldn't read it — don't block on an unknown
+    return oldestLsn <= desc.lsn;
+  } catch {
+    return true; // a lookup failure should not itself force every table to re-snapshot
+  }
+};
+
 /// Which INIT stream a snapshot for the current tenant lives on — one stream per request,
 /// unlike `cdcStreams()`'s two-stream watch, since a snapshot request/replay targets a
 /// single tenant at a time. `INIT_<TENANT>` for a declared tenant, `INIT_PUBLIC` for the
 /// open tenant and public-only reads alike, or the legacy `INIT` stream when tenants
 /// aren't declared at all — same fallback shape as `cdcStreams()`.
-const initStream = (): string => {
+const initStream = (tenant: string): string => {
   const cfg = (topology as any).init_streams;
   if (!cfg) return topology.streams.init;                   // untenanted deployment
   const tenants: string[] = (topology as any).tenants || [];
-  if (!TENANT || !tenants.includes(TENANT)) return cfg.public;  // open tenant, or no mapping
-  return `${cfg.tenant_prefix}${TENANT.toUpperCase()}`;
+  if (!tenant || !tenants.includes(tenant)) return cfg.public;  // open tenant, or no mapping
+  return `${cfg.tenant_prefix}${tenant.toUpperCase()}`;
+};
+
+/// Which tenant token a specific table's snapshot request/descriptor/stream lookup should
+/// use — the client's own `TENANT` for a table `TENANT_RULES` actually scopes, or
+/// `topology.open_tenant` for one it doesn't. Without this every table used the client's
+/// own tenant unconditionally, so a tenant-agnostic table (`users`, any system table)
+/// ended up with one redundant cached snapshot per principal instead of every principal
+/// converging on the single one the bridge already stores under the open tenant.
+const effectiveTenantFor = (table: string): string => {
+  const state = syncedTables.get(table);
+  if (state?.tenantColumn) return TENANT;
+  return (topology as any).open_tenant || TENANT; // fall back to TENANT if topology.json predates this field
 };
 
 /**
@@ -829,6 +918,11 @@ export default function App() {
     // from the column list would be wrong half the time.
     const tombstoneColumn: string | null =
       typeof val.tombstone_column === 'string' ? val.tombstone_column : null;
+    // Which column scopes this table by tenant, or null for a table every principal
+    // shares the same content of. See TableState.tenantColumn's own comment for why this
+    // has to come from the bridge rather than `topology.json`'s `public_tables` list.
+    const tenantColumn: string | null =
+      typeof val.tenant_column === 'string' ? val.tenant_column : null;
     const names = cols.map((c) => c.name);
 
     const existing = syncedTables.get(table);
@@ -892,7 +986,7 @@ export default function App() {
         await sql(`CREATE TABLE ${table} (${cols.map(ddl).join(', ')}${tableConstraint});`);
         appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
       } else if (added.length === 0 && removed.length === 0) {
-        syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn });
+        syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
         refreshTableNames();
         reach('migrated');
         return; // identical schema, e.g. a boot republish
@@ -924,7 +1018,7 @@ export default function App() {
       await sql(`DROP VIEW IF EXISTS ${table}_view;`);
       if (viewCols) await sql(`CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`);
 
-      syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn });
+      syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
       refreshTableNames();
       // ⚠️ Both registration paths mark the phase. Marking only one left `migrated`
       // grey on a client that took the other, while `snapshot` went green after it —
@@ -1178,20 +1272,30 @@ export default function App() {
           const snapshotPromises = [];
 
           for (const table of tablesToSnap) {
-            const snapKey = tenanted ? `${TENANT}.${table}` : table;
+            // `TENANT` for a table `TENANT_RULES` actually scopes; `topology.open_tenant`
+            // for one it doesn't (system tables, tenant-agnostic business tables) — every
+            // client converges on the same shared entry for the latter instead of each
+            // caching its own redundant copy.
+            const tenantForTable = tenanted ? effectiveTenantFor(table) : '';
+            const snapKey = tenanted ? `${tenantForTable}.${table}` : table;
             let desc: any = null;
             if (snapKv) {
               try {
                 const entry = await snapKv.get(snapKey);
                 if (entry) {
-                  desc = decode(entry.value); // descriptor is always msgpack, never JSON
+                  const candidate = decode(entry.value); // descriptor is always msgpack, never JSON
+                  if (await descriptorStillFresh(js, tenantForTable, candidate)) {
+                    desc = candidate;
+                  } else {
+                    appendLog('SYS', `Cached snapshot for ${table} is orphaned (CDC no longer covers its watermark) — requesting a fresh one instead`, 'WARNING');
+                  }
                 }
               } catch (e) {}
             }
 
             if (!desc && snapKv) {
               const reqSubject = tenanted
-                ? `${topology.subjects.snapshot_request}.${TENANT}.${table}`
+                ? `${topology.subjects.snapshot_request}.${tenantForTable}.${table}`
                 : `${topology.subjects.snapshot_request}.${table}`;
 
               // PROTOCOL.md §6, "The fourth case: no answer at all".
@@ -1267,9 +1371,9 @@ export default function App() {
                 try {
                   await sql(`DELETE FROM ${table}`);
 
-                  const stream = tenanted ? initStream() : topology.streams.init;
+                  const stream = tenanted ? initStream(tenantForTable) : topology.streams.init;
                   const filterSubject = tenanted
-                    ? `${topology.subjects.init_prefix}.snap.${TENANT}.${table}.${desc.snapshot_id}.>`
+                    ? `${topology.subjects.init_prefix}.snap.${tenantForTable}.${table}.${desc.snapshot_id}.>`
                     : `${topology.subjects.init_prefix}.snap.${table}.${desc.snapshot_id}.>`;
                   const ci = await jsm.consumers.add(stream, {
                     filter_subject: filterSubject,
