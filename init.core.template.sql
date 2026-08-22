@@ -57,6 +57,66 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_BRIDGE_USER};
 -- Ensure bridge user gets SELECT permissions on all FUTURE tables created by the DB owner
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${POSTGRES_BRIDGE_USER};
 
+-- Scope the reader's SELECT by tenant, for the snapshot path — see PROTOCOL.md "The
+-- Connection Flow" Step 0, NOTES.md §1.12 part 1
+--
+-- ⚠️ RLS is evaluated against a query, and logical decoding has no query — structurally
+-- invisible to CDC (§1.8: a policy returned 1 row to a SELECT while the WAL still carried
+-- 2). CDC's tenant correctness is the subject's job and stays that way; this function
+-- only ever affects a real SELECT, which today means the snapshot listener's own
+-- connection setting `zb.tenant` before it queries.
+--
+-- Lives in core, not write: it needs nothing from `zebridge_user_tenants` (that table
+-- resolves a WRITER's own tenant when omitted from a write — a write-path concern only)
+-- and nothing from the writer role. A read-only deployment (`init.core.template.sql`
+-- alone, `ZB_PROFILE=readonly`) can scope its snapshots by tenant with no write profile
+-- installed at all.
+--
+-- ⚠️ `zb_reader_all` cannot simply gain a second, more restrictive policy alongside it:
+-- PostgreSQL ORs every applicable permissive policy for one role/command together, so a
+-- second policy next to an existing `USING (true)` changes nothing — the permissive one
+-- always wins. The fix is making the ONE policy conditional instead: wholesale when
+-- `zb.tenant` is unset, filtered when it is. The replication connection never calls
+-- `set_config('zb.tenant', ...)` — and RLS does not apply to it regardless — so this is a
+-- no-op for CDC and preserves exactly what `zb_reader_all USING (true)` already gave every
+-- caller that never sets it: the reader sees everything by default, and only narrows on
+-- an explicit opt-in.
+--
+-- ⚠️ `coalesce(..., '') = ''`, NOT `IS NULL` — the same trap `zb_sweeper`'s policy already
+-- documents for `zb.principal`, measured again building this one: `current_setting(...,
+-- true)` returns an empty string, not SQL NULL, for a GUC that has never been set on this
+-- role/session (not only after a `SET LOCAL` resets at COMMIT). `IS NULL` never matched —
+-- the "wholesale when unset" branch was dead code, and every reader saw zero rows instead
+-- of everything until this was measured directly against the running database.
+--
+-- ⚠️ The bridge sets `zb.tenant` from the AUTHENTICATED REQUEST SUBJECT, never resolves it
+-- through `zebridge_user_tenants` for this purpose — two derivations of one fact can
+-- disagree (subject says acme, mapping says globex), and only one of them cannot disagree
+-- with itself.
+CREATE OR REPLACE FUNCTION public.zebridge_scope_reads_by_tenant(tbl regclass, tenant_col name)
+RETURNS void AS $$
+DECLARE
+    t text := tbl::text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute
+                   WHERE attrelid = tbl AND attname = tenant_col
+                     AND attnum > 0 AND NOT attisdropped AND attnotnull) THEN
+        RAISE EXCEPTION 'tenant column %.% must exist and be NOT NULL', tbl, tenant_col;
+    END IF;
+
+    EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', tbl);
+
+    EXECUTE format('DROP POLICY IF EXISTS zb_reader_all ON %s', tbl);
+    EXECUTE format(
+        'CREATE POLICY zb_reader_all ON %s FOR SELECT TO %I'
+        ' USING (coalesce(current_setting(''zb.tenant'', true), '''') = '''' OR %I::text = current_setting(''zb.tenant'', true))',
+        tbl, '${POSTGRES_BRIDGE_USER}', tenant_col);
+
+    RAISE NOTICE 'reads on % now filtered by % when zb.tenant is set — CDC is unaffected (RLS does not apply to replication); the snapshot connection sets zb.tenant to scope it',
+                 tbl, tenant_col;
+END;
+$$ LANGUAGE plpgsql;
+
 
 -- The widest row actually stored, in the units CDC packs — see PROTOCOL.md §9
 --
@@ -705,13 +765,21 @@ BEGIN
                 EXECUTE format('SELECT public.zebridge_scope_writes_by_tenant(%L::regclass, %L)', tbl, tenant_col);
             END IF;
             RETURN QUERY SELECT 'rls', verb,
-                format('zebridge_scope_writes_by_tenant(%L, %L) — writes scoped, reads deliberately NOT',
+                format('zebridge_scope_writes_by_tenant(%L, %L) — writes AND snapshot reads scoped; '
+                       'CDC stays scoped by the subject, not RLS (RLS cannot see it)',
                        tbl::text, tenant_col);
         END IF;
     ELSIF tenant_col IS NOT NULL THEN
-        RETURN QUERY SELECT 'rls', 'skipped',
-            'writable => false: nothing to scope in PostgreSQL. Tenant-scoped *reads* are '
-            'enforced by the subject and the NATS grant, not by RLS';
+        -- writable => false: nothing to scope on the WRITE side, but the READ side still
+        -- can be — zebridge_scope_reads_by_tenant needs nothing this branch doesn't
+        -- already have (init.core.template.sql, no write profile required).
+        IF NOT dry_run THEN
+            EXECUTE format('SELECT public.zebridge_scope_reads_by_tenant(%L::regclass, %L)', tbl, tenant_col);
+        END IF;
+        RETURN QUERY SELECT 'rls', verb,
+            format('zebridge_scope_reads_by_tenant(%L, %L) — snapshot reads scoped; '
+                   'CDC stays scoped by the subject, not RLS (RLS cannot see it)',
+                   tbl::text, tenant_col);
     END IF;
 
     IF public_reason IS NOT NULL THEN
@@ -760,8 +828,10 @@ BEGIN
         CASE WHEN tenant_col IS NULL
              THEN format('grant subscribe on cdc.%s.> — and init.snap.%s.> to match, because a '
                          'client must not be able to dump what it cannot subscribe to', short, short)
-             ELSE 'grant subscribe on cdc.<tenant>.> per principal; reload NATS, not the bridge. '
-                  'The snapshot path is NOT tenant-scoped (NOTES.md §1.12)' END;
+             ELSE 'grant subscribe on cdc.<tenant>.>, init.snap.<tenant>.> and '
+                  '$KV.snapshots.<tenant>.> per principal — one stream (INIT_<TENANT>) per '
+                  'tenant, same reason as CDC_<TENANT> (a JetStream filter_subject is '
+                  'reader-chosen, not ACL-checked); reload NATS, not the bridge' END;
 
     IF dry_run THEN
         RETURN QUERY SELECT 'summary', 'DRY RUN', 'nothing was applied — re-run with dry_run => false';

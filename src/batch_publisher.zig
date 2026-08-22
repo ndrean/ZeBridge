@@ -396,7 +396,6 @@ pub const BatchPublisher = struct {
     allocator: std.mem.Allocator,
     publisher: *nats_publisher.Publisher,
     config: BatchConfig,
-    format: encoder_mod.Format,
     metrics: ?*Metrics, // Optional metrics reference
 
     // Pre-allocated ring buffer of CDCEvent structs (zero malloc/free!)
@@ -473,7 +472,6 @@ pub const BatchPublisher = struct {
         allocator: std.mem.Allocator,
         publisher: *nats_publisher.Publisher,
         config: BatchConfig,
-        format: encoder_mod.Format,
         metrics: ?*Metrics,
         runtime_config: *const Config.RuntimeConfig,
         /// This instance's resolved column-descriptor ceiling — auto-detected from the
@@ -606,7 +604,6 @@ pub const BatchPublisher = struct {
             .allocator = allocator,
             .publisher = publisher,
             .config = config,
-            .format = format,
             .metrics = metrics,
             .events = events,
             .data_slab = data_slab,
@@ -1057,7 +1054,7 @@ pub const BatchPublisher = struct {
             const slot_idx = indices[0];
             const event = &self.events[slot_idx];
 
-            var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
+            var encoder = encoder_mod.Encoder.init(flush_alloc, .msgpack);
 
             var event_map = encoder.createMap();
 
@@ -1107,7 +1104,7 @@ pub const BatchPublisher = struct {
             log.debug("Published single event: {s}", .{event.getSubject()});
         } else {
             // Batch publishing
-            var encoder = encoder_mod.Encoder.init(flush_alloc, self.format);
+            var encoder = encoder_mod.Encoder.init(flush_alloc, .msgpack);
 
             var batch_array = try encoder.createArray(event_count);
 

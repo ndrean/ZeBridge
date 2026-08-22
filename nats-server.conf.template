@@ -101,7 +101,8 @@ ALICE_READ = [
   "cdc.acme.>"                 # her tenant's change feed — and nobody else's
   "cdc.users.>"                # public tables, which carry no tenant token
   "cdc.${OPEN_TENANT}.>"       # the open tenant: rows that opted into no tenant
-  "init.>"                     # snapshot chunks, schemas, snapshot errors
+  "init.snap.acme.>"           # her tenant's snapshot chunks and dump metadata
+  "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
   "mutation_ack.alice.>"       # her own write verdicts, keyed by her Nats-Msg-Id
   "$KV.schemas.>"              # schema descriptors
   "$KV.snapshots.>"            # snapshot descriptors
@@ -121,7 +122,8 @@ BOB_READ = [
   "cdc.globex.>"               # HIS tenant — the same one-line difference as mutation_ack
   "cdc.users.>"                # public tables
   "cdc.${OPEN_TENANT}.>"       # the open tenant — same subject as alice's, by design
-  "init.>"
+  "init.snap.globex.>"         # HIS tenant's snapshot chunks and dump metadata
+  "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
   "mutation_ack.bob.>"         # HIS own verdicts — not alice's
   "$KV.schemas.>"
   "$KV.snapshots.>"
@@ -135,7 +137,7 @@ JOHN_READ = [
   "cdc.users.>"                # public tables
   "cdc.${OPEN_TENANT}.>"       # HIS tenant, in the open-mapping sense — same subject as
                                 # alice's and bob's open-tenant reads, by design
-  "init.>"
+  "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
   "mutation_ack.john.>"        # HIS own verdicts
   "$KV.schemas.>"
   "$KV.snapshots.>"
@@ -149,8 +151,24 @@ MARY_READ = [
   "cdc.globex.>"
   "cdc.users.>"
   "cdc.${OPEN_TENANT}.>"
-  "init.>"
+  "init.snap.globex.>"         # this tenant's snapshot chunks and dump metadata
+  "init.snap.${OPEN_TENANT}.>"       # open-tenant + public-table snapshot data
   "mutation_ack.mary.>"        # HER own verdicts — not bob's
+  "$KV.schemas.>"
+  "$KV.snapshots.>"
+  "_INBOX.>"
+]
+
+# ⚠️ Also `globex`, like bob and mary. A third principal on the same tenant — same
+# reasoning as mary's own comment: `$KV.tenants.nina` is its own key, resolving the
+# same value from its own `zebridge_user_tenants` row, not a shared credential.
+NINA_READ = [
+  "cdc.globex.>"
+  "cdc.users.>"
+  "cdc.${OPEN_TENANT}.>"
+  "init.snap.globex.>"         # this tenant's snapshot chunks and dump metadata
+  "init.snap.${OPEN_TENANT}.>"       # open-tenant + public-table snapshot data
+  "mutation_ack.nina.>"        # HER own verdicts — not bob's or mary's
   "$KV.schemas.>"
   "$KV.snapshots.>"
   "_INBOX.>"
@@ -176,12 +194,11 @@ authorization {
           # matters for integrity: alice's writes are confined to her own subtree.
           "mutation.alice.>"
 
-          # Read-side requests. Both `snapshot.request` and `init.schema` are
-          # captured by the REQUESTS stream, so a client may ask for any table's
-          # snapshot — asking is not reading, and the reply lands on init.> which
-          # it may already see.
-          "snapshot.request.>"
-          "init.schema.>"
+          # Read-side requests. `snapshot.request` is captured by the REQUESTS
+          # stream, so a client may ask for any table's snapshot — asking is not
+          # reading, and the reply lands on init.> which it may already see.
+          "snapshot.request.acme.>"
+          "snapshot.request.${OPEN_TENANT}.>"
 
           # The account-info probe. `jetstreamManager(nc)` issues this before anything
           # else, so omitting it does not fail one feature — it fails the connection,
@@ -198,7 +215,8 @@ authorization {
           # Scoping to named streams is what stops alice creating a consumer on
           # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
           # would hand her exactly that, which is why it is not used here.
-          "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
+          "$JS.API.CONSUMER.CREATE.INIT_ACME",     "$JS.API.CONSUMER.CREATE.INIT_ACME.>"
+          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           # ⚠️ **The stream name is the read boundary, not the subject.** A JetStream
           # consumer never subscribes to the subject it filters on, so `cdc.acme.>` in the
           # subscribe list below cannot stop a client creating a consumer on a shared stream
@@ -215,7 +233,8 @@ authorization {
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
-          "$JS.API.CONSUMER.INFO.INIT.>"
+          "$JS.API.CONSUMER.INFO.INIT_ACME.>"
+          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_ACME.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
@@ -228,21 +247,23 @@ authorization {
           # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
           # and REQUESTS, which no client can reach at all.
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_ACME.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_ACME.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT"
+          "$JS.API.STREAM.INFO.INIT_ACME"
+          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_ACME"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.acme.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
-          "$JS.API.STREAM.MSG.GET.KV_snapshots"
 
           # ⚠️ PROTOCOL.md Step 0: alice may fetch ONLY her own key. Direct Get puts
           # the key in the SUBJECT, which is what makes this scopable at all — unlike
@@ -292,12 +313,11 @@ authorization {
           # matters for integrity: bob's writes are confined to her own subtree.
           "mutation.bob.>"
 
-          # Read-side requests. Both `snapshot.request` and `init.schema` are
-          # captured by the REQUESTS stream, so a client may ask for any table's
-          # snapshot — asking is not reading, and the reply lands on init.> which
-          # it may already see.
-          "snapshot.request.>"
-          "init.schema.>"
+          # Read-side requests. `snapshot.request` is captured by the REQUESTS
+          # stream, so a client may ask for any table's snapshot — asking is not
+          # reading, and the reply lands on init.> which it may already see.
+          "snapshot.request.globex.>"
+          "snapshot.request.${OPEN_TENANT}.>"
 
           # The account-info probe. `jetstreamManager(nc)` issues this before anything
           # else, so omitting it does not fail one feature — it fails the connection,
@@ -314,7 +334,8 @@ authorization {
           # Scoping to named streams is what stops bob creating a consumer on
           # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
           # would hand her exactly that, which is why it is not used here.
-          "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
+          "$JS.API.CONSUMER.CREATE.INIT_GLOBEX",     "$JS.API.CONSUMER.CREATE.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           # ⚠️ **The stream name is the read boundary, not the subject.** A JetStream
           # consumer never subscribes to the subject it filters on, so `cdc.acme.>` in the
           # subscribe list below cannot stop a client creating a consumer on a shared stream
@@ -331,7 +352,8 @@ authorization {
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
-          "$JS.API.CONSUMER.INFO.INIT.>"
+          "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
@@ -344,21 +366,23 @@ authorization {
           # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
           # and REQUESTS, which no client can reach at all.
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT"
+          "$JS.API.STREAM.INFO.INIT_GLOBEX"
+          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_GLOBEX"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.globex.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
-          "$JS.API.STREAM.MSG.GET.KV_snapshots"
 
           # See alice's block above for why this is the exact key and not a wildcard,
           # and why STREAM.MSG.GET.KV_tenants / CONSUMER.*.KV_tenants are absent.
@@ -388,33 +412,31 @@ authorization {
         publish = { allow: [
           "mutation.john.>"
 
-          "snapshot.request.>"
-          "init.schema.>"
+          "snapshot.request.${OPEN_TENANT}.>"
 
           "$JS.API.INFO"
 
-          "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
+          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
-          "$JS.API.CONSUMER.INFO.INIT.>"
+          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
           "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT"
+          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
-          "$JS.API.STREAM.MSG.GET.KV_snapshots"
 
           # Granted even though `$KV.tenants` has no entry for john — without this he
           # gets a Permissions Violation on the attempt itself (indistinguishable from
@@ -438,43 +460,95 @@ authorization {
         publish = { allow: [
           "mutation.mary.>"
 
-          "snapshot.request.>"
-          "init.schema.>"
+          "snapshot.request.globex.>"
+          "snapshot.request.${OPEN_TENANT}.>"
 
           "$JS.API.INFO"
 
-          "$JS.API.CONSUMER.CREATE.INIT",           "$JS.API.CONSUMER.CREATE.INIT.>"
+          "$JS.API.CONSUMER.CREATE.INIT_GLOBEX",     "$JS.API.CONSUMER.CREATE.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
-          "$JS.API.CONSUMER.INFO.INIT.>"
+          "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
           "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT"
+          "$JS.API.STREAM.INFO.INIT_GLOBEX"
+          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_GLOBEX"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.globex.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
-          "$JS.API.STREAM.MSG.GET.KV_snapshots"
 
           # See alice's block above for why this is the exact key and not a wildcard.
           "$JS.API.DIRECT.GET.KV_tenants.$KV.tenants.mary"
           "$JS.ACK.>"
         ] }
         subscribe = { allow: $MARY_READ }
+    } }
+
+    # ── a fifth principal, third on globex — three independent rows resolving one value ──
+    { user: "nina", password: "${NATS_NINA_PASSWORD}", permissions: {
+        publish = { allow: [
+          "mutation.nina.>"
+
+          "snapshot.request.globex.>"
+          "snapshot.request.${OPEN_TENANT}.>"
+
+          "$JS.API.INFO"
+
+          "$JS.API.CONSUMER.CREATE.INIT_GLOBEX",     "$JS.API.CONSUMER.CREATE.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
+          "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
+          "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
+          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
+          "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
+          "$JS.API.CONSUMER.INFO.KV_schemas.>"
+          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
+
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
+          "$JS.API.STREAM.INFO.INIT_GLOBEX"
+          "$JS.API.STREAM.INFO.INIT_PUBLIC"
+          "$JS.API.STREAM.INFO.CDC_GLOBEX"
+          "$JS.API.STREAM.INFO.CDC_PUBLIC"
+          "$JS.API.STREAM.INFO.KV_schemas"
+          "$JS.API.STREAM.INFO.KV_snapshots"
+          "$JS.API.STREAM.INFO.KV_tenants"
+          "$JS.API.DIRECT.GET.KV_schemas.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.globex.>"
+          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
+          "$JS.API.STREAM.MSG.GET.KV_schemas"
+
+          # See alice's block above for why this is the exact key and not a wildcard.
+          "$JS.API.DIRECT.GET.KV_tenants.$KV.tenants.nina"
+          "$JS.ACK.>"
+        ] }
+        subscribe = { allow: $NINA_READ }
     } }
   ]
 

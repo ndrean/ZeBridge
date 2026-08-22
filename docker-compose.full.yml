@@ -69,7 +69,7 @@ services:
         # OPEN_TENANT is not a credential but fails the same way: empty renders `cdc..>`,
         # an illegal subject the server refuses at startup — with every login failing
         # for a reason that reads like a credential problem.
-        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD NATS_JOHN_PASSWORD NATS_MARY_PASSWORD OPEN_TENANT; do
+        for v in NATS_BRIDGE_NKEY_PUB NATS_ALICE_PASSWORD NATS_BOB_PASSWORD NATS_JOHN_PASSWORD NATS_MARY_PASSWORD NATS_NINA_PASSWORD OPEN_TENANT; do
           eval "val=\$$$$v"
           if [ -z "$$val" ]; then
             echo "✗ $$v is unset — refusing to generate a config with an empty value" >&2
@@ -84,6 +84,7 @@ services:
             -e "s|\$${NATS_BOB_PASSWORD}|$${NATS_BOB_PASSWORD}|g" \
             -e "s|\$${NATS_JOHN_PASSWORD}|$${NATS_JOHN_PASSWORD}|g" \
             -e "s|\$${NATS_MARY_PASSWORD}|$${NATS_MARY_PASSWORD}|g" \
+            -e "s|\$${NATS_NINA_PASSWORD}|$${NATS_NINA_PASSWORD}|g" \
             -e "s|\$${OPEN_TENANT}|$${OPEN_TENANT}|g" \
             /nats-server.conf.template > /config/nats-server.conf
         # ⚠️ Every $${...} must be gone. An unsubstituted one is not a config error — NATS
@@ -334,8 +335,55 @@ services:
         fi
         fi
 
-        echo "Creating NATS JetStream stream: $$INIT_STREAM (subject: $$INIT_PREFIX.>)"
-        nats stream add $$INIT_STREAM --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+        # ── INIT is SPLIT PER TENANT too, same reason and same measured bug as CDC ──
+        #
+        # A JetStream consumer's `filter_subject` is reader-chosen and never checked
+        # against a subject permission — only the STREAM a consumer is created on is
+        # ACL-governed. One wide INIT stream with tenant only in the subject would let
+        # any client with consumer-creation rights on it pull another tenant's snapshot
+        # chunks by choosing a different `filter_subject` — the exact leak
+        # `scripts/scenarios/crosstenant.py` already measured for CDC before that split,
+        # reproduced on the snapshot path instead (its own check D flags this).
+        #
+        # Subject shape: `init.snap.<tenant>.<table>...` — tenant right after `snap`,
+        # uniformly, so `init.snap.acme.>` alone catches the data chunks AND the
+        # start/error/meta/schema-for-that-dump subjects, which all share the same
+        # prefix by design (see topology.json). INIT_PUBLIC carries the `_default`-tenant
+        # snapshot data — open-tenant rows of a tenant-scoped table, and genuinely public
+        # tables, which use the same open token for snapshots since there is no tenant
+        # column to filter a public table's content by regardless of which stream its
+        # chunks land in, so audience is the only thing the token decides there.
+        # (`init.schema.<table>` — the on-demand live table-shape descriptor request —
+        # used to share this stream too; the bridge no longer listens on that subject at
+        # all, so it is no longer part of this filter — see NOTES.md/PROTOCOL.md.)
+        INIT_TENANT_PREFIX=$(jq -r '.init_streams.tenant_prefix' /topology.json)
+        INIT_PUBLIC_STREAM=$(jq -r '.init_streams.public' /topology.json)
+
+        if [ "$$TENANT_COUNT" = "0" ]; then
+          echo "No tenants declared in topology.json — keeping the single wide stream $$INIT_STREAM"
+          nats stream add $$INIT_STREAM --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+        else
+
+        if nats stream info $$INIT_STREAM --json >/dev/null 2>&1; then
+          echo "Removing legacy wide stream $$INIT_STREAM (subjects overlap the per-tenant split)"
+          nats stream rm $$INIT_STREAM -f || true
+        fi
+
+        for T in $(jq -r '.tenants[]' /topology.json); do
+          UPPER=$(echo "$$T" | tr '[:lower:]' '[:upper:]')
+          echo "Creating per-tenant INIT stream: $$INIT_TENANT_PREFIX$$UPPER (subject: $$INIT_PREFIX.snap.$$T.>)"
+          nats stream add $$INIT_TENANT_PREFIX$$UPPER --subjects="$$INIT_PREFIX.snap.$$T.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+        done
+
+        INIT_PUBLIC_SUBJECTS="$$INIT_PREFIX.snap.$${OPEN_TENANT}.>"
+        if nats stream info $$INIT_PUBLIC_STREAM --json >/dev/null 2>&1; then
+          echo "Updating public INIT stream: $$INIT_PUBLIC_STREAM (subjects: $$INIT_PUBLIC_SUBJECTS)"
+          nats stream edit $$INIT_PUBLIC_STREAM --subjects="$$INIT_PUBLIC_SUBJECTS" -f || true
+        else
+          echo "Creating public INIT stream: $$INIT_PUBLIC_STREAM (subjects: $$INIT_PUBLIC_SUBJECTS)"
+          nats stream add $$INIT_PUBLIC_STREAM --subjects="$$INIT_PUBLIC_SUBJECTS" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
+        fi
+        fi
 
         # Default: INIT's own 7-day retention minus a 30-minute safety margin, not a
         # short anti-thundering-herd debounce. A snapshot already in INIT is good for

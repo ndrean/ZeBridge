@@ -49,11 +49,11 @@ const SnapshotResult = struct {
 fn publishSnapshotError(
     allocator: std.mem.Allocator,
     conn_nats: *nats.Connection,
+    tenant: []const u8,
     table_name: []const u8,
     error_type: []const u8,
     error_message: []const u8,
     available_tables: []const []const u8,
-    format: encoder_mod.Format,
     topo: *const topology_mod.Topology,
     /// The snapshot that failed, when one had been started. Null for a request rejected
     /// before generation began (unknown table, refused table). Present so an operator can
@@ -64,12 +64,12 @@ fn publishSnapshotError(
     const subject = try topology_mod.render(
         allocator,
         topo.snapshot_error_pattern,
-        &.{.{ .name = "table", .value = table_name }},
+        &.{ .{ .name = "tenant", .value = tenant }, .{ .name = "table", .value = table_name } },
         null,
     );
     defer allocator.free(subject);
 
-    var encoder = encoder_mod.Encoder.init(allocator, format);
+    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
     defer encoder.deinit();
 
     var map = encoder.createMap();
@@ -304,7 +304,7 @@ fn purgeOrphanChunks(
     allocator: std.mem.Allocator,
     js: *nats.JetStream,
     topo: *const topology_mod.Topology,
-    stream: []const u8,
+    tenant: []const u8,
     table_name: []const u8,
     snapshot_id: []const u8,
 ) void {
@@ -313,6 +313,7 @@ fn purgeOrphanChunks(
     // chunks were published with, so a renamed subject space cannot leave the purge
     // pointing at the old one.
     const chunk_filter = topology_mod.render(allocator, topo.snapshot_data_pattern, &.{
+        .{ .name = "tenant", .value = tenant },
         .{ .name = "table", .value = table_name },
         .{ .name = "snapshot_id", .value = snapshot_id },
         .{ .name = "chunk", .value = ">" },
@@ -320,20 +321,37 @@ fn purgeOrphanChunks(
     defer allocator.free(chunk_filter);
 
     const schema_subject = topology_mod.render(allocator, topo.snapshot_schema_pattern, &.{
+        .{ .name = "tenant", .value = tenant },
         .{ .name = "table", .value = table_name },
         .{ .name = "snapshot_id", .value = snapshot_id },
     }, null) catch return;
     defer allocator.free(schema_subject);
 
-    for ([_][]const u8{ chunk_filter, schema_subject }) |filter| {
-        // Native here; the vendored client had no purge-by-filter, so this used to call
-        // a `PURGE_FILTER` added to it by hand.
-        var res = js.purgeStream(stream, .{ .filter = filter }) catch |err| {
-            log.warn("🧹 could not purge orphaned '{s}' ({}); it will age out with the stream", .{ filter, err });
-            continue;
-        };
-        res.deinit();
-        log.info("🧹 purged orphaned snapshot data: {s}", .{filter});
+    // INIT is split per tenant (same reason as CDC — a JetStream purge is stream-scoped,
+    // not subject-checked). Which stream actually holds this tenant's chunks isn't known
+    // here without threading OPEN_TENANT into the bridge, so this tries both candidates
+    // and tolerates whichever one doesn't apply — cheap, since this is best-effort orphan
+    // cleanup on an already-failed snapshot, not a path anything correctness-sensitive
+    // depends on. `js.purgeStream` on a stream with no matching messages (or a tenant
+    // stream that doesn't exist at all) just fails softly into the existing warn-and-skip
+    // branch below.
+    var upper_buf: [64]u8 = undefined;
+    const upper_len = @min(tenant.len, upper_buf.len);
+    const tenant_upper = std.ascii.upperString(upper_buf[0..upper_len], tenant[0..upper_len]);
+    const tenant_stream = std.fmt.allocPrint(allocator, "{s}{s}", .{ topo.init_stream_prefix, tenant_upper }) catch return;
+    defer allocator.free(tenant_stream);
+
+    for ([_][]const u8{ tenant_stream, topo.init_stream_public }) |stream| {
+        for ([_][]const u8{ chunk_filter, schema_subject }) |filter| {
+            // Native here; the vendored client had no purge-by-filter, so this used to call
+            // a `PURGE_FILTER` added to it by hand.
+            var res = js.purgeStream(stream, .{ .filter = filter }) catch |err| {
+                log.warn("🧹 could not purge orphaned '{s}' on {s} ({}); it will age out with the stream", .{ filter, stream, err });
+                continue;
+            };
+            res.deinit();
+            log.info("🧹 purged orphaned snapshot data: {s} on {s}", .{ filter, stream });
+        }
     }
 }
 
@@ -783,7 +801,6 @@ pub const SnapshotListener = struct {
     publication_name: []const u8,
     refused: *refused_tables.Registry,
     thread: ?std.Thread = null,
-    format: encoder_mod.Format,
     chunk_size: usize,
     io: std.Io,
     /// Where NATS is, resolved once in `bridge.zig`. Not re-derived here: see
@@ -802,7 +819,6 @@ pub const SnapshotListener = struct {
         monitored_tables: []const []const u8,
         publication_name: []const u8,
         refused: *refused_tables.Registry,
-        format: encoder_mod.Format,
         runtime_config: *const config.RuntimeConfig,
         io: std.Io,
         endpoint: config.Nats.Endpoint,
@@ -816,7 +832,6 @@ pub const SnapshotListener = struct {
             .publication_name = publication_name,
             .refused = refused,
             .thread = null,
-            .format = format,
             .io = io,
             .endpoint = endpoint,
             .boot_fatal = boot_fatal,
@@ -848,22 +863,16 @@ pub const SnapshotListener = struct {
 
     /// Background listening loop (internal)
     fn listenLoop(self: *SnapshotListener) !void {
-        // Two independent subscribers, each with its own NATS connection: a schema
-        // request must not queue behind a snapshot's COPY, which can run for minutes.
-        log.info("📋 Spawning schema request listener...", .{});
-        const schema_thread = try std.Thread.spawn(.{}, listenForSchemaRequests, .{
-            self.allocator,
-            self.pg_config,
-            self.should_stop,
-            self.monitored_tables,
-            self.refused,
-            self.format,
-            self.io,
-            self.endpoint,
-            self.boot_fatal,
-            self.topology,
-        });
-
+        // The schema-request listener (`init.schema.<table>`) that used to run alongside
+        // this was removed: it was a pull mechanism from an earlier design that predates
+        // the current push model (`event_processor.publishBootSchemas` at boot,
+        // `packDdlToSlot` on every DDL change, both writing straight to `$KV.schemas` —
+        // see PROTOCOL.md). Its own stated rationale, "answers on its own connection so a
+        // request never queues behind a slow COPY," only matters if a client asks and
+        // waits; the real client only ever `kv.watch()`s `$KV.schemas`, which delivers the
+        // current value immediately and every update after, with nothing to queue behind.
+        // Zero scenario-script coverage and zero use in App.tsx confirmed it was never
+        // exercised outside manual testing.
         log.info("📸 Spawning snapshot request listener...", .{});
         const snapshot_thread = try std.Thread.spawn(.{}, listenForSnapshotRequests, .{
             self.allocator,
@@ -872,7 +881,6 @@ pub const SnapshotListener = struct {
             self.monitored_tables,
             self.publication_name,
             self.refused,
-            self.format,
             self.chunk_size,
             self.io,
             self.endpoint,
@@ -885,337 +893,8 @@ pub const SnapshotListener = struct {
             utils.sleep(100 * std.time.ns_per_ms);
         }
 
-        // Wait for threads to finish
-        schema_thread.join();
+        // Wait for the snapshot listener to finish.
         snapshot_thread.join();
-    }
-
-    // Listens for schema requests on topo.schema_request and responds
-    // with fresh schema data queried from PostgreSQL information_schema.
-
-    /// Column information from information_schema
-    const SchemaColumnInfo = struct {
-        name: []const u8,
-        position: u32,
-        data_type: []const u8,
-        is_nullable: bool,
-        column_default: ?[]const u8,
-    };
-
-    /// Schema request handler — subscribes to the topology's schema request subject and
-    /// responds with table schemas
-    /// Note: Thread functions cannot return errors - all errors must be caught internally
-    fn listenForSchemaRequests(
-        allocator: std.mem.Allocator,
-        pg_config: *const pg_conn.PgConf,
-        should_stop: *std.atomic.Value(bool),
-        monitored_tables: []const []const u8,
-        refused: *refused_tables.Registry,
-        format: encoder_mod.Format,
-        io: std.Io,
-        endpoint: config.Nats.Endpoint,
-        boot_fatal: *std.atomic.Value(bool),
-        topo: *const topology_mod.Topology,
-    ) void {
-        const reconnect_delay_ms = config.Retry.nats_reconnect_delay_ms;
-
-        // See `Retry.listener_boot_connect_attempts`: the first connection is bounded
-        // because failing it means misconfiguration, every later one is not.
-        var boot = BootConnect{ .who = "📋 Schema listener", .should_stop = should_stop, .fatal = boot_fatal, .requests_stream = topo.stream_requests };
-
-        // Outer reconnection loop
-        while (!should_stop.load(.acquire)) {
-            log.info("📋 Schema listener: Connecting to NATS...", .{});
-
-            // Core NATS: schema requests are a plain subject, not a stream.
-            var core = nats.Connection.init(allocator, io, .{
-                .user = endpoint.user,
-                .password = endpoint.pass,
-                .nkey_seed = endpoint.seed,
-            });
-            defer core.deinit();
-
-            const core_url = std.fmt.allocPrint(allocator, "nats://{s}:{d}", .{ endpoint.host, endpoint.port }) catch continue;
-            defer allocator.free(core_url);
-            core.connect(core_url) catch |err| {
-                if (boot.failed(err, endpoint.host, endpoint.port)) return;
-                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
-                continue;
-            };
-
-            log.info("📋 Schema listener: Connected! Subscribing to 'init.schema'...", .{});
-
-            // Subscribe to init.schema
-            const sub = core.subscribeSync(topo.schema_request) catch |err| {
-                log.err("📋 Schema listener: Failed to subscribe: {} - reconnecting", .{err});
-                utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
-                continue;
-            };
-            defer sub.deinit();
-
-            // Listen for schema requests
-            while (!should_stop.load(.acquire)) {
-                // Short timeout so shutdown stays responsive: this loop is the only thing
-                // between a Ctrl-C and the thread's join.
-                const msg = sub.nextMsgTimeout(.{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } }) catch |err| {
-                    if (err == error.Timeout) continue;
-                    log.err("📋 Schema listener: Error receiving: {} - reconnecting", .{err});
-                    utils.sleep(reconnect_delay_ms * std.time.ns_per_ms);
-                    break;
-                };
-                defer msg.deinit();
-
-                log.info("📋 Schema request received: {s}", .{msg.data});
-
-                handleSchemaRequest(
-                    allocator,
-                    &core,
-                    pg_config,
-                    monitored_tables,
-                    refused,
-                    format,
-                    topo,
-                ) catch |err| {
-                    log.err("📋 Failed to handle schema request: {}", .{err});
-                };
-            }
-        }
-
-        log.info("📋 Schema listener stopped", .{});
-    }
-
-    /// Handle a single schema request by querying PostgreSQL and publishing response
-    fn handleSchemaRequest(
-        allocator: std.mem.Allocator,
-        core: *nats.Connection,
-        pg_config: *const pg_conn.PgConf,
-        monitored_tables: []const []const u8,
-        refused: *refused_tables.Registry,
-        format: encoder_mod.Format,
-        topo: *const topology_mod.Topology,
-    ) !void {
-        // Create PostgreSQL connection
-        const conninfo = try pg_config.connInfo(allocator, false);
-        defer allocator.free(conninfo);
-
-        const conn = c.PQconnectdb(conninfo.ptr);
-        if (conn == null) return error.ConnectionFailed;
-        defer c.PQfinish(conn);
-
-        if (c.PQstatus(conn) != c.CONNECTION_OK) {
-            return error.ConnectionFailed;
-        }
-
-        // Build IN clause for monitored tables
-        var in_clause: std.ArrayList(u8) = .empty;
-        defer in_clause.deinit(allocator);
-
-        try in_clause.appendSlice(allocator, "(");
-        var listed: usize = 0;
-        for (monitored_tables) |table| {
-            // Extract table name if it's "schema.table" format
-            const table_name = blk: {
-                if (std.mem.indexOf(u8, table, ".")) |idx| {
-                    break :blk table[idx + 1 ..];
-                }
-                break :blk table;
-            };
-
-            // Withhold refused tables here too. This is the third schema publisher
-            // (boot pass, DDL path, and this on-demand responder); a guard on two of
-            // three still leaks a live schema for a table that will never send rows.
-            if (refused.isRefused(table_name)) {
-                log.warn(
-                    "📋 Withholding schema for refused table '{s}' ({s})",
-                    .{ table_name, if (refused.reasonFor(table_name)) |r| r.wireName() else "refused" },
-                );
-                continue;
-            }
-
-            // Counted separately from the loop index: skipping a table must not leave a
-            // dangling comma in the IN clause.
-            if (listed > 0) try in_clause.appendSlice(allocator, ", ");
-            listed += 1;
-
-            try in_clause.appendSlice(allocator, "'");
-            try in_clause.appendSlice(allocator, table_name);
-            try in_clause.appendSlice(allocator, "'");
-        }
-        try in_clause.appendSlice(allocator, ")");
-
-        // Query information_schema
-        const query = try utils.allocPrintZ(
-            allocator,
-            \\SELECT
-            \\    t.table_schema,
-            \\    t.table_name,
-            \\    c.column_name,
-            \\    c.ordinal_position,
-            \\    c.data_type,
-            \\    c.is_nullable,
-            \\    c.column_default
-            \\FROM information_schema.tables t
-            \\JOIN information_schema.columns c
-            \\    ON t.table_schema = c.table_schema
-            \\    AND t.table_name = c.table_name
-            \\WHERE t.table_schema = 'public'
-            \\    AND t.table_type = 'BASE TABLE'
-            \\    AND t.table_name IN {s}
-            \\ORDER BY t.table_name, c.ordinal_position;
-        ,
-            .{in_clause.items},
-        );
-        // !! TODO handle empty tables. `if (length(in_clause.items)==0) {}
-        defer allocator.free(query);
-
-        const result = c.PQexec(conn, query.ptr);
-        defer c.PQclear(result);
-
-        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
-            return error.QueryFailed;
-        }
-
-        const num_rows: usize = @intCast(c.PQntuples(result));
-        if (num_rows == 0) {
-            log.warn("📋 No schemas found for monitored tables", .{});
-            return;
-        }
-
-        // Group columns by table
-        var table_schemas = std.StringHashMap(std.ArrayList(SchemaColumnInfo)).init(allocator);
-        defer {
-            var it = table_schemas.iterator();
-            while (it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                for (entry.value_ptr.items) |col| {
-                    allocator.free(col.name);
-                    allocator.free(col.data_type);
-                    if (col.column_default) |d| allocator.free(d);
-                }
-                entry.value_ptr.deinit(allocator);
-            }
-            table_schemas.deinit();
-        }
-
-        // Parse rows and group by table
-        for (0..num_rows) |ui| {
-            const i: c_int = @intCast(ui);
-            const table_schema = std.mem.span(c.PQgetvalue(result, i, 0));
-            const table_name = std.mem.span(c.PQgetvalue(result, i, 1));
-            const column_name = std.mem.span(c.PQgetvalue(result, i, 2));
-            const position_str = std.mem.span(c.PQgetvalue(result, i, 3));
-            const data_type = std.mem.span(c.PQgetvalue(result, i, 4));
-            const is_nullable_str = std.mem.span(c.PQgetvalue(result, i, 5));
-            const column_default_ptr = c.PQgetvalue(result, i, 6);
-
-            const position = try std.fmt.parseInt(u32, position_str, 10);
-            const is_nullable = std.mem.eql(u8, is_nullable_str, "YES");
-            const column_default = if (c.PQgetisnull(result, i, 6) == 1)
-                null
-            else
-                std.mem.span(column_default_ptr);
-
-            // Build full table name: schema.table
-            const full_table_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ table_schema, table_name });
-
-            const entry = try table_schemas.getOrPut(full_table_name);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = std.ArrayList(SchemaColumnInfo).empty;
-            } else {
-                allocator.free(full_table_name);
-            }
-
-            try entry.value_ptr.append(allocator, .{
-                .name = try allocator.dupe(u8, column_name),
-                .position = position,
-                .data_type = try allocator.dupe(u8, data_type),
-                .is_nullable = is_nullable,
-                .column_default = if (column_default) |d| try allocator.dupe(u8, d) else null,
-            });
-        }
-
-        // Publish each table's schema as response
-        var it = table_schemas.iterator();
-        while (it.next()) |entry| {
-            const table_name = entry.key_ptr.*;
-            const columns = entry.value_ptr.items;
-
-            try publishSchemaResponse(allocator, core, table_name, columns, format, topo);
-        }
-
-        log.info("📋 Published schemas for {d} tables", .{table_schemas.count()});
-    }
-
-    /// Publish schema response to NATS
-    fn publishSchemaResponse(
-        allocator: std.mem.Allocator,
-        core: *nats.Connection,
-        table_name: []const u8,
-        columns: []const SchemaColumnInfo,
-        format: encoder_mod.Format,
-        topo: *const topology_mod.Topology,
-    ) !void {
-        // Extract just table name (remove schema prefix)
-        const table_only = blk: {
-            if (std.mem.indexOf(u8, table_name, ".")) |idx| {
-                break :blk table_name[idx + 1 ..];
-            }
-            break :blk table_name;
-        };
-
-        // Build payload
-        var encoder = encoder_mod.Encoder.init(allocator, format);
-        defer encoder.deinit();
-
-        var schema_map = encoder.createMap();
-        defer schema_map.free(allocator);
-
-        try schema_map.put(encoder.allocator, "table", try encoder.createString(table_only));
-        try schema_map.put(encoder.allocator, "schema", try encoder.createString(table_name));
-        try schema_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
-
-        var columns_array = try encoder.createArray(columns.len);
-        for (columns, 0..) |col, i| {
-            var col_map = encoder.createMap();
-            try col_map.put(encoder.allocator, "name", try encoder.createString(col.name));
-            try col_map.put(encoder.allocator, "position", encoder.createInt(@intCast(col.position)));
-            try col_map.put(encoder.allocator, "data_type", try encoder.createString(col.data_type));
-            try col_map.put(encoder.allocator, "is_nullable", encoder.createBool(col.is_nullable));
-
-            if (col.column_default) |default_val| {
-                try col_map.put(encoder.allocator, "column_default", try encoder.createString(default_val));
-            } else {
-                try col_map.put(encoder.allocator, "column_default", encoder.createNull());
-            }
-
-            try columns_array.setIndex(i, col_map);
-        }
-        try schema_map.put(encoder.allocator, "columns", columns_array);
-
-        const encoded = try encoder.encode(schema_map);
-        defer allocator.free(encoded);
-
-        // Publish to $KV.schemas.{table_name} subject to populate the KV bucket!
-        const subject = try topology_mod.render(
-            allocator,
-            topo.kv_schemas_subject_pattern,
-            &.{.{ .name = "table", .value = table_only }},
-            null,
-        );
-        defer allocator.free(subject);
-
-        core.publish(subject, encoded) catch |err| {
-            log.err("📋 Failed to publish schema for {s}: {}", .{ table_only, err });
-            return err;
-        };
-
-        // Print the subject actually published to. It read "schema.{table}" before —
-        // a subject this code has not used since schemas moved into the KV bucket.
-        log.info("📋 ✅ Published schema → {s} ({d} columns, {d} bytes)", .{
-            subject,
-            columns.len,
-            encoded.len,
-        });
     }
 
     /// Snapshot request handler - listens on "snapshot.request.>" and generates snapshots
@@ -1227,7 +906,6 @@ pub const SnapshotListener = struct {
         monitored_tables: []const []const u8,
         publication_name: []const u8,
         refused: *refused_tables.Registry,
-        format: encoder_mod.Format,
         chunk_size: usize,
         io: std.Io,
         endpoint: config.Nats.Endpoint,
@@ -1334,10 +1012,15 @@ pub const SnapshotListener = struct {
                     // max-msgs-per-subject window is what stops a re-request meanwhile.
                     msg.ack() catch {};
 
-                    // Extract table name from subject: init.snapshot.<table>
+                    // Extract tenant + table from subject: snapshot.request.<tenant>.<table>
+                    // — tenant-keyed, not principal-keyed (NOTES.md §1.12 part 2: a dump is
+                    // shared by every principal in a tenant). The tenant is a NATS subject
+                    // token the requester's own permissions already bounded them to; the
+                    // bridge relays it into the query, it does not validate which tenants
+                    // exist (PROTOCOL.md "The Connection Flow", Step 0).
                     const subject = msg.msg.subject;
 
-                    const table_name = blk: {
+                    const rest = blk: {
                         const prefix = topo.request_subject_prefix;
                         if (std.mem.startsWith(u8, subject, prefix)) {
                             break :blk subject[prefix.len..];
@@ -1345,8 +1028,14 @@ pub const SnapshotListener = struct {
                         log.err("📸 Invalid snapshot request subject: {s}", .{subject});
                         continue;
                     };
+                    const dot = std.mem.indexOfScalar(u8, rest, '.') orelse {
+                        log.err("📸 Invalid snapshot request subject (no tenant segment): {s}", .{subject});
+                        continue;
+                    };
+                    const tenant = rest[0..dot];
+                    const table_name = rest[dot + 1 ..];
 
-                    log.info("📸 Snapshot request received for table: {s}", .{table_name});
+                    log.info("📸 Snapshot request received for tenant '{s}', table '{s}'", .{ tenant, table_name });
 
                     // A refused table is in the publication but has no schema in KV, so
                     // seeding from it would populate a client table built from a shape
@@ -1373,11 +1062,11 @@ pub const SnapshotListener = struct {
                         publishSnapshotError(
                             allocator,
                             &snap_conn,
+                            tenant,
                             table_name,
                             "table_refused",
                             detail,
                             monitored_tables,
-                            format,
                             topo,
                             null,
                         ) catch |err| {
@@ -1396,11 +1085,11 @@ pub const SnapshotListener = struct {
                         publishSnapshotError(
                             allocator,
                             &snap_conn,
+                            tenant,
                             table_name,
                             "table_not_monitored",
                             "Table is not in the publication this bridge replicates",
                             monitored_tables,
-                            format,
                             topo,
                             null,
                         ) catch |err| {
@@ -1421,9 +1110,9 @@ pub const SnapshotListener = struct {
                     const result = generateIncrementalSnapshot(
                         allocator,
                         pg_config,
+                        tenant,
                         table_name,
                         snapshot_id,
-                        format,
                         chunk_size,
                         should_stop,
                         io,
@@ -1436,11 +1125,11 @@ pub const SnapshotListener = struct {
                         publishSnapshotError(
                             allocator,
                             &snap_conn,
+                            tenant,
                             table_name,
                             "generation_failed",
                             @errorName(err),
                             monitored_tables,
-                            format,
                             topo,
                             snapshot_id,
                         ) catch |perr| {
@@ -1462,9 +1151,9 @@ pub const SnapshotListener = struct {
     fn generateIncrementalSnapshot(
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
+        tenant: []const u8,
         table_name: []const u8,
         snapshot_id: []const u8,
-        format: encoder_mod.Format,
         chunk_size: usize,
         should_stop: *std.atomic.Value(bool),
         io: std.Io,
@@ -1518,7 +1207,7 @@ pub const SnapshotListener = struct {
             allocator,
             &js,
             topo,
-            topo.stream_init,
+            tenant,
             table_name,
             snapshot_id,
         );
@@ -1544,6 +1233,29 @@ pub const SnapshotListener = struct {
             return error.TransactionFailed;
         }
 
+        // `zb.tenant`, from the authenticated request subject — never resolved through
+        // zebridge_user_tenants, which is the write path's (NOTES.md §1.12 part 1: two
+        // derivations of one fact can disagree; a token relayed from the subject that
+        // already gated this request cannot disagree with itself). Parameterized, not
+        // string-built: `tenant` is client-controlled input, however NATS-authenticated.
+        // Must share this transaction, or the setting is gone before the SELECT/COPY
+        // below ever runs — the same rule mutation_listener.zig's own `zb.principal`
+        // documents, for the same reason (`set_config(..., is_local => true)` resets at
+        // COMMIT). `zebridge_scope_reads_by_tenant()`'s `zb_reader_all` policy is what
+        // reads this back; a table nobody scoped that way just sees it and ignores it.
+        {
+            const tenant_z = try allocator.dupeZ(u8, tenant);
+            defer allocator.free(tenant_z);
+            const set_sql = "SELECT set_config('" ++ config.Sync.tenant_setting ++ "', $1, true)";
+            const set_params = [_]?[*:0]const u8{tenant_z.ptr};
+            const set_result = c.PQexecParams(conn, set_sql, 1, null, &set_params[0], null, null, 0);
+            defer c.PQclear(set_result);
+            if (c.PQresultStatus(set_result) != c.PGRES_TUPLES_OK) {
+                log.err("set_config('{s}', ...) failed: {s}", .{ config.Sync.tenant_setting, c.PQerrorMessage(conn) });
+                return error.TransactionFailed;
+            }
+        }
+
         // Get snapshot LSN
         const lsn_query = "SELECT pg_current_wal_lsn()::text";
         const lsn_result = c.PQexec(conn, lsn_query.ptr);
@@ -1560,10 +1272,10 @@ pub const SnapshotListener = struct {
         publishSnapshotStart(
             allocator,
             &js,
+            tenant,
             table_name,
             snapshot_id,
             lsn_str,
-            format,
             should_stop,
             topo,
         ) catch |err| {
@@ -1837,10 +1549,10 @@ pub const SnapshotListener = struct {
                 try publishSchema(
                     chunk_alloc,
                     &js,
+                    tenant,
                     table_name,
                     snapshot_id,
                     col_names,
-                    format,
                     should_stop,
                     topo,
                 );
@@ -1859,6 +1571,7 @@ pub const SnapshotListener = struct {
             // Use chunk_alloc (arena) for all per-chunk allocations
             const chunk_text = try std.fmt.allocPrint(chunk_alloc, "{d}", .{batch});
             const subject = try topology_mod.render(chunk_alloc, topo.snapshot_data_pattern, &.{
+                .{ .name = "tenant", .value = tenant },
                 .{ .name = "table", .value = table_name },
                 .{ .name = "snapshot_id", .value = snapshot_id },
                 .{ .name = "chunk", .value = chunk_text },
@@ -1913,12 +1626,12 @@ pub const SnapshotListener = struct {
         try publishSnapshotMetadata(
             allocator,
             &js,
+            tenant,
             table_name,
             snapshot_id,
             lsn_str,
             batch,
             total_rows,
-            format,
             should_stop,
             topo,
         );
@@ -1963,14 +1676,14 @@ pub const SnapshotListener = struct {
     fn publishSnapshotStart(
         allocator: std.mem.Allocator,
         js: *nats.JetStream,
+        tenant: []const u8,
         table_name: []const u8,
         snapshot_id: []const u8,
         lsn: []const u8,
-        format: encoder_mod.Format,
         should_stop: *std.atomic.Value(bool),
         topo: *const topology_mod.Topology,
     ) !void {
-        var encoder = encoder_mod.Encoder.init(allocator, format);
+        var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
         defer encoder.deinit();
 
         var start_map = encoder.createMap();
@@ -1984,7 +1697,6 @@ pub const SnapshotListener = struct {
         try start_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(lsn_int)));
         try start_map.put(encoder.allocator, "timestamp", encoder.createInt(@as(i64, c.time(null))));
         try start_map.put(encoder.allocator, "status", try encoder.createString("starting"));
-        try start_map.put(encoder.allocator, "format", try encoder.createString(@tagName(format)));
 
         const encoded = try encoder.encode(start_map);
         defer allocator.free(encoded);
@@ -1992,7 +1704,7 @@ pub const SnapshotListener = struct {
         const subject = try topology_mod.render(
             allocator,
             topo.snapshot_start_pattern,
-            &.{.{ .name = "table", .value = table_name }},
+            &.{ .{ .name = "tenant", .value = tenant }, .{ .name = "table", .value = table_name } },
             null,
         );
         defer allocator.free(subject);
@@ -2007,16 +1719,16 @@ pub const SnapshotListener = struct {
     fn publishSnapshotMetadata(
         allocator: std.mem.Allocator,
         js: *nats.JetStream,
+        tenant: []const u8,
         table_name: []const u8,
         snapshot_id: []const u8,
         lsn: []const u8,
         batch_count: u32,
         row_count: u64,
-        format: encoder_mod.Format,
         should_stop: *std.atomic.Value(bool),
         topo: *const topology_mod.Topology,
     ) !void {
-        var encoder = encoder_mod.Encoder.init(allocator, format);
+        var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
         defer encoder.deinit();
 
         var meta_map = encoder.createMap();
@@ -2038,7 +1750,7 @@ pub const SnapshotListener = struct {
         const subject = try topology_mod.render(
             allocator,
             topo.snapshot_meta_pattern,
-            &.{.{ .name = "table", .value = table_name }},
+            &.{ .{ .name = "tenant", .value = tenant }, .{ .name = "table", .value = table_name } },
             null,
         );
         defer allocator.free(subject);
@@ -2054,10 +1766,12 @@ pub const SnapshotListener = struct {
         // Also publish to the KV bucket so clients can check for a cached snapshot
         // before requesting a fresh one. Subject built from topology, not a literal:
         // renaming the bucket there must move the bridge and `nats-init` together.
+        // Tenant-keyed like the request/data subjects (NOTES.md §1.12 part 2): keyed by
+        // table alone, a second tenant's descriptor would overwrite the first's.
         const kv_subject = try topology_mod.render(
             allocator,
             topo.kv_snapshots_subject_pattern,
-            &.{.{ .name = "table", .value = table_name }},
+            &.{ .{ .name = "tenant", .value = tenant }, .{ .name = "table", .value = table_name } },
             null,
         );
         defer allocator.free(kv_subject);
@@ -2104,14 +1818,14 @@ fn parsePgLsn(lsn_str: []const u8) !u64 {
 fn publishSchema(
     allocator: std.mem.Allocator,
     js: *nats.JetStream,
+    tenant: []const u8,
     table_name: []const u8,
     snapshot_id: []const u8,
     column_names: [][]const u8,
-    format: encoder_mod.Format,
     should_stop: *std.atomic.Value(bool),
     topo: *const topology_mod.Topology,
 ) !void {
-    var encoder = encoder_mod.Encoder.init(allocator, format);
+    var encoder = encoder_mod.Encoder.init(allocator, .msgpack);
     defer encoder.deinit();
 
     var schema_map = encoder.createMap();
@@ -2132,6 +1846,7 @@ fn publishSchema(
     defer allocator.free(encoded);
 
     const subject = try topology_mod.render(allocator, topo.snapshot_schema_pattern, &.{
+        .{ .name = "tenant", .value = tenant },
         .{ .name = "table", .value = table_name },
         .{ .name = "snapshot_id", .value = snapshot_id },
     }, null);

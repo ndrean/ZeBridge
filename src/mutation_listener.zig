@@ -1287,7 +1287,8 @@ pub const MutationListener = struct {
 
         switch (mutation.operation) {
             .delete => try self.applyDelete(alloc, conn, meta, mutation, key_values.items, version_text),
-            .insert, .update => try self.applyUpsert(alloc, conn, meta, mutation, map, version_text, key_values.items),
+            .update => try self.applyUpdate(alloc, conn, meta, mutation, map, version_text, key_values.items),
+            .insert => try self.applyUpsert(alloc, conn, meta, mutation, map, version_text, key_values.items),
         }
     }
 
@@ -1546,6 +1547,125 @@ pub const MutationListener = struct {
                 break;
             }
         }
+        try self.exec(
+            alloc,
+            conn,
+            mutation,
+            sql.items,
+            vals.items,
+            try buildReturning(alloc, meta, version_param),
+            try buildClassify(alloc, meta, mutation.table),
+            key_values,
+        );
+    }
+
+    /// UPDATE <table> SET col1 = $1, … WHERE <pk> = $key AND (version guard [OR tie]).
+    ///
+    /// Not an upsert: `applyUpsert` builds `INSERT (cols from data) … ON CONFLICT DO
+    /// UPDATE`, and PostgreSQL must be able to satisfy the INSERT branch even though only
+    /// the UPDATE branch can ever fire for a row the client already knows exists — every
+    /// NOT NULL column without a database-level default has to be present in `data` or the
+    /// statement is rejected before ON CONFLICT is even considered. Measured: a genuine
+    /// partial update — `{some_text, updated_at}` against a table whose `inserted_at` is
+    /// NOT NULL with no DB default — failed `23502` even though the row already existed
+    /// and `inserted_at` was never going to change. A real UPDATE has no INSERT branch to
+    /// satisfy, so it only ever needs the columns actually changing.
+    ///
+    /// Same last-write-wins guard and tie-break as `applyUpsert`, just written against a
+    /// bound parameter instead of `EXCLUDED` — there is no pseudo-table in a plain UPDATE.
+    fn applyUpdate(
+        self: *MutationListener,
+        alloc: std.mem.Allocator,
+        conn: ?*c.PGconn,
+        meta: *const TableMeta,
+        mutation: Mutation,
+        map: anytype,
+        version_text: [*:0]const u8,
+        key_values: []const ?[*:0]const u8,
+    ) !void {
+        const data_val = map.getByString("data") orelse return error.MissingData;
+        if (data_val != .map) return error.InvalidDataFormat;
+
+        var cols: std.ArrayList([]const u8) = .empty;
+        var vals: std.ArrayList(?[*:0]const u8) = .empty;
+
+        var it = data_val.map.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.* != .str) continue;
+            const name = entry.key_ptr.str.value();
+            if (!meta.hasColumn(name)) {
+                log.info("⛔ '{s}' has no column '{s}' — refusing mutation from '{s}'", .{ mutation.table, name, mutation.principal });
+                return error.UnknownColumn;
+            }
+            if (meta.isPk(name)) continue; // the key it matched on — never reassigned
+            if (std.mem.eql(u8, name, meta.version_col)) continue; // set from `version`
+            if (meta.client_col) |cc| {
+                if (std.mem.eql(u8, name, cc)) continue;
+            }
+            try cols.append(alloc, name);
+            try vals.append(alloc, try self.payloadToString(alloc, entry.value_ptr.*));
+        }
+
+        try cols.append(alloc, meta.version_col);
+        try vals.append(alloc, version_text);
+
+        if (meta.client_col) |client_col| {
+            const cid = if (map.getByString("client_id")) |v|
+                try self.payloadToString(alloc, v)
+            else
+                null;
+            try cols.append(alloc, client_col);
+            try vals.append(alloc, cid);
+        }
+
+        var version_param: usize = 0;
+        var client_param: usize = 0;
+        for (cols.items, 0..) |col, i| {
+            if (std.mem.eql(u8, col, meta.version_col)) version_param = i + 1;
+            if (meta.client_col) |cc| {
+                if (std.mem.eql(u8, col, cc)) client_param = i + 1;
+            }
+        }
+        const version_expr = try renderVersionExpr(alloc, meta, version_param);
+
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
+        try sql.appendSlice(alloc, "UPDATE ");
+        try appendIdent(&sql, alloc, mutation.table);
+        try sql.appendSlice(alloc, " SET ");
+        for (cols.items, 0..) |col, i| {
+            if (i > 0) try sql.appendSlice(alloc, ", ");
+            try appendIdent(&sql, alloc, col);
+            try sql.appendSlice(alloc, " = ");
+            try sql.appendSlice(alloc, try renderValuePlaceholder(alloc, meta, col, i + 1));
+        }
+        try sql.appendSlice(alloc, " WHERE ");
+        for (meta.pk_cols, key_values, 0..) |col, val, i| {
+            if (i > 0) try sql.appendSlice(alloc, " AND ");
+            try appendIdent(&sql, alloc, col);
+            try sql.appendSlice(alloc, try std.fmt.allocPrint(alloc, " = ${d}", .{cols.items.len + i + 1}));
+            try vals.append(alloc, val);
+        }
+        // Same "IS NULL OR stale" guard as the upsert and the delete: a stale update must
+        // not win, and a never-stamped row must not refuse every write forever.
+        try sql.appendSlice(alloc, " AND (");
+        try appendIdent(&sql, alloc, meta.version_col);
+        try sql.appendSlice(alloc, " IS NULL OR ");
+        try appendIdent(&sql, alloc, meta.version_col);
+        try sql.appendSlice(alloc, " < ");
+        try sql.appendSlice(alloc, version_expr);
+        if (meta.client_col) |client_col| {
+            try sql.appendSlice(alloc, " OR (");
+            try appendIdent(&sql, alloc, meta.version_col);
+            try sql.appendSlice(alloc, " = ");
+            try sql.appendSlice(alloc, version_expr);
+            try sql.appendSlice(alloc, " AND coalesce(");
+            try appendIdent(&sql, alloc, client_col);
+            try sql.appendSlice(alloc, ", '') < coalesce(");
+            try sql.appendSlice(alloc, try std.fmt.allocPrint(alloc, "${d}", .{client_param}));
+            try sql.appendSlice(alloc, ", ''))");
+        }
+        try sql.appendSlice(alloc, ")");
+
         try self.exec(
             alloc,
             conn,

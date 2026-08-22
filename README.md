@@ -12,19 +12,19 @@
 
 By pushing all consumer state, caching, and rate-limiting down into NATS/JS, the ZeBridge binary is stateless toward consumers.
 
+**What is it not**: ZeBridge serves a large number of small to medium consumers via NATS. It is NOT for large and long tables or tables containing large objects: it is not a file transfer tool. A large blob (>1 MB) belongs in object storage: tables should only contain the reference to a blob.
+
 **Can I read and write from edge?**: It can be used as a **READ tool only**, or **bidirectional** with WRITE capacities:
 
 * **READ**: it streams Postgres CDC events and table snapshots to a NATS/JS server your consumer is connected to.
 * **WRITE**: it propagates a consumer's local writes back to Postgres via NATS/JS, which then sends a CDC event so the consumer updates its local state with last-write-wins (LWW) conflict resolution.
 
-**How is data protected?**:
+**How is data access protected?**: each consumer must have its own unique identity and segregated by tenants. Access per stream / bucket is granted by NATS and access by tenant is enforced by Postgres.
 
 * ZeBridge can only read the declared tables and columns in Postgres, with a dedicated user.
 * Access is scoped by tenant.
 * The read-only configuration is the base; add RLS on top to filter CDC events and snapshots by tenant.
 * The read/write configuration comes in two flavors: single tenant with full Postgres control, or multi-tenant.
-
-**What is it not**: ZeBridge serves a large number of small to medium consumers via NATS. It is NOT a file transfer tool — a large blob (>1 MB) belongs in object storage, not in a replicated table.
 
 **Performance**: you can expect 200 kevt/s. See [An example of a measured throughput](#an-example-of-a-measured-throughput) for a real, reproducible number — run it yourself on your own hardware before trusting any figure quoted here.
 
@@ -62,7 +62,7 @@ See the Table of Contents below for configuration, scaling, evaluation, and tele
 
 ## Overview
 
-A consumer connects to a NATS server facing ZeBridge.
+A consumer connects to a NATS/JS (v2.10+) server facing ZeBridge connected to PostgreSQL (v14+).
 
 **Example of Architecture**:
 
@@ -143,9 +143,9 @@ A ZeBridge instance is started with one config. The DBA starts the NATS server w
 
 These are hardcoded in `nats-init`'s stream setup (`docker-compose.full.yml`), not currently an env var — a deployment that wants a different window edits that script. Changing it does **not** retroactively apply to an already-provisioned stream: `nats-init`'s update path for an existing stream only touches subjects, never limits (see the script's own comment) — an operator has to `nats stream edit <name> --max-age=… -f` by hand, or start from a clean stream.
 
-⚠️ **CDC deliberately outlives INIT, by a day.** Snapshot generation isn't instant — it's a single sequential worker with no timeout, so "a small table can wait behind a large one" (see [Thread Model](#thread-model-8-threads)) can genuinely delay how long a snapshot takes to finish landing in INIT. If CDC and INIT expired on the same clock, a CDC event for a write that happened *while* a snapshot was still queued could age out before that snapshot itself does — leaving a client that replays a still-valid snapshot with a gap right at the start of what it needs from CDC. The one-day margin exists to absorb that queueing delay; INIT's 7 days is what actually matters operationally: **the longest a consumer can be offline before it must re-seed from a fresh snapshot instead of just resuming CDC.**
+⚠️ **CDC deliberately outlives INIT, by a day.** Snapshot generation isn't instant — it's a single sequential worker with no timeout, so "a small table can wait behind a large one" (see [Thread Model](#thread-model-8-threads)) can genuinely delay how long a snapshot takes to finish landing in INIT. If CDC and INIT expired on the same clock, a CDC event for a write that happened _while_ a snapshot was still queued could age out before that snapshot itself does — leaving a client that replays a still-valid snapshot with a gap right at the start of what it needs from CDC. The one-day margin exists to absorb that queueing delay; INIT's 7 days is what actually matters operationally: **the longest a consumer can be offline before it must re-seed from a fresh snapshot instead of just resuming CDC.**
 
-Snapshot *requests* (not the data itself) are separately throttled: the `REQUESTS` stream holds one request message per table at a time, for up to the `SNAP_RET` window (`SNAP_RET_SECONDS`) — a second request for that table inside the window is refused, so a client is expected to check the `snapshots` KV bucket first. `SNAP_RET`'s production default is intentionally close to INIT's own 7-day retention (minus a 30-minute margin), not a short debounce: a snapshot already in INIT is good for its whole retention window, so a fresh dump of the same table before then would just be redundant load on Postgres. The KV descriptor itself has no expiry, so a client always has something to check regardless of where `SNAP_RET` currently stands.
+Snapshot _requests_ (not the data itself) are separately throttled: the `REQUESTS` stream holds one request message per table at a time, for up to the `SNAP_RET` window (`SNAP_RET_SECONDS`) — a second request for that table inside the window is refused, so a client is expected to check the `snapshots` KV bucket first. `SNAP_RET`'s production default is intentionally close to INIT's own 7-day retention (minus a 30-minute margin), not a short debounce: a snapshot already in INIT is good for its whole retention window, so a fresh dump of the same table before then would just be redundant load on Postgres. The KV descriptor itself has no expiry, so a client always has something to check regardless of where `SNAP_RET` currently stands.
 Consumers use these streams to interact with NATS; the exact names are declared in `topology.json`.
 
 ### The memory setting
@@ -230,9 +230,11 @@ Lastly, consumer state always arrives through CDCs: no optimistic WRITE.
 * PostgreSQL _proto-v1_ streams using logical replication (`pgoutput` binary format)
 * Publishes schemas from the catalogue to NATS KV store on startup,
 * Generates table snapshots on-demand, chunked by **bytes** to fit one NATS message (10 000 rows is only a ceiling), via NATS requests,
+* tenants management,
 * Triggers message to NATS on schema change via Postgres DDL event triggers,
 * schemas are available in two formats: PostgreSQL(eg for PQLite) and SQLite,
-* `MessagePack` default encoding (JSON available with `--json`),
+* `MessagePack` default encoding for CDCs and snpashot,
+* last-write-wins (LWW) strategy for writes,
 * At-least-once delivery with idempotent message IDs,
 * Graceful shutdown with LSN acknowledgment,
 * telemetry via HTTP `/metrics` (Prometheus format) and structured logs on **stderr** (Grafana Loki)
@@ -258,8 +260,6 @@ DATABASE_URL=postgres://bridge_reader:pw@replica_1:5432/postgres \
 ```
 
 * Encoding. The default is **MessagePack**: compact (~30% smaller than JSON), type-safe (it preserves int/float/binary distinctions, where JSON sends everything as strings or generic numbers), and fast to encode/decode. Libraries exist for most languages.
-
-* Use flag `--json` to receive a JSON format. Slightly larger payload size and slower encoding/decoding.
 
 ### Bridge ACK Flow and NATS outages
 
@@ -442,7 +442,7 @@ Source: `topology.json`
 * **Bucket Name:** `schemas`
 
 * **Key Convention:** `<table_name>` (e.g., `users`)
-* **Client Action:** `kv.get('users')` to fetch the MessagePack/JSON schema definition.
+* **Client Action:** `kv.get('users')` to fetch the JSON schema definition.
 
 #### 2. Snapshots (NATS JetStream)
 
@@ -584,7 +584,6 @@ The user of the bridge defines a `REPLICATION_SLOT` with the flag `--slot my_slo
   --slot <NAME>     Mandatory: Replication slot name (default: cdc_slot)
   --pub <NAME>      Mandatory: use the Postgres `PUBLICATION`
   --port <PORT>     HTTP telemetry port (default: 9090)
-  --json            Encoder option: defaults to `MessagePack`
   --help, -h        Show this help message
 ```
 
@@ -1034,7 +1033,7 @@ Event ordering follows from [one WAL-reading thread per bridge](#design-overview
 
 ## Inside
 
-### Thread Model (8 threads)
+### Thread Model (7 threads)
 
 Every one is spawned once at startup and lives until shutdown. Nothing is spawned per
 request, per table or per connection.
@@ -1045,31 +1044,36 @@ request, per table or per connection.
 | 2 | **Batch publisher** | `batch_publisher.zig:534` | drains the ring buffer, encodes MessagePack, publishes to the `CDC` stream |
 | 3 | **WAL monitor** | `wal_monitor.zig:50` | replication-slot lag, every 30 s |
 | 4 | **HTTP telemetry** | `http_server.zig:49` | `/metrics`, `/health`, `/status`, `/shutdown`. Accepts and serves inline — no thread per connection |
-| 5 | **Snapshot supervisor** | `snapshot_listener.zig:710` | spawns 6 and 7, then sleeps until shutdown and joins them. Does no work of its own |
-| 6 | **Schema requests** | `snapshot_listener.zig:731` | answers `init.schema` on its own connection, so a schema request never queues behind a multi-minute `COPY` |
-| 7 | **Snapshot requests** | `snapshot_listener.zig:745` | consumes `snapshot.request.>` and generates snapshots **inline** — one at a time, in arrival order |
-| 8 | **Mutation listener** | `mutation_listener.zig:137` | consumes `mutation.>`, applies writes under the ingress role. Only started when `DATABASE_WRITER_URL` is set |
+| 5 | **Snapshot supervisor** | `snapshot_listener.zig:710` | spawns 6, then sleeps until shutdown and joins it. Does no work of its own |
+| 6 | **Snapshot requests** | `snapshot_listener.zig:745` | consumes `snapshot.request.>` and generates snapshots **inline** — one at a time, in arrival order |
+| 7 | **Mutation listener** | `mutation_listener.zig:137` | consumes `mutation.>`, applies writes under the ingress role. Only started when `DATABASE_WRITER_URL` is set |
+
+There used to be an eighth, a schema-request listener answering `init.schema` on its own
+connection — removed along with the on-demand `init.schema.<table>` request/response
+mechanism it served (PROTOCOL.md §1): an earlier design that predates the current push
+model, where the bridge writes every table's schema straight into `$KV.schemas.<table>`
+at boot and on every DDL change, and a client just watches that bucket.
 
 Two things this table is meant to stop people assuming:
 
-* **Snapshots are not concurrent.** Thread 7 calls `generateIncrementalSnapshot` inline, so
+* **Snapshots are not concurrent.** Thread 6 calls `generateIncrementalSnapshot` inline, so
   a large table blocks every other table's request behind it in the stream. Requests are
   durable so nothing is lost, and the ack happens on receipt rather than on completion —
   but a small table waits for a big one. (`Config.Snapshot.max_concurrent_snapshots`
   states an intent that was never built; it is read by nothing.)
 * **Preflight is not a thread.** It is an inline call in `main` (`bridge.zig:377`) that runs
-  _before_ threads 5–8 exist, which is why it can write the refusal registry without
+  _before_ threads 5–7 exist, which is why it can write the refusal registry without
   synchronising with anyone.
 
 #### Who touches the refusal registry
 
-`refused_tables.Registry` is shared by the CDC, snapshot and schema paths — one table must
-not be refused by one and served by another. Three roles reach it:
+`refused_tables.Registry` is shared by the CDC and snapshot paths — one table must not be
+refused by one and served by another. Three roles reach it:
 
 | | role |
 | --- | --- |
 | main thread (1) | writes (DDL path) **and** reads (`shouldDrop` per event) |
-| snapshot requests (7) | writes (a row too wide to publish) **and** reads (rejects requests) |
+| snapshot requests (6) | writes (a row too wide to publish) **and** reads (rejects requests) |
 | HTTP telemetry (4) | reads only, for `/metrics` and `/status` |
 
 Two concurrent _writers_ and a concurrent _reader_ is why the registry is an append-only
@@ -1103,7 +1107,7 @@ The ring buffer is pre-allocated once at startup, in three parts: a fixed-size e
 **Arena allocator** (a separate, smaller one, for the encode/publish step):
 
 * Reused once per flush, reset (not freed) between flushes.
-* Backs the MessagePack/JSON value trees built for one batch.
+* Backs the MessagePack value trees built for one batch.
 * Avoids one malloc per column per event that a naive implementation would otherwise pay.
 
 ### Replication Slot Management

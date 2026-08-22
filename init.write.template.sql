@@ -424,14 +424,13 @@ BEGIN
         '   WHERE principal = current_setting(''zb.principal'', true)) OR %I = ''${OPEN_TENANT}'')',
         tbl, '${POSTGRES_WRITER_USER}', tenant_col, tenant_col, tenant_col, tenant_col);
 
-    -- ⚠️ The reader sees everything, deliberately. It feeds CDC and snapshots for *all*
-    -- tenants, and the split happens on the subject — a reader bounded by RLS would make
-    -- the change feed silently incomplete instead of correctly partitioned.
-    EXECUTE format('DROP POLICY IF EXISTS zb_reader_all ON %s', tbl);
-    EXECUTE format('CREATE POLICY zb_reader_all ON %s FOR SELECT TO %I USING (true)',
-                   tbl, '${POSTGRES_BRIDGE_USER}');
+    -- Reads: CDC stays subject-scoped regardless (RLS cannot see it — see
+    -- zebridge_scope_reads_by_tenant's own comment, init.core.template.sql). Snapshots
+    -- now ARE RLS-scoped, via the same function a read-only deployment would call
+    -- directly — defined once in core so it needs nothing from this file.
+    PERFORM public.zebridge_scope_reads_by_tenant(tbl, tenant_col);
 
-    RAISE NOTICE 'writes on % are now scoped by %; reads are NOT — set TENANT_RULES=%:% and scope cdc.<tenant>.> in NATS',
+    RAISE NOTICE 'writes and snapshot reads on % are now scoped by %; CDC stays scoped by the subject, not RLS — set TENANT_RULES=%:% and scope cdc.<tenant>.> in NATS',
                  tbl, tenant_col, tbl, tenant_col;
 END;
 $$ LANGUAGE plpgsql;

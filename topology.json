@@ -19,6 +19,11 @@
     "public": "CDC_PUBLIC"
   },
 
+  "init_streams": {
+    "tenant_prefix": "INIT_",
+    "public": "INIT_PUBLIC"
+  },
+
   "subjects": {
     "cdc_prefix": "cdc",
     "init_prefix": "init",
@@ -29,13 +34,13 @@
     "mutation_ack_prefix": "mutation_ack",
     "mutation_ack_pattern": "mutation_ack.{[principal]s}.{[msg_id]s}",
     "snapshot_request": "snapshot.request",
-    "schema_request": "init.schema",
+    "snapshot_request_pattern": "snapshot.request.{[tenant]s}.{[table]s}",
 
-    "snapshot_data_pattern": "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
-    "snapshot_start_pattern": "init.snap.start.{[table]s}",
-    "snapshot_error_pattern": "init.snap.error.{[table]s}",
-    "snapshot_meta_pattern": "init.snap.meta.{[table]s}",
-    "snapshot_schema_pattern": "init.snap.schema.{[table]s}.{[snapshot_id]s}"
+    "snapshot_data_pattern": "init.snap.{[tenant]s}.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
+    "snapshot_start_pattern": "init.snap.{[tenant]s}.start.{[table]s}",
+    "snapshot_error_pattern": "init.snap.{[tenant]s}.error.{[table]s}",
+    "snapshot_meta_pattern": "init.snap.{[tenant]s}.meta.{[table]s}",
+    "snapshot_schema_pattern": "init.snap.{[tenant]s}.schema.{[table]s}.{[snapshot_id]s}"
   },
   "kv": {
     "schemas": "schemas",

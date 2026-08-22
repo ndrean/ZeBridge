@@ -1,7 +1,6 @@
 //! Command-line arguments parsing for CDC Bridge application
 const std = @import("std");
 const config = @import("config.zig");
-const encoder = @import("encoder.zig");
 const topology_mod = @import("topology.zig");
 const log = std.log.scoped(.args);
 
@@ -16,7 +15,6 @@ const usage =
     \\  --port <PORT>   HTTP telemetry port
     \\  --top <PATH>    topology.json to read (default: ./topology.json). Carries every
     \\                  stream, subject and KV name; missing file or key is fatal.
-    \\  --json          Encode as JSON (default: MessagePack)
     \\  --strict-tables Refuse to start if any published table lacks a primary key
     \\                  (default: skip the table, keep replicating the rest)
     \\  --help, -h      Show this message
@@ -110,7 +108,6 @@ pub const Args = struct {
     http_bind: []const u8,
     slot_name: []const u8,
     publication_name: []const u8,
-    encoding_format: encoder.Format,
 
     /// Parse command-line arguments and create RuntimeConfig.
     ///
@@ -130,7 +127,6 @@ pub const Args = struct {
         var http_port: ?u16 = null;
         var slot_name: []const u8 = config.Postgres.default_slot_name; // default
         var publication_name: []const u8 = config.Postgres.default_publication_name; // default
-        var encoding_format: encoder.Format = .msgpack; // default
         // Off by default: one keyless table should not stop every other table from
         // replicating. See preflight.zig for the full argument.
         var strict_tables: bool = false;
@@ -151,8 +147,6 @@ pub const Args = struct {
                 if (args_iter.next()) |value| publication_name = value;
             } else if (std.mem.eql(u8, arg, "--top")) {
                 if (args_iter.next()) |value| topology_path = value;
-            } else if (std.mem.eql(u8, arg, "--json")) {
-                encoding_format = .json;
             } else if (std.mem.eql(u8, arg, "--strict-tables")) {
                 strict_tables = true;
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -213,7 +207,6 @@ pub const Args = struct {
             .http_bind = resolved_bind,
             .slot_name = slot_name,
             .publication_name = publication_name,
-            .encoding_format = encoding_format,
         };
 
         // Build runtime configuration by merging CLI args with compile-time defaults
@@ -221,7 +214,6 @@ pub const Args = struct {
         runtime_config.http_port = resolved_port;
         runtime_config.slot_name = slot_name;
         runtime_config.publication_name = publication_name;
-        runtime_config.encoding_format = encoding_format;
         runtime_config.strict_tables = strict_tables;
 
         // Read PostgreSQL configuration from environment variables via Juicy Main environ.

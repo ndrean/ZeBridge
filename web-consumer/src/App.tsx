@@ -255,15 +255,16 @@ type TableState = {
 const SNAPSHOT_WAIT_MS = 60_000;
 const SNAPSHOT_REQUEST_ATTEMPTS = 5;
 
-/// Wait for this table's snapshot descriptor, or give up after `timeoutMs`.
+/// Wait for this snapshot descriptor (KV key, already `<tenant>.<table>` when tenants are
+/// declared), or give up after `timeoutMs`.
 ///
 /// Returns null on timeout rather than throwing: "not yet" is an ordinary outcome here,
 /// not an exception. The watch is always torn down — an abandoned KV watch leaks a
 /// subscription per attempt, and this is on the retry path.
-async function waitForDescriptor(kv: any, table: string, timeoutMs: number): Promise<any | null> {
+async function waitForDescriptor(kv: any, key: string, timeoutMs: number): Promise<any | null> {
   let iter: any = null;
   try {
-    iter = await kv.watch({ key: table });
+    iter = await kv.watch({ key });
     return await Promise.race([
       (async () => {
         for await (const entry of iter) {
@@ -309,11 +310,30 @@ let globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, se
 /// Which CDC streams this client reads. One per tenant plus the shared public stream — the
 /// stream name is the read boundary, because a `filter_subject` is chosen by the reader and
 /// is not a permission (see nats-server.conf.template).
+///
+/// ⚠️ Checked against the declared tenant list, not just truthiness: `TENANT` can resolve
+/// to a real value that still isn't a *tenant* — the open tenant (`_default`, john's own
+/// mapping) has no `CDC_<TENANT>` stream of its own, only `CDC_PUBLIC`. Truthiness alone
+/// built `CDC__DEFAULT`, a stream that was never created; `jsm.streams.info` on it throws.
 const cdcStreams = (): string[] => {
   const cfg = (topology as any).cdc_streams;
   if (!cfg) return [topology.streams.cdc];                  // untenanted deployment
-  if (!TENANT) return [cfg.public];                          // public-only reads
+  const tenants: string[] = (topology as any).tenants || [];
+  if (!TENANT || !tenants.includes(TENANT)) return [cfg.public];  // open tenant, or no mapping
   return [`${cfg.tenant_prefix}${TENANT.toUpperCase()}`, cfg.public];
+};
+
+/// Which INIT stream a snapshot for the current tenant lives on — one stream per request,
+/// unlike `cdcStreams()`'s two-stream watch, since a snapshot request/replay targets a
+/// single tenant at a time. `INIT_<TENANT>` for a declared tenant, `INIT_PUBLIC` for the
+/// open tenant and public-only reads alike, or the legacy `INIT` stream when tenants
+/// aren't declared at all — same fallback shape as `cdcStreams()`.
+const initStream = (): string => {
+  const cfg = (topology as any).init_streams;
+  if (!cfg) return topology.streams.init;                   // untenanted deployment
+  const tenants: string[] = (topology as any).tenants || [];
+  if (!TENANT || !tenants.includes(TENANT)) return cfg.public;  // open tenant, or no mapping
+  return `${cfg.tenant_prefix}${TENANT.toUpperCase()}`;
 };
 
 /**
@@ -723,9 +743,11 @@ export default function App() {
               continue;
             }
 
-            let val: any;
-            try { val = decode(entry.value); } catch { val = JSON.parse(td.decode(entry.value)); }
-            if (val?.schema && typeof val.schema === 'string') val = JSON.parse(val.schema);
+            // Schema is always JSON, never msgpack — a fixed bridge-side rule, not a
+            // per-deployment choice (NOTES.md/PROTOCOL.md). No decode() attempt, no
+            // double-unwrap: both the boot/DDL path and the on-demand init.schema
+            // responder now emit the identical {table, pg, sqlite, pk} shape.
+            const val: any = JSON.parse(td.decode(entry.value));
 
             // Tombstone: the bridge publishes {"dropped":true} rather than removing the
             // key, so a client arriving after the DROP still learns the table is gone.
@@ -1131,28 +1153,45 @@ export default function App() {
         appendLog('SYS', `Gap detected or first run! ${gapDetail.join('; ')}. Snapshots required!`, 'WARNING');
           
           let snapKv;
-          try { 
+          try {
             const kvm = new Kvm(nc!);
-            snapKv = await kvm.open(topology.kv.snapshots); 
+            // ⚠️ `allow_direct` must be passed explicitly — `Kvm.open()`/`Bucket.bind()`
+            // defaults it to `false` without ever asking the server, sending get()/watch()
+            // down the unscopable `$JS.API.STREAM.MSG.GET.KV_snapshots` path instead of
+            // Direct Get. Unlike `$KV.schemas` (deliberately wholesale-granted — schema
+            // disclosure stays unscoped by design), `$KV.snapshots` grants ONLY the
+            // exact-key Direct Get path per tenant, so the wholesale path is a genuine
+            // Permissions Violation here, not a fallback. Same lesson as `resolveTenant()`'s
+            // `$KV.tenants` open above, never applied to this bucket until now — see
+            // NOTES.md §1.12 part 3.
+            snapKv = await kvm.open(topology.kv.snapshots, { allow_direct: true });
           } catch { /* ignore */ }
+
+          // Tenant-scoped iff topology.json declares `init_streams` — the same signal
+          // `initStream()` and `cdcStreams()` gate on. When true, every snapshot subject
+          // and KV key below carries `TENANT` as its own token (PROTOCOL.md "The
+          // Connection Flow" §2): `snapshot.request.<tenant>.<table>`,
+          // `$KV.snapshots.<tenant>.<table>`, `init.snap.<tenant>.<table>.<snapshot_id>.>`.
+          const tenanted = !!(topology as any).init_streams;
 
           const tablesToSnap = new Set(syncedTables.keys());
           const snapshotPromises = [];
 
           for (const table of tablesToSnap) {
+            const snapKey = tenanted ? `${TENANT}.${table}` : table;
             let desc: any = null;
             if (snapKv) {
               try {
-                const entry = await snapKv.get(table);
+                const entry = await snapKv.get(snapKey);
                 if (entry) {
-                  try { desc = decode(entry.value); } catch { desc = JSON.parse(td.decode(entry.value)); }
+                  desc = decode(entry.value); // descriptor is always msgpack, never JSON
                 }
               } catch (e) {}
             }
 
             if (!desc && snapKv) {
-              const reqSubject = topology.subjects.snapshot_request.includes('{[table]s}')
-                ? topology.subjects.snapshot_request.replace('{[table]s}', table)
+              const reqSubject = tenanted
+                ? `${topology.subjects.snapshot_request}.${TENANT}.${table}`
                 : `${topology.subjects.snapshot_request}.${table}`;
 
               // PROTOCOL.md §6, "The fourth case: no answer at all".
@@ -1185,7 +1224,7 @@ export default function App() {
                   appendLog('SYS', `Request for ${table} refused (${e?.message ?? e}) — a snapshot is already pending, waiting for it`, 'INFO');
                 }
 
-                desc = await waitForDescriptor(snapKv, table, SNAPSHOT_WAIT_MS);
+                desc = await waitForDescriptor(snapKv, snapKey, SNAPSHOT_WAIT_MS);
                 if (!desc) {
                   appendLog('SYS', `No snapshot for ${table} after ${SNAPSHOT_WAIT_MS / 1000}s — the request may have expired unread; re-requesting`, 'WARNING');
                 }
@@ -1211,7 +1250,7 @@ export default function App() {
             }
 
             if (desc) {
-              appendLog('SYS', `Snapshot metadata ready for ${table} (LSN ${desc.lsn}). Replaying...`, 'INFO');
+              appendLog('SYS', `Snapshot metadata ready for ${table} (LSN ${desc.lsn}, ${desc.row_count ?? '?'} rows). Replaying...`, 'INFO');
               reach('snapshot');
               
               const pullPromise = (async () => {
@@ -1228,15 +1267,20 @@ export default function App() {
                 try {
                   await sql(`DELETE FROM ${table}`);
 
-                  const ci = await jsm.consumers.add(topology.streams.init, {
-                    filter_subject: `init.snap.${table}.${desc.snapshot_id}.>`,
+                  const stream = tenanted ? initStream() : topology.streams.init;
+                  const filterSubject = tenanted
+                    ? `${topology.subjects.init_prefix}.snap.${TENANT}.${table}.${desc.snapshot_id}.>`
+                    : `${topology.subjects.init_prefix}.snap.${table}.${desc.snapshot_id}.>`;
+                  const ci = await jsm.consumers.add(stream, {
+                    filter_subject: filterSubject,
                     deliver_policy: DeliverPolicy.All,
                   });
-                  const replayConsumer = await js.consumers.get(topology.streams.init, ci.name);
+                  const replayConsumer = await js.consumers.get(stream, ci.name);
 
                   // Use fetch to reliably pull all chunks currently in the stream for this snapshot
                   let done = false;
                   let snapshotColumns: string[] | null = null;
+                  let rowsApplied = 0;
 
                   while (!done) {
                     // ⚠️ 5s, not 1s. A 1s window left too little margin for the first
@@ -1250,7 +1294,19 @@ export default function App() {
                     for await (const msg of batch) {
                       receivedCount++;
                       let chunkDecoded: any;
-                      try { chunkDecoded = decode(msg.data); } catch { chunkDecoded = JSON.parse(td.decode(msg.data)); }
+                      try {
+                        chunkDecoded = decode(msg.data); // snapshot chunks are always msgpack, never JSON
+                      } catch (err) {
+                        // ⚠️ Caught and logged, not left to throw. The bridge only ever
+                        // produces msgpack here (verified), but an uncaught throw inside
+                        // this `for await` would silently kill the whole replay loop for
+                        // this table — no more chunks processed, no error visible anywhere
+                        // except an easy-to-miss unhandled rejection. A corrupt/unexpected
+                        // message should skip itself loudly, not take the table down with it.
+                        appendLog('SYS', `Snapshot chunk for ${table} failed to decode (seq ${msg.seq}): ${err} — skipping this message`, 'ERROR');
+                        msg.ack();
+                        continue;
+                      }
 
                       const state = syncedTables.get(table);
 
@@ -1264,11 +1320,13 @@ export default function App() {
                           const rowObj: any = {};
                           cols.forEach((col: string, i: number) => { rowObj[col] = rowVals[i]; });
                           await applyEvent(table, { table, operation: 'INSERT', data: rowObj, lsn: desc.lsn });
+                          rowsApplied++;
                         }
                       } else if (state && chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
                         // Legacy JSON format fallback
                         for (const row of chunkDecoded.data) {
                           await applyEvent(table, { table, operation: 'INSERT', data: row, lsn: desc.lsn });
+                          rowsApplied++;
                         }
                       }
                       msg.ack();
@@ -1282,7 +1340,14 @@ export default function App() {
 
                   const state = syncedTables.get(table);
                   if (state) state.lsn = desc.lsn;
-                  appendLog('SYS', `Replay finished for ${table} (Snapshot ID: ${desc.snapshot_id})`, 'INFO');
+                  // Compares against the descriptor's own row_count — a mismatch here means
+                  // the snapshot under- or over-delivered, which is exactly the kind of thing
+                  // that otherwise only shows up later as "the count looks wrong" with no clue
+                  // why.
+                  const rowCountNote = desc.row_count != null && desc.row_count !== rowsApplied
+                    ? ` ⚠️ expected ${desc.row_count} rows per the descriptor`
+                    : '';
+                  appendLog('SYS', `Replay finished for ${table} (Snapshot ID: ${desc.snapshot_id}, ${rowsApplied} rows applied${rowCountNote})`, 'INFO');
                 } catch (err) {
                   // Same "unseeded is not the same as synced" rule as the no-descriptor
                   // case above: a table that failed mid-replay must not go on receiving
@@ -1337,13 +1402,49 @@ export default function App() {
           opt_start_seq: last > 0 ? last + 1 : undefined,
         });
         const consumer = await js.consumers.get(streamName, ci.name);
-        appendLog('SYS', `CDC consumer on ${streamName} (from seq ${last || 'all'})`, 'INFO');
+        // `num_pending` is how many messages this consumer has yet to deliver — the real
+        // backlog size, not just "from seq all". A fresh client on a stream carrying old
+        // burst-test history (CDC_PUBLIC has held 67k+ leftover messages before) silently
+        // has to iterate all of it before reaching anything current; without this number
+        // that looks identical to "nothing is happening" from the log alone.
+        appendLog('SYS', `CDC consumer on ${streamName} (from seq ${last || 'all'}, ${ci.num_pending ?? '?'} messages pending)`, 'INFO');
 
         const iter = await consumer.consume();
         void (async () => {
+          // Throttled, not per-message — appendLog already skips INSERT/UPDATE/DELETE/CDC
+          // individually for exactly this reason (protecting the UI thread on a burst), but
+          // that leaves catch-up on a large backlog completely invisible: no error, no
+          // progress, indistinguishable from actually being stuck. This logs every 2000
+          // messages regardless of opType, so "still working, N/pending processed" is
+          // visible without reintroducing a log line per row.
+          let processedSinceStart = 0;
+          let caughtUpLogged = ci.num_pending === 0;
+          const progressEvery = 2000;
           for await (const msg of iter) {
+            processedSinceStart++;
+            if (processedSinceStart % progressEvery === 0) {
+              appendLog('SYS', `${streamName} catch-up: ${processedSinceStart} messages processed so far, at seq ${msg.seq}`, 'INFO');
+            }
+            // The backlog moment has no other marker otherwise — the consumer just keeps
+            // running forever, live and catch-up look identical from outside this loop.
+            if (!caughtUpLogged && ci.num_pending != null && processedSinceStart >= ci.num_pending) {
+              caughtUpLogged = true;
+              appendLog('SYS', `${streamName} caught up (${processedSinceStart} messages) — now live`, 'INFO');
+            }
             let decoded: any;
-            try { decoded = decode(msg.data); } catch { decoded = JSON.parse(td.decode(msg.data)); }
+            try {
+              decoded = decode(msg.data); // CDC events are always msgpack, never JSON
+            } catch (err) {
+              // ⚠️ Caught and logged, not left to throw. This `for await` runs inside a
+              // fire-and-forget `void (async () => {...})()` — the outer try/catch around
+              // consumer setup cannot reach an error thrown in here, since this IIFE isn't
+              // awaited. An uncaught throw would silently end CDC consumption for this
+              // *entire stream* (every table on it) with nothing visible but an
+              // easy-to-miss unhandled rejection — not just skip the one bad message.
+              appendLog('SYS', `CDC event on ${streamName} failed to decode (seq ${msg.seq}): ${err} — skipping this message`, 'ERROR');
+              msg.ack();
+              continue;
+            }
             const events = Array.isArray(decoded) ? decoded : [decoded];
 
             for (const ev of events) {
@@ -1834,6 +1935,12 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
                 by grant, one refused by shape. Without the first, the panel demonstrated
                 only the ways writing fails. */}
             <button onClick={() => void insertRandom()} style="background: #2e7d32;">Push to test_types — accepted</button>
+            {/* updateLast()/deleteLast() already existed (used by earlier scenario testing)
+                but had no button — INSERT was the only mutation shape actually exercised
+                from the UI. Both target the most recently touched *live* row, so run them
+                after at least one insert. */}
+            <button onClick={() => void updateLast()} style="background: #1565c0;">Update last row</button>
+            <button onClick={() => void deleteLast()} style="background: #ef6c00;">Delete last row</button>
             <button onClick={publishToReadOnlyTable} style="background: #6a1b9a;">Push to users — refused</button>
             <button onClick={publishMalformed} style="background: #b71c1c;">Push malformed — verdict now</button>
           </div>

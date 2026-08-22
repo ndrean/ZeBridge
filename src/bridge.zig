@@ -15,12 +15,10 @@ const metrics_mod = @import("metrics.zig");
 const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
-const schema_publisher = @import("schema_publisher.zig");
 const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
 const mutation_listener = @import("mutation_listener.zig");
 const catalog_epoch_mod = @import("catalog_epoch.zig");
-const encoder_mod = @import("encoder.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const utils = @import("utils.zig");
@@ -254,7 +252,6 @@ fn initNatsPublisher(
 fn initBatchPublisher(
     allocator: std.mem.Allocator,
     publisher: *nats_publisher.Publisher,
-    format: encoder_mod.Format,
     metrics: *metrics_mod.Metrics,
     runtime_config: *const Config.RuntimeConfig,
     max_columns: u16,
@@ -272,7 +269,6 @@ fn initBatchPublisher(
         allocator,
         publisher,
         batch_config,
-        format,
         metrics,
         runtime_config,
         max_columns,
@@ -391,7 +387,7 @@ pub fn main(init: std.process.Init) !void {
     log.info("Publication name: \x1b[1m {s} \x1b[0m", .{parsed_args.publication_name});
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
-    log.info("Encoding format: \x1b[1m {s} \x1b[0m", .{@tagName(parsed_args.encoding_format)});
+    log.info("Wire format: \x1b[1m msgpack (CDC/snapshot), JSON (schema) \x1b[0m — fixed, not configurable", .{});
     log.info("Streams: \x1b[1m {s}, {s}, {s}, {s} \x1b[0m (from {s})", .{
         runtime_config.topology.stream_cdc,
         runtime_config.topology.stream_init,
@@ -657,7 +653,6 @@ pub fn main(init: std.process.Init) !void {
         monitored_tables,
         parsed_args.publication_name,
         &refused,
-        parsed_args.encoding_format,
         &runtime_config,
         io,
         nats_endpoint,
@@ -800,7 +795,6 @@ pub fn main(init: std.process.Init) !void {
     const batch_pub = try initBatchPublisher(
         event_alloc,
         &publisher,
-        parsed_args.encoding_format,
         &metrics,
         &runtime_config,
         resolved_max_columns,

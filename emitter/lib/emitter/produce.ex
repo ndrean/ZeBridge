@@ -70,7 +70,7 @@ defmodule Produce do
               price: 10.5 * idx,
               inserted_at: now,
               updated_at: now,
-              tenant_id: "acme"
+              tenant_id: "_default"
             }
           end
       end

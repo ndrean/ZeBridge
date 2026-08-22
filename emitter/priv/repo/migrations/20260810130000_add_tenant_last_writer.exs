@@ -36,33 +36,37 @@ defmodule Emitter.PgProducer.Repo.AddTenantLastWriter do
       add(:last_writer, :string)
     end
 
-    # `init.write.template.sql` already has ONE entry point for turning a tenant column
-    # into a properly-scoped one — `zebridge_scope_writes_by_tenant(tbl, tenant_col)` —
-    # and it does more than the replica-identity fix this migration used to hand-roll
-    # here: it also `ENABLE ROW LEVEL SECURITY`s the table and installs the
-    # `zb_tenant_write`/`zb_reader_all` policies. Without it, `test_types` had a correct
-    # CDC *read* path (tenant-routed subjects) but an entirely unscoped *write* path —
-    # `bridge_writer` could write any tenant's rows regardless of
-    # `zebridge_user_tenants`, silently, because nothing had ever enabled RLS on the
-    # table. Measured: `relrowsecurity = f`, zero rows in `pg_policies` for
-    # `test_types`, after the hand-rolled index/identity fix alone.
+    flush()
+
+    # ONE call finishes everything `test_types` still needs, and publishes it for the
+    # first time (the previous migration deliberately left it unpublished — see its own
+    # comment): `zebridge_enable(..., tenant_col: ..., writable: true, ...)` re-grants
+    # edge writes and re-installs the version/tombstone guards (idempotent — both already
+    # ran in `SetupCdcTables`), installs the tenant guard trigger for the first time (only
+    # happens when `tenant_col` is given), calls `zebridge_scope_writes_by_tenant` (moves
+    # the tenant column into the replica identity if needed, enables RLS, installs
+    # `zb_tenant_write`/`zb_reader_all`), and only then — now that the preflight considers
+    # the table scoped — adds it to the publication.
     #
-    # Idempotent (`CREATE UNIQUE INDEX IF NOT EXISTS`, `DROP POLICY IF EXISTS` before
-    # each `CREATE POLICY`), so calling it again — e.g. if the table already has the
-    # right replica identity from an earlier manual fix — is a safe no-op on that part.
-    #
-    # Guarded on the function existing, same reasoning as `zebridge_grant_edge_writes`
-    # in the sibling migration: a database brought up without `init.write.template.sql`
-    # should skip this rather than fail the whole migration on something it does not
-    # need.
+    # This is the single entry point that replaces three separate manual fixes made by
+    # hand earlier in this project's history: the `CREATE UNIQUE INDEX` +
+    # `REPLICA IDENTITY USING INDEX` pair, the `zebridge_scope_writes_by_tenant` call, and
+    # the missing tenant guard trigger — each found only after the bridge refused the
+    # table for a different reason each time. `zebridge_enable()` does all three at once,
+    # in the order its own preflight requires, so there is no window where a partial
+    # application looks finished.
     execute("""
     DO $$
     BEGIN
-        IF EXISTS (
-            SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE p.proname = 'zebridge_scope_writes_by_tenant' AND n.nspname = 'public'
-        ) THEN
-            PERFORM public.zebridge_scope_writes_by_tenant('public.test_types'::regclass, 'tenant_id');
+        IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'zebridge_enable') THEN
+            PERFORM * FROM public.zebridge_enable(
+                'public.test_types'::regclass,
+                tenant_col => 'tenant_id',
+                writable => true,
+                version_col => 'updated_at',
+                tombstone_col => 'deleted_at',
+                dry_run => false
+            );
         END IF;
     END $$;
     """)

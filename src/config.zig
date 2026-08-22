@@ -4,7 +4,6 @@
 //! Instead of hardcoded values scattered across files, all tunables are defined here.
 
 const std = @import("std");
-const encoder = @import("encoder.zig");
 const Topo = @import("topology.zig");
 
 pub const log = std.log.scoped(.config);
@@ -321,6 +320,19 @@ pub const Sync = struct {
     /// setting, every policy predicate evaluates to NULL, and **every write is refused**
     /// with `new row violates row-level security policy`. Nothing names the real cause.
     pub const principal_setting = "zb.principal";
+
+    /// The session setting the snapshot listener stamps with the requesting tenant
+    /// before every snapshot query, and that `zebridge_scope_reads_by_tenant()`'s
+    /// `zb_reader_all` policy reads back — PROTOCOL.md "The Connection Flow" Step 0,
+    /// NOTES.md §1.12 part 1.
+    ///
+    /// ⚠️ Same failure shape as `principal_setting` above if this drifts from the name
+    /// `zebridge_scope_reads_by_tenant()` uses in `init.core.template.sql`: a mismatch
+    /// is silent, `current_setting(..., true)` reads as empty either way (not NULL —
+    /// see that function's own comment on the `coalesce(..., '') = ''` trap), and the
+    /// policy falls through to its wholesale branch instead of filtering — a snapshot
+    /// that silently carries every tenant's rows instead of refusing outright.
+    pub const tenant_setting = "zb.tenant";
 
     /// Column-name prefixes that can never be a version column, whatever the operator
     /// configures. Both are set once at insert and never touched again, so as a version
@@ -707,9 +719,6 @@ pub const RuntimeConfig = struct {
     /// "what got decided."
     max_columns_override: ?u16,
 
-    // Encoding format
-    encoding_format: encoder.Format,
-
     /// Create default runtime configuration from compile-time constants
     /// Note: PostgreSQL connection fields are set to defaults that should be overridden from environment
     pub fn defaults() RuntimeConfig {
@@ -739,7 +748,6 @@ pub const RuntimeConfig = struct {
             .event_data_buffer_log2 = Buffers.default_event_data_buffer_log2,
             .event_data_buffer_max_log2 = Buffers.default_max_event_data_buffer_log2,
             .max_columns_override = null,
-            .encoding_format = .msgpack,
         };
     }
 

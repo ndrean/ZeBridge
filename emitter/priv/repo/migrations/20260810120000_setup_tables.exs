@@ -1,7 +1,6 @@
 defmodule Emitter.PgProducer.Repo.SetupCdcTables do
   use Ecto.Migration
 
-  @publication_name System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub") |> dbg()
   # The two fixtures are a deliberate contrast, and every scenario reads better for it:
   #
   #   users      — bigserial PK, no tombstone, no write grant. **Outbound only.** A client
@@ -23,35 +22,6 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
   #
   # The difference is visible in the published schema descriptor: `pk` is `id`/INTEGER
   # versus `uid`/TEXT, and `tombstone_column` is null versus `deleted_at`.
-  @cdc_tables ["users", "test_types"]
-  # `GRANT ... TO` needs a bare role name, not a connection string — interpolating
-  # `DATABASE_URL` whole produced a SQL syntax error (`GRANT SELECT ON TABLE
-  # public.users TO postgres://bridge_reader:...@127.0.0.1:5432/postgres;`). The
-  # role is the URL's userinfo, up to the first `:` — parsed out here rather than
-  # read from a second env var, since `DATABASE_URL` is the one this migration is
-  # actually launched with.
-  @bridge_user (
-                 System.get_env("DATABASE_URL")
-                 |> URI.parse()
-                 |> Map.fetch!(:userinfo)
-                 |> String.split(":", parts: 2)
-                 |> List.first()
-               )
-               |> dbg()
-  @bridge_writer System.get_env("DATABASE_WRITER_URL")
-
-  # Tables that accept writes from the edge. Reading needs only the SELECT granted to
-  # every CDC table below; writing needs an explicit grant, because `bridge_writer` is
-  # created with **no table privileges at all** — ingress is closed until a DBA opens a
-  # table, so that a new table is never silently writable from an untrusted client.
-  #
-  # ⚠️ Without this the failure is silent, not loud: the bridge classifies
-  # `permission denied` as transient (it cannot distinguish it from a dropped connection),
-  # so a well-formed mutation is retried to `max_deliver` and the client sees no error, no
-  # row, and no CDC echo. See PROTOCOL.md §7.2, "Two failures that look like nothing
-  # happening".
-  @writable_tables ["test_types"]
-
   def up do
     create_if_not_exists table(:users) do
       add(:name, :string, null: false)
@@ -84,68 +54,53 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
 
     flush()
 
-    @cdc_tables |> dbg()
-
-    # Set REPLICA IDENTITY DEFAULT and attach to Publication
-    for table <- @cdc_tables do
-      execute("ALTER TABLE public.#{table} REPLICA IDENTITY DEFAULT;")
-
-      # ⚠️ Recorded as deliberately unscoped BEFORE publishing. `zebridge_publication_guard`
-      # refuses `ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped
-      # nor listed here — so "everyone reads this" has to be stated, not assumed.
-      #
-      # These two fixtures genuinely are public: they carry no tenant column and exist to
-      # exercise CDC, not to model a real schema. A multi-tenant table would instead be
-      # opened with zebridge_scope_publication_to_one_tenant/4, which creates the policies and the row
-      # filter first and then publishes.
-      execute("""
-      DO $$
-      BEGIN
-          IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'zebridge_public_tables') THEN
-              INSERT INTO public.zebridge_public_tables (tbl, reason)
-              VALUES ('public.#{table}'::regclass,
-                      'CDC fixture: no tenant column, readable by every consumer')
-              ON CONFLICT (tbl) DO NOTHING;
-          END IF;
-      END $$;
-      """)
-
-      execute("""
-      DO $$
-      BEGIN
-          IF NOT EXISTS (
-              SELECT 1 FROM pg_publication_tables
-              WHERE pubname = '#{@publication_name}' AND tablename = '#{table}'
-          ) THEN
-              ALTER PUBLICATION #{@publication_name} ADD TABLE public.#{table};
-          END IF;
-      END $$;
-      """)
-
-      execute("GRANT SELECT ON TABLE public.#{table} TO #{@bridge_user};")
-    end
-
-    # Uses `zebridge_grant_edge_writes/1` rather than spelling the GRANT out, so the
-    # privilege set has exactly one definition. It also refuses `zebridge_ddl_events` by
-    # name — the one table where "can write my own rows" becomes "can publish a
-    # fabricated schema to every client" — which a hand-written GRANT here would not.
+    # `users` — genuinely public, no tenant column, ever. `zebridge_enable()` (defined in
+    # init.core.template.sql — the READ half, no write profile needed for this call) does
+    # in one statement what this migration used to hand-roll in four: sets
+    # `REPLICA IDENTITY`, records the table in `zebridge_public_tables` with a reason,
+    # and — only once that scoping decision exists, which its own preflight enforces —
+    # adds it to the publication. `writable` defaults to false, so nothing here touches
+    # the write role at all.
     #
-    # Guarded on the function existing: it comes from `init.sql.template`, not from Ecto,
-    # so a database brought up without that bootstrap should skip the grant rather than
-    # fail the whole migration on something it does not need.
-    for table <- @writable_tables do
-      execute("""
-      DO $$
-      BEGIN
-          IF EXISTS (
-              SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-              WHERE p.proname = 'zebridge_grant_edge_writes' AND n.nspname = 'public'
-          ) THEN
-              PERFORM public.zebridge_grant_edge_writes('public.#{table}'::regclass);
-          END IF;
-      END $$;
-      """)
-    end
+    # Guarded on the function existing: a database whose SQL predates this refactor (or
+    # was bootstrapped from an older template) skips this rather than failing the whole
+    # migration on something it does not have yet.
+    execute("""
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'zebridge_enable') THEN
+            PERFORM * FROM public.zebridge_enable(
+                'public.users'::regclass,
+                public_reason => 'CDC fixture: no tenant column, readable by every consumer',
+                dry_run => false
+            );
+        END IF;
+    END $$;
+    """)
+
+    # `test_types` — writable, but NOT yet tenant-scoped: `tenant_id` does not exist until
+    # `AddTenantLastWriter` (the next migration) adds it. `zebridge_enable()` refuses to
+    # publish an unscoped table by design (its own preflight), so calling it here with no
+    # `tenant_col` and no `public_reason` would just error out rather than doing a partial
+    # job. This stage is deliberately partial instead: grants + guards only, no publish.
+    # The next migration finishes the job — tenant scoping and the first-ever publish,
+    # via the same `zebridge_enable()`, once the column it needs actually exists.
+    #
+    # Publishing early would buy nothing anyway: `.env.bridge` already declares
+    # `TENANT_RULES=test_types:tenant_id`, so a bridge that saw this table published
+    # before the column exists would just suspend it (`no_tenant_column`) the moment it
+    # tried to preflight it.
+    execute("""
+    DO $$
+    BEGIN
+        IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'zebridge_grant_edge_writes') THEN
+            PERFORM public.zebridge_grant_edge_writes('public.test_types'::regclass);
+            PERFORM public.zebridge_install_write_guards(
+                'public.test_types'::regclass, 'updated_at', 'deleted_at'
+            );
+        END IF;
+    END $$;
+    """)
   end
 
   def down do

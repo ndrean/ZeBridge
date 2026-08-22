@@ -69,7 +69,6 @@ consumed by the NATS init scripts and the reference clients.
     "init_prefix": "init",
     "mutations_prefix": "mutation",
     "snapshot_request": "snapshot.request",
-    "schema_request": "init.schema",
     "snapshot_data_pattern":  "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
     "snapshot_start_pattern": "init.snap.start.{[table]s}",
     "snapshot_error_pattern": "init.snap.error.{[table]s}",
@@ -88,7 +87,14 @@ either side.
 Every key here is read by something. `streams.schema` and `subjects.schema_prefix`
 used to sit in this file unused — no SCHEMA stream was ever created, and schemas travel
 through the KV bucket — so they were removed rather than left as an invitation to
-implement against them.
+implement against them. `subjects.schema_request` (`init.schema`) went the same way
+later: it named an on-demand schema-request/response mechanism from an earlier design
+that predates the current push model — the bridge writes every table's schema straight
+into `$KV.schemas.<table>` at boot and on every DDL change, and a client just
+`kv.watch()`s that bucket, so nothing was ever left waiting for a reply an on-demand
+request could usefully shorten. Zero scenario-script coverage and zero use in the
+reference client confirmed it was never exercised outside manual testing before it was
+removed.
 
 | key | read by |
 | --- | --- |
@@ -97,7 +103,6 @@ implement against them.
 | `subjects.init_prefix` | `nats-init` (INIT stream subjects), clients. Note the snapshot patterns still embed `init.` literally rather than composing from it. |
 | `subjects.mutations_prefix` | bridge (consumer filter), `nats-init` (MUTATIONS subjects) |
 | `subjects.snapshot_request` | bridge (subscription), clients (request), `nats-init` (REQUESTS subjects) |
-| `subjects.schema_request` | bridge (subscription) and the subject prefix its schema replies are published under |
 | `kv.schemas` | bridge (`$KV.schemas.<table>`), clients |
 | `kv.snapshots` | bridge (`$KV.snapshots.<table>`), `nats-init`, clients |
 

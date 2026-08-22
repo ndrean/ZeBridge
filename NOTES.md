@@ -626,7 +626,7 @@ under light load and stopped under heavy load — a leak-adjacent bug whose trig
 So the property is: **adding a table, an operation or a suffix can never widen or break a
 grant.** That is what makes it a safety guard rather than a naming convention.
 
-Where the invariant holds today — 3 of 10:
+Where the invariant holds today — 3 of 9:
 
 | pattern | identity-first |
 | --- | --- |
@@ -637,7 +637,6 @@ Where the invariant holds today — 3 of 10:
 | `mutation_error.<table>` | ❌ keyed by table |
 | `init.snap.<table>.<snapshot_id>.<chunk>` | ❌ keyed by table |
 | `snapshot.request.<table>` | ❌ no identity |
-| `init.schema` | ❌ no identity |
 | `$KV.schemas.<table>` | ❌ every client reads every table's columns |
 | `$KV.snapshots.<table>` | ❌ no identity |
 
@@ -653,7 +652,7 @@ The snapshot rows are what increment 2 must change: `init.snap.<tenant>.<table>.
 - **A publisher bug.** NATS enforces who may subscribe; nothing verifies that the bridge
   tagged a row with the right tenant. That is model B's residual risk and no grammar closes
   it.
-- **Anything not behind an identity token** — seven of the ten patterns above.
+- **Anything not behind an identity token** — six of the nine patterns above.
 
 #### The cost of per-tenant snapshots — measured, and it hinges on clustering
 
@@ -943,6 +942,86 @@ dumps shareable again.
   (row absent, verdict present, right SQLSTATE); `probe.py` covers its **cardinality** and the
   disclosure premise itself — measured: `alice` reads all 5 columns of `users`, writes to it,
   and is refused once as `DbAllocatedKey` with nothing following.
+
+#### Object Store for the bulk path — one part measured, one still open
+
+Two separate questions, easy to conflate because they surfaced in the same conversation.
+
+**Should delivery move to NATS Object Store at all**, independent of anything below? Today a
+snapshot is: generate on request, publish as `chunk_size`-row (10,000, `config.zig:380`)
+messages on `INIT_<TENANT>`/`INIT_PUBLIC`, point `$KV.snapshots.<tenant>.<table>` at the
+`snapshot_id`, and make the client do a two-step dance — watch the KV key for a descriptor,
+then derive a `filter_subject` and run an ephemeral pull consumer against the stream to
+reassemble the chunks (`App.tsx`, the whole `snapshotPromises` block). Object Store collapses
+that: one `put()` per generation, one `get()` per client, no separate descriptor bucket (the
+`ObjectInfo` — size, digest, chunk count — already carries what `$KV.snapshots` exists to
+carry), no hand-rolled ephemeral consumer. It would also stop `INIT_<TENANT>` accumulating
+every generation's chunks until `max_age` expires them (§ "The cost of per-tenant snapshots"
+above: chunk bytes × tenants × however many generations land inside the 7-day window) — an
+Object Store `put()` on the same key overwrites, so only the latest generation's bytes are
+ever held. Against that: this is not a small change. It removes `INIT_<TENANT>`/`INIT_PUBLIC`,
+`$KV.snapshots`, and four of the five `subjects.snapshot_*_pattern` entries in `topology.json`,
+and touches `snapshot_listener.zig`, every stream-creation script, and `App.tsx`'s replay block
+— roughly the footprint of the INIT split just finished. And crosstenant.py's finding (a
+JetStream consumer's `filter_subject` is reader-chosen, not ACL-checked — the *stream* is the
+real boundary) presumably applies to Object Store buckets the same way, which would mean
+per-tenant buckets, not per-tenant keys inside one shared bucket — **unverified**, not assumed;
+check whether an exact-key grant on `$O.<bucket>.C.>`/`$O.<bucket>.M.>` scopes the way
+`$KV.tenants`'s exact-key Direct Get grant does (§1.12 part 1) before leaning on it.
+
+**Separately**, a reseed-on-cadence "leaf" (build it up to date, drop the TTL, replay only the
+CDC since the leaf's own cutoff) changes something the current design gets for free: today a
+snapshot is immutable at birth — a new generation gets a new `snapshot_id`, the old one's
+chunks stay valid and complete under their *own* subject until they separately age out, so a
+client mid-fetch is never affected by a new generation starting elsewhere. There is no shared
+mutable identity for two writers to race on. A leaf reintroduces exactly that: the object name
+is now reused across every refresh, so a client's `get()` can race a `put()` of the next
+revision.
+
+**Measured** (`scripts/scenarios/objstore_race.py`, `nats-py`'s `ObjectStore` — 20 rounds
+across two runs, 40 MB object, `put()` fired 0–20 ms into a ~2 s `get()`, plus one deliberate
+run with `put()` fired exactly 0.5 s into the transfer and a 20 s wait after): a torn read
+(part-old, part-new content) **never occurred, and cannot by construction** — reading
+`nats-py`'s `put()`/`get()` source confirms every `put()` writes its chunks under a brand-new
+nuid-keyed subject and only swaps a single ROLLUP meta message once they're all written; `get()`
+resolves the nuid once, up front, and reads only that nuid's chunks for its whole transfer, so a
+byte published under a different nuid can never reach an in-flight reader. What *does* happen,
+every single time a `put()` lands while a `get()` is still receiving chunks (20/20, including
+the deliberate 0.5 s-in case): **the in-flight reader hangs forever** — still unresolved 20 s
+after the race, not merely slow. `put()`'s last step purges the *old* nuid's chunks once the new
+object is fully written; a reader still subscribed to that now-purged subject is left waiting on
+an `OBJ_NO_PENDING` marker that will never arrive, and nothing times it out. The store itself is
+unaffected — a fresh `get()` issued right after a hung one returns the new revision cleanly — so
+this is a per-reader liveness bug, not a data-integrity one. No torn reads is the right guarantee
+to have needed proof of; the hang is the one a leaf design has to plan around, not assume away.
+
+**Also measured**: the hang only afflicts a reader already mid-transfer *before* the swap —
+one that instead watches first and only reads after being told a fresh revision exists never
+hits it. `ObjectStore.watch()` is a JetStream consumer on the object's *meta* subject alone
+(never the chunk data), and that meta message is published exactly once per `put()`, only
+after every chunk is already durably written — an atomic, native "available" signal, not
+something to hand-roll as a separate flag key. 5/5 rounds of watch-then-`get()` (wait for the
+meta update, then fetch) resolved cleanly in ~1.6–1.9s each, every time, against the identical
+race that hung 20/20 when the reader was already attached beforehand. This is not new
+machinery either — it is the exact shape `App.tsx` already runs today, `kv.watch({key: table})`
+in `waitForDescriptor` against `$KV.snapshots`, just Object Store providing the same signal one
+level down, on the object itself instead of a separate descriptor.
+
+That narrows the risk rather than removing it: a *watching* reader is still exposed if its own
+read overlaps the *next* refresh after the one it just watched for — now a function of refresh
+cadence versus realistic read duration, not something every read risks. Two ways to close that
+residual gap, and they compose rather than compete. Cheap: keep reading straight off the one
+leaf key, discipline every call site to watch-then-fetch (never hold a `get()` open across an
+unbounded wait), and size the refresh cadence so it's comfortably longer than the slowest
+realistic read. Unconditional: still don't overwrite in place — keep a tiny KV entry per
+tenant/table naming the *current* object key (`snapshots.acme.test_types` →
+`test_types-gen-042`, mirroring `$KV.snapshots` today), have the refresh job `put()` the new
+generation under a **new** key, and swap the pointer last, itself watchable the same way. A
+reader that resolved the pointer keeps reading an object nothing will ever overwrite, so the
+hang becomes structurally impossible rather than merely unlikely — old generations purge on a
+grace delay after the swap, once no reader could plausibly still be attached to them. Same
+snapshot_id-per-generation shape already in production, just an object instead of a
+chunk-message run underneath each generation.
 
 ### 2.13 A wildcard inbox made every pull request spawn another
 

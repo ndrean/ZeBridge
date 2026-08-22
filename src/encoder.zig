@@ -430,7 +430,9 @@ test "encoder: format selection from runtime value" {
     // (it will have the key, but in binary format)
     try std.testing.expect(encoded1.len > 0);
 
-    // Simulate CLI flag parsing: --json flag
+    // Encoder still supports both formats directly (event_processor.zig's DDL/boot
+    // schema writes are hardcoded to .json, everything else to .msgpack — nothing
+    // threads a runtime choice through a CLI flag any more).
     const json_format: Format = .json;
     var encoder2 = Encoder.init(allocator, json_format);
     defer encoder2.deinit();
