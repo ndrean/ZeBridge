@@ -38,6 +38,17 @@ const NATS_URL = 'ws://localhost:8080';
 const PRINCIPAL = (import.meta.env.VITE_PRINCIPAL as string | undefined) ?? 'alice';
 const PASSWORD = (import.meta.env.VITE_PASSWORD as string | undefined) ?? 's3cret';
 
+/// Opt in to a stable, per-principal OPFS file (`zebridge_<principal>.sqlite3`) instead of
+/// a fresh one every page load. Off by default — the timestamped name is the project's own
+/// dev/test convention (incognito only, clean room every run) and this must not weaken it.
+///
+///     VITE_DURABLE=1 VITE_PRINCIPAL=alice VITE_PASSWORD=s3cret pnpm dev --port 5173
+///
+/// Durability is what makes the outbox below meaningful: a row queued for send has to
+/// survive the reload that might follow it, and a file that is deleted every load cannot
+/// do that regardless of what table lives in it.
+const DURABLE = ['1', 'true'].includes((import.meta.env.VITE_DURABLE as string | undefined) ?? '');
+
 /// The tenant subtree this client reads, when the deployment routes CDC by tenant.
 ///
 /// ⚠️ **RLS does not bound reads.** It bounds what a principal may write and what a
@@ -75,36 +86,35 @@ let TENANT = '';
 ///
 /// Note the bridge's nkey is **gone from this file**. That was the real hole: the client
 /// held the bridge's own credential, so every permission below was moot.
-// ⚠️ A **new OPFS file on every page load**, which is why "Clear site data" appears to do
-// nothing and why files accumulate: nothing ever reuses or removes the previous one, and
-// OPFS is not what that devtools button clears. `zb.orphans()` / `zb.purge()` below make
-// that visible and reclaimable, so incognito is not the only way to get a clean run.
+// ⚠️ A **new OPFS file on every page load** by default, which is why "Clear site data"
+// appears to do nothing and why files accumulate: nothing ever reuses or removes the
+// previous one, and OPFS is not what that devtools button clears. `zb.orphans()` /
+// `zb.purge()` below make that visible and reclaimable, so incognito is not the only way
+// to get a clean run.
 //
-// It also means the replica is **rebuilt from snapshot + CDC on every load**, so there is
-// no durable outbox — and therefore nothing for `Nats-Msg-Id` to be idempotent *across*
-// yet. A stable name is what turns the replica durable; that is a design decision, not a
-// cleanup, so it is left alone here.
-const DB_NAME = `zebridge_${Date.now()}.sqlite3`;
-const { sql, deleteDatabaseFile } = new SQLocal(DB_NAME);
+// `VITE_DURABLE` (above) is the opt-in past this: a stable, per-principal name instead of
+// one stamped with `Date.now()`. Off by default, the replica is rebuilt from snapshot + CDC
+// on every load — a clean room per test run, unchanged from before the outbox existed.
+const DB_NAME = DURABLE ? `zebridge_${PRINCIPAL}.sqlite3` : `zebridge_${Date.now()}.sqlite3`;
+const { sql, deleteDatabaseFile, transaction } = new SQLocal(DB_NAME);
 
-/// The write outbox — mutations sent but not yet confirmed — in its **own** database.
+/// The write outbox — mutations sent but not yet confirmed — lives in the **same** database
+/// as the replica, not a second one.
 ///
-/// ⚠️ It cannot live in the replica DB above: `DB_NAME` is stamped with `Date.now()`, so
-/// every page load gets a fresh file and anything stored there is gone on reload. That is
-/// deliberate for the replica (a clean room per test run) and fatal for an outbox, whose
-/// entire job is to survive the reload. Hence a second, stable-named database.
+/// ⚠️ It has to: the whole point is that the optimistic row and the intent-to-send commit
+/// **together** (PROTOCOL.md §7.1), in one `sql.transaction`. Two separate `SQLocal`
+/// instances are two separate Workers with no shared transaction — a first version of this
+/// lived in its own `zebridge_outbox_<principal>.sqlite3` file, which could never be atomic
+/// with the data write no matter how carefully the two calls were sequenced. Fixed by moving
+/// it here; the risk that motivated a separate file in the first place — an outbox needing
+/// to survive a timestamped, wiped-every-load `DB_NAME` — is what `VITE_DURABLE` now solves
+/// instead, at the source, rather than by moving the outbox somewhere the reload can't reach.
 ///
-/// ⚠️ Keyed by principal: two dev servers on different ports are different OPFS origins
-/// today, but the name should not be the only thing preventing alice from replaying bob's
-/// writes if that ever changes.
-const OUTBOX_DB = `zebridge_outbox_${PRINCIPAL}.sqlite3`;
-const { sql: outboxSql } = new SQLocal(OUTBOX_DB);
-
 /// `payload` is stored as JSON, not as the MessagePack bytes actually published. The
 /// payload is plain JSON-safe data (`{data, version, client_id}`), so the round trip is
 /// lossless, and JSON is inspectable from `zb.outbox()` — which matters for a queue whose
 /// contents you only look at when something has already gone wrong.
-const outboxInit = outboxSql`
+const outboxInit = sql`
   CREATE TABLE IF NOT EXISTS outbox (
     msg_id     TEXT PRIMARY KEY,
     subject    TEXT NOT NULL,
@@ -116,15 +126,18 @@ const outboxInit = outboxSql`
   )
 `;
 
+/// `exec` defaults to the module-level `sql`, but every call site that needs this in the
+/// *same* transaction as an optimistic apply passes `tx.sql` instead — see `sendMutation`.
 const outboxPut = async (r: {
   msgId: string; subject: string; payload: unknown; table: string; id: string | number;
-}) => {
+}, exec: typeof sql = sql) => {
   await outboxInit;
-  await outboxSql`
-    INSERT INTO outbox (msg_id, subject, payload, tbl, row_id, created_at, attempts)
-    VALUES (${r.msgId}, ${r.subject}, ${JSON.stringify(r.payload)}, ${r.table}, ${String(r.id)}, ${Date.now()}, 0)
-    ON CONFLICT(msg_id) DO UPDATE SET attempts = outbox.attempts + 1
-  `;
+  await exec(
+    `INSERT INTO outbox (msg_id, subject, payload, tbl, row_id, created_at, attempts)
+     VALUES (?, ?, ?, ?, ?, ?, 0)
+     ON CONFLICT(msg_id) DO UPDATE SET attempts = outbox.attempts + 1`,
+    r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id), Date.now(),
+  );
 };
 
 /// Remove a write from the outbox. Called only on a **definitive** outcome — a verdict, or
@@ -132,12 +145,12 @@ const outboxPut = async (r: {
 /// and "no answer yet" is not one.
 const outboxDrop = async (msgId: string) => {
   await outboxInit;
-  await outboxSql`DELETE FROM outbox WHERE msg_id = ${msgId}`;
+  await sql`DELETE FROM outbox WHERE msg_id = ${msgId}`;
 };
 
 const outboxAll = async (): Promise<any[]> => {
   await outboxInit;
-  return outboxSql`SELECT * FROM outbox ORDER BY created_at`;
+  return sql`SELECT * FROM outbox ORDER BY created_at`;
 };
 
 
@@ -443,6 +456,16 @@ export default function App() {
   const [pendingCount, setPendingCount] = createSignal(0);
   const [suspended, setSuspended] = createSignal<Record<string, string>>({});
 
+  /// Guards the resync (subscribeStreams + flushOutbox) from running twice at once.
+  ///
+  /// Shared between two independent triggers, not local to either: `nc.status()`'s own
+  /// 'reconnect' event, and the active `nc.rtt()` poll below — a server freeze (`kill
+  /// -STOP`) can leave the WebSocket object believing it is still connected, with no
+  /// 'disconnect'/'reconnect' event ever firing, since nothing at that layer detected a
+  /// failure to report. `/bridge/health` already polls actively every 10s for exactly this
+  /// reason (see its own comment); the NATS side only ever reacted to events until this.
+  let resyncing = false;
+
   /// The four things that must happen before a replica is trustworthy, in order.
   ///
   /// Shown as a strip rather than a log line because the interesting question is never
@@ -605,9 +628,15 @@ export default function App() {
             // The one case last-write-wins cannot decide for the user: their edit targeted
             // a row someone else deleted. §7.1 SHOULD-2 — surface it rather than silently
             // discarding it.
+            //
+            // ⚠️ Nothing is coming via CDC to correct this one. `stale` is silently fine —
+            // the winning row arrives and overwrites the optimistic guess — but a
+            // permanently refused write leaves whatever was optimistically applied sitting
+            // in the replica with nothing left to reconcile it. The row shown locally may no
+            // longer match Postgres at all.
             appendLog(
               m.subject,
-              `${where}: the row was deleted elsewhere, so this edit cannot be applied. Surface this to the user rather than dropping it.`,
+              `${where}: the row was deleted elsewhere, so this edit cannot be applied — the local copy may still show it. Surface this to the user rather than dropping it.`,
               'ERROR',
             );
             break;
@@ -616,9 +645,12 @@ export default function App() {
             // PostgreSQL refused, and would refuse the same bytes again — a constraint, a
             // missing grant, a bad type. Retrying is not a strategy; the fix is a schema
             // change, a grant, or different data.
+            //
+            // ⚠️ Same caveat as row_deleted: whatever this write optimistically applied
+            // locally is not getting corrected by CDC, since nothing changed server-side.
             appendLog(
               m.subject,
-              `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'}`,
+              `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'} — the local copy may not match the server`,
               'ERROR',
             );
             break;
@@ -779,14 +811,35 @@ export default function App() {
       // through this function, so a flush placed only above would run once per page load
       // and never after a network blip. Watching the status is what covers the case the
       // outbox exists for.
+      // ⚠️ A mobile/PWA client has no page refresh to fall back on — this loop is the
+      // *only* thing that ever re-syncs it. Measured live: after a reconnect, CDC events
+      // stopped arriving with no error anywhere, and only a full page reload brought the
+      // replica current again. flushOutbox() alone doesn't fix that — it only resends
+      // queued writes, it does nothing about the CDC consumers a stale connection left
+      // behind. subscribeStreams() is safe to re-run here: its own gap check compares the
+      // *persisted* last-processed sequence against what the stream currently retains, so
+      // a normal reconnect (still within retention) just resumes CDC from where it left
+      // off — cheap, no re-snapshot, no duplicate data applied (upserts are idempotent
+      // even if it were). `resyncing` guards against overlapping calls if `reconnect`
+      // events fire in a burst.
+      //
+      // ⚠️ Not fully verified: whether nats.js's own `reconnect: true` already transparently
+      // resumes the *previous* call's consumers once the connection comes back, which would
+      // make this create a second, redundant set alongside them rather than a clean
+      // replacement. Harmless if so (upserts are idempotent, just wasted work), but worth
+      // watching across repeated reconnects rather than assuming either way. Shared with
+      // the active `nc.rtt()` poll below, not local here — see that declaration's comment.
       void (async () => {
         try {
           for await (const st of nc!.status()) {
             const t = String((st as any).type);
             if (t === 'reconnect') {
               setStatus('connected');
-              appendLog('SYS', 'NATS reconnected — flushing outbox', 'INFO');
+              if (resyncing) continue;
+              resyncing = true;
+              appendLog('SYS', 'NATS reconnected — flushing outbox and re-syncing streams', 'INFO');
               void flushOutbox();
+              void subscribeStreams().finally(() => { resyncing = false; });
             } else if (t === 'disconnect') {
               setStatus('disconnected');
             }
@@ -1085,7 +1138,18 @@ export default function App() {
     if (logging()[table]) console.log(`[${table}] ${verb}`, ev.data);
   };
 
-  const applyEvent = async (table: string, ev: any) => {
+  /// `exec` defaults to the module-level `sql`; a batched CDC flush or an optimistic apply
+  /// passes `tx.sql` instead, so several events land in one SQLite transaction rather than
+  /// one round trip each — see the CDC consume loop and `sendMutation`.
+  ///
+  /// `ev.optimistic` marks a synthetic event built from a mutation this client is about to
+  /// send, not a real CDC/snapshot row: `lsn` is a sentinel (`Number.MAX_SAFE_INTEGER`, so
+  /// the gate below never blocks it — `state.lsn` itself is only ever written by real
+  /// snapshot/CDC application, never read back from an optimistic call, so this cannot
+  /// corrupt what a later real event is compared against) and the echo-pop block at the
+  /// bottom must not run for it — that block exists to recognise *our own write coming back*,
+  /// and an optimistic call is the write going out, not coming back.
+  const applyEvent = async (table: string, ev: any, exec: typeof sql = sql) => {
     const state = syncedTables.get(table);
     if (!state || !ev?.data) return;
     markVerb(table, ev);
@@ -1145,7 +1209,7 @@ export default function App() {
         if (keyChanged) {
           const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
           try {
-            await sql(`DELETE FROM ${table} WHERE ${where}`, ...oldPk);
+            await exec(`DELETE FROM ${table} WHERE ${where}`, ...oldPk);
             appendLog('CDC', `Key change on ${table}: ${JSON.stringify(oldPk)} → ${JSON.stringify(newPk)}`, 'REKEY');
           } catch (err) {
             appendLog('SQLITE', `Key-change cleanup on ${table} failed: ${err}`, 'ERROR');
@@ -1173,7 +1237,7 @@ export default function App() {
       }
 
       try {
-        await sql(query, ...values);
+        await exec(query, ...values);
       } catch (err) {
         appendLog('SQLITE', `UPSERT on ${table} failed: ${err}`, 'ERROR');
       }
@@ -1186,7 +1250,7 @@ export default function App() {
       if (state.pkCols.length && pkVals.every((v) => v !== undefined && v !== null)) {
         const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
         try {
-          await sql(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
+          await exec(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
         } catch (err) {
           appendLog('SQLITE', `DELETE on ${table} failed: ${err}`, 'ERROR');
         }
@@ -1206,7 +1270,7 @@ export default function App() {
     // echo carries back. It also means an echo of *someone else's* write to the same row
     // clears our entry — which is correct: the row reached the state we can observe, and
     // whether our version or theirs won is a question LWW already answered.
-    if (state.pkCols.length && pendingWrites.size) {
+    if (!ev.optimistic && state.pkCols.length && pendingWrites.size) {
       const echoedKey = state.pkCols.map((c) => String(ev.data?.[c])).join('|');
       for (const [msgId, w] of pendingWrites) {
         if (w.table !== table || String(w.id) !== echoedKey) continue;
@@ -1216,15 +1280,20 @@ export default function App() {
       }
     }
 
+    // ⚠️ Optimistic events never reach here for resume bookkeeping — `ev.lsn` is a
+    // sentinel (`Number.MAX_SAFE_INTEGER`), not a real WAL position. Letting it through
+    // would set `globalSyncState.lsn` to the sentinel permanently: every later *real* CDC
+    // event compares `< MAX_SAFE_INTEGER` and the resume position would never advance
+    // again.
     const stream: string = ev.stream ?? "";
     const streamSeq = stream ? (globalSyncState.seq[stream] ?? 0) : 0;
-    if ((ev.lsn ?? 0) > globalSyncState.lsn || (ev.seq ?? 0) > streamSeq) {
+    if (!ev.optimistic && ((ev.lsn ?? 0) > globalSyncState.lsn || (ev.seq ?? 0) > streamSeq)) {
       globalSyncState.lsn = Math.max(globalSyncState.lsn, ev.lsn ?? 0);
       if (stream) globalSyncState.seq[stream] = Math.max(streamSeq, ev.seq ?? 0);
       try {
-        await sql(`UPDATE _zebridge_sync SET global_last_lsn = ? WHERE id = 1`, globalSyncState.lsn);
+        await exec(`UPDATE _zebridge_sync SET global_last_lsn = ? WHERE id = 1`, globalSyncState.lsn);
         if (stream) {
-          await sql(
+          await exec(
             `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
              ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
             stream, globalSyncState.seq[stream]
@@ -1512,6 +1581,10 @@ export default function App() {
       // tables, so no row is described by both. Ordering *within* a table still comes from
       // its own stream.
       for (const streamName of cdcStreams()) {
+        // ⚠️ Timed, not guessed. This project's own rule: measure before assuming which
+        // part of a "few seconds" delay is actually slow (the consumer round trip, message
+        // delivery, or applying them) rather than fixing whichever one sounds plausible.
+        const setupStart = performance.now();
         const last = globalSyncState.seq[streamName] ?? 0;
         const ci = await jsm.consumers.add(streamName, {
           // No filter: the stream itself is now the filter. Narrowing further here would
@@ -1520,12 +1593,13 @@ export default function App() {
           opt_start_seq: last > 0 ? last + 1 : undefined,
         });
         const consumer = await js.consumers.get(streamName, ci.name);
+        const setupMs = Math.round(performance.now() - setupStart);
         // `num_pending` is how many messages this consumer has yet to deliver — the real
         // backlog size, not just "from seq all". A fresh client on a stream carrying old
         // burst-test history (CDC_PUBLIC has held 67k+ leftover messages before) silently
         // has to iterate all of it before reaching anything current; without this number
         // that looks identical to "nothing is happening" from the log alone.
-        appendLog('SYS', `CDC consumer on ${streamName} (from seq ${last || 'all'}, ${ci.num_pending ?? '?'} messages pending)`, 'INFO');
+        appendLog('SYS', `CDC consumer on ${streamName} (from seq ${last || 'all'}, ${ci.num_pending ?? '?'} messages pending, consumer setup took ${setupMs}ms)`, 'INFO');
 
         const iter = await consumer.consume();
         void (async () => {
@@ -1538,6 +1612,50 @@ export default function App() {
           let processedSinceStart = 0;
           let caughtUpLogged = ci.num_pending === 0;
           const progressEvery = 2000;
+
+          // ⚠️ Batched into one `sql.transaction`, not one autocommitting `sql()` call per
+          // event. Measured this session: 9–43 CDC messages — genuinely tiny — still took
+          // multiple seconds to replay. `SQLocal`'s `tx.sql()` is still one Worker round trip
+          // per statement even inside a transaction (checked its own source —
+          // `transactionKey` only wraps the calls in one BEGIN/COMMIT, it does not merge the
+          // postMessage calls themselves), so this does not cut round-trip count. What it
+          // does cut is per-write commit/fsync overhead to OPFS — N autocommitting
+          // statements each pay that, one transaction of N pays it once — which is the
+          // well-known reason "wrap many writes in one transaction" is a real SQLite win
+          // regardless of the transport underneath. If round-trip count itself turns out to
+          // still matter after this, `TransactionHandle.batch` sends multiple statements in
+          // one message and would need `applyEvent` restructured to return statements rather
+          // than execute them — not done here, this pass only threads through `exec`.
+          // Flushing every `BATCH_SIZE` events, or every `BATCH_MS` if fewer have arrived,
+          // mirrors why `batch_publisher.zig`'s `flushLoop` batches on the bridge side, same
+          // shape, client side. Messages are only ack'd after their batch's transaction has
+          // actually committed — acking first and losing the write between the two would
+          // be worse than the seconds this replaces.
+          const BATCH_SIZE = 100;
+          const BATCH_MS = 200;
+          let batch: { table: string; ev: any }[] = [];
+          let batchMsgs: any[] = [];
+          let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+          const flushBatch = async () => {
+            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+            if (!batch.length) return;
+            const toApply = batch;
+            const toAck = batchMsgs;
+            batch = [];
+            batchMsgs = [];
+            try {
+              await transaction(async (tx) => {
+                for (const { table, ev } of toApply) {
+                  await applyEvent(table, ev, tx.sql);
+                }
+              });
+            } catch (err) {
+              appendLog('SYS', `${streamName} batch of ${toApply.length} event(s) failed to apply: ${err}`, 'ERROR');
+            }
+            for (const m of toAck) m.ack();
+          };
+
           for await (const msg of iter) {
             processedSinceStart++;
             if (processedSinceStart % progressEvery === 0) {
@@ -1547,7 +1665,8 @@ export default function App() {
             // running forever, live and catch-up look identical from outside this loop.
             if (!caughtUpLogged && ci.num_pending != null && processedSinceStart >= ci.num_pending) {
               caughtUpLogged = true;
-              appendLog('SYS', `${streamName} caught up (${processedSinceStart} messages) — now live`, 'INFO');
+              const totalMs = Math.round(performance.now() - setupStart);
+              appendLog('SYS', `${streamName} caught up (${processedSinceStart} messages, ${totalMs}ms total since consumer setup started) — now live`, 'INFO');
             }
             let decoded: any;
             try {
@@ -1576,10 +1695,17 @@ export default function App() {
               const parts = msg.subject.split('.');
               const table = ev?.table || (parts.length >= 4 ? parts[2] : parts[1]);
               appendLog(msg.subject, ev, ev?.operation || 'CDC');
-              if (table) await applyEvent(table, ev);
+              if (table) batch.push({ table, ev });
             }
-            msg.ack();
+            batchMsgs.push(msg);
+
+            if (batch.length >= BATCH_SIZE) {
+              await flushBatch();
+            } else if (!flushTimer) {
+              flushTimer = setTimeout(() => { void flushBatch(); }, BATCH_MS);
+            }
           }
+          await flushBatch();
         })();
       }
     } catch (e) {
@@ -1869,7 +1995,31 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
     // (the msg_id makes it idempotent); a write that reached JetStream but was never
     // stored is simply lost. Ordering it this way trades a possible duplicate — which
     // dedup collapses — for a possible loss, which nothing can recover.
-    await outboxPut({ msgId, subject, payload, table, id });
+    //
+    // The outbox insert and the optimistic apply happen in **one transaction** (PROTOCOL.md
+    // §7.1) — either both land or neither does, so there is never a visible row with no
+    // queued intent behind it, or a queued intent with nothing shown. `DELETE`'s `payload`
+    // carries `key`, never `data` (there is nothing to upsert), so the synthetic event reads
+    // from whichever one applies. `lsn: Number.MAX_SAFE_INTEGER` + `optimistic: true` are
+    // `applyEvent`'s own contract for this — see its doc comment.
+    try {
+      await transaction(async (tx) => {
+        await outboxPut({ msgId, subject, payload, table, id }, tx.sql);
+        await applyEvent(table, {
+          table,
+          operation: op,
+          data: op === 'DELETE' ? (payload as any).key : (payload as any).data,
+          lsn: Number.MAX_SAFE_INTEGER,
+          optimistic: true,
+        }, tx.sql);
+      });
+    } catch (err) {
+      // Nothing was queued and nothing was shown — safe to stop here rather than publish a
+      // write this client cannot itself account for.
+      pendingWrites.delete(msgId);
+      appendLog(subject, `optimistic apply failed, write not sent: ${err}`, 'ERROR');
+      return;
+    }
 
     // **JetStream publish, not core** — the same rule the snapshot request above already
     // follows, and the write path needs it more.
@@ -1986,9 +2136,52 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
     const intervalId = setInterval(pollHealth, 10_000);
     const sweepId = setInterval(sweepPendingWrites, 1000);
 
+    /// The NATS-side counterpart to `pollHealth` above — same reason, same shape: `status`
+    /// was previously updated only by `nc.status()`'s own event stream, which reacts to
+    /// what the WebSocket *reports* about itself, not to what actually is true. A frozen
+    /// `nats-server` (measured live: `kill -STOP`) can leave the WebSocket object believing
+    /// it is still open, with no 'disconnect' event ever fired to react to — `nc.rtt()`
+    /// sends a real PING and waits for a PONG, so it fails when the connection genuinely
+    /// isn't answering, whether or not the transport layer has noticed yet.
+    ///
+    /// Only acts on a **transition**, not every poll: repeatedly re-triggering a resync
+    /// while already known-down would just queue redundant `subscribeStreams()` calls
+    /// behind the `resyncing` guard for no benefit. The transition back to healthy is what
+    /// matters — that is the moment `nc.status()` might never announce on its own, so it is
+    /// the one this poll exists to catch.
+    let naturallyConnected = true;
+    const pollNatsRtt = async () => {
+      if (!nc) return;
+      try {
+        await Promise.race([
+          nc.rtt(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('rtt timeout')), 3000)),
+        ]);
+        if (!naturallyConnected) {
+          naturallyConnected = true;
+          setStatus('connected');
+          appendLog('SYS', 'NATS rtt check recovered — re-syncing (nc.status() never reported this)', 'INFO');
+          if (!resyncing) {
+            resyncing = true;
+            void flushOutbox();
+            void subscribeStreams().finally(() => { resyncing = false; });
+          }
+        }
+      } catch (err) {
+        if (naturallyConnected) {
+          naturallyConnected = false;
+          setStatus('disconnected');
+          appendLog('SYS', `NATS rtt check failed — connection is not actually answering: ${err}`, 'WARNING');
+        }
+      }
+    };
+    void pollNatsRtt();
+    const rttIntervalId = setInterval(pollNatsRtt, 10_000);
+
     onCleanup(() => {
       clearInterval(intervalId);
       clearInterval(sweepId);
+      clearInterval(rttIntervalId);
       if (nc) nc.close();
     });
 

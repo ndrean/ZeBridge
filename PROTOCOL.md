@@ -669,7 +669,9 @@ is a protocol gap rather than a storage limitation.
 
 ## 6. Snapshots — stream `INIT` ✅
 
-Snapshots seed the client with historical data. The bridge can generate and publish snapshots on request; the client uses them to recover from a stream gap.
+Snapshots seed the client with historical data.
+The bridge ~~can~~ generates and publishes snapshots ~~on request~~; the client uses them to recover from a stream gap.
+Snapshots are stored in the INIT stream with A TTL. If the client needs one butt the snapshot is not available, it is
 
 ### The Storage Architecture
 
@@ -1510,7 +1512,7 @@ One recurring confusion, worth stating once: `SYNC_RULES` maps protocol concepts
 *your* schema. Every column name in it is yours to choose. Every payload field name is
 fixed by this protocol.
 
-```
+```txt
 SYNC_RULES=orders:updated_at,deleted_at,last_writer
                   ^^^^^^^^^^ ^^^^^^^^^^ ^^^^^^^^^^^
                   version    tombstone  tiebreak     — your column names
@@ -1640,7 +1642,7 @@ listening. Use a UUID or a hex string.
 ⚠️ **Deliberately outside `mutation.>`.** The ingress consumer filters on that prefix, so a
 reply published under it would be read back by the bridge as if it were a write.
 
-**Payload**
+**Payload**:
 
 ```json
 {
@@ -1662,7 +1664,7 @@ reply published under it would be read back by the bridge as if it were a write.
 | `seq` | the `MUTATIONS` stream sequence — the number the client already got in its `PubAck`, so it can correlate without having stored its own `msg_id` |
 | `version` | the version **actually stored**, in the wire format of §7.3. Authoritative: after a clamp it is not what you sent |
 
-**The five statuses**
+**The five statuses**:
 
 | status | it means | client |
 | --- | --- | --- |

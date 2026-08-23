@@ -785,10 +785,12 @@ guessed.
 
 1. **Audience — tenant-keyed, filtered by the same token it is routed by.** ✅ BUILT:
 
+```txt
        snapshot.request.<tenant>.<table>        grant: snapshot.request.acme.>
        init.snap.<tenant>.<table>.<id>.<chunk>  grant: init.snap.acme.>
        $KV.snapshots.<tenant>.<table>           grant: $KV.snapshots.acme.>
        cdc.<tenant>.>                           grant: cdc.acme.>      (already exists)
+```
 
    ⚠️ **The tenant in the subject is granted, not asserted.** A client cannot name a tenant it does not hold, because NATS refuses the subject — the same thing that makes `mutation.<principal>.…` trustworthy. This is why it is safe to route on it.
 
