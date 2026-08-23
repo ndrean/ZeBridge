@@ -465,6 +465,10 @@ export default function App() {
 
   /// Per-table row counts, and the last CDC verb, for the flash.
   const [counts, setCounts] = createSignal<Record<string, number>>({});
+  /// The counter tables' own `value` column — not a row count, so it rides alongside
+  /// `counts` rather than in it, but on the exact same reactive trigger (`recount()`,
+  /// debounced off CDC apply) so both stay in sync with no separate polling mechanism.
+  const [counterValues, setCounterValues] = createSignal<Record<string, number>>({});
   const [lastVerb, setLastVerb] = createSignal<Record<string, string>>({});
   /// Which tables log their events to the console. Off by default: a burst from the
   /// emitter is noisy enough to hide everything else.
@@ -494,6 +498,16 @@ export default function App() {
       } catch { /* table not ready yet */ }
     }
     setCounts(next);
+
+    const nextCounters: Record<string, number> = {};
+    for (const table of ['counter_public', 'counter_tenant']) {
+      if (!syncedTables.has(table)) continue;
+      try {
+        const r = await sql(`SELECT value FROM ${table} LIMIT 1`);
+        nextCounters[table] = r[0]?.value ?? 0;
+      } catch { /* table not ready yet */ }
+    }
+    setCounterValues(nextCounters);
   };
 
   /// ⚠️ Debounced, and triggered by CDC — **not** by the click that sent a mutation.
@@ -1719,6 +1733,37 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
     });
   };
 
+  /// +1/-1 on the one row a counter table holds. No tombstone, no delete button — a
+  /// counter only ever has an INSERT (first click, no row yet) or an UPDATE (every click
+  /// after). The two must send different columns: INSERT needs `inserted_at` to satisfy
+  /// the column's NOT NULL with no default; UPDATE must NOT resend it — the exact
+  /// NOT-NULL-satisfying-only-what-changed lesson `applyUpdate` exists for, except here
+  /// it falls out naturally from only including the field when it's actually needed.
+  const bumpCounter = async (table: 'counter_public' | 'counter_tenant', delta: number) => {
+    if (!nc) return;
+    let row: { uid: string; value: number } | null = null;
+    try {
+      const r = await sql(`SELECT uid, value FROM ${table} LIMIT 1`);
+      row = r[0] ? { uid: r[0].uid, value: r[0].value } : null;
+    } catch {
+      /* table not ready yet */
+    }
+
+    const id = row?.uid ?? uuidv7();
+    const nextValue = (row?.value ?? 0) + delta;
+    const version = versionNow();
+    const data: Record<string, unknown> = { uid: id, value: nextValue, updated_at: version };
+    if (table === 'counter_tenant') data.tenant_id = TENANT || undefined;
+    if (!row) data.inserted_at = version;
+
+    await sendMutation(table, row ? 'UPDATE' : 'INSERT', id, version, {
+      key: { uid: id },
+      data,
+      version,
+      client_id: CLIENT_ID,
+    });
+  };
+
   /// Write to `users`, which is **outbound-only**: it has no `bridge_writer` grant.
   ///
   /// Expect a pause of about **four seconds**, then a verdict. `permission denied` is a
@@ -1957,11 +2002,6 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
             <span class={`badge ${health() === 'up' ? 'connected' : 'disconnected'}`}>
               bridge {health()}
             </span>
-            <span id="sync-state">
-              principal <strong>{PRINCIPAL}</strong> · client <strong>{CLIENT_ID}</strong>
-              {' '}· tenant <strong>{tenant()}</strong>
-              {' '}· held {pendingCount()}
-            </span>
           </div>
 
           {/* The startup state machine. Each cell greens once and stays green — the useful
@@ -1991,6 +2031,11 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
 
         <main>
           <h3>Replica</h3>
+          <p id="sync-state">
+            principal <strong>{PRINCIPAL}</strong> · client <strong>{CLIENT_ID}</strong>
+            {' '}· tenant <strong>{tenant()}</strong>
+            {' '}· held {pendingCount()}
+          </p>
           <table class="tables-summary">
             <thead>
               <tr><th>table</th><th>rows</th><th>last CDC</th><th>log</th><th>actions</th></tr>
@@ -2035,16 +2080,36 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
 
           <div class="controls">
             <button onClick={recount} style="background: #37474f;">Recount</button>
-            {/* The three push buttons are a set: one write that is accepted, one refused
-                by grant, one refused by shape. Without the first, the panel demonstrated
-                only the ways writing fails. */}
-            <button onClick={() => void insertRandom()} style="background: #2e7d32;">Push to test_types — accepted</button>
-            {/* updateLast()/deleteLast() already existed (used by earlier scenario testing)
-                but had no button — INSERT was the only mutation shape actually exercised
-                from the UI. Both target the most recently touched *live* row, so run them
-                after at least one insert. */}
+          </div>
+
+          {/* One row per demo, not one flat button strip — the three test_types buttons
+              are a set (accepted / refused by grant / refused by shape), and the two
+              counters are the offline-first walkthrough fixture: same +/- shape, one
+              public (every principal shares the row), one tenant-scoped (RLS-filtered,
+              one row per tenant) — see the schema's own `tenant_column` for which is
+              which, not a name convention. */}
+          <div class="controls">
+            <span>test_types:</span>
+            <button onClick={() => void insertRandom()} style="background: #2e7d32;">Push — accepted</button>
             <button onClick={() => void updateLast()} style="background: #1565c0;">Update last row</button>
             <button onClick={() => void deleteLast()} style="background: #ef6c00;">Delete last row</button>
+          </div>
+
+          <div class="controls">
+            <span>counter (public):</span>
+            <button onClick={() => void bumpCounter('counter_public', -1)} style="background: #ef6c00;">-</button>
+            <strong>{counterValues()['counter_public'] ?? 0}</strong>
+            <button onClick={() => void bumpCounter('counter_public', 1)} style="background: #2e7d32;">+</button>
+          </div>
+
+          <div class="controls">
+            <span>counter (tenant):</span>
+            <button onClick={() => void bumpCounter('counter_tenant', -1)} style="background: #ef6c00;">-</button>
+            <strong>{counterValues()['counter_tenant'] ?? 0}</strong>
+            <button onClick={() => void bumpCounter('counter_tenant', 1)} style="background: #2e7d32;">+</button>
+          </div>
+
+          <div class="controls">
             <button onClick={publishToReadOnlyTable} style="background: #6a1b9a;">Push to users — refused</button>
             <button onClick={publishMalformed} style="background: #b71c1c;">Push malformed — verdict now</button>
           </div>

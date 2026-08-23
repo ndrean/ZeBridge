@@ -706,7 +706,7 @@ authorization bypassed with extra steps.
 | schema | the *shape* of a table | `$KV.schemas.>` — wholesale | same bucket, same grant |
 | table | that rows exist, and their content | grant `cdc.*.<t>.>` instead of `cdc.>` | grant `init.snap.<t>.>` + `snapshot.request.<t>` |
 | column | which columns | publication column list (§1.8) | same list — `snapshot_listener.zig:470` |
-| row / tenant | which rows | tenant is a **subject token**: `cdc.<tenant>.>` | ❌ **nothing to match on** |
+| row / tenant | which rows | tenant is a **subject token**: `cdc.<tenant>.>` | ✅ **built and measured** — see "The design, in three parts" below |
 
 Two of these are already solved and simply unused. **Column** scoping works on both paths
 through the publication column list. **Table** scoping is expressible on both paths today —
@@ -715,18 +715,21 @@ the shipped conf grants `cdc.>`, `init.>` and `snapshot.request.>` wholesale. Ti
 is a conf edit and no code, and the invariant above is what makes it checkable: for every
 table, the `init.snap.<t>.>` grant must match the `cdc.*.<t>.>` grant.
 
-**Row scoping is the architecture gap**, and no amount of NATS configuration reaches it:
-`init.snap.<table>.<snapshot_id>.<chunk>` has no tenant token, and `snapshot.request.<table>`
-carries no principal, so the bridge has nothing trustworthy to filter *by*. The conf records
-the reasoning that led here — *"asking is not reading, and the reply lands on `init.>` which
-it may already see"* — which is sound given universal `init.>`, and circular as a
-justification for scoping it.
+**Row scoping was the architecture gap; it is now built, in the three parts described
+below** — `init.snap.<tenant>.<table>.<snapshot_id>.<chunk>` carries the tenant, and
+`snapshot.request.<tenant>.<table>` carries the audience it was requested for.
 
-Measured: `bob` (tenant `globex`) published `snapshot.request.test_types` — a table whose
-rows are all `acme` — and the bridge answered him with a data chunk. The row payload was not
-decoded, so this is not a verified row-level leak; the **request-and-delivery path is
-unscoped**, which is what `snapshot_listener.zig` already says by containing no reference to
-`tenant` anywhere in its 2093 lines.
+The original finding, kept for the record: `bob` (tenant `globex`) published
+`snapshot.request.test_types` (no tenant token, the old shape) — a table whose rows are all
+`acme` — and the bridge answered him with a data chunk. The row payload was not decoded, so
+that was not a verified row-level leak; it was that the **request-and-delivery path was
+unscoped**, which `snapshot_listener.zig` said by containing no reference to `tenant`
+anywhere in its 2093 lines. Both now false: the audience half is enforced by the
+`INIT_<TENANT>`/`INIT_PUBLIC` stream split (mirroring the CDC split — a JetStream consumer's
+`filter_subject` is reader-chosen, not ACL-checked, so the stream itself is the boundary,
+`scripts/scenarios/crosstenant.py`), and re-measured directly against fresh data: `bob`
+denied both `INIT_ACME`'s stream info and `$KV.snapshots.acme.test_types`'s descriptor
+(`scripts/scenarios/tenant_kv.py` check 4).
 
 #### Where enforcement actually lives, per shape
 
@@ -757,11 +760,16 @@ the **audience**. Doing only the first gives correctly-filtered dumps published 
 wrong tenant can read them. The third makes the client's own tenant authoritative instead of
 guessed.
 
-1. **Contents — in PostgreSQL, not in the bridge.** The snapshot opens its *own* connection
-   (`snapshot_listener.zig:1530`), separate from replication (`:137`). Set **`zb.tenant`** on
-   it from the authenticated request subject — the same `set_config(…, is_local => true)` the
-   mutation listener already uses for `zb.principal` — and add a reader `SELECT` policy
-   filtering on `current_setting('zb.tenant', true)`.
+1. **Contents — in PostgreSQL, not in the bridge.** ✅ BUILT. The snapshot opens its *own*
+   connection (`snapshot_listener.zig`, `generateIncrementalSnapshot`), separate from
+   replication. `zb.tenant` is set on it from the authenticated request subject — the same
+   `set_config(…, is_local => true)` the mutation listener already uses for `zb.principal` —
+   and `zebridge_scope_reads_by_tenant()` (`init.core.template.sql`, wired into
+   `zebridge_enable()` for every tenant-scoped table, read-only or writable) adds the reader
+   `SELECT` policy filtering on `current_setting('zb.tenant', true)`. Measured end to end: a
+   `test_types` snapshot pulled as `alice` (tenant `acme`) against a table holding both
+   tenants' rows decoded to exactly the `acme`-tagged row, nothing from `globex`
+   (`tenant_kv.py` check 4).
 
    §1.8 measured that **RLS filters the snapshot** and is bypassed by CDC. That asymmetry is
    exactly what makes this work: the snapshot obeys the policy, and CDC is scoped by the
@@ -775,7 +783,7 @@ guessed.
    ⚠️ If `zb.tenant` is unset the predicate is NULL and **every** row is excluded — the same fail-closed shape the write path has, where a missing `zb.principal` refuses every write.
    Silent emptiness is the correct failure here, but it looks exactly like an empty table, so it needs to be distinguishable in the descriptor (see the closed filter-vs-refuse question).
 
-1. **Audience — tenant-keyed, filtered by the same token it is routed by.** DECIDED:
+1. **Audience — tenant-keyed, filtered by the same token it is routed by.** ✅ BUILT:
 
        snapshot.request.<tenant>.<table>        grant: snapshot.request.acme.>
        init.snap.<tenant>.<table>.<id>.<chunk>  grant: init.snap.acme.>
@@ -833,11 +841,18 @@ guessed.
    like "this client stays on Direct Get" has to be checked against the specific client
    library actually shipping, not against whichever tool was on hand to test with.
 
-   ⚠️ **Not yet fed live.** The bucket itself is created (`nats-init`, native `up.sh`) and
-   the client reads it, but nothing populates `$KV.tenants.<principal>` from
-   `zebridge_user_tenants` yet — that is the trigger → WAL → KV pipeline described above,
-   still pending in the bridge. Seeded by hand (`nats kv put tenants alice acme`) until
-   then.
+   ✅ **Fed live.** `zebridge_user_tenants` INSERT/UPDATE is special-cased in the WAL loop
+   (`bridge.zig`), routed to `packTenantToKvSlot` (`event_processor.zig`, mirrors
+   `packDdlToSlot`'s pattern — publishes the bare tenant string, no JSON wrapping), plus a
+   one-shot `publishBootTenants()` backfill of existing rows at startup. Measured live, no
+   bridge restart: an `INSERT` into `zebridge_user_tenants` for a throwaway principal showed
+   up in `$KV.tenants.<principal>` within the poll window, and a subsequent `UPDATE`
+   reassigning its tenant did too (`tenant_kv.py` check 3). ⚠️ **`DELETE` is not handled** —
+   deliberately deferred, not an oversight: a revoked or reassigned-away mapping leaves a
+   stale `$KV.tenants` entry behind, since only the insert/update branches are special-cased.
+   A client reading a stale entry would resolve a tenant that no longer has a row for it in
+   `zebridge_user_tenants` — worth closing before this ships anywhere principals get
+   deprovisioned.
 
    ⚠️ **Granted per principal — `$KV.tenants.alice`, never `$KV.tenants.>`.** The wholesale
    grant would hand every client the full principal→tenant map, which is a roster of who else
@@ -906,6 +921,20 @@ list, mirroring the bucket it reads.
 Filtered dumps cannot be shared: different contents, different messages. The multiplier is
 the **tenant** count, not the principal count — principals sharing a tenant share a dump.
 
+⚠️ **And, since the schema payload's `tenant_column` fix, the multiplier only applies to
+tables `TENANT_RULES` actually scopes — not to every table indiscriminately.** Before that
+fix, a client's `snapKey`/request subject used its own resolved tenant unconditionally, so a
+genuinely tenant-agnostic table (`users`, every internal `zebridge_*` table) got a redundant
+per-tenant snapshot per principal — five principals, five copies of identical content, none
+of them sharing. The schema now carries `tenant_column` (the bridge already had this from
+`TENANT_RULES` for CDC routing, `EventProcessor.tenant_rules`; it just wasn't told to
+clients), and `App.tsx`'s `effectiveTenantFor(table)` uses it: the client's own tenant for a
+table with a real `tenant_column`, `topology.open_tenant` for one without. Measured live:
+`alice` (acme) and `bob` (globex) ended up with the *identical* `snapshot_id` for `users`
+after this fix, and correctly different ones for `test_types` — so the multiplier below is
+now bounded to the tables that genuinely need it, which for most schemas is a small
+fraction.
+
 | stream | limit today | effect |
 | --- | --- | --- |
 | `INIT` | `max_age=604800s`, `max_msgs_per_subject=-1` | chunk bytes × tenants, hard 7-day ceiling |
@@ -942,6 +971,42 @@ dumps shareable again.
   (row absent, verdict present, right SQLSTATE); `probe.py` covers its **cardinality** and the
   disclosure premise itself — measured: `alice` reads all 5 columns of `users`, writes to it,
   and is refused once as `DbAllocatedKey` with nothing following.
+
+#### A cached descriptor has no expiry of its own — found live, fixed
+
+A client accepted **any** existing `$KV.snapshots` descriptor unconditionally, however old —
+the only trigger for a fresh generation was *no* descriptor existing at all
+(`App.tsx`'s snapshot-request block: `if (entry) { desc = decode(...) }`, no further check).
+Nothing tied a cached descriptor's validity to whether the relevant CDC stream still covers
+the gap back to its own LSN watermark.
+
+Measured live: `users`' descriptor sat at a stale 1-row watermark while Postgres held 4 rows,
+because a `CDC_PUBLIC` purge (routine dev-environment cleanup — itself safe by the gap-check
+design above, which is exactly what should have caught a client whose *own* `local` seq fell
+off the stream) orphaned a descriptor a *different* client had already cached, with nothing
+tying the two together. The client had no way to tell the cached watermark could no longer be
+bridged to "now."
+
+Fixed with `descriptorStillFresh(js, tenant, desc)` in `App.tsx`: before accepting a cached
+descriptor, fetch the oldest message still available on the CDC stream that tenant's writes
+land on (an ephemeral pull consumer at `first_seq` — reuses the exact
+`deliver_policy: StartSequence`/`opt_start_seq` shape the main CDC subscription loop already
+uses, deliberately to avoid a new NATS grant) and compare its LSN against the descriptor's
+watermark. Oldest-available postdates the watermark → the gap is unrecoverable → discard the
+descriptor and request a fresh one. An unverifiable case (stream currently empty, but a
+descriptor exists) is treated as unsafe rather than assumed fine — the only two explanations
+are "nothing written since boot" (a harmless extra regeneration) and "everything aged out
+from under this exact descriptor" (the failure this exists to catch), and an empty stream
+alone cannot tell them apart. Verified via a deliberate reproduction: purged `CDC_ACME`,
+reconnected, and watched all five affected tables correctly log
+`Cached snapshot for <table> is orphaned … requesting a fresh one instead` and regenerate.
+
+This is the same *shape* of problem the Object Store race below is about — a cached read has
+to know when it stops being safe to trust — solved here inside the current architecture
+(compare against live stream state) rather than via Object Store's own signals. Worth keeping
+in mind for whoever eventually does that work: the mechanism would need re-deriving, not
+reusing, since Object Store's own `watch()`/meta-freshness answers "is a newer object
+available", not "is the CDC history to bridge from this one still there."
 
 #### Object Store for the bulk path — one part measured, one still open
 
@@ -1023,6 +1088,28 @@ grace delay after the swap, once no reader could plausibly still be attached to 
 snapshot_id-per-generation shape already in production, just an object instead of a
 chunk-message run underneath each generation.
 
+### 1.13 Pipeline the flush thread — encode the next batch while NATS acks the current one
+
+`batch_publisher.zig`'s `flushLoop` is fully synchronous today: drain events into a batch,
+`flushBatch` → `doPublish`, wait for the publish to return, only then start draining the
+next batch. Confirmed by reading the code, not assumed — `doPublish`'s own comment says so
+directly ("the publish calls below are synchronous").
+
+The idea: while NATS is acking the batch just sent, the flush thread could already be
+draining and encoding the *next* batch, so it is ready to send the instant the ack for the
+current one lands, instead of only starting then. The size of the win depends on what the
+ack wait actually is. It is not network RTT — the bridge and `nats-server` are colocated on
+one VPS (§0 elsewhere in this file), so that part is already small. It is plausibly disk
+write/fsync time on the NATS side for a file-backed JetStream stream, which colocation does
+not shrink at all.
+
+Not yet measured, so not yet built. Before writing any pipelining code: log the time between
+issuing a publish and its ack returning, for real batches under real load. If that number is
+a few ms and batches are frequent, this is a real win. If it is sub-millisecond, it is not
+worth the added complexity. Judge any resulting change the same way every other perf change
+in this file is judged — against the README burst benchmark, by iters delta, not by
+intuition about which side "must" be slow.
+
 ### 2.13 A wildcard inbox made every pull request spawn another
 
 `jetstream.zig` `fetch` mints a unique reply subject per request but reads from a
@@ -1057,6 +1144,119 @@ the instant PostgreSQL writes, so latency is unchanged.
 ⚠️ Not a latency bug — publish latency measured 8.6–13.8 ms (median 10.4) commit→NATS
 both before and after. An early 41 ms reading was a measurement artifact: the harness
 spawned a Python interpreter per message.
+
+### 2.15 `Kvm.open()` on `$KV.snapshots` was missing `allow_direct` — same bug class as §1.12's `$KV.tenants` fix, never applied to the second bucket
+
+`resolveTenant()`'s `kvm.open(topology.kv.tenants, { allow_direct: true })` fix (§1.12 part
+3) was never mirrored onto the snapshot-replay code's own `kvm.open(topology.kv.snapshots)`
+call — it opened the bucket with no options, defaulting `allow_direct` to `false`.
+
+`$KV.schemas` tolerates this silently, because it is deliberately wholesale-granted
+(`$JS.API.STREAM.MSG.GET.KV_schemas` — schema disclosure stays unscoped by design). `$KV.snapshots`
+is not: only the exact-key Direct Get path is granted per tenant, so every `get()`/`watch()`
+against it was a genuine `Publish Violation`.
+
+Found via `nats-server.log`, not guessed: every one of five test principals hit
+`Publish Violation - Subject "$JS.API.STREAM.MSG.GET.KV_snapshots"`, five times each in a
+sub-20 ms cluster — matching `SNAPSHOT_REQUEST_ATTEMPTS` exactly. `waitForDescriptor`'s
+`kv.watch()` was throwing immediately rather than actually waiting the timeout, so the
+5-attempt retry loop burned through in milliseconds instead of minutes, then gave up and
+`syncedTables.delete(table)`d — silently discarding every subsequent CDC event for that
+table, no error, no symptom but a permanently-wrong count. Some clients still showed partial
+data because a plain `snapKv.get()` (issued once, before the broken retry loop) apparently
+resolves via a different internal path that happened to succeed when a descriptor already
+existed from another client's earlier request — explaining the "some counts wrong,
+inconsistently, across principals on the same tenant" symptom rather than a uniform failure.
+
+Fixed the same way as the original: `{ allow_direct: true }` on the `kvm.open()` call.
+
+### 2.16 Removing a format fallback and removing crash containment are not the same diff
+
+Part of this session's wire-format cleanup (schema always JSON, CDC/snapshot always
+MessagePack, `--json` removed — see `PROTOCOL.md` §3/§4) correctly stripped the now-dead
+`catch { JSON.parse(...) }` fallback from `App.tsx`'s snapshot-chunk and CDC-event `decode()`
+calls, since the bridge can no longer produce JSON on either path. But the instruction also
+removed the `try`/`catch` entirely, not just the JSON guess — leaving a bare `decode(msg.data)`
+with nothing catching a genuine decode failure.
+
+Both call sites sit inside a fire-and-forget `void (async () => { for await (...) })()` — an
+un-awaited IIFE the outer `try`/`catch` around consumer setup cannot reach. An uncaught throw
+inside either loop silently ends the whole loop for that table (snapshot replay) or that
+entire stream — every table it carries (CDC consumption) — with nothing visible but an
+easy-to-miss unhandled promise rejection. No error banner, no crash, just permanently stalled
+sync.
+
+Restored crash containment at both sites: catch, log a visible `SYS ERROR` (table/stream, seq,
+the actual error), `ack()`, and `continue` — skip the one bad message, not the whole pipeline.
+The lesson to keep: a format fallback (try msgpack, guess JSON) and crash containment (don't
+let one bad message kill the loop) can live in the same `try`/`catch` and look like the same
+diff to remove, but they are two different guarantees. Removing the first because the bridge
+proved it unnecessary does not make the second unnecessary too.
+
+### 2.17 `mutation.<principal>.<table>.update` was routed through the INSERT-shaped upsert, so a genuine partial update could fail on a column it never touched
+
+`applyUpsert` (`mutation_listener.zig`) handled both `insert` and `update` mutations
+identically: `INSERT (cols from data) VALUES (...) ON CONFLICT (pk) DO UPDATE SET ...`.
+PostgreSQL must be able to satisfy the INSERT branch even when only the UPDATE branch can
+ever fire for a row the client already knows exists — every `NOT NULL` column with no
+database-level default has to be present in `data`, or the statement is rejected before
+`ON CONFLICT` is even considered.
+
+A correctly-written partial update (`{some_text, updated_at}` only, deliberately omitting
+every unchanged column — exactly what `PROTOCOL.md` §4's UPDATE omission rule already asks a
+*reader* to expect) against a table whose `inserted_at` is `NOT NULL` with no default failed
+`23502`, reproduced live via two different principals' own Update-button presses through the
+UI. This was `PROTOCOL.md` §7.2's documented "item 2" limitation ("`data` omits a NOT NULL
+column that has no DEFAULT. The INSERT fails, forever") — but that limitation only makes
+sense for a genuine INSERT; nothing about an UPDATE against a row that already has an
+`inserted_at` should need to re-supply it.
+
+Fixed with a dedicated `applyUpdate` — a real `UPDATE ... SET ... WHERE pk AND
+version-guard`, mirroring `applyDelete`'s WHERE-guard/tie-break shape (there is no `EXCLUDED`
+pseudo-table in a plain UPDATE, so the tie-break reuses the same bound parameter position
+instead of `EXCLUDED.col`) rather than `applyUpsert`'s INSERT-shaped one. `.insert` still
+goes through `applyUpsert` — correctly, since client-generated-key retry-safety needs upsert
+semantics — `.delete` is untouched, only `.update` moved.
+
+⚠️ **This also changes a documented protocol invariant, not just fixes a bug** — see
+`PROTOCOL.md` §7.4's "There is no 'row not found'" section, corrected in the same pass as
+this fix: an `update` naming a key that does not exist no longer silently creates a phantom
+row. It now runs through the exact same classify logic `applyDelete` already used (`affected
+== 0` → check whether the row exists/is tombstoned → `.row_deleted` if not, `.stale`
+otherwise), verified by reading `buildClassify`/the pipeline result handling in
+`mutation_listener.zig` rather than assumed. A client relying on the old "update always
+succeeds" behavior needs to handle `row_deleted` on update the same way it already does on
+delete.
+
+### 2.18 `zebridge_scope_reads_by_tenant()` had no open-tenant carve-out — audience said everyone, contents said only the open tenant itself
+
+`zebridge_scope_writes_by_tenant()`'s write policy has always granted every principal
+read/write on a row mapped to the OPEN tenant (`init.write.template.sql`, `zb_tenant_write`:
+`... OR tenant_col = '${OPEN_TENANT}'`) — SECURITY.md's own "Open means open to READ"
+already documented this as the intended behavior. `zebridge_scope_reads_by_tenant()`'s read
+policy (`init.core.template.sql`, `zb_reader_all`), added later for snapshot scoping,
+never got the same clause — it only matched `coalesce(zb.tenant,'')='' OR tenant_col =
+zb.tenant`, nothing else.
+
+CDC doesn't apply RLS (it isn't a query), so the open tenant's rows already reached every
+client correctly via `CDC_PUBLIC`'s wildcard subject — audience was right. But a snapshot
+*is* a query, gated by this exact policy, and a non-open-tenant client's snapshot connection
+never had `zb.tenant` equal to the open value, so the policy never matched — contents was
+wrong. A client's local copy of an open-tenant row ended up depending on whether a live CDC
+write for it happened to arrive while connected, not on what its own snapshot returned:
+reconnect before any further write touched that row, and the row silently vanished from a
+fresh replica. Found live on the `counter_tenant` demo table — three tenants' worth of rows
+in Postgres, every non-open-tenant client reporting a count one row short of what CDC alone
+would eventually converge them to, and inconsistently so depending on connection timing.
+
+Fixed by adding the identical carve-out to the read policy:
+`... OR tenant_col::text = '${OPEN_TENANT}'`, mirroring `zb_tenant_write` exactly. Verified
+live: `SET LOCAL ROLE bridge_reader; SELECT set_config('zb.tenant','acme',true);` against
+`counter_tenant` now returns both `acme`'s own row and the `_default` row. Every existing
+`$KV.snapshots` descriptor for a tenant-scoped table predates this fix and was purged —
+a cached descriptor's own staleness check (§1.12) only catches a CDC-coverage gap, not "the
+RLS policy that generated this content has since changed," so a policy fix like this one
+needs its own manual purge, not just a restart.
 
 ## 3. PostgreSQL behaviours worth remembering
 

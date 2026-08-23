@@ -6,7 +6,8 @@
     "requests": "REQUESTS"
   },
   "public_tables": [
-    "users"
+    "users",
+    "counter_public"
   ],
 
   "tenants": [

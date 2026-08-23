@@ -210,10 +210,27 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 ```
 
 Root keys are `table`, `pg`, `sqlite`, `lsn`, plus the **write contract**:
-`version_column`, `tombstone_column`, `mutation_timeout_ms` and `replica_identity`.
+`version_column`, `tombstone_column`, `tenant_column`, `mutation_timeout_ms` and
+`replica_identity`.
 
 `version_column` is the column to send back as `version` (§7.3); `tombstone_column` is
-`null` when the table deletes physically rather than softly (§7.5).
+`null` when the table deletes physically rather than softly (§7.5). `tenant_column` is the
+`TENANT_RULES` column name, or `null` for a table every principal reads and writes the same
+content of — every internal `zebridge_*` table, and any business table `TENANT_RULES`
+doesn't name (not the same set as `topology.json`'s `public_tables`, which only lists
+user-schema tables). Drives which token a client uses when it builds a snapshot subject or
+KV key for that specific table: its own resolved tenant when `tenant_column` is set, the
+shared open-tenant token when it is `null` — without this a client had no way to tell the two
+apart per table and defaulted to its own tenant everywhere, so N principals cached N
+redundant copies of a tenant-agnostic table instead of converging on the one shared entry
+(§6, "Connection Flow").
+
+⚠️ **This payload is always JSON, unconditionally — never MessagePack.** Unlike the CDC and
+snapshot payloads below (§4, §6), there is no `--json` flag or runtime choice for schema:
+the bridge hardcodes JSON here regardless of how it encodes everything else. Small, rare
+payloads (one per table, at boot and on DDL) where human-readability (`nats kv get schemas
+<table>`) outweighs MessagePack's compactness, and worth stating explicitly rather than
+leaving a reader to infer it from the ` ```json ` fence below.
 
 Each entry in `pg.columns[]` also carries `required` — `true` when the column is `NOT NULL`
 with no default, so a mutation omitting it is refused (§7.2).
@@ -447,7 +464,13 @@ a DELETE carries the key (plus nulls under DEFAULT identity, as above).
 
 ### Value encoding
 
-MessagePack by default, JSON with `--json`. Either way:
+⚠️ **Always MessagePack, unconditionally — never JSON.** There used to be a `--json` flag
+making this a runtime choice; it is gone, along with the whole `Format`-as-CLI-choice axis
+(`args.zig`, `batch_publisher.zig`). Every CDC event and every snapshot payload (§6) is
+MessagePack, full stop — the mirror image of schema's "always JSON" (§3). A client written
+against the old "MessagePack by default" wording should stop carrying a JSON fallback for
+this payload; the bridge can no longer produce one, and a stray fallback here is dead code
+that only obscures a genuine decode failure (`NOTES.md` §2.16).
 
 * `numeric` arrives as a **string** (`"123.45000000"`) to preserve precision.
 * a column PostgreSQL sent in **text format** (it does this per column, even under
@@ -474,16 +497,17 @@ The core of the protocol, and the part most easily got wrong.
 
 ```mermaid
 sequenceDiagram
-    participant PG as PostgreSQL
+    participant PG@{ "type" : "database" }
     participant B as ZeBridge
     participant KV as KV schemas
     participant S as CDC stream
     participant C as Client
 
-    Note over PG: ALTER TABLE users ADD COLUMN kyc_status;<br/>INSERT … (same transaction)
 
     PG->>B: WAL: DDL event, then row
+    Note over PG,B: ALTER TABLE users... 
     B->>KV: schema (lsn=X)
+    NOTE over PG,B:INSERT INTO users...
     B->>S: cdc.users.insert (lsn>X)
 
     par independent subscriptions
@@ -659,20 +683,27 @@ Snapshot data is megabytes-to-gigabytes of ordered chunks. It flows through thre
 
 **Requesting a snapshot:**
 
-1. A client checks `kv.snapshots.<table>`. If a valid snapshot exists (i.e., its LSN is within the `CDC` retention window), the client can replay it immediately.
-2. If no valid snapshot exists, the client publishes an empty message to `snapshot.request.<table>`.
+1. A client checks `kv.snapshots.<tenant>.<table>` (§ "The Connection Flow" below covers resolving `<tenant>`, and it must also verify a hit is still within the CDC window it can bridge from — `NOTES.md` §"A cached descriptor has no expiry of its own"). If a valid snapshot exists, the client can replay it immediately.
+2. If no valid snapshot exists, the client publishes an empty message to `snapshot.request.<tenant>.<table>`.
 3. If NATS accepts the publish, the bridge generates the snapshot. If NATS rejects the publish (because a request is already running or cached within `SNAP_RET`), the client simply ignores the error, waits, and watches the KV bucket.
 
 **Responses (from bridge):**
 
 | subject | payload |
 | --- | --- |
-| `init.snap.start.<table>` | `{snapshot_id, table, lsn, timestamp, status:"starting", format}` |
-| `init.snap.<table>.<snapshot_id>.<chunk>` | `{table, operation:"snapshot", snapshot_id, chunk, lsn, data:[…]}` |
-| `init.snap.meta.<table>` | `{snapshot_id, table, lsn, timestamp, batch_count, row_count}` |
-| `init.snap.error.<table>` | `{table, timestamp, status:"failed", error_type, error_message, available_tables}` |
+| `init.snap.<tenant>.start.<table>` | `{snapshot_id, table, lsn, timestamp, status:"starting"}` |
+| `init.snap.<tenant>.<table>.<snapshot_id>.<chunk>` | `{table, operation:"snapshot", snapshot_id, chunk, lsn, data:[…]}` |
+| `init.snap.<tenant>.meta.<table>` | `{snapshot_id, table, lsn, timestamp, batch_count, row_count}` |
+| `init.snap.<tenant>.error.<table>` | `{table, timestamp, status:"failed", error_type, error_message, available_tables}` |
 
-*Note: Metadata is written to `kv.snapshots.<table>` upon completion, not broadcasted as an event.*
+`<tenant>` is the tenant token the request was made for (§ "The Connection Flow" below) —
+always present, third token after `init.snap`, in the same position across every one of
+these patterns so a single stream filter (`init.snap.<tenant>.>`) catches all of them. There
+is no `format` field on `init.snap.<tenant>.start.<table>` — every one of these payloads is
+MessagePack, unconditionally (§4), so there is nothing left to announce per snapshot.
+
+*Note: Metadata is written to `kv.snapshots.<tenant>.<table>` upon completion, not
+broadcasted as an event.*
 
 `error_type` is the machine-readable discriminator; branch on it, not on `error_message`:
 
@@ -954,9 +985,10 @@ rows a principal may *receive* — is a separate problem this rule does not touc
 mutation.<principal>.<table>.<operation>      e.g. mutation.a3f9c1.users.insert
 ```
 
-`<operation>` is `insert` | `update` | `delete` — the same verbs as `cdc.<table>.<op>`.
-Server-side `insert` and `update` are the same upsert, but the verb is a **subject
-token** so that "may create, may not delete" is expressible as a broker permission.
+`<operation>` is `insert` | `update` | `delete` — the same verbs as `cdc.<table>.<op>`. The
+verb is a **subject token** so that "may create, may not delete" is expressible as a broker
+permission. ⚠️ **`insert` and `update` are no longer the same operation server-side** — see
+§7.4's "There is no 'row not found'", corrected below.
 
 **The principal is in the subject because NATS authorizes subjects, not payloads.** A
 client issued `publish: ["mutation.a3f9c1.>"]` physically cannot write as anyone else,
@@ -1273,12 +1305,18 @@ GRANT SELECT, INSERT, UPDATE ON public.<table> TO bridge_writer;  -- + DELETE if
 `SELECT` is required as well as `INSERT`/`UPDATE`: the upsert's `WHERE` reads the stored
 version to decide the conflict.
 
-**2. `data` omits a NOT NULL column that has no DEFAULT.** The INSERT fails, forever, on
-every retry. ⚠️ A client **cannot discover this from the protocol** — the schema
-descriptor in the `schemas` KV carries only column `name` and `type`, never nullability
-or defaults. Until it does, the writable column set is out-of-band knowledge, and
+**2. An `insert` omits a NOT NULL column that has no DEFAULT.** The INSERT fails, forever, on
+every retry. Discoverable from the protocol via `pg.columns[].required` (§3) — `true` marks
+exactly this case — so check it before sending rather than after being refused.
 `inserted_at`-style columns (NOT NULL, no default, set by the application rather than the
 database) are the usual casualty.
+
+⚠️ **This is INSERT-only.** An `update` that omits the same column no longer fails — it goes
+through a real `UPDATE ... SET <only the columns in data> WHERE ...` (§7.4), which never
+touches `inserted_at` at all unless the client actually sends it. Confusing the two used to
+matter: a partial update that correctly omitted unchanged columns failed the same way an
+incomplete insert did, because both went through the same INSERT-shaped statement. They no
+longer share a code path.
 
 ### 7.3 The version value
 
@@ -1547,16 +1585,44 @@ With a surrogate `uuid`, re-adding is a new row with no history to fight, and
 `(user_id, role_id)` becomes a `UNIQUE` constraint. Natural uniqueness is a constraint;
 identity is a key. The same split as email, one level up.
 
-#### ⚠️ There is no "row not found"
+#### ⚠️ `update` now answers "row not found" — this changed
 
-`insert` and `update` are the **same operation**: an upsert on the primary key. The subject
-token distinguishes them for authorization and logging, not for behaviour. So an `update`
-naming a key that does not exist does not fail — **it creates that row.**
+Until this was fixed, `insert` and `update` were the same operation server-side: an upsert on
+the primary key, with the subject token distinguishing them only for authorization and
+logging, never for behaviour. An `update` naming a key that did not exist did not fail — it
+created that row. That is no longer true.
 
-That makes UPDATE and DELETE safe in the sense that matters here (neither invents a key, so
-neither can collide), but it means the client's key is load-bearing in both directions: a
-wrong key is not rejected, it is a new row. And it is why item 3 exists — without a
-tombstone, an offline edit to a row deleted elsewhere silently brings it back.
+`update` is now a real `UPDATE ... SET <the columns in data> WHERE <pk> AND
+<version guard>` — no `ON CONFLICT`, no INSERT branch, so a key that does not exist (or
+whose row was tombstoned, per §7.5) affects zero rows rather than inventing one. This runs
+through the **same classify logic `delete` already used** (`NOTES.md` §2.17): the bridge
+follows up a zero-row UPDATE with a cheap `SELECT` on the same key to tell "gone" from
+"stale", and the mutation gets a definitive verdict either way — `row_deleted` when the row
+does not exist or is tombstoned, `stale` when it exists and the version guard simply rejected
+a write that arrived too late (§7.4b). **A client must now handle `row_deleted` on an
+`update` reply the same way it already handles it on a `delete` reply** — pop, and surface
+it: the row is gone, not merely unconfirmed.
+
+`insert` is unchanged: still the upsert described above, still what makes a retried
+client-minted key idempotent rather than a duplicate-key error. Only `update` moved off it.
+
+The consequence for a wrong or stale key differs by operation now, where it used to be one
+rule for both:
+
+| operation | key does not exist | key exists, version guard rejects |
+| --- | --- | --- |
+| `insert` | creates the row (that is the point) | `stale` — someone else already wrote a newer version |
+| `update` | `row_deleted` — nothing to update | `stale` |
+| `delete` | `row_deleted` | `stale` |
+
+`update` and `delete` now genuinely behave the same way here, which is the safer default for
+both: neither invents a key, so a wrong or late key is rejected rather than silently taken as
+license to create or overwrite. Item 3 (a tombstone column) still matters for a different
+reason — without one a *soft* delete's WHERE clause has nothing to detect once the physical
+row is gone, so an offline edit to a hard-deleted row can still land on a key GC has already
+reclaimed if it lands inside that window; the tombstone is what makes `deleted_at IS NOT
+NULL` a stable, queryable fact for the classify step to find instead of a row that simply no
+longer exists.
 
 ### 7.4b The reply channel — `mutation_ack.<principal>.<msg_id>` ✅
 

@@ -106,6 +106,9 @@ defmodule Emitter.Scenario do
     count_exotic()
   end
 
+  def step9, do: migrate(20260823080000, Emitter.PgProducer.Repo.AddCounters)
+
+
   @doc "What PostgreSQL itself renders, to diff the snapshot against."
   def count_exotic do
     with_repo(fn repo ->

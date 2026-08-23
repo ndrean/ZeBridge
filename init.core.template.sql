@@ -109,8 +109,15 @@ BEGIN
     EXECUTE format('DROP POLICY IF EXISTS zb_reader_all ON %s', tbl);
     EXECUTE format(
         'CREATE POLICY zb_reader_all ON %s FOR SELECT TO %I'
-        ' USING (coalesce(current_setting(''zb.tenant'', true), '''') = '''' OR %I::text = current_setting(''zb.tenant'', true))',
-        tbl, '${POSTGRES_BRIDGE_USER}', tenant_col);
+        -- Same open-tenant carve-out zb_tenant_write already has (init.write.template.sql):
+        -- a row mapped to the OPEN tenant is readable by every principal, not just whoever
+        -- has zb.tenant set to it. Without this, CDC (subject-routed, RLS-blind) delivers
+        -- an open row to every client while a snapshot never grants the SELECT that would
+        -- have put it there in the first place — audience says everyone, contents says only
+        -- the open tenant itself, and a client's local copy of the row depends on whether it
+        -- happened to be connected for a live CDC write, not on what its snapshot returned.
+        ' USING (coalesce(current_setting(''zb.tenant'', true), '''') = '''' OR %I::text = current_setting(''zb.tenant'', true) OR %I::text = ''${OPEN_TENANT}'')',
+        tbl, '${POSTGRES_BRIDGE_USER}', tenant_col, tenant_col);
 
     RAISE NOTICE 'reads on % now filtered by % when zb.tenant is set — CDC is unaffected (RLS does not apply to replication); the snapshot connection sets zb.tenant to scope it',
                  tbl, tenant_col;

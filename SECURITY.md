@@ -95,8 +95,13 @@ scoped?* — the invariant a pass-through bridge cannot check for itself.
 **Writable from the edge.**
 
 ```sql
-SELECT zebridge_grant_edge_writes('public.orders');
-SELECT zebridge_install_write_guards('public.orders', 'updated_at', 'deleted_at');
+SELECT * FROM zebridge_enable(
+    'public.orders'::regclass,
+    writable      => true,
+    version_col   => 'updated_at',
+    tombstone_col => 'deleted_at',
+    dry_run       => false
+);
 ```
 
 Then, in the bridge's own environment — boot-read, needs a restart:
@@ -105,48 +110,54 @@ Then, in the bridge's own environment — boot-read, needs a restart:
 SYNC_RULES=orders:updated_at,deleted_at[,last_writer]
 ```
 
-`zebridge_grant_edge_writes` opens the table (`SELECT, INSERT, UPDATE, DELETE`, and refuses
-`zebridge_ddl_events` by name — see §1.7). `zebridge_install_write_guards` attaches the
-triggers that make the columns named in `SYNC_RULES` true for *every* writer, not just the
-bridge: `zebridge_bump_version_t` stamps the version column when a statement leaves it
-alone, `zebridge_soft_delete_t` turns a DELETE into a tombstoning UPDATE when a tombstone
-column is given. Skip it and both guarantees are fiction — the columns exist, but nothing
-enforces what they're supposed to mean, and it produces no error: writes still succeed,
-deletes still "work". `zebridge_audit_write_guards()` reports what is actually attached, to
-compare against `SYNC_RULES`.
+This grants the table (`SELECT, INSERT, UPDATE, DELETE`, and refuses `zebridge_ddl_events`
+by name — see §1.7) and attaches the triggers that make the columns named in `SYNC_RULES`
+true for *every* writer, not just the bridge: `zebridge_bump_version_t` stamps the version
+column when a statement leaves it alone, `zebridge_soft_delete_t` turns a DELETE into a
+tombstoning UPDATE when a tombstone column is given. Skip either argument and that guarantee
+is fiction — the column exists, but nothing enforces what it's supposed to mean, and it
+produces no error: writes still succeed, deletes still "work". `zebridge_audit_write_guards()`
+reports what is actually attached, to compare against `SYNC_RULES`.
 
 **Tenant-scoped (multi-tenant, routed per row — many tenants share one bridge, one
 publication, one stream family).**
+
+`zebridge_enable()` is the entry point — one call does grants, guards, RLS (read and
+write), and publication registration together, and prints what it did as its own return
+table:
 
 ```sql
 -- The table needs a NOT NULL tenant column, and every writer needs to be in this table —
 -- N-1: exactly one tenant per client principal.
 INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
 
--- Same call as "writable from the edge" above, plus a 4th argument: fills an omitted
--- tenant from zebridge_user_tenants (fail-closed if the principal is unmapped), refuses a
--- malformed one outright.
-SELECT zebridge_install_write_guards('public.orders', 'updated_at', 'deleted_at', 'tenant_id');
-
--- ONE call, not three: moves the tenant column into the replica identity (so a DELETE can
--- be routed by tenant), ENABLEs ROW LEVEL SECURITY, and installs both the
--- zb_tenant_write and zb_reader_all policies.
-SELECT zebridge_scope_writes_by_tenant('public.orders', 'tenant_id');
+SELECT * FROM zebridge_enable(
+    'public.orders'::regclass,
+    tenant_col    => 'tenant_id',
+    writable      => true,
+    version_col   => 'updated_at',
+    tombstone_col => 'deleted_at',
+    dry_run       => false
+);
 ```
 
 Then, in the bridge's own environment — boot-read, needs a restart:
 
 ```
 TENANT_RULES=orders:tenant_id
+SYNC_RULES=orders:updated_at,deleted_at[,last_writer]
 ```
 
-⚠️ **Measured, not hypothetical.** A table on this project's own dev stack had
-`TENANT_RULES` set and CDC reads correctly tenant-routed for a full session before this was
-checked — and had **zero** triggers, RLS disabled, and no policies at all: writes from any
-principal could touch any tenant's rows, silently, because `zebridge_install_write_guards`
-and `zebridge_scope_writes_by_tenant` had simply never been called for it. Reads looking
-correct is not evidence writes are scoped; they are two different mechanisms, on two
-different sides of the bridge, and neither implies the other.
+`zebridge_audit_write_guards()` reports what triggers/policies/RLS state are actually
+attached to a table, to compare against what `TENANT_RULES`/`SYNC_RULES` claim. Reads
+routing correctly is not evidence writes are scoped — they are two different mechanisms,
+on two different sides of the bridge, and neither implies the other; check both.
+
+For a table that only needs read scoping (no `writable => true`), or to compose the pieces
+by hand for a case `zebridge_enable()` doesn't cover, the underlying functions are still
+callable directly: `zebridge_grant_edge_writes`, `zebridge_install_write_guards`,
+`zebridge_scope_writes_by_tenant`, `zebridge_scope_reads_by_tenant` — each documented at
+its own definition in `init.write.template.sql`/`init.core.template.sql`.
 
 ⚠️ `zebridge_scope_publication_to_one_tenant()` is a different shape entirely — it pins a
 publication (and therefore the bridge) to **one** tenant value, for one-bridge-per-tenant
@@ -201,6 +212,17 @@ with an error naming something else entirely.
    partitioning by tenant gives the same locality permanently.
 4. **Check preflight at the next boot.** It reports grants that the schema cannot honour,
    version columns that are naive, and tenant columns outside the replica identity.
+5. **Update the bridge's config, then restart it.** A public table goes in `topology.json`'s
+   `public_tables` array; a tenant-scoped one does not — `TENANT_RULES` alone is what marks
+   it. Add the table to `SYNC_RULES` (version column, tombstone column if it has one, tiebreak
+   column) in the bridge's env, and to `TENANT_RULES` if it's tenant-scoped. Both are read
+   once at boot — the bridge will not see either change until it restarts.
+6. **NATS: nothing for a tenant-scoped table, one subject edit for a public one.** A
+   tenant-scoped table is already covered by the tenant's existing `cdc.<tenant>.>` grant —
+   no NATS change needed. A public table gets its own named subject
+   (`cdc.<table>.>`), not a wildcard, so `CDC_PUBLIC`'s subject list needs that subject added
+   — `nats stream edit CDC_PUBLIC --subjects=...`. Its snapshot side needs nothing extra:
+   `INIT_PUBLIC`'s existing `init.snap.<open tenant>.>` already covers any public table.
 
 ### 1.5 PostgreSQL: maintenance — tombstone GC, and why
 
@@ -300,8 +322,10 @@ rows arrived under light load and stopped under heavy load — a bug whose trigg
 **only** `cdc.acme.>` receiving both the single and the batched event while never seeing
 `globex`. ⚠️ **No scenario file** — the reproduction needs a burst large enough to batch.
 
-Held today by `mutation.<principal>.…`, `mutation_ack.<principal>.…` and
-🚧 `cdc.<tenant>.…`. Not yet by the snapshot, request and KV subjects.
+Held by `mutation.<principal>.…`, `mutation_ack.<principal>.…`, `cdc.<tenant>.…`,
+`snapshot.request.<tenant>.<table>`, `init.snap.<tenant>.<table>.…`, and the tenant-scoped
+KV subjects (`$KV.snapshots.<tenant>.<table>`, `$KV.tenants.<principal>`) alike — one
+invariant, applied everywhere a subject carries an identity to grant against.
 
 ⚠️ **Values interpolated into subjects are validated** (`utils.isSubjectToken`). A tenant
 value is row data and can contain anything: a dot splits the token and the row vanishes
