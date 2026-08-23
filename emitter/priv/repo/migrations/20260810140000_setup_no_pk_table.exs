@@ -18,6 +18,16 @@ defmodule Emitter.PgProducer.Repo.SetupNoPkTable do
     # Set REPLICA IDENTITY DEFAULT and attach to Publication
     execute("ALTER TABLE public.#{@cdc_table} REPLICA IDENTITY DEFAULT;")
 
+    # The publication guard refuses an unscoped table (no RLS, no row filter) unless the
+    # decision to publish it wide-open is recorded — this table is the deliberate
+    # exception: a keyless fixture for preflight/no-PK testing, not a real business
+    # table, so there is no tenant to scope it by.
+    execute("""
+    INSERT INTO zebridge_public_tables (tbl, reason)
+    VALUES ('#{@cdc_table}', 'keyless preflight/no-PK test fixture, not real business data')
+    ON CONFLICT (tbl) DO NOTHING;
+    """)
+
     execute("""
     DO $$
     BEGIN

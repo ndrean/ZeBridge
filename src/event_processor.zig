@@ -13,6 +13,7 @@ const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
 const RefusedTables = @import("refused_tables.zig");
+const WritableTables = @import("writable_tables.zig");
 const TypeRegistry = @import("type_registry.zig");
 const Topology = @import("topology.zig");
 const Preflight = @import("preflight.zig");
@@ -131,6 +132,13 @@ pub const EventProcessor = struct {
     /// a protocol constant: a client that hardcoded it would be wrong the moment an
     /// operator raised it.
     event_buf_bytes: usize,
+    /// Per-table edge-writability (NOTES.md §1.11), computed by preflight at boot and
+    /// kept current here by `reportEdgeWritability` on a `CREATE TABLE` DDL event.
+    /// `appendWriteContract` publishes it; nothing else reads it.
+    writable: *WritableTables.Registry,
+    /// Same role `writable`'s verdicts were checked against, so a table appearing after
+    /// boot is graded by the same grant `preflight.run` used.
+    writer_role: ?[]const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -146,6 +154,8 @@ pub const EventProcessor = struct {
         tenant_rules: *const Config.EventClassification.TransitionRules,
         /// `2^BASE_BUF`. Published so a client can size a write before sending it.
         event_buf_bytes: usize,
+        writable: *WritableTables.Registry,
+        writer_role: ?[]const u8,
     ) EventProcessor {
         return .{
             .allocator = allocator,
@@ -160,6 +170,8 @@ pub const EventProcessor = struct {
             .default_version_column = default_version_column,
             .tenant_rules = tenant_rules,
             .event_buf_bytes = event_buf_bytes,
+            .writable = writable,
+            .writer_role = writer_role,
         };
     }
 
@@ -185,6 +197,8 @@ pub const EventProcessor = struct {
             table,
             self.sync_rules,
             self.default_version_column,
+            self.writer_role,
+            self.writable,
         ) catch |err| {
             log.debug("edge-writability report for '{s}' skipped: {}", .{ table, err });
         };
@@ -925,6 +939,22 @@ pub const EventProcessor = struct {
         } else {
             try json_str.appendSlice(arena, ",\"tenant_column\":null");
         }
+
+        // NOTES.md §1.11: whether this table accepts edge writes at all, from the same
+        // verdict preflight already computes (a usable version column, the writer's
+        // actual grant, and not a database-allocated key — `logVerdict`/`reportTable`).
+        // `null` means "not yet reported" (a table that raced this publish before its
+        // own DDL event landed), not "not writable" — a client should not treat the two
+        // the same, so the field is omitted rather than defaulted to `false`.
+        if (self.writable.get(table)) |w| {
+            try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                arena,
+                ",\"writable\":{s}",
+                .{if (w) "true" else "false"},
+            ));
+        } else {
+            try json_str.appendSlice(arena, ",\"writable\":null");
+        }
     }
 
     pub fn packDdlToSlot(
@@ -1143,6 +1173,43 @@ pub const EventProcessor = struct {
             );
         }
 
+        // Refuse a table whose CDC subject has nowhere to go — neither tenant-scoped
+        // nor in `topology.json`'s `public_tables`. Checked *before* attempting to
+        // publish anything for it: found live, a publish to an unrouted subject does
+        // not fail fast, it blocks for the full publish timeout, retries the identical
+        // dead end, and enough of that exhausts the bridge's retry budget and
+        // self-terminates. Refusing here turns a bridge-wide outage into a named,
+        // immediate, per-table refusal instead.
+        //
+        // ⚠️ `zebridge_user_tenants` is exempt, not `isInternalTable` (it still needs
+        // every other check — no-PK, version columns, writability). Its row changes
+        // never touch `cdc.<table>.<op>` at all: they are transformed into
+        // `$KV.tenants.<principal>` by a dedicated path elsewhere in this file, which
+        // has nothing to do with the CDC stream subject filter this check is about —
+        // deliberately, so the tenant roster is never broadcast (NOTES.md §…, the
+        // roster-disclosure leak `$KV.tenants` exists to avoid).
+        if (!std.mem.eql(u8, clean_table, "zebridge_user_tenants") and
+            !self.topology.isCdcRoutable(clean_table, self.tenant_rules.contains(clean_table)))
+        {
+            log.err(
+                "🔴 REFUSING '{s}': not tenant-scoped and not in topology.json's public_tables — its CDC subject matches no stream. Publishing would block on every write. Add it to public_tables and CDC_PUBLIC's subjects, or set TENANT_RULES for it.",
+                .{clean_table},
+            );
+            self.refused.refuse(clean_table, .no_cdc_subject) catch |err| {
+                log.err("🔴 Could not record refusal for '{s}': {}", .{ clean_table, err });
+            };
+
+            const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-{s}-{d}", .{ clean_table, wal_end });
+            return try self.publishSuspension(
+                arena,
+                clean_table,
+                RefusedTables.Reason.no_cdc_subject.wireName(),
+                msg_id,
+                rel.relation_id,
+                wal_end,
+            );
+        }
+
         // Reaching here means the table has a key. If it was refused before, this DDL
         // event is the migration that fixed it — resume without a restart.
         self.refused.clear(clean_table);
@@ -1240,9 +1307,16 @@ pub const EventProcessor = struct {
         relation_id: u32,
         lsn: u64,
     ) !u32 {
+        // ⚠️ `"writable":false`, always — not read from the registry. A suspended
+        // table can never be safely written to regardless of what preflight concluded
+        // about its grant: CDC drops every event for it at the source, so an optimistic
+        // write would never be confirmed or corrected (§1.6c/§1.6d). The client-side
+        // `suspended` gate already blocks this independently; this field exists so a
+        // client checking `writable` alone — without also checking `suspended` — does
+        // not read a merely-absent field as "unknown, might be writable".
         const payload = try std.fmt.allocPrint(
             arena,
-            "{{\"table\":\"{s}\",\"suspended\":true,\"reason\":\"{s}\",\"lsn\":{d}}}",
+            "{{\"table\":\"{s}\",\"suspended\":true,\"reason\":\"{s}\",\"lsn\":{d},\"writable\":false}}",
             .{ clean_table, reason, lsn },
         );
         const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);

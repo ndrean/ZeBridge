@@ -66,6 +66,12 @@ pub const Topology = struct {
     cdc_stream_prefix: []const u8,
     cdc_stream_public: []const u8,
 
+    /// Tables `CDC_PUBLIC`'s subject filter actually covers when they are *not*
+    /// tenant-scoped — `nats-init`/`up.sh` build the stream's subjects from exactly this
+    /// list. A table that is neither tenant-scoped (in `TENANT_RULES`) nor listed here
+    /// has no destination for `cdc.<table>.<op>` at all — see `isCdcRoutable`.
+    public_tables: []const []const u8,
+
     // ─── per-tenant INIT streams (same reasoning as CDC above) ────────────────────
     //
     // A JetStream consumer's `filter_subject` is reader-chosen and unchecked by any
@@ -137,6 +143,29 @@ pub const Topology = struct {
     /// `snapshot.request.>` — what the snapshot consumer filters on.
     request_subject_wildcard: []const u8,
 
+    /// Whether `cdc.<table>.<op>` (untenanted) or `cdc.<tenant>.<table>.<op>` (any
+    /// tenant) has *some* stream willing to accept it — not whether the table replicates
+    /// correctly in every other respect, just whether the publish has anywhere to go.
+    ///
+    /// Tenant-scoped tables are always covered: `CDC_<TENANT>` exists for every declared
+    /// tenant (preflight's own boot check enforces that), and `CDC_PUBLIC` additionally
+    /// covers the open-tenant case — so `TENANT_RULES` membership alone is sufficient,
+    /// with no need to special-case which tenant a row carries. `is_tenant_scoped` is the
+    /// caller's own `tenant_rules.contains(table)`, not re-derived here, because
+    /// `TransitionRules` lives in `config.zig`, which already imports this module —
+    /// importing it back would be circular.
+    ///
+    /// An untenanted table is covered only if it is in `public_tables`, exactly the list
+    /// `nats-init`/`up.sh` used to build `CDC_PUBLIC`'s subjects — anything else was
+    /// never added to any stream's subject filter, by construction, not by a bug.
+    pub fn isCdcRoutable(self: *const Topology, table: []const u8, is_tenant_scoped: bool) bool {
+        if (is_tenant_scoped) return true;
+        for (self.public_tables) |t| {
+            if (std.mem.eql(u8, t, table)) return true;
+        }
+        return false;
+    }
+
     /// A fixed set of names for tests, so a unit test never needs a file on disk.
     /// **Not a fallback**: nothing in the running bridge reads this, because a default
     /// that silently substitutes for a missing file is exactly the drift this module
@@ -147,6 +176,7 @@ pub const Topology = struct {
         .stream_mutations = "MUTATIONS",
         .stream_requests = "REQUESTS",
         .tenants = &.{},
+        .public_tables = &.{},
         .cdc_stream_prefix = "CDC_",
         .cdc_stream_public = "CDC_PUBLIC",
         .init_stream_prefix = "INIT_",
@@ -243,6 +273,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     // Optional: a deployment with no `tenants` is not tenant-routed, and that is a valid
     // shape (the single wide CDC stream). Absent means an empty list, never an error.
     t.tenants = try optStrArray(a, root, "tenants");
+    // Same optionality: absent means no untenanted table is CDC-routable, which is a
+    // real (if unusual) shape rather than a mistake to reject.
+    t.public_tables = try optStrArray(a, root, "public_tables");
     if (root.get("cdc_streams")) |cs| switch (cs) {
         .object => |o| {
             t.cdc_stream_prefix = if (o.get("tenant_prefix")) |v| (switch (v) {
@@ -619,6 +652,10 @@ test "the test fixture matches the repository's own topology.json" {
         // drift, and this test exists to catch drift in the *names*, not to assert the
         // fixture is a byte-for-byte copy of the file.
         if (comptime std.mem.eql(u8, f.name, "tenants")) continue;
+        // Same reasoning as `tenants` — a data field, not a name, and `for_tests`
+        // deliberately carries none so unit tests default to no untenanted table being
+        // CDC-routable via `public_tables` either.
+        if (comptime std.mem.eql(u8, f.name, "public_tables")) continue;
         try testing.expectEqualStrings(@field(fixture, f.name), @field(real, f.name));
     }
 }

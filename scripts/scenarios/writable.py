@@ -119,7 +119,48 @@ async def main():
         zb.bad(f"'{readonly}' was meant to be the outbound-only fixture but has INSERT")
         failed += 1
 
-    # ── 2. what a client actually observes on a refused table ────────────────────
+    # ── 2. does the published schema agree with the matrix? (NOTES.md §1.11) ─────
+    #
+    # The bridge now computes this same verdict independently, in Zig, at boot
+    # (`preflight.reportVersionColumns`) and on a `CREATE TABLE` DDL event
+    # (`preflight.reportTable`), and publishes it as `writable` in the schema payload
+    # (`$KV.schemas.<table>`). This checks the two never drift, the same way the matrix
+    # above checks grant vs. schema — same shape of test, one layer further out.
+    #
+    # ⚠️ `expected` here is the matrix's own simplification (a hardcoded `updated_at`
+    # presence-and-type check), not the bridge's full `classifyVersionColumn` — it
+    # cannot tell a genuinely unusable column (`.creation_column`, a nullable/naive
+    # timestamp) from an absent one. Fine for these fixtures, which don't exercise that
+    # distinction; a mismatch here on a table that does would need a closer look before
+    # trusting either side.
+    print()
+    for name, f in facts.items():
+        res = zb.nats_cli("kv", "get", "schemas", name, "--raw")
+        if res.returncode != 0 or not res.stdout.strip():
+            zb.bad(f"'{name}': could not read schema from KV")
+            failed += 1
+            continue
+        try:
+            published = json.loads(res.stdout).get("writable")
+        except json.JSONDecodeError:
+            zb.bad(f"'{name}': schema is not valid JSON")
+            failed += 1
+            continue
+
+        expected = f["granted"] and f["mintable"] and f["version"]
+        if published is None:
+            zb.bad(f"'{name}': schema publishes \"writable\": null — expected {expected}")
+            failed += 1
+        elif published != expected:
+            zb.bad(
+                f"'{name}': schema publishes \"writable\": {published}, but "
+                f"grant+schema say {expected}"
+            )
+            failed += 1
+        else:
+            zb.ok(f"'{name}': schema publishes \"writable\": {published}, agrees")
+
+    # ── 3. what a client actually observes on a refused table ────────────────────
     #
     # The decisive assertion, and the reason this is a scenario rather than a query:
     # the refusal is real (PostgreSQL says so) but *invisible on the wire*. Anything

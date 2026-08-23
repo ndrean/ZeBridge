@@ -64,6 +64,14 @@ pub const Reason = enum {
     /// deletes could not route at all: rows would stay in every replica that held them,
     /// with no later event able to remove them.
     tenant_not_in_replica_identity,
+    /// Neither tenant-scoped nor in `topology.json`'s `public_tables` — its CDC subject
+    /// matches no stream's filter at all. Found live: publishing to it doesn't fail
+    /// fast, it blocks for the full publish timeout (nothing ever acks a message no
+    /// stream accepted), then retries the identical dead end, and enough of that
+    /// exhausts the bridge's retry budget and self-terminates. Refusing at the source
+    /// — before the first publish is ever attempted — is what turns that into a named,
+    /// immediate refusal instead of a bridge-wide outage.
+    no_cdc_subject,
 
     /// The string clients receive in a suspension payload.
     pub fn wireName(self: Reason) []const u8 {
@@ -78,6 +86,7 @@ pub const Reason = enum {
             .row_too_large => "restart with a larger BASE_BUF, or move the oversized column out of the replicated table",
             .no_tenant_column => "add the column named in TENANT_RULES, or correct the rule",
             .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
+            .no_cdc_subject => "add this table to topology.json's public_tables and CDC_PUBLIC's subject filter (nats stream edit CDC_PUBLIC), or set TENANT_RULES for it",
         };
     }
 };

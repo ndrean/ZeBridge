@@ -24,6 +24,7 @@ const c = c_imports.c;
 const utils = @import("utils.zig");
 const preflight = @import("preflight.zig");
 const refused_tables = @import("refused_tables.zig");
+const writable_tables = @import("writable_tables.zig");
 const type_registry = @import("type_registry.zig");
 const topology_mod = @import("topology.zig");
 
@@ -468,11 +469,23 @@ pub fn main(init: std.process.Init) !void {
     var refused = refused_tables.Registry.init(allocator);
     defer refused.deinit();
 
+    // Shared the same way, for the opposite fact: whether a table accepts edge writes
+    // at all (NOTES.md §1.11). Preflight computes it; `EventProcessor.appendWriteContract`
+    // reads it back when building each table's schema payload.
+    var writable = writable_tables.Registry.init(allocator);
+    defer writable.deinit();
+
     // OID → typtype for types the CDC decoder's switch does not cover. Populated from
     // DDL events and from the boot schema pass, and never invalidated: an OID outlives
     // nothing, so a stale entry describes a type that can no longer reach the wire.
     var type_registry_inst = type_registry.Registry.init(allocator);
     defer type_registry_inst.deinit();
+
+    // The writer's grants are the authoritative statement of which tables are meant to
+    // accept edge writes. Null when ingress is unconfigured, which makes every grant
+    // check a correct false. Shared with `EventProcessor` below, so a table that
+    // appears after boot is checked against the same role preflight used.
+    const writer_role = if (runtime_config.pg_writer_url) |url| preflight.roleFromUrl(url) else null;
 
     // Validate the publication before any thread exists. Preflight only needs Postgres,
     // and under STRICT_TABLES it returns an error — bailing out after the worker threads
@@ -487,12 +500,11 @@ pub fn main(init: std.process.Init) !void {
         default_version_column,
         runtime_config.strict_tables,
         &refused,
-        // The writer's grants are the authoritative statement of which tables are meant
-        // to accept edge writes; preflight needs the role they were made to. Null when
-        // ingress is unconfigured, which makes every grant check a correct false.
-        if (runtime_config.pg_writer_url) |url| preflight.roleFromUrl(url) else null,
+        writer_role,
         &tenant_rules,
         @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
+        &writable,
+        &runtime_config.topology,
     ) catch |err| switch (err) {
         // STRICT_TABLES asked us to stop; that verdict must reach main, not be
         // swallowed as "the check could not run". Signal first: unwinding runs
@@ -820,6 +832,8 @@ pub fn main(init: std.process.Init) !void {
         default_version_column,
         &tenant_rules,
         @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
+        &writable,
+        writer_role,
     );
 
     // Publish boot schemas to NATS KV for all monitored tables

@@ -210,8 +210,8 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 ```
 
 Root keys are `table`, `pg`, `sqlite`, `lsn`, plus the **write contract**:
-`version_column`, `tombstone_column`, `tenant_column`, `mutation_timeout_ms` and
-`replica_identity`.
+`version_column`, `tombstone_column`, `tenant_column`, `writable`,
+`mutation_timeout_ms` and `replica_identity`.
 
 `version_column` is the column to send back as `version` (§7.3); `tombstone_column` is
 `null` when the table deletes physically rather than softly (§7.5). `tenant_column` is the
@@ -247,16 +247,31 @@ way to read the bridge's environment. Treat it as an upper bound to stay under, 
 budget to fill: the encoded CDC event carries every column plus its name, so it is always
 larger than the payload you send.
 
-⚠️ **The schema does not say whether a table accepts edge writes, and a non-null
-`version_column` does not mean it does.** Writability is a *grant*, granted separately with
-`zebridge_grant_edge_writes` (§7.4), and grants are not in this payload. Measured: `users`
-publishes `version_column: "updated_at"` and refuses every write with SQLSTATE `42501`,
-because the writer role has no `INSERT` on it — the column exists and would serve, but the
-privilege was never given.
+⚠️ **A non-null `version_column` does not mean a table accepts edge writes.**
+Writability is a *grant*, granted separately with `zebridge_grant_edge_writes` (§7.4) —
+`users` publishes `version_column: "updated_at"` yet refuses every write with SQLSTATE
+`42501`, because the writer role has no `INSERT` on it: the column exists and would
+serve, but the privilege was never given. Check `writable`, not `version_column`, before
+offering to edit a table.
 
-So a client that offers editing wherever `version_column` is non-null will offer it on
-tables that reject everything. Until a `writable` flag exists here, the only reliable
-signals are the operator telling you, or a `rejected` verdict carrying `42501` (§7.4b).
+`writable` is `true` when the table has a usable version column, the writer role holds
+`INSERT`, and its primary key is not database-allocated (a serial/identity key refuses
+edge writes outright, `DbAllocatedKey`, independent of the grant) — the same combined
+verdict preflight computes and logs at boot. `false` means at least one of those fails,
+permanently until the DBA changes it. `null` means "not yet checked" — a table that
+raced this publish before its own edge-writability report landed; treat it the same as
+`false` for now and expect a follow-up publish shortly after.
+
+This is a **whole-bridge** fact today, not a per-principal one: there is one
+`bridge_writer` role, so `writable` is the same answer for every client. If per-principal
+write grants exist in a future deployment, expect this field's *computation* to sharpen
+accordingly — its meaning ("can I write this table") does not change, so no client-side
+migration is implied by that evolution.
+
+A **suspended** table (§9, `"suspended": true`) always carries `"writable": false`,
+regardless of what preflight concluded about its grant — a suspended table has no CDC
+path, so an optimistic write could never be confirmed or corrected even if PostgreSQL
+would otherwise accept it. Check `suspended` before `writable`.
 
 * `table` duplicates the KV key. The **key remains authoritative** — if they ever
   disagree, trust the key. The field exists so the value is self-describing like every
@@ -1115,8 +1130,19 @@ Two things follow, and they are the whole reason this section is long:
    | --- | --- |
    | `accepted` | pop |
    | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC |
-   | `row_deleted` | pop, and surface it: the row was deleted elsewhere |
+   | `row_deleted` | pop, revert the local row to "deleted," and surface it to the user |
+   | `rejected` | pop, revert the local row to its pre-write state |
    | timeout / error | keep, retry (idempotent via `msg_id` for 2 minutes — §2) |
+
+   `row_deleted` and `rejected` are the two replies with no correcting CDC event behind
+   them — nothing changed server-side, so nothing will arrive to overwrite the optimistic
+   guess. A revert is therefore the client's own responsibility, to two different targets:
+   `row_deleted` reverts to "no row" (the row is confirmed gone; restoring old data would
+   resurrect it), `rejected` reverts to whatever the row held immediately before this
+   write (captured alongside the queue entry — see `_zebridge_outbox.before` below).
+   Revert only if the row still shows exactly what this write applied; if something else
+   — another client's CDC event, or a second write of your own — has touched it since,
+   leave it alone rather than clobbering something more correct.
 
 5. **Treat the reply as a verdict, not as data.** State always arrives through CDC.
    Keeping one path for state and another for verdicts is what stops a client having two
@@ -1133,6 +1159,45 @@ Two things follow, and they are the whole reason this section is long:
 2. Surface `row_deleted` to the user rather than silently discarding their edit — this
    is the one case where LWW cannot decide for them.
 3. Bound the outbox, and tell the user when it stops draining.
+
+#### Client bookkeeping tables
+
+Three tables, not one — a client has to track resume position (two axes: a global LSN
+and a per-stream sequence, §4) and its own unconfirmed writes, and none of that is
+something to invent per implementation. All three share the `_zebridge_` prefix so none
+can ever collide with a genuinely replicated table of the same name, and all three
+belong in one init path, run before the connection opens — a resume or a flush racing
+their own creation is a bug class with no reason to exist.
+
+```sql
+CREATE TABLE _zebridge_sync (
+  id               INTEGER PRIMARY KEY,   -- one row, id = 1
+  global_last_lsn  INTEGER,               -- highest LSN applied from any stream (§4)
+  global_last_seq  INTEGER                -- unused; kept so an older client's row still reads
+);
+
+CREATE TABLE _zebridge_stream_seq (
+  stream    TEXT PRIMARY KEY,             -- e.g. CDC_ACME, CDC_PUBLIC
+  last_seq  INTEGER NOT NULL              -- last JetStream sequence consumed on this stream
+);
+
+CREATE TABLE _zebridge_outbox (
+  msg_id     TEXT PRIMARY KEY,  -- the Nats-Msg-Id this mutation was sent with
+  subject    TEXT NOT NULL,     -- mutation.<principal>.<table>.<operation>
+  payload    TEXT NOT NULL,     -- the envelope (§7.2), JSON — replayed verbatim on reconnect
+  tbl        TEXT NOT NULL,
+  row_id     TEXT NOT NULL,
+  before     TEXT,              -- the row's full prior state, JSON; null if this write is an INSERT
+  created_at INTEGER NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0
+);
+```
+
+`global_last_lsn`/`last_seq` are what make a reconnect a resume rather than a reseed
+(§4's `deliver_policy: StartSequence`/`opt_start_seq`). `before` is what makes a
+`rejected`/`row_deleted` verdict revertible rather than merely loggable — captured in
+the *same* transaction as the optimistic apply (rule 1), so it reflects the row as it
+truly stood, not whatever the replica holds by the time the verdict arrives.
 
 ### 7.2 The mutation envelope
 
@@ -1896,15 +1961,16 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
 
 * `web-consumer/` — SolidJS + WASM SQLite (OPFS) over WebSocket with nkey auth.
   Implements §3, §4 and §5 in full, and §7.1's reply handling over the §7.4b channel: it
-  pops on `accepted` / `stale` / `row_deleted` / `rejected`, keeps on `failed`, and
-  surfaces `row_deleted` rather than discarding the edit. The browser is the *hardest*
-  target; iOS and Android both ship SQLite natively, so a mobile port is largely a
-  storage-adapter swap.
+  pops on `accepted` / `stale`, and on `row_deleted` / `rejected` it reverts the local row
+  (guarded — only if nothing else has touched it since) before popping, surfacing
+  `row_deleted` rather than discarding the edit. The browser is the *hardest* target; iOS
+  and Android both ship SQLite natively, so a mobile port is largely a storage-adapter
+  swap.
 
-  ⚠️ **Its outbox is in memory**, so it does not survive a reload — the replica is rebuilt
-  from snapshot + CDC on every load. A durable outbox, written in the same transaction as
-  the optimistic row, is what §7.1 actually asks for and is the piece a production client
-  must add.
+  The replica database name is timestamped by default — a fresh OPFS file every load, so
+  the dev loop always exercises schema, snapshot and CDC from empty. `VITE_DURABLE` opts
+  into a stable, per-principal name instead, which is what makes `_zebridge_outbox`
+  actually durable across reloads rather than rebuilt-away with everything else.
 * `web-consumer/zb-mutate.mjs` — the smallest end-to-end write: one envelope, and the
   verdict it produced. Useful as a first check that ingress is alive at all, since a
   verdict distinguishes "refused" from "never arrived", which silence does not.

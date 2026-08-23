@@ -220,9 +220,12 @@ fn publishSuspension(
     lsn: u64,
     should_stop: *std.atomic.Value(bool),
 ) !void {
+    // `"writable":false` always — see `event_processor.publishSuspension`'s comment.
+    // Must match that payload's spelling exactly, same reasoning as this function's own
+    // doc comment on why the shape is copied rather than shared.
     const payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"table\":\"{s}\",\"suspended\":true,\"reason\":\"{s}\",\"lsn\":{d}}}",
+        "{{\"table\":\"{s}\",\"suspended\":true,\"reason\":\"{s}\",\"lsn\":{d},\"writable\":false}}",
         .{ table_name, reason, lsn },
     );
     defer allocator.free(payload);

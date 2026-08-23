@@ -33,6 +33,14 @@ Usage:  python scripts/scenarios/invalidate.py
 
 Needs the bridge running, a live NATS, and admin psql. Restores every schema it changes,
 including on failure.
+
+⚠️ Act 3's `SCRATCH` fixture stays suspended after its no-PK refusal lifts — for a
+*different* reason (`no_cdc_subject`), not a bug. It was never declared in
+`topology.json`'s `public_tables`, so its CDC subject has no stream to reach it, and the
+bridge now refuses that at the source instead of hanging on the first publish attempt
+(`src/refused_tables.zig`, found live via this exact scenario). Making it fully resume
+would need `topology.json` changed and the bridge restarted, which defeats the "no
+restart needed" point this act is making about the no-PK refusal specifically.
 """
 
 import asyncio
@@ -160,6 +168,23 @@ async def main():
             elif c not in d:
                 d[c] = v
         return d
+
+    # `SCRATCH` is created dynamically here, not declared in `topology.json:public_tables`
+    # and not tenant-scoped — so `cdc.<SCRATCH>.*` matches no stream's subject filter, and
+    # never can without editing `topology.json` and restarting the bridge (its own config
+    # is read once at boot, never re-read live — editing `CDC_PUBLIC`'s live subjects
+    # alone does not make the bridge believe the table is routable, and rightly so: an
+    # operator manually widening a stream is not the same as *declaring* a table public).
+    #
+    # ⚠️ Found live: before the bridge refused this at the source, publishing to an
+    # unrouted subject did not fail fast — it blocked for the full publish timeout, then
+    # reconnected, and retried the identical dead end until the retry budget exhausted
+    # and the bridge self-terminated (`FATAL: stopping bridge to prevent WAL overflow`).
+    # That was the empirical version of the risk SECURITY.md §1.4's migration checklist
+    # warns about. The bridge now refuses such a table immediately
+    # (`no_cdc_subject`, `src/refused_tables.zig`) instead of ever attempting the
+    # publish — which is why act 3 below does not expect `SCRATCH` to resume CDC after
+    # gaining a primary key: it correctly stays suspended, for a different reason.
 
     try:
         # ══ 0. warm the write path's cache ══════════════════════════════════════
@@ -355,26 +380,33 @@ async def main():
             zb.ok("its events were dropped while refused")
 
         # The migration that fixes it. No restart, no signal: the DDL event is the signal.
+        #
+        # ⚠️ `SCRATCH` was never declared in `topology.json:public_tables` — deliberately,
+        # it is a throwaway fixture, not a real table anyone should add to the static
+        # config for. So gaining a primary key lifts the `no_primary_key` refusal, but the
+        # table correctly *stays* suspended, now for `no_cdc_subject` (its CDC subject
+        # still has no stream to reach — see the note above `try:`). Expecting it to fully
+        # resume here would mean expecting the bridge to trust a table it was never told
+        # about, which is the exact hole `no_cdc_subject` exists to close.
         zb.psql(f"ALTER TABLE public.{SCRATCH} ADD PRIMARY KEY (id)", quiet=True)
         await asyncio.sleep(SETTLE)
 
         doc = kv_get(SCRATCH)
-        if doc and not doc.get("suspended") and "pg" in doc:
-            zb.ok("the refusal lifted on the fixing migration — no restart needed")
+        if doc and doc.get("suspended") and doc.get("reason") == "no_cdc_subject":
+            zb.ok(
+                "the no_primary_key refusal lifted on the fixing migration — no restart "
+                "needed — and it now correctly stays suspended for a different reason: "
+                "never declared in topology.json's public_tables"
+            )
+        elif doc and doc.get("suspended") and doc.get("reason") == "no_primary_key":
+            zb.bad(f"'{SCRATCH}' is still suspended for no_primary_key after gaining one: the fix did not take")
+            failed += 1
         else:
             zb.bad(
-                f"'{SCRATCH}' is still suspended after gaining a primary key (KV said "
-                f"{str(doc)[:80]}): the only recovery is a restart"
+                f"'{SCRATCH}' is not suspended for no_cdc_subject as expected (KV said "
+                f"{str(doc)[:80]}) — an undeclared table's CDC subject still has nowhere "
+                "to reach, and should be refused for it"
             )
-            failed += 1
-
-        mark = len(cdc_seen)
-        zb.psql(f"INSERT INTO public.{SCRATCH} (id, name) VALUES (2, 'after the fix')", quiet=True)
-        await asyncio.sleep(SETTLE)
-        if any(SCRATCH in s for s in cdc_seen[mark:]):
-            zb.ok("and its events flow again")
-        else:
-            zb.bad(f"'{SCRATCH}' still produces no CDC after the refusal lifted")
             failed += 1
 
         # ══ 4. the table disappears ═════════════════════════════════════════════

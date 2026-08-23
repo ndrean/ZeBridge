@@ -17,22 +17,59 @@ checked against the server's `max_payload`, because exceeding it does not raise:
 server closes the connection, every retry re-sends the identical payload, and the
 snapshot is lost.
 
-Usage:  python scripts/scenarios/snapshot.py [table] [seed_rows]
+Usage:  python scripts/scenarios/snapshot.py [table] [seed_rows] [tenant]
 
-  snapshot.py test_types           # whatever is already there
-  snapshot.py test_types 25000     # seed 25k first — forces ~3 chunks
+  snapshot.py test_types                # whatever is already there, tenant auto-detected
+  snapshot.py test_types 25000          # seed 25k first — forces ~3 chunks
+  snapshot.py test_types 25000 globex   # same, for a specific tenant
+
+⚠️ Tenant-scoped since §1.12: `snapshot.request`/`init.snap`/`$KV.snapshots` are all
+keyed `<tenant>.<table>`, not a bare table name — a snapshot is per-tenant, since each
+tenant's rows are a different dump. `tenant` defaults to `OPEN_TENANT` (from
+`topology.json`) for a public table, or the first entry in `topology.json`'s `tenants[]`
+for a tenant-scoped one — read from the table's own published schema
+(`tenant_column` in `$KV.schemas.<table>`), the same source of truth `App.tsx` uses,
+never guessed from the table name.
 """
 
 import asyncio
+import json
 import sys
 
 import zb
 from nats.js.api import ConsumerConfig, DeliverPolicy
 
 
+def schema_tenant_column(table: str) -> str | None:
+    """`tenant_column` from the table's own published schema — `None` for a public
+    table. Read the way a client reads it (`invalidate.py`'s `kv_get` pattern), not
+    guessed from `topology.json:public_tables`, which is a different, narrower set
+    (NOTES.md §1.6/§1.12: `tenant_column` is authoritative; `public_tables` only lists
+    user-schema tables, missing the internal ones that are just as tenant-agnostic).
+    """
+    res = zb.nats_cli("kv", "get", "schemas", table, "--raw")
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    try:
+        doc = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        return None
+    return doc.get("tenant_column")
+
+
 async def main():
     table = sys.argv[1] if len(sys.argv) > 1 else "test_types"
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+
+    tenant_col = schema_tenant_column(table)
+    if len(sys.argv) > 3:
+        tenant = sys.argv[3]
+    elif tenant_col:
+        tenant = zb.TOPOLOGY["tenants"][0]
+        print(f"'{table}' is tenant-scoped and no tenant was given — defaulting to '{tenant}'")
+    else:
+        tenant = zb.TOPOLOGY["open_tenant"]
+    print(f"tenant: {tenant}")
 
     if seed:
         # Idempotent, so re-running the probe does not multiply the table. Column names
@@ -61,7 +98,13 @@ async def main():
                 f"WHERE table_name='{table}' AND column_name='{c}'"
             ).strip()
             cols.append(c)
-            if t == "uuid":
+            if tenant_col and c == tenant_col:
+                # Stamp the tenant under test, not a per-row placeholder — a garbage
+                # value here means every seeded row is filtered out by RLS from the
+                # very snapshot it exists to force multiple chunks for, and the test
+                # ends up asserting against 0 of the rows it just inserted.
+                vals.append(f"'{tenant}'")
+            elif t == "uuid":
                 # Deterministic from the series, so re-running tops up rather than duplicating.
                 vals.append("md5(i::text)::uuid")
             elif "timestamp" in t:
@@ -100,13 +143,14 @@ async def main():
     nc = await zb.connect()
     js = nc.jetstream()
     kv_snap = await js.key_value(zb.TOPOLOGY["kv"]["snapshots"])
+    snap_key = f"{tenant}.{table}"
 
     # Remember what is already there. The KV keeps the *previous* descriptor until the
     # new snapshot finishes, so "read the KV after publishing" races and will happily
     # replay a stale snapshot's chunks against the current table.
     async def descriptor():
         try:
-            return zb.decode((await kv_snap.get(table)).value)
+            return zb.decode((await kv_snap.get(snap_key)).value)
         except Exception:  # noqa: BLE001
             return None
 
@@ -114,7 +158,7 @@ async def main():
     stale_id = before["snapshot_id"] if before else None
     fell_back = False
 
-    req = zb.subject(zb.TOPOLOGY["subjects"]["snapshot_request"], table)
+    req = zb.subject(zb.TOPOLOGY["subjects"]["snapshot_request"], tenant, table)
     try:
         await js.publish(req, b"")
         print(f"requested {req}")
@@ -141,9 +185,20 @@ async def main():
     print(f"descriptor: snapshot_id={desc['snapshot_id']} lsn={desc['lsn']}")
 
     # Chunks are arrays of row-arrays, positional against the schema's column order.
-    filt = f"init.snap.{table}.{desc['snapshot_id']}.>"
+    #
+    # ⚠️ INIT is split per tenant (§1.12, same reasoning as CDC's split) — there is no
+    # stream literally named "INIT" to subscribe to; `topology.json:streams.init` is a
+    # generic label, not a real stream name. The real one is `INIT_PUBLIC` for the open
+    # tenant or `INIT_<TENANT_UPPER>` otherwise, matching what `scripts/native/up.sh` /
+    # `nats-init` actually create.
+    init_stream = (
+        zb.TOPOLOGY["init_streams"]["public"]
+        if tenant == zb.TOPOLOGY["open_tenant"]
+        else zb.TOPOLOGY["init_streams"]["tenant_prefix"] + tenant.upper()
+    )
+    filt = f"init.snap.{tenant}.{table}.{desc['snapshot_id']}.>"
     sub = await js.pull_subscribe(
-        filt, durable=None, stream=zb.TOPOLOGY["streams"]["init"],
+        filt, durable=None, stream=init_stream,
         config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL, filter_subject=filt),
     )
     columns = zb.psql(
@@ -170,11 +225,15 @@ async def main():
             await msg.ack()
     await nc.close()
 
+    # A tenant-scoped snapshot only ever contains that tenant's rows (RLS,
+    # `zebridge_scope_reads_by_tenant`) — the comparison has to match, or every
+    # tenant-scoped table fails here by construction, not because pagination is wrong.
+    tenant_where = f" WHERE {tenant_col} = '{tenant}'" if tenant_col else ""
     keys = [tuple(str(r[i]) for i in pk_idx) for r in rows]
     expected = [
         tuple(line.split("|"))
         for line in zb.psql(
-            f"SELECT {', '.join(pk)} FROM public.{table} ORDER BY {', '.join(pk)}"
+            f"SELECT {', '.join(pk)} FROM public.{table}{tenant_where} ORDER BY {', '.join(pk)}"
         ).splitlines()
         if line
     ]

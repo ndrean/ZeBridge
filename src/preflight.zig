@@ -31,6 +31,8 @@ const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
 const RefusedTables = @import("refused_tables.zig");
+const WritableTables = @import("writable_tables.zig");
+const Topology = @import("topology.zig");
 
 pub const log = std.log.scoped(.preflight);
 
@@ -287,6 +289,9 @@ pub fn reportVersionColumns(
     sync_rules: *const Config.EventClassification.TransitionRules,
     default_version_column: []const u8,
     writer_role: ?[]const u8,
+    /// Records the combined verdict (§1.11) so `appendWriteContract` can publish it
+    /// instead of a client discovering "outbound-only" only after a rejected write.
+    writable: *WritableTables.Registry,
 ) !void {
     // Every orderable column of every published table, in one round trip. Ordering by
     // table then attnum makes the grouping a single pass.
@@ -325,7 +330,7 @@ pub fn reportVersionColumns(
     }
 
     const rows: usize = @intCast(c.PQntuples(res));
-    var writable: usize = 0;
+    var writable_count: usize = 0;
     var outbound_only: usize = 0;
     var mismatched: usize = 0;
 
@@ -369,11 +374,21 @@ pub fn reportVersionColumns(
         }
         _ = table_start;
 
-        if (logVerdict(table, wanted, verdict, candidates.items, granted)) writable += 1 else outbound_only += 1;
+        const usable = logVerdict(table, wanted, verdict, candidates.items, granted);
+        if (usable) writable_count += 1 else outbound_only += 1;
         if (reportWriteIntent(table, verdict, granted, key_db_allocated, sync_rules.get(table) != null)) mismatched += 1;
+
+        // `logVerdict` alone would call a table with a database-allocated key
+        // "writable" — it has grant and version column, but `mutation_listener.zig`
+        // refuses every write to it anyway (`DbAllocatedKey`). The published fact has
+        // to be what a client can actually rely on, not just what the schema shape
+        // permits.
+        writable.set(table, usable and !key_db_allocated) catch |err| {
+            log.warn("⚠️  Could not record writability for '{s}': {}", .{ table, err });
+        };
     }
 
-    log.info("✅ Edge writes: {d} table(s) writable, {d} outbound-only", .{ writable, outbound_only });
+    log.info("✅ Edge writes: {d} table(s) writable, {d} outbound-only", .{ writable_count, outbound_only });
     if (mismatched > 0) {
         // ⚠️ Deliberately does NOT say "each one fails at runtime". That was true when the
         // only finding here was a missing version column, and it is false for a
@@ -524,13 +539,31 @@ pub fn reportTable(
     table: []const u8,
     sync_rules: *const Config.EventClassification.TransitionRules,
     default_version_column: []const u8,
+    /// Same role `run()` checks grants against. Null when ingress is unconfigured, in
+    /// which case the query's own `pg_roles` guard makes every grant check a correct
+    /// `false` — mirrors `reportVersionColumns`.
+    writer_role: ?[]const u8,
+    /// Records the combined verdict (§1.11) for `appendWriteContract` to publish.
+    writable: *WritableTables.Registry,
 ) !void {
     if (isInternalTable(table)) return;
 
-    // Parameterised: the name arrives from a DDL event, and interpolating it would put a
-    // value the bridge did not choose into SQL.
-    const query =
-        \\SELECT a.attname, t.typname, a.atttypmod, a.attnotnull
+    // The role name is trusted config, safe to interpolate (same as
+    // `reportVersionColumns`); the table name is not — it arrives from a DDL event, so
+    // it stays a bound `$1` rather than being interpolated into SQL.
+    const query = try utils.allocPrintZ(
+        allocator,
+        \\SELECT a.attname, t.typname, a.atttypmod, a.attnotnull,
+        \\       CASE WHEN '{s}' <> '' AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{s}')
+        \\            THEN has_table_privilege('{s}', cl.oid, 'INSERT') ELSE false END AS granted,
+        \\       coalesce((
+        \\         SELECT bool_or(pg_get_expr(ad.adbin, ad.adrelid) LIKE 'nextval%'
+        \\                        OR pk.attidentity <> '')
+        \\         FROM pg_index i
+        \\         JOIN pg_attribute pk ON pk.attrelid = i.indrelid AND pk.attnum = ANY(i.indkey)
+        \\         LEFT JOIN pg_attrdef ad ON ad.adrelid = pk.attrelid AND ad.adnum = pk.attnum
+        \\         WHERE i.indrelid = cl.oid AND i.indisprimary
+        \\       ), false) AS key_db_allocated
         \\FROM pg_class cl
         \\JOIN pg_namespace ns ON ns.oid = cl.relnamespace AND ns.nspname = 'public'
         \\JOIN pg_attribute a ON a.attrelid = cl.oid AND a.attnum > 0 AND NOT a.attisdropped
@@ -538,13 +571,16 @@ pub fn reportTable(
         \\WHERE cl.relname = $1
         \\  AND t.typname IN ('timestamp', 'timestamptz', 'int8', 'int4')
         \\ORDER BY a.attnum;
-    ;
+    ,
+        .{ writer_role orelse "", writer_role orelse "", writer_role orelse "" },
+    );
+    defer allocator.free(query);
 
     const table_z = try allocator.dupeZ(u8, table);
     defer allocator.free(table_z);
     const values = [_][*c]const u8{table_z.ptr};
 
-    const res = c.PQexecParams(conn, query, 1, null, &values, null, null, 0);
+    const res = c.PQexecParams(conn, query.ptr, 1, null, &values, null, null, 0);
     defer c.PQclear(res);
 
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
@@ -558,6 +594,8 @@ pub fn reportTable(
         default_version_column;
 
     var verdict: VersionVerdict = .absent;
+    var granted = false;
+    var key_db_allocated = false;
     var candidates: std.ArrayList([]const u8) = .empty;
     defer candidates.deinit(allocator);
 
@@ -567,6 +605,8 @@ pub fn reportTable(
         const typname = std.mem.span(c.PQgetvalue(res, @intCast(i), 1));
         const typmod = std.fmt.parseInt(i32, std.mem.span(c.PQgetvalue(res, @intCast(i), 2)), 10) catch -1;
         const notnull = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 3)), "t");
+        granted = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 4)), "t");
+        key_db_allocated = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 5)), "t");
 
         if (std.mem.eql(u8, col, wanted)) {
             verdict = classifyVersionColumn(col, typname, typmod, notnull);
@@ -575,10 +615,16 @@ pub fn reportTable(
         }
     }
 
-    // The post-boot path has no privilege lookup in hand, so it reports on capability
-    // only. Passing `true` keeps the wording it always had rather than inventing a
-    // grant claim it cannot check.
-    _ = logVerdict(table, wanted, verdict, candidates.items, true);
+    // ⚠️ A table with no orderable column at all never enters the loop above, so
+    // `granted`/`key_db_allocated` stay at their `false` default even if the grant
+    // exists — the same blind spot `reportVersionColumns` has (its per-row read of the
+    // same two flags never runs either, for the same reason). Harmless here: such a
+    // table is `.absent` regardless, and `logVerdict` already returns false for that
+    // case, so the registry ends up correctly `false` either way.
+    const usable = logVerdict(table, wanted, verdict, candidates.items, granted);
+    writable.set(table, usable and !key_db_allocated) catch |err| {
+        log.warn("⚠️  Could not record writability for '{s}': {}", .{ table, err });
+    };
 }
 
 /// Tables that are ours or the migration tool's — mirrors zebridge_is_internal_table()
@@ -775,6 +821,11 @@ pub fn run(
     /// The CDC per-event buffer, `2^BASE_BUF`. Compared against the widest row already
     /// stored — see `checkStoredRowsFit`.
     event_buf_bytes: usize,
+    /// Records the per-table edge-writability verdict (§1.11) for `appendWriteContract`
+    /// to publish.
+    writable: *WritableTables.Registry,
+    /// `public_tables` — what `isCdcRoutable` checks an untenanted table against.
+    topology: *const Topology.Topology,
 ) !Summary {
     var standard_config = pg_config.*;
     standard_config.replication = false;
@@ -871,6 +922,34 @@ pub fn run(
         }
     }
 
+    // A second pass, over every published table regardless of PK/identity findings —
+    // CDC-routability is orthogonal to those. Checked at boot so a table left out of
+    // `public_tables` (and not tenant-scoped) is refused before the first WAL byte
+    // arrives, the same reasoning `no_primary_key` above already uses: publishing to an
+    // unrouted subject blocks for the full publish timeout rather than failing fast,
+    // and enough of that exhausts the bridge's retry budget and self-terminates.
+    r = 0;
+    while (r < @as(c_int, @intCast(rows))) : (r += 1) {
+        const table = std.mem.span(c.PQgetvalue(res, r, 0));
+        if (isInternalTable(table)) continue;
+        // `zebridge_user_tenants` is exempt for the same reason `event_processor.zig`'s
+        // runtime check exempts it: its rows are transformed into
+        // `$KV.tenants.<principal>` by a dedicated path, never `cdc.<table>.<op>`.
+        if (std.mem.eql(u8, table, "zebridge_user_tenants")) continue;
+        if (topology.isCdcRoutable(table, tenant_rules.contains(table))) continue;
+
+        summary.with_findings += 1;
+        summary.refused += 1;
+        refused.refuse(table, .no_cdc_subject) catch |err| {
+            log.err("🔴 Could not record refusal for '{s}': {}", .{ table, err });
+            continue;
+        };
+        log.err(
+            "🔴 REFUSING '{s}': not tenant-scoped and not in topology.json's public_tables — its CDC subject matches no stream. Publishing would block on every write. Add it to public_tables and CDC_PUBLIC's subjects, or set TENANT_RULES for it.",
+            .{table},
+        );
+    }
+
     if (summary.with_findings == 0) {
         log.info("✅ Preflight: {d} table(s) checked, no issues", .{summary.checked});
     } else {
@@ -883,7 +962,7 @@ pub fn run(
 
     // Reported after the table shapes, because "can this table be edited from the edge"
     // only matters for tables that replicate at all.
-    reportVersionColumns(allocator, conn, publication_name, sync_rules, default_version_column, writer_role) catch |err| {
+    reportVersionColumns(allocator, conn, publication_name, sync_rules, default_version_column, writer_role, writable) catch |err| {
         log.warn("⚠️  Version-column report failed: {}", .{err});
     };
 

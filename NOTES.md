@@ -42,21 +42,51 @@ The migration is the right place to *make* these decisions (the Elixir emitter
 migration already sets `REPLICA IDENTITY` per table). Preflight is what makes a
 wrong decision visible rather than invisible.
 
-### 1.2 RENAME COLUMN forces a full client rebuild
+### 1.2 RENAME COLUMN silently nulls the renamed column, client-wide
 
 The sharpest remaining gap. `ALTER TABLE ... RENAME COLUMN` is metadata-only in
-Postgres — **measured at 10.2 ms**, no table rewrite. But the published schema goes
-from `[... email ...]` to `[... email_address ...]`, and a column-set diff reads that
-as one removed + one added, so the client rebuilds and **loses its entire local
-replica** for a change that touched no data.
+Postgres — **measured at 10.2 ms**, no table rewrite. The published schema goes
+from `[... email ...]` to `[... email_address ...]`, and a column-set diff reads
+that as one removed + one added — but checked against `applySchema` (`App.tsx`)
+directly, the damage is narrower than "loses its entire local replica":
 
-Cheapest possible server-side DDL, most expensive client response.
+- The common case is `ALTER TABLE ... DROP COLUMN "email"` followed by
+  `ALTER TABLE ... ADD COLUMN "email_address"` — both succeed (SQLite has
+  supported `DROP COLUMN` since 3.35), so **the table and every other column and
+  row survive**. What's actually lost is narrower: the renamed column's own
+  **values**, reset to NULL for every row that existed before the rename.
+- Only if the renamed column is part of a PK/unique index does SQLite refuse the
+  `DROP COLUMN`, falling back to `rebuildPreservingData` — which still copies
+  every column the two schemas share **by name**, so again only the renamed
+  column's data is lost, not the table.
 
-Postgres does distinguish it at the event-trigger level (the rename has its own
-command tag), so capturing a `renamed_from` hint in `schema_def` would let a client
-do a local `ALTER TABLE ... RENAME COLUMN` and keep its rows. Not built.
+Still real, silent data loss — a client offering to edit `email_address` sees
+nothing where a value used to be, for every row until some later CDC event
+happens to touch it — just not the scale the original wording claimed. Cheapest
+possible server-side DDL, a real but smaller client cost than described.
 
-### 1.3 RING_BUFFER_COUNT sizing
+⚠️ **Not a Postgres limitation, and not about sniffing the DDL command.** The DDL
+capture query (`init.core.template.sql`, the `columns` JSONB in the event
+trigger) joins `information_schema.columns` to `pg_attribute` **by name**
+(`a.attname = c.column_name`) and publishes `name`/`type`/`nullable`/
+`has_default`/`required`/`oid`/`typtype` — never `attnum`. But `attnum` is
+exactly what survives a rename: Postgres renames a column by updating
+`pg_attribute.attname` alone, never `attnum` — which is *why* the rename is
+metadata-only in the first place. Add `'attnum', a.attnum` to that same
+`jsonb_build_object`, and a rename becomes a plain diff — same `attnum`,
+different `name`, between this `zebridge_ddl_events` row and the table's
+previous one — with no need to inspect `ALTER TABLE`'s command tag at all (which
+doesn't cleanly itemize which sub-clause fired). That diff, published as a
+`renamed_from` hint in `schema_def`, is what would let a client do a local
+`ALTER TABLE ... RENAME COLUMN` and keep its rows. Not built.
+
+⚠️ **Not a storage-engine limitation on either client.** SQLite has supported
+`ALTER TABLE ... RENAME COLUMN` natively since 3.25 (2018) — the same primitive
+PGlite has, since it's real Postgres. The gap is entirely upstream, in capturing
+and forwarding the rename; nothing about the client's own storage blocks doing
+this properly once that exists.
+
+### 1.3 CLOSED — RING_BUFFER_COUNT settled at 65536
 
 The original rationale (in `config.zig`) was: 65536 slots ≈ 1092 ms at 60K events/s,
 which *covered* one NATS reconnect interval when that was 1000 ms. Reconciling the
@@ -64,42 +94,123 @@ hardcoded 2000 ms into config broke that invariant — the buffer now covers abo
 a reconnect.
 
 Safe, not broken: a full ring backpressures the WAL reader, so events are delayed,
-never dropped. Restoring the old property means `RING_BUFFER_COUNT=131072`
-(≈2184 ms, ~4 MB slab) — ⚠️ a memory-doubling decision left
+never dropped. Restoring the old property would mean `RING_BUFFER_COUNT=131072`
+(≈2184 ms), doubling memory.
 
-Metrics show PG reconnects dominate and NATS reconnects are rare.
-On a *Postgres* loss the producer stops, so the ring **drains** rather than fills —
-ring size does nothing for that failure mode. The slot and WAL retention cover it.
-So this sizing debate only ever mattered for the rarer failure.
+**Settled: leave it at 65536.** Metrics show PG reconnects dominate and NATS
+reconnects are rare — and on a *Postgres* loss the producer stops, so the ring
+**drains** rather than fills; ring size does nothing for that failure mode, the
+slot and WAL retention cover it. So the sizing only ever mattered for the rarer
+failure, and the cost of doubling is real: 65536 × 4096 B (`BASE_BUF=12`) ≈
+256 MiB already, before per-slot overhead (subject buffer, metadata) — around
+300 MB, not a small number to double for a failure mode that already has
+~2 seconds of headroom against a genuinely solid 30K evt/s.
 
-### 1.4 Unbounded `zebridge_ddl_events` — partially closed
+### 1.4 CLOSED — `zebridge_ddl_events` pruning is disk hygiene, not correctness
 
-Pruning is in (7-day window, run inside both triggers). Still open: whether 7 days is
-right, given the table is only a human audit trail. The bridge never reads it — it
-reads the WAL — so rows are disposable the moment they commit.
+Pruning is in (2-day window, run inline inside both DDL-trigger call sites —
+`zebridge_prune_ddl_events()`, not a separate scheduled process; `bridge_sweeper`
+never touches this table, it reaps tombstoned rows in `SYNC_RULES`-listed user
+tables, a different table set and a different problem).
 
-### 1.5 Snapshot / seed design
+**Why it needs pruning at all, confirmed by checking every call site:** nothing in
+the bridge ever `SELECT`s this table. The bridge only ever consumes it by decoding
+its INSERTs off the WAL in real time (`event_processor.zig`), and a reconnecting
+client gets the *current* schema from `$KV.schemas` (last-value KV) — neither path
+touches the table's own rows. Logical decoding replays from the WAL itself on a
+bridge restart too, not by re-reading the table, so a pruned row affects nothing
+functional either way. The table exists only so the DDL event trigger has
+somewhere to atomically write the schema JSONB inside the same transaction as the
+DDL (§2.2) — once that row has been WAL-decoded, it is pure disk cost with zero
+remaining purpose.
 
-Sketched, not built. Intent: at most one snapshot per table per `SNAP_RET` (~10 min),
-CDC retention longer (~15 min), client drives the sync dance.
+So the 2-day window is arbitrary, not a correctness parameter — it could be
+shorter or longer with no risk either way. Not worth further attention.
 
-Two concerns raised and unresolved:
+### 1.5 CLOSED — snapshot / seed design
 
-- **KV cannot hold snapshot data.** JetStream KV values are capped (1 MB default) and
-  are last-value-per-key. Chunks must stay in the INIT stream; KV should hold the
-  *descriptor* (`{snapshot_id, lsn, timestamp, chunk_count, format}`).
-- **The retention arithmetic fails silently.** Snapshot at LSN L with `SNAP_RET=10m`
-  and `CDC_RET=15m` gives a client 5 minutes to seed. Exceed it and the CDC stream has
-  pruned past L — the client diverges with no error. Needs an explicit invariant
-  (`CDC_RET > SNAP_RET + max client apply time`) *and* a way for the client to detect
-  the gap (compare seed LSN against the stream's oldest sequence) rather than
-  quietly missing rows.
+Was sketched, not built, with two concerns raised and unresolved. Both are now
+built, and match the sketch exactly:
 
-### 1.6 Web client uses core NATS, not JetStream consumers
+- **"KV cannot hold snapshot data."** Shipped design: `$KV.snapshots` holds the
+  descriptor (`{snapshot_id, lsn, chunk_count, ...}`), chunks stay in the INIT
+  stream (`init.snap.<tenant>.<table>.<snapshot_id>.<chunk>`) — the split this
+  concern asked for.
+- **"The retention arithmetic fails silently... needs a way for the client to
+  detect the gap."** Built as `descriptorStillFresh()` (§1.6a): before trusting a
+  cached descriptor, the client compares its LSN against the CDC stream's
+  oldest-available LSN and discards it if the gap is unrecoverable, rather than
+  seeding from a descriptor the stream can no longer back up. Found live and
+  fixed the same way §1.6a describes — including the case this section's own
+  arithmetic warns about (a cached descriptor outliving what the stream can still
+  cover).
 
-`nc.subscribe('cdc.>')` receives only messages published while connected — no replay.
-Fine for watching chaos live; it is the thing the seed design must solve, since a
-client connecting after the fact gets schemas (KV keeps last value) but no history.
+### 1.6 CLOSED — web client uses real JetStream consumers
+
+`subscribeStreams()` (`App.tsx`) opens a JetStream `consumer.consume()` per stream
+with `deliver_policy: last > 0 ? StartSequence : All, opt_start_seq: last > 0 ? last
++ 1 : undefined`. A client connecting after the fact replays from its own persisted
+`_zebridge_stream_seq`, not just live traffic. The same call runs again on
+reconnect (§1.6a below), so a dropped connection resumes rather than silently
+missing events.
+
+Stale-descriptor handling is covered separately (§1.12, "A cached descriptor has
+no expiry of its own"). One gap that check still cannot see: it catches the CDC
+stream aging out from under a descriptor, not a policy change (§2.18's RLS fix)
+that makes the *rows themselves* wrong without moving any LSN — those six
+descriptors had to be purged by hand.
+
+#### 1.6b Reconnect now re-syncs CDC, not just the outbox
+
+Reconnecting used to call `flushOutbox()` only; `subscribeStreams()` ran once, at
+mount. A client that reconnected after a real outage kept the outbox promise
+(pending writes got resent) but never resumed consuming — other clients' changes
+made during the outage stayed invisible until a manual page reload.
+
+Fixed: reconnect now re-runs `subscribeStreams()` as well, which reuses its own
+gap-check (persisted seq vs. stream retention) to resume correctly rather than
+resubscribing blind. Driven by two independent signals, since `nc.status()` alone
+did not reliably report every outage shape: its own `reconnect` event, and an
+active `nc.rtt()` poll every 10s (mirroring the existing `/bridge/health` poll).
+Both share one `resyncing` guard so they cannot double-fire. Verified live:
+freezing `nats-server` disconnects every client with no cherry-picking, and on
+resume all clients — not just the one that sent a write — catch up without a
+reload.
+
+#### 1.6c Table suspension now freezes client writes too, not just reads
+
+A suspended table (`src/refused_tables.zig` — no PK, an undecodable column type, a
+row too large for `BASE_BUF`, or `TENANT_RULES` naming a missing/misplaced
+column) already reached the client as a signal: `App.tsx`'s schema watch sets
+`suspended()` off the `{"suspended":true,"reason":…}` payload and shows a banner
+saying local rows are "frozen." The banner text was wrong — nothing gated
+`sendMutation`, so a click on a suspended table still queued the outbox entry and
+optimistically applied the write.
+
+That is the worst shape of the §1.9 gap (a permanently-rejected write with no
+echo to correct it): suspension drops every CDC event for the table at the
+source, so the optimistic guess would never be confirmed *or* corrected — not
+until an operator fixes the shape, which could be indefinite, and it would affect
+every write to that table, not one bad payload.
+
+Fixed: `sendMutation` checks `suspended()[table]` first and refuses client-side —
+no outbox entry, no optimistic apply, just a logged refusal. The banner text now
+says writes are refused, not just reads frozen.
+
+**Verified this is table quarantine's only trigger — a bad payload cannot cause
+it.** `refused_tables.refuse()` is called from exactly two places,
+`event_processor.zig` and `snapshot_listener.zig`, both reacting to a table's
+*shape* from the DDL/CDC/snapshot path. `mutation_listener.zig` — the per-write
+path — never calls it. A write PostgreSQL refuses (bad constraint, wrong type, a
+client bug that will fail identically every retry) ends at
+`publishVerdict(..., "rejected", …)` on `mutation_ack.<principal>.<msg_id>`,
+addressed to that one sender only; the table and every other client are
+untouched. The mutation listener's own oversized-payload guard (line ~1205,
+`error.RowTooLargeToReplicate`) is built on exactly this principle and says so in
+its own comment: *"a bad write should cost its sender a verdict, not cost every
+reader a table."* So a client with a deterministic bug in its write path
+penalizes only itself — other, correct clients keep writing to the same table
+without disruption.
 
 ### 1.7 Deliberately not fixed
 
@@ -358,27 +469,54 @@ transaction shape and row count, so the next regression has something to contrad
 
 ---
 
-### 1.11 The schema payload cannot express "writable"
+### 1.11 CLOSED — the schema payload now publishes "writable"
 
 `CLIENT_WRITES.md` designed the schema's write contract as
-`"sync": { "version": …, "tombstone": …, "writable": true }`, and the `writable` half was
-never built. What ships is flat — `version_column`, `tombstone_column`,
-`mutation_timeout_ms`, `replica_identity` — with **no writability signal at all**.
+`"sync": { "version": …, "tombstone": …, "writable": true }`. The `writable` half went
+unbuilt for a while — what shipped was flat (`version_column`, `tombstone_column`,
+`mutation_timeout_ms`, `replica_identity`) with no writability signal — even though
+`users` measurably publishes `version_column: "updated_at"` and refuses every mutation
+with SQLSTATE `42501`, because writability is a **grant**
+(`zebridge_grant_edge_writes`), and grants weren't in the payload.
 
-⚠️ **A non-null `version_column` does not mean the table accepts writes.** Measured:
-`users` publishes `version_column: "updated_at"` and refuses every mutation with SQLSTATE
-`42501`, because writability is a **grant** (`zebridge_grant_edge_writes`) and grants are
-not in the payload. A client that offers editing wherever a version column exists will
-offer it on tables that reject everything, and only find out per-write.
+Not a withheld decision, once checked: `SYNC_RULES`, `TENANT_RULES`, and preflight's
+grant check (`logVerdict`/`reportVersionColumns`) already concluded the right answer
+per table at boot and logged it — `'users': outbound-only — the writer has no INSERT
+privilege`. The verdict was just print-only: two local counters for one summary line,
+nothing retained for `appendWriteContract` to read back.
 
-The bridge already knows: preflight computes exactly this and logs
-`'users': outbound-only — the writer has no INSERT privilege`. It simply is not published.
+Built as `src/writable_tables.zig` — a table→bool registry, same append-only/atomic
+shape as `refused_tables.zig` (no `std.Io.Mutex`, so entries are appended and never
+removed, readers hold name slices safely). Two writers populate it:
 
-Not done yet because it needs a decision rather than code: the grant is per **role**, and
-the schema is published once for all clients — so `writable` would mean "writable by the
-bridge's writer role", which is true for every client or none. That is the right answer
-for the current single-writer-role model, and would have to change if per-principal write
-grants ever arrive (§7.1). Worth doing with that in mind rather than before it.
+- **Boot**: `reportVersionColumns` records `usable and not key_db_allocated` per
+  table — the database-allocated-key case matters here specifically because
+  `logVerdict` alone would call such a table "writable" (it has grant and version
+  column), while `mutation_listener.zig` refuses every write to it anyway
+  (`DbAllocatedKey`). The published fact has to be what a client can actually rely
+  on, not just what the schema shape permits.
+- **Runtime**: `reportTable`, called from `event_processor.reportEdgeWritability` on a
+  `CREATE TABLE` DDL event, now runs the *same* grant + key-allocation query the boot
+  path does — it used to hardcode `granted: true` ("no privilege lookup in hand"),
+  which would have reported a table as writable that the writer has no grant on. Fixed
+  by threading `writer_role` through instead of assuming.
+
+`appendWriteContract` (`event_processor.zig`) reads the registry and publishes
+`writable: true|false`, or `null` for a table that raced the publish before its own
+report landed — never guessed either way. `PROTOCOL.md` §3 now documents the field.
+
+⚠️ **Found live, extending `writable.py` into a drift check against this field**: a
+*suspended* table's payload never went through `appendWriteContract` at all —
+`publishSuspension` (both copies, `event_processor.zig` and `snapshot_listener.zig`)
+builds a smaller, separate payload (`{table, suspended, reason, lsn}`) on a different
+code path, so `writable` was silently absent rather than `false`, even though preflight
+had already concluded `false` for it. Not wrong exactly — the client's `suspended` gate
+(§1.6c) already blocks writes to it independent of `writable` — but a client checking
+`writable` alone, without also checking `suspended`, would have read the missing field
+as "unknown, might be writable." Fixed: both `publishSuspension` copies now hardcode
+`"writable":false` (never read from the registry — a suspended table is *always*
+unwritable, regardless of grant, since no CDC event will ever confirm or correct an
+optimistic write to it).
 
 ### 1.10 `ColumnView` could store lengths only — 12 B → 8 B
 
@@ -416,55 +554,109 @@ metadata from 1614 MB to 462 MB on a 262,144-slot ring; this would take it to 33
 order of magnitude less win, for a refactor of the decode path. Worth doing only if the
 bridge is being pushed into a genuinely memory-tight deployment.
 
-### 1.9 A durable client outbox — deferred to the final pass
+### 1.9 CLOSED — a durable client outbox, and how optimistic apply reconciles with CDC
 
-The bridge now holds up its end of §7.1: every write gets a definitive reply on
-`mutation_ack.<principal>.<msg_id>` (§7.4b), and `web-consumer` pops, keeps or surfaces on
-each status. What the reference client still lacks is the *durable* half — §7.1's actual
-requirement, which is that the optimistic row and the intent-to-send commit **together**:
+The bridge holds up its end of §7.1: every write gets a definitive reply on
+`mutation_ack.<principal>.<msg_id>` (§7.4b). The client now holds up the other
+half — the optimistic row and the intent-to-send commit land **together**:
 
 ```sql
 BEGIN;
-  UPDATE users SET name = ? WHERE id = ?;      -- what the user sees
-  INSERT INTO _zebridge_outbox (…) VALUES (…); -- the intent to send
+  UPDATE users SET name = ? WHERE id = ?;  -- what the user sees, right away
+  INSERT INTO outbox (…) VALUES (…);       -- the intent to send
 COMMIT;
 ```
 
-⚠️ **`localStorage` cannot be either statement, and speed is not the reason.** SQLocal runs
-SQLite in a Worker (`sqlocal/dist/client.js`), and `localStorage` is defined on `Window` —
-workers get IndexedDB and Cache, never Web Storage. So the outbox write would happen on the
-main thread while the row write happens in the worker: two stores, no shared commit, and
-the gap between them is exactly the window that loses writes. A non-atomic outbox is a
-queue that can disagree with its own data, which is the failure the pattern exists to
-prevent. (It is also synchronous and main-thread-blocking, which is a second reason and a
-smaller one.)
+Built via SQLocal's `transaction()` API — `outboxPut(row, tx.sql)` and
+`applyEvent(table, {..., lsn: Number.MAX_SAFE_INTEGER, optimistic: true}, tx.sql)`
+inside one `transaction()` call in `sendMutation`. The table is `_zebridge_outbox`
+— renamed from an earlier `outbox`, since a bare name could collide with a
+genuinely replicated table of that name, and PROTOCOL.md §7.1 now specifies the
+name and schema for all three of the client's bookkeeping tables (it is not
+something a client author should have to invent). It lives in the same SQLite
+file as the replica, not a second database (an earlier, separate two-database
+WIP attempt was scrapped and rebuilt this way).
 
-The outbox therefore belongs in the same SQLite file, which is what §7.1 shows and what
-SQLocal's `transaction` API already supports.
+All three bookkeeping tables — `_zebridge_sync`, `_zebridge_stream_seq`,
+`_zebridge_outbox` — are now created together in `initSyncState()`, the first
+thing `initNats()` awaits, rather than each owning its own init path. The outbox
+table used to create itself in a standalone module-level promise that happened
+to resolve before `initSyncState()` ran in practice; nothing enforced the
+ordering, it just worked out that way. `initSyncState()` now creates all three
+directly and resolves a deferred `outboxInit` promise when done, so the outbox
+helpers (which run later, only after a connection exists) still `await
+outboxInit` without needing their own creation path.
 
-⚠️ **The prerequisite is a stable `DB_NAME`, and today's per-load name is deliberate.**
-`web-consumer/src/App.tsx` opens `zebridge_${Date.now()}.sqlite3`, a new OPFS file per page
-load, and the client is run **exclusively in incognito** precisely so every session
-rebuilds from scratch and exercises the whole chain — schema, snapshot, CDC — against a
-fresh database, with no cache or leftover state to explain a result away. That is a good
-dev loop and should not be traded for durability.
+`DB_NAME` stays timestamped by default (`zebridge_${Date.now()}.sqlite3`) — the
+incognito, rebuild-from-scratch dev loop is unchanged. A stable name
+(`zebridge_<principal>.sqlite3`, durable across reloads) is opt-in via
+`VITE_DURABLE`, exactly as planned: a durable outbox is pointless in a file wiped
+every reload, and forcing it on by default would have traded the dev loop's main
+value — no cache or leftover state to explain a result away — for nothing.
 
-So this is two modes, not a bug to fix: the throwaway replica stays the way the reference
-client is *tested*, and durability is what a production client adds. Whoever picks this up
-should make the stable name opt-in rather than replacing the current behaviour.
+#### How the optimistic write and the CDC echo reconcile
 
-Sequence, when this is picked up:
+There is no version check at the SQLite layer — the optimistic apply and every
+CDC/snapshot apply run the identical `INSERT … ON CONFLICT DO UPDATE SET col =
+excluded.col`, an unconditional overwrite. Ordering is what makes this correct:
 
-1. stable `DB_NAME`;
-2. `_zebridge_outbox` table in the replica;
-3. optimistic apply wrapped in `sql.transaction` with the outbox insert;
-4. pop on the verdicts, which already arrive.
+- The optimistic write's sentinel LSN (`Number.MAX_SAFE_INTEGER`) always clears
+  the per-table LSN gate, so it applies immediately, and — deliberately — never
+  advances `state.lsn` or `globalSyncState.lsn` (`App.tsx` around `applyEvent`'s
+  resume-bookkeeping block). If it did, every later real CDC event for that table
+  would compare `< MAX_SAFE_INTEGER` and never apply again.
+- When the real CDC event for that write arrives, its real `lsn` is still `>
+  state.lsn` (untouched by the optimistic write), so it passes the gate normally
+  and runs the same upsert — overwriting the optimistic guess with whatever
+  Postgres actually holds. Accepted-unchanged: a no-op. LWW picked a different
+  winner: the guess is silently replaced.
+- The echo is also what clears `pendingWrites` and pops the outbox row (matched
+  on primary key, not on `msg_id` — so *someone else's* echo of the same row
+  correctly clears our entry too, since the row reached an observable state and
+  LWW already decided whose write that was).
 
-⚠️ Step 1 has a consequence worth planning for rather than discovering: a durable replica
-can boot **stale**, so the client must decide whether queued writes are older than the GC
-watermark (§7.1 MUST-6) — the tombstone that would have overruled them may already be
-reaped. Today the replica is rebuilt from snapshot + CDC on every load, which makes that
-question impossible to ask and therefore invisible.
+#### 1.6d CLOSED — a rejected or row_deleted write now reverts, not just logs
+
+`stale` self-corrects — the winner arrives over CDC and overwrites the guess.
+`rejected` and `row_deleted` don't: Postgres never applied the mutation, so no
+CDC event for it exists, and the row sat wrong in the local replica indefinitely
+until some unrelated write happened to touch it.
+
+Fixed with `revertOptimisticWrite(msgId, mode)`. `outboxPut` now captures a
+`before` snapshot — the row exactly as it stood, read inside the same
+transaction as the optimistic apply, so it reflects what was really there rather
+than whatever the replica holds by the time a verdict shows up. `before` is
+`null` when the write was an INSERT (there was no prior row).
+
+The two verdicts revert to different truths, not the same one:
+
+- **`rejected`** — the write never applied, so the correct state is whatever was
+  there **before** it. Restore `before` (or delete the row, if `before` is
+  null — the write was an INSERT that never happened).
+- **`row_deleted`** — the row is *confirmed gone* server-side. Restoring
+  `before` would resurrect data that no longer exists anywhere; the only correct
+  local state is "no row", regardless of what `before` says.
+
+⚠️ **Guarded, not unconditional.** Something can touch the row between the
+optimistic apply and the verdict arriving — a real CDC event from another
+client, or a second optimistic write from this same client (a double-click).
+Reverting blind would clobber state that is *more* correct than what's about to
+be written. So the revert only fires if the row still shows exactly what this
+write's own optimistic apply produced (compared against the outbox's stored
+`payload`, not re-derived); otherwise it just drops the outbox entry and leaves
+the row alone — the same behaviour as before this existed, and correct, because
+something else has since explained what's there.
+
+Reads the outbox row itself, not in-memory `pendingWrites` — a write replayed by
+`flushOutbox` after a reload has no in-memory entry, but the durable row (with
+its `before`) is exactly what a revert needs, so this works identically whether
+the write was sent this session or resent on reconnect.
+
+⚠️ **A durable replica can boot stale**, which the timestamped default never had
+to face: a queued outbox write can be older than the GC watermark (§7.1 MUST-6) —
+the tombstone that should have overruled it may already be reaped, and replay has
+no way to tell "stale" from "safe to resend" once that evidence is gone. Not yet
+addressed; only surfaces with `VITE_DURABLE` after a long outage.
 
 ### 1.8 Read authorization — what the publication can and cannot filter
 
@@ -1112,6 +1304,100 @@ worth the added complexity. Judge any resulting change the same way every other 
 in this file is judged — against the README burst benchmark, by iters delta, not by
 intuition about which side "must" be slow.
 
+### 1.14 `web-consumer`'s schema watch leaks a JetStream consumer roughly every 30s — client-side, in `@nats-io/kv`/`@nats-io/jetstream`, not the bridge
+
+Found live, watching the Docker `nats-server` container's own log while testing:
+repeated `Publish Violation` lines for `$JS.API.CONSUMER.DELETE.KV_schemas.oc_...`,
+one per connected principal, roughly every 30 seconds. `nats consumer report
+KV_schemas` confirmed it directly — 31 consumers and climbing, none ever
+disappearing, one new one per watcher every ~30s.
+
+The denial itself is correct, working-as-designed server config (both
+`nats-server.conf.template` and `scripts/native/nats-server.conf`, identical,
+carry the same deliberate comment: `$JS.API.CONSUMER.DELETE.*` is withheld
+because a static config has no per-client name templating, so granting it on a
+shared subject would let alice delete bob's in-flight consumer). The bug is
+that the *premise* behind leaving it withheld — "the client never deletes a
+consumer, its ephemerals expire on their own inactivity threshold" — does not
+hold for `web-consumer`'s `watchSchemas()` (`App.tsx`, `kv.watch()`): its
+consumers are not expiring, they are accumulating, unbounded, for the life of
+the connection.
+
+**Traced to a specific, checkable claim, not just reproduced.** `@nats-io/kv`'s
+`watch()` (`kv.js:707-726`) explicitly names its consumer `KV_WATCHER_<nuid>` —
+a *stable* name, reused across resets. But the consumers actually piling up are
+named `oc_<id>_2`, `_3`, `_4`... — the OrderedConsumer naming pattern
+(`consumer.js:86`: `` ocs.namePrefix = iopts.name_prefix ?? `oc_${nuid.next()}` ``),
+which only fires when `this.consumer.ordered === true` (`consumer.js:74`).
+So the consumer `getPushConsumer` returns for a KV watch is being treated as
+*ordered* internally, despite being given an explicit stable name — ordered
+consumers self-heal by minting a brand-new uniquely-named replacement whenever
+they can't reuse the old one, which is exactly what a denied DELETE guarantees
+every single time.
+
+⚠️ **The natural first fix doesn't work.** `KvWatchOptions` (the public type
+`kv.watch()` accepts) only forwards `headers_only`/`include`/`ignoreDeletes`/
+`resumeFromRevision` into the consumer config — `idle_heartbeat` is not
+exposed at all; it is hardcoded inside `kv.js`'s private `_buildCC` (5s,
+independent of `@nats-io/jetstream`'s own unrelated 30s default in
+`pushconsumer.js:131`). There is no way to influence this through `kv.watch()`'s
+public API — a real fix means bypassing it and building the consumer manually
+via lower-level `@nats-io/jetstream` calls, replicating what `kv.js` does
+internally with the ordered/heartbeat behavior actually under our control.
+
+Not yet root-caused *why* the returned consumer ends up `ordered` at all, nor
+why resets happen roughly every 30s on an otherwise idle bucket. Next session:
+start from `consumer.js:74` and `getPushConsumer`'s implementation in
+`@nats-io/jetstream` to find what sets `.ordered`, and instrument
+`start()`/`_reset()` (`consumer.js`) to see what triggers the reset cadence
+before deciding on a workaround (self-hosting the KV watch instead of using
+`kv.watch()`, an explicit low-level consumer with a controlled
+`idle_heartbeat`, or a periodic client-side purge job using a scoped grant —
+each has different tradeoffs not yet weighed).
+
+### 1.16 `decode_integrity.py` has the same stale-`INIT`-stream bug `snapshot.py` had
+
+`zb.TOPOLOGY["streams"]["init"]` is `"INIT"` — a generic label in `topology.json`, not
+a real stream name; only `INIT_ACME`/`INIT_GLOBEX`/`INIT_PUBLIC` exist since §1.12's
+tenant split. `decode_integrity.py:265` still passes it directly to
+`js.pull_subscribe(..., stream=...)`, same shape of bug already found and fixed in
+`snapshot.py` this session (§1.6/earlier work). Confirmed live: NATS server log shows
+`Publish Violation - Subject "$JS.API.CONSUMER.CREATE.INIT...."` for a real client
+connected as alice — the request never reaches a real stream. Fix is the same pattern
+already applied to `snapshot.py`: resolve the correct `INIT_<TENANT>`/`INIT_PUBLIC`
+stream name from `topology.json`, and add the tenant token to the chunk-filter subject
+(`init.snap.<tenant>.<table>.<snapshot_id>.>`, not `init.snap.<table>.<snapshot_id>.>`).
+Not yet applied — found right before a deliberate infra teardown, no time to verify a
+fix in the same session.
+
+### 1.15 A `DbAllocatedKey` write refusal may leak into the shared `refused_tables` registry — unconfirmed, highest priority open item
+
+`keys.py` (`scripts/scenarios/keys.py`) ran for real against a fresh Docker IaC stack
+for the first time this session — it had been silently broken all session by `users`
+losing its sequence-backed PK to an unrelated demo migration (now fixed, see the
+`emitter/priv/repo/migrations/2026081015/60000_users_*` pair, redirected onto a new
+`demo_key_migration` table so `users` keeps its documented bigserial-PK role). Once it
+could actually run, it found three failures in one pass, not test staleness:
+
+1. **No verdict published** for the refused mutation — the write correctly does not
+   land, but no `mutation_ack.<principal>.<msg_id>` arrives within 4s. A client cannot
+   tell a refused write from a lost one.
+2. **A completely unrelated, well-formed mutation to `test_types`, sent immediately
+   after, never landed.**
+3. **`bridge_refused_tables` read 3, not the environment's confirmed baseline of 2**
+   (`users_no_pk`, `exotic_types`) — suggesting the write-path refusal added `users` to
+   the same registry `no_primary_key`/`no_cdc_subject`/etc. use, which drives *CDC
+   dropping for every reader*, not per-write rejection.
+
+`mutation_listener.zig`'s own design intent — quoted in `keys.py`'s own comment —
+is that "the mutation listener holds no reference to [refused_tables]." That
+invariant needs re-checking against the current code; either it no longer holds, or
+something else explains the registry moving in lockstep with this one mutation. Not
+yet root-caused. Reproduce with `python scripts/scenarios/keys.py` against a bridge
+with `LOG_LEVEL=info` and read its own log around the refusal — start by checking
+whether `mutation_listener.zig` calls `refused.refuse(...)` or anything that does
+(as of this session, only `event_processor.zig` and `snapshot_listener.zig` do).
+
 ### 2.13 A wildcard inbox made every pull request spawn another
 
 `jetstream.zig` `fetch` mints a unique reply subject per request but reads from a
@@ -1259,6 +1545,86 @@ live: `SET LOCAL ROLE bridge_reader; SELECT set_config('zb.tenant','acme',true);
 a cached descriptor's own staleness check (§1.12) only catches a CDC-coverage gap, not "the
 RLS policy that generated this content has since changed," so a policy fix like this one
 needs its own manual purge, not just a restart.
+
+### 2.19 A table with no CDC route didn't fail fast — it blocked, retried the identical dead end, and could take the whole bridge down
+
+Every published table's `cdc.<table>.<op>` needs a stream willing to accept it:
+tenant-scoped tables are covered by `CDC_<TENANT>` (one exists for every declared
+tenant), untenanted ones only if `topology.json`'s `public_tables` lists them —
+exactly the list `nats-init`/`scripts/native/up.sh` use to build `CDC_PUBLIC`'s
+subject filter. Nothing enforced that a table actually satisfies one of those two
+conditions before the bridge tried to publish for it.
+
+⚠️ **The failure this produces is not "CDC silently doesn't arrive."** `Publisher.publish`
+(`src/nats_publisher.zig`) is synchronous and ack-waiting — it sends the JetStream
+publish and blocks for the reply. When no stream's subject filter matches, nothing
+ever generates that reply, so the call doesn't fail fast, it blocks for the full
+client-side publish timeout (~5s), then fails with `NoStreamResponse`/`Timeout`,
+reconnects, and retries — the **identical** unrouted publish, which fails the
+identical way. Enough of that exhausts `batch_publisher`'s 6-attempt outer retry
+budget and hits `FATAL: stopping bridge to prevent WAL overflow` — the bridge's own
+deliberate safety shutdown, correctly triggered, for a cause that had nothing to do
+with what it guards against.
+
+Found live via `invalidate.py`'s `SCRATCH` fixture (a dynamically-created test
+table, never declared in `topology.json`): its act 3 "after the fix" `INSERT`
+reliably reproduced the full sequence — 5s stall, reconnect storm, and (once,
+while chasing it) an actual bridge shutdown. Confirmed empirically with debug
+timestamps around every publish call: `js.publish(cdc.zb_invalidate.insert)`
+entered at one timestamp and didn't fail until **5 seconds later** — not a race,
+a genuine wait for a reply that would never come — and `nats stream subjects
+CDC_PUBLIC`/`CDC_GLOBEX` confirmed no stream's filter matched that subject at all.
+
+This is the empirical version of the risk SECURITY.md §1.4's migration checklist
+already named ("a new public table needs one `nats stream edit CDC_PUBLIC` subject
+addition") — what was missing was *what happens if that step is skipped*, and the
+answer turned out to be far worse than "no CDC for that table."
+
+**Fixed at the source, not by making publishing more resilient.** A new
+`Topology.isCdcRoutable(table, is_tenant_scoped)` (`src/topology.zig`) answers
+the question locally, from the bridge's own boot-time config — no NATS round trip,
+no dependency on live stream state (an operator manually widening a stream's live
+subjects without also updating `topology.json` and restarting does **not** make
+the bridge trust it, deliberately: the bridge's belief about what's routable comes
+from its own declared config, the same way `SYNC_RULES`/`TENANT_RULES` already
+work, not from probing NATS at runtime). A table that fails it is refused with a
+new reason, `no_cdc_subject` (`src/refused_tables.zig`) — checked in two places,
+mirroring `no_primary_key` exactly: `preflight.run`'s boot pass (a second pass
+over every published table, independent of the PK/identity findings loop) and
+`event_processor.zig`'s DDL-driven runtime path (`packDdlToSlot`, right where
+`no_primary_key` already sits). Once refused, the existing machinery does the
+rest — `shouldDrop()` drops its CDC events before they ever reach `doPublish`, and
+`publishSuspension` tells clients why, so the write-side gate (§1.6c) also blocks
+optimistic writes to it.
+
+⚠️ **`zebridge_user_tenants` is exempt, not `isInternalTable`.** Its row changes
+never touch `cdc.<table>.<op>` at all — a dedicated path transforms them into
+`$KV.tenants.<principal>` instead, deliberately, so the tenant roster is never
+broadcast (§1.12). It still needs every *other* preflight check (no-PK, version
+columns, writability), so it isn't globally internal — just excluded from this
+one, by name, in both call sites.
+
+**A real, separate gap this surfaced along the way:** `zebridge_gc_watermark`
+was never in `topology.json`'s `public_tables`, despite PROTOCOL.md §7.5
+explicitly documenting `cdc.zebridge_gc_watermark.update` as a subject clients
+read. Its CDC route had silently never worked in this deployment — nothing had
+triggered a live GC-watermark update yet to expose it. Fixed: added to
+`public_tables`, and `CDC_PUBLIC`'s live subjects edited to match
+(`topology.json` changing alone does not retroactively update an
+already-created stream — the same manual step SECURITY.md §1.4 describes).
+
+**Verified end to end**, with debug instrumentation added and then fully
+reverted (`git diff` confirmed clean before continuing): a table created with no
+`public_tables`/`TENANT_RULES` entry is now refused **immediately** at DDL time
+— a real row insert against it completes in milliseconds (measured: 32ms,
+psql overhead included) instead of blocking, and `bridge_nats_reconnects_total`
+stays at `0` throughout. `invalidate.py`'s act 3 updated to match the new,
+correct behavior: `SCRATCH`'s `no_primary_key` refusal still lifts without a
+restart, but it now correctly *stays* suspended afterward, for `no_cdc_subject`
+— it was never declared routable, and making it fully resume would need
+`topology.json` changed and the bridge restarted, defeating the "no restart
+needed" point that act is actually making (about the no-PK refusal, not about
+CDC routing).
 
 ## 3. PostgreSQL behaviours worth remembering
 

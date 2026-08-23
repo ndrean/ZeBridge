@@ -114,29 +114,61 @@ const { sql, deleteDatabaseFile, transaction } = new SQLocal(DB_NAME);
 /// payload is plain JSON-safe data (`{data, version, client_id}`), so the round trip is
 /// lossless, and JSON is inspectable from `zb.outbox()` — which matters for a queue whose
 /// contents you only look at when something has already gone wrong.
-const outboxInit = sql`
-  CREATE TABLE IF NOT EXISTS outbox (
-    msg_id     TEXT PRIMARY KEY,
-    subject    TEXT NOT NULL,
-    payload    TEXT NOT NULL,
-    tbl        TEXT NOT NULL,
-    row_id     TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    attempts   INTEGER NOT NULL DEFAULT 0
-  )
-`;
+///
+/// `_zebridge_outbox` (PROTOCOL.md §7.1) — not a name this file invented: it is one of
+/// the client's three bookkeeping tables, alongside `_zebridge_sync` and
+/// `_zebridge_stream_seq`, and the `_zebridge_` prefix is what keeps all three from ever
+/// colliding with a genuinely replicated table of the same name. All three are created
+/// in one place, `initSyncState()`, which runs before anything else in `initNats()` —
+/// not three independent init paths that happen to agree. This module-scope promise is
+/// resolved from there; every outbox helper below awaits it rather than creating the
+/// table itself.
+let resolveOutboxInit: () => void;
+const outboxInit = new Promise<void>((resolve) => { resolveOutboxInit = resolve; });
 
+/// Creates `_zebridge_outbox` (and migrates an older file that predates a column).
+/// Called once, from `initSyncState()` — see the doc comment on `outboxInit` above for
+/// why it lives there rather than running itself.
+const createOutboxTable = async () => {
+  await sql`
+    CREATE TABLE IF NOT EXISTS _zebridge_outbox (
+      msg_id     TEXT PRIMARY KEY,
+      subject    TEXT NOT NULL,
+      payload    TEXT NOT NULL,
+      tbl        TEXT NOT NULL,
+      row_id     TEXT NOT NULL,
+      before     TEXT,
+      created_at INTEGER NOT NULL,
+      attempts   INTEGER NOT NULL DEFAULT 0
+    )
+  `;
+  // A durable (`VITE_DURABLE`) file created before `before` existed lacks the column.
+  // SQLite has no `ADD COLUMN IF NOT EXISTS`, so the failure (duplicate column) is the
+  // signal that it is already there — not an error worth surfacing.
+  try {
+    await sql`ALTER TABLE _zebridge_outbox ADD COLUMN before TEXT`;
+  } catch { /* already has it */ }
+};
+
+/// `before` is the row's full previous state (JSON, or null when this write is an
+/// INSERT — there was no previous row), captured in the same transaction as the
+/// optimistic apply. It exists to make a `rejected`/`row_deleted` verdict revertible —
+/// see `revertOptimisticWrite` — rather than leaving whatever was guessed sitting in the
+/// replica forever (NOTES.md §1.9/§1.6d).
+///
 /// `exec` defaults to the module-level `sql`, but every call site that needs this in the
 /// *same* transaction as an optimistic apply passes `tx.sql` instead — see `sendMutation`.
 const outboxPut = async (r: {
   msgId: string; subject: string; payload: unknown; table: string; id: string | number;
+  before: unknown;
 }, exec: typeof sql = sql) => {
   await outboxInit;
   await exec(
-    `INSERT INTO outbox (msg_id, subject, payload, tbl, row_id, created_at, attempts)
-     VALUES (?, ?, ?, ?, ?, ?, 0)
-     ON CONFLICT(msg_id) DO UPDATE SET attempts = outbox.attempts + 1`,
-    r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id), Date.now(),
+    `INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, before, created_at, attempts)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+     ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1`,
+    r.msgId, r.subject, JSON.stringify(r.payload), r.table, String(r.id),
+    r.before == null ? null : JSON.stringify(r.before), Date.now(),
   );
 };
 
@@ -145,14 +177,96 @@ const outboxPut = async (r: {
 /// and "no answer yet" is not one.
 const outboxDrop = async (msgId: string) => {
   await outboxInit;
-  await sql`DELETE FROM outbox WHERE msg_id = ${msgId}`;
+  await sql`DELETE FROM _zebridge_outbox WHERE msg_id = ${msgId}`;
 };
 
 const outboxAll = async (): Promise<any[]> => {
   await outboxInit;
-  return sql`SELECT * FROM outbox ORDER BY created_at`;
+  return sql`SELECT * FROM _zebridge_outbox ORDER BY created_at`;
 };
 
+/// Undo an optimistic write that the bridge has definitively told us did not happen —
+/// `rejected` (PostgreSQL refused it) or `row_deleted` (it targeted a row someone else
+/// removed). Neither gets a correcting CDC event: nothing changed server-side, so there
+/// is nothing for the replica to converge to on its own (NOTES.md §1.9/§1.6d).
+///
+/// Reads the outbox row itself for `tbl`/`payload`/`before` rather than trusting
+/// in-memory `pendingWrites` — a write replayed by `flushOutbox` after a reload has no
+/// in-memory entry, but the durable outbox row is exactly what this needs.
+///
+/// `mode` distinguishes what "correct" means for the two verdicts:
+/// - `'restore'` (rejected): our write never applied, so the row should look exactly
+///   like it did before we touched it — `before`.
+/// - `'delete'` (row_deleted): the row is confirmed gone server-side. Restoring
+///   `before` would resurrect data that no longer exists anywhere; the only correct
+///   local state is "no row".
+///
+/// ⚠️ **Guarded, not unconditional.** Something else may have touched the row between
+/// the optimistic apply and this verdict arriving — a real CDC event from another
+/// client, or a second optimistic write from this same client. Reverting blind would
+/// clobber state that is *more* correct than what we're about to write. So this only
+/// acts if the row still shows exactly what our own write applied; otherwise it just
+/// drops the outbox entry and leaves the (now independently-explained) row alone —
+/// the same behaviour as before this existed.
+const revertOptimisticWrite = async (msgId: string, mode: 'restore' | 'delete') => {
+  await outboxInit;
+  const rows = await sql(`SELECT tbl, payload, before FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+  const entry = rows[0];
+  if (!entry) return;
+
+  const table: string = entry.tbl;
+  const sent = JSON.parse(entry.payload);
+  const before = entry.before ? JSON.parse(entry.before) : null;
+  const state = syncedTables.get(table);
+  const keyObj = sent.key as Record<string, unknown> | undefined;
+
+  if (!state?.pkCols.length || !keyObj) {
+    await sql`DELETE FROM _zebridge_outbox WHERE msg_id = ${msgId}`;
+    return;
+  }
+
+  const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+  const pkVals = state.pkCols.map((c) => keyObj[c]);
+
+  await transaction(async (tx) => {
+    const current = await tx.sql(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals);
+    const currentRow = current[0] ?? null;
+
+    // "Still ours": the row is exactly what our optimistic apply left behind — an
+    // INSERT/UPDATE's row matches `sent.data` on every column it set; a DELETE's
+    // absence is itself the match.
+    const stillOurs = sent.data
+      ? currentRow != null && Object.entries(sent.data as Record<string, unknown>)
+          .every(([k, v]) => String(currentRow[k]) === String(v))
+      : currentRow == null;
+
+    if (stillOurs) {
+      if (mode === 'delete') {
+        if (currentRow) await tx.sql(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
+      } else if (before == null) {
+        // Our write was an INSERT; there was no row before it.
+        if (currentRow) await tx.sql(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
+      } else if (currentRow == null) {
+        // Our write was a DELETE that got rejected; restore the row it removed.
+        const cols = Object.keys(before);
+        const placeholders = cols.map(() => '?').join(', ');
+        await tx.sql(
+          `INSERT INTO ${table} (${cols.map((c) => `"${c}"`).join(', ')}) VALUES (${placeholders})`,
+          ...cols.map((c) => before[c]),
+        );
+      } else {
+        // Our write was an UPDATE that got rejected; restore its previous columns.
+        const cols = Object.keys(before).filter((c) => !state.pkCols.includes(c));
+        if (cols.length) {
+          const setClause = cols.map((c) => `"${c}" = ?`).join(', ');
+          await tx.sql(`UPDATE ${table} SET ${setClause} WHERE ${where}`, ...cols.map((c) => before[c]), ...pkVals);
+        }
+      }
+    }
+
+    await tx.sql(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+  });
+};
 
 const td = new TextDecoder();
 
@@ -588,8 +702,11 @@ export default function App() {
         // entry stays and `sweepPendingWrites` decides when to give up. Everything else
         // pops — including `stale` and `rejected`, where resending cannot change anything.
         const definitive = verdict.status !== 'failed';
-        if (definitive) {
-          pendingWrites.delete(msgId);
+        if (definitive) pendingWrites.delete(msgId);
+        // `rejected`/`row_deleted` pop the outbox as part of `revertOptimisticWrite`
+        // (below) — it needs the row still there to know what to undo. Every other
+        // definitive status pops it here, unchanged.
+        if (definitive && verdict.status !== 'rejected' && verdict.status !== 'row_deleted') {
           void outboxDrop(msgId);
         }
 
@@ -630,13 +747,15 @@ export default function App() {
             // discarding it.
             //
             // ⚠️ Nothing is coming via CDC to correct this one. `stale` is silently fine —
-            // the winning row arrives and overwrites the optimistic guess — but a
-            // permanently refused write leaves whatever was optimistically applied sitting
-            // in the replica with nothing left to reconcile it. The row shown locally may no
-            // longer match Postgres at all.
+            // the winning row arrives and overwrites the optimistic guess. So this reverts
+            // by hand: the row is confirmed gone server-side, so the only correct local
+            // state is "no row" — restoring the pre-write snapshot would resurrect data
+            // that no longer exists anywhere (NOTES.md §1.6d). Guarded: only if the row
+            // still shows exactly what our own write applied — see `revertOptimisticWrite`.
+            void revertOptimisticWrite(msgId, 'delete');
             appendLog(
               m.subject,
-              `${where}: the row was deleted elsewhere, so this edit cannot be applied — the local copy may still show it. Surface this to the user rather than dropping it.`,
+              `${where}: the row was deleted elsewhere, so this edit cannot be applied — reverting the local copy. Surface this to the user rather than dropping it silently.`,
               'ERROR',
             );
             break;
@@ -646,11 +765,14 @@ export default function App() {
             // missing grant, a bad type. Retrying is not a strategy; the fix is a schema
             // change, a grant, or different data.
             //
-            // ⚠️ Same caveat as row_deleted: whatever this write optimistically applied
-            // locally is not getting corrected by CDC, since nothing changed server-side.
+            // ⚠️ Same caveat as row_deleted: nothing changed server-side, so no CDC event
+            // is coming to correct what this write optimistically applied. Reverted by
+            // hand to the pre-write snapshot captured in the outbox — guarded the same way
+            // (NOTES.md §1.6d).
+            void revertOptimisticWrite(msgId, 'restore');
             appendLog(
               m.subject,
-              `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'} — the local copy may not match the server`,
+              `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'} — reverting the local copy`,
               'ERROR',
             );
             break;
@@ -705,6 +827,10 @@ export default function App() {
     }
   };
 
+  /// Creates the client's three bookkeeping tables (PROTOCOL.md §7.1) and loads resume
+  /// state from two of them. All three, together, here — not one init path per table
+  /// that happens to agree with the other two. This runs first in `initNats()`, before
+  /// the connection even opens, so nothing that needs them can race their creation.
   const initSyncState = async () => {
     await sql(`
       CREATE TABLE IF NOT EXISTS _zebridge_sync (
@@ -722,6 +848,8 @@ export default function App() {
         last_seq INTEGER NOT NULL
       );
     `);
+    await createOutboxTable();
+    resolveOutboxInit();
     await sql(`INSERT OR IGNORE INTO _zebridge_sync (id, global_last_lsn, global_last_seq) VALUES (1, 0, 0)`);
     const res = await sql(`SELECT global_last_lsn, global_last_seq FROM _zebridge_sync WHERE id = 1`);
     if (res.length > 0) {
@@ -1959,6 +2087,18 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
     payload: Record<string, unknown>,
   ) => {
     if (!nc) return;
+
+    // A suspended table (`$KV.schemas` said `suspended: true` — NOTES.md §1.6c) has no
+    // CDC path: the bridge drops every event for it at the source, refused or not. An
+    // optimistic write here would apply locally and then never get a confirming or
+    // correcting echo — permanently, not just until a retry — so it is refused
+    // client-side instead of ever being queued.
+    const suspendReason = suspended()[table];
+    if (suspendReason) {
+      appendLog(table, `write refused: table is suspended upstream (${suspendReason}) — no CDC echo would ever confirm it`, 'ERROR');
+      return;
+    }
+
     // mutation.<principal>.<table>.<operation>. The principal must match the NATS user
     // we connected as — the server's allow-list is what makes this token trustworthy.
     const subject = `mutation.${PRINCIPAL}.${table}.${op.toLowerCase()}`;
@@ -2004,7 +2144,21 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
     // `applyEvent`'s own contract for this — see its doc comment.
     try {
       await transaction(async (tx) => {
-        await outboxPut({ msgId, subject, payload, table, id }, tx.sql);
+        // Snapshot the row exactly as it stands right now, in the same transaction as
+        // the optimistic apply — so a later revert restores what was really there, not
+        // whatever the replica happened to hold by the time the verdict arrives.
+        const state = syncedTables.get(table);
+        let before: any = null;
+        if (state?.pkCols.length) {
+          const keyObj = (payload as any).key as Record<string, unknown> | undefined;
+          if (keyObj) {
+            const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+            const pkVals = state.pkCols.map((c) => keyObj[c]);
+            const existing = await tx.sql(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals);
+            before = existing[0] ?? null;
+          }
+        }
+        await outboxPut({ msgId, subject, payload, table, id, before }, tx.sql);
         await applyEvent(table, {
           table,
           operation: op,
@@ -2217,7 +2371,8 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
           {([table, reason]) => (
             <div class="suspended-banner">
               ⏸ <strong>{table}</strong> is suspended upstream ({reason}). Local rows are frozen and
-              still valid, but no new events or snapshots will arrive until the shape is fixed.
+              still valid, but no new events or snapshots will arrive, and writes are refused
+              client-side, until the shape is fixed.
             </div>
           )}
         </For>
