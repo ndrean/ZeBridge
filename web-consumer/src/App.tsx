@@ -2,6 +2,7 @@ import { createSignal, onCleanup, For } from 'solid-js';
 import { wsconnect, NatsConnection, headers } from '@nats-io/nats-core';
 import { jetstream, jetstreamManager, DeliverPolicy } from '@nats-io/jetstream';
 import { Kvm } from '@nats-io/kv';
+import { Objm } from '@nats-io/obj';
 import { decode, encode } from '@msgpack/msgpack';
 import topology from '../../topology.json';
 import { SQLocal } from 'sqlocal';
@@ -35,8 +36,12 @@ const NATS_URL = 'ws://localhost:8080';
 ///
 /// The name must exist as a NATS user with a matching `mutation.<principal>.>` grant, or
 /// the connection is refused at authentication — before any of this code runs.
-const PRINCIPAL = (import.meta.env.VITE_PRINCIPAL as string | undefined) ?? 'alice';
-const PASSWORD = (import.meta.env.VITE_PASSWORD as string | undefined) ?? 's3cret';
+/// `?principal=bob` beats the build-time env: one dev server can then serve several
+/// principals side by side (multi-browser demos, the generations staggered-seed test)
+/// without rebuilding or running one vite per identity. Same for `?password=`.
+const _qs = new URLSearchParams(window.location.search);
+const PRINCIPAL = _qs.get('principal') ?? (import.meta.env.VITE_PRINCIPAL as string | undefined) ?? 'alice';
+const PASSWORD = _qs.get('password') ?? (import.meta.env.VITE_PASSWORD as string | undefined) ?? 's3cret';
 
 /// Opt in to a stable, per-principal OPFS file (`zebridge_<principal>.sqlite3`) instead of
 /// a fresh one every page load. Off by default — the timestamped name is the project's own
@@ -485,6 +490,23 @@ async function waitForDescriptor(js: any, bucket: string, key: string, timeoutMs
   }
 }
 
+/// PG text-mode timestamptz (`2026-08-24 20:25:23.217730+00`, UTC — the producer pins
+/// its snapshot transaction there) → the CDC wire format (`2026-08-24T20:25:23.217730Z`).
+/// Pure string surgery, microseconds preserved — `Date` would truncate to ms. This
+/// matters because the version guard compares AS STRINGS: `' '` sorts before `'T'`, so
+/// unnormalized chain values would lose every comparison against CDC-written ones.
+const pgTsToWire = (v: any): any =>
+  typeof v === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?\+00(:00)?$/.test(v)
+    ? v.replace(' ', 'T').replace(/\+00(:00)?$/, 'Z')
+    : v;
+
+/// `pg_lsn` text (`0/C5793FD0`) → the numeric WAL position CDC events carry.
+/// Number is exact to 2^53 — far beyond any WAL position this demo will meet.
+const lsnToNumber = (lsn: string): number => {
+  const [hi, lo] = String(lsn).split('/');
+  return parseInt(hi, 16) * 0x100000000 + parseInt(lo, 16);
+};
+
 /// Tables that could not be seeded. Held out of `syncedTables` so no CDC event is applied
 /// to a local table that has no baseline — an unseeded replica must stay visibly absent
 /// rather than quietly partial.
@@ -682,6 +704,48 @@ export default function App() {
     console.log(`[${timestamp}] ${topic} ${opType}:`, bodyStr);
   };
 
+  /// ── SQL console — the replica IS the API ─────────────────────────────────
+  ///
+  /// Arbitrary SQL against THIS tab's own local replica. This is the one place a
+  /// public SQL box is safe: worst case you wreck your own copy, and a reload
+  /// rebuilds it from the generation chain. Tenancy was enforced upstream by which
+  /// streams this principal could read — the replica physically contains only what
+  /// it is entitled to, so there is nothing to inject into.
+  ///
+  /// `live` re-runs the last query on the same debounced trigger `recount` uses, so
+  /// a SELECT becomes a live view over CDC. Writes execute too — locally only, and
+  /// labeled: the feed owns these tables, so a hand edit lasts exactly until the
+  /// row next changes upstream (two-sources-of-truth, felt firsthand). The
+  /// legitimate write path is the outbox (`mutation.*`), never SQL.
+  const [sqlText, setSqlText] = createSignal(
+    'SELECT name, email, updated_at FROM users ORDER BY updated_at DESC LIMIT 8',
+  );
+  const [sqlRows, setSqlRows] = createSignal<any[] | null>(null);
+  const [sqlError, setSqlError] = createSignal<string | null>(null);
+  const [sqlLive, setSqlLive] = createSignal(true);
+  const [sqlMs, setSqlMs] = createSignal<number | null>(null);
+  /// Live re-runs start only after the first manual Run: auto-running the default
+  /// query while tables are still seeding would just render errors.
+  let sqlHasRun = false;
+  const sqlIsRead = () => /^\s*(select|with|explain|pragma|values)\b/i.test(sqlText());
+  const runSql = async () => {
+    const q = sqlText().trim();
+    if (!q) return;
+    sqlHasRun = true;
+    const t0 = performance.now();
+    try {
+      const rows = await sql(q);
+      setSqlMs(Math.round(performance.now() - t0));
+      setSqlError(null);
+      // Capped for the DOM's sake, not SQLite's — the cap is labeled in the UI.
+      setSqlRows(Array.isArray(rows) ? rows.slice(0, 200) : []);
+    } catch (e: any) {
+      setSqlError(String(e?.message ?? e));
+      setSqlRows(null);
+      setSqlMs(null);
+    }
+  };
+
   /// Recount every synced table. Counts only — the row grid it replaced queried 100 rows
   /// per table per second and rendered them, which is most of what made the UI thread the
   /// bottleneck during a burst.
@@ -707,6 +771,10 @@ export default function App() {
       } catch { /* table not ready yet */ }
     }
     setCounterValues(nextCounters);
+
+    // The SQL console's live mode rides the exact same debounced trigger: CDC
+    // applied → recount → the last query re-runs against the fresh replica.
+    if (sqlLive() && sqlHasRun) void runSql();
   };
 
   /// ⚠️ Debounced, and triggered by CDC — **not** by the click that sent a mutation.
@@ -908,6 +976,16 @@ export default function App() {
       CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (
         stream TEXT PRIMARY KEY,
         last_seq INTEGER NOT NULL
+      );
+    `);
+    // Generation watermarks (NOTES.md §1.13): one row per table, the manifest
+    // cutoff last applied. The client tracks WATERMARKS, never gen numbers — a gen
+    // is an object-naming detail; the cutoff is what deltas chain on.
+    await sql(`
+      CREATE TABLE IF NOT EXISTS _zebridge_generations (
+        tbl TEXT PRIMARY KEY,
+        watermark TEXT NOT NULL,
+        cutoff_lsn INTEGER NOT NULL
       );
     `);
     await createOutboxTable();
@@ -1534,6 +1612,133 @@ export default function App() {
     }
   };
 
+  /// Seed or catch up one table from its delta-generation chain (NOTES.md §1.13).
+  ///
+  /// Returns true when the table is current as of the manifest's cutoff — the caller
+  /// skips the snapshot path entirely. Returns false for every "not this way" outcome
+  /// (no `generations` section in topology, no manifest for this table, no pk yet,
+  /// unknown columns, object pruned even after a re-read): the snapshot path is the
+  /// fallback, not an error handler, so this function never throws.
+  ///
+  /// The walk is WATERMARK-based, never gen-based: apply, in order, every delta whose
+  /// cutoff is past our watermark, provided the oldest reaches back to it
+  /// (`prev_cutoff <= watermark`); otherwise the full plus the deltas after it. Bounds
+  /// are PostgreSQL text timestamps compared as strings — same producer, same format,
+  /// same offset, and the margin + guard absorb the boundary either way.
+  ///
+  /// Every row lands through a version-GUARDED upsert (`WHERE excluded.v > local.v`),
+  /// unlike the CDC applier's plain upsert: a delta's filter overlaps the previous
+  /// cutoff by the clamp margin ON PURPOSE (overlap-never-gap), so re-delivered rows
+  /// are the normal case here, and the guard is what makes them free. Tombstones ride
+  /// as rows (soft-delete tables), so a delete arrives as an UPDATE setting the
+  /// tombstone — nothing special to do.
+  const applyGenerations = async (table: string): Promise<boolean> => {
+    const GEN = (topology as any).generations;
+    if (!GEN || !nc) return false;
+    const state = syncedTables.get(table);
+    if (!state || !state.pkCols.length) return false;   // the guard needs a key
+
+    const tenantForTable = effectiveTenantFor(table);
+    const key = `${tenantForTable}.${table}`;
+    const readManifest = async (): Promise<any | null> => {
+      try {
+        const kvm = new Kvm(nc!);
+        // allow_direct, explicitly — same lesson as $KV.tenants/$KV.snapshots: the
+        // per-tenant grant covers ONLY the Direct Get path, and `open()` never asks.
+        const kv = await kvm.open(GEN.kv, { allow_direct: true });
+        const entry = await kv.get(key);
+        return entry ? JSON.parse(td.decode(entry.value)) : null;  // manifest is JSON
+      } catch { return null; }
+    };
+    let manifest = await readManifest();
+    if (!manifest?.full?.object) return false;
+
+    let os: any;
+    try { os = await new Objm(nc).open(manifest.bucket); } catch { return false; }
+    const fetchDoc = async (name: string): Promise<any | null> => {
+      try {
+        const blob = await os.getBlob(name);
+        return blob ? (decode(blob) as any) : null;                // objects are msgpack
+      } catch { return null; }
+    };
+
+    let watermark: string | null = null;
+    try {
+      const r = await sql(`SELECT watermark FROM _zebridge_generations WHERE tbl = ?`, table);
+      watermark = r[0]?.watermark ?? null;
+    } catch { /* fresh replica */ }
+
+    const planFrom = (man: any): { name: string; kind: 'full' | 'delta' }[] => {
+      const deltas: any[] = man.deltas ?? [];
+      const applicable = watermark ? deltas.filter((d) => d.cutoff > watermark!) : deltas;
+      const reaches = watermark != null &&
+        (applicable.length === 0 || applicable[0].prev_cutoff <= watermark);
+      if (reaches) return applicable.map((d) => ({ name: d.object, kind: 'delta' as const }));
+      return [
+        { name: man.full.object, kind: 'full' as const },
+        ...deltas.filter((d) => d.gen > man.full.gen)
+                 .map((d) => ({ name: d.object, kind: 'delta' as const })),
+      ];
+    };
+
+    const applyPlan = async (plan: { name: string; kind: string }[]): Promise<number | null> => {
+      let applied = 0;
+      for (const step of plan) {
+        const doc = await fetchDoc(step.name);
+        if (!doc) return null;                          // pruned under us — caller re-reads
+        const cols: string[] = doc.columns ?? [];
+        if (!cols.length || !cols.every((c) => state.columns.includes(c))) {
+          appendLog('SYS', `Generation ${step.name} for ${table} references columns the local schema lacks — falling back to snapshot`, 'WARNING');
+          return null;
+        }
+        const vcol: string = doc.version_column ?? manifest.version_column;
+        const colList = cols.map((c) => `"${c}"`).join(', ');
+        const ph = cols.map(() => '?').join(', ');
+        const conflict = state.pkCols.map((c) => `"${c}"`).join(', ');
+        const sets = cols.filter((c) => !state.pkCols.includes(c))
+                         .map((c) => `"${c}" = excluded."${c}"`).join(', ');
+        let q = `INSERT INTO ${table} (${colList}) VALUES (${ph})`;
+        q += sets
+          ? ` ON CONFLICT(${conflict}) DO UPDATE SET ${sets}` +
+            (vcol && cols.includes(vcol) ? ` WHERE excluded."${vcol}" > ${table}."${vcol}"` : '')
+          : ` ON CONFLICT(${conflict}) DO NOTHING`;
+        await transaction(async (tx) => {
+          // A full replaces the baseline wholesale; deltas layer onto it. The DELETE
+          // shares the transaction so a crash mid-apply cannot leave an empty table.
+          if (step.kind === 'full') await tx.sql(`DELETE FROM ${table}`);
+          for (const row of doc.rows) {
+            await tx.sql(q, ...row.map((v: any) =>
+              v !== null && typeof v === 'object' ? JSON.stringify(v) : pgTsToWire(v)));
+          }
+        });
+        applied += doc.rows.length;
+      }
+      return applied;
+    };
+
+    let applied = await applyPlan(planFrom(manifest));
+    if (applied === null) {
+      // An object 404 mid-walk means the chain was pruned between manifest read and
+      // fetch. The manifest is re-read ONCE and the walk restarts from ITS full —
+      // overlap, never a gap; a second failure falls back to the snapshot path.
+      manifest = await readManifest();
+      if (!manifest?.full?.object) return false;
+      watermark = null;
+      applied = await applyPlan(planFrom(manifest));
+      if (applied === null) return false;
+    }
+
+    state.lsn = lsnToNumber(manifest.cutoff_lsn);
+    await sql(
+      `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?)
+       ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn`,
+      table, manifest.cutoff_version, state.lsn,
+    );
+    scheduleRecount();
+    appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
+    return true;
+  };
+
   const subscribeStreams = async () => {
     if (!nc) return;
     const js = jetstream(nc);
@@ -1590,6 +1795,17 @@ export default function App() {
             // caching its own redundant copy.
             const tenantForTable = tenanted ? effectiveTenantFor(table) : '';
             const snapKey = tenanted ? `${tenantForTable}.${table}` : table;
+
+            // ── Delta generations first (NOTES.md §1.13) ─────────────────────
+            // A manifest read + a few objects beat a per-client snapshot: the
+            // producer builds once on a cadence, every client catches up on deltas.
+            // Any "not this way" outcome falls through to the snapshot request
+            // path unchanged — that path retires only when every table has a chain.
+            if (await applyGenerations(table)) {
+              reach('snapshot');
+              continue;
+            }
+
             let desc: any = null;
             if (snapKv) {
               try {
@@ -2537,6 +2753,61 @@ const CLIENT_ID = `c-${crypto.randomUUID().slice(0, 8)}`;
 
           <div class="controls">
             <button onClick={recount} style="background: #37474f;">Recount</button>
+          </div>
+
+          {/* SQL console — see the comment block above `runSql`. */}
+          <div class="controls" style="flex-direction: column; align-items: stretch; gap: 6px;">
+            <span>SQL console — your local replica, this tab only:</span>
+            <textarea
+              rows={3}
+              style="width: 100%; font-family: monospace; font-size: 12px; background: #263238; color: #eceff1; border: 1px solid #455a64; border-radius: 4px; padding: 6px; box-sizing: border-box;"
+              value={sqlText()}
+              onInput={(e) => setSqlText(e.currentTarget.value)}
+              onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); void runSql(); } }}
+            />
+            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+              <button onClick={() => void runSql()} style="background: #37474f;">Run (⌘⏎)</button>
+              <label style="display: flex; gap: 4px; align-items: center; font-size: 12px; cursor: pointer;">
+                <input type="checkbox" checked={sqlLive()} onInput={(e) => setSqlLive(e.currentTarget.checked)} />
+                live — re-run when CDC touches the replica
+              </label>
+              {sqlMs() != null && (
+                <span style="font-size: 12px; opacity: 0.7;">
+                  {sqlRows()?.length ?? 0} row(s) · {sqlMs()}ms{(sqlRows()?.length ?? 0) === 200 ? ' · capped at 200' : ''}
+                </span>
+              )}
+            </div>
+            {!sqlIsRead() && (
+              <div style="font-size: 12px; color: #ffb74d;">
+                ⚠ not a read: this executes locally only — the feed owns these tables, so this
+                edit lasts exactly until the row next changes upstream. Real writes go through
+                the outbox, never SQL.
+              </div>
+            )}
+            {sqlError() && (
+              <div style="font-size: 12px; color: #ef5350; font-family: monospace;">{sqlError()}</div>
+            )}
+            {sqlRows() && sqlRows()!.length > 0 && (
+              <div style="overflow-x: auto;">
+                <table class="tables-summary" style="font-size: 12px;">
+                  <thead>
+                    <tr><For each={Object.keys(sqlRows()![0])}>{(c) => <th>{c}</th>}</For></tr>
+                  </thead>
+                  <tbody>
+                    <For each={sqlRows()!}>{(r) => (
+                      <tr>
+                        <For each={Object.keys(sqlRows()![0])}>{(c) => (
+                          <td>{r[c] === null ? 'NULL' : String(r[c])}</td>
+                        )}</For>
+                      </tr>
+                    )}</For>
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {sqlRows() && sqlRows()!.length === 0 && !sqlError() && (
+              <div style="font-size: 12px; opacity: 0.7;">0 rows</div>
+            )}
           </div>
 
           {/* One row per demo, not one flat button strip — the three test_types buttons

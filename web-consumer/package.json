@@ -13,6 +13,7 @@
     "@nats-io/jetstream": "^3.4.0",
     "@nats-io/kv": "^3.4.0",
     "@nats-io/nats-core": "^3.4.0",
+    "@nats-io/obj": "3.4.0",
     "solid-js": "^1.9.14",
     "sqlocal": "^0.18.0",
     "uuid": "^14.0.1"

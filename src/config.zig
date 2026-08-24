@@ -649,6 +649,19 @@ pub const MemoryBounds = struct {
 
 /// Runtime configuration combining compile-time defaults with CLI arguments and environment variables
 /// This struct should be passed to modules instead of having them import config.zig directly
+/// Delta-generation producer (NOTES.md §1.13). Enabled by GENERATION_RULES.
+pub const Generations = struct {
+    pub const default_cadence_seconds: u64 = 600;
+    pub const min_cadence_seconds: u64 = 5;
+    pub const max_cadence_seconds: u64 = 86_400;
+    /// Generations kept per (tenant, table) — the delta chain depth k. Coupled to the
+    /// sweeper by the correctness inequality: sweeper retention ≥ k × cadence.
+    pub const default_chain_depth: u32 = 6;
+    // The KV bucket and per-tenant object-bucket prefix live in topology.json
+    // (`"generations": {kv, bucket_prefix}`) — one file, three readers, same as every
+    // other wire name. Only pacing stays here.
+};
+
 pub const RuntimeConfig = struct {
     // HTTP
     http_port: u16,
@@ -674,6 +687,8 @@ pub const RuntimeConfig = struct {
     // PostgreSQL replication
     slot_name: []const u8,
     publication_name: []const u8,
+    generation_cadence_seconds: u64 = Generations.default_cadence_seconds,
+    generation_chain_depth: u32 = Generations.default_chain_depth,
 
     /// Every wire name, read from topology.json at startup. Carried on RuntimeConfig
     /// because that is already threaded to each component that publishes or subscribes,

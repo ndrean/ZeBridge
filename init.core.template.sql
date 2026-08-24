@@ -461,9 +461,19 @@ CREATE TABLE IF NOT EXISTS public.zebridge_generations (
     -- Where CDC resumes after applying this generation's chain: clients skip events
     -- with lsn <= cutoff_lsn (every CDC event carries lsn).
     cutoff_lsn     pg_lsn NOT NULL,
+    -- The previous generation's cutoff — the delta's lower bound (minus the margin).
+    -- Stored, not derived: after pruning, the oldest kept delta's lower bound refers
+    -- to a generation whose row is gone. NULL on a chain's first generation.
+    prev_cutoff    timestamptz,
+    -- Whether this generation also shipped a full object (`<tbl>-g<N>-full`): the
+    -- chain's jump-in point, refreshed before it can age out of the kept window.
+    has_full       boolean NOT NULL DEFAULT false,
     built_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant, tbl, gen)
 );
+-- Databases created before the delta milestone: same columns, idempotently.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS prev_cutoff timestamptz;
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolean NOT NULL DEFAULT false;
 
 -- ⚠️ The ONE deliberate write grant the read role holds, and why it is not a breach of
 -- "the read role is physically unable to write": the generation's content query MUST

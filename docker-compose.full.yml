@@ -250,6 +250,7 @@ services:
         SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
         SNAPSHOT_KV=$(jq -r '.kv.snapshots' /topology.json)
         TENANTS_KV=$(jq -r '.kv.tenants' /topology.json)
+        GENERATIONS_KV=$(jq -r '.generations.kv' /topology.json)
 
         # ── CDC is SPLIT PER TENANT, and that is a security boundary, not tidiness ──
         #
@@ -424,7 +425,7 @@ services:
         echo "Creating NATS KV bucket: $$SNAPSHOT_KV"
         nats kv add $$SNAPSHOT_KV --history=1 --replicas=1 || true
 
-        # PROTOCOL.md "The Connection Flow" §Step 0: `$KV.tenants.<principal>` → tenant,
+        # PROTOCOL.md "The Connection Flow" §Step 0: `$$KV.tenants.<principal>` → tenant,
         # so a client holding only a principal ID can learn its own tenant without
         # guessing or a build-time constant. --history=1: only the current mapping is
         # ever read, same reasoning as SNAPSHOT_KV above.
@@ -436,6 +437,11 @@ services:
         #   nats kv put $$TENANTS_KV bob   globex
         echo "Creating NATS KV bucket: $$TENANTS_KV"
         nats kv add $$TENANTS_KV --history=1 --replicas=1 || true
+
+        # Chain manifests for the generation producer (NOTES.md §1.13); --history=1, same
+        # reasoning as SNAPSHOT_KV. Per-tenant OBJ_gen-<tenant> buckets are runtime-created.
+        echo "Creating NATS KV bucket: $$GENERATIONS_KV"
+        nats kv add $$GENERATIONS_KV --history=1 --replicas=1 || true
 
         echo 'NATS initialization complete!'
         exit 0

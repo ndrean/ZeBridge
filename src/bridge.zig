@@ -17,6 +17,7 @@ const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
+const generation_producer = @import("generation_producer.zig");
 const mutation_listener = @import("mutation_listener.zig");
 const catalog_epoch_mod = @import("catalog_epoch.zig");
 const c_imports = @import("c_imports.zig");
@@ -684,6 +685,53 @@ pub fn main(init: std.process.Init) !void {
     defer snap_listener.deinit();
     errdefer should_stop.store(true, .seq_cst);
     log.info("✅ Snapshot listener thread started\n", .{});
+
+    // === Start thread: generation producer (only when GENERATION_RULES is set)
+    var generation_rules = try args.Args.parseGenerationRules(allocator, &init);
+    defer args.Args.deinitTransitionRules(&generation_rules, allocator);
+    var gen_producer: ?*generation_producer.GenerationProducer = null;
+    defer if (gen_producer) |gp| {
+        gp.join();
+        allocator.destroy(gp);
+    };
+    if (generation_rules.count() > 0) {
+        // The correctness inequality (NOTES.md §1.13): a client up to `depth` gens
+        // behind catches up on deltas, so tombstones must outlive depth × cadence or
+        // a hard delete is reaped before the delta that would have shipped it — and
+        // the row silently survives on that client. The sweeper is a separate
+        // process; when its GC_THRESHOLD_MS is visible here, check it, otherwise
+        // state the number the operator must hold it above.
+        const promise_s: u64 = runtime_config.generation_cadence_seconds * runtime_config.generation_chain_depth;
+        if (init.minimal.environ.getPosix("GC_THRESHOLD_MS")) |thr_str| {
+            const thr_ms = std.fmt.parseInt(u64, thr_str, 10) catch 0;
+            if (thr_ms / 1000 < promise_s) {
+                log.warn("⚠️ GC_THRESHOLD_MS ~{d}s is BELOW chain depth × cadence = {d}s: a tombstone can be reaped before the delta that ships it, and a hard-deleted row silently survives on a catching-up client (NOTES.md §1.13)", .{ thr_ms / 1000, promise_s });
+            } else {
+                log.info("🧬 retention: sweeper window {d}s ≥ depth × cadence {d}s ✓", .{ thr_ms / 1000, promise_s });
+            }
+        } else {
+            log.info("🧬 delta catch-up window: depth × cadence = {d}s. The sweeper's GC_THRESHOLD_MS must stay above it (not visible in this env — checked when it is)", .{promise_s});
+        }
+        const gp = try allocator.create(generation_producer.GenerationProducer);
+        gp.* = generation_producer.GenerationProducer.init(
+            allocator,
+            &pg_config,
+            &should_stop,
+            io,
+            nats_endpoint,
+            &generation_rules,
+            &sync_rules,
+            runtime_config.generation_cadence_seconds,
+            runtime_config.generation_chain_depth,
+            runtime_config.topology.kv_generations,
+            runtime_config.topology.generation_bucket_prefix,
+        );
+        try gp.start();
+        gen_producer = gp;
+        log.info("🧬 Generation producer thread started", .{});
+    } else {
+        log.info("No GENERATION_RULES — generation producer disabled", .{});
+    }
 
     // === Start thread: mutation listener (only if an ingress role is configured)
     //

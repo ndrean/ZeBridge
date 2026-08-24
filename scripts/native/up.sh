@@ -105,6 +105,7 @@ if [ "$FRESH_NATS" = "1" ]; then
   SCHEMA_KV=$(jq -r '.kv.schemas' "$ROOT/topology.json")
   SNAPSHOT_KV=$(jq -r '.kv.snapshots' "$ROOT/topology.json")
   TENANTS_KV=$(jq -r '.kv.tenants' "$ROOT/topology.json")
+  GENERATIONS_KV=$(jq -r '.generations.kv' "$ROOT/topology.json")
   TENANT_PREFIX=$(jq -r '.cdc_streams.tenant_prefix' "$ROOT/topology.json")
   PUBLIC_STREAM=$(jq -r '.cdc_streams.public' "$ROOT/topology.json")
   INIT_TENANT_PREFIX=$(jq -r '.init_streams.tenant_prefix' "$ROOT/topology.json")
@@ -167,6 +168,12 @@ if [ "$FRESH_NATS" = "1" ]; then
   #   nats --server "$NATS_URL" --nkey "$SEED" kv put "$TENANTS_KV" alice acme
   #   nats --server "$NATS_URL" --nkey "$SEED" kv put "$TENANTS_KV" bob   globex
   nats --server "$NATS_URL" --nkey "$SEED" kv add "$TENANTS_KV" --history=1 --replicas=1 >/dev/null
+  # Chain manifests for the generation producer (NOTES.md §1.13). --history=1: only the
+  # current manifest is ever read. The CLI enables direct gets, which the per-tenant
+  # DIRECT.GET grants in nats-server.conf depend on. The per-tenant OBJ_gen-<tenant>
+  # object buckets are NOT pre-created here: the producer provisions them at runtime,
+  # the same shape dyntenant streams have.
+  nats --server "$NATS_URL" --nkey "$SEED" kv add "$GENERATIONS_KV" --history=1 --replicas=1 >/dev/null
   echo "[native] streams + KV buckets created"
 fi
 

@@ -121,6 +121,14 @@ pub const Topology = struct {
     kv_snapshots: []const u8,
     kv_tenants: []const u8,
 
+    // ─── generations (NOTES.md §1.13) ───────────────────────────────────────────
+    /// KV bucket holding the chain manifests, keyed `<tenant>.<table>` — tenant first,
+    /// which is what makes per-tenant `DIRECT.GET` grants scopable at all.
+    kv_generations: []const u8,
+    /// Object-store bucket per tenant: `<prefix><tenant>`. A bucket IS a stream
+    /// (`OBJ_<bucket>`), so the prefix is part of the ACL boundary, same as `CDC_`.
+    generation_bucket_prefix: []const u8,
+
     // ─── derived, built once at load ────────────────────────────────────────────
     //
     // These were `++` concatenations when the names were comptime. Same values, computed
@@ -199,6 +207,8 @@ pub const Topology = struct {
         .kv_schemas = "schemas",
         .kv_snapshots = "snapshots",
         .kv_tenants = "tenants",
+        .kv_generations = "generations",
+        .generation_bucket_prefix = "gen-",
         .mutations_subject_wildcard = "mutation.>",
         .kv_schemas_subject_pattern = "$KV.schemas.{[table]s}",
         .kv_snapshots_subject_pattern = "$KV.snapshots.{[tenant]s}.{[table]s}",
@@ -339,6 +349,28 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.kv_schemas = try str(a, kv, "kv", "schemas", diag);
     t.kv_snapshots = try str(a, kv, "kv", "snapshots", diag);
     t.kv_tenants = try str(a, kv, "kv", "tenants", diag);
+
+    // Optional, like cdc_streams: a deployment that never sets GENERATION_RULES has no
+    // reason to name these, and absent means the defaults the feature was built against.
+    if (root.get("generations")) |gv| switch (gv) {
+        .object => |o| {
+            t.kv_generations = if (o.get("kv")) |v| (switch (v) {
+                .string => |x| try a.dupe(u8, x),
+                else => "generations",
+            }) else "generations";
+            t.generation_bucket_prefix = if (o.get("bucket_prefix")) |v| (switch (v) {
+                .string => |x| try a.dupe(u8, x),
+                else => "gen-",
+            }) else "gen-";
+        },
+        else => {
+            t.kv_generations = "generations";
+            t.generation_bucket_prefix = "gen-";
+        },
+    } else {
+        t.kv_generations = "generations";
+        t.generation_bucket_prefix = "gen-";
+    }
 
     // Derived. `$KV.` is not in topology.json on purpose: it is JetStream's own subject
     // mapping for a bucket, not a name anyone is free to choose.

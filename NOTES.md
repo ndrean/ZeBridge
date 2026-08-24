@@ -1395,18 +1395,25 @@ arbitrarily stale without ever taking a full object.
   its **single deliberate write grant** (INSERT+DELETE, no UPDATE — append-only by
   privilege; the content query must run as the reader for SELECT-everywhere +
   `zb.tenant` RLS, and the bookkeeping row must share its transaction), the PK
-  forbids chain forks, and the writer holds nothing. Remaining for milestone 2: the
-  producer itself (cadence trigger, object put, pointer swap).
+  forbids chain forks, and the writer holds nothing. Milestone 2 (the producer)
+  is built — next bullet.
 - **`cutoff_lsn` is the producer's own to stamp, no thread coordination**: any
   connection can `SELECT pg_current_wal_lsn()`, and the snapshot listener already
   does exactly this ("Snapshot started at LSN" / the descriptor's `lsn`). Ordering
   rule, overlap-never-gap: read the LSN **before** establishing the REPEATABLE READ
   snapshot, so a commit in the window is visible in the generation AND ≥ the
   recorded LSN (replayed twice, absorbed by the guard) — the reverse order makes it
-  invisible AND below the LSN: skipped by both paths, lost. The
-  `zebridge_generations` row commits in the same transaction as the content query.
+  invisible AND below the LSN: skipped by both paths, lost.
   (`CREATE_REPLICATION_SLOT … USE_SNAPSHOT` pairs snapshot and consistent-point
   atomically if the window ever needs to be exactly zero.)
+  **Amended by the first live tick (2026-08-24):** `cutoff_version` is captured
+  INSIDE the snapshot transaction (`now()` = txn start, the instant the content is
+  consistent with), but the row is INSERTed only after the object and pointer are
+  live. The first run did it the other way and a NATS failure after COMMIT left a
+  row pointing at an object that never existed — skip-if-unchanged then trusted it
+  forever. With the row last, a crash in the window means no row: the next tick
+  rebuilds the same gen number (same object name, overwritten; pointer re-put) —
+  duplicate work, never a gap, never a dangling pointer.
 
 - **Storage decided: Object Store, per-tenant buckets, KV pointer retained
   (2026-08-24).** Generations (fulls and deltas) are named immutable objects in
@@ -1432,10 +1439,140 @@ arbitrarily stale without ever taking a full object.
   the old path is retired later, not refactored first. The two subsystems share no
   mutable state, so coexistence is safe by construction.
 
+- **Milestone 2 BUILT and live-tested (2026-08-24): the producer loop** —
+  `src/generation_producer.zig`, a `WalMonitor`-shaped thread beside
+  `snapshot_listener` (no shared mutable state), enabled only by
+  `GENERATION_RULES=users:_default;test_types:acme,globex` (same grammar as
+  TENANT_RULES, but the columns ARE tenants — nothing derived from topology.json,
+  the dyntenant lesson), paced by `GENERATION_CADENCE_SECONDS` (default 600, min 5)
+  and `GENERATION_CHAIN_DEPTH` (default 6). Per tick per pair, fresh PG+NATS
+  connections (at cadence the handshake is noise, and no tick inherits a half-dead
+  socket): last gen from `zebridge_generations` → skip-if-unchanged (one `EXISTS`
+  on the SYNC_RULES version column with the 5s clamp margin — idle cadences touch
+  nothing) → LSN before REPEATABLE READ + `zb.tenant` → full content as msgpack
+  `{columns, rows, gen}` (text-mode values) → object `<table>-g<N>` into
+  `gen-<tenant>` (bucket auto-created) → KV `generations` pointer
+  `<tenant>.<table>` = `{gen, object, bucket, cutoff_version, cutoff_lsn, rows}`
+  swapped last → THEN the bookkeeping row (see the amended ordering above) → prune
+  `gen ≤ N − depth`: PG rows first (the authority, via the DELETE grant), then the
+  objects they named. Failures are logged per pair and retried next cadence, never
+  fatal to the bridge. Proven end-to-end by `scripts/scenarios/genproducer.py`
+  (6/6): g1 unprompted, object decodes with exact row count, pointer coherent and
+  never dangling, idle ticks skip, a touched row yields g2 with the pointer
+  advanced, chain pruned to depth with the g1 object gone. The margin means a write
+  can echo into one duplicate build on the following tick — absorbed by the guarded
+  upsert, by design. Deltas and the chain manifest are milestone 3 — next bullet.
+
+- **Milestone 3 BUILT and live-tested (2026-08-24): deltas and the chain.** Every
+  generation after the first ships a **delta** — `WHERE version > prev_cutoff −
+  margin`, same predicate as skip-if-unchanged, so a built delta is never empty —
+  and a **full** is built at g1 then refreshed whenever the last one would age out
+  of the kept window (`gen − F ≥ depth − 1` keeps the jump-in point always inside
+  `gen > N − depth`). Objects: `<tbl>-g<N>-delta` / `<tbl>-g<N>-full`, msgpack
+  `{columns, rows, gen, kind, cutoff, prev_cutoff}` — self-describing, bounds
+  carried in-band. The KV pointer is now the **chain manifest**, swapped last:
+  `{gen, bucket, cutoff_version, cutoff_lsn, full: {gen, object, cutoff},
+  deltas: [{gen, object, prev_cutoff, cutoff}…]}`. The client contract stays
+  watermark-based, never gen numbers: apply, in order, every delta whose cutoff is
+  past your watermark, provided the oldest reaches back to it; otherwise full +
+  the deltas after it; a 404 mid-walk (pruned under you) means re-read the
+  manifest and fall back to the full — never a gap. `zebridge_generations` gained
+  `prev_cutoff` (stored, not derived: after pruning, the oldest kept delta's lower
+  bound names a row that is gone) and `has_full`; template + idempotent ALTERs.
+  Prune deletes PG rows first (the authority), then both object names per gen —
+  the kind that never existed 404s quietly; a deleted object leaves an ADR-20
+  tombstone (zero-size meta) that `list()` still shows, which is a *client-library
+  listing detail*, not surviving data (the scenario's first FAIL was exactly that
+  misread). The retention check found its home at producer wiring in `bridge.zig`:
+  depth × cadence is computed and logged at boot, compared against
+  `GC_THRESHOLD_MS` when that is visible in the bridge env, warned loudly when the
+  sweeper window is smaller. Proven end-to-end by `scripts/scenarios/genproducer.py`
+  (5/5): g1 full-only with the jump-in point set, idle skip, a touched row riding
+  a 1-row delta with bounds matching the manifest, chain continuity
+  (`d[i+1].prev_cutoff == d[i].cutoff`, first delta after the full chains off its
+  cutoff, head reaches the manifest cutoff), prune to depth with the refreshed full
+  inside the window and fetchable. Remaining: client apply (guarded upsert over
+  deltas) + migration off `$KV.snapshots`, then retiring the snapshot path.
+
+- **Names centralized, grants real (2026-08-24).** The KV bucket and object-bucket
+  prefix moved out of `config.Generations` into topology.json
+  (`"generations": {"kv": "generations", "bucket_prefix": "gen-"}`) — one file,
+  three readers, parsed in `topology.zig` as an *optional* section (cdc_streams
+  style: absent means the defaults, not an error) and injected into the producer at
+  wiring. Only pacing (`GENERATION_CADENCE_SECONDS`, `GENERATION_CHAIN_DEPTH`)
+  stays in config/env. The manifest KV is now pre-created centrally
+  (`up.sh` + compose nats-init, `--history=1`, CLI-created so direct gets are on —
+  this nats.zig `KVConfig` has no direct knob, so the producer's fallback
+  `createBucket` makes a non-direct bucket: it exists only for a bucket nobody
+  provisioned); per-tenant `OBJ_gen-<tenant>` buckets stay runtime-created by the
+  producer, the dyntenant shape. And the ACL story left the spike: every principal
+  in `nats-server.conf.template` (and the live native conf, SIGHUP'd) now carries
+  `$KV.generations.>` subscribe + the objgrants-verified per-tenant grant block —
+  `DIRECT.GET.KV_generations.$KV.generations.<tenant>.>` works precisely because
+  manifest keys are `<tenant>.<table>`, tenant first. `$JS.API.STREAM.NAMES` is
+  deliberately absent (bind the stream explicitly). Probed live as alice: reads her
+  manifest and `OBJ_gen-acme`, refused globex's manifest and `OBJ_gen-globex` by
+  the broker; `genproducer.py` re-passed 5/5 with every name read from
+  topology.json.
+
+- **The CLIENT side BUILT (2026-08-24): web-consumer applies the chain.**
+  `App.tsx` seeds each table from its generation chain BEFORE the snapshot
+  request path — `applyGenerations()` returns false for every "not this way"
+  outcome (no `generations` in topology, no manifest, no pk yet, unknown columns,
+  object pruned twice) and the snapshot path is the unchanged fallback, retiring
+  only when every table has a chain. The walk is watermark-based, never
+  gen-based: a `_zebridge_generations` table stores the last-applied cutoff per
+  table; deltas with `cutoff > watermark` apply in order when the oldest reaches
+  back (`prev_cutoff ≤ watermark`), else full + the deltas after it; a 404
+  mid-walk re-reads the manifest once and restarts from ITS full. Rows land
+  through a version-GUARDED upsert (`… DO UPDATE SET … WHERE excluded.v >
+  local.v`) — unlike the CDC applier's plain upsert, because delta overlap is
+  deliberate (margin rule) and the guard makes re-delivery free; the guard
+  column arrives IN-BAND (`version_column` in manifest and payloads — added
+  because the schema descriptor still lacks it, the noted client gap). The full's
+  `DELETE FROM` shares the apply transaction. After apply, `state.lsn =
+  cutoff_lsn` (hex `pg_lsn` → number) so the CDC gate skips pre-cutoff events.
+  Object reads use `@nats-io/obj` (added via pnpm — npm's arborist crashes on
+  this pnpm layout): `getBlob` rides `STREAM.MSG.GET` + a consumer, both already
+  granted; no `STREAM.NAMES` needed, as intended. The main bridge now runs the
+  producer (`.env.bridge`: `GENERATION_RULES="users:_default;test_types:acme,globex"`,
+  30s demo cadence with the depth × cadence warning documented beside it) —
+  first-tick fulls and manifests verified live. Remaining: retire the snapshot
+  path once every table has a chain, and move `version_column` into the schema
+  descriptor properly.
+
+**Caught by the SQL console's own output (2026-08-24): the version guard compares
+STRINGS, and the two wire formats disagreed.** CDC events carry timestamps as
+`2026-08-24T20:25:23.217730Z` (ISO, UTC); generation artifacts carried PG text mode
+in session-local time (`2026-08-24 21:26:55.379164+02`). `' '` sorts before `'T'`,
+so in durable mode an offline client catching up on deltas would compare a chain
+value against a CDC-written local one and wrongly lose — newer rows silently
+skipped, the exact failure the guard exists to prevent. Fixed at both ends: the
+producer runs `SET LOCAL timezone TO 'UTC'` inside the snapshot transaction (text
+mode then renders `…+00`), and the client normalizes chain values to the CDC shape
+with pure string surgery (`' '→'T'`, `+00→Z` — a `Date` round-trip would truncate
+microseconds). A wire-format change resets chains: old `+02` artifacts were wiped,
+gen numbering restarted. The lesson generalizes: the guard's comparability is part
+of the wire contract — any value the guard touches must have ONE canonical text
+form across every path that can write the column.
+
+**Consequence for retirement day — CDC retention shrinks to ~2 × cadence.** A
+chain-seeded client needs CDC only from its manifest's `cutoff_lsn` forward, and the
+manifest it read is at most one cadence stale (two, if it caught the pointer just
+before a swap). Idle windows need nothing retained (skip = no events in between);
+a client offline past retention just re-seeds from artifacts built once for
+everyone — a gap stops being an emergency. So the CDC streams' 8d max-age can drop
+to ~2 × cadence, and NATS then stores roughly ONE copy of the published data
+(per-tenant fulls + small deltas) instead of days of chunks. Preconditions: every
+table in the stream has a chain (the snapshot-path retirement itself), and note it
+is the NATS window that shrinks — `GC_THRESHOLD_MS` (§7.5, offline writers) is a
+PostgreSQL tombstone clock and keeps its own, longer horizon, coupled to the chain
+only by depth × cadence.
+
 Remaining correctness inventory: (1) overlap/regression — settled by the guarded
-upsert; (2) deletions — tombstones ride deltas as rows, `sweeper retention ≥
-k × cadence (+ margin)` still needs its check wired (a home next to
-`descriptorStillFresh()`); (3) clock skew — settled by the margin rule; (4)
+upsert; (2) deletions — tombstones ride deltas as rows, and the `sweeper retention ≥
+k × cadence` check is wired at producer wiring in `bridge.zig` (2026-08-24: stated
+at boot, compared against `GC_THRESHOLD_MS` when visible, loud warn when smaller); (3) clock skew — settled by the margin rule; (4)
 pointer/object atomicity — settled by the pointer-swap layout (`objstore_race.py`).
 
 ⚠️ **The cadence becomes a correctness parameter, not a freshness knob.** Two pieces of
@@ -2535,7 +2672,7 @@ zig build test-nats
 | `zebridge_public_tables` | Registers tables that are deliberately published unscoped to all tenants. It acts as an escape hatch for public shared datasets (e.g., product catalogs or currency lists) and justifies why they bypass the scoping guards. |
 | `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
 | `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
-| `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. |
+| `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. |
 
 #### Client-Side Tables (`web-consumer/src/App.tsx`)
 
@@ -2651,3 +2788,127 @@ Once these steps occur, ZeBridge seamlessly picks up the new `tenant_id` from th
 > write** — a tenant-routed row whose subject matches no stream is the §2.19 blocking
 > shape (no PubAck, retries, eventual bridge FATAL). The backend's provisioning step
 > is therefore step 1, not housekeeping.
+
+## 10. libzebridge — one Zig core, every consumer (2026-08-25)
+
+The consumer-code problem, named honestly: App.tsx is ~2700 lines, and the hard 60%
+is the write side — outbox, verdict state machine, optimistic apply with two revert
+modes, clamp, echo-as-confirmation. None of it is accidental complexity; all of it
+would have to be re-derived per language for the example matrix ([Leaf+Python+PG],
+[Leaf+Go+SQLite], [Leaf+Phoenix+PG], Flutter, Swift, Node/TS — Ruby viable too:
+Rails 8 pushes SQLite-in-production, `nats-pure` is official). This section is the
+answer, so it does not get re-invented worse later.
+
+**The split: eater vs speaker.** Every consumer has exactly two roles, and the
+socket belongs to only one of them.
+
+- **The eater** — the applier core, sans-I/O: bytes in → SQL + instructions out.
+  It NEVER touches a socket, not even to "propagate the good news": an outbound
+  write surfaces as an instruction ("publish these bytes on
+  `mutation.<principal>.<table>.<verb>` with this msg-id"), and the host's
+  transport does the sending. Everything hard lives here: the chain walk (manifest
+  → watermark rule → full-or-deltas plan → 404-means-re-read-from-the-full), the
+  version-GUARDED upsert, the LSN gate, the wire-format normalization (§1.13's
+  `' '` vs `'T'` catch — fixed in ONE place forever), the verdict machine, the
+  outbox rules. "The snapshot business" is deliberately INSIDE: it is the most
+  standardized part of the protocol. Driven as a state machine with an effect
+  queue: host feeds bytes (manifest, objects, CDC events, verdicts), core returns
+  effects (fetch X, run these statements in one transaction, publish Y, persist
+  watermark W / lsn L). No daemon-ness: the loop, threads and liveness live in the
+  speaker; the eater is a function you keep calling — which is also why it is
+  testable by fixtures instead of a harness.
+
+- **The speaker** — the pump that owns the socket, reconnects, the read loop.
+  Necessarily native to its platform: `@nats-io/nats-core` over WebSockets in the
+  browser, `nats.zig` (TLS verified 2026-08-24) everywhere else. ~50 lines per
+  platform, not ~800.
+
+**One Zig source, two artifacts.**
+
+- `applier.wasm` — the eater compiled `wasm32-freestanding`. Sans-I/O means NO
+  WASI: no sockets, clock, or fs imports, so it runs on any runtime including tiny
+  interpreters. Hosts: browser (native), Node (same V8 bytes as the browser — zero
+  deps), Go (`wazero`, pure Go, no cgo), Python/Ruby/Elixir (official wasmtime
+  bindings). ABI: primitive byte-passing over linear memory; the Component
+  Model/WIT is deliberately skipped until it settles — adopting it later changes
+  no logic.
+- `libzebridge` — the eater + `nats.zig` + linked `sqlite3.c`, compiled natively
+  (Zig cross-compiles `aarch64-ios`/`aarch64-android` out of the box; iOS forbids
+  JIT, so native beats interpreted wasm there). The library OWNS the replica.
+  C ABI on the order of: `zb_connect(url, creds)`, `zb_query(sql)`,
+  `zb_mutate(table, key, values)`, `zb_on_change(table, cb)`. Swift consumes the
+  header directly, Dart via `dart:ffi`, Kotlin via JNI, Python `ctypes`, Ruby
+  `fiddle`. Being a LIBRARY, not a process, makes the read-loop thread, reconnect
+  policy and FFI memory ownership deliberate API surface — ordinary C-library
+  discipline, designed once.
+
+**The browser carve-out** (the one place the full-Zig client cannot go): wasm has
+no sockets, so nats.zig's transport physically cannot run there — and does not
+need to: the TS pump extracted from App.tsx (`zebridge-client-ts`) is already
+built and debugged. Browser = TS speaker + wasm eater. Server-side wasm WITH
+sockets (WASI preview-2) is parked as bleeding-edge; servers load the native lib
+via FFI instead, or use the wasm eater with their own native pump.
+
+**The consumer contract fits on an index card.**
+
+- `query` — arbitrary SELECTs, joins, window functions, run DIRECTLY against the
+  local SQLite: the replica IS the API, snapshot-consistent (chain-seeded to one
+  cutoff, CDC-advanced in lane order, FK integrity via the PROTOCOL §4 deferral
+  rule), offline included. Complex dashboards are the user's business, not the
+  API's.
+- `mutate(table, key, values)` — a 1:1 constructor for the wire message, three
+  verbs. **No SQL interpreter exists anywhere in the library**: SQL is only ever
+  GENERATED (inbound verbs → statements at the last inch), never PARSED — no
+  dialect on the write path, no injection surface. Mirrors the server's trust
+  model, where PostgreSQL never receives client SQL either: the whole pipeline
+  moves facts about rows.
+- `onChange(table, cb)` — the doorbell; the app re-queries.
+
+**The one rule, made mechanical** ("the ones that only live in prose are the ones
+that bite" — third occurrence of the pattern after the timestamp and publication
+guards): direct writes to the replica bypass the outbox and diverge silently, so
+`libzebridge` keeps its read-write connection PRIVATE and hands the app a second
+connection opened `SQLITE_OPEN_READONLY` (WAL: readers never block the applier).
+A stray UPDATE is an error at the call site, not a violated convention. In the
+browser tier (one sqlocal connection, OPFS sync handles are exclusive) the package
+instead simply exports no write path except `mutate()`; the raw handle stays for
+the SQL console, labeled.
+
+**The conformance harness certifies ONE artifact, not six ports.** A sans-I/O core
+is its own harness target: fixtures in, emitted SQL and effects out, byte-for-byte
+deterministic — no NATS, PG, or browser required. The scenario suite's tricky
+cases (clamp, tiebreak, pruned-mid-walk, the timestamp-format edges) become golden
+files; the same fixtures certify the wasm build and the native build (they don't
+care where the bytes ran). A language binding then only proves its pump: "I fed
+the bytes in order and executed what came out." PROTOCOL §7's verdict machine gets
+written down as a one-page transition table (~10 transitions) as part of this.
+
+**Dialect choice**: the eater emits SQL TEXT, SQLite dialect first — matching the
+schema descriptors' existing two-dialect (`pg`/`sqlite`) philosophy; the PG
+dialect lands when the Python/Phoenix consumers force it (rule of three). Neutral
+statement-descriptions were considered and rejected: they push rendering into
+every binding, the exact cost this design exists to kill.
+
+**Extraction order** (rule of three, twice): `zebridge-client-ts` is extracted
+with App.tsx as its FIRST consumer and the Node example as its second — the
+browser demo becomes the regression test for the extraction. Likewise no
+universal SDK abstraction before two ports exist against the protocol directly.
+
+**Rejected on the way here, recorded so it stays rejected**: the reverse
+architecture (push RAW pgoutput to NATS, decode at the edge / wasmCloud). It
+breaks the tenant ACL — subject routing REQUIRES decoding (the tenant column
+lives in the decoded tuple), so raw frames hand every edge decoder all tenants
+mixed — and pgoutput is stateful (tuples reference relation OIDs from earlier
+Relation messages: every consumer grows a relcache, late joiners can't decode,
+retention must preserve schema messages forever). The gain would have been
+offloading ~3.5µs/event of decode CPU that was never scarce. The salvageable
+adjacent idea: an optional **SQL lane** — a small worker (wasmCloud fits HERE)
+consuming the already-tenant-routed streams and republishing rendered SQL phrases
+per dialect (`cdc-sql.<dialect>.<tenant>.<table>.>`), making ~50-line consumers
+possible for teams that want them. Behind the bridge, opt-in, ACL intact.
+
+Context this slots into: the leaf topology (bridge↔NATS plain TCP colocated,
+NATS↔leaves TLS, PG↔bridge SSL for PG-as-a-service; one leaf per tenant whose hub
+credential carries that tenant's grants; ~20ms leaf latency exercising LWW and the
+5s clamp in anger) and the ~20MB bridge footprint (ring buffer is the knob,
+arenas, no GC). Small tool, sharp contract — the contract is the investment.

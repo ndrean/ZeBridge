@@ -49,6 +49,13 @@ const usage =
     \\                        orders:tenant_id;invoices:tenant_id
     \\                        A listed table gets its tenant appended to every CDC
     \\                        subject, so reads can be scoped per principal.
+    \\  GENERATION_RULES      which (table, tenant) pairs the generation producer
+    \\                        builds (NOTES.md §1.13); unset disables it:
+    \\                        users:_default;test_types:acme,globex
+    \\  GENERATION_CADENCE_SECONDS  tick interval (default: 600). A CORRECTNESS
+    \\                        parameter: depth × cadence must stay under the
+    \\                        sweeper's tombstone retention.
+    \\  GENERATION_CHAIN_DEPTH  generations kept per pair (default: 6)
     \\  LOG_LEVEL             debug|info|warn|err (default: info).
     \\                        Log lines print "warning"/"error"; both
     \\                        spellings are accepted here.
@@ -388,6 +395,26 @@ pub const Args = struct {
         }
         runtime_config.nats_seed = init.minimal.environ.getPosix("NATS_NKEY_SEED");
 
+        // Generation producer pacing. ⚠️ The cadence is a CORRECTNESS parameter, not a
+        // freshness knob: chain depth × cadence must stay under the sweeper's tombstone
+        // retention or deltas silently lose deletions (NOTES.md §1.13).
+        runtime_config.generation_cadence_seconds = envUint(
+            u64,
+            init,
+            "GENERATION_CADENCE_SECONDS",
+            config.Generations.default_cadence_seconds,
+            config.Generations.min_cadence_seconds,
+            config.Generations.max_cadence_seconds,
+        );
+        runtime_config.generation_chain_depth = envUint(
+            u32,
+            init,
+            "GENERATION_CHAIN_DEPTH",
+            config.Generations.default_chain_depth,
+            1,
+            64,
+        );
+
         return .{
             .args = cli_args,
             .runtime_config = runtime_config,
@@ -427,6 +454,16 @@ pub const Args = struct {
     /// first column is read.
     pub fn parseTenantRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
         return parseTableRules(allocator, init, "TENANT_RULES");
+    }
+
+    /// `GENERATION_RULES=users:_default;test_types:acme,globex`
+    ///
+    /// Which (table, tenant) pairs the generation producer builds (NOTES.md §1.13).
+    /// Same grammar as TENANT_RULES, but the columns ARE tenants — explicit on
+    /// purpose: dyntenant.py proved topology.json's tenant list is not the runtime
+    /// truth, so nothing here is derived from it.
+    pub fn parseGenerationRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
+        return parseTableRules(allocator, init, "GENERATION_RULES");
     }
 
     fn parseTableRules(

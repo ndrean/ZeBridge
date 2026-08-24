@@ -23,7 +23,7 @@ buggy one (PROTOCOL.md §7.0).
 | role | holds | must never have |
 | --- | --- | --- |
 | **`postgres`** (admin) | creates roles, runs `init.sql`, owns tables | to appear in `.env.bridge`. It is not a bridge credential |
-| **`bridge_reader`** | `SELECT` + `REPLICATION` — plus one deliberate exception: `INSERT`+`DELETE` (never `UPDATE`) on `zebridge_generations`, the generation producer's own bookkeeping, because the content query must run as the reader and the bookkeeping row must share its transaction (append-only by privilege; `scripts/scenarios/generations.py` proves the boundary) | any write privilege on user data. It is *physically* unable to write anything a client reads |
+| **`bridge_reader`** | `SELECT` + `REPLICATION` — plus one deliberate exception: `INSERT`+`DELETE` (never `UPDATE`) on `zebridge_generations`, the generation producer's own bookkeeping, because the content query must run as the reader (SELECT-everywhere + `zb.tenant` RLS), and the bookkeeping row is written by that same connection — after the objects and manifest are live, so it never vouches for artifacts that don't exist (append-only by privilege; `scripts/scenarios/generations.py` proves the boundary) | any write privilege on user data. It is *physically* unable to write anything a client reads |
 | **`bridge_writer`** | per-table `SELECT, INSERT, UPDATE`, granted one table at a time | `BYPASSRLS`. That attribute is what makes RLS enforce writes |
 
 There is **no tenant role.** A tenant is a column value, not a login. One writer role

@@ -107,6 +107,7 @@ ALICE_READ = [
   "mutation_ack.alice.>"       # her own write verdicts, keyed by her Nats-Msg-Id
   "$KV.schemas.>"              # schema descriptors
   "$KV.snapshots.>"            # snapshot descriptors
+  "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"                   # JetStream replies — omit this and everything hangs
 ]
 
@@ -129,6 +130,7 @@ BOB_READ = [
   "mutation_ack.bob.>"         # HIS own verdicts — not alice's
   "$KV.schemas.>"
   "$KV.snapshots.>"
+  "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
 
@@ -144,6 +146,7 @@ JOHN_READ = [
   "mutation_ack.john.>"        # HIS own verdicts
   "$KV.schemas.>"
   "$KV.snapshots.>"
+  "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
 
@@ -160,6 +163,7 @@ MARY_READ = [
   "mutation_ack.mary.>"        # HER own verdicts — not bob's
   "$KV.schemas.>"
   "$KV.snapshots.>"
+  "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
 
@@ -176,6 +180,7 @@ NINA_READ = [
   "mutation_ack.nina.>"        # HER own verdicts — not bob's or mary's
   "$KV.schemas.>"
   "$KV.snapshots.>"
+  "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
 
@@ -235,6 +240,29 @@ authorization {
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
+          # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
+          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
+          # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
+          # explicitly (nats.zig can; granting NAMES leaks the stream roster).
+          "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
+          "$JS.API.CONSUMER.INFO.KV_generations.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_generations.>"
+          "$JS.API.STREAM.INFO.KV_generations"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.acme.>"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.${OPEN_TENANT}.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-acme"
+          "$JS.API.DIRECT.GET.OBJ_gen-acme.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-acme"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-acme", "$JS.API.CONSUMER.CREATE.OBJ_gen-acme.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-acme.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-acme.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.DIRECT.GET.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
@@ -354,6 +382,29 @@ authorization {
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
+          # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
+          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
+          # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
+          # explicitly (nats.zig can; granting NAMES leaks the stream roster).
+          "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
+          "$JS.API.CONSUMER.INFO.KV_generations.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_generations.>"
+          "$JS.API.STREAM.INFO.KV_generations"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.globex.>"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.${OPEN_TENANT}.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-globex"
+          "$JS.API.DIRECT.GET.OBJ_gen-globex.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-globex"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-globex", "$JS.API.CONSUMER.CREATE.OBJ_gen-globex.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-globex.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-globex.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.DIRECT.GET.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
@@ -425,6 +476,22 @@ authorization {
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
+          # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
+          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
+          # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
+          # explicitly (nats.zig can; granting NAMES leaks the stream roster).
+          "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
+          "$JS.API.CONSUMER.INFO.KV_generations.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_generations.>"
+          "$JS.API.STREAM.INFO.KV_generations"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.${OPEN_TENANT}.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.DIRECT.GET.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
@@ -476,6 +543,29 @@ authorization {
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
+          # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
+          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
+          # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
+          # explicitly (nats.zig can; granting NAMES leaks the stream roster).
+          "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
+          "$JS.API.CONSUMER.INFO.KV_generations.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_generations.>"
+          "$JS.API.STREAM.INFO.KV_generations"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.globex.>"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.${OPEN_TENANT}.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-globex"
+          "$JS.API.DIRECT.GET.OBJ_gen-globex.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-globex"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-globex", "$JS.API.CONSUMER.CREATE.OBJ_gen-globex.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-globex.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-globex.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.DIRECT.GET.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
           "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
@@ -524,6 +614,29 @@ authorization {
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
+          # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
+          # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
+          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
+          # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
+          # explicitly (nats.zig can; granting NAMES leaks the stream roster).
+          "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
+          "$JS.API.CONSUMER.INFO.KV_generations.>"
+          "$JS.API.CONSUMER.MSG.NEXT.KV_generations.>"
+          "$JS.API.STREAM.INFO.KV_generations"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.globex.>"
+          "$JS.API.DIRECT.GET.KV_generations.$KV.generations.${OPEN_TENANT}.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-globex"
+          "$JS.API.DIRECT.GET.OBJ_gen-globex.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-globex"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-globex", "$JS.API.CONSUMER.CREATE.OBJ_gen-globex.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-globex.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-globex.>"
+          "$JS.API.STREAM.INFO.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.DIRECT.GET.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.STREAM.MSG.GET.OBJ_gen-${OPEN_TENANT}"
+          "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
+          "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
           "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"

@@ -4,31 +4,36 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-**What is it?**: ZeBridge is an opinionated bidirectional daemon connecting `PostgreSQL` to the message broker `NATS/JetStream` for Edge sync.
+**What is it?**:  `ZeBridge` is an opinionated, bidirectional system in two parts: a server-side executable (daemon) that streams PostgreSQL changes onto NATS/JetStream and applies writes coming back, and a client library — `libzebridge` — that keeps a local SQLite replica on the edge: browsers, phones, services. Consumers query their replica offline and write through three verbs (INS, DEL, UP), resolved **last-write-wins**.
+NATS/JS is the transport, the fan-out/in, and the tenant boundary.
 
-**What can it do?**: Allows mobile, WASM ([PGLite](https://github.com/electric-sql/pglite), [SQLite](https://sqlite.org/wasm/doc/trunk/index.md)) web apps or microservices to sync with a Postgres database via NATS/JS without ever reaching for Postgres.
+The consumer can query his database (off/online). The system resyncs when returning online. All writes writes flow back as three-verb mutations (INS, DEL, UP) resolved as **last-write-wins**.
+It uses the message broker `NATS/JetStream` for the transport, the fan out/in and tenant boundary.
 
-**Design**: This tool is built to serve a large number of small to medium consumers via the message broker NATS/JS, so it is designed to be fast and safe. It projects PostgreSQL onto NATS/JS. Consumers connect to NATS and keep their local database in sync.
+| artifact | what it is | who uses it |
+| -- | -- | -- |
+| zebridge | executable (daemon) | next to PG ← ZeBridge →  NATS |
+| libzebridge | native library, C ABI | mobile apps, desktop apps, microservices via FFI |
+| libzebridge.js | npm package (TS pump + wasm eater) | browsers, Node, Electron |
 
-By pushing all consumer state, caching, and rate-limiting down into NATS/JS, the ZeBridge binary is stateless toward consumers.
+**Design**: This tool is built to serve a large number of small to medium consumers via the message broker NATS/JS, so it is designed to be fast and safe.
 
-**What is it not**: ZeBridge serves a large number of small to medium consumers via NATS. It is NOT for large and long tables or tables containing large objects: it is not a file transfer tool. A large blob (>1 MB) belongs in object storage: tables should only contain the reference to a blob.
+**What is it not**: It is NOT for large and long tables or tables containing large objects: it is not a file transfer tool. A large blob (> 1 MB) belongs in object storage. Tables should only contain the reference to a blob.
 
-**Can I read and write from edge?**: It can be used as a **READ tool only**, or **bidirectional** with WRITE capacities:
+**Can I write from edge?**: writes are optimistic and propagated back to Postgres via NATS/JS. The returned CDC event to the consumer updates its local state with **last-write-wins** (LWW) conflict resolution.
 
-* **READ**: it streams Postgres CDC events and table snapshots to a NATS/JS server your consumer is connected to.
-* **WRITE**: it propagates a consumer's local writes back to Postgres via NATS/JS, which then sends a CDC event so the consumer updates its local state with last-write-wins (LWW) conflict resolution.
-
-**How is data access protected?**: each consumer must have its own unique identity and segregated by tenants. Access per stream / bucket is granted by NATS and access by tenant is enforced by Postgres.
+**How is data access protected?**: each consumer must have its own unique identity and belongs to a tenant. The DBA adds the consumer to Postgres.
+Access per stream / bucket is granted by NATS and access by tenant is enforced by Postgres.
 
 * ZeBridge can only read the declared tables and columns in Postgres, with a dedicated user.
 * Access is scoped by tenant.
 * The read-only configuration is the base; add RLS on top to filter CDC events and snapshots by tenant.
 * The read/write configuration comes in two flavors: single tenant with full Postgres control, or multi-tenant.
 
-**Performance**: you can expect 200 kevt/s. See [An example of a measured throughput](#an-example-of-a-measured-throughput) for a real, reproducible number — run it yourself on your own hardware before trusting any figure quoted here.
+**Performance**: you can expect up to 250-300.000 evt/s on your local computer. It depends almost entirely upon Postgres `pgoutput` rate. ZeBridge and NATS just absorb whatever's given. hen deployed, you ohave the unavoidable network latency.
+See [An example of a measured throughput](#an-example-of-a-measured-throughput) for a real, reproducible number — run it yourself on your own hardware before trusting any figure quoted here.
 
-**Security**: read [SECURITY.md](SECURITY.md)
+**Admin setup**: read [SECURITY.md](SECURITY.md)
 
 **Status**: Dev stage — see [Roadmap](#roadmap) for the current version and what's next.
 
@@ -68,26 +73,36 @@ A consumer connects to a NATS/JS (v2.10+) server facing ZeBridge connected to Po
 
 ```mermaid
 flowchart LR
-    subgraph VPS["VPS / Private Network"]
-        PG[("Postgres <br> Master")]
-        subgraph Localhost ["VPS - Localhost"]
-        Bridge["ZeBridge <br> daemon"]
-        NATS[("NATS")]
+     subgraph VPS["VPS"]
+        PG[("Postgres<br>Master")]
+        subgraph Localhost ["localhost"]
+            Bridge(("ZeBridge"))
+            NATS[("NATS hub")]
+        end
+        PG <-- "TCP<br>SSL (opt)" --> Bridge
+        Bridge <--> |"TCP<br>(colocated,<br>nothing to encrypt)"| NATS
     end
 
-    PG <-- "TCP <br> SSL (opt)" --> Bridge
-  
-    Bridge <--> |"TCP" <br> only| NATS
-    end
-    NATS <-- TLS/WSS --> App
+    NATS <-- "TLS" --> NATS_L
+    NATS <-- "TLS / WSS" --> Lib
 
 
-    subgraph Consumers["Consumers"]
-        App["App"] <--> LocalDB[("Local_DB")]
+     subgraph Edge["Server-side consumers (per tenant)"]
+        NATS_L["NATS Leaf<br>(tenant-scoped creds)"]
+        NATS_L <--> Svc["microservice<br>(libzebridge via FFI<br>or wasm eater + pump)"]
     end
+
+    subgraph Mobile["Mobile consumer"]
+        Lib["libzebridge<br>nats.zig + applier + SQLite"]
+        Lib -- "query · mutate · onChange<br>(C ABI, read-only handle)" --> App["App"]
+    end
+
+    style Bridge fill:#f59e0b,stroke:#d97706,color:#000
+    style NATS fill:#10b981,stroke:#059669,color:#000
+    style NATS_L fill:#b8f8e3,stroke:#059669,stroke-dasharray:5 5,color:#000
 ```
 
-> [!NOTE] v0.14: NATS and ZeBridge need to be colocated (same host) since the communication between them is plain text only — see [Roadmap](#roadmap).
+> [!NOTE] v0.14: NATS and ZeBridge are colocated (same host) for performance. You can  — see [Roadmap](#roadmap).
 
 NATS has client libraries for 40+ languages, so instead of an SDK, we propose [PROTOCOL.md](PROTOCOL.md). It details the workflows and rules to connect consumers to the NATS server and sync the local-first database, with worked examples for Flutter, webapps (WASM-SQLite + OPFS), and backend microservices in Node, Python & Elixir (_TODO_).
 

@@ -45,5 +45,9 @@
     "schemas": "schemas",
     "snapshots": "snapshots",
     "tenants": "tenants"
+  },
+  "generations": {
+    "kv": "generations",
+    "bucket_prefix": "gen-"
   }
 }
