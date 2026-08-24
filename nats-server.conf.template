@@ -100,6 +100,7 @@ http_port: 8222
 ALICE_READ = [
   "cdc.acme.>"                 # her tenant's change feed — and nobody else's
   "cdc.users.>"                # public tables, which carry no tenant token
+  "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"       # the open tenant: rows that opted into no tenant
   "init.snap.acme.>"           # her tenant's snapshot chunks and dump metadata
   "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
@@ -121,6 +122,7 @@ ALICE_READ = [
 BOB_READ = [
   "cdc.globex.>"               # HIS tenant — the same one-line difference as mutation_ack
   "cdc.users.>"                # public tables
+  "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"       # the open tenant — same subject as alice's, by design
   "init.snap.globex.>"         # HIS tenant's snapshot chunks and dump metadata
   "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
@@ -135,6 +137,7 @@ BOB_READ = [
 # to read. Public tables plus the open tenant are everything he is entitled to.
 JOHN_READ = [
   "cdc.users.>"                # public tables
+  "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"       # HIS tenant, in the open-mapping sense — same subject as
                                 # alice's and bob's open-tenant reads, by design
   "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
@@ -150,6 +153,7 @@ JOHN_READ = [
 MARY_READ = [
   "cdc.globex.>"
   "cdc.users.>"
+  "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"
   "init.snap.globex.>"         # this tenant's snapshot chunks and dump metadata
   "init.snap.${OPEN_TENANT}.>"       # open-tenant + public-table snapshot data
@@ -165,6 +169,7 @@ MARY_READ = [
 NINA_READ = [
   "cdc.globex.>"
   "cdc.users.>"
+  "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"
   "init.snap.globex.>"         # this tenant's snapshot chunks and dump metadata
   "init.snap.${OPEN_TENANT}.>"       # open-tenant + public-table snapshot data

@@ -241,7 +241,7 @@ reader a table."* So a client with a deterministic bug in its write path
 penalizes only itself — other, correct clients keep writing to the same table
 without disruption.
 
-### 1.7 Deliberately not fixed
+### 1.7 CLOSED — both former deliberately-not-fixed items are resolved (2026-08-24: schema events counted separately; pk moved to the payload root)
 
 - **`cdc_events_published` undercounts — resolved sideways (2026-08-24).** The counter
   increments only in the row-event branches, so DDL/SCHEMA publishes were invisible.
@@ -1440,7 +1440,11 @@ iters delta, not by intuition about which side "must" be slow.
   where this bites: declared FKs would reject the child. That client must either not
   declare FKs on the replica (the source already enforces them), declare them
   `DEFERRABLE INITIALLY DEFERRED` and apply each batch in one transaction, or apply
-  in LSN order across streams (every event carries `lsn`).
+  in LSN order across streams (every event carries `lsn`). **Settled 2026-08-24 as a
+  consumer rule, now in PROTOCOL.md §4 ("Ordering — what is guaranteed, and the
+  foreign-key rule")**: both engines support deferral (PostgreSQL `DEFERRABLE
+  INITIALLY DEFERRED`; SQLite the same in DDL, or `PRAGMA defer_foreign_keys` per
+  transaction), and the lsn field already carries commit order — no wire change.
 **BUILT and verified (2026-08-24), as planned below.** `PublishWindow` in
 `nats_publisher.zig` (per-window reply inbox, in-flight list, `drain` fails the whole
 window into `flushBatch`'s retry; per-ack latency feeds the same metric); lane-aware

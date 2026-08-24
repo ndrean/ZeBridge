@@ -150,7 +150,9 @@ def seed_table():
             quiet=True,
         )
     else:
-        zb.psql(f"TRUNCATE public.{TABLE};", quiet=True)
+        # CASCADE: `orders` references users (FK-ordering demo table); a bare TRUNCATE
+        # refuses while anything references the table.
+        zb.psql(f"TRUNCATE public.{TABLE} CASCADE;", quiet=True)
 
     in_pub = zb.psql(
         f"SELECT 1 FROM pg_publication_tables WHERE pubname='{PUB}' AND tablename='{TABLE}'"

@@ -411,6 +411,50 @@ whatever its first event happened to be, mixing tables and operations under one
 subject (`NOTES.md` §2.1). Do not rely on the payload's `subject` field disagreeing
 with the message subject — they now agree, and that is the contract.
 
+### Ordering — what is guaranteed, and the foreign-key rule
+
+**Per lane** — one table's events (`cdc.[tenant.]<table>.*`) — order on the stream is
+arrival order in PostgreSQL, always, including across verb changes on the same key.
+
+**Across tables there is no ordering guarantee**, even for rows written in one
+PostgreSQL transaction: the bridge groups a flush run per lane, emitted in
+first-appearance order, so a child row can reach the stream before the parent it
+references. Concretely, with `order_items.order_id → orders.id` and one flush run
+(≤500 ms of WAL) holding:
+
+```
+1. INSERT order_items (id=1000, order_id=41)   -- txn A: item for an existing order
+2. INSERT orders      (id=42)                  -- txn B begins
+3. INSERT order_items (id=1001, order_id=42)   -- txn B: child of that new order
+```
+
+lane `order_items` appears first (event 1), so its group collects **both** item
+events and publishes ahead of lane `orders` — on the stream, item 1001 arrives
+before order 42, even though PostgreSQL committed them in one transaction, parent
+first. Replicas that declare no foreign keys (the reference SQLite clients) never
+notice — applies are per-row primary-key upserts and the final state converges; the
+child is merely "orphaned" for the milliseconds between the two applies.
+
+A replica that **does** declare foreign keys must handle this itself, and both
+engines make it a consumer-side rule with no wire change:
+
+* declare the constraints `DEFERRABLE INITIALLY DEFERRED` (PostgreSQL and SQLite
+  both accept this in DDL), or in SQLite enable `PRAGMA defer_foreign_keys = ON` at
+  the start of **each** apply transaction (it resets at every COMMIT — and never set
+  it to `0` mid-transaction, which discards the tracked violations);
+* apply CDC in transactions batched so a parent and its child land before the same
+  COMMIT. Every event carries `lsn`, and commit order **is** `lsn` order, so the
+  robust form is a small `lsn`-sorted reorder window — the interleave distance is
+  bounded by one flush run (at most a few thousand events, occasionally spanning
+  two adjacent runs), never unbounded;
+* a deferred violation surfacing at COMMIT means the batch was cut between a child
+  and its parent: widen the batch (pull more messages) and retry, rather than
+  treating it as data corruption.
+
+The simplest correct choice remains not declaring foreign keys on the replica at
+all — the source database already enforces them, and a replica's job is to converge
+on what the source accepted.
+
 ### Event payload
 
 ```json

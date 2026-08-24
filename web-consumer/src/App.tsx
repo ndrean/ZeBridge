@@ -1224,6 +1224,13 @@ export default function App() {
     // guarantee has to come from the writer always supplying the key.
     const inlinePk = pkCols.length === 1;
     const isPk = (name: string) => pkCols.includes(name);
+    // ⚠️ Deliberately NO foreign-key constraints, whatever the source schema declares —
+    // PROTOCOL.md §4 ("Ordering — what is guaranteed, and the foreign-key rule"): cross-
+    // table order is not guaranteed on the wire, so a child row can arrive before its
+    // parent. This replica converges through per-row PK upserts precisely because nothing
+    // here can reject the child; the source database is where referential integrity is
+    // enforced. A fork that adds FKs must also adopt the deferral rule at the CDC apply
+    // transaction below.
     const ddl = (c: { name: string; type: string }) =>
       `"${c.name}" ${c.type}` +
       (isPk(c.name) ? ' NOT NULL' : '') +
@@ -1868,6 +1875,14 @@ export default function App() {
             batchMsgs = [];
             try {
               await transaction(async (tx) => {
+                // PROTOCOL.md §4's foreign-key rule in executable form. A no-op today —
+                // applySchema declares no FKs — but a fork that adds them inherits the
+                // correct behavior: enforcement waits until this batch's COMMIT, so a
+                // child arriving before its parent inside one batch cannot fail the
+                // apply. Per-transaction on purpose (SQLite resets it at every COMMIT),
+                // and never set it to 0 mid-transaction — that discards the tracked
+                // violations and lets a genuinely broken batch commit.
+                await tx.sql(`PRAGMA defer_foreign_keys = ON;`);
                 for (const { table, ev } of toApply) {
                   await applyEvent(table, ev, tx.sql);
                 }

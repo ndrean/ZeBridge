@@ -8,26 +8,22 @@
   "public_tables": [
     "users",
     "counter_public",
-    "zebridge_gc_watermark"
+    "zebridge_gc_watermark",
+    "orders"
   ],
-
   "tenants": [
     "acme",
     "globex"
   ],
-
   "open_tenant": "_default",
-
   "cdc_streams": {
     "tenant_prefix": "CDC_",
     "public": "CDC_PUBLIC"
   },
-
   "init_streams": {
     "tenant_prefix": "INIT_",
     "public": "INIT_PUBLIC"
   },
-
   "subjects": {
     "cdc_prefix": "cdc",
     "init_prefix": "init",
@@ -39,7 +35,6 @@
     "mutation_ack_pattern": "mutation_ack.{[principal]s}.{[msg_id]s}",
     "snapshot_request": "snapshot.request",
     "snapshot_request_pattern": "snapshot.request.{[tenant]s}.{[table]s}",
-
     "snapshot_data_pattern": "init.snap.{[tenant]s}.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
     "snapshot_start_pattern": "init.snap.{[tenant]s}.start.{[table]s}",
     "snapshot_error_pattern": "init.snap.{[tenant]s}.error.{[table]s}",
