@@ -42,7 +42,7 @@ The migration is the right place to *make* these decisions (the Elixir emitter
 migration already sets `REPLICA IDENTITY` per table). Preflight is what makes a
 wrong decision visible rather than invisible.
 
-### 1.2 RENAME COLUMN silently nulls the renamed column, client-wide
+### 1.2 CLOSED — RENAME COLUMN travels as a `renamed` hint; clients keep their values
 
 The sharpest remaining gap. `ALTER TABLE ... RENAME COLUMN` is metadata-only in
 Postgres — **measured at 10.2 ms**, no table rewrite. The published schema goes
@@ -85,6 +85,35 @@ doesn't cleanly itemize which sub-clause fired). That diff, published as a
 PGlite has, since it's real Postgres. The gap is entirely upstream, in capturing
 and forwarding the rename; nothing about the client's own storage blocks doing
 this properly once that exists.
+
+**Built 2026-08-24, exactly as sketched above.** Three pieces, one per layer:
+
+- **Trigger** (`init.core.template.sql`): the columns capture gains `'attnum',
+  a.attnum` (bridge-facing, like `oid`/`typtype` — never forwarded to clients).
+  Where `last_def` is already in hand for the dedup check, a
+  `jsonb_to_recordset` self-join on attnum with differing names produces
+  `'renamed': {"new_name": "old_name"}`, merged into `schema_def`. The dedup
+  comparison strips `renamed` from **both** sides — it describes the transition,
+  not the shape, and comparing it would emit one spurious event on the first
+  unrelated DDL after a rename. A `last_def` written by the older trigger has no
+  attnum, joins nothing, and yields no hint — the first rename after the upgrade
+  degrades to the old drop+add behaviour, and every one after is detected.
+- **Bridge** (`event_processor.zig`): `renamed` passes through at the payload
+  root, next to `table` (PROTOCOL.md, schema payload). Boot schemas never carry
+  it; absent means nothing renamed.
+- **Client** (`App.tsx` `applySchema`): the add/drop diff is computed *as if*
+  the renames had already happened, and the honoured pairs (old name present
+  locally, new name not) run as `ALTER TABLE … RENAME COLUMN` — after the view
+  drop (§1.17), before the add/drop loops and the copy-based fallback, both of
+  which match columns by name and so see post-rename names.
+
+Verified live, both halves of the upgrade boundary: a rename whose previous
+event predated the trigger upgrade produced no hint (documented degradation);
+the next one produced `{"name": "full_name"}` in `zebridge_ddl_events`, the KV
+payload carried `"renamed":{"name":"full_name"}` at the root, and the client
+logged `~[full_name→name] via ALTER (rows preserved)` with no error. Value
+survival is SQLite's own RENAME COLUMN guarantee once that path is taken; what
+the hint changes is *which* path is taken.
 
 ### 1.3 CLOSED — RING_BUFFER_COUNT settled at 65536
 
@@ -149,7 +178,7 @@ built, and match the sketch exactly:
 
 `subscribeStreams()` (`App.tsx`) opens a JetStream `consumer.consume()` per stream
 with `deliver_policy: last > 0 ? StartSequence : All, opt_start_seq: last > 0 ? last
-+ 1 : undefined`. A client connecting after the fact replays from its own persisted
+- 1 : undefined`. A client connecting after the fact replays from its own persisted
 `_zebridge_stream_seq`, not just live traffic. The same call runs again on
 reconnect (§1.6a below), so a dropped connection resumes rather than silently
 missing events.
@@ -214,13 +243,25 @@ without disruption.
 
 ### 1.7 Deliberately not fixed
 
-- **`cdc_events_published` undercounts.** The counter increments only in the mutation
-  branches, so DDL/SCHEMA events are missing. I am ok: imprecise but rare
-  enough not to matter.
-- **pk lives inside the `sqlite` object** in the schema payload
-  (`{"sqlite":{"columns":[...],"pk":"id"}}`) rather than at the root. Arguably wrong
-  — pk is not SQLite-specific — but the browser client reads `val.sqlite.pk`, so
-  changing it is a breaking wire change for no functional gain.
+- **`cdc_events_published` undercounts — resolved sideways (2026-08-24).** The counter
+  increments only in the row-event branches, so DDL/SCHEMA publishes were invisible.
+  Folding them in was the wrong fix: that counter's value is *trusted to equal row
+  events delivered* — the README burst method and `speed.py` both poll it for exact row
+  counts, and rare schema traffic mixed in would skew exactly those measurements. So
+  schema publishes now have their own counter, `bridge_schema_events_published_total`
+  (DDL schemas, suspensions, drop tombstones), incremented at the same
+  publish-acknowledged point as the CDC one. Neither counter is imprecise any more, and
+  neither's meaning moved.
+- **pk lived inside the `sqlite` object — resolved, root-only (2026-08-24).** The key
+  comes from `pg_index`, a fact about the table, not a dialect — yet it lived only in
+  the `sqlite` block because the SQLite clients consumed it first; a PGlite-style
+  client building from the `pg` block would have had to reach into another dialect's
+  block for its key. `pk`/`pk_columns` now live **at the root, and only there**, next
+  to the other dialect-independent facts. A duplicated-in-both interim was considered
+  and rejected: two copies of one fact eventually differ, and with no installed base
+  yet there is nothing a duplicate would protect. Both in-repo readers moved in the
+  same change (web `applySchema`, Flutter `db_manager.dart`) — this IS a wire break,
+  taken deliberately while breaking is still free.
 
 ---
 
@@ -518,41 +559,31 @@ as "unknown, might be writable." Fixed: both `publishSuspension` copies now hard
 unwritable, regardless of grant, since no CDC event will ever confirm or correct an
 optimistic write to it).
 
-### 1.10 `ColumnView` could store lengths only — 12 B → 8 B
+### 1.10 CLOSED — `ColumnView` reached 8 bytes, by packing, not by dropping offsets
 
-`CDCEvent.ColumnView` is replicated `max_columns × RING_BUFFER_COUNT` times, so its width
-is a direct multiplier on startup memory. It currently holds
-`{name_len: u8, name_offset: u32, value_tag, value_len: u32}` = **12 bytes**.
+Superseded by `44a941d` (2026-08-21): `CDCEvent.ColumnView` is now a `packed struct`
+of `{name_len: u8, name_offset: u24, value_tag (u8-backed), value_len: u24}` — exactly
+64 bits, 8 bytes against the previous 12, a third off the dominant
+`RING_BUFFER_COUNT × max_columns` memory term.
 
-⚠️ **Narrowing the field does not help, and this was measured rather than assumed.**
-Unpacked, every integer from `u17` to `u32` occupies 4 bytes — `@sizeOf(u21) == @sizeOf(u32)`
-— so `u21` is free *and* pointless. The only smaller step is `u16` at 2 bytes, which caps
-the offset at 65535 and is exactly the wrap bug of §2.10. A `packed struct` does reach 8
-bytes, but puts a shift+mask on every column access in the hottest loop.
+Both of this section's original claims aged badly, in instructive ways:
 
-The saving is available by storing **less**, not narrower. `addColumn` lays each column
-down contiguously, so the whole offset chain is derivable from the lengths:
+- **"A packed struct puts a shift+mask on every column access"** — only when fields
+  straddle byte boundaries. These widths were *chosen* so every field starts at a bit
+  offset that is a multiple of 8, and access compiles to a load plus at most one
+  register shift / hardware bitfield-insert — verified by disassembly (the struct's own
+  doc comment). Now enforced by a `comptime` block asserting the 64-bit size and the
+  byte alignment of every field, so a reorder or re-widening fails the build instead of
+  silently getting slower.
+- **The store-lengths-only iterator design was never needed.** It bought the same 8
+  bytes at the cost of making the array sequential-only — the packed struct keeps
+  `columns[i]` random-access and needed no decode-path refactor.
 
-```
-name_offset[0] = 0
-name_offset[i] = name_offset[i-1] + name_len[i-1] + value_len[i-1]
-```
-
-Dropping `name_offset` gives `{name_len, value_tag, value_len}` = **8 bytes**, measured —
-the packed struct's saving with no bit manipulation. (`value_offset` was already removed
-on the same reasoning, §2.10.) All three production readers already iterate
-`columns[0..column_count]` or take `columns[0]`, so a running offset drops straight in.
-
-⚠️ **The catch is that it makes the array sequential-only.** `columns[i]` stops being
-meaningful standalone, and a later random access would silently read the wrong bytes —
-the same failure class as the `u16` wrap. So it should ship as an **iterator** yielding
-`(name, value)` slices, with no offset accessor at all, making the contract structural
-instead of a comment.
-
-**Not done because the ratio is poor.** Sizing `max_columns` to reality (512 → 128) took
-metadata from 1614 MB to 462 MB on a 262,144-slot ring; this would take it to 334 MB. An
-order of magnitude less win, for a refactor of the decode path. Worth doing only if the
-bridge is being pushed into a genuinely memory-tight deployment.
+The `u24`s are byte offsets into `data_buffer`, sized to its hard ceiling
+(`absolute_max_event_data_buffer_log2` = 24 → 16 MiB) — not column counts. The
+column count is `column_count: u16` with `MAX_COLUMNS` clamped to 8–1600
+(PostgreSQL's own table-width cap) in `args.zig`. And the `u16→u24` widening of
+`name_offset` is §2.10's fix riding along: `u16` was the silent wide-row corruption.
 
 ### 1.9 CLOSED — a durable client outbox, and how optimistic apply reconciles with CDC
 
@@ -1350,12 +1381,16 @@ one VPS (§0 elsewhere in this file), so that part is already small. It is plaus
 write/fsync time on the NATS side for a file-backed JetStream stream, which colocation does
 not shrink at all.
 
-Not yet measured, so not yet built. Before writing any pipelining code: log the time between
-issuing a publish and its ack returning, for real batches under real load. If that number is
-a few ms and batches are frequent, this is a real win. If it is sub-millisecond, it is not
-worth the added complexity. Judge any resulting change the same way every other perf change
-in this file is judged — against the README burst benchmark, by iters delta, not by
-intuition about which side "must" be slow.
+Not yet built; **the measurement it was gated on now exists** (2026-08-24).
+`batch_publisher.timedPublish` times every publish→PubAck round trip: summed on
+`/metrics` as `bridge_nats_publish_ack_seconds_total` next to
+`bridge_nats_publishes_total` (mean = quotient, windows = scrape deltas), and
+debug-logged per call. First idle-boot reading: 15 publishes, 19.5 ms total —
+**~1.3 ms mean ack wait**, which is in "a few ms × frequent batches = real win"
+territory, not sub-millisecond noise. Still to do before building: read the same
+number under the README burst load (the ack wait under fsync pressure is the one
+that matters), and judge any pipelining change against the burst benchmark by
+iters delta, not by intuition about which side "must" be slow.
 
 ### 1.14 CLOSED — `web-consumer`'s schema watch no longer uses `kv.watch()`; it is a pull consumer
 
@@ -1363,7 +1398,7 @@ The leak's mechanism, confirmed in `@nats-io/jetstream` 3.4.0 and reproduced liv
 (`scratchpad/watchprobe.mjs`, a Node script that hands `getPushConsumer` exactly what
 `kv.watch()` does):
 
-* `kv.js`'s `_buildCC` returns a config carrying `filter_subject` and `deliver_policy`.
+- `kv.js`'s `_buildCC` returns a config carrying `filter_subject` and `deliver_policy`.
   `getPushConsumer(stream, cc)` (`jsmstream_api.js:62`) is overloaded on its second
   argument: a string binds an existing consumer, an object that satisfies
   `isOrderedPushConsumerOptions` (`types.js:22` — true for *any* object with
@@ -1372,14 +1407,14 @@ The leak's mechanism, confirmed in `@nats-io/jetstream` 3.4.0 and reproduced liv
   is overwritten with `oc_<nuid>_1` (`jsmstream_api.js:115`), and the 5s
   `idle_heartbeat` `kv.js` asks for is overwritten with 30s (`:104`). The probe confirms
   it: `ordered=true`, name `oc_…_1`, `hb=30s`.
-* An ordered consumer heals by replacement: `reset()` (`pushconsumer.js:64`) deletes
+- An ordered consumer heals by replacement: `reset()` (`pushconsumer.js:64`) deletes
   the current consumer and creates `<prefix>_<n+1>`. It fires on two missed heartbeats
   (`IdleHeartbeatMonitor`, `maxOut: 2`, checked every 30s) or on a delivery-sequence gap.
   The delete is denied here — `$JS.API.CONSUMER.DELETE` is withheld from clients on
   purpose, and that stays — so each reset leaves the old consumer to its 5-minute
   inactivity threshold. `reset()` also never clears the monitor's `missed` counter, so
   once heartbeats stop arriving **every** 30s tick resets again: the cadence observed.
-* Flow control is on (`flow_control: true`) but alice has no `$JS.FC.>` publish grant,
+- Flow control is on (`flow_control: true`) but alice has no `$JS.FC.>` publish grant,
   so a flow-control reply would also be a Publish Violation. Not the trigger on an idle
   bucket, but the same shape of problem: the library assumes grants the server withholds.
 
@@ -1408,20 +1443,29 @@ COLUMN` applied 1s after the DDL, `nats consumer ls KV_schemas` shows one consum
 page (a random name, no `oc_` prefix), and zero Publish Violations in the server log.
 `Kvm`/`kv.get()` stay in use for direct reads — only the watch changed.
 
-### 1.16 `decode_integrity.py` has the same stale-`INIT`-stream bug `snapshot.py` had
+### 1.16 CLOSED — `decode_integrity.py` caught up with the tenant split, and with §2.19
 
-`zb.TOPOLOGY["streams"]["init"]` is `"INIT"` — a generic label in `topology.json`, not
-a real stream name; only `INIT_ACME`/`INIT_GLOBEX`/`INIT_PUBLIC` exist since §1.12's
-tenant split. `decode_integrity.py:265` still passes it directly to
-`js.pull_subscribe(..., stream=...)`, same shape of bug already found and fixed in
-`snapshot.py` this session (§1.6/earlier work). Confirmed live: NATS server log shows
-`Publish Violation - Subject "$JS.API.CONSUMER.CREATE.INIT...."` for a real client
-connected as alice — the request never reaches a real stream. Fix is the same pattern
-already applied to `snapshot.py`: resolve the correct `INIT_<TENANT>`/`INIT_PUBLIC`
-stream name from `topology.json`, and add the tenant token to the chunk-filter subject
-(`init.snap.<tenant>.<table>.<snapshot_id>.>`, not `init.snap.<table>.<snapshot_id>.>`).
-Not yet applied — found right before a deliberate infra teardown, no time to verify a
-fix in the same session.
+The stale-`INIT`-stream bug, fixed as prescribed (same pattern as `snapshot.py`): the
+snapshot path now resolves the real stream (`INIT_PUBLIC` — `decode_fixture` is a public
+table, so its tenant is the open tenant), keys the descriptor as `<tenant>.<table>`,
+requests on `snapshot.request.<tenant>.<table>`, and filters chunks on
+`init.snap.<tenant>.<table>.<id>.>`.
+
+Fixing that exposed a second staleness the Publish Violation had been masking: the CDC
+half **also** failed, because since §2.19 the bridge refuses any table that is neither
+tenant-scoped nor in **topology.json's** `public_tables` — a check younger than this
+scenario. The script registered its fixture in two places (Postgres:
+`zebridge_public_tables` + publication; NATS: `CDC_PUBLIC`'s subjects) but not the
+third, so its own bridge dropped every event at the source
+(`REFUSING 'decode_fixture': not ... in topology.json's public_tables`). Fixed
+scenario-side, since the bridge is behaving exactly as §2.19 intends: the script hands
+*its own* bridge a temp topology (the repo's file plus the fixture) via
+`TOPOLOGY_PATH`, never touching the deployed one. Onboarding a public table takes three
+registrations, not two — worth remembering next time a fixture table "publishes fine"
+into nothing.
+
+Verified: both acts pass, 400/400 rows byte-for-byte on the CDC path and the snapshot
+path (label, jsonb, numeric, enum).
 
 ### 1.17 CLOSED — `applySchema` failed on a dropped column while `<table>_view` existed
 
@@ -1711,6 +1755,33 @@ restart, but it now correctly *stays* suspended afterward, for `no_cdc_subject`
 `topology.json` changed and the bridge restarted, defeating the "no restart
 needed" point that act is actually making (about the no-PK refusal, not about
 CDC routing).
+
+### 2.20 Boot schemas could not change shape across a quick restart, and composite keys never survived boot at all
+
+Found while verifying the root-only `pk` move (§1.7): the new bridge booted, logged
+"Boot schema published to KV" for every table — and the KV kept the *previous* boot's
+payload. Not a race, not a stale binary (checked: process younger than the binary, new
+SQL present in `strings`): the boot publisher's `Nats-Msg-Id` was `schema-boot-<table>`,
+identical on every boot, so any restart inside the stream's duplicate window had its
+boot schemas **silently deduplicated by JetStream** — acked, logged as published, never
+stored. Exactly the failure mode that makes "deploy a schema-shape change, restart the
+bridge, client sees nothing" a mystery. The DDL path never had this: its ids carry
+`wal_end`. Boot ids now carry the boot LSN (`schema-boot-<table>-<lsn>`), unique per
+boot, still idempotent within one.
+
+The same verification exposed a second boot-only gap: `publishBootSchemas`' key query
+filtered on `array_length(i.indkey, 1) = 1` and emitted no `pk_columns`, so a
+**composite-key table that saw no DDL since bridge start** published `pk: null` and
+nothing else — the client would build it with no primary key and every upsert's
+`ON CONFLICT` would misfire. The DDL path has carried the full key since the composite
+work; boot now runs the same ordered `unnest(indkey)` query and emits the same
+`pk`/`pk_columns` (at the root, per §1.7).
+
+Lesson: the payload has **three** producers — `publishBootSchemas` (boot),
+`packDdlToSlot` (DDL), and the suspension publishers — and a wire-shape change is not
+done until each is checked. The first two must emit identical shapes (`App.tsx` relies
+on it); this is the second time boot lagged DDL (`required` had the same history, per
+the boot query's own comment).
 
 ## 3. PostgreSQL behaviours worth remembering
 
@@ -2110,6 +2181,7 @@ zig build test-nats
 ### Tables
 
 #### Server-Side Tables (`init.*.sql`)
+
 | Table Name | Role / Description |
 | :--- | :--- |
 | `zebridge_ddl_events` | The DDL transport mechanism. Because PostgreSQL's logical replication (WAL) natively ignores DDL statements (like `ALTER TABLE`), ZeBridge relies on event triggers (`zebridge_ddl_trigger_fn` and `zebridge_drop_trigger_fn`) to intercept schema changes and log them as `INSERT`s in this table. These `INSERT`s *are* emitted via the WAL, allowing the bridge to read schema changes in strict stream order with CDC data and publish them to NATS KV. |
@@ -2118,6 +2190,7 @@ zig build test-nats
 | `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
 
 #### Client-Side Tables (`web-consumer/src/App.tsx`)
+
 | Table Name | Role / Description |
 | :--- | :--- |
 | `_zebridge_outbox` | Holds optimistic edge writes sent by the client that are pending a confirmation/verdict from NATS and the bridge. |
@@ -2151,7 +2224,7 @@ The functions are divided into read-only configurations, edge-write guard config
 | `zebridge_bump_version()` | Write trigger ensuring that any write omitting the version column (e.g., `updated_at`) gets appropriately stamped with the current timestamp. |
 | `zebridge_soft_delete()` | Write trigger converting physical `DELETE` statements on tables with a tombstone column into soft-deleting `UPDATE` operations. |
 | `zebridge_guard_tenant()` | Write trigger enforcing that a row's tenant is present and valid against NATS subject parameters (no whitespace or wildcards). Discards or falls back to the writer's mapped tenant. |
-| `zebridge_scope_writes_by_tenant()`| Multi-tenant configuration for edge writes. Sets up RLS and forces the creation of a unique `REPLICA IDENTITY` index (combining PK and tenant) so PostgreSQL routes `DELETE`s properly over CDC. |
+| `zebridge_scope_writes_by_tenant()` | Multi-tenant configuration for edge writes. Sets up RLS and forces the creation of a unique `REPLICA IDENTITY` index (combining PK and tenant) so PostgreSQL routes `DELETE`s properly over CDC. |
 | `zebridge_scope_publication_to_one_tenant()` | Single-tenant alternative that uses a PostgreSQL publication row filter (`WHERE tenant = 'acme'`) to pin an entire publication to a specific tenant value. |
 | `zebridge_audit_write_guards()` | Audits all tables and reports which ones possess ZeBridge's write guard triggers. |
 | `zebridge_audit_sweeper()` | Checks if the internal sweeper principal (`zb_sweeper`) has any unreachable tenants, thereby helping track tenants whose tombstones won't get collected. |
@@ -2178,11 +2251,12 @@ The following constants in `src/config.zig` are declared but never referenced by
 ZeBridge's runtime publisher is entirely dynamic and does **not** rely on the `tenants` array in `topology.json` during operation. The `topology.json` tenant list is currently only used for a boot-time pre-flight check (to ensure streams exist before starting) and by the `nats-init` script to physically create the streams.
 
 When migrating to a **JWT / Operator Authentication** model, multi-tenancy can be managed dynamically with zero config reloads or bridge restarts:
+
 1. **Backend provisions stream:** The application backend dynamically creates the `CDC_<TENANT>` and `INIT_<TENANT>` JetStream streams via the NATS API.
 2. **Backend mints JWT:** The backend embeds the exact tenant boundaries (`cdc.<tenant>.>`) into the short-lived NATS user JWT.
 3. **Link User in DB:** A new mapping is inserted into `zebridge_user_tenants`.
 
-Once these steps occur, ZeBridge seamlessly picks up the new `tenant_id` from the Postgres WAL row, dynamically constructs the `cdc.<tenant>.<table>.<op>` subject, and publishes it. Since the stream was already created in JetStream by the backend, the data lands perfectly. 
+Once these steps occur, ZeBridge seamlessly picks up the new `tenant_id` from the Postgres WAL row, dynamically constructs the `cdc.<tenant>.<table>.<op>` subject, and publishes it. Since the stream was already created in JetStream by the backend, the data lands perfectly.
 
 > [!NOTE]
 > **To Be Tested:** This fully dynamic mechanism needs to be empirically verified. The test should involve manually provisioning a new tenant stream in NATS, inserting a new user/tenant mapping row directly into `zebridge_user_tenants` (e.g., a new tenant that is intentionally omitted from `topology.json`), and verifying that ZeBridge routes and publishes the runtime CDC events to the new stream correctly without any restarts.

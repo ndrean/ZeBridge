@@ -1075,6 +1075,34 @@ pub const EventProcessor = struct {
         // in one testable place (schema_mapper.zig) rather than in plpgsql.
         var json_str: std.ArrayList(u8) = .empty;
 
+        // RENAME COLUMN hints (§1.2), forwarded at the root like `table`: they describe
+        // the transition between two schema generations, not either dialect's shape.
+        // `{"new_name": "old_name"}`, produced by the event trigger's attnum diff.
+        // Without this a client reads a rename as drop+add and nulls every existing
+        // value of the renamed column. Absent on boot schemas and on any event that
+        // renamed nothing — same absent-means-nothing convention as `required`.
+        var renamed_json: []const u8 = "";
+        if (parsed.value.object.get("renamed")) |rv| {
+            if (rv == .object and rv.object.count() > 0) {
+                var rbuf: std.ArrayList(u8) = .empty;
+                try rbuf.appendSlice(arena, "\"renamed\":{");
+                var it = rv.object.iterator();
+                var first = true;
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.* != .string) continue;
+                    if (!first) try rbuf.appendSlice(arena, ",");
+                    first = false;
+                    try rbuf.appendSlice(arena, try std.fmt.allocPrint(
+                        arena,
+                        "\"{s}\":\"{s}\"",
+                        .{ entry.key_ptr.*, entry.value_ptr.*.string },
+                    ));
+                }
+                try rbuf.appendSlice(arena, "},");
+                renamed_json = rbuf.items;
+            }
+        }
+
         // Name the table in the payload as well as the KV key. The key stays
         // authoritative, but every other payload in the protocol is self-describing
         // (CDC events, snapshot chunks, and this schema's own tombstone all carry
@@ -1082,8 +1110,8 @@ pub const EventProcessor = struct {
         // is useless once it travels without its key (logs, caches, forwarding).
         try json_str.appendSlice(arena, try std.fmt.allocPrint(
             arena,
-            "{{\"table\":\"{s}\",\"pg\":{{\"columns\":[",
-            .{clean_table},
+            "{{\"table\":\"{s}\",{s}\"pg\":{{\"columns\":[",
+            .{ clean_table, renamed_json },
         ));
         // Column names, kept so the write contract can say whether the configured
         // version/tombstone columns actually exist on this table.
@@ -1221,11 +1249,24 @@ pub const EventProcessor = struct {
             );
         }
 
-        // `pk` stays a single string for the common case (existing clients read it
-        // directly), and is null for a composite key — a client cannot identify rows
-        // from one column of a two-column key, so claiming one would be worse than
-        // admitting none. `pk_columns` always carries the whole key, so a client that
-        // understands composites has what it needs.
+        // The key is NOT in here: it lives at the root (below). It used to sit inside
+        // this object because the SQLite clients consumed it first, which left a
+        // PGlite-style client reaching into another dialect's block for a fact about
+        // the table. One copy, one home — changed while there is no installed base to
+        // keep the duplicate alive for.
+
+        // Close the sqlite object, then attach the LSN at the root. Clients need the
+        // ordering key: KV and CDC are independent subscriptions, so without it a
+        // consumer cannot tell whether a CDC event precedes or follows this schema
+        // and the bridge's ordering guarantee stops at the wire.
+        try json_str.appendSlice(arena, "}");
+
+        // The key, at the root — where every other dialect-independent fact lives. It
+        // comes from pg_index, a fact about the table, not about either dialect. `pk`
+        // stays a single string for the common case and is null for a composite key —
+        // a client cannot identify rows from one column of a two-column key, so
+        // claiming one would be worse than admitting none. `pk_columns` always carries
+        // the whole key, in key order.
         if (pk_cols.len == 1 and pk_cols[0] == .string) {
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
@@ -1235,7 +1276,6 @@ pub const EventProcessor = struct {
         } else {
             try json_str.appendSlice(arena, ",\"pk\":null");
         }
-
         try json_str.appendSlice(arena, ",\"pk_columns\":[");
         for (pk_cols, 0..) |col, i| {
             if (col != .string) continue;
@@ -1243,12 +1283,6 @@ pub const EventProcessor = struct {
             try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{col.string}));
         }
         try json_str.appendSlice(arena, "]");
-
-        // Close the sqlite object, then attach the LSN at the root. Clients need the
-        // ordering key: KV and CDC are independent subscriptions, so without it a
-        // consumer cannot tell whether a CDC event precedes or follows this schema
-        // and the bridge's ordering guarantee stops at the wire.
-        try json_str.appendSlice(arena, "}");
         try json_str.appendSlice(arena, try std.fmt.allocPrint(
             arena,
             ",\"replica_identity\":\"{s}\"",
@@ -1616,29 +1650,52 @@ pub const EventProcessor = struct {
             }
             try json_str.appendSlice(arena, "] ");
             
+            // Close the sqlite object first: like the DDL path, the key lives at the
+            // ROOT — it is a fact about the table (pg_index), not the SQLite dialect.
+            try json_str.appendSlice(arena, "}");
+
+            // ⚠️ The WHOLE key, in key order — this used to filter on
+            // `array_length(i.indkey, 1) = 1`, so a composite-key table that saw no DDL
+            // since bridge start published `pk: null` and no `pk_columns` at all: a
+            // client would build it with no primary key and every upsert's ON CONFLICT
+            // would misfire. The DDL path already carried the full key; boot now
+            // matches it.
             const pk_query = try utils.allocPrintZ(
                 arena,
                 \\SELECT a.attname
                 \\FROM pg_index i
-                \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                \\JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
+                \\JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
                 \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
                 \\  AND i.indisprimary
-                \\  AND array_length(i.indkey, 1) = 1;
+                \\ORDER BY k.ord;
             ,
                 .{ "public", clean_table },
             );
             const pk_result = c.PQexec(conn, pk_query.ptr);
             defer c.PQclear(pk_result);
-            
+
             // Emit pk unconditionally — null when there is no single-column primary
             // key. See the DDL path for why omission is not an acceptable encoding.
-            if (c.PQresultStatus(pk_result) == c.PGRES_TUPLES_OK and c.PQntuples(pk_result) > 0) {
+            const pk_rows: i32 = if (c.PQresultStatus(pk_result) == c.PGRES_TUPLES_OK) c.PQntuples(pk_result) else 0;
+            if (pk_rows == 1) {
                 const pk_name = std.mem.span(c.PQgetvalue(pk_result, 0, 0));
-                const pk_json = try std.fmt.allocPrint(arena, ",\"pk\":\"{s}\"", .{pk_name});
-                try json_str.appendSlice(arena, pk_json);
+                try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"pk\":\"{s}\"", .{pk_name}));
             } else {
                 try json_str.appendSlice(arena, ",\"pk\":null");
             }
+            try json_str.appendSlice(arena, ",\"pk_columns\":[");
+            var pk_i: i32 = 0;
+            while (pk_i < pk_rows) : (pk_i += 1) {
+                if (pk_i > 0) try json_str.appendSlice(arena, ",");
+                try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                    arena,
+                    "\"{s}\"",
+                    .{std.mem.span(c.PQgetvalue(pk_result, pk_i, 0))},
+                ));
+            }
+            try json_str.appendSlice(arena, "]");
+
             // Replica identity, so a boot schema carries the same fields as a
             // DDL-driven one. A client must not have to know which path produced its
             // schema in order to know what UPDATE/DELETE will contain.
@@ -1664,7 +1721,6 @@ pub const EventProcessor = struct {
             // wal_end to inherit. Stamp the current WAL position: the schema is valid
             // from here, which lets a client compare it against CDC lsns the same way
             // it would a DDL-driven schema.
-            try json_str.appendSlice(arena, "}");
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
                 ",\"replica_identity\":\"{s}\"",
@@ -1674,7 +1730,12 @@ pub const EventProcessor = struct {
             try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{boot_lsn}));
 
             const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
-            const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}", .{clean_table});
+            // ⚠️ Suffixed with the boot LSN, like the DDL path's `schema-{table}-{wal_end}`.
+            // A bare `schema-boot-<table>` is the same Nats-Msg-Id on every boot, so a
+            // bridge restart inside the stream's duplicate window had its boot schemas
+            // silently deduplicated — the KV kept the previous boot's value, and a
+            // schema-shape change deployed with a quick restart never reached clients.
+            const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}-{d}", .{ clean_table, boot_lsn });
             
             var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
             try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });

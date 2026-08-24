@@ -487,6 +487,7 @@ DECLARE
     cmd_tag     text   := 'UNKNOWN';
     schema_json jsonb;
     last_def    jsonb;
+    renames     jsonb;
 BEGIN
     -- Pass 1: collect the distinct tables this command touched.
     -- object_identity is 'public.users' for a table but 'public.users.email' for a
@@ -536,7 +537,15 @@ BEGIN
                               'has_default', (c.column_default IS NOT NULL),
                               'required', (c.is_nullable = 'NO' AND c.column_default IS NULL),
                               'oid', a.atttypid::int,
-                              'typtype', t.typtype
+                              'typtype', t.typtype,
+                              -- `attnum` is what survives a RENAME COLUMN: Postgres
+                              -- renames by updating pg_attribute.attname alone, never
+                              -- attnum (which is also never reused — a dropped column
+                              -- keeps its attnum with attisdropped). Same-attnum,
+                              -- different-name between two events IS the rename, with
+                              -- no need to parse ALTER TABLE's command tag. For the
+                              -- BRIDGE like oid/typtype; never forwarded to clients.
+                              'attnum', a.attnum
                             ) ORDER BY c.ordinal_position)
                      FROM information_schema.columns c
                      JOIN pg_attribute a
@@ -599,7 +608,27 @@ BEGIN
             ORDER BY e.id DESC
             LIMIT 1;
 
-            IF last_def IS DISTINCT FROM schema_json THEN
+            -- RENAME COLUMN detection (§1.2): same attnum, different name between this
+            -- schema and the previous event's. Without this hint a rename reads as
+            -- drop+add and the client nulls every existing value of the renamed column.
+            -- Emitted as {"new_name": "old_name"}. An older last_def without attnum
+            -- joins nothing and yields NULL — renames are simply not detected across
+            -- the trigger upgrade, which is the pre-existing behaviour.
+            renames := NULL;
+            IF last_def IS NOT NULL THEN
+                SELECT jsonb_object_agg(n.name, o.name) INTO renames
+                FROM jsonb_to_recordset(schema_json -> 'columns') AS n(name text, attnum int)
+                JOIN jsonb_to_recordset(last_def -> 'columns') AS o(name text, attnum int)
+                  ON n.attnum = o.attnum AND n.name <> o.name;
+            END IF;
+            IF renames IS NOT NULL THEN
+                schema_json := schema_json || jsonb_build_object('renamed', renames);
+            END IF;
+
+            -- Compare with 'renamed' stripped from BOTH sides: it describes the
+            -- transition, not the shape. Comparing it too would emit one spurious
+            -- schema event on the first unrelated DDL after a rename.
+            IF (last_def - 'renamed') IS DISTINCT FROM (schema_json - 'renamed') THEN
                 INSERT INTO public.zebridge_ddl_events
                        (schema_name, table_name, command_tag, schema_def)
                 VALUES ('public', tbl, cmd_tag, schema_json);

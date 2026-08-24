@@ -1092,7 +1092,7 @@ export default function App() {
             // Schema is always JSON, never msgpack — a fixed bridge-side rule, not a
             // per-deployment choice (NOTES.md/PROTOCOL.md). No decode() attempt, no
             // double-unwrap: both the boot/DDL path and the on-demand init.schema
-            // responder now emit the identical {table, pg, sqlite, pk} shape.
+            // responder now emit the identical {table, pg, sqlite, pk, pk_columns} shape.
             const val: any = JSON.parse(td.decode(entry.value));
 
             // Tombstone: the bridge publishes {"dropped":true} rather than removing the
@@ -1159,12 +1159,14 @@ export default function App() {
    */
   const applySchema = async (table: string, val: any) => {
     // `pk_columns` is authoritative and always present; `pk` is the legacy
-    // single-column form and is null for a composite key. Falling back keeps this
-    // working against a bridge that predates pk_columns.
-    const pkCols: string[] = Array.isArray(val.sqlite.pk_columns)
-      ? val.sqlite.pk_columns
-      : val.sqlite.pk
-        ? [val.sqlite.pk]
+    // single-column form and is null for a composite key. Both live at the payload
+    // ROOT — the key is a fact about the table, not the SQLite dialect (it used to sit
+    // inside `val.sqlite`; moved while there is no installed base to keep a duplicate
+    // alive for).
+    const pkCols: string[] = Array.isArray(val.pk_columns)
+      ? val.pk_columns
+      : val.pk
+        ? [val.pk]
         : [];
     const cols: { name: string; type: string }[] = val.sqlite.columns;
     const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
@@ -1183,8 +1185,24 @@ export default function App() {
     const names = cols.map((c) => c.name);
 
     const existing = syncedTables.get(table);
-    const added = existing ? names.filter((n) => !existing.columns.includes(n)) : [];
-    const removed = existing ? existing.columns.filter((n) => !names.includes(n)) : [];
+
+    // RENAME COLUMN hints from the bridge (§1.2): `val.renamed` maps new name → old
+    // name, derived from pg_attribute.attnum (which survives a rename) by the DDL
+    // trigger. Applied as a local RENAME below so existing values survive; without the
+    // hint a rename reads as drop+add and every value of the column resets to NULL.
+    // Only pairs the local table can actually honour: old name present, new name not.
+    const renames: [string, string][] = existing
+    ? Object.entries((val.renamed ?? {}) as Record<string, string>)
+        .filter(([to, from]) => existing.columns.includes(from) && !existing.columns.includes(to))
+        .map(([to, from]) => [from, to])
+    : [];
+    // The diff is computed as if the renames had already happened, so a renamed column
+    // is "unchanged" rather than one removed + one added.
+    const effectiveCols = existing
+      ? existing.columns.map((n) => renames.find(([from]) => from === n)?.[1] ?? n)
+      : [];
+    const added = existing ? names.filter((n) => !effectiveCols.includes(n)) : [];
+    const removed = existing ? effectiveCols.filter((n) => !names.includes(n)) : [];
 
     // A single-column key can be declared inline; a composite one must be a
     // table-level constraint, so the column DDL stays bare and the constraint is
@@ -1242,7 +1260,7 @@ export default function App() {
         await sql(`DROP TABLE IF EXISTS ${table};`);
         await sql(`CREATE TABLE ${table} (${cols.map(ddl).join(', ')}${tableConstraint});`);
         appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
-      } else if (added.length === 0 && removed.length === 0) {
+      } else if (added.length === 0 && removed.length === 0 && renames.length === 0) {
         syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
         refreshTableNames();
         reach('migrated');
@@ -1255,6 +1273,12 @@ export default function App() {
         // recreated against the new column set below, so nothing is lost by dropping it
         // early; `ADD COLUMN` only worked because it never touches a referenced column.
         await sql(`DROP VIEW IF EXISTS ${table}_view;`);
+        // Renames first, so the add/drop loops below and the copy-based fallback (which
+        // matches columns by name) both see the post-rename names. SQLite has RENAME
+        // COLUMN since 3.25.
+        for (const [from, to] of renames) {
+          await sql(`ALTER TABLE ${table} RENAME COLUMN "${from}" TO "${to}";`);
+        }
         // Apply in place where SQLite allows it. DROP COLUMN exists since 3.35 and
         // preserves every remaining row — a removed column is not a reason to discard
         // the replica. SQLite still refuses to drop a PK/UNIQUE/indexed column, so
@@ -1268,6 +1292,7 @@ export default function App() {
             await sql(`ALTER TABLE ${table} ADD COLUMN "${name}" ${type};`);
           }
           const parts = [
+            renames.length ? `~[${renames.map(([f, t]) => `${f}→${t}`).join(', ')}]` : null,
             added.length ? `+[${added.join(', ')}]` : null,
             removed.length ? `-[${removed.join(', ')}]` : null,
           ].filter(Boolean).join(' ');

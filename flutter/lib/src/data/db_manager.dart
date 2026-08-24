@@ -64,7 +64,10 @@ class DbManager {
   Future<void> applySchema(String table, Map<String, dynamic> val, Map<String, dynamic>? existingTableState) async {
     if (_db == null || !_db!.isOpen) return;
     final sqlite = val['sqlite'];
-    final pkCols = (sqlite['pk_columns'] as List<dynamic>?)?.cast<String>() ?? (sqlite['pk'] != null ? [sqlite['pk'] as String] : <String>[]);
+    // Read at the payload ROOT: the key is a fact about the table, not the SQLite
+    // dialect. It used to live inside val['sqlite']; moved while there is no installed
+    // base to keep a duplicate alive for.
+    final pkCols = (val['pk_columns'] as List<dynamic>?)?.cast<String>() ?? (val['pk'] != null ? [val['pk'] as String] : <String>[]);
     final cols = (sqlite['columns'] as List<dynamic>).cast<Map<String, dynamic>>();
     
     final names = cols.map((c) => c['name'] as String).toList();

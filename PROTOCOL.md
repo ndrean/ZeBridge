@@ -203,15 +203,29 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 {
   "table":  "users",
   "pg":     { "columns": [ { "name": "id", "type": "bigint" }, … ] },
-  "sqlite": { "columns": [ { "name": "id", "type": "INTEGER" }, … ],
-              "pk": "id" },
+  "sqlite": { "columns": [ { "name": "id", "type": "INTEGER" }, … ] },
+  "pk": "id",
+  "pk_columns": ["id"],
   "lsn": 25429824
 }
 ```
 
-Root keys are `table`, `pg`, `sqlite`, `lsn`, plus the **write contract**:
-`version_column`, `tombstone_column`, `tenant_column`, `writable`,
+Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, plus the **write
+contract**: `version_column`, `tombstone_column`, `tenant_column`, `writable`,
 `mutation_timeout_ms` and `replica_identity`.
+
+`pk_columns` is the whole primary key in key order; `pk` is the legacy single-column
+form and is `null` for a composite key. Both live at the root and only there: the key
+is a fact about the table (`pg_index`), not about a dialect, so it sits with the other
+dialect-independent facts rather than inside `sqlite` or `pg`.
+
+`renamed` appears only on the schema event produced by an
+`ALTER TABLE … RENAME COLUMN`, mapping each new column name to its old one
+(`{"email_address": "email"}`). It is derived server-side from
+`pg_attribute.attnum`, which a rename never changes. A client applies it as a local
+`RENAME COLUMN` before diffing the column lists, so existing values survive; a client
+that ignores it falls back to reading the rename as drop-plus-add, which keeps the
+table but resets that column's values.
 
 `version_column` is the column to send back as `version` (§7.3); `tombstone_column` is
 `null` when the table deletes physically rather than softly (§7.5). `tenant_column` is the

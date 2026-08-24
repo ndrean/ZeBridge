@@ -190,6 +190,18 @@ pub const CDCEvent = struct {
         pub inline fn valueOffset(self: ColumnView) u32 {
             return @as(u32, self.name_offset) + self.name_len;
         }
+
+        // The doc comment above says reordering or re-widening these fields loses the
+        // byte-boundary property *silently* — so make it loud instead. Every field must
+        // start on a byte boundary and the whole struct must stay 64 bits, or the
+        // packed layout stops compiling to plain loads/stores.
+        comptime {
+            std.debug.assert(@bitSizeOf(ColumnView) == 64);
+            std.debug.assert(@bitOffsetOf(ColumnView, "name_len") % 8 == 0);
+            std.debug.assert(@bitOffsetOf(ColumnView, "name_offset") % 8 == 0);
+            std.debug.assert(@bitOffsetOf(ColumnView, "value_tag") % 8 == 0);
+            std.debug.assert(@bitOffsetOf(ColumnView, "value_len") % 8 == 0);
+        }
     };
 
     /// Set subject string (copies into inline buffer)
@@ -932,6 +944,19 @@ pub const BatchPublisher = struct {
         }
     }
 
+    /// §1.13's measurement prerequisite: the wall time between issuing a publish and
+    /// its PubAck returning, per call. The flush loop is serial, so the /metrics sum
+    /// divided by `bridge_nats_publishes_total` is the mean ack wait — the number that
+    /// decides whether pipelining the flush thread is worth building at all. Debug-logged
+    /// per call for a live look; aggregated on /metrics either way.
+    fn timedPublish(self: *BatchPublisher, subject: []const u8, msg_id: ?[]const u8, data: []const u8) !void {
+        const t0 = utils.nanoTimestamp();
+        try self.publisher.publish(subject, msg_id, data);
+        const elapsed_ns = utils.nanoTimestamp() - t0;
+        if (self.metrics) |m| m.recordPublishAck(elapsed_ns);
+        log.debug("publish→ack {d} µs on {s}", .{ elapsed_ns / std.time.ns_per_us, subject });
+    }
+
     fn doPublish(self: *BatchPublisher, indices: []usize) !void {
         if (indices.len == 0) return;
 
@@ -966,7 +991,11 @@ pub const BatchPublisher = struct {
                     
                     const msg_id = event.getMsgId();
                     
-                    try self.publisher.publish(event.getSubject(), msg_id, raw_json);
+                    try self.timedPublish(event.getSubject(), msg_id, raw_json);
+                    // §1.7's undercount, resolved sideways: SCHEMA events get their own
+                    // counter rather than joining `cdc_events_published`, whose value is
+                    // trusted to equal row events (README burst method, speed.py).
+                    if (self.metrics) |m| m.incrementSchemaEvents();
                     log.info("📤 Published KV schema: {d} bytes to {s}", .{raw_json.len, event.getSubject()});
                 }
             } else {
@@ -1089,7 +1118,7 @@ pub const BatchPublisher = struct {
             // Create headers with message ID for deduplication
                     const msg_id = event.getMsgId();
 
-            try self.publisher.publish(event.getSubject(), msg_id, encoded);
+            try self.timedPublish(event.getSubject(), msg_id, encoded);
 
             // ⚠️ Counted here too, not only in the batch path below.
             //
@@ -1161,7 +1190,7 @@ pub const BatchPublisher = struct {
 
             const msg_id = batch_msg_id;
 
-            try self.publisher.publish(batch_subject, msg_id, encoded);
+            try self.timedPublish(batch_subject, msg_id, encoded);
             const publish_elapsed = utils.getMilliTimestamp() - publish_start;
 
             // Counted **here**, on a publish the server acknowledged — not when the event

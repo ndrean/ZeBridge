@@ -235,16 +235,25 @@ async def collect_snapshot(nc, columns: list[str]) -> dict[int, dict]:
     js = nc.jetstream()
     kv_snap = await js.key_value(zb.TOPOLOGY["kv"]["snapshots"])
 
+    # ⚠️ Everything on the snapshot path is tenant-scoped since §1.12 — the KV key, the
+    # request subject, the chunk filter, and the stream itself. `decode_fixture` is a
+    # *public* table (zebridge_public_tables), so its tenant is the open tenant, and its
+    # chunks live on INIT_PUBLIC. The old shape (`snapshot.request.<table>`, stream
+    # "INIT") produced a Publish Violation and a consumer on a stream that does not
+    # exist — NOTES.md §1.16.
+    tenant = zb.TOPOLOGY["open_tenant"]
+    snap_key = f"{tenant}.{TABLE}"
+
     async def descriptor():
         try:
-            return zb.decode((await kv_snap.get(TABLE)).value)
+            return zb.decode((await kv_snap.get(snap_key)).value)
         except Exception:  # noqa: BLE001
             return None
 
     before = await descriptor()
     stale_id = before["snapshot_id"] if before else None
 
-    req = zb.subject(zb.TOPOLOGY["subjects"]["snapshot_request"], TABLE)
+    req = zb.subject(zb.TOPOLOGY["subjects"]["snapshot_request"], tenant, TABLE)
     try:
         await js.publish(req, b"")
     except Exception:  # noqa: BLE001
@@ -260,9 +269,12 @@ async def collect_snapshot(nc, columns: list[str]) -> dict[int, dict]:
     if not desc:
         sys.exit("no fresh snapshot descriptor appeared — is the bridge running?")
 
-    filt = f"init.snap.{TABLE}.{desc['snapshot_id']}.>"
+    # Same resolution as snapshot.py: `streams.init` ("INIT") is a generic label, not a
+    # real stream — only INIT_PUBLIC / INIT_<TENANT> exist.
+    init_stream = zb.TOPOLOGY["init_streams"]["public"]
+    filt = f"init.snap.{tenant}.{TABLE}.{desc['snapshot_id']}.>"
     sub = await js.pull_subscribe(
-        filt, durable=None, stream=zb.TOPOLOGY["streams"]["init"],
+        filt, durable=None, stream=init_stream,
         config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL, filter_subject=filt),
     )
 
@@ -304,9 +316,24 @@ async def main():
             "subscription sees exactly this run's inserts.\n    pkill -f zig-out/bin/bridge"
         )
 
+    # ⚠️ Three registrations make a public table reachable, not two. Postgres
+    # (`zebridge_public_tables` + publication, in seed()) and the NATS stream's subjects
+    # (register_nats_subject) both existed here already — but since §2.19 the bridge
+    # itself refuses any table that is neither tenant-scoped nor in **topology.json's**
+    # `public_tables`, *before* attempting a publish that could never be acked. This
+    # scenario predates that check and silently lost its CDC path to it (`REFUSING
+    # 'decode_fixture': not ... in topology.json's public_tables`, bridge log). The
+    # bridge this scenario starts is its own, so it gets its own topology: the repo's
+    # file with the fixture appended, via TOPOLOGY_PATH — the deployed topology.json is
+    # never touched.
+    topo = json.loads(pathlib.Path(zb.ROOT / "topology.json").read_text())
+    topo["public_tables"] = topo.get("public_tables", []) + [TABLE]
+    topo_path = SCRATCH / "decode_integrity.topology.json"
+    topo_path.write_text(json.dumps(topo))
+
     try:
         register_nats_subject()
-        with zb.Bridge(SCRATCH / "decode_integrity.log") as br:
+        with zb.Bridge(SCRATCH / "decode_integrity.log", TOPOLOGY_PATH=str(topo_path)) as br:
             if not br.wait_for_log("Replication started successfully", timeout=60):
                 sys.exit(f"could not start a bridge — see {SCRATCH / 'decode_integrity.log'}")
 
@@ -327,6 +354,7 @@ async def main():
             finally:
                 await nc.close()
     finally:
+        topo_path.unlink(missing_ok=True)
         unregister_nats_subject()
         zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
         zb.psql(f"DROP TYPE IF EXISTS {KIND_TYPE}", quiet=True)

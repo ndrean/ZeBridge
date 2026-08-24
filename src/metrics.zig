@@ -36,6 +36,21 @@ pub const Metrics = struct {
     // Stored as integer percentage (0-100) to avoid f64 atomic operations
     queue_usage_percent: std.atomic.Value(u32),
 
+    // JetStream publish→ack timing (§1.13's measurement prerequisite): the wall time
+    // between issuing a publish and its PubAck returning, summed, plus the call count —
+    // mean latency is the quotient, rate windows come from scraping deltas. Counters
+    // rather than a gauge so no sample is lost between scrapes.
+    nats_publish_ack_ns: std.atomic.Value(u64),
+    nats_publishes: std.atomic.Value(u64),
+
+    // SCHEMA/KV publishes (DDL schemas, suspensions, drop tombstones). Deliberately a
+    // separate counter from `cdc_events_published` (§1.7): that one's arithmetic is
+    // trusted to equal ROW events delivered (the README burst method and speed.py both
+    // poll it for exact row counts), so folding rare schema traffic into it would skew
+    // the measurements it exists for — the undercount was the lesser evil until this
+    // counter existed.
+    schema_events_published: std.atomic.Value(u64),
+
     /// Initialize metrics struct with zeroed atomic counters
     pub fn init() Metrics {
         return .{
@@ -53,6 +68,9 @@ pub const Metrics = struct {
             .wal_confirmed_lag_bytes = std.atomic.Value(u64).init(0),
             .last_wal_check_time = std.atomic.Value(i64).init(0),
             .queue_usage_percent = std.atomic.Value(u32).init(0),
+            .nats_publish_ack_ns = std.atomic.Value(u64).init(0),
+            .nats_publishes = std.atomic.Value(u64).init(0),
+            .schema_events_published = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -104,6 +122,17 @@ pub const Metrics = struct {
         self.queue_usage_percent.store(percent, .monotonic);
     }
 
+    /// Lock-free increment of the SCHEMA/KV events counter
+    pub fn incrementSchemaEvents(self: *Metrics) void {
+        _ = self.schema_events_published.fetchAdd(1, .monotonic);
+    }
+
+    /// Lock-free record of one JetStream publish→ack round trip
+    pub fn recordPublishAck(self: *Metrics, elapsed_ns: u64) void {
+        _ = self.nats_publish_ack_ns.fetchAdd(elapsed_ns, .monotonic);
+        _ = self.nats_publishes.fetchAdd(1, .monotonic);
+    }
+
     /// Get current uptime in seconds (lock-free read)
     pub fn getUptimeSeconds(self: *Metrics) i64 {
         return @as(i64, @intCast(c.time(null))) - self.start_time;
@@ -126,6 +155,9 @@ pub const Metrics = struct {
         wal_confirmed_lag_bytes: u64,
         last_wal_check_time: i64,
         queue_usage_percent: u32, // 0-100
+        nats_publish_ack_ns: u64,
+        nats_publishes: u64,
+        schema_events_published: u64,
     };
 
     /// Get a lock-free snapshot of all metrics
@@ -156,6 +188,9 @@ pub const Metrics = struct {
             .wal_confirmed_lag_bytes = self.wal_confirmed_lag_bytes.load(.monotonic),
             .last_wal_check_time = self.last_wal_check_time.load(.monotonic),
             .queue_usage_percent = self.queue_usage_percent.load(.monotonic),
+            .nats_publish_ack_ns = self.nats_publish_ack_ns.load(.monotonic),
+            .nats_publishes = self.nats_publishes.load(.monotonic),
+            .schema_events_published = self.schema_events_published.load(.monotonic),
         };
     }
 };

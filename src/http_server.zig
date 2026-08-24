@@ -406,6 +406,10 @@ pub const Server = struct {
                 \\# TYPE bridge_cdc_events_published_total counter
                 \\bridge_cdc_events_published_total {d}
                 \\
+                \\# HELP bridge_schema_events_published_total SCHEMA/KV events published to NATS (DDL schemas, suspensions, drop tombstones) - kept out of the CDC counter so that one stays equal to row events
+                \\# TYPE bridge_schema_events_published_total counter
+                \\bridge_schema_events_published_total {d}
+                \\
                 \\# HELP bridge_last_ack_lsn Last acknowledged LSN position
                 \\# TYPE bridge_last_ack_lsn gauge
                 \\bridge_last_ack_lsn {d}
@@ -438,6 +442,14 @@ pub const Server = struct {
                 \\# TYPE bridge_queue_usage_percent gauge
                 \\bridge_queue_usage_percent {d}
                 \\
+                \\# HELP bridge_nats_publish_ack_seconds_total Summed wall time between issuing a JetStream publish and its PubAck (divide by bridge_nats_publishes_total for the mean)
+                \\# TYPE bridge_nats_publish_ack_seconds_total counter
+                \\bridge_nats_publish_ack_seconds_total {d}.{d:0>6}
+                \\
+                \\# HELP bridge_nats_publishes_total JetStream publishes timed by the flush thread
+                \\# TYPE bridge_nats_publishes_total counter
+                \\bridge_nats_publishes_total {d}
+                \\
                 \\# HELP bridge_cpu_seconds_total CPU time consumed by the bridge process (user + system)
                 \\# TYPE bridge_cpu_seconds_total counter
                 \\bridge_cpu_seconds_total {d}.{d:0>3}
@@ -450,6 +462,7 @@ pub const Server = struct {
                 snap.uptime_seconds,
                 snap.wal_messages_received,
                 snap.cdc_events_published,
+                snap.schema_events_published,
                 snap.last_ack_lsn,
                 if (snap.is_connected) @as(u8, 1) else @as(u8, 0),
                 snap.reconnect_count,
@@ -458,6 +471,9 @@ pub const Server = struct {
                 snap.wal_lag_bytes,
                 snap.wal_confirmed_lag_bytes,
                 snap.queue_usage_percent,
+                snap.nats_publish_ack_ns / std.time.ns_per_s,
+                (snap.nats_publish_ack_ns % std.time.ns_per_s) / std.time.ns_per_us,
+                snap.nats_publishes,
                 cpu_ns / std.time.ns_per_s,
                 (cpu_ns % std.time.ns_per_s) / std.time.ns_per_ms,
                 utils.maxRssBytes(),
