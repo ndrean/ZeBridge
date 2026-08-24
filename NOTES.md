@@ -1358,6 +1358,86 @@ no digests, just cutoffs the version column already provides. Buckets are the
 escalation if delta scans on very large tables ever hurt, or if clients must be
 arbitrarily stale without ever taking a full object.
 
+**Client/producer contract, settled in discussion 2026-08-24:**
+
+- **Clients track watermarks, never generation numbers.** A client that also tails
+  CDC is always ahead of the last generation it touched, so "which Gxx am I at" is
+  the wrong coordinate. Its position stays what it already is: per-(tenant, table)
+  max applied version plus the stream positions in `_zebridge_sync`/
+  `_zebridge_stream_seq`. Each generation artifact carries its own coordinates —
+  `{gen, prev_cutoff, cutoff, cutoff_lsn}` — and reconnection is a comparison: CDC
+  resumable → tail as today; fell off retention → apply every delta whose
+  `cutoff > my_watermark`, oldest first, then tail the CDC stream skipping events
+  with `lsn ≤ cutoff_lsn` (every event carries `lsn`; no stream-seq coordinate is
+  needed, and over-replay is free under the guarded upsert anyway).
+- **Delta apply MUST be a version-guarded upsert** (`… DO UPDATE WHERE
+  excluded.version >= current.version`), not the CDC path's arrival-order LWW: a
+  client that tailed CDC past a delta's cutoff and then applies that delta would
+  otherwise regress rows to older values. The guard makes overlap in either
+  direction free — double-applied deltas are no-ops, CDC-fresher rows survive —
+  and is precisely what buys "no generation bookkeeping needed."
+- **Producer state lives in PG, not read back from NATS**: a restarted bridge must
+  know the last cutoff, and "the bridge never reads its own output back" is a
+  founding invariant — so `zebridge_generations (tenant, tbl, gen, cutoff_version,
+  cutoff_lsn, built_at)`, append-only, pruned past chain depth k, doubling as the
+  audit trail.
+- **Cutoffs need a clock-skew margin**: versions are timestamps writers may supply
+  themselves (within the clamp tolerance), so a row committed inside generation N's
+  window can carry `version ≤ prev_cutoff` and be missed by every delta forever.
+  Query `version > prev_cutoff − clamp_tolerance` — the slight overlap is free
+  under the guarded upsert — and take the cutoff inside the generation's own
+  `REPEATABLE READ` transaction so cutoff and content agree.
+- **The table is BUILT and contract-tested (2026-08-24)** —
+  `zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn pg_lsn,
+  built_at)` in `init.core.template.sql`, applied live, proven by
+  `scripts/scenarios/generations.py` (7/7): invisible to clients (internal-listed,
+  unpublished, no KV key), the reader runs the full LSN-before-snapshot recipe on
+  its **single deliberate write grant** (INSERT+DELETE, no UPDATE — append-only by
+  privilege; the content query must run as the reader for SELECT-everywhere +
+  `zb.tenant` RLS, and the bookkeeping row must share its transaction), the PK
+  forbids chain forks, and the writer holds nothing. Remaining for milestone 2: the
+  producer itself (cadence trigger, object put, pointer swap).
+- **`cutoff_lsn` is the producer's own to stamp, no thread coordination**: any
+  connection can `SELECT pg_current_wal_lsn()`, and the snapshot listener already
+  does exactly this ("Snapshot started at LSN" / the descriptor's `lsn`). Ordering
+  rule, overlap-never-gap: read the LSN **before** establishing the REPEATABLE READ
+  snapshot, so a commit in the window is visible in the generation AND ≥ the
+  recorded LSN (replayed twice, absorbed by the guard) — the reverse order makes it
+  invisible AND below the LSN: skipped by both paths, lost. The
+  `zebridge_generations` row commits in the same transaction as the content query.
+  (`CREATE_REPLICATION_SLOT … USE_SNAPSHOT` pairs snapshot and consistent-point
+  atomically if the window ever needs to be exactly zero.)
+
+- **Storage decided: Object Store, per-tenant buckets, KV pointer retained
+  (2026-08-24).** Generations (fulls and deltas) are named immutable objects in
+  `OBJ_<TENANT>` buckets — `ObjectInfo` supplies size/chunking/SHA-256 digest (client
+  integrity checks for free), the library handles `max_payload` chunking in both
+  directions, and `nats.zig` upstream already ships Object Store with streaming
+  (its own e2e suite covers it). The pointer stays a tiny KV entry — Object Store
+  has no pointer primitive — and becomes the chain manifest
+  (`generations.<tenant>.<table>` → current gen + delta list + cutoffs), swapped
+  last per the pointer-swap layout. ACL follows the crosstenant rule: a bucket IS a
+  stream (`$O.<bucket>.C.>`/`.M.>`), so per-tenant buckets, granted per bucket —
+  the grant-scoping shape is **verified** (`scripts/scenarios/objgrants.py`,
+  2026-08-24): alice, granted only `OBJ_genacme`-named API subjects, reads her
+  bucket byte-for-byte and is refused `genglobex` by the broker
+  (`permissions violation for publish to "$JS.API.STREAM.INFO.OBJ_genglobex"`) —
+  the bucket is the boundary, same as CDC_/INIT_. One client-library finding rode
+  along: nats-py's `obj.get()` resolves subject→stream via `$JS.API.STREAM.NAMES`
+  before subscribing, so a nats-py consumer needs that grant (names-only metadata
+  leak) — a client that binds the stream explicitly (nats.zig can) needs no such
+  grant, which is how the real consumers should do it. Strategically: the generation producer is NEW
+  code on a cadence trigger, built BESIDE `snapshot_listener` — `INIT_*`/
+  `$KV.snapshots`/the request window keep serving existing clients unchanged, and
+  the old path is retired later, not refactored first. The two subsystems share no
+  mutable state, so coexistence is safe by construction.
+
+Remaining correctness inventory: (1) overlap/regression — settled by the guarded
+upsert; (2) deletions — tombstones ride deltas as rows, `sweeper retention ≥
+k × cadence (+ margin)` still needs its check wired (a home next to
+`descriptorStillFresh()`); (3) clock skew — settled by the margin rule; (4)
+pointer/object atomicity — settled by the pointer-swap layout (`objstore_race.py`).
+
 ⚠️ **The cadence becomes a correctness parameter, not a freshness knob.** Two pieces of
 retention hang off it: the delta chain (k × cadence of catch-up depth) and tombstone
 retention (the sweeper must not reap a tombstone before every client that could still
@@ -2455,6 +2535,7 @@ zig build test-nats
 | `zebridge_public_tables` | Registers tables that are deliberately published unscoped to all tenants. It acts as an escape hatch for public shared datasets (e.g., product catalogs or currency lists) and justifies why they bypass the scoping guards. |
 | `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
 | `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
+| `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. |
 
 #### Client-Side Tables (`web-consumer/src/App.tsx`)
 
@@ -2523,7 +2604,7 @@ carry them:
 
 | Object | Kind | Role / Description |
 | :--- | :--- | :--- |
-| `bridge_reader` (`POSTGRES_BRIDGE_USER`) | PG role | REPLICATION + SELECT everywhere. The read path, physically unable to write. Its snapshot SELECTs are scoped by `zb_reader_all` when the connection sets `zb.tenant`; RLS never touches CDC (logical decoding has no query). |
+| `bridge_reader` (`POSTGRES_BRIDGE_USER`) | PG role | REPLICATION + SELECT everywhere. The read path — unable to write anything a client reads, with one deliberate exception: `INSERT`+`DELETE` (no `UPDATE`) on `zebridge_generations`, its own bookkeeping. Its snapshot SELECTs are scoped by `zb_reader_all` when the connection sets `zb.tenant`; RLS never touches CDC (logical decoding has no query). |
 | `bridge_writer` (`POSTGRES_WRITER_USER`) | PG role | Ingress. Created with **no table privileges** — tables open one at a time via `zebridge_grant_edge_writes()`. Writes are tenant-bounded by `zb_tenant_write` reading `zb.principal`. |
 | `zb_sweeper` | **not** a PG role | A `zb.principal` GUC value plus `zebridge_user_tenants` rows (one per tenant, or its reaps see nothing under RLS). Set by the bridge's own sweeper (`src/gc.zig`); recognised by `zebridge_soft_delete_t`'s bypass so tombstones can actually be removed. `zebridge_audit_sweeper()` reports tenants it cannot reach. |
 | `postgres` (admin) | PG role | Init/render and migrations only. The bridge never reads its credentials (`args.zig` rejects the PG_* fallback by design). |

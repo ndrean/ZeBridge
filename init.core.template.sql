@@ -433,12 +433,53 @@ BEGIN
     END IF;
 END $$;
 
+-- ---------------------------------------------------------
+-- Generation bookkeeping — the producer's own memory (NOTES.md §1.13, delta generations)
+-- ---------------------------------------------------------
+--
+-- One row per built generation of a (tenant, table) pair: which cutoff it used and at
+-- which LSN it was taken. The generation producer reads its LAST row to compute the
+-- next delta and appends its new one — from PostgreSQL, never from NATS, because "the
+-- bridge never reads its own output back" is a founding invariant. Append-only with
+-- pruning past the chain depth; the rows double as the audit trail ("what did G17
+-- cover and when").
+--
+-- ⚠️ `cutoff_lsn` is stamped by the producer itself: `SELECT pg_current_wal_lsn()`
+-- taken BEFORE the REPEATABLE READ snapshot that reads the content, and this row
+-- committed in that same transaction — overlap-never-gap; see NOTES.md §1.13 for why
+-- the reverse order loses rows.
+--
+-- ⚠️ NOT published and listed in `zebridge_is_internal_table`: clients must never build
+-- a local replica of producer bookkeeping, and its DDL must not reach `$KV.schemas`.
+CREATE TABLE IF NOT EXISTS public.zebridge_generations (
+    tenant         text NOT NULL,
+    tbl            text NOT NULL,
+    gen            bigint NOT NULL,
+    -- The version watermark this generation's content query cut at. The next delta
+    -- selects `version > cutoff_version - clamp_tolerance` (the margin rule).
+    cutoff_version timestamptz NOT NULL,
+    -- Where CDC resumes after applying this generation's chain: clients skip events
+    -- with lsn <= cutoff_lsn (every CDC event carries lsn).
+    cutoff_lsn     pg_lsn NOT NULL,
+    built_at       timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant, tbl, gen)
+);
+
+-- ⚠️ The ONE deliberate write grant the read role holds, and why it is not a breach of
+-- "the read role is physically unable to write": the generation's content query MUST
+-- run as the reader (SELECT-everywhere + `zb.tenant` RLS scoping belong to it), and
+-- the bookkeeping row MUST commit in that same transaction — so the same connection
+-- writes it. The grant is INSERT + DELETE (pruning) on THIS table only; no UPDATE, so
+-- history is append-only by privilege, not by convention.
+GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_BRIDGE_USER};
+
 -- keeps the tracker's own rows out of the DDL feed — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
 RETURNS boolean AS $$
     SELECT tbl = ANY (ARRAY[
-        'zebridge_ddl_events',  -- our own DDL tracker
-        'schema_migrations'     -- Ecto / ActiveRecord migration bookkeeping
+        'zebridge_ddl_events',   -- our own DDL tracker
+        'zebridge_generations',  -- generation producer bookkeeping (NOTES.md §1.13)
+        'schema_migrations'      -- Ecto / ActiveRecord migration bookkeeping
     ]);
 $$ LANGUAGE sql IMMUTABLE;
 
