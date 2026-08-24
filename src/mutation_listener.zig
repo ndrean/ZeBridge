@@ -444,8 +444,12 @@ pub const MutationListener = struct {
                     // attempt per second and the queue never advanced past it.
                     if (isPermanent(err)) {
                         if (isOperatorFault(err)) {
+                            // One line for every operator fault: the specific reason was
+                            // already logged where it was detected (`tableMeta`), and
+                            // `DbAllocatedKey` is not a SYNC_RULES disagreement — it is
+                            // the table's key shape — so this stays generic.
                             log.err(
-                                "🔴 '{s}' cannot accept writes ({}): the schema and SYNC_RULES disagree. Preflight reports this at boot.",
+                                "🔴 '{s}' cannot accept writes ({}): only a migration or a SYNC_RULES change can fix this. Preflight reports it at boot; see the line above for the reason.",
                                 .{ mutation.table, err },
                             );
                         } else {

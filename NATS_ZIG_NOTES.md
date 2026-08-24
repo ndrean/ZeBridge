@@ -192,3 +192,27 @@ Create a pull consumer on an empty stream, loop `fetch(1, 500ms)`, and watch
 `expires ÷ actual_period` instead. A caller cannot detect this from the API: `fetch` reports
 408 in `MessageBatch.err` rather than returning an error, so `catch { continue; }` never fires
 and an empty `messages` slice looks like a normal idle result.
+
+---
+
+## 4. Submodule bumped to upstream `d4cd40d` (2026-08-24)
+
+`b3684bd` ("Retry JetStream publishes on no responders", #148) → `d4cd40d`
+("Type-check the public surface", #157) — 11 upstream commits. None of them contain
+fixes 1–3 above, so both local patches were re-applied; both applied cleanly with no
+re-fit (`git apply` straight from `nats.zig-connection.patch` and
+`nats.zig-jetstream-stale-408.patch`).
+
+What the bump brings, relevant to ZeBridge:
+
+* **#153/#154/#156** — lock-order inversion and deinit races around `subs_mutex` in
+  `connection.zig`, the same shutdown region fix 2 touches.
+* **TLS** (#150 series, incl. mutual TLS) — the client can now speak `tls://`. Does not
+  change the v1.0 colocation decision, but the "no TLS client exists" premise behind it
+  is no longer true.
+* **#157** — type-checks the public surface; three API functions never compiled before.
+
+Verified after the bump: `zig build` and `zig build test` clean (Debug and ReleaseFast),
+bridge boots against the Docker stack, `keys.py` passes 7/7 (exercises the pull-fetch
+loop fix 3 guards), and the `MUTATIONS` durable shows `num_waiting: 0` after the run —
+no parked-pull storm.

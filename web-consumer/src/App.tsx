@@ -396,19 +396,81 @@ type TableState = {
 const SNAPSHOT_WAIT_MS = 60_000;
 const SNAPSHOT_REQUEST_ATTEMPTS = 5;
 
+/// A KV entry as `watchBucket` yields it — the four fields the callers read from
+/// `@nats-io/kv`'s own `KvEntry`, and nothing else.
+interface BucketEntry {
+  key: string;
+  operation: 'PUT' | 'DEL' | 'PURGE';
+  value: Uint8Array;
+  /// Messages still queued behind this one: `0` marks the last entry of the initial
+  /// replay, exactly like `KvEntry.delta`.
+  delta: number;
+}
+
+/// Watch a KV bucket through a plain pull consumer instead of `kv.watch()`.
+///
+/// ⚠️ `kv.watch()` is the wrong primitive under this server config, and the reason is in
+/// `@nats-io/jetstream`, not here. It hands `getPushConsumer` a config carrying
+/// `filter_subject`/`deliver_policy`, which `isOrderedPushConsumerOptions` classifies as
+/// an **ordered** consumer — so the stable `KV_WATCHER_*` name it picks is discarded for
+/// `oc_<nuid>_1`, and every reset (a missed heartbeat pair, a delivery-sequence gap)
+/// deletes the old consumer and creates `_2`, `_3`, … The server withholds
+/// `$JS.API.CONSUMER.DELETE` from clients on purpose (see `nats-server.conf.template`),
+/// so the delete is denied and the abandoned consumers pile up until their 5-minute
+/// inactivity threshold — measured live at one new consumer per watcher per reset
+/// (NOTES.md §1.14).
+///
+/// A pull consumer has no reset path: a missed heartbeat just means the next pull. It is
+/// also the primitive the CDC path already uses, and it needs only grants a principal
+/// already holds (`CONSUMER.CREATE`/`INFO`/`MSG.NEXT` on `KV_<bucket>`). Ephemeral, so it
+/// expires on its own once `stop()` is called or the connection drops — nothing to delete.
+///
+/// Same semantics the callers relied on: `LastPerSubject` replays the current value of
+/// every matching key first, then streams updates; `delta === 0` marks the end of the
+/// replay. An empty bucket yields nothing and reports `pending: 0` up front, which
+/// `kv.watch()` never did — the caller can resolve instead of waiting forever.
+async function watchBucket(
+  js: any,
+  bucket: string,
+  filterKey: string = '>',
+): Promise<{ pending: number; entries: AsyncIterable<BucketEntry>; stop: () => void }> {
+  const stream = `KV_${bucket}`;
+  const prefix = `$KV.${bucket}.`;
+  const jsm = await js.jetstreamManager();
+  const ci = await jsm.consumers.add(stream, {
+    deliver_policy: DeliverPolicy.LastPerSubject,
+    filter_subject: `${prefix}${filterKey}`,
+    ack_policy: 'none',
+  });
+  const consumer = await js.consumers.get(stream, ci.name);
+  const iter = await consumer.consume();
+  const entries = (async function* () {
+    for await (const m of iter) {
+      const op = m.headers?.get('KV-Operation') || 'PUT';
+      yield {
+        key: m.subject.substring(prefix.length),
+        operation: (op === 'DEL' || op === 'PURGE' ? op : 'PUT') as BucketEntry['operation'],
+        value: m.data,
+        delta: m.info.pending,
+      };
+    }
+  })();
+  return { pending: ci.num_pending ?? 0, entries, stop: () => { try { iter.stop(); } catch { /* closed */ } } };
+}
+
 /// Wait for this snapshot descriptor (KV key, already `<tenant>.<table>` when tenants are
 /// declared), or give up after `timeoutMs`.
 ///
 /// Returns null on timeout rather than throwing: "not yet" is an ordinary outcome here,
 /// not an exception. The watch is always torn down — an abandoned KV watch leaks a
 /// subscription per attempt, and this is on the retry path.
-async function waitForDescriptor(kv: any, key: string, timeoutMs: number): Promise<any | null> {
-  let iter: any = null;
+async function waitForDescriptor(js: any, bucket: string, key: string, timeoutMs: number): Promise<any | null> {
+  let watch: Awaited<ReturnType<typeof watchBucket>> | null = null;
   try {
-    iter = await kv.watch({ key });
+    watch = await watchBucket(js, bucket, key);
     return await Promise.race([
       (async () => {
-        for await (const entry of iter) {
+        for await (const entry of watch.entries) {
           if (entry.operation === "DEL" || entry.operation === "PURGE") continue;
           try { return decode(entry.value); } catch { return JSON.parse(new TextDecoder().decode(entry.value)); }
         }
@@ -419,7 +481,7 @@ async function waitForDescriptor(kv: any, key: string, timeoutMs: number): Promi
   } catch {
     return null;
   } finally {
-    try { iter?.stop?.(); } catch { /* already closed */ }
+    watch?.stop();
   }
 }
 
@@ -994,16 +1056,16 @@ export default function App() {
   const watchSchemas = async () => {
     if (!nc) return;
     try {
-      const kvm = new Kvm(nc);
-      const kv = await kvm.open(topology.kv.schemas);
-      const watcher = await kv.watch();
+      const watch = await watchBucket(jetstream(nc), topology.kv.schemas);
       appendLog('SCHEMA', `Watching KV bucket "${topology.kv.schemas}" for all tables...`, 'WATCH');
 
       return new Promise<void>((resolve) => {
         let initialized = false;
+        // Nothing published yet: there is no "last entry of the replay" to wait for.
+        if (watch.pending === 0) { initialized = true; resolve(); }
 
         (async () => {
-          for await (const entry of watcher) {
+          for await (const entry of watch.entries) {
             // ⚠️ `delta === 0` marks the last entry of the initial replay, but this entry
             // has NOT been applied yet — the migration below is still to come, and it
             // awaits SQL. Resolving here would let `subscribeStreams()` run and snapshot
@@ -1186,6 +1248,13 @@ export default function App() {
         reach('migrated');
         return; // identical schema, e.g. a boot republish
       } else {
+        // ⚠️ The view goes first. SQLite's `ALTER TABLE … DROP COLUMN` re-validates every
+        // schema object that references the table, and the copy-based fallback drops and
+        // renames the table under it — with `<table>_view` still defined, both fail with
+        // `error in view users_view: no such table: main.users` (NOTES.md §1.17). It is
+        // recreated against the new column set below, so nothing is lost by dropping it
+        // early; `ADD COLUMN` only worked because it never touches a referenced column.
+        await sql(`DROP VIEW IF EXISTS ${table}_view;`);
         // Apply in place where SQLite allows it. DROP COLUMN exists since 3.35 and
         // preserves every remaining row — a removed column is not a reason to discard
         // the replica. SQLite still refuses to drop a PK/UNIQUE/indexed column, so
@@ -1539,7 +1608,7 @@ export default function App() {
                   appendLog('SYS', `Request for ${table} refused (${e?.message ?? e}) — a snapshot is already pending, waiting for it`, 'INFO');
                 }
 
-                desc = await waitForDescriptor(snapKv, snapKey, SNAPSHOT_WAIT_MS);
+                desc = await waitForDescriptor(js, topology.kv.snapshots, snapKey, SNAPSHOT_WAIT_MS);
                 if (!desc) {
                   appendLog('SYS', `No snapshot for ${table} after ${SNAPSHOT_WAIT_MS / 1000}s — the request may have expired unread; re-requesting`, 'WARNING');
                 }

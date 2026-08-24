@@ -1304,56 +1304,56 @@ worth the added complexity. Judge any resulting change the same way every other 
 in this file is judged — against the README burst benchmark, by iters delta, not by
 intuition about which side "must" be slow.
 
-### 1.14 `web-consumer`'s schema watch leaks a JetStream consumer roughly every 30s — client-side, in `@nats-io/kv`/`@nats-io/jetstream`, not the bridge
+### 1.14 CLOSED — `web-consumer`'s schema watch no longer uses `kv.watch()`; it is a pull consumer
 
-Found live, watching the Docker `nats-server` container's own log while testing:
-repeated `Publish Violation` lines for `$JS.API.CONSUMER.DELETE.KV_schemas.oc_...`,
-one per connected principal, roughly every 30 seconds. `nats consumer report
-KV_schemas` confirmed it directly — 31 consumers and climbing, none ever
-disappearing, one new one per watcher every ~30s.
+The leak's mechanism, confirmed in `@nats-io/jetstream` 3.4.0 and reproduced live
+(`scratchpad/watchprobe.mjs`, a Node script that hands `getPushConsumer` exactly what
+`kv.watch()` does):
 
-The denial itself is correct, working-as-designed server config (both
-`nats-server.conf.template` and `scripts/native/nats-server.conf`, identical,
-carry the same deliberate comment: `$JS.API.CONSUMER.DELETE.*` is withheld
-because a static config has no per-client name templating, so granting it on a
-shared subject would let alice delete bob's in-flight consumer). The bug is
-that the *premise* behind leaving it withheld — "the client never deletes a
-consumer, its ephemerals expire on their own inactivity threshold" — does not
-hold for `web-consumer`'s `watchSchemas()` (`App.tsx`, `kv.watch()`): its
-consumers are not expiring, they are accumulating, unbounded, for the life of
-the connection.
+* `kv.js`'s `_buildCC` returns a config carrying `filter_subject` and `deliver_policy`.
+  `getPushConsumer(stream, cc)` (`jsmstream_api.js:62`) is overloaded on its second
+  argument: a string binds an existing consumer, an object that satisfies
+  `isOrderedPushConsumerOptions` (`types.js:22` — true for *any* object with
+  `filter_subject`/`deliver_policy`/`headers_only`…) goes to `getOrderedPushConsumer`.
+  So every KV watch is an **ordered** consumer. The `KV_WATCHER_<nuid>` name `kv.js` sets
+  is overwritten with `oc_<nuid>_1` (`jsmstream_api.js:115`), and the 5s
+  `idle_heartbeat` `kv.js` asks for is overwritten with 30s (`:104`). The probe confirms
+  it: `ordered=true`, name `oc_…_1`, `hb=30s`.
+* An ordered consumer heals by replacement: `reset()` (`pushconsumer.js:64`) deletes
+  the current consumer and creates `<prefix>_<n+1>`. It fires on two missed heartbeats
+  (`IdleHeartbeatMonitor`, `maxOut: 2`, checked every 30s) or on a delivery-sequence gap.
+  The delete is denied here — `$JS.API.CONSUMER.DELETE` is withheld from clients on
+  purpose, and that stays — so each reset leaves the old consumer to its 5-minute
+  inactivity threshold. `reset()` also never clears the monitor's `missed` counter, so
+  once heartbeats stop arriving **every** 30s tick resets again: the cadence observed.
+* Flow control is on (`flow_control: true`) but alice has no `$JS.FC.>` publish grant,
+  so a flow-control reply would also be a Publish Violation. Not the trigger on an idle
+  bucket, but the same shape of problem: the library assumes grants the server withholds.
 
-**Traced to a specific, checkable claim, not just reproduced.** `@nats-io/kv`'s
-`watch()` (`kv.js:707-726`) explicitly names its consumer `KV_WATCHER_<nuid>` —
-a *stable* name, reused across resets. But the consumers actually piling up are
-named `oc_<id>_2`, `_3`, `_4`... — the OrderedConsumer naming pattern
-(`consumer.js:86`: `` ocs.namePrefix = iopts.name_prefix ?? `oc_${nuid.next()}` ``),
-which only fires when `this.consumer.ordered === true` (`consumer.js:74`).
-So the consumer `getPushConsumer` returns for a KV watch is being treated as
-*ordered* internally, despite being given an explicit stable name — ordered
-consumers self-heal by minting a brand-new uniquely-named replacement whenever
-they can't reuse the old one, which is exactly what a denied DELETE guarantees
-every single time.
+What *starts* the resets was not reproduced this session: the probe ran 110s idle
+(three heartbeats on time, no reset), then across a bridge restart (nine KV puts,
+`dseq 10–18` in order, no reset); the browser tab in the foreground ran 6 minutes on
+one consumer. Last session's observation was made while watching the server log in a
+terminal — a hidden tab, where Chrome throttles timers and, after 5 minutes, runs them
+about once a minute — or across reconnects. Either would starve the monitor. Not chased
+further, because the fix does not depend on it.
 
-⚠️ **The natural first fix doesn't work.** `KvWatchOptions` (the public type
-`kv.watch()` accepts) only forwards `headers_only`/`include`/`ignoreDeletes`/
-`resumeFromRevision` into the consumer config — `idle_heartbeat` is not
-exposed at all; it is hardcoded inside `kv.js`'s private `_buildCC` (5s,
-independent of `@nats-io/jetstream`'s own unrelated 30s default in
-`pushconsumer.js:131`). There is no way to influence this through `kv.watch()`'s
-public API — a real fix means bypassing it and building the consumer manually
-via lower-level `@nats-io/jetstream` calls, replicating what `kv.js` does
-internally with the ordered/heartbeat behavior actually under our control.
+**Fix (`App.tsx`, `watchBucket`)**: the watch is a plain named-ephemeral **pull**
+consumer on `KV_<bucket>` — `deliver_policy: LastPerSubject`, `filter_subject:
+$KV.<bucket>.<key>`, `ack_policy: none` — the primitive the CDC path already uses. A
+pull consumer has no reset path (a missed heartbeat is just the next pull), and it needs
+only grants every principal already holds: `CONSUMER.CREATE`/`CONSUMER.INFO`/`MSG.NEXT`
+on `KV_schemas` and `KV_snapshots`. Entries are shaped as the callers already read them
+(`key`, `operation` from the `KV-Operation` header, `value`, `delta = pending`). Both
+`kv.watch()` sites moved: `watchSchemas()` and `waitForDescriptor()` (which leaked one
+abandoned `oc_` consumer per snapshot attempt for the same reason). One behaviour gained:
+an empty bucket reports `pending: 0` up front, so `watchSchemas()` resolves instead of
+waiting for a last-entry marker that never comes.
 
-Not yet root-caused *why* the returned consumer ends up `ordered` at all, nor
-why resets happen roughly every 30s on an otherwise idle bucket. Next session:
-start from `consumer.js:74` and `getPushConsumer`'s implementation in
-`@nats-io/jetstream` to find what sets `.ordered`, and instrument
-`start()`/`_reset()` (`consumer.js`) to see what triggers the reset cadence
-before deciding on a workaround (self-hosting the KV watch instead of using
-`kv.watch()`, an explicit low-level consumer with a controlled
-`idle_heartbeat`, or a periodic client-side purge job using a scoped grant —
-each has different tradeoffs not yet weighed).
+Verified in Chrome: initial replay of all schemas on load, a live `ALTER TABLE users ADD
+COLUMN` applied 1s after the DDL, `nats consumer ls KV_schemas` shows one consumer per
+page (a random name, no `oc_` prefix), and zero Publish Violations in the server log.
+`Kvm`/`kv.get()` stay in use for direct reads — only the watch changed.
 
 ### 1.16 `decode_integrity.py` has the same stale-`INIT`-stream bug `snapshot.py` had
 
@@ -1370,33 +1370,66 @@ stream name from `topology.json`, and add the tenant token to the chunk-filter s
 Not yet applied — found right before a deliberate infra teardown, no time to verify a
 fix in the same session.
 
-### 1.15 A `DbAllocatedKey` write refusal may leak into the shared `refused_tables` registry — unconfirmed, highest priority open item
+### 1.17 CLOSED — `applySchema` failed on a dropped column while `<table>_view` existed
 
-`keys.py` (`scripts/scenarios/keys.py`) ran for real against a fresh Docker IaC stack
-for the first time this session — it had been silently broken all session by `users`
-losing its sequence-backed PK to an unrelated demo migration (now fixed, see the
-`emitter/priv/repo/migrations/2026081015/60000_users_*` pair, redirected onto a new
-`demo_key_migration` table so `users` keeps its documented bigserial-PK role). Once it
-could actually run, it found three failures in one pass, not test staleness:
+Seen twice this session on a fresh page load, with the schema push itself arriving
+fine: `ALTER TABLE users DROP COLUMN zb_probe_col` in PostgreSQL reaches the client and
+`applySchema` logs `SCHEMA ERROR: … SQLITE_ERROR: error in view users_view: no such
+table: main.users`. The `ADD COLUMN` half of the same round-trip applies cleanly.
+SQLite's `ALTER TABLE … DROP COLUMN` re-validates every schema object that references
+the table, and `users_view` is one; the copy-based `rebuildPreservingData` fallback
+takes the `DROP TABLE` + `RENAME` route with the view still defined, which is where the
+"no such table" comes from. Fix: drop `<table>_view` *before* the
+alteration; the recreate after it was already there, just too late. Verified in Chrome:
+the same `ADD COLUMN` / `DROP COLUMN` round-trip now applies both halves via ALTER with
+rows preserved. Found while verifying §1.14.
 
-1. **No verdict published** for the refused mutation — the write correctly does not
-   land, but no `mutation_ack.<principal>.<msg_id>` arrives within 4s. A client cannot
-   tell a refused write from a lost one.
-2. **A completely unrelated, well-formed mutation to `test_types`, sent immediately
-   after, never landed.**
-3. **`bridge_refused_tables` read 3, not the environment's confirmed baseline of 2**
-   (`users_no_pk`, `exotic_types`) — suggesting the write-path refusal added `users` to
-   the same registry `no_primary_key`/`no_cdc_subject`/etc. use, which drives *CDC
-   dropping for every reader*, not per-write rejection.
+### 1.15 CLOSED — the `DbAllocatedKey` "registry leak" was `keys.py` publishing to a malformed subject
 
-`mutation_listener.zig`'s own design intent — quoted in `keys.py`'s own comment —
-is that "the mutation listener holds no reference to [refused_tables]." That
-invariant needs re-checking against the current code; either it no longer holds, or
-something else explains the registry moving in lockstep with this one mutation. Not
-yet root-caused. Reproduce with `python scripts/scenarios/keys.py` against a bridge
-with `LOG_LEVEL=info` and read its own log around the refusal — start by checking
-whether `mutation_listener.zig` calls `refused.refuse(...)` or anything that does
-(as of this session, only `event_processor.zig` and `snapshot_listener.zig` do).
+`keys.py` reported three failures in one run: no verdict for the refused `users` write,
+an unrelated `test_types` write that never landed, and `bridge_refused_tables` at 3
+instead of the expected 2. Reproduced against a fresh Docker stack with `LOG_LEVEL=info`;
+the bridge log names the cause in one line:
+
+```txt
+⚠️  Malformed mutation subject 'mutation.127.0.0.1.users.insert' (error.MalformedSubject):
+    dead-lettering, and no verdict is addressable
+⚠️  Malformed mutation subject 'mutation.127.0.0.1.test_types.insert' ...
+```
+
+`keys.py` read the principal out of `NATS_URL` with `rsplit("@")` — under nkey auth the
+URL is `nats://127.0.0.1:4222`, no user, so the "principal" became the host and the
+subject gained two tokens. `mutate.py` and `rowsize.py` already fall back to `alice` for
+exactly this case; `keys.py` did not. Both writes were dead-lettered before the write
+path ever saw them, which is why no verdict came back (the subject is what failed, so
+there is no address) and why the second write "leaked".
+
+The third number was the environment, not the write path: `demo_key_migration` (the
+emitter's no-PK-then-composite-key demo fixture, §1.15's own fix) is not in
+`topology.json`'s `public_tables`, so preflight refuses it at boot with `no_cdc_subject`.
+The baseline is 3, not 2 — the "confirmed by boot log" 2 predated that fixture. And
+`keys.py` compared against **0**, which can never hold on a stack with any refused
+table.
+
+**The write path is correct.** With the subject fixed, the bridge publishes
+`{"status":"rejected","reason":"DbAllocatedKey"}` on `mutation_ack.alice.<msg_id>`, the
+following `test_types` write is `accepted`, the registry stays at 3, and `keys.py` passes
+7/7. `mutation_listener.zig` still holds no reference to `refused_tables` — the invariant
+its comment claims held all along.
+
+Fixed in `keys.py`: principal via `ZB_PRINCIPAL` / URL user / `alice`, same rule as the
+sibling scripts; the tenant for the cross-table write is looked up for that principal
+(`zebridge_user_tenants`), falling back to `OPEN_TENANT`; and the registry check is
+before-vs-after, like `invalidate.py`, not against zero. One wording fix in the bridge:
+the operator-fault log line said "the schema and SYNC_RULES disagree" for every
+operator fault, including `DbAllocatedKey`, which is a key-shape problem — now generic,
+deferring to the reason already logged by `tableMeta`.
+
+Lesson, the same one as §2.19 and `mutate.py`'s own comment: a scenario that fails on
+"the client cannot tell X from Y" should first check the bridge log for the *subject*
+it published. A malformed subject produces exactly the symptoms of a write-path bug,
+and two unrelated-looking failures from one message are a hint that the message never
+got as far as the code under test.
 
 ### 2.13 A wildcard inbox made every pull request spawn another
 
@@ -2016,3 +2049,87 @@ docker stop nats-server
 docker run -d --rm --name nats-test -p 4222:4222 -p 8222:8222 nats:2.11 -js -m 8222
 zig build test-nats
 ```
+
+---
+
+## 7. Database Schema and Roles
+
+### Tables
+
+#### Server-Side Tables (`init.*.sql`)
+| Table Name | Role / Description |
+| :--- | :--- |
+| `zebridge_ddl_events` | The DDL transport mechanism. Because PostgreSQL's logical replication (WAL) natively ignores DDL statements (like `ALTER TABLE`), ZeBridge relies on event triggers (`zebridge_ddl_trigger_fn` and `zebridge_drop_trigger_fn`) to intercept schema changes and log them as `INSERT`s in this table. These `INSERT`s *are* emitted via the WAL, allowing the bridge to read schema changes in strict stream order with CDC data and publish them to NATS KV. |
+| `zebridge_public_tables` | Registers tables that are deliberately published unscoped to all tenants. It acts as an escape hatch for public shared datasets (e.g., product catalogs or currency lists) and justifies why they bypass the scoping guards. |
+| `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
+| `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
+
+#### Client-Side Tables (`web-consumer/src/App.tsx`)
+| Table Name | Role / Description |
+| :--- | :--- |
+| `_zebridge_outbox` | Holds optimistic edge writes sent by the client that are pending a confirmation/verdict from NATS and the bridge. |
+| `_zebridge_sync` | Stores the `global_last_lsn` (PostgreSQL WAL position) successfully applied by the consumer, allowing it to discard already-seen CDC events. (Contains a legacy `global_last_seq` column). |
+| `_zebridge_stream_seq` | Tracks JetStream sequences (`last_seq`) grouped by stream. Lets the consumer detect if it has fallen off the back of a stream's retention window when reconnecting. |
+
+<br>
+
+### PostgreSQL Functions (`init.*.sql`)
+
+The functions are divided into read-only configurations, edge-write guard configurations, and composition helpers.
+
+| Function | Usage / Role |
+| :--- | :--- |
+| **Helpers / Entry Points** | |
+| `zebridge_enable()` | The main orchestration entry point that combines grants, guards, RLS policies, and publication logic. Can dry-run to print its plan or apply configurations in a single call. |
+| `zebridge_is_internal_table()` | Checks if a table belongs to ZeBridge (or standard migration tools) to hide it from schema publications and avoid pointless client-side syncing. |
+| **Read/CDC Operations** | |
+| `zebridge_scope_reads_by_tenant()` | Enables RLS on a table to restrict snapshot `SELECT` operations to the active session's tenant. |
+| `zebridge_publication_guard()` | Event trigger function protecting against unscoped `ALTER PUBLICATION ... ADD TABLE`. Rejects publications of tables without row-filters or RLS unless they are registered as public. |
+| `zebridge_audit_publications()` | Audits the database to ensure no tables are published without appropriate tenant scoping. |
+| `zebridge_ddl_trigger_fn()` | Event trigger running on `ddl_command_end` to capture modified table schemas directly from the catalog and log them as `INSERT`s into `zebridge_ddl_events`. |
+| `zebridge_drop_trigger_fn()` | Event trigger running on `sql_drop` to inform clients when tables are permanently deleted by logging the event into `zebridge_ddl_events`. |
+| `zebridge_prune_ddl_events()` | TTL function that deletes events older than 2 days from `zebridge_ddl_events` to bound table growth. |
+| `zebridge_widest_row()` | Scans a table's data types to evaluate its byte size floor, ensuring it fits inside NATS message ceilings. |
+| `zebridge_oversized_defaults()` | Detects column default values that would break the NATS message size budget. |
+| **Write/Ingress Operations** | |
+| `zebridge_grant_edge_writes()` | Grants `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on a table to the `bridge_writer` role to permit edge mutations. |
+| `zebridge_install_write_guards()` | Helper function that sets up triggers for `bump_version`, `soft_delete`, and `guard_tenant` on a table. |
+| `zebridge_remove_write_guards()` | Clears the write guard triggers, useful when an admin needs to perform physical cleanups on a table that is restricted to soft-deletes. |
+| `zebridge_bump_version()` | Write trigger ensuring that any write omitting the version column (e.g., `updated_at`) gets appropriately stamped with the current timestamp. |
+| `zebridge_soft_delete()` | Write trigger converting physical `DELETE` statements on tables with a tombstone column into soft-deleting `UPDATE` operations. |
+| `zebridge_guard_tenant()` | Write trigger enforcing that a row's tenant is present and valid against NATS subject parameters (no whitespace or wildcards). Discards or falls back to the writer's mapped tenant. |
+| `zebridge_scope_writes_by_tenant()`| Multi-tenant configuration for edge writes. Sets up RLS and forces the creation of a unique `REPLICA IDENTITY` index (combining PK and tenant) so PostgreSQL routes `DELETE`s properly over CDC. |
+| `zebridge_scope_publication_to_one_tenant()` | Single-tenant alternative that uses a PostgreSQL publication row filter (`WHERE tenant = 'acme'`) to pin an entire publication to a specific tenant value. |
+| `zebridge_audit_write_guards()` | Audits all tables and reports which ones possess ZeBridge's write guard triggers. |
+| `zebridge_audit_sweeper()` | Checks if the internal sweeper principal (`zb_sweeper`) has any unreachable tenants, thereby helping track tenants whose tombstones won't get collected. |
+
+---
+
+## 8. Configuration Orphans
+
+The following constants in `src/config.zig` are declared but never referenced by any other `.zig` source file. They are effectively dead code:
+
+- **PostgreSQL (`Postgres`)**: `connection_timeout_ms`, `replication_receive_timeout_ms`, `wal_sender_timeout_seconds`, `max_wal_retention_gb`
+- **HTTP (`Http`)**: `metrics_path`, `health_path`
+- **WAL Monitoring (`WalMonitor`)**: `warning_threshold_bytes`, `critical_threshold_bytes`
+- **Snapshots (`Snapshot`)**: `max_concurrent_snapshots` (commented as declared/never read), `poll_interval_ms`
+- **Metrics (`Metrics`)**: `log_interval_seconds`, `debug_enabled`
+- **Retries (`Retry`)**: `flush_stall_timeout_ns`
+- **Threading (`Threading`)**: `wal_monitor_threads`, `snapshot_generator_threads`, `http_server_threads`, `main_loop_sleep_ms`
+- **Buffers (`Buffers`)**: `conninfo_buffer_size`, `url_buffer_size`
+
+---
+
+## 9. Dynamic Tenant Provisioning & JWT Auth
+
+ZeBridge's runtime publisher is entirely dynamic and does **not** rely on the `tenants` array in `topology.json` during operation. The `topology.json` tenant list is currently only used for a boot-time pre-flight check (to ensure streams exist before starting) and by the `nats-init` script to physically create the streams.
+
+When migrating to a **JWT / Operator Authentication** model, multi-tenancy can be managed dynamically with zero config reloads or bridge restarts:
+1. **Backend provisions stream:** The application backend dynamically creates the `CDC_<TENANT>` and `INIT_<TENANT>` JetStream streams via the NATS API.
+2. **Backend mints JWT:** The backend embeds the exact tenant boundaries (`cdc.<tenant>.>`) into the short-lived NATS user JWT.
+3. **Link User in DB:** A new mapping is inserted into `zebridge_user_tenants`.
+
+Once these steps occur, ZeBridge seamlessly picks up the new `tenant_id` from the Postgres WAL row, dynamically constructs the `cdc.<tenant>.<table>.<op>` subject, and publishes it. Since the stream was already created in JetStream by the backend, the data lands perfectly. 
+
+> [!NOTE]
+> **To Be Tested:** This fully dynamic mechanism needs to be empirically verified. The test should involve manually provisioning a new tenant stream in NATS, inserting a new user/tenant mapping row directly into `zebridge_user_tenants` (e.g., a new tenant that is intentionally omitted from `topology.json`), and verifying that ZeBridge routes and publishes the runtime CDC events to the new stream correctly without any restarts.

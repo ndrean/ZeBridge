@@ -64,6 +64,18 @@ TABLE = sys.argv[1] if len(sys.argv) > 1 else "users"
 SCRATCH = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
 
 
+# ⚠️ Same rule as `mutate.py` and `rowsize.py`: the principal is the NATS user this
+# script authenticates AS. Under nkey auth the URL carries no user at all, and reading
+# the host out of it produced `mutation.127.0.0.1.users.insert` — one token too many.
+# The bridge dead-letters a malformed subject with **no addressable verdict**, which
+# made every assertion below fail at once and looked exactly like a write-path leak.
+def principal() -> str:
+    if os.environ.get("ZB_PRINCIPAL"):
+        return os.environ["ZB_PRINCIPAL"]
+    rest = zb.NATS_URL.split("://", 1)[-1]
+    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
+
+
 def kv_raw(bucket: str, key: str) -> bytes | None:
     """A KV value as bytes, or None when absent."""
     import subprocess
@@ -144,6 +156,10 @@ async def main():
         # ⚠️ ONE client for everything below. The question is not "does some reader still
         # get CDC" — it is whether the client that was just refused still does. A refused
         # write must cost that client one message, not its subscription.
+        # ⚠️ Baseline, not zero: the registry legitimately holds tables refused at boot
+        # (no PK, no CDC route). The claim is that *this write* adds nothing to it.
+        refused_before = metric("bridge_refused_tables")
+
         nc = await zb.connect()
         js = nc.jetstream()
         cdc_seen = []
@@ -155,7 +171,7 @@ async def main():
 
         cdc_task = asyncio.create_task(watch_cdc())
         verdicts = {}
-        who0 = zb.NATS_URL.split("://", 1)[-1].rsplit("@", 1)[0].split(":", 1)[0]
+        who0 = principal()
         # ⚠️ `mutation_ack.>` is denied — a client is granted only its own subtree.
         sub = await nc.subscribe(f"mutation_ack.{who0}.*")
 
@@ -169,7 +185,7 @@ async def main():
         probe_id = 987654321
         msg_id = f"key-{os.urandom(6).hex()}"
         v = zb.psql("SELECT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US') || 'Z'").strip()
-        who = zb.NATS_URL.split("://", 1)[-1].rsplit("@", 1)[0].split(":", 1)[0]
+        who = who0
         await js.publish(
             zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], who, TABLE, "insert"),
             msgpack.packb({
@@ -220,7 +236,11 @@ async def main():
 
         # And a write to a DIFFERENT table, with a mintable key, which must be unaffected.
         other = "test_types"
-        tenant = zb.psql("SELECT tenant_id FROM zebridge_user_tenants LIMIT 1").strip()
+        # The tenant this principal is mapped to, or RLS refuses the write (same lookup
+        # as `mutate.py`); an unmapped principal falls back to the open tenant.
+        tenant = zb.psql(
+            f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal='{who0}' LIMIT 1"
+        ).strip() or os.environ.get("OPEN_TENANT", "public")
         other_uid = __import__("uuid").uuid4()
         ov = zb.psql("SELECT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US') || 'Z'").strip()
         await js2.publish(
@@ -276,14 +296,17 @@ async def main():
         # The registry drives CDC dropping. A write refusal must never reach it — and the
         # mutation listener holds no reference to it, which this is the end-to-end proof of.
         refused_now = metric("bridge_refused_tables")
-        if refused_now in (0, 0.0):
-            zb.ok("and no table is in the refused registry — the write path never touches it")
-        elif refused_now is None:
+        if refused_now is None or refused_before is None:
             print("  ⓘ  /metrics unreachable — skipping the registry check")
+        elif refused_now == refused_before:
+            zb.ok(
+                f"and the refused registry did not move ({refused_now:.0f} before and after) — "
+                "the write path never touches it"
+            )
         else:
             zb.bad(
-                f"bridge_refused_tables is {refused_now:.0f}: a write-path refusal reached the "
-                "shared registry, which drops CDC for every reader"
+                f"bridge_refused_tables went {refused_before:.0f} → {refused_now:.0f}: a "
+                "write-path refusal reached the shared registry, which drops CDC for every reader"
             )
             failed += 1
 
