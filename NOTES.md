@@ -2478,6 +2478,7 @@ The functions are divided into read-only configurations, edge-write guard config
 | **Read/CDC Operations** | |
 | `zebridge_scope_reads_by_tenant()` | Enables RLS on a table to restrict snapshot `SELECT` operations to the active session's tenant. |
 | `zebridge_publication_guard()` | Event trigger function protecting against unscoped `ALTER PUBLICATION ... ADD TABLE`. Rejects publications of tables without row-filters or RLS unless they are registered as public. |
+| `zebridge_timestamp_guard()` | Event trigger function refusing any `CREATE`/`ALTER TABLE` in `public` that introduces a `timestamp without time zone` column — §7.2's wire format and version clamping need absolute instants. `zebridge_is_internal_table` names are exempt (Ecto's `schema_migrations` is naive by design). |
 | `zebridge_audit_publications()` | Audits the database to ensure no tables are published without appropriate tenant scoping. |
 | `zebridge_ddl_trigger_fn()` | Event trigger running on `ddl_command_end` to capture modified table schemas directly from the catalog and log them as `INSERT`s into `zebridge_ddl_events`. |
 | `zebridge_drop_trigger_fn()` | Event trigger running on `sql_drop` to inform clients when tables are permanently deleted by logging the event into `zebridge_ddl_events`. |
@@ -2490,11 +2491,44 @@ The functions are divided into read-only configurations, edge-write guard config
 | `zebridge_remove_write_guards()` | Clears the write guard triggers, useful when an admin needs to perform physical cleanups on a table that is restricted to soft-deletes. |
 | `zebridge_bump_version()` | Write trigger ensuring that any write omitting the version column (e.g., `updated_at`) gets appropriately stamped with the current timestamp. |
 | `zebridge_soft_delete()` | Write trigger converting physical `DELETE` statements on tables with a tombstone column into soft-deleting `UPDATE` operations. |
-| `zebridge_guard_tenant()` | Write trigger enforcing that a row's tenant is present and valid against NATS subject parameters (no whitespace or wildcards). Discards or falls back to the writer's mapped tenant. |
+| `zebridge_guard_tenant()` | Write trigger on tenant-routed tables. An absent/empty tenant is resolved through `zebridge_user_tenants` by `zb.principal` — and **fails closed** (raises) when the principal is unset or unmapped, rather than leaving a row unroutable. A tenant containing a NATS subject metacharacter (`.` `*` `>` or space) is rejected outright: it would route to a subject no consumer receives. |
 | `zebridge_scope_writes_by_tenant()` | Multi-tenant configuration for edge writes. Sets up RLS and forces the creation of a unique `REPLICA IDENTITY` index (combining PK and tenant) so PostgreSQL routes `DELETE`s properly over CDC. |
 | `zebridge_scope_publication_to_one_tenant()` | Single-tenant alternative that uses a PostgreSQL publication row filter (`WHERE tenant = 'acme'`) to pin an entire publication to a specific tenant value. |
 | `zebridge_audit_write_guards()` | Audits all tables and reports which ones possess ZeBridge's write guard triggers. |
 | `zebridge_audit_sweeper()` | Checks if the internal sweeper principal (`zb_sweeper`) has any unreachable tenants, thereby helping track tenants whose tombstones won't get collected. |
+
+
+### Event triggers (the objects the functions above are wired to)
+
+| Trigger | Fires on | Function |
+| :--- | :--- | :--- |
+| `zebridge_ddl_trigger` | `ddl_command_end` | `zebridge_ddl_trigger_fn()` — captures the schema inside the DDL transaction |
+| `zebridge_drop_trigger` | `sql_drop` | `zebridge_drop_trigger_fn()` — drops never reach `ddl_command_end` |
+| `zebridge_publication_guard_t` | `ddl_command_end`, tag `ALTER PUBLICATION` | `zebridge_publication_guard()` |
+| `zebridge_timestamp_guard_t` | `ddl_command_end`, tags `CREATE TABLE`/`CREATE TABLE AS`/`ALTER TABLE` | `zebridge_timestamp_guard()` |
+
+### Table triggers (installed per guarded table by `zebridge_install_write_guards()`)
+
+These are the trigger *objects* the write-guard functions run as — one set per table,
+which is why `zebridge_audit_write_guards()` exists to report which tables actually
+carry them:
+
+| Trigger | Timing | Behaviour |
+| :--- | :--- | :--- |
+| `zebridge_bump_version_t` | `BEFORE UPDATE` | stamps the version column when a writer leaves it untouched |
+| `zebridge_soft_delete_t` | `BEFORE DELETE` | converts a physical DELETE into a tombstoning UPDATE — **except** when `zb.principal = 'zb_sweeper'`, the carve-out that lets the sweeper actually reap |
+| `zebridge_guard_tenant_t` | `BEFORE INSERT OR UPDATE` | `zebridge_guard_tenant()` — see the functions table |
+
+### Roles & policies
+
+| Object | Kind | Role / Description |
+| :--- | :--- | :--- |
+| `bridge_reader` (`POSTGRES_BRIDGE_USER`) | PG role | REPLICATION + SELECT everywhere. The read path, physically unable to write. Its snapshot SELECTs are scoped by `zb_reader_all` when the connection sets `zb.tenant`; RLS never touches CDC (logical decoding has no query). |
+| `bridge_writer` (`POSTGRES_WRITER_USER`) | PG role | Ingress. Created with **no table privileges** — tables open one at a time via `zebridge_grant_edge_writes()`. Writes are tenant-bounded by `zb_tenant_write` reading `zb.principal`. |
+| `zb_sweeper` | **not** a PG role | A `zb.principal` GUC value plus `zebridge_user_tenants` rows (one per tenant, or its reaps see nothing under RLS). Set by the bridge's own sweeper (`src/gc.zig`); recognised by `zebridge_soft_delete_t`'s bypass so tombstones can actually be removed. `zebridge_audit_sweeper()` reports tenants it cannot reach. |
+| `postgres` (admin) | PG role | Init/render and migrations only. The bridge never reads its credentials (`args.zig` rejects the PG_* fallback by design). |
+| `zb_reader_all` | RLS policy | On tenant-read-scoped tables, for `bridge_reader`: everything when `zb.tenant` is unset, that tenant plus the open tenant when set. |
+| `zb_tenant_write` | RLS policy | On tenant-write-scoped tables, for `bridge_writer`: the row's tenant must match the one derived from `zb.principal` — fail-closed when underivable. |
 
 ---
 
@@ -2526,4 +2560,13 @@ When migrating to a **JWT / Operator Authentication** model, multi-tenancy can b
 Once these steps occur, ZeBridge seamlessly picks up the new `tenant_id` from the Postgres WAL row, dynamically constructs the `cdc.<tenant>.<table>.<op>` subject, and publishes it. Since the stream was already created in JetStream by the backend, the data lands perfectly.
 
 > [!NOTE]
-> **To Be Tested:** This fully dynamic mechanism needs to be empirically verified. The test should involve manually provisioning a new tenant stream in NATS, inserting a new user/tenant mapping row directly into `zebridge_user_tenants` (e.g., a new tenant that is intentionally omitted from `topology.json`), and verifying that ZeBridge routes and publishes the runtime CDC events to the new stream correctly without any restarts.
+> **Tested 2026-08-24, and it holds — `scripts/scenarios/dyntenant.py` is the runnable
+> proof.** Against a live bridge, with tenant `dynten` deliberately absent from
+> `topology.json`: `CDC_DYNTEN`/`INIT_DYNTEN` provisioned at runtime, a
+> `zebridge_user_tenants` mapping propagated to `$KV.tenants.<principal>` with no
+> restart, and a `test_types` row with `tenant_id='dynten'` published to
+> `cdc.dynten.test_types.insert` in the new stream — routed from the row's tenant
+> value alone. One contract is load-bearing: **the stream must exist before the first
+> write** — a tenant-routed row whose subject matches no stream is the §2.19 blocking
+> shape (no PubAck, retries, eventual bridge FATAL). The backend's provisioning step
+> is therefore step 1, not housekeeping.

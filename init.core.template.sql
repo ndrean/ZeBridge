@@ -693,6 +693,61 @@ BEGIN
     END IF;
 END $$;
 
+-- Refuses CREATE/ALTER TABLE that introduces a `timestamp without time zone` column.
+-- The version protocol depends on it: version columns travel in §7.2's wire format
+-- (UTC, trailing Z), are compared and clamped as absolute instants, and a naive
+-- timestamp makes two writers in different zones disagree about which write is newer —
+-- silently, per row. The rule lived in prose ("use timestamptz") until a migration
+-- forgot it; this is the mechanical form, same pattern as zebridge_publication_guard:
+-- refuse at the source, inside the DDL transaction, so the migration fails whole.
+--
+-- ⚠️ `zebridge_is_internal_table` names are exempt — Ecto's own `schema_migrations`
+-- uses naive timestamps by design, and blocking it would stop `mix ecto.migrate`'s
+-- very first statement on a fresh database. Scoped to ordinary tables in `public`;
+-- a deliberate exception is a DBA act:
+--   ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate; then ENABLE
+-- refuses naive-timestamp columns — see SECURITY.md §1.3
+CREATE OR REPLACE FUNCTION public.zebridge_timestamp_guard()
+RETURNS event_trigger AS $$
+DECLARE
+    r       record;
+    bad_col text;
+    rel     text;
+BEGIN
+    FOR r IN SELECT * FROM pg_event_trigger_ddl_commands()
+             WHERE command_tag IN ('CREATE TABLE', 'CREATE TABLE AS', 'ALTER TABLE')
+               AND object_type IN ('table', 'table column')
+    LOOP
+        SELECT c.relname INTO rel
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = r.objid AND n.nspname = 'public' AND c.relkind IN ('r', 'p');
+        CONTINUE WHEN rel IS NULL;
+        CONTINUE WHEN public.zebridge_is_internal_table(rel);
+
+        SELECT a.attname INTO bad_col
+        FROM pg_attribute a
+        JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = r.objid
+          AND t.typname = 'timestamp'
+          AND a.attnum > 0 AND NOT a.attisdropped
+        LIMIT 1;
+
+        IF FOUND THEN
+            RAISE EXCEPTION
+                'migration rejected: column "%" on table "%" is "timestamp without time zone" — use timestamptz (Ecto: timestamps(type: :timestamptz)). Version comparison and the §7.2 wire format need absolute instants.',
+                bad_col, rel;
+        END IF;
+        rel := NULL;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP EVENT TRIGGER IF EXISTS zebridge_timestamp_guard_t;
+CREATE EVENT TRIGGER zebridge_timestamp_guard_t ON ddl_command_end
+    WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'ALTER TABLE')
+    EXECUTE FUNCTION public.zebridge_timestamp_guard();
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- The T2 entry point — one call instead of six remembered ones (NOTES.md §4.5)
 -- ─────────────────────────────────────────────────────────────────────────────

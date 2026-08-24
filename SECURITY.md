@@ -241,6 +241,19 @@ correct CDC routing and an entirely unscoped write path.
 ⚠️ Dropping that index drops the replica identity with it, and `UPDATE`/`DELETE` then fail
 with an error naming something else entirely.
 
+**Timestamps are `timestamptz`, and the rule is mechanical.** Version columns travel
+in §7.2's UTC wire format and are compared and clamped as absolute instants; a naive
+`timestamp` lets two writers in different zones disagree about which write is newer,
+silently, per row. `zebridge_timestamp_guard` (an event trigger, same pattern as the
+publication guard) refuses any `CREATE TABLE`/`ALTER TABLE` in `public` that
+introduces a `timestamp without time zone` column — the migration fails whole, inside
+its own transaction. `zebridge_is_internal_table` names are exempt (Ecto's
+`schema_migrations` is naive by design). A deliberate exception is a DBA act:
+
+```sql
+ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
+```
+
 ### 1.4 PostgreSQL: after every migration
 
 1. **Open new tables explicitly** — the full sequence for the shape the table needs (§1.2:
