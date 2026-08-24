@@ -216,3 +216,18 @@ Verified after the bump: `zig build` and `zig build test` clean (Debug and Relea
 bridge boots against the Docker stack, `keys.py` passes 7/7 (exercises the pull-fetch
 loop fix 3 guards), and the `MUTATIONS` durable shows `num_waiting: 0` after the run —
 no parked-pull storm.
+
+**TLS verified (2026-08-24).** The library's own e2e TLS suite passes 8/8 against real
+`nats-server` containers (`TEST_FILTER="tls e2e" zig build test-e2e`): CA-verified
+connect, verification failure without the CA, insecure-skip-verify, handshake-first,
+mutual TLS with `verify_and_map` as the authentication, rejection without/with an
+unmapped client cert, and reconnect over TLS. On top of that, a standalone probe ran the
+bridge's workload shape — `addStream`, acked `js.publish`, durable `pullSubscribe` +
+`fetch` + ack — against a host `nats-server` with only a `tls{}` listener
+(JetStream on, CA-verified, no insecure flags): all green. That probe is now permanent:
+`scripts/scenarios/tls.py` provisions the server, builds the probe against the
+submodule, and asserts both the verified round trip and that a connect *without* the CA
+is refused (`CertificateIssuerNotFound`). So `tls://` is real for
+both core NATS and JetStream, which reopens the door the colocation constraint closed —
+a bridge talking to a remote NATS (e.g. a per-tenant leaf) over TLS is now a client
+capability, not a wish.

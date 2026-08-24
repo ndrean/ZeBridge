@@ -1282,6 +1282,59 @@ grace delay after the swap, once no reader could plausibly still be attached to 
 snapshot_id-per-generation shape already in production, just an object instead of a
 chunk-message run underneath each generation.
 
+#### Delta generations — catch-up without touching PostgreSQL (sketch, 2026-08-24)
+
+Context for this sketch: the client-side motivation is that replaying missed CDC on top
+of a snapshot is very slow even inside one transaction, and the cadence-built
+per-tenant snapshot (the "leaf" idea above) removes most of that replay. The question
+was whether a client that already holds data can catch up incrementally instead of
+re-fetching the full object.
+
+**Not by chunk index.** Today's chunks are keyset-paginated row-count windows, so chunk
+N's boundaries depend on every row before it — one insert anywhere shifts every later
+boundary, and "which chunks am I missing" means nothing across generations. The
+partial-last-chunk worry is a symptom of that instability, not a special case to solve.
+
+**Not by on-demand delta either, and the reason is the storm.** A delta query
+(`WHERE version > my_max_version`) is keyed by *client state*, not by (table, tenant).
+The full-snapshot path survives a thousand simultaneous arrivals because they collapse —
+`REQUESTS` is `max_msgs_per_subject=1`, one request enters the window, everyone reuses
+the result (`stampede.py`). A thousand clients each carrying their own `max_version` ask
+a thousand different questions: nothing dedupes, every arrival is a PostgreSQL scan.
+On-demand delta is the one variant that re-couples PG load to client arrival rate —
+exactly what the cadence design exists to break.
+
+**The shape that works: key deltas by generation, not by client.** The cron job that
+builds generation N also publishes "delta N−1 → N" in the same pass — one extra bounded
+query per tenant/table per tick (`WHERE version > cutoff(N−1)`), cost independent of
+client count — and keeps the last k deltas. A connecting client asks PostgreSQL nothing:
+it reads the pointer (current full object + delta lineage), knows its own last
+generation M, and fetches the N−M small delta objects from NATS, applying them in order
+as plain upserts — last-write-wins is already the house rule (§1.9), and tombstones ride
+in the delta so deletes apply too. Too far behind, or older than what tombstone
+retention can vouch for → take the full object. Every artifact is shared and cacheable;
+fan-out lands on NATS (and on per-tenant leaf nodes at the edge, now reachable over TLS
+— see NATS_ZIG_NOTES.md §4), while PostgreSQL's total load is tenants × tables per
+cadence, flat whether ten clients connect or ten thousand. Classic base-plus-
+incrementals, and it composes with the pointer-swap design above: the pointer just
+grows a chain.
+
+The bucket-digest alternative (stable PK-range partitions + per-bucket digests,
+PowerSync-style) solves the storm the same way — buckets are precomputed per generation,
+clients self-select — so the storm argument does not choose between them; it only rules
+out on-demand anything. Generation-deltas are less machinery: no partitioning scheme,
+no digests, just cutoffs the version column already provides. Buckets are the
+escalation if delta scans on very large tables ever hurt, or if clients must be
+arbitrarily stale without ever taking a full object.
+
+⚠️ **The cadence becomes a correctness parameter, not a freshness knob.** Two pieces of
+retention hang off it: the delta chain (k × cadence of catch-up depth) and tombstone
+retention (the sweeper must not reap a tombstone before every client that could still
+apply it as a delta has had the chance — sweeper retention > k × cadence, or a
+hard-deleted row silently survives on a stale client). Same class of arithmetic
+`descriptorStillFresh()` guards today for CDC gaps; the check needs a home, not a new
+idea.
+
 ### 1.13 Pipeline the flush thread — encode the next batch while NATS acks the current one
 
 `batch_publisher.zig`'s `flushLoop` is fully synchronous today: drain events into a batch,
