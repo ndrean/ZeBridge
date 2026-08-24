@@ -71,6 +71,14 @@ METRICS_PORT = 9096  # ZB_BRIDGE_ARGS' default --port
 BRIDGE_ENV = {
     "BASE_BUF": os.environ.get("SPEED_BASE_BUF", "11"),
     "RING_BUFFER_COUNT": os.environ.get("SPEED_RING_BUFFER_COUNT", "65536"),
+    # ⚠️ FORCED to info, not defaulted — `bridge_env`'s `setdefault` respects an
+    # inherited LOG_LEVEL, and `.env.bridge`/dev shells commonly carry
+    # LOG_LEVEL=debug. At debug the bridge logs PER EVENT (a `writev` per line from
+    # the hot path), which cost a measured **4x CPU per event** (8.5s → 35s for 2M)
+    # and reported ~55k ev/s on a machine whose real number is ~160k — three days
+    # spent looking regression-shaped, entirely the harness's own logging. A
+    # benchmark at debug measures the logger, not the bridge (NOTES.md §4.6).
+    "LOG_LEVEL": os.environ.get("SPEED_LOG_LEVEL", "info"),
 }
 
 

@@ -1009,211 +1009,177 @@ pub const BatchPublisher = struct {
         }
     }
 
-    /// Publish a run of CDC events, grouped by subject.
+    /// Publish a run of CDC events — lane-aware grouping, async across lanes.
     ///
     /// A flush batch is drained from the ring buffer indiscriminately, so one run can
-    /// mix operations AND tables. This used to publish the whole run under the first
-    /// event's subject, which misrouted everything else in it: a DELETE batched behind
-    /// an INSERT landed on `cdc.<table>.insert.batch`, and a run spanning two tables
-    /// published one table's rows under the other's subject. Payloads still carried
-    /// the right per-event `subject`/`table`/`operation`, so nothing was lost — but
-    /// subject filtering, which is the documented consumer pattern, returned wrong
-    /// data and leaked rows across tables.
+    /// mix operations AND tables. Two rules shape what goes on the wire (NOTES.md
+    /// §1.13/§1.18):
     ///
-    /// Groups are emitted in first-appearance order, so a causal sequence on the same
-    /// row (INSERT then DELETE in one transaction) still reaches the stream in the
-    /// right order for a consumer reading `cdc.>`.
+    ///   * **A lane is a subject minus its operation token** (`cdc.[tenant.]<table>`),
+    ///     and a lane's events must reach the stream in arrival order. Coalescing a
+    ///     subject's events across the whole run — what this did before — broke that
+    ///     for same-key verb alternation: `INSERT(1), DELETE(2), INSERT(3)` became
+    ///     `insert[1,3]` then `delete[2]`, and the client deleted a row PostgreSQL
+    ///     has. A lane's group therefore splits at each of ITS OWN verb changes.
+    ///   * **Across lanes there is nothing to preserve** — cross-table order inside a
+    ///     stream was never guaranteed — so different lanes still coalesce freely
+    ///     (interleaved `t1,t2,t1,t2` inserts remain two batch messages, not many).
+    ///
+    /// Publishing: one group is the synchronous fast path. Several groups over
+    /// distinct lanes go through an async PubAck window — write them all in order on
+    /// the one connection, then collect every ack — so a run spanning N lanes pays
+    /// roughly one ack wait instead of N. A run where some lane alternates verbs
+    /// (rare: it needs same-table verb flips inside one ≤500 ms window) publishes
+    /// fully synchronously: consecutive runs of one lane must never share a window,
+    /// or a partial failure could store run N+1 while run N is re-published later.
     fn publishCDCSubBatch(self: *BatchPublisher, indices: []usize) !void {
         if (indices.len == 0) return;
         if (indices.len == 1) return self.publishSubjectGroup(indices);
 
-        // Same arena as doPublish, which called this and reset it fresh — grouping
-        // bookkeeping and the encode work below share one lifetime.
+        // Same arena as doPublish, which called this and reset it fresh.
         const flush_alloc = self.encode_arena.allocator();
 
-        // Subjects in first-appearance order; the map holds each subject's indices.
-        var order: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer order.deinit(flush_alloc);
-
-        var groups = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(flush_alloc);
-        defer {
-            var it = groups.valueIterator();
-            while (it.next()) |list| list.deinit(flush_alloc);
-            groups.deinit();
-        }
+        const Group = struct { subject: []const u8, indices: std.ArrayListUnmanaged(usize) };
+        var groups: std.ArrayListUnmanaged(Group) = .empty;
+        const Lane = struct { subject: []const u8, group: usize };
+        var lanes = std.StringHashMap(Lane).init(flush_alloc);
+        defer lanes.deinit();
+        var lane_repeat = false;
 
         for (indices) |slot_idx| {
             // Slices into the slot's inline subject_buf; slots are not reset until
             // after publishing, so these stay valid for the life of this call.
             const subject = self.events[slot_idx].getSubject();
-            const gop = try groups.getOrPut(subject);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .empty;
-                try order.append(flush_alloc, subject);
+            const lane_key = subject[0 .. std.mem.lastIndexOfScalar(u8, subject, '.') orelse subject.len];
+            const gop = try lanes.getOrPut(lane_key);
+            if (gop.found_existing and std.mem.eql(u8, gop.value_ptr.subject, subject)) {
+                try groups.items[gop.value_ptr.group].indices.append(flush_alloc, slot_idx);
+                continue;
             }
-            try gop.value_ptr.append(flush_alloc, slot_idx);
+            if (gop.found_existing) lane_repeat = true; // this lane changed verb mid-run
+            try groups.append(flush_alloc, .{ .subject = subject, .indices = .empty });
+            try groups.items[groups.items.len - 1].indices.append(flush_alloc, slot_idx);
+            gop.value_ptr.* = .{ .subject = subject, .group = groups.items.len - 1 };
         }
 
-        // Homogeneous run: avoid the copy and publish it directly.
-        if (order.items.len == 1) return self.publishSubjectGroup(indices);
+        if (groups.items.len == 1) return self.publishSubjectGroup(indices);
 
-        log.debug("📦 Flush run spans {d} subjects — publishing one message each", .{order.items.len});
+        if (lane_repeat) {
+            log.debug("📦 Flush run spans {d} groups with a lane verb-alternation — publishing sequentially", .{groups.items.len});
+            for (groups.items) |*g| try self.publishSubjectGroup(g.indices.items);
+            return;
+        }
 
-        for (order.items) |subject| {
-            const group = groups.get(subject).?;
-            try self.publishSubjectGroup(group.items);
+        log.debug("📦 Flush run spans {d} distinct lanes — async PubAck window", .{groups.items.len});
+        var win = try self.publisher.beginWindow(self.allocator);
+        defer win.deinit();
+        var total: usize = 0;
+        for (groups.items) |*g| {
+            const eg = try self.encodeGroup(g.indices.items);
+            try win.publish(eg.subject, eg.msg_id, eg.payload);
+            total += eg.count;
+        }
+        try win.drain(Config.Nats.publish_ack_timeout_ms);
+        // Counted only after every ack landed — same "delivered, not produced"
+        // invariant as timedPublish's call sites.
+        if (self.metrics) |m| {
+            for (0..total) |_| m.incrementCdcEvents();
         }
     }
 
-    /// Publish events that all share one subject. Callers must guarantee that;
+    /// One wire message, encoded but not yet published. Slices live in the flush
+    /// arena; valid until doPublish's reset.
+    const EncodedGroup = struct {
+        subject: []const u8,
+        msg_id: []const u8,
+        payload: []const u8,
+        count: usize,
+    };
+
+    /// Encode a same-subject group: a single event publishes bare, several publish as
+    /// a `.batch` array. Callers must guarantee the shared subject; the grouping in
     /// publishCDCSubBatch is what establishes it.
-    ///
-    /// Every allocation here — the msgpack/JSON value tree, the encoded bytes, the
-    /// batch subject/msg-id — comes from `doPublish`'s arena and needs no individual
-    /// `.free()`: the caller resets the whole arena once this flush's publish calls
-    /// return, which is the same "arena.deinit() handles everything" pattern the WAL
-    /// parse loop uses. Freeing any of it here would be freeing arena memory through
-    /// `self.allocator` (c_allocator/DebugAllocator), which does not own it.
-    fn publishSubjectGroup(self: *BatchPublisher, indices: []usize) !void {
+    fn encodeGroup(self: *BatchPublisher, indices: []usize) !EncodedGroup {
         const flush_alloc = self.encode_arena.allocator();
         const event_count = indices.len;
 
-        // For single event, encode and publish directly
         if (event_count == 1) {
-            const slot_idx = indices[0];
-            const event = &self.events[slot_idx];
-
+            const event = &self.events[indices[0]];
             var encoder = encoder_mod.Encoder.init(flush_alloc, .msgpack);
-
             var event_map = encoder.createMap();
-
             try event_map.put(encoder.allocator, "subject", try encoder.createString(event.getSubject()));
             try event_map.put(encoder.allocator, "table", try encoder.createString(event.getTable()));
             try event_map.put(encoder.allocator, "operation", try encoder.createString(event.getOperation()));
             try event_map.put(encoder.allocator, "msg_id", try encoder.createString(event.getMsgId()));
             try event_map.put(encoder.allocator, "relation_id", encoder.createInt(@intCast(event.relation_id)));
             try event_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(event.lsn)));
-
-            // Add column data from packed buffer
             if (event.column_count > 0) {
-                log.debug("Single event has {d} columns", .{event.column_count});
                 var data_map = encoder.createMap();
-
-                // Iterate over column descriptors and decode from packed buffer
                 for (event.columns[0..event.column_count]) |col_view| {
-                    // Extract column name from packed buffer
                     const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
-
-                    // Decode value based on type tag. An absent key means "unchanged",
-                    // which is what Postgres said.
+                    // Absent key = "unchanged", which is what Postgres said.
                     const value_enc = try decodePackedValue(&encoder, event, col_view) orelse continue;
                     try data_map.put(encoder.allocator, col_name, value_enc);
                 }
-
                 try event_map.put(encoder.allocator, "data", data_map);
             }
-
             const encoded = try encoder.encode(event_map);
-
-            // Create headers with message ID for deduplication
-                    const msg_id = event.getMsgId();
-
-            try self.timedPublish(event.getSubject(), msg_id, encoded);
-
-            // ⚠️ Counted here too, not only in the batch path below.
-            //
-            // It was missing, and the omission was invisible at load and glaring at idle:
-            // a burst goes through the batch path and increments, while a demo doing one
-            // insert at a time goes through *this* path and never did — so
-            // `bridge_cdc_events_published_total` read **0** while `cdc.users.insert`
-            // was demonstrably on the wire. The metric said the bridge was dead when it
-            // was working, which is the worst direction for a counter to be wrong in.
-            if (self.metrics) |m| m.incrementCdcEvents();
-
-            log.debug("Published single event: {s}", .{event.getSubject()});
-        } else {
-            // Batch publishing
-            var encoder = encoder_mod.Encoder.init(flush_alloc, .msgpack);
-
-            var batch_array = try encoder.createArray(event_count);
-
-            const encode_start = utils.getMilliTimestamp();
-
-            for (indices, 0..) |slot_idx, i| {
-                const event = &self.events[slot_idx];
-
-                var event_map = encoder.createMap();
-
-                try event_map.put(encoder.allocator, "subject", try encoder.createString(event.getSubject()));
-                try event_map.put(encoder.allocator, "table", try encoder.createString(event.getTable()));
-                try event_map.put(encoder.allocator, "operation", try encoder.createString(event.getOperation()));
-                try event_map.put(encoder.allocator, "msg_id", try encoder.createString(event.getMsgId()));
-                try event_map.put(encoder.allocator, "relation_id", encoder.createInt(@intCast(event.relation_id)));
-                try event_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(event.lsn)));
-
-                // Add column data from packed buffer
-                if (event.column_count > 0) {
-                    var data_map = encoder.createMap();
-
-                    for (event.columns[0..event.column_count]) |col_view| {
-                        const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
-                        // Absent key = "unchanged", which is what Postgres said.
-                        const value_enc = try decodePackedValue(&encoder, event, col_view) orelse continue;
-                        try data_map.put(encoder.allocator, col_name, value_enc);
-                    }
-
-                    try event_map.put(encoder.allocator, "data", data_map);
-                }
-
-                try batch_array.setIndex(i, event_map);
-            }
-
-            const encoded = try encoder.encode(batch_array);
-
-            const encode_elapsed = utils.getMilliTimestamp() - encode_start;
-
-            // Publish the batch with a composite message ID
-            const publish_start = utils.getMilliTimestamp();
-            const first_event = &self.events[indices[0]];
-            const last_event = &self.events[indices[event_count - 1]];
-            const batch_msg_id = try std.fmt.allocPrint(
-                flush_alloc,
-                "batch-{s}-to-{s}",
-                .{ first_event.getMsgId(), last_event.getMsgId() },
-            );
-
-            const batch_subject = try std.fmt.allocPrint(
-                flush_alloc,
-                "{s}.batch",
-                .{first_event.getSubject()},
-            );
-
-            const msg_id = batch_msg_id;
-
-            try self.timedPublish(batch_subject, msg_id, encoded);
-            const publish_elapsed = utils.getMilliTimestamp() - publish_start;
-
-            // Counted **here**, on a publish the server acknowledged — not when the event
-            // was packed into a ring-buffer slot, which is where this used to live.
-            //
-            // That placement made `bridge_cdc_events_published_total` count events the
-            // bridge had *produced*, under a name promising events it had *delivered*.
-            // When oversized batches were being refused by the server, the metric read
-            // 50 000 published against a stream holding zero — the dashboard's "NATS
-            // Events Out" line was green throughout total data loss. A counter that
-            // cannot distinguish those two states cannot be alerted on.
-            if (self.metrics) |m| {
-                for (0..event_count) |_| m.incrementCdcEvents();
-            }
-
-            log.debug("📤 Published batch: {d} events, {d} bytes to {s} (encode: {d}ms, publish: {d}ms)", .{
-                event_count,
-                encoded.len,
-                batch_subject,
-                encode_elapsed,
-                publish_elapsed,
-            });
+            return .{ .subject = event.getSubject(), .msg_id = event.getMsgId(), .payload = encoded, .count = 1 };
         }
+
+        var encoder = encoder_mod.Encoder.init(flush_alloc, .msgpack);
+        var batch_array = try encoder.createArray(event_count);
+        for (indices, 0..) |slot_idx, i| {
+            const event = &self.events[slot_idx];
+            var event_map = encoder.createMap();
+            try event_map.put(encoder.allocator, "subject", try encoder.createString(event.getSubject()));
+            try event_map.put(encoder.allocator, "table", try encoder.createString(event.getTable()));
+            try event_map.put(encoder.allocator, "operation", try encoder.createString(event.getOperation()));
+            try event_map.put(encoder.allocator, "msg_id", try encoder.createString(event.getMsgId()));
+            try event_map.put(encoder.allocator, "relation_id", encoder.createInt(@intCast(event.relation_id)));
+            try event_map.put(encoder.allocator, "lsn", encoder.createInt(@intCast(event.lsn)));
+            if (event.column_count > 0) {
+                var data_map = encoder.createMap();
+                for (event.columns[0..event.column_count]) |col_view| {
+                    const col_name = event.data_buffer[col_view.name_offset..][0..col_view.name_len];
+                    // Absent key = "unchanged", which is what Postgres said.
+                    const value_enc = try decodePackedValue(&encoder, event, col_view) orelse continue;
+                    try data_map.put(encoder.allocator, col_name, value_enc);
+                }
+                try event_map.put(encoder.allocator, "data", data_map);
+            }
+            try batch_array.setIndex(i, event_map);
+        }
+        const encoded = try encoder.encode(batch_array);
+
+        const first_event = &self.events[indices[0]];
+        const last_event = &self.events[indices[event_count - 1]];
+        const batch_msg_id = try std.fmt.allocPrint(
+            flush_alloc,
+            "batch-{s}-to-{s}",
+            .{ first_event.getMsgId(), last_event.getMsgId() },
+        );
+        const batch_subject = try std.fmt.allocPrint(
+            flush_alloc,
+            "{s}.batch",
+            .{first_event.getSubject()},
+        );
+        return .{ .subject = batch_subject, .msg_id = batch_msg_id, .payload = encoded, .count = event_count };
+    }
+
+    /// Encode and publish one same-subject group synchronously.
+    ///
+    /// Counted **after** the acked publish, not when the event was packed into a
+    /// ring-buffer slot — a counter that counts produced-not-delivered events reads
+    /// green through total data loss (this file's history; see the metric's own
+    /// exposition comment).
+    fn publishSubjectGroup(self: *BatchPublisher, indices: []usize) !void {
+        const eg = try self.encodeGroup(indices);
+        try self.timedPublish(eg.subject, eg.msg_id, eg.payload);
+        if (self.metrics) |m| {
+            for (0..eg.count) |_| m.incrementCdcEvents();
+        }
+        log.debug("📤 Published {d} event(s), {d} bytes to {s}", .{ eg.count, eg.payload.len, eg.subject });
     }
 
     /// Flush a batch to NATS with retry logic and exponential backoff

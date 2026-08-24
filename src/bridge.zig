@@ -336,6 +336,15 @@ pub fn main(init: std.process.Init) !void {
     // replace and disappears at exactly the setting that asked to see it.
     runtime_log_level = Config.getDefaultLogLevel(&init);
     log.debug("LOG_LEVEL → runtime log level: {s}", .{@tagName(runtime_log_level)});
+    // Loud on purpose, and warn-level so it survives every filter: debug logs PER
+    // EVENT from the hot path (a writev per line), measured at **4x CPU per event**
+    // under burst (8.5s → 35s for 2M) — a benchmark run at debug measures the logger,
+    // not the bridge. This has now been rediscovered twice via a LOG_LEVEL=debug
+    // inherited from a dev shell (`.env.bridge` used to carry it); the third time
+    // should cost one glance at the boot log. NOTES.md §1.13.
+    if (runtime_log_level == .debug) {
+        log.warn("⚠️  LOG_LEVEL=debug: per-event hot-path logging costs ~4x CPU under load — throughput numbers taken at this level are invalid", .{});
+    }
     const io = init.io;
     const IS_DEBUG = builtin.mode == .Debug;
 

@@ -144,6 +144,12 @@ pub const Nats = struct {
     /// Not in topology.json, and not a name anyone is free to choose — it is the server's.
     pub const kv_subject_prefix = "$KV.";
 
+    /// How long the async publish window waits for the last outstanding PubAck before
+    /// failing the whole flush into the retry path (NOTES.md §1.13). Matches the
+    /// JetStream client's own request-timeout order of magnitude; a healthy colocated
+    /// ack is ~1–2 ms, so hitting this means the server is gone, not slow.
+    pub const publish_ack_timeout_ms: i64 = 10_000;
+
     // Stream names, subject prefixes, subject patterns and KV bucket names all used to
     // live here as `pub const`s fed by build.zig's @embedFile of topology.json. They are
     // now fields on `RuntimeConfig.topology`, read from that file at startup — see

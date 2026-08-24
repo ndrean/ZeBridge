@@ -1366,7 +1366,7 @@ hard-deleted row silently survives on a stale client). Same class of arithmetic
 `descriptorStillFresh()` guards today for CDC gaps; the check needs a home, not a new
 idea.
 
-### 1.13 Pipeline the flush thread — encode the next batch while NATS acks the current one
+### 1.13 Async publish lanes — the plan (supersedes "pipeline the flush thread")
 
 `batch_publisher.zig`'s `flushLoop` is fully synchronous today: drain events into a batch,
 `flushBatch` → `doPublish`, wait for the publish to return, only then start draining the
@@ -1391,6 +1391,226 @@ territory, not sub-millisecond noise. Still to do before building: read the same
 number under the README burst load (the ack wait under fsync pressure is the one
 that matters), and judge any pipelining change against the burst benchmark by
 iters delta, not by intuition about which side "must" be slow.
+
+**Checked against the code (2026-08-24), because the design depends on it:**
+
+- The flush thread drains the ring *indiscriminately* (up to 5000 events / 256 KB /
+  500 ms), and only `doPublish` splits the run: KV/schema events publish individually
+  inline (flushing pending CDC first, for order), CDC events group **by subject** —
+  `cdc.[tenant.]<table>.<operation>` — in first-appearance order. So batching is per
+  (table × verb), and yes: a mixed flush run *has* to publish once per distinct
+  subject group, serialized, each paying its own PubAck wait. T tables × V verbs
+  active in one flush = up to T×V sequential ack waits per cycle. A homogeneous burst
+  collapses to one group per flush (one ack per ~256 KB); a mixed workload of many
+  small groups is where the ack share compounds.
+- "Drain the ring during the ack wait" is not where the win is: the replication
+  thread packs into the ring regardless, and the flush thread re-drains the moment
+  `flushBatch` returns. The serialized chain is encode(G1) → publish+ack(G1) →
+  encode(G2) → … The overlap opportunity is **encode next group / next batch during
+  the current ack wait** — and the win per cycle is bounded by min(ack, encode), so
+  a 2–5 ms ack behind a 20 ms encode caps around 20 %, not 2×.
+- The constraint that rules out the naive version: **publishes must stay strictly
+  serialized on one connection.** Group order is first-appearance on purpose (a
+  causal INSERT→DELETE across subjects, the §2.1 lesson), and a JetStream stream
+  stores in arrival order — concurrent publishes interleave arbitrarily and break
+  exactly what `publishCDCSubBatch` was built to guarantee. Slot lifetime is
+  compatible (slots free only in `updateConfirmedLsn`, after the whole batch), and
+  the retry path already leans on msg_id dedup, so encode-ahead is safe; concurrent
+  fan-out is not.
+- The emerging lane model (talked through 2026-08-24): batches stay homogeneous per
+  subject — one `.batch` message cannot mix verbs, that was §2.1's bug — so a
+  (tenant, table) lane's `INSERT, DELETE, INSERT` becomes three messages on their
+  runs' subjects, written to the socket in CDC arrival order. Async only means nobody
+  waits for the PubAck between them; there is still exactly ONE connection and one
+  writer, and socket write order is what the stream stores. Different tenants are
+  different streams — no shared order at all. Two tables of one tenant share a
+  stream: interleaving their lanes is harmless because nothing guarantees cross-table
+  order inside a stream even today (first-appearance grouping already reorders it);
+  the invariant that must hold is per-lane internal order, which one ordered writer
+  gives for free. The only cross-table casualty is same-transaction multi-table
+  causality (FK parent/child), which today's grouping breaks identically — the
+  replica has no FK constraints and converges by PK upsert, so this stays a
+  documented non-guarantee rather than a regression. Concretely: with
+  `order_items.order_id → orders.id`, a flush run holding
+  `items(1000 → existing order)`, then `orders(42)`, `items(1001 → 42)` groups as
+  lane `order_items` first (first appearance, carrying BOTH item events) and lane
+  `orders` second — so item 1001 reaches the stream before its parent order 42.
+  SQLite clients shrug (no FK declared, PK upserts, final state converges; the child
+  is "orphaned" only mid-replay). The planned Python + local-Postgres consumer is
+  where this bites: declared FKs would reject the child. That client must either not
+  declare FKs on the replica (the source already enforces them), declare them
+  `DEFERRABLE INITIALLY DEFERRED` and apply each batch in one transaction, or apply
+  in LSN order across streams (every event carries `lsn`).
+**BUILT and verified (2026-08-24), as planned below.** `PublishWindow` in
+`nats_publisher.zig` (per-window reply inbox, in-flight list, `drain` fails the whole
+window into `flushBatch`'s retry; per-ack latency feeds the same metric); lane-aware
+grouping in `publishCDCSubBatch` (per-lane verb-runs, cross-lane coalescing, window
+only when every group is a distinct lane). Live mixed-matrix run — `users` (public)
+plus `test_types` under `acme` and `globex`, all three verbs, three transactions —
+hit all three paths by design: "3 groups with a lane verb-alternation — publishing
+sequentially" (the §1.18 case, client ends CORRECT), "3 distinct lanes — async PubAck
+window" (one ack wait for three streams' worth of messages), and the sequential
+fallback for a mixed-verb lane. Stream counts, PG truth, and the alice client all
+agree; zero errors. What remains of the original idea is only the measurement-driven
+question of whether MORE overlap (encode-ahead across flush batches) ever pays —
+revisit after a burst-load reading of the ack counters.
+
+**Measured under burst (2026-08-24, native PG+NATS on the host, ReleaseFast,
+OrbStack stopped):**
+
+- **README burst (2M rows, homogeneous)**: iters ≈ 1.97M for 2M events — the healthy
+  ~1 iter/WAL message, no hot-path drift. 3,283 publishes (~609 events each), Σ ack
+  2.09 s of a 23.7 s drain → mean ack **0.64 ms**, ack share **~9%** while the
+  replication thread ran 85% busy in decode+pack. Verdict on the residual idea:
+  encode-ahead pipelining would buy ≤9% under burst — **not worth building**; the
+  window's real value is mixed-lane latency, already taken.
+- **A/B against the pre-async binary** (async-lane files stashed, rebuilt, rerun):
+  56.6k vs 54.0k ev/s, CPU 107% vs 106%, proc_ms 12742 vs 12716, iters identical —
+  the async-lane change costs nothing measurable.
+- **Mixed window burst** (200 txns × users+acme+globex inserts, 100k rows): all 200
+  flush runs took the async window (200× logged), 601 publishes for 3 lanes × 200
+  runs, mean ack 0.36 ms — one window drain per run instead of three serialized ack
+  waits. Streams: +200 CDC_ACME, +200 CDC_GLOBEX, users on CDC_PUBLIC.
+- **Alternation burst** (100 txns of INSERT/DELETE/INSERT on users, ~40k events):
+  all 100 runs took the sequential fallback (100× logged), 301 publishes ≈ 3 groups
+  per txn, mean ack 0.23 ms.
+- **The ~54k ev/s / ~20 µs-per-event figures above were WRONG, and the story of
+  finding out is the lesson.** They looked like a 4x regression against the
+  README-era ~189k; hours of bisection exonerated, one at a time: OrbStack, host
+  starvation, orphan processes, the async-lane diff (A/B), BASE_BUF, the slot, the
+  SQL text, metric polling, spawner (bash vs python, parent alive vs dead), QoS
+  clamping, E-cores, pipes. The tell that finally cracked it — after the user asked
+  whether the test was even measuring the same thing — was a mid-drain `sample` of a
+  "107 % CPU" bridge showing it mostly *blocked*, with the call graph pointing at
+  `acquireAndFillSlot → Io.Writer → writev`: the hot path was **writing per-event
+  debug log lines**. The slow runs' stderr files were **632 MB / 10 million debug
+  lines** (5 per event); the fast runs' 12 KB. `LOG_LEVEL=debug` had leaked in from
+  the sourced dev env (`.env.bridge` carries it), and `speed.py`'s
+  `setdefault("LOG_LEVEL", "info")` *respects* an inherited value — every harness
+  wrapper that happened to `export LOG_LEVEL=info` measured fast, every one that
+  didn't measured the logger. Fixed: `speed.py` now **forces** info
+  (`SPEED_LOG_LEVEL` to override deliberately).
+
+  **Final numbers came only after cleaning TWO more contamination layers** (both
+  spotted by the user, not the harness): the native `postgres-data` predated the
+  demo-migration redirect, so `users` carried the composite `(name,email)` TEXT
+  primary key instead of `id bigserial` — every benchmark insert maintained a text
+  btree, capping PostgreSQL at ~190k rows/s regardless of txn shape; and **twelve
+  orphaned metric-poll loops from a PREVIOUS session (started Friday, ports
+  9095/9099, ~29 CPU-hours consumed)** were still running — invisible to sandboxed
+  `pgrep`, they matched "bridge" in Activity Monitor because their command lines
+  poll `bridge_*` metrics. Lesson on top of the LOG_LEVEL one: sandboxed kills
+  don't reach other invocations' processes — sweep with the sandbox disabled, and
+  `down.sh --clean` + fresh migrations beat forensically trusting an old data dir.
+
+  **Corrected native numbers (M2 Pro, ReleaseFast, fresh tuned PG 18.6
+  (shared_buffers=2GB, max_wal_size=16GB) + fresh NATS, one bridge, warm-up then
+  test)**:
+
+  | run | end-to-end | PG write | drain tail | bridge CPU |
+  | --- | --- | --- | --- | --- |
+  | canonical 2M INSERT | **236k ev/s** | 2.4 s (~830k rows/s) | 6.1 s | 6.96 s (**3.5 µs/event**, 82 % of one core) |
+  | mixed 2M (50 % INS / 30 % UPD / 20 % DEL, id-keyed) | **245k ev/s** | 2.4 s | 5.7 s | 7.03 s (3.5 µs/event) |
+
+  Above the README's 200k+ record, and **mixed verbs cost the same per event as
+  inserts** (an earlier 27k mixed figure was the stale composite-PK table: its
+  UPDATEs rewrote primary keys and its range-DELETEs seq-scanned). No regression
+  exists anywhere — the async-lane work is cost-free (A/B), and the drain-side
+  ceiling is now ~330–350k ev/s (2M / ~6 s tail) with PostgreSQL no longer the
+  bottleneck at ~830k rows/s ingest.
+
+  Two durable lessons: **a benchmark run at debug measures the logger, not the
+  bridge** — check the log file's *size* first when a number looks wrong; and
+  `iters` alone cannot catch this class of slowdown (it counts loop trips, not the
+  cost inside each) — pair it with CPU-per-event from `bridge_cpu_seconds_total`.
+
+**Where the ceiling actually lives (instrumented 2026-08-24):** a per-second timeline
+of the clean 2M burst shows the ring at 0–1 % throughout, Σ PubAck wait 0.61 s of a
+6.2 s drain (0.20 ms mean), and the WAL loop *idle in 34 % of its iterations* with
+`recv_ms` (waiting on libpq) at 2.5 s against `proc_ms` 1.0 s — the bridge is starved
+by **PostgreSQL's walsender/pgoutput**, which delivers ~320k ev/s on this machine.
+NATS ingestion is the least-loaded stage by an order of magnitude. WAL retention under
+a faster-than-pipeline burst behaves exactly as designed: peaks (251 MB after a 2.4 s
+830k rows/s write) and bleeds to 0 within ~6 s; at any sustained rate under ~300k ev/s
+it never grows. Output format is already pgoutput binary — no client-side decode lever
+remains. The one untried lever if this ceiling ever matters: **partition tables across
+several publications/slots** so N walsenders run in parallel — each still decodes the
+full WAL but only pays output-callback and send costs for its own tables, so the gain
+depends on where pgoutput's time actually goes; measure before believing. The deeper
+answer is architectural and already sketched: delta-generation snapshots (§1.12) make
+cold-client catch-up independent of walsender throughput entirely — live tailing at
+~300k ev/s per slot is then the only walsender-bound path.
+
+**The multi-slot partition lever, tried (2026-08-24):** two dedicated publications
+(`pub_users`, `pub_tt` — created ad hoc in SQL; the real flow is the migrations'
+`zebridge_enable()`), two bridges at `RING_BUFFER_COUNT=8192` (**19 MB ring each**,
+against 156 MB at 65536 — the footprint drops as expected since the ring measured
+0–1 % under burst). Result: with 1M narrow `users` rows + 1M wide `test_types` rows
+written concurrently, **both configurations are producer-bound and equivalent** —
+single bridge: 10.4 s / 191k ev/s / 8.8 s CPU; two bridges: ~13 s (3 s poll
+granularity) with each bridge tracking its writer essentially live (4.3 µs/ev narrow,
+4.8 µs/ev wide). The single walsender never reached its ~320k ceiling at this load, so
+partitioning had nothing to win yet; the regime where it pays is a sustained
+multi-table aggregate above ~320k ev/s, which these fixtures cannot produce (only
+`users` is narrow, and one table cannot span publications). Two fixture traps cost a
+run each, worth remembering: `test_types` DELETEs are tombstones (guards), so
+"cleanup by DELETE" leaves every row in place and re-used deterministic uids then
+collide (unique-violation storms that read as a dead walsender); and preflight demands
+`zebridge_ddl_events` in EVERY publication a bridge attaches to.
+
+**Segregating tables per publication — the DBA recipe and the one engineering gap
+(2026-08-24):** the PostgreSQL side is ready today. `zebridge_enable()` already takes
+`publication => 'pub_x'` (its default is just `${BRIDGE_CDC_PUBLICATION}` rendered at
+init time), it is idempotent (`'already'` when the table is in the publication,
+`ON CONFLICT DO NOTHING` on the registry), and any number of migrations may each call
+it — that is exactly how the existing migrations work, one call per table. So a DBA can
+freely pair publications with slots and run one bridge per pair (`--pub pub_x --slot
+slot_x`), rightsizing each ring (`RING_BUFFER_COUNT=8192` → 19 MB was ample under
+burst). Per-publication checklist, learned the hard way: `zebridge_ddl_events` must be
+added to EVERY publication a bridge attaches to (preflight refuses otherwise — it is
+guard-exempt, add it directly), and `zebridge_gc_watermark` belongs in any publication
+whose clients flush outboxes. The gap that makes N>1 bridges NOT production-ready yet:
+the NATS durables are fixed names shared by every bridge — `bridge_mutations_worker`
+on MUTATIONS and the snapshot listener's fixed durable on REQUESTS — so two bridges
+work-steal from both queues. For mutations that is accidentally fine (the apply path
+is plain SQL, publication-independent); for snapshot requests it is not: the bridge
+that wins a request for a table outside its publication cannot serve it, and the
+request is consumed. Per-bridge durable names derived from the slot (plus a
+publication-aware request filter, or table-partitioned request subjects) is the
+missing piece.
+
+**The plan (2026-08-24), settled after the lane discussion — executed above:**
+
+1. **Verb-run grouping.** `publishCDCSubBatch` stops coalescing a subject's events
+   across the whole run and instead cuts a group at every subject *change* —
+   `INSERT(1), DELETE(2), INSERT(3)` on one table becomes three messages in arrival
+   order, not `insert[1,3]` + `delete[2]`. This alone closes §1.18 by construction.
+2. **One connection, one writer, an in-flight PubAck window.** The flush thread writes
+   each run's message with a per-publish reply inbox (`_INBOX.<prefix>.<n>`) and a
+   `Nats-Msg-Id`, without waiting; a wildcard sync subscription on the prefix collects
+   PubAcks; after the batch's last run is written, the thread drains the window and
+   fails the flush if any ack is missing or is an error — which lands in `flushBatch`'s
+   existing retry-with-dedup path.
+3. **Sequential within a lane, free across lanes.** Consecutive runs of the SAME lane
+   (subject minus the operation token — the table axis) are the only order-coupled
+   pairs, and a mid-window failure must never let run N+1 be stored while run N is
+   re-published later. v1 keeps this trivially: if a flush batch contains two runs of
+   one lane (rare — it needs verb alternation inside one ≤500 ms window), that batch
+   publishes fully synchronously, today's path; batches whose runs are all distinct
+   lanes — the common case — go through the window. No failure mode reorders a lane.
+4. **KV/schema events are an order barrier.** They stay synchronous, and drain the
+   window first — a schema must not overtake the CDC events that precede it.
+5. **The metric stays honest.** Each in-flight entry records its send time;
+   `recordPublishAck` fires per ack, so `bridge_nats_publish_ack_seconds_total` keeps
+   meaning wall time per publish, now overlapped instead of serialized.
+
+- The endgame alternative: an **async publish with an in-flight PubAck window**
+  (nats.go's `PublishAsync` shape). Writes on one connection stay ordered, so the
+  stream's arrival order is preserved while nobody waits per message — that removes
+  the ack wait entirely instead of hiding one encode behind it. nats.zig's
+  `js.publish` is synchronous request/reply today, so this is an upstream feature
+  (or a bridge-side manual reply-inbox scheme) — worth weighing against the
+  thread-pipelining before building either.
 
 ### 1.14 CLOSED — `web-consumer`'s schema watch no longer uses `kv.watch()`; it is a pull consumer
 
@@ -1527,6 +1747,49 @@ Lesson, the same one as §2.19 and `mutate.py`'s own comment: a scenario that fa
 it published. A malformed subject produces exactly the symptoms of a write-path bug,
 and two unrelated-looking failures from one message are a hint that the message never
 got as far as the code under test.
+
+### 1.18 CLOSED — lane-aware grouping; same-key verb alternation publishes in order
+
+Found while checking §1.13's grouping claims (2026-08-24), by reading, not yet
+reproduced. `publishCDCSubBatch` groups a flush run by subject and emits groups in
+**first-appearance** order. Its own comment proves the two-event case: INSERT then
+DELETE of one row lands as insert-group before delete-group — correct. But coalescing
+puts *every* event of a subject into that subject's one group, so a three-event
+alternation on the same key inside one run (≤500 ms / 5000 events) breaks:
+
+- `INSERT(1), DELETE(2), INSERT(3)` → groups `insert[1,3]`, then `delete[2]` — the
+  client applies the re-insert *before* the delete and ends with the row gone while
+  PostgreSQL has it.
+- `DELETE(1), INSERT(2), DELETE(3)` → the mirror image: row survives client-side,
+  gone upstream.
+
+The client cannot rescue it: the CDC DELETE path is an unconditional delete-by-PK
+(`App.tsx`, `op === 'DELETE'`) — under REPLICA IDENTITY DEFAULT a delete carries no
+version to guard on. Reachability is narrow but legal: hard-delete tables with key
+reuse inside the flush window (REPLACE-style delete+reinsert idioms twice in quick
+succession; client-minted uuid keys rarely recur, `bigserial` never). Soft-delete
+tables are immune — their deletes are UPDATEs, one subject.
+
+Fix directions, not yet chosen, and in tension with §1.13: fully order-safe grouping
+means breaking a group at every subject *change* (coalesce only consecutive runs),
+which turns verb alternation into one publish per flip — exactly the context-switch
+cost coalescing exists to avoid — and is the strongest argument for the async
+publish-window (§1.13): with no per-publish ack wait, run-level grouping becomes
+affordable and the ordering question disappears rather than being patched. A cheaper
+interim: within-run last-write-wins per key before grouping (drop all but the final
+event per (subject, key) in the run) — correct final state, loses intermediate events
+consumers currently see.
+
+**Resolved by §1.13's execution (2026-08-24).** `publishCDCSubBatch` now groups
+per-lane verb-runs: a lane (subject minus the operation token) splits its group at
+each of its own verb changes, while different lanes still coalesce freely — so
+interleaved multi-table traffic keeps today's message counts, and the alternation
+above becomes three messages in arrival order. A run containing any lane alternation
+publishes fully synchronously (order under retry); runs of distinct lanes go through
+the async PubAck window. Verified live with the exact scenario: one transaction
+`INSERT(id=987001), DELETE, INSERT` on `users` — the bridge logged "3 groups with a
+lane verb-alternation — publishing sequentially" and the connected client finished
+with the row PRESENT, where the old coalescing left it deleted.
 
 ### 2.13 A wildcard inbox made every pull request spawn another
 

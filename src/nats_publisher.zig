@@ -81,6 +81,29 @@ pub const Publisher = struct {
         };
     }
 
+    /// Open an async publish window (NOTES.md §1.13): a per-window wildcard reply
+    /// inbox on THIS connection. Everything written through the window lands on its
+    /// stream in write order — socket order is storage order — while nobody waits per
+    /// message. Caller must `drain()` to learn the outcome; `deinit()` alone abandons
+    /// outstanding acks, which is only correct when the caller is about to fail the
+    /// flush into the retry path anyway.
+    pub fn beginWindow(self: *Publisher, allocator: std.mem.Allocator) !PublishWindow {
+        const conn = self.conn orelse return error.NotConnected;
+        // Unique per window: monotonic time plus a process-wide counter. This only has
+        // to never collide with another subscription of this process on this server —
+        // no unguessability requirement, so no need for a CSPRNG.
+        const prefix = try std.fmt.allocPrint(
+            allocator,
+            "_INBOX.zbw{x}.{d}.",
+            .{ utils.nanoTimestamp(), window_counter.fetchAdd(1, .monotonic) },
+        );
+        errdefer allocator.free(prefix);
+        const wildcard = try std.fmt.allocPrint(allocator, "{s}*", .{prefix});
+        defer allocator.free(wildcard);
+        const sub = try conn.subscribeSync(wildcard);
+        return .{ .publisher = self, .sub = sub, .prefix = prefix, .allocator = allocator };
+    }
+
     /// The resolved address, for anything that needs to connect the same way.
     pub fn endpoint(self: *const Publisher) Conf.Nats.Endpoint {
         return self.config.endpoint;
@@ -404,3 +427,84 @@ pub fn checkStreams(
         return error.NotConnected;
     }
 }
+
+/// A bounded in-flight JetStream publish window on one connection — see
+/// `Publisher.beginWindow`. The recovery contract: any missing ack, error ack, or
+/// status frame fails the WHOLE window, and the caller re-publishes the whole batch
+/// through `flushBatch`'s existing retry — `Nats-Msg-Id` dedup absorbs the messages
+/// the server already stored. The caller guarantees no two order-coupled messages
+/// (same lane) share a window, so a partial failure can never reorder a lane.
+var window_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub const PublishWindow = struct {
+    publisher: *Publisher,
+    sub: *nats.Subscription,
+    prefix: []u8,
+    allocator: std.mem.Allocator,
+    inflight: std.ArrayListUnmanaged(InFlight) = .empty,
+    next_token: u64 = 0,
+
+    const InFlight = struct { token: u64, sent_ns: u64 };
+
+    /// Write one message with a per-publish reply inbox and return without waiting.
+    pub fn publish(self: *PublishWindow, subject: []const u8, msg_id: ?[]const u8, data: []const u8) !void {
+        const conn = self.publisher.conn orelse return error.NotConnected;
+        const msg = try conn.newMsg();
+        defer msg.deinit();
+        try msg.setSubject(subject, false);
+        try msg.setPayload(data, false);
+        if (msg_id) |id| try msg.headerSet("Nats-Msg-Id", id);
+        var reply_buf: [128]u8 = undefined;
+        const reply = try std.fmt.bufPrint(&reply_buf, "{s}{d}", .{ self.prefix, self.next_token });
+        try conn.publishRequestMsg(msg, reply);
+        try self.inflight.append(self.allocator, .{ .token = self.next_token, .sent_ns = utils.nanoTimestamp() });
+        self.next_token += 1;
+    }
+
+    /// Collect every outstanding PubAck, failing on the first error, status frame, or
+    /// timeout. Per-ack latency is recorded to the same metric the synchronous path
+    /// feeds, so `bridge_nats_publish_ack_seconds_total` keeps meaning wall time per
+    /// publish — now overlapped instead of serialized.
+    pub fn drain(self: *PublishWindow, timeout_ms: i64) !void {
+        const deadline = utils.getMilliTimestamp() + timeout_ms;
+        while (self.inflight.items.len > 0) {
+            const remaining = deadline - utils.getMilliTimestamp();
+            if (remaining <= 0) {
+                log.err("PubAck window timed out with {d} ack(s) outstanding", .{self.inflight.items.len});
+                return error.AckTimeout;
+            }
+            const raw = self.sub.nextMsgTimeout(.{ .duration = .{ .raw = .fromMilliseconds(remaining), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => {
+                    log.err("PubAck window timed out with {d} ack(s) outstanding", .{self.inflight.items.len});
+                    return error.AckTimeout;
+                },
+                else => return err,
+            };
+            defer raw.deinit();
+            if (!std.mem.startsWith(u8, raw.subject, self.prefix)) continue;
+            const token = std.fmt.parseInt(u64, raw.subject[self.prefix.len..], 10) catch continue;
+            const idx = blk: {
+                for (self.inflight.items, 0..) |entry, i| {
+                    if (entry.token == token) break :blk i;
+                }
+                continue;
+            };
+            const entry = self.inflight.swapRemove(idx);
+            if (self.publisher.metrics) |m| m.recordPublishAck(utils.nanoTimestamp() - entry.sent_ns);
+            if (raw.status_code > 0) {
+                log.err("async publish {d} answered with status {d} — no stream listening?", .{ token, raw.status_code });
+                return error.NoStreamResponse;
+            }
+            if (std.mem.indexOf(u8, raw.data, "\"error\"") != null) {
+                log.err("async publish {d} refused: {s}", .{ token, raw.data });
+                return error.PublishNack;
+            }
+        }
+    }
+
+    pub fn deinit(self: *PublishWindow) void {
+        self.sub.deinit();
+        self.inflight.deinit(self.allocator);
+        self.allocator.free(self.prefix);
+    }
+};

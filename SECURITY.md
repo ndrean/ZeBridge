@@ -163,6 +163,56 @@ its own definition in `init.write.template.sql`/`init.core.template.sql`.
 publication (and therefore the bridge) to **one** tenant value, for one-bridge-per-tenant
 deployments. It is not the multi-tenant, per-row path above, and does not compose with it.
 
+**The publication itself — where its name comes from, and how tables reach it.**
+
+`BRIDGE_CDC_PUBLICATION` (`.env.admin`) is consumed exactly **once**, by the init render
+(`bridge-init` in compose, or `scripts/native/up.sh` — both are
+`cat templates | envsubst | psql`). That single render does two things: creates the
+publication, and bakes the name into `zebridge_enable()`'s `publication` parameter as its
+default, stored in the function definition itself (`\df+ zebridge_enable` shows it).
+After init the env var is dead: the bridge never reads it — `--pub` on the command line
+is its only source — and a migration's shell environment is equally inert, because the
+default a migration gets is the one frozen in the database, not whatever the shell
+carries. That is why the pieces agree without coordination: everything descends from the
+one render. The invariant that keeps it true: **the publication name is write-once at
+init.** Renaming it means re-rendering the templates, never just editing the env file.
+
+Tables reach a publication by exactly three paths, all funnelled through the publication
+guard: a migration calling `zebridge_enable()` (the baked default, or an explicit
+`publication => 'pub_x'`); the init templates themselves for the bridge-owned tables
+(`zebridge_ddl_events`, `zebridge_gc_watermark`, `zebridge_user_tenants` — hardcoded,
+because the bridge cannot boot without them); and
+`zebridge_scope_publication_to_one_tenant()` for the one-bridge-per-tenant shape, the one
+signature where the publication is a required argument.
+
+Divergence cannot end in a half-state. A bridge started with a `--pub` naming a missing
+publication refuses to boot (`PublicationNotFound`, with the `CREATE PUBLICATION` hint);
+one naming an existing publication that lacks a table simply never sees that table — no
+CDC, no boot schema — which the boot log's explicit table list
+(`Publication '…' verified (N tables: …)`) is there to make visible. A migration naming
+a publication that does not exist fails hard: the `ALTER PUBLICATION … ADD TABLE` inside
+`zebridge_enable()` raises, and the transaction rolls back **everything** the call did —
+grants, guards, RLS included — so `mix ecto.migrate` stops with nothing half-applied.
+
+**A dedicated publication** (to pair with its own slot and bridge — e.g. partitioning
+tables across walsenders) is created in the same migration that populates it, atomically
+and with no env var anywhere:
+
+```sql
+CREATE PUBLICATION pub_orders;                                        -- bare CREATE passes the guard
+ALTER PUBLICATION pub_orders ADD TABLE public.zebridge_ddl_events;    -- preflight requires it in EVERY
+                                                                      -- publication a bridge attaches to
+ALTER PUBLICATION pub_orders ADD TABLE public.zebridge_gc_watermark;  -- if this lane's clients flush outboxes
+SELECT * FROM zebridge_enable('public.orders'::regclass,
+    tenant_col => 'tenant_id', writable => true, version_col => 'updated_at',
+    publication => 'pub_orders', dry_run => false);
+```
+
+The matching bridge runs `--pub pub_orders --slot slot_orders`. ⚠️ Running several
+bridges concurrently against one NATS deployment is not yet supported: the MUTATIONS and
+REQUESTS durables are fixed names shared by every bridge, so two bridges steal each
+other's snapshot requests — NOTES.md §1.13 carries the details and the missing piece.
+
 ### 1.3 PostgreSQL: what the schema must satisfy
 
 A table is **readable** as it is. Being **writable** from the edge, or **tenant-scoped**,
