@@ -81,6 +81,17 @@ async def main():
         sys.exit("another bridge is already running — it would produce this scenario's "
                  "chain concurrently; stop it first")
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tenant='{TENANT}' AND tbl='{TABLE}'")
+    # The probe needs at least one row: `touch()` updates min(id), and an EMPTY
+    # fixture makes every touch a 0-row no-op — no delta ever rides, and the
+    # depth loop below used to spin on that forever (measured: a 52-minute wedge
+    # after the fixture baseline was reborn empty).
+    # updated_at a full minute in the past — OUTSIDE the 5s clamp margin. A seed
+    # at now() sits inside the delta predicate's margin window at the next tick,
+    # so the idle check sees a margin-echo delta and calls skip-if-unchanged
+    # broken (measured: gens=[1, 2] while idle).
+    zb.psql(f"INSERT INTO public.{TABLE} (name, email, inserted_at, updated_at) "
+            f"SELECT 'genproducer probe', 'probe@zb', now(), now() - interval '1 minute' "
+            f"WHERE NOT EXISTS (SELECT 1 FROM public.{TABLE})", quiet=True)
 
     nc = await zb.connect()
     js = nc.jetstream()
@@ -177,9 +188,16 @@ async def main():
                 failed += 1
 
             # ── 6. prune past depth, jump-in point survives ────────────────────
-            while (g := gens()) and max(g) < DEPTH + 2:
+            # Bounded: a producer that stopped building must FAIL the scenario,
+            # not wedge it — each touch gets a few cadences to ride, no more.
+            attempts = 0
+            while (g := gens()) and max(g) < DEPTH + 2 and attempts < (DEPTH + 2) * 4:
                 touch()
+                attempts += 1
                 await poll(lambda: False, timeout=CADENCE)
+            if (g := gens()) and max(g) < DEPTH + 2:
+                zb.bad(f"producer stopped building: still gens={g} after {attempts} touches")
+                failed += 1
             await asyncio.sleep(CADENCE * 2 + 2)    # let margin echoes settle
             chain = gens()
             top = max(chain)

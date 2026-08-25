@@ -1165,6 +1165,14 @@ pub const EventProcessor = struct {
             clean_table = clean_table[7..];
         }
 
+        // `zebridge_user_tenants` publishes NO schema, ever — not at boot (below)
+        // and not from DDL. Its rows are diverted to `$KV.tenants.<principal>` and
+        // never reach `cdc.<table>.*`, so a descriptor would hand every client an
+        // empty local table plus the roster table's shape — the disclosure the
+        // principal-keyed KV bucket exists to avoid. (The empty table measured in
+        // every browser replica was exactly this leak.)
+        if (std.mem.eql(u8, clean_table, "zebridge_user_tenants")) return null;
+
         log.info("🔍 Processing DDL event for table '{s}' ({s})", .{
             clean_table,
             command_tag orelse "UNKNOWN",
@@ -1716,6 +1724,14 @@ pub const EventProcessor = struct {
 
             if (isInternalTable(clean_table)) {
                 log.debug("Skipping boot schema for internal table '{s}'", .{clean_table});
+                continue;
+            }
+
+            // The roster table: rows are diverted to `$KV.tenants.<principal>`, so a
+            // schema descriptor here would only leak its shape and grow an empty
+            // table in every replica — see the same guard on the DDL path.
+            if (std.mem.eql(u8, clean_table, "zebridge_user_tenants")) {
+                log.debug("Skipping boot schema for '{s}' (rows divert to the tenants KV; no descriptor published)", .{clean_table});
                 continue;
             }
 

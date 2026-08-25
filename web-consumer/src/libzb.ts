@@ -33,7 +33,7 @@ export interface ZeBridgeConfig {
   natsUrl: string;
   principal: string;
   password?: string;
-  topology: any;
+  grammar: any;   // the parsed grammar.json — wire names only; the consumer imports and passes it
   durable?: boolean;
 }
 
@@ -555,8 +555,8 @@ export class ZeBridge {
     if (!this.nc) return;
     try {
       return (async () => {
-        const watch = await watchBucket(jetstream(this.nc!), this.config.topology.kv.schemas);
-        this.appendLog('SCHEMA', `Watching KV bucket "${this.config.topology.kv.schemas}" for all tables...`, 'WATCH');
+        const watch = await watchBucket(jetstream(this.nc!), this.config.grammar.kv.schemas);
+        this.appendLog('SCHEMA', `Watching KV bucket "${this.config.grammar.kv.schemas}" for all tables...`, 'WATCH');
 
         return new Promise<void>((resolve) => {
           let initialized = false;
@@ -862,22 +862,22 @@ export class ZeBridge {
   /// One stream per tenant plus the shared public one — the stream NAME is the read
   /// boundary (a filter_subject is reader-chosen, not a permission).
   private cdcStreams(): string[] {
-    const cfg = this.config.topology.cdc_streams;
-    if (!cfg) return [this.config.topology.streams.cdc];
-    // $KV.tenants is the runtime truth, NOT topology.json's tenant list: a tenant
+    const cfg = this.config.grammar.cdc_streams;
+    if (!cfg) return [this.config.grammar.streams.cdc];
+    // $KV.tenants is the runtime truth, NOT grammar.json's tenant list: a tenant
     // born after the file was written (dyntenant) has real streams the client must
     // read. The one tenant with no stream of its own is the OPEN tenant — checked
     // explicitly (the old list-membership gate silently ignored dynamic tenants;
     // its original job was only to avoid the CDC__DEFAULT ghost stream).
-    const open = this.config.topology.open_tenant || '_default';
+    const open = this.config.grammar.open_tenant || '_default';
     if (!this.tenantValue || this.tenantValue === open) return [cfg.public];
     return [`${cfg.tenant_prefix}${this.tenantValue.toUpperCase()}`, cfg.public];
   }
 
   private cdcStreamForTenant(tenant: string): string {
-    const cfg = this.config.topology.cdc_streams;
-    if (!cfg) return this.config.topology.streams.cdc;
-    const open = this.config.topology.open_tenant || '_default';
+    const cfg = this.config.grammar.cdc_streams;
+    if (!cfg) return this.config.grammar.streams.cdc;
+    const open = this.config.grammar.open_tenant || '_default';
     if (!tenant || tenant === open) return cfg.public;
     return `${cfg.tenant_prefix}${tenant.toUpperCase()}`;
   }
@@ -888,13 +888,13 @@ export class ZeBridge {
   private effectiveTenantFor(table: string): string {
     const state = this.syncedTables.get(table);
     if (state?.tenantColumn) return this.tenantValue;
-    return this.config.topology.open_tenant || this.tenantValue;
+    return this.config.grammar.open_tenant || this.tenantValue;
   }
 
   private initStream(tenant: string): string {
-    const cfg = this.config.topology.init_streams;
-    if (!cfg) return this.config.topology.streams.init;
-    const open = this.config.topology.open_tenant || '_default';
+    const cfg = this.config.grammar.init_streams;
+    if (!cfg) return this.config.grammar.streams.init;
+    const open = this.config.grammar.open_tenant || '_default';
     if (!tenant || tenant === open) return cfg.public;
     return `${cfg.tenant_prefix}${tenant.toUpperCase()}`;
   }
@@ -905,7 +905,7 @@ export class ZeBridge {
       const kvm = new Kvm(this.nc);
       // allow_direct must be explicit: Kvm.open never asks the server, and the grant
       // covers ONLY the per-key Direct Get path (measured — see App.tsx history).
-      const kv = await kvm.open(this.config.topology.kv.tenants, { allow_direct: true });
+      const kv = await kvm.open(this.config.grammar.kv.tenants, { allow_direct: true });
       const entry = await kv.get(this.config.principal);
       if (entry) {
         let val: string;
@@ -927,7 +927,7 @@ export class ZeBridge {
   /// fallback, not an error handler. Watermark-based walk, guarded upsert, one
   /// manifest re-read on a 404 mid-walk. Never throws.
   private async applyGenerations(table: string): Promise<boolean> {
-    const GEN = this.config.topology.generations;
+    const GEN = this.config.grammar.generations;
     if (!GEN || !this.nc) return false;
     const state = this.syncedTables.get(table);
     if (!state || !state.pkCols.length) return false;
@@ -1096,10 +1096,10 @@ export class ZeBridge {
         try {
           const kvm = new Kvm(this.nc!);
           // Per-tenant grant covers ONLY the exact-key Direct Get path (see history).
-          snapKv = await kvm.open(this.config.topology.kv.snapshots, { allow_direct: true });
+          snapKv = await kvm.open(this.config.grammar.kv.snapshots, { allow_direct: true });
         } catch { /* no snapshot bucket access — generations may still seed */ }
 
-        const tenanted = !!this.config.topology.init_streams;
+        const tenanted = !!this.config.grammar.init_streams;
         const tablesToSeed = new Set(this.syncedTables.keys());
         const seedPromises: Promise<void>[] = [];
 
@@ -1132,8 +1132,8 @@ export class ZeBridge {
 
           if (!desc && snapKv) {
             const reqSubject = tenanted
-              ? `${this.config.topology.subjects.snapshot_request}.${tenantForTable}.${table}`
-              : `${this.config.topology.subjects.snapshot_request}.${table}`;
+              ? `${this.config.grammar.subjects.snapshot_request}.${tenantForTable}.${table}`
+              : `${this.config.grammar.subjects.snapshot_request}.${table}`;
 
             // PROTOCOL.md §6 "no answer at all": JetStream publish (503 = already
             // queued, which is what a retry needs to know), bounded wait, re-request.
@@ -1144,7 +1144,7 @@ export class ZeBridge {
               } catch (e: any) {
                 this.appendLog('SYS', `Request for ${table} refused (${e?.message ?? e}) — a snapshot is already pending, waiting for it`, 'INFO');
               }
-              desc = await waitForDescriptor(js, this.config.topology.kv.snapshots, snapKey, SNAPSHOT_WAIT_MS);
+              desc = await waitForDescriptor(js, this.config.grammar.kv.snapshots, snapKey, SNAPSHOT_WAIT_MS);
               if (!desc) {
                 this.appendLog('SYS', `No snapshot for ${table} after ${SNAPSHOT_WAIT_MS / 1000}s — the request may have expired unread; re-requesting`, 'WARNING');
               }
@@ -1285,10 +1285,10 @@ export class ZeBridge {
     try {
       await this.run(`DELETE FROM ${table}`);
 
-      const stream = tenanted ? this.initStream(tenantForTable) : this.config.topology.streams.init;
+      const stream = tenanted ? this.initStream(tenantForTable) : this.config.grammar.streams.init;
       const filterSubject = tenanted
-        ? `${this.config.topology.subjects.init_prefix}.snap.${tenantForTable}.${table}.${desc.snapshot_id}.>`
-        : `${this.config.topology.subjects.init_prefix}.snap.${table}.${desc.snapshot_id}.>`;
+        ? `${this.config.grammar.subjects.init_prefix}.snap.${tenantForTable}.${table}.${desc.snapshot_id}.>`
+        : `${this.config.grammar.subjects.init_prefix}.snap.${table}.${desc.snapshot_id}.>`;
       const ci = await jsm.consumers.add(stream, {
         filter_subject: filterSubject,
         deliver_policy: DeliverPolicy.All,

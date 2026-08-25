@@ -376,7 +376,18 @@ pub fn reportVersionColumns(
 
         const usable = logVerdict(table, wanted, verdict, candidates.items, granted);
         if (usable) writable_count += 1 else outbound_only += 1;
-        if (reportWriteIntent(table, verdict, granted, key_db_allocated, sync_rules.get(table) != null)) mismatched += 1;
+        // "Named in SYNC_RULES" meant WRITE INTENT while the env named only edge
+        // tables. The catalogue fills the map for EVERY replicated table now, so a
+        // bare version column is universal bookkeeping, not intent — only an entry
+        // that also carries a tombstone or tiebreak still signals "someone expects
+        // edge writes here" (outbound-only tables warned spuriously otherwise).
+        const write_intent = blk: {
+            const cols = sync_rules.get(table) orelse break :blk false;
+            if (cols.len > 1 and cols[1].len > 0) break :blk true;
+            if (cols.len > 2 and cols[2].len > 0) break :blk true;
+            break :blk false;
+        };
+        if (reportWriteIntent(table, verdict, granted, key_db_allocated, write_intent)) mismatched += 1;
 
         // `logVerdict` alone would call a table with a database-allocated key
         // "writable" — it has grant and version column, but `mutation_listener.zig`

@@ -37,7 +37,7 @@ Access per stream / bucket is granted by NATS and access by tenant is enforced b
 Some elements:
 
 * read tables need a **PK** and **uuid**,
-* write tables need a **version** column timestamp**Z**
+* write tables need a **version** column with `timestamp`**Z**
 * since we want to allow writes, we chosed **LWW**,
 * since we use NATS, the payload is capped and tables get quarantined is rows are oversized
 * since we use a fixed buffer, the bridge daemon itself rejects oversized rows

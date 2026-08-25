@@ -1895,6 +1895,33 @@ clients — they reconnect to the tombstone and drop the table anyway. Client si
 dropped table, LOUDLY — a queued write for a dead table could only ever earn
 `row_deleted`, or worse, land on an unrelated table that later reuses the name.
 
+**The road-sweep (2026-08-25, late): the fixture baseline was the last open wound.**
+Asked "is anything left open?", the scenario re-sweep answered with three failures
+that were all ONE finding wearing different masks: the fresh-volume reset had
+wiped not just the fixture TABLES (`users`, `test_types`, `orders` — restored via
+`zebridge_enable`, catalogue-era, tiebreak included) but the PRINCIPAL MAPPINGS
+(`zebridge_user_tenants` — alice/bob/mary/zb_sweeper restored, propagated live to
+`$KV.tenants` with no restart). legacybait failed as "bait not stored" (no
+test_types), widthguard's edge case answered `row_deleted` for a row psql could
+see (unmapped alice → the writer's RLS sees nothing — fail-closed working exactly
+as designed, against the wrong baseline), and genproducer WEDGED for 52 minutes:
+its `touch()` updates `min(id)` of an EMPTY `users`, and the depth loop retried
+that forever. Three scenario hardenings came out of it: genproducer self-seeds
+its probe row (with `updated_at` a minute in the past — a seed at `now()` sits
+inside the 5s clamp margin and the idle check reads the margin-echo delta as
+skip-if-unchanged broken, measured) and bounds the depth loop so a dead producer
+FAILS loudly; tzguard self-provisions `schema_migrations` (probing a missing
+table reported "exemption broken" when the guard was fine). One product fix
+rode along: preflight's "named in SYNC_RULES ⇒ write intent" heuristic warned on
+every outbound-only table once the catalogue filled the sync map for ALL tables —
+intent is now a tombstone or tiebreak column, not mere presence. Migrations
+followed the era too: the no-PK and exotic fixtures register in
+`zebridge_catalogue` (their `zebridge_public_tables` INSERTs would fail any fresh
+bootstrap), and 130000 passes `tiebreak_col` through `zebridge_enable`. End
+state: envcheck, tzguard, check (zero disagreements), livebirth, decode_integrity,
+legacybait, widthguard and genproducer ALL green under the catalogue era, one
+slot, no orphans, no debris.
+
 (Also relearned at the shell: zsh does not word-split `$N` — an alias-style
 `N="nats -s …"; $N kv purge …` is a silent no-op with stderr swallowed, which
 manufactured a false "already clean" mid-investigation. Literal commands only.)
@@ -3204,3 +3231,16 @@ Next: lift the file into a real `zb-client-ts` package (the Node consumer with b
 **Rejected on the way here, recorded so it stays rejected**: the reverse architecture (push RAW pgoutput to NATS, decode at the edge / wasmCloud). It breaks the tenant ACL — subject routing REQUIRES decoding (the tenant column lives in the decoded tuple), so raw frames hand every edge decoder all tenants mixed — and pgoutput is stateful (tuples reference relation OIDs from earlier Relation messages: every consumer grows a relcache, late joiners can't decode, retention must preserve schema messages forever). The gain would have been offloading ~3.5µs/event of decode CPU that was never scarce. The salvageable adjacent idea: an optional **SQL lane** — a small worker (wasmCloud fits HERE) consuming the already-tenant-routed streams and republishing rendered SQL phrases per dialect (`cdc-sql.<dialect>.<tenant>.<table>.>`), making ~50-line consumers possible for teams that want them. Behind the bridge, opt-in, ACL intact.
 
 Context this slots into: the leaf topology (bridge↔NATS plain TCP colocated, NATS↔leaves TLS, PG↔bridge SSL for PG-as-a-service; one leaf per tenant whose hub credential carries that tenant's grants; ~20ms leaf latency exercising LWW and the 5s clamp in anger) and the ~20MB bridge footprint (ring buffer is the knob, arenas, no GC). Small tool, sharp contract — the contract is the investment.
+
+## 11 Restart Rules
+
+The restart rules, as they stand today
+
+|  Change  |  What's needed.  |
+|----------| -----------------|
+| New table (public or tenant-scoped)  | one zebridge_enable(...) migration + one bridge restart — boot reads the catalogue and, for public tables, reconciles CDC_PUBLIC's subject filter itself. No env edit, no nats stream edit. |
+| Changed rule on an existing table (version/tombstone/tiebreak/tenant_col)  | catalogue row updates via zebridge_enable re-run + bridge restart (boot-level read; the sweeper likewise re-reads on its own restart) |
+| New tenant | zero bridge restarts: backend creates CDC_<T>/INIT_<T>, inserts the zebridge_user_tenants row (propagates live to $KV.tenants) — plus the NATS grant block + SIGHUP (reload, not restart) until the JWT signing key |
+| New user on an existing tenant    | conf grant + SIGHUP only  |
+| DROP TABLE   | nothing for the bridge — but purge the four ghost sources (chain, descriptor, INIT chunks, CDC retention) or resh clients resurrect rows |
+| Generations on/off, tenant set growth    | nothing — the producer reads the catalogue and the data per tick |

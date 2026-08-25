@@ -5,7 +5,7 @@
 /// deliberately does not own, the /bridge/health poll through the Vite proxy.
 
 import { createSignal, onCleanup, For } from 'solid-js';
-import topology from '../../grammar.json';
+import grammar from '../../grammar.json';
 import { ZeBridge } from './libzb';
 
 const NATS_URL = 'ws://localhost:8080';
@@ -27,7 +27,7 @@ const zb = new ZeBridge({
   natsUrl: NATS_URL,
   principal: PRINCIPAL,
   password: PASSWORD,
-  topology,
+  grammar,
   durable: DURABLE,
 });
 
