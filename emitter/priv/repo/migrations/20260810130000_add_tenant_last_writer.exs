@@ -1,10 +1,11 @@
 defmodule Emitter.PgProducer.Repo.AddTenantLastWriter do
   use Ecto.Migration
 
-  # Brings `test_types` in line with what the bridge is configured to expect:
+  # Brings `test_types` in line with what its `zebridge_catalogue` row declares
+  # (written by the `zebridge_enable` call below, atomically with the guards):
   #
-  #   SYNC_RULES=test_types:updated_at,deleted_at,last_writer   ← field 3 needs last_writer
-  #   TENANT_RULES=test_types:tenant_id                         ← needs tenant_id
+  #   tombstone_col/tiebreak_col need `deleted_at` / `last_writer`
+  #   tenant_col needs `tenant_id`
   #
   # ⚠️ `test_types`, not `users`. `users` is the outbound-only fixture: no write grant and a
   # bigserial key no client can mint, so a tenant column there scopes nothing and a tiebreak
@@ -30,7 +31,7 @@ defmodule Emitter.PgProducer.Repo.AddTenantLastWriter do
       # trigger keeps it in one place instead of a DEFAULT clause per table.
       add(:tenant_id, :string, null: false)
 
-      # LWW tiebreak (SYNC_RULES field 3). Holds a client_id like `c-3f9a21b7`; the bridge
+      # LWW tiebreak (`zebridge_catalogue.tiebreak_col`). Holds a client_id like `c-3f9a21b7`; the bridge
       # compares `coalesce(stored,'') < coalesce(incoming,'')`. Nullable — a row written
       # before this column existed simply has no recorded winner.
       add(:last_writer, :string)
@@ -65,6 +66,7 @@ defmodule Emitter.PgProducer.Repo.AddTenantLastWriter do
                 writable => true,
                 version_col => 'updated_at',
                 tombstone_col => 'deleted_at',
+                tiebreak_col => 'last_writer',
                 dry_run => false
             );
         END IF;

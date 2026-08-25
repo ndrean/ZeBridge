@@ -64,7 +64,7 @@ defmodule Emitter.PgProducer.Repo.SetupExoticTypes do
     # Same publication guard as `users_no_pk` — this fixture has no tenant to scope it
     # by either, so the decision to publish it wide-open is recorded explicitly.
     execute("""
-    INSERT INTO zebridge_public_tables (tbl, reason)
+    INSERT INTO zebridge_catalogue (tbl, public_reason)
     VALUES ('#{@cdc_table}', 'decode-coverage fixture for exotic PG types, not real business data')
     ON CONFLICT (tbl) DO NOTHING;
     """)

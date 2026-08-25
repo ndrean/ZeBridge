@@ -23,7 +23,7 @@ defmodule Emitter.PgProducer.Repo.SetupNoPkTable do
     # exception: a keyless fixture for preflight/no-PK testing, not a real business
     # table, so there is no tenant to scope it by.
     execute("""
-    INSERT INTO zebridge_public_tables (tbl, reason)
+    INSERT INTO zebridge_catalogue (tbl, public_reason)
     VALUES ('#{@cdc_table}', 'keyless preflight/no-PK test fixture, not real business data')
     ON CONFLICT (tbl) DO NOTHING;
     """)

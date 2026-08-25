@@ -94,6 +94,18 @@ def main():
             failed += 1
 
         # ── exemption: internal tables stay naive-capable, or migrations break ─
+        # The probe table may not exist outside an Ecto-bootstrapped database —
+        # create it if absent (through the guard: CREATE with a naive timestamp on
+        # an exempt name must itself pass, which is half the point) and remember
+        # to remove it. Probing a missing table reported "exemption broken" when
+        # the guard was fine — found on the catalogue-era re-sweep.
+        created_probe = not zb.psql(
+            "SELECT 1 FROM pg_class WHERE relname='schema_migrations'", quiet=True).strip()
+        if created_probe:
+            r0 = run_sql("CREATE TABLE public.schema_migrations (version bigint PRIMARY KEY, inserted_at timestamp(0) without time zone);")
+            if r0.returncode != 0:
+                zb.bad(f"the exemption is broken at CREATE: {r0.stderr.strip()[:140]}")
+                failed += 1
         r = run_sql("ALTER TABLE public.schema_migrations ADD COLUMN tzguard_probe timestamp;")
         if r.returncode == 0:
             zb.psql("ALTER TABLE public.schema_migrations DROP COLUMN tzguard_probe", quiet=True)
@@ -101,6 +113,8 @@ def main():
         else:
             zb.bad(f"the exemption is broken; migrations cannot run on a fresh database: {r.stderr.strip()[:140]}")
             failed += 1
+        if created_probe:
+            zb.psql("DROP TABLE IF EXISTS public.schema_migrations", quiet=True)
     finally:
         for t in ("tzguard_bad", "tzguard_ok", "tzguard_half", "tzguard_bad2"):
             zb.psql(f"DROP TABLE IF EXISTS public.{t}", quiet=True)

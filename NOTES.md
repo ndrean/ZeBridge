@@ -178,6 +178,7 @@ built, and match the sketch exactly:
 
 `subscribeStreams()` (`App.tsx`) opens a JetStream `consumer.consume()` per stream
 with `deliver_policy: last > 0 ? StartSequence : All, opt_start_seq: last > 0 ? last
+
 - 1 : undefined`. A client connecting after the fact replays from its own persisted
 `_zebridge_stream_seq`, not just live traffic. The same call runs again on
 reconnect (§1.6a below), so a dropped connection resumes rather than silently
@@ -3056,7 +3057,6 @@ The functions are divided into read-only configurations, edge-write guard config
 | `zebridge_audit_write_guards()` | Audits all tables and reports which ones possess ZeBridge's write guard triggers. |
 | `zebridge_audit_sweeper()` | Checks if the internal sweeper principal (`zb_sweeper`) has any unreachable tenants, thereby helping track tenants whose tombstones won't get collected. |
 
-
 ### Event triggers (the objects the functions above are wired to)
 
 | Trigger | Fires on | Function |
@@ -3130,65 +3130,26 @@ Once these steps occur, ZeBridge seamlessly picks up the new `tenant_id` from th
 > shape (no PubAck, retries, eventual bridge FATAL). The backend's provisioning step
 > is therefore step 1, not housekeeping.
 
-## 10. libzebridge — one Zig core, every consumer (2026-08-25)
+## 10. libzb — one Zig core, every consumer (2026-08-25)
 
-The consumer-code problem, named honestly: App.tsx is ~2700 lines, and the hard 60%
-is the write side — outbox, verdict state machine, optimistic apply with two revert
-modes, clamp, echo-as-confirmation. None of it is accidental complexity; all of it
-would have to be re-derived per language for the example matrix ([Leaf+Python+PG],
-[Leaf+Go+SQLite], [Leaf+Phoenix+PG], Flutter, Swift, Node/TS — Ruby viable too:
-Rails 8 pushes SQLite-in-production, `nats-pure` is official). This section is the
-answer, so it does not get re-invented worse later.
+The consumer-code problem, named honestly: App.tsx is ~2700 lines, and the hard 60% is the write side — outbox, verdict state machine, optimistic apply with two revert modes, clamp, echo-as-confirmation. None of it is accidental complexity; all of it would have to be re-derived per language for the example matrix ([Leaf+Python+PG], [Leaf+Go+SQLite], [Leaf+Phoenix+PG], Flutter, Swift, Node/TS — Ruby viable too: Rails 8 pushes SQLite-in-production, `nats-pure` is official). This section is the answer, so it does not get re-invented worse later.
 
-**The split: eater vs speaker.** Every consumer has exactly two roles, and the
-socket belongs to only one of them.
+**The split: eater vs speaker.** Every consumer has exactly two roles, and the socket belongs to only one of them.
 
 - **The eater** — the applier core, sans-I/O: bytes in → SQL + instructions out.
-  It NEVER touches a socket, not even to "propagate the good news": an outbound
-  write surfaces as an instruction ("publish these bytes on
-  `mutation.<principal>.<table>.<verb>` with this msg-id"), and the host's
-  transport does the sending. Everything hard lives here: the chain walk (manifest
-  → watermark rule → full-or-deltas plan → 404-means-re-read-from-the-full), the
-  version-GUARDED upsert, the LSN gate, the wire-format normalization (§1.13's
-  `' '` vs `'T'` catch — fixed in ONE place forever), the verdict machine, the
-  outbox rules. "The snapshot business" is deliberately INSIDE: it is the most
-  standardized part of the protocol. Driven as a state machine with an effect
-  queue: host feeds bytes (manifest, objects, CDC events, verdicts), core returns
-  effects (fetch X, run these statements in one transaction, publish Y, persist
-  watermark W / lsn L). No daemon-ness: the loop, threads and liveness live in the
-  speaker; the eater is a function you keep calling — which is also why it is
-  testable by fixtures instead of a harness.
+  It NEVER touches a socket, not even to "propagate the good news": an outbound write surfaces as an instruction ("publish these bytes on `mutation.<principal>.<table>.<verb>` with this msg-id"), and the host's transport does the sending. Everything hard lives here: the chain walk (manifest → watermark rule → full-or-deltas plan → 404-means-re-read-from-the-full), the version-GUARDED upsert, the LSN gate, the wire-format normalization (§1.13's `' '` vs `'T'` catch — fixed in ONE place forever), the verdict machine, the outbox rules. "The snapshot business" is deliberately INSIDE: it is the most standardized part of the protocol. Driven as a state machine with an effect queue: host feeds bytes (manifest, objects, CDC events, verdicts), core returns effects (fetch X, run these statements in one transaction, publish Y, persist watermark W / lsn L). No daemon-ness: the loop, threads and liveness live in the speaker; the eater is a function you keep calling — which is also why it is testable by fixtures instead of a harness.
 
 - **The speaker** — the pump that owns the socket, reconnects, the read loop.
-  Necessarily native to its platform: `@nats-io/nats-core` over WebSockets in the
-  browser, `nats.zig` (TLS verified 2026-08-24) everywhere else. ~50 lines per
-  platform, not ~800.
+  Necessarily native to its platform: `@nats-io/nats-core` over WebSockets in the browser, `nats.zig` (TLS verified 2026-08-24) everywhere else. ~50 lines per platform, not ~800.
 
 **One Zig source, two artifacts.**
 
 - `applier.wasm` — the eater compiled `wasm32-freestanding`. Sans-I/O means NO
-  WASI: no sockets, clock, or fs imports, so it runs on any runtime including tiny
-  interpreters. Hosts: browser (native), Node (same V8 bytes as the browser — zero
-  deps), Go (`wazero`, pure Go, no cgo), Python/Ruby/Elixir (official wasmtime
-  bindings). ABI: primitive byte-passing over linear memory; the Component
-  Model/WIT is deliberately skipped until it settles — adopting it later changes
-  no logic.
-- `libzebridge` — the eater + `nats.zig` + linked `sqlite3.c`, compiled natively
-  (Zig cross-compiles `aarch64-ios`/`aarch64-android` out of the box; iOS forbids
-  JIT, so native beats interpreted wasm there). The library OWNS the replica.
-  C ABI on the order of: `zb_connect(url, creds)`, `zb_query(sql)`,
-  `zb_mutate(table, key, values)`, `zb_on_change(table, cb)`. Swift consumes the
-  header directly, Dart via `dart:ffi`, Kotlin via JNI, Python `ctypes`, Ruby
-  `fiddle`. Being a LIBRARY, not a process, makes the read-loop thread, reconnect
-  policy and FFI memory ownership deliberate API surface — ordinary C-library
-  discipline, designed once.
+  WASI: no sockets, clock, or fs imports, so it runs on any runtime including tiny interpreters. Hosts: browser (native), Node (same V8 bytes as the browser — zero deps), Go (`wazero`, pure Go, no cgo), Python/Ruby/Elixir (official wasmtime bindings). ABI: primitive byte-passing over linear memory; the Component Model/WIT is deliberately skipped until it settles — adopting it later changes no logic.
+- `libzb` — the eater + `nats.zig` + linked `sqlite3.c`, compiled natively
+  (Zig cross-compiles `aarch64-ios`/`aarch64-android` out of the box; iOS forbids JIT, so native beats interpreted wasm there). The library OWNS the C ABI on the order of: `zb_connect(url, creds)`, `zb_query(sql)`, `zb_mutate(table, key, values)`, `zb_on_change(table, cb)`. Swift consumes the header directly, Dart via `dart:ffi`, Kotlin via JNI, Python `ctypes`, Ruby `fiddle`. Being a LIBRARY, not a process, makes the read-loop thread, reconnect policy and FFI memory ownership deliberate API surface — ordinary C-library discipline, designed once.
 
-**The browser carve-out** (the one place the full-Zig client cannot go): wasm has
-no sockets, so nats.zig's transport physically cannot run there — and does not
-need to: the TS pump extracted from App.tsx (`zebridge-client-ts`) is already
-built and debugged. Browser = TS speaker + wasm eater. Server-side wasm WITH
-sockets (WASI preview-2) is parked as bleeding-edge; servers load the native lib
-via FFI instead, or use the wasm eater with their own native pump.
+**The browser carve-out** (the one place the full-Zig client cannot go): wasm hano sockets, so nats.zig's transport physically cannot run there — and does not need to: the TS pump extracted from App.tsx (`zb-client-ts`) is alread built and debugged. Browser = TS speaker + wasm eater. Server-side wasm WITH sockets (WASI preview-2) is parked as bleeding-edge; servers load the native lib via FFI instead, or use the wasm eater with their own native pump.
 
 **The consumer contract fits on an index card.**
 
@@ -3205,15 +3166,11 @@ via FFI instead, or use the wasm eater with their own native pump.
   moves facts about rows.
 - `onChange(table, cb)` — the doorbell; the app re-queries.
 
-**The one rule, made mechanical** ("the ones that only live in prose are the ones
-that bite" — third occurrence of the pattern after the timestamp and publication
-guards): direct writes to the replica bypass the outbox and diverge silently, so
-`libzebridge` keeps its read-write connection PRIVATE and hands the app a second
-connection opened `SQLITE_OPEN_READONLY` (WAL: readers never block the applier).
-A stray UPDATE is an error at the call site, not a violated convention. In the
-browser tier (one sqlocal connection, OPFS sync handles are exclusive) the package
-instead simply exports no write path except `mutate()`; the raw handle stays for
-the SQL console, labeled.
+**The one rule, made mechanical** ("the ones that only live in prose are the ones that bite" — third occurrence of the pattern after the timestamp and publication guards): direct writes to the replica bypass the outbox and diverge silently, so:
+❇️  `libzb` keeps its read-write connection PRIVATE and
+❇️ hands the app a second connection opened `SQLITE_OPEN_READONLY` (WAL: readers never block the applier).
+
+A stray UPDATE is an error at the call site, not a violated convention. In the browser tier (one sqlocal connection, OPFS sync handles are exclusive) the package instead simply exports no write path except `mutate()`; the raw handle stays for the SQL console, labeled.
 
 **The conformance harness certifies ONE artifact, not six ports.** A sans-I/O core
 is its own harness target: fixtures in, emitted SQL and effects out, byte-for-byte
@@ -3230,44 +3187,20 @@ dialect lands when the Python/Phoenix consumers force it (rule of three). Neutra
 statement-descriptions were considered and rejected: they push rendering into
 every binding, the exact cost this design exists to kill.
 
-**Extraction order** (rule of three, twice): `zebridge-client-ts` is extracted
-with App.tsx as its FIRST consumer and the Node example as its second — the
-browser demo becomes the regression test for the extraction. Likewise no
-universal SDK abstraction before two ports exist against the protocol directly.
+**Extraction order** (rule of three, twice): `zb-client-ts` is extracted with App.tsx as its FIRST consumer and the Node example as its second — the browser demo becomes the regression test for the extraction. Likewise no universal SDK abstraction before two ports exist against the protocol directly.
 
-**Extraction step 1 LANDED (2026-08-25): `web-consumer/src/libzb.ts`.** The sync
-core is out of App.tsx: one `ZeBridge` class (~1500 lines with its comments) holding
-schema watch, chain-first seeding with the snapshot fallback, CDC apply (batched,
-`defer_foreign_keys`), the whole §7 write path (outbox, optimistic apply + two revert
-modes, verdicts, echo-confirm, rtt liveness), and the doorbell events. App.tsx fell
-from ~2780 lines to ~490 of pure theater — signals, badges, demo buttons, the SQL
-console, the /bridge/health poll — wired through the class's public surface: `query`,
-`mutate` (returns the stamped version; `rawMutation` stays public as the deliberate
-escape hatch for the malformed-payload demo), `onChange`/`onTableEvent`/`onAnyChange`,
-`onLog`/`onPhase`/`onSuspended`/`onStatus`, and debug getters that rebuilt the
-`window.zb` console helpers unchanged. Verified live as its own regression test:
-fresh load seeded `users` from chain g4 (12 rows) + CDC delivered the 13th, tenant
-resolved, and a button write round-tripped MUTATION OUT → PubAck → verdict
-`accepted` → optimistic row visible. Next: lift the file into a real
-`zebridge-client-ts` package (the Node consumer with better-sqlite3 + TCP transport
-becomes its second consumer, forcing the storage/transport seams), THEN carve the
-sans-I/O eater boundary inside it.
+**Extraction step 1 LANDED (2026-08-25): `web-consumer/src/libzb.ts`.** The sync core is out of App.tsx. One `ZeBridge` class (~1500 lines with its comments) holding:
 
-**Rejected on the way here, recorded so it stays rejected**: the reverse
-architecture (push RAW pgoutput to NATS, decode at the edge / wasmCloud). It
-breaks the tenant ACL — subject routing REQUIRES decoding (the tenant column
-lives in the decoded tuple), so raw frames hand every edge decoder all tenants
-mixed — and pgoutput is stateful (tuples reference relation OIDs from earlier
-Relation messages: every consumer grows a relcache, late joiners can't decode,
-retention must preserve schema messages forever). The gain would have been
-offloading ~3.5µs/event of decode CPU that was never scarce. The salvageable
-adjacent idea: an optional **SQL lane** — a small worker (wasmCloud fits HERE)
-consuming the already-tenant-routed streams and republishing rendered SQL phrases
-per dialect (`cdc-sql.<dialect>.<tenant>.<table>.>`), making ~50-line consumers
-possible for teams that want them. Behind the bridge, opt-in, ACL intact.
+- schema watch,
+- chain-first seeding with the snapshot fallback,
+- CDC apply (batched `defer_foreign_keys`),
+- the whole §7 write path (outbox optimistic apply + two revert modes, verdicts, echo-confirm, rtt liveness), and the doorbell events.
 
-Context this slots into: the leaf topology (bridge↔NATS plain TCP colocated,
-NATS↔leaves TLS, PG↔bridge SSL for PG-as-a-service; one leaf per tenant whose hub
-credential carries that tenant's grants; ~20ms leaf latency exercising LWW and the
-5s clamp in anger) and the ~20MB bridge footprint (ring buffer is the knob,
-arenas, no GC). Small tool, sharp contract — the contract is the investment.
+App.tsx fell from ~2780 lines to ~490 of pure theater — signals, badges, demo buttons, the SQL console, the /bridge/health poll — wired through the class's public surface: `query`, `mutate` (returns the stamped version; `rawMutation` stays public as the deliberate escape hatch for the malformed-payload demo `onChange`/`onTableEvent`/`onAnyChange`, `onLog`/`onPhase`/`onSuspended`/`onStatus`, and debug getters that rebuilt the `window.zb` console helpers unchanged.
+Verified live as its own regression test: fresh load seeded `users` from chain g4 (12 rows) + CDC delivered the 13th, tenant resolved, and a button write round-tripped MUTATION OUT → PubAck → verdict `accepted` → optimistic row visible.
+
+Next: lift the file into a real `zb-client-ts` package (the Node consumer with better-sqlite3 + TCP transport becomes its second consumer, forcing the storage/transport seams), THEN carve the sans-I/O eater boundary inside it.
+
+**Rejected on the way here, recorded so it stays rejected**: the reverse architecture (push RAW pgoutput to NATS, decode at the edge / wasmCloud). It breaks the tenant ACL — subject routing REQUIRES decoding (the tenant column lives in the decoded tuple), so raw frames hand every edge decoder all tenants mixed — and pgoutput is stateful (tuples reference relation OIDs from earlier Relation messages: every consumer grows a relcache, late joiners can't decode, retention must preserve schema messages forever). The gain would have been offloading ~3.5µs/event of decode CPU that was never scarce. The salvageable adjacent idea: an optional **SQL lane** — a small worker (wasmCloud fits HERE) consuming the already-tenant-routed streams and republishing rendered SQL phrases per dialect (`cdc-sql.<dialect>.<tenant>.<table>.>`), making ~50-line consumers possible for teams that want them. Behind the bridge, opt-in, ACL intact.
+
+Context this slots into: the leaf topology (bridge↔NATS plain TCP colocated, NATS↔leaves TLS, PG↔bridge SSL for PG-as-a-service; one leaf per tenant whose hub credential carries that tenant's grants; ~20ms leaf latency exercising LWW and the 5s clamp in anger) and the ~20MB bridge footprint (ring buffer is the knob, arenas, no GC). Small tool, sharp contract — the contract is the investment.

@@ -45,8 +45,9 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
       # Nullable by definition — a set value *is* the tombstone.
       #
       # ⚠️ Declaring the column is only half of it: the bridge learns which column is the
-      # tombstone from `SYNC_RULES=test_types:updated_at,deleted_at`, not from the schema.
-      # Without that line this is an ordinary nullable timestamp and deletes stay physical.
+      # tombstone from the table's `zebridge_catalogue` row (written by `zebridge_enable`
+      # in the NEXT migration), not from the schema. Without it this is an ordinary
+      # nullable timestamp and deletes stay physical.
       add(:deleted_at, :timestamptz)
 
       timestamps(type: :timestamptz)
@@ -57,7 +58,7 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
     # `users` — genuinely public, no tenant column, ever. `zebridge_enable()` (defined in
     # init.core.template.sql — the READ half, no write profile needed for this call) does
     # in one statement what this migration used to hand-roll in four: sets
-    # `REPLICA IDENTITY`, records the table in `zebridge_public_tables` with a reason,
+    # `REPLICA IDENTITY`, records the table in `zebridge_catalogue` with a `public_reason`,
     # and — only once that scoping decision exists, which its own preflight enforces —
     # adds it to the publication. `writable` defaults to false, so nothing here touches
     # the write role at all.
@@ -86,8 +87,8 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
     # The next migration finishes the job — tenant scoping and the first-ever publish,
     # via the same `zebridge_enable()`, once the column it needs actually exists.
     #
-    # Publishing early would buy nothing anyway: `.env.bridge` already declares
-    # `TENANT_RULES=test_types:tenant_id`, so a bridge that saw this table published
+    # Publishing early would buy nothing anyway: the catalogue will declare
+    # `tenant_col = tenant_id` for it, so a bridge that saw this table published
     # before the column exists would just suspend it (`no_tenant_column`) the moment it
     # tried to preflight it.
     execute("""

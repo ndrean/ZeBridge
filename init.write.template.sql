@@ -430,7 +430,7 @@ BEGIN
     -- directly — defined once in core so it needs nothing from this file.
     PERFORM public.zebridge_scope_reads_by_tenant(tbl, tenant_col);
 
-    RAISE NOTICE 'writes and snapshot reads on % are now scoped by %; CDC stays scoped by the subject, not RLS — set TENANT_RULES=%:% and scope cdc.<tenant>.> in NATS',
+    RAISE NOTICE 'writes and snapshot reads on % are now scoped by %; CDC stays scoped by the subject, not RLS — zebridge_enable records %.% in zebridge_catalogue, and the bridge routes it after one restart',
                  tbl, tenant_col, tbl, tenant_col;
 END;
 $$ LANGUAGE plpgsql;
