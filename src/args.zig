@@ -513,16 +513,23 @@ pub const Args = struct {
             var col_list: std.ArrayList([]const u8) = .empty;
             errdefer col_list.deinit(allocator);
 
+            // ⚠️ Empty fields are KEPT as empty strings: the grammar is positional
+            // (`version[,tombstone[,tiebreak]]`), so `updated_at,,last_writer` means
+            // "no tombstone, tiebreak last_writer". Skipping empties silently slid the
+            // tiebreak into the tombstone slot — found live: counter_public treated
+            // `last_writer` as its tombstone and never stamped a tiebreak. Every
+            // consumer treats an empty entry as "not configured".
             var col_iter = std.mem.splitScalar(u8, columns_str, ',');
+            var any_nonempty = false;
             while (col_iter.next()) |col| {
                 const col_trimmed = std.mem.trim(u8, col, " \t\n\r");
-                if (col_trimmed.len > 0) {
-                    const col_owned = try allocator.dupe(u8, col_trimmed);
-                    try col_list.append(allocator, col_owned);
-                }
+                if (col_trimmed.len > 0) any_nonempty = true;
+                const col_owned = try allocator.dupe(u8, col_trimmed);
+                try col_list.append(allocator, col_owned);
             }
 
-            if (col_list.items.len == 0) {
+            if (!any_nonempty) {
+                for (col_list.items) |c| allocator.free(c);
                 col_list.deinit(allocator);
                 log.warn("No valid columns for table '{s}', skipping", .{table_name});
                 continue;

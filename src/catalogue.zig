@@ -105,11 +105,14 @@ pub fn loadRules(
             grew = true;
         }
         if (sync_rules.get(tbl) == null) {
-            // Positional grammar mirrored from parseTableRules: non-empty columns in
-            // version, tombstone, tiebreak order (the parser skips empties too).
+            // POSITIONAL grammar mirrored from parseTableRules: version, tombstone,
+            // tiebreak — and position IS the meaning, so a tiebreak with no tombstone
+            // keeps an empty placeholder in slot 1. Sliding it forward made the
+            // tiebreak the tombstone (found live on counter_public: last_writer as
+            // tombstone, ties never stamped). Consumers treat "" as "not configured".
             var list: std.ArrayList([]const u8) = .empty;
             list.append(allocator, allocator.dupe(u8, version_col) catch continue) catch continue;
-            if (tombstone_col.len > 0)
+            if (tombstone_col.len > 0 or tiebreak_col.len > 0)
                 list.append(allocator, allocator.dupe(u8, tombstone_col) catch continue) catch continue;
             if (tiebreak_col.len > 0)
                 list.append(allocator, allocator.dupe(u8, tiebreak_col) catch continue) catch continue;

@@ -19,6 +19,7 @@ const Topology = @import("topology.zig");
 const Preflight = @import("preflight.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
+const nats_publisher = @import("nats_publisher.zig");
 const schema_mapper = @import("schema_mapper.zig");
 
 fn nanoNow() u64 {
@@ -110,6 +111,11 @@ fn valuesEqual(a: pgoutput.DecodedValue, b: pgoutput.DecodedValue) bool {
 pub const EventProcessor = struct {
     allocator: std.mem.Allocator,
     batch_publisher: *batch_publisher.BatchPublisher,
+    /// The shared NATS publisher, for the DROP-prune below. Optional and assigned
+    /// after construction (bridge.zig), because the publisher outlives this struct
+    /// but is built later in boot. Cross-thread JS requests on it are the same
+    /// pattern the HTTP server's stream endpoints already use.
+    publisher: ?*nats_publisher.Publisher = null,
     metrics: ?*Metrics,
     transition_rules: *const Config.EventClassification.TransitionRules,
     pg_config: *const pg_conn.PgConf,
@@ -818,6 +824,171 @@ pub const EventProcessor = struct {
     /// ⚠️ Deliberately *not* "does the table have a column called deleted_at". A column
     /// nobody configured is an ordinary nullable timestamp, deletes on that table are
     /// physical and real, and suppressing them would strand rows in every replica.
+    /// Best-effort NATS-side prune when a table is DROPPED — the omar-replay
+    /// finding (NOTES.md): the schema tombstone tells LIVE clients the table died,
+    /// but the generation chain (manifest + objects), the snapshot descriptor, the
+    /// INIT chunks and the CDC retention all survive under the reused name, and a
+    /// FRESH client seeds ghosts from whichever it hits first. This prunes all four
+    /// on the same event that publishes the tombstone.
+    ///
+    /// Every step is advisory: a failed prune logs and moves on — the WAL path must
+    /// never stall or die on broker housekeeping. Coverage is boot-scoped like the
+    /// stream reconciliation: the open tenant always, plus every boot-known tenant
+    /// when the table was tenant-routed; a tenant born after boot keeps its
+    /// artifacts until its backend prunes them (the dyntenant contract).
+    ///
+    /// ⚠️ Purging CDC retention is deliberate data loss for OFFLINE clients: they
+    /// reconnect to the tombstone and drop the table anyway — the retained rows
+    /// could only ever have been ghosts.
+    fn pruneDroppedTable(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8) void {
+        const publ = self.publisher orelse return;
+        const js = if (publ.js) |*j| j else return;
+
+        const open = self.topology.open_tenant;
+        const tenant_scoped = self.tenant_rules.contains(table);
+
+        var purges: usize = 0;
+        var objects: usize = 0;
+        var keys: usize = 0;
+
+        // One tenant's worth of artifacts. `null` stream names mean "the public
+        // pair" (open-tenant rows and untenanted rows both land there).
+        const Step = struct { tenant: []const u8, cdc_stream: ?[]const u8, init_stream: ?[]const u8 };
+        var steps: std.ArrayList(Step) = .empty;
+        defer steps.deinit(arena);
+        steps.append(arena, .{ .tenant = open, .cdc_stream = null, .init_stream = null }) catch return;
+        if (tenant_scoped) for (self.topology.tenants) |t| {
+            steps.append(arena, .{ .tenant = t, .cdc_stream = t, .init_stream = t }) catch continue;
+        };
+
+        for (steps.items) |step| {
+            var name_buf: [256]u8 = undefined;
+
+            // ── CDC retention ────────────────────────────────────────────────
+            // Untenanted rows: `cdc.<tbl>.>` in CDC_PUBLIC. Tenant-routed rows:
+            // `cdc.<tenant>.<tbl>.>` — open tenant's in CDC_PUBLIC, others in CDC_<T>.
+            {
+                const stream = if (step.cdc_stream) |t| blk: {
+                    const prefix = self.topology.cdc_stream_prefix;
+                    const upper = std.ascii.upperString(name_buf[prefix.len..], t);
+                    @memcpy(name_buf[0..prefix.len], prefix);
+                    break :blk name_buf[0 .. prefix.len + upper.len];
+                } else self.topology.cdc_stream_public;
+                const tenant_filter = std.fmt.allocPrint(arena, "{s}.{s}.{s}.>", .{ self.topology.subject_cdc_prefix, step.tenant, table }) catch return;
+                if (js.purgeStream(stream, .{ .filter = tenant_filter })) |res| {
+                    var r = res;
+                    r.deinit();
+                    purges += 1;
+                } else |err| log.warn("🧹 prune '{s}': CDC purge on {s} failed: {s}", .{ table, stream, @errorName(err) });
+                if (step.cdc_stream == null and !tenant_scoped) {
+                    const bare = std.fmt.allocPrint(arena, "{s}.{s}.>", .{ self.topology.subject_cdc_prefix, table }) catch return;
+                    if (js.purgeStream(stream, .{ .filter = bare })) |res| {
+                        var r = res;
+                        r.deinit();
+                        purges += 1;
+                    } else |err| log.warn("🧹 prune '{s}': CDC purge on {s} failed: {s}", .{ table, stream, @errorName(err) });
+                }
+            }
+
+            // ── INIT chunks and the dump's side subjects ─────────────────────
+            // Five shapes, because only the DATA chunks carry the table right
+            // after the tenant (`init.snap.<t>.<tbl>.<id>.<n>`) — start, error,
+            // meta and schema put a keyword first (`init.snap.<t>.meta.<tbl>` …),
+            // so one filter cannot cover them all (measured: the first prune left
+            // meta/start/error/schema rows behind).
+            {
+                const stream = if (step.init_stream) |t| blk: {
+                    const prefix = self.topology.init_stream_prefix;
+                    const upper = std.ascii.upperString(name_buf[prefix.len..], t);
+                    @memcpy(name_buf[0..prefix.len], prefix);
+                    break :blk name_buf[0 .. prefix.len + upper.len];
+                } else self.topology.init_stream_public;
+                const shapes = [_][]const u8{ "{s}.snap.{s}.{s}.>", "{s}.snap.{s}.start.{s}", "{s}.snap.{s}.error.{s}", "{s}.snap.{s}.meta.{s}", "{s}.snap.{s}.schema.{s}.>" };
+                inline for (shapes) |shape| {
+                    const filt = std.fmt.allocPrint(arena, shape, .{ self.topology.subject_init_prefix, step.tenant, table }) catch return;
+                    if (js.purgeStream(stream, .{ .filter = filt })) |res| {
+                        var r = res;
+                        r.deinit();
+                        purges += 1;
+                    } else |err| log.warn("🧹 prune '{s}': INIT purge on {s} failed: {s}", .{ table, stream, @errorName(err) });
+                }
+            }
+
+            const key = std.fmt.allocPrint(arena, "{s}.{s}", .{ step.tenant, table }) catch return;
+
+            // ── chain objects, manifest-driven, THEN the manifest ────────────
+            // The manifest is the only pointer to the object names, so it is read
+            // first and purged last — the reverse of the producer's swap order.
+            if (js.kvBucket(self.topology.kv_generations)) |kv_const| {
+                var kv = kv_const;
+                defer kv.deinit();
+                if (kv.get(key)) |entry_const| {
+                    var entry = entry_const;
+                    defer entry.deinit();
+                    objects += self.deleteChainObjects(arena, js, entry.value);
+                } else |_| {} // no manifest — nothing to point at
+                if (kv.purge(key, .{})) |_| {
+                    keys += 1;
+                } else |err| log.warn("🧹 prune '{s}': generations purge of {s} failed: {s}", .{ table, key, @errorName(err) });
+            } else |err| log.warn("🧹 prune '{s}': generations bucket unreachable: {s}", .{ table, @errorName(err) });
+
+            // ── snapshot descriptor ──────────────────────────────────────────
+            if (js.kvBucket(self.topology.kv_snapshots)) |kv_const| {
+                var kv = kv_const;
+                defer kv.deinit();
+                if (kv.purge(key, .{})) |_| {
+                    keys += 1;
+                } else |err| log.warn("🧹 prune '{s}': snapshots purge of {s} failed: {s}", .{ table, key, @errorName(err) });
+            } else |err| log.warn("🧹 prune '{s}': snapshots bucket unreachable: {s}", .{ table, @errorName(err) });
+        }
+
+        log.info("🧹 drop prune for '{s}': {d} stream purge(s), {d} chain object(s), {d} KV key(s)", .{ table, purges, objects, keys });
+    }
+
+    /// Delete every object a chain manifest names. Returns how many went.
+    fn deleteChainObjects(self: *EventProcessor, arena: std.mem.Allocator, js: anytype, manifest_bytes: []const u8) usize {
+        _ = self;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, manifest_bytes, .{}) catch return 0;
+        const root = switch (parsed) {
+            .object => |o| o,
+            else => return 0,
+        };
+        const bucket = if (root.get("bucket")) |b| switch (b) {
+            .string => |x| x,
+            else => return 0,
+        } else return 0;
+
+        var osm = js.objectStoreManager();
+        var store = osm.openStore(bucket) catch return 0;
+        defer store.deinit();
+
+        var gone: usize = 0;
+        if (root.get("full")) |f| switch (f) {
+            .object => |fo| if (fo.get("object")) |n| switch (n) {
+                .string => |name| {
+                    store.delete(name) catch {};
+                    gone += 1;
+                },
+                else => {},
+            },
+            else => {},
+        };
+        if (root.get("deltas")) |ds| switch (ds) {
+            .array => |arr| for (arr.items) |d| switch (d) {
+                .object => |dobj| if (dobj.get("object")) |n| switch (n) {
+                    .string => |name| {
+                        store.delete(name) catch {};
+                        gone += 1;
+                    },
+                    else => {},
+                },
+                else => {},
+            },
+            else => {},
+        };
+        return gone;
+    }
+
     pub fn hasTombstone(self: *const EventProcessor, table: []const u8) bool {
         const cols = self.sync_rules.get(table) orelse return false;
         return cols.len > 1 and cols[1].len > 0;
@@ -846,8 +1017,8 @@ pub const EventProcessor = struct {
         var version_name: []const u8 = self.default_version_column;
         var tombstone_name: ?[]const u8 = null;
         if (self.sync_rules.get(table)) |cols| {
-            if (cols.len > 0) version_name = cols[0];
-            if (cols.len > 1) tombstone_name = cols[1];
+            if (cols.len > 0 and cols[0].len > 0) version_name = cols[0];
+            if (cols.len > 1 and cols[1].len > 0) tombstone_name = cols[1];
         }
 
         const has = struct {
@@ -1033,6 +1204,10 @@ pub const EventProcessor = struct {
                 // reuses the name. Every other refusal lifts through a DDL event
                 // carrying a fixed schema; a DROP carries none, so it must lift here.
                 self.refused.clear(clean_table);
+
+                // The tombstone tells clients the table died; this clears what the
+                // tombstone cannot reach — the ghosts a FRESH client would seed from.
+                self.pruneDroppedTable(arena, clean_table);
 
                 log.info("🗑️  DROP TABLE tombstone published for '{s}'", .{clean_table});
                 return slot_idx;

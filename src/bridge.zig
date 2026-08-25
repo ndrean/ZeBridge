@@ -879,6 +879,11 @@ pub fn main(init: std.process.Init) !void {
         writer_role,
     );
 
+    // The DROP-prune needs the shared publisher's JetStream context (assigned
+    // here, not in init, because the publisher is built earlier in boot but the
+    // processor's ctor predates it in the file's dependency order).
+    event_proc.publisher = &publisher;
+
     // Publish boot schemas to NATS KV for all monitored tables
     try event_proc.publishBootSchemas(allocator, monitored_tables);
 

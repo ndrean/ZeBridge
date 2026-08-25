@@ -1084,12 +1084,14 @@ pub const MutationListener = struct {
         var tombstone_name: ?[]const u8 = null;
         var client_name: ?[]const u8 = null;
         if (self.sync_rules.get(table)) |cols| {
-            if (cols.len > 0) version_name = cols[0];
-            if (cols.len > 1) tombstone_name = cols[1];
+            // Positional, and an empty entry means "not configured" — `updated_at,,x`
+            // is version + tiebreak with NO tombstone (see parseTableRules).
+            if (cols.len > 0 and cols[0].len > 0) version_name = cols[0];
+            if (cols.len > 1 and cols[1].len > 0) tombstone_name = cols[1];
             // `table:updated_at,deleted_at,last_writer` — the third column is where the
             // winner's client_id is kept. Opt-in per table because it costs a column, and
             // a table that never sees concurrent equal versions does not need one.
-            if (cols.len > 2) client_name = cols[2];
+            if (cols.len > 2 and cols[2].len > 0) client_name = cols[2];
         }
 
         var version_type: VersionType = .other;

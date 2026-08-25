@@ -1843,6 +1843,61 @@ for the next boot to gain its subject — the restart IS the T3 step, for public
 tables too now. And the endgame table below is down to one static surface: the
 NATS per-principal grants, waiting on the JWT signing key.
 
+**The omar replay (same evening, second pass) — two real findings.** Replaying the
+dyntenant browser exercise through the new `tiebreak_col` parameter, with the
+counters dropped and reborn cleanly, surfaced two bugs the first pass had masked:
+
+(1) **The positional-rule collapse.** `parseTableRules` SKIPPED empty fields, so
+`counter_public:updated_at,,last_writer` — the documented "no tombstone, tiebreak
+last_writer" shape, double comma and all — collapsed to `[updated_at,
+last_writer]`, and every consumer reads position 1 as the TOMBSTONE. counter_public
+had `last_writer` as its tombstone column and no tiebreak at all, silently, since
+the counters were born; `.env.bridge`'s comment promised a semantics the parser
+never had, and catalogue.zig inherited the collapse faithfully (a catalogue
+tiebreak with a NULL tombstone slid into slot 1). Invisible because `last_writer`
+stayed NULL — nothing ever *looked* soft-deleted — and tiebreak.py only exercises
+the all-three-columns shape. Fixed everywhere position is the meaning: the parser
+keeps empty fields as empty strings, catalogue.zig writes an empty placeholder in
+slot 1 when only the tiebreak is set, and all five consumers (mutation listener,
+event processor, preflight ×2, producer) treat "" as "not configured". Proof: a
+fresh omar click now lands `value=1 last_writer=c-4c879720` in Postgres AND in the
+replica via the echo — stamped from the envelope's client_id, never from data.
+
+(2) **DROP + recreate leaves ghosts in every seeding source.** Dropping a table
+clears Postgres and (live) the client's local table — but the generation chain
+manifest, its objects, the snapshot descriptor, the INIT chunks and the CDC
+retention all survive under the same table name. A FRESH client seeds from
+whichever it hits first and resurrects pre-drop rows: measured, a replayed ghost
+row whose update then earned `row_deleted` → revert (the write path handled it
+perfectly — the ghost was purely client-side). livebirth.py always knew: its
+cleanup deletes the manifest and bookkeeping by hand. The general rule a backend
+must follow on DROP (or DROP+recreate): purge `$KV.generations.<t>.<tbl>`,
+`$KV.snapshots.<t>.<tbl>`, the `init.snap.<t>.<tbl>.>` chunks and the
+`cdc.…<tbl>…` retention, or bump past them. Filed and CLOSED the same evening:
+the DDL pipeline now does all four itself. `pruneDroppedTable`
+(event_processor.zig) runs on the same event that publishes the schema tombstone:
+subject-filtered STREAM.PURGE on the CDC and INIT streams (five INIT shapes,
+because only the data chunks carry the table right after the tenant — start,
+error, meta and schema put a keyword first, and the first acceptance run left
+exactly those behind), manifest-driven object deletes in `gen-<tenant>` (read the
+manifest FIRST, purge it LAST — the reverse of the producer's swap order), then
+KV-rollup purges of the generations and snapshots keys. Everything is advisory
+(log-and-continue: the WAL path never stalls on broker housekeeping) and
+boot-scoped like stream reconciliation: open tenant always, boot-known tenants
+when the table was tenant-routed — a tenant born after boot keeps its artifacts
+until its backend prunes, the dyntenant contract. Two deliberate limits: objects
+whose manifest is already gone are invisible to the pruner (the manifest is the
+only pointer; the producer's own gen-pruning covers retired objects in normal
+operation), and purging CDC retention is intentional data loss for OFFLINE
+clients — they reconnect to the tombstone and drop the table anyway. Client side:
+`dropLocalTable` (libzb.ts) now also drains `_zebridge_outbox` rows for the
+dropped table, LOUDLY — a queued write for a dead table could only ever earn
+`row_deleted`, or worse, land on an unrelated table that later reuses the name.
+
+(Also relearned at the shell: zsh does not word-split `$N` — an alias-style
+`N="nats -s …"; $N kv purge …` is a silent no-op with stderr swallowed, which
+manufactured a false "already clean" mid-investigation. Literal commands only.)
+
 What topology.json keeps: the genuinely static wire grammar — stream prefixes,
 subject patterns, KV names, open tenant — which changes only in coordinated
 redeploys and therefore never needs re-reading. Deliberately REJECTED: re-reading
@@ -2951,18 +3006,20 @@ zig build test-nats
 | Table Name | Role / Description |
 | :--- | :--- |
 | `zebridge_ddl_events` | The DDL transport mechanism. Because PostgreSQL's logical replication (WAL) natively ignores DDL statements (like `ALTER TABLE`), ZeBridge relies on event triggers (`zebridge_ddl_trigger_fn` and `zebridge_drop_trigger_fn`) to intercept schema changes and log them as `INSERT`s in this table. These `INSERT`s *are* emitted via the WAL, allowing the bridge to read schema changes in strict stream order with CDC data and publish them to NATS KV. |
-| `zebridge_public_tables` | Registers tables that are deliberately published unscoped to all tenants. It acts as an escape hatch for public shared datasets (e.g., product catalogs or currency lists) and justifies why they bypass the scoping guards. |
+| `zebridge_catalogue` | **THE catalogue — one row per replicated table, the single source the bridge, the sweeper and the generation producer read.** `tenant_col NULL` = public (the CHECK forces a recorded `public_reason`, so an unscoped, unjustified row is unrepresentable), NOT NULL = tenant-scoped; `version_col`/`tombstone_col`/`tiebreak_col` are the LWW columns; `generations` opts a table out of chain building. UPSERTed by `zebridge_enable` in the same transaction as the guards it installs, loaded by the bridge at boot (rule maps, the public set for CDC_PUBLIC's subject reconciliation) and by the producer per tick. Absorbed and replaced `zebridge_public_tables` and `zebridge_generation_overrides` — both were projections of it. `SYNC_RULES`/`TENANT_RULES` env demoted to per-table emergency overrides. |
 | `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
 | `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
 | `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. |
+| `zebridge_limits` | One row (`id = 1`): `max_row_bytes`, the width-guard budget (SECURITY.md §1.8). Read by the per-table `zebridge_width_guard` trigger at write time (SECURITY DEFINER, so `bridge_writer` can read it through RLS-less access), so the row-width ceiling is a database fact the DBA can raise in one place — not a constant baked into N trigger bodies. |
 
-#### Client-Side Tables (`web-consumer/src/App.tsx`)
+#### Client-Side Tables (`web-consumer/src/libzb.ts`)
 
 | Table Name | Role / Description |
 | :--- | :--- |
 | `_zebridge_outbox` | Holds optimistic edge writes sent by the client that are pending a confirmation/verdict from NATS and the bridge. |
 | `_zebridge_sync` | Stores the `global_last_lsn` (PostgreSQL WAL position) successfully applied by the consumer, allowing it to discard already-seen CDC events. (Contains a legacy `global_last_seq` column). |
 | `_zebridge_stream_seq` | Tracks JetStream sequences (`last_seq`) grouped by stream. Lets the consumer detect if it has fallen off the back of a stream's retention window when reconnecting. |
+| `_zebridge_generations` | Per-table generation WATERMARK (`tbl PK, watermark, cutoff_lsn`) — the client tracks cutoffs, never gen numbers (a gen is an object-naming detail; the cutoff is what deltas chain on). On reconnect the chain walk applies only deltas whose `cutoff` exceeds the stored watermark. |
 
 <br>
 
@@ -2973,11 +3030,12 @@ The functions are divided into read-only configurations, edge-write guard config
 | Function | Usage / Role |
 | :--- | :--- |
 | **Helpers / Entry Points** | |
-| `zebridge_enable()` | The main orchestration entry point that combines grants, guards, RLS policies, and publication logic. Can dry-run to print its plan or apply configurations in a single call. |
+| `zebridge_enable()` | The main orchestration entry point: grants, write guards, RLS, the width guard, the `zebridge_catalogue` UPSERT (tenant/version/tombstone/`tiebreak_col`/generations — the declaration itself, atomic with the guards) and the publication ADD, LAST. Can dry-run to print its plan. Its T3/T4 rows name the only remaining manual steps: one bridge restart, and the NATS grants. |
 | `zebridge_is_internal_table()` | Checks if a table belongs to ZeBridge (or standard migration tools) to hide it from schema publications and avoid pointless client-side syncing. |
 | **Read/CDC Operations** | |
 | `zebridge_scope_reads_by_tenant()` | Enables RLS on a table to restrict snapshot `SELECT` operations to the active session's tenant. |
-| `zebridge_publication_guard()` | Event trigger function protecting against unscoped `ALTER PUBLICATION ... ADD TABLE`. Rejects publications of tables without row-filters or RLS unless they are registered as public. |
+| `zebridge_tenants_of()` | The generation producer's per-tick tenant set for a tenant-scoped table: `SELECT DISTINCT <tenant_col>` from the DATA. SECURITY DEFINER, because the reader's own RLS would scope the DISTINCT to one tenant — PG functions hold the rules. |
+| `zebridge_publication_guard()` | Event trigger function protecting against unscoped `ALTER PUBLICATION ... ADD TABLE`. Rejects publications of tables without row-filters or RLS unless the catalogue marks them public (`tenant_col IS NULL`). |
 | `zebridge_timestamp_guard()` | Event trigger function refusing any `CREATE`/`ALTER TABLE` in `public` that introduces a `timestamp without time zone` column — §7.2's wire format and version clamping need absolute instants. `zebridge_is_internal_table` names are exempt (Ecto's `schema_migrations` is naive by design). |
 | `zebridge_audit_publications()` | Audits the database to ensure no tables are published without appropriate tenant scoping. |
 | `zebridge_ddl_trigger_fn()` | Event trigger running on `ddl_command_end` to capture modified table schemas directly from the catalog and log them as `INSERT`s into `zebridge_ddl_events`. |
@@ -2988,6 +3046,7 @@ The functions are divided into read-only configurations, edge-write guard config
 | **Write/Ingress Operations** | |
 | `zebridge_grant_edge_writes()` | Grants `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on a table to the `bridge_writer` role to permit edge mutations. |
 | `zebridge_install_write_guards()` | Helper function that sets up triggers for `bump_version`, `soft_delete`, and `guard_tenant` on a table. |
+| `zebridge_install_width_guard()` | Builds and installs the per-table `zebridge_width_guard` trigger: a static body summing the table's unbounded columns (text/unbounded varchar/bytea/json/jsonb/xml/arrays) against `zebridge_limits.max_row_bytes`, raising SQLSTATE 23514 at write time — the same class-23 code the edge-write path already treats as a permanent, immediate rejection, so both doors (consumer and psql) are guarded by one trigger with zero listener code. No-op on tables without unbounded columns. |
 | `zebridge_remove_write_guards()` | Clears the write guard triggers, useful when an admin needs to perform physical cleanups on a table that is restricted to soft-deletes. |
 | `zebridge_bump_version()` | Write trigger ensuring that any write omitting the version column (e.g., `updated_at`) gets appropriately stamped with the current timestamp. |
 | `zebridge_soft_delete()` | Write trigger converting physical `DELETE` statements on tables with a tombstone column into soft-deleting `UPDATE` operations. |

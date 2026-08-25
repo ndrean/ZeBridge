@@ -234,12 +234,15 @@ pub const GenerationProducer = struct {
             const allowed: ?[]const []const u8 = if (restricted) self.rules.get(table) else null;
             if (restricted and allowed == null) continue;
 
-            const vcol = if (self.sync_rules.get(table)) |cols|
-                cols[0]
-            else if (cat_version_col.len > 0)
-                cat_version_col
-            else
-                config.Sync.default_version_column;
+            const vcol = blk: {
+                if (self.sync_rules.get(table)) |cols| {
+                    if (cols.len > 0 and cols[0].len > 0) break :blk cols[0];
+                }
+                break :blk if (cat_version_col.len > 0)
+                    cat_version_col
+                else
+                    config.Sync.default_version_column;
+            };
 
             if (tenant_scoped) {
                 // The tenant SET comes from the data, not from grammar.json — the

@@ -622,6 +622,18 @@ export class ZeBridge {
       await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
       await this.run(`DROP TABLE IF EXISTS ${table};`);
       this.syncedTables.delete(table);
+      // Queued writes for a dropped table can never apply — the server would only
+      // answer row_deleted (or worse, land on an unrelated table that later reuses
+      // the name). Discard them LOUDLY: a silent queue that drains into a void is
+      // exactly what the outbox exists to prevent.
+      try {
+        const q = await this.run(`SELECT count(*) AS k FROM _zebridge_outbox WHERE tbl = ?`, table);
+        const k = q?.[0]?.k ?? 0;
+        if (k > 0) {
+          await this.run(`DELETE FROM _zebridge_outbox WHERE tbl = ?`, table);
+          this.appendLog('SCHEMA', `${k} queued write(s) for dropped table "${table}" discarded — surface this to the user`, 'WARNING');
+        }
+      } catch { /* outbox not initialized yet — nothing queued */ }
       this.appendLog('SCHEMA', `Dropped local table "${table}" (${reason})`, 'DROP');
       this.scheduleRecount();
     } catch (err) {

@@ -344,7 +344,7 @@ pub fn reportVersionColumns(
 
         // The configured name for this table, or the global default.
         const wanted: []const u8 = if (sync_rules.get(table)) |cols|
-            (if (cols.len > 0) cols[0] else default_version_column)
+            (if (cols.len > 0 and cols[0].len > 0) cols[0] else default_version_column)
         else
             default_version_column;
 
@@ -589,7 +589,7 @@ pub fn reportTable(
     }
 
     const wanted: []const u8 = if (sync_rules.get(table)) |cols|
-        (if (cols.len > 0) cols[0] else default_version_column)
+        (if (cols.len > 0 and cols[0].len > 0) cols[0] else default_version_column)
     else
         default_version_column;
 
