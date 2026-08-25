@@ -87,7 +87,7 @@ http_port: 8222
 #
 # ⚠️ `cdc.users.>` is a SECOND entry and not an oversight. Tables with no tenant column
 # publish on the bare `cdc.<table>.<op>` subject (they are recorded in
-# `zebridge_public_tables`, mirrored to `topology.json:public_tables`), so a tenant grant
+# `zebridge_catalogue` (public rows; the bridge reconciles CDC_PUBLIC's subjects from it at boot), so a tenant grant
 # alone cannot reach them. Add a public table, add a line here — and to the matching
 # `filter_subjects` in the client, or it subscribes to something it is not granted and looks
 # idle rather than refused.

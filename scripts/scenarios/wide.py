@@ -92,8 +92,8 @@ def seed(table: str, n: int):
         f"INSERT INTO public.{table} SELECT i, "
         f"(SELECT string_agg(md5(random()::text), '') FROM generate_series(1, {ROW_BYTES // 32})), "
         f"'{{\"k\":\"v\"}}'::jsonb FROM generate_series(1,{n}) i; "
-        "INSERT INTO public.zebridge_public_tables (tbl, reason) VALUES "
-        f"('public.{table}'::regclass, 'wide.py fixture') ON CONFLICT DO NOTHING; "
+        "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
+        f"('{table}', 'wide.py fixture') ON CONFLICT DO NOTHING; "
         f"ALTER PUBLICATION {PUB} ADD TABLE public.{table}",
         quiet=True,
     )
@@ -397,7 +397,7 @@ async def main():
         for t in (SMALL_T, BIG_T):
             zb.psql(f"DROP TABLE IF EXISTS public.{t}", quiet=True)
         zb.psql(
-            "DELETE FROM public.zebridge_public_tables WHERE reason = 'wide.py fixture'",
+            "DELETE FROM public.zebridge_catalogue WHERE public_reason = 'wide.py fixture'",
             quiet=True,
         )
 

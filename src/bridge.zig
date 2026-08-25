@@ -17,6 +17,7 @@ const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const publication_mod = @import("publication.zig");
 const snapshot_listener = @import("snapshot_listener.zig");
+const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
 const mutation_listener = @import("mutation_listener.zig");
 const catalog_epoch_mod = @import("catalog_epoch.zig");
@@ -471,6 +472,19 @@ pub fn main(init: std.process.Init) !void {
     // letting it be assumed.
     var tenant_rules = try args.Args.parseTenantRules(allocator, &init);
     defer args.Args.deinitTransitionRules(&tenant_rules, allocator);
+
+    // THE CATALOGUE (NOTES.md, static-residue endgame): `zebridge_catalogue` is the
+    // authoritative per-table rule source, written by zebridge_enable atomically
+    // with the guards. Env rules above become per-table OVERRIDES; the catalogue
+    // fills everything else, and a pre-catalogue database loads zero rows.
+    const cat = catalogue.loadRules(allocator, &pg_config, &tenant_rules, &sync_rules);
+    if (cat.available) {
+        // The catalogue is authoritative for the public set, and the tenant list is
+        // DATA (zebridge_user_tenants) — the grammar file no longer carries either
+        // (both keys still parse, for a pre-catalogue database only).
+        runtime_config.topology.public_tables = cat.publics;
+        if (cat.tenants.len > 0) runtime_config.topology.tenants = cat.tenants;
+    }
     const default_version_column = init.minimal.environ.getPosix("SYNC_VERSION_COLUMN") orelse
         Config.Sync.default_version_column;
 
@@ -597,52 +611,22 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // === Boot preflight: every declared tenant must have its CDC stream ===
+    // === Boot reconciliation: the streams the catalogue implies must exist ===
     //
-    // CDC is routed by subject and stored per tenant (NOTES.md §1.12). A row whose tenant
-    // is in the WAL but whose `CDC_<TENANT>` stream does not exist has nowhere to land: the
-    // publish never gets a PubAck, retries exhaust, and the bridge FATALs mid-stream —
-    // stranding whatever was queued behind it and leaving the slot to retain WAL. That is a
-    // runtime failure for a condition knowable at boot.
-    //
-    // ⚠️ This does NOT prevent the *undeclared*-tenant case (a row whose tenant is in no
-    // stream and no `topology.tenants`) — nothing at boot can, because that tenant is data
-    // that has not arrived yet. It closes the DECLARED case: `topology.json` says a tenant
-    // exists, so its stream must too, and disagreeing is a deployment error worth refusing
-    // to start over rather than discovering under load.
-    if (runtime_config.topology.tenants.len > 0) {
-        var missing: usize = 0;
-        // Each tenant's own stream, then the shared public stream.
-        for (runtime_config.topology.tenants) |tenant| {
-            // CDC_<TENANT> — upper-cased to match nats-init's `tr '[:lower:]' '[:upper:]'`.
-            var name_buf: [256]u8 = undefined;
-            const upper = std.ascii.upperString(name_buf[runtime_config.topology.cdc_stream_prefix.len..], tenant);
-            @memcpy(name_buf[0..runtime_config.topology.cdc_stream_prefix.len], runtime_config.topology.cdc_stream_prefix);
-            const stream_name = name_buf[0 .. runtime_config.topology.cdc_stream_prefix.len + upper.len];
-            if (publisher.streamExists(stream_name)) {
-                log.info("✅ tenant '{s}' → stream {s}", .{ tenant, stream_name });
-            } else {
-                log.err("🔴 tenant '{s}' is declared but stream {s} does not exist. " ++
-                    "Create it (nats-init reads topology.json) or remove the tenant.", .{ tenant, stream_name });
-                missing += 1;
-            }
-        }
-        // The public stream: tables with no tenant column publish here, so its absence is
-        // the same class of hole for a different set of tables.
-        if (publisher.streamExists(runtime_config.topology.cdc_stream_public)) {
-            log.info("✅ public tables → stream {s}", .{runtime_config.topology.cdc_stream_public});
-        } else {
-            log.err("🔴 public stream {s} does not exist. Public-table CDC has nowhere to land.", .{runtime_config.topology.cdc_stream_public});
-            missing += 1;
-        }
-
-        if (missing > 0) {
-            log.err("🔴 FATAL: {d} declared CDC stream(s) missing — refusing to start rather than FATAL under load.", .{missing});
-            should_stop.store(true, .seq_cst);
-            return error.MissingTenantStreams;
-        }
-        log.info("✅ Tenant-stream preflight: {d} tenant(s) + public stream all present", .{runtime_config.topology.tenants.len});
-    }
+    // Tenants come from the DATA (zebridge_user_tenants) and the public set from the
+    // catalogue, so the bridge no longer asks an init container to pre-build what it
+    // can ensure itself: a missing CDC_<TENANT>/INIT_<TENANT> stream is CREATED here
+    // (modest 1G caps — JetStream reservations count against the server's storage
+    // budget, the INIT_TANGO lesson; an operator can raise them), and CDC_PUBLIC's
+    // subject filter is reconciled to exactly the catalogue's public tables plus the
+    // open tenant. That closes the declared half of the routing hole at boot; a
+    // tenant born AFTER boot keeps the dyntenant contract — whoever onboards it
+    // provisions its streams before the first row.
+    reconcileCdcStreams(allocator, &publisher, &runtime_config.topology) catch |err| {
+        log.err("🔴 FATAL: stream reconciliation failed ({s}) — refusing to start rather than FATAL under load.", .{@errorName(err)});
+        should_stop.store(true, .seq_cst);
+        return err;
+    };
 
     // Make publisher available to HTTP server for stream management
     http_srv.nats_publisher = &publisher;
@@ -694,7 +678,7 @@ pub fn main(init: std.process.Init) !void {
         gp.join();
         allocator.destroy(gp);
     };
-    if (generation_rules.count() > 0) {
+    if (runtime_config.generations_enabled or generation_rules.count() > 0) {
         // The correctness inequality (NOTES.md §1.13): a client up to `depth` gens
         // behind catches up on deltas, so tombstones must outlive depth × cadence or
         // a hard delete is reaped before the delta that would have shipped it — and
@@ -721,16 +705,18 @@ pub fn main(init: std.process.Init) !void {
             nats_endpoint,
             &generation_rules,
             &sync_rules,
+            &tenant_rules,
+            &runtime_config.topology,
+            parsed_args.publication_name,
             runtime_config.generation_cadence_seconds,
             runtime_config.generation_chain_depth,
-            runtime_config.topology.kv_generations,
-            runtime_config.topology.generation_bucket_prefix,
+            @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
         );
         try gp.start();
         gen_producer = gp;
         log.info("🧬 Generation producer thread started", .{});
     } else {
-        log.info("No GENERATION_RULES — generation producer disabled", .{});
+        log.info("Generation producer disabled (set GENERATIONS_ENABLED=1 to derive from the publication, or GENERATION_RULES to restrict a probe)", .{});
     }
 
     // === Start thread: mutation listener (only if an ingress role is configured)
@@ -1531,4 +1517,118 @@ pub fn main(init: std.process.Init) !void {
     }
 
     log.info("Bridge stopped gracefully\n", .{});
+}
+
+/// Are two subject filters the same set? Order-insensitive, exact strings.
+fn streamSubjectsEqual(have: []const []const u8, wanted: []const []const u8) bool {
+    if (have.len != wanted.len) return false;
+    outer: for (wanted) |w| {
+        for (have) |h| if (std.mem.eql(u8, h, w)) continue :outer;
+        return false;
+    }
+    return true;
+}
+
+/// Boot-time stream reconciliation (see the call site above). Creation parameters
+/// mirror what nats-init used to apply — file storage, limits retention, s2, 8d CDC /
+/// 7d INIT — except max_bytes, deliberately 1G: JetStream treats every stream's
+/// max_bytes as a reservation against the server's storage budget, and a boot that
+/// reserves 10G per tenant refuses to create anything on a small server.
+fn reconcileCdcStreams(
+    allocator: std.mem.Allocator,
+    publisher: anytype,
+    topo: *const topology_mod.Topology,
+) !void {
+    const js = if (publisher.js) |*j| j else return error.NotConnected;
+    const day_ns: u64 = 24 * 60 * 60 * 1_000_000_000;
+    const cap_bytes: i64 = 1 << 30;
+
+    // ── per-tenant streams: ensure, create when missing ─────────────────────────
+    for (topo.tenants) |tenant| {
+        var name_buf: [256]u8 = undefined;
+        inline for (.{
+            .{ topo.cdc_stream_prefix, "{s}.{s}.>", @as(u64, 8) },
+            .{ topo.init_stream_prefix, "{s}.snap.{s}.>", @as(u64, 7) },
+        }) |shape| {
+            const prefix = shape[0];
+            // CDC_<TENANT> / INIT_<TENANT> — upper-cased, matching nats-init's old tr.
+            const upper = std.ascii.upperString(name_buf[prefix.len..], tenant);
+            @memcpy(name_buf[0..prefix.len], prefix);
+            const stream_name = name_buf[0 .. prefix.len + upper.len];
+            if (publisher.streamExists(stream_name)) {
+                log.info("✅ tenant '{s}' → stream {s}", .{ tenant, stream_name });
+            } else {
+                const prefix_val = if (comptime std.mem.indexOf(u8, shape[1], "snap") != null)
+                    topo.subject_init_prefix
+                else
+                    topo.subject_cdc_prefix;
+                const subj = try std.fmt.allocPrint(allocator, shape[1], .{ prefix_val, tenant });
+                defer allocator.free(subj);
+                var res = try js.addStream(.{
+                    .name = stream_name,
+                    .subjects = &.{subj},
+                    .max_age = shape[2] * day_ns,
+                    .max_msgs = 10_000_000,
+                    .max_bytes = cap_bytes,
+                    .compression = .s2,
+                });
+                res.deinit();
+                log.info("🆕 tenant '{s}' → created stream {s} ({s})", .{ tenant, stream_name, subj });
+            }
+        }
+    }
+
+    // ── CDC_PUBLIC: subjects ARE the catalogue's public set + the open tenant ───
+    var wanted: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (wanted.items) |w| allocator.free(w);
+        wanted.deinit(allocator);
+    }
+    for (topo.public_tables) |tbl|
+        try wanted.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}.>", .{ topo.subject_cdc_prefix, tbl }));
+    try wanted.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}.>", .{ topo.subject_cdc_prefix, topo.open_tenant }));
+
+    if (js.getStreamInfo(topo.cdc_stream_public)) |info_const| {
+        var info = info_const;
+        defer info.deinit();
+        if (streamSubjectsEqual(info.value.config.subjects, wanted.items)) {
+            log.info("✅ {s} subjects already match the catalogue ({d} subject(s))", .{ topo.cdc_stream_public, wanted.items.len });
+        } else {
+            // The FULL stored config back, with only the subjects replaced —
+            // updateStream serializes everything, so a partial config would silently
+            // reset retention and limits to defaults.
+            var cfg = info.value.config;
+            cfg.subjects = wanted.items;
+            var res = try js.updateStream(cfg);
+            res.deinit();
+            log.info("🛠️ {s} subjects reconciled to the catalogue ({d} subject(s))", .{ topo.cdc_stream_public, wanted.items.len });
+        }
+    } else |_| {
+        var res = try js.addStream(.{
+            .name = topo.cdc_stream_public,
+            .subjects = wanted.items,
+            .max_age = 8 * day_ns,
+            .max_msgs = 10_000_000,
+            .max_bytes = cap_bytes,
+            .compression = .s2,
+        });
+        res.deinit();
+        log.info("🆕 created stream {s} with {d} subject(s)", .{ topo.cdc_stream_public, wanted.items.len });
+    }
+
+    // ── INIT_PUBLIC: fixed shape, just ensure it exists ─────────────────────────
+    if (!publisher.streamExists(topo.init_stream_public)) {
+        const subj = try std.fmt.allocPrint(allocator, "{s}.snap.{s}.>", .{ topo.subject_init_prefix, topo.open_tenant });
+        defer allocator.free(subj);
+        var res = try js.addStream(.{
+            .name = topo.init_stream_public,
+            .subjects = &.{subj},
+            .max_age = 7 * day_ns,
+            .max_msgs = 10_000_000,
+            .max_bytes = cap_bytes,
+            .compression = .s2,
+        });
+        res.deinit();
+        log.info("🆕 created stream {s} ({s})", .{ topo.init_stream_public, subj });
+    }
 }

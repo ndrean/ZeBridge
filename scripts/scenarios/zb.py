@@ -1,6 +1,6 @@
 """Shared helpers for the scenario scripts.
 
-Names come from `topology.json`, never from literals here — the whole point of that
+Names come from `grammar.json`, never from literals here — the whole point of that
 file is that one rename moves the bridge, `nats-init` and every client together, and a
 test harness that hardcodes `cdc.` is one more place to forget.
 
@@ -20,7 +20,7 @@ import msgpack
 import nats
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-TOPOLOGY = json.loads((ROOT / "topology.json").read_text())
+TOPOLOGY = json.loads((ROOT / "grammar.json").read_text())
 
 NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
 NKEY_SEED = os.environ.get("NATS_NKEY_SEED")
@@ -31,6 +31,14 @@ PSQL = os.environ.get("ZB_PSQL", "docker exec -i postgres-primary psql -U postgr
 
 def subject(*parts: str) -> str:
     return ".".join(parts)
+
+
+def tenants() -> list[str]:
+    """The live tenant list. Tenants are DATA (zebridge_user_tenants), not config —
+    grammar.json no longer carries a `tenants` key, and the bridge derives the same
+    list at boot for its stream reconciliation."""
+    out = psql("SELECT DISTINCT tenant_id FROM public.zebridge_user_tenants ORDER BY 1", quiet=True)
+    return [t for t in out.splitlines() if t]
 
 
 async def connect():

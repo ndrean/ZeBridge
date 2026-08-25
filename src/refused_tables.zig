@@ -64,7 +64,7 @@ pub const Reason = enum {
     /// deletes could not route at all: rows would stay in every replica that held them,
     /// with no later event able to remove them.
     tenant_not_in_replica_identity,
-    /// Neither tenant-scoped nor in `topology.json`'s `public_tables` — its CDC subject
+    /// Neither tenant-scoped nor marked public in `zebridge_catalogue` — its CDC subject
     /// matches no stream's filter at all. Found live: publishing to it doesn't fail
     /// fast, it blocks for the full publish timeout (nothing ever acks a message no
     /// stream accepted), then retries the identical dead end, and enough of that
@@ -84,9 +84,9 @@ pub const Reason = enum {
             .no_primary_key => "add a primary key to replicate this table",
             .unsupported_column_type => "change the column to a type the bridge can decode (or drop it from the table)",
             .row_too_large => "restart with a larger BASE_BUF, or move the oversized column out of the replicated table",
-            .no_tenant_column => "add the column named in TENANT_RULES, or correct the rule",
+            .no_tenant_column => "add the column the catalogue/TENANT_RULES names, or correct the rule",
             .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
-            .no_cdc_subject => "add this table to topology.json's public_tables and CDC_PUBLIC's subject filter (nats stream edit CDC_PUBLIC), or set TENANT_RULES for it",
+            .no_cdc_subject => "declare the table in zebridge_catalogue (zebridge_enable with public_reason or tenant_col) and restart the bridge — boot reconciles CDC_PUBLIC's subjects from it",
         };
     }
 };

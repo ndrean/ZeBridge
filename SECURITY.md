@@ -48,7 +48,7 @@ per transaction. No Zig code reads `zebridge_user_tenants` and nothing caches it
 takes effect on the very next mutation. Restarting the bridge for it is harmless and
 pointless. What *does* need a restart is a different axis, and confusing the two is easy:
 adding a NATS **principal** means regenerating `nats-server.conf` and reloading **NATS**
-(not the bridge), while `TENANT_RULES` and `SYNC_RULES` are bridge environment read at
+(not the bridge), while the per-table rules are `zebridge_catalogue` rows read at
 boot, so changing *which tables* are tenant-routed does need the bridge to come back.
 
 ⚠️ Before this the bridge never set the session variable, so any policy reading it saw
@@ -67,21 +67,24 @@ table, so a new table is never silently writable. Three shapes, each a fixed seq
 calls — not one function each, because the calls compose (a writable table is also
 tenant-scoped; a public table is neither) and skipping one leaves a table that *looks*
 finished but silently isn't. Every function referenced below is defined once, in
-`init.write.template.sql` (or `init.core.template.sql` for `zebridge_public_tables`) —
+`init.write.template.sql` (or `init.core.template.sql` for `zebridge_catalogue`) —
 `grep` for the name rather than a line number, which drifts.
 
 **Readable via CDC (public — every tenant, every subscriber sees it).**
 
 ```sql
-INSERT INTO zebridge_public_tables (tbl, reason)
-VALUES ('public.currencies', 'ISO list — identical for every tenant');
-
-ALTER PUBLICATION my_pub ADD TABLE public.currencies;
+SELECT * FROM zebridge_enable(
+    'public.currencies'::regclass,
+    public_reason => 'ISO list — identical for every tenant',
+    dry_run       => false
+);
 ```
 
-⚠️ **Order matters.** The event trigger refuses `ALTER PUBLICATION ... ADD TABLE` for a
-table that is neither tenant-scoped nor recorded in `zebridge_public_tables` — register the
-table first, or the second statement is refused. Deliberately: a bare `ALTER PUBLICATION`
+⚠️ **The reason is mandatory.** A public table is a `zebridge_catalogue` row with
+`tenant_col IS NULL`, and the table's CHECK forces a recorded `public_reason` — who decided
+this table is public, and why. The event trigger refuses a bare
+`ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped nor in the
+catalogue. Deliberately: a bare `ALTER PUBLICATION`
 publishes with no row filter and no RLS, sending every row to every subscriber, and nothing
 in the bridge can detect that — it is a pass-through by design.
 
@@ -100,31 +103,32 @@ SELECT * FROM zebridge_enable(
     writable      => true,
     version_col   => 'updated_at',
     tombstone_col => 'deleted_at',
+    tiebreak_col  => 'last_writer',
     dry_run       => false
 );
 ```
 
-Then, in the bridge's own environment — boot-read, needs a restart:
-
-```
-SYNC_RULES=orders:updated_at,deleted_at[,last_writer]
-```
+The call also writes the table's `zebridge_catalogue` row (`version_col`,
+`tombstone_col`, `tiebreak_col`) in the same transaction; the bridge reads the catalogue
+at boot, so a restart makes it pick the table up. (`SYNC_RULES` in the bridge's
+environment is an optional per-table override for emergencies; production leaves it
+unset.)
 
 This grants the table (`SELECT, INSERT, UPDATE, DELETE`, and refuses `zebridge_ddl_events`
-by name — see §1.7) and attaches the triggers that make the columns named in `SYNC_RULES`
+by name — see §1.7) and attaches the triggers that make the columns named in the catalogue
 true for *every* writer, not just the bridge: `zebridge_bump_version_t` stamps the version
 column when a statement leaves it alone, `zebridge_soft_delete_t` turns a DELETE into a
 tombstoning UPDATE when a tombstone column is given. Skip either argument and that guarantee
 is fiction — the column exists, but nothing enforces what it's supposed to mean, and it
 produces no error: writes still succeed, deletes still "work". `zebridge_audit_write_guards()`
-reports what is actually attached, to compare against `SYNC_RULES`.
+reports what is actually attached, to compare against the catalogue.
 
 **Tenant-scoped (multi-tenant, routed per row — many tenants share one bridge, one
 publication, one stream family).**
 
-`zebridge_enable()` is the entry point — one call does grants, guards, RLS (read and
-write), and publication registration together, and prints what it did as its own return
-table:
+`zebridge_enable()` is the entry point — one call writes the `zebridge_catalogue` row
+and does grants, guards, RLS (read and write), and publication registration together,
+atomically, and prints what it did as its own return table:
 
 ```sql
 -- The table needs a NOT NULL tenant column, and every writer needs to be in this table —
@@ -137,19 +141,18 @@ SELECT * FROM zebridge_enable(
     writable      => true,
     version_col   => 'updated_at',
     tombstone_col => 'deleted_at',
+    tiebreak_col  => 'last_writer',
     dry_run       => false
 );
 ```
 
-Then, in the bridge's own environment — boot-read, needs a restart:
-
-```
-TENANT_RULES=orders:tenant_id
-SYNC_RULES=orders:updated_at,deleted_at[,last_writer]
-```
+The catalogue row (`tenant_col`, `version_col`, `tombstone_col`) lands in the same
+transaction; the bridge reads the catalogue at boot, so a restart makes it pick the table
+up. (`TENANT_RULES`/`SYNC_RULES` in the bridge's environment are optional per-table
+overrides for emergencies; production leaves them unset.)
 
 `zebridge_audit_write_guards()` reports what triggers/policies/RLS state are actually
-attached to a table, to compare against what `TENANT_RULES`/`SYNC_RULES` claim. Reads
+attached to a table, to compare against what the catalogue claims. Reads
 routing correctly is not evidence writes are scoped — they are two different mechanisms,
 on two different sides of the bridge, and neither implies the other; check both.
 
@@ -223,7 +226,7 @@ constrains it:
 | primary key | rows must be identifiable; DELETE is otherwise ambiguous | table refused outright |
 | key is `uuid`, minted by the client | a `bigserial` cannot be minted offline — two clients pick the same id and one row is silently overwritten | delayed duplicate-key collisions |
 | version column that changes on every write | last-write-wins compares it | every mutation fails `NoVersionColumn` |
-| tiebreak column (3rd `SYNC_RULES` field), if equal versions are possible | equal versions are otherwise **refused**, so two replicas holding different rows refuse each other forever | silent permanent divergence, no error anywhere |
+| tiebreak column (the catalogue's `tiebreak_col`), if equal versions are possible | equal versions are otherwise **refused**, so two replicas holding different rows refuse each other forever | silent permanent divergence, no error anywhere |
 | `timestamptz`, not `timestamp` | naive columns record no zone; a client writing local time wins or loses on its offset, silently | wrong write wins, no error |
 | tombstone column (soft delete) | an offline client's queued edit is overruled instead of resurrecting the row | deletes are physical; offline edits resurrect rows |
 | every `NOT NULL` column has a `DEFAULT`, or the client sends it | the schema descriptor carries no nullability | writes fail; the client learns only from the rejection |
@@ -275,17 +278,18 @@ ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
    partitioning by tenant gives the same locality permanently.
 4. **Check preflight at the next boot.** It reports grants that the schema cannot honour,
    version columns that are naive, and tenant columns outside the replica identity.
-5. **Update the bridge's config, then restart it.** A public table goes in `topology.json`'s
-   `public_tables` array; a tenant-scoped one does not — `TENANT_RULES` alone is what marks
-   it. Add the table to `SYNC_RULES` (version column, tombstone column if it has one, tiebreak
-   column) in the bridge's env, and to `TENANT_RULES` if it's tenant-scoped. Both are read
-   once at boot — the bridge will not see either change until it restarts.
-6. **NATS: nothing for a tenant-scoped table, one subject edit for a public one.** A
-   tenant-scoped table is already covered by the tenant's existing `cdc.<tenant>.>` grant —
-   no NATS change needed. A public table gets its own named subject
-   (`cdc.<table>.>`), not a wildcard, so `CDC_PUBLIC`'s subject list needs that subject added
-   — `nats stream edit CDC_PUBLIC --subjects=...`. Its snapshot side needs nothing extra:
-   `INIT_PUBLIC`'s existing `init.snap.<open tenant>.>` already covers any public table.
+5. **Restart the bridge.** There is nothing to transcribe: the `zebridge_enable(...)`
+   migration already wrote the table's `zebridge_catalogue` row (tenant column or public
+   reason, version/tombstone/tiebreak columns), and the bridge reads the catalogue once at
+   boot — it will not see the new table until it restarts. (`SYNC_RULES`/`TENANT_RULES`
+   remain as optional per-table env overrides for emergencies; production leaves them
+   unset.)
+6. **NATS: nothing by hand.** A tenant-scoped table is already covered by the tenant's
+   existing `cdc.<tenant>.>` grant. A public table gets its own named subject
+   (`cdc.<table>.>`), not a wildcard — and the restart in step 5 is what binds it: at boot
+   the bridge sets `CDC_PUBLIC`'s subject list authoritatively from the catalogue's public
+   tables. The snapshot side needs nothing extra: `INIT_PUBLIC`'s existing
+   `init.snap.<open tenant>.>` already covers any public table.
 
 ### 1.5 PostgreSQL: maintenance — tombstone GC, and why
 
@@ -320,9 +324,10 @@ weeks later. That asymmetry is why the cutoff is computed by `now()` on the **se
 sweeper whose host clock ran fast would reap early, which is the direction that loses data.
 A clock running slow only delays the sweep, which costs disk and nothing else.
 
-✅ The sweep set is derived from `SYNC_RULES` — the same variable the bridge reads — so the
-two cannot disagree about which column is the tombstone. A table with no tombstone is not
-swept: its deletes are physical and there is nothing to reap.
+✅ The sweep set is derived from `zebridge_catalogue.tombstone_col`, read on the sweeper's
+own writer connection — the same table the bridge reads — so the two cannot disagree about
+which column is the tombstone (`SYNC_RULES` is an optional override). A table with no
+tombstone is not swept: its deletes are physical and there is nothing to reap.
 
 ```
 GC: sweeping test_types on tombstone column 'deleted_at'
@@ -398,6 +403,38 @@ can repair. ✅ Such rows are quarantined to `.unrouted`, never published bare �
 and `a b`, all three quarantined.
 
 ---
+
+### 1.8 The row-width budget: every size guard, one table
+
+The change feed packs each row into a fixed `2^BASE_BUF` buffer (default 16 KB);
+NATS accepts up to `max_payload` (1 MB). Between the two sits every row a writer can
+legally create and the feed cannot carry. These are the checks that close that gap,
+by location and path. Consequences: **warning** — logged, flow continues;
+**reject** — atomic refusal charged to the writer (verdict for an edge write, plain
+ERROR for psql; nothing commits); **quarantine** — the table is suspended,
+frozen-and-valid for every reader, lifted only by a bridge restart whose preflight
+re-proves the cause is gone.
+
+| where | CDC path | generation path |
+|---|---|---|
+| **PostgreSQL** (the row, any writer) | `zebridge_width_guard` trigger — installed by `zebridge_enable`, unbounded columns only, budget from the one-row `zebridge_limits` table: row width ≥ budget → **reject** (SQLSTATE 23514, in the writer's own transaction) — ✅ `widthguard.py` (both doors, atomicity, ceiling-not-tax) | *the same trigger* — it guards the row, not the path — ✅ same |
+| **bridge ingress** (mutation listener) | payload ≥ event buffer → **reject** (`RowTooLargeToReplicate`, dead-lettered on first delivery, verdict). A deliberate lower bound: the CDC event is always larger than the payload, so nothing legitimate is refused — ✅ `rowsize.py` (incl. the published `max_row_bytes`) | — (generations are read-path; there is no ingress) |
+| **bridge egress** | boot preflight (stored rows + column defaults vs buffer) → **quarantine** before a byte streams — ✅ `legacybait.py` (re-derived every boot, and the readmission after repair); decode-time slot overflow → **quarantine** (`suspendForRowTooLarge`: ACK past, suspension published) — ✅ `legacybait.py` (log + `"suspended":true` in `$KV.schemas`); *until snapshot retirement:* `measureWidestRow` ≥ chunk budget → **quarantine** — ✅ `wide.py` | widest row, measured free in the producer's encode loop, ≥ event buffer → **warning** on every build (chains carry it; CDC will suspend on its next touch) — the detector for rows that predate the trigger — ✅ `legacybait.py` (warns on the first build over planted bait). Object chunking (nats.zig, 128 KB) means no wire limit exists on this path to check |
+| **NATS broker** | any single message > `max_payload` → publish refused — the floor under `BASE_BUF`'s ceiling (2^20 = 1 MB). Broker contract, not bridge code — no scenario, by design | chunk messages are 128 KB by construction; the broker limit is unreachable |
+
+Two properties to read off the matrix. Down the CDC column, consequences soften as
+checks move earlier: quarantine remains only where a row got past every reject —
+the reject rows exist to starve the quarantine row. And the generation column's
+near-emptiness is earned, not missing: the trigger covers its writes, chunking
+dissolves its wire limit, and only the legacy detector remains.
+
+⚠️ The one coupling to maintain by hand: `zebridge_limits.max_row_bytes` must track
+`2^BASE_BUF`. Raising `BASE_BUF` without the matching `UPDATE` leaves the trigger
+refusing rows the feed could now carry (safe, but needlessly strict); lowering it
+without the `UPDATE` reopens the gap (a row the trigger accepts that CDC then
+suspends on). Every cell above names the scenario that exercises it — a check the
+table cites but nothing runs is prose, and the untested cells were found exactly
+that way.
 
 ## Part 2 — The consumer
 
@@ -557,6 +594,8 @@ refactor, or a migration — and most of the defects found while building this w
 | a sequence-backed primary key on an edge-writable table is **refused** on the write path (`DbAllocatedKey`), not merely warned about — the one hazard whose damage is invisible when it happens | ✅ `scripts/scenarios/keys.py` |
 | a refused write costs the client **one message, not its subscription**: the same connection still receives CDC for the table it was refused on, no `suspended` schema is published, the shared registry is untouched, and other tables are unaffected | ✅ `scripts/scenarios/keys.py` — asserted on the refused client's own connection |
 | a client cannot suspend a table for everyone with one oversized write; the limit is discoverable as `max_row_bytes` | ✅ `scripts/scenarios/rowsize.py` — the DoS was measured before the guard existed |
+| a row the change feed cannot carry is refused at WRITE time, both doors, atomically: edge writes get a `rejected` verdict (SQLSTATE 23514), psql an ordinary ERROR; bounded-only tables get no trigger at all | ✅ `scripts/scenarios/widthguard.py` — 6 assertions, including the small-payload fattening edit the ingress check cannot see |
+| a legacy oversized row (pre-guard data) is detected by the generation producer on its first build, quarantines the table on its first CDC touch (`$KV.schemas` says `"suspended": true`), is re-flagged by every boot's preflight from the stored data, and the de-quarantine recipe (repair, reboot) readmits mechanically | ✅ `scripts/scenarios/legacybait.py` — 7 assertions; owns the only bridge |
 | mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `web-consumer/zb-mutate.mjs` |
 | the principal reaches RLS: `set_config` and the upsert share one transaction, now the pipeline's implicit one | ✅ `scripts/scenarios/writable.py`, `tiebreak.py`, `invalidate.py` — every RLS-scoped write would be refused if it did not |
 | client's JetStream permission set is complete | ✅ `web-consumer/zb-probe.mjs` |

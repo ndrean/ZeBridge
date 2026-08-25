@@ -95,10 +95,10 @@ async def main():
     # direction or the other: before the split it called a missing stream a refusal, after
     # the split it would call a genuine refusal inconclusive.
     #
-    # topology.json declares which streams a deployment is supposed to have, so it resolves
+    # zebridge_user_tenants declares which streams a deployment is supposed to have (the same list the bridge reconciles at boot), so it resolves
     # the ambiguity without needing admin credentials.
     prefix = (zb.TOPOLOGY.get("cdc_streams") or {}).get("tenant_prefix", "CDC_")
-    declared = {t: f"{prefix}{t.upper()}" for t in (zb.TOPOLOGY.get("tenants") or [])}
+    declared = {t: f"{prefix}{t.upper()}" for t in zb.tenants()}
     victim_stream = declared.get(VICTIM, f"{prefix}{VICTIM.upper()}")
     victim_stream_declared = VICTIM in declared
     victim_stream_exists = None          # None = unknown, and unknown is not "safe"
@@ -136,11 +136,11 @@ async def main():
     # make this line turn green now and stay green after the stream appears — the test would
     # start lying at exactly the moment it began to matter.
     if victim_stream_exists is False and victim_stream_declared:
-        # Declared in topology.json but unreachable by this principal: that is the split
+        # Declared in grammar.json but unreachable by this principal: that is the split
         # working, not an absent stream.
-        blocked(f"stream_info {victim_stream}", "declared in topology.json but not reachable")
+        blocked(f"stream_info {victim_stream}", "declared in grammar.json but not reachable")
     elif victim_stream_exists is False:
-        print(f"  ⓘ  stream_info {victim_stream}: not declared in topology.json — N/A, not a pass")
+        print(f"  ⓘ  stream_info {victim_stream}: not declared in grammar.json — N/A, not a pass")
     else:
         try:
             info = await js.stream_info(victim_stream)

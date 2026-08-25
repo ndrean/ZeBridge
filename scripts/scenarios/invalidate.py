@@ -36,10 +36,10 @@ including on failure.
 
 ⚠️ Act 3's `SCRATCH` fixture stays suspended after its no-PK refusal lifts — for a
 *different* reason (`no_cdc_subject`), not a bug. It was never declared in
-`topology.json`'s `public_tables`, so its CDC subject has no stream to reach it, and the
+`grammar.json`'s `public_tables`, so its CDC subject has no stream to reach it, and the
 bridge now refuses that at the source instead of hanging on the first publish attempt
 (`src/refused_tables.zig`, found live via this exact scenario). Making it fully resume
-would need `topology.json` changed and the bridge restarted, which defeats the "no
+would need `grammar.json` changed and the bridge restarted, which defeats the "no
 restart needed" point this act is making about the no-PK refusal specifically.
 """
 
@@ -169,9 +169,9 @@ async def main():
                 d[c] = v
         return d
 
-    # `SCRATCH` is created dynamically here, not declared in `topology.json:public_tables`
+    # `SCRATCH` is created dynamically here, not declared in `grammar.json:public_tables`
     # and not tenant-scoped — so `cdc.<SCRATCH>.*` matches no stream's subject filter, and
-    # never can without editing `topology.json` and restarting the bridge (its own config
+    # never can without editing `grammar.json` and restarting the bridge (its own config
     # is read once at boot, never re-read live — editing `CDC_PUBLIC`'s live subjects
     # alone does not make the bridge believe the table is routable, and rightly so: an
     # operator manually widening a stream is not the same as *declaring* a table public).
@@ -352,8 +352,8 @@ async def main():
         # The publication guard refuses an unscoped table; this one is a fixture, and
         # saying so in `zebridge_public_tables` is the documented way to say it.
         zb.psql(
-            "INSERT INTO public.zebridge_public_tables (tbl, reason) VALUES "
-            f"('public.{SCRATCH}'::regclass, 'invalidate.py fixture') "
+            "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
+            f"('{SCRATCH}', 'invalidate.py fixture') "
             "ON CONFLICT DO NOTHING",
             quiet=True,
         )
@@ -381,7 +381,7 @@ async def main():
 
         # The migration that fixes it. No restart, no signal: the DDL event is the signal.
         #
-        # ⚠️ `SCRATCH` was never declared in `topology.json:public_tables` — deliberately,
+        # ⚠️ `SCRATCH`'s catalogue row was written after the bridge booted — deliberately,
         # it is a throwaway fixture, not a real table anyone should add to the static
         # config for. So gaining a primary key lifts the `no_primary_key` refusal, but the
         # table correctly *stays* suspended, now for `no_cdc_subject` (its CDC subject
@@ -396,7 +396,7 @@ async def main():
             zb.ok(
                 "the no_primary_key refusal lifted on the fixing migration — no restart "
                 "needed — and it now correctly stays suspended for a different reason: "
-                "never declared in topology.json's public_tables"
+                "declared in the catalogue only after this bridge booted (boot-level derivation)"
             )
         elif doc and doc.get("suspended") and doc.get("reason") == "no_primary_key":
             zb.bad(f"'{SCRATCH}' is still suspended for no_primary_key after gaining one: the fix did not take")
@@ -440,7 +440,7 @@ async def main():
         zb.psql(f"ALTER TABLE public.{TABLE} DROP COLUMN IF EXISTS {PROBE}", quiet=True)
         zb.psql(f"DROP TABLE IF EXISTS public.{SCRATCH}", quiet=True)
         zb.psql(
-            "DELETE FROM public.zebridge_public_tables WHERE reason = 'invalidate.py fixture'",
+            "DELETE FROM public.zebridge_catalogue WHERE public_reason = 'invalidate.py fixture'",
             quiet=True,
         )
         t1.cancel()

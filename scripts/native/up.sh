@@ -84,7 +84,7 @@ for _ in $(seq 1 30); do
 done
 
 if [ "$FRESH_NATS" = "1" ]; then
-  echo "[native] creating streams + KV buckets from topology.json"
+  echo "[native] creating streams + KV buckets from grammar.json"
   set -a
   # shellcheck disable=SC1091
   source "$ROOT/.env.admin"
@@ -93,64 +93,28 @@ if [ "$FRESH_NATS" = "1" ]; then
   echo "$NATS_NKEY_SEED" > "$ROOT/scripts/native/seed.txt"
   SEED="$ROOT/scripts/native/seed.txt"
 
-  CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' "$ROOT/topology.json")
-  INIT_STREAM=$(jq -r '.streams.init' "$ROOT/topology.json")
-  INIT_PREFIX=$(jq -r '.subjects.init_prefix' "$ROOT/topology.json")
-  REQUESTS_STREAM=$(jq -r '.streams.requests' "$ROOT/topology.json")
-  REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' "$ROOT/topology.json")
-  MUTATIONS_STREAM=$(jq -r '.streams.mutations' "$ROOT/topology.json")
-  MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' "$ROOT/topology.json")
-  MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' "$ROOT/topology.json")
-  MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' "$ROOT/topology.json")
-  SCHEMA_KV=$(jq -r '.kv.schemas' "$ROOT/topology.json")
-  SNAPSHOT_KV=$(jq -r '.kv.snapshots' "$ROOT/topology.json")
-  TENANTS_KV=$(jq -r '.kv.tenants' "$ROOT/topology.json")
-  GENERATIONS_KV=$(jq -r '.generations.kv' "$ROOT/topology.json")
-  TENANT_PREFIX=$(jq -r '.cdc_streams.tenant_prefix' "$ROOT/topology.json")
-  PUBLIC_STREAM=$(jq -r '.cdc_streams.public' "$ROOT/topology.json")
-  INIT_TENANT_PREFIX=$(jq -r '.init_streams.tenant_prefix' "$ROOT/topology.json")
-  INIT_PUBLIC_STREAM=$(jq -r '.init_streams.public' "$ROOT/topology.json")
+  CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' "$ROOT/grammar.json")
+  INIT_STREAM=$(jq -r '.streams.init' "$ROOT/grammar.json")
+  INIT_PREFIX=$(jq -r '.subjects.init_prefix' "$ROOT/grammar.json")
+  REQUESTS_STREAM=$(jq -r '.streams.requests' "$ROOT/grammar.json")
+  REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' "$ROOT/grammar.json")
+  MUTATIONS_STREAM=$(jq -r '.streams.mutations' "$ROOT/grammar.json")
+  MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' "$ROOT/grammar.json")
+  MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' "$ROOT/grammar.json")
+  MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' "$ROOT/grammar.json")
+  SCHEMA_KV=$(jq -r '.kv.schemas' "$ROOT/grammar.json")
+  SNAPSHOT_KV=$(jq -r '.kv.snapshots' "$ROOT/grammar.json")
+  TENANTS_KV=$(jq -r '.kv.tenants' "$ROOT/grammar.json")
+  GENERATIONS_KV=$(jq -r '.generations.kv' "$ROOT/grammar.json")
   # CDC-family streams outlive INIT by a day on purpose: snapshot generation isn't
   # instant (queued behind other tables, no timeout), so CDC events for writes right
   # after a snapshot's LSN must not age out before the snapshot itself does — see
   # README's "The NATS streams and buckets" for the full reasoning.
   SNAP_RET="${SNAP_RET_SECONDS:-603000}"
 
-  for T in $(jq -r '.tenants[]' "$ROOT/topology.json"); do
-    UPPER=$(echo "$T" | tr '[:lower:]' '[:upper:]')
-    nats --server "$NATS_URL" --nkey "$SEED" stream add "$TENANT_PREFIX$UPPER" \
-      --subjects="$CDC_PREFIX.$T.>" --storage=file --retention=limits --max-age=8d \
-      --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults >/dev/null
-  done
-
-  PUBLIC_SUBJECTS=$(jq -r --arg p "$CDC_PREFIX" --arg o "$OPEN_TENANT" \
-    '[.public_tables[] | $p + "." + . + ".>"] + [$p + "." + $o + ".>"] | join(",")' "$ROOT/topology.json")
-  nats --server "$NATS_URL" --nkey "$SEED" stream add "$PUBLIC_STREAM" \
-    --subjects="$PUBLIC_SUBJECTS" --storage=file --retention=limits --max-age=8d \
-    --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults >/dev/null
-
-  # INIT is split per tenant, same reason as CDC's split above (crosstenant.py's finding
-  # applies identically to the snapshot path — a JetStream consumer's filter_subject is
-  # reader-chosen, not ACL-checked, so the stream itself is the only real boundary).
-  # Subject shape: init.snap.<tenant>.<table>... — tenant right after "snap", uniformly,
-  # so init.snap.acme.> alone catches the data chunks and the start/error/meta/schema
-  # subjects for that dump. (That per-dump "schema" message — init.snap.<tenant>.schema.
-  # <table>.<snapshot_id> — is unrelated to the now-removed init.schema.<table> live
-  # descriptor request/response; the bridge no longer listens on that subject at all, so
-  # it is no longer part of this stream's filter either — see NOTES.md/PROTOCOL.md.)
-  # _default-tenant snapshot data — open-tenant rows, and genuinely public tables, which
-  # have no tenant column to filter content by regardless of which stream they land in.
-  for T in $(jq -r '.tenants[]' "$ROOT/topology.json"); do
-    UPPER=$(echo "$T" | tr '[:lower:]' '[:upper:]')
-    nats --server "$NATS_URL" --nkey "$SEED" stream add "$INIT_TENANT_PREFIX$UPPER" \
-      --subjects="$INIT_PREFIX.snap.$T.>" --storage=file --retention=limits --max-age=7d \
-      --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults >/dev/null
-  done
-
-  nats --server "$NATS_URL" --nkey "$SEED" stream add "$INIT_PUBLIC_STREAM" \
-    --subjects="$INIT_PREFIX.snap.$OPEN_TENANT.>" --storage=file \
-    --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 \
-    --compression s2 --defaults >/dev/null
+  # CDC_<TENANT>, CDC_PUBLIC, INIT_<TENANT> and INIT_PUBLIC are no longer created
+  # here: the BRIDGE reconciles them at boot — tenants from zebridge_user_tenants,
+  # the public subject set from zebridge_catalogue. The catalogue is the config.
 
   nats --server "$NATS_URL" --nkey "$SEED" stream add "$REQUESTS_STREAM" \
     --subjects="$REQUESTS_PREFIX.>" --storage=file --retention=limits \

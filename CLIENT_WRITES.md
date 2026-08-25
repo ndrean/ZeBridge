@@ -53,12 +53,7 @@ That last row is a warning rather than a refusal precisely because of your own s
 
 **Configuration shape**:
 
-Reuse the format you already have for TRANSITION_RULES, since operators have learned it once:
-
-SYNC_RULES=users:updated_at,deleted_at;orders:modified;audit_log:-
-SYNC_VERSION_COLUMN=updated_at        # default for tables not listed
-
-table:version[,tombstone], - meaning explicitly outbound-only. Everything unlisted falls back to the default name; a table that doesn't have it becomes outbound-only automatically, with the reason in the preflight summary.
+The version and tombstone columns live in the table's `zebridge_catalogue` row (`version_col`, defaulting to `updated_at`, and `tombstone_col`), written by `zebridge_enable(...)`. `SYNC_RULES`/`SYNC_VERSION_COLUMN` in the bridge's environment are optional per-table overrides for emergencies. A table with no usable version column becomes outbound-only, with the reason in the preflight summary.
 
 But the important part is where it ends up. The version and tombstone columns are part of the client contract — the consumer must know which column to send back as its version and which one means "deleted". So it belongs in the schema KV payload, alongside pg.columns and sqlite.columns, per table:
 
@@ -66,7 +61,7 @@ But the important part is where it ends up. The version and tombstone columns ar
   "pg": { "columns": [...] },
   "sync": { "version": "updated_at", "tombstone": "deleted_at", "writable": true } }
 
-Then clients discover it exactly the way they discover the schema, and there's no second contract to keep in step with topology.json. A table with "writable": false tells the client "don't offer editing here", which is a genuinely useful thing for a UI to know.
+Then clients discover it exactly the way they discover the schema, and there's no second contract to keep in step with grammar.json. A table with "writable": false tells the client "don't offer editing here", which is a genuinely useful thing for a UI to know.
 
 The legacy-database answer
 
@@ -158,8 +153,9 @@ checked by grepping for the thing that implements it, not from memory.
 **Config and discovery**
 
 - [x] `SYNC_RULES=table:version[,tombstone[,client_id]]` + `SYNC_VERSION_COLUMN` default —
-      `args.parseSyncRules`. Gained a **third** field since this was written: the tiebreak
-      column (PROTOCOL.md §7.4).
+      `args.parseSyncRules`, an optional per-table override: the primary source is the
+      table's `zebridge_catalogue` row (`version_col`, `tombstone_col`, `tiebreak_col`),
+      loaded at boot. The third field is the tiebreak column (PROTOCOL.md §7.4).
 - [x] preflight validates the version column: exists, orderable, precision, NOT NULL,
       naive-vs-timestamptz — `preflight.classifyVersionColumn`, and it now also refuses a
       tenant column outside the replica identity.
@@ -397,7 +393,7 @@ What to do when a table genuinely has no version column — and I'd add this run
 ┌─────────────────────────┬────────┬─────────────────────────────────────────────────────┬───────────────────────────────┐
 │        table has        │ writes │                       policy                        │      how you ask for it       │
 ├─────────────────────────┼────────┼─────────────────────────────────────────────────────┼───────────────────────────────┤
-│ version column          │ ✅     │ LWW — later intent wins                             │ SYNC_RULES=orders:modified_at │
+│ version column          │ ✅     │ LWW — later intent wins                             │ version_col => 'modified_at'  │
 │ none, and you accept it │ ✅     │ last-arrival-wins — whoever arrives last overwrites │ SYNC_RULES=orders:-arrival    │
 ├─────────────────────────┼────────┼─────────────────────────────────────────────────────┼───────────────────────────────┤
 │ none, and you don't     │ ❌     │ outbound-only                                       │ default                       │

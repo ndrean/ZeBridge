@@ -36,16 +36,12 @@ pub fn main(init: std.process.Init) !void {
     // sweeper read the same variable, so they cannot disagree about which column is the
     // tombstone. A table with no tombstone is not swept — its deletes are physical and
     // there is nothing to reap.
-    const sync_rules_str = env.getPosix("SYNC_RULES") orelse {
-        std.debug.print(
-            "FATAL: SYNC_RULES is required (e.g. orders:updated_at,deleted_at). It names the " ++
-                "tombstone column per table; without it there is nothing to sweep. GC_TABLES is " ++
-                "no longer read — it could name a table whose tombstone column this process " ++
-                "would then have to guess.\n",
-            .{},
-        );
-        return;
-    };
+    // Optional OVERRIDE, no longer required: the sweep set's source of truth is
+    // `zebridge_catalogue.tombstone_col`, read below on the same connection that
+    // sweeps — written by `zebridge_enable` atomically with the tombstone trigger
+    // itself, so the sweeper and the guard cannot disagree about which column it
+    // is. An env entry still wins for its table (same contract as the bridge).
+    const sync_rules_str = env.getPosix("SYNC_RULES");
 
     // ── The threshold, and why it is guarded ────────────────────────────────────
     //
@@ -102,7 +98,8 @@ pub fn main(init: std.process.Init) !void {
     var sweeps = std.ArrayList(Sweep).empty;
     defer sweeps.deinit(allocator);
 
-    var rule_it = std.mem.splitScalar(u8, sync_rules_str, ';');
+    if (sync_rules_str) |srs| {
+    var rule_it = std.mem.splitScalar(u8, srs, ';');
     while (rule_it.next()) |rule| {
         const trimmed = std.mem.trim(u8, rule, " ");
         if (trimmed.len == 0) continue;
@@ -123,18 +120,6 @@ pub fn main(init: std.process.Init) !void {
         if (table.len == 0 or tombstone.len == 0) continue;
         try sweeps.append(allocator, .{ .table = table, .tombstone = tombstone });
     }
-
-    if (sweeps.items.len == 0) {
-        std.debug.print(
-            "No table in SYNC_RULES declares a tombstone column, so there is nothing to " ++
-                "sweep. Deletes on those tables are physical, and an offline client's queued " ++
-                "edit can resurrect a row (PROTOCOL.md §7.5).\n",
-            .{},
-        );
-        return;
-    }
-    for (sweeps.items) |sw| {
-        std.debug.print("GC: sweeping {s} on tombstone column '{s}'\n", .{ sw.table, sw.tombstone });
     }
 
     // Connect to PostgreSQL
@@ -155,6 +140,52 @@ pub fn main(init: std.process.Init) !void {
     {
         const tz = c.PQexec(pg_conn, "SET TIME ZONE 'UTC'");
         defer c.PQclear(tz);
+    }
+
+    // ── The sweep set, from the catalogue ───────────────────────────────────────
+    //
+    // `zebridge_catalogue.tombstone_col` is written in the same transaction as the
+    // soft-delete trigger it names, so this read cannot disagree with the guard. A
+    // table the env named above keeps its env columns (override); everything else
+    // comes from here. A pre-catalogue database returns an error result and the env
+    // set stands alone — graceful, like the bridge's own loader.
+    {
+        const cres = c.PQexec(pg_conn, "SELECT tbl, tombstone_col::text FROM public.zebridge_catalogue" ++
+            " WHERE tombstone_col IS NOT NULL ORDER BY tbl");
+        defer c.PQclear(cres);
+        if (c.PQresultStatus(cres) == c.PGRES_TUPLES_OK) {
+            const n: usize = @intCast(c.PQntuples(cres));
+            var added: usize = 0;
+            rows: for (0..n) |i| {
+                const tbl = std.mem.span(c.PQgetvalue(cres, @intCast(i), 0));
+                const tomb = std.mem.span(c.PQgetvalue(cres, @intCast(i), 1));
+                if (tbl.len == 0 or tomb.len == 0) continue;
+                for (sweeps.items) |sw| {
+                    if (std.mem.eql(u8, sw.table, tbl)) continue :rows; // env override wins
+                }
+                try sweeps.append(allocator, .{
+                    .table = try allocator.dupe(u8, tbl),
+                    .tombstone = try allocator.dupe(u8, tomb),
+                });
+                added += 1;
+            }
+            std.debug.print("GC: catalogue supplied {d} sweep table(s)\n", .{added});
+        } else {
+            std.debug.print("GC: no zebridge_catalogue (pre-catalogue database?) — env SYNC_RULES only\n", .{});
+        }
+    }
+
+    if (sweeps.items.len == 0) {
+        std.debug.print(
+            "Neither the catalogue nor SYNC_RULES declares a tombstone column, so there " ++
+                "is nothing to sweep. Deletes on those tables are physical, and an offline " ++
+                "client's queued edit can resurrect a row (PROTOCOL.md \u{00a7}7.5).\n",
+            .{},
+        );
+        return;
+    }
+    for (sweeps.items) |sw| {
+        std.debug.print("GC: sweeping {s} on tombstone column '{s}'\n", .{ sw.table, sw.tombstone });
     }
 
     // ── The sweeper's identity ──────────────────────────────────────────────────
@@ -244,7 +275,7 @@ pub fn main(init: std.process.Init) !void {
             // (PROTOCOL.md §7.3).
             //
             // Identifiers are quoted rather than interpolated bare: they come from
-            // SYNC_RULES, which is operator input.
+            // the catalogue / SYNC_RULES, which is operator input.
             // `GC_DRY_RUN=1` counts instead of deleting. There is no undo on this path, so
             // the only safe way to change a threshold on a live database is to see what the
             // new one would take first.

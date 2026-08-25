@@ -141,7 +141,7 @@ pub const Nats = struct {
     pub const status_update_byte_threshold: u64 = 1024 * 1024; // 1MB
 
     /// JetStream's own mapping of a KV bucket into the subject space: `$KV.<bucket>.<key>`.
-    /// Not in topology.json, and not a name anyone is free to choose — it is the server's.
+    /// Not in grammar.json, and not a name anyone is free to choose — it is the server's.
     pub const kv_subject_prefix = "$KV.";
 
     /// How long the async publish window waits for the last outstanding PubAck before
@@ -151,11 +151,11 @@ pub const Nats = struct {
     pub const publish_ack_timeout_ms: i64 = 10_000;
 
     // Stream names, subject prefixes, subject patterns and KV bucket names all used to
-    // live here as `pub const`s fed by build.zig's @embedFile of topology.json. They are
+    // live here as `pub const`s fed by build.zig's @embedFile of grammar.json. They are
     // now fields on `RuntimeConfig.topology`, read from that file at startup — see
     // src/topology.zig for why the compile-time version had to go.
     //
-    // What stays here is what topology.json does not describe: retry budgets, token
+    // What stays here is what grammar.json does not describe: retry budgets, token
     // positions, and the redelivery limits below.
 
     /// Redelivery budget for a mutation. Bounded so that a message the bridge
@@ -178,7 +178,7 @@ pub const Nats = struct {
 
     /// Token positions in the mutation subject, after splitting on '.'. The *shape* of
     /// `mutation.<principal>.<table>.<operation>` is fixed here while the prefix itself
-    /// comes from topology.json: a deployment may rename the prefix, but moving the
+    /// comes from grammar.json: a deployment may rename the prefix, but moving the
     /// principal to another position would change what the broker's authorization
     /// wildcard covers, which is a protocol change and not a configuration one.
     pub const mutation_token_principal = 1;
@@ -657,7 +657,7 @@ pub const Generations = struct {
     /// Generations kept per (tenant, table) — the delta chain depth k. Coupled to the
     /// sweeper by the correctness inequality: sweeper retention ≥ k × cadence.
     pub const default_chain_depth: u32 = 6;
-    // The KV bucket and per-tenant object-bucket prefix live in topology.json
+    // The KV bucket and per-tenant object-bucket prefix live in grammar.json
     // (`"generations": {kv, bucket_prefix}`) — one file, three readers, same as every
     // other wire name. Only pacing stays here.
 };
@@ -689,8 +689,11 @@ pub const RuntimeConfig = struct {
     publication_name: []const u8,
     generation_cadence_seconds: u64 = Generations.default_cadence_seconds,
     generation_chain_depth: u32 = Generations.default_chain_depth,
+    /// Master switch: derive-and-produce for every published table. GENERATION_RULES
+    /// alone also enables the producer, as a RESTRICTION (probes, dev subsets).
+    generations_enabled: bool = false,
 
-    /// Every wire name, read from topology.json at startup. Carried on RuntimeConfig
+    /// Every wire name, read from grammar.json at startup. Carried on RuntimeConfig
     /// because that is already threaded to each component that publishes or subscribes,
     /// which is what keeps one file the single source for the bridge, `nats-init` and
     /// the clients alike.
@@ -753,7 +756,7 @@ pub const RuntimeConfig = struct {
             .publication_name = Postgres.default_publication_name,
             // Always replaced in `main` immediately after parseArgs. Safe as a default
             // only because a test asserts `for_tests` equals the repository's own
-            // topology.json, so the two cannot drift.
+            // grammar.json, so the two cannot drift.
             .topology = Topo.Topology.for_tests,
             .nats_url = Nats.default_url,
             .nats_seed = null,

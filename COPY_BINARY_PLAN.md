@@ -367,7 +367,7 @@ Do snapshots first. Decide CDC separately, with the standby-lag metric already i
 
 **1. "A topology rename is a restart." — It is now. Fixed 2026-08-16.**
 
-topology.json is read at **startup** (`src/topology.zig`), not baked in by `build.zig`.
+grammar.json is read at **startup** (`src/topology.zig`), not baked in by `build.zig`.
 `TOPOLOGY_PATH` overrides the location; a missing file or key stops the bridge before any
 thread exists, naming the key (`MissingKey at "subjects"."snapshot_meta_pattern"`), so the
 guarantee the compile-time version gave moved rather than disappeared. Verified: renaming
@@ -383,15 +383,15 @@ all if no stream captures it.
 *What follows is the finding that prompted the change.*
 
 **1a. Why it had to move — No: it was a rebuild.** `build.zig:62`
-`@embedFile("topology.json")` feeds `addOptions`, so every stream, subject and bucket name
+`@embedFile("grammar.json")` feeds `addOptions`, so every stream, subject and bucket name
 is *baked into the binary*. Tested: renaming `streams.cdc` and running `zig build` with no
 `.zig` file touched does pick the change up (the build system tracks the embed correctly),
 but the **already-built binary keeps the old name** — it logged
-`Streams: CDC_RENAMED …` while topology.json on disk said `CDC`. The log line said
-"(from topology.json)", which implied runtime reading; it now says "compiled in … rebuild
+`Streams: CDC_RENAMED …` while grammar.json on disk said `CDC`. The log line said
+"(from grammar.json)", which implied runtime reading; it now says "compiled in … rebuild
 to change".
 
-The asymmetry is the friction point: `nats-init` reads topology.json at *container run
+The asymmetry is the friction point: `nats-init` reads grammar.json at *container run
 time* with `jq` (docker-compose.full.yml:161-164), so `docker compose up` applies a rename
 to the server immediately, while the bridge needs a rebuild and redeploy. A rename is
 therefore three coordinated moves — rebuild the bridge, re-run nats-init, update clients —
@@ -1055,7 +1055,7 @@ Electric. Client-facing rules live in `PROTOCOL.md` §7; this is the bridge side
 **Security — first, because "it works" and "it is correct" currently diverge silently**
 
 - [x] **subject grammar fixed 2026-08-15**: `mutation.<principal>.<table>.<operation>`,
-      in `topology.json` → `build.zig` → `Config.Nats.mutation_subject_pattern` plus the
+      in `grammar.json` → `build.zig` → `Config.Nats.mutation_subject_pattern` plus the
       token positions. Nothing parses it yet; the contract is pinned so the switch from
       nkey to JWT/operator becomes a deployment change rather than a client migration.
       Principal first because a per-user grant is then one wildcard (`mutation.<id>.>`)
@@ -1163,8 +1163,9 @@ row of it*.**
 **Version column (LWW)**
 
 - [x] **`SYNC_RULES` + `SYNC_VERSION_COLUMN` — DONE 2026-08-16.** Same grammar as
-      `TRANSITION_RULES`, same parser (`parseTableRules`). `-arrival` (writable with
-      last-arrival-wins) is **not** implemented yet.
+      `TRANSITION_RULES`, same parser (`parseTableRules`). An optional per-table
+      override: the primary source is the table's `zebridge_catalogue` row, loaded at
+      boot. `-arrival` (writable with last-arrival-wins) is **not** implemented yet.
 - [x] **preflight reporting — DONE 2026-08-16.** Checks the *named* column, never
       searches; lists the table's orderable columns as candidates with the exact
       `SYNC_RULES=` line to set. Warns on naive-vs-tz, second precision and nullability

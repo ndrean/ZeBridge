@@ -51,6 +51,7 @@ const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const encoder_mod = @import("encoder.zig");
 const nats = @import("nats");
+const topology_mod = @import("topology.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 
@@ -62,16 +63,27 @@ pub const GenerationProducer = struct {
     should_stop: *std.atomic.Value(bool),
     io: std.Io,
     endpoint: config.Nats.Endpoint,
-    /// table → list of tenants (GENERATION_RULES grammar, parsed like TENANT_RULES)
+    /// GENERATION_RULES — a RESTRICTION intersected with the derived set (probes,
+    /// dev subsets). Empty means: everything the publication carries.
     rules: *const config.EventClassification.TransitionRules,
     /// table → [version_col, …] (SYNC_RULES); absent falls back to the default column
     sync_rules: *const config.EventClassification.TransitionRules,
+    /// table → [tenant_col] (TENANT_RULES) — which tables are tenant-scoped, and by
+    /// which column; the tenant SET itself comes from the data (zebridge_tenants_of).
+    tenant_rules: *const config.EventClassification.TransitionRules,
+    /// For isCdcRoutable (skip tables no client can follow) and the open tenant.
+    topo: *const topology_mod.Topology,
+    /// The publication IS the list (the BRIDGE_CDC_TABLES lesson): membership is
+    /// derived from pg_publication_tables each tick, so zebridge_enable() cascades
+    /// to generations with no second list existing to disagree.
+    publication_name: []const u8,
     cadence_seconds: u64,
     chain_depth: u32,
-    /// From topology.json `"generations".kv` — the manifest bucket.
-    kv_bucket: []const u8,
-    /// From topology.json `"generations".bucket_prefix` — `<prefix><tenant>` objects.
-    bucket_prefix: []const u8,
+    /// The CDC per-event buffer (2^BASE_BUF). The chain has no per-row ceiling —
+    /// object chunking removes it — so the producer is where a row too wide for
+    /// CDC gets DETECTED (the retirement survivor of the snapshot path's
+    /// measureWidestRow): measured for free while encoding, warned loudly.
+    event_buf_bytes: usize,
     thread: ?std.Thread = null,
 
     pub fn init(
@@ -82,10 +94,12 @@ pub const GenerationProducer = struct {
         endpoint: config.Nats.Endpoint,
         rules: *const config.EventClassification.TransitionRules,
         sync_rules: *const config.EventClassification.TransitionRules,
+        tenant_rules: *const config.EventClassification.TransitionRules,
+        topo: *const topology_mod.Topology,
+        publication_name: []const u8,
         cadence_seconds: u64,
         chain_depth: u32,
-        kv_bucket: []const u8,
-        bucket_prefix: []const u8,
+        event_buf_bytes: usize,
     ) GenerationProducer {
         return .{
             .allocator = allocator,
@@ -95,10 +109,12 @@ pub const GenerationProducer = struct {
             .endpoint = endpoint,
             .rules = rules,
             .sync_rules = sync_rules,
+            .tenant_rules = tenant_rules,
+            .topo = topo,
+            .publication_name = publication_name,
             .cadence_seconds = cadence_seconds,
             .chain_depth = chain_depth,
-            .kv_bucket = kv_bucket,
-            .bucket_prefix = bucket_prefix,
+            .event_buf_bytes = event_buf_bytes,
         };
     }
 
@@ -112,8 +128,11 @@ pub const GenerationProducer = struct {
     }
 
     fn run(self: *GenerationProducer) void {
-        log.info("🧬 Generation producer started: {d} table(s), cadence {d}s, chain depth {d}", .{
-            self.rules.count(), self.cadence_seconds, self.chain_depth,
+        log.info("🧬 Generation producer started: deriving from publication '{s}' ({s}), cadence {d}s, chain depth {d}", .{
+            self.publication_name,
+            if (self.rules.count() > 0) "RESTRICTED by GENERATION_RULES" else "every published table",
+            self.cadence_seconds,
+            self.chain_depth,
         });
         // First tick immediately: an operator enabling generations should not wait a
         // full cadence to learn whether the configuration works.
@@ -141,6 +160,16 @@ pub const GenerationProducer = struct {
             log.err("🧬 PG connect failed: {s}", .{c.PQerrorMessage(pgc)});
             return error.ConnectionFailed;
         }
+        // The WHOLE connection renders timestamps in UTC, not just the snapshot
+        // transaction: the window query that rebuilds manifest entries reads stored
+        // cutoffs OUTSIDE the transaction, and a session-timezone render there mixed
+        // `+02` and `+00` strings inside one manifest (measured live in the
+        // live-birth exercise: full.cutoff +02, delta cutoff +00). Chain bounds are
+        // STRING-compared — one canonical form or nothing, same law as payloads.
+        {
+            const res = try queryOne(pgc, "SET timezone TO 'UTC'", &.{});
+            c.PQclear(res);
+        }
 
         var conn_nats = nats.Connection.init(self.allocator, self.io, .{
             .user = self.endpoint.user,
@@ -152,17 +181,105 @@ pub const GenerationProducer = struct {
         try conn_nats.connect(url);
         var js = conn_nats.jetstream(.{});
 
-        var it = self.rules.iterator();
-        while (it.next()) |entry| {
-            const table = entry.key_ptr.*;
-            const vcol = if (self.sync_rules.get(table)) |cols| cols[0] else config.Sync.default_version_column;
-            for (entry.value_ptr.*) |tenant| {
-                if (self.should_stop.load(.acquire)) return;
+        // ── derive the pair list: the publication IS the list ────────────────
+        // Minus internals (zebridge_is_internal_table — one predicate, every door),
+        // minus keyless tables (the client's guarded upsert needs a key), minus
+        // explicit opt-outs (zebridge_enable(generations => false)). Routability and
+        // tenancy are decided per table below; GENERATION_RULES, when set, only
+        // INTERSECTS what was derived.
+        const pub_z = try alloc.dupeZ(u8, self.publication_name);
+        const derive_params = [_]?[*:0]const u8{pub_z.ptr};
+        // The catalogue rides the derive query: per-tick tenant/version columns and
+        // the generations opt-out come from `zebridge_catalogue` (LEFT JOIN — a table
+        // with no row yet falls back to the boot-time maps and defaults), which is
+        // what makes chain onboarding fully LIVE: a table enabled mid-flight gets its
+        // chain on the next tick with no restart and no env edit.
+        const derived = try queryOne(pgc,
+            "SELECT pt.tablename, COALESCE(cat.tenant_col::text, ''), COALESCE(cat.version_col::text, '') " ++
+                "FROM pg_publication_tables pt " ++
+                "LEFT JOIN public.zebridge_catalogue cat ON cat.tbl = pt.tablename " ++
+                "WHERE pt.pubname = $1 " ++
+                "AND COALESCE(cat.generations, true) " ++
+                "AND NOT public.zebridge_is_internal_table(pt.tablename) " ++
+                // Catalog joins, no regclass cast: resolving `format(...)::regclass`
+                // as the READER touched pg_toast schema resolution and was refused —
+                // pg_class/pg_namespace/pg_index answer the same question with plain
+                // catalog reads any role may make.
+                "AND EXISTS (SELECT 1 FROM pg_class cl " ++
+                "            JOIN pg_namespace ns ON ns.oid = cl.relnamespace " ++
+                "            JOIN pg_index i ON i.indrelid = cl.oid AND i.indisprimary " ++
+                "            WHERE ns.nspname = pt.schemaname AND cl.relname = pt.tablename) " ++
+                "ORDER BY 1", &derive_params);
+        defer c.PQclear(derived);
+
+        const restricted = self.rules.count() > 0;
+        var pairs: usize = 0;
+        const n_tables: usize = @intCast(c.PQntuples(derived));
+        for (0..n_tables) |i| {
+            if (self.should_stop.load(.acquire)) return;
+            const table = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(derived, @intCast(i), 0)));
+            const cat_tenant_col = std.mem.span(c.PQgetvalue(derived, @intCast(i), 1));
+            const cat_version_col = std.mem.span(c.PQgetvalue(derived, @intCast(i), 2));
+
+            // Catalogue first (live), boot-time maps as fallback (env overrides
+            // were already merged into those maps at boot — env still wins there).
+            const env_tenant_cols = self.tenant_rules.get(table);
+            const tenant_col_eff: []const u8 =
+                if (env_tenant_cols) |cols| cols[0] else cat_tenant_col;
+            const tenant_scoped = tenant_col_eff.len > 0;
+            // A table no client can follow over CDC gets no chain either: chains seed
+            // what CDC then keeps current, and seeding the unfollowable is pure waste.
+            if (!tenant_scoped and !self.topo.isCdcRoutable(table, false)) continue;
+
+            const allowed: ?[]const []const u8 = if (restricted) self.rules.get(table) else null;
+            if (restricted and allowed == null) continue;
+
+            const vcol = if (self.sync_rules.get(table)) |cols|
+                cols[0]
+            else if (cat_version_col.len > 0)
+                cat_version_col
+            else
+                config.Sync.default_version_column;
+
+            if (tenant_scoped) {
+                // The tenant SET comes from the data, not from grammar.json — the
+                // dyntenant lesson: a new tenant's first row creates its chain on the
+                // next tick, and a tenant with no rows has nothing to seed.
+                const tbl_ref = try utils.allocPrintZ(alloc, "public.\"{s}\"", .{table});
+                const col_z = try alloc.dupeZ(u8, tenant_col_eff);
+                const tparams = [_]?[*:0]const u8{ tbl_ref.ptr, col_z.ptr };
+                const tres = queryOne(pgc, "SELECT * FROM public.zebridge_tenants_of($1::regclass, $2::name)", &tparams) catch |err| {
+                    log.err("🧬 tenants_of('{s}') failed: {} — table skipped this tick", .{ table, err });
+                    continue;
+                };
+                defer c.PQclear(tres);
+                const nt: usize = @intCast(c.PQntuples(tres));
+                for (0..nt) |t| {
+                    const tenant = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(tres, @intCast(t), 0)));
+                    if (allowed) |a| {
+                        var ok = false;
+                        for (a) |cand| ok = ok or std.mem.eql(u8, cand, tenant);
+                        if (!ok) continue;
+                    }
+                    pairs += 1;
+                    self.buildOne(alloc, pgc, &js, table, tenant, vcol) catch |err| {
+                        log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
+                    };
+                }
+            } else {
+                const tenant = self.topo.open_tenant;
+                if (allowed) |a| {
+                    var ok = false;
+                    for (a) |cand| ok = ok or std.mem.eql(u8, cand, tenant);
+                    if (!ok) continue;
+                }
+                pairs += 1;
                 self.buildOne(alloc, pgc, &js, table, tenant, vcol) catch |err| {
                     log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                 };
             }
         }
+        log.debug("🧬 tick: {d} published table(s) derived, {d} (table, tenant) pair(s) built or checked", .{ n_tables, pairs });
     }
 
     fn queryOne(pgc: *c.PGconn, sql: [:0]const u8, params: []const ?[*:0]const u8) !*c.PGresult {
@@ -186,6 +303,7 @@ pub const GenerationProducer = struct {
         prev_cutoff: ?[]const u8,
         vcol: []const u8,
         out_rows: *usize,
+        out_widest: *usize,
     ) ![]const u8 {
         const nrows: usize = @intCast(c.PQntuples(res));
         const ncols: usize = @intCast(c.PQnfields(res));
@@ -198,16 +316,22 @@ pub const GenerationProducer = struct {
             try cols_arr.setIndex(i, try enc.createString(std.mem.span(c.PQfname(res, @intCast(i)))));
         }
         try root.put(enc.allocator, "columns", cols_arr);
+        var names_bytes: usize = 0;
+        for (0..ncols) |i| names_bytes += std.mem.span(c.PQfname(res, @intCast(i))).len;
         var rows_arr = try enc.createArray(nrows);
         for (0..nrows) |r| {
+            var row_bytes: usize = names_bytes + 256; // envelope margin, mirrors wireSize
             var row_arr = try enc.createArray(ncols);
             for (0..ncols) |col| {
                 if (c.PQgetisnull(res, @intCast(r), @intCast(col)) == 1) {
                     try row_arr.setIndex(col, enc.createNull());
                 } else {
-                    try row_arr.setIndex(col, try enc.createString(std.mem.span(c.PQgetvalue(res, @intCast(r), @intCast(col)))));
+                    const val = std.mem.span(c.PQgetvalue(res, @intCast(r), @intCast(col)));
+                    row_bytes += val.len;
+                    try row_arr.setIndex(col, try enc.createString(val));
                 }
             }
+            if (row_bytes > out_widest.*) out_widest.* = row_bytes;
             try rows_arr.setIndex(r, row_arr);
         }
         try root.put(enc.allocator, "rows", rows_arr);
@@ -323,11 +447,12 @@ pub const GenerationProducer = struct {
         // ── 3. content: full and/or delta against the SAME snapshot ──────────
         var full_payload: ?[]const u8 = null;
         var full_rows: usize = 0;
+        var widest_row: usize = 0;
         if (build_full) {
             const sql = try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
             const res = try queryOne(pgc, sql, &.{});
             defer c.PQclear(res);
-            full_payload = try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows);
+            full_payload = try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
         }
         var delta_payload: ?[]const u8 = null;
         var delta_rows: usize = 0;
@@ -339,15 +464,24 @@ pub const GenerationProducer = struct {
             const params = [_]?[*:0]const u8{prev_z.ptr};
             const res = try queryOne(pgc, sql, &params);
             defer c.PQclear(res);
-            delta_payload = try encodeContent(alloc, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows);
+            delta_payload = try encodeContent(alloc, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
         }
         {
             const res = try queryOne(pgc, "COMMIT", &.{});
             c.PQclear(res);
         }
 
+        // The retirement survivor of measureWidestRow (NOTES.md §1.13): the chain
+        // carries any width (object chunking), but CDC cannot — a row at or over the
+        // event buffer will suspend this table the moment ANY writer touches it. Say
+        // so on every build, before it happens; the width-guard trigger stops NEW
+        // rows, this catches the legacy ones already seeded to clients.
+        if (widest_row >= self.event_buf_bytes) {
+            log.warn("⚠️ '{s}'/'{s}': widest row ~{d} bytes is at or over the {d}-byte CDC event buffer. Chains carry it; CDC will SUSPEND this table on its next touch. Shrink the row (store a reference, not the blob) or raise BASE_BUF.", .{ tenant, table, widest_row, self.event_buf_bytes });
+        }
+
         // ── 4. immutable objects first ───────────────────────────────────────
-        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.bucket_prefix, tenant });
+        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
         var osm = js.objectStoreManager();
         var store = osm.openStore(bucket) catch |err| blk: {
             if (err == error.StoreNotFound or err == error.StreamNotFound) {
@@ -409,9 +543,9 @@ pub const GenerationProducer = struct {
             try deltas_json.appendSlice(alloc, frag);
         }
 
-        var kv = js.kvBucket(self.kv_bucket) catch blk: {
+        var kv = js.kvBucket(self.topo.kv_generations) catch blk: {
             var km = js.kvManager();
-            break :blk try km.createBucket(.{ .bucket = self.kv_bucket, .history = 1 });
+            break :blk try km.createBucket(.{ .bucket = self.topo.kv_generations, .history = 1 });
         };
         defer kv.deinit();
         const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });

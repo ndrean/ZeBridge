@@ -209,17 +209,31 @@ END;
 $$ LANGUAGE plpgsql STABLE;
 
 
--- Tables deliberately published to everyone. The escape hatch has to exist — a currency
--- list or a product catalogue is identical for every tenant — but it is recorded, with a
--- reason and an author, so "open bar" is a decision someone made rather than a default
--- nobody noticed.
--- tables deliberately readable by everyone — see NOTES.md §1.8
-CREATE TABLE IF NOT EXISTS public.zebridge_public_tables (
-    tbl      regclass PRIMARY KEY,
-    reason   text NOT NULL,
-    added_by text NOT NULL DEFAULT current_user,
-    added_at timestamptz NOT NULL DEFAULT now()
+-- THE CATALOGUE comes first: the guard below and every registration in this file
+-- read it. Public tables used to live in a separate `zebridge_public_tables`; that
+-- was a strict projection of this relation (`tenant_col IS NULL`) and is gone — the
+-- deliberate "published to everyone" decision is the `public_reason` column, which
+-- the CHECK makes mandatory exactly when a row is public.
+-- THE CATALOGUE — one row per replicated table, the disjoint union of public and
+-- tenant-scoped as one nullable column (NOTES.md, the static-residue endgame).
+-- Written by `zebridge_enable` in the SAME transaction as the guards it installs
+-- with these very columns, so nothing can disagree: TENANT_RULES and SYNC_RULES
+-- become boot-time reads of this table (env demotes to override), the generation
+-- producer reads it per tick, and the T3 "transcribe into .env.bridge" era ends.
+-- The CHECK absorbs the publication guard's core law into the schema itself: a
+-- row is tenant-scoped or publicly justified — never silently neither.
+CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
+    tbl           text PRIMARY KEY,
+    tenant_col    name,            -- NULL = public; NOT NULL = tenant-scoped
+    public_reason text,
+    version_col   name NOT NULL DEFAULT 'updated_at',
+    tombstone_col name,
+    tiebreak_col  name,
+    generations   boolean NOT NULL DEFAULT true,
+    CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
+GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_WRITER_USER};
 
 -- Refuses `ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped nor
 -- recorded as public. The bridge cannot check this for itself — it is a pass-through, and
@@ -264,7 +278,9 @@ BEGIN
         -- `cdc.zebridge_user_tenants.*` would hand every client with a broad CDC grant
         -- exactly that roster.
         CONTINUE WHEN relid::regclass::text LIKE '%zebridge_user_tenants';
-        CONTINUE WHEN EXISTS (SELECT 1 FROM public.zebridge_public_tables WHERE tbl = relid);
+        CONTINUE WHEN EXISTS (SELECT 1 FROM public.zebridge_catalogue cat
+                              WHERE cat.tbl = (SELECT relname FROM pg_class WHERE oid = relid)
+                                AND cat.tenant_col IS NULL);
         -- Either model counts as scoped:
         --   A  a publication row filter  → PostgreSQL bounds CDC itself
         --   B  RLS enabled               → RLS bounds writes and snapshots, and the
@@ -280,8 +296,8 @@ BEGIN
         USING HINT =
             'Use SELECT zebridge_scope_publication_to_one_tenant(''' || relid::regclass ||
             ''', ''<tenant_col>'', ''<tenant>'', ''<publication>''), or record the decision '
-            'with INSERT INTO zebridge_public_tables (tbl, reason) VALUES (''' ||
-            relid::regclass || ''', ''why everyone may read this'').';
+            'with SELECT zebridge_enable(''' || relid::regclass ||
+            ''', public_reason => ''why everyone may read this'', dry_run => false).';
     END LOOP;
 END $$;
 
@@ -410,7 +426,7 @@ ON CONFLICT (id) DO NOTHING;
 --                      them anywhere else would mean the bridge could boot without them.
 --   a migration        application tables. Tenant-scoped ones go through
 --                      `zebridge_scope_publication_to_one_tenant()`; genuinely public ones are recorded
---                      in `zebridge_public_tables` and added directly.
+--                      in `zebridge_catalogue` (public_reason) and added directly.
 --
 -- Both paths still pass through `zebridge_publication_guard`, which is why the registration
 -- below is not optional even here: the guard refuses an unscoped ADD TABLE regardless of who
@@ -418,12 +434,10 @@ ON CONFLICT (id) DO NOTHING;
 -- consumer.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'zebridge_public_tables') THEN
-        INSERT INTO public.zebridge_public_tables (tbl, reason)
-        VALUES ('public.zebridge_gc_watermark'::regclass,
-                'GC watermark: one row, no tenant, every client needs it')
-        ON CONFLICT (tbl) DO NOTHING;
-    END IF;
+    INSERT INTO public.zebridge_catalogue (tbl, public_reason)
+    VALUES ('zebridge_gc_watermark',
+            'GC watermark: one row, no tenant, every client needs it')
+    ON CONFLICT (tbl) DO NOTHING;
 
     IF NOT EXISTS (
         SELECT 1 FROM pg_publication_tables
@@ -489,6 +503,13 @@ RETURNS boolean AS $$
     SELECT tbl = ANY (ARRAY[
         'zebridge_ddl_events',   -- our own DDL tracker
         'zebridge_generations',  -- generation producer bookkeeping (NOTES.md §1.13)
+        'zebridge_limits',       -- the change-feed width budget (one row)
+        'zebridge_generation_overrides',  -- superseded by zebridge_catalogue.generations
+        'zebridge_catalogue',    -- THE catalogue: one row per replicated table
+        -- ⚠️ the principal→tenant roster: BRIDGE INPUT (its CDC feeds $KV.tenants),
+        -- never client-replicated — replicating it would disclose the roster the
+        -- per-key $KV.tenants grant exists to protect (NOTES.md §1.12 part 3).
+        'zebridge_user_tenants',
         'schema_migrations'      -- Ecto / ActiveRecord migration bookkeeping
     ]);
 $$ LANGUAGE sql IMMUTABLE;
@@ -823,6 +844,124 @@ CREATE EVENT TRIGGER zebridge_timestamp_guard_t ON ddl_command_end
 -- ⚠️ Lives in the core half but dispatches the write-path calls through EXECUTE, so a
 -- read-only install can still use it for the one step it needs (publishing a table) and
 -- fails with a *named* reason rather than "function does not exist" if asked for writes.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- The change-feed row-width budget, and the guard that enforces it AT THE ROW.
+--
+-- Two doors write rows: the edge (mutations through the bridge) and psql/backend
+-- apps. The bridge's ingress check measures only the mutation PAYLOAD, so a small
+-- edit to an already-wide row — or any direct backend write — could commit a row
+-- the change feed cannot carry, and the first CDC touch would then suspend the
+-- table for every reader ("accepted, then everybody freezes" — NOTES.md §1.13,
+-- case C). A BEFORE trigger closes BOTH doors at the only place they meet: the
+-- row, inside the writer's own transaction. The edge write becomes a verdict
+-- (`rejected`, SQLSTATE 23514 — class 23 is already classified permanent by the
+-- mutation listener); the psql write becomes an ordinary ERROR. Rules that only
+-- live in prose are the ones that bite.
+--
+-- ⚠️ `max_row_bytes` must track the bridge's per-event buffer (2^BASE_BUF,
+-- default 16384). It lives in a table rather than the trigger body so a BASE_BUF
+-- change is one UPDATE, not a re-install per table.
+CREATE TABLE IF NOT EXISTS public.zebridge_limits (
+    id            smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    max_row_bytes integer  NOT NULL DEFAULT 16384
+);
+INSERT INTO public.zebridge_limits (id) VALUES (1) ON CONFLICT DO NOTHING;
+GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_BRIDGE_USER};
+
+
+
+-- Which tenants a tenant-scoped table currently holds — the generation producer's
+-- per-tenant chain set, derived from the DATA (dyntenant-correct: a new tenant's
+-- first row creates its chain on the next tick; grammar.json is not runtime
+-- truth). SECURITY DEFINER because the reader's own RLS would scope the DISTINCT
+-- to one tenant — PG functions hold the rules.
+CREATE OR REPLACE FUNCTION public.zebridge_tenants_of(tbl regclass, tenant_col name)
+RETURNS SETOF text AS $$
+BEGIN
+    RETURN QUERY EXECUTE format(
+        'SELECT DISTINCT %I::text FROM %s WHERE %I IS NOT NULL', tenant_col, tbl, tenant_col);
+END;
+$$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_catalog;
+
+-- Install (or refresh) the per-table width guard. Only unbounded columns are
+-- measured — text, unbounded varchar, bytea (×2: the feed renders it as hex),
+-- json/jsonb/xml, and arrays of any type — because a table with none of them is
+-- statically inside every budget and gets no trigger at all (hot-path cost only
+-- where overflow is possible). The generated trigger body is STATIC per table:
+-- explicit column references, no runtime catalog reads, one SELECT on the one-row
+-- limits table.
+CREATE OR REPLACE FUNCTION public.zebridge_install_width_guard(tbl regclass)
+RETURNS text AS $$
+DECLARE
+    short       text := (SELECT relname FROM pg_class WHERE oid = tbl);
+    expr        text := '';
+    n_cols      int  := 0;
+    n_unbounded int  := 0;
+    col         record;
+    fn_body     text;
+BEGIN
+    FOR col IN
+        SELECT a.attname, t.typname, a.atttypmod, t.typcategory
+        FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+    LOOP
+        n_cols := n_cols + 1;
+        IF col.typname = 'bytea' THEN
+            n_unbounded := n_unbounded + 1;
+            expr := expr || format(' + coalesce(octet_length(NEW.%I) * 2 + 2, 0)', col.attname);
+        ELSIF col.typname IN ('text', 'json', 'jsonb', 'xml')
+              OR (col.typname = 'varchar' AND col.atttypmod = -1)
+              OR col.typcategory = 'A' THEN
+            n_unbounded := n_unbounded + 1;
+            expr := expr || format(' + coalesce(octet_length(NEW.%I::text), 0)', col.attname);
+        END IF;
+    END LOOP;
+
+    IF n_unbounded = 0 THEN
+        RETURN format('%s: no unbounded columns — statically inside every budget, no guard installed', short);
+    END IF;
+
+    -- ⚠️ The generated body is assembled as a STRING and attached via quote_literal,
+    -- never via nested dollar-quote tags (dollar-f-dollar and the like): the
+    -- templates pass through envsubst at init, which eats any `$word` as an (empty)
+    -- shell variable and leaves an unterminated quote that swallows every statement
+    -- after it. Measured on the first fresh boot: this function AND zebridge_enable
+    -- simply did not exist. Only the plain double-dollar delimiter survives envsubst
+    -- — and it must never be SPELLED inside a body either, comments included: the
+    -- lexer ends the body at the first occurrence, wherever it sits. (This very
+    -- comment broke two boots by naming it literally.)
+    --
+    -- SECURITY DEFINER: the guard reads zebridge_limits as whoever writes the row
+    -- (bridge_writer, a backend app), and none of them should need a grant on bridge
+    -- internals just to be told no. search_path pinned, as every SECURITY DEFINER must.
+    fn_body := format(
+        'DECLARE '
+        '  budget integer := (SELECT max_row_bytes FROM public.zebridge_limits WHERE id = 1); '
+        '  width  integer := %s + %s; '
+        'BEGIN '
+        '  IF width >= budget THEN '
+        '    RAISE EXCEPTION ''row width %% bytes is at or over the %%-byte change-feed budget: the feed could not carry this row (zebridge_limits.max_row_bytes; store a reference, not the blob)'', width, budget '
+        '      USING ERRCODE = ''check_violation''; '
+        '  END IF; '
+        '  RETURN NEW; '
+        'END',
+        substr(expr, 4), 32 * n_cols + 256);
+
+    EXECUTE 'CREATE OR REPLACE FUNCTION public.' || quote_ident('zebridge_width_guard_' || short)
+         || '() RETURNS trigger AS ' || quote_literal(fn_body)
+         || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog';
+
+    EXECUTE format('DROP TRIGGER IF EXISTS zebridge_width_guard ON %s', tbl);
+    EXECUTE format('CREATE TRIGGER zebridge_width_guard BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION public.%I()',
+                   tbl, 'zebridge_width_guard_' || short);
+    RETURN format('%s: width guard installed over %s unbounded column(s)', short, n_unbounded);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Adding a parameter changes the function's identity: without this DROP the old
+-- signature would survive CREATE OR REPLACE and every named-argument call would
+-- be ambiguous between the two.
+DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, boolean, text, name, boolean);
 CREATE OR REPLACE FUNCTION public.zebridge_enable(
     tbl           regclass,
     tenant_col    name    DEFAULT NULL,
@@ -830,6 +969,8 @@ CREATE OR REPLACE FUNCTION public.zebridge_enable(
     columns       name[]  DEFAULT NULL,
     version_col   name    DEFAULT NULL,
     tombstone_col name    DEFAULT NULL,
+    tiebreak_col  name    DEFAULT NULL,  -- where the winning writer's id is stored; makes equal versions resolvable
+    generations   boolean DEFAULT true,
     public_reason text    DEFAULT NULL,
     publication   name    DEFAULT '${BRIDGE_CDC_PUBLICATION}',
     dry_run       boolean DEFAULT true
@@ -867,9 +1008,8 @@ BEGIN
               OR EXISTS (SELECT 1 FROM pg_publication_rel WHERE prrelid = tbl AND prqual IS NOT NULL)
               -- ⚠️ Aliased and qualified: the parameter is also named `tbl`, and this
               -- table has a column of that name, so the unqualified form is ambiguous.
-              OR EXISTS (SELECT 1 FROM pg_class c WHERE c.relname = 'zebridge_public_tables'
-                         AND EXISTS (SELECT 1 FROM public.zebridge_public_tables pt
-                                     WHERE pt.tbl = zebridge_enable.tbl))
+              OR EXISTS (SELECT 1 FROM public.zebridge_catalogue cat
+                         WHERE cat.tbl = short AND cat.tenant_col IS NULL)
               OR public_reason IS NOT NULL
               OR (writable AND tenant_col IS NOT NULL);   -- scope_writes_by_tenant enables RLS
     IF NOT scoped THEN
@@ -877,7 +1017,7 @@ BEGIN
             format('%s would be published unscoped, which zebridge_publication_guard refuses. '
                    'Pick one: (a) writable => true with tenant_col, which enables RLS; '
                    '(b) public_reason => ''why everyone may read this'', recorded in '
-                   'zebridge_public_tables; (c) call zebridge_scope_publication_to_one_tenant() '
+                   'zebridge_catalogue; (c) call zebridge_scope_publication_to_one_tenant() '
                    'first for a one-bridge-per-tenant deployment.', tbl);
         RETURN;
     END IF;
@@ -924,14 +1064,32 @@ BEGIN
                    tbl::text, tenant_col);
     END IF;
 
-    IF public_reason IS NOT NULL THEN
-        IF NOT dry_run THEN
-            EXECUTE format('INSERT INTO public.zebridge_public_tables (tbl, reason) VALUES (%L::regclass, %L) '
-                           'ON CONFLICT (tbl) DO NOTHING', tbl, public_reason);
-        END IF;
-        RETURN QUERY SELECT 'public', verb,
-            format('recorded in zebridge_public_tables: %L', public_reason);
+    -- ── the width guard: both doors, one trigger ──────────────────────────────
+    IF NOT dry_run THEN
+        EXECUTE format('SELECT public.zebridge_install_width_guard(%L::regclass)', tbl);
     END IF;
+    RETURN QUERY SELECT 'width guard', verb,
+        format('zebridge_install_width_guard(%L) — a row the change feed cannot carry is '
+               'refused at write time: edge writes get a rejected verdict (SQLSTATE 23514), '
+               'psql gets an ordinary ERROR. No-op on tables without unbounded columns.', tbl::text);
+
+    -- ── THE CATALOGUE ROW: the declaration itself, atomically with the guards ──
+    IF NOT dry_run THEN
+        EXECUTE format(
+            'INSERT INTO public.zebridge_catalogue (tbl, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations) '
+            'VALUES (%L, %L, %L, COALESCE(%L, ''updated_at''), %L, %L, %L) '
+            'ON CONFLICT (tbl) DO UPDATE SET tenant_col = EXCLUDED.tenant_col, '
+            'public_reason = EXCLUDED.public_reason, version_col = EXCLUDED.version_col, '
+            'tombstone_col = EXCLUDED.tombstone_col, tiebreak_col = EXCLUDED.tiebreak_col, '
+            'generations = EXCLUDED.generations',
+            short, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations);
+    END IF;
+    RETURN QUERY SELECT 'catalogue', verb,
+        format('zebridge_catalogue[%s]: tenant_col=%s version_col=%s tombstone=%s tiebreak=%s generations=%s '
+               '— the bridge reads this at boot (env rules become overrides) and the '
+               'generation producer per tick', short,
+               COALESCE(tenant_col::text, 'NULL(public)'), COALESCE(version_col::text, 'updated_at'),
+               COALESCE(tombstone_col::text, '-'), COALESCE(tiebreak_col::text, '-'), generations);
 
     -- ── publication LAST ──────────────────────────────────────────────────────
     SELECT EXISTS (SELECT 1 FROM pg_publication_tables
@@ -956,16 +1114,15 @@ BEGIN
     END IF;
 
     -- ── T3 and T4 live outside the database and always will ───────────────────
-    IF tenant_col IS NOT NULL THEN
-        RETURN QUERY SELECT 'T3 bridge env', 'MANUAL',
-            format('TENANT_RULES=%s:%s   — restart the bridge; without it events publish to '
-                   'cdc.%s.<op> with no tenant token and no client can scope them', short, tenant_col, short);
-    END IF;
-    IF writable AND version_col IS NOT NULL THEN
-        RETURN QUERY SELECT 'T3 bridge env', 'MANUAL',
-            format('SYNC_RULES=%s:%s%s   — restart the bridge', short, version_col,
-                   CASE WHEN tombstone_col IS NULL THEN '' ELSE ',' || tombstone_col END);
-    END IF;
+    RETURN QUERY SELECT 'T3 bridge', 'MANUAL',
+        CASE WHEN tenant_col IS NULL
+             THEN 'restart the bridge — boot reconciles CDC_PUBLIC''s subject filter from the '
+                  'catalogue, so a NEW public table needs one restart to gain its subject. '
+                  'No env transcription, no stream edit by hand.'
+             ELSE 'restart the bridge — it reads zebridge_catalogue at boot, so the routing for a '
+                  'NEW tenant-scoped table needs one restart (no env transcription: SYNC_RULES/'
+                  'TENANT_RULES are legacy overrides now). The generation chain needs nothing — '
+                  'the producer reads the catalogue per tick.' END;
     RETURN QUERY SELECT 'T4 nats conf', 'MANUAL',
         CASE WHEN tenant_col IS NULL
              THEN format('grant subscribe on cdc.%s.> — and init.snap.%s.> to match, because a '

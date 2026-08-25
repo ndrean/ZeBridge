@@ -811,7 +811,7 @@ pub const SnapshotListener = struct {
     endpoint: config.Nats.Endpoint,
     /// Set when a listener gives up on its first connection; see `BootConnect`.
     boot_fatal: *std.atomic.Value(bool),
-    /// Wire names, read from topology.json at startup. See src/topology.zig.
+    /// Wire names, read from grammar.json at startup. See src/topology.zig.
     topology: *const topology_mod.Topology,
 
     /// Initialize snapshot listener (does not start the thread)

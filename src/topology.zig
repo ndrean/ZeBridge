@@ -1,6 +1,6 @@
-//! Wire names, read at **startup** from topology.json.
+//! Wire names, read at **startup** from grammar.json.
 //!
-//! These used to be compile-time constants: `build.zig` `@embedFile`d topology.json and
+//! These used to be compile-time constants: `build.zig` `@embedFile`d grammar.json and
 //! `addOptions` baked every stream, subject and bucket name into the binary. That bought
 //! a real guarantee — a key missing from the file failed the *build*, which is what
 //! stopped the bridge and `nats-init` drifting apart — and it cost more than it was
@@ -21,8 +21,8 @@ const std = @import("std");
 
 pub const log = std.log.scoped(.topology);
 
-/// Where topology.json is, when `TOPOLOGY_PATH` does not say.
-pub const default_path = "topology.json";
+/// Where grammar.json is, when `TOPOLOGY_PATH` does not say.
+pub const default_path = "grammar.json";
 
 pub const Error = error{
     MissingKey,
@@ -58,18 +58,20 @@ pub const Topology = struct {
 
     // ─── per-tenant CDC streams (empty when the deployment is not tenant-routed) ──
     //
-    // The tenant list is what the boot preflight checks NATS against: every name here
-    // must have a `<cdc_stream_prefix><TENANT>` stream, or the bridge refuses to start.
-    // A row whose tenant is not in this list has no destination — the whole reason the
-    // check exists (NOTES.md §1.12, §4.5).
+    // No longer read from the grammar file: tenants are DATA, and boot derives this
+    // list from `zebridge_user_tenants` (src/catalogue.zig) before the stream
+    // reconciliation that ensures every `<cdc_stream_prefix><TENANT>` stream exists.
+    // A `tenants` key still present in the file merges in for compatibility.
     tenants: []const []const u8,
     cdc_stream_prefix: []const u8,
     cdc_stream_public: []const u8,
 
-    /// Tables `CDC_PUBLIC`'s subject filter actually covers when they are *not*
-    /// tenant-scoped — `nats-init`/`up.sh` build the stream's subjects from exactly this
-    /// list. A table that is neither tenant-scoped (in `TENANT_RULES`) nor listed here
-    /// has no destination for `cdc.<table>.<op>` at all — see `isCdcRoutable`.
+    /// Tables `CDC_PUBLIC`'s subject filter covers when they are *not* tenant-scoped.
+    /// No longer read from the grammar file: boot fills this from the catalogue
+    /// (`zebridge_catalogue.tenant_col IS NULL`) and the bridge reconciles the
+    /// stream's subject filter itself. A table that is neither tenant-scoped nor in
+    /// the catalogue as public has no destination for `cdc.<table>.<op>` at all —
+    /// see `isCdcRoutable`.
     public_tables: []const []const u8,
 
     // ─── per-tenant INIT streams (same reasoning as CDC above) ────────────────────
@@ -121,6 +123,10 @@ pub const Topology = struct {
     kv_snapshots: []const u8,
     kv_tenants: []const u8,
 
+    /// The tenant token tenant-agnostic tables live under (`"_default"` unless
+    /// grammar.json says otherwise) — snapshot descriptors, generation manifests.
+    open_tenant: []const u8,
+
     // ─── generations (NOTES.md §1.13) ───────────────────────────────────────────
     /// KV bucket holding the chain manifests, keyed `<tenant>.<table>` — tenant first,
     /// which is what makes per-tenant `DIRECT.GET` grants scopable at all.
@@ -163,9 +169,10 @@ pub const Topology = struct {
     /// `TransitionRules` lives in `config.zig`, which already imports this module —
     /// importing it back would be circular.
     ///
-    /// An untenanted table is covered only if it is in `public_tables`, exactly the list
-    /// `nats-init`/`up.sh` used to build `CDC_PUBLIC`'s subjects — anything else was
-    /// never added to any stream's subject filter, by construction, not by a bug.
+    /// An untenanted table is covered only if it is in `public_tables` — at boot the
+    /// catalogue's public rows, exactly the set the bridge reconciled `CDC_PUBLIC`'s
+    /// subject filter to — anything else was never added to any stream's subject
+    /// filter, by construction, not by a bug.
     pub fn isCdcRoutable(self: *const Topology, table: []const u8, is_tenant_scoped: bool) bool {
         if (is_tenant_scoped) return true;
         for (self.public_tables) |t| {
@@ -207,6 +214,7 @@ pub const Topology = struct {
         .kv_schemas = "schemas",
         .kv_snapshots = "snapshots",
         .kv_tenants = "tenants",
+        .open_tenant = "_default",
         .kv_generations = "generations",
         .generation_bucket_prefix = "gen-",
         .mutations_subject_wildcard = "mutation.>",
@@ -350,6 +358,11 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.kv_snapshots = try str(a, kv, "kv", "snapshots", diag);
     t.kv_tenants = try str(a, kv, "kv", "tenants", diag);
 
+    t.open_tenant = if (root.get("open_tenant")) |v| (switch (v) {
+        .string => |x| try a.dupe(u8, x),
+        else => "_default",
+    }) else "_default";
+
     // Optional, like cdc_streams: a deployment that never sets GENERATION_RULES has no
     // reason to name these, and absent means the defaults the feature was built against.
     if (root.get("generations")) |gv| switch (gv) {
@@ -372,7 +385,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
         t.generation_bucket_prefix = "gen-";
     }
 
-    // Derived. `$KV.` is not in topology.json on purpose: it is JetStream's own subject
+    // Derived. `$KV.` is not in grammar.json on purpose: it is JetStream's own subject
     // mapping for a bucket, not a name anyone is free to choose.
     t.mutations_subject_wildcard = try std.fmt.allocPrint(a, "{s}.>", .{t.subject_mutations_prefix});
     t.kv_schemas_subject_pattern = try std.fmt.allocPrint(a, "$KV.{s}.{{[table]s}}", .{t.kv_schemas});
@@ -456,7 +469,7 @@ pub const Arg = struct {
 ///
 /// `std.fmt.allocPrint` needs a **comptime** format string, so the moment these patterns
 /// came from a file at runtime it stopped being usable for them. The syntax is kept
-/// exactly as it was so topology.json does not change: a half-upgraded deployment cannot
+/// exactly as it was so grammar.json does not change: a half-upgraded deployment cannot
 /// end up publishing to a differently-shaped subject.
 ///
 /// Both directions are checked. An unknown placeholder means the file asks for something
@@ -571,7 +584,7 @@ test "render: a placeholder the call site cannot supply is an error, not an empt
 }
 
 test "render: an argument the pattern never uses is an error too" {
-    // The other direction: topology.json dropped a placeholder, so the value silently
+    // The other direction: grammar.json dropped a placeholder, so the value silently
     // stops appearing in the subject and every table shares one.
     try testing.expectError(
         RenderError.UnusedArgument,
@@ -653,14 +666,14 @@ test "parse: a non-string name is rejected" {
     try testing.expectError(Error.NotAString, parse(testing.allocator, json, null));
 }
 
-test "the test fixture matches the repository's own topology.json" {
+test "the test fixture matches the repository's own grammar.json" {
     // `Topology.for_tests` is a convenience, and a convenience that drifts from the real
     // file is worse than none: unit tests would pass against names the bridge never uses.
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, "topology.json", testing.allocator, .limited(64 * 1024)) catch |err| {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, "grammar.json", testing.allocator, .limited(64 * 1024)) catch |err| {
         // `zig build test` runs from the repository root; if that ever stops being true,
         // skip rather than fail on a path.
         if (err == error.FileNotFound) return error.SkipZigTest;
@@ -678,7 +691,7 @@ test "the test fixture matches the repository's own topology.json" {
         // (whichever tenants a deployment happens to declare), so it is `[]const
         // []const u8`, not `[]const u8`, and `expectEqualStrings` does not even
         // typecheck against it. It is also deliberately excluded from "matches the
-        // repository's own topology.json" on purpose: `for_tests` carries no tenants
+        // repository's own grammar.json" on purpose: `for_tests` carries no tenants
         // so unit tests default to untenanted behaviour, while the real file declares
         // some for the multi-tenant scenarios — that difference is intentional, not
         // drift, and this test exists to catch drift in the *names*, not to assert the

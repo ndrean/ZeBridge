@@ -25,7 +25,7 @@ The 5s clamp margin means a write can echo into one extra build on the following
 tick (a duplicate delta, absorbed by the guarded upsert — never a gap), so checks
 are structural (bounds, kinds, windows), never tick-counting.
 
-Usage:  python scripts/scenarios/genproducer.py
+Usage:  python scripts/scenarios/genproducer.py   (⚠️ owns the only bridge)
 Needs the probe-bridge env (`set -a && . ./.env.bridge && set +a`, NATS_NKEY_SEED)
 plus ZB_PSQL admin access for the row touches. Cleans up its rows, objects and
 pointer; the shared `generations` KV bucket and `gen-_default` store remain.
@@ -34,6 +34,8 @@ pointer; the shared `generations` KV bucket and `gen-_default` store remain.
 import asyncio
 import json
 import re
+import subprocess
+import sys
 import time
 
 import zb
@@ -69,6 +71,15 @@ async def poll(pred, timeout):
 
 async def main():
     failed = 0
+    # ⚠️ Owns the only bridge (since derivation landed): every bridge with
+    # GENERATIONS_ENABLED derives the full published set, so a concurrently running
+    # production bridge would produce this scenario's pair too and race its
+    # controlled cadence. The probe scopes itself with GENERATION_RULES (now a
+    # RESTRICTION intersected with the derived set).
+    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
+    if running.stdout.strip():
+        sys.exit("another bridge is already running — it would produce this scenario's "
+                 "chain concurrently; stop it first")
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tenant='{TENANT}' AND tbl='{TABLE}'")
 
     nc = await zb.connect()

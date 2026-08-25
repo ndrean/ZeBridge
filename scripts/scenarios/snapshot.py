@@ -26,7 +26,7 @@ Usage:  python scripts/scenarios/snapshot.py [table] [seed_rows] [tenant]
 ⚠️ Tenant-scoped since §1.12: `snapshot.request`/`init.snap`/`$KV.snapshots` are all
 keyed `<tenant>.<table>`, not a bare table name — a snapshot is per-tenant, since each
 tenant's rows are a different dump. `tenant` defaults to `OPEN_TENANT` (from
-`topology.json`) for a public table, or the first entry in `topology.json`'s `tenants[]`
+`grammar.json`) for a public table, or the first entry in `grammar.json`'s `tenants[]`
 for a tenant-scoped one — read from the table's own published schema
 (`tenant_column` in `$KV.schemas.<table>`), the same source of truth `App.tsx` uses,
 never guessed from the table name.
@@ -43,7 +43,7 @@ from nats.js.api import ConsumerConfig, DeliverPolicy
 def schema_tenant_column(table: str) -> str | None:
     """`tenant_column` from the table's own published schema — `None` for a public
     table. Read the way a client reads it (`invalidate.py`'s `kv_get` pattern), not
-    guessed from `topology.json:public_tables`, which is a different, narrower set
+    guessed from `grammar.json:public_tables`, which is a different, narrower set
     (NOTES.md §1.6/§1.12: `tenant_column` is authoritative; `public_tables` only lists
     user-schema tables, missing the internal ones that are just as tenant-agnostic).
     """
@@ -65,8 +65,11 @@ async def main():
     if len(sys.argv) > 3:
         tenant = sys.argv[3]
     elif tenant_col:
-        tenant = zb.TOPOLOGY["tenants"][0]
-        print(f"'{table}' is tenant-scoped and no tenant was given — defaulting to '{tenant}'")
+        live = zb.tenants()
+        if not live:
+            sys.exit(f"'{table}' is tenant-scoped but zebridge_user_tenants is empty — pass a tenant")
+        tenant = live[0]
+        print(f"'{table}' is tenant-scoped and no tenant was given — defaulting to '{tenant}' (from the data)")
     else:
         tenant = zb.TOPOLOGY["open_tenant"]
     print(f"tenant: {tenant}")
@@ -187,7 +190,7 @@ async def main():
     # Chunks are arrays of row-arrays, positional against the schema's column order.
     #
     # ⚠️ INIT is split per tenant (§1.12, same reasoning as CDC's split) — there is no
-    # stream literally named "INIT" to subscribe to; `topology.json:streams.init` is a
+    # stream literally named "INIT" to subscribe to; `grammar.json:streams.init` is a
     # generic label, not a real stream name. The real one is `INIT_PUBLIC` for the open
     # tenant or `INIT_<TENANT_UPPER>` otherwise, matching what `scripts/native/up.sh` /
     # `nats-init` actually create.

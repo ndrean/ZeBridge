@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""A tenant born at runtime — no topology.json entry, no bridge restart, no reload.
+"""A tenant born at runtime — no grammar.json entry, no bridge restart, no reload.
 
-NOTES.md §9's claim: the bridge's publisher is fully dynamic — `topology.json`'s
+NOTES.md §9's claim: the bridge's publisher is fully dynamic — `grammar.json`'s
 `tenants` array feeds only the boot preflight and `nats-init`'s stream creation. At
 runtime the subject is built from the ROW's tenant value, so a backend that (1)
 creates the `CDC_<TENANT>`/`INIT_<TENANT>` streams itself and (2) inserts the
 principal→tenant mapping can onboard a tenant with zero config changes.
 
 This proves it end to end against a LIVE bridge, with a tenant deliberately absent
-from topology.json:
+from grammar.json:
 
   1. the new tenant's CDC stream is provisioned at runtime (what a backend would do);
   2. a `zebridge_user_tenants` mapping inserted NOW propagates to `$KV.tenants.<principal>`
@@ -48,8 +48,8 @@ def stream_msgs(name):
 def main():
     failed = 0
     topo = zb.TOPOLOGY
-    if TENANT in (topo.get("tenants") or []):
-        sys.exit(f"'{TENANT}' is declared in topology.json — the whole point is that it is not")
+    if TENANT in zb.tenants():
+        sys.exit(f"'{TENANT}' is already mapped in zebridge_user_tenants — the whole point is that it is not")
     cdc_stream = topo["cdc_streams"]["tenant_prefix"] + TENANT.upper()
     init_stream = topo["init_streams"]["tenant_prefix"] + TENANT.upper()
     cdc_prefix = topo["subjects"]["cdc_prefix"]
@@ -101,7 +101,7 @@ def main():
             subj_ok = subj.startswith(f"{cdc_prefix}.{TENANT}.test_types.insert")
             if subj_ok:
                 zb.ok(f"the write landed on {cdc_prefix}.{TENANT}.test_types.insert in {cdc_stream} "
-                      "— routed from the ROW's tenant value, topology.json never consulted")
+                      "— routed from the ROW's tenant value, grammar.json never consulted")
             else:
                 zb.bad(f"a message arrived but not on the expected subject:\n{r.stdout[:200]}")
                 failed += 1

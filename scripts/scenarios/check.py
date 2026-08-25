@@ -10,10 +10,10 @@ both sides looking healthy:
     printed `✓ Generated NATS config with credentials` and exited 0.
   • `users` published with no `TENANT_RULES` entry, so it emitted `cdc.users.insert` — a
     subject no tenant-scoped consumer filter can match. Counters incremented; nothing arrived.
-  • `zebridge_public_tables` still calling `test_types` public after it gained `tenant_id`.
+  • the catalogue still calling `test_types` public after it gained `tenant_id`.
   • `BRIDGE_CDC_TABLES` in an env file, read by no code, free to disagree with the publication.
 
-This changes nothing. It reads what is *declared* (conf, env, topology.json) and what is
+This changes nothing. It reads what is *declared* (conf, env, grammar.json) and what is
 *actual* (PostgreSQL, NATS) and reports where they differ.
 
 ⚠️ Exits non-zero on drift, but **nothing should `depends_on` it**. The exit code is how the
@@ -148,47 +148,61 @@ def main():
             elif snap_t and cdc_t and snap_t != cdc_t:
                 bad(f"'{p}': snapshot reach {sorted(snap_t)} != subscribe reach {sorted(cdc_t)}")
 
-    # ── 5. topology.json public_tables vs the database ────────────────────────
-    declared = set(zb.TOPOLOGY.get("public_tables") or [])
-    actual = {r.split(".")[-1] for r in zb.psql(
-        "SELECT tbl::text FROM zebridge_public_tables").splitlines() if r}
-    if declared - actual:
-        bad(f"topology.json declares public but the DB does not: {sorted(declared - actual)}")
-    if actual - declared:
-        # Bridge-owned tables are public by construction, so this alone is information.
-        extra = sorted(t for t in (actual - declared) if not t.startswith("zebridge_"))
-        infra = sorted(t for t in (actual - declared) if t.startswith("zebridge_"))
-        if infra:
-            print(f"  \u24d8  bridge-owned and public by construction: {infra}")
-        if extra:
-            print(f"  \u24d8  public in the DB but not in topology.json: {extra}")
+    # ── 5. the catalogue's public set vs CDC_PUBLIC's bound subjects ──────────
+    #
+    # The bridge reconciles CDC_PUBLIC's subject filter from `zebridge_catalogue`
+    # (tenant_col IS NULL) at BOOT, so drift here has exactly one meaning: the
+    # catalogue changed after the bridge booted, and a restart is due.
+    publics = {r for r in zb.psql(
+        "SELECT tbl FROM zebridge_catalogue WHERE tenant_col IS NULL").splitlines() if r}
+    cdc_prefix = zb.TOPOLOGY["subjects"]["cdc_prefix"]
+    open_t = zb.TOPOLOGY.get("open_tenant", "_default")
+    pinfo = zb.nats_cli("stream", "info", "CDC_PUBLIC", "--json")
+    if pinfo.returncode != 0:
+        print("  ⓘ  could not read CDC_PUBLIC — public-subject check skipped")
+    else:
+        bound = set(json.loads(pinfo.stdout).get("config", {}).get("subjects", []))
+        unbound = {t for t in publics if f"{cdc_prefix}.{t}.>" not in bound}
+        if unbound:
+            bad(f"catalogue-public but not bound in CDC_PUBLIC: {sorted(unbound)}",
+                "Declared after the bridge booted. Restart the bridge — boot reconciles\n"
+                "CDC_PUBLIC's subjects from the catalogue.")
+        else:
+            zb.ok(f"CDC_PUBLIC binds every catalogue-public table ({len(publics)})")
+        stale = sorted(x.split(".")[1] for x in bound
+                       if x.count(".") >= 2 and x.split(".")[1] not in publics
+                       and x.split(".")[1] != open_t)
+        if stale:
+            print(f"  ⓘ  bound but no longer catalogue-public (stale until the next boot): {stale}")
 
-    # ⚠️ The contradiction that matters: a table declared readable by EVERY consumer while
-    # being tenant-scoped. `zebridge_public_tables` records a decision and its reason, so a
-    # stale row is a stale *decision* — it says the table has no tenant column when it has
-    # one, and nothing recomputes that when a migration adds the column.
-    for tbl in sorted(actual):
+    # The contradiction that matters: a catalogue row calling a table public while
+    # the table HAS a tenant column. The CHECK constraint guarantees a reason was
+    # recorded; nothing recomputes the decision when a migration adds the column.
+    for tbl in sorted(publics):
         col = zb.psql(
-            "SELECT attname FROM pg_attribute "
-            f"WHERE attrelid='public.{tbl}'::regclass AND attname='tenant_id' AND attnum>0"
+            "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid "
+            f"WHERE c.relname='{tbl}' AND a.attname='tenant_id' AND a.attnum>0", quiet=True
         ).strip()
         if col:
             reason = zb.psql(
-                f"SELECT reason FROM zebridge_public_tables WHERE tbl='public.{tbl}'::regclass"
-            ).strip()
-            bad(f"'{tbl}' is declared public but HAS a tenant column ({col})",
+                f"SELECT public_reason FROM zebridge_catalogue WHERE tbl='{tbl}'").strip()
+            bad(f"'{tbl}' is catalogue-public but HAS a tenant column ({col})",
                 f"recorded reason: {reason!r}\n"
                 "Every consumer may read it while its rows belong to individual tenants.\n"
-                "Either drop the zebridge_public_tables row or drop the tenant column.")
-    if not (declared - actual):
-        zb.ok(f"topology.json public_tables agrees with zebridge_public_tables ({sorted(declared)})")
+                "Either delete the catalogue row or drop the tenant column.")
 
-    # ── 6. TENANT_RULES vs the schema, and published tables that need one ─────
+    # ── 6. tenant columns (catalogue + env overrides) vs the schema ───────────
     tenant_rules = {}
     for entry in os.environ.get("TENANT_RULES", "").split(";"):
         if ":" in entry:
             t, c = entry.split(":", 1)
             tenant_rules[t.strip()] = c.strip()
+    for r in zb.psql(
+            "SELECT tbl||':'||tenant_col FROM zebridge_catalogue "
+            "WHERE tenant_col IS NOT NULL").splitlines():
+        if ":" in r:
+            t, c = r.split(":", 1)
+            tenant_rules.setdefault(t.strip(), c.strip())
 
     for tbl, col in tenant_rules.items():
         info = zb.psql(
@@ -196,15 +210,15 @@ def main():
             f"WHERE attrelid='public.{tbl}'::regclass AND attname='{col}' AND attnum>0"
         ).strip()
         if not info:
-            bad(f"TENANT_RULES names {tbl}.{col}, which does not exist")
+            bad(f"tenant rule names {tbl}.{col}, which does not exist")
         # ⚠️ `attnotnull::text` renders as 'true'/'false', not psql's usual 't'/'f'. Comparing
         # against 't' reported every NOT NULL column as nullable — a checker that cries wolf
         # is worse than no checker, so accept both spellings.
         elif info not in ("t", "true"):
-            bad(f"TENANT_RULES column {tbl}.{col} is NULLABLE",
+            bad(f"tenant column {tbl}.{col} is NULLABLE",
                 "A NULL tenant belongs to nobody and cannot carry a replica identity.")
         else:
-            zb.ok(f"TENANT_RULES {tbl}:{col} exists and is NOT NULL")
+            zb.ok(f"tenant rule {tbl}:{col} exists and is NOT NULL")
 
     published = [r for r in zb.psql(
         "SELECT tablename FROM pg_publication_tables").splitlines() if r]
@@ -216,9 +230,10 @@ def main():
             f"WHERE attrelid='public.{tbl}'::regclass AND attname='tenant_id' AND attnum>0"
         ).strip()
         if has_tenant:
-            bad(f"'{tbl}' is published and has tenant_id, but no TENANT_RULES entry",
+            bad(f"'{tbl}' is published and has tenant_id, but no tenant rule anywhere",
                 f"It publishes to cdc.{tbl}.<op> with no tenant token, which no tenant-scoped\n"
-                f"consumer filter can match. Set TENANT_RULES={tbl}:tenant_id and restart.")
+                f"consumer filter can match. Declare it: zebridge_enable(..., tenant_col =>\n"
+                f"'tenant_id', dry_run => false), then restart the bridge.")
 
     # ── 7. SYNC_RULES columns exist ───────────────────────────────────────────
     for entry in os.environ.get("SYNC_RULES", "").split(";"):
@@ -234,6 +249,28 @@ def main():
                     "delivery — the client sees a rejection it cannot act on.")
         else:
             zb.ok(f"SYNC_RULES {tbl}: every named column exists")
+
+    # catalogue LWW columns: enable() validated them at write time, but a later
+    # DROP COLUMN invalidates the row silently — same failure shape as SYNC_RULES.
+    for r in zb.psql(
+            "SELECT tbl||'|'||version_col||'|'||COALESCE(tombstone_col::text,'')||'|'||"
+            "COALESCE(tiebreak_col::text,'') FROM zebridge_catalogue").splitlines():
+        parts = r.split("|")
+        if len(parts) != 4:
+            continue
+        tbl = parts[0]
+        exists = zb.psql(
+            f"SELECT 1 FROM pg_class WHERE relname='{tbl}' AND relkind='r'", quiet=True).strip()
+        if not exists:
+            print(f"  ⓘ  catalogue row for '{tbl}' but no such table (dropped? delete the row)")
+            continue
+        for col in [c for c in parts[1:] if c]:
+            if not zb.psql(
+                    "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid "
+                    f"WHERE c.relname='{tbl}' AND a.attname='{col}' AND a.attnum>0", quiet=True).strip():
+                bad(f"catalogue names {tbl}.{col}, which does not exist",
+                    "Every mutation to this table fails permanently and dead-letters on first\n"
+                    "delivery — fix the catalogue row or restore the column.")
 
     # ── 8. replication slots: orphans retain WAL for everyone ─────────────────
     #
@@ -298,16 +335,16 @@ def main():
     if not open_tenant:
         print("  ⓘ  OPEN_TENANT unset — comparing against '_default', the .env.admin default")
         open_tenant = "_default"
-    tenants = set(zb.TOPOLOGY.get("tenants") or [])
+    tenants = set(zb.tenants())
     open_subject = f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{open_tenant}.>"
 
     if re.search(r"[.*> ]", open_tenant):
         bad(f"OPEN_TENANT={open_tenant!r} is not a legal NATS subject token",
             "It becomes `cdc.<OPEN_TENANT>.<table>.<op>`; a dot splits it into two tokens.")
     if open_tenant in tenants:
-        bad(f"OPEN_TENANT={open_tenant!r} is also a declared tenant in topology.json",
-            "nats-init would bind the same subject into two streams, and NATS refuses\n"
-            "overlapping streams — whichever is created second silently does not exist.")
+        bad(f"OPEN_TENANT={open_tenant!r} is also a live tenant (zebridge_user_tenants)",
+            "The bridge's boot reconciliation would bind the same subject into two streams,\n"
+            "and NATS refuses overlapping streams — whichever comes second does not exist.")
 
     if tenants:
         # what NATS actually stores: the public stream's bound subjects
@@ -320,7 +357,7 @@ def main():
             if open_subject not in bound:
                 bad(f"stream {public_stream} does not bind {open_subject} (bound: {bound})",
                     "Rows that opted into no tenant publish there and NO stream captures them.\n"
-                    "Re-run nats-init; it rebuilds the public stream from topology.json + OPEN_TENANT.")
+                    "Restart the bridge; boot reconciles CDC_PUBLIC from the catalogue + OPEN_TENANT.")
             else:
                 zb.ok(f"stream {public_stream} binds {open_subject}")
 

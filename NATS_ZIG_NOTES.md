@@ -75,7 +75,7 @@ cd nats.zig && zig build test                    # 104 + 167 tests pass
 ```
 
 The spike deliberately omits `.stream` so it takes the lookup path. A caller that passes
-`.stream` (as ZeBridge normally would, since topology.json names it) never hits this,
+`.stream` (as ZeBridge normally would, since grammar.json names it) never hits this,
 which is why it survived 249 commits.
 
 

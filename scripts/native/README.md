@@ -10,9 +10,10 @@ section for the full comparison.
 
 Configured identically to `docker-compose.full.yml`'s `postgres-primary` and the
 `nats-config-gen`/`nats-init` services — same PostgreSQL flags, same
-`nats-server.conf.template` rendering, same stream/KV topology from `topology.json`
-— so a native run and a Docker run differ only in the virtualization layer, nothing
-else.
+`nats-server.conf.template` rendering, same MUTATIONS/REQUESTS streams and KV
+buckets from `grammar.json` (the bridge creates and reconciles the CDC/INIT stream
+family itself at boot, from `zebridge_catalogue`) — so a native run and a Docker run
+differ only in the virtualization layer, nothing else.
 
 ## Usage
 

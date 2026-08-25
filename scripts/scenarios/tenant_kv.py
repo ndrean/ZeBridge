@@ -360,7 +360,7 @@ async def main():
     # ── 5. zebridge_user_tenants never reaches CDC ─────────────────────────────
     prefix = (zb.TOPOLOGY.get("cdc_streams") or {}).get("tenant_prefix", "CDC_")
     public_stream = (zb.TOPOLOGY.get("cdc_streams") or {}).get("public", "CDC_PUBLIC")
-    tenant_streams = [f"{prefix}{t.upper()}" for t in (zb.TOPOLOGY.get("tenants") or [])]
+    tenant_streams = [f"{prefix}{t.upper()}" for t in zb.tenants()]
     for stream in [*tenant_streams, public_stream]:
         try:
             info = await admin_js.stream_info(stream)

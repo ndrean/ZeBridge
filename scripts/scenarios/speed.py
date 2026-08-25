@@ -39,7 +39,7 @@ timed bridge starts, so the run measures only what it just inserted.
 
 Usage:  python scripts/scenarios/speed.py [statements] [rows_per_statement]
 
-Reuses `users` — the table topology.json's `public_tables` already names — creating it
+Reuses `users` — the table grammar.json's `public_tables` already names — creating it
 only if genuinely absent; an existing table is left structurally alone and only
 `TRUNCATE`d. Starts its own bridge on the shared probe slot/port and refuses to run if
 another bridge process is already up. Needs DATABASE_URL.
@@ -129,7 +129,7 @@ def settled_baseline(pid: int) -> int:
 def seed_table():
     """Get `users` ready for a burst, WITHOUT assuming this script owns it.
 
-    ⚠️ Never `DROP`/`CREATE` here. `users` is topology.json's own `public_tables` entry —
+    ⚠️ Never `DROP`/`CREATE` here. `users` is grammar.json's own `public_tables` entry —
     a real migrated table in whatever project this runs against, not a throwaway fixture
     this script invented (unlike `wide.py`'s `wide_rows_*` or `decode_integrity.py`'s
     `decode_fixture`, which really are ephemeral and safe to drop). Dropping someone's
@@ -159,8 +159,8 @@ def seed_table():
     ).strip()
     if not in_pub:
         zb.psql(
-            "INSERT INTO public.zebridge_public_tables (tbl, reason) VALUES "
-            f"('public.{TABLE}'::regclass, 'speed.py fixture') ON CONFLICT DO NOTHING; "
+            "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
+            f"('{TABLE}', 'speed.py fixture') ON CONFLICT DO NOTHING; "
             f"ALTER PUBLICATION {PUB} ADD TABLE public.{TABLE};",
             quiet=True,
         )

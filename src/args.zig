@@ -13,7 +13,7 @@ const usage =
     \\  --slot <NAME>   Replication slot name (created if absent)
     \\  --pub <NAME>    PostgreSQL PUBLICATION to stream
     \\  --port <PORT>   HTTP telemetry port
-    \\  --top <PATH>    topology.json to read (default: ./topology.json). Carries every
+    \\  --top <PATH>    grammar.json to read (default: ./grammar.json). Carries every
     \\                  stream, subject and KV name; missing file or key is fatal.
     \\  --strict-tables Refuse to start if any published table lacks a primary key
     \\                  (default: skip the table, keep replicating the rest)
@@ -49,8 +49,12 @@ const usage =
     \\                        orders:tenant_id;invoices:tenant_id
     \\                        A listed table gets its tenant appended to every CDC
     \\                        subject, so reads can be scoped per principal.
-    \\  GENERATION_RULES      which (table, tenant) pairs the generation producer
-    \\                        builds (NOTES.md §1.13); unset disables it:
+    \\  GENERATIONS_ENABLED   1/true: the generation producer derives its table set
+    \\                        from the publication (minus internals, no-PK,
+    \\                        non-routable, opted-out via zebridge_enable) and its
+    \\                        tenants from the data (NOTES.md §1.13)
+    \\  GENERATION_RULES      a RESTRICTION intersected with the derived set —
+    \\                        probes/dev only; also enables the producer by itself:
     \\                        users:_default;test_types:acme,globex
     \\  GENERATION_CADENCE_SECONDS  tick interval (default: 600). A CORRECTNESS
     \\                        parameter: depth × cadence must stay under the
@@ -109,7 +113,7 @@ fn envUint(
 
 /// Command-line arguments structure
 pub const Args = struct {
-    /// Where topology.json is. See `--top`.
+    /// Where grammar.json is. See `--top`.
     topology_path: []const u8,
     http_port: u16,
     http_bind: []const u8,
@@ -200,7 +204,7 @@ pub const Args = struct {
                 "default",
         });
 
-        // `--top` beats TOPOLOGY_PATH beats ./topology.json — the same precedence as
+        // `--top` beats TOPOLOGY_PATH beats ./grammar.json — the same precedence as
         // `--port` over BRIDGE_PORT. Only the *path* is resolved here; reading it is
         // `main`'s job, because a failure there must stop the process with a message,
         // not be folded into argument parsing.
@@ -398,6 +402,10 @@ pub const Args = struct {
         // Generation producer pacing. ⚠️ The cadence is a CORRECTNESS parameter, not a
         // freshness knob: chain depth × cadence must stay under the sweeper's tombstone
         // retention or deltas silently lose deletions (NOTES.md §1.13).
+        runtime_config.generations_enabled = if (init.minimal.environ.getPosix("GENERATIONS_ENABLED")) |v|
+            (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true"))
+        else
+            false;
         runtime_config.generation_cadence_seconds = envUint(
             u64,
             init,
@@ -458,10 +466,13 @@ pub const Args = struct {
 
     /// `GENERATION_RULES=users:_default;test_types:acme,globex`
     ///
-    /// Which (table, tenant) pairs the generation producer builds (NOTES.md §1.13).
-    /// Same grammar as TENANT_RULES, but the columns ARE tenants — explicit on
-    /// purpose: dyntenant.py proved topology.json's tenant list is not the runtime
-    /// truth, so nothing here is derived from it.
+    /// A RESTRICTION, not a source (NOTES.md §1.13). The producer derives its
+    /// membership from the publication (minus internals, no-PK, non-routable,
+    /// opted-out) and its tenants from the data via `zebridge_tenants_of` — this
+    /// variable, when set, only intersects that derived set: probes and dev runs
+    /// scope themselves to one pair without a second list existing to disagree.
+    /// Setting it also enables the producer on its own (implied intent);
+    /// production uses `GENERATIONS_ENABLED=1` with this unset.
     pub fn parseGenerationRules(allocator: std.mem.Allocator, init: *const std.process.Init) !config.EventClassification.TransitionRules {
         return parseTableRules(allocator, init, "GENERATION_RULES");
     }

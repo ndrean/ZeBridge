@@ -55,32 +55,41 @@ by `scripts/scenarios/invalidate.py`, which covers all four caches a migration m
 
 ---
 
-## 1. Vocabulary — `topology.json` is the single source
+## 1. Vocabulary — `grammar.json` is the single source
 
-Every stream, subject and bucket name comes from `topology.json` at the repository
-root. It is compiled into the bridge (via `build.zig` → the `topology` module) and
-consumed by the NATS init scripts and the reference clients.
+Every stream, subject and bucket name comes from `grammar.json` at the repository
+root. The bridge reads it at startup (`src/topology.zig`, `--top` / `TOPOLOGY_PATH`); the
+NATS init scripts and the reference clients read the same file. It carries only the static
+wire grammar — `streams`, `subjects`, `kv`, `cdc_streams`, `init_streams`, `open_tenant`,
+`generations`. Which tables replicate, and their tenancy and LWW columns, is not in this
+file: that lives in `zebridge_catalogue` (§8). The parser still accepts legacy
+`tenants`/`public_tables` keys for a pre-catalogue database — with no `zebridge_catalogue`
+present, the loader logs it and the file/env values stand.
 
 ```json
 {
   "streams":  { "cdc": "CDC", "init": "INIT", "mutations": "MUTATIONS", "requests": "REQUESTS" },
+  "open_tenant": "_default",
+  "cdc_streams":  { "tenant_prefix": "CDC_",  "public": "CDC_PUBLIC" },
+  "init_streams": { "tenant_prefix": "INIT_", "public": "INIT_PUBLIC" },
   "subjects": {
     "cdc_prefix": "cdc",
     "init_prefix": "init",
     "mutations_prefix": "mutation",
     "snapshot_request": "snapshot.request",
-    "snapshot_data_pattern":  "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
-    "snapshot_start_pattern": "init.snap.start.{[table]s}",
-    "snapshot_error_pattern": "init.snap.error.{[table]s}",
-    "snapshot_meta_pattern":  "init.snap.meta.{[table]s}",
-    "snapshot_schema_pattern": "init.snap.schema.{[table]s}.{[snapshot_id]s}"
+    "snapshot_data_pattern":  "init.snap.{[tenant]s}.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
+    "snapshot_start_pattern": "init.snap.{[tenant]s}.start.{[table]s}",
+    "snapshot_error_pattern": "init.snap.{[tenant]s}.error.{[table]s}",
+    "snapshot_meta_pattern":  "init.snap.{[tenant]s}.meta.{[table]s}",
+    "snapshot_schema_pattern": "init.snap.{[tenant]s}.schema.{[table]s}.{[snapshot_id]s}"
   },
-  "kv": { "schemas": "schemas", "snapshots": "snapshots" }
+  "kv": { "schemas": "schemas", "snapshots": "snapshots", "tenants": "tenants" },
+  "generations": { "kv": "generations", "bucket_prefix": "gen-" }
 }
 ```
 
-**Renaming anything here requires rebuilding the bridge *and* re-provisioning the
-NATS server.** The names are baked in at compile time; a change applied to only one
+**Renaming anything here requires restarting the bridge *and* re-provisioning the
+NATS server.** The names are read once at startup; a change applied to only one
 side produces a bridge publishing into a subject space nobody reads, with no error on
 either side.
 
@@ -98,13 +107,17 @@ removed.
 
 | key | read by |
 | --- | --- |
-| `streams.*` | `nats-init` creates them; the bridge names `MUTATIONS` for its ingress consumer |
+| `streams.*` | `nats-init` creates `MUTATIONS` and `REQUESTS`; the bridge names `MUTATIONS` for its ingress consumer |
+| `open_tenant` | bridge (routing for tenant-agnostic tables), clients (the shared subject/KV token) |
+| `cdc_streams.*` / `init_streams.*` | bridge — at boot it creates any missing `CDC_<TENANT>`/`INIT_<TENANT>` pair, sets `CDC_PUBLIC`'s subjects from the catalogue, and ensures `INIT_PUBLIC` exists |
 | `subjects.cdc_prefix` | bridge (CDC subject), clients (subscription) |
-| `subjects.init_prefix` | `nats-init` (INIT stream subjects), clients. Note the snapshot patterns still embed `init.` literally rather than composing from it. |
+| `subjects.init_prefix` | bridge (INIT stream subjects), clients. Note the snapshot patterns still embed `init.` literally rather than composing from it. |
 | `subjects.mutations_prefix` | bridge (consumer filter), `nats-init` (MUTATIONS subjects) |
 | `subjects.snapshot_request` | bridge (subscription), clients (request), `nats-init` (REQUESTS subjects) |
 | `kv.schemas` | bridge (`$KV.schemas.<table>`), clients |
 | `kv.snapshots` | bridge (`$KV.snapshots.<table>`), `nats-init`, clients |
+| `kv.tenants` | bridge (`$KV.tenants.<principal>`), clients |
+| `generations.*` | bridge (generation producer), clients (the `gen-<tenant>` buckets) |
 
 ---
 
@@ -229,10 +242,10 @@ table but resets that column's values.
 
 `version_column` is the column to send back as `version` (§7.3); `tombstone_column` is
 `null` when the table deletes physically rather than softly (§7.5). `tenant_column` is the
-`TENANT_RULES` column name, or `null` for a table every principal reads and writes the same
-content of — every internal `zebridge_*` table, and any business table `TENANT_RULES`
-doesn't name (not the same set as `topology.json`'s `public_tables`, which only lists
-user-schema tables). Drives which token a client uses when it builds a snapshot subject or
+catalogue's `tenant_col` (`zebridge_catalogue`, §8), or `null` for a table every principal
+reads and writes the same content of — every internal `zebridge_*` table, and any table
+whose catalogue row is public (`tenant_col IS NULL`, the reason recorded in
+`public_reason`). Drives which token a client uses when it builds a snapshot subject or
 KV key for that specific table: its own resolved tenant when `tenant_column` is set, the
 shared open-tenant token when it is `null` — without this a client had no way to tell the two
 apart per table and defaulted to its own tenant everywhere, so N principals cached N
@@ -357,7 +370,7 @@ Published when the bridge refuses a table. Two reasons exist:
 | `no_primary_key` | rows cannot be identified, so DELETE is ambiguous (§9) | add a primary key |
 | `unsupported_column_type` | a column's type cannot be decoded and is not an enum (§4) | change or drop that column |
 | `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | restart the bridge with a larger buffer, or move the oversized column out of the table |
-| `no_tenant_column` | `TENANT_RULES` names a column this table does not have | add the column, or correct the rule |
+| `no_tenant_column` | the catalogue names a tenant column this table does not have | add the column, or correct the catalogue row |
 | `tenant_not_in_replica_identity` | the tenant column is outside the replica identity, so a DELETE could not be routed to a tenant at all | add a unique index covering `(tenant, pk)` and point `REPLICA IDENTITY` at it |
 
 ⚠️ **Treat an unrecognised `reason` as "suspended, cause unknown" rather than a parse error** — the set grows, and a client that throws on a new value stops replicating a table it could have simply left alone.
@@ -484,7 +497,7 @@ JetStream deduplicates retries. Batches use
 | DELETE | ⚠️ under `REPLICA IDENTITY DEFAULT`: **the primary key populated, every other column `null`** |
 
 ⚠️ **A table with a tombstone column emits no `cdc.<table>.delete` at all.** If its
-`SYNC_RULES` entry names a tombstone (§7.5), the bridge **drops every physical DELETE** for
+catalogue row names a tombstone (`tombstone_col`, §7.5), the bridge **drops every physical DELETE** for
 that table — not only the sweeper's reaps. Deletes reach clients as an `update` setting the
 tombstone, and the physical removal that follows once the tombstone ages out is
 deliberately not forwarded: the client already removed the row when the soft delete
@@ -996,14 +1009,14 @@ free.** That is the whole list, and it is why it is as long as it is:
 | a return value | the verdict channel (§7.4b) |
 | seeing a row deleted while you were away | tombstones and the GC watermark (§7.5) |
 | a session identity the server already knows | the principal as a subject token the broker vouched for (§7.1) |
-| a server that knows your schema | `SYNC_RULES` and the write contract in the schema (§3) |
+| a server that knows your schema | `zebridge_catalogue` and the write contract in the schema (§3) |
 
 None of these is a preference. Remove any one and the failure is not an error — it is a
 replica that quietly stops matching the database, which is the failure this whole protocol
 exists to prevent.
 
 **And the bill is opt-in.** A deployment that never grants edge writes never leaves the
-five-rule world: no `SYNC_RULES`, no version column, no tombstones, no principal
+five-rule world: no version column, no tombstones, no principal
 mapping — outbound replication only, and §7 does not apply to it. The rules arrive with the
 capability, and they are the price of *offline-capable writes onto an ordinary PostgreSQL
 schema*. Give up either half of that and most of them disappear:
@@ -1553,10 +1566,12 @@ SELECT set_config('zb.principal', 'zb_sweeper', false);  -- this session only
 SELECT zebridge_remove_write_guards('public.users');     -- permanently
 ```
 
-⚠️ **The column names are a second copy of `SYNC_RULES`, and nothing cross-checks them.**
-Name a different column here and the bridge and the database disagree about what "version"
-means, with no error anywhere. `zebridge_audit_write_guards()` lists what is actually
-attached so the two can be compared. Tested by `scripts/scenarios/guards.py`.
+⚠️ **The column names must match that table's catalogue row (`version_col`,
+`tombstone_col`).** `zebridge_enable(...)` writes the row and installs the guards in one
+transaction, so they cannot drift; a direct `zebridge_install_write_guards` call naming a
+different column makes the bridge and the database disagree about what "version" means,
+with no error anywhere. `zebridge_audit_write_guards()` lists what is actually attached so
+the two can be compared. Tested by `scripts/scenarios/guards.py`.
 
 #### Why the sound type is not the default
 
@@ -1602,9 +1617,11 @@ CREATE TABLE public.notes (
   inserted_at timestamptz NOT NULL DEFAULT now(),
   updated_at  timestamptz NOT NULL DEFAULT now()   -- version (item 2)
 );
-GRANT SELECT, INSERT, UPDATE ON public.notes TO bridge_writer;   -- item 4
-ALTER PUBLICATION <pub> ADD TABLE public.notes;
--- and SYNC_RULES=notes:updated_at,deleted_at
+-- one call: catalogue row, grant (item 4), guards, publication — atomically
+SELECT * FROM zebridge_enable('public.notes'::regclass,
+    public_reason => '…', writable => true,
+    version_col => 'updated_at', tombstone_col => 'deleted_at',
+    tiebreak_col => 'last_writer', dry_run => false);
 ```
 
 ⚠️ `timestamptz` for the version column, not `timestamp` — it sidesteps every caveat in
@@ -1629,23 +1646,24 @@ allocates instead (§7.2).
   conflict target, delete-by-key, and the snapshot's keyset pagination — and are the right
   choice for read-only tables. For *writable* ones, prefer a surrogate; see below.
 
-#### `SYNC_RULES` names your columns; the wire names never change
+#### The catalogue names your columns; the wire names never change
 
-One recurring confusion, worth stating once: `SYNC_RULES` maps protocol concepts onto
-*your* schema. Every column name in it is yours to choose. Every payload field name is
-fixed by this protocol.
+One recurring confusion, worth stating once: the catalogue (`zebridge_catalogue`) maps
+protocol concepts onto *your* schema. Every column name in it is yours to choose. Every
+payload field name is fixed by this protocol. (The `SYNC_RULES`/`TENANT_RULES` environment
+variables are optional per-table overrides for emergencies; production leaves them unset.)
 
 ```txt
-SYNC_RULES=orders:updated_at,deleted_at,last_writer
-                  ^^^^^^^^^^ ^^^^^^^^^^ ^^^^^^^^^^^
-                  version    tombstone  tiebreak     — your column names
+version_col   = 'updated_at'    -- version   — your column names
+tombstone_col = 'deleted_at'    -- tombstone
+tiebreak_col  = 'last_writer'   -- tiebreak
 ```
 
 | protocol concept | payload field | column | who writes it |
 | --- | --- | --- | --- |
-| version | `version` | 1st in `SYNC_RULES` (default `updated_at`) | the bridge, from the field |
-| tombstone | *(none)* | 2nd, optional | the bridge, on a delete |
-| tiebreak | `client_id` | 3rd, optional | the bridge, from the field |
+| version | `version` | `version_col` (default `updated_at`) | the bridge, from the field |
+| tombstone | *(none)* | `tombstone_col`, optional | the bridge, on a delete |
+| tiebreak | `client_id` | `tiebreak_col`, optional | the bridge, from the field |
 | primary key | `key` | from the catalog | the client, in `data` |
 
 ⚠️ The bridge stamps the version and tiebreak columns **from the envelope**, and ignores
@@ -1653,11 +1671,11 @@ them in `data`. A client that sets `last_writer` directly is not honoured — ot
 could claim any identity when a tie is broken, which is the same forgery the version column
 is protected from.
 
-**2. A version column that changes on every write.** `updated_at` by default; override per
-table with `SYNC_RULES`. Its *type* decides whether LWW is sound — see §7.3, and note the
+**2. A version column that changes on every write.** `updated_at` by default; set per
+table in the catalogue (`version_col`). Its *type* decides whether LWW is sound — see §7.3, and note the
 common case (`timestamp without time zone`) is the one with caveats.
 
-**2b. A tiebreak column, if equal versions are possible.** ✅ Third field in `SYNC_RULES`.
+**2b. A tiebreak column, if equal versions are possible.** ✅ `tiebreak_col` in the catalogue.
 Without one, two writes carrying the *same* version are both **refused** — which is not a
 resolution: two replicas each holding the other's row refuse each other forever, silently.
 With one, the higher `client_id` wins, and the winner's id is stored so the comparison is
@@ -1674,7 +1692,7 @@ the property that makes replicas converge rather than race.
 **3. A tombstone column, if deletes must survive offline clients.** Without one a delete is
 physical, and an offline client's queued edit **resurrects the row** — there is no "row not
 found" on this path (see below). With one, the delete is a soft delete that LWW can
-overrule. Configured as the second column in that table's `SYNC_RULES` entry (§7.5).
+overrule. Configured as that table's `tombstone_col` in the catalogue (§7.5).
 
 **4. A grant.** `bridge_writer` starts with no table privileges, deliberately:
 
@@ -1918,7 +1936,7 @@ line above it, so the two directions answer each other.
 | `zebridge_ddl_events` | table | DDL transport — the **INSERT** is what reaches the bridge over the WAL | drop it and schema changes stop reaching clients |
 | `zebridge_gc_watermark` | table | one row; the GC watermark clients read before flushing an outbox (§7.5) | unpublish it and clients cannot tell whether a queued write is safe |
 | `zebridge_user_tenants` | table | principal → tenant, the mapping RLS resolves against (§7.4) | the reach of every principal, including the sweeper, is defined here |
-| `zebridge_public_tables` | table | tables deliberately readable by everyone | the record of who decided a table is public, and why |
+| `zebridge_catalogue` | table | one row per replicated table: a tenant column *or* a recorded `public_reason` (the CHECK forbids neither), plus the LWW columns | the config is a table — the bridge's rule maps and the sweeper's sweep set load from it; written by `zebridge_enable(...)` in the same transaction as the guards |
 | `zebridge_grant_edge_writes(regclass)` | function | opens one table to edge writes (§7.4) | the only supported way; refuses `zebridge_ddl_events` by name |
 | `zebridge_scope_publication_to_one_tenant(...)` | function | publishes a tenant-scoped table, policies first | ordering is load-bearing — it creates RLS *before* publishing |
 | `zebridge_publication_guard` | event trigger | refuses a bare `ALTER PUBLICATION ... ADD TABLE` | an unscoped publish sends every row to every subscriber, silently |
@@ -1929,8 +1947,8 @@ line above it, so the two directions answer each other.
 | `zebridge_is_internal_table(text)` | function | keeps the tracker's own rows out of the DDL feed | ⚠️ `zebridge_gc_watermark` is deliberately **not** internal — clients need it |
 | `zebridge_install_write_guards(regclass, text, text)` | function | attaches the `BEFORE UPDATE` / `BEFORE DELETE` guards to one table (§7.3) | the version is only true if *every* writer stamps it, not just the bridge |
 | `zebridge_remove_write_guards(regclass)` | function | takes them off again | ⚠️ needed more often than it looks — with the delete guard on, only the sweeper can physically delete |
-| `zebridge_bump_version()` / `zebridge_soft_delete()` | trigger functions | the guards themselves | attached per table, never globally; the column names must match that table's `SYNC_RULES` |
-| `zebridge_audit_write_guards()` | function | *which tables are guarded, on which columns?* | the guard columns duplicate `SYNC_RULES` and nothing cross-checks them — this is how you compare |
+| `zebridge_bump_version()` / `zebridge_soft_delete()` | trigger functions | the guards themselves | attached per table, never globally; the column names must match that table's catalogue row |
+| `zebridge_audit_write_guards()` | function | *which tables are guarded, on which columns?* | the guard columns must match the catalogue's `version_col`/`tombstone_col` — this is how you compare |
 
 ⚠️ **None of these are optional**, and none fail loudly if removed. Dropping the guard does
 not break the bridge — it removes a refusal. Unpublishing the watermark does not error — it
@@ -1952,7 +1970,7 @@ Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 | `TRANSITION_RULES` without `FULL` | ⚠️ transitions can never fire — silently inert |
 | column of an unsupported type | 🔴 **suspended** (`unsupported_column_type`) — CDC dropped, snapshots refused (§6) |
 | a row wider than the per-event buffer | 🔴 **suspended** (`row_too_large`) — the row fits no NATS message, so neither CDC nor a snapshot can carry it. Fix by moving the oversized column out of the replicated table, or by raising `BASE_BUF` within what `max_payload` allows |
-| `TENANT_RULES` names a column the table lacks | 🔴 **suspended** (`no_tenant_column`) |
+| the catalogue names a tenant column the table lacks | 🔴 **suspended** (`no_tenant_column`) |
 | the tenant column is outside the replica identity | 🔴 **suspended** (`tenant_not_in_replica_identity`) — a DELETE would carry the key and nothing else, so it could not be routed to a tenant at all and rows would stay in every replica that held them |
 
 ⚠️ These five strings are the `reason` field of the suspension payload (§3). A client

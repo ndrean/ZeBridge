@@ -33,19 +33,13 @@ NUMERIC to its declared scale to match PostgreSQL's own `::text` (see `padNumeri
 doc comment), but the CDC path does not, so a byte-string comparison would fail on a
 padding difference that is not a bug. Decimal equality still catches a wrong value.
 
-⚠️ `decode_fixture` is a table this script invents, and `zebridge_public_tables` /
-`ALTER PUBLICATION` (Postgres) is only *half* of making a table's CDC reach a client —
-the other half is a NATS stream whose `--subjects` actually covers `cdc.decode_fixture.>`
-(SECURITY.md's T4 step). `register_nats_subject`/`unregister_nats_subject` do that
-against `CDC_PUBLIC`. Skipping it doesn't fail loudly: the bridge's `js.publish()` calls
-still go out, still time out waiting for a PubAck no stream can ever send, retry with
-backoff, and eventually hit `FATAL: Exhausted retries` — while this script's own
-`cdc.>` subscription is a *core* NATS subscribe, which receives every published message
-regardless of whether any stream claims its subject. So a run missing this step can
-still look like rows arrived correctly right up until concurrent load makes the bridge's
-retries fall behind — indistinguishable, from the bridge's log alone, from a slow or
-flaky NATS server. (It took several hours and a request-timeout increase that turned out
-to be unnecessary to find this the first time.)
+⚠️ `decode_fixture` is a table this script invents. Its catalogue row is written
+BEFORE the probe bridge starts: the bridge derives the public set from
+`zebridge_catalogue` at boot and reconciles CDC_PUBLIC's subject filter itself, so
+the row IS the registration — the `nats stream edit` half this scenario used to do
+by hand (and once lost several hours to, when it was skipped and every publish
+timed out unacked) is now the bridge's own boot step, and check 0 asserts it
+happened rather than performing it.
 
 Usage:  python scripts/scenarios/decode_integrity.py [row_count]
 
@@ -72,40 +66,6 @@ CDC_PUBLIC_STREAM = "CDC_PUBLIC"
 FIXTURE_SUBJECT = f"cdc.{TABLE}.>"
 
 
-def _cdc_public_subjects() -> list[str]:
-    res = zb.nats_cli("stream", "info", CDC_PUBLIC_STREAM, "--json")
-    if res.returncode != 0:
-        sys.exit(f"could not read {CDC_PUBLIC_STREAM}'s subjects: {res.stderr.strip()}")
-    return json.loads(res.stdout)["config"]["subjects"]
-
-
-def register_nats_subject():
-    """The NATS-side half of onboarding a public table (SECURITY.md's T4 step).
-
-    ⚠️ `zebridge_public_tables` (Postgres) and a stream's `--subjects` (NATS) are two
-    separate registrations, and only the first is inside this script's `seed()`. Without
-    this, `cdc.decode_fixture.>` matches no stream: the bridge's `js.publish()` calls
-    have nothing to ACK them and time out on every single publish, indistinguishably
-    from an actually slow or broken server — which is exactly what made this look like a
-    nats.zig / Docker-I/O bug for several hours before the subject list was checked.
-    """
-    subjects = _cdc_public_subjects()
-    if FIXTURE_SUBJECT in subjects:
-        return
-    updated = subjects + [FIXTURE_SUBJECT]
-    res = zb.nats_cli("stream", "edit", CDC_PUBLIC_STREAM, f"--subjects={','.join(updated)}", "-f")
-    if res.returncode != 0:
-        sys.exit(f"could not add {FIXTURE_SUBJECT} to {CDC_PUBLIC_STREAM}: {res.stderr.strip()}")
-
-
-def unregister_nats_subject():
-    """Leave the stream exactly as this scenario found it."""
-    subjects = _cdc_public_subjects()
-    if FIXTURE_SUBJECT not in subjects:
-        return
-    updated = [s for s in subjects if s != FIXTURE_SUBJECT]
-    zb.nats_cli("stream", "edit", CDC_PUBLIC_STREAM, f"--subjects={','.join(updated)}", "-f")
-
 # Comfortably past one page, so a run of these forces the WAL-message arena
 # (bridge.zig's `arena.reset(.retain_capacity)`, once per WAL message — not per row) to
 # grow mid-transaction rather than settle into one steady allocation reused untouched.
@@ -122,8 +82,6 @@ def seed(n: int):
         "  id uuid PRIMARY KEY, idx int NOT NULL, label text NOT NULL, "
         "  doc jsonb NOT NULL, amount numeric(20,8) NOT NULL, "
         f"  kind {KIND_TYPE} NOT NULL); "
-        "INSERT INTO public.zebridge_public_tables (tbl, reason) VALUES "
-        f"('public.{TABLE}'::regclass, 'decode_integrity.py fixture') ON CONFLICT DO NOTHING; "
         f"ALTER PUBLICATION {PUB} ADD TABLE public.{TABLE};",
         quiet=True,
     )
@@ -316,26 +274,26 @@ async def main():
             "subscription sees exactly this run's inserts.\n    pkill -f zig-out/bin/bridge"
         )
 
-    # ⚠️ Three registrations make a public table reachable, not two. Postgres
-    # (`zebridge_public_tables` + publication, in seed()) and the NATS stream's subjects
-    # (register_nats_subject) both existed here already — but since §2.19 the bridge
-    # itself refuses any table that is neither tenant-scoped nor in **topology.json's**
-    # `public_tables`, *before* attempting a publish that could never be acked. This
-    # scenario predates that check and silently lost its CDC path to it (`REFUSING
-    # 'decode_fixture': not ... in topology.json's public_tables`, bridge log). The
-    # bridge this scenario starts is its own, so it gets its own topology: the repo's
-    # file with the fixture appended, via TOPOLOGY_PATH — the deployed topology.json is
-    # never touched.
-    topo = json.loads(pathlib.Path(zb.ROOT / "topology.json").read_text())
-    topo["public_tables"] = topo.get("public_tables", []) + [TABLE]
-    topo_path = SCRATCH / "decode_integrity.topology.json"
-    topo_path.write_text(json.dumps(topo))
+    # ONE declaration makes a public table reachable now: its catalogue row,
+    # written BEFORE the probe boots. The bridge derives the public set from
+    # `zebridge_catalogue` at boot (grammar.json no longer carries a table list)
+    # and reconciles CDC_PUBLIC's subject filter to it — the temp-topology and
+    # stream-edit machinery this scenario used to need are both gone.
+    zb.psql(
+        "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
+        f"('{TABLE}', 'decode_integrity.py fixture') ON CONFLICT (tbl) DO NOTHING",
+        quiet=True)
 
     try:
-        register_nats_subject()
-        with zb.Bridge(SCRATCH / "decode_integrity.log", TOPOLOGY_PATH=str(topo_path)) as br:
+        with zb.Bridge(SCRATCH / "decode_integrity.log") as br:
             if not br.wait_for_log("Replication started successfully", timeout=60):
                 sys.exit(f"could not start a bridge — see {SCRATCH / 'decode_integrity.log'}")
+
+            info = zb.nats_cli("stream", "info", CDC_PUBLIC_STREAM, "--json")
+            bound = json.loads(info.stdout)["config"]["subjects"] if info.returncode == 0 else []
+            if FIXTURE_SUBJECT not in bound:
+                sys.exit(f"boot reconciliation did not bind {FIXTURE_SUBJECT} (bound: {bound})")
+            print(f"0. boot reconciliation bound {FIXTURE_SUBJECT} in {CDC_PUBLIC_STREAM}")
 
             nc = await zb.connect()
             try:
@@ -354,12 +312,12 @@ async def main():
             finally:
                 await nc.close()
     finally:
-        topo_path.unlink(missing_ok=True)
-        unregister_nats_subject()
+        # CDC_PUBLIC keeps the fixture subject until the NEXT bridge boot reconciles
+        # it away — restart your bridge after this scenario.
         zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
         zb.psql(f"DROP TYPE IF EXISTS {KIND_TYPE}", quiet=True)
         zb.psql(
-            "DELETE FROM public.zebridge_public_tables WHERE reason = "
+            "DELETE FROM public.zebridge_catalogue WHERE public_reason = "
             "'decode_integrity.py fixture'",
             quiet=True,
         )

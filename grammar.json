@@ -5,16 +5,6 @@
     "mutations": "MUTATIONS",
     "requests": "REQUESTS"
   },
-  "public_tables": [
-    "users",
-    "counter_public",
-    "zebridge_gc_watermark",
-    "orders"
-  ],
-  "tenants": [
-    "acme",
-    "globex"
-  ],
   "open_tenant": "_default",
   "cdc_streams": {
     "tenant_prefix": "CDC_",

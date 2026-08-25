@@ -117,7 +117,7 @@ pub const EventProcessor = struct {
     /// OID → typtype, populated from DDL events and at boot. The CDC decoder consults
     /// it for any type its switch does not cover; see type_registry.zig.
     types: *TypeRegistry.Registry,
-    /// Wire names, read from topology.json at startup. See src/topology.zig.
+    /// Wire names, read from grammar.json at startup. See src/topology.zig.
     topology: *const Topology.Topology,
     /// Per-table version-column overrides and the global default, for the edge-writability
     /// report a table gets when it appears after boot. Same two values preflight uses.
@@ -1202,7 +1202,7 @@ pub const EventProcessor = struct {
         }
 
         // Refuse a table whose CDC subject has nowhere to go — neither tenant-scoped
-        // nor in `topology.json`'s `public_tables`. Checked *before* attempting to
+        // nor marked public in the catalogue. Checked *before* attempting to
         // publish anything for it: found live, a publish to an unrouted subject does
         // not fail fast, it blocks for the full publish timeout, retries the identical
         // dead end, and enough of that exhausts the bridge's retry budget and
@@ -1220,7 +1220,7 @@ pub const EventProcessor = struct {
             !self.topology.isCdcRoutable(clean_table, self.tenant_rules.contains(clean_table)))
         {
             log.err(
-                "🔴 REFUSING '{s}': not tenant-scoped and not in topology.json's public_tables — its CDC subject matches no stream. Publishing would block on every write. Add it to public_tables and CDC_PUBLIC's subjects, or set TENANT_RULES for it.",
+                "🔴 REFUSING '{s}': not tenant-scoped and no catalogue row marks it public — its CDC subject matches no stream. Publishing would block on every write. Declare it (zebridge_enable with public_reason or tenant_col) and restart the bridge.",
                 .{clean_table},
             );
             self.refused.refuse(clean_table, .no_cdc_subject) catch |err| {

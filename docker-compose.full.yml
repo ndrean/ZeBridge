@@ -155,7 +155,7 @@ services:
       - ZB_NATS_CONF=/config/nats-server.conf
     volumes:
       - ./scripts:/scripts:ro
-      - ./topology.json:/topology.json:ro
+      - ./grammar.json:/grammar.json:ro
       - nats-config:/config:ro
     working_dir: /scripts/scenarios
     command:
@@ -236,21 +236,21 @@ services:
         # Stream NAMES as well as subjects: the bridge compiles both from this same
         # file (build.zig -> the "topology" module), so a rename here moves both ends
         # together. Hardcoding the names here is what let them drift before.
-        echo 'Reading streams from topology.json...'
-        CDC_STREAM=$(jq -r '.streams.cdc' /topology.json)
-        INIT_STREAM=$(jq -r '.streams.init' /topology.json)
-        REQUESTS_STREAM=$(jq -r '.streams.requests' /topology.json)
-        MUTATIONS_STREAM=$(jq -r '.streams.mutations' /topology.json)
-        CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' /topology.json)
-        INIT_PREFIX=$(jq -r '.subjects.init_prefix' /topology.json)
-        REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' /topology.json)
-        MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' /topology.json)
-        MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' /topology.json)
-        MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' /topology.json)
-        SCHEMA_KV=$(jq -r '.kv.schemas' /topology.json)
-        SNAPSHOT_KV=$(jq -r '.kv.snapshots' /topology.json)
-        TENANTS_KV=$(jq -r '.kv.tenants' /topology.json)
-        GENERATIONS_KV=$(jq -r '.generations.kv' /topology.json)
+        echo 'Reading streams from grammar.json...'
+        CDC_STREAM=$(jq -r '.streams.cdc' /grammar.json)
+        INIT_STREAM=$(jq -r '.streams.init' /grammar.json)
+        REQUESTS_STREAM=$(jq -r '.streams.requests' /grammar.json)
+        MUTATIONS_STREAM=$(jq -r '.streams.mutations' /grammar.json)
+        CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' /grammar.json)
+        INIT_PREFIX=$(jq -r '.subjects.init_prefix' /grammar.json)
+        REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' /grammar.json)
+        MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' /grammar.json)
+        MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' /grammar.json)
+        MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' /grammar.json)
+        SCHEMA_KV=$(jq -r '.kv.schemas' /grammar.json)
+        SNAPSHOT_KV=$(jq -r '.kv.snapshots' /grammar.json)
+        TENANTS_KV=$(jq -r '.kv.tenants' /grammar.json)
+        GENERATIONS_KV=$(jq -r '.generations.kv' /grammar.json)
 
         # ── CDC is SPLIT PER TENANT, and that is a security boundary, not tidiness ──
         #
@@ -272,15 +272,13 @@ services:
         # The bridge does not change: JetStream binds streams to subjects and the bridge
         # already publishes `cdc.<tenant>.<table>.<op>`. Each message lands in exactly one
         # stream — no duplication.
-        TENANT_PREFIX=$(jq -r '.cdc_streams.tenant_prefix' /topology.json)
-        PUBLIC_STREAM=$(jq -r '.cdc_streams.public' /topology.json)
 
         # ⚠️ Only split when tenants are declared. An untenanted deployment has no
         # `cdc.<tenant>.…` subjects at all, so per-tenant streams would capture nothing and
         # removing the wide stream would leave the change feed with nowhere to land.
-        TENANT_COUNT=$(jq -r '(.tenants // []) | length' /topology.json)
+        TENANT_COUNT=$(jq -r '(.tenants // []) | length' /grammar.json)
         if [ "$$TENANT_COUNT" = "0" ]; then
-          echo "No tenants declared in topology.json — keeping the single wide stream $$CDC_STREAM"
+          echo "No tenants declared in grammar.json — keeping the single wide stream $$CDC_STREAM"
           nats stream add $$CDC_STREAM --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=8d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
         else
 
@@ -292,15 +290,10 @@ services:
           nats stream rm $$CDC_STREAM -f || true
         fi
 
-        for T in $(jq -r '.tenants[]' /topology.json); do
-          UPPER=$(echo "$$T" | tr '[:lower:]' '[:upper:]')
-          echo "Creating per-tenant CDC stream: $$TENANT_PREFIX$$UPPER (subject: $$CDC_PREFIX.$$T.>)"
-          nats stream add $$TENANT_PREFIX$$UPPER --subjects="$$CDC_PREFIX.$$T.>" --storage=file --retention=limits --max-age=8d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
-        done
 
         # Tables with no tenant column publish on the bare `cdc.<table>.<op>` subject, so
         # they belong to no tenant stream. One shared stream carries them, granted to every
-        # principal — which is what `zebridge_public_tables` already declares them to be.
+        # principal — which is what `zebridge_catalogue` already declares them to be.
         #
         # ⚠️ Plus `cdc.<OPEN_TENANT>.>`: the open tenant, the token `zebridge_guard_tenant()`
         # writes when a tenant column arrives NULL or empty. It is a tenant no declared
@@ -316,23 +309,16 @@ services:
         esac
         # A declared tenant with the same name would get its own stream on the same subject,
         # and NATS refuses overlapping streams — leaving whichever came second uncreated.
-        if jq -e --arg o "$$OPEN_TENANT" '(.tenants // []) | index($$o) != null' /topology.json >/dev/null; then
-          echo "✗ OPEN_TENANT='$${OPEN_TENANT}' is also a declared tenant in topology.json — pick one" >&2
+        if jq -e --arg o "$$OPEN_TENANT" '(.tenants // []) | index($$o) != null' /grammar.json >/dev/null; then
+          echo "✗ OPEN_TENANT='$${OPEN_TENANT}' is also a declared tenant in grammar.json — pick one" >&2
           exit 1
         fi
-        PUBLIC_SUBJECTS=$(jq -r --arg p "$$CDC_PREFIX" --arg o "$$OPEN_TENANT" '[.public_tables[] | $$p + "." + . + ".>"] + [$$p + "." + $$o + ".>"] | join(",")' /topology.json)
-        # ⚠️ EDIT when it already exists. Every other `stream add … || true` here is idempotent
-        # because the stream's config never changes; this one's subject list is DERIVED —
+        # CDC_PUBLIC / INIT_PUBLIC / per-tenant streams: created and reconciled by the
+        # BRIDGE at boot from zebridge_catalogue + zebridge_user_tenants.
         # from public_tables and OPEN_TENANT — and `add` on an existing stream with a
         # different config is an error the `|| true` would swallow, leaving the old binding
         # in place and check.py §9 red after every re-run. Subjects only: limits are left
         # as they are.
-        if nats stream info $$PUBLIC_STREAM --json >/dev/null 2>&1; then
-          echo "Updating public CDC stream: $$PUBLIC_STREAM (subjects: $$PUBLIC_SUBJECTS)"
-          nats stream edit $$PUBLIC_STREAM --subjects="$$PUBLIC_SUBJECTS" -f || true
-        else
-          echo "Creating public CDC stream: $$PUBLIC_STREAM (subjects: $$PUBLIC_SUBJECTS)"
-          nats stream add $$PUBLIC_STREAM --subjects="$$PUBLIC_SUBJECTS" --storage=file --retention=limits --max-age=8d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
         fi
         fi
 
@@ -349,7 +335,7 @@ services:
         # Subject shape: `init.snap.<tenant>.<table>...` — tenant right after `snap`,
         # uniformly, so `init.snap.acme.>` alone catches the data chunks AND the
         # start/error/meta/schema-for-that-dump subjects, which all share the same
-        # prefix by design (see topology.json). INIT_PUBLIC carries the `_default`-tenant
+        # prefix by design (see grammar.json). INIT_PUBLIC carries the `_default`-tenant
         # snapshot data — open-tenant rows of a tenant-scoped table, and genuinely public
         # tables, which use the same open token for snapshots since there is no tenant
         # column to filter a public table's content by regardless of which stream its
@@ -357,11 +343,9 @@ services:
         # (`init.schema.<table>` — the on-demand live table-shape descriptor request —
         # used to share this stream too; the bridge no longer listens on that subject at
         # all, so it is no longer part of this filter — see NOTES.md/PROTOCOL.md.)
-        INIT_TENANT_PREFIX=$(jq -r '.init_streams.tenant_prefix' /topology.json)
-        INIT_PUBLIC_STREAM=$(jq -r '.init_streams.public' /topology.json)
 
         if [ "$$TENANT_COUNT" = "0" ]; then
-          echo "No tenants declared in topology.json — keeping the single wide stream $$INIT_STREAM"
+          echo "No tenants declared in grammar.json — keeping the single wide stream $$INIT_STREAM"
           nats stream add $$INIT_STREAM --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
         else
 
@@ -370,19 +354,7 @@ services:
           nats stream rm $$INIT_STREAM -f || true
         fi
 
-        for T in $(jq -r '.tenants[]' /topology.json); do
-          UPPER=$(echo "$$T" | tr '[:lower:]' '[:upper:]')
-          echo "Creating per-tenant INIT stream: $$INIT_TENANT_PREFIX$$UPPER (subject: $$INIT_PREFIX.snap.$$T.>)"
-          nats stream add $$INIT_TENANT_PREFIX$$UPPER --subjects="$$INIT_PREFIX.snap.$$T.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
-        done
 
-        INIT_PUBLIC_SUBJECTS="$$INIT_PREFIX.snap.$${OPEN_TENANT}.>"
-        if nats stream info $$INIT_PUBLIC_STREAM --json >/dev/null 2>&1; then
-          echo "Updating public INIT stream: $$INIT_PUBLIC_STREAM (subjects: $$INIT_PUBLIC_SUBJECTS)"
-          nats stream edit $$INIT_PUBLIC_STREAM --subjects="$$INIT_PUBLIC_SUBJECTS" -f || true
-        else
-          echo "Creating public INIT stream: $$INIT_PUBLIC_STREAM (subjects: $$INIT_PUBLIC_SUBJECTS)"
-          nats stream add $$INIT_PUBLIC_STREAM --subjects="$$INIT_PUBLIC_SUBJECTS" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
         fi
         fi
 
@@ -447,7 +419,7 @@ services:
         exit 0
     restart: "no"
     volumes:
-      - ./topology.json:/topology.json:ro
+      - ./grammar.json:/grammar.json:ro
 
   # 6. Primary Postgres Initialization (Creates publication, users, test tables)
   bridge-init:

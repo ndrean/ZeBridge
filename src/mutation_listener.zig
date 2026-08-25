@@ -202,7 +202,7 @@ pub const MutationListener = struct {
     /// `DATABASE_URL` (kept in `PgConf.db_url`) and `sslmode`. With a URL set, every
     /// other component connected where it said and this thread dialled the PG_* defaults.
     pg_config: *const pg_conn.PgConf,
-    /// Wire names, read from topology.json at startup. See src/topology.zig.
+    /// Wire names, read from grammar.json at startup. See src/topology.zig.
     endpoint_topology: *const Topology.Topology,
     /// Where NATS is, resolved once in `bridge.zig`. This used to be `nats_host` read
     /// straight off RuntimeConfig **with no port at all**, so `NATS_URL` was ignored on
@@ -352,7 +352,7 @@ pub const MutationListener = struct {
 
         var js = nats.JetStream.init(conn_nats, .{});
 
-        // `.stream` given explicitly rather than derived from the subject: topology.json
+        // `.stream` given explicitly rather than derived from the subject: grammar.json
         // names it, and the lookup path allocates a name the subscription then owns (see
         // nats.zig/NOTES.md #1).
         const consumer = js.pullSubscribe(

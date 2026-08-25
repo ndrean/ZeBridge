@@ -824,7 +824,7 @@ pub fn run(
     /// Records the per-table edge-writability verdict (§1.11) for `appendWriteContract`
     /// to publish.
     writable: *WritableTables.Registry,
-    /// `public_tables` — what `isCdcRoutable` checks an untenanted table against.
+    /// the catalogue's public set — what `isCdcRoutable` checks an untenanted table against.
     topology: *const Topology.Topology,
 ) !Summary {
     var standard_config = pg_config.*;
@@ -923,8 +923,8 @@ pub fn run(
     }
 
     // A second pass, over every published table regardless of PK/identity findings —
-    // CDC-routability is orthogonal to those. Checked at boot so a table left out of
-    // `public_tables` (and not tenant-scoped) is refused before the first WAL byte
+    // CDC-routability is orthogonal to those. Checked at boot so a table the catalogue
+    // does not mark public (and not tenant-scoped) is refused before the first WAL byte
     // arrives, the same reasoning `no_primary_key` above already uses: publishing to an
     // unrouted subject blocks for the full publish timeout rather than failing fast,
     // and enough of that exhausts the bridge's retry budget and self-terminates.
@@ -945,7 +945,7 @@ pub fn run(
             continue;
         };
         log.err(
-            "🔴 REFUSING '{s}': not tenant-scoped and not in topology.json's public_tables — its CDC subject matches no stream. Publishing would block on every write. Add it to public_tables and CDC_PUBLIC's subjects, or set TENANT_RULES for it.",
+            "🔴 REFUSING '{s}': not tenant-scoped and no catalogue row marks it public — its CDC subject matches no stream. Publishing would block on every write. Declare it (zebridge_enable with public_reason or tenant_col) and restart the bridge.",
             .{table},
         );
     }

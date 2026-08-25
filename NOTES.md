@@ -1556,6 +1556,108 @@ gen numbering restarted. The lesson generalizes: the guard's comparability is pa
 of the wire contract — any value the guard touches must have ONE canonical text
 form across every path that can write the column.
 
+**Retirement carries two survivors (2026-08-25).** (1) `measureWidestRow` lives in
+the snapshot listener but protects CDC: a row at or above the message budget
+suspends the table (unreplicable, not just unsnapshottable). Retiring the snapshot
+path must MOVE this check into the generation producer's build transaction (same
+REPEATABLE READ, same cheap `octet_length`-on-TOAST trick, same suspension
+publish), not delete it. (2) Size guards differ per path by design: objects have no
+per-message budget — the object store chunks the payload into 128 KiB stream
+messages, so wire overflow cannot happen — but generation builds are memory-bound
+instead (libpq buffers the full SELECT, the arena holds the full payload ≈ 2× table
+size on the bridge; getBlob + decode ≈ 2× on the client). The 100M-row remedy is
+already half-shipped: nats.zig's `ObjectStore.put(meta, reader)` streams (putBytes
+is its wrapper), so cursor-FETCH batches + incremental encode give a constant-memory
+producer, and the JS lib's `get()` already returns a ReadableStream for the client
+half. Gate it behind that table's `zebridge_generation_overrides` row when the day
+comes.
+
+**Case C CLOSED (2026-08-25): the width guard, both doors, one trigger.**
+`zebridge_install_width_guard(tbl)` — installed by `zebridge_enable` as its own
+step — generates a STATIC per-table BEFORE INSERT/UPDATE trigger over unbounded
+columns only (text, unbounded varchar, bytea ×2 for the hex rendering,
+json/jsonb/xml, arrays; a bounded-only table gets NO trigger — statically safe,
+zero hot-path cost; live: users needed none, test_types guards 4 columns). Budget
+in the one-row `zebridge_limits` table (internal-listed, default 16384 = 2^BASE_BUF
+— one UPDATE when BASE_BUF changes, not a re-install). It RAISEs ERRCODE 23514
+(check_violation): class 23 is already in the mutation listener's permanent set, so
+fix 2 cost ZERO bridge code — an edge write becomes verdict `rejected`/23514, a
+psql write an ordinary ERROR, both atomic in the writer's own transaction. Fix 1
+(the measureWidestRow retirement survivor) landed as a zero-cost measurement in the
+generation producer's encode loop: a legacy row at or over the buffer logs a loud
+per-build warning (chains carry it; CDC will suspend on touch). Proven by
+`scripts/scenarios/widthguard.py` (6/6) and end-to-end from the browser. Three
+deployment lessons paid for on the way: (1) the generated trigger MUST be
+SECURITY DEFINER with a pinned search_path — it reads `zebridge_limits` as whoever
+writes the row, and bridge_writer had no grant: every guarded edge write died 42501
+until then; (2) jsonb travels the mutation wire as a JSON STRING — nested maps are
+refused (`UnsupportedPayloadType`), scalars only, by design; (3) a test minting
+hardcoded FUTURE versions collides with the version clamp and loses to LWW as
+`stale` before the guard is asked — clamp and LWW both behaved per spec while
+refuting a broken test. Still queued from the original trace: nothing — the
+producer detects, the trigger prevents, the verdict charges the sender.
+Coverage closed same day: `legacybait.py` (7/7) exercises the three matrix cells
+`widthguard.py` cannot reach — detector warning, decode quarantine + suspended KV
+key, boot-preflight re-derivation — and proves the de-quarantine recipe
+(repair → reboot → readmitted, key thawed). SECURITY.md §1.8 now cites a scenario
+per cell; the untested cells were themselves found by demanding the citations.
+
+**(Superseded trace, kept for the reasoning) Case C — the accepted-then-freeze path (2026-08-25, found by asking, not yet by
+test).** A row oversized vs BASE_BUF but loaded by a BACKEND writer rides the
+generation chain to every client (no per-row ceiling exists on that path — object
+chunking removes it), where it looks editable. A consumer edit touching only small
+columns then passes the ingress guard (which measures the PAYLOAD, and says so),
+is APPLIED to PostgreSQL, answered `accepted` — and the CDC event for the full row
+suspends the table for every reader. Worst ordering: refusal after commitment.
+Mitigations: (B) usually saves us — pgoutput elides unchanged TOASTed values, so a
+genuinely TOASTed blob edits cleanly around itself; the bad case is INLINE width
+(many mid-size columns). Three fixes, by depth: (1) the widest-row check moving
+into the producer (already queued) is really about refusing to SEED BAIT — the
+snapshot path used to catch this before any client held the row; (2) NEW: a
+post-apply width check in the writer's transaction — `octet_length` sum on the
+resulting row, over budget → ROLLBACK → verdict `rejected` — makes edge writes
+categorically unable to suspend a table (judge vs burst benchmark first);
+(3) the `zebridge_enable` width trigger stops backend writers creating the bait
+at all. Until (1)+(2) land, generations quietly widened the exposure the snapshot
+path's measureWidestRow used to close.
+
+**The oversize row, exercised end-to-end from the browser (2026-08-25).** A 20 KB
+mutation against the 16 KB event buffer, driven through `libzb`'s `mutate()`:
+MUTATIONS accepted it (PubAck), the listener refused it before PostgreSQL
+("20274 bytes exceeds the 16384-byte CDC event buffer... not retrying"), one
+dead-letter, verdict `rejected (RowTooLargeToReplicate)`, and the client reverted
+the optimistic row — appear, verdict, vanish, outbox empty, PG untouched. Nothing
+sneaks into the system; the refused row's brief local visibility is the designed
+optimistic window, and the revert is the answer to "is display OK?" — a row that
+will never echo must not linger. Getting there surfaced TWO client bugs the
+server-side scenarios (rowsize.py covers the guard itself) could never see:
+(1) INHERITED from App.tsx — `revertOptimisticWrite`'s "still ours" check compared
+`String(stored)` to `String(sent)`, but SQLite stores booleans as 0/1 vs the
+payload's true/false, so any table with a boolean column failed the match and the
+revert DECLINED, leaving a ghost row until reload; fixed by normalizing the sent
+side to storage shape (booleans → 0/1, objects → JSON). (2) Extraction-born — the
+revert's change notification carried no event and crashed the app's verb handler;
+evless notifications now skip per-event hooks. Lesson for the §10 conformance
+fixtures: the verdict→revert path needs golden cases per column TYPE (boolean,
+json, null), because coercion bugs hide exactly there.
+
+**Row-too-large becomes a latency downgrade, not a freeze (2026-08-25).** Both
+size doors exist and hold today: ingress refuses an oversized mutation with a
+verdict before PostgreSQL sees it ("a bad write should cost its sender a verdict,
+not cost every reader a table" — size measured from what NATS delivered, never
+declared; threshold a deliberate lower bound so no legitimate write is refused),
+and egress suspends a table whose row outgrew the event buffer by any other
+writer's hand (frozen-and-valid, ex-@panic — the crash-loop reasoning is in
+`suspendForRowTooLarge`'s comment). The retirement-era insight: the generation
+producer reads POSTGRES, not CDC, and object-store chunking has no per-message
+budget — so a row no NATS message can carry still rides a chain. After retirement,
+`row_too_large` suspension should mean "CDC frozen, chains still current at
+cadence latency": the client keeps chain-seeding suspended tables instead of
+treating them as dead, and the 1 MB ceiling stops being a freeze at all. Optional
+hardening for non-edge writers stays queued: a width guard trigger installed by
+`zebridge_enable` only on tables whose unbounded columns can overflow, judged
+against the burst benchmark first (perf: no drift).
+
 **Consequence for retirement day — CDC retention shrinks to ~2 × cadence.** A
 chain-seeded client needs CDC only from its manifest's `cutoff_lsn` forward, and the
 manifest it read is at most one cadence stale (two, if it caught the pointer just
@@ -1568,6 +1670,186 @@ table in the stream has a chain (the snapshot-path retirement itself), and note 
 is the NATS window that shrinks — `GC_THRESHOLD_MS` (§7.5, offline writers) is a
 PostgreSQL tombstone clock and keeps its own, longer horizon, coupled to the chain
 only by depth × cadence.
+
+**DERIVATION LANDED (2026-08-25): the publication IS the generation list.** The
+producer's tick now derives its membership each pass — `pg_publication_tables`
+minus `zebridge_is_internal_table()` (one predicate, every door), minus keyless
+tables (catalog joins, NOT a `::regclass` cast: resolving `format(...)::regclass`
+as the reader was refused `permission denied for schema pg_toast`; pg_class ⋈
+pg_namespace ⋈ pg_index answers the same question with plain reads), minus
+non-routable tables (`isCdcRoutable` ∪ TENANT_RULES — a table no client can follow
+gets no chain), minus opt-outs. Tenants come from the DATA via `zebridge_tenants_of`
+(SECURITY DEFINER — the reader's own RLS would scope the DISTINCT): dyntenant-
+correct BY CONSTRUCTION, proven immediately when the live derive found leftover
+tenant `dynten` and chained it with zero configuration, while row-less `globex`
+correctly got nothing new. `zebridge_enable` cascades: a published table has a
+chain within one cadence, opt-out via `generations => false` writing the ONLY
+config that exists — `zebridge_generation_overrides`, an exception list (with
+reserved per-table cadence/depth columns). `GENERATIONS_ENABLED=1` is the master
+switch (.env.bridge); `GENERATION_RULES` demoted to a RESTRICTION intersected with
+the derived set — probes and dev subsets, also enabling the producer by itself.
+Side effects handled: `zebridge_user_tenants` added to the internal list (the
+roster-leak door derivation would have opened — its schema/snapshot egress doors
+remain queued), and `genproducer.py` now owns the only bridge (every enabled
+bridge derives the full set and would race a probe's cadence). Verified live:
+first derived tick, zero errors, manifests exactly {_default.{users, orders,
+counter_public, zebridge_gc_watermark}, acme/globex/dynten.test_types}. ⚠️ Drift
+note: the LIVE database's `zebridge_enable` predates the width-guard and
+generations steps (template has both) — refresh it from the template before the
+next migration relies on either step.
+
+**THE LIVE-BIRTH EXERCISE (2026-08-25) — fresh volumes, a table born in front of a
+consumer, both doors, offline and back.** Script: new volumes → system from
+templates → consumer up FIRST → migrate `memo` (uid, txt, updated_at) via
+`zebridge_enable(writable, version_col => 'updated_at')` → populate → consumer
+oversizes (rejected) → consumer away, psql oversized (rejected) + one valid edit →
+consumer returns. Everything held: the DDL pipeline carried the newborn's schema
+live ("created (first sight)" with zero restarts — updated_at being the DEFAULT
+version column meant no SYNC_RULES either), CDC delivered its rows to the watching
+client, derivation chained it within one cadence, the consumer's 20 KB edit hit
+the INGRESS door (one-column table: the payload itself is the width) → verdict
+`rejected` → revert → replica == PG byte-for-byte, the psql edit hit the
+TEMPLATE-BORN trigger (`zebridge_width_guard_memo`, first fire in anger, 23514),
+the away-time valid edit rode a delta, and the return seeded from the chain
+("Seeded memo from generation chain g1, watermark ...+00") with full equality.
+Recorded as `scripts/scenarios/livebirth.py` (temp-topology probe + CDC_PUBLIC
+subject grant, both restored; owns the only bridge) — 5/5 on its first complete
+run, after its own two failures delivered findings (3b) and the parser lesson. FOUR findings, each now fixed or filed:
+(1) **envsubst eats any `$word` in the templates** — my `$f$`/`$t$` dollar-quote
+tags (and later a comment merely SPELLING the double-dollar delimiter!) broke two
+fresh boots by unterminating quoting and silently swallowing every later statement
+incl. `zebridge_enable`; law recorded in the template itself: only the plain
+double-dollar delimiter survives, and it must never be spelled inside a body,
+comments included. Scratch-DB apply with ON_ERROR_STOP is now the proven check.
+(2) **The manifest timezone mix**: the producer's window query renders STORED
+cutoffs outside the UTC transaction, so one manifest carried `+02` and `+00`
+bounds — string-compared bounds, the payload lesson reborn one layer up. Fixed by
+pinning the producer's whole SESSION to UTC; memo's chain reset; canonical-`+00`
+assertion added to livebirth.py. genproducer.py missed it because its structural
+checks compare within one source, never across ticks — coverage lesson noted.
+(3) **`zebridge_user_tenants` still reaches clients on a VIRGIN world** — the
+internal-list predicate guards the DDL trigger and the producer, but the boot
+schema publish remains the unclosed egress door (empty roster today, so no data
+leaked; the door itself is confirmed live). Still queued.
+(3b) **A table born LIVE bypasses the routability refusal** — boot preflight
+refuses a non-routable table before streaming; a table created while the bridge
+runs skips that check, publishes into the void, and the bridge FATALs after
+retries ("stopping bridge to prevent WAL overflow"). Correct last resort, wrong
+first response: first-sight relations need the same no_cdc_subject refusal at
+runtime. Found when livebirth.py's temp topology satisfied the bridge but not
+CDC_PUBLIC's subject filter — which is also the lesson that T4 has TWO halves:
+the topology file AND the stream's subjects.
+(4) `zebridge_enable`'s T3 note says "SYNC_RULES + restart" even when the version
+column is the global default and no restart is needed — conservative boilerplate;
+make it conditional someday.
+
+**THE DYNTENANT CAPSTONE (2026-08-25): a new user, a new tenant, a watching
+browser.** nina (existing NATS principal, never used) was mapped to brand-new
+tenant `tango` on the live fresh world: runtime streams CDC_TANGO/INIT_TANGO,
+conf grants + SIGHUP, `note_t` (tenant-scoped, writable) migrated with the full
+cascade (tenant guard fail-closed, RLS, replica identity moved to (tenant_id,
+uid)), TENANT_RULES + one bridge restart (the honest T3 residue), mapping row →
+`$KV.tenants.nina = tango` instantly. Results, all on film: nina's tab resolved
+`tenant tango` live, her gap-check NAMED CDC_TANGO, `note_t` seeded from chain
+g2 (full+delta, 4 rows applied over guarded overlap), the CDC_TANGO consumer up
+in 6ms, a live psql insert moved her 2→3 — and alice (tenant-less) holds the
+same schema with ZERO tango rows: isolation by stream, as designed. It forced
+one real CLIENT fix: `cdcStreams`/`initStream`/`cdcStreamForTenant` gated tenant
+streams on topology.json's tenant LIST, silently ignoring runtime-born tenants —
+now they trust `$KV.tenants` as the runtime truth and special-case only the open
+tenant (the list-gate's one legitimate job, avoiding the CDC__DEFAULT ghost).
+Two findings + demo-state notes: (1) **JetStream storage reservations**: each
+stream's max-bytes counts against the server cap, so runtime tenant provisioning
+at up.sh sizes was refused ("insufficient storage resources") — INIT_TANGO landed
+at 1G; dyntenant provisioning must budget modestly. (2) The per-principal conf
+grant remains the static residue the signing-key endpoint retires — a new tenant
+today = one grant block + SIGHUP. Demo state: tango's grants live only in the
+RENDERED native conf (a --clean re-render loses them, deliberately — tango is
+demo debris, unlike memo which persists via topology.json).
+
+**THE STATIC-RESIDUE ENDGAME (2026-08-25, design filed).** After derivation and
+dyntenant, three static surfaces remain, and each now has its named successor —
+the winning pattern, six-for-six today: PG functions hold the rules, CDC carries
+the news, the broker gets edited by the bridge, and the file keeps only what
+never moves.
+
+| static surface today | runtime source (successor) | mechanism |
+| --- | --- | --- |
+| ~~GENERATION_RULES~~ | the publication | derived per tick — DONE |
+| ~~topology.tenants (runtime role)~~ | the data (`zebridge_tenants_of`) + `$KV.tenants` | runtime streams (dyntenant), client trusts KV — DONE |
+| ~~`topology.public_tables`~~ | **the catalogue's public rows** (`tenant_col IS NULL`) — `zebridge_public_tables` itself was a projection and is DROPPED | bridge derives untenanted routability from the TABLE, and EDITS `CDC_PUBLIC`'s subject filter itself at runtime when a public table is born — the same move it already makes creating `CDC_<TENANT>`. One migration then does everything: publish, guard, chain, route, stream subject. **Mechanically closes finding (3b)**: a live-born table gains its subject instead of publishing into the void and FATALing. `topology.public_tables` demotes to up.sh's fresh-boot seed, like `tenants` |
+| ~~`SYNC_RULES` / `TENANT_RULES` env~~ (was the last hand-worker reconciliation) | **`zebridge_table_rules`**, written by `zebridge_enable` in the SAME transaction as the guards it already installs with those very columns — the env var is a hand-copied duplicate of a fact the catalog holds | the bridge consumes it through the meta-cache + epoch-invalidation machinery it already has (invalidate.py's plumbing): the mutation listener's per-table meta read gains the rule columns, the sweeper and producer read the table they already query, decode-time tenant_col arrives at relation first-sight/DDL. Both T3 MANUAL rows vanish; "verified before migration" dissolves because rules+guards+publication commit atomically and nothing CAN disagree; env demotes to bootstrap/override with a boot-time disagreement warning during transition. Clients unaffected — the descriptor already carries version_column/tombstone_column |
+| NATS per-principal conf grants | **operator/JWT with a scoped signing key** | the permission shape is written ONCE on the signing key (`mutation.{{name()}}.>` etc.); every user JWT inherits it at mint time; a new principal or tenant is an auth-server event, not a conf edit + SIGHUP. The nina/tango grant block was the last manual rehearsal of what the signing key automates |
+
+**Refinement (same day): the three PG-side rows are ONE relation.** The disjoint
+union of the two positive lists (tenant-scoped in TENANT_RULES, public in
+topology + zebridge_public_tables) collapses because `zebridge_enable` already
+receives the single distinguishing fact — `tenant_col`. Unify as
+`zebridge_catalogue(tbl PK, tenant_col NULL, public_reason, version_col DEFAULT
+'updated_at', tombstone_col, tiebreak_col, generations, CHECK ((tenant_col IS
+NULL) <> (public_reason IS NULL)))`: NULL tenant_col = public, NOT NULL =
+scoped — one nullable column IS the disjoint union. TENANT_RULES, SYNC_RULES,
+zebridge_public_tables and zebridge_generation_overrides all become projections
+of it; CDC_PUBLIC's subjects derive from the public half; the CHECK absorbs the
+publication guard's core law into the schema (an unscoped, unjustified row
+cannot exist — stronger than an event trigger refusing it after the fact);
+`zebridge_enable` becomes an UPSERT plus the materialization of the row (guards,
+RLS, publication) in one transaction. The bridge consumes it via the meta-cache
+epoch it already has. The catalogue is the config; the config is a table.
+
+**Built the same evening (2026-08-25): the catalogue row is DONE at boot level.**
+`zebridge_catalogue` exists with exactly the refined shape; `zebridge_enable` now
+UPSERTs it in the same transaction as the guards (the `generations`/overrides
+step became the `catalogue` step, and the two T3 rows collapsed to one — restart
+only for a NEW tenant-scoped table's routing). The bridge gained `catalogue.zig`:
+one SELECT at boot merges rows into tenant_rules/sync_rules with env winning per
+table, graceful on a pre-catalogue database. The producer's derive query LEFT
+JOINs the catalogue for tenant_col/version_col and `COALESCE(generations, true)`
+retired `zebridge_generation_overrides`. The decisive proof: `note_t` was
+stripped from `TENANT_RULES`, the bridge restarted, and a live insert still
+routed to `cdc.tango.note_t.insert` — boot line `🗂️ catalogue: 3 row(s),
+3 table(s) gained rules`. Backfill surfaced a small finding on the way:
+`zebridge_public_tables.tbl` was a regclass, and the dropped livebirth fixture
+left a dangling OID that rendered as NULL — the backfill filtered on existence.
+(The residue noted here at first — sweeper on env, boot-level only — closed the
+same evening; see part 2 below.)
+
+**Part 2, same evening: the residue swept, and the file renamed.** Everything the
+env and the topology file still transcribed is gone. `SYNC_RULES`/`TENANT_RULES`
+left `.env.bridge` (they still parse, as per-table emergency overrides); the
+sweeper reads `zebridge_catalogue.tombstone_col` on its own writer connection —
+written in the same transaction as the tombstone trigger it names, so they cannot
+disagree. `topology.json` became **`grammar.json`** and lost its `tenants` and
+`public_tables` keys: tenants are DATA (`SELECT DISTINCT tenant_id FROM
+zebridge_user_tenants`), the public set is the catalogue's `tenant_col IS NULL`
+rows, and the bridge now RECONCILES the streams itself at boot — creates any
+missing `CDC_<T>`/`INIT_<T>` (1G caps: JetStream max_bytes is a storage
+reservation, the INIT_TANGO lesson) and sets `CDC_PUBLIC`'s subject filter
+authoritatively to the catalogue's publics plus the open tenant, preserving the
+rest of the stored config (updateStream serializes everything — a partial config
+would silently reset limits). `up.sh` and `nats-init` create only MUTATIONS,
+REQUESTS and the KV buckets now. `zebridge_public_tables` is dropped everywhere:
+the publication guard, the audit, `zebridge_enable`'s scoped check and the
+gc-watermark registration all read the catalogue. Proof, live with an empty rule
+env: `cdc.tango.note_t.insert` in CDC_TANGO, `cdc.memo.update` in CDC_PUBLIC,
+boot line `🗂️ catalogue: 8 row(s) … 5 public, 1 tenant(s)` — one tenant because
+the DATA says tango is the only mapped tenant, which is the point. Scenarios
+moved with it: livebirth and decode_integrity pre-declare their fixture with one
+catalogue INSERT and assert the bridge's own boot reconciliation bound the
+subject (their temp-topology and stream-edit machinery deleted); check.py's
+drift checks compare catalogue against CDC_PUBLIC's bound subjects. What remains
+of finding (3b) is only the runtime half: a table born mid-flight still waits
+for the next boot to gain its subject — the restart IS the T3 step, for public
+tables too now. And the endgame table below is down to one static surface: the
+NATS per-principal grants, waiting on the JWT signing key.
+
+What topology.json keeps: the genuinely static wire grammar — stream prefixes,
+subject patterns, KV names, open tenant — which changes only in coordinated
+redeploys and therefore never needs re-reading. Deliberately REJECTED: re-reading
+topology.json on DB triggers ("more dynamic") — it inverts the coupling, makes a
+file the runtime source refreshed by database events, and forces the DBA to touch
+two places for one fact. The file shrinks toward being the contract; contracts
+don't hot-reload.
 
 Remaining correctness inventory: (1) overlap/regression — settled by the guarded
 upsert; (2) deletions — tombstones ride deltas as rows, and the `sweeper retention ≥
@@ -2893,6 +3175,24 @@ every binding, the exact cost this design exists to kill.
 with App.tsx as its FIRST consumer and the Node example as its second — the
 browser demo becomes the regression test for the extraction. Likewise no
 universal SDK abstraction before two ports exist against the protocol directly.
+
+**Extraction step 1 LANDED (2026-08-25): `web-consumer/src/libzb.ts`.** The sync
+core is out of App.tsx: one `ZeBridge` class (~1500 lines with its comments) holding
+schema watch, chain-first seeding with the snapshot fallback, CDC apply (batched,
+`defer_foreign_keys`), the whole §7 write path (outbox, optimistic apply + two revert
+modes, verdicts, echo-confirm, rtt liveness), and the doorbell events. App.tsx fell
+from ~2780 lines to ~490 of pure theater — signals, badges, demo buttons, the SQL
+console, the /bridge/health poll — wired through the class's public surface: `query`,
+`mutate` (returns the stamped version; `rawMutation` stays public as the deliberate
+escape hatch for the malformed-payload demo), `onChange`/`onTableEvent`/`onAnyChange`,
+`onLog`/`onPhase`/`onSuspended`/`onStatus`, and debug getters that rebuilt the
+`window.zb` console helpers unchanged. Verified live as its own regression test:
+fresh load seeded `users` from chain g4 (12 rows) + CDC delivered the 13th, tenant
+resolved, and a button write round-tripped MUTATION OUT → PubAck → verdict
+`accepted` → optimistic row visible. Next: lift the file into a real
+`zebridge-client-ts` package (the Node consumer with better-sqlite3 + TCP transport
+becomes its second consumer, forcing the storage/transport seams), THEN carve the
+sans-I/O eater boundary inside it.
 
 **Rejected on the way here, recorded so it stays rejected**: the reverse
 architecture (push RAW pgoutput to NATS, decode at the edge / wasmCloud). It
