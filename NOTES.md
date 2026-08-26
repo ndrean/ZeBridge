@@ -115,9 +115,9 @@ logged `~[full_name→name] via ALTER (rows preserved)` with no error. Value
 survival is SQLite's own RENAME COLUMN guarantee once that path is taken; what
 the hint changes is *which* path is taken.
 
-### 1.3 CLOSED — RING_BUFFER_COUNT settled at 65536
+### 1.3 CLOSED — RING_BUFFER_COUNT settled at 32768
 
-The original rationale (in `config.zig`) was: 65536 slots ≈ 1092 ms at 60K events/s,
+The original rationale (in `config.zig`) was: 32768 slots ≈ 1092 ms at 30K events/s,
 which *covered* one NATS reconnect interval when that was 1000 ms. Reconciling the
 hardcoded 2000 ms into config broke that invariant — the buffer now covers about half
 a reconnect.
@@ -126,7 +126,7 @@ Safe, not broken: a full ring backpressures the WAL reader, so events are delaye
 never dropped. Restoring the old property would mean `RING_BUFFER_COUNT=131072`
 (≈2184 ms), doubling memory.
 
-**Settled: leave it at 65536.** Metrics show PG reconnects dominate and NATS
+**Settled: leave it at 32768.** Metrics show PG reconnects dominate and NATS
 reconnects are rare — and on a *Postgres* loss the producer stops, so the ring
 **drains** rather than fills; ring size does nothing for that failure mode, the
 slot and WAL retention cover it. So the sizing only ever mattered for the rarer
@@ -1984,7 +1984,7 @@ corollary: an operator can run `leaks <prod-pid>` against a live ReleaseFast
 bridge for full-coverage leak detection with no rebuild — the one place the
 test-time tool doubles as a production tool.
 
-**Chaos & adversarial testing found FOUR real robustness bugs (2026-08-26) — all
+**Chaos & adversarial testing found SIX real robustness bugs (2026-08-26) — all
 in the bridge's OWN logic, neither in NATS or libpq, exactly where the weak point
 was predicted to be.** Memory was never the problem (0 leaks through every phase);
 the two failures were both in error-handling DECISIONS:
@@ -2102,6 +2102,110 @@ msgpack + /enroll fuzz), `race.py` (concurrent writers, poison interleaved with
 legit, leaks under contention). All were RED when they found the bugs — a test
 that cannot fail proves nothing.
 
+  5. **One large transaction wedges the bridge PERMANENTLY** (found 2026-08-26 while
+     measuring the pgoutput ceiling — by accident, writing a burst as a single `DO`
+     block instead of 2000 separate transactions). The WAL loop buffers a whole
+     transaction's ring slots and releases them to the publisher only at `.commit`.
+     When the tracker fills it logs, discards the in-flight transaction, and
+     `return error.TransactionOverflow` — which propagates out of the loop and
+     **kills the process**:
+
+         Ring buffer capacity: 32768 slots, transaction row limit: 32767
+         Transaction overflow: exceeds 32767 row limit — discarding entire in-flight transaction
+         error: TransactionOverflow
+
+     The transaction is still unacked in the slot, so the next boot replays it and
+     dies again. Measured: two consecutive restarts, both dead. The bridge was
+     **unstartable** until an operator ran `pg_replication_slot_advance` — which
+     silently discards those changes, so every replica then diverges from Postgres
+     permanently and invisibly. Same end state as finding 4, reached through
+     ORDINARY APPLICATION BEHAVIOUR rather than a bridge restart: a bulk import, a
+     migration backfill, a `COPY`, a `DELETE FROM big_table` — any single
+     transaction over `RING_BUFFER_COUNT` rows.
+
+     ⚠️ Lowering `RING_BUFFER_COUNT` lowers this cliff with it. The default moved
+     65536 → 32768 the same day, halving the threshold to ~32.7k rows, which an
+     ordinary migration reaches without trying.
+
+     **Why nothing caught it**: every scenario writes in small transactions, and
+     speed.py deliberately uses 2000 × 1000 — so the suite drives 2M rows through
+     the bridge routinely and never once in one transaction. The guard's own
+     comment shows the limit was understood as a deadlock backstop (cap the tracker
+     one below the pool so `acquireAndFillSlot` cannot spin on an empty queue); what
+     was not considered is what the process should DO when it fires.
+
+     **The cap is a backstop for a SELF-INFLICTED deadlock.** Back-pressure already
+     exists and is well built: `acquireAndFillSlot` spins for a free slot with a
+     fatal-error check and a 30 s watchdog, so a producer outrunning the publisher
+     simply blocks until slots come back. What defeats it is the all-or-nothing
+     hold — during one transaction NOTHING reaches the publisher, so its queue is
+     empty, no slot can ever return, and the wait would be infinite. The cap fires
+     before that. It is not a sizing decision; it prevents a starvation the hold
+     itself creates, by killing the process.
+
+     **Fix — release incrementally, ack at commit.** The all-or-nothing
+     hold is unnecessary: `proto_version '1'` has no streaming, so PostgreSQL sends
+     a transaction's changes only AFTER it commits — everything the loop receives is
+     already committed, and there is no abort to roll back. So when the tracker
+     fills, release the buffered slots to the publisher, reset the counter, and keep
+     going; ack the LSN only at `.commit`, exactly as now. Then:
+       * the row limit disappears — a transaction of any size streams through,
+         bounded by the ring buffer and its existing back-pressure;
+       * the deadlock the cap defends against cannot occur, because releasing gives
+         the publisher work, so slots keep returning and the EXISTING back-pressure
+         wait behaves normally — nothing new is built; `max_tx_rows`, the overflow
+         branch and `error.TransactionOverflow` are all DELETED;
+       * a crash mid-transaction publishes a PARTIAL transaction, and the unacked
+         LSN makes PostgreSQL replay the whole thing on restart. That is safe by the
+         same property finding 4 relies on: msg ids are LSN-derived, so JetStream
+         dedups inside its window and the client applier is idempotent (LWW upsert +
+         LSN gate). A duplicate is recoverable; a crash loop is not.
+     The cost is that consumers can transiently observe a partial transaction, where
+     today they observe none of it. Set against a permanently unstartable bridge and
+     operator-forced data loss, that is the right trade — and it is the same
+     at-least-once bargain the whole pipeline already makes.
+
+     Rejected alternative: quarantine the transaction (suspend its tables, ack past
+     it) — that stops the crash loop but KEEPS the silent divergence, which is the
+     worse half of the bug. PostgreSQL's `streaming` option (proto v2, PG14+) would
+     also solve it and is the "proper" answer, but it means handling STREAM
+     START/STOP/ABORT and a protocol bump for a case incremental release already
+     covers.
+
+  6. **Schema generation omits FOREIGN KEYS, so PROTOCOL §4 is unimplementable**
+     (found 2026-08-26 while asking whether a split transaction could break FK
+     ordering client-side). `pg_constraint` appears ZERO times in the whole Zig
+     source: the schema builder assembles `pg`/`sqlite` columns, `pk`,
+     `pk_columns`, `replica_identity`, the write contract and `lsn`, and never asks
+     PostgreSQL about foreign keys. Measured on `$KV.schemas.orders` — no
+     `foreign`, `references`, `fkey` or `constraint` key anywhere in the payload.
+
+     Downstream everything then behaves correctly on wrong information: the client
+     generates `CREATE TABLE orders ("uid" TEXT NOT NULL PRIMARY KEY, "user_id"
+     INTEGER, ...)` — columns and a PK, nothing else — and `foreign_key_list(orders)`
+     comes back empty. So `PRAGMA defer_foreign_keys = ON` in the CDC apply path
+     guards a constraint that CANNOT EXIST, and §4's deferral rule has nothing to
+     defer. `orders` is declared in the migration as the FK-ordering demo
+     ("FK-ordering demo: child of users, PROTOCOL.md §4", a real
+     `references(:users, on_delete: :delete_all)`), and the demo cannot fire.
+
+     ⚠️ **The consequence for finding 5**: a transaction split across batches cannot
+     break FK ordering on a client TODAY — but by accident, not by design. Measured:
+     one transaction of 15,000 users + 15,000 orders interleaved, ring 4096 so it
+     split across ~8 releases, 30,000/30,000 events published, bridge alive, zero
+     drops. That test passes because there is no constraint to violate, so it does
+     NOT establish that the ordering is correct. The moment a consumer mirrors FKs
+     (a PGlite replica, a hand-written binding following §4) the question becomes
+     live, and the metadata to answer it never arrives.
+
+     **Fix**: query `pg_constraint WHERE contype='f'` in the schema builder, emit the
+     referenced table and columns, and let the client add `REFERENCES` to its
+     generated DDL. Sequencing matters — adding FKs client-side CREATES the
+     cross-batch risk that today does not exist, so the metadata and the applier's
+     FK hold/retry must land together, and the 30k split test must then be re-run
+     WITH constraints present, where it becomes a real test rather than a vacuous
+     pass.
+
 Finding 4 is the one that argues loudest for the [[test-escalation]] topic: no
 single-fault scenario could see it. Every scenario spins a FRESH probe slot, so
 "resume from the head" and "resume from the slot" are identical for them — the
@@ -2119,7 +2223,6 @@ dedups inside a 2-minute window, so a rerun with static ids gets clean PubAcks
 three checks, and chaos.py + adversarial.py were RE-RUN against the fixed
 binary the same day (policy: the listener's behavior changed, so the recorded
 results are stale until re-proven) — both PASS, 0 leaks throughout.
-
 
 **Refinement (same day): the three PG-side rows are ONE relation.** The disjoint
 union of the two positive lists (tenant-scoped in TENANT_RULES, public in
@@ -3377,7 +3480,7 @@ zig build test-nats
 | `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
 | `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
 | `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. |
-| `zebridge_limits` | One row (`id = 1`): `max_row_bytes`, the width-guard budget (SECURITY.md §1.8). Read by the per-table `zebridge_width_guard` trigger at write time (SECURITY DEFINER, so `bridge_writer` can read it through RLS-less access), so the row-width ceiling is a database fact the DBA can raise in one place — not a constant baked into N trigger bodies. |
+| `zebridge_limits` | One row per (`tbl`, `slot`): `max_row_bytes`, the width-guard budget (SECURITY.md §1.8), REGISTERED BY EACH BRIDGE AT BOOT from its own `2^BASE_BUF` via `zebridge_register_limits()` — never maintained by hand, and rows whose slot has left `pg_replication_slots` are GC'd on the next boot. Read by the per-table `zebridge_width_guard` trigger at write time (SECURITY DEFINER, so `bridge_writer` can read it through RLS-less access), so the row-width ceiling is a database fact the DBA can raise in one place — not a constant baked into N trigger bodies. |
 
 #### Client-Side Tables (`web-consumer/src/libzb.ts`)
 
@@ -3413,7 +3516,8 @@ The functions are divided into read-only configurations, edge-write guard config
 | **Write/Ingress Operations** | |
 | `zebridge_grant_edge_writes()` | Grants `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on a table to the `bridge_writer` role to permit edge mutations. |
 | `zebridge_install_write_guards()` | Helper function that sets up triggers for `bump_version`, `soft_delete`, and `guard_tenant` on a table. |
-| `zebridge_install_width_guard()` | Builds and installs the per-table `zebridge_width_guard` trigger: a static body summing the table's unbounded columns (text/unbounded varchar/bytea/json/jsonb/xml/arrays) against `zebridge_limits.max_row_bytes`, raising SQLSTATE 23514 at write time — the same class-23 code the edge-write path already treats as a permanent, immediate rejection, so both doors (consumer and psql) are guarded by one trigger with zero listener code. No-op on tables without unbounded columns. |
+| `zebridge_register_limits(slot, publication, max_row_bytes)` | **SECURITY DEFINER**, and the only writer of `zebridge_limits`. Called by every bridge at boot over its READER connection (the reader holds `EXECUTE` and no table write privilege — which is what lets a read-only deployment register at all). Three steps: GC rows whose `slot` has left `pg_replication_slots` (a retired instance must stop constraining everyone else), drop this slot's rows for tables it no longer carries, then upsert one row per table currently in its publication with `2^BASE_BUF`. Replaces the hand-maintained global row that SECURITY.md flagged and that was duly forgotten the first time `BASE_BUF` moved. Returns the number of rows written. ⚠️ Must run AFTER the slot exists, or step 1 deletes what step 3 writes. |
+| `zebridge_install_width_guard()` | Builds and installs the per-table `zebridge_width_guard` trigger: a static body summing the table's unbounded columns (text/unbounded varchar/bytea/json/jsonb/xml/arrays) against `COALESCE(MIN(max_row_bytes) …, 16384)` from `zebridge_limits` for that table (MIN: a row must fit the narrowest instance carrying it), raising SQLSTATE 23514 at write time — the same class-23 code the edge-write path already treats as a permanent, immediate rejection, so both doors (consumer and psql) are guarded by one trigger with zero listener code. No-op on tables without unbounded columns. |
 | `zebridge_remove_write_guards()` | Clears the write guard triggers, useful when an admin needs to perform physical cleanups on a table that is restricted to soft-deletes. |
 | `zebridge_bump_version()` | Write trigger ensuring that any write omitting the version column (e.g., `updated_at`) gets appropriately stamped with the current timestamp. |
 | `zebridge_soft_delete()` | Write trigger converting physical `DELETE` statements on tables with a tombstone column into soft-deleting `UPDATE` operations. |
@@ -3580,18 +3684,19 @@ better-sqlite3, CDC caught up (832 + 1282), `mutate()` round-tripped to an accep
 verdict, outbox drained, and every table's row count matched Postgres exactly.
 
 Four things the second consumer taught, none of which a single host could have:
-  - **Node's ESM resolver needs explicit extensions.** Vite tolerated `from './libzb'`;
+
+- **Node's ESM resolver needs explicit extensions.** Vite tolerated `from './libzb'`;
     Node does not. All internal specifiers now carry `.ts`.
-  - **Type-only imports must say `import type`.** Node strips types syntactically,
+- **Type-only imports must say `import type`.** Node strips types syntactically,
     without analysis, so a value-position type import is a runtime SyntaxError.
     `verbatimModuleSyntax: true` is now on, so tsc catches the whole class.
-  - **The storage contract was implicit.** The core drives several lanes at once (a
+- **The storage contract was implicit.** The core drives several lanes at once (a
     CDC consumer per stream + the write path) and calls `transaction()` concurrently.
     sqlocal satisfied that invisibly — one worker, one queue — so nobody had to say it.
     better-sqlite3 does not, and interleaved BEGINs dropped whole 100-event batches
     (`cannot start a transaction within a transaction`). The rule is now WRITTEN in
     storage.ts and honoured by a promise chain in node.ts.
-  - **A host bundler can silently serve HTML as a worker.** (Step 2's lesson; the
+- **A host bundler can silently serve HTML as a worker.** (Step 2's lesson; the
     reason the storage adapter belongs to the host, not the core.)
 
 Next: carve the sans-I/O eater boundary inside the package, capturing the tricky
@@ -3602,6 +3707,60 @@ portable to Zig.
 **Rejected on the way here, recorded so it stays rejected**: the reverse architecture (push RAW pgoutput to NATS, decode at the edge / wasmCloud). It breaks the tenant ACL — subject routing REQUIRES decoding (the tenant column lives in the decoded tuple), so raw frames hand every edge decoder all tenants mixed — and pgoutput is stateful (tuples reference relation OIDs from earlier Relation messages: every consumer grows a relcache, late joiners can't decode, retention must preserve schema messages forever). The gain would have been offloading ~3.5µs/event of decode CPU that was never scarce. The salvageable adjacent idea: an optional **SQL lane** — a small worker (wasmCloud fits HERE) consuming the already-tenant-routed streams and republishing rendered SQL phrases per dialect (`cdc-sql.<dialect>.<tenant>.<table>.>`), making ~50-line consumers possible for teams that want them. Behind the bridge, opt-in, ACL intact.
 
 Context this slots into: the leaf topology (bridge↔NATS plain TCP colocated, NATS↔leaves TLS, PG↔bridge SSL for PG-as-a-service; one leaf per tenant whose hub credential carries that tenant's grants; ~20ms leaf latency exercising LWW and the 5s clamp in anger) and the ~20MB bridge footprint (ring buffer is the knob, arenas, no GC). Small tool, sharp contract — the contract is the investment.
+
+## 10b. The row-width budget registers itself (2026-08-26)
+
+`zebridge_limits` was ONE global row and a coupling maintained by hand — SECURITY.md
+said so in a ⚠️ line, and it was forgotten the first time `BASE_BUF` moved: buffer
+4 KB, table still 16384, so PostgreSQL would accept rows the feed could not carry
+and suspend the table on the first CDC touch. Found by reading the boot log after a
+sizing change, not by any test.
+
+**Two things were wrong, not one.** The forgetting was the symptom; the design error
+was a UNIVERSAL limit. `BASE_BUF` is a per-process setting, so two bridges on one
+database can legitimately carry different ceilings, and no single row can be true
+for both.
+
+**Shape, chosen by measurement.** The guard fires on every insert/update, so the
+budget lookup is hot-path. Timed against the live DB, 2000 iterations each:
+
+| lookup | us/row |
+| --- | --- |
+| old single global row | 2.19 |
+| resolve publication per row (`pg_publication_tables` join + slot liveness) | 22.14 |
+| slot-liveness only | 4.35 |
+| **per-(table,slot) indexed, liveness GC'd at boot** | **3.01** |
+
+Resolving the publication inside the trigger costs 10x — a 100k-row bulk insert
+would pay ~2s of pure guard overhead. So the COLD path resolves and the HOT path
+reads: `zebridge_register_limits(slot, publication, bytes)` expands publication →
+tables once at boot and writes one row per (tbl, slot); the trigger does a plain
+indexed `COALESCE(MIN(max_row_bytes) … WHERE tbl = <oid>::regclass, 16384)`.
+
+**Why `slot` and not `publication` as the key** — the question that decided it: PG
+cannot map a table to a slot (`pg_create_logical_replication_slot` takes no
+publication; the binding is per-session at `START_REPLICATION` and never stored),
+so publication is what the guard must join on. But `slot` is what
+`pg_replication_slots` KNOWS, which makes retired instances detectable: any bridge's
+boot deletes rows whose slot is gone. Keyed by publication, a decommissioned 4 KB
+instance would pin the budget low forever with nothing able to tell. So: slot for
+identity and liveness, publication for scope. `MIN` because a row must fit the
+narrowest instance carrying the table.
+
+**Why a SECURITY DEFINER function rather than a grant.** A read-only deployment has
+no writer role, so the bridge must register over the READER connection — and
+granting the reader INSERT/UPDATE would have cost the invariant the whole read path
+leans on. `zebridge_register_limits` is SECURITY DEFINER with `EXECUTE` granted to
+the reader: one code path for both profiles, and `bridge_reader` still holds no
+write privilege on any user table (the two internal grants on
+`zebridge_generations` predate this and are unchanged).
+
+**A latent bug found on the way**: `init.core.template.sql` granted
+`zebridge_catalogue` SELECT to `${POSTGRES_WRITER_USER}` — violating its own header
+rule ("nothing here may reference the writer role"), which breaks the read-only
+profile on a FRESH cluster. It passed everywhere it was ever run because roles are
+cluster-wide and the write half had always been applied first. Moved to
+init.write.template.sql.
 
 ## 11 Restart Rules
 
