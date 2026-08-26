@@ -1522,6 +1522,47 @@ pub const EventProcessor = struct {
                 try json_str.appendSlice(arena, "]");
             }
         }
+        // Foreign keys, forwarded from the trigger, which has already filtered them
+        // to what SQLite can satisfy (NOTES §10d).
+        if (parsed.value.object.get("foreign_keys")) |fks| {
+            if (fks == .array) {
+                try json_str.appendSlice(arena, ",\"foreign_keys\":[");
+                var fk_emitted: usize = 0;
+                for (fks.array.items) |entry| {
+                    if (entry != .object) continue;
+                    const fk_name = entry.object.get("name") orelse continue;
+                    const fk_cols = entry.object.get("columns") orelse continue;
+                    const fk_ref = entry.object.get("references") orelse continue;
+                    const fk_pcols = entry.object.get("parent_columns") orelse continue;
+                    if (fk_name != .string or fk_ref != .string) continue;
+                    if (fk_cols != .array or fk_pcols != .array) continue;
+                    // Matching arity or the constraint is nonsense; refusing to emit it
+                    // is better than shipping a CREATE TABLE the client cannot run.
+                    if (fk_cols.array.items.len == 0 or fk_cols.array.items.len != fk_pcols.array.items.len) continue;
+
+                    if (fk_emitted > 0) try json_str.appendSlice(arena, ",");
+                    try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                        arena,
+                        "{{\"name\":\"{s}\",\"references\":\"{s}\",\"columns\":[",
+                        .{ fk_name.string, fk_ref.string },
+                    ));
+                    for (fk_cols.array.items, 0..) |cv, ci| {
+                        if (cv != .string) continue;
+                        if (ci > 0) try json_str.appendSlice(arena, ",");
+                        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{cv.string}));
+                    }
+                    try json_str.appendSlice(arena, "],\"parent_columns\":[");
+                    for (fk_pcols.array.items, 0..) |cv, ci| {
+                        if (cv != .string) continue;
+                        if (ci > 0) try json_str.appendSlice(arena, ",");
+                        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{cv.string}));
+                    }
+                    try json_str.appendSlice(arena, "]}");
+                    fk_emitted += 1;
+                }
+                try json_str.appendSlice(arena, "]");
+            }
+        }
         try self.appendWriteContract(arena, &json_str, clean_table, column_names.items);
         try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{wal_end}));
 
@@ -1999,6 +2040,75 @@ pub const EventProcessor = struct {
                     }
                     try json_str.appendSlice(arena, "]}");
                     ix_emitted += 1;
+                }
+            }
+            try json_str.appendSlice(arena, "]");
+
+            // Foreign keys — same filter as the DDL trigger, queried here because a
+            // table that emitted no DDL since boot never goes through that path.
+            // Both paths, every time (§10c's rule).
+            const fk_query = try utils.allocPrintZ(
+                arena,
+                \\SELECT con.conname, pc.relname,
+                \\       (SELECT string_agg(a.attname, ',' ORDER BY k.ord)
+                \\          FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+                \\          JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum),
+                \\       (SELECT string_agg(a.attname, ',' ORDER BY k.ord)
+                \\          FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+                \\          JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum)
+                \\FROM pg_constraint con
+                \\JOIN pg_class pc ON pc.oid = con.confrelid
+                \\WHERE con.conrelid = '"{s}"."{s}"'::regclass
+                \\  AND con.contype = 'f'
+                \\  AND EXISTS (SELECT 1 FROM public.zebridge_catalogue cat WHERE cat.tbl = pc.relname)
+                \\  AND EXISTS (
+                \\      SELECT 1 FROM pg_index i
+                \\      JOIN pg_class ci ON ci.oid = i.indexrelid
+                \\      JOIN pg_am am ON am.oid = ci.relam
+                \\      WHERE i.indrelid = con.confrelid AND i.indisunique
+                \\        AND i.indpred IS NULL AND i.indexprs IS NULL AND am.amname = 'btree'
+                \\        AND i.indkey::int2[] @> con.confkey::int2[]
+                \\        AND con.confkey::int2[] @> i.indkey::int2[])
+                \\ORDER BY con.conname;
+            ,
+                .{ "public", clean_table },
+            );
+            const fk_result = c.PQexec(conn, fk_query.ptr);
+            defer c.PQclear(fk_result);
+            try json_str.appendSlice(arena, ",\"foreign_keys\":[");
+            if (c.PQresultStatus(fk_result) == c.PGRES_TUPLES_OK) {
+                const fk_rows = c.PQntuples(fk_result);
+                var fk_i: i32 = 0;
+                var fk_emitted: usize = 0;
+                while (fk_i < fk_rows) : (fk_i += 1) {
+                    const ccsv = std.mem.span(c.PQgetvalue(fk_result, fk_i, 2));
+                    const pcsv = std.mem.span(c.PQgetvalue(fk_result, fk_i, 3));
+                    if (ccsv.len == 0 or pcsv.len == 0) continue;
+                    if (fk_emitted > 0) try json_str.appendSlice(arena, ",");
+                    try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                        arena,
+                        "{{\"name\":\"{s}\",\"references\":\"{s}\",\"columns\":[",
+                        .{ std.mem.span(c.PQgetvalue(fk_result, fk_i, 0)), std.mem.span(c.PQgetvalue(fk_result, fk_i, 1)) },
+                    ));
+                    var cit = std.mem.splitScalar(u8, ccsv, ',');
+                    var cfirst = true;
+                    while (cit.next()) |cn| {
+                        if (cn.len == 0) continue;
+                        if (!cfirst) try json_str.appendSlice(arena, ",");
+                        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{cn}));
+                        cfirst = false;
+                    }
+                    try json_str.appendSlice(arena, "],\"parent_columns\":[");
+                    var pit = std.mem.splitScalar(u8, pcsv, ',');
+                    var pfirst = true;
+                    while (pit.next()) |pn| {
+                        if (pn.len == 0) continue;
+                        if (!pfirst) try json_str.appendSlice(arena, ",");
+                        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{pn}));
+                        pfirst = false;
+                    }
+                    try json_str.appendSlice(arena, "]}");
+                    fk_emitted += 1;
                 }
             }
             try json_str.appendSlice(arena, "]");

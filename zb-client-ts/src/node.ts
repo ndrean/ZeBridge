@@ -9,6 +9,10 @@ import type { Exec, StorageFactory } from './storage.ts';
 export const nodeStorage: StorageFactory = (dbName) => {
   const db = new Database(dbName);
   db.pragma('journal_mode = WAL');
+  // better-sqlite3 already defaults this ON, which is exactly why it is spelled
+  // out: an invariant that holds by a dependency's default is one upgrade away
+  // from not holding, and the browser adapter had the opposite default.
+  db.pragma('foreign_keys = ON');
 
   const exec: Exec = async (q, ...params) => {
     const text = q.trim().replace(/;\s*$/, '');

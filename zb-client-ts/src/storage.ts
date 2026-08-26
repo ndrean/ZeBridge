@@ -27,4 +27,15 @@ export interface Storage {
 
 /// The host hands the core a factory, not an instance: the core owns the DB
 /// NAME (per-principal, or per-load in the browser dev convention).
+///
+/// ⚠️ CONTRACT: an adapter MUST enable `foreign_keys`. SQLite defaults it OFF and
+/// it is PER CONNECTION, and our two adapters disagreed on it by accident —
+/// better-sqlite3 turns it on when it opens a database, sqlocal never sets it.
+/// Left alone, the same core over the same data would ENFORCE referential
+/// integrity in Node and IGNORE it in the browser.
+///
+/// The line to hold: an adapter may choose pragmas that trade PERFORMANCE
+/// (`journal_mode`, `synchronous`, cache size) as its engine sees fit, but pragmas
+/// that change SEMANTICS belong to the contract, because a consumer must not have
+/// to know which adapter it is running on to know what its data means.
 export type StorageFactory = (dbName: string) => Storage;

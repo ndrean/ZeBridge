@@ -696,6 +696,64 @@ BEGIN
                        AND i.indexprs IS NULL
                        AND am.amname = 'btree'
                  ), '[]'::jsonb),
+                 -- Foreign keys, so a replica can enforce referential integrity
+                 -- rather than merely resemble it (PROTOCOL §4; NOTES §10d).
+                 --
+                 -- ⚠️ Filtered to what SQLite will ACCEPT, which is stricter than what
+                 -- PostgreSQL allows. SQLite requires the parent key to be the parent's
+                 -- PRIMARY KEY or to carry a UNIQUE INDEX, and refuses anything else at
+                 -- DML time with `foreign key mismatch` — a failure no amount of waiting
+                 -- resolves. Measured, both directions. So a constraint travels only if
+                 -- its parent columns are the parent's PK, or are covered by a unique
+                 -- index we ACTUALLY PORT (btree, non-partial, non-expression): a parent
+                 -- key unique only under a partial or expression index is unique to
+                 -- PostgreSQL and unsatisfiable on the replica.
+                 --
+                 -- Composite keys included: confrelid/conkey/confkey are arrays, and the
+                 -- child and parent column lists must stay in matching order.
+                 'foreign_keys', COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object(
+                              'name', con.conname,
+                              'columns', child_cols.cols,
+                              'references', pc.relname,
+                              'parent_columns', parent_cols.cols
+                            ) ORDER BY con.conname)
+                     FROM pg_constraint con
+                     JOIN pg_class pc ON pc.oid = con.confrelid
+                     JOIN LATERAL (
+                         SELECT jsonb_agg(a.attname ORDER BY k.ord) AS cols
+                         FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord)
+                         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+                     ) child_cols ON true
+                     JOIN LATERAL (
+                         SELECT jsonb_agg(a.attname ORDER BY k.ord) AS cols,
+                                array_agg(k.attnum ORDER BY k.ord) AS attnums
+                         FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord)
+                         JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum
+                     ) parent_cols ON true
+                     WHERE con.conrelid = to_regclass(format('%I.%I', 'public', tbl))
+                       AND con.contype = 'f'
+                       -- the parent table must itself be replicated, or the child
+                       -- references something the replica will never have
+                       -- ⚠️ catalogue.tbl is TEXT (the bare relname), not regclass —
+                       -- comparing it to an oid raises `operator does not exist:
+                       -- text = oid`, which inside this trigger would fail the DDL
+                       -- itself. Same comparison the generation producer uses.
+                       AND EXISTS (SELECT 1 FROM public.zebridge_catalogue cat
+                                    WHERE cat.tbl = pc.relname)
+                       -- parent key is the PK, or has a unique index we port
+                       AND EXISTS (
+                           SELECT 1 FROM pg_index i
+                           JOIN pg_class ci ON ci.oid = i.indexrelid
+                           JOIN pg_am am ON am.oid = ci.relam
+                           WHERE i.indrelid = con.confrelid
+                             AND i.indisunique
+                             AND i.indpred IS NULL AND i.indexprs IS NULL
+                             AND am.amname = 'btree'
+                             AND i.indkey::int2[] @> parent_cols.attnums::int2[]
+                             AND parent_cols.attnums::int2[] @> i.indkey::int2[]
+                       )
+                 ), '[]'::jsonb),
                  -- Replica identity governs what UPDATE/DELETE actually carry, so both
                  -- the bridge and its clients need it: without a PK, DEFAULT means
                  -- PostgreSQL rejects writes outright, and only FULL yields old.* values

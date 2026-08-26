@@ -7,6 +7,11 @@ import type { Exec, StorageFactory } from './storage.ts';
 export const browserStorage: StorageFactory = (dbName) => {
   const sqlocal = new SQLocal(dbName);
   const exec: Exec = (q, ...params) => (sqlocal.sql as any)(q, ...params);
+  // Semantics, not performance — see the contract in storage.ts. sqlocal sets no
+  // pragma of its own, so without this the browser silently ignores every foreign
+  // key while Node enforces them. Fire-and-forget: the first real statement is
+  // queued behind it on the same connection.
+  void exec(`PRAGMA foreign_keys = ON;`);
   return {
     exec,
     transaction: (fn) =>

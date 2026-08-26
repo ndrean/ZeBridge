@@ -153,11 +153,31 @@ type Exec = (q: string, ...params: any[]) => Promise<any[]>;
 /// Assemble a .creds file's text from a JWT and a seed — what the enrollment
 /// flow holds after the mint responds (the seed never crossed the wire; the app
 /// generated the pair itself).
-/// SQLite reports a deferred FK failure at COMMIT and an immediate one at the
-/// statement; both carry the same phrase. Matching the message is unavoidable —
-/// sqlocal and better-sqlite3 surface different error CLASSES for the same fault.
-function isForeignKeyFailure(e: unknown): boolean {
-  return /FOREIGN KEY constraint failed/i.test(String((e as any)?.message ?? e));
+/// Is this failure "the parent is not here YET" rather than "this row is wrong"?
+///
+/// THREE distinct messages, and only the first one says what you would expect —
+/// all measured against SQLite:
+///
+///   FOREIGN KEY constraint failed        the parent ROW is missing
+///   no such table: main.<parent>         the parent TABLE has not been created yet
+///                                        (FK resolution is lazy at DDL, strict at
+///                                        DML, so a child can exist before its
+///                                        parent when schemas arrive out of order)
+///   foreign key mismatch - "c" ref "p"   the parent KEY is not the PK and has no
+///                                        UNIQUE index — a schema-porting fault,
+///                                        NOT a missing parent
+///
+/// The first two are worth holding and retrying: a later batch supplies what is
+/// missing. The third never resolves by waiting — the parent key will not become
+/// unique — so it is matched here only to be reported distinctly rather than
+/// retried forever. Matching messages is unavoidable: sqlocal and better-sqlite3
+/// surface different error CLASSES for the same fault.
+function foreignKeyFailureKind(e: unknown): 'missing-parent' | 'mismatch' | null {
+  const m = String((e as any)?.message ?? e);
+  if (/foreign key mismatch/i.test(m)) return 'mismatch';
+  if (/FOREIGN KEY constraint failed/i.test(m)) return 'missing-parent';
+  if (/no such table: /i.test(m)) return 'missing-parent';
+  return null;
 }
 
 export function credsFileText(jwt: string, seed: string): string {
@@ -702,6 +722,10 @@ export class ZeBridge {
     // and in PGlite/local Postgres, so one list serves every consumer shape (§10c).
     const indexes: { name: string; unique?: boolean; columns: string[] }[] =
       Array.isArray(val.indexes) ? val.indexes : [];
+    // Already filtered upstream to constraints SQLite can satisfy — parent key is
+    // the parent's PK or has a ported UNIQUE index (NOTES §10d).
+    const foreignKeys: { name: string; columns: string[]; references: string; parent_columns: string[] }[] =
+      Array.isArray(val.foreign_keys) ? val.foreign_keys : [];
     const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
     const tombstoneColumn: string | null = typeof val.tombstone_column === 'string' ? val.tombstone_column : null;
     const tenantColumn: string | null = typeof val.tenant_column === 'string' ? val.tenant_column : null;
@@ -735,7 +759,19 @@ export class ZeBridge {
       `"${c.name}" ${c.type}` +
       (isPk(c.name) || c.required ? ' NOT NULL' : '') +
       (inlinePk && c.name === pkCols[0] ? ' PRIMARY KEY' : '');
-    const tableConstraint = pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '';
+    // ⚠️ SQLite has no ALTER TABLE ADD CONSTRAINT, so a foreign key can only be
+    // declared INSIDE CREATE TABLE. That is why an FK change forces a rebuild below
+    // while an index change is a cheap CREATE/DROP.
+    const fkClauses = foreignKeys
+      .filter((f) => f?.references && Array.isArray(f.columns) && f.columns.length &&
+                     Array.isArray(f.parent_columns) && f.parent_columns.length === f.columns.length)
+      .map((f) =>
+        `, FOREIGN KEY (${f.columns.map((c) => `"${c}"`).join(', ')})` +
+        ` REFERENCES ${f.references} (${f.parent_columns.map((c) => `"${c}"`).join(', ')})`,
+      )
+      .join('');
+    const tableConstraint =
+      (pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '') + fkClauses;
 
     const rebuildPreservingData = async (why: string) => {
       const tmp = `${table}__migrating`;
@@ -757,7 +793,8 @@ export class ZeBridge {
         await this.run(`DROP TABLE IF EXISTS ${table};`);
         await this.run(`CREATE TABLE ${table} (${cols.map(ddl).join(', ')}${tableConstraint});`);
         this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
-      } else if (added.length === 0 && removed.length === 0 && renames.length === 0) {
+      } else if (added.length === 0 && removed.length === 0 && renames.length === 0 &&
+                 !(await this.foreignKeysDiffer(table, fkClauses))) {
         this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
         this.reach('migrated');
         this.scheduleRecount();
@@ -781,6 +818,10 @@ export class ZeBridge {
             const type = cols.find((c) => c.name === name)!.type;
             await this.run(`ALTER TABLE ${table} ADD COLUMN "${name}" ${type};`);
           }
+          if (await this.foreignKeysDiffer(table, fkClauses)) {
+            // ALTER cannot add or drop a constraint in SQLite; only a rebuild can.
+            await rebuildPreservingData('foreign keys changed');
+          }
         } catch (alterErr) {
           await rebuildPreservingData(`ALTER refused: ${alterErr}`);
         }
@@ -803,6 +844,28 @@ export class ZeBridge {
       await this.drainPending(table);
     } catch (err) {
       this.appendLog('SCHEMA', `Applying schema for ${table} failed: ${err}`, 'ERROR');
+    }
+  }
+
+  /// Does the stored table's DDL disagree with the foreign keys we now want?
+  ///
+  /// Compared against the recorded CREATE TABLE text because SQLite keeps no
+  /// queryable "expected constraints" — `foreign_key_list` reports what IS declared,
+  /// and comparing that back to clauses is more fragile than comparing the clauses
+  /// themselves. A mismatch forces `rebuildPreservingData`, since ALTER cannot add
+  /// or drop a constraint.
+  private async foreignKeysDiffer(table: string, fkClauses: string): Promise<boolean> {
+    try {
+      const rows = await this.run(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table);
+      const ddl: string = rows?.[0]?.sql ?? '';
+      if (!ddl) return false;                       // no table yet: the create path handles it
+      const hasAny = /FOREIGN KEY/i.test(ddl);
+      if (!fkClauses) return hasAny;                // wanted none, has some
+      // Normalise whitespace; the stored DDL is our own generated text.
+      const want = fkClauses.replace(/^,\s*/, '').replace(/\s+/g, ' ').trim();
+      return !ddl.replace(/\s+/g, ' ').includes(want);
+    } catch {
+      return false;
     }
   }
 
@@ -875,9 +938,15 @@ export class ZeBridge {
         });
         applied++;
       } catch (e) {
-        if (isForeignKeyFailure(e)) {
+        const kind = foreignKeyFailureKind(e);
+        if (kind === 'missing-parent') {
           this.fkHeld.push({ table, ev });
           held++;
+        } else if (kind === 'mismatch') {
+          // Waiting cannot fix this: the parent key is not the PK and carries no
+          // UNIQUE index, so the constraint should never have been ported.
+          failed++;
+          this.appendLog('CDC', `DROPPED ${ev?.operation} on ${table}: ${e} — the ported FK is unsatisfiable, its parent key needs a UNIQUE index (NOTES §10d)`, 'ERROR');
         } else {
           failed++;
           this.appendLog('CDC', `DROPPED ${ev?.operation} on ${table} (lsn ${ev?.lsn}): ${e}`, 'ERROR');
@@ -908,7 +977,7 @@ export class ZeBridge {
         });
         applied++;
       } catch (e) {
-        if (isForeignKeyFailure(e)) {
+        if (foreignKeyFailureKind(e) === 'missing-parent') {
           this.fkHeld.push({ table, ev });   // still waiting; try again next batch
         } else {
           this.appendLog('CDC', `DROPPED held ${ev?.operation} on ${table}: ${e}`, 'ERROR');
