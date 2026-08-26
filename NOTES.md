@@ -3762,6 +3762,61 @@ profile on a FRESH cluster. It passed everywhere it was ever run because roles a
 cluster-wide and the write half had always been applied first. Moved to
 init.write.template.sql.
 
+## 10c. What a PostgreSQL schema carries, and what reaches the replica (2026-08-26)
+
+The client builds its local tables from `$KV.schemas.<table>`, so whatever the
+schema generator does not emit simply does not exist on the edge. Taking stock of
+what a PG table declares against what actually lands:
+
+| feature | status | consequence of the gap |
+| --- | --- | --- |
+| column types | ✅ ported | two dialects, `pg` and `sqlite` |
+| PRIMARY KEY | ✅ ported | `pk` + `pk_columns` (composite-safe) |
+| **NOT NULL** | ❌ **computed, then dropped** | the write path round-trips a failure it could refuse locally |
+| **indexes** | ❌ never emitted | the replica IS the query API; every query is a sequential scan |
+| **FOREIGN KEY** | ❌ finding 6 | PROTOCOL §4's deferral rule is unimplementable |
+| UNIQUE constraints | ❌ | integrity, and they are indexes too |
+| DEFAULT values | ❌ | a client must supply every column on an insert |
+| CHECK constraints | ❌ | includes PG enums, which arrive as bare TEXT |
+
+Deliberately NOT ported, and correctly so: sequences and identity columns (the
+`DbAllocatedKey` rule refuses server-allocated keys on writable tables — a client
+mints its own), and triggers / RLS / partitioning, which are server-side concerns
+a replica has no business mirroring. Beyond those, the table above is the whole
+list.
+
+**SQLite supports all three of the missing structural ones natively** — `NOT NULL`,
+`CREATE INDEX`, and `FOREIGN KEY ... REFERENCES` — so nothing here is blocked by
+the target engine. The gap is entirely in what the generator gathers.
+
+**NOT NULL is the sharp one, because the data is ALREADY on the wire.** The `pg`
+dialect carries `required` per column and the `sqlite` dialect drops it:
+
+    pg     : {"name": "user_id", "type": "bigint", "required": true}
+    sqlite : {"name": "user_id", "type": "INTEGER"}
+
+and the client's generated DDL adds `NOT NULL` only to primary keys, so
+`CREATE TABLE users ("id" INTEGER NOT NULL PRIMARY KEY, "name" TEXT, ...)` —
+where `name` is NOT NULL in PostgreSQL. Measured, not theorised: the first
+`mutate()` from the Node consumer applied LOCALLY and was then refused upstream
+with `null value in column "inserted_at" violates not-null constraint`. The
+replica accepted a row PostgreSQL would not. That is the same
+"accepted locally, rejected upstream" round trip the ingress width cap exists to
+kill (finding 5's sibling), except here the information needed to refuse it
+locally was already published and thrown away.
+
+**Ordering, by payoff over cost:**
+  1. **NOT NULL** — the value is published already; carry `required` into the
+     sqlite dialect and emit it in the DDL. Fails a bad optimistic write instantly
+     instead of round-tripping to a 23502 verdict.
+  2. **indexes** (and UNIQUE with them) — read `pg_index`, emit `CREATE INDEX`.
+     This is what makes "query your replica directly, any SQL, joins, aggregates,
+     offline" true rather than aspirational; without it a 100k-row table scans.
+  3. **FOREIGN KEY** — must land WITH the applier's FK hold/retry, because porting
+     FKs CREATES the cross-batch ordering risk that today does not exist
+     (finding 6), and the 30k split test only passes today because there is no
+     constraint to violate.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today

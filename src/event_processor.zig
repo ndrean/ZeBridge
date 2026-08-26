@@ -1336,11 +1336,22 @@ pub const EventProcessor = struct {
             const ty = if (col_val == .object) col_val.object.get("type") else null;
             if (name == null or ty == null or name.? != .string or ty.? != .string) continue;
 
+            // `required` travels in BOTH dialects. It used to be emitted only in `pg`,
+            // so a client building its local table from `sqlite` produced
+            //   CREATE TABLE users ("id" INTEGER NOT NULL PRIMARY KEY, "name" TEXT, ...)
+            // where `name` is NOT NULL upstream — the replica accepted rows PostgreSQL
+            // then refused. Measured: a mutate() applied locally and came back
+            // `null value in column "inserted_at" violates not-null constraint`. The
+            // information to refuse it locally was already computed and thrown away.
+            // SQLite has NOT NULL natively; nothing about the target engine blocked it.
+            const sq_required = if (col_val == .object) col_val.object.get("required") else null;
+            const sq_is_required = sq_required != null and sq_required.? == .bool and sq_required.?.bool;
+
             if (i > 0) try json_str.appendSlice(arena, ",");
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
-                "{{\"name\":\"{s}\",\"type\":\"{s}\"}}",
-                .{ name.?.string, schema_mapper.pgToSqliteType(ty.?.string) },
+                "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                .{ name.?.string, schema_mapper.pgToSqliteType(ty.?.string), if (sq_is_required) "true" else "false" },
             ));
         }
         try json_str.appendSlice(arena, "] ");
@@ -1841,8 +1852,15 @@ pub const EventProcessor = struct {
                 if (r > 0) try json_str.appendSlice(arena, ",");
                 const col_name = std.mem.span(c.PQgetvalue(result, r, 0));
                 const data_type = std.mem.span(c.PQgetvalue(result, r, 1));
-                
-                const col_json = try std.fmt.allocPrint(arena, "{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{col_name, schema_mapper.pgToSqliteType(data_type)});
+                // Same column index the `pg` loop above reads: NOT NULL travels in
+                // both dialects, or a client building from `sqlite` loses it (§10c).
+                const sq_required = std.mem.eql(u8, std.mem.span(c.PQgetvalue(result, r, 4)), "t");
+
+                const col_json = try std.fmt.allocPrint(
+                    arena,
+                    "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                    .{ col_name, schema_mapper.pgToSqliteType(data_type), if (sq_required) "true" else "false" },
+                );
                 try json_str.appendSlice(arena, col_json);
             }
             try json_str.appendSlice(arena, "] ");

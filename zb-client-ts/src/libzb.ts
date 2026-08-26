@@ -719,9 +719,17 @@ export class ZeBridge {
 
     const inlinePk = pkCols.length === 1;
     const isPk = (name: string) => pkCols.includes(name);
-    const ddl = (c: { name: string; type: string }) =>
+    // `required` is NOT NULL with no DEFAULT, published in both dialects. Honouring
+    // it makes a bad optimistic write fail HERE instead of round-tripping: before
+    // this, mutate() applied locally and came back
+    // `null value in column "inserted_at" violates not-null constraint` — the
+    // replica accepted a row PostgreSQL would not (NOTES §10c).
+    //
+    // Tolerant of absence: a bridge older than the field publishes no `required`,
+    // which reads as nullable — the same table this built before it existed.
+    const ddl = (c: { name: string; type: string; required?: boolean }) =>
       `"${c.name}" ${c.type}` +
-      (isPk(c.name) ? ' NOT NULL' : '') +
+      (isPk(c.name) || c.required ? ' NOT NULL' : '') +
       (inlinePk && c.name === pkCols[0] ? ' PRIMARY KEY' : '');
     const tableConstraint = pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '';
 
