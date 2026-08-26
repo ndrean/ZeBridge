@@ -3898,6 +3898,58 @@ That is the point — it is the same argument as NOT NULL, failing at the call s
 instead of round-tripping a verdict — but it is a behaviour change for existing
 consumers, not a pure addition.
 
+## 10e. The wire does NOT preserve ordering ACROSS tables (2026-08-26)
+
+Found while making foreign keys real (§10d): a child row can reach a client before
+its parent, at ANY transaction size, in an ordinary write. This is a protocol-level
+property that was never written down, and it became load-bearing the moment §10c's
+FK port gave clients a constraint that can notice it.
+
+**Measured.** 1000 users + 1000 orders inserted INTERLEAVED in one transaction —
+2,000 events, comfortably UNDER the 4095 flush quantum, so no transaction split was
+involved at all:
+
+    seq 61757 -> cdc.users.insert.batch
+    seq 61758 -> cdc.orders.insert.batch
+    seq 61759 -> cdc.users.insert.batch
+    seq 61760 -> cdc.orders.insert.batch
+    seq 61761 -> cdc.orders.insert.batch     <- children
+    seq 61762 -> cdc.users.insert.batch      <- their parents, published AFTER
+
+322 events failed their FK on arrival and had to be held. Testing the UNDER-limit
+case is what found this: the assumption had been that transaction splitting caused
+it, and the un-split case disproved that in one run.
+
+**Mechanism, and it is not a bug in the grouping order.** `publishCDCSubBatch`
+groups a flush run's events by subject and emits groups in order of FIRST
+APPEARANCE, which is WAL order — that part is correct. The reorder comes from
+grouping COLLAPSING the interleave. Take a run that begins mid-pair:
+
+    run N   : ... user[k]
+    run N+1 : order[k], user[k+1], order[k+1], user[k+2], ...
+
+In run N+1 the first subject seen is `orders`, so the orders group is emitted
+first and carries order[k], order[k+1], order[k+2]... while the users group
+emitted after it carries user[k+1], user[k+2]... So order[k] is fine (its parent
+was in run N) and EVERY LATER ORDER IN THAT RUN jumps ahead of its parent.
+
+**The trade this exposes.** Preserving cross-table order exactly would mean
+grouping only CONSECUTIVE same-subject events, and with interleaved data that
+degenerates to batches of one — losing the batching that the `.batch` subject
+exists for. Grouping is worth having; the ordering guarantee is the price.
+
+**So the protocol fact is: CDC preserves order WITHIN a table, not ACROSS tables.**
+A client must be order-tolerant. For most consumers this has always been
+invisible — rows are applied by primary key, LWW, idempotent — which is why it
+went unnoticed for so long. It becomes visible exactly when a client holds a
+constraint that spans tables, i.e. a foreign key.
+
+⚠️ This belongs in PROTOCOL.md next to §4's deferral rule, which is the
+INTRA-batch half of the same problem: `defer_foreign_keys` handles a child
+arriving before its parent inside ONE batch, and nothing handled it across
+batches until the applier's hold/retry (§10d). The two together are what make FKs
+survivable; either alone is not enough.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today
