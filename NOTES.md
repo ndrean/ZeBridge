@@ -3784,8 +3784,8 @@ what a PG table declares against what actually lands:
 | PRIMARY KEY | ✅ ported | `pk` + `pk_columns` (composite-safe) |
 | **NOT NULL** | ✅ ported 2026-08-26 | was computed then dropped; the replica accepted rows PG refused |
 | **indexes** | ✅ ported 2026-08-26 | root-level and dialect-neutral; partial/expression/non-btree excluded |
-| **FOREIGN KEY** | ❌ finding 6 | PROTOCOL §4's deferral rule is unimplementable |
-| UNIQUE constraints | ❌ | integrity, and they are indexes too |
+| **FOREIGN KEY** | ✅ ported 2026-08-26 | was finding 6; needed pragma parity + an order-tolerant applier (§10d, §10e) |
+| UNIQUE constraints | ✅ ported 2026-08-26 | via the index port — PG backs them with a unique index and SQLite implements them AS one, so enforcement is identical; verified `UNIQUE constraint failed: users.email` on the replica |
 | DEFAULT values | ❌ | a client must supply every column on an insert |
 | CHECK constraints | ❌ | includes PG enums, which arrive as bare TEXT |
 
@@ -3826,14 +3826,19 @@ locally was already published and thrown away.
      `EXPLAIN QUERY PLAN` reports `SEARCH orders USING INDEX orders_user_id_idx`.
      The client syncs on the identical-schema path too — adding an index upstream
      changes no COLUMN, so that is exactly where its republish lands.
-  3. **FOREIGN KEY** — still open, and must land WITH the applier's FK hold/retry,
-     because porting FKs CREATES the cross-batch ordering risk that today does not
-     exist (finding 6), and the 30k split test only passes today because there is
-     no constraint to violate.
-  4. Remaining after that: UNIQUE constraints proper (as opposed to unique
-     indexes, which now travel), DEFAULT values, and CHECK constraints including
-     PG enums — all lower value, since a replica receives complete rows and
-     defaults only matter for local optimistic inserts.
+  3. ~~FOREIGN KEY~~ — DONE 2026-08-26, and it needed all of §10d: pragma parity
+     across the adapters, a detector that knows SQLite's THREE FK messages, and an
+     order-tolerant applier. Porting the constraint made §10e's cross-table
+     reordering visible for the first time — it had always been there.
+  4. ~~UNIQUE~~ — DONE with the index port. A PG UNIQUE constraint is backed by a
+     unique index, SQLite implements UNIQUE AS an index, so shipping the index
+     ships the enforcement. Verified end to end.
+  5. **Remaining, both low value**: DEFAULT values and CHECK constraints (including
+     PG enums, which arrive as bare TEXT). A replica receives COMPLETE rows, so
+     defaults matter only for local optimistic inserts, and a CHECK the server
+     already enforced cannot be violated by a row the server accepted. Neither is
+     a correctness gap for replication; both would only fail a bad local write
+     slightly earlier.
 
 **A rule this pair established, worth keeping**: there are TWO schema paths — the
 DDL trigger and the boot-time query — and a field added to only one gives it to
