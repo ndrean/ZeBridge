@@ -3772,8 +3772,8 @@ what a PG table declares against what actually lands:
 | --- | --- | --- |
 | column types | ✅ ported | two dialects, `pg` and `sqlite` |
 | PRIMARY KEY | ✅ ported | `pk` + `pk_columns` (composite-safe) |
-| **NOT NULL** | ❌ **computed, then dropped** | the write path round-trips a failure it could refuse locally |
-| **indexes** | ❌ never emitted | the replica IS the query API; every query is a sequential scan |
+| **NOT NULL** | ✅ ported 2026-08-26 | was computed then dropped; the replica accepted rows PG refused |
+| **indexes** | ✅ ported 2026-08-26 | root-level and dialect-neutral; partial/expression/non-btree excluded |
 | **FOREIGN KEY** | ❌ finding 6 | PROTOCOL §4's deferral rule is unimplementable |
 | UNIQUE constraints | ❌ | integrity, and they are indexes too |
 | DEFAULT values | ❌ | a client must supply every column on an insert |
@@ -3806,16 +3806,31 @@ kill (finding 5's sibling), except here the information needed to refuse it
 locally was already published and thrown away.
 
 **Ordering, by payoff over cost:**
-  1. **NOT NULL** — the value is published already; carry `required` into the
-     sqlite dialect and emit it in the DDL. Fails a bad optimistic write instantly
-     instead of round-tripping to a 23502 verdict.
-  2. **indexes** (and UNIQUE with them) — read `pg_index`, emit `CREATE INDEX`.
-     This is what makes "query your replica directly, any SQL, joins, aggregates,
-     offline" true rather than aspirational; without it a 100k-row table scans.
-  3. **FOREIGN KEY** — must land WITH the applier's FK hold/retry, because porting
-     FKs CREATES the cross-batch ordering risk that today does not exist
-     (finding 6), and the 30k split test only passes today because there is no
-     constraint to violate.
+  1. ~~NOT NULL~~ — DONE 2026-08-26. `required` now travels in both dialects and
+     the client emits it. Verified: the replica refuses locally with `NOT NULL
+     constraint failed: orders.user_id`, where before the write applied and came
+     back a 23502 verdict.
+  2. ~~indexes~~ (and UNIQUE with them) — DONE 2026-08-26. Root-level,
+     dialect-neutral; only btree, non-partial, non-expression indexes travel,
+     since anything excluded costs a scan and never a wrong row. Verified:
+     `EXPLAIN QUERY PLAN` reports `SEARCH orders USING INDEX orders_user_id_idx`.
+     The client syncs on the identical-schema path too — adding an index upstream
+     changes no COLUMN, so that is exactly where its republish lands.
+  3. **FOREIGN KEY** — still open, and must land WITH the applier's FK hold/retry,
+     because porting FKs CREATES the cross-batch ordering risk that today does not
+     exist (finding 6), and the 30k split test only passes today because there is
+     no constraint to violate.
+  4. Remaining after that: UNIQUE constraints proper (as opposed to unique
+     indexes, which now travel), DEFAULT values, and CHECK constraints including
+     PG enums — all lower value, since a replica receives complete rows and
+     defaults only matter for local optimistic inserts.
+
+**A rule this pair established, worth keeping**: there are TWO schema paths — the
+DDL trigger and the boot-time query — and a field added to only one gives it to
+tables created while the bridge runs while silently leaving every table present
+at boot on the old shape. NOT NULL nearly shipped that way. Both paths, every
+time, and the boot path is the easy one to forget because it is not the one you
+are testing when you write the feature.
 
 ## 11 Restart Rules
 
