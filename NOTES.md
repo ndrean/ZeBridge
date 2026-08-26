@@ -3832,6 +3832,72 @@ at boot on the old shape. NOT NULL nearly shipped that way. Both paths, every
 time, and the boot path is the easy one to forget because it is not the one you
 are testing when you write the feature.
 
+## 10d. What porting FOREIGN KEYs actually requires (2026-08-26)
+
+Measured against SQLite before writing any of it, because the docs' rules bite in
+ways that decide the design.
+
+**1. `foreign_keys` is per-connection and OFF by default — and our two adapters
+DISAGREE.** better-sqlite3 turns it ON when it opens a database; sqlocal never
+sets the pragma, so the browser gets SQLite's default of OFF. Measured: the live
+Node replica reports `foreign_keys: 1`, and nothing in sqlocal's dist mentions
+the pragma at all. Port FKs today and they would be ENFORCED in Node and IGNORED
+in the browser — the same core, the same data, different integrity semantics per
+consumer. Invisible right now only because no FK exists to enforce.
+
+That is a storage-seam bug independent of FKs: the adapters must agree on pragmas
+that change SEMANTICS (`foreign_keys`), as opposed to ones that only change
+performance (`journal_mode`). Fix it in `storage.ts` as part of the contract, not
+in each adapter's private setup.
+
+**2. FK resolution is LAZY at DDL, strict at DML.** `CREATE TABLE child(a, b
+REFERENCES nosuch(id))` succeeds even though `nosuch` does not exist; the INSERT
+then fails with `no such table: main.nosuch`. So schema ARRIVAL ORDER is not a
+problem for table creation — the client can keep building tables in whatever
+order the KV watch delivers them — but a child that receives CDC before its
+parent table exists will fail at apply time.
+
+**3. Two failure messages, neither of which says "FOREIGN KEY constraint
+failed".** Measured:
+    parent table missing        -> `no such table: main.nosuch`
+    parent column not unique    -> `foreign key mismatch - "c4" referencing "parent"`
+The applier's `isForeignKeyFailure` matches only /FOREIGN KEY constraint failed/,
+so both of those would be classified as permanent and DROPPED rather than held.
+The detector has to broaden before FKs travel, or the hold/retry silently becomes
+a delete.
+
+**4. The parent key must be the PK or carry a UNIQUE index.** SQLite refuses
+`foreign key mismatch` otherwise — the docs' child4 case, reproduced. A plain
+index does NOT satisfy it; a UNIQUE one does (reproduced both ways). Since §10c's
+index port now ships unique btree indexes, most PG unique constraints arrive
+already satisfied — but an FK whose parent key is covered only by a PARTIAL or
+EXPRESSION unique index (which we deliberately do not port) would mismatch. So
+the FK filter must check that the parent key is the PK or has a PORTED unique
+index, not merely that PostgreSQL considered it unique.
+
+**5. Adding an FK upstream forces a client table REBUILD.** SQLite has no
+`ALTER TABLE ADD CONSTRAINT`, so unlike an index — created and dropped freely —
+an FK change means `rebuildPreservingData`. FK churn is therefore expensive in a
+way index churn is not, which argues for porting FKs once at table creation and
+treating later constraint changes as the rare, costly case they are.
+
+**Order to build it, given the above:**
+  1. pragma parity in the storage seam (`foreign_keys = ON` in both adapters) —
+     needed regardless, and it is what makes the browser and Node agree;
+  2. broaden the FK-failure detector to the two messages above, so the applier's
+     hold/retry actually holds instead of dropping;
+  3. emit FKs from BOTH schema paths, filtered to parent keys that are the PK or
+     have a ported unique index, and have the client declare them inside
+     `CREATE TABLE`;
+  4. re-run the 30k interleaved split test WITH constraints present, where it
+     stops being a vacuous pass (§10c, finding 6).
+
+⚠️ Enabling enforcement makes the replica STRICTER than it is today: a local
+optimistic write that violates an FK starts failing where it used to succeed.
+That is the point — it is the same argument as NOT NULL, failing at the call site
+instead of round-tripping a verdict — but it is a behaviour change for existing
+consumers, not a pure addition.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today
