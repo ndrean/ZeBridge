@@ -1231,7 +1231,21 @@ pub const MutationListener = struct {
         var writer = std.Io.Writer.fixed(&dummy_out);
         var packer = @import("msgpack").PackerIO.init(&reader, &writer);
 
-        const payload = try packer.read(alloc);
+        // A decode failure is PERMANENT by nature: the same bytes decode the same
+        // way forever, so a truncated or garbage payload must dead-letter on first
+        // delivery, never enter the transient-retry budget. Before this, a
+        // truncated msgpack raised `error.EndOfStream`, which fell through to
+        // "will retry" and was redelivered mutation_max_deliver times — a handful
+        // of malformed messages stalled the single-consumer queue long enough to
+        // block legitimate writes behind them (a poison-pill DoS on the mutation
+        // lane, found by adversarial.py). Only OutOfMemory stays transient: it is
+        // genuine memory pressure that a retry can outlast. Every other decode
+        // error collapses to InvalidPayloadFormat, which isPermanent() already
+        // dead-letters — future-proof against any error the msgpack lib adds.
+        const payload = packer.read(alloc) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.InvalidPayloadFormat;
+        };
         if (payload != .map) return error.InvalidPayloadFormat;
         const map = payload.map;
 

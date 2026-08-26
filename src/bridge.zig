@@ -498,7 +498,10 @@ pub fn main(init: std.process.Init) !void {
     // authoritative per-table rule source, written by zebridge_enable atomically
     // with the guards. Env rules above become per-table OVERRIDES; the catalogue
     // fills everything else, and a pre-catalogue database loads zero rows.
-    const cat = catalogue.loadRules(allocator, &pg_config, &tenant_rules, &sync_rules);
+    var cat = catalogue.loadRules(allocator, &pg_config, &tenant_rules, &sync_rules);
+    // Freed on the way out of main — topology.public_tables/tenants alias these
+    // slices, and LIFO defers put this AFTER every thread join that reads them.
+    defer cat.deinit(allocator);
     if (cat.available) {
         // The catalogue is authoritative for the public set, and the tenant list is
         // DATA (zebridge_user_tenants) — the grammar file no longer carries either
@@ -1429,13 +1432,24 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         } else |err| {
-            if (err == error.StreamEnded) {
-                log.info("Stream ended gracefully", .{});
+            // A stream end is only GRACEFUL if we requested the shutdown. Otherwise
+            // the server severed it — a killed walsender, a dropped link libpq read
+            // as a clean COPY end — and a bridge that BREAKS here keeps running with
+            // CDC silently dead (found by chaos.py's pg_terminate_backend phase:
+            // the process stayed green, the mutation listener reconnected, and
+            // replication was gone with pg_reconnects still 0). A severed stream is
+            // reconnectable exactly like any other connection loss.
+            if (err == error.StreamEnded and should_stop.load(.seq_cst)) {
+                log.info("Stream ended (shutdown requested)", .{});
                 break;
             }
 
-            // Handle connection errors by reconnecting
-            log.warn("Connection lost: {}", .{err});
+            // Handle connection errors by reconnecting.
+            if (err == error.StreamEnded) {
+                log.warn("⚠️ Replication stream ended unexpectedly (server severed it) — reconnecting", .{});
+            } else {
+                log.warn("Connection lost: {}", .{err});
+            }
             metrics.setConnected(false);
 
             // Discard any slots buffered for the in-flight transaction.

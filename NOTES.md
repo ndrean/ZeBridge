@@ -1934,6 +1934,77 @@ is a cap, not a reservation. The mitigation is that the bridge's load-bearing
 connections are long-lived (they already hold their slots when the flood
 arrives), and everything transient degrades into the retry shapes above.
 
+**The memory audit (2026-08-26): three detectors, three worlds, all green.** The
+daemon is long-running, so the leak that matters is the one that GROWS — and the
+detectors compose because they see different allocators:
+
+  1. **DebugAllocator exit audit** (Zig's world — mmap-backed, invisible to
+     malloc tools): only speaks on paths that terminate, which makes early-exit
+     paths its best witness. A bad-nkey boot found exactly one leak this way —
+     `catalogue.Load`'s publics/tenants lists, allocated "for the life of the
+     process" (a euphemism for never freed). Fixed with `Load.deinit` deferred in
+     main (LIFO order puts it after every thread join that reads the aliased
+     topology slices) plus frees on the loop's partial-failure branches. The
+     repro now exits with ZERO reports — keeping failure exits audit-clean is
+     what keeps this detector trustworthy.
+  2. **macOS `leaks`** (the malloc zones — libpq's world, where a forgotten
+     PQclear is the classic daemon drip): 0 leaks on the live process, every
+     sample.
+  3. **`leaksoak.py`** (drift over time, the recorded policy): two `leaks`+RSS
+     samples around a churn window grinding the REAL verb matrix — three CDC
+     verbs public AND tenant-scoped, refused enrolls every round plus successful
+     mints every 10th (writer CTE + JWT signing + the user_tenants CDC
+     diversion), snapshot-worker requests, mutation-listener round-trips (real
+     msgpack envelopes, applied and verdicted — the counter's `last_writer`
+     said `c-soak` afterwards), one sweeper pass, /metrics + /status renders.
+
+Three 240s soaks, measured: naive churn +7 MB RSS, 0 leaks; full CDC matrix
+**exactly flat** — 2205→2205 malloc nodes, 7360→7360 KB, +1 MB RSS over 113
+rounds; complete matrix (mutations + sweeper) 2205→2209 nodes (the sweeper's
+own libc bits), KB flat, +6 MB RSS, 0 leaks. The 1.0G "physical footprint" in
+the leaks header is the RESERVED ring-slab mapping; resident truth is ~30 MB.
+`SOAK_SECONDS` scales the scenario to an hours-long soak when a release wants
+the stronger claim.
+
+**Chaos & adversarial testing found TWO real robustness bugs (2026-08-26) — both
+in the bridge's OWN logic, neither in NATS or libpq, exactly where the weak point
+was predicted to be.** Memory was never the problem (0 leaks through every phase);
+the two failures were both in error-handling DECISIONS:
+
+  1. **WAL `StreamEnded` conflation → silent CDC death** (chaos.py, PG-loss).
+     `pg_terminate_backend` on the walsender surfaces as `error.StreamEnded`,
+     which the main loop treated as a GRACEFUL end and `break`ed the replication
+     loop forever — process alive, /health green, mutation listener reconnected,
+     CDC gone with `pg_reconnects` still 0. A `StreamEnded` is graceful ONLY when
+     WE requested the shutdown (`should_stop`); otherwise the server severed it
+     and it is reconnectable like any other loss. Fixed in bridge.zig.
+  2. **`EndOfStream` retry storm → poison-pill DoS** (adversarial.py). A
+     truncated/garbage msgpack payload raised `error.EndOfStream`, which fell
+     through to the TRANSIENT-retry branch and was redelivered
+     `mutation_max_deliver` (15) times with ack_wait between each — a handful of
+     malformed messages stalled the single-consumer queue long enough to block
+     legitimate writes behind them. An attacker with one lane could DoS a
+     tenant's ingress with truncated bytes. Fixed: a decode failure is PERMANENT
+     by nature (same bytes fail forever) → dead-letter on first delivery, except
+     OutOfMemory which stays transient. Applied at the decode call site, so any
+     error the msgpack lib ever adds is permanent by construction.
+
+What the adversarial pass CLEARED (17 hostile mutation shapes): no crash, no
+injection (column-name and value both neutralized — allowlist + `$N` params +
+`appendIdent`), no hostile data stored, 0 leaks on every refusal path. The
+decode-to-SQL surface is sound; both bugs were purely in retry/reconnect
+classification — the "synchronous ⇒ correct" assumption's exact blind spot.
+
+Three chaos/robustness scenarios now guard this: `chaos.py` (bad creds boot,
+NATS jitter, PG loss, :9090 exhaustion, leaks), `adversarial.py` (hostile
+msgpack + /enroll fuzz), `race.py` (concurrent writers through a broker restart,
+poison interleaved with legit). All were RED when they found the bugs — a test
+that cannot fail proves nothing. (`race.py` is WIP: its `leaks`-under-concurrency
+check passes, but the convergence checks have an unresolved harness wiring issue
+in the async omar-publish path — a TEST problem, not a product race; the bridge
+rejected every malformed input cleanly throughout, and chaos.py + adversarial.py
+cover the product guarantees that matter.)
+
 
 **Refinement (same day): the three PG-side rows are ONE relation.** The disjoint
 union of the two positive lists (tenant-scoped in TENANT_RULES, public in

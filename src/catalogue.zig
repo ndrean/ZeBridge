@@ -28,9 +28,11 @@ const c = c_imports.c;
 const log = std.log.scoped(.catalogue);
 
 /// What one boot-time read of the catalogue produced. The slices are allocated from
-/// the caller's allocator and live for the life of the process (the bridge reads the
-/// catalogue exactly once, at boot — restart to pick up new rows, exactly the single
-/// remaining MANUAL step `zebridge_enable` reports).
+/// the caller's allocator; the caller owns them for the life of the process (the
+/// bridge reads the catalogue exactly once, at boot) and frees them via `deinit` on
+/// the way out — an early exit (a refused NATS auth, say) must leave a clean
+/// allocator audit, not a "lives forever" euphemism. Entries merged into the rule
+/// MAPS are owned by the maps and freed by their own deinits, not here.
 pub const Load = struct {
     /// Whether the catalogue was reachable at all. False = pre-catalogue database or
     /// connect failure; the caller keeps whatever the grammar file / env provided.
@@ -44,6 +46,14 @@ pub const Load = struct {
     publics: []const []const u8 = &.{},
     /// DISTINCT tenants from `zebridge_user_tenants` — whose streams boot ensures.
     tenants: []const []const u8 = &.{},
+
+    pub fn deinit(self: *Load, allocator: std.mem.Allocator) void {
+        for (self.publics) |name| allocator.free(name);
+        if (self.publics.len > 0) allocator.free(self.publics);
+        for (self.tenants) |name| allocator.free(name);
+        if (self.tenants.len > 0) allocator.free(self.tenants);
+        self.* = .{};
+    }
 };
 
 /// Merge catalogue rows into the already-parsed env maps (env wins per table) and
@@ -99,9 +109,21 @@ pub fn loadRules(
 
         if (tenant_col.len > 0 and tenant_rules.get(tbl) == null) {
             const key = allocator.dupe(u8, tbl) catch continue;
-            var cols = allocator.alloc([]const u8, 1) catch continue;
-            cols[0] = allocator.dupe(u8, tenant_col) catch continue;
-            tenant_rules.put(key, cols) catch continue;
+            var cols = allocator.alloc([]const u8, 1) catch {
+                allocator.free(key);
+                continue;
+            };
+            cols[0] = allocator.dupe(u8, tenant_col) catch {
+                allocator.free(cols);
+                allocator.free(key);
+                continue;
+            };
+            tenant_rules.put(key, cols) catch {
+                allocator.free(cols[0]);
+                allocator.free(cols);
+                allocator.free(key);
+                continue;
+            };
             grew = true;
         }
         if (sync_rules.get(tbl) == null) {
