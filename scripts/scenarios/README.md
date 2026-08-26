@@ -46,6 +46,28 @@ one rename must move the bridge, `nats-init` and this harness together. `zb.py` 
 exposes `tenants()`, which reads the live tenant list from `zebridge_user_tenants` —
 tenants are data, not config, so no file carries them.
 
+## ⚠️ Special / heavy scenarios — run in ISOLATION, never batched
+
+Most scenarios spin their own probe bridge on a private slot+port (`zb_probe` / :9096)
+and leave a running production bridge untouched — those are safe to run back-to-back.
+A subset is **special** and must be run one at a time, alone, on a quiet system,
+NOT folded into a "run everything" pass:
+
+| scenario | why it is special |
+| --- | --- |
+| `speed.py` | measures THROUGHPUT — any other load on the box skews the number |
+| `leaksoak.py` | long memory soak (`SOAK_SECONDS`) — concurrent churn from another scenario invalidates the RSS-drift reading; also the one that wants a ReleaseFast build for the production-shape leak proof |
+| `chaos.py` | **restarts the shared nats-server** and kills PG backends — every other consumer (browsers, a running bridge) disconnects during it |
+| `race.py` | concurrent-contention probe, owns the bridge (WIP — see its banner) |
+| `adversarial.py` | fires hostile input at a probe bridge; owns the bridge, runs as a client principal |
+| `faults.py` | deletes and recreates the `REQUESTS` stream out from under the bridge |
+
+Rule of thumb: if a scenario's `⚠️` line says it *restarts nats-server*, *owns the only
+bridge*, or *measures timing/memory*, give it the whole machine for its run. Stop any
+production bridge and close browser tabs first; each restores what it touched on the way
+out, but they will disrupt anything live meanwhile. The rest of the table below is the
+non-invasive set.
+
 ## Scripts
 
 | script | scenario | asserts |

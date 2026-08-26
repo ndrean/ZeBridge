@@ -1966,6 +1966,24 @@ the leaks header is the RESERVED ring-slab mapping; resident truth is ~30 MB.
 `SOAK_SECONDS` scales the scenario to an hours-long soak when a release wants
 the stronger claim.
 
+**The leak-detection boundary, made explicit and closed (2026-08-26).** The two
+auto-detectors are TESTING-TIME, not production: `leaks` is invoked by the .py
+scenarios (nothing runs it in prod automatically), and the DebugAllocator is a
+BUILD-MODE thing (`IS_DEBUG = builtin.mode == .Debug`) — `zig build` defaults to
+Debug (gpa + detectLeaks on clean exit), but production is
+`-Doptimize=ReleaseFast` → `c_allocator`, NO DebugAllocator, NO exit-time check.
+So all the Debug-build soaks proved the Debug build clean; a leak is a
+free/PQclear LOGIC fact identical across build modes, so that transfers — but
+"policy, never trust" says prove it, not argue it. Done: leaksoak against a
+ReleaseFast binary → 0 leaks, +7 MB RSS over 180s. The proof is also MORE
+complete than any Debug run, because in Release `c_allocator` routes every Zig
+allocation through malloc — so `leaks` sees Zig AND libpq in one pass (visible in
+the numbers: malloc footprint ~1.09 GB in Release, where the ring-slab is malloc,
+vs ~7 MB in Debug where it is mmap and invisible to `leaks`). Operational
+corollary: an operator can run `leaks <prod-pid>` against a live ReleaseFast
+bridge for full-coverage leak detection with no rebuild — the one place the
+test-time tool doubles as a production tool.
+
 **Chaos & adversarial testing found TWO real robustness bugs (2026-08-26) — both
 in the bridge's OWN logic, neither in NATS or libpq, exactly where the weak point
 was predicted to be.** Memory was never the problem (0 leaks through every phase);
