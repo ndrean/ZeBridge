@@ -62,20 +62,30 @@ pub const ReplicationStream = struct {
         log.info("🥁 Disconnected from PostgreSQL", .{});
     }
 
-    /// Start streaming from the replication slot
-    pub fn startStreaming(self: *ReplicationStream, start_lsn: ?[]const u8) !void {
+    /// Start streaming — always from the slot's own confirmed position.
+    ///
+    /// The `0/0` in the command below is PostgreSQL's sentinel for "resume where
+    /// this slot left off" (its `confirmed_flush_lsn`); it does NOT mean "from the
+    /// beginning of the WAL". It is written literally here because it is part of
+    /// the replication protocol, not a setting: there is no other correct value,
+    /// so there is no parameter to pass.
+    ///
+    /// This function used to take a `start_lsn`. That parameter was the bug: both
+    /// callers passed `pg_current_wal_lsn()` — the WAL *head* — which told
+    /// PostgreSQL to skip everything committed while the bridge was away. Deletes
+    /// made during a restart never reached CDC, so replicas diverged permanently
+    /// and silently. Removing the parameter is the fix that cannot regress: the
+    /// wrong position is no longer expressible at a call site.
+    pub fn startStreaming(self: *ReplicationStream) !void {
         if (self.conn == null) {
             return error.NotConnected;
         }
 
-        // Determine starting LSN (default to 0/0 if not provided)
-        const lsn = start_lsn orelse "0/0";
-
         // Build START_REPLICATION command
         const query = try utils.allocPrintZ(
             self.allocator,
-            "START_REPLICATION SLOT {s} LOGICAL {s} (proto_version '1', publication_names '{s}', binary 'true')",
-            .{ self.config.slot_name, lsn, self.config.publication_name },
+            "START_REPLICATION SLOT {s} LOGICAL 0/0 (proto_version '1', publication_names '{s}', binary 'true')",
+            .{ self.config.slot_name, self.config.publication_name },
         );
         defer self.allocator.free(query);
 

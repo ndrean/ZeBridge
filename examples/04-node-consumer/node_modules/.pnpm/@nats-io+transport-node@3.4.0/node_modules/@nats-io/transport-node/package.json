@@ -1,0 +1,71 @@
+{
+  "name": "@nats-io/transport-node",
+  "version": "3.4.0",
+  "description": "Node.js client for NATS, a lightweight, high-performance cloud native messaging system",
+  "keywords": [
+    "nats",
+    "messaging",
+    "pubsub",
+    "publish",
+    "subscribe",
+    "queue",
+    "distributed",
+    "queueing"
+  ],
+  "homepage": "https://nats.io",
+  "bugs": {
+    "url": "https://github.com/nats-io/nats.js/issues"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nats-io/nats.js.git"
+  },
+  "private": false,
+  "author": {
+    "name": "The NATS Authors"
+  },
+  "contributors": [],
+  "main": "index.js",
+  "types": "lib/mod.d.ts",
+  "files": [
+    "lib/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "real-clean": "npm run clean && shx rm -Rf ./node_modules",
+    "clean": "shx rm -Rf ./lib/* ./coverage/ out.lcov",
+    "fmt": "deno fmt src/ examples/ test/ ",
+    "prepack": "npm run check-package && npm run build",
+    "test": "npm run before-test && node --test --test-force-exit --experimental-test-coverage --test-coverage-include='lib/**/*' --test-coverage-exclude='lib/mod.js' --test-coverage-exclude='lib/nats-base-client.js'",
+    "coverage": "npm run before-test && node --test --experimental-test-coverage --test-force-exit --test-reporter=lcov --test-reporter-destination=out.lcov --test-coverage-include='lib/**/*' --test-coverage-exclude='lib/mod.js' --test-coverage-exclude='lib/nats-base-client.js'",
+    "before-test": "npm run clean && npm run check-package && npm run build && NODE_EXTRA_CA_CERTS=test/certs/ca.pem",
+    "setup": "curl -fsSL https://deno.land/x/install/install.sh | sh",
+    "setup_win": "choco install deno",
+    "cover:html": "genhtml -o ./coverage/html ./out.lcov && open ./coverage/html/index.html",
+    "check-package": "cd .. && deno run --allow-all bin/check-bundle-version.ts --module transport-node",
+    "postversion": "git push && git push --tags",
+    "bump-qualifier": "npm version prerelease --no-commit-hooks --no-git-tag-version",
+    "bump-release": "npm version patch --no-commit-hooks --no-git-tag-version"
+  },
+  "engines": {
+    "node": ">= 18.0.0"
+  },
+  "dependencies": {
+    "@nats-io/nats-core": "3.4.0",
+    "@nats-io/nkeys": "2.0.3",
+    "@nats-io/nuid": "3.0.0"
+  },
+  "devDependencies": {
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/kv": "3.4.0",
+    "@nats-io/nst": "3.4.0",
+    "@nats-io/obj": "3.4.0",
+    "@types/node": "^25.6.1",
+    "minimist": "^1.2.8",
+    "shx": "^0.4.0",
+    "typescript": "^5.9.2"
+  }
+}

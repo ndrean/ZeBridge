@@ -144,7 +144,13 @@ pub const Metrics = struct {
         wal_messages_received: u64,
         cdc_events_published: u64,
         last_ack_lsn: u64,
-        current_lsn_str: []const u8,
+        /// `last_ack_lsn` as `0/<hex>`, for humans. It is the position THIS BRIDGE has
+        /// confirmed — never `pg_current_wal_lsn()`, the server's WAL head. It was
+        /// called `current_lsn_str` (and exposed on /status as "current_lsn"), which
+        /// read exactly like the server's head; that conflation is how a WAL-head LSN
+        /// ended up passed to START_REPLICATION and silently skipped every change made
+        /// while the bridge was down (NOTES.md finding 4).
+        last_ack_lsn_str: []const u8,
         is_connected: bool,
         reconnect_count: u32, // PostgreSQL reconnections
         last_reconnect_time: i64,
@@ -177,7 +183,7 @@ pub const Metrics = struct {
             .wal_messages_received = self.wal_messages_received.load(.monotonic),
             .cdc_events_published = self.cdc_events_published.load(.monotonic),
             .last_ack_lsn = lsn,
-            .current_lsn_str = lsn_str_owned,
+            .last_ack_lsn_str = lsn_str_owned,
             .is_connected = self.is_connected.load(.monotonic),
             .reconnect_count = self.reconnect_count.load(.monotonic),
             .last_reconnect_time = self.last_reconnect_time.load(.monotonic),

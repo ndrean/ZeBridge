@@ -1,0 +1,5 @@
+# better-sqlite3 is a native module: it must run its install script to build the
+# binding. esbuild mirrors the web-consumer convention.
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true

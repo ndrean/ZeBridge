@@ -300,7 +300,22 @@ fn initHttpServer(
     );
 }
 
-/// Connect to PostgreSQL replication stream and start streaming from current LSN
+/// Connect to PostgreSQL replication stream and resume from the SLOT's position.
+///
+/// ⚠️ It resumes from the slot's `confirmed_flush_lsn` — the last position this
+/// bridge actually acked — because `startStreaming()` takes no position and cannot
+/// be told otherwise. That is the entire purpose of a persistent replication slot,
+/// and the only way a restart cannot lose data.
+///
+/// This used to pass `pg_current_wal_lsn()` — the CURRENT WAL head — which silently
+/// skipped every change committed while the bridge was down. Measured: stop the
+/// bridge, `DELETE FROM memo ...`, restart → the delete never reached CDC, so every
+/// replica kept the row forever while Postgres no longer had it. Silent divergence,
+/// no error anywhere. Resuming from the slot instead means a restart may REPUBLISH
+/// events already published (at-least-once), which is safe by construction: msg ids
+/// are LSN-derived, so JetStream dedups inside its window and the client's applier
+/// is idempotent (LWW upsert + LSN gate). Duplicates are recoverable; a missing
+/// delete is not.
 fn initReplicationStream(
     allocator: std.mem.Allocator,
     pg_config: *pg_conn.PgConf,
@@ -309,11 +324,11 @@ fn initReplicationStream(
 ) !wal_stream.ReplicationStream {
     log.debug("Connecting to WAL replication stream...", .{});
 
-    const current_lsn = try wal_monitor.getCurrentLSN(allocator, pg_config);
-    defer allocator.free(current_lsn);
-
-    log.debug("▶️ Current LSN: {s}\n", .{current_lsn});
-
+    // No LSN is read here on purpose. The WAL head is not this function's business,
+    // and a `current_lsn` in scope next to the START_REPLICATION call is exactly how
+    // it got passed as the start position for so long. Lag belongs to wal_monitor,
+    // which reports it against the slot (`confirmed_flush_lsn`) — the number that
+    // actually means something — every check interval.
     var pg_stream = wal_stream.ReplicationStream.init(
         allocator,
         .{
@@ -325,9 +340,12 @@ fn initReplicationStream(
     errdefer pg_stream.deinit();
 
     try pg_stream.connect();
-    try pg_stream.startStreaming(current_lsn);
+    try pg_stream.startStreaming();
 
-    log.info("✅ WAL replication stream started from LSN {s}\n", .{current_lsn});
+    log.info(
+        "✅ WAL replication resumed from slot '{s}' — anything it still holds replays now\n",
+        .{slot_name},
+    );
 
     return pg_stream;
 }
@@ -1052,7 +1070,7 @@ pub fn main(init: std.process.Init) !void {
         // Periodic structured metric logging for Alloy/Loki
         if (now_s - last_metric_log_time >= metric_log_interval_seconds) {
             const snap = try metrics.snapshot(allocator);
-            defer allocator.free(snap.current_lsn_str);
+            defer allocator.free(snap.last_ack_lsn_str);
 
             // Structured log format parseable by Grafana Alloy
             // A refusal logged once at boot has scrolled away by the time anyone
@@ -1085,7 +1103,7 @@ pub fn main(init: std.process.Init) !void {
                 snap.uptime_seconds,
                 snap.wal_messages_received,
                 snap.cdc_events_published,
-                snap.current_lsn_str,
+                snap.last_ack_lsn_str,
                 if (snap.is_connected) @as(u8, 1) else @as(u8, 0),
                 snap.reconnect_count,
                 snap.nats_reconnect_count,
@@ -1467,12 +1485,7 @@ pub fn main(init: std.process.Init) !void {
             utils.sleep(2000 * std.time.ns_per_ms); // 2 seconds
 
             // Get latest LSN and reconnect
-            const reconnect_lsn = wal_monitor.getCurrentLSN(allocator, &pg_config) catch |lsn_err| {
-                log.err("Failed to get LSN for reconnect: {}", .{lsn_err});
-                utils.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
-                continue;
-            };
-            defer allocator.free(reconnect_lsn);
+
 
             // Clean up old connection before reconnecting
             pg_stream.deinit();
@@ -1484,13 +1497,16 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             };
 
-            pg_stream.startStreaming(reconnect_lsn) catch |stream_err| {
+            // Resumes from the slot, like the boot path — a reconnect happens
+            // exactly when the walsender was severed (Finding 1's territory), the
+            // moment changes are most likely to be in flight.
+            pg_stream.startStreaming() catch |stream_err| {
                 log.err("Failed to restart streaming: {}", .{stream_err});
                 utils.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
 
-            log.info("✓ Reconnected to WAL stream at LSN {s}", .{reconnect_lsn});
+            log.info("✓ Reconnected to WAL stream, resumed from the slot's confirmed position", .{});
             metrics.recordReconnect();
             metrics.setConnected(true);
         }

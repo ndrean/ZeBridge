@@ -7,7 +7,8 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./node": "./src/node.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
@@ -22,6 +23,22 @@
     "uuid": "^14.0.1"
   },
   "devDependencies": {
-    "typescript": "^5.7.2"
+    "typescript": "^5.7.2",
+    "better-sqlite3": "^12.4.1",
+    "@nats-io/transport-node": "^3.4.0",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^24.3.0"
+  },
+  "peerDependencies": {
+    "better-sqlite3": ">=11",
+    "@nats-io/transport-node": ">=3"
+  },
+  "peerDependenciesMeta": {
+    "better-sqlite3": {
+      "optional": true
+    },
+    "@nats-io/transport-node": {
+      "optional": true
+    }
   }
 }

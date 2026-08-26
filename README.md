@@ -11,23 +11,19 @@ It is **one bridge with two components** you build on:
 PG  ←→  zebridge (daemon)  ←→  NATS  ←→  libzb(.js) (library)  ←→  consumer
 ```
 
-`zebridge` (the daemon) streams PostgreSQL changes onto NATS/JetStream and applies writes coming back. `libzb` (the client library) keeps a local SQLite replica on the edge — browsers, phones, services — and is the only way the consumer reads and writes.
+The daemon `zebridge` streams PostgreSQL changes onto NATS/JetStream and applies writes coming back.
+The client library `libzb` keeps a local SQLite replica on the edge — browsers, phones, services — and is the only way the consumer reads and writes.
 Consumers query their replica offline  - dashboard, search index, analytics...and optimistic writes are pushed using `libzb` through three verbs (INS, DEL, UP), resolved **last-write-wins**.
+
 NATS/JS is the transport, the fan-out/in, and the tenant boundary.
 
-**Design**: This tool is built to serve a large number of small to medium consumers via the message broker NATS/JS,
-so it is designed to be fast and safe.
+**Design**: This tool is built to serve a large number of small to medium consumers via the message broker NATS/JS, so it is designed to be fast and safe.
 It is NOT for large and long tables or tables containing large objects: it is not a file transfer tool. A large blob (> 1 MB) belongs in object storage. Tables should only contain the reference to a blob.
-ZeBridge state is essentially in Postgres - no reads from NATS, and the consumer state is in NATS/JS.
-
-**Can I write from edge?**: writes are optimistic and propagated back to Postgres via NATS/JS. The returned CDC event to the consumer updates its local state with **last-write-wins** (LWW) conflict resolution.
 
 **Performance**: you can expect up to 250-300.000 evt/s on your local computer. It essentially depends entirely on Postgres `pgoutput` rate. ZeBridge and NATS just absorb whatever's given. Once deployed, you have the unavoidable network latency.
 See [An example of a measured throughput](#an-example-of-a-measured-throughput) for a real, reproducible number — run it yourself on your own hardware before trusting any figure quoted here.
 
-**Admin setup**: read [SECURITY.md](SECURITY.md)
-
-**Status**: Dev stage — see [Roadmap](#roadmap) for the current version and what's next.
+**Status**: Dev stage.
 
 See the Table of Contents below for configuration, scaling, evaluation, and telemetry.
 
@@ -220,7 +216,7 @@ ZeBridge uses two PostgreSQL roles:
 
 The superuser credentials create these roles **once**, at the init step; the bridge never connects as the superuser at runtime. Each role carries a connection-limit budget, so the bridge cannot exhaust the database.
 
-📖 **[SECURITY.md](SECURITY.md) is the reference**: what each role holds, what the schema must satisfy to be writable or tenant-scoped, what to do after a migration, and what is _not_ protected — with a table of where every claim is tested.
+📖 **[SECURITY.md](SECURITY.md) is the reference**: what each role holds, what the schema must satisfy to be writable or tenant-scoped, what to do after a migration, and what is *not* protected — with a table of where every claim is tested.
 
 ### Credentials & trust boundaries
 
@@ -246,7 +242,7 @@ A ZeBridge instance is started with one config. The DBA starts the NATS server w
 
 **Three data flows**:
 
-1. **Bootstrap** (READ): the consumer takes each table's _schema_ (from the `schemas` KV) and seeds it — from the **generation chain** (objects + a manifest in the `generations` KV) normally, or from a **snapshot** (INIT stream) when no chain exists yet: PG → ZeBridge → NATS/JS.
+1. **Bootstrap** (READ): the consumer takes each table's *schema* (from the `schemas` KV) and seeds it — from the **generation chain** (objects + a manifest in the `generations` KV) normally, or from a **snapshot** (INIT stream) when no chain exists yet: PG → ZeBridge → NATS/JS.
 2. **Real-time CDC** (CDC stream, READ): the consumer receives INSERT/UPDATE/DELETE events as they happen: PG → ZeBridge → NATS/JS.
 3. **Real-time ingress** (MUTATIONS stream, WRITE): the consumer updates its local storage and sends the intended change to NATS/JS → ZeBridge → PostgreSQL.
 
@@ -260,9 +256,9 @@ Besides the three streams, the bridge maintains the seeding buckets: the **`gene
 
 The CDC/INIT stream family is owned by the bridge: at boot it creates any missing `CDC_<TENANT>`/`INIT_<TENANT>` stream with file storage, limits retention, s2 compression, these max-ages and a 1 GB max-bytes cap — deliberately modest, because JetStream `max_bytes` is a reservation against the server's storage budget. It also sets `CDC_PUBLIC`'s subjects authoritatively to `cdc.<tbl>.>` for every catalogue-public table plus `cdc.<open_tenant>.>`, and ensures `INIT_PUBLIC` exists. MUTATIONS and REQUESTS keep the limits `nats-init` gives them.
 
-⚠️ **CDC deliberately outlives INIT, by a day.** Snapshot generation isn't instant — it's a single sequential worker with no timeout, so "a small table can wait behind a large one" (see [Thread Model](#thread-model-7-threads)) can genuinely delay how long a snapshot takes to finish landing in INIT. If CDC and INIT expired on the same clock, a CDC event for a write that happened _while_ a snapshot was still queued could age out before that snapshot itself does — leaving a client that replays a still-valid snapshot with a gap right at the start of what it needs from CDC. The one-day margin exists to absorb that queueing delay; INIT's 7 days is what actually matters operationally: **the longest a consumer can be offline before it must re-seed from a fresh snapshot instead of just resuming CDC.**
+⚠️ **CDC deliberately outlives INIT, by a day.** Snapshot generation isn't instant — it's a single sequential worker with no timeout, so "a small table can wait behind a large one" (see [Thread Model](#thread-model-7-threads)) can genuinely delay how long a snapshot takes to finish landing in INIT. If CDC and INIT expired on the same clock, a CDC event for a write that happened *while* a snapshot was still queued could age out before that snapshot itself does — leaving a client that replays a still-valid snapshot with a gap right at the start of what it needs from CDC. The one-day margin exists to absorb that queueing delay; INIT's 7 days is what actually matters operationally: **the longest a consumer can be offline before it must re-seed from a fresh snapshot instead of just resuming CDC.**
 
-Snapshot _requests_ (not the data itself) are separately throttled: the `REQUESTS` stream holds one request message per table at a time, for up to the `SNAP_RET` window (`SNAP_RET_SECONDS`) — a second request for that table inside the window is refused, so a client is expected to check the `snapshots` KV bucket first. `SNAP_RET`'s production default is intentionally close to INIT's own 7-day retention (minus a 30-minute margin), not a short debounce: a snapshot already in INIT is good for its whole retention window, so a fresh dump of the same table before then would just be redundant load on Postgres. The KV descriptor itself has no expiry, so a client always has something to check regardless of where `SNAP_RET` currently stands.
+Snapshot *requests* (not the data itself) are separately throttled: the `REQUESTS` stream holds one request message per table at a time, for up to the `SNAP_RET` window (`SNAP_RET_SECONDS`) — a second request for that table inside the window is refused, so a client is expected to check the `snapshots` KV bucket first. `SNAP_RET`'s production default is intentionally close to INIT's own 7-day retention (minus a 30-minute margin), not a short debounce: a snapshot already in INIT is good for its whole retention window, so a fresh dump of the same table before then would just be redundant load on Postgres. The KV descriptor itself has no expiry, so a client always has something to check regardless of where `SNAP_RET` currently stands.
 Consumers use these streams to interact with NATS; the exact names are declared in `grammar.json`.
 
 ### The memory setting
@@ -711,7 +707,7 @@ file. Redirect with `2>`:
 `info` the volume is small — the `METRICS` line every 15 s is ~5 700 lines/day — and
 everything worth keeping is included. **Do not point a file sink at `debug`.**
 
-⚠️ The level _names_ differ between input and output: you set `LOG_LEVEL=warn` but the
+⚠️ The level *names* differ between input and output: you set `LOG_LEVEL=warn` but the
 lines read `warning(scope):`. Both spellings are accepted for the variable; when
 grepping or writing alert rules, match what the lines actually print:
 
@@ -773,7 +769,7 @@ The four worth alerting on:
 | `bridge_refused_tables` | `> 0` | a table is **suspended** — no primary key, an undecodable column type, or a row larger than the event buffer. The log line names which and why. |
 | `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
 | `bridge_wal_confirmed_lag_bytes` | rising steadily | **the bridge is behind**: WAL it has not confirmed yet. This is the backlog number. |
-| `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is _retaining_ on disk for the slot, until `max_slot_wal_keep_size` |
+| `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is *retaining* on disk for the slot, until `max_slot_wal_keep_size` |
 | `bridge_connected` | `== 0` | the replication stream is down |
 
 ⚠️ **The two lag metrics are not the same question.** `bridge_wal_lag_bytes` measures
@@ -818,7 +814,7 @@ scrape_configs:
   "uptime_seconds": 331,
   "wal_messages_received": 1797,
   "cdc_events_published": 288,
-  "current_lsn": "0/1832ce8",
+  "last_ack_lsn": "0/1832ce8",
   "is_connected": true,
   "pg_reconnect_count": 0,
   "nats_reconnect_count": 0,
@@ -1019,7 +1015,7 @@ request, per table or per connection.
 
 | # | thread | spawned at | does |
 | --- | --- | --- | --- |
-| 1 | **Main** | — | consumes the WAL stream, parses pgoutput, packs rows into the ring buffer. `EventProcessor` runs _inline_ here, so "the CDC path" and "the main thread" are the same thread |
+| 1 | **Main** | — | consumes the WAL stream, parses pgoutput, packs rows into the ring buffer. `EventProcessor` runs *inline* here, so "the CDC path" and "the main thread" are the same thread |
 | 2 | **Batch publisher** | `batch_publisher.zig:534` | drains the ring buffer, encodes MessagePack, publishes to the `CDC` stream |
 | 3 | **WAL monitor** | `wal_monitor.zig:50` | replication-slot lag, every 30 s |
 | 4 | **HTTP telemetry** | `http_server.zig:49` | `/metrics`, `/health`, `/status`, `/shutdown`. Accepts and serves inline — no thread per connection |
@@ -1041,7 +1037,7 @@ Two things this table is meant to stop people assuming:
   but a small table waits for a big one. (`Config.Snapshot.max_concurrent_snapshots`
   states an intent that was never built; it is read by nothing.)
 * **Preflight is not a thread.** It is an inline call in `main` (`bridge.zig:377`) that runs
-  _before_ threads 5–7 exist, which is why it can write the refusal registry without
+  *before* threads 5–7 exist, which is why it can write the refusal registry without
   synchronising with anyone.
 
 #### Who touches the refusal registry
@@ -1055,7 +1051,7 @@ refused by one and served by another. Three roles reach it:
 | snapshot requests (6) | writes (a row too wide to publish) **and** reads (rejects requests) |
 | HTTP telemetry (4) | reads only, for `/metrics` and `/status` |
 
-Two concurrent _writers_ and a concurrent _reader_ is why the registry is an append-only
+Two concurrent *writers* and a concurrent *reader* is why the registry is an append-only
 array with atomic publication rather than a hash map with a lock — see the header of
 `src/refused_tables.zig`.
 
@@ -1133,7 +1129,7 @@ The ring buffer is pre-allocated once at startup, in three parts: a fixed-size e
   (`brew install libpq` on macOS, `apk add postgresql-dev` / `apt install libpq-dev` on Linux). Override its location with `zig build -Dlibpq-prefix=/path`.
 
   ⚠️ The version floor is on **libpq at build time, not on the PostgreSQL server**.
-  The write path uses pipeline mode (`PQenterPipelineMode`, libpq 14+), which the libpq documentation describes as _"client-side and compatible with any server supporting the v3 extended query protocol"_ — so the database itself can be older (Postgres ≧ 14).
+  The write path uses pipeline mode (`PQenterPipelineMode`, libpq 14+), which the libpq documentation describes as *"client-side and compatible with any server supporting the v3 extended query protocol"* — so the database itself can be older (Postgres ≧ 14).
   It buys a mutation costing **one** network round trip instead of four, which is the difference between ~20 ms and ~80 ms per row against a remote database and is invisible when PostgreSQL is on the same host.
 
 There is no vendored-library build step: the NATS client is pure Zig and lives in `/nats.zig`.
@@ -1173,7 +1169,7 @@ pnpm run dev
 
 Open localhost:3000
 
-( _admin|admin_, then set the password of your choice)
+( *admin|admin*, then set the password of your choice)
 
 **Run Tests**:
 
@@ -1181,7 +1177,7 @@ Open localhost:3000
 zig build test
 ```
 
-`Python` and `envsubt` on host to play _/scripts/scenarios_
+`Python` and `envsubt` on host to play */scripts/scenarios*
 
 ---
 
@@ -1244,7 +1240,7 @@ ring = ( 2^BASE_BUF  +  sizeof(CDCEvent)  +  MAX_COLUMNS × sizeof(ColumnView) )
   20 /  1024, MAX_COLUMNS=128 = 1024 MB data + <1 MB meta +  1 MB cols = 1025 MB  ← 1 MB rows, wide table, minimum ring
 ```
 
-`sizeof(CDCEvent)` is small and fixed regardless of table shape — `columns` is a _slice_
+`sizeof(CDCEvent)` is small and fixed regardless of table shape — `columns` is a *slice*
 into a separate slab, not an inline array, so this term no longer grows with the widest
 table you might ever replicate. `MAX_COLUMNS` is what used to be a single fixed 128 baked
 into every deployment; it is now resolved **per instance, at boot**:
@@ -1267,10 +1263,10 @@ arithmetic on the data slab alone suggests.
 
 Each knob answers a different question:
 
-* **`BASE_BUF`** (log2 bytes, range 10–20) is _how large a single row may be_. Size it
+* **`BASE_BUF`** (log2 bytes, range 10–20) is *how large a single row may be*. Size it
   to your widest row: a `jsonb` document, a long `text` column, a big array.
-* **`RING_BUFFER_COUNT`** (range 1024–1048576, **clamped** to the nearest bound if you go outside it — an out-of-range value used to fall back to the _default_, so asking for 64 got you 65536) is _how many events can queue while NATS is unreachable_. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
-* **`MAX_COLUMNS`** is _how many columns one event may carry_ — normally left to
+* **`RING_BUFFER_COUNT`** (range 1024–1048576, **clamped** to the nearest bound if you go outside it — an out-of-range value used to fall back to the *default*, so asking for 64 got you 65536) is *how many events can queue while NATS is unreachable*. 65536 slots ≈ 1 second at 60K events/s. Below that, a NATS blip starts back-pressuring the WAL reader sooner.
+* **`MAX_COLUMNS`** is *how many columns one event may carry* — normally left to
   auto-detection; override it only to widen the ceiling ahead of a migration or to pin the
   value across instances.
 
@@ -1280,7 +1276,7 @@ Each knob answers a different question:
 
 Because `MAX_COLUMNS` is now resolved per instance rather than a single fixed constant, a
 static `BASE_BUF × RING_BUFFER_COUNT` table can no longer show the true total in one
-number — the columns term depends on what _your_ publication's widest table looks like.
+number — the columns term depends on what *your* publication's widest table looks like.
 The bridge computes and logs the exact figure at startup instead, both knobs included:
 
 ```txt
@@ -1390,7 +1386,7 @@ Same machine (Apple M2 Pro, 10 cores), same load (2,000,000-row burst, detailed 
 
 The gap is the virtualization layer, not the bridge: the same binary, same code, same load — only Docker's I/O virtualization differs. If you're chasing a specific throughput number on your own hardware, measure both before assuming the bridge itself is the ceiling.
 
-⚠️ Treat either figure as a reference point, not a spec — absolute throughput moves with machine, build mode, PostgreSQL version, and host load (a background process competing for CPU cores measurably drops it). A rerun that differs is not automatically a regression; see below for the number that _is_ comparable across machines.
+⚠️ Treat either figure as a reference point, not a spec — absolute throughput moves with machine, build mode, PostgreSQL version, and host load (a background process competing for CPU cores measurably drops it). A rerun that differs is not automatically a regression; see below for the number that *is* comparable across machines.
 
 <details>
 <summary>Full method, raw output, and how to read the <code>LOOP</code> line</summary>
@@ -1422,7 +1418,7 @@ rows, and `INSERT … SELECT … FROM generate_series` inserts one row per value
 statement writes 1000 rows in **one** transaction rather than 1000 round trips. That is
 deliberate: the point is to saturate the WAL, and a client sending 2,000,000 separate
 `INSERT`s would be measuring the client, not the bridge. 2000 statements × 1000 rows is
-also 2000 _transactions_, so the WAL carries 2000 BEGIN/COMMIT pairs — visible as the gap
+also 2000 *transactions*, so the WAL carries 2000 BEGIN/COMMIT pairs — visible as the gap
 between `wal_messages` and `cdc_events` below.
 
 **How to measure it.** The `METRICS` line is a 15 s sampler with no timestamp, so it
@@ -1468,7 +1464,7 @@ METRICS uptime=30 wal_messages=2004279 cdc_events=2000000 …
 | time decoding + packing (`proc_ms`) | 7.9% |
 | CPU while draining | **31% of one core** (`bridge_cpu_seconds_total` rose 7.6 s in total) |
 
-The number that _is_ comparable across machines is `iters` for a fixed event count. The
+The number that *is* comparable across machines is `iters` for a fixed event count. The
 WAL loop runs roughly one iteration per WAL message, so 2M events should cost ~2M
 iterations wherever it runs; a rerun within a few percent means the hot path is unchanged
 even when the wall-clock figures differ.
@@ -1531,6 +1527,49 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 
 ---
 
+## Requirements, Dependencies & Licenses
+
+**Managed via `build.zig.zon`:**
+
+* [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding. License MIT
+
+**Currently vendored (in `/`):**
+
+* [nats.zig](https://github.com/lalinsky/nats.zig). License Apache 2.
+
+**System:**
+
+* [libpq](https://www.postgresql.org/docs/current/libpq.html) ≧ 14  at build time (pipeline mode). License MIT
+
+* `PostgreSQL` ≧ 14 (`pgoutput` **binary** mode),
+* `Nats/JetStream` 2.10+
+
+---
+
+## Roadmap
+
+**Current — v0.14:**
+
+* [x] **The catalogue is the config.** One `zebridge_catalogue` row per table, written by `zebridge_enable(...)`, is the single source the bridge, sweeper and producer read; env vars are optional overrides. `grammar.json` holds only the static wire names; the bridge reconciles its NATS streams itself at boot.
+* [x] **Operator/JWT auth for consumers**, with a scoped signing key holding the grant template — a new consumer is one minted JWT + one mapping row, no server-config edit. An enrollment/mint endpoint on the bridge issues credentials; the bridge signs user JWTs in pure Zig.
+* **The client library**, step one: `libzebridge.js` (TypeScript pump + applier) drives the browser consumer today.
+* Read-only or read/write, separable (`init.core.sql` / `init.write.sql`); tenant-scoped reads via RLS, one-or-N bridges per tenant; last-write-wins ingress with tombstone + tiebreak.
+* Delta **generations** (full+delta chains in object storage) for fast seeding of hot tables.
+* Per-instance memory sizing, preflight schema analysis, a PG connection budget enforced in the roles.
+* Telemetry (`/metrics`, `/status`, `/health`) and a robustness suite: chaos, adversarial-input, and memory-leak scenarios (both build modes).
+
+**Next:**
+
+* [ ] **`libzebridge` native + the shared Zig eater** — the §10 vision: one sans-I/O applier core in Zig, compiled native (`.so`/`.dylib`/`.dll`, C ABI) for FFI hosts — mobile (Swift/Kotlin/Dart), native microservices, Windows (.NET/C++) — and to `applier.wasm` for **non-JS** hosts that want that same core without native FFI (Go via `wazero`, Python/Ruby/Elixir via wasmtime). JavaScript hosts do not need it: `libzebridge.js` already *is* the core, in TypeScript.
+* [ ] **Auth callout** — the login rides the NATS connect (`$SYS.REQ.USER.AUTH`), so even the mint endpoint disappears; the bridge is the responder.
+* [ ] Split READ (CDC + bootstrap) onto a **standby replica** (PG ≧ 16) from WRITE on the primary, with async snapshotting on the replica.
+* [ ] TLS on the NATS↔leaf and PG↔bridge links for cross-network deployments.
+* [ ] **Windows Server for the bridge daemon** — Zig targets `x86_64-windows`, but the daemon has Unix-isms to port first: POSIX signal handling for graceful shutdown (→ `SetConsoleCtrlHandler`) and the `poll()` WAL loop (→ `WSAPoll`), then the scenario suite re-run on Windows. Colocation with NATS is usually Linux, so this is for Windows-only shops. **Separate from the consumer**, which already runs on Windows today — native `libzebridge.dll` via P/Invoke, or `libzebridge.js` in a Node/Electron service, no wasm needed.
+* [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite (single owned connection); still to verify for PGlite, and to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.
+* [ ] **Retire the snapshot path.** Generations are the seed mechanism; snapshots survive only as the cold-start fallback. Cover that case with generations (a chain built on first sight of a tenant/table) and remove the snapshot request/serve path — one fewer moving part, and Postgres is never queried per consumer.
+* [ ] **A post-boot wiring checker** — one command, run once the bridge is up, that verifies the whole chain (catalogue ↔ streams ↔ grants ↔ RLS) and returns a single verdict. Today the pieces are `check.py` and the `zebridge_audit_*()` functions; the goal is to unify them into one green/red gate.
+* [ ] Metrics export to StatsD/InfluxDB
+
 ## Notes on nkeys
 
 * The NATS client has **no TLS**: `protocol.zig` sends `"tls_required":false`, so [bridge ↔ nats-server] must stay on a private network.
@@ -1548,7 +1587,7 @@ nk -gen user -pubout
 # public: UDIUGKDO52EGKF5VUPIZBJEMY2HY7W6PM4TP2D4FUMQ2XX74BZXMAHCV
 ```
 
-In _nats-server.conf_, set the **public** key:
+In *nats-server.conf*, set the **public** key:
 
 ```diff
 authorization {
@@ -1571,54 +1610,5 @@ NATS_URL=nats://localhost:4222 \
 ```
 
 ---
-
-## Dependencies & Licenses
-
-**Managed via `build.zig.zon`:**
-
-* [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding. License MIT
-
-**Currently vendored (in `/`):**
-
-* [nats.zig](https://github.com/lalinsky/nats.zig). License Apache 2.
-
-**System:**
-
-* [libpq](https://www.postgresql.org/docs/current/libpq.html) ≧ 14. License MIT
-
----
-
-## Roadmap
-
-**Current — v0.15:**
-
-* **PG ≧ 14** (`pgoutput` **binary** mode); `libpq` 14+ at build time (pipeline mode) — only the client needs it.
-* `NATS` 2.10+, colocated with the bridge on plain TCP (integrity is TLS's job on the links that cross a network — see below).
-* **The catalogue is the config.** One `zebridge_catalogue` row per table, written by `zebridge_enable(...)`, is the single source the bridge, sweeper and producer read; env vars are optional overrides. `grammar.json` holds only the static wire names; the bridge reconciles its NATS streams itself at boot.
-* **Operator/JWT auth for consumers**, with a scoped signing key holding the grant template — a new consumer is one minted JWT + one mapping row, no server-config edit. An enrollment/mint endpoint on the bridge issues credentials; the bridge signs user JWTs in pure Zig.
-* **The client library**, step one: `libzebridge.js` (TypeScript pump + applier) drives the browser consumer today.
-* Read-only or read/write, separable (`init.core.sql` / `init.write.sql`); tenant-scoped reads via RLS, one-or-N bridges per tenant; last-write-wins ingress with tombstone + tiebreak.
-* Delta **generations** (full+delta chains in object storage) for fast seeding of hot tables.
-* Per-instance memory sizing, preflight schema analysis, a PG connection budget enforced in the roles.
-* Telemetry (`/metrics`, `/status`, `/health`) and a robustness suite: chaos, adversarial-input, and memory-leak scenarios (both build modes).
-
-**Next:**
-
-* [ ] **`libzebridge` native + the shared Zig eater** — the §10 vision: one sans-I/O applier core in Zig, compiled native (`.so`/`.dylib`/`.dll`, C ABI) for FFI hosts — mobile (Swift/Kotlin/Dart), native microservices, Windows (.NET/C++) — and to `applier.wasm` for **non-JS** hosts that want that same core without native FFI (Go via `wazero`, Python/Ruby/Elixir via wasmtime). JavaScript hosts do not need it: `libzebridge.js` already *is* the core, in TypeScript.
-* [ ] **Auth callout** — the login rides the NATS connect (`$SYS.REQ.USER.AUTH`), so even the mint endpoint disappears; the bridge is the responder.
-* [ ] Split READ (CDC + bootstrap) onto a **standby replica** (PG ≧ 16) from WRITE on the primary, with async snapshotting on the replica.
-* [ ] TLS on the NATS↔leaf and PG↔bridge links for cross-network deployments.
-* [ ] **Windows Server for the bridge daemon** — Zig targets `x86_64-windows`, but the daemon has Unix-isms to port first: POSIX signal handling for graceful shutdown (→ `SetConsoleCtrlHandler`) and the `poll()` WAL loop (→ `WSAPoll`), then the scenario suite re-run on Windows. Colocation with NATS is usually Linux, so this is for Windows-only shops. **Separate from the consumer**, which already runs on Windows today — native `libzebridge.dll` via P/Invoke, or `libzebridge.js` in a Node/Electron service, no wasm needed.
-* [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite (single owned connection); still to verify for PGlite, and to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.
-* [ ] **Retire the snapshot path.** Generations are the seed mechanism; snapshots survive only as the cold-start fallback. Cover that case with generations (a chain built on first sight of a tenant/table) and remove the snapshot request/serve path — one fewer moving part, and Postgres is never queried per consumer.
-* [ ] **A post-boot wiring checker** — one command, run once the bridge is up, that verifies the whole chain (catalogue ↔ streams ↔ grants ↔ RLS) and returns a single verdict. Today the pieces are `check.py` and the `zebridge_audit_*()` functions; the goal is to unify them into one green/red gate.
-
-**Possible enhancements:**
-
-* [ ] Metrics export to StatsD/InfluxDB
-
-**Open questions:**
-
-* The documented burst benchmark is producer-bound under Docker: PostgreSQL needs ~6s to write 2M rows the bridge drains in ~7.6s of loop time. Running the same benchmark natively (no Docker/VM virtualization) removes that ceiling and reaches 200k+ events/s — see [An example of a measured throughput](#an-example-of-a-measured-throughput). What still isn't pinned down precisely is the bridge's own per-event CPU cost floor, independent of host contention — measured indirectly (CPU-seconds stay near-constant across runs even when wall-clock time doesn't), never isolated directly.
 
 **Contributions welcome!** If you find it useful (or find gaps), feedback is valuable.

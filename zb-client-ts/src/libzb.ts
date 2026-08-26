@@ -21,12 +21,14 @@
 /// path (one sqlocal connection — OPFS sync handles are exclusive, so a second
 /// read-only connection is not available here the way `libzebridge` native has one).
 
-import { wsconnect, NatsConnection, headers, credsAuthenticator } from '@nats-io/nats-core';
+import { wsconnect, headers, credsAuthenticator } from '@nats-io/nats-core';
+import type { NatsConnection } from '@nats-io/nats-core';
 import { jetstream, jetstreamManager, DeliverPolicy } from '@nats-io/jetstream';
 import { Kvm } from '@nats-io/kv';
 import { Objm } from '@nats-io/obj';
 import { decode, encode } from '@msgpack/msgpack';
-import { SQLocal } from 'sqlocal';
+import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
+import { browserStorage } from './browser-storage.ts';
 import { v7 as uuidv7 } from 'uuid';
 
 export interface ZeBridgeConfig {
@@ -39,6 +41,11 @@ export interface ZeBridgeConfig {
   creds?: string;
   grammar: any;   // the parsed grammar.json — wire names only; the consumer imports and passes it
   durable?: boolean;
+  /// The two seams (NOTES §10). Defaults are the browser: sqlocal/OPFS storage
+  /// and a NATS WebSocket dial. A Node host injects better-sqlite3 + TCP
+  /// (`zb-client-ts/node`); any other host brings its own pair.
+  storage?: StorageFactory;
+  connect?: (opts: any) => Promise<NatsConnection>;
 }
 
 export type TableState = {
@@ -165,12 +172,12 @@ export function principalFromCreds(creds: string): string | null {
 
 export class ZeBridge {
   public readonly dbName: string;
-  public sql: SQLocal['sql'];
-  public transaction: SQLocal['transaction'];
-  public deleteDatabaseFile: SQLocal['deleteDatabaseFile'];
+  public sql: StorageExec;
+  public transaction: Storage['transaction'];
+  public deleteDatabaseFile: Storage['deleteDatabaseFile'];
 
   private nc: NatsConnection | null = null;
-  private sqlocal: SQLocal;
+  private storage: Storage;
 
   private syncedTables = new Map<string, TableState>();
   private failed = new Set<string>();
@@ -203,7 +210,10 @@ export class ZeBridge {
   private rttIntervalId?: ReturnType<typeof setInterval>;
   private recountTimer?: ReturnType<typeof setTimeout>;
 
-  constructor(private config: ZeBridgeConfig) {
+  private config: ZeBridgeConfig;
+
+  constructor(config: ZeBridgeConfig) {
+    this.config = config;
     // The creds win over the passed principal — kills the mismatch class where
     // config says bob but the JWT says omar (every publish would just bounce).
     if (config.creds) {
@@ -216,10 +226,10 @@ export class ZeBridge {
     this.dbName = config.durable
       ? `zebridge_${config.principal}.sqlite3`
       : `zebridge_${Date.now()}.sqlite3`;
-    this.sqlocal = new SQLocal(this.dbName);
-    this.sql = this.sqlocal.sql;
-    this.transaction = this.sqlocal.transaction;
-    this.deleteDatabaseFile = this.sqlocal.deleteDatabaseFile;
+    this.storage = (config.storage ?? browserStorage)(this.dbName);
+    this.sql = this.storage.exec;
+    this.transaction = (fn) => this.storage.transaction(fn);
+    this.deleteDatabaseFile = () => this.storage.deleteDatabaseFile();
     this.outboxInitPromise = new Promise((resolve) => { this.resolveOutboxInit = resolve; });
   }
 
@@ -337,7 +347,8 @@ export class ZeBridge {
       this.emitStatus('connecting');
       this.appendLog('SYS', `Connecting to NATS at ${this.config.natsUrl}...`);
 
-      this.nc = await wsconnect({
+      const dial = this.config.connect ?? wsconnect;
+      this.nc = await dial({
         servers: this.config.natsUrl,
         ...(this.config.creds
           ? { authenticator: credsAuthenticator(new TextEncoder().encode(this.config.creds)) }
@@ -348,7 +359,7 @@ export class ZeBridge {
 
       this.emitStatus('connected');
       this.reach('connected');
-      this.appendLog('SYS', `Connected to NATS over WebSockets as '${this.config.principal}'`);
+      this.appendLog('SYS', `Connected to NATS as '${this.config.principal}'`);
       await this.watchSchemas();
       await this.watchVerdicts();
       await this.resolveTenant();
@@ -402,7 +413,7 @@ export class ZeBridge {
 
   // ─── internals ────────────────────────────────────────────────────────────
 
-  private run: Exec = (q, ...params) => (this.sql as any)(q, ...params);
+  private run: Exec = (q, ...params) => this.sql(q, ...params);
 
   private appendLog(topic: string, data: any, level = 'INFO') {
     for (const cb of this.logHandlers) cb(topic, data, level);
@@ -537,8 +548,7 @@ export class ZeBridge {
     const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
     const pkVals = state.pkCols.map((c) => keyObj[c]);
 
-    await this.transaction(async (tx) => {
-      const txExec: Exec = (q, ...p) => (tx.sql as any)(q, ...p);
+    await this.transaction(async (txExec) => {
       const current = await txExec(`SELECT * FROM ${table} WHERE ${where}`, ...pkVals);
       const currentRow = current[0] ?? null;
 
@@ -1034,8 +1044,7 @@ export class ZeBridge {
           ? ` ON CONFLICT(${conflict}) DO UPDATE SET ${sets}` +
             (vcol && cols.includes(vcol) ? ` WHERE excluded."${vcol}" > ${table}."${vcol}"` : '')
           : ` ON CONFLICT(${conflict}) DO NOTHING`;
-        await this.transaction(async (tx) => {
-          const txExec: Exec = (qq, ...p) => (tx.sql as any)(qq, ...p);
+        await this.transaction(async (txExec) => {
           // A full replaces the baseline wholesale; the DELETE shares the transaction
           // so a crash mid-apply cannot leave an empty table.
           if (step.kind === 'full') await txExec(`DELETE FROM ${table}`);
@@ -1256,8 +1265,7 @@ export class ZeBridge {
             batch = [];
             batchMsgs = [];
             try {
-              await this.transaction(async (tx) => {
-                const txExec: Exec = (q, ...p) => (tx.sql as any)(q, ...p);
+              await this.transaction(async (txExec) => {
                 // PROTOCOL.md §4's FK rule in executable form: enforcement waits for
                 // this batch's COMMIT, so a child arriving before its parent inside
                 // one batch cannot fail the apply.
@@ -1487,8 +1495,7 @@ export class ZeBridge {
     // Outbox insert and optimistic apply in ONE transaction (§7.1), persisted BEFORE
     // the publish: a duplicate is collapsed by dedup, a loss is unrecoverable.
     try {
-      await this.transaction(async (tx) => {
-        const txExec: Exec = (q, ...p) => (tx.sql as any)(q, ...p);
+      await this.transaction(async (txExec) => {
         const state = this.syncedTables.get(table);
         let before: any = null;
         if (state?.pkCols.length) {

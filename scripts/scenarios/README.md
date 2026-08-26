@@ -60,6 +60,7 @@ NOT folded into a "run everything" pass:
 | `chaos.py` | **restarts the shared nats-server** and kills PG backends — every other consumer (browsers, a running bridge) disconnects during it |
 | `race.py` | concurrent-contention probe, owns the bridge (WIP — see its banner) |
 | `adversarial.py` | fires hostile input at a probe bridge; owns the bridge, runs as a client principal |
+| `downtime.py` | stops and restarts a bridge on a SHARED slot to prove changes committed during the outage still replay; owns the only bridge |
 | `faults.py` | deletes and recreates the `REQUESTS` stream out from under the bridge |
 
 Rule of thumb: if a scenario's `⚠️` line says it *restarts nats-server*, *owns the only

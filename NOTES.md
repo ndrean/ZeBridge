@@ -1984,7 +1984,7 @@ corollary: an operator can run `leaks <prod-pid>` against a live ReleaseFast
 bridge for full-coverage leak detection with no rebuild — the one place the
 test-time tool doubles as a production tool.
 
-**Chaos & adversarial testing found THREE real robustness bugs (2026-08-26) — all
+**Chaos & adversarial testing found FOUR real robustness bugs (2026-08-26) — all
 in the bridge's OWN logic, neither in NATS or libpq, exactly where the weak point
 was predicted to be.** Memory was never the problem (0 leaks through every phase);
 the two failures were both in error-handling DECISIONS:
@@ -2016,6 +2016,79 @@ the two failures were both in error-handling DECISIONS:
      key stalled at round 2 of 5 inside the check window. Fixed in
      mutation_listener.zig — sleep only when the fetch is empty
      (`Config.Nats.mutation_pull_idle_ms`).
+  4. **Replication resumed from the WAL HEAD, not the slot → silent permanent
+     data loss** (found while validating the Node consumer, 2026-08-26). Both
+     `initReplicationStream` and the reconnect path called
+     `wal_monitor.getCurrentLSN()` and passed it to `START_REPLICATION`. That
+     tells PostgreSQL "start here", so **every change committed while the bridge
+     was down, or while its walsender was severed, was skipped and never
+     published**. The replication slot was doing its job — retaining the WAL —
+     and the bridge stepped over it on every start. Nothing errored; replicas
+     simply diverged from Postgres forever. Measured, reproducibly: stop the
+     bridge → `DELETE FROM memo WHERE txt='fixtest'` → restart → the delete never
+     reached CDC (`cdc.memo.delete` frozen at 193), while PG no longer had the
+     row. Fixed by DELETING the parameter: `startStreaming()` now takes no
+     position at all, and the `0/0` sentinel ("resume from this slot's
+     confirmed_flush_lsn" — not "from the beginning") is written literally into
+     the `START_REPLICATION` command in wal_stream.zig, where the protocol lives.
+     Verified: the same delete now replays.
+
+     The first attempt at this fix put `0/0` in `Config` and passed it at both
+     sites. Wrong, and the review caught it: **`Config` is for tunables an
+     operator may legitimately change; this is a protocol invariant with exactly
+     one correct value.** Naming it in config invites the very edit that caused
+     the bug. The parameter itself was the defect — it let two call sites express
+     a wrong position, and both did — so removing it makes the mistake
+     unrepresentable rather than merely discouraged. Same lesson as the timestamp
+     and publication guards: a rule that lives only in prose is a rule that bites.
+     (The boot path's `getCurrentLSN` call went too: once it no longer feeds
+     `START_REPLICATION` it was a Postgres round-trip serving one log line, and a
+     `current_lsn` in scope beside that call is precisely how it got passed for so
+     long. Lag reporting belongs to wal_monitor, which measures it against the
+     slot — the number that means something.)
+
+     **Guarded by `downtime.py`** (new, 2026-08-26), which is the answer to "why
+     did nothing catch this?": every existing scenario spins a FRESH probe slot,
+     and for a new slot the WAL head and `confirmed_flush_lsn` are the same
+     position — the two behaviours are literally identical, so the bug was
+     invisible by construction. The scenarios that restart or sever a bridge
+     (chaos.py) write and check AFTER the event, testing the *after* and never the
+     *during*. And the browser demo takes a fresh OPFS database on every load, so
+     accumulated drift was erased before anyone could see it. `downtime.py`
+     deliberately does the one thing none of them do: reuse ONE slot across two
+     bridge lifetimes and commit all three verbs into the gap between them.
+     Verified both ways — RED on the pre-fix binary (INSERT, UPDATE and DELETE all
+     lost: the window ate everything, not just deletes), GREEN on the fixed one.
+     It also covers `kill -9`, because a crash and a clean stop are different paths:
+     SIGKILL runs no handler and sends no final status update, so only what
+     PostgreSQL already holds survives.
+
+     **Where the resume position actually lives, since the naming invites
+     confusion.** Three different quantities wear the word "LSN":
+       - `pg_current_wal_lsn()` — the SERVER's WAL head. Only wal_monitor should
+         ever read it (lag arithmetic). Using it as a start position was the bug.
+       - `metrics.last_ack_lsn` — what the bridge has RECEIVED
+         (`metrics.updateLsn(wal_msg.wal_end)`); observability only. Note it is
+         RENAMED 2026-08-26 to `last_ack_lsn` in the Snapshot and on `/status`; it
+         used to be `current_lsn`, which read exactly like the first one — the same
+         conflation that made the bug natural to write.
+       - the CLIENT's `lsn` — `_zebridge_sync.global_last_lsn` and per-table
+         `state.lsn`, taken from `ev.lsn` inside each CDC payload, driving the seed
+         gate. It never reads the bridge's metrics.
+     None of these is the durable position. **That one belongs to PostgreSQL**: the
+     bridge sends `sendStatusUpdate(batch_pub.getLastConfirmedLsn())` — strictly
+     what JetStream has confirmed, never the WAL it merely received — and PG stores
+     it as the slot's `confirmed_flush_lsn`. The bridge keeps nothing across a
+     restart, which is exactly why `kill -9` is safe.
+
+     The trade this accepts, deliberately: a restart may REPUBLISH events it
+     already published (at-least-once instead of the previous at-most-once).
+     That is safe by construction — msg ids are LSN-derived, so JetStream dedups
+     inside its window and the client applier is idempotent (LWW upsert + LSN
+     gate). A duplicate is recoverable; a missing delete is not. This is also the
+     bug that made the earlier memo divergence (PG 4 rows, every replica 11)
+     read like a client bug: the client was applying faithfully, and the DELETE
+     events for those rows did not exist anywhere in CDC.
 
 What the adversarial pass CLEARED (17 hostile mutation shapes): no crash, no
 injection (column-name and value both neutralized — allowlist + `$N` params +
@@ -2028,6 +2101,13 @@ NATS jitter, PG loss, :9090 exhaustion, leaks), `adversarial.py` (hostile
 msgpack + /enroll fuzz), `race.py` (concurrent writers, poison interleaved with
 legit, leaks under contention). All were RED when they found the bugs — a test
 that cannot fail proves nothing.
+
+Finding 4 is the one that argues loudest for the [[test-escalation]] topic: no
+single-fault scenario could see it. Every scenario spins a FRESH probe slot, so
+"resume from the head" and "resume from the slot" are identical for them — the
+gap only exists for a slot that already has history and a bridge that was away.
+It took a second consumer, seeded independently and compared against Postgres
+row by row, to make the divergence visible at all.
 
 `race.py`'s long "WIP" convergence failures resolved 2026-08-26 into finding 3
 above plus three HARNESS lessons now encoded in the script: (a) `ZB_PSQL` must
@@ -3489,7 +3569,35 @@ Verified live as its own regression test: fresh load seeded `users` from chain g
 
 One real lesson, recorded in `vite.config.ts` where it bit: a **linked package's deps resolve inside its own node_modules and are served over `/@fs/` URLs — and vite does not resolve extensionless requests there**. sqlocal spawns its worker with `new Worker(new URL('./worker', import.meta.url))`; under `/node_modules/` vite resolves `worker` → `worker.js`, under `/@fs/` it fell through to the SPA fallback and served **index.html with a 200**. The worker parsed HTML, died silently, and every DB call hung forever — no error in any console, no socket ever dialed, because `connect()`'s first await is `initSyncState()`. Diagnosed by racing `SELECT 1` against a timeout, then fetching both worker URLs and comparing content-types. Fix: `resolve.dedupe` for sqlocal and the shared runtime deps (@nats-io/*, msgpack, uuid) so the linked package uses the consumer's copies. The same class of hazard awaits any host that embeds the library: **the storage adapter owns a worker, and the worker's URL resolution is the host bundler's problem** — an argument for making the storage seam explicit (step 3) instead of letting sqlocal's spawn hide inside the core.
 
-Next: the Node consumer (better-sqlite3 + TCP transport) as consumer #2, forcing the storage/transport seams into real interfaces; THEN carve the sans-I/O eater boundary inside the package.
+**Extraction step 3 LANDED (2026-08-26): the seams, and consumer #2.** The core no
+longer names a driver or a transport. `src/storage.ts` declares the seam (`Exec`,
+`transaction`, `deleteDatabaseFile`, a `StorageFactory` the HOST supplies);
+`browser-storage.ts` holds the sqlocal default; `node.ts` holds better-sqlite3 +
+`@nats-io/transport-node`, exported as `zb-client-ts/node`. `ZeBridgeConfig` gained
+`storage` and `connect`; the browser keeps working by defaulting to both.
+`examples/04-node-consumer/` is consumer #2, verified live: seeded 8 tables into
+better-sqlite3, CDC caught up (832 + 1282), `mutate()` round-tripped to an accepted
+verdict, outbox drained, and every table's row count matched Postgres exactly.
+
+Four things the second consumer taught, none of which a single host could have:
+  - **Node's ESM resolver needs explicit extensions.** Vite tolerated `from './libzb'`;
+    Node does not. All internal specifiers now carry `.ts`.
+  - **Type-only imports must say `import type`.** Node strips types syntactically,
+    without analysis, so a value-position type import is a runtime SyntaxError.
+    `verbatimModuleSyntax: true` is now on, so tsc catches the whole class.
+  - **The storage contract was implicit.** The core drives several lanes at once (a
+    CDC consumer per stream + the write path) and calls `transaction()` concurrently.
+    sqlocal satisfied that invisibly — one worker, one queue — so nobody had to say it.
+    better-sqlite3 does not, and interleaved BEGINs dropped whole 100-event batches
+    (`cannot start a transaction within a transaction`). The rule is now WRITTEN in
+    storage.ts and honoured by a promise chain in node.ts.
+  - **A host bundler can silently serve HTML as a worker.** (Step 2's lesson; the
+    reason the storage adapter belongs to the host, not the core.)
+
+Next: carve the sans-I/O eater boundary inside the package, capturing the tricky
+cases as golden fixtures AS THEY ARE WRITTEN (clamp, tiebreak, pruned-mid-walk,
+timestamp edges) — the fixtures, not "Node works", are what proves the core is
+portable to Zig.
 
 **Rejected on the way here, recorded so it stays rejected**: the reverse architecture (push RAW pgoutput to NATS, decode at the edge / wasmCloud). It breaks the tenant ACL — subject routing REQUIRES decoding (the tenant column lives in the decoded tuple), so raw frames hand every edge decoder all tenants mixed — and pgoutput is stateful (tuples reference relation OIDs from earlier Relation messages: every consumer grows a relcache, late joiners can't decode, retention must preserve schema messages forever). The gain would have been offloading ~3.5µs/event of decode CPU that was never scarce. The salvageable adjacent idea: an optional **SQL lane** — a small worker (wasmCloud fits HERE) consuming the already-tenant-routed streams and republishing rendered SQL phrases per dialect (`cdc-sql.<dialect>.<tenant>.<table>.>`), making ~50-line consumers possible for teams that want them. Behind the bridge, opt-in, ACL intact.
 

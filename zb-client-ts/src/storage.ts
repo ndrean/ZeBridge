@@ -1,0 +1,30 @@
+/// The storage seam (NOTES.md §10). The core never talks to a database driver —
+/// it talks to THIS. One call shape (`Exec`), one transaction shape (an Exec
+/// scoped to the transaction), one lifecycle verb. The browser default lives in
+/// browser-storage.ts (sqlocal/OPFS); Node's adapter in node.ts (better-sqlite3).
+/// Keeping drivers behind a factory is also the §10 lesson made structural: a
+/// driver that spawns a worker (sqlocal) makes its URL resolution the HOST
+/// bundler's problem — so the host, not the core, chooses the driver.
+
+export type Exec = (q: string, ...params: any[]) => Promise<any[]>;
+
+export interface Storage {
+  exec: Exec;
+  /// Runs fn inside ONE transaction; the passed Exec is scoped to it.
+  /// Rolls back if fn throws, commits otherwise.
+  ///
+  /// ⚠️ CONTRACT: the adapter MUST serialize. The core drives several lanes at
+  /// once (one CDC consumer per stream, plus the write path), so `transaction`
+  /// and `exec` can be called concurrently — and an adapter that lets two
+  /// transactions interleave gets `cannot start a transaction within a
+  /// transaction` and drops whole batches. sqlocal satisfied this invisibly
+  /// (one worker, one queue), which is exactly why it went unstated until a
+  /// second adapter appeared. If your driver does not serialize, wrap it (see
+  /// node.ts).
+  transaction(fn: (tx: Exec) => Promise<void>): Promise<void>;
+  deleteDatabaseFile(): Promise<void>;
+}
+
+/// The host hands the core a factory, not an instance: the core owns the DB
+/// NAME (per-principal, or per-load in the browser dev convention).
+export type StorageFactory = (dbName: string) => Storage;

@@ -1,0 +1,22 @@
+{
+  "name": "zb-node-consumer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Consumer #2 — a Node microservice on the same core as the browser (NOTES §10)",
+  "scripts": {
+    "start": "node --experimental-strip-types index.ts"
+  },
+  "dependencies": {
+    "zb-client-ts": "link:../../zb-client-ts",
+    "better-sqlite3": "^12.4.1",
+    "@nats-io/transport-node": "^3.4.0",
+    "@nats-io/nats-core": "^3.4.0",
+    "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/kv": "^3.4.0",
+    "@nats-io/obj": "3.4.0",
+    "@msgpack/msgpack": "^3.0.0-beta.1",
+    "sqlocal": "^0.18.0",
+    "uuid": "^14.0.1"
+  }
+}

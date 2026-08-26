@@ -455,7 +455,7 @@ pub const Server = struct {
         const status_cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
             const snap = try m.snapshot(self.allocator);
-            defer self.allocator.free(snap.current_lsn_str);
+            defer self.allocator.free(snap.last_ack_lsn_str);
 
             var buf: [4096]u8 = undefined;
             const body = try std.fmt.bufPrint(&buf,
@@ -464,7 +464,7 @@ pub const Server = struct {
                 \\  "uptime_seconds": {d},
                 \\  "wal_messages_received": {d},
                 \\  "cdc_events_published": {d},
-                \\  "current_lsn": "{s}",
+                \\  "last_ack_lsn": "{s}",
                 \\  "is_connected": {s},
                 \\  "pg_reconnect_count": {d},
                 \\  "nats_reconnect_count": {d},
@@ -483,7 +483,7 @@ pub const Server = struct {
                 snap.uptime_seconds,
                 snap.wal_messages_received,
                 snap.cdc_events_published,
-                snap.current_lsn_str,
+                snap.last_ack_lsn_str,
                 if (snap.is_connected) "true" else "false",
                 snap.reconnect_count,
                 snap.nats_reconnect_count,
@@ -524,7 +524,7 @@ pub const Server = struct {
         const cpu_ns = utils.cpuTimeNanos();
         if (self.metrics) |m| {
             const snap = try m.snapshot(self.allocator);
-            defer self.allocator.free(snap.current_lsn_str);
+            defer self.allocator.free(snap.last_ack_lsn_str);
 
             var buf: [8192]u8 = undefined;
             const body = try std.fmt.bufPrint(&buf,
