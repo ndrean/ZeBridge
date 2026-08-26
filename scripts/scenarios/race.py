@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Concurrent-consumer races against nats.zig — the entry point under contention.
 
-⚠️ WORK IN PROGRESS (2026-08-26). The `leaks`-under-concurrency check passes; the
-convergence checks have an unresolved HARNESS issue — the async omar-publish path
-does not land verdicts in this scenario's wiring (a test problem, NOT a product
-race: throughout every run the bridge correctly REJECTED every malformed input
-and never crashed, corrupted, or wedged — see chaos.py/adversarial.py, which DO
-pass and cover the product-relevant guarantees). Do not treat a red result here
-as a product regression until the publish wiring is fixed.
+FOUND A REAL BUG (2026-08-26, fixed same day): the mutation listener's pull loop
+slept 100 ms after EVERY message — a `for … else` meant as "sleep on timeout",
+but Zig runs the else on every normal completion — capping the whole ingress
+lane at ~10 writes/s regardless of backlog. Invisible to every single-write
+scenario; this one's 24 concurrent writers exposed it in one run. Fixed in
+mutation_listener.zig (sleep only when the fetch is empty; constant in Config).
+
+Harness lessons paid for on the way (all encoded below): ZB_PSQL must point at
+the host PG; publish failures must be LOUD (a swallowed error scored as
+"24/24 wrong"); and Nats-Msg-Ids must be namespaced per run — MUTATIONS dedups
+inside a 2-minute window, so a rerun with static ids gets clean PubAcks
+(duplicate=true) while storing NOTHING.
 
 The synchronous-per-connection structure is the safety ARGUMENT; this is the
 test. Many principals hammer the mutation lane at once, THROUGH a NATS reconnect,
@@ -39,6 +44,11 @@ import msgpack
 
 import zb
 
+import time
+RUN = str(int(time.time()))  # msgid namespace: JetStream dedups Nats-Msg-Id inside the
+# duplicate window — static ids made every rerun's publishes silent no-ops (PubAck
+# duplicate=true, nothing stored) and scored 24/24-wrong with zero real writes.
+
 LOG = "/tmp/zb_race_bridge.log"
 NATS_PID_FILE = "scripts/native/nats-server.pid"
 NATS_CONF = "scripts/native/nats-server-jwt.conf"
@@ -54,10 +64,12 @@ async def one_write(js, uid, value, msgid, raw=None):
         {"key": {"uid": uid}, "version": now_v(), "client_id": f"c-{value}",
          "data": {"uid": uid, "value": value, "updated_at": now_v()}})
     try:
-        await js.publish("mutation.omar.counter_public.update", payload, headers={"Nats-Msg-Id": msgid})
-        return True
-    except Exception:
-        return False
+        ack = await js.publish("mutation.omar.counter_public.update", payload, headers={"Nats-Msg-Id": msgid})
+        if getattr(ack, "duplicate", False):
+            return f"duplicate msgid {msgid}: PubAck ok but message NOT stored"
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
 
 
 async def main():
@@ -108,18 +120,30 @@ async def main():
         js = nc.jetstream()
 
         # ── 1. concurrent writers, distinct keys, each its final value ────────
+        pub_errors = []
         async def writer(i):
             uid = keys[i]
             for r in range(5):
-                await one_write(js, uid, i * 100 + r, f"race1-{i}-{r}")
+                err = await one_write(js, uid, i * 100 + r, f"race1-{RUN}-{i}-{r}")
+                if err:
+                    pub_errors.append(err)
             return i * 100 + 4  # the final value for this key
         finals = await asyncio.gather(*(writer(i) for i in range(N_WRITERS)))
+        # A swallowed publish failure scored this test "24/24 keys wrong" when the
+        # writes never entered the stream at all. Publishes must ACK before
+        # convergence is worth scoring.
+        if pub_errors:
+            zb.bad(f"{len(pub_errors)}/{N_WRITERS * 5} publishes FAILED — first: {pub_errors[0]} "
+                   f"(harness/wiring, not a convergence result)")
+            failed += 1
         await asyncio.sleep(6)
         alive1 = bridge.proc.poll() is None
         mismatched = 0
         for i, uid in enumerate(keys):
             got = zb.psql(f"SELECT value FROM public.counter_public WHERE uid='{uid}'", quiet=True).strip()
             if got != str(finals[i]):
+                if mismatched < 3:
+                    print(f"      key[{i}] {uid}: got {got!r}, want {finals[i]!r}")
                 mismatched += 1
         if alive1 and mismatched == 0:
             zb.ok(f"{N_WRITERS} concurrent writers × 5 writes: every key converged to its final value, no lost/torn update")
@@ -133,12 +157,18 @@ async def main():
         # non-invasive — pure concurrent contention against nats.zig.)
 
         # ── 3. poison interleaved with legit, many senders ────────────────────
+        pub_errors3 = []
         async def mixed(i):
             if i % 4 == 0:
-                await one_write(js, keys[i], 0, f"race3-poison-{i}", raw=msgpack.packb([1, 2])[:1] + b"\xff")
+                err = await one_write(js, keys[i], 0, f"race3-{RUN}-poison-{i}", raw=msgpack.packb([1, 2])[:1] + b"\xff")
             else:
-                await one_write(js, keys[i], 9000 + i, f"race3-{i}")
+                err = await one_write(js, keys[i], 9000 + i, f"race3-{RUN}-{i}")
+            if err:
+                pub_errors3.append(err)
         await asyncio.gather(*(mixed(i) for i in range(N_WRITERS)))
+        if pub_errors3:
+            zb.bad(f"{len(pub_errors3)}/{N_WRITERS} phase-3 publishes FAILED — first: {pub_errors3[0]}")
+            failed += 1
         await asyncio.sleep(6)
         legit_applied = sum(
             zb.psql(f"SELECT value FROM public.counter_public WHERE uid='{keys[i]}'", quiet=True).strip() == str(9000 + i)

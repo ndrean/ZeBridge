@@ -541,9 +541,15 @@ pub const MutationListener = struct {
                 );
 
                 msg.ack() catch {};
-            } else {
-                // Timeout, just loop again
-                utils.sleep(100 * std.time.ns_per_ms);
+            }
+
+            // Sleep ONLY when the fetch came back empty. This was a `for … else`,
+            // meant as "sleep on timeout" — but Zig runs the else on every normal
+            // completion, so the listener slept 100 ms after EVERY message and the
+            // whole ingress lane was capped at ~10 writes/s regardless of backlog
+            // (found by race.py: 24 writers × 5 writes outlived a 6 s window).
+            if (batch.messages.len == 0) {
+                utils.sleep(config.Nats.mutation_pull_idle_ms * std.time.ns_per_ms);
             }
         }
 

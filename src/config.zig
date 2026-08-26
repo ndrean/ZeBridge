@@ -43,6 +43,12 @@ pub const Nats = struct {
     pub const default_host = "127.0.0.1";
     pub const default_port = 4222;
 
+    /// Idle pause of the mutation pull loop when a fetch returns no messages.
+    /// Applies ONLY to the empty case — under backlog the loop must drain at
+    /// fetch speed (the sleep once ran unconditionally and capped ingress at
+    /// ~10 msg/s; see mutation_listener.zig).
+    pub const mutation_pull_idle_ms = 100;
+
     /// Derived, never written out again. Nothing in the live path builds a URL any more
     /// — `Endpoint` below is the address, and a URL is only ever an *input* — but the
     /// literal used to be spelled here, again in `nats_publisher.PublisherConfig`, and a

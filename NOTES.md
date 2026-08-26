@@ -1984,7 +1984,7 @@ corollary: an operator can run `leaks <prod-pid>` against a live ReleaseFast
 bridge for full-coverage leak detection with no rebuild — the one place the
 test-time tool doubles as a production tool.
 
-**Chaos & adversarial testing found TWO real robustness bugs (2026-08-26) — both
+**Chaos & adversarial testing found THREE real robustness bugs (2026-08-26) — all
 in the bridge's OWN logic, neither in NATS or libpq, exactly where the weak point
 was predicted to be.** Memory was never the problem (0 leaks through every phase);
 the two failures were both in error-handling DECISIONS:
@@ -2006,6 +2006,16 @@ the two failures were both in error-handling DECISIONS:
      by nature (same bytes fail forever) → dead-letter on first delivery, except
      OutOfMemory which stays transient. Applied at the decode call site, so any
      error the msgpack lib ever adds is permanent by construction.
+  3. **`for … else` sleep → ingress capped at ~10 writes/s** (race.py). The
+     mutation pull loop's 100 ms pause was written as a `for … else` meant as
+     "sleep on fetch timeout" — but Zig runs the else on every NORMAL completion,
+     so the listener slept after EVERY message, throttling the whole ingress
+     lane to ~10 msg/s regardless of backlog. Invisible to every single-write
+     scenario (their cadence sits under the cap — which is also why their PASS
+     verdicts were honest); 24 concurrent writers exposed it in one run: every
+     key stalled at round 2 of 5 inside the check window. Fixed in
+     mutation_listener.zig — sleep only when the fetch is empty
+     (`Config.Nats.mutation_pull_idle_ms`).
 
 What the adversarial pass CLEARED (17 hostile mutation shapes): no crash, no
 injection (column-name and value both neutralized — allowlist + `$N` params +
@@ -2015,13 +2025,20 @@ classification — the "synchronous ⇒ correct" assumption's exact blind spot.
 
 Three chaos/robustness scenarios now guard this: `chaos.py` (bad creds boot,
 NATS jitter, PG loss, :9090 exhaustion, leaks), `adversarial.py` (hostile
-msgpack + /enroll fuzz), `race.py` (concurrent writers through a broker restart,
-poison interleaved with legit). All were RED when they found the bugs — a test
-that cannot fail proves nothing. (`race.py` is WIP: its `leaks`-under-concurrency
-check passes, but the convergence checks have an unresolved harness wiring issue
-in the async omar-publish path — a TEST problem, not a product race; the bridge
-rejected every malformed input cleanly throughout, and chaos.py + adversarial.py
-cover the product guarantees that matter.)
+msgpack + /enroll fuzz), `race.py` (concurrent writers, poison interleaved with
+legit, leaks under contention). All were RED when they found the bugs — a test
+that cannot fail proves nothing.
+
+`race.py`'s long "WIP" convergence failures resolved 2026-08-26 into finding 3
+above plus three HARNESS lessons now encoded in the script: (a) `ZB_PSQL` must
+point at the host PG (the docker-exec default silently returns empty); (b) a
+swallowed publish exception scored as "24/24 keys wrong" — publish failures are
+now counted and loud; (c) Nats-Msg-Ids must be namespaced per run — MUTATIONS
+dedups inside a 2-minute window, so a rerun with static ids gets clean PubAcks
+(`duplicate=true`) while storing NOTHING. After the fix, race.py passes all
+three checks, and chaos.py + adversarial.py were RE-RUN against the fixed
+binary the same day (policy: the listener's behavior changed, so the recorded
+results are stale until re-proven) — both PASS, 0 leaks throughout.
 
 
 **Refinement (same day): the three PG-side rows are ONE relation.** The disjoint
