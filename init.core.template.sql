@@ -849,6 +849,22 @@ BEGIN
                 INSERT INTO public.zebridge_ddl_events
                        (schema_name, table_name, command_tag, schema_def)
                 VALUES ('public', tbl, 'DROP TABLE', NULL);
+
+                -- Reap the table's generated width guard. `zebridge_install_width_guard`
+                -- creates ONE FUNCTION PER TABLE, and DROP TABLE ... CASCADE removes the
+                -- trigger (which belongs to the table) but NOT the function (which does
+                -- not) — so every dropped table used to leave a dead
+                -- zebridge_width_guard_<tbl>() behind, permanently. Measured: two were
+                -- found in a running database, and one still carried the pre-2026-08-26
+                -- `WHERE id = 1` budget lookup against a column that no longer exists,
+                -- so calling it raised. Dead code that is also a landmine.
+                --
+                -- Here rather than in the bridge because it is DDL about the database's
+                -- own objects, it runs in the same transaction as the DROP, and it needs
+                -- no connection the bridge would have to open. `IF EXISTS` because a
+                -- table with no unbounded columns never had a guard installed.
+                EXECUTE format('DROP FUNCTION IF EXISTS public.%I()',
+                               'zebridge_width_guard_' || tbl);
             END IF;
         END IF;
     END LOOP;
