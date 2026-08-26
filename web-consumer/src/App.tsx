@@ -6,7 +6,7 @@
 
 import { createSignal, onCleanup, For } from 'solid-js';
 import grammar from '../../grammar.json';
-import { ZeBridge, credsFileText, principalFromCreds } from './libzb';
+import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
 import { nkeys } from '@nats-io/nats-core';
 
 const NATS_URL = 'ws://localhost:8080';
@@ -371,6 +371,7 @@ export default function App() {
     <>
       <header>
         <h1>ZeBridge CDC Web Consumer</h1>
+        <link rel="icon" type="image/svg+xml" href="/bridge.svg" />
         <div class="status-bar">
           <span class={`badge ${status()}`}>{status().toUpperCase()}</span>
           <span id="server-url">{NATS_URL}</span>

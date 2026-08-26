@@ -60,3 +60,6 @@ scripts/native/seed.txt
 scripts/native/nsc-store/
 scripts/native/creds/
 nats-data.pre-jwt/
+
+# zb-client-ts package
+zb-client-ts/node_modules/

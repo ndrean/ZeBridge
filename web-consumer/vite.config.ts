@@ -30,5 +30,14 @@ export default defineConfig({
   },
   optimizeDeps: {
     exclude: ['sqlocal']
+  },
+  resolve: {
+    // zb-client-ts is a linked (symlinked) package; without dedupe its imports
+    // resolve inside zb-client-ts/node_modules, served over /@fs/ URLs. sqlocal
+    // spawns its worker with an EXTENSIONLESS `new URL('./worker', import.meta.url)`
+    // — vite resolves that under /node_modules/ but serves the SPA index.html
+    // (200, text/html) for the /@fs/ form, so the worker dies silently and every
+    // DB call hangs. Dedupe pins the shared runtime deps to this package's copies.
+    dedupe: ['sqlocal', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
   }
 });

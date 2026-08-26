@@ -101,7 +101,7 @@ flowchart LR
 | -- | -- | -- |
 | zebridge | executable (daemon) | next to PG ← ZeBridge →  NATS |
 | libzebridge | native library, C ABI | mobile apps, desktop apps, microservices via FFI |
-| libzebridge.js | npm package (TS pump + wasm eater) | browsers, Node, Electron |
+| libzebridge.js | npm package (self-contained TypeScript) | any JS runtime: browsers, Node, Electron, Deno, Bun |
 
 We have worked examples for Flutter, webapps (WASM-SQLite + OPFS), and backend microservices in Node, Go,Python & Elixir.
 
@@ -538,7 +538,7 @@ You do not talk to NATS by hand. The library does all of it: it watches the sche
 
 Two builds of the same core:
 
-* **`libzebridge.js`** — an npm package for browsers, Node and Electron (a TypeScript pump + a wasm applier). The browser cannot use the native NATS transport, so it uses this.
+* **`libzebridge.js`** — a self-contained TypeScript package that runs **as-is** in any JS runtime: browsers, Node, Electron, Deno, Bun. No wasm and no native library needed — a JavaScript host just uses this.
 * **`libzebridge`** — a native library with a C ABI for mobile apps, desktop apps and microservices (via FFI).
 
 The API is small — three verbs and a doorbell:
@@ -1604,10 +1604,11 @@ NATS_URL=nats://localhost:4222 \
 
 **Next:**
 
-* [ ] **`libzebridge` native** — the §10 vision: one Zig applier core (sans-I/O "eater"), compiled to wasm (browser) and native (mobile/microservice via FFI), so every consumer shares one implementation of the sync logic.
+* [ ] **`libzebridge` native + the shared Zig eater** — the §10 vision: one sans-I/O applier core in Zig, compiled native (`.so`/`.dylib`/`.dll`, C ABI) for FFI hosts — mobile (Swift/Kotlin/Dart), native microservices, Windows (.NET/C++) — and to `applier.wasm` for **non-JS** hosts that want that same core without native FFI (Go via `wazero`, Python/Ruby/Elixir via wasmtime). JavaScript hosts do not need it: `libzebridge.js` already *is* the core, in TypeScript.
 * [ ] **Auth callout** — the login rides the NATS connect (`$SYS.REQ.USER.AUTH`), so even the mint endpoint disappears; the bridge is the responder.
 * [ ] Split READ (CDC + bootstrap) onto a **standby replica** (PG ≧ 16) from WRITE on the primary, with async snapshotting on the replica.
 * [ ] TLS on the NATS↔leaf and PG↔bridge links for cross-network deployments.
+* [ ] **Windows Server for the bridge daemon** — Zig targets `x86_64-windows`, but the daemon has Unix-isms to port first: POSIX signal handling for graceful shutdown (→ `SetConsoleCtrlHandler`) and the `poll()` WAL loop (→ `WSAPoll`), then the scenario suite re-run on Windows. Colocation with NATS is usually Linux, so this is for Windows-only shops. **Separate from the consumer**, which already runs on Windows today — native `libzebridge.dll` via P/Invoke, or `libzebridge.js` in a Node/Electron service, no wasm needed.
 * [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite (single owned connection); still to verify for PGlite, and to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.
 * [ ] **Retire the snapshot path.** Generations are the seed mechanism; snapshots survive only as the cold-start fallback. Cover that case with generations (a chain built on first sight of a tenant/table) and remove the snapshot request/serve path — one fewer moving part, and Postgres is never queried per consumer.
 * [ ] **A post-boot wiring checker** — one command, run once the bridge is up, that verifies the whole chain (catalogue ↔ streams ↔ grants ↔ RLS) and returns a single verdict. Today the pieces are `check.py` and the `zebridge_audit_*()` functions; the goal is to unify them into one green/red gate.

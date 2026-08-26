@@ -32,6 +32,9 @@ importers:
       uuid:
         specifier: ^14.0.1
         version: 14.0.1
+      zb-client-ts:
+        specifier: link:../zb-client-ts
+        version: link:../zb-client-ts
     devDependencies:
       typescript:
         specifier: ^5.7.2
