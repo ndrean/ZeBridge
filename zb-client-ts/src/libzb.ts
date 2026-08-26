@@ -969,18 +969,36 @@ export class ZeBridge {
     const pending = this.fkHeld;
     this.fkHeld = [];
     let applied = 0;
-    for (const { table, ev } of pending) {
-      try {
-        await this.transaction(async (txExec) => {
-          await txExec(`PRAGMA defer_foreign_keys = ON;`);
-          await this.applyEvent(table, ev, txExec);
-        });
-        applied++;
-      } catch (e) {
-        if (foreignKeyFailureKind(e) === 'missing-parent') {
-          this.fkHeld.push({ table, ev });   // still waiting; try again next batch
-        } else {
-          this.appendLog('CDC', `DROPPED held ${ev?.operation} on ${table}: ${e}`, 'ERROR');
+
+    // ⚠️ BULK FIRST, and this is the whole difference between converging and not.
+    // Retrying one-transaction-per-event after every batch is O(n * batches): with
+    // 15,000 held across 51 batches that is ~765,000 transactions, which never
+    // finishes and starves the very batches that carry the missing parents —
+    // measured, the held set sat at 15,000 with 0 resolved while the parent table
+    // stopped advancing entirely. One deferred transaction retries the whole set at
+    // once, and once the parents have landed that is a single COMMIT.
+    try {
+      await this.transaction(async (txExec) => {
+        await txExec(`PRAGMA defer_foreign_keys = ON;`);
+        for (const { table, ev } of pending) await this.applyEvent(table, ev, txExec);
+      });
+      applied = pending.length;
+    } catch {
+      // Some are still orphaned. NOW it is worth isolating, because only the ones
+      // that individually fail go back on the queue.
+      for (const { table, ev } of pending) {
+        try {
+          await this.transaction(async (txExec) => {
+            await txExec(`PRAGMA defer_foreign_keys = ON;`);
+            await this.applyEvent(table, ev, txExec);
+          });
+          applied++;
+        } catch (e) {
+          if (foreignKeyFailureKind(e) === 'missing-parent') {
+            this.fkHeld.push({ table, ev });   // still waiting; try again next batch
+          } else {
+            this.appendLog('CDC', `DROPPED held ${ev?.operation} on ${table}: ${e}`, 'ERROR');
+          }
         }
       }
     }
