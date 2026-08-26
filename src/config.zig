@@ -607,7 +607,7 @@ pub const Buffers = struct {
     /// bridge keeps running — it used to `@panic`, which crash-looped under a supervisor
     /// because the offending row precedes any later ACK and is re-read on restart.
     /// See README "Sizing BASE_BUF and RING_BUFFER_COUNT" for the memory formula.
-    pub const default_event_data_buffer_log2: u6 = 14; // 2^14 = 16KB
+    pub const default_event_data_buffer_log2: u6 = 12; // 2^12 = 4KB
 
     /// `BASE_BUF`'s floor. Nothing structural sits at 2^10 — it is just small enough
     /// that going lower is almost certainly a units mistake, not a deployment that
@@ -647,7 +647,7 @@ pub const Buffers = struct {
     pub const absolute_max_event_data_buffer_log2: u6 = 24;
 
     /// Ring buffer event count (number of pre-allocated event slots)
-    /// Default: 65536 events
+    /// Default: 32768 events
     /// Configurable via environment variable RING_BUFFER_COUNT
     /// Total memory = event_count × event_buffer_size
     /// Example: 65536 slots × 16KB (BASE_BUF=14) = 1GB slab
@@ -666,7 +666,7 @@ pub const Buffers = struct {
     /// reconnect fits entirely in RAM" property is gone. To restore it, raise
     /// RING_BUFFER_COUNT to 131072 (≈2184ms, ~4MB slab) rather than shortening
     /// the reconnect wait.
-    pub const default_ring_buffer_count: usize = 65536;
+    pub const default_ring_buffer_count: usize = 32768;
 
     /// `RING_BUFFER_COUNT`'s clamp range. Named here rather than left as bare literals
     /// in args.zig so the `--help` usage string can be generated from the same numbers

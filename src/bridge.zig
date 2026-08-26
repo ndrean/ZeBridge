@@ -88,7 +88,7 @@ comptime {
 var should_stop = std.atomic.Value(bool).init(false);
 
 /// Raised when a worker thread stops the bridge because of a configuration fault, as
-/// opposed to Ctrl+C or /shutdown. Only the exit code distinguishes the two for whatever
+/// opposed to Ctrl+C. Only the exit code distinguishes the two for whatever
 /// supervises this process, and "misconfigured" must not look like "finished".
 var boot_fatal = std.atomic.Value(bool).init(false);
 
@@ -300,6 +300,116 @@ fn initHttpServer(
     );
 }
 
+/// Hand a transaction's buffered slots to the background publisher.
+///
+/// Called at `.commit` for the whole transaction, and mid-transaction whenever the
+/// scratchpad fills (NOTES.md finding 5) — which is what lets a transaction of any
+/// size stream through at ring-buffer pace instead of killing the process.
+fn releaseTxSlots(
+    event_proc: anytype,
+    tx_slots_buf: []u32,
+    tx_slots_count: *usize,
+) !void {
+    var released: usize = 0;
+    while (released < tx_slots_count.*) : (released += 1) {
+        event_proc.releaseSlotToQueue(tx_slots_buf[released]) catch |err| {
+            log.err("Failed to release slot to publisher: {} — discarding {d} remaining slots", .{ err, tx_slots_count.* - released });
+            for (tx_slots_buf[released..tx_slots_count.*]) |s| event_proc.discardSlot(s);
+            tx_slots_count.* = 0;
+            return err;
+        };
+    }
+    tx_slots_count.* = 0;
+}
+
+/// Register THIS instance's row-width budget in `zebridge_limits`.
+///
+/// The PostgreSQL-side width guard refuses rows the change feed could not carry.
+/// Its budget used to be a single global row a human had to keep in step with
+/// `BASE_BUF` — SECURITY.md called it "the one coupling to maintain by hand", and
+/// it was duly forgotten the first time BASE_BUF changed: buffer 4 KB, table still
+/// 16384, so Postgres would accept rows that suspend the table on the first CDC
+/// touch. The budget is per INSTANCE (BASE_BUF is a per-process setting), so the
+/// instance is what should write it, every boot, from the value it actually uses.
+///
+/// Runs over the READER connection through a SECURITY DEFINER function, which is
+/// what lets a read-only deployment do this at all: the reader keeps SELECT +
+/// REPLICATION and gains no write privilege on any table — only EXECUTE on one
+/// function that writes rows describing this bridge.
+///
+/// Not fatal. A bridge that cannot register still replicates correctly; what it
+/// loses is the guard's accuracy, so this warns loudly rather than refusing to boot.
+fn registerRowWidthBudget(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    slot_name: []const u8,
+    pub_name: []const u8,
+    max_row_bytes: usize,
+) ?usize {
+    const conninfo = pg_config.connInfo(allocator, false) catch |err| {
+        log.warn("⚠️  row-width budget not registered (conninfo: {}) — the guard keeps its previous value", .{err});
+        return null;
+    };
+    defer allocator.free(conninfo);
+
+    const conn = c.PQconnectdb(conninfo.ptr);
+    defer if (conn != null) c.PQfinish(conn);
+    if (conn == null or c.PQstatus(conn) != c.CONNECTION_OK) {
+        log.warn("⚠️  row-width budget not registered (no connection) — the guard keeps its previous value", .{});
+        return null;
+    }
+
+    // Bound as parameters, never interpolated: a slot or publication name is
+    // operator input, and this is the one place a bridge writes SQL of its own.
+    var slot_buf: [256]u8 = undefined;
+    var pub_buf: [256]u8 = undefined;
+    var bytes_buf: [32]u8 = undefined;
+    const slot_z = std.fmt.bufPrintZ(&slot_buf, "{s}", .{slot_name}) catch return null;
+    const pub_z = std.fmt.bufPrintZ(&pub_buf, "{s}", .{pub_name}) catch return null;
+    const bytes_z = std.fmt.bufPrintZ(&bytes_buf, "{d}", .{max_row_bytes}) catch return null;
+    const params = [_]?[*:0]const u8{ slot_z.ptr, pub_z.ptr, bytes_z.ptr };
+
+    // Second column: the EFFECTIVE budget — MIN over the instances carrying anything
+    // in this publication. The ingress check below uses it so the bridge stops
+    // accepting writes PostgreSQL will then refuse (measured: a 3352-byte edge write
+    // passed a 4096 bridge and was rejected by a 2048 trigger — correct, but a wasted
+    // round trip and a confusing log).
+    const res = c.PQexecParams(
+        conn,
+        "SELECT public.zebridge_register_limits($1, $2::name, $3::integer), " ++
+            "COALESCE((SELECT MIN(max_row_bytes) FROM public.zebridge_limits), $3::integer)",
+        3,
+        null,
+        &params[0],
+        null,
+        null,
+        0,
+    );
+    defer if (res != null) c.PQclear(res);
+    if (res == null or c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.warn(
+            "⚠️  row-width budget not registered: {s} — the guard keeps its previous value, so PostgreSQL may accept rows this bridge cannot carry",
+            .{c.PQerrorMessage(conn)},
+        );
+        return null;
+    }
+
+    const n = std.mem.span(c.PQgetvalue(res, 0, 0));
+    const effective = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 1)), 10) catch max_row_bytes;
+    if (effective < max_row_bytes) {
+        log.info(
+            "📏 row-width budget registered: {d} bytes (slot '{s}', publication '{s}'), {s} guard(s) re-baked — ingress capped at {d}, the NARROWEST instance carrying these tables",
+            .{ max_row_bytes, slot_name, pub_name, n, effective },
+        );
+    } else {
+        log.info(
+            "📏 row-width budget registered: {d} bytes (slot '{s}', publication '{s}'), {s} guard(s) re-baked",
+            .{ max_row_bytes, slot_name, pub_name, n },
+        );
+    }
+    return effective;
+}
+
 /// Connect to PostgreSQL replication stream and resume from the SLOT's position.
 ///
 /// ⚠️ It resumes from the slot's `confirmed_flush_lsn` — the last position this
@@ -495,6 +605,18 @@ pub fn main(init: std.process.Init) !void {
         pub_name_z,
     );
     defer replication_ctx.deinit();
+
+    // The slot exists and the publication is verified, so the registrar's GC step
+    // cannot delete the rows it is about to write. Reader connection, SECURITY
+    // DEFINER function — works in the read-only profile too.
+    const own_event_buf = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
+    const effective_row_budget = registerRowWidthBudget(
+        allocator,
+        &pg_config,
+        slot_name_z,
+        pub_name_z,
+        own_event_buf,
+    ) orelse own_event_buf;
 
     // === Parse transition rules from environment variable
     // Format: "table1:col1,col2;table2:col3,col4"
@@ -786,7 +908,12 @@ pub fn main(init: std.process.Init) !void {
             io,
             &should_stop,
             &catalog_epoch,
-            @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
+            // min(my buffer, the narrowest instance carrying these tables). The first
+            // is physical — I cannot encode more than my own buffer. The second is the
+            // system constraint PostgreSQL's width guard enforces anyway, so refusing
+            // at ingress turns a wasted round trip (publish → apply → 23514 verdict)
+            // into an immediate, cheaper rejection with the same outcome.
+            @min(own_event_buf, effective_row_budget),
         );
         try mut_listener.?.start();
         log.info("✅ Mutation listener thread started\n", .{});
@@ -802,7 +929,7 @@ pub fn main(init: std.process.Init) !void {
     // Both exist because their failure modes are silent and late: an OOM kill under load,
     // and a row that packs successfully and is then refused by the server forever.
     {
-        const event_buf_bytes = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
+        const event_buf_bytes = own_event_buf;
         const count = runtime_config.batch_ring_buffer_size;
         const data_bytes = event_buf_bytes * count;
 
@@ -998,8 +1125,32 @@ pub fn main(init: std.process.Init) !void {
     // --->
 
     // Per-transaction slot scratchpad: holds ring-buffer indices for the current
-    // in-flight transaction. Nothing is released to the background publisher until
-    // the matching .commit arrives.
+    // in-flight transaction, normally released to the publisher at .commit so a
+    // consumer sees a whole transaction at once.
+    //
+    // ⚠️ When it FILLS, the batch is released early instead (`drainTxSlots` below).
+    // It used to log, discard the transaction and `return error.TransactionOverflow`,
+    // which killed the process — and since the transaction was still unacked in the
+    // slot, every restart replayed it and died again. Measured 2026-08-26: a single
+    // 2M-row transaction (an ordinary `DO` block, a bulk import, a `COPY`) made the
+    // bridge PERMANENTLY unstartable, recoverable only by an operator running
+    // pg_replication_slot_advance — which silently discards those changes and
+    // diverges every replica. NOTES.md finding 5.
+    //
+    // Releasing early is safe because `proto_version '1'` does not stream: PostgreSQL
+    // sends a transaction's changes only AFTER it commits, so everything here is
+    // already committed and there is nothing to roll back. The LSN is still acked
+    // only at .commit, so a crash mid-transaction replays the whole thing — and the
+    // pipeline is idempotent by construction (LSN-derived msg ids → JetStream dedup,
+    // LWW upsert + LSN gate in the applier). A duplicate is recoverable; a crash
+    // loop is not.
+    //
+    // This also un-breaks the back-pressure that was always there:
+    // `acquireAndFillSlot` blocks for a free slot with a watchdog, but during an
+    // all-or-nothing hold the publisher's queue stayed EMPTY, so no slot could ever
+    // come back and the wait would have been infinite. That starvation — created by
+    // the hold itself — is what the old row cap existed to pre-empt. Handing the
+    // publisher work removes the starvation, so the cap has nothing left to guard.
     //
     // Safety invariant: tx_slots_buf.len < ring_buffer_capacity.
     // If a single transaction claimed every ring buffer slot before .commit arrived,
@@ -1008,12 +1159,14 @@ pub fn main(init: std.process.Init) !void {
     // the ring buffer size the overflow guard always fires with at least one slot
     // still free, keeping the background thread able to make progress.
     const ring_buffer_capacity = runtime_config.batch_ring_buffer_size;
-    const max_tx_rows = ring_buffer_capacity - 1;
-    const tx_slots_buf: []u32 = try allocator.alloc(u32, max_tx_rows);
+    // Not a limit any more — the point at which a long transaction is handed to the
+    // publisher in a batch. One below capacity so a release always happens while at
+    // least one slot is still free.
+    const tx_flush_quantum = ring_buffer_capacity - 1;
+    const tx_slots_buf: []u32 = try allocator.alloc(u32, tx_flush_quantum);
     defer allocator.free(tx_slots_buf);
     var tx_slots_count: usize = 0;
-    std.debug.assert(ring_buffer_capacity > tx_slots_buf.len); // invariant: never exhaust the pool
-    log.info("Ring buffer capacity: {d} slots, transaction row limit: {d}", .{ ring_buffer_capacity, max_tx_rows });
+    log.info("Ring buffer capacity: {d} slots, transaction flush quantum: {d} rows (no transaction size limit)", .{ ring_buffer_capacity, tx_flush_quantum });
 
     // Track relation metadata (table info)
     var relation_map = std.AutoHashMap(u32, pgoutput.RelationMessage).init(allocator);
@@ -1211,10 +1364,9 @@ pub fn main(init: std.process.Init) !void {
                             .insert => |ins| {
                                 if (relation_map.get(ins.relation_id)) |rel| {
                                     if (tx_slots_count >= tx_slots_buf.len) {
-                                        log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
-                                        for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
-                                        tx_slots_count = 0;
-                                        return error.TransactionOverflow;
+                                        // Long transaction: hand this batch over so the publisher can drain
+                                        // and slots return to the pool. The LSN is still acked at .commit.
+                                        try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
                                     }
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) {
                                         // Before packing, and unconditionally: the write
@@ -1269,10 +1421,9 @@ pub fn main(init: std.process.Init) !void {
                                         // what the KV bucket should hold, same helper as
                                         // the insert branch above.
                                         if (tx_slots_count >= tx_slots_buf.len) {
-                                            log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
-                                            for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
-                                            tx_slots_count = 0;
-                                            return error.TransactionOverflow;
+                                            // Long transaction: hand this batch over so the publisher can drain
+                                            // and slots return to the pool. The LSN is still acked at .commit.
+                                            try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
                                         }
                                         if (try event_proc.packTenantToKvSlot(arena_allocator, rel, upd.new_tuple, wal_msg.wal_end)) |slot_idx| {
                                             tx_slots_buf[tx_slots_count] = slot_idx;
@@ -1283,10 +1434,9 @@ pub fn main(init: std.process.Init) !void {
                                     }
                                     if (event_proc.refused.shouldDrop(rel.name)) break :blk_upd;
                                     if (tx_slots_count >= tx_slots_buf.len) {
-                                        log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
-                                        for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
-                                        tx_slots_count = 0;
-                                        return error.TransactionOverflow;
+                                        // Long transaction: hand this batch over so the publisher can drain
+                                        // and slots return to the pool. The LSN is still acked at .commit.
+                                        try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
                                     }
                                     const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
@@ -1353,10 +1503,9 @@ pub fn main(init: std.process.Init) !void {
                                         break :blk_del;
                                     }
                                     if (tx_slots_count >= tx_slots_buf.len) {
-                                        log.err("Transaction overflow: exceeds {d} row limit — discarding entire in-flight transaction", .{tx_slots_buf.len});
-                                        for (tx_slots_buf[0..tx_slots_count]) |s| event_proc.discardSlot(s);
-                                        tx_slots_count = 0;
-                                        return error.TransactionOverflow;
+                                        // Long transaction: hand this batch over so the publisher can drain
+                                        // and slots return to the pool. The LSN is still acked at .commit.
+                                        try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
                                     }
                                     const slot_idx = try event_proc.packMutationToSlot(
                                         arena_allocator,
@@ -1485,7 +1634,6 @@ pub fn main(init: std.process.Init) !void {
             utils.sleep(2000 * std.time.ns_per_ms); // 2 seconds
 
             // Get latest LSN and reconnect
-
 
             // Clean up old connection before reconnecting
             pg_stream.deinit();
