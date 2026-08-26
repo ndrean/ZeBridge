@@ -340,6 +340,7 @@ pub const MutationListener = struct {
             .user = self.endpoint.user,
             .password = self.endpoint.pass,
             .nkey_seed = self.endpoint.seed,
+            .user_creds = self.endpoint.creds,
         });
         defer conn_nats.deinit();
 

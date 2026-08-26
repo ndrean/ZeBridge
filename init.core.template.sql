@@ -44,6 +44,14 @@ BEGIN
         CREATE USER ${POSTGRES_BRIDGE_USER} WITH PASSWORD '${POSTGRES_BRIDGE_PASSWORD}';
         ALTER USER ${POSTGRES_BRIDGE_USER} WITH REPLICATION;
     END IF;
+    -- The reader's connection BUDGET, DB-enforced (outside the IF: applies to
+    -- pre-existing roles on re-apply). Steady state is ~4 backends (producer,
+    -- snapshot worker, boot passes) — the replication stream rides a walsender
+    -- slot, not a regular backend. 10 leaves boot-burst headroom while making it
+    -- impossible for a bridge bug to eat the cluster's default 100.
+    ALTER ROLE ${POSTGRES_BRIDGE_USER} CONNECTION LIMIT 10;
+    IF true THEN
+    END IF;
 END;
 $$;
 
@@ -506,6 +514,7 @@ RETURNS boolean AS $$
         'zebridge_limits',       -- the change-feed width budget (one row)
         'zebridge_generation_overrides',  -- superseded by zebridge_catalogue.generations
         'zebridge_catalogue',    -- THE catalogue: one row per replicated table
+        'zebridge_invites',      -- enrollment codes: bridge infrastructure, never replicated
         -- ⚠️ the principal→tenant roster: BRIDGE INPUT (its CDC feeds $KV.tenants),
         -- never client-replicated — replicating it would disclose the roster the
         -- per-key $KV.tenants grant exists to protect (NOTES.md §1.12 part 3).

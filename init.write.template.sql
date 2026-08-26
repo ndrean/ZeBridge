@@ -54,6 +54,12 @@ BEGIN
         CREATE USER ${POSTGRES_WRITER_USER} WITH PASSWORD '${POSTGRES_WRITER_PASSWORD}'
             NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
     END IF;
+    -- The writer's connection BUDGET, DB-enforced (outside the IF: applies on
+    -- re-apply to existing roles). Inventory: mutation listener 1 + sweeper 1 +
+    -- enrollment permits ≤4 (http_server caps them, connect_timeout=3 bounds a
+    -- hang) + margin. 8 total: the bridge cannot starve the cluster's default
+    -- 100 even through a bug — the budget is a rule in PG, not prose.
+    ALTER ROLE ${POSTGRES_WRITER_USER} CONNECTION LIMIT 8;
 END;
 $$;
 
@@ -510,6 +516,28 @@ CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
     PRIMARY KEY (principal, tenant_id)
 );
 GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_BRIDGE_USER}, ${POSTGRES_WRITER_USER};
+
+-- Enrollment invites — the pump-starter (NOTES: the JWT mint flow). One row per
+-- invitation: a high-entropy single-use code the operator hands out out-of-band;
+-- presenting it to the bridge's /enroll endpoint IS the authentication (a one-time
+-- password), and the row carries everything the mint needs: principal, tenant,
+-- role. The principal CHECK is the naming police — the narrow waist between the
+-- identity world and the routing world ([A-Za-z0-9_-] is the intersection of NATS
+-- subject-token, KV-key and template-expansion alphabets, measured).
+CREATE TABLE IF NOT EXISTS public.zebridge_invites (
+    code       text PRIMARY KEY,
+    principal  text NOT NULL CHECK (principal ~ '^[A-Za-z0-9_-]+$'),
+    tenant_id  text NOT NULL,
+    role       text NOT NULL DEFAULT 'client',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL DEFAULT now() + interval '7 days',
+    used_at    timestamptz
+);
+-- The bridge redeems invites over its WRITER connection: read the row, stamp
+-- used_at, and register the principal→tenant mapping in the same transaction.
+GRANT SELECT, UPDATE ON public.zebridge_invites TO ${POSTGRES_WRITER_USER};
+GRANT INSERT ON public.zebridge_user_tenants TO ${POSTGRES_WRITER_USER};
+
 
 -- ⚠️ Never published as ordinary CDC — see the matching exemption in
 -- `zebridge_publication_guard()` (init.core.template.sql). The bridge special-cases this

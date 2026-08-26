@@ -126,6 +126,7 @@ pub const Publisher = struct {
             .user = ep.user,
             .password = ep.pass,
             .nkey_seed = ep.seed,
+            .user_creds = ep.creds,
             // The library reconnects on its own and buffers publishes while it does. The
             // hand-rolled reconnect below stays as the outer guard for the case it gives
             // up on, but it is no longer the first line of defence.

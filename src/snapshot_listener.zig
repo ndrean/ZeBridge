@@ -338,10 +338,8 @@ fn purgeOrphanChunks(
     // depends on. `js.purgeStream` on a stream with no matching messages (or a tenant
     // stream that doesn't exist at all) just fails softly into the existing warn-and-skip
     // branch below.
-    var upper_buf: [64]u8 = undefined;
-    const upper_len = @min(tenant.len, upper_buf.len);
-    const tenant_upper = std.ascii.upperString(upper_buf[0..upper_len], tenant[0..upper_len]);
-    const tenant_stream = std.fmt.allocPrint(allocator, "{s}{s}", .{ topo.init_stream_prefix, tenant_upper }) catch return;
+    // tenant AS-IS: stream names match the JWT tag (lowercase, never upper-cased).
+    const tenant_stream = std.fmt.allocPrint(allocator, "{s}{s}", .{ topo.init_stream_prefix, tenant }) catch return;
     defer allocator.free(tenant_stream);
 
     for ([_][]const u8{ tenant_stream, topo.init_stream_public }) |stream| {
@@ -940,6 +938,7 @@ pub const SnapshotListener = struct {
                 .user = endpoint.user,
                 .password = endpoint.pass,
                 .nkey_seed = endpoint.seed,
+            .user_creds = endpoint.creds,
             });
             defer snap_conn.deinit();
 
@@ -1186,6 +1185,7 @@ pub const SnapshotListener = struct {
             .user = endpoint.user,
             .password = endpoint.pass,
             .nkey_seed = endpoint.seed,
+            .user_creds = endpoint.creds,
         });
         defer pub_conn.deinit();
 

@@ -98,8 +98,8 @@ async def main():
     # zebridge_user_tenants declares which streams a deployment is supposed to have (the same list the bridge reconciles at boot), so it resolves
     # the ambiguity without needing admin credentials.
     prefix = (zb.TOPOLOGY.get("cdc_streams") or {}).get("tenant_prefix", "CDC_")
-    declared = {t: f"{prefix}{t.upper()}" for t in zb.tenants()}
-    victim_stream = declared.get(VICTIM, f"{prefix}{VICTIM.upper()}")
+    declared = {t: f"{prefix}{t}" for t in zb.tenants()}
+    victim_stream = declared.get(VICTIM, f"{prefix}{VICTIM}")
     victim_stream_declared = VICTIM in declared
     victim_stream_exists = None          # None = unknown, and unknown is not "safe"
     for stream in ("CDC", victim_stream):

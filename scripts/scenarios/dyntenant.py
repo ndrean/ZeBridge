@@ -50,8 +50,8 @@ def main():
     topo = zb.TOPOLOGY
     if TENANT in zb.tenants():
         sys.exit(f"'{TENANT}' is already mapped in zebridge_user_tenants — the whole point is that it is not")
-    cdc_stream = topo["cdc_streams"]["tenant_prefix"] + TENANT.upper()
-    init_stream = topo["init_streams"]["tenant_prefix"] + TENANT.upper()
+    cdc_stream = topo["cdc_streams"]["tenant_prefix"] + TENANT
+    init_stream = topo["init_streams"]["tenant_prefix"] + TENANT
     cdc_prefix = topo["subjects"]["cdc_prefix"]
 
     if stream_exists(cdc_stream):

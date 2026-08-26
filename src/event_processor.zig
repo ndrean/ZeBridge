@@ -39,6 +39,10 @@ pub const log = std.log.scoped(.event_processor);
 /// two paths disagree and clients build a local replica of our own bookkeeping.
 fn isInternalTable(name: []const u8) bool {
     return std.mem.eql(u8, name, "zebridge_ddl_events") or
+        // Enrollment invites: pure bridge infrastructure, never published — but its
+        // CREATE fires the DDL trigger like any table, and without this line the DDL
+        // path refused it and left a suspended $KV.schemas key in every client.
+        std.mem.eql(u8, name, "zebridge_invites") or
         std.mem.eql(u8, name, "schema_migrations");
 }
 
@@ -870,9 +874,10 @@ pub const EventProcessor = struct {
             {
                 const stream = if (step.cdc_stream) |t| blk: {
                     const prefix = self.topology.cdc_stream_prefix;
-                    const upper = std.ascii.upperString(name_buf[prefix.len..], t);
+                    // tenant AS-IS: stream names match the JWT tag (lowercase).
                     @memcpy(name_buf[0..prefix.len], prefix);
-                    break :blk name_buf[0 .. prefix.len + upper.len];
+                    @memcpy(name_buf[prefix.len..][0..t.len], t);
+                    break :blk name_buf[0 .. prefix.len + t.len];
                 } else self.topology.cdc_stream_public;
                 const tenant_filter = std.fmt.allocPrint(arena, "{s}.{s}.{s}.>", .{ self.topology.subject_cdc_prefix, step.tenant, table }) catch return;
                 if (js.purgeStream(stream, .{ .filter = tenant_filter })) |res| {
@@ -899,9 +904,10 @@ pub const EventProcessor = struct {
             {
                 const stream = if (step.init_stream) |t| blk: {
                     const prefix = self.topology.init_stream_prefix;
-                    const upper = std.ascii.upperString(name_buf[prefix.len..], t);
+                    // tenant AS-IS: stream names match the JWT tag (lowercase).
                     @memcpy(name_buf[0..prefix.len], prefix);
-                    break :blk name_buf[0 .. prefix.len + upper.len];
+                    @memcpy(name_buf[prefix.len..][0..t.len], t);
+                    break :blk name_buf[0 .. prefix.len + t.len];
                 } else self.topology.init_stream_public;
                 const shapes = [_][]const u8{ "{s}.snap.{s}.{s}.>", "{s}.snap.{s}.start.{s}", "{s}.snap.{s}.error.{s}", "{s}.snap.{s}.meta.{s}", "{s}.snap.{s}.schema.{s}.>" };
                 inline for (shapes) |shape| {

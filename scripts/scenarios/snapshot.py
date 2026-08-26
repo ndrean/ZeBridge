@@ -197,7 +197,7 @@ async def main():
     init_stream = (
         zb.TOPOLOGY["init_streams"]["public"]
         if tenant == zb.TOPOLOGY["open_tenant"]
-        else zb.TOPOLOGY["init_streams"]["tenant_prefix"] + tenant.upper()
+        else zb.TOPOLOGY["init_streams"]["tenant_prefix"] + tenant
     )
     filt = f"init.snap.{tenant}.{table}.{desc['snapshot_id']}.>"
     sub = await js.pull_subscribe(

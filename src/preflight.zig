@@ -642,6 +642,10 @@ pub fn reportTable(
 /// in init.{core,write}.template.sql and isInternalTable() in event_processor.zig.
 fn isInternalTable(name: []const u8) bool {
     return std.mem.eql(u8, name, "zebridge_ddl_events") or
+        // Enrollment invites: pure bridge infrastructure, never published — but its
+        // CREATE fires the DDL trigger like any table, and without this line the DDL
+        // path refused it and left a suspended $KV.schemas key in every client.
+        std.mem.eql(u8, name, "zebridge_invites") or
         std.mem.eql(u8, name, "schema_migrations");
 }
 
@@ -984,6 +988,10 @@ pub fn run(
         log.warn("⚠️  Tenant-column report failed: {}", .{err});
     };
 
+    reportConnectionBudget(conn, writer_role) catch |err| {
+        log.warn("⚠️  Connection-budget report failed: {}", .{err});
+    };
+
     // Refusing to start is deliberately NOT the default: one PK-less table would stop
     // replication for every other table, and a table created while the bridge runs
     // would turn a schema mistake into an outage. Skipping keeps the same correctness
@@ -1140,4 +1148,49 @@ test "roleFromUrl: not a URL" {
 
 fn preflightRole(url: []const u8) ?[]const u8 {
     return roleFromUrl(url);
+}
+
+/// The connection budget, introspected at boot — policy, never trust
+/// (NOTES 2026-08-26; contract also proven externally by connbudget.py, but the
+/// scenario runs when someone runs it and THIS runs every boot). Reads the live
+/// role limits and the cluster ceiling, then checks the three ways the budget
+/// drifts: a limit quietly raised to unlimited, a budget grown past the
+/// cluster's headroom, and — the one only the bridge can see — a writer limit
+/// LOWERED below what its own consumers need (mutation listener + sweeper +
+/// enroll permits), which would let an enrollment burst starve edge writes.
+/// Warnings, not refusals: none of these is a guaranteed runtime failure.
+fn reportConnectionBudget(conn: *c.PGconn, writer_role: ?[]const u8) !void {
+    const enrolls: i64 = Config.Http.max_concurrent_enrolls;
+
+    var wr_buf: [128]u8 = undefined;
+    const wr = writer_role orelse "";
+    const wr_z = std.fmt.bufPrintZ(&wr_buf, "{s}", .{wr}) catch return;
+    const params = [_]?[*:0]const u8{wr_z.ptr};
+    const res = c.PQexecParams(conn,
+        "SELECT current_setting('max_connections')::int, " ++
+            "COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = current_user), -1), " ++
+            "COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = $1), -1)",
+        1, null, &params[0], null, null, 0);
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return error.QueryFailed;
+
+    const max_conn = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch return;
+    const reader_lim = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 1)), 10) catch return;
+    const writer_lim = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 2)), 10) catch return;
+
+    log.info("🔌 connection budget: reader limit {d}, writer limit {d}, cluster max {d} — bridge worst case {d} (headroom {d})", .{
+        reader_lim, writer_lim, max_conn,
+        if (reader_lim > 0 and writer_lim > 0) reader_lim + writer_lim else -1,
+        if (reader_lim > 0 and writer_lim > 0) max_conn - reader_lim - writer_lim else -1,
+    });
+
+    if (reader_lim < 0)
+        log.warn("⚠️  the reader role has NO connection limit — a bridge bug can eat the cluster's {d}. ALTER ROLE <reader> CONNECTION LIMIT 10;", .{max_conn});
+    if (writer_role != null and writer_lim < 0)
+        log.warn("⚠️  the writer role has NO connection limit — same exposure. ALTER ROLE {s} CONNECTION LIMIT 8;", .{wr});
+    if (reader_lim > 0 and writer_lim > 0 and reader_lim + writer_lim > @divTrunc(max_conn, 2))
+        log.warn("⚠️  bridge budget {d}+{d} exceeds half of max_connections={d} — the headroom accounting is gone", .{ reader_lim, writer_lim, max_conn });
+    const reserved: i64 = Config.Http.pg_writer_reserved_connections;
+    if (writer_role != null and writer_lim > 0 and writer_lim < reserved + enrolls)
+        log.warn("⚠️  writer limit {d} < {d} enroll permits + reserved slots: an enrollment burst can starve the mutation listener/sweeper. Raise the role limit or lower Config.Http.max_concurrent_enrolls.", .{ writer_lim, reserved + enrolls });
 }

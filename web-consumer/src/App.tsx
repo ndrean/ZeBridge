@@ -6,7 +6,8 @@
 
 import { createSignal, onCleanup, For } from 'solid-js';
 import grammar from '../../grammar.json';
-import { ZeBridge } from './libzb';
+import { ZeBridge, credsFileText, principalFromCreds } from './libzb';
+import { nkeys } from '@nats-io/nats-core';
 
 const NATS_URL = 'ws://localhost:8080';
 
@@ -23,10 +24,62 @@ const DURABLE = ['1', 'true'].includes((import.meta.env.VITE_DURABLE as string |
 
 /// THE instance. One replica, one socket, one outbox — module-level like the
 /// SQLocal handle it wraps used to be.
+/// Operator/JWT mode: the dev server exposes scripts/native/creds/ under
+/// /creds (a public/ symlink), so each principal's tab fetches its own creds
+/// file — the JWT carries the permissions (scoped signing key), and no server
+/// conf names the principal. Missing file → fall back to user/password, so the
+/// same App works against a pre-operator server.
+/// Enrollment (?invite=<code>): the pump-starter, live. The app generates its
+/// OWN nkey pair, sends {code, user_pubkey} to the bridge's mint endpoint, and
+/// gets back a JWT — the seed never crosses the wire in either direction. The
+/// code is a one-time bearer secret (a password with hygiene); the principal is
+/// never sent — it comes back INSIDE the JWT, and libzb treats it as
+/// authoritative.
+const INVITE = _qs.get('invite');
+
+/// The button's half of enrollment: generate a pair, send code + PUBLIC key,
+/// stash the assembled creds in sessionStorage (demo-tier storage — per tab,
+/// gone with it) and reload clean. Returns an error string instead of reloading
+/// when the mint refuses.
+async function enroll(code: string): Promise<string | undefined> {
+  if (!code.trim()) return 'enter an invite code';
+  const kp = nkeys.createUser();
+  const seed = new TextDecoder().decode(kp.getSeed());
+  // GET with params: a CORS "simple request" — no preflight, no body parsing.
+  const res = await fetch(
+    `http://localhost:9090/enroll?code=${code.trim()}&user_pubkey=${kp.getPublicKey()}`,
+  ).catch(() => null);
+  if (!res) return 'bridge unreachable on :9090';
+  if (!res.ok) return `refused (${res.status}) — invalid, used, or expired code`;
+  const { jwt } = await res.json();
+  sessionStorage.setItem('zb_creds', credsFileText(jwt, seed));
+  location.href = location.pathname; // clean reload; the stash wins below
+  return undefined;
+}
+
+const CREDS = await (async () => {
+  const stashed = sessionStorage.getItem('zb_creds');
+  if (stashed) return stashed;
+  if (INVITE) {
+    const err = await enroll(INVITE); // URL flow reuses the button's path
+    if (err) console.error('enrollment failed:', err);
+    return undefined; // success never reaches here — enroll() reloads
+  }
+  return fetch(`/creds/${PRINCIPAL}.creds`)
+    .then((r) => (r.ok ? r.text() : undefined))
+    .catch(() => undefined);
+})();
+
+/// The creds are authoritative for identity — the header must show who the JWT
+/// says we are, not what the URL guessed (measured: an enrolled pia labeled
+/// "alice" because the display used the URL default).
+const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
+
 const zb = new ZeBridge({
   natsUrl: NATS_URL,
   principal: PRINCIPAL,
   password: PASSWORD,
+  creds: CREDS,
   grammar,
   durable: DURABLE,
 });
@@ -94,6 +147,8 @@ export default function App() {
   });
   const [health, setHealth] = createSignal<'up' | 'down' | 'unknown'>('unknown');
   const [tenant, setTenant] = createSignal<string>('—');
+  const [inviteCode, setInviteCode] = createSignal('');
+  const [enrollMsg, setEnrollMsg] = createSignal('');
   const [counts, setCounts] = createSignal<Record<string, number>>({});
   const [counterValues, setCounterValues] = createSignal<Record<string, number>>({});
   const [lastVerb, setLastVerb] = createSignal<Record<string, string>>({});
@@ -353,7 +408,7 @@ export default function App() {
       <main>
         <h3>Replica</h3>
         <p id="sync-state">
-          principal <strong>{PRINCIPAL}</strong> · client <strong>{zb.clientId}</strong>
+          principal <strong>{EFFECTIVE_PRINCIPAL}</strong> · client <strong>{zb.clientId}</strong>
           {' '}· tenant <strong>{tenant()}</strong>
           {' '}· held {pendingCount()}
         </p>
@@ -456,6 +511,26 @@ export default function App() {
           {sqlRows() && sqlRows()!.length === 0 && !sqlError() && (
             <div style="font-size: 12px; opacity: 0.7;">0 rows</div>
           )}
+        </div>
+
+        {/* Enrollment: the pump-starter as a BUTTON. Paste the one-time code the
+            operator handed you; the click generates this tab's own nkey pair,
+            sends code + public key to the bridge's mint, and reloads connected
+            as whoever the returned JWT says you are. */}
+        <div class="controls">
+          <span>enroll:</span>
+          <input
+            id="invite-input"
+            value={inviteCode()}
+            onInput={(e) => setInviteCode(e.currentTarget.value)}
+            placeholder="one-time invite code"
+            style="width: 22rem; font-family: monospace;"
+          />
+          <button
+            onClick={() => void enroll(inviteCode()).then((err) => setEnrollMsg(err ?? ''))}
+            style="background: #6a1b9a;"
+          >Enroll → get JWT</button>
+          <span style="color: #ef6c00;">{enrollMsg()}</span>
         </div>
 
         {/* One row per demo: the three test_types buttons are a set (accepted /

@@ -57,3 +57,6 @@ scripts/scenarios/__pycache__/
 scripts/native/*.log
 scripts/native/*.pid
 scripts/native/seed.txt
+scripts/native/nsc-store/
+scripts/native/creds/
+nats-data.pre-jwt/

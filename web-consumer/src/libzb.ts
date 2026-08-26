@@ -21,7 +21,7 @@
 /// path (one sqlocal connection — OPFS sync handles are exclusive, so a second
 /// read-only connection is not available here the way `libzebridge` native has one).
 
-import { wsconnect, NatsConnection, headers } from '@nats-io/nats-core';
+import { wsconnect, NatsConnection, headers, credsAuthenticator } from '@nats-io/nats-core';
 import { jetstream, jetstreamManager, DeliverPolicy } from '@nats-io/jetstream';
 import { Kvm } from '@nats-io/kv';
 import { Objm } from '@nats-io/obj';
@@ -33,6 +33,10 @@ export interface ZeBridgeConfig {
   natsUrl: string;
   principal: string;
   password?: string;
+  /// Operator/JWT mode: the CONTENT of a .creds file (user JWT + nkey seed).
+  /// When set it wins over user/password — the JWT carries the permissions
+  /// (scoped signing key), so no server conf names this principal at all.
+  creds?: string;
   grammar: any;   // the parsed grammar.json — wire names only; the consumer imports and passes it
   durable?: boolean;
 }
@@ -139,6 +143,26 @@ const lsnToNumber = (lsn: string): number => {
 const td = new TextDecoder();
 type Exec = (q: string, ...params: any[]) => Promise<any[]>;
 
+/// Assemble a .creds file's text from a JWT and a seed — what the enrollment
+/// flow holds after the mint responds (the seed never crossed the wire; the app
+/// generated the pair itself).
+export function credsFileText(jwt: string, seed: string): string {
+  return `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n` +
+         `-----BEGIN USER NKEY SEED-----\n${seed}\n------END USER NKEY SEED------\n`;
+}
+
+/// The JWT's own name claim — the creds are AUTHORITATIVE for the principal:
+/// the payload is plain base64 (only the signature is cryptographic), and the
+/// server expands permissions from THIS name, never from what the app believes.
+export function principalFromCreds(creds: string): string | null {
+  const m = creds.match(/BEGIN NATS USER JWT-+\s*\n([^\n]+)/);
+  if (!m) return null;
+  try {
+    const payload = m[1].split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(atob(payload)).name ?? null;
+  } catch { return null; }
+}
+
 export class ZeBridge {
   public readonly dbName: string;
   public sql: SQLocal['sql'];
@@ -180,6 +204,12 @@ export class ZeBridge {
   private recountTimer?: ReturnType<typeof setTimeout>;
 
   constructor(private config: ZeBridgeConfig) {
+    // The creds win over the passed principal — kills the mismatch class where
+    // config says bob but the JWT says omar (every publish would just bounce).
+    if (config.creds) {
+      const fromJwt = principalFromCreds(config.creds);
+      if (fromJwt && fromJwt !== config.principal) config.principal = fromJwt;
+    }
     // A fresh OPFS file per load by default — the project's own clean-room dev
     // convention; `durable` opts into the stable per-principal name that makes the
     // outbox meaningful across reloads.
@@ -309,8 +339,9 @@ export class ZeBridge {
 
       this.nc = await wsconnect({
         servers: this.config.natsUrl,
-        user: this.config.principal,
-        pass: this.config.password,
+        ...(this.config.creds
+          ? { authenticator: credsAuthenticator(new TextEncoder().encode(this.config.creds)) }
+          : { user: this.config.principal, pass: this.config.password }),
         reconnect: true,
         maxReconnectAttempts: -1,
       });
@@ -748,7 +779,7 @@ export class ZeBridge {
 
   /// `ev.optimistic` marks a synthetic event from our own mutate(): lsn is a sentinel
   /// so the gate never blocks it, and neither the echo-pop nor resume bookkeeping run.
-  private async applyEvent(table: string, ev: any, exec: Exec = this.run) {
+  private async applyEvent(table: string, ev: any, exec: Exec = this.run, seed = false) {
     const state = this.syncedTables.get(table);
     if (!state || !ev?.data) return;
     this.triggerChange(table, ev);
@@ -756,7 +787,16 @@ export class ZeBridge {
     // Strictly `<`, never `<=`: the first post-snapshot commit carries the watermark
     // LSN itself — skipping it loses exactly one row per snapshot (measured).
     // Re-applying is free (the upsert converges); skipping is permanent.
-    if (ev.lsn < state.lsn) return;
+    //
+    // ⚠️ `seed` bypasses the gate entirely. The schema descriptor is re-published at
+    // every bridge restart with the CURRENT WAL LSN, so on a fresh replica
+    // `state.lsn` starts far ahead of any stored snapshot's descriptor LSN — and
+    // this line silently dropped EVERY snapshot-replayed row while the replay
+    // counter kept counting ("3 rows applied", table empty — found live in the
+    // enrollment demo; chain seeding survived only because it writes outside this
+    // path). Seeding IS the baseline: it must land unconditionally, and the
+    // caller re-anchors state.lsn to the snapshot's own watermark afterwards.
+    if (!seed && ev.lsn < state.lsn) return;
 
     const op = ev.operation;
 
@@ -871,7 +911,7 @@ export class ZeBridge {
     // its original job was only to avoid the CDC__DEFAULT ghost stream).
     const open = this.config.grammar.open_tenant || '_default';
     if (!this.tenantValue || this.tenantValue === open) return [cfg.public];
-    return [`${cfg.tenant_prefix}${this.tenantValue.toUpperCase()}`, cfg.public];
+    return [`${cfg.tenant_prefix}${this.tenantValue}`, cfg.public];
   }
 
   private cdcStreamForTenant(tenant: string): string {
@@ -879,7 +919,7 @@ export class ZeBridge {
     if (!cfg) return this.config.grammar.streams.cdc;
     const open = this.config.grammar.open_tenant || '_default';
     if (!tenant || tenant === open) return cfg.public;
-    return `${cfg.tenant_prefix}${tenant.toUpperCase()}`;
+    return `${cfg.tenant_prefix}${tenant}`;
   }
 
   /// The tenant token THIS table's descriptors/manifests live under: the client's own
@@ -896,7 +936,7 @@ export class ZeBridge {
     if (!cfg) return this.config.grammar.streams.init;
     const open = this.config.grammar.open_tenant || '_default';
     if (!tenant || tenant === open) return cfg.public;
-    return `${cfg.tenant_prefix}${tenant.toUpperCase()}`;
+    return `${cfg.tenant_prefix}${tenant}`;
   }
 
   private async resolveTenant() {
@@ -1327,12 +1367,12 @@ export class ZeBridge {
             for (const rowVals of chunkDecoded) {
               const rowObj: any = {};
               cols.forEach((col: string, i: number) => { rowObj[col] = rowVals[i]; });
-              await this.applyEvent(table, { table, operation: 'INSERT', data: rowObj, lsn: desc.lsn });
+              await this.applyEvent(table, { table, operation: 'INSERT', data: rowObj, lsn: desc.lsn }, this.run, true);
               rowsApplied++;
             }
           } else if (state && chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
             for (const row of chunkDecoded.data) {
-              await this.applyEvent(table, { table, operation: 'INSERT', data: row, lsn: desc.lsn });
+              await this.applyEvent(table, { table, operation: 'INSERT', data: row, lsn: desc.lsn }, this.run, true);
               rowsApplied++;
             }
           }

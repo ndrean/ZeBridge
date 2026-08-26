@@ -71,6 +71,10 @@ pub const Nats = struct {
         user: ?[]const u8 = null,
         pass: ?[]const u8 = null,
         seed: ?[]const u8 = null,
+        /// Path to a .creds file (operator/JWT mode). Takes precedence in the
+        /// client over the bare seed; the file is re-read on every reconnect,
+        /// so rotation needs no restart.
+        creds: ?[]const u8 = null,
 
         pub const ParseError = error{ MissingScheme, BadPort };
 
@@ -117,6 +121,7 @@ pub const Nats = struct {
             // Kept out of the URL deliberately: a seed is a private key and belongs in
             // its own variable, not in a string that gets logged by accident.
             out.seed = rc.nats_seed;
+            out.creds = rc.nats_creds;
             return out;
         }
     };
@@ -128,6 +133,16 @@ pub const Nats = struct {
     /// Was 1000 here while nats_publisher used a hardcoded 2000; 2000 is the value
     /// that was actually in effect and the one the README documents, so that wins.
     pub const reconnect_wait_ms = 2000;
+
+    /// ── boot stream reconciliation (bridge.zig reconcileCdcStreams) ─────────
+    /// Parameters for the CDC/INIT streams the bridge creates itself. max_bytes
+    /// is deliberately modest: JetStream treats it as a RESERVATION against the
+    /// server's storage budget (the INIT_TANGO lesson — a 10G-per-tenant boot
+    /// refuses to create anything on a small server).
+    pub const reconciled_cdc_max_age_days: u64 = 8;
+    pub const reconciled_init_max_age_days: u64 = 7;
+    pub const reconciled_stream_max_bytes: i64 = 1 << 30;
+    pub const reconciled_stream_max_msgs: i64 = 10_000_000;
 
     /// Ceiling for the publisher's exponential reconnect backoff (milliseconds)
     pub const max_backoff_ms = 30_000;
@@ -226,6 +241,30 @@ pub const Http = struct {
     /// immediately rather than queued — a scraper retries in 10s, and refusing fast beats
     /// a queue nobody drains.
     pub const max_connections: u32 = 16;
+
+    /// Concurrent /enroll requests (each dials a PG writer connection). Must FIT
+    /// the writer role's CONNECTION LIMIT alongside the mutation listener and the
+    /// sweeper — preflight's budget introspection warns when it does not.
+    pub const max_concurrent_enrolls: u32 = 4;
+
+    /// The writer role's slots that are NOT enrollment's to spend: the mutation
+    /// listener's persistent connection plus the sweeper's reserved one (an
+    /// external cron job — transient, but its slot must exist when it fires).
+    pub const pg_writer_reserved_connections: u32 = 2;
+
+    /// Invite-code length bounds accepted by /enroll. Codes are operator-minted
+    /// hex (32 chars today); the range refuses garbage before any PG work.
+    pub const enroll_code_min_len: usize = 16;
+    pub const enroll_code_max_len: usize = 128;
+
+    /// Lifetime of a minted user JWT. Expiry IS the revocation story: a deleted
+    /// mapping stops mattering at most this long after the deletion.
+    pub const enroll_jwt_ttl_seconds: i64 = 60 * 60 * 24;
+
+    /// connect_timeout for the enroll handler's PG dial: a hung Postgres must
+    /// cost an enroll permit for seconds, not forever — the permits are the
+    /// flood bound, so nothing may park in one.
+    pub const enroll_pg_connect_timeout_seconds: u32 = 3;
 
     /// HTTP server bind address, overridable with `BRIDGE_BIND`.
     ///
@@ -704,6 +743,7 @@ pub const RuntimeConfig = struct {
     /// because `defaults()` predates parsing; `args.zig` always fills it in.
     nats_url: ?[]const u8,
     nats_seed: ?[]const u8, // Optional NKey Seed
+    nats_creds: ?[]const u8, // Optional .creds path (operator/JWT mode; wins over the seed)
 
     // Batch settings
     batch_max_events: usize,
@@ -760,6 +800,7 @@ pub const RuntimeConfig = struct {
             .topology = Topo.Topology.for_tests,
             .nats_url = Nats.default_url,
             .nats_seed = null,
+            .nats_creds = null,
             .batch_max_events = Batch.max_events,
             .batch_max_wait_ms = Batch.max_age_ms,
             .batch_max_payload_bytes = Batch.max_payload_bytes,

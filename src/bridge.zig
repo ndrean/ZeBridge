@@ -432,6 +432,27 @@ pub fn main(init: std.process.Init) !void {
         &metrics,
         null,
     );
+    // Enrollment/mint (NOTES: the JWT mint flow): armed only when the operator
+    // handed over the scoped client signing seed — the bridge is a signer, not a
+    // key store: no file I/O, the seed arrives like NATS_NKEY_SEED always did.
+    if (init.minimal.environ.getPosix("ZB_SIGNING_SEED")) |seed| {
+        if (init.minimal.environ.getPosix("ZB_ACCOUNT_PUB")) |acct| {
+            if (runtime_config.pg_writer_url) |wurl| {
+                // connect_timeout: a hung PG must cost an enroll permit for
+                // seconds, not forever — the permits are the flood bound.
+                const sep: []const u8 = if (std.mem.indexOfScalar(u8, wurl, '?') != null) "&" else "?";
+                http_srv.enroll = .{
+                    .writer_conninfo = try std.fmt.allocPrintSentinel(allocator, "{s}{s}connect_timeout={d}", .{ wurl, sep, Config.Http.enroll_pg_connect_timeout_seconds }, 0),
+                    .signing_seed = seed,
+                    .account_pub = acct,
+                };
+                log.info("🎟️ enrollment endpoint armed: GET /enroll (signer: scoped client key)", .{});
+            } else {
+                log.warn("🎟️ ZB_SIGNING_SEED set but no DATABASE_WRITER_URL — enrollment needs the writer; endpoint stays off", .{});
+            }
+        }
+    }
+
     // Start HTTP server thread AFTER http_srv is at its final memory location
     try http_srv.start();
     defer http_srv.join();
@@ -1545,21 +1566,24 @@ fn reconcileCdcStreams(
     topo: *const topology_mod.Topology,
 ) !void {
     const js = if (publisher.js) |*j| j else return error.NotConnected;
-    const day_ns: u64 = 24 * 60 * 60 * 1_000_000_000;
-    const cap_bytes: i64 = 1 << 30;
+    const day_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
+    const cap_bytes: i64 = Config.Nats.reconciled_stream_max_bytes;
 
     // ── per-tenant streams: ensure, create when missing ─────────────────────────
     for (topo.tenants) |tenant| {
         var name_buf: [256]u8 = undefined;
         inline for (.{
-            .{ topo.cdc_stream_prefix, "{s}.{s}.>", @as(u64, 8) },
-            .{ topo.init_stream_prefix, "{s}.snap.{s}.>", @as(u64, 7) },
+            .{ topo.cdc_stream_prefix, "{s}.{s}.>", Config.Nats.reconciled_cdc_max_age_days },
+            .{ topo.init_stream_prefix, "{s}.snap.{s}.>", Config.Nats.reconciled_init_max_age_days },
         }) |shape| {
             const prefix = shape[0];
-            // CDC_<TENANT> / INIT_<TENANT> — upper-cased, matching nats-init's old tr.
-            const upper = std.ascii.upperString(name_buf[prefix.len..], tenant);
+            // CDC_<tenant> / INIT_<tenant> — the tenant AS-IS, never upper-cased:
+            // the JWT signing key's role template renders CDC_{{tag(tenant)}}
+            // literally and nsc lowercases tags, so the stream name must match
+            // the tag byte-for-byte.
             @memcpy(name_buf[0..prefix.len], prefix);
-            const stream_name = name_buf[0 .. prefix.len + upper.len];
+            @memcpy(name_buf[prefix.len..][0..tenant.len], tenant);
+            const stream_name = name_buf[0 .. prefix.len + tenant.len];
             if (publisher.streamExists(stream_name)) {
                 log.info("✅ tenant '{s}' → stream {s}", .{ tenant, stream_name });
             } else {
@@ -1573,7 +1597,7 @@ fn reconcileCdcStreams(
                     .name = stream_name,
                     .subjects = &.{subj},
                     .max_age = shape[2] * day_ns,
-                    .max_msgs = 10_000_000,
+                    .max_msgs = Config.Nats.reconciled_stream_max_msgs,
                     .max_bytes = cap_bytes,
                     .compression = .s2,
                 });
@@ -1612,8 +1636,8 @@ fn reconcileCdcStreams(
         var res = try js.addStream(.{
             .name = topo.cdc_stream_public,
             .subjects = wanted.items,
-            .max_age = 8 * day_ns,
-            .max_msgs = 10_000_000,
+            .max_age = Config.Nats.reconciled_cdc_max_age_days * day_ns,
+            .max_msgs = Config.Nats.reconciled_stream_max_msgs,
             .max_bytes = cap_bytes,
             .compression = .s2,
         });
@@ -1628,8 +1652,8 @@ fn reconcileCdcStreams(
         var res = try js.addStream(.{
             .name = topo.init_stream_public,
             .subjects = &.{subj},
-            .max_age = 7 * day_ns,
-            .max_msgs = 10_000_000,
+            .max_age = Config.Nats.reconciled_init_max_age_days * day_ns,
+            .max_msgs = Config.Nats.reconciled_stream_max_msgs,
             .max_bytes = cap_bytes,
             .compression = .s2,
         });

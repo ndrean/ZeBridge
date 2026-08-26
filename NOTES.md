@@ -1780,7 +1780,160 @@ never moves.
 | ~~topology.tenants (runtime role)~~ | the data (`zebridge_tenants_of`) + `$KV.tenants` | runtime streams (dyntenant), client trusts KV — DONE |
 | ~~`topology.public_tables`~~ | **the catalogue's public rows** (`tenant_col IS NULL`) — `zebridge_public_tables` itself was a projection and is DROPPED | bridge derives untenanted routability from the TABLE, and EDITS `CDC_PUBLIC`'s subject filter itself at runtime when a public table is born — the same move it already makes creating `CDC_<TENANT>`. One migration then does everything: publish, guard, chain, route, stream subject. **Mechanically closes finding (3b)**: a live-born table gains its subject instead of publishing into the void and FATALing. `topology.public_tables` demotes to up.sh's fresh-boot seed, like `tenants` |
 | ~~`SYNC_RULES` / `TENANT_RULES` env~~ (was the last hand-worker reconciliation) | **`zebridge_table_rules`**, written by `zebridge_enable` in the SAME transaction as the guards it already installs with those very columns — the env var is a hand-copied duplicate of a fact the catalog holds | the bridge consumes it through the meta-cache + epoch-invalidation machinery it already has (invalidate.py's plumbing): the mutation listener's per-table meta read gains the rule columns, the sweeper and producer read the table they already query, decode-time tenant_col arrives at relation first-sight/DDL. Both T3 MANUAL rows vanish; "verified before migration" dissolves because rules+guards+publication commit atomically and nothing CAN disagree; env demotes to bootstrap/override with a boot-time disagreement warning during transition. Clients unaffected — the descriptor already carries version_column/tombstone_column |
-| NATS per-principal conf grants | **operator/JWT with a scoped signing key** | the permission shape is written ONCE on the signing key (`mutation.{{name()}}.>` etc.); every user JWT inherits it at mint time; a new principal or tenant is an auth-server event, not a conf edit + SIGHUP. The nina/tango grant block was the last manual rehearsal of what the signing key automates |
+| ~~NATS per-principal conf grants~~ (LANDED 2026-08-25) | **operator/JWT with a scoped signing key** | the permission shape is written ONCE on the signing key (`mutation.{{name()}}.>` etc.); every user JWT inherits it at mint time; a new principal or tenant is an auth-server event, not a conf edit + SIGHUP. The nina/tango grant block was the last manual rehearsal of what the signing key automates |
+
+**The JWT cutover (2026-08-25, evening): the endgame table is EMPTY.** Operator
+mode is live on the native stack. `scripts/native/jwt-bootstrap.sh` builds the
+whole trust chain from nothing: operator → SYS + ZEBRIDGE (JetStream unlimited)
+→ two signing keys — a `service` key (the bridge) and THE `client` scoped key,
+which carries the entire per-principal grant block ONCE as a role template
+(`mutation.{{name()}}.>`, `cdc.{{tag(tenant)}}.>`, the full `$JS.API` litany,
+`$KV.tenants.{{name()}}`). Onboarding a principal is now ONE mint:
+`nsc add user -K <client-sk> --tag tenant:<t>` plus the `zebridge_user_tenants`
+row — no conf edit, no SIGHUP, ever. The server conf shrank to
+`nats-server-jwt.conf`: operator + MEMORY resolver + websocket + jetstream;
+every authorization block is gone. Because nsc lowercases tags and templates
+substitute literally, tenant stream names carry the tenant AS-IS now
+(`CDC_kilo`, never `CDC_KILO`) — reconciler, pruner, snapshot listener, client
+and scenarios all changed together. Creds everywhere: the bridge takes
+`NATS_CREDS` (nats.zig re-reads the file per reconnect — rotation without
+restart), the browser fetches `/creds/<principal>.creds` (public/ symlink) and
+authenticates via `credsAuthenticator` — falling back to user/password against
+a pre-operator server; `zb.py` honors `NATS_CREDS` in both `connect()` and
+`nats_cli`. The account switch orphans the old `$G` JetStream state
+(`nats-data.pre-jwt`, kept) — the bridge rebuilt everything at boot: schemas,
+tenants backfill, the CDC family, chains. Proof, live: `cdc.kilo.note_t.insert`
+stored in `CDC_kilo`; omar publishes `mutation.omar.ping` but subscribing to
+`cdc.acme.>` answers `Permissions Violation`; a browser tab with NO password
+seeded as kilo and pushed an accepted counter write. (A denied JS API call, per
+the harness's own warning, times out unanswered — the scoped key's deny is
+silence on that path.) Residue, named: up.sh's NATS boot still speaks the old
+world (conf render + nkey creation) — next edit; `nats-server.conf.template`
+and check.py's conf-grant drift checks describe a dead mechanism and want
+retirement; and the nsc store (`scripts/native/nsc-store`, gitignored: it holds
+PRIVATE operator/account keys) is the new authority the mint endpoint will wrap.
+
+**The mint endpoint, LANDED (2026-08-25, night): enrollment end to end.** The
+"pump-starter" is real: `zebridge_invites(code PK, principal CHECK
+[A-Za-z0-9_-]+, tenant_id, role, expires_at, used_at)` — the naming police as a
+CHECK constraint, the code a one-time bearer secret — plus `GET
+/enroll?code&user_pubkey` on the bridge's existing HTTP listener. The browser
+generates its OWN nkey pair (`nkeys.createUser()` ships in nats-core), sends the
+code + public key, and the bridge redeems-and-registers in ONE writer-connection
+CTE (used_at is the single-use latch; the `user_tenants` INSERT is the same
+event's second projection — the bridge's own CDC then carries it to
+`$KV.tenants.<principal>` live, measured) and mints the user JWT in pure
+in-memory Zig: `src/jwt_mint.zig`, ~100 lines — nkeys signing the bridge already
+had, a local RFC-4648 base32 for the jti, claims matching nsc's byte-shape
+(`pub:{} sub:{}` required-empty; the limits fields were dropped to match,
+necessity untested). The seed never crosses the wire in either direction: the
+client keeps its own, the response is `{jwt, principal}`, and the client
+assembles the creds text itself (`credsFileText`). The principal comes back
+INSIDE the JWT and libzb + the App header now treat the creds as authoritative
+for identity — closing the config-says-bob-JWT-says-omar mismatch class.
+
+Proof, live: an invited browser tab (`?invite=<code>`, no principal, no
+password) enrolled as 'pia', tenant kilo resolved from the KV her own enrollment
+populated, pushed an accepted counter write (`mutation_ack.pia.…`); the same
+JWT's deny held (`Permissions Violation` on `cdc.acme.>`); a replayed code
+answers 403. Two debugging lessons paid for it: (1) `grep -o 'U[A-Z0-9]{55}'`
+extracts SUBSTRINGS — it sliced a "public key" out of the MIDDLE OF THE SEED
+TEXT, minting JWTs whose sub could never match the nonce signer; two
+Authorization Violations were blamed on the mint before line-anchored grep
+exposed the harness (the Zig mint had been correct from take one). (2) The
+enrolled page LOOKED wrong afterward — labeled alice — because the header showed
+the URL-default principal while the JWT said pia; the mutation subject
+(`mutation_ack.pia.…`) was the witness that couldn't lie. Residue: /enroll
+speaks plain HTTP on loopback (the Caddy block terminates TLS in production);
+the auth-callout responder — same lookup, same mint, riding `$SYS.REQ.USER.AUTH`
+so even the route disappears — is the filed next rung.
+
+**And the demo found a real client bug on its way out: the snapshot-replay LSN
+gate.** Every fresh session logged "note_t … 3 rows applied" while the table sat
+at 0 — for EVERY snapshot-replayed table, while chain-seeded ones were fine. The
+chain of causes: schema descriptors are re-published at every bridge restart
+with the CURRENT WAL LSN; `applySchema` initializes the table's `state.lsn` from
+that; snapshot rows are applied through `applyEvent`, whose `ev.lsn < state.lsn`
+gate then silently dropped every one of them (the descriptor's LSN predates the
+restarts) — and the replay counter incremented regardless, so the log claimed
+success. Chain seeding survived only because it writes outside `applyEvent`.
+Fix: seeding IS the baseline — replay now applies in `seed` mode that bypasses
+the gate, and the existing post-replay `state.lsn = desc.lsn` re-anchors the
+watermark to the snapshot's own truth. Two general lessons: a counter
+incremented beside a call that decides internally is a liar by construction
+(count what LANDED); and a schema republish must never advance a DATA watermark.
+The closing proof: an invited tab (`?invite=`, nothing else) enrolled as pia,
+seeded all three kilo notes BY NAME plus every public table, and pushed an
+accepted write — the full OAuth-shaped loop, minus only the real IdP.
+
+**The connection budget (2026-08-26): /enroll must not starve anything.** Exposing
+:9090 for more than metrics raised the right question: what bounds the damage? The
+accept loop already had the shape (a `std.Io.Group` with GUARANTEED-thread
+`concurrent` per connection — `async` may run inline, and a measured zero-byte
+client once wedged the whole server that way — plus a receive watchdog and a
+16-connection cap that refuses-and-closes: a queue nobody drains is just a slower
+outage). What /enroll uniquely burns is not HTTP threads but PG WRITER
+connections, so the bounds are layered where each resource lives:
+
+| layer | bound | enforced by |
+| --- | --- | --- |
+| enroll concurrency | 4, then 503 | bridge (`enroll_in_flight` permit pool, refuse-fast) |
+| a hung PG dial | 3s | libpq (`connect_timeout=3` on the enroll conninfo) |
+| `bridge_writer` total | **8** | **PG**: `ALTER ROLE … CONNECTION LIMIT` — mutation listener 1 + sweeper 1 + enrolls ≤4 + margin |
+| `bridge_reader` total | **10** | **PG** — producer, snapshot worker, boot bursts; the replication stream rides a walsender slot |
+| everyone | 100 | PG `max_connections` |
+
+"Match" here means CAP MINUS WHAT WE ALREADY NEED: the bridge may claim at most
+18 of the default 100 BY CONSTRUCTION, leaving 82 for operators, psql and the
+future app backends — the budget is the headroom accounting, not numeric
+equality. The sweeper counts as exactly one because it is an EXTERNAL job
+(cron/systemctl): its connection exists only for the seconds a sweep runs, but
+the budget reserves its slot so a sweep never races the ceiling. Both role
+limits live in the init templates (scratch-verified, live-applied,
+`rolconnlimit` = 10/8 confirmed), so a bridge bug that leaked connections in a
+loop would hit ITS role ceiling and log refusals on its own side while the
+cluster keeps breathing — the rule is in PG, not prose. Smoke, live: 12 parallel
+bogus enrolls answered `503 ×8, 403 ×4` while a concurrent `/metrics` scrape
+returned 200 mid-burst. Measured steady state at rest: reader 1 backend (the
+walsender), writer 1 (the mutation listener). Contract proven by
+`scripts/scenarios/connbudget.py` — first run 5/5, including the bite test: PG
+itself refused 3 of limit+2 sleeper connections with `too many connections for
+role`, so a changed setting (a `-1` limit, a deleted permit pool, an oversized
+budget) fails a scenario instead of surviving as stale prose. And the bridge
+INTROSPECTS the budget at every boot (preflight's 🔌 line: limits, ceiling,
+worst case, headroom) with three warnings: a limit raised to unlimited, a budget
+past half the cluster, and the coherence case only the bridge can judge — a
+writer limit lowered below its own consumers (listener 1 + sweeper 1 + enroll
+permits 4), which would let an enrollment burst starve edge writes. The warning
+was PROVEN to fire (limit dropped to 3 → boot warned → restored), and
+connbudget.py carries the same coherence check — the scenario for operators, the
+boot line for every start, PG for the enforcement: three layers, no prose.
+
+**The exhaustion contract (the counter-measure's other half): what actually
+happens at each ceiling.** Refusal everywhere, retry on the CALLER side, and no
+internal queue anywhere — deliberately. A queue in front of a saturated resource
+adds latency and memory without adding capacity, and the one flow that must
+never drop already HAS its durable queue: edge writes live in the client's
+outbox until verdict/echo (PROTOCOL §7.1) and in JetStream's MUTATIONS stream
+until acked-after-apply — a second buffer inside the bridge would double-queue
+the same bytes with worse semantics. Everything else is idempotent and cheap to
+retry from where the "is it still worth it" knowledge lives: the caller.
+
+| ceiling hit | the symptom | who retries | what is never lost |
+| --- | --- | --- | --- |
+| HTTP cap (16) | accept-then-CLOSE: the 17th connection gets no HTTP response at all (coarser than a 503, by design — writing a response would itself cost a slot) | the scraper's own schedule; the browser's fetch error | nothing was in flight |
+| enroll permits (4) | explicit `503 busy — retry shortly` | the human re-clicks / the app backs off | the invite row is untouched — a refused attempt consumes nothing |
+| writer role limit (8) via enroll | libpq `too many connections for role` inside the 3s dial → `503 backend unavailable` | same | same |
+| writer role limit via the mutation listener's reconnect | reconnect refused → its own backoff loop | the bridge retries; meanwhile mutations WAIT in JetStream (unacked → redelivered) and in client outboxes | edge writes — this is the flow the whole design protects |
+| writer limit via the sweeper | one cron run fails to connect | the next systemctl tick | tombstones reaped a cycle later; the watermark stays conservative (older = safe) |
+| cluster max_connections (100), eaten by OTHERS | the bridge's long-lived conns (walsender, listener) HOLD their slots; only reconnects and per-tick conns fail | bridge backoff / next tick | WAL — the replication slot retains it, the same §2.19 guarantee as any reader outage |
+
+One honest asymmetry, named: the role limits guarantee the bridge cannot starve
+the cluster, NOT that the cluster cannot starve the bridge — a CONNECTION LIMIT
+is a cap, not a reservation. The mitigation is that the bridge's load-bearing
+connections are long-lived (they already hold their slots when the flood
+arrives), and everything transient degrades into the retry shapes above.
+
 
 **Refinement (same day): the three PG-side rows are ONE relation.** The disjoint
 union of the two positive lists (tenant-scoped in TENANT_RULES, public in

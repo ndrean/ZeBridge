@@ -1,6 +1,9 @@
 const std = @import("std");
 const metrics_mod = @import("metrics.zig");
 const nats_publisher = @import("nats_publisher.zig");
+const jwt_mint = @import("jwt_mint.zig");
+const c = @import("c_imports.zig").c;
+const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
@@ -41,7 +44,29 @@ pub const Server = struct {
     /// Set after construction, like nats_publisher. Only its atomic summaries are read
     /// here — the map belongs to the replication thread (see refused_tables.zig).
     refused: ?*const refused_tables.Registry = null,
+    /// Enrollment/mint context (NOTES: the JWT mint flow). Set after construction
+    /// like nats_publisher; null leaves /enroll answering 404 — the bridge is only
+    /// a signer when the operator handed it the scoped seed.
+    enroll: ?EnrollCtx = null,
+    /// Concurrent enrollments in flight. Bounded separately from `open_conns`
+    /// because each one dials a PG writer connection — the resource a flood
+    /// actually starves (the bridge's own writer shares that Postgres). Refuse
+    /// fast past the cap, same philosophy as the connection cap above.
+    enroll_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     thread: ?std.Thread = null,
+
+    /// Generous for a human-paced flow: enrollment is one click per onboarding.
+    const max_concurrent_enrolls: u32 = Config.Http.max_concurrent_enrolls;
+
+    pub const EnrollCtx = struct {
+        /// The WRITER connection string — redeeming an invite writes (used_at,
+        /// user_tenants), and the reader must not be able to.
+        writer_conninfo: [:0]const u8,
+        /// The scoped CLIENT signing key's seed. Can only ever mint client-role
+        /// users — the role template lives in the account JWT, not here.
+        signing_seed: []const u8,
+        account_pub: []const u8,
+    };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -206,11 +231,9 @@ pub const Server = struct {
 
     /// Serve one connection, then close it.
     ///
-    /// ⚠️ Still missing a receive deadline. A client that connects and never sends now
-    /// parks one task instead of the accept loop — a leak rather than an outage, which is
-    /// the right direction but not a resolution. A bounded read timeout (and a cap on
-    /// concurrent connections) is the remaining hardening; both belong here, not in the
-    /// accept loop.
+    /// A client that connects and never sends parks one task, not the accept loop —
+    /// and the receive watchdog below reaps it: `done` is set the moment the head
+    /// parses, so only a connection with no usable request in time gets shut down.
     fn serviceStream(self: *Server, stream: std.Io.net.Stream) void {
         defer stream.close(self.io);
         defer _ = self.open_conns.fetchSub(1, .monotonic);
@@ -292,9 +315,120 @@ pub const Server = struct {
             try self.handleStatus(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/metrics")) {
             try self.handleMetrics(req);
+        } else if (method == .GET and std.mem.startsWith(u8, target, "/enroll?")) {
+            try self.handleEnroll(req);
         } else {
             try req.respond("Not Found\n", .{ .status = .not_found });
         }
+    }
+
+    /// One query-param value out of the target, percent-decoding skipped on
+    /// purpose: both accepted values are machine-generated from alphabets that
+    /// never need escaping (hex code, base32 nkey).
+    fn queryParam(target: []const u8, key: []const u8) ?[]const u8 {
+        const q = target[(std.mem.indexOfScalar(u8, target, '?') orelse return null) + 1 ..];
+        var it = std.mem.splitScalar(u8, q, '&');
+        while (it.next()) |pair| {
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+            if (std.mem.eql(u8, pair[0..eq], key)) return pair[eq + 1 ..];
+        }
+        return null;
+    }
+
+    /// GET /enroll?code=<invite>&user_pubkey=<U...> → {"jwt":"..."}
+    ///
+    /// The pump-starter, live: the code is a one-time bearer secret from
+    /// `zebridge_invites` (the DBA's half of onboarding); the pubkey is the half
+    /// of a pair the CLIENT generated — its seed never crosses the wire. Redeem
+    /// and register in ONE transaction on the writer connection, then mint. The
+    /// principal is never accepted from the caller; it comes out of the row.
+    fn handleEnroll(self: *Server, req: *std.http.Server.Request) !void {
+        // CORS: a browser on the dev origin calls this cross-port. Wide open is
+        // fine — the endpoint's protection is the code, not the origin.
+        const cors: []const std.http.Header = &.{
+            .{ .name = "content-type", .value = "application/json" },
+            .{ .name = "access-control-allow-origin", .value = "*" },
+        };
+        const ctx = self.enroll orelse {
+            try req.respond("{\"error\":\"enrollment not configured\"}\n", .{ .status = .not_found, .extra_headers = cors });
+            return;
+        };
+        // The permit, before any work — and before the PG dial especially. The
+        // slot is released on every exit path via the defer.
+        if (self.enroll_in_flight.fetchAdd(1, .monotonic) >= max_concurrent_enrolls) {
+            _ = self.enroll_in_flight.fetchSub(1, .monotonic);
+            try req.respond("{\"error\":\"busy — retry shortly\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            return;
+        }
+        defer _ = self.enroll_in_flight.fetchSub(1, .monotonic);
+
+        const target = req.head.target;
+        const code = queryParam(target, "code") orelse "";
+        const user_pub = queryParam(target, "user_pubkey") orelse "";
+        if (code.len < Config.Http.enroll_code_min_len or code.len > Config.Http.enroll_code_max_len or
+            user_pub.len != nats.nkeys.public_key_text_len or user_pub[0] != 'U')
+        {
+            try req.respond("{\"error\":\"bad request\"}\n", .{ .status = .bad_request, .extra_headers = cors });
+            return;
+        }
+
+        // One short-lived writer connection per enrollment — a rare, human-paced event.
+        const conn = c.PQconnectdb(ctx.writer_conninfo.ptr) orelse {
+            try req.respond("{\"error\":\"backend unavailable\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            return;
+        };
+        defer c.PQfinish(conn);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            try req.respond("{\"error\":\"backend unavailable\"}\n", .{ .status = .service_unavailable, .extra_headers = cors });
+            return;
+        }
+
+        var code_buf: [Config.Http.enroll_code_max_len + 8]u8 = undefined;
+        const code_z = std.fmt.bufPrintZ(&code_buf, "{s}", .{code}) catch unreachable;
+        const params = [_]?[*:0]const u8{code_z.ptr};
+        // Redeem + register, atomically: the row's used_at is the single-use latch
+        // (the WHERE arm makes replays lose the race), and the user_tenants insert
+        // is the same-event second projection — the bridge's own CDC then carries
+        // it to $KV.tenants.<principal> live.
+        const redeem_sql =
+            "WITH redeemed AS (" ++
+            "  UPDATE public.zebridge_invites SET used_at = now()" ++
+            "  WHERE code = $1 AND used_at IS NULL AND expires_at > now()" ++
+            "  RETURNING principal, tenant_id, role" ++
+            "), registered AS (" ++
+            "  INSERT INTO public.zebridge_user_tenants (principal, tenant_id)" ++
+            "  SELECT principal, tenant_id FROM redeemed" ++
+            "  ON CONFLICT DO NOTHING" ++
+            ") SELECT principal, tenant_id, role FROM redeemed";
+        const res = c.PQexecParams(conn, redeem_sql, 1, null, &params[0], null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
+            log.warn("🎟️ enrollment refused (code invalid, used, or expired)", .{});
+            try req.respond("{\"error\":\"invalid or used code\"}\n", .{ .status = .forbidden, .extra_headers = cors });
+            return;
+        }
+        const principal = std.mem.span(c.PQgetvalue(res, 0, 0));
+        const tenant = std.mem.span(c.PQgetvalue(res, 0, 1));
+
+        const jwt = jwt_mint.mint(
+            self.allocator,
+            ctx.signing_seed,
+            ctx.account_pub,
+            principal,
+            tenant,
+            user_pub,
+            Config.Http.enroll_jwt_ttl_seconds,
+            @as(i64, @intCast(c.time(null))),
+        ) catch {
+            try req.respond("{\"error\":\"mint failed\"}\n", .{ .status = .internal_server_error, .extra_headers = cors });
+            return;
+        };
+        defer self.allocator.free(jwt);
+
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\"}}\n", .{ jwt, principal });
+        defer self.allocator.free(body);
+        log.info("🎟️ enrolled '{s}' (tenant '{s}') — JWT minted, mapping registered", .{ principal, tenant });
+        try req.respond(body, .{ .status = .ok, .extra_headers = cors });
     }
 
     /// `std.http` writes the status line, headers and framing; this only picks the type.

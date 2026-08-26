@@ -58,6 +58,11 @@ async def connect():
     nothing — every permissions violation it exists to catch is one the bridge is allowed
     to perform.
     """
+    creds = os.environ.get("NATS_CREDS")
+    if creds:
+        return await nats.connect(NATS_URL.split("://")[0] + "://" +
+                                  NATS_URL.split("://", 1)[-1].rsplit("@", 1)[-1],
+                                  user_credentials=creds)
     if "@" in NATS_URL.split("://", 1)[-1]:
         return await nats.connect(NATS_URL)
     if not NKEY_SEED:
@@ -198,8 +203,10 @@ def nats_cli(*args, seed_file=None) -> subprocess.CompletedProcess:
     address = rest.rsplit("@", 1)[-1] if "@" in rest else rest
     server = f"{scheme}://{address}" if scheme else address
 
+    creds = os.environ.get("NATS_CREDS")
+    auth = ["--creds", creds] if creds else ["--nkey", str(seed_file)]
     return subprocess.run(
-        ["nats", "--server", server, "--nkey", str(seed_file), *args],
+        ["nats", "--server", server, *auth, *args],
         capture_output=True,
         text=True,
     )
