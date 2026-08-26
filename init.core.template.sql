@@ -660,6 +660,42 @@ BEGIN
                      WHERE i.indrelid = to_regclass(format('%I.%I', 'public', tbl))
                        AND i.indisprimary
                  ),
+                 -- Secondary indexes, so a replica can be QUERIED rather than only
+                 -- scanned. "Query your replica directly — joins, aggregates, offline"
+                 -- is the product's central promise, and without these a 100k-row table
+                 -- answers every predicate with a sequential scan.
+                 --
+                 -- Dialect-NEUTRAL and at the root, like 'pk': CREATE [UNIQUE] INDEX
+                 -- name ON tbl (cols) is the same statement in PostgreSQL/PGlite and in
+                 -- SQLite, so one list serves both consumer shapes.
+                 --
+                 -- Only what actually translates:
+                 --   NOT indisprimary — the PK is created inline with the table
+                 --   indpred IS NULL  — partial indexes carry a PG WHERE expression
+                 --   indexprs IS NULL — expression indexes carry PG expressions
+                 --   amname = 'btree' — gin/gist/brin have no SQLite equivalent
+                 -- Anything excluded is a performance loss on the replica, never a
+                 -- correctness one: an index is never the reason a row is right.
+                 'indexes', COALESCE((
+                     SELECT jsonb_agg(jsonb_build_object(
+                              'name', ci.relname,
+                              'unique', i.indisunique,
+                              'columns', (
+                                  SELECT jsonb_agg(a.attname ORDER BY k.ord)
+                                  FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                                  JOIN pg_attribute a
+                                    ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+                              )
+                            ) ORDER BY ci.relname)
+                     FROM pg_index i
+                     JOIN pg_class ci ON ci.oid = i.indexrelid
+                     JOIN pg_am am ON am.oid = ci.relam
+                     WHERE i.indrelid = to_regclass(format('%I.%I', 'public', tbl))
+                       AND NOT i.indisprimary
+                       AND i.indpred IS NULL
+                       AND i.indexprs IS NULL
+                       AND am.amname = 'btree'
+                 ), '[]'::jsonb),
                  -- Replica identity governs what UPDATE/DELETE actually carry, so both
                  -- the bridge and its clients need it: without a PK, DEFAULT means
                  -- PostgreSQL rejects writes outright, and only FULL yields old.* values

@@ -1488,6 +1488,40 @@ pub const EventProcessor = struct {
             ",\"replica_identity\":\"{s}\"",
             .{identity},
         ));
+        // Secondary indexes, forwarded verbatim from the DDL trigger: dialect-neutral
+        // and at the root, because CREATE [UNIQUE] INDEX is the same statement in
+        // PostgreSQL/PGlite and SQLite (NOTES §10c). Absent on a database whose
+        // trigger predates the field, which reads as "no indexes" — the same answer
+        // the descriptor gave before it existed.
+        if (parsed.value.object.get("indexes")) |ix| {
+            if (ix == .array) {
+                try json_str.appendSlice(arena, ",\"indexes\":[");
+                var emitted: usize = 0;
+                for (ix.array.items) |entry| {
+                    if (entry != .object) continue;
+                    const ix_name = entry.object.get("name") orelse continue;
+                    const ix_cols = entry.object.get("columns") orelse continue;
+                    if (ix_name != .string or ix_cols != .array or ix_cols.array.items.len == 0) continue;
+                    const uniq = entry.object.get("unique");
+                    const is_uniq = uniq != null and uniq.? == .bool and uniq.?.bool;
+
+                    if (emitted > 0) try json_str.appendSlice(arena, ",");
+                    try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                        arena,
+                        "{{\"name\":\"{s}\",\"unique\":{s},\"columns\":[",
+                        .{ ix_name.string, if (is_uniq) "true" else "false" },
+                    ));
+                    for (ix_cols.array.items, 0..) |cv, ci| {
+                        if (cv != .string) continue;
+                        if (ci > 0) try json_str.appendSlice(arena, ",");
+                        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{cv.string}));
+                    }
+                    try json_str.appendSlice(arena, "]}");
+                    emitted += 1;
+                }
+                try json_str.appendSlice(arena, "]");
+            }
+        }
         try self.appendWriteContract(arena, &json_str, clean_table, column_names.items);
         try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"lsn\":{d}}}", .{wal_end}));
 
@@ -1908,6 +1942,64 @@ pub const EventProcessor = struct {
                     "\"{s}\"",
                     .{std.mem.span(c.PQgetvalue(pk_result, pk_i, 0))},
                 ));
+            }
+            try json_str.appendSlice(arena, "]");
+
+            // Secondary indexes — the same list the DDL trigger builds, queried here
+            // because a table that emitted no DDL since boot never goes through that
+            // path. NOT NULL taught this lesson the hard way: fixing only one of the
+            // two schema paths gives new tables the field and silently leaves every
+            // table present at boot with the old shape (NOTES §10c).
+            //
+            // Same exclusions as the trigger: the PK is inline, and partial /
+            // expression / non-btree indexes carry PostgreSQL syntax with no SQLite
+            // equivalent. Dropping one costs a scan, never a wrong row.
+            const ix_query = try utils.allocPrintZ(
+                arena,
+                \\SELECT ci.relname, i.indisunique,
+                \\       (SELECT string_agg(a.attname, ',' ORDER BY k.ord)
+                \\          FROM unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
+                \\          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum)
+                \\FROM pg_index i
+                \\JOIN pg_class ci ON ci.oid = i.indexrelid
+                \\JOIN pg_am am ON am.oid = ci.relam
+                \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
+                \\  AND NOT i.indisprimary AND i.indpred IS NULL AND i.indexprs IS NULL
+                \\  AND am.amname = 'btree'
+                \\ORDER BY ci.relname;
+            ,
+                .{ "public", clean_table },
+            );
+            const ix_result = c.PQexec(conn, ix_query.ptr);
+            defer c.PQclear(ix_result);
+            try json_str.appendSlice(arena, ",\"indexes\":[");
+            if (c.PQresultStatus(ix_result) == c.PGRES_TUPLES_OK) {
+                const ix_rows = c.PQntuples(ix_result);
+                var ix_i: i32 = 0;
+                var ix_emitted: usize = 0;
+                while (ix_i < ix_rows) : (ix_i += 1) {
+                    const cols_csv = std.mem.span(c.PQgetvalue(ix_result, ix_i, 2));
+                    if (cols_csv.len == 0) continue;
+                    if (ix_emitted > 0) try json_str.appendSlice(arena, ",");
+                    try json_str.appendSlice(arena, try std.fmt.allocPrint(
+                        arena,
+                        "{{\"name\":\"{s}\",\"unique\":{s},\"columns\":[",
+                        .{
+                            std.mem.span(c.PQgetvalue(ix_result, ix_i, 0)),
+                            if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(ix_result, ix_i, 1)), "t")) "true" else "false",
+                        },
+                    ));
+                    var it = std.mem.splitScalar(u8, cols_csv, ',');
+                    var first = true;
+                    while (it.next()) |cname| {
+                        if (cname.len == 0) continue;
+                        if (!first) try json_str.appendSlice(arena, ",");
+                        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, "\"{s}\"", .{cname}));
+                        first = false;
+                    }
+                    try json_str.appendSlice(arena, "]}");
+                    ix_emitted += 1;
+                }
             }
             try json_str.appendSlice(arena, "]");
 

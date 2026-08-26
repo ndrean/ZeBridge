@@ -697,7 +697,11 @@ export class ZeBridge {
   private async applySchema(table: string, val: any) {
     // `pk_columns` is authoritative; `pk` is the legacy single-column form.
     const pkCols: string[] = Array.isArray(val.pk_columns) ? val.pk_columns : val.pk ? [val.pk] : [];
-    const cols: { name: string; type: string }[] = val.sqlite.columns;
+    const cols: { name: string; type: string; required?: boolean }[] = val.sqlite.columns;
+    // Dialect-neutral, at the root: CREATE [UNIQUE] INDEX is the same statement here
+    // and in PGlite/local Postgres, so one list serves every consumer shape (§10c).
+    const indexes: { name: string; unique?: boolean; columns: string[] }[] =
+      Array.isArray(val.indexes) ? val.indexes : [];
     const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
     const tombstoneColumn: string | null = typeof val.tombstone_column === 'string' ? val.tombstone_column : null;
     const tenantColumn: string | null = typeof val.tenant_column === 'string' ? val.tenant_column : null;
@@ -757,6 +761,10 @@ export class ZeBridge {
         this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
         this.reach('migrated');
         this.scheduleRecount();
+        // ⚠️ NOT a no-op path for indexes. Adding an index in PostgreSQL changes no
+        // column, so the republish that carries it lands EXACTLY here — returning
+        // without syncing would make `CREATE INDEX` upstream a silent no-op forever.
+        await this.syncIndexes(table, indexes);
         return; // identical schema, e.g. a boot republish
       } else {
         // The view goes FIRST (§1.17): DROP COLUMN re-validates every schema object
@@ -783,6 +791,10 @@ export class ZeBridge {
       await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
       if (viewCols) await this.run(`CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`);
 
+      // After every shape change, because a rebuild DROPs the table and takes its
+      // indexes with it.
+      await this.syncIndexes(table, indexes);
+
       this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
@@ -791,6 +803,49 @@ export class ZeBridge {
       await this.drainPending(table);
     } catch (err) {
       this.appendLog('SCHEMA', `Applying schema for ${table} failed: ${err}`, 'ERROR');
+    }
+  }
+
+  /// Bring the replica's secondary indexes in line with the published list.
+  ///
+  /// Without these the replica answers every predicate with a sequential scan, which
+  /// quietly undercuts the whole promise of querying it directly. The bridge sends
+  /// only what translates (no partial, expression or non-btree indexes), so this is a
+  /// straight create/drop against the names it names.
+  ///
+  /// Drops indexes we hold that are no longer published — an index removed upstream
+  /// should not linger, costing writes for a query nobody makes. `sqlite_`-prefixed
+  /// entries are SQLite's own (the implicit PK index) and are never touched.
+  private async syncIndexes(table: string, indexes: { name: string; unique?: boolean; columns: string[] }[]) {
+    try {
+      const rows = await this.run(
+        `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND name NOT LIKE 'sqlite_%'`,
+        table,
+      );
+      const have = new Set<string>((rows ?? []).map((r: any) => r.name));
+      const want = new Set(indexes.map((i) => i.name));
+
+      for (const stale of have) {
+        if (!want.has(stale)) {
+          await this.run(`DROP INDEX IF EXISTS "${stale}";`);
+          this.appendLog('SCHEMA', `${table}: dropped index ${stale} (no longer published)`, 'MIGRATE');
+        }
+      }
+      let created = 0;
+      for (const ix of indexes) {
+        if (!ix?.name || !Array.isArray(ix.columns) || !ix.columns.length) continue;
+        if (have.has(ix.name)) continue;
+        const cols = ix.columns.map((c) => `"${c}"`).join(', ');
+        await this.run(`CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS "${ix.name}" ON ${table} (${cols});`);
+        created++;
+      }
+      if (created) {
+        this.appendLog('SCHEMA', `${table}: ${created} index(es) created`, 'MIGRATE');
+      }
+    } catch (err) {
+      // An index is a performance object: failing to build one must never stop a
+      // table from syncing. Loud, but not fatal.
+      this.appendLog('SCHEMA', `${table}: index sync failed (queries will scan): ${err}`, 'ERROR');
     }
   }
 
