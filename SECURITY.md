@@ -417,7 +417,7 @@ re-proves the cause is gone.
 
 | where | CDC path | generation path |
 | --- | --- | --- |
-| **PostgreSQL** (the row, any writer) | `zebridge_width_guard` trigger — installed by `zebridge_enable`, unbounded columns only, budget from `zebridge_limits`, per (table, slot), written by each bridge at boot from its own `BASE_BUF`: row width ≥ budget → **reject** (SQLSTATE 23514, in the writer's own transaction) — ✅ `widthguard.py` (both doors, atomicity, ceiling-not-tax) | *the same trigger* — it guards the row, not the path — ✅ same |
+| **PostgreSQL** (the row, any writer) | `zebridge_width_guard` trigger — installed by `zebridge_enable`, unbounded columns only, budget baked into the trigger as a literal, re-derived at every bridge boot from `zebridge_limits` (one row per instance) as MIN over the instances carrying the table: row width ≥ budget → **reject** (SQLSTATE 23514, in the writer's own transaction) — ✅ `widthguard.py` (both doors, atomicity, ceiling-not-tax) | *the same trigger* — it guards the row, not the path — ✅ same |
 | **bridge ingress** (mutation listener) | payload ≥ event buffer → **reject** (`RowTooLargeToReplicate`, dead-lettered on first delivery, verdict). A deliberate lower bound: the CDC event is always larger than the payload, so nothing legitimate is refused — ✅ `rowsize.py` (incl. the published `max_row_bytes`) | — (generations are read-path; there is no ingress) |
 | **bridge egress** | boot preflight (stored rows + column defaults vs buffer) → **quarantine** before a byte streams — ✅ `legacybait.py` (re-derived every boot, and the readmission after repair); decode-time slot overflow → **quarantine** (`suspendForRowTooLarge`: ACK past, suspension published) — ✅ `legacybait.py` (log + `"suspended":true` in `$KV.schemas`); *until snapshot retirement:* `measureWidestRow` ≥ chunk budget → **quarantine** — ✅ `wide.py` | widest row, measured free in the producer's encode loop, ≥ event buffer → **warning** on every build (chains carry it; CDC will suspend on its next touch) — the detector for rows that predate the trigger — ✅ `legacybait.py` (warns on the first build over planted bait). Object chunking (nats.zig, 128 KB) means no wire limit exists on this path to check |
 | **NATS broker** | any single message > `max_payload` → publish refused — the floor under `BASE_BUF`'s ceiling (2^20 = 1 MB). Broker contract, not bridge code — no scenario, by design | chunk messages are 128 KB by construction; the broker limit is unreachable |
@@ -430,8 +430,8 @@ dissolves its wire limit, and only the legacy detector remains.
 
 The budget is **not** maintained by hand. Each bridge registers its own
 `2^BASE_BUF` at boot — `zebridge_register_limits(slot, publication, bytes)`, one
-row per (table, slot) — so the trigger's ceiling is always the buffer the instance
-actually runs with. It was a manual `UPDATE` until 2026-08-26, this file said so,
+row per INSTANCE, keyed by slot — so the trigger's ceiling is always the buffer the
+narrowest instance carrying that table actually runs with. It was a manual `UPDATE` until 2026-08-26, this file said so,
 and it was forgotten the first time `BASE_BUF` moved: buffer 4 KB, table still
 16384, PostgreSQL accepting rows that suspend the table on the first CDC touch.
 

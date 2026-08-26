@@ -1579,7 +1579,7 @@ step — generates a STATIC per-table BEFORE INSERT/UPDATE trigger over unbounde
 columns only (text, unbounded varchar, bytea ×2 for the hex rendering,
 json/jsonb/xml, arrays; a bounded-only table gets NO trigger — statically safe,
 zero hot-path cost; live: users needed none, test_types guards 4 columns). Budget
-in the one-row `zebridge_limits` table (internal-listed, default 16384 = 2^BASE_BUF
+in the `zebridge_limits` table (internal-listed; ONE ROW PER INSTANCE since 2026-08-26 — see §10b — default 16384 = 2^BASE_BUF
 — one UPDATE when BASE_BUF changes, not a re-install). It RAISEs ERRCODE 23514
 (check_violation): class 23 is already in the mutation listener's permanent set, so
 fix 2 cost ZERO bridge code — an edge write becomes verdict `rejected`/23514, a
@@ -3734,8 +3734,18 @@ budget lookup is hot-path. Timed against the live DB, 2000 iterations each:
 Resolving the publication inside the trigger costs 10x — a 100k-row bulk insert
 would pay ~2s of pure guard overhead. So the COLD path resolves and the HOT path
 reads: `zebridge_register_limits(slot, publication, bytes)` expands publication →
-tables once at boot and writes one row per (tbl, slot); the trigger does a plain
-indexed `COALESCE(MIN(max_row_bytes) … WHERE tbl = <oid>::regclass, 16384)`.
+tables once at boot and writes ONE ROW PER INSTANCE (`slot` PK); the trigger reads
+nothing at all — its budget is a baked literal, re-derived at each boot as MIN over
+the instances carrying that table.
+
+⚠️ Superseded within the day, twice, and both corrections are the point. The first
+shape keyed rows by (tbl, slot) so the trigger could do a cheap indexed lookup; the
+review then asked why the table is stored per-table at all when the per-slot fact
+is what an instance knows — and measuring answered it: a literal costs NOTHING
+per row (2.04 us against 2.88 with no guard) where even an indexed lookup cost
++4.81. Once the hot path reads nothing, the per-table denormalisation had no
+purpose left, and the storage collapsed to one row per instance with the
+publication join done once at boot.
 
 **Why `slot` and not `publication` as the key** — the question that decided it: PG
 cannot map a table to a slot (`pg_create_logical_replication_slot` takes no
