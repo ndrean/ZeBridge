@@ -153,6 +153,13 @@ type Exec = (q: string, ...params: any[]) => Promise<any[]>;
 /// Assemble a .creds file's text from a JWT and a seed — what the enrollment
 /// flow holds after the mint responds (the seed never crossed the wire; the app
 /// generated the pair itself).
+/// SQLite reports a deferred FK failure at COMMIT and an immediate one at the
+/// statement; both carry the same phrase. Matching the message is unavoidable —
+/// sqlocal and better-sqlite3 surface different error CLASSES for the same fault.
+function isForeignKeyFailure(e: unknown): boolean {
+  return /FOREIGN KEY constraint failed/i.test(String((e as any)?.message ?? e));
+}
+
 export function credsFileText(jwt: string, seed: string): string {
   return `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n` +
          `-----BEGIN USER NKEY SEED-----\n${seed}\n------END USER NKEY SEED------\n`;
@@ -206,6 +213,7 @@ export class ZeBridge {
   private suspendedHandlers = new Set<(table: string, reason: string | null) => void>();
   private statusHandlers = new Set<(s: ConnStatus) => void>();
 
+  private fkHeld: { table: string; ev: any }[] = [];
   private sweepId?: ReturnType<typeof setInterval>;
   private rttIntervalId?: ReturnType<typeof setInterval>;
   private recountTimer?: ReturnType<typeof setTimeout>;
@@ -307,6 +315,10 @@ export class ZeBridge {
   public get clientId(): string { return this.clientIdValue; }
   /// Events held back waiting for a schema newer than they are.
   public get heldCount(): number { return this.pendingEvents.length; }
+  /// Events held waiting for a PARENT ROW — a foreign key whose target has not
+  /// arrived yet, which happens when one PostgreSQL transaction is split across
+  /// batches. Non-zero for long is a real signal: the parent never came.
+  public get fkHeldCount(): number { return this.fkHeld.length; }
   public tableNames(): string[] { return [...this.syncedTables.keys()]; }
   public tableState(table: string): TableState | undefined { return this.syncedTables.get(table); }
   public suspendedTables(): Record<string, string> { return Object.fromEntries(this.suspendedMap); }
@@ -783,6 +795,67 @@ export class ZeBridge {
     }
     this.appendLog('CDC', `Replaying ${mine.length} held event(s) for ${table}`, 'DRAIN');
     for (const p of mine) await this.applyEvent(p.table, p.ev);
+  }
+
+  /// A batch failed as a unit — replay it event by event so one bad row cannot take
+  /// the rest with it. Anything failing a FOREIGN KEY check is HELD, not dropped:
+  /// its parent may simply be in a later batch, which happens whenever a single
+  /// PostgreSQL transaction is larger than the bridge's ring and gets split across
+  /// batches (NOTES.md finding 5).
+  private async applyBatchIsolated(streamName: string, toApply: { table: string; ev: any }[], batchErr: string) {
+    let applied = 0, held = 0, failed = 0;
+    for (const { table, ev } of toApply) {
+      try {
+        await this.transaction(async (txExec) => {
+          await txExec(`PRAGMA defer_foreign_keys = ON;`);
+          await this.applyEvent(table, ev, txExec);
+        });
+        applied++;
+      } catch (e) {
+        if (isForeignKeyFailure(e)) {
+          this.fkHeld.push({ table, ev });
+          held++;
+        } else {
+          failed++;
+          this.appendLog('CDC', `DROPPED ${ev?.operation} on ${table} (lsn ${ev?.lsn}): ${e}`, 'ERROR');
+        }
+      }
+    }
+    this.appendLog(
+      'SYS',
+      `${streamName} batch of ${toApply.length} failed as a unit (${batchErr}) — isolated replay: ` +
+        `${applied} applied, ${held} held for a missing parent, ${failed} dropped`,
+      failed ? 'ERROR' : 'WARNING',
+    );
+  }
+
+  /// Retry events held for a missing parent. Called after every batch, because the
+  /// parent arrives in a LATER batch when a big transaction was split — which makes
+  /// a cross-batch split self-healing rather than a silent hole.
+  private async retryFkHeld(streamName: string) {
+    if (!this.fkHeld.length) return;
+    const pending = this.fkHeld;
+    this.fkHeld = [];
+    let applied = 0;
+    for (const { table, ev } of pending) {
+      try {
+        await this.transaction(async (txExec) => {
+          await txExec(`PRAGMA defer_foreign_keys = ON;`);
+          await this.applyEvent(table, ev, txExec);
+        });
+        applied++;
+      } catch (e) {
+        if (isForeignKeyFailure(e)) {
+          this.fkHeld.push({ table, ev });   // still waiting; try again next batch
+        } else {
+          this.appendLog('CDC', `DROPPED held ${ev?.operation} on ${table}: ${e}`, 'ERROR');
+        }
+      }
+    }
+    if (applied) {
+      this.appendLog('SYS', `${streamName}: ${applied} held event(s) applied once their parent arrived` +
+        (this.fkHeld.length ? `, ${this.fkHeld.length} still waiting` : ''), 'INFO');
+    }
   }
 
   // ── CDC apply ──────────────────────────────────────────────────────────────
@@ -1275,9 +1348,20 @@ export class ZeBridge {
                 }
               });
             } catch (err) {
-              this.appendLog('SYS', `${streamName} batch of ${toApply.length} event(s) failed to apply: ${err}`, 'ERROR');
+              // ⚠️ This used to log and fall through to the ack below, so ONE bad event
+              // silently discarded the other 99 and the replica still reported itself
+              // caught up. Measured 2026-08-26: six batches × 100 events dropped that
+              // way during the Node-consumer work, from a single adapter bug.
+              //
+              // Isolate instead: replay the batch ONE EVENT AT A TIME, each in its own
+              // transaction, so only the genuinely bad event is affected.
+              await this.applyBatchIsolated(streamName, toApply, String(err));
             }
+            // Held events are accounted for (retried after later batches), so acking
+            // here is correct — what must never happen again is acking events that
+            // were neither applied nor held.
             for (const m of toAck) m.ack();
+            await this.retryFkHeld(streamName);
           };
 
           for await (const msg of iter) {
