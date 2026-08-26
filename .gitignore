@@ -63,3 +63,5 @@ nats-data.pre-jwt/
 
 # zb-client-ts package
 zb-client-ts/node_modules/
+
+examples/04-node-consumer/node_modules/
