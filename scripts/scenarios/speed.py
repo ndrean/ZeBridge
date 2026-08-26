@@ -307,6 +307,24 @@ def main():
         f"{log_path}."
     )
     zb.ok(f"{total:,} events, {rate:,.0f} events/s end-to-end, peak +{peak - base:,} KB over settled baseline")
+
+    # ⚠️ DROP THE SLOT. Every other bridge-owning scenario does this; leaving it
+    # behind costs twice, and both were measured after one 2M-row run:
+    #
+    #   * an inactive slot PINS WAL — 399 MB retained, and it never recycles,
+    #     which on a real box is a disk-space incident rather than an untidiness;
+    #   * this probe runs at BASE_BUF=11 (2048), and a bridge registers its
+    #     row-width budget in `zebridge_limits` at boot. The guard takes MIN over
+    #     instances that still EXIST, so a lingering probe slot silently holds every
+    #     writer in the database to 2048 — correct behaviour (a down bridge is not a
+    #     gone bridge), and a confusing one to debug if the probe was a benchmark
+    #     nobody remembers running.
+    zb.psql(
+        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "
+        f"WHERE slot_name='{SLOT}' AND NOT active) "
+        f"THEN PERFORM pg_drop_replication_slot('{SLOT}'); END IF; END $$",
+        quiet=True,
+    )
     return 0
 
 
