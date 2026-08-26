@@ -66,6 +66,11 @@ $$;
 GRANT CONNECT ON DATABASE ${TARGET_DB} TO ${POSTGRES_WRITER_USER};
 GRANT USAGE ON SCHEMA public TO ${POSTGRES_WRITER_USER};
 
+-- Read-only catalogue access (moved here from init.core: that file must never name
+-- this role, or the read-only profile cannot apply on a fresh cluster).
+GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_WRITER_USER};
+
+
 -- Deliberately NOT granted: SELECT/INSERT/UPDATE on any table, and no ALTER DEFAULT
 -- PRIVILEGES. A new table is not edge-writable until someone says so.
 

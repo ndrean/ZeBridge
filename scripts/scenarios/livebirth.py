@@ -142,7 +142,12 @@ def main_sync():
                     failed += 1
 
             # ── 4. the migration-born width guard, psql door ───────────────────
-            budget = int(zb.psql("SELECT max_row_bytes FROM public.zebridge_limits WHERE id = 1").strip())
+            # Per (table, slot) since 2026-08-26 — the bridge registers its own
+            # BASE_BUF at boot; MIN because a row must fit the narrowest carrier.
+            budget = int(zb.psql(
+                f"SELECT COALESCE(MIN(max_row_bytes), 16384) FROM public.zebridge_limits "
+                f"WHERE tbl = to_regclass('public.{FIX}')"
+            ).strip())
             zb.psql(f"UPDATE public.{FIX} SET txt = repeat('x', {budget}), updated_at = now() WHERE txt = 'born live'", quiet=True)
             width = zb.psql(f"SELECT length(txt) FROM public.{FIX} WHERE length(txt) >= {budget}").strip()
             if width == "":

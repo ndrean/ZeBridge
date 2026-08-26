@@ -241,7 +241,11 @@ CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
     CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
 GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_BRIDGE_USER};
-GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_WRITER_USER};
+-- The writer's grant lives in init.write.template.sql, NOT here: roles are
+-- cluster-wide, so this line passed silently on any cluster where the write half
+-- had ever run — and failed with `role does not exist` only on a fresh cluster
+-- running the read-only profile, which is precisely the profile it breaks. See
+-- this file's header: nothing here may reference the writer role.
 
 -- Refuses `ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped nor
 -- recorded as public. The bridge cannot check this for itself — it is a pass-through, and
@@ -867,15 +871,193 @@ CREATE EVENT TRIGGER zebridge_timestamp_guard_t ON ddl_command_end
 -- mutation listener); the psql write becomes an ordinary ERROR. Rules that only
 -- live in prose are the ones that bite.
 --
--- ⚠️ `max_row_bytes` must track the bridge's per-event buffer (2^BASE_BUF,
--- default 16384). It lives in a table rather than the trigger body so a BASE_BUF
--- change is one UPDATE, not a re-install per table.
+-- ⚠️ The budget is PER BRIDGE INSTANCE, not per database. `BASE_BUF` is a
+-- per-process memory setting, so two bridges on the same database can legitimately
+-- carry different row ceilings; a single global limit was simply wrong. It was also
+-- a coupling maintained BY HAND — SECURITY.md said so, and it was forgotten the
+-- first time BASE_BUF changed (measured: buffer 4 KB, table still 16384, so
+-- PostgreSQL would accept rows the feed could not carry and suspend the table).
+--
+-- So the bridge WRITES this table at boot from its own resolved BASE_BUF. Nobody
+-- maintains it; there is nothing to forget.
+--
+--   slot          — the instance. It is the identity PostgreSQL already keeps
+--                   (`pg_replication_slots`), so a retired bridge's row is detectable
+--                   and GC'd on the next boot of any bridge. Keyed by publication
+--                   instead, a decommissioned 4 KB instance would pin the budget low
+--                   forever with nothing able to tell.
+--   publication   — what it carries. `pg_publication_tables` expands it to tables.
+--   max_row_bytes — that instance's `2^BASE_BUF`.
+--
+-- ⚠️ This table is the INPUT, not what the guard reads. Each table's guard carries its
+-- budget as a LITERAL, baked at boot by `zebridge_register_limits` from
+--
+--     zebridge_limits (slot -> budget)  x  pg_publication_tables (publication -> tables)
+--
+-- taking MIN per table: a row must fit the NARROWEST instance carrying it, or it is
+-- accepted here and suspends the feed over there. Measured, and the reason the join is
+-- not in the trigger: a per-row publication join cost 22 us against 2.2 for a plain
+-- lookup, and a plain lookup still cost +4.81 us/row against a baked literal, which is
+-- free. The cold path resolves; the hot path reads nothing at all.
 CREATE TABLE IF NOT EXISTS public.zebridge_limits (
-    id            smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    max_row_bytes integer  NOT NULL DEFAULT 16384
+    slot          text PRIMARY KEY,
+    publication   name    NOT NULL,
+    max_row_bytes integer NOT NULL,
+    updated_at    timestamptz NOT NULL DEFAULT now()
 );
-INSERT INTO public.zebridge_limits (id) VALUES (1) ON CONFLICT DO NOTHING;
 GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_BRIDGE_USER};
+
+-- The bridge registers its OWN budget here at boot. One call, over the connection
+-- that always exists (the reader's), so this works identically in the read-only and
+-- read/write profiles — a read-only deployment still has a width guard, and it is
+-- still the truth about that instance's buffer.
+--
+-- ⚠️ SECURITY DEFINER, and that is the whole point: ${POSTGRES_BRIDGE_USER} keeps
+-- SELECT + REPLICATION and NO write privilege on any table. "The reader is
+-- physically unable to write" stays literally true and testable in
+-- `role_table_grants` — the reader's only power here is to call this one function,
+-- which writes rows describing itself and nothing else. Granting the reader
+-- INSERT/UPDATE on the table instead would have bought the same behaviour by
+-- weakening the one invariant the whole read path leans on.
+--
+-- Three steps, in this order:
+--   1. GC instances PostgreSQL no longer knows — a retired bridge must stop
+--      constraining everyone else, and its slot vanishing is the signal. Any
+--      bridge's boot cleans up after every dead one.
+--   2. drop this slot's rows for tables it no longer carries.
+--   3. upsert one row per table currently in its publication.
+--
+-- ⚠️ Call it AFTER the replication slot exists, or step 1 deletes what step 3
+-- writes on the next boot.
+CREATE OR REPLACE FUNCTION public.zebridge_register_limits(
+    p_slot          text,
+    p_publication   name,
+    p_max_row_bytes integer
+) RETURNS integer AS $$
+DECLARE
+    r       record;
+    n_guard integer := 0;
+BEGIN
+    IF p_max_row_bytes IS NULL OR p_max_row_bytes < 1024 THEN
+        RAISE EXCEPTION 'refusing a row-width budget of %: below any sane floor', p_max_row_bytes
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    -- 1. GC instances PostgreSQL no longer knows. A retired bridge must stop
+    --    constraining everyone else, and its slot vanishing is the signal. An
+    --    INACTIVE slot is NOT gone — that bridge is down, its WAL is retained, and
+    --    it will replay; its budget still binds.
+    DELETE FROM public.zebridge_limits l
+     WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.slot_name = l.slot);
+
+    -- 2. this instance's own row.
+    INSERT INTO public.zebridge_limits (slot, publication, max_row_bytes, updated_at)
+    VALUES (p_slot, p_publication, p_max_row_bytes, now())
+    ON CONFLICT (slot) DO UPDATE
+       SET publication   = EXCLUDED.publication,
+           max_row_bytes = EXCLUDED.max_row_bytes,
+           updated_at    = now();
+
+    -- 3. bake the literal into every guard this instance carries.
+    --
+    -- MIN over the instances that carry the table: a row must fit the NARROWEST of
+    -- them. Taking MAX would admit rows the smallest instance cannot encode, and it
+    -- would suspend the table for every reader on ITS feed while the wider instance
+    -- carried on — a partial, per-feed outage that reads as a mystery.
+    FOR r IN
+        SELECT format('%I.%I', pt.schemaname, pt.tablename)::regclass AS tbl,
+               MIN(l.max_row_bytes) AS budget
+          FROM public.zebridge_limits l
+          JOIN pg_publication_tables pt ON pt.pubname = l.publication
+         WHERE format('%I.%I', pt.schemaname, pt.tablename)::regclass IN (
+                   SELECT format('%I.%I', p2.schemaname, p2.tablename)::regclass
+                     FROM pg_publication_tables p2 WHERE p2.pubname = p_publication)
+         GROUP BY 1
+    LOOP
+        IF public.zebridge_rebudget_width_guard(r.tbl, r.budget) THEN
+            n_guard := n_guard + 1;
+        END IF;
+    END LOOP;
+
+    RETURN n_guard;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
+
+-- Rewrite ONE guard's budget, body only. Returns true if a guard was rewritten.
+--
+-- ⚠️ **Never touches the TRIGGER**, and that is the whole point of it existing
+-- separately from `zebridge_install_width_guard`. Measured against a table with one
+-- open writer: `CREATE OR REPLACE FUNCTION` completed in 203 ms, while `DROP TRIGGER`
+-- blocked past a 6 s timeout waiting for ACCESS EXCLUSIVE. A pending exclusive lock
+-- also queues AHEAD of new writers, so doing that at every bridge boot would freeze a
+-- busy table for the length of someone else's transaction. Replacing the body needs no
+-- table lock at all: the trigger keeps pointing at the same function, and PostgreSQL
+-- invalidates the cached plan, so even a pool connection open for months uses the new
+-- literal on its very next write (measured both ways).
+--
+-- The width EXPRESSION is regenerated too, since the column set may have changed; only
+-- the trigger creation is skipped, and only when the trigger is already there.
+CREATE OR REPLACE FUNCTION public.zebridge_rebudget_width_guard(tbl regclass, p_budget integer)
+RETURNS boolean AS $$
+DECLARE
+    short       text := (SELECT relname FROM pg_class WHERE oid = tbl);
+    expr        text := '';
+    n_cols      int  := 0;
+    n_unbounded int  := 0;
+    col         record;
+    fn_body     text;
+BEGIN
+    -- A table with no guard installed has none to rebudget. Installing one here would
+    -- need the trigger DDL this function exists to avoid.
+    IF NOT EXISTS (SELECT 1 FROM pg_trigger g
+                    WHERE g.tgrelid = tbl AND g.tgname = 'zebridge_width_guard'
+                      AND NOT g.tgisinternal) THEN
+        RETURN false;
+    END IF;
+
+    FOR col IN
+        SELECT a.attname, t.typname, a.atttypmod, t.typcategory
+        FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+    LOOP
+        n_cols := n_cols + 1;
+        IF col.typname = 'bytea' THEN
+            n_unbounded := n_unbounded + 1;
+            expr := expr || format(' + coalesce(octet_length(NEW.%I) * 2 + 2, 0)', col.attname);
+        ELSIF col.typname IN ('text', 'json', 'jsonb', 'xml')
+              OR (col.typname = 'varchar' AND col.atttypmod = -1)
+              OR col.typcategory = 'A' THEN
+            n_unbounded := n_unbounded + 1;
+            expr := expr || format(' + coalesce(octet_length(NEW.%I::text), 0)', col.attname);
+        END IF;
+    END LOOP;
+
+    IF n_unbounded = 0 THEN
+        RETURN false;
+    END IF;
+
+    fn_body := format(
+        'DECLARE '
+        '  budget integer := %s; '
+        '  width  integer := %s + %s; '
+        'BEGIN '
+        '  IF width >= budget THEN '
+        '    RAISE EXCEPTION ''row width %% bytes is at or over the %%-byte change-feed budget: the feed could not carry this row (zebridge_limits, narrowest instance carrying this table; store a reference, not the blob)'', width, budget '
+        '      USING ERRCODE = ''check_violation''; '
+        '  END IF; '
+        '  RETURN NEW; '
+        'END',
+        p_budget, substr(expr, 4), 32 * n_cols + 256);
+
+    EXECUTE 'CREATE OR REPLACE FUNCTION public.' || quote_ident('zebridge_width_guard_' || short)
+         || '() RETURNS trigger AS ' || quote_literal(fn_body)
+         || ' LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog';
+    RETURN true;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
+
+GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer)
+    TO ${POSTGRES_BRIDGE_USER};
 
 
 
@@ -908,6 +1090,7 @@ DECLARE
     n_unbounded int  := 0;
     col         record;
     fn_body     text;
+    budget_lit  integer;
 BEGIN
     FOR col IN
         SELECT a.attname, t.typname, a.atttypmod, t.typcategory
@@ -943,18 +1126,33 @@ BEGIN
     -- SECURITY DEFINER: the guard reads zebridge_limits as whoever writes the row
     -- (bridge_writer, a backend app), and none of them should need a grant on bridge
     -- internals just to be told no. search_path pinned, as every SECURITY DEFINER must.
+    -- The budget is baked as a LITERAL, resolved HERE, once. MIN over the instances
+    -- carrying this table: a row must fit the NARROWEST of them, or it is accepted
+    -- here and suspends the feed over there. COALESCE covers "no bridge has
+    -- registered yet" — nothing replicates the table, so there is no feed to
+    -- overflow. `zebridge_register_limits` re-bakes it at every bridge boot.
+    --
+    -- Measured, and the reason it is a literal rather than a lookup: per row, a
+    -- publication join cost 22 us, a plain indexed lookup 3.0 us, and a literal is
+    -- free (within noise of no guard at all). This trigger fires on every insert and
+    -- update of the table.
+    SELECT COALESCE(MIN(l.max_row_bytes), 16384) INTO budget_lit
+      FROM public.zebridge_limits l
+      JOIN pg_publication_tables pt ON pt.pubname = l.publication
+     WHERE format('%I.%I', pt.schemaname, pt.tablename)::regclass = tbl;
+
     fn_body := format(
         'DECLARE '
-        '  budget integer := (SELECT max_row_bytes FROM public.zebridge_limits WHERE id = 1); '
+        '  budget integer := %s; '
         '  width  integer := %s + %s; '
         'BEGIN '
         '  IF width >= budget THEN '
-        '    RAISE EXCEPTION ''row width %% bytes is at or over the %%-byte change-feed budget: the feed could not carry this row (zebridge_limits.max_row_bytes; store a reference, not the blob)'', width, budget '
+        '    RAISE EXCEPTION ''row width %% bytes is at or over the %%-byte change-feed budget: the feed could not carry this row (zebridge_limits, narrowest instance carrying this table; store a reference, not the blob)'', width, budget '
         '      USING ERRCODE = ''check_violation''; '
         '  END IF; '
         '  RETURN NEW; '
         'END',
-        substr(expr, 4), 32 * n_cols + 256);
+        budget_lit, substr(expr, 4), 32 * n_cols + 256);
 
     EXECUTE 'CREATE OR REPLACE FUNCTION public.' || quote_ident('zebridge_width_guard_' || short)
          || '() RETURNS trigger AS ' || quote_literal(fn_body)

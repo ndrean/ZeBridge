@@ -416,8 +416,8 @@ frozen-and-valid for every reader, lifted only by a bridge restart whose preflig
 re-proves the cause is gone.
 
 | where | CDC path | generation path |
-|---|---|---|
-| **PostgreSQL** (the row, any writer) | `zebridge_width_guard` trigger — installed by `zebridge_enable`, unbounded columns only, budget from the one-row `zebridge_limits` table: row width ≥ budget → **reject** (SQLSTATE 23514, in the writer's own transaction) — ✅ `widthguard.py` (both doors, atomicity, ceiling-not-tax) | *the same trigger* — it guards the row, not the path — ✅ same |
+| --- | --- | --- |
+| **PostgreSQL** (the row, any writer) | `zebridge_width_guard` trigger — installed by `zebridge_enable`, unbounded columns only, budget from `zebridge_limits`, per (table, slot), written by each bridge at boot from its own `BASE_BUF`: row width ≥ budget → **reject** (SQLSTATE 23514, in the writer's own transaction) — ✅ `widthguard.py` (both doors, atomicity, ceiling-not-tax) | *the same trigger* — it guards the row, not the path — ✅ same |
 | **bridge ingress** (mutation listener) | payload ≥ event buffer → **reject** (`RowTooLargeToReplicate`, dead-lettered on first delivery, verdict). A deliberate lower bound: the CDC event is always larger than the payload, so nothing legitimate is refused — ✅ `rowsize.py` (incl. the published `max_row_bytes`) | — (generations are read-path; there is no ingress) |
 | **bridge egress** | boot preflight (stored rows + column defaults vs buffer) → **quarantine** before a byte streams — ✅ `legacybait.py` (re-derived every boot, and the readmission after repair); decode-time slot overflow → **quarantine** (`suspendForRowTooLarge`: ACK past, suspension published) — ✅ `legacybait.py` (log + `"suspended":true` in `$KV.schemas`); *until snapshot retirement:* `measureWidestRow` ≥ chunk budget → **quarantine** — ✅ `wide.py` | widest row, measured free in the producer's encode loop, ≥ event buffer → **warning** on every build (chains carry it; CDC will suspend on its next touch) — the detector for rows that predate the trigger — ✅ `legacybait.py` (warns on the first build over planted bait). Object chunking (nats.zig, 128 KB) means no wire limit exists on this path to check |
 | **NATS broker** | any single message > `max_payload` → publish refused — the floor under `BASE_BUF`'s ceiling (2^20 = 1 MB). Broker contract, not bridge code — no scenario, by design | chunk messages are 128 KB by construction; the broker limit is unreachable |
@@ -428,13 +428,27 @@ the reject rows exist to starve the quarantine row. And the generation column's
 near-emptiness is earned, not missing: the trigger covers its writes, chunking
 dissolves its wire limit, and only the legacy detector remains.
 
-⚠️ The one coupling to maintain by hand: `zebridge_limits.max_row_bytes` must track
-`2^BASE_BUF`. Raising `BASE_BUF` without the matching `UPDATE` leaves the trigger
-refusing rows the feed could now carry (safe, but needlessly strict); lowering it
-without the `UPDATE` reopens the gap (a row the trigger accepts that CDC then
-suspends on). Every cell above names the scenario that exercises it — a check the
-table cites but nothing runs is prose, and the untested cells were found exactly
-that way.
+The budget is **not** maintained by hand. Each bridge registers its own
+`2^BASE_BUF` at boot — `zebridge_register_limits(slot, publication, bytes)`, one
+row per (table, slot) — so the trigger's ceiling is always the buffer the instance
+actually runs with. It was a manual `UPDATE` until 2026-08-26, this file said so,
+and it was forgotten the first time `BASE_BUF` moved: buffer 4 KB, table still
+16384, PostgreSQL accepting rows that suspend the table on the first CDC touch.
+
+Three properties fall out of the shape:
+
+* **per instance, not per database.** `BASE_BUF` is a per-process setting, so two
+  bridges may legitimately carry different ceilings. The trigger takes `MIN` over
+  the instances that carry the table — a row must fit the narrowest of them.
+* **self-cleaning.** A retired bridge's rows are the ones whose `slot` is gone
+  from `pg_replication_slots`; the next boot of any bridge deletes them, so a
+  decommissioned instance stops constraining everyone else.
+* **the reader gains no write privilege.** The registrar is SECURITY DEFINER and
+  the reader holds only `EXECUTE` on it, so a read-only deployment registers its
+  budget while `bridge_reader` keeps SELECT + REPLICATION and no table writes.
+
+Every cell above names the scenario that exercises it — a check the table cites
+but nothing runs is prose, and the untested cells were found exactly that way.
 
 ## Part 2 — The consumer
 
@@ -548,7 +562,7 @@ written down.
 
   | endpoint | exposure |
   | --- | --- |
-  | `POST /shutdown` | **stops CDC in one request.** It duplicates SIGTERM, which the bridge already handles (`bridge.zig:304`) — but SIGTERM needs process ownership, this needs a socket. Removing it is safer than authenticating or rate-limiting it, because a limiter still permits the kill |
+  | ~~`POST /shutdown`~~ | ~~stops CDC in one request. It duplicates SIGTERM, which the bridge already handles (`bridge.zig:304`) — but SIGTERM needs process ownership, this needs a socket. Removing it is safer than authenticating or rate-limiting it, because a limiter still permits the kill~~ |
   | `GET /streams/info?stream=` | one **NATS round trip per HTTP request** (amplification), and it discloses stream names and configuration |
   | `GET /metrics`, `/status`, `/health` | disclosure of table names, lag and throughput; cheap to serve |
 

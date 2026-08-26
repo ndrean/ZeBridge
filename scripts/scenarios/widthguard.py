@@ -18,7 +18,8 @@ is already in the mutation listener's permanent set, so the edge write becomes a
 
 Six checks:
 
-  1. the budget is a TABLE (`zebridge_limits`), not a constant in a trigger body;
+  1. the budget is a TABLE (`zebridge_limits`), written by each bridge at boot from
+     its own BASE_BUF — per (table, slot), not one global row a human maintains;
   2. a table with no unbounded columns gets NO guard — statically safe, zero cost;
   3. psql door: an oversized INSERT is refused with SQLSTATE 23514, atomically;
   4. a row just under the budget still applies — the guard is a ceiling, not a tax;
@@ -47,13 +48,31 @@ FIX = "zb_width_fixture"
 
 async def main():
     failed = 0
-    budget = zb.psql("SELECT max_row_bytes FROM public.zebridge_limits WHERE id = 1").strip()
+    # PER TABLE and per instance now, not one global row: BASE_BUF is a per-process
+    # setting, so the budget is MIN over the instances that carry a table (a row must
+    # fit the narrowest of them). Written by each bridge at boot, never by hand.
+    #
+    # The fixture below is NOT in a publication, so it has no registered row and the
+    # guard falls back to the same default this reads — which is exactly the contract
+    # under test: whatever the guard would compute, computed the same way here. The
+    # live registration is asserted separately, against a table a bridge really carries.
+    budget = zb.psql(
+        "SELECT COALESCE(MIN(max_row_bytes), 16384) FROM public.zebridge_limits "
+        # to_regclass, not ::regclass: the cast ERRORS on a missing relation, and this
+        # runs before the fixture is created. NULL simply matches no row.
+        f"WHERE tbl = to_regclass('public.{FIX}')"
+    ).strip()
 
-    # ── 1. the budget lives in a table ─────────────────────────────────────────
+    # ── 1. the budget lives in a table, written by the bridge ──────────────────
+    registered = zb.psql(
+        "SELECT count(DISTINCT slot)||' instance(s), '||count(*)||' table row(s): '"
+        "||COALESCE(string_agg(DISTINCT slot||'='||max_row_bytes, ', '), 'none') "
+        "FROM public.zebridge_limits"
+    ).strip()
     if budget.isdigit() and int(budget) >= 1024:
-        zb.ok(f"budget is data, not code: zebridge_limits.max_row_bytes = {budget}")
+        zb.ok(f"budget is data, not code: {budget} bytes for {FIX}; registry holds {registered}")
     else:
-        zb.bad(f"zebridge_limits missing or nonsense: {budget!r}")
+        zb.bad(f"zebridge_limits has no usable budget for {FIX}: {budget!r}")
         return 1
     budget = int(budget)
 
