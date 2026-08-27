@@ -371,7 +371,6 @@ export default function App() {
     <>
       <header>
         <h1>ZeBridge CDC Web Consumer</h1>
-        <link rel="icon" type="image/svg+xml" href="/bridge.svg" />
         <div class="status-bar">
           <span class={`badge ${status()}`}>{status().toUpperCase()}</span>
           <span id="server-url">{NATS_URL}</span>

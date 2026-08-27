@@ -80,7 +80,7 @@ pub const HelpRequested = error{HelpRequested};
 /// ⚠️ **Unset or unparseable falls back to the default; out-of-range CLAMPS.** They are
 /// different signals and used to be treated alike. `banana` carries no intent, so the
 /// default is the only sensible answer — but `RING_BUFFER_COUNT=64` carries a *direction*:
-/// "less memory". Substituting the default gave 65536, a thousand times **more** than was
+/// "less memory". Substituting the default gave 32768, a thousand times **more** than was
 /// asked for, which at BASE_BUF=19 is a 32 GB ring that the sizing check then refuses
 /// outright. The leniency produced both a fatal error and an unrecognisable one — the
 /// operator sees a number they never typed.

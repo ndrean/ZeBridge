@@ -82,7 +82,7 @@ async def main():
             zb.bad(f"GET {path:<10} → {got}, expected {want}")
             failed += 1
 
-    # `/shutdown`, `/streams/info` and `/streams/purge` were dev conveniences and are
+    # `/streams/info` and `/streams/purge` were dev conveniences and are
     # gone. Not asserted here: a check that a removed thing stays removed only tracks
     # removed things, and the 404 above already proves unknown paths are refused.
 
