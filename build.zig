@@ -74,7 +74,6 @@ pub fn build(b: *std.Build) void {
     // a rebuild while logging the names as though it had just read them. It is read at
     // startup now; see src/topology.zig.
 
-
     // src/mailbox_vendor/ removed with src/nats_vendor/: it existed only to back that
     // client's message pool, and nothing in the bridge imported it directly.
 

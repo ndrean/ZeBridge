@@ -5074,6 +5074,70 @@ Build it only if the delta ratios say so.
 (web-consumer/src/App.tsx carries the fzstd hook but is deliberately NOT in
 this commit — the file holds the user's own in-progress edits.)
 
+## 10x. The compression dictionary — the lifecycle, in full (2026-08-27)
+
+Phase two of §10w, and the design that finally makes per-table trained
+dictionaries viable — because the chain gives the dictionary a lifecycle
+instead of making it a standing asset. The original implementation died of
+exactly that missing lifecycle (training pipeline, drift, distribution,
+retention). Here every one of those is answered by an existing mechanism.
+
+**What a dictionary is (the thing that makes the lifecycle simple).** A zstd
+dictionary is a STATIC blob produced by ONE training call — samples in, blob
+out. It is not a mode, it does not learn as data flows, nothing accumulates.
+`compress(bytes, dict)` and `decompress(frame, dict)` are stateless; a dict
+mismatch fails LOUDLY (measured: node:zlib raises ZSTD_error_corruption on a
+dict frame decoded without the dict — a safety property). So "when does
+training start/stop?" is a category error: it is a function call inside a
+build, not a phase the producer occupies.
+
+**The flow, per (tenant, table):**
+  * **At every FULL build** (the existing chain-roll, no new knob): train a
+    fresh dictionary from THAT full's own msgpack bytes (split into 2 KiB
+    delta-sized samples; skipped when the full is < 16 KiB / < 8 samples —
+    dictionaries earn nothing on tiny corpora and ZDICT refuses them). Store
+    it as one more object (`<table>-g<N>-dict`) AND persist the bytes on the
+    full's `zebridge_generations` row (`dict bytea`). PG is the producer's
+    memory — the LAW: deltas built ticks later (across restarts) read the
+    dictionary back from HERE, never from NATS.
+  * **At every DELTA build** in that era: read the current full's dictionary
+    from PG, compress the delta WITH it, and record `dict_object` on the
+    delta's row + a `"dict":"<name>"` field on the delta's manifest entry.
+  * **Next full**: trains a NEW dictionary from scratch. Nothing carries
+    across eras — the full IS the best corpus, and incremental cross-era
+    learning is the exact history-state the law forbids.
+  * **Prune**: a dictionary object outlives its full's row — it is deleted
+    only when NO remaining row still references it (`SELECT DISTINCT
+    dict_object`). Lifecycle = chain lifecycle, GC'd by the chain window.
+
+**Client side.** A manifest's delta window can straddle two eras, so the dict
+reference lives PER DELTA, not per manifest. `core.planFromManifest` carries
+`dict` onto the delta step (fixture-pinned, 92 total). The applier fetches a
+named dict once per era, caches it in memory AND in `_zebridge_dicts(name,
+bytes)` so a reconnect never re-downloads it — immutable by name, so the cache
+can never go stale (the one failure mode dict caches usually have). A client
+that lacks it just fetches it; correctness never depends on having kept it.
+
+**The decoder matrix, extended.** Compression needs C (bridge links libzstd +
+libzstd's ZDICT trainer). Decompression of a DICT frame needs the dictionary
+fed in: Zig via libzstd `ZSTD_decompress_usingDict` (std.compress.zstd parses
+a dict id but cannot USE one, so the client links libzstd for this path only —
+plain frames still go through std); Node via `node:zlib` `{dictionary}`;
+browser via `@bokuweb/zstd-wasm` `decompressUsingDict` (replaced fzstd, which
+is dict-less); Python 3.14 stdlib supports it. Verified live end to end on a
+419-row users table: producer trained a 10101-byte dict from the g1 full,
+built g2/g3 deltas `[dict]`, and ALL THREE clients decoded them to users=419
+== PG — Node (node:zlib), zb-demo (libzstd), browser (zstd-wasm, webby2).
+
+**Measured on the dev table** (small, so the ratio is only indicative): the
+full compressed 40407 -> 1797 (4%), a dict delta 39160 -> 1293 (3%). The real
+signal — dict vs plain on SMALL deltas — needs production-sized deltas; the
+🗜️ log's `[dict]` tag plus the byte counts are the standing measurement, and
+the go/no-go was always "build it and let the deltas judge", now built.
+
+(web-consumer/src/App.tsx carries the zstd-wasm hook but stays OUT of the
+commit — the user's own in-progress edits live there.)
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

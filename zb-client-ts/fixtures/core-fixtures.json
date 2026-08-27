@@ -234,6 +234,47 @@
           "kind": "delta"
         }
       ]
+    },
+    {
+      "name": "\u00a710x: a delta naming its dictionary carries it on the step; others stay bare",
+      "manifest": {
+        "gen": 3,
+        "full": {
+          "object": "t-g1-full",
+          "gen": 1
+        },
+        "deltas": [
+          {
+            "object": "t-g2-delta",
+            "cutoff": "B",
+            "prev_cutoff": "A",
+            "gen": 2
+          },
+          {
+            "object": "t-g3-delta",
+            "cutoff": "C",
+            "prev_cutoff": "B",
+            "gen": 3,
+            "dict": "t-g1-dict"
+          }
+        ]
+      },
+      "watermark": null,
+      "plan": [
+        {
+          "name": "t-g1-full",
+          "kind": "full"
+        },
+        {
+          "name": "t-g2-delta",
+          "kind": "delta"
+        },
+        {
+          "name": "t-g3-delta",
+          "kind": "delta",
+          "dict": "t-g1-dict"
+        }
+      ]
     }
   ],
   "fullPredates": [

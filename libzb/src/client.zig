@@ -15,6 +15,7 @@ const core = @import("core.zig");
 const storage = @import("storage.zig");
 const transport = @import("transport.zig");
 const msgpack = @import("msgpack");
+const C = @import("c");
 
 const Value = std.json.Value;
 
@@ -58,6 +59,8 @@ pub const SyncClient = struct {
     open_tenant: []const u8 = "_default",
 
     tenant: []const u8 = "",
+    /// §10x dictionaries by object name — immutable, so the cache cannot go stale.
+    dicts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
     held: std.ArrayList(Held) = .empty,
 
@@ -264,7 +267,19 @@ pub const SyncClient = struct {
         var applied: usize = 0;
         for (plan.array.items) |step| {
             const raw = try self.t.objectGetBytes(a, bucket, step.object.get("name").?.string);
-            const blob = try maybeZstd(a, raw); // §10w: magic-sniffed, mixed chains fine
+            // §10x: a delta names the dictionary it was compressed with; fetch it
+            // once per era from the same bucket and keep it (immutable by name).
+            var dict: ?[]const u8 = null;
+            if (step.object.get("dict")) |dv| if (dv == .string) {
+                if (self.dicts.get(dv.string)) |d| {
+                    dict = d;
+                } else {
+                    const d = try self.t.objectGetBytes(a, bucket, dv.string);
+                    try self.dicts.put(a, try a.dupe(u8, dv.string), d);
+                    dict = d;
+                }
+            };
+            const blob = try maybeZstd(a, raw, dict); // §10w: magic-sniffed, mixed chains fine
             const doc = try decodeMsgpack(a, blob);
             const cols = try jsonStrList(a, doc.object.get("columns"));
             const vcol_v = doc.object.get("version_column") orelse (man.object.get("version_column") orelse @as(Value, .null));
@@ -465,8 +480,22 @@ fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
 
 /// Chain objects may be zstd frames (§10w) — sniffed by the standard 4-byte
 /// magic; decompression is pure std (std.compress.zstd), no C on the client.
-fn maybeZstd(a: std.mem.Allocator, b: []const u8) ![]const u8 {
+fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8 {
     if (b.len < 4 or b[0] != 0x28 or b[1] != 0xb5 or b[2] != 0x2f or b[3] != 0xfd) return b;
+    if (dict) |d| {
+        // Dictionary frame: libzstd (std.compress.zstd cannot take a dictionary).
+        // ZSTD_CONTENTSIZE_UNKNOWN/ERROR are (0ULL-1)/(0ULL-2): translate-c
+        // overflows on the macros, so spell them out.
+        const unknown: c_ulonglong = std.math.maxInt(c_ulonglong);
+        const size = C.ZSTD_getFrameContentSize(b.ptr, b.len);
+        if (size == unknown or size == unknown - 1) return error.ZstdSizeUnknown;
+        const out = try a.alloc(u8, @intCast(size));
+        const dctx = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
+        defer _ = C.ZSTD_freeDCtx(dctx);
+        const n = C.ZSTD_decompress_usingDict(dctx, out.ptr, out.len, b.ptr, b.len, d.ptr, d.len);
+        if (C.ZSTD_isError(n) != 0) return error.ZstdDecompressFailed;
+        return out[0..n];
+    }
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     var in: std.Io.Reader = .fixed(b);

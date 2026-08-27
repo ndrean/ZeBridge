@@ -50,7 +50,7 @@ export interface ZeBridgeConfig {
   /// via node:zlib automatically; a BROWSER host must supply this hook (the
   /// web consumer passes fzstd's decompress). Absent where needed, seeding
   /// fails LOUDLY naming the fix — never by feeding zstd bytes to msgpack.
-  zstdDecompress?: (b: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+  zstdDecompress?: (b: Uint8Array, dict?: Uint8Array) => Uint8Array | Promise<Uint8Array>;
   /// Operator/JWT mode: the CONTENT of a .creds file (user JWT + nkey seed).
   /// When set it wins over user/password — the JWT carries the permissions
   /// (scoped signing key), so no server conf names this principal at all.
@@ -195,6 +195,7 @@ export class ZeBridge {
   private clientIdValue = `c-${crypto.randomUUID().slice(0, 8)}`;
   private readonly transport: Transport;
   private lastVersion = '';
+  private dictCache = new Map<string, Uint8Array>();
   /// The HLC floor (§10q): the newest version this client has OBSERVED —
   /// CDC events' version column, chain cutoff_version. newVersion() stamps
   /// strictly above it, so a slow clock cannot lose to a row already seen.
@@ -489,6 +490,7 @@ export class ZeBridge {
         cutoff_lsn INTEGER NOT NULL
       );
     `);
+    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_dicts (name TEXT PRIMARY KEY, bytes BLOB NOT NULL)`); // §10x dictionary cache
     await this.createOutboxTable();
     this.resolveOutboxInit();
     await this.run(`INSERT OR IGNORE INTO _zebridge_sync (id, global_last_lsn, global_last_seq) VALUES (1, 0, 0)`);
@@ -1207,16 +1209,16 @@ export class ZeBridge {
 
   /// zstd frame magic: 28 B5 2F FD. Our msgpack docs always start with a map
   /// marker, so the sniff is unambiguous and needs no wire-format field.
-  private async maybeZstd(b: Uint8Array): Promise<Uint8Array> {
+  private async maybeZstd(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array> {
     if (b.length < 4 || b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return b;
-    if (this.config.zstdDecompress) return await this.config.zstdDecompress(b);
+    if (this.config.zstdDecompress) return await this.config.zstdDecompress(b, dict);
     // Node default, written so a BROWSER tsconfig/bundler never sees the node
     // module: globalThis probe + Function-constructed dynamic import.
     const proc = (globalThis as any).process;
     if (proc?.versions?.node) {
       const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
       const zlib = await dynImport('node:zlib');
-      return new Uint8Array(zlib.zstdDecompressSync(b));
+      return new Uint8Array(zlib.zstdDecompressSync(b, dict ? { dictionary: dict } : undefined));
     }
     throw new Error('chain object is zstd-compressed: pass config.zstdDecompress (e.g. fzstd.decompress in the browser)');
   }
@@ -1267,11 +1269,28 @@ export class ZeBridge {
 
     let os: any;
     try { os = await this.transport.objectStore(this.nc, manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
-    const fetchDoc = async (name: string): Promise<any | null> => {
+    // §10x: a delta names the dictionary it was compressed with. Fetched once
+    // per era from the same bucket, kept in memory AND in _zebridge_dicts so a
+    // reconnect does not re-download it; immutable by name, so never stale.
+    const dictFor = async (name: string): Promise<Uint8Array> => {
+      const cached = this.dictCache.get(name);
+      if (cached) return cached;
+      try {
+        const rows = await this.run(`SELECT bytes FROM _zebridge_dicts WHERE name = ?`, name);
+        if (rows?.[0]?.bytes) { const d = new Uint8Array(rows[0].bytes); this.dictCache.set(name, d); return d; }
+      } catch { /* table absent on an older replica — fetch below */ }
+      const d = await os.getBlob(name);
+      if (!d) throw new Error(`dictionary ${name} missing from ${manifest.bucket}`);
+      this.dictCache.set(name, d);
+      try { await this.run(`INSERT OR REPLACE INTO _zebridge_dicts (name, bytes) VALUES (?, ?)`, name, d); } catch { /* best effort */ }
+      return d;
+    };
+    const fetchDoc = async (name: string, dictName?: string): Promise<any | null> => {
       try {
         let blob = await os.getBlob(name);
         if (!blob) return null;
-        blob = await this.maybeZstd(blob); // §10w: sniffed by magic, mixed chains fine
+        const dict = dictName ? await dictFor(dictName) : undefined;
+        blob = await this.maybeZstd(blob, dict); // §10w: sniffed by magic, mixed chains fine
         return decode(blob) as any; // objects are msgpack
       } catch (e) { this.appendLog('SYS', `${table}: chain object ${name} unreadable: ${e}`, 'ERROR'); return null; }
     };
@@ -1286,10 +1305,10 @@ export class ZeBridge {
     // time (it resets to null on a mid-walk manifest re-read).
     const planFrom = (man: any) => planFromManifest(man, watermark);
 
-    const applyPlan = async (plan: { name: string; kind: string }[]): Promise<number | null> => {
+    const applyPlan = async (plan: PlanStep[]): Promise<number | null> => {
       let applied = 0;
       for (const step of plan) {
-        const doc = await fetchDoc(step.name);
+        const doc = await fetchDoc(step.name, step.dict);
         if (!doc) return null; // pruned under us — caller re-reads
         const cols: string[] = doc.columns ?? [];
         if (!cols.length || !cols.every((c) => state.columns.includes(c))) {

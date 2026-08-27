@@ -21,6 +21,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "include" }) });
+    // libzstd for DICTIONARY frames (§10x): std.compress.zstd parses a dictionary
+    // id but cannot use one; plain frames still decode through std.
+    const zstd_prefix: []const u8 = if (builtin.os.tag == .macos) "/opt/homebrew/opt/zstd" else "/usr";
+    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
     const c_mod = translate_c.createModule();
 
     const nats_dep = b.dependency("nats", .{ .target = target, .optimize = optimize });
@@ -36,6 +40,8 @@ pub fn build(b: *std.Build) void {
     mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
     mod.linkSystemLibrary("sqlite3", .{});
+    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+    mod.linkSystemLibrary("zstd", .{});
     mod.link_libc = true;
 
     // The C-ABI shared library: one JSON dispatch entrypoint (zb_call) +
@@ -58,6 +64,8 @@ pub fn build(b: *std.Build) void {
     demo_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
     demo_mod.linkSystemLibrary("sqlite3", .{});
+    demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+    demo_mod.linkSystemLibrary("zstd", .{});
     demo_mod.link_libc = true;
     const demo = b.addExecutable(.{ .name = "zb-demo", .root_module = demo_mod });
     b.installArtifact(demo);

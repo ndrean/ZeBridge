@@ -515,12 +515,7 @@ pub fn planFromManifest(a: std.mem.Allocator, man: Value, watermark: ?[]const u8
         std.mem.order(u8, getStr(applicable.items[0], "prev_cutoff") orelse "", watermark.?) != .gt);
 
     if (reaches) {
-        for (applicable.items) |d| {
-            var step: std.json.ObjectMap = .empty;
-            try step.put(a, "name", .{ .string = getStr(d, "object") orelse "" });
-            try step.put(a, "kind", .{ .string = "delta" });
-            try plan.append(.{ .object = step });
-        }
+        for (applicable.items) |d| try plan.append(try deltaStep(a, d));
         return .{ .array = plan };
     }
     const full = if (man == .object) man.object.get("full") else null;
@@ -531,14 +526,18 @@ pub fn planFromManifest(a: std.mem.Allocator, man: Value, watermark: ?[]const u8
     try plan.append(.{ .object = fstep });
     const full_gen = getInt(full.?, "gen") orelse 0;
     for (deltas.items) |d| {
-        if ((getInt(d, "gen") orelse 0) > full_gen) {
-            var step: std.json.ObjectMap = .empty;
-            try step.put(a, "name", .{ .string = getStr(d, "object") orelse "" });
-            try step.put(a, "kind", .{ .string = "delta" });
-            try plan.append(.{ .object = step });
-        }
+        if ((getInt(d, "gen") orelse 0) > full_gen) try plan.append(try deltaStep(a, d));
     }
     return .{ .array = plan };
+}
+
+/// A delta step carries its dictionary name when the manifest names one (§10x).
+fn deltaStep(a: std.mem.Allocator, d: Value) !Value {
+    var step: std.json.ObjectMap = .empty;
+    try step.put(a, "name", .{ .string = getStr(d, "object") orelse "" });
+    try step.put(a, "kind", .{ .string = "delta" });
+    if (getStr(d, "dict")) |dn| try step.put(a, "dict", .{ .string = dn });
+    return .{ .object = step };
 }
 
 /// core.ts fullPredatesReplica (D2's destruction guard).

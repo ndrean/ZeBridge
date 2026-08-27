@@ -764,7 +764,8 @@ built; Postgres is never queried per consumer.
 | **Objects** | `gen-<tenant>` object store | The full and delta payloads: MessagePack rows, normally wrapped in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. Chunked by the object store itself (128 KB) — no NATS `max_payload` limit applies to a seed. |
 
 The manifest carries `gen` (the chain number), `full` (object name + gen), `deltas`
-(object, `cutoff`, `prev_cutoff`, gen — newest last), `cutoff_version` (the row-timestamp
+(object, `cutoff`, `prev_cutoff`, gen — newest last; plus `dict` naming the
+dictionary object a delta was compressed with, §10x, absent for plain frames), `cutoff_version` (the row-timestamp
 watermark), `cutoff_lsn`, and — the splice point — **`cutoff_seq`** with `cdc_stream`:
 the CDC stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction
 begins. Everything at or below `cutoff_seq` on that stream is in the chain; everything

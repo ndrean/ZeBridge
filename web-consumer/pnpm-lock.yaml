@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@bokuweb/zstd-wasm':
+        specifier: ^0.0.27
+        version: 0.0.27
       '@msgpack/msgpack':
         specifier: ^3.0.0-beta.1
         version: 3.1.3
@@ -23,9 +26,6 @@ importers:
       '@nats-io/obj':
         specifier: 3.4.0
         version: 3.4.0
-      fzstd:
-        specifier: ^0.1.1
-        version: 0.1.1
       solid-js:
         specifier: ^1.9.14
         version: 1.9.14
@@ -131,6 +131,9 @@ packages:
   '@babel/types@7.29.8':
     resolution: {integrity: sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg==}
     engines: {node: '>=6.9.0'}
+
+  '@bokuweb/zstd-wasm@0.0.27':
+    resolution: {integrity: sha512-GDm2uOTK3ESjnYmSeLQifJnBsRCWajKLvN32D2ZcQaaCIJI/Hse9s74f7APXjHit95S10UImsRGkTsbwHmrtmg==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -363,9 +366,6 @@ packages:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
     os: [darwin]
-
-  fzstd@0.1.1:
-    resolution: {integrity: sha512-dkuVSOKKwh3eas5VkJy1AW1vFpet8TA/fGmVA5krThl8YcOVE/8ZIoEA1+U1vEn5ckxxhLirSdY837azmbaNHA==}
 
   gc-hook@0.3.1:
     resolution: {integrity: sha512-E5M+O/h2o7eZzGhzRZGex6hbB3k4NWqO0eA+OzLRLXxhdbYPajZnynPwAtphnh+cRHPwsj5Z80dqZlfI4eK55A==}
@@ -772,6 +772,8 @@ snapshots:
       '@babel/helper-string-parser': 7.29.7
       '@babel/helper-validator-identifier': 7.29.7
 
+  '@bokuweb/zstd-wasm@0.0.27': {}
+
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
       '@jridgewell/sourcemap-codec': 1.5.5
@@ -954,8 +956,6 @@ snapshots:
 
   fsevents@2.3.3:
     optional: true
-
-  fzstd@0.1.1: {}
 
   gc-hook@0.3.1: {}
 

@@ -514,6 +514,33 @@ pub const GenerationProducer = struct {
             log.warn("⚠️ '{s}'/'{s}': widest row ~{d} bytes is at or over the {d}-byte CDC event buffer. Chains carry it; CDC will SUSPEND this table on its next touch. Shrink the row (store a reference, not the blob) or raise BASE_BUF.", .{ tenant, table, widest_row, self.event_buf_bytes });
         }
 
+        // ── 3b. the dictionary (§10x): a chain member, trained ONLY at a full ──
+        // build from the full's own msgpack bytes. The producer's memory is PG:
+        // the dictionary persists on the full's bookkeeping row and is read back
+        // from THERE for the era's deltas — never from NATS. No training state
+        // crosses eras: the next full trains a fresh one.
+        var dict_bytes: ?[]u8 = null;
+        var dict_name: ?[]const u8 = null;
+        if (build_full) {
+            if (full_payload) |p| {
+                if (try trainDict(alloc, p)) |d| {
+                    dict_bytes = d;
+                    dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen });
+                }
+            }
+        } else if (build_delta) {
+            const params_d = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+            const res_d = try queryOne(pgc,
+                "SELECT gen, encode(dict, 'hex') FROM public.zebridge_generations " ++
+                    "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_d);
+            defer c.PQclear(res_d);
+            if (c.PQntuples(res_d) > 0) {
+                const g = std.mem.span(c.PQgetvalue(res_d, 0, 0));
+                dict_bytes = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
+                dict_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g });
+            }
+        }
+
         // ── 4. immutable objects first ───────────────────────────────────────
         const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
         var osm = js.objectStoreManager();
@@ -536,9 +563,14 @@ pub const GenerationProducer = struct {
             var r = try store.putBytes(name, z);
             r.deinit();
         }
+        if (build_full) if (dict_bytes) |d| {
+            var r = try store.putBytes(dict_name.?, d);
+            r.deinit();
+            log.info("📖 '{s}'/'{s}': g{d} dictionary {d} bytes trained from the full", .{ tenant, table, gen, d.len });
+        };
         if (delta_payload) |p| {
-            const z = try compressZstd(alloc, p, 3);
-            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%)", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1) });
+            const z = if (dict_bytes) |d| try compressZstdDict(alloc, p, d, 3) else try compressZstd(alloc, p, 3);
+            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1), if (dict_bytes != null) " [dict]" else "" });
             const name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
             var r = try store.putBytes(name, z);
             r.deinit();
@@ -554,7 +586,7 @@ pub const GenerationProducer = struct {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{gen - @as(i64, self.chain_depth)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
             const res = try queryOne(pgc,
-                "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full " ++
+                "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full, COALESCE(dict_object, '') " ++
                     "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 ORDER BY gen", &params);
             defer c.PQclear(res);
             const n: usize = @intCast(c.PQntuples(res));
@@ -568,9 +600,11 @@ pub const GenerationProducer = struct {
                     full_cutoff_m = try alloc.dupe(u8, cutoff);
                 }
                 if (prev.len > 0) {
+                    const dref = std.mem.span(c.PQgetvalue(res, @intCast(i), 4));
+                    const dict_frag = if (dref.len > 0) try std.fmt.allocPrint(alloc, ",\"dict\":\"{s}\"", .{dref}) else "";
                     const frag = try std.fmt.allocPrint(alloc,
-                        "{s}{{\"gen\":{s},\"object\":\"{s}-g{s}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"}}",
-                        .{ if (deltas_json.items.len > 0) "," else "", g, table, g, prev, cutoff });
+                        "{s}{{\"gen\":{s},\"object\":\"{s}-g{s}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"{s}}}",
+                        .{ if (deltas_json.items.len > 0) "," else "", g, table, g, prev, cutoff, dict_frag });
                     try deltas_json.appendSlice(alloc, frag);
                 }
             }
@@ -580,9 +614,10 @@ pub const GenerationProducer = struct {
             full_cutoff_m = cutoff_version;
         }
         if (build_delta) {
+            const dict_frag = if (dict_name) |dn| try std.fmt.allocPrint(alloc, ",\"dict\":\"{s}\"", .{dn}) else "";
             const frag = try std.fmt.allocPrint(alloc,
-                "{s}{{\"gen\":{d},\"object\":\"{s}-g{d}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"}}",
-                .{ if (deltas_json.items.len > 0) "," else "", gen, table, gen, last_cutoff.?, cutoff_version });
+                "{s}{{\"gen\":{d},\"object\":\"{s}-g{d}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"{s}}}",
+                .{ if (deltas_json.items.len > 0) "," else "", gen, table, gen, last_cutoff.?, cutoff_version, dict_frag });
             try deltas_json.appendSlice(alloc, frag);
         }
 
@@ -609,10 +644,12 @@ pub const GenerationProducer = struct {
             const lsn_z = try alloc.dupeZ(u8, lsn);
             const cut_z = try alloc.dupeZ(u8, cutoff_version);
             const prev_z: ?[*:0]const u8 = if (last_cutoff) |p| (try alloc.dupeZ(u8, p)).ptr else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f" };
+            const dict_hex_z: ?[*:0]const u8 = if (build_full) (if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null) else null;
+            const dict_obj_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z };
             const res = try queryOne(pgc,
-                "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full) " ++
-                    "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean) " ++
+                "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object) " ++
+                    "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9) " ++
                     "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -625,6 +662,11 @@ pub const GenerationProducer = struct {
                 "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen <= $3 RETURNING gen", &params);
             defer c.PQclear(res);
             const pruned: usize = @intCast(c.PQntuples(res));
+            // Dictionaries outlive their full's row: a pruned era's dictionary must
+            // survive while any REMAINING row was compressed with it (§10x).
+            const still_ref = try queryOne(pgc,
+                "SELECT DISTINCT dict_object FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND dict_object IS NOT NULL", &params);
+            defer c.PQclear(still_ref);
             for (0..pruned) |i| {
                 const g = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
                 // A generation has a delta, a full, or both; delete both names and let
@@ -635,6 +677,15 @@ pub const GenerationProducer = struct {
                         if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
                     };
                 }
+                const dict_old = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g });
+                var referenced = false;
+                const nref: usize = @intCast(c.PQntuples(still_ref));
+                for (0..nref) |k| {
+                    if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(still_ref, @intCast(k), 0)), dict_old)) referenced = true;
+                }
+                if (!referenced) store.delete(dict_old) catch |err| {
+                    if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned dictionary {s}: {}", .{ dict_old, err });
+                };
             }
         }
 
@@ -655,4 +706,46 @@ fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
     const n = c.ZSTD_compress(dst.ptr, bound, src.ptr, src.len, level);
     if (c.ZSTD_isError(n) != 0) return error.ZstdCompressFailed;
     return dst[0..n];
+}
+
+/// §10x: train a zstd dictionary from one full's msgpack bytes, split into
+/// delta-sized samples (2 KiB — the unit a dictionary will actually compress).
+/// Null when the full is too small to learn from: dictionaries earn nothing
+/// there, and zdict refuses tiny corpora anyway.
+fn trainDict(alloc: std.mem.Allocator, full: []const u8) !?[]u8 {
+    const sample_len: usize = 2048;
+    const nsamples = full.len / sample_len;
+    if (full.len < 16 * 1024 or nsamples < 8) return null;
+    const sizes = try alloc.alloc(usize, nsamples);
+    for (sizes) |*sz| sz.* = sample_len;
+    const cap: usize = @max(@as(usize, 1024), @min(@as(usize, 112 * 1024), full.len / 4));
+    const dict = try alloc.alloc(u8, cap);
+    const n = c.ZDICT_trainFromBuffer(dict.ptr, cap, full.ptr, sizes.ptr, @intCast(nsamples));
+    if (c.ZDICT_isError(n) != 0) {
+        log.warn("📖 dictionary training failed: {s}", .{std.mem.span(c.ZDICT_getErrorName(n))});
+        return null;
+    }
+    return dict[0..n];
+}
+
+fn compressZstdDict(alloc: std.mem.Allocator, src: []const u8, dict: []const u8, level: c_int) ![]u8 {
+    const cctx = c.ZSTD_createCCtx() orelse return error.ZstdCompressFailed;
+    defer _ = c.ZSTD_freeCCtx(cctx);
+    const bound = c.ZSTD_compressBound(src.len);
+    const dst = try alloc.alloc(u8, bound);
+    const n = c.ZSTD_compress_usingDict(cctx, dst.ptr, bound, src.ptr, src.len, dict.ptr, dict.len, level);
+    if (c.ZSTD_isError(n) != 0) return error.ZstdCompressFailed;
+    return dst[0..n];
+}
+
+fn hexEncodeZ(alloc: std.mem.Allocator, bytes: []const u8) ![:0]u8 {
+    const out = try alloc.allocSentinel(u8, bytes.len * 2, 0);
+    for (bytes, 0..) |b, i| utils.byteToHex(out[i * 2 .. i * 2 + 2], b);
+    return out;
+}
+
+fn hexDecode(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
+    const out = try alloc.alloc(u8, hex.len / 2);
+    for (out, 0..) |*b, i| b.* = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16);
+    return out;
 }

@@ -497,6 +497,12 @@ CREATE TABLE IF NOT EXISTS public.zebridge_generations (
     built_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant, tbl, gen)
 );
+-- §10x: the compression dictionary is a chain member. `dict` holds the trained
+-- dictionary on the row that carried the full (the producer's memory — read back
+-- from HERE for the era's deltas, never from NATS); `dict_object` names the
+-- dictionary object this row's payload was compressed with (NULL = plain zstd).
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict bytea;
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_object text;
 -- Databases created before the delta milestone: same columns, idempotently.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS prev_cutoff timestamptz;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolean NOT NULL DEFAULT false;

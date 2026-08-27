@@ -24,7 +24,7 @@ export type SeedAnchor = {
 
 export type CoreEvent = { lsn?: number; seq?: number; stream?: string };
 
-export type ManifestDelta = { object: string; cutoff: string; prev_cutoff: string; gen: number };
+export type ManifestDelta = { object: string; cutoff: string; prev_cutoff: string; gen: number; dict?: string };
 export type ChainManifest = {
   gen: number;
   full?: { object: string; gen: number } | null;
@@ -32,7 +32,9 @@ export type ChainManifest = {
   cutoff_seq?: number;
   cdc_stream?: string;
 };
-export type PlanStep = { name: string; kind: 'full' | 'delta' };
+/// `dict` names the dictionary object a delta was compressed with (§10x) —
+/// carried through so the applier fetches it before decoding.
+export type PlanStep = { name: string; kind: 'full' | 'delta'; dict?: string };
 
 // ─── the seed gate (findings 7 and 10) ───────────────────────────────────────
 
@@ -64,12 +66,12 @@ export function planFromManifest(man: ChainManifest, watermark: string | null): 
   const applicable = watermark ? deltas.filter((d) => d.cutoff > watermark) : deltas;
   const reaches = watermark != null &&
     (applicable.length === 0 || applicable[0].prev_cutoff <= watermark);
-  if (reaches) return applicable.map((d) => ({ name: d.object, kind: 'delta' as const }));
+  const step = (d: ManifestDelta): PlanStep => ({ name: d.object, kind: 'delta', ...(d.dict ? { dict: d.dict } : {}) });
+  if (reaches) return applicable.map(step);
   if (!man.full) return [];
   return [
     { name: man.full.object, kind: 'full' as const },
-    ...deltas.filter((d) => d.gen > man.full!.gen)
-             .map((d) => ({ name: d.object, kind: 'delta' as const })),
+    ...deltas.filter((d) => d.gen > man.full!.gen).map(step),
   ];
 }
 
