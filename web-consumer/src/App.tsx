@@ -7,6 +7,19 @@
 import { createSignal, onCleanup, For } from 'solid-js';
 import grammar from '../../grammar.json';
 import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
+import { init as zstdInit, decompress as zstdDecompress, createDCtx, decompressUsingDict } from '@bokuweb/zstd-wasm';
+
+/// §10x: chain objects are zstd frames, deltas may name a dictionary. One wasm
+/// decoder, initialized once; a dict frame decodes through a decompression
+/// context holding the dictionary bytes.
+let zstdReady: Promise<void> | null = null;
+async function zstdDecode(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array> {
+  zstdReady ??= zstdInit();
+  await zstdReady;
+  if (!dict) return zstdDecompress(b);
+  const dctx = createDCtx();
+  try { return decompressUsingDict(dctx, b, dict); } finally { /* ctx freed by GC in this build */ }
+}
 import { nkeys } from '@nats-io/nats-core';
 
 const NATS_URL = 'ws://localhost:8080';
@@ -76,6 +89,7 @@ const CREDS = await (async () => {
 const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
 
 const zb = new ZeBridge({
+      zstdDecompress: zstdDecode,
   natsUrl: NATS_URL,
   principal: PRINCIPAL,
   password: PASSWORD,
