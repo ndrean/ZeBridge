@@ -4022,6 +4022,56 @@ which is a STRONGER guarantee than ZeBridge offers today. Neither is a
 prerequisite for FKs working — they already do — so this is an improvement to
 sequence deliberately, not a hole to plug.
 
+## 10g. A stale snapshot can DESTROY a correct replica (2026-08-27, OPEN)
+
+Found in a clean room while chasing a 3,000-row discrepancy. Not yet fully fixed —
+the guard added is partial, and the underlying gap is a design one.
+
+**What happens.** `replaySnapshot` begins with `DELETE FROM <table>` and then
+replays the descriptor's chunks. So replaying a STALE descriptor does not merely
+fail to help, it destroys data. Measured, from the client's own log:
+
+    Cached snapshot for orders is orphaned (CDC no longer covers its watermark)
+      — requesting a fresh one instead
+    Request for orders refused (maximum messages per subject exceeded)
+      — a snapshot is already pending, waiting for it
+    Snapshot metadata ready for orders (LSN 8722029312, 0 rows). Replaying...
+    Replay finished for orders (0 rows applied)
+    => orders = 0            (it held 5,000 correct rows a moment earlier)
+
+Every step is ordinary. The client judged its cached snapshot orphaned, asked for
+a fresh one, the **SNAP_RET throttle refused it** because one was already pending,
+and it fell back to that pending descriptor — which had been taken when the table
+was EMPTY and carried an LSN (8722029312) BEHIND the client's own position
+(8728358024). It rewound, and `DELETE FROM` did the rest.
+
+**This is finding 4's shape on the client side**: resume forward, never rewind. A
+snapshot older than data already held is not a baseline, it is a regression.
+
+**Partial fix in place**: `replaySnapshot` now refuses a descriptor when the table
+HOLDS ROWS and the descriptor's lsn is behind `globalSyncState.lsn`. An empty
+table has nothing to lose and always seeds — which matters, because on a fresh
+replica `state.lsn` starts far ahead of any descriptor (see applyEvent's gate), so
+a naive lsn comparison would refuse every legitimate first seed.
+
+**Why that is not enough, and what the real gap is.** The client has no per-table
+DATA watermark. `global_last_lsn` is global across tables, and `state.lsn` is the
+SCHEMA's lsn, not the position its rows are at. So the client cannot reliably
+answer the only question that matters here — "is this descriptor older than the
+data I hold for THIS table?" — and a second run still emptied `users` with the
+guard in place. The fix is to track an applied-position per table and compare
+against that; anything less is guessing with a DELETE in hand.
+
+**Also worth pulling on**: the throttle refusing a fresh snapshot and the client
+then USING the stale pending one is a bad pairing. A refusal should not silently
+degrade into "use whatever is cached" — the safe response to "no fresh snapshot
+available" is to keep the current data and stay on CDC, not to rewind.
+
+⚠️ Until the per-table watermark exists, a client that loses CDC coverage while
+holding data can still be emptied by a stale descriptor. The window is narrow
+(it needs an orphaned cached snapshot plus a throttled request) but it is real,
+and the failure is silent and total for that table.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today

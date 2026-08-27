@@ -233,7 +233,7 @@ export class ZeBridge {
   private suspendedHandlers = new Set<(table: string, reason: string | null) => void>();
   private statusHandlers = new Set<(s: ConnStatus) => void>();
 
-  private fkHeld: { table: string; ev: any }[] = [];
+  private fkHeld: { id?: number; table: string; ev: any }[] = [];
   private sweepId?: ReturnType<typeof setInterval>;
   private rttIntervalId?: ReturnType<typeof setInterval>;
   private recountTimer?: ReturnType<typeof setTimeout>;
@@ -339,6 +339,12 @@ export class ZeBridge {
   /// arrived yet, which happens when one PostgreSQL transaction is split across
   /// batches. Non-zero for long is a real signal: the parent never came.
   public get fkHeldCount(): number { return this.fkHeld.length; }
+  /// The durable hold queue, oldest first — what is waiting and for how long. A row
+  /// with a high `attempts` is a parent that is never coming, which is a real
+  /// condition worth seeing rather than expiring away.
+  public async inbox(): Promise<any[]> {
+    return this.run(`SELECT id, tbl, lsn, reason, held_at, attempts FROM _zebridge_inbox ORDER BY id`);
+  }
   public tableNames(): string[] { return [...this.syncedTables.keys()]; }
   public tableState(table: string): TableState | undefined { return this.syncedTables.get(table); }
   public suspendedTables(): Record<string, string> { return Object.fromEntries(this.suspendedMap); }
@@ -392,6 +398,7 @@ export class ZeBridge {
       this.emitStatus('connected');
       this.reach('connected');
       this.appendLog('SYS', `Connected to NATS as '${this.config.principal}'`);
+      await this.loadHeldEvents();
       await this.watchSchemas();
       await this.watchVerdicts();
       await this.resolveTenant();
@@ -517,6 +524,18 @@ export class ZeBridge {
   // ── outbox (PROTOCOL.md §7.1) ──────────────────────────────────────────────
 
   private async createOutboxTable() {
+    await this.run(`
+      CREATE TABLE IF NOT EXISTS _zebridge_inbox (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        tbl      TEXT    NOT NULL,
+        lsn      INTEGER NOT NULL,
+        ev       TEXT    NOT NULL,
+        reason   TEXT    NOT NULL,
+        held_at  INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    await this.run(`CREATE INDEX IF NOT EXISTS _zebridge_inbox_tbl ON _zebridge_inbox (tbl, lsn)`);
     await this.run(`
       CREATE TABLE IF NOT EXISTS _zebridge_outbox (
         msg_id     TEXT PRIMARY KEY,
@@ -692,6 +711,7 @@ export class ZeBridge {
 
   private async dropLocalTable(table: string, reason: string) {
     try {
+      await this.pruneInboxDropped(table);
       await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
       await this.run(`DROP TABLE IF EXISTS ${table};`);
       this.syncedTables.delete(table);
@@ -940,7 +960,7 @@ export class ZeBridge {
       } catch (e) {
         const kind = foreignKeyFailureKind(e);
         if (kind === 'missing-parent') {
-          this.fkHeld.push({ table, ev });
+          await this.holdEvent(table, ev, String(e));
           held++;
         } else if (kind === 'mismatch') {
           // Waiting cannot fix this: the parent key is not the PK and carries no
@@ -959,6 +979,78 @@ export class ZeBridge {
         `${applied} applied, ${held} held for a missing parent, ${failed} dropped`,
       failed ? 'ERROR' : 'WARNING',
     );
+  }
+
+  private async deleteHeld(rows: { id?: number }[], exec: Exec = this.run) {
+    const ids = rows.map((r) => r.id).filter((i): i is number => i != null);
+    if (!ids.length) return;
+    await exec(`DELETE FROM _zebridge_inbox WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids);
+  }
+
+  /// Persist a held event and remember it. In memory ALONE it was lost on restart
+  /// while already ACKed to JetStream — so it would never be redelivered either.
+  /// Silent, permanent divergence, the same family as findings 4 and 5.
+  ///
+  /// `id` is AUTOINCREMENT: arrival order is apply order, and a restart must
+  /// replay them in the order they were received, not by lsn (which is NOT
+  /// monotonic in delivery order — NOTES §10f).
+  private async holdEvent(table: string, ev: any, reason: string) {
+    const lsn = typeof ev?.lsn === 'number' ? ev.lsn : 0;
+    try {
+      const r = await this.run(
+        `INSERT INTO _zebridge_inbox (tbl, lsn, ev, reason, held_at) VALUES (?,?,?,?,?) RETURNING id`,
+        table, lsn, JSON.stringify(ev), reason.slice(0, 300), Date.now(),
+      );
+      this.fkHeld.push({ id: r?.[0]?.id, table, ev });
+    } catch (err) {
+      // Never lose the event to a bookkeeping failure — hold it in memory at least.
+      this.fkHeld.push({ table, ev });
+      this.appendLog('CDC', `held event could not be persisted (${err}) — it survives only until restart`, 'ERROR');
+    }
+  }
+
+  /// Reload holds after a restart, in arrival order.
+  private async loadHeldEvents() {
+    try {
+      const rows = await this.run(`SELECT id, tbl, ev FROM _zebridge_inbox ORDER BY id`);
+      if (!rows?.length) return;
+      for (const r of rows) {
+        try { this.fkHeld.push({ id: r.id, table: r.tbl, ev: JSON.parse(r.ev) }); } catch { /* unreadable row */ }
+      }
+      this.appendLog('SYS', `${this.fkHeld.length} held event(s) restored from the inbox — awaiting their parents`, 'INFO');
+    } catch { /* table absent on an older replica */ }
+  }
+
+  /// PRUNING. Four points, and deliberately no fifth:
+  ///
+  ///   applied      — the row is done; delete it. The primary path.
+  ///   re-seeded    — a seed is a new baseline at a watermark, so anything at or
+  ///                  below it is ALREADY in the seeded data. Rows ABOVE it are
+  ///                  NOT, and must survive: they were acked, so CDC will never
+  ///                  redeliver them. Hence `lsn <= watermark`, never a blanket
+  ///                  delete by table.
+  ///   table dropped— the table is gone; its holds are meaningless.
+  ///   ...and NOT by age. A parent that never arrives is a REAL condition (a
+  ///   constraint whose parent row the client may not read), and expiring the row
+  ///   would silently discard data — the exact failure class this whole table
+  ///   exists to end. It stays, it is counted, and it is loud.
+  private async pruneInboxSeeded(table: string, watermarkLsn: number) {
+    try {
+      await this.run(`DELETE FROM _zebridge_inbox WHERE tbl = ? AND lsn <= ?`, table, watermarkLsn);
+      this.fkHeld = this.fkHeld.filter((h) => !(h.table === table && (h.ev?.lsn ?? 0) <= watermarkLsn));
+    } catch { /* nothing held */ }
+  }
+
+  private async pruneInboxDropped(table: string) {
+    try {
+      const q = await this.run(`SELECT count(*) AS k FROM _zebridge_inbox WHERE tbl = ?`, table);
+      const k = q?.[0]?.k ?? 0;
+      if (k > 0) {
+        this.appendLog('CDC', `${table}: discarding ${k} held event(s) — the table was dropped upstream`, 'WARNING');
+        await this.run(`DELETE FROM _zebridge_inbox WHERE tbl = ?`, table);
+      }
+      this.fkHeld = this.fkHeld.filter((h) => h.table !== table);
+    } catch { /* nothing held */ }
   }
 
   /// Retry events held for a missing parent. Called after every batch, because the
@@ -981,23 +1073,32 @@ export class ZeBridge {
       await this.transaction(async (txExec) => {
         await txExec(`PRAGMA defer_foreign_keys = ON;`);
         for (const { table, ev } of pending) await this.applyEvent(table, ev, txExec);
+        // Same transaction as the apply: an event is either applied AND forgotten,
+        // or neither. A crash between the two would replay it forever or lose it.
+        await this.deleteHeld(pending, txExec);
       });
       applied = pending.length;
     } catch {
       // Some are still orphaned. NOW it is worth isolating, because only the ones
       // that individually fail go back on the queue.
-      for (const { table, ev } of pending) {
+      for (const held of pending) {
+        const { table, ev } = held;
         try {
           await this.transaction(async (txExec) => {
             await txExec(`PRAGMA defer_foreign_keys = ON;`);
             await this.applyEvent(table, ev, txExec);
+            await this.deleteHeld([held], txExec);
           });
           applied++;
         } catch (e) {
           if (foreignKeyFailureKind(e) === 'missing-parent') {
-            this.fkHeld.push({ table, ev });   // still waiting; try again next batch
+            this.fkHeld.push(held);            // still waiting; try again next batch
+            if (held.id != null) {
+              try { await this.run(`UPDATE _zebridge_inbox SET attempts = attempts + 1 WHERE id = ?`, held.id); } catch { /* best effort */ }
+            }
           } else {
             this.appendLog('CDC', `DROPPED held ${ev?.operation} on ${table}: ${e}`, 'ERROR');
+            await this.deleteHeld([held]);
           }
         }
       }
@@ -1293,6 +1394,7 @@ export class ZeBridge {
     }
 
     state.lsn = lsnToNumber(manifest.cutoff_lsn);
+    await this.pruneInboxSeeded(table, state.lsn);
     await this.run(
       `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?)
        ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn`,
@@ -1565,6 +1667,35 @@ export class ZeBridge {
   /// (same "unseeded is not synced" rule) but never abandon other tables' replays.
   private async replaySnapshot(js: any, jsm: any, table: string, desc: any, tenanted: boolean, tenantForTable: string): Promise<void> {
     try {
+      // ⚠️ A SNAPSHOT MUST NEVER MOVE THIS TABLE BACKWARDS.
+      //
+      // Replaying starts with DELETE FROM, so a stale descriptor does not merely
+      // fail to help — it DESTROYS a correct replica. Measured in a clean room: a
+      // populated `orders` (5,000 rows) was emptied by replaying a descriptor taken
+      // when the table was empty. The path there is entirely ordinary: the client
+      // judged its cached snapshot orphaned, asked for a fresh one, the SNAP_RET
+      // throttle REFUSED it ("maximum messages per subject exceeded — a snapshot is
+      // already pending"), and it fell back to the pending descriptor, which was
+      // older than its own position. 0 rows applied, 5,000 rows gone.
+      //
+      // The rule is finding 4's, on the client side: resume forward, never rewind.
+      // A snapshot older than data we already hold is not a baseline, it is a
+      // regression. Comparing against `state.lsn` alone will not do — on a FRESH
+      // replica that starts far ahead of any descriptor (see the gate in
+      // applyEvent) — so the test is "do we actually hold rows this descriptor
+      // predates?". An empty table has nothing to lose and always seeds.
+      const descLsn = typeof desc?.lsn === 'number' ? desc.lsn : 0;
+      const held = (await this.run(`SELECT COUNT(*) AS n FROM ${table}`))?.[0]?.n ?? 0;
+      if (held > 0 && descLsn > 0 && descLsn < this.globalSyncState.lsn) {
+        this.appendLog(
+          'SYS',
+          `REFUSED a stale snapshot for ${table}: descriptor @ lsn ${descLsn} is behind this replica (${this.globalSyncState.lsn}) ` +
+            `and the table holds ${held} row(s) — replaying it would DELETE them and restore an older state. Keeping what we have; CDC carries on.`,
+          'ERROR',
+        );
+        return;
+      }
+
       await this.run(`DELETE FROM ${table}`);
 
       const stream = tenanted ? this.initStream(tenantForTable) : this.config.grammar.streams.init;
@@ -1625,7 +1756,10 @@ export class ZeBridge {
       }
 
       const state = this.syncedTables.get(table);
-      if (state) state.lsn = desc.lsn;
+      if (state) {
+        state.lsn = desc.lsn;
+        await this.pruneInboxSeeded(table, desc.lsn);
+      }
       const rowCountNote = desc.row_count != null && desc.row_count !== rowsApplied
         ? ` ⚠️ expected ${desc.row_count} rows per the descriptor`
         : '';
