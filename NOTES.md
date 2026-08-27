@@ -4358,6 +4358,63 @@ the lsn gate the same shape was silently lost.
     documented weaker guarantee of physical deletes, amplified by chain windows.
     The answer remains "give the table a tombstone column"; no gate can fix it.
 
+## 10j. The cross-STREAM FK test — and the two client defects it exposed (2026-08-27)
+
+§10h's FK verification used `users`+`orders` — both PUBLIC, one stream. The
+cross-STREAM shape (tenant-scoped child, public parent: the `salaries` case the
+review insisted on keeping) had never actually been exercised. Built live:
+
+    CREATE TABLE salaries (uid uuid PK, user_id bigint REFERENCES users(id),
+                           tenant_id text NOT NULL, ...);
+    SELECT zebridge_enable('public.salaries', writable => true,
+                           tenant_col => 'tenant_id', dry_run => false);
+
+**The approval doors verified themselves on the way:**
+  * First attempt used `tenant_col` WITHOUT `writable` — zebridge_enable REFUSED
+    it: "would be published unscoped, which zebridge_publication_guard refuses",
+    with the three legal options in the error. The migration door works.
+  * After the correct enable, the RUNNING bridge still published the schema from
+    its boot-time catalogue view (tenant_column None, no FK) — the T3 restart
+    law, stated by zebridge_enable's own output. After one restart the schema
+    carried tenant_column, writable, AND the ported FK; the client's local DDL
+    had `FOREIGN KEY (user_id) REFERENCES users(id)`.
+
+**What worked:** fresh cross-stream seed (750 users via CDC_PUBLIC chain, 750
+kilo salaries via gen-kilo chain, zero orphans, FK live); the over-ring 3000-pair
+single transaction split across the ring, bridge alive, and the applier's
+hold/retry converged 3000 held -> 3000 resolved, zero orphans, across TWO
+independent consumers. The core cross-stream FK machinery works.
+
+**What it exposed — two OPEN client defects, found because the durable client
+was reconnected repeatedly:**
+
+  1. **CDC_kilo's position is never persisted when every event on it was HELD.**
+     `_zebridge_stream_seq` held only CDC_PUBLIC after runs whose kilo traffic
+     was 100% FK-held. A stream whose seq is never recorded reads as a GAP on the
+     next connect, which triggers a full RE-SEED on every reconnect — turning the
+     durable client into a permanently fresh one for that stream.
+  2. **A chain-full re-seed DESTROYS rows the chain lacks.** applyPlan's full
+     step is `DELETE FROM <table>` + insert the full's rows; the settle pass
+     re-seeded salaries from a chain reporting 3000 rows while PG held 4500, and
+     the 750 CDC-arrived rows were wiped (replica 3750, then 3000). The replica
+     ended MISSING the 750 cx users as well. Same DELETE-then-replay destruction
+     class as the retired snapshot path (§10g) — the chain path inherited it.
+     The chain-full row count itself (3000 of 4500 present at build time) also
+     needs explaining — full-scan vs bookkeeping mismatch, or my reading of an
+     interleaved log; NOT yet diagnosed.
+
+Both defects need a CLEAN-ROOM diagnosis (this environment has absorbed a day of
+purges and slot advances) before fixes: per §10h's own lesson, establish what
+actually ran before theorising. The under-ring run's "750 held, 0 resolved at
+close" is likely defect 1's shadow (client closed before the public-stream
+parents were consumed), not a hold/retry failure.
+
+**Status of the schema portage after this test**: types, PK, NOT NULL, indexes,
+UNIQUE (via unique indexes), FOREIGN KEY — all ported and verified, including
+cross-stream. Remaining: DEFAULT and CHECK (both low value; a replica receives
+complete rows). The PG -> SQLite portage is functionally complete for
+replication correctness.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today
