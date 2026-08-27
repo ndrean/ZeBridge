@@ -12,8 +12,9 @@ PG  ←→  zebridge (daemon)  ←→  NATS  ←→  libzb(.js) (library)  ←�
 ```
 
 The daemon `zebridge` streams PostgreSQL changes onto NATS/JetStream and applies writes coming back.
-The client library `libzb` keeps a local SQLite replica on the edge — browsers, phones, services — and is the only way the consumer reads and writes.
-Consumers query their replica offline  - dashboard, search index, analytics...and optimistic writes are pushed using `libzb` through three verbs (INS, DEL, UP), resolved **last-write-wins**.
+The client C-library `libzb` (or `zb-client-ts` for JavaScript based consumers) keeps a local SQLite replica on the edge — browsers, phones, services.
+Consumers query their replica on/offline  - dashboard, search index, analytics...
+Optimistic writes are pushed using the client library primitives (`mutate()`, `query()`) through three verbs (INSERT, DELETE, UPDATE), resolved **last-write-wins**.
 
 NATS/JS is the transport, the fan-out/in, and the tenant boundary.
 
@@ -76,7 +77,7 @@ flowchart LR
 
      subgraph Edge["Server-side consumers (per tenant)"]
         NATS_L["NATS Leaf<br>(tenant-scoped creds)"]
-        NATS_L <--> Svc["microservice<br>(libzb via FFI<br>or wasm eater + pump)"]
+        NATS_L <--> Svc["microservice<br>(zb-client-ts, or<br>libzb via FFI)"]
     end
 
     subgraph Mobile["Mobile consumer"]
@@ -1523,7 +1524,7 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 
 **Next:**
 
-* [ ] **`libzebridge` native + the shared Zig eater** — the §10 vision: one sans-I/O applier core in Zig, compiled native (`.so`/`.dylib`/`.dll`, C ABI) for FFI hosts — mobile (Swift/Kotlin/Dart), native microservices, Windows (.NET/C++) — and to `applier.wasm` for **non-JS** hosts that want that same core without native FFI (Go via `wazero`, Python/Ruby/Elixir via wasmtime). JavaScript hosts do not need it: `libzebridge.js` already *is* the core, in TypeScript.
+* [ ] **`libzebridge` native** — one sans-I/O core, now carved in TypeScript (`zb-client-ts/src/core.ts`) with a language-neutral conformance suite (`zb-client-ts/fixtures/core-fixtures.json`), to be ported to Zig and compiled native (`.so`/`.dylib`/`.dll`, C ABI) for FFI hosts — mobile (Swift/Kotlin/Dart), native microservices, Windows (.NET/C++). The port is correct when it passes the same fixtures. JavaScript hosts need none of it: `zb-client-ts` already *is* the core. (WASM dropped 2026-08-27, NOTES §10s: every host is covered by the JS package or the C ABI.)
 * [ ] **Auth callout** — the login rides the NATS connect (`$SYS.REQ.USER.AUTH`), so even the mint endpoint disappears; the bridge is the responder.
 * [ ] Split READ (CDC + bootstrap) onto a **standby replica** (PG ≧ 16) from WRITE on the primary, with chain building on the replica.
 * [ ] TLS on the NATS↔leaf and PG↔bridge links for cross-network deployments.

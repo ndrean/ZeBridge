@@ -30,6 +30,11 @@ import { decode, encode } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 import { browserStorage } from './browser-storage.ts';
 import { v7 as uuidv7 } from 'uuid';
+import {
+  seedGateDrops, planFromManifest, fullPredatesReplica as coreFullPredates,
+  scopeSeeding, advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
+} from './core.ts';
+import type { PlanStep } from './core.ts';
 
 export interface ZeBridgeConfig {
   natsUrl: string;
@@ -127,53 +132,14 @@ async function watchBucket(
   return { pending: ci.num_pending ?? 0, entries, stop: () => { try { iter.stop(); } catch { /* closed */ } } };
 }
 
-/// PG text-mode timestamptz (UTC — the producer pins its snapshot txn there) → the CDC
-/// wire shape. String surgery, microseconds preserved (`Date` would truncate to ms).
-/// The version guard compares AS STRINGS: `' '` sorts before `'T'`, so unnormalized
-/// chain values would lose every comparison against CDC-written ones (NOTES.md §1.13).
-const pgTsToWire = (v: any): any =>
-  typeof v === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?\+00(:00)?$/.test(v)
-    ? v.replace(' ', 'T').replace(/\+00(:00)?$/, 'Z')
-    : v;
-
-/// `pg_lsn` text (`0/C5793FD0`) → the numeric WAL position CDC events carry.
-const lsnToNumber = (lsn: string): number => {
-  const [hi, lo] = String(lsn).split('/');
-  return parseInt(hi, 16) * 0x100000000 + parseInt(lo, 16);
-};
-
+// pgTsToWire and lsnToNumber live in core.ts (§10s).
 const td = new TextDecoder();
 type Exec = (q: string, ...params: any[]) => Promise<any[]>;
 
 /// Assemble a .creds file's text from a JWT and a seed — what the enrollment
 /// flow holds after the mint responds (the seed never crossed the wire; the app
 /// generated the pair itself).
-/// Is this failure "the parent is not here YET" rather than "this row is wrong"?
-///
-/// THREE distinct messages, and only the first one says what you would expect —
-/// all measured against SQLite:
-///
-///   FOREIGN KEY constraint failed        the parent ROW is missing
-///   no such table: main.<parent>         the parent TABLE has not been created yet
-///                                        (FK resolution is lazy at DDL, strict at
-///                                        DML, so a child can exist before its
-///                                        parent when schemas arrive out of order)
-///   foreign key mismatch - "c" ref "p"   the parent KEY is not the PK and has no
-///                                        UNIQUE index — a schema-porting fault,
-///                                        NOT a missing parent
-///
-/// The first two are worth holding and retrying: a later batch supplies what is
-/// missing. The third never resolves by waiting — the parent key will not become
-/// unique — so it is matched here only to be reported distinctly rather than
-/// retried forever. Matching messages is unavoidable: sqlocal and better-sqlite3
-/// surface different error CLASSES for the same fault.
-function foreignKeyFailureKind(e: unknown): 'missing-parent' | 'mismatch' | null {
-  const m = String((e as any)?.message ?? e);
-  if (/foreign key mismatch/i.test(m)) return 'mismatch';
-  if (/FOREIGN KEY constraint failed/i.test(m)) return 'missing-parent';
-  if (/no such table: /i.test(m)) return 'missing-parent';
-  return null;
-}
+// foreignKeyFailureKind lives in core.ts (§10s) — the three measured SQLite messages.
 
 export function credsFileText(jwt: string, seed: string): string {
   return `-----BEGIN NATS USER JWT-----\n${jwt}\n------END NATS USER JWT------\n\n` +
@@ -1155,24 +1121,10 @@ export class ZeBridge {
     // enrollment demo; chain seeding survived only because it writes outside this
     // path). Seeding IS the baseline: it must land unconditionally, and the
     // caller re-anchors state.lsn to the snapshot's own watermark afterwards.
-    if (!seed) {
-      if (typeof state.seedSeq === 'number' && state.seedStream) {
-        // ── finding 7's fix (NOTES §10i) ──
-        // Drop only what the chain provably contains: an event published at or
-        // before cutoff_seq was decoded from a transaction that COMMITTED before
-        // the producer's snapshot began (capture precedes BEGIN), so the snapshot
-        // saw it. An in-flight transaction commits later, publishes later, and its
-        // seq exceeds the cutoff even though its row lsns may be LOWER — measured:
-        // inflight-A, seq 62129 > cutoff, lsn below it, lost under the lsn gate.
-        // Events from OTHER streams and optimistic locals carry no matching
-        // seq/stream and pass untouched.
-        if (ev.stream === state.seedStream && typeof ev.seq === 'number' && ev.seq <= state.seedSeq) return;
-      } else if (typeof state.seedLsn === 'number' && ev.lsn < state.seedLsn) {
-        // Legacy manifest without cutoff_seq (an older bridge): the lsn gate, with
-        // its known in-flight blind spot, is still better than no gate at all.
-        return;
-      }
-    }
+    // The decision is core.seedGateDrops — findings 7 and 10 as one pure rule
+    // (seq-primary because commit-ordered; strict-< lsn fallback anchored only
+    // by a seed), pinned executable in fixtures/core-fixtures.json.
+    if (!seed && seedGateDrops(ev, state)) return;
 
     const op = ev.operation;
 
@@ -1368,18 +1320,9 @@ export class ZeBridge {
       watermark = r[0]?.watermark ?? null;
     } catch { /* fresh replica */ }
 
-    const planFrom = (man: any): { name: string; kind: 'full' | 'delta' }[] => {
-      const deltas: any[] = man.deltas ?? [];
-      const applicable = watermark ? deltas.filter((d) => d.cutoff > watermark!) : deltas;
-      const reaches = watermark != null &&
-        (applicable.length === 0 || applicable[0].prev_cutoff <= watermark);
-      if (reaches) return applicable.map((d) => ({ name: d.object, kind: 'delta' as const }));
-      return [
-        { name: man.full.object, kind: 'full' as const },
-        ...deltas.filter((d) => d.gen > man.full.gen)
-                 .map((d) => ({ name: d.object, kind: 'delta' as const })),
-      ];
-    };
+    // The walk itself is core.planFromManifest; `watermark` is read at call
+    // time (it resets to null on a mid-walk manifest re-read).
+    const planFrom = (man: any) => planFromManifest(man, watermark);
 
     const applyPlan = async (plan: { name: string; kind: string }[]): Promise<number | null> => {
       let applied = 0;
@@ -1416,20 +1359,11 @@ export class ZeBridge {
       return applied;
     };
 
-    // D2 (NOTES §10n): a chain-full is DELETE FROM + replay, so a chain whose
-    // cutoff predates this replica's applied stream position would destroy every
-    // row applied AFTER the chain was built — rows the resumed CDC will never
-    // re-deliver (they are behind the stored position). Such a chain cannot help
-    // with a gap either: the gap sits ABOVE the stored position it fails to
-    // reach. Refuse it; the caller's poll picks up the next cadence build, whose
-    // cutoff is taken at the stream tail. Legacy manifests (no cutoff_seq) stay
-    // ungated — lsn is not comparable across commits (finding 7). Delta-only
-    // plans are upserts and need no gate.
-    const fullPredatesReplica = (man: any, plan: { kind: string }[]): boolean => {
-      if (!plan.some((step) => step.kind === 'full')) return false;
-      if (typeof man.cutoff_seq !== 'number' || man.cutoff_seq <= 0 || !man.cdc_stream) return false;
+    // D2's destruction guard is core.fullPredatesReplica (NOTES §10n/§10s);
+    // this wrapper only supplies the stored position and the log line.
+    const fullPredatesReplica = (man: any, plan: PlanStep[]): boolean => {
       const pos = this.globalSyncState.seq[man.cdc_stream] ?? 0;
-      if (man.cutoff_seq >= pos) return false;
+      if (!coreFullPredates(man, plan, pos)) return false;
       this.appendLog('SYS', `${table}: chain g${man.gen} predates this replica (cutoff seq ${man.cutoff_seq} < applied ${pos} on ${man.cdc_stream}) — a full replay would destroy newer rows; waiting for a newer build`, 'WARNING');
       return true;
     };
@@ -1476,16 +1410,13 @@ export class ZeBridge {
     // 1. Gap detection — asked of EVERY stream this client reads: a gap in any of
     // them means missing rows, and checking only one looks like an empty table.
     try {
-      const gappedStreams = new Set<string>();
-      const gapDetail: string[] = [];
+      const streamGaps: Record<string, { firstSeq: number; stored: number }> = {};
       for (const streamName of this.cdcStreams()) {
         const info = await jsm.streams.info(streamName);
-        const firstSeq = info.state.first_seq;
-        const local = this.globalSyncState.seq[streamName] ?? 0;
-        if (local === 0 || (firstSeq > 0 && local < firstSeq - 1)) {
-          gappedStreams.add(streamName);
-          gapDetail.push(`${streamName}: local ${local}, stream first ${firstSeq}`);
-        }
+        streamGaps[streamName] = {
+          firstSeq: info.state.first_seq,
+          stored: this.globalSyncState.seq[streamName] ?? 0,
+        };
       }
 
       // D2 (NOTES §10n): seeding is SCOPED. A gap on one stream re-seeds only
@@ -1499,11 +1430,19 @@ export class ZeBridge {
         const rows: any[] = (await this.run(`SELECT tbl FROM _zebridge_generations`)) ?? [];
         seededBefore = new Set(rows.map((r: any) => r.tbl));
       } catch { /* fresh replica */ }
-      const tablesToSeed = new Set<string>();
+      const tableRoutes: Record<string, { route: string; seeded: boolean }> = {};
       for (const table of this.syncedTables.keys()) {
-        const route = this.cdcStreamForTenant(this.effectiveTenantFor(table));
-        if (gappedStreams.has(route) || !seededBefore.has(table)) tablesToSeed.add(table);
+        tableRoutes[table] = {
+          route: this.cdcStreamForTenant(this.effectiveTenantFor(table)),
+          seeded: seededBefore.has(table),
+        };
       }
+      // The decision is core.scopeSeeding (D2, §10n) — gapped streams plus
+      // never-seeded tables, everything else untouched.
+      const scoped = scopeSeeding(streamGaps, tableRoutes);
+      const gapDetail = scoped.gapped.map(
+        (g) => `${g}: local ${streamGaps[g].stored}, stream first ${streamGaps[g].firstSeq}`);
+      const tablesToSeed = new Set(scoped.tablesToSeed);
       const gap = tablesToSeed.size > 0;
 
       if (!gap) {
@@ -1688,7 +1627,7 @@ export class ZeBridge {
             // new data). Delivery + accounting IS the position: an applied event is
             // in the tables, a gated one is provably in the seeded chain, a held one
             // is durably in the inbox — none of them needs redelivery.
-            const maxSeq = toAck.reduce((m2, msg) => Math.max(m2, msg.seq ?? 0), 0);
+            const maxSeq = advancePosition(0, toAck.map((msg) => msg.seq ?? 0));
             if (maxSeq > (this.globalSyncState.seq[streamName] ?? 0)) {
               this.globalSyncState.seq[streamName] = maxSeq;
               try {

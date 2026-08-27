@@ -1,0 +1,568 @@
+{
+  "_": "The conformance spec for the sans-I/O core (NOTES \u00a710s). Language-neutral: the TS runner is src/core.test.ts; a port (Zig, \u2026) is correct exactly when it passes every case here. Each case that encodes a measured finding names it.",
+  "seedGate": [
+    {
+      "name": "seq below cutoff drops",
+      "ev": {
+        "seq": 100,
+        "stream": "CDC_kilo",
+        "lsn": 999
+      },
+      "anchor": {
+        "seedSeq": 862,
+        "seedStream": "CDC_kilo"
+      },
+      "drops": true
+    },
+    {
+      "name": "seq equal to cutoff drops (<= is safe in commit order)",
+      "ev": {
+        "seq": 862,
+        "stream": "CDC_kilo"
+      },
+      "anchor": {
+        "seedSeq": 862,
+        "seedStream": "CDC_kilo"
+      },
+      "drops": true
+    },
+    {
+      "name": "seq above cutoff applies",
+      "ev": {
+        "seq": 863,
+        "stream": "CDC_kilo"
+      },
+      "anchor": {
+        "seedSeq": 862,
+        "seedStream": "CDC_kilo"
+      },
+      "drops": false
+    },
+    {
+      "name": "other stream never gated by this anchor",
+      "ev": {
+        "seq": 1,
+        "stream": "CDC_PUBLIC"
+      },
+      "anchor": {
+        "seedSeq": 862,
+        "seedStream": "CDC_kilo"
+      },
+      "drops": false
+    },
+    {
+      "name": "FINDING 7: in-flight txn \u2014 lower lsn but higher seq APPLIES when seq is primary",
+      "ev": {
+        "seq": 900,
+        "stream": "CDC_kilo",
+        "lsn": 1000
+      },
+      "anchor": {
+        "seedSeq": 862,
+        "seedStream": "CDC_kilo",
+        "seedLsn": 5000
+      },
+      "drops": false
+    },
+    {
+      "name": "FINDING 10: no anchor at all \u2014 never drop by lsn (schema lsn must not gate data)",
+      "ev": {
+        "seq": 5,
+        "stream": "CDC_PUBLIC",
+        "lsn": 10
+      },
+      "anchor": {},
+      "drops": false
+    },
+    {
+      "name": "legacy seedLsn: strictly below drops",
+      "ev": {
+        "lsn": 4999
+      },
+      "anchor": {
+        "seedLsn": 5000
+      },
+      "drops": true
+    },
+    {
+      "name": "legacy seedLsn boundary: equal APPLIES (<= loses exactly one row per seed)",
+      "ev": {
+        "lsn": 5000
+      },
+      "anchor": {
+        "seedLsn": 5000
+      },
+      "drops": false
+    },
+    {
+      "name": "legacy seedLsn: above applies",
+      "ev": {
+        "lsn": 5001
+      },
+      "anchor": {
+        "seedLsn": 5000
+      },
+      "drops": false
+    },
+    {
+      "name": "event without lsn is never dropped by the lsn fallback",
+      "ev": {
+        "seq": 7
+      },
+      "anchor": {
+        "seedLsn": 5000
+      },
+      "drops": false
+    }
+  ],
+  "chainPlan": [
+    {
+      "name": "fresh table: full plus deltas after the full's gen",
+      "manifest": {
+        "gen": 3,
+        "full": {
+          "object": "t-g1-full",
+          "gen": 1
+        },
+        "deltas": [
+          {
+            "object": "t-g2-delta",
+            "cutoff": "B",
+            "prev_cutoff": "A",
+            "gen": 2
+          },
+          {
+            "object": "t-g3-delta",
+            "cutoff": "C",
+            "prev_cutoff": "B",
+            "gen": 3
+          }
+        ]
+      },
+      "watermark": null,
+      "plan": [
+        {
+          "name": "t-g1-full",
+          "kind": "full"
+        },
+        {
+          "name": "t-g2-delta",
+          "kind": "delta"
+        },
+        {
+          "name": "t-g3-delta",
+          "kind": "delta"
+        }
+      ]
+    },
+    {
+      "name": "watermark reached: only newer deltas, no full",
+      "manifest": {
+        "gen": 3,
+        "full": {
+          "object": "t-g1-full",
+          "gen": 1
+        },
+        "deltas": [
+          {
+            "object": "t-g2-delta",
+            "cutoff": "B",
+            "prev_cutoff": "A",
+            "gen": 2
+          },
+          {
+            "object": "t-g3-delta",
+            "cutoff": "C",
+            "prev_cutoff": "B",
+            "gen": 3
+          }
+        ]
+      },
+      "watermark": "B",
+      "plan": [
+        {
+          "name": "t-g3-delta",
+          "kind": "delta"
+        }
+      ]
+    },
+    {
+      "name": "watermark newer than every delta: empty plan (nothing to do)",
+      "manifest": {
+        "gen": 3,
+        "full": {
+          "object": "t-g1-full",
+          "gen": 1
+        },
+        "deltas": [
+          {
+            "object": "t-g3-delta",
+            "cutoff": "C",
+            "prev_cutoff": "B",
+            "gen": 3
+          }
+        ]
+      },
+      "watermark": "Z",
+      "plan": []
+    },
+    {
+      "name": "stale watermark the deltas cannot reach: back to the full",
+      "manifest": {
+        "gen": 4,
+        "full": {
+          "object": "t-g2-full",
+          "gen": 2
+        },
+        "deltas": [
+          {
+            "object": "t-g4-delta",
+            "cutoff": "E",
+            "prev_cutoff": "D",
+            "gen": 4
+          }
+        ]
+      },
+      "watermark": "A",
+      "plan": [
+        {
+          "name": "t-g2-full",
+          "kind": "full"
+        },
+        {
+          "name": "t-g4-delta",
+          "kind": "delta"
+        }
+      ]
+    }
+  ],
+  "fullPredates": [
+    {
+      "name": "D2 RED (measured): chain cutoff 862 below stored 100861 REFUSED",
+      "manifest": {
+        "gen": 6,
+        "full": {
+          "object": "f",
+          "gen": 6
+        },
+        "cutoff_seq": 862,
+        "cdc_stream": "CDC_kilo"
+      },
+      "plan": [
+        {
+          "name": "f",
+          "kind": "full"
+        }
+      ],
+      "storedSeq": 100861,
+      "predates": true
+    },
+    {
+      "name": "cutoff equal to stored allows (same data replayed, safe)",
+      "manifest": {
+        "gen": 6,
+        "full": {
+          "object": "f",
+          "gen": 6
+        },
+        "cutoff_seq": 862,
+        "cdc_stream": "CDC_kilo"
+      },
+      "plan": [
+        {
+          "name": "f",
+          "kind": "full"
+        }
+      ],
+      "storedSeq": 862,
+      "predates": false
+    },
+    {
+      "name": "cutoff above stored allows",
+      "manifest": {
+        "gen": 7,
+        "full": {
+          "object": "f",
+          "gen": 7
+        },
+        "cutoff_seq": 900,
+        "cdc_stream": "CDC_kilo"
+      },
+      "plan": [
+        {
+          "name": "f",
+          "kind": "full"
+        }
+      ],
+      "storedSeq": 862,
+      "predates": false
+    },
+    {
+      "name": "delta-only plan is never gated (upserts destroy nothing)",
+      "manifest": {
+        "gen": 6,
+        "full": {
+          "object": "f",
+          "gen": 6
+        },
+        "cutoff_seq": 1,
+        "cdc_stream": "CDC_kilo"
+      },
+      "plan": [
+        {
+          "name": "d",
+          "kind": "delta"
+        }
+      ],
+      "storedSeq": 100861,
+      "predates": false
+    },
+    {
+      "name": "legacy manifest without cutoff_seq stays ungated",
+      "manifest": {
+        "gen": 6,
+        "full": {
+          "object": "f",
+          "gen": 6
+        }
+      },
+      "plan": [
+        {
+          "name": "f",
+          "kind": "full"
+        }
+      ],
+      "storedSeq": 100861,
+      "predates": false
+    },
+    {
+      "name": "fresh replica (stored 0) is never refused",
+      "manifest": {
+        "gen": 6,
+        "full": {
+          "object": "f",
+          "gen": 6
+        },
+        "cutoff_seq": 862,
+        "cdc_stream": "CDC_kilo"
+      },
+      "plan": [
+        {
+          "name": "f",
+          "kind": "full"
+        }
+      ],
+      "storedSeq": 0,
+      "predates": false
+    }
+  ],
+  "scope": [
+    {
+      "name": "D2 (measured): gap on CDC_kilo re-seeds only kilo-routed tables",
+      "streams": {
+        "CDC_kilo": {
+          "firstSeq": 863,
+          "stored": 861
+        },
+        "CDC_PUBLIC": {
+          "firstSeq": 62174,
+          "stored": 62179
+        }
+      },
+      "tables": {
+        "salaries": {
+          "route": "CDC_kilo",
+          "seeded": true
+        },
+        "note_t": {
+          "route": "CDC_kilo",
+          "seeded": true
+        },
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        },
+        "orders": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_kilo"
+      ],
+      "tablesToSeed": [
+        "salaries",
+        "note_t"
+      ]
+    },
+    {
+      "name": "never-seeded table seeds even with zero gaps",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 100,
+          "stored": 120
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        },
+        "newborn": {
+          "route": "CDC_PUBLIC",
+          "seeded": false
+        }
+      },
+      "gapped": [],
+      "tablesToSeed": [
+        "newborn"
+      ]
+    },
+    {
+      "name": "first run: stored 0 gaps every stream, everything seeds",
+      "streams": {
+        "CDC_kilo": {
+          "firstSeq": 863,
+          "stored": 0
+        },
+        "CDC_PUBLIC": {
+          "firstSeq": 62174,
+          "stored": 0
+        }
+      },
+      "tables": {
+        "salaries": {
+          "route": "CDC_kilo",
+          "seeded": false
+        },
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": false
+        }
+      },
+      "gapped": [
+        "CDC_kilo",
+        "CDC_PUBLIC"
+      ],
+      "tablesToSeed": [
+        "salaries",
+        "users"
+      ]
+    },
+    {
+      "name": "stored == firstSeq - 1 is NOT a gap (the next message needed still exists)",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 100,
+          "stored": 99
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [],
+      "tablesToSeed": []
+    },
+    {
+      "name": "stored == firstSeq - 2 IS a gap (one message lost)",
+      "streams": {
+        "CDC_PUBLIC": {
+          "firstSeq": 100,
+          "stored": 98
+        }
+      },
+      "tables": {
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_PUBLIC"
+      ],
+      "tablesToSeed": [
+        "users"
+      ]
+    }
+  ],
+  "position": [
+    {
+      "name": "advances to the batch max",
+      "stored": 861,
+      "batch": [
+        862,
+        863
+      ],
+      "next": 863
+    },
+    {
+      "name": "never moves backwards",
+      "stored": 863,
+      "batch": [
+        100,
+        200
+      ],
+      "next": 863
+    },
+    {
+      "name": "empty batch leaves it alone",
+      "stored": 863,
+      "batch": [],
+      "next": 863
+    }
+  ],
+  "fkKind": [
+    {
+      "name": "missing parent row",
+      "message": "FOREIGN KEY constraint failed",
+      "kind": "missing-parent"
+    },
+    {
+      "name": "missing parent table (lazy DDL, strict DML)",
+      "message": "no such table: main.users",
+      "kind": "missing-parent"
+    },
+    {
+      "name": "schema-level mismatch drops loudly",
+      "message": "foreign key mismatch - \"salaries\" referencing \"users\"",
+      "kind": "mismatch"
+    },
+    {
+      "name": "unrelated error is not an FK hold",
+      "message": "UNIQUE constraint failed: memo.id",
+      "kind": null
+    }
+  ],
+  "pgTsToWire": [
+    {
+      "name": "space + offset become T + Z, microseconds preserved",
+      "in": "2026-08-27 10:09:49.685820+00",
+      "out": "2026-08-27T10:09:49.685820Z"
+    },
+    {
+      "name": "colon-form offset too",
+      "in": "2026-08-27 10:09:49+00:00",
+      "out": "2026-08-27T10:09:49Z"
+    },
+    {
+      "name": "non-timestamp strings pass through untouched",
+      "in": "hello world",
+      "out": "hello world"
+    }
+  ],
+  "lsnToNumber": [
+    {
+      "name": "hi/lo compose",
+      "in": "2/97B6ED8",
+      "out": 8749018840
+    },
+    {
+      "name": "zero page",
+      "in": "0/C5793FD0",
+      "out": 3313057744
+    }
+  ]
+}

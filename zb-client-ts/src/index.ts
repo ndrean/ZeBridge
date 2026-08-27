@@ -3,4 +3,5 @@
 /// the §7 write path (outbox, optimistic apply, verdicts, echo-confirm).
 /// Consumers: web-consumer (browser, #1), Node microservice (#2, forces the
 /// storage and transport seams).
+export * from './core.ts';
 export * from './libzb.ts';

@@ -4772,6 +4772,46 @@ seed, in scripts/native/nsc-store/.../keys/A/...) AND `ZB_ACCOUNT_PUB` (the
 ZEBRIDGE account public key) are set — with only the seed it stays off
 SILENTLY (no warn line; the warn only covers the missing-writer case).
 
+## 10s. The carve: a sans-I/O core with conformance fixtures — and WASM dropped (2026-08-27)
+
+**The decision, recorded.** Ordering for the client's future: (1) carve the
+pure decision core out of zb-client-ts, (2) encode every measured finding as a
+language-neutral fixture, (3) only then port to Zig — the port implements the
+fixtures, not the living TS. Rationale: findings 9 and 10 were client-core
+bugs found THIS WEEK; a second implementation of a moving target fixes every
+bug twice forever, while a port against a fixture spec is caught by the shared
+suite. **WASM is dropped from the roadmap**: its job was "run the core outside
+a browser", and that is now covered twice — zb-client-ts runs as-is in every
+JS runtime (Windows server included), and the native libzb (C ABI) will cover
+every non-JS host via FFI. The only WASM left is sqlocal's SQLite inside the
+browser, which is the storage adapter's private business.
+
+**Carve increment 1 — DONE.** `zb-client-ts/src/core.ts`: pure, imports
+nothing, calls nothing — `seedGateDrops` (findings 7+10 as one rule),
+`planFromManifest` + `fullPredatesReplica` (the chain walk and D2's
+destruction guard), `streamHasGap` + `scopeSeeding` (the per-stream gap rule,
+never-seeded criterion, D2 scoping), `advancePosition` (D1's accounting),
+`foreignKeyFailureKind` (the three measured SQLite messages), `pgTsToWire`,
+`lsnToNumber`. libzb.ts now delegates at every one of those sites; the I/O
+shells (NATS pump, storage adapter) stay where they were.
+
+**The fixtures ARE the spec**: `zb-client-ts/fixtures/core-fixtures.json` —
+36 cases, each measured finding by name (the in-flight transaction below the
+lsn watermark, the schema-lsn event that must never gate data, the D2 RED
+cutoff 862 vs stored 100861, the kilo-scoped re-seed, the firstSeq-1
+boundary, the strict-< lsn edge). `src/core.test.ts` is the TS runner
+(`pnpm test`, node:test over strip-types); a Zig core writes its own thin
+runner over the SAME JSON and is correct exactly when it passes. (The suite
+already earned its keep once: its first run caught a hand-mis-hexed lsn in a
+fixture — the expected values must be derived, never typed from memory.)
+
+**Still in the shell, candidates for increment 2**: the LWW upsert SQL
+builder (applyEvent's INSERT..ON CONFLICT with the version guard and the
+key-change delete), the schema migration planner (applySchema's
+create/add/drop/rebuild decision — where finding 9 lived), and the mutate()
+envelope constructor. Then the transport seam (NATS behind an interface —
+the one seam the Node consumer did not force), then the Zig port.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
