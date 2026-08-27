@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
     const c_mod = translate_c.createModule();
 
     const nats_dep = b.dependency("nats", .{ .target = target, .optimize = optimize });
+    const msgpack_dep = b.dependency("zig_msgpack", .{ .target = target, .optimize = optimize });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/capi.zig"),
@@ -32,6 +33,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("c", c_mod);
     mod.addImport("nats", nats_dep.module("nats"));
+    mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
     mod.linkSystemLibrary("sqlite3", .{});
     mod.link_libc = true;
@@ -44,6 +46,21 @@ pub fn build(b: *std.Build) void {
         .linkage = .dynamic,
     });
     b.installArtifact(lib);
+
+    // The orchestration demo (consumer #4): the loop against the live stack.
+    const demo_mod = b.createModule(.{
+        .root_source_file = b.path("src/demo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    demo_mod.addImport("c", c_mod);
+    demo_mod.addImport("nats", nats_dep.module("nats"));
+    demo_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
+    demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+    demo_mod.linkSystemLibrary("sqlite3", .{});
+    demo_mod.link_libc = true;
+    const demo = b.addExecutable(.{ .name = "zb-demo", .root_module = demo_mod });
+    b.installArtifact(demo);
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);

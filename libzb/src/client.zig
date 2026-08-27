@@ -1,0 +1,528 @@
+//! The orchestration loop — the third piece after core and the two shells.
+//!
+//! Wires core.zig (decisions) to storage.zig (SQLite) and transport.zig
+//! (nats.zig) into a working read-path client: schemas from KV, seeding from
+//! generation chains (with the §10n destruction guard), the per-stream gap
+//! rule, the finding-7/10 seed gate, FK hold/retry, and durable positions.
+//! This is INCREMENT 1: read path + catch-up-to-tail semantics. The write
+//! path (outbox, verdicts, HLC stamping via core) and live tailing are next.
+//!
+//! Composition, not invention: every rule here is a call into core.zig, the
+//! same functions the 91 fixtures pin.
+
+const std = @import("std");
+const core = @import("core.zig");
+const storage = @import("storage.zig");
+const transport = @import("transport.zig");
+const msgpack = @import("msgpack");
+
+const Value = std.json.Value;
+
+pub const Options = struct {
+    url: []const u8,
+    creds_path: []const u8,
+    grammar_path: []const u8,
+    db_path: [*:0]const u8,
+    principal: []const u8,
+    /// Parents FIRST: seeding runs in this order with foreign_keys ON.
+    tables: []const []const u8,
+};
+
+const TableState = struct {
+    pk: []const []const u8,
+    cols: []const []const u8,
+    version_col: ?[]const u8,
+    tenant_col: ?[]const u8,
+    route: []const u8, // the CDC stream this table's events ride
+    seed_seq: ?u64 = null,
+    seed_stream: ?[]const u8 = null,
+    seed_lsn: ?i64 = null,
+};
+
+const Held = struct { table: []const u8, ev: Value };
+
+pub const SyncClient = struct {
+    a: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator, // client-lifetime allocations (states, grammar)
+    t: *transport.Transport,
+    st: storage.Storage,
+    opts: Options,
+
+    // grammar
+    cdc_prefix: []const u8 = "CDC_",
+    cdc_public: []const u8 = "CDC_PUBLIC",
+    kv_schemas: []const u8 = "schemas",
+    kv_tenants: []const u8 = "tenants",
+    kv_generations: []const u8 = "generations",
+    gen_bucket_prefix: []const u8 = "gen-",
+    open_tenant: []const u8 = "_default",
+
+    tenant: []const u8 = "",
+    states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
+    held: std.ArrayList(Held) = .empty,
+
+    pub fn init(a: std.mem.Allocator, opts: Options) !*SyncClient {
+        const self = try a.create(SyncClient);
+        self.* = .{
+            .a = a,
+            .arena = std.heap.ArenaAllocator.init(a),
+            .t = undefined,
+            .st = try storage.Storage.open(opts.db_path),
+            .opts = opts,
+        };
+        errdefer a.destroy(self);
+        try self.loadGrammar();
+        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = opts.creds_path });
+        return self;
+    }
+
+    pub fn deinit(self: *SyncClient) void {
+        self.t.deinit();
+        self.st.close();
+        self.arena.deinit();
+        self.a.destroy(self);
+    }
+
+    fn aa(self: *SyncClient) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    fn loadGrammar(self: *SyncClient) !void {
+        const a = self.aa();
+        var th: std.Io.Threaded = .init(self.a, .{});
+        defer th.deinit();
+        const io = th.io();
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, self.opts.grammar_path, a, .limited(1 << 20));
+        const g = try std.json.parseFromSlice(Value, a, bytes, .{});
+        const root = g.value.object;
+        if (root.get("cdc_streams")) |cs| {
+            if (cs.object.get("tenant_prefix")) |v| self.cdc_prefix = v.string;
+            if (cs.object.get("public")) |v| self.cdc_public = v.string;
+        }
+        if (root.get("kv")) |kv| {
+            if (kv.object.get("schemas")) |v| self.kv_schemas = v.string;
+            if (kv.object.get("tenants")) |v| self.kv_tenants = v.string;
+        }
+        if (root.get("generations")) |gen| {
+            if (gen.object.get("kv")) |v| self.kv_generations = v.string;
+            if (gen.object.get("bucket_prefix")) |v| self.gen_bucket_prefix = v.string;
+        }
+        if (root.get("open_tenant")) |v| self.open_tenant = v.string;
+    }
+
+    // ─── step 0: tenant (PROTOCOL §6 Step 0 — resolved, never guessed) ──────
+
+    pub fn resolveTenant(self: *SyncClient) !void {
+        const bytes = (try self.t.kvGet(self.aa(), self.kv_tenants, self.opts.principal)) orelse {
+            self.tenant = self.open_tenant;
+            return;
+        };
+        // The value may be msgpack-encoded (the bridge's KV diversion) or raw.
+        self.tenant = decodeMaybeMsgpackString(self.aa(), bytes) catch bytes;
+        std.debug.print("tenant: {s} -> {s}\n", .{ self.opts.principal, self.tenant });
+    }
+
+    // ─── step 1: schemas → local DDL, existence from the DATABASE (finding 9) ─
+
+    pub fn syncSchemas(self: *SyncClient) !void {
+        const a = self.aa();
+        for (self.opts.tables) |table| {
+            const bytes = (try self.t.kvGet(a, self.kv_schemas, table)) orelse {
+                std.debug.print("schema missing for {s}\n", .{table});
+                continue;
+            };
+            const parsed = try std.json.parseFromSlice(Value, a, bytes, .{});
+            const val = parsed.value;
+
+            const pk = try jsonStrList(a, val.object.get("pk_columns"));
+            const cols_v = val.object.get("sqlite").?.object.get("columns").?;
+            var names: std.ArrayList([]const u8) = .empty;
+            for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
+            const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
+            const version_col: ?[]const u8 = if (val.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
+
+            // FINDING 9: existence is the DATABASE's to answer, never a map's.
+            var qa = std.heap.ArenaAllocator.init(self.a);
+            defer qa.deinit();
+            const exists = (try self.st.query(qa.allocator(),
+                "SELECT name FROM sqlite_master WHERE type='table' AND name = ?", &.{.{ .text = table }})).len > 0;
+            if (!exists) {
+                const fks = val.object.get("foreign_keys") orelse Value{ .array = std.json.Array.init(a) };
+                const steps = try core.createTableSteps(a, table, cols_v.array, pk, fks.array);
+                for (steps.array.items) |stp| try self.execStep(stp);
+                const idx = val.object.get("indexes") orelse Value{ .array = std.json.Array.init(a) };
+                const plan = try core.indexSyncPlan(a, table, &.{}, idx.array);
+                for (plan.object.get("creates").?.array.items) |stp| try self.execStep(stp);
+                std.debug.print("{s}: created\n", .{table});
+            }
+            // TODO increment 2: the alter/rebuild path via core.diffColumns —
+            // this increment assumes a stable schema during the run.
+
+            const route = if (tenant_col != null)
+                try std.fmt.allocPrint(a, "{s}{s}", .{ self.cdc_prefix, self.tenant })
+            else
+                self.cdc_public;
+            try self.states.put(a, table, .{
+                .pk = pk,
+                .cols = names.items,
+                .version_col = version_col,
+                .tenant_col = tenant_col,
+                .route = route,
+            });
+        }
+        try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
+        try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER)");
+    }
+
+    fn execStep(self: *SyncClient, stp: Value) !void {
+        _ = stp.object.get("params"); // core SqlSteps carry no params today
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        _ = try self.st.query(qa.allocator(), stp.object.get("sql").?.string, &.{});
+    }
+
+    // ─── positions ──────────────────────────────────────────────────────────
+
+    fn storedSeq(self: *SyncClient, stream: []const u8) u64 {
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        const rows = self.st.query(qa.allocator(),
+            "SELECT last_seq FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }}) catch return 0;
+        if (rows.len == 0) return 0;
+        return @intCast(rows[0][0].integer);
+    }
+
+    fn persistSeq(self: *SyncClient, stream: []const u8, seq: u64) !void {
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        _ = try self.st.query(qa.allocator(),
+            "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq",
+            &.{ .{ .text = stream }, .{ .integer = @intCast(seq) } });
+    }
+
+    fn effTenant(self: *SyncClient, table: []const u8) []const u8 {
+        const st = self.states.get(table) orelse return self.open_tenant;
+        return if (st.tenant_col != null) self.tenant else self.open_tenant;
+    }
+
+    // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
+
+    pub fn gapAndSeed(self: *SyncClient) !void {
+        const a = self.aa();
+        var gapped: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            const stream = e.value_ptr.route;
+            if (gapped.contains(stream)) continue;
+            var info = self.t.js.getStreamInfo(stream) catch continue;
+            defer info.deinit();
+            const first: i64 = @intCast(info.value.state.first_seq);
+            const stored: i64 = @intCast(self.storedSeq(stream));
+            if (core.streamHasGap(first, stored)) try gapped.put(a, stream, {});
+        }
+        // Seed in the CONFIGURED order (parents first) with foreign_keys ON:
+        // scoped to gapped routes plus never-seeded tables (§10n).
+        for (self.opts.tables) |table| {
+            const st = self.states.get(table) orelse continue;
+            var qa = std.heap.ArenaAllocator.init(self.a);
+            defer qa.deinit();
+            const seeded = (self.st.query(qa.allocator(),
+                "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch @as([]storage.Row, &.{})).len > 0;
+            if (gapped.contains(st.route) or !seeded) {
+                try self.applyChain(table);
+            }
+        }
+    }
+
+    fn applyChain(self: *SyncClient, table: []const u8) !void {
+        const a = self.aa();
+        const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ self.effTenant(table), table });
+        const man_bytes = (try self.t.kvGet(a, self.kv_generations, key)) orelse {
+            std.debug.print("{s}: no chain yet\n", .{table});
+            return;
+        };
+        const man = (try std.json.parseFromSlice(Value, a, man_bytes, .{})).value;
+
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        const wm_rows = self.st.query(qa.allocator(),
+            "SELECT watermark FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch @as([]storage.Row, &.{});
+        const watermark: ?[]const u8 = if (wm_rows.len > 0 and wm_rows[0][0] == .text) wm_rows[0][0].text else null;
+
+        const plan = try core.planFromManifest(a, man, watermark);
+        // D2's destruction guard: a full from a chain older than this replica's
+        // position would destroy rows CDC will never re-deliver.
+        const cdc_stream = if (man.object.get("cdc_stream")) |v| (if (v == .string) v.string else "") else "";
+        const pos: i64 = if (cdc_stream.len > 0) @intCast(self.storedSeq(cdc_stream)) else 0;
+        if (core.fullPredatesReplica(man, plan.array, pos)) {
+            std.debug.print("{s}: chain predates replica — refusing the full (D2)\n", .{table});
+            return;
+        }
+
+        const st = self.states.getPtr(table).?;
+        const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
+        var applied: usize = 0;
+        for (plan.array.items) |step| {
+            const blob = try self.t.objectGetBytes(a, bucket, step.object.get("name").?.string);
+            const doc = try decodeMsgpack(a, blob);
+            const cols = try jsonStrList(a, doc.object.get("columns"));
+            const vcol_v = doc.object.get("version_column") orelse (man.object.get("version_column") orelse @as(Value, .null));
+            const vcol: ?[]const u8 = if (vcol_v == .string and contains(cols, vcol_v.string)) vcol_v.string else null;
+            const sql = try core.chainUpsertSql(a, table, cols, st.pk, vcol);
+            const is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full");
+
+            var ta = std.heap.ArenaAllocator.init(self.a);
+            defer ta.deinit();
+            const taa = ta.allocator();
+            // The DELETE shares the transaction: a crash mid-apply cannot leave
+            // an empty table (§10n).
+            try self.st.execSimple("BEGIN IMMEDIATE;");
+            errdefer self.st.execSimple("ROLLBACK;") catch {};
+            if (is_full) {
+                const del = try std.fmt.allocPrint(taa, "DELETE FROM {s}", .{table});
+                _ = try self.st.query(taa, del, &.{});
+            }
+            const rows = doc.object.get("rows").?.array;
+            for (rows.items) |row| {
+                const params = try a.alloc(storage.Value, row.array.items.len);
+                for (row.array.items, 0..) |cell, i| params[i] = try chainCellToStorage(taa, cell);
+                _ = try self.st.query(taa, sql, params);
+            }
+            try self.st.execSimple("COMMIT;");
+            applied += rows.items.len;
+        }
+
+        // Anchors (findings 7 + 10): the ONE place the gate may anchor to.
+        if (man.object.get("cutoff_seq")) |v| if (v == .integer and v.integer > 0) {
+            st.seed_seq = @intCast(v.integer);
+            st.seed_stream = if (cdc_stream.len > 0) try a.dupe(u8, cdc_stream) else null;
+        };
+        if (man.object.get("cutoff_lsn")) |v| if (v == .string) {
+            st.seed_lsn = core.lsnToNumber(v.string);
+        };
+        const cv = if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "";
+        _ = try self.st.query(qa.allocator(),
+            "INSERT INTO _zbz_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?) ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn",
+            &.{ .{ .text = table }, .{ .text = cv }, .{ .integer = st.seed_lsn orelse 0 } });
+        std.debug.print("{s}: seeded {d} row(s) from chain g{d}\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0 });
+    }
+
+    // ─── step 3: CDC catch-up (gate → apply → hold → positions) ─────────────
+
+    pub fn drainCdc(self: *SyncClient) !void {
+        const a = self.aa();
+        var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
+        // Public first: parents (users) ride CDC_PUBLIC — fewer FK holds.
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.value_ptr.route, self.cdc_public)) try streams.put(a, e.value_ptr.route, {});
+        }
+        it = self.states.iterator();
+        while (it.next()) |e| try streams.put(a, e.value_ptr.route, {});
+
+        var sit = streams.iterator();
+        while (sit.next()) |se| try self.drainStream(se.key_ptr.*);
+
+        // FK hold/retry (§10h): one bulk retry pass after every stream drained.
+        var resolved: usize = 0;
+        for (self.held.items) |h| {
+            if (self.applyEvent(h.table, h.ev, 0)) |_| {
+                resolved += 1;
+            } else |_| {}
+        }
+        if (self.held.items.len > 0) {
+            std.debug.print("fk held: {d}, resolved on retry: {d}\n", .{ self.held.items.len, resolved });
+        }
+        self.held.clearRetainingCapacity();
+    }
+
+    fn drainStream(self: *SyncClient, stream: []const u8) !void {
+        const a = self.aa();
+        const last = self.storedSeq(stream);
+        var name_buf: [48]u8 = undefined;
+        // Unique-enough per process: pid + a monotonic counter (std.crypto.random
+        // wants an Io in 0.16; libc is already linked).
+        const Ctr = struct {
+            var n = std.atomic.Value(u32).init(0);
+        };
+        const cname = try std.fmt.bufPrint(&name_buf, "zbz{d}x{d}", .{ std.c.getpid(), Ctr.n.fetchAdd(1, .monotonic) });
+
+        var cfg = transportConsumerConfig();
+        cfg.name = cname;
+        cfg.durable_name = cname;
+        if (last > 0) {
+            cfg.deliver_policy = .by_start_sequence;
+            cfg.opt_start_seq = last + 1;
+        } else {
+            cfg.deliver_policy = .all;
+        }
+        const sub = try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg });
+        defer sub.deinit();
+
+        var max_seq: u64 = last;
+        while (true) {
+            var batch = sub.fetch(100, .{ .duration = .{ .raw = .fromMilliseconds(900), .clock = .awake } }) catch break;
+            defer batch.deinit();
+            if (batch.messages.len == 0) break; // caught up to the tail
+            for (batch.messages) |m| {
+                const seq = m.metadata.sequence.stream;
+                const doc = decodeMsgpack(a, m.msg.data) catch {
+                    m.ack() catch {};
+                    continue;
+                };
+                const events: []const Value = if (doc == .array) doc.array.items else &.{doc};
+                for (events) |ev| {
+                    if (ev != .object) continue;
+                    const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
+                    if (self.states.get(table) == null) continue;
+                    self.applyEvent(table, ev, seq) catch |err| {
+                        if (err == error.FkHeld) {
+                            self.held.append(self.a, .{ .table = try a.dupe(u8, table), .ev = ev }) catch {};
+                        }
+                    };
+                }
+                m.ack() catch {};
+                if (seq > max_seq) max_seq = seq;
+            }
+            // D1: delivery + accounting IS the position — applied, gated or held.
+            if (max_seq > last) try self.persistSeq(stream, max_seq);
+        }
+        if (max_seq > last) try self.persistSeq(stream, max_seq);
+        std.debug.print("{s}: drained to seq {d}\n", .{ stream, max_seq });
+    }
+
+    fn applyEvent(self: *SyncClient, table: []const u8, ev: Value, seq: u64) !void {
+        const st = self.states.get(table).?;
+        // The seed gate (findings 7 + 10) — seq primary, seed-anchored lsn fallback.
+        if (st.seed_seq != null and st.seed_stream != null) {
+            if (seq != 0 and std.mem.eql(u8, st.seed_stream.?, st.route) and seq <= st.seed_seq.?) return;
+        } else if (st.seed_lsn) |floor| {
+            const lsn: i64 = if (ev.object.get("lsn")) |v| (if (v == .integer) v.integer else 0) else 0;
+            if (lsn != 0 and lsn < floor) return;
+        }
+
+        const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
+        const data = ev.object.get("data") orelse return;
+        if (data != .object) return;
+
+        var ta = std.heap.ArenaAllocator.init(self.a);
+        defer ta.deinit();
+        const taa = ta.allocator();
+
+        if (std.mem.eql(u8, op, "DELETE")) {
+            if (try core.planDelete(taa, table, st.pk, data)) |stp| {
+                _ = try self.stepExec(taa, stp);
+            }
+            return;
+        }
+        if (try core.planKeyChange(taa, table, st.pk, data)) |kc| _ = try self.stepExec(taa, kc);
+        const up = try core.planUpsert(taa, table, st.pk, data);
+        _ = self.stepExec(taa, up) catch |err| {
+            if (err == storage.Error.StepFailed and
+                std.mem.indexOf(u8, self.st.errMsg(), "FOREIGN KEY") != null)
+            {
+                return error.FkHeld;
+            }
+            return err;
+        };
+    }
+
+    fn stepExec(self: *SyncClient, a: std.mem.Allocator, stp: Value) ![]storage.Row {
+        const params_v = stp.object.get("params").?.array;
+        const params = try a.alloc(storage.Value, params_v.items.len);
+        for (params_v.items, 0..) |v, i| params[i] = try jsonToStorage(a, v);
+        return self.st.query(a, stp.object.get("sql").?.string, params);
+    }
+
+    pub fn count(self: *SyncClient, table: []const u8) i64 {
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        const sql = std.fmt.allocPrint(qa.allocator(), "SELECT count(*) FROM {s}", .{table}) catch return -1;
+        const rows = self.st.query(qa.allocator(), sql, &.{}) catch return -1;
+        return rows[0][0].integer;
+    }
+};
+
+// ─── conversions ────────────────────────────────────────────────────────────
+
+fn transportConsumerConfig() @import("nats").ConsumerConfig {
+    return .{ .ack_policy = .explicit, .max_ack_pending = 512 };
+}
+
+fn contains(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return true;
+    return false;
+}
+
+fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
+    const val = v orelse return &.{};
+    if (val != .array) return &.{};
+    var out = try a.alloc([]const u8, val.array.items.len);
+    for (val.array.items, 0..) |x, i| out[i] = if (x == .string) x.string else "";
+    return out;
+}
+
+/// msgpack bytes → std.json.Value (the shape core.zig speaks).
+fn decodeMsgpack(a: std.mem.Allocator, bytes: []const u8) !Value {
+    var reader = std.Io.Reader.fixed(bytes);
+    var dummy: [0]u8 = .{};
+    var writer = std.Io.Writer.fixed(&dummy);
+    var packer = msgpack.PackerIO.init(&reader, &writer);
+    const payload = try packer.read(a);
+    return mpToJson(a, payload);
+}
+
+fn decodeMaybeMsgpackString(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const v = decodeMsgpack(a, bytes) catch return bytes;
+    return if (v == .string) v.string else bytes;
+}
+
+fn mpToJson(a: std.mem.Allocator, p: msgpack.Payload) error{OutOfMemory}!Value {
+    return switch (p) {
+        .nil => .null,
+        .bool => |b| .{ .bool = b },
+        .int => |i| .{ .integer = i },
+        .uint => |u| if (u <= std.math.maxInt(i64)) Value{ .integer = @intCast(u) } else Value{ .float = @floatFromInt(u) },
+        .float => |f| .{ .float = f },
+        .str => |s| .{ .string = s.value() },
+        .bin => |b| .{ .string = b.value() },
+        .arr => |items| blk: {
+            var arr = std.json.Array.init(a);
+            for (items) |item| try arr.append(try mpToJson(a, item));
+            break :blk .{ .array = arr };
+        },
+        .map => |m| blk: {
+            var obj: std.json.ObjectMap = .empty;
+            var it = m.map.iterator();
+            while (it.next()) |e| {
+                const k = e.key_ptr.*;
+                if (k != .str) continue;
+                try obj.put(a, k.str.value(), try mpToJson(a, e.value_ptr.*));
+            }
+            break :blk .{ .object = obj };
+        },
+        else => .null,
+    };
+}
+
+/// A core-built SQL param (json.Value) → a storage bind value.
+fn jsonToStorage(a: std.mem.Allocator, v: Value) !storage.Value {
+    return switch (v) {
+        .null => .null,
+        .bool => |b| .{ .boolean = b },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .real = f },
+        .string => |s| .{ .text = s },
+        else => .{ .text = try core.valueToString(a, v) },
+    };
+}
+
+/// A chain-row cell (json.Value from msgpack) → a storage bind value,
+/// mirroring core.chainRowParams: structured → JSON text, strings → wire ts.
+fn chainCellToStorage(a: std.mem.Allocator, v: Value) !storage.Value {
+    return switch (v) {
+        .string => |s| .{ .text = try core.pgTsToWire(a, s) },
+        .object, .array => .{ .text = try core.valueToString(a, v) },
+        else => jsonToStorage(a, v),
+    };
+}

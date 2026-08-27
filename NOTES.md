@@ -4964,9 +4964,68 @@ against the patched lib; the service key's wildcard never noticed either form.
 Zig 0.16 tolls this round: std.Thread.Mutex is gone (std.Io.Mutex wants an
 Io), std.posix.getenv too (std.c.getenv in a libc-linked test).
 
+**Why libzb allocates through arenas (the short version).** The lifetimes are
+REQUEST-SHAPED, so ownership by scope beats ownership by object. One zb_call
+dispatch allocates dozens of tangled things — the parsed JSON tree, ArrayList
+buffers, SQL fragments, maps whose values alias the input — and every one of
+them dies at the same instant: end of call. A general-purpose allocator would
+make each core function define who frees what (returned slices are views into
+lists; map values alias parsed input) and that bookkeeping would be most of
+the code and all of the leaks. The arena collapses it: allocate freely,
+deinit once; the one survivor (the result string) is COPIED to malloc so the
+C boundary's contract stays plain free()/zb_free. Backing the capi arena with
+c_allocator (not page_allocator) is the same thought — the ABI already links
+libc. storage.query is arena-FRIENDLY, not arena-required: it takes any
+allocator; rows are slices of duped cells, so per-batch arena + one deinit is
+the natural caller shape, but a GPA works. Trade-off, stated: an arena never
+returns memory mid-scope, so high-water = sum of the scope's allocations —
+noise for request-shaped calls; for a big chain document the doc must be
+resident anyway, and `reset(.retain_capacity)` per delta is the bridge-proven
+answer if it ever matters. Same philosophy as the bridge's per-WAL-message
+arena: when everything in a scope dies together, the right policy is "free
+the scope".
+
 **libzb now has all three legs in Zig**: core (91/91 fixtures via zb_call),
 storage, transport. What remains is the orchestration — the ZeBridge loop
 that wires them — and that is a composition task, not a porting one.
+
+## 10v. The orchestration loop: zb-demo, consumer #4 (2026-08-27)
+
+`libzb/src/client.zig` wires the three legs into a working read-path client —
+composition, not invention: every rule is a call into core.zig, the same
+functions the 91 fixtures pin. The flow: grammar from grammar.json; tenant
+resolved from $KV.tenants (never guessed); schemas from KV with EXISTENCE
+ANSWERED BY THE DATABASE (finding 9 — sqlite_master, not a map); DDL via
+core.createTableSteps/indexSyncPlan; the per-stream gap rule via
+core.streamHasGap plus the never-seeded criterion (§10n scope); chain seeding
+via core.planFromManifest with the D2 destruction guard
+(core.fullPredatesReplica) and the full's DELETE sharing its transaction;
+seed anchors (findings 7+10) set only by the seed; CDC drained through the
+seq-primary gate with msgpack->json conversion feeding core.planUpsert/
+planDelete/planKeyChange; FK holds classified by the storage error and
+retried in one bulk pass; positions persisted per batch (D1 — delivery +
+accounting IS the position). `src/demo.zig` (zb-demo) runs it against the
+live stack as omar: tenant kilo resolved, users+salaries created, seeded 16
+and 17 rows from chains g4/g13, both streams drained to tail, and the counts
+matched Postgres exactly.
+
+**Second nats.zig local patch on the way** (nats.zig/NOTES.md): a NAMED
+consumer went through the legacy `CONSUMER.DURABLE.CREATE` endpoint, which
+least-privilege grants exclude — and under JWT an unauthorized API publish is
+silently dropped, so the failure was a bare request Timeout (the worst
+diagnostic). addConsumer now uses the modern
+`CONSUMER.CREATE.<stream>.<name>[.<filter>]` form (server >= 2.9), which the
+grants cover. Same lesson as the direct-get patch, one endpoint over: the
+grant model is the compatibility test a client library never runs against
+itself.
+
+**Increment 1 boundaries, stated**: read path with catch-up-to-tail
+semantics; fresh-replica demo convention. Not yet: the write path (outbox,
+verdicts, HLC stamping — core has every piece), live tailing (the drain stops
+at the first empty fetch), the alter/rebuild migration path (core has the
+planner; the shell takes the create-only branch), and consumer cleanup (the
+teardown logs a cosmetic 404). Known Zig 0.16 boundary: consumer names come
+from pid+counter because std.crypto.random now wants an Io.
 
 ## 11 Restart Rules
 
