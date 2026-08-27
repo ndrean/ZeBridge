@@ -4553,6 +4553,51 @@ is still `DELETE FROM` + insert, so a chain older than the replica's CDC-applied
 data still destroys the newer rows. Next: per-stream scoping + the per-table
 data watermark before any chain-full DELETE (§10g residual, §10k D2).
 
+## 10n. D2: re-seeding is scoped and non-destructive (2026-08-27)
+
+The two halves of §10k's D2, both in libzb.ts, both RED-then-GREEN verified.
+
+**Scoped seeding.** Gap detection already worked per stream; seeding now uses
+it. `tablesToSeed` = tables ROUTED to a gapped stream (route = the table's
+effective tenant's CDC stream) plus tables with NO generations watermark (never
+seeded: a brand-new replica, or a table enabled between two connects — the
+latter previously never seeded at all without a coincidental gap). Everything
+else resumes from its stored position untouched. Measured: a purge-induced gap
+on CDC_kilo alone produced `Seeding 4 table(s) [note_t, counter_tenant,
+test_types, salaries]; 5 resume untouched` — zero `Seeded users`, yet users
+grew by the row written during the outage, delivered LIVE on the ungapped
+CDC_PUBLIC. A mobile client reconnecting with one stale stream no longer
+rebuilds its whole replica.
+
+**The chain-full guard (the §10g/§10j destruction, closed).** A chain-full is
+`DELETE FROM` + replay, so a chain whose `cutoff_seq` is below the replica's
+stored position for that stream would destroy every row applied AFTER the chain
+was built — rows the resumed CDC will never re-deliver. Such a chain cannot
+close a gap either (the gap sits ABOVE the position it fails to reach).
+`applyGenerations` now refuses it before touching the table and returns false;
+the existing wait loop polls for the next cadence build, whose cutoff is taken
+at the stream tail. Delta-only plans are upserts and need no gate; legacy
+manifests without `cutoff_seq` stay ungated (lsn is not comparable — finding 7).
+Measured RED: position inflated +100000, salaries watermark dropped (forcing a
+full plan) — every poll logged `chain g6 predates this replica (cutoff seq 862
+< applied 100861 on CDC_kilo)`, the client gave up on salaries, and the 11 rows
+SURVIVED. GREEN: position repaired — `Seeded salaries from generation chain g6
+(11 row(s))`, replica == PG.
+
+**Residuals, stated so they are not lost:**
+  * A chain can be newer than the stored position yet still short of the
+    stream's `first_seq` after aggressive pruning — events between its cutoff
+    and `first_seq` are lost with no warning. The chain-orphan check (§10k
+    discussion: verify CDC covers the manifest's cutoff_seq at seed time) is
+    designed, not built. Retention >= cadence makes it structurally rare.
+  * The retired snapshot path's replay still begins with an ungated
+    `DELETE FROM` — acceptable only because the path is behind
+    `LEGACY_SNAPSHOT_SEEDING = false`; delete it rather than gate it.
+
+With D1 (§10m) + D2, §10k's plan is down to its last item: strip the legacy
+snapshot dependencies from the scenario suite, then remove the bridge-side
+snapshot code.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

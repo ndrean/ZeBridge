@@ -1465,14 +1465,36 @@ export class ZeBridge {
       return applied;
     };
 
-    let applied = await applyPlan(planFrom(manifest));
+    // D2 (NOTES §10n): a chain-full is DELETE FROM + replay, so a chain whose
+    // cutoff predates this replica's applied stream position would destroy every
+    // row applied AFTER the chain was built — rows the resumed CDC will never
+    // re-deliver (they are behind the stored position). Such a chain cannot help
+    // with a gap either: the gap sits ABOVE the stored position it fails to
+    // reach. Refuse it; the caller's poll picks up the next cadence build, whose
+    // cutoff is taken at the stream tail. Legacy manifests (no cutoff_seq) stay
+    // ungated — lsn is not comparable across commits (finding 7). Delta-only
+    // plans are upserts and need no gate.
+    const fullPredatesReplica = (man: any, plan: { kind: string }[]): boolean => {
+      if (!plan.some((step) => step.kind === 'full')) return false;
+      if (typeof man.cutoff_seq !== 'number' || man.cutoff_seq <= 0 || !man.cdc_stream) return false;
+      const pos = this.globalSyncState.seq[man.cdc_stream] ?? 0;
+      if (man.cutoff_seq >= pos) return false;
+      this.appendLog('SYS', `${table}: chain g${man.gen} predates this replica (cutoff seq ${man.cutoff_seq} < applied ${pos} on ${man.cdc_stream}) — a full replay would destroy newer rows; waiting for a newer build`, 'WARNING');
+      return true;
+    };
+
+    let plan = planFrom(manifest);
+    if (fullPredatesReplica(manifest, plan)) return false;
+    let applied = await applyPlan(plan);
     if (applied === null) {
       // Pruned between manifest read and fetch: re-read ONCE, restart from ITS full —
       // overlap, never a gap; a second failure falls back to the snapshot path.
       manifest = await readManifest();
       if (!manifest?.full?.object) return false;
       watermark = null;
-      applied = await applyPlan(planFrom(manifest));
+      plan = planFrom(manifest);
+      if (fullPredatesReplica(manifest, plan)) return false;
+      applied = await applyPlan(plan);
       if (applied === null) return false;
     }
 
@@ -1535,23 +1557,45 @@ export class ZeBridge {
     // 1. Gap detection — asked of EVERY stream this client reads: a gap in any of
     // them means missing rows, and checking only one looks like an empty table.
     try {
-      let gap = false;
+      const gappedStreams = new Set<string>();
       const gapDetail: string[] = [];
       for (const streamName of this.cdcStreams()) {
         const info = await jsm.streams.info(streamName);
         const firstSeq = info.state.first_seq;
         const local = this.globalSyncState.seq[streamName] ?? 0;
         if (local === 0 || (firstSeq > 0 && local < firstSeq - 1)) {
-          gap = true;
+          gappedStreams.add(streamName);
           gapDetail.push(`${streamName}: local ${local}, stream first ${firstSeq}`);
         }
       }
+
+      // D2 (NOTES §10n): seeding is SCOPED. A gap on one stream re-seeds only
+      // the tables ROUTED to that stream; every other table resumes from its
+      // stored position untouched — a mobile client reconnecting with one stale
+      // stream must not rebuild its whole replica. A table with no generations
+      // watermark has never been seeded at all (enabled between two connects,
+      // or a brand-new replica) and seeds regardless of its stream's health.
+      let seededBefore = new Set<string>();
+      try {
+        const rows: any[] = (await this.run(`SELECT tbl FROM _zebridge_generations`)) ?? [];
+        seededBefore = new Set(rows.map((r: any) => r.tbl));
+      } catch { /* fresh replica */ }
+      const tablesToSeed = new Set<string>();
+      for (const table of this.syncedTables.keys()) {
+        const route = this.cdcStreamForTenant(this.effectiveTenantFor(table));
+        if (gappedStreams.has(route) || !seededBefore.has(table)) tablesToSeed.add(table);
+      }
+      const gap = tablesToSeed.size > 0;
 
       if (!gap) {
         this.appendLog('SYS', 'No CDC gap — resuming from stored positions, no seeding needed', 'INFO');
         this.reach('snapshot');
       } else {
-        this.appendLog('SYS', `Gap detected or first run! ${gapDetail.join('; ')}. Seeding required!`, 'WARNING');
+        const untouched = this.syncedTables.size - tablesToSeed.size;
+        this.appendLog('SYS',
+          `${gapDetail.length ? `Gap detected or first run! ${gapDetail.join('; ')}. ` : ''}` +
+          `Seeding ${tablesToSeed.size} table(s) [${[...tablesToSeed].join(', ')}]` +
+          `${untouched > 0 ? `; ${untouched} table(s) resume untouched` : ''}`, 'WARNING');
 
         let snapKv: any;
         try {
@@ -1561,7 +1605,6 @@ export class ZeBridge {
         } catch { /* no snapshot bucket access — generations may still seed */ }
 
         const tenanted = !!this.config.grammar.init_streams;
-        const tablesToSeed = new Set(this.syncedTables.keys());
         const seedPromises: Promise<void>[] = [];
 
         // Off for the duration of the bulk load — see the re-arm below. A no-op
