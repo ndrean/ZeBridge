@@ -4668,6 +4668,37 @@ seedLsn fallback; the producer always ships cutoff_seq, so that fallback can go
 once no pre-cutoff_seq chain can exist. Docs (README/PROTOCOL/SECURITY) rewrite
 follows in its own commit.
 
+## 10q. LWW clock sensitivity, the PowerSync sequencer, and the HLC candidate (2026-08-27)
+
+Discussion record, no code change yet.
+
+PowerSync does not resolve conflicts: writes go client -> the developer's own
+backend API (a CRUD upload queue) and the backend applies them however it
+likes — in practice, arrival order, so last-arrival-wins. Downstream is an
+op-log with server-assigned sequences and checkpoints; the client rebases its
+optimistic pending edits on each checkpoint (server wins). DELETEs need no
+tombstone column because they travel as explicit REMOVE ops in the log; a
+client offline past bucket compaction re-syncs the bucket wholesale. The
+schema demands nothing, but the write path is yours to build — the intrusion
+we put in columns (version/tombstone/tiebreak), they put in a backend you
+must design correctly per app.
+
+Arrival time vs client time is a question about offline: arrival order
+resolves "which edit was later" by CONNECTIVITY (a Monday offline edit synced
+Wednesday loses to Tuesday's online edit); clock skew is seconds while
+reconnection delay is days, so client-stamped time better approximates
+intent for offline-first. Inside the skew window no clock is "right" — that
+is the tiebreak column's job, deterministic rather than an arrival race.
+
+Existing mitigation: `version_future_tolerance` (5s) caps fast-clock
+dominance. The open hole is the SLOW clock losing its own edits.
+
+**Candidate, cheap: HLC-style stamping in libzb's mutate()** —
+`version = max(wall_clock, newest_version_seen_via_CDC + 1us)`. A device that
+has seen the current row can never stamp below it; no schema, protocol, or
+bridge change. Bridge arrival time stays interesting only as an audit column,
+never as the comparator.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
