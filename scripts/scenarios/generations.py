@@ -84,19 +84,19 @@ SELECT pg_current_wal_lsn() AS l \\gset
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT count(*) FROM public.users;
 INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn)
-VALUES ('_default', 'users', 1, now(), :'l');
+VALUES ('_default', 'users', 900001, now(), :'l');
 COMMIT;
-SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='_default' AND tbl='users';
+SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='_default' AND tbl='users' AND gen >= 900000;
 """)
-        if r.returncode == 0 and "1@" in r.stdout:
-            zb.ok(f"the reader built generation 1 with the LSN-before-snapshot recipe ({r.stdout.strip().splitlines()[-1]})")
+        if r.returncode == 0 and "900001@" in r.stdout:
+            zb.ok(f"the reader built a generation with the LSN-before-content recipe ({r.stdout.strip().splitlines()[-1]})")
         else:
             zb.bad(f"recipe failed as bridge_reader: {r.stderr.strip()[:160]}")
             failed += 1
 
         # ── PK: the chain cannot fork ──────────────────────────────────────────
         r = reader("INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn) "
-                   "VALUES ('_default', 'users', 1, now(), pg_current_wal_lsn());")
+                   "VALUES ('_default', 'users', 900001, now(), pg_current_wal_lsn());")
         if r.returncode != 0 and "duplicate key" in r.stderr:
             zb.ok("a second generation 1 is refused by the primary key — the chain cannot fork")
         else:
@@ -104,7 +104,7 @@ SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='_
             failed += 1
 
         # ── 4. append-only by privilege ────────────────────────────────────────
-        r = reader("UPDATE public.zebridge_generations SET cutoff_version = now() WHERE gen = 1;")
+        r = reader("UPDATE public.zebridge_generations SET cutoff_version = now() WHERE gen = 900001;")
         if r.returncode != 0 and "permission denied" in r.stderr:
             zb.ok("the reader cannot UPDATE — history is append-only by privilege, not convention")
         else:
@@ -113,7 +113,7 @@ SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='_
 
         # ── 5. the writer holds nothing here ───────────────────────────────────
         r = writer("INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn) "
-                   "VALUES ('_default', 'users', 99, now(), pg_current_wal_lsn());")
+                   "VALUES ('_default', 'users', 900099, now(), pg_current_wal_lsn());")
         if r.returncode != 0 and "permission denied" in r.stderr:
             zb.ok("bridge_writer is refused entirely — generation bookkeeping is not ingress")
         else:
@@ -121,7 +121,7 @@ SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='_
             failed += 1
     finally:
         # cleanup through the very grant that pruning will use
-        r = reader("DELETE FROM public.zebridge_generations WHERE tenant='_default' AND tbl='users';")
+        r = reader("DELETE FROM public.zebridge_generations WHERE tenant='_default' AND tbl='users' AND gen >= 900000;")
         if r.returncode == 0:
             zb.ok("cleanup via the reader's DELETE grant — the pruning path works")
         else:

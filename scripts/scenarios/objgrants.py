@@ -63,10 +63,11 @@ async def main():
         sys.exit("could not find alice in the rendered conf")
     alice_pw = m.group(1)
 
-    # Insert the OBJ grants inside ALICE's block only, anchored on her INIT_ACME line.
+    # Insert the OBJ grants inside ALICE's block only, anchored on her CDC_ACME line
+    # (the INIT_ACME anchor left with snapshot-on-demand, NOTES §10p).
     a_start = conf.index('{ user: "alice"')
     a_end = conf.index('{ user: "bob"', a_start)
-    anchor = '"$JS.API.CONSUMER.CREATE.INIT_ACME"'
+    anchor = '"$JS.API.CONSUMER.CREATE.CDC_ACME"'
     line_start = conf.index(anchor, a_start, a_end)
     line_end = conf.index("\n", line_start) + 1
     backup = CONF.with_suffix(".conf.objgrants-backup")

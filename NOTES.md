@@ -4701,6 +4701,65 @@ has seen the current row can never stamp below it; no schema, protocol, or
 bridge change. Bridge arrival time stays interesting only as an audit column,
 never as the comparator.
 
+## 10r. The full test campaign after the snapshot removal (2026-08-27)
+
+Run on the native stack (JWT NATS, host PG), main bridge at BASE_BUF=12,
+cadence 20s. Two battery rounds plus a Node client pass.
+
+**PASS (24)**: render, dyntenant, generations, mutate, writable, tiebreak,
+poison, invalidate, burst, offline, replies, guards, tzguard, sweeper, reaps,
+connbudget, sizing, race, downtime, credentials-preflight half of keys,
+endpoint, livebirth, legacybait, decode_integrity. The tricky-point coverage
+held: WAL replay across kill -9 (downtime), the ingress throttle fix (race),
+newborn width budgets (livebirth), legacy oversized rows (legacybait), CDC
+decode integrity (now CDC-only), the generations SQL contract, the write path
+end to end (mutate/tiebreak/poison/invalidate/replies/offline).
+
+**Environmental, not code** — the harness lessons:
+  * zb.py's psql defaults to `docker exec` — the native stack needs
+    `ZB_PSQL="psql <url>"` exported, or every scenario fails on the OrbStack
+    socket while looking like product breakage.
+  * python-consumer/.venv lacked `nkeys`; with NATS_CREDS exported, nats-py
+    takes its JWT path and imports it. Installed (uv pip).
+  * sizing's test 1 failed only inside the battery: its bridge contended for
+    the walsender the just-killed main bridge still held, and stalled before
+    the payload check. Solo on a probe slot: all green, including
+    EventBufferExceedsMaxPayload firing (direct repro confirmed the guard).
+  * envcheck's port findings are the native-vs-compose declaration mismatch,
+    pre-existing.
+
+**Still red, one class**: objgrants (edits the password conf, not the JWT one),
+credentials (password principals), clamp and keys' write half (no verdict, no
+CDC echo for the probe principal) — the user/password-era scenarios that
+never crossed the JWT migration, joining crosstenant/tenant_kv/widthguard on
+the known rework list. Not snapshot-cleanup fallout: their failures are
+Authorization Violation / missing verdicts, and keys' preflight half passes.
+
+**Scenario fixes made**: generations.py's fixture now uses gen 900001+ and its
+cleanup no longer DELETEs the live producer's real bookkeeping (it was
+deleting `WHERE tbl='users'` wholesale); objgrants re-anchored on CDC_ACME
+(INIT_ACME left with §10p); burst.py now documents that it deliberately
+leaves its 2,000,000 rows and must never run in a shared battery.
+
+**The burst pollution incident, and the two-sided cleanup lesson.** burst.py's
+2M rows turned every fresh seed into a 2M-row chain apply (Node runs timed
+out; that is how it was noticed). Recovery: stop bridge -> DELETE the rows ->
+`pg_replication_slot_advance` past the delete WAL (streaming 2M deletes would
+re-flood) -> purge CDC_PUBLIC -> remove the users chain objects + manifest.
+⚠️ That last step was HALF a cleanup: the producer's memory is
+`zebridge_generations` in PG ("the bridge never reads its own output back"),
+so it kept building deltas on top of objects that no longer existed — a chain
+whose manifest 404s on fetch. The client handled it correctly (loud fail, no
+destruction — the §10n behaviour), and clearing the PG rows made the next
+tick rebuild g1 from scratch. Cleanup of a chain must clear BOTH sides or
+neither.
+
+**Node client pass (zb-client-ts over better-sqlite3)**: fresh seed (9 tables,
+users 13 rows from the fresh g1), reconnect with zero gaps, zero re-seeds and
+zero `created (first sight)` (findings 9/10 stay dead), offline cross-stream
+FK pair held then resolved on parent arrival — replica == PG (14/16).
+Browser pass pending (Chrome extension disconnected at time of writing).
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

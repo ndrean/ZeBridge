@@ -27,6 +27,13 @@ import zb
 
 def main():
     table = sys.argv[1] if len(sys.argv) > 1 else "users"
+    # ⚠️ This benchmark LEAVES its 2M rows in `users` on purpose (the measurement is
+    # the ingest, and a CDC-visible delete storm would poison the next measurement).
+    # NEVER run it as part of a shared-environment battery: clean up afterwards with
+    #   DELETE FROM users WHERE name LIKE 'User-%';
+    #   SELECT pg_replication_slot_advance('<slot>', pg_current_wal_lsn());  -- skip the deletes
+    # then purge CDC_PUBLIC and the users generation chain (measured 2026-08-27:
+    # the leftover rows turned every fresh seed into a 2M-row chain apply).
     statements = int(sys.argv[2]) if len(sys.argv) > 2 else 2000
     per = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
 
