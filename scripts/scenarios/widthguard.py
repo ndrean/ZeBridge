@@ -57,10 +57,12 @@ async def main():
     # under test: whatever the guard would compute, computed the same way here. The
     # live registration is asserted separately, against a table a bridge really carries.
     budget = zb.psql(
-        "SELECT COALESCE(MIN(max_row_bytes), 16384) FROM public.zebridge_limits "
-        # to_regclass, not ::regclass: the cast ERRORS on a missing relation, and this
-        # runs before the fixture is created. NULL simply matches no row.
-        f"WHERE tbl = to_regclass('public.{FIX}')"
+        # zebridge_limits collapsed to ONE ROW PER INSTANCE (slot PK) on 2026-08-26 —
+        # there is no tbl column. The budget for a table is what the guard bakes:
+        # MIN over the instances whose publication carries it, defaulting 16384.
+        f"SELECT COALESCE((SELECT MIN(l.max_row_bytes) FROM public.zebridge_limits l "
+        f"JOIN pg_publication_tables pt ON pt.pubname = l.publication "
+        f"WHERE pt.tablename = '{FIX}'), 16384)"
     ).strip()
 
     # ── 1. the budget lives in a table, written by the bridge ──────────────────

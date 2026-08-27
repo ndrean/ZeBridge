@@ -148,9 +148,14 @@ def main_sync():
             # ── 4. the migration-born width guard, psql door ───────────────────
             # Per (table, slot) since 2026-08-26 — the bridge registers its own
             # BASE_BUF at boot; MIN because a row must fit the narrowest carrier.
+            # zebridge_limits collapsed to ONE ROW PER INSTANCE (slot PK) on
+            # 2026-08-26 — there is no tbl column. The budget for a table is what
+            # the guard bakes: MIN over the instances whose publication carries
+            # it, defaulting 16384.
             budget = int(zb.psql(
-                f"SELECT COALESCE(MIN(max_row_bytes), 16384) FROM public.zebridge_limits "
-                f"WHERE tbl = to_regclass('public.{FIX}')"
+                f"SELECT COALESCE((SELECT MIN(l.max_row_bytes) FROM public.zebridge_limits l "
+                f"JOIN pg_publication_tables pt ON pt.pubname = l.publication "
+                f"WHERE pt.tablename = '{FIX}'), 16384)"
             ).strip())
             zb.psql(f"UPDATE public.{FIX} SET txt = repeat('x', {budget}), updated_at = now() WHERE txt = 'born live'", quiet=True)
             width = zb.psql(f"SELECT length(txt) FROM public.{FIX} WHERE length(txt) >= {budget}").strip()

@@ -1482,6 +1482,31 @@ BEGIN
             format('ALTER PUBLICATION %I ADD TABLE %s%s', publication, tbl, col_list);
     END IF;
 
+    -- ── re-bake the width guard NOW THAT THE TABLE IS PUBLISHED ───────────────
+    -- The guard is installed BEFORE the publication step (its own required
+    -- ordering), but its baked budget derives from a join through
+    -- pg_publication_tables — which at install time contains NOTHING for this
+    -- table, so a newborn's guard silently baked the 16384 default and ignored
+    -- every registered instance budget until the next bridge restart. Measured:
+    -- livebirth's 4096-budget probe stored a 4096-byte row the guard should have
+    -- refused (case C, the exact failure the guard exists for). Re-derive with
+    -- the publication row in place; rebudget is body-only, so no table lock.
+    IF NOT dry_run THEN
+        DECLARE
+            eff_budget integer;
+        BEGIN
+            SELECT COALESCE((SELECT MIN(l.max_row_bytes)
+                             FROM public.zebridge_limits l
+                             JOIN pg_publication_tables pt ON pt.pubname = l.publication
+                             WHERE pt.tablename = short), 16384)
+              INTO eff_budget;
+            IF public.zebridge_rebudget_width_guard(tbl, eff_budget) THEN
+                RETURN QUERY SELECT 'width guard', 'done',
+                    format('budget re-baked at %s bytes now the publication carries %s', eff_budget, tbl);
+            END IF;
+        END;
+    END IF;
+
     IF columns IS NOT NULL AND tenant_col IS NOT NULL THEN
         RETURN QUERY SELECT 'publication', 'NOTE',
             format('column list + tenant scoping: put %I inside the replica identity, or '
