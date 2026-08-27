@@ -198,3 +198,8 @@ test "smoke: seed gate through the dispatch layer" {
     const r = try dispatch(a, "seedGate", parsed.value);
     try std.testing.expectEqualStrings("true", r);
 }
+
+test {
+    _ = @import("storage.zig");
+    _ = @import("transport.zig");
+}

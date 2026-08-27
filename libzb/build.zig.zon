@@ -1,0 +1,17 @@
+.{
+    .name = .libzb,
+    .version = "0.0.0",
+    .fingerprint = 0xe1f15b9e89edbf2c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The same local nats.zig the bridge builds against — one client, one
+        // set of local fixes (nats.zig/NOTES.md).
+        .nats = .{ .path = "../nats.zig" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "python",
+    },
+}

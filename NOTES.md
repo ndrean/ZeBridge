@@ -4926,6 +4926,48 @@ SQLite driver (with the binding-semantics contract: bool -> 0/1, undefined ->
 NULL) — plus the orchestration loop that libzb.ts's ZeBridge class embodies.
 The decisions those shells execute are now all behind zb_call.
 
+## 10u. The two Zig shells — and a nats.zig fix the grants forced (2026-08-27)
+
+**`libzb/src/storage.zig`** — system SQLite behind the storage contract, held
+exactly as the TS adapters hold it: transactions serialize (a spinlock until
+the orchestration brings its std.Io), `foreign_keys` ON at open (semantics,
+never a driver default to trust), and finding 11's binding rule as a TYPE —
+`Value.boolean` binds as 0/1, `.null` as NULL. Arena-friendly `query()`
+(prepare/bind/step, typed cells out), `transaction()` with rollback-on-error.
+Offline tests pin the contract: bool roundtrips as integer 1, an orphan child
+is refused, a failed transaction leaves no rows. One C nit: SQLITE_TRANSIENT
+is a -1 function-pointer macro translate-c cannot align — a null destructor
+is correct here because params outlive the statement.
+
+**`libzb/src/transport.zig`** — nats.zig behind the transport surface: creds
+connect (mirroring credsAuthenticator), JetStream publish with Nats-Msg-Id,
+KV get, object-store getBytes (128 KiB chunks), core subscribe for verdicts.
+The live test (ZB_LIVE=1, omar's client creds) proves the read path end to
+end: connect, schema KV, chain manifest, full object with a msgpack marker.
+
+**The find: nats.zig's direct gets vs the per-key grants.** KV.get and both
+object-store meta lookups published to the BUCKET-level
+`$JS.API.DIRECT.GET.<stream>` API with a JSON body — Permissions Violation
+under client creds, because the JWT grants deliberately cover only the
+PER-KEY form (`DIRECT.GET.KV_x.$KV.x.<key>…`): per-key scoping is what makes
+tenant-scoped KV grants possible at all (a bucket-level grant on
+KV_generations would hand every tenant every manifest). Fixed as a LOCAL
+nats.zig patch, per that clone's own policy: `getMsgDirect` now uses the
+ADR-31 subject form (`DIRECT.GET.<stream>.<subject>`, empty body) for
+last-by-subject lookups — identical semantics, least-privilege compatible —
+recorded in nats.zig/NOTES.md and left UNCOMMITTED in the submodule for
+review. (A first workaround reimplemented the lookup in the shell; reverted —
+the library layer also handles KV DEL/PURGE tombstones, which a raw direct
+get would misread as values.) The bridge builds and its unit tests pass
+against the patched lib; the service key's wildcard never noticed either form.
+
+Zig 0.16 tolls this round: std.Thread.Mutex is gone (std.Io.Mutex wants an
+Io), std.posix.getenv too (std.c.getenv in a libc-linked test).
+
+**libzb now has all three legs in Zig**: core (91/91 fixtures via zb_call),
+storage, transport. What remains is the orchestration — the ZeBridge loop
+that wires them — and that is a composition task, not a porting one.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
