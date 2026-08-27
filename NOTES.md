@@ -4415,7 +4415,52 @@ cross-stream. Remaining: DEFAULT and CHECK (both low value; a replica receives
 complete rows). The PG -> SQLite portage is functionally complete for
 replication correctness.
 
+## 10k. Policy decisions and the reconnect-safety plan (2026-08-27)
+
+Decided in review, recorded here so a session break loses nothing:
+
+  1. **Restart policy** — promoted to README ("Restart rules"). The compressed
+     law: the catalogue governs it -> migration + restart; data governs it ->
+     live. Roadmap: extend `catalog_epoch` refresh (which the mutation listener
+     already uses) to the CDC routing map, so mid-flight enables stop needing a
+     restart at all.
+
+  2. **Tombstone gate — BUILT.** `zebridge_enable(writable => true)` now REFUSES
+     a table without `tombstone_col`: with snapshots retired, chains are the only
+     seed path and a physical DELETE is inexpressible in an upsert-only delta, so
+     hard-deleted rows resurrect on fresh seeds (measured, §10i). Escape hatch
+     `allow_physical_deletes => true` passes with a WARNING row — mechanical
+     refusal + recorded intent, same pattern as the timestamp and publication
+     guards. Old 11-arg signature dropped; livebirth's tombstone-less fixture now
+     opts out explicitly. Residual: psql deletes on READ-ONLY tombstone-less
+     tables share the hole; candidate mitigation is a producer-forced FULL
+     rebuild on seeing a DELETE event for such a table (caps resurrection at one
+     cadence). Not built.
+
+  3. **Cross-tenant FK is NOT forbiddable** (public parent, tenant child is the
+     product's own shape) and mobile makes RECONNECTION THE COMMON PATH — which
+     promotes §10j's two defects to core correctness work, in this order:
+       D1. Persist the stream position when an event is HELD: the inbox row
+           already carries the event durably (with its seq and stream), so
+           holding IS accounting for it — advance `_zebridge_stream_seq` at hold
+           time. Kills the perpetual-gap -> re-seed-on-every-reconnect loop that
+           a 100%-held stream currently causes.
+       D2. Make re-seeding SCOPED and NON-DESTRUCTIVE: a gap on CDC_kilo must
+           re-seed only kilo-routed tables, and no chain-full may DELETE FROM a
+           table holding newer CDC-applied data — the per-table data watermark
+           (§10g residual) becomes mandatory. Clean-room the two §10j anomalies
+           first (the chain-full row-count mismatch and the vanished cx users)
+           per §10h's lesson: establish what ran before theorising.
+     After D1+D2: strip the legacy snapshot dependencies from the scenario suite
+     (inventory in the 2026-08-27 discussion: snapshot.py, stampede.py, wide.py,
+     decode_integrity.py, faults.py, plus lighter references in check.py,
+     crosstenant.py, envcheck.py, leaksoak.py, objstore_race.py, tls.py,
+     tenant_kv.py, endpoint.py) so the bridge-side snapshot code can come out.
+
 ## 11 Restart Rules
+
+PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
+the current-state copy; this section keeps the history.
 
 The restart rules, as they stand today
 

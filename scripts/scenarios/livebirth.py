@@ -90,6 +90,10 @@ def main_sync():
                 CREATE TABLE public.{FIX} (uid uuid PRIMARY KEY, txt text, updated_at timestamptz NOT NULL);
                 SELECT step || ':' || status FROM zebridge_enable('public.{FIX}',
                     writable => true, version_col => 'updated_at',
+                    -- the fixture has no tombstone column ON PURPOSE (it tests the birth
+                    -- cascade, not delete semantics) — the gate added 2026-08-27 refuses
+                    -- writable-without-tombstone unless the acceptance is explicit:
+                    allow_physical_deletes => true,
                     public_reason => 'livebirth scenario fixture — pre-declared before probe boot', dry_run => false);
             """)
             need = {"grants:done", "guards:done", "width guard:done", "catalogue:done", "publication:done"}

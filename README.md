@@ -41,6 +41,7 @@ See the Table of Contents below for configuration, scaling, evaluation, and tele
 * [Quick review of PG & NATS setup](#quick-review-of-pg--nats-setup)
 * [The consumer side — use the library](#the-consumer-side--use-the-library)
 * [Running the Bridge](#running-the-bridge)
+* [Restart rules](#restart-rules)
 * [Monitoring & Telemetry](#monitoring--telemetry)
 * [Safety & Guarantees](#safety--guarantees)
 * [Inside](#inside)
@@ -54,10 +55,6 @@ See the Table of Contents below for configuration, scaling, evaluation, and tele
 ---
 
 ## Overview
-
- The `ZeBridge` daemon connects the Postgres database and a NATS/JS server.
-A consumer uses the library `libzb` to connect to the NATS/JS  server  - or leaf node - and to synchronize Postgres with its local SQLite database - or PGLITE or Postgres.
-The consumer can query his database and mutate through the `libzb` API.
 
 **Example of Architecture**:
 
@@ -99,12 +96,15 @@ flowchart LR
 | libzb | native library, C ABI | mobile apps, desktop apps, microservices via FFI |
 | zb-client-ts | npm package (self-contained TypeScript) | any JS runtime: browsers, Node, Electron, Deno, Bun |
 
+The `ZeBridge` daemon connects the Postgres database and a NATS/JS server.
+It proposes a protocol — a set of rules and workflows — to connect a consumer to NATS. The library `libzeb` implements the protocole to be used by a consumer to connect to the NATS/JS  server  - or leaf node.
+This will enable the sync to Postgres with its local SQLite database - or PGLITE or Postgres.
+The consumer can query his database and mutate through the `libzb` API.
+
 We have worked examples for Flutter, webapps (WASM-SQLite + OPFS), and backend microservices in Node, Go,Python & Elixir.
 
 ## How ZeBridge compares
 
-> ZeBridge is an inflow daemon that connects PostgreSQL and NATS.JS, and nothing else.
-It proposes a protocol — a set of rules and workflows — to connect a consumer to NATS. The library `libzeb` implements the protocole in the conusmer code.
 Reads are scoped by Postgres tenant.
 Writes are authorized by NATS subject grants together with the Postgres tenant, and resolved last-write-wins.
 No sync-rules DSL to write, no gatekeeper service to run — authorization and conflict resolution both live where the data already does.
@@ -666,6 +666,27 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up --build -d
 This uses `docker-compose.prod.yml` which includes the bridge container alongside PostgreSQL and NATS. See that file for complete configuration.
 
 ---
+
+## Restart rules
+
+One rule covers almost everything:
+
+> **The catalogue governs it → migration + restart. Data governs it → live.**
+
+| change | what's needed |
+| --- | --- |
+| new table (public or tenant-scoped) | one `zebridge_enable(...)` migration + **one bridge restart** — boot reads the catalogue and reconciles the CDC streams itself. No env edit, no stream edit by hand. |
+| changed rule on an existing table (version / tombstone / tiebreak / tenant column) | re-run `zebridge_enable` + **bridge restart** (the sweeper re-reads on its own restart) |
+| new tenant | **no restart** — create its streams, insert the `zebridge_user_tenants` row (propagates live to `$KV.tenants`); NATS grants need a SIGHUP (reload, not restart) until the JWT signing key covers them |
+| new user on an existing tenant | conf grant + SIGHUP only — with the JWT operator model, not even that |
+| `BASE_BUF` / `RING_BUFFER_COUNT` / other bridge env | **bridge restart** (the bridge re-registers its row-width budget and re-bakes the guards at boot) |
+| generations on/off, tenant growth, invites, enrollment | **nothing** — the producer and the mint read the database per tick/request |
+| `DROP TABLE` | nothing for the bridge — the DDL trigger tombstones the schema and reaps the guard |
+
+Until you restart after a migration, the running bridge serves its **boot-time view**: a
+newly enabled tenant-scoped table publishes a schema without its tenant column or
+foreign keys, and clients will build the wrong table from it. `zebridge_enable` prints
+this as its `T3 bridge MANUAL` step — treat that output as the checklist it is.
 
 ## Monitoring & Telemetry
 

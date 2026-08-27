@@ -1304,6 +1304,7 @@ $$ LANGUAGE plpgsql;
 -- signature would survive CREATE OR REPLACE and every named-argument call would
 -- be ambiguous between the two.
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, boolean, text, name, boolean);
+DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, text, name, boolean);
 CREATE OR REPLACE FUNCTION public.zebridge_enable(
     tbl           regclass,
     tenant_col    name    DEFAULT NULL,
@@ -1312,6 +1313,12 @@ CREATE OR REPLACE FUNCTION public.zebridge_enable(
     version_col   name    DEFAULT NULL,
     tombstone_col name    DEFAULT NULL,
     tiebreak_col  name    DEFAULT NULL,  -- where the winning writer's id is stored; makes equal versions resolvable
+    -- ⚠️ The conscious opt-OUT of the tombstone requirement (see the gate below).
+    -- Physical deletes are INEXPRESSIBLE in a generation delta (deltas are
+    -- upsert-only), and generations are the only seed path — so a hard-deleted row
+    -- RESURRECTS on any fresh or re-seeding client until the next full (measured,
+    -- NOTES §10i/§10j). Setting this true says the operator accepts that.
+    allow_physical_deletes boolean DEFAULT false,
     generations   boolean DEFAULT true,
     public_reason text    DEFAULT NULL,
     publication   name    DEFAULT '${BRIDGE_CDC_PUBLICATION}',
@@ -1330,6 +1337,32 @@ BEGIN
             'writable => true, but the write half is not installed — this database was '
             'initialised with ZB_PROFILE=readonly (init.core.template.sql alone).';
         RETURN;
+    END IF;
+
+    -- ── the tombstone gate ────────────────────────────────────────────────────
+    -- A writable table without a tombstone column deletes PHYSICALLY, and a
+    -- physical delete cannot travel in a generation delta (deltas are upsert-only).
+    -- With snapshot-on-demand retired, chains are the ONLY seed path — so a
+    -- hard-deleted row silently RESURRECTS on every fresh or re-seeding client
+    -- until the next full rebuild. That stopped being a "documented weaker
+    -- guarantee" and became a divergence generator the day snapshots retired
+    -- (measured: NOTES §10i, trigger-B). Refused mechanically, same pattern as the
+    -- timestamp and publication guards; `allow_physical_deletes => true` is the
+    -- recorded, deliberate opt-out.
+    IF writable AND tombstone_col IS NULL AND NOT allow_physical_deletes THEN
+        RETURN QUERY SELECT 'preflight', 'ERROR',
+            format('%s is writable but has no tombstone_col: DELETEs would be physical, '
+                   'and a physical delete cannot travel in a generation delta — hard-deleted '
+                   'rows RESURRECT on fresh clients until the next full (NOTES §10i). '
+                   'Add a tombstone column (e.g. deleted_at timestamptz) and pass '
+                   'tombstone_col => %L, or state the acceptance explicitly with '
+                   'allow_physical_deletes => true.', tbl, 'deleted_at');
+        RETURN;
+    END IF;
+    IF writable AND tombstone_col IS NULL AND allow_physical_deletes THEN
+        RETURN QUERY SELECT 'tombstone', 'WARNING',
+            format('%s: physical deletes ACCEPTED by the operator — hard-deleted rows '
+                   'resurrect on fresh seeds until the next full rebuild.', tbl);
     END IF;
 
     IF tenant_col IS NOT NULL AND NOT EXISTS (
