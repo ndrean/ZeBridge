@@ -4090,6 +4090,151 @@ holding data can still be emptied by a stale descriptor. The window is narrow
 (it needs an orphaned cached snapshot plus a throttled request) but it is real,
 and the failure is silent and total for that table.
 
+## 10h. The foreign-key port, end to end — findings and wrong turns (2026-08-27)
+
+A consolidated record of the FK work, because the useful part is not the diff: it
+is what porting one constraint EXPOSED about the wire, and how many wrong
+hypotheses it cost before the real causes surfaced. Details live in §10c–§10g;
+this is the thread through them.
+
+### The starting point
+
+`pg_constraint` appeared ZERO times in the whole Zig source. `orders` was declared
+in the migration as the FK-ordering demo ("child of users, PROTOCOL.md §4") and
+reached every replica as columns and a primary key, nothing else — measured on
+`$KV.schemas.orders`: no `foreign`, `references`, `fkey` or `constraint` key
+anywhere. So PROTOCOL §4's deferral rule was unimplementable by any consumer, and
+libzb's `PRAGMA defer_foreign_keys = ON` guarded a constraint that could not
+exist. The demo table was there; the metadata that would make it a demo was not.
+
+### What porting it actually required (all measured, §10d)
+
+  * **`foreign_keys` is per-connection, OFF by default, and our adapters
+    DISAGREED** — better-sqlite3 turns it on at open, sqlocal never sets it. Port
+    FKs and they would be ENFORCED in Node and IGNORED in the browser: the same
+    core, the same data, different integrity per consumer. Now part of the storage
+    contract, with the line drawn at PERFORMANCE pragmas (an adapter's business)
+    versus SEMANTIC ones (the seam's).
+  * **SQLite reports THREE different failures** and only one says what you expect:
+    `FOREIGN KEY constraint failed` (missing parent ROW), `no such table:
+    main.<parent>` (missing parent TABLE — resolution is lazy at DDL, strict at
+    DML), and `foreign key mismatch` (parent key is not the PK and has no UNIQUE
+    index). The applier matched only the first, so the other two would have been
+    classed permanent and DROPPED — the hold/retry would silently have become a
+    delete.
+  * **The parent key must be the PK or carry a UNIQUE index**, reproduced both
+    ways. The §10c index port ships unique btree indexes, so most PG unique
+    constraints arrive already satisfied — but a parent key unique only under a
+    PARTIAL or EXPRESSION index is unique to PostgreSQL and unsatisfiable here, so
+    the filter checks for an index we ACTUALLY PORT.
+  * **No `ALTER TABLE ADD CONSTRAINT` in SQLite**, so an FK change forces a table
+    rebuild where an index change is a cheap CREATE/DROP.
+
+### What it EXPOSED: the wire does not order across tables (§10e)
+
+This is the finding that outlived the feature. A child can reach a client before
+its parent at ANY transaction size — measured on 2,000 events comfortably under
+the flush quantum, so no transaction split was involved:
+
+    seq 61761 -> cdc.orders.insert.batch     (children)
+    seq 61762 -> cdc.users.insert.batch      (their parents, published AFTER)
+
+The grouping ORDER is correct (groups emit in first-appearance order, which is WAL
+order). What breaks it is grouping COLLAPSING the interleave: a run beginning
+mid-pair emits the orders group first, carrying every later order, while the users
+group after it carries their parents. Preserving order exactly would mean grouping
+only CONSECUTIVE same-subject events, which with interleaved data degenerates to
+batches of one — so grouping is worth having and the ordering guarantee is its
+price. **CDC preserves order WITHIN a table, not ACROSS tables.** Invisible to any
+consumer applying by primary key with LWW; visible precisely when a client holds a
+constraint spanning tables.
+
+### And the trap underneath it: LSN is not monotonic in delivery order (§10f)
+
+PostgreSQL gives a strict total order — transactions in COMMIT order, changes
+within a transaction in execution order — which is causal order, exactly what a
+foreign key needs. But delivery follows COMMIT order, so a transaction that begins
+earlier and commits later arrives later carrying a LOWER lsn:
+
+    lsn=8700486880  T2-committed-first    <- delivered FIRST
+    lsn=8700486488  T1-first-write        <- lower lsn, delivered SECOND
+
+So a client must NEVER sort by lsn to "restore" order — it would reorder across
+commit boundaries and break causality. libzb survives this by design rather than
+luck: `state.lsn` advances only at SEEDING, so it is a "was this in my snapshot?"
+watermark, not a running maximum. Had it tracked a maximum, `T1-first-write` would
+have been silently dropped; verified 3/3 rows landed.
+
+**The monotonic-id idea (PowerSync's), raised in review**: give every event a
+stamp the client CAN sort by. Sound here, and cheap — the WAL loop is
+single-threaded and decodes in commit order, so a counter incremented as each
+event is packed IS the global total order. But **sortable is not sufficient**: a
+client sees only a SUBSET of that sequence (its tenant plus public), so gaps are
+permanent and indistinguishable from "still in flight". Holding stamp 100 from
+CDC_PUBLIC and 105 from CDC_kilo, it cannot know whether 101-104 belong to a
+tenant it may not read. The missing half is a per-scope CHECKPOINT — "you are
+consistent as of X" — and that is the substantial part. Not built.
+
+Also withdrawn on review: refusing to port an FK whose parent lives in a different
+stream. A PUBLIC `users` parent with a PRIVATE `salaries` child scoped to one
+tenant is the multi-tenant shape this product exists for, not an edge case. Which
+means cross-stream FKs stay unorderable and the order-tolerant applier is required
+regardless — a stamp would make holds rarer, never unnecessary.
+
+### The applier, in layers
+
+  1. batch apply inside one transaction with `defer_foreign_keys` — handles a child
+     before its parent WITHIN a batch (PROTOCOL §4's rule, and the common case);
+  2. on batch failure, ISOLATED replay one event at a time, so one bad row cannot
+     discard 99 innocent ones (it used to log and ack anyway: ~600 events were lost
+     that way during the Node-consumer work);
+  3. missing-parent failures are HELD and retried after each later batch —
+     bulk-first in ONE transaction, since per-event retry after every batch is
+     O(held x batches) and measured at ~765,000 transactions for 15,000 held,
+     which never converged and starved the batches carrying the parents;
+  4. holds are DURABLE (`_zebridge_inbox`) — in memory alone they were lost on
+     restart while already ACKed, so JetStream would never redeliver them.
+
+Verified: 15,000 users + 15,000 orders interleaved in one transaction, ring 4096
+so it split across ~8 releases, FK live — 7,212 held, 7,212 resolved, 0 dropped,
+30,000/30,000, zero orphans. And across a kill: 4,280 holds persisted, restored
+on restart, drained to 15,000/15,000.
+
+### The wrong turns, recorded because they cost the most
+
+Chasing "`orders` silently fails to seed", THREE hypotheses were pursued and code
+was changed on each:
+
+  1. **the ported FK** — plausible, since orders is the only table with one. Wrong.
+  2. **concurrent bulk-load ordering** — seeding runs every table in parallel, so a
+     child's rows could hit the constraint before its parent's landed. Wrong as the
+     cause, though the fix (FK enforcement OFF during the bulk load, re-armed with
+     `foreign_key_check` after) is correct and kept: a seed is a bulk load of an
+     already-consistent snapshot.
+  3. **an empty chain object** — disproved by the object store: `orders-g3-delta`
+     was 165 KiB and the manifest well-formed.
+
+The actual cause was in none of them: the seeding loop awaited each table's whole
+request/retry cycle INLINE, so `test_types` — orphaned and throttled, sitting
+AHEAD of `orders` — starved it for 5 attempts x 60s. `orders` was never REACHED
+inside the test's timeout. Five minutes of head-of-line blocking presenting as
+data loss.
+
+**The lesson, and it generalises**: when something "silently fails", establish
+that it was REACHED before theorising about why it failed. The unfiltered log said
+so the whole time; grepping for the expected failure hid it. Three wrong fixes
+cost more than reading the log once would have.
+
+### Open
+
+  * the monotonic stamp + per-scope checkpoint (§10f) — designed, not built;
+  * the orphaned-descriptor + `SNAP_RET` throttle deadlock (§10g) — a table whose
+    cached snapshot ages out cannot get a fresh one inside the window; it no longer
+    blocks other tables, but it is unresolved, and it lives in the legacy snapshot
+    path that generations are meant to retire;
+  * the per-table DATA watermark (§10g) — without it the stale-snapshot guard is
+    partial, because `global_last_lsn` is global and `state.lsn` is the schema's.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today
