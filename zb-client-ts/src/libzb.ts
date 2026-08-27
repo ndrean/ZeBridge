@@ -111,7 +111,16 @@ async function watchBucket(
 
 /// Wait for one KV value (snapshot descriptor), or null on timeout — "not yet" is an
 /// ordinary outcome here, not an exception. The watch is always torn down.
-async function waitForDescriptor(js: any, bucket: string, key: string, timeoutMs: number): Promise<any | null> {
+/// `rejectId` is the descriptor this caller has ALREADY refused.
+///
+/// ⚠️ Without it this function hands back the very descriptor the caller just
+/// rejected. A KV watch replays the current value first, so the sequence
+/// "judge the cached descriptor orphaned -> request a fresh one -> wait for a
+/// descriptor" resolves instantly with the SAME stale one — and replaying it
+/// starts with DELETE FROM. Measured: a table holding 5,000 correct rows was
+/// emptied that way (NOTES §10g). Skipping the rejected snapshot_id is what makes
+/// "requesting a fresh one instead" mean it.
+async function waitForDescriptor(js: any, bucket: string, key: string, timeoutMs: number, rejectId?: string): Promise<any | null> {
   let watch: Awaited<ReturnType<typeof watchBucket>> | null = null;
   try {
     watch = await watchBucket(js, bucket, key);
@@ -119,7 +128,11 @@ async function waitForDescriptor(js: any, bucket: string, key: string, timeoutMs
       (async () => {
         for await (const entry of watch.entries) {
           if (entry.operation === 'DEL' || entry.operation === 'PURGE') continue;
-          try { return decode(entry.value); } catch { return JSON.parse(new TextDecoder().decode(entry.value)); }
+          let d: any;
+          try { d = decode(entry.value); } catch { d = JSON.parse(new TextDecoder().decode(entry.value)); }
+          // Keep waiting: this is the one we already refused.
+          if (rejectId && d?.snapshot_id === rejectId) continue;
+          return d;
         }
         return null;
       })(),
@@ -1314,18 +1327,18 @@ export class ZeBridge {
         const kv = await kvm.open(GEN.kv, { allow_direct: true });
         const entry = await kv.get(key);
         return entry ? JSON.parse(td.decode(entry.value)) : null; // manifest is JSON
-      } catch { return null; }
+      } catch (e) { this.appendLog('SYS', `${table}: chain manifest unreadable: ${e}`, 'ERROR'); return null; }
     };
     let manifest = await readManifest();
     if (!manifest?.full?.object) return false;
 
     let os: any;
-    try { os = await new Objm(this.nc).open(manifest.bucket); } catch { return false; }
+    try { os = await new Objm(this.nc).open(manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
     const fetchDoc = async (name: string): Promise<any | null> => {
       try {
         const blob = await os.getBlob(name);
         return blob ? (decode(blob) as any) : null; // objects are msgpack
-      } catch { return null; }
+      } catch (e) { this.appendLog('SYS', `${table}: chain object ${name} unreadable: ${e}`, 'ERROR'); return null; }
     };
 
     let watermark: string | null = null;
@@ -1477,7 +1490,22 @@ export class ZeBridge {
         const tablesToSeed = new Set(this.syncedTables.keys());
         const seedPromises: Promise<void>[] = [];
 
-        for (const table of tablesToSeed) {
+        // Off for the duration of the bulk load — see the re-arm below. A no-op
+        // inside a transaction, which is why it is here and not in a seed step.
+        try { await this.run(`PRAGMA foreign_keys = OFF;`); } catch { /* engine without it */ }
+
+        // ⚠️ ONE TABLE PER PROMISE, and that is the point.
+        //
+        // This used to be a sequential `for` that awaited each table's whole
+        // request/retry cycle inline — so a single table that could not be seeded
+        // blocked every table AFTER it for 5 attempts x 60 s. Measured: `orders`
+        // never seeded at all and looked broken, when in fact `test_types` sat ahead
+        // of it in the loop, orphaned and throttled, and `orders` was never reached.
+        // Five minutes of head-of-line blocking presenting as data loss.
+        //
+        // A table that cannot seed is ITS OWN failure (`this.failed`), never a
+        // reason to starve the rest.
+        for (const table of tablesToSeed) seedPromises.push((async () => {
           const tenantForTable = tenanted ? this.effectiveTenantFor(table) : '';
           const snapKey = tenanted ? `${tenantForTable}.${table}` : table;
 
@@ -1486,18 +1514,20 @@ export class ZeBridge {
           // falls through to the snapshot request path unchanged.
           if (await this.applyGenerations(table)) {
             this.reach('snapshot');
-            continue;
+            return;
           }
 
           let desc: any = null;
+          let rejectedId: string | undefined;
           if (snapKv) {
             try {
               const entry = await snapKv.get(snapKey);
               if (entry) {
-                const candidate = decode(entry.value); // descriptor is always msgpack
+                const candidate = decode(entry.value) as any; // descriptor is always msgpack
                 if (await this.descriptorStillFresh(js, tenantForTable, candidate)) {
                   desc = candidate;
                 } else {
+                  rejectedId = candidate?.snapshot_id;
                   this.appendLog('SYS', `Cached snapshot for ${table} is orphaned (CDC no longer covers its watermark) — requesting a fresh one instead`, 'WARNING');
                 }
               }
@@ -1518,7 +1548,7 @@ export class ZeBridge {
               } catch (e: any) {
                 this.appendLog('SYS', `Request for ${table} refused (${e?.message ?? e}) — a snapshot is already pending, waiting for it`, 'INFO');
               }
-              desc = await waitForDescriptor(js, this.config.grammar.kv.snapshots, snapKey, SNAPSHOT_WAIT_MS);
+              desc = await waitForDescriptor(js, this.config.grammar.kv.snapshots, snapKey, SNAPSHOT_WAIT_MS, rejectedId);
               if (!desc) {
                 this.appendLog('SYS', `No snapshot for ${table} after ${SNAPSHOT_WAIT_MS / 1000}s — the request may have expired unread; re-requesting`, 'WARNING');
               }
@@ -1527,6 +1557,12 @@ export class ZeBridge {
             if (!desc) {
               // Unseeded is NOT the same as synced: following CDC against an unseeded
               // table diverges silently — strictly worse than being visibly absent.
+              //
+              // ⚠️ Note what this does NOT do: fall back to the descriptor rejected
+              // above. "No fresh snapshot available" must never degrade into "replay
+              // a stale one", because replaying begins with DELETE FROM — the answer
+              // to not knowing is to keep what we have and be loud, never to rewind
+              // (NOTES §10g).
               this.syncedTables.delete(table);
               this.failed.add(table);
               this.scheduleRecount();
@@ -1537,11 +1573,31 @@ export class ZeBridge {
           if (desc) {
             this.appendLog('SYS', `Snapshot metadata ready for ${table} (LSN ${desc.lsn}, ${desc.row_count ?? '?'} rows). Replaying...`, 'INFO');
             this.reach('snapshot');
-            seedPromises.push(this.replaySnapshot(js, jsm, table, desc, tenanted, tenantForTable));
+            await this.replaySnapshot(js, jsm, table, desc, tenanted, tenantForTable);
           }
-        }
+        })().catch((e) => {
+          // One table's failure is one table's failure.
+          this.failed.add(table);
+          this.appendLog('SYS', `Seeding ${table} failed: ${e}`, 'ERROR');
+        }));
 
         await Promise.all(seedPromises);
+
+        // ⚠️ Re-arm referential integrity, and CHECK what the bulk load produced.
+        // Seeding runs every table CONCURRENTLY (the Promise.all above), so with
+        // enforcement on, a child's rows hit the constraint before its parent's have
+        // landed — measured: `orders` seeded from a chain holding 6,500 rows applied
+        // NOTHING, silently, because `users` was still loading beside it. A seed is a
+        // bulk load of an ALREADY-CONSISTENT snapshot: enforcing order during it is
+        // both unnecessary and actively wrong. The standard SQLite bulk-load shape —
+        // off during load, on after, then verify.
+        try {
+          await this.run(`PRAGMA foreign_keys = ON;`);
+          const bad = await this.run(`PRAGMA foreign_key_check;`);
+          if (bad?.length) {
+            this.appendLog('SYS', `⚠️ ${bad.length} foreign key violation(s) survive seeding — the seeded set is not self-consistent`, 'ERROR');
+          }
+        } catch { /* engine without the pragma */ }
         if (this.failed.size > 0) {
           this.appendLog('SYS', `Seeding done, but ${this.failed.size} table(s) could not be seeded and are excluded: ${[...this.failed].join(', ')}`, 'WARNING');
         } else {

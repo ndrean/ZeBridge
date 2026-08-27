@@ -4062,6 +4062,24 @@ data I hold for THIS table?" — and a second run still emptied `users` with the
 guard in place. The fix is to track an applied-position per table and compare
 against that; anything less is guessing with a DELETE in hand.
 
+**A SECOND defect, found by the same hunt and now fixed: head-of-line blocking.**
+The seeding loop awaited each table's whole request/retry cycle INLINE, so one
+table that could not be seeded starved every table after it for
+SNAPSHOT_REQUEST_ATTEMPTS x SNAPSHOT_WAIT_MS — 5 x 60s. Measured: `orders`
+appeared to be silently failing to seed, and three separate hypotheses were
+chased (the ported FK, concurrent bulk-load ordering, an empty chain object)
+before the real cause showed: `test_types` sat AHEAD of it in the loop, orphaned
+and throttled, and `orders` was simply never reached inside the test's timeout.
+Five minutes of head-of-line blocking presenting as data loss.
+
+Seeding is now one promise per table: a table that cannot seed is its own failure
+(`this.failed`), never a reason to starve the rest. Verified — `orders` seeds
+1,503 rows while `test_types` is still stuck, replica matches PostgreSQL exactly.
+
+⚠️ The lesson for the next hunt: when a table "silently fails", check whether it
+was ever REACHED before theorising about why it failed. Three wrong hypotheses
+cost more than reading the unfiltered log once would have.
+
 **Also worth pulling on**: the throttle refusing a fresh snapshot and the client
 then USING the stale pending one is a bad pairing. A refusal should not silently
 degrade into "use whatever is cached" — the safe response to "no fresh snapshot
