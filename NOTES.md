@@ -4885,6 +4885,47 @@ NULL, in every adapter; node.ts now coerces. Verified: the same write that
 errored three times runs clean, the local replica shows the row and then its
 tombstone.
 
+## 10t. The Zig core port — libzb/ exists, and Python is consumer #3 (2026-08-27)
+
+The §10s plan's "port against the fixtures", executed the same evening.
+
+**`libzb/`** builds a C-ABI shared library (`libzbcore`) from two files:
+`src/core.zig` — the full sans-I/O core, function-for-function from
+zb-client-ts/src/core.ts — and `src/capi.zig`, whose whole ABI is three
+symbols:
+
+    char* zb_call(const char* fn, const char* args_json);  // free via zb_free
+    void  zb_free(char* p);
+    int   zb_abi_version(void);
+
+One JSON-dispatch entrypoint, deliberately: `fn` names a fixture section,
+`args_json` is that case's input fields verbatim, the return is the expected
+output as JSON. Every host binding (Python ctypes today; Dart/Swift/Kotlin/
+.NET later) is three declarations, and the conformance runner is a TABLE, not
+a bridge. Unknown fn returns {"error":"unknown fn"} so a runner SKIPs loudly.
+
+**`python/runner.py`** loads the dylib with ctypes and runs
+zb-client-ts/fixtures/core-fixtures.json — the SAME file the TS core is
+pinned by — against it. Result: **91 pass, 0 fail, 0 skip**. The seed gate,
+positions, FK classification, wire helpers, versions + HLC, the whole
+mutate() envelope, all four apply-SQL builders (byte-identical statements),
+chain planning + the D2 guard, the gap/scope rule, and the complete schema
+migration planner. Two cores, one spec, and a third language proving it.
+
+Zig 0.16 lessons paid on the way: std.json kept a MANAGED Array
+(`init(a)`/`append(v)`) while ObjectMap went unmanaged (`.empty`/`put(a,..)`)
+— a split a blanket migration regex walks straight into; and JSON output is
+written by hand (compact, key-order-preserving) rather than betting on the
+churning std.json stringify API — the fixtures compare against JS
+`JSON.stringify` shapes, so owning the writer IS the compatibility.
+
+**What libzb still needs to become the native client**: the two shells —
+Transport mapped to nats.zig (connect/creds/JS/KV/object store; nkeys.zig
+already covers enrollment key generation end to end) and Storage mapped to a
+SQLite driver (with the binding-semantics contract: bool -> 0/1, undefined ->
+NULL) — plus the orchestration loop that libzb.ts's ZeBridge class embodies.
+The decisions those shells execute are now all behind zb_call.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
