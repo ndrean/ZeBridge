@@ -4695,7 +4695,11 @@ is the tiebreak column's job, deterministic rather than an arrival race.
 Existing mitigation: `version_future_tolerance` (5s) caps fast-clock
 dominance. The open hole is the SLOW clock losing its own edits.
 
-**Candidate, cheap: HLC-style stamping in libzb's mutate()** —
+**BUILT 2026-08-27 (§10s): core.hlcVersion + normalizeVersion, floor fed
+from CDC events' version column and chain cutoff_version.** Measured live: a
+row stamped 30s in the future arrived via CDC and the client's next version
+landed one microsecond above it while its wall clock sat 22s below. The
+original sketch:**
 `version = max(wall_clock, newest_version_seen_via_CDC + 1us)`. A device that
 has seen the current row can never stamp below it; no schema, protocol, or
 bridge change. Bridge arrival time stays interesting only as an audit column,
@@ -4830,6 +4834,17 @@ trigger: `ALTER TABLE memo ADD COLUMN` then `DROP COLUMN` in PG — the replica
 migrated in place both ways, 6 rows preserved throughout, zero gaps, zero
 re-creates. The shell's applySchema is now orchestration only: fetch physical
 state, execute steps, log, book-keep.
+
+**The §10q HLC — BUILT (same day).** `normalizeVersion` (canonical 6-digit
+micros — PG trims trailing zeros, and mixed widths break both string
+comparison and the micro arithmetic), `maxVersion`, `hlcVersion`
+(= nextVersion over max(own last, observed floor)). The floor is fed from
+every arriving CDC row's version column (never our own optimistic stamps) and
+from each chain's cutoff_version at seed time; the schema payload's
+version_column now lands in TableState. A slow-clock device stamps one
+microsecond above the newest version it has seen; arrival time never becomes
+the comparator. 8 fixtures; measured live with a +30s future row against a
+wall clock 22s behind it.
 
 **Increment 2c — the mutate() envelope, DONE (same day).** `nextVersion`
 (the monotonic stamp as a pure rule — the clock stays in the shell, and this

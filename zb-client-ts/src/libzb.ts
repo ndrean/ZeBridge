@@ -32,10 +32,11 @@ import { browserStorage } from './browser-storage.ts';
 import { v7 as uuidv7 } from 'uuid';
 import {
   seedGateDrops, planFromManifest, fullPredatesReplica as coreFullPredates,
-  scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber,
+  scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire,
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
-  nextVersion, mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
+  mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
+  normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
@@ -62,6 +63,9 @@ export type TableState = {
   columns: string[];
   tombstoneColumn: string | null;
   tenantColumn: string | null;
+  /// The table's LWW version column (from the schema payload) — read to feed
+  /// the HLC floor; the guard itself runs in SQL and in PG.
+  versionColumn?: string | null;
   lsn: number;
   /// The seed gate's PRIMARY anchor (finding 7, NOTES §10i): the CDC stream's
   /// last_seq captured by the producer AT CHAIN BUILD TIME, and which stream it
@@ -184,6 +188,10 @@ export class ZeBridge {
   /// need identity to survive a reload (NOTES.md §1.9).
   private clientIdValue = `c-${crypto.randomUUID().slice(0, 8)}`;
   private lastVersion = '';
+  /// The HLC floor (§10q): the newest version this client has OBSERVED —
+  /// CDC events' version column, chain cutoff_version. newVersion() stamps
+  /// strictly above it, so a slow clock cannot lose to a row already seen.
+  private hlcFloor = '';
 
   private outboxInitPromise: Promise<void>;
   private resolveOutboxInit!: () => void;
@@ -326,9 +334,10 @@ export class ZeBridge {
   /// timestamptz column (ISO, six digits, trailing Z), strictly increasing within
   /// this instance so same-millisecond edits never tie against themselves.
   public newVersion(): string {
-    // core.nextVersion (§10s 2c): monotonic past the last stamp even inside
-    // one millisecond — the clock stays here, the rule lives in the core.
-    this.lastVersion = nextVersion(new Date().toISOString(), this.lastVersion);
+    // core.hlcVersion (§10q): the wall clock floored by the newest version
+    // seen arriving — a slow clock lifts to just past the observed floor, and
+    // arrival time never becomes the comparator (that would punish offline).
+    this.lastVersion = hlcVersion(new Date().toISOString(), this.lastVersion, this.hlcFloor);
     return this.lastVersion;
   }
 
@@ -710,6 +719,7 @@ export class ZeBridge {
     const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
     const tombstoneColumn: string | null = typeof val.tombstone_column === 'string' ? val.tombstone_column : null;
     const tenantColumn: string | null = typeof val.tenant_column === 'string' ? val.tenant_column : null;
+    const versionColumn: string | null = typeof val.version_column === 'string' ? val.version_column : null;
     const names = cols.map((c) => c.name);
 
     // ── FINDING 9 (the destroyer behind §10j): "first sight" must be decided by
@@ -768,7 +778,7 @@ export class ZeBridge {
         this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses))) {
-        this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
+        this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn });
         this.reach('migrated');
         this.scheduleRecount();
         // ⚠️ NOT a no-op path for indexes. Adding an index in PostgreSQL changes no
@@ -806,7 +816,7 @@ export class ZeBridge {
       // indexes with it.
       await this.syncIndexes(table, indexes);
 
-      this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn });
+      this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn });
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
       this.scheduleRecount();
@@ -1068,6 +1078,15 @@ export class ZeBridge {
     // by a seed), pinned executable in fixtures/core-fixtures.json.
     if (!seed && seedGateDrops(ev, state)) return;
 
+    // Feed the HLC floor (§10q) from every arriving row's version column —
+    // observed remote versions, never our own optimistic stamps.
+    if (!ev.optimistic && state.versionColumn) {
+      const seen = ev.data?.[state.versionColumn];
+      if (typeof seen === 'string') {
+        this.hlcFloor = maxVersion(this.hlcFloor, normalizeVersion(pgTsToWire(seen)));
+      }
+    }
+
     const op = ev.operation;
 
     if (op === 'INSERT' || op === 'UPDATE') {
@@ -1300,6 +1319,11 @@ export class ZeBridge {
     if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
       state.seedSeq = manifest.cutoff_seq;
       state.seedStream = manifest.cdc_stream;
+    }
+    // The chain's cutoff_version is an observed version watermark: floor the HLC
+    // with it so a freshly seeded slow-clock client stamps above its own seed.
+    if (typeof manifest.cutoff_version === 'string') {
+      this.hlcFloor = maxVersion(this.hlcFloor, normalizeVersion(pgTsToWire(manifest.cutoff_version)));
     }
     await this.pruneInboxSeeded(table, state.lsn);
     await this.run(

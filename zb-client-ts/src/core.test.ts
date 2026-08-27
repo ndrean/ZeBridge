@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
+  normalizeVersion, hlcVersion,
   nextVersion, subjectSafeToken, buildMutation,
   columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   fkTextDiffers, viewSteps, indexSyncPlan,
@@ -106,4 +107,11 @@ for (const c of fx.subjectSafe) {
 }
 for (const c of fx.envelope) {
   test(`envelope: ${c.name}`, () => assert.deepEqual(buildMutation(c.args), c.out));
+}
+
+for (const c of fx.normalizeVersion) {
+  test(`normalizeVersion: ${c.name}`, () => assert.equal(normalizeVersion(c.in), c.out));
+}
+for (const c of fx.hlcVersion) {
+  test(`hlcVersion: ${c.name}`, () => assert.equal(hlcVersion(c.now, c.last, c.floor), c.out));
 }

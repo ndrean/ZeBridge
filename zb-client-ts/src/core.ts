@@ -497,3 +497,32 @@ export function buildMutation(args: {
     optimistic: optimisticEvent(args.table, args.op, payload),
   };
 }
+
+// ─── the hybrid logical clock (§10q, built §10s) ─────────────────────────────
+//
+// LWW on client-stamped time has one real hole: a device with a SLOW clock
+// loses its own edits to rows it has just seen. The fix is the standard HLC
+// move — the version stamp is the wall clock FLOORED by the newest version the
+// client has observed (CDC events\' version column, chain cutoff_version), so a
+// device that has seen the current row can never stamp below it. Arrival time
+// never becomes the comparator (that would punish offline edits, §10q); the
+// floor only lifts a lagging clock to just past what was already seen.
+
+/// Canonical wire version: exactly six fractional digits. PG text output trims
+/// trailing zeros (`.68582+00`), and mixed widths break both string comparison
+/// (`.5Z` > `.50001Z` lexicographically, < numerically) and nextVersion\'s
+/// fixed-width micro arithmetic. Non-timestamp strings pass through untouched.
+export function normalizeVersion(v: string): string {
+  const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z$/.exec(v);
+  if (!m) return v;
+  return `${m[1]}.${(m[2] ?? '').padEnd(6, '0').slice(0, 6)}Z`;
+}
+
+export const maxVersion = (a: string, b: string): string => (b > a ? b : a);
+
+/// The HLC stamp: strictly after BOTH this client\'s own last stamp and the
+/// newest version it has seen arrive. With an accurate clock this is exactly
+/// the wall time; with a slow one it is the observed floor plus one microsecond.
+export function hlcVersion(nowIso: string, lastVersion: string, seenFloor: string): string {
+  return nextVersion(nowIso, maxVersion(lastVersion, seenFloor));
+}

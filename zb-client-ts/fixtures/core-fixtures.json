@@ -1398,5 +1398,55 @@
         }
       }
     }
+  ],
+  "normalizeVersion": [
+    {
+      "name": "PG-trimmed micros pad to six digits",
+      "in": "2026-08-27T10:09:49.68582Z",
+      "out": "2026-08-27T10:09:49.685820Z"
+    },
+    {
+      "name": "no fraction gains .000000",
+      "in": "2026-08-27T10:09:49Z",
+      "out": "2026-08-27T10:09:49.000000Z"
+    },
+    {
+      "name": "already canonical passes through",
+      "in": "2026-08-27T10:09:49.123456Z",
+      "out": "2026-08-27T10:09:49.123456Z"
+    },
+    {
+      "name": "nanosecond overshoot truncates to micros",
+      "in": "2026-08-27T10:09:49.123456789Z",
+      "out": "2026-08-27T10:09:49.123456Z"
+    },
+    {
+      "name": "non-timestamp version untouched (integer version columns)",
+      "in": "42",
+      "out": "42"
+    }
+  ],
+  "hlcVersion": [
+    {
+      "name": "THE lost-update killer: slow clock, newer floor seen via CDC -> floor + 1\u00b5s",
+      "now": "2026-08-27T10:00:00.000Z",
+      "last": "2026-08-27T09:00:00.000000Z",
+      "floor": "2026-08-27T10:00:30.500000Z",
+      "out": "2026-08-27T10:00:30.500001Z"
+    },
+    {
+      "name": "accurate clock ahead of everything: wall time wins",
+      "now": "2026-08-27T11:00:00.123Z",
+      "last": "2026-08-27T10:59:00.000000Z",
+      "floor": "2026-08-27T10:58:00.000000Z",
+      "out": "2026-08-27T11:00:00.123000Z"
+    },
+    {
+      "name": "own last stamp still the highest: bump past it, not the floor",
+      "now": "2026-08-27T10:00:00.000Z",
+      "last": "2026-08-27T10:00:05.000009Z",
+      "floor": "2026-08-27T10:00:01.000000Z",
+      "out": "2026-08-27T10:00:05.000010Z"
+    }
   ]
 }
