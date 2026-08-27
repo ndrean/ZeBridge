@@ -21,11 +21,8 @@
 /// path (one sqlocal connection — OPFS sync handles are exclusive, so a second
 /// read-only connection is not available here the way `libzebridge` native has one).
 
-import { wsconnect, headers, credsAuthenticator } from '@nats-io/nats-core';
-import type { NatsConnection } from '@nats-io/nats-core';
-import { jetstream, jetstreamManager, DeliverPolicy } from '@nats-io/jetstream';
-import { Kvm } from '@nats-io/kv';
-import { Objm } from '@nats-io/obj';
+import { natsTransport } from './transport.ts';
+import type { Transport, TransportConnection } from './transport.ts';
 import { decode, encode } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 import { browserStorage } from './browser-storage.ts';
@@ -42,6 +39,9 @@ import {
 import type { PlanStep } from './core.ts';
 
 export interface ZeBridgeConfig {
+  /// Replace the whole wire layer (NATS factories, headers, wire constants) —
+  /// the transport seam (transport.ts). Default: the @nats-io libraries.
+  transport?: Transport;
   natsUrl: string;
   principal: string;
   password?: string;
@@ -55,7 +55,7 @@ export interface ZeBridgeConfig {
   /// and a NATS WebSocket dial. A Node host injects better-sqlite3 + TCP
   /// (`zb-client-ts/node`); any other host brings its own pair.
   storage?: StorageFactory;
-  connect?: (opts: any) => Promise<NatsConnection>;
+  connect?: (opts: any) => Promise<TransportConnection>;
 }
 
 export type TableState = {
@@ -120,7 +120,7 @@ async function watchBucket(
   const prefix = `$KV.${bucket}.`;
   const jsm = await js.jetstreamManager();
   const ci = await jsm.consumers.add(stream, {
-    deliver_policy: DeliverPolicy.LastPerSubject,
+    deliver_policy: 'last_per_subject', // NATS wire constant (transport.DELIVER_POLICY)
     filter_subject: `${prefix}${filterKey}`,
     ack_policy: 'none',
   });
@@ -172,7 +172,7 @@ export class ZeBridge {
   public transaction: Storage['transaction'];
   public deleteDatabaseFile: Storage['deleteDatabaseFile'];
 
-  private nc: NatsConnection | null = null;
+  private nc: TransportConnection | null = null;
   private storage: Storage;
 
   private syncedTables = new Map<string, TableState>();
@@ -187,6 +187,7 @@ export class ZeBridge {
   /// tiebreaker and msg-id prefix. Must move INTO the replica when durable outboxes
   /// need identity to survive a reload (NOTES.md §1.9).
   private clientIdValue = `c-${crypto.randomUUID().slice(0, 8)}`;
+  private readonly transport: Transport;
   private lastVersion = '';
   /// The HLC floor (§10q): the newest version this client has OBSERVED —
   /// CDC events' version column, chain cutoff_version. newVersion() stamps
@@ -228,6 +229,7 @@ export class ZeBridge {
       ? `zebridge_${config.principal}.sqlite3`
       : `zebridge_${Date.now()}.sqlite3`;
     this.storage = (config.storage ?? browserStorage)(this.dbName);
+    this.transport = config.transport ?? natsTransport;
     this.sql = this.storage.exec;
     this.transaction = (fn) => this.storage.transaction(fn);
     this.deleteDatabaseFile = () => this.storage.deleteDatabaseFile();
@@ -355,11 +357,11 @@ export class ZeBridge {
       this.emitStatus('connecting');
       this.appendLog('SYS', `Connecting to NATS at ${this.config.natsUrl}...`);
 
-      const dial = this.config.connect ?? wsconnect;
+      const dial = this.config.connect ?? this.transport.connect;
       this.nc = await dial({
         servers: this.config.natsUrl,
         ...(this.config.creds
-          ? { authenticator: credsAuthenticator(new TextEncoder().encode(this.config.creds)) }
+          ? { authenticator: this.transport.credsAuthenticator(new TextEncoder().encode(this.config.creds)) }
           : { user: this.config.principal, pass: this.config.password }),
         reconnect: true,
         maxReconnectAttempts: -1,
@@ -617,7 +619,7 @@ export class ZeBridge {
     if (!this.nc) return;
     try {
       return (async () => {
-        const watch = await watchBucket(jetstream(this.nc!), this.config.grammar.kv.schemas);
+        const watch = await watchBucket(this.transport.jetstream(this.nc!), this.config.grammar.kv.schemas);
         this.appendLog('SCHEMA', `Watching KV bucket "${this.config.grammar.kv.schemas}" for all tables...`, 'WATCH');
 
         return new Promise<void>((resolve) => {
@@ -1200,10 +1202,9 @@ export class ZeBridge {
   private async resolveTenant() {
     if (!this.nc) return;
     try {
-      const kvm = new Kvm(this.nc);
-      // allow_direct must be explicit: Kvm.open never asks the server, and the grant
-      // covers ONLY the per-key Direct Get path (measured — see App.tsx history).
-      const kv = await kvm.open(this.config.grammar.kv.tenants, { allow_direct: true });
+      // allow_direct must be explicit: the KV open never asks the server, and the
+      // grant covers ONLY the per-key Direct Get path (measured — App.tsx history).
+      const kv = await this.transport.kv(this.nc, this.config.grammar.kv.tenants, { allow_direct: true });
       const entry = await kv.get(this.config.principal);
       if (entry) {
         let val: string;
@@ -1234,8 +1235,7 @@ export class ZeBridge {
     const key = `${tenantForTable}.${table}`;
     const readManifest = async (): Promise<any | null> => {
       try {
-        const kvm = new Kvm(this.nc!);
-        const kv = await kvm.open(GEN.kv, { allow_direct: true });
+        const kv = await this.transport.kv(this.nc!, GEN.kv, { allow_direct: true });
         const entry = await kv.get(key);
         return entry ? JSON.parse(td.decode(entry.value)) : null; // manifest is JSON
       } catch (e) { this.appendLog('SYS', `${table}: chain manifest unreadable: ${e}`, 'ERROR'); return null; }
@@ -1244,7 +1244,7 @@ export class ZeBridge {
     if (!manifest?.full?.object) return false;
 
     let os: any;
-    try { os = await new Objm(this.nc).open(manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
+    try { os = await this.transport.objectStore(this.nc, manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
     const fetchDoc = async (name: string): Promise<any | null> => {
       try {
         const blob = await os.getBlob(name);
@@ -1340,8 +1340,8 @@ export class ZeBridge {
 
   private async subscribeStreams() {
     if (!this.nc) return;
-    const js = jetstream(this.nc);
-    const jsm = await jetstreamManager(this.nc);
+    const js = this.transport.jetstream(this.nc);
+    const jsm = await this.transport.jetstreamManager(this.nc);
 
     // 1. Gap detection — asked of EVERY stream this client reads: a gap in any of
     // them means missing rows, and checking only one looks like an empty table.
@@ -1498,7 +1498,7 @@ export class ZeBridge {
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }
         const last = this.globalSyncState.seq[streamName] ?? 0;
         const ci = await jsm.consumers.add(streamName, {
-          deliver_policy: last > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
+          deliver_policy: last > 0 ? this.transport.deliverPolicy.byStartSequence : this.transport.deliverPolicy.all,
           opt_start_seq: last > 0 ? last + 1 : undefined,
         });
         const consumer = await js.consumers.get(streamName, ci.name);
@@ -1709,7 +1709,7 @@ export class ZeBridge {
     // of the same edit is not.
     const subject = mutationSubject(this.config.principal, table, op);
     const msgId = mutationMsgId(this.clientIdValue, table, id, version);
-    const h = headers();
+    const h = this.transport.headers();
     h.set('Nats-Msg-Id', msgId);
     this.pendingWrites.set(msgId, { table, id, at: Date.now() });
 
@@ -1740,7 +1740,7 @@ export class ZeBridge {
     // JetStream publish, not core: the PubAck proves durability (not application —
     // the verdict/echo decide that), and `duplicate: true` is a success.
     try {
-      const ack = await jetstream(this.nc).publish(subject, encode(payload), { headers: h });
+      const ack = await this.transport.jetstream(this.nc).publish(subject, encode(payload), { headers: h });
       this.appendLog(subject, { ...payload, _ack: { seq: ack.seq, duplicate: ack.duplicate } }, 'MUTATION OUT');
     } catch (err) {
       this.appendLog(subject, `not accepted by JetStream: ${err}`, 'ERROR');
@@ -1763,10 +1763,10 @@ export class ZeBridge {
     for (const r of rows) {
       if (!this.nc) return;
       try {
-        const h = headers();
+        const h = this.transport.headers();
         h.set('Nats-Msg-Id', r.msg_id);
         this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now() });
-        const ack = await jetstream(this.nc).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
+        const ack = await this.transport.jetstream(this.nc).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
         this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
       } catch (err) {
         this.appendLog('OUTBOX', `replay of ${r.msg_id} failed, kept for next connection: ${err}`, 'ERROR');

@@ -4858,10 +4858,23 @@ the whole envelope in one call, the first thing a port implements. 7 new
 fixtures (83 total). Verified live: a Node INSERT round-tripped
 mutate -> MUTATIONS -> writer -> PG -> CDC echo (outbox drained to 0), and
 the DELETE came back as the tombstoning UPDATE the soft-delete trigger makes
-of it. The carve is COMPLETE but for the transport seam: applyEvent,
-applySchema, applyGenerations, the gap scope and the write path all execute
-what the core builds. Next: the transport seam, then the Zig port against
-all 83 fixtures.
+of it. **The transport seam — DONE (same day), and the carve is COMPLETE.**
+`transport.ts` is the second wall next to storage.ts: a `Transport` interface
+(connect / credsAuthenticator / headers / jetstream / jetstreamManager / kv /
+objectStore / deliverPolicy) with the @nats-io wrap as `natsTransport`, a
+structural `TransportConnection` (close/status/subscribe/rtt) replacing the
+NatsConnection type, and the NATS wire constants (DELIVER_POLICY) spelled once
+— they are protocol tokens, identical in nats.zig. libzb now contains ZERO
+@nats-io imports; `config.connect` still overrides just the dial (the Node
+TCP adapter), `config.transport` replaces the whole wire layer — which is also
+what a serverless mock test injects. Verified live through the seam: full
+read path (dial, KV, object store, consumers, schema watch — reconnect clean,
+replica == PG) and full write path (headers, publish, verdict sub — zero
+errors, outbox drained, row in PG).
+
+**The port is unblocked**: a Zig libzb implements core.ts against the 91
+fixtures, maps Transport to nats.zig and Storage to a SQLite driver, and the
+shells are all that remains to write.
 
 **Finding 11, small, found by 2c's live write**: better-sqlite3 refuses JS
 booleans and `undefined` at bind time, so on Node the optimistic apply and
