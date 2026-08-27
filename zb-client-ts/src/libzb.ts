@@ -54,6 +54,13 @@ export type TableState = {
   tombstoneColumn: string | null;
   tenantColumn: string | null;
   lsn: number;
+  /// The seed gate's PRIMARY anchor (finding 7, NOTES §10i): the CDC stream's
+  /// last_seq captured by the producer AT CHAIN BUILD TIME, and which stream it
+  /// belongs to. Stream sequence is commit-ordered and monotonic — lsn is NOT
+  /// (a transaction that begins early and commits late delivers late with a
+  /// LOWER lsn), so gating on lsn silently dropped in-flight transactions.
+  seedSeq?: number;
+  seedStream?: string;
 };
 
 export type Phase = 'connected' | 'migrated' | 'snapshot' | 'cdc';
@@ -1159,7 +1166,24 @@ export class ZeBridge {
     // enrollment demo; chain seeding survived only because it writes outside this
     // path). Seeding IS the baseline: it must land unconditionally, and the
     // caller re-anchors state.lsn to the snapshot's own watermark afterwards.
-    if (!seed && ev.lsn < state.lsn) return;
+    if (!seed) {
+      if (typeof state.seedSeq === 'number' && state.seedStream) {
+        // ── finding 7's fix (NOTES §10i) ──
+        // Drop only what the chain provably contains: an event published at or
+        // before cutoff_seq was decoded from a transaction that COMMITTED before
+        // the producer's snapshot began (capture precedes BEGIN), so the snapshot
+        // saw it. An in-flight transaction commits later, publishes later, and its
+        // seq exceeds the cutoff even though its row lsns may be LOWER — measured:
+        // inflight-A, seq 62129 > cutoff, lsn below it, lost under the lsn gate.
+        // Events from OTHER streams and optimistic locals carry no matching
+        // seq/stream and pass untouched.
+        if (ev.stream === state.seedStream && typeof ev.seq === 'number' && ev.seq <= state.seedSeq) return;
+      } else if (ev.lsn < state.lsn) {
+        // Legacy manifest without cutoff_seq (an older bridge): the lsn gate, with
+        // its known in-flight blind spot, is still better than no gate at all.
+        return;
+      }
+    }
 
     const op = ev.operation;
 
@@ -1423,6 +1447,10 @@ export class ZeBridge {
     }
 
     state.lsn = lsnToNumber(manifest.cutoff_lsn);
+    if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
+      state.seedSeq = manifest.cutoff_seq;
+      state.seedStream = manifest.cdc_stream;
+    }
     await this.pruneInboxSeeded(table, state.lsn);
     await this.run(
       `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?)

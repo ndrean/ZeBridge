@@ -4334,9 +4334,29 @@ in-flight transactions; stream-derived positions are not. (The user's earlier
 "2 x REFRESH_SNAP" instinct was the same point — retention and cutoffs should be
 measured in the stream's own coordinates.)
 
-⚠️ Residual, to check when building: the chain path should verify CDC still
-covers its cutoff_seq (the snapshot path had `descriptorStillFresh` for exactly
-this) — a chain whose cutoff_seq has aged out of CDC retention is an orphan.
+**BUILT and verified same day.** The producer captures the CDC stream's
+`last_seq` beside the lsn — BEFORE the snapshot begins, keeping the
+overlap-never-gap direction — and ships `cutoff_seq` + `cdc_stream` in the
+manifest (omitted if the stream-info call fails, so old clients and degraded
+ticks fall back to the lsn gate). The client anchors `state.seedSeq`/`seedStream`
+at chain seed and gates `ev.seq <= seedSeq` on the matching stream; optimistic
+locals and other streams pass untouched. Re-ran the exact experiment: a
+transaction held open across a build (`inflight-A2`), new generation built while
+it was open, fresh replica seeded from that chain — **the row ARRIVED**. Under
+the lsn gate the same shape was silently lost.
+
+⚠️ Residuals:
+  * the chain path should verify CDC still covers its cutoff_seq (the snapshot
+    path had `descriptorStillFresh` for exactly this) — a chain whose cutoff_seq
+    has aged out of CDC retention is an orphan;
+  * `seedSeq` is anchored in memory only — a durable replica that resumes from
+    its stored per-stream seq never replays old events, so persistence is not
+    needed for correctness today, but re-seeding paths should re-anchor;
+  * observed during verification, PRE-EXISTING and documented: a tombstone-less
+    table (memo) resurrected a hard-DELETEd row (`trigger-B`) because old chain
+    deltas still carry it and the delete event sits below any cutoff — the
+    documented weaker guarantee of physical deletes, amplified by chain windows.
+    The answer remains "give the table a tombstone column"; no gate can fix it.
 
 ## 11 Restart Rules
 

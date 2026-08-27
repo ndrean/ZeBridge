@@ -414,6 +414,36 @@ pub const GenerationProducer = struct {
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
         };
 
+        // ── 1b. the CDC stream's last_seq, ALSO before the snapshot (finding 7,
+        // NOTES §10i). Stream sequence is commit-ordered where lsn is not: a
+        // transaction open across this build writes LOW lsns, commits late, and the
+        // client's lsn gate dropped its events as "already in the snapshot" when the
+        // snapshot never saw it. Everything published at or before this seq belongs
+        // to a transaction that committed before our REPEATABLE READ begins (the
+        // bridge publishes post-commit decode), so the snapshot contains it — the
+        // one boundary that is exact in the stream's own coordinates. Capturing
+        // BEFORE the snapshot keeps the overlap-never-gap direction: a visible but
+        // not-yet-published transaction lands above the cutoff and is applied twice,
+        // which the idempotent upsert absorbs.
+        //
+        // 0 = unavailable (stream missing or NATS hiccup): the manifest then omits
+        // the field and clients fall back to the legacy lsn gate — degraded, never
+        // wrong-er than before this field existed.
+        const cutoff_seq: u64, const cdc_stream: []const u8 = blk: {
+            const name = if (std.mem.eql(u8, tenant, self.topo.open_tenant))
+                self.topo.cdc_stream_public
+            else
+                try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.cdc_stream_prefix, tenant });
+            if (js.getStreamInfo(name)) |info_const| {
+                var info = info_const;
+                defer info.deinit();
+                break :blk .{ info.value.state.last_seq, try alloc.dupe(u8, name) };
+            } else |err| {
+                log.warn("🧬 '{s}'/'{s}': stream info for {s} failed ({}) — manifest ships without cutoff_seq, clients use the legacy lsn gate", .{ tenant, table, name, err });
+                break :blk .{ 0, name };
+            }
+        };
+
         // ── 2. REPEATABLE READ + tenant scoping, same policy as snapshots ────
         {
             const res = try queryOne(pgc, "BEGIN ISOLATION LEVEL REPEATABLE READ", &.{});
@@ -553,11 +583,15 @@ pub const GenerationProducer = struct {
         };
         defer kv.deinit();
         const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
+        const seq_frag: []const u8 = if (cutoff_seq > 0)
+            try std.fmt.allocPrint(alloc, "\"cutoff_seq\":{d},\"cdc_stream\":\"{s}\",", .{ cutoff_seq, cdc_stream })
+        else
+            "";
         const manifest = try std.fmt.allocPrint(alloc,
-            "{{\"gen\":{d},\"bucket\":\"{s}\",\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
+            "{{\"gen\":{d},\"bucket\":\"{s}\",{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
                 "\"version_column\":\"{s}\"," ++
                 "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"}},\"deltas\":[{s}]}}",
-            .{ gen, bucket, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, deltas_json.items });
+            .{ gen, bucket, seq_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, deltas_json.items });
         _ = try kv.put(key, manifest, .{});
 
         // ── objects and manifest live: NOW the row becomes the producer's memory ──
