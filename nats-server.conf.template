@@ -102,11 +102,8 @@ ALICE_READ = [
   "cdc.users.>"                # public tables, which carry no tenant token
   "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"       # the open tenant: rows that opted into no tenant
-  "init.snap.acme.>"           # her tenant's snapshot chunks and dump metadata
-  "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
   "mutation_ack.alice.>"       # her own write verdicts, keyed by her Nats-Msg-Id
   "$KV.schemas.>"              # schema descriptors
-  "$KV.snapshots.>"            # snapshot descriptors
   "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"                   # JetStream replies — omit this and everything hangs
 ]
@@ -125,11 +122,8 @@ BOB_READ = [
   "cdc.users.>"                # public tables
   "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"       # the open tenant — same subject as alice's, by design
-  "init.snap.globex.>"         # HIS tenant's snapshot chunks and dump metadata
-  "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
   "mutation_ack.bob.>"         # HIS own verdicts — not alice's
   "$KV.schemas.>"
-  "$KV.snapshots.>"
   "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
@@ -142,10 +136,8 @@ JOHN_READ = [
   "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"       # HIS tenant, in the open-mapping sense — same subject as
                                 # alice's and bob's open-tenant reads, by design
-  "init.snap.${OPEN_TENANT}.>" # open-tenant + public-table snapshot data
   "mutation_ack.john.>"        # HIS own verdicts
   "$KV.schemas.>"
-  "$KV.snapshots.>"
   "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
@@ -158,11 +150,8 @@ MARY_READ = [
   "cdc.users.>"
   "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"
-  "init.snap.globex.>"         # this tenant's snapshot chunks and dump metadata
-  "init.snap.${OPEN_TENANT}.>"       # open-tenant + public-table snapshot data
   "mutation_ack.mary.>"        # HER own verdicts — not bob's
   "$KV.schemas.>"
-  "$KV.snapshots.>"
   "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
@@ -175,11 +164,8 @@ NINA_READ = [
   "cdc.users.>"
   "cdc.orders.>"               # public FK-demo table (PROTOCOL.md §4)
   "cdc.${OPEN_TENANT}.>"
-  "init.snap.globex.>"         # this tenant's snapshot chunks and dump metadata
-  "init.snap.${OPEN_TENANT}.>"       # open-tenant + public-table snapshot data
   "mutation_ack.nina.>"        # HER own verdicts — not bob's or mary's
   "$KV.schemas.>"
-  "$KV.snapshots.>"
   "$KV.generations.>"        # generation chain manifests (NOTES.md §1.13)
   "_INBOX.>"
 ]
@@ -204,11 +190,8 @@ authorization {
           # matters for integrity: alice's writes are confined to her own subtree.
           "mutation.alice.>"
 
-          # Read-side requests. `snapshot.request` is captured by the REQUESTS
           # stream, so a client may ask for any table's snapshot — asking is not
           # reading, and the reply lands on init.> which it may already see.
-          "snapshot.request.acme.>"
-          "snapshot.request.${OPEN_TENANT}.>"
 
           # The account-info probe. `jetstreamManager(nc)` issues this before anything
           # else, so omitting it does not fail one feature — it fails the connection,
@@ -218,15 +201,13 @@ authorization {
           "$JS.API.INFO"
 
           # JetStream plumbing, scoped to the streams a client is allowed to read.
-          # `CREATE.INIT` and `CREATE.INIT.>` are both needed: in NATS `INIT.>`
-          # does not match `INIT` itself, and an ephemeral consumer is created on
+          # `CREATE.<STREAM>` and `CREATE.<STREAM>.>` are both needed: in NATS `X.>`
+          # does not match `X` itself, and an ephemeral consumer is created on
           # the bare form.
           #
           # Scoping to named streams is what stops alice creating a consumer on
           # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
           # would hand her exactly that, which is why it is not used here.
-          "$JS.API.CONSUMER.CREATE.INIT_ACME",     "$JS.API.CONSUMER.CREATE.INIT_ACME.>"
-          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           # ⚠️ **The stream name is the read boundary, not the subject.** A JetStream
           # consumer never subscribes to the subject it filters on, so `cdc.acme.>` in the
           # subscribe list below cannot stop a client creating a consumer on a shared stream
@@ -239,10 +220,8 @@ authorization {
           "$JS.API.CONSUMER.CREATE.CDC_ACME",     "$JS.API.CONSUMER.CREATE.CDC_ACME.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
-          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
           # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
-          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
           # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
           # explicitly (nats.zig can; granting NAMES leaks the stream roster).
           "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
@@ -266,12 +245,9 @@ authorization {
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
-          "$JS.API.CONSUMER.INFO.INIT_ACME.>"
-          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_ACME.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
-          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
           # ⚠️ `$JS.API.CONSUMER.DELETE.*` is deliberately absent. The client never
           # deletes a consumer (its ephemerals expire on their inactivity threshold),
@@ -280,27 +256,18 @@ authorization {
           # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
           # and REQUESTS, which no client can reach at all.
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_ACME.>"
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_ACME.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT_ACME"
-          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_ACME"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
-          "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.acme.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
 
           # ⚠️ PROTOCOL.md Step 0: alice may fetch ONLY her own key. Direct Get puts
           # the key in the SUBJECT, which is what makes this scopable at all — unlike
-          # KV_schemas/KV_snapshots above, this bucket is deliberately NOT wholesale
           # (NOTES.md §1.12 part 3: leaking one principal's tenant must not disclose
           # the roster).
           #
@@ -346,11 +313,8 @@ authorization {
           # matters for integrity: bob's writes are confined to her own subtree.
           "mutation.bob.>"
 
-          # Read-side requests. `snapshot.request` is captured by the REQUESTS
           # stream, so a client may ask for any table's snapshot — asking is not
           # reading, and the reply lands on init.> which it may already see.
-          "snapshot.request.globex.>"
-          "snapshot.request.${OPEN_TENANT}.>"
 
           # The account-info probe. `jetstreamManager(nc)` issues this before anything
           # else, so omitting it does not fail one feature — it fails the connection,
@@ -360,15 +324,13 @@ authorization {
           "$JS.API.INFO"
 
           # JetStream plumbing, scoped to the streams a client is allowed to read.
-          # `CREATE.INIT` and `CREATE.INIT.>` are both needed: in NATS `INIT.>`
-          # does not match `INIT` itself, and an ephemeral consumer is created on
+          # `CREATE.<STREAM>` and `CREATE.<STREAM>.>` are both needed: in NATS `X.>`
+          # does not match `X` itself, and an ephemeral consumer is created on
           # the bare form.
           #
           # Scoping to named streams is what stops bob creating a consumer on
           # MUTATIONS and reading everyone else's writes — `$JS.API.CONSUMER.>`
           # would hand her exactly that, which is why it is not used here.
-          "$JS.API.CONSUMER.CREATE.INIT_GLOBEX",     "$JS.API.CONSUMER.CREATE.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           # ⚠️ **The stream name is the read boundary, not the subject.** A JetStream
           # consumer never subscribes to the subject it filters on, so `cdc.acme.>` in the
           # subscribe list below cannot stop a client creating a consumer on a shared stream
@@ -381,10 +343,8 @@ authorization {
           "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
-          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
           # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
-          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
           # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
           # explicitly (nats.zig can; granting NAMES leaks the stream roster).
           "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
@@ -408,12 +368,9 @@ authorization {
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
-          "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
-          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
           # ⚠️ `$JS.API.CONSUMER.DELETE.*` is deliberately absent. The client never
           # deletes a consumer (its ephemerals expire on their inactivity threshold),
@@ -422,22 +379,14 @@ authorization {
           # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
           # and REQUESTS, which no client can reach at all.
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT_GLOBEX"
-          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_GLOBEX"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
-          "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.globex.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
 
           # See alice's block above for why this is the exact key and not a wildcard,
@@ -468,17 +417,13 @@ authorization {
         publish = { allow: [
           "mutation.john.>"
 
-          "snapshot.request.${OPEN_TENANT}.>"
 
           "$JS.API.INFO"
 
-          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
-          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
           # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
-          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
           # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
           # explicitly (nats.zig can; granting NAMES leaks the stream roster).
           "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
@@ -492,22 +437,15 @@ authorization {
           "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
-          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
-          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
-          "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
 
           # Granted even though `$KV.tenants` has no entry for john — without this he
@@ -532,20 +470,14 @@ authorization {
         publish = { allow: [
           "mutation.mary.>"
 
-          "snapshot.request.globex.>"
-          "snapshot.request.${OPEN_TENANT}.>"
 
           "$JS.API.INFO"
 
-          "$JS.API.CONSUMER.CREATE.INIT_GLOBEX",     "$JS.API.CONSUMER.CREATE.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
-          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
           # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
-          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
           # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
           # explicitly (nats.zig can; granting NAMES leaks the stream roster).
           "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
@@ -566,29 +498,18 @@ authorization {
           "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
-          "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
-          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT_GLOBEX"
-          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_GLOBEX"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
-          "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.globex.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
 
           # See alice's block above for why this is the exact key and not a wildcard.
@@ -603,20 +524,14 @@ authorization {
         publish = { allow: [
           "mutation.nina.>"
 
-          "snapshot.request.globex.>"
-          "snapshot.request.${OPEN_TENANT}.>"
 
           "$JS.API.INFO"
 
-          "$JS.API.CONSUMER.CREATE.INIT_GLOBEX",     "$JS.API.CONSUMER.CREATE.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.CREATE.INIT_PUBLIC",     "$JS.API.CONSUMER.CREATE.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
-          "$JS.API.CONSUMER.CREATE.KV_snapshots",   "$JS.API.CONSUMER.CREATE.KV_snapshots.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
           # KV_generations keys are `<tenant>.<table>`, so DIRECT.GET scopes per tenant
-          # exactly like KV_snapshots above. The OBJ_* shape is the objgrants.py-verified
           # list; $JS.API.STREAM.NAMES is deliberately absent — bind the stream
           # explicitly (nats.zig can; granting NAMES leaks the stream roster).
           "$JS.API.CONSUMER.CREATE.KV_generations", "$JS.API.CONSUMER.CREATE.KV_generations.>"
@@ -637,29 +552,18 @@ authorization {
           "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
-          "$JS.API.CONSUMER.INFO.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.INFO.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
-          "$JS.API.CONSUMER.INFO.KV_snapshots.>"
 
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_GLOBEX.>"
-          "$JS.API.CONSUMER.MSG.NEXT.INIT_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.CONSUMER.MSG.NEXT.KV_snapshots.>"
-          "$JS.API.STREAM.INFO.INIT_GLOBEX"
-          "$JS.API.STREAM.INFO.INIT_PUBLIC"
           "$JS.API.STREAM.INFO.CDC_GLOBEX"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
-          "$JS.API.STREAM.INFO.KV_snapshots"
           "$JS.API.STREAM.INFO.KV_tenants"
           "$JS.API.DIRECT.GET.KV_schemas.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.globex.>"
-          "$JS.API.DIRECT.GET.KV_snapshots.$KV.snapshots.${OPEN_TENANT}.>"
           "$JS.API.STREAM.MSG.GET.KV_schemas"
 
           # See alice's block above for why this is the exact key and not a wildcard.

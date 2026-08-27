@@ -330,7 +330,7 @@ pub fn main(init: std.process.Init) !void {
         // the maximum offline window this deployment supports, and until this row existed
         // a client had no way to locate that line — it could only assume the sweeper was
         // keeping up. A client whose oldest queued write predates `watermark` must
-        // re-snapshot instead of flushing, or it resurrects rows deleted while it was away.
+        // re-seed instead of flushing, or it resurrects rows deleted while it was away.
         //
         // ⚠️ Written **after** the deletes, never before. The guarantee is "nothing older
         // than this survives", so publishing first would advertise a line the sweep had

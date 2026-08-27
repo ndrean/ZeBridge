@@ -16,7 +16,6 @@ const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const publication_mod = @import("publication.zig");
-const snapshot_listener = @import("snapshot_listener.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
 const mutation_listener = @import("mutation_listener.zig");
@@ -47,11 +46,8 @@ comptime {
     _ = @import("refused_tables.zig");
     _ = @import("catalog_epoch.zig");
     _ = @import("type_registry.zig");
-    _ = @import("pg_copy_binary.zig");
-    _ = @import("snapshot_listener.zig");
     _ = @import("schema_mapper.zig");
     _ = @import("spsc_queue.zig");
-    _ = @import("streaming_encoder.zig");
     _ = @import("topology.zig");
 }
 
@@ -493,11 +489,6 @@ pub fn main(init: std.process.Init) !void {
     else
         std.heap.c_allocator;
 
-    // Snapshot allocator (used by snapshot_listener for chunk processing)
-    // Debug: Use GPA for leak detection
-    // Release: Use c_allocator for better performance
-    const snap_base_alloc = if (IS_DEBUG) allocator else std.heap.c_allocator;
-
     // Parse command-line arguments and build runtime config.
     // --help prints usage and exits 0; anything unparseable exits non-zero.
     const parsed = args.Args.parseArgs(&init) catch |err| switch (err) {
@@ -527,11 +518,9 @@ pub fn main(init: std.process.Init) !void {
     log.info("Publication name: \x1b[1m {s} \x1b[0m", .{parsed_args.publication_name});
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
-    log.info("Wire format: \x1b[1m msgpack (CDC/snapshot), JSON (schema) \x1b[0m — fixed, not configurable", .{});
-    log.info("Streams: \x1b[1m {s}, {s}, {s}, {s} \x1b[0m (from {s})", .{
+    log.info("Wire format: \x1b[1m msgpack (CDC), JSON (schema) \x1b[0m — fixed, not configurable", .{});
+    log.info("Streams: \x1b[1m {s}, {s} \x1b[0m (from {s})", .{
         runtime_config.topology.stream_cdc,
-        runtime_config.topology.stream_init,
-        runtime_config.topology.stream_requests,
         runtime_config.topology.stream_mutations,
         topology_path,
     });
@@ -727,7 +716,7 @@ pub fn main(init: std.process.Init) !void {
 
     // === Connect to NATS JetStream
     //
-    // Resolved once, here, and passed to the publisher, the snapshot listener and the
+    // Resolved once, here, and passed to the publisher and the
     // mutation listener alike. They used to derive it independently — see
     // `Config.Nats.Endpoint` for the split-brain that produced.
     const nats_endpoint = Config.Nats.Endpoint.resolve(&runtime_config) catch |err| {
@@ -746,28 +735,15 @@ pub fn main(init: std.process.Init) !void {
     // What the server will accept, logged once. The check that acts on it runs below,
     // just before the slab is allocated — this is the observation, that is the decision.
     //
-    // Both CDC's per-event buffer and the snapshot path's per-chunk buffer answer to
-    // the same live fact (this server's advertised max_payload) but scale completely
-    // differently — CDC's is claimed once per ring slot and held for the process's
-    // life, the snapshot's is claimed once, period, per request. Logging what each one
-    // resolves to, from the one number they both actually depend on, is what makes that
-    // coherent rather than two independent guesses an operator has to reconcile by hand.
     if (publisher.js) |*js| {
         if (nats_publisher.serverMaxPayload(js)) |max_payload| {
-            const snapshot_budget: usize = if (max_payload > Config.Nats.payload_envelope_margin_bytes)
-                @intCast(max_payload - Config.Nats.payload_envelope_margin_bytes)
-            else
-                @intCast(max_payload / 2);
-            const snapshot_chunk_bytes = @min(snapshot_budget, Config.Snapshot.encode_buffer_max_bytes);
             log.info(
-                "NATS max_payload: {d} KB (server-advertised) → CDC per-event buffer: {d} KB (BASE_BUF={d}, ceiling {d}) | snapshot per-chunk buffer: {d} KB (ceiling {d})",
+                "NATS max_payload: {d} KB (server-advertised) → CDC per-event buffer: {d} KB (BASE_BUF={d}, ceiling {d})",
                 .{
                     max_payload / 1024,
                     (@as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2)) / 1024,
                     runtime_config.event_data_buffer_log2,
                     runtime_config.event_data_buffer_max_log2,
-                    snapshot_chunk_bytes / 1024,
-                    Config.Snapshot.encode_buffer_max_bytes / 1024,
                 },
             );
         } else {
@@ -779,7 +755,7 @@ pub fn main(init: std.process.Init) !void {
     //
     // Tenants come from the DATA (zebridge_user_tenants) and the public set from the
     // catalogue, so the bridge no longer asks an init container to pre-build what it
-    // can ensure itself: a missing CDC_<TENANT>/INIT_<TENANT> stream is CREATED here
+    // can ensure itself: a missing CDC_<TENANT> stream is CREATED here
     // (modest 1G caps — JetStream reservations count against the server's storage
     // budget, the INIT_TANGO lesson; an operator can raise them), and CDC_PUBLIC's
     // subject filter is reconciled to exactly the catalogue's public tables plus the
@@ -799,8 +775,7 @@ pub fn main(init: std.process.Init) !void {
     // Initialize schema cache for tracking relation_id changes
     log.debug("Schema cache initialized\n", .{});
 
-    // Publish initial schemas to INIT stream (only for monitored tables)
-    // Store monitored tables for validation (used by schema changes and snapshot requests)
+    // Monitored tables (boot schema publish + schema-change validation).
     const monitored_tables = replication_ctx.tables;
 
     // Resolve this instance's column-descriptor ceiling now — after the publication
@@ -813,26 +788,6 @@ pub fn main(init: std.process.Init) !void {
         parsed_args.publication_name,
         runtime_config.max_columns_override,
     );
-
-    // === Start thread: snapshot listener
-    log.info("Starting snapshot listener thread...", .{});
-    var snap_listener = snapshot_listener.SnapshotListener.init(
-        snap_base_alloc,
-        &pg_config,
-        &should_stop,
-        monitored_tables,
-        parsed_args.publication_name,
-        &refused,
-        &runtime_config,
-        io,
-        nats_endpoint,
-        &boot_fatal,
-    );
-    try snap_listener.start();
-    defer snap_listener.join();
-    defer snap_listener.deinit();
-    errdefer should_stop.store(true, .seq_cst);
-    log.info("✅ Snapshot listener thread started\n", .{});
 
     // === Start thread: generation producer (only when GENERATION_RULES is set)
     var generation_rules = try args.Args.parseGenerationRules(allocator, &init);
@@ -955,7 +910,7 @@ pub fn main(init: std.process.Init) !void {
             log.debug("Cannot determine the memory limit; skipping the slab sizing check", .{});
         } else if (slab_bytes * 2 > limit) {
             // Half the limit is the line: the slab is not the only thing resident — libpq
-            // buffers, the NATS client, the snapshot encode buffer and the arenas all sit
+            // buffers, the NATS client and the arenas all sit
             // beside it — and a slab past half leaves no room for the work it exists to do.
             log.err(
                 "🔴 The ring would be {d} MB — {d} MB of data (BASE_BUF={d} → {d} KB × RING_BUFFER_COUNT={d}) plus {d} MB of per-event metadata ({d} B each) plus {d} MB of column descriptors (MAX_COLUMNS={d} × {d} B × RING_BUFFER_COUNT) — against a {d} MB memory limit. It is pre-allocated at startup, so this is an OOM kill under load rather than a slow degradation. Halve RING_BUFFER_COUNT for each step you raise BASE_BUF; see README 'Sizing BASE_BUF and RING_BUFFER_COUNT'.",
@@ -1752,10 +1707,9 @@ fn reconcileCdcStreams(
         var name_buf: [256]u8 = undefined;
         inline for (.{
             .{ topo.cdc_stream_prefix, "{s}.{s}.>", Config.Nats.reconciled_cdc_max_age_days },
-            .{ topo.init_stream_prefix, "{s}.snap.{s}.>", Config.Nats.reconciled_init_max_age_days },
         }) |shape| {
             const prefix = shape[0];
-            // CDC_<tenant> / INIT_<tenant> — the tenant AS-IS, never upper-cased:
+            // CDC_<tenant> — the tenant AS-IS, never upper-cased:
             // the JWT signing key's role template renders CDC_{{tag(tenant)}}
             // literally and nsc lowercases tags, so the stream name must match
             // the tag byte-for-byte.
@@ -1765,10 +1719,7 @@ fn reconcileCdcStreams(
             if (publisher.streamExists(stream_name)) {
                 log.info("✅ tenant '{s}' → stream {s}", .{ tenant, stream_name });
             } else {
-                const prefix_val = if (comptime std.mem.indexOf(u8, shape[1], "snap") != null)
-                    topo.subject_init_prefix
-                else
-                    topo.subject_cdc_prefix;
+                const prefix_val = topo.subject_cdc_prefix;
                 const subj = try std.fmt.allocPrint(allocator, shape[1], .{ prefix_val, tenant });
                 defer allocator.free(subj);
                 var res = try js.addStream(.{
@@ -1823,19 +1774,5 @@ fn reconcileCdcStreams(
         log.info("🆕 created stream {s} with {d} subject(s)", .{ topo.cdc_stream_public, wanted.items.len });
     }
 
-    // ── INIT_PUBLIC: fixed shape, just ensure it exists ─────────────────────────
-    if (!publisher.streamExists(topo.init_stream_public)) {
-        const subj = try std.fmt.allocPrint(allocator, "{s}.snap.{s}.>", .{ topo.subject_init_prefix, topo.open_tenant });
-        defer allocator.free(subj);
-        var res = try js.addStream(.{
-            .name = topo.init_stream_public,
-            .subjects = &.{subj},
-            .max_age = Config.Nats.reconciled_init_max_age_days * day_ns,
-            .max_msgs = Config.Nats.reconciled_stream_max_msgs,
-            .max_bytes = cap_bytes,
-            .compression = .s2,
-        });
-        res.deinit();
-        log.info("🆕 created stream {s} ({s})", .{ topo.init_stream_public, subj });
-    }
+
 }

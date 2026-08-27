@@ -249,7 +249,7 @@ pub const EventProcessor = struct {
         wal_end: u64,
     ) !u32 {
         log.err(
-            "🔴 SUSPENDING '{s}': it has a column whose type the CDC decoder cannot handle (see the preceding line for which). Its events are dropped and its schema withheld until the column is changed to a supported type. Snapshots refuse it for the same reason.",
+            "🔴 SUSPENDING '{s}': it has a column whose type the CDC decoder cannot handle (see the preceding line for which). Its events are dropped and its schema withheld until the column is changed to a supported type. The generation producer skips it for the same reason.",
             .{rel.name},
         );
 
@@ -299,7 +299,7 @@ pub const EventProcessor = struct {
             .{},
         );
         log.err(
-            "    Every other table keeps replicating. This one resumes automatically once the bridge restarts with a buffer that fits, and its clients re-seed from a snapshot.",
+            "    Every other table keeps replicating. This one resumes automatically once the bridge restarts with a buffer that fits, and its clients re-seed from the generation chain.",
             .{},
         );
 
@@ -830,7 +830,7 @@ pub const EventProcessor = struct {
     /// physical and real, and suppressing them would strand rows in every replica.
     /// Best-effort NATS-side prune when a table is DROPPED — the omar-replay
     /// finding (NOTES.md): the schema tombstone tells LIVE clients the table died,
-    /// but the generation chain (manifest + objects), the snapshot descriptor, the
+    /// but the generation chain (manifest + objects), the
     /// INIT chunks and the CDC retention all survive under the reused name, and a
     /// FRESH client seeds ghosts from whichever it hits first. This prunes all four
     /// on the same event that publishes the tombstone.
@@ -857,12 +857,12 @@ pub const EventProcessor = struct {
 
         // One tenant's worth of artifacts. `null` stream names mean "the public
         // pair" (open-tenant rows and untenanted rows both land there).
-        const Step = struct { tenant: []const u8, cdc_stream: ?[]const u8, init_stream: ?[]const u8 };
+        const Step = struct { tenant: []const u8, cdc_stream: ?[]const u8 };
         var steps: std.ArrayList(Step) = .empty;
         defer steps.deinit(arena);
-        steps.append(arena, .{ .tenant = open, .cdc_stream = null, .init_stream = null }) catch return;
+        steps.append(arena, .{ .tenant = open, .cdc_stream = null }) catch return;
         if (tenant_scoped) for (self.topology.tenants) |t| {
-            steps.append(arena, .{ .tenant = t, .cdc_stream = t, .init_stream = t }) catch continue;
+            steps.append(arena, .{ .tenant = t, .cdc_stream = t }) catch continue;
         };
 
         for (steps.items) |step| {
@@ -895,31 +895,6 @@ pub const EventProcessor = struct {
                 }
             }
 
-            // ── INIT chunks and the dump's side subjects ─────────────────────
-            // Five shapes, because only the DATA chunks carry the table right
-            // after the tenant (`init.snap.<t>.<tbl>.<id>.<n>`) — start, error,
-            // meta and schema put a keyword first (`init.snap.<t>.meta.<tbl>` …),
-            // so one filter cannot cover them all (measured: the first prune left
-            // meta/start/error/schema rows behind).
-            {
-                const stream = if (step.init_stream) |t| blk: {
-                    const prefix = self.topology.init_stream_prefix;
-                    // tenant AS-IS: stream names match the JWT tag (lowercase).
-                    @memcpy(name_buf[0..prefix.len], prefix);
-                    @memcpy(name_buf[prefix.len..][0..t.len], t);
-                    break :blk name_buf[0 .. prefix.len + t.len];
-                } else self.topology.init_stream_public;
-                const shapes = [_][]const u8{ "{s}.snap.{s}.{s}.>", "{s}.snap.{s}.start.{s}", "{s}.snap.{s}.error.{s}", "{s}.snap.{s}.meta.{s}", "{s}.snap.{s}.schema.{s}.>" };
-                inline for (shapes) |shape| {
-                    const filt = std.fmt.allocPrint(arena, shape, .{ self.topology.subject_init_prefix, step.tenant, table }) catch return;
-                    if (js.purgeStream(stream, .{ .filter = filt })) |res| {
-                        var r = res;
-                        r.deinit();
-                        purges += 1;
-                    } else |err| log.warn("🧹 prune '{s}': INIT purge on {s} failed: {s}", .{ table, stream, @errorName(err) });
-                }
-            }
-
             const key = std.fmt.allocPrint(arena, "{s}.{s}", .{ step.tenant, table }) catch return;
 
             // ── chain objects, manifest-driven, THEN the manifest ────────────
@@ -938,14 +913,6 @@ pub const EventProcessor = struct {
                 } else |err| log.warn("🧹 prune '{s}': generations purge of {s} failed: {s}", .{ table, key, @errorName(err) });
             } else |err| log.warn("🧹 prune '{s}': generations bucket unreachable: {s}", .{ table, @errorName(err) });
 
-            // ── snapshot descriptor ──────────────────────────────────────────
-            if (js.kvBucket(self.topology.kv_snapshots)) |kv_const| {
-                var kv = kv_const;
-                defer kv.deinit();
-                if (kv.purge(key, .{})) |_| {
-                    keys += 1;
-                } else |err| log.warn("🧹 prune '{s}': snapshots purge of {s} failed: {s}", .{ table, key, @errorName(err) });
-            } else |err| log.warn("🧹 prune '{s}': snapshots bucket unreachable: {s}", .{ table, @errorName(err) });
         }
 
         log.info("🧹 drop prune for '{s}': {d} stream purge(s), {d} chain object(s), {d} KV key(s)", .{ table, purges, objects, keys });

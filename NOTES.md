@@ -4618,6 +4618,56 @@ pg_copy_binary.zig, the INIT_* publish path, SNAP_RET_SECONDS and friends) is
 now unreferenced by the suite and can come out; .env/.conf cleanup rides with
 that removal.
 
+## 10p. Snapshot-on-demand is DELETED, and finding 10 (2026-08-27)
+
+The cleanup §10o cleared the way for. Removed in one pass, verified live:
+
+**Bridge**: `snapshot_listener.zig`, `pg_copy_binary.zig`, `streaming_encoder.zig`
+(used only by those two) deleted; the listener thread, its allocator, the
+snapshot half of the max_payload budget log, and `Config.Snapshot` excised;
+`reconcileCdcStreams` now creates only `CDC_<TENANT>` (the whole INIT family is
+gone — with `init.schema` already retired, INIT carried nothing but snapshot
+chunks). Boot log now reads `Streams: CDC, MUTATIONS`.
+
+**Topology/grammar**: `streams.init`, `streams.requests`, `init_streams`, every
+`snapshot_*` subject, `subjects.init_prefix`, and `kv.snapshots` are out of
+grammar.json and topology.zig alike. ⚠️ Two regressions the cleanup itself
+caused, both caught before commit: the line-filter swallowed the
+`t.subject_cdc_prefix` parse assignment (undefined memory — unit test segfault,
+then a live `integer overflow` panic in reconcile from a stale binary), and it
+corrupted the parse test's embedded JSON. Lesson repeated: after a mechanical
+line-filter, run BOTH `zig build` and `zig build test`, and reinstall the exe
+before restarting anything.
+
+**NATS**: REQUESTS stream, KV_snapshots, and every INIT_* stream deleted from
+the live server; nats-init (compose + up.sh), both server confs (218 grant
+lines), and jwt-bootstrap.sh no longer create or grant any of it.
+`SNAP_RET_SECONDS` is gone from .env.admin.
+
+**Client**: the gated legacy path is deleted, not gated — waitForDescriptor,
+descriptorStillFresh, replaySnapshot, initStream, the request/retry loop, and
+the LEGACY_SNAPSHOT_SEEDING switch itself. Phase name 'snapshot' kept (UI
+compat); it means "seeded".
+
+**Finding 10 (client, fixed here — found by the post-cleanup verification).**
+The seed gate's lsn fallback compared `ev.lsn < state.lsn`, but `state.lsn` is
+advanced by every SCHEMA event — and a bridge restart republishes schemas at
+the WAL head. So the composition restart x reconnect dropped every event the
+new bridge replayed (older lsn than the fresh schema): measured — two rows
+consumed and position-accounted, absent from the tables, unrecoverable without
+a re-seed since the position had moved past them. Fix: a dedicated
+`state.seedLsn`, set ONLY by applyGenerations at the manifest cutoff; schema
+lsns never gate data. RED->GREEN: the same composition (pair inserted offline,
+bridge restarted, client reconnected) now applies the replayed events — the
+salary FK-held and resolved when its parent arrived. The pre-fix casualties
+were healed by dropping the two tables' watermarks: scoped seeding re-pulled
+chains g7/g9 and the replica ended identical to PG.
+
+Residual: `zb-client-ts` still tolerates manifests without `cutoff_seq` via the
+seedLsn fallback; the producer always ships cutoff_seq, so that fallback can go
+once no pre-cutoff_seq chain can exist. Docs (README/PROTOCOL/SECURITY) rewrite
+follows in its own commit.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

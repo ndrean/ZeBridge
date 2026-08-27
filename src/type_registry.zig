@@ -41,7 +41,7 @@ pub const Verdict = enum {
 /// Deliberately unsynchronised, because every access is on one thread: `publishBootSchemas`
 /// populates it on the main thread *before* replication starts, and after that both the
 /// writer (`packDdlToSlot`) and the reader (`packMutationToSlot` → `decodeTuple`) are the
-/// WAL thread. The snapshot path does not consult it at all — it has the catalog open
+/// WAL thread.
 /// inside its own transaction and reads `typtype` from there directly.
 ///
 /// If a second thread ever needs to read this, it cannot simply take a lock: 0.16's

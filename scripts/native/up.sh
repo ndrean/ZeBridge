@@ -94,39 +94,22 @@ if [ "$FRESH_NATS" = "1" ]; then
   SEED="$ROOT/scripts/native/seed.txt"
 
   CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' "$ROOT/grammar.json")
-  INIT_STREAM=$(jq -r '.streams.init' "$ROOT/grammar.json")
-  INIT_PREFIX=$(jq -r '.subjects.init_prefix' "$ROOT/grammar.json")
-  REQUESTS_STREAM=$(jq -r '.streams.requests' "$ROOT/grammar.json")
-  REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' "$ROOT/grammar.json")
   MUTATIONS_STREAM=$(jq -r '.streams.mutations' "$ROOT/grammar.json")
   MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' "$ROOT/grammar.json")
   MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' "$ROOT/grammar.json")
   MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' "$ROOT/grammar.json")
   SCHEMA_KV=$(jq -r '.kv.schemas' "$ROOT/grammar.json")
-  SNAPSHOT_KV=$(jq -r '.kv.snapshots' "$ROOT/grammar.json")
   TENANTS_KV=$(jq -r '.kv.tenants' "$ROOT/grammar.json")
   GENERATIONS_KV=$(jq -r '.generations.kv' "$ROOT/grammar.json")
-  # CDC-family streams outlive INIT by a day on purpose: snapshot generation isn't
-  # instant (queued behind other tables, no timeout), so CDC events for writes right
-  # after a snapshot's LSN must not age out before the snapshot itself does — see
-  # README's "The NATS streams and buckets" for the full reasoning.
-  SNAP_RET="${SNAP_RET_SECONDS:-603000}"
-
-  # CDC_<TENANT>, CDC_PUBLIC, INIT_<TENANT> and INIT_PUBLIC are no longer created
-  # here: the BRIDGE reconciles them at boot — tenants from zebridge_user_tenants,
-  # the public subject set from zebridge_catalogue. The catalogue is the config.
-
-  nats --server "$NATS_URL" --nkey "$SEED" stream add "$REQUESTS_STREAM" \
-    --subjects="$REQUESTS_PREFIX.>" --storage=file --retention=limits \
-    --max-msgs-per-subject=1 --discard=new --discard-per-subject \
-    --max-age="${SNAP_RET}s" --replicas=1 --defaults >/dev/null
+  # CDC_<TENANT> and CDC_PUBLIC are no longer created here: the BRIDGE reconciles
+  # them at boot — tenants from zebridge_user_tenants, the public subject set from
+  # zebridge_catalogue. The catalogue is the config.
 
   nats --server "$NATS_URL" --nkey "$SEED" stream add "$MUTATIONS_STREAM" \
     --subjects="$MUTATIONS_PREFIX.>,$MUTATION_ERROR_PREFIX.>,$MUTATION_ACK_PREFIX.>" \
     --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults >/dev/null
 
   nats --server "$NATS_URL" --nkey "$SEED" kv add "$SCHEMA_KV" --history=10 --replicas=1 >/dev/null
-  nats --server "$NATS_URL" --nkey "$SEED" kv add "$SNAPSHOT_KV" --history=1 --replicas=1 >/dev/null
   # PROTOCOL.md "The Connection Flow" §Step 0. Not yet fed by a PG trigger — seed by
   # hand to test the NATS side alone:
   #   nats --server "$NATS_URL" --nkey "$SEED" kv put "$TENANTS_KV" alice acme

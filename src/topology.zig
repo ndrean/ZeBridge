@@ -39,7 +39,6 @@ pub const Error = error{
 pub const Diagnostic = struct {
     /// e.g. `subjects`, or the pattern being rendered.
     context: []const u8 = "",
-    /// e.g. `snapshot_data_pattern`, or the offending placeholder.
     detail: []const u8 = "",
 
     fn set(self: ?*Diagnostic, context: []const u8, detail: []const u8) void {
@@ -52,9 +51,7 @@ pub const Diagnostic = struct {
 pub const Topology = struct {
     // ─── streams ────────────────────────────────────────────────────────────────
     stream_cdc: []const u8,
-    stream_init: []const u8,
     stream_mutations: []const u8,
-    stream_requests: []const u8,
 
     // ─── per-tenant CDC streams (empty when the deployment is not tenant-routed) ──
     //
@@ -82,12 +79,9 @@ pub const Topology = struct {
     // client with consumer-creation rights on it choose a different tenant's
     // `filter_subject` and read those chunks — the exact leak `crosstenant.py` proved
     // for CDC before that split (NOTES.md §1.12).
-    init_stream_prefix: []const u8,
-    init_stream_public: []const u8,
 
     // ─── subject prefixes ───────────────────────────────────────────────────────
     subject_cdc_prefix: []const u8,
-    subject_init_prefix: []const u8,
     subject_mutations_prefix: []const u8,
 
     // ─── ingress ────────────────────────────────────────────────────────────────
@@ -103,28 +97,12 @@ pub const Topology = struct {
     mutation_ack_prefix: []const u8,
     mutation_ack_pattern: []const u8,
 
-    // ─── requests ───────────────────────────────────────────────────────────────
-    snapshot_request: []const u8,
-    /// `snapshot.request.{[tenant]s}.{[table]s}` — tenant-keyed, not principal-keyed:
-    /// a dump is shared by every principal in a tenant, and principal-keying would
-    /// make a fleet restart spawn one serialized snapshot per principal per table
-    /// (NOTES.md §1.12 part 2).
-    snapshot_request_pattern: []const u8,
-
-    // ─── snapshot subjects ──────────────────────────────────────────────────────
-    snapshot_data_pattern: []const u8,
-    snapshot_start_pattern: []const u8,
-    snapshot_error_pattern: []const u8,
-    snapshot_meta_pattern: []const u8,
-    snapshot_schema_pattern: []const u8,
-
     // ─── KV buckets ─────────────────────────────────────────────────────────────
     kv_schemas: []const u8,
-    kv_snapshots: []const u8,
     kv_tenants: []const u8,
 
     /// The tenant token tenant-agnostic tables live under (`"_default"` unless
-    /// grammar.json says otherwise) — snapshot descriptors, generation manifests.
+    /// grammar.json says otherwise) — generation manifests.
     open_tenant: []const u8,
 
     // ─── generations (NOTES.md §1.13) ───────────────────────────────────────────
@@ -149,13 +127,10 @@ pub const Topology = struct {
     /// subjects above, and for the same reason: keyed by table alone, a second
     /// requester's descriptor would overwrite the first's across tenants (NOTES.md
     /// §1.12 part 2).
-    kv_snapshots_subject_pattern: []const u8,
     /// `$KV.tenants.{[principal]s}` — PROTOCOL.md "The Connection Flow", Step 0.
     kv_tenants_subject_pattern: []const u8,
     /// `snapshot.request.` — a request's subject minus the table.
-    request_subject_prefix: []const u8,
     /// `snapshot.request.>` — what the snapshot consumer filters on.
-    request_subject_wildcard: []const u8,
 
     /// Whether `cdc.<table>.<op>` (untenanted) or `cdc.<tenant>.<table>.<op>` (any
     /// tenant) has *some* stream willing to accept it — not whether the table replicates
@@ -187,42 +162,26 @@ pub const Topology = struct {
     /// exists to prevent.
     pub const for_tests = Topology{
         .stream_cdc = "CDC",
-        .stream_init = "INIT",
         .stream_mutations = "MUTATIONS",
-        .stream_requests = "REQUESTS",
         .tenants = &.{},
         .public_tables = &.{},
         .cdc_stream_prefix = "CDC_",
         .cdc_stream_public = "CDC_PUBLIC",
-        .init_stream_prefix = "INIT_",
-        .init_stream_public = "INIT_PUBLIC",
         .subject_cdc_prefix = "cdc",
-        .subject_init_prefix = "init",
         .subject_mutations_prefix = "mutation",
         .mutation_pattern = "mutation.{[principal]s}.{[table]s}.{[operation]s}",
         .mutation_error_prefix = "mutation_error",
         .mutation_error_pattern = "mutation_error.{[table]s}",
         .mutation_ack_prefix = "mutation_ack",
         .mutation_ack_pattern = "mutation_ack.{[principal]s}.{[msg_id]s}",
-        .snapshot_request = "snapshot.request",
-        .snapshot_request_pattern = "snapshot.request.{[tenant]s}.{[table]s}",
-        .snapshot_data_pattern = "init.snap.{[tenant]s}.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
-        .snapshot_start_pattern = "init.snap.{[tenant]s}.start.{[table]s}",
-        .snapshot_error_pattern = "init.snap.{[tenant]s}.error.{[table]s}",
-        .snapshot_meta_pattern = "init.snap.{[tenant]s}.meta.{[table]s}",
-        .snapshot_schema_pattern = "init.snap.{[tenant]s}.schema.{[table]s}.{[snapshot_id]s}",
         .kv_schemas = "schemas",
-        .kv_snapshots = "snapshots",
         .kv_tenants = "tenants",
         .open_tenant = "_default",
         .kv_generations = "generations",
         .generation_bucket_prefix = "gen-",
         .mutations_subject_wildcard = "mutation.>",
         .kv_schemas_subject_pattern = "$KV.schemas.{[table]s}",
-        .kv_snapshots_subject_pattern = "$KV.snapshots.{[tenant]s}.{[table]s}",
         .kv_tenants_subject_pattern = "$KV.tenants.{[principal]s}",
-        .request_subject_prefix = "snapshot.request.",
-        .request_subject_wildcard = "snapshot.request.>",
     };
 };
 
@@ -284,9 +243,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     var t: Topology = undefined;
 
     t.stream_cdc = try str(a, streams, "streams", "cdc", diag);
-    t.stream_init = try str(a, streams, "streams", "init", diag);
     t.stream_mutations = try str(a, streams, "streams", "mutations", diag);
-    t.stream_requests = try str(a, streams, "streams", "requests", diag);
 
     // Optional: a deployment with no `tenants` is not tenant-routed, and that is a valid
     // shape (the single wide CDC stream). Absent means an empty list, never an error.
@@ -315,28 +272,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     }
 
     // Same optionality as cdc_streams, same reasoning: absent means not tenant-routed.
-    if (root.get("init_streams")) |is| switch (is) {
-        .object => |o| {
-            t.init_stream_prefix = if (o.get("tenant_prefix")) |v| (switch (v) {
-                .string => |x| try a.dupe(u8, x),
-                else => "INIT_",
-            }) else "INIT_";
-            t.init_stream_public = if (o.get("public")) |v| (switch (v) {
-                .string => |x| try a.dupe(u8, x),
-                else => "INIT_PUBLIC",
-            }) else "INIT_PUBLIC";
-        },
-        else => {
-            t.init_stream_prefix = "INIT_";
-            t.init_stream_public = "INIT_PUBLIC";
-        },
-    } else {
-        t.init_stream_prefix = "INIT_";
-        t.init_stream_public = "INIT_PUBLIC";
-    }
-
     t.subject_cdc_prefix = try str(a, subjects, "subjects", "cdc_prefix", diag);
-    t.subject_init_prefix = try str(a, subjects, "subjects", "init_prefix", diag);
     t.subject_mutations_prefix = try str(a, subjects, "subjects", "mutations_prefix", diag);
 
     t.mutation_pattern = try str(a, subjects, "subjects", "mutation_pattern", diag);
@@ -345,17 +281,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.mutation_ack_prefix = try str(a, subjects, "subjects", "mutation_ack_prefix", diag);
     t.mutation_ack_pattern = try str(a, subjects, "subjects", "mutation_ack_pattern", diag);
 
-    t.snapshot_request = try str(a, subjects, "subjects", "snapshot_request", diag);
-    t.snapshot_request_pattern = try str(a, subjects, "subjects", "snapshot_request_pattern", diag);
 
-    t.snapshot_data_pattern = try str(a, subjects, "subjects", "snapshot_data_pattern", diag);
-    t.snapshot_start_pattern = try str(a, subjects, "subjects", "snapshot_start_pattern", diag);
-    t.snapshot_error_pattern = try str(a, subjects, "subjects", "snapshot_error_pattern", diag);
-    t.snapshot_meta_pattern = try str(a, subjects, "subjects", "snapshot_meta_pattern", diag);
-    t.snapshot_schema_pattern = try str(a, subjects, "subjects", "snapshot_schema_pattern", diag);
 
     t.kv_schemas = try str(a, kv, "kv", "schemas", diag);
-    t.kv_snapshots = try str(a, kv, "kv", "snapshots", diag);
     t.kv_tenants = try str(a, kv, "kv", "tenants", diag);
 
     t.open_tenant = if (root.get("open_tenant")) |v| (switch (v) {
@@ -389,10 +317,7 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     // mapping for a bucket, not a name anyone is free to choose.
     t.mutations_subject_wildcard = try std.fmt.allocPrint(a, "{s}.>", .{t.subject_mutations_prefix});
     t.kv_schemas_subject_pattern = try std.fmt.allocPrint(a, "$KV.{s}.{{[table]s}}", .{t.kv_schemas});
-    t.kv_snapshots_subject_pattern = try std.fmt.allocPrint(a, "$KV.{s}.{{[tenant]s}}.{{[table]s}}", .{t.kv_snapshots});
     t.kv_tenants_subject_pattern = try std.fmt.allocPrint(a, "$KV.{s}.{{[principal]s}}", .{t.kv_tenants});
-    t.request_subject_prefix = try std.fmt.allocPrint(a, "{s}.", .{t.snapshot_request});
-    t.request_subject_wildcard = try std.fmt.allocPrint(a, "{s}.>", .{t.snapshot_request});
 
     return .{ .arena = arena, .topology = t };
 }
@@ -615,18 +540,14 @@ test "render: malformed patterns are rejected rather than half-substituted" {
 test "parse: reads every name and derives the composites" {
     const json =
         \\{
-        \\  "streams": {"cdc":"C","init":"I","mutations":"M","requests":"R"},
+        \\  "streams": {"cdc":"C","mutations":"M"},
         \\  "subjects": {
-        \\    "cdc_prefix":"cdc","init_prefix":"init","mutations_prefix":"mut",
+        \\    "cdc_prefix":"cdc","mutations_prefix":"mut",
         \\    "mutation_pattern":"mut.{[principal]s}.{[table]s}.{[operation]s}",
         \\    "mutation_error_prefix":"mut_err","mutation_error_pattern":"mut_err.{[table]s}",
-        \\    "mutation_ack_prefix":"mut_ack","mutation_ack_pattern":"mut_ack.{[principal]s}.{[msg_id]s}",
-        \\    "snapshot_request":"snap.req","snapshot_request_pattern":"snap.req.{[tenant]s}.{[table]s}",
-        \\    "snapshot_data_pattern":"d","snapshot_start_pattern":"s",
-        \\    "snapshot_error_pattern":"e","snapshot_meta_pattern":"m",
-        \\    "snapshot_schema_pattern":"sc"
+        \\    "mutation_ack_prefix":"mut_ack","mutation_ack_pattern":"mut_ack.{[principal]s}.{[msg_id]s}"
         \\  },
-        \\  "kv": {"schemas":"sch","snapshots":"snp","tenants":"ten"}
+        \\  "kv": {"schemas":"sch","tenants":"ten"}
         \\}
     ;
     var owned = try parse(testing.allocator, json, null);
@@ -638,17 +559,14 @@ test "parse: reads every name and derives the composites" {
 
     // Derived from the parsed values, not from literals.
     try testing.expectEqualStrings("mut.>", t.mutations_subject_wildcard);
-    try testing.expectEqualStrings("snap.req.", t.request_subject_prefix);
-    try testing.expectEqualStrings("snap.req.>", t.request_subject_wildcard);
     try testing.expectEqualStrings("$KV.sch.{[table]s}", t.kv_schemas_subject_pattern);
-    try testing.expectEqualStrings("$KV.snp.{[tenant]s}.{[table]s}", t.kv_snapshots_subject_pattern);
     try testing.expectEqualStrings("$KV.ten.{[principal]s}", t.kv_tenants_subject_pattern);
 }
 
 test "parse: a missing key fails at load, naming it" {
     // This is the guarantee the compile-time version had. It moved; it did not go.
     const json =
-        \\{"streams": {"cdc":"C","init":"I","mutations":"M"},
+        \\{"streams": {"cdc":"C"},
         \\ "subjects": {}, "kv": {}}
     ;
     try testing.expectError(Error.MissingKey, parse(testing.allocator, json, null));
@@ -660,7 +578,7 @@ test "parse: a missing section fails at load" {
 
 test "parse: a non-string name is rejected" {
     const json =
-        \\{"streams": {"cdc":42,"init":"I","mutations":"M","requests":"R"},
+        \\{"streams": {"cdc":42,"mutations":"M"},
         \\ "subjects": {}, "kv": {}}
     ;
     try testing.expectError(Error.NotAString, parse(testing.allocator, json, null));

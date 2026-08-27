@@ -51,7 +51,6 @@ def main():
     if TENANT in zb.tenants():
         sys.exit(f"'{TENANT}' is already mapped in zebridge_user_tenants — the whole point is that it is not")
     cdc_stream = topo["cdc_streams"]["tenant_prefix"] + TENANT
-    init_stream = topo["init_streams"]["tenant_prefix"] + TENANT
     cdc_prefix = topo["subjects"]["cdc_prefix"]
 
     if stream_exists(cdc_stream):
@@ -60,13 +59,12 @@ def main():
     uid = __import__("uuid").uuid4()
     try:
         # ── 1. runtime stream provisioning (the backend's half of the contract) ──
-        for name, subj in ((cdc_stream, f"{cdc_prefix}.{TENANT}.>"),
-                           (init_stream, f"{topo['subjects']['init_prefix']}.snap.{TENANT}.>")):
+        for name, subj in ((cdc_stream, f"{cdc_prefix}.{TENANT}.>"),):
             r = zb.nats_cli("stream", "add", name, f"--subjects={subj}", "--storage=file",
                             "--retention=limits", "--max-age=8d", "--replicas=1", "--defaults")
             if r.returncode != 0:
                 sys.exit(f"could not create {name}: {r.stderr.strip()}")
-        zb.ok(f"streams {cdc_stream}/{init_stream} provisioned at runtime (bridge untouched)")
+        zb.ok(f"stream {cdc_stream} provisioned at runtime (bridge untouched)")
 
         # ── 2. the mapping propagates live to $KV.tenants ────────────────────────
         zb.psql(f"INSERT INTO public.zebridge_user_tenants (principal, tenant_id) "
@@ -113,8 +111,7 @@ def main():
         zb.psql(f"DELETE FROM public.test_types WHERE uid='{uid}'", quiet=True)
         zb.psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal='{PRINCIPAL}'", quiet=True)
         time.sleep(1.5)  # let the delete's own events publish before the stream goes
-        for name in (cdc_stream, init_stream):
-            zb.nats_cli("stream", "rm", name, "-f")
+        zb.nats_cli("stream", "rm", cdc_stream, "-f")
 
     return 1 if failed else 0
 

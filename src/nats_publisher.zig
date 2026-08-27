@@ -328,8 +328,8 @@ pub const Publisher = struct {
     ///
     /// ⚠️ Replaces a `getStreamInfo` that returned a hand-built JSON blob and referenced
     /// `nats.JS.StreamInfoRequest`, a type that does not exist — it was dead code Zig never
-    /// analysed because nothing called it. The library's own `js.getStreamInfo` (used in
-    /// snapshot_listener.zig and below) is the real API; this wraps it for a bool.
+    /// analysed because nothing called it. The library's own `js.getStreamInfo` is the
+    /// real API; this wraps it for a bool.
     pub fn streamExists(self: *Publisher, stream_name: []const u8) bool {
         if (self.js) |*js| {
             var res = js.getStreamInfo(stream_name) catch return false;
@@ -386,8 +386,8 @@ pub const Publisher = struct {
 ///
 /// `max_payload` as this connection's server advertised it, or null if unknown.
 ///
-/// Load-bearing rather than informational: `BASE_BUF` must stay under it, and the snapshot
-/// chunker sizes every COPY against it. A message over the limit is not rejected with an
+/// Load-bearing rather than informational: `BASE_BUF` must stay under it.
+/// A message over the limit is not rejected with an
 /// error — the server closes the connection, and every retry re-sends the same bytes.
 pub fn serverMaxPayload(js: *nats.JetStream) ?u64 {
     const mp = js.nc.server_info.max_payload;

@@ -61,8 +61,15 @@ export type TableState = {
   /// LOWER lsn), so gating on lsn silently dropped in-flight transactions.
   seedSeq?: number;
   seedStream?: string;
+  /// FINDING 10: the lsn fallback gate must compare against a lsn that a SEED set —
+  /// never `state.lsn`, which the boot schema-republish advances to the WAL head, so
+  /// after any bridge restart every replayed data event carried an older lsn and was
+  /// dropped as "already seeded" (measured: two rows consumed, accounted, and absent).
+  seedLsn?: number;
 };
 
+/// 'snapshot' means "seeded" — the name predates the retirement of
+/// snapshot-on-demand and is kept for UI compatibility.
 export type Phase = 'connected' | 'migrated' | 'snapshot' | 'cdc';
 export type ConnStatus = 'connected' | 'disconnected' | 'connecting';
 
@@ -73,22 +80,10 @@ interface BucketEntry {
   delta: number;
 }
 
-/// How long to wait for a snapshot descriptor before re-requesting. Must exceed a
-/// realistic snapshot for the largest table, and stay well below the REQUESTS stream's
-/// max_age (retrying at the last moment is the same as not retrying).
-const SNAPSHOT_WAIT_MS = 60_000;
-const SNAPSHOT_REQUEST_ATTEMPTS = 5;
-
-/// ⚠️ RETIRED 2026-08-27 — snapshot-on-demand seeding (NOTES §10g/§10h; README
-/// roadmap "Retire the snapshot path"). Seeding is cron-based generations now:
-/// the producer queries PG on GENERATION_CADENCE_SECONDS and pushes chains to
-/// object storage; a client pulls the chain and never asks PG-adjacent machinery
-/// for a bespoke dump. The legacy path is GATED, not erased, because it earned
-/// three findings in one day — a stale descriptor that DELETEd 5,000 correct rows,
-/// the SNAP_RET throttle deadlocking an orphaned table for its whole 7-day window,
-/// and 5x60s of head-of-line blocking — and the code is the documentation of them.
-/// Flip to true only to study that behaviour; never in production.
-const LEGACY_SNAPSHOT_SEEDING: boolean = false;
+/// Snapshot-on-demand seeding is DELETED (2026-08-27, NOTES §10p) — generations
+/// are the only seed path. Its three findings (a stale descriptor that DELETEd
+/// 5,000 correct rows, the SNAP_RET throttle deadlock, head-of-line blocking)
+/// live in NOTES §10g/§10h.
 /// How long a client waits for the producer to publish a usable chain before
 /// declaring the table unseedable. Covers a fresh table between two cadence ticks;
 /// a table still chainless after this fails LOUDLY and seeds on the next connect.
@@ -130,42 +125,6 @@ async function watchBucket(
     }
   })();
   return { pending: ci.num_pending ?? 0, entries, stop: () => { try { iter.stop(); } catch { /* closed */ } } };
-}
-
-/// Wait for one KV value (snapshot descriptor), or null on timeout — "not yet" is an
-/// ordinary outcome here, not an exception. The watch is always torn down.
-/// `rejectId` is the descriptor this caller has ALREADY refused.
-///
-/// ⚠️ Without it this function hands back the very descriptor the caller just
-/// rejected. A KV watch replays the current value first, so the sequence
-/// "judge the cached descriptor orphaned -> request a fresh one -> wait for a
-/// descriptor" resolves instantly with the SAME stale one — and replaying it
-/// starts with DELETE FROM. Measured: a table holding 5,000 correct rows was
-/// emptied that way (NOTES §10g). Skipping the rejected snapshot_id is what makes
-/// "requesting a fresh one instead" mean it.
-async function waitForDescriptor(js: any, bucket: string, key: string, timeoutMs: number, rejectId?: string): Promise<any | null> {
-  let watch: Awaited<ReturnType<typeof watchBucket>> | null = null;
-  try {
-    watch = await watchBucket(js, bucket, key);
-    return await Promise.race([
-      (async () => {
-        for await (const entry of watch.entries) {
-          if (entry.operation === 'DEL' || entry.operation === 'PURGE') continue;
-          let d: any;
-          try { d = decode(entry.value); } catch { d = JSON.parse(new TextDecoder().decode(entry.value)); }
-          // Keep waiting: this is the one we already refused.
-          if (rejectId && d?.snapshot_id === rejectId) continue;
-          return d;
-        }
-        return null;
-      })(),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs)),
-    ]);
-  } catch {
-    return null;
-  } finally {
-    watch?.stop();
-  }
 }
 
 /// PG text-mode timestamptz (UTC — the producer pins its snapshot txn there) → the CDC
@@ -1208,7 +1167,7 @@ export class ZeBridge {
         // Events from OTHER streams and optimistic locals carry no matching
         // seq/stream and pass untouched.
         if (ev.stream === state.seedStream && typeof ev.seq === 'number' && ev.seq <= state.seedSeq) return;
-      } else if (ev.lsn < state.lsn) {
+      } else if (typeof state.seedLsn === 'number' && ev.lsn < state.seedLsn) {
         // Legacy manifest without cutoff_seq (an older bridge): the lsn gate, with
         // its known in-flight blind spot, is still better than no gate at all.
         return;
@@ -1346,14 +1305,6 @@ export class ZeBridge {
     const state = this.syncedTables.get(table);
     if (state?.tenantColumn) return this.tenantValue;
     return this.config.grammar.open_tenant || this.tenantValue;
-  }
-
-  private initStream(tenant: string): string {
-    const cfg = this.config.grammar.init_streams;
-    if (!cfg) return this.config.grammar.streams.init;
-    const open = this.config.grammar.open_tenant || '_default';
-    if (!tenant || tenant === open) return cfg.public;
-    return `${cfg.tenant_prefix}${tenant}`;
   }
 
   private async resolveTenant() {
@@ -1499,6 +1450,7 @@ export class ZeBridge {
     }
 
     state.lsn = lsnToNumber(manifest.cutoff_lsn);
+    state.seedLsn = state.lsn; // the ONE place the legacy data gate may anchor to (finding 10)
     if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
       state.seedSeq = manifest.cutoff_seq;
       state.seedStream = manifest.cdc_stream;
@@ -1512,39 +1464,6 @@ export class ZeBridge {
     this.scheduleRecount();
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
     return true;
-  }
-
-  /// Is a cached snapshot descriptor still safe to trust, or has the CDC stream aged
-  /// past its watermark (orphaned descriptor — the failure `descriptorStillFresh` was
-  /// built for)? Unverifiable cases resolve to "fresh" — a lookup failure must not
-  /// force every table to re-snapshot.
-  private async descriptorStillFresh(js: any, tenant: string, desc: any): Promise<boolean> {
-    if (desc?.lsn == null) return true;
-    const streamName = this.cdcStreamForTenant(tenant);
-    try {
-      const jsm = await js.jetstreamManager();
-      const info = await jsm.streams.info(streamName);
-      if (info.state.messages === 0) return false;
-      if (info.state.first_seq <= 1) return true;
-      const ci = await jsm.consumers.add(streamName, {
-        deliver_policy: DeliverPolicy.StartSequence,
-        opt_start_seq: info.state.first_seq,
-      });
-      const consumer = await js.consumers.get(streamName, ci.name);
-      const batch = await consumer.fetch({ max_messages: 1, expires: 3000 });
-      let oldestLsn: number | null = null;
-      for await (const m of batch) {
-        try {
-          const decoded = decode(m.data);
-          const ev = Array.isArray(decoded) ? decoded[0] : decoded;
-          oldestLsn = ev?.lsn ?? null;
-        } catch { /* undecodable — treat as unknown */ }
-      }
-      if (oldestLsn == null) return true;
-      return oldestLsn <= desc.lsn;
-    } catch {
-      return true;
-    }
   }
 
   // ── the main orchestration: gap check → seed → CDC ────────────────────────
@@ -1597,14 +1516,6 @@ export class ZeBridge {
           `Seeding ${tablesToSeed.size} table(s) [${[...tablesToSeed].join(', ')}]` +
           `${untouched > 0 ? `; ${untouched} table(s) resume untouched` : ''}`, 'WARNING');
 
-        let snapKv: any;
-        try {
-          const kvm = new Kvm(this.nc!);
-          // Per-tenant grant covers ONLY the exact-key Direct Get path (see history).
-          snapKv = await kvm.open(this.config.grammar.kv.snapshots, { allow_direct: true });
-        } catch { /* no snapshot bucket access — generations may still seed */ }
-
-        const tenanted = !!this.config.grammar.init_streams;
         const seedPromises: Promise<void>[] = [];
 
         // Off for the duration of the bulk load — see the re-arm below. A no-op
@@ -1623,9 +1534,6 @@ export class ZeBridge {
         // A table that cannot seed is ITS OWN failure (`this.failed`), never a
         // reason to starve the rest.
         for (const table of tablesToSeed) seedPromises.push((async () => {
-          const tenantForTable = tenanted ? this.effectiveTenantFor(table) : '';
-          const snapKey = tenanted ? `${tenantForTable}.${table}` : table;
-
           // Generations are the ONLY seeding path (NOTES.md §1.13, §10h): the
           // producer builds once on a cadence, every client catches up on deltas.
           if (await this.applyGenerations(table)) {
@@ -1633,7 +1541,7 @@ export class ZeBridge {
             return;
           }
 
-          if (!LEGACY_SNAPSHOT_SEEDING) {
+          {
             // No usable chain yet — the ordinary case is a table created between two
             // cadence ticks. Wait for the producer rather than demanding a bespoke
             // dump: polling the chain is idempotent and cannot rewind anything,
@@ -1652,70 +1560,8 @@ export class ZeBridge {
             this.syncedTables.delete(table);
             this.failed.add(table);
             this.scheduleRecount();
-            this.appendLog('SYS', `Giving up on ${table}: no generation chain after ${GENERATION_WAIT_MS / 1000}s — NOT following CDC for it. Check the producer (GENERATIONS_ENABLED, its cadence, and the gen-<tenant> object store); the table seeds on the next connect once a chain exists. Snapshot-on-demand is retired (NOTES §10h).`, 'ERROR');
+            this.appendLog('SYS', `Giving up on ${table}: no generation chain after ${GENERATION_WAIT_MS / 1000}s — NOT following CDC for it. Check the producer (GENERATIONS_ENABLED, its cadence, and the gen-<tenant> object store); the table seeds on the next connect once a chain exists. Snapshot-on-demand is gone (NOTES §10h/§10p).`, 'ERROR');
             return;
-          }
-
-          // ─────────────────────────────────────────────────────────────────────
-          // Everything below is the RETIRED path, reachable only via the gate above.
-          // ─────────────────────────────────────────────────────────────────────
-          let desc: any = null;
-          let rejectedId: string | undefined;
-          if (snapKv) {
-            try {
-              const entry = await snapKv.get(snapKey);
-              if (entry) {
-                const candidate = decode(entry.value) as any; // descriptor is always msgpack
-                if (await this.descriptorStillFresh(js, tenantForTable, candidate)) {
-                  desc = candidate;
-                } else {
-                  rejectedId = candidate?.snapshot_id;
-                  this.appendLog('SYS', `Cached snapshot for ${table} is orphaned (CDC no longer covers its watermark) — requesting a fresh one instead`, 'WARNING');
-                }
-              }
-            } catch { /* no cached descriptor */ }
-          }
-
-          if (!desc && snapKv) {
-            const reqSubject = tenanted
-              ? `${this.config.grammar.subjects.snapshot_request}.${tenantForTable}.${table}`
-              : `${this.config.grammar.subjects.snapshot_request}.${table}`;
-
-            // PROTOCOL.md §6 "no answer at all": JetStream publish (503 = already
-            // queued, which is what a retry needs to know), bounded wait, re-request.
-            for (let attempt = 1; attempt <= SNAPSHOT_REQUEST_ATTEMPTS && !desc; attempt++) {
-              try {
-                await js.publish(reqSubject, new Uint8Array(0));
-                this.appendLog('SYS', `Snapshot requested for ${table} (attempt ${attempt}/${SNAPSHOT_REQUEST_ATTEMPTS})`, 'INFO');
-              } catch (e: any) {
-                this.appendLog('SYS', `Request for ${table} refused (${e?.message ?? e}) — a snapshot is already pending, waiting for it`, 'INFO');
-              }
-              desc = await waitForDescriptor(js, this.config.grammar.kv.snapshots, snapKey, SNAPSHOT_WAIT_MS, rejectedId);
-              if (!desc) {
-                this.appendLog('SYS', `No snapshot for ${table} after ${SNAPSHOT_WAIT_MS / 1000}s — the request may have expired unread; re-requesting`, 'WARNING');
-              }
-            }
-
-            if (!desc) {
-              // Unseeded is NOT the same as synced: following CDC against an unseeded
-              // table diverges silently — strictly worse than being visibly absent.
-              //
-              // ⚠️ Note what this does NOT do: fall back to the descriptor rejected
-              // above. "No fresh snapshot available" must never degrade into "replay
-              // a stale one", because replaying begins with DELETE FROM — the answer
-              // to not knowing is to keep what we have and be loud, never to rewind
-              // (NOTES §10g).
-              this.syncedTables.delete(table);
-              this.failed.add(table);
-              this.scheduleRecount();
-              this.appendLog('SYS', `Giving up on ${table} after ${SNAPSHOT_REQUEST_ATTEMPTS} attempts — NOT following CDC for it, the local copy would silently diverge. If the table was added to the publication after the bridge started, restart the bridge.`, 'ERROR');
-            }
-          }
-
-          if (desc) {
-            this.appendLog('SYS', `Snapshot metadata ready for ${table} (LSN ${desc.lsn}, ${desc.row_count ?? '?'} rows). Replaying...`, 'INFO');
-            this.reach('snapshot');
-            await this.replaySnapshot(js, jsm, table, desc, tenanted, tenantForTable);
           }
         })().catch((e) => {
           // One table's failure is one table's failure.
@@ -1902,115 +1748,6 @@ export class ZeBridge {
       }
     } catch (e) {
       this.appendLog('SYS', `Failed to start CDC consumer: ${e}`, 'ERROR');
-    }
-  }
-
-  /// Replay one snapshot's chunks off the INIT stream. Failures exclude the table
-  /// (same "unseeded is not synced" rule) but never abandon other tables' replays.
-  private async replaySnapshot(js: any, jsm: any, table: string, desc: any, tenanted: boolean, tenantForTable: string): Promise<void> {
-    try {
-      // ⚠️ A SNAPSHOT MUST NEVER MOVE THIS TABLE BACKWARDS.
-      //
-      // Replaying starts with DELETE FROM, so a stale descriptor does not merely
-      // fail to help — it DESTROYS a correct replica. Measured in a clean room: a
-      // populated `orders` (5,000 rows) was emptied by replaying a descriptor taken
-      // when the table was empty. The path there is entirely ordinary: the client
-      // judged its cached snapshot orphaned, asked for a fresh one, the SNAP_RET
-      // throttle REFUSED it ("maximum messages per subject exceeded — a snapshot is
-      // already pending"), and it fell back to the pending descriptor, which was
-      // older than its own position. 0 rows applied, 5,000 rows gone.
-      //
-      // The rule is finding 4's, on the client side: resume forward, never rewind.
-      // A snapshot older than data we already hold is not a baseline, it is a
-      // regression. Comparing against `state.lsn` alone will not do — on a FRESH
-      // replica that starts far ahead of any descriptor (see the gate in
-      // applyEvent) — so the test is "do we actually hold rows this descriptor
-      // predates?". An empty table has nothing to lose and always seeds.
-      const descLsn = typeof desc?.lsn === 'number' ? desc.lsn : 0;
-      const held = (await this.run(`SELECT COUNT(*) AS n FROM ${table}`))?.[0]?.n ?? 0;
-      if (held > 0 && descLsn > 0 && descLsn < this.globalSyncState.lsn) {
-        this.appendLog(
-          'SYS',
-          `REFUSED a stale snapshot for ${table}: descriptor @ lsn ${descLsn} is behind this replica (${this.globalSyncState.lsn}) ` +
-            `and the table holds ${held} row(s) — replaying it would DELETE them and restore an older state. Keeping what we have; CDC carries on.`,
-          'ERROR',
-        );
-        return;
-      }
-
-      await this.run(`DELETE FROM ${table}`);
-
-      const stream = tenanted ? this.initStream(tenantForTable) : this.config.grammar.streams.init;
-      const filterSubject = tenanted
-        ? `${this.config.grammar.subjects.init_prefix}.snap.${tenantForTable}.${table}.${desc.snapshot_id}.>`
-        : `${this.config.grammar.subjects.init_prefix}.snap.${table}.${desc.snapshot_id}.>`;
-      const ci = await jsm.consumers.add(stream, {
-        filter_subject: filterSubject,
-        deliver_policy: DeliverPolicy.All,
-      });
-      const replayConsumer = await js.consumers.get(stream, ci.name);
-
-      let done = false;
-      let snapshotColumns: string[] | null = null;
-      let rowsApplied = 0;
-
-      while (!done) {
-        // 5s, not 1s: a tighter window missed the first pull's heartbeat on a
-        // freshly-created consumer (measured).
-        const batch = await replayConsumer.fetch({ max_messages: 100, expires: 5000 }).catch(() => null);
-        if (!batch) break;
-
-        let receivedCount = 0;
-        for await (const msg of batch) {
-          receivedCount++;
-          let chunkDecoded: any;
-          try {
-            chunkDecoded = decode(msg.data); // snapshot chunks are always msgpack
-          } catch (err) {
-            this.appendLog('SYS', `Snapshot chunk for ${table} failed to decode (seq ${msg.seq}): ${err} — skipping this message`, 'ERROR');
-            msg.ack();
-            continue;
-          }
-
-          const state = this.syncedTables.get(table);
-
-          if (chunkDecoded && typeof chunkDecoded === 'object' && Array.isArray(chunkDecoded.schema)) {
-            snapshotColumns = chunkDecoded.schema;
-            this.appendLog('SYS', `Received snapshot schema for ${table}: ${snapshotColumns!.join(', ')}`, 'INFO');
-          } else if (state && Array.isArray(chunkDecoded)) {
-            const cols = snapshotColumns || state.columns;
-            for (const rowVals of chunkDecoded) {
-              const rowObj: any = {};
-              cols.forEach((col: string, i: number) => { rowObj[col] = rowVals[i]; });
-              await this.applyEvent(table, { table, operation: 'INSERT', data: rowObj, lsn: desc.lsn }, this.run, true);
-              rowsApplied++;
-            }
-          } else if (state && chunkDecoded.operation === 'snapshot' && chunkDecoded.data) {
-            for (const row of chunkDecoded.data) {
-              await this.applyEvent(table, { table, operation: 'INSERT', data: row, lsn: desc.lsn }, this.run, true);
-              rowsApplied++;
-            }
-          }
-          msg.ack();
-        }
-
-        if (receivedCount === 0) done = true;
-      }
-
-      const state = this.syncedTables.get(table);
-      if (state) {
-        state.lsn = desc.lsn;
-        await this.pruneInboxSeeded(table, desc.lsn);
-      }
-      const rowCountNote = desc.row_count != null && desc.row_count !== rowsApplied
-        ? ` ⚠️ expected ${desc.row_count} rows per the descriptor`
-        : '';
-      this.appendLog('SYS', `Replay finished for ${table} (Snapshot ID: ${desc.snapshot_id}, ${rowsApplied} rows applied${rowCountNote})`, 'INFO');
-    } catch (err) {
-      this.syncedTables.delete(table);
-      this.failed.add(table);
-      this.scheduleRecount();
-      this.appendLog('SYS', `Replay of ${table} failed: ${err} — NOT following CDC for it, the local copy would silently diverge.`, 'ERROR');
     }
   }
 

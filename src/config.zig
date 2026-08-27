@@ -146,7 +146,6 @@ pub const Nats = struct {
     /// server's storage budget (the INIT_TANGO lesson — a 10G-per-tenant boot
     /// refuses to create anything on a small server).
     pub const reconciled_cdc_max_age_days: u64 = 8;
-    pub const reconciled_init_max_age_days: u64 = 7;
     pub const reconciled_stream_max_bytes: i64 = 1 << 30;
     pub const reconciled_stream_max_msgs: i64 = 10_000_000;
 
@@ -372,17 +371,17 @@ pub const Sync = struct {
     /// with `new row violates row-level security policy`. Nothing names the real cause.
     pub const principal_setting = "zb.principal";
 
-    /// The session setting the snapshot listener stamps with the requesting tenant
-    /// before every snapshot query, and that `zebridge_scope_reads_by_tenant()`'s
+    /// The session setting the generation producer stamps with the tenant before
+    /// every content query, and that `zebridge_scope_reads_by_tenant()`'s
     /// `zb_reader_all` policy reads back — PROTOCOL.md "The Connection Flow" Step 0,
-    /// NOTES.md §1.12 part 1.
+    /// NOTES.md §1.13.
     ///
     /// ⚠️ Same failure shape as `principal_setting` above if this drifts from the name
     /// `zebridge_scope_reads_by_tenant()` uses in `init.core.template.sql`: a mismatch
     /// is silent, `current_setting(..., true)` reads as empty either way (not NULL —
     /// see that function's own comment on the `coalesce(..., '') = ''` trap), and the
-    /// policy falls through to its wholesale branch instead of filtering — a snapshot
-    /// that silently carries every tenant's rows instead of refusing outright.
+    /// policy falls through to its wholesale branch instead of filtering — a chain
+    /// build that silently carries every tenant's rows instead of refusing outright.
     pub const tenant_setting = "zb.tenant";
 
     /// Column-name prefixes that can never be a version column, whatever the operator
@@ -415,75 +414,6 @@ pub const Sync = struct {
     ///
     /// Applies only to timestamp version columns. An integer version has no future.
     pub const version_future_tolerance = "5 seconds";
-};
-
-/// Snapshot generation configuration
-pub const Snapshot = struct {
-    // Snapshot identifiers
-
-    /// **Ceiling** on rows per snapshot chunk, not the row count.
-    ///
-    /// The real limit is bytes: the chunk query asks Postgres for the longest prefix whose
-    /// cumulative row size fits one NATS message, and this only stops a table of tiny rows
-    /// from asking for a million of them at once. A chunk of 10 000 rows is what a narrow
-    /// table gets; a table of 256 KiB blobs gets three.
-    pub const chunk_size = 10_000;
-
-    /// How full a chunk aims to be: 4/5 of the message budget.
-    ///
-    /// The row count is derived from the *average* row size, and a run of above-average
-    /// rows still has to fit. The running sum in the chunk query enforces the budget
-    /// exactly — this only decides how often the encoder has to re-encode a prefix, and
-    /// aiming at 100% would guarantee it.
-    pub const chunk_fill_num = 4;
-    pub const chunk_fill_den = 5;
-
-    /// Ceiling on the encode buffer, which is otherwise sized to the server's
-    /// `max_payload`. A NATS server advertising 8 MiB should not turn into an 8 MiB
-    /// resident buffer. One buffer exists at a time — snapshots run sequentially on a
-    /// single thread — so this is a ceiling on the bridge, not per request.
-    ///
-    /// ⚠️ Deliberately **not** the same constant as `Buffers.default_max_event_data_buffer_log2`
-    /// (CDC's ceiling), even though both ultimately bound "how big can one NATS message
-    /// be": the two allocations have completely different multiplication factors. CDC's
-    /// per-event buffer is claimed once and held for the process's entire life, ×
-    /// `RING_BUFFER_COUNT` (tens of thousands) — raising it multiplies. This buffer is
-    /// claimed once, full stop, freed when the snapshot request finishes — raising it
-    /// costs exactly its own size. That is why this can afford to sit above CDC's 1 MiB
-    /// default without the same blast radius, not because snapshots and CDC disagree
-    /// about what NATS will accept — they both still clamp to whatever the *live*
-    /// server actually advertises (`serverMaxPayload`), same as CDC's own startup check.
-    pub const encode_buffer_max_bytes = 2 * 1024 * 1024;
-
-    // Snapshot freshness used to be a bridge-local cache (`SnapshotCache`), which
-    // could not coordinate across bridge instances and died on restart. It is now the
-    // REQUESTS stream's own policy — max-msgs-per-subject=1, discard=new, max-age —
-    // so the window is enforced by the broker for every client, and SNAP_RET_SECONDS
-    // configures nats-init rather than the bridge.
-
-    /// ⚠️ **Declared, never read.** Snapshots are not concurrent: `listenForSnapshotRequests`
-    /// calls `generateIncrementalSnapshot` inline, so requests are served strictly one at a
-    /// time in arrival order, and a large table blocks the queue behind it. Left here
-    /// because the number states an intent — a worker pool — that was never built. Delete
-    /// it or implement it, but do not read it as describing current behaviour.
-    pub const max_concurrent_snapshots = 3;
-
-    /// How long the broker waits for the snapshot worker's ack before redelivering.
-    /// Generous because generation is synchronous and a large table takes minutes; the
-    /// default 30s would redeliver a request whose COPY is still running.
-    pub const request_ack_wait_ns: u64 = 10 * 60 * std.time.ns_per_s;
-
-    /// A snapshot request that keeps failing must stop being redelivered.
-    pub const request_max_deliver: i32 = 3;
-
-    /// Snapshot polling interval (milliseconds)
-    /// How often to check for new snapshot requests via LISTEN/NOTIFY
-    pub const poll_interval_ms = 100;
-
-    // Snapshot subject patterns moved to `RuntimeConfig.topology` (src/topology.zig).
-
-    /// Message ID pattern for data chunks: "snap-<table>-<snapshot_id>-<chunk>"
-    pub const data_msg_id_pattern = "snap-{s}-{s}-{d}";
 };
 
 /// Logging and metrics configuration
@@ -523,15 +453,14 @@ pub const EventClassification = struct {
 ///
 /// These are the compile-time defaults; the operationally interesting ones are
 /// overridable at runtime via RuntimeConfig (see args.zig for the env names).
-/// Values here were previously duplicated as literals across batch_publisher,
-/// snapshot_listener and event_processor — identical by intention but free to
+/// Values here were previously duplicated as literals across batch_publisher
+/// and event_processor — identical by intention but free to
 /// drift, which is exactly the failure this section exists to prevent.
 pub const Retry = struct {
     /// PostgreSQL reconnection delay (seconds)
     pub const pg_reconnect_delay_seconds = 5;
 
-    /// Publish retry budget, shared by the CDC batch publisher and the snapshot
-    /// publisher. Exhausting it is fatal: the bridge stops rather than ACK an LSN
+    /// Publish retry budget for the CDC batch publisher. Exhausting it is fatal: the bridge stops rather than ACK an LSN
     /// whose data never reached NATS.
     pub const publish_max_retries = 5;
 
@@ -552,10 +481,9 @@ pub const Retry = struct {
     /// Only the first one is bounded. A drop after the listener has worked once is a
     /// real outage and must be retried forever — that is what the outer loop is for.
     /// But a listener that has *never* connected is describing a configuration fault,
-    /// not an outage: the wrong host, a rejected nkey, or a `REQUESTS` stream that
-    /// `nats-init` never created. Left unbounded, the bridge logged one line every 2s
-    /// and otherwise looked healthy — `/health` green, CDC flowing — while no client
-    /// could ever bootstrap, because the thread that answers snapshot requests was
+    /// not an outage: the wrong host, a rejected nkey, or a stream that was never
+    /// created. Left unbounded, the bridge logged one line every 2s and otherwise
+    /// looked healthy — `/health` green, CDC flowing — while the listener thread was
     /// spinning on a connection it would never get.
     ///
     /// 5 × `nats_reconnect_delay_ms` ≈ 10s, enough to ride out a NATS container still
@@ -575,9 +503,6 @@ pub const Retry = struct {
 pub const Threading = struct {
     /// Number of WAL monitor threads
     pub const wal_monitor_threads = 1;
-
-    /// Number of snapshot generator threads
-    pub const snapshot_generator_threads = 1;
 
     /// Number of HTTP server threads
     pub const http_server_threads = 1;
@@ -757,8 +682,6 @@ pub const RuntimeConfig = struct {
     batch_max_payload_bytes: usize,
     batch_ring_buffer_size: usize,
 
-    // Snapshot settings
-    snapshot_chunk_size: usize,
     /// Refuse to start when any published table has no primary key (STRICT_TABLES).
     strict_tables: bool,
 
@@ -811,7 +734,6 @@ pub const RuntimeConfig = struct {
             .batch_max_wait_ms = Batch.max_age_ms,
             .batch_max_payload_bytes = Batch.max_payload_bytes,
             .batch_ring_buffer_size = Buffers.default_ring_buffer_count,
-            .snapshot_chunk_size = Snapshot.chunk_size,
             .strict_tables = false,
             .publish_max_retries = Retry.publish_max_retries,
             .publish_backoff_ms = Retry.publish_backoff_ms,

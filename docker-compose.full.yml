@@ -238,17 +238,12 @@ services:
         # together. Hardcoding the names here is what let them drift before.
         echo 'Reading streams from grammar.json...'
         CDC_STREAM=$(jq -r '.streams.cdc' /grammar.json)
-        INIT_STREAM=$(jq -r '.streams.init' /grammar.json)
-        REQUESTS_STREAM=$(jq -r '.streams.requests' /grammar.json)
         MUTATIONS_STREAM=$(jq -r '.streams.mutations' /grammar.json)
         CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' /grammar.json)
-        INIT_PREFIX=$(jq -r '.subjects.init_prefix' /grammar.json)
-        REQUESTS_PREFIX=$(jq -r '.subjects.snapshot_request' /grammar.json)
         MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' /grammar.json)
         MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' /grammar.json)
         MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' /grammar.json)
         SCHEMA_KV=$(jq -r '.kv.schemas' /grammar.json)
-        SNAPSHOT_KV=$(jq -r '.kv.snapshots' /grammar.json)
         TENANTS_KV=$(jq -r '.kv.tenants' /grammar.json)
         GENERATIONS_KV=$(jq -r '.generations.kv' /grammar.json)
 
@@ -322,55 +317,6 @@ services:
         fi
         fi
 
-        # ── INIT is SPLIT PER TENANT too, same reason and same measured bug as CDC ──
-        #
-        # A JetStream consumer's `filter_subject` is reader-chosen and never checked
-        # against a subject permission — only the STREAM a consumer is created on is
-        # ACL-governed. One wide INIT stream with tenant only in the subject would let
-        # any client with consumer-creation rights on it pull another tenant's snapshot
-        # chunks by choosing a different `filter_subject` — the exact leak
-        # `scripts/scenarios/crosstenant.py` already measured for CDC before that split,
-        # reproduced on the snapshot path instead (its own check D flags this).
-        #
-        # Subject shape: `init.snap.<tenant>.<table>...` — tenant right after `snap`,
-        # uniformly, so `init.snap.acme.>` alone catches the data chunks AND the
-        # start/error/meta/schema-for-that-dump subjects, which all share the same
-        # prefix by design (see grammar.json). INIT_PUBLIC carries the `_default`-tenant
-        # snapshot data — open-tenant rows of a tenant-scoped table, and genuinely public
-        # tables, which use the same open token for snapshots since there is no tenant
-        # column to filter a public table's content by regardless of which stream its
-        # chunks land in, so audience is the only thing the token decides there.
-        # (`init.schema.<table>` — the on-demand live table-shape descriptor request —
-        # used to share this stream too; the bridge no longer listens on that subject at
-        # all, so it is no longer part of this filter — see NOTES.md/PROTOCOL.md.)
-
-        if [ "$$TENANT_COUNT" = "0" ]; then
-          echo "No tenants declared in grammar.json — keeping the single wide stream $$INIT_STREAM"
-          nats stream add $$INIT_STREAM --subjects="$$INIT_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-msgs=10000000 --max-bytes=8G --replicas=1 --compression s2 --defaults || true
-        else
-
-        if nats stream info $$INIT_STREAM --json >/dev/null 2>&1; then
-          echo "Removing legacy wide stream $$INIT_STREAM (subjects overlap the per-tenant split)"
-          nats stream rm $$INIT_STREAM -f || true
-        fi
-
-
-        fi
-        fi
-
-        # Default: INIT's own 7-day retention minus a 30-minute safety margin, not a
-        # short anti-thundering-herd debounce. A snapshot already in INIT is good for
-        # the whole 7 days — the KV descriptor's "no TTL" is what lets a client reuse
-        # it, and a client should always check that before requesting a new one. So
-        # SNAP_RET's real job is to *forbid* a redundant re-dump of a table that
-        # already has a perfectly usable snapshot, and only let a fresh request
-        # through once the existing one is close enough to expiring that a client
-        # legitimately needs a new one. Override for local dev, where waiting days to
-        # exercise the "existing snapshot has expired" path isn't practical.
-        SNAP_RET=$${SNAP_RET_SECONDS:-603000}
-        echo "Creating NATS JetStream stream: $$REQUESTS_STREAM (subject: $$REQUESTS_PREFIX.>)"
-        nats stream add $$REQUESTS_STREAM --subjects="$$REQUESTS_PREFIX.>" --storage=file --retention=limits --max-msgs-per-subject=1 --discard=new --discard-per-subject --max-age=$${SNAP_RET}s --replicas=1 --defaults || true
-
         echo "Creating NATS JetStream stream: $$MUTATIONS_STREAM (subject: $$MUTATIONS_PREFIX.>)"
         # Dead letters share the stream but NOT the subject space: the ingress consumer
         # filters on "$$MUTATIONS_PREFIX.>", so a rejected mutation republished under that
@@ -389,18 +335,10 @@ services:
         echo "Creating NATS KV bucket: $$SCHEMA_KV"
         nats kv add $$SCHEMA_KV --history=10 --replicas=1 || true
 
-        # The snapshot descriptor bucket: one entry per table, holding the metadata of
-        # the latest snapshot so a client can decide whether to request a new one.
-        # --history=1 because only the current descriptor is ever read, and no TTL: it
-        # must outlive nothing in particular, but it must not expire while the chunks it
-        # describes are still in INIT.
-        echo "Creating NATS KV bucket: $$SNAPSHOT_KV"
-        nats kv add $$SNAPSHOT_KV --history=1 --replicas=1 || true
-
         # PROTOCOL.md "The Connection Flow" §Step 0: `$$KV.tenants.<principal>` → tenant,
         # so a client holding only a principal ID can learn its own tenant without
         # guessing or a build-time constant. --history=1: only the current mapping is
-        # ever read, same reasoning as SNAPSHOT_KV above.
+        # ever read.
         #
         # Not yet fed by a PG trigger on `zebridge_user_tenants` (NOTES.md §1.12 part 3)
         # — that lands with the rest of the Zig changes. Until then, seed it by hand to
@@ -410,8 +348,8 @@ services:
         echo "Creating NATS KV bucket: $$TENANTS_KV"
         nats kv add $$TENANTS_KV --history=1 --replicas=1 || true
 
-        # Chain manifests for the generation producer (NOTES.md §1.13); --history=1, same
-        # reasoning as SNAPSHOT_KV. Per-tenant OBJ_gen-<tenant> buckets are runtime-created.
+        # Chain manifests for the generation producer (NOTES.md §1.13); --history=1: only the
+        # current manifest is ever read. Per-tenant OBJ_gen-<tenant> buckets are runtime-created.
         echo "Creating NATS KV bucket: $$GENERATIONS_KV"
         nats kv add $$GENERATIONS_KV --history=1 --replicas=1 || true
 
