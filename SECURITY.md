@@ -212,9 +212,9 @@ SELECT * FROM zebridge_enable('public.orders'::regclass,
 ```
 
 The matching bridge runs `--pub pub_orders --slot slot_orders`. ⚠️ Running several
-bridges concurrently against one NATS deployment is not yet supported: the MUTATIONS and
-REQUESTS durables are fixed names shared by every bridge, so two bridges steal each
-other's snapshot requests — NOTES.md §1.13 carries the details and the missing piece.
+bridges concurrently against one NATS deployment is not yet supported: the MUTATIONS
+durable is a fixed name shared by every bridge, so two bridges steal each other's
+ingress messages — NOTES.md §1.13 carries the details and the missing piece.
 
 ### 1.3 PostgreSQL: what the schema must satisfy
 
@@ -272,8 +272,8 @@ ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
    the first and not on the second.
 3. 🚧 **Re-`CLUSTER` tenant-scoped tables.** Locality decays: new rows land wherever there
    is space, so tenants interleave again. ✅ Measured on 200k rows / 20 tenants: one
-   tenant's snapshot read **6,250 blocks** interleaved versus **313** after
-   `CLUSTER t USING t_zb_ri` — the difference between N snapshots costing N table scans
+   tenant's chain build read **6,250 blocks** interleaved versus **313** after
+   `CLUSTER t USING t_zb_ri` — the difference between N tenants costing N table scans
    and costing one. `CLUSTER` takes an `ACCESS EXCLUSIVE` lock and is not maintained;
    partitioning by tenant gives the same locality permanently.
 4. **Check preflight at the next boot.** It reports grants that the schema cannot honour,
@@ -288,8 +288,8 @@ ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
    existing `cdc.<tenant>.>` grant. A public table gets its own named subject
    (`cdc.<table>.>`), not a wildcard — and the restart in step 5 is what binds it: at boot
    the bridge sets `CDC_PUBLIC`'s subject list authoritatively from the catalogue's public
-   tables. The snapshot side needs nothing extra: `INIT_PUBLIC`'s existing
-   `init.snap.<open tenant>.>` already covers any public table.
+   tables. The seeding side needs nothing extra: the producer derives its table set from
+   the publication and writes public tables under the open tenant's manifests.
 
 ### 1.5 PostgreSQL: maintenance — tombstone GC, and why
 
@@ -390,10 +390,10 @@ rows arrived under light load and stopped under heavy load — a bug whose trigg
 **only** `cdc.acme.>` receiving both the single and the batched event while never seeing
 `globex`. ⚠️ **No scenario file** — the reproduction needs a burst large enough to batch.
 
-Held by `mutation.<principal>.…`, `mutation_ack.<principal>.…`, `cdc.<tenant>.…`,
-`snapshot.request.<tenant>.<table>`, `init.snap.<tenant>.<table>.…`, and the tenant-scoped
-KV subjects (`$KV.snapshots.<tenant>.<table>`, `$KV.tenants.<principal>`) alike — one
-invariant, applied everywhere a subject carries an identity to grant against.
+Held by `mutation.<principal>.…`, `mutation_ack.<principal>.…`, `cdc.<tenant>.…`, the
+tenant-keyed generation names (`$KV.generations.<tenant>.<table>`, `gen-<tenant>`), and
+`$KV.tenants.<principal>` alike — one invariant, applied everywhere a name carries an
+identity to grant against.
 
 ⚠️ **Values interpolated into subjects are validated** (`utils.isSubjectToken`). A tenant
 value is row data and can contain anything: a dot splits the token and the row vanishes
@@ -419,7 +419,7 @@ re-proves the cause is gone.
 | --- | --- | --- |
 | **PostgreSQL** (the row, any writer) | `zebridge_width_guard` trigger — installed by `zebridge_enable`, unbounded columns only, budget baked into the trigger as a literal, re-derived at every bridge boot from `zebridge_limits` (one row per instance) as MIN over the instances carrying the table: row width ≥ budget → **reject** (SQLSTATE 23514, in the writer's own transaction) — ✅ `widthguard.py` (both doors, atomicity, ceiling-not-tax) | *the same trigger* — it guards the row, not the path — ✅ same |
 | **bridge ingress** (mutation listener) | payload ≥ event buffer → **reject** (`RowTooLargeToReplicate`, dead-lettered on first delivery, verdict). A deliberate lower bound: the CDC event is always larger than the payload, so nothing legitimate is refused — ✅ `rowsize.py` (incl. the published `max_row_bytes`) | — (generations are read-path; there is no ingress) |
-| **bridge egress** | boot preflight (stored rows + column defaults vs buffer) → **quarantine** before a byte streams — ✅ `legacybait.py` (re-derived every boot, and the readmission after repair); decode-time slot overflow → **quarantine** (`suspendForRowTooLarge`: ACK past, suspension published) — ✅ `legacybait.py` (log + `"suspended":true` in `$KV.schemas`); *until snapshot retirement:* `measureWidestRow` ≥ chunk budget → **quarantine** — ✅ `wide.py` | widest row, measured free in the producer's encode loop, ≥ event buffer → **warning** on every build (chains carry it; CDC will suspend on its next touch) — the detector for rows that predate the trigger — ✅ `legacybait.py` (warns on the first build over planted bait). Object chunking (nats.zig, 128 KB) means no wire limit exists on this path to check |
+| **bridge egress** | boot preflight (stored rows + column defaults vs buffer) → **quarantine** before a byte streams — ✅ `legacybait.py` (re-derived every boot, and the readmission after repair); decode-time slot overflow → **quarantine** (`suspendForRowTooLarge`: ACK past, suspension published) — ✅ `legacybait.py` (log + `"suspended":true` in `$KV.schemas`); | widest row, measured free in the producer's encode loop, ≥ event buffer → **warning** on every build (chains carry it; CDC will suspend on its next touch) — the detector for rows that predate the trigger — ✅ `legacybait.py` (warns on the first build over planted bait). Object chunking (nats.zig, 128 KB) means no wire limit exists on this path to check |
 | **NATS broker** | any single message > `max_payload` → publish refused — the floor under `BASE_BUF`'s ceiling (2^20 = 1 MB). Broker contract, not bridge code — no scenario, by design | chunk messages are 128 KB by construction; the broker limit is unreachable |
 
 Two properties to read off the matrix. Down the CDC column, consequences soften as
@@ -474,7 +474,7 @@ but nothing runs is prose, and the untested cells were found exactly that way.
 ```
 connect            credential = identity; the tenant comes from the JWT claim (🚧) or a
                    per-principal KV entry — never from user code
-seed               request a snapshot, replay chunks, then apply CDC from the snapshot LSN
+seed               apply the generation chain, then follow CDC from the manifest's cutoff
 steady state       apply CDC with INSERT … ON CONFLICT(pk) DO UPDATE — idempotent, so a
                    replayed or redelivered event converges
 write              publish mutation.<principal>.<table>.<op>; wait for the PubAck
@@ -490,7 +490,7 @@ confirm            the CDC echo carries your key — that is success. A verdict 
 | **write refused** | ✅ verdict: `rejected` (permanent — do not resend) or `failed` (retry budget exhausted) | branch on `status` |
 | **write lost** | no echo, no verdict — the bridge died before reporting | timeout, then retry; `Nats-Msg-Id` makes it idempotent |
 | **stale write** | LWW rejected it; no event, no verdict | the winner arrives via CDC. Do not hand-revert |
-| **history aged out** | the CDC stream pruned past your position | compare your `seq` against the stream's `first_seq`; re-snapshot |
+| **history aged out** | the CDC stream pruned past your position | compare your `seq` against the stream's `first_seq`; re-seed from the chain |
 | **offline too long** | your tombstone was reaped; a queued edit resurrects a deleted row | check the GC watermark before flushing |
 | **PubAck ≠ applied** | the row can still be refused by PostgreSQL afterwards | a PubAck means "the bridge will see this", never "this was written" |
 
@@ -530,7 +530,7 @@ written down.
   tagged a row with the right tenant. That is the cost of one bridge serving many tenants.
   A publication and slot per tenant moves that guarantee back into PostgreSQL.
 * **Reads, today** — every client subscribed to `cdc.>` receives every published table's
-  changes. Tenant routing is ✅ built for CDC and 🚧 not for snapshots.
+  changes. Tenant routing is ✅ built for CDC and for the per-tenant generation buckets.
 * **Schema metadata** — `$KV.schemas.<table>` is readable by every client: table names and
   column names, never row values. A deliberate trade; per-tenant schema copies would cost
   more than they protect.
@@ -572,7 +572,7 @@ written down.
 
 * **Read filtering by RLS** — RLS is evaluated for a *query*, and logical decoding runs no
   query. ✅ Measured: a policy returned 1 row to a `SELECT` and the WAL carried 2. Use a
-  publication row filter for CDC; RLS bounds writes and snapshots only.
+  publication row filter for CDC; RLS bounds writes and the producer's content queries only.
 
 ---
 
@@ -613,15 +613,13 @@ refactor, or a migration — and most of the defects found while building this w
 | mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `web-consumer/zb-mutate.mjs` |
 | the principal reaches RLS: `set_config` and the upsert share one transaction, now the pipeline's implicit one | ✅ `scripts/scenarios/writable.py`, `tiebreak.py`, `invalidate.py` — every RLS-scoped write would be refused if it did not |
 | client's JetStream permission set is complete | ✅ `web-consumer/zb-probe.mjs` |
-| snapshot memory is bounded by the message budget rather than the table; an unpublishable row is refused before transfer; an aborted snapshot leaves nothing reachable | ✅ `scripts/scenarios/wide.py` — 9 assertions. 52 MB of table cost +6.8 MB RSS and 522 MB cost +12.0 MB, measured against one shared baseline |
-| snapshot key order matches PostgreSQL's `ORDER BY`; chunks fit `max_payload` | ✅ `scripts/scenarios/snapshot.py` |
-| one snapshot request per table per window | ✅ `scripts/scenarios/stampede.py` |
+| ~~the snapshot-serving invariants~~ | retired with snapshot-on-demand (NOTES §10o–§10p): `wide.py`, `snapshot.py`, `stampede.py` deleted with the path they tested |
 | a schema change reaches every cache: KV schema, relation decode, refusal registry, write-path catalog | ✅ `scripts/scenarios/invalidate.py` — found the added-column half unwritable until restart, and verified to *fail* before the fix |
 | a malformed mutation dead-letters and does not block the queue | ✅ `scripts/scenarios/poison.py` |
 | credentials and endpoint resolution | ✅ `scripts/scenarios/credentials.py`, `endpoint.py` |
 | cross-file config coherence | ✅ `scripts/scenarios/envcheck.py` |
 | the ring is refused when it cannot fit memory or a message, and out-of-range tunables clamp rather than silently becoming larger | ✅ `scripts/scenarios/sizing.py` — 7 assertions, including that the guard and the allocator report the same total |
-| reconnect and fault behaviour | ✅ `scripts/scenarios/faults.py`, `burst.py` |
+| reconnect and fault behaviour | ✅ `scripts/scenarios/burst.py`, `downtime.py` |
 | subject-token validation (dot, `*`, `>`, whitespace, length) | ✅ `src/utils.zig`, 6 tests |
 | ack-subject parsing, both JetStream forms | ✅ `src/mutation_listener.zig`, 4 tests |
 | header parsing survives the stripped trailing CRLF | ✅ `src/mutation_listener.zig`, 4 tests |
@@ -640,7 +638,7 @@ refactor, or a migration — and most of the defects found while building this w
 | **batched events reach a tenant-only grant** | ⚠️ manual |
 | **RLS filters SELECT and is ignored by CDC** | ⚠️ manual |
 | **publication filter on a non-key column blocks UPDATE/DELETE** | ⚠️ manual |
-| **`CLUSTER` collapses per-tenant snapshot I/O 20×** | ⚠️ manual |
+| **`CLUSTER` collapses per-tenant chain-build I/O 20×** | ⚠️ manual |
 | **`bridge_reader` policy vs `BYPASSRLS`** | ⚠️ manual |
 
 Run the automated set with:

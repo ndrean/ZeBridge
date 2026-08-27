@@ -60,7 +60,7 @@ by `scripts/scenarios/invalidate.py`, which covers all four caches a migration m
 Every stream, subject and bucket name comes from `grammar.json` at the repository
 root. The bridge reads it at startup (`src/topology.zig`, `--top` / `TOPOLOGY_PATH`); the
 NATS init scripts and the reference clients read the same file. It carries only the static
-wire grammar — `streams`, `subjects`, `kv`, `cdc_streams`, `init_streams`, `open_tenant`,
+wire grammar — `streams`, `subjects`, `kv`, `cdc_streams`, `open_tenant`,
 `generations`. Which tables replicate, and their tenancy and LWW columns, is not in this
 file: that lives in `zebridge_catalogue` (§8). The parser still accepts legacy
 `tenants`/`public_tables` keys for a pre-catalogue database — with no `zebridge_catalogue`
@@ -68,23 +68,32 @@ present, the loader logs it and the file/env values stand.
 
 ```json
 {
-  "streams":  { "cdc": "CDC", "init": "INIT", "mutations": "MUTATIONS", "requests": "REQUESTS" },
+  "streams": {
+    "cdc": "CDC",
+    "mutations": "MUTATIONS"
+  },
   "open_tenant": "_default",
-  "cdc_streams":  { "tenant_prefix": "CDC_",  "public": "CDC_PUBLIC" },
-  "init_streams": { "tenant_prefix": "INIT_", "public": "INIT_PUBLIC" },
+  "cdc_streams": {
+    "tenant_prefix": "CDC_",
+    "public": "CDC_PUBLIC"
+  },
   "subjects": {
     "cdc_prefix": "cdc",
-    "init_prefix": "init",
     "mutations_prefix": "mutation",
-    "snapshot_request": "snapshot.request",
-    "snapshot_data_pattern":  "init.snap.{[tenant]s}.{[table]s}.{[snapshot_id]s}.{[chunk]d}",
-    "snapshot_start_pattern": "init.snap.{[tenant]s}.start.{[table]s}",
-    "snapshot_error_pattern": "init.snap.{[tenant]s}.error.{[table]s}",
-    "snapshot_meta_pattern":  "init.snap.{[tenant]s}.meta.{[table]s}",
-    "snapshot_schema_pattern": "init.snap.{[tenant]s}.schema.{[table]s}.{[snapshot_id]s}"
+    "mutation_pattern": "mutation.{[principal]s}.{[table]s}.{[operation]s}",
+    "mutation_error_prefix": "mutation_error",
+    "mutation_error_pattern": "mutation_error.{[table]s}",
+    "mutation_ack_prefix": "mutation_ack",
+    "mutation_ack_pattern": "mutation_ack.{[principal]s}.{[msg_id]s}"
   },
-  "kv": { "schemas": "schemas", "snapshots": "snapshots", "tenants": "tenants" },
-  "generations": { "kv": "generations", "bucket_prefix": "gen-" }
+  "kv": {
+    "schemas": "schemas",
+    "tenants": "tenants"
+  },
+  "generations": {
+    "kv": "generations",
+    "bucket_prefix": "gen-"
+  }
 }
 ```
 
@@ -103,19 +112,19 @@ into `$KV.schemas.<table>` at boot and on every DDL change, and a client just
 `kv.watch()`s that bucket, so nothing was ever left waiting for a reply an on-demand
 request could usefully shorten. Zero scenario-script coverage and zero use in the
 reference client confirmed it was never exercised outside manual testing before it was
-removed.
+removed. The snapshot keys — `streams.init`, `streams.requests`, `init_streams`,
+every `subjects.snapshot_*`, `subjects.init_prefix`, `kv.snapshots` — left with
+snapshot-on-demand (2026-08-27): seeding is generation chains (§6), and the INIT and
+REQUESTS streams carried nothing else.
 
 | key | read by |
 | --- | --- |
-| `streams.*` | `nats-init` creates `MUTATIONS` and `REQUESTS`; the bridge names `MUTATIONS` for its ingress consumer |
+| `streams.*` | `nats-init` creates `MUTATIONS`; the bridge names it for its ingress consumer |
 | `open_tenant` | bridge (routing for tenant-agnostic tables), clients (the shared subject/KV token) |
-| `cdc_streams.*` / `init_streams.*` | bridge — at boot it creates any missing `CDC_<TENANT>`/`INIT_<TENANT>` pair, sets `CDC_PUBLIC`'s subjects from the catalogue, and ensures `INIT_PUBLIC` exists |
+| `cdc_streams.*` | bridge — at boot it creates any missing `CDC_<TENANT>` stream and sets `CDC_PUBLIC`'s subjects from the catalogue |
 | `subjects.cdc_prefix` | bridge (CDC subject), clients (subscription) |
-| `subjects.init_prefix` | bridge (INIT stream subjects), clients. Note the snapshot patterns still embed `init.` literally rather than composing from it. |
 | `subjects.mutations_prefix` | bridge (consumer filter), `nats-init` (MUTATIONS subjects) |
-| `subjects.snapshot_request` | bridge (subscription), clients (request), `nats-init` (REQUESTS subjects) |
 | `kv.schemas` | bridge (`$KV.schemas.<table>`), clients |
-| `kv.snapshots` | bridge (`$KV.snapshots.<table>`), `nats-init`, clients |
 | `kv.tenants` | bridge (`$KV.tenants.<principal>`), clients |
 | `generations.*` | bridge (generation producer), clients (the `gen-<tenant>` buckets) |
 
@@ -123,22 +132,20 @@ removed.
 
 ## 2. Channels
 
-**Five** — one KV bucket and four streams — with different durability characteristics,
-chosen deliberately rather than incidentally. Three carry the bridge's output; two carry
-the client's input.
+**Five** — two KV buckets, one object-store family, and two streams — with different
+durability characteristics, chosen deliberately rather than incidentally. Four carry the
+bridge's output; one carries the client's input.
 
 ```mermaid
 flowchart TD
   B[ZeBridge]-->|"$KV.schemas.&lt;table&gt;"| KV[["KV: schemas<br/>last value per key"]]
   B -->|"cdc.&lt;table&gt;.&lt;op&gt;"| CDC[["Stream: CDC<br/>time-bounded"]]
-  B -->|"init.snap.*"| INIT[["Stream: INIT<br/>longer retention"]]
+  B -->|"manifest + chain objects"| GEN[["KV: generations<br/>+ OBJ gen-&lt;tenant&gt;"]]
   KV --> C[Client]
   CDC --> C
-  INIT --> C
+  GEN --> C
   C -->|"mutation.&lt;principal&gt;.&lt;table&gt;.&lt;op&gt;"| MUT[["Stream: MUTATIONS<br/>writes + verdicts"]]
-  C -->|"snapshot.request.&lt;table&gt;"| REQ[["Stream: REQUESTS<br/>one per table at a time"]]
   MUT --> B
-  REQ --> B
   MUT -->|"mutation_ack.&lt;principal&gt;.&lt;msg_id&gt;"| C
   C --> L[(Local store<br/>SQLite / PG / …)]
 ```
@@ -147,9 +154,8 @@ flowchart TD
 | --- | --- | --- | --- |
 | `schemas` | **KV bucket** | bridge → client | Last-value-per-key. A client connecting at any time gets the current schema without replay. Schema is *state*, not an event. |
 | `CDC` | **stream** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*. |
-| `INIT` | **stream** | bridge → client | Longer retention than CDC — snapshot chunks must outlive the CDC window a client is catching up across. |
+| `generations` + `gen-<tenant>` | **KV + object store** | bridge → client | The seed source (§6): one chain manifest per `<tenant>.<table>`, objects chunked by the store itself — a seed is *state*, built on a cadence, never served per request. |
 | `MUTATIONS` | **stream** | client → bridge → client | Edge writes (§7), and the verdicts answering them. |
-| `REQUESTS` | **stream** | client → bridge | Snapshot requests (§6), with a deliberately unusual policy — see below. |
 
 ### `MUTATIONS` carries both directions
 
@@ -168,25 +174,9 @@ alongside the writes.
 on `mutation.>`, so publishing a verdict under that prefix would feed it back in as if it
 were a write — a loop ending in a poison pill.
 
-### `REQUESTS` is the odd one, and its policy is the feature
-
-| | `CDC` / `INIT` / `MUTATIONS` | `REQUESTS` |
-| --- | --- | --- |
-| discard | old | **new, per subject** |
-| max age | 7 days | **1 minute** |
-
-⚠️ **`discard: new per subject` with one message per subject is what makes a snapshot
-stampede impossible**: while a request for `orders` is outstanding, a second one is
-*refused by the broker* rather than queued, and the refusal is the `503` §6 documents. The
-bridge does not deduplicate requests — the stream does, before the bridge ever sees them.
-
-⚠️ **The 1-minute age is a timeout, not housekeeping.** A request nobody served expires and
-vanishes, so a client that gets no chunks and no error was not ignored — its request aged
-out unread (§6, "The fourth case: no answer at all").
-
 ### One number that changes what "idempotent" means
 
-Every stream here runs a **duplicate window of 2 minutes** (1 minute for `REQUESTS`).
+Every stream here runs a **duplicate window of 2 minutes**.
 `Nats-Msg-Id` deduplication only holds *inside* that window.
 
 ⚠️ So "a retry is idempotent rather than a second write" (§7.1) is true for a prompt retry
@@ -245,15 +235,15 @@ table but resets that column's values.
 catalogue's `tenant_col` (`zebridge_catalogue`, §8), or `null` for a table every principal
 reads and writes the same content of — every internal `zebridge_*` table, and any table
 whose catalogue row is public (`tenant_col IS NULL`, the reason recorded in
-`public_reason`). Drives which token a client uses when it builds a snapshot subject or
-KV key for that specific table: its own resolved tenant when `tenant_column` is set, the
+`public_reason`). Drives which token a client uses when it builds a chain-manifest
+KV key or object-store name for that specific table: its own resolved tenant when `tenant_column` is set, the
 shared open-tenant token when it is `null` — without this a client had no way to tell the two
 apart per table and defaulted to its own tenant everywhere, so N principals cached N
 redundant copies of a tenant-agnostic table instead of converging on the one shared entry
 (§6, "Connection Flow").
 
 ⚠️ **This payload is always JSON, unconditionally — never MessagePack.** Unlike the CDC and
-snapshot payloads below (§4, §6), there is no `--json` flag or runtime choice for schema:
+chain payloads (§4, §6), there is no `--json` flag or runtime choice for schema:
 the bridge hardcodes JSON here regardless of how it encodes everything else. Small, rare
 payloads (one per table, at boot and on DDL) where human-readability (`nats kv get schemas
 <table>`) outweighs MessagePack's compactness, and worth stating explicitly rather than
@@ -302,8 +292,8 @@ would otherwise accept it. Check `suspended` before `writable`.
 
 * `table` duplicates the KV key. The **key remains authoritative** — if they ever
   disagree, trust the key. The field exists so the value is self-describing like every
-  other payload in the protocol (CDC events, snapshot chunks, and this schema's own
-  tombstone all carry `table`), which matters once a payload travels without its key:
+  other payload in the protocol (CDC events and this schema's own
+  tombstone both carry `table`), which matters once a payload travels without its key:
   logs, caches, forwarding.
 * `pg.columns[].type` is **`format_type(atttypid, atttypmod)`** — the type as PostgreSQL
   spells it, *with* modifiers: `bigint`, `character varying(255)`, `numeric(20,8)`,
@@ -341,8 +331,8 @@ root-level flags, and a client that collapses them will either lose data or hang
 
 ⚠️ **`suspended` is not `dropped`.** Treating a suspension as a tombstone destroys the
 client's rows over what is usually a migration mistake that will be fixed in minutes —
-and the client cannot re-seed afterwards, since a suspended table serves no snapshot
-either. Treating it as a live schema is the opposite failure: the table looks healthy
+and the client cannot re-seed afterwards, since the producer skips a suspended
+table — no fresh chain either. Treating it as a live schema is the opposite failure: the table looks healthy
 and silently never updates again.
 
 ### Tombstones
@@ -382,7 +372,7 @@ lifts by itself the moment the shape is fixed.
 While a table is suspended:
 
 * its CDC events are **dropped at the bridge** — nothing reaches the `CDC` stream;
-* a `snapshot.request.<table>` is answered with `error_type: "table_refused"` (§6);
+* the generation producer skips it, so its chain stops refreshing (§6);
 * the previous live schema is **overwritten** by this value, so a client connecting
   later cannot read a stale shape and build a table that will never receive rows.
 
@@ -545,14 +535,14 @@ list and defaulting the missing ones to null erases data PostgreSQL never touche
 reference client does the former (`INSERT … ON CONFLICT DO UPDATE SET` over the present
 keys only).
 
-Only UPDATE can omit a column: INSERT and snapshot rows always carry every column, and
+Only UPDATE can omit a column: INSERT and chain rows always carry every column, and
 a DELETE carries the key (plus nulls under DEFAULT identity, as above).
 
 ### Value encoding
 
 ⚠️ **Always MessagePack, unconditionally — never JSON.** There used to be a `--json` flag
 making this a runtime choice; it is gone, along with the whole `Format`-as-CLI-choice axis
-(`args.zig`, `batch_publisher.zig`). Every CDC event and every snapshot payload (§6) is
+(`args.zig`, `batch_publisher.zig`). Every CDC event and every chain payload (§6) is
 MessagePack, full stop — the mirror image of schema's "always JSON" (§3). A client written
 against the old "MessagePack by default" wording should stop carrying a JSON fallback for
 this payload; the bridge can no longer produce one, and a stray fallback here is dead code
@@ -637,8 +627,8 @@ migration for it is still ahead, and it is asynchronous.
 
 A client that treats the marker as "initialisation complete" starts its gap check while the
 last table is still being created, reads a table list that does not contain it, and **never
-requests a snapshot for it**. Observed in a live run: two tables, `users` snapshotted,
-`test_types` silently skipped, and the client still reporting all snapshots replayed. It
+seeds it**. Observed in a live run: two tables, `users` seeded, `test_types` silently
+skipped, and the client still reporting every table seeded. It
 had rows only because the CDC stream happened to still hold every insert from `first_seq`;
 after any rotation that table would have been quietly empty.
 
@@ -652,7 +642,7 @@ answer different questions, and using one for the other's job is a silent bug.
 | stored | compared against | answers |
 | --- | --- | --- |
 | **`seq`** — the JetStream stream sequence of the last CDC message applied | the CDC stream's `state.first_seq` | *"has the history I still need fallen off the back of the stream?"* |
-| **`lsn`** — the PostgreSQL WAL position of the last row applied | a snapshot descriptor's `lsn`, per event | *"have I already got this row from the snapshot?"* |
+| **`lsn`** — the PostgreSQL WAL position of the last row applied | the manifest's `cutoff_lsn`, per event (legacy manifests only — `cutoff_seq` is the primary gate) | *"have I already got this row from the seed?"* |
 
 **Gap detection uses `seq`, never `lsn`:**
 
@@ -667,7 +657,7 @@ produces permanent silent divergence rather than a stall.
 ```js
 const firstSeq = streamInfo.state.first_seq;
 if (mySeq === 0 || (firstSeq > 0 && mySeq < firstSeq - 1)) {
-    // a snapshot is required
+    // seeding is required
 }
 ```
 
@@ -678,24 +668,30 @@ which is what `seq` is for.
 
 Two details that look like off-by-ones and are not:
 
-* `mySeq === 0` is the fresh-client case: no history at all, so seed from a snapshot.
+* `mySeq === 0` is the fresh-client case: no history at all, so seed from the chain.
 * `< firstSeq - 1`, not `< firstSeq`: if the stream's oldest is 100 and you hold 99, the very
   next message you need is 100 and it is still there — no gap. Only at 98 or below is
   message 99 genuinely lost.
 
-**`lsn` then does the other job, after a snapshot.** Having replayed a snapshot taken at LSN
-X, set the table's `lsn = X` and discard every CDC event with **`event.lsn < X`** — those
-rows are already in the data you just seeded.
+**The per-event seed gate, after a chain.** The PRIMARY gate is in the stream's own
+coordinates: the manifest carries `cutoff_seq` (captured before the build), and on that
+stream every event with **`seq <= cutoff_seq`** is already in the seed — drop it. `<=` is
+safe here precisely because `seq` is commit-ordered: no in-flight transaction can land
+below the cutoff.
 
-⚠️ **Strictly less-than. `<=` loses exactly one row per snapshot.** The watermark is
-`pg_current_wal_lsn()` taken at the snapshot's BEGIN, and the next commit is stamped with
-*that same LSN* — measured: watermark `25472600`, first post-snapshot event `25472600`. A
-`<=` gate discards it even though the snapshot never contained it, and the loss is silent:
-the table simply misses the first row written after seeding.
+⚠️ **Do not gate data on `lsn` when `cutoff_seq` is available.** LSNs are not monotonic
+in delivery order — a transaction that begins before the chain build and commits after it
+delivers late carrying a *lower* lsn, and an lsn gate silently drops it even though the
+chain never contained it (measured; `cutoff_seq` is the fix, NOTES §10i). For a legacy
+manifest without `cutoff_seq`, gate with **strictly less-than** on `cutoff_lsn` — `<=`
+loses exactly one row per seed, because the watermark is taken at the build's BEGIN and
+the next commit is stamped with *that same LSN* (measured: watermark `25472600`, first
+post-seed event `25472600`). And anchor that lsn ONLY to a value a seed set — never to a
+schema event's lsn, which a bridge restart advances to the WAL head and which would then
+eat every event the new bridge replays (measured, NOTES §10p).
 
-The boundary is genuinely ambiguous, so break the tie by cost. Re-applying a row that *was*
-in the snapshot is free — the apply is an upsert and converges to the same value. Dropping
-a row that was *not* in it is permanent.
+The boundary tie breaks by cost either way: re-applying a seeded row is a free idempotent
+upsert; dropping an unseeded one is permanent.
 
 ⚠️ **Gate on the column set, not on the LSN.** The LSN tells you *where you are*; the
 column set tells you *whether you can proceed*. Blocking whenever
@@ -742,9 +738,8 @@ Everything the two schemas share survives. A schema change should therefore
 **never** trigger a re-seed — re-seeding is for a CDC gap (§6), not for DDL.
 
 ⚠️ Re-seeding here is wasteful rather than dangerous, and that is worth knowing before you
-optimise: it costs a full snapshot of the table and occupies the one-request-per-table
-window (§6), so a migration touching ten tables can lock every other client out of
-snapshots while it runs. The data would be correct — just paid for twice.
+optimise: it replays the whole chain for a table whose data the in-place migration
+already preserved. The data would be correct — just paid for twice.
 
 ⚠️ A **`RENAME COLUMN`** still appears as one removed + one added, because the
 payload carries no rename hint (`NOTES.md` §1.2). The other columns survive; the
@@ -753,139 +748,118 @@ is a protocol gap rather than a storage limitation.
 
 ---
 
-## 6. Snapshots — stream `INIT` ✅
+## 6. Seeding — generation chains ✅
 
-Snapshots seed the client with historical data.
-The bridge ~~can~~ generates and publishes snapshots ~~on request~~; the client uses them to recover from a stream gap.
-Snapshots are stored in the INIT stream with A TTL. If the client needs one butt the snapshot is not available, it is
+Seeding gives a fresh or fallen-behind client its starting point. There is no
+snapshot-on-demand: the generation producer builds, on a cadence
+(`GENERATION_CADENCE_SECONDS`), a *full* plus a series of *deltas* per table — the
+chain — and publishes it to object storage. Clients only ever read what is already
+built; Postgres is never queried per consumer.
 
-### The Storage Architecture
-
-Snapshot data is megabytes-to-gigabytes of ordered chunks. It flows through three channels:
+### The storage architecture
 
 | | where | why |
 | --- | --- | --- |
-| **Requests** | `REQUESTS` stream | A dedicated stream with `max_msgs_per_subject=1`, `DiscardNew`, and `max_age=SNAP_RET`. This acts as a native NATS lock. It squashes 10 million concurrent client requests into exactly 1 message, shielding the bridge and Postgres from DDoS attacks. |
-| **Data (chunks)** | `INIT` stream | JetStream streams reliably hold ordered sequences of chunks for long retention periods. |
-| **Metadata** | `kv.snapshots` bucket | A single small descriptor (schema, snapshot ID, LSN, row count). Last-value-per-key makes it trivial for a client to discover the active snapshot without scanning streams. |
+| **Manifest** | `generations` KV, key `<tenant>.<table>` | One small JSON document naming the chain: the full, the deltas, the cutoff. Last-value-per-key makes discovery one read. |
+| **Objects** | `gen-<tenant>` object store | The full and delta payloads (MessagePack rows), chunked by the object store itself (128 KB) — no NATS `max_payload` limit applies to a seed. |
 
-**Requesting a snapshot:**
+The manifest carries `gen` (the chain number), `full` (object name + gen), `deltas`
+(object, `cutoff`, `prev_cutoff`, gen — newest last), `cutoff_version` (the row-timestamp
+watermark), `cutoff_lsn`, and — the splice point — **`cutoff_seq`** with `cdc_stream`:
+the CDC stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction
+begins. Everything at or below `cutoff_seq` on that stream is in the chain; everything
+above it is not. The direction is overlap-never-gap: a transaction still in flight when
+the chain was built shows up as a duplicate to absorb, never as a hole. (`lsn` cannot do
+this job — it is not monotonic in delivery order, §8.)
 
-1. A client checks `kv.snapshots.<tenant>.<table>` (§ "The Connection Flow" below covers resolving `<tenant>`, and it must also verify a hit is still within the CDC window it can bridge from — `NOTES.md` §"A cached descriptor has no expiry of its own"). If a valid snapshot exists, the client can replay it immediately.
-2. If no valid snapshot exists, the client publishes an empty message to `snapshot.request.<tenant>.<table>`.
-3. If NATS accepts the publish, the bridge generates the snapshot. If NATS rejects the publish (because a request is already running or cached within `SNAP_RET`), the client simply ignores the error, waits, and watches the KV bucket.
+A tenant with no rows for a table still gets a manifest (an explicit empty full), so a
+client can distinguish "empty" from "not built yet".
 
-**Responses (from bridge):**
+### Applying a chain
 
-| subject | payload |
-| --- | --- |
-| `init.snap.<tenant>.start.<table>` | `{snapshot_id, table, lsn, timestamp, status:"starting"}` |
-| `init.snap.<tenant>.<table>.<snapshot_id>.<chunk>` | `{table, operation:"snapshot", snapshot_id, chunk, lsn, data:[…]}` |
-| `init.snap.<tenant>.meta.<table>` | `{snapshot_id, table, lsn, timestamp, batch_count, row_count}` |
-| `init.snap.<tenant>.error.<table>` | `{table, timestamp, status:"failed", error_type, error_message, available_tables}` |
+1. **Read the manifest.** No manifest, or no `full` object → the table has no chain yet
+   (the ordinary case is a table enabled between two cadence ticks). Poll — the producer
+   builds every cadence. Bound the wait (`GENERATION_WAIT_MS`) and mark the table failed
+   rather than following CDC unseeded: an unseeded table that follows CDC diverges
+   silently, which is strictly worse than being visibly absent.
+2. **Plan from the local watermark** (the last applied `cutoff_version`): if the deltas
+   reach it, apply only the newer deltas — idempotent upserts guarded by the version
+   column. Otherwise apply the full, then the deltas after it.
+3. **A full is `DELETE FROM` + replay, in one transaction.** Two rules make that
+   destruction safe:
+   * ⚠️ **Never apply a full whose `cutoff_seq` is below the replica's stored position
+     for that stream.** Such a chain predates rows CDC already delivered and will never
+     re-deliver; refuse it and wait for the next cadence build.
+   * The DELETE shares the transaction with the rows, so a crash mid-apply cannot leave
+     an empty table.
+4. **Record the cutoff** (`cutoff_version`/`cutoff_lsn`) as the new watermark, and anchor
+   the seed gate: on the manifest's `cdc_stream`, drop CDC events with
+   `seq <= cutoff_seq` — they are in the chain. ⚠️ The lsn fallback (a manifest without
+   `cutoff_seq`) must anchor only to a lsn a SEED set — never to a schema event's lsn,
+   which a bridge restart advances to the WAL head and which would then eat every event
+   the new bridge replays.
 
-`<tenant>` is the tenant token the request was made for (§ "The Connection Flow" below) —
-always present, third token after `init.snap`, in the same position across every one of
-these patterns so a single stream filter (`init.snap.<tenant>.>`) catches all of them. There
-is no `format` field on `init.snap.<tenant>.start.<table>` — every one of these payloads is
-MessagePack, unconditionally (§4), so there is nothing left to announce per snapshot.
-
-*Note: Metadata is written to `kv.snapshots.<tenant>.<table>` upon completion, not
-broadcasted as an event.*
-
-`error_type` is the machine-readable discriminator; branch on it, not on `error_message`:
-
-| `error_type` | meaning | client action |
-| --- | --- | --- |
-| `table_refused` | the table is suspended — `error_message` names **which** of the reasons in §9 applies (it is not always a missing primary key; `row_too_large` is common on wide tables) | do not retry; wait for a live schema on the KV key |
-| `table_not_monitored` | table is not in the publication this bridge replicates | do not retry; check `available_tables` |
-| `generation_failed` | the `COPY` failed (permissions, lock, connection) | retry with backoff |
-
-⚠️ `table_refused` and `table_not_monitored` are **not** retryable — retrying either is a busy-loop against a condition only a migration or a config change will clear.
-
-#### The fourth case: no answer at all
-
-**A client MUST bound its wait for the descriptor and re-request.** Every row above assumes
-a message arrives; the case with no message is the one that hangs.
-
-Snapshots are served one at a time, and a request waits **in the `REQUESTS` stream** until
-the worker polls for it. That stream has a `max_age`. If the wait exceeds it — the wait being
-the *sum of the work ahead of it*, not one long snapshot — the broker drops the request
-unread. No chunks, no error, nothing: the bridge never saw it.
-
-⚠️ **Request with a JetStream publish, never a core publish.** A core `publish` is
-fire-and-forget: when the one-per-table window is occupied the broker drops the message and
-tells the client nothing, so it cannot distinguish "queued" from "discarded" and has
-nothing to retry against. Only a JetStream publish returns the 503 below.
-
-Retrying is safe and self-correcting, because the two outcomes are exactly the two you want:
-
-| state when you retry | broker's answer | meaning |
-| --- | --- | --- |
-| your request expired | **accepted** | it was lost; this one takes its place |
-| your request is still queued | `503 … maximum messages per subject exceeded` | still pending — keep waiting |
-
-So a bounded wait plus backoff cannot cause a stampede (the broker refuses the duplicate)
-and cannot hang (an expired request is replaced). An unbounded `await` on the KV watch can
-do neither — it simply stops.
-
-⚠️ Sizing `SNAP_RET` larger is a *mitigation*, not the fix. It is a guess at
-`worst-case snapshot × tables requesting at once`, both of which grow with the database, and
-it is capped from above by `CDC_RET > SNAP_RET + apply time` — so raising it eats the margin
-that keeps a seeding client from falling off the CDC stream. The client-side timeout is what
-makes the system correct at any setting.
-
-#### Chunking
-
-Chunked by **bytes**, not rows: the bridge asks Postgres for the longest prefix of rows whose
-cumulative size fits one NATS message. `chunk_size` is a row *ceiling* (10 000), which a
-narrow table reaches and a table of 256 KiB rows does not — it gets three rows a chunk. A row
-too large to publish at all suspends the table rather than being split or skipped.
-
-Any primary key works, including a **composite** one: pagination compares the whole key as a
-row value (`("a","b") > (…)`), which matches the `ORDER BY` exactly.
+If an object 404s mid-walk (pruned under you), re-read the manifest once and restart from
+*its* full — overlap, never a gap.
 
 ### The Connection Flow (Resolving the Gap)
 
-Run on every connect and reconnect. The client must evaluate the **Gap Rule** to decide whether a snapshot is needed — once **per stream** it reads, not once overall. A consumer's tenant-scoped tables live on `CDC_<tenant>`; its public tables (no tenant column) live on `CDC_PUBLIC`. These are two independent streams with unrelated sequence numbers — a consumer reading both tracks two independent gap decisions, not one.
+Run on every connect and reconnect, once **per stream** the client reads, not once
+overall. A consumer's tenant-scoped tables live on `CDC_<tenant>`; its public tables on
+`CDC_PUBLIC`. These are independent streams with unrelated sequence numbers — a consumer
+reading both tracks two independent gap decisions, not one.
 
 #### Step 0: know your tenant
 
-Everything below needs a tenant token to build subject names. A client holds only its principal ID (issuing that ID is a separate, out-of-scope bootstrap problem — assume the client already has it), and resolves its tenant by asking NATS, not by guessing or embedding a build-time constant:
+Everything below needs a tenant token to build subject and bucket names. A client holds
+only its principal ID (issuing that ID is a separate, out-of-scope bootstrap problem —
+assume the client already has it), and resolves its tenant by asking NATS, not by
+guessing or embedding a build-time constant:
 
 ```
 tenant ← KV.tenants.get(<principal>)
 ```
 
-This reads `$KV.tenants.<principal>` — a single value, populated live by a trigger on `zebridge_user_tenants` (mirroring exactly how `$KV.schemas` is kept current from DDL, §1). **Resolved fresh on every connect, never cached client-side across sessions**: the bucket is what lets a tenant reassignment take effect without restarting anything, and a locally-cached value would defeat that the moment it goes stale. The NATS grant on this key is scoped to the client's own principal (`$KV.tenants.alice`, never a wildcard) — a leaked credential discloses only that principal's own tenant, never the membership roster.
+This reads `$KV.tenants.<principal>` — a single value, populated live by a trigger on
+`zebridge_user_tenants` (mirroring exactly how `$KV.schemas` is kept current from DDL,
+§1). **Resolved fresh on every connect, never cached client-side across sessions**: the
+bucket is what lets a tenant reassignment take effect without restarting anything. The
+NATS grant on this key is scoped to the client's own principal (`$KV.tenants.alice`,
+never a wildcard) — a leaked credential discloses only that principal's own tenant.
 
-A client with no tenant-scoped tables skips this step: its reach is `CDC_PUBLIC` only, and every `<tenant>` placeholder below is the fixed `OPEN_TENANT` value for that traffic, never a resolved one.
+A client with no tenant-scoped tables skips this step: its reach is `CDC_PUBLIC` only,
+and every `<tenant>` token below is the fixed `OPEN_TENANT` value.
 
-A naive client might track the last LSN per table. This causes the **"abandoned table paradox"**: if Table A changes rapidly but Table B never changes, Table B's local LSN falls far behind the stream's oldest available LSN. A per-table gap check would incorrectly assume Table B missed events and force a snapshot.
+#### The Gap Rule, per stream
 
-To solve this, the client must track a **Global Sync State per stream**:
+The client durably stores one position per stream — `stored_seq[stream]`, the highest
+JetStream sequence it has accounted for on that stream — and compares it against the
+stream's `first_seq`:
 
-* `global_last_lsn[stream]`: The highest LSN the client has successfully processed from that stream, across every table the stream carries.
-* `global_last_seq[stream]`: The JetStream sequence number corresponding to `global_last_lsn[stream]`.
+* `stored_seq == 0` (first run) or `stored_seq < first_seq - 1` (the stream pruned past
+  the stored position) → **gap** on that stream.
+* Otherwise resume that stream from `stored_seq + 1`.
 
-**The Gap Rule**, evaluated independently for each stream the client reads:
-Compare `global_last_lsn[stream] >= oldest_cdc_lsn(stream)`.
+⚠️ **The position is per stream, never per table.** A per-table check hits the
+"abandoned table paradox": a table that never changes falls behind the stream's horizon
+and looks gapped forever. One stream position covers every table the stream carries,
+including the ones that have not changed in months.
 
-* **If true:** The client has no gaps on that stream. Every table it carries is safe, even those that haven't changed in months. Resume that stream from `global_last_seq[stream] + 1`.
-* **If false (or first run):** The client missed history on that stream. It must request a snapshot for every table *that stream* carries, as it cannot prove which ones changed during the blackout. (The other stream, if any, is unaffected — a gap on `CDC_<tenant>` says nothing about `CDC_PUBLIC`.)
+⚠️ **Re-seeding is SCOPED.** A gap on one stream re-seeds only the tables *routed* to
+that stream (a table's route is its effective tenant's CDC stream), plus any table with
+no generations watermark at all (never seeded: a brand-new replica, or a table enabled
+between connects). Every other table resumes untouched — a mobile client reconnecting
+with one stale stream must not rebuild its whole replica.
 
 ```mermaid
 flowchart TD
     T["tenant ← KV.tenants.get(principal)<br/>(skip — use OPEN_TENANT — if public-only)"] --> A[connect]
     A --> B["schema ← KV.get(table)<br/>migrate local in place"]
-    B --> C{"per stream (CDC_&lt;tenant&gt;, CDC_PUBLIC):<br/>global_last_lsn[stream] exists AND<br/>&gt;= oldest_cdc_lsn(stream) ?"}
-    C -->|yes| Z["resume that stream from<br/>global_last_seq[stream] + 1"]
-    C -->|"no — first run, or gap"| D{"valid snapshot in<br/>KV.snapshots.&lt;tenant&gt;.&lt;table&gt; AND<br/>snapshot.lsn &gt;= oldest_cdc_lsn(stream) ?"}
-    D -->|yes| E["truncate local<br/>apply chunks via JetStream Pull<br/>from init.snap.&lt;tenant&gt;.&lt;table&gt;.…<br/>global_last_lsn[stream] ← max(snapshot LSNs)"]
-    D -->|"no snapshot, or<br/>snapshot too old"| F["publish snapshot.request.&lt;tenant&gt;.&lt;table&gt;<br/>(ignore NATS rejects) · wait on<br/>KV.snapshots.&lt;tenant&gt;.&lt;table&gt;"]
-    F --> E
-    E --> Z
-    Z --> Y["per-event rule (§5)"]
+    B --> C{"per stream (CDC_&lt;tenant&gt;, CDC_PUBLIC):<br/>stored_seq[stream] &gt; 0 AND<br/>&gt;= first_seq(stream) - 1 ?"}
+    C -->|yes| Z["resume that stream from<br/>stored_seq[stream] + 1"]
+    C -->|"no — first run, or gap"| D["for each table ROUTED to this stream,<br/>plus never-seeded tables:<br/>apply the generation chain (§6)"]
+    D --> Z
+    Z --> Y["per-event rule (§5), gated by<br/>seq &le; cutoff_seq on the seed stream"]
 ```
 
 In pseudocode:
@@ -893,44 +867,56 @@ In pseudocode:
 ```python
 tenant = kv.tenants.get(principal) if reads_tenant_scoped_tables else OPEN_TENANT
 
-for stream in streams_this_client_reads:  # CDC_<tenant>, and/or CDC_PUBLIC
-    if global_last_lsn[stream] exists and global_last_lsn[stream] >= oldest_cdc_lsn(stream):
-        accept stream from global_last_seq[stream] + 1
-        continue
+gapped = set()
+for stream in streams_this_client_reads:          # CDC_<tenant>, and/or CDC_PUBLIC
+    local = stored_seq[stream]                     # durable, advanced per applied batch
+    if local == 0 or local < stream.first_seq - 1:
+        gapped.add(stream)
 
-    for each table carried by stream:
-        check kv.snapshots[tenant][table] for a snapshot >= oldest_cdc_lsn(stream)
-        if none exists:
-            publish snapshot.request.<tenant>.<table>, wait for kv.snapshots[tenant][table] to update
-        truncate local table
-        replay chunks from init.snap.<tenant>.<table>.… using JetStream Pull Consumer
+to_seed = {t for t in tables
+           if route(t) in gapped or t has no generations watermark}
 
-    global_last_lsn[stream] = max(snapshot LSNs for that stream's tables)
-    accept stream from now
+for table in to_seed:                              # concurrently — one table's failure
+    apply_chain(tenant_for(table), table)          # is one table's failure (§6 above)
+
+for stream in streams_this_client_reads:
+    consume from stored_seq[stream] + 1
+    # per batch: apply / gate (seq <= cutoff_seq) / hold (FK parent missing, durably)
+    # then persist stored_seq[stream] = max seq in the batch
 ```
 
 **Notes that matter for a correct port:**
 
-* ⚠️ **Resolve tenant before constructing any subject below.** Every `<tenant>` token in `cdc.<tenant>.>`, `snapshot.request.<tenant>.<table>`, `init.snap.<tenant>.<table>.…` and `$KV.snapshots.<tenant>.<table>` is the value from Step 0 — never a guess, never a build-time config value, and never derived from data already in the local replica (that reasoning is circular: it assumes the thing being verified).
-* ⚠️ **`snapshot.request` and `init.snap` are tenant-keyed, not principal-keyed.** A dump is shared by every principal in a tenant; keying it by principal instead would make a fleet restart spawn one serialized snapshot run per principal per table — a connection storm — for no correctness gain once one principal holds exactly one tenant.
-* ⚠️ **`global_last_lsn` may not exist**, per stream. First run has no value for that stream; test for its presence explicitly.
-* ⚠️ **`>=`, not `>`.** If `global_last_lsn[stream] == oldest_cdc_lsn(stream)` you have applied the oldest retained event on that stream and everything after it is present. Strict `>` forces a needless re-seed.
-* ⚠️ **`snapshot_lsn >= oldest_cdc_lsn(stream)` must be verified**, against the LSN horizon of the stream that table belongs to. A snapshot older than that stream's CDC window seeds you to LSN *s* and then needs CDC from *s* — which has been evicted. You land in a hole immediately.
-* ⚠️ **Truncate before applying a snapshot**, do not merge. A snapshot names only rows that *exist*; rows deleted while you were away are never mentioned, so an upsert-only apply leaves them behind forever.
-* A schema change **never** triggers this flow. Migrations apply in place (§5); re-seeding is for a CDC gap only.
+* ⚠️ **Resolve tenant before constructing any name below.** Every `<tenant>` token in
+  `cdc.<tenant>.>`, `$KV.generations.<tenant>.<table>` and `gen-<tenant>` is the value
+  from Step 0 — never a guess, never a build-time constant, and never derived from data
+  already in the local replica (that reasoning is circular).
+* ⚠️ **Chains are tenant-keyed, not principal-keyed.** A chain is shared by every
+  principal in a tenant; the manifests of tenant-agnostic tables live under the open
+  tenant, so every principal converges on one shared entry.
+* ⚠️ **`stored_seq` advances on accounting, not only on application.** An applied event
+  is in the tables; a gated one is provably in the seeded chain; a held one is durably
+  in the FK inbox. All three account for the message — persist the batch's max seq after
+  processing it. A position that only advances on the applied path reads as a permanent
+  gap for a stream whose traffic was 100% gated or held, and re-seeds on every connect.
+* ⚠️ **Never let a full move a table backwards** — the `cutoff_seq >= stored_seq` rule
+  in "Applying a chain". A chain older than the replica is not a baseline, it is a
+  regression.
+* A schema change **never** triggers this flow. Migrations apply in place (§5);
+  re-seeding is for a CDC gap only.
 
-### Resuming in practice
+### Resuming in practice### Resuming in practice
 
 Keeping the sequence client-side allows **ephemeral** consumers. A durable consumer would have NATS track the position server-side, but that is per-client state on the server — thousands of mobile clients means thousands of consumer objects to create, leak and expire. Client-stored position keeps the server stateless.
 
 ---
 
-### Snapshot values come from the same decoder as CDC
+### Chain values converge with CDC values
 
-Snapshots use `COPY ... FORMAT binary` and decode through `pgoutput.decodeBinColumnData`
-— the decoder the CDC path already uses. A value is therefore identical whether it
-reached the client by seed or by stream; previously the two could differ and nothing
-would have said so.
+Chain rows come from the producer's ordinary text-mode queries; CDC values come from
+pgoutput. The client normalizes the one shape difference — text-mode `timestamptz`
+(`2026-01-01 00:00:00+00`) to the CDC wire form (`2026-01-01T00:00:00Z`), microseconds
+preserved — so the version guard compares like against like.
 
 Two consequences worth knowing:
 
@@ -948,15 +934,14 @@ decides what happens:
 | typtype | example | behaviour |
 | --- | --- | --- |
 | `e` (enum) | `CREATE TYPE mood AS ENUM (...)` | ✅ passes through — Postgres sends enum **labels as text** in binary |
-| anything else | `hstore`, composite, range, PostGIS | 🔴 refused, naming the column and OID: the snapshot aborts, and CDC **suspends the table** (§3) |
+| anything else | `hstore`, composite, range, PostGIS | 🔴 refused, naming the column and OID: CDC **suspends the table** (§3) and the producer skips it |
 
 The refusal exists because the alternative was observed in practice: an `hstore` column
 was emitting its binary wire form — `\0\0\0\1\0\0\0\1k\0\0\0\1v` — as a string value
 behind nothing but a warning. Plausible-looking, entirely wrong, and undetectable
 downstream.
 
-Both paths reach the same verdict from different sources. A snapshot reads `typtype`
-from the catalog inside its own transaction; CDC cannot query the catalog on the
+CDC cannot query the catalog on the
 replication hot path, so the **DDL event carries `oid` and `typtype` for every column**
 and the bridge keeps an OID → typtype registry. That registry needs no invalidation: a
 type's OID lives as long as the type, so dropping and recreating one yields a *new* OID
@@ -1134,10 +1119,10 @@ But that is only true for consumers that *write*. The read path needs no identit
 
 | | subscribe | publish | needs an account |
 | --- | --- | --- | --- |
-| **read-only consumer** | `cdc.>`, `init.>`, `$KV.schemas.>`, `$KV.snapshots.>` | `snapshot.request.>` | **no** |
+| **read-only consumer** | `cdc.>`, `$KV.schemas.>`, `$KV.generations.>`, the `gen-<tenant>` objects | — | **no** |
 | **read-write consumer** | the same | + `mutation.<principal>.>` | yes |
 
-So a deployment can offer local-first *reading* — schemas, snapshots, live CDC into a
+So a deployment can offer local-first *reading* — schemas, chain seeds, live CDC into a
 local SQLite — with a single shared credential and no user system whatsoever. Identity
 is required only at the point where a client starts writing back, which is also the
 point where "who is allowed to change this row" first becomes a question worth asking.
@@ -1321,7 +1306,7 @@ a tuning choice.
 
 ⚠️ **The refusal is scoped to the write path, not the table.** Such a table replicates
 outbound perfectly well and its readers are not at risk, so it keeps its CDC and its
-snapshots; only mutations are refused. Preflight also reports it at boot, so a table
+chains; only mutations are refused. Preflight also reports it at boot, so a table
 granted INSERT and shaped this way is named before any client tries.
 
 ⚠️ **A refused client is not a blocked client.** A rejected mutation costs you that one
@@ -1643,7 +1628,7 @@ allocates instead (§7.2).
   (`pg_index.indisprimary`), so it can be called anything.
 * Never `serial`/`bigserial` (§7.2), never a natural key such as an email (§7.2).
 * **Single column.** Composite keys are supported everywhere — local DDL, the upsert's
-  conflict target, delete-by-key, and the snapshot's keyset pagination — and are the right
+  conflict target, and delete-by-key — and are the right
   choice for read-only tables. For *writable* ones, prefer a surrogate; see below.
 
 #### The catalogue names your columns; the wire names never change
@@ -1968,8 +1953,8 @@ Checked at bridge startup (`src/preflight.zig`) and again on every DDL event:
 | composite PK | ✅ full support — pagination compares the whole key as a row value |
 | **no PK, any replica identity** | 🔴 **refused** (`no_primary_key`) — suspended, events dropped |
 | `TRANSITION_RULES` without `FULL` | ⚠️ transitions can never fire — silently inert |
-| column of an unsupported type | 🔴 **suspended** (`unsupported_column_type`) — CDC dropped, snapshots refused (§6) |
-| a row wider than the per-event buffer | 🔴 **suspended** (`row_too_large`) — the row fits no NATS message, so neither CDC nor a snapshot can carry it. Fix by moving the oversized column out of the replicated table, or by raising `BASE_BUF` within what `max_payload` allows |
+| column of an unsupported type | 🔴 **suspended** (`unsupported_column_type`) — CDC dropped, schema withheld (§3) |
+| a row wider than the per-event buffer | 🔴 **suspended** (`row_too_large`) — the row fits no NATS message, so no CDC event can carry it. Fix by moving the oversized column out of the replicated table, or by raising `BASE_BUF` within what `max_payload` allows |
 | the catalogue names a tenant column the table lacks | 🔴 **suspended** (`no_tenant_column`) |
 | the tenant column is outside the replica identity | 🔴 **suspended** (`tenant_not_in_replica_identity`) — a DELETE would carry the key and nothing else, so it could not be routed to a tenant at all and rows would stay in every replica that held them |
 
@@ -2012,7 +1997,7 @@ cannot be identified, so a DELETE could only be expressed as a full-row match �
 removes *every* duplicate where PostgreSQL removed one — and under at-least-once
 delivery a redelivered INSERT has nothing to upsert on, so it duplicates. Neither is
 fixable on the client. The bridge therefore publishes a suspension (§3), drops the
-table's CDC events, and refuses its snapshots, while every other table keeps
+table's CDC events and withholds its schema, while every other table keeps
 replicating. Fix it with a migration adding a primary key; recovery is automatic and
 needs no restart.
 
@@ -2022,9 +2007,7 @@ would otherwise stop replication for every table, and a table created while the 
 runs would turn a schema mistake into an outage.
 
 **A composite primary key is ordinary.** It identifies rows exactly, so CDC is fully
-correct, and snapshot chunking pages on the whole key with a row-value comparison —
-`("a","b") > (…) ORDER BY "a","b"` — which is the same ordering Postgres compares
-against, so no chunk boundary can fall inside a run of equal leading values.
+correct and the chain's upsert conflicts on the whole key.
 
 `REPLICA IDENTITY FULL` multiplies WAL volume on wide tables, so `DEFAULT` is a
 legitimate trade. The decision is **per table** and belongs in your migrations. Note
@@ -2044,7 +2027,7 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
   swap.
 
   The replica database name is timestamped by default — a fresh OPFS file every load, so
-  the dev loop always exercises schema, snapshot and CDC from empty. `VITE_DURABLE` opts
+  the dev loop always exercises schema, seeding and CDC from empty. `VITE_DURABLE` opts
   into a stable, per-principal name instead, which is what makes `_zebridge_outbox`
   actually durable across reloads rather than rebuilt-away with everything else.
 * `web-consumer/zb-mutate.mjs` — the smallest end-to-end write: one envelope, and the
