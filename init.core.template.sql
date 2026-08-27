@@ -1495,10 +1495,14 @@ BEGIN
         DECLARE
             eff_budget integer;
         BEGIN
+            -- Schema-qualified regclass comparison, IDENTICAL to
+            -- zebridge_install_width_guard's own derivation: `pt.tablename = short`
+            -- matches by bare name across every schema in the publication, so two
+            -- same-named tables in different schemas would share a budget.
             SELECT COALESCE((SELECT MIN(l.max_row_bytes)
                              FROM public.zebridge_limits l
                              JOIN pg_publication_tables pt ON pt.pubname = l.publication
-                             WHERE pt.tablename = short), 16384)
+                             WHERE format('%I.%I', pt.schemaname, pt.tablename)::regclass = tbl), 16384)
               INTO eff_budget;
             IF public.zebridge_rebudget_width_guard(tbl, eff_budget) THEN
                 RETURN QUERY SELECT 'width guard', 'done',

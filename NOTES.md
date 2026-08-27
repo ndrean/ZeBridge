@@ -4457,6 +4457,38 @@ Decided in review, recorded here so a session break loses nothing:
      crosstenant.py, envcheck.py, leaksoak.py, objstore_race.py, tls.py,
      tenant_kv.py, endpoint.py) so the bridge-side snapshot code can come out.
 
+## 10l. Finding 8: the newborn width-guard budget, and the workflow consolidated (2026-08-27)
+
+**Finding 8 (fixed, 4d6a030).** Every NEWLY enabled table's width guard baked the
+16384 default and ignored all registered instance budgets until the next bridge
+restart. Mechanism: `zebridge_enable` installs the guard BEFORE the publication
+step (the publication guard's own required ordering), but the baked budget
+derives from a join through `pg_publication_tables` — empty for the newborn at
+install time — so `COALESCE(..., 16384)` always won. Measured: livebirth's
+4096-budget probe STORED a 4096-byte row the guard exists to refuse (case C,
+reopened for newborns only). Found by re-running livebirth to verify the
+tombstone gate — the fix is a post-publication re-bake inside `zebridge_enable`
+(body-only rebudget, no table lock), reported as its own migration step.
+
+**The width-guard workflow, in one place** (the state after §10b, findings 7-8):
+
+  1. the bridge reads env `BASE_BUF` (env ONLY — there is no `--buf` CLI flag;
+     the CLI carries --slot/--pub/--port/--top and everything else is env.
+     OPEN: whether per-instance sizing deserves a CLI option);
+  2. at boot it calls `zebridge_register_limits(slot, publication, 2^BASE_BUF)`
+     over the READER connection (SECURITY DEFINER; EXECUTE-only grant) — one row
+     per instance in `zebridge_limits` (slot PK), dead-slot GC, and a re-bake of
+     every guard its publication carries;
+  3. `zebridge_install_width_guard` (at enable) and the boot re-bake both derive
+     the budget as MIN over instances whose publication carries the table,
+     via the schema-qualified `format('%I.%I', ...)::regclass = tbl` join,
+     defaulting 16384 — and `zebridge_enable` re-bakes AFTER the publication step
+     (finding 8). The enable re-bake originally compared `pt.tablename = short`
+     (name-only, over-matches across schemas) — unified to the regclass form the
+     day it was found, in review;
+  4. the guard BODY reads nothing at write time: the budget is a baked literal
+     (§10b's measurement: literal free, lookup +4.81us/row, join +22us/row).
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
