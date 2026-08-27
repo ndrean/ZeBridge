@@ -7,3 +7,4 @@
  */
 #include <libpq-fe.h>
 #include <time.h>
+#include <zstd.h>

@@ -263,7 +263,8 @@ pub const SyncClient = struct {
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
         var applied: usize = 0;
         for (plan.array.items) |step| {
-            const blob = try self.t.objectGetBytes(a, bucket, step.object.get("name").?.string);
+            const raw = try self.t.objectGetBytes(a, bucket, step.object.get("name").?.string);
+            const blob = try maybeZstd(a, raw); // §10w: magic-sniffed, mixed chains fine
             const doc = try decodeMsgpack(a, blob);
             const cols = try jsonStrList(a, doc.object.get("columns"));
             const vcol_v = doc.object.get("version_column") orelse (man.object.get("version_column") orelse @as(Value, .null));
@@ -460,6 +461,18 @@ fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
     var out = try a.alloc([]const u8, val.array.items.len);
     for (val.array.items, 0..) |x, i| out[i] = if (x == .string) x.string else "";
     return out;
+}
+
+/// Chain objects may be zstd frames (§10w) — sniffed by the standard 4-byte
+/// magic; decompression is pure std (std.compress.zstd), no C on the client.
+fn maybeZstd(a: std.mem.Allocator, b: []const u8) ![]const u8 {
+    if (b.len < 4 or b[0] != 0x28 or b[1] != 0xb5 or b[2] != 0x2f or b[3] != 0xfd) return b;
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(b);
+    var zs: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
+    _ = try zs.reader.streamRemaining(&out.writer);
+    return try out.toOwnedSlice();
 }
 
 /// msgpack bytes → std.json.Value (the shape core.zig speaks).

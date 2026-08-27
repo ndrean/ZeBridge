@@ -524,14 +524,23 @@ pub const GenerationProducer = struct {
             return err;
         };
         defer store.deinit();
+        // Chain objects ship as zstd frames (§10w): built once, read by every
+        // client forever — the one payload where compression amortizes fully.
+        // Clients detect by the standard 4-byte magic, so mixed chains (older
+        // uncompressed deltas referenced by the same manifest) keep working and
+        // no object is ever rewritten. Fulls take level 9 (read-many), deltas 3.
         if (full_payload) |p| {
+            const z = try compressZstd(alloc, p, 9);
+            log.info("🗜️ '{s}'/'{s}': g{d} full {d} -> {d} bytes ({d}%)", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1) });
             const name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen });
-            var r = try store.putBytes(name, p);
+            var r = try store.putBytes(name, z);
             r.deinit();
         }
         if (delta_payload) |p| {
+            const z = try compressZstd(alloc, p, 3);
+            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%)", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1) });
             const name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
-            var r = try store.putBytes(name, p);
+            var r = try store.putBytes(name, z);
             r.deinit();
         }
 
@@ -638,3 +647,12 @@ pub const GenerationProducer = struct {
         if (build_full) log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, full_payload.?.len });
     }
 };
+
+
+fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
+    const bound = c.ZSTD_compressBound(src.len);
+    const dst = try alloc.alloc(u8, bound);
+    const n = c.ZSTD_compress(dst.ptr, bound, src.ptr, src.len, level);
+    if (c.ZSTD_isError(n) != 0) return error.ZstdCompressFailed;
+    return dst[0..n];
+}

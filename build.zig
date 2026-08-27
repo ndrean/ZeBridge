@@ -12,6 +12,14 @@ const builtin = @import("builtin");
 /// Auto-detection:
 ///   macOS  → /opt/homebrew/opt/libpq  (brew install libpq)
 ///   Linux  → /usr                     (apk add postgresql-dev / apt install libpq-dev)
+/// Link system libzstd (compression side only: the generation producer
+/// compresses chain objects; clients DEcompress via std.compress.zstd or
+/// their runtime's native zstd — no C needed there).
+fn linkZstd(compile: *std.Build.Step.Compile, b: *std.Build, prefix: []const u8) void {
+    compile.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+    compile.root_module.linkSystemLibrary("zstd", .{});
+}
+
 fn linkLibpq(compile: *std.Build.Step.Compile, b: *std.Build, prefix: []const u8) void {
     const lib_path = b.pathJoin(&.{ prefix, "lib" });
     compile.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
@@ -46,6 +54,8 @@ pub fn build(b: *std.Build) void {
     // A path that does not exist is simply ignored.
     translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
     translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include", "postgresql" }) });
+    const zstd_prefix: []const u8 = if (builtin.os.tag == .macos) "/opt/homebrew/opt/zstd" else "/usr";
+    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
     const c_mod = translate_c.createModule();
 
     const mod = b.addModule("bridge", .{
@@ -98,6 +108,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.link_libc = true;
     linkLibpq(exe, b, prefix);
+    linkZstd(exe, b, zstd_prefix);
 
     b.installArtifact(exe);
 
@@ -116,6 +127,7 @@ pub fn build(b: *std.Build) void {
     });
     gc_exe.root_module.link_libc = true;
     linkLibpq(gc_exe, b, prefix);
+    linkZstd(gc_exe, b, zstd_prefix);
     b.installArtifact(gc_exe);
 
     const gc_run_cmd = b.addRunArtifact(gc_exe);

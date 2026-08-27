@@ -45,6 +45,12 @@ export interface ZeBridgeConfig {
   natsUrl: string;
   principal: string;
   password?: string;
+  /// Chain objects may arrive as zstd frames (detected by the 4-byte magic —
+  /// no manifest field, so mixed old/new chains keep working). Node decodes
+  /// via node:zlib automatically; a BROWSER host must supply this hook (the
+  /// web consumer passes fzstd's decompress). Absent where needed, seeding
+  /// fails LOUDLY naming the fix — never by feeding zstd bytes to msgpack.
+  zstdDecompress?: (b: Uint8Array) => Uint8Array | Promise<Uint8Array>;
   /// Operator/JWT mode: the CONTENT of a .creds file (user JWT + nkey seed).
   /// When set it wins over user/password — the JWT carries the permissions
   /// (scoped signing key), so no server conf names this principal at all.
@@ -1199,6 +1205,22 @@ export class ZeBridge {
     return this.config.grammar.open_tenant || this.tenantValue;
   }
 
+  /// zstd frame magic: 28 B5 2F FD. Our msgpack docs always start with a map
+  /// marker, so the sniff is unambiguous and needs no wire-format field.
+  private async maybeZstd(b: Uint8Array): Promise<Uint8Array> {
+    if (b.length < 4 || b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return b;
+    if (this.config.zstdDecompress) return await this.config.zstdDecompress(b);
+    // Node default, written so a BROWSER tsconfig/bundler never sees the node
+    // module: globalThis probe + Function-constructed dynamic import.
+    const proc = (globalThis as any).process;
+    if (proc?.versions?.node) {
+      const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
+      const zlib = await dynImport('node:zlib');
+      return new Uint8Array(zlib.zstdDecompressSync(b));
+    }
+    throw new Error('chain object is zstd-compressed: pass config.zstdDecompress (e.g. fzstd.decompress in the browser)');
+  }
+
   private async resolveTenant() {
     if (!this.nc) return;
     try {
@@ -1247,8 +1269,10 @@ export class ZeBridge {
     try { os = await this.transport.objectStore(this.nc, manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
     const fetchDoc = async (name: string): Promise<any | null> => {
       try {
-        const blob = await os.getBlob(name);
-        return blob ? (decode(blob) as any) : null; // objects are msgpack
+        let blob = await os.getBlob(name);
+        if (!blob) return null;
+        blob = await this.maybeZstd(blob); // §10w: sniffed by magic, mixed chains fine
+        return decode(blob) as any; // objects are msgpack
       } catch (e) { this.appendLog('SYS', `${table}: chain object ${name} unreadable: ${e}`, 'ERROR'); return null; }
     };
 

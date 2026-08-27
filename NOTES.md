@@ -5027,6 +5027,53 @@ planner; the shell takes the create-only branch), and consumer cleanup (the
 teardown logs a cosmetic 404). Known Zig 0.16 boundary: consumer names come
 from pid+counter because std.crypto.random now wants an Io.
 
+## 10w. zstd on the chain objects — phase one (2026-08-27)
+
+The original zstd instinct, landed where the architecture now wants it. The
+reasons, restated as they were argued: chains are per-table snapshots of the
+same shape every time (the compressible case by construction); NATS holds a
+mirror of the database, so the object store IS storage and deserves a real
+codec; a mobile client's seed download is the biggest bytes-on-radio item in
+the protocol; and placement — broker-side `compression: s2` taxes every NATS
+node per stored block, while producer-side zstd is paid ONCE at the edge by
+the process that owns the CPU budget, and unlike broker compression the wire
+bytes shrink too.
+
+**The shape.** The producer compresses each chain object before `putBytes`
+(fulls level 9 — built once, read many; deltas level 3) and logs the ratio
+per build. Detection is the standard 4-byte zstd magic (`28 B5 2F FD`), NOT
+a manifest field: a manifest references deltas from several generations, so
+any manifest-level flag lies during a transition and a per-object field means
+bookkeeping migrations — while the magic is unambiguous (our msgpack docs
+always begin with a map marker) and lets mixed-era chains work with no object
+ever rewritten. Manifests stay uncompressed JSON (tiny, debuggable). CDC
+events stay uncompressed (tiny payloads, poor ratio; their streams keep
+broker s2 for storage). The gen buckets get no s2 — double compression is
+CPU for nothing.
+
+**The decoder matrix that makes it cheap**: compression needs C (the bridge
+links libzstd, same pattern as libpq) but DECOMPRESSION is native everywhere
+— Zig `std.compress.zstd` (pure std, the client links nothing), Node
+`node:zlib` (probed via globalThis so browser tsconfigs never see the
+module), the browser via a `config.zstdDecompress` hook (web-consumer passes
+fzstd, ~30 KB pure JS), Python 3.14 stdlib. Verified live through all three
+consumers against MIXED chains (old uncompressed fulls + new compressed
+deltas in one manifest): Node seeded via node:zlib, zb-demo via std, the
+browser via fzstd — every count identical to Postgres. Dev-sized deltas
+compress to 75–85%; the real ratios arrive with real fulls, and the per-build
+🗜️ log line is the measurement.
+
+**Phase two, designed and parked (§10q of compression):** the dictionary.
+The first implementation's per-table trained dictionaries died of lifecycle —
+training pipeline, drift, distribution, retention coupling. The chain
+dissolves all four: train at build time from the full (the perfect,
+always-fresh corpus), store the dictionary as a chain member, reference it
+from the manifest — lifecycle becomes chain lifecycle, GC'd by chain pruning.
+Build it only if the delta ratios say so.
+
+(web-consumer/src/App.tsx carries the fzstd hook but is deliberately NOT in
+this commit — the file holds the user's own in-progress edits.)
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

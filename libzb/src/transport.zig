@@ -117,7 +117,9 @@ test "live: creds connect, schema KV, chain manifest, chain object" {
     const full = man.value.object.get("full").?.object.get("object").?.string;
     const blob = try t.objectGetBytes(aa, "gen-_default", full);
     try std.testing.expect(blob.len > 0);
-    // msgpack map marker: fixmap (0x80-0x8f) or map16/32 (0xde/0xdf)
+    // msgpack map marker (fixmap/map16/map32) OR a zstd frame (§10w magic).
     const b0 = blob[0];
-    try std.testing.expect((b0 >= 0x80 and b0 <= 0x8f) or b0 == 0xde or b0 == 0xdf);
+    const is_map = (b0 >= 0x80 and b0 <= 0x8f) or b0 == 0xde or b0 == 0xdf;
+    const is_zstd = blob.len >= 4 and b0 == 0x28 and blob[1] == 0xb5 and blob[2] == 0x2f and blob[3] == 0xfd;
+    try std.testing.expect(is_map or is_zstd);
 }
