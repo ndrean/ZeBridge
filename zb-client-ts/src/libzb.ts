@@ -787,7 +787,31 @@ export class ZeBridge {
     const tenantColumn: string | null = typeof val.tenant_column === 'string' ? val.tenant_column : null;
     const names = cols.map((c) => c.name);
 
-    const existing = this.syncedTables.get(table);
+    // ── FINDING 9 (the destroyer behind §10j): "first sight" must be decided by
+    // the DATABASE, not this in-memory map. `syncedTables` is empty in every fresh
+    // process, so a durable replica's every reconnect took the "first sight" path —
+    // DROP TABLE + CREATE — wiping the data while the durable bookkeeping
+    // (watermarks, stream positions) survived and testified that everything was
+    // fine. Measured in a clean room: every run logged `created (first sight)` for
+    // every table; a reconnect with no gap left users=0/salaries=0 because nothing
+    // re-seeded what the drop had just emptied; and one run kept its users only
+    // because the salaries FOREIGN KEY blocked the DROP. This single defect is the
+    // vanished-cx-users and the 3750-of-4500 of §10j.
+    let existing = this.syncedTables.get(table);
+    if (!existing) {
+      try {
+        const phys: any[] = (await this.run(`PRAGMA table_info("${table}")`)) ?? [];
+        if (phys.length) {
+          existing = {
+            columns: phys.map((c: any) => c.name),
+            pkCols: phys.filter((c: any) => c.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((c: any) => c.name),
+            lsn: 0,
+            tombstoneColumn: null,
+            tenantColumn: null,
+          };
+        }
+      } catch { /* engine without the pragma — behaves as before */ }
+    }
     // Renames land BEFORE the add/remove diff — a renamed column is neither.
     const renames: [string, string][] = existing
       ? Object.entries((val.renamed ?? {}) as Record<string, string>)
@@ -830,6 +854,11 @@ export class ZeBridge {
       (pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '') + fkClauses;
 
     const rebuildPreservingData = async (why: string) => {
+      // Schema surgery on an already-consistent copy: with foreign_keys ON, the
+      // DROP of a referenced parent is refused outright (measured: users, blocked
+      // by salaries' FK). Off for the surgery, back on after — the data is copied,
+      // not changed.
+      try { await this.run(`PRAGMA foreign_keys = OFF;`); } catch { /* no pragma */ }
       const tmp = `${table}__migrating`;
       await this.run(`DROP TABLE IF EXISTS ${tmp};`);
       await this.run(`CREATE TABLE ${tmp} (${cols.map(ddl).join(', ')}${tableConstraint});`);
@@ -841,6 +870,7 @@ export class ZeBridge {
       }
       await this.run(`DROP TABLE IF EXISTS ${table};`);
       await this.run(`ALTER TABLE ${tmp} RENAME TO ${table};`);
+      try { await this.run(`PRAGMA foreign_keys = ON;`); } catch { /* no pragma */ }
       this.appendLog('SCHEMA', `${table}: rebuilt preserving common columns (${why}), lsn=${lsn}`, 'MIGRATE');
     };
 
@@ -1683,6 +1713,25 @@ export class ZeBridge {
     try {
       for (const streamName of this.cdcStreams()) {
         const setupStart = performance.now();
+        // A stream that is fully consumed (or empty) delivers no message, so the
+        // per-batch persist below never fires — record its CURRENT tail now, or a
+        // quiet stream reads as `local 0` forever and re-seeds every reconnect.
+        try {
+          const sinfo = await jsm.streams.info(streamName);
+          const tail = sinfo?.state?.last_seq ?? 0;
+          if (tail > (this.globalSyncState.seq[streamName] ?? 0) && (this.globalSyncState.seq[streamName] ?? 0) === 0) {
+            // Only when we hold NO position: a stored position must never jump
+            // forward past unconsumed messages. Zero means "fresh or gated-all",
+            // and in both cases seeding has just covered everything at or before
+            // the tail we are about to record.
+            this.globalSyncState.seq[streamName] = tail;
+            await this.run(
+              `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
+               ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
+              streamName, tail,
+            );
+          }
+        } catch { /* stream info unavailable — the per-batch persist still covers it */ }
         const last = this.globalSyncState.seq[streamName] ?? 0;
         const ci = await jsm.consumers.add(streamName, {
           deliver_policy: last > 0 ? DeliverPolicy.StartSequence : DeliverPolicy.All,
@@ -1738,6 +1787,31 @@ export class ZeBridge {
             // here is correct — what must never happen again is acking events that
             // were neither applied nor held.
             for (const m of toAck) m.ack();
+
+            // ── ADVANCE THE STREAM POSITION FOR EVERY DELIVERED MESSAGE ──
+            // It used to advance only inside applyEvent, whose early returns (the
+            // seed gate, the FK hold, the schema hold) skipped it — so a stream whose
+            // delivered events were all gated or held NEVER persisted a position,
+            // read as `local 0` on the next connect, and forced a FULL RE-SEED on
+            // every reconnect (measured in a clean room: run 1 applied everything
+            // and stream_seq still lacked CDC_PUBLIC, because its one event was
+            // correctly gate-dropped; run 2 then gap-detected and re-seeded with no
+            // new data). Delivery + accounting IS the position: an applied event is
+            // in the tables, a gated one is provably in the seeded chain, a held one
+            // is durably in the inbox — none of them needs redelivery.
+            const maxSeq = toAck.reduce((m2, msg) => Math.max(m2, msg.seq ?? 0), 0);
+            if (maxSeq > (this.globalSyncState.seq[streamName] ?? 0)) {
+              this.globalSyncState.seq[streamName] = maxSeq;
+              try {
+                await this.run(
+                  `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
+                   ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
+                  streamName, maxSeq,
+                );
+              } catch (e) {
+                this.appendLog('SQLITE', `Failed to persist ${streamName} position: ${e}`, 'ERROR');
+              }
+            }
             await this.retryFkHeld(streamName);
           };
 

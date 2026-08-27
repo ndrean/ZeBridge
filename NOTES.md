@@ -4403,6 +4403,10 @@ was reconnected repeatedly:**
      needs explaining — full-scan vs bookkeeping mismatch, or my reading of an
      interleaved log; NOT yet diagnosed.
 
+RESOLVED 2026-08-27: defect 1 is D1, fixed in §10m; defect 2's data losses
+(vanished cx users, 3750-of-4500) were finding 9 (§10m), not the chain path —
+the chain-full DELETE destruction itself remains real and is D2's scope.
+
 Both defects need a CLEAN-ROOM diagnosis (this environment has absorbed a day of
 purges and slot advances) before fixes: per §10h's own lesson, establish what
 actually ran before theorising. The under-ring run's "750 held, 0 resolved at
@@ -4488,6 +4492,66 @@ tombstone gate — the fix is a post-publication re-bake inside `zebridge_enable
      day it was found, in review;
   4. the guard BODY reads nothing at write time: the budget is a baked literal
      (§10b's measurement: literal free, lookup +4.81us/row, join +22us/row).
+
+## 10m. Finding 9: every reconnect dropped every table — and D1 closed (2026-08-27)
+
+The §10k clean room (5 users + 5 kilo salaries, full logs, tiny bridge config)
+ran before theorising, per §10h's lesson. It closed D1 and then convicted a
+single defect for BOTH §10j anomalies.
+
+**D1 — fixed.** The position persist lived only on the applied-event path;
+gate-dropped and held events returned before it. Fix: persist per BATCH, after
+the acks — delivery + accounting IS the position (an applied event is in the
+tables, a gated one is provably in the seeded chain, a held one is durably in
+the inbox). Plus: at consumer setup, a stream whose stored position is 0 gets
+the stream's current tail persisted (quiet-stream case; never moves a real
+stored position). Verified: the gap->re-seed loop is dead (reconnects report
+0 gap lines, 0 re-seeds, both streams in `_zebridge_stream_seq`).
+
+**Finding 9 (the §10j destroyer).** With D1 fixed, reconnects STILL lost data:
+one run ended `users=5 salaries=0`, the next `users=0 salaries=0` with the log
+explicitly saying "No CDC gap — no seeding needed". The full logs showed why:
+
+    [MIGRATE] users: created (first sight)     <- on EVERY connect
+    [ERROR] Applying schema for users failed: FOREIGN KEY constraint failed
+
+`applySchema` decided "first sight" from `syncedTables` — an IN-MEMORY map,
+empty in every fresh process — so every reconnect took the first-sight path:
+`DROP TABLE` + `CREATE`, wiping the data, while the durable bookkeeping
+(watermarks, stream positions) survived and testified everything was fine. The
+run that kept its users kept them by ACCIDENT: the salaries FK blocked the
+DROP (that's the [ERROR] line). When seeding was skipped — correctly, no gap —
+nothing refilled what the drop had just emptied.
+
+This one defect explains all of §10j's unexplained data: the vanished cx users,
+the 3750-of-4500 chain-full mystery (the count was taken from a replica that a
+reconnect had partially wiped), and §10g's "stale snapshot destruction" had the
+same silhouette. The durable client was never durable for DATA — only for its
+bookkeeping, which made every symptom look like a seeding bug.
+
+**Fix (two parts, both in libzb.ts):**
+  1. Existence comes from the DATABASE: when `syncedTables` misses, read
+     `PRAGMA table_info` and reconstruct the existing-table state (columns +
+     pk order) from the physical schema. "First sight" now means the table is
+     genuinely absent.
+  2. `rebuildPreservingData` (the legitimate drop/recreate path) wraps itself
+     in `PRAGMA foreign_keys OFF/ON`: with FK ON, SQLite refuses the DROP of a
+     referenced parent outright (measured — the [ERROR] line above). The data
+     is copied, not changed, so the surgery is FK-safe by construction.
+
+Verified together: fresh seed then two reconnects -> `users=8 salaries=8` all
+three runs, `created (first sight)` 9 tables on run 1 and ZERO on reconnects,
+0 gaps, and PG agrees (8/8).
+
+**Lesson** (same family as §10h): the in-memory mirror of durable state is a
+cache, never the truth. Any decision that destroys data must be grounded in
+what is physically in the database.
+
+**Still open — D2, now sharply scoped**: the destruction that remains is real
+but narrow. A gap on one stream still re-seeds globally, and a chain-full apply
+is still `DELETE FROM` + insert, so a chain older than the replica's CDC-applied
+data still destroys the newer rows. Next: per-stream scoping + the per-table
+data watermark before any chain-full DELETE (§10g residual, §10k D2).
 
 ## 11 Restart Rules
 
