@@ -1171,16 +1171,41 @@ GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer)
 
 
 
--- Which tenants a tenant-scoped table currently holds — the generation producer's
--- per-tenant chain set, derived from the DATA (dyntenant-correct: a new tenant's
--- first row creates its chain on the next tick; grammar.json is not runtime
--- truth). SECURITY DEFINER because the reader's own RLS would scope the DISTINCT
--- to one tenant — PG functions hold the rules.
+-- The generation producer's per-tenant chain set: tenants found in the DATA,
+-- UNIONed with every tenant the system KNOWS (zebridge_user_tenants).
+--
+-- Data alone was the original rule (dyntenant-correct: a new tenant's first row
+-- creates its chain on the next tick) — but data alone made "no chain" AMBIGUOUS.
+-- Measured (NOTES §10h): test_types holds rows for acme/dynten only, so no
+-- kilo chain was ever built, and a kilo client could not tell "producer has not
+-- built yet" from "genuinely empty for me" — the retired snapshot path used to
+-- answer that with a 0-row RLS dump. Including known tenants means an EMPTY
+-- MANIFEST (a 0-row full) is built for them, which is the explicit "nothing to
+-- seed": the client seeds zero rows, anchors its watermark, and follows CDC.
+--
+-- A tenant that exists ONLY as data (dyntenant, not yet registered) still gets
+-- its chain from the data half of the union — neither source is dropped.
+--
+-- ⚠️ `zebridge_user_tenants` is created by init.write, and THIS file must stay
+-- runnable (and its functions callable) in the read-only profile — hence the
+-- to_regclass guard rather than a bare reference: plpgsql only resolves tables
+-- at call time, so an unguarded reference would pass the apply and then fail
+-- every producer tick on a read-only deployment.
+--
+-- SECURITY DEFINER because the reader's own RLS would scope the DISTINCT to one
+-- tenant — PG functions hold the rules.
 CREATE OR REPLACE FUNCTION public.zebridge_tenants_of(tbl regclass, tenant_col name)
 RETURNS SETOF text AS $$
 BEGIN
-    RETURN QUERY EXECUTE format(
-        'SELECT DISTINCT %I::text FROM %s WHERE %I IS NOT NULL', tenant_col, tbl, tenant_col);
+    IF to_regclass('public.zebridge_user_tenants') IS NOT NULL THEN
+        RETURN QUERY EXECUTE format(
+            'SELECT DISTINCT %I::text FROM %s WHERE %I IS NOT NULL '
+            'UNION SELECT DISTINCT tenant_id::text FROM public.zebridge_user_tenants',
+            tenant_col, tbl, tenant_col);
+    ELSE
+        RETURN QUERY EXECUTE format(
+            'SELECT DISTINCT %I::text FROM %s WHERE %I IS NOT NULL', tenant_col, tbl, tenant_col);
+    END IF;
 END;
 $$ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_catalog;
 

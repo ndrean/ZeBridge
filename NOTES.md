@@ -4251,11 +4251,23 @@ strict for the genuinely-empty case. The producer publishing an explicit empty
 manifest per known (tenant, table) — or a tenant-scoped "nothing to seed" marker —
 is the clean fix; NOT built.
 
+**CLOSED same day — the empty manifest.** `zebridge_tenants_of` now UNIONs the
+data-derived tenant set with every tenant the system KNOWS
+(`zebridge_user_tenants`), so a known tenant with no rows in a table gets a
+0-row full built for it — the explicit "nothing to seed". The client seeds zero
+rows, anchors its watermark, and follows CDC; a dyntenant that exists only as
+data still gets its chain from the data half of the union, so neither source is
+dropped. Guarded with `to_regclass` because `zebridge_user_tenants` is created by
+init.write and plpgsql resolves tables at CALL time — an unguarded reference
+would pass the apply and then fail every producer tick on a read-only deployment.
+No bridge change and no restart: the producer calls the function fresh each tick.
+Verified: `kilo.test_types` g1 built on the next cadence, the client seeded it as
+0 rows with a watermark, no exclusions, no 90s wait — and 0 rows also confirms
+the tenant scoping held (none of acme's rows leaked into kilo's chain).
+
 ### Open
 
   * the monotonic stamp + per-scope checkpoint (§10f) — designed, not built;
-  * the "no chain vs empty tenant" disambiguation above — the producer side of
-    retiring snapshots;
   * the per-table DATA watermark (§10g) — still wanted for CDC-side safety even
     with snapshot replay retired;
   * bridge-side retirement (snapshot listener, REQUESTS/SNAP_RET, INIT streams) —
