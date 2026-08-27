@@ -4225,15 +4225,42 @@ that it was REACHED before theorising about why it failed. The unfiltered log sa
 so the whole time; grepping for the expected failure hid it. Three wrong fixes
 cost more than reading the log once would have.
 
+### Retired instead of fixed (2026-08-27)
+
+The client's snapshot-on-demand seeding is now GATED OFF (`LEGACY_SNAPSHOT_SEEDING
+= false` in libzb.ts — kept readable, not erased: the path earned three findings in
+one day and the code is their documentation). Seeding is generations-only, with a
+bounded wait (`GENERATION_WAIT_MS`, polled) for a chain that has not been built
+yet; a still-chainless table fails LOUDLY, is excluded from CDC, and seeds on the
+next connect. The bridge still SERVES snapshots — old consumers and the scenario
+suite are untouched; only this client stopped asking.
+
+That retirement DISSOLVES two of the §10g opens for this client (the stale
+descriptor cannot rewind a table it never replays; the throttle cannot deadlock a
+request never made) — and immediately exposed the retired path's one real virtue:
+
+**"No chain" is ambiguous, and the snapshot path used to disambiguate it.**
+Solved live: `test_types` would not seed for omar, and the cause was not the
+throttle after all — its 33 rows belong to `acme`/`dynten`, omar is `kilo`, and
+the producer derives tenants FROM DATA, so a `kilo.test_types` chain simply never
+exists. "No chain for my tenant" means EITHER "producer has not built yet" OR
+"the correct state is empty", and the old path answered the second case with a
+0-row RLS-scoped dump. Guessing "empty" would silently diverge when the producer
+is merely down, so the client currently refuses loudly — correct but overly
+strict for the genuinely-empty case. The producer publishing an explicit empty
+manifest per known (tenant, table) — or a tenant-scoped "nothing to seed" marker —
+is the clean fix; NOT built.
+
 ### Open
 
   * the monotonic stamp + per-scope checkpoint (§10f) — designed, not built;
-  * the orphaned-descriptor + `SNAP_RET` throttle deadlock (§10g) — a table whose
-    cached snapshot ages out cannot get a fresh one inside the window; it no longer
-    blocks other tables, but it is unresolved, and it lives in the legacy snapshot
-    path that generations are meant to retire;
-  * the per-table DATA watermark (§10g) — without it the stale-snapshot guard is
-    partial, because `global_last_lsn` is global and `state.lsn` is the schema's.
+  * the "no chain vs empty tenant" disambiguation above — the producer side of
+    retiring snapshots;
+  * the per-table DATA watermark (§10g) — still wanted for CDC-side safety even
+    with snapshot replay retired;
+  * bridge-side retirement (snapshot listener, REQUESTS/SNAP_RET, INIT streams) —
+    deliberately untouched so old consumers and the scenario suite keep working;
+    remove once no consumer asks.
 
 ## 11 Restart Rules
 

@@ -18,7 +18,7 @@ Consumers query their replica offline  - dashboard, search index, analytics...an
 NATS/JS is the transport, the fan-out/in, and the tenant boundary.
 
 **Design**: This tool is built to serve a large number of small to medium consumers via the message broker NATS/JS, so it is designed to be fast and safe.
-It is NOT for large and long tables or tables containing large objects: it is not a file transfer tool. A large blob (> 1 MB) belongs in object storage. Tables should only contain the reference to a blob.
+It is NOT for large and long tables or tables containing large objects: it is not a file transfer tool. A large blob (> 1 MB) belongs in object storage. Tables should only contain the metadata, a reference (URL of the bucket) to a blob.
 
 **Performance**: you can expect up to 250-300.000 evt/s on your local computer. It essentially depends entirely on Postgres `pgoutput` rate. ZeBridge and NATS just absorb whatever's given. Once deployed, you have the unavoidable network latency.
 See [An example of a measured throughput](#an-example-of-a-measured-throughput) for a real, reproducible number — run it yourself on your own hardware before trusting any figure quoted here.
@@ -1512,7 +1512,7 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 * [ ] TLS on the NATS↔leaf and PG↔bridge links for cross-network deployments.
 * [ ] **Windows Server for the bridge daemon** — Zig targets `x86_64-windows`, but the daemon has Unix-isms to port first: POSIX signal handling for graceful shutdown (→ `SetConsoleCtrlHandler`) and the `poll()` WAL loop (→ `WSAPoll`), then the scenario suite re-run on Windows. Colocation with NATS is usually Linux, so this is for Windows-only shops. **Separate from the consumer**, which already runs on Windows today — native `libzebridge.dll` via P/Invoke, or `libzebridge.js` in a Node/Electron service, no wasm needed.
 * [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite (single owned connection); still to verify for PGlite, and to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.
-* [ ] **Retire the snapshot path.** Generations are the seed mechanism; snapshots survive only as the cold-start fallback. Cover that case with generations (a chain built on first sight of a tenant/table) and remove the snapshot request/serve path — one fewer moving part, and Postgres is never queried per consumer.
+* [~] **Retire the snapshot path.** CLIENT side done (2026-08-27): `libzb` seeds from generation chains only, with a bounded wait for a chain not yet built — snapshot-on-demand is gated off after it produced three findings in one day (NOTES §10g/§10h). Remaining: the producer must disambiguate "no chain yet" from "genuinely empty for this tenant" (an explicit empty manifest), and the bridge-side serve path (snapshot listener, REQUESTS/SNAP_RET, INIT streams) comes out once no consumer asks — one fewer moving part, and Postgres is never queried per consumer.
 * [ ] **A post-boot wiring checker** — one command, run once the bridge is up, that verifies the whole chain (catalogue ↔ streams ↔ grants ↔ RLS) and returns a single verdict. Today the pieces are `check.py` and the `zebridge_audit_*()` functions; the goal is to unify them into one green/red gate.
 * [ ] Metrics export to StatsD/InfluxDB
 

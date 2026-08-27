@@ -71,6 +71,22 @@ interface BucketEntry {
 /// max_age (retrying at the last moment is the same as not retrying).
 const SNAPSHOT_WAIT_MS = 60_000;
 const SNAPSHOT_REQUEST_ATTEMPTS = 5;
+
+/// ⚠️ RETIRED 2026-08-27 — snapshot-on-demand seeding (NOTES §10g/§10h; README
+/// roadmap "Retire the snapshot path"). Seeding is cron-based generations now:
+/// the producer queries PG on GENERATION_CADENCE_SECONDS and pushes chains to
+/// object storage; a client pulls the chain and never asks PG-adjacent machinery
+/// for a bespoke dump. The legacy path is GATED, not erased, because it earned
+/// three findings in one day — a stale descriptor that DELETEd 5,000 correct rows,
+/// the SNAP_RET throttle deadlocking an orphaned table for its whole 7-day window,
+/// and 5x60s of head-of-line blocking — and the code is the documentation of them.
+/// Flip to true only to study that behaviour; never in production.
+const LEGACY_SNAPSHOT_SEEDING: boolean = false;
+/// How long a client waits for the producer to publish a usable chain before
+/// declaring the table unseedable. Covers a fresh table between two cadence ticks;
+/// a table still chainless after this fails LOUDLY and seeds on the next connect.
+const GENERATION_WAIT_MS = 90_000;
+const GENERATION_POLL_MS = 10_000;
 /// Derived from bridge-side max_deliver × retry sleep + batch window + slack; see the
 /// verdict-timeout discussion in PROTOCOL §7 — a guess kept in step by hand until it
 /// rides in the schema descriptor.
@@ -1509,14 +1525,39 @@ export class ZeBridge {
           const tenantForTable = tenanted ? this.effectiveTenantFor(table) : '';
           const snapKey = tenanted ? `${tenantForTable}.${table}` : table;
 
-          // Delta generations first (NOTES.md §1.13): the producer builds once on a
-          // cadence, every client catches up on deltas. Any "not this way" outcome
-          // falls through to the snapshot request path unchanged.
+          // Generations are the ONLY seeding path (NOTES.md §1.13, §10h): the
+          // producer builds once on a cadence, every client catches up on deltas.
           if (await this.applyGenerations(table)) {
             this.reach('snapshot');
             return;
           }
 
+          if (!LEGACY_SNAPSHOT_SEEDING) {
+            // No usable chain yet — the ordinary case is a table created between two
+            // cadence ticks. Wait for the producer rather than demanding a bespoke
+            // dump: polling the chain is idempotent and cannot rewind anything,
+            // which is precisely what the retired path below could not promise.
+            this.appendLog('SYS', `${table}: no generation chain yet — waiting up to ${GENERATION_WAIT_MS / 1000}s for the producer (builds every GENERATION_CADENCE_SECONDS)`, 'INFO');
+            const deadline = Date.now() + GENERATION_WAIT_MS;
+            while (Date.now() < deadline) {
+              await new Promise((r) => setTimeout(r, GENERATION_POLL_MS));
+              if (await this.applyGenerations(table)) {
+                this.reach('snapshot');
+                return;
+              }
+            }
+            // Unseeded is NOT the same as synced: following CDC against an unseeded
+            // table diverges silently — strictly worse than being visibly absent.
+            this.syncedTables.delete(table);
+            this.failed.add(table);
+            this.scheduleRecount();
+            this.appendLog('SYS', `Giving up on ${table}: no generation chain after ${GENERATION_WAIT_MS / 1000}s — NOT following CDC for it. Check the producer (GENERATIONS_ENABLED, its cadence, and the gen-<tenant> object store); the table seeds on the next connect once a chain exists. Snapshot-on-demand is retired (NOTES §10h).`, 'ERROR');
+            return;
+          }
+
+          // ─────────────────────────────────────────────────────────────────────
+          // Everything below is the RETIRED path, reachable only via the gate above.
+          // ─────────────────────────────────────────────────────────────────────
           let desc: any = null;
           let rejectedId: string | undefined;
           if (snapKv) {
