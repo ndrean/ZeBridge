@@ -1,3 +1,0 @@
-flask[async]
-nats-py
-msgpack
