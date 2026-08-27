@@ -4758,7 +4758,19 @@ neither.
 users 13 rows from the fresh g1), reconnect with zero gaps, zero re-seeds and
 zero `created (first sight)` (findings 9/10 stay dead), offline cross-stream
 FK pair held then resolved on parent arrival — replica == PG (14/16).
-Browser pass pending (Chrome extension disconnected at time of writing).
+**Browser pass (web-consumer over ws://8080, JWT enrollment)**: invite
+`webby@kilo` redeemed end to end — GET /enroll minted the JWT (client-side
+nkey pair, seed never crossed the wire), used_at stamped, zebridge_user_tenants
+row + live $KV.tenants entry; the page connected, seeded all 9 tables with
+counts identical to PG, rendered the three suspended fixtures as banners, and
+went live: a psql INSERT appeared in the browser within seconds (users 14->15,
+INS badge), and the UI's test_types INSERT round-tripped browser -> MUTATIONS
+-> writer -> PG -> CDC echo, with the replica seeing exactly its own kilo row
+of PG's five (tenant scoping live). ⚠️ Operational gotcha found on the way:
+the mint arms only when BOTH `ZB_SIGNING_SEED` (the client-scoped signing key
+seed, in scripts/native/nsc-store/.../keys/A/...) AND `ZB_ACCOUNT_PUB` (the
+ZEBRIDGE account public key) are set — with only the seed it stays off
+SILENTLY (no warn line; the warn only covers the missing-writer case).
 
 ## 11 Restart Rules
 
