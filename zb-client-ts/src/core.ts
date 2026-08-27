@@ -162,3 +162,110 @@ export const lsnToNumber = (lsn: string): number => {
   const [hi, lo] = String(lsn).split('/');
   return parseInt(hi, 16) * 0x100000000 + parseInt(lo, 16);
 };
+
+// ─── the apply SQL builders (§10s increment 2a) ──────────────────────────────
+//
+// The exact statements a replica executes for one CDC event and for one chain
+// row. Pure string/param construction — the shell owns exec, transactions,
+// logging and error classification. A port producing byte-identical SQL and
+// params is applying events exactly like this client.
+
+export type SqlStep = { sql: string; params: any[] };
+export type KeyChangeStep = SqlStep & { oldKey: any[]; newKey: any[] };
+
+/// One CDC value → one bound parameter: structured values travel as JSON text
+/// (SQLite has no object affinity); everything else binds as-is (the CDC wire
+/// already normalizes timestamps).
+export const cdcValue = (v: any): any =>
+  v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+
+/// A changed primary key arrives as an UPDATE with `old.*` — the old key must
+/// be deleted first, or the row lives on under both keys forever (measured
+/// live). Null when the event carries no complete, actually-different old key.
+export function planKeyChange(
+  table: string,
+  pkCols: string[],
+  data: Record<string, any>,
+): KeyChangeStep | null {
+  if (!pkCols.length) return null;
+  const oldKey = pkCols.map((c) => data[`old.${c}`]);
+  const newKey = pkCols.map((c) => data[c]);
+  const changed =
+    oldKey.every((v) => v !== undefined && v !== null) &&
+    oldKey.some((v, i) => v !== newKey[i]);
+  if (!changed) return null;
+  const where = pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+  return { sql: `DELETE FROM ${table} WHERE ${where}`, params: oldKey, oldKey, newKey };
+}
+
+/// The CDC upsert: INSERT .. ON CONFLICT(pk) DO UPDATE over the non-key
+/// columns. A table whose every column is in the key gets DO NOTHING — a
+/// redelivered insert must converge, not throw (the §7.1 idempotency promise;
+/// the chain path always had this and the CDC path now matches it). A keyless
+/// table gets a plain INSERT (it is refused upstream anyway, §9).
+export function planUpsert(
+  table: string,
+  pkCols: string[],
+  data: Record<string, any>,
+): SqlStep {
+  const dataKeys = Object.keys(data).filter((k) => !k.startsWith('old.'));
+  const params = dataKeys.map((k) => cdcValue(data[k]));
+  const columns = dataKeys.map((k) => `"${k}"`).join(', ');
+  const placeholders = dataKeys.map(() => '?').join(', ');
+  const updates = dataKeys
+    .filter((k) => !pkCols.includes(k))
+    .map((k) => `"${k}" = excluded."${k}"`)
+    .join(', ');
+  let sql = `INSERT INTO ${table} (${columns}) VALUES (${placeholders})`;
+  if (pkCols.length) {
+    const conflict = pkCols.map((c) => `"${c}"`).join(', ');
+    sql += updates
+      ? ` ON CONFLICT(${conflict}) DO UPDATE SET ${updates}`
+      : ` ON CONFLICT(${conflict}) DO NOTHING`;
+  }
+  return { sql, params };
+}
+
+/// The CDC delete. Null when any key column is absent: a partial composite key
+/// would match MORE rows than PostgreSQL deleted — skipping is the only safe
+/// answer (the row converges on the next seed).
+export function planDelete(
+  table: string,
+  pkCols: string[],
+  data: Record<string, any>,
+): SqlStep | null {
+  if (!pkCols.length) return null;
+  const params = pkCols.map((c) => data[c]);
+  if (!params.every((v) => v !== undefined && v !== null)) return null;
+  const where = pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+  return { sql: `DELETE FROM ${table} WHERE ${where}`, params };
+}
+
+/// The chain-row upsert: like planUpsert but column-list driven (chain objects
+/// carry rows as arrays), and version-GUARDED when the table has a version
+/// column the object carries — a chain row must never overwrite a NEWER value
+/// CDC already applied (LWW holds during seeding too).
+export function chainUpsertSql(
+  table: string,
+  cols: string[],
+  pkCols: string[],
+  versionCol: string | null,
+): string {
+  const colList = cols.map((c) => `"${c}"`).join(', ');
+  const ph = cols.map(() => '?').join(', ');
+  const conflict = pkCols.map((c) => `"${c}"`).join(', ');
+  const sets = cols.filter((c) => !pkCols.includes(c))
+                   .map((c) => `"${c}" = excluded."${c}"`).join(', ');
+  let sql = `INSERT INTO ${table} (${colList}) VALUES (${ph})`;
+  sql += sets
+    ? ` ON CONFLICT(${conflict}) DO UPDATE SET ${sets}` +
+      (versionCol ? ` WHERE excluded."${versionCol}" > ${table}."${versionCol}"` : '')
+    : ` ON CONFLICT(${conflict}) DO NOTHING`;
+  return sql;
+}
+
+/// One chain row → bound parameters: structured values as JSON, text-mode
+/// timestamps normalized to the CDC wire shape so the version guard compares
+/// like against like (NOTES §1.13).
+export const chainRowParams = (row: any[]): any[] =>
+  row.map((v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : pgTsToWire(v)));

@@ -32,7 +32,8 @@ import { browserStorage } from './browser-storage.ts';
 import { v7 as uuidv7 } from 'uuid';
 import {
   seedGateDrops, planFromManifest, fullPredatesReplica as coreFullPredates,
-  scopeSeeding, advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
+  scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber,
+  planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
 
@@ -1138,55 +1139,32 @@ export class ZeBridge {
         return;
       }
 
-      // A changed primary key arrives as an UPDATE with `old.*` — delete the old key
-      // first, or the row lives on under both keys forever (measured live).
-      if (state.pkCols.length) {
-        const oldPk = state.pkCols.map((c) => ev.data[`old.${c}`]);
-        const newPk = state.pkCols.map((c) => ev.data[c]);
-        const keyChanged =
-          oldPk.every((v) => v !== undefined && v !== null) &&
-          oldPk.some((v, i) => v !== newPk[i]);
-        if (keyChanged) {
-          const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
-          try {
-            await exec(`DELETE FROM ${table} WHERE ${where}`, ...oldPk);
-            this.appendLog('CDC', `Key change on ${table}: ${JSON.stringify(oldPk)} → ${JSON.stringify(newPk)}`, 'REKEY');
-          } catch (err) {
-            this.appendLog('SQLITE', `Key-change cleanup on ${table} failed: ${err}`, 'ERROR');
-          }
+      // The statements come from core.ts (§10s 2a): the key-change delete
+      // (a changed PK arrives as an UPDATE with old.* — measured: the row
+      // lived under both keys) and the idempotent upsert, fixture-pinned.
+      const kc = planKeyChange(table, state.pkCols, ev.data);
+      if (kc) {
+        try {
+          await exec(kc.sql, ...kc.params);
+          this.appendLog('CDC', `Key change on ${table}: ${JSON.stringify(kc.oldKey)} → ${JSON.stringify(kc.newKey)}`, 'REKEY');
+        } catch (err) {
+          this.appendLog('SQLITE', `Key-change cleanup on ${table} failed: ${err}`, 'ERROR');
         }
       }
 
-      const dataKeys = keys.filter((k) => !k.startsWith('old.'));
-      const values = dataKeys.map((k) => ev.data[k]).map((v) =>
-        v !== null && typeof v === 'object' ? JSON.stringify(v) : v,
-      );
-      const columns = dataKeys.map((k) => `"${k}"`).join(', ');
-      const placeholders = dataKeys.map(() => '?').join(', ');
-      const updates = dataKeys
-        .filter((k) => !state.pkCols.includes(k))
-        .map((k) => `"${k}" = excluded."${k}"`)
-        .join(', ');
-
-      let query = `INSERT INTO ${table} (${columns}) VALUES (${placeholders})`;
-      if (state.pkCols.length && updates) {
-        const conflict = state.pkCols.map((c) => `"${c}"`).join(', ');
-        query += ` ON CONFLICT(${conflict}) DO UPDATE SET ${updates}`;
-      }
-
+      const up = planUpsert(table, state.pkCols, ev.data);
       try {
-        await exec(query, ...values);
+        await exec(up.sql, ...up.params);
       } catch (err) {
         this.appendLog('SQLITE', `UPSERT on ${table} failed: ${err}`, 'ERROR');
       }
     } else if (op === 'DELETE') {
-      // Every key column must be present: a partial composite key would match more
-      // rows than PostgreSQL deleted.
-      const pkVals = state.pkCols.map((c) => ev.data[c]);
-      if (state.pkCols.length && pkVals.every((v) => v !== undefined && v !== null)) {
-        const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+      // core.planDelete: null on a partial composite key — deleting on it would
+      // match MORE rows than PostgreSQL did.
+      const del = planDelete(table, state.pkCols, ev.data);
+      if (del) {
         try {
-          await exec(`DELETE FROM ${table} WHERE ${where}`, ...pkVals);
+          await exec(del.sql, ...del.params);
         } catch (err) {
           this.appendLog('SQLITE', `DELETE on ${table} failed: ${err}`, 'ERROR');
         }
@@ -1335,23 +1313,16 @@ export class ZeBridge {
           return null;
         }
         const vcol: string = doc.version_column ?? manifest.version_column;
-        const colList = cols.map((c) => `"${c}"`).join(', ');
-        const ph = cols.map(() => '?').join(', ');
-        const conflict = state.pkCols.map((c) => `"${c}"`).join(', ');
-        const sets = cols.filter((c) => !state.pkCols.includes(c))
-                         .map((c) => `"${c}" = excluded."${c}"`).join(', ');
-        let q = `INSERT INTO ${table} (${colList}) VALUES (${ph})`;
-        q += sets
-          ? ` ON CONFLICT(${conflict}) DO UPDATE SET ${sets}` +
-            (vcol && cols.includes(vcol) ? ` WHERE excluded."${vcol}" > ${table}."${vcol}"` : '')
-          : ` ON CONFLICT(${conflict}) DO NOTHING`;
+        // core.chainUpsertSql: version-guarded when the object carries the
+        // table's version column — LWW holds during seeding too.
+        const q = chainUpsertSql(table, cols, state.pkCols,
+          vcol && cols.includes(vcol) ? vcol : null);
         await this.transaction(async (txExec) => {
           // A full replaces the baseline wholesale; the DELETE shares the transaction
           // so a crash mid-apply cannot leave an empty table.
           if (step.kind === 'full') await txExec(`DELETE FROM ${table}`);
           for (const row of doc.rows) {
-            await txExec(q, ...row.map((v: any) =>
-              v !== null && typeof v === 'object' ? JSON.stringify(v) : pgTsToWire(v)));
+            await txExec(q, ...chainRowParams(row));
           }
         });
         applied += doc.rows.length;

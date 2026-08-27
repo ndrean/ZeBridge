@@ -564,5 +564,243 @@
       "in": "0/C5793FD0",
       "out": 3313057744
     }
+  ],
+  "keyChange": [
+    {
+      "name": "changed key deletes the old one first (measured: row lived under both keys)",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "old.id": 1,
+        "id": 2,
+        "v": "x"
+      },
+      "step": {
+        "sql": "DELETE FROM t WHERE \"id\" = ?",
+        "params": [
+          1
+        ],
+        "oldKey": [
+          1
+        ],
+        "newKey": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "same key: no delete",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "old.id": 2,
+        "id": 2
+      },
+      "step": null
+    },
+    {
+      "name": "no old.* on the event: no delete",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": 2
+      },
+      "step": null
+    },
+    {
+      "name": "composite: any old column missing means no delete",
+      "table": "t",
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "data": {
+        "old.a": 1,
+        "a": 9,
+        "b": 9
+      },
+      "step": null
+    }
+  ],
+  "upsert": [
+    {
+      "name": "ordinary two-column upsert",
+      "table": "users",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": 7,
+        "name": "n1"
+      },
+      "step": {
+        "sql": "INSERT INTO users (\"id\", \"name\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\"",
+        "params": [
+          7,
+          "n1"
+        ]
+      }
+    },
+    {
+      "name": "all columns in the key: DO NOTHING (redelivery must converge, not throw)",
+      "table": "m",
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "data": {
+        "a": 1,
+        "b": 2
+      },
+      "step": {
+        "sql": "INSERT INTO m (\"a\", \"b\") VALUES (?, ?) ON CONFLICT(\"a\", \"b\") DO NOTHING",
+        "params": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "keyless table: plain INSERT (refused upstream anyway)",
+      "table": "k",
+      "pkCols": [],
+      "data": {
+        "x": 1
+      },
+      "step": {
+        "sql": "INSERT INTO k (\"x\") VALUES (?)",
+        "params": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "structured values bind as JSON text; old.* never lands in columns",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "old.id": 1,
+        "id": 2,
+        "meta": {
+          "k": "v"
+        }
+      },
+      "step": {
+        "sql": "INSERT INTO t (\"id\", \"meta\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"meta\" = excluded.\"meta\"",
+        "params": [
+          2,
+          "{\"k\":\"v\"}"
+        ]
+      }
+    }
+  ],
+  "delete": [
+    {
+      "name": "full key deletes",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": 5
+      },
+      "step": {
+        "sql": "DELETE FROM t WHERE \"id\" = ?",
+        "params": [
+          5
+        ]
+      }
+    },
+    {
+      "name": "partial composite key SKIPS (would match more rows than PG deleted)",
+      "table": "t",
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "data": {
+        "a": 1
+      },
+      "step": null
+    },
+    {
+      "name": "keyless table skips",
+      "table": "t",
+      "pkCols": [],
+      "data": {
+        "x": 1
+      },
+      "step": null
+    }
+  ],
+  "chainUpsert": [
+    {
+      "name": "version-guarded: a chain row never overwrites a newer CDC value",
+      "table": "salaries",
+      "cols": [
+        "uid",
+        "amount",
+        "updated_at"
+      ],
+      "pkCols": [
+        "uid"
+      ],
+      "versionCol": "updated_at",
+      "sql": "INSERT INTO salaries (\"uid\", \"amount\", \"updated_at\") VALUES (?, ?, ?) ON CONFLICT(\"uid\") DO UPDATE SET \"amount\" = excluded.\"amount\", \"updated_at\" = excluded.\"updated_at\" WHERE excluded.\"updated_at\" > salaries.\"updated_at\""
+    },
+    {
+      "name": "no version column: unguarded update",
+      "table": "t",
+      "cols": [
+        "id",
+        "v"
+      ],
+      "pkCols": [
+        "id"
+      ],
+      "versionCol": null,
+      "sql": "INSERT INTO t (\"id\", \"v\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"v\" = excluded.\"v\""
+    },
+    {
+      "name": "all-key row: DO NOTHING",
+      "table": "t",
+      "cols": [
+        "a",
+        "b"
+      ],
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "versionCol": null,
+      "sql": "INSERT INTO t (\"a\", \"b\") VALUES (?, ?) ON CONFLICT(\"a\", \"b\") DO NOTHING"
+    }
+  ],
+  "chainRowParams": [
+    {
+      "name": "timestamps normalize to the wire shape, objects to JSON, scalars pass",
+      "row": [
+        "2026-08-27 10:09:49.685820+00",
+        {
+          "k": 1
+        },
+        42,
+        null
+      ],
+      "params": [
+        "2026-08-27T10:09:49.685820Z",
+        "{\"k\":1}",
+        42,
+        null
+      ]
+    }
   ]
 }

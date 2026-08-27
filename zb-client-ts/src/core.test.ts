@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
+  planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
   seedGateDrops, planFromManifest, fullPredatesReplica, scopeSeeding,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
 } from './core.ts';
@@ -42,4 +43,25 @@ for (const c of fx.pgTsToWire) {
 }
 for (const c of fx.lsnToNumber) {
   test(`lsnToNumber: ${c.name}`, () => assert.equal(lsnToNumber(c.in), c.out));
+}
+
+for (const c of fx.keyChange) {
+  test(`keyChange: ${c.name}`, () =>
+    assert.deepEqual(planKeyChange(c.table, c.pkCols, c.data), c.step));
+}
+for (const c of fx.upsert) {
+  test(`upsert: ${c.name}`, () =>
+    assert.deepEqual(planUpsert(c.table, c.pkCols, c.data), c.step));
+}
+for (const c of fx.delete) {
+  test(`delete: ${c.name}`, () =>
+    assert.deepEqual(planDelete(c.table, c.pkCols, c.data), c.step));
+}
+for (const c of fx.chainUpsert) {
+  test(`chainUpsert: ${c.name}`, () =>
+    assert.equal(chainUpsertSql(c.table, c.cols, c.pkCols, c.versionCol), c.sql));
+}
+for (const c of fx.chainRowParams) {
+  test(`chainRowParams: ${c.name}`, () =>
+    assert.deepEqual(chainRowParams(c.row), c.params));
 }

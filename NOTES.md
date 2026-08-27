@@ -4805,12 +4805,23 @@ runner over the SAME JSON and is correct exactly when it passes. (The suite
 already earned its keep once: its first run caught a hand-mis-hexed lsn in a
 fixture — the expected values must be derived, never typed from memory.)
 
-**Still in the shell, candidates for increment 2**: the LWW upsert SQL
-builder (applyEvent's INSERT..ON CONFLICT with the version guard and the
-key-change delete), the schema migration planner (applySchema's
-create/add/drop/rebuild decision — where finding 9 lived), and the mutate()
-envelope constructor. Then the transport seam (NATS behind an interface —
-the one seam the Node consumer did not force), then the Zig port.
+**Increment 2a — the apply SQL builders, DONE (same day).** `planKeyChange`
+(the changed-PK delete, with the measured both-keys-live rationale),
+`planUpsert` (the CDC upsert), `planDelete` (null on a partial composite key —
+deleting on it would match more rows than PG did), `chainUpsertSql` (the
+version-guarded chain upsert) and `chainRowParams` (JSON + wire-timestamp
+binding) — applyEvent and applyPlan now execute exactly what the core builds,
+and 16 new fixtures pin the SQL byte-for-byte (52 total). One deliberate
+behaviour ALIGNMENT rode along: a table whose every column is in the key now
+gets `ON CONFLICT .. DO NOTHING` on the CDC path too — previously a plain
+INSERT that would THROW on redelivery, violating §7.1's idempotency promise;
+the chain path always had the DO NOTHING, and the two now match.
+
+**Still in the shell, candidates for increment 2b**: the schema migration
+planner (applySchema's create/add/drop/rebuild decision — where finding 9
+lived), and the mutate() envelope constructor. Then the transport seam (NATS
+behind an interface — the one seam the Node consumer did not force), then the
+Zig port.
 
 ## 11 Restart Rules
 
