@@ -7,6 +7,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
+  columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
+  fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
   seedGateDrops, planFromManifest, fullPredatesReplica, scopeSeeding,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
@@ -64,4 +66,33 @@ for (const c of fx.chainUpsert) {
 for (const c of fx.chainRowParams) {
   test(`chainRowParams: ${c.name}`, () =>
     assert.deepEqual(chainRowParams(c.row), c.params));
+}
+
+for (const c of fx.columnDdl) {
+  test(`columnDdl: ${c.name}`, () => assert.equal(columnDdl(c.col, c.pkCols), c.ddl));
+}
+for (const c of fx.fkClauses) {
+  test(`fkClauses: ${c.name}`, () => assert.equal(fkClausesFor(c.fks), c.text));
+}
+for (const c of fx.createTable) {
+  test(`createTable: ${c.name}`, () =>
+    assert.deepEqual(createTableSteps(c.table, c.cols, c.pkCols, c.fks), c.steps));
+}
+for (const c of fx.rebuildSteps) {
+  test(`rebuildSteps: ${c.name}`, () =>
+    assert.deepEqual(rebuildSteps(c.table, c.cols, c.pkCols, c.fks, c.existing), c.steps));
+}
+for (const c of fx.diffColumns) {
+  test(`diffColumns: ${c.name}`, () =>
+    assert.deepEqual(diffColumns(c.existing, c.wanted, c.renamed), c.out));
+}
+for (const c of fx.fkDiffer) {
+  test(`fkDiffer: ${c.name}`, () => assert.equal(fkTextDiffers(c.ddl, c.want), c.differs));
+}
+for (const c of fx.viewSteps) {
+  test(`viewSteps: ${c.name}`, () => assert.deepEqual(viewSteps(c.table, c.names), c.steps));
+}
+for (const c of fx.indexPlan) {
+  test(`indexPlan: ${c.name}`, () =>
+    assert.deepEqual(indexSyncPlan(c.table, c.have, c.want), { drops: c.drops, creates: c.creates }));
 }

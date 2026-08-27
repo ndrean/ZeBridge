@@ -802,5 +802,452 @@
         null
       ]
     }
+  ],
+  "columnDdl": [
+    {
+      "name": "single-column pk is inline PRIMARY KEY and NOT NULL",
+      "col": {
+        "name": "id",
+        "type": "INTEGER"
+      },
+      "pkCols": [
+        "id"
+      ],
+      "ddl": "\"id\" INTEGER NOT NULL PRIMARY KEY"
+    },
+    {
+      "name": "required column is NOT NULL (a bad optimistic write fails locally)",
+      "col": {
+        "name": "inserted_at",
+        "type": "TEXT",
+        "required": true
+      },
+      "pkCols": [
+        "id"
+      ],
+      "ddl": "\"inserted_at\" TEXT NOT NULL"
+    },
+    {
+      "name": "plain nullable column",
+      "col": {
+        "name": "note",
+        "type": "TEXT"
+      },
+      "pkCols": [
+        "id"
+      ],
+      "ddl": "\"note\" TEXT"
+    },
+    {
+      "name": "composite pk member: NOT NULL but not inline (constraint carries the key)",
+      "col": {
+        "name": "a",
+        "type": "TEXT"
+      },
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "ddl": "\"a\" TEXT NOT NULL"
+    }
+  ],
+  "fkClauses": [
+    {
+      "name": "well-formed FK renders",
+      "fks": [
+        {
+          "columns": [
+            "user_id"
+          ],
+          "references": "users",
+          "parent_columns": [
+            "id"
+          ]
+        }
+      ],
+      "text": ", FOREIGN KEY (\"user_id\") REFERENCES users (\"id\")"
+    },
+    {
+      "name": "arity mismatch is dropped, not guessed",
+      "fks": [
+        {
+          "columns": [
+            "a",
+            "b"
+          ],
+          "references": "p",
+          "parent_columns": [
+            "x"
+          ]
+        }
+      ],
+      "text": ""
+    },
+    {
+      "name": "missing references is dropped",
+      "fks": [
+        {
+          "columns": [
+            "a"
+          ],
+          "parent_columns": [
+            "x"
+          ]
+        }
+      ],
+      "text": ""
+    }
+  ],
+  "createTable": [
+    {
+      "name": "composite pk + fk: the full statement",
+      "table": "salaries",
+      "cols": [
+        {
+          "name": "uid",
+          "type": "TEXT"
+        },
+        {
+          "name": "user_id",
+          "type": "INTEGER",
+          "required": true
+        },
+        {
+          "name": "tenant_id",
+          "type": "TEXT"
+        }
+      ],
+      "pkCols": [
+        "uid"
+      ],
+      "fks": [
+        {
+          "columns": [
+            "user_id"
+          ],
+          "references": "users",
+          "parent_columns": [
+            "id"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "sql": "DROP TABLE IF EXISTS salaries;",
+          "params": []
+        },
+        {
+          "sql": "CREATE TABLE salaries (\"uid\" TEXT NOT NULL PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"tenant_id\" TEXT, FOREIGN KEY (\"user_id\") REFERENCES users (\"id\"));",
+          "params": []
+        }
+      ]
+    }
+  ],
+  "rebuildSteps": [
+    {
+      "name": "FINDING 9's legitimate path: tmp, copy COMMON columns, swap",
+      "table": "t",
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        },
+        {
+          "name": "v",
+          "type": "TEXT"
+        }
+      ],
+      "pkCols": [
+        "id"
+      ],
+      "fks": [],
+      "existing": [
+        "id",
+        "v",
+        "gone"
+      ],
+      "steps": [
+        {
+          "sql": "DROP TABLE IF EXISTS t__migrating;",
+          "params": []
+        },
+        {
+          "sql": "CREATE TABLE t__migrating (\"id\" INTEGER NOT NULL PRIMARY KEY, \"v\" TEXT);",
+          "params": []
+        },
+        {
+          "sql": "INSERT INTO t__migrating (\"id\", \"v\") SELECT \"id\", \"v\" FROM t;",
+          "params": []
+        },
+        {
+          "sql": "DROP TABLE IF EXISTS t;",
+          "params": []
+        },
+        {
+          "sql": "ALTER TABLE t__migrating RENAME TO t;",
+          "params": []
+        }
+      ]
+    },
+    {
+      "name": "no common columns: no copy step (nothing to preserve)",
+      "table": "t",
+      "cols": [
+        {
+          "name": "x",
+          "type": "TEXT"
+        }
+      ],
+      "pkCols": [],
+      "fks": [],
+      "existing": [
+        "a"
+      ],
+      "steps": [
+        {
+          "sql": "DROP TABLE IF EXISTS t__migrating;",
+          "params": []
+        },
+        {
+          "sql": "CREATE TABLE t__migrating (\"x\" TEXT);",
+          "params": []
+        },
+        {
+          "sql": "DROP TABLE IF EXISTS t;",
+          "params": []
+        },
+        {
+          "sql": "ALTER TABLE t__migrating RENAME TO t;",
+          "params": []
+        }
+      ]
+    }
+  ],
+  "diffColumns": [
+    {
+      "name": "no existing table: nothing to diff (create path owns it)",
+      "existing": null,
+      "wanted": [
+        "a"
+      ],
+      "renamed": {},
+      "out": {
+        "renames": [],
+        "added": [],
+        "removed": []
+      }
+    },
+    {
+      "name": "plain add and remove",
+      "existing": [
+        "a",
+        "b"
+      ],
+      "wanted": [
+        "a",
+        "c"
+      ],
+      "renamed": {},
+      "out": {
+        "renames": [],
+        "added": [
+          "c"
+        ],
+        "removed": [
+          "b"
+        ]
+      }
+    },
+    {
+      "name": "a hinted rename is neither added nor removed",
+      "existing": [
+        "a",
+        "old_n"
+      ],
+      "wanted": [
+        "a",
+        "new_n"
+      ],
+      "renamed": {
+        "new_n": "old_n"
+      },
+      "out": {
+        "renames": [
+          [
+            "old_n",
+            "new_n"
+          ]
+        ],
+        "added": [],
+        "removed": []
+      }
+    },
+    {
+      "name": "rename hint ignored when the target already exists",
+      "existing": [
+        "a",
+        "old_n",
+        "new_n"
+      ],
+      "wanted": [
+        "a",
+        "new_n"
+      ],
+      "renamed": {
+        "new_n": "old_n"
+      },
+      "out": {
+        "renames": [],
+        "added": [],
+        "removed": [
+          "old_n"
+        ]
+      }
+    },
+    {
+      "name": "\u00a71.2: an unhinted rename degrades to add+remove (values lost, by protocol)",
+      "existing": [
+        "a",
+        "old_n"
+      ],
+      "wanted": [
+        "a",
+        "new_n"
+      ],
+      "renamed": {},
+      "out": {
+        "renames": [],
+        "added": [
+          "new_n"
+        ],
+        "removed": [
+          "old_n"
+        ]
+      }
+    }
+  ],
+  "fkDiffer": [
+    {
+      "name": "no stored ddl: create path owns it",
+      "ddl": "",
+      "want": ", FOREIGN KEY (\"x\") REFERENCES p (\"y\")",
+      "differs": false
+    },
+    {
+      "name": "wanted none, has some: differs",
+      "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES p (\"y\"))",
+      "want": "",
+      "differs": true
+    },
+    {
+      "name": "wanted none, has none: same",
+      "ddl": "CREATE TABLE t (\"a\" TEXT)",
+      "want": "",
+      "differs": false
+    },
+    {
+      "name": "clause present (whitespace-normalized): same",
+      "ddl": "CREATE TABLE t (\"a\" TEXT,\n  FOREIGN KEY (\"a\")  REFERENCES p (\"y\"))",
+      "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
+      "differs": false
+    },
+    {
+      "name": "different parent: differs (forces a rebuild \u2014 SQLite has no ADD CONSTRAINT)",
+      "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES q (\"y\"))",
+      "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
+      "differs": true
+    }
+  ],
+  "viewSteps": [
+    {
+      "name": "plumbing columns excluded from the app view",
+      "table": "t",
+      "names": [
+        "uid",
+        "name",
+        "updated_at"
+      ],
+      "steps": [
+        {
+          "sql": "DROP VIEW IF EXISTS t_view;",
+          "params": []
+        },
+        {
+          "sql": "CREATE VIEW t_view AS SELECT \"name\" FROM t;",
+          "params": []
+        }
+      ]
+    },
+    {
+      "name": "all columns excluded: drop only, no view",
+      "table": "t",
+      "names": [
+        "uid",
+        "updated_at"
+      ],
+      "steps": [
+        {
+          "sql": "DROP VIEW IF EXISTS t_view;",
+          "params": []
+        }
+      ]
+    }
+  ],
+  "indexPlan": [
+    {
+      "name": "create the missing, drop the unpublished, keep the matching",
+      "table": "t",
+      "have": [
+        "ix_keep",
+        "ix_stale"
+      ],
+      "want": [
+        {
+          "name": "ix_keep",
+          "columns": [
+            "a"
+          ]
+        },
+        {
+          "name": "ix_new",
+          "unique": true,
+          "columns": [
+            "b",
+            "c"
+          ]
+        }
+      ],
+      "drops": [
+        {
+          "sql": "DROP INDEX IF EXISTS \"ix_stale\";",
+          "params": []
+        }
+      ],
+      "creates": [
+        {
+          "sql": "CREATE UNIQUE INDEX IF NOT EXISTS \"ix_new\" ON t (\"b\", \"c\");",
+          "params": []
+        }
+      ]
+    },
+    {
+      "name": "malformed entries skip",
+      "table": "t",
+      "have": [],
+      "want": [
+        {
+          "name": "",
+          "columns": [
+            "a"
+          ]
+        },
+        {
+          "name": "x",
+          "columns": []
+        }
+      ],
+      "drops": [],
+      "creates": []
+    }
   ]
 }

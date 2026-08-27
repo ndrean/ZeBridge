@@ -269,3 +269,143 @@ export function chainUpsertSql(
 /// like against like (NOTES §1.13).
 export const chainRowParams = (row: any[]): any[] =>
   row.map((v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : pgTsToWire(v)));
+
+// ─── the schema migration planner (§10s increment 2b — finding 9's home) ────
+//
+// Everything applySchema DECIDES, as pure functions over data the shell
+// fetches: the incoming descriptor, the existing column list (from
+// syncedTables or PRAGMA table_info — never from memory alone, finding 9),
+// the stored CREATE TABLE text, and the existing index names. The shell
+// executes, logs, and owns the runtime ALTER→rebuild fallback (that decision
+// is error-driven, not plannable).
+
+export type SchemaColumn = { name: string; type: string; required?: boolean };
+export type SchemaIndex = { name: string; unique?: boolean; columns: string[] };
+export type SchemaForeignKey = { name?: string; columns: string[]; references: string; parent_columns: string[] };
+
+/// One column's DDL. `required` is NOT NULL with no DEFAULT, published in both
+/// dialects — honouring it makes a bad optimistic write fail locally instead of
+/// round-tripping to a PostgreSQL refusal (NOTES §10c). Tolerant of absence: an
+/// older bridge publishes no `required`, which reads as nullable.
+export function columnDdl(c: SchemaColumn, pkCols: string[]): string {
+  const inlinePk = pkCols.length === 1;
+  return `"${c.name}" ${c.type}` +
+    (pkCols.includes(c.name) || c.required ? ' NOT NULL' : '') +
+    (inlinePk && c.name === pkCols[0] ? ' PRIMARY KEY' : '');
+}
+
+/// The FOREIGN KEY table-constraint text. ⚠️ SQLite has no ALTER TABLE ADD
+/// CONSTRAINT — an FK lives only inside CREATE TABLE, which is why an FK change
+/// forces a rebuild while an index change is a cheap CREATE/DROP. Malformed
+/// entries (missing parents, arity mismatch) are dropped, not guessed at.
+export function fkClausesFor(foreignKeys: SchemaForeignKey[]): string {
+  return foreignKeys
+    .filter((f) => f?.references && Array.isArray(f.columns) && f.columns.length &&
+                   Array.isArray(f.parent_columns) && f.parent_columns.length === f.columns.length)
+    .map((f) =>
+      `, FOREIGN KEY (${f.columns.map((c) => `"${c}"`).join(', ')})` +
+      ` REFERENCES ${f.references} (${f.parent_columns.map((c) => `"${c}"`).join(', ')})`)
+    .join('');
+}
+
+function tableBody(cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[]): string {
+  const constraint =
+    (pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '') +
+    fkClausesFor(foreignKeys);
+  return `${cols.map((c) => columnDdl(c, pkCols)).join(', ')}${constraint}`;
+}
+
+/// First sight — which, after finding 9, means the table is PHYSICALLY absent.
+export function createTableSteps(
+  table: string, cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[],
+): SqlStep[] {
+  return [
+    { sql: `DROP TABLE IF EXISTS ${table};`, params: [] },
+    { sql: `CREATE TABLE ${table} (${tableBody(cols, pkCols, foreignKeys)});`, params: [] },
+  ];
+}
+
+/// The rebuild sequence (tmp → copy common columns → swap). The shell wraps it
+/// in PRAGMA foreign_keys OFF/ON: with FK enforcement on, the DROP of a
+/// referenced parent is refused outright (measured — users, blocked by
+/// salaries' FK). The data is copied, not changed.
+export function rebuildSteps(
+  table: string, cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[],
+  existingColumns: string[],
+): SqlStep[] {
+  const tmp = `${table}__migrating`;
+  const steps: SqlStep[] = [
+    { sql: `DROP TABLE IF EXISTS ${tmp};`, params: [] },
+    { sql: `CREATE TABLE ${tmp} (${tableBody(cols, pkCols, foreignKeys)});`, params: [] },
+  ];
+  const common = cols.map((c) => c.name).filter((n) => existingColumns.includes(n)).map((n) => `"${n}"`);
+  if (common.length) {
+    steps.push({ sql: `INSERT INTO ${tmp} (${common.join(', ')}) SELECT ${common.join(', ')} FROM ${table};`, params: [] });
+  }
+  steps.push({ sql: `DROP TABLE IF EXISTS ${table};`, params: [] });
+  steps.push({ sql: `ALTER TABLE ${tmp} RENAME TO ${table};`, params: [] });
+  return steps;
+}
+
+/// The column diff, rename-aware. A rename hint counts only when its source
+/// still exists and its target does not — anything else degrades to add+remove
+/// (the §1.2 rename gap: without a hint the values are lost, by protocol).
+/// Renames land BEFORE the add/remove diff — a renamed column is neither.
+export function diffColumns(
+  existingColumns: string[] | null,
+  wantedNames: string[],
+  renamed: Record<string, string>,
+): { renames: [string, string][]; added: string[]; removed: string[] } {
+  if (!existingColumns) return { renames: [], added: [], removed: [] };
+  const renames: [string, string][] = Object.entries(renamed)
+    .filter(([to, from]) => existingColumns.includes(from) && !existingColumns.includes(to))
+    .map(([to, from]) => [from, to]);
+  const effective = existingColumns.map((n) => renames.find(([from]) => from === n)?.[1] ?? n);
+  return {
+    renames,
+    added: wantedNames.filter((n) => !effective.includes(n)),
+    removed: effective.filter((n) => !wantedNames.includes(n)),
+  };
+}
+
+/// Does the stored CREATE TABLE text disagree with the FK clauses now wanted?
+/// Text-compared because SQLite keeps no queryable "expected constraints", and
+/// the stored DDL is our own generated text. Empty ddl → false (no table yet:
+/// the create path owns it).
+export function fkTextDiffers(ddl: string, fkClauses: string): boolean {
+  if (!ddl) return false;
+  const hasAny = /FOREIGN KEY/i.test(ddl);
+  if (!fkClauses) return hasAny;
+  const want = fkClauses.replace(/^,\s*/, '').replace(/\s+/g, ' ').trim();
+  return !ddl.replace(/\s+/g, ' ').includes(want);
+}
+
+/// The app-facing view: the replica's columns minus the plumbing ones. All
+/// columns excluded → no view at all.
+export const VIEW_EXCLUDED_COLUMNS = ['uid', 'inserted_at', 'updated_at', 'metadata'];
+export function viewSteps(table: string, names: string[]): SqlStep[] {
+  const viewCols = names.filter((n) => !VIEW_EXCLUDED_COLUMNS.includes(n)).map((n) => `"${n}"`).join(', ');
+  const steps: SqlStep[] = [{ sql: `DROP VIEW IF EXISTS ${table}_view;`, params: [] }];
+  if (viewCols) steps.push({ sql: `CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`, params: [] });
+  return steps;
+}
+
+/// Bring the replica's secondary indexes in line with the published list:
+/// create what is missing, drop what is no longer published (an index removed
+/// upstream must not linger, costing writes for a query nobody makes).
+/// `have` arrives pre-filtered of sqlite_% internals. Malformed entries skip.
+export function indexSyncPlan(
+  table: string, have: string[], want: SchemaIndex[],
+): { drops: SqlStep[]; creates: SqlStep[] } {
+  const wantNames = new Set(want.map((i) => i.name));
+  const haveSet = new Set(have);
+  const drops = have.filter((n) => !wantNames.has(n))
+    .map((n) => ({ sql: `DROP INDEX IF EXISTS "${n}";`, params: [] }));
+  const creates = want
+    .filter((ix) => ix?.name && Array.isArray(ix.columns) && ix.columns.length && !haveSet.has(ix.name))
+    .map((ix) => ({
+      sql: `CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS "${ix.name}" ON ${table} (${ix.columns.map((c) => `"${c}"`).join(', ')});`,
+      params: [],
+    }));
+  return { drops, creates };
+}

@@ -4817,11 +4817,23 @@ gets `ON CONFLICT .. DO NOTHING` on the CDC path too — previously a plain
 INSERT that would THROW on redelivery, violating §7.1's idempotency promise;
 the chain path always had the DO NOTHING, and the two now match.
 
-**Still in the shell, candidates for increment 2b**: the schema migration
-planner (applySchema's create/add/drop/rebuild decision — where finding 9
-lived), and the mutate() envelope constructor. Then the transport seam (NATS
-behind an interface — the one seam the Node consumer did not force), then the
-Zig port.
+**Increment 2b — the schema migration planner, DONE (same day).** Everything
+applySchema DECIDES is now pure and fixture-pinned: `columnDdl` (inline pk /
+`required` NOT NULL), `fkClausesFor` (malformed FKs dropped, not guessed),
+`createTableSteps`, `rebuildSteps` (finding 9's legitimate drop/recreate as an
+exact step list — the shell keeps only the FK-pragma wrap and the error-driven
+ALTER->rebuild fallback), `diffColumns` (rename-aware: a hinted rename is
+neither added nor removed, an unhinted one degrades to add+remove — §1.2 as a
+named fixture), `fkTextDiffers`, `viewSteps` (the plumbing-column exclusion),
+and `indexSyncPlan`. 24 new fixtures (76 total). Verified LIVE through the DDL
+trigger: `ALTER TABLE memo ADD COLUMN` then `DROP COLUMN` in PG — the replica
+migrated in place both ways, 6 rows preserved throughout, zero gaps, zero
+re-creates. The shell's applySchema is now orchestration only: fetch physical
+state, execute steps, log, book-keep.
+
+**Still in the shell, candidates for increment 2c**: the mutate() envelope
+constructor. Then the transport seam (NATS behind an interface — the one seam
+the Node consumer did not force), then the Zig port against all 76+ fixtures.
 
 ## 11 Restart Rules
 

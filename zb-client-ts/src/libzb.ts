@@ -34,6 +34,8 @@ import {
   seedGateDrops, planFromManifest, fullPredatesReplica as coreFullPredates,
   scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber,
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
+  fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
+  fkTextDiffers, viewSteps, indexSyncPlan,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
 
@@ -738,46 +740,15 @@ export class ZeBridge {
         }
       } catch { /* engine without the pragma — behaves as before */ }
     }
-    // Renames land BEFORE the add/remove diff — a renamed column is neither.
-    const renames: [string, string][] = existing
-      ? Object.entries((val.renamed ?? {}) as Record<string, string>)
-          .filter(([to, from]) => existing.columns.includes(from) && !existing.columns.includes(to))
-          .map(([to, from]) => [from, to])
-      : [];
+    // core.diffColumns (§10s 2b): rename-aware — a hinted rename is neither
+    // added nor removed; an unhinted one degrades to add+remove (§1.2).
+    const { renames, added, removed } = diffColumns(
+      existing ? existing.columns : null, names, (val.renamed ?? {}) as Record<string, string>);
 
-    const effectiveCols = existing
-      ? existing.columns.map((n) => renames.find(([from]) => from === n)?.[1] ?? n)
-      : [];
-    const added = existing ? names.filter((n) => !effectiveCols.includes(n)) : [];
-    const removed = existing ? effectiveCols.filter((n) => !names.includes(n)) : [];
-
-    const inlinePk = pkCols.length === 1;
-    const isPk = (name: string) => pkCols.includes(name);
-    // `required` is NOT NULL with no DEFAULT, published in both dialects. Honouring
-    // it makes a bad optimistic write fail HERE instead of round-tripping: before
-    // this, mutate() applied locally and came back
-    // `null value in column "inserted_at" violates not-null constraint` — the
-    // replica accepted a row PostgreSQL would not (NOTES §10c).
-    //
-    // Tolerant of absence: a bridge older than the field publishes no `required`,
-    // which reads as nullable — the same table this built before it existed.
-    const ddl = (c: { name: string; type: string; required?: boolean }) =>
-      `"${c.name}" ${c.type}` +
-      (isPk(c.name) || c.required ? ' NOT NULL' : '') +
-      (inlinePk && c.name === pkCols[0] ? ' PRIMARY KEY' : '');
-    // ⚠️ SQLite has no ALTER TABLE ADD CONSTRAINT, so a foreign key can only be
-    // declared INSIDE CREATE TABLE. That is why an FK change forces a rebuild below
-    // while an index change is a cheap CREATE/DROP.
-    const fkClauses = foreignKeys
-      .filter((f) => f?.references && Array.isArray(f.columns) && f.columns.length &&
-                     Array.isArray(f.parent_columns) && f.parent_columns.length === f.columns.length)
-      .map((f) =>
-        `, FOREIGN KEY (${f.columns.map((c) => `"${c}"`).join(', ')})` +
-        ` REFERENCES ${f.references} (${f.parent_columns.map((c) => `"${c}"`).join(', ')})`,
-      )
-      .join('');
-    const tableConstraint =
-      (pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '') + fkClauses;
+    // DDL text and constraints come from core (columnDdl/fkClausesFor, §10s 2b).
+    // SQLite has no ALTER TABLE ADD CONSTRAINT, so an FK change forces a rebuild
+    // below while an index change stays a cheap CREATE/DROP.
+    const fkClauses = fkClausesFor(foreignKeys);
 
     const rebuildPreservingData = async (why: string) => {
       // Schema surgery on an already-consistent copy: with foreign_keys ON, the
@@ -785,25 +756,18 @@ export class ZeBridge {
       // by salaries' FK). Off for the surgery, back on after — the data is copied,
       // not changed.
       try { await this.run(`PRAGMA foreign_keys = OFF;`); } catch { /* no pragma */ }
-      const tmp = `${table}__migrating`;
-      await this.run(`DROP TABLE IF EXISTS ${tmp};`);
-      await this.run(`CREATE TABLE ${tmp} (${cols.map(ddl).join(', ')}${tableConstraint});`);
-      if (existing) {
-        const common = names.filter((n) => existing.columns.includes(n)).map((n) => `"${n}"`);
-        if (common.length) {
-          await this.run(`INSERT INTO ${tmp} (${common.join(', ')}) SELECT ${common.join(', ')} FROM ${table};`);
-        }
+      for (const st of rebuildSteps(table, cols, pkCols, foreignKeys, existing ? existing.columns : [])) {
+        await this.run(st.sql, ...st.params);
       }
-      await this.run(`DROP TABLE IF EXISTS ${table};`);
-      await this.run(`ALTER TABLE ${tmp} RENAME TO ${table};`);
       try { await this.run(`PRAGMA foreign_keys = ON;`); } catch { /* no pragma */ }
       this.appendLog('SCHEMA', `${table}: rebuilt preserving common columns (${why}), lsn=${lsn}`, 'MIGRATE');
     };
 
     try {
       if (!existing) {
-        await this.run(`DROP TABLE IF EXISTS ${table};`);
-        await this.run(`CREATE TABLE ${table} (${cols.map(ddl).join(', ')}${tableConstraint});`);
+        for (const st of createTableSteps(table, cols, pkCols, foreignKeys)) {
+          await this.run(st.sql, ...st.params);
+        }
         this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses))) {
@@ -839,10 +803,7 @@ export class ZeBridge {
         }
       }
 
-      const EXCLUDE_FROM_VIEW = ['uid', 'inserted_at', 'updated_at', 'metadata'];
-      const viewCols = names.filter((n) => !EXCLUDE_FROM_VIEW.includes(n)).map((n) => `"${n}"`).join(', ');
-      await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
-      if (viewCols) await this.run(`CREATE VIEW ${table}_view AS SELECT ${viewCols} FROM ${table};`);
+      for (const st of viewSteps(table, names)) await this.run(st.sql, ...st.params);
 
       // After every shape change, because a rebuild DROPs the table and takes its
       // indexes with it.
@@ -869,13 +830,7 @@ export class ZeBridge {
   private async foreignKeysDiffer(table: string, fkClauses: string): Promise<boolean> {
     try {
       const rows = await this.run(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table);
-      const ddl: string = rows?.[0]?.sql ?? '';
-      if (!ddl) return false;                       // no table yet: the create path handles it
-      const hasAny = /FOREIGN KEY/i.test(ddl);
-      if (!fkClauses) return hasAny;                // wanted none, has some
-      // Normalise whitespace; the stored DDL is our own generated text.
-      const want = fkClauses.replace(/^,\s*/, '').replace(/\s+/g, ' ').trim();
-      return !ddl.replace(/\s+/g, ' ').includes(want);
+      return fkTextDiffers(rows?.[0]?.sql ?? '', fkClauses); // the pure compare lives in core (§10s 2b)
     } catch {
       return false;
     }
@@ -897,25 +852,14 @@ export class ZeBridge {
         `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND name NOT LIKE 'sqlite_%'`,
         table,
       );
-      const have = new Set<string>((rows ?? []).map((r: any) => r.name));
-      const want = new Set(indexes.map((i) => i.name));
-
-      for (const stale of have) {
-        if (!want.has(stale)) {
-          await this.run(`DROP INDEX IF EXISTS "${stale}";`);
-          this.appendLog('SCHEMA', `${table}: dropped index ${stale} (no longer published)`, 'MIGRATE');
-        }
+      const plan = indexSyncPlan(table, (rows ?? []).map((r: any) => r.name), indexes);
+      for (const d of plan.drops) {
+        await this.run(d.sql, ...d.params);
+        this.appendLog('SCHEMA', `${table}: dropped index (no longer published): ${d.sql}`, 'MIGRATE');
       }
-      let created = 0;
-      for (const ix of indexes) {
-        if (!ix?.name || !Array.isArray(ix.columns) || !ix.columns.length) continue;
-        if (have.has(ix.name)) continue;
-        const cols = ix.columns.map((c) => `"${c}"`).join(', ');
-        await this.run(`CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX IF NOT EXISTS "${ix.name}" ON ${table} (${cols});`);
-        created++;
-      }
-      if (created) {
-        this.appendLog('SCHEMA', `${table}: ${created} index(es) created`, 'MIGRATE');
+      for (const c of plan.creates) await this.run(c.sql, ...c.params);
+      if (plan.creates.length) {
+        this.appendLog('SCHEMA', `${table}: ${plan.creates.length} index(es) created`, 'MIGRATE');
       }
     } catch (err) {
       // An index is a performance object: failing to build one must never stop a
