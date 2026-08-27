@@ -4274,6 +4274,70 @@ the tenant scoping held (none of acme's rows leaked into kilo's chain).
     deliberately untouched so old consumers and the scenario suite keep working;
     remove once no consumer asks.
 
+## 10i. Finding 7: the LSN seed gate LOSES in-flight transactions (2026-08-27)
+
+Found by pressing on the question "is the monotonic stamp actually useful?" — the
+answer turned out to be a measured data-loss bug, and the stamp we need turns out
+to ALREADY EXIST.
+
+**The experiment.** Session A: `BEGIN; INSERT 'inflight-A'; pg_sleep(45); COMMIT`.
+While A is open, an ordinary committed row forces the producer to build new
+generations (g2 at 10:44:24, g3 at 10:44:44 — both while A is still open, so both
+snapshots exclude it). A commits at ~10:45. PostgreSQL then holds both rows; the
+CDC stream carries both events; a FRESH replica seeding from g3 ends with only
+`trigger-B`. `inflight-A` is silently gone.
+
+**The mechanism, three layers deep:**
+
+  1. A's row lsn (2/8F3A6C8) is BELOW g3's cutoff_lsn (2/8F3E740) — it wrote
+     early, committed late. The client anchors `state.lsn` to the chain cutoff and
+     gates `ev.lsn < state.lsn -> drop`, so A's CDC event is discarded as
+     "already in the snapshot" when it is precisely NOT in the snapshot.
+  2. The DELTA filter shares the defect in a different coordinate: deltas select
+     `version > prev cutoff_version`, and `now()` is TRANSACTION-START time — A's
+     updated_at (10:44:18) predates every later cutoff, so A is excluded from all
+     future deltas too.
+  3. Only a future FULL (whole-table scan, sees committed A) rescues fresh
+     clients — so with chain depth 6, every client seeding between g3 and the
+     next full misses the row. Clients already live before g3 got A normally,
+     which makes the divergence maddeningly inconsistent across replicas.
+
+Measured on the wire, the general shape (delivery is COMMIT order, lsn is WRITE
+position):
+
+    trigger-B    lsn=8740121656  stream_seq=62128
+    inflight-A   lsn=8740120392  stream_seq=62129   <- after B, LOWER lsn
+
+**The answer to the stamp question: we do not need to mint one.** JetStream's
+per-stream sequence IS a commit-ordered monotonic id — the bridge publishes in
+decode order, decode is commit order (§10f), and the client already persists
+`last_seq` per stream. What is missing is not the stamp but its USE at the
+cutoff:
+
+  * the producer records, per manifest, the CDC stream's last_seq AT BUILD TIME
+    (`cutoff_seq`), alongside the existing cutoff_lsn/version;
+  * the client anchors its gate on `msg.seq <= cutoff_seq -> drop` instead of
+    the lsn comparison.
+
+Correctness: a transaction visible to the snapshot AND published before capture
+has seq <= cutoff_seq (dropped, correct); one invisible to the snapshot commits
+later, publishes later, seq > cutoff_seq (applied, correct — this is exactly
+inflight-A, 62129); one visible but not yet published at capture has seq >
+cutoff_seq (applied AGAIN over its snapshot copy — a duplicate, absorbed by the
+idempotent LWW upsert). The failure mode collapses to the duplicate direction,
+which the pipeline already absorbs everywhere. The delta filter's exclusion stops
+mattering because CDC replay above cutoff_seq carries what deltas miss.
+
+This is PowerSync's op_id lesson landing in our architecture with zero new
+machinery: query-based deltas with timestamp cutoffs are inherently racy against
+in-flight transactions; stream-derived positions are not. (The user's earlier
+"2 x REFRESH_SNAP" instinct was the same point — retention and cutoffs should be
+measured in the stream's own coordinates.)
+
+⚠️ Residual, to check when building: the chain path should verify CDC still
+covers its cutoff_seq (the snapshot path had `descriptorStillFresh` for exactly
+this) — a chain whose cutoff_seq has aged out of CDC retention is an orphan.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today
