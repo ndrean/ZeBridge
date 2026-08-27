@@ -4831,9 +4831,22 @@ migrated in place both ways, 6 rows preserved throughout, zero gaps, zero
 re-creates. The shell's applySchema is now orchestration only: fetch physical
 state, execute steps, log, book-keep.
 
-**Still in the shell, candidates for increment 2c**: the mutate() envelope
-constructor. Then the transport seam (NATS behind an interface — the one seam
-the Node consumer did not force), then the Zig port against all 76+ fixtures.
+**Increment 2c — the mutate() envelope, DONE (same day).** `nextVersion`
+(the monotonic stamp as a pure rule — the clock stays in the shell, and this
+is exactly where the §10q HLC candidate will land), `subjectSafeToken` (the
+msg_id rides as mutation_ack subject tokens — unescaped, one write's ack
+would fan out as a wildcard), `mutationSubject`, `mutationMsgId` (the version
+stays IN the id: a second edit is a different write, a retry is not),
+`mutationKeyId`, `mutationPayload` (DELETE ships no data), `optimisticEvent`
+(lsn pinned at MAX_SAFE_INTEGER, optimistic-flagged), and `buildMutation` —
+the whole envelope in one call, the first thing a port implements. 7 new
+fixtures (83 total). Verified live: a Node INSERT round-tripped
+mutate -> MUTATIONS -> writer -> PG -> CDC echo (outbox drained to 0), and
+the DELETE came back as the tombstoning UPDATE the soft-delete trigger makes
+of it. The carve is COMPLETE but for the transport seam: applyEvent,
+applySchema, applyGenerations, the gap scope and the write path all execute
+what the core builds. Next: the transport seam, then the Zig port against
+all 83 fixtures.
 
 ## 11 Restart Rules
 

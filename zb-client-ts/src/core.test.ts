@@ -7,6 +7,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
+  nextVersion, subjectSafeToken, buildMutation,
   columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
@@ -95,4 +96,14 @@ for (const c of fx.viewSteps) {
 for (const c of fx.indexPlan) {
   test(`indexPlan: ${c.name}`, () =>
     assert.deepEqual(indexSyncPlan(c.table, c.have, c.want), { drops: c.drops, creates: c.creates }));
+}
+
+for (const c of fx.nextVersion) {
+  test(`nextVersion: ${c.name}`, () => assert.equal(nextVersion(c.now, c.last), c.out));
+}
+for (const c of fx.subjectSafe) {
+  test(`subjectSafe: ${c.name}`, () => assert.equal(subjectSafeToken(c.in), c.out));
+}
+for (const c of fx.envelope) {
+  test(`envelope: ${c.name}`, () => assert.deepEqual(buildMutation(c.args), c.out));
 }

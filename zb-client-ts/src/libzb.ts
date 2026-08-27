@@ -35,6 +35,7 @@ import {
   scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber,
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
+  nextVersion, mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   fkTextDiffers, viewSteps, indexSyncPlan,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
@@ -246,9 +247,8 @@ export class ZeBridge {
     const state = this.syncedTables.get(table);
     if (!state || !state.pkCols.length) throw new Error(`table ${table} is not synced or has no primary key`);
     const version = opts?.version ?? this.newVersion();
-    const id = state.pkCols.map((c) => key[c]).join('|');
-    const payload: Record<string, unknown> = { key, version, client_id: this.clientIdValue };
-    if (op !== 'DELETE') payload.data = values ?? {};
+    const id = mutationKeyId(state.pkCols, key);
+    const payload = mutationPayload(op, key, values, version, this.clientIdValue);
     await this.rawMutation(table, op, id, version, payload);
     return { version };
   }
@@ -326,13 +326,10 @@ export class ZeBridge {
   /// timestamptz column (ISO, six digits, trailing Z), strictly increasing within
   /// this instance so same-millisecond edits never tie against themselves.
   public newVersion(): string {
-    let candidate = new Date().toISOString().replace('Z', '') + '000Z';
-    if (candidate <= this.lastVersion) {
-      const micros = (parseInt(this.lastVersion.slice(-7, -1), 10) + 1) % 1000000;
-      candidate = `${this.lastVersion.slice(0, -7)}${String(micros).padStart(6, '0')}Z`;
-    }
-    this.lastVersion = candidate;
-    return candidate;
+    // core.nextVersion (§10s 2c): monotonic past the last stamp even inside
+    // one millisecond — the clock stays here, the rule lives in the core.
+    this.lastVersion = nextVersion(new Date().toISOString(), this.lastVersion);
+    return this.lastVersion;
   }
 
   // ─── lifecycle ────────────────────────────────────────────────────────────
@@ -1683,12 +1680,11 @@ export class ZeBridge {
       return;
     }
 
-    const subject = `mutation.${this.config.principal}.${table}.${op.toLowerCase()}`;
-    // Dots stripped: the msg_id becomes subject tokens on mutation_ack, and the
-    // version carries fractional seconds. The version stays IN the id: a second edit
-    // to the same row is a different write; a retry of the same edit is not.
-    const subjectSafe = (v: string) => v.replace(/[.*>\s]/g, '-');
-    const msgId = subjectSafe(`${this.clientIdValue}-${table}-${id}-${version}`);
+    // Subject and idempotency id come from core (§10s 2c): the version stays
+    // IN the id — a second edit to the same row is a different write; a retry
+    // of the same edit is not.
+    const subject = mutationSubject(this.config.principal, table, op);
+    const msgId = mutationMsgId(this.clientIdValue, table, id, version);
     const h = headers();
     h.set('Nats-Msg-Id', msgId);
     this.pendingWrites.set(msgId, { table, id, at: Date.now() });
@@ -1709,13 +1705,7 @@ export class ZeBridge {
           }
         }
         await this.outboxPut({ msgId, subject, payload, table, id, before }, txExec);
-        await this.applyEvent(table, {
-          table,
-          operation: op,
-          data: op === 'DELETE' ? (payload as any).key : (payload as any).data,
-          lsn: Number.MAX_SAFE_INTEGER,
-          optimistic: true,
-        }, txExec);
+        await this.applyEvent(table, optimisticEvent(table, op, payload), txExec);
       });
     } catch (err) {
       this.pendingWrites.delete(msgId);

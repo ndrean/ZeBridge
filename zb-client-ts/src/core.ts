@@ -409,3 +409,91 @@ export function indexSyncPlan(
     }));
   return { drops, creates };
 }
+
+// ─── the mutate() envelope (§10s increment 2c) ───────────────────────────────
+//
+// The 1:1 construction of one wire write: subject, idempotency id, payload,
+// and the synthetic optimistic event applied locally. No SQL is ever parsed —
+// mutate() is a constructor, not a query language. Pure: the clock and the
+// last-version state stay in the shell.
+
+/// The next version stamp: wall-clock ISO time widened to microseconds, bumped
+/// past the last issued stamp when the clock has not moved (or moved backwards)
+/// — a client's own versions are strictly monotonic even inside one millisecond.
+/// (This is also where the §10q HLC candidate would land: feed `nowIso` the max
+/// of the wall clock and the newest version seen via CDC.)
+export function nextVersion(nowIso: string, lastVersion: string): string {
+  let candidate = nowIso.replace('Z', '') + '000Z';
+  if (candidate <= lastVersion) {
+    const micros = (parseInt(lastVersion.slice(-7, -1), 10) + 1) % 1000000;
+    candidate = `${lastVersion.slice(0, -7)}${String(micros).padStart(6, '0')}Z`;
+  }
+  return candidate;
+}
+
+/// NATS-subject-safe token: dots, wildcards and whitespace become dashes. The
+/// msg_id rides as subject tokens on mutation_ack, and the version carries
+/// fractional seconds — unescaped, one write's ack would fan out as a wildcard.
+export const subjectSafeToken = (v: string): string => v.replace(/[.*>\s]/g, '-');
+
+export function mutationSubject(principal: string, table: string, op: string): string {
+  return `mutation.${principal}.${table}.${op.toLowerCase()}`;
+}
+
+/// The idempotency id. The version stays IN the id: a second edit to the same
+/// row is a different write; a retry of the same edit is not.
+export function mutationMsgId(clientId: string, table: string, id: string | number, version: string): string {
+  return subjectSafeToken(`${clientId}-${table}-${id}-${version}`);
+}
+
+/// The row id mutate() reports and the outbox tracks: the PK values joined with
+/// '|' (composite keys welcome — the echo-confirm joins the same way).
+export function mutationKeyId(pkCols: string[], key: Record<string, unknown>): string {
+  return pkCols.map((c) => key[c]).join('|');
+}
+
+/// The wire payload (PROTOCOL §7.4): key + version + client_id, plus `data`
+/// for everything but DELETE — a delete is expressed by its key alone.
+export function mutationPayload(
+  op: 'INSERT' | 'UPDATE' | 'DELETE',
+  key: Record<string, unknown>,
+  values: Record<string, unknown> | undefined,
+  version: string,
+  clientId: string,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = { key, version, client_id: clientId };
+  if (op !== 'DELETE') payload.data = values ?? {};
+  return payload;
+}
+
+/// The synthetic event the optimistic local apply runs through the SAME
+/// applyEvent path as CDC: DELETE carries its key as data, lsn is pinned at
+/// MAX_SAFE_INTEGER (an optimistic row must never lose to any gate), and the
+/// `optimistic` flag keeps it out of position accounting and echo-confirm.
+export function optimisticEvent(table: string, op: string, payload: Record<string, unknown>): Record<string, unknown> {
+  return {
+    table,
+    operation: op,
+    data: op === 'DELETE' ? (payload as any).key : (payload as any).data,
+    lsn: Number.MAX_SAFE_INTEGER,
+    optimistic: true,
+  };
+}
+
+/// The whole envelope in one call — what a port implements first.
+export function buildMutation(args: {
+  principal: string; clientId: string; table: string;
+  op: 'INSERT' | 'UPDATE' | 'DELETE';
+  key: Record<string, unknown>; values?: Record<string, unknown>;
+  pkCols: string[]; version: string;
+}): { subject: string; msgId: string; id: string; payload: Record<string, unknown>; optimistic: Record<string, unknown> } {
+  const id = mutationKeyId(args.pkCols, args.key);
+  const payload = mutationPayload(args.op, args.key, args.values, args.version, args.clientId);
+  return {
+    subject: mutationSubject(args.principal, args.table, args.op),
+    msgId: mutationMsgId(args.clientId, args.table, id, args.version),
+    id,
+    payload,
+    optimistic: optimisticEvent(args.table, args.op, payload),
+  };
+}

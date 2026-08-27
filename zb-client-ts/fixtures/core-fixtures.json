@@ -1249,5 +1249,154 @@
       "drops": [],
       "creates": []
     }
+  ],
+  "nextVersion": [
+    {
+      "name": "clock ahead: wall time widened to microseconds",
+      "now": "2026-08-27T10:00:00.123Z",
+      "last": "2026-08-27T09:59:59.000000Z",
+      "out": "2026-08-27T10:00:00.123000Z"
+    },
+    {
+      "name": "clock tied: bump one microsecond past the last stamp",
+      "now": "2026-08-27T10:00:00.123Z",
+      "last": "2026-08-27T10:00:00.123000Z",
+      "out": "2026-08-27T10:00:00.123001Z"
+    },
+    {
+      "name": "clock behind (skew): still strictly after the last stamp",
+      "now": "2026-08-27T09:00:00.000Z",
+      "last": "2026-08-27T10:00:00.123456Z",
+      "out": "2026-08-27T10:00:00.123457Z"
+    }
+  ],
+  "subjectSafe": [
+    {
+      "name": "dots, wildcards and spaces become dashes",
+      "in": "c-1.users.*>x y",
+      "out": "c-1-users---x-y"
+    }
+  ],
+  "envelope": [
+    {
+      "name": "UPDATE: full envelope",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-40acde74",
+        "table": "test_types",
+        "op": "UPDATE",
+        "key": {
+          "uid": "u-1"
+        },
+        "values": {
+          "note": "hi"
+        },
+        "pkCols": [
+          "uid"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": {
+        "subject": "mutation.omar.test_types.update",
+        "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
+        "id": "u-1",
+        "payload": {
+          "key": {
+            "uid": "u-1"
+          },
+          "version": "2026-08-27T10:00:00.123000Z",
+          "client_id": "c-40acde74",
+          "data": {
+            "note": "hi"
+          }
+        },
+        "optimistic": {
+          "table": "test_types",
+          "operation": "UPDATE",
+          "data": {
+            "note": "hi"
+          },
+          "lsn": 9007199254740991,
+          "optimistic": true
+        }
+      }
+    },
+    {
+      "name": "DELETE: no data on the wire; the optimistic event carries the key",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-1",
+        "table": "t",
+        "op": "DELETE",
+        "key": {
+          "a": 1,
+          "b": 2
+        },
+        "pkCols": [
+          "a",
+          "b"
+        ],
+        "version": "2026-08-27T10:00:00.000000Z"
+      },
+      "out": {
+        "subject": "mutation.omar.t.delete",
+        "msgId": "c-1-t-1|2-2026-08-27T10:00:00-000000Z",
+        "id": "1|2",
+        "payload": {
+          "key": {
+            "a": 1,
+            "b": 2
+          },
+          "version": "2026-08-27T10:00:00.000000Z",
+          "client_id": "c-1"
+        },
+        "optimistic": {
+          "table": "t",
+          "operation": "DELETE",
+          "data": {
+            "a": 1,
+            "b": 2
+          },
+          "lsn": 9007199254740991,
+          "optimistic": true
+        }
+      }
+    },
+    {
+      "name": "INSERT with no values still ships an empty data object",
+      "args": {
+        "principal": "p",
+        "clientId": "c",
+        "table": "t",
+        "op": "INSERT",
+        "key": {
+          "id": 5
+        },
+        "pkCols": [
+          "id"
+        ],
+        "version": "2026-08-27T10:00:00.000000Z"
+      },
+      "out": {
+        "subject": "mutation.p.t.insert",
+        "msgId": "c-t-5-2026-08-27T10:00:00-000000Z",
+        "id": "5",
+        "payload": {
+          "key": {
+            "id": 5
+          },
+          "version": "2026-08-27T10:00:00.000000Z",
+          "client_id": "c",
+          "data": {}
+        },
+        "optimistic": {
+          "table": "t",
+          "operation": "INSERT",
+          "data": {},
+          "lsn": 9007199254740991,
+          "optimistic": true
+        }
+      }
+    }
   ]
 }
