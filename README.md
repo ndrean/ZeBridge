@@ -7,7 +7,7 @@
 **What is it?**:  An opinionated, bidirectional bridge to synchronize a single PostgreSQL (14+) database with a local replica via NATS/JetStream (2.10+).
 It is **one bridge with two components** you build on:
 
-```
+```txt
 PG  ←→  zebridge (daemon)  ←→  NATS  ←→  libzb(.js) (library)  ←→  consumer
 ```
 
@@ -96,8 +96,8 @@ flowchart LR
 | artifact | what it is | who uses it |
 | -- | -- | -- |
 | zebridge | executable (daemon) | next to PG ← ZeBridge →  NATS |
-| libzebridge | native library, C ABI | mobile apps, desktop apps, microservices via FFI |
-| libzebridge.js | npm package (self-contained TypeScript) | any JS runtime: browsers, Node, Electron, Deno, Bun |
+| libzb | native library, C ABI | mobile apps, desktop apps, microservices via FFI |
+| zb-client-ts | npm package (self-contained TypeScript) | any JS runtime: browsers, Node, Electron, Deno, Bun |
 
 We have worked examples for Flutter, webapps (WASM-SQLite + OPFS), and backend microservices in Node, Go,Python & Elixir.
 
@@ -278,7 +278,7 @@ override that.
 It caps the event size, suspends a table and drives the total memory used.
 
 Ceiling is NATS/JS, the host capactiy, not ZeBridge.
-The defaults (ring=65536, BASE_BUF=14 → 16 KB rows, MAX_COLUMNS auto-detected at 8 for a `users`-shaped table) land around 1 GB, dominated almost entirely by the data slab — see the worked formula below.
+The defaults (ring=32768, BASE_BUF=14 → 16 KB rows, MAX_COLUMNS auto-detected at 8 for a `users`-shaped table) land around 1 GB, dominated almost entirely by the data slab — see the worked formula below.
 
 ❇️ Read [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count)
 
@@ -302,7 +302,7 @@ Before starting a bridge:
 
 The bridge is then started with:
 
-* a memory budget: `BASE_BUF` (default 2^14 = 16 KB) and `RING_BUFFER_COUNT` (default 65536), sized to the tables this instance handles — see [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count). `MAX_COLUMNS` is usually left unset and auto-detected.
+* a memory budget: `BASE_BUF` (default 2^14 = 16 KB) and `RING_BUFFER_COUNT` (default 32768), sized to the tables this instance handles — see [Sizing BASE_BUF and RING_BUFFER_COUNT](#sizing-base_buf-and-ring_buffer_count). `MAX_COLUMNS` is usually left unset and auto-detected.
 * a unique `--slot` — the WAL pointer PostgreSQL keeps for this instance. Each running instance needs its own.
 * a unique `--port` for its telemetry webserver. Each running instance needs its own.
 * `--top`, defaulting to `./grammar.json` — the stream/bucket names shared between ZeBridge, NATS and consumers.
@@ -914,16 +914,6 @@ Status: `200 OK` when bridge HTTP server is running.
 
 Use for Docker health checks, Kubernetes probes, or load balancers.
 
-### 5. Graceful Shutdown Endpoint
-
-**HTTP POST** `http://localhost:9090/shutdown`
-
-Triggers the same graceful shutdown as `SIGINT`/`SIGTERM` — see [Graceful Shutdown](#graceful-shutdown) for the exact sequence.
-
-```bash
-curl -X POST http://localhost:9090/shutdown
-```
-
 ### 6. Stream Management Endpoints
 
 **Get stream info:**
@@ -986,7 +976,11 @@ The full mechanism — bridge ACKs PostgreSQL only after JetStream confirms, wha
 
 Each snapshot carries the LSN it was taken at, so a consumer can reconstruct exact table state at that point — and discard any CDC event at or before it as already included (the library handles this — [the consumer side](#the-consumer-side--use-the-library)).
 
-Event ordering follows from [one WAL-reading thread per bridge](#design-overview): PostgreSQL's WAL is already sequential, the bridge doesn't reorder it, and JetStream delivers in the order it received.
+Event ordering follows from [one WAL-reading thread per bridge](#design-overview): PostgreSQL hands the bridge a strict total order — transactions in **commit** order, and each transaction's changes in execution order — and the bridge reads it sequentially.
+
+⚠️ **Order is preserved WITHIN a table, not ACROSS tables.** A flush is grouped by subject before publishing, which collapses interleaving: when a run begins mid-pair, a child's batch can be published before the batch carrying its parents. Measured. Most consumers never notice — rows are applied by primary key, last-write-wins, idempotent — but a consumer holding a constraint that spans tables (a foreign key) must be order-tolerant, which is why `libzb` holds a row whose parent has not arrived and retries it after the next batch.
+
+⚠️ **Do not sort by `lsn` to "restore" order.** LSNs are not monotonic in delivery order: a transaction that begins earlier but commits later arrives later carrying a *lower* LSN (measured: `lsn=8700486880` delivered before `lsn=8700486488`). Delivery order is the truth; `lsn` is a watermark for "was this already in my snapshot?", nothing more.
 
 ### Graceful Shutdown
 
@@ -1008,53 +1002,6 @@ Event ordering follows from [one WAL-reading thread per bridge](#design-overview
 
 ## Inside
 
-### Thread Model (7 threads)
-
-Every one is spawned once at startup and lives until shutdown. Nothing is spawned per
-request, per table or per connection.
-
-| # | thread | spawned at | does |
-| --- | --- | --- | --- |
-| 1 | **Main** | — | consumes the WAL stream, parses pgoutput, packs rows into the ring buffer. `EventProcessor` runs *inline* here, so "the CDC path" and "the main thread" are the same thread |
-| 2 | **Batch publisher** | `batch_publisher.zig:534` | drains the ring buffer, encodes MessagePack, publishes to the `CDC` stream |
-| 3 | **WAL monitor** | `wal_monitor.zig:50` | replication-slot lag, every 30 s |
-| 4 | **HTTP telemetry** | `http_server.zig:49` | `/metrics`, `/health`, `/status`, `/shutdown`. Accepts and serves inline — no thread per connection |
-| 5 | **Snapshot supervisor** | `snapshot_listener.zig:710` | spawns 6, then sleeps until shutdown and joins it. Does no work of its own |
-| 6 | **Snapshot requests** | `snapshot_listener.zig:745` | consumes `snapshot.request.>` and generates snapshots **inline** — one at a time, in arrival order |
-| 7 | **Mutation listener** | `mutation_listener.zig:137` | consumes `mutation.>`, applies writes under the ingress role. Only started when `DATABASE_WRITER_URL` is set |
-
-There used to be an eighth, a schema-request listener answering `init.schema` on its own
-connection — removed along with the on-demand `init.schema.<table>` request/response
-mechanism it served (PROTOCOL.md §1): an earlier design that predates the current push
-model, where the bridge writes every table's schema straight into `$KV.schemas.<table>`
-at boot and on every DDL change, and a client just watches that bucket.
-
-Two things this table is meant to stop people assuming:
-
-* **Snapshots are not concurrent.** Thread 6 calls `generateIncrementalSnapshot` inline, so
-  a large table blocks every other table's request behind it in the stream. Requests are
-  durable so nothing is lost, and the ack happens on receipt rather than on completion —
-  but a small table waits for a big one. (`Config.Snapshot.max_concurrent_snapshots`
-  states an intent that was never built; it is read by nothing.)
-* **Preflight is not a thread.** It is an inline call in `main` (`bridge.zig:377`) that runs
-  *before* threads 5–7 exist, which is why it can write the refusal registry without
-  synchronising with anyone.
-
-#### Who touches the refusal registry
-
-`refused_tables.Registry` is shared by the CDC and snapshot paths — one table must not be
-refused by one and served by another. Three roles reach it:
-
-| | role |
-| --- | --- |
-| main thread (1) | writes (DDL path) **and** reads (`shouldDrop` per event) |
-| snapshot requests (6) | writes (a row too wide to publish) **and** reads (rejects requests) |
-| HTTP telemetry (4) | reads only, for `/metrics` and `/status` |
-
-Two concurrent *writers* and a concurrent *reader* is why the registry is an append-only
-array with atomic publication rather than a hash map with a lock — see the header of
-`src/refused_tables.zig`.
-
 ### Data Flow
 
 ```txt
@@ -1073,7 +1020,9 @@ NATS JetStream (async publish)
 PostgreSQL LSN ACK
 ```
 
-The SPSC queue serves two purposes: it decouples WAL reading from NATS publishing (so a slow flush never blocks the WAL reader directly), and it absorbs a NATS outage without losing anything — see [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages) for what happens when it fills. Sized by `RING_BUFFER_COUNT`; roughly 1 second of buffer at 60K events/s with the defaults.
+The SPSC queue serves two purposes: it decouples WAL reading from NATS publishing (so a slow flush never blocks the WAL reader directly), and it absorbs a NATS outage without losing anything — see [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages) for what happens when it fills.
+
+❇️ Sized by `RING_BUFFER_COUNT`; roughly 1 second of buffer at 60K events/s with the defaults.
 
 ### Memory Management
 
@@ -1101,7 +1050,7 @@ The ring buffer is pre-allocated once at startup, in three parts: a fixed-size e
 **On shutdown:**
 
 * Bridge sends final ACK with last confirmed LSN
-* Replication slot preserves position for restart
+* Replication slot preserves position for restart <- ??
 
 ### Reconnection Handling
 
@@ -1399,7 +1348,7 @@ The gap is the virtualization layer, not the bridge: the same binary, same code,
 | build | `zig build -Doptimize=ReleaseFast` — a Debug build is several times slower |
 | PostgreSQL | 18.4 in Docker on the same machine |
 | NATS | JetStream, file storage, in Docker on the same machine, **no consumers attached** |
-| bridge | one instance, `BASE_BUF=14` (16 KB/event), `RING_BUFFER_COUNT=65536`, MessagePack |
+| bridge | one instance, `BASE_BUF=14` (16 KB/event), `RING_BUFFER_COUNT=32768`, MessagePack |
 | table | `users` — 4 small columns, single-column PK, `REPLICA IDENTITY DEFAULT` |
 | load | 2000 statements × a 1000-row `INSERT … SELECT … generate_series`, each its own transaction = **2,000,000 rows** |
 
@@ -1503,9 +1452,6 @@ curl http://localhost:9090/metrics
 
 # Stream management
 curl http://localhost:9090/streams/info?stream=CDC | jq
-
-# Graceful shutdown
-curl -X POST http://localhost:9090/shutdown
 ```
 
 ### Monitoring Replication Slot

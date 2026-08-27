@@ -3965,6 +3965,63 @@ arriving before its parent inside ONE batch, and nothing handled it across
 batches until the applier's hold/retry (§10d). The two together are what make FKs
 survivable; either alone is not enough.
 
+## 10f. A monotonic event stamp, and why it is not sufficient alone (2026-08-27)
+
+Raised in review: refusing to port an FK whose parent lives in another stream is
+too restrictive — a PUBLIC `users` parent with a PRIVATE `salaries` child scoped
+to one tenant is exactly the multi-tenant shape this product exists for, not an
+edge case. Withdrawn. The alternative raised was PowerSync's: give every event a
+monotonic unique id, which is sound here precisely because pgoutput hands us a
+total order.
+
+**What PostgreSQL actually guarantees, measured.** Within one replication slot,
+logical decoding delivers transactions in COMMIT order and each transaction's
+changes in execution order. That is causal order: PostgreSQL enforces a foreign
+key at statement time, so a parent always precedes its child in the same
+transaction or sits in an earlier-committed one.
+
+**And the sharp edge that makes a stamp necessary rather than cosmetic:** LSNs
+are NOT monotonic in delivery order. A transaction that begins earlier and
+commits later arrives later carrying a LOWER lsn:
+
+    lsn=8700486880  T2-committed-first    <- delivered FIRST
+    lsn=8700486488  T1-first-write        <- lower lsn, delivered SECOND
+    lsn=8700487104  T1-second-write
+
+So a client must NEVER sort by lsn to recover order — that would reorder across
+commit boundaries and actively break causality. (libzb is safe today by design
+rather than luck: `state.lsn` advances only at SEEDING, never per applied event,
+so it is a "was this in my snapshot?" watermark. Had it tracked a running
+maximum, `T1-first-write` would have been silently dropped. Verified 3/3 rows
+landed.)
+
+**A monotonic stamp is cheap and correct here.** The WAL loop is single-threaded
+and decodes in commit order, so a counter incremented as each event is packed IS
+the global total order — no coordination, no clock, no ambiguity. That gives a
+client something it can legitimately sort by, across streams, which `lsn` cannot
+provide.
+
+**But sortable is not sufficient.** A client sees only a SUBSET of the global
+sequence — its own tenant plus public — so gaps are permanent and expected, and
+indistinguishable from "still in flight". Holding stamp 100 from CDC_PUBLIC and
+105 from CDC_kilo, it cannot know whether 101-104 belong to a tenant it may not
+read or are about to arrive. Ordering what you have does not tell you when it is
+safe to apply.
+
+That missing half is exactly what PowerSync's CHECKPOINT is: a barrier saying
+"you are consistent as of X", letting the client apply everything up to it
+atomically. The full design is therefore stamp + per-scope watermark, and the
+watermark is the substantial part — it needs the bridge to know, per client
+scope, what it has finished publishing.
+
+**Where that leaves us.** The order-tolerant applier (§10d/§10e) is required
+regardless, because it is the only mechanism that handles a gap the client cannot
+interpret. A stamp would make holds rarer and give a deterministic apply order
+for what has arrived; a checkpoint would make partial transactions unobservable,
+which is a STRONGER guarantee than ZeBridge offers today. Neither is a
+prerequisite for FKs working — they already do — so this is an improvement to
+sequence deliberately, not a hole to plug.
+
 ## 11 Restart Rules
 
 The restart rules, as they stand today
