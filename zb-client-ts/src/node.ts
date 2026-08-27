@@ -21,7 +21,14 @@ export const nodeStorage: StorageFactory = (dbName) => {
       return Array.isArray(r) ? r : [];
     }
     const stmt = db.prepare(text);
-    return stmt.reader ? stmt.all(...params) : (stmt.run(...params), []);
+    // Binding is SEMANTICS, so it belongs to the contract (storage.ts): sqlocal's
+    // wasm SQLite binds JS booleans as 0/1 and undefined as NULL; better-sqlite3
+    // REFUSES both ("can only bind numbers, strings, bigints, buffers, and
+    // null") — measured: the optimistic apply and every boolean-carrying CDC
+    // echo failed on Node while the same rows applied fine in the browser.
+    const bound = params.map((p) =>
+      p === undefined ? null : typeof p === 'boolean' ? (p ? 1 : 0) : p);
+    return stmt.reader ? stmt.all(...bound) : (stmt.run(...bound), []);
   };
 
   // The storage contract: transactions must serialize. better-sqlite3 is a

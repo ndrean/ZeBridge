@@ -34,6 +34,11 @@ export interface Storage {
 /// Left alone, the same core over the same data would ENFORCE referential
 /// integrity in Node and IGNORE it in the browser.
 ///
+/// ⚠️ CONTRACT: value BINDING is semantics too. A JS boolean binds as 0/1 and
+/// `undefined` binds as NULL, whatever the engine natively accepts — sqlocal
+/// does this implicitly, better-sqlite3 refuses both and must coerce (node.ts).
+/// Left unaligned, the same event applies in one adapter and errors in the other.
+///
 /// The line to hold: an adapter may choose pragmas that trade PERFORMANCE
 /// (`journal_mode`, `synchronous`, cache size) as its engine sees fit, but pragmas
 /// that change SEMANTICS belong to the contract, because a consumer must not have

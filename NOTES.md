@@ -4848,6 +4848,15 @@ applySchema, applyGenerations, the gap scope and the write path all execute
 what the core builds. Next: the transport seam, then the Zig port against
 all 83 fixtures.
 
+**Finding 11, small, found by 2c's live write**: better-sqlite3 refuses JS
+booleans and `undefined` at bind time, so on Node the optimistic apply and
+every boolean-carrying CDC echo errored locally while the same rows applied
+fine in the browser (sqlocal coerces implicitly). Binding is SEMANTICS, so the
+rule joined the storage contract (storage.ts): boolean -> 0/1, undefined ->
+NULL, in every adapter; node.ts now coerces. Verified: the same write that
+errored three times runs clean, the local replica shows the row and then its
+tombstone.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
