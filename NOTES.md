@@ -4598,6 +4598,26 @@ With D1 (§10m) + D2, §10k's plan is down to its last item: strip the legacy
 snapshot dependencies from the scenario suite, then remove the bridge-side
 snapshot code.
 
+## 10o. The scenario suite no longer depends on snapshot-on-demand (2026-08-27)
+
+The §10k plan's last precondition, done. DELETED (their purpose WAS the retired
+path): snapshot.py (request/replay/verify), stampede.py (request hammering),
+wide.py (width discipline via the snapshot working set — the width guard itself
+is covered by widthguard.py and livebirth.py), faults.py (snapshot-listener
+fault regressions; the listener leaves with the path). EDITED: check.py (§4
+init.snap.* grant-symmetry check retired in place), crosstenant.py (probe D),
+tenant_kv.py (§4 audience/contents), leaksoak.py (the every-30th snapshot
+request op), decode_integrity.py (now CDC-only; the COPY-binary decode half
+leaves with pg_copy_binary.zig), envcheck.py (SNAP_RET_SECONDS out of the known
+set). Comment-only mentions in tls.py, objstore_race.py, endpoint.py, speed.py,
+generations.py, zb.py stay — they are history or generations terminology.
+
+Nothing in scripts/scenarios references snapshot_request, init.snap.*, or the
+$KV.snapshots bucket any more. The bridge-side snapshot code (listener, worker,
+pg_copy_binary.zig, the INIT_* publish path, SNAP_RET_SECONDS and friends) is
+now unreferenced by the suite and can come out; .env/.conf cleanup rides with
+that removal.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

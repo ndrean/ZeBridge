@@ -149,20 +149,10 @@ async def main():
         except Exception as e:
             blocked(f"stream_info {victim_stream}", type(e).__name__)
 
-    # ── D. the snapshot path, which has the same shape ────────────────────────
-    try:
-        sub = await js.pull_subscribe("init.snap.>", durable=None, stream="INIT")
-        msgs = await sub.fetch(1, timeout=3)
-        for m in msgs:
-            await m.nak()
-        leak("JS consumer on INIT filtered init.snap.>",
-             f"pulled {len(msgs)} snapshot chunk(s): {', '.join(m.subject for m in msgs)}\n"
-             "Snapshots carry no tenant token at all, so there is not even a subject to\n"
-             "scope. Same stream-level fix required (NOTES.md §1.12).")
-    except nats.errors.TimeoutError:
-        print("  ⓘ  JS consumer on INIT: created, nothing to pull (inconclusive)")
-    except Exception as e:
-        blocked("JS consumer on INIT", type(e).__name__)
+    # ── D. RETIRED (2026-08-27): the snapshot path ────────────────────────────
+    # Snapshot-on-demand is gone (NOTES §10h/§10n); seeding reads generation
+    # chains from the gen-<tenant> object stores, whose per-tenant isolation is
+    # what tenant scoping now means on the read path.
 
     await nc.close()
 

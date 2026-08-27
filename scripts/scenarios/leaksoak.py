@@ -70,8 +70,6 @@ def churn(rnd: int):
       every 10th       a SUCCESSFUL enrollment: mint an invite row, redeem it —
                        the writer CTE, the JWT mint, and the user_tenants insert
                        whose CDC diversion feeds $KV.tenants
-      every 30th       a snapshot request for kilo.note_t — the snapshot worker's
-                       COPY/chunk/descriptor path
       every 20th       a REAL edge-write envelope on mutation.omar.counter_public
                        (msgpack, fresh version, Nats-Msg-Id) — the mutation
                        listener's decode/apply/verdict path, an UPDATE so no rows
@@ -125,11 +123,6 @@ async def main():
     swept = False
     while time.time() < deadline:
         churn(rounds)
-        if rounds % 30 == 15:
-            try:
-                await js.publish(zb.subject(zb.TOPOLOGY["subjects"]["snapshot_request"], "kilo", "note_t"), b"")
-            except Exception:
-                pass
         if counter_uid and rounds % 20 == 10:
             # the mutation listener's full path: decode → LWW guard → apply →
             # verdict publish. UPDATE with a fresh version: converges, no growth.

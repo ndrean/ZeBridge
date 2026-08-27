@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Row values survive the zero-copy decode path, in both CDC and snapshots.
+"""Row values survive the zero-copy decode path.
 
 2026-08-20: `decodeTuple`/`decodeBinColumnData` (src/pgoutput.zig) stopped copying a
 column's TEXT/VARCHAR/BPCHAR/JSON/BYTEA/JSONB/NUMERIC/enum-passthrough bytes out of the
 WAL or COPY-binary buffer and started aliasing them directly, on the reasoning that the
 buffer and the decoded value share one arena and nothing resets it until this row's
 value has already been consumed — packed into the CDC ring buffer
-(event_processor.zig), or encoded into a snapshot chunk (pg_copy_binary.zig). Zig unit
-tests confirmed the two call sites this was actually changed for, under
+(event_processor.zig). Zig unit
+tests confirmed the call sites this was actually changed for, under
 `std.testing.allocator` (which panics on a double-free), but that only proves the
 *reasoning* is internally consistent — not that the *assumption* (this buffer, this
 allocator, this lifetime) still holds against a live WAL stream and a live COPY, where
@@ -22,16 +22,11 @@ each carrying `idx` baked into every variable-length value so a misattributed ro
 visibly wrong rather than accidentally identical — and matches by primary key, not by
 delivery order, so a reordering bug cannot hide as a values bug or vice versa.
 
-Two acts, same fixture:
-
-  1. CDC — subscribe to `cdc.>`, run the seed INSERT, and check every event's `data`
-     against PostgreSQL.
-  2. snapshot — request a snapshot, replay its chunks, and check the same way.
-
-NUMERIC is compared by decimal value, not by string: pg_copy_binary.zig pads a snapshot
-NUMERIC to its declared scale to match PostgreSQL's own `::text` (see `padNumeric`'s
-doc comment), but the CDC path does not, so a byte-string comparison would fail on a
-padding difference that is not a bug. Decimal equality still catches a wrong value.
+One act: CDC — subscribe to `cdc.>`, run the seed INSERT, and check every event's
+`data` against PostgreSQL. (The second act, replaying a requested snapshot through
+pg_copy_binary.zig's COPY-binary decode, retired with snapshot-on-demand — NOTES
+§10h/§10n. NUMERIC stays compared by decimal value, which still catches a wrong
+value regardless of scale padding.)
 
 ⚠️ `decode_fixture` is a table this script invents. Its catalogue row is written
 BEFORE the probe bridge starts: the bridge derives the public set from
@@ -188,81 +183,6 @@ async def collect_cdc(nc, n: int, timeout: float) -> dict[int, dict]:
     return got
 
 
-async def collect_snapshot(nc, columns: list[str]) -> dict[int, dict]:
-    """Request a snapshot of TABLE and decode every chunk into idx -> row."""
-    js = nc.jetstream()
-    kv_snap = await js.key_value(zb.TOPOLOGY["kv"]["snapshots"])
-
-    # ⚠️ Everything on the snapshot path is tenant-scoped since §1.12 — the KV key, the
-    # request subject, the chunk filter, and the stream itself. `decode_fixture` is a
-    # *public* table (zebridge_public_tables), so its tenant is the open tenant, and its
-    # chunks live on INIT_PUBLIC. The old shape (`snapshot.request.<table>`, stream
-    # "INIT") produced a Publish Violation and a consumer on a stream that does not
-    # exist — NOTES.md §1.16.
-    tenant = zb.TOPOLOGY["open_tenant"]
-    snap_key = f"{tenant}.{TABLE}"
-
-    async def descriptor():
-        try:
-            return zb.decode((await kv_snap.get(snap_key)).value)
-        except Exception:  # noqa: BLE001
-            return None
-
-    before = await descriptor()
-    stale_id = before["snapshot_id"] if before else None
-
-    req = zb.subject(zb.TOPOLOGY["subjects"]["snapshot_request"], tenant, TABLE)
-    try:
-        await js.publish(req, b"")
-    except Exception:  # noqa: BLE001
-        pass  # a request already in flight is fine — read whatever descriptor lands
-
-    desc = None
-    for _ in range(30):
-        desc = await descriptor()
-        if desc and desc["snapshot_id"] != stale_id:
-            break
-        desc = None
-        await asyncio.sleep(1)
-    if not desc:
-        sys.exit("no fresh snapshot descriptor appeared — is the bridge running?")
-
-    # Same resolution as snapshot.py: `streams.init` ("INIT") is a generic label, not a
-    # real stream — only INIT_PUBLIC / INIT_<TENANT> exist.
-    init_stream = zb.TOPOLOGY["init_streams"]["public"]
-    filt = f"init.snap.{tenant}.{TABLE}.{desc['snapshot_id']}.>"
-    sub = await js.pull_subscribe(
-        filt, durable=None, stream=init_stream,
-        config=ConsumerConfig(deliver_policy=DeliverPolicy.ALL, filter_subject=filt),
-    )
-
-    idx_col, label_col, doc_col, amount_col, kind_col = (
-        columns.index(c) for c in ("idx", "label", "doc", "amount", "kind")
-    )
-
-    got: dict[int, dict] = {}
-    while True:
-        try:
-            batch = await sub.fetch(50, timeout=2)
-        except Exception:  # noqa: BLE001
-            break
-        if not batch:
-            break
-        for msg in batch:
-            for row in zb.decode(msg.data):
-                # Every snapshot column is text (pg_copy_binary.zig's renderValue), idx
-                # included — unlike the CDC path, where msgpack carries it as an int.
-                idx = int(row[idx_col])
-                got[idx] = {
-                    "label": row[label_col],
-                    "doc": json.loads(row[doc_col]) if isinstance(row[doc_col], str) else row[doc_col],
-                    "amount": decimal.Decimal(str(row[amount_col])),
-                    "kind": row[kind_col],
-                }
-            await msg.ack()
-    return got
-
-
 async def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 400
     failed = 0
@@ -301,14 +221,6 @@ async def main():
                 got_cdc = await collect_cdc(nc, n, timeout=30)
                 expected = expected_rows()
                 failed += check_rows(got_cdc, expected, "CDC")
-
-                print(f"\n2. snapshot path ({n} rows)")
-                columns = zb.psql(
-                    f"SELECT attname FROM pg_attribute WHERE attrelid='public.{TABLE}'::regclass "
-                    "AND attnum>0 AND NOT attisdropped ORDER BY attnum"
-                ).splitlines()
-                got_snap = await collect_snapshot(nc, columns)
-                failed += check_rows(got_snap, expected, "snapshot")
             finally:
                 await nc.close()
     finally:

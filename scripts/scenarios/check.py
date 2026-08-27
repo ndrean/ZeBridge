@@ -134,19 +134,10 @@ def main():
         else:
             zb.ok("no principal is granted the whole change feed")
 
-        # ── 4. snapshot reach == subscribe reach ──────────────────────────────
-        for p, subs in grants.items():
-            if p not in mapping:
-                continue
-            cdc = {s for s in subs if s.startswith("cdc.")}
-            snap = {s for s in subs if s.startswith("init.")}
-            cdc_t = {s.split(".")[1] for s in cdc if s.count(".") >= 2 and s.split(".")[1] != ">"}
-            snap_t = {s.split(".")[2] for s in snap if s.startswith("init.snap.") and s.count(".") >= 3}
-            if "init.>" in snap and cdc_t:
-                bad(f"'{p}' has tenant-scoped CDC {sorted(cdc_t)} but wholesale 'init.>'",
-                    "A client must not be able to dump what it cannot subscribe to.")
-            elif snap_t and cdc_t and snap_t != cdc_t:
-                bad(f"'{p}': snapshot reach {sorted(snap_t)} != subscribe reach {sorted(cdc_t)}")
+        # ── 4. RETIRED (2026-08-27): snapshot reach == subscribe reach ────────
+        # Snapshot-on-demand is gone (NOTES §10h/§10n) — clients seed from
+        # generation chains, whose objects carry no per-principal subjects to
+        # compare. The init.snap.* grant symmetry this checked no longer exists.
 
     # ── 5. the catalogue's public set vs CDC_PUBLIC's bound subjects ──────────
     #
@@ -280,7 +271,7 @@ def main():
     # describe the bridge's OWN slot, so an abandoned one is reported by nothing.
     #
     # Left alone it grows to `max_slot_wal_keep_size` and is then INVALIDATED, at which
-    # point it cannot resume at all and whatever it fed needs a full resnapshot. So the
+    # point it cannot resume at all and whatever it fed needs a full re-seed. So the
     # window between "orphaned" and "unrecoverable" is exactly that setting.
     declared_slot = os.environ.get("BRIDGE_CDC_SLOT", "").strip()
     rows = [r for r in zb.psql(
