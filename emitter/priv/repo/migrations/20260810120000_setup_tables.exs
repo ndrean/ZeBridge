@@ -66,19 +66,12 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
     # Guarded on the function existing: a database whose SQL predates this refactor (or
     # was bootstrapped from an older template) skips this rather than failing the whole
     # migration on something it does not have yet.
-    execute("""
-    DO $$
-    BEGIN
-        IF EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'zebridge_enable') THEN
-            PERFORM * FROM public.zebridge_enable(
-                'public.users'::regclass,
-                public_reason => 'CDC fixture: no tenant column, readable by every consumer',
-                publication => '#{zb_publication()}',
-                dry_run => false
-            );
-        END IF;
-    END $$;
-    """)
+    execute(zb_enable("""
+    'public.users'::regclass,
+    public_reason => 'CDC fixture: no tenant column, readable by every consumer',
+    publication => '#{zb_publication()}',
+    dry_run => false
+    """))
 
     # `test_types` — writable, but NOT yet tenant-scoped: `tenant_id` does not exist until
     # `AddTenantLastWriter` (the next migration) adds it. `zebridge_enable()` refuses to
@@ -118,6 +111,45 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
       raise "BRIDGE_CDC_PUBLICATION is not set: this migration publishes a table and must " <>
               "name the publication (the same name the bridge is given as --pub). " <>
               "Source .env.bridge before running migrations."
+  end
+
+
+  # ⚠️ NOT `PERFORM * FROM zebridge_enable(...)`. `PERFORM` discards the result, and
+  # the result is where the refusals live: zebridge_enable reports a preflight failure
+  # as an ERROR ROW and returns, so `mix ecto.migrate` printed "Migrated" while the
+  # table was never published. Measured on a fresh database 2026-08-28 — the tombstone
+  # gate refused both counter tables and both were silently absent from the
+  # publication, with nothing in the migrator output to say so.
+  #
+  # One evaluation of the function, both aggregates via FILTER. An ERROR aborts the
+  # migration, which is safe precisely because the function returns EARLY on a
+  # preflight failure — there is no half-applied state to roll back, and the
+  # transaction rolls back anyway. A WARNING is surfaced rather than raised: those are
+  # the width-budget and second-publication notices, and nobody was reading them
+  # either.
+  defp zb_enable(args) do
+    """
+    DO $$
+    DECLARE refused text; warned text;
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'zebridge_enable') THEN
+            RAISE NOTICE 'zebridge_enable() is not installed — skipping (database predates ZeBridge)';
+            RETURN;
+        END IF;
+
+        SELECT string_agg(step || ': ' || detail, chr(10)) FILTER (WHERE status = 'ERROR'),
+               string_agg(step || ': ' || detail, chr(10)) FILTER (WHERE status = 'WARNING')
+          INTO refused, warned
+          FROM public.zebridge_enable(#{args});
+
+        IF warned IS NOT NULL THEN
+            RAISE WARNING E'zebridge_enable warnings:\n%', warned;
+        END IF;
+        IF refused IS NOT NULL THEN
+            RAISE EXCEPTION E'zebridge_enable REFUSED:\n%', refused;
+        END IF;
+    END $$;
+    """
   end
 
 end

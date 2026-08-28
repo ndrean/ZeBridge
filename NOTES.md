@@ -5392,6 +5392,49 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10ap. Migrations no longer discard zebridge_enable's refusals (2026-08-28)
+
+The problem §10ai recorded, now fixed. Every emitter migration called
+
+    PERFORM * FROM public.zebridge_enable(...)
+
+and `PERFORM` DISCARDS the result — which is where the refusals live. `zebridge_enable`
+reports a preflight failure as an ERROR **row** and returns, so `mix ecto.migrate`
+printed `== Migrated` while the table was never published. That is exactly how
+`counter_public` and `counter_tenant` ended up absent from the publication on a fresh
+database with a completely green migration run.
+
+Each call site is now wrapped by a `zb_enable/1` helper — one per migration file, NOT
+shared, because a migration is a snapshot and a shared helper could change the meaning
+of one that has already been applied:
+
+    SELECT string_agg(step || ': ' || detail, chr(10)) FILTER (WHERE status = 'ERROR'),
+           string_agg(step || ': ' || detail, chr(10)) FILTER (WHERE status = 'WARNING')
+      INTO refused, warned
+      FROM public.zebridge_enable(<args>);
+    IF warned  IS NOT NULL THEN RAISE WARNING   ...; END IF;
+    IF refused IS NOT NULL THEN RAISE EXCEPTION ...; END IF;
+
+One evaluation of the function, both aggregates via `FILTER`. **ERROR aborts**, which
+is safe precisely because the function returns EARLY on a preflight failure — there is
+no half-applied state, and the transaction rolls back regardless. **WARNING surfaces
+without aborting**: those are the tombstone-acceptance and second-publication
+width-budget notices, which `PERFORM` was swallowing too.
+
+Verified RED→GREEN on a fresh scratch database:
+
+    GREEN  8/8 migrations, and my_pub carries counter_public + counter_tenant
+    RED    acceptance removed from counter_public ->
+           ** (Postgrex.Error) ERROR P0001 zebridge_enable REFUSED:
+              preflight: counter_public is writable but has no tombstone_col …
+    WARN   counter_public added to a second publication -> both warnings printed,
+           exit 0, migration continues
+
+⚠️ **`docker exec` without `-i` does not attach stdin**, so a heredoc'd psql script
+runs as an empty input and reports NOTHING — which reads exactly like "the statement
+produced no warnings". Cost one wrong conclusion mid-test before the missing `DO`
+line in the output gave it away.
+
 ## 10ao. The compose stack carries the full loop, both directions (2026-08-28)
 
 Confirmed by the operator: Elixir emits against PostgreSQL, the browser replica picks
