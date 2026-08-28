@@ -1,8 +1,12 @@
 //! The C ABI: one JSON dispatch entrypoint.
 //!
-//!   char* zb_call(const char* fn, const char* args_json);  // caller frees via zb_free
-//!   void  zb_free(char* p);
-//!   int   zb_abi_version(void);
+//!   char*    zb_call(const char* fn, const char* args_json);  // caller frees via zb_free
+//!   void     zb_free(char* p);
+//!   int      zb_abi_version(void);
+//!
+//!   uint64_t zb_client_open(const char* opts_json);   // 0 on failure
+//!   int      zb_client_close(uint64_t handle);        // 0 ok, 1 unknown handle
+//!   int      zb_client_live(void);                    // open clients, for tests
 //!
 //! `fn` names a fixture section of core-fixtures.json; `args_json` is that
 //! case's input fields verbatim; the return value is the expected output as
@@ -13,7 +17,20 @@
 
 const std = @import("std");
 const core = @import("core.zig");
+const client = @import("client.zig");
+const handles = @import("handles.zig");
 const Value = std.json.Value;
+
+/// ⚠️ The host never receives a pointer — only a generation-tagged u64 (handles.zig).
+///
+/// An embedder cannot catch a Zig panic, so at this boundary a double close or a
+/// use-after-close is not a stack trace, it is the host process dying. Routing every
+/// client through this table turns all three ordinary FFI mistakes — close twice,
+/// close from two threads, use after close — into a lookup that returns nothing.
+///
+/// 64 is a deployment ceiling, not a design one: a host that wants more clients than
+/// that is doing something this API has not been asked for yet, and gets a clean 0.
+var clients: handles.Table(ClientBox, 64) = .{};
 
 export fn zb_abi_version() c_int {
     return 1;
@@ -194,6 +211,120 @@ export fn zb_call(fn_name: ?[*:0]const u8, args_json: ?[*:0]const u8) ?[*:0]u8 {
     return dupeZ(result);
 }
 
+/// A client plus the strings its `Options` point into.
+///
+/// ⚠️ `Options` holds SLICES, and the client reads `principal` (and the rest) for its
+/// whole life — so these cannot die with the JSON they were parsed from, and cannot be
+/// freed on success. They must be freed on FAILURE and at close, which is what this
+/// box is for: one owner, one destructor, both paths.
+///
+/// This existed as five bare `dupeZ` calls first, and `leaks` counted the result:
+/// 11,000 leaks for 422 KB across 2,200 failed opens — exactly five per open, because
+/// `init` failing returned 0 without freeing any of them. `std.testing.allocator` sees
+/// none of this; the strings come from `c_allocator`, whose leaks live in the malloc
+/// zone where only `leaks` looks.
+const ClientBox = struct {
+    c: *client.SyncClient,
+    url: [:0]u8,
+    creds: [:0]u8,
+    grammar: [:0]u8,
+    db: [:0]u8,
+    principal: [:0]u8,
+
+    fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
+        self.c.deinit();
+        a.free(self.url);
+        a.free(self.creds);
+        a.free(self.grammar);
+        a.free(self.db);
+        a.free(self.principal);
+        a.destroy(self);
+    }
+};
+
+/// Open a client. `opts_json` mirrors `client.Options`; 0 means it did not open, and
+/// the reason is logged rather than returned — a richer error channel is worth adding
+/// the day a host needs to distinguish "bad credentials" from "no broker".
+export fn zb_client_open(opts_json: ?[*:0]const u8) u64 {
+    const text = std.mem.span(opts_json orelse return 0);
+    const box = openBox(std.heap.c_allocator, text) catch return 0;
+    const h = clients.insert(box);
+    if (h == 0) box.destroy(std.heap.c_allocator); // table full: do not leak it
+    return h;
+}
+
+/// Everything fallible, in a function that can actually RETURN an error.
+///
+/// ⚠️ This split is the whole point, and getting it wrong cost the first fix.
+/// `errdefer` fires when its function returns an error — so in an `export fn`
+/// returning `u64`, which cannot return one, **every `errdefer` is dead code**. The
+/// five `dupeZ` calls sat there with `errdefer a.free(...)` beneath them looking
+/// correct, and leaked on every failed open regardless: `leaks` counted 11,000 of them
+/// across 2,200 opens and pointed at those exact lines. Zig does not warn, because an
+/// unreachable `errdefer` is not an error — it is just never scheduled.
+///
+/// So: nothing fallible above the boundary, and the boundary only maps error -> 0.
+fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
+    const parsed = try std.json.parseFromSlice(Value, a, text, .{});
+    defer parsed.deinit();
+    const o = parsed.value;
+    if (o != .object) return error.BadOptions;
+
+    const str = struct {
+        fn get(v: Value, k: []const u8, dflt: []const u8) []const u8 {
+            const f = v.object.get(k) orelse return dflt;
+            return if (f == .string) f.string else dflt;
+        }
+    };
+
+    // One acquire per statement, its errdefer on the next line — and here they FIRE,
+    // because this function returns an error union.
+    const url = try a.dupeZ(u8, str.get(o, "url", "nats://127.0.0.1:4222"));
+    errdefer a.free(url);
+    const creds = try a.dupeZ(u8, str.get(o, "credsPath", ""));
+    errdefer a.free(creds);
+    const grammar = try a.dupeZ(u8, str.get(o, "grammarPath", "grammar.json"));
+    errdefer a.free(grammar);
+    const db = try a.dupeZ(u8, str.get(o, "dbPath", "zb.sqlite3"));
+    errdefer a.free(db);
+    const principal = try a.dupeZ(u8, str.get(o, "principal", ""));
+    errdefer a.free(principal);
+
+    const box = try a.create(ClientBox);
+    errdefer a.destroy(box);
+
+    box.* = .{
+        .c = try client.SyncClient.init(a, .{
+            .url = url,
+            .creds_path = creds,
+            .grammar_path = grammar,
+            .db_path = db,
+            .principal = principal,
+            .tables = &.{},
+        }),
+        .url = url,
+        .creds = creds,
+        .grammar = grammar,
+        .db = db,
+        .principal = principal,
+    };
+    return box;
+}
+
+/// Close a client. Idempotent BY CONSTRUCTION: `remove` hands back the pointer at most
+/// once, so a second close finds nothing and returns 1 instead of freeing twice.
+export fn zb_client_close(handle: u64) c_int {
+    const box = clients.remove(handle) orelse return 1;
+    box.destroy(std.heap.c_allocator);
+    return 0;
+}
+
+/// Open clients. Exists so a test can assert the table empties — a leak of a whole
+/// client is otherwise invisible from outside.
+export fn zb_client_live() c_int {
+    return @intCast(clients.liveCount());
+}
+
 test "smoke: seed gate through the dispatch layer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -214,4 +345,5 @@ test {
     // binary called it (NOTES §10av). A module absent from the test graph is a module
     // nobody is compiling.
     _ = @import("client.zig");
+    _ = @import("handles.zig");
 }

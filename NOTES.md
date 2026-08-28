@@ -5489,6 +5489,61 @@ ever wrong. Reading it never required writing it.
 
 **BUILT** the same day in both cores — §10at (TypeScript) and §10au (Zig).
 
+## 10ay. The handle table, and the leak my Zig tests could not see (2026-08-28)
+
+Two things, and the second is the lesson.
+
+**The feature.** `libzb/src/handles.zig` — a generation-tagged handle table — plus
+`zb_client_open` / `zb_client_close` / `zb_client_live` on the C ABI. The host never
+receives a pointer, only a `u64`: slot index in the low 32 bits, generation in the
+high 32. Every access re-validates both halves, so a stale handle names a slot whose
+generation has moved on and resolves to nothing. That turns the three ordinary FFI
+mistakes — close twice, close from two threads, use after close — into a lookup that
+returns null, which is what §10ax said was the precondition for exposing the client at
+a boundary where an embedder cannot catch a Zig panic.
+
+`remove` hands back the pointer AT MOST ONCE, under the same lock that bumps the
+generation, so a double close is a no-op by construction rather than by discipline.
+5 unit tests cover it; `python/abuse.py` drives the real `.dylib` through the abuse a
+host binding actually commits, including 4 threads racing open/close.
+
+⚠️ `std.Thread.Mutex` does not exist in 0.16 and `std.Io.Mutex` would force an `Io` on
+every caller of an ABI whose point is passing integers and strings — so the same
+atomic spinlock `storage.zig` already uses, for the same reason.
+
+**The lesson: `std.testing.allocator` could not see the bug, and there was one.**
+Asked whether I had run `leaks` in both build modes. I had not. Doing it:
+
+    Debug        11000 leaks for 422400 total leaked bytes
+    ReleaseFast  10999 leaks for 422368 total leaked bytes
+
+2,200 opens x **5** — the five `dupeZ` strings in `zb_client_open`, one per failed
+open. Zig's testing allocator sees none of it: those come from `c_allocator`, and a
+leaked `sqlite3*` is malloc'd by C. **The Zig tests were green throughout.**
+
+And the first fix did not work, which is the part worth keeping:
+
+> **`errdefer` fires when its function returns an ERROR. An `export fn` returning `u64`
+> cannot return one, so every `errdefer` in it is dead code** — never scheduled, never
+> run, and Zig does not warn, because an unreachable `errdefer` is not an error.
+
+The five `errdefer a.free(...)` lines sat under their allocations looking exactly
+right and did nothing. `leaks` with `MallocStackLogging=1` named the lines
+(`capi.zig:267,269,271,273,275`) and settled it. The fix is structural: **nothing
+fallible above the boundary.** `openBox()` does all of it and returns an error union,
+where `errdefer` works; `zb_client_open` only maps error -> 0. Result: 0 leaks in both
+modes.
+
+**`scripts/ffi-leakcheck.sh`** runs it in Debug and ReleaseFast, and was proven able to
+FAIL by deleting one `errdefer` — 2,200 leaks, exactly one per open.
+
+⚠️ It attaches to a live pid rather than using `leaks --atExit`, which crashes on this
+macOS for ANY ctypes-loaded dylib. Reproduced with `/usr/lib/libsqlite3.dylib` and
+nothing of ours: `Assertion failed: previous_refcount >= refs …
+uniquing_table_mutator.c`. Worth recording so the next person does not spend the time
+I did suspecting their own library — `leaksoak.py` already attaches to a pid, which is
+why it never hit this.
+
 ## 10ax. The teardown panic was the symptom; init leaked on every failure path (2026-08-28)
 
 Asked to dig into the `deinit` panic rather than leave it noted. Doing so found that
