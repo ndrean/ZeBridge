@@ -5358,6 +5358,32 @@ flags from `.env.bridge` alone (systemd `EnvironmentFile`, compose `env_file` �
 both far easier than assembling a command line), while `--pub` overrides it for
 a one-off. CLI wins over env, exactly as `--slot` does.
 
+## 10ag. TODO: speed.py's drain no longer meets its own deadline (2026-08-28)
+
+Noticed while regression-testing §10ad, and **A/B'd on the spot so it is not
+mistaken for this work's fault**: the same machine, the same load, HEAD's bridge
+against the one built from `174d952` (the commit before the argument and
+publication changes):
+
+    HEAD       777,284 / 2,000,000 events in the 100s deadline
+    174d952    802,000 / 2,000,000
+    (an earlier HEAD run, with a 393 MB WAL backlog present: 632,492)
+
+Same ballpark, so the shortfall predates all of it — which the diff already said
+(`174d952..HEAD` under `src/` touches args.zig, config.zig and wal_stream.zig, none
+of them in the data path). Recorded so the next person does not re-derive it.
+
+What the probe's own log says: `iters≈87k idle≈630 recv_ms≈7500` — the loop is
+spending SEVEN AND A HALF SECONDS in recv, so the bridge is waiting on PostgreSQL,
+not burning CPU. The deadline is `max(60, total/20_000)`, i.e. it assumes 20k
+events/s; the measured rate is ~7.8k. Whether the expectation drifted from reality
+(machine, PG settings, macOS) or something in the decode path genuinely slowed is
+NOT established — the A/B only rules out these three commits.
+
+Next step when this is picked up: bisect `speed.py` across the zstd/dictionary work
+(§10x) with the same 2M load, and read `iters` at a fixed event count as the README
+says, rather than the pass/fail line.
+
 ## 10af. pubname.py — the recorded matrix for "named, never defaulted" (2026-08-28)
 
 The five bridge cases asked for, plus the three that surround them, plus the SQL
