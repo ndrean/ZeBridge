@@ -5416,12 +5416,33 @@ for wanting it, not about reachability.
 **2. CORS was never the problem.** `/enroll` already answers with
 `access-control-allow-origin: *` — checked before assuming.
 
-**3. The client hardcoded two host ports.** `ws://localhost:8080` and
-`http://localhost:9090` — correct for the native loop, wrong the moment compose
-publishes elsewhere, and invisible to the user because a browser cannot explain a
-refused connection. They are `VITE_NATS_URL` / `VITE_BRIDGE_URL` now, with the
-native values as defaults, and `web-consumer/.env.compose.example` carries the
-compose pair.
+**3. The ports were hardcoded in TWO files, and the second one is the one that
+mattered.** `App.tsx` named `ws://localhost:8080`, and `vite.config.ts` proxied
+`/bridge` to `http://127.0.0.1:9090`. Compose published those services on 8081 and
+9098. Measured while diagnosing: **8080 and 9090 were both FREE** while the services
+ran one number away — which is the whole failure, and a browser can say nothing
+about it beyond "connection refused".
+
+The fix is not another env var in the client. The dev server was ALREADY the right
+place — its `/bridge` proxy exists because the page sets COEP `require-corp` for
+OPFS, under which a cross-origin response needs CORS or CORP headers, which
+`/metrics` must not have. So NATS goes through the same door: `/nats` with
+`ws: true`, and now the client names **no port at all** —
+
+    App.tsx        NATS_URL   = ws://<own host>/nats
+                   BRIDGE_URL = /bridge
+    vite.config.ts ZB_BRIDGE_ORIGIN   (default http://127.0.0.1:9090)
+                   ZB_NATS_WS_ORIGIN  (default ws://127.0.0.1:8080)
+
+Two values, one file, and `VITE_NATS_URL`/`VITE_BRIDGE_URL` remain as the escape
+hatch for a built bundle served from somewhere other than the dev server.
+
+Verified against the compose stack end to end, dev server pointed at 9098/8081:
+
+    /bridge/health  200  {"status":"ok"}
+    /bridge/enroll  404  {"error":"enrollment not configured"}   (routes; see below)
+    /nats           101  Switching Protocols
+    wsconnect('ws://127.0.0.1:5201/nats', alice) -> CDC_PUBLIC: 8 subjects, 2 messages
 
 **The edge** (`edge/nginx.conf`, service `edge`, `bridge` profile) puts everything
 the browser needs on ONE port: `/health` `/status` `/metrics` `/enroll` to the

@@ -22,20 +22,22 @@ async function zstdDecode(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array>
 }
 import { nkeys } from '@nats-io/nats-core';
 
-/// Both endpoints are overridable, because the ports are not a property of the
-/// client — they are whatever the stack publishes. The NATIVE dev loop publishes
-/// NATS's websocket on 8080 and the bridge on 9090, which is why those are the
-/// defaults; the compose stack puts BOTH behind one nginx origin (edge/nginx.conf),
-/// so there you set a single value:
+/// ⚠️ No ports here, on purpose. Both of these are SAME-ORIGIN paths served by the
+/// Vite dev server, which proxies them to wherever the stack actually is —
+/// `ZB_BRIDGE_ORIGIN` and `ZB_NATS_WS_ORIGIN` in vite.config.ts, one file, two
+/// values. This file used to name `ws://localhost:8080` and `http://localhost:9090`
+/// and broke the moment compose published the same services on 8081 and 9098: the
+/// page just failed to connect, and a browser cannot tell you why.
 ///
-///   web-consumer/.env.local
-///     VITE_NATS_URL=ws://localhost:8090/nats
-///     VITE_BRIDGE_URL=http://localhost:8090
+/// Same-origin also settles COEP. The page sets `require-corp` for OPFS, under which
+/// a cross-origin response needs CORS or CORP headers; through the proxy the question
+/// never arises, for `/enroll` as much as for `/health`.
 ///
-/// Hardcoding them cost an afternoon: compose moved the published ports and the
-/// client kept dialling 8080/9090 with no error a browser could explain.
-const NATS_URL = import.meta.env.VITE_NATS_URL ?? 'ws://localhost:8080';
-const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:9090';
+/// The escape hatch stays for a page served from somewhere other than the dev server
+/// (a built bundle behind the compose `edge` nginx, say).
+const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+const NATS_URL = import.meta.env.VITE_NATS_URL ?? `${wsScheme}://${location.host}/nats`;
+const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? '/bridge';
 
 /// `?principal=bob` beats the build-time env: one dev server serves several
 /// principals side by side (multi-browser demos, the generations staggered-seed
