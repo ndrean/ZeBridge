@@ -5304,6 +5304,45 @@ and the compose stack would collide with the native stack on 5432/4222 anyway.
 That is the next test to run, and the JWT dance in compose is the interesting
 half of it.
 
+## 10ab. TODO: column slicing across publications — and why it cannot work yet
+
+The idea (worth keeping): a table too wide for one event buffer is published in
+SLICES — `pub_a` carries `(id, name)`, `pub_b` carries `(id, blob)` — and the
+client reassembles them, because the applier is already an upsert on the primary
+key that only writes the columns an event actually carries (§4's "an absent key
+on an UPDATE means unchanged, never null"). `zebridge_enable(..., columns =>
+ARRAY[...])` already emits the column list, so the SQL half exists.
+
+**Never tested, and blocked by two things — both measured today, not guessed:**
+
+  1. **The msg_id collapses the slices.** A CDC message's id is
+     `"{wal_end:x}-{table}-{operation}"` (event_processor.zig) — no publication,
+     no slot, no column set. Two bridges slicing the same row produce the SAME
+     id on the SAME subject, so JetStream's duplicate window (2 min) drops the
+     second slice SILENTLY. The client gets one slice and cannot know the other
+     existed. Fixing it means putting the publication (or slot) in the id, and
+     deciding whether the slices should even share a subject.
+  2. **The width guard is per-TABLE, not per-projection.** It sums every
+     unbounded column of the table (`WHERE a.attrelid = tbl`) and the bake takes
+     `MIN(max_row_bytes)` joined on `pg_publication_tables` while ignoring
+     `attnames`. So the narrow bridge's budget constrains writes to a column it
+     does not even carry — which defeats the whole point of slicing, since the
+     write is refused before any feed sees it. Making it projection-aware is
+     expressible (bake one clause per distinct projection: `sum(cols_A) >=
+     budget_A OR sum(cols_B) >= budget_B`), just not built.
+
+Two smaller mismatches to remember if this is ever picked up: the schema in
+`$KV.schemas.<table>` is the FULL table shape (the DDL trigger does not know
+about publications), and a generation chain is built by querying the table
+directly — so a sliced client seeds with every column and then receives partial
+CDC. Harmless (the seed is a superset) but worth stating.
+
+**Shipped now instead**: `zebridge_enable` emits a WARNING row when the table is
+already in another publication, naming it and the consequence — the narrowest
+instance sets the ceiling for every writer, and a bridge whose buffer is smaller
+than an existing row quarantines the table on its own feed while the other keeps
+carrying it. A per-feed outage that otherwise reads as a mystery. Verified live.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

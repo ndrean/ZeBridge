@@ -291,6 +291,32 @@ ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
    tables. The seeding side needs nothing extra: the producer derives its table set from
    the publication and writes public tables under the open tenant's manifests.
 
+### 1.4b ⚠️ One table, two publications: the narrowest bridge sets the ceiling
+
+Publishing a table into more than one publication is legitimate — two NATS
+deployments, or a staged migration — and it has one sharp edge worth knowing
+before you do it.
+
+The row-width guard bakes `MIN(max_row_bytes)` across **every instance whose
+publication carries that table**. So the bridge with the smallest `BASE_BUF`
+sets the write ceiling for *all* writers of that table, including those who only
+talk to the wider feed. Worse, it is retroactive in one direction: rows already
+stored above the new ceiling remain perfectly valid in PostgreSQL and on the
+wider feed, but the narrow bridge cannot encode them — so **it quarantines the
+table on its own feed** (boot preflight, or `suspendForRowTooLarge` on the next
+touch) while the other bridge carries on. A partial, per-feed outage.
+
+That is the correct behaviour — a row must fit the narrowest carrier, and the
+alternative is a silent quarantine instead of a loud refusal — but it is silent
+about its *cause*. Two things now say it out loud: `zebridge_enable` returns a
+`WARNING` row when the table is already in another publication, and
+`scripts/zbdoctor.py` reports instances that disagree on the budget, naming each
+slot. Keep their `BASE_BUF` equal, or keep the publications disjoint.
+
+⚠️ Column lists (`zebridge_enable(..., columns => …)`) do **not** soften this:
+the guard is per-table, not per-projection, so a narrow bridge constrains writes
+to columns it does not carry. See NOTES §10ab.
+
 ### 1.5 PostgreSQL: maintenance — tombstone GC, and why
 
 A soft delete leaves the row with its tombstone set so a late edit from an offline client

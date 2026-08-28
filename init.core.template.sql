@@ -1337,6 +1337,7 @@ DECLARE
     scoped     boolean;
     col_list   text;
     verb       text := CASE WHEN dry_run THEN 'would' ELSE 'done' END;
+    r           record;
 BEGIN
     IF writable AND NOT have_write THEN
         RETURN QUERY SELECT 'preflight', 'ERROR',
@@ -1487,6 +1488,29 @@ BEGIN
         RETURN QUERY SELECT 'publication', verb,
             format('ALTER PUBLICATION %I ADD TABLE %s%s', publication, tbl, col_list);
     END IF;
+
+    -- ── the same table in a SECOND publication: warn, never refuse ────────────
+    -- Legitimate (two NATS deployments, a staged migration), and dangerous in one
+    -- specific way: the width guard bakes MIN(max_row_bytes) across every instance
+    -- whose publication carries this table, so the NARROWEST bridge sets the ceiling
+    -- for everyone. Rows already stored above that ceiling stay valid in Postgres and
+    -- on the wider feed — but the narrow bridge cannot encode them, so IT quarantines
+    -- the table (preflight at boot, or on the next touch) while the other carries on.
+    -- A per-feed outage that reads as a mystery unless someone says this out loud.
+    FOR r IN
+        SELECT p.pubname
+          FROM pg_publication_tables p
+         WHERE format('%I.%I', p.schemaname, p.tablename)::regclass = tbl
+           AND p.pubname <> publication
+    LOOP
+        RETURN QUERY SELECT 'publication'::text, 'WARNING'::text,
+            format('%s is also in publication %I. The width guard takes the MINIMUM '
+                   'budget across every instance carrying it, so the narrowest bridge '
+                   'sets the ceiling for ALL writers — and any bridge whose buffer is '
+                   'smaller than an existing row quarantines this table on its own feed. '
+                   'Keep their BASE_BUF equal, or keep the publications disjoint.',
+                   tbl::text, r.pubname);
+    END LOOP;
 
     -- ── re-bake the width guard NOW THAT THE TABLE IS PUBLISHED ───────────────
     -- The guard is installed BEFORE the publication step (its own required
