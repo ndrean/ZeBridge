@@ -5544,6 +5544,29 @@ with the verdict subscription still live, and nats.zig panics on exactly that ("
 sub.deinit() on every subscription before destroying its connection"). The demo never
 hit it because it never held a subscription across a teardown. Fixed in `deinit`.
 
+**Audited afterwards, because "is it a pattern?" is the question that matters.** It is
+not. Every other subscription in the client is scoped: `drainStream`'s pull consumer
+is `defer sub.deinit()`, its batches `defer batch.deinit()`, the KV and object-store
+handles likewise. Mine was the ONLY one held across calls, and storing it in a field
+without teaching `deinit` about it is what broke the invariant.
+
+**Severity, stated plainly.** Small today: the code was one day old, reached only from
+`zb-demo` and `zb-soak`, and the failure is a panic at TEARDOWN — after every write has
+landed and every verdict has been read. No data loss, no silent corruption, and the
+first program to exercise it died loudly on its first run. `capi.zig` exposes only the
+pure core through `zb_call`; `SyncClient` is not in the C ABI, so no host process could
+reach it.
+
+⚠️ **But it is a hazard for the direction this library is going**, and that is the part
+worth keeping. nats.zig PANICS on a lifecycle mistake instead of returning an error.
+While the client is used from Zig binaries, a panic is a stack trace and an exit code.
+The moment `SyncClient` is exposed through `zb_call` — the whole point of a C ABI, with
+Python, Dart, Swift and Kotlin hosts — the same class of mistake becomes **the host
+process dying**, and an embedder cannot catch a Zig panic. So exposing the client
+through the C ABI has a precondition that has nothing to do with the API shape: teardown
+must be exhaustive and defensive (idempotent close, every handle owned and released in
+one place), because there the cost of getting it wrong is not a stack trace.
+
 **One observation left open**: `zebridge_gc_watermark.reaped` read 0 while four rows
 had just been reaped. The watermark and `swept_at` both advanced, so the sweep itself
 is fine; the counter may be per-pass, or per-tenant, or wrong. Worth a look before
