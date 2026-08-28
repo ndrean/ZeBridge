@@ -58,7 +58,7 @@ REQUIRED_VARS = [
 ]
 
 ADMIN_URL = os.environ.get(
-    "ADMIN_DATABASE_READER_URL", "postgres://postgres:postgres_password@127.0.0.1:55432/postgres"
+    "ADMIN_DATABASE_URL", "postgres://postgres:postgres_password@127.0.0.1:55432/postgres"
 )
 
 
