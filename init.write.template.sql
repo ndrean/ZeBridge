@@ -29,7 +29,7 @@
 -- The WRITE role — separate from the read role on purpose
 -- ---------------------------------------------------------
 --
--- ${POSTGRES_BRIDGE_USER} stays exactly what it is: SELECT + REPLICATION, physically
+-- ${POSTGRES_READER_USER} stays exactly what it is: SELECT + REPLICATION, physically
 -- unable to write. The ingress path (NATS -> bridge -> PostgreSQL) uses a *second*
 -- connection under this role, so adding the write feature never widens the privileges
 -- of the read path.
@@ -520,7 +520,7 @@ CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
     tenant_id text NOT NULL,
     PRIMARY KEY (principal, tenant_id)
 );
-GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_BRIDGE_USER}, ${POSTGRES_WRITER_USER};
+GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
 
 -- Enrollment invites — the pump-starter (NOTES: the JWT mint flow). One row per
 -- invitation: a high-entropy single-use code the operator hands out out-of-band;

@@ -23,7 +23,7 @@ scripts/native/down.sh    # stops both, leaves data in place (like `docker compo
 scripts/native/down.sh --clean   # also wipes postgres-data/ and nats-data/ (like `down -v`)
 ```
 
-`up.sh` prints the `DATABASE_URL`/`NATS_URL`/etc. to export once it's ready.
+`up.sh` prints the `DATABASE_READER_URL`/`NATS_URL`/etc. to export once it's ready.
 
 ⚠️ **`down.sh --clean` is destructive** — it deletes `postgres-data/` and
 `nats-data/` at the repo root, same as `docker compose down -v` deletes those

@@ -46,8 +46,8 @@ SCRATCH_DB = "zb_render_check"
 # The variables the template interpolates. Unset ones render as "" and produce SQL that
 # looks fine, so they are checked before anything else.
 REQUIRED_VARS = [
-    "POSTGRES_BRIDGE_USER",
-    "POSTGRES_BRIDGE_PASSWORD",
+    "POSTGRES_READER_USER",
+    "POSTGRES_READER_PASSWORD",
     "POSTGRES_WRITER_USER",
     "POSTGRES_WRITER_PASSWORD",
     "TARGET_DB",
@@ -58,7 +58,7 @@ REQUIRED_VARS = [
 ]
 
 ADMIN_URL = os.environ.get(
-    "ADMIN_DATABASE_URL", "postgres://postgres:postgres_password@127.0.0.1:55432/postgres"
+    "ADMIN_DATABASE_READER_URL", "postgres://postgres:postgres_password@127.0.0.1:55432/postgres"
 )
 
 

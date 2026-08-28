@@ -28,7 +28,7 @@ preserve.
 Usage:  python scripts/scenarios/sizing.py
 
 Starts short-lived bridges of its own (own slot and port, via `ZB_BRIDGE_ARGS`). Needs
-DATABASE_URL.
+DATABASE_READER_URL.
 """
 
 import asyncio

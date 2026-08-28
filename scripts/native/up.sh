@@ -127,7 +127,7 @@ fi
 cat <<EOF
 
 [native] up. Point the bridge at:
-  DATABASE_URL="postgres://bridge_reader:bridge_password_changeme@127.0.0.1:${PGPORT}/postgres"
+  DATABASE_READER_URL="postgres://bridge_reader:bridge_password_changeme@127.0.0.1:${PGPORT}/postgres"
   DATABASE_WRITER_URL="postgres://bridge_writer:writer_password_changeme@127.0.0.1:${PGPORT}/postgres"
   NATS_URL="nats://127.0.0.1:4222"
   NATS_NKEY_SEED=<from .env.admin>

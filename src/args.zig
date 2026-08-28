@@ -20,7 +20,7 @@ const usage =
     \\  --help, -h      Show this message
     \\
     \\Environment:
-    \\  DATABASE_URL          REQUIRED. Read path, credentials included:
+    \\  DATABASE_READER_URL          REQUIRED. Read path, credentials included:
     \\                        postgres://<role>:<pass>@<host>:<port>/<db>[?sslmode=…]
     \\  DATABASE_WRITER_URL   Ingress path, same form. Unset disables the mutation
     \\                        listener entirely — it never falls back to the read role.
@@ -65,7 +65,7 @@ const usage =
     \\                        Log lines print "warning"/"error"; both
     \\                        spellings are accepted here.
     \\
-    \\Admin credentials (PG_HOST/PG_USER/PG_PASSWORD, POSTGRES_BRIDGE_*,
+    \\Admin credentials (PG_HOST/PG_USER/PG_PASSWORD, POSTGRES_READER_*,
     \\POSTGRES_WRITER_*) are NOT read by the bridge — they belong to init.sql and the
     \\bridge-init container. Keep them in .env.admin. Defaults live in src/config.zig.
     \\
@@ -238,16 +238,22 @@ pub const Args = struct {
         // PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DB used to be a fallback here. They are
         // the **superuser** credentials `bridge-init` interpolates into init.sql to
         // create the bridge's roles, and they sit in the same environment — so a missing
-        // or misspelled DATABASE_URL silently connected as `postgres` instead of the
+        // or misspelled DATABASE_READER_URL silently connected as `postgres` instead of the
         // read role, and the log looked fine. Convenient, and precisely the wrong thing
         // to be convenient about: the read role is deliberately unable to write, and
         // that guarantee is worth nothing if the process can connect as someone else.
         //
         // Failing here rather than defaulting is the whole point. `sslmode` goes in the
         // URL's query string.
-        runtime_config.db_url = init.minimal.environ.getPosix("DATABASE_URL") orelse {
+        // ⚠️ Named DATABASE_URL until 2026-08-28, and renamed for the same reason the
+        // PG_* fallback was deleted: DATABASE_URL is the Heroku-style "my application's
+        // database", so it invites exactly the value that must never be pasted here — a
+        // full-privilege URL works and silently dissolves the reader/writer split. No
+        // compatibility path: an env still carrying the old name fails HERE, by name.
+        runtime_config.db_url = init.minimal.environ.getPosix("DATABASE_READER_URL") orelse {
             log.err(
-                "🔴 DATABASE_URL is required: postgres://<role>:<password>@<host>:<port>/<db>. " ++
+                "🔴 DATABASE_READER_URL is required: postgres://<role>:<password>@<host>:<port>/<db>. " ++
+                    "(It was called DATABASE_URL before 2026-08-28 — rename it.) " ++
                     "There is no PG_HOST/PG_USER fallback — those are the admin credentials init.sql " ++
                     "runs under, and the bridge must not be able to connect with them.",
                 .{},
@@ -262,7 +268,7 @@ pub const Args = struct {
             init.minimal.environ.getPosix("PG_USER") != null)
         {
             log.debug(
-                "PG_HOST/PG_USER/PG_PASSWORD/PG_DB are set but ignored — the bridge uses DATABASE_URL. " ++
+                "PG_HOST/PG_USER/PG_PASSWORD/PG_DB are set but ignored — the bridge uses DATABASE_READER_URL. " ++
                     "Those belong in .env.admin, which only compose and bridge-init read.",
                 .{},
             );

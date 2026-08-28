@@ -636,11 +636,11 @@ pub const RuntimeConfig = struct {
     // HTTP
     http_port: u16,
 
-    /// `DATABASE_URL` — the read/replication connection, credentials and all.
+    /// `DATABASE_READER_URL` — the read/replication connection, credentials and all.
     ///
     /// Required, with **no fallback to PG_HOST/PG_USER/PG_PASSWORD**. Those name the
     /// superuser `bridge-init` uses to create roles; they live in the same environment,
-    /// and while the bridge accepted them a missing or misspelled DATABASE_URL meant
+    /// and while the bridge accepted them a missing or misspelled DATABASE_READER_URL meant
     /// connecting as `postgres` and looking perfectly healthy. `sslmode` belongs in the
     /// URL's query string, where it stays a stated decision rather than whatever libpq's
     /// `prefer` happens to negotiate.
@@ -717,7 +717,7 @@ pub const RuntimeConfig = struct {
     pub fn defaults() RuntimeConfig {
         return .{
             .http_port = Http.default_port,
-            // Not a usable connection on purpose: `parseArgs` requires DATABASE_URL and
+            // Not a usable connection on purpose: `parseArgs` requires DATABASE_READER_URL and
             // fails without it, so nothing should ever reach a default here.
             .db_url = "",
             .pg_writer_url = null,

@@ -40,30 +40,30 @@
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_BRIDGE_USER}') THEN
-        CREATE USER ${POSTGRES_BRIDGE_USER} WITH PASSWORD '${POSTGRES_BRIDGE_PASSWORD}';
-        ALTER USER ${POSTGRES_BRIDGE_USER} WITH REPLICATION;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${POSTGRES_READER_USER}') THEN
+        CREATE USER ${POSTGRES_READER_USER} WITH PASSWORD '${POSTGRES_READER_PASSWORD}';
+        ALTER USER ${POSTGRES_READER_USER} WITH REPLICATION;
     END IF;
     -- The reader's connection BUDGET, DB-enforced (outside the IF: applies to
     -- pre-existing roles on re-apply). Steady state is ~4 backends (producer,
     -- snapshot worker, boot passes) — the replication stream rides a walsender
     -- slot, not a regular backend. 10 leaves boot-burst headroom while making it
     -- impossible for a bridge bug to eat the cluster's default 100.
-    ALTER ROLE ${POSTGRES_BRIDGE_USER} CONNECTION LIMIT 10;
+    ALTER ROLE ${POSTGRES_READER_USER} CONNECTION LIMIT 10;
     IF true THEN
     END IF;
 END;
 $$;
 
-GRANT CONNECT ON DATABASE ${TARGET_DB} TO ${POSTGRES_BRIDGE_USER};
+GRANT CONNECT ON DATABASE ${TARGET_DB} TO ${POSTGRES_READER_USER};
 
-GRANT USAGE ON SCHEMA public TO ${POSTGRES_BRIDGE_USER};
+GRANT USAGE ON SCHEMA public TO ${POSTGRES_READER_USER};
 
 -- Grant SELECT on existing tables
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${POSTGRES_READER_USER};
 
 -- Ensure bridge user gets SELECT permissions on all FUTURE tables created by the DB owner
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${POSTGRES_BRIDGE_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${POSTGRES_READER_USER};
 
 -- Scope the reader's SELECT by tenant, for the snapshot path — see PROTOCOL.md "The
 -- Connection Flow" Step 0, NOTES.md §1.12 part 1
@@ -125,7 +125,7 @@ BEGIN
         -- the open tenant itself, and a client's local copy of the row depends on whether it
         -- happened to be connected for a live CDC write, not on what its snapshot returned.
         ' USING (coalesce(current_setting(''zb.tenant'', true), '''') = '''' OR %I::text = current_setting(''zb.tenant'', true) OR %I::text = ''${OPEN_TENANT}'')',
-        tbl, '${POSTGRES_BRIDGE_USER}', tenant_col, tenant_col);
+        tbl, '${POSTGRES_READER_USER}', tenant_col, tenant_col);
 
     RAISE NOTICE 'reads on % now filtered by % when zb.tenant is set — CDC is unaffected (RLS does not apply to replication); the snapshot connection sets zb.tenant to scope it',
                  tbl, tenant_col;
@@ -240,7 +240,7 @@ CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
     generations   boolean NOT NULL DEFAULT true,
     CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
-GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_READER_USER};
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
@@ -419,7 +419,7 @@ CREATE TABLE IF NOT EXISTS public.zebridge_gc_watermark (
 -- The sweeper writes it; everyone else reads it through CDC. ⚠️ SELECT for the reader is
 -- what puts it in snapshots; UPDATE/INSERT for the writer is what lets the sweeper stamp
 -- it. No DELETE: a singleton is never removed, and the row must survive a sweeper bug.
-GRANT SELECT ON public.zebridge_gc_watermark TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT ON public.zebridge_gc_watermark TO ${POSTGRES_READER_USER};
 
 INSERT INTO public.zebridge_gc_watermark (id, watermark, threshold_ms)
 VALUES (1, now(), 0)
@@ -513,7 +513,7 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolea
 -- the bookkeeping row MUST commit in that same transaction — so the same connection
 -- writes it. The grant is INSERT + DELETE (pruning) on THIS table only; no UPDATE, so
 -- history is append-only by privilege, not by convention.
-GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER_USER};
 
 -- keeps the tracker's own rows out of the DDL feed — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
@@ -566,7 +566,7 @@ $$ LANGUAGE plpgsql;
 
 -- Full replica identity ensures ZeBridge gets all columns in the WAL
 ALTER TABLE public.zebridge_ddl_events REPLICA IDENTITY FULL;
-GRANT SELECT ON TABLE public.zebridge_ddl_events TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT ON TABLE public.zebridge_ddl_events TO ${POSTGRES_READER_USER};
 
 -- on ddl_command_end: writes the schema-change row — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_ddl_trigger_fn()
@@ -1021,14 +1021,14 @@ CREATE TABLE IF NOT EXISTS public.zebridge_limits (
     max_row_bytes integer NOT NULL,
     updated_at    timestamptz NOT NULL DEFAULT now()
 );
-GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_BRIDGE_USER};
+GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_READER_USER};
 
 -- The bridge registers its OWN budget here at boot. One call, over the connection
 -- that always exists (the reader's), so this works identically in the read-only and
 -- read/write profiles — a read-only deployment still has a width guard, and it is
 -- still the truth about that instance's buffer.
 --
--- ⚠️ SECURITY DEFINER, and that is the whole point: ${POSTGRES_BRIDGE_USER} keeps
+-- ⚠️ SECURITY DEFINER, and that is the whole point: ${POSTGRES_READER_USER} keeps
 -- SELECT + REPLICATION and NO write privilege on any table. "The reader is
 -- physically unable to write" stays literally true and testable in
 -- `role_table_grants` — the reader's only power here is to call this one function,
@@ -1173,7 +1173,7 @@ END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
 
 GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer)
-    TO ${POSTGRES_BRIDGE_USER};
+    TO ${POSTGRES_READER_USER};
 
 
 

@@ -14,13 +14,13 @@ pub const log = std.log.scoped(.pg_conn);
 /// It used to carry `host`/`port`/`user`/`password`/`database`/`sslmode` as well, filled
 /// from `PG_HOST`/`PG_USER`/`PG_PASSWORD`/… — which are the **superuser** credentials
 /// `bridge-init` interpolates into `init.sql` to create roles. They sat in the same
-/// environment as everything else, so a bridge launched with `DATABASE_URL` unset, or
+/// environment as everything else, so a bridge launched with `DATABASE_READER_URL` unset, or
 /// misspelled, fell back to connecting as `postgres` and looked entirely healthy doing
 /// it. Convenient, and exactly the wrong thing to be convenient about: the read role is
 /// deliberately unable to write, and that guarantee is worth nothing if the process can
 /// silently connect as someone else.
 ///
-/// So there is no fallback. `DATABASE_URL` is required (see `args.zig`), the ingress path
+/// So there is no fallback. `DATABASE_READER_URL` is required (see `args.zig`), the ingress path
 /// needs its own `DATABASE_WRITER_URL`, and neither can be assembled out of parts.
 pub const PgConf = struct {
     /// `postgres://user:pass@host:port/db[?sslmode=…]`. Credentials included — this is
@@ -32,7 +32,7 @@ pub const PgConf = struct {
     /// Which role this is, for logs only. Never used to connect — the URL carries the
     /// real credentials — but it keeps a writer connection from being announced under
     /// the reader's name.
-    role: []const u8 = "(from DATABASE_URL)",
+    role: []const u8 = "(from DATABASE_READER_URL)",
 
     /// The ingress connection, or null when none is configured.
     ///

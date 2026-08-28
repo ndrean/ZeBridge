@@ -4,7 +4,7 @@
 `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD` are the **superuser** credentials
 `bridge-init` interpolates into `init.sql` to create the bridge's roles. They used to be
 a fallback for the bridge's own connection, sitting in the same environment as
-everything else — so a `DATABASE_URL` that was missing, misspelled, or dropped by a
+everything else — so a `DATABASE_READER_URL` that was missing, misspelled, or dropped by a
 deploy meant connecting as `postgres` instead of `bridge_reader`, with a log that looked
 entirely healthy.
 
@@ -15,8 +15,8 @@ connect as someone else.
 
 Three phases, all with a live admin account in the environment:
 
-  A  no DATABASE_URL, full admin credentials present → must refuse to start
-  B  DATABASE_URL set, admin credentials also present → must warn and ignore them
+  A  no DATABASE_READER_URL, full admin credentials present → must refuse to start
+  B  DATABASE_READER_URL set, admin credentials also present → must warn and ignore them
   C  no DATABASE_WRITER_URL, POSTGRES_WRITER_USER present → ingress off, not fallen back
 
 Usage:  python scripts/scenarios/credentials.py
@@ -68,26 +68,26 @@ def run(name, log, drop=(), add=None, expect_exit=False, timeout=45):
 def main_sync() -> int:
     failed = 0
 
-    print("\nA. DATABASE_URL absent, admin credentials present")
-    code, text = run("A", "/tmp/zb_cred_a.log", drop=("DATABASE_URL",), expect_exit=True)
+    print("\nA. DATABASE_READER_URL absent, admin credentials present")
+    code, text = run("A", "/tmp/zb_cred_a.log", drop=("DATABASE_READER_URL",), expect_exit=True)
     if code is None:
-        zb.bad("still running — it found a way to connect without DATABASE_URL")
+        zb.bad("still running — it found a way to connect without DATABASE_READER_URL")
         failed = 1
-    elif "DATABASE_URL is required" in text and code != 0:
+    elif "DATABASE_READER_URL is required" in text and code != 0:
         zb.ok(f"refused to start, exit {code}, and said why")
     else:
-        zb.bad(f"exited {code} without the DATABASE_URL diagnosis")
+        zb.bad(f"exited {code} without the DATABASE_READER_URL diagnosis")
         failed = 1
     if ADMIN["PG_USER"] in text and "ignored" not in text and "required" not in text:
         zb.bad(f"the log mentions '{ADMIN['PG_USER']}' — check it did not connect as admin")
         failed = 1
 
-    print("\nB. DATABASE_URL present, admin credentials also present")
+    print("\nB. DATABASE_READER_URL present, admin credentials also present")
     _, text = run("B", "/tmp/zb_cred_b.log")
     if "are set but ignored" in text:
         zb.ok("admin variables noted as ignored (debug)")
     else:
-        zb.bad("nothing in the log connects the ignored admin variables to DATABASE_URL")
+        zb.bad("nothing in the log connects the ignored admin variables to DATABASE_READER_URL")
         failed = 1
     connected = [l for l in text.splitlines() if "connected to PostgreSQL" in l]
     for line in connected:

@@ -17,7 +17,7 @@ contract is more than a shape:
   5. **the writer holds nothing** — generation bookkeeping is not ingress.
 
 Usage:  python scripts/scenarios/generations.py
-Needs POSTGRES_BRIDGE_* / POSTGRES_WRITER_* creds in the env (source .env.admin).
+Needs POSTGRES_READER_* / POSTGRES_WRITER_* creds in the env (source .env.admin).
 Cleans up its rows via the DELETE grant it is testing.
 """
 
@@ -44,7 +44,7 @@ def as_role(user_env, pw_env, sql):
 
 
 def reader(sql):
-    return as_role("POSTGRES_BRIDGE_USER", "POSTGRES_BRIDGE_PASSWORD", sql)
+    return as_role("POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", sql)
 
 
 def writer(sql):

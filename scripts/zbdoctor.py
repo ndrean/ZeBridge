@@ -23,7 +23,7 @@ to SKIP (never to red) when they are absent.
     python3 scripts/zbdoctor.py --json     # machine verdict for CI
 
 Environment (all optional, sane defaults):
-    ZB_PSQL / DATABASE_URL   how to reach Postgres  (default: docker exec)
+    ZB_PSQL / DATABASE_READER_URL   how to reach Postgres  (default: docker exec)
     NATS_URL                 how to reach NATS      (default: 127.0.0.1:4222)
     NATS_CREDS               a .creds file (operator/JWT mode) — wins if both are set
     NATS_NKEY_SEED           the seed itself (nkey mode), as the bridge takes it
@@ -70,8 +70,8 @@ NATS_CREDS = os.environ.get("NATS_CREDS")
 
 if os.environ.get("ZB_PSQL"):
     PSQL = shlex.split(os.environ["ZB_PSQL"])
-elif os.environ.get("DATABASE_URL"):
-    PSQL = ["psql", os.environ["DATABASE_URL"]]
+elif os.environ.get("DATABASE_READER_URL"):
+    PSQL = ["psql", os.environ["DATABASE_READER_URL"]]
 else:
     PSQL = shlex.split("docker exec -i postgres-primary psql -U postgres")
 
@@ -198,9 +198,23 @@ def gate_bridge() -> dict | None:
         ok("connected to NATS")
 
     if not st.get("slot_active"):
-        red("A", "the replication slot is INACTIVE — no CDC is flowing",
-            "a previous bridge may still hold it (kill -9 leaves a walsender for up to "
-            "wal_sender_timeout); check pg_replication_slots")
+        # ⚠️ /status reports the bridge's OWN VIEW, refreshed by the WAL monitor on a
+        # timer — so for the first seconds after a restart it reads false while
+        # PostgreSQL already shows the slot held. That is exactly when a POST-BOOT
+        # checker runs, so ask PostgreSQL (the authority) before calling it red.
+        try:
+            rows = psql("SELECT active FROM pg_replication_slots WHERE active")
+            pg_holds = len(rows) > 0
+        except RuntimeError:
+            pg_holds = False
+        if pg_holds:
+            amber("A", "the bridge reports slot_active=false while PostgreSQL shows a slot held",
+                  "normal for a few seconds after a restart — the metric is monitor-sampled; "
+                  "if it persists, the WAL monitor is stuck")
+        else:
+            red("A", "the replication slot is INACTIVE — no CDC is flowing",
+                "a previous bridge may still hold it (kill -9 leaves a walsender for up to "
+                "wal_sender_timeout); check pg_replication_slots")
     else:
         ok(f"replication slot active, WAL lag {st.get('wal_lag_mb', '?')} MB")
 
@@ -518,7 +532,7 @@ def main() -> int:
     except RuntimeError as e:
         print(f"{RED}cannot read zebridge_catalogue: {e}{OFF}", file=sys.stderr)
         print("the catalogue IS the configuration — without it there is nothing to check "
-              "(set ZB_PSQL or DATABASE_URL)", file=sys.stderr)
+              "(set ZB_PSQL or DATABASE_READER_URL)", file=sys.stderr)
         return 2
     catalogue = {r[0]: {"tenant_col": r[1] or None, "version_col": r[2] or None,
                         "tombstone_col": r[3] or None, "generations": truthy(r[4])}

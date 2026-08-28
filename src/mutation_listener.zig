@@ -199,7 +199,7 @@ pub const MutationListener = struct {
     /// The one connection description every component shares. Held by pointer, like the
     /// snapshot listener does: this used to copy `pg_host`/`pg_port`/… out of
     /// RuntimeConfig and rebuild a conninfo string by hand, which silently ignored
-    /// `DATABASE_URL` (kept in `PgConf.db_url`) and `sslmode`. With a URL set, every
+    /// `DATABASE_READER_URL` (kept in `PgConf.db_url`) and `sslmode`. With a URL set, every
     /// other component connected where it said and this thread dialled the PG_* defaults.
     pg_config: *const pg_conn.PgConf,
     /// Wire names, read from grammar.json at startup. See src/topology.zig.
@@ -300,7 +300,7 @@ pub const MutationListener = struct {
 
         // 1. Connect to PostgreSQL (dedicated connection for mutations — the WAL
         //    stream's connection is in replication mode and cannot run ordinary SQL).
-        //    `connInfo` is the shared builder, so DATABASE_URL and sslmode apply here
+        //    `connInfo` is the shared builder, so DATABASE_READER_URL and sslmode apply here
         //    exactly as they do everywhere else.
         const conninfo = self.pg_config.connInfo(self.allocator, false) catch |err| {
             log.err("Mutation listener: cannot build connection string: {}", .{err});
@@ -316,7 +316,7 @@ pub const MutationListener = struct {
         }
         defer c.PQfinish(conn);
         // Asked of libpq rather than read back from the config fields: with
-        // DATABASE_URL set those fields hold the unused PG_* defaults, so printing them
+        // DATABASE_READER_URL set those fields hold the unused PG_* defaults, so printing them
         // would report a host this connection never dialled.
         // Role included: the whole point of the ingress connection is that it is NOT
         // the replication role, and a log line that cannot show which one connected

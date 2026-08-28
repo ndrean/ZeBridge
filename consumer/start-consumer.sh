@@ -1,7 +1,7 @@
 #!/bin/bash
 # Unset conflicting PostgreSQL environment variables
 unset PG_HOST PG_PORT PG_USER PG_PASSWORD PG_DB
-unset POSTGRES_BRIDGE_USER POSTGRES_BRIDGE_PASSWORD
+unset POSTGRES_READER_USER POSTGRES_READER_PASSWORD
 
 # Run Elixir consumer with explicit environment variables
 NATS_USER=bridge_user \

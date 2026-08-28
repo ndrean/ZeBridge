@@ -213,21 +213,21 @@ PGPASSWORD=my_pwd psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
 **DBA creates two USER profils in the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils:
 
 ```sh
-# init.core.template.sql
-POSTGRES_BRIDGE_READER=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
-
-# init.write.template.sql
-POSTGRES_BRIDGE_WRITER=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
+# .env.admin — the DBA sets the role names and passwords; the templates interpolate them
+POSTGRES_READER_USER=bridge_reader      # created by init.core.template.sql
+POSTGRES_READER_PASSWORD=...
+POSTGRES_WRITER_USER=bridge_writer      # created by init.write.template.sql
+POSTGRES_WRITER_PASSWORD=...
 ```
 
 **ZeBridge uses these USER profils**: the reader USER and writer USER, set in _.env.bridge_, are used by `ZeBridge`.
 
 ```txt
-DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
+DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
 DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
 ```
 
-**DBA creates nkey pair for ZeBridge ↔ NATS**: The DBA generates a keypair. Set the public key in teh NATS config and use the seed as `NATS_NKEY_SEED` (in _.env.bridge_) to run ZeBridge:
+**DBA creates nkey pair for ZeBridge ↔ NATS**: The DBA generates a keypair. Set the public key in the NATS config and use the seed as `NATS_NKEY_SEED` (in _.env.bridge_) to run ZeBridge:
 
 ```sh
 NATS_NKEY_SEED=SU... ./bridge --pub my_pub --slot my_slot
@@ -285,7 +285,6 @@ Same dance at connect time (step 6 is identical) — only steps 1–4 are replac
 ⚠️ **The `/enroll` endpoint is off unless all three are present**: `ZB_SIGNING_SEED` (the account signing seed — the mint authority), `ZB_ACCOUNT_PUB` (the account public key, which goes into every JWT it issues), and `DATABASE_WRITER_URL` (redeeming an invite is a write). Miss one and the bridge starts normally and answers `{"error":"enrollment not configured"}` — check the boot log for `🎟️ enrollment endpoint armed`.
 
 **The even older shape** (`scripts/native/nats-server.conf`, no operator) uses plain user/password for clients and an nkey seed for the bridge. It still works, and it is what `NATS_NKEY_SEED` above is for — but there are no JWTs, no tags, and every principal is written into the server config by hand.
-
 
 ## Architecture & Internals
 
@@ -549,7 +548,7 @@ set -a && source .env.admin && set +a
 
    For the operator/JWT world (consumers), run `scripts/native/jwt-bootstrap.sh` once to build the operator, accounts and scoped signing keys, and start NATS with the operator config it emits instead.
 
-5. **Configure the bridge.** Fill in `.env.bridge`: the connection strings (`DATABASE_URL`, `DATABASE_WRITER_URL`, `NATS_URL`), the credential (`NATS_CREDS` for JWT, or `NATS_NKEY_SEED`), and `BASE_BUF` if the default is too small for your widest table.
+5. **Configure the bridge.** Fill in `.env.bridge`: the connection strings (`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL`), the credential (`NATS_CREDS` for JWT, or `NATS_NKEY_SEED`), and `BASE_BUF` if the default is too small for your widest table.
 
 6. **Start the bridge.**
 
@@ -660,7 +659,7 @@ The bridge is then started with:
 * a unique `--port` for its telemetry webserver. Each running instance needs its own.
 * `--top`, defaulting to `./grammar.json` — the stream/bucket names shared between ZeBridge, NATS and consumers.
 * the mandatory `NATS_NKEY_SEED` env var — the private half of the public nkey the NATS server was given.
-* `DATABASE_URL`, `DATABASE_WRITER_URL`, `NATS_URL` — the connection strings.
+* `DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL` — the connection strings.
 
 For example, one instance on the publication `my_pub` (created by the DBA) with the slot `my_slot`:
 
@@ -670,7 +669,7 @@ RING_BUFFER_COUNT=4096 \          # default 65536
 NATS_URL=nats://127.0.0.1:4222 \  # default value
 BRIDGE_PORT=9090 \                # default port
 NATS_NKEY_SEED=SU... \            # mandatory
-DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:55432/postgres \
+DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:55432/postgres \
 DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:55432/postgres \
 ./bridge --slot my_slot --pub my_pub --top grammar.json
 ```
@@ -850,7 +849,7 @@ zig build
 **Step 3**: Run the bridge with environment variables:
 
 ```bash
-DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@localhost:5432/postgres \
+DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@localhost:5432/postgres \
 NATS_URL=nats://bridge_user:bridge_secure_password@localhost:4222 \
 ./zig-out/bin/bridge --slot my_slot --pub cdc_pub
 
@@ -862,7 +861,7 @@ NATS_URL=nats://bridge_user:bridge_secure_password@localhost:4222 \
 
 ```bash
 # PostgreSQL. URLs only: there is no PG_HOST/PG_USER fallback, on purpose (below).
-DATABASE_URL=postgres://bridge_reader:pw@localhost:5432/postgres        # required
+DATABASE_READER_URL=postgres://bridge_reader:pw@localhost:5432/postgres        # required
 DATABASE_WRITER_URL=postgres://bridge_writer:pw@localhost:5432/postgres # unset = no ingress
 
 # NATS. One address input; NATS_HOST is ignored with a warning.
@@ -880,7 +879,7 @@ The vendored pure-Zig NATS client has no TLS, so a bridge→NATS hop across a ne
 
 `NATS_URL` accepts only `nats://` and rejects `tls://` for the same reason — a URL promising transport security the client cannot provide is worse than a refusal.
 
-This constrains only that one hop. Clients still reach the broker from anywhere over its websocket port, and **Postgres may be remote**: `DATABASE_URL` carries `sslmode` in its query string and libpq does the work (untested as of 2026-08-16 — see `COPY_BINARY_PLAN.md`).
+This constrains only that one hop. Clients still reach the broker from anywhere over its websocket port, and **Postgres may be remote**: `DATABASE_READER_URL` carries `sslmode` in its query string and libpq does the work (untested as of 2026-08-16 — see `COPY_BINARY_PLAN.md`).
 
 Lifting the constraint is **v1.0**: migrating to `nats-io/nats.zig`, which has
 server-authenticated TLS and native nkey auth.
@@ -895,7 +894,7 @@ The variables above are the bridge's. A second family — `PG_HOST`, `PG_PORT`, 
 They live in `.env.admin` — together with `PG_PUBLISH_PORT` and
 the nkey's public half, all of which are read by compose or by the init containers and
 
-The bridge does not read any of them. The bridge reads `.env.bridge`. The bridge refuses to start without `DATABASE_URL`:
+The bridge does not read any of them. The bridge reads `.env.bridge`. The bridge refuses to start without `DATABASE_READER_URL`:
 
 ```bash
 # the stack — .env.admin only: every service compose starts is an admin task
@@ -1024,7 +1023,7 @@ Use the **private** nkey to start ZeBridge daemon:
 NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI \
 RING_BUFFER_COUNT=2048 \
 BASE_BUF=12 \
-DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@localhost:55432/postgres \
+DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@localhost:55432/postgres \
 NATS_URL=nats://localhost:4222 \
 ./zig-out/bin/bridge --slot my_slot --pub my_pub
 ```

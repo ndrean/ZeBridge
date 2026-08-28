@@ -535,7 +535,7 @@ written down.
   column names, never row values. A deliberate trade; per-tenant schema copies would cost
   more than they protect.
 * **Credentials in git** ⚠️ — `.env.bridge` and `.env.admin` are tracked, and contain
-  `DATABASE_WRITER_URL`, `DATABASE_URL` and the superuser password. They are `*_changeme`
+  `DATABASE_WRITER_URL`, `DATABASE_READER_URL` and the superuser password. They are `*_changeme`
   dev values today, but the *shape* is the exposure: rotating them later does not remove
   them from history.
 

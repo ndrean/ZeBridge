@@ -6,7 +6,7 @@ in the shell that launches the bridge — but the split leaves one value that ha
 across the boundary and no component able to notice when it does not:
 
     .env.admin   PG_PUBLISH_PORT=55432        the port compose publishes Postgres on
-    .env.bridge  DATABASE_URL=…@127.0.0.1:55432/…   the port the bridge dials
+    .env.bridge  DATABASE_READER_URL=…@127.0.0.1:55432/…   the port the bridge dials
 
 Change one and the bridge simply fails to connect, with an error naming a port that
 looks correct in whichever file you happen to open. The bridge cannot check this itself:
@@ -35,7 +35,7 @@ BRIDGE = zb.ROOT / ".env.bridge"
 # other half of this list.
 ADMIN_ONLY = [
     "PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DB", "TARGET_DB",
-    "POSTGRES_BRIDGE_USER", "POSTGRES_BRIDGE_PASSWORD",
+    "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD",
     "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD",
     "PG_PUBLISH_PORT", "NATS_BRIDGE_NKEY_PUB",
 ]
@@ -64,11 +64,11 @@ async def main():
         zb.bad("PG_PUBLISH_PORT is not in .env.admin — compose falls back to 55432 silently")
         failed = 1
 
-    for name in ("DATABASE_URL", "DATABASE_WRITER_URL"):
+    for name in ("DATABASE_READER_URL", "DATABASE_WRITER_URL"):
         url = bridge.get(name)
         if not url:
-            if name == "DATABASE_URL":
-                zb.bad("DATABASE_URL is missing from .env.bridge — the bridge will refuse to start")
+            if name == "DATABASE_READER_URL":
+                zb.bad("DATABASE_READER_URL is missing from .env.bridge — the bridge will refuse to start")
                 failed = 1
             else:
                 print(f"  ⓘ  {name} unset: ingress disabled")
@@ -96,11 +96,11 @@ async def main():
     # shell that has sourced both — or a compose run given both — ends up with whichever
     # was read last, and neither file shows which one won.
     #
-    # `DATABASE_URL` is the sharp case. The admin legitimately needs a superuser
-    # connection (init.sql, the Elixir emitter), but naming it `DATABASE_URL` means
+    # `DATABASE_READER_URL` is the sharp case. The admin legitimately needs a superuser
+    # connection (init.sql, the Elixir emitter), but naming it `DATABASE_READER_URL` means
     # sourcing .env.admin hands the *bridge's* variable a superuser — the exact fallback
     # that was deliberately removed from the code. Give the admin's its own name.
-    BRIDGE_OWNED = ("DATABASE_URL", "DATABASE_WRITER_URL", "NATS_URL", "BRIDGE_PORT")
+    BRIDGE_OWNED = ("DATABASE_READER_URL", "DATABASE_WRITER_URL", "NATS_URL", "BRIDGE_PORT")
     for name in sorted(set(admin) & set(bridge)):
         same = admin[name] == bridge[name]
         if name in BRIDGE_OWNED:

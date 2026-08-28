@@ -5229,6 +5229,39 @@ ground truth rather than trusting the output** — the discipline §10h named:
      `lstrip('✗ ')` never reached the glyph. Stripped properly, which also
      keeps `--json` text clean.
 
+## 10z. DATABASE_URL -> DATABASE_READER_URL, and the admin half (2026-08-28)
+
+A naming sweep with a security point behind it. `DATABASE_URL` is the
+Heroku-style "my application's database", so it invites exactly the value that
+must never be pasted there: a full-privilege URL works fine and silently
+dissolves the reader/writer split the whole model rests on. `DATABASE_READER_URL`
+refuses that mistake by looking wrong. The writer was already correctly named.
+
+The same asymmetry lived on the admin side, one file over: the READER's
+credentials were `POSTGRES_BRIDGE_USER` / `POSTGRES_BRIDGE_PASSWORD` (the reader
+called "BRIDGE") against `POSTGRES_WRITER_*`. Now `POSTGRES_READER_*` /
+`POSTGRES_WRITER_*` — a symmetric pair on both sides. `_URL` stays on the bridge
+vars because those hold a whole connection string, while the admin pair holds a
+username and a password.
+
+**No compatibility path, deliberately** — the same call as the retired snapshot
+code: this project deletes rather than gates. An env still carrying the old name
+fails at boot, by name, with a line saying what to rename. 101 occurrences
+across 28 files; NOTES.md keeps the old names where it is recording history.
+
+Verified: `zig build` green, the templates still render (`render.py`: 25
+functions, 4 event triggers applied to a scratch DB — the strongest check of the
+admin rename), the bridge boots on the new name, the old name fails with the
+rename hint, and zbdoctor comes back to its usual 6 findings.
+
+**One bug the verification exposed**, and it mattered for a POST-BOOT tool:
+`/status`'s `slot_active` is the bridge's own view, refreshed by the WAL monitor
+on a timer, so for the first seconds after a restart it reads false while
+PostgreSQL already shows the slot held — a red finding at exactly the moment an
+operator runs the checker. Gate A now asks PostgreSQL (the authority) before
+calling it red, and reports the disagreement as amber "monitor-sampled, normal
+right after a restart".
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

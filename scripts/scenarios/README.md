@@ -19,7 +19,7 @@ harness grows.
 python3 -m venv scripts/scenarios/.venv
 scripts/scenarios/.venv/bin/pip install -r scripts/scenarios/requirements.txt
 
-set -a && . ./.env.bridge && set +a   # DATABASE_URL, NATS_URL, BRIDGE_PORT
+set -a && . ./.env.bridge && set +a   # DATABASE_READER_URL, NATS_URL, BRIDGE_PORT
 export NATS_NKEY_SEED="SU..."         # kept out of the file on purpose
 
 scripts/scenarios/.venv/bin/python scripts/scenarios/stampede.py
@@ -38,7 +38,7 @@ lazily, so a missing dependency surfaces at connect time, not at install time.
 | `NATS_CREDS` | *the JWT world's credential*: path to a .creds file (bridge.creds for admin scenarios, a principal's for client ones). Wins over the seed in `connect()` and `nats_cli` |
 | `NATS_NKEY_SEED` | legacy (pre-operator server), from `.env` |
 | `ZB_PSQL` | `docker exec -i postgres-primary psql -U postgres` |
-| `DATABASE_URL` | *required by the bridge-spawning probes* — they start a real bridge, and it no longer has a PG_HOST/PG_USER fallback |
+| `DATABASE_READER_URL` | *required by the bridge-spawning probes* — they start a real bridge, and it no longer has a PG_HOST/PG_USER fallback |
 | `ZB_BRIDGE_ARGS` | `--slot zb_probe --pub my_pub --port 9096` — the probes get their own slot and port so they never disturb a running bridge |
 
 Subject and stream names are read from `grammar.json` (via `zb.py`), never hardcoded:
@@ -112,7 +112,7 @@ non-invasive set.
 | `dyntenant.py` | tenancy | NOTES.md §9 proven live: a brand-new tenant (no `zebridge_user_tenants` row, no streams) is onboarded against a RUNNING bridge with zero restarts — its `CDC_<T>`/`INIT_<T>` streams provisioned at runtime (the backend's half of the contract, and mandatory: a tenant-routed write with no stream is the §2.19 blocking shape), a `zebridge_user_tenants` mapping that propagates to `$KV.tenants.<principal>` immediately, and a row whose tenant value alone routes it onto `cdc.<tenant>.<table>.insert` in the new stream. Cleans up its streams, mapping and rows |
 | `tzguard.py` | schema | `zebridge_timestamp_guard` — the mechanical form of "timestamps are timestamptz" (§7.2's wire format and version clamping need absolute instants). Asserts the guard exists (render.py's vanishing-trigger lesson), a naive-`timestamp` CREATE/ALTER is refused with a message that names the fix, `timestamptz` passes, a mixed migration rolls back WHOLE (nothing half-applied — the property that makes it quarantine rather than a warning), and `schema_migrations` stays exempt so `mix ecto.migrate` can still bootstrap a fresh database. Needs only psql |
 | `tls.py` | — | `nats.zig` speaks TLS, JetStream included — the capability that makes bridge/NATS colocation a choice rather than a constraint. Standalone (no stack, no `zb`, no env): provisions its own TLS-only + JetStream `nats-server` from the submodule's test certs, generates and builds a Zig probe **against the vendored `nats.zig` itself** (Python is orchestration only), and asserts both directions: a CA-verified `tls://` connect runs the bridge's shapes (stream create, acked publish, durable pull fetch, ack), and the same connect without the CA is **refused** with `CertificateIssuerNotFound` — proving verification is real, not skipped. Skips cleanly if `nats-server` is not on PATH. Complements `nats.zig`'s own e2e TLS suite, which covers core pub/sub and mTLS but not JetStream |
-| `credentials.py` | config | the bridge cannot connect as the admin: no `DATABASE_URL` → refuses to start even with full `PG_*` credentials present; no `DATABASE_WRITER_URL` → ingress off rather than falling back to the read role |
+| `credentials.py` | config | the bridge cannot connect as the admin: no `DATABASE_READER_URL` → refuses to start even with full `PG_*` credentials present; no `DATABASE_WRITER_URL` → ingress off rather than falling back to the read role |
 | `faults.py` | config | `REQUESTS` missing → the bridge stops **non-zero** instead of spinning; the consumer deleted underneath it → a status frame is recycled, not acked into a null unwrap |
 
 Exit code is 0 when the assertion holds, so these can be chained in CI later. `burst.py`

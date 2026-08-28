@@ -370,7 +370,7 @@ services:
       - ./init.core.template.sql:/init.core.template.sql:ro
       - ./init.write.template.sql:/init.write.template.sql:ro
     # .env.admin only: this is the one container that connects as the superuser, and
-    # the bridge's own DATABASE_URL has no business being in its environment.
+    # the bridge's own DATABASE_READER_URL has no business being in its environment.
     env_file:
       - .env.admin
 

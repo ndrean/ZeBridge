@@ -25,7 +25,7 @@ both granted to `bridge_reader`:
 scenario size. Bring the stack up with
 `NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml --env-file .env.admin
 up -d postgres-primary nats-config-gen nats-server nats-init bridge-init`, then run the
-bridge from the host with `.env.bridge` (it needs DATABASE_URL; there is no PG_* fallback
+bridge from the host with `.env.bridge` (it needs DATABASE_READER_URL; there is no PG_* fallback
 any more).
 
 **Also landed 2026-08-15, after §E:** the oversized-row `@panic` is gone. A row that
@@ -114,7 +114,7 @@ report all exist; the subject is still parsed from the payload, there is no repl
 **Untested, noted 2026-08-16: encryption in transit.** Neither leg has ever been run
 with TLS.
 
-- **Postgres.** Should be the easy one now: `sslmode` rides in `DATABASE_URL`'s query
+- **Postgres.** Should be the easy one now: `sslmode` rides in `DATABASE_READER_URL`'s query
   string (`?sslmode=verify-full&sslrootcert=…`), libpq does the work, and `connInfo`
   passes the URL through untouched. Worth an actual run against a TLS-enabled server
   before claiming it — in particular that `verify-full` still works once `connInfo`
@@ -198,7 +198,7 @@ or not that migration ever happens.
 **Named for its floor, and usable without a standby.** `v0.16` raises the PostgreSQL
 minimum to 16 because that is where logical decoding on a standby begins. The *release* is
 still usable against a lone primary, or against logical replicas — those deployments simply
-point `DATABASE_URL` somewhere else and leave the new switch off. What actually changes per
+point `DATABASE_READER_URL` somewhere else and leave the new switch off. What actually changes per
 deployment is two things: a genuinely different reader URL, and a flag along the lines of
 `--conc true`.
 
@@ -275,7 +275,7 @@ retention on the primary.
 So: one standby with `hot_standby_feedback=on`, or two standbys where the snapshot one is a
 plain read replica with no slot, no PG16 requirement, and permission to lag freely.
 
-**Config: nothing new.** `DATABASE_URL` = standby, `DATABASE_WRITER_URL` = primary. That
+**Config: nothing new.** `DATABASE_READER_URL` = standby, `DATABASE_WRITER_URL` = primary. That
 is the whole configuration change, and it is the payoff of the 2026-08-16 URL split —
 before it, the read path was assembled from `PG_HOST`/`PG_USER` with no seam to point at
 a second host.
@@ -349,7 +349,7 @@ standby decoding, no invalidation-on-conflict.
 
 **Staging — snapshots first, and it is the cheaper half by a long way.** An earlier draft
 framed this as the *more* awkward option because it needs a third URL
-(`DATABASE_SNAPSHOT_URL`, defaulting to `DATABASE_URL`) where the full split needs none.
+(`DATABASE_SNAPSHOT_URL`, defaulting to `DATABASE_READER_URL`) where the full split needs none.
 That weighed the wrong thing. A snapshot standby:
 
 - needs **no replication slot**, so the invalidation risk does not exist

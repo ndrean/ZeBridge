@@ -117,14 +117,14 @@ BRIDGE_ARGS = os.environ.get(
 def bridge_env(**overrides) -> dict:
     """Inherit the shell's env, then override.
 
-    DATABASE_URL is required rather than assembled: the bridge dropped its
+    DATABASE_READER_URL is required rather than assembled: the bridge dropped its
     PG_HOST/PG_USER fallback precisely so that no component quietly builds a connection
     out of parts, and a test harness that did it anyway would be testing a path that no
     longer exists.
     """
-    if not os.environ.get("DATABASE_URL"):
+    if not os.environ.get("DATABASE_READER_URL"):
         sys.exit(
-            "DATABASE_URL is not set — the probes start a real bridge.\n"
+            "DATABASE_READER_URL is not set — the probes start a real bridge.\n"
             "  set -a && . ./.env.bridge && set +a\n"
             '  export NATS_NKEY_SEED="SU..."'
         )

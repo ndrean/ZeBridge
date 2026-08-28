@@ -42,7 +42,7 @@ Usage:  python scripts/scenarios/speed.py [statements] [rows_per_statement]
 Reuses `users` — the table grammar.json's `public_tables` already names — creating it
 only if genuinely absent; an existing table is left structurally alone and only
 `TRUNCATE`d. Starts its own bridge on the shared probe slot/port and refuses to run if
-another bridge process is already up. Needs DATABASE_URL.
+another bridge process is already up. Needs DATABASE_READER_URL.
 """
 
 import os

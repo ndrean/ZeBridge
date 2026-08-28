@@ -1,6 +1,6 @@
 -- Two principals, two tenants, one bridge — the setup the two-window demo needs.
 --
---   psql "$DATABASE_URL" -f scripts/demo_two_tenants.sql
+--   psql "$DATABASE_READER_URL" -f scripts/demo_two_tenants.sql
 --
 -- ⚠️ This is **model B**. Do not use `zebridge_scope_publication_to_one_tenant` for it: that adds a
 -- publication row filter (`WHERE tenant_id = 'acme'`), which pins the publication — and so

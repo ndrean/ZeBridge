@@ -11,7 +11,7 @@
 //!
 //! The guarantee is not lost, only moved: a missing or malformed key now fails at
 //! **startup**, before a single thread exists, with the key named. That is the same place
-//! `DATABASE_URL` is enforced, and an operator error belongs there rather than in a
+//! `DATABASE_READER_URL` is enforced, and an operator error belongs there rather than in a
 //! compiler.
 //!
 //! One file, three readers: the bridge (here), `nats-init` (jq, creating the streams),

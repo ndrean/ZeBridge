@@ -39,7 +39,7 @@ happened rather than performing it.
 Usage:  python scripts/scenarios/decode_integrity.py [row_count]
 
 Seeds and drops its own `decode_fixture` table and its NATS subject registration. Needs
-DATABASE_URL (it starts a bridge).
+DATABASE_READER_URL (it starts a bridge).
 """
 
 import asyncio
