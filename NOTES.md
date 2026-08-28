@@ -5392,6 +5392,42 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10ao. The compose stack carries the full loop, both directions (2026-08-28)
+
+Confirmed by the operator: Elixir emits against PostgreSQL, the browser replica picks
+it up, and a browser write updates PostgreSQL. First time end to end in compose —
+the bridge container had never run at all before today (§10ai).
+
+The configuration that works, written down because seven things had to be true at
+once and six of them were wrong this morning:
+
+    docker-compose.full.yml   bridge under the `bridge` profile, BRIDGE_BIND: 0.0.0.0
+                              (§10ak — loopback inside a container reaches nothing)
+    nats-init                 creates NO CDC stream (§10ai); the bridge reconciles
+                              CDC_PUBLIC and CDC_<tenant> at boot
+    nats-server.conf          tenant streams granted VERBATIM: CDC_acme (§10an)
+    zebridge_user_tenants     at least one row, or every tenant-scoped table is
+                              unreadable — nothing writes it for you (§10an)
+    vite.config.ts            ZB_BRIDGE_ORIGIN / ZB_NATS_WS_ORIGIN, the only place
+                              a port is named (§10ak)
+    web-consumer/.env.local   VITE_AUTH=password — the compose broker is the
+                              pre-operator world and refuses a JWT (§10am)
+    Dockerfile                zstd-dev + zstd-libs, and the Linux-only compile
+                              errors fixed (§10ai)
+
+**What this closes.** Until today the compose stack was a way to run PostgreSQL and
+NATS next to a HOST bridge; the bridge service had been commented out long enough
+for four independent defects to accumulate behind it, none of which any test could
+see. The loop now runs with the bridge as a container, which is the shape a
+deployment actually has — and it exercised the Alpine/musl build, the published
+ports, the container's own network namespace, and the browser's origin, all of which
+the host dev loop silently satisfies for free.
+
+**Still not compose's job**: enrollment. That broker has no operator and no resolver,
+so `/enroll` correctly answers `enrollment not configured` and the browser connects
+as a declared principal. The JWT world is the native stack's
+(`scripts/native/jwt-bootstrap.sh`).
+
 ## 10an. An empty tenant became a KV key, and a stream name diverged (2026-08-28)
 
 Reported as `counter_tenant: chain manifest unreadable: Error: invalid key:
