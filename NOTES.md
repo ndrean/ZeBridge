@@ -5304,6 +5304,49 @@ and the compose stack would collide with the native stack on 5432/4222 anyway.
 That is the next test to run, and the JWT dance in compose is the interesting
 half of it.
 
+## 10ad. The publication should be created BY zebridge_enable — and the recipe
+we wrote two turns ago is incomplete (2026-08-28)
+
+The argument (user's, and correct): creating an EMPTY publication in init.core is
+ceremony. It exists only so the bridge's boot check passes and so `enable` has a
+target; every byte of its content arrives later, through `enable`. Making the DBA
+run `CREATE PUBLICATION` first is a second step whose only job is to make the
+first step legal, and `CREATE PUBLICATION` is idempotent-ish anyway, so nothing
+is gained by hoisting it.
+
+**And checking it surfaced a real latent bug.** `${BRIDGE_CDC_PUBLICATION}` is
+not used once — it is used to attach THREE internal tables that every consuming
+bridge needs:
+
+  * `zebridge_ddl_events`   (init.core) — the DDL transport. Without it a bridge
+    never learns a schema changed.
+  * `zebridge_gc_watermark` (init.core) — the offline-window watermark clients read.
+  * `zebridge_user_tenants` (init.write) — the roster diverted to `$KV.tenants`;
+    without it PROTOCOL Step 0 fails for every client of that bridge.
+
+So the multi-publication recipe recorded earlier — `CREATE PUBLICATION pub_x;`
+then `zebridge_enable(..., publication => 'pub_x')` — is INCOMPLETE. A second
+bridge on `pub_x` boots happily, replicates the user tables, and silently loses
+DDL propagation, the GC watermark and tenant resolution. Nothing catches it
+today: the publication is not empty, so §10ac's cop stays green.
+
+**The design that fixes both** (not yet built):
+
+    zebridge_create_publication(name)      -- idempotent: CREATE IF NOT EXISTS,
+                                           -- then attach the three internal tables
+    zebridge_enable(tbl, ..., create_publication => true)   -- opt-in, same shape
+                                           -- as allow_physical_deletes: refuse by
+                                           -- default (a typo must not manufacture a
+                                           -- publication), create when asked
+
+With that, `${BRIDGE_CDC_PUBLICATION}` leaves the templates entirely — the
+publication name becomes an argument to a migration, which is where it belongs,
+and `.env.bridge` keeps it only because the BRIDGE needs to name what it reads.
+init.core/write would define the functions and attach nothing on their own.
+
+⚠️ Until it is built, a hand-made second publication must also carry the three
+internal tables — otherwise its bridge is a quiet cripple.
+
 ## 10ac. The publication's own cops (2026-08-28)
 
 Asked and answered from the code, not memory — three layers, and they were
