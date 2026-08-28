@@ -110,9 +110,13 @@ services:
       nats-config-gen:
         condition: service_completed_successfully
     ports:
-      - "4222:4222" # Client TCP connections
-      - "8222:8222" # HTTP monitoring
-      - "8080:8080" # WebSocket connections
+      # ⚠️ Parameterized like PG_PUBLISH_PORT above, and for the same reason: a
+      # native stack on the host already holds 4222/8222/8080, and a hardcoded
+      # publish makes `docker compose up` fail to bind rather than run beside it.
+      # The values inside the network never change (containers talk on 4222).
+      - "${NATS_PUBLISH_PORT:-4222}:4222"   # Client TCP connections
+      - "${NATS_MONITOR_PUBLISH_PORT:-8222}:8222" # HTTP monitoring
+      - "${NATS_WS_PUBLISH_PORT:-8080}:8080"      # WebSocket connections
     volumes:
       - nats-data:/data
       - nats-config:/config:ro

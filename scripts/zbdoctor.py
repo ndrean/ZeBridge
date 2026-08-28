@@ -325,6 +325,25 @@ def gate_postgres(catalogue: dict) -> None:
         if not unreachable:
             ok(f"the sweeper reaches every tenant it must ({len(sweep)} pairs)")
 
+    # Several bridges over one table: the width guard bakes MIN(max_row_bytes)
+    # across the instances whose publication carries it, because a row must fit
+    # the NARROWEST carrier — a row that fits only the wider one would suspend
+    # the table on the other bridge. Correct, and silent, so say it out loud.
+    try:
+        budgets = psql("SELECT l.slot, l.max_row_bytes, count(DISTINCT pt.tablename) "
+                       "FROM zebridge_limits l LEFT JOIN pg_publication_tables pt "
+                       "  ON pt.pubname = l.publication GROUP BY 1, 2 ORDER BY 1")
+    except RuntimeError:
+        budgets = []
+    if len({r[1] for r in budgets if len(r) >= 2}) > 1:
+        detail = ", ".join(f"{r[0]}={r[1]}B" for r in budgets if len(r) >= 2)
+        amber("B", f"instances disagree on the row-width budget: {detail}",
+              "every shared table is guarded at the MINIMUM — raise BASE_BUF on the "
+              "narrow instance, or keep their publications disjoint")
+    elif budgets:
+        ok(f"{len(budgets)} bridge instance(s) registered, one row-width budget "
+           f"({budgets[0][1]} bytes)")
+
     # Slots: an orphan retains WAL for EVERYONE, which is the one PG-side fault
     # that degrades the whole cluster rather than one table.
     try:
