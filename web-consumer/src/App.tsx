@@ -22,7 +22,20 @@ async function zstdDecode(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array>
 }
 import { nkeys } from '@nats-io/nats-core';
 
-const NATS_URL = 'ws://localhost:8080';
+/// Both endpoints are overridable, because the ports are not a property of the
+/// client — they are whatever the stack publishes. The NATIVE dev loop publishes
+/// NATS's websocket on 8080 and the bridge on 9090, which is why those are the
+/// defaults; the compose stack puts BOTH behind one nginx origin (edge/nginx.conf),
+/// so there you set a single value:
+///
+///   web-consumer/.env.local
+///     VITE_NATS_URL=ws://localhost:8090/nats
+///     VITE_BRIDGE_URL=http://localhost:8090
+///
+/// Hardcoding them cost an afternoon: compose moved the published ports and the
+/// client kept dialling 8080/9090 with no error a browser could explain.
+const NATS_URL = import.meta.env.VITE_NATS_URL ?? 'ws://localhost:8080';
+const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? 'http://localhost:9090';
 
 /// `?principal=bob` beats the build-time env: one dev server serves several
 /// principals side by side (multi-browser demos, the generations staggered-seed
@@ -60,9 +73,9 @@ async function enroll(code: string): Promise<string | undefined> {
   const seed = new TextDecoder().decode(kp.getSeed());
   // GET with params: a CORS "simple request" — no preflight, no body parsing.
   const res = await fetch(
-    `http://localhost:9090/enroll?code=${code.trim()}&user_pubkey=${kp.getPublicKey()}`,
+    `${BRIDGE_URL}/enroll?code=${code.trim()}&user_pubkey=${kp.getPublicKey()}`,
   ).catch(() => null);
-  if (!res) return 'bridge unreachable on :9090';
+  if (!res) return `bridge unreachable at ${BRIDGE_URL}`;
   if (!res.ok) return `refused (${res.status}) — invalid, used, or expired code`;
   const { jwt } = await res.json();
   sessionStorage.setItem('zb_creds', credsFileText(jwt, seed));

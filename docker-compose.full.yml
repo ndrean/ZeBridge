@@ -445,6 +445,14 @@ services:
       # bridge stopped assembling connections out of parts: DATABASE_READER_URL in
       # .env.docker is the single source, and it already names postgres-primary:5432.
       TOPOLOGY_PATH: /grammar.json
+      # ⚠️ 0.0.0.0, and it MUST be. The default is 127.0.0.1, which inside a container
+      # means the loopback of that container's own network namespace — so a published
+      # port reaches nothing, and neither does another container. Measured: with the
+      # default, `curl localhost:<published>/health` answered nothing at all, and the
+      # browser client could not reach /enroll. The README's warning about 0.0.0.0
+      # exposing unauthenticated telemetry is about a HOST process; here the namespace
+      # is the boundary and the published port is the deliberate exposure.
+      BRIDGE_BIND: 0.0.0.0
       # No seed mapping here. The bridge reads NATS_BRIDGE_NKEY_SEED — the same name
       # nats-init and nats-config-gen use — so .env.docker's copy reaches it through
       # env_file with nothing in between. A translation line
@@ -457,6 +465,29 @@ services:
     # No --slot/--pub: BRIDGE_CDC_SLOT and BRIDGE_CDC_PUBLICATION are in .env.docker,
     # and this is exactly the flagless boot they exist for. Neither has a default, so
     # removing them from the env file stops the container rather than guessing.
+    networks:
+      - cdc-net
+    restart: unless-stopped
+
+  # 7b. The browser's single origin.
+  #
+  # A browser client needs two different things — the bridge's /enroll and NATS over
+  # websocket — and they live on two ports that compose is free to move. The client
+  # hardcoded both (`ws://localhost:8080`, `http://localhost:9090`) and broke the
+  # moment either moved. One port in front of both, so the client knows one URL.
+  edge:
+    profiles: ["bridge"]
+    image: nginx:alpine
+    container_name: edge
+    depends_on:
+      bridge:
+        condition: service_started
+      nats-server:
+        condition: service_started
+    ports:
+      - "${EDGE_PUBLISH_PORT}:8090"
+    volumes:
+      - ./edge/nginx.conf:/etc/nginx/nginx.conf:ro
     networks:
       - cdc-net
     restart: unless-stopped

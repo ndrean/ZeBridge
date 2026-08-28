@@ -5392,6 +5392,64 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10ak. Why the browser client reached nothing in compose (2026-08-28)
+
+Reported as "the browser client does not reach nats nor the bridge". Three separate
+things, and the one that mattered was not the one that looked likely.
+
+**1. The bridge bound loopback INSIDE its container.** `BRIDGE_BIND` defaults to
+`127.0.0.1`, which on a host is the right default — every telemetry endpoint is
+unauthenticated. In a container it means the loopback of that container's own
+network namespace, so a published port reaches nothing and neither does another
+container:
+
+    info(args): HTTP telemetry bind 127.0.0.1 (from default)
+    $ curl localhost:9098/health   ->  (nothing, code 000)
+
+`BRIDGE_BIND: 0.0.0.0` on the compose service. The README's warning about 0.0.0.0
+is about a host process; here the namespace is the boundary and the published port
+is the deliberate exposure. ⚠️ **nginx would NOT have fixed this** — a proxy dials
+the container over the network too, and would have been refused just the same. The
+proxy is about resembling a real deployment, which is the operator's stated reason
+for wanting it, not about reachability.
+
+**2. CORS was never the problem.** `/enroll` already answers with
+`access-control-allow-origin: *` — checked before assuming.
+
+**3. The client hardcoded two host ports.** `ws://localhost:8080` and
+`http://localhost:9090` — correct for the native loop, wrong the moment compose
+publishes elsewhere, and invisible to the user because a browser cannot explain a
+refused connection. They are `VITE_NATS_URL` / `VITE_BRIDGE_URL` now, with the
+native values as defaults, and `web-consumer/.env.compose.example` carries the
+compose pair.
+
+**The edge** (`edge/nginx.conf`, service `edge`, `bridge` profile) puts everything
+the browser needs on ONE port: `/health` `/status` `/metrics` `/enroll` to the
+bridge, websocket to nats-server.
+
+⚠️ **The websocket is served at the ROOT**, and finding out why cost a round: the Go
+client behind the `nats` CLI DISCARDS the path in `ws://host/nats` and requests `/`.
+nginx's access log is what showed it — `GET /` for a connection opened as `/nats`.
+A prefix-only proxy works from a browser (nats.ws keeps the path) and fails from
+every Go-based tool with `invalid websocket connection`, which reads like a protocol
+fault rather than a routing one. Root proxies the websocket; `/nats` stays as an
+alias; the help text moved to `/edge`.
+
+**Verified through the edge:** `/health` `/status` `/metrics` `/edge` all 200;
+`/enroll` routes and returns the bridge's own JSON; `nats --server ws://edge:8090`
+connects as alice at both the root and `/nats`; `stream info CDC_PUBLIC` returns her
+8 bound subjects. (`stream ls` times out — `$JS.API.STREAM.LIST` is not in her
+grants. Least privilege working, not a proxy fault.)
+
+**And a real limit worth stating: `/enroll` cannot work against the compose stack.**
+It answers `{"error":"enrollment not configured"}` because `ZB_SIGNING_SEED` and
+`ZB_ACCOUNT_PUB` are not in `.env.docker` — and they should not be, because that
+broker is the PRE-OPERATOR world: `authorization { users: … }` with password
+principals and the bridge's nkey, no operator and no resolver. A JWT minted by
+`/enroll` would have nothing to validate it. Enrollment belongs to the native stack
+(`scripts/native/jwt-bootstrap.sh`); in compose the browser connects as a declared
+principal (`alice`/`s3cret`).
+
 ## 10aj. The pre-split `.env` is gone (2026-08-28)
 
 `.env` was still tracked, three env files after it stopped being read. It carried a
