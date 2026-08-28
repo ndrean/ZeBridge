@@ -5424,6 +5424,27 @@ is worse than none, because the failure arrives as an authorization error instea
 a missing file. Confirmed in the built bundle:
 `io = $a.get("auth") ?? "password" ?? "creds"`.
 
+**Follow-up, same session: `SYS ERROR: Connection failed: AuthorizationError:
+Authorization Violation` in the browser.** The same cause, one step later — the
+switch existed but nothing had set it. There was no `web-consumer/.env.local`, so
+`AUTH` fell to its `'creds'` default and the client again offered the operator JWT
+to a password-only broker. Reproduced through the operator's OWN dev server, which
+is what makes it conclusive rather than plausible:
+
+    ws://[::1]:5173/nats   creds    -> Authorization Violation
+    ws://[::1]:5173/nats   password -> connected
+
+So the proxy chain was right and the credential was the only wrong thing. Two ways
+out, and the URL one needs no restart because Vite reads env files only at server
+start: `?auth=password` on the page URL, or `.env.local` (now created, and
+`web-consumer/.env.local` is gitignored — which stack a developer is pointed at, and
+which credential it accepts, is per-developer by definition).
+
+⚠️ Also worth remembering: with only the compose broker up, `4222` and `8080` are
+FREE, so a client aimed at the native ports fails with a CONNECTION error. Getting
+an AUTHORIZATION error instead is itself evidence the transport is fine — it proves
+you reached a broker and it disliked your credential.
+
 **3. A regression I had introduced.** Making the edge's `/` the websocket meant
 every ordinary path was proxied into nats-server's websocket endpoint and answered
 `400 Bad Request` — including `/creds/alice.creds`, which reads as "the file is

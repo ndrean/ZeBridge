@@ -73,3 +73,9 @@ seed.txt
 # (.env.bridge, .env.docker, .env.admin) are tracked; a bare .env is not, so a
 # local scratch copy cannot drift back into the repo.
 /.env
+
+# Vite's local overrides. `.env.local` is per-developer by convention and by name —
+# which stack you happen to be pointed at, and (via VITE_AUTH) which credential that
+# broker accepts. `.env.compose.example` is the tracked copy worth reading.
+web-consumer/.env.local
+web-consumer/.env.*.local
