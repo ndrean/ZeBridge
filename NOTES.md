@@ -5358,6 +5358,28 @@ flags from `.env.bridge` alone (systemd `EnvironmentFile`, compose `env_file` �
 both far easier than assembling a command line), while `--pub` overrides it for
 a one-off. CLI wins over env, exactly as `--slot` does.
 
+## 10ah. TODO: zbdoctor's version-trigger rule misfires on bridge-owned tables (2026-08-28)
+
+Seen on the post-§10ad health run:
+
+    ✗ 'zebridge_gc_watermark' is edge-writable with version_col=updated_at,
+      but the bump-version trigger is MISSING
+
+Pre-existing, and the diff proves it: `174d952..HEAD` touches nothing about that
+table's grants or its catalogue row — only the publication attachment moved.
+
+But the rule that fires is questionable. It reads "edge-writable" off
+`bridge_writer` holding UPDATE, and `bridge_writer` holds UPDATE on this table BY
+DESIGN — the bridge itself writes the watermark, no edge client ever does. The
+`version_col=updated_at` half is not a declaration either: nothing sets it, it is
+the column DEFAULT of `zebridge_catalogue`. So the check is reporting "a table the
+bridge owns has no LWW guard", which is correct and irrelevant.
+
+Fix when picked up: exempt the three bridge-owned tables from the edge-write rules
+(they are already special-cased by name in `zebridge_publication_guard` and in the
+bridge's WAL loop), or key the rule off an actual edge grant rather than
+`bridge_writer`'s.
+
 ## 10ag. TODO: speed.py's drain no longer meets its own deadline (2026-08-28)
 
 Noticed while regression-testing §10ad, and **A/B'd on the spot so it is not
