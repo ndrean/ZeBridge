@@ -22,6 +22,8 @@ const usage =
     \\Environment:
     \\  DATABASE_READER_URL          REQUIRED. Read path, credentials included:
     \\                        postgres://<role>:<pass>@<host>:<port>/<db>[?sslmode=…]
+    \\  BRIDGE_CDC_PUBLICATION  The publication to replicate. --pub overrides it.
+    \\  BRIDGE_CDC_SLOT       The replication slot. --slot overrides it.
     \\  DATABASE_WRITER_URL   Ingress path, same form. Unset disables the mutation
     \\                        listener entirely — it never falls back to the read role.
     \\  BRIDGE_PORT           HTTP telemetry port when --port is absent
@@ -137,8 +139,19 @@ pub const Args = struct {
         // literal default used to be 6543 here while Config.Http.default_port said
         // 9090 — two answers, and the one that won was the one nobody had written down.
         var http_port: ?u16 = null;
-        var slot_name: []const u8 = config.Postgres.default_slot_name; // default
-        var publication_name: []const u8 = config.Postgres.default_publication_name; // default
+        // Precedence: CLI flag > env > compiled default.
+        //
+        // ⚠️ The env layer exists to kill a DUPLICATION, not for convenience. The
+        // publication is created by init.sql from `BRIDGE_CDC_PUBLICATION` and then
+        // named again on the bridge's command line as `--pub`; two spellings of one
+        // value that MUST agree, with no error when they drift — the bridge simply
+        // replicates a publication that carries no tables. Same story for the slot.
+        // Reading the same variable the DBA already set makes the flag an override
+        // rather than a second source of truth.
+        var slot_name: []const u8 =
+            init.minimal.environ.getPosix("BRIDGE_CDC_SLOT") orelse config.Postgres.default_slot_name;
+        var publication_name: []const u8 =
+            init.minimal.environ.getPosix("BRIDGE_CDC_PUBLICATION") orelse config.Postgres.default_publication_name;
         // Off by default: one keyless table should not stop every other table from
         // replicating. See preflight.zig for the full argument.
         var strict_tables: bool = false;

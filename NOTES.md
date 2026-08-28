@@ -5262,6 +5262,48 @@ operator runs the checker. Gate A now asks PostgreSQL (the authority) before
 calling it red, and reports the disagreement as amber "monitor-sampled, normal
 right after a restart".
 
+## 10aa. Three env files, one definition per value (2026-08-28)
+
+The duplication behind §10z: the reader's password was byte-identical in
+`.env.admin` (as `POSTGRES_READER_PASSWORD`, for `CREATE ROLE`) and inside
+`.env.bridge`'s `DATABASE_READER_URL` (for connecting). Same secret, two
+shapes, two files — change one and nothing complains until the next restart
+fails to authenticate, naming the ROLE rather than the file that went stale.
+`BRIDGE_CDC_PUBLICATION` had the same disease against the bridge's `--pub`
+flag, and `OPEN_TENANT` against grammar.json (check.py exists partly to catch
+that third one).
+
+**The shape now:**
+  * **`.env.bridge`** — the bridge, complete. The role URLs (canonical: the
+    passwords live here and nowhere else), the publication, the slot, its NATS
+    credential. `./zig-out/bin/bridge` with NO FLAGS now boots from this file
+    alone — `--pub`/`--slot` became overrides, reading
+    `BRIDGE_CDC_PUBLICATION`/`BRIDGE_CDC_SLOT` when absent.
+  * **`.env.admin`** — the DBA's scope only: the superuser connection, the
+    target database, the published port. Eight variables, down from twenty-two.
+  * **`.env.docker`** — the compose stack, SELF-CONTAINED by design. It repeats
+    values on purpose: every address there is a container name
+    (`postgres-primary:5432`), not `127.0.0.1:55432`. One file, so no
+    cross-file drift is possible within that deployment either.
+
+**`scripts/zb-derive-env.py`** closes the loop: init.sql needs the role
+credentials in parts, so they are DERIVED from the canonical URLs (and
+OPEN_TENANT from grammar.json) rather than stored a second time. Never
+overwrites an explicit value. Wired into `up.sh` and `render.py`.
+
+Verified in clean environments (`env -i`): `render.py` renders and applies the
+templates end to end (25 functions, 4 event triggers, 7 tables) from
+`.env.admin` + `.env.bridge` + derivation; and the bridge boots flagless on
+`my_pub`/`my_slot` with replication started.
+
+⚠️ **Two things carried forward, both unverified here**: the Dockerfile now
+installs `zstd-dev`/`zstd-libs` (the container build would otherwise fail on
+`zstd.h` since §10w — a bug shipped that day), and compose's five services were
+repointed to `.env.docker`. Neither could be exercised: Docker is not running,
+and the compose stack would collide with the native stack on 5432/4222 anyway.
+That is the next test to run, and the JWT dance in compose is the interesting
+half of it.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

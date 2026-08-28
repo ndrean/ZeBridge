@@ -5,7 +5,7 @@ services:
     container_name: postgres-primary
     # The server's own superuser bootstrap — admin territory, same as bridge-init.
     env_file:
-      - .env.admin
+      - .env.docker
     environment:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_USER: ${PG_USER}
@@ -55,7 +55,7 @@ services:
     # .env.admin: NATS_BRIDGE_NKEY_PUB is the key the *server* is told to trust, which
     # is an authorization decision and not one of the bridge's own credentials.
     env_file:
-      - .env.admin
+      - .env.docker
     volumes:
       - nats-config:/config
       - ./nats-server.conf.template:/nats-server.conf.template:ro
@@ -141,7 +141,7 @@ services:
       postgres-primary:
         condition: service_healthy
     env_file:
-      - .env.admin
+      - .env.docker
       - .env.bridge
     environment:
       # zb.py shells out to psql. Inside a container there is no docker socket, so it
@@ -180,7 +180,7 @@ services:
       nats-server:
         condition: service_started
     env_file:
-      - .env.admin
+      - .env.docker
     # From the shell, not from a file — a private key belongs in neither env file.
     # ⚠️ Unset means a blank seed: the server answers `Authorization Violation`, and the
     # `until nats server check connection` loop below spins forever without ever
@@ -369,10 +369,10 @@ services:
     volumes:
       - ./init.core.template.sql:/init.core.template.sql:ro
       - ./init.write.template.sql:/init.write.template.sql:ro
-    # .env.admin only: this is the one container that connects as the superuser, and
-    # the bridge's own DATABASE_READER_URL has no business being in its environment.
+    # .env.docker: the compose stack's own self-contained file (see its header).
+    # This is the one container that connects as the superuser.
     env_file:
-      - .env.admin
+      - .env.docker
 
     command:
       - /bin/bash
@@ -418,7 +418,7 @@ services:
   #     nats-init:
   #       condition: service_completed_successfully
   #   env_file:
-  #     - .env.prod
+  #     - .env.docker
   #   environment:
   #     PG_HOST: postgres-primary
   #     PG_PORT: 5432
@@ -486,7 +486,7 @@ services:
   #     postgres-replica:
   #       condition: service_healthy
   #   env_file:
-  #     - .env.prod
+  #     - .env.docker
   #   environment:
   #     NATS_HOST: nats-server
   #     NATS_PORT: "4222"

@@ -4,8 +4,10 @@ ARG BASE_IMAGE=alpine:3.22
 
 FROM ${BASE_IMAGE} AS builder
 
-# postgresql-dev provides libpq-fe.h, which the translate-c step in build.zig
-# needs at build time (see src/c_includes.h).
+# postgresql-dev provides libpq-fe.h and zstd-dev provides zstd.h/zdict.h, both
+# of which the translate-c step in build.zig needs at build time (src/c_includes.h).
+# ⚠️ zstd is not optional: the generation producer compresses every chain object
+# and trains the per-table dictionary through libzstd (NOTES §10w/§10x).
 RUN apk add --no-cache \
     curl \
     xz \
@@ -16,6 +18,7 @@ RUN apk add --no-cache \
     g++ \
     musl-dev \
     postgresql-dev \
+    zstd-dev \
     openssl-dev \
     openssl-libs-static
 
@@ -43,9 +46,11 @@ RUN zig build -Doptimize=ReleaseFast
 FROM ${BASE_IMAGE}
 
 # Runtime dependencies (dynamically linked)
-# libpq pulls in libssl3/libcrypto3 transitively on Alpine
+# libpq pulls in libssl3/libcrypto3 transitively on Alpine; zstd-libs carries
+# libzstd.so for the chain compressor + dictionary trainer.
 RUN apk add --no-cache \
     libpq \
+    zstd-libs \
     ca-certificates
 
 COPY --from=builder /build/zig-out/bin/bridge /usr/local/bin/bridge

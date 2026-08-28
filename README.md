@@ -200,15 +200,34 @@ That is the whole contract for an app author. The wire format — the NATS subje
 
 **Postgres database**: the DBA credentials
 
-```txt
-postgres://<username>:<password>@<127.0.0.1:<port>/<dbname>
-```
-
-**psql access**: use `PGPASSWORD`:
+<details><summary>psql access</summary>
 
 ```sh
+psql postgres://<role>:<password>@<host>:<port>/<dbname> -c "...;"
+```
+
+or decomposing with flags, but `PGPASSWORD` is separated. The other creds can be either standard Postgres env vars (PGHOST, PGPORT, PGUSER, PGDATABASE) or flags:
+
+```sh
+PGPASSWORD=my_pwd PGHOST=xx  PGPORT=xx PGUSER=xx  PGDATABASE=xx psql -c "...;"
+
+# or
 PGPASSWORD=my_pwd psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
 ```
+
+or by reading the password from the file _~/pgpass_ with the STRCIT ordering below, so that `psql` will extract the password when the other credentials match:
+
+```txt
+#~/.pgpass
+hostname:port:database:username:password.  #<- strict ordering
+```
+
+```sh
+psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
+```
+
+</details>
+<br>
 
 **DBA creates two USER profils in the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils:
 
@@ -216,6 +235,7 @@ PGPASSWORD=my_pwd psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
 # .env.admin — the DBA sets the role names and passwords; the templates interpolate them
 POSTGRES_READER_USER=bridge_reader      # created by init.core.template.sql
 POSTGRES_READER_PASSWORD=...
+
 POSTGRES_WRITER_USER=bridge_writer      # created by init.write.template.sql
 POSTGRES_WRITER_PASSWORD=...
 ```

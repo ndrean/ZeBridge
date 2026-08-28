@@ -45,6 +45,13 @@ SCRATCH_DB = "zb_render_check"
 
 # The variables the template interpolates. Unset ones render as "" and produce SQL that
 # looks fine, so they are checked before anything else.
+# The role credentials live once, in .env.bridge's URLs (scripts/zb-derive-env.py).
+import importlib.util as _ilu
+_derive = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "zb-derive-env.py")
+_spec = _ilu.spec_from_file_location("zb_derive_env", _derive)
+_mod = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_mod)
+_mod.derive_into(os.environ)
+
 REQUIRED_VARS = [
     "POSTGRES_READER_USER",
     "POSTGRES_READER_PASSWORD",

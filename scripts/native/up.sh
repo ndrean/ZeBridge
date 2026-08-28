@@ -57,7 +57,15 @@ if [ "$FRESH_PG" = "1" ]; then
   set -a
   # shellcheck disable=SC1091
   source "$ROOT/.env.admin"
+  # ⚠️ The role credentials are NOT declared twice. `.env.bridge` owns them —
+  # they are the bridge's own identity — and init.sql's `CREATE ROLE … PASSWORD`
+  # needs the same secret in parts. Deriving beats duplicating: a password
+  # written in two files drifts silently, and the failure lands at the next
+  # bridge restart as an authentication error naming the ROLE, not the file.
+  # shellcheck disable=SC1091
+  source "$ROOT/.env.bridge"
   set +a
+  eval "$(python3 "$ROOT/scripts/zb-derive-env.py")"
   export PG_HOST=127.0.0.1
   export PG_PORT="$PGPORT"
   "$PGBIN/psql" -h 127.0.0.1 -p "$PGPORT" -U postgres -d postgres \
