@@ -24,7 +24,14 @@ to SKIP (never to red) when they are absent.
 
 Environment (all optional, sane defaults):
     ZB_PSQL / DATABASE_URL   how to reach Postgres  (default: docker exec)
-    NATS_URL, NATS_CREDS     how to reach NATS      (default: 127.0.0.1:4222)
+    NATS_URL                 how to reach NATS      (default: 127.0.0.1:4222)
+    NATS_CREDS               a .creds file (operator/JWT mode) — wins if both are set
+    NATS_NKEY_SEED           the seed itself (nkey mode), as the bridge takes it
+
+⚠️ Gate C and D need an ADMIN credential: they list streams and read the
+generations KV. A client's own creds authenticate fine and then answer
+"no streams" — the grants are per-principal by design. Use the same
+credential nats-init / the bridge itself uses.
     BRIDGE_URL               the bridge's HTTP      (default: http://127.0.0.1:9090)
 """
 
@@ -32,8 +39,10 @@ import json
 import os
 import re
 import shlex
+import atexit
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -108,11 +117,45 @@ def truthy(v: str) -> bool:
     return v.strip().lower() in ("t", "true", "y", "yes", "1")
 
 
+_seed_path: str | None = None
+
+
+def nkey_file() -> str | None:
+    """The `nats` CLI takes `--nkey` as a FILE, so a seed handed through the
+    environment has to touch disk for the length of this run. Written 0600 and
+    unlinked at exit: a seed travels in env/CLI and must not outlive the
+    process in a file (SECURITY.md's rule, which is why the bridge takes
+    NATS_NKEY_SEED the same way)."""
+    global _seed_path
+    seed = (os.environ.get("NATS_NKEY_SEED") or "").strip()
+    if not seed:
+        return None
+    if _seed_path is None:
+        fd, path = tempfile.mkstemp(prefix="zbdoctor-", suffix=".nk")
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(seed + "\n")
+        _seed_path = path
+        atexit.register(lambda: os.path.exists(path) and os.unlink(path))
+    return _seed_path
+
+
 def nats(*args: str) -> subprocess.CompletedProcess:
-    cmd = ["nats", "--server", NATS_URL]
+    """Creds win over a seed — the same precedence the bridge resolves."""
+    server, auth = NATS_URL, []
     if NATS_CREDS:
-        cmd += ["--creds", NATS_CREDS]
-    return subprocess.run(cmd + list(args), capture_output=True, text=True)
+        auth = ["--creds", NATS_CREDS]
+    elif (seed_file := nkey_file()):
+        auth = ["--nkey", seed_file]
+        # ⚠️ Strip `user:pass@` from the URL when the seed IS the credential.
+        # Inline credentials win, and every administrative command is then denied
+        # opaquely — a denied JetStream API publish never answers, so it surfaces
+        # as "context deadline exceeded", not as an auth error (zb.py, §1.8).
+        scheme, _, rest = NATS_URL.partition("://")
+        address = rest.rsplit("@", 1)[-1] if "@" in rest else rest
+        server = f"{scheme}://{address}" if scheme else address
+    return subprocess.run(["nats", "--server", server, *auth, *args],
+                          capture_output=True, text=True)
 
 
 def http_json(path: str):
@@ -287,8 +330,14 @@ def gate_nats(tenants: list[str]) -> set[str]:
     gate("C. NATS carries the topology")
     r = nats("stream", "ls", "-n")
     if r.returncode != 0:
-        red("C", f"cannot list NATS streams ({r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'failed'})",
-            "check NATS_URL / NATS_CREDS — every check below needs the broker")
+        detail = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "failed"
+        how = ("NATS_CREDS is set" if NATS_CREDS else
+               "NATS_NKEY_SEED is set" if os.environ.get("NATS_NKEY_SEED") else
+               "NO credential is set")
+        red("C", f"cannot list NATS streams ({detail}) — {how}",
+            "gates C and D need an ADMIN credential: export NATS_CREDS=<.creds file> "
+            "or NATS_NKEY_SEED=<seed>. A client principal's own credential "
+            "authenticates and then sees nothing — the grants are per-principal")
         return set()
     streams = {s.strip() for s in r.stdout.splitlines() if s.strip()}
 

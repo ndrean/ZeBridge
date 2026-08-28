@@ -5151,6 +5151,19 @@ mechanically), **E** declared-vs-actual drift (delegates to `check.py`).
 Stdlib-only on purpose — an operator has `psql`, `nats`, python3, not a venv;
 gate E finds the scenario venv itself and degrades to SKIP, never to red.
 
+**Credentials: gates C and D need an ADMIN one.** They list streams and read
+the generations KV, and grants are per-principal by design — a client's own
+creds authenticate happily and then see nothing. Both of the bridge's own auth
+modes are accepted, with the bridge's precedence (creds win): `NATS_CREDS` for
+operator/JWT, or `NATS_NKEY_SEED` for nkey mode. ⚠️ The `nats` CLI takes
+`--nkey` as a FILE, so a seed handed through the environment is written to a
+0600 temp file and unlinked at exit — it must not outlive the process on disk.
+When a seed is used the CLI's `--server` is stripped of any `user:pass@`,
+because inline credentials would win and every admin command would then be
+denied opaquely ("context deadline exceeded", never an auth error). The failure
+line names which mode was in play, so "no credential" and "wrong credential"
+are never confused.
+
 **The value is in the READING, not the running.** Two of the audit functions
 answer for a deployment shape this one does not use, and a naive wrapper turns
 them into noise the operator learns to ignore:
