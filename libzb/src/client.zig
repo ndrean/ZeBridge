@@ -94,6 +94,15 @@ pub const SyncClient = struct {
     }
 
     pub fn deinit(self: *SyncClient) void {
+        // ⚠️ Before the transport: nats.zig PANICS if a connection is destroyed with a
+        // live subscription ("call sub.deinit() on every subscription before destroying
+        // its connection"). The verdict channel is held open across the whole session
+        // by design, so it is this teardown's job to release it — found by the soak,
+        // which is the first thing to both subscribe and exit.
+        if (self.verdicts) |sub| {
+            sub.deinit();
+            self.verdicts = null;
+        }
         self.t.deinit();
         self.st.close();
         self.arena.deinit();

@@ -5489,6 +5489,55 @@ ever wrong. Reading it never required writing it.
 
 **BUILT** the same day in both cores — §10at (TypeScript) and §10au (Zig).
 
+## 10aw. The tombstone/GC soak, driven by the Zig client (2026-08-28)
+
+`libzb/src/soak.zig` (`zb-soak`) + `scripts/soak-check.sh`. Every INTERVAL seconds it
+INSERTs a row and DELETEs it, both as real mutations through `mutate()` — not psql —
+and appends each uid to `soak-uids.txt`. That ledger is what makes an hour-long run
+checkable instead of merely survivable.
+
+**The property, in one sentence: no delete is ever lost.** Afterwards every uid must
+be tombstoned (`deleted_at` set) or reaped (gone). A uid that is present and ALIVE
+means a DELETE was dropped or a row was resurrected — the exact failure the GC
+watermark exists to prevent, and the reason this soak is worth an hour.
+
+    cd libzb && zig build
+    GC_THRESHOLD_MS=60000 GC_INTERVAL_MS=20000 ../zig-out/bin/bridge_sweeper &
+    ZB_SOAK_SECONDS=3600 ZB_SOAK_INTERVAL=30 ./zig-out/bin/zb-soak
+    ../scripts/soak-check.sh soak-uids.txt
+
+Verified end to end on a short run: 4 cycles → 4 inserted, 4 deleted, **8 verdicts**
+(one per mutation), then `tombstoned 4 / alive 0`, and after one sweep
+`reaped 4 / tombstoned 0 / alive 0`.
+
+**Three preconditions, and each fails SILENTLY if missed** — this is the real content
+of this section:
+
+  1. **The write guards must be installed on the table.** `test_types` carried only
+     `zebridge_width_guard` (the standing zbdoctor RED), so a DELETE removed the row
+     PHYSICALLY and left no tombstone at all. Re-running `zebridge_enable` with
+     `tombstone_col` installed `zebridge_soft_delete_t` and the other two. Without
+     this the soak proves nothing about GC — it deletes rows and they are simply gone.
+  2. **`zb_sweeper` must be mapped to the soak's tenant.** It was mapped to `globex`
+     and `acme`, not `kilo`. RLS scopes its DELETEs, so it reaped nothing — while
+     still advancing the watermark, which is what makes this silent: the watermark
+     moving looks exactly like the sweeper working. One row in
+     `zebridge_user_tenants` fixed it, and the same 4 tombstones then reaped on the
+     next pass. zbdoctor reports this as an amber ("UNREAPED — zb_sweeper is not
+     mapped to it") and it was right.
+  3. **`GC_THRESHOLD_MS` must be SHORTER than the soak.** It defaults to one hour, so
+     a one-hour run at the default reaps nothing.
+
+**A bug the soak found immediately**: `SyncClient.deinit()` destroyed the transport
+with the verdict subscription still live, and nats.zig panics on exactly that ("call
+sub.deinit() on every subscription before destroying its connection"). The demo never
+hit it because it never held a subscription across a teardown. Fixed in `deinit`.
+
+**One observation left open**: `zebridge_gc_watermark.reaped` read 0 while four rows
+had just been reaped. The watermark and `swept_at` both advanced, so the sweep itself
+is fine; the counter may be per-pass, or per-tenant, or wrong. Worth a look before
+anyone builds an alert on it.
+
 ## 10av. The Zig write path, built and run (2026-08-28)
 
 `libzb` was read-only — seed and follow CDC, with `Transport.publish` sitting there

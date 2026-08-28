@@ -70,6 +70,23 @@ pub fn build(b: *std.Build) void {
     const demo = b.addExecutable(.{ .name = "zb-demo", .root_module = demo_mod });
     b.installArtifact(demo);
 
+    // The soak: the same client, driven for an hour. Its own binary because it is a
+    // test harness with a ledger, not a demo.
+    const soak_mod = b.createModule(.{
+        .root_source_file = b.path("src/soak.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    soak_mod.addImport("c", c_mod);
+    soak_mod.addImport("nats", nats_dep.module("nats"));
+    soak_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
+    soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+    soak_mod.linkSystemLibrary("sqlite3", .{});
+    soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+    soak_mod.linkSystemLibrary("zstd", .{});
+    soak_mod.link_libc = true;
+    b.installArtifact(b.addExecutable(.{ .name = "zb-soak", .root_module = soak_mod }));
+
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests (ZB_LIVE=1 adds the live transport test)");
