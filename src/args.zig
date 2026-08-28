@@ -130,6 +130,14 @@ pub const Args = struct {
     /// init.minimal.environ.getPosix() replaces the removed std.process.getEnvVarOwned().
     /// Allocates nothing: every string in the returned config is either a compile-time
     /// default or a slice borrowed from argv/environ, both of which outlive the process.
+    /// The value that must follow a flag, or a refusal naming the flag.
+    fn requireValue(it: anytype, flag: []const u8) ![]const u8 {
+        return it.next() orelse {
+            log.err("🔴 {s} requires a value (it was given as the last argument, with nothing after it)", .{flag});
+            return error.InvalidArguments;
+        };
+    }
+
     pub fn parseArgs(init: *const std.process.Init) !struct { args: Args, runtime_config: config.RuntimeConfig } {
         var args_iter = init.minimal.args.iterate();
         _ = args_iter.next(); // skip argv[0] (program name)
@@ -158,6 +166,16 @@ pub const Args = struct {
         // Null means "not given", so TOPOLOGY_PATH can still speak before the default.
         var topology_path: ?[]const u8 = null;
 
+        // ⚠️ A flag whose value is MISSING must fail, not fall back.
+        // `--pub` at the end of the command line used to leave the compiled
+        // default in place — measured: `bridge --slot my_slot --pub` started on
+        // `cdc_pub`. It happened to die here because that publication does not
+        // exist; on a deployment where it does, the bridge would have replicated
+        // the WRONG table set, quietly. `--pub ""` was always caught (the
+        // existence check refuses ''), which is exactly what made the missing
+        // value the dangerous one: it looks like a typo and behaves like a
+        // default.
+
         while (args_iter.next()) |arg| {
             if (std.mem.eql(u8, arg, "--port")) {
                 if (args_iter.next()) |value| {
@@ -167,11 +185,11 @@ pub const Args = struct {
                     };
                 }
             } else if (std.mem.eql(u8, arg, "--slot")) {
-                if (args_iter.next()) |value| slot_name = value;
+                slot_name = try requireValue(&args_iter, "--slot");
             } else if (std.mem.eql(u8, arg, "--pub")) {
-                if (args_iter.next()) |value| publication_name = value;
+                publication_name = try requireValue(&args_iter, "--pub");
             } else if (std.mem.eql(u8, arg, "--top")) {
-                if (args_iter.next()) |value| topology_path = value;
+                topology_path = try requireValue(&args_iter, "--top");
             } else if (std.mem.eql(u8, arg, "--strict-tables")) {
                 strict_tables = true;
             } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {

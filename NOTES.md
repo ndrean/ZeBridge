@@ -5304,6 +5304,38 @@ and the compose stack would collide with the native stack on 5432/4222 anyway.
 That is the next test to run, and the JWT dance in compose is the interesting
 half of it.
 
+## 10ae. A flag with a missing value must fail, not fall back (2026-08-28)
+
+Found while arguing about whether the bridge still needs
+`BRIDGE_CDC_PUBLICATION` at all. The claim under test was "we are covered either
+way, because the bridge refuses an empty --pub". Half true, and the other half
+was the dangerous one:
+
+    bridge --slot my_slot --pub ""     ->  Publication '' not found      (loud ✓)
+    bridge --slot my_slot --pub        ->  Publication name: cdc_pub     (SILENT ✗)
+
+A flag given as the last argument, with nothing after it, left the COMPILED
+DEFAULT in place. It died here only because `cdc_pub` happens not to exist; on a
+deployment where it does — and it is the default name, so it plausibly does —
+the bridge would have started on the WRONG publication and replicated the wrong
+table set, with every check green. The empty string was always caught, which is
+what made the missing value the trap: it looks like a typo and behaves like a
+default. `--slot` and `--top` had the same shape.
+
+Fixed: `requireValue()` refuses, naming the flag. Same argument as
+`unknown argument:` being an error rather than a skip — silently continuing with
+a plausible value is the failure mode this CLI already refused everywhere else.
+
+**On the original question** — does the bridge still need to READ
+`BRIDGE_CDC_PUBLICATION`? The DUPLICATION justification does disappear once
+§10ad lands and the templates stop naming the publication: there is then no
+second definition to drift from, and the convergence guarantee is the boot-time
+existence check, not a shared value. What remains is ergonomics, and both
+channels earn their place: the env var is what lets the bridge boot with NO
+flags from `.env.bridge` alone (systemd `EnvironmentFile`, compose `env_file` —
+both far easier than assembling a command line), while `--pub` overrides it for
+a one-off. CLI wins over env, exactly as `--slot` does.
+
 ## 10ad. The publication should be created BY zebridge_enable — and the recipe
 we wrote two turns ago is incomplete (2026-08-28)
 
