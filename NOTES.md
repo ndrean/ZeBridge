@@ -5588,6 +5588,51 @@ the correct design AND it is for an API that does not exist — `zb_call` expose
 the pure core today. Building it now would be inventing a lifecycle for a client the
 boundary cannot reach. The precondition is recorded; the code waits for the feature.
 
+## 10ba. The ingress accepts arrays and jsonb (2026-08-28)
+
+§10az found that `payloadToString` handled `nil/bool/int/uint/float/str` and answered
+`UnsupportedPayloadType` for everything else, so a client had to hand-build
+PostgreSQL literals for `text[]`, `int[][]` and `jsonb`. It does not any more.
+
+**The design turns on one fact: the value cannot decide its own text form.** The bridge
+binds every parameter as text and lets PostgreSQL parse it with the column's input
+function — and the same msgpack array is `{a,b}` for a `text[]` column and `["a","b"]`
+for a `jsonb` one. Those literals are not interchangeable, so the TARGET TYPE decides:
+
+    ColKind.json     any value, as JSON               {"k":1}   ["a","b"]
+    ColKind.array    a msgpack array, as a literal     {a,b}     {{1,2}}
+    ColKind.scalar   unchanged — an array or map here is still refused, because no
+                     scalar column can parse either
+
+`TableMeta` now carries `col_kinds` parallel to `columns`, read from the catalog with
+everything else (so a DDL epoch change re-reads it). The kind comes from
+`t.typcategory = 'A'` — **PostgreSQL's own answer to "is this an array type"**, which a
+hardcoded OID list would get wrong for every domain and user-defined array — and from
+`typname IN ('json','jsonb')`.
+
+⚠️ Only the DATA binds are typed. The version column and the primary key are scalars by
+definition; routing them through the lookup would buy nothing.
+
+**Where else this could have lived**: the published `pg` descriptor in `$KV.schemas`
+already carries `"type":"text[]"` and `"jsonb"`, so a CLIENT could serialise instead —
+the operator pointed this out. Bridge-side wins on two counts: one implementation
+serves every client (TS, Zig, and the FFI hosts that follow), and the catalog is
+authoritative where a cached descriptor can be stale between a DDL and the client's
+next schema read.
+
+**The escaping is the part that bites**, so it is tested directly. Every array element
+is double-quoted unless it is NULL — not laziness: an unquoted element ends at a comma
+or a brace, so `a,b{c}d` would split into three and leave the literal unbalanced. NULL
+is bare, because quoted it is the four-character string. Six unit tests cover the ugly
+cases (delimiters inside an element, embedded quotes and backslashes, nesting, NULL,
+and the same array rendered both ways), proven to run by breaking one.
+
+    live: tags {soak,"cycle-1,with{braces}"}   matrix {{1,2}}
+          metadata {"cycle": 1, "source": "zb-soak"}
+
+That `tags` value is the point — a comma AND braces inside one element, preserved.
+`scripts/scenarios/mutate.py` still passes, so the scalar LWW path is untouched.
+
 ## 10az. The 10-minute soak at 1 s, all three verbs, wide rows (2026-08-28)
 
 472 cycles, 1,416 mutations — INSERT + UPDATE + DELETE each second — against a sweeper

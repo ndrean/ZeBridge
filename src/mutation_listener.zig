@@ -124,11 +124,125 @@ const VersionType = enum {
     }
 };
 
+/// What a column's TEXT form has to look like, which is not the same question as what
+/// the value is.
+///
+/// The bridge binds every parameter as text and lets PostgreSQL parse it with the
+/// column's own input function — so a msgpack array destined for `text[]` must arrive
+/// as `{a,b}` and the SAME array destined for `jsonb` must arrive as `["a","b"]`.
+/// Those literals are not interchangeable, so the target type decides, and the value
+/// alone cannot.
+const ColKind = enum {
+    scalar,
+    /// json / jsonb: any msgpack value serialises, objects included.
+    json,
+    /// A PostgreSQL array type: `{…}` literal, quoted per element.
+    array,
+};
+
+/// A msgpack payload as JSON, for a json/jsonb column.
+fn writeJsonPayload(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    p: @import("msgpack").Payload,
+) error{OutOfMemory}!void {
+    switch (p) {
+        .nil => try out.appendSlice(alloc, "null"),
+        .bool => |b| try out.appendSlice(alloc, if (b) "true" else "false"),
+        .int => |i| try out.print(alloc, "{d}", .{i}),
+        .uint => |u| try out.print(alloc, "{d}", .{u}),
+        .float => |f| try out.print(alloc, "{d}", .{f}),
+        .str => |v| try writeJsonString(alloc, out, v.value()),
+        .bin => |v| try writeJsonString(alloc, out, v.value()),
+        .arr => |items| {
+            try out.append(alloc, '[');
+            for (items, 0..) |item, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try writeJsonPayload(alloc, out, item);
+            }
+            try out.append(alloc, ']');
+        },
+        .map => |m| {
+            try out.append(alloc, '{');
+            var it = m.map.iterator();
+            var first = true;
+            while (it.next()) |e| {
+                if (e.key_ptr.* != .str) continue; // a non-string key has no JSON form
+                if (!first) try out.append(alloc, ',');
+                first = false;
+                try writeJsonString(alloc, out, e.key_ptr.str.value());
+                try out.append(alloc, ':');
+                try writeJsonPayload(alloc, out, e.value_ptr.*);
+            }
+            try out.append(alloc, '}');
+        },
+        else => try out.appendSlice(alloc, "null"),
+    }
+}
+
+fn writeJsonString(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: []const u8) error{OutOfMemory}!void {
+    try out.append(alloc, '"');
+    for (v) |ch| switch (ch) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        '\n' => try out.appendSlice(alloc, "\\n"),
+        '\r' => try out.appendSlice(alloc, "\\r"),
+        '\t' => try out.appendSlice(alloc, "\\t"),
+        else => if (ch < 0x20) try out.print(alloc, "\\u{x:0>4}", .{ch}) else try out.append(alloc, ch),
+    };
+    try out.append(alloc, '"');
+}
+
+/// A msgpack array as a PostgreSQL array literal: `{a,b}`, nesting as `{{1,2}}`.
+///
+/// ⚠️ Every element is DOUBLE-QUOTED unless it is NULL. That is not laziness — an
+/// unquoted element ends at a comma or a brace, so a string containing `,` `{` `}` `"`
+/// `\` or leading whitespace would silently split into several elements or corrupt the
+/// literal. Quoting always is both correct and shorter than deciding when to.
+fn writeArrayLiteral(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    p: @import("msgpack").Payload,
+) error{OutOfMemory}!void {
+    switch (p) {
+        .arr => |items| {
+            try out.append(alloc, '{');
+            for (items, 0..) |item, i| {
+                if (i > 0) try out.append(alloc, ',');
+                try writeArrayLiteral(alloc, out, item);
+            }
+            try out.append(alloc, '}');
+        },
+        .nil => try out.appendSlice(alloc, "NULL"), // unquoted: quoted is the STRING "NULL"
+        .bool => |b| try out.appendSlice(alloc, if (b) "\"t\"" else "\"f\""),
+        .int => |i| try out.print(alloc, "\"{d}\"", .{i}),
+        .uint => |u| try out.print(alloc, "\"{d}\"", .{u}),
+        .float => |f| try out.print(alloc, "\"{d}\"", .{f}),
+        .str => |v| try writeArrayElement(alloc, out, v.value()),
+        .bin => |v| try writeArrayElement(alloc, out, v.value()),
+        else => try out.appendSlice(alloc, "NULL"),
+    }
+}
+
+fn writeArrayElement(alloc: std.mem.Allocator, out: *std.ArrayList(u8), v: []const u8) error{OutOfMemory}!void {
+    try out.append(alloc, '"');
+    for (v) |ch| switch (ch) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        else => try out.append(alloc, ch),
+    };
+    try out.append(alloc, '"');
+}
+
 const TableMeta = struct {
     /// Primary key columns in key order — the `ON CONFLICT` target.
     pk_cols: [][]const u8,
     /// Every column, so a payload naming something else can be rejected before SQL.
     columns: [][]const u8,
+    /// Parallel to `columns`: how each one's text form must be shaped. Read from the
+    /// catalog with everything else, so it is re-read on a DDL epoch change like the
+    /// rest of this struct.
+    col_kinds: []ColKind,
     /// The column compared for last-write-wins.
     version_col: []const u8,
     /// Optional third `SYNC_RULES` column: where the winning writer's id is stored, so
@@ -150,9 +264,20 @@ const TableMeta = struct {
         allocator.free(self.pk_cols);
         for (self.columns) |col| allocator.free(col);
         allocator.free(self.columns);
+        allocator.free(self.col_kinds);
         allocator.free(self.version_col);
         if (self.client_col) |cc| allocator.free(cc);
         if (self.tombstone_col) |t| allocator.free(t);
+    }
+
+    /// The kind of `name`, or `.scalar` when the column is unknown — an unknown column
+    /// is rejected elsewhere, and guessing `.scalar` here keeps that the single place
+    /// that decides it.
+    fn kindOf(self: *const TableMeta, name: []const u8) ColKind {
+        for (self.columns, 0..) |col, i| {
+            if (std.mem.eql(u8, col, name)) return self.col_kinds[i];
+        }
+        return .scalar;
     }
 
     fn hasColumn(self: *const TableMeta, name: []const u8) bool {
@@ -1057,10 +1182,16 @@ pub const MutationListener = struct {
             \\SELECT a.attname,
             \\       COALESCE(k.ord, 0) AS pk_ord,
             \\       a.atttypid::int AS type_oid,
+            \\       -- `typcategory = 'A'` is PostgreSQL's own answer to "is this an
+            \\       -- array type", which beats a hardcoded OID list that would miss
+            \\       -- every domain and every user-defined array.
+            \\       t.typcategory::text AS type_cat,
+            \\       t.typname::text AS type_name,
             \\       (k.ord IS NOT NULL
             \\        AND pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) IS NOT NULL)
             \\         AS key_from_sequence
             \\FROM pg_attribute a
+            \\JOIN pg_type t ON t.oid = a.atttypid
             \\LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
             \\LEFT JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, ord)
             \\  ON k.attnum = a.attnum
@@ -1101,16 +1232,34 @@ pub const MutationListener = struct {
         // second query; matched by name below, once SYNC_RULES has said which it is.
         var type_oids: std.ArrayList(u32) = .empty;
         defer type_oids.deinit(alloc);
+        var kinds: std.ArrayList(ColKind) = .empty;
+        errdefer kinds.deinit(alloc);
         var key_from_sequence = false;
         var r: usize = 0;
         while (r < rows) : (r += 1) {
+            // ⚠️ Column indices, in the query's own order: 0 attname, 1 pk_ord,
+            // 2 type_oid, 3 type_cat, 4 type_name, 5 key_from_sequence. Adding the two
+            // type columns SHIFTED key_from_sequence from 3 to 5 — read positionally,
+            // so a new column in the middle silently changes what every later index
+            // means.
             const name = std.mem.span(c.PQgetvalue(res, @intCast(r), 0));
             const ord = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, @intCast(r), 1)), 10) catch 0;
             const oid = std.fmt.parseInt(u32, std.mem.span(c.PQgetvalue(res, @intCast(r), 2)), 10) catch 0;
-            if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(r), 3)), "t")) key_from_sequence = true;
+            const cat = std.mem.span(c.PQgetvalue(res, @intCast(r), 3));
+            const tname = std.mem.span(c.PQgetvalue(res, @intCast(r), 4));
+            if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(r), 5)), "t")) key_from_sequence = true;
+
+            const kind: ColKind = if (std.mem.eql(u8, tname, "json") or std.mem.eql(u8, tname, "jsonb"))
+                .json
+            else if (std.mem.eql(u8, cat, "A"))
+                .array
+            else
+                .scalar;
+
             const owned = try alloc.dupe(u8, name);
             try columns.append(alloc, owned);
             try type_oids.append(alloc, oid);
+            try kinds.append(alloc, kind);
             if (ord > 0 and ord <= ordered.len) ordered[ord - 1] = owned;
         }
         for (ordered) |maybe| {
@@ -1147,6 +1296,7 @@ pub const MutationListener = struct {
             .pk_cols = try pk.toOwnedSlice(alloc),
             .columns = try columns.toOwnedSlice(alloc),
             .version_col = try alloc.dupe(u8, version_name),
+            .col_kinds = try kinds.toOwnedSlice(alloc),
             .version_type = version_type,
             .client_col = if (client_name) |cn| try alloc.dupe(u8, cn) else null,
             .tombstone_col = if (tombstone_name) |t| try alloc.dupe(u8, t) else null,
@@ -1497,7 +1647,10 @@ pub const MutationListener = struct {
                 if (std.mem.eql(u8, name, cc)) continue;
             }
             try cols.append(alloc, name);
-            try vals.append(alloc, try self.payloadToString(alloc, entry.value_ptr.*));
+            // Typed: the column decides the text form (ColKind). Only the DATA binds
+            // go through this — the version and the primary key are scalars by
+            // definition, and routing them here would only add a lookup.
+            try vals.append(alloc, try self.payloadToStringTyped(alloc, entry.value_ptr.*, meta.kindOf(name)));
         }
 
         // The version is the bridge's to write, from the message's `version` field —
@@ -1664,7 +1817,10 @@ pub const MutationListener = struct {
                 if (std.mem.eql(u8, name, cc)) continue;
             }
             try cols.append(alloc, name);
-            try vals.append(alloc, try self.payloadToString(alloc, entry.value_ptr.*));
+            // Typed: the column decides the text form (ColKind). Only the DATA binds
+            // go through this — the version and the primary key are scalars by
+            // definition, and routing them here would only add a lookup.
+            try vals.append(alloc, try self.payloadToStringTyped(alloc, entry.value_ptr.*, meta.kindOf(name)));
         }
 
         try cols.append(alloc, meta.version_col);
@@ -2099,6 +2255,52 @@ pub const MutationListener = struct {
         }
     }
 
+    /// A value's text form for a column of `kind` — the typed entry point.
+    ///
+    /// Scalars are unchanged from before. What is new is that a msgpack ARRAY or MAP is
+    /// no longer refused outright: it is rendered the way the target column's input
+    /// function will read it.
+    ///
+    ///   json / jsonb   any value, as JSON            -> {"k":1}   ["a","b"]
+    ///   array          a msgpack array, as a literal -> {a,b}     {{1,2}}
+    ///   scalar         unchanged; an array or map is still UnsupportedPayloadType,
+    ///                  because no scalar column can parse either
+    ///
+    /// ⚠️ The two literals are NOT interchangeable — `{a,b}` is not valid JSON and
+    /// `["a","b"]` is not a valid array literal — which is exactly why this takes the
+    /// column kind and cannot be decided from the value alone.
+    fn payloadToStringTyped(
+        self: *MutationListener,
+        alloc: std.mem.Allocator,
+        payload: @import("msgpack").Payload,
+        kind: ColKind,
+    ) !?[*:0]const u8 {
+        return switch (kind) {
+            .scalar => self.payloadToString(alloc, payload),
+            .json => switch (payload) {
+                .nil => null,
+                else => blk: {
+                    var out: std.ArrayList(u8) = .empty;
+                    defer out.deinit(alloc);
+                    try writeJsonPayload(alloc, &out, payload);
+                    break :blk (try out.toOwnedSliceSentinel(alloc, 0)).ptr;
+                },
+            },
+            .array => switch (payload) {
+                .nil => null,
+                .arr => blk: {
+                    var out: std.ArrayList(u8) = .empty;
+                    defer out.deinit(alloc);
+                    try writeArrayLiteral(alloc, &out, payload);
+                    break :blk (try out.toOwnedSliceSentinel(alloc, 0)).ptr;
+                },
+                // A scalar into an array column: let PostgreSQL judge it rather than
+                // inventing a one-element array the client did not ask for.
+                else => self.payloadToString(alloc, payload),
+            },
+        };
+    }
+
     fn payloadToString(self: *MutationListener, alloc: std.mem.Allocator, payload: @import("msgpack").Payload) !?[*:0]const u8 {
         _ = self;
         switch (payload) {
@@ -2272,3 +2474,99 @@ test "rememberFailure: the column name survives for a NOT NULL violation" {
     try std.testing.expect(std.mem.indexOf(u8, got, "inserted_at") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "secret") == null);
 }
+
+// ─── array / json literal tests ─────────────────────────────────────────────
+//
+// The escaping is where this kind of code goes wrong, so the cases that matter are the
+// ugly ones: an element containing the delimiters, a quote, a backslash, a NULL.
+
+const mp = @import("msgpack");
+
+fn arrLit(a: std.mem.Allocator, p: mp.Payload) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try writeArrayLiteral(a, &out, p);
+    return out.toOwnedSlice(a);
+}
+
+fn jsonLit(a: std.mem.Allocator, p: mp.Payload) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try writeJsonPayload(a, &out, p);
+    return out.toOwnedSlice(a);
+}
+
+test "array literal: scalars are quoted, NULL is not" {
+    const a = std.testing.allocator;
+    var arr = try mp.Payload.arrPayload(3, a);
+    defer arr.free(a);
+    try arr.setArrElement(0, try mp.Payload.strToPayload("soak", a));
+    try arr.setArrElement(1, .{ .int = 42 });
+    try arr.setArrElement(2, .{ .nil = {} });
+    const got = try arrLit(a, arr);
+    defer a.free(got);
+    // NULL bare: quoted, it would be the four-character STRING "NULL".
+    try std.testing.expectEqualStrings("{\"soak\",\"42\",NULL}", got);
+}
+
+test "array literal: an element containing the delimiters survives" {
+    const a = std.testing.allocator;
+    var arr = try mp.Payload.arrPayload(1, a);
+    defer arr.free(a);
+    // Unquoted, this would split into three elements and leave an unbalanced brace.
+    try arr.setArrElement(0, try mp.Payload.strToPayload("a,b{c}d", a));
+    const got = try arrLit(a, arr);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("{\"a,b{c}d\"}", got);
+}
+
+test "array literal: quotes and backslashes are escaped" {
+    const a = std.testing.allocator;
+    var arr = try mp.Payload.arrPayload(1, a);
+    defer arr.free(a);
+    try arr.setArrElement(0, try mp.Payload.strToPayload("he said \"hi\" \\ bye", a));
+    const got = try arrLit(a, arr);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("{\"he said \\\"hi\\\" \\\\ bye\"}", got);
+}
+
+test "array literal: nesting" {
+    const a = std.testing.allocator;
+    var inner = try mp.Payload.arrPayload(2, a);
+    try inner.setArrElement(0, .{ .int = 1 });
+    try inner.setArrElement(1, .{ .int = 2 });
+    var outer = try mp.Payload.arrPayload(1, a);
+    defer outer.free(a);
+    try outer.setArrElement(0, inner);
+    const got = try arrLit(a, outer);
+    defer a.free(got);
+    try std.testing.expectEqualStrings("{{\"1\",\"2\"}}", got);
+}
+
+test "json: an object, with the string escapes jsonb needs" {
+    const a = std.testing.allocator;
+    var m = mp.Payload.mapPayload(a);
+    defer m.free(a);
+    try m.mapPut("cycle", .{ .int = 355 });
+    try m.mapPut("quote", try mp.Payload.strToPayload("say \"hi\"", a));
+    const got = try jsonLit(a, m);
+    defer a.free(got);
+    // Key order follows the map's iteration order, so assert on the pieces.
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"cycle\":355") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\"quote\":\"say \\\"hi\\\"\"") != null);
+    try std.testing.expect(got[0] == '{' and got[got.len - 1] == '}');
+}
+
+test "json: an array is a JSON array, NOT a PG array literal" {
+    const a = std.testing.allocator;
+    var arr = try mp.Payload.arrPayload(2, a);
+    defer arr.free(a);
+    try arr.setArrElement(0, try mp.Payload.strToPayload("a", a));
+    try arr.setArrElement(1, .{ .int = 2 });
+    const got = try jsonLit(a, arr);
+    defer a.free(got);
+    // The whole reason ColKind exists: the same value, two incompatible spellings.
+    try std.testing.expectEqualStrings("[\"a\",2]", got);
+    const as_array = try arrLit(a, arr);
+    defer a.free(as_array);
+    try std.testing.expectEqualStrings("{\"a\",\"2\"}", as_array);
+}
+

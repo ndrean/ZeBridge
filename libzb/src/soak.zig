@@ -133,9 +133,22 @@ pub fn main() !void {
         // and PostgreSQL parses these literals itself. Sending real arrays got every
         // INSERT rejected while the soak still counted a verdict for each, which is
         // exactly the failure a one-cycle smoke test is for.
-        const tags = try std.fmt.allocPrint(aa, "{{soak,cycle-{d}}}", .{cycle});
-        const matrix = try std.fmt.allocPrint(aa, "{{{{{d},{d}}}}}", .{ cycle, cycle * 2 });
-        const meta = try std.fmt.allocPrint(aa, "{{\"cycle\":{d},\"source\":\"zb-soak\"}}", .{cycle});
+        // NATIVE values now — a real array and a real map, no hand-built literals.
+        // The ingress renders each one the way its column's input function reads it
+        // (mutation_listener.zig ColKind), so the client sends what it has.
+        var tags = std.json.Array.init(aa);
+        try tags.append(.{ .string = "soak" });
+        try tags.append(.{ .string = try std.fmt.allocPrint(aa, "cycle-{d},with{{braces}}", .{cycle}) });
+
+        var inner = std.json.Array.init(aa);
+        try inner.append(.{ .integer = @intCast(cycle) });
+        try inner.append(.{ .integer = @intCast(cycle * 2) });
+        var matrix = std.json.Array.init(aa);
+        try matrix.append(.{ .array = inner });
+
+        var meta: std.json.ObjectMap = .empty;
+        try meta.put(aa, "cycle", .{ .integer = @intCast(cycle) });
+        try meta.put(aa, "source", .{ .string = "zb-soak" });
 
         var vals: std.json.ObjectMap = .empty;
         try vals.put(aa, "uid", .{ .string = uid });
@@ -145,9 +158,9 @@ pub fn main() !void {
         try vals.put(aa, "temperature", .{ .float = 36.6 });
         try vals.put(aa, "price", .{ .string = "1234.56789012" }); // numeric(20,8) as text
         try vals.put(aa, "is_true", .{ .bool = cycle % 2 == 0 });
-        try vals.put(aa, "tags", .{ .string = tags });
-        try vals.put(aa, "matrix", .{ .string = matrix });
-        try vals.put(aa, "metadata", .{ .string = meta });
+        try vals.put(aa, "tags", .{ .array = tags });
+        try vals.put(aa, "matrix", .{ .array = matrix });
+        try vals.put(aa, "metadata", .{ .object = meta });
         try vals.put(aa, "inserted_at", .{ .string = now });
         try vals.put(aa, "updated_at", .{ .string = now });
 
