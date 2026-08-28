@@ -22,6 +22,8 @@ We use aggressive delta compression when reseeding, which reduces the need for l
 However, it is _NOT_ designed for very large tables or tables containing large objects; in other words, it moves rows, not files. On one side, NATS/JS forbids large payloads (> 1 MB by default), and on the other, the memory consumption of ZeBridge would explode.
 > Large payloads belong in object storage: database tables should only contain metadata or a reference (e.g., a bucket URL) to the blob.
 
+**Opinionated**: because ZeBridge makes decisions for you that other sync engines leave you to, we have a diagnostic tool to check the conformance of the schemas and setup.
+
 **Configuration**: ZeBridge uses a **fixed-size buffer** with two dimensions: the number of slots and the size per slot. The number of slots reflects the maximum number of rows per transaction and helps buffer potential NATS network jitter. The size per slot corresponds to the payload size of a single row (CDC).
 ➡ Total buffer size is essentially the product of these two numbers. You can set it anywhere from 16MB to 4GB+, depending on the size of the published tables you wish to track, the maximum row size, the maximum rows per transaction, and the CDC emission rate you want to buffer during a possible NATS reconnection (e.g., 100 to 50,000 evt/s).
 
@@ -106,7 +108,15 @@ The writes use three verbs (INSERT, DELETE, UPDATE), resolved via **last-write-w
 
 ## Opinionated
 
-ZeBridge makes choices that a general sync engine usually leaves to you. These choices act as constraints—though mostly mechanical—and that is the point: each one buys a specific guarantee. Here they are, so you can judge the fit before adopting it.
+ZeBridge makes choices that a general sync engine usually leaves to you. These choices act as constraints—though mostly mechanical—and that is the point: each one buys a specific guarantee.
+
+The design choices can be checked against the running setup with a simple diagnostic tool:
+
+```sh
+python3 src/zbdoctor.py
+```
+
+Here they are, so you can judge the fit before adopting it.
 
 **Every consumer is an identity in a tenant.** A consumer connects as a _principal_ — a stable, unique name — that belongs to exactly one tenant. Reads are scoped to that tenant by PostgreSQL RLS; writes are confined to that principal by NATS subject grants. There is _no anonymous consumer_ and no cross-tenant read.
 ➡ Enrollment is the only way in: a JWT minted under a scoped signing key, plus a `zebridge_user_tenants` row — one identity, written once, in two projections.
@@ -150,15 +160,16 @@ The API is small — three verbs and a doorbell:
 * **`mutate(table, key, values)`** — one write, three verbs (insert, update, delete), resolved last-write-wins. This is the only way to change data.
 * **`onChange(table, cb)`** — a doorbell. When the change feed touches a table, re-run your query.
 
-For example, a query:
+For example, a mutation query:
 
 ```sql
-UPDATE (
+UPDATE orders
+SET status = 'Expired';
+WHERE id IN (
     SELECT status 
     FROM orders 
     WHERE order_date < '2023-01-01' AND status = 'Pending'
-)
-SET status = 'Expired';
+);
 ```
 
 becomes:
@@ -184,6 +195,97 @@ That is the whole contract for an app author. The wire format — the NATS subje
 **Getting a consumer connected** is enrollment: the app authenticates to your backend (or the bridge's mint endpoint), receives a JWT credential, and connects. The principal comes back _inside_ the credential — the consumer never types it. The same model works for every consumer type; see [Credentials & trust boundaries](#credentials--trust-boundaries).
 
 **Examples**: [App.tsx](/web-consumer/src/App.tsx) (browser, live), a [Flutter](/flutter) example, and planned Node, Go, Python and Elixir microservices.
+
+## Authentication end-to-end
+
+**Postgres database**: the DBA credentials
+
+```txt
+postgres://<username>:<password>@<127.0.0.1:<port>/<dbname>
+```
+
+**psql access**: use `PGPASSWORD`:
+
+```sh
+PGPASSWORD=my_pwd psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
+```
+
+**DBA creates two USER profils in the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils:
+
+```sh
+# init.core.template.sql
+POSTGRES_BRIDGE_READER=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
+
+# init.write.template.sql
+POSTGRES_BRIDGE_WRITER=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
+```
+
+**ZeBridge uses these USER profils**: the reader USER and writer USER, set in _.env.bridge_, are used by `ZeBridge`.
+
+```txt
+DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
+DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
+```
+
+**DBA creates nkey pair for ZeBridge ↔ NATS**: The DBA generates a keypair. Set the public key in teh NATS config and use the seed as `NATS_NKEY_SEED` (in _.env.bridge_) to run ZeBridge:
+
+```sh
+NATS_NKEY_SEED=SU... ./bridge --pub my_pub --slot my_slot
+```
+
+### The client to NATS dance
+
+A client never gets a password. It gets a **`.creds` file**, which holds two things:
+
+* a **user JWT** — public. It says "this public key is `omar`, tenant `kilo`", and it is signed by the account.
+* a **user seed** — private. The client's own key. It never leaves the device.
+
+Think SSH: the JWT is the certificate, the seed is the private key, the account signing key is the CA.
+
+**Step by step:**
+
+1. **The client makes its own keypair.** `nkeys.createUser()` in the browser, or the equivalent on mobile. It keeps the seed.
+2. **The DBA hands out an invite.** One row in `zebridge_invites`: a code, the principal it will become, and its tenant.
+3. **The client asks the bridge for a JWT.** It sends the invite code and its **public** key only:
+
+   ```txt
+   GET /enroll?code=<invite>&user_pubkey=U...
+   ```
+
+4. **The bridge mints it.** In one transaction it redeems the invite (stamps `used_at`, writes the `principal → tenant` row), then signs a user JWT for that public key with the account signing key (`ZB_SIGNING_SEED`). It answers `{"jwt":"..."}` — nothing else.
+5. **The client assembles the creds file** from the JWT it received and the seed it already had. Browser: `sessionStorage`. Mobile: the keychain. Service: a file or a secret mount.
+6. **It connects.** The server sends a random nonce. The client sends its JWT plus a signature of that nonce made with its seed. The server checks the JWT against the account key it trusts, takes the public key out of the JWT, and verifies the signature. **No secret crosses the wire.**
+7. **It expires.** Minted JWTs live 24 h (`enroll_jwt_ttl_seconds`). After that the client enrolls again.
+
+**Who holds what:**
+
+| who | holds | can |
+| --- | --- | --- |
+| the client | its own seed + its JWT | be itself |
+| ZeBridge | the account signing seed (`ZB_SIGNING_SEED`) | mint JWTs for others |
+| the NATS server | the operator JWT | trust what the account signed |
+
+**Permissions are not in the JWT.** They come from the signing key's role template, which expands `{{name()}}` and `{{tag(tenant)}}` at connect time. That is why the JWT carries `tenant:kilo` as a tag, and why **onboarding a tenant needs no NATS config change**.
+
+**⚠️ In local dev it is simpler — there is no enrollment.** `scripts/native/jwt-bootstrap.sh` pre-mints the fixed principals with `nsc` and writes their creds to disk:
+
+```sh
+scripts/native/creds/{alice,bob,mary,nina,omar,bridge,zbdoctor}.creds
+```
+
+Anything that reads `NATS_CREDS` just points at one:
+
+```sh
+NATS_CREDS=scripts/native/creds/zbdoctor.creds python3 scripts/zbdoctor.py
+NATS_CREDS=scripts/native/creds/omar.creds     python3 scripts/scenarios/mutate.py
+```
+
+Same dance at connect time (step 6 is identical) — only steps 1–4 are replaced by "someone minted it for you ahead of time".
+
+⚠️ **The `/enroll` endpoint is off unless all three are present**: `ZB_SIGNING_SEED` (the account signing seed — the mint authority), `ZB_ACCOUNT_PUB` (the account public key, which goes into every JWT it issues), and `DATABASE_WRITER_URL` (redeeming an invite is a write). Miss one and the bridge starts normally and answers `{"error":"enrollment not configured"}` — check the boot log for `🎟️ enrollment endpoint armed`.
+
+**The even older shape** (`scripts/native/nats-server.conf`, no operator) uses plain user/password for clients and an nkey seed for the bridge. It still works, and it is what `NATS_NKEY_SEED` above is for — but there are no JWTs, no tags, and every principal is written into the server config by hand.
+
 
 ## Architecture & Internals
 
@@ -458,7 +560,7 @@ set -a && source .env.admin && set +a
 
    At boot it reads the catalogue, reconciles the CDC streams, publishes every table's schema, and begins streaming.
 
-7. **Verify the wiring** — `python3 scripts/zbdoctor.py`. One command, one verdict (exit 0 green / 1 red, `--json` for CI). It checks the bridge's own health (`/health`, `/status`), the PostgreSQL posture (the `zebridge_audit_*()` functions, read *through* the catalogue so a declared-public table is not flagged for being unscoped), the NATS topology (CDC streams, KV buckets), and the property that actually matters after boot: that a **fresh client** can resolve its tenant, read every schema, and seed from a chain whose objects are really there. Its last gate delegates to [`scripts/scenarios/check.py`](scripts/scenarios/check.py) for declared-vs-actual drift. Stdlib-only: it runs wherever `psql`, `nats` and python3 do.
+7. **Verify the wiring** — `python3 scripts/zbdoctor.py`. One command, one verdict (exit 0 green / 1 red, `--json` for CI). It checks the bridge's own health (`/health`, `/status`), the PostgreSQL posture (the `zebridge_audit_*()` functions, read _through_ the catalogue so a declared-public table is not flagged for being unscoped), the NATS topology (CDC streams, KV buckets), and the property that actually matters after boot: that a **fresh client** can resolve its tenant, read every schema, and seed from a chain whose objects are really there. Its last gate delegates to [`scripts/scenarios/check.py`](scripts/scenarios/check.py) for declared-vs-actual drift. Stdlib-only: it runs wherever `psql`, `nats` and python3 do.
 
 ### Roles and privileges
 
@@ -1604,5 +1706,5 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 * [ ] **Windows Server for the bridge daemon** — Zig targets `x86_64-windows`, but the daemon has Unix-isms to port first: POSIX signal handling for graceful shutdown (→ `SetConsoleCtrlHandler`) and the `poll()` WAL loop (→ `WSAPoll`), then the scenario suite re-run on Windows. Colocation with NATS is usually Linux, so this is for Windows-only shops. **Separate from the consumer**, which already runs on Windows today — native `libzb.dll` via P/Invoke, or `libzb.js` in a Node/Electron service, no wasm needed.
 * [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite (single owned connection); still to verify for PGlite, and to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.
 * [x] **Retire the snapshot path.** Done end to end (2026-08-27, NOTES §10n–§10p): `libzb` seeds from generation chains only — bounded wait for a chain not yet built, per-stream scoped re-seeding, and a chain-full can never destroy newer data; the producer publishes explicit empty manifests for known tenants; and the bridge-side serve path (snapshot listener, COPY-binary encoder, REQUESTS/`SNAP_RET`, the INIT stream family, `$KV.snapshots`) is deleted. One fewer moving part, and Postgres is never queried per consumer.
-* [x] **A post-boot wiring checker** — `python3 scripts/zbdoctor.py` (add `--json` for CI). Five gates, one verdict: the bridge is alive (`/health`, `/status`), PostgreSQL is wired (the `zebridge_audit_*()` functions read *through* the catalogue, so a declared-public table is not flagged for being unscoped), NATS carries the topology (CDC streams, KV buckets), a fresh client can seed and follow (schemas published, tenants resolvable, every `(tenant, table)` chain present *and* its full object actually fetchable), and no declared-vs-actual drift (delegates to `check.py`). Stdlib-only — it runs on a box with `psql`, `nats` and python3.
-* [ ] Metrics export to StatsD/InfluxDB
+* [x] **A post-boot wiring checker** — `python3 scripts/zbdoctor.py` (add `--json` for CI). Five gates, one verdict: the bridge is alive (`/health`, `/status`), PostgreSQL is wired (the `zebridge_audit_*()` functions read _through_ the catalogue, so a declared-public table is not flagged for being unscoped), NATS carries the topology (CDC streams, KV buckets), a fresh client can seed and follow (schemas published, tenants resolvable, every `(tenant, table)` chain present _and_ its full object actually fetchable), and no declared-vs-actual drift (delegates to `check.py`). Stdlib-only — it runs on a box with `psql`, `nats` and python3.
+* [ ] `bridge_sweeper` on completion?
