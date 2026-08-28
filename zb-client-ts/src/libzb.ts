@@ -1840,6 +1840,30 @@ export class ZeBridge {
       return;
     }
 
+    // ⚠️ The GC watermark gates the FIRST send too, not only replays.
+    //
+    // Publishing straight from here left a hole: the gate lives in `flushOutbox`, so a
+    // write's first send skipped it entirely and only a later replay was ever checked.
+    // Found in the Zig port's first live test — the gate printed its refusal while the
+    // row was already in PostgreSQL — and the same shape was here.
+    //
+    // Normally invisible, because a fresh write is stamped `now` and the watermark is
+    // in the past. It bites exactly where it matters: a lagging clock, or a client
+    // whose queued write is being sent for the first time long after it was made.
+    const wm = await this.gcWatermark();
+    if (outboxWatermarkGate([{ msgId, version: (payload as any)?.version ?? null }], wm).refuse.length) {
+      await this.revertOptimisticWrite(msgId, 'restore');
+      await this.outboxDrop(msgId);
+      this.appendLog(
+        subject,
+        `${table}[${id}] predates the GC watermark (${wm}) and CANNOT be sent: its tombstone ` +
+          `has been reaped, so sending it would resurrect a deleted row (PROTOCOL §MUST 6). ` +
+          `The local copy has been reverted — this edit is lost.`,
+        'ERROR',
+      );
+      return;
+    }
+
     // JetStream publish, not core: the PubAck proves durability (not application —
     // the verdict/echo decide that), and `duplicate: true` is a success.
     try {

@@ -5489,6 +5489,66 @@ ever wrong. Reading it never required writing it.
 
 **BUILT** the same day in both cores — §10at (TypeScript) and §10au (Zig).
 
+## 10av. The Zig write path, built and run (2026-08-28)
+
+`libzb` was read-only — seed and follow CDC, with `Transport.publish` sitting there
+uncalled (§10au). It writes now, and the loop closed against the live stack:
+
+    mutate queued: zig-client-test_types-…-2026-08-28T20:11:53-337899000Z
+    flushed: 1, verdicts settled: 1
+    PG has it: 00000000-…-1111 | written by the zig client
+    outbox left: 0
+
+What was added to `client.zig`: `ensureOutbox` (the same `_zebridge_outbox` shape as
+the TS client), `mutate` (stamp → optimistic apply → queue → send), `flushOutbox`
+(gated), `subscribeVerdicts`/`drainVerdicts`, `gcWatermark`, plus `beforeImage` and
+`revertOptimistic` for the undo. `buildMutation` was already ported, so the envelope
+itself needed nothing.
+
+**Four bugs the live run found that compiling never would.** Recording them because
+each is a shape, not a typo:
+
+  1. **Zig analyses lazily, so an unreferenced `pub fn` is never type-checked.** The
+     whole write path "built" clean while containing three compile errors. They
+     appeared the moment `demo.zig` CALLED it. Same lesson as the Linux-only branches
+     a macOS build switches out (§10ai) — and the fix is the same: reference it from
+     something that runs.
+  2. **`std.time` has no timestamp functions in 0.16** — no `nanoTimestamp`, no
+     `milliTimestamp`. libc is linked, so `std.c.clock_gettime(.REALTIME, …)` is the
+     one that exists, and REALTIME is required: this stamp is compared across machines.
+  3. **The verdict's msg id is in the SUBJECT, not the body**
+     (`mutation_ack.<principal>.<msg_id>`), and the body is **JSON, not msgpack** —
+     CDC and mutations are msgpack, a verdict is not. Reading the body for a `msg_id`
+     silently settled zero verdicts while the row was already in PostgreSQL. The wire
+     statuses are `accepted` / `stale` / `row_deleted` / `rejected` / `failed`, and
+     only the last stays queued. `stale` does not revert: the authoritative row is
+     already on its way over CDC, and restoring a before-image could undo it.
+  4. **A core subscription must be open BEFORE the write.** Subscribing inside
+     `drainVerdicts` meant the verdict had already been published and was gone.
+     `subscribeVerdicts()` is separate now. ⚠️ This bounds what the Zig client
+     promises: verdicts are ALSO stored in MUTATIONS so an offline client can collect
+     them on reconnect, and a core subscription cannot do that. A JetStream consumer
+     filtered to the subject is the durable form — the follow-up.
+
+**And the one that mattered, found by the test rather than by reading.** The watermark
+gate lived in `flushOutbox`, but `mutate` published DIRECTLY — so a write's first send
+skipped the gate and only replays were ever checked. The test printed `flushed: 0`
+beside a row that was already in PostgreSQL. Both clients now send through one path:
+Zig's `mutate` calls `flushOutbox`, and the TS client gates before its immediate
+publish. Verified after the fix: refused, and **0 rows in PostgreSQL**.
+
+⚠️ **The same hole was in `zb-client-ts` the whole time**, written the same day and
+reviewed twice. It is invisible in normal use — a fresh write is stamped `now` and the
+watermark is in the past — so it only bites a lagging clock or a first send made long
+after the write. Ported bugs are found by porting.
+
+**Not verified: the seed path in this environment.** `zb-demo`'s `gapAndSeed` fails
+with `MsgPackError.ArrayTooLarge` on a chain object, and the manifest explains why it
+is not worth chasing here: gen 14, full at gen 11, deltas at gen **9** — older than
+the full. That is a dev store that has accumulated across many sessions at a 20 s
+cadence, not a client defect. `ZB_SKIP_SEED=1` exists so the write path can be
+exercised without it.
+
 ## 10au. The same gate in libzb — and where it stops (2026-08-28)
 
 `outboxWatermarkGate` ported to `libzb/src/core.zig`, dispatched through `zb_call` as
