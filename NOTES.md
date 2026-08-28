@@ -2102,7 +2102,7 @@ msgpack + /enroll fuzz), `race.py` (concurrent writers, poison interleaved with
 legit, leaks under contention). All were RED when they found the bugs — a test
 that cannot fail proves nothing.
 
-  5. **One large transaction wedges the bridge PERMANENTLY** (found 2026-08-26 while
+  1. **One large transaction wedges the bridge PERMANENTLY** (found 2026-08-26 while
      measuring the pgoutput ceiling — by accident, writing a burst as a single `DO`
      block instead of 2000 separate transactions). The WAL loop buffers a whole
      transaction's ring slots and releases them to the publisher only at `.commit`.
@@ -2149,13 +2149,13 @@ that cannot fail proves nothing.
      already committed, and there is no abort to roll back. So when the tracker
      fills, release the buffered slots to the publisher, reset the counter, and keep
      going; ack the LSN only at `.commit`, exactly as now. Then:
-       * the row limit disappears — a transaction of any size streams through,
+       - the row limit disappears — a transaction of any size streams through,
          bounded by the ring buffer and its existing back-pressure;
-       * the deadlock the cap defends against cannot occur, because releasing gives
+       - the deadlock the cap defends against cannot occur, because releasing gives
          the publisher work, so slots keep returning and the EXISTING back-pressure
          wait behaves normally — nothing new is built; `max_tx_rows`, the overflow
          branch and `error.TransactionOverflow` are all DELETED;
-       * a crash mid-transaction publishes a PARTIAL transaction, and the unacked
+       - a crash mid-transaction publishes a PARTIAL transaction, and the unacked
          LSN makes PostgreSQL replay the whole thing on restart. That is safe by the
          same property finding 4 relies on: msg ids are LSN-derived, so JetStream
          dedups inside its window and the client applier is idempotent (LWW upsert +
@@ -2172,7 +2172,7 @@ that cannot fail proves nothing.
      START/STOP/ABORT and a protocol bump for a case incremental release already
      covers.
 
-  6. **Schema generation omits FOREIGN KEYS, so PROTOCOL §4 is unimplementable**
+  2. **Schema generation omits FOREIGN KEYS, so PROTOCOL §4 is unimplementable**
      (found 2026-08-26 while asking whether a split transaction could break FK
      ordering client-side). `pg_constraint` appears ZERO times in the whole Zig
      source: the schema builder assembles `pg`/`sqlite` columns, `pk`,
@@ -3818,6 +3818,7 @@ kill (finding 5's sibling), except here the information needed to refuse it
 locally was already published and thrown away.
 
 **Ordering, by payoff over cost:**
+
   1. ~~NOT NULL~~ — DONE 2026-08-26. `required` now travels in both dialects and
      the client emits it. Verified: the replica refuses locally with `NOT NULL
      constraint failed: orders.user_id`, where before the write applied and came
@@ -3899,6 +3900,7 @@ way index churn is not, which argues for porting FKs once at table creation and
 treating later constraint changes as the rare, costly case they are.
 
 **Order to build it, given the above:**
+
   1. pragma parity in the storage seam (`foreign_keys = ON` in both adapters) —
      needed regardless, and it is what makes the browser and Node agree;
   2. broaden the FK-failure detector to the two messages above, so the applier's
@@ -4111,25 +4113,25 @@ exist. The demo table was there; the metadata that would make it a demo was not.
 
 ### What porting it actually required (all measured, §10d)
 
-  * **`foreign_keys` is per-connection, OFF by default, and our adapters
+- **`foreign_keys` is per-connection, OFF by default, and our adapters
     DISAGREED** — better-sqlite3 turns it on at open, sqlocal never sets it. Port
     FKs and they would be ENFORCED in Node and IGNORED in the browser: the same
     core, the same data, different integrity per consumer. Now part of the storage
     contract, with the line drawn at PERFORMANCE pragmas (an adapter's business)
     versus SEMANTIC ones (the seam's).
-  * **SQLite reports THREE different failures** and only one says what you expect:
+- **SQLite reports THREE different failures** and only one says what you expect:
     `FOREIGN KEY constraint failed` (missing parent ROW), `no such table:
     main.<parent>` (missing parent TABLE — resolution is lazy at DDL, strict at
     DML), and `foreign key mismatch` (parent key is not the PK and has no UNIQUE
     index). The applier matched only the first, so the other two would have been
     classed permanent and DROPPED — the hold/retry would silently have become a
     delete.
-  * **The parent key must be the PK or carry a UNIQUE index**, reproduced both
+- **The parent key must be the PK or carry a UNIQUE index**, reproduced both
     ways. The §10c index port ships unique btree indexes, so most PG unique
     constraints arrive already satisfied — but a parent key unique only under a
     PARTIAL or EXPRESSION index is unique to PostgreSQL and unsatisfiable here, so
     the filter checks for an index we ACTUALLY PORT.
-  * **No `ALTER TABLE ADD CONSTRAINT` in SQLite**, so an FK change forces a table
+- **No `ALTER TABLE ADD CONSTRAINT` in SQLite**, so an FK change forces a table
     rebuild where an index change is a cheap CREATE/DROP.
 
 ### What it EXPOSED: the wire does not order across tables (§10e)
@@ -4269,10 +4271,10 @@ the tenant scoping held (none of acme's rows leaked into kilo's chain).
 
 ### Open
 
-  * the monotonic stamp + per-scope checkpoint (§10f) — designed, not built;
-  * the per-table DATA watermark (§10g) — still wanted for CDC-side safety even
+- the monotonic stamp + per-scope checkpoint (§10f) — designed, not built;
+- the per-table DATA watermark (§10g) — still wanted for CDC-side safety even
     with snapshot replay retired;
-  * bridge-side retirement (snapshot listener, REQUESTS/SNAP_RET, INIT streams) —
+- bridge-side retirement (snapshot listener, REQUESTS/SNAP_RET, INIT streams) —
     deliberately untouched so old consumers and the scenario suite keep working;
     remove once no consumer asks.
 
@@ -4316,9 +4318,9 @@ decode order, decode is commit order (§10f), and the client already persists
 `last_seq` per stream. What is missing is not the stamp but its USE at the
 cutoff:
 
-  * the producer records, per manifest, the CDC stream's last_seq AT BUILD TIME
+- the producer records, per manifest, the CDC stream's last_seq AT BUILD TIME
     (`cutoff_seq`), alongside the existing cutoff_lsn/version;
-  * the client anchors its gate on `msg.seq <= cutoff_seq -> drop` instead of
+- the client anchors its gate on `msg.seq <= cutoff_seq -> drop` instead of
     the lsn comparison.
 
 Correctness: a transaction visible to the snapshot AND published before capture
@@ -4348,13 +4350,14 @@ it was open, fresh replica seeded from that chain — **the row ARRIVED**. Under
 the lsn gate the same shape was silently lost.
 
 ⚠️ Residuals:
-  * the chain path should verify CDC still covers its cutoff_seq (the snapshot
+
+- the chain path should verify CDC still covers its cutoff_seq (the snapshot
     path had `descriptorStillFresh` for exactly this) — a chain whose cutoff_seq
     has aged out of CDC retention is an orphan;
-  * `seedSeq` is anchored in memory only — a durable replica that resumes from
+- `seedSeq` is anchored in memory only — a durable replica that resumes from
     its stored per-stream seq never replays old events, so persistence is not
     needed for correctness today, but re-seeding paths should re-anchor;
-  * observed during verification, PRE-EXISTING and documented: a tombstone-less
+- observed during verification, PRE-EXISTING and documented: a tombstone-less
     table (memo) resurrected a hard-DELETEd row (`trigger-B`) because old chain
     deltas still carry it and the delete event sits below any cutoff — the
     documented weaker guarantee of physical deletes, amplified by chain windows.
@@ -4372,10 +4375,11 @@ review insisted on keeping) had never actually been exercised. Built live:
                            tenant_col => 'tenant_id', dry_run => false);
 
 **The approval doors verified themselves on the way:**
-  * First attempt used `tenant_col` WITHOUT `writable` — zebridge_enable REFUSED
+
+- First attempt used `tenant_col` WITHOUT `writable` — zebridge_enable REFUSED
     it: "would be published unscoped, which zebridge_publication_guard refuses",
     with the three legal options in the error. The migration door works.
-  * After the correct enable, the RUNNING bridge still published the schema from
+- After the correct enable, the RUNNING bridge still published the schema from
     its boot-time catalogue view (tenant_column None, no FK) — the T3 restart
     law, stated by zebridge_enable's own output. After one restart the schema
     carried tenant_column, writable, AND the ported FK; the client's local DDL
@@ -4532,6 +4536,7 @@ same silhouette. The durable client was never durable for DATA — only for its
 bookkeeping, which made every symptom look like a seeding bug.
 
 **Fix (two parts, both in libzb.ts):**
+
   1. Existence comes from the DATABASE: when `syncedTables` misses, read
      `PRAGMA table_info` and reconstruct the existing-table state (columns +
      pk order) from the physical schema. "First sight" now means the table is
@@ -4587,12 +4592,13 @@ SURVIVED. GREEN: position repaired — `Seeded salaries from generation chain g6
 (11 row(s))`, replica == PG.
 
 **Residuals, stated so they are not lost:**
-  * A chain can be newer than the stored position yet still short of the
+
+- A chain can be newer than the stored position yet still short of the
     stream's `first_seq` after aggressive pruning — events between its cutoff
     and `first_seq` are lost with no warning. The chain-orphan check (§10k
     discussion: verify CDC covers the manifest's cutoff_seq at seed time) is
     designed, not built. Retention >= cadence makes it structurally rare.
-  * The retired snapshot path's replay still begins with an ungated
+- The retired snapshot path's replay still begins with an ungated
     `DELETE FROM` — acceptable only because the path is behind
     `LEGACY_SNAPSHOT_SEEDING = false`; delete it rather than gate it.
 
@@ -4720,16 +4726,17 @@ decode integrity (now CDC-only), the generations SQL contract, the write path
 end to end (mutate/tiebreak/poison/invalidate/replies/offline).
 
 **Environmental, not code** — the harness lessons:
-  * zb.py's psql defaults to `docker exec` — the native stack needs
+
+- zb.py's psql defaults to `docker exec` — the native stack needs
     `ZB_PSQL="psql <url>"` exported, or every scenario fails on the OrbStack
     socket while looking like product breakage.
-  * python-consumer/.venv lacked `nkeys`; with NATS_CREDS exported, nats-py
+- python-consumer/.venv lacked `nkeys`; with NATS_CREDS exported, nats-py
     takes its JWT path and imports it. Installed (uv pip).
-  * sizing's test 1 failed only inside the battery: its bridge contended for
+- sizing's test 1 failed only inside the battery: its bridge contended for
     the walsender the just-killed main bridge still held, and stalled before
     the payload check. Solo on a probe slot: all green, including
     EventBufferExceedsMaxPayload firing (direct repro confirmed the guard).
-  * envcheck's port findings are the native-vs-compose declaration mismatch,
+- envcheck's port findings are the native-vs-compose declaration mismatch,
     pre-existing.
 
 **Still red, one class**: objgrants (edits the password conf, not the JWT one),
@@ -5092,7 +5099,8 @@ training start/stop?" is a category error: it is a function call inside a
 build, not a phase the producer occupies.
 
 **The flow, per (tenant, table):**
-  * **At every FULL build** (the existing chain-roll, no new knob): train a
+
+- **At every FULL build** (the existing chain-roll, no new knob): train a
     fresh dictionary from THAT full's own msgpack bytes (split into 2 KiB
     delta-sized samples; skipped when the full is < 16 KiB / < 8 samples —
     dictionaries earn nothing on tiny corpora and ZDICT refuses them). Store
@@ -5100,13 +5108,13 @@ build, not a phase the producer occupies.
     full's `zebridge_generations` row (`dict bytea`). PG is the producer's
     memory — the LAW: deltas built ticks later (across restarts) read the
     dictionary back from HERE, never from NATS.
-  * **At every DELTA build** in that era: read the current full's dictionary
+- **At every DELTA build** in that era: read the current full's dictionary
     from PG, compress the delta WITH it, and record `dict_object` on the
     delta's row + a `"dict":"<name>"` field on the delta's manifest entry.
-  * **Next full**: trains a NEW dictionary from scratch. Nothing carries
+- **Next full**: trains a NEW dictionary from scratch. Nothing carries
     across eras — the full IS the best corpus, and incremental cross-era
     learning is the exact history-state the law forbids.
-  * **Prune**: a dictionary object outlives its full's row — it is deleted
+- **Prune**: a dictionary object outlives its full's row — it is deleted
     only when NO remaining row still references it (`SELECT DISTINCT
     dict_object`). Lifecycle = chain lifecycle, GC'd by the chain window.
 
@@ -5155,7 +5163,7 @@ gate E finds the scenario venv itself and degrades to SKIP, never to red.
 the generations KV, and grants are per-principal by design — a client's own
 creds authenticate happily and then see nothing. Both of the bridge's own auth
 modes are accepted, with the bridge's precedence (creds win): `NATS_CREDS` for
-operator/JWT, or `NATS_NKEY_SEED` for nkey mode. ⚠️ The `nats` CLI takes
+operator/JWT, or `NATS_BRIDGE_NKEY_SEED` for nkey mode. ⚠️ The `nats` CLI takes
 `--nkey` as a FILE, so a seed handed through the environment is written to a
 0600 temp file and unlinked at exit — it must not outlive the process on disk.
 When a seed is used the CLI's `--server` is stripped of any `user:pass@`,
@@ -5167,13 +5175,14 @@ are never confused.
 **The value is in the READING, not the running.** Two of the audit functions
 answer for a deployment shape this one does not use, and a naive wrapper turns
 them into noise the operator learns to ignore:
-  * `zebridge_audit_publications()` reports 'CDC UNSCOPED' for every
+
+- `zebridge_audit_publications()` reports 'CDC UNSCOPED' for every
     tenant-scoped table, because it assumes the publication row filter is the
     boundary. Here the per-tenant STREAM is the boundary (crosstenant.py
     measures exactly that), so 'CDC UNSCOPED' with RLS on is EXPECTED; what is
     never expected is PASS-THROUGH or 'WRITES UNSCOPED' on a tenant-scoped
     table. Catalogue-public tables are exempt BY DECLARATION.
-  * `zebridge_audit_write_guards()` reports every table; guards are only owed
+- `zebridge_audit_write_guards()` reports every table; guards are only owed
     by EDGE-WRITABLE ones, and "writable" means what SECURITY.md says — the
     writer role holds INSERT. An outbound-only table (`users`) legitimately
     declares a version column with no trigger.
@@ -5182,11 +5191,12 @@ them into noise the operator learns to ignore:
 its own least-privilege identity — `bridge_reader` on Postgres (measured: every
 gate passes, no permission degradation) and a dedicated `zbdoctor` NATS user
 minted by jwt-bootstrap.sh. Two things had to be right:
-  * It is signed by the account IDENTITY key, not by a signing key. Both of
+
+- It is signed by the account IDENTITY key, not by a signing key. Both of
     this account's signing keys are ROLE-SCOPED, and a scoped signing key
     REPLACES the user JWT's own permissions — a narrow auditor minted under
     the service key would silently inherit `>` and be able to read everything.
-  * The grant set was narrowed by measurement (remove one, re-run, see what
+- The grant set was narrowed by measurement (remove one, re-run, see what
     goes red), landing at: `$JS.API.INFO`, `STREAM.NAMES`, `STREAM.INFO.>`,
     `DIRECT.GET.>`, and sub `_INBOX.>`.
 
@@ -5217,6 +5227,7 @@ shared dev stack is the operator's call, and the checker's job is to say so.
 
 **Two bugs in the checker itself, both caught by verifying findings against
 ground truth rather than trusting the output** — the discipline §10h named:
+
   1. `active::text` renders `true`/`false`, while a RAW boolean column renders
      `t`/`f` through `psql -tA`. Comparing against one form mis-read the other:
      the tool called a demonstrably streaming slot INACTIVE (six samples said
@@ -5274,14 +5285,15 @@ flag, and `OPEN_TENANT` against grammar.json (check.py exists partly to catch
 that third one).
 
 **The shape now:**
-  * **`.env.bridge`** — the bridge, complete. The role URLs (canonical: the
+
+- **`.env.bridge`** — the bridge, complete. The role URLs (canonical: the
     passwords live here and nowhere else), the publication, the slot, its NATS
     credential. `./zig-out/bin/bridge` with NO FLAGS now boots from this file
     alone — `--pub`/`--slot` became overrides, reading
     `BRIDGE_CDC_PUBLICATION`/`BRIDGE_CDC_SLOT` when absent.
-  * **`.env.admin`** — the DBA's scope only: the superuser connection, the
+- **`.env.admin`** — the DBA's scope only: the superuser connection, the
     target database, the published port. Eight variables, down from twenty-two.
-  * **`.env.docker`** — the compose stack, SELF-CONTAINED by design. It repeats
+- **`.env.docker`** — the compose stack, SELF-CONTAINED by design. It repeats
     values on purpose: every address there is a container name
     (`postgres-primary:5432`), not `127.0.0.1:55432`. One file, so no
     cross-file drift is possible within that deployment either.
@@ -5380,31 +5392,20 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
-## 10ag. TODO: speed.py's drain no longer meets its own deadline (2026-08-28)
+## 10ag. speed.py is not a benchmark on a shared machine — WITHDRAWN (2026-08-28)
 
-Noticed while regression-testing §10ad, and **A/B'd on the spot so it is not
-mistaken for this work's fault**: the same machine, the same load, HEAD's bridge
-against the one built from `174d952` (the commit before the argument and
-publication changes):
+I ran `speed.py` while regression-testing §10ad and reported a drain shortfall
+(777k/2M against a 100s deadline). **That number means nothing and is withdrawn.**
 
-    HEAD       777,284 / 2,000,000 events in the 100s deadline
-    174d952    802,000 / 2,000,000
-    (an earlier HEAD run, with a 393 MB WAL backlog present: 632,492)
+The operator's rule, and it is the right one: `speed.py` is only a measurement on
+the HOST with almost everything closed — no Chrome, no VSCode, no OrbStack —
+because PostgreSQL needs the machine to itself for it. It was run here with Docker,
+a browser and an editor up, so it measured the machine, not the bridge.
 
-Same ballpark, so the shortfall predates all of it — which the diff already said
-(`174d952..HEAD` under `src/` touches args.zig, config.zig and wal_stream.zig, none
-of them in the data path). Recorded so the next person does not re-derive it.
-
-What the probe's own log says: `iters≈87k idle≈630 recv_ms≈7500` — the loop is
-spending SEVEN AND A HALF SECONDS in recv, so the bridge is waiting on PostgreSQL,
-not burning CPU. The deadline is `max(60, total/20_000)`, i.e. it assumes 20k
-events/s; the measured rate is ~7.8k. Whether the expectation drifted from reality
-(machine, PG settings, macOS) or something in the decode path genuinely slowed is
-NOT established — the A/B only rules out these three commits.
-
-Next step when this is picked up: bisect `speed.py` across the zstd/dictionary work
-(§10x) with the same 2M load, and read `iters` at a fixed event count as the README
-says, rather than the pass/fail line.
+Kept only for the one thing that survives: an A/B on the same loaded machine
+(HEAD 777,284 vs `174d952` 802,000) rules out the argument and publication changes
+as a cause of anything, which is all it was ever asked to do. There is no finding
+here. Do not run it as part of a change's regression pass.
 
 ## 10af. pubname.py — the recorded matrix for "named, never defaulted" (2026-08-28)
 
@@ -5414,7 +5415,7 @@ half of the same rule. All green on the native stack.
 **The bridge** (`--port 9097`, each case a fresh process, killed after it speaks):
 
 | # | environment | argv | outcome |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 1a | — | — | `🔴 no replication slot named` — names `--slot` AND `BRIDGE_CDC_SLOT`, and `cdc_slot` appears nowhere |
 | 1b | `BRIDGE_CDC_SLOT` | — | `🔴 no publication named` — same shape, no `cdc_pub` |
 | 2 | — | `--slot s --pub` | `🔴 --pub requires a value` — the missing value never reaches the resolver |
@@ -5446,6 +5447,7 @@ at all — the template checker had been dead since its last commit. It runs aga
 37 CREATE statements survive the render, 26 functions and 4 event triggers apply.
 
 ## 10ad. The publication should be created BY zebridge_enable — and the recipe
+
 we wrote two turns ago is incomplete (2026-08-28)
 
 The argument (user's, and correct): creating an EMPTY publication in init.core is
@@ -5459,10 +5461,10 @@ is gained by hoisting it.
 not used once — it is used to attach THREE internal tables that every consuming
 bridge needs:
 
-  * `zebridge_ddl_events`   (init.core) — the DDL transport. Without it a bridge
+- `zebridge_ddl_events`   (init.core) — the DDL transport. Without it a bridge
     never learns a schema changed.
-  * `zebridge_gc_watermark` (init.core) — the offline-window watermark clients read.
-  * `zebridge_user_tenants` (init.write) — the roster diverted to `$KV.tenants`;
+- `zebridge_gc_watermark` (init.core) — the offline-window watermark clients read.
+- `zebridge_user_tenants` (init.write) — the roster diverted to `$KV.tenants`;
     without it PROTOCOL Step 0 fails for every client of that bridge.
 
 So the multi-publication recipe recorded earlier — `CREATE PUBLICATION pub_x;`
@@ -5508,18 +5510,18 @@ carry and nothing else does (`zebridge_ddl_events`). Both orders end complete:
 Asked and answered from the code, not memory — three layers, and they were
 already mostly there:
 
-  * **Missing publication → FATAL.** `replication_setup.zig` returns
+- **Missing publication → FATAL.** `replication_setup.zig` returns
     `error.PublicationNotFound` with the `CREATE PUBLICATION` hint; the bridge
     refuses to start. Seen live while testing the flagless boot: a wrong
     `BRIDGE_CDC_PUBLICATION` stopped it dead rather than streaming nothing.
-  * **Empty publication → one warning at boot**, and nothing else. That is the
+- **Empty publication → one warning at boot**, and nothing else. That is the
     quietest failure in the system: the bridge finds the publication, verifies
     it, logs `⚠️ Publication 'x' exists but has no tables` once, and then
     delivers nothing forever while /health, /status and every consumer look
     fine. zbdoctor now reports it as RED, keyed off `zebridge_limits` — what
     the RUNNING bridge registered, not what an env file claims. RED/GREEN
     verified with a throwaway empty publication.
-  * **A typo'd publication name cannot create anything.** `zebridge_enable`
+- **A typo'd publication name cannot create anything.** `zebridge_enable`
     only ever runs `ALTER PUBLICATION`, so `publication => 'typo_pub'` fails
     loudly in PostgreSQL. That is the argument for keeping `CREATE PUBLICATION`
     in `init.core` rather than teaching enable to create on demand: creating
