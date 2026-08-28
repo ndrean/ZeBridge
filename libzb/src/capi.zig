@@ -208,4 +208,10 @@ test "smoke: seed gate through the dispatch layer" {
 test {
     _ = @import("storage.zig");
     _ = @import("transport.zig");
+    // ⚠️ client.zig belongs here too. Zig analyses lazily, so leaving it out meant
+    // `zig build test` never TYPE-CHECKED the client at all — the whole write path
+    // compiled clean while containing three errors, and they only surfaced when a
+    // binary called it (NOTES §10av). A module absent from the test graph is a module
+    // nobody is compiling.
+    _ = @import("client.zig");
 }

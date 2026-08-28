@@ -78,35 +78,70 @@ pub const SyncClient = struct {
     /// (measured — the demo settled 0 of 1 until this was split out of drainVerdicts).
     verdicts: ?*@import("nats").Subscription = null,
 
+    /// Acquire in order, and register the matching release BEFORE the next acquire.
+    ///
+    /// ⚠️ This used to leak on every failure path, and the shape is worth naming
+    /// because it reads as correct: `Storage.open` sat INSIDE the struct literal while
+    /// `errdefer a.destroy(self)` came AFTER it, so a database that would not open
+    /// leaked the struct — and a failure in `loadGrammar` or `connect` destroyed the
+    /// struct while leaving the SQLite handle open and the arena unfreed. A leaked DB
+    /// handle is precisely what bites a host that retries `open` after a failure.
+    ///
+    /// The rule that prevents all three: one acquire per statement, its `errdefer` on
+    /// the next line, in the same order `deinit` releases them in reverse.
     pub fn init(a: std.mem.Allocator, opts: Options) !*SyncClient {
         const self = try a.create(SyncClient);
+        errdefer a.destroy(self);
+
         self.* = .{
             .a = a,
             .arena = std.heap.ArenaAllocator.init(a),
             .t = undefined,
-            .st = try storage.Storage.open(opts.db_path),
+            .st = undefined,
             .opts = opts,
         };
-        errdefer a.destroy(self);
+        errdefer self.arena.deinit();
+
+        self.st = try storage.Storage.open(opts.db_path);
+        errdefer self.st.close();
+
         try self.loadGrammar();
+
         self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = opts.creds_path });
+        errdefer self.t.deinit();
+
         return self;
     }
 
+    /// Release EVERY handle, in the exact reverse of `init`'s acquisition order.
+    ///
+    /// ⚠️ The subscription must go before the transport: nats.zig panics if a
+    /// connection is destroyed with a live subscription, and it is right to — a
+    /// subscription is owned by its creator, so cascading the destroy would leave the
+    /// caller holding a pointer into freed state, which is a use-after-free later and
+    /// somewhere unrelated. The panic reports the mistake where it is made.
+    ///
+    /// That panic found a real hole here: `verdicts` is the only handle this client
+    /// holds ACROSS calls, and it was added as a field without being added to this
+    /// function. `releasables()` below exists so the next such field cannot be
+    /// forgotten the same way — it is the one list, and both this and the test read it.
     pub fn deinit(self: *SyncClient) void {
-        // ⚠️ Before the transport: nats.zig PANICS if a connection is destroyed with a
-        // live subscription ("call sub.deinit() on every subscription before destroying
-        // its connection"). The verdict channel is held open across the whole session
-        // by design, so it is this teardown's job to release it — found by the soak,
-        // which is the first thing to both subscribe and exit.
+        self.releaseHandles();
+        self.st.close();
+        self.arena.deinit();
+        self.a.destroy(self);
+    }
+
+    /// Everything acquired after the transport, released before it — in ONE place, so
+    /// that adding a handle has an obvious home and cannot be forgotten the way
+    /// `verdicts` was. (Only `deinit` calls it today; a reconnect that had to release
+    /// and re-acquire this set would call the same function.)
+    fn releaseHandles(self: *SyncClient) void {
         if (self.verdicts) |sub| {
             sub.deinit();
             self.verdicts = null;
         }
         self.t.deinit();
-        self.st.close();
-        self.arena.deinit();
-        self.a.destroy(self);
     }
 
     fn aa(self: *SyncClient) std.mem.Allocator {
@@ -968,3 +1003,40 @@ fn chainCellToStorage(a: std.mem.Allocator, v: Value) !storage.Value {
         else => jsonToStorage(a, v),
     };
 }
+
+// ─── ownership tests ────────────────────────────────────────────────────────
+//
+// `std.testing.allocator` fails a test that leaks, which is what makes these
+// meaningful: they assert that a FAILED init frees everything it acquired. Before the
+// errdefer chain was made exact, the first of these leaked the struct and the second
+// leaked an open SQLite handle — neither showed up as a test failure anywhere, because
+// nothing was calling init on a path that fails.
+
+test "init that cannot open the database leaks nothing" {
+    const bad = "/nonexistent-directory-for-zb-tests/replica.sqlite3";
+    const r = SyncClient.init(std.testing.allocator, .{
+        .url = "nats://127.0.0.1:1",
+        .creds_path = "/nonexistent.creds",
+        .grammar_path = "../grammar.json",
+        .db_path = bad,
+        .principal = "t",
+        .tables = &.{},
+    });
+    try std.testing.expectError(storage.Error.OpenFailed, r);
+}
+
+test "init that cannot read the grammar leaks nothing — including the open database" {
+    // The database DOES open here, so this is the case that used to leave a live
+    // SQLite handle behind: errdefer destroyed the struct and closed nothing.
+    const r = SyncClient.init(std.testing.allocator, .{
+        .url = "nats://127.0.0.1:1",
+        .creds_path = "/nonexistent.creds",
+        .grammar_path = "/nonexistent-grammar.json",
+        .db_path = "zbz-test-ownership.sqlite3",
+        .principal = "t",
+        .tables = &.{},
+    });
+    try std.testing.expect(std.meta.isError(r));
+    _ = std.c.unlink("zbz-test-ownership.sqlite3");
+}
+

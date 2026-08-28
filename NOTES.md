@@ -5489,6 +5489,50 @@ ever wrong. Reading it never required writing it.
 
 **BUILT** the same day in both cores — §10at (TypeScript) and §10au (Zig).
 
+## 10ax. The teardown panic was the symptom; init leaked on every failure path (2026-08-28)
+
+Asked to dig into the `deinit` panic rather than leave it noted. Doing so found that
+the panic was the visible half of a bigger hole, and the invisible half was worse.
+
+**`init` leaked on all three of its failure paths**, and it read as correct:
+
+    const self = try a.create(SyncClient);
+    self.* = .{ …, .st = try storage.Storage.open(opts.db_path), … };  // ← acquire
+    errdefer a.destroy(self);                                          // ← registered AFTER
+    try self.loadGrammar();
+    self.t = try transport.Transport.connect(…);
+
+  * `Storage.open` sits INSIDE the struct literal while its `errdefer` comes after, so
+    a database that will not open leaks the struct.
+  * A failure in `loadGrammar` or `connect` runs `a.destroy(self)` and nothing else —
+    **the SQLite handle stays open and the arena is never freed**. A leaked database
+    handle is exactly what bites a host that retries `open` after a failure.
+
+Fixed by a rule rather than by patching the three cases: **one acquire per statement,
+its `errdefer` on the next line, in the same order `deinit` releases in reverse.**
+`releaseHandles()` now holds the post-transport set in one place, so the next field
+added across calls has an obvious home — which is the thing `verdicts` did not have.
+
+**Two tests that would have caught it**, using `std.testing.allocator`, which fails a
+test that leaks: one init that cannot open the database, one that opens it and then
+fails on the grammar (the case that used to leave the handle live). Proven to run by
+breaking one deliberately — `6 pass, 1 skip, 1 fail`, naming the test.
+
+⚠️ **And the reason none of this was caught: `client.zig` was not in the test graph.**
+`capi.zig`'s test block imported `storage` and `transport` and not `client`, and Zig
+analyses lazily — so `zig build test` never TYPE-CHECKED the client, let alone ran
+anything against it. That is the same lazy-analysis trap as §10av's three compile
+errors, in a second disguise: a module absent from the test graph is a module nobody
+is compiling. It is imported now.
+
+**Not built, deliberately: the handle table.** Making `close` idempotent cannot be done
+with a flag inside the struct, because after `destroy` the second call is already
+reading freed memory. The real answer at a C ABI is an opaque handle the host holds,
+looked up in a table that `close` nulls, so a double close is a lookup miss. That is
+the correct design AND it is for an API that does not exist — `zb_call` exposes only
+the pure core today. Building it now would be inventing a lifecycle for a client the
+boundary cannot reach. The precondition is recorded; the code waits for the feature.
+
 ## 10aw. The tombstone/GC soak, driven by the Zig client (2026-08-28)
 
 `libzb/src/soak.zig` (`zb-soak`) + `scripts/soak-check.sh`. Every INTERVAL seconds it
