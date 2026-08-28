@@ -65,6 +65,21 @@ const DURABLE = ['1', 'true'].includes((import.meta.env.VITE_DURABLE as string |
 /// authoritative.
 const INVITE = _qs.get('invite');
 
+/// Which credential the BROKER will accept — not a preference, a property of the
+/// stack you are pointed at, and the client cannot infer it.
+///
+///   'creds'    (default) operator/JWT: fetch /creds/<principal>.creds, or enrol
+///   'password' the pre-operator world: principal + password from the conf
+///
+/// ⚠️ Why this has to be explicit. `public/creds` is a symlink to
+/// `scripts/native/creds`, so the fetch SUCCEEDS (200, a real JWT) no matter which
+/// stack is running — and the code then chose JWT auth. Against the compose broker,
+/// which is `authorization { users: … }` with no operator and no resolver, that JWT
+/// is refused with `Authorization Violation` while `alice`/`s3cret` sitting right
+/// there would have connected. Measured 2026-08-28. The reachable file was never the
+/// question; the broker's opinion of it was.
+const AUTH = _qs.get('auth') ?? (import.meta.env.VITE_AUTH as string | undefined) ?? 'creds';
+
 /// The button's half of enrollment: generate a pair, send code + PUBLIC key,
 /// stash the assembled creds in sessionStorage (demo-tier storage — per tab,
 /// gone with it) and reload clean. Returns an error string instead of reloading
@@ -86,6 +101,10 @@ async function enroll(code: string): Promise<string | undefined> {
 }
 
 const CREDS = await (async () => {
+  // Password mode short-circuits BEFORE anything else, including a stashed JWT: a
+  // credential the broker cannot validate is worse than no credential, because the
+  // failure arrives as an authorization error rather than a missing file.
+  if (AUTH === 'password') return undefined;
   const stashed = sessionStorage.getItem('zb_creds');
   if (stashed) return stashed;
   if (INVITE) {

@@ -5392,6 +5392,50 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10am. "The browser cannot reach the creds" — it reached them fine (2026-08-28)
+
+The file was never the problem, and checking beat assuming twice over. What I
+expected — `public/creds` is a symlink to `scripts/native/creds`, outside the Vite
+root, so `server.fs` blocks it — was **wrong**. Vite serves it:
+
+    GET /creds/alice.creds  ->  200  -----BEGIN NATS USER JWT-----
+
+Three separate things were behind the report.
+
+**1. The dev server under test was gone.** The failing URL was `:5174`; by the time
+I looked, only `:5173` remained (and it answers `/creds/alice.creds` with 200).
+Worth noting for its own sake: those servers bind `[::1]` ONLY, so a probe at
+`127.0.0.1:5173` returns nothing while `localhost:5173` works — an IPv6/IPv4 trap
+that looks exactly like a dead server.
+
+**2. The real defect: a reachable credential the broker will not accept.** Because
+the symlinked fetch succeeds against ANY stack, the client chose JWT auth even
+against compose. Measured, both directions, same broker:
+
+    alice.creds   ->  Authorization Violation
+    alice/s3cret  ->  connected
+
+The compose broker is `authorization { users: … }` — no operator, no resolver — so
+that JWT has nothing to validate it, while the password sitting in the same config
+would have worked. The client cannot infer which world it is in, so it is declared:
+`VITE_AUTH=creds|password` (or `?auth=password`), and password mode short-circuits
+BEFORE the fetch and before a stashed JWT — a credential the broker cannot validate
+is worse than none, because the failure arrives as an authorization error instead of
+a missing file. Confirmed in the built bundle:
+`io = $a.get("auth") ?? "password" ?? "creds"`.
+
+**3. A regression I had introduced.** Making the edge's `/` the websocket meant
+every ordinary path was proxied into nats-server's websocket endpoint and answered
+`400 Bad Request` — including `/creds/alice.creds`, which reads as "the file is
+missing" and is nothing of the kind. The root is upgrade-aware now: websocket on an
+`Upgrade` header, an explanatory 404 otherwise.
+
+⚠️ And an nginx rule worth keeping: **`proxy_pass` cannot carry a URI part inside a
+named location.** `proxy_pass http://nats-server:8080/;` in `location @nats_ws`
+crash-looped the container with `[emerg] "proxy_pass" cannot have URI part in
+location given by regular expression, or inside named location`. Drop the trailing
+slash; an upgrade arrives there with the URI already `/`.
+
 ## 10al. The monitoring trio was published on every interface (2026-08-28)
 
 Spotted by the operator while I was arguing about `BRIDGE_BIND`: Prometheus (9091),
