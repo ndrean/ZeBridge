@@ -26,7 +26,7 @@ Usage:  python scripts/scenarios/render.py
 Needs `envsubst` (gettext) and the variables `init.{core,write}.template.sql` interpolates — source
 `.env.admin` first:
 
-    set -a && . ./.env.admin && set +a
+    set -a && . ./.env.admin && . ./.env.bridge && set +a && eval "$(python3 scripts/zb-derive-env.py)"
 """
 
 import os
@@ -89,7 +89,7 @@ async def main():
         sys.exit(
             f"unset: {', '.join(missing)}\n"
             "  envsubst replaces these with the empty string, which renders as valid SQL.\n"
-            "  set -a && . ./.env.admin && set +a"
+            "  set -a && . ./.env.admin && . ./.env.bridge && set +a && eval "$(python3 scripts/zb-derive-env.py)""
         )
     zb.ok(f"all {len(REQUIRED_VARS)} interpolated variables are set")
 
