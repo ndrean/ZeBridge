@@ -5588,6 +5588,50 @@ the correct design AND it is for an API that does not exist — `zb_call` expose
 the pure core today. Building it now would be inventing a lifecycle for a client the
 boundary cannot reach. The precondition is recorded; the code waits for the feature.
 
+## 10az. The 10-minute soak at 1 s, all three verbs, wide rows (2026-08-28)
+
+472 cycles, 1,416 mutations — INSERT + UPDATE + DELETE each second — against a sweeper
+at `GC_THRESHOLD_MS=GC_INTERVAL_MS=180000`. **Zero failures.**
+
+    ledger 472   still_present 132   tombstoned 132   alive_BAD 0   reaped 340
+    ✓ no delete was lost: every uid is tombstoned or reaped
+
+The split is the expected shape: rows deleted more than three minutes before the last
+sweep are gone, the last three minutes' worth are still tombstoned, and **not one row
+was left alive** — which is the whole property. All 132 survivors read
+`some_text='soak-updated'`, so every UPDATE landed too, not just the bookends.
+
+**Three real defects found by tightening the loop**, none of which the 30 s version
+would have reached:
+
+  1. **The ingress accepts SCALARS ONLY.** `payloadToString` handles
+     nil/bool/int/uint/float/str and answers `UnsupportedPayloadType` for anything
+     else, so `text[]`, `int[][]` and `jsonb` must be sent as their PostgreSQL TEXT
+     form. Sending real msgpack arrays got every INSERT rejected — while the soak
+     still counted a verdict for each, which is why a one-cycle smoke test that reads
+     PostgreSQL back is worth more than a counter.
+
+     ⚠️ Worth being exact, because `test_types` exists to carry awkward types and IS
+     mutated from the browser: web-consumer sends only its SCALARS
+     (`uid, some_text, age, is_true, tenant_id, updated_at, inserted_at`). The exotic
+     columns had been exercised INBOUND only (PG → bridge → client, `decode_integrity`).
+     Nothing had ever sent them OUTBOUND. Verified afterwards on a survivor:
+     `{soak,cycle-355}`, `{{355,710}}`, `{"cycle": 355, …}`, `1234.56789012`, `36.6`.
+
+  2. **A partial UPDATE payload fails the LOCAL apply.** The optimistic apply is an
+     upsert, so SQLite evaluates the INSERT arm first and a payload missing a NOT NULL
+     column violates it before the conflict is ever resolved — PROTOCOL §7's asymmetry,
+     which is exactly why the wire carries full rows. It surfaced as a bare
+     `StepFailed`; `applyOptimistic` now carries SQLite's own message out with it.
+
+  3. **A failed optimistic apply means the mutation is never published at all** — the
+     apply precedes the outbox write. Correct (do not send what you could not apply),
+     but it made the failure quiet: `upd=N` counted attempts while nothing reached the
+     wire. Reading PostgreSQL is what caught it.
+
+**And the `reaped` counter question from §10aw is answered**: per-pass, not cumulative.
+142 on the last pass against 340 reaped overall.
+
 ## 10aw. The tombstone/GC soak, driven by the Zig client (2026-08-28)
 
 `libzb/src/soak.zig` (`zb-soak`) + `scripts/soak-check.sh`. Every INTERVAL seconds it
@@ -5681,10 +5725,11 @@ released in one exhaustive, idempotent place. That is a precondition on exposing
 is what a library owes a host when the failure mode on the other side is a dead
 process rather than a stack trace.
 
-**One observation left open**: `zebridge_gc_watermark.reaped` read 0 while four rows
-had just been reaped. The watermark and `swept_at` both advanced, so the sweep itself
-is fine; the counter may be per-pass, or per-tenant, or wrong. Worth a look before
-anyone builds an alert on it.
+**The `reaped` counter, resolved by the long run (§10az)**: it is PER-PASS, not
+cumulative. It read 0 after the short soak because that pass reaped nothing (the
+sweeper was not yet mapped to the tenant), and it read 142 after the long one —
+matching the last pass exactly, not the 340 total. Fine for "did the last sweep do
+anything"; wrong for any alert phrased as a total.
 
 ## 10av. The Zig write path, built and run (2026-08-28)
 

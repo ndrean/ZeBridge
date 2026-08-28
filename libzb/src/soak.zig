@@ -59,6 +59,7 @@ pub fn main() !void {
     const seconds = env("ZB_SOAK_SECONDS", 3600);
     const interval = env("ZB_SOAK_INTERVAL", 30);
     const table = if (std.c.getenv("ZB_SOAK_TABLE")) |t| std.mem.span(t) else "test_types";
+    const verdict_ms = env("ZB_SOAK_VERDICT_MS", 800);
 
     // One replica for the whole run: the outbox has to survive between cycles, which
     // is half of what is being soaked.
@@ -94,6 +95,7 @@ pub fn main() !void {
     const deadline = @as(i64, ts.sec) + @as(i64, @intCast(seconds));
     var cycle: u64 = 0;
     var inserted: u64 = 0;
+    var updated: u64 = 0;
     var deleted: u64 = 0;
     var settled: usize = 0;
 
@@ -115,10 +117,37 @@ pub fn main() !void {
         var key: std.json.ObjectMap = .empty;
         try key.put(aa, "uid", .{ .string = uid });
 
+        // A WIDE row on purpose, and the distinction is worth being exact about.
+        // `test_types` exists to carry the awkward types and IS mutated from the
+        // browser — but only its scalars: web-consumer sends
+        // `uid, some_text, age, is_true, tenant_id, updated_at, inserted_at`. The
+        // exotic columns were exercised INBOUND only (PG -> bridge -> client, which
+        // decode_integrity.py covers). Nothing had ever sent `text[]`, `int[][]`,
+        // `jsonb`, `numeric` or `double precision` OUTBOUND, which is why the first
+        // wide row here was rejected by an ingress nobody had pushed on.
+        //
+        // ⚠️ Arrays and jsonb go as their POSTGRESQL TEXT form, not as msgpack arrays
+        // or maps. The ingress accepts scalars only — `payloadToString` handles
+        // nil/bool/int/uint/float/str and answers `UnsupportedPayloadType` for
+        // anything else — because a mutation is applied as a parameterised statement
+        // and PostgreSQL parses these literals itself. Sending real arrays got every
+        // INSERT rejected while the soak still counted a verdict for each, which is
+        // exactly the failure a one-cycle smoke test is for.
+        const tags = try std.fmt.allocPrint(aa, "{{soak,cycle-{d}}}", .{cycle});
+        const matrix = try std.fmt.allocPrint(aa, "{{{{{d},{d}}}}}", .{ cycle, cycle * 2 });
+        const meta = try std.fmt.allocPrint(aa, "{{\"cycle\":{d},\"source\":\"zb-soak\"}}", .{cycle});
+
         var vals: std.json.ObjectMap = .empty;
         try vals.put(aa, "uid", .{ .string = uid });
         try vals.put(aa, "tenant_id", .{ .string = "kilo" });
         try vals.put(aa, "some_text", .{ .string = "soak" });
+        try vals.put(aa, "age", .{ .integer = @intCast(cycle % 120) });
+        try vals.put(aa, "temperature", .{ .float = 36.6 });
+        try vals.put(aa, "price", .{ .string = "1234.56789012" }); // numeric(20,8) as text
+        try vals.put(aa, "is_true", .{ .bool = cycle % 2 == 0 });
+        try vals.put(aa, "tags", .{ .string = tags });
+        try vals.put(aa, "matrix", .{ .string = matrix });
+        try vals.put(aa, "metadata", .{ .string = meta });
         try vals.put(aa, "inserted_at", .{ .string = now });
         try vals.put(aa, "updated_at", .{ .string = now });
 
@@ -127,6 +156,26 @@ pub fn main() !void {
             continue;
         };
         inserted += 1;
+
+        // UPDATE between the two: a different plan from INSERT (a partial payload on
+        // an existing row) and a second version stamp, so LWW has something to order.
+        // The version must move or the bridge is right to call the write stale.
+        // ⚠️ A FULL row, not just the changed fields. The local apply is an upsert, so
+        // SQLite evaluates the INSERT arm and a payload missing a NOT NULL column
+        // fails before the conflict is resolved — PROTOCOL §7's asymmetry, which is
+        // why full rows are the rule. Measured: a four-field UPDATE failed with a bare
+        // `StepFailed` and never reached the wire at all.
+        const later = try nowIso(aa);
+        var upd: std.json.ObjectMap = .empty;
+        var vit = vals.iterator();
+        while (vit.next()) |e| try upd.put(aa, e.key_ptr.*, e.value_ptr.*);
+        try upd.put(aa, "some_text", .{ .string = "soak-updated" });
+        try upd.put(aa, "age", .{ .integer = @intCast((cycle % 120) + 1) });
+        try upd.put(aa, "updated_at", .{ .string = later });
+        _ = c.mutate(table, "UPDATE", .{ .object = key }, .{ .object = upd }) catch |err| {
+            std.debug.print("cycle {d}: UPDATE failed: {any}\n", .{ cycle, err });
+        };
+        updated += 1;
 
         // The DELETE is a separate mutation, as a client would send it — the tombstone
         // is written by the guard in PostgreSQL, not by us.
@@ -139,10 +188,14 @@ pub fn main() !void {
         const line = try std.fmt.allocPrint(aa, "{s}\n", .{uid});
         _ = std.c.write(ledger, line.ptr, line.len);
 
-        settled += c.drainVerdicts(3000) catch 0;
+        // ⚠️ The budget only applies when NOTHING has arrived yet, but at a 1s cycle
+        // even that dominates the loop — a 3s wait per cycle makes the interval a lie.
+        // Locally a verdict lands in ~100ms; ZB_SOAK_VERDICT_MS raises it if a slower
+        // deployment needs to.
+        settled += c.drainVerdicts(verdict_ms) catch 0;
         if (cycle % 10 == 0 or cycle == 1) {
-            std.debug.print("  cycle {d}: inserted={d} deleted={d} verdicts={d} watermark={s}\n",
-                .{ cycle, inserted, deleted, settled, c.gcWatermark(aa) orelse "(none)" });
+            std.debug.print("  cycle {d}: ins={d} upd={d} del={d} verdicts={d} watermark={s}\n",
+                .{ cycle, inserted, updated, deleted, settled, c.gcWatermark(aa) orelse "(none)" });
         }
 
         // ⚠️ No std.c.sleep and no std.time.sleep in 0.16 — nanosleep is the one
@@ -152,9 +205,9 @@ pub fn main() !void {
     }
 
     // A final pass: verdicts for the last cycle, and whatever the outbox still holds.
-    settled += c.drainVerdicts(5000) catch 0;
+    settled += c.drainVerdicts(5000) catch 0; // a generous last pass
     var fa = std.heap.ArenaAllocator.init(a);
     defer fa.deinit();
-    std.debug.print("zb-soak done: cycles={d} inserted={d} deleted={d} verdicts={d} watermark={s}\n",
-        .{ cycle, inserted, deleted, settled, c.gcWatermark(fa.allocator()) orelse "(none)" });
+    std.debug.print("zb-soak done: cycles={d} ins={d} upd={d} del={d} verdicts={d} watermark={s}\n",
+        .{ cycle, inserted, updated, deleted, settled, c.gcWatermark(fa.allocator()) orelse "(none)" });
 }

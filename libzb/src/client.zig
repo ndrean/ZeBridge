@@ -750,6 +750,14 @@ pub const SyncClient = struct {
     }
 
     /// Apply this client's own edit locally, before the server has seen it.
+    ///
+    /// ⚠️ A partial payload fails here, and the message must say so. The local apply is
+    /// an UPSERT, so SQLite evaluates the INSERT arm first — a payload missing a
+    /// `NOT NULL` column violates it before the conflict is ever resolved, and the
+    /// error is a bare `StepFailed` unless the SQLite text is carried out with it.
+    /// This is PROTOCOL §7's asymmetry exactly: a partial payload succeeds on the
+    /// update path and fails on the insert path, which is why the wire carries FULL
+    /// rows.
     fn applyOptimistic(self: *SyncClient, table: []const u8, st: TableState, ev: Value) !void {
         var ta = std.heap.ArenaAllocator.init(self.a);
         defer ta.deinit();
@@ -761,7 +769,13 @@ pub const SyncClient = struct {
             return;
         }
         const up = try core.planUpsert(taa, table, st.pk, data);
-        _ = try self.stepExec(taa, up);
+        _ = self.stepExec(taa, up) catch |err| {
+            std.debug.print(
+                "optimistic apply of {s} failed: {any} — sqlite: {s}\n",
+                .{ table, err, self.st.errMsg() },
+            );
+            return err;
+        };
     }
 
     /// Undo an optimistic apply from the stored before-image: restore it if there was
