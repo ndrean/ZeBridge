@@ -5513,11 +5513,22 @@ Verified end to end on a short run: 4 cycles → 4 inserted, 4 deleted, **8 verd
 **Three preconditions, and each fails SILENTLY if missed** — this is the real content
 of this section:
 
-  1. **The write guards must be installed on the table.** `test_types` carried only
-     `zebridge_width_guard` (the standing zbdoctor RED), so a DELETE removed the row
-     PHYSICALLY and left no tombstone at all. Re-running `zebridge_enable` with
-     `tombstone_col` installed `zebridge_soft_delete_t` and the other two. Without
-     this the soak proves nothing about GC — it deletes rows and they are simply gone.
+  1. **The write guards must be installed on the table** — and on the native database
+     they were not: `test_types` carried only `zebridge_width_guard`, so a DELETE
+     removed the row PHYSICALLY and left no tombstone to reap.
+
+     ⚠️ **This is NOT a defect in the migrations, and saying so was my error.**
+     Checked afterwards on a fresh database: `20260810120000` + `20260810130000` alone
+     produce all four triggers (`zebridge_bump_version_t`, `zebridge_guard_tenant_t`,
+     `zebridge_soft_delete_t`, `zebridge_width_guard`) — the second migration's
+     `zebridge_enable(..., tombstone_col => 'deleted_at', writable => true, …)` does
+     exactly what it claims. The NATIVE database has **no `schema_migrations` table at
+     all**: those migrations never ran there. Its `test_types` came from somewhere else
+     and drifted, and `zebridge_enable` re-run by hand is what repaired it.
+
+     The lesson is about the environment, not the code: a long-lived dev database is
+     not what the migrations would build today, and zbdoctor comparing DECLARED against
+     ACTUAL is the thing that notices.
   2. **`zb_sweeper` must be mapped to the soak's tenant.** It was mapped to `globex`
      and `acme`, not `kilo`. RLS scopes its DELETEs, so it reaped nothing — while
      still advancing the watermark, which is what makes this silent: the watermark
