@@ -988,8 +988,30 @@ pub const MutationListener = struct {
     /// publish a fabricated schema, suspension or tombstone to **every** client. The SQL
     /// helper refuses to grant on it, and this refuses again — a privilege check and a
     /// name check fail in different ways, and this one costs nothing.
+    ///
+    /// ⚠️ `zebridge_gc_watermark` was NOT on this list, and that was exploitable. Proven
+    /// 2026-08-28 against the compose stack: `alice`, an ordinary principal whose only
+    /// publish grant is `mutation.alice.>`, sent one envelope to
+    /// `mutation.alice.zebridge_gc_watermark.update` and PostgreSQL changed —
+    ///
+    ///     watermark     2026-08-28  ->  2020-01-01
+    ///     threshold_ms  0           ->  999999999
+    ///     ✅ mutation applied [alice] on 'zebridge_gc_watermark' (1 row)
+    ///
+    /// Nothing else stood in the way: the table is in `zebridge_catalogue` (so the
+    /// listener resolves its identifiers), and `bridge_writer` holds UPDATE on it
+    /// BECAUSE THE SWEEPER NEEDS IT — that grant cannot be revoked, which is exactly why
+    /// the name check has to exist. The watermark bounds the offline window for every
+    /// client, so moving it is a global act by one principal.
+    ///
+    /// `zebridge_user_tenants` is the principal→tenant roster: a forged row is
+    /// cross-tenant privilege escalation. It was reachable only by accident — it is not
+    /// in the catalogue, so the listener fails to resolve it — and an accident is not a
+    /// control.
     fn isForbiddenTable(table: []const u8) bool {
         return std.mem.eql(u8, table, "zebridge_ddl_events") or
+            std.mem.eql(u8, table, "zebridge_gc_watermark") or
+            std.mem.eql(u8, table, "zebridge_user_tenants") or
             std.mem.eql(u8, table, "schema_migrations");
     }
 

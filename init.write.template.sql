@@ -90,9 +90,25 @@ RETURNS void AS $$
 DECLARE
     tbl_name text := tbl::text;
 BEGIN
-    IF tbl_name IN ('zebridge_ddl_events', 'public.zebridge_ddl_events') THEN
-        RAISE EXCEPTION 'refusing to grant edge writes on %: forging rows here would '
-                        'let a client publish a fabricated schema to every client', tbl_name;
+    -- ⚠️ All THREE bridge-owned tables, not just the DDL transport. Each is a
+    -- different escalation, and the second one was proven exploitable on 2026-08-28
+    -- (NOTES §10aq) before the ingress path learned to refuse it by name:
+    --
+    --   zebridge_ddl_events    a forged row publishes a fabricated schema, suspension
+    --                          or tombstone to EVERY client
+    --   zebridge_gc_watermark  the offline window for every client — one principal
+    --                          dragged it back six years with a single mutation
+    --   zebridge_user_tenants  the principal->tenant roster: a forged row is
+    --                          cross-tenant privilege escalation
+    --
+    -- This does not revoke what the BRIDGE itself needs (the sweeper writes the
+    -- watermark as bridge_writer, and must keep that grant). It refuses to hand those
+    -- tables to the EDGE, which is a different question and the one that was wrong.
+    IF tbl_name IN ('zebridge_ddl_events',   'public.zebridge_ddl_events',
+                    'zebridge_gc_watermark', 'public.zebridge_gc_watermark',
+                    'zebridge_user_tenants', 'public.zebridge_user_tenants') THEN
+        RAISE EXCEPTION 'refusing to grant edge writes on %: this is a bridge-owned '
+                        'table — a forged row here reaches every client', tbl_name;
     END IF;
 
     -- DELETE as well as SELECT/INSERT/UPDATE, for two paths that both need it:

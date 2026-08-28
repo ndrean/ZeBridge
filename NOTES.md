@@ -5370,7 +5370,18 @@ flags from `.env.bridge` alone (systemd `EnvironmentFile`, compose `env_file` �
 both far easier than assembling a command line), while `--pub` overrides it for
 a one-off. CLI wins over env, exactly as `--slot` does.
 
-## 10ah. TODO: zbdoctor's version-trigger rule misfires on bridge-owned tables (2026-08-28)
+## 10ah. zbdoctor's gc_watermark finding was REAL — see §10aq (2026-08-28)
+
+⚠️ SUPERSEDED. This section wrote the finding below off as "correct and irrelevant".
+That verdict was WRONG: the table was genuinely edge-writable, and one ordinary
+principal rewrote it. The exploit, the fix and the proof are in §10aq. The text
+below is kept as written so the mistake is legible — I reasoned from "the rule looks
+like a false positive" instead of testing whether the write actually went through,
+and it did.
+
+---
+
+## 10ah (original). TODO: zbdoctor's version-trigger rule misfires on bridge-owned tables (2026-08-28)
 
 Seen on the post-§10ad health run:
 
@@ -5391,6 +5402,58 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 (they are already special-cased by name in `zebridge_publication_guard` and in the
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
+
+## 10aq. The GC watermark was writable from the edge — a real hole zbdoctor caught (2026-08-28)
+
+zbdoctor flagged `zebridge_gc_watermark` as edge-writable-without-a-version-guard. In
+§10ah I dismissed it: `bridge_writer` holds UPDATE only because the sweeper needs it,
+`version_col` is a catalogue default, so the rule "looks like" a false positive. **I
+was wrong, and the difference was one test I did not run — does the write actually
+apply?** It does.
+
+**The exploit.** `alice`, an ordinary principal whose only publish grant is
+`mutation.alice.>`, against the live compose stack:
+
+    publish mutation.alice.zebridge_gc_watermark.update  { version, key:{id:1}, data:{…} }
+
+    watermark     2026-08-28  ->  2020-01-01
+    threshold_ms  0           ->  999999999
+    ✅ mutation applied [alice] on 'zebridge_gc_watermark' (1 row)
+
+Three things had to line up, and all three did: the table is in `zebridge_catalogue`
+(so the listener resolves its identifiers), `bridge_writer` holds INSERT/UPDATE on it
+(the sweeper stamps the watermark and CANNOT lose that grant), and
+`isForbiddenTable()` listed only `zebridge_ddl_events` and `schema_migrations`. The
+watermark bounds the offline window for EVERY client, so one principal moving it back
+six years is a global act — a client that had been offline longer than the real
+window would seed as if it were fresh.
+
+`zebridge_user_tenants` was reachable by the same door in principle (a forged row is
+cross-tenant escalation); it happened to fail only because it is not in the catalogue,
+and "not in the catalogue" is an accident, not a control.
+
+**The fix, three layers, because one is a check and one is a grant and one is a name:**
+
+  * `isForbiddenTable()` now refuses all three bridge-owned tables by name, before a
+    byte of payload is decoded — this is the control.
+  * `zebridge_grant_edge_writes()` refuses to GRANT on all three (it already refused
+    the DDL table) — defence in depth against a future hand-grant.
+  * zbdoctor exempts the three by name, keyed EXPLICITLY to that refusal, with a
+    comment that the exemption is only valid while the refusal exists — the check that
+    found this must not become the check that hides it.
+
+**Proof it is closed.** Restored the row, rebuilt the bridge container, replayed the
+identical envelope from the same principal:
+
+    ⛔ 'alice' refused writes to 'zebridge_gc_watermark': the bridge's own table
+    PostgreSQL unchanged.
+    SELECT zebridge_grant_edge_writes('public.zebridge_gc_watermark')
+      -> ERROR: refusing to grant edge writes … a forged row here reaches every client
+
+**The lesson, restated for next time.** A finding that "looks like a false positive"
+is a hypothesis, not a verdict. The cheap test — actually perform the write — is the
+one that distinguishes a redundant check from a live vulnerability, and it is exactly
+the test I skipped in §10ah. zbdoctor was doing its job; I overrode it with reasoning.
 
 ## 10ap. Migrations no longer discard zebridge_enable's refusals (2026-08-28)
 

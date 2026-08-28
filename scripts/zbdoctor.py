@@ -290,8 +290,22 @@ def gate_postgres(catalogue: dict) -> None:
     except RuntimeError as e:
         amber("B", f"write-guard audit unavailable ({e})")
     else:
+        # The ingress path refuses these by NAME, whatever the grants say
+        # (mutation_listener.zig isForbiddenTable, and zebridge_grant_edge_writes).
+        # `bridge_writer` still holds INSERT/UPDATE on them because the BRIDGE writes
+        # them — the sweeper stamps the watermark — so a privilege probe alone reads
+        # them as edge-writable and demands LWW guards they will never need.
+        #
+        # ⚠️ This is an exemption, not a suppression, and it is only correct because
+        # that refusal exists. It did NOT exist until 2026-08-28: this very check went
+        # RED on zebridge_gc_watermark, was written off as a false positive, and the
+        # table turned out to be genuinely writable from the edge (NOTES §10aq). If
+        # the name list here and the one in the bridge ever drift apart, this line
+        # goes back to hiding a real finding.
+        BRIDGE_OWNED = {"zebridge_ddl_events", "zebridge_gc_watermark", "zebridge_user_tenants"}
+
         missing = 0
-        for tbl in sorted(set(catalogue) & writable):
+        for tbl in sorted((set(catalogue) & writable) - BRIDGE_OWNED):
             meta = catalogue[tbl]
             has_version, has_delete = guards.get(tbl, (False, False))
             if meta["version_col"] and not has_version:
@@ -309,7 +323,9 @@ def gate_postgres(catalogue: dict) -> None:
                     "ingress path soft-deletes on its own — this is the other door")
         if not missing:
             ok(f"every edge-writable table's declared guards are attached "
-               f"({len(set(catalogue) & writable)} writable of {len(catalogue)})")
+               f"({len((set(catalogue) & writable) - BRIDGE_OWNED)} writable of "
+               f"{len(catalogue)}; {len(set(catalogue) & writable & BRIDGE_OWNED)} "
+               f"bridge-owned table(s) exempt — the ingress path refuses them by name)")
 
     # audit_sweeper: a tenant the sweeper cannot reach keeps its tombstones
     # forever, which is the offline-window promise quietly breaking.
