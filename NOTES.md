@@ -5487,8 +5487,36 @@ edge client could actually write. The cost of a legitimate read path was an
 illegitimate write path — they came from the same row, and only the write half was
 ever wrong. Reading it never required writing it.
 
-**BUILT** the same day — see §10at. Still TODO in `libzb` (the Zig client), which
-shares the fixtures and can implement `outboxWatermarkGate` against them.
+**BUILT** the same day in both cores — §10at (TypeScript) and §10au (Zig).
+
+## 10au. The same gate in libzb — and where it stops (2026-08-28)
+
+`outboxWatermarkGate` ported to `libzb/src/core.zig`, dispatched through `zb_call` as
+`outboxWatermark`, and driven by the SAME `core-fixtures.json`. Both cores now answer
+all 101 cases, which is the entire point of the fixture file: the nine watermark cases
+were written for TypeScript and the Zig port had to satisfy them without amendment.
+
+Two details the port had to get right, and the fixtures are what enforce them:
+
+  * `std.mem.order(u8, nv, m) != .gt` is the `<=` — a mutation stamped exactly at the
+    watermark is refused, because the watermark is the oldest STANDING tombstone.
+  * `normalizeVersion` on BOTH sides before comparing. PG trims trailing fractional
+    zeros, so `.5Z` vs `.50001Z` orders wrongly as raw text; two fixtures cover that
+    pair in both directions and a port that skipped the normalize would fail them.
+
+**Verified the group actually runs**, rather than trusting a pass count: corrupted one
+expectation in the shared fixture file and the Zig runner reported exactly one failure
+with the right diff (`want refuse:["WRONG"] got refuse:["a"]`), then restored it. A
+green total is not evidence that a new group was executed — the count went 91 → 101
+for reasons that were not all mine.
+
+⚠️ **Where it stops, stated plainly: libzb has no outbox, so nothing is wired.** The
+Zig client is read-only today — it seeds and follows CDC. `Transport.publish` and
+`subscribeSync` exist as primitives and NOTHING calls them: there is no mutation
+builder, no outbox table, no flush. So the gate is a correct, conformance-tested
+function with no caller, waiting for the write path (the standing TODO in §10 client
+work). When that path is built, the call site is one line before the first publish,
+exactly as in `zb-client-ts`'s `flushOutbox`.
 
 ## 10at. The outbox watermark gate, built (2026-08-28)
 

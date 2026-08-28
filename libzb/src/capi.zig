@@ -126,6 +126,12 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         const wm: ?[]const u8 = if (wm_v == .string) wm_v.string else null;
         return try core.valueToString(a, try core.planFromManifest(a, man, wm));
     }
+    if (eq(u8, name, "outboxWatermark")) {
+        const entries = args.object.get("entries").?.array;
+        const wm_v = args.object.get("watermark") orelse .null;
+        const wm: ?[]const u8 = if (wm_v == .string) wm_v.string else null;
+        return try core.valueToString(a, try core.outboxWatermarkGate(a, entries, wm));
+    }
     if (eq(u8, name, "fullPredates")) {
         const man = args.object.get("manifest") orelse .null;
         const plan = args.object.get("plan").?.array;

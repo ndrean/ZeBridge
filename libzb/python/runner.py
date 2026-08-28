@@ -55,6 +55,7 @@ SECTIONS = {
     "chainRowParams":  (lambda c: {"row": c["row"]},                               lambda c: c["params"]),
     "chainPlan":       (lambda c: {"manifest": c["manifest"], "watermark": c["watermark"]}, lambda c: c["plan"]),
     "fullPredates":    (lambda c: {"manifest": c["manifest"], "plan": c["plan"], "storedSeq": c["storedSeq"]}, lambda c: c["predates"]),
+    "outboxWatermark": (lambda c: {"entries": c["entries"], "watermark": c["watermark"]}, lambda c: {"send": c["send"], "refuse": c["refuse"]}),
     "scope":           (lambda c: {"streams": c["streams"], "tables": c["tables"]}, lambda c: {"gapped": sorted(c["gapped"]), "tablesToSeed": sorted(c["tablesToSeed"])}),
     "columnDdl":       (lambda c: {"col": c["col"], "pkCols": c["pkCols"]},          lambda c: c["ddl"]),
     "fkClauses":       (lambda c: {"fks": c["fks"]},                                 lambda c: c["text"]),

@@ -592,6 +592,53 @@ pub fn scopeSeeding(a: std.mem.Allocator, streams: Value, tables: Value) !Value 
     return .{ .object = out };
 }
 
+/// core.ts outboxWatermarkGate — PROTOCOL.md §MUST 6.
+///
+/// A queued mutation older than the GC watermark cannot be sent: the tombstone that
+/// would have overruled it has been reaped, so the write lands as a resurrection of a
+/// row somebody deleted. It is the one failure LWW cannot catch, because every version
+/// the bridge would compare has already been discarded.
+///
+/// Conservative at both unknowns, and the TS core is the spec here (fixtures
+/// `outboxWatermark`): a null/empty watermark refuses NOTHING — the table is only
+/// published if the DBA put it there, so "not known" is an ordinary deployment — and an
+/// entry with no version is never refused, because the server's own version guard still
+/// fronts it. The comparison is `<=`: the watermark is the OLDEST STANDING tombstone, so
+/// a mutation stamped exactly at it may already have lost its overruling tombstone.
+///
+/// String comparison AFTER normalizeVersion, exactly as planFromManifest does with
+/// cutoffs — PG trims trailing fractional zeros, so `.5Z` and `.50001Z` order wrongly
+/// until both are padded to six digits.
+pub fn outboxWatermarkGate(a: std.mem.Allocator, entries: std.json.Array, watermark: ?[]const u8) !Value {
+    var send = std.json.Array.init(a);
+    var refuse = std.json.Array.init(a);
+
+    const mark: ?[]const u8 = if (watermark) |w|
+        (if (w.len == 0) null else try normalizeVersion(a, w))
+    else
+        null;
+
+    for (entries.items) |e| {
+        const msg_id = getStr(e, "msgId") orelse "";
+        const ver: ?[]const u8 = getStr(e, "version");
+        var refused = false;
+        if (mark) |m| {
+            if (ver) |v| {
+                if (v.len != 0) {
+                    const nv = try normalizeVersion(a, v);
+                    refused = std.mem.order(u8, nv, m) != .gt;
+                }
+            }
+        }
+        if (refused) try refuse.append(.{ .string = msg_id }) else try send.append(.{ .string = msg_id });
+    }
+
+    var out: std.json.ObjectMap = .empty;
+    try out.put(a, "send", .{ .array = send });
+    try out.put(a, "refuse", .{ .array = refuse });
+    return .{ .object = out };
+}
+
 // ─── the schema migration planner (§10s 2b) ─────────────────────────────────
 
 fn colName(c: Value) []const u8 {
