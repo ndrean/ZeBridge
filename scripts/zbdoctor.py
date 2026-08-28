@@ -335,6 +335,18 @@ def gate_postgres(catalogue: dict) -> None:
                        "  ON pt.pubname = l.publication GROUP BY 1, 2 ORDER BY 1")
     except RuntimeError:
         budgets = []
+    # ⚠️ A publication that EXISTS but carries no tables is the quietest failure in
+    # the system: the bridge finds it, verifies it, logs one warning at boot and
+    # then streams nothing, forever, while every health check stays green. The
+    # registered publication comes from zebridge_limits — what the RUNNING bridge
+    # told the database it replicates, not what an env file claims.
+    for slot, _budget, ntables in ((r[0], r[1], int(r[2] or 0)) for r in budgets if len(r) >= 3):
+        if ntables == 0:
+            red("B", f"instance '{slot}' replicates a publication that carries NO tables",
+                "the bridge boots, verifies it and delivers nothing — add tables with "
+                "SELECT zebridge_enable('public.<table>', ...), which is the only way in "
+                "(a bare ALTER PUBLICATION is refused by the publication guard)")
+
     if len({r[1] for r in budgets if len(r) >= 2}) > 1:
         detail = ", ".join(f"{r[0]}={r[1]}B" for r in budgets if len(r) >= 2)
         amber("B", f"instances disagree on the row-width budget: {detail}",

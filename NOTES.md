@@ -5304,6 +5304,37 @@ and the compose stack would collide with the native stack on 5432/4222 anyway.
 That is the next test to run, and the JWT dance in compose is the interesting
 half of it.
 
+## 10ac. The publication's own cops (2026-08-28)
+
+Asked and answered from the code, not memory — three layers, and they were
+already mostly there:
+
+  * **Missing publication → FATAL.** `replication_setup.zig` returns
+    `error.PublicationNotFound` with the `CREATE PUBLICATION` hint; the bridge
+    refuses to start. Seen live while testing the flagless boot: a wrong
+    `BRIDGE_CDC_PUBLICATION` stopped it dead rather than streaming nothing.
+  * **Empty publication → one warning at boot**, and nothing else. That is the
+    quietest failure in the system: the bridge finds the publication, verifies
+    it, logs `⚠️ Publication 'x' exists but has no tables` once, and then
+    delivers nothing forever while /health, /status and every consumer look
+    fine. zbdoctor now reports it as RED, keyed off `zebridge_limits` — what
+    the RUNNING bridge registered, not what an env file claims. RED/GREEN
+    verified with a throwaway empty publication.
+  * **A typo'd publication name cannot create anything.** `zebridge_enable`
+    only ever runs `ALTER PUBLICATION`, so `publication => 'typo_pub'` fails
+    loudly in PostgreSQL. That is the argument for keeping `CREATE PUBLICATION`
+    in `init.core` rather than teaching enable to create on demand: creating
+    implicitly would turn a typo into a silent, empty, perfectly healthy-looking
+    second publication.
+
+**Does `CREATE PUBLICATION` belong in init.core?** Yes, and it already behaves:
+the statement is wrapped in `IF NOT EXISTS`, so the script stays idempotent, and
+it creates exactly ONE publication — the default the default `.env.bridge`
+expects. It is empty until the first `zebridge_enable`, which is the "fake
+publication" state above, now caught. Additional publications stay explicit DBA
+acts (`CREATE PUBLICATION` + enables), symmetric with additional bridges being
+explicit acts.
+
 ## 10ab. TODO: column slicing across publications — and why it cannot work yet
 
 The idea (worth keeping): a table too wide for one event buffer is published in
