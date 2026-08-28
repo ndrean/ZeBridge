@@ -57,7 +57,7 @@ import urllib.request
 import zb
 
 TABLE = "users"
-PUB = os.environ.get("BRIDGE_CDC_PUBLICATION", "my_pub")
+PUB = zb.publication()
 SLOT = "zb_probe"  # matches ZB_BRIDGE_ARGS' default; skip_wal() advances it by name
 SCRATCH = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
 METRICS_PORT = 9096  # ZB_BRIDGE_ARGS' default --port

@@ -43,6 +43,7 @@ defmodule Emitter.PgProducer.Repo.UsersDropPk do
             PERFORM * FROM public.zebridge_enable(
                 'public.demo_key_migration'::regclass,
                 public_reason => 'CDC fixture: no-PK-refusal-then-composite-key-fix demo',
+                publication => '#{zb_publication()}',
                 dry_run => false
             );
         END IF;
@@ -58,4 +59,15 @@ defmodule Emitter.PgProducer.Repo.UsersDropPk do
       "ALTER TABLE public.demo_key_migration ADD CONSTRAINT demo_key_migration_pkey PRIMARY KEY (id);"
     )
   end
+
+  # The publication is an ARGUMENT now, never a default: `zebridge_enable` has no
+  # default for it (NOTES §10ad), because that name decides which tables a bridge
+  # replicates. Unset stops the migration rather than publishing into a guess.
+  defp zb_publication do
+    System.get_env("BRIDGE_CDC_PUBLICATION") ||
+      raise "BRIDGE_CDC_PUBLICATION is not set: this migration publishes a table and must " <>
+              "name the publication (the same name the bridge is given as --pub). " <>
+              "Source .env.bridge before running migrations."
+  end
+
 end

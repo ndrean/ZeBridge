@@ -204,6 +204,17 @@ D1 is runnable (drive it with the `nats` CLI and inspect KV); the rest need clie
 | E2 | Create a table, add to publication **after** bridge start, request snapshot | ⚠️ **Currently fails**: `monitored_tables` is boot-time, so it is rejected with a misleading `available_tables`. Fixed by the pending publication refresh. |
 | E3 | `REVOKE SELECT ON users FROM bridge_reader`, request snapshot | `init.snap.error.users` with `error_type: generation_failed`. |
 | E4 | Stop NATS mid-load, restart | Bridge backpressures, WAL accumulates, then drains. No loss. |
+| E5 | `./zig-out/bin/bridge` with neither `--pub`/`--slot` nor their env vars | 🔴 refuses, naming both channels. There is no compiled default: one used to exist (`cdc_pub`/`cdc_slot`), and it turned every way of forgetting which publication you meant into a bridge that booted cleanly on the wrong table set. ✅ verified — `pubname.py` 1a/1b |
+| E6 | `bridge --slot s --pub` (flag last, nothing after it) | 🔴 `--pub requires a value`. The missing value used to fall into the compiled default, which made a typo look like a working command; `--pub ''` was always caught, which is what hid this. ✅ verified — `pubname.py` 2/3 |
+| E7 | `--pub` and `BRIDGE_CDC_PUBLICATION` both set, to different names | the flag wins, and the other name appears nowhere. ✅ verified — `pubname.py` 6 |
+| E8 | `--pub` naming a publication PostgreSQL does not have | 🔴 fatal at boot, before any streaming — not a bridge that quietly delivers nothing. ✅ verified — `pubname.py` 4/5a/7 |
+| E9 | `zebridge_enable(...)` with no `publication`, or one that does not exist | raises (not an ERROR row — a migration's `PERFORM * FROM` would discard those). `create_publication => true` creates it, complete with `zebridge_ddl_events` / `_gc_watermark` / `_user_tenants`. ✅ verified — `pubname.py` 8d/8e/8f |
+
+Run all nine of the naming cases at once:
+
+```bash
+scripts/scenarios/.venv/bin/python scripts/scenarios/pubname.py
+```
 
 ---
 

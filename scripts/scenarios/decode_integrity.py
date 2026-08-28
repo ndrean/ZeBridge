@@ -55,7 +55,7 @@ from nats.js.api import ConsumerConfig, DeliverPolicy
 
 TABLE = "decode_fixture"
 KIND_TYPE = "decode_fixture_kind"
-PUB = os.environ.get("BRIDGE_CDC_PUBLICATION", "my_pub")
+PUB = zb.publication()
 SCRATCH = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
 CDC_PUBLIC_STREAM = "CDC_PUBLIC"
 FIXTURE_SUBJECT = f"cdc.{TABLE}.>"

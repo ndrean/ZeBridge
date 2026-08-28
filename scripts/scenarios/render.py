@@ -58,7 +58,9 @@ REQUIRED_VARS = [
     "POSTGRES_WRITER_USER",
     "POSTGRES_WRITER_PASSWORD",
     "TARGET_DB",
-    "BRIDGE_CDC_PUBLICATION",
+    # BRIDGE_CDC_PUBLICATION is deliberately NOT here: the templates stopped
+    # naming a publication (NOTES §10ad). It is an argument to
+    # zebridge_create_publication / zebridge_enable now, not a substitution.
     # The tenant guard's default. Empty renders `hstore(col, '')` — a row routed to
     # `cdc..<table>.<op>`, an illegal subject no stream captures.
     "OPEN_TENANT",
@@ -89,7 +91,8 @@ async def main():
         sys.exit(
             f"unset: {', '.join(missing)}\n"
             "  envsubst replaces these with the empty string, which renders as valid SQL.\n"
-            "  set -a && . ./.env.admin && . ./.env.bridge && set +a && eval "$(python3 scripts/zb-derive-env.py)""
+            "  set -a && . ./.env.admin && . ./.env.bridge && set +a"
+            " && eval \"$(python3 scripts/zb-derive-env.py)\"\n"
         )
     zb.ok(f"all {len(REQUIRED_VARS)} interpolated variables are set")
 

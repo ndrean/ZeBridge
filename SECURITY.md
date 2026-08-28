@@ -76,6 +76,7 @@ finished but silently isn't. Every function referenced below is defined once, in
 SELECT * FROM zebridge_enable(
     'public.currencies'::regclass,
     public_reason => 'ISO list — identical for every tenant',
+    publication   => 'my_pub',
     dry_run       => false
 );
 ```
@@ -104,6 +105,7 @@ SELECT * FROM zebridge_enable(
     version_col   => 'updated_at',
     tombstone_col => 'deleted_at',
     tiebreak_col  => 'last_writer',
+    publication   => 'my_pub',
     dry_run       => false
 );
 ```
@@ -142,6 +144,7 @@ SELECT * FROM zebridge_enable(
     version_col   => 'updated_at',
     tombstone_col => 'deleted_at',
     tiebreak_col  => 'last_writer',
+    publication   => 'my_pub',
     dry_run       => false
 );
 ```
@@ -168,28 +171,40 @@ deployments. It is not the multi-tenant, per-row path above, and does not compos
 
 **The publication itself — where its name comes from, and how tables reach it.**
 
-`BRIDGE_CDC_PUBLICATION` (`.env.admin`) is consumed exactly **once**, by the init render
-(`bridge-init` in compose, or `scripts/native/up.sh` — both are
-`cat templates | envsubst | psql`). That single render does two things: creates the
-publication, and bakes the name into `zebridge_enable()`'s `publication` parameter as its
-default, stored in the function definition itself (`\df+ zebridge_enable` shows it).
-After init the env var is dead: the bridge never reads it — `--pub` on the command line
-is its only source — and a migration's shell environment is equally inert, because the
-default a migration gets is the one frozen in the database, not whatever the shell
-carries. That is why the pieces agree without coordination: everything descends from the
-one render. The invariant that keeps it true: **the publication name is write-once at
-init.** Renaming it means re-rendering the templates, never just editing the env file.
+A ZeBridge publication is **created by name, on request, and never as a side effect**.
+The templates create none: `zebridge_create_publication('my_pub')` is the only supported
+way to make one, and `zebridge_enable(..., create_publication => true)` calls it for you.
+Neither has a default name.
+
+That function exists because the name is not the whole story. Three tables must be in
+**every** publication a bridge attaches to, and a hand-written `CREATE PUBLICATION`
+leaves all three out:
+
+| table | what its absence costs that bridge |
+| --- | --- |
+| `zebridge_ddl_events` | never learns a schema changed — clients keep the old shape |
+| `zebridge_gc_watermark` | clients have no offline-window watermark to read |
+| `zebridge_user_tenants` | `$KV.tenants` is never populated: PROTOCOL Step 0 fails for every client |
+
+None of that is visible from outside. The publication is not empty, the bridge boots, the
+feed carries user rows, and every health check is green. `zebridge_create_publication`
+attaches the three; the write half's own install attaches `zebridge_user_tenants` to every
+publication that already exists, so the two orders (core→write→create, core→create→write)
+both end complete.
+
+`BRIDGE_CDC_PUBLICATION` no longer enters any template. It is an ordinary input to the
+bridge — the one that lets it boot with no flags from `.env.bridge` — with `--pub`
+overriding it, and neither has a fallback: unset stops the boot. Migrations name their
+publication as an argument.
 
 Tables reach a publication by exactly three paths, all funnelled through the publication
-guard: a migration calling `zebridge_enable()` (the baked default, or an explicit
-`publication => 'pub_x'`); the init templates themselves for the bridge-owned tables
-(`zebridge_ddl_events`, `zebridge_gc_watermark`, `zebridge_user_tenants` — hardcoded,
-because the bridge cannot boot without them); and
-`zebridge_scope_publication_to_one_tenant()` for the one-bridge-per-tenant shape, the one
-signature where the publication is a required argument.
+guard: a migration calling `zebridge_enable(..., publication => 'pub_x')`;
+`zebridge_create_publication` for the three bridge-owned tables above; and
+`zebridge_scope_publication_to_one_tenant()` for the one-bridge-per-tenant shape.
 
-Divergence cannot end in a half-state. A bridge started with a `--pub` naming a missing
-publication refuses to boot (`PublicationNotFound`, with the `CREATE PUBLICATION` hint);
+Divergence cannot end in a half-state. A bridge given no publication at all — no `--pub`,
+no `BRIDGE_CDC_PUBLICATION` — refuses to boot rather than falling back to a compiled name;
+one naming a missing publication refuses to boot (`PublicationNotFound`, with the hint);
 one naming an existing publication that lacks a table simply never sees that table — no
 CDC, no boot schema — which the boot log's explicit table list
 (`Publication '…' verified (N tables: …)`) is there to make visible. A migration naming
@@ -202,14 +217,17 @@ tables across walsenders) is created in the same migration that populates it, at
 and with no env var anywhere:
 
 ```sql
-CREATE PUBLICATION pub_orders;                                        -- bare CREATE passes the guard
-ALTER PUBLICATION pub_orders ADD TABLE public.zebridge_ddl_events;    -- preflight requires it in EVERY
-                                                                      -- publication a bridge attaches to
-ALTER PUBLICATION pub_orders ADD TABLE public.zebridge_gc_watermark;  -- if this lane's clients flush outboxes
+-- One call. It creates pub_orders AND attaches the three bridge-owned tables, which
+-- is the half a hand-written CREATE PUBLICATION silently skipped.
 SELECT * FROM zebridge_enable('public.orders'::regclass,
     tenant_col => 'tenant_id', writable => true, version_col => 'updated_at',
-    publication => 'pub_orders', dry_run => false);
+    publication => 'pub_orders', create_publication => true, dry_run => false);
 ```
+
+`create_publication` is opt-in for the same reason `allow_physical_deletes` is: without
+it, `publication => 'pub_odrers'` would manufacture a second publication, silently, and
+the typo would show up as a bridge that replicates one table and nothing else. Unknown
+name + no opt-in = a raise naming both ways out.
 
 The matching bridge runs `--pub pub_orders --slot slot_orders`. ⚠️ Running several
 bridges concurrently against one NATS deployment is not yet supported: the MUTATIONS

@@ -94,7 +94,11 @@ def main_sync():
                     -- cascade, not delete semantics) — the gate added 2026-08-27 refuses
                     -- writable-without-tombstone unless the acceptance is explicit:
                     allow_physical_deletes => true,
-                    public_reason => 'livebirth scenario fixture — pre-declared before probe boot', dry_run => false);
+                    public_reason => 'livebirth scenario fixture — pre-declared before probe boot',
+                    -- named explicitly: zebridge_enable has no default publication
+                    -- (NOTES §10ad), and this scenario runs on the same feed the
+                    -- probe bridge is booted against.
+                    publication => '{zb.publication()}', dry_run => false);
             """)
             need = {"grants:done", "guards:done", "width guard:done", "catalogue:done", "publication:done"}
             # splitlines, NOT split(): 'width guard:done' contains a space and whitespace

@@ -1607,7 +1607,8 @@ CREATE TABLE public.notes (
 SELECT * FROM zebridge_enable('public.notes'::regclass,
     public_reason => '…', writable => true,
     version_col => 'updated_at', tombstone_col => 'deleted_at',
-    tiebreak_col => 'last_writer', dry_run => false);
+    -- named, never defaulted: it decides which feed carries the table
+    tiebreak_col => 'last_writer', publication => 'my_pub', dry_run => false);
 ```
 
 ⚠️ `timestamptz` for the version column, not `timestamp` — it sidesteps every caveat in

@@ -401,6 +401,15 @@ services:
           echo "[bridge-init] profile: write-enabled (CDC + snapshots + ingress)" >&2
           cat /init.core.template.sql /init.write.template.sql
         fi | envsubst | psql -v ON_ERROR_STOP=1 -h "$${PG_HOST}" -p "$${PG_PORT}" -U "$${PG_USER}" -d "$${PG_DB}"
+        # The templates create no publication (NOTES §10ad): the name was
+        # substituted into them, which made it a second spelling of the bridge's
+        # own --pub. It is an argument now, and this function is the only
+        # supported way to make one — it also attaches the three internal tables
+        # (ddl_events, gc_watermark, user_tenants) that a hand-made
+        # `CREATE PUBLICATION` silently left out, crippling that bridge.
+        : "$${BRIDGE_CDC_PUBLICATION:?set it in .env.docker — there is no default}"
+        psql -v ON_ERROR_STOP=1 -h "$${PG_HOST}" -p "$${PG_PORT}" -U "$${PG_USER}" -d "$${PG_DB}" \
+          -c "SELECT step, status, detail FROM public.zebridge_create_publication('$${BRIDGE_CDC_PUBLICATION}')"
         echo "[bridge-init] Postgres initialization complete!"
     networks:
       - cdc-net

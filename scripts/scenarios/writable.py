@@ -74,7 +74,7 @@ def version_now() -> str:
 async def main():
     writable = sys.argv[1] if len(sys.argv) > 1 else "test_types"
     readonly = sys.argv[2] if len(sys.argv) > 2 else "users"
-    pub = os.environ.get("BRIDGE_CDC_PUBLICATION", "my_pub")
+    pub = zb.publication()
 
     # ── 1. the matrix ────────────────────────────────────────────────────────────
     print("published table    grant  key-mintable  version  tombstone   verdict")

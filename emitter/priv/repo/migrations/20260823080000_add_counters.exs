@@ -33,6 +33,7 @@ defmodule Emitter.PgProducer.Repo.AddCounters do
                 writable => true,
                 version_col => 'updated_at',
                 public_reason => 'demo counter — identical content for every tenant',
+                publication => '#{zb_publication()}',
                 dry_run => false
             );
             PERFORM * FROM public.zebridge_enable(
@@ -40,6 +41,7 @@ defmodule Emitter.PgProducer.Repo.AddCounters do
                 tenant_col => 'tenant_id',
                 writable => true,
                 version_col => 'updated_at',
+                publication => '#{zb_publication()}',
                 dry_run => false
             );
         END IF;
@@ -51,4 +53,15 @@ defmodule Emitter.PgProducer.Repo.AddCounters do
     drop_if_exists(table(:counter_public))
     drop_if_exists(table(:counter_tenant))
   end
+
+  # The publication is an ARGUMENT now, never a default: `zebridge_enable` has no
+  # default for it (NOTES §10ad), because that name decides which tables a bridge
+  # replicates. Unset stops the migration rather than publishing into a guess.
+  defp zb_publication do
+    System.get_env("BRIDGE_CDC_PUBLICATION") ||
+      raise "BRIDGE_CDC_PUBLICATION is not set: this migration publishes a table and must " <>
+              "name the publication (the same name the bridge is given as --pub). " <>
+              "Source .env.bridge before running migrations."
+  end
+
 end

@@ -73,6 +73,17 @@ if [ "$FRESH_PG" = "1" ]; then
   cat "$ROOT/init.core.template.sql" "$ROOT/init.write.template.sql" \
     | envsubst \
     | "$PGBIN/psql" -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PGPORT" -U postgres -d postgres >/dev/null
+
+  # The templates create NO publication (NOTES §10ad) — the name used to be
+  # substituted into them, which made it a second spelling of the bridge's own
+  # --pub with nothing checking that the two agreed. Creating one is an explicit
+  # act now, and this function is the only supported way to do it: it also
+  # attaches the three internal tables (ddl_events, gc_watermark, user_tenants)
+  # that a hand-made `CREATE PUBLICATION` silently left out.
+  : "${BRIDGE_CDC_PUBLICATION:?set it in .env.bridge — there is no default}"
+  echo "[native] creating publication $BRIDGE_CDC_PUBLICATION"
+  "$PGBIN/psql" -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PGPORT" -U postgres -d postgres \
+    -c "SELECT step, status, detail FROM public.zebridge_create_publication('$BRIDGE_CDC_PUBLICATION')"
   echo "[native] postgres initialized"
 fi
 

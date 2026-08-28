@@ -29,6 +29,17 @@ NKEY_SEED = os.environ.get("NATS_NKEY_SEED")
 PSQL = os.environ.get("ZB_PSQL", "docker exec -i postgres-primary psql -U postgres")
 
 
+def publication() -> str:
+    """The publication under test — named, never guessed.
+
+    Scenarios used to write `os.environ.get("BRIDGE_CDC_PUBLICATION", "my_pub")`,
+    which is the same defaulting the bridge and `zebridge_enable` both stopped
+    doing (NOTES §10ad/§10ae): a run pointed at another publication would quietly
+    inspect `my_pub` instead and report on a feed nobody was testing.
+    """
+    return os.environ["BRIDGE_CDC_PUBLICATION"]
+
+
 def subject(*parts: str) -> str:
     return ".".join(parts)
 

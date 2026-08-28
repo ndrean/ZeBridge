@@ -551,14 +551,31 @@ GRANT INSERT ON public.zebridge_user_tenants TO ${POSTGRES_WRITER_USER};
 -- Publishing it as `cdc.zebridge_user_tenants.*` would hand every client with a broad CDC
 -- grant the full principal→tenant roster — the disclosure the KV bucket's principal-first
 -- key order exists to prevent.
+-- Attached to every ZeBridge publication that ALREADY exists; the ones created
+-- later get it from `zebridge_create_publication`, which knows this table by name.
+-- Between the two, the install order stops mattering — core then write then
+-- create, or core then create then write, and the table lands either way. That is
+-- the whole point: this file used to attach it to one name rendered from the
+-- environment, so a publication made any other way silently had no tenant roster
+-- and PROTOCOL Step 0 failed for every one of its clients.
+--
+-- A ZeBridge publication is recognised by the one table they all carry and
+-- nothing else does: zebridge_ddl_events.
 DO $$
+DECLARE p record;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_publication_tables
-        WHERE pubname = '${BRIDGE_CDC_PUBLICATION}' AND tablename = 'zebridge_user_tenants'
-    ) THEN
-        ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE public.zebridge_user_tenants;
-    END IF;
+    FOR p IN SELECT DISTINCT pubname FROM pg_publication_tables
+              WHERE schemaname = 'public' AND tablename = 'zebridge_ddl_events'
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_publication_tables
+            WHERE pubname = p.pubname AND schemaname = 'public'
+              AND tablename = 'zebridge_user_tenants'
+        ) THEN
+            EXECUTE format('ALTER PUBLICATION %I ADD TABLE public.zebridge_user_tenants', p.pubname);
+            RAISE NOTICE 'zebridge: attached zebridge_user_tenants to publication %', p.pubname;
+        END IF;
+    END LOOP;
 END $$;
 
 -- ⚠️ Dollar-quote with a bare double-dollar ONLY — never a named tag (dollar, letters,

@@ -5358,6 +5358,45 @@ flags from `.env.bridge` alone (systemd `EnvironmentFile`, compose `env_file` �
 both far easier than assembling a command line), while `--pub` overrides it for
 a one-off. CLI wins over env, exactly as `--slot` does.
 
+## 10af. pubname.py — the recorded matrix for "named, never defaulted" (2026-08-28)
+
+The five bridge cases asked for, plus the three that surround them, plus the SQL
+half of the same rule. All green on the native stack.
+
+**The bridge** (`--port 9097`, each case a fresh process, killed after it speaks):
+
+| # | environment | argv | outcome |
+|---|---|---|---|
+| 1a | — | — | `🔴 no replication slot named` — names `--slot` AND `BRIDGE_CDC_SLOT`, and `cdc_slot` appears nowhere |
+| 1b | `BRIDGE_CDC_SLOT` | — | `🔴 no publication named` — same shape, no `cdc_pub` |
+| 2 | — | `--slot s --pub` | `🔴 --pub requires a value` — the missing value never reaches the resolver |
+| 3 | — | `--slot s --pub ''` | `🔴 Publication '' not found` — an empty name is a name, refused where names are checked |
+| 4 | — | `--pub zb_ghost_flag` | `Publication 'zb_ghost_flag' not found` |
+| 5a | `…=zb_ghost_env` | — | `Publication 'zb_ghost_env' not found` |
+| 6 | `…=zb_ghost_env` | `--pub zb_ghost_flag` | `…'zb_ghost_flag' not found`, and `zb_ghost_env` is absent from the log |
+| 7 | (case 6's run) | | that refusal is `🔴` and fatal — not a bridge that streams nothing |
+| 5b | `…=my_pub`, own slot | — | `✅ Replication started successfully` — the flagless `.env.bridge` boot, all the way through |
+
+The trick that makes 4/5a/6 one-line assertions: every ghost name is one PostgreSQL
+does not have, so the not-found error *reports what the bridge resolved*. One run
+proves both which channel won and that a wrong name stops the boot.
+
+**The SQL** (a scratch database, both templates rendered fresh):
+
+  8a. after init.core, `pg_publication` is EMPTY — the name left the templates
+  8b. `zebridge_create_publication('p_probe')` on the readonly profile: created,
+      two internal tables added, `ABSENT` reported for `zebridge_user_tenants`
+  8c. applying init.write afterwards backfills it — install order does not matter
+  8d. `zebridge_enable(...)` with no publication → raises, naming both channels
+  8e. with an unknown publication → raises rather than creating it
+  8f. with `create_publication => true` → the publication carries the user table
+      AND all three internal tables
+
+**Also fixed on the way**: `scripts/scenarios/render.py` had an unterminated string
+literal (an unescaped `"` inside a hint added in 174d952) and could not be imported
+at all — the template checker had been dead since its last commit. It runs again:
+37 CREATE statements survive the render, 26 functions and 4 event triggers apply.
+
 ## 10ad. The publication should be created BY zebridge_enable — and the recipe
 we wrote two turns ago is incomplete (2026-08-28)
 
@@ -5384,22 +5423,37 @@ bridge on `pub_x` boots happily, replicates the user tables, and silently loses
 DDL propagation, the GC watermark and tenant resolution. Nothing catches it
 today: the publication is not empty, so §10ac's cop stays green.
 
-**The design that fixes both** (not yet built):
+**BUILT 2026-08-28.** Both halves:
 
-    zebridge_create_publication(name)      -- idempotent: CREATE IF NOT EXISTS,
-                                           -- then attach the three internal tables
-    zebridge_enable(tbl, ..., create_publication => true)   -- opt-in, same shape
-                                           -- as allow_physical_deletes: refuse by
-                                           -- default (a typo must not manufacture a
-                                           -- publication), create when asked
+    zebridge_create_publication(name)      -- idempotent: creates it, then attaches
+                                           -- whichever of the three internal tables
+                                           -- exist, and SAYS SO about any that do not
+    zebridge_enable(..., create_publication => true)  -- opt-in, same shape as
+                                           -- allow_physical_deletes: an unknown name
+                                           -- raises by default, because a typo must
+                                           -- not manufacture a publication
 
-With that, `${BRIDGE_CDC_PUBLICATION}` leaves the templates entirely — the
-publication name becomes an argument to a migration, which is where it belongs,
-and `.env.bridge` keeps it only because the BRIDGE needs to name what it reads.
-init.core/write would define the functions and attach nothing on their own.
+`${BRIDGE_CDC_PUBLICATION}` is gone from both templates — they now create no
+publication and attach nothing on their own. The name is an ARGUMENT: to
+`zebridge_create_publication` in the installers (`up.sh`, compose's `bridge-init`),
+to `zebridge_enable` in every migration. `.env.bridge` keeps it because the BRIDGE
+needs to name what it reads, and that is now its only job.
 
-⚠️ Until it is built, a hand-made second publication must also carry the three
-internal tables — otherwise its bridge is a quiet cripple.
+`zebridge_enable`'s `publication` has no default either, and the refusal is a RAISE
+rather than one of its ERROR rows: an enable that does not name its publication is a
+malformed CALL, not a table failing a rule, and the rows are easy to not read
+(`PERFORM * FROM zebridge_enable(...)` in a migration discards every one of them).
+
+**The ordering hole, closed.** `zebridge_user_tenants` lives in init.write, so
+`create_publication` cannot attach it on a database that has not applied that file
+yet — it reports `ABSENT` instead of pretending. init.write then attaches the table
+to every publication that already exists, recognising them by the one table they all
+carry and nothing else does (`zebridge_ddl_events`). Both orders end complete:
+
+    core -> write -> create      create attaches all three
+    core -> create -> write      create attaches two + says ABSENT; write backfills
+
+**Test**: `scripts/scenarios/pubname.py`, 15 assertions, all green — §10af.
 
 ## 10ac. The publication's own cops (2026-08-28)
 

@@ -73,6 +73,7 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
             PERFORM * FROM public.zebridge_enable(
                 'public.users'::regclass,
                 public_reason => 'CDC fixture: no tenant column, readable by every consumer',
+                publication => '#{zb_publication()}',
                 dry_run => false
             );
         END IF;
@@ -108,4 +109,15 @@ defmodule Emitter.PgProducer.Repo.SetupCdcTables do
     drop_if_exists(table(:users))
     drop_if_exists(table(:test_types))
   end
+
+  # The publication is an ARGUMENT now, never a default: `zebridge_enable` has no
+  # default for it (NOTES §10ad), because that name decides which tables a bridge
+  # replicates. Unset stops the migration rather than publishing into a guess.
+  defp zb_publication do
+    System.get_env("BRIDGE_CDC_PUBLICATION") ||
+      raise "BRIDGE_CDC_PUBLICATION is not set: this migration publishes a table and must " <>
+              "name the publication (the same name the bridge is given as --pub). " <>
+              "Source .env.bridge before running migrations."
+  end
+
 end

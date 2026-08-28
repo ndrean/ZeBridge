@@ -1,4 +1,4 @@
-# ZeBridge: replicate and sync PostgreSQL
+# ZeBridge: sync with PostgreSQL locally
 
 <p align="center"><img  width="355" height="233" alt="Screenshot 2025-12-26 at 02 37 57" src="https://github.com/user-attachments/assets/b3701ef4-2d58-497a-be21-52ad1b970644" /></p>
 
@@ -198,12 +198,12 @@ That is the whole contract for an app author. The wire format — the NATS subje
 
 ## Authentication end-to-end
 
-**Postgres database**: the DBA credentials
+### Postgres and ZeBridge
 
-<details><summary>psql access</summary>
+<details><summary>The DBA credentials and psql access</summary>
 
 ```sh
-ADMIN_DATABASE_URL=postgres://<role>:<password>@<host>:<port>/<dbname> \
+PGDATABASE=postgres://<role>:<password>@<host>:<port>/<dbname> \
 psql  -c "...;"
 ```
 
@@ -211,15 +211,18 @@ or decomposing with flags, but `PGPASSWORD` is separated. The other creds can be
 
 ```sh
 PGPASSWORD=my_pwd PGHOST=xx  PGPORT=xx PGUSER=xx  PGDATABASE=xx psql -c "...;"
+```
 
-# or
+or
+
+```sh
 PGPASSWORD=my_pwd psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
 ```
 
 or by reading the password from the file _~/pgpass_ with the STRCIT ordering below, so that `psql` will extract the password when the other credentials match:
 
 ```txt
-#~/.pgpass
+#~/.pgpass #<- chmod 0600
 hostname:port:database:username:password.  #<- strict ordering
 ```
 
@@ -250,20 +253,23 @@ POSTGRES_READER_PASSWORD=...
 POSTGRES_WRITER_USER=bridge_writer      # created by init.write.template.sql
 POSTGRES_WRITER_PASSWORD=...
 
-BRIDGE_CDC_PUBLICATION=...
 TARGET_DB=...
 
 envsubst < init.core.template.sql  | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -
 envsubst < init.write.template.sql | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -   # read/write only
+
+# The templates create no publication. Make it by name — this is the only supported
+# way, because it also attaches the three tables every bridge needs in its own
+# publication (zebridge_ddl_events, zebridge_gc_watermark, zebridge_user_tenants).
+psql "$ADMIN_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
 ```
 
-**ZeBridge uses these USER profils**: the reader USER and writer USER, set in _.env.bridge_, are used by `ZeBridge`.
+**ZeBridge uses these USER profils**: the reader USER and writer USER, set in _.env.bridge_, are used by `ZeBridge` (after the DBA has run the migrations and used `zebrdige_enable(..)`, see further down)
 
 ```sh
 DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres \
 DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres \
-BRIDGE_CDC_PUBLICATION=... \
-./bridge --slot my_slot --port 9090
+./bridge --pub my_pub --slot my_slot --port 9090
 ```
 
 **DBA creates nkey pair for ZeBridge ↔ NATS**: The DBA generates a keypair. Set the public key in the NATS config and use the seed as `NATS_NKEY_SEED` (in _.env.bridge_) to run ZeBridge:
@@ -569,11 +575,29 @@ set -a && source .env.admin && set +a
    envsubst < init.write.template.sql | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -   # read/write only
    ```
 
+   Then create the publication, by name. The templates create none — the name used to be
+   substituted into them, which made it a second spelling of the bridge's own `--pub`
+   with nothing checking that the two agreed:
+
+   ```sh
+   psql "$ADMIN_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
+   ```
+
+   ⚠️ Do not hand-write `CREATE PUBLICATION`. Three tables have to be in **every**
+   publication a bridge attaches to — `zebridge_ddl_events` (schema changes),
+   `zebridge_gc_watermark` (the offline window), `zebridge_user_tenants` (tenant
+   resolution) — and a publication missing them still boots a bridge, still carries user
+   rows, and still passes every health check. `zebridge_create_publication` attaches them;
+   nothing else will.
+
 2. **Declare your tables** — the important step. Run your own migrations to create the application tables, and call `zebridge_enable(...)` for each table you want replicated. One call writes the `zebridge_catalogue` row, installs the guards, scopes RLS and adds the table to the publication, atomically:
 
    ```sql
    SELECT zebridge_enable('public.notes', writable => true,
-       version_col => 'updated_at', tenant_col => 'tenant_id', dry_run => false);
+       version_col => 'updated_at', tenant_col => 'tenant_id',
+       -- named, never defaulted: this argument decides which feed carries the table.
+       -- Add create_publication => true to make the publication in the same call.
+       publication => 'my_pub', dry_run => false);
    ```
 
 3. **Place the wire grammar.** Copy `grammar.json` where the bridge and the NATS setup can read it — it holds the static names both sides share.

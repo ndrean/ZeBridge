@@ -341,13 +341,71 @@ RETURNS TABLE (publication name, tbl text, row_filter text, rls boolean, verdict
     ORDER BY p.pubname, 2;
 $$ LANGUAGE sql;
 
-DO $$
+-- ── making a publication is an OPERATION, not a line in a template ──────────
+--
+-- Nothing in these files creates a publication any more. This one used to:
+-- init.core rendered `CREATE PUBLICATION` with BRIDGE_CDC_PUBLICATION substituted in from the
+-- environment, so the name a bridge streams was spelled in two places — the
+-- template's env and the bridge's own `--pub` — with nothing to make them agree.
+--
+-- And that block was not the only reader of the variable. THREE internal tables
+-- get attached to the publication, and every consuming bridge needs all three:
+--
+--   zebridge_ddl_events    the DDL transport. Without it a bridge never learns a
+--                          schema changed.
+--   zebridge_gc_watermark  the offline-window watermark every client reads.
+--   zebridge_user_tenants  the principal->tenant roster, diverted to $KV.tenants.
+--                          Without it PROTOCOL Step 0 fails for every client of
+--                          that bridge. (Write profile only.)
+--
+-- So the obvious recipe for a second bridge — `CREATE PUBLICATION pub_x` by hand,
+-- then enables — produced a QUIET CRIPPLE: user tables replicate, DDL
+-- propagation, the GC watermark and tenant resolution silently do not, and every
+-- check stays green because the publication is not empty.
+--
+-- One fix for both: the publication is created HERE, by name, as a deliberate
+-- act, and this is the only supported way to make one — so the three cannot be
+-- forgotten. Idempotent, and worth re-running after init.write.template.sql to
+-- pick up zebridge_user_tenants.
+CREATE OR REPLACE FUNCTION public.zebridge_create_publication(p_name name)
+RETURNS TABLE (step text, status text, detail text) AS $$
+DECLARE
+    t        text;
+    -- Existence-checked one by one rather than assumed: zebridge_user_tenants
+    -- lives in init.write, which a readonly-profile database never applies.
+    internal text[] := ARRAY['zebridge_ddl_events', 'zebridge_gc_watermark', 'zebridge_user_tenants'];
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = '${BRIDGE_CDC_PUBLICATION}') THEN
-        CREATE PUBLICATION ${BRIDGE_CDC_PUBLICATION};
+    IF p_name IS NULL OR p_name = '' THEN
+        RAISE EXCEPTION 'zebridge_create_publication: no name given'
+            USING HINT = 'Name it: SELECT * FROM zebridge_create_publication(''my_pub''). '
+                         'The same name the bridge is given as --pub / BRIDGE_CDC_PUBLICATION.';
     END IF;
-END;
-$$;
+
+    IF EXISTS (SELECT 1 FROM pg_publication WHERE pubname = p_name) THEN
+        RETURN QUERY SELECT 'publication', 'already', format('%I exists', p_name);
+    ELSE
+        EXECUTE format('CREATE PUBLICATION %I', p_name);
+        RETURN QUERY SELECT 'publication', 'created',
+            format('CREATE PUBLICATION %I — carries only the internal tables until the '
+                   'first zebridge_enable', p_name);
+    END IF;
+
+    FOREACH t IN ARRAY internal LOOP
+        IF to_regclass('public.' || quote_ident(t)) IS NULL THEN
+            RETURN QUERY SELECT 'internal', 'ABSENT',
+                format('%I does not exist in this database. If this is a write-enabled '
+                       'deployment, apply init.write.template.sql and re-run this function — '
+                       'a bridge on %I loses what that table carries.', t, p_name);
+        ELSIF EXISTS (SELECT 1 FROM pg_publication_tables
+                      WHERE pubname = p_name AND schemaname = 'public' AND tablename = t) THEN
+            RETURN QUERY SELECT 'internal', 'already', format('%I already carries %I', p_name, t);
+        ELSE
+            EXECUTE format('ALTER PUBLICATION %I ADD TABLE public.%I', p_name, t);
+            RETURN QUERY SELECT 'internal', 'added',
+                format('ALTER PUBLICATION %I ADD TABLE %I', p_name, t);
+        END IF;
+    END LOOP;
+END $$ LANGUAGE plpgsql;
 
 -- ---------------------------------------------------------
 -- ZeBridge DDL Event Tracking
@@ -451,12 +509,11 @@ BEGIN
             'GC watermark: one row, no tenant, every client needs it')
     ON CONFLICT (tbl) DO NOTHING;
 
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_publication_tables
-        WHERE pubname = '${BRIDGE_CDC_PUBLICATION}' AND tablename = 'zebridge_gc_watermark'
-    ) THEN
-        ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE public.zebridge_gc_watermark;
-    END IF;
+    -- The catalogue row is written here and the publication attachment is NOT:
+    -- `zebridge_create_publication` attaches this table to whichever publication
+    -- is being made. The row must exist first either way — it is what carries this
+    -- table past zebridge_publication_guard (tenant_col IS NULL == public), and
+    -- the guard fires on the ALTER, not here.
 END $$;
 
 -- ---------------------------------------------------------
@@ -883,16 +940,10 @@ DROP EVENT TRIGGER IF EXISTS zebridge_drop_trigger;
 CREATE EVENT TRIGGER zebridge_drop_trigger ON sql_drop
 EXECUTE FUNCTION public.zebridge_drop_trigger_fn();
 
--- Automatically add the tracking table to the ZeBridge publication
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_publication_tables 
-        WHERE pubname = '${BRIDGE_CDC_PUBLICATION}' AND tablename = 'zebridge_ddl_events'
-    ) THEN
-        ALTER PUBLICATION ${BRIDGE_CDC_PUBLICATION} ADD TABLE public.zebridge_ddl_events;
-    END IF;
-END $$;
+-- No publication attachment here: `zebridge_create_publication` adds this table
+-- to every publication it makes. Attaching it to one name rendered from the
+-- environment is what made a second, hand-made publication a quiet cripple —
+-- it replicated user tables and never carried a schema change.
 
 -- Refuses CREATE/ALTER TABLE that introduces a `timestamp without time zone` column.
 -- The version protocol depends on it: version columns travel in §7.2's wire format
@@ -1311,6 +1362,7 @@ $$ LANGUAGE plpgsql;
 -- be ambiguous between the two.
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, boolean, text, name, boolean);
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, text, name, boolean);
+DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, boolean, text, name, boolean);
 CREATE OR REPLACE FUNCTION public.zebridge_enable(
     tbl           regclass,
     tenant_col    name    DEFAULT NULL,
@@ -1327,7 +1379,15 @@ CREATE OR REPLACE FUNCTION public.zebridge_enable(
     allow_physical_deletes boolean DEFAULT false,
     generations   boolean DEFAULT true,
     public_reason text    DEFAULT NULL,
-    publication   name    DEFAULT '${BRIDGE_CDC_PUBLICATION}',
+    -- ⚠️ No default. It used to render BRIDGE_CDC_PUBLICATION here, which made
+    -- this name a SECOND source of truth against the bridge's own `--pub` —
+    -- two spellings that had to agree, with nothing checking that they did.
+    -- Naming it is one word, and it decides which tables get replicated.
+    publication   name    DEFAULT NULL,
+    -- Opt-in, same shape as allow_physical_deletes: a typo must not manufacture
+    -- a publication (that would be a silent, empty, perfectly healthy-looking
+    -- second feed), so an unknown name is refused unless this says otherwise.
+    create_publication boolean DEFAULT false,
     dry_run       boolean DEFAULT true
 ) RETURNS TABLE (step text, status text, detail text) AS $$
 DECLARE
@@ -1339,6 +1399,40 @@ DECLARE
     verb       text := CASE WHEN dry_run THEN 'would' ELSE 'done' END;
     r           record;
 BEGIN
+    -- ── the publication must be NAMED, and may only be created on request ─────
+    --
+    -- A RAISE, not one of this function's ERROR rows: an enable that does not name
+    -- its publication is a malformed CALL, not a table failing a rule — and the
+    -- rows are easy to not read (`PERFORM * FROM zebridge_enable(...)` in a
+    -- migration discards every one of them). Same reasoning as the bridge's own
+    -- refusal to invent a publication name: this argument decides WHICH TABLES get
+    -- replicated, so there is nothing sensible to guess.
+    IF publication IS NULL THEN
+        RAISE EXCEPTION 'zebridge_enable(%): no publication named', tbl
+            USING HINT = 'Pass publication => ''my_pub'' — the same name the bridge is given as '
+                         '--pub / BRIDGE_CDC_PUBLICATION. There is no default. Add '
+                         'create_publication => true if it does not exist yet.';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = publication) THEN
+        IF NOT create_publication THEN
+            RAISE EXCEPTION 'zebridge_enable(%): publication % does not exist', tbl, publication
+                USING HINT = 'Refused by default so a typo cannot manufacture a silent, empty, '
+                             'healthy-looking second feed. If you meant to create it: '
+                             'create_publication => true, or SELECT * FROM '
+                             'zebridge_create_publication(''<name>'') first.';
+        END IF;
+        -- Reported through the same rows as everything else, so the operator sees
+        -- the three internal tables land in the enable's own output.
+        IF dry_run THEN
+            RETURN QUERY SELECT 'publication', 'would',
+                format('CREATE PUBLICATION %I, with zebridge_ddl_events / _gc_watermark / '
+                       '_user_tenants attached', publication);
+        ELSE
+            RETURN QUERY SELECT * FROM public.zebridge_create_publication(publication);
+        END IF;
+    END IF;
+
     IF writable AND NOT have_write THEN
         RETURN QUERY SELECT 'preflight', 'ERROR',
             'writable => true, but the write half is not installed — this database was '
