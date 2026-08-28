@@ -5138,6 +5138,60 @@ the go/no-go was always "build it and let the deltas judge", now built.
 (web-consumer/src/App.tsx carries the zstd-wasm hook but stays OUT of the
 commit — the user's own in-progress edits live there.)
 
+## 10y. zbdoctor: the post-boot wiring gate — and what it found (2026-08-28)
+
+The roadmap's "one command, one verdict" checker, built as `scripts/zbdoctor.py`.
+Five gates: **A** the bridge is alive (`/health`, `/status`), **B** PostgreSQL is
+wired (the three `zebridge_audit_*()` functions + slots), **C** NATS carries the
+topology (CDC streams, KV buckets, retired snapshot-era leftovers), **D** *a
+fresh client can connect, seed and follow* (schemas published, tenants
+resolvable, and for every `(tenant, table)`: a chain manifest whose full object
+is actually FETCHABLE — the two-sided-cleanup failure of §10r caught
+mechanically), **E** declared-vs-actual drift (delegates to `check.py`).
+Stdlib-only on purpose — an operator has `psql`, `nats`, python3, not a venv;
+gate E finds the scenario venv itself and degrades to SKIP, never to red.
+
+**The value is in the READING, not the running.** Two of the audit functions
+answer for a deployment shape this one does not use, and a naive wrapper turns
+them into noise the operator learns to ignore:
+  * `zebridge_audit_publications()` reports 'CDC UNSCOPED' for every
+    tenant-scoped table, because it assumes the publication row filter is the
+    boundary. Here the per-tenant STREAM is the boundary (crosstenant.py
+    measures exactly that), so 'CDC UNSCOPED' with RLS on is EXPECTED; what is
+    never expected is PASS-THROUGH or 'WRITES UNSCOPED' on a tenant-scoped
+    table. Catalogue-public tables are exempt BY DECLARATION.
+  * `zebridge_audit_write_guards()` reports every table; guards are only owed
+    by EDGE-WRITABLE ones, and "writable" means what SECURITY.md says — the
+    writer role holds INSERT. An outbound-only table (`users`) legitimately
+    declares a version column with no trigger.
+
+**It found a real, live defect on its first honest run**: `test_types` and
+`salaries` carry ONLY `zebridge_width_guard` — no `zebridge_bump_version_t`, no
+`zebridge_soft_delete_t`, no `zebridge_guard_tenant_t`. Proven empirically, not
+inferred: a raw `DELETE` on `test_types` PHYSICALLY removed the row while the
+catalogue declares `tombstone_col=deleted_at`, so those rows RESURRECT on any
+fresh seed (§10i's hazard, live). The ingress path soft-deletes on its own,
+which is why every mutate() test all week looked correct — the psql door was
+the unguarded one, and that is precisely the door SECURITY.md says the guards
+exist to cover. `check.py`'s own tenant-capable section flags the same two
+tables from the declared-vs-actual angle: two independent checks, one defect.
+NOT repaired here — re-running `zebridge_enable(..., writable => true)` on a
+shared dev stack is the operator's call, and the checker's job is to say so.
+
+**Two bugs in the checker itself, both caught by verifying findings against
+ground truth rather than trusting the output** — the discipline §10h named:
+  1. `active::text` renders `true`/`false`, while a RAW boolean column renders
+     `t`/`f` through `psql -tA`. Comparing against one form mis-read the other:
+     the tool called a demonstrably streaming slot INACTIVE (six samples said
+     `true`, `pg_stat_replication` said `streaming`), and — far worse — read
+     `generations::text` as false for every table, so **gate D silently skipped
+     every chain check and reported green by not looking**. A checker that
+     passes by omission is worse than no checker. One `truthy()` helper now
+     accepts both forms, and gate D really verifies 21 (tenant, table) chains.
+  2. Gate E doubled `check.py`'s ✗ because its lines carry ANSI escapes, so
+     `lstrip('✗ ')` never reached the glyph. Stripped properly, which also
+     keeps `--json` text clean.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
