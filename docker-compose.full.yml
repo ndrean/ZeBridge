@@ -445,10 +445,15 @@ services:
       # bridge stopped assembling connections out of parts: DATABASE_READER_URL in
       # .env.docker is the single source, and it already names postgres-primary:5432.
       TOPOLOGY_PATH: /grammar.json
-      # The bridge's own key. .env.docker carries it as NATS_BRIDGE_NKEY_SEED because
-      # that is the name nats-init and nats-config-gen use; the bridge reads
-      # NATS_NKEY_SEED.
-      NATS_NKEY_SEED: ${NATS_BRIDGE_NKEY_SEED}
+      # No seed mapping here. The bridge reads NATS_BRIDGE_NKEY_SEED — the same name
+      # nats-init and nats-config-gen use — so .env.docker's copy reaches it through
+      # env_file with nothing in between. A translation line
+      # (`NATS_NKEY_SEED: ${NATS_BRIDGE_NKEY_SEED}`) is exactly the kind of second
+      # spelling this whole day has been about removing.
+      #
+      # ⚠️ Direction check, since it is the one that matters: the SERVER holds the
+      # PUBLIC key (nats-server.conf renders `nkey: "U…"` from NATS_BRIDGE_NKEY_PUB and
+      # contains no seed at all), and the CLIENTS hold the seed. Never the reverse.
     # No --slot/--pub: BRIDGE_CDC_SLOT and BRIDGE_CDC_PUBLICATION are in .env.docker,
     # and this is exactly the flagless boot they exist for. Neither has a default, so
     # removing them from the env file stops the container rather than guessing.
