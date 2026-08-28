@@ -230,8 +230,8 @@ docker compose -f docker-compose.full.yml down -v --remove-orphans
 docker compose -f docker-compose.full.yml up -d \
   postgres-primary nats-config-gen nats-server nats-init bridge-init
 
-set -a && source .env && set +a
-./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090   # keep visible
+set -a && source .env.bridge && set +a
+./zig-out/bin/bridge --port 9090          # slot and publication come from .env.bridge
 cd web-consumer && npm run dev                                  # keep open
 
 cd emitter

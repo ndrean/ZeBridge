@@ -69,3 +69,7 @@ README.md.bak
 reorganize.py
 test_map.zig
 seed.txt
+# The pre-split .env, removed 2026-08-28. The three files that replaced it
+# (.env.bridge, .env.docker, .env.admin) are tracked; a bare .env is not, so a
+# local scratch copy cannot drift back into the repo.
+/.env

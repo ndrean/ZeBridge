@@ -36,7 +36,7 @@ lazily, so a missing dependency surfaces at connect time, not at install time.
 | --- | --- |
 | `NATS_URL` | `nats://127.0.0.1:4222` |
 | `NATS_CREDS` | *the JWT world's credential*: path to a .creds file (bridge.creds for admin scenarios, a principal's for client ones). Wins over the seed in `connect()` and `nats_cli` |
-| `NATS_BRIDGE_NKEY_SEED` | legacy (pre-operator server), from `.env` |
+| `NATS_BRIDGE_NKEY_SEED` | legacy (pre-operator server), from `.env.bridge` |
 | `ZB_PSQL` | `docker exec -i postgres-primary psql -U postgres` |
 | `DATABASE_READER_URL` | *required by the bridge-spawning probes* — they start a real bridge, and it no longer has a PG_HOST/PG_USER fallback |
 | `ZB_BRIDGE_ARGS` | `--slot zb_probe --pub my_pub --port 9096` — the probes get their own slot and port so they never disturb a running bridge |

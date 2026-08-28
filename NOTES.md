@@ -5392,6 +5392,27 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10aj. The pre-split `.env` is gone (2026-08-28)
+
+`.env` was still tracked, three env files after it stopped being read. It carried a
+complete snapshot of the old world — 20 values: both role passwords, PG superuser
+credentials, the publication and slot, the NATS seed AND the server's public key —
+and **nothing sourced it**. Every one of those values now lives in `.env.bridge`,
+`.env.docker` or `.env.admin`, so the file was 20 duplicate definitions waiting to
+disagree with the real ones, in the one file a newcomer is most likely to open.
+
+Checked before deleting: every name it carried is defined somewhere else, except
+`NATS_HOST` — and that absence is correct. The bridge IGNORES `NATS_HOST` (it reads
+`NATS_URL`, host and port together), and `scripts/scenarios/endpoint.py` is the
+regression test that proves it, asserting the log line `NATS_HOST='…' is ignored`.
+It reached the old `.env` from the era when the mutation listener read it raw and
+dialled `NATS_HOST:4222` whatever the URL said.
+
+Two documents still said `source .env` and now say `.env.bridge`
+(`TEST_SCENARIOS.md`'s F-group setup, `scripts/scenarios/README.md`). `/.env` is in
+`.gitignore` now, root-anchored so it cannot match `.env.bridge` and friends — a
+local scratch copy can exist without drifting back into the repository.
+
 ## 10ai. The compose stack could not run a bridge — four defects behind one comment (2026-08-28)
 
 `# bridge:` had been commented out in `docker-compose.full.yml` "for local
