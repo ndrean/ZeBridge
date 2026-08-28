@@ -34,7 +34,7 @@ import {
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
-  fkTextDiffers, viewSteps, indexSyncPlan,
+  fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
 
@@ -170,6 +170,20 @@ export function principalFromCreds(creds: string): string | null {
     const payload = m[1].split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
     return JSON.parse(atob(payload)).name ?? null;
   } catch { return null; }
+}
+
+/// The version an outbox entry carries, dug out of the envelope it stored.
+///
+/// The payload is the mutation envelope as JSON (`{version, key, data}`), so the
+/// version is a field of it rather than a column — the outbox table deliberately does
+/// not duplicate it, and a copy would be one more thing to drift.
+function outboxVersionOf(row: { payload?: string }): string | null {
+  try {
+    const v = JSON.parse(row.payload ?? '').version;
+    return typeof v === 'string' && v.length ? v : null;
+  } catch {
+    return null;
+  }
 }
 
 export class ZeBridge {
@@ -547,6 +561,25 @@ export class ZeBridge {
   private async outboxDrop(msgId: string) {
     await this.outboxInitPromise;
     await this.run(`DELETE FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+  }
+
+  /// The one row of `zebridge_gc_watermark`, read from THIS client's own replica.
+  ///
+  /// No extra subscription and no request path: the table arrives over CDC like any
+  /// other, which is the whole point of publishing it (§10as). Returns null whenever
+  /// the answer is not known — the table is not replicated here, has no row yet, or
+  /// the read failed — and `outboxWatermarkGate` treats null as "refuse nothing".
+  ///
+  /// ⚠️ Deployments exist where this table is absent (it is only in a publication if
+  /// the DBA put it there), so a missing table is an ordinary state, not an error.
+  public async gcWatermark(): Promise<string | null> {
+    try {
+      const rows = await this.run(`SELECT watermark FROM zebridge_gc_watermark LIMIT 1`);
+      const w = rows?.[0]?.watermark;
+      return typeof w === 'string' && w.length ? w : null;
+    } catch {
+      return null;
+    }
   }
 
   /// Public for the console (`zb.outbox()`): a queue you only inspect when something
@@ -1829,6 +1862,39 @@ export class ZeBridge {
       return;
     }
     if (!rows.length) return;
+
+    // ── the GC watermark gate (PROTOCOL.md §MUST 6) ─────────────────────────
+    //
+    // Runs BEFORE the first publish, not per-entry inside the loop: one read of the
+    // watermark for the whole flush, and an entry that must not be sent is never
+    // sent even if a later one fails.
+    const watermark = await this.gcWatermark();
+    const gate = outboxWatermarkGate(
+      rows.map((r: any) => ({ msgId: r.msg_id, version: outboxVersionOf(r) })),
+      watermark,
+    );
+    if (gate.refuse.length) {
+      const refused = new Set(gate.refuse);
+      for (const r of rows.filter((x: any) => refused.has(x.msg_id))) {
+        // Same handling as a `rejected` verdict, and for the same reason: this write
+        // will never be sent, so the optimistic copy is a divergence. Restore the
+        // before-image and say so — the user's edit is being dropped, and PROTOCOL
+        // §SHOULD 2's rule (surface it, never silently discard) is exactly this case.
+        await this.revertOptimisticWrite(r.msg_id, 'restore');
+        await this.outboxDrop(r.msg_id);
+        this.appendLog(
+          'OUTBOX',
+          `${r.tbl}[${r.row_id}] ${r.msg_id} was queued before the GC watermark ` +
+            `(${watermark}) and CANNOT be sent: the tombstone that would have overruled ` +
+            `it has been reaped, so sending it would resurrect a deleted row ` +
+            `(PROTOCOL §MUST 6). The local copy has been reverted — this edit is lost.`,
+          'ERROR',
+        );
+      }
+      rows = rows.filter((x: any) => !refused.has(x.msg_id));
+      if (!rows.length) return;
+    }
+
     this.appendLog('OUTBOX', `replaying ${rows.length} unconfirmed write(s)`, 'INFO');
     for (const r of rows) {
       if (!this.nc) return;

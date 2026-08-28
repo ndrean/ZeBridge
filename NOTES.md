@@ -5487,10 +5487,54 @@ edge client could actually write. The cost of a legitimate read path was an
 illegitimate write path — they came from the same row, and only the write half was
 ever wrong. Reading it never required writing it.
 
-**TODO**: implement the check in `zb-client-ts` — on reconnect, before flushing the
-outbox, compare each queued mutation's version against the replicated watermark and
-refuse (surfacing it, like `row_deleted`) rather than sending. Then the same in
-`libzb`.
+**BUILT** the same day — see §10at. Still TODO in `libzb` (the Zig client), which
+shares the fixtures and can implement `outboxWatermarkGate` against them.
+
+## 10at. The outbox watermark gate, built (2026-08-28)
+
+PROTOCOL §MUST 6, implemented in `zb-client-ts`: before flushing the outbox, refuse
+any queued mutation older than the replicated GC watermark, because the tombstone that
+would have overruled it has been reaped and sending it resurrects a deleted row.
+
+Split the way everything else here is split — decision in the pure core, I/O in the
+client:
+
+    core.ts      outboxWatermarkGate(entries, watermark) -> { send, refuse }
+    libzb.ts     gcWatermark()  reads the one row from THIS replica
+                 flushOutbox()  gates BEFORE the first publish
+
+**Conservative in both directions, deliberately.** A null watermark refuses NOTHING —
+the table is only in a publication if the DBA put it there, so "not known" is an
+ordinary deployment and refusing there would break every client of a stack that never
+enabled GC. An entry with no version is likewise never refused: the server's own
+version guard is still in front of it, and dropping an edit we cannot judge costs a
+user their work for no reason. The comparison is `<=`, not `<` — the watermark is the
+OLDEST STANDING tombstone, so a mutation stamped exactly at it may already have lost
+its overruling tombstone.
+
+**Refusal behaves like a `rejected` verdict**, which is what it is: revert the
+optimistic apply to the before-image, drop the entry, and log at ERROR naming the
+table, the row, the watermark and the consequence. PROTOCOL §SHOULD 2 — surface it,
+never silently discard — applies exactly here, and this is the one case where LWW
+cannot decide for the user because every version it would compare has been reaped.
+
+**The gate runs once per flush, before the loop**, not per entry inside it: one read
+of the watermark for the whole pass, and an entry that must not be sent is not sent
+even if an earlier publish throws.
+
+Verified two ways. Nine fixtures in `core-fixtures.json` (101 cases total, all green),
+including the two that would silently pass with a naive string compare — PG trims
+trailing fractional zeros, so `.5Z` vs `.50001Z` orders wrongly until
+`normalizeVersion` pads both. And the WIRING, against a real `ZeBridge` over node
+storage with no broker at all:
+
+    watermark read from the replica: 2026-08-01T00:00:00.000000Z
+    queued: stale, fresh
+    still queued after flush: fresh
+    ✓ stale entry refused and dropped
+    ✓ fresh entry kept (no broker to send it to)
+
+`zb.watermark()` joins the console handle next to `zb.outbox()`.
 
 ## 10ar. The complete list of bridge-owned tables, derived rather than remembered (2026-08-28)
 

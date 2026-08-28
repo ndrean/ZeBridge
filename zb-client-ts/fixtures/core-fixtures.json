@@ -1489,5 +1489,149 @@
       "floor": "2026-08-27T10:00:01.000000Z",
       "out": "2026-08-27T10:00:05.000010Z"
     }
+  ],
+  "outboxWatermark": [
+    {
+      "name": "no watermark known -> everything sends (GC may simply be off)",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": "2020-01-01T00:00:00.000000Z"
+        }
+      ],
+      "watermark": null,
+      "send": [
+        "a"
+      ],
+      "refuse": []
+    },
+    {
+      "name": "empty-string watermark is treated as unknown, not as the epoch",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": "2020-01-01T00:00:00.000000Z"
+        }
+      ],
+      "watermark": "",
+      "send": [
+        "a"
+      ],
+      "refuse": []
+    },
+    {
+      "name": "newer than the watermark -> sends",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": "2026-08-28T12:00:00.000000Z"
+        }
+      ],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "send": [
+        "a"
+      ],
+      "refuse": []
+    },
+    {
+      "name": "older than the watermark -> REFUSED, its tombstone was reaped",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": "2026-07-01T00:00:00.000000Z"
+        }
+      ],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "send": [],
+      "refuse": [
+        "a"
+      ]
+    },
+    {
+      "name": "exactly AT the watermark -> refused; the oldest standing tombstone is not a safe boundary",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": "2026-08-01T00:00:00.000000Z"
+        }
+      ],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "send": [],
+      "refuse": [
+        "a"
+      ]
+    },
+    {
+      "name": "an entry with no version is never refused \u2014 the server's version guard still fronts it",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": null
+        }
+      ],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "send": [
+        "a"
+      ],
+      "refuse": []
+    },
+    {
+      "name": "mixed queue splits, and order within each side is preserved",
+      "entries": [
+        {
+          "msgId": "old1",
+          "version": "2026-01-01T00:00:00.000000Z"
+        },
+        {
+          "msgId": "new1",
+          "version": "2026-09-01T00:00:00.000000Z"
+        },
+        {
+          "msgId": "old2",
+          "version": "2026-02-01T00:00:00.000000Z"
+        },
+        {
+          "msgId": "new2",
+          "version": "2026-10-01T00:00:00.000000Z"
+        }
+      ],
+      "watermark": "2026-08-01T00:00:00.000000Z",
+      "send": [
+        "new1",
+        "new2"
+      ],
+      "refuse": [
+        "old1",
+        "old2"
+      ]
+    },
+    {
+      "name": "trimmed PG fractional digits compare correctly once normalized",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": "2026-08-01T00:00:00.5Z"
+        }
+      ],
+      "watermark": "2026-08-01T00:00:00.50001Z",
+      "send": [],
+      "refuse": [
+        "a"
+      ]
+    },
+    {
+      "name": "and the same pair the other way round",
+      "entries": [
+        {
+          "msgId": "a",
+          "version": "2026-08-01T00:00:00.50001Z"
+        }
+      ],
+      "watermark": "2026-08-01T00:00:00.5Z",
+      "send": [
+        "a"
+      ],
+      "refuse": []
+    }
   ]
 }

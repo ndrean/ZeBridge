@@ -522,6 +522,49 @@ export function normalizeVersion(v: string): string {
 
 export const maxVersion = (a: string, b: string): string => (b > a ? b : a);
 
+export type OutboxCandidate = { msgId: string; version: string | null };
+export type OutboxGate = { send: string[]; refuse: string[] };
+
+/// PROTOCOL.md §MUST 6 — the GC watermark bounds how long a queued write stays
+/// SENDABLE, and this decides which of an outbox's entries have passed it.
+///
+/// A mutation older than the watermark cannot be applied safely. The tombstone that
+/// would have overruled it has already been reaped, so the server has nothing left to
+/// compare against and the write lands as a resurrection of a row someone deleted.
+/// That is the one failure LWW cannot catch on its own: every version comparison the
+/// bridge could make has been discarded.
+///
+/// Deliberately conservative in both directions, because both unknowns are common and
+/// neither is evidence of danger:
+///
+///   * no watermark (null) — the client has never received the one row of
+///     `zebridge_gc_watermark`, e.g. it is not published in this deployment. Nothing
+///     is known, so nothing is refused; refusing here would break every client of a
+///     deployment that simply never enabled GC.
+///   * no version on an entry — the server's own version guard is still in front of
+///     it, and refusing a write we cannot judge would lose an edit for no reason.
+///
+/// The comparison is `<=`: a mutation stamped exactly AT the watermark is refused,
+/// because the watermark is the oldest tombstone still standing — anything at or
+/// before it may already have been reaped. String comparison after `normalizeVersion`,
+/// the same rule the chain planner uses on cutoffs (§7.2 fixes the wire format, so
+/// lexicographic order is chronological order once the widths match).
+export function outboxWatermarkGate(
+  entries: OutboxCandidate[],
+  watermark: string | null,
+): OutboxGate {
+  if (!watermark) return { send: entries.map((e) => e.msgId), refuse: [] };
+  const mark = normalizeVersion(watermark);
+  const send: string[] = [];
+  const refuse: string[] = [];
+  for (const e of entries) {
+    if (e.version && normalizeVersion(e.version) <= mark) refuse.push(e.msgId);
+    else send.push(e.msgId);
+  }
+  return { send, refuse };
+}
+
+
 /// The HLC stamp: strictly after BOTH this client\'s own last stamp and the
 /// newest version it has seen arrive. With an accurate clock this is exactly
 /// the wall time; with a slow one it is the observed floor plus one microsecond.

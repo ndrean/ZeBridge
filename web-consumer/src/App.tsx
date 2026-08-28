@@ -149,6 +149,10 @@ if (typeof window !== 'undefined') {
     ids: async (table: string, col = 'id') =>
       (await zb.query(`SELECT ${col} FROM ${table} ORDER BY ${col}`)).map((r: any) => r[col]),
     outbox: () => zb.outboxAll(),
+    // The GC watermark as THIS replica sees it — the bound on how long a queued
+    // write stays sendable (PROTOCOL §MUST 6). null means the table is not
+    // replicated here, which is a normal deployment, not a fault.
+    watermark: () => zb.gcWatermark(),
     flushOutbox: () => zb.flushOutbox(),
     /** The blessed write path, exposed for console-driven tests (oversize probes,
      *  scripted demos). Same rules as the buttons — verdicts and reverts included. */

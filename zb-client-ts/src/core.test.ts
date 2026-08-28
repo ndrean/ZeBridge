@@ -14,6 +14,7 @@ import {
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
   seedGateDrops, planFromManifest, fullPredatesReplica, scopeSeeding,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
+  outboxWatermarkGate,
 } from './core.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -24,6 +25,10 @@ for (const c of fx.seedGate) {
 }
 for (const c of fx.chainPlan) {
   test(`chainPlan: ${c.name}`, () => assert.deepEqual(planFromManifest(c.manifest, c.watermark), c.plan));
+}
+for (const c of fx.outboxWatermark) {
+  test(`outboxWatermark: ${c.name}`, () =>
+    assert.deepEqual(outboxWatermarkGate(c.entries, c.watermark), { send: c.send, refuse: c.refuse }));
 }
 for (const c of fx.fullPredates) {
   test(`fullPredates: ${c.name}`, () =>
