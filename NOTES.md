@@ -5455,6 +5455,43 @@ is a hypothesis, not a verdict. The cheap test — actually perform the write �
 one that distinguishes a redundant check from a live vulnerability, and it is exactly
 the test I skipped in §10ah. zbdoctor was doing its job; I overrode it with reasoning.
 
+## 10as. What zebridge_gc_watermark is public FOR — and the MUST no client implements (2026-08-28)
+
+Asked while reviewing §10aq: if the watermark must not be writable, what is the point
+of it being published at all?
+
+**It is readable on purpose, and it is a protocol MUST.** PROTOCOL.md §"MUST" item 6:
+before flushing a queued outbox after a long offline period, a client checks the one
+row of `zebridge_gc_watermark`. A mutation older than the watermark **cannot be
+applied safely** — the tombstone that would have overruled it has already been reaped,
+so flushing it RESURRECTS a deleted row. Delivering it as an ordinary replicated
+one-row table is the elegant part: no extra subscription, no request path, it is
+simply already in the client's own replica.
+
+**No client implements it.** Grepped: `zebridge_gc_watermark` appears nowhere in
+`zb-client-ts/src`, `libzb/src` or `web-consumer/src`, and there is no outbox-age or
+stale-flush check of any kind. (The `watermark` identifiers that do appear are the
+generation-chain watermark — a different thing entirely, local to the client.) So the
+row is replicated into every replica and read by nobody, and the resurrection this
+MUST exists to prevent is currently unprevented for any client that queues writes
+across a GC cycle.
+
+Earlier work fixed the DELIVERY half (§ above: the table was missing from
+`public_tables`, so its CDC route had silently never worked). The CONSUMING half was
+never built, and nothing was tracking that.
+
+**And the connection back to §10aq worth stating plainly.** Being publishable is why
+it has a `zebridge_catalogue` row; having a catalogue row is why the ingress path
+could resolve its identifiers; and that is why it was the one bridge-owned table an
+edge client could actually write. The cost of a legitimate read path was an
+illegitimate write path — they came from the same row, and only the write half was
+ever wrong. Reading it never required writing it.
+
+**TODO**: implement the check in `zb-client-ts` — on reconnect, before flushing the
+outbox, compare each queued mutation's version against the replicated watermark and
+refuse (surfacing it, like `row_deleted`) rather than sending. Then the same in
+`libzb`.
+
 ## 10ar. The complete list of bridge-owned tables, derived rather than remembered (2026-08-28)
 
 After §10aq the operator observed that `zebridge_gc_watermark` looked like the only
