@@ -5178,6 +5178,30 @@ them into noise the operator learns to ignore:
     writer role holds INSERT. An outbound-only table (`users`) legitimately
     declares a version column with no trigger.
 
+**The auditor principal, and the grant that shaped the tool.** zbdoctor runs as
+its own least-privilege identity — `bridge_reader` on Postgres (measured: every
+gate passes, no permission degradation) and a dedicated `zbdoctor` NATS user
+minted by jwt-bootstrap.sh. Two things had to be right:
+  * It is signed by the account IDENTITY key, not by a signing key. Both of
+    this account's signing keys are ROLE-SCOPED, and a scoped signing key
+    REPLACES the user JWT's own permissions — a narrow auditor minted under
+    the service key would silently inherit `>` and be able to read everything.
+  * The grant set was narrowed by measurement (remove one, re-run, see what
+    goes red), landing at: `$JS.API.INFO`, `STREAM.NAMES`, `STREAM.INFO.>`,
+    `DIRECT.GET.>`, and sub `_INBOX.>`.
+
+⚠️ **The narrowing changed the TOOL, not just the grant.** `nats kv ls` needs
+CONSUMER.CREATE — and a credential that can create a consumer can READ that
+stream, so listing keys would have forced the auditor to hold the very power it
+exists to verify nobody has. But zbdoctor never needs to know *what keys
+exist*, only *whether key X does* — every question is per-key. Gate D now does
+per-key GETs, which needs nothing beyond DIRECT.GET, the same shape a tenant
+client uses. Verified negatively as well as positively: with these creds the
+tool passes all five gates, and `nats pub` is refused ("Permissions Violation")
+while `nats consumer add` dies as "context deadline exceeded" — the opaque
+denial of an unauthorized JetStream API publish, which is itself why the
+failure messages name which credential mode was in play.
+
 **It found a real, live defect on its first honest run**: `test_types` and
 `salaries` carry ONLY `zebridge_width_guard` — no `zebridge_bump_version_t`, no
 `zebridge_soft_delete_t`, no `zebridge_guard_tenant_t`. Proven empirically, not

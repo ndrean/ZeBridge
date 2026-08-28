@@ -28,10 +28,17 @@ Environment (all optional, sane defaults):
     NATS_CREDS               a .creds file (operator/JWT mode) — wins if both are set
     NATS_NKEY_SEED           the seed itself (nkey mode), as the bridge takes it
 
-⚠️ Gate C and D need an ADMIN credential: they list streams and read the
-generations KV. A client's own creds authenticate fine and then answer
-"no streams" — the grants are per-principal by design. Use the same
-credential nats-init / the bridge itself uses.
+⚠️ Gates C and D need ADMIN-SHAPED reach: they enumerate streams and read the
+KV/object stores. A tenant client's own creds authenticate fine and then show
+an empty world — grants are per-principal by design. Use the dedicated
+auditor minted by scripts/native/jwt-bootstrap.sh:
+
+    NATS_CREDS=scripts/native/creds/zbdoctor.creds
+
+It is read-only by construction (NOTES §10y): stream names/info, per-key
+DIRECT.GET, its own inbox — and no CONSUMER.CREATE, so it cannot read a
+stream's data even though it can see that the stream exists. Postgres needs
+no more than the read role either: `bridge_reader` runs every gate.
     BRIDGE_URL               the bridge's HTTP      (default: http://127.0.0.1:9090)
 """
 
@@ -376,11 +383,18 @@ def gate_client(catalogue: dict, tenants: list[str], streams: set[str]) -> None:
         print(f"  {DIM}skipped — NATS is unreachable{OFF}")
         return
 
+    # ⚠️ Every question below is "does key X exist?", never "what keys exist?" —
+    # so each is a per-key GET, not a `kv ls`. Listing keys requires consumer
+    # CREATION rights, and a credential that can create a consumer on a stream
+    # can READ that stream: an auditor would need the very grant it exists to
+    # verify nobody has. Per-key gets need only DIRECT.GET, which is the same
+    # least-privilege shape the tenant clients use (§10y).
+    def kv_has(bucket: str, key: str) -> bool:
+        return nats("kv", "get", bucket, key, "--raw").returncode == 0
+
     # 1. every catalogue table must have a published schema, or a client cannot
     #    even build the local table.
-    r = nats("kv", "ls", KV_SCHEMAS)
-    published = {k.strip() for k in r.stdout.splitlines() if k.strip()} if r.returncode == 0 else set()
-    missing = [t for t in catalogue if t not in published]
+    missing = [t for t in catalogue if not kv_has(KV_SCHEMAS, t)]
     if missing:
         red("D", f"no published schema for: {', '.join(sorted(missing))}",
             "the bridge publishes every catalogue table's schema at boot — a table enabled "
@@ -389,13 +403,11 @@ def gate_client(catalogue: dict, tenants: list[str], streams: set[str]) -> None:
         ok(f"every catalogue table has a published schema ({len(catalogue)})")
 
     # 2. every mapped principal must resolve its tenant (PROTOCOL Step 0).
-    r = nats("kv", "ls", KV_TENANTS)
-    mapped_kv = {k.strip() for k in r.stdout.splitlines() if k.strip()} if r.returncode == 0 else set()
     try:
         principals = [row[0] for row in psql("SELECT DISTINCT principal FROM zebridge_user_tenants") if row[0]]
     except RuntimeError:
         principals = []
-    lacking = [p for p in principals if p not in mapped_kv]
+    lacking = [p for p in principals if not kv_has(KV_TENANTS, p)]
     if lacking:
         red("D", f"principal(s) with no $KV.{KV_TENANTS} entry: {', '.join(sorted(lacking))}",
             "Step 0 fails for them — the client cannot resolve its tenant and reads nothing")
@@ -406,9 +418,6 @@ def gate_client(catalogue: dict, tenants: list[str], streams: set[str]) -> None:
     #    is there a chain manifest, and does the object it names actually exist?
     #    The second half is the two-sided-cleanup failure (NOTES §10r): a manifest
     #    whose objects were purged leaves the producer building deltas over a void.
-    r = nats("kv", "ls", KV_GENERATIONS)
-    manifests = {k.strip() for k in r.stdout.splitlines() if k.strip()} if r.returncode == 0 else set()
-
     expected: list[tuple[str, str]] = []
     for tbl, meta in catalogue.items():
         if not meta["generations"]:
@@ -425,9 +434,6 @@ def gate_client(catalogue: dict, tenants: list[str], streams: set[str]) -> None:
     no_chain, dangling, checked = [], [], 0
     for tenant, tbl in expected:
         key = f"{tenant}.{tbl}"
-        if key not in manifests:
-            no_chain.append(key)
-            continue
         got = nats("kv", "get", KV_GENERATIONS, key, "--raw")
         if got.returncode != 0:
             no_chain.append(key)

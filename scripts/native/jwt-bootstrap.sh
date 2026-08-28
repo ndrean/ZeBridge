@@ -93,7 +93,35 @@ for spec in alice:acme bob:globex mary:globex nina:tango omar:kilo; do
   nsc add user --account ZEBRIDGE --name "$u" -K "$SK_CLIENT" --tag "tenant:$t" 2>/dev/null || echo "$u exists"
 done
 
-for u in bridge alice bob mary nina omar; do
+# ── the auditor: zbdoctor's own principal, read-only by construction ────────
+#
+# ⚠️ Minted WITHOUT -K, i.e. signed by the account IDENTITY key. Both signing
+# keys above are ROLE-SCOPED, and a scoped signing key REPLACES whatever
+# permissions the user JWT carries — so a "narrow" auditor minted under one
+# would silently inherit its template (`>` for the service key) and be able to
+# read every tenant's data. Signed by the identity key, the user's own
+# permissions are what the server enforces.
+#
+# The grant set is the MEASURED minimum for scripts/zbdoctor.py (NOTES §10y),
+# narrowed by removing grants until a gate went red:
+#   INFO          the account probe every JetStream client issues first
+#   STREAM.NAMES  the topology gate (does CDC_<tenant> exist?)
+#   STREAM.INFO.> stream state, and the object-store meta lookups
+#   DIRECT.GET.>  per-key KV reads and chain objects
+#   _INBOX.>      request/reply replies — the grant everyone forgets
+#
+# ⚠️ NOT granted: CONSUMER.CREATE. A credential that can create a consumer can
+# READ that stream, which is precisely what an auditor must not do. `nats kv ls`
+# needs it, so zbdoctor asks "does key X exist?" per key instead of listing —
+# that design choice is what keeps this grant set this small.
+nsc add user --account ZEBRIDGE --name zbdoctor \
+    --allow-pub "\$JS.API.INFO" \
+    --allow-pub "\$JS.API.STREAM.NAMES" \
+    --allow-pub "\$JS.API.STREAM.INFO.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.>" \
+    --allow-sub "_INBOX.>" 2>/dev/null || echo "zbdoctor exists"
+
+for u in bridge alice bob mary nina omar zbdoctor; do
   nsc generate creds --account ZEBRIDGE --name "$u" > "$CREDS/$u.creds"
 done
 chmod 600 "$CREDS"/*.creds
