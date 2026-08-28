@@ -302,7 +302,8 @@ def gate_postgres(catalogue: dict) -> None:
         # table turned out to be genuinely writable from the edge (NOTES §10aq). If
         # the name list here and the one in the bridge ever drift apart, this line
         # goes back to hiding a real finding.
-        BRIDGE_OWNED = {"zebridge_ddl_events", "zebridge_gc_watermark", "zebridge_user_tenants"}
+        BRIDGE_OWNED = {"zebridge_ddl_events", "zebridge_gc_watermark",
+                        "zebridge_user_tenants", "zebridge_invites"}
 
         missing = 0
         for tbl in sorted((set(catalogue) & writable) - BRIDGE_OWNED):

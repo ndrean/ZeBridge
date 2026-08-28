@@ -1005,13 +1005,25 @@ pub const MutationListener = struct {
     /// client, so moving it is a global act by one principal.
     ///
     /// `zebridge_user_tenants` is the principal→tenant roster: a forged row is
-    /// cross-tenant privilege escalation. It was reachable only by accident — it is not
-    /// in the catalogue, so the listener fails to resolve it — and an accident is not a
-    /// control.
+    /// cross-tenant privilege escalation.
+    ///
+    /// `zebridge_invites` is the enrollment table, and `bridge_writer` holds
+    /// SELECT+UPDATE on it because redeeming an invite stamps `used_at`. UPDATE covers
+    /// every column, so a client who knows any code — their own, already spent — could
+    /// clear `used_at` to replay it, push `expires_at` out, or rewrite
+    /// `principal`/`tenant_id`/`role` and enrol as somebody else in another tenant.
+    ///
+    /// ⚠️ Both of those were reachable only BY ACCIDENT: neither is in
+    /// `zebridge_catalogue`, so the listener fails to resolve their identifiers. That
+    /// is not a control — it is a property of a config table that a future migration
+    /// could change without anyone connecting it to this. `zebridge_gc_watermark` IS in
+    /// the catalogue, which is the whole difference between the three, and it is the
+    /// one that was actually exploited (§10aq).
     fn isForbiddenTable(table: []const u8) bool {
         return std.mem.eql(u8, table, "zebridge_ddl_events") or
             std.mem.eql(u8, table, "zebridge_gc_watermark") or
             std.mem.eql(u8, table, "zebridge_user_tenants") or
+            std.mem.eql(u8, table, "zebridge_invites") or
             std.mem.eql(u8, table, "schema_migrations");
     }
 

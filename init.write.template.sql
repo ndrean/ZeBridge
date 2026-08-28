@@ -100,13 +100,18 @@ BEGIN
     --                          dragged it back six years with a single mutation
     --   zebridge_user_tenants  the principal->tenant roster: a forged row is
     --                          cross-tenant privilege escalation
+    --   zebridge_invites       the enrollment table. bridge_writer holds UPDATE so
+    --                          redemption can stamp used_at — and UPDATE covers every
+    --                          column, so a known code could be un-spent, un-expired,
+    --                          or re-pointed at another principal, tenant and role
     --
     -- This does not revoke what the BRIDGE itself needs (the sweeper writes the
     -- watermark as bridge_writer, and must keep that grant). It refuses to hand those
     -- tables to the EDGE, which is a different question and the one that was wrong.
     IF tbl_name IN ('zebridge_ddl_events',   'public.zebridge_ddl_events',
                     'zebridge_gc_watermark', 'public.zebridge_gc_watermark',
-                    'zebridge_user_tenants', 'public.zebridge_user_tenants') THEN
+                    'zebridge_user_tenants', 'public.zebridge_user_tenants',
+                    'zebridge_invites',      'public.zebridge_invites') THEN
         RAISE EXCEPTION 'refusing to grant edge writes on %: this is a bridge-owned '
                         'table — a forged row here reaches every client', tbl_name;
     END IF;

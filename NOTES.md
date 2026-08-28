@@ -5455,6 +5455,48 @@ is a hypothesis, not a verdict. The cheap test — actually perform the write �
 one that distinguishes a redundant check from a live vulnerability, and it is exactly
 the test I skipped in §10ah. zbdoctor was doing its job; I overrode it with reasoning.
 
+## 10ar. The complete list of bridge-owned tables, derived rather than remembered (2026-08-28)
+
+After §10aq the operator observed that `zebridge_gc_watermark` looked like the only
+bridge table exposed that way. Checked instead of agreed, and it is **not** — there is
+a fourth, and it is a worse target.
+
+Enumerated from the templates, so the answer does not depend on a running stack:
+
+    table                    writer grant        in catalogue?   was refused?
+    zebridge_ddl_events      (refused already)   yes             yes
+    zebridge_gc_watermark    INSERT/UPDATE       YES             no  -> EXPLOITED §10aq
+    zebridge_user_tenants    INSERT              no              no
+    zebridge_invites         SELECT, UPDATE      no              no  <- found here
+    zebridge_generations     (reader, not writer) —              n/a
+    zebridge_catalogue       none                —               n/a
+    zebridge_limits          none                —               n/a
+
+`zebridge_invites` is the enrollment table. `bridge_writer` holds UPDATE because
+redeeming an invite stamps `used_at` — and UPDATE covers EVERY column, so a client
+who knows any code (their own, already spent) could clear `used_at` to replay it,
+push `expires_at` out, or rewrite `principal` / `tenant_id` / `role` and enrol as
+somebody else in another tenant. It has no INSERT grant, so codes cannot be minted
+from nothing; one known code is enough.
+
+**Why only the watermark actually fired.** The listener resolves a table's identifiers
+from `zebridge_catalogue`, and only `zebridge_gc_watermark` has a catalogue row. The
+other two were "protected" by not being in a config table — which is a property a
+future migration can change without anyone connecting it to the ingress path. That is
+not a control, and it is now not the thing standing in the way.
+
+**The three lists that must agree** — the ingress refusal
+(`mutation_listener.zig isForbiddenTable`), the grant refusal
+(`zebridge_grant_edge_writes`), and zbdoctor's exemption set. They are checked against
+each other by hand today; the exemption comment says why that matters, because the
+day they drift is the day zbdoctor stops reporting the thing it caught in §10aq.
+A scenario asserting all three agree would be worth more than the comment.
+
+⚠️ Not exploited live: the stack was being shut down. `zebridge_invites` is closed by
+the same name check that is PROVEN to work on `zebridge_gc_watermark` (§10aq replayed
+the identical envelope and got `⛔ refused`), and by the grant refusal, which was
+verified directly.
+
 ## 10ap. Migrations no longer discard zebridge_enable's refusals (2026-08-28)
 
 The problem §10ai recorded, now fixed. Every emitter migration called
