@@ -141,7 +141,7 @@ async def main():
         # Expected as a client principal: `$JS.API.STREAM.INFO.<stream>` is not in a
         # client's allow-list, and should not be. Re-run with the bridge nkey to see it.
         print("dedup window: not readable as a client principal — re-run with "
-              "NATS_NKEY_SEED to report it\n")
+              "NATS_BRIDGE_NKEY_SEED to report it\n")
 
     def row(uid: str, text: str, version: str) -> dict:
         d = {

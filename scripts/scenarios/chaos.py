@@ -103,7 +103,7 @@ async def main():
     # ── 0. wrong NATS creds: clean refusal, audit-silent ──────────────────────
     bad = subprocess.run(
         [str(zb.BRIDGE), *zb.BRIDGE_ARGS],
-        env={**zb.bridge_env(), "NATS_CREDS": "/dev/null", "NATS_NKEY_SEED": None and "" or "SUINVALIDSEED"},
+        env={**zb.bridge_env(), "NATS_CREDS": "/dev/null", "NATS_BRIDGE_NKEY_SEED": None and "" or "SUINVALIDSEED"},
         capture_output=True, text=True, timeout=60,
     )
     out = bad.stderr + bad.stdout

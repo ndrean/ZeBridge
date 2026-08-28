@@ -23,7 +23,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOPOLOGY = json.loads((ROOT / "grammar.json").read_text())
 
 NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
-NKEY_SEED = os.environ.get("NATS_NKEY_SEED")
+NKEY_SEED = os.environ.get("NATS_BRIDGE_NKEY_SEED")
 
 # How to reach psql. Defaults to the compose stack; override for a remote database.
 PSQL = os.environ.get("ZB_PSQL", "docker exec -i postgres-primary psql -U postgres")
@@ -57,7 +57,7 @@ async def connect():
 
     Two shapes now, because the server carries per-principal permissions:
 
-      nkey            `NATS_NKEY_SEED` — the bridge's own key, authorised for everything.
+      nkey            `NATS_BRIDGE_NKEY_SEED` — the bridge's own key, authorised for everything.
                       Right for scenarios that inspect streams or act as the bridge.
       user/password   userinfo in `NATS_URL`, e.g.
                       `NATS_URL=nats://alice:s3cret@127.0.0.1:4222`. Right for anything
@@ -137,7 +137,7 @@ def bridge_env(**overrides) -> dict:
         sys.exit(
             "DATABASE_READER_URL is not set — the probes start a real bridge.\n"
             "  set -a && . ./.env.bridge && set +a\n"
-            '  export NATS_NKEY_SEED="SU..."'
+            '  export NATS_BRIDGE_NKEY_SEED="SU..."'
         )
     env = dict(os.environ)
     env.setdefault("LOG_LEVEL", "info")

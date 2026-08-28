@@ -25,7 +25,7 @@ then set TENANT_RULES, then reload NATS. Findings during that window are correct
 bugs. That is why this starts advisory.
 
 Usage:
-    NATS_URL=nats://127.0.0.1:4222 NATS_NKEY_SEED=SU... \
+    NATS_URL=nats://127.0.0.1:4222 NATS_BRIDGE_NKEY_SEED=SU... \
         python scripts/scenarios/check.py
 
     ZB_NATS_CONF=/config/nats-server.conf python scripts/scenarios/check.py   # in compose

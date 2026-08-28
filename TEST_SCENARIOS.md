@@ -36,7 +36,7 @@ nothing is actually verified. Do not tick those off early.
 ```bash
 # fresh everything
 docker compose -f docker-compose.full.yml --env-file .env.admin down -v --remove-orphans
-NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml --env-file .env.admin up -d \
+NATS_BRIDGE_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml --env-file .env.admin up -d \
   postgres-primary nats-config-gen nats-server nats-init bridge-init
 
 # admin: create tables + publication membership
@@ -45,7 +45,7 @@ cd emitter && mix run --no-start -e 'path = Path.join([File.cwd!(),"priv","repo"
 
 # bridge — .env.bridge only, so no admin credential enters this shell
 set -a && source .env.bridge && set +a
-NATS_NKEY_SEED="SU..." ./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
+NATS_BRIDGE_NKEY_SEED="SU..." ./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
 
 # client
 cd web-consumer && npm run dev      # http://localhost:5173

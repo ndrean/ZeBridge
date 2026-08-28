@@ -26,7 +26,7 @@ tick (a duplicate delta, absorbed by the guarded upsert — never a gap), so che
 are structural (bounds, kinds, windows), never tick-counting.
 
 Usage:  python scripts/scenarios/genproducer.py   (⚠️ owns the only bridge)
-Needs the probe-bridge env (`set -a && . ./.env.bridge && set +a`, NATS_NKEY_SEED)
+Needs the probe-bridge env (`set -a && . ./.env.bridge && set +a`, NATS_BRIDGE_NKEY_SEED)
 plus ZB_PSQL admin access for the row touches. Cleans up its rows, objects and
 pointer; the shared `generations` KV bucket and `gen-_default` store remain.
 """

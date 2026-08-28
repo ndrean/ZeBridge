@@ -26,7 +26,7 @@ Environment (all optional, sane defaults):
     ZB_PSQL / DATABASE_READER_URL   how to reach Postgres  (default: docker exec)
     NATS_URL                 how to reach NATS      (default: 127.0.0.1:4222)
     NATS_CREDS               a .creds file (operator/JWT mode) — wins if both are set
-    NATS_NKEY_SEED           the seed itself (nkey mode), as the bridge takes it
+    NATS_BRIDGE_NKEY_SEED           the seed itself (nkey mode), as the bridge takes it
 
 ⚠️ Gates C and D need ADMIN-SHAPED reach: they enumerate streams and read the
 KV/object stores. A tenant client's own creds authenticate fine and then show
@@ -132,9 +132,9 @@ def nkey_file() -> str | None:
     environment has to touch disk for the length of this run. Written 0600 and
     unlinked at exit: a seed travels in env/CLI and must not outlive the
     process in a file (SECURITY.md's rule, which is why the bridge takes
-    NATS_NKEY_SEED the same way)."""
+    NATS_BRIDGE_NKEY_SEED the same way)."""
     global _seed_path
-    seed = (os.environ.get("NATS_NKEY_SEED") or "").strip()
+    seed = (os.environ.get("NATS_BRIDGE_NKEY_SEED") or "").strip()
     if not seed:
         return None
     if _seed_path is None:
@@ -384,11 +384,11 @@ def gate_nats(tenants: list[str]) -> set[str]:
     if r.returncode != 0:
         detail = r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "failed"
         how = ("NATS_CREDS is set" if NATS_CREDS else
-               "NATS_NKEY_SEED is set" if os.environ.get("NATS_NKEY_SEED") else
+               "NATS_BRIDGE_NKEY_SEED is set" if os.environ.get("NATS_BRIDGE_NKEY_SEED") else
                "NO credential is set")
         red("C", f"cannot list NATS streams ({detail}) — {how}",
             "gates C and D need an ADMIN credential: export NATS_CREDS=<.creds file> "
-            "or NATS_NKEY_SEED=<seed>. A client principal's own credential "
+            "or NATS_BRIDGE_NKEY_SEED=<seed>. A client principal's own credential "
             "authenticates and then sees nothing — the grants are per-principal")
         return set()
     streams = {s.strip() for s in r.stdout.splitlines() if s.strip()}

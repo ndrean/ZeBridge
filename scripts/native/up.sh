@@ -109,7 +109,7 @@ if [ "$FRESH_NATS" = "1" ]; then
   source "$ROOT/.env.admin"
   set +a
   NATS_URL=127.0.0.1:4222
-  echo "$NATS_NKEY_SEED" > "$ROOT/scripts/native/seed.txt"
+  echo "$NATS_BRIDGE_NKEY_SEED" > "$ROOT/scripts/native/seed.txt"
   SEED="$ROOT/scripts/native/seed.txt"
 
   CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' "$ROOT/grammar.json")
@@ -149,7 +149,7 @@ cat <<EOF
   DATABASE_READER_URL="postgres://bridge_reader:bridge_password_changeme@127.0.0.1:${PGPORT}/postgres"
   DATABASE_WRITER_URL="postgres://bridge_writer:writer_password_changeme@127.0.0.1:${PGPORT}/postgres"
   NATS_URL="nats://127.0.0.1:4222"
-  NATS_NKEY_SEED=<from .env.admin>
+  NATS_BRIDGE_NKEY_SEED=<from .env.admin>
   ZB_PSQL="$PGBIN/psql -h 127.0.0.1 -p ${PGPORT} -U postgres"
 
 Tear down: scripts/native/down.sh (add --clean to also wipe postgres-data/ and nats-data/)

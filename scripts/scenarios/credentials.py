@@ -205,7 +205,7 @@ async def malformed_principal_is_visible():
 
     seed = zb.NKEY_SEED
     if not seed:
-        print("  (skipped: no NATS_NKEY_SEED, so these subjects cannot be published at all)")
+        print("  (skipped: no NATS_BRIDGE_NKEY_SEED, so these subjects cannot be published at all)")
         return 0
 
     bare = zb.NATS_URL.split("://", 1)

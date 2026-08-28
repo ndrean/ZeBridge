@@ -5392,6 +5392,95 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10ai. The compose stack could not run a bridge — four defects behind one comment (2026-08-28)
+
+`# bridge:` had been commented out in `docker-compose.full.yml` "for local
+host-based dev execution". A commented-out service is an untested service, and
+four independent breakages had accumulated behind it. All four are now fixed and
+the container runs.
+
+**1. `nats-init` died on a shell syntax error — since 2026-08-25.**
+`f3be486` moved per-tenant stream creation into the bridge's boot reconciliation
+and deleted the block that did it here, leaving BOTH its `fi` and half of its
+comment behind. One `fi` too many:
+
+    sh: syntax error: unexpected "fi"     -> exit 2
+
+`up -d` reports the container as *started* either way, so nothing said a word —
+and the MUTATIONS stream and all three KV buckets were never created. Only the
+NATIVE installer (`scripts/native/up.sh`) does that work too, which is why three
+days passed. Verified after the fix: MUTATIONS + `KV_schemas`, `KV_tenants`,
+`KV_generations` all present.
+
+**2. `nats-init` then created the legacy WIDE `cdc.>` stream, every time.**
+The surviving branch read `jq '(.tenants // []) | length'` from `grammar.json` and
+created the wide stream when it came out zero. Tenants left `grammar.json` in the
+catalogue era — they are rows in `zebridge_user_tenants` now — so it came out zero
+ALWAYS. `cdc.>` overlaps every subject the bridge's boot reconciliation wants, so:
+
+    🔴 FATAL: stream reconciliation failed (StreamSubjectOverlap)
+
+The branch is gone. nats-init creates no CDC stream at all now and removes a legacy
+one if it finds it; the bridge owns that family. The `OPEN_TENANT` validation stays,
+because nothing else can do it.
+
+**3. The bridge did not COMPILE for Linux.** Two errors, both in branches a macOS
+build eliminates at comptime and therefore never analyses:
+
+    src/utils.zig:65  std.fs.openFileAbsolute   -> moved onto std.Io.Dir in 0.16
+                                                   (and it now wants an `Io`)
+    src/utils.zig:106 std.c._SC.PHYS_PAGES      -> musl does not define it at all
+
+Fixed with `std.posix.openat` + `std.posix.system.close` for the cgroup read, and
+`/proc/meminfo`'s `MemTotal` for physical RAM. ⚠️ **Alpine is the deployment
+target**, so these were not cosmetic — the image could not be built.
+
+*Method worth keeping*: `zig build-obj -target x86_64-linux-musl` on a scratch file
+containing just the function compiles the Linux branch **on the host**, in a second,
+with no Docker round trip. That is how the second error was found and fixed.
+
+**4. The service definition itself was stale.** It set `PG_PORT: 55432` — the
+PUBLISHED port — from inside the network where it is 5432, harmless only because
+the bridge stopped assembling connections out of parts. It mounted no
+`grammar.json` (not in the image, deliberately — those are deployment names), and
+passed no NATS seed. It now runs under a `bridge` PROFILE, so the default `up`
+still leaves the bridge to the host binary while `--profile bridge` builds and runs
+it — out of the default path without being out of the tested path.
+
+**And the point of the exercise — zstd, verified in the container**, which building
+the image alone would never have shown:
+
+    🗜️ '_default'/'users': g1 full 275812 -> 9013 bytes (3%)
+    📖 '_default'/'users': g1 dictionary 68953 bytes trained from the full
+    $ od -An -tx1 -N8 users-g1-full
+      28 b5 2f fd a0 64 35 04          <- the zstd magic, on the wire
+
+`zstd-dev` (builder) and `zstd-libs` (runtime) in the Dockerfile are what make that
+work, and until the container ran they were an untested guess.
+
+**Also found and fixed on the way** (both pre-existing, both invisible on the
+already-migrated native database):
+
+  * `mix ecto.migrate` could not complete on a FRESH database.
+    `20260810140000_setup_no_pk_table` declares `timestamps(type: :utc_datetime_usec)`,
+    which Ecto renders as `timestamp(6) WITHOUT time zone` — refused outright by
+    `zebridge_timestamp_guard`. The fixture's point is the missing primary key, not
+    the column type; it is `:timestamptz` now.
+  * `counter_public` and `counter_tenant` were silently left UNPUBLISHED. The
+    2026-08-27 tombstone gate refuses writable-without-tombstone, and it does so with
+    an ERROR **row** — which `PERFORM * FROM zebridge_enable(...)` discards, so
+    `mix ecto.migrate` reported success and the demo tables were simply absent from
+    the publication. `allow_physical_deletes => true` records the acceptance (a
+    counter is never deleted). ⚠️ **The general problem stands**: every emitter
+    migration uses `PERFORM * FROM`, so any ERROR row is invisible. The fix is to
+    `SELECT ... WHERE status = 'ERROR'` into a variable and `RAISE` when it is not
+    null — same reasoning that made `zebridge_enable` raise rather than return a row
+    for a missing publication (§10ad). Not done.
+  * Two more publication fallbacks the §10ad sweep missed, both in fixture
+    migrations that hand-roll `ALTER PUBLICATION` instead of calling
+    `zebridge_enable`: `System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub")` in
+    `setup_no_pk_table` (written twice, one line apart) and `setup_exotic_types`.
+
 ## 10ag. speed.py is not a benchmark on a shared machine — WITHDRAWN (2026-08-28)
 
 I ran `speed.py` while regression-testing §10ad and reported a drain shortfall

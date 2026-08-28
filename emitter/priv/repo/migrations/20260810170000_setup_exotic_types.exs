@@ -22,7 +22,6 @@ defmodule Emitter.PgProducer.Repo.SetupExoticTypes do
     they are here as the control, and `price` pins the trailing-zero padding.
   """
 
-  @publication_name System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub")
   @bridge_user System.get_env("POSTGRES_BRIDGE_USER", "bridge_reader")
   @cdc_table "exotic_types"
 
@@ -74,9 +73,9 @@ defmodule Emitter.PgProducer.Repo.SetupExoticTypes do
     BEGIN
         IF NOT EXISTS (
             SELECT 1 FROM pg_publication_tables
-            WHERE pubname = '#{@publication_name}' AND tablename = '#{@cdc_table}'
+            WHERE pubname = '#{zb_publication()}' AND tablename = '#{@cdc_table}'
         ) THEN
-            ALTER PUBLICATION #{@publication_name} ADD TABLE public.#{@cdc_table};
+            ALTER PUBLICATION #{zb_publication()} ADD TABLE public.#{@cdc_table};
         END IF;
     END $$;
     """)
@@ -88,4 +87,15 @@ defmodule Emitter.PgProducer.Repo.SetupExoticTypes do
     execute("DROP TABLE IF EXISTS public.#{@cdc_table};")
     execute("DROP TYPE IF EXISTS mood;")
   end
+  # No default. The publication decides which feed carries this table, and
+  # `zebridge_enable` / the bridge both refuse to guess one (NOTES §10ad/§10ae) —
+  # a migration that fell back to "my_pub" would publish into whichever feed
+  # happened to be named that on the machine it ran on.
+  defp zb_publication do
+    System.get_env("BRIDGE_CDC_PUBLICATION") ||
+      raise "BRIDGE_CDC_PUBLICATION is not set: this migration publishes a table and must " <>
+              "name the publication (the same name the bridge is given as --pub). " <>
+              "Source .env.bridge before running migrations."
+  end
+
 end

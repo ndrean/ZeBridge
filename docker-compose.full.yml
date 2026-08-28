@@ -114,9 +114,9 @@ services:
       # native stack on the host already holds 4222/8222/8080, and a hardcoded
       # publish makes `docker compose up` fail to bind rather than run beside it.
       # The values inside the network never change (containers talk on 4222).
-      - "${NATS_PUBLISH_PORT:-4222}:4222"   # Client TCP connections
+      - "${NATS_PUBLISH_PORT:-4222}:4222" # Client TCP connections
       - "${NATS_MONITOR_PUBLISH_PORT:-8222}:8222" # HTTP monitoring
-      - "${NATS_WS_PUBLISH_PORT:-8080}:8080"      # WebSocket connections
+      - "${NATS_WS_PUBLISH_PORT:-8080}:8080" # WebSocket connections
     volumes:
       - nats-data:/data
       - nats-config:/config:ro
@@ -140,7 +140,7 @@ services:
   zb-check:
     image: python:3.12-slim
     container_name: zb-check
-    profiles: ["check"]          # never starts with a plain `up`; ask for it by name
+    profiles: [ "check" ] # never starts with a plain `up`; ask for it by name
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -153,7 +153,7 @@ services:
       - ZB_PSQL=psql -h postgres-primary -p 5432 -U ${PG_USER} -d ${PG_DB}
       - PGPASSWORD=${PG_PASSWORD}
       - NATS_URL=nats://nats-server:4222
-      - NATS_NKEY_SEED=${NATS_NKEY_SEED}
+      - NATS_BRIDGE_NKEY_SEED=${NATS_BRIDGE_NKEY_SEED}
       # The LIVE rendered conf, mounted read-only — not the template. Their disagreement is
       # itself a finding.
       - ZB_NATS_CONF=/config/nats-server.conf
@@ -189,9 +189,9 @@ services:
     # ⚠️ Unset means a blank seed: the server answers `Authorization Violation`, and the
     # `until nats server check connection` loop below spins forever without ever
     # creating a stream. Run compose as:
-    #   NATS_NKEY_SEED="SU..." docker compose ... up -d
+    #   NATS_BRIDGE_NKEY_SEED="SU..." docker compose ... up -d
     environment:
-      - NATS_NKEY_SEED=${NATS_NKEY_SEED}
+      - NATS_BRIDGE_NKEY_SEED=${NATS_BRIDGE_NKEY_SEED}
     command:
       - sh
       - -c
@@ -204,16 +204,16 @@ services:
         # `nats server check connection` reports that as "not up yet", so the loop spun
         # forever and `up -d` looked like it had merely been slow. An empty seed is a
         # missing argument, not a transient condition.
-        if [ -z "$${NATS_NKEY_SEED}" ]; then
-          echo '✗ NATS_NKEY_SEED is empty.' >&2
+        if [ -z "$${NATS_BRIDGE_NKEY_SEED}" ]; then
+          echo '✗ NATS_BRIDGE_NKEY_SEED is empty.' >&2
           echo '  The server requires an nkey, and this container creates the streams,' >&2
           echo '  so it needs the seed. It is deliberately in no env file — pass it in:' >&2
-          echo '    NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml \' >&2
+          echo '    NATS_BRIDGE_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml \' >&2
           echo '      --env-file .env.admin up -d' >&2
           exit 1
         fi
 
-        echo $${NATS_NKEY_SEED} > /tmp/seed.txt
+        echo $${NATS_BRIDGE_NKEY_SEED} > /tmp/seed.txt
         export NATS_NKEY=/tmp/seed.txt
 
         # Bounded: a wait that cannot end is indistinguishable from a hang. 60s is far
@@ -272,54 +272,39 @@ services:
         # already publishes `cdc.<tenant>.<table>.<op>`. Each message lands in exactly one
         # stream — no duplication.
 
-        # ⚠️ Only split when tenants are declared. An untenanted deployment has no
-        # `cdc.<tenant>.…` subjects at all, so per-tenant streams would capture nothing and
-        # removing the wide stream would leave the change feed with nowhere to land.
-        TENANT_COUNT=$(jq -r '(.tenants // []) | length' /grammar.json)
-        if [ "$$TENANT_COUNT" = "0" ]; then
-          echo "No tenants declared in grammar.json — keeping the single wide stream $$CDC_STREAM"
-          nats stream add $$CDC_STREAM --subjects="$$CDC_PREFIX.>" --storage=file --retention=limits --max-age=8d --max-msgs=10000000 --max-bytes=10G --replicas=1 --compression s2 --defaults || true
-        else
-
-        # ⚠️ The legacy wide stream must go first. Its `cdc.>` overlaps every per-tenant
-        # subject, and NATS refuses overlapping subjects across streams in one account — so
-        # leaving it would silently keep the hole open AND block the fix.
+        # ── NO CDC stream is created here. Not one. ────────────────────────────
+        #
+        # CDC_PUBLIC, INIT_PUBLIC and the per-tenant CDC_<T> streams are created and
+        # reconciled BY THE BRIDGE at boot, from zebridge_catalogue and
+        # zebridge_user_tenants (f3be486). Tenants are no longer declared in
+        # grammar.json at all — they are rows in a table now.
+        #
+        # ⚠️ This block used to branch on `jq '(.tenants // []) | length'` and, when it
+        # came out 0, create the legacy WIDE stream on `cdc.>`. With tenants gone from
+        # grammar.json it came out 0 every time — so nats-init created `cdc.>`, whose
+        # subjects overlap every stream the bridge then tries to make, and the bridge
+        # died at boot with `StreamSubjectOverlap`. Measured on the compose stack
+        # 2026-08-28: the bridge container could not start at all.
+        #
+        # A legacy wide stream from an older deployment is REMOVED for the same reason.
         if nats stream info $$CDC_STREAM --json >/dev/null 2>&1; then
-          echo "Removing legacy wide stream $$CDC_STREAM (subjects overlap the per-tenant split)"
+          echo "Removing legacy wide stream $$CDC_STREAM — its cdc.> overlaps every stream the bridge creates"
           nats stream rm $$CDC_STREAM -f || true
         fi
 
-
-        # Tables with no tenant column publish on the bare `cdc.<table>.<op>` subject, so
-        # they belong to no tenant stream. One shared stream carries them, granted to every
-        # principal — which is what `zebridge_catalogue` already declares them to be.
-        #
-        # ⚠️ Plus `cdc.<OPEN_TENANT>.>`: the open tenant, the token `zebridge_guard_tenant()`
-        # writes when a tenant column arrives NULL or empty. It is a tenant no declared
-        # stream owns, so without this binding those rows publish to a subject NO stream
-        # captures — no PubAck, retries exhaust, the bridge FATALs mid-WAL. The value comes
-        # from .env.admin, the same copy bridge-init renders into the guard.
+        # OPEN_TENANT is still validated here, because nothing else can: it is the token
+        # `zebridge_guard_tenant()` writes when a tenant column arrives NULL or empty, so
+        # rows carrying it publish to `cdc.<OPEN_TENANT>.<table>.<op>`. The bridge binds
+        # that subject into CDC_PUBLIC at boot — but only if the value is a legal subject
+        # token. Empty or malformed, those rows reach a subject NO stream captures: no
+        # PubAck, retries exhaust, the bridge FATALs mid-WAL.
         if [ -z "$${OPEN_TENANT}" ]; then
-          echo '✗ OPEN_TENANT is empty — the open tenant needs a subject in CDC_PUBLIC (set it in .env.admin)' >&2
+          echo '✗ OPEN_TENANT is empty — the open tenant needs a subject in CDC_PUBLIC (set it in .env.docker)' >&2
           exit 1
         fi
         case "$${OPEN_TENANT}" in *.*|*' '*|*'*'*|*'>'*)
           echo "✗ OPEN_TENANT='$${OPEN_TENANT}' is not a legal NATS subject token" >&2; exit 1;;
         esac
-        # A declared tenant with the same name would get its own stream on the same subject,
-        # and NATS refuses overlapping streams — leaving whichever came second uncreated.
-        if jq -e --arg o "$$OPEN_TENANT" '(.tenants // []) | index($$o) != null' /grammar.json >/dev/null; then
-          echo "✗ OPEN_TENANT='$${OPEN_TENANT}' is also a declared tenant in grammar.json — pick one" >&2
-          exit 1
-        fi
-        # CDC_PUBLIC / INIT_PUBLIC / per-tenant streams: created and reconciled by the
-        # BRIDGE at boot from zebridge_catalogue + zebridge_user_tenants.
-        # from public_tables and OPEN_TENANT — and `add` on an existing stream with a
-        # different config is an error the `|| true` would swallow, leaving the old binding
-        # in place and check.py §9 red after every re-run. Subjects only: limits are left
-        # as they are.
-        fi
-        fi
 
         echo "Creating NATS JetStream stream: $$MUTATIONS_STREAM (subject: $$MUTATIONS_PREFIX.>)"
         # Dead letters share the stream but NOT the subject space: the ingress consumer
@@ -383,6 +368,11 @@ services:
       - -c
       - |
         set -ex
+        # Checked FIRST, for the same reason nats-init checks its seed before the
+        # wait loop: this container's last act is to create the publication by name,
+        # and there is no default for it. Finding that out after apt-get and two
+        # template applies wastes the run and buries the message under psql output.
+        : "$${BRIDGE_CDC_PUBLICATION:?is not set — .env.docker must name the publication, there is no default}"
         export PGPASSWORD="$${PG_PASSWORD}"
         # bring in `envsubst` via gettext-base
         apt-get update && apt-get install -y gettext-base
@@ -407,7 +397,6 @@ services:
         # supported way to make one — it also attaches the three internal tables
         # (ddl_events, gc_watermark, user_tenants) that a hand-made
         # `CREATE PUBLICATION` silently left out, crippling that bridge.
-        : "$${BRIDGE_CDC_PUBLICATION:?set it in .env.docker — there is no default}"
         psql -v ON_ERROR_STOP=1 -h "$${PG_HOST}" -p "$${PG_PORT}" -U "$${PG_USER}" -d "$${PG_DB}" \
           -c "SELECT step, status, detail FROM public.zebridge_create_publication('$${BRIDGE_CDC_PUBLICATION}')"
         echo "[bridge-init] Postgres initialization complete!"
@@ -415,37 +404,57 @@ services:
       - cdc-net
     restart: "no"
 
-  # 7. ZeBridge (Zig CDC Bridge Server) - Commented out for local host-based dev execution
-  # bridge:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: bridge
-  #   ports:
-  #     - "${BRIDGE_PORT}:${BRIDGE_PORT}"
-  #   depends_on:
-  #     bridge-init:
-  #       condition: service_completed_successfully
-  #     postgres-primary:
-  #       condition: service_healthy
-  #     nats-init:
-  #       condition: service_completed_successfully
-  #   env_file:
-  #     - .env.docker
-  #   environment:
-  #     PG_HOST: postgres-primary
-  #     PG_PORT: 5432
-  #     NATS_HOST: nats-server
-  #   command:
-  #     - "--slot"
-  #     - "${BRIDGE_CDC_SLOT}"
-  #     - "--pub"
-  #     - "${BRIDGE_CDC_PUBLICATION}"
-  #     - "--port"
-  #     - "${BRIDGE_PORT}"
-  #   networks:
-  #     - cdc-net
-  #   restart: unless-stopped
+  # 7. ZeBridge itself.
+  #
+  # Started with the profile `bridge`, so the default `up` still leaves the bridge to
+  # the host binary (the dev loop this repo is written around):
+  #
+  #   docker compose -f docker-compose.full.yml --env-file .env.docker --profile bridge up -d
+  #
+  # ⚠️ It was COMMENTED OUT for months, which meant the Dockerfile was never built and
+  # never run. Two Linux-only compile errors had accumulated behind that comment —
+  # `std.fs.openFileAbsolute` (moved onto std.Io.Dir in 0.16) and `_SC.PHYS_PAGES`
+  # (musl does not define it) — both in branches a macOS build switches out at comptime.
+  # A commented-out service is an untested service; a profile keeps it out of the
+  # default `up` while still building and running on demand.
+  bridge:
+    profiles: ["bridge"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bridge
+    ports:
+      # Published on its own knob: the host dev loop usually holds 9090 already.
+      - "${BRIDGE_PUBLISH_PORT}:${BRIDGE_PORT}"
+    depends_on:
+      bridge-init:
+        condition: service_completed_successfully
+      postgres-primary:
+        condition: service_healthy
+      nats-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env.docker
+    volumes:
+      # The wire grammar is NOT in the image — stream, subject and KV names are
+      # deployment data, and baking them in would make the image deployment-specific.
+      - ./grammar.json:/grammar.json:ro
+    environment:
+      # ⚠️ No PG_HOST/PG_PORT here. They used to be, pointing at 55432 (the PUBLISHED
+      # port) from inside the network where it is 5432 — harmless only because the
+      # bridge stopped assembling connections out of parts: DATABASE_READER_URL in
+      # .env.docker is the single source, and it already names postgres-primary:5432.
+      TOPOLOGY_PATH: /grammar.json
+      # The bridge's own key. .env.docker carries it as NATS_BRIDGE_NKEY_SEED because
+      # that is the name nats-init and nats-config-gen use; the bridge reads
+      # NATS_NKEY_SEED.
+      NATS_NKEY_SEED: ${NATS_BRIDGE_NKEY_SEED}
+    # No --slot/--pub: BRIDGE_CDC_SLOT and BRIDGE_CDC_PUBLICATION are in .env.docker,
+    # and this is exactly the flagless boot they exist for. Neither has a default, so
+    # removing them from the env file stops the container rather than guessing.
+    networks:
+      - cdc-net
+    restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:latest

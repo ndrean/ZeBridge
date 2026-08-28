@@ -32,6 +32,11 @@ defmodule Emitter.PgProducer.Repo.AddCounters do
                 'public.counter_public'::regclass,
                 writable => true,
                 version_col => 'updated_at',
+                -- A counter is never deleted, so there is no tombstone column to name.
+                -- Without this the 2026-08-27 tombstone gate returns an ERROR ROW and the
+                -- table is silently left unpublished — `PERFORM * FROM` discards the row,
+                -- so `mix ecto.migrate` reports success. Measured on a fresh database.
+                allow_physical_deletes => true,
                 public_reason => 'demo counter — identical content for every tenant',
                 publication => '#{zb_publication()}',
                 dry_run => false
@@ -41,6 +46,7 @@ defmodule Emitter.PgProducer.Repo.AddCounters do
                 tenant_col => 'tenant_id',
                 writable => true,
                 version_col => 'updated_at',
+                allow_physical_deletes => true,   -- same as its public sibling above
                 publication => '#{zb_publication()}',
                 dry_run => false
             );

@@ -62,9 +62,16 @@ pub fn memoryLimitBytes() u64 {
         };
         for (paths) |p| {
             var buf: [64]u8 = undefined;
-            const f = std.fs.openFileAbsolute(p, .{}) catch continue;
-            defer f.close();
-            const n = f.readAll(&buf) catch continue;
+            // ⚠️ std.posix, not std.fs. Zig 0.16 moved `openFileAbsolute` onto
+            // `std.Io.Dir` and made it take an `Io` — and this branch is
+            // `builtin.os.tag == .linux`, so a macOS build never analyses it and
+            // never sees the breakage. The Docker build did, and could not compile
+            // at all (2026-08-28). Threading an `Io` into a leaf query that answers
+            // "how much memory do I have" is the wrong shape; the raw syscall pair
+            // needs nothing and is what the file read is anyway.
+            const fd = std.posix.openat(std.posix.AT.FDCWD, p, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+            defer _ = std.posix.system.close(fd);
+            const n = std.posix.read(fd, &buf) catch continue;
             const text = std.mem.trim(u8, buf[0..n], " \n\r\t");
             if (std.mem.eql(u8, text, "max")) continue;
             const v = std.fmt.parseInt(u64, text, 10) catch continue;
@@ -96,10 +103,26 @@ pub fn systemMemoryBytes() u64 {
             return mem;
         },
         .linux => {
-            const pages = std.c.sysconf(@intFromEnum(std.c._SC.PHYS_PAGES));
-            const page_size = std.c.sysconf(@intFromEnum(std.c._SC.PAGESIZE));
-            if (pages <= 0 or page_size <= 0) return 0;
-            return @as(u64, @intCast(pages)) * @as(u64, @intCast(page_size));
+            // ⚠️ /proc/meminfo, not `sysconf(_SC_PHYS_PAGES)`. musl does not define that
+            // constant, so on Alpine the enum has no `PHYS_PAGES` member and the file
+            // does not COMPILE — which a macOS build never discovers, because this
+            // branch is switched out at comptime. Found by the first Docker build
+            // (2026-08-28); the deployment target is Alpine, so this is the path that
+            // has to work. MemTotal is in kB and is the first line on every kernel that
+            // has the file.
+            var buf: [4096]u8 = undefined;
+            const fd = std.posix.openat(std.posix.AT.FDCWD, "/proc/meminfo", .{ .ACCMODE = .RDONLY }, 0) catch return 0;
+            defer _ = std.posix.system.close(fd);
+            const n = std.posix.read(fd, &buf) catch return 0;
+            var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+            while (it.next()) |line| {
+                if (!std.mem.startsWith(u8, line, "MemTotal:")) continue;
+                var f = std.mem.tokenizeScalar(u8, line["MemTotal:".len..], ' ');
+                const kb_text = f.next() orelse return 0;
+                const kb = std.fmt.parseInt(u64, kb_text, 10) catch return 0;
+                return kb * 1024;
+            }
+            return 0;
         },
         else => return 0,
     }

@@ -33,7 +33,7 @@ const usage =
     \\                        endpoint is unauthenticated, so 0.0.0.0 exposes table
     \\                        names, lag and throughput to anything that can reach it.
     \\  NATS_URL              nats://[user:pass@]host[:port] (default: localhost)
-    \\  NATS_NKEY_SEED        NATS nkey seed
+    \\  NATS_BRIDGE_NKEY_SEED        NATS nkey seed
     \\  NATS_CREDS            path to a .creds file (operator/JWT mode; wins over the seed)
     \\  BASE_BUF              log2 of per-event data buffer (10-20 by default)
     \\  BASE_BUF_MAX          Raise BASE_BUF's ceiling past 20 (to at most 24), for a
@@ -454,7 +454,7 @@ pub const Args = struct {
         if (init.minimal.environ.getPosix("NATS_HOST")) |host| {
             log.debug("NATS_HOST='{s}' is ignored — set NATS_URL (currently {s})", .{ host, runtime_config.nats_url.? });
         }
-        runtime_config.nats_seed = init.minimal.environ.getPosix("NATS_NKEY_SEED");
+        runtime_config.nats_seed = init.minimal.environ.getPosix("NATS_BRIDGE_NKEY_SEED");
         runtime_config.nats_creds = init.minimal.environ.getPosix("NATS_CREDS");
 
         // Generation producer pacing. ⚠️ The cadence is a CORRECTNESS parameter, not a

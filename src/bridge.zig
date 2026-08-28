@@ -551,7 +551,7 @@ pub fn main(init: std.process.Init) !void {
     );
     // Enrollment/mint (NOTES: the JWT mint flow): armed only when the operator
     // handed over the scoped client signing seed — the bridge is a signer, not a
-    // key store: no file I/O, the seed arrives like NATS_NKEY_SEED always did.
+    // key store: no file I/O, the seed arrives like NATS_BRIDGE_NKEY_SEED always did.
     if (init.minimal.environ.getPosix("ZB_SIGNING_SEED")) |seed| {
         if (init.minimal.environ.getPosix("ZB_ACCOUNT_PUB")) |acct| {
             if (runtime_config.pg_writer_url) |wurl| {
@@ -1773,6 +1773,4 @@ fn reconcileCdcStreams(
         res.deinit();
         log.info("🆕 created stream {s} with {d} subject(s)", .{ topo.cdc_stream_public, wanted.items.len });
     }
-
-
 }

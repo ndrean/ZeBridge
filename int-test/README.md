@@ -63,7 +63,7 @@ The NKey configuration (_user.nk_) uses:
 
 To generate a pair,
 
-- install the NATS tool [nk](https://docs.nats.io/using-nats/nats-tools/nk). 
+- install the NATS tool [nk](https://docs.nats.io/using-nats/nats-tools/nk).
 - run: `nk -gen user -pubout > user.nk`
 
 ```bash
@@ -71,7 +71,7 @@ To generate a pair,
 nats-server -c test/nats-nkey.conf &
 
 # Run the test with the matching private seed
-NATS_NKEY_SEED="SUAEBVUWOAJRL5FSDXP3A7EEUC3ZU7GYILW6TMVK2J63RQAZQQ642MVIBI" zig build test --summary all
+NATS_BRIDGE_NKEY_SEED="SUAEBVUWOAJRL5FSDXP3A7EEUC3ZU7GYILW6TMVK2J63RQAZQQ642MVIBI" zig build test --summary all
 
 # Stop server
 killall nats-server

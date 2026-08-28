@@ -92,7 +92,7 @@ defmodule Consumer.Application do
           host: System.get_env("NATS_HOST") || "localhost",
           port: String.to_integer(System.get_env("NATS_PORT") || "4222"),
           jwt: System.get_env("NATS_JWT"),
-          nkey_seed: System.get_env("NATS_NKEY_SEED")
+          nkey_seed: System.get_env("NATS_BRIDGE_NKEY_SEED")
         }
         |> Enum.reject(fn {_, v} -> is_nil(v) end)
         |> Map.new()

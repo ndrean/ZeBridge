@@ -23,7 +23,7 @@ both granted to `bridge_reader`:
 `DROP TABLE public.ck, public.sk;` when they stop being useful, and
 `DELETE FROM public.users WHERE name LIKE 'n-%';` to put `users` back to its
 scenario size. Bring the stack up with
-`NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml --env-file .env.admin
+`NATS_BRIDGE_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml --env-file .env.admin
 up -d postgres-primary nats-config-gen nats-server nats-init bridge-init`, then run the
 bridge from the host with `.env.bridge` (it needs DATABASE_READER_URL; there is no PG_* fallback
 any more).
@@ -258,7 +258,7 @@ walsender of whichever host owns the slot.
 **One standby or two?** One is the design. Two is worth knowing about, because the two
 reads want *opposite* settings from the same host:
 
-|  | snapshot reads | CDC reads |
+| | snapshot reads | CDC reads |
 | --- | --- | --- |
 | needs a replication slot | **no** — just a consistent read + an LSN | yes |
 | minimum PostgreSQL | any (14+, as today) | **16** — logical decoding on standby |

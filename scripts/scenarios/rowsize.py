@@ -52,7 +52,7 @@ def principal() -> str:
 
 def schema(table: str) -> dict:
     seed = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_seed.nk"
-    seed.write_text(os.environ.get("NATS_NKEY_SEED", ""))
+    seed.write_text(os.environ.get("NATS_BRIDGE_NKEY_SEED", ""))
     scheme, _, rest = zb.NATS_URL.partition("://")
     server = f"{scheme}://{rest.rsplit('@', 1)[-1]}"
     r = subprocess.run(["nats", "--server", server, "--nkey", str(seed),

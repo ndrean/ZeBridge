@@ -219,11 +219,12 @@ or
 PGPASSWORD=my_pwd psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
 ```
 
-or by reading the password from the file _~/pgpass_ with the STRCIT ordering below, so that `psql` will extract the password when the other credentials match:
+or by reading the password from the file _~/.pgpass_ with the STRCIT ordering below, so that `psql` will extract the password when the other credentials match:
 
-```txt
-#~/.pgpass #<- chmod 0600
+```sh
+#~/.pgpass 
 hostname:port:database:username:password.  #<- strict ordering
+#<- chmod 0600
 ```
 
 ```sh
@@ -233,19 +234,11 @@ psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
 </details>
 <br>
 
-**DBA creates two USER profils in the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils:
+**DBA creates two USER profils in the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils.
 
 ```sh
 set -a && source .env.admin && source .env.bridge && set +a
-```
 
-1. **Create the bridge's database objects.** Read side, then write side (write side only if you want edge writes):
-
-   ```sh
-   
-   ```
-
-```sh
 # .env.admin — the DBA sets the role names and passwords; the templates interpolate them
 POSTGRES_READER_USER=bridge_reader      # created by init.core.template.sql
 POSTGRES_READER_PASSWORD=...
@@ -261,10 +254,11 @@ envsubst < init.write.template.sql | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -  
 # The templates create no publication. Make it by name — this is the only supported
 # way, because it also attaches the three tables every bridge needs in its own
 # publication (zebridge_ddl_events, zebridge_gc_watermark, zebridge_user_tenants).
-psql "$ADMIN_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
+PGDATABASE=postgres://admin:s3cret@127.0.0.1:5432/py_db \
+psql -c "SELECT * FROM zebridge_create_publication('my_pub')"
 ```
 
-**ZeBridge uses these USER profils**: the reader USER and writer USER, set in _.env.bridge_, are used by `ZeBridge` (after the DBA has run the migrations and used `zebrdige_enable(..)`, see further down)
+**ZeBridge uses these USER profils**: the reader USER and writer USER, set in _.env.bridge_, are used by `ZeBridge` (after the DBA has run the migrations and used `zebrdige_enable(..)`, see further down). Now ZeBridge can communicate with Postgres.
 
 ```sh
 DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres \
@@ -272,10 +266,10 @@ DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:
 ./bridge --pub my_pub --slot my_slot --port 9090
 ```
 
-**DBA creates nkey pair for ZeBridge ↔ NATS**: The DBA generates a keypair. Set the public key in the NATS config and use the seed as `NATS_NKEY_SEED` (in _.env.bridge_) to run ZeBridge:
+**DBA creates nkey pair for ZeBridge ↔ NATS**: The DBA generates a keypair. Set the public key in the NATS config (`NATS_BRIDGE_NKEY_PUB`)  and use the seed as`NATS_BRIDGE_NKEY_SEED` (in _.env.bridge_) to run ZeBridge:
 
 ```sh
-NATS_NKEY_SEED=SU... ./bridge --pub my_pub --slot my_slot
+NATS_BRIDGE_NKEY_SEED=SU... ./bridge --pub my_pub --slot my_slot
 ```
 
 ### The client to NATS dance
@@ -329,7 +323,7 @@ Same dance at connect time (step 6 is identical) — only steps 1–4 are replac
 
 ⚠️ **The `/enroll` endpoint is off unless all three are present**: `ZB_SIGNING_SEED` (the account signing seed — the mint authority), `ZB_ACCOUNT_PUB` (the account public key, which goes into every JWT it issues), and `DATABASE_WRITER_URL` (redeeming an invite is a write). Miss one and the bridge starts normally and answers `{"error":"enrollment not configured"}` — check the boot log for `🎟️ enrollment endpoint armed`.
 
-**The even older shape** (`scripts/native/nats-server.conf`, no operator) uses plain user/password for clients and an nkey seed for the bridge. It still works, and it is what `NATS_NKEY_SEED` above is for — but there are no JWTs, no tags, and every principal is written into the server config by hand.
+**The even older shape** (`scripts/native/nats-server.conf`, no operator) uses plain user/password for clients and an nkey seed for the bridge. It still works, and it is what `NATS_BRIDGE_NKEY_SEED` above is for — but there are no JWTs, no tags, and every principal is written into the server config by hand.
 
 ## Architecture & Internals
 
@@ -565,64 +559,64 @@ A read-only deployment never touches `init.write.sql`; a read/write one runs bot
 On a fresh VPS, in order. Drive it with whatever you like — a shell script, your migration tool, Ansible; the steps are the same, and the compose stack simply does them for you. The SQL and config templates carry `${VAR}` placeholders, so they are rendered with `envsubst` from the admin environment first.
 
 ```sh
-set -a && source .env.admin && set +a
+set -a && source .env.admin && source .env.bridge && set +a \
 ```
 
-1. **Create the bridge's database objects.** Read side, then write side (write side only if you want edge writes):
+**Create the bridge's database objects.** Read side, then write side (write side only if you want edge writes):
 
-   ```sh
-   envsubst < init.core.template.sql  | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -
-   envsubst < init.write.template.sql | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -   # read/write only
-   ```
+```sh
+envsubst < init.core.template.sql  | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -
+envsubst < init.write.template.sql | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -
+# read/write only
+# The templates create no publication. Make it by name — this is the only supported
+# way, because it also attaches the three tables every bridge needs in its own
+# publication (zebridge_ddl_events, zebridge_gc_watermark, zebridge_user_tenants)
 
-   Then create the publication, by name. The templates create none — the name used to be
-   substituted into them, which made it a second spelling of the bridge's own `--pub`
-   with nothing checking that the two agreed:
+PGDATABASE=postgres://admin:s3cret@127.0.0.1:5432/py_db \
+psql -c "SELECT * FROM zebridge_create_publication('my_pub')"
+```
 
-   ```sh
-   psql "$ADMIN_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
-   ```
+Then create the publication, by name. The templates create none — the name used to be substituted into them, which made it a second spelling of the bridge's own `--pub` with nothing checking that the two agreed:
 
-   ⚠️ Do not hand-write `CREATE PUBLICATION`. Three tables have to be in **every**
-   publication a bridge attaches to — `zebridge_ddl_events` (schema changes),
-   `zebridge_gc_watermark` (the offline window), `zebridge_user_tenants` (tenant
-   resolution) — and a publication missing them still boots a bridge, still carries user
-   rows, and still passes every health check. `zebridge_create_publication` attaches them;
-   nothing else will.
+```sh
+psql "$ADMIN_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
+```
 
-2. **Declare your tables** — the important step. Run your own migrations to create the application tables, and call `zebridge_enable(...)` for each table you want replicated. One call writes the `zebridge_catalogue` row, installs the guards, scopes RLS and adds the table to the publication, atomically:
+⚠️ Do not hand-write `CREATE PUBLICATION`. Three tables have to be in **every** publication a bridge attaches to — `zebridge_ddl_events` (schema changes), `zebridge_gc_watermark` (the offline window), `zebridge_user_tenants` (tenant resolution) — and a publication missing them still boots a bridge, still carries user rows, and still passes every health check. `zebridge_create_publication` attaches them; nothing else will.
 
-   ```sql
-   SELECT zebridge_enable('public.notes', writable => true,
-       version_col => 'updated_at', tenant_col => 'tenant_id',
-       -- named, never defaulted: this argument decides which feed carries the table.
-       -- Add create_publication => true to make the publication in the same call.
-       publication => 'my_pub', dry_run => false);
-   ```
+**Declare your tables** — the important step. Run your own migrations to create the application tables, and call `zebridge_enable(...)` for each table you want replicated. One call writes the `zebridge_catalogue` row, installs the guards, scopes RLS and adds the table to the publication, atomically:
 
-3. **Place the wire grammar.** Copy `grammar.json` where the bridge and the NATS setup can read it — it holds the static names both sides share.
+```sql
+SELECT zebridge_enable('public.notes', writable => true,
+    version_col => 'updated_at', tenant_col => 'tenant_id',
+    -- named, never defaulted: this argument decides which feed carries the table.
+    -- Add create_publication => true to make the publication in the same call.
+    publication => 'my_pub', dry_run => false);
+```
 
-4. **Configure and start NATS with JetStream.** Render the server config from its template, then start it:
+**Place the wire grammar.** Copy `grammar.json` where the bridge and the NATS setup can read it — it holds the static names both sides share.
 
-   ```sh
-   envsubst < nats-server.conf.template > nats-server.conf
-   nats-server -js -c nats-server.conf
-   ```
+**Configure and start NATS with JetStream.** Render the server config from its template, then start it:
 
-   For the operator/JWT world (consumers), run `scripts/native/jwt-bootstrap.sh` once to build the operator, accounts and scoped signing keys, and start NATS with the operator config it emits instead.
+```sh
+envsubst < nats-server.conf.template > nats-server.conf
+nats-server -js -c nats-server.conf
+```
 
-5. **Configure the bridge.** Fill in `.env.bridge`: the connection strings (`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL`), the credential (`NATS_CREDS` for JWT, or `NATS_NKEY_SEED`), and `BASE_BUF` if the default is too small for your widest table.
+For the operator/JWT world (consumers), run `scripts/native/jwt-bootstrap.sh` once to build the operator, accounts and scoped signing keys, and start NATS with the operator config it emits instead.
 
-6. **Start the bridge.**
+**Configure the bridge.** Fill in `.env.bridge`: the connection strings (`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL`), the credential (`NATS_CREDS` for JWT, or `NATS_BRIDGE_NKEY_SEED`), and `BASE_BUF` if the default is too small for your widest table.
 
-   ```sh
-   set -a && source .env.bridge && set +a
-   ./bridge --slot my_slot --pub my_pub --port 9090
-   ```
+**Start the bridge.**
 
-   At boot it reads the catalogue, reconciles the CDC streams, publishes every table's schema, and begins streaming.
+```sh
+set -a && source .env.bridge && set +a
+./bridge --slot my_slot --pub my_pub --port 9090
+```
 
-7. **Verify the wiring** — `python3 scripts/zbdoctor.py`. One command, one verdict (exit 0 green / 1 red, `--json` for CI). It checks the bridge's own health (`/health`, `/status`), the PostgreSQL posture (the `zebridge_audit_*()` functions, read _through_ the catalogue so a declared-public table is not flagged for being unscoped), the NATS topology (CDC streams, KV buckets), and the property that actually matters after boot: that a **fresh client** can resolve its tenant, read every schema, and seed from a chain whose objects are really there. Its last gate delegates to [`scripts/scenarios/check.py`](scripts/scenarios/check.py) for declared-vs-actual drift. Stdlib-only: it runs wherever `psql`, `nats` and python3 do.
+At boot it reads the catalogue, reconciles the CDC streams, publishes every table's schema, and begins streaming.
+
+**Verify the wiring** — `python3 scripts/zbdoctor.py`. One command, one verdict (exit 0 green / 1 red, `--json` for CI). It checks the bridge's own health (`/health`, `/status`), the PostgreSQL posture (the `zebridge_audit_*()` functions, read _through_ the catalogue so a declared-public table is not flagged for being unscoped), the NATS topology (CDC streams, KV buckets), and the property that actually matters after boot: that a **fresh client** can resolve its tenant, read every schema, and seed from a chain whose objects are really there. Its last gate delegates to [`scripts/scenarios/check.py`](scripts/scenarios/check.py) for declared-vs-actual drift. Stdlib-only: it runs wherever `psql`, `nats` and python3 do.
 
 ### Roles and privileges
 
@@ -721,7 +715,7 @@ The bridge is then started with:
 * a unique `--slot` — the WAL pointer PostgreSQL keeps for this instance. Each running instance needs its own.
 * a unique `--port` for its telemetry webserver. Each running instance needs its own.
 * `--top`, defaulting to `./grammar.json` — the stream/bucket names shared between ZeBridge, NATS and consumers.
-* the mandatory `NATS_NKEY_SEED` env var — the private half of the public nkey the NATS server was given.
+* the mandatory `NATS_BRIDGE_NKEY_SEED` env var — the private half of the public nkey the NATS server was given.
 * `DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL` — the connection strings.
 
 For example, one instance on the publication `my_pub` (created by the DBA) with the slot `my_slot`:
@@ -731,7 +725,7 @@ BASE_BUF=10 \                     # default 14
 RING_BUFFER_COUNT=4096 \          # default 65536
 NATS_URL=nats://127.0.0.1:4222 \  # default value
 BRIDGE_PORT=9090 \                # default port
-NATS_NKEY_SEED=SU... \            # mandatory
+NATS_BRIDGE_NKEY_SEED=SU... \            # mandatory
 DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:55432/postgres \
 DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:55432/postgres \
 ./bridge --slot my_slot --pub my_pub --top grammar.json
@@ -945,7 +939,7 @@ DATABASE_WRITER_URL=postgres://bridge_writer:pw@localhost:5432/postgres # unset 
 
 # NATS. One address input; NATS_HOST is ignored with a warning.
 NATS_URL=nats://[user:pass@]localhost:4222
-NATS_NKEY_SEED=SU...
+NATS_BRIDGE_NKEY_SEED=SU...
 
 BRIDGE_PORT=9090          # HTTP telemetry, when --port is absent
 ```
@@ -977,12 +971,12 @@ The bridge does not read any of them. The bridge reads `.env.bridge`. The bridge
 
 ```bash
 # the stack — .env.admin only: every service compose starts is an admin task
-NATS_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml \
+NATS_BRIDGE_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml \
   --env-file .env.admin up -d
 
 # the bridge — .env.bridge only, so no superuser password enters this shell
 set -a && source .env.bridge && set +a
-NATS_NKEY_SEED="SU..." ./zig-out/bin/bridge --slot my_slot --pub my_pub
+NATS_BRIDGE_NKEY_SEED="SU..." ./zig-out/bin/bridge --slot my_slot --pub my_pub
 ```
 
 ### Production Deployment (Full Container Stack)
@@ -1039,7 +1033,7 @@ zig build (-Doptimize=ReleaseFast)
 
 ```sh
 set -a && source .env.bridge && set +a && \
-NATS_NKEY_SEED="SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q" \
+NATS_BRIDGE_NKEY_SEED="SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q" \
 LOG_LEVEL=info \
 ./zig-out/bin/bridge --slot my_slot --pub my_pub
 ```
@@ -1099,7 +1093,7 @@ authorization {
 Use the **private** nkey to start ZeBridge daemon:
 
 ```sh
-NATS_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI \
+NATS_BRIDGE_NKEY_SEED=SUAAF6OSYEICIIMANGOM5WCIRDEILIMKLLQWOXPKB4DOVEDZN22CPMWVVI \
 RING_BUFFER_COUNT=2048 \
 BASE_BUF=12 \
 DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@localhost:55432/postgres \

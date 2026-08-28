@@ -1,16 +1,19 @@
 defmodule Emitter.PgProducer.Repo.SetupNoPkTable do
   use Ecto.Migration
 
-  @publication_name System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub")
   @cdc_table "users_no_pk"
-  @publication_name System.get_env("BRIDGE_CDC_PUBLICATION", "my_pub")
   @bridge_user System.get_env("POSTGRES_BRIDGE_USER", "bridge_reader")
 
   def up do
     create table(:users_no_pk, primary_key: false) do
       add(:name, :string, null: false)
       add(:email, :string)
-      timestamps(type: :utc_datetime_usec)
+      # ⚠️ :timestamptz, not :utc_datetime_usec — Ecto renders the latter as
+      # `timestamp(6) WITHOUT time zone`, which zebridge_timestamp_guard refuses
+      # outright. The fixture's point is the missing PRIMARY KEY, not the column
+      # type; with the naive type this migration could not apply to a fresh
+      # database at all (measured on the compose stack, 2026-08-28).
+      timestamps(type: :timestamptz)
     end
 
     flush()
@@ -33,9 +36,9 @@ defmodule Emitter.PgProducer.Repo.SetupNoPkTable do
     BEGIN
         IF NOT EXISTS (
             SELECT 1 FROM pg_publication_tables
-            WHERE pubname = '#{@publication_name}' AND tablename = '#{@cdc_table}'
+            WHERE pubname = '#{zb_publication()}' AND tablename = '#{@cdc_table}'
         ) THEN
-            ALTER PUBLICATION #{@publication_name} ADD TABLE public.#{@cdc_table};
+            ALTER PUBLICATION #{zb_publication()} ADD TABLE public.#{@cdc_table};
         END IF;
     END $$;
     """)
@@ -46,4 +49,15 @@ defmodule Emitter.PgProducer.Repo.SetupNoPkTable do
   def down do
     drop_if_exists(table(:users_no_pk))
   end
+  # No default. The publication decides which feed carries this table, and
+  # `zebridge_enable` / the bridge both refuse to guess one (NOTES §10ad/§10ae) —
+  # a migration that fell back to "my_pub" would publish into whichever feed
+  # happened to be named that on the machine it ran on.
+  defp zb_publication do
+    System.get_env("BRIDGE_CDC_PUBLICATION") ||
+      raise "BRIDGE_CDC_PUBLICATION is not set: this migration publishes a table and must " <>
+              "name the publication (the same name the bridge is given as --pub). " <>
+              "Source .env.bridge before running migrations."
+  end
+
 end

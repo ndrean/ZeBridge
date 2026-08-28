@@ -21,7 +21,7 @@ no stream is the §2.19 failure shape: the publish gets no PubAck, retries, and 
 of that kills the bridge. Step (1) is not setup convenience — it is the contract.
 
 Usage:  python scripts/scenarios/dyntenant.py
-Needs a running bridge with TENANT_RULES covering test_types, NATS_NKEY_SEED, psql.
+Needs a running bridge with TENANT_RULES covering test_types, NATS_BRIDGE_NKEY_SEED, psql.
 Cleans up its streams, mapping and rows.
 """
 

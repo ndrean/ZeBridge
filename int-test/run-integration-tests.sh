@@ -5,7 +5,7 @@
 
 set -e
 
-unset NATS_TOKEN NATS_USER NATS_PASS NATS_NKEY_SEED
+unset NATS_TOKEN NATS_USER NATS_PASS NATS_BRIDGE_NKEY_SEED
 
 # Change to project root directory
 cd "$(dirname "$0")/.."
@@ -49,7 +49,7 @@ SERVER_PID=$!
 sleep 2
 
 # !! seed matches the public key in the config
-NATS_NKEY_SEED=SUAEBVUWOAJRL5FSDXP3A7EEUC3ZU7GYILW6TMVK2J63RQAZQQ642MVIBI zig build integration-test --summary all 2>&1 | grep -E "(Auth: NKey|passed|failed)" || true
+NATS_BRIDGE_NKEY_SEED=SUAEBVUWOAJRL5FSDXP3A7EEUC3ZU7GYILW6TMVK2J63RQAZQQ642MVIBI zig build integration-test --summary all 2>&1 | grep -E "(Auth: NKey|passed|failed)" || true
 
 kill $SERVER_PID 2>/dev/null || true
 sleep 1
