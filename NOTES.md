@@ -5392,6 +5392,50 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10an. An empty tenant became a KV key, and a stream name diverged (2026-08-28)
+
+Reported as `counter_tenant: chain manifest unreadable: Error: invalid key:
+.counter_tenant`. The leading dot is the whole story — the key is
+`<tenant>.<table>`, and the tenant was the empty string.
+
+**The client contradicted itself.** `resolveTenant()` had already logged the truth,
+and the operator saw it in the same session's log:
+
+    SYS INFO: No tenant mapping for 'alice' — public-only reads
+    SYS ERROR: counter_tenant: chain manifest unreadable: invalid key: .counter_tenant
+
+`effectiveTenantFor()` returned `this.tenantValue` for a tenant-scoped table without
+checking whether it was empty, so a principal with no roster entry built a key NATS
+had to refuse — and the error blamed the KEY SYNTAX for a missing roster row. It now
+returns `null` for that case, and both call sites treat it as the real state it is:
+`applyGenerations` skips the table with a message naming the principal, the KV bucket
+and the fix (`zebridge_user_tenants`), and the seeding scan leaves the table out
+rather than routing it to a stream name built from an empty token.
+
+**The data half.** `zebridge_user_tenants` was EMPTY in the compose stack — no
+migration writes it — so `$KV.tenants` had no keys at all. One INSERT
+(`alice`→`acme`) propagated to `$KV.tenants.alice` **live**, no restart, through the
+bridge's user_tenants diversion. The rest of the cascade needed the one documented
+restart (a new tenant is a boot-time reconciliation): `CDC_acme`, `OBJ_gen-acme` and
+the `acme.counter_tenant` chain all appeared.
+
+**And it surfaced a naming divergence that would have been the next failure.** The
+rendered NATS conf granted `CDC_ACME`; the bridge created `CDC_acme`:
+
+    conf grant   $JS.API.CONSUMER.CREATE.CDC_ACME
+    bridge made  CDC_acme
+
+Uppercase because `nats-init` used to create these with
+`tr '[:lower:]' '[:upper:]'` — deleted with the rest of that block in f3be486, when
+stream creation moved into the bridge, which builds
+`<cdc_streams.tenant_prefix><tenant>` verbatim. The subjects (`cdc.acme.>`) and the
+object store (`OBJ_gen-acme`) in the SAME permission block were always lowercase;
+only the stream name diverged, so it read as a permissions mystery rather than a
+typo. The operator side never had it — it grants `CDC_{{tag(tenant)}}`, verbatim,
+which is the authoritative convention. Template corrected (`CDC_acme`, `CDC_globex`,
+`CDC_john`; `CDC_PUBLIC` is a literal from grammar.json and stays). Verified: alice
+sees `CDC_acme` and creates a consumer on it.
+
 ## 10am. "The browser cannot reach the creds" — it reached them fine (2026-08-28)
 
 The file was never the problem, and checking beat assuming twice over. What I

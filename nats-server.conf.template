@@ -3,6 +3,16 @@
 # ${NATS_JOHN_PASSWORD}, ${NATS_MARY_PASSWORD} and ${OPEN_TENANT} are substituted at
 # startup (nats-config-gen, from .env.admin).
 #
+# ⚠️ Tenant stream names are the tenant token VERBATIM: CDC_acme, not CDC_ACME.
+#
+# They used to be uppercased here because nats-init created them with
+# `tr '[:lower:]' '[:upper:]'`. f3be486 moved stream creation into the BRIDGE, which
+# builds `<cdc_streams.tenant_prefix><tenant>` from grammar.json and the roster — so
+# the bridge makes CDC_acme while this file granted CDC_ACME, and a client with a
+# perfectly good tenant was refused its own stream. Measured 2026-08-28. The operator
+# side never had the bug: it grants `CDC_{{tag(tenant)}}`, verbatim. Note that the
+# subjects in this file (`cdc.acme.>`) and the object store (`OBJ_gen-acme`) were
+# always lowercase — only the stream name diverged.
 # ─────────────────────────────────────────────────────────────────────────────
 # This file is where PROTOCOL.md §7.1 stops being a claim and becomes a fact.
 #
@@ -217,7 +227,7 @@ authorization {
           #
           # Naming the streams here is therefore what actually enforces the tenant split.
           # CDC_PUBLIC carries tables with no tenant column and is granted to everyone.
-          "$JS.API.CONSUMER.CREATE.CDC_ACME",     "$JS.API.CONSUMER.CREATE.CDC_ACME.>"
+          "$JS.API.CONSUMER.CREATE.CDC_acme",     "$JS.API.CONSUMER.CREATE.CDC_acme.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
@@ -245,7 +255,7 @@ authorization {
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
-          "$JS.API.CONSUMER.INFO.CDC_ACME.>"
+          "$JS.API.CONSUMER.INFO.CDC_acme.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
 
@@ -256,10 +266,10 @@ authorization {
           # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
           # and REQUESTS, which no client can reach at all.
 
-          "$JS.API.CONSUMER.MSG.NEXT.CDC_ACME.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_acme.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.STREAM.INFO.CDC_ACME"
+          "$JS.API.STREAM.INFO.CDC_acme"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_tenants"
@@ -340,7 +350,7 @@ authorization {
           #
           # Naming the streams here is therefore what actually enforces the tenant split.
           # CDC_PUBLIC carries tables with no tenant column and is granted to everyone.
-          "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.CDC_globex",     "$JS.API.CONSUMER.CREATE.CDC_globex.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
@@ -368,7 +378,7 @@ authorization {
           # `js.consumers.get(stream, name)` reads the consumer back before binding, so
           # this is needed on every stream the client pulls from. Read-only metadata on
           # a stream it may already read.
-          "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.CDC_globex.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
 
@@ -379,10 +389,10 @@ authorization {
           # cannot be narrowed to her own. The bridge's own durables are on MUTATIONS
           # and REQUESTS, which no client can reach at all.
 
-          "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_globex.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.STREAM.INFO.CDC_GLOBEX"
+          "$JS.API.STREAM.INFO.CDC_globex"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_tenants"
@@ -409,7 +419,7 @@ authorization {
     # user means no connection at all, and no Postgres mapping means an omitted-column
     # write is refused even once connected.
     #
-    # No `$JS.API.CONSUMER.*.CDC_JOHN` grants below, because there is no such stream —
+    # No `$JS.API.CONSUMER.*.CDC_john` grants below, because there is no such stream —
     # he has no private tenant to have one. `CDC_PUBLIC` and the open-tenant subject
     # are the whole of what he can read, same mechanism as alice's and bob's public
     # reads, just without a second stream alongside it.
@@ -473,7 +483,7 @@ authorization {
 
           "$JS.API.INFO"
 
-          "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.CDC_globex",     "$JS.API.CONSUMER.CREATE.CDC_globex.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
@@ -498,14 +508,14 @@ authorization {
           "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
-          "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.CDC_globex.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
 
-          "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_globex.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.STREAM.INFO.CDC_GLOBEX"
+          "$JS.API.STREAM.INFO.CDC_globex"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_tenants"
@@ -527,7 +537,7 @@ authorization {
 
           "$JS.API.INFO"
 
-          "$JS.API.CONSUMER.CREATE.CDC_GLOBEX",     "$JS.API.CONSUMER.CREATE.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.CREATE.CDC_globex",     "$JS.API.CONSUMER.CREATE.CDC_globex.>"
           "$JS.API.CONSUMER.CREATE.CDC_PUBLIC",     "$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.CREATE.KV_schemas",     "$JS.API.CONSUMER.CREATE.KV_schemas.>"
           # ── Generations (NOTES.md §1.13): chain manifests + per-tenant object buckets.
@@ -552,14 +562,14 @@ authorization {
           "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}", "$JS.API.CONSUMER.CREATE.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.INFO.OBJ_gen-${OPEN_TENANT}.>"
           "$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-${OPEN_TENANT}.>"
-          "$JS.API.CONSUMER.INFO.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.INFO.CDC_globex.>"
           "$JS.API.CONSUMER.INFO.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.INFO.KV_schemas.>"
 
-          "$JS.API.CONSUMER.MSG.NEXT.CDC_GLOBEX.>"
+          "$JS.API.CONSUMER.MSG.NEXT.CDC_globex.>"
           "$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>"
           "$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>"
-          "$JS.API.STREAM.INFO.CDC_GLOBEX"
+          "$JS.API.STREAM.INFO.CDC_globex"
           "$JS.API.STREAM.INFO.CDC_PUBLIC"
           "$JS.API.STREAM.INFO.KV_schemas"
           "$JS.API.STREAM.INFO.KV_tenants"

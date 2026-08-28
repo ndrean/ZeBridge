@@ -1201,10 +1201,19 @@ export class ZeBridge {
   /// The tenant token THIS table's descriptors/manifests live under: the client's own
   /// tenant when the table is tenant-scoped, the open tenant otherwise — so every
   /// principal converges on one shared entry for tenant-agnostic tables.
-  private effectiveTenantFor(table: string): string {
+  ///
+  /// ⚠️ Returns null when the table is tenant-scoped and this principal resolved NO
+  /// tenant. That is a real state, not an error: `resolveTenant()` already logs
+  /// "No tenant mapping for 'x' — public-only reads" when `$KV.tenants.<principal>`
+  /// is absent. What used to happen next was that this returned `''` anyway, and the
+  /// caller built the manifest key `'' + '.' + table` — so NATS refused
+  /// `.counter_tenant` and the client reported `chain manifest unreadable: invalid
+  /// key`, blaming the key syntax for a missing roster entry. Measured against the
+  /// compose stack 2026-08-28, where `zebridge_user_tenants` is empty.
+  private effectiveTenantFor(table: string): string | null {
     const state = this.syncedTables.get(table);
-    if (state?.tenantColumn) return this.tenantValue;
-    return this.config.grammar.open_tenant || this.tenantValue;
+    if (state?.tenantColumn) return this.tenantValue || null;
+    return this.config.grammar.open_tenant || this.tenantValue || null;
   }
 
   /// zstd frame magic: 28 B5 2F FD. Our msgpack docs always start with a map
@@ -1256,6 +1265,19 @@ export class ZeBridge {
     if (!state || !state.pkCols.length) return false;
 
     const tenantForTable = this.effectiveTenantFor(table);
+    if (tenantForTable === null) {
+      // Say what is actually wrong. A tenant-scoped table is unreadable by a
+      // principal with no tenant — there is no chain to find, and no key that could
+      // name one.
+      this.appendLog(
+        'SYS',
+        `${table} is tenant-scoped and '${this.config.principal}' has no tenant ` +
+          `(no ${this.config.grammar.kv.tenants}.${this.config.principal} entry) — skipping. ` +
+          `Add the principal to zebridge_user_tenants.`,
+        'WARN',
+      );
+      return false;
+    }
     const key = `${tenantForTable}.${table}`;
     const readManifest = async (): Promise<any | null> => {
       try {
@@ -1411,8 +1433,13 @@ export class ZeBridge {
       } catch { /* fresh replica */ }
       const tableRoutes: Record<string, { route: string; seeded: boolean }> = {};
       for (const table of this.syncedTables.keys()) {
+        // Same null as above: a tenant-scoped table this principal cannot route is
+        // left out of the seeding decision entirely rather than routed to a stream
+        // name built from an empty token.
+        const t = this.effectiveTenantFor(table);
+        if (t === null) continue;
         tableRoutes[table] = {
-          route: this.cdcStreamForTenant(this.effectiveTenantFor(table)),
+          route: this.cdcStreamForTenant(t),
           seeded: seededBefore.has(table),
         };
       }
