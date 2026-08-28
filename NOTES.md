@@ -5326,6 +5326,28 @@ Fixed: `requireValue()` refuses, naming the flag. Same argument as
 `unknown argument:` being an error rather than a skip — silently continuing with
 a plausible value is the failure mode this CLI already refused everywhere else.
 
+**And the second half, which is the bigger one.** Refusing the missing value
+still left the compiled defaults `cdc_slot` / `cdc_pub` standing, so
+`bridge` with no flags and no env vars started on a publication nobody had
+named. Same failure with a wider door: every way of forgetting to say which
+publication you meant produced a bridge that booted cleanly and replicated the
+wrong table set. And two tenants on one cluster share that default name, so the
+second bridge to boot fights the first for its slot.
+
+A default cannot be correct here. `--port` can have one because any port works
+and a wrong one costs you a curl; these two names decide WHICH ROWS get
+replicated and WHOSE WAL position is kept. Unset is not ambiguous — it means
+nobody said — so it is no longer guessed at:
+
+    bridge                     ->  🔴 no replication slot named: pass --slot <name>,
+                                   or set BRIDGE_CDC_SLOT (there is no default …)
+
+Deleted: `Postgres.default_slot_name`, `Postgres.default_publication_name`, the
+`StreamConfig` field defaults (one caller, and it passes both), and the
+`defaults()` seeds — now `""` with the same comment `db_url` already carried.
+The four paths measured: unset → refusal; env only → boots (this is the
+`.env.bridge` boot); missing value → refusal; flag over env → flag wins.
+
 **On the original question** — does the bridge still need to READ
 `BRIDGE_CDC_PUBLICATION`? The DUPLICATION justification does disappear once
 §10ad lands and the templates stop naming the publication: there is then no

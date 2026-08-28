@@ -10,8 +10,10 @@ const usage =
     \\Streams PostgreSQL logical replication (pgoutput) to NATS JetStream.
     \\
     \\Options:
-    \\  --slot <NAME>   Replication slot name (created if absent)
-    \\  --pub <NAME>    PostgreSQL PUBLICATION to stream
+    \\  --slot <NAME>   Replication slot (created if absent). REQUIRED here or as
+    \\                  BRIDGE_CDC_SLOT — there is no default.
+    \\  --pub <NAME>    PostgreSQL PUBLICATION to stream. REQUIRED here or as
+    \\                  BRIDGE_CDC_PUBLICATION — there is no default.
     \\  --port <PORT>   HTTP telemetry port
     \\  --top <PATH>    grammar.json to read (default: ./grammar.json). Carries every
     \\                  stream, subject and KV name; missing file or key is fatal.
@@ -22,8 +24,8 @@ const usage =
     \\Environment:
     \\  DATABASE_READER_URL          REQUIRED. Read path, credentials included:
     \\                        postgres://<role>:<pass>@<host>:<port>/<db>[?sslmode=…]
-    \\  BRIDGE_CDC_PUBLICATION  The publication to replicate. --pub overrides it.
-    \\  BRIDGE_CDC_SLOT       The replication slot. --slot overrides it.
+    \\  BRIDGE_CDC_PUBLICATION  REQUIRED unless --pub is given (which overrides it).
+    \\  BRIDGE_CDC_SLOT       REQUIRED unless --slot is given (which overrides it).
     \\  DATABASE_WRITER_URL   Ingress path, same form. Unset disables the mutation
     \\                        listener entirely — it never falls back to the read role.
     \\  BRIDGE_PORT           HTTP telemetry port when --port is absent
@@ -147,19 +149,24 @@ pub const Args = struct {
         // literal default used to be 6543 here while Config.Http.default_port said
         // 9090 — two answers, and the one that won was the one nobody had written down.
         var http_port: ?u16 = null;
-        // Precedence: CLI flag > env > compiled default.
+        // Precedence: CLI flag > env > NOTHING. There is no compiled default for
+        // either name, and adding one back would be a mistake:
         //
-        // ⚠️ The env layer exists to kill a DUPLICATION, not for convenience. The
-        // publication is created by init.sql from `BRIDGE_CDC_PUBLICATION` and then
-        // named again on the bridge's command line as `--pub`; two spellings of one
-        // value that MUST agree, with no error when they drift — the bridge simply
-        // replicates a publication that carries no tables. Same story for the slot.
-        // Reading the same variable the DBA already set makes the flag an override
-        // rather than a second source of truth.
-        var slot_name: []const u8 =
-            init.minimal.environ.getPosix("BRIDGE_CDC_SLOT") orelse config.Postgres.default_slot_name;
-        var publication_name: []const u8 =
-            init.minimal.environ.getPosix("BRIDGE_CDC_PUBLICATION") orelse config.Postgres.default_publication_name;
+        // These two names decide WHICH ROWS this bridge replicates and WHERE its
+        // WAL position is kept. A default cannot be right — it can only be a name
+        // that happens to exist somewhere. `cdc_pub` and `cdc_slot` were those
+        // names, and they turned every way of forgetting to say which publication
+        // you meant into a bridge that started, logged nothing unusual, and
+        // replicated a different table set. Two tenants on one cluster share the
+        // default; the second bridge to boot then fights the first for its slot.
+        //
+        // Unset is not ambiguous, so it is not guessed at: the bridge stops and
+        // says which of the two channels to use. Both channels are real — the env
+        // var is what lets the bridge boot with no flags at all from .env.bridge
+        // (systemd EnvironmentFile, compose env_file), and the flag overrides it
+        // for a one-off run against another publication on the same host.
+        var slot_name: ?[]const u8 = init.minimal.environ.getPosix("BRIDGE_CDC_SLOT");
+        var publication_name: ?[]const u8 = init.minimal.environ.getPosix("BRIDGE_CDC_PUBLICATION");
         // Off by default: one keyless table should not stop every other table from
         // replicating. See preflight.zig for the full argument.
         var strict_tables: bool = false;
@@ -203,6 +210,18 @@ pub const Args = struct {
                 return error.InvalidArguments;
             }
         }
+
+        // ⚠️ No default, so an unset name stops the boot here rather than
+        // silently choosing one. Reported together: a fresh deployment is
+        // usually missing both, and one error per run is one edit per run.
+        const resolved_slot = slot_name orelse {
+            log.err("🔴 no replication slot named: pass --slot <name>, or set BRIDGE_CDC_SLOT (there is no default — the slot holds this bridge's WAL position)", .{});
+            return error.InvalidArguments;
+        };
+        const resolved_publication = publication_name orelse {
+            log.err("🔴 no publication named: pass --pub <name>, or set BRIDGE_CDC_PUBLICATION (there is no default — the publication decides which tables this bridge replicates)", .{});
+            return error.InvalidArguments;
+        };
 
         // `--port` beats `BRIDGE_PORT` beats the compiled default. BRIDGE_PORT was
         // declared in .env.bridge and read by nobody: setting it and omitting --port
@@ -248,15 +267,15 @@ pub const Args = struct {
             .topology_path = resolved_topology,
             .http_port = resolved_port,
             .http_bind = resolved_bind,
-            .slot_name = slot_name,
-            .publication_name = publication_name,
+            .slot_name = resolved_slot,
+            .publication_name = resolved_publication,
         };
 
         // Build runtime configuration by merging CLI args with compile-time defaults
         var runtime_config = config.RuntimeConfig.defaults();
         runtime_config.http_port = resolved_port;
-        runtime_config.slot_name = slot_name;
-        runtime_config.publication_name = publication_name;
+        runtime_config.slot_name = resolved_slot;
+        runtime_config.publication_name = resolved_publication;
         runtime_config.strict_tables = strict_tables;
 
         // Read PostgreSQL configuration from environment variables via Juicy Main environ.

@@ -203,7 +203,8 @@ That is the whole contract for an app author. The wire format — the NATS subje
 <details><summary>psql access</summary>
 
 ```sh
-psql postgres://<role>:<password>@<host>:<port>/<dbname> -c "...;"
+ADMIN_DATABASE_URL=postgres://<role>:<password>@<host>:<port>/<dbname> \
+psql  -c "...;"
 ```
 
 or decomposing with flags, but `PGPASSWORD` is separated. The other creds can be either standard Postgres env vars (PGHOST, PGPORT, PGUSER, PGDATABASE) or flags:
@@ -232,19 +233,37 @@ psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
 **DBA creates two USER profils in the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils:
 
 ```sh
+set -a && source .env.admin && source .env.bridge && set +a
+```
+
+1. **Create the bridge's database objects.** Read side, then write side (write side only if you want edge writes):
+
+   ```sh
+   
+   ```
+
+```sh
 # .env.admin — the DBA sets the role names and passwords; the templates interpolate them
 POSTGRES_READER_USER=bridge_reader      # created by init.core.template.sql
 POSTGRES_READER_PASSWORD=...
 
 POSTGRES_WRITER_USER=bridge_writer      # created by init.write.template.sql
 POSTGRES_WRITER_PASSWORD=...
+
+BRIDGE_CDC_PUBLICATION=...
+TARGET_DB=...
+
+envsubst < init.core.template.sql  | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -
+envsubst < init.write.template.sql | psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -   # read/write only
 ```
 
 **ZeBridge uses these USER profils**: the reader USER and writer USER, set in _.env.bridge_, are used by `ZeBridge`.
 
-```txt
-DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
-DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
+```sh
+DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres \
+DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres \
+BRIDGE_CDC_PUBLICATION=... \
+./bridge --slot my_slot --port 9090
 ```
 
 **DBA creates nkey pair for ZeBridge ↔ NATS**: The DBA generates a keypair. Set the public key in the NATS config and use the seed as `NATS_NKEY_SEED` (in _.env.bridge_) to run ZeBridge:
@@ -831,13 +850,29 @@ accounts {
 
 ### Running the Bridge
 
-The user of the bridge defines a `REPLICATION_SLOT` with the flag `--slot my_slot`. The bridge will create it.
+The bridge is told which slot and which publication to use, and refuses to start
+without both. There is no default for either: a default publication would decide
+which tables get replicated, and a default slot would decide whose WAL position
+is kept — both are guesses, and a wrong guess starts cleanly and replicates the
+wrong data. Name them either way:
+
+```bash
+bridge --slot my_slot --pub my_pub          # flags
+BRIDGE_CDC_SLOT=my_slot BRIDGE_CDC_PUBLICATION=my_pub bridge   # or the environment
+```
+
+The flags win over the environment, so `.env.bridge` can carry the usual pair and
+a one-off run can still point at another publication. The slot is created by the
+bridge if it does not exist; the publication is not — it must already exist, and
+the bridge stops at boot if it does not (see `zebridge_enable`).
 
 ### Command-Line Options
 
 ```txt
-  --slot <NAME>     Mandatory: Replication slot name (default: cdc_slot)
-  --pub <NAME>      Mandatory: use the Postgres `PUBLICATION`
+  --slot <NAME>     Replication slot (created if absent). No default —
+                    required here or as BRIDGE_CDC_SLOT.
+  --pub <NAME>      Postgres PUBLICATION to stream. No default —
+                    required here or as BRIDGE_CDC_PUBLICATION.
   --port <PORT>     HTTP telemetry port (default: 9090)
   --help, -h        Show this help message
 ```
@@ -848,7 +883,7 @@ The user of the bridge defines a `REPLICATION_SLOT` with the flag `--slot my_slo
 
 **Prerequisites**:
 
-* PostgreSQL admin has created publication (e.g., `cdc_pub`) and bridge user (`bridge_reader`)
+* PostgreSQL admin has created the publication (`my_pub` below) and the bridge user (`bridge_reader`)
 * NATS admin has created the MUTATIONS stream, KV buckets, and credentials — the bridge creates the CDC streams at boot
 
 **Step 1**: Start infrastructure containers:
@@ -1672,7 +1707,7 @@ docker exec -it postgres psql -U postgres -c "
   SELECT slot_name, active,
          pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
   FROM pg_replication_slots
-  WHERE slot_name = 'cdc_slot';
+  WHERE slot_name = 'my_slot';
 "
 ```
 

@@ -6,15 +6,16 @@ const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
-const Conf = @import("config.zig");
 const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.wal_stream);
 
 pub const StreamConfig = struct {
     pg_config: *const pg_conn.PgConf,
-    slot_name: [:0]const u8 = Conf.Postgres.default_slot_name, // "cdc_slot"
-    publication_name: [:0]const u8 = Conf.Postgres.default_publication_name, // "cdc_pub"
+    // No field defaults: the one caller (bridge.zig) passes both, and a default
+    // would let a future caller open a stream on a publication nobody named.
+    slot_name: [:0]const u8,
+    publication_name: [:0]const u8,
 };
 
 pub const ReplicationStream = struct {

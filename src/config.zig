@@ -10,8 +10,9 @@ pub const log = std.log.scoped(.config);
 
 /// PostgreSQL connection and replication configuration
 pub const Postgres = struct {
-    pub const default_slot_name = "cdc_slot";
-    pub const default_publication_name = "cdc_pub";
+    // No default_slot_name / default_publication_name on purpose: a default here
+    // is a guess about which tables to replicate and whose WAL position to keep.
+    // `parseArgs` requires --slot/--pub or their env vars and refuses without them.
     pub const connection_timeout_ms = 5000; // milliseconds
 
     /// Replication connection receive timeout (milliseconds)
@@ -721,8 +722,10 @@ pub const RuntimeConfig = struct {
             // fails without it, so nothing should ever reach a default here.
             .db_url = "",
             .pg_writer_url = null,
-            .slot_name = Postgres.default_slot_name,
-            .publication_name = Postgres.default_publication_name,
+            // Unusable on purpose, like `db_url` above: `parseArgs` overwrites both
+            // and refuses to return when either name is unset, so nothing reaches these.
+            .slot_name = "",
+            .publication_name = "",
             // Always replaced in `main` immediately after parseArgs. Safe as a default
             // only because a test asserts `for_tests` equals the repository's own
             // grammar.json, so the two cannot drift.
