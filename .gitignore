@@ -65,3 +65,7 @@ nats-data.pre-jwt/
 zb-client-ts/node_modules/
 
 examples/04-node-consumer/node_modules/
+README.md.bak
+reorganize.py
+test_map.zig
+seed.txt
