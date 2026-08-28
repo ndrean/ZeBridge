@@ -498,7 +498,17 @@ services:
     volumes:
       - ./telemetry/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9091:9090"
+      # ⚠️ 127.0.0.1, not the default. A bare "9091:9090" binds EVERY interface, so
+      # this reaches anything that can route to the machine — a café network, a
+      # colleague's laptop, a VPN peer. Prometheus, Grafana and the NATS exporter are
+      # all unauthenticated by default and, between them, publish the table names,
+      # per-table throughput, WAL lag, stream and consumer inventory, and the account
+      # topology. None of them is a service; all three are a developer's own window
+      # onto the stack, so loopback is the correct audience.
+      #
+      # Scraping is unaffected: Prometheus reaches `bridge:9090` and
+      # `nats-exporter:7777` over the compose network, not through a published port.
+      - "127.0.0.1:9091:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -508,7 +518,9 @@ services:
     image: grafana/grafana:latest
     container_name: zebridge_grafana
     ports:
-      - "3000:3000"
+      # Loopback, same reasoning as Prometheus above — Grafana ships with a known
+      # default login and reads that Prometheus.
+      - "127.0.0.1:3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
@@ -525,7 +537,9 @@ services:
     container_name: zebridge_nats_exporter
     command: [ "-jsz", "all", "-varz", "http://nats-server:8222" ]
     ports:
-      - "7777:7777"
+      # Loopback, same reasoning. Prometheus scrapes this over the compose network at
+      # `nats-exporter:7777`, so publishing it at all is only for a human with curl.
+      - "127.0.0.1:7777:7777"
     depends_on:
       - nats-server
     networks:

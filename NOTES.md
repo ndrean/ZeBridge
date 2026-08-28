@@ -5392,6 +5392,38 @@ Fix when picked up: exempt the three bridge-owned tables from the edge-write rul
 bridge's WAL loop), or key the rule off an actual edge grant rather than
 `bridge_writer`'s.
 
+## 10al. The monitoring trio was published on every interface (2026-08-28)
+
+Spotted by the operator while I was arguing about `BRIDGE_BIND`: Prometheus (9091),
+Grafana (3000) and the NATS exporter (7777) all used a bare `"port:port"`, which
+binds EVERY interface — reachable from anything that can route to the machine.
+Between them they publish the table names, per-table throughput, WAL lag, stream and
+consumer inventory, and the account topology, all unauthenticated, and Grafana ships
+with a known default login.
+
+Now `127.0.0.1:9091:9090` and friends. Measured both directions:
+
+    127.0.0.1:9091/-/healthy    200      192.168.1.75:9091  ->  000
+    127.0.0.1:3000/api/health   200      192.168.1.75:3000  ->  000
+    127.0.0.1:7777/metrics      200      192.168.1.75:7777  ->  000
+
+Scraping is untouched, which is the thing narrowing a publish could plausibly break:
+Prometheus reaches `bridge:9090` and `nats-exporter:7777` over the compose network,
+not through a published port. Both report `up` afterwards.
+
+**Worth separating from `BRIDGE_BIND`**, because they look alike and are not the same
+thing. `BRIDGE_BIND: 0.0.0.0` is the bind INSIDE the container's own network
+namespace and exposes nothing by itself — the published port is what exposes. Every
+one of these services binds 0.0.0.0 inside its container too; the difference is only
+in how the host publishes it.
+
+**One target is legitimately down and always will be**: `host.docker.internal:9090`,
+the HOST-run bridge, which binds 127.0.0.1 by default — correct for a host process,
+and a container cannot reach it. It is a convenience target for whoever runs the
+bridge natively AND wants the compose Prometheus to see it; that costs
+`BRIDGE_BIND=0.0.0.0` on the host bridge, which is a deliberate choice, not a
+default worth changing.
+
 ## 10ak. Why the browser client reached nothing in compose (2026-08-28)
 
 Reported as "the browser client does not reach nats nor the bridge". Three separate
