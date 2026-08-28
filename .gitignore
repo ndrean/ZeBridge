@@ -79,3 +79,5 @@ seed.txt
 # broker accepts. `.env.compose.example` is the tracked copy worth reading.
 web-consumer/.env.local
 web-consumer/.env.*.local
+libzb/soak-uids.txt
+libzb/zbz-*.sqlite3*
