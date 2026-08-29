@@ -164,7 +164,7 @@ pub fn main() !void {
         try vals.put(aa, "inserted_at", .{ .string = now });
         try vals.put(aa, "updated_at", .{ .string = now });
 
-        _ = c.mutate(table, "INSERT", .{ .object = key }, .{ .object = vals }) catch |err| {
+        _ = c.mutate(aa, table, "INSERT", .{ .object = key }, .{ .object = vals }) catch |err| {
             std.debug.print("cycle {d}: INSERT failed: {any}\n", .{ cycle, err });
             continue;
         };
@@ -185,14 +185,14 @@ pub fn main() !void {
         try upd.put(aa, "some_text", .{ .string = "soak-updated" });
         try upd.put(aa, "age", .{ .integer = @intCast((cycle % 120) + 1) });
         try upd.put(aa, "updated_at", .{ .string = later });
-        _ = c.mutate(table, "UPDATE", .{ .object = key }, .{ .object = upd }) catch |err| {
+        _ = c.mutate(aa, table, "UPDATE", .{ .object = key }, .{ .object = upd }) catch |err| {
             std.debug.print("cycle {d}: UPDATE failed: {any}\n", .{ cycle, err });
         };
         updated += 1;
 
         // The DELETE is a separate mutation, as a client would send it — the tombstone
         // is written by the guard in PostgreSQL, not by us.
-        _ = c.mutate(table, "DELETE", .{ .object = key }, null) catch |err| {
+        _ = c.mutate(aa, table, "DELETE", .{ .object = key }, null) catch |err| {
             std.debug.print("cycle {d}: DELETE failed: {any}\n", .{ cycle, err });
             continue;
         };

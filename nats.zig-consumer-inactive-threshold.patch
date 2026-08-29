@@ -1,0 +1,16 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -223,6 +223,12 @@
+     deliver_group: ?[]const u8 = null,
+     /// Enable flow control protocol for push consumers
+     flow_control: ?bool = null,
++    /// LOCAL FIX (see NOTES.md): nanoseconds of inactivity after which the SERVER
++    /// deletes the consumer. Honoured for durable consumers too on nats-server >= 2.9,
++    /// which is what makes a named consumer reapable from a client whose grants
++    /// exclude `$JS.API.CONSUMER.DELETE`. Null (the default) keeps upstream behaviour:
++    /// the consumer persists until deleted.
++    inactive_threshold: ?u64 = null,
+ };
+ 
+ pub const ConsumerInfo = struct {

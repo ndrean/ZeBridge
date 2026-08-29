@@ -38,6 +38,10 @@ const TableState = struct {
     cols: []const []const u8,
     version_col: ?[]const u8,
     tenant_col: ?[]const u8,
+    /// PROTOCOL §7.5: a soft delete arrives as an update setting this column, and the
+    /// physical reap is never forwarded — so a row with it set is REMOVED here, on
+    /// seed, on CDC and on the local optimistic apply alike. See `tombstoned`.
+    tombstone_col: ?[]const u8,
     route: []const u8, // the CDC stream this table's events ride
     seed_seq: ?u64 = null,
     seed_stream: ?[]const u8 = null,
@@ -66,13 +70,24 @@ pub const SyncClient = struct {
     /// §10x dictionaries by object name — immutable, so the cache cannot go stale.
     dicts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
+    /// FK-held events (§10h) outlive the `drainStream` call that decoded them — they
+    /// wait for `drainCdc`'s retry pass — but not the pass itself. So they get their
+    /// own arena, reset after every pass: a third lifetime, between "this call" and
+    /// "this client", and the only one that needs a deep copy (see `cloneValue`).
+    held_arena: std.heap.ArenaAllocator,
     held: std.ArrayList(Held) = .empty,
     /// The HLC's two inputs (§7.2). `seen_floor` is the newest version this replica
     /// has OBSERVED (from CDC), `last_version` its own last stamp. A version is
     /// strictly after both, so a lagging clock cannot stamp under a row it has seen —
     /// and arrival time never becomes the comparator, which would punish offline edits.
+    ///
+    /// ⚠️ `last_version` is a slice into `last_version_buf`, not an arena string: it is
+    /// rewritten on every `mutate`, and a per-write dupe into the client arena would
+    /// grow that arena for the life of the client (the pattern §1 of the review found
+    /// in every loop entry point — the arena is a LIFETIME, not a convenience).
     seen_floor: []const u8 = "",
     last_version: []const u8 = "",
+    last_version_buf: [64]u8 = undefined,
     /// Held open across mutate/flush: a CORE subscription only delivers what arrives
     /// while it exists, so subscribing after publishing misses the verdict every time
     /// (measured — the demo settled 0 of 1 until this was split out of drainVerdicts).
@@ -96,19 +111,23 @@ pub const SyncClient = struct {
         self.* = .{
             .a = a,
             .arena = std.heap.ArenaAllocator.init(a),
+            .held_arena = std.heap.ArenaAllocator.init(a),
             .t = undefined,
             .st = undefined,
             .opts = opts,
         };
         errdefer self.arena.deinit();
+        errdefer self.held_arena.deinit();
 
         self.st = try storage.Storage.open(opts.db_path);
         errdefer self.st.close();
 
-        try self.loadGrammar();
-
         self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = opts.creds_path });
         errdefer self.t.deinit();
+
+        // After the transport: the grammar read borrows its Io rather than standing up
+        // a second thread pool for one file.
+        try self.loadGrammar();
 
         return self;
     }
@@ -128,6 +147,7 @@ pub const SyncClient = struct {
     pub fn deinit(self: *SyncClient) void {
         self.releaseHandles();
         self.st.close();
+        self.held_arena.deinit(); // `held`'s backing array lives here too
         self.arena.deinit();
         self.a.destroy(self);
     }
@@ -149,10 +169,10 @@ pub const SyncClient = struct {
     }
 
     fn loadGrammar(self: *SyncClient) !void {
+        // Client-lifetime arena, deliberately: the grammar strings below are read for
+        // the life of the client, and this runs once.
         const a = self.aa();
-        var th: std.Io.Threaded = .init(self.a, .{});
-        defer th.deinit();
-        const io = th.io();
+        const io = self.t.threaded.io();
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, self.opts.grammar_path, a, .limited(1 << 20));
         const g = try std.json.parseFromSlice(Value, a, bytes, .{});
         const root = g.value.object;
@@ -201,6 +221,7 @@ pub const SyncClient = struct {
             for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
             const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
             const version_col: ?[]const u8 = if (val.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
+            const tombstone_col: ?[]const u8 = if (val.object.get("tombstone_column")) |v| (if (v == .string) v.string else null) else null;
 
             // FINDING 9: existence is the DATABASE's to answer, never a map's.
             var qa = std.heap.ArenaAllocator.init(self.a);
@@ -228,6 +249,7 @@ pub const SyncClient = struct {
                 .cols = names.items,
                 .version_col = version_col,
                 .tenant_col = tenant_col,
+                .tombstone_col = tombstone_col,
                 .route = route,
             });
         }
@@ -235,8 +257,8 @@ pub const SyncClient = struct {
         try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER)");
     }
 
+    /// DDL steps from core carry no params (unlike the DML plans `stepExec` runs).
     fn execStep(self: *SyncClient, stp: Value) !void {
-        _ = stp.object.get("params"); // core SqlSteps carry no params today
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
         _ = try self.st.query(qa.allocator(), stp.object.get("sql").?.string, &.{});
@@ -244,11 +266,14 @@ pub const SyncClient = struct {
 
     // ─── positions ──────────────────────────────────────────────────────────
 
-    fn storedSeq(self: *SyncClient, stream: []const u8) u64 {
+    /// ⚠️ A read failure is an ERROR, not 0. Answering 0 to "where was I" tells the
+    /// gap rule the replica has never been here, which is a full re-seed — the most
+    /// expensive thing this client can do, triggered by a locked database file.
+    fn storedSeq(self: *SyncClient, stream: []const u8) !u64 {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
-        const rows = self.st.query(qa.allocator(),
-            "SELECT last_seq FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }}) catch return 0;
+        const rows = try self.st.query(qa.allocator(),
+            "SELECT last_seq FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }});
         if (rows.len == 0) return 0;
         return @intCast(rows[0][0].integer);
     }
@@ -269,7 +294,9 @@ pub const SyncClient = struct {
     // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
 
     pub fn gapAndSeed(self: *SyncClient) !void {
-        const a = self.aa();
+        var ca = std.heap.ArenaAllocator.init(self.a);
+        defer ca.deinit();
+        const a = ca.allocator();
         var gapped: std.StringArrayHashMapUnmanaged(void) = .empty;
         var it = self.states.iterator();
         while (it.next()) |e| {
@@ -278,25 +305,82 @@ pub const SyncClient = struct {
             var info = self.t.js.getStreamInfo(stream) catch continue;
             defer info.deinit();
             const first: i64 = @intCast(info.value.state.first_seq);
-            const stored: i64 = @intCast(self.storedSeq(stream));
+            const stored: i64 = @intCast(try self.storedSeq(stream));
             if (core.streamHasGap(first, stored)) try gapped.put(a, stream, {});
         }
         // Seed in the CONFIGURED order (parents first) with foreign_keys ON:
         // scoped to gapped routes plus never-seeded tables (§10n).
         for (self.opts.tables) |table| {
             const st = self.states.get(table) orelse continue;
-            var qa = std.heap.ArenaAllocator.init(self.a);
-            defer qa.deinit();
-            const seeded = (self.st.query(qa.allocator(),
-                "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch @as([]storage.Row, &.{})).len > 0;
+            // ⚠️ `try`, not "treat a failed read as never seeded": that would answer a
+            // locked database with a full re-seed (the same trap as `storedSeq`).
+            const seeded = (try self.st.query(a,
+                "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }})).len > 0;
             if (gapped.contains(st.route) or !seeded) {
                 try self.applyChain(table);
             }
         }
     }
 
+    /// One chain step's rows, applied inside `Storage.transaction` — the DELETE of a
+    /// full shares the transaction so a crash mid-apply cannot leave an empty table
+    /// (§10n). A struct because `transaction` takes `(ctx, fn)`, and the fn needs
+    /// everything the step decoded.
+    const ChainStep = struct {
+        client: *SyncClient,
+        a: std.mem.Allocator,
+        table: []const u8,
+        sql: []const u8,
+        rows: std.json.Array,
+        is_full: bool,
+        cols: []const []const u8,
+        pk: []const []const u8,
+        /// Index of the tombstone column in `cols`, when the table has one and the
+        /// chain carries it.
+        tomb_idx: ?usize,
+
+        fn apply(cs: ChainStep, st: *storage.Storage) !void {
+            if (cs.is_full) {
+                const del = try std.fmt.allocPrint(cs.a, "DELETE FROM {s}", .{cs.table});
+                _ = try st.query(cs.a, del, &.{});
+            }
+            for (cs.rows.items, 0..) |row, n| {
+                // §7.5: a tombstoned row in a chain is a row this replica must NOT hold.
+                // A chain is built from the table as it stands, so it carries every
+                // tombstone not yet reaped; the reap itself never reaches a client.
+                if (cs.tomb_idx) |ti| if (ti < row.array.items.len and row.array.items[ti] != .null) {
+                    var keyed: std.json.ObjectMap = .empty;
+                    for (cs.pk) |pc| {
+                        for (cs.cols, 0..) |c, i| if (std.mem.eql(u8, c, pc) and i < row.array.items.len) {
+                            try keyed.put(cs.a, pc, row.array.items[i]);
+                        };
+                    }
+                    if (try core.planDelete(cs.a, cs.table, cs.pk, .{ .object = keyed })) |stp| {
+                        _ = try cs.client.stepExec(cs.a, stp);
+                    }
+                    continue;
+                };
+                const params = try cs.a.alloc(storage.Value, row.array.items.len);
+                for (row.array.items, 0..) |cell, i| params[i] = try chainCellToStorage(cs.a, cell);
+                _ = st.query(cs.a, cs.sql, params) catch |err| {
+                    // Read the SQLite text HERE, before the rollback clears it: it is
+                    // what tells an FK refusal from a bad column apart.
+                    std.debug.print("{s}: row {d} of {d} refused: {any} — sqlite: {s}\n", .{
+                        cs.table, n + 1, cs.rows.items.len, err, st.errMsg(),
+                    });
+                    return err;
+                };
+            }
+        }
+    };
+
     fn applyChain(self: *SyncClient, table: []const u8) !void {
-        const a = self.aa();
+        // Per-call: a seed can be megabytes, and it is dead the moment it is applied.
+        // Only two things leave this arena — the dictionary cache and `seed_stream` —
+        // and both are duped into the client arena explicitly below.
+        var ca = std.heap.ArenaAllocator.init(self.a);
+        defer ca.deinit();
+        const a = ca.allocator();
         const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ self.effTenant(table), table });
         const man_bytes = (try self.t.kvGet(a, self.kv_generations, key)) orelse {
             std.debug.print("{s}: no chain yet\n", .{table});
@@ -304,17 +388,15 @@ pub const SyncClient = struct {
         };
         const man = (try std.json.parseFromSlice(Value, a, man_bytes, .{})).value;
 
-        var qa = std.heap.ArenaAllocator.init(self.a);
-        defer qa.deinit();
-        const wm_rows = self.st.query(qa.allocator(),
-            "SELECT watermark FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch @as([]storage.Row, &.{});
+        const wm_rows = try self.st.query(a,
+            "SELECT watermark FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
         const watermark: ?[]const u8 = if (wm_rows.len > 0 and wm_rows[0][0] == .text) wm_rows[0][0].text else null;
 
         const plan = try core.planFromManifest(a, man, watermark);
         // D2's destruction guard: a full from a chain older than this replica's
         // position would destroy rows CDC will never re-deliver.
         const cdc_stream = if (man.object.get("cdc_stream")) |v| (if (v == .string) v.string else "") else "";
-        const pos: i64 = if (cdc_stream.len > 0) @intCast(self.storedSeq(cdc_stream)) else 0;
+        const pos: i64 = if (cdc_stream.len > 0) @intCast(try self.storedSeq(cdc_stream)) else 0;
         if (core.fullPredatesReplica(man, plan.array, pos)) {
             std.debug.print("{s}: chain predates replica — refusing the full (D2)\n", .{table});
             return;
@@ -324,58 +406,65 @@ pub const SyncClient = struct {
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
         var applied: usize = 0;
         for (plan.array.items) |step| {
-            const raw = try self.t.objectGetBytes(a, bucket, step.object.get("name").?.string);
+            // Per-step: `raw`, `blob` and `doc` are three copies of the same seed at
+            // their largest; freeing them per step bounds the peak at one step's worth.
+            var sa = std.heap.ArenaAllocator.init(self.a);
+            defer sa.deinit();
+            const step_a = sa.allocator();
+            const raw = try self.t.objectGetBytes(step_a, bucket, step.object.get("name").?.string);
             // §10x: a delta names the dictionary it was compressed with; fetch it
-            // once per era from the same bucket and keep it (immutable by name).
+            // once per era from the same bucket and keep it (immutable by name, so
+            // client-lifetime is the RIGHT arena here — the one place in this fn).
             var dict: ?[]const u8 = null;
             if (step.object.get("dict")) |dv| if (dv == .string) {
                 if (self.dicts.get(dv.string)) |d| {
                     dict = d;
                 } else {
-                    const d = try self.t.objectGetBytes(a, bucket, dv.string);
-                    try self.dicts.put(a, try a.dupe(u8, dv.string), d);
+                    const la = self.aa();
+                    const d = try self.t.objectGetBytes(la, bucket, dv.string);
+                    try self.dicts.put(la, try la.dupe(u8, dv.string), d);
                     dict = d;
                 }
             };
-            const blob = try maybeZstd(a, raw, dict); // §10w: magic-sniffed, mixed chains fine
-            const doc = try decodeMsgpack(a, blob);
-            const cols = try jsonStrList(a, doc.object.get("columns"));
+            const blob = try maybeZstd(step_a, raw, dict); // §10w: magic-sniffed, mixed chains fine
+            const doc = try decodeMsgpack(step_a, blob);
+            const cols = try jsonStrList(step_a, doc.object.get("columns"));
             const vcol_v = doc.object.get("version_column") orelse (man.object.get("version_column") orelse @as(Value, .null));
             const vcol: ?[]const u8 = if (vcol_v == .string and contains(cols, vcol_v.string)) vcol_v.string else null;
-            const sql = try core.chainUpsertSql(a, table, cols, st.pk, vcol);
-            const is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full");
-
-            var ta = std.heap.ArenaAllocator.init(self.a);
-            defer ta.deinit();
-            const taa = ta.allocator();
-            // The DELETE shares the transaction: a crash mid-apply cannot leave
-            // an empty table (§10n).
-            try self.st.execSimple("BEGIN IMMEDIATE;");
-            errdefer self.st.execSimple("ROLLBACK;") catch {};
-            if (is_full) {
-                const del = try std.fmt.allocPrint(taa, "DELETE FROM {s}", .{table});
-                _ = try self.st.query(taa, del, &.{});
-            }
             const rows = doc.object.get("rows").?.array;
-            for (rows.items) |row| {
-                const params = try a.alloc(storage.Value, row.array.items.len);
-                for (row.array.items, 0..) |cell, i| params[i] = try chainCellToStorage(taa, cell);
-                _ = try self.st.query(taa, sql, params);
-            }
-            try self.st.execSimple("COMMIT;");
+            const cs = ChainStep{
+                .client = self,
+                .a = step_a,
+                .table = table,
+                .sql = try core.chainUpsertSql(step_a, table, cols, st.pk, vcol),
+                .rows = rows,
+                .is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full"),
+                .cols = cols,
+                .pk = st.pk,
+                .tomb_idx = if (st.tombstone_col) |tc| indexOf(cols, tc) else null,
+            };
+            self.st.transaction(cs, ChainStep.apply) catch |err| {
+                // The SQLite text is the only thing that distinguishes a bad row from
+                // a bad schema; a bare StepFailed here cost a run to find out which.
+                std.debug.print("{s}: chain step {s} ({s}, {d} rows) rolled back: {any}\n", .{
+                    table, step.object.get("name").?.string, if (cs.is_full) "full" else "delta",
+                    rows.items.len, err,
+                });
+                return err;
+            };
             applied += rows.items.len;
         }
 
         // Anchors (findings 7 + 10): the ONE place the gate may anchor to.
         if (man.object.get("cutoff_seq")) |v| if (v == .integer and v.integer > 0) {
             st.seed_seq = @intCast(v.integer);
-            st.seed_stream = if (cdc_stream.len > 0) try a.dupe(u8, cdc_stream) else null;
+            st.seed_stream = if (cdc_stream.len > 0) try self.aa().dupe(u8, cdc_stream) else null;
         };
         if (man.object.get("cutoff_lsn")) |v| if (v == .string) {
             st.seed_lsn = core.lsnToNumber(v.string);
         };
         const cv = if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "";
-        _ = try self.st.query(qa.allocator(),
+        _ = try self.st.query(a,
             "INSERT INTO _zbz_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?) ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn",
             &.{ .{ .text = table }, .{ .text = cv }, .{ .integer = st.seed_lsn orelse 0 } });
         std.debug.print("{s}: seeded {d} row(s) from chain g{d}\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0 });
@@ -384,7 +473,9 @@ pub const SyncClient = struct {
     // ─── step 3: CDC catch-up (gate → apply → hold → positions) ─────────────
 
     pub fn drainCdc(self: *SyncClient) !void {
-        const a = self.aa();
+        var ca = std.heap.ArenaAllocator.init(self.a);
+        defer ca.deinit();
+        const a = ca.allocator();
         var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
         // Public first: parents (users) ride CDC_PUBLIC — fewer FK holds.
         var it = self.states.iterator();
@@ -407,12 +498,15 @@ pub const SyncClient = struct {
         if (self.held.items.len > 0) {
             std.debug.print("fk held: {d}, resolved on retry: {d}\n", .{ self.held.items.len, resolved });
         }
-        self.held.clearRetainingCapacity();
+        // The pass is over: drop the list AND its events in one reset. The list's
+        // backing array lives in the same arena, so it must be re-zeroed, not
+        // `clearRetainingCapacity`'d — that would keep a pointer into reset memory.
+        self.held = .empty;
+        _ = self.held_arena.reset(.retain_capacity);
     }
 
     fn drainStream(self: *SyncClient, stream: []const u8) !void {
-        const a = self.aa();
-        const last = self.storedSeq(stream);
+        const last = try self.storedSeq(stream);
         var name_buf: [48]u8 = undefined;
         // Unique-enough per process: pid + a monotonic counter (std.crypto.random
         // wants an Io in 0.16; libc is already linked).
@@ -424,6 +518,15 @@ pub const SyncClient = struct {
         var cfg = transportConsumerConfig();
         cfg.name = cname;
         cfg.durable_name = cname;
+        // ⚠️ Reaped by the SERVER, not deleted by us. The consumer is named (nats.zig's
+        // `pullSubscribe` requires it, and sets it durable), and the client JWT has no
+        // `$JS.API.CONSUMER.DELETE` grant — by design — so deleting it from here was
+        // refused and cost a 5 s timeout per stream (measured 2026-08-29). An inactive
+        // threshold makes the server do it: nats-server >= 2.9 honours it on durable
+        // consumers as well. 30 s is well past any fetch gap in a drain and short
+        // enough that a client draining on a timer never accumulates consumers.
+        // (Field added by the local nats.zig patch — nats.zig/NOTES.md.)
+        cfg.inactive_threshold = 30 * std.time.ns_per_s;
         if (last > 0) {
             cfg.deliver_policy = .by_start_sequence;
             cfg.opt_start_seq = last + 1;
@@ -431,13 +534,25 @@ pub const SyncClient = struct {
             cfg.deliver_policy = .all;
         }
         const sub = try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg });
-        defer sub.deinit();
+        defer sub.deinit(); // the server reaps the consumer itself — see inactive_threshold above
 
         var max_seq: u64 = last;
         while (true) {
-            var batch = sub.fetch(100, .{ .duration = .{ .raw = .fromMilliseconds(900), .clock = .awake } }) catch break;
+            // ⚠️ Only a TIMEOUT means "caught up". A closed connection or a slow
+            // consumer used to break here too — and then persist the position, which
+            // is how a network blip becomes a recorded claim to have read the tail.
+            var batch = sub.fetch(100, .{ .duration = .{ .raw = .fromMilliseconds(900), .clock = .awake } }) catch |err| switch (err) {
+                error.Timeout => break,
+                else => return err,
+            };
             defer batch.deinit();
             if (batch.messages.len == 0) break; // caught up to the tail
+
+            // Per-batch: every decoded event dies with the batch, except the FK-held
+            // ones, which are deep-copied into `held_arena` below.
+            var ba = std.heap.ArenaAllocator.init(self.a);
+            defer ba.deinit();
+            const a = ba.allocator();
             for (batch.messages) |m| {
                 const seq = m.metadata.sequence.stream;
                 const doc = decodeMsgpack(a, m.msg.data) catch {
@@ -449,10 +564,14 @@ pub const SyncClient = struct {
                     if (ev != .object) continue;
                     const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
                     if (self.states.get(table) == null) continue;
-                    self.applyEvent(table, ev, seq) catch |err| {
-                        if (err == error.FkHeld) {
-                            self.held.append(self.a, .{ .table = try a.dupe(u8, table), .ev = ev }) catch {};
-                        }
+                    self.applyEvent(table, ev, seq) catch |err| switch (err) {
+                        // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
+                        // event that is acked, positioned past, and never applied.
+                        error.FkHeld => {
+                            const ha = self.held_arena.allocator();
+                            try self.held.append(ha, .{ .table = try ha.dupe(u8, table), .ev = try cloneValue(ha, ev) });
+                        },
+                        else => {},
                     };
                 }
                 m.ack() catch {};
@@ -483,7 +602,9 @@ pub const SyncClient = struct {
         defer ta.deinit();
         const taa = ta.allocator();
 
-        if (std.mem.eql(u8, op, "DELETE")) {
+        // A hard DELETE (tables without a tombstone column) and a soft delete (an
+        // update that SETS the tombstone, §7.5) end the same way here: the row goes.
+        if (std.mem.eql(u8, op, "DELETE") or tombstoned(st, data)) {
             if (try core.planDelete(taa, table, st.pk, data)) |stp| {
                 _ = try self.stepExec(taa, stp);
             }
@@ -537,13 +658,20 @@ pub const SyncClient = struct {
     /// The order is the contract. The optimistic apply and the outbox row are written
     /// BEFORE the publish, so a crash between them leaves a queued write that the next
     /// flush repeats — never a write that was sent but not remembered.
-    pub fn mutate(self: *SyncClient, table: []const u8, op: []const u8, key: Value, values: ?Value) ![]const u8 {
-        const a = self.aa();
+    ///
+    /// `result_a` owns the returned msg_id and nothing else: everything this call
+    /// builds — envelope, before-image, JSON, msgpack — is per-call and freed on return.
+    pub fn mutate(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op: []const u8, key: Value, values: ?Value) ![]const u8 {
+        var ca = std.heap.ArenaAllocator.init(self.a);
+        defer ca.deinit();
+        const a = ca.allocator();
         const st = self.states.get(table) orelse return error.UnknownTable;
         try self.ensureOutbox();
 
         const version = try core.hlcVersion(a, try nowWireIso(a), self.last_version, self.seen_floor);
-        self.last_version = version;
+        if (version.len > self.last_version_buf.len) return error.VersionTooLong;
+        @memcpy(self.last_version_buf[0..version.len], version);
+        self.last_version = self.last_version_buf[0..version.len];
 
         var args: std.json.ObjectMap = .empty;
         try args.put(a, "principal", .{ .string = self.opts.principal });
@@ -595,13 +723,19 @@ pub const SyncClient = struct {
             // Kept, not lost: the entry is durable and the next flush retries.
             std.debug.print("mutate: send failed ({any}) — queued as {s}\n", .{ err, msg_id });
         };
-        return msg_id;
+        return try result_a.dupe(u8, msg_id);
     }
 
     /// Republish everything still queued — and refuse what the GC watermark has
     /// outlived (§10at). Returns the number actually sent.
+    ///
+    /// A publish failure is logged and the entry stays queued; the pass continues so
+    /// one bad send does not starve the rest. If NOTHING could be sent the last error
+    /// is returned — "flushed: 0" next to a broker that is down should say why.
     pub fn flushOutbox(self: *SyncClient) !usize {
-        const a = self.aa();
+        var ca = std.heap.ArenaAllocator.init(self.a);
+        defer ca.deinit();
+        const a = ca.allocator();
         try self.ensureOutbox();
         const rows = try self.st.query(a,
             "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox ORDER BY created_at", &.{});
@@ -626,6 +760,8 @@ pub const SyncClient = struct {
         for (gate.object.get("refuse").?.array.items) |v| try refused.put(a, v.string, {});
 
         var sent: usize = 0;
+        var failed: usize = 0;
+        var last_err: ?anyerror = null;
         for (rows) |r| {
             const msg_id = if (r[0] == .text) r[0].text else continue;
             if (refused.contains(msg_id)) {
@@ -644,9 +780,15 @@ pub const SyncClient = struct {
                 continue;
             }
             const env = if (r[2] == .text) try parseStoredJson(a, r[2].text) else Value.null;
-            self.publishEnvelope(a, r[1].text, env, msg_id) catch continue;
+            self.publishEnvelope(a, r[1].text, env, msg_id) catch |err| {
+                failed += 1;
+                last_err = err;
+                std.debug.print("outbox: {s} not sent ({any}) — still queued\n", .{ msg_id, err });
+                continue;
+            };
             sent += 1;
         }
+        if (sent == 0 and failed > 0) return last_err.?;
         return sent;
     }
 
@@ -673,7 +815,6 @@ pub const SyncClient = struct {
     /// already in PostgreSQL. Once messages start arriving the loop drains them all
     /// and stops at the first gap.
     pub fn drainVerdicts(self: *SyncClient, wait_ms: u64) !usize {
-        const a = self.aa();
         try self.subscribeVerdicts();
         const sub = self.verdicts.?;
         var settled: usize = 0;
@@ -682,9 +823,24 @@ pub const SyncClient = struct {
             if (settled == 0 and @as(u64, @intCast(nowMillis() - started)) > wait_ms) break;
             // The bridge's own idiom (nats_publisher.zig): a bounded wait, so a
             // drain with nothing pending returns instead of blocking forever.
+            // Only a timeout ends the drain quietly; a closed connection is an error.
             const msg = sub.nextMsgTimeout(
                 .{ .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake } },
-            ) catch break;
+            ) catch |err| switch (err) {
+                error.Timeout => break,
+                else => return err,
+            };
+            // ⚠️ The message is OURS: `nextMsgTimeout` hands over a `*Message` and
+            // nats.zig frees nothing on our behalf. Without this, every verdict leaked
+            // its arena (or its pool slot) — invisible to `std.testing.allocator`
+            // because no unit test drains a verdict, and to the soak because nothing
+            // measured RSS across it.
+            defer msg.deinit();
+            // Per-verdict arena: the parsed JSON and the outbox row are dead once the
+            // entry is popped.
+            var va = std.heap.ArenaAllocator.init(self.a);
+            defer va.deinit();
+            const a = va.allocator();
             // ⚠️ The msg id is in the SUBJECT, not the body — `mutation_ack.<principal>.<msg_id>`
             // — for the same reason a mutation carries no `table` field: NATS authorizes
             // subjects and not payloads, so identity belongs where the broker can see it.
@@ -764,7 +920,9 @@ pub const SyncClient = struct {
         const taa = ta.allocator();
         const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
         const data = ev.object.get("data") orelse return;
-        if (std.mem.eql(u8, op, "DELETE")) {
+        // The same §7.5 rule as the CDC path: our own edit that sets the tombstone
+        // removes the row locally, exactly as the server's echo of it would.
+        if (std.mem.eql(u8, op, "DELETE") or tombstoned(st, data)) {
             if (try core.planDelete(taa, table, st.pk, data)) |stp| _ = try self.stepExec(taa, stp);
             return;
         }
@@ -825,6 +983,21 @@ fn transportConsumerConfig() @import("nats").ConsumerConfig {
 fn contains(list: []const []const u8, s: []const u8) bool {
     for (list) |x| if (std.mem.eql(u8, x, s)) return true;
     return false;
+}
+
+fn indexOf(list: []const []const u8, s: []const u8) ?usize {
+    for (list, 0..) |x, i| if (std.mem.eql(u8, x, s)) return i;
+    return null;
+}
+
+/// PROTOCOL §7.5: the row is soft-deleted when its tombstone column is present and
+/// not null. A table without a tombstone column is never tombstoned (its deletes are
+/// physical and arrive as DELETE events).
+fn tombstoned(st: TableState, data: Value) bool {
+    const tc = st.tombstone_col orelse return false;
+    if (data != .object) return false;
+    const v = data.object.get(tc) orelse return false;
+    return v != .null;
 }
 
 fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
@@ -899,16 +1072,43 @@ fn jsonToMsgpack(a: std.mem.Allocator, v: Value) error{ OutOfMemory, NotMap, Not
     };
 }
 
+/// ⚠️ A growing writer, not a fixed 1 MiB buffer. The fixed buffer was allocated per
+/// publish from whatever arena the caller passed — and the caller passed the
+/// client-lifetime arena, so every write pinned a megabyte until `deinit`. Virtual
+/// and untouched, so RSS never showed it; only VSZ would have.
 fn encodeMsgpack(a: std.mem.Allocator, v: Value) ![]const u8 {
     const payload = try jsonToMsgpack(a, v);
-    // Sized for a mutation envelope, not a seed: an oversized row is refused by the
-    // bridge's width guard long before it reaches this buffer.
-    const buf = try a.alloc(u8, 1 << 20);
     var reader = std.Io.Reader.fixed(&[_]u8{});
-    var writer = std.Io.Writer.fixed(buf);
-    var packer = msgpack.PackerIO.init(&reader, &writer);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var packer = msgpack.PackerIO.init(&reader, &out.writer);
     try packer.write(payload);
-    return buf[0..writer.end];
+    return try out.toOwnedSlice();
+}
+
+/// Deep copy of a Value into `a` — for the one case where a Value must outlive the
+/// arena it was decoded into (an FK-held event, see `held_arena`).
+/// ⚠️ The error set is explicit because the function is recursive (as `jsonToMsgpack`).
+fn cloneValue(a: std.mem.Allocator, v: Value) error{OutOfMemory}!Value {
+    return switch (v) {
+        .null, .bool, .integer, .float => v,
+        .number_string => |s| .{ .number_string = try a.dupe(u8, s) },
+        .string => |s| .{ .string = try a.dupe(u8, s) },
+        .array => |arr| blk: {
+            var out = try std.json.Array.initCapacity(a, arr.items.len);
+            for (arr.items) |item| out.appendAssumeCapacity(try cloneValue(a, item));
+            break :blk .{ .array = out };
+        },
+        .object => |obj| blk: {
+            var out: std.json.ObjectMap = .empty;
+            try out.ensureTotalCapacity(a, obj.count());
+            var it = obj.iterator();
+            while (it.next()) |e| {
+                out.putAssumeCapacity(try a.dupe(u8, e.key_ptr.*), try cloneValue(a, e.value_ptr.*));
+            }
+            break :blk .{ .object = out };
+        },
+    };
 }
 
 /// A stored cell → the JSON the core speaks (for the before-image).
@@ -953,12 +1153,43 @@ fn nowWireIso(a: std.mem.Allocator) ![]const u8 {
     });
 }
 
+/// ⚠️ A decoder with the container caps LIFTED. zig_msgpack's `PackerIO` refuses any
+/// array or map over 1,000,000 entries (`ParseLimits`) — a defence against hostile
+/// input. A chain full is one `rows` array holding the whole table, and `users` is
+/// two million rows: the stock decoder answered `ArrayTooLarge` and seeding died on
+/// the first object (measured 2026-08-29 — the soak never seeds, so nothing noticed).
+/// Everything decoded here arrives on subjects the broker authorised, from the
+/// bridge; the byte limits and the depth cap stay at their defaults.
+const WideReaderCtx = struct {
+    reader: *std.Io.Reader,
+    fn read(self: WideReaderCtx, buf: []u8) std.Io.Reader.Error!usize {
+        try self.reader.readSliceAll(buf);
+        return buf.len;
+    }
+};
+const WideWriterCtx = struct {
+    writer: *std.Io.Writer,
+    fn write(self: WideWriterCtx, bytes: []const u8) std.Io.Writer.Error!usize {
+        try self.writer.writeAll(bytes);
+        return bytes.len;
+    }
+};
+const WidePack = msgpack.PackWithLimits(
+    WideWriterCtx,
+    WideReaderCtx,
+    std.Io.Writer.Error,
+    std.Io.Reader.Error,
+    WideWriterCtx.write,
+    WideReaderCtx.read,
+    .{ .max_array_length = 1 << 31, .max_map_size = 1 << 31 },
+);
+
 /// msgpack bytes → std.json.Value (the shape core.zig speaks).
 fn decodeMsgpack(a: std.mem.Allocator, bytes: []const u8) !Value {
     var reader = std.Io.Reader.fixed(bytes);
     var dummy: [0]u8 = .{};
     var writer = std.Io.Writer.fixed(&dummy);
-    var packer = msgpack.PackerIO.init(&reader, &writer);
+    var packer = WidePack.init(.{ .writer = &writer }, .{ .reader = &reader });
     const payload = try packer.read(a);
     return mpToJson(a, payload);
 }
@@ -1025,6 +1256,39 @@ fn chainCellToStorage(a: std.mem.Allocator, v: Value) !storage.Value {
 // errdefer chain was made exact, the first of these leaked the struct and the second
 // leaked an open SQLite handle — neither showed up as a test failure anywhere, because
 // nothing was calling init on a path that fails.
+
+test "cloneValue: a held event survives the arena it was decoded into" {
+    var keep = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer keep.deinit();
+    var copy: Value = undefined;
+    {
+        var batch = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer batch.deinit();
+        const src = try std.json.parseFromSlice(Value, batch.allocator(),
+            \\{"table":"salaries","data":{"id":7,"tags":["a","b"],"amt":1.5,"gone":null}}
+        , .{});
+        copy = try cloneValue(keep.allocator(), src.value);
+    } // the batch arena is gone; every byte the copy points at must be in `keep`
+    try std.testing.expectEqualStrings("salaries", copy.object.get("table").?.string);
+    const data = copy.object.get("data").?.object;
+    try std.testing.expectEqual(@as(i64, 7), data.get("id").?.integer);
+    try std.testing.expectEqualStrings("b", data.get("tags").?.array.items[1].string);
+    try std.testing.expect(data.get("gone").? == .null);
+}
+
+test "msgpack encode/decode roundtrip allocates only what it writes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = try std.json.parseFromSlice(Value, a, \\{"key":{"uid":"u1"},"version":"2026-01-01T00:00:00.000000Z","n":[1,2,3]}
+    , .{});
+    const bytes = try encodeMsgpack(a, src.value);
+    // The old fixed buffer was 1 MiB per call; the envelope is well under 100 bytes.
+    try std.testing.expect(bytes.len < 128);
+    const back = try decodeMsgpack(a, bytes);
+    try std.testing.expectEqualStrings("u1", back.object.get("key").?.object.get("uid").?.string);
+    try std.testing.expectEqual(@as(i64, 3), back.object.get("n").?.array.items[2].integer);
+}
 
 test "init that cannot open the database leaks nothing" {
     const bad = "/nonexistent-directory-for-zb-tests/replica.sqlite3";

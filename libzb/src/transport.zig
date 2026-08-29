@@ -21,12 +21,23 @@ pub const Transport = struct {
     threaded: std.Io.Threaded,
     conn: *nats.Connection,
     js: nats.JetStream,
+    /// The object store handle for the bucket last read (a chain is one bucket, many
+    /// objects). `ObjectStore.init` is four small string dupes, so this is a tidiness
+    /// cache, not a hot-path one; what matters is that it is released in `deinit`.
+    os: ?nats.ObjectStore = null,
+    os_bucket: []u8 = &.{},
 
     pub fn connect(allocator: std.mem.Allocator, opts: ConnectOptions) !*Transport {
         const self = try allocator.create(Transport);
         errdefer allocator.destroy(self);
-        self.allocator = allocator;
-        self.threaded = .init(allocator, .{});
+        // ⚠️ A struct literal, so the defaulted fields (`os`, `os_bucket`) are set.
+        // Field-by-field assignment leaves every unassigned field undefined.
+        self.* = .{
+            .allocator = allocator,
+            .threaded = .init(allocator, .{}),
+            .conn = undefined,
+            .js = undefined,
+        };
         errdefer self.threaded.deinit();
         const io = self.threaded.io();
 
@@ -45,10 +56,28 @@ pub const Transport = struct {
     }
 
     pub fn deinit(self: *Transport) void {
+        self.dropObjectStore();
         self.conn.deinit();
         self.allocator.destroy(self.conn);
         self.threaded.deinit();
         self.allocator.destroy(self);
+    }
+
+    fn dropObjectStore(self: *Transport) void {
+        if (self.os) |*o| o.deinit();
+        self.os = null;
+        self.allocator.free(self.os_bucket);
+        self.os_bucket = &.{};
+    }
+
+    fn objectStore(self: *Transport, bucket: []const u8) !*nats.ObjectStore {
+        if (self.os != null and std.mem.eql(u8, self.os_bucket, bucket)) return &self.os.?;
+        self.dropObjectStore();
+        const name = try self.allocator.dupe(u8, bucket);
+        errdefer self.allocator.free(name);
+        self.os = try nats.ObjectStore.init(self.allocator, self.js, bucket, 128 * 1024);
+        self.os_bucket = name;
+        return &self.os.?;
     }
 
     /// KV get: the current value for `bucket`/`key`, copied into `a`-owned
@@ -70,8 +99,7 @@ pub const Transport = struct {
     /// Object store get: the whole object, `a`-owned. The store chunks at
     /// 128 KiB — no NATS max_payload limit applies to a seed (§10n).
     pub fn objectGetBytes(self: *Transport, a: std.mem.Allocator, bucket: []const u8, name: []const u8) ![]u8 {
-        var os = try nats.ObjectStore.init(self.allocator, self.js, bucket, 128 * 1024);
-        defer os.deinit();
+        const os = try self.objectStore(bucket);
         var res = try os.getBytes(name);
         defer res.deinit();
         return try a.dupe(u8, res.value);
@@ -123,3 +151,4 @@ test "live: creds connect, schema KV, chain manifest, chain object" {
     const is_zstd = blob.len >= 4 and b0 == 0x28 and blob[1] == 0xb5 and blob[2] == 0x2f and blob[3] == 0xfd;
     try std.testing.expect(is_map or is_zstd);
 }
+

@@ -100,7 +100,7 @@ pub fn main() !void {
         try vals.put(a, "inserted_at", .{ .string = now });
         try vals.put(a, "updated_at", .{ .string = now });
 
-        const msg_id = try c.mutate("test_types", "INSERT", .{ .object = key }, .{ .object = vals });
+        const msg_id = try c.mutate(a, "test_types", "INSERT", .{ .object = key }, .{ .object = vals });
         std.debug.print("   mutate queued: {s}\n", .{msg_id});
     }
 

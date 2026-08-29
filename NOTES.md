@@ -6545,6 +6545,130 @@ instance sets the ceiling for every writer, and a bridge whose buffer is smaller
 than an existing row quarantines the table on its own feed while the other keeps
 carrying it. A per-feed outage that otherwise reads as a mystery. Verified live.
 
+## 10bb. The producer cannot see a delete — and the client review that found it (2026-08-29)
+
+**Queued, not fixed.** The stack is being pruned of speed.py's residue first
+(2M `users` rows, stale chains, ~1 GB of `cdc.users.insert.batch`), so that what
+follows is checked against a known state and not one of unknown origin. Then this.
+
+**The defect.** `generation_producer.zig:387`, skip-if-unchanged:
+
+    SELECT EXISTS(SELECT 1 FROM "<table>" WHERE "<version_col>" > $cutoff - tolerance)
+
+A hard DELETE — or a TRUNCATE — leaves no row newer than the cutoff, so an emptied
+table is indistinguishable from an untouched one and the producer skips it on every
+tick. Its last full stays in the object store and the manifest in `$KV.generations`,
+and both keep describing rows PostgreSQL no longer has. Any fresh client seeding from
+that chain **resurrects the deleted rows**; a table whose FK parent has meanwhile
+changed refuses the whole chain instead. Deletes are meant to be covered by
+tombstones, but a table with `tombstone_column: null` (salaries, users, orders) has
+none, and nothing else in the producer's predicate sees the delete.
+
+Measured, live: `salaries` was emptied on 08-27 and `users` reloaded on 08-28
+(ids 8,101,926–10,101,925). `salaries-g11-full` still carries 15 rows with `user_id`
+2,101,505–4,101,519; PostgreSQL has 0 salaries rows, 0 orphans, a validated FK — the
+tables were consistent, the CHAIN was not. Seeding parents-first with `foreign_keys
+ON` then failed on row 1:
+
+    salaries: row 1 of 15 refused: error.StepFailed — sqlite: FOREIGN KEY constraint failed
+    salaries: chain step salaries-g11-full (full, 15 rows) rolled back
+
+Candidate fixes, to be weighed once the baseline is clean: (a) compare `count(*)`
+against the count recorded at the last cutoff — cheap, and catches every emptying;
+(b) read the table's delete count from `pg_stat_user_tables.n_tup_del` per tick;
+(c) require a tombstone column for any table with `GENERATIONS_ENABLED`, which
+makes the predicate honest by construction but is a catalogue rule, not a producer
+one. §11's DROP TABLE row already says "purge the four ghost sources or fresh
+clients resurrect rows" — this is the same ghost, reached without a DROP.
+
+**How it surfaced — the libzb review.** The client was reviewed for errdefer and
+allocation discipline; the `init`/`deinit`/`openBox` chains and the handle table
+were correct. What was wrong sat one level up: `mutate`, `flushOutbox`,
+`drainVerdicts` and `drainStream` all allocated from the CLIENT-LIFETIME arena —
+including a fixed 1 MiB msgpack buffer per publish — so the soak grew ~3 MiB/s of
+arena that neither `leaks` nor RSS could show (virtual, untouched). Also found:
+`nextMsgTimeout`'s `*Message` never freed (one leak per verdict), `held` allocated
+from the base allocator and never released, a hand-rolled BEGIN/errdefer
+ROLLBACK/COMMIT in `applyChain` bypassing `Storage.transaction` and its mutex, and
+`fetch`/`nextMsgTimeout` breaking on EVERY error and then persisting the position.
+All fixed; per-call arenas throughout, a `held_arena` reset per CDC pass with
+`cloneValue` for the one value that crosses lifetimes, `mutate` now takes a result
+allocator for the msg_id.
+
+Then the seed ran and died on the first object: zig_msgpack's `ParseLimits`
+refuses any array over 1,000,000 elements, and `users-g6-full` carried exactly
+2,000,000 rows. Not a data fault — the zstd frame decompressed byte-for-byte to
+what the CLI produced, 206,982,060 bytes of valid msgpack — but a decoder default
+that had silently become a "tables ≤ 1M rows" rule. `decodeMsgpack` now uses
+`PackWithLimits` with the container caps lifted (byte and depth caps unchanged).
+Seeding 2M rows then took ~20 s at a 2.3 GB peak: raw + decompressed + decoded, three
+copies of a 207 MB seed. Worth revisiting only if tables that size are a supported
+case; with the benchmark pruned it is not the next thing.
+
+**Clean baseline, after the prune (same day).** `users` truncated, both chains
+rebuilt as g1 by the producer within a tick, CDC_PUBLIC down from ~1 GB to 152 KiB.
+`zb-demo` on the full seed path: rc=0, users 0 / salaries 0 / test_types 143 rows
+seeded, both streams drained, **4.4 s, 47 MB RSS** — against 2.3 GB and a refused
+chain an hour earlier. This is the state later findings are measured from.
+
+**And the same defect, on real data, immediately.** Cross-checked against
+PostgreSQL: `test_types`/kilo has 8 rows there, the replica has 142. The 8 ALIVE
+rows match exactly; the 134 extra are TOMBSTONES (`deleted_at` 08-28 21:39–21:51,
+the §10az soak) that the sweeper has since reaped — PostgreSQL holds 0 tombstones,
+the GC watermark is 10:31 today — while the chain's g66 full (cutoff 08-28 23:42)
+still carries them. That is CORRECT by PROTOCOL §7.5: a soft delete reaches a
+client as an `update` setting the tombstone, "the client already removed the row when
+the soft delete arrived", and the physical reap is deliberately never forwarded — so a
+chain may carry tombstoned rows and a conforming client drops them on apply. libzb
+does not conform: `TableState` ignores the schema's `tombstone_column`, so it keeps
+every tombstoned row a browser client would have removed, on seed and on CDC alike.
+Live data is correct; the dead rows are a libzb gap, not a producer one.
+
+**The tombstone rule, implemented in libzb (same day).** `TableState` now carries
+`tombstone_col` from the schema, and one predicate — `tombstoned(st, data)`: the
+column present and not null — routes a row to `planDelete` instead of the upsert in
+all three places rows arrive: the chain seed (`ChainStep.apply`, by column index),
+the CDC event (`applyEvent`) and the local optimistic apply (`applyOptimistic`, so
+our own soft delete removes the row exactly as the server's echo would). Re-run on
+the clean stack: replica test_types 8 rows / 0 tombstoned = PostgreSQL kilo 8 / 0.
+⚠️ The TS client stores `tombstoneColumn` in `syncedTables` and never reads it
+(grep: set at libzb.ts:824/862, no consumer) — so as of today NO client implemented
+§7.5's removal, and every browser replica holds tombstones until a full re-seed.
+Queued for zb-client-ts.
+
+**ReleaseFast under `leaks` (same day), the review's own verification.** The
+arena-lifetime finding was invisible to `leaks` by construction, so the check is the
+soak's PROCESS numbers over time, not a leak count alone. `zb-soak` ReleaseFast,
+1 s cycles, 45 s: 35 cycles, 105 mutations, 105 verdicts settled. `leaks --nocontext`
+attached at 15 s and 40 s: **0 leaks both times**, malloc nodes 492 -> 494 and
+1,858 KB -> 1,938 KB, RSS 4.9 -> 5.0 MB. Flat — where the old client grew ~3 MiB of
+arena per second of soak. `leaks --atExit` on `zb-demo` (full seed + drain): 0 leaks.
+Both binaries' Zig tests: 14 pass, 1 gated skip.
+
+Which sharpens the producer defect above to exactly its heading: a table WITH a
+tombstone column is covered (soft deletes bump `updated_at`, reaps need not be
+seen); a table WITHOUT one (`users`, `salaries`, `orders`) has hard deletes as its
+only deletes, and those the predicate cannot see. Two items, then: the producer
+must see hard deletes on tombstone-less tables, and libzb must apply the tombstone
+rule (`tombstone_column` from the schema → remove the row when it is set).
+
+**Closed the same day — one consumer per drain, server-side.** The review's fix for
+the durable pull consumer every `drainStream` left behind was to delete it, and that
+is DENIED: the client JWT carries no `$JS.API.CONSUMER.DELETE` grant (by design), and
+the refused request cost a 5 s timeout per stream. It could not be made ephemeral
+from here either: nats.zig's `pullSubscribe` requires a name, `getOrCreateConsumer`
+sets it as `durable_name` unconditionally, and `ConsumerConfig` had no
+`inactive_threshold`. So: a third local nats.zig patch
+(`nats.zig-consumer-inactive-threshold.patch`, one optional field, upstream behaviour
+unchanged by default), and libzb sets 30 s on its drain consumers. nats-server >= 2.9
+honours the threshold on durable consumers too — verified on 2.14.5: 16 leaked
+`zbz*` consumers cleared, one demo run created two, both gone from `consumer ls`
+30 s later. The JWT stays exactly as it was; the server does the deleting.
+
+⚠️ Both faults sat unseen for the same reason: the soak never seeds (`syncSchemas`
+only) and the demo was run with `ZB_SKIP_SEED`. A path nobody runs is a path
+nobody has verified — §10av's lesson about the test graph, again, for the data.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

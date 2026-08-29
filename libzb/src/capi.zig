@@ -1,6 +1,7 @@
 //! The C ABI: one JSON dispatch entrypoint.
 //!
 //!   char*    zb_call(const char* fn, const char* args_json);  // caller frees via zb_free
+//!                                                            // NULL: a NULL argument, or malloc failed
 //!   void     zb_free(char* p);
 //!   int      zb_abi_version(void);
 //!
@@ -206,8 +207,15 @@ export fn zb_call(fn_name: ?[*:0]const u8, args_json: ?[*:0]const u8) ?[*:0]u8 {
 
     const parsed = std.json.parseFromSlice(Value, a, args_text, .{}) catch
         return dupeZ("{\"error\":\"bad args json\"}");
-    const result = dispatch(a, name, parsed.value) catch
-        return dupeZ("{\"error\":\"dispatch failed\"}");
+    // The error NAME goes back to the host: a runner debugging a fixture gets
+    // `NotMap` or `OutOfMemory`, not "dispatch failed". Error names are identifiers,
+    // so they need no JSON escaping.
+    const result = dispatch(a, name, parsed.value) catch |err| {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "{{\"error\":\"dispatch failed: {s}\"}}", .{@errorName(err)}) catch
+            return dupeZ("{\"error\":\"dispatch failed\"}");
+        return dupeZ(msg);
+    };
     return dupeZ(result);
 }
 

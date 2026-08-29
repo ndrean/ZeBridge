@@ -62,6 +62,8 @@ pub const Storage = struct {
             return Error.OpenFailed;
         }
         var self = Storage{ .db = db.? };
+        // The handle is acquired; a failing pragma below must not leak it.
+        errdefer _ = c.sqlite3_close(self.db);
         self.execSimple("PRAGMA journal_mode = WAL;") catch {};
         try self.execSimple("PRAGMA foreign_keys = ON;");
         return self;
@@ -75,11 +77,16 @@ pub const Storage = struct {
         return std.mem.span(c.sqlite3_errmsg(self.db));
     }
 
-    /// Statement without parameters or results.
+    /// Statement without parameters, whose results (if any) are discarded.
+    ///
+    /// A stack buffer, not an arena over `page_allocator`: that was an mmap/munmap
+    /// pair per `BEGIN`, `COMMIT` and `PRAGMA`. Most such statements return no rows;
+    /// `PRAGMA journal_mode` returns one short text cell, which this covers. A
+    /// statement that returns more than fits is a misuse of execSimple — use `query`.
     pub fn execSimple(self: *Storage, sql: []const u8) Error!void {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        _ = self.query(arena.allocator(), sql, &.{}) catch |e| return e;
+        var buf: [256]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&buf);
+        _ = try self.query(fba.allocator(), sql, &.{});
     }
 
     /// Prepare, bind, step. Rows (and their text/blob contents) are allocated
@@ -90,7 +97,10 @@ pub const Storage = struct {
             return Error.PrepareFailed;
         }
         defer _ = c.sqlite3_finalize(stmt);
-        const s = stmt orelse return if (params.len == 0) &.{} else Error.PrepareFailed;
+        // SQLITE_OK with a null statement means the SQL was empty or only a comment.
+        // That is never what a caller meant, so it fails the same way for every
+        // caller — it used to succeed silently when there were no params.
+        const s = stmt orelse return Error.PrepareFailed;
 
         for (params, 1..) |p, i| {
             const idx: c_int = @intCast(i);
