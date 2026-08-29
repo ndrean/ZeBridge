@@ -55,7 +55,12 @@ pub const SyncClient = struct {
     arena: std.heap.ArenaAllocator, // client-lifetime allocations (states, grammar)
     t: *transport.Transport,
     st: storage.Storage,
+    /// The app's connection: the same file, opened read-only (NOTES §10). `query` runs
+    /// here and nowhere else, so the replica cannot be written around `mutate`.
+    ro: storage.Storage,
     opts: Options,
+    /// `syncOnce` runs the one-time steps once; the per-pass steps every call.
+    schemas_synced: bool = false,
 
     // ── grammar.json, and ONLY grammar.json (PROTOCOL §1) ─────────────────────
     // No defaults: every name below is REQUIRED by `loadGrammar`, which fails naming
@@ -123,6 +128,7 @@ pub const SyncClient = struct {
             .held_arena = std.heap.ArenaAllocator.init(a),
             .t = undefined,
             .st = undefined,
+            .ro = undefined,
             .opts = opts,
         };
         errdefer self.arena.deinit();
@@ -130,6 +136,9 @@ pub const SyncClient = struct {
 
         self.st = try storage.Storage.open(opts.db_path);
         errdefer self.st.close();
+        // After the read-write open: that is what creates the file.
+        self.ro = try storage.Storage.openReadOnly(opts.db_path);
+        errdefer self.ro.close();
 
         self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = opts.creds_path });
         errdefer self.t.deinit();
@@ -155,6 +164,7 @@ pub const SyncClient = struct {
     /// forgotten the same way — it is the one list, and both this and the test read it.
     pub fn deinit(self: *SyncClient) void {
         self.releaseHandles();
+        self.ro.close();
         self.st.close();
         self.held_arena.deinit(); // `held`'s backing array lives here too
         self.arena.deinit();
@@ -1032,6 +1042,61 @@ pub const SyncClient = struct {
         return self.st.query(a, stp.object.get("sql").?.string, params);
     }
 
+    // ── the index card (NOTES §10): query / mutate / sync / flush ────────────────
+
+    /// The app's read: arbitrary SQL against the read-only connection, JSON params in,
+    /// `{"columns":[…],"rows":[[…],…]}` out — allocated from `a`. A write through here
+    /// fails in SQLite ("attempt to write a readonly database"), which is the point.
+    pub fn query(self: *SyncClient, a: std.mem.Allocator, sql: []const u8, params_json: Value) !Value {
+        const n: usize = if (params_json == .array) params_json.array.items.len else 0;
+        const params = try a.alloc(storage.Value, n);
+        if (params_json == .array) for (params_json.array.items, 0..) |v, i| {
+            params[i] = try jsonToStorage(a, v);
+        };
+        const res = try self.ro.queryNamed(a, sql, params);
+        var cols = std.json.Array.init(a);
+        for (res.columns) |cn| try cols.append(.{ .string = cn });
+        var rows = std.json.Array.init(a);
+        for (res.rows) |r| {
+            var row = std.json.Array.init(a);
+            for (r) |cell| try row.append(storageToJson(cell));
+            try rows.append(.{ .array = row });
+        }
+        var out: std.json.ObjectMap = .empty;
+        try out.put(a, "columns", .{ .array = cols });
+        try out.put(a, "rows", .{ .array = rows });
+        return .{ .object = out };
+    }
+
+    pub const SyncReport = struct { tenant: []const u8, first: bool };
+
+    /// One pass of the read side: the one-time steps (tenant, schemas, outbox table,
+    /// the verdict channel) the first time, then seed-if-gapped and drain-to-tail every
+    /// time. Idempotent by construction — a host calls it at boot and on a timer.
+    pub fn syncOnce(self: *SyncClient) !SyncReport {
+        const first = !self.schemas_synced;
+        if (first) {
+            try self.resolveTenant();
+            try self.syncSchemas();
+            try self.ensureOutbox();
+            try self.subscribeVerdicts();
+            self.schemas_synced = true;
+        }
+        try self.gapAndSeed();
+        try self.drainCdc();
+        return .{ .tenant = self.tenant, .first = first };
+    }
+
+    pub const FlushReport = struct { sent: usize, settled: usize };
+
+    /// The write side's pump: collect and replay the outbox (§7.1), then wait up to
+    /// `wait_ms` for the first verdict and drain what follows.
+    pub fn flush(self: *SyncClient, wait_ms: u64) !FlushReport {
+        const sent = try self.flushOutbox();
+        const settled = try self.drainVerdicts(wait_ms);
+        return .{ .sent = sent, .settled = settled };
+    }
+
     pub fn count(self: *SyncClient, table: []const u8) i64 {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
@@ -1054,9 +1119,13 @@ fn grammarString(root: Value, path: []const []const u8) ![]const u8 {
 }
 
 fn grammarMissing(path: []const []const u8) error{GrammarKeyMissing} {
-    std.debug.print("grammar.json: required key missing or not a string: ", .{});
-    for (path, 0..) |k, i| std.debug.print("{s}{s}", .{ if (i > 0) "." else "", k });
-    std.debug.print("\n", .{});
+    // Not under test: the grammar test provokes this on purpose, and the build
+    // runner reports any stderr from a test step as a failed command.
+    if (!@import("builtin").is_test) {
+        std.debug.print("grammar.json: required key missing or not a string: ", .{});
+        for (path, 0..) |k, i| std.debug.print("{s}{s}", .{ if (i > 0) "." else "", k });
+        std.debug.print("\n", .{});
+    }
     return error.GrammarKeyMissing;
 }
 

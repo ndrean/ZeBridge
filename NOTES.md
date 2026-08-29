@@ -7036,7 +7036,7 @@ the session scratchpad; what it changed:
     step, §6's `source .env`, §1.1's opening, §5's heading).
   * Still open, recorded here so they stop hiding: `$KV.tenants` on DELETE (§1.12);
     libzb's C ABI has no query/mutate (§10's index card exists only in the demo/soak
-    binaries); libzb's live tailing and alter/rebuild path (§10v); the `catalog_epoch`
+    binaries — closed in §10bg); libzb's live tailing and alter/rebuild path (§10v); the `catalog_epoch`
     → CDC-routing roadmap (§10k, §11 still says "one restart"); §10ab's column
     slicing; sixteen orphan constants in `config.zig` (§8; three snapshot ones are gone).
 
@@ -7101,6 +7101,62 @@ named `process` and imported `node:fs/promises`, which a browser tsconfig reject
 in dead branches. Detection now goes through `globalThis`, the import through a variable
 specifier; web-consumer's `tsc` is clean again and the Node consumer still resumes its
 persisted directory.
+
+## 10bg. libzb's index card on the C ABI — query, mutate, sync, flush (2026-08-29)
+
+§10 promised hosts an index card: `query` reads, `mutate` writes, nothing else. Until
+today libzb's C ABI had only `zb_client_open/close` — the card existed in the demo and
+soak binaries, in Zig, for Zig. Now a host binding is five declarations:
+
+    char* zb_client_sync(h);                          {"tenant":…,"first":bool}
+    char* zb_client_query(h, sql, params_json);       {"columns":[…],"rows":[[…],…]}
+    char* zb_client_mutate(h, table, op, key, values); {"msgId":…}
+    char* zb_client_flush(h, wait_ms);                {"sent":n,"settled":n}
+    void  zb_free(p);
+
+plus `tables` (parents first) and `clientId` in `zb_client_open`'s JSON, which were
+hardcoded to nothing. One JSON string in, one out, `{"error":"<Name>"}` on failure —
+the same shape as `zb_call`, so `runner.py`'s three ctypes lines become eight.
+
+**The read-only connection.** `query` does not run on the client's connection. `init`
+opens the same file a second time with `SQLITE_OPEN_READONLY` (`Storage.openReadOnly`,
+after the read-write open that creates the file) and `query` runs there. PROTOCOL's
+"the app reads freely, writes only through `mutate`" stops being a convention: a
+`DELETE` through the app's handle is an SQLite error at the call site
+("attempt to write a readonly database"), and `index_card.py` asserts exactly that. WAL
+means the reader never blocks the applier.
+
+**Two verbs the JS client does not need.** The TS shell tails CDC on a subscription;
+the Zig client is pull-driven, so a host must be able to say "catch up" and "push".
+`syncOnce` runs the one-time steps once (tenant, schemas, outbox table, verdict
+channel — guarded by `schemas_synced`, because `syncSchemas` allocates from the
+client-lifetime arena and must not run per call) and the per-pass steps every call
+(seed-if-gapped, drain-to-tail). `flush` is `flushOutbox` then `drainVerdicts(wait_ms)`.
+Both idempotent, so a host calls them at boot and on a timer.
+
+**Shape lessons carried over from §10az/§10ba.** Each export is a thin renderer over an
+error-returning `*Json` function, because an `errdefer` in an `export fn` is dead code;
+each call gets its own arena and frees it before returning the malloc'd string;
+the handle resolves through the generation-tagged table, so a closed or fabricated
+handle answers `{"error":"UnknownHandle"}` — `index_card.py` passes handle 0 to prove
+it. Not thread-safe per handle, and the header says so: the table makes the wrong
+thread's mistake non-fatal, it does not make it correct.
+
+**Proof.** `libzb/python/index_card.py` against the native stack as omar: sync
+(tenant kilo, 18 live `test_types` rows through the read-only handle), the refused
+write, a typed INSERT (text[] with a comma inside an element, int[][], jsonb, numeric,
+float, bool) → flush sent=1 settled=1 → sync → the echo row carries
+`last_writer = py-index-card` and `tags = {"py","index-card","with,comma"}`; DELETE →
+settled → the §7.5 tombstone rule leaves 0 rows; close. 127/127 conformance unchanged.
+
+**A wrinkle found on the way.** `zig build test` reported `failed command` while its
+own summary said `15/16 passed, 1 skipped, test success`: the build runner flags any
+stderr from a test step, and §10bf's grammar test provokes `grammarMissing`, which
+prints. It predates today (checked on a stash). The print is now skipped under
+`builtin.is_test`; the error, and the test, are unchanged.
+
+Still open after this: libzb's live tailing and the alter/rebuild path (§10v);
+`catalog_epoch` → CDC routing (§10k); §10ab's column slicing.
 
 ## 11 Restart Rules
 
@@ -7225,4 +7281,3 @@ compose-era variables and are NOT what the bridge dials — `DATABASE_READER_URL
 reader (§10p); `SYNC_RULES`/`TENANT_RULES` are overridden by `zebridge_catalogue` where a
 row exists (§10k). `RING_BUFFER_COUNT=4096` × `2^BASE_BUF=4096` B = 16 MiB of ring —
 the dev size, not §1.3's 32768.
-

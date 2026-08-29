@@ -69,8 +69,39 @@ pub const Storage = struct {
         return self;
     }
 
+    /// A second connection to the same file, opened READ-ONLY — the app's handle
+    /// (NOTES §10: "libzb keeps its read-write connection private and hands the app a
+    /// second connection opened SQLITE_OPEN_READONLY"). A stray UPDATE through it is
+    /// an SQLite error at the call site, not a violated convention. WAL: readers never
+    /// block the applier. Must be opened AFTER the read-write one created the file.
+    pub fn openReadOnly(path: [*:0]const u8) Error!Storage {
+        var db: ?*c.sqlite3 = null;
+        if (c.sqlite3_open_v2(path, &db, c.SQLITE_OPEN_READONLY, null) != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return Error.OpenFailed;
+        }
+        return Storage{ .db = db.? };
+    }
+
     pub fn close(self: *Storage) void {
         _ = c.sqlite3_close(self.db);
+    }
+
+    /// The rows AND the column names, for a caller that renders results (the C ABI's
+    /// `zb_client_query`). `query` stays positional for the shell's own statements.
+    pub const Named = struct { columns: []const []const u8, rows: []Row };
+
+    pub fn queryNamed(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value) Error!Named {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return Error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        const s = stmt orelse return Error.PrepareFailed;
+        const ncol: usize = @intCast(c.sqlite3_column_count(s));
+        const cols = try a.alloc([]const u8, ncol);
+        for (cols, 0..) |*name, i| name.* = try a.dupe(u8, std.mem.span(c.sqlite3_column_name(s, @intCast(i))));
+        // Re-run through `query` for the rows: one bind/step implementation, not two.
+        const rows = try self.query(a, sql, params);
+        return .{ .columns = cols, .rows = rows };
     }
 
     pub fn errMsg(self: *Storage) []const u8 {

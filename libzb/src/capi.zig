@@ -9,6 +9,19 @@
 //!   int      zb_client_close(uint64_t handle);        // 0 ok, 1 unknown handle
 //!   int      zb_client_live(void);                    // open clients, for tests
 //!
+//! The index card (NOTES §10), one JSON string in and one out, freed via zb_free.
+//! Every call answers `{"error":"<Name>"}` on failure and never a NULL except for a
+//! NULL argument or a failed malloc. A handle is NOT thread-safe: one thread drives
+//! one client; the table only makes the WRONG thread's mistakes non-fatal.
+//!   char* zb_client_sync(uint64_t h);                              // {"tenant":…,"first":bool}
+//!   char* zb_client_query(uint64_t h, const char* sql, const char* params_json);
+//!                                                                  // {"columns":[…],"rows":[[…],…]} — read-only connection
+//!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
+//!                          const char* key_json, const char* values_json);   // {"msgId":…}
+//!   char* zb_client_flush(uint64_t h, uint64_t wait_ms);           // {"sent":n,"settled":n}
+//! `opts_json`: url, credsPath, grammarPath, dbPath, principal, tables (array,
+//! parents first), clientId (stable across restarts — it is the msg_id prefix).
+//!
 //! `fn` names a fixture section of core-fixtures.json; `args_json` is that
 //! case's input fields verbatim; the return value is the expected output as
 //! JSON. One string-shaped convention keeps every host binding (Python ctypes,
@@ -261,6 +274,8 @@ const ClientBox = struct {
     grammar: [:0]u8,
     db: [:0]u8,
     principal: [:0]u8,
+    client_id: [:0]u8,
+    tables: []const []const u8,
 
     fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
         self.c.deinit();
@@ -269,6 +284,9 @@ const ClientBox = struct {
         a.free(self.grammar);
         a.free(self.db);
         a.free(self.principal);
+        a.free(self.client_id);
+        for (self.tables) |t| a.free(t);
+        a.free(self.tables);
         a.destroy(self);
     }
 };
@@ -320,6 +338,21 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     errdefer a.free(db);
     const principal = try a.dupeZ(u8, str.get(o, "principal", ""));
     errdefer a.free(principal);
+    const client_id = try a.dupeZ(u8, str.get(o, "clientId", "zig-client"));
+    errdefer a.free(client_id);
+    // The tables, parents first, each its own allocation so the box can free them.
+    const tv = o.object.get("tables");
+    const ntab: usize = if (tv != null and tv.? == .array) tv.?.array.items.len else 0;
+    const tables = try a.alloc([]const u8, ntab);
+    var filled: usize = 0;
+    errdefer {
+        for (tables[0..filled]) |t| a.free(t);
+        a.free(tables);
+    }
+    if (ntab > 0) for (tv.?.array.items) |v| {
+        tables[filled] = try a.dupe(u8, if (v == .string) v.string else "");
+        filled += 1;
+    };
 
     const box = try a.create(ClientBox);
     errdefer a.destroy(box);
@@ -331,13 +364,16 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .grammar_path = grammar,
             .db_path = db,
             .principal = principal,
-            .tables = &.{},
+            .tables = tables,
+            .client_id = client_id,
         }),
         .url = url,
         .creds = creds,
         .grammar = grammar,
         .db = db,
         .principal = principal,
+        .client_id = client_id,
+        .tables = tables,
     };
     return box;
 }
@@ -354,6 +390,88 @@ export fn zb_client_close(handle: u64) c_int {
 /// client is otherwise invisible from outside.
 export fn zb_client_live() c_int {
     return @intCast(clients.liveCount());
+}
+
+// ── the index card ────────────────────────────────────────────────────────────
+
+fn errJson(name: []const u8) ?[*:0]u8 {
+    var buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{{\"error\":\"{s}\"}}", .{name}) catch return dupeZ("{\"error\":\"error\"}");
+    return dupeZ(msg);
+}
+
+fn lookup(handle: u64) ?*ClientBox {
+    return clients.get(handle);
+}
+
+/// Everything fallible in one error-returning function per verb (the openBox lesson:
+/// an `errdefer` in an `export fn` is dead code), rendered to JSON by the export.
+fn syncJson(a: std.mem.Allocator, b: *ClientBox) ![]const u8 {
+    const r = try b.c.syncOnce();
+    var out: std.json.ObjectMap = .empty;
+    try out.put(a, "tenant", .{ .string = r.tenant });
+    try out.put(a, "first", .{ .bool = r.first });
+    return try core.valueToString(a, .{ .object = out });
+}
+
+export fn zb_client_sync(handle: u64) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = syncJson(arena.allocator(), b) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
+}
+
+fn queryJson(a: std.mem.Allocator, b: *ClientBox, sql: []const u8, params_text: []const u8) ![]const u8 {
+    const params = if (params_text.len == 0) Value{ .array = std.json.Array.init(a) } else (try std.json.parseFromSlice(Value, a, params_text, .{})).value;
+    return try core.valueToString(a, try b.c.query(a, sql, params));
+}
+
+export fn zb_client_query(handle: u64, sql: ?[*:0]const u8, params_json: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const q = std.mem.span(sql orelse return null);
+    const p = if (params_json) |pj| std.mem.span(pj) else "";
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = queryJson(arena.allocator(), b, q, p) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
+}
+
+fn mutateJson(a: std.mem.Allocator, b: *ClientBox, table: []const u8, op: []const u8, key_text: []const u8, values_text: []const u8) ![]const u8 {
+    const key = (try std.json.parseFromSlice(Value, a, key_text, .{})).value;
+    const values: ?Value = if (values_text.len == 0) null else (try std.json.parseFromSlice(Value, a, values_text, .{})).value;
+    const msg_id = try b.c.mutate(a, table, op, key, values);
+    var out: std.json.ObjectMap = .empty;
+    try out.put(a, "msgId", .{ .string = msg_id });
+    return try core.valueToString(a, .{ .object = out });
+}
+
+export fn zb_client_mutate(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u8, key_json: ?[*:0]const u8, values_json: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const t = std.mem.span(table orelse return null);
+    const o = std.mem.span(op orelse return null);
+    const k = std.mem.span(key_json orelse return null);
+    const v = if (values_json) |vj| std.mem.span(vj) else "";
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = mutateJson(arena.allocator(), b, t, o, k, v) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
+}
+
+fn flushJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
+    const r = try b.c.flush(wait_ms);
+    var out: std.json.ObjectMap = .empty;
+    try out.put(a, "sent", .{ .integer = @intCast(r.sent) });
+    try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
+    return try core.valueToString(a, .{ .object = out });
+}
+
+export fn zb_client_flush(handle: u64, wait_ms: u64) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = flushJson(arena.allocator(), b, wait_ms) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
 }
 
 test "smoke: seed gate through the dispatch layer" {
