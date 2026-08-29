@@ -248,15 +248,139 @@ pub const SyncClient = struct {
 
     // ─── step 1: schemas → local DDL, existence from the DATABASE (finding 9) ─
 
+    /// The outcome of one table's migration — what `syncSchemas` logs and what the
+    /// unit test asserts.
+    pub const Migration = enum { created, unchanged, altered, rebuilt };
+
+    /// Bring one replica table in line with its published descriptor, deciding from
+    /// the DATABASE (finding 9: `PRAGMA table_info`, `sqlite_master`), never from
+    /// memory. The port of the TS shell's `applySchema` decision path, with the
+    /// planner already in `core` (fixture-pinned): first sight → create; column
+    /// diff (rename-aware) → ALTER; an FK change, or an ALTER SQLite refuses →
+    /// rebuild copying the common columns; the `_view` dropped before and recreated
+    /// after; indexes synced on EVERY path, because an index added upstream changes
+    /// no column and lands on the "unchanged" path (the TS shell's ⚠️).
+    ///
+    /// Touches only `st`, so it is testable against a scratch SQLite with no NATS.
+    /// (§10bi — the "increment 2" this file promised in §10v.)
+    pub fn migrateTable(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, val: Value) !Migration {
+        const pk = try jsonStrList(a, val.object.get("pk_columns"));
+        const cols_v = val.object.get("sqlite").?.object.get("columns").?;
+        var names: std.ArrayList([]const u8) = .empty;
+        for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
+        const empty_arr = Value{ .array = std.json.Array.init(a) };
+        const fks = val.object.get("foreign_keys") orelse empty_arr;
+        const idx = val.object.get("indexes") orelse empty_arr;
+        const renamed = val.object.get("renamed") orelse Value{ .object = .empty };
+
+        // FINDING 9: existence — and the existing columns — are the DATABASE's to answer.
+        const info = try st.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = table }});
+        var existing: ?[]const []const u8 = null;
+        if (info.len > 0) {
+            const ex = try a.alloc([]const u8, info.len);
+            for (info, 0..) |row, k| ex[k] = row[0].text;
+            existing = ex;
+        }
+
+        var outcome: Migration = .unchanged;
+        if (existing == null) {
+            const steps = try core.createTableSteps(a, table, cols_v.array, pk, fks.array);
+            for (steps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+            outcome = .created;
+        } else {
+            const diff = try core.diffColumns(a, existing, names.items, renamed);
+            const renames = diff.object.get("renames").?.array.items;
+            const added = diff.object.get("added").?.array.items;
+            const removed = diff.object.get("removed").?.array.items;
+            const fk_clauses = try core.fkClausesFor(a, fks.array);
+            const ddl_rows = try st.query(a, "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?", &.{.{ .text = table }});
+            const ddl: []const u8 = if (ddl_rows.len > 0 and ddl_rows[0][0] == .text) ddl_rows[0][0].text else "";
+            const fk_differs = try core.fkTextDiffers(a, ddl, fk_clauses);
+            const shape_changed = renames.len > 0 or added.len > 0 or removed.len > 0;
+
+            if (shape_changed or fk_differs) {
+                // The view goes FIRST (§1.17): DROP COLUMN re-validates every schema
+                // object referencing the table, and a stale view kills the ALTER.
+                try execSql(st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS {s}_view;", .{table}));
+                // And so do the indexes no longer published — SQLite refuses DROP
+                // COLUMN on an indexed column, which sent a plain remove down the
+                // rebuild path in the unit test before this line existed. Drops here,
+                // creates after the shape settled (the plan below).
+                const pre = try indexPlan(st, a, table, idx.array);
+                for (pre.object.get("drops").?.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+                for (renames) |pair| {
+                    try execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} RENAME COLUMN \"{s}\" TO \"{s}\";", .{ table, pair.array.items[0].string, pair.array.items[1].string }));
+                }
+                outcome = .altered;
+                const altered = blk: {
+                    for (removed) |n| execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} DROP COLUMN \"{s}\";", .{ table, n.string })) catch break :blk false;
+                    for (added) |n| {
+                        const ty = columnType(cols_v.array, n.string) orelse "TEXT";
+                        execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} ADD COLUMN \"{s}\" {s};", .{ table, n.string, ty })) catch break :blk false;
+                    }
+                    // SQLite has no ALTER TABLE ADD/DROP CONSTRAINT: an FK change is a rebuild.
+                    if (fk_differs) break :blk false;
+                    break :blk true;
+                };
+                if (!altered) {
+                    // Schema surgery on a consistent copy: with foreign_keys ON the DROP
+                    // of a referenced parent is refused (measured: users, blocked by
+                    // salaries' FK). Off for the surgery, on after — data is copied.
+                    try execSql(st, a, "PRAGMA foreign_keys = OFF;");
+                    const steps = try core.rebuildSteps(a, table, cols_v.array, pk, fks.array, existing.?);
+                    for (steps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+                    try execSql(st, a, "PRAGMA foreign_keys = ON;");
+                    outcome = .rebuilt;
+                }
+                const vsteps = try core.viewSteps(a, table, names.items);
+                for (vsteps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+            }
+        }
+
+        // Indexes on every path — after a rebuild, because the DROP took them along.
+        const plan = try indexPlan(st, a, table, idx.array);
+        for (plan.object.get("drops").?.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+        for (plan.object.get("creates").?.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+        return outcome;
+    }
+
+    /// `core.indexSyncPlan` over what the database actually holds (finding 9 again).
+    fn indexPlan(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, want: std.json.Array) !Value {
+        const have_rows = try st.query(a, "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name = ? AND name NOT LIKE 'sqlite_%'", &.{.{ .text = table }});
+        const have = try a.alloc([]const u8, have_rows.len);
+        for (have_rows, 0..) |row, k| have[k] = row[0].text;
+        return core.indexSyncPlan(a, table, have, want);
+    }
+
+    fn columnType(cols: std.json.Array, name: []const u8) ?[]const u8 {
+        for (cols.items) |c| {
+            if (std.mem.eql(u8, c.object.get("name").?.string, name)) {
+                return if (c.object.get("type")) |t| (if (t == .string) t.string else null) else null;
+            }
+        }
+        return null;
+    }
+
+    fn execSql(st: *storage.Storage, a: std.mem.Allocator, sql: []const u8) !void {
+        _ = try st.query(a, sql, &.{});
+    }
+
+    /// Every table's descriptor from KV through `migrateTable`, then the in-memory
+    /// state (pk, columns, route…) refreshed only when it changed — this runs on
+    /// every `syncOnce`, and the client-lifetime arena must not grow on a no-op.
     pub fn syncSchemas(self: *SyncClient) !void {
-        const a = self.aa();
+        var sa = std.heap.ArenaAllocator.init(self.a);
+        defer sa.deinit();
+        const a = sa.allocator();
         for (self.opts.tables) |table| {
             const bytes = (try self.t.kvGet(a, self.kv_schemas, table)) orelse {
                 std.debug.print("schema missing for {s}\n", .{table});
                 continue;
             };
-            const parsed = try std.json.parseFromSlice(Value, a, bytes, .{});
-            const val = parsed.value;
+            const val = (try std.json.parseFromSlice(Value, a, bytes, .{})).value;
+
+            const outcome = try migrateTable(&self.st, a, table, val);
+            if (outcome != .unchanged) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
 
             const pk = try jsonStrList(a, val.object.get("pk_columns"));
             const cols_v = val.object.get("sqlite").?.object.get("columns").?;
@@ -266,35 +390,35 @@ pub const SyncClient = struct {
             const version_col: ?[]const u8 = if (val.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
             const tombstone_col: ?[]const u8 = if (val.object.get("tombstone_column")) |v| (if (v == .string) v.string else null) else null;
 
-            // FINDING 9: existence is the DATABASE's to answer, never a map's.
-            var qa = std.heap.ArenaAllocator.init(self.a);
-            defer qa.deinit();
-            const exists = (try self.st.query(qa.allocator(),
-                "SELECT name FROM sqlite_master WHERE type='table' AND name = ?", &.{.{ .text = table }})).len > 0;
-            if (!exists) {
-                const fks = val.object.get("foreign_keys") orelse Value{ .array = std.json.Array.init(a) };
-                const steps = try core.createTableSteps(a, table, cols_v.array, pk, fks.array);
-                for (steps.array.items) |stp| try self.execStep(stp);
-                const idx = val.object.get("indexes") orelse Value{ .array = std.json.Array.init(a) };
-                const plan = try core.indexSyncPlan(a, table, &.{}, idx.array);
-                for (plan.object.get("creates").?.array.items) |stp| try self.execStep(stp);
-                std.debug.print("{s}: created\n", .{table});
+            if (self.states.getPtr(table)) |st| {
+                if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) continue;
             }
-            // TODO increment 2: the alter/rebuild path via core.diffColumns —
-            // this increment assumes a stable schema during the run.
-
+            // Changed, or first time: into the client-lifetime arena.
+            const ca = self.aa();
             const route = if (tenant_col != null)
-                try std.fmt.allocPrint(a, "{s}{s}", .{ self.cdc_prefix, self.tenant })
+                try std.fmt.allocPrint(ca, "{s}{s}", .{ self.cdc_prefix, self.tenant })
             else
                 self.cdc_public;
-            try self.states.put(a, table, .{
-                .pk = pk,
-                .cols = names.items,
-                .version_col = version_col,
-                .tenant_col = tenant_col,
-                .tombstone_col = tombstone_col,
+            const fresh: TableState = .{
+                .pk = try dupeStrings(ca, pk),
+                .cols = try dupeStrings(ca, names.items),
+                .version_col = if (version_col) |v| try ca.dupe(u8, v) else null,
+                .tenant_col = if (tenant_col) |v| try ca.dupe(u8, v) else null,
+                .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
                 .route = route,
-            });
+            };
+            if (self.states.getPtr(table)) |st| {
+                // In place: the seed gate (`seed_seq/seed_stream/seed_lsn`) belongs to
+                // the replica's history, not to the descriptor, and survives a migration.
+                st.pk = fresh.pk;
+                st.cols = fresh.cols;
+                st.version_col = fresh.version_col;
+                st.tenant_col = fresh.tenant_col;
+                st.tombstone_col = fresh.tombstone_col;
+                st.route = fresh.route;
+            } else {
+                try self.states.put(ca, try ca.dupe(u8, table), fresh);
+            }
         }
         try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
         try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER)");
@@ -1234,11 +1358,14 @@ pub const SyncClient = struct {
         const first = !self.schemas_synced;
         if (first) {
             try self.resolveTenant();
-            try self.syncSchemas();
             try self.ensureOutbox();
             try self.subscribeVerdicts();
             self.schemas_synced = true;
         }
+        // Every pass, not only the first: `migrateTable` decides from the database and
+        // is a no-op on an identical descriptor, so a schema change published while
+        // this client runs lands on its next sync (§10v's alter/rebuild path).
+        try self.syncSchemas();
         try self.gapAndSeed();
         try self.drainCdc();
         return .{ .tenant = self.tenant, .first = first };
@@ -1319,6 +1446,18 @@ fn indexOf(list: []const []const u8, s: []const u8) ?usize {
 /// PROTOCOL §7.5 — the decision is core.tombstoned, fixture-pinned in both cores.
 fn tombstoned(st: TableState, data: Value) bool {
     return core.tombstoned(st.tombstone_col, data);
+}
+
+fn sameStrings(x: []const []const u8, y: []const []const u8) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+    return true;
+}
+
+fn dupeStrings(a: std.mem.Allocator, src: []const []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, src.len);
+    for (src, 0..) |sv, i| out[i] = try a.dupe(u8, sv);
+    return out;
 }
 
 fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
@@ -1639,3 +1778,67 @@ test "init that cannot read the grammar leaks nothing — including the open dat
     _ = std.c.unlink("zbz-test-ownership.sqlite3");
 }
 
+
+test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds — the row survives each" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa_ = arena.allocator();
+    const path = "/tmp/zb-migrate-test.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var st = try storage.Storage.open(path);
+    defer st.close();
+
+    const desc = struct {
+        fn make(al: std.mem.Allocator, json: []const u8) !Value {
+            return (try std.json.parseFromSlice(Value, al, json, .{})).value;
+        }
+    };
+    // 1. first sight: created (with an index)
+    const d1 = try desc.make(aa_,
+        \\{"pk_columns":["uid"],"sqlite":{"columns":[{"name":"uid","type":"TEXT"},{"name":"a","type":"INTEGER"},{"name":"updated_at","type":"TEXT"}]},
+        \\ "foreign_keys":[],"indexes":[{"name":"t_a","columns":["a"]}]}
+    );
+    try std.testing.expectEqual(SyncClient.Migration.created, try SyncClient.migrateTable(&st, aa_, "t", d1));
+    _ = try st.query(aa_, "INSERT INTO t (uid, a, updated_at) VALUES ('u1', 7, 'v1')", &.{});
+    try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d1));
+
+    // 2. add b, remove a — ALTER; the index on a goes with it; the view exists
+    const d2 = try desc.make(aa_,
+        \\{"pk_columns":["uid"],"sqlite":{"columns":[{"name":"uid","type":"TEXT"},{"name":"b","type":"TEXT"},{"name":"updated_at","type":"TEXT"}]},
+        \\ "foreign_keys":[],"indexes":[]}
+    );
+    try std.testing.expectEqual(SyncClient.Migration.altered, try SyncClient.migrateTable(&st, aa_, "t", d2));
+    var rows = try st.query(aa_, "SELECT uid, b FROM t", &.{});
+    try std.testing.expectEqual(1, rows.len);
+    try std.testing.expectEqualStrings("u1", rows[0][0].text);
+    try std.testing.expectEqual(0, (try st.query(aa_, "SELECT name FROM sqlite_master WHERE type='index' AND name='t_a'", &.{})).len);
+    try std.testing.expectEqual(1, (try st.query(aa_, "SELECT name FROM sqlite_master WHERE type='view' AND name='t_view'", &.{})).len);
+
+    // 3. a rename hint: b → c keeps the value (§1.2: without the hint it would be lost)
+    _ = try st.query(aa_, "UPDATE t SET b = 'kept'", &.{});
+    const d3 = try desc.make(aa_,
+        \\{"pk_columns":["uid"],"sqlite":{"columns":[{"name":"uid","type":"TEXT"},{"name":"c","type":"TEXT"},{"name":"updated_at","type":"TEXT"}]},
+        \\ "foreign_keys":[],"indexes":[],"renamed":{"c":"b"}}
+    );
+    try std.testing.expectEqual(SyncClient.Migration.altered, try SyncClient.migrateTable(&st, aa_, "t", d3));
+    rows = try st.query(aa_, "SELECT c FROM t", &.{});
+    try std.testing.expectEqualStrings("kept", rows[0][0].text);
+
+    // 4. an FK appears: SQLite cannot ALTER a constraint in — rebuild, row copied
+    _ = try st.query(aa_, "CREATE TABLE p (uid TEXT PRIMARY KEY)", &.{});
+    _ = try st.query(aa_, "INSERT INTO p VALUES ('u1')", &.{});
+    const d4 = try desc.make(aa_,
+        \\{"pk_columns":["uid"],"sqlite":{"columns":[{"name":"uid","type":"TEXT"},{"name":"c","type":"TEXT"},{"name":"updated_at","type":"TEXT"}]},
+        \\ "foreign_keys":[{"columns":["uid"],"references":"p","parent_columns":["uid"]}],"indexes":[{"name":"t_c","columns":["c"]}]}
+    );
+    try std.testing.expectEqual(SyncClient.Migration.rebuilt, try SyncClient.migrateTable(&st, aa_, "t", d4));
+    rows = try st.query(aa_, "SELECT c FROM t", &.{});
+    try std.testing.expectEqual(1, rows.len);
+    try std.testing.expectEqualStrings("kept", rows[0][0].text);
+    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "FOREIGN KEY") != null);
+    try std.testing.expectEqual(1, (try st.query(aa_, "SELECT name FROM sqlite_master WHERE type='index' AND name='t_c'", &.{})).len);
+    try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d4));
+    // and the FK is live again after the surgery
+    try std.testing.expectError(error.StepFailed, st.query(aa_, "INSERT INTO t (uid, c, updated_at) VALUES ('orphan', 'x', 'v')", &.{}));
+}

@@ -844,6 +844,7 @@ export class ZeBridge {
         // The view goes FIRST (§1.17): DROP COLUMN re-validates every schema object
         // referencing the table, and the stale view kills the ALTER.
         await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
+        await this.syncIndexes(table, indexes, 'drops');
         for (const [from, to] of renames) {
           await this.run(`ALTER TABLE ${table} RENAME COLUMN "${from}" TO "${to}";`);
         }
@@ -915,7 +916,11 @@ export class ZeBridge {
   /// Drops indexes we hold that are no longer published — an index removed upstream
   /// should not linger, costing writes for a query nobody makes. `sqlite_`-prefixed
   /// entries are SQLite's own (the implicit PK index) and are never touched.
-  private async syncIndexes(table: string, indexes: { name: string; unique?: boolean; columns: string[] }[]) {
+  /// `only: 'drops'` runs the drop half alone — called BEFORE the ALTERs, because
+  /// SQLite refuses DROP COLUMN on an indexed column (found by libzb's unit test on
+  /// 2026-08-29: a plain column removal fell through to a rebuild). Same rule as the
+  /// view (§1.17): every schema object on the column goes first.
+  private async syncIndexes(table: string, indexes: { name: string; unique?: boolean; columns: string[] }[], only?: 'drops') {
     try {
       const have = await this.dialect.indexNames(this.run, table);
       const plan = indexSyncPlan(table, have, indexes);
@@ -923,6 +928,7 @@ export class ZeBridge {
         await this.run(d.sql, ...d.params);
         this.appendLog('SCHEMA', `${table}: dropped index (no longer published): ${d.sql}`, 'MIGRATE');
       }
+      if (only === 'drops') return;
       for (const c of plan.creates) await this.run(c.sql, ...c.params);
       if (plan.creates.length) {
         this.appendLog('SCHEMA', `${table}: ${plan.creates.length} index(es) created`, 'MIGRATE');

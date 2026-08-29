@@ -7263,6 +7263,56 @@ still lands as one message in one poll (300 applied, 97 ms; the matching DELETE 
 1040 bytes it first reported were the demo's write block on `c_allocator`, now an
 arena — `ZB_POLL=n` added to the demo so the tail path is under `leaks` too).
 
+## 10bi. libzb's alter/rebuild path — the last promise of §10v (2026-08-29)
+
+`syncSchemas` had one branch: absent → create; the comment said "increment 2: the
+alter/rebuild path via core.diffColumns — this increment assumes a stable schema
+during the run". The planner was already in `core.zig`, fixture-pinned since §10t
+(`diffColumns`, `rebuildSteps`, `fkTextDiffers`, `viewSteps`, `indexSyncPlan` — all in
+the 127); what was missing was the shell's decision path, a port of `libzb.ts`'s
+`applySchema`.
+
+**`migrateTable(st, a, table, descriptor) → created | unchanged | altered | rebuilt`.**
+Decides from the DATABASE (finding 9: `pragma_table_info`, `sqlite_master`), never
+from memory. First sight → create. Column diff, rename-aware, → `ALTER TABLE` RENAME /
+DROP / ADD COLUMN. An FK change, or an ALTER SQLite refuses → rebuild copying the
+common columns, `PRAGMA foreign_keys` off for the surgery and on after. The `_view`
+dropped before and recreated after. Indexes synced on EVERY outcome, because an
+index added upstream changes no column and lands on "unchanged" (the TS shell's ⚠️).
+It touches only `Storage`, so the unit test runs on a scratch SQLite with no NATS:
+create → ALTER add/remove → rename hint keeps the value → FK appears → rebuilt, the
+row copied, the FK enforced afterwards (an orphan insert refused), a second pass
+`unchanged`.
+
+**What the unit test found before it passed.** The plain column removal came back
+`rebuilt`: SQLite refuses `DROP COLUMN` on an indexed column, and the index on it was
+still there. Same rule as the view (§1.17) — every schema object on the column goes
+first — so the no-longer-published indexes are now dropped BEFORE the ALTERs and the
+new ones created after. The TS shell had the identical gap (its `syncIndexes` ran
+after the ALTERs only); `syncIndexes(table, indexes, 'drops')` now runs before them.
+
+**`syncSchemas` runs on every `syncOnce`, not only the first.** It is diff-based and
+a no-op on an identical descriptor, so a change published while the client runs
+lands on its next sync. Two consequences handled: the parsing moved to a per-call
+arena (the client-lifetime arena must not grow on a no-op — the §10az lesson, one
+layer up), and a changed `TableState` is updated IN PLACE so the seed gate
+(`seed_seq/seed_stream/seed_lsn`) survives a migration; it belongs to the replica's
+history, not the descriptor.
+
+**Live — `libzb/python/migrate.py`** against the native stack as omar, a client
+running throughout: `ALTER TABLE test_types ADD COLUMN note` → in the replica after
+3.9 s of syncs (the bridge's descriptor republish cadence, not the client); an
+INSERT carrying `note` arrives with it; `RENAME COLUMN note TO remark` → the bridge's
+hint `{"remark":"note"}` is honoured, `altered`, the value kept; `DROP COLUMN` →
+gone, 14 columns again; the row survived every step. Every migration went the ALTER
+way — the rebuild is the unit test's to prove, and does. `tail.py`, `index_card.py`,
+the 3 ms poll bench and `leaks` (0) unchanged.
+
+§10v is now closed in full: write path, live tailing (§10bh), alter/rebuild (here),
+consumer cleanup (the server's inactive threshold, §10bb). Left from §10be:
+`catalog_epoch` → CDC routing (§10k); column slicing (§10ab) postponed — not an easy
+subject; the browser full round trip to be measured after the routing work.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
