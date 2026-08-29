@@ -1,6 +1,6 @@
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -446,18 +446,30 @@
+@@ -449,18 +449,30 @@
      fetch_id_counter: u64 = 0,
      /// Mutex for fiber safety
      mutex: xsync.Mutex = .init,
@@ -33,7 +33,7 @@
  
          try self.mutex.lock(self.js.nc.io);
          defer self.mutex.unlock(self.js.nc.io);
-@@ -627,9 +639,162 @@
+@@ -630,9 +642,162 @@
              .err = null,
              .allocator = self.js.nc.allocator,
          };
@@ -196,7 +196,7 @@
  /// JetStream push subscription
  pub const JetStreamSubscription = struct {
      /// Underlying NATS subscription
-@@ -691,6 +856,12 @@
+@@ -694,6 +859,12 @@
  
      /// Full consumer configuration
      config: ?ConsumerConfig = null,
@@ -209,7 +209,7 @@
  };
  
  pub const JetStreamOptions = struct {
-@@ -1643,6 +1814,21 @@
+@@ -1646,6 +1817,21 @@
      }
  
      /// Create a pull subscription for the specified stream
@@ -231,7 +231,7 @@
      pub fn pullSubscribe(self: JetStream, subject: ?[]const u8, durable: []const u8, options: PullSubscribeOptions) !*PullSubscription {
          // Resolve stream name
          const stream_name = if (options.stream) |s|
-@@ -1672,6 +1858,25 @@
+@@ -1675,6 +1861,25 @@
              consumer_info.value.config.durable_name orelse
              durable;
  

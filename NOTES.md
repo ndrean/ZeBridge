@@ -7248,6 +7248,21 @@ alone at its stored position, all gone (`NoResponders`) re-opened together.
 `tail.py`: outside INSERT and UPDATE both in the replica 13 ms after psql returned.
 The Zig client is still single-threaded and host-driven; only the wait changed shape.
 
+**Where the 13 ms went — and why it is 3 now.** "200 000 events/s" is 5 µs per event
+*amortised* over a batch; a single event pays every hop's round trip once. Measured
+on the native stack: PG `clock_timestamp()` at commit → the message stored in
+JetStream (`stream info` `last_ts`): 3.5–4.4 ms, and that includes Postgres's own
+commit fsync and overlaps psql's exit (the bench's clock starts after psql returns).
+One SQLite WAL commit on this disk: 0.05 ms (`synchronous=FULL`). The rest was
+`fetch_idle_after_first`: the nats.zig patch kept collecting for 10 ms after the first
+message, and for a lone event that is pure wait. At 1 ms — a batch already in flight
+arrives back-to-back on the socket, so 1 ms still collects it — the bench reads
+p50 3 ms (min 3, max 3), `tail.py` 3–4 ms, and a burst of 300 rows in one transaction
+still lands as one message in one poll (300 applied, 97 ms; the matching DELETE 74 ms).
+`leaks` on a ReleaseFast `zb-demo` over seed + write + five poll turns: 0 leaks (the
+1040 bytes it first reported were the demo's write block on `c_allocator`, now an
+arena — `ZB_POLL=n` added to the demo so the tail path is under `leaks` too).
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

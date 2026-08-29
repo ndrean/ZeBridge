@@ -87,23 +87,40 @@ pub fn main() !void {
         // in this replica, so the insert fails before anything reaches the wire. That
         // is the applier being right, not a bug.
         const uid = if (std.c.getenv("ZB_WRITE_UID")) |u| std.mem.span(u) else "00000000-0000-0000-0000-0000000000aa";
-        const now = try nowIso(a);
+        // The write's own arena: the key, the values, the timestamp and the returned
+        // msg_id (`mutate` dupes it for the CALLER to own) all die here. Built with
+        // the demo's allocator they were the 1040 bytes `leaks` reported on
+        // 2026-08-29 — the demo's, not the library's, but a leak in the example is
+        // the example teaching it.
+        var wa = std.heap.ArenaAllocator.init(a);
+        defer wa.deinit();
+        const w = wa.allocator();
+        const now = try nowIso(w);
 
         var key: std.json.ObjectMap = .empty;
-        try key.put(a, "uid", .{ .string = uid });
+        try key.put(w, "uid", .{ .string = uid });
 
         var vals: std.json.ObjectMap = .empty;
-        try vals.put(a, "uid", .{ .string = uid });
-        try vals.put(a, "tenant_id", .{ .string = "kilo" });
-        try vals.put(a, "some_text", .{ .string = "written by the zig client" });
-        try vals.put(a, "age", .{ .integer = 42 });
-        try vals.put(a, "inserted_at", .{ .string = now });
-        try vals.put(a, "updated_at", .{ .string = now });
+        try vals.put(w, "uid", .{ .string = uid });
+        try vals.put(w, "tenant_id", .{ .string = "kilo" });
+        try vals.put(w, "some_text", .{ .string = "written by the zig client" });
+        try vals.put(w, "age", .{ .integer = 42 });
+        try vals.put(w, "inserted_at", .{ .string = now });
+        try vals.put(w, "updated_at", .{ .string = now });
 
-        const msg_id = try c.mutate(a, "test_types", "INSERT", .{ .object = key }, .{ .object = vals });
+        const msg_id = try c.mutate(w, "test_types", "INSERT", .{ .object = key }, .{ .object = vals });
         std.debug.print("   mutate queued: {s}\n", .{msg_id});
     }
 
     std.debug.print("   flushed: {d}, verdicts settled: {d}\n",
         .{ try c.flushOutbox(), try c.drainVerdicts(4000) });
+
+    // ZB_POLL=n: n turns of the live tail (§10bh) — the shared inbox, the persistent
+    // consumers, the per-stream grouping — so `leaks` sees that path too.
+    if (std.c.getenv("ZB_POLL")) |n_z| {
+        const n = std.fmt.parseInt(usize, std.mem.span(n_z), 10) catch 3;
+        var applied: usize = 0;
+        for (0..n) |_| applied += (try c.poll(300)).applied;
+        std.debug.print("   polled {d}x300 ms: {d} event(s) applied\n", .{ n, applied });
+    }
 }

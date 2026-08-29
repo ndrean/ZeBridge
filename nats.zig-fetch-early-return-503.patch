@@ -21,17 +21,20 @@
      err: ?anyerror = null,
  
      pub fn deinit(self: *MessageBatch) void {
-@@ -415,6 +422,9 @@
+@@ -415,6 +422,12 @@
  };
  
  /// JetStream pull subscription
-+/// How long `fetch` keeps collecting after its first message (see `fetch`).
-+const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
++/// How long `fetch` keeps collecting after its first message (see `fetch`). 1 ms: a
++/// batch already in flight arrives back-to-back on the socket, so this collects it;
++/// anything longer is pure latency on a single event — measured end to end in
++/// ZeBridge's libzb, 10 ms here made a 13 ms row, 1 ms makes it 3 ms.
++const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
 +
  pub const PullSubscription = struct {
      /// JetStream context
      js: JetStream,
-@@ -488,7 +498,17 @@
+@@ -488,7 +501,17 @@
  
          // Convert the timeout to an absolute deadline so that receiving a
          // message (or a heartbeat) does not re-arm the full timeout.
@@ -50,17 +53,17 @@
  
          // Collect messages until batch is complete or timeout
          while (!batch_complete and messages.items.len < request.batch) {
-@@ -518,10 +538,24 @@
+@@ -518,8 +541,22 @@
                  }
  
                  if (raw_msg.status_code == STATUS_NOT_FOUND) {
 -                    // No messages available
 +                    // No messages available (404, a no_wait pull): "nothing before the
 +                    // deadline", the same answer as an expiry.
-                     raw_msg.deinit();
++                    raw_msg.deinit();
 +                    if (messages.items.len == 0) fetch_error = error.Timeout;
-                     batch_complete = true;
-                     break;
++                    batch_complete = true;
++                    break;
 +                } else if (raw_msg.status_code == STATUS_NO_RESPONSE) {
 +                    // ⚠️ 503 "No Responders": nothing serves this consumer's pull subject —
 +                    // the consumer was deleted, reaped by its inactive threshold, or never
@@ -69,14 +72,12 @@
 +                    // the whole timeout and got `error.Timeout`. Verified against
 +                    // nats-server 2.14.5: `$JS.API.CONSUMER.MSG.NEXT.<stream>.<missing>`
 +                    // answers a bare 503.
-+                    raw_msg.deinit();
-+                    if (messages.items.len == 0) fetch_error = error.NoResponders;
-+                    batch_complete = true;
-+                    break;
-                 } else if (raw_msg.status_code == STATUS_TIMEOUT) {
-                     // Request timeout
                      raw_msg.deinit();
-@@ -552,10 +586,16 @@
++                    if (messages.items.len == 0) fetch_error = error.NoResponders;
+                     batch_complete = true;
+                     break;
+                 } else if (raw_msg.status_code == STATUS_TIMEOUT) {
+@@ -552,10 +589,16 @@
                      errdefer js_msg_ptr.deinit();
  
                      try messages.append(self.js.nc.allocator, js_msg_ptr);
@@ -94,7 +95,7 @@
                      batch_complete = true;
                  },
                  error.Canceled, error.ConnectionClosed, error.SlowConsumer => {
-@@ -566,6 +606,17 @@
+@@ -566,6 +609,17 @@
                      return err;
                  },
              }
@@ -112,7 +113,7 @@
          }
  
          // Convert ArrayList to owned slice
-@@ -573,7 +624,7 @@
+@@ -573,7 +627,7 @@
  
          return MessageBatch{
              .messages = messages_slice,
