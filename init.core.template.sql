@@ -563,6 +563,11 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_object tex
 -- Databases created before the delta milestone: same columns, idempotently.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS prev_cutoff timestamptz;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolean NOT NULL DEFAULT false;
+-- The tenant-scoped row count at this generation's cutoff (NOTES §10bb). The
+-- producer's skip test is version-based and cannot see a hard delete; comparing
+-- count(*) against this catches it and forces a full — the only artifact that can
+-- tell a client a row is gone. NULL on rows from before the column: built once.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS row_count bigint;
 
 -- ⚠️ The ONE deliberate write grant the read role holds, and why it is not a breach of
 -- "the read role is physically unable to write": the generation's content query MUST

@@ -366,13 +366,19 @@ pub const GenerationProducer = struct {
         var last_gen: i64 = 0;
         var last_cutoff: ?[]const u8 = null;
         var last_full_gen: i64 = 0;
+        // The row count at the last generation's cutoff — null on rows written
+        // before the column existed, which reads as "unknown" and builds once.
+        var last_row_count: ?i64 = null;
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(pgc, "SELECT gen, cutoff_version::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(pgc, "SELECT gen, cutoff_version::text, row_count FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
                 last_cutoff = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 1)));
+                if (c.PQgetisnull(res, 0, 2) == 0) {
+                    last_row_count = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 2)), 10) catch null;
+                }
             }
         }
         {
@@ -384,8 +390,17 @@ pub const GenerationProducer = struct {
             }
         }
 
-        // ── skip-if-unchanged: same predicate as the delta filter, so passing it
-        // means the delta will be non-empty ──────────────────────────────────
+        // ── unchanged-by-version: the delta filter's own predicate, so passing it
+        // means the delta will be non-empty. ⚠️ It is BLIND TO HARD DELETES: a row
+        // that is gone has no version to be newer than the cutoff. On a table with a
+        // tombstone column that is fine (a soft delete bumps the version and the reap
+        // is never forwarded, PROTOCOL §7.5); on a table without one it left the last
+        // full describing rows PostgreSQL no longer had — measured: `memo` 6 rows in
+        // every fresh replica against 2 in PostgreSQL, with the DELETE events long
+        // evicted from CDC_PUBLIC, so no client had a path back (NOTES §10bb). The
+        // decision is therefore NOT taken here: it is completed inside the snapshot
+        // below, where the row count can be compared under the same tenant scope.
+        var unchanged_by_version = false;
         if (last_cutoff) |cut| {
             const cut_z = try alloc.dupeZ(u8, cut);
             const check = try utils.allocPrintZ(alloc,
@@ -394,10 +409,7 @@ pub const GenerationProducer = struct {
             const params = [_]?[*:0]const u8{cut_z.ptr};
             const res = try queryOne(pgc, check, &params);
             defer c.PQclear(res);
-            if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "f")) {
-                log.debug("🧬 '{s}'/'{s}': unchanged since g{d} — skipped", .{ tenant, table, last_gen });
-                return;
-            }
+            unchanged_by_version = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "f");
         }
 
         const gen = last_gen + 1;
@@ -405,7 +417,7 @@ pub const GenerationProducer = struct {
         // point), then refreshed BEFORE the last one can age out of the kept window
         // (gen > N − depth): rebuild at distance depth − 1 keeps it always inside.
         const build_delta = last_gen > 0;
-        const build_full = last_full_gen == 0 or (gen - last_full_gen) >= @as(i64, self.chain_depth) - 1;
+        var build_full = last_full_gen == 0 or (gen - last_full_gen) >= @as(i64, self.chain_depth) - 1;
 
         // ── 1. LSN BEFORE the snapshot (overlap-never-gap) ───────────────────
         const lsn: []const u8 = blk: {
@@ -476,6 +488,48 @@ pub const GenerationProducer = struct {
             const res = try queryOne(pgc, "SELECT now()::text", &.{});
             defer c.PQclear(res);
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+        };
+
+        // ── the count-at-cutoff check (NOTES §10bb): inside the snapshot, under the
+        // tenant scope, so it is the same count the content queries see ──────
+        //
+        // A hard delete is invisible to the version predicate but not to count(*).
+        // Compared with the count recorded at the LAST cutoff: equal and unchanged by
+        // version → nothing to build; different → rows went (or came and went), and
+        // the only artifact that can tell a client about a missing row is a FULL, so
+        // one is forced regardless of the chain-depth schedule. A null last count is a
+        // row from before this column existed: unknown, so build once and record it.
+        //
+        // ⚠️ Known blind spot, accepted for this candidate: N inserts and N deletes
+        // between two ticks leave the count unchanged — but then the inserts fail the
+        // version predicate, a delta is built, and its rows are the survivors; only a
+        // delete of a row NOT touched since the last cutoff, exactly offset by a new
+        // row, escapes. The tombstone-column route has no such gap; this one is for
+        // tables that do not have it.
+        const row_count_now: i64 = blk: {
+            const sql = try utils.allocPrintZ(alloc, "SELECT count(*) FROM \"{s}\"", .{table});
+            const res = try queryOne(pgc, sql, &.{});
+            defer c.PQclear(res);
+            break :blk std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
+        };
+        if (unchanged_by_version) {
+            if (last_row_count) |prev| {
+                if (prev == row_count_now) {
+                    log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows) — skipped", .{ tenant, table, last_gen, prev });
+                    const rb = try queryOne(pgc, "ROLLBACK", &.{});
+                    c.PQclear(rb);
+                    return;
+                }
+                log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the row count did ({d} -> {d}) — rows were deleted; forcing a full", .{ tenant, table, last_gen, prev, row_count_now });
+            } else {
+                log.info("🧬 '{s}'/'{s}': no row count recorded for g{d} — building once to record {d}", .{ tenant, table, last_gen, row_count_now });
+            }
+            build_full = true;
+        } else if (last_row_count) |prev| if (row_count_now < prev) {
+            // Changed by version AND shrunk: the delta will carry the survivors that
+            // moved, but nothing can carry the rows that went — a full must.
+            log.info("🧬 '{s}'/'{s}': row count shrank since g{d} ({d} -> {d}) — forcing a full alongside the delta", .{ tenant, table, last_gen, prev, row_count_now });
+            build_full = true;
         };
 
         // ── 3. content: full and/or delta against the SAME snapshot ──────────
@@ -646,10 +700,11 @@ pub const GenerationProducer = struct {
             const prev_z: ?[*:0]const u8 = if (last_cutoff) |p| (try alloc.dupeZ(u8, p)).ptr else null;
             const dict_hex_z: ?[*:0]const u8 = if (build_full) (if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null) else null;
             const dict_obj_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z };
+            const count_z = try utils.allocPrintZ(alloc, "{d}", .{row_count_now});
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr };
             const res = try queryOne(pgc,
-                "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object) " ++
-                    "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9) " ++
+                "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count) " ++
+                    "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint) " ++
                     "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -664,8 +719,15 @@ pub const GenerationProducer = struct {
             const pruned: usize = @intCast(c.PQntuples(res));
             // Dictionaries outlive their full's row: a pruned era's dictionary must
             // survive while any REMAINING row was compressed with it (§10x).
+            // ⚠️ Its OWN two parameters. This reused the DELETE's three-element array
+            // above for a two-placeholder statement, and libpq refuses that: "bind
+            // message supplies 3 parameters, but prepared statement requires 2". Latent
+            // since §10x landed, because it only runs when a chain is deeper than
+            // `chain_depth` — the first such build after it (memo g9, 2026-08-29)
+            // failed here, after its objects and manifest were already live.
+            const ref_params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
             const still_ref = try queryOne(pgc,
-                "SELECT DISTINCT dict_object FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND dict_object IS NOT NULL", &params);
+                "SELECT DISTINCT dict_object FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND dict_object IS NOT NULL", &ref_params);
             defer c.PQclear(still_ref);
             for (0..pruned) |i| {
                 const g = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));

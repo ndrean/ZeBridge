@@ -990,14 +990,9 @@ fn indexOf(list: []const []const u8, s: []const u8) ?usize {
     return null;
 }
 
-/// PROTOCOL §7.5: the row is soft-deleted when its tombstone column is present and
-/// not null. A table without a tombstone column is never tombstoned (its deletes are
-/// physical and arrive as DELETE events).
+/// PROTOCOL §7.5 — the decision is core.tombstoned, fixture-pinned in both cores.
 fn tombstoned(st: TableState, data: Value) bool {
-    const tc = st.tombstone_col orelse return false;
-    if (data != .object) return false;
-    const v = data.object.get(tc) orelse return false;
-    return v != .null;
+    return core.tombstoned(st.tombstone_col, data);
 }
 
 fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {

@@ -4,14 +4,14 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-**What is it?**:  An opinionated, bidirectional bridge to synchronize a single PostgreSQL (14+) database with a local replica via NATS/JetStream (2.10+).
+**What is it?**:  An opinionated, bidirectional bridge to synchronize a single [PostgreSQL](https://www.postgresql.org/) (14+) database with a local replica  - [SQLite](https://sqlite.org/) or [PGLITE](https://pglite.dev/)/PostgreSQL - via [NATS/JetStream](https://nats.io/) (2.10+).
 It is **one bridge with two components** you build on:
 
 ```txt
 PG  ←→  zebridge (daemon)  ←→  NATS  ←→  libzb(.js) (library)  ←→  consumer
 ```
 
-It can be used by browsers (SQLite, PGLite), mobile apps (SQLite), and backend services (SQLite, Postgres).
+It can be used by browsers, mobile apps and backend services with SQLite, PGLITE/PostgreSQL.
 
 **Two parts**:
 The daemon `zebridge` streams PostgreSQL changes onto NATS/JetStream and applies writes coming back.
@@ -133,11 +133,11 @@ Here they are, so you can judge the fit before adopting it.
 **The library owns the write path — reads are open, writes go through `mutate()`.** The opinion is firm: the consumer reads its local database freely — any SQL, joins, aggregates, offline — but changes it only through the library, so every write gets the outbox, the version stamp and the LWW echo. A write that skips the library is a bug you should not be able to make by accident. _How_ that is enforced depends on the local engine, and here is how we approach it:
 
 * **Browser SQLite (one OPFS connection):** the library owns the single connection and hands the app a **read-only** handle — a direct write is simply unreachable. Enforced today.
-* **PGlite:** the library also carries a Postgres schema, so PGlite is a valid local engine; whether its setup can lock the write path the same way is **not yet tested**.
+* **PGlite:** a supported engine (`?engine=pglite` in web-consumer; adapter at `zb-client-ts/pglite`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single in-memory connection exactly as it owns the OPFS one, so the same handle-level lock applies; the schema-migration path on PGlite is not yet driven.
 * **Mobile and microservice SQLite:** SQLite is the only mobile engine, and there the library does not own the connection the same way — so the lock moves into the schema: an **initial migration** makes the app-facing tables read-only (views + triggers) and routes writes through the library's own path. Enforced by the schema, not the handle.
 * **Local Postgres (microservice):** the same choice as PGlite, schema-enforced.
 
-The rule is the same everywhere; the _mechanism_ that guarantees it is engine-specific, and the PGlite case is still open. It is why the library — not a set of naming conventions — is the API.
+The rule is the same everywhere; the _mechanism_ that guarantees it is engine-specific. It is why the library — not a set of naming conventions — is the API.
 
 **Authorization lives where the data does — no gatekeeper, no DSL.** NATS grants (a scoped JWT signing key) decide which subjects a principal may touch; PostgreSQL RLS and the tenant guard decide which rows it may read and write. There is no sync-rules language to author and no separate authorization service to run and keep in sync — the two systems that already hold the data hold the rules, and the principal is a subject token the broker vouches for, never a claim in a payload.
 
@@ -1776,7 +1776,7 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 * [ ] Split READ (CDC + bootstrap) onto a **standby replica** (PG ≧ 16) from WRITE on the primary, with chain building on the replica.
 * [ ] TLS on the NATS↔leaf and PG↔bridge links for cross-network deployments.
 * [ ] **Windows Server for the bridge daemon** — Zig targets `x86_64-windows`, but the daemon has Unix-isms to port first: POSIX signal handling for graceful shutdown (→ `SetConsoleCtrlHandler`) and the `poll()` WAL loop (→ `WSAPoll`), then the scenario suite re-run on Windows. Colocation with NATS is usually Linux, so this is for Windows-only shops. **Separate from the consumer**, which already runs on Windows today — native `libzb.dll` via P/Invoke, or `libzb.js` in a Node/Electron service, no wasm needed.
-* [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite (single owned connection); still to verify for PGlite, and to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.
+* [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite and PGlite (single owned connection, both); still to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.
 * [x] **Retire the snapshot path.** Done end to end (2026-08-27, NOTES §10n–§10p): `libzb` seeds from generation chains only — bounded wait for a chain not yet built, per-stream scoped re-seeding, and a chain-full can never destroy newer data; the producer publishes explicit empty manifests for known tenants; and the bridge-side serve path (snapshot listener, COPY-binary encoder, REQUESTS/`SNAP_RET`, the INIT stream family, `$KV.snapshots`) is deleted. One fewer moving part, and Postgres is never queried per consumer.
 * [x] **A post-boot wiring checker** — `python3 scripts/zbdoctor.py` (add `--json` for CI). Five gates, one verdict: the bridge is alive (`/health`, `/status`), PostgreSQL is wired (the `zebridge_audit_*()` functions read _through_ the catalogue, so a declared-public table is not flagged for being unscoped), NATS carries the topology (CDC streams, KV buckets), a fresh client can seed and follow (schemas published, tenants resolvable, every `(tenant, table)` chain present _and_ its full object actually fetchable), and no declared-vs-actual drift (delegates to `check.py`). Stdlib-only — it runs on a box with `psql`, `nats` and python3.
 * [ ] `bridge_sweeper` on completion?

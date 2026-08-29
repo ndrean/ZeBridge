@@ -6,3 +6,6 @@
 export * from './core.ts';
 export * from './transport.ts';
 export * from './libzb.ts';
+export * from './dialect.ts';
+// The PGlite adapter is NOT re-exported here: importing it pulls the WASM engine
+// into every consumer. It lives at `zb-client-ts/pglite`, opt-in per host.

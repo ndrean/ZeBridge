@@ -251,6 +251,15 @@ pub fn foreignKeyFailureKind(message: []const u8) ?[]const u8 {
     return null;
 }
 
+/// core.ts tombstoned (PROTOCOL §7.5): the row is soft-deleted when its tombstone
+/// column is present and not null; a table without one is never tombstoned.
+pub fn tombstoned(tombstone_col: ?[]const u8, data: Value) bool {
+    const tc = tombstone_col orelse return false;
+    if (data != .object) return false;
+    const v = data.object.get(tc) orelse return false;
+    return v != .null;
+}
+
 /// core.ts seedGateDrops (findings 7 + 10).
 pub fn seedGateDrops(ev: Value, anchor: Value) bool {
     const seed_seq = getInt(anchor, "seedSeq");

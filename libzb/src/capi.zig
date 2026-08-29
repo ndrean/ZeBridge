@@ -61,6 +61,11 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
     const eq = std.mem.eql;
     var out: std.ArrayList(u8) = .empty;
 
+    if (eq(u8, name, "tombstoned")) {
+        const tc_v = args.object.get("tombstoneColumn") orelse .null;
+        const tc: ?[]const u8 = if (tc_v == .string) tc_v.string else null;
+        return if (core.tombstoned(tc, args.object.get("data") orelse .null)) "true" else "false";
+    }
     if (eq(u8, name, "seedGate")) {
         const ev = args.object.get("ev") orelse .null;
         const anchor = args.object.get("anchor") orelse .null;

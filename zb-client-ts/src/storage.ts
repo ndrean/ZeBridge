@@ -23,7 +23,14 @@ export interface Storage {
   /// node.ts).
   transaction(fn: (tx: Exec) => Promise<void>): Promise<void>;
   deleteDatabaseFile(): Promise<void>;
+  /// What the engine speaks (dialect.ts). Absent means SQLite — the two adapters
+  /// that predate the seam. An adapter over PostgreSQL (PGlite, a local server)
+  /// MUST say so: the shell picks the descriptor's `pg` block, BIGINT bookkeeping
+  /// and `session_replication_role` from it.
+  dialect?: Dialect;
 }
+
+import type { Dialect } from './dialect.ts';
 
 /// The host hands the core a factory, not an instance: the core owns the DB
 /// NAME (per-principal, or per-load in the browser dev convention).

@@ -49,6 +49,17 @@ export type PlanStep = { name: string; kind: 'full' | 'delta'; dict?: string };
 /// `<=` loses exactly one row per seed (the next commit is stamped with the
 /// watermark's own lsn). No anchor at all → never drop: duplicates are
 /// absorbed by the idempotent LWW upsert; a dropped row is gone forever.
+/// PROTOCOL §7.5: a soft delete reaches a client as an update that SETS the tombstone
+/// column, and the physical reap that follows is never forwarded — so a row whose
+/// tombstone is present and not null is removed by the client, on seed, on CDC and on
+/// its own optimistic apply alike. A table without a tombstone column is never
+/// tombstoned: its deletes are physical DELETE events. Pinned in fixtures/tombstoned.
+export function tombstoned(tombstoneColumn: string | null, data: unknown): boolean {
+  if (!tombstoneColumn || data === null || typeof data !== 'object') return false;
+  const v = (data as Record<string, unknown>)[tombstoneColumn];
+  return v !== undefined && v !== null;
+}
+
 export function seedGateDrops(ev: CoreEvent, anchor: SeedAnchor): boolean {
   if (typeof anchor.seedSeq === 'number' && anchor.seedStream) {
     return ev.stream === anchor.seedStream && typeof ev.seq === 'number' && ev.seq <= anchor.seedSeq;
@@ -300,30 +311,37 @@ export function columnDdl(c: SchemaColumn, pkCols: string[]): string {
 /// CONSTRAINT — an FK lives only inside CREATE TABLE, which is why an FK change
 /// forces a rebuild while an index change is a cheap CREATE/DROP. Malformed
 /// entries (missing parents, arity mismatch) are dropped, not guessed at.
-export function fkClausesFor(foreignKeys: SchemaForeignKey[]): string {
+/// `deferrable` (PostgreSQL engines): declare each FK `DEFERRABLE INITIALLY
+/// IMMEDIATE`, so `SET CONSTRAINTS ALL DEFERRED` can hold the check to COMMIT the way
+/// SQLite's `PRAGMA defer_foreign_keys` does. Off by default — the fixtures pin the
+/// SQLite text, and SQLite would reject the clause.
+export type DdlOptions = { deferrable?: boolean };
+
+export function fkClausesFor(foreignKeys: SchemaForeignKey[], opts: DdlOptions = {}): string {
   return foreignKeys
     .filter((f) => f?.references && Array.isArray(f.columns) && f.columns.length &&
                    Array.isArray(f.parent_columns) && f.parent_columns.length === f.columns.length)
     .map((f) =>
       `, FOREIGN KEY (${f.columns.map((c) => `"${c}"`).join(', ')})` +
-      ` REFERENCES ${f.references} (${f.parent_columns.map((c) => `"${c}"`).join(', ')})`)
+      ` REFERENCES ${f.references} (${f.parent_columns.map((c) => `"${c}"`).join(', ')})` +
+      (opts.deferrable ? ' DEFERRABLE INITIALLY IMMEDIATE' : ''))
     .join('');
 }
 
-function tableBody(cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[]): string {
+function tableBody(cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[], opts: DdlOptions = {}): string {
   const constraint =
     (pkCols.length > 1 ? `, PRIMARY KEY (${pkCols.map((c) => `"${c}"`).join(', ')})` : '') +
-    fkClausesFor(foreignKeys);
+    fkClausesFor(foreignKeys, opts);
   return `${cols.map((c) => columnDdl(c, pkCols)).join(', ')}${constraint}`;
 }
 
 /// First sight — which, after finding 9, means the table is PHYSICALLY absent.
 export function createTableSteps(
-  table: string, cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[],
+  table: string, cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[], opts: DdlOptions = {},
 ): SqlStep[] {
   return [
     { sql: `DROP TABLE IF EXISTS ${table};`, params: [] },
-    { sql: `CREATE TABLE ${table} (${tableBody(cols, pkCols, foreignKeys)});`, params: [] },
+    { sql: `CREATE TABLE ${table} (${tableBody(cols, pkCols, foreignKeys, opts)});`, params: [] },
   ];
 }
 
@@ -333,12 +351,12 @@ export function createTableSteps(
 /// salaries' FK). The data is copied, not changed.
 export function rebuildSteps(
   table: string, cols: SchemaColumn[], pkCols: string[], foreignKeys: SchemaForeignKey[],
-  existingColumns: string[],
+  existingColumns: string[], opts: DdlOptions = {},
 ): SqlStep[] {
   const tmp = `${table}__migrating`;
   const steps: SqlStep[] = [
     { sql: `DROP TABLE IF EXISTS ${tmp};`, params: [] },
-    { sql: `CREATE TABLE ${tmp} (${tableBody(cols, pkCols, foreignKeys)});`, params: [] },
+    { sql: `CREATE TABLE ${tmp} (${tableBody(cols, pkCols, foreignKeys, opts)});`, params: [] },
   ];
   const common = cols.map((c) => c.name).filter((n) => existingColumns.includes(n)).map((n) => `"${n}"`);
   if (common.length) {

@@ -12,7 +12,7 @@ import {
   columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
-  seedGateDrops, planFromManifest, fullPredatesReplica, scopeSeeding,
+  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
 } from './core.ts';
@@ -22,6 +22,9 @@ const fx = JSON.parse(readFileSync(join(here, '..', 'fixtures', 'core-fixtures.j
 
 for (const c of fx.seedGate) {
   test(`seedGate: ${c.name}`, () => assert.equal(seedGateDrops(c.ev, c.anchor), c.drops));
+}
+for (const c of fx.tombstoned) {
+  test(`tombstoned: ${c.name}`, () => assert.equal(tombstoned(c.tombstoneColumn, c.data), c.drops));
 }
 for (const c of fx.chainPlan) {
   test(`chainPlan: ${c.name}`, () => assert.deepEqual(planFromManifest(c.manifest, c.watermark), c.plan));

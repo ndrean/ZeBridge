@@ -26,9 +26,10 @@ import type { Transport, TransportConnection } from './transport.ts';
 import { decode, encode } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 import { browserStorage } from './browser-storage.ts';
+import { sqliteDialect, type Dialect } from './dialect.ts';
 import { v7 as uuidv7 } from 'uuid';
 import {
-  seedGateDrops, planFromManifest, fullPredatesReplica as coreFullPredates,
+  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
   scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire,
   planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
@@ -194,6 +195,8 @@ export class ZeBridge {
 
   private nc: TransportConnection | null = null;
   private storage: Storage;
+  /// What the replica engine speaks (dialect.ts) — SQLite unless the adapter says otherwise.
+  private dialect: Dialect;
 
   private syncedTables = new Map<string, TableState>();
   private failed = new Set<string>();
@@ -250,6 +253,7 @@ export class ZeBridge {
       ? `zebridge_${config.principal}.sqlite3`
       : `zebridge_${Date.now()}.sqlite3`;
     this.storage = (config.storage ?? browserStorage)(this.dbName);
+    this.dialect = this.storage.dialect ?? sqliteDialect;
     this.transport = config.transport ?? natsTransport;
     this.sql = this.storage.exec;
     this.transaction = (fn) => this.storage.transaction(fn);
@@ -483,8 +487,8 @@ export class ZeBridge {
     await this.run(`
       CREATE TABLE IF NOT EXISTS _zebridge_sync (
         id INTEGER PRIMARY KEY,
-        global_last_lsn INTEGER,
-        global_last_seq INTEGER
+        global_last_lsn ${this.dialect.int64},
+        global_last_seq ${this.dialect.int64}
       );
     `);
     // One row per stream: JetStream sequences are per stream, and a single global
@@ -492,7 +496,7 @@ export class ZeBridge {
     await this.run(`
       CREATE TABLE IF NOT EXISTS _zebridge_stream_seq (
         stream TEXT PRIMARY KEY,
-        last_seq INTEGER NOT NULL
+        last_seq ${this.dialect.int64} NOT NULL
       );
     `);
     // Generation watermarks (NOTES.md §1.13): the client tracks WATERMARKS, never gen
@@ -501,13 +505,13 @@ export class ZeBridge {
       CREATE TABLE IF NOT EXISTS _zebridge_generations (
         tbl TEXT PRIMARY KEY,
         watermark TEXT NOT NULL,
-        cutoff_lsn INTEGER NOT NULL
+        cutoff_lsn ${this.dialect.int64} NOT NULL
       );
     `);
-    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_dicts (name TEXT PRIMARY KEY, bytes BLOB NOT NULL)`); // §10x dictionary cache
+    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_dicts (name TEXT PRIMARY KEY, bytes ${this.dialect.blobType} NOT NULL)`); // §10x dictionary cache
     await this.createOutboxTable();
     this.resolveOutboxInit();
-    await this.run(`INSERT OR IGNORE INTO _zebridge_sync (id, global_last_lsn, global_last_seq) VALUES (1, 0, 0)`);
+    await this.run(this.dialect.insertIgnore('_zebridge_sync', ['id', 'global_last_lsn', 'global_last_seq'], ['id']), 1, 0, 0);
     const res = await this.run(`SELECT global_last_lsn FROM _zebridge_sync WHERE id = 1`);
     if (res.length > 0) this.globalSyncState.lsn = res[0].global_last_lsn ?? 0;
     for (const r of await this.run(`SELECT stream, last_seq FROM _zebridge_stream_seq`)) {
@@ -520,12 +524,12 @@ export class ZeBridge {
   private async createOutboxTable() {
     await this.run(`
       CREATE TABLE IF NOT EXISTS _zebridge_inbox (
-        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        id       ${this.dialect.autoincrementPk},
         tbl      TEXT    NOT NULL,
-        lsn      INTEGER NOT NULL,
+        lsn      ${this.dialect.int64} NOT NULL,
         ev       TEXT    NOT NULL,
         reason   TEXT    NOT NULL,
-        held_at  INTEGER NOT NULL,
+        held_at  ${this.dialect.int64} NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0
       )
     `);
@@ -538,7 +542,7 @@ export class ZeBridge {
         tbl        TEXT NOT NULL,
         row_id     TEXT NOT NULL,
         before     TEXT,
-        created_at INTEGER NOT NULL,
+        created_at ${this.dialect.int64} NOT NULL,
         attempts   INTEGER NOT NULL DEFAULT 0
       )
     `);
@@ -750,7 +754,12 @@ export class ZeBridge {
   private async applySchema(table: string, val: any) {
     // `pk_columns` is authoritative; `pk` is the legacy single-column form.
     const pkCols: string[] = Array.isArray(val.pk_columns) ? val.pk_columns : val.pk ? [val.pk] : [];
-    const cols: { name: string; type: string; required?: boolean }[] = val.sqlite.columns;
+    // The column TYPES come from the block this engine speaks (dialect.ts): `sqlite`
+    // for the SQLite adapters, `pg` for PGlite / a local Postgres — the descriptor has
+    // carried both since §10c, and this is the first consumer of `pg`. Column NAMES,
+    // pk, indexes and FKs are dialect-neutral at the root.
+    const block = val[this.dialect.schemaBlock] ?? val.sqlite;
+    const cols: { name: string; type: string; required?: boolean }[] = block.columns;
     // Dialect-neutral, at the root: CREATE [UNIQUE] INDEX is the same statement here
     // and in PGlite/local Postgres, so one list serves every consumer shape (§10c).
     const indexes: { name: string; unique?: boolean; columns: string[] }[] =
@@ -778,17 +787,17 @@ export class ZeBridge {
     let existing = this.syncedTables.get(table);
     if (!existing) {
       try {
-        const phys: any[] = (await this.run(`PRAGMA table_info("${table}")`)) ?? [];
+        const phys = await this.dialect.tableInfo(this.run, table);
         if (phys.length) {
           existing = {
-            columns: phys.map((c: any) => c.name),
-            pkCols: phys.filter((c: any) => c.pk > 0).sort((a: any, b: any) => a.pk - b.pk).map((c: any) => c.name),
+            columns: phys.map((c) => c.name),
+            pkCols: phys.filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name),
             lsn: 0,
             tombstoneColumn: null,
             tenantColumn: null,
           };
         }
-      } catch { /* engine without the pragma — behaves as before */ }
+      } catch { /* introspection failed — behaves as before */ }
     }
     // core.diffColumns (§10s 2b): rename-aware — a hinted rename is neither
     // added nor removed; an unhinted one degrades to add+remove (§1.2).
@@ -798,24 +807,25 @@ export class ZeBridge {
     // DDL text and constraints come from core (columnDdl/fkClausesFor, §10s 2b).
     // SQLite has no ALTER TABLE ADD CONSTRAINT, so an FK change forces a rebuild
     // below while an index change stays a cheap CREATE/DROP.
-    const fkClauses = fkClausesFor(foreignKeys);
+    const ddlOpts = { deferrable: this.dialect.deferrableForeignKeys };
+    const fkClauses = fkClausesFor(foreignKeys, ddlOpts);
 
     const rebuildPreservingData = async (why: string) => {
       // Schema surgery on an already-consistent copy: with foreign_keys ON, the
       // DROP of a referenced parent is refused outright (measured: users, blocked
       // by salaries' FK). Off for the surgery, back on after — the data is copied,
       // not changed.
-      try { await this.run(`PRAGMA foreign_keys = OFF;`); } catch { /* no pragma */ }
-      for (const st of rebuildSteps(table, cols, pkCols, foreignKeys, existing ? existing.columns : [])) {
+      try { await this.dialect.setForeignKeys(this.run, false); } catch { /* engine without it */ }
+      for (const st of rebuildSteps(table, cols, pkCols, foreignKeys, existing ? existing.columns : [], ddlOpts)) {
         await this.run(st.sql, ...st.params);
       }
-      try { await this.run(`PRAGMA foreign_keys = ON;`); } catch { /* no pragma */ }
+      try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ }
       this.appendLog('SCHEMA', `${table}: rebuilt preserving common columns (${why}), lsn=${lsn}`, 'MIGRATE');
     };
 
     try {
       if (!existing) {
-        for (const st of createTableSteps(table, cols, pkCols, foreignKeys)) {
+        for (const st of createTableSteps(table, cols, pkCols, foreignKeys, ddlOpts)) {
           await this.run(st.sql, ...st.params);
         }
         this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
@@ -879,8 +889,9 @@ export class ZeBridge {
   /// or drop a constraint.
   private async foreignKeysDiffer(table: string, fkClauses: string): Promise<boolean> {
     try {
-      const rows = await this.run(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table);
-      return fkTextDiffers(rows?.[0]?.sql ?? '', fkClauses); // the pure compare lives in core (§10s 2b)
+      const ddl = await this.dialect.tableDdl(this.run, table);
+      if (ddl === null) return false; // engine keeps no DDL text: an FK change is not detectable here
+      return fkTextDiffers(ddl, fkClauses); // the pure compare lives in core (§10s 2b)
     } catch {
       return false;
     }
@@ -898,11 +909,8 @@ export class ZeBridge {
   /// entries are SQLite's own (the implicit PK index) and are never touched.
   private async syncIndexes(table: string, indexes: { name: string; unique?: boolean; columns: string[] }[]) {
     try {
-      const rows = await this.run(
-        `SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=? AND name NOT LIKE 'sqlite_%'`,
-        table,
-      );
-      const plan = indexSyncPlan(table, (rows ?? []).map((r: any) => r.name), indexes);
+      const have = await this.dialect.indexNames(this.run, table);
+      const plan = indexSyncPlan(table, have, indexes);
       for (const d of plan.drops) {
         await this.run(d.sql, ...d.params);
         this.appendLog('SCHEMA', `${table}: dropped index (no longer published): ${d.sql}`, 'MIGRATE');
@@ -939,7 +947,7 @@ export class ZeBridge {
     for (const { table, ev } of toApply) {
       try {
         await this.transaction(async (txExec) => {
-          await txExec(`PRAGMA defer_foreign_keys = ON;`);
+          await this.dialect.deferForeignKeys(txExec);
           await this.applyEvent(table, ev, txExec);
         });
         applied++;
@@ -1057,7 +1065,7 @@ export class ZeBridge {
     // once, and once the parents have landed that is a single COMMIT.
     try {
       await this.transaction(async (txExec) => {
-        await txExec(`PRAGMA defer_foreign_keys = ON;`);
+        await this.dialect.deferForeignKeys(txExec);
         for (const { table, ev } of pending) await this.applyEvent(table, ev, txExec);
         // Same transaction as the apply: an event is either applied AND forgotten,
         // or neither. A crash between the two would replay it forever or lose it.
@@ -1071,7 +1079,7 @@ export class ZeBridge {
         const { table, ev } = held;
         try {
           await this.transaction(async (txExec) => {
-            await txExec(`PRAGMA defer_foreign_keys = ON;`);
+            await this.dialect.deferForeignKeys(txExec);
             await this.applyEvent(table, ev, txExec);
             await this.deleteHeld([held], txExec);
           });
@@ -1130,7 +1138,13 @@ export class ZeBridge {
       }
     }
 
-    const op = ev.operation;
+    // PROTOCOL §7.5, decided by core.tombstoned: an INSERT/UPDATE that carries the
+    // tombstone set is the delete — the reap that follows is never forwarded, so this
+    // is the replica's only chance to drop the row. Applies to our own optimistic
+    // soft delete too, exactly as the server's echo of it would.
+    // ⚠️ This was stored (`state.tombstoneColumn`) and never read: every replica held
+    // its tombstones until a full re-seed (measured in libzb: 134 reaped rows kept).
+    const op = tombstoned(state.tombstoneColumn, ev.data) ? 'DELETE' : ev.operation;
 
     if (op === 'INSERT' || op === 'UPDATE') {
       const keys = Object.keys(ev.data);
@@ -1337,7 +1351,7 @@ export class ZeBridge {
       const d = await os.getBlob(name);
       if (!d) throw new Error(`dictionary ${name} missing from ${manifest.bucket}`);
       this.dictCache.set(name, d);
-      try { await this.run(`INSERT OR REPLACE INTO _zebridge_dicts (name, bytes) VALUES (?, ?)`, name, d); } catch { /* best effort */ }
+      try { await this.run(this.dialect.insertReplace('_zebridge_dicts', ['name', 'bytes'], ['name']), name, d); } catch { /* best effort */ }
       return d;
     };
     const fetchDoc = async (name: string, dictName?: string): Promise<any | null> => {
@@ -1375,11 +1389,24 @@ export class ZeBridge {
         // table's version column — LWW holds during seeding too.
         const q = chainUpsertSql(table, cols, state.pkCols,
           vcol && cols.includes(vcol) ? vcol : null);
+        // §7.5 on the seed path: a chain is built from the table as it stands, so it
+        // carries every tombstone not yet reaped. Chain rows are positional — resolve
+        // the tombstone column to its index once, then decide per row via
+        // core.tombstoned on a keyed view of the row.
+        const tombIdx = state.tombstoneColumn ? cols.indexOf(state.tombstoneColumn) : -1;
+        const pkIdx = state.pkCols.map((c) => cols.indexOf(c));
         await this.transaction(async (txExec) => {
           // A full replaces the baseline wholesale; the DELETE shares the transaction
           // so a crash mid-apply cannot leave an empty table.
           if (step.kind === 'full') await txExec(`DELETE FROM ${table}`);
           for (const row of doc.rows) {
+            if (tombIdx >= 0 && tombstoned(state.tombstoneColumn, { [cols[tombIdx]]: row[tombIdx] })) {
+              const keyed: Record<string, unknown> = {};
+              state.pkCols.forEach((c, i) => { if (pkIdx[i] >= 0) keyed[c] = row[pkIdx[i]]; });
+              const del = planDelete(table, state.pkCols, keyed);
+              if (del) await txExec(del.sql, ...del.params);
+              continue;
+            }
             await txExec(q, ...chainRowParams(row));
           }
         });
@@ -1498,7 +1525,7 @@ export class ZeBridge {
 
         // Off for the duration of the bulk load — see the re-arm below. A no-op
         // inside a transaction, which is why it is here and not in a seed step.
-        try { await this.run(`PRAGMA foreign_keys = OFF;`); } catch { /* engine without it */ }
+        try { await this.dialect.setForeignKeys(this.run, false); } catch { /* engine without it */ }
 
         // ⚠️ ONE TABLE PER PROMISE, and that is the point.
         //
@@ -1558,10 +1585,12 @@ export class ZeBridge {
         // both unnecessary and actively wrong. The standard SQLite bulk-load shape —
         // off during load, on after, then verify.
         try {
-          await this.run(`PRAGMA foreign_keys = ON;`);
-          const bad = await this.run(`PRAGMA foreign_key_check;`);
-          if (bad?.length) {
-            this.appendLog('SYS', `⚠️ ${bad.length} foreign key violation(s) survive seeding — the seeded set is not self-consistent`, 'ERROR');
+          await this.dialect.setForeignKeys(this.run, true);
+          const bad = await this.dialect.foreignKeyViolations(this.run);
+          if (bad > 0) {
+            this.appendLog('SYS', `⚠️ ${bad} foreign key violation(s) survive seeding — the seeded set is not self-consistent`, 'ERROR');
+          } else if (bad < 0) {
+            this.appendLog('SYS', `foreign keys re-enabled; this engine (${this.dialect.name}) offers no cheap post-load check`, 'INFO');
           }
         } catch { /* engine without the pragma */ }
         if (this.failed.size > 0) {
@@ -1635,7 +1664,7 @@ export class ZeBridge {
                 // PROTOCOL.md §4's FK rule in executable form: enforcement waits for
                 // this batch's COMMIT, so a child arriving before its parent inside
                 // one batch cannot fail the apply.
-                await txExec(`PRAGMA defer_foreign_keys = ON;`);
+                await this.dialect.deferForeignKeys(txExec);
                 for (const { table, ev } of toApply) {
                   await this.applyEvent(table, ev, txExec);
                 }

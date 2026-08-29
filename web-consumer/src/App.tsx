@@ -7,6 +7,7 @@
 import { createSignal, onCleanup, For } from 'solid-js';
 import grammar from '../../grammar.json';
 import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
+import { pgliteStorage } from 'zb-client-ts/pglite';
 import { init as zstdInit, decompress as zstdDecompress, createDCtx, decompressUsingDict } from '@bokuweb/zstd-wasm';
 
 /// §10x: chain objects are zstd frames, deltas may name a dictionary. One wasm
@@ -49,6 +50,12 @@ const PASSWORD = _qs.get('password') ?? (import.meta.env.VITE_PASSWORD as string
 /// Opt in to a stable per-principal OPFS file instead of a fresh one every load.
 /// Off by default — the timestamped name is the project's clean-room dev convention.
 const DURABLE = ['1', 'true'].includes((import.meta.env.VITE_DURABLE as string | undefined) ?? '');
+
+/// `?engine=pglite`: PostgreSQL-in-the-browser as the replica engine instead of
+/// OPFS SQLite — "PG to PG". Same core, same protocol; the adapter brings the
+/// dialect (zb-client-ts/src/dialect.ts) and the descriptor's `pg` block is used for
+/// the DDL. In-memory, fresh per load, like the SQLite default.
+const ENGINE = (_qs.get('engine') ?? (import.meta.env.VITE_ENGINE as string | undefined) ?? 'sqlite') as 'sqlite' | 'pglite';
 
 /// THE instance. One replica, one socket, one outbox — module-level like the
 /// SQLocal handle it wraps used to be.
@@ -130,6 +137,7 @@ const zb = new ZeBridge({
   creds: CREDS,
   grammar,
   durable: DURABLE,
+  storage: ENGINE === 'pglite' ? pgliteStorage : undefined,
 });
 
 // Console handle for inspecting the local replica directly — the database lives in
@@ -284,11 +292,25 @@ export default function App() {
   const insertRandom = async () => {
     const id = zb.uuid();
     const version = zb.newVersion();
+    const n = Math.floor(Math.random() * 10_000);
     await zb.mutate('test_types', 'INSERT', { uid: id }, {
       uid: id,
-      some_text: `random ${Math.floor(Math.random() * 10_000)}`,
+      some_text: `random ${n}`,
       age: Math.floor(Math.random() * 90),
       is_true: Math.random() > 0.5,
+      // The awkward columns, as NATIVE values — the same shape libzb's soak sends.
+      // The wire is msgpack, so these travel as an array, a nested array, a map, a
+      // float; the ingress renders each to the TEXT form its column's input function
+      // reads (`{a,b}` for text[], JSON for jsonb) and binds it as a text parameter —
+      // PostgreSQL parses. `price` is numeric(20,8): sent as a string on purpose,
+      // because a JS number cannot carry eight decimals faithfully.
+      // ⚠️ Until 2026-08-29 this button sent scalars only, so the typed ingress path
+      // had never been exercised from a browser.
+      tags: ['web', `push-${n}`, 'with,comma'],
+      matrix: [[n, n * 2], [1, 2]],
+      metadata: { source: 'web-consumer', n, nested: { ok: true } },
+      price: '1234.56789012',
+      temperature: 36.6,
       tenant_id: zb.tenant || undefined,
       updated_at: version,
       inserted_at: version,
@@ -321,6 +343,57 @@ export default function App() {
     const uid = await lastLiveUid();
     if (!uid) return appendLog('SYS', 'nothing live to delete', 'WARNING');
     await zb.mutate('test_types', 'DELETE', { uid });
+  };
+
+  // ── salaries: the FK table (user_id → users.id), same three verbs ──────────
+  //
+  // `users` is outbound-only, so the PARENT must exist server-side first (psql
+  // or a backend), and be replicated here — the optimistic apply enforces the FK
+  // locally with `foreign_keys = ON`, and a child with no local parent fails
+  // before it is queued. INS therefore picks a parent from the replica's `users`.
+  // Measured 2026-08-29: with a bogus user_id the local upsert failed
+  // (SQLITE_CONSTRAINT_FOREIGNKEY), the mutation was still sent, PostgreSQL
+  // refused it (23503) and the `rejected` verdict reverted — two guards, one
+  // answer. `salaries` has NO tombstone column, so DEL is a physical delete and
+  // comes back as a real `cdc.salaries.delete`.
+  const lastSalaryUid = async (): Promise<string | null> => {
+    try {
+      const r = await zb.query(`SELECT uid FROM salaries ORDER BY updated_at DESC LIMIT 1`);
+      return r[0]?.uid ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const insertSalary = async () => {
+    let parent: number | null = null;
+    try {
+      const r = await zb.query(`SELECT id FROM users ORDER BY id LIMIT 1`);
+      parent = r[0]?.id ?? null;
+    } catch { /* not seeded yet */ }
+    if (parent == null) return appendLog('SYS', 'salaries INS: no user in the replica to reference — insert one in PostgreSQL first (users is outbound-only)', 'WARNING');
+    const uid = zb.uuid();
+    const version = zb.newVersion();
+    await zb.mutate('salaries', 'INSERT', { uid }, {
+      uid, user_id: parent, tenant_id: zb.tenant || undefined,
+      amount: 1000 + Math.floor(Math.random() * 9000),
+      inserted_at: version, updated_at: version,
+    }, { version });
+  };
+
+  const updateSalary = async () => {
+    const uid = await lastSalaryUid();
+    if (!uid) return appendLog('SYS', 'no salary to update', 'WARNING');
+    const version = zb.newVersion();
+    await zb.mutate('salaries', 'UPDATE', { uid }, {
+      uid, amount: 1000 + Math.floor(Math.random() * 9000), updated_at: version,
+    }, { version });
+  };
+
+  const deleteSalary = async () => {
+    const uid = await lastSalaryUid();
+    if (!uid) return appendLog('SYS', 'no salary to delete', 'WARNING');
+    await zb.mutate('salaries', 'DELETE', { uid });
   };
 
   /// INSERT on first click (no row yet, needs inserted_at for the NOT NULL), UPDATE
@@ -494,6 +567,12 @@ export default function App() {
                         <button onClick={() => void insertRandom()}>INS</button>
                         <button onClick={() => void updateLast()}>UP</button>
                         <button onClick={() => void deleteLast()}>DEL</button>
+                      </span>
+                    ) : t === 'salaries' ? (
+                      <span class="row-actions">
+                        <button onClick={() => void insertSalary()}>INS</button>
+                        <button onClick={() => void updateSalary()}>UP</button>
+                        <button onClick={() => void deleteSalary()}>DEL</button>
                       </span>
                     ) : (
                       <em class="readonly">read-only</em>

@@ -59,7 +59,9 @@ export default defineConfig({
     }
   },
   optimizeDeps: {
-    exclude: ['sqlocal']
+    // PGlite ships its WASM/fs assets next to its module; pre-bundling breaks the
+    // relative asset URLs, same class of problem as sqlocal's worker below.
+    exclude: ['sqlocal', '@electric-sql/pglite']
   },
   resolve: {
     // zb-client-ts is a linked (symlinked) package; without dedupe its imports
@@ -68,6 +70,6 @@ export default defineConfig({
     // — vite resolves that under /node_modules/ but serves the SPA index.html
     // (200, text/html) for the /@fs/ form, so the worker dies silently and every
     // DB call hangs. Dedupe pins the shared runtime deps to this package's copies.
-    dedupe: ['sqlocal', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
+    dedupe: ['sqlocal', '@electric-sql/pglite', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
   }
 });

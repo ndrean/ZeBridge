@@ -1,5 +1,5 @@
 {
-  "_": "The conformance spec for the sans-I/O core (NOTES \u00a710s). Language-neutral: the TS runner is src/core.test.ts; a port (Zig, \u2026) is correct exactly when it passes every case here. Each case that encodes a measured finding names it.",
+  "_": "The conformance spec for the sans-I/O core (NOTES §10s). Language-neutral: the TS runner is src/core.test.ts; a port (Zig, …) is correct exactly when it passes every case here. Each case that encodes a measured finding names it.",
   "seedGate": [
     {
       "name": "seq below cutoff drops",
@@ -51,7 +51,7 @@
       "drops": false
     },
     {
-      "name": "FINDING 7: in-flight txn \u2014 lower lsn but higher seq APPLIES when seq is primary",
+      "name": "FINDING 7: in-flight txn — lower lsn but higher seq APPLIES when seq is primary",
       "ev": {
         "seq": 900,
         "stream": "CDC_kilo",
@@ -65,7 +65,7 @@
       "drops": false
     },
     {
-      "name": "FINDING 10: no anchor at all \u2014 never drop by lsn (schema lsn must not gate data)",
+      "name": "FINDING 10: no anchor at all — never drop by lsn (schema lsn must not gate data)",
       "ev": {
         "seq": 5,
         "stream": "CDC_PUBLIC",
@@ -236,7 +236,7 @@
       ]
     },
     {
-      "name": "\u00a710x: a delta naming its dictionary carries it on the step; others stay bare",
+      "name": "§10x: a delta naming its dictionary carries it on the step; others stay bare",
       "manifest": {
         "gen": 3,
         "full": {
@@ -1146,7 +1146,7 @@
       }
     },
     {
-      "name": "\u00a71.2: an unhinted rename degrades to add+remove (values lost, by protocol)",
+      "name": "§1.2: an unhinted rename degrades to add+remove (values lost, by protocol)",
       "existing": [
         "a",
         "old_n"
@@ -1193,7 +1193,7 @@
       "differs": false
     },
     {
-      "name": "different parent: differs (forces a rebuild \u2014 SQLite has no ADD CONSTRAINT)",
+      "name": "different parent: differs (forces a rebuild — SQLite has no ADD CONSTRAINT)",
       "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES q (\"y\"))",
       "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
       "differs": true
@@ -1469,7 +1469,7 @@
   ],
   "hlcVersion": [
     {
-      "name": "THE lost-update killer: slow clock, newer floor seen via CDC -> floor + 1\u00b5s",
+      "name": "THE lost-update killer: slow clock, newer floor seen via CDC -> floor + 1µs",
       "now": "2026-08-27T10:00:00.000Z",
       "last": "2026-08-27T09:00:00.000000Z",
       "floor": "2026-08-27T10:00:30.500000Z",
@@ -1562,7 +1562,7 @@
       ]
     },
     {
-      "name": "an entry with no version is never refused \u2014 the server's version guard still fronts it",
+      "name": "an entry with no version is never refused — the server's version guard still fronts it",
       "entries": [
         {
           "msgId": "a",
@@ -1632,6 +1632,59 @@
         "a"
       ],
       "refuse": []
+    }
+  ],
+  "tombstoned": [
+    {
+      "name": "tombstone set drops the row (PROTOCOL §7.5: the soft delete IS the removal; the reap never arrives)",
+      "tombstoneColumn": "deleted_at",
+      "data": {
+        "uid": "u1",
+        "deleted_at": "2026-08-28T21:39:17.279256Z"
+      },
+      "drops": true
+    },
+    {
+      "name": "tombstone null keeps the row",
+      "tombstoneColumn": "deleted_at",
+      "data": {
+        "uid": "u1",
+        "deleted_at": null
+      },
+      "drops": false
+    },
+    {
+      "name": "tombstone column absent from the payload keeps the row (partial UPDATE)",
+      "tombstoneColumn": "deleted_at",
+      "data": {
+        "uid": "u1",
+        "age": 3
+      },
+      "drops": false
+    },
+    {
+      "name": "a table without a tombstone column is never tombstoned (its deletes are physical)",
+      "tombstoneColumn": null,
+      "data": {
+        "uid": "u1",
+        "deleted_at": "2026-08-28T21:39:17.279256Z"
+      },
+      "drops": false
+    },
+    {
+      "name": "empty string is a value, not null — the row is tombstoned (measured: libzb held 134 reaped rows)",
+      "tombstoneColumn": "deleted_at",
+      "data": {
+        "uid": "u1",
+        "deleted_at": ""
+      },
+      "drops": true
+    },
+    {
+      "name": "non-object data keeps nothing to decide on",
+      "tombstoneColumn": "deleted_at",
+      "data": null,
+      "drops": false
     }
   ]
 }

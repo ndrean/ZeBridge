@@ -6631,10 +6631,17 @@ all three places rows arrive: the chain seed (`ChainStep.apply`, by column index
 the CDC event (`applyEvent`) and the local optimistic apply (`applyOptimistic`, so
 our own soft delete removes the row exactly as the server's echo would). Re-run on
 the clean stack: replica test_types 8 rows / 0 tombstoned = PostgreSQL kilo 8 / 0.
-⚠️ The TS client stores `tombstoneColumn` in `syncedTables` and never reads it
-(grep: set at libzb.ts:824/862, no consumer) — so as of today NO client implemented
-§7.5's removal, and every browser replica holds tombstones until a full re-seed.
-Queued for zb-client-ts.
+⚠️ The TS client stored `tombstoneColumn` in `syncedTables` and never read it — so
+until today NO client implemented §7.5's removal, and every browser replica held its
+tombstones until a full re-seed. Closed the same day, the §10s way: the decision is
+`core.tombstoned(tombstoneColumn, data)` in BOTH cores, pinned by a new `tombstoned`
+fixture section (six cases, including "empty string is a value, not null" and "no
+tombstone column → never tombstoned"); TS 107 and Zig 107 conformance cases pass.
+`libzb.ts` applies it in `applyEvent` (an INSERT/UPDATE carrying the tombstone is
+routed as a DELETE — this also covers the client's own optimistic soft delete) and in
+the chain `applyPlan` (by column index, deleting by PK instead of upserting). Nothing
+outside the package applies rows itself: web-consumer links the package source
+(`link:../zb-client-ts`), so it picks the rule up with no rebuild step.
 
 **ReleaseFast under `leaks` (same day), the review's own verification.** The
 arena-lifetime finding was invisible to `leaks` by construction, so the check is the
@@ -6644,6 +6651,28 @@ attached at 15 s and 40 s: **0 leaks both times**, malloc nodes 492 -> 494 and
 1,858 KB -> 1,938 KB, RSS 4.9 -> 5.0 MB. Flat — where the old client grew ~3 MiB of
 arena per second of soak. `leaks --atExit` on `zb-demo` (full seed + drain): 0 leaks.
 Both binaries' Zig tests: 14 pass, 1 gated skip.
+
+**Browser, same day, fresh OPFS replica (`?principal=omar&auth=creds`).** `test_types`
+shows **8** rows — chain g70 carried 182, the rule removed the tombstoned 174 — and
+PostgreSQL has 8 alive / 0 tombstoned. `counter_public` 27 = 27. The rule touches
+nothing else: tables without a tombstone column are never routed through it.
+(⚠️ `.env.local` pins `VITE_AUTH=password`; without `&auth=creds` the JWT principal
+gets `Authorization Violation` and the page sits DISCONNECTED — the query string
+wins, the env is the default.)
+
+**And `memo` diverges, permanently, on every fresh client — the producer defect
+with no benchmark anywhere near it.** Browser 6 rows, PostgreSQL 2. `memo` has no
+tombstone column. Its chain is g6 full (cutoff 08-27 12:54 UTC) plus deltas to g8
+(12:55); four rows were hard-deleted later, and the skip predicate — `EXISTS rows
+WHERE updated_at > cutoff` — has answered "unchanged" on every tick since, so no
+generation has been built for two days. The DELETE events that would have corrected
+a client are gone too: CDC_PUBLIC's `first_seq` is 80,399 (08-28 20:29 UTC, discard-old
+under the 2M-row burst), and the stream holds no `cdc.memo.*` at all. So a fresh
+replica seeds six rows from a chain that predates the deletes, drains a stream that
+no longer remembers them, and converges on the wrong answer with nothing left
+anywhere to fix it. That is the whole case for the producer fix: on a
+tombstone-less table a hard delete must trigger a generation, or a client that missed
+the event has no path back.
 
 Which sharpens the producer defect above to exactly its heading: a table WITH a
 tombstone column is covered (soft deletes bump `updated_at`, reaps need not be
@@ -6665,9 +6694,148 @@ honours the threshold on durable consumers too — verified on 2.14.5: 16 leaked
 `zbz*` consumers cleared, one demo run created two, both gone from `consumer ls`
 30 s later. The JWT stays exactly as it was; the server does the deleting.
 
+**The producer fix — count-at-cutoff (same day, closed).** `zebridge_generations`
+gains `row_count bigint` (template + live ALTER), recorded per build from
+`count(*)` taken INSIDE the REPEATABLE READ snapshot after `set_config(zb.tenant)`,
+so it is the same tenant-scoped count the content queries see. The version predicate
+no longer returns early; it sets `unchanged_by_version` and the decision completes in
+the snapshot: unchanged and count equal → ROLLBACK, skipped; unchanged and count
+different → rows were deleted, a FULL is forced (a delta cannot carry an absence);
+changed and count shrank → full alongside the delta; last count NULL (rows from before
+the column) → build once and record. Known gap, accepted for this candidate and
+written next to the code: N inserts exactly offset by N deletes of untouched rows.
+Tables with a tombstone column never needed this; it exists for the ones without.
+
+Verified: first pass after restart rebuilt every legacy chain once ("no row count
+recorded for gN — building once"), memo landing as g9 full with `row_count = 2`; a
+fresh browser replica then seeded `memo` from g9 and showed **2** (was 6), with every
+other table unchanged. Next tick: "unchanged since g9 (2 rows) — skipped" at debug.
+
+**And a latent bug the first pruning build tripped over.** The §10x dictionary code
+in the prune step ran `SELECT DISTINCT dict_object … WHERE tenant=$1 AND tbl=$2`
+with the DELETE's THREE-element parameter array; libpq: "bind message supplies 3
+parameters, but prepared statement requires 2". Reachable only when a chain is
+deeper than `chain_depth`, and no such build had happened since the code landed —
+memo g9 was the first, and it failed AFTER objects, manifest and bookkeeping row were
+live (which is why the rerun found nothing to do). Fixed with its own two-parameter
+array. ⚠️ A parameter array shared across statements is a bug waiting for the first
+statement with a different arity.
+
+**How a "full" mutation travels, checked from the browser.** The envelope is msgpack
+with NATIVE values; the ingress renders each to the TEXT form its column's input
+function reads (`{a,b}` for `text[]`, `{{1,2}}` for `integer[]`, JSON for `jsonb`,
+`{d}` for numbers) and binds them as text parameters — PostgreSQL parses. So "it is
+all text" is true exactly at the PG boundary and nowhere else. What was NOT true:
+the web-consumer's "Push — accepted" sent scalars only, so the typed path had never
+been exercised from a browser — only libzb's soak had. `insertRandom` now sends
+`tags` (with a comma inside a value), a nested `matrix`, a `metadata` map, `price`
+as a string (a JS number cannot carry numeric(20,8)), `temperature` as a float.
+Pushed once from the browser: PostgreSQL holds `{web,push-3143,"with,comma"}`,
+`{{3143,6286},{1,2}}`, the jsonb, `1234.56789012`, `36.6`, `last_writer` = the tab;
+the CDC echo applied and the replica counted 9. Two dev-loop notes from the run:
+the Chrome extension cannot dispatch mouse events to a minimized window (script
+`click()` works), and an HMR reload of the app leaves two instances in the tab —
+the old one then reports every chain object "unreadable" — so after editing
+`App.tsx`, reload the tab.
+
+**The three row verbs, from the browser, after all of the above.** `INS` → replica
+10, PostgreSQL holds the typed row (`tags`, `matrix`, jsonb, numeric, writer = the
+tab). `UP` sends a PARTIAL payload (`uid, some_text, updated_at`) → PostgreSQL
+`some_text = "updated 11:32:13"` with `tags`, `matrix`, `price`, `age` intact — the
+ingress UPDATE touches only what was sent, as §7 says of the update path. `DEL` →
+PostgreSQL row still present with `deleted_at` set (kilo alive 9 / tombstoned 1),
+replica back to **9** with verb `DEL`: the soft-delete echo removed the row locally
+via the §7.5 rule shipped today. Fresh replica after reload: memo 2, test_types 9.
+
+**The FK pair from the browser — users (public, outbound-only) + salaries (tenant,
+writable, FK to users.id).** The parent has to come from PostgreSQL (`users` has no
+edge-write grant) and reaches the replica over CDC_PUBLIC; the child goes from the
+edge. Driven through `window.zb.mutate` first, then through three new `INS`/`UP`/`DEL`
+row buttons on `salaries` (INS picks a parent from the replica's `users`; without one
+it says so and sends nothing). INSERT (user_id 424242, amount 1000) → in PostgreSQL,
+replica 1, outbox 0. UPDATE (partial, amount 2000) → both sides. DELETE → `salaries`
+has no tombstone column, so PostgreSQL removed the row and forwarded a real
+`cdc.salaries.delete`; replica 0. Then the parent deleted in PostgreSQL → replica
+`users` 0. The negative case, a child pointing at user_id 999999: the LOCAL upsert
+failed first (`SQLITE_CONSTRAINT_FOREIGNKEY`, foreign_keys ON in the replica), the
+mutation was still SENT, PostgreSQL refused it (23503), the verdict came back
+`rejected` and the revert left nothing — two guards, one answer; the wire trip is the
+price of letting the server be the authority (a parent may simply not have replicated
+yet). Side observations: the DELETE's version was clamped ("this client's clock is
+ahead of the database") — clamp.py's rule, seen from the browser; and the SQL console
+does go through `zb.query()` (a `sqlite_master` query rendered "16 row(s) · 11ms"), so
+local-vs-PostgreSQL comparison is a paste away. One load (09:39 UTC) showed `users`
+empty although the g5 delta carrying user 424243 existed since 09:38:12; a reload
+seeded it correctly and I could not capture that load's console — not explained,
+noted so it is recognised if it recurs.
+
 ⚠️ Both faults sat unseen for the same reason: the soak never seeds (`syncSchemas`
 only) and the demo was run with `ZB_SKIP_SEED`. A path nobody runs is a path
 nobody has verified — §10av's lesson about the test graph, again, for the data.
+
+## 10bc. PG to PG — PGlite as the replica engine (2026-08-29)
+
+The schema descriptor has carried a `pg` block next to `sqlite` since §10c, and no
+client ever read it. Now one does: `?engine=pglite` in web-consumer runs PostgreSQL
+18.3 (PGlite 0.5.8, WASM, in memory, fresh per load) as the replica, through the
+same `ZeBridge` class, the same core, the same protocol.
+
+**What it took — a dialect seam, not a second client.** The core's SQL was already
+portable (`INSERT … ON CONFLICT … DO UPDATE … WHERE excluded."v" > t."v"`, quoted
+identifiers) and the CDC wire already carries PostgreSQL's own text forms (`{a,b}`,
+`{{1,2}}`, JSON, `t`/`f`, ISO `Z`) — SQLite stores them as text, PostgreSQL parses
+them. What was not portable was the shell's housekeeping, fourteen sites in
+`libzb.ts`: `PRAGMA table_info` / `sqlite_master` (introspection), `PRAGMA
+foreign_keys` (the bulk-load toggle), `PRAGMA defer_foreign_keys` (four transaction
+sites), `PRAGMA foreign_key_check`, `INSERT OR IGNORE/REPLACE`, `BLOB`,
+`AUTOINCREMENT`, and which descriptor block supplies column types. All of it now
+goes through `dialect.ts` (`sqliteDialect`, `postgresDialect`), carried by the
+storage adapter; `core.ts` gained one optional `deferrable` flag on the FK clause
+(PostgreSQL needs `DEFERRABLE INITIALLY IMMEDIATE` for `SET CONSTRAINTS ALL
+DEFERRED` to mean what the pragma means). Fixtures unchanged, 107/107 both cores.
+The adapter (`pglite-storage.ts`, exported at `zb-client-ts/pglite` so the WASM
+never enters a consumer that did not ask) rewrites `?` → `$n` outside quotes, binds
+`undefined` as NULL, and relies on PGlite's single connection for the serialization
+contract.
+
+**Three things measured on the way.**
+  1. ⚠️ SQLite's INTEGER is 64-bit, PostgreSQL's is 32-bit. The bookkeeping tables
+     store LSNs (~1e10) and millisecond times (~1.7e12) in "INTEGER"; the dialect
+     names `int64` (BIGINT there) and the adapter parses int8 to Number — a BigInt
+     would break `JSON.stringify` of the sync state.
+  2. ⚠️ PGlite's constructor is `(dataDir?, options?)` but its body does `typeof
+     dataDir == "string" ? … : options = dataDir` — `new PGlite(undefined, opts)`
+     silently discards opts. Every timestamptz came back a Date with the text parser
+     "in place" until the call became `new PGlite(opts)`.
+  3. `session_replication_role = replica` is the FK toggle for the bulk seed, and
+     unlike SQLite there is no cheap post-load check; the log says so
+     (`foreignKeyViolations` answers -1).
+
+**Results, same stack, same tenant, minutes apart.** Fresh PGlite replica: every
+count equal to the SQLite replica (27 / 1 / 2 / 3 / 0 / 0 / 9 / 1 / 1), four phase
+badges green. In the replica `tags` is a real `text[]` (a JS array), `matrix` a
+nested array, `metadata` a jsonb object, `price` a numeric kept as the string
+"1234.56789012", `is_true` a boolean — nothing flattened. `test_types` INS/UP/DEL:
+10 → 10 → 9, tags intact across the partial UP; `salaries` INS/UP/DEL with the FK
+to `users`: `user_id` typed bigint, outbox 0 after each. The SQLite engine,
+re-run after the refactor: identical behaviour. Dev-loop notes: vite caches the
+linked package's `package.json`, so a new `exports` entry needs a dev-server
+restart; `optimizeDeps.exclude` and `dedupe` list `@electric-sql/pglite` for the
+same reason sqlocal is there.
+
+**Found in the SQLite console while doing this, unrelated to PGlite:** the `UP`
+button's PARTIAL payload fails the local optimistic upsert on the INSERT arm
+(`NOT NULL constraint failed: test_types.tenant_id` — §7's asymmetry, exactly as
+libzb's soak hit it), logged as a SQLITE ERROR and then corrected by the CDC echo.
+The user never sees a wrong row, but the optimistic apply of a partial UPDATE is a
+no-op today in the browser too. Full rows, or an UPDATE-shaped local plan.
+
+**Still open for PGlite**: the schema-migration path (rename/drop/add, the
+FK-change rebuild) has not been driven — `tableDdl` answers null there, so an FK
+change is not detectable by text compare; OPFS persistence (`dataDir`) is untried;
+and README's question whether PGlite's single connection locks the write path the
+way OPFS SQLite does — it is one connection, so the answer is yes by construction,
+but it has not been probed.
 
 ## 11 Restart Rules
 
