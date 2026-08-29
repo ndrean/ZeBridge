@@ -33,6 +33,14 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_SERVICE" --role service \
 echo "service signing key: $SK_SERVICE"
 
 # ── the CLIENT signing key: the WHOLE per-principal grant block, ONCE ────────
+#
+# `DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>` is what lets a client collect the
+# verdicts it MISSED while offline (PROTOCOL §7.4b): the outbox knows every msg_id it
+# awaits and a verdict is one message on `mutation_ack.<principal>.<msg_id>`, so a
+# per-key direct get answers "was this judged?" — scoped to the principal's own
+# replies, no consumer state, the same exact-key form as `$KV.tenants`. A consumer
+# on MUTATIONS is NOT granted: MSG.NEXT cannot be scoped below the stream, so one
+# principal could pull another's verdicts by guessing a consumer name.
 SK_CLIENT=$(nsc edit account ZEBRIDGE --sk generate 2>&1 | grep -o 'A[A-Z0-9]\{55\}' | tail -1)
 nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "mutation.{{name()}}.>" \
@@ -78,6 +86,7 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
     --allow-pub "\$JS.ACK.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>" \
     --allow-sub "mutation_ack.{{name()}}.>" \
     --allow-sub "cdc.{{tag(tenant)}}.>" \
     --allow-sub "cdc._default.>" \
@@ -128,5 +137,23 @@ chmod 600 "$CREDS"/*.creds
 
 # ── the server side: operator + preloaded accounts, one fragment ─────────────
 nsc generate config --mem-resolver --config-file "$ROOT/scripts/native/resolver.conf" --force
+
+# ⚠️ The running server does NOT read resolver.conf: nats-server-jwt.conf carries its
+# own inline `resolver_preload`, pasted from an earlier generation. Editing a signing
+# key regenerates the ACCOUNT JWT, so that block must be refreshed too, or a reload
+# reports "Reloaded: accounts" while enforcing the old template (measured 2026-08-29:
+# a new DIRECT.GET grant was refused for 20 minutes after a successful reload).
+# Splice the fresh ZEBRIDGE JWT in when the file exists, then `kill -HUP` the server.
+JWTCONF="$ROOT/scripts/native/nats-server-jwt.conf"
+if [ -f "$JWTCONF" ]; then
+  python3 - "$ROOT/scripts/native/resolver.conf" "$JWTCONF" <<'PY'
+import re, sys
+res, conf = open(sys.argv[1]).read(), open(sys.argv[2]).read()
+for acc, jwt in re.findall(r'([A-Z2-7]{56}):\s*(ey[A-Za-z0-9_.\-]+)', res):
+    conf = re.sub(acc + r':\s*ey[A-Za-z0-9_.\-]+', acc + ': ' + jwt, conf)
+open(sys.argv[2], 'w').write(conf)
+print('nats-server-jwt.conf: account JWTs refreshed — reload the server (kill -HUP)')
+PY
+fi
 echo; echo "── store ──"; nsc describe account ZEBRIDGE | head -30
 echo "── creds ──"; ls -la "$CREDS"

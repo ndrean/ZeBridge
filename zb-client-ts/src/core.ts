@@ -531,8 +531,10 @@ export function nextVersion(nowIso: string, lastVersion: string): string {
 /// fractional seconds — unescaped, one write's ack would fan out as a wildcard.
 export const subjectSafeToken = (v: string): string => v.replace(/[.*>\s]/g, '-');
 
-export function mutationSubject(principal: string, table: string, op: string): string {
-  return `mutation.${principal}.${table}.${op.toLowerCase()}`;
+/// `prefix` is grammar.json's `subjects.mutations_prefix`; the shell passes it, the
+/// fixtures rely on the protocol default.
+export function mutationSubject(principal: string, table: string, op: string, prefix = 'mutation'): string {
+  return `${prefix}.${principal}.${table}.${op.toLowerCase()}`;
 }
 
 /// The idempotency id. The version stays IN the id: a second edit to the same
@@ -581,11 +583,12 @@ export function buildMutation(args: {
   op: 'INSERT' | 'UPDATE' | 'DELETE';
   key: Record<string, unknown>; values?: Record<string, unknown>;
   pkCols: string[]; version: string;
+  mutationsPrefix?: string;
 }): { subject: string; msgId: string; id: string; payload: Record<string, unknown>; optimistic: Record<string, unknown> } {
   const id = mutationKeyId(args.pkCols, args.key);
   const payload = mutationPayload(args.op, args.key, args.values, args.version, args.clientId);
   return {
-    subject: mutationSubject(args.principal, args.table, args.op),
+    subject: mutationSubject(args.principal, args.table, args.op, args.mutationsPrefix),
     msgId: mutationMsgId(args.clientId, args.table, id, args.version),
     id,
     payload,

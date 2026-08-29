@@ -1309,6 +1309,14 @@ export class ZeBridge {
     throw new Error('chain object is zstd-compressed: pass config.zstdDecompress (e.g. fzstd.decompress in the browser)');
   }
 
+  /// grammar.json's `subjects.mutation_ack_prefix` — the verdict channel's first token.
+  /// The literal `mutation_ack` used to be hardcoded at three sites; the grammar is
+  /// the single source (PROTOCOL §1) and a renamed prefix must not leave a client
+  /// listening on a subject nobody publishes.
+  private ackPrefix(): string {
+    return this.config.grammar.subjects?.mutation_ack_prefix ?? 'mutation_ack';
+  }
+
   private async resolveTenant() {
     if (!this.nc) return;
     try {
@@ -1790,12 +1798,70 @@ export class ZeBridge {
 
   // ── the write path (PROTOCOL.md §7) ───────────────────────────────────────
 
+  /// The verdicts this client MISSED — published while it was offline, or before this
+  /// process existed (PROTOCOL §7.4b). The outbox knows every msg_id it awaits and a
+  /// verdict is one retained message on `mutation_ack.<principal>.<msg_id>`, so one
+  /// per-key direct get per pending entry answers "was this judged?" and settles it
+  /// through the same handler the live subscription uses. A 404 means not judged (or
+  /// judged longer ago than MUTATIONS keeps) — the entry stays and is replayed.
+  ///
+  /// ⚠️ This is what makes "verdicts are stored so an offline client can collect them"
+  /// (PROTOCOL §2) TRUE. Until 2026-08-29 no client read a stored verdict: convergence
+  /// came from the REPLAY earning a fresh one, which costs a second PostgreSQL write
+  /// attempt per entry and, past the duplicate window, a `stale` for a write that had
+  /// in fact been accepted. The grant is per key —
+  /// `$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.<principal>.>` — scoped like `$KV.tenants`.
+  private async collectMissedVerdicts(rows: any[]): Promise<Set<string>> {
+    const settled = new Set<string>();
+    if (!this.nc || !rows.length) return settled;
+    const stream = this.config.grammar.streams?.mutations ?? 'MUTATIONS';
+    let jsm: any;
+    try { jsm = await this.transport.jetstreamManager(this.nc); } catch { return settled; }
+    // ⚠️ The DIRECT form only. `jsm.streams.getMessage` is the legacy
+    // `$JS.API.STREAM.MSG.GET.<stream>` request, which the client JWT does not grant
+    // (and must not: it is not scopable per key). Without `jsm.direct` there is
+    // nothing to collect with, and the replay path answers as before.
+    if (!jsm.direct?.getMessage) {
+      this.appendLog('OUTBOX', 'this NATS client has no direct-get API — stored verdicts cannot be collected, replaying instead', 'WARNING');
+      return settled;
+    }
+    let firstFailure: string | null = null;
+    for (const r of rows) {
+      const subject = `${this.ackPrefix()}.${this.config.principal}.${r.msg_id}`;
+      try {
+        const m = await jsm.direct.getMessage(stream, { last_by_subj: subject });
+        if (!m) continue;
+        const data: Uint8Array = m.data instanceof Uint8Array ? m.data : new TextEncoder().encode(String(m.data ?? ''));
+        if (await this.handleVerdict(m.subject ?? subject, data)) settled.add(r.msg_id);
+      } catch (e: any) {
+        // A 404 is the ordinary answer (not judged yet, or aged out); anything else —
+        // a permission violation, a timeout — is worth one line, or a grant mistake
+        // reads as "verdicts never get collected" with no symptom.
+        const text = String(e?.message ?? e);
+        if (!/404|no message found|not found/i.test(text) && firstFailure === null) firstFailure = text;
+      }
+    }
+    if (firstFailure) this.appendLog('OUTBOX', `collecting stored verdicts failed (${firstFailure}) — replaying instead`, 'WARNING');
+    if (settled.size) this.appendLog('OUTBOX', `collected ${settled.size} verdict(s) published while this client was away — settled without replay`, 'INFO');
+    return settled;
+  }
+
   private async watchVerdicts() {
     if (!this.nc) return;
-    const sub = this.nc.subscribe(`mutation_ack.${this.config.principal}.>`);
+    const sub = this.nc.subscribe(`${this.ackPrefix()}.${this.config.principal}.>`);
     void (async () => {
-      for await (const m of sub) {
-        const prefix = `mutation_ack.${this.config.principal}.`;
+      for await (const m of sub) await this.handleVerdict(m.subject, m.data);
+    })();
+  }
+
+  /// One verdict, live or collected: true when it was definitive (the outbox entry is
+  /// settled one way or another), false for `failed` or an unknown status (kept).
+  private async handleVerdict(subject: string, data: Uint8Array): Promise<boolean> {
+    const m = { subject, data };
+    let ok: boolean;
+    {
+      {
+        const prefix = `${this.ackPrefix()}.${this.config.principal}.`;
         const msgId = m.subject.startsWith(prefix) ? m.subject.slice(prefix.length) : m.subject;
         const verdict = JSON.parse(new TextDecoder().decode(m.data));
         const pending = this.pendingWrites.get(msgId);
@@ -1803,9 +1869,10 @@ export class ZeBridge {
 
         // 'failed' is the ONE status that is not definitive (§7.1: keep and retry).
         const definitive = verdict.status !== 'failed';
+        ok = definitive;
         if (definitive) this.pendingWrites.delete(msgId);
         if (definitive && verdict.status !== 'rejected' && verdict.status !== 'row_deleted') {
-          void this.outboxDrop(msgId);
+          await this.outboxDrop(msgId);
         }
 
         switch (verdict.status) {
@@ -1823,22 +1890,24 @@ export class ZeBridge {
             break;
           case 'row_deleted':
             // Nothing is coming via CDC to correct this one — revert by hand (§1.6d).
-            void this.revertOptimisticWrite(msgId, 'delete');
+            await this.revertOptimisticWrite(msgId, 'delete');
             this.appendLog(m.subject, `${where}: the row was deleted elsewhere, so this edit cannot be applied — reverting the local copy. Surface this to the user rather than dropping it silently.`, 'ERROR');
             break;
           case 'rejected':
-            void this.revertOptimisticWrite(msgId, 'restore');
+            await this.revertOptimisticWrite(msgId, 'restore');
             this.appendLog(m.subject, `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'} — reverting the local copy`, 'ERROR');
             break;
           case 'failed':
             this.appendLog(m.subject, `${where}: failed after the bridge's delivery limit (${verdict.reason}) — kept for retry`, 'WARNING');
             break;
           default:
+            ok = false;
             this.pendingWrites.set(msgId, pending ?? { table: '?', id: '?', at: Date.now() });
             this.appendLog(m.subject, { ...verdict, write: where, note: 'unknown status — kept pending' }, 'ERROR');
         }
       }
-    })();
+    }
+    return ok;
   }
 
   private sweepPendingWrites() {
@@ -1869,7 +1938,7 @@ export class ZeBridge {
     // Subject and idempotency id come from core (§10s 2c): the version stays
     // IN the id — a second edit to the same row is a different write; a retry
     // of the same edit is not.
-    const subject = mutationSubject(this.config.principal, table, op);
+    const subject = mutationSubject(this.config.principal, table, op, this.config.grammar.subjects?.mutations_prefix);
     const msgId = mutationMsgId(this.clientIdValue, table, id, version);
     const h = this.transport.headers();
     h.set('Nats-Msg-Id', msgId);
@@ -1945,6 +2014,13 @@ export class ZeBridge {
       return;
     }
     if (!rows.length) return;
+
+    // ── first, the verdicts already waiting for us (PROTOCOL §7.4b) ──────────
+    const settled = await this.collectMissedVerdicts(rows);
+    if (settled.size) {
+      rows = rows.filter((r: any) => !settled.has(r.msg_id));
+      if (!rows.length) return;
+    }
 
     // ── the GC watermark gate (PROTOCOL.md §MUST 6) ─────────────────────────
     //

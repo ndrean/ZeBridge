@@ -10,8 +10,8 @@ are the way they are* and *what is still undecided*.
 
 ### 1.1 Preflight validation — BUILT (`src/preflight.zig`)
 
-ZeBridge imposes requirements on tables but enforces none of them at startup.
-Two failures are currently silent:
+ZeBridge imposes requirements on tables; before preflight existed none were enforced
+at startup, and two failures were silent:
 
 - **No single-column PK** → snapshots fail *late*, at request time, per table
   (`getTablePrimaryKey` requires `array_length(i.indkey,1) = 1` and returns
@@ -158,6 +158,9 @@ shorter or longer with no risk either way. Not worth further attention.
 
 ### 1.5 CLOSED — snapshot / seed design
 
+⚠️ Superseded 2026-08-27 (§10p): the snapshot path described below is deleted; seeding
+is generation chains only. Kept for the reasoning.
+
 Was sketched, not built, with two concerns raised and unresolved. Both are now
 built, and match the sketch exactly:
 
@@ -175,6 +178,9 @@ built, and match the sketch exactly:
   cover).
 
 ### 1.6 CLOSED — web client uses real JetStream consumers
+
+(`descriptorStillFresh` and every `$KV.snapshots` reference below went with the snapshot
+path, §10p; the per-stream gap rule that replaced them is PROTOCOL §6.)
 
 `subscribeStreams()` (`App.tsx`) opens a JetStream `consumer.consume()` per stream
 with `deliver_policy: last > 0 ? StartSequence : All, opt_start_seq: last > 0 ? last
@@ -689,6 +695,7 @@ to face: a queued outbox write can be older than the GC watermark (§7.1 MUST-6)
 the tombstone that should have overruled it may already be reaped, and replay has
 no way to tell "stale" from "safe to resend" once that evidence is gone. Not yet
 addressed; only surfaces with `VITE_DURABLE` after a long outage.
+→ Closed 2026-08-28: the outbox watermark gate, §10at (TS) and §10av (libzb).
 
 ### 1.8 Read authorization — what the publication can and cannot filter
 
@@ -1078,7 +1085,11 @@ guessed.
    stale `$KV.tenants` entry behind, since only the insert/update branches are special-cased.
    A client reading a stale entry would resolve a tenant that no longer has a row for it in
    `zebridge_user_tenants` — worth closing before this ships anywhere principals get
-   deprovisioned.
+   deprovisioned. → Closed 2026-08-29 (§10be follow-up): the DELETE branch decodes the
+   key tuple and purges `$KV.tenants.<principal>` through the KV API (a purge is a header
+   on an empty message, which the ring slot cannot carry); an absent key already resolves
+   to the open tenant in both clients, so no client change. Measured: INSERT → key
+   `kilo` within a poll; DELETE → `nats kv get` finds nothing, history shows the PURGE.
 
    ⚠️ **Granted per principal — `$KV.tenants.alice`, never `$KV.tenants.>`.** The wholesale
    grant would hand every client the full principal→tenant map, which is a roster of who else
@@ -1177,6 +1188,9 @@ dumps shareable again.
 
 #### Still open
 
+(Superseded 2026-08-27, §10p: snapshot-on-demand is deleted, so the per-tenant dump
+cost above no longer exists; chains are built once per cadence and shared.)
+
 - ~~Filtered snapshot or refusal?~~ **CLOSED: filtered.** Not merely because it mirrors CDC,
   but because the invariant forces it. A client whose *feed* is filtered and whose *dump* is
   refused can never bootstrap the rows it is entitled to see, so it holds a permanently
@@ -1256,7 +1270,9 @@ and touches `snapshot_listener.zig`, every stream-creation script, and `App.tsx`
 — roughly the footprint of the INIT split just finished. And crosstenant.py's finding (a
 JetStream consumer's `filter_subject` is reader-chosen, not ACL-checked — the *stream* is the
 real boundary) presumably applies to Object Store buckets the same way, which would mean
-per-tenant buckets, not per-tenant keys inside one shared bucket — **unverified**, not assumed;
+per-tenant buckets, not per-tenant keys inside one shared bucket — **unverified** then,
+verified since: `scripts/scenarios/objgrants.py`, and the chains live in `gen-<tenant>`
+buckets (§10x);
 check whether an exact-key grant on `$O.<bucket>.C.>`/`$O.<bucket>.M.>` scopes the way
 `$KV.tenants`'s exact-key Direct Get grant does (§1.12 part 1) before leaning on it.
 
@@ -1619,6 +1635,9 @@ post-apply width check in the writer's transaction — `octet_length` sum on the
 resulting row, over budget → ROLLBACK → verdict `rejected` — makes edge writes
 categorically unable to suspend a table (judge vs burst benchmark first);
 (3) the `zebridge_enable` width trigger stops backend writers creating the bait
+→ (1) built (§10l/§10v: the producer measures the widest row while encoding); (3) built
+(§10b/§10l: `zebridge_install_width_guard`, present on every enabled table); (2) subsumed
+by (3) — the trigger refuses the write inside the transaction and the verdict is `rejected`
 at all. Until (1)+(2) land, generations quietly widened the exposure the snapshot
 path's measureWidestRow used to close.
 
@@ -1657,7 +1676,7 @@ cadence latency": the client keeps chain-seeding suspended tables instead of
 treating them as dead, and the 1 MB ceiling stops being a freeze at all. Optional
 hardening for non-edge writers stays queued: a width guard trigger installed by
 `zebridge_enable` only on tables whose unbounded columns can overflow, judged
-against the burst benchmark first (perf: no drift).
+against the burst benchmark first (perf: no drift). → Built, §10b/§10l.
 
 **Consequence for retirement day — CDC retention shrinks to ~2 × cadence.** A
 chain-seeded client needs CDC only from its manifest's `cutoff_lsn` forward, and the
@@ -1732,6 +1751,8 @@ checks compare within one source, never across ticks — coverage lesson noted.
 internal-list predicate guards the DDL trigger and the producer, but the boot
 schema publish remains the unclosed egress door (empty roster today, so no data
 leaked; the door itself is confirmed live). Still queued.
+→ Closed: `zebridge_user_tenants` is in `zebridge_is_internal_table` and exempt from every
+schema publish, the boot pass included (`event_processor.zig`, "publishes NO schema, ever").
 (3b) **A table born LIVE bypasses the routability refusal** — boot preflight
 refuses a non-routable table before streaming; a table created while the bridge
 runs skips that check, publishes into the void, and the bridge FATALs after
@@ -1740,6 +1761,8 @@ first response: first-sight relations need the same no_cdc_subject refusal at
 runtime. Found when livebirth.py's temp topology satisfied the bridge but not
 CDC_PUBLIC's subject filter — which is also the lesson that T4 has TWO halves:
 the topology file AND the stream's subjects.
+→ Closed: a first-sight relation with no route is refused at runtime with `no_cdc_subject`
+(`event_processor.zig`, the `isCdcRoutable` check before any publish).
 (4) `zebridge_enable`'s T3 note says "SYNC_RULES + restart" even when the version
 column is the global default and no restart is needed — conservative boilerplate;
 make it conditional someday.
@@ -2405,7 +2428,7 @@ one VPS (§0 elsewhere in this file), so that part is already small. It is plaus
 write/fsync time on the NATS side for a file-backed JetStream stream, which colocation does
 not shrink at all.
 
-Not yet built; **the measurement it was gated on now exists** (2026-08-24).
+Not yet built at the time of this paragraph — **BUILT 2026-08-24, see "BUILT and verified" below** (`PublishWindow`). The measurement it was gated on:
 `batch_publisher.timedPublish` times every publish→PubAck round trip: summed on
 `/metrics` as `bridge_nats_publish_ack_seconds_total` next to
 `bridge_nats_publishes_total` (mean = quotient, windows = scrape deltas), and
@@ -3400,7 +3423,7 @@ NOTICE` used `%s` where PL/pgSQL's placeholder is `%`, so it printed
 `TENANT_RULES=orderss:tenant_id` — the value followed by a literal `s`. A DBA copying that
 line would have configured a table that does not exist. Fixed.
 
-## 5. Client-side protocol (browser / WASM SQLite)
+## 5. Client-side protocol (any local engine)
 
 The bridge publishes schema-before-row, but KV and CDC are **independent
 subscriptions** in the client, so the row can still win locally. Observed live:
@@ -3442,7 +3465,7 @@ PG_PUBLISH_PORT=55432 docker compose -f docker-compose.full.yml --env-file .env.
 cd emitter && mix run --no-start -e 'path = Path.join([File.cwd!(), "priv","repo","migrations"]); \
   {:ok,_,_} = Ecto.Migrator.with_repo(Emitter.Producer.Repo, fn r -> Ecto.Migrator.run(r, path, :up, all: true) end)'
 
-set -a && source .env && set +a
+set -a && source .env.bridge && set +a   # §10aj: .env.admin / .env.bridge / .env.docker
 ./zig-out/bin/bridge --slot my_slot --pub my_pub --port 9090
 
 cd web-consumer && npm run dev     # http://localhost:5173
@@ -3571,16 +3594,13 @@ carry them:
 
 ## 8. Configuration Orphans
 
-The following constants in `src/config.zig` are declared but never referenced by any other `.zig` source file. They are effectively dead code:
-
-- **PostgreSQL (`Postgres`)**: `connection_timeout_ms`, `replication_receive_timeout_ms`, `wal_sender_timeout_seconds`, `max_wal_retention_gb`
-- **HTTP (`Http`)**: `metrics_path`, `health_path`
-- **WAL Monitoring (`WalMonitor`)**: `warning_threshold_bytes`, `critical_threshold_bytes`
-- **Snapshots (`Snapshot`)**: `max_concurrent_snapshots` (commented as declared/never read), `poll_interval_ms`
-- **Metrics (`Metrics`)**: `log_interval_seconds`, `debug_enabled`
-- **Retries (`Retry`)**: `flush_stall_timeout_ns`
-- **Threading (`Threading`)**: `wal_monitor_threads`, `snapshot_generator_threads`, `http_server_threads`, `main_loop_sleep_ms`
-- **Buffers (`Buffers`)**: `conninfo_buffer_size`, `url_buffer_size`
+Sixteen constants in `src/config.zig` were declared and read by nothing (`Postgres`
+timeouts and retention, `Http` paths, `WalMonitor` thresholds, `Metrics` logging,
+`Retry.flush_stall_timeout_ns`, the whole `Threading` struct, two `Buffers` sizes);
+three snapshot-era ones had already gone with §10p. Removed 2026-08-29 (§10bf) — the
+`Threading` struct with them, since nothing was left in it. Bridge tests 264/264 after.
+A constant nobody reads is a claim nobody checks; if a knob is needed, it comes back
+with its reader.
 
 ---
 
@@ -3590,7 +3610,7 @@ ZeBridge's runtime publisher is entirely dynamic and does **not** rely on the `t
 
 When migrating to a **JWT / Operator Authentication** model, multi-tenancy can be managed dynamically with zero config reloads or bridge restarts:
 
-1. **Backend provisions stream:** The application backend dynamically creates the `CDC_<TENANT>` and `INIT_<TENANT>` JetStream streams via the NATS API.
+1. **Backend provisions stream:** The application backend dynamically creates the `CDC_<TENANT>` JetStream stream via the NATS API (the `INIT_<TENANT>` streams went with snapshot-on-demand, §10p).
 2. **Backend mints JWT:** The backend embeds the exact tenant boundaries (`cdc.<tenant>.>`) into the short-lived NATS user JWT.
 3. **Link User in DB:** A new mapping is inserted into `zebridge_user_tenants`.
 
@@ -3622,7 +3642,7 @@ The consumer-code problem, named honestly: App.tsx is ~2700 lines, and the hard 
 
 **One Zig source, two artifacts.**
 
-- `applier.wasm` — the eater compiled `wasm32-freestanding`. Sans-I/O means NO
+- `applier.wasm` (dropped 2026-08-27, §10s — the core is TypeScript + a Zig port, no wasm artifact) — the eater compiled `wasm32-freestanding`. Sans-I/O means NO
   WASI: no sockets, clock, or fs imports, so it runs on any runtime including tiny interpreters. Hosts: browser (native), Node (same V8 bytes as the browser — zero deps), Go (`wazero`, pure Go, no cgo), Python/Ruby/Elixir (official wasmtime bindings). ABI: primitive byte-passing over linear memory; the Component Model/WIT is deliberately skipped until it settles — adopting it later changes no logic.
 - `libzb` — the eater + `nats.zig` + linked `sqlite3.c`, compiled natively
   (Zig cross-compiles `aarch64-ios`/`aarch64-android` out of the box; iOS forbids JIT, so native beats interpreted wasm there). The library OWNS the C ABI on the order of: `zb_connect(url, creds)`, `zb_query(sql)`, `zb_mutate(table, key, values)`, `zb_on_change(table, cb)`. Swift consumes the header directly, Dart via `dart:ffi`, Kotlin via JNI, Python `ctypes`, Ruby `fiddle`. Being a LIBRARY, not a process, makes the read-loop thread, reconnect policy and FFI memory ownership deliberate API surface — ordinary C-library discipline, designed once.
@@ -4032,7 +4052,7 @@ which is a STRONGER guarantee than ZeBridge offers today. Neither is a
 prerequisite for FKs working — they already do — so this is an improvement to
 sequence deliberately, not a hole to plug.
 
-## 10g. A stale snapshot can DESTROY a correct replica (2026-08-27, OPEN)
+## 10g. A stale snapshot can DESTROY a correct replica (2026-08-27, OPEN → closed by §10n)
 
 Found in a clean room while chasing a 3,000-row discrepancy. Not yet fully fixed —
 the guard added is partial, and the underlying gap is a design one.
@@ -4451,7 +4471,8 @@ Decided in review, recorded here so a session break loses nothing:
      opts out explicitly. Residual: psql deletes on READ-ONLY tombstone-less
      tables share the hole; candidate mitigation is a producer-forced FULL
      rebuild on seeing a DELETE event for such a table (caps resurrection at one
-     cadence). Not built.
+     cadence). Not built. → Built 2026-08-29 (§10bb): the producer forces a full when
+     the row count or `n_tup_del` moved since the last cutoff.
 
   3. **Cross-tenant FK is NOT forbiddable** (public parent, tenant child is the
      product's own shape) and mobile makes RECONNECTION THE COMMON PATH — which
@@ -4467,7 +4488,7 @@ Decided in review, recorded here so a session break loses nothing:
            (§10g residual) becomes mandatory. Clean-room the two §10j anomalies
            first (the chain-full row-count mismatch and the vanished cx users)
            per §10h's lesson: establish what ran before theorising.
-     After D1+D2: strip the legacy snapshot dependencies from the scenario suite
+     After D1+D2 (done, §10o): strip the legacy snapshot dependencies from the scenario suite
      (inventory in the 2026-08-27 discussion: snapshot.py, stampede.py, wide.py,
      decode_integrity.py, faults.py, plus lighter references in check.py,
      crosstenant.py, envcheck.py, leaksoak.py, objstore_race.py, tls.py,
@@ -4560,7 +4581,7 @@ three runs, `created (first sight)` 9 tables on run 1 and ZERO on reconnects,
 cache, never the truth. Any decision that destroys data must be grounded in
 what is physically in the database.
 
-**Still open — D2, now sharply scoped**: the destruction that remains is real
+**Still open — D2, now sharply scoped** (closed in §10n, the next section): the destruction that remains is real
 but narrow. A gap on one stream still re-seeds globally, and a chain-full apply
 is still `DELETE FROM` + insert, so a chain older than the replica's CDC-applied
 data still destroys the newer rows. Next: per-stream scoping + the per-table
@@ -5314,7 +5335,7 @@ templates end to end (25 functions, 4 event triggers, 7 tables) from
 `.env.admin` + `.env.bridge` + derivation; and the bridge boots flagless on
 `my_pub`/`my_slot` with replication started.
 
-⚠️ **Two things carried forward, both unverified here**: the Dockerfile now
+⚠️ **Two things carried forward, both unverified here** (verified the same day, §10ai/§10ao): the Dockerfile now
 installs `zstd-dev`/`zstd-libs` (the container build would otherwise fail on
 `zstd.h` since §10w — a bug shipped that day), and compose's five services were
 repointed to `.env.docker`. Neither could be exercised: Docker is not running,
@@ -5835,7 +5856,9 @@ reviewed twice. It is invisible in normal use — a fresh write is stamped `now`
 watermark is in the past — so it only bites a lagging clock or a first send made long
 after the write. Ported bugs are found by porting.
 
-**Not verified: the seed path in this environment.** `zb-demo`'s `gapAndSeed` fails
+**Not verified: the seed path in this environment** (verified 2026-08-29, §10bb — the
+`ArrayTooLarge` was a 2,000,000-row `users` full against zig_msgpack's 1,000,000-element
+cap, not the chain). `zb-demo`'s `gapAndSeed` fails
 with `MsgPackError.ArrayTooLarge` on a chain object, and the manifest explains why it
 is not worth chasing here: gen 14, full at gen 11, deltas at gen **9** — older than
 the full. That is a dev store that has accumulated across many sessions at a 20 s
@@ -5868,7 +5891,7 @@ Zig client is read-only today — it seeds and follows CDC. `Transport.publish` 
 `subscribeSync` exist as primitives and NOTHING calls them: there is no mutation
 builder, no outbox table, no flush. So the gate is a correct, conformance-tested
 function with no caller, waiting for the write path (the standing TODO in §10 client
-work). When that path is built, the call site is one line before the first publish,
+work — built the same day, §10av). When that path is built, the call site is one line before the first publish,
 exactly as in `zb-client-ts`'s `flushOutbox`.
 
 ## 10at. The outbox watermark gate, built (2026-08-28)
@@ -6997,6 +7020,88 @@ made: `encodeContent` emits a msgpack bool when `PQftype` is `bool` (OID 16); bo
 `chainRowParams` already pass a boolean through, now pinned by a fixture case (127 cases
 each). A fresh `test_types` full (g91) from the fixed producer seeds INTEGER 0/1 only.
 
+## 10be. The NOTES reread — what was left behind, and two of it closed (2026-08-29)
+
+The second half of the pause. Target: not history (NOTES keeps it) but claims that still
+READ as open when they were closed elsewhere, and promises nothing implements. Method:
+every "queued / not yet / unverified / TODO" marker traced to its resolution in the code
+or the stack, plus §1, §3–§9 and the §10 plan sections read in full. The ledger lives in
+the session scratchpad; what it changed:
+
+  * Fourteen notes annotated in place with "→ closed in §X" (the outbox watermark gate,
+    the object-store grant test, the width-guard trio, the `zebridge_user_tenants`
+    egress door, the first-sight routability refusal, the async publish window, D2,
+    the producer-forced full, the compose verification, the snapshot-era closures now
+    superseded by §10p). Four pieces of stale guidance fixed (§9's `INIT_<TENANT>`
+    step, §6's `source .env`, §1.1's opening, §5's heading).
+  * Still open, recorded here so they stop hiding: `$KV.tenants` on DELETE (§1.12);
+    libzb's C ABI has no query/mutate (§10's index card exists only in the demo/soak
+    binaries); libzb's live tailing and alter/rebuild path (§10v); the `catalog_epoch`
+    → CDC-routing roadmap (§10k, §11 still says "one restart"); §10ab's column
+    slicing; sixteen orphan constants in `config.zig` (§8; three snapshot ones are gone).
+
+**Closed 1 — libzb's HLC floor was half-built.** `seen_floor` was declared, read by
+`hlcVersion`, and never assigned (§10q says "BUILT" — for the TS client). Now fed from
+every applied CDC row's version column and from each chain's `cutoff_version`, in a
+fixed buffer like `last_version` (an arena dupe per row would be §10bb's lifetime bug
+again).
+
+**Closed 2 — no client collected a stored verdict.** PROTOCOL §2's reason for keeping
+`mutation_ack.>` in MUTATIONS is "an offline client collects the answers it missed" —
+and both clients used a core subscription; convergence came from the REPLAY earning a
+fresh verdict (a second PostgreSQL attempt, and past the duplicate window a `stale` for
+an accepted write). The design that fits the grants: not a consumer on MUTATIONS
+(`MSG.NEXT` cannot be scoped below the stream, so a principal could pull another's
+verdicts by guessing a consumer name) but one per-key DIRECT GET per pending outbox
+entry — `$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>`, the exact-key form
+`$KV.tenants` already uses. Built in both clients (`collectMissedVerdicts` /
+`settleVerdict`, before the watermark gate, before any replay), the grant added to the
+client signing key, PROTOCOL §7.1 MUST 7 and §7.4b. Proven twice, the same shape:
+bridge stopped, a write queued (MUTATIONS stores it, no verdict), the client parked,
+bridge started (verdict published to nobody), client back — "collected 1 verdict(s)
+published while this client was away — settled without replay", outbox 0, the bridge
+log holding exactly ONE verdict for that msg_id. TS in the browser, libzb via two
+`zb-demo` runs on one `ZB_KEEP_DB` replica.
+
+⚠️ **And the twenty minutes in between.** The grant was refused after a successful
+`kill -HUP` that logged "Reloaded: accounts". `nsc generate config --mem-resolver`
+rewrites `resolver.conf` — which the running server does not read: `nats-server-jwt.conf`
+carries its OWN inline `resolver_preload`, pasted from an earlier generation, so the
+reload re-read the old account JWT. Diagnosed by the difference in JWT length (5,492
+vs 5,618 bytes). The bootstrap now splices the fresh account JWTs into that file and
+says to reload; the client JWTs themselves never change (a scoped signing key's
+template lives in the ACCOUNT claim).
+
+## 10bf. Housekeeping: the orphan constants, and libzb's grammar made strict (2026-08-29)
+
+**Orphans (§8)** — sixteen `config.zig` constants declared and never read, removed
+along with the emptied `Threading` struct. Verified by grep across `src/` and `scripts/`
+before each deletion; the bridge's 264 tests pass after.
+
+**libzb's grammar.** `SyncClient` carried hardcoded defaults for every name in
+`grammar.json` (`"CDC_"`, `"CDC_PUBLIC"`, `"schemas"`, `"tenants"`, `"generations"`,
+`"gen-"`, `"_default"`, `"MUTATIONS"`) and `loadGrammar` overrode them only when the key
+was present — so a renamed stream or bucket in the file would have left this client
+watching a subject nobody publishes, with no error on either side (PROTOCOL §1's
+warning, exactly). Now every name is REQUIRED: `grammarString(root, path)` fails with
+`GrammarKeyMissing` naming the path (a unit test pins the three shapes: absent, wrong
+type, empty), and the struct fields are `undefined` until `loadGrammar` has run, which
+`init` does not return without.
+
+Two more literals were hardcoded in BOTH cores, not just the shell: the `mutation.` and
+`mutation_ack.` subject prefixes, which `grammar.json` names as
+`subjects.mutations_prefix` / `subjects.mutation_ack_prefix`. `core.buildMutation` /
+`mutationSubject` take an optional prefix (the fixtures keep the protocol default, so
+127/127 holds), and both shells pass the grammar's value; the three `mutation_ack.`
+sites in `libzb.ts` go through one `ackPrefix()`. Verified: a `zb-demo` write through
+the strict loader against the real `grammar.json` — queued, flushed, verdict settled.
+
+A side catch from the browser typecheck: the PGlite adapter's Node-persistence branch
+named `process` and imported `node:fs/promises`, which a browser tsconfig rejects even
+in dead branches. Detection now goes through `globalThis`, the import through a variable
+specifier; web-consumer's `tsc` is clean again and the Node consumer still resumes its
+persisted directory.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
@@ -7012,3 +7117,112 @@ The restart rules, as they stand today
 | New user on an existing tenant    | conf grant + SIGHUP only  |
 | DROP TABLE   | nothing for the bridge — but purge the four ghost sources (chain, descriptor, INIT chunks, CDC retention) or resh clients resurrect rows |
 | Generations on/off, tenant set growth    | nothing — the producer reads the catalogue and the data per tick |
+
+## 12. Host settings (the native dev stack, as running on 2026-08-29)
+
+The values the sessions of §10bb–§10be ran against, pasted rather than remembered.
+Everything here is a dev artifact — the seeds, passwords and JWT public keys are the
+ones `scripts/native/jwt-bootstrap.sh` and `up.sh` mint into the repo, not secrets.
+
+### Processes
+
+    postgres    /opt/homebrew/opt/postgresql@18/bin/pg_ctl -D $ROOT/postgres-data -p 5432   (PostgreSQL 18.6, Homebrew, aarch64)
+    nats-server nats-server -js -c scripts/native/nats-server-jwt.conf                     (v2.14.5; up.sh's default is nats-server.conf, the JWT conf is the one running)
+    bridge      env -i $(cat bridge.env) ./zig-out/bin/bridge                               (restarted with pid 470's exact env, log in the session scratchpad)
+    sweeper     ./zig-out/bin/bridge_sweeper                                                GC_THRESHOLD_MS=180000 GC_INTERVAL_MS=180000
+    vite        web-consumer: npm run dev → http://localhost:5173 (proxies /nats → ws://127.0.0.1:8080, /bridge → http://127.0.0.1:9090)
+
+### PostgreSQL
+
+`up.sh` PG_FLAGS (passed to `pg_ctl -o`):
+
+    -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+    -c max_slot_wal_keep_size=10GB -c wal_sender_timeout=300s
+    -c logical_decoding_work_mem=256MB -c wal_buffers=64MB
+    -c commit_delay=1000 -c commit_siblings=5
+
+Effective (`pg_settings`): port 5432, wal_level logical, max_replication_slots 10,
+max_wal_senders 10, max_slot_wal_keep_size 10 GB, wal_keep_size 0, shared_buffers 128 MB
+(16384 × 8 kB), max_connections 100, synchronous_commit on, log_min_duration_statement -1.
+`pg_hba.conf`: `trust` for local, 127.0.0.1/32 and ::1/128, for `all` and `replication`.
+
+    slot         my_slot (active, lag 20 kB at capture)
+    publication  my_pub: counter_public, counter_tenant, memo, note_t, orders, salaries,
+                 test_types, users, zebridge_ddl_events, zebridge_gc_watermark, zebridge_user_tenants
+    roles        postgres (repl, login) · bridge_reader (repl, login) · bridge_writer (login)
+    catalogue    tbl(tenant_col / version_col / tombstone_col / tiebreak_col)
+                 counter_public(public/updated_at/-/last_writer)   counter_tenant(tenant_id/updated_at/-/last_writer)
+                 memo(public/updated_at/-/-)                       note_t(tenant_id/updated_at/-/-)
+                 orders(public/updated_at/-/-)                     salaries(tenant_id/updated_at/-/-)
+                 test_types(tenant_id/updated_at/deleted_at/last_writer)
+                 users(public/updated_at/-/-)                      zebridge_gc_watermark(public/updated_at/-/-)
+
+### NATS (`scripts/native/nats-server-jwt.conf`, JWT bodies elided)
+
+    port: 4222
+    websocket { port: 8080, no_tls: true }
+    jetstream { store_dir: "/Users/nevendrean/code/zig/ZeBridge/nats-data" }   # absolute on purpose (comment in the file)
+    system_account: AAYJPIUUCTOGFQCMKESUEODXHJYO5BDHTJDPYFAN72VDRS7WV2TTJK56
+    resolver: MEMORY
+    resolver_preload: { SYS: <jwt>, ZEBRIDGE (ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L): <jwt> }
+    # ⚠️ this preload is a PASTED copy — see §10be: refresh it after any signing-key edit
+
+Operator `ZeBridgeOp`; account `ZEBRIDGE` with two scoped signing keys — service (`>`)
+and client (the per-principal template, §10be for the newest grant). Principals minted:
+bridge (service), alice:acme, bob:globex, mary:globex, nina:tango, omar:kilo (client,
+tenant tag), zbdoctor (identity-signed, read-only). Creds in `scripts/native/creds/`.
+
+Streams and buckets (`nats stream info`, at capture):
+
+    CDC_PUBLIC      subjects cdc.counter_public.> cdc.memo.> cdc.orders.> cdc.users.> cdc.zebridge_gc_watermark.> cdc._default.>
+                    limits · max_msgs 10M · max_bytes 1 GiB · max_age 8 d · file · discard old · dup 120 s · allow_direct off
+    CDC_kilo        subjects cdc.kilo.>      same limits as CDC_PUBLIC (one stream per tenant: acme, globex, tango, dynten too)
+    MUTATIONS       subjects mutation.> mutation_error.> mutation_ack.>
+                    limits · max_bytes 1 GiB · max_age 7 d · file · discard old · dup 120 s · allow_direct ON (verdict collection, §7.4b)
+    KV_schemas      history 10 · allow_direct · no age limit
+    KV_tenants      history 1  · allow_direct
+    KV_generations  history 1  · allow_direct
+    OBJ_gen-<tenant> object stores ($O.gen-<t>.C.> / .M.>), 128 KiB chunks, allow_direct
+
+### Bridge environment (`bridge.env`, the running process's, verbatim)
+
+    DATABASE_READER_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
+    DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
+    DATABASE_URL=postgres://bridge_reader:bridge_password_changeme@127.0.0.1:5432/postgres
+    PG_HOST=postgres-primary
+    PG_PORT=5432
+    PG_PUBLISH_PORT=55432
+    PG_DB=postgres
+    PG_USER=postgres
+    PG_PASSWORD=postgres_password
+    NATS_URL=nats://127.0.0.1:4222
+    NATS_CREDS=scripts/native/creds/bridge.creds
+    NATS_NKEY_SEED=SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q
+    NATS_BRIDGE_NKEY_PUB=UBZIPHB3HH2J7KJRV6MJVZVDEJA6CD5TYQ6E4K6YZEBWZC7OAHMWFER3
+    ZB_ACCOUNT_PUB=ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L
+    ZB_SIGNING_SEED=SAACCFKLDBPL7XF4J37NLV76GH7FJCRVQJZXPTY6WRRINQLYQFVUVMAC3Y
+    ZB_PROFILE=write
+    BRIDGE_CDC_PUBLICATION=my_pub
+    BRIDGE_CDC_SLOT=my_slot
+    BRIDGE_PORT=9090
+    BASE_BUF=12
+    RING_BUFFER_COUNT=4096
+    GENERATIONS_ENABLED=1
+    GENERATION_CADENCE_SECONDS=60
+    TENANT_RULES=test_types:tenant_id
+    SYNC_RULES=test_types:updated_at,deleted_at,last_writer
+    SNAP_RET_SECONDS=60
+    LOG_LEVEL=info
+    NATS_ALICE_PASSWORD=s3cret
+    NATS_BOB_PASSWORD=s3cret
+    NATS_JOHN_PASSWORD=s3cret
+    NATS_MARY_PASSWORD=s3cret
+    NATS_NINA_PASSWORD=s3cret
+
+Notes on that block: `PG_HOST=postgres-primary` / `PG_PUBLISH_PORT=55432` are the
+compose-era variables and are NOT what the bridge dials — `DATABASE_READER_URL` /
+`DATABASE_WRITER_URL` are (§10z); `SNAP_RET_SECONDS` is a snapshot-era leftover with no
+reader (§10p); `SYNC_RULES`/`TENANT_RULES` are overridden by `zebridge_catalogue` where a
+row exists (§10k). `RING_BUFFER_COUNT=4096` × `2^BASE_BUF=4096` B = 16 MiB of ring —
+the dev size, not §1.3's 32768.
+

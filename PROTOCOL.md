@@ -120,7 +120,7 @@ REQUESTS streams carried nothing else.
 
 | key | read by |
 | --- | --- |
-| `streams.mutations` | `nats-init` creates `MUTATIONS`; the bridge names it for its ingress consumer. `streams.cdc` is the pre-tenant name of the single CDC stream and is only echoed in the bridge's boot log — the CDC streams are named by `cdc_streams.*` |
+| `streams.*` | `nats-init` creates `MUTATIONS`; the bridge names it for its ingress consumer, and clients name it to collect stored verdicts (§7.4b). `streams.cdc` is the pre-tenant name of the single CDC stream: the bridge echoes it at boot, and a client falls back to it only when `cdc_streams` is absent |
 | `open_tenant` | bridge (routing for tenant-agnostic tables), clients (the shared subject/KV token) |
 | `cdc_streams.*` | bridge — at boot it creates any missing `CDC_<TENANT>` stream and sets `CDC_PUBLIC`'s subjects from the catalogue |
 | `subjects.cdc_prefix` | bridge (CDC subject), clients (subscription) |
@@ -170,9 +170,9 @@ mutation_ack.>      verdicts (§7.4b)  bridge → client
 
 ⚠️ **They share a stream so the verdicts are durable.** A verdict is an ordinary retained
 message, which is what lets a client that was offline collect the answers it missed —
-something a core-NATS reply, a `-NAK` or a JetStream advisory could not do (§7.4b).
-Confirmed against a running stack: `mutation_ack.*` subjects are stored in `MUTATIONS`
-alongside the writes.
+something a core-NATS reply, a `-NAK` or a JetStream advisory could not do. The
+collection itself is one per-key direct get per pending outbox entry (§7.4b), granted
+per principal; both reference clients do it before replaying anything.
 
 ⚠️ **They are separate subject spaces on purpose.** The bridge's ingress consumer filters
 on `mutation.>`, so publishing a verdict under that prefix would feed it back in as if it
@@ -834,9 +834,10 @@ guessing or embedding a build-time constant:
 tenant ← KV.tenants.get(<principal>)
 ```
 
-This reads `$KV.tenants.<principal>` — a single value, populated live by a trigger on
-`zebridge_user_tenants` (mirroring exactly how `$KV.schemas` is kept current from DDL,
-§1). **Resolved fresh on every connect, never cached client-side across sessions**: the
+This reads `$KV.tenants.<principal>` — a single value, populated live from
+`zebridge_user_tenants` over the WAL (mirroring exactly how `$KV.schemas` is kept current
+from DDL, §1): an INSERT or UPDATE writes the key, a DELETE purges it, so a revoked
+principal resolves to no mapping — the open tenant — on its next connect. **Resolved fresh on every connect, never cached client-side across sessions**: the
 bucket is what lets a tenant reassignment take effect without restarting anything. The
 NATS grant on this key is scoped to the client's own principal (`$KV.tenants.alice`,
 never a wildcard) — a leaked credential discloses only that principal's own tenant.
@@ -1225,6 +1226,12 @@ Two things follow, and they are the whole reason this section is long:
    `zebridge_gc_watermark`, which arrives over CDC like any other table (§7.5). A queued
    mutation older than the watermark cannot be applied safely — the tombstone that would
    have overruled it has been reaped (§7.5).
+
+7. **Collect the verdicts you missed before replaying anything.** A verdict is retained
+   on `mutation_ack.<principal>.<msg_id>`, and the outbox knows every `msg_id` it awaits:
+   one direct get, last-by-subject, per pending entry settles what was judged while the
+   client was away (§7.4b). Replaying first costs a second write attempt per entry and,
+   past the duplicate window, earns a `stale` for a write that was in fact accepted.
 
 **SHOULD**
 
@@ -1846,6 +1853,16 @@ reply published under it would be read back by the bridge as if it were a write.
 ⚠️ **`accepted`, `stale` and `row_deleted` are all successes at the SQL level**, and two of
 them are *zero rows affected*. The bridge tells them apart by reading the row's state in
 the same transaction as the write; a client cannot derive them and must not try.
+
+**Collecting a verdict you were not there for.** The reply is retained in `MUTATIONS`,
+so a client that reconnects asks for it by key — `$JS.API.DIRECT.GET.MUTATIONS.
+mutation_ack.<principal>.<msg_id>` (the same exact-key direct-get form as `$KV.tenants`)
+— for every entry still in its outbox, and settles each answer through the same handler
+as a live verdict; a 404 means not judged yet, or judged longer ago than the stream keeps,
+and the entry is replayed. The grant is `DIRECT.GET.MUTATIONS.mutation_ack.<principal>.>`,
+scoped to the principal's own replies. ⚠️ Not a JetStream consumer on `MUTATIONS`: a
+consumer's `MSG.NEXT` cannot be scoped below the stream, so one principal could pull
+another's verdicts by guessing a consumer name.
 
 ⚠️ **This is one reply per mutation**, so a write-heavy deployment carries roughly twice
 the ingress message count. That is the price of §7.1's "pop only on a definitive reply" —

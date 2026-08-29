@@ -57,14 +57,22 @@ pub const SyncClient = struct {
     st: storage.Storage,
     opts: Options,
 
-    // grammar
-    cdc_prefix: []const u8 = "CDC_",
-    cdc_public: []const u8 = "CDC_PUBLIC",
-    kv_schemas: []const u8 = "schemas",
-    kv_tenants: []const u8 = "tenants",
-    kv_generations: []const u8 = "generations",
-    gen_bucket_prefix: []const u8 = "gen-",
-    open_tenant: []const u8 = "_default",
+    // ── grammar.json, and ONLY grammar.json (PROTOCOL §1) ─────────────────────
+    // No defaults: every name below is REQUIRED by `loadGrammar`, which fails naming
+    // the missing key. A hardcoded fallback would let a renamed stream or bucket
+    // leave this client publishing into, or watching, a subject nobody else uses —
+    // with no error on either side. `undefined` until `loadGrammar` has run; `init`
+    // does not return without it.
+    cdc_prefix: []const u8 = undefined, // cdc_streams.tenant_prefix — the CDC_<tenant> STREAM prefix
+    cdc_public: []const u8 = undefined, // cdc_streams.public
+    kv_schemas: []const u8 = undefined, // kv.schemas
+    kv_tenants: []const u8 = undefined, // kv.tenants
+    kv_generations: []const u8 = undefined, // generations.kv
+    gen_bucket_prefix: []const u8 = undefined, // generations.bucket_prefix
+    open_tenant: []const u8 = undefined, // open_tenant
+    stream_mutations: []const u8 = undefined, // streams.mutations
+    subject_mutations_prefix: []const u8 = undefined, // subjects.mutations_prefix
+    subject_mutation_ack_prefix: []const u8 = undefined, // subjects.mutation_ack_prefix
 
     tenant: []const u8 = "",
     /// §10x dictionaries by object name — immutable, so the cache cannot go stale.
@@ -86,6 +94,7 @@ pub const SyncClient = struct {
     /// grow that arena for the life of the client (the pattern §1 of the review found
     /// in every loop entry point — the arena is a LIFETIME, not a convenience).
     seen_floor: []const u8 = "",
+    seen_floor_buf: [64]u8 = undefined,
     last_version: []const u8 = "",
     last_version_buf: [64]u8 = undefined,
     /// Held open across mutate/flush: a CORE subscription only delivers what arrives
@@ -175,20 +184,17 @@ pub const SyncClient = struct {
         const io = self.t.threaded.io();
         const bytes = try std.Io.Dir.cwd().readFileAlloc(io, self.opts.grammar_path, a, .limited(1 << 20));
         const g = try std.json.parseFromSlice(Value, a, bytes, .{});
-        const root = g.value.object;
-        if (root.get("cdc_streams")) |cs| {
-            if (cs.object.get("tenant_prefix")) |v| self.cdc_prefix = v.string;
-            if (cs.object.get("public")) |v| self.cdc_public = v.string;
-        }
-        if (root.get("kv")) |kv| {
-            if (kv.object.get("schemas")) |v| self.kv_schemas = v.string;
-            if (kv.object.get("tenants")) |v| self.kv_tenants = v.string;
-        }
-        if (root.get("generations")) |gen| {
-            if (gen.object.get("kv")) |v| self.kv_generations = v.string;
-            if (gen.object.get("bucket_prefix")) |v| self.gen_bucket_prefix = v.string;
-        }
-        if (root.get("open_tenant")) |v| self.open_tenant = v.string;
+        const root = g.value;
+        self.cdc_prefix = try grammarString(root, &.{ "cdc_streams", "tenant_prefix" });
+        self.cdc_public = try grammarString(root, &.{ "cdc_streams", "public" });
+        self.kv_schemas = try grammarString(root, &.{ "kv", "schemas" });
+        self.kv_tenants = try grammarString(root, &.{ "kv", "tenants" });
+        self.kv_generations = try grammarString(root, &.{ "generations", "kv" });
+        self.gen_bucket_prefix = try grammarString(root, &.{ "generations", "bucket_prefix" });
+        self.open_tenant = try grammarString(root, &.{"open_tenant"});
+        self.stream_mutations = try grammarString(root, &.{ "streams", "mutations" });
+        self.subject_mutations_prefix = try grammarString(root, &.{ "subjects", "mutations_prefix" });
+        self.subject_mutation_ack_prefix = try grammarString(root, &.{ "subjects", "mutation_ack_prefix" });
     }
 
     // ─── step 0: tenant (PROTOCOL §6 Step 0 — resolved, never guessed) ──────
@@ -464,6 +470,16 @@ pub const SyncClient = struct {
             st.seed_lsn = core.lsnToNumber(v.string);
         };
         const cv = if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "";
+        // The chain's cutoff is a version this replica has now seen (every seeded row is
+        // at or below it): feed the HLC floor, as the TS client does.
+        if (cv.len > 0) {
+            const norm = try core.normalizeVersion(a, try core.pgTsToWire(a, cv));
+            const floor = core.maxVersion(self.seen_floor, norm);
+            if (floor.ptr != self.seen_floor.ptr and floor.len <= self.seen_floor_buf.len) {
+                @memcpy(self.seen_floor_buf[0..floor.len], floor);
+                self.seen_floor = self.seen_floor_buf[0..floor.len];
+            }
+        }
         _ = try self.st.query(a,
             "INSERT INTO _zbz_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?) ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn",
             &.{ .{ .text = table }, .{ .text = cv }, .{ .integer = st.seed_lsn orelse 0 } });
@@ -602,6 +618,22 @@ pub const SyncClient = struct {
         defer ta.deinit();
         const taa = ta.allocator();
 
+        // ⚠️ The HLC floor (§7.2, NOTES §10q), fed from every arriving row's version
+        // column — OBSERVED remote versions, never our own stamps. This field was
+        // declared, read by `hlcVersion` and never written (found by the 2026-08-29
+        // NOTES reread): a lagging clock could stamp under a row this replica had
+        // already seen, the exact case the floor exists to prevent. A fixed buffer, not
+        // an arena dupe, for the same reason as `last_version`.
+        if (st.version_col) |vc| if (data.object.get(vc)) |sv| if (sv == .string) {
+            const wire = try core.pgTsToWire(taa, sv.string);
+            const norm = try core.normalizeVersion(taa, wire);
+            const floor = core.maxVersion(self.seen_floor, norm);
+            if (floor.ptr != self.seen_floor.ptr and floor.len <= self.seen_floor_buf.len) {
+                @memcpy(self.seen_floor_buf[0..floor.len], floor);
+                self.seen_floor = self.seen_floor_buf[0..floor.len];
+            }
+        };
+
         // A hard DELETE (tables without a tombstone column) and a soft delete (an
         // update that SETS the tombstone, §7.5) end the same way here: the row goes.
         if (std.mem.eql(u8, op, "DELETE") or tombstoned(st, data)) {
@@ -701,6 +733,7 @@ pub const SyncClient = struct {
         var pk_arr = std.json.Array.init(a);
         for (st.pk) |c| try pk_arr.append(.{ .string = c });
         try args.put(a, "pkCols", .{ .array = pk_arr });
+        try args.put(a, "mutationsPrefix", .{ .string = self.subject_mutations_prefix });
 
         const env = try core.buildMutation(a, .{ .object = args });
         const subject = env.object.get("subject").?.string;
@@ -779,8 +812,24 @@ pub const SyncClient = struct {
         var sent: usize = 0;
         var failed: usize = 0;
         var last_err: ?anyerror = null;
+        var collected: usize = 0;
         for (rows) |r| {
             const msg_id = if (r[0] == .text) r[0].text else continue;
+            // The verdicts this client MISSED (PROTOCOL §7.4b): one per-key direct get per
+            // pending entry, settled through the same handler `drainVerdicts` uses. Until
+            // 2026-08-29 nothing read a stored verdict — the replay earned a fresh one,
+            // at the cost of a second PostgreSQL attempt and, past the duplicate window,
+            // a `stale` for a write that had been accepted.
+            if (!refused.contains(msg_id)) {
+                const ack_subject = try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ self.subject_mutation_ack_prefix, self.opts.principal, msg_id });
+                if (self.t.lastBySubject(self.stream_mutations, ack_subject) catch null) |vm| {
+                    defer vm.deinit();
+                    if (try self.settleVerdict(a, msg_id, vm.data)) {
+                        collected += 1;
+                        continue;
+                    }
+                }
+            }
             if (refused.contains(msg_id)) {
                 // Exactly a `rejected` verdict's handling, because that is what it is:
                 // this write will never be sent, so the optimistic copy is a
@@ -805,8 +854,28 @@ pub const SyncClient = struct {
             };
             sent += 1;
         }
+        if (collected > 0) std.debug.print("outbox: collected {d} verdict(s) published while this client was away — settled without replay\n", .{collected});
         if (sent == 0 and failed > 0) return last_err.?;
         return sent;
+    }
+
+    /// One verdict, live or collected: true when definitive (the outbox entry is
+    /// settled one way or another), false for `failed` (kept for retry).
+    fn settleVerdict(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, data: []const u8) !bool {
+        const v = parseStoredJson(a, data) catch return false;
+        const status = if (v == .object) (if (v.object.get("status")) |x| (if (x == .string) x.string else "") else "") else "";
+        if (std.mem.eql(u8, status, "failed")) return false;
+        if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
+            const rows = try self.st.query(a,
+                "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?",
+                &.{.{ .text = mid }});
+            if (rows.len == 1) try self.revertOptimistic(a, rows[0]);
+        }
+        // `stale` deliberately does NOT revert: the authoritative row is already on its
+        // way over CDC, and restoring a before-image could undo a newer value that has
+        // since been applied. Dropping the entry is the whole correction.
+        _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        return true;
     }
 
     /// Pop entries whose fate is settled. `applied` is confirmation; `rejected` and
@@ -822,7 +891,7 @@ pub const SyncClient = struct {
     /// follow-up; this is correct for a client that stays connected.
     pub fn subscribeVerdicts(self: *SyncClient) !void {
         if (self.verdicts != null) return;
-        const subject = try std.fmt.allocPrint(self.aa(), "mutation_ack.{s}.>", .{self.opts.principal});
+        const subject = try std.fmt.allocPrint(self.aa(), "{s}.{s}.>", .{ self.subject_mutation_ack_prefix, self.opts.principal });
         self.verdicts = try self.t.subscribeSync(subject);
     }
 
@@ -872,29 +941,10 @@ pub const SyncClient = struct {
             if (mid.len == 0) continue;
 
             // ⚠️ JSON, not msgpack. CDC and mutations are msgpack; a verdict is JSON —
-            // it is read by humans and by `nats sub` as often as by a client.
-            const v = parseStoredJson(a, msg.data) catch continue;
-            const status = if (v == .object) (if (v.object.get("status")) |x| (if (x == .string) x.string else "") else "") else "";
-
-            // The wire names are the bridge's (`wireName()` plus the two error paths):
-            //   accepted     applied — the write landed
-            //   stale        it lost LWW; PostgreSQL holds something newer
-            //   row_deleted  the row is gone server-side
-            //   rejected     refused permanently
-            //   failed       past the delivery limit but retryable — stays QUEUED
-            if (std.mem.eql(u8, status, "failed")) continue;
-            if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
-                const rows = try self.st.query(a,
-                    "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?",
-                    &.{.{ .text = mid }});
-                if (rows.len == 1) try self.revertOptimistic(a, rows[0]);
-            }
-            // `stale` deliberately does NOT revert: the authoritative row is already on
-            // its way over CDC, and restoring a before-image could undo a newer value
-            // that has since been applied. Dropping the entry is the whole correction.
-
-            _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
-            settled += 1;
+            // it is read by humans and by `nats sub` as often as by a client. The wire
+            // names are the bridge's: accepted / stale / row_deleted / rejected settle
+            // the entry (the last two revert the optimistic copy); `failed` stays queued.
+            if (try self.settleVerdict(a, mid, msg.data)) settled += 1;
         }
         return settled;
     }
@@ -990,6 +1040,39 @@ pub const SyncClient = struct {
         return rows[0][0].integer;
     }
 };
+
+/// One required string from grammar.json, by path. The error names the key, because
+/// "which name did the file forget" is the whole diagnostic.
+fn grammarString(root: Value, path: []const []const u8) ![]const u8 {
+    var cur = root;
+    for (path) |key| {
+        if (cur != .object) return grammarMissing(path);
+        cur = cur.object.get(key) orelse return grammarMissing(path);
+    }
+    if (cur != .string or cur.string.len == 0) return grammarMissing(path);
+    return cur.string;
+}
+
+fn grammarMissing(path: []const []const u8) error{GrammarKeyMissing} {
+    std.debug.print("grammar.json: required key missing or not a string: ", .{});
+    for (path, 0..) |k, i| std.debug.print("{s}{s}", .{ if (i > 0) "." else "", k });
+    std.debug.print("\n", .{});
+    return error.GrammarKeyMissing;
+}
+
+test "grammar: a missing key fails naming its path, never a silent default" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const ok = try std.json.parseFromSlice(Value, a, \\{"kv":{"schemas":"schemas"}}
+    , .{});
+    try std.testing.expectEqualStrings("schemas", try grammarString(ok.value, &.{ "kv", "schemas" }));
+    try std.testing.expectError(error.GrammarKeyMissing, grammarString(ok.value, &.{ "kv", "tenants" }));
+    try std.testing.expectError(error.GrammarKeyMissing, grammarString(ok.value, &.{"open_tenant"}));
+    const empty = try std.json.parseFromSlice(Value, a, \\{"open_tenant":""}
+    , .{});
+    try std.testing.expectError(error.GrammarKeyMissing, grammarString(empty.value, &.{"open_tenant"}));
+}
 
 // ─── conversions ────────────────────────────────────────────────────────────
 

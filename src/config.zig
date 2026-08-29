@@ -13,18 +13,6 @@ pub const Postgres = struct {
     // No default_slot_name / default_publication_name on purpose: a default here
     // is a guess about which tables to replicate and whose WAL position to keep.
     // `parseArgs` requires --slot/--pub or their env vars and refuses without them.
-    pub const connection_timeout_ms = 5000; // milliseconds
-
-    /// Replication connection receive timeout (milliseconds)
-    /// Set to 0 for blocking mode
-    pub const replication_receive_timeout_ms = 0;
-
-    /// WAL sender timeout (PostgreSQL server-side, configured in docker-compose.yml)
-    /// This is just for documentation - actual value set in PostgreSQL config
-    pub const wal_sender_timeout_seconds = 300; // 5 minutes
-
-    /// Maximum WAL retention size (10GB)
-    pub const max_wal_retention_gb = 10;
 
     /// TCP keepalives on every libpq connection.
     ///
@@ -281,11 +269,6 @@ pub const Http = struct {
     /// INADDR_ANY, so the declared default and the actual bind disagreed silently.
     pub const default_bind = "127.0.0.1";
 
-    /// Metrics endpoint path
-    pub const metrics_path = "/metrics";
-
-    /// Health check endpoint path
-    pub const health_path = "/health";
 };
 
 /// Batch publishing configuration
@@ -343,11 +326,6 @@ pub const WalMonitor = struct {
     /// Default check interval (seconds)
     pub const default_check_interval_seconds = 30;
 
-    /// Warning threshold for WAL lag (bytes)
-    pub const warning_threshold_bytes = 512 * 1024 * 1024; // 512MB
-
-    /// Critical threshold for WAL lag (bytes)
-    pub const critical_threshold_bytes = 1024 * 1024 * 1024; // 1GB
 };
 
 pub const Bridge = struct {
@@ -419,12 +397,7 @@ pub const Sync = struct {
 
 /// Logging and metrics configuration
 pub const Metrics = struct {
-    /// Metric log interval (seconds)
-    /// How often to emit structured metric logs for observability
-    pub const log_interval_seconds = 60;
 
-    /// Enable debug logging
-    pub const debug_enabled = false;
     pub const metric_log_interval_seconds = 15;
 };
 
@@ -495,21 +468,6 @@ pub const Retry = struct {
     /// thread has died. Internal tuning, not worth exposing.
     pub const spins_before_fatal_check = 1_000;
 
-    /// Hard ceiling on a stalled flush thread before declaring the NATS client
-    /// hung and forcing shutdown (nanoseconds).
-    pub const flush_stall_timeout_ns = 30 * std.time.ns_per_s;
-};
-
-/// Threading configuration
-pub const Threading = struct {
-    /// Number of WAL monitor threads
-    pub const wal_monitor_threads = 1;
-
-    /// Number of HTTP server threads
-    pub const http_server_threads = 1;
-
-    /// Main loop sleep interval when idle (milliseconds)
-    pub const main_loop_sleep_ms = 1;
 };
 
 /// Buffer sizes
@@ -519,12 +477,6 @@ pub const Buffers = struct {
 
     /// Message ID buffer size
     pub const msg_id_buffer_size = 128;
-
-    /// Connection string buffer size
-    pub const conninfo_buffer_size = 512;
-
-    /// URL buffer size
-    pub const url_buffer_size = 256;
 
     /// Event data buffer size (per-event packed column storage), as log2 bytes.
     /// Configurable via BASE_BUF: BASE_BUF=16 → 64KB, 14 → 16KB.

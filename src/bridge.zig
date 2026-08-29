@@ -1413,17 +1413,24 @@ pub fn main(init: std.process.Init) !void {
                                     // Pruning old rows produces DELETEs that must never surface as
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_del;
-                                    // ⚠️ A revoked mapping (DELETE FROM zebridge_user_tenants)
-                                    // is a known, deliberately deferred gap: this leaves
-                                    // the principal's $KV.tenants entry stale rather than
-                                    // purging or tombstoning it, so a revoked principal
-                                    // keeps resolving its old tenant until something else
-                                    // overwrites that key. Handling it correctly needs a
-                                    // tombstone convention on this bucket (mirroring
-                                    // packDdlToSlot's DROP TABLE case) plus matching
-                                    // client-side handling in resolveTenant() — deferred,
-                                    // not silently ignored.
-                                    if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) break :blk_del;
+                                    // A revoked mapping (DELETE FROM zebridge_user_tenants):
+                                    // purge the principal's $KV.tenants key, so the next
+                                    // resolveTenant() reads "no mapping" → the open tenant,
+                                    // the same state a principal with no row has. No client
+                                    // change needed: both already treat an absent key that
+                                    // way. Never a cdc.zebridge_user_tenants.* event either.
+                                    // The DELETE carries the key columns (REPLICA IDENTITY
+                                    // DEFAULT, PK = principal) — enough to name the key.
+                                    if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) {
+                                        if (pgoutput.decodeTuple(arena_allocator, del.old_tuple, rel.columns, event_proc.types)) |cols| {
+                                            for (cols.items) |col| {
+                                                if (std.mem.eql(u8, col.name, "principal") and col.value == .text) {
+                                                    event_proc.purgeTenantKey(col.value.text);
+                                                }
+                                            }
+                                        } else |err| log.warn("revoked tenant mapping: could not decode the key: {s}", .{@errorName(err)});
+                                        break :blk_del;
+                                    }
                                     if (event_proc.refused.shouldDrop(rel.name)) break :blk_del;
 
                                     // ── The sweeper's reaps are not client data ──────────

@@ -42,7 +42,10 @@ export type PgliteStorageOptions = {
   dataDir?: string;
 };
 
-const isNode = typeof process !== 'undefined' && !!(process as any).versions?.node && typeof indexedDB === 'undefined';
+// Detected without naming `process`: this file is compiled by browser hosts whose
+// tsconfig has no Node types, and a `process` reference there is a type error even
+// when the branch never runs.
+const isNode = typeof (globalThis as any).process?.versions?.node === 'string' && typeof (globalThis as any).indexedDB === 'undefined';
 
 export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFactory {
   return (dbName) => {
@@ -88,13 +91,16 @@ export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFacto
         // PGlite keeps under `/pglite/<name>` (browser) or the data directory
         // (Node) — best effort, the way sqlocal's deleteDatabaseFile is.
         if (opts.persist && isNode) {
-          const fs = await import('node:fs/promises');
+          // A variable specifier keeps browser bundlers and browser tsconfigs from
+          // resolving a Node-only module they cannot see.
+          const spec = 'node:fs/promises';
+          const fs = await import(/* @vite-ignore */ spec);
           await fs.rm(nodeDir, { recursive: true, force: true }).catch(() => {});
           return;
         }
-        if (opts.persist && typeof indexedDB !== 'undefined') {
+        if (opts.persist && typeof (globalThis as any).indexedDB !== 'undefined') {
           await new Promise<void>((resolve) => {
-            const req = indexedDB.deleteDatabase(idbName);
+            const req = (globalThis as any).indexedDB.deleteDatabase(idbName);
             req.onsuccess = req.onerror = req.onblocked = () => resolve();
           });
         }

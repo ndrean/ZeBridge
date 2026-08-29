@@ -844,6 +844,25 @@ pub const EventProcessor = struct {
     /// ⚠️ Purging CDC retention is deliberate data loss for OFFLINE clients: they
     /// reconnect to the tombstone and drop the table anyway — the retained rows
     /// could only ever have been ghosts.
+    /// A revoked mapping — `DELETE FROM zebridge_user_tenants` — purges the principal's
+    /// `$KV.tenants.<principal>` key, so the next `resolveTenant()` reads "no mapping"
+    /// and lands on the open tenant, exactly the state a principal with no row has.
+    /// Direct KV API rather than the ring slot: a KV delete is a header
+    /// (`KV-Operation: PURGE`) on an empty message, and the slot path carries neither.
+    /// Advisory like every broker housekeeping step: a failure logs, the WAL path goes
+    /// on, and the stale key is at worst what it was before 2026-08-29 (NOTES §1.12).
+    pub fn purgeTenantKey(self: *EventProcessor, principal: []const u8) void {
+        const publ = self.publisher orelse return;
+        const js = if (publ.js) |*j| j else return;
+        if (js.kvBucket(self.topology.kv_tenants)) |kv_const| {
+            var kv = kv_const;
+            defer kv.deinit();
+            if (kv.purge(principal, .{})) |_| {
+                log.info("🧹 $KV.{s}.{s} purged — mapping revoked", .{ self.topology.kv_tenants, principal });
+            } else |err| log.warn("🧹 $KV.{s}.{s}: purge failed: {s} — the stale mapping stands", .{ self.topology.kv_tenants, principal, @errorName(err) });
+        } else |err| log.warn("🧹 tenants bucket unreachable for a revoked mapping ({s}): {s}", .{ principal, @errorName(err) });
+    }
+
     fn pruneDroppedTable(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8) void {
         const publ = self.publisher orelse return;
         const js = if (publ.js) |*j| j else return;

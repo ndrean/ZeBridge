@@ -111,6 +111,16 @@ pub const Transport = struct {
         res.deinit();
     }
 
+    /// The last retained message on one subject, by direct get — or null when the
+    /// stream holds none. The per-key form is what the client JWT grants
+    /// (`DIRECT.GET.<stream>.<subject>`), as for `$KV.tenants`.
+    pub fn lastBySubject(self: *Transport, stream: []const u8, subject: []const u8) !?*nats.Message {
+        return self.js.getMsg(stream, .{ .last_by_subj = subject, .direct = true }) catch |err| switch (err) {
+            error.MessageNotFound => null,
+            else => err,
+        };
+    }
+
     /// Core subscription (the verdict channel `mutation_ack.<principal>.>`).
     pub fn subscribeSync(self: *Transport, subject: []const u8) !*nats.Subscription {
         return self.conn.subscribeSync(subject);

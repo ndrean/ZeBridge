@@ -587,7 +587,10 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
     try optimistic.put(a, "optimistic", .{ .bool = true });
 
     var out: std.json.ObjectMap = .empty;
-    try out.put(a, "subject", .{ .string = try std.fmt.allocPrint(a, "mutation.{s}.{s}.{s}", .{ principal, table, op_lower }) });
+    // The subject prefix is grammar.json's `subjects.mutations_prefix`; the shell passes
+    // it as `mutationsPrefix`. Absent (the fixtures) → the protocol default.
+    const prefix = getStr(args, "mutationsPrefix") orelse "mutation";
+    try out.put(a, "subject", .{ .string = try std.fmt.allocPrint(a, "{s}.{s}.{s}.{s}", .{ prefix, principal, table, op_lower }) });
     try out.put(a, "msgId", .{ .string = try subjectSafeToken(a, try std.fmt.allocPrint(a, "{s}-{s}-{s}-{s}", .{ client_id, table, id.items, version })) });
     try out.put(a, "id", .{ .string = id.items });
     try out.put(a, "payload", .{ .object = payload });
