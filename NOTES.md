@@ -7155,8 +7155,98 @@ stderr from a test step, and §10bf's grammar test provokes `grammarMissing`, wh
 prints. It predates today (checked on a stash). The print is now skipped under
 `builtin.is_test`; the error, and the test, are unchanged.
 
-Still open after this: libzb's live tailing and the alter/rebuild path (§10v);
-`catalog_epoch` → CDC routing (§10k); §10ab's column slicing.
+Still open after this: libzb's live tailing (closed in §10bh) and the alter/rebuild
+path (§10v); `catalog_epoch` → CDC routing (§10k); §10ab's column slicing.
+
+## 10bh. libzb live tailing — the host-driven `zb_client_poll` (2026-08-29)
+
+§10bg left the Zig client pull-driven: nothing arrived unless a host called
+`zb_client_sync`, and every sync on an idle stream cost the 900 ms empty-fetch wait
+per stream — ~1.8 s of pure waiting for public + tenant. The choice was between libzb
+owning a thread (and a lock around `Storage`) and the host owning it. The host owns
+it: `zb_client_poll(h, wait_ms)` blocks the calling thread up to `wait_ms`, returns as
+soon as a CDC batch was applied, and a host loop is `while running: poll(h, 1000)`.
+The C-ABI-honest shape: a Python, Dart or .NET host wraps it in its own event loop;
+libzb stays single-threaded and needs no lock it does not have.
+
+**What poll is.** One persistent pull consumer per CDC stream (`tails`), opened on
+first use at `stored_seq + 1`, kept across calls, released in `releaseHandles` with the
+rest. Each poll round-robins the streams in 250 ms slices until the deadline, applies
+through the same `applyBatch` the bounded drain uses (gate → apply → hold → position,
+D1 unchanged), runs the FK-held retry once anything landed, then sweeps verdicts with
+a 1 ms per-message wait so a poll with nothing pending costs a millisecond there, not
+`drainVerdicts`' 250 ms. `sync` keeps its bounded drain for catch-up; `poll` is the
+tail.
+
+**Two measurements that shaped it.** (1) The first version fetched 100 with the full
+wait: the row was applied at once and the poll still returned at 3006 ms of a 3000 ms
+budget. nats.zig's `fetch(n, t)` ends on a full batch or a status frame, so a pull for
+100 with one message queued parks on the server until `t`. Now: a batch of ONE with
+the wait, which returns the moment anything arrives, then batches of 100 with a 50 ms
+expiry to sweep what was queued behind it. (2) A sequential split of the wait across
+streams made a busy `CDC_kilo` wait out `CDC_PUBLIC`'s whole idle share first — 1555 ms
+on a 3000 ms poll. Slices bound it at 250 ms; the idle price is one short pull per
+stream per slice, each expired before the next is issued, so nothing parks up.
+
+**A reaped consumer looks like an idle one.** The tail consumers carry a 120 s
+`inactive_threshold` (the JWT has no consumer-delete grant, §10bb — the server reaps
+them). A fetch against a reaped consumer answers a 503 that nats.zig folds into a
+plain Timeout — indistinguishable from idle on the wire. So `tailFor` keeps
+`last_fetch_ms` and re-opens the consumer at the stored position when the host has not
+polled for longer than the threshold. The clock tells them apart; the wire cannot.
+
+**Proof — `libzb/python/tail.py`** against the native stack as omar: an idle poll of
+600 ms costs 603 ms and applies nothing; an INSERT done from OUTSIDE the client (psql)
+is in the replica after one poll, 306 ms end to end; an outside UPDATE 304 ms on a
+3000 ms budget; the client's own DELETE with `flush(0)` (no wait) settles through
+poll's verdict sweep and the row is gone locally while PostgreSQL shows it
+soft-deleted — the tombstone rule, both sides. 200 idle polls: RSS +80 KiB, 22 ms per
+20 ms poll. Conformance 127/127, `index_card.py` still PASS.
+
+**Two tripwires in the test itself, kept.** `test_types.inserted_at/updated_at` are NOT
+NULL — a psql INSERT must supply them (the client's `mutate` does; a raw SQL write does
+not). And a soft-deleted row keeps its uid, so a re-run with a fixed uid collides —
+the test mints a uuid per run.
+
+**Same day, the nats.zig side (`nats.zig-fetch-early-return-503.patch`, nats.zig/NOTES.md).**
+Two of the workarounds above were nats.zig's to remove, so they were removed there:
+`fetch` now returns as soon as it has its first message plus a 10 ms idle window
+(nats.go's legacy `Fetch`), and a 503 on the pull subject surfaces as
+`error.NoResponders`. Measured in nats.zig's own e2e suite, pre-patch vs patched:
+fetch(100) with one queued message 2002 ms → 11 ms; fetch on a deleted consumer
+2002 ms + `Timeout` → 0 ms + `NoResponders`. 182/182 e2e, 132/132 unit.
+
+A third thing surfaced while writing those tests: `fetch` reported the expiry as an
+EMPTY BATCH with `err = Timeout` — the async `jetstream.MessageBatch` shape on a
+synchronous call — so every `catch error.Timeout` in libzb was dead code and the
+length check was the real "caught up" test. The patch adopts the legacy contract
+outright: an empty batch with a terminal status is a RETURNED error, a partial batch
+is a success. `poll` is now one `fetch(100, slice)` per stream per turn; `Timeout`
+continues, `NoResponders` re-opens the tail at the stored position (`reopenTail`) —
+the `last_fetch_ms` clock is gone. The bridge's own call site
+(`mutation_listener.zig`) already treated a returned error like an empty batch.
+
+Still open: the alter/rebuild path (§10v); `catalog_epoch` → CDC routing (§10k);
+§10ab's column slicing.
+
+**The shared inbox, and what alternating actually cost.** nats.zig gained `PullInbox`
+(`nats.zig-shared-pull-inbox.patch`): one inbox, several pull consumers, one wait, a
+consumer that disappears reported per consumer (`gone[i]`). The plan was to keep the
+250 ms alternation for two streams and switch at ten. Measuring first changed that:
+`libzb/python/bench_poll.py`, 20 outside UPDATEs, psql-return → poll-return:
+
+    alternating (250 ms slices)   min 264  p50 265  p90 266  max 266 ms
+    shared inbox                  min  13  p50  13  p90  13  max  14 ms
+
+Not the 0–250 ms spread the slice model predicts, but a FIXED 265 ± 1: the write
+always lands on `CDC_<tenant>`, every poll began with `CDC_PUBLIC`'s full idle slice,
+so every row waited one whole slice. Two streams were already the bad case. `poll` is
+now one `PullInbox.fetch` over all tails for the whole `wait_ms` — no slices, one
+pull per stream per wait when idle (5 polls of 1000 ms in 5 s, same as before),
+messages grouped per stream for the positioned applier, a `gone[i]` tail re-opened
+alone at its stored position, all gone (`NoResponders`) re-opened together.
+`tail.py`: outside INSERT and UPDATE both in the replica 13 ms after psql returned.
+The Zig client is still single-threaded and host-driven; only the wait changed shape.
 
 ## 11 Restart Rules
 

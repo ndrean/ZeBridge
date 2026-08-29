@@ -6,7 +6,7 @@ Drives the C ABI exactly as a host binding would — ctypes, five declarations, 
 and out — against the native stack as `omar`. Asserts the write round-trips into the
 read-only connection, and that a write THROUGH that connection is refused.
 """
-import ctypes, json, os, sys, time
+import ctypes, json, os, sys, time, uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 lib = ctypes.CDLL(os.path.join(ROOT, "zig-out", "lib", "libzbcore.dylib"))
@@ -63,7 +63,7 @@ try:
     refused = query(h, "DELETE FROM test_types")
     check("a write THROUGH the app connection is refused (read-only)", "error" in refused)
 
-    uid = "00000000-0000-4000-8000-0000000000c1"
+    uid = str(uuid.uuid4())  # fresh per run: a fixed uid is soft-deleted by the previous run, and an INSERT onto a tombstoned row echoes as deleted
     now = time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())
     m = take(lib.zb_client_mutate(h, b"test_types", b"INSERT", json.dumps({"uid": uid}).encode(), json.dumps({
         "uid": uid, "some_text": "written by the python index card", "age": 7, "is_true": True,

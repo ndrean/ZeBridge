@@ -1,0 +1,272 @@
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -446,18 +446,30 @@
+     fetch_id_counter: u64 = 0,
+     /// Mutex for fiber safety
+     mutex: xsync.Mutex = .init,
++    /// False when `inbox_subscription`/`inbox_prefix` belong to a shared `PullInbox`.
++    owns_inbox: bool = true,
+ 
+     pub fn deinit(self: *PullSubscription) void {
+         if (self.owns_stream_name) self.js.nc.allocator.free(self.stream_name);
+         self.consumer_info.deinit();
+-        self.inbox_subscription.deinit(); // This will unsubscribe and release the user reference
+-        self.js.nc.allocator.free(self.inbox_prefix);
++        if (self.owns_inbox) {
++            self.inbox_subscription.deinit(); // This will unsubscribe and release the user reference
++            self.js.nc.allocator.free(self.inbox_prefix);
++        }
+         self.js.nc.allocator.destroy(self);
++    }
++
++    /// The pull API subject for this consumer, allocated from `a`.
++    fn nextSubject(self: *PullSubscription, a: std.mem.Allocator) ![]u8 {
++        return std.fmt.allocPrint(a, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.stream_name, self.consumer_name });
+     }
+ 
+     /// Fetch a batch of messages from the pull consumer
+     pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
+         if (batch == 0) return error.InvalidBatchSize;
++        // A shared inbox is read by `PullInbox.fetch` only: reading it here would
++        // consume the other consumers' replies.
++        if (!self.owns_inbox) return error.SharedInbox;
+ 
+         try self.mutex.lock(self.js.nc.io);
+         defer self.mutex.unlock(self.js.nc.io);
+@@ -627,9 +639,162 @@
+             .err = null,
+             .allocator = self.js.nc.allocator,
+         };
++    }
++};
++
++/// What `PullInbox.fetch` returns: messages from ANY of the consumers asked (each
++/// says which via `metadata.stream` / `metadata.consumer`), and per consumer whether
++/// nobody served it (`gone[i]`: a 503 — deleted, reaped, never created). A partial
++/// failure is the normal case here, which is why it is a field and not an error: one
++/// consumer of ten going away must not hide the nine that answered.
++pub const MultiBatch = struct {
++    allocator: std.mem.Allocator,
++    messages: []*JetStreamMessage,
++    /// Indexed like the `subs` slice given to `fetch`.
++    gone: []bool,
++
++    pub fn deinit(self: *MultiBatch) void {
++        for (self.messages) |m| m.deinit();
++        self.allocator.free(self.messages);
++        self.allocator.free(self.gone);
+     }
+ };
++
++/// One inbox, several pull consumers, ONE wait.
++///
++/// A `PullSubscription` owns a private wildcard inbox, so a client tailing N streams
++/// can block on one consumer at a time and must alternate between them in slices —
++/// measured in ZeBridge's libzb: two streams, 250 ms slices, a busy stream waits out
++/// the idle one's slice. With a shared inbox every consumer answers into the same
++/// subscription; `fetch` issues one pull per consumer and then waits on the single
++/// queue, so the first message from ANY of them ends the wait.
++///
++/// Attribution is what makes this safe: a status frame (404/408/503) is addressed to
++/// the reply subject of the pull it answers, and a data message carries its stream
++/// and consumer in its ack subject (`metadata`). Replies to an EARLIER fetch — a
++/// parked pull that expired after we returned, or its late messages — are therefore
++/// either dropped (stale status) or delivered to the right consumer anyway (data).
++///
++/// Create with `JetStream.pullInbox`; pass to `pullSubscribe` as `.inbox`. Not
++/// fiber-safe across concurrent `fetch` calls (one waiter per inbox, by design).
++pub const PullInbox = struct {
++    js: JetStream,
++    inbox_subscription: *Subscription,
++    inbox_prefix: []u8,
++    fetch_id_counter: u64 = 0,
++    mutex: xsync.Mutex = .init,
+ 
++    pub fn deinit(self: *PullInbox) void {
++        self.inbox_subscription.deinit();
++        self.js.nc.allocator.free(self.inbox_prefix);
++        self.js.nc.allocator.destroy(self);
++    }
++
++    /// Pull up to `batch` messages from EACH of `subs` (all on this inbox), waiting
++    /// at most `timeout` for the first message from any of them, then a short idle
++    /// window for what is in flight. Returns `error.NoResponders` only when EVERY
++    /// consumer answered 503; otherwise a `MultiBatch`, possibly with no messages
++    /// (the expiry), whose `gone` says which consumers need re-creating.
++    pub fn fetch(self: *PullInbox, subs: []const *PullSubscription, batch: usize, timeout: Io.Timeout) !MultiBatch {
++        if (batch == 0) return error.InvalidBatchSize;
++        if (subs.len == 0) return error.NoSubscriptions;
++        const a = self.js.nc.allocator;
++
++        try self.mutex.lock(self.js.nc.io);
++        defer self.mutex.unlock(self.js.nc.io);
++
++        self.fetch_id_counter += 1;
++        const fetch_id = self.fetch_id_counter;
++
++        // One reply subject per consumer: `<prefix><fetch>x<i>` — a single token, as
++        // the wildcard requires — so a status frame names the consumer it answers.
++        const replies = try a.alloc([]u8, subs.len);
++        var made: usize = 0;
++        defer {
++            for (replies[0..made]) |r| a.free(r);
++            a.free(replies);
++        }
++        for (subs, 0..) |sub, i| {
++            if (sub.inbox_subscription != self.inbox_subscription) return error.NotOnThisInbox;
++            replies[i] = try std.fmt.allocPrint(a, "{s}{d}x{d}", .{ self.inbox_prefix, fetch_id, i });
++            made += 1;
++        }
++
++        const timeout_duration = timeout.toDurationFromNow(self.js.nc.io);
++        const request_json = try jsonStringifyAlloc(a, FetchRequest{
++            .batch = batch,
++            .expires = if (timeout_duration) |d| @intCast(d.raw.toNanoseconds()) else null,
++        }, .{ .emit_null_optional_fields = false });
++        defer a.free(request_json);
++
++        for (subs, 0..) |sub, i| {
++            const api_subject = try sub.nextSubject(a);
++            defer a.free(api_subject);
++            try self.js.nc.publishRequest(api_subject, replies[i], request_json);
++        }
++
++        const gone = try a.alloc(bool, subs.len);
++        errdefer a.free(gone);
++        @memset(gone, false);
++        const done = try a.alloc(bool, subs.len);
++        defer a.free(done);
++        @memset(done, false);
++        var open: usize = subs.len;
++
++        var messages = std.ArrayList(*JetStreamMessage).empty;
++        defer messages.deinit(a);
++        errdefer for (messages.items) |m| m.deinit();
++
++        var receive_deadline = timeout.toDeadline(self.js.nc.io);
++        const cap = batch * subs.len;
++
++        while (open > 0 and messages.items.len < cap) {
++            const raw_msg = self.inbox_subscription.nextMsgTimeout(receive_deadline) catch |err| switch (err) {
++                error.Timeout => break,
++                error.Canceled, error.ConnectionClosed, error.SlowConsumer => return err,
++            };
++            if (raw_msg.status_code > 0) {
++                // Which pull does this frame answer? A stale one (earlier fetch) is dropped.
++                const idx: ?usize = for (replies, 0..) |r, i| {
++                    if (std.mem.eql(u8, raw_msg.subject, r)) break i;
++                } else null;
++                const code = raw_msg.status_code;
++                raw_msg.deinit();
++                const i = idx orelse continue;
++                if (code == STATUS_CONTROL) continue; // heartbeat
++                if (done[i]) continue;
++                if (code == STATUS_NO_RESPONSE) gone[i] = true;
++                // 404, 408, 409, 503 — all terminal for this consumer's pull.
++                done[i] = true;
++                open -= 1;
++                continue;
++            }
++            const js_msg = jetstream_message.createJetStreamMessage(self.js.nc, raw_msg) catch |err| {
++                raw_msg.deinit();
++                return err;
++            };
++            errdefer js_msg.deinit();
++            try messages.append(a, js_msg);
++            // Something arrived: from here on wait only for what is already in flight.
++            if (messages.items.len == 1) receive_deadline = fetch_idle_after_first.toDeadline(self.js.nc.io);
++        }
++
++        if (messages.items.len == 0) {
++            var all_gone = true;
++            for (gone) |g| all_gone = all_gone and g;
++            if (all_gone) {
++                a.free(gone);
++                return error.NoResponders;
++            }
++        }
++        return MultiBatch{
++            .allocator = a,
++            .messages = try messages.toOwnedSlice(a),
++            .gone = gone,
++        };
++    }
++};
++
+ /// JetStream push subscription
+ pub const JetStreamSubscription = struct {
+     /// Underlying NATS subscription
+@@ -691,6 +856,12 @@
+ 
+     /// Full consumer configuration
+     config: ?ConsumerConfig = null,
++
++    /// Answer into a SHARED inbox (`JetStream.pullInbox`) instead of a private one.
++    /// The subscription is then fetched through `PullInbox.fetch` together with
++    /// every other subscription on that inbox — `PullSubscription.fetch` refuses it —
++    /// and the inbox must outlive the subscription.
++    inbox: ?*PullInbox = null,
+ };
+ 
+ pub const JetStreamOptions = struct {
+@@ -1643,6 +1814,21 @@
+     }
+ 
+     /// Create a pull subscription for the specified stream
++    /// One inbox for several pull consumers — see `PullInbox`.
++    pub fn pullInbox(self: JetStream) !*PullInbox {
++        const inbox_base = try inbox.newInbox(self.nc.allocator);
++        defer self.nc.allocator.free(inbox_base);
++        const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
++        errdefer self.nc.allocator.free(inbox_prefix);
++        const wildcard_subject = try std.fmt.allocPrint(self.nc.allocator, "{s}*", .{inbox_prefix});
++        defer self.nc.allocator.free(wildcard_subject);
++        const inbox_subscription = try self.nc.subscribeSync(wildcard_subject);
++        errdefer self.nc.unsubscribe(inbox_subscription);
++        const shared = try self.nc.allocator.create(PullInbox);
++        shared.* = .{ .js = self, .inbox_subscription = inbox_subscription, .inbox_prefix = inbox_prefix };
++        return shared;
++    }
++
+     pub fn pullSubscribe(self: JetStream, subject: ?[]const u8, durable: []const u8, options: PullSubscribeOptions) !*PullSubscription {
+         // Resolve stream name
+         const stream_name = if (options.stream) |s|
+@@ -1672,6 +1858,25 @@
+             consumer_info.value.config.durable_name orelse
+             durable;
+ 
++        // A shared inbox: borrow its subscription and prefix, own nothing of them.
++        if (options.inbox) |shared| {
++            // The limits only ever go up, so several consumers on one inbox get the
++            // largest of their windows.
++            applyPendingLimits(shared.inbox_subscription, &consumer_info.value.config);
++            const pull_subscription = try self.nc.allocator.create(PullSubscription);
++            pull_subscription.* = PullSubscription{
++                .js = self,
++                .stream_name = stream_name,
++                .owns_stream_name = owns_stream_name,
++                .consumer_name = consumer_name,
++                .consumer_info = consumer_info,
++                .inbox_subscription = shared.inbox_subscription,
++                .inbox_prefix = shared.inbox_prefix,
++                .owns_inbox = false,
++            };
++            return pull_subscription;
++        }
++
+         // Generate unique inbox prefix for this pull subscription
+         const inbox_base = try inbox.newInbox(self.nc.allocator);
+         defer self.nc.allocator.free(inbox_base);
+diff --git a/src/root.zig b/src/root.zig
+index 8e99099..fc337a6 100644
+--- a/src/root.zig
++++ b/src/root.zig
+@@ -52,6 +52,8 @@ pub const JetStreamSubscription = @import("jetstream.zig").JetStreamSubscription
+ pub const PullSubscription = @import("jetstream.zig").PullSubscription;
+ pub const FetchRequest = @import("jetstream.zig").FetchRequest;
+ pub const MessageBatch = @import("jetstream.zig").MessageBatch;
++pub const PullInbox = @import("jetstream.zig").PullInbox;
++pub const MultiBatch = @import("jetstream.zig").MultiBatch;
+ 
+ // JetStream KV types
+ pub const KV = @import("jetstream_kv.zig").KV;

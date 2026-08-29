@@ -106,6 +106,22 @@ pub const SyncClient = struct {
     /// while it exists, so subscribing after publishing misses the verdict every time
     /// (measured — the demo settled 0 of 1 until this was split out of drainVerdicts).
     verdicts: ?*@import("nats").Subscription = null,
+    /// Live tailing (§10bh): one persistent pull consumer per CDC stream, created by
+    /// the first `poll` and kept across calls. `stream` points into `states`' routes
+    /// (client-lifetime memory).
+    tails: std.ArrayListUnmanaged(Tail) = .empty,
+    /// The ONE inbox every tail answers into (nats.zig `PullInbox`): `poll` is a single
+    /// wait over all streams, ended by the first message from any of them.
+    tail_inbox: ?*@import("nats").PullInbox = null,
+
+    const Tail = struct {
+        stream: []const u8,
+        sub: *@import("nats").PullSubscription,
+    };
+    /// The server reaps a tail consumer idle this long (`inactive_threshold`). A host
+    /// that stops polling for longer gets a fresh consumer at the stored position —
+    /// the reaped one answers the next fetch with `NoResponders` (nats.zig patch).
+    const tail_inactive_ns: u64 = 120 * std.time.ns_per_s;
 
     /// Acquire in order, and register the matching release BEFORE the next acquire.
     ///
@@ -180,7 +196,18 @@ pub const SyncClient = struct {
             sub.deinit();
             self.verdicts = null;
         }
+        self.dropTails();
         self.t.deinit();
+    }
+
+    fn dropTails(self: *SyncClient) void {
+        for (self.tails.items) |t| t.sub.deinit();
+        self.tails.clearRetainingCapacity();
+        // After the subscriptions that borrow it.
+        if (self.tail_inbox) |ib| {
+            ib.deinit();
+            self.tail_inbox = null;
+        }
     }
 
     fn aa(self: *SyncClient) std.mem.Allocator {
@@ -513,8 +540,24 @@ pub const SyncClient = struct {
 
         var sit = streams.iterator();
         while (sit.next()) |se| try self.drainStream(se.key_ptr.*);
+        self.retryHeld();
+    }
 
-        // FK hold/retry (§10h): one bulk retry pass after every stream drained.
+    /// The streams this client reads, public first: parents (users) ride
+    /// CDC_PUBLIC — fewer FK holds. Allocated from `a`.
+    fn cdcStreams(self: *SyncClient, a: std.mem.Allocator) ![]const []const u8 {
+        var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.value_ptr.route, self.cdc_public)) try streams.put(a, e.value_ptr.route, {});
+        }
+        it = self.states.iterator();
+        while (it.next()) |e| try streams.put(a, e.value_ptr.route, {});
+        return try a.dupe([]const u8, streams.keys());
+    }
+
+    /// FK hold/retry (§10h): one bulk retry pass after every stream had its turn.
+    fn retryHeld(self: *SyncClient) void {
         var resolved: usize = 0;
         for (self.held.items) |h| {
             if (self.applyEvent(h.table, h.ev, 0)) |_| {
@@ -531,7 +574,9 @@ pub const SyncClient = struct {
         _ = self.held_arena.reset(.retain_capacity);
     }
 
-    fn drainStream(self: *SyncClient, stream: []const u8) !void {
+    /// A pull consumer on `stream` positioned just past the stored sequence, named
+    /// uniquely per process, reaped by the server after `inactive_ns` idle.
+    fn openConsumer(self: *SyncClient, stream: []const u8, inactive_ns: u64, shared: ?*@import("nats").PullInbox) !*@import("nats").PullSubscription {
         const last = try self.storedSeq(stream);
         var name_buf: [48]u8 = undefined;
         // Unique-enough per process: pid + a monotonic counter (std.crypto.random
@@ -552,34 +597,58 @@ pub const SyncClient = struct {
         // consumers as well. 30 s is well past any fetch gap in a drain and short
         // enough that a client draining on a timer never accumulates consumers.
         // (Field added by the local nats.zig patch — nats.zig/NOTES.md.)
-        cfg.inactive_threshold = 30 * std.time.ns_per_s;
+        cfg.inactive_threshold = inactive_ns;
         if (last > 0) {
             cfg.deliver_policy = .by_start_sequence;
             cfg.opt_start_seq = last + 1;
         } else {
             cfg.deliver_policy = .all;
         }
-        const sub = try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg });
-        defer sub.deinit(); // the server reaps the consumer itself — see inactive_threshold above
+        return try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
+    }
+
+    fn drainStream(self: *SyncClient, stream: []const u8) !void {
+        const last = try self.storedSeq(stream);
+        const sub = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
+        defer sub.deinit(); // the server reaps the consumer itself — see openConsumer
 
         var max_seq: u64 = last;
         while (true) {
             // ⚠️ Only a TIMEOUT means "caught up". A closed connection or a slow
             // consumer used to break here too — and then persist the position, which
             // is how a network blip becomes a recorded claim to have read the tail.
+            //
+            // ⚠️ This arm was DEAD CODE until 2026-08-29 (§10bh): the unpatched
+            // nats.zig `fetch` never returned `Timeout` — it handed back an empty batch
+            // with the error parked in `batch.err`, and the length check below was the
+            // only thing ending the drain. Against the patched `fetch`
+            // (`nats.zig-fetch-early-return-503.patch`) an empty batch with a terminal
+            // status IS a returned error, so this arm is the exit and the length check
+            // is a belt for a partial-batch `fetch` that returns nothing (it cannot).
             var batch = sub.fetch(100, .{ .duration = .{ .raw = .fromMilliseconds(900), .clock = .awake } }) catch |err| switch (err) {
-                error.Timeout => break,
+                error.Timeout => break, // the expiry: caught up to the tail
                 else => return err,
             };
             defer batch.deinit();
-            if (batch.messages.len == 0) break; // caught up to the tail
+            if (batch.messages.len == 0) break;
+            _ = try self.applyBatch(stream, batch.messages, last, &max_seq);
+        }
+        if (max_seq > last) try self.persistSeq(stream, max_seq);
+        std.debug.print("{s}: drained to seq {d}\n", .{ stream, max_seq });
+    }
 
+    /// One fetched batch through the gate → apply → hold → position path, shared by
+    /// the bounded drain and the live tail. Returns the number of events offered to
+    /// `applyEvent` (applied, gated or held — D1: all three ARE the position).
+    fn applyBatch(self: *SyncClient, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, last: u64, max_seq: *u64) !usize {
+        var offered: usize = 0;
+        {
             // Per-batch: every decoded event dies with the batch, except the FK-held
             // ones, which are deep-copied into `held_arena` below.
             var ba = std.heap.ArenaAllocator.init(self.a);
             defer ba.deinit();
             const a = ba.allocator();
-            for (batch.messages) |m| {
+            for (messages) |m| {
                 const seq = m.metadata.sequence.stream;
                 const doc = decodeMsgpack(a, m.msg.data) catch {
                     m.ack() catch {};
@@ -590,6 +659,7 @@ pub const SyncClient = struct {
                     if (ev != .object) continue;
                     const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
                     if (self.states.get(table) == null) continue;
+                    offered += 1;
                     self.applyEvent(table, ev, seq) catch |err| switch (err) {
                         // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
                         // event that is acked, positioned past, and never applied.
@@ -601,13 +671,94 @@ pub const SyncClient = struct {
                     };
                 }
                 m.ack() catch {};
-                if (seq > max_seq) max_seq = seq;
+                if (seq > max_seq.*) max_seq.* = seq;
             }
-            // D1: delivery + accounting IS the position — applied, gated or held.
-            if (max_seq > last) try self.persistSeq(stream, max_seq);
         }
-        if (max_seq > last) try self.persistSeq(stream, max_seq);
-        std.debug.print("{s}: drained to seq {d}\n", .{ stream, max_seq });
+        // D1: delivery + accounting IS the position — applied, gated or held.
+        if (max_seq.* > last) try self.persistSeq(stream, max_seq.*);
+        return offered;
+    }
+
+    // ─── live tailing (§10bh): the host-driven poll ─────────────────────────
+
+    /// The tail for `stream`, opened on first use.
+    fn tailInbox(self: *SyncClient) !*@import("nats").PullInbox {
+        if (self.tail_inbox) |ib| return ib;
+        self.tail_inbox = try self.t.js.pullInbox();
+        return self.tail_inbox.?;
+    }
+
+    fn tailFor(self: *SyncClient, stream: []const u8) !*Tail {
+        for (self.tails.items) |*t| {
+            if (std.mem.eql(u8, t.stream, stream)) return t;
+        }
+        const sub = try self.openConsumer(stream, tail_inactive_ns, try self.tailInbox());
+        errdefer sub.deinit();
+        try self.tails.append(self.aa(), .{ .stream = stream, .sub = sub });
+        return &self.tails.items[self.tails.items.len - 1];
+    }
+
+    /// The consumer behind a tail is gone (reaped, or deleted): open a fresh one at
+    /// the stored position. Positions are the client's, not the consumer's (D1), so
+    /// nothing is lost — the new consumer starts where the replica actually is.
+    fn reopenTail(self: *SyncClient, t: *Tail) !void {
+        t.sub.deinit();
+        t.sub = try self.openConsumer(t.stream, tail_inactive_ns, try self.tailInbox());
+    }
+
+    pub const PollReport = struct { applied: usize, settled: usize };
+
+    /// One turn of the host's loop: wait up to `wait_ms` for CDC on the persistent
+    /// tails, apply what arrived, retry the FK-held, then sweep verdicts without
+    /// waiting. Blocks the calling thread only — the host owns the thread, which is
+    /// the C-ABI-honest shape (§10bh). The wait is shared across the streams in turn;
+    /// once anything arrives the remaining streams get a quick look, not the full wait.
+    pub fn poll(self: *SyncClient, wait_ms: u64) !PollReport {
+        var ca = std.heap.ArenaAllocator.init(self.a);
+        defer ca.deinit();
+        const streams = try self.cdcStreams(ca.allocator());
+        if (streams.len == 0) return .{ .applied = 0, .settled = 0 };
+
+        // ONE wait over every stream (nats.zig `PullInbox`, §10bh): one pull per
+        // tail into a shared inbox, and the first message from any of them ends the
+        // wait. This replaced a 250 ms round-robin whose cost was not the average
+        // slice but a FIXED one: the write always lands on CDC_<tenant>, every poll
+        // began with CDC_PUBLIC's full idle slice, and the row waited 265 ± 1 ms on
+        // every one of 20 runs. Idle now costs one pull per stream per `wait_ms`.
+        const a = ca.allocator();
+        const subs = try a.alloc(*@import("nats").PullSubscription, streams.len);
+        for (streams, 0..) |stream, i| subs[i] = (try self.tailFor(stream)).sub;
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@max(1, wait_ms))), .clock = .awake } };
+        var applied: usize = 0;
+        var mb = (try self.tailInbox()).fetch(subs, 100, t) catch |err| switch (err) {
+            // EVERY tail's consumer is gone (a long pause past inactive_threshold):
+            // re-open them all at the stored positions; the next poll reads.
+            error.NoResponders => {
+                for (self.tails.items) |*tl| try self.reopenTail(tl);
+                return .{ .applied = 0, .settled = try self.drainVerdictsWith(0, 1) };
+            },
+            else => return err,
+        };
+        defer mb.deinit();
+        // A consumer that went away while the others answered: re-open it alone.
+        for (mb.gone, 0..) |g, i| {
+            if (g) try self.reopenTail(&self.tails.items[i]);
+        }
+        // Messages come interleaved across streams; the applier positions per stream,
+        // so group them (order within a stream is preserved).
+        for (streams) |stream| {
+            var mine: std.ArrayListUnmanaged(*@import("nats").JetStreamMessage) = .empty;
+            for (mb.messages) |m| {
+                if (std.mem.eql(u8, m.metadata.stream, stream)) try mine.append(a, m);
+            }
+            if (mine.items.len == 0) continue;
+            const last = try self.storedSeq(stream);
+            var max_seq = last;
+            applied += try self.applyBatch(stream, mine.items, last, &max_seq);
+        }
+        if (applied > 0) self.retryHeld();
+        const settled = try self.drainVerdictsWith(0, 1);
+        return .{ .applied = applied, .settled = settled };
     }
 
     fn applyEvent(self: *SyncClient, table: []const u8, ev: Value, seq: u64) !void {
@@ -911,6 +1062,12 @@ pub const SyncClient = struct {
     /// already in PostgreSQL. Once messages start arriving the loop drains them all
     /// and stops at the first gap.
     pub fn drainVerdicts(self: *SyncClient, wait_ms: u64) !usize {
+        return self.drainVerdictsWith(wait_ms, 250);
+    }
+
+    /// `per_msg_ms` is the wait for EACH next message; `poll` passes 1 so a sweep with
+    /// nothing pending costs a millisecond, not the 250 ms a settle wait affords.
+    fn drainVerdictsWith(self: *SyncClient, wait_ms: u64, per_msg_ms: u64) !usize {
         try self.subscribeVerdicts();
         const sub = self.verdicts.?;
         var settled: usize = 0;
@@ -921,7 +1078,7 @@ pub const SyncClient = struct {
             // drain with nothing pending returns instead of blocking forever.
             // Only a timeout ends the drain quietly; a closed connection is an error.
             const msg = sub.nextMsgTimeout(
-                .{ .duration = .{ .raw = .fromMilliseconds(250), .clock = .awake } },
+                .{ .duration = .{ .raw = .fromMilliseconds(@intCast(per_msg_ms)), .clock = .awake } },
             ) catch |err| switch (err) {
                 error.Timeout => break,
                 else => return err,

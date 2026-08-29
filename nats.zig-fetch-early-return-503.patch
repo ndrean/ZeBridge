@@ -1,0 +1,123 @@
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -21,6 +21,7 @@
+ const STATUS_NOT_FOUND = message_mod.STATUS_NOT_FOUND;
+ const STATUS_TIMEOUT = message_mod.STATUS_TIMEOUT;
+ const STATUS_MAX_BYTES = message_mod.STATUS_MAX_BYTES;
++const STATUS_NO_RESPONSE = message_mod.STATUS_NO_RESPONSE;
+ const Connection = @import("connection.zig").Connection;
+ const Subscription = @import("subscription.zig").Subscription;
+ const subscription_mod = @import("subscription.zig");
+@@ -402,6 +403,12 @@
+     /// Array of JetStream messages
+     messages: []*JetStreamMessage,
+     /// Any error that occurred during fetch
++    /// ⚠️ DEAD since 2026-08-29 — always `null`. Terminal statuses (408 expiry, 404
++    /// no-messages, 503 no-responders) are now RETURNED by `fetch` when the batch is
++    /// empty, and a partial batch is a success (nats.go's legacy `Fetch` contract).
++    /// The field is kept so existing callers still compile; it carries nothing, and
++    /// reading it is a mistake the old contract invited (see `fetch`). Remove it in the
++    /// next breaking release.
+     err: ?anyerror = null,
+ 
+     pub fn deinit(self: *MessageBatch) void {
+@@ -415,6 +422,9 @@
+ };
+ 
+ /// JetStream pull subscription
++/// How long `fetch` keeps collecting after its first message (see `fetch`).
++const fetch_idle_after_first: Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } };
++
+ pub const PullSubscription = struct {
+     /// JetStream context
+     js: JetStream,
+@@ -488,7 +498,17 @@
+ 
+         // Convert the timeout to an absolute deadline so that receiving a
+         // message (or a heartbeat) does not re-arm the full timeout.
+-        const receive_deadline = timeout.toDeadline(self.js.nc.io);
++        //
++        // ⚠️ Once the FIRST message has arrived the deadline shrinks to a short idle
++        // window (`fetch_idle_after_first`): a fetch returns as soon as it has
++        // something and the in-flight remainder has been collected, instead of
++        // parking until `timeout` in the hope of filling the batch. This is nats.go's
++        // legacy `Fetch` contract, and the difference between a caller seeing a row at
++        // once and seeing it when the expiry fires (measured in libzb: one queued
++        // message, a 3 s fetch for 100, returned at 3006 ms). The server keeps the
++        // pull request parked until its own `expires`; its late 408 is attributed to
++        // this reply subject and dropped by the guard below on a later fetch.
++        var receive_deadline = timeout.toDeadline(self.js.nc.io);
+ 
+         // Collect messages until batch is complete or timeout
+         while (!batch_complete and messages.items.len < request.batch) {
+@@ -518,10 +538,24 @@
+                 }
+ 
+                 if (raw_msg.status_code == STATUS_NOT_FOUND) {
+-                    // No messages available
++                    // No messages available (404, a no_wait pull): "nothing before the
++                    // deadline", the same answer as an expiry.
+                     raw_msg.deinit();
++                    if (messages.items.len == 0) fetch_error = error.Timeout;
+                     batch_complete = true;
+                     break;
++                } else if (raw_msg.status_code == STATUS_NO_RESPONSE) {
++                    // ⚠️ 503 "No Responders": nothing serves this consumer's pull subject —
++                    // the consumer was deleted, reaped by its inactive threshold, or never
++                    // created. Folding it into the unknown-status branch (as before) made
++                    // a gone consumer look exactly like an idle one: the caller waited out
++                    // the whole timeout and got `error.Timeout`. Verified against
++                    // nats-server 2.14.5: `$JS.API.CONSUMER.MSG.NEXT.<stream>.<missing>`
++                    // answers a bare 503.
++                    raw_msg.deinit();
++                    if (messages.items.len == 0) fetch_error = error.NoResponders;
++                    batch_complete = true;
++                    break;
+                 } else if (raw_msg.status_code == STATUS_TIMEOUT) {
+                     // Request timeout
+                     raw_msg.deinit();
+@@ -552,10 +586,16 @@
+                     errdefer js_msg_ptr.deinit();
+ 
+                     try messages.append(self.js.nc.allocator, js_msg_ptr);
++                    // Something arrived: from here on wait only for what is already in flight.
++                    if (messages.items.len == 1) {
++                        receive_deadline = fetch_idle_after_first.toDeadline(self.js.nc.io);
++                    }
+                 }
+             } else |err| switch (err) {
+                 error.Timeout => {
+-                    // Timeout occurred
++                    // The CLIENT-side deadline — it fires before the server's 408 when
++                    // the two are equal, so this is the usual way an idle fetch ends.
++                    if (messages.items.len == 0) fetch_error = error.Timeout;
+                     batch_complete = true;
+                 },
+                 error.Canceled, error.ConnectionClosed, error.SlowConsumer => {
+@@ -566,6 +606,17 @@
+                     return err;
+                 },
+             }
++        }
++
++        // ⚠️ nats.go's legacy `Fetch` contract, which fits a SYNCHRONOUS call: an empty
++        // batch with a terminal status is an ERROR (`Timeout` for the 408 expiry,
++        // `NoResponders` for the 503), and a partial batch is a success with `err`
++        // null — the caller got messages, there is nothing to report. Parking the error
++        // on the batch (the async `jetstream.MessageBatch` shape) let a caller `try` the
++        // fetch and never look at `err`; every `catch error.Timeout` written against the
++        // old behaviour was dead code.
++        if (messages.items.len == 0) {
++            if (fetch_error) |err| return err;
+         }
+ 
+         // Convert ArrayList to owned slice
+@@ -573,7 +624,7 @@
+ 
+         return MessageBatch{
+             .messages = messages_slice,
+-            .err = fetch_error,
++            .err = null,
+             .allocator = self.js.nc.allocator,
+         };
+     }

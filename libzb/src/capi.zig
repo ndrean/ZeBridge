@@ -19,6 +19,7 @@
 //!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
 //!                          const char* key_json, const char* values_json);   // {"msgId":…}
 //!   char* zb_client_flush(uint64_t h, uint64_t wait_ms);           // {"sent":n,"settled":n}
+//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n} — live tail, blocks ≤ wait_ms
 //! `opts_json`: url, credsPath, grammarPath, dbPath, principal, tables (array,
 //! parents first), clientId (stable across restarts — it is the msg_id prefix).
 //!
@@ -464,6 +465,25 @@ fn flushJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     try out.put(a, "sent", .{ .integer = @intCast(r.sent) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
     return try core.valueToString(a, .{ .object = out });
+}
+
+fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
+    const r = try b.c.poll(wait_ms);
+    var out: std.json.ObjectMap = .empty;
+    try out.put(a, "applied", .{ .integer = @intCast(r.applied) });
+    try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
+    return try core.valueToString(a, .{ .object = out });
+}
+
+/// The host's loop body: `while (running) poll(h, 1000)`. Returns as soon as a CDC
+/// batch was applied, or after `wait_ms` with nothing — never earlier on idle, so the
+/// host's loop does not spin. Requires a prior `zb_client_sync` (schemas, positions).
+export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = pollJson(arena.allocator(), b, wait_ms) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
 }
 
 export fn zb_client_flush(handle: u64, wait_ms: u64) ?[*:0]u8 {
