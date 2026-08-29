@@ -39,6 +39,9 @@ fx = json.loads(FIXTURES.read_text())
 # case's own fields; the expected value is what the TS runner asserts.
 SECTIONS = {
     "seedGate":        (lambda c: {"ev": c["ev"], "anchor": c["anchor"]},          lambda c: c["drops"]),
+    "update":          (lambda c: {"table": c["table"], "pkCols": c["pkCols"], "data": c["data"]}, lambda c: c["plan"]),
+    "exists":          (lambda c: {"table": c["table"], "pkCols": c["pkCols"], "data": c["data"]}, lambda c: c["plan"]),
+    "pgArrayLiteral":  (lambda c: {"in": c["in"]},                                 lambda c: c["out"]),
     "tombstoned":      (lambda c: {"tombstoneColumn": c["tombstoneColumn"], "data": c["data"]}, lambda c: c["drops"]),
     "position":        (lambda c: {"stored": c["stored"], "batch": c["batch"]},    lambda c: c["next"]),
     "fkKind":          (lambda c: {"message": c["message"]},                       lambda c: c["kind"]),

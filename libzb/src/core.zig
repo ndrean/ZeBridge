@@ -389,6 +389,96 @@ pub fn planUpsert(a: std.mem.Allocator, table: []const u8, pk: []const []const u
     return .{ .object = obj };
 }
 
+/// core.ts pgArrayLiteral: a JSON array as PostgreSQL's array-literal text —
+/// `{a,b}`, nested `{{1,2},{3}}`, elements quoted when they need it, null → NULL.
+/// The form the CDC wire already carries for arrays; a replica on a PostgreSQL
+/// engine binds its own optimistic write in it. Pinned in fixtures/pgArrayLiteral.
+pub fn pgArrayLiteral(a: std.mem.Allocator, arr: std.json.Array) error{OutOfMemory}![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '{');
+    for (arr.items, 0..) |item, i| {
+        if (i > 0) try out.append(a, ',');
+        switch (item) {
+            .null => try out.appendSlice(a, "NULL"),
+            .array => |inner| try out.appendSlice(a, try pgArrayLiteral(a, inner)),
+            .object => try pgArrayQuote(a, &out, try valueToString(a, item)),
+            .bool => |b| try out.appendSlice(a, if (b) "t" else "f"),
+            .integer => |n| try out.appendSlice(a, try std.fmt.allocPrint(a, "{d}", .{n})),
+            .float => |f| try out.appendSlice(a, try std.fmt.allocPrint(a, "{d}", .{f})),
+            .number_string => |s| try out.appendSlice(a, s),
+            .string => |s| try pgArrayQuote(a, &out, s),
+        }
+    }
+    try out.append(a, '}');
+    return out.items;
+}
+
+fn pgArrayQuote(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) error{OutOfMemory}!void {
+    var needs = s.len == 0 or std.ascii.eqlIgnoreCase(s, "NULL");
+    for (s) |ch| {
+        if (ch == ',' or ch == '{' or ch == '}' or ch == '"' or ch == '\\' or std.ascii.isWhitespace(ch)) needs = true;
+    }
+    if (!needs) return out.appendSlice(a, s);
+    try out.append(a, '"');
+    for (s) |ch| {
+        if (ch == '"' or ch == '\\') try out.append(a, '\\');
+        try out.append(a, ch);
+    }
+    try out.append(a, '"');
+}
+
+/// core.ts planUpdate: the UPDATE-shaped plan for a row that exists — only the
+/// payload's columns are set, so a partial payload is fine. Null without a full
+/// key or without a non-key column. See core.ts for why it sits beside planUpsert.
+pub fn planUpdate(a: std.mem.Allocator, table: []const u8, pk: []const []const u8, data: Value) !?Value {
+    if (pk.len == 0 or data != .object) return null;
+    var key = std.json.Array.init(a);
+    for (pk) |c| {
+        const v = data.object.get(c) orelse return null;
+        if (v == .null) return null;
+        try key.append(v);
+    }
+    var sets: std.ArrayList(u8) = .empty;
+    var params = std.json.Array.init(a);
+    var it = data.object.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        if (std.mem.startsWith(u8, k, "old.") or containsStr(pk, k)) continue;
+        if (params.items.len > 0) try sets.appendSlice(a, ", ");
+        try sets.appendSlice(a, try std.fmt.allocPrint(a, "\"{s}\" = ?", .{k}));
+        try params.append(try cdcValue(a, e.value_ptr.*));
+    }
+    if (params.items.len == 0) return null;
+    for (key.items) |v| try params.append(v);
+    var where: std.ArrayList(u8) = .empty;
+    for (pk, 0..) |c, i| {
+        if (i > 0) try where.appendSlice(a, " AND ");
+        try where.appendSlice(a, try std.fmt.allocPrint(a, "\"{s}\" = ?", .{c}));
+    }
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "sql", .{ .string = try std.fmt.allocPrint(a, "UPDATE {s} SET {s} WHERE {s}", .{ table, sets.items, where.items }) });
+    try obj.put(a, "params", .{ .array = params });
+    return .{ .object = obj };
+}
+
+/// core.ts planExists: `SELECT 1 … LIMIT 1` by the full key, or null.
+pub fn planExists(a: std.mem.Allocator, table: []const u8, pk: []const []const u8, data: Value) !?Value {
+    if (pk.len == 0 or data != .object) return null;
+    var params = std.json.Array.init(a);
+    var where: std.ArrayList(u8) = .empty;
+    for (pk, 0..) |c, i| {
+        const v = data.object.get(c) orelse return null;
+        if (v == .null) return null;
+        try params.append(v);
+        if (i > 0) try where.appendSlice(a, " AND ");
+        try where.appendSlice(a, try std.fmt.allocPrint(a, "\"{s}\" = ?", .{c}));
+    }
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "sql", .{ .string = try std.fmt.allocPrint(a, "SELECT 1 FROM {s} WHERE {s} LIMIT 1", .{ table, where.items }) });
+    try obj.put(a, "params", .{ .array = params });
+    return .{ .object = obj };
+}
+
 /// core.ts planDelete: {sql, params} | null.
 pub fn planDelete(a: std.mem.Allocator, table: []const u8, pk: []const []const u8, data: Value) !?Value {
     if (pk.len == 0 or data != .object) return null;

@@ -1686,5 +1686,249 @@
       "data": null,
       "drops": false
     }
+  ],
+  "update": [
+    {
+      "name": "partial payload on an existing row sets only what was sent (§7's asymmetry — the upsert's INSERT arm failed NOT NULL here)",
+      "table": "test_types",
+      "pkCols": [
+        "uid"
+      ],
+      "data": {
+        "uid": "u1",
+        "some_text": "updated",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "plan": {
+        "sql": "UPDATE test_types SET \"some_text\" = ?, \"updated_at\" = ? WHERE \"uid\" = ?",
+        "params": [
+          "updated",
+          "2026-01-01T00:00:00.000000Z",
+          "u1"
+        ]
+      }
+    },
+    {
+      "name": "composite key: every key column in the WHERE, none in the SET",
+      "table": "t",
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "data": {
+        "a": 1,
+        "b": 2,
+        "v": "x"
+      },
+      "plan": {
+        "sql": "UPDATE t SET \"v\" = ? WHERE \"a\" = ? AND \"b\" = ?",
+        "params": [
+          "x",
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "old.* columns are never set (a key change is planKeyChange's job)",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": 7,
+        "old.id": 6,
+        "v": "x"
+      },
+      "plan": {
+        "sql": "UPDATE t SET \"v\" = ? WHERE \"id\" = ?",
+        "params": [
+          "x",
+          7
+        ]
+      }
+    },
+    {
+      "name": "structured values are JSON text, as in the upsert",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": 1,
+        "meta": {
+          "k": 1
+        }
+      },
+      "plan": {
+        "sql": "UPDATE t SET \"meta\" = ? WHERE \"id\" = ?",
+        "params": [
+          "{\"k\":1}",
+          1
+        ]
+      }
+    },
+    {
+      "name": "key only: nothing to set → null",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": 1
+      },
+      "plan": null
+    },
+    {
+      "name": "incomplete key → null (cannot address one row)",
+      "table": "t",
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "data": {
+        "a": 1,
+        "v": "x"
+      },
+      "plan": null
+    },
+    {
+      "name": "no primary key → null",
+      "table": "t",
+      "pkCols": [],
+      "data": {
+        "id": 1,
+        "v": "x"
+      },
+      "plan": null
+    }
+  ],
+  "exists": [
+    {
+      "name": "full key → SELECT 1 … LIMIT 1",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": 7,
+        "v": "x"
+      },
+      "plan": {
+        "sql": "SELECT 1 FROM t WHERE \"id\" = ? LIMIT 1",
+        "params": [
+          7
+        ]
+      }
+    },
+    {
+      "name": "composite key",
+      "table": "t",
+      "pkCols": [
+        "a",
+        "b"
+      ],
+      "data": {
+        "a": 1,
+        "b": 2
+      },
+      "plan": {
+        "sql": "SELECT 1 FROM t WHERE \"a\" = ? AND \"b\" = ? LIMIT 1",
+        "params": [
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "null key column → null",
+      "table": "t",
+      "pkCols": [
+        "id"
+      ],
+      "data": {
+        "id": null
+      },
+      "plan": null
+    },
+    {
+      "name": "no primary key → null",
+      "table": "t",
+      "pkCols": [],
+      "data": {
+        "id": 1
+      },
+      "plan": null
+    }
+  ],
+  "pgArrayLiteral": [
+    {
+      "name": "plain strings",
+      "in": [
+        "web",
+        "push-1"
+      ],
+      "out": "{web,push-1}"
+    },
+    {
+      "name": "a comma inside a value is quoted (measured: the browser's INS on PGlite — malformed array literal on the JSON form)",
+      "in": [
+        "a",
+        "with,comma"
+      ],
+      "out": "{a,\"with,comma\"}"
+    },
+    {
+      "name": "nested integer arrays",
+      "in": [
+        [
+          1,
+          2
+        ],
+        [
+          3,
+          4
+        ]
+      ],
+      "out": "{{1,2},{3,4}}"
+    },
+    {
+      "name": "quote and backslash are escaped",
+      "in": [
+        "say \"hi\"",
+        "back\\slash"
+      ],
+      "out": "{\"say \\\"hi\\\"\",\"back\\\\slash\"}"
+    },
+    {
+      "name": "empty string and the word NULL are quoted; a null element is NULL",
+      "in": [
+        "",
+        "null",
+        null
+      ],
+      "out": "{\"\",\"null\",NULL}"
+    },
+    {
+      "name": "booleans and numbers",
+      "in": [
+        true,
+        false,
+        1.5
+      ],
+      "out": "{t,f,1.5}"
+    },
+    {
+      "name": "whitespace inside a value is quoted",
+      "in": [
+        "two words"
+      ],
+      "out": "{\"two words\"}"
+    },
+    {
+      "name": "empty array",
+      "in": [],
+      "out": "{}"
+    }
   ]
 }

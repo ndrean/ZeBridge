@@ -7,7 +7,7 @@
 import { createSignal, onCleanup, For } from 'solid-js';
 import grammar from '../../grammar.json';
 import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
-import { pgliteStorage } from 'zb-client-ts/pglite';
+import { makePgliteStorage } from 'zb-client-ts/pglite';
 import { init as zstdInit, decompress as zstdDecompress, createDCtx, decompressUsingDict } from '@bokuweb/zstd-wasm';
 
 /// §10x: chain objects are zstd frames, deltas may name a dictionary. One wasm
@@ -49,7 +49,7 @@ const PASSWORD = _qs.get('password') ?? (import.meta.env.VITE_PASSWORD as string
 
 /// Opt in to a stable per-principal OPFS file instead of a fresh one every load.
 /// Off by default — the timestamped name is the project's clean-room dev convention.
-const DURABLE = ['1', 'true'].includes((import.meta.env.VITE_DURABLE as string | undefined) ?? '');
+const DURABLE = ['1', 'true'].includes(_qs.get('durable') ?? (import.meta.env.VITE_DURABLE as string | undefined) ?? '');
 
 /// `?engine=pglite`: PostgreSQL-in-the-browser as the replica engine instead of
 /// OPFS SQLite — "PG to PG". Same core, same protocol; the adapter brings the
@@ -137,7 +137,8 @@ const zb = new ZeBridge({
   creds: CREDS,
   grammar,
   durable: DURABLE,
-  storage: ENGINE === 'pglite' ? pgliteStorage : undefined,
+  // Persistence follows the same switch as the SQLite file: DURABLE → `idb://`.
+  storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: DURABLE }) : undefined,
 });
 
 // Console handle for inspecting the local replica directly — the database lives in
@@ -258,10 +259,15 @@ export default function App() {
     setCounts(next);
 
     const nextCounters: Record<string, number> = {};
-    for (const table of ['counter_public', 'counter_tenant']) {
+    for (const table of ['counter_public', 'counter_tenant'] as const) {
       if (!zb.tableNames().includes(table)) continue;
       try {
-        const r = await zb.query(`SELECT value FROM ${table} LIMIT 1`);
+        // By KEY, never `LIMIT 1` without an ORDER BY: that picked an arbitrary row,
+        // stable on SQLite (rowid order) and shifting on PostgreSQL, where an updated
+        // row moves to a new heap tuple — so the display and the bump below could
+        // address two different rows (measured on PGlite: +1 and -1 landed on two
+        // uids while the shown value never moved).
+        const r = await zb.query(`SELECT value FROM ${table} WHERE uid = ?`, counterUid(table));
         nextCounters[table] = r[0]?.value ?? 0;
       } catch { /* table not ready yet */ }
     }
@@ -396,16 +402,32 @@ export default function App() {
     await zb.mutate('salaries', 'DELETE', { uid });
   };
 
+  /// ONE well-known counter row per table, addressed by key. The old shape read
+  /// `LIMIT 1` and minted a NEW uid whenever the read came back empty — which it does
+  /// on every click before the seed lands — so `counter_public` accumulated 27 rows
+  /// from one writer over three days, and on PostgreSQL the arbitrary `LIMIT 1` row
+  /// then shifted between clicks. A fixed uid for the public counter; for the tenant
+  /// counter one uid per tenant (uid is the PK, so tenants cannot share it).
+  const counterUid = (table: 'counter_public' | 'counter_tenant'): string => {
+    if (table === 'counter_public') return '00000000-0000-4000-8000-00000000c0de';
+    // A stable 48-bit tail from the tenant name (FNV-1a), in uuid shape.
+    let h = 0x811c9dc5;
+    for (const ch of zb.tenant || '_default') h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+    return `00000000-0000-4000-8000-${h.toString(16).padStart(8, '0')}c0df`;
+  };
+
   /// INSERT on first click (no row yet, needs inserted_at for the NOT NULL), UPDATE
-  /// after — sending only what each verb actually needs.
+  /// after — sending only what each verb actually needs. ⚠️ A click before the seed
+  /// has landed still INSERTs a row PostgreSQL already has: that comes back as a
+  /// `rejected` verdict (duplicate key) and reverts — one lost click, not a stray row.
   const bumpCounter = async (table: 'counter_public' | 'counter_tenant', delta: number) => {
+    const id = counterUid(table);
     let row: { uid: string; value: number } | null = null;
     try {
-      const r = await zb.query(`SELECT uid, value FROM ${table} LIMIT 1`);
+      const r = await zb.query(`SELECT uid, value FROM ${table} WHERE uid = ?`, id);
       row = r[0] ? { uid: r[0].uid, value: r[0].value } : null;
     } catch { /* table not ready yet */ }
 
-    const id = row?.uid ?? zb.uuid();
     const version = zb.newVersion();
     const data: Record<string, unknown> = { uid: id, value: (row?.value ?? 0) + delta, updated_at: version };
     if (table === 'counter_tenant') data.tenant_id = zb.tenant || undefined;

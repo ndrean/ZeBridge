@@ -11,7 +11,7 @@ import {
   nextVersion, subjectSafeToken, buildMutation,
   columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   fkTextDiffers, viewSteps, indexSyncPlan,
-  planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
+  planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
@@ -64,6 +64,15 @@ for (const c of fx.keyChange) {
 for (const c of fx.upsert) {
   test(`upsert: ${c.name}`, () =>
     assert.deepEqual(planUpsert(c.table, c.pkCols, c.data), c.step));
+}
+for (const c of fx.pgArrayLiteral) {
+  test(`pgArrayLiteral: ${c.name}`, () => assert.equal(pgArrayLiteral(c.in), c.out));
+}
+for (const c of fx.update) {
+  test(`update: ${c.name}`, () => assert.deepEqual(planUpdate(c.table, c.pkCols, c.data), c.plan));
+}
+for (const c of fx.exists) {
+  test(`exists: ${c.name}`, () => assert.deepEqual(planExists(c.table, c.pkCols, c.data), c.plan));
 }
 for (const c of fx.delete) {
   test(`delete: ${c.name}`, () =>

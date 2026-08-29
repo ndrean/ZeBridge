@@ -6830,12 +6830,80 @@ libzb's soak hit it), logged as a SQLITE ERROR and then corrected by the CDC ech
 The user never sees a wrong row, but the optimistic apply of a partial UPDATE is a
 no-op today in the browser too. Full rows, or an UPDATE-shaped local plan.
 
-**Still open for PGlite**: the schema-migration path (rename/drop/add, the
-FK-change rebuild) has not been driven — `tableDdl` answers null there, so an FK
-change is not detectable by text compare; OPFS persistence (`dataDir`) is untried;
-and README's question whether PGlite's single connection locks the write path the
-way OPFS SQLite does — it is one connection, so the answer is yes by construction,
-but it has not been probed.
+**Same day, the three follow-ups.**
+
+  1. **The optimistic UPDATE applies as an UPDATE.** `core.planUpdate` (only the
+     columns sent, full key in the WHERE) and `core.planExists` (`SELECT 1 … LIMIT 1`),
+     eleven fixture cases, both cores; the shells probe existence and apply the
+     UPDATE-shaped plan when the row is there, the upsert otherwise — TS `applyEvent`
+     and libzb `applyEvent`/`applyOptimistic` alike. Measured after: the browser
+     `UP` is visible locally at 150 ms on SQLite and on PGlite, no `SQLITE ERROR`,
+     the echo confirms the same text. (Note for the eye: SQLite then stores the
+     echo's `tags` in PostgreSQL's canonical quoted form `{"web","push-3143",…}`,
+     while the local write wrote `{web,push-3143,…}` — same array, two spellings;
+     PostgreSQL parses both.)
+
+  2. **Persistence on PGlite**: `makePgliteStorage({ persist })` → `idb://<dbName>`
+     (PGlite's IndexedDB filesystem; the OPFS access-handle pool needs a worker),
+     wired to the same `durable` switch as the SQLite file, `?durable=1` now also
+     on the URL. Verified: IndexedDB `/pglite/zebridge_omar.sqlite3`, positions
+     CDC_kilo 2505 / CDC_PUBLIC 80805 and every count identical across a reload.
+     `deleteDatabaseFile` closes and drops the IndexedDB database.
+
+  3. **A real FK check on PostgreSQL**: `postgresDialect.foreignKeyViolations` reads
+     every FK from `pg_constraint` and counts children with no parent, one anti-join
+     per constraint — the answer SQLite's `foreign_key_check` gives, for the seed
+     path's post-load verification.
+
+  And a fourth, found by the first: **the optimistic INSERT on PGlite failed on
+  arrays** — `cdcValue` JSON-encodes a JS array, `text[]` wants `{a,b}`:
+  `malformed array literal: ["web","push-3029",…]`, the row appearing only with the
+  echo. `core.pgArrayLiteral` (eight fixture cases, both cores: quoting for commas,
+  braces, quotes, backslashes, whitespace, empty and the word NULL; nested arrays;
+  `t`/`f`) and `core.pgEngineValues` encode a LOCAL write's payload for a PostgreSQL
+  engine; CDC events, already in PostgreSQL text form, are untouched. Measured
+  after: INS visible locally at 150 ms with typed `text[]`/nested/jsonb values.
+  Conformance: 126 cases, TS and Zig.
+
+**The counter demo, caught by PGlite (same day).** `+1` then `-1` on
+`counter_public` were accepted and the shown value never moved; the verdicts named
+two different uids. Both the display and `bumpCounter` chose their row with
+`SELECT … LIMIT 1` and no ORDER BY — stable on SQLite (rowid order), shifting on
+PostgreSQL, where an updated row moves to a new heap tuple. And the table held 27
+rows from one writer over three days because the bump INSERTed a fresh uid whenever
+the read came back empty, which it does on every click before the seed lands. Fixed
+in the demo, not the library: one well-known uid per counter table (fixed for the
+public one; per tenant, FNV-1a of the tenant name in uuid shape, for the tenant one),
+read and written by key. Measured on PGlite: 0 → 1 → 2 → 3 → 2, one uid, PostgreSQL
+agreeing; tenant counter 0 → 1 on `…c20f40e0c0df` for kilo. The 27 stray rows are
+still in `counter_public`; harmless, and a visible fossil of the old shape.
+⚠️ The general lesson is the one PGlite exists to teach: SQLite's accidental
+orderings are not orderings. Any `LIMIT 1` without ORDER BY in a consumer is a
+PostgreSQL bug waiting.
+
+**The schema-migration path on PGlite (same day, closed).** Two things were
+missing: an FK change was invisible (`tableDdl` answered null, so `fkTextDiffers`
+never fired), and SQLite's answer to it — rebuild the table — is one PostgreSQL
+refuses for a referenced parent (`DROP TABLE` of a parent is a dependency error;
+`session_replication_role` is about triggers, not dependencies). PostgreSQL has the
+better tool, so the dialect gained an optional `alterForeignKeys` (`ALTER TABLE …
+DROP CONSTRAINT` every FK, `ADD FOREIGN KEY … DEFERRABLE INITIALLY IMMEDIATE` every
+wanted one — in place, rows untouched), and the PostgreSQL `tableDdl` synthesises
+the FK clause text from `pg_constraint` in exactly the form `core.fkClausesFor`
+emits, so the text compare needs no engine branch. The shell prefers
+`alterForeignKeys` when the dialect offers it, the rebuild otherwise.
+
+Driven live on `memo`, DDL in PostgreSQL, the descriptor republished by the DDL
+trigger each time, the replica checked after each step:
+  PGlite  `ADD COLUMN note text` → column present, view intact, rows 2.
+          `CREATE INDEX` + `ADD COLUMN user_id` + `ADD CONSTRAINT … REFERENCES users`
+          → index `memo_txt_idx`, column, FK `FOREIGN KEY (user_id) REFERENCES
+          users(id) DEFERRABLE` — added in place. Then all four dropped upstream →
+          back to `uid, txt, updated_at`, `memo_pkey` only, no FK, view intact, rows 2.
+  SQLite  the same forward sequence → the rebuild path, stored DDL now carrying the
+          FOREIGN KEY, column and index present, rows 2; reverted → original shape.
+Nothing is open on PGlite now. The write-path lock is answered by construction (one
+owned connection, `query()`/`mutate()` only) and README says so.
 
 ## 11 Restart Rules
 

@@ -45,12 +45,18 @@ export interface Dialect {
   setForeignKeys(exec: Exec, on: boolean): Promise<void>;
   /// Inside a transaction: check FKs at COMMIT, so a child may precede its parent.
   deferForeignKeys(tx: Exec): Promise<void>;
-  /// Violations after a bulk load; -1 when the engine cannot answer cheaply.
+  /// Violations after a bulk load; -1 when the engine cannot answer.
   foreignKeyViolations(exec: Exec): Promise<number>;
   /// `INSERT … ` that ignores a conflicting row / replaces it. `?` placeholders.
   insertIgnore(table: string, cols: string[], conflictCols: string[]): string;
   insertReplace(table: string, cols: string[], conflictCols: string[]): string;
+  /// Replace the table's FOREIGN KEYs in place, for engines that can ALTER a
+  /// constraint. Absent (SQLite) → the shell rebuilds the table instead, which is
+  /// the only way there — and which PostgreSQL would refuse for a referenced parent.
+  alterForeignKeys?(exec: Exec, table: string, fks: ForeignKeySpec[]): Promise<void>;
 }
+
+export type ForeignKeySpec = { columns: string[]; references: string; parent_columns: string[] };
 
 const ph = (n: number) => Array.from({ length: n }, () => '?').join(', ');
 const q = (cols: string[]) => cols.map((c) => `"${c}"`).join(', ');
@@ -102,7 +108,17 @@ export const postgresDialect: Dialect = {
         ORDER BY a.attnum`, table);
     return (rows ?? []).map((r: any) => ({ name: r.name, pk: Number(r.pk ?? 0) }));
   },
-  async tableDdl() { return null; },
+  /// PostgreSQL keeps no CREATE TABLE text; what the shell compares is the FK
+  /// clause text, so synthesize exactly the form `core.fkClausesFor` emits (with the
+  /// DEFERRABLE suffix this dialect always requests) from `pg_constraint`, and the
+  /// text compare in `core.fkTextDiffers` needs no engine branch. An absent table
+  /// answers '' — the create path owns it.
+  async tableDdl(exec, table) {
+    const fks = await pgForeignKeys(exec, table);
+    if (fks === null) return '';
+    return 'CREATE TABLE ' + table + ' (' + fks.map((f) =>
+      `, FOREIGN KEY (${q(f.columns)}) REFERENCES ${f.references} (${q(f.parent_columns)}) DEFERRABLE INITIALLY IMMEDIATE`).join('') + ')';
+  },
   async indexNames(exec, table) {
     // Secondary indexes only: not the PK's, not one backing a constraint.
     const rows = await exec(
@@ -114,16 +130,77 @@ export const postgresDialect: Dialect = {
   },
   // ⚠️ `replica` skips FK (and other) triggers for the session; nothing is re-checked
   // when it goes back to `origin`. Same contract as SQLite's PRAGMA — the bulk load is
-  // of an already-consistent snapshot — but without a cheap post-load check.
+  // of an already-consistent snapshot — and `foreignKeyViolations` below is the
+  // post-load check that PostgreSQL does not offer as a pragma.
   async setForeignKeys(exec, on) { await exec(`SET session_replication_role = ${on ? 'origin' : 'replica'}`); },
   async deferForeignKeys(tx) { await tx(`SET CONSTRAINTS ALL DEFERRED`); },
-  async foreignKeyViolations() { return -1; },
+  /// PostgreSQL has no `foreign_key_check`, and `session_replication_role = replica`
+  /// re-checks nothing on the way back to `origin` — so this asks the catalogue for
+  /// every FK and counts the children with no parent, one anti-join per constraint.
+  /// Same answer SQLite's pragma gives; a few catalogue reads more.
+  async foreignKeyViolations(exec) {
+    const fks: any[] = (await exec(
+      `SELECT c.conname,
+              c.conrelid::regclass::text  AS child,
+              c.confrelid::regclass::text AS parent,
+              (SELECT array_agg(a.attname ORDER BY k.ord)
+                 FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS cols,
+              (SELECT array_agg(a.attname ORDER BY k.ord)
+                 FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+                 JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum) AS pcols
+         FROM pg_constraint c
+        WHERE c.contype = 'f' AND c.connamespace = 'public'::regnamespace`)) ?? [];
+    let total = 0;
+    for (const fk of fks) {
+      const cols: string[] = fk.cols ?? [];
+      const pcols: string[] = fk.pcols ?? [];
+      if (!cols.length || cols.length !== pcols.length) continue;
+      const notNull = cols.map((c) => `ch."${c}" IS NOT NULL`).join(' AND ');
+      const join = cols.map((c, i) => `p."${pcols[i]}" = ch."${c}"`).join(' AND ');
+      const rows = await exec(
+        `SELECT count(*) AS n FROM ${fk.child} ch WHERE ${notNull} AND NOT EXISTS (SELECT 1 FROM ${fk.parent} p WHERE ${join})`);
+      total += Number(rows?.[0]?.n ?? 0);
+    }
+    return total;
+  },
   insertIgnore: (t, cols) =>
     `INSERT INTO ${t} (${q(cols)}) VALUES (${ph(cols.length)}) ON CONFLICT DO NOTHING`,
   insertReplace: (t, cols, conflictCols) =>
     `INSERT INTO ${t} (${q(cols)}) VALUES (${ph(cols.length)}) ON CONFLICT (${q(conflictCols)}) DO UPDATE SET ` +
     cols.filter((c) => !conflictCols.includes(c)).map((c) => `"${c}" = EXCLUDED."${c}"`).join(', '),
+  /// Drop every FK the table holds, add every FK wanted — in place, data untouched.
+  /// ⚠️ Not a rebuild: `DROP TABLE` of a referenced parent is refused by PostgreSQL
+  /// regardless of `session_replication_role`, which is about triggers, not
+  /// dependencies. ALTER is the native path, and it keeps the table's identity.
+  async alterForeignKeys(exec, table, fks) {
+    const have: any[] = (await exec(
+      `SELECT conname FROM pg_constraint WHERE contype = 'f' AND conrelid = to_regclass(?)`, table)) ?? [];
+    for (const c of have) await exec(`ALTER TABLE ${table} DROP CONSTRAINT "${c.conname}"`);
+    for (const f of fks) {
+      await exec(`ALTER TABLE ${table} ADD FOREIGN KEY (${q(f.columns)}) REFERENCES ${f.references} (${q(f.parent_columns)}) DEFERRABLE INITIALLY IMMEDIATE`);
+    }
+  },
 };
+
+/// The table's FKs from the catalogue, in definition order; null when the table
+/// does not exist.
+async function pgForeignKeys(exec: Exec, table: string): Promise<ForeignKeySpec[] | null> {
+  const exists = await exec(`SELECT to_regclass(?) IS NOT NULL AS ok`, table);
+  if (!exists?.[0]?.ok) return null;
+  const rows: any[] = (await exec(
+    `SELECT c.confrelid::regclass::text AS parent,
+            (SELECT array_agg(a.attname ORDER BY k.ord)
+               FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum) AS cols,
+            (SELECT array_agg(a.attname ORDER BY k.ord)
+               FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord)
+               JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum) AS pcols
+       FROM pg_constraint c
+      WHERE c.contype = 'f' AND c.conrelid = to_regclass(?)
+      ORDER BY c.oid`, table)) ?? [];
+  return rows.map((r) => ({ columns: r.cols ?? [], references: r.parent, parent_columns: r.pcols ?? [] }));
+}
 
 /// `?` → `$1, $2, …` for engines that number their parameters. Skips quoted
 /// strings and quoted identifiers, so a literal `?` inside them is left alone.

@@ -123,6 +123,24 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         const data = args.object.get("data") orelse .null;
         return try core.valueToString(a, try core.planUpsert(a, table, pk, data));
     }
+    if (eq(u8, name, "pgArrayLiteral")) {
+        try core.writeJsonString(a, &out, try core.pgArrayLiteral(a, args.object.get("in").?.array));
+        return out.items;
+    }
+    if (eq(u8, name, "update")) {
+        const table = args.object.get("table").?.string;
+        const pk = try strArrField(a, args, "pkCols");
+        const data = args.object.get("data") orelse .null;
+        if (try core.planUpdate(a, table, pk, data)) |v| return try core.valueToString(a, v);
+        return "null";
+    }
+    if (eq(u8, name, "exists")) {
+        const table = args.object.get("table").?.string;
+        const pk = try strArrField(a, args, "pkCols");
+        const data = args.object.get("data") orelse .null;
+        if (try core.planExists(a, table, pk, data)) |v| return try core.valueToString(a, v);
+        return "null";
+    }
     if (eq(u8, name, "delete")) {
         const table = args.object.get("table").?.string;
         const pk = try strArrField(a, args, "pkCols");

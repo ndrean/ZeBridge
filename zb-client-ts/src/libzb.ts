@@ -31,7 +31,8 @@ import { v7 as uuidv7 } from 'uuid';
 import {
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
   scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire,
-  planKeyChange, planUpsert, planDelete, chainUpsertSql, chainRowParams,
+  planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
+  type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
@@ -855,8 +856,15 @@ export class ZeBridge {
             await this.run(`ALTER TABLE ${table} ADD COLUMN "${name}" ${type};`);
           }
           if (await this.foreignKeysDiffer(table, fkClauses)) {
-            // ALTER cannot add or drop a constraint in SQLite; only a rebuild can.
-            await rebuildPreservingData('foreign keys changed');
+            if (this.dialect.alterForeignKeys) {
+              // PostgreSQL: constraints are ALTERable, and a rebuild would be refused
+              // for a referenced parent anyway (dialect.ts).
+              await this.dialect.alterForeignKeys(this.run, table, foreignKeys);
+              this.appendLog('SCHEMA', `${table}: foreign keys altered in place`, 'MIGRATE');
+            } else {
+              // ALTER cannot add or drop a constraint in SQLite; only a rebuild can.
+              await rebuildPreservingData('foreign keys changed');
+            }
           }
         } catch (alterErr) {
           await rebuildPreservingData(`ALTER refused: ${alterErr}`);
@@ -1146,6 +1154,13 @@ export class ZeBridge {
     // its tombstones until a full re-seed (measured in libzb: 134 reaped rows kept).
     const op = tombstoned(state.tombstoneColumn, ev.data) ? 'DELETE' : ev.operation;
 
+    // A LOCAL write's payload carries JS values (arrays, objects); a PostgreSQL engine
+    // must bind arrays as array literals — core.pgEngineValues — or `text[]` refuses
+    // the JSON form (measured: `malformed array literal` on every optimistic INS on
+    // PGlite, the row appearing only with the echo). CDC events already carry
+    // PostgreSQL's text forms and are left alone; SQLite stores either as text.
+    if (ev.optimistic && this.dialect.name === 'postgres') ev = { ...ev, data: pgEngineValues(ev.data) };
+
     if (op === 'INSERT' || op === 'UPDATE') {
       const keys = Object.keys(ev.data);
       const unknown = keys.filter((k) => !state.columns.includes(k) && !k.startsWith('old.'));
@@ -1169,11 +1184,26 @@ export class ZeBridge {
         }
       }
 
-      const up = planUpsert(table, state.pkCols, ev.data);
+      // An UPDATE for a row that is HERE is applied as an UPDATE — only the columns
+      // sent — never as the upsert, whose INSERT arm fails NOT NULL on a partial
+      // payload before the conflict is resolved (core.planUpdate's comment; measured
+      // on every browser `UP` and in libzb's soak). A row that is not here (or an
+      // INSERT) takes the upsert as before. The existence probe is core.planExists.
+      let step: SqlStep | null = null;
+      if (op === 'UPDATE' && !kc) {
+        const ex = planExists(table, state.pkCols, ev.data);
+        if (ex) {
+          try {
+            const hit = await exec(ex.sql, ...ex.params);
+            if (Array.isArray(hit) && hit.length) step = planUpdate(table, state.pkCols, ev.data);
+          } catch { /* probe failed — the upsert path answers */ }
+        }
+      }
+      const up = step ?? planUpsert(table, state.pkCols, ev.data);
       try {
         await exec(up.sql, ...up.params);
       } catch (err) {
-        this.appendLog('SQLITE', `UPSERT on ${table} failed: ${err}`, 'ERROR');
+        this.appendLog('SQLITE', `${step ? 'UPDATE' : 'UPSERT'} on ${table} failed: ${err}`, 'ERROR');
       }
     } else if (op === 'DELETE') {
       // core.planDelete: null on a partial composite key — deleting on it would

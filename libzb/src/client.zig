@@ -611,7 +611,7 @@ pub const SyncClient = struct {
             return;
         }
         if (try core.planKeyChange(taa, table, st.pk, data)) |kc| _ = try self.stepExec(taa, kc);
-        const up = try core.planUpsert(taa, table, st.pk, data);
+        const up = try self.updateOrUpsert(taa, table, st, op, data);
         _ = self.stepExec(taa, up) catch |err| {
             if (err == storage.Error.StepFailed and
                 std.mem.indexOf(u8, self.st.errMsg(), "FOREIGN KEY") != null)
@@ -620,6 +620,23 @@ pub const SyncClient = struct {
             }
             return err;
         };
+    }
+
+    /// An UPDATE for a row that is HERE is applied as an UPDATE (core.planUpdate —
+    /// only the columns sent), never as the upsert whose INSERT arm fails NOT NULL on
+    /// a partial payload before the conflict is resolved (§7's asymmetry; measured in
+    /// the soak as a bare StepFailed on a four-field UPDATE). A row that is not here,
+    /// or an INSERT, takes the upsert. The probe is core.planExists.
+    fn updateOrUpsert(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, op: []const u8, data: Value) !Value {
+        if (std.mem.eql(u8, op, "UPDATE")) {
+            if (try core.planExists(a, table, st.pk, data)) |ex| {
+                const hit = self.stepExec(a, ex) catch &.{};
+                if (hit.len > 0) {
+                    if (try core.planUpdate(a, table, st.pk, data)) |upd| return upd;
+                }
+            }
+        }
+        return core.planUpsert(a, table, st.pk, data);
     }
 
     // ── the write path (PROTOCOL.md §7.1) ───────────────────────────────────
@@ -926,7 +943,7 @@ pub const SyncClient = struct {
             if (try core.planDelete(taa, table, st.pk, data)) |stp| _ = try self.stepExec(taa, stp);
             return;
         }
-        const up = try core.planUpsert(taa, table, st.pk, data);
+        const up = try self.updateOrUpsert(taa, table, st, op, data);
         _ = self.stepExec(taa, up) catch |err| {
             std.debug.print(
                 "optimistic apply of {s} failed: {any} — sqlite: {s}\n",

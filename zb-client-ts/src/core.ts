@@ -192,6 +192,41 @@ export type KeyChangeStep = SqlStep & { oldKey: any[]; newKey: any[] };
 export const cdcValue = (v: any): any =>
   v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
 
+/// A JS array as PostgreSQL's array-literal TEXT: `{a,b}`, nested `{{1,2},{3}}`,
+/// elements quoted when they need it (comma, brace, quote, backslash, whitespace,
+/// empty, or the word NULL), `null` elements as NULL. The form PostgreSQL's array
+/// input function reads — and the form the CDC wire already carries for arrays, so a
+/// replica on a PostgreSQL engine sees its own optimistic write exactly as it will
+/// see the echo. Measured without it: `malformed array literal: ["web","push-…"]` —
+/// `cdcValue`'s JSON is right for a jsonb column and wrong for `text[]`.
+/// Pinned in fixtures/pgArrayLiteral.
+export function pgArrayLiteral(v: any[]): string {
+  const elem = (x: any): string => {
+    if (x === null || x === undefined) return 'NULL';
+    if (Array.isArray(x)) return pgArrayLiteral(x);
+    if (typeof x === 'object') return quote(JSON.stringify(x));
+    if (typeof x === 'boolean') return x ? 't' : 'f';
+    if (typeof x === 'number') return String(x);
+    return quote(String(x));
+  };
+  const quote = (s: string): string =>
+    s === '' || /[\s,{}"\\]/.test(s) || s.toUpperCase() === 'NULL'
+      ? `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+      : s;
+  return `{${v.map(elem).join(',')}}`;
+}
+
+/// The payload of a LOCAL write as a PostgreSQL engine must bind it: arrays as
+/// array literals, plain objects as JSON (jsonb reads that), scalars unchanged. CDC
+/// events need none of this — the wire is already in these forms.
+export function pgEngineValues(data: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(data)) {
+    out[k] = Array.isArray(v) ? pgArrayLiteral(v) : v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+  }
+  return out;
+}
+
 /// A changed primary key arrives as an UPDATE with `old.*` — the old key must
 /// be deleted first, or the row lives on under both keys forever (measured
 /// live). Null when the event carries no complete, actually-different old key.
@@ -242,6 +277,46 @@ export function planUpsert(
 /// The CDC delete. Null when any key column is absent: a partial composite key
 /// would match MORE rows than PostgreSQL deleted — skipping is the only safe
 /// answer (the row converges on the next seed).
+/// The UPDATE-shaped plan for a row that EXISTS locally: only the columns the
+/// payload carries are touched, so a partial payload is fine. Null when there is no
+/// key, the key is incomplete, or nothing but the key was sent (nothing to set).
+///
+/// ⚠️ Why this exists next to planUpsert. The upsert is one statement for both
+/// arms, and SQLite evaluates the INSERT arm first: a partial UPDATE payload on an
+/// existing row failed the INSERT's NOT NULL check before the conflict was ever
+/// resolved (measured: `NOT NULL constraint failed: test_types.tenant_id` on every
+/// browser `UP`, corrected only by the CDC echo; libzb's soak hit the same). So the
+/// shell asks `planExists` first and applies THIS when the row is there; the upsert
+/// remains the plan for a row that is not. Pinned in fixtures/update.
+export function planUpdate(
+  table: string,
+  pkCols: string[],
+  data: Record<string, any>,
+): SqlStep | null {
+  if (!pkCols.length) return null;
+  const key = pkCols.map((c) => data[c]);
+  if (!key.every((v) => v !== undefined && v !== null)) return null;
+  const setKeys = Object.keys(data).filter((k) => !k.startsWith('old.') && !pkCols.includes(k));
+  if (!setKeys.length) return null;
+  const sets = setKeys.map((k) => `"${k}" = ?`).join(', ');
+  const where = pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+  return { sql: `UPDATE ${table} SET ${sets} WHERE ${where}`, params: [...setKeys.map((k) => cdcValue(data[k])), ...key] };
+}
+
+/// "Is this row here?" — `SELECT 1 … LIMIT 1` by the full key, or null when the key
+/// is incomplete (then nothing can be looked up and the caller falls back to upsert).
+export function planExists(
+  table: string,
+  pkCols: string[],
+  data: Record<string, any>,
+): SqlStep | null {
+  if (!pkCols.length) return null;
+  const key = pkCols.map((c) => data[c]);
+  if (!key.every((v) => v !== undefined && v !== null)) return null;
+  const where = pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+  return { sql: `SELECT 1 FROM ${table} WHERE ${where} LIMIT 1`, params: key };
+}
+
 export function planDelete(
   table: string,
   pkCols: string[],
