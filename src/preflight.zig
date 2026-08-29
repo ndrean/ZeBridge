@@ -674,6 +674,9 @@ pub fn reportTable(
 /// in init.{core,write}.template.sql and isInternalTable() in event_processor.zig.
 fn isInternalTable(name: []const u8) bool {
     return std.mem.eql(u8, name, "zebridge_ddl_events") or
+        // The catalogue rides the publication as a control signal (§10bj) — never
+        // routed, never published, so never "unrouted" either.
+        std.mem.eql(u8, name, "zebridge_catalogue") or
         // Enrollment invites: pure bridge infrastructure, never published — but its
         // CREATE fires the DDL trigger like any table, and without this line the DDL
         // path refused it and left a suspended $KV.schemas key in every client.
@@ -992,7 +995,7 @@ pub fn run(
             continue;
         };
         log.err(
-            "🔴 REFUSING '{s}': not tenant-scoped and no catalogue row marks it public — its CDC subject matches no stream. Publishing would block on every write. Declare it (zebridge_enable with public_reason or tenant_col) and restart the bridge.",
+            "🔴 REFUSING '{s}': not tenant-scoped and no catalogue row marks it public — its CDC subject matches no stream. Publishing would block on every write. Declare it (zebridge_enable with public_reason or tenant_col) — the bridge reloads on the catalogue row, no restart (§10bj).",
             .{table},
         );
     }

@@ -627,7 +627,29 @@ pub fn main(init: std.process.Init) !void {
     // authoritative per-table rule source, written by zebridge_enable atomically
     // with the guards. Env rules above become per-table OVERRIDES; the catalogue
     // fills everything else, and a pre-catalogue database loads zero rows.
-    var cat = catalogue.loadRules(allocator, &pg_config, &tenant_rules, &sync_rules);
+    // What the ENV named, snapshotted before the catalogue touches the maps: these
+    // tables stay the env's on every reload (§10bj). `env_sync_rules` is the listener's
+    // copy — immutable for the life of the process, so the write path never reads a
+    // map the replication thread rewrites.
+    var env_tenant_keys: catalogue.KeySet = .init(allocator);
+    defer env_tenant_keys.deinit();
+    var env_sync_keys: catalogue.KeySet = .init(allocator);
+    defer env_sync_keys.deinit();
+    var env_sync_rules: Config.EventClassification.TransitionRules = .init(allocator);
+    defer args.Args.deinitTransitionRules(&env_sync_rules, allocator);
+    {
+        var it = tenant_rules.keyIterator();
+        while (it.next()) |k| try env_tenant_keys.put(k.*, {});
+        var it2 = sync_rules.iterator();
+        while (it2.next()) |e| {
+            try env_sync_keys.put(e.key_ptr.*, {});
+            const cols = try allocator.alloc([]const u8, e.value_ptr.*.len);
+            for (e.value_ptr.*, 0..) |cname, i| cols[i] = try allocator.dupe(u8, cname);
+            try env_sync_rules.put(try allocator.dupe(u8, e.key_ptr.*), cols);
+        }
+    }
+    const catalogue_env: catalogue.Env = .{ .tenant_keys = &env_tenant_keys, .sync_keys = &env_sync_keys };
+    var cat = catalogue.loadRules(allocator, &pg_config, &tenant_rules, &sync_rules, catalogue_env);
     // Freed on the way out of main — topology.public_tables/tenants alias these
     // slices, and LIFO defers put this AFTER every thread join that reads them.
     defer cat.deinit(allocator);
@@ -651,6 +673,19 @@ pub fn main(init: std.process.Init) !void {
     // reads it back when building each table's schema payload.
     var writable = writable_tables.Registry.init(allocator);
     defer writable.deinit();
+
+    // The catalogue, live (§10bj): re-read on every `zebridge_catalogue` row the WAL
+    // carries, from the replication loop — the only thread that reads the rule maps.
+    var live_catalogue = LiveCatalogue{
+        .allocator = allocator,
+        .pg_config = &pg_config,
+        .tenant_rules = &tenant_rules,
+        .sync_rules = &sync_rules,
+        .env = catalogue_env,
+        .cat = &cat,
+        .topo = &runtime_config.topology,
+        .refused = &refused,
+    };
 
     // OID → typtype for types the CDC decoder's switch does not cover. Populated from
     // DDL events and from the boot schema pass, and never invalidated: an OID outlives
@@ -858,7 +893,7 @@ pub fn main(init: std.process.Init) !void {
             wc,
             nats_endpoint,
             &runtime_config.topology,
-            &sync_rules,
+            &env_sync_rules,
             default_version_column,
             io,
             &should_stop,
@@ -1121,6 +1156,15 @@ pub fn main(init: std.process.Init) !void {
     const tx_slots_buf: []u32 = try allocator.alloc(u32, tx_flush_quantum);
     defer allocator.free(tx_slots_buf);
     var tx_slots_count: usize = 0;
+    // A `zebridge_catalogue` row was seen in the transaction in flight: reload at its
+    // COMMIT, after the transaction's slots are released — never mid-transaction.
+    // zebridge_enable's own ALTER TABLE fires a DDL event that precedes the catalogue
+    // row in the same transaction and is refused (the catalogue is not reloaded
+    // yet); its suspension sits in `tx_slots_buf` until commit, and a schema
+    // published from a mid-transaction reload jumped AHEAD of it in the publisher's
+    // queue — measured: the good 1089-byte descriptor, then the 97-byte suspension
+    // overwrote it (§10bj).
+    var catalogue_moved = false;
     log.info("Ring buffer capacity: {d} slots, transaction flush quantum: {d} rows (no transaction size limit)", .{ ring_buffer_capacity, tx_flush_quantum });
 
     // Track relation metadata (table info)
@@ -1335,6 +1379,13 @@ pub fn main(init: std.process.Init) !void {
                                             tx_slots_count += 1;
                                             cdc_events += 1;
                                         }
+                                    } else if (std.mem.eql(u8, rel.name, "zebridge_catalogue")) {
+                                        // zebridge_enable's row, arriving through the WAL like
+                                        // DDL (§10bj): the catalogue moved, so the write path's
+                                        // cache is stale AND the routing map is — reload both.
+                                        // Never published as CDC.
+                                        catalog_epoch.bump();
+                                        catalogue_moved = true;
                                     } else if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) {
                                         // Never a cdc.zebridge_user_tenants.* event — see
                                         // the matching exemption in
@@ -1370,6 +1421,13 @@ pub fn main(init: std.process.Init) !void {
                                     // Pruning old rows produces DELETEs that must never surface as
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_upd;
+                                    if (std.mem.eql(u8, rel.name, "zebridge_catalogue")) {
+                                        // A re-run of zebridge_enable (ON CONFLICT DO UPDATE):
+                                        // a changed rule, live — §11's "restart" row retired.
+                                        catalog_epoch.bump();
+                                        catalogue_moved = true;
+                                        break :blk_upd;
+                                    }
                                     if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) {
                                         // A reassignment (`UPDATE ... SET tenant_id = ...`)
                                         // arrives here, not as .insert — the NEW row is
@@ -1413,6 +1471,13 @@ pub fn main(init: std.process.Init) !void {
                                     // Pruning old rows produces DELETEs that must never surface as
                                     // cdc.zebridge_ddl_events.* to consumers.
                                     if (std.mem.eql(u8, rel.name, "zebridge_ddl_events")) break :blk_del;
+                                    if (std.mem.eql(u8, rel.name, "zebridge_catalogue")) {
+                                        // A table taken out of the catalogue: its rules go, and
+                                        // CDC_PUBLIC's filter shrinks with them.
+                                        catalog_epoch.bump();
+                                        catalogue_moved = true;
+                                        break :blk_del;
+                                    }
                                     // A revoked mapping (DELETE FROM zebridge_user_tenants):
                                     // purge the principal's $KV.tenants key, so the next
                                     // resolveTenant() reads "no mapping" → the open tenant,
@@ -1496,6 +1561,13 @@ pub fn main(init: std.process.Init) !void {
 
                                 const events_released_in_tx = tx_slots_count;
                                 tx_slots_count = 0;
+
+                                // After the release loop: what this reload publishes queues
+                                // BEHIND everything the transaction itself produced.
+                                if (catalogue_moved) {
+                                    catalogue_moved = false;
+                                    live_catalogue.reload(&publisher, &event_proc);
+                                }
 
                                 if (commit.commit_lsn != last_lsn) {
                                     const lsn_diff = commit.commit_lsn - last_lsn;
@@ -1700,6 +1772,107 @@ fn streamSubjectsEqual(have: []const []const u8, wanted: []const []const u8) boo
 /// 7d INIT — except max_bytes, deliberately 1G: JetStream treats every stream's
 /// max_bytes as a reservation against the server's storage budget, and a boot that
 /// reserves 10G per tenant refuses to create anything on a small server.
+/// The catalogue as a LIVE input (§10bj). Until this existed the rule maps,
+/// `topology.public_tables` and CDC_PUBLIC's subject filter were read once at boot, so
+/// a table enabled while the bridge ran hit `isCdcRoutable == false` and was refused
+/// with "restart the bridge". Now `zebridge_catalogue` rides the publication and each
+/// of its rows, arriving through the WAL (PROTOCOL §0: the signal is never read back
+/// from NATS), triggers this: re-read the rules (env entries still win; the catalogue
+/// adds, replaces and removes the rest), re-point the public set, reconcile the
+/// streams, lift `no_cdc_subject` refusals, and publish the schema of every table that
+/// became routable — the DDL event that would have carried it was refused at the time.
+///
+/// Runs on the replication thread, which is the only reader of the maps it rewrites;
+/// the mutation listener holds the env-only copy and reads the catalogue itself.
+/// Never fails the loop: a reload that cannot complete logs and leaves the previous
+/// state in place, which is exactly what a restart-only bridge had.
+const LiveCatalogue = struct {
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    tenant_rules: *Config.EventClassification.TransitionRules,
+    sync_rules: *Config.EventClassification.TransitionRules,
+    env: catalogue.Env,
+    cat: *catalogue.Load,
+    topo: *topology_mod.Topology,
+    refused: *refused_tables.Registry,
+
+    fn reload(self: *LiveCatalogue, publisher: anytype, event_proc: anytype) void {
+        var fresh = catalogue.loadRules(self.allocator, self.pg_config, self.tenant_rules, self.sync_rules, self.env);
+        if (!fresh.available) {
+            log.warn("🗂️ catalogue moved but could not be re-read — routing unchanged until the next row", .{});
+            fresh.deinit(self.allocator);
+            return;
+        }
+        // Swap the scope lists under the topology, then free the old ones. When the
+        // tenant list came back empty the old one stays (boot kept the grammar's, and
+        // an empty read is a degraded read, not a revocation).
+        var old = self.cat.*;
+        self.topo.public_tables = fresh.publics;
+        if (fresh.tenants.len > 0) {
+            self.topo.tenants = fresh.tenants;
+        } else {
+            fresh.tenants = old.tenants;
+            old.tenants = &.{};
+        }
+        self.cat.* = fresh;
+        old.deinit(self.allocator);
+
+        reconcileCdcStreams(self.allocator, publisher, self.topo) catch |err| {
+            log.err("🗂️ catalogue reloaded but the streams could not be reconciled ({s}) — a new public table stays unrouted until the next row", .{@errorName(err)});
+        };
+
+        // Symmetric, per table the read changed: routable now → lift a standing
+        // `no_cdc_subject` refusal and publish the schema its refused DDL event never
+        // did; unrouted now (taken out of the catalogue) → refuse it here and now,
+        // because its next row would otherwise block the publisher on a subject no
+        // stream matches — the outage that refusal exists to prevent.
+        // `publishBootSchemas` then does the right thing for each: a descriptor for a
+        // routable table, a suspension for a refused one.
+        var republish: std.ArrayList([]const u8) = .empty;
+        defer republish.deinit(self.allocator);
+        for (self.cat.changed) |tbl| {
+            if (self.topo.isCdcRoutable(tbl, self.tenant_rules.contains(tbl))) {
+                if (self.refused.reasonFor(tbl) == .no_cdc_subject) {
+                    self.refused.clear(tbl);
+                    log.info("🗂️ '{s}' is routable now — refusal lifted", .{tbl});
+                }
+            } else if (self.refused.reasonFor(tbl) == null) {
+                self.refused.refuse(tbl, .no_cdc_subject) catch |err| {
+                    log.err("🗂️ '{s}' left the catalogue but could not be refused ({s}) — its rows would block the publisher", .{ tbl, @errorName(err) });
+                };
+                log.warn("🗂️ '{s}' left the catalogue — refused (no CDC subject) until it is declared again", .{tbl});
+            }
+            republish.append(self.allocator, tbl) catch {};
+        }
+        // And any table the catalogue routes that a DDL event refused BEFORE this
+        // read (a CREATE TABLE ahead of its zebridge_enable, in another transaction).
+        var it = self.tenant_rules.keyIterator();
+        while (it.next()) |k| self.liftIfUnrouted(k.*, &republish);
+        for (self.topo.public_tables) |t| self.liftIfUnrouted(t, &republish);
+        if (republish.items.len > 0) {
+            // The writability verdict was computed at each table's DDL event — for a
+            // pre-existing table, BEFORE zebridge_enable granted the writer role — so
+            // the descriptor would carry `writable: false`. Re-run the report against
+            // the grants as they are now, then publish.
+            for (republish.items) |tbl| event_proc.reportEdgeWritability(tbl);
+            event_proc.publishBootSchemas(self.allocator, republish.items) catch |err| {
+                log.err("🗂️ catalogue reloaded but {d} schema(s) could not be published ({s})", .{ republish.items.len, @errorName(err) });
+            };
+        }
+        log.info("🗂️ catalogue reloaded live: {d} public, {d} tenant-scoped rule(s), {d} table(s) changed, {d} schema(s) published", .{
+            self.topo.public_tables.len, self.tenant_rules.count(), self.cat.changed.len, republish.items.len,
+        });
+    }
+
+    fn liftIfUnrouted(self: *LiveCatalogue, table: []const u8, republish: *std.ArrayList([]const u8)) void {
+        if (self.refused.reasonFor(table) != .no_cdc_subject) return;
+        self.refused.clear(table);
+        for (republish.items) |r| if (std.mem.eql(u8, r, table)) return;
+        republish.append(self.allocator, table) catch {};
+        log.info("🗂️ '{s}' is routable now — refusal lifted", .{table});
+    }
+};
+
 fn reconcileCdcStreams(
     allocator: std.mem.Allocator,
     publisher: anytype,

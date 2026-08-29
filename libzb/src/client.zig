@@ -264,8 +264,13 @@ pub const SyncClient = struct {
     /// Touches only `st`, so it is testable against a scratch SQLite with no NATS.
     /// (§10bi — the "increment 2" this file promised in §10v.)
     pub fn migrateTable(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, val: Value) !Migration {
+        // ⚠️ Never `.?` into a descriptor. A suspension (`{"table":…,"suspended":…}`,
+        // §5) has no columns, and a host behind the C ABI cannot catch a Zig panic —
+        // measured 2026-08-29: a refused table's 97-byte suspension reached this
+        // function and took a Python process down. Unusable → an error the caller
+        // logs and skips; the replica keeps what it has.
+        const cols_v = descriptorColumns(val) orelse return error.SchemaUnusable;
         const pk = try jsonStrList(a, val.object.get("pk_columns"));
-        const cols_v = val.object.get("sqlite").?.object.get("columns").?;
         var names: std.ArrayList([]const u8) = .empty;
         for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
         const empty_arr = Value{ .array = std.json.Array.init(a) };
@@ -352,6 +357,17 @@ pub const SyncClient = struct {
         return core.indexSyncPlan(a, table, have, want);
     }
 
+    /// The `sqlite.columns` array of a descriptor, or null for anything that is not a
+    /// usable descriptor (a suspension, a non-object, a missing key).
+    fn descriptorColumns(val: Value) ?Value {
+        if (val != .object) return null;
+        const sq = val.object.get("sqlite") orelse return null;
+        if (sq != .object) return null;
+        const cols = sq.object.get("columns") orelse return null;
+        if (cols != .array) return null;
+        return cols;
+    }
+
     fn columnType(cols: std.json.Array, name: []const u8) ?[]const u8 {
         for (cols.items) |c| {
             if (std.mem.eql(u8, c.object.get("name").?.string, name)) {
@@ -379,11 +395,21 @@ pub const SyncClient = struct {
             };
             const val = (try std.json.parseFromSlice(Value, a, bytes, .{})).value;
 
-            const outcome = try migrateTable(&self.st, a, table, val);
+            const outcome = migrateTable(&self.st, a, table, val) catch |err| switch (err) {
+                error.SchemaUnusable => {
+                    // Suspended (no primary key, or unrouted — §5) or malformed: the
+                    // table stays as it is locally, and stays out of `states` if it was
+                    // never usable, so no CDC event is applied against a missing table.
+                    const why = if (val == .object) (val.object.get("suspended") orelse Value{ .null = {} }) else Value{ .null = {} };
+                    std.debug.print("{s}: schema unusable ({s}) — skipped\n", .{ table, if (why == .string) why.string else "no columns" });
+                    continue;
+                },
+                else => return err,
+            };
             if (outcome != .unchanged) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
 
             const pk = try jsonStrList(a, val.object.get("pk_columns"));
-            const cols_v = val.object.get("sqlite").?.object.get("columns").?;
+            const cols_v = descriptorColumns(val).?; // checked by migrateTable above
             var names: std.ArrayList([]const u8) = .empty;
             for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
             const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
@@ -1841,4 +1867,18 @@ test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds �
     try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d4));
     // and the FK is live again after the surgery
     try std.testing.expectError(error.StepFailed, st.query(aa_, "INSERT INTO t (uid, c, updated_at) VALUES ('orphan', 'x', 'v')", &.{}));
+}
+
+test "migrateTable: a suspension descriptor is an error, never a panic" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const path = "/tmp/zb-migrate-susp.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var st = try storage.Storage.open(path);
+    defer st.close();
+    const susp = (try std.json.parseFromSlice(Value, arena.allocator(), "{\"table\":\"t\",\"suspended\":\"no_cdc_subject\",\"lsn\":1}", .{})).value;
+    try std.testing.expectError(error.SchemaUnusable, SyncClient.migrateTable(&st, arena.allocator(), "t", susp));
+    const junk = (try std.json.parseFromSlice(Value, arena.allocator(), "[1,2]", .{})).value;
+    try std.testing.expectError(error.SchemaUnusable, SyncClient.migrateTable(&st, arena.allocator(), "t", junk));
 }

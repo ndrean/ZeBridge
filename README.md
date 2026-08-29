@@ -1302,22 +1302,26 @@ Raising `max_payload` in `nats-server.conf` is possible but affects every client
 
 One rule covers almost everything:
 
-> **The catalogue governs it → migration + restart. Data governs it → live.**
+> **The catalogue governs it → a migration. Data governs it → live. Neither restarts the bridge:** `zebridge_catalogue` rides the publication, so its rows reach the bridge through the WAL like DDL and it reloads its routing on the spot.
 
 | change | what's needed |
 | --- | --- |
-| new table (public or tenant-scoped) | one `zebridge_enable(...)` migration + **one bridge restart** — boot reads the catalogue and reconciles the CDC streams itself. No env edit, no stream edit by hand. |
-| changed rule on an existing table (version / tombstone / tiebreak / tenant column) | re-run `zebridge_enable` + **bridge restart** (the sweeper re-reads on its own restart) |
+| new table (public or tenant-scoped) | one `zebridge_enable(...)` migration, **no restart** — the bridge sees the catalogue row in the WAL, reloads its rules, reconciles CDC_PUBLIC's subjects, lifts the table's refusal and publishes its schema. No env edit, no stream edit by hand. |
+| changed rule on an existing table (version / tombstone / tiebreak / tenant column) | re-run `zebridge_enable`, **no restart** — same path (the write path re-reads the catalogue on the same signal; the sweeper still re-reads on its own restart) |
 | new tenant | **no restart** — create its streams, insert the `zebridge_user_tenants` row (propagates live to `$KV.tenants`); NATS grants need a SIGHUP (reload, not restart) until the JWT signing key covers them |
 | new user on an existing tenant | conf grant + SIGHUP only — with the JWT operator model, not even that |
 | `BASE_BUF` / `RING_BUFFER_COUNT` / other bridge env | **bridge restart** (the bridge re-registers its row-width budget and re-bakes the guards at boot) |
 | generations on/off, tenant growth, invites, enrollment | **nothing** — the producer and the mint read the database per tick/request |
 | `DROP TABLE` | nothing for the bridge — the DDL trigger tombstones the schema and reaps the guard |
 
-Until you restart after a migration, the running bridge serves its **boot-time view**: a
-newly enabled tenant-scoped table publishes a schema without its tenant column or
-foreign keys, and clients will build the wrong table from it. `zebridge_enable` prints
-this as its `T3 bridge MANUAL` step — treat that output as the checklist it is.
+What makes this safe is that `zebridge_enable` is the gate: its own preflight (the
+tombstone gate, the tenant column's existence, the width guard, the publication check)
+returns `preflight ERROR` rows and writes **no catalogue row** for a table that fails,
+so the running bridge never sees a rule it should refuse. What it does see it treats the
+way boot does — a table it cannot route (or that lost its row) is refused on the spot
+and its clients get a suspension, never a bare subject that blocks the publisher.
+`zebridge_enable` prints the bridge side as its `T3 bridge LIVE` step; `T4 nats conf`
+is the one step that stays outside the database.
 
 ## Monitoring & Telemetry
 

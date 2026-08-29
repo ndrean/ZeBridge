@@ -39,6 +39,10 @@ pub const log = std.log.scoped(.event_processor);
 /// two paths disagree and clients build a local replica of our own bookkeeping.
 fn isInternalTable(name: []const u8) bool {
     return std.mem.eql(u8, name, "zebridge_ddl_events") or
+        // The catalogue rides the publication so the bridge learns of an enable
+        // without a restart (§10bj); its rows are a control signal, never CDC, and
+        // it publishes no schema.
+        std.mem.eql(u8, name, "zebridge_catalogue") or
         // Enrollment invites: pure bridge infrastructure, never published — but its
         // CREATE fires the DDL trigger like any table, and without this line the DDL
         // path refused it and left a suspended $KV.schemas key in every client.
@@ -190,7 +194,7 @@ pub const EventProcessor = struct {
     /// Short-lived by design: this fires on `CREATE TABLE`, which is rare, and holding an
     /// idle connection for it would be a worse trade than opening one. Every failure is
     /// swallowed with a line — the report is advice, and advice must not break CDC.
-    fn reportEdgeWritability(self: *EventProcessor, table: []const u8) void {
+    pub fn reportEdgeWritability(self: *EventProcessor, table: []const u8) void {
         const conninfo = self.pg_config.connInfo(self.allocator, false) catch return;
         defer self.allocator.free(conninfo);
 
@@ -1406,7 +1410,7 @@ pub const EventProcessor = struct {
             !self.topology.isCdcRoutable(clean_table, self.tenant_rules.contains(clean_table)))
         {
             log.err(
-                "🔴 REFUSING '{s}': not tenant-scoped and no catalogue row marks it public — its CDC subject matches no stream. Publishing would block on every write. Declare it (zebridge_enable with public_reason or tenant_col) and restart the bridge.",
+                "🔴 REFUSING '{s}': not tenant-scoped and no catalogue row marks it public — its CDC subject matches no stream. Publishing would block on every write. Declare it (zebridge_enable with public_reason or tenant_col) — the bridge reloads on the catalogue row, no restart (§10bj).",
                 .{clean_table},
             );
             self.refused.refuse(clean_table, .no_cdc_subject) catch |err| {

@@ -337,6 +337,8 @@ pub const MutationListener = struct {
     io: std.Io,
     should_stop: *std.atomic.Value(bool),
     /// Per-table version/tombstone column overrides, `SYNC_RULES`.
+    /// The ENV's SYNC_RULES only — an immutable copy made at boot. The catalogue's
+    /// rules are read from the catalogue itself in `tableMeta` (§10bj).
     sync_rules: *const config.EventClassification.TransitionRules,
     default_version_column: []const u8,
     /// table -> catalog facts, resolved on first use. See `TableMeta`.
@@ -1273,6 +1275,9 @@ pub const MutationListener = struct {
         var version_name: []const u8 = self.default_version_column;
         var tombstone_name: ?[]const u8 = null;
         var client_name: ?[]const u8 = null;
+        // Kept until the names are duped into `meta` below — the values point into it.
+        var cat_res: ?*c.PGresult = null;
+        defer if (cat_res) |res_| c.PQclear(res_);
         if (self.sync_rules.get(table)) |cols| {
             // Positional, and an empty entry means "not configured" — `updated_at,,x`
             // is version + tiebreak with NO tombstone (see parseTableRules).
@@ -1282,6 +1287,26 @@ pub const MutationListener = struct {
             // winner's client_id is kept. Opt-in per table because it costs a column, and
             // a table that never sees concurrent equal versions does not need one.
             if (cols.len > 2 and cols[2].len > 0) client_name = cols[2];
+        } else if (conn) |cn| {
+            // Not named by the env: the CATALOGUE is the rule source, and it is read
+            // here — not from the bridge's rule map, which the replication thread
+            // rewrites on a live enable (§10bj). This struct is already re-read on
+            // every catalog epoch, and a catalogue row bumps it, so a changed rule
+            // reaches the write path without a restart.
+            const tbl_z = try alloc.dupeZ(u8, table);
+            defer alloc.free(tbl_z);
+            const cat_params = [_]?[*:0]const u8{tbl_z.ptr};
+            cat_res = c.PQexecParams(cn, "SELECT version_col::text, COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, '') FROM public.zebridge_catalogue WHERE tbl = $1", 1, null, &cat_params, null, null, 0);
+            if (cat_res) |cr| {
+                if (c.PQresultStatus(cr) == c.PGRES_TUPLES_OK and c.PQntuples(cr) == 1) {
+                    const v = std.mem.span(c.PQgetvalue(cr, 0, 0));
+                    const t = std.mem.span(c.PQgetvalue(cr, 0, 1));
+                    const k = std.mem.span(c.PQgetvalue(cr, 0, 2));
+                    if (v.len > 0) version_name = v;
+                    if (t.len > 0) tombstone_name = t;
+                    if (k.len > 0) client_name = k;
+                }
+            }
         }
 
         var version_type: VersionType = .other;

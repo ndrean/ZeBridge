@@ -7313,6 +7313,94 @@ consumer cleanup (the server's inactive threshold, §10bb). Left from §10be:
 `catalog_epoch` → CDC routing (§10k); column slicing (§10ab) postponed — not an easy
 subject; the browser full round trip to be measured after the routing work.
 
+## 10bj. catalog_epoch → CDC routing: a table enabled live, no restart (2026-08-29)
+
+§10k's roadmap line, and §11's two "+ bridge restart" rows. The rule maps
+(`tenant_rules`, `sync_rules`), `topology.public_tables` and CDC_PUBLIC's subject
+filter were read once at boot, so a table enabled while the bridge ran hit
+`isCdcRoutable == false` and was refused with "restart the bridge" in the message.
+
+**The signal is the catalogue row itself, through the WAL.** `zebridge_catalogue`
+now rides the publication like `zebridge_user_tenants` (an internal table in
+`zebridge_create_publication`, skipped by the publication guard, never published as
+CDC). Each of its rows — `zebridge_enable`'s upsert, a re-run's update, a delete —
+bumps the catalog epoch and marks the transaction; PROTOCOL §0 kept: nothing is read
+back from NATS.
+
+**What the reload does (`LiveCatalogue.reload`, bridge.zig).** `catalogue.loadRules`
+again — the env's SYNC_RULES/TENANT_RULES entries (snapshotted as key sets before the
+first read) still win; the catalogue ADDS, REPLACES and REMOVES everything else, and
+reports `changed`. `public_tables` re-pointed, old lists freed; `reconcileCdcStreams`
+(CDC_PUBLIC's filter, new tenants' streams); then, per changed table, symmetric:
+routable now → a standing `no_cdc_subject` refusal lifted; unrouted now (left the
+catalogue) → refused on the spot, because its next row would block the publisher on a
+subject no stream matches — the outage the refusal exists to prevent. Then
+`publishBootSchemas` for the changed set: a descriptor for a routable table, a
+suspension for a refused one. Plus any table the catalogue routes that a DDL event
+refused before the row arrived (a CREATE TABLE ahead of its enable).
+
+**Two defects the first live run found.** (1) The reload ran mid-transaction and
+published its schema at once, while the suspension from the refused `ALTER TABLE`
+inside `zebridge_enable`'s own transaction sat in `tx_slots_buf` until commit —
+the good 1089-byte descriptor, then the 97-byte suspension overwrote it. The reload
+now runs at `.commit`, after the transaction's slots are released, so it queues
+behind them in the same FIFO. (2) That ghost reached libzb's `migrateTable`, which
+`.?`'d into `sqlite.columns` and took the Python host down — a C-ABI host cannot catch
+a Zig panic (§10az). A descriptor without columns is `error.SchemaUnusable` now,
+logged and skipped, with a unit test on a suspension and on junk.
+
+**The one cross-thread hazard.** The mutation listener read `sync_rules` — a map the
+replication loop now rewrites. It reads the env-only copy (immutable) and, for every
+other table, the catalogue itself in `tableMeta` (`SELECT version_col, tombstone_col,
+tiebreak_col FROM zebridge_catalogue WHERE tbl = $1`), which is already re-read on
+every epoch — and a catalogue row bumps it. A changed rule reaches the write path
+without a restart, which retires §11's second row too.
+
+**Live — `libzb/python/live_enable.py`**, three cycles, 8/8 each, bridge pid
+unchanged throughout: `CREATE TABLE livetab` → its DDL event refused
+(`no_cdc_subject`, as before) → `zebridge_enable(livetab, tenant_col)` → "catalogue
+reloaded live" in the same second, refusal lifted, `$KV.schemas.livetab` in 0.04 s, a
+row inserted from psql in a libzb client via `CDC_kilo`; `zebridge_enable(pubtab,
+public_reason)` → `cdc.pubtab.>` in CDC_PUBLIC's filter in 0.26 s, its row in a client
+via `CDC_PUBLIC`; `DELETE FROM zebridge_catalogue WHERE tbl='pubtab'` → the subject
+gone in 0.26 s, the table refused, a suspension published. `leaks` on the running
+bridge after the three cycles: 0. Bridge unit tests 264/264.
+
+Retired with it: the "and restart the bridge" text in three refusal messages,
+README's restart-rules rows, §11's table. What still needs a restart: `BASE_BUF`
+(a sizing verdict, §10x), and a renamed grammar entry (PROTOCOL §1).
+
+## 10bk. The browser's full round trip — and the 200 ms that was a timer (2026-08-29)
+
+The measurement deferred at the end of §10bh, taken from inside the page
+(`window.zb`: `mutate` → poll `outbox()` empty for the verdict → poll
+`last_writer IS NOT NULL` on the row for the CDC echo, since only PostgreSQL sets the
+tiebreak column; ten rounds, web-consumer as omar, durable, OPFS):
+
+    optimistic apply (local SQLite in OPFS)   p50  13 ms   (11–24)
+    verdict settled (outbox empty)            p50  26 ms   (23–49)
+    CDC echo applied                          p50 235 ms   (230–256)
+
+The verdict says PostgreSQL had the row in ~26 ms; a Zig client sees the same echo in
+3 ms (§10bh); and the echo's ±3 ms flatness said "timer", not "queue". It was
+`BATCH_MS = 200` in the JS shell's CDC consume loop: events are batched into one
+transaction per flush (right — N autocommits each pay an OPFS fsync), and the batch
+flushed on a 200 ms timer unless it filled — so a lone event always waited the full
+200 ms. The same shape as nats.zig's `fetch` this afternoon, one layer up.
+
+**The rule, not the number.** JetStream tells a consumer per message how many are
+still pending (`msg.info.pending`). When this message was the last in flight, flush
+now; when more follow, keep batching. A lone event lands at once, a burst still lands
+as one transaction. Re-measured after the change (tab reloaded, ten rounds):
+
+    CDC echo applied                          p50  36 ms   (32–65)
+
+Verdict and optimistic unchanged. What remains of the 36 ms: the bridge's ~4 ms
+(§10bh), the websocket hop, the OPFS transaction commit (~10 ms, the same cost the
+optimistic apply shows), and the 2 ms poll granularity of the measurement itself.
+127/127 TS tests, `tsc` clean. Whether the web-consumer's own UI adds anything on top
+was not measured — this is the shell, which is what every JS host gets.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
@@ -7322,8 +7410,8 @@ The restart rules, as they stand today
 
 |  Change  |  What's needed.  |
 |----------| -----------------|
-| New table (public or tenant-scoped)  | one zebridge_enable(...) migration + one bridge restart — boot reads the catalogue and, for public tables, reconciles CDC_PUBLIC's subject filter itself. No env edit, no nats stream edit. |
-| Changed rule on an existing table (version/tombstone/tiebreak/tenant_col)  | catalogue row updates via zebridge_enable re-run + bridge restart (boot-level read; the sweeper likewise re-reads on its own restart) |
+| New table (public or tenant-scoped)  | one zebridge_enable(...) migration, NO restart since §10bj — the catalogue row arrives through the WAL and the bridge reloads rules, CDC_PUBLIC's filter, refusals and the schema itself. (Until 2026-08-29: + one restart.) |
+| Changed rule on an existing table (version/tombstone/tiebreak/tenant_col)  | zebridge_enable re-run, NO restart since §10bj (the write path reads the catalogue on the epoch the row bumps; the sweeper still re-reads on its own restart) |
 | New tenant | zero bridge restarts: backend creates CDC_<T>/INIT_<T>, inserts the zebridge_user_tenants row (propagates live to $KV.tenants) — plus the NATS grant block + SIGHUP (reload, not restart) until the JWT signing key |
 | New user on an existing tenant    | conf grant + SIGHUP only  |
 | DROP TABLE   | nothing for the bridge — but purge the four ghost sources (chain, descriptor, INIT chunks, CDC retention) or resh clients resurrect rows |

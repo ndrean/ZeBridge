@@ -86,7 +86,7 @@ pub const Reason = enum {
             .row_too_large => "restart with a larger BASE_BUF, or move the oversized column out of the replicated table",
             .no_tenant_column => "add the column the catalogue/TENANT_RULES names, or correct the rule",
             .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
-            .no_cdc_subject => "declare the table in zebridge_catalogue (zebridge_enable with public_reason or tenant_col) and restart the bridge — boot reconciles CDC_PUBLIC's subjects from it",
+            .no_cdc_subject => "declare the table in zebridge_catalogue (zebridge_enable with public_reason or tenant_col) — the bridge reloads on the catalogue row and lifts this itself, no restart",
         };
     }
 };

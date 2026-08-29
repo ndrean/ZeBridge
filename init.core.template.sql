@@ -290,6 +290,9 @@ BEGIN
         -- `cdc.zebridge_user_tenants.*` would hand every client with a broad CDC grant
         -- exactly that roster.
         CONTINUE WHEN relid::regclass::text LIKE '%zebridge_user_tenants';
+        -- A control table like the two above: the bridge diverts its rows into a
+        -- catalogue reload and never publishes them (NOTES §10bj).
+        CONTINUE WHEN relid::regclass::text LIKE '%zebridge_catalogue';
         CONTINUE WHEN EXISTS (SELECT 1 FROM public.zebridge_catalogue cat
                               WHERE cat.tbl = (SELECT relname FROM pg_class WHERE oid = relid)
                                 AND cat.tenant_col IS NULL);
@@ -327,6 +330,7 @@ RETURNS TABLE (publication name, tbl text, row_filter text, rls boolean, verdict
            c.relrowsecurity,
            CASE
              WHEN pr.prrelid::regclass::text LIKE '%zebridge_ddl_events' THEN 'internal — expected'
+             WHEN pr.prrelid::regclass::text LIKE '%zebridge_catalogue' THEN 'internal — expected'
              WHEN pr.prqual IS NULL AND NOT c.relrowsecurity THEN
                'PASS-THROUGH — every row reaches every subscriber of this publication'
              WHEN pr.prqual IS NULL AND c.relrowsecurity THEN
@@ -373,7 +377,10 @@ DECLARE
     t        text;
     -- Existence-checked one by one rather than assumed: zebridge_user_tenants
     -- lives in init.write, which a readonly-profile database never applies.
-    internal text[] := ARRAY['zebridge_ddl_events', 'zebridge_gc_watermark', 'zebridge_user_tenants'];
+    -- zebridge_catalogue rides along so a running bridge sees zebridge_enable's row
+    -- the way it sees DDL — through the WAL — and reloads its routing without a
+    -- restart (NOTES §10bj). Its rows are never published as CDC.
+    internal text[] := ARRAY['zebridge_ddl_events', 'zebridge_gc_watermark', 'zebridge_user_tenants', 'zebridge_catalogue'];
 BEGIN
     IF p_name IS NULL OR p_name = '' THEN
         RAISE EXCEPTION 'zebridge_create_publication: no name given'
@@ -1651,15 +1658,16 @@ BEGIN
     END IF;
 
     -- ── T3 and T4 live outside the database and always will ───────────────────
-    RETURN QUERY SELECT 'T3 bridge', 'MANUAL',
+    RETURN QUERY SELECT 'T3 bridge', 'LIVE',
         CASE WHEN tenant_col IS NULL
-             THEN 'restart the bridge — boot reconciles CDC_PUBLIC''s subject filter from the '
-                  'catalogue, so a NEW public table needs one restart to gain its subject. '
-                  'No env transcription, no stream edit by hand.'
-             ELSE 'restart the bridge — it reads zebridge_catalogue at boot, so the routing for a '
-                  'NEW tenant-scoped table needs one restart (no env transcription: SYNC_RULES/'
-                  'TENANT_RULES are legacy overrides now). The generation chain needs nothing — '
-                  'the producer reads the catalogue per tick.' END;
+             THEN 'nothing to do — the catalogue row this wrote reaches a running bridge '
+                  'through the WAL; it reconciles CDC_PUBLIC''s subject filter, lifts the '
+                  'table''s refusal and publishes its schema on the spot (NOTES §10bj). '
+                  'A bridge started later reads the same row at boot.'
+             ELSE 'nothing to do — the catalogue row this wrote reaches a running bridge '
+                  'through the WAL; it reloads its routing, lifts the table''s refusal and '
+                  'publishes its schema on the spot (NOTES §10bj). The generation chain '
+                  'needs nothing either — the producer reads the catalogue per tick.' END;
     RETURN QUERY SELECT 'T4 nats conf', 'MANUAL',
         CASE WHEN tenant_col IS NULL
              THEN format('grant subscribe on cdc.%s.> — and init.snap.%s.> to match, because a '

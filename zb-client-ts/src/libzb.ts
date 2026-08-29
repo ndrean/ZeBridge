@@ -1788,7 +1788,14 @@ export class ZeBridge {
             }
             batchMsgs.push(msg);
 
-            if (batch.length >= BATCH_SIZE) {
+            // ⚠️ The timer is for a BURST, not for a lone event. JetStream tells us per
+            // message how many are still pending for this consumer; when this one was
+            // the last in flight, waiting BATCH_MS gains nothing and costs exactly
+            // BATCH_MS — measured in the browser 2026-08-29: a write's CDC echo landed
+            // at 235 ± 3 ms while the verdict took 26 ms and a Zig client saw the same
+            // echo in 3 ms. Flush now when nothing follows; batch when something does.
+            const lastInFlight = typeof msg.info?.pending === 'number' && msg.info.pending === 0;
+            if (batch.length >= BATCH_SIZE || lastInFlight) {
               await flushBatch();
             } else if (!flushTimer) {
               flushTimer = setTimeout(() => { void flushBatch(); }, BATCH_MS);

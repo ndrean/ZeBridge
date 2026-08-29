@@ -27,10 +27,19 @@ const c = c_imports.c;
 
 const log = std.log.scoped(.catalogue);
 
-/// What one boot-time read of the catalogue produced. The slices are allocated from
-/// the caller's allocator; the caller owns them for the life of the process (the
-/// bridge reads the catalogue exactly once, at boot) and frees them via `deinit` on
-/// the way out — an early exit (a refused NATS auth, say) must leave a clean
+/// The tables the ENV named (SYNC_RULES / TENANT_RULES) — snapshotted before the
+/// first catalogue read. An env entry overrides the catalogue for its table, at boot
+/// and on every reload; the catalogue owns every other table's entry outright.
+pub const KeySet = std.StringHashMap(void);
+pub const Env = struct {
+    tenant_keys: *const KeySet,
+    sync_keys: *const KeySet,
+};
+
+/// What one read of the catalogue produced. The slices are allocated from the
+/// caller's allocator; the caller owns them until the next read replaces them (the
+/// bridge re-reads on every `zebridge_catalogue` row the WAL carries — §10bj) and frees
+/// them via `deinit` — an early exit (a refused NATS auth, say) must leave a clean
 /// allocator audit, not a "lives forever" euphemism. Entries merged into the rule
 /// MAPS are owned by the maps and freed by their own deinits, not here.
 pub const Load = struct {
@@ -46,26 +55,117 @@ pub const Load = struct {
     publics: []const []const u8 = &.{},
     /// DISTINCT tenants from `zebridge_user_tenants` — whose streams boot ensures.
     tenants: []const []const u8 = &.{},
+    /// Tables whose rules were added, replaced or removed by THIS read — what a live
+    /// reload must (re)publish a schema for or lift a refusal on. Empty at boot.
+    changed: []const []const u8 = &.{},
 
     pub fn deinit(self: *Load, allocator: std.mem.Allocator) void {
         for (self.publics) |name| allocator.free(name);
         if (self.publics.len > 0) allocator.free(self.publics);
         for (self.tenants) |name| allocator.free(name);
         if (self.tenants.len > 0) allocator.free(self.tenants);
+        for (self.changed) |name| allocator.free(name);
+        if (self.changed.len > 0) allocator.free(self.changed);
         self.* = .{};
     }
 };
 
-/// Merge catalogue rows into the already-parsed env maps (env wins per table) and
-/// collect the boot-scope lists. Never fails: every degraded shape logs and returns
-/// what it could get.
+fn freeCols(allocator: std.mem.Allocator, cols: []const []const u8) void {
+    for (cols) |col| allocator.free(col);
+    allocator.free(cols);
+}
+
+/// Put `cols` under `tbl` unless the env owns that table. Returns true when the map
+/// changed (added, or replaced with a different value). A replaced value is freed
+/// here; the key is the map's and stays.
+fn upsertRule(
+    allocator: std.mem.Allocator,
+    map: *config.EventClassification.TransitionRules,
+    env_keys: *const KeySet,
+    tbl: []const u8,
+    cols: []const []const u8,
+) bool {
+    if (env_keys.contains(tbl)) {
+        freeCols(allocator, cols);
+        return false;
+    }
+    if (map.getPtr(tbl)) |vp| {
+        var same = vp.*.len == cols.len;
+        if (same) for (vp.*, cols) |x, y| {
+            if (!std.mem.eql(u8, x, y)) same = false;
+        };
+        if (same) {
+            freeCols(allocator, cols);
+            return false;
+        }
+        freeCols(allocator, vp.*);
+        vp.* = cols;
+        return true;
+    }
+    const key = allocator.dupe(u8, tbl) catch {
+        freeCols(allocator, cols);
+        return false;
+    };
+    map.put(key, cols) catch {
+        allocator.free(key);
+        freeCols(allocator, cols);
+        return false;
+    };
+    return true;
+}
+
+/// Drop every catalogue-owned entry whose table the catalogue no longer lists.
+fn pruneRules(
+    allocator: std.mem.Allocator,
+    map: *config.EventClassification.TransitionRules,
+    env_keys: *const KeySet,
+    seen: *const KeySet,
+    changed: *std.ArrayList([]const u8),
+) void {
+    var gone: std.ArrayList([]const u8) = .empty;
+    defer gone.deinit(allocator);
+    var it = map.iterator();
+    while (it.next()) |e| {
+        if (env_keys.contains(e.key_ptr.*) or seen.contains(e.key_ptr.*)) continue;
+        gone.append(allocator, e.key_ptr.*) catch continue;
+    }
+    for (gone.items) |k| {
+        const kv = map.fetchRemove(k) orelse continue;
+        // Once per table, not once per map it was pruned from: a removed table
+        // appeared twice here (tenant + sync) and had its suspension published twice.
+        var listed = false;
+        for (changed.items) |cname| {
+            if (std.mem.eql(u8, cname, kv.key)) listed = true;
+        }
+        if (!listed) {
+            changed.append(allocator, allocator.dupe(u8, kv.key) catch {
+                allocator.free(kv.key);
+                freeCols(allocator, kv.value);
+                continue;
+            }) catch {};
+        }
+        allocator.free(kv.key);
+        freeCols(allocator, kv.value);
+    }
+}
+
+/// Read the catalogue into the rule maps (env wins per table; the catalogue ADDS,
+/// REPLACES and REMOVES everything else) and collect the scope lists. Never fails:
+/// every degraded shape logs and returns what it could get. Called at boot and again
+/// on every `zebridge_catalogue` row the WAL delivers (§10bj), from the same thread
+/// that reads the maps for CDC — the mutation listener never reads them (it has the
+/// env map and the catalogue itself).
 pub fn loadRules(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
     tenant_rules: *config.EventClassification.TransitionRules,
     sync_rules: *config.EventClassification.TransitionRules,
+    env: Env,
 ) Load {
     var out: Load = .{};
+    var changed: std.ArrayList([]const u8) = .empty;
+    var seen: KeySet = .init(allocator);
+    defer seen.deinit();
 
     const conninfo = pg_config.connInfo(allocator, false) catch return out;
     defer allocator.free(conninfo);
@@ -107,26 +207,23 @@ pub fn loadRules(
             publics.append(allocator, name) catch continue;
         }
 
-        if (tenant_col.len > 0 and tenant_rules.get(tbl) == null) {
-            const key = allocator.dupe(u8, tbl) catch continue;
-            var cols = allocator.alloc([]const u8, 1) catch {
-                allocator.free(key);
-                continue;
-            };
+        seen.put(tbl, {}) catch {};
+        if (tenant_col.len > 0) {
+            var cols = allocator.alloc([]const u8, 1) catch continue;
             cols[0] = allocator.dupe(u8, tenant_col) catch {
                 allocator.free(cols);
-                allocator.free(key);
                 continue;
             };
-            tenant_rules.put(key, cols) catch {
-                allocator.free(cols[0]);
-                allocator.free(cols);
-                allocator.free(key);
-                continue;
-            };
-            grew = true;
+            if (upsertRule(allocator, tenant_rules, env.tenant_keys, tbl, cols)) grew = true;
+        } else if (!env.tenant_keys.contains(tbl)) {
+            // Public now: a tenant rule the catalogue used to carry goes.
+            if (tenant_rules.fetchRemove(tbl)) |kv| {
+                allocator.free(kv.key);
+                freeCols(allocator, kv.value);
+                grew = true;
+            }
         }
-        if (sync_rules.get(tbl) == null) {
+        {
             // POSITIONAL grammar mirrored from parseTableRules: version, tombstone,
             // tiebreak — and position IS the meaning, so a tiebreak with no tombstone
             // keeps an empty placeholder in slot 1. Sliding it forward made the
@@ -138,13 +235,19 @@ pub fn loadRules(
                 list.append(allocator, allocator.dupe(u8, tombstone_col) catch continue) catch continue;
             if (tiebreak_col.len > 0)
                 list.append(allocator, allocator.dupe(u8, tiebreak_col) catch continue) catch continue;
-            const key = allocator.dupe(u8, tbl) catch continue;
-            sync_rules.put(key, list.toOwnedSlice(allocator) catch continue) catch continue;
-            grew = true;
+            const cols = list.toOwnedSlice(allocator) catch continue;
+            if (upsertRule(allocator, sync_rules, env.sync_keys, tbl, cols)) grew = true;
         }
-        if (grew) out.merged += 1;
+        if (grew) {
+            out.merged += 1;
+            changed.append(allocator, allocator.dupe(u8, tbl) catch continue) catch {};
+        }
     }
     out.publics = publics.toOwnedSlice(allocator) catch &.{};
+    // Tables gone from the catalogue: their catalogue-owned rules go with them.
+    pruneRules(allocator, tenant_rules, env.tenant_keys, &seen, &changed);
+    pruneRules(allocator, sync_rules, env.sync_keys, &seen, &changed);
+    out.changed = changed.toOwnedSlice(allocator) catch &.{};
 
     // Tenants are data, not config: whoever is mapped today is whose streams boot
     // must ensure. RLS does not hide this from the bridge role (the boot KV backfill
@@ -166,8 +269,8 @@ pub fn loadRules(
     }
     out.tenants = tenants.toOwnedSlice(allocator) catch &.{};
 
-    log.info("🗂️ catalogue: {d} row(s), {d} table(s) gained rules (env entries override), {d} public, {d} tenant(s)", .{
-        out.rows, out.merged, out.publics.len, out.tenants.len,
+    log.info("🗂️ catalogue: {d} row(s), {d} table(s) gained or changed rules (env entries override), {d} public, {d} tenant(s), {d} changed", .{
+        out.rows, out.merged, out.publics.len, out.tenants.len, out.changed.len,
     });
     return out;
 }
