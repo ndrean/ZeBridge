@@ -175,6 +175,38 @@ pub fn classifyVersionColumn(
 ///
 /// Refusal, not a warning: a table whose deletes cannot be addressed would leave rows in
 /// every replica that ever held them, and no later event could remove them.
+/// Generation-enabled tables WITHOUT a tombstone column: their deletes are hard, so the
+/// producer's version predicate cannot see them and it falls back to count(*) and
+/// `pg_stat_user_tables.n_tup_del`, forcing a FULL whenever either moved (NOTES §10bb).
+/// Correct, but a full per delete batch where a tombstone column would make each
+/// delete an ordinary versioned row. Said once at boot and on every DDL event, like
+/// the other shape reports — a catalogue choice, not a fault.
+pub fn reportTombstoneColumns(allocator: std.mem.Allocator, conn: *c.PGconn, publication_name: []const u8) void {
+    const query = utils.allocPrintZ(allocator,
+        \\SELECT pt.tablename
+        \\FROM pg_publication_tables pt
+        \\LEFT JOIN public.zebridge_catalogue cat ON cat.tbl = pt.tablename
+        \\WHERE pt.pubname = '{s}'
+        \\  AND COALESCE(cat.generations, true)
+        \\  AND cat.tombstone_col IS NULL
+        \\  AND NOT public.zebridge_is_internal_table(pt.tablename)
+        \\  AND pt.tablename <> 'zebridge_gc_watermark'
+        \\ORDER BY 1;
+    , .{publication_name}) catch return;
+    defer allocator.free(query);
+    const res = c.PQexec(conn, query.ptr);
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.warn("⚠️  Tombstone-column report skipped: {s}", .{c.PQerrorMessage(conn)});
+        return;
+    }
+    const n: usize = @intCast(c.PQntuples(res));
+    for (0..n) |i| {
+        const table = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
+        log.info("🪦 '{s}': no tombstone column — deletes are hard, detected by row count and n_tup_del, each costing a full generation; a tombstone column makes them ordinary versioned rows", .{table});
+    }
+}
+
 pub fn reportTenantColumns(
     allocator: std.mem.Allocator,
     conn: *c.PGconn,
@@ -980,6 +1012,7 @@ pub fn run(
     reportVersionColumns(allocator, conn, publication_name, sync_rules, default_version_column, writer_role, writable) catch |err| {
         log.warn("⚠️  Version-column report failed: {}", .{err});
     };
+    reportTombstoneColumns(allocator, conn, publication_name);
 
     // Last, because a table that cannot replicate at all does not need its read scoping
     // checked — and because this one *refuses* tables, so it must run after the shape

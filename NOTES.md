@@ -3479,10 +3479,15 @@ zig build test-nats
 | `zebridge_catalogue` | **THE catalogue — one row per replicated table, the single source the bridge, the sweeper and the generation producer read.** `tenant_col NULL` = public (the CHECK forces a recorded `public_reason`, so an unscoped, unjustified row is unrepresentable), NOT NULL = tenant-scoped; `version_col`/`tombstone_col`/`tiebreak_col` are the LWW columns; `generations` opts a table out of chain building. UPSERTed by `zebridge_enable` in the same transaction as the guards it installs, loaded by the bridge at boot (rule maps, the public set for CDC_PUBLIC's subject reconciliation) and by the producer per tick. Absorbed and replaced `zebridge_public_tables` and `zebridge_generation_overrides` — both were projections of it. `SYNC_RULES`/`TENANT_RULES` env demoted to per-table emergency overrides. |
 | `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
 | `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
-| `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. |
+| `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. Since §10bb also `row_count` (tenant-scoped `count(*)` inside the build's snapshot) and `del_count` (`pg_stat_user_tables.n_tup_del`, cumulative) at the cutoff: a hard delete is invisible to the version predicate, so the producer skips a tick only when the version predicate, the count AND the delete count all held; either moving forces a full, because only a full can carry an absence. NULL on rows from before the columns → built once. |
 | `zebridge_limits` | One row per INSTANCE (`slot` PK, `publication`, `max_row_bytes`, `updated_at`), registered by each bridge at boot from its own `2^BASE_BUF` via `zebridge_register_limits()` — never maintained by hand; rows whose slot has left `pg_replication_slots` are GC'd on the next boot. ⚠️ NOT read at write time: a table's budget (MIN over the instances whose publication carries it, via the `pg_publication_tables` join) is BAKED as a literal into its `zebridge_width_guard_<tbl>` body — §10b measured the literal free vs +4.81µs/row for a lookup and +22µs/row for the join — and re-derived at every bridge boot and at every `zebridge_enable` (§10l finding 8). The table is the source; the trigger body is the cache. |
 
 #### Client-Side Tables (`zb-client-ts/src/libzb.ts` — the extracted package; web-consumer and the Node consumer both import it)
+
+Created by the shell through the storage adapter's dialect (`zb-client-ts/src/dialect.ts`, §10bc): on SQLite the
+64-bit columns below (LSNs, stream seqs, millisecond stamps) are `INTEGER`, blobs `BLOB`, the inbox key
+`INTEGER PRIMARY KEY AUTOINCREMENT`; on PostgreSQL (PGlite) they are `BIGINT`, `BYTEA`, `BIGSERIAL` — the same
+tables, one definition, two spellings.
 
 | Table Name | Role / Description |
 | :--- | :--- |
@@ -3490,6 +3495,7 @@ zig build test-nats
 | `_zebridge_sync` | Stores the `global_last_lsn` (PostgreSQL WAL position) successfully applied by the consumer, allowing it to discard already-seen CDC events. (Contains a legacy `global_last_seq` column). |
 | `_zebridge_stream_seq` | One durable position per stream (`last_seq`). The gap check compares it against the stream's `first_seq` on reconnect. Advanced per delivered BATCH, not per applied event (§10m D1): an applied event is in the tables, a gated one is provably in the seeded chain, a held one is durably in the inbox — all three account for the message. |
 | `_zebridge_inbox` | Durable FK hold (§10h): events whose parent row has not arrived yet (cross-table/cross-stream ordering is not guaranteed) are parked here in the same transaction that failed them, and replayed bulk-first after later batches. Pruned when a seed covers them (`lsn <= watermark`) or the table is dropped — never by age. |
+| `_zebridge_dicts` | The §10x dictionary cache (`name PK, bytes`): a delta names the zstd dictionary it was compressed with; fetched once from the generation bucket and kept, since a dictionary is immutable by name. Best-effort — absent on an older replica, refetched. |
 | `_zebridge_generations` | Per-table generation WATERMARK (`tbl PK, watermark, cutoff_lsn`) — the client tracks cutoffs, never gen numbers (a gen is an object-naming detail; the cutoff is what deltas chain on). On reconnect the chain walk applies only deltas whose `cutoff` exceeds the stored watermark. |
 
 <br>
@@ -6547,9 +6553,9 @@ carrying it. A per-feed outage that otherwise reads as a mystery. Verified live.
 
 ## 10bb. The producer cannot see a delete — and the client review that found it (2026-08-29)
 
-**Queued, not fixed.** The stack is being pruned of speed.py's residue first
-(2M `users` rows, stale chains, ~1 GB of `cdc.users.insert.batch`), so that what
-follows is checked against a known state and not one of unknown origin. Then this.
+**Found queued, closed the same day** — the section reads in the order it happened:
+the defect, the prune that gave a known baseline, the count-at-cutoff fix, the
+n_tup_del closure of its blind spot, and the preflight report (all below).
 
 **The defect.** `generation_producer.zig:387`, skip-if-unchanged:
 
@@ -6651,6 +6657,31 @@ attached at 15 s and 40 s: **0 leaks both times**, malloc nodes 492 -> 494 and
 1,858 KB -> 1,938 KB, RSS 4.9 -> 5.0 MB. Flat — where the old client grew ~3 MiB of
 arena per second of soak. `leaks --atExit` on `zb-demo` (full seed + drain): 0 leaks.
 Both binaries' Zig tests: 14 pass, 1 gated skip.
+
+**The blind spot, closed with `n_tup_del` (same day).** The count check cannot see N
+inserts exactly offset by N deletes of untouched rows. `pg_stat_user_tables.n_tup_del`
+can: cumulative per table, it only grows, and the reader role can read it. Recorded
+per generation as `del_count` (template + live ALTER); moved since the last cutoff →
+a full is forced whatever the count says, and whatever the version predicate says
+(changed-by-version + deletes → full alongside the delta). NULL on a row from before
+the column → build once and record, like `row_count`. Table-wide, not tenant-scoped,
+so one tenant's delete costs every tenant of that table a full — conservative and
+cheap. Lags a commit by up to ~500 ms, far inside a 60 s cadence; a stats reset drops
+it to 0, which reads as "moved" and costs one extra full.
+
+Provoked exactly: an INSERT with `updated_at = now() - 1 hour` (invisible to the
+version predicate) plus a DELETE of an untouched original row — count 2 before and
+after. Next tick: "no version moved and the count held since g10, but n_tup_del
+moved (244 -> 245) — deletes offset by inserts; forcing a full" → g11 full,
+`row_count 2, del_count 245`.
+
+**And the catalogue side, as a report rather than a rule.** `preflight.reportTombstoneColumns`
+now says, at boot and on every DDL event, for each generation-enabled table without a
+tombstone column: deletes are hard, detected by count and n_tup_del, each costing a
+full — a tombstone column makes them ordinary versioned rows. Seven tables here
+(`counter_public`, `counter_tenant`, `memo`, `note_t`, `orders`, `salaries`, `users`).
+Not a refusal: the shape is legitimate for a table that is rarely deleted from, and
+the bridge is now correct either way — the report is the cost, stated.
 
 **Browser, same day, fresh OPFS replica (`?principal=omar&auth=creds`).** `test_types`
 shows **8** rows — chain g70 carried 182, the rule removed the tombstoned 174 — and
@@ -6902,6 +6933,27 @@ trigger each time, the replica checked after each step:
           back to `uid, txt, updated_at`, `memo_pkey` only, no FK, view intact, rows 2.
   SQLite  the same forward sequence → the rebuild path, stored DDL now carrying the
           FOREIGN KEY, column and index present, rows 2; reverted → original shape.
+**The Node consumer on PGlite (same day).** `examples/04-node-consumer` gained
+`ZB_ENGINE=pglite`: `makePgliteStorage({ persist: true, dataDir: '/tmp' })` — in Node
+PGlite persists to a plain directory (`<dataDir>/<dbName>`), so the adapter now picks
+`idb://` in a browser and a directory in Node from the same `persist` switch, and
+`deleteDatabaseFile` removes whichever it made. Three runs: the first seeded from the
+chains with every count equal to the browser replica's (memo 2, test_types 9,
+salaries 0 — the fresh-replica truth), wrote a full typed row through `mutate()` and
+read it back as real arrays, a jsonb object, a boolean and an eight-decimal numeric;
+the second and third RESUMED the persisted directory — no gap, no re-seed, consumers
+picked up at their stored positions with nothing pending, 10 → 11 → 12. PASS each
+time. Two corrections to the example on the way: it used to INSERT a fresh random uid
+into `counter_public` on every run — the very habit that minted the 27 stray counter
+rows — so it now writes a full row to `test_types`; and its SQLite baseline had
+silently RESUMED a stale `zebridge_omar.sqlite3` from 08-26 (`durable: true` names the
+file, the printed `DB` path was never passed), showing 17 salaries and 6 memos that
+PostgreSQL no longer had, with no gap to trigger a re-seed — the file is gone, and it
+is the same lesson as the producer's: a replica with no gap and no event has no path
+back to the truth for rows that vanished while it was away. One adapter tidy-up: the
+PGlite session is pinned to UTC, so a timestamptz renders as the wire's instant rather
+than the host's zone.
+
 Nothing is open on PGlite now. The write-path lock is answered by construction (one
 owned connection, `query()`/`mutate()` only) and README says so.
 

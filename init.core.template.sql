@@ -568,6 +568,10 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolea
 -- count(*) against this catches it and forces a full — the only artifact that can
 -- tell a client a row is gone. NULL on rows from before the column: built once.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS row_count bigint;
+-- pg_stat_user_tables.n_tup_del for the table at this cutoff: cumulative deletes,
+-- which offsetting inserts cannot hide from count(*). Moved since the last
+-- generation → a full is forced (NOTES §10bb).
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS del_count bigint;
 
 -- ⚠️ The ONE deliberate write grant the read role holds, and why it is not a breach of
 -- "the read role is physically unable to write": the generation's content query MUST

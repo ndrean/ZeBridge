@@ -8,15 +8,16 @@
     "start": "node --experimental-strip-types index.ts"
   },
   "dependencies": {
-    "zb-client-ts": "link:../../zb-client-ts",
-    "better-sqlite3": "^12.4.1",
-    "@nats-io/transport-node": "^3.4.0",
-    "@nats-io/nats-core": "^3.4.0",
+    "@electric-sql/pglite": "0.5.8",
+    "@msgpack/msgpack": "^3.0.0-beta.1",
     "@nats-io/jetstream": "^3.4.0",
     "@nats-io/kv": "^3.4.0",
+    "@nats-io/nats-core": "^3.4.0",
     "@nats-io/obj": "3.4.0",
-    "@msgpack/msgpack": "^3.0.0-beta.1",
+    "@nats-io/transport-node": "^3.4.0",
+    "better-sqlite3": "^12.4.1",
     "sqlocal": "^0.18.0",
-    "uuid": "^14.0.1"
+    "uuid": "^14.0.1",
+    "zb-client-ts": "link:../../zb-client-ts"
   }
 }

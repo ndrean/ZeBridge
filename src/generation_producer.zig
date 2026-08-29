@@ -369,15 +369,23 @@ pub const GenerationProducer = struct {
         // The row count at the last generation's cutoff — null on rows written
         // before the column existed, which reads as "unknown" and builds once.
         var last_row_count: ?i64 = null;
+        // The table's cumulative delete count (pg_stat_user_tables.n_tup_del) at the
+        // last cutoff — the one number a hard delete cannot hide from, even when
+        // offset by an insert. Table-wide, not tenant-scoped: any tenant's delete
+        // costs every tenant of that table one full, which is conservative and cheap.
+        var last_del_count: ?i64 = null;
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(pgc, "SELECT gen, cutoff_version::text, row_count FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(pgc, "SELECT gen, cutoff_version::text, row_count, del_count FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
                 last_cutoff = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 1)));
                 if (c.PQgetisnull(res, 0, 2) == 0) {
                     last_row_count = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 2)), 10) catch null;
+                }
+                if (c.PQgetisnull(res, 0, 3) == 0) {
+                    last_del_count = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 3)), 10) catch null;
                 }
             }
         }
@@ -512,18 +520,43 @@ pub const GenerationProducer = struct {
             defer c.PQclear(res);
             break :blk std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
         };
+        // ⚠️ The count's blind spot, closed: N inserts exactly offset by N deletes of
+        // rows untouched since the cutoff leave count(*) unchanged. The statistics
+        // collector's n_tup_del is cumulative per table and only ever grows — if it
+        // moved, something was deleted, whatever the count says. It lags a commit by
+        // up to ~500 ms, far inside a cadence; a stats reset drops it to 0, which reads
+        // as "moved" and costs one extra full. NULL for a table the collector has not
+        // seen yet: treated as 0.
+        const del_count_now: i64 = blk: {
+            const res = try queryOne(pgc, "SELECT COALESCE(n_tup_del, 0) FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = $1", &.{table_z.ptr});
+            defer c.PQclear(res);
+            if (c.PQntuples(res) == 0) break :blk 0;
+            break :blk std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
+        };
+        const deletes_moved = if (last_del_count) |prev| del_count_now != prev else false;
         if (unchanged_by_version) {
-            if (last_row_count) |prev| {
-                if (prev == row_count_now) {
-                    log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows) — skipped", .{ tenant, table, last_gen, prev });
+            if (last_row_count) |prev| if (last_del_count == null) {
+                log.info("🧬 '{s}'/'{s}': no delete count recorded for g{d} — building once to record {d}", .{ tenant, table, last_gen, del_count_now });
+            } else {
+                if (prev == row_count_now and !deletes_moved) {
+                    log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows, {d} deletes) — skipped", .{ tenant, table, last_gen, prev, del_count_now });
                     const rb = try queryOne(pgc, "ROLLBACK", &.{});
                     c.PQclear(rb);
                     return;
                 }
-                log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the row count did ({d} -> {d}) — rows were deleted; forcing a full", .{ tenant, table, last_gen, prev, row_count_now });
+                if (prev != row_count_now) {
+                    log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the row count did ({d} -> {d}) — rows were deleted; forcing a full", .{ tenant, table, last_gen, prev, row_count_now });
+                } else {
+                    log.info("🧬 '{s}'/'{s}': no version moved and the count held since g{d}, but n_tup_del moved ({d} -> {d}) — deletes offset by inserts; forcing a full", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
+                }
             } else {
                 log.info("🧬 '{s}'/'{s}': no row count recorded for g{d} — building once to record {d}", .{ tenant, table, last_gen, row_count_now });
             }
+            build_full = true;
+        } else if (deletes_moved) {
+            // Changed by version AND something was deleted: the delta carries what
+            // moved, a full is the only thing that can carry an absence.
+            log.info("🧬 '{s}'/'{s}': n_tup_del moved since g{d} ({d} -> {d}) — forcing a full alongside the delta", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
             build_full = true;
         } else if (last_row_count) |prev| if (row_count_now < prev) {
             // Changed by version AND shrunk: the delta will carry the survivors that
@@ -701,10 +734,11 @@ pub const GenerationProducer = struct {
             const dict_hex_z: ?[*:0]const u8 = if (build_full) (if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null) else null;
             const dict_obj_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
             const count_z = try utils.allocPrintZ(alloc, "{d}", .{row_count_now});
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr };
+            const del_z = try utils.allocPrintZ(alloc, "{d}", .{del_count_now});
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr };
             const res = try queryOne(pgc,
-                "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count) " ++
-                    "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint) " ++
+                "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count) " ++
+                    "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint) " ++
                     "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }

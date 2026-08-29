@@ -34,9 +34,15 @@ import { numberPlaceholders, postgresDialect } from './dialect.ts';
 const asText = (x: string | null) => x;
 
 export type PgliteStorageOptions = {
-  /// Keep the database across reloads (`idb://<dbName>`); default in memory.
+  /// Keep the database across reloads/restarts; default in memory. In the browser
+  /// this is `idb://<dbName>`; in Node a directory `<dataDir>/<dbName>` (PGlite's
+  /// node filesystem backend), `dataDir` defaulting to the working directory.
   persist?: boolean;
+  /// Node only: the parent directory for a persisted database.
+  dataDir?: string;
 };
+
+const isNode = typeof process !== 'undefined' && !!(process as any).versions?.node && typeof indexedDB === 'undefined';
 
 export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFactory {
   return (dbName) => {
@@ -47,8 +53,10 @@ export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFacto
     // apparently in place). An object as the first argument keeps them; `dataDir`
     // inside it selects persistence.
     const idbName = `/pglite/${dbName}`;
+    const nodeDir = `${opts.dataDir ?? '.'}/${dbName}`;
+    const location = !opts.persist ? undefined : isNode ? nodeDir : `idb://${dbName}`;
     const pg = new PGlite({
-      ...(opts.persist ? { dataDir: `idb://${dbName}` } : {}),
+      ...(location ? { dataDir: location } : {}),
       parsers: {
         [types.INT8]: (x: string | null) => (x === null ? null : Number(x)),
         [types.TIMESTAMPTZ]: asText,
@@ -57,6 +65,11 @@ export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFacto
         [types.NUMERIC]: asText,
       },
     });
+    // UTC for the one session, so a timestamptz renders as the wire's instant
+    // (`… +00`) rather than the host's zone — PGlite inherits the process/browser
+    // zone otherwise, and the replica then shows `+01` text next to SQLite's `Z`.
+    // Queued behind PGlite's own init; the first real statement follows it.
+    void pg.exec(`SET timezone TO 'UTC'`).catch(() => {});
     // `?` → `$n` once per statement text; `undefined` binds as NULL (the storage
     // contract — better-sqlite3 refuses it, sqlocal coerces, PGlite must agree).
     const bind = (params: any[]) => params.map((p) => (p === undefined ? null : p));
@@ -72,8 +85,13 @@ export function makePgliteStorage(opts: PgliteStorageOptions = {}): StorageFacto
       deleteDatabaseFile: async () => {
         await pg.close();
         // In memory, closing IS deleting. Persisted: drop the IndexedDB database
-        // PGlite keeps under `/pglite/<name>` — best effort, the way sqlocal's
-        // deleteDatabaseFile is.
+        // PGlite keeps under `/pglite/<name>` (browser) or the data directory
+        // (Node) — best effort, the way sqlocal's deleteDatabaseFile is.
+        if (opts.persist && isNode) {
+          const fs = await import('node:fs/promises');
+          await fs.rm(nodeDir, { recursive: true, force: true }).catch(() => {});
+          return;
+        }
         if (opts.persist && typeof indexedDB !== 'undefined') {
           await new Promise<void>((resolve) => {
             const req = indexedDB.deleteDatabase(idbName);

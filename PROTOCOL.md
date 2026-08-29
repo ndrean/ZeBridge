@@ -2037,6 +2037,44 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
   verdict distinguishes "refused" from "never arrived", which silence does not.
 * `emitter/` — Elixir producer used to generate load and drive chaos tests.
 
+### Local engines
+
+The client library runs the same code on every local engine. An application picks a
+storage adapter once and writes no engine-specific code: `mutate()`, `query()`, the
+outbox, verdicts, seeding, the tombstone rule and the UPDATE rule are identical.
+
+Two engines are supported in the browser today: SQLite over OPFS (the default) and
+PGlite — PostgreSQL compiled to WASM (`?engine=pglite` in `web-consumer`, adapter at
+`zb-client-ts/pglite`). PGlite is "PG to PG": the CDC wire already carries PostgreSQL's
+own text forms (`{a,b}`, JSON, `t`/`f`), which SQLite stores as text and PGlite parses
+natively — so `query()` returns a real array for `text[]`, an object for `jsonb`, and
+`numeric(20,8)` keeps its decimals.
+
+The UPDATE-versus-upsert choice is about the row, not the engine. On both engines an
+incoming UPDATE (a CDC echo or the client's own optimistic write) is applied as an
+UPDATE of only the columns sent when the row exists locally, and as the upsert when it
+does not. The reason is the same on both: an upsert evaluates its INSERT arm first, and
+a partial payload fails NOT NULL there before the conflict clause runs.
+
+What differs between engines lives in one object, the dialect, carried by the storage
+adapter:
+
+| concern | SQLite | PostgreSQL |
+| --- | --- | --- |
+| column types for DDL | the descriptor's `sqlite` block (§3) | the descriptor's `pg` block |
+| table introspection | `PRAGMA table_info` | `pg_attribute` / `pg_index` |
+| pause foreign keys for the bulk seed | `PRAGMA foreign_keys` | `session_replication_role` |
+| defer foreign keys inside a transaction | `PRAGMA defer_foreign_keys` | `SET CONSTRAINTS ALL DEFERRED` (FKs declared `DEFERRABLE`) |
+| change a foreign key | rebuild the table | `ALTER TABLE … DROP/ADD CONSTRAINT` in place |
+| 64-bit integers, blobs, auto-increment | `INTEGER`, `BLOB`, `AUTOINCREMENT` | `BIGINT`, `BYTEA`, `BIGSERIAL` |
+| placeholders | `?` | `$n`, rewritten by the adapter |
+| a local write's array values | text as sent | array literal `{a,b}` |
+| post-seed foreign-key check | `PRAGMA foreign_key_check` | one anti-join per constraint from `pg_constraint` |
+
+Persistence follows the same switch on both: a fresh database per load by default,
+a stable per-principal one under `durable` (an OPFS file for SQLite, `idb://` for
+PGlite).
+
 A server-side reference client (Elixir) replicating into SQLite or PostgreSQL is
 planned, and is the real test of whether this document is sufficient: it exercises
 durable consumers, restart and replay, which a browser never does.

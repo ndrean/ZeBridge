@@ -1737,22 +1737,29 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 
 ---
 
-## Requirements, Dependencies & Licenses
+## Requirements, Dependencies, Licenses & Sources
 
-**Managed via `build.zig.zon`:**
+**Managed via `build.zig.zon`**:
 
 * [zig-msgpack](https://github.com/zigcc/zig-msgpack) - MessagePack encoding. License MIT
 
-**Currently vendored (in `/`):**
+**Currently vendored (in `/`)**:
 
 * [nats.zig](https://github.com/lalinsky/nats.zig). License Apache 2.
 
-**System:**
+**System**:
 
 * [libpq](https://www.postgresql.org/docs/current/libpq.html) ≧ 14  at build time (pipeline mode). License MIT
 
 * `PostgreSQL` ≧ 14 (`pgoutput` **binary** mode),
 * `Nats/JetStream` 2.10+
+
+**Sources**:
+
+* PGLITE: <https://github.com/electric-sql/pglite>
+* OPFS: <https://webkit.org/blog/12257/the-file-system-access-api-with-origin-private-file-system/>
+* SQLite-WASM: <https://sqlite.org/wasm/doc/trunk/index.md>
+* SQLite-WASM/persistence: <https://sqlite.org/wasm/doc/trunk/persistence.md>
 
 ---
 

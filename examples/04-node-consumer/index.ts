@@ -7,17 +7,25 @@
 /// had leaked into the browser adapter, this file would not work.
 ///
 ///   pnpm start                      (seed, follow CDC, write once, report)
+///   ZB_ENGINE=pglite pnpm start     (the same, on PostgreSQL-in-process — PGlite,
+///                                    persisted under /tmp; the dialect seam, §10bc)
 ///
-/// Env: NATS_URL, ZB_PRINCIPAL, ZB_CREDS, ZB_TABLE, ZB_DB.
+/// Env: NATS_URL, ZB_PRINCIPAL, ZB_CREDS, ZB_TABLE, ZB_DB, ZB_ENGINE (sqlite|pglite).
 import { readFileSync } from 'node:fs';
 import { ZeBridge } from 'zb-client-ts';
 import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
+import { makePgliteStorage } from 'zb-client-ts/pglite';
 
 const REPO = new URL('../../', import.meta.url).pathname;
 const PRINCIPAL = process.env.ZB_PRINCIPAL ?? 'omar';
 const CREDS = readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8');
 const GRAMMAR = JSON.parse(readFileSync(`${REPO}grammar.json`, 'utf8'));
-const TABLE = process.env.ZB_TABLE ?? 'counter_public';
+// ⚠️ Not `counter_public`: this example used to INSERT a fresh random uid there on
+// every run, which is exactly how that table accumulated 27 stray counter rows
+// (§10bc). `test_types` is the table built to take a full, typed row — and on the
+// PostgreSQL engine the arrays and the jsonb below arrive as real arrays and jsonb.
+const TABLE = process.env.ZB_TABLE ?? 'test_types';
+const ENGINE = (process.env.ZB_ENGINE ?? 'sqlite') as 'sqlite' | 'pglite';
 const DB = process.env.ZB_DB ?? `/tmp/zb-node-${PRINCIPAL}-${Date.now()}.sqlite3`;
 
 const zb = new ZeBridge({
@@ -27,7 +35,7 @@ const zb = new ZeBridge({
   grammar: GRAMMAR,
   durable: true,
   // ── the two seams ──
-  storage: nodeStorage,
+  storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: '/tmp' }) : nodeStorage,
   connect: nodeConnect,
 });
 
@@ -39,7 +47,7 @@ zb.onLog((topic: string, data: any, level: string) => {
 
 const deadline = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-console.log(`▶ node consumer: principal=${PRINCIPAL} db=${DB}`);
+console.log(`▶ node consumer: principal=${PRINCIPAL} engine=${ENGINE} db=${DB}`);
 await zb.connect();
 
 // Seeding and the CDC catch-up are driven by connect(); give them a moment to land.
@@ -63,16 +71,18 @@ const before = (await zb.query(`SELECT COUNT(*) AS n FROM ${TABLE}`))[0].n;
 const uid = zb.uuid();
 const version = zb.newVersion();
 console.log(`\n✍  mutate(): INSERT ${TABLE} uid=${uid}`);
-await zb.mutate(
-  TABLE,
-  'INSERT',
-  { uid },                                                   // the key
-  { uid, value: 4242, updated_at: version, inserted_at: version },  // the row
-);
+// A full row (§7's asymmetry: the local upsert's INSERT arm needs every NOT NULL).
+const row0 = TABLE === 'test_types'
+  ? { uid, some_text: 'written by the node consumer', age: 42, is_true: true,
+      tags: ['node', ENGINE, 'with,comma'], matrix: [[1, 2], [3, 4]],
+      metadata: { source: 'node-consumer', engine: ENGINE }, price: '1234.56789012', temperature: 36.6,
+      tenant_id: zb.tenant || undefined, updated_at: version, inserted_at: version }
+  : { uid, value: 4242, updated_at: version, inserted_at: version };
+await zb.mutate(TABLE, 'INSERT', { uid }, row0, { version });
 
 await deadline(4000);
 const after = (await zb.query(`SELECT COUNT(*) AS n FROM ${TABLE}`))[0].n;
-const row = (await zb.query(`SELECT uid, value FROM ${TABLE} WHERE uid = ?`, uid))[0];
+const row = (await zb.query(`SELECT * FROM ${TABLE} WHERE uid = ?`, uid))[0];
 const outbox = await zb.outboxAll();
 
 console.log(`\n── result ──────────────────────────────`);
