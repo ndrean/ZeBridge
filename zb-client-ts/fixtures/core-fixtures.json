@@ -842,6 +842,21 @@
         42,
         null
       ]
+    },
+    {
+      "name": "a boolean passes through as a boolean — the producer emits msgpack bools for bool columns, never t/f text (measured: a SQLite replica held TEXT 't' from chains and INTEGER 1 from CDC in one column)",
+      "row": [
+        "u1",
+        true,
+        false,
+        null
+      ],
+      "params": [
+        "u1",
+        true,
+        false,
+        null
+      ]
     }
   ],
   "columnDdl": [

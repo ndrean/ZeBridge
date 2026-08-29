@@ -6957,6 +6957,46 @@ than the host's zone.
 Nothing is open on PGlite now. The write-path lock is answered by construction (one
 owned connection, `query()`/`mutate()` only) and README says so.
 
+## 10bd. The PROTOCOL reread — and the boolean that did not converge (2026-08-29)
+
+The first half of the planned pause: PROTOCOL.md reread end to end, every claim checked
+against the code or the running stack, and every claim that was history removed rather
+than narrated — the document describes what is, NOTES keeps what was. The ledger:
+
+  * Fourteen past claims gone: "there is deliberately no SDK" (the libraries exist and are
+    §10 now); the 🚧 convention with no sections left; `pk` "inside `sqlite`" (it is at the
+    root, and has been); "two reasons exist" over a five-row table; §4's single `CDC`
+    stream and un-tenanted subjects; "jsonb arrives as a nested object in MessagePack mode,
+    a string in JSON mode" (no JSON mode; it is a string); "the reference SQLite clients
+    declare no foreign keys" (they port, defer and hold); §5's "no rename hint" (§3 has
+    `renamed`); §6's "the CDC path does not have this guard yet" (`decodeTuple` takes the
+    registry at four call sites); §7.0's separate-table optimistic design (neither client
+    does it — the practised rule is `before` + revert + echo, now stated); the GUC
+    `zebridge.principal` (it is `zb.principal`, 17 to 0); "three bookkeeping tables" (six);
+    the space-separated `version` example; "`client_id` accepted but not yet compared"
+    (tiebreak is live); §7.4's "a client cannot discover which columns are required"
+    (`required`); the "update now answers row-not-found — this changed" narrative; §10's
+    "nkey auth" and "an Elixir client is planned".
+  * Six omissions filled: the `tenants` KV and `mutation_error` in §2 (the count is six,
+    not five); `indexes`/`foreign_keys`/`max_row_bytes` and the `pg` block's consumer in
+    §3; eight of fifteen ingress errors in §7.2; the verdict's `write` field; the client's
+    own tombstone rule in §7.5; thirteen objects in §8b's DBA inventory; the library, the
+    Node example, libzb and the Python example in §10.
+  * Left in the ledger, not the doc: `grammar.json`'s `streams.cdc` is read only for a boot
+    log line (the doc now says so; the key itself can go with the parser field).
+
+**And one defect the reread found by reading §6's convergence claim against a replica.**
+"The one shape difference is timestamptz" — booleans were another. The producer's
+content queries are text-mode, so a chain row carried `t`/`f`; CDC carries a msgpack
+boolean. A SQLite replica stores the chain's `t` as TEXT (no numeric affinity rescues
+it — integers and floats are safe for exactly that reason) and the CDC echo's `true` as
+INTEGER 1: measured in one replica, `is_true` TEXT `t` ×4, TEXT `f` ×2 from the chain and
+INTEGER 1 from a live write, so `WHERE is_true = 1` missed every seeded row. PGlite parses
+both, which is why the engine that exists to catch this did not. Fixed where the shape is
+made: `encodeContent` emits a msgpack bool when `PQftype` is `bool` (OID 16); both cores'
+`chainRowParams` already pass a boolean through, now pinned by a fixture case (127 cases
+each). A fresh `test_types` full (g91) from the fixed producer seeds INTEGER 0/1 only.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

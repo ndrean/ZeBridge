@@ -332,7 +332,18 @@ pub const GenerationProducer = struct {
                 } else {
                     const val = std.mem.span(c.PQgetvalue(res, @intCast(r), @intCast(col)));
                     row_bytes += val.len;
-                    try row_arr.setIndex(col, try enc.createString(val));
+                    // ⚠️ Text-mode results render a boolean as `t`/`f`, while CDC carries a
+                    // real boolean. A SQLite replica stores the chain's `t` as TEXT (no
+                    // numeric affinity rescues it) and the CDC echo's `true` as INTEGER 1 —
+                    // the same column in two forms, and `WHERE is_true = 1` missed every
+                    // chain-seeded row (measured 2026-08-29). Ints and floats are safe: their
+                    // text is numeric and the column affinity converts. Booleans are the one
+                    // type that must leave here as what CDC sends.
+                    if (c.PQftype(res, @intCast(col)) == 16) { // BOOLOID
+                        try row_arr.setIndex(col, enc.createBool(val.len > 0 and val[0] == 't'));
+                    } else {
+                        try row_arr.setIndex(col, try enc.createString(val));
+                    }
                 }
             }
             if (row_bytes > out_widest.*) out_widest.* = row_bytes;

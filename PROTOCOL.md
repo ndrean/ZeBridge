@@ -2,8 +2,10 @@
 
 **This is a protocol, not a framework.** ZeBridge and NATS provide primitives and a
 small set of ordering guarantees; the *client* implements the sync state machine.
-There is deliberately no SDK — NATS already has clients in ~40 languages, and a
-consumer that speaks this document needs nothing else.
+Reference client libraries exist (`zb-client-ts` for JavaScript hosts, `libzb` for Zig
+and C-ABI hosts, §10), but they are implementations of this document, not the contract:
+NATS has clients in ~40 languages, and a consumer that speaks this document needs
+nothing else.
 
 Where that boundary sits matters: if you find yourself wanting the bridge to track
 per-client state, resolve conflicts, or manage local storage, that is the boundary
@@ -14,8 +16,7 @@ guessable** — the reference web client got one of them wrong and silently drop
 row. They are marked ⚠️.
 
 > **Status.** Everything marked ✅ is implemented and verified against a running
-> stack. Sections marked 🚧 are designed but not built; do not implement against them
-> yet. See `NOTES.md` for the open questions behind each.
+> stack. See `NOTES.md` for the history and the open questions behind each section.
 
 ---
 
@@ -119,7 +120,7 @@ REQUESTS streams carried nothing else.
 
 | key | read by |
 | --- | --- |
-| `streams.*` | `nats-init` creates `MUTATIONS`; the bridge names it for its ingress consumer |
+| `streams.mutations` | `nats-init` creates `MUTATIONS`; the bridge names it for its ingress consumer. `streams.cdc` is the pre-tenant name of the single CDC stream and is only echoed in the bridge's boot log — the CDC streams are named by `cdc_streams.*` |
 | `open_tenant` | bridge (routing for tenant-agnostic tables), clients (the shared subject/KV token) |
 | `cdc_streams.*` | bridge — at boot it creates any missing `CDC_<TENANT>` stream and sets `CDC_PUBLIC`'s subjects from the catalogue |
 | `subjects.cdc_prefix` | bridge (CDC subject), clients (subscription) |
@@ -132,16 +133,18 @@ REQUESTS streams carried nothing else.
 
 ## 2. Channels
 
-**Five** — two KV buckets, one object-store family, and two streams — with different
-durability characteristics, chosen deliberately rather than incidentally. Four carry the
-bridge's output; one carries the client's input.
+**Six** — three KV buckets, one object-store family, and two stream families — with
+different durability characteristics, chosen deliberately rather than incidentally. Five
+carry the bridge's output; one carries the client's input and the bridge's answers.
 
 ```mermaid
 flowchart TD
   B[ZeBridge]-->|"$KV.schemas.&lt;table&gt;"| KV[["KV: schemas<br/>last value per key"]]
-  B -->|"cdc.&lt;table&gt;.&lt;op&gt;"| CDC[["Stream: CDC<br/>time-bounded"]]
+  B -->|"$KV.tenants.&lt;principal&gt;"| TEN[["KV: tenants<br/>principal → tenant"]]
+  B -->|"cdc.[&lt;tenant&gt;.]&lt;table&gt;.&lt;op&gt;"| CDC[["Streams: CDC_PUBLIC, CDC_&lt;tenant&gt;<br/>time-bounded"]]
   B -->|"manifest + chain objects"| GEN[["KV: generations<br/>+ OBJ gen-&lt;tenant&gt;"]]
   KV --> C[Client]
+  TEN --> C
   CDC --> C
   GEN --> C
   C -->|"mutation.&lt;principal&gt;.&lt;table&gt;.&lt;op&gt;"| MUT[["Stream: MUTATIONS<br/>writes + verdicts"]]
@@ -153,9 +156,10 @@ flowchart TD
 | channel | kind | direction | why |
 | --- | --- | --- | --- |
 | `schemas` | **KV bucket** | bridge → client | Last-value-per-key. A client connecting at any time gets the current schema without replay. Schema is *state*, not an event. |
-| `CDC` | **stream** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*. |
+| `tenants` | **KV bucket** | bridge → client | `$KV.tenants.<principal>` → the principal's tenant, kept current from `zebridge_user_tenants` (§6, Step 0). One key per principal, granted per principal. |
+| `CDC_PUBLIC`, `CDC_<tenant>` | **streams** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*: public tables on `CDC_PUBLIC`, a tenant's tables on its own stream (§4). |
 | `generations` + `gen-<tenant>` | **KV + object store** | bridge → client | The seed source (§6): one chain manifest per `<tenant>.<table>`, objects chunked by the store itself — a seed is *state*, built on a cadence, never served per request. |
-| `MUTATIONS` | **stream** | client → bridge → client | Edge writes (§7), and the verdicts answering them. |
+| `MUTATIONS` | **stream** | client → bridge → client | Edge writes (§7), the verdicts answering them (`mutation_ack.>`), and the dead-letter copies of refused writes (`mutation_error.<table>`) for the operator. |
 
 ### `MUTATIONS` carries both directions
 
@@ -213,9 +217,14 @@ writes a bucket by publishing there. Clients should use their NATS client's KV A
 }
 ```
 
-Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, plus the **write
-contract**: `version_column`, `tombstone_column`, `tenant_column`, `writable`,
-`mutation_timeout_ms` and `replica_identity`.
+Root keys are `table`, `pg`, `sqlite`, `lsn`, `pk`, `pk_columns`, `indexes`,
+`foreign_keys`, `max_row_bytes`, plus the **write contract**: `version_column`,
+`tombstone_column`, `tenant_column`, `writable`, `mutation_timeout_ms` and
+`replica_identity`. `indexes` and `foreign_keys` are dialect-neutral (a `CREATE INDEX`
+and a `FOREIGN KEY` clause read the same on every engine), so they sit at the root;
+`pg` and `sqlite` carry only column types, and a client reads the block its engine
+speaks — SQLite replicas the `sqlite` block, PostgreSQL replicas (PGlite, a local
+server) the `pg` block (§10).
 
 `pk_columns` is the whole primary key in key order; `pk` is the legacy single-column
 form and is `null` for a composite key. Both live at the root and only there: the key
@@ -304,8 +313,6 @@ would otherwise accept it. Check `suspended` before `writable`.
   breaks clients — a bare **`ARRAY`** for every array type, losing the element type
   entirely. A client written against the old description mis-maps every array column.
 * `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
-* ⚠️ `pk` sits **inside `sqlite`**, not at the root. Historical, and the reference
-  client depends on it; treat it as part of the contract.
 * `lsn` is the WAL position this schema is valid from. For DDL-driven schemas it is
   the exact position of the DDL event; for boot-time schemas it is the WAL position
   read once at bridge startup.
@@ -353,7 +360,7 @@ operator may purge a key manually.)
 { "table": "t_nopk", "suspended": true, "reason": "no_primary_key", "lsn": 25722184 }
 ```
 
-Published when the bridge refuses a table. Two reasons exist:
+Published when the bridge refuses a table. The reasons:
 
 | `reason` | meaning | fix |
 | --- | --- | --- |
@@ -389,10 +396,12 @@ needs to.
 
 ---
 
-## 4. CDC — stream `CDC` ✅
+## 4. CDC — streams `CDC_PUBLIC` and `CDC_<tenant>` ✅
 
-**Subjects:** `cdc.<table>.<operation>` where operation is `insert` / `update` /
-`delete`, lowercase.
+**Subjects:** `cdc.<table>.<operation>` on `CDC_PUBLIC` for a public table,
+`cdc.<tenant>.<table>.<operation>` on `CDC_<tenant>` for a tenant-scoped one, where
+operation is `insert` / `update` / `delete`, lowercase. The examples below use the
+public form; a tenant-scoped table carries its tenant token between `cdc` and the table.
 
 Two suffixes exist:
 
@@ -434,9 +443,9 @@ references. Concretely, with `order_items.order_id → orders.id` and one flush 
 lane `order_items` appears first (event 1), so its group collects **both** item
 events and publishes ahead of lane `orders` — on the stream, item 1001 arrives
 before order 42, even though PostgreSQL committed them in one transaction, parent
-first. Replicas that declare no foreign keys (the reference SQLite clients) never
-notice — applies are per-row primary-key upserts and the final state converges; the
-child is merely "orphaned" for the milliseconds between the two applies.
+first. A replica that declares no foreign keys never notices — applies are per-row
+primary-key upserts and the final state converges; the child is merely "orphaned" for
+the milliseconds between the two applies.
 
 A replica that **does** declare foreign keys must handle this itself, and both
 engines make it a consumer-side rule with no wire change:
@@ -456,7 +465,10 @@ engines make it a consumer-side rule with no wire change:
 
 The simplest correct choice remains not declaring foreign keys on the replica at
 all — the source database already enforces them, and a replica's job is to converge
-on what the source accepted.
+on what the source accepted. The reference clients do declare them (the descriptor
+carries `foreign_keys`, §3): each apply transaction defers the check to COMMIT, and a
+child whose parent has not arrived is parked durably in `_zebridge_inbox` and retried
+after later batches (§7.1).
 
 ### Event payload
 
@@ -532,8 +544,9 @@ ZeBridge encodes this by **omitting the column from `data`**. So on an UPDATE:
 **A client must apply only the keys present.** Building an UPDATE from
 `Object.keys(data)` does the right thing automatically; expanding to the full column
 list and defaulting the missing ones to null erases data PostgreSQL never touched. The
-reference client does the former (`INSERT … ON CONFLICT DO UPDATE SET` over the present
-keys only).
+reference clients do the former: an `UPDATE` of the present keys when the row exists
+locally, the upsert (`INSERT … ON CONFLICT DO UPDATE SET` over the present keys) when it
+does not (§10).
 
 Only UPDATE can omit a column: INSERT and chain rows always carry every column, and
 a DELETE carries the key (plus nulls under DEFAULT identity, as above).
@@ -552,8 +565,9 @@ that only obscures a genuine decode failure (`NOTES.md` §2.16).
 * a column PostgreSQL sent in **text format** (it does this per column, even under
   `binary 'true'`, for any type with no binary send function) arrives as that text
   verbatim — no type-specific decoding is applied or needed.
-* `jsonb` arrives as a nested object in MessagePack mode, a string in JSON mode.
-* arrays and `bytea` arrive as strings.
+* `jsonb` arrives as its JSON text — a string, which a PostgreSQL replica parses back
+  into a document and a SQLite replica stores as text.
+* arrays and `bytea` arrive as strings (arrays in PostgreSQL's literal form, `{a,b}`).
 * **`timestamptz` arrives as ISO-8601 with `Z`; `timestamp` arrives without it.** The
   suffix is not decoration — `timestamptz` is stored as UTC, so `Z` states a recorded
   fact, while `timestamp` is a naive wall-clock reading with no zone. A client must
@@ -741,10 +755,9 @@ Everything the two schemas share survives. A schema change should therefore
 optimise: it replays the whole chain for a table whose data the in-place migration
 already preserved. The data would be correct — just paid for twice.
 
-⚠️ A **`RENAME COLUMN`** still appears as one removed + one added, because the
-payload carries no rename hint (`NOTES.md` §1.2). The other columns survive; the
-renamed column's values do not. That is the one avoidable loss in this table, and it
-is a protocol gap rather than a storage limitation.
+A **`RENAME COLUMN`** arrives with the `renamed` hint (§3): apply it as a local rename
+*before* diffing the column lists and the column's values survive. A client that ignores
+the hint reads the rename as drop-plus-add and loses that column's values.
 
 ---
 
@@ -906,7 +919,7 @@ for stream in streams_this_client_reads:
 * A schema change **never** triggers this flow. Migrations apply in place (§5);
   re-seeding is for a CDC gap only.
 
-### Resuming in practice### Resuming in practice
+### Resuming in practice
 
 Keeping the sequence client-side allows **ephemeral** consumers. A durable consumer would have NATS track the position server-side, but that is per-client state on the server — thousands of mobile clients means thousands of consumer objects to create, leak and expire. Client-stored position keeps the server stateless.
 
@@ -952,9 +965,9 @@ schema pass.
 A column Postgres sends in **text format** is never affected: the bytes are already its
 text output, so no OID knowledge is needed and none is required.
 
-⚠️ **The CDC path does not have this guard yet.** It decodes with OIDs from the
-`RELATION` message, which carries no `typtype`, so an `hstore` column in a published
-table still corrupts CDC events the same way. Planned fix in `COPY_BINARY_PLAN.md` §E.
+The CDC decoder is handed the same registry: a `RELATION` message carries OIDs and no
+`typtype`, so the decoder looks each OID up and refuses what the registry does not know
+as an enum, suspending the table (§3) rather than emitting bytes that look like a value.
 
 ---
 
@@ -1043,11 +1056,14 @@ why, because it removes a class of work rather than adding one:
   *what actually happens*. Neither has to model the other, and a gap in one is not a
   breach of the other.
 
-⚠️ **Optimistic apply is the one thing that can break it.** Writing an unconfirmed row
-straight into a synced table puts state there that PostgreSQL never emitted — exactly what
-the rule forbids — and does it silently, because the row looks like every other row. Keep
-optimistic writes in a separate table and union them in a view, so "is this confirmed?"
-stays answerable by *where the row is* rather than by remembering how it got there.
+⚠️ **Optimistic apply is the one deliberate exception.** An optimistic apply writes a row
+PostgreSQL has not emitted — exactly what the rule forbids — so it is allowed only under
+three conditions, which the reference clients keep: the row's prior state is captured in
+the outbox entry (`before`, §7.1) in the same transaction as the apply; a refusal
+(`rejected`, `row_deleted`) reverts it; and only the CDC echo confirms it — the verdict
+is a signal, never data. A client that cannot keep all three should keep optimistic rows
+in a separate table and union them in a view, so "is this confirmed?" stays answerable by
+*where the row is*.
 
 ⚠️ **This is a guarantee about writes only.** Its mirror image is not free: every client
 subscribed to `cdc.>` sees every published table's changes. Read authorization — which
@@ -1061,8 +1077,8 @@ mutation.<principal>.<table>.<operation>      e.g. mutation.a3f9c1.users.insert
 
 `<operation>` is `insert` | `update` | `delete` — the same verbs as `cdc.<table>.<op>`. The
 verb is a **subject token** so that "may create, may not delete" is expressible as a broker
-permission. ⚠️ **`insert` and `update` are no longer the same operation server-side** — see
-§7.4's "There is no 'row not found'", corrected below.
+permission. ⚠️ **`insert` and `update` are different operations server-side** — an `update` on a
+missing key is `row_deleted`, never a creation; see §7.4.
 
 **The principal is in the subject because NATS authorizes subjects, not payloads.** A
 client issued `publish: ["mutation.a3f9c1.>"]` physically cannot write as anyone else,
@@ -1132,8 +1148,8 @@ Worth designing for deliberately rather than discovering: it means the read path
 ship, and be demonstrated, long before authentication exists.
 
 ⚠️ **It is an application identity, not a PostgreSQL role.** The bridge issues
-`SET LOCAL zebridge.principal = '<token>'` and row-level policies compare
-`current_setting('zebridge.principal')` against an ordinary column. One database role,
+`SET LOCAL zb.principal = '<token>'` and row-level policies compare
+`current_setting('zb.principal')` against an ordinary column. One database role,
 any number of principals.
 
 ### The policy: last-write-wins on a version column
@@ -1219,12 +1235,16 @@ Two things follow, and they are the whole reason this section is long:
 
 #### Client bookkeeping tables
 
-Three tables, not one — a client has to track resume position (two axes: a global LSN
-and a per-stream sequence, §4) and its own unconfirmed writes, and none of that is
-something to invent per implementation. All three share the `_zebridge_` prefix so none
-can ever collide with a genuinely replicated table of the same name, and all three
-belong in one init path, run before the connection opens — a resume or a flush racing
-their own creation is a bug class with no reason to exist.
+Six tables — a client has to track its resume position (two axes: a global LSN and a
+per-stream sequence, §5), its seed watermarks, the events it is holding for a missing
+parent, its own unconfirmed writes, and the dictionaries its chains were compressed
+with — and none of that is something to invent per implementation. All share the
+`_zebridge_` prefix so none can ever collide with a genuinely replicated table of the
+same name, and all belong in one init path, run before the connection opens — a resume
+or a flush racing their own creation is a bug class with no reason to exist. The DDL
+below is the SQLite spelling; a PostgreSQL replica uses `BIGINT` for the 64-bit columns
+(LSNs, sequences, millisecond stamps), `BYTEA` for the blob and `BIGSERIAL` for the
+inbox key — the storage adapter's dialect emits it (§10).
 
 ```sql
 CREATE TABLE _zebridge_sync (
@@ -1248,6 +1268,27 @@ CREATE TABLE _zebridge_outbox (
   created_at INTEGER NOT NULL,
   attempts   INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE _zebridge_generations (
+  tbl        TEXT PRIMARY KEY,      -- the seed watermark per table (§6): the last applied
+  watermark  TEXT NOT NULL,         -- cutoff_version — deltas chain on cutoffs, never gens
+  cutoff_lsn INTEGER NOT NULL
+);
+
+CREATE TABLE _zebridge_inbox (      -- the FK hold (§4): a child whose parent has not
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,  -- arrived, parked in the transaction that
+  tbl      TEXT    NOT NULL,        -- failed it and replayed after later batches
+  lsn      INTEGER NOT NULL,
+  ev       TEXT    NOT NULL,        -- the event, JSON
+  reason   TEXT    NOT NULL,
+  held_at  INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE _zebridge_dicts (      -- zstd dictionaries named by chain deltas (§6),
+  name  TEXT PRIMARY KEY,           -- fetched once, immutable by name
+  bytes BLOB NOT NULL
+);
 ```
 
 `global_last_lsn`/`last_seq` are what make a reconnect a resume rather than a reseed
@@ -1266,8 +1307,8 @@ and the payload copies are ignored.
 ```json
 {
   "key":       { "id": 42 },
-  "data":      { "id": 42, "some_text": "hello", "updated_at": "2026-08-17 17:02:09.151330" },
-  "version":   "2026-08-17 17:02:09.151330",
+  "data":      { "id": 42, "some_text": "hello", "updated_at": "2026-08-17T17:02:09.151330Z" },
+  "version":   "2026-08-17T17:02:09.151330Z",
   "client_id": "c-8f3a"
 }
 ```
@@ -1279,7 +1320,7 @@ MessagePack, as everywhere else on the wire (§4).
 | `key` | always | Every primary key column, by name. A **partial** key is refused rather than guessed: `ON CONFLICT` would otherwise match a different row than the client meant, and a DELETE would remove more rows than it asked for |
 | `data` | insert, update | The full row. Column names are checked against the catalog, which is the allowlist — an unknown name is refused and never reaches SQL. Ignored for `delete` |
 | `version` | always | The value of *this table's* version column, as text, rendered exactly as CDC renders it (§7.3). Not a timestamp of your choosing, and not a field name you pick |
-| `client_id` | should | Tiebreaker for equal versions (§7.3). Must be **stable across restarts** — a value regenerated per page load also changes `Nats-Msg-Id`, so a mutation retried after a crash is deduplicated against nothing and applies twice. ⚠️ **Accepted but not yet compared** — the bridge resolves on `version` alone today, so equal versions are rejected rather than broken by `client_id` |
+| `client_id` | should | Tiebreaker for equal versions (§7.3): on a table with a `tiebreak_col` the higher `client_id` wins and is stored in that column (§7.4, 2b). Must be **stable across restarts** — a value regenerated per page load also changes `Nats-Msg-Id`, so a mutation retried after a crash is deduplicated against nothing and applies twice |
 
 **`msg_id` is a header, not a field.** Set `Nats-Msg-Id` on the message and JetStream
 deduplicates retries for you; a payload field named `msg_id` is ignored.
@@ -1392,6 +1433,12 @@ with no SQLSTATE at all — are retried up to `max_deliver` and then reported as
 | `MalformedSubject` | the subject is not four tokens (§7.1) |
 | `ForbiddenTable` | the table is not writable from the edge |
 | `NoVersionColumn` | the *table* has no version column configured — outbound-only, not a payload problem |
+| `UnknownTable` | the subject names a table the catalogue does not carry |
+| `UnknownOperation` | the subject's verb is not `insert` / `update` / `delete` |
+| `MissingTable` / `MissingOperation` | the subject has a token missing (a malformed principal usually gets `MalformedSubject` first) |
+| `DbAllocatedKey` | the table's primary key is sequence-backed — see "Who allocates the key" |
+| `RowTooLargeToReplicate` | the payload is wider than `max_row_bytes` (§3) — storing it would suspend the table for every client |
+| `UnsupportedPayloadType` | a value's MessagePack type cannot be rendered for its column — an array or a map sent to a scalar column |
 
 ⚠️ **A verdict can only have come from the bridge.** A client may publish under its own
 `mutation.<principal>.>` and nowhere else — it cannot publish a verdict, to itself or to
@@ -1688,9 +1735,9 @@ GRANT SELECT, INSERT, UPDATE ON public.<table> TO bridge_writer;   -- + DELETE i
                                                                    -- tombstone column
 ```
 
-**5. Every `NOT NULL` column either has a `DEFAULT` or is sent in `data`.** The schema
-descriptor carries only names and types, so a client cannot discover which is which —
-today this is out-of-band knowledge (§7.2).
+**5. Every `NOT NULL` column either has a `DEFAULT` or is sent in `data`.**
+`pg.columns[].required` (§3) marks exactly the columns that must be sent, so a client can
+check a payload before it leaves rather than after it is refused (§7.2).
 
 #### Composite keys: the arity is not the problem
 
@@ -1715,29 +1762,21 @@ With a surrogate `uuid`, re-adding is a new row with no history to fight, and
 `(user_id, role_id)` becomes a `UNIQUE` constraint. Natural uniqueness is a constraint;
 identity is a key. The same split as email, one level up.
 
-#### ⚠️ `update` now answers "row not found" — this changed
+#### `update` answers "row not found"
 
-Until this was fixed, `insert` and `update` were the same operation server-side: an upsert on
-the primary key, with the subject token distinguishing them only for authorization and
-logging, never for behaviour. An `update` naming a key that did not exist did not fail — it
-created that row. That is no longer true.
+`insert` and `update` are different statements server-side. `insert` is an upsert on the
+primary key — what makes a retried client-minted key idempotent rather than a
+duplicate-key error. `update` is a real `UPDATE ... SET <the columns in data> WHERE <pk>
+AND <version guard>` — no `ON CONFLICT`, no INSERT branch, so a key that does not exist
+(or whose row was tombstoned, §7.5) affects zero rows rather than inventing one. Zero
+rows runs through the same classify step `delete` uses: the bridge follows up with a
+cheap `SELECT` on the key to tell "gone" from "stale", and the mutation gets a
+definitive verdict either way — `row_deleted` when the row does not exist or is
+tombstoned, `stale` when it exists and the version guard rejected a write that arrived
+too late (§7.4b). **A client handles `row_deleted` on an `update` reply the same way as
+on a `delete` reply** — pop, and surface it: the row is gone, not merely unconfirmed.
 
-`update` is now a real `UPDATE ... SET <the columns in data> WHERE <pk> AND
-<version guard>` — no `ON CONFLICT`, no INSERT branch, so a key that does not exist (or
-whose row was tombstoned, per §7.5) affects zero rows rather than inventing one. This runs
-through the **same classify logic `delete` already used** (`NOTES.md` §2.17): the bridge
-follows up a zero-row UPDATE with a cheap `SELECT` on the same key to tell "gone" from
-"stale", and the mutation gets a definitive verdict either way — `row_deleted` when the row
-does not exist or is tombstoned, `stale` when it exists and the version guard simply rejected
-a write that arrived too late (§7.4b). **A client must now handle `row_deleted` on an
-`update` reply the same way it already handles it on a `delete` reply** — pop, and surface
-it: the row is gone, not merely unconfirmed.
-
-`insert` is unchanged: still the upsert described above, still what makes a retried
-client-minted key idempotent rather than a duplicate-key error. Only `update` moved off it.
-
-The consequence for a wrong or stale key differs by operation now, where it used to be one
-rule for both:
+The consequence for a wrong or stale key, by operation:
 
 | operation | key does not exist | key exists, version guard rejects |
 | --- | --- | --- |
@@ -1745,7 +1784,7 @@ rule for both:
 | `update` | `row_deleted` — nothing to update | `stale` |
 | `delete` | `row_deleted` | `stale` |
 
-`update` and `delete` now genuinely behave the same way here, which is the safer default for
+`update` and `delete` behave the same way here, which is the safer default for
 both: neither invents a key, so a wrong or late key is rejected rather than silently taken as
 license to create or overwrite. Item 3 (a tombstone column) still matters for a different
 reason — without one a *soft* delete's WHERE clause has nothing to detect once the physical
@@ -1779,7 +1818,8 @@ reply published under it would be read back by the bridge as if it were a write.
   "sqlstate": "",
   "detail":   "",
   "seq":      186,
-  "version":  "2026-08-19T05:55:40.495972Z"
+  "version":  "2026-08-19T05:55:40.495972Z",
+  "write":    "users#42"
 }
 ```
 
@@ -1791,6 +1831,7 @@ reply published under it would be read back by the bridge as if it were a write.
 | `detail` | **first line only** of the server's message. Its `DETAIL` can quote rows written by other tenants, so the rest is kept to the operator's log |
 | `seq` | the `MUTATIONS` stream sequence — the number the client already got in its `PubAck`, so it can correlate without having stored its own `msg_id` |
 | `version` | the version **actually stored**, in the wire format of §7.3. Authoritative: after a clamp it is not what you sent |
+| `write` | `<table>#<key>` — the row the verdict is about, for a log line that has nothing else to name it by |
 
 **The five statuses**:
 
@@ -1820,6 +1861,13 @@ A delete from the edge is a **soft delete**: the row survives with its tombstone
 set, so that an offline client's later edit can be overruled instead of resurrecting the
 row. Tombstones are reaped after `GC_THRESHOLD_MS`, which is therefore **the maximum
 offline window with pending writes that this deployment supports**.
+
+⚠️ **A client removes the row the moment the tombstone arrives.** The soft delete reaches
+a replica as an ordinary `update` whose tombstone column is set — on CDC, in a chain
+row, or as the client's own optimistic apply — and the physical reap that follows is
+never forwarded (§4). So the tombstone *is* the delete on the client side: a replica that
+keeps tombstoned rows holds them forever. The reference clients apply one rule at all
+three doors: tombstone present and not null → delete by key.
 
 > ### 🔴 **DBA — a table is created for this**
 >
@@ -1932,7 +1980,18 @@ line above it, so the two directions answer each other.
 | `zebridge_ddl_trigger` / `zebridge_drop_trigger` | event triggers | capture DDL and drops | `DROP TABLE` never reaches `ddl_command_end`, hence two |
 | `zebridge_prune_ddl_events()` | function | retention for the DDL audit trail | pure housekeeping; the bridge reads the WAL, never this table |
 | `zebridge_is_internal_table(text)` | function | keeps the tracker's own rows out of the DDL feed | ⚠️ `zebridge_gc_watermark` is deliberately **not** internal — clients need it |
-| `zebridge_install_write_guards(regclass, text, text)` | function | attaches the `BEFORE UPDATE` / `BEFORE DELETE` guards to one table (§7.3) | the version is only true if *every* writer stamps it, not just the bridge |
+| `zebridge_install_write_guards(regclass, version, tombstone, tenant)` | function | attaches the `BEFORE UPDATE` / `BEFORE DELETE` / `BEFORE INSERT OR UPDATE` guards to one table (§7.3) | the version is only true if *every* writer stamps it, not just the bridge |
+| `zebridge_guard_tenant()` | trigger function | on a tenant-routed table, resolves an absent tenant from `zb.principal` through `zebridge_user_tenants` — and fails closed when it cannot | a row with no routable tenant would reach no replica and be flagged by nothing |
+| `zebridge_scope_writes_by_tenant(regclass, text)` | function | RLS for `bridge_writer` plus a unique `REPLICA IDENTITY` index over `(tenant, pk)` | without the index a DELETE carries the key alone and cannot be routed to a tenant (§9) |
+| `zebridge_scope_reads_by_tenant(regclass, text)` | function | RLS for the reader's `SELECT`s, scoped by `zb.tenant` | the generation producer's per-tenant content queries depend on it |
+| `zebridge_tenants_of(regclass, name)` | function | the producer's per-tick tenant set: distinct values in the data ∪ the tenants of `zebridge_user_tenants` | a new tenant's first row creates its chain on the next tick |
+| `zebridge_limits` | table | one row per bridge instance (`slot`, `publication`, `max_row_bytes`), registered at boot by `zebridge_register_limits(...)` | the width budget every guard is baked from — never maintained by hand |
+| `zebridge_register_limits(slot, publication, max_row_bytes)` | function, `SECURITY DEFINER` | the only writer of `zebridge_limits`; called by the reader connection at boot | the reader holds `EXECUTE` and no table write privilege |
+| `zebridge_install_width_guard(regclass)` / `zebridge_rebudget_width_guard(regclass)` | functions | the per-table `BEFORE INSERT OR UPDATE` trigger refusing a row wider than the deployment's budget, and the cheap re-derivation of its body | the ingress check sees only edge writes; this one sees every writer |
+| `zebridge_widest_row(regclass)` / `zebridge_oversized_defaults()` | functions | preflight's two width probes: the widest stored row, and a column `DEFAULT` that would break the budget on first insert | a `BASE_BUF` lowered below stored data is named at boot, not at 3am (§9) |
+| `zebridge_timestamp_guard` | event trigger | refuses a `CREATE`/`ALTER TABLE` that introduces `timestamp without time zone` in `public` | §7.2's wire format and §7.3's clamp need an absolute instant |
+| `zebridge_generations` | table | the generation producer's memory: one row per built generation of a (tenant, table) — cutoffs, `has_full`, the dictionary, and the row count and delete count at the cutoff | the skip test compares against it; deletes on a tombstone-less table are seen only through those two counts |
+| `zb_reader_all` / `zb_tenant_write` | RLS policies | the reader's scope (everything when `zb.tenant` is unset, one tenant plus the open tenant when set) and the writer's (the row's tenant must match the one derived from `zb.principal`, fail-closed) | the two ends of the tenant boundary, on the same GUCs the bridge sets |
 | `zebridge_remove_write_guards(regclass)` | function | takes them off again | ⚠️ needed more often than it looks — with the delete guard on, only the sweeper can physically delete |
 | `zebridge_bump_version()` / `zebridge_soft_delete()` | trigger functions | the guards themselves | attached per table, never globally; the column names must match that table's catalogue row |
 | `zebridge_audit_write_guards()` | function | *which tables are guarded, on which columns?* | the guard columns must match the catalogue's `version_col`/`tombstone_col` — this is how you compare |
@@ -2020,18 +2079,34 @@ UPDATE/DELETE check, but a replica still cannot identify a row.
 
 ## 10. Reference implementations
 
-* `web-consumer/` — SolidJS + WASM SQLite (OPFS) over WebSocket with nkey auth.
-  Implements §3, §4 and §5 in full, and §7.1's reply handling over the §7.4b channel: it
-  pops on `accepted` / `stale`, and on `row_deleted` / `rejected` it reverts the local row
-  (guarded — only if nothing else has touched it since) before popping, surfacing
-  `row_deleted` rather than discarding the edit. The browser is the *hardest* target; iOS
-  and Android both ship SQLite natively, so a mobile port is largely a storage-adapter
-  swap.
+* `zb-client-ts/` — the client library every JavaScript consumer below imports: one core
+  (`core.ts`, pure and fixture-pinned), the shell (`libzb.ts`: schema watch, chain-first
+  seeding, CDC apply, the §7 write path with outbox, optimistic apply, verdicts and
+  echo-confirm), and two seams a host fills — storage and transport. Storage adapters:
+  OPFS SQLite (browser), better-sqlite3 (Node), PGlite (browser or Node). The
+  conformance fixtures (`fixtures/core-fixtures.json`) are the spec for every port.
+* `libzb/` — the same core in Zig, behind a C ABI (`zb_call`, one JSON entry point), with
+  a Python runner that answers the same fixtures; a SQLite client on top (`client.zig`)
+  drives the read and write paths against the live stack and is the soak harness.
+* `web-consumer/` — SolidJS in the browser over WebSocket, JWT credentials by default
+  (`?auth=password` for a pre-operator broker). Implements §3–§7 in full through the
+  library: it pops on `accepted` / `stale`, and on `row_deleted` / `rejected` reverts the
+  local row (guarded — only if nothing else has touched it since) before popping,
+  surfacing `row_deleted` rather than discarding the edit. `?engine=pglite` runs the same
+  page on PostgreSQL (below). The browser is the *hardest* target; iOS and Android both
+  ship SQLite natively, so a mobile port is largely a storage-adapter swap.
 
-  The replica database name is timestamped by default — a fresh OPFS file every load, so
-  the dev loop always exercises schema, seeding and CDC from empty. `VITE_DURABLE` opts
-  into a stable, per-principal name instead, which is what makes `_zebridge_outbox`
-  actually durable across reloads rather than rebuilt-away with everything else.
+  The replica database name is timestamped by default — a fresh database every load, so
+  the dev loop always exercises schema, seeding and CDC from empty. `?durable=1` (or
+  `VITE_DURABLE`) opts into a stable, per-principal name instead, which is what makes
+  `_zebridge_outbox` actually durable across reloads rather than rebuilt-away with
+  everything else.
+* `examples/04-node-consumer/` — a Node service on the same library: better-sqlite3 over
+  TCP by default, `ZB_ENGINE=pglite` for a persisted PostgreSQL replica. Seeds, follows
+  CDC, writes one full typed row through `mutate()` and reads it back.
+* `examples/02-python-consumer/` — a Python consumer of the read path.
+* `consumer/` — an Elixir application used as a PostgreSQL-side producer (`PgProducer`:
+  CRUD, bulk, streams of writes) to drive the stack under load.
 * `web-consumer/zb-mutate.mjs` — the smallest end-to-end write: one envelope, and the
   verdict it produced. Useful as a first check that ingress is alive at all, since a
   verdict distinguishes "refused" from "never arrived", which silence does not.
@@ -2075,6 +2150,5 @@ Persistence follows the same switch on both: a fresh database per load by defaul
 a stable per-principal one under `durable` (an OPFS file for SQLite, `idb://` for
 PGlite).
 
-A server-side reference client (Elixir) replicating into SQLite or PostgreSQL is
-planned, and is the real test of whether this document is sufficient: it exercises
-durable consumers, restart and replay, which a browser never does.
+Restart and replay are exercised by the Node consumer's persisted replica (a second run
+resumes from its stored positions with nothing re-seeded) and by libzb's soak.
