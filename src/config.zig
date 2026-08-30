@@ -776,10 +776,12 @@ test "Endpoint.parseUrl: a trailing path is not part of the address" {
 
 test "Endpoint.parseUrl: rejects what it cannot resolve" {
     try std.testing.expectError(error.MissingScheme, Nats.Endpoint.parseUrl("127.0.0.1:4222"));
-    // `tls://` is refused rather than silently downgraded to plaintext: TLS was never
-    // made to work with the vendored client, so accepting the scheme would promise
-    // encryption the connection does not have. See COPY_BINARY_PLAN "encryption in
-    // transit".
+    // `tls://` is refused rather than silently downgraded to plaintext. The client
+    // (nats.zig) does speak TLS — scripts/scenarios/tls.py proves JetStream over a
+    // CA-verified `tls://` with it — but this bridge is not wired to pass it the TLS
+    // options: the shipped topology colocates bridge and broker over loopback, and
+    // accepting the scheme would promise encryption the connection does not have.
+    // Unparking a remote broker means wiring those options, then lifting this.
     try std.testing.expectError(error.MissingScheme, Nats.Endpoint.parseUrl("tls://host:4222"));
     try std.testing.expectError(error.BadPort, Nats.Endpoint.parseUrl("nats://host:not-a-port"));
 }

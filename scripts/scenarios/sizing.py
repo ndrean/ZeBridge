@@ -28,7 +28,7 @@ preserve.
 Usage:  python scripts/scenarios/sizing.py
 
 Starts short-lived bridges of its own (own slot and port, via `ZB_BRIDGE_ARGS`). Needs
-DATABASE_READER_URL.
+DATABASE_READER_URL. Drops the probe slot and its `zebridge_limits` row at the end.
 """
 
 import asyncio
@@ -40,6 +40,7 @@ import sys
 import zb
 
 SCRATCH = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
+SLOT = zb.BRIDGE_ARGS[zb.BRIDGE_ARGS.index("--slot") + 1] if "--slot" in zb.BRIDGE_ARGS else "zb_probe"
 
 # Big enough to be refused on any machine: 512 KB events x 1,048,576 slots is ~550 GB once
 # the per-event metadata is counted. Hardcoding a "too big" number that depends on the host
@@ -58,7 +59,28 @@ def boot(name: str, **env) -> tuple[int | None, str]:
         return code, br.text()
 
 
+def cleanup():
+    """Drop the probe slot and its registration. An inactive slot pins WAL, and the
+    probes that DID start registered a BASE_BUF budget in `zebridge_limits` — the width
+    guard takes MIN over instances that still exist, so a lingering probe row would hold
+    every writer to the probe's budget (see speed.py's identical note)."""
+    zb.psql(
+        "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots "
+        f"WHERE slot_name='{SLOT}' AND NOT active) "
+        f"THEN PERFORM pg_drop_replication_slot('{SLOT}'); END IF; END $$",
+        quiet=True,
+    )
+    zb.psql(f"DELETE FROM public.zebridge_limits WHERE slot = '{SLOT}'", quiet=True)
+
+
 async def main():
+    try:
+        return await checks()
+    finally:
+        cleanup()
+
+
+async def checks():
     failed = 0
 
     # ── 1. a row that cannot fit a NATS message ────────────────────────────────

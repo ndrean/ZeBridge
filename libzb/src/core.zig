@@ -612,9 +612,18 @@ pub fn planFromManifest(a: std.mem.Allocator, man: Value, watermark: ?[]const u8
             try applicable.append(d);
         }
     }
+    // "Reaches" = the chain continues from where this replica stands: the first
+    // applicable delta starts at or before the watermark — or nothing is newer AND the
+    // chain's full itself is not newer than the watermark. A chain REBUILT after the
+    // watermark (a fresh g1 full, no deltas: what a feed restart produces, NOTES §10bm)
+    // is unreachable, not "already applied"; the walk starts from its full.
+    const full_v = if (man == .object) man.object.get("full") else null;
+    const full_cutoff: ?[]const u8 = if (full_v != null and full_v.? == .object) getStr(full_v.?, "cutoff") else null;
     const reaches = watermark != null and
-        (applicable.items.len == 0 or
-        std.mem.order(u8, getStr(applicable.items[0], "prev_cutoff") orelse "", watermark.?) != .gt);
+        (if (applicable.items.len > 0)
+            std.mem.order(u8, getStr(applicable.items[0], "prev_cutoff") orelse "", watermark.?) != .gt
+        else
+            (full_cutoff == null or std.mem.order(u8, full_cutoff.?, watermark.?) != .gt));
 
     if (reaches) {
         for (applicable.items) |d| try plan.append(try deltaStep(a, d));
@@ -657,8 +666,17 @@ pub fn fullPredatesReplica(man: Value, plan: std.json.Array, stored_seq: i64) bo
 
 // ─── the gap rule and seeding scope (D2) ────────────────────────────────────
 
-pub fn streamHasGap(first_seq: i64, stored: i64) bool {
-    return stored == 0 or (first_seq > 0 and stored < first_seq - 1);
+/// Three shapes of "the stream no longer continues from where I stopped": never here
+/// (`stored == 0`); the tail retained away (`stored < first_seq - 1`); and the stream
+/// RESTARTED under me — a position beyond its last sequence. The third is a lost
+/// replication slot seen from a client (NOTES §10bm): WAL the bridge never saw leaves
+/// no hole in the numbering, so the bridge recreates the CDC streams on a new slot and
+/// this is the only trace a client can read. `last_seq < 0` = unknown (not checked).
+pub fn streamHasGap(first_seq: i64, stored: i64, last_seq: i64) bool {
+    if (stored == 0) return true;
+    if (first_seq > 0 and stored < first_seq - 1) return true;
+    if (last_seq >= 0 and stored > last_seq) return true;
+    return false;
 }
 
 /// core.ts scopeSeeding: {gapped, tablesToSeed}.
@@ -668,8 +686,9 @@ pub fn scopeSeeding(a: std.mem.Allocator, streams: Value, tables: Value) !Value 
         var it = streams.object.iterator();
         while (it.next()) |e| {
             const first_seq = getInt(e.value_ptr.*, "firstSeq") orelse 0;
+            const last_seq = getInt(e.value_ptr.*, "lastSeq") orelse -1;
             const stored = getInt(e.value_ptr.*, "stored") orelse 0;
-            if (streamHasGap(first_seq, stored)) try gapped.append(.{ .string = e.key_ptr.* });
+            if (streamHasGap(first_seq, stored, last_seq)) try gapped.append(.{ .string = e.key_ptr.* });
         }
     }
     var to_seed = std.json.Array.init(a);

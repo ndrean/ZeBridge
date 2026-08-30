@@ -498,8 +498,19 @@ pub const SyncClient = struct {
             var info = self.t.js.getStreamInfo(stream) catch continue;
             defer info.deinit();
             const first: i64 = @intCast(info.value.state.first_seq);
+            const last: i64 = @intCast(info.value.state.last_seq);
             const stored: i64 = @intCast(try self.storedSeq(stream));
-            if (core.streamHasGap(first, stored)) try gapped.put(a, stream, {});
+            if (core.streamHasGap(first, stored, last)) {
+                try gapped.put(a, stream, {});
+                // The feed restarted under us (position beyond last_seq): the position is
+                // meaningless in the new numbering. Reset it, or `fullPredates` reads the
+                // fresh chain's small cutoff_seq as "older than where I am" and skips the
+                // very full this gap needs (measured: slot_loss.py, 2026-08-29).
+                if (last >= 0 and stored > last) {
+                    std.debug.print("{s}: stream restarted (position {d} beyond last_seq {d}) — position reset\n", .{ stream, stored, last });
+                    try self.persistSeq(stream, 0);
+                }
+            }
         }
         // Seed in the CONFIGURED order (parents first) with foreign_keys ON:
         // scoped to gapped routes plus never-seeded tables (§10n).

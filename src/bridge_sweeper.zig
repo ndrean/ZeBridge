@@ -1,3 +1,11 @@
+//! The tombstone GC sidecar. Sweeps every table whose `zebridge_catalogue` row
+//! declares a `tombstone_col` (plus any `SYNC_RULES` override), reaping tombstones
+//! older than `GC_THRESHOLD_MS`, then publishes the watermark.
+//!
+//! `SWEEP_ONLY_TABLES` (comma list) narrows one run to the named tables — a SCOPED
+//! run for tests (`scripts/scenarios/sweeper.py` sets it to its own fixture so a test
+//! pass never reaps a real table's tombstones). Unset in production: a sweeper that
+//! silently skips tables lets their tombstones pile up and the GC watermark lie.
 const std = @import("std");
 const c = @import("c_imports.zig").c;
 const utils = @import("utils.zig");
@@ -173,6 +181,27 @@ pub fn main(init: std.process.Init) !void {
         } else {
             std.debug.print("GC: no zebridge_catalogue (pre-catalogue database?) — env SYNC_RULES only\n", .{});
         }
+    }
+
+    // ── SWEEP_ONLY_TABLES: a scoped run ─────────────────────────────────────────
+    //
+    // Applied AFTER the set is built from both sources, so it is a pure filter — it
+    // cannot add a table the catalogue or SYNC_RULES did not declare, and a name that
+    // matches nothing sweeps nothing (reported below as "nothing to sweep").
+    if (env.getPosix("SWEEP_ONLY_TABLES")) |only| {
+        var kept = std.ArrayList(Sweep).empty;
+        for (sweeps.items) |sw| {
+            var it = std.mem.splitScalar(u8, only, ',');
+            while (it.next()) |raw| {
+                if (std.mem.eql(u8, std.mem.trim(u8, raw, " "), sw.table)) {
+                    try kept.append(allocator, sw);
+                    break;
+                }
+            }
+        }
+        std.debug.print("GC: SWEEP_ONLY_TABLES='{s}' — scoped run, {d} of {d} table(s) kept\n", .{ only, kept.items.len, sweeps.items.len });
+        sweeps.deinit(allocator);
+        sweeps = kept;
     }
 
     if (sweeps.items.len == 0) {

@@ -1,43 +1,43 @@
 #!/usr/bin/env python3
 """A table born in front of the system — zero-restart onboarding, end to end.
 
-The live-birth exercise (2026-08-25), recorded, now in the catalogue era: a table
-that did not exist when the bridge booted is created and `zebridge_enable`d
-mid-flight, and everything must cascade with ZERO restarts — the DDL pipeline
-publishes its schema live, the generation producer derives it on the next tick
-(the publication IS the list), and the width guard is armed from the same
-migration. The one residue is deliberate and visible: the bridge derives the
-public set and CDC_PUBLIC's subject filter from `zebridge_catalogue` at BOOT, so
-the fixture's catalogue row is written BEFORE the probe bridge starts — one
-INSERT, no temp topology, no `nats stream edit` by hand (both of which this
-scenario needed before the bridge learned to reconcile its own streams).
+The live-birth exercise (2026-08-25), recorded, now in the catalogue era with a LIVE
+catalogue: a table that did not exist when the bridge booted is created and
+`zebridge_enable`d mid-flight, and everything cascades with ZERO restarts. The
+catalogue row `zebridge_enable` writes travels the WAL like any other row, and the
+bridge reloads at its commit (NOTES §10bj): CDC_PUBLIC's subject filter is
+reconciled, the newborn's `no_cdc_subject` refusal — the refusal every undeclared
+table gets — is lifted, and its schema is published, all from inside the one
+migration. Nothing is pre-declared; the probe boots knowing nothing of the fixture.
 
 Checks:
 
-  0. boot reconciliation: the probe bridge itself put `cdc.zb_livebirth.>` into
-     CDC_PUBLIC's subject filter, from the pre-declared catalogue row;
   1. `zebridge_enable` on the newborn reports the full cascade in one migration:
-     grants, guards, width guard, catalogue, publication LAST;
-  2. the schema reaches `$KV.schemas` LIVE — no bridge restart, the DDL pipeline
-     carries a table the boot preflight never saw;
-  3. the chain manifest appears within a cadence, derived (no GENERATION_RULES for
+     grants, guards, width guard, catalogue, publication LAST, and `T3 bridge:LIVE`
+     — the function's own statement that no restart is owed;
+  2. live reconciliation: `cdc.zb_livebirth.>` appears in CDC_PUBLIC's subject filter
+     after the migration, put there by a bridge that booted without the row;
+  3. the schema reaches `$KV.schemas` LIVE and unsuspended — the refusal lifted and
+     the DDL pipeline carried a table the boot preflight never saw;
+  4. a row written now reaches the wire on the newborn's subject — routing is real;
+  5. the chain manifest appears within a cadence, derived (no GENERATION_RULES for
      it anywhere), and every cutoff in it is CANONICAL UTC (`+00`) — the regression
      check for the manifest timezone mix the exercise found;
-  4. the width guard born from the migration refuses an oversized psql UPDATE
+  6. the width guard born from the migration refuses an oversized psql UPDATE
      atomically (SQLSTATE 23514) — `updated_at` as the version column, so the
      WHOLE onboarding needed no env rules and no restart;
-  5. teardown: DROP TABLE publishes the schema tombstone live, same pipeline.
+  7. teardown: DROP TABLE publishes the schema tombstone live, same pipeline; and
+     deleting the catalogue row is reloaded live too — the fixture's subject leaves
+     CDC_PUBLIC with the row, no boot needed to forget it.
 
-⚠️ Owns the only bridge (its probe reconciles CDC_PUBLIC to the catalogue as IT
-sees it; a production bridge booted without the fixture row would refuse the
-fixture as not-routable). Stop yours first; restart it after — its own boot
-reconciliation removes the fixture subject again.
+⚠️ Owns the only bridge: a production bridge would reload on the same catalogue rows
+and race the probe's stream edits. Stop yours first; restart it after.
 
 Usage:  python scripts/scenarios/livebirth.py   (admin ZB_PSQL + probe-bridge env)
 """
 
+import asyncio
 import json
-import subprocess
 import sys
 import time
 
@@ -45,24 +45,46 @@ import zb
 
 FIX = "zb_livebirth"
 LOG = "/tmp/zb_livebirth_bridge.log"
+CDC = zb.TOPOLOGY["subjects"]["cdc_prefix"]
+CDC_PUBLIC = zb.TOPOLOGY["cdc_streams"]["public"]
+OPEN = zb.TOPOLOGY["open_tenant"]
+REASON = "livebirth scenario fixture — declared while the probe runs"
 
 
-def main_sync():
+def cdc_public_subjects() -> list[str]:
+    info = zb.nats_cli("stream", "info", CDC_PUBLIC, "--json")
+    return json.loads(info.stdout)["config"]["subjects"] if info.returncode == 0 else []
+
+
+async def wait_for(pred, seconds=30, step=1.0):
+    """⚠️ async, and it must stay so: a `time.sleep` here blocks the event loop, and the
+    NATS subscription that fills `cdc_seen` never gets to run — the rows were routed
+    and the check still said "unrouted" (measured 2026-08-29)."""
+    for _ in range(int(seconds / step)):
+        if pred():
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
+async def main():
     failed = 0
 
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
-    if running.stdout.strip():
+    if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
 
     zb.psql(f"DROP TABLE IF EXISTS public.{FIX}", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
 
-    # The pre-declaration: one catalogue row, BEFORE the probe boots. This is what
-    # the temp-topology + stream-edit machinery used to fake — the bridge now reads
-    # the same fact from the table and edits the stream itself.
-    zb.psql(
-        "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
-        f"('{FIX}', 'livebirth scenario fixture — pre-declared before probe boot') "
-        "ON CONFLICT (tbl) DO NOTHING", quiet=True)
+    nc = await zb.connect()
+    cdc_seen: list[str] = []
+    cdc_sub = await nc.subscribe(f"{CDC}.{FIX}.>")
+
+    async def watch():
+        async for m in cdc_sub.messages:
+            cdc_seen.append(m.subject)
+
+    watcher = asyncio.create_task(watch())
 
     try:
         # GENERATIONS_ENABLED, explicitly: the probe inherits the runner's shell, not
@@ -76,14 +98,10 @@ def main_sync():
                 print(bridge.text()[-1500:])
                 return 1
 
-            # ── 0. the probe's own boot put the fixture into CDC_PUBLIC ────────
-            info = zb.nats_cli("stream", "info", "CDC_PUBLIC", "--json")
-            bound = json.loads(info.stdout)["config"]["subjects"] if info.returncode == 0 else []
-            if f"cdc.{FIX}.>" in bound:
-                zb.ok("boot reconciliation bound cdc.zb_livebirth.> in CDC_PUBLIC — no stream edit by hand")
-            else:
-                zb.bad(f"cdc.{FIX}.> not in CDC_PUBLIC after boot (bound: {bound})")
-                failed += 1
+            # The premise: the probe booted knowing nothing of the fixture.
+            if f"{CDC}.{FIX}.>" in cdc_public_subjects():
+                zb.bad(f"{CDC}.{FIX}.> already in {CDC_PUBLIC} at boot — a stale declaration; clean up first")
+                return 1
 
             # ── 1. the birth: one migration, the full cascade ──────────────────
             out = zb.psql(f"""
@@ -94,49 +112,73 @@ def main_sync():
                     -- cascade, not delete semantics) — the gate added 2026-08-27 refuses
                     -- writable-without-tombstone unless the acceptance is explicit:
                     allow_physical_deletes => true,
-                    public_reason => 'livebirth scenario fixture — pre-declared before probe boot',
+                    public_reason => '{REASON}',
                     -- named explicitly: zebridge_enable has no default publication
                     -- (NOTES §10ad), and this scenario runs on the same feed the
                     -- probe bridge is booted against.
                     publication => '{zb.publication()}', dry_run => false);
             """)
-            need = {"grants:done", "guards:done", "width guard:done", "catalogue:done", "publication:done"}
             # splitlines, NOT split(): 'width guard:done' contains a space and whitespace
             # splitting can never match it — the first run failed on exactly that.
-            got = set(l.strip() for l in out.splitlines())
-            if need <= got:
-                zb.ok("one migration, full cascade: grants, guards, width guard, catalogue, publication")
+            got = {}
+            for l in out.splitlines():
+                step, _, status = l.strip().rpartition(":")
+                if step:
+                    got[step] = status
+            # A step is satisfied when it was done now OR already held: a re-run on a
+            # half-cleaned fixture reports 'already'/'skipped' and that is not a failure.
+            fine = {"done", "ok", "already", "skipped"}
+            need = ["grants", "guards", "width guard", "catalogue", "publication"]
+            short = [s for s in need if got.get(s) not in fine]
+            if not short and got.get("T3 bridge") == "LIVE":
+                zb.ok("one migration, full cascade: grants, guards, width guard, catalogue, "
+                      "publication — and T3 bridge:LIVE, no restart owed")
             else:
-                zb.bad(f"cascade incomplete: {sorted(need - got)}")
+                zb.bad(f"cascade incomplete: {short or ''} T3={got.get('T3 bridge')!r} (got {got})")
                 failed += 1
 
-            # ── 2. schema reaches clients LIVE (no restart) ────────────────────
-            key_seen = False
-            for _ in range(30):
-                r = zb.nats_cli("kv", "get", zb.TOPOLOGY["kv"]["schemas"], FIX, "--raw")
-                if r.returncode == 0 and '"sqlite"' in r.stdout:
-                    key_seen = True
-                    break
-                time.sleep(1)
-            if key_seen:
-                zb.ok("schema published live: the DDL pipeline carried a table the boot never saw")
+            # ── 2. live reconciliation of the stream filter ────────────────────
+            if await wait_for(lambda: f"{CDC}.{FIX}.>" in cdc_public_subjects(), 20):
+                zb.ok(f"{CDC}.{FIX}.> bound in {CDC_PUBLIC} by a bridge that booted without the row — reloaded live")
             else:
-                zb.bad("no $KV.schemas key for the newborn within 30s")
+                zb.bad(f"{CDC}.{FIX}.> not in {CDC_PUBLIC} after the migration (bound: {cdc_public_subjects()})")
                 failed += 1
 
-            # rows, so the chain has content
+            # ── 3. schema reaches clients LIVE, unsuspended ────────────────────
+            def live_schema():
+                raw = zb.kv_get("schemas", FIX)
+                try:
+                    doc = json.loads(raw) if raw else None
+                except json.JSONDecodeError:
+                    return None
+                return doc if doc and "pg" in doc and not doc.get("suspended") else None
+
+            if await wait_for(lambda: live_schema() is not None, 30):
+                zb.ok("schema published live and unsuspended: the refusal lifted, the DDL pipeline "
+                      "carried a table the boot never saw")
+            else:
+                raw = zb.kv_get("schemas", FIX)
+                zb.bad(f"no live $KV.schemas key for the newborn within 30s (KV said {raw[:100]!r})")
+                failed += 1
+
+            # ── 4. rows reach the wire — routing is real ───────────────────────
             zb.psql(f"""INSERT INTO public.{FIX} (uid, txt, updated_at) VALUES
                         (gen_random_uuid(), 'born live', now()),
                         (gen_random_uuid(), 'second row', now())""")
+            if await wait_for(lambda: any(s.startswith(f"{CDC}.{FIX}.") for s in cdc_seen), 15):
+                zb.ok(f"rows written after the birth arrived on {CDC}.{FIX}.* — routed, live")
+            else:
+                zb.bad(f"no CDC for '{FIX}' — declared, keyed, published, yet unrouted")
+                failed += 1
 
-            # ── 3. derived chain, canonical UTC bounds ─────────────────────────
+            # ── 5. derived chain, canonical UTC bounds ─────────────────────────
             man = None
             for _ in range(30):
-                r = zb.nats_cli("kv", "get", zb.TOPOLOGY["generations"]["kv"], f"_default.{FIX}", "--raw")
+                r = zb.nats_cli("kv", "get", zb.TOPOLOGY["generations"]["kv"], f"{OPEN}.{FIX}", "--raw")
                 if r.returncode == 0 and r.stdout.strip():
                     man = json.loads(r.stdout.strip().splitlines()[0])
                     break
-                time.sleep(1)
+                await asyncio.sleep(1)
             if man is None:
                 zb.bad("no chain manifest within 30s — derivation did not pick up the newborn")
                 failed += 1
@@ -149,13 +191,12 @@ def main_sync():
                     zb.bad(f"non-canonical cutoff in manifest: {cutoffs}")
                     failed += 1
 
-            # ── 4. the migration-born width guard, psql door ───────────────────
+            # ── 6. the migration-born width guard, psql door ───────────────────
             # Per (table, slot) since 2026-08-26 — the bridge registers its own
             # BASE_BUF at boot; MIN because a row must fit the narrowest carrier.
-            # zebridge_limits collapsed to ONE ROW PER INSTANCE (slot PK) on
-            # 2026-08-26 — there is no tbl column. The budget for a table is what
-            # the guard bakes: MIN over the instances whose publication carries
-            # it, defaulting 16384.
+            # zebridge_limits is ONE ROW PER INSTANCE (slot PK) — no tbl column. The
+            # budget for a table is what the guard bakes: MIN over the instances
+            # whose publication carries it, defaulting 16384.
             budget = int(zb.psql(
                 f"SELECT COALESCE((SELECT MIN(l.max_row_bytes) FROM public.zebridge_limits l "
                 f"JOIN pg_publication_tables pt ON pt.pubname = l.publication "
@@ -169,35 +210,38 @@ def main_sync():
                 zb.bad(f"oversized row stored: {width} bytes")
                 failed += 1
 
-            # ── 5. death is live too ───────────────────────────────────────────
+            # ── 7. death is live too ───────────────────────────────────────────
             zb.psql(f"DROP TABLE public.{FIX}")
-            gone = False
-            for _ in range(30):
-                r = zb.nats_cli("kv", "get", zb.TOPOLOGY["kv"]["schemas"], FIX, "--raw")
-                if r.returncode != 0 or '"dropped":true' in r.stdout.replace(" ", ""):
-                    gone = True
-                    break
-                time.sleep(1)
-            if gone:
+
+            def tombstoned():
+                raw = zb.kv_get("schemas", FIX)
+                return not raw or '"dropped":true' in raw.replace(" ", "")
+
+            if await wait_for(tombstoned, 30):
                 zb.ok("DROP TABLE published the tombstone live — same pipeline, both directions")
             else:
                 zb.bad("schema key never tombstoned after DROP")
                 failed += 1
 
+            # The catalogue row's removal is a catalogue commit like any other: the
+            # bridge reloads and CDC_PUBLIC forgets the subject — no boot needed.
+            zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
+            if await wait_for(lambda: f"{CDC}.{FIX}.>" not in cdc_public_subjects(), 20):
+                zb.ok(f"the catalogue DELETE was reloaded live too — {CDC}.{FIX}.> left {CDC_PUBLIC}")
+            else:
+                zb.bad(f"{CDC}.{FIX}.> still in {CDC_PUBLIC} after its catalogue row was deleted")
+                failed += 1
+
     finally:
-        # The catalogue row goes; CDC_PUBLIC keeps the fixture subject until the NEXT
-        # bridge boot reconciles it away — restart your bridge after this scenario.
+        watcher.cancel()
+        await nc.close()
         zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
         zb.psql(f"DROP TABLE IF EXISTS public.{FIX}", quiet=True)
         zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{FIX}'", quiet=True)
-        zb.nats_cli("kv", "del", zb.TOPOLOGY["generations"]["kv"], f"_default.{FIX}", "-f")
+        zb.nats_cli("kv", "del", zb.TOPOLOGY["generations"]["kv"], f"{OPEN}.{FIX}", "-f")
 
     print("PASS" if failed == 0 else f"FAIL ({failed})")
     return failed
-
-
-async def main():
-    return main_sync()
 
 
 zb.run(main)

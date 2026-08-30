@@ -27,8 +27,6 @@ and rows would accumulate.
 Usage:  python scripts/scenarios/guards.py [table]
 """
 
-import asyncio
-import os
 import sys
 import uuid
 
@@ -37,20 +35,12 @@ import zb
 TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
 
 
-def rules() -> list[str]:
-    entry = next(
-        (r for r in os.environ.get("SYNC_RULES", "").split(";") if r.strip().startswith(f"{TABLE}:")),
-        None,
-    )
-    return [c.strip() for c in entry.split(":", 1)[1].split(",")] if entry else []
-
-
 async def main():
     failed = 0
-    cols = rules()
-    if len(cols) < 2:
-        sys.exit(f"'{TABLE}' needs a version and a tombstone column in SYNC_RULES")
-    version_col, tombstone_col = cols[0], cols[1]
+    # From zebridge_catalogue (SYNC_RULES is only an override), exactly as the bridge
+    # resolves them — reading the env alone exits on every catalogue-configured stack.
+    cols = zb.require_rules(TABLE, "version", "tombstone")
+    version_col, tombstone_col = cols["version"], cols["tombstone"]
     print(f"version={version_col}  tombstone={tombstone_col}\n")
 
     required = [

@@ -3,9 +3,9 @@ client runs; the bridge republishes the descriptor; the client's next `sync`
 migrates the replica in place. ADD → INSERT with the new column → RENAME (hint) →
 DROP, the value surviving the rename."""
 import ctypes, json, os, subprocess, sys, time, uuid
-R = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PSQL = ["/opt/homebrew/opt/postgresql@18/bin/psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-d", "postgres", "-c"]
-lib = ctypes.CDLL(os.path.join(R, "zig-out", "lib", "libzbcore.dylib"))
+from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c")
+lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
 lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.argtypes = [ctypes.c_uint64]
@@ -29,16 +29,15 @@ def check(label, cond):
     global ok; ok &= bool(cond); print(("  ✓ " if cond else "  ✗ ") + label)
 
 db = "/tmp/zb-migrate.sqlite3"
-for f in (db, db + "-wal", db + "-shm"):
-    try: os.unlink(f)
-    except FileNotFoundError: pass
-h = lib.zb_client_open(json.dumps({"url": "nats://127.0.0.1:4222", "credsPath": R + "/../scripts/native/creds/omar.creds",
-    "grammarPath": R + "/../grammar.json", "dbPath": db, "principal": "omar", "clientId": "py-migrate", "tables": ["users", "salaries", "test_types"]}).encode())
-assert h
-s = take(lib.zb_client_sync(h)); before = cols(h)
-check(f"sync: {len(before)} columns in the replica's test_types", "note" not in before)
+rm_sqlite(db)
+h = lib.zb_client_open(json.dumps({"url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
+    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar", "clientId": "py-migrate", "tables": ["users", "salaries", "test_types"]}).encode())
 uid = str(uuid.uuid4())
 try:
+    if not h:
+        sys.exit("open failed (is the native stack up? nats 127.0.0.1:4222, creds for omar)")
+    s = take(lib.zb_client_sync(h)); before = cols(h)
+    check(f"sync: {len(before)} columns in the replica's test_types", "note" not in before)
     pg("ALTER TABLE test_types ADD COLUMN note text")
     dt = sync_until(h, lambda: "note" in cols(h), "add")
     check(f"ADD COLUMN in PostgreSQL → column in the replica after {dt and round(dt,2)} s of syncs", dt is not None)
@@ -63,5 +62,7 @@ finally:
     subprocess.run(PSQL + ["ALTER TABLE test_types DROP COLUMN IF EXISTS note"], check=False)
     subprocess.run(PSQL + ["ALTER TABLE test_types DROP COLUMN IF EXISTS remark"], check=False)
     subprocess.run(PSQL + [f"DELETE FROM test_types WHERE uid = '{uid}'"], check=False)
-    lib.zb_client_close(h)
+    if h:
+        lib.zb_client_close(h)
+    rm_sqlite(db)
 print("PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)

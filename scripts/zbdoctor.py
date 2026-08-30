@@ -20,10 +20,19 @@ Gate E is the one part that needs the scenario suite's deps, and it degrades
 to SKIP (never to red) when they are absent.
 
     python3 scripts/zbdoctor.py            # human output, exit 0 green / 1 red
-    python3 scripts/zbdoctor.py --json     # machine verdict for CI
+    python3 scripts/zbdoctor.py --json     # machine verdict on stdout, gates on stderr
+    python3 scripts/zbdoctor.py --intent intent.json [--partial]
+                                           # gate F: zebridge_check_all() against
+                                           # what you MEANT each table to be
+
+The intent file is the spec zebridge_check_all(jsonb, boolean) takes:
+    {"users": "read_only", "test_types": {"mode": "writable", "version": "updated_at",
+     "tombstone": "deleted_at", "tiebreak": "uid", "tenant": "tenant_id"}}
+A catalogue table the spec leaves out is an ERROR unless --partial.
 
 Environment (all optional, sane defaults):
-    ZB_PSQL / DATABASE_READER_URL   how to reach Postgres  (default: docker exec)
+    ZB_PSQL / DATABASE_READER_URL   how to reach Postgres  (default: the native psql,
+                                    Homebrew postgresql@18 if present, -h 127.0.0.1 -U postgres)
     NATS_URL                 how to reach NATS      (default: 127.0.0.1:4222)
     NATS_CREDS               a .creds file (operator/JWT mode) — wins if both are set
     NATS_BRIDGE_NKEY_SEED           the seed itself (nkey mode), as the bridge takes it
@@ -68,12 +77,14 @@ BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:9090").rstrip("/")
 NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
 NATS_CREDS = os.environ.get("NATS_CREDS")
 
+HOMEBREW_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
 if os.environ.get("ZB_PSQL"):
     PSQL = shlex.split(os.environ["ZB_PSQL"])
 elif os.environ.get("DATABASE_READER_URL"):
     PSQL = ["psql", os.environ["DATABASE_READER_URL"]]
 else:
-    PSQL = shlex.split("docker exec -i postgres-primary psql -U postgres")
+    PSQL = [HOMEBREW_PSQL if os.path.exists(HOMEBREW_PSQL) else "psql",
+            "-h", "127.0.0.1", "-p", "5432", "-U", "postgres"]
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 GREEN, RED, YELLOW, DIM, BOLD, OFF = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[1m", "\033[0m"
@@ -458,9 +469,12 @@ def gate_client(catalogue: dict, tenants: list[str], streams: set[str]) -> None:
     #    even build the local table.
     missing = [t for t in catalogue if not kv_has(KV_SCHEMAS, t)]
     if missing:
+        # The bridge reloads the catalogue LIVE (NOTES §10bj): a table enabled after
+        # boot is published within one reload tick, no restart. Missing while a bridge
+        # is up means the reload did not publish it.
         red("D", f"no published schema for: {', '.join(sorted(missing))}",
-            "the bridge publishes every catalogue table's schema at boot — a table enabled "
-            "after boot needs a restart (the catalogue governs it → migration + restart)")
+            "the live reload did not publish it — check the bridge log for "
+            "'catalogue reloaded live' (and for a refusal naming the table)")
     else:
         ok(f"every catalogue table has a published schema ({len(catalogue)})")
 
@@ -552,27 +566,99 @@ def gate_drift() -> None:
         print(f"  {DIM}  → python3 -m venv scripts/scenarios/.venv && "
               f"scripts/scenarios/.venv/bin/pip install msgpack nats-py nkeys{OFF}")
         return
-    if r.returncode == 0:
-        ok("no drift between what is declared and what is live")
-        return
+    out_lines = [ANSI.sub("", l).strip() for l in (r.stdout + "\n" + r.stderr).splitlines()]
+    # check.py skips a block when it cannot read a resource (the rendered NATS conf,
+    # a stream). A skipped block is not "no drift" — it is unverified, so it is amber
+    # here, and it says what was skipped.
+    skips = [l for l in out_lines if "skip" in l.lower()]
+    for l in skips:
+        amber("E", f"check.py skipped: {l.lstrip('⚠️ⓘ ').strip()}",
+              "that block is UNVERIFIED — set ZB_NATS_CONF / the creds it needs and re-run")
     # Surface check.py's own ✗ lines rather than a bare exit code.
-    for line in r.stdout.splitlines():
+    for line in out_lines:
         if "✗" in line:
-            # check.py colours its own output; strip the escapes so the finding
-            # reads as one line here (and so --json carries clean text).
-            clean = ANSI.sub("", line).strip().lstrip("✗").strip()
+            clean = line.lstrip("✗").strip()
             findings.append({"gate": "E", "message": clean, "fix": ""})
             print(f"  {RED}✗{OFF} {clean}")
-    if not any(f["gate"] == "E" for f in findings):
-        red("E", f"check.py exited {r.returncode}", "run it directly for the detail")
+    if r.returncode != 0 and not any(f["gate"] == "E" for f in findings):
+        amber("E", f"check.py exited {r.returncode} with no ✗ line", "run it directly for the detail")
+    if r.returncode == 0 and not skips:
+        ok("no drift between what is declared and what is live")
+    elif r.returncode == 0:
+        print(f"  {DIM}the blocks check.py could read show no drift; the skipped ones are unverified{OFF}")
+
+
+# ─── Gate F: intent — what the operator MEANT each table to be ──────────────
+
+def gate_intent(spec: dict, partial: bool) -> None:
+    gate("F. intent vs catalogue (zebridge_check_all)")
+    spec_lit = json.dumps(spec).replace("'", "''")
+    try:
+        rows = psql("SELECT tbl, check_name, status, detail FROM "
+                    f"zebridge_check_all('{spec_lit}'::jsonb, {'true' if partial else 'false'}) "
+                    "ORDER BY tbl, check_name")
+    except RuntimeError as e:
+        red("F", f"zebridge_check_all() failed ({e})",
+            "it ships in init.core.template.sql — apply it, and check the spec's shape")
+        return
+    by_tbl: dict[str, list] = {}
+    for r in rows:
+        if len(r) < 4:
+            continue
+        by_tbl.setdefault(r[0], []).append((r[1], r[2], "|".join(r[3:])))
+    n_err = n_warn = 0
+    for tbl in sorted(by_tbl):
+        print(f"  {BOLD}{tbl}{OFF}")
+        for name, status, detail in by_tbl[tbl]:
+            st = status.strip().upper()
+            colour = RED if st == "ERROR" else YELLOW if st == "WARNING" else DIM if st == "NOTE" else GREEN
+            print(f"    {colour}{st:<7}{OFF} {name:<28} {detail}")
+            if st == "ERROR":
+                n_err += 1
+                findings.append({"gate": "F", "message": f"{tbl}/{name}: {detail}", "fix": ""})
+            elif st == "WARNING":
+                n_warn += 1
+                warnings.append({"gate": "F", "message": f"{tbl}/{name}: {detail}", "fix": ""})
+    if not rows:
+        amber("F", "zebridge_check_all() returned no rows — an empty spec?")
+    elif n_err == 0:
+        ok(f"intent holds for {len(by_tbl)} table(s), {n_warn} warning(s)")
+    else:
+        print(f"  {RED}✗{OFF} {n_err} ERROR(s), {n_warn} WARNING(s) across {len(by_tbl)} table(s)")
 
 
 # ─── the verdict ────────────────────────────────────────────────────────────
 
+def parse_args():
+    import argparse
+    ap = argparse.ArgumentParser(prog="zbdoctor", description="one command, one verdict")
+    ap.add_argument("--json", action="store_true", help="machine verdict on stdout; gate text goes to stderr")
+    ap.add_argument("--intent", metavar="FILE|JSON",
+                    help="a zebridge_check_all() spec — a .json file, or the JSON inline")
+    ap.add_argument("--partial", action="store_true",
+                    help="with --intent: catalogue tables the spec omits are not errors")
+    return ap.parse_args()
+
+
+def load_intent(arg: str) -> dict:
+    text = Path(arg).read_text() if Path(arg).exists() else arg
+    try:
+        spec = json.loads(text)
+    except json.JSONDecodeError as e:
+        sys.exit(f"--intent: not JSON ({e}); expected a file path or an inline object")
+    if not isinstance(spec, dict):
+        sys.exit("--intent: the spec must be an object {\"table\": \"read_only\"|\"writable\"|{...}}")
+    return spec
+
+
 def main() -> int:
-    as_json = "--json" in sys.argv
+    args = parse_args()
+    as_json = args.json
+    intent = load_intent(args.intent) if args.intent else None
     if as_json:
-        sys.stdout = open(os.devnull, "w")  # gates print; only the verdict escapes
+        # The gates narrate as they go; in --json mode that narration goes to stderr
+        # and stdout carries only the verdict. No devnull handle, nothing to leak.
+        sys.stdout = sys.stderr
 
     try:
         cat_rows = psql("SELECT tbl, coalesce(tenant_col,''), coalesce(version_col,''), "
@@ -596,11 +682,14 @@ def main() -> int:
     streams = gate_nats(tenants)
     gate_client(catalogue, tenants, streams)
     gate_drift()
+    if intent is not None:
+        gate_intent(intent, args.partial)
 
     if as_json:
         sys.stdout = sys.__stdout__
         print(json.dumps({"verdict": "red" if findings else "green",
-                          "findings": findings, "warnings": warnings, "skipped": skipped}, indent=2))
+                          "findings": findings, "warnings": warnings, "skipped": skipped,
+                          "intent": {"checked": intent is not None, "partial": args.partial}}, indent=2))
         return 1 if findings else 0
 
     print()

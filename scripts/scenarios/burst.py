@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""TEST_SCENARIOS I — burst throughput, and the failure signature to watch for.
+"""Burst throughput driver, and the failure signature to watch for.
+
+⚠️ This is a MANUAL benchmark, not a verdict: it exits 0 as soon as PostgreSQL has
+absorbed the rows and asserts nothing about the bridge. It lives in run.py's
+"manual" group (listed, never run in a battery) because it leaves its rows behind.
 
 **Not a trickle.** Every load test before 2026-08-15 paced small transactions, and every
 one passed while a quadratic bug in the WAL reader capped bursts at ~1.2k msg/s. The bug
@@ -68,7 +72,7 @@ def main():
         f"\n  healthy : cdc_events reaches {total:,}; idle stays high once drained\n"
         "  broken  : recv_ms → 15000, idle=0, cpu≈100%\n"
         "\nAnd the backlog — the number that answers 'is the bridge behind?':\n"
-        "  curl -s localhost:9090/metrics | grep bridge_wal_confirmed_lag_bytes"
+        f"  curl -s {zb.http_base()}/metrics | grep bridge_wal_confirmed_lag_bytes"
     )
     return 0
 

@@ -55,8 +55,10 @@ import asyncio
 import os
 import pathlib
 import sys
+from urllib.parse import unquote
 
 import msgpack
+from nats.js.api import ConsumerConfig, DeliverPolicy
 
 import zb
 
@@ -65,33 +67,27 @@ SCRATCH = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
 
 
 # ⚠️ Same rule as `mutate.py` and `rowsize.py`: the principal is the NATS user this
-# script authenticates AS. Under nkey auth the URL carries no user at all, and reading
-# the host out of it produced `mutation.127.0.0.1.users.insert` — one token too many.
-# The bridge dead-letters a malformed subject with **no addressable verdict**, which
-# made every assertion below fail at once and looked exactly like a write-path leak.
-def principal() -> str:
-    if os.environ.get("ZB_PRINCIPAL"):
-        return os.environ["ZB_PRINCIPAL"]
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
+# script authenticates AS (`zb.require_principal()`: ZB_PRINCIPAL, else the creds file's
+# stem). A guessed name publishes on a subject the connection is not allowed to use,
+# and the bridge dead-letters it with **no addressable verdict** — every assertion
+# below then fails at once and looks exactly like a write-path leak.
 
 
-def kv_raw(bucket: str, key: str) -> bytes | None:
-    """A KV value as bytes, or None when absent."""
-    import subprocess
-    seed = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_seed.nk"
-    seed.write_text(os.environ.get("NATS_BRIDGE_NKEY_SEED", ""))
-    scheme, _, rest = zb.NATS_URL.partition("://")
-    server = f"{scheme}://{rest.rsplit('@', 1)[-1]}"
-    r = subprocess.run(["nats", "--server", server, "--nkey", str(seed),
-                        "kv", "get", bucket, key, "--raw"], capture_output=True)
-    return r.stdout if r.returncode == 0 else None
+def writer_role() -> str:
+    """The writer role's name, out of the URL the bridge dials it with."""
+    url = os.environ.get("DATABASE_WRITER_URL")
+    if not url:
+        sys.exit("DATABASE_WRITER_URL is not set — set -a && . ./.env.bridge && set +a")
+    rest = url.split("://", 1)[-1]
+    creds = rest.rsplit("@", 1)[0] if "@" in rest else ""
+    return unquote(creds.partition(":")[0])
 
 
 def metric(name: str) -> float | None:
     import urllib.request
     try:
-        with urllib.request.urlopen("http://127.0.0.1:9090/metrics", timeout=4) as r:
+        # The long-running bridge's: the probe has exited by the time this is read.
+        with urllib.request.urlopen(zb.http_base() + "/metrics", timeout=4) as r:
             for line in r.read().decode().splitlines():
                 if line.startswith(f"{name} "):
                     return float(line.split()[1])
@@ -102,9 +98,8 @@ def metric(name: str) -> float | None:
 
 async def main():
     failed = 0
-    writer = os.environ.get("POSTGRES_WRITER_USER")
-    if not writer:
-        sys.exit("POSTGRES_WRITER_USER is not set — source .env.admin")
+    writer = writer_role()
+    who0 = zb.require_principal()
 
     pk_seq = zb.psql(
         "SELECT coalesce(pg_get_serial_sequence('public.%s', a.attname), '') "
@@ -160,10 +155,18 @@ async def main():
         # (no PK, no CDC route). The claim is that *this write* adds nothing to it.
         refused_before = metric("bridge_refused_tables")
 
-        nc = await zb.connect()
+        # As the CLIENT principal, confined exactly as a real client is: connected as
+        # the bridge this would pass while proving nothing. A client holds no core
+        # `cdc.>` subscription — public tables are read through a consumer on
+        # CDC_PUBLIC, delivered on its inbox — so that is how CDC is watched here.
+        nc = await zb.connect_as(who0)
         js = nc.jetstream()
         cdc_seen = []
-        cdc_sub = await nc.subscribe("cdc.>")
+        cdc_sub = await js.subscribe(
+            f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{TABLE}.>",
+            stream=zb.TOPOLOGY["cdc_streams"]["public"],
+            config=ConsumerConfig(deliver_policy=DeliverPolicy.NEW),
+        )
 
         async def watch_cdc():
             async for m in cdc_sub.messages:
@@ -171,9 +174,8 @@ async def main():
 
         cdc_task = asyncio.create_task(watch_cdc())
         verdicts = {}
-        who0 = principal()
         # ⚠️ `mutation_ack.>` is denied — a client is granted only its own subtree.
-        sub = await nc.subscribe(f"mutation_ack.{who0}.*")
+        sub = await nc.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who0}.*")
 
         async def collect():
             async for m in sub.messages:
@@ -238,9 +240,7 @@ async def main():
         other = "test_types"
         # The tenant this principal is mapped to, or RLS refuses the write (same lookup
         # as `mutate.py`); an unmapped principal falls back to the open tenant.
-        tenant = zb.psql(
-            f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal='{who0}' LIMIT 1"
-        ).strip() or os.environ.get("OPEN_TENANT", "public")
+        tenant = zb.tenant_of(who0) or zb.TOPOLOGY["open_tenant"]
         other_uid = __import__("uuid").uuid4()
         ov = zb.psql("SELECT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US') || 'Z'").strip()
         await js2.publish(
@@ -255,6 +255,10 @@ async def main():
         )
         await asyncio.sleep(5)
         cdc_task.cancel()
+        try:
+            await cdc_sub.unsubscribe()   # the ephemeral consumer goes with it
+        except Exception:  # noqa: BLE001
+            pass
         await nc.close()
 
         # ⚠️ Same client, same connection, *after* its write was refused.
@@ -280,7 +284,7 @@ async def main():
         # write side, and which mean opposite things on the read side. A suspension tells
         # every client to DROP its local copy of the table; a write refusal must leave
         # them alone.
-        doc = (kv_raw("schemas", TABLE) or b"").decode("utf-8", errors="replace")
+        doc = zb.kv_get("schemas", TABLE).replace(" ", "")
         if '"suspended":true' in doc:
             zb.bad(
                 f"'{TABLE}' was published as SUSPENDED — every client drops its local copy "

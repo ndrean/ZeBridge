@@ -10,10 +10,11 @@ nothing used to compare them:
   **capability** the schema: a usable version column (PROTOCOL.md §7.3), and a primary
                  key a client can mint (§7.2).
 
-`SYNC_RULES` is neither. It says *how* to write a table — which column is the version,
-which is the tombstone — never *whether* the table may be written. So a table can be
-configured for writes it will never perform, or granted writes its schema cannot honour,
-and both look fine until a mutation is already in flight.
+The catalogue's LWW columns (`zebridge_catalogue.version_col`/`tombstone_col`) are
+neither. They say *how* to write a table — which column is the version, which is the
+tombstone — never *whether* the table may be written. So a table can be configured for
+writes it will never perform, or granted writes its schema cannot honour, and both look
+fine until a mutation is already in flight.
 
 ⚠️ The failure this exists to catch is **silent**. `permission denied` is a SQL error,
 and the bridge classifies every SQL error as transient — it cannot distinguish a refused
@@ -26,6 +27,8 @@ Usage:  python scripts/scenarios/writable.py [writable_table] [readonly_table]
 
   writable.py                       # test_types (writable) vs users (outbound-only)
   writable.py notes users           # a different pair
+
+Sends its probe write as a client principal (`NATS_CREDS=scripts/native/creds/<p>.creds`).
 """
 
 import asyncio
@@ -67,8 +70,8 @@ ORDER BY pt.tablename
 
 
 def version_now() -> str:
-    """The shape CDC echoes back: ISO with `T`, microseconds, no zone suffix."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    """§7.2 wire format: ISO with `T`, microseconds, and the `Z` the bridge requires."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 async def main():
@@ -166,7 +169,8 @@ async def main():
     # the refusal is real (PostgreSQL says so) but *invisible on the wire*. Anything
     # that later makes it visible — the reply channel — should turn this assertion
     # around, and this is where that will be noticed.
-    nc = await zb.connect()
+    who = zb.require_principal()
+    nc = await zb.connect_as(who)
     js = nc.jetstream()
 
     # `mutation_ack.<principal>.>`, not `mutation_error.>`: the dead letter is keyed by
@@ -174,7 +178,7 @@ async def main():
     # verdict is keyed by the client's own msg_id and scoped to the principal, which is
     # what makes it matchable to a queued write and safe to grant.
     verdicts = []
-    sub = await nc.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.alice.>")
+    sub = await nc.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>")
 
     async def collect():
         async for msg in sub.messages:
@@ -192,7 +196,7 @@ async def main():
             "client_id": "scenario-writable",
         }
         subject = zb.subject(
-            zb.TOPOLOGY["subjects"]["mutations_prefix"], "alice", table, "insert"
+            zb.TOPOLOGY["subjects"]["mutations_prefix"], who, table, "insert"
         )
         # The msg_id is the correlation token *and* becomes a subject token, so it must
         # avoid `.`, `*`, `>` and whitespace — a value carrying a dot silently changes the

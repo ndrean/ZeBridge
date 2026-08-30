@@ -21,19 +21,20 @@ claim from the LIVE system:
 the live mutation listener may see one refused reconnect attempt during it — by
 design, that is exactly the ceiling working.
 
-Usage:  python scripts/scenarios/connbudget.py   (admin ZB_PSQL; bridge on :9090)
+Usage:  python scripts/scenarios/connbudget.py   (admin ZB_PSQL; the long-running bridge,
+        zb.http_base(); DATABASE_WRITER_URL from .env.bridge for the bite test)
 """
 
 import concurrent.futures
 import os
 import re
 import subprocess
-import sys
 import urllib.request
 
 import zb
 
-HTTP = os.environ.get("ZB_BRIDGE_HTTP", "http://127.0.0.1:9090")
+HTTP = os.environ.get("ZB_BRIDGE_HTTP") or zb.http_base()
+PSQL_BIN = zb.PSQL.split()[0]   # the same psql binary the harness uses, not whatever is on PATH
 
 
 def http_status(path: str, timeout: float = 5) -> int:
@@ -79,13 +80,16 @@ def main():
         zb.ok(f"writer budget fits its consumers: {writer} ≥ 2 + 4 enroll permits")
 
     # ── 2. the writer ceiling BITES ───────────────────────────────────────────
+    # DATABASE_WRITER_URL is what .env.bridge carries; a run without it cannot prove
+    # the ceiling and must say FAIL, not skip — a skipped bite test is how a
+    # `CONNECTION LIMIT -1` regression would sail through this battery.
     wurl = os.environ.get("DATABASE_WRITER_URL", "")
     if writer > 0 and wurl:
-        m = re.match(r"postgres://([^:]+):([^@]+)@([^:/]+):?(\d*)/(\w+)", wurl)
+        m = re.match(r"postgres(?:ql)?://([^:]+):([^@]+)@([^:/]+):?(\d*)/(\w+)", wurl)
         if m:
             user, pw, host, port, db = m.groups()
             procs = [subprocess.Popen(
-                ["psql", "-h", host, "-p", port or "5432", "-U", user, "-d", db,
+                [PSQL_BIN, "-h", host, "-p", port or "5432", "-U", user, "-d", db,
                  "-Atc", "SELECT pg_sleep(4)"],
                 env={**os.environ, "PGPASSWORD": pw},
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -100,9 +104,13 @@ def main():
                        "the CONNECTION LIMIT is not enforcing")
                 failed += 1
         else:
-            print("  ⓘ  DATABASE_WRITER_URL unparseable — bite test skipped")
-    else:
-        print("  ⓘ  no DATABASE_WRITER_URL in env — bite test skipped")
+            zb.bad("DATABASE_WRITER_URL is set but unparseable (expected postgres://user:pw@host:port/db) — "
+                   "the bite test cannot run, and an untested ceiling is a failure, not a skip")
+            failed += 1
+    elif writer > 0:
+        zb.bad("DATABASE_WRITER_URL absent — the bite test cannot run. "
+               "`set -a && . ./.env.bridge && set +a` before this scenario")
+        failed += 1
 
     # ── 3. the enroll permit pool + telemetry under flood ─────────────────────
     probe = http_status("/enroll?code=" + "0" * 32 + "&user_pubkey=U" + "A" * 55)

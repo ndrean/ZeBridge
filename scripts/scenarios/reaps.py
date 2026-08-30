@@ -32,11 +32,17 @@ Usage:  python scripts/scenarios/reaps.py [tombstoned_table] [plain_table]
 
   reaps.py                       # test_types (soft-deletes) vs users (physical)
 
-Needs the bridge running with the table's SYNC_RULES entry, and a live NATS.
+Needs the bridge running, a live NATS, and the soft table's tombstone column declared in
+`zebridge_catalogue` (the sweeper reads the same row). Runs with the BRIDGE identity
+(`NATS_CREDS=scripts/native/creds/bridge.creds`): the CDC subscription below is a negative
+check, and a client principal — which is not allowed `cdc.>` — would see nothing and pass
+it vacuously.
 """
 
 import asyncio
 import os
+import pathlib
+import subprocess
 import sys
 import uuid
 
@@ -44,26 +50,25 @@ import zb
 
 SOFT = sys.argv[1] if len(sys.argv) > 1 else "test_types"
 HARD = sys.argv[2] if len(sys.argv) > 2 else "users"
-
-
-def rules_for(table: str) -> list[str]:
-    entry = next(
-        (r for r in os.environ.get("SYNC_RULES", "").split(";") if r.strip().startswith(f"{table}:")),
-        None,
-    )
-    return [c.strip() for c in entry.split(":", 1)[1].split(",")] if entry else []
+CDC = zb.TOPOLOGY["subjects"]["cdc_prefix"]
 
 
 async def main():
     failed = 0
-    cols = rules_for(SOFT)
-    if len(cols) < 2:
+
+    creds = os.environ.get("NATS_CREDS", "")
+    if pathlib.Path(creds).name != "bridge.creds":
         sys.exit(
-            f"'{SOFT}' has no tombstone column in SYNC_RULES, so its deletes are physical\n"
-            f"  and there is nothing to suppress.\n"
-            f"    SYNC_RULES={SOFT}:updated_at,deleted_at"
+            "reaps.py must subscribe to the CDC feed with the bridge's own creds: the assertion\n"
+            "  'no delete reached the wire' is a NEGATIVE check, and a principal that is not\n"
+            "  allowed `cdc.>` sees nothing at all — every reap would pass unobserved.\n"
+            "    export NATS_CREDS=scripts/native/creds/bridge.creds"
         )
-    version_col, tombstone_col = cols[0], cols[1]
+
+    r = zb.require_rules(SOFT, "version", "tombstone")
+    version_col, tombstone_col = r["version"], r["tombstone"]
+    if zb.rules(HARD)["tombstone"]:
+        sys.exit(f"'{HARD}' has a tombstone column declared — pick a table whose deletes are physical")
     print(f"{SOFT}: version={version_col} tombstone={tombstone_col}")
     print(f"{HARD}: no tombstone — its deletes are real\n")
 
@@ -76,13 +81,26 @@ async def main():
             "AND column_name <> 'uid'"
         ).splitlines() if c
     ]
-    tenant = zb.psql(
-        "SELECT tenant_id FROM zebridge_user_tenants WHERE principal='zb_sweeper' LIMIT 1"
+    # The row must sit in a tenant the sweeper's principal is mapped to, or RLS hides it
+    # from the reap and the "did not reap" failure blames the wrong thing. The sweeper
+    # runs as `zb_sweeper` (bridge_sweeper.zig sets it as the RLS principal) — NOT as
+    # whoever runs this scenario; ZB_SWEEPER_PRINCIPAL only for a stack that renamed it.
+    sweeper_principal = os.environ.get("ZB_SWEEPER_PRINCIPAL") or "zb_sweeper"
+    mapped = zb.psql(
+        f"SELECT tenant_id FROM public.zebridge_user_tenants WHERE principal = '{sweeper_principal}' LIMIT 1",
+        quiet=True,
     ).strip()
+    if not mapped:
+        sys.exit(
+            f"principal '{sweeper_principal}' has no row in zebridge_user_tenants — the reap would\n"
+            f"  be refused by RLS and this scenario would blame the sweeper. Map it, or set\n"
+            f"  ZB_SWEEPER_PRINCIPAL to the principal the sweeper runs as."
+        )
+    tenant = zb.tenant_of(sweeper_principal)
 
     nc = await zb.connect()
     seen: list[str] = []
-    sub = await nc.subscribe("cdc.>")
+    sub = await nc.subscribe(f"{CDC}.>")
 
     async def collect():
         async for m in sub.messages:
@@ -121,11 +139,9 @@ async def main():
     #
     # Run against the same threshold the bridge is configured with; the sweeper is a
     # separate binary, so this is the real path rather than a simulated DELETE.
-    sweeper = zb.ROOT / "zig-out" / "bin" / "bridge_sweeper"
+    sweeper = zb.SWEEPER
     if not sweeper.exists():
         sys.exit(f"{sweeper} not built — run `zig build`")
-
-    import subprocess
 
     env = dict(os.environ)
     env["GC_THRESHOLD_MS"] = "3600000"
@@ -138,7 +154,8 @@ async def main():
 
     gone = zb.psql(f"SELECT count(*) FROM public.{SOFT} WHERE uid = '{uid}'").strip()
     if gone != "0":
-        zb.bad(f"the sweeper did not reap the row — check its principal and SYNC_RULES")
+        zb.bad(f"the sweeper did not reap the row — check its principal's tenant mapping "
+               f"and the tombstone column in zebridge_catalogue")
         failed += 1
 
     reap_events = [s for s in seen[len(before):] if s.endswith(f"{SOFT}.delete")]

@@ -48,7 +48,7 @@ LOG_C = "/tmp/zb_legacybait_c.log"
 def main_sync():
     failed = 0
 
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
+    running = subprocess.run(["pgrep", "-f", r"zig-out/bin/bridge$"], capture_output=True, text=True)
     if running.stdout.strip():
         sys.exit("another bridge is already running — this scenario owns the only bridge "
                  "(it quarantines test_types on purpose; a live bridge would carry that "
@@ -131,10 +131,18 @@ def main_sync():
             failed += 1
 
     finally:
-        zb.psql("ALTER TABLE public.test_types ENABLE TRIGGER USER", quiet=True)
-        zb.psql("ALTER TABLE public.test_types DISABLE TRIGGER USER", quiet=True)
-        zb.psql(f"DELETE FROM public.test_types WHERE uid = '{uid}'", quiet=True)
-        zb.psql("ALTER TABLE public.test_types ENABLE TRIGGER USER", quiet=True)
+        # ONE transaction: disable the user triggers (the soft-delete guard would only
+        # tombstone the bait, still stored, still too wide), remove the row, re-arm.
+        # Four separate psql calls used to do this, and a crash between the DISABLE
+        # and the ENABLE left test_types with its guards off for every later scenario.
+        # A single -c string is one implicit transaction: either all of it applies —
+        # triggers back on — or none of it does and they were never off.
+        zb.psql(
+            "ALTER TABLE public.test_types DISABLE TRIGGER USER; "
+            f"DELETE FROM public.test_types WHERE uid = '{uid}'; "
+            "ALTER TABLE public.test_types ENABLE TRIGGER USER",
+            quiet=True,
+        )
 
     print("PASS" if failed == 0 else f"FAIL ({failed})")
     return failed

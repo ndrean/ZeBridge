@@ -12,7 +12,11 @@ tenant, derived from `zb.principal`. Coalescing to a constant open value (an ear
 version) meant one forgotten field turned a private row public with no error.
 
 Everything runs on a throwaway table this scenario creates and drops, with throwaway
-principals in `zebridge_user_tenants`, so it touches no fixture and leaves nothing behind.
+principals in `zebridge_user_tenants`, so it touches no fixture. ⚠️ Not quite nothing
+left behind: the throwaway tenants `tw_acme`/`tw_globex` are new to a running bridge,
+which onboards them live — `CDC_tw_acme`/`CDC_tw_globex` streams and
+`$KV.tenants.tw_*` keys appear. The keys are deleted in `finally` when `NATS_CREDS` is
+set; the streams are left (empty, and dyntenant.py's territory to prove removable).
 
 ⚠️ Runs its writes as `bridge_writer` with `zb.principal` set **inside the transaction** —
 the one thing that makes RLS and the guard work, and the thing autocommit silently breaks
@@ -24,6 +28,7 @@ Needs the write profile (guards + RLS functions) and the OPEN_TENANT carve-out i
 `zebridge_scope_writes_by_tenant`. Read-only or single-tenant deployments will skip.
 """
 
+import os
 import subprocess
 import sys
 import uuid
@@ -76,6 +81,19 @@ def main():
     carve = sql("SELECT (prosrc LIKE '%_default%')::text FROM pg_proc "
                 "WHERE proname='zebridge_scope_writes_by_tenant'").strip()
 
+    try:
+        return checks(carve)
+    finally:
+        # ── cleanup, whatever happened above ───────────────────────────────────
+        sql(f"DROP TABLE IF EXISTS public.{T} CASCADE")
+        sql(f"DELETE FROM public.zebridge_user_tenants WHERE principal IN ('{A}','{B}','{P}')")
+        if os.environ.get("NATS_CREDS"):
+            bucket = zb.TOPOLOGY["kv"]["tenants"]
+            for who in (A, B, P):
+                zb.nats_cli("kv", "del", bucket, who, "-f")
+
+
+def checks(carve: str) -> int:
     # ── setup: a throwaway table + throwaway principals ─────────────────────────
     sql(f"DROP TABLE IF EXISTS public.{T} CASCADE")
     sql(f"CREATE TABLE public.{T} (uid uuid, tenant_id text NOT NULL, note text, "
@@ -165,10 +183,6 @@ def main():
     dead = sql(f"SELECT (deleted_at IS NOT NULL)::text FROM public.{T} WHERE note='a-own'").strip()
     check("alice soft-deletes her own row", dead in ("t", "true"),
           "tombstoned (DELETE became an UPDATE)" if dead in ("t", "true") else "not tombstoned")
-
-    # ── cleanup ────────────────────────────────────────────────────────────────
-    sql(f"DROP TABLE IF EXISTS public.{T} CASCADE")
-    sql(f"DELETE FROM public.zebridge_user_tenants WHERE principal IN ('{A}','{B}','{P}')")
 
     print()
     return 1 if failed else 0

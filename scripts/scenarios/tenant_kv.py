@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Tenant scoping end to end: identity ($KV.tenants), audience (INIT_<TENANT> streams),
-and contents (RLS via zb.tenant) — the whole of NOTES.md §1.12 in one replayable script.
+"""Tenant identity end to end: `$KV.tenants.<principal>` — who a client is, resolved
+from NATS and nothing else.
 
 PROTOCOL.md "The Connection Flow", Step 0: a fresh consumer holding only its principal ID
 asks NATS for its own tenant instead of guessing or hardcoding one. This is the behavioural
 counterpart to that design (NOTES.md §1.12 part 3) — a client's own kv.get() against its own
 key, another principal's key, and what happens when zebridge_user_tenants changes while the
-bridge is running. The final section extends this past identity into the read path itself:
-does a tenant-scoped snapshot request actually reach only the right stream, and does it
-actually contain only the right tenant's rows?
+bridge is running.
 
-Four things this exists to keep caught, each measured once while building the feature and
+Three things this exists to keep caught, each measured once while building the feature and
 each a way this could silently regress:
 
   1. The exact-key grant is not the bare key. Direct Get's scopable subject is
@@ -30,15 +28,6 @@ each a way this could silently regress:
      reload and no bridge restart — the whole point of a live KV bucket over a static
      config. Tested here with a throwaway principal, not a fixture.
 
-  4. A tenant-scoped snapshot must be scoped in BOTH senses, and either one missing is
-     a real leak: `bob` must not be able to reach `acme`'s dump (audience — the stream
-     and the `$KV.snapshots` descriptor), and even alice's own dump of a table holding
-     both tenants' rows must contain ONLY her tenant's (contents — `zb.tenant` + the
-     `zebridge_scope_reads_by_tenant()` RLS policy, PROTOCOL.md "The Connection Flow"
-     §2, NOTES.md §1.12 part 1). Audience without contents is a stream a client can't
-     reach holding the wrong rows anyway; contents without audience is correctly
-     filtered data anyone can still read. Neither alone is the property that matters.
-
 ⚠️ NOT covered here: the `@nats-io/kv` client's `Kvm.open()` defaulting to the
 unscopable `$JS.API.STREAM.MSG.GET.KV_tenants` path unless `{allow_direct: true}` is
 passed explicitly. This scenario drives the `nats-py` client, which stays on Direct Get
@@ -48,16 +37,12 @@ regardless of that option — it cannot reproduce a regression in `web-consumer`
 Usage:
     scripts/scenarios/.venv/bin/python scripts/scenarios/tenant_kv.py
 
-Needs alice/bob/john/mary declared in nats-server.conf (dev password `s3cret`) and mapped
-in `zebridge_user_tenants` — the same fixtures this project's own dev stack already
-carries. Reads and writes `zebridge_user_tenants` for a throwaway principal
-(`tw_kv_probe`) to test live propagation, and cleans it up whether the checks pass or
-fail. Inserts two throwaway rows into `test_types` (marked `tw_kv_acme_row`/
-`tw_kv_globex_row`) to test snapshot contents, hard-deleted at the end as `zb_sweeper` —
-a plain `DELETE` would only tombstone them (the soft-delete guard intercepts every
-writer alike), and the sweeper identity is what that trigger's own bypass exists for.
-The live-propagation and snapshot checks need a running bridge and are skipped — not
-failed — if no response arrives within their timeout; every other check needs only NATS.
+Needs the creds `scripts/native/jwt-bootstrap.sh` mints (alice/bob/mary/nina), each
+mapped in `zebridge_user_tenants` as the bootstrap maps them, and `NATS_CREDS` for the
+admin half (`bridge.creds`). Reads and writes `zebridge_user_tenants` for a throwaway
+principal (`tw_kv_probe`) to test live propagation, and cleans it up whether the checks
+pass or fail. The live-propagation check needs a running bridge and is skipped — not
+failed — if no response arrives within its timeout; every other check needs only NATS.
 """
 
 import asyncio
@@ -68,15 +53,14 @@ import nats.js.errors
 
 import zb
 
-# principal -> (password, expected tenant). `john` is mapped to OPEN_TENANT
-# (`_default`) rather than to a private tenant — a deliberate membership (SECURITY.md
-# §1.2, "'Open' is a mapping, not a default"), not an absence of one, so he resolves a
-# real value here too.
+# principal -> expected tenant, as scripts/native/jwt-bootstrap.sh mints them
+# (alice:acme bob:globex mary:globex nina:tango). nina's tenant was born at runtime
+# (dyntenant onboarding) — a mapping like any other once it exists.
 PRINCIPALS = {
-    "alice": ("s3cret", "acme"),
-    "bob": ("s3cret", "globex"),
-    "mary": ("s3cret", "globex"),
-    "john": ("s3cret", "_default"),
+    "alice": "acme",
+    "bob": "globex",
+    "mary": "globex",
+    "nina": "tango",
 }
 
 # principal -> a key it must NOT be able to read
@@ -84,13 +68,6 @@ DENIED = {"alice": "bob", "bob": "alice", "mary": "alice"}
 
 PROBE = "tw_kv_probe"
 BUCKET = zb.TOPOLOGY["kv"]["tenants"]
-
-# For check 4 (snapshot audience + contents). `test_types` is the project's own
-# tenant-scoped writable fixture (TENANT_RULES=test_types:tenant_id in .env.bridge) —
-# not a throwaway table, so only these two marked rows are ours to add and remove.
-SNAP_TABLE = "test_types"
-SNAP_ACME_TEXT = "tw_kv_acme_row"
-SNAP_GLOBEX_TEXT = "tw_kv_globex_row"
 
 failed = 0
 
@@ -112,8 +89,9 @@ async def _silent_error(_e):
     pass
 
 
-async def connect_as(principal: str, password: str) -> nats.NATS:
-    return await nats.connect(zb.NATS_URL, user=principal, password=password, error_cb=_silent_error)
+async def connect_as(principal: str) -> nats.NATS:
+    """`zb.connect_as`, plus the silent error callback: same creds file, same server."""
+    return await nats.connect(zb.nats_server(), user_credentials=zb.creds_for(principal), error_cb=_silent_error)
 
 
 async def own_key(nc: nats.NATS, key: str):
@@ -133,8 +111,8 @@ async def main():
     print()
 
     # ── 1. each principal resolves its own tenant correctly ────────────────────
-    for principal, (password, expected) in PRINCIPALS.items():
-        nc = await connect_as(principal, password)
+    for principal, expected in PRINCIPALS.items():
+        nc = await connect_as(principal)
         value, err = await own_key(nc, principal)
         await nc.close()
         check(
@@ -145,12 +123,11 @@ async def main():
 
     # ── 1b. a genuinely unmapped key gets a clean 'not found', never a violation ─
     #
-    # None of the four fixtures above is actually unmapped any more (john is mapped
-    # to the open tenant on purpose — see PRINCIPALS above), so this exercises the
-    # same code path directly against the admin connection instead of pretending a
-    # real principal has no mapping. It is the same claim the exact-key grant makes
-    # for john's own connection when he genuinely has none: absence is a clean miss,
-    # not a Permissions Violation, because he is still granted his own exact key.
+    # None of the four principals above is unmapped, so this exercises the same code
+    # path directly against the admin connection instead of pretending a real
+    # principal has no mapping. It is the same claim the exact-key grant makes for a
+    # principal's own connection when it genuinely has none: absence is a clean miss,
+    # not a Permissions Violation, because it is still granted its own exact key.
     admin_probe = await zb.connect()
     admin_probe_js = admin_probe.jetstream()
     admin_probe_kv = await admin_probe_js.key_value(BUCKET)
@@ -165,8 +142,7 @@ async def main():
 
     # ── 2. cross-principal denial — the exact-key grant, not a wildcard ────────
     for principal, victim in DENIED.items():
-        password = PRINCIPALS[principal][0]
-        nc = await connect_as(principal, password)
+        nc = await connect_as(principal)
         try:
             js = nc.jetstream()
             kv = await js.key_value(BUCKET)
@@ -201,30 +177,27 @@ async def main():
             await asyncio.sleep(0.5)
         return False
 
-    zb.psql(f"INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('{PROBE}', 'acme')")
-    if await poll_for("acme"):
-        check("live INSERT propagates", True, f"$KV.{BUCKET}.{PROBE} = 'acme', no bridge restart")
+    try:
+        zb.psql(f"INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('{PROBE}', 'acme')")
+        if await poll_for("acme"):
+            check("live INSERT propagates", True, f"$KV.{BUCKET}.{PROBE} = 'acme', no bridge restart")
 
-        zb.psql(f"UPDATE zebridge_user_tenants SET tenant_id = 'globex' WHERE principal = '{PROBE}'")
-        check(
-            "live UPDATE propagates",
-            await poll_for("globex"),
-            f"$KV.{BUCKET}.{PROBE} = 'globex' after reassignment, no bridge restart",
-        )
-    else:
-        print(
-            "  ⓘ  no bridge reachable within 15s — live-propagation checks skipped, not "
-            "failed (checks 1 and 2 above still ran against whatever was already in the bucket)"
-        )
+            zb.psql(f"UPDATE zebridge_user_tenants SET tenant_id = 'globex' WHERE principal = '{PROBE}'")
+            check(
+                "live UPDATE propagates",
+                await poll_for("globex"),
+                f"$KV.{BUCKET}.{PROBE} = 'globex' after reassignment, no bridge restart",
+            )
+        else:
+            print(
+                "  ⓘ  no bridge reachable within 15s — live-propagation checks skipped, not "
+                "failed (checks 1 and 2 above still ran against whatever was already in the bucket)"
+            )
+    finally:
+        # Whatever happened above, the throwaway mapping must not outlive the run.
+        zb.psql(f"DELETE FROM zebridge_user_tenants WHERE principal = '{PROBE}'", quiet=True)
 
-    zb.psql(f"DELETE FROM zebridge_user_tenants WHERE principal = '{PROBE}'", quiet=True)
-
-    # ── 4. RETIRED (2026-08-27): snapshot audience AND contents ───────────────
-    # Snapshot-on-demand is gone (NOTES §10h/§10n). The read-path scoping it
-    # verified (per-tenant chunk subjects, $KV.snapshots descriptors) now lives
-    # in the per-tenant gen-<tenant> object stores and KV_generations manifests.
-
-    # ── 5. zebridge_user_tenants never reaches CDC ─────────────────────────────
+    # ── 4. zebridge_user_tenants never reaches CDC ─────────────────────────────
     prefix = (zb.TOPOLOGY.get("cdc_streams") or {}).get("tenant_prefix", "CDC_")
     public_stream = (zb.TOPOLOGY.get("cdc_streams") or {}).get("public", "CDC_PUBLIC")
     tenant_streams = [f"{prefix}{t}" for t in zb.tenants()]

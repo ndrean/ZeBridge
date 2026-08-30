@@ -27,7 +27,7 @@ export type CoreEvent = { lsn?: number; seq?: number; stream?: string };
 export type ManifestDelta = { object: string; cutoff: string; prev_cutoff: string; gen: number; dict?: string };
 export type ChainManifest = {
   gen: number;
-  full?: { object: string; gen: number } | null;
+  full?: { object: string; gen: number; cutoff?: string } | null;
   deltas?: ManifestDelta[];
   cutoff_seq?: number;
   cdc_stream?: string;
@@ -75,8 +75,16 @@ export function seedGateDrops(ev: CoreEvent, anchor: SeedAnchor): boolean {
 export function planFromManifest(man: ChainManifest, watermark: string | null): PlanStep[] {
   const deltas: ManifestDelta[] = man.deltas ?? [];
   const applicable = watermark ? deltas.filter((d) => d.cutoff > watermark) : deltas;
-  const reaches = watermark != null &&
-    (applicable.length === 0 || applicable[0].prev_cutoff <= watermark);
+  // "Reaches" = the chain continues from where this replica stands: either the first
+  // applicable delta starts at or before the watermark, or there is nothing newer AND
+  // the chain's full itself is not newer than the watermark. The second half is the
+  // part that was missing: a chain REBUILT after the watermark (a fresh g1 full, no
+  // deltas — what a feed restart produces, NOTES §10bm) is not "already applied", it
+  // is unreachable, and the walk must start from its full.
+  const reaches = watermark != null && (
+    applicable.length > 0
+      ? applicable[0].prev_cutoff <= watermark
+      : (man.full == null || man.full.cutoff == null || man.full.cutoff <= watermark));  // a legacy full without a cutoff is taken as reached, as the Zig core does
   const step = (d: ManifestDelta): PlanStep => ({ name: d.object, kind: 'delta', ...(d.dict ? { dict: d.dict } : {}) });
   if (reaches) return applicable.map(step);
   if (!man.full) return [];
@@ -104,14 +112,24 @@ export function fullPredatesReplica(
 
 // ─── the gap rule and seeding scope (D2, §10n) ───────────────────────────────
 
-export type StreamGap = { firstSeq: number; stored: number };
+export type StreamGap = { firstSeq: number; stored: number; lastSeq?: number };
 
 /// Per-stream, never per-table (the abandoned-table paradox). `stored === 0` is
 /// the fresh-client case; `< firstSeq - 1` means the stream pruned past the
 /// stored position. `stored === firstSeq - 1` is NOT a gap: the very next
 /// message needed is the oldest one still held.
+/// Three shapes of "the stream no longer continues from where I stopped":
+///   never here (`stored === 0`); the tail I need was retained away
+///   (`stored < firstSeq - 1`); and the stream RESTARTED under me — my position is
+///   beyond its last sequence (`stored > lastSeq`). The third is what a lost
+///   replication slot looks like from a client: WAL the bridge never saw leaves no
+///   hole in the stream's numbering, so the bridge recreates the CDC streams on a new
+///   slot (NOTES §10bm) and this is the only trace a client can read.
 export function streamHasGap(g: StreamGap): boolean {
-  return g.stored === 0 || (g.firstSeq > 0 && g.stored < g.firstSeq - 1);
+  if (g.stored === 0) return true;
+  if (g.firstSeq > 0 && g.stored < g.firstSeq - 1) return true;
+  if (typeof g.lastSeq === 'number' && g.lastSeq >= 0 && g.stored > g.lastSeq) return true;
+  return false;
 }
 
 /// Seeding is SCOPED: a gap on one stream re-seeds only the tables ROUTED to

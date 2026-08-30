@@ -123,14 +123,8 @@ pub const Topology = struct {
     mutations_subject_wildcard: []const u8,
     /// JetStream exposes a KV bucket as `$KV.<bucket>.<key>`.
     kv_schemas_subject_pattern: []const u8,
-    /// `$KV.snapshots.{[tenant]s}.{[table]s}` — tenant-keyed like the request and data
-    /// subjects above, and for the same reason: keyed by table alone, a second
-    /// requester's descriptor would overwrite the first's across tenants (NOTES.md
-    /// §1.12 part 2).
     /// `$KV.tenants.{[principal]s}` — PROTOCOL.md "The Connection Flow", Step 0.
     kv_tenants_subject_pattern: []const u8,
-    /// `snapshot.request.` — a request's subject minus the table.
-    /// `snapshot.request.>` — what the snapshot consumer filters on.
 
     /// Whether `cdc.<table>.<op>` (untenanted) or `cdc.<tenant>.<table>.<op>` (any
     /// tenant) has *some* stream willing to accept it — not whether the table replicates
@@ -482,13 +476,13 @@ pub fn render(
 const testing = std.testing;
 
 test "render: substitutes named placeholders in order" {
-    const out = try render(testing.allocator, "init.snap.{[table]s}.{[snapshot_id]s}.{[chunk]d}", &.{
+    const out = try render(testing.allocator, "cdc.{[tenant]s}.{[table]s}.{[op]s}", &.{
         .{ .name = "table", .value = "users" },
-        .{ .name = "snapshot_id", .value = "snap-1-ab" },
-        .{ .name = "chunk", .value = "3" },
+        .{ .name = "tenant", .value = "acme" },
+        .{ .name = "op", .value = "insert" },
     }, null);
     defer testing.allocator.free(out);
-    try testing.expectEqualStrings("init.snap.users.snap-1-ab.3", out);
+    try testing.expectEqualStrings("cdc.acme.users.insert", out);
 }
 
 test "render: the type letter is ignored — everything arrives as text" {
@@ -500,11 +494,11 @@ test "render: the type letter is ignored — everything arrives as text" {
 }
 
 test "render: a placeholder the call site cannot supply is an error, not an empty token" {
-    // Silently substituting "" would publish to `init.snap..snap-1` — a subject that
-    // still matches `init.>`, so the stream accepts it and no one ever notices.
+    // Silently substituting "" would publish to `cdc..users` — a subject that
+    // still matches `cdc.>`, so a stream accepts it and no one ever notices.
     try testing.expectError(
         RenderError.UnknownPlaceholder,
-        render(testing.allocator, "init.snap.{[tabel]s}", &.{.{ .name = "table", .value = "users" }}, null),
+        render(testing.allocator, "cdc.{[tabel]s}", &.{.{ .name = "table", .value = "users" }}, null),
     );
 }
 
@@ -513,9 +507,9 @@ test "render: an argument the pattern never uses is an error too" {
     // stops appearing in the subject and every table shares one.
     try testing.expectError(
         RenderError.UnusedArgument,
-        render(testing.allocator, "init.snap.{[table]s}", &.{
+        render(testing.allocator, "cdc.{[table]s}", &.{
             .{ .name = "table", .value = "users" },
-            .{ .name = "snapshot_id", .value = "snap-1" },
+            .{ .name = "tenant", .value = "acme" },
         }, null),
     );
 }

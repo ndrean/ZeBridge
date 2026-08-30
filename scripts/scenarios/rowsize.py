@@ -27,13 +27,15 @@ the sender is exactly who it guards against. Same rule as `client_id` (stamped f
 envelope) and the principal (a subject token the broker vouched for).
 
 Usage:  python scripts/scenarios/rowsize.py [table]
+
+    NATS_CREDS=scripts/native/creds/omar.creds python scripts/scenarios/rowsize.py
+
+Runs as a CLIENT principal against the long-running bridge (its /metrics is read for the
+suspension check).
 """
 
 import asyncio
 import json
-import os
-import pathlib
-import subprocess
 import sys
 import urllib.request
 import uuid
@@ -45,24 +47,16 @@ import zb
 TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
 
 
-def principal() -> str:
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
-
-
 def schema(table: str) -> dict:
-    seed = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_seed.nk"
-    seed.write_text(os.environ.get("NATS_BRIDGE_NKEY_SEED", ""))
-    scheme, _, rest = zb.NATS_URL.partition("://")
-    server = f"{scheme}://{rest.rsplit('@', 1)[-1]}"
-    r = subprocess.run(["nats", "--server", server, "--nkey", str(seed),
-                        "kv", "get", "schemas", table, "--raw"], capture_output=True, text=True)
-    return json.loads(r.stdout) if r.returncode == 0 and r.stdout.strip() else {}
+    """The schema descriptor from `$KV.schemas.<table>`, read with whatever credential
+    the run carries — the bucket is granted to every principal."""
+    raw = zb.kv_get("schemas", table)
+    return json.loads(raw) if raw else {}
 
 
 def refused_tables() -> float | None:
     try:
-        with urllib.request.urlopen("http://127.0.0.1:9090/metrics", timeout=4) as r:
+        with urllib.request.urlopen(f"{zb.http_base()}/metrics", timeout=4) as r:
             for line in r.read().decode().splitlines():
                 if line.startswith("bridge_refused_tables "):
                     return float(line.split()[1])
@@ -73,7 +67,7 @@ def refused_tables() -> float | None:
 
 async def main():
     failed = 0
-    who = principal()
+    who = zb.require_principal()
 
     # ── 3. the limit must be discoverable ──────────────────────────────────────
     #
@@ -95,16 +89,21 @@ async def main():
             f"WHERE table_name='{TABLE}' AND is_nullable='NO' AND column_default IS NULL"
         ).splitlines() if c
     ]
-    tenant = zb.psql("SELECT tenant_id FROM zebridge_user_tenants LIMIT 1").strip()
+    tenant = zb.tenant_of(who)
 
-    nc = await zb.connect()
+    nc = await zb.connect_as(who)
     js = nc.jetstream()
     verdicts: dict[str, dict] = {}
-    sub = await nc.subscribe(f"mutation_ack.{who}.*")
+    ack_prefix = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
+    sub = await nc.subscribe(f"{ack_prefix}.{who}.*")
 
     async def collect():
+        # Verdicts are JSON on the wire.
         async for m in sub.messages:
-            verdicts[m.subject.rsplit(".", 1)[-1]] = zb.decode(m.data)
+            try:
+                verdicts[m.subject.rsplit(".", 1)[-1]] = json.loads(m.data.decode())
+            except Exception as err:  # noqa: BLE001
+                verdicts[m.subject.rsplit(".", 1)[-1]] = {"status": "<undecodable>", "error": str(err)}
 
     task = asyncio.create_task(collect())
     await asyncio.sleep(0.5)

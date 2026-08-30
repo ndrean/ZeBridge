@@ -81,3 +81,5 @@ web-consumer/.env.local
 web-consumer/.env.*.local
 libzb/soak-uids.txt
 libzb/zbz-*.sqlite3*
+zb-client-ts/zebridge_*.sqlite3
+zb-client-ts/zebridge_*.sqlite3-*

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A visible heartbeat for the demo: +1 row per second on the read-only table.
 
+A DEMO, not a test: nothing is asserted, the exit code is always 0, and the rows are
+left behind on purpose. It lives beside the scenarios only because it shares `zb.py`.
+
 Writes **directly to PostgreSQL**, not through the bridge — which is the point. `users` is
 outbound-only (no `bridge_writer` grant), so this is the application writing to its own
 database exactly as it always did, while every connected consumer watches the change arrive
@@ -13,7 +16,7 @@ climbs by one:
     UPDATE the last  → one orange
     DELETE one       → one red, net +1 row
 
-⚠️ `users` has no tombstone column in `SYNC_RULES`, so its deletes are **physical** and
+⚠️ `users` declares no `tombstone_col` in `zebridge_catalogue`, so its deletes are **physical** and
 arrive as `cdc.users.delete`. On a tombstoned table the same DELETE would arrive as an
 UPDATE setting the tombstone (§7.5) — which is why the web client reads the tombstone to
 decide the verb, rather than trusting the operation.

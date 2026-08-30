@@ -19,28 +19,55 @@ Three phases, all with a live admin account in the environment:
   B  DATABASE_READER_URL set, admin credentials also present → must warn and ignore them
   C  no DATABASE_WRITER_URL, POSTGRES_WRITER_USER present → ingress off, not fallen back
 
-Usage:  python scripts/scenarios/credentials.py
+then two on the NATS side, where the principal is the JWT's user name:
+
+  D  as a CLIENT principal: may publish under its own name only, cannot forge verdicts
+  E  as the BRIDGE: a principal that is not a legal NATS token never lands a write
+
+⚠️ Owns the only bridge (phases A–C start one). run.py runs it in the "bridge" role,
+i.e. NATS_CREDS=scripts/native/creds/bridge.creds; phase D picks a client principal
+itself (ZB_PRINCIPAL, else omar — the same default run.py gives client scenarios).
+
+Usage:  python scripts/scenarios/credentials.py   (set -a && . ./.env.bridge && set +a)
 """
 
 import asyncio
 import os
-
+import pathlib
+import re
+import sys
 import uuid
+from datetime import datetime, timezone
 
 import msgpack
-from datetime import datetime, timezone
 
 import zb
 
+TMP = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
+
 # A plausible admin environment: whatever the operator's .env.admin holds, with
-# defaults matching the compose stack so this runs without one.
+# defaults matching the NATIVE stack (127.0.0.1:5432, postgres) so this runs without one.
 ADMIN = {
     "PG_HOST": os.environ.get("PG_HOST", "127.0.0.1"),
-    "PG_PORT": os.environ.get("PG_PORT", "55432"),
+    "PG_PORT": os.environ.get("PG_PORT", "5432"),
     "PG_USER": os.environ.get("PG_USER", "postgres"),
-    "PG_PASSWORD": os.environ.get("PG_PASSWORD", "postgres_password"),
+    "PG_PASSWORD": os.environ.get("PG_PASSWORD", ""),
     "PG_DB": os.environ.get("PG_DB", "postgres"),
 }
+
+
+def writer_parts() -> tuple[str, str]:
+    """(user, password) from DATABASE_WRITER_URL — never a hardcoded password."""
+    m = re.match(r"postgres(?:ql)?://([^:]+):([^@]+)@", os.environ.get("DATABASE_WRITER_URL", ""))
+    if not m:
+        sys.exit("DATABASE_WRITER_URL is not set or not parseable — phase C needs the writer's "
+                 "user/password to offer as POSTGRES_WRITER_*: set -a && . ./.env.bridge && set +a")
+    return m.group(1), m.group(2)
+
+
+def drop_probe_slot():
+    zb.psql("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='zb_probe' AND NOT active) "
+            "THEN PERFORM pg_drop_replication_slot('zb_probe'); END IF; END $$", quiet=True)
 
 
 def run(name, log, drop=(), add=None, expect_exit=False, timeout=45):
@@ -59,8 +86,8 @@ def run(name, log, drop=(), add=None, expect_exit=False, timeout=45):
         if expect_exit:
             code = br.wait_for_exit(timeout=20)
             return code, br.text()
-        br.wait_for_log("Mutation listener", timeout=timeout) or br.wait_for_log(
-            "WAL replication stream started", timeout=5
+        br.wait_for_log("Mutation listener: ✅ Ready", timeout=timeout) or br.wait_for_log(
+            "Replication started successfully", timeout=5
         )
         return br.proc.poll(), br.text()
 
@@ -69,7 +96,7 @@ def main_sync() -> int:
     failed = 0
 
     print("\nA. DATABASE_READER_URL absent, admin credentials present")
-    code, text = run("A", "/tmp/zb_cred_a.log", drop=("DATABASE_READER_URL",), expect_exit=True)
+    code, text = run("A", str(TMP / "zb_cred_a.log"), drop=("DATABASE_READER_URL",), expect_exit=True)
     if code is None:
         zb.bad("still running — it found a way to connect without DATABASE_READER_URL")
         failed = 1
@@ -83,7 +110,7 @@ def main_sync() -> int:
         failed = 1
 
     print("\nB. DATABASE_READER_URL present, admin credentials also present")
-    _, text = run("B", "/tmp/zb_cred_b.log")
+    _, text = run("B", str(TMP / "zb_cred_b.log"))
     if "are set but ignored" in text:
         zb.ok("admin variables noted as ignored (debug)")
     else:
@@ -99,11 +126,12 @@ def main_sync() -> int:
         zb.ok("every connection used a role from a URL, not the admin account")
 
     print("\nC. DATABASE_WRITER_URL absent, POSTGRES_WRITER_USER present")
+    wuser, wpass = writer_parts()
     _, text = run(
         "C",
-        "/tmp/zb_cred_c.log",
+        str(TMP / "zb_cred_c.log"),
         drop=("DATABASE_WRITER_URL",),
-        add={"POSTGRES_WRITER_USER": "bridge_writer", "POSTGRES_WRITER_PASSWORD": "writer_password_changeme"},
+        add={"POSTGRES_WRITER_USER": wuser, "POSTGRES_WRITER_PASSWORD": wpass},
     )
     if "ingress (mutation) path disabled" in text:
         zb.ok("ingress off — it did not assemble a writer connection from parts")
@@ -131,15 +159,15 @@ async def principal_is_enforced() -> int:
     not match its credential and hung for ten seconds, which reads like a broker fault
     rather than the guard working exactly as designed.
     """
-    import msgpack
-
-    nc = await zb.connect()
+    # A CLIENT principal, connected with ITS creds. run.py gives this scenario the
+    # bridge's creds (it owns a bridge), and as the bridge every check below passes
+    # while proving nothing — so the client identity is chosen here: ZB_PRINCIPAL,
+    # else omar (run.py's own default for client scenarios).
+    me = os.environ.get("ZB_PRINCIPAL") or zb.principal()
+    if not me or me == "bridge":
+        me = "omar"
+    nc = await zb.connect_as(me)
     js = nc.jetstream()
-    me = zb.NATS_URL.split("://", 1)[-1].rsplit("@", 1)[0].split(":", 1)[0] if "@" in zb.NATS_URL else None
-    if not me:
-        print("  (skipped: NATS_URL carries no user, so there is no principal to compare)")
-        await nc.close()
-        return 0
 
     body = msgpack.packb({"key": {"uid": "x"}, "version": "2026-01-01T00:00:00.000000Z"})
     failed = 0
@@ -196,21 +224,17 @@ async def malformed_principal_is_visible():
     the account is created, and every symptom appears at the far end where nobody is
     watching. PROTOCOL.md §7.1.
 
-    Published with the operator seed, because a correctly-confined client *cannot* reach
-    these subjects — which is exactly why the mistake survives to production.
+    Published as the BRIDGE (NATS_CREDS=bridge.creds, which run.py provides for this
+    scenario), because a correctly-confined client *cannot* reach these subjects —
+    which is exactly why the mistake survives to production.
     """
-    import os
-
-    import nats
-
-    seed = zb.NKEY_SEED
-    if not seed:
-        print("  (skipped: no NATS_BRIDGE_NKEY_SEED, so these subjects cannot be published at all)")
+    creds = os.environ.get("NATS_CREDS", "")
+    if pathlib.Path(creds).stem != "bridge":
+        print(f"  (skipped: NATS_CREDS={creds or 'unset'} is not bridge.creds, and only the bridge "
+              "identity can publish under an arbitrary principal)")
         return 0
 
-    bare = zb.NATS_URL.split("://", 1)
-    url = f"{bare[0]}://{bare[-1].rsplit('@', 1)[-1]}"
-    nc = await nats.connect(url, nkeys_seed_str=seed)
+    nc = await zb.connect()
     js = nc.jetstream()
     v = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
     failed = 0
@@ -256,7 +280,13 @@ async def malformed_principal_is_visible():
 
 
 async def main():
-    rc = main_sync() or 0
+    if zb.another_bridge_running():
+        sys.exit("another bridge is already running — this scenario owns the only bridge (phases A–C start one)")
+    drop_probe_slot()
+    try:
+        rc = main_sync() or 0
+    finally:
+        drop_probe_slot()
     print("\nD. the subject's principal is the authenticated user")
     rc += await principal_is_enforced()
     print("\nE. a principal that is not a legal NATS token")

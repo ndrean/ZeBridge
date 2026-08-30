@@ -14,7 +14,7 @@ named, never defaulted**, on both sides of the boundary.
     `--pub` — two values that had to agree with nothing checking that they did.
     The templates now name no publication at all; `zebridge_create_publication`
     makes one, and it is the only supported way, because it also attaches the three
-    internal tables (ddl_events, gc_watermark, user_tenants) that a hand-made
+    internal tables (ddl_events, gc_watermark, user_tenants, catalogue) that a hand-made
     `CREATE PUBLICATION` silently left out — a bridge that replicates user tables
     but never learns a schema changed and cannot resolve a tenant.
 
@@ -52,7 +52,7 @@ import zb
 
 BRIDGE = zb.ROOT / "zig-out" / "bin" / "bridge"
 ADMIN_URL = os.environ.get(
-    "ADMIN_DATABASE_URL", "postgres://postgres:postgres_password@127.0.0.1:55432/postgres"
+    "ADMIN_DATABASE_URL", "postgres://postgres@127.0.0.1:5432/postgres"
 )
 SCRATCH = "zb_pubname_scratch"
 PROBE_SLOT = "zb_pubname_probe"
@@ -93,7 +93,10 @@ def boot(argv: list[str], env_over: dict, seconds: float = 6.0) -> str:
             except subprocess.TimeoutExpired:
                 proc.kill()
         log.flush()
-        return open(log.name, errors="replace").read()
+        with open(log.name, errors="replace") as fh:
+            text = fh.read()
+    os.unlink(log.name)
+    return text
 
 
 async def main():
@@ -203,8 +206,9 @@ async def main():
         out = admin("SELECT status FROM public.zebridge_create_publication('p_probe')",
                     db=SCRATCH).stdout.split()
         # created + ddl_events + gc_watermark + user_tenants(ABSENT, write half not applied)
-        if out[:1] == ["created"] and out.count("added") == 2 and "ABSENT" in out:
-            zb.ok("8b. create_publication: made it, attached the two internal tables that "
+        # + zebridge_catalogue (internal since §10bj: the bridge reloads on its rows)
+        if out[:1] == ["created"] and out.count("added") == 3 and "ABSENT" in out:
+            zb.ok("8b. create_publication: made it, attached the three internal tables that "
                   "exist, and SAID SO about the third")
         else:
             zb.bad(f"8b. unexpected create_publication report: {out}")
@@ -216,7 +220,7 @@ async def main():
         carried = admin("SELECT string_agg(tablename, ',' ORDER BY tablename) "
                         "FROM pg_publication_tables WHERE pubname='p_probe'",
                         db=SCRATCH).stdout.strip()
-        want = "zebridge_ddl_events,zebridge_gc_watermark,zebridge_user_tenants"
+        want = "zebridge_catalogue,zebridge_ddl_events,zebridge_gc_watermark,zebridge_user_tenants"
         if carried == want:
             zb.ok("8c. init.write applied AFTER the publication existed still attached "
                   "zebridge_user_tenants — install order does not matter")
@@ -242,7 +246,7 @@ async def main():
         carried = admin("SELECT string_agg(tablename, ',' ORDER BY tablename) "
                         "FROM pg_publication_tables WHERE pubname='p_typo'",
                         db=SCRATCH).stdout.strip()
-        want = ("widgets,zebridge_ddl_events,zebridge_gc_watermark,zebridge_user_tenants")
+        want = ("widgets,zebridge_catalogue,zebridge_ddl_events,zebridge_gc_watermark,zebridge_user_tenants")
         if carried == want:
             zb.ok("8f. create_publication => true makes one that is COMPLETE — the three "
                   "internal tables, not just the user table")

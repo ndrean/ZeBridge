@@ -19,10 +19,9 @@ a live pid works, which is what leaksoak.py already does and what the script abo
 uses. `--hold` keeps this process alive so it can be attached to.
 """
 import ctypes, json, os, sys, threading
+from _env import load_lib, GRAMMAR, rm_sqlite
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LIB = os.path.join(HERE, "..", "zig-out", "lib", "libzbcore.dylib")
-lib = ctypes.CDLL(LIB)
+lib = load_lib()
 lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.restype, lib.zb_client_close.argtypes = ctypes.c_int, [ctypes.c_uint64]
 lib.zb_client_live.restype = ctypes.c_int
@@ -40,43 +39,45 @@ def opts(db):
     return json.dumps({
         "url": "nats://127.0.0.1:1",           # nothing listening, on purpose
         "credsPath": "/nonexistent.creds",
-        "grammarPath": os.path.join(HERE, "..", "..", "grammar.json"),
+        "grammarPath": GRAMMAR,
         "dbPath": db,
         "principal": "abuse",
     }).encode()
 
-print("── the failure path a host retries ──")
-# init fails at `connect`, AFTER the database is open — the case that leaked a live
-# sqlite3* before the errdefer chain was made exact. 200 of them, so a leak is loud.
-for i in range(200):
-    h = lib.zb_client_open(opts(f"/tmp/zb-abuse-{i % 4}.sqlite3"))
-    check("open against a dead broker returns 0", h == 0) if i == 0 else None
-check("200 failed opens leave no live client", lib.zb_client_live() == 0)
+DBS = [f"/tmp/zb-abuse-{i}.sqlite3" for i in list(range(4)) + ["thread"]]
+try:
+    print("── the failure path a host retries ──")
+    # init fails at `connect`, AFTER the database is open — the case that leaked a live
+    # sqlite3* before the errdefer chain was made exact. 200 of them, so a leak is loud.
+    for i in range(200):
+        h = lib.zb_client_open(opts(f"/tmp/zb-abuse-{i % 4}.sqlite3"))
+        check("open against a dead broker returns 0", h == 0) if i == 0 else None
+    check("200 failed opens leave no live client", lib.zb_client_live() == 0)
 
-print("── handles that name nothing ──")
-check("close of a never-issued handle is refused, not a crash", lib.zb_client_close(12345) == 1)
-check("close of 0 is refused", lib.zb_client_close(0) == 1)
-check("close of a wild value is refused", lib.zb_client_close(2**63 - 1) == 1)
+    print("── handles that name nothing ──")
+    check("close of a never-issued handle is refused, not a crash", lib.zb_client_close(12345) == 1)
+    check("close of 0 is refused", lib.zb_client_close(0) == 1)
+    check("close of a wild value is refused", lib.zb_client_close(2**63 - 1) == 1)
 
-print("── the classic: double close, and close from two threads ──")
-# These need a handle that actually opened. Without a broker we cannot get one, so the
-# table is exercised directly through the same code path a real handle would take:
-# every one of the calls above went through Table.remove, which is where the
-# idempotency lives. Assert the invariant that makes it safe.
-check("live count is still zero after all the abuse", lib.zb_client_live() == 0)
+    print("── the classic: double close, and close from two threads ──")
+    # These need a handle that actually opened. Without a broker we cannot get one, so the
+    # table is exercised directly through the same code path a real handle would take:
+    # every one of the calls above went through Table.remove, which is where the
+    # idempotency lives. Assert the invariant that makes it safe.
+    check("live count is still zero after all the abuse", lib.zb_client_live() == 0)
 
-def hammer():
-    for _ in range(500):
-        lib.zb_client_close(1)          # a plausible-looking handle that names nothing
-        lib.zb_client_open(opts("/tmp/zb-abuse-thread.sqlite3"))
-threads = [threading.Thread(target=hammer) for _ in range(4)]
-[t.start() for t in threads]
-[t.join() for t in threads]
-check("4 threads racing open/close leave no live client", lib.zb_client_live() == 0)
+    def hammer():
+        for _ in range(500):
+            lib.zb_client_close(1)          # a plausible-looking handle that names nothing
+            lib.zb_client_open(opts("/tmp/zb-abuse-thread.sqlite3"))
+    threads = [threading.Thread(target=hammer) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    check("4 threads racing open/close leave no live client", lib.zb_client_live() == 0)
 
-for i in list(range(4)) + ["thread"]:
-    try: os.unlink(f"/tmp/zb-abuse-{i}.sqlite3")
-    except OSError: pass
+finally:
+    for db in DBS:
+        rm_sqlite(db)
 
 print(f"\n{'PASS' if not fails else 'FAIL: ' + ', '.join(fails)}")
 

@@ -655,7 +655,7 @@ answer different questions, and using one for the other's job is a silent bug.
 
 | stored | compared against | answers |
 | --- | --- | --- |
-| **`seq`** — the JetStream stream sequence of the last CDC message applied | the CDC stream's `state.first_seq` | *"has the history I still need fallen off the back of the stream?"* |
+| **`seq`** — the JetStream stream sequence of the last CDC message applied | the CDC stream's `state.first_seq` **and `state.last_seq`** | *"has the history I still need fallen off the back of the stream?"* — and *"did the stream restart under me?"* |
 | **`lsn`** — the PostgreSQL WAL position of the last row applied | the manifest's `cutoff_lsn`, per event (legacy manifests only — `cutoff_seq` is the primary gate) | *"have I already got this row from the seed?"* |
 
 **Gap detection uses `seq`, never `lsn`:**
@@ -669,11 +669,21 @@ symptom until someone reads a row that was never written. This is the one bug in
 produces permanent silent divergence rather than a stall.
 
 ```js
-const firstSeq = streamInfo.state.first_seq;
-if (mySeq === 0 || (firstSeq > 0 && mySeq < firstSeq - 1)) {
+const { first_seq: firstSeq, last_seq: lastSeq } = streamInfo.state;
+if (mySeq === 0                                  // never here
+    || (firstSeq > 0 && mySeq < firstSeq - 1)    // the tail I need was retained away
+    || mySeq > lastSeq) {                         // the stream RESTARTED under me
     // seeding is required
 }
 ```
+
+The third shape is what a **lost replication slot** looks like from a client. When
+PostgreSQL invalidates the bridge's slot, the changes between the slot's last confirmed
+LSN and the recovery were never published — and the stream's numbering shows no hole for
+them. So the bridge, started once with `ZB_FEED_RESTART=1` after the slot is recreated,
+restarts the feed: the CDC streams are recreated (numbering from 1), the chains are
+rebuilt as fresh fulls, and every client's stored position is beyond `last_seq`. A
+client that only checked `first_seq` would resume past the hole and never know.
 
 `first_seq` is JetStream's own numbering — "the oldest message I still hold is #4711". Your
 LSN is PostgreSQL's numbering. **There is no conversion between them.** To ask whether your

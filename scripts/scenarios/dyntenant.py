@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""A tenant born at runtime — no grammar.json entry, no bridge restart, no reload.
+"""A tenant born at runtime — no config entry, no bridge restart, no reload.
 
-NOTES.md §9's claim: the bridge's publisher is fully dynamic — `grammar.json`'s
-`tenants` array feeds only the boot preflight and `nats-init`'s stream creation. At
-runtime the subject is built from the ROW's tenant value, so a backend that (1)
-creates the `CDC_<TENANT>`/`INIT_<TENANT>` streams itself and (2) inserts the
-principal→tenant mapping can onboard a tenant with zero config changes.
+NOTES.md §9's claim: the bridge's publisher is fully dynamic. Tenants are DATA
+(`zebridge_user_tenants`), not config: the bridge derives the tenant list at boot only
+for its stream reconciliation. At runtime the subject is built from the ROW's tenant
+value, so a backend that (1) creates the `CDC_<TENANT>` stream itself and (2) inserts
+the principal→tenant mapping can onboard a tenant with zero config changes.
 
 This proves it end to end against a LIVE bridge, with a tenant deliberately absent
-from grammar.json:
+from every mapping the bridge has ever read:
 
   1. the new tenant's CDC stream is provisioned at runtime (what a backend would do);
   2. a `zebridge_user_tenants` mapping inserted NOW propagates to `$KV.tenants.<principal>`
@@ -21,12 +21,12 @@ no stream is the §2.19 failure shape: the publish gets no PubAck, retries, and 
 of that kills the bridge. Step (1) is not setup convenience — it is the contract.
 
 Usage:  python scripts/scenarios/dyntenant.py
-Needs a running bridge with TENANT_RULES covering test_types, NATS_BRIDGE_NKEY_SEED, psql.
-Cleans up its streams, mapping and rows.
+Needs a running bridge, a catalogue row for test_types with a tenant_col, NATS_CREDS
+(bridge.creds — it provisions a stream), admin psql. Cleans up its streams, mapping
+and rows.
 """
 
 import json
-import os
 import time
 import sys
 
@@ -99,7 +99,7 @@ def main():
             subj_ok = subj.startswith(f"{cdc_prefix}.{TENANT}.test_types.insert")
             if subj_ok:
                 zb.ok(f"the write landed on {cdc_prefix}.{TENANT}.test_types.insert in {cdc_stream} "
-                      "— routed from the ROW's tenant value, grammar.json never consulted")
+                      "— routed from the ROW's tenant value, no config consulted")
             else:
                 zb.bad(f"a message arrived but not on the expected subject:\n{r.stdout[:200]}")
                 failed += 1

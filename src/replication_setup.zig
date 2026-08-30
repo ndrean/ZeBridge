@@ -22,6 +22,11 @@ pub const log = std.log.scoped(.replication_setup);
 pub const ReplicationContext = struct {
     allocator: std.mem.Allocator,
     tables: [][]const u8, // Owned strings in "schema.table" format
+    /// True when THIS boot created the slot. A new slot is a new feed: nothing between
+    /// the old slot's last confirmed LSN and now was ever published, and the CDC
+    /// streams' numbering shows no hole — so the bridge restarts the streams and the
+    /// chains, which is the only trace a client can read (NOTES §10bm).
+    slot_created: bool = false,
 
     pub fn deinit(self: *ReplicationContext) void {
         for (self.tables) |table| {
@@ -63,10 +68,35 @@ pub const ReplicationSetup = struct {
     /// Privilege requirements:
     /// - To CREATE: Requires REPLICATION privilege
     /// - To VERIFY: Requires ability to query pg_replication_slots
+    /// Refuse an INVALIDATED slot at boot. PostgreSQL drops the WAL a slot retains once
+    /// it outgrows max_slot_wal_keep_size and marks the slot `wal_status = lost`; the
+    /// row stays, so "exists" alone would let START_REPLICATION fail and the reconnect
+    /// loop retry a dead slot every two seconds forever (found by
+    /// scripts/scenarios/slot_loss.py, 2026-08-29). Say what happened and how to recover.
+    fn refuseLostSlot(self: *const ReplicationSetup, conn: *c.PGconn, slot_name: []const u8) !void {
+        const q = try utils.allocPrintZ(self.allocator,
+            "SELECT wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) " ++
+                "FROM pg_replication_slots WHERE slot_name = '{s}'", .{slot_name});
+        defer self.allocator.free(q);
+        const res = runQuery(conn, q) catch return;
+        defer c.PQclear(res);
+        if (c.PQntuples(res) == 0) return;
+        const status = std.mem.span(c.PQgetvalue(res, 0, 0));
+        if (std.mem.eql(u8, status, "lost")) {
+            log.err("🔴 FATAL: replication slot '{s}' is INVALIDATED (wal_status = lost): PostgreSQL discarded the WAL it retained for this bridge (max_slot_wal_keep_size). Every change since is gone from the feed; no restart can recover it.", .{slot_name});
+            log.err("   Recovery: SELECT pg_drop_replication_slot('{s}'); then start the bridge ONCE with ZB_FEED_RESTART=1 — it creates a new slot, restarts the CDC streams and the chains, and every client re-seeds from a fresh full (NOTES §10bm).", .{slot_name});
+            return error.SlotInvalidated;
+        }
+        if (std.mem.eql(u8, status, "unreserved")) {
+            log.warn("⚠️ replication slot '{s}' is 'unreserved' ({s} of WAL behind): PostgreSQL may invalidate it at the next checkpoint — catch up now, or raise max_slot_wal_keep_size", .{ slot_name, std.mem.span(c.PQgetvalue(res, 0, 1)) });
+        }
+    }
+
+    /// Returns true when this call CREATED the slot — a new feed, see ReplicationContext.
     pub fn createSlot(
         self: *const ReplicationSetup,
         slot_name: []const u8,
-    ) !void {
+    ) !bool {
         const conn = try self.connect();
         defer c.PQfinish(conn);
 
@@ -88,8 +118,9 @@ pub const ReplicationSetup = struct {
         const exists = c.PQntuples(check_result) > 0;
 
         if (exists) {
+            try self.refuseLostSlot(conn, slot_name);
             log.info("✅ Replication slot '{s}' already exists", .{slot_name});
-            return;
+            return false;
         }
 
         // Try to create the slot
@@ -111,7 +142,7 @@ pub const ReplicationSetup = struct {
 
             if (c.PQntuples(recheck_result) > 0) {
                 log.info("✅ Replication slot '{s}' exists (created externally)", .{slot_name});
-                return;
+                return false;
             }
 
             log.err("🔴 Failed to create replication slot '{s}'", .{slot_name});
@@ -122,6 +153,7 @@ pub const ReplicationSetup = struct {
         defer c.PQclear(create_result);
 
         log.info("✅ Replication slot '{s}' created", .{slot_name});
+        return true;
     }
 
     /// Check that a publication exists and return its table list
@@ -321,7 +353,7 @@ pub fn init(
 
     // Create replication slot (if it doesn't exist)
     log.info("Setting up replication slot '{s}'...", .{slot_name});
-    try setup.createSlot(slot_name);
+    const slot_created = try setup.createSlot(slot_name);
 
     // Verify publication and get table list
     log.info("Checking publication '{s}'...", .{publication_name});
@@ -334,6 +366,7 @@ pub fn init(
     pub_info.tables = &[_][]const u8{}; // Empty slice so deinit() doesn't free tables
 
     return ReplicationContext{
+        .slot_created = slot_created,
         .allocator = allocator,
         .tables = tables,
     };

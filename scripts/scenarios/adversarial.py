@@ -22,23 +22,26 @@ code is safe" is literature; this is the test.
 ⚠️ Owns the only bridge. Run as a real client principal (omar) for the mutation
 half — as the bridge it proves nothing, the bridge may do anything.
 
-Usage:  python scripts/scenarios/adversarial.py   (admin ZB_PSQL; omar creds)
+Usage:  python scripts/scenarios/adversarial.py   (admin ZB_PSQL; NATS_CREDS=bridge.creds
+        for the probe it starts; ADVERSARY_PRINCIPAL, default omar, for the client half)
 """
 
 import asyncio
 import datetime
-import json
 import os
+import pathlib
 import subprocess
+import sys
 import urllib.request
 
 import msgpack
 
 import zb
 
-HTTP = "http://127.0.0.1:9096"
-CREDS = os.environ.get("ADVERSARY_CREDS", "scripts/native/creds/omar.creds")
-LOG = "/tmp/zb_adversarial_bridge.log"
+HTTP = zb.http_base(probe=True)          # the probe's --port, from zb.BRIDGE_ARGS
+ADVERSARY = os.environ.get("ADVERSARY_PRINCIPAL", "omar")
+LOG = str(pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_adversarial_bridge.log")
+MUT = zb.TOPOLOGY["subjects"]["mutations_prefix"]
 
 
 def alive(bridge):
@@ -57,7 +60,8 @@ async def legit_write_flows(js, uid, tag):
     target = 40000 + tag
     env = msgpack.packb({"key": {"uid": uid}, "version": version, "client_id": "c-adv",
                          "data": {"uid": uid, "value": target, "updated_at": version}})
-    await js.publish("mutation.omar.counter_public.update", env, headers={"Nats-Msg-Id": f"adv-legit-{tag}-{version}"})
+    await js.publish(zb.subject(MUT, ADVERSARY, "counter_public", "update"), env,
+                     headers={"Nats-Msg-Id": f"adv-legit-{tag}-{version}"})
     for _ in range(20):
         if counter_value() == str(target):
             return True
@@ -106,16 +110,29 @@ def _nest(depth):
 
 
 async def main():
-    failed = 0
-
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
-    if running.stdout.strip():
-        import sys
+    if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
 
     zb.psql("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='zb_probe' AND NOT active) "
             "THEN PERFORM pg_drop_replication_slot('zb_probe'); END IF; END $$", quiet=True)
 
+    # The legit-write probe moves counter_public.value; put it back whatever happens.
+    value_before = counter_value()
+    try:
+        failed = await scenario()
+    finally:
+        if value_before:
+            # updated_at bumped too: the version guard refuses an UPDATE that does not move it
+            zb.psql(f"UPDATE public.counter_public SET value = {int(value_before)}, updated_at = now()", quiet=True)
+        zb.psql("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='zb_probe' AND NOT active) "
+                "THEN PERFORM pg_drop_replication_slot('zb_probe'); END IF; END $$", quiet=True)
+
+    print("PASS" if failed == 0 else f"FAIL ({failed})")
+    return failed
+
+
+async def scenario() -> int:
+    failed = 0
     with zb.Bridge(LOG) as bridge:
         if not bridge.wait_for_log("Replication started successfully", timeout=60):
             zb.bad("probe bridge never started — see " + LOG)
@@ -125,13 +142,12 @@ async def main():
         if not uid:
             uid = zb.psql("INSERT INTO public.counter_public (value) VALUES (0) RETURNING uid", quiet=True).strip()
 
-        # connect as OMAR — the allow-list confines this exactly as a real client,
-        # so the mutation lane is all the reach the adversary has. The probe bridge
-        # already launched with the BRIDGE creds it inherited; switch only THIS
-        # process's env so zb.connect authenticates as the adversary, not the bridge.
-        os.environ["NATS_CREDS"] = os.environ.get("ADVERSARY_CREDS", "scripts/native/creds/omar.creds")
-        os.environ["NATS_URL"] = "nats://127.0.0.1:4222"
-        nc = await zb.connect()
+        # connect as the ADVERSARY (a client principal) — its JWT confines this
+        # exactly as a real client, so the mutation lane is all the reach it has.
+        # The probe bridge already launched with the bridge creds it inherited
+        # (run.py sets NATS_CREDS=bridge.creds for this scenario); only this
+        # connection is the client.
+        nc = await zb.connect_as(ADVERSARY)
         js = nc.jetstream()
 
         # ── A. the mutation path, one hostile message at a time ───────────────
@@ -141,9 +157,9 @@ async def main():
         for i, (name, raw) in enumerate(hostile_payloads()):
             version = f"2026-01-01T00:00:{i:02d}.000000Z"
             try:
-                await js.publish("mutation.omar.counter_public.update", raw,
+                await js.publish(zb.subject(MUT, ADVERSARY, "counter_public", "update"), raw,
                                  headers={"Nats-Msg-Id": f"adv-hostile-{i}-{version}"})
-            except Exception as e:
+            except Exception:
                 # the CLIENT-side publish may itself reject (e.g. a broker limit) —
                 # that is fine, the point is the bridge must not die
                 pass
@@ -209,20 +225,19 @@ async def main():
                 failed += 1
 
         # ── C. the audit on the survivor ──────────────────────────────────────
-        pid = subprocess.run(["pgrep", "-f", "bridge --slot zb_probe"], capture_output=True, text=True).stdout.split()
-        if pid:
-            rep = subprocess.run(["leaks", "--nocontext", pid[0]], capture_output=True, text=True).stdout
+        # The probe is OUR subprocess: its pid is known, no pgrep pattern needed.
+        if not zb.leaks_available():
+            print("  ⓘ  `leaks` not available (macOS only) — the memory audit is skipped, not passed")
+        elif alive(bridge):
+            rep = subprocess.run(["leaks", "--nocontext", str(bridge.proc.pid)], capture_output=True, text=True).stdout
             if "0 leaks for 0 total leaked bytes" in rep:
                 zb.ok("after every hostile input: `leaks` reports 0 — no drip on the refusal paths")
             else:
                 zb.bad(f"leaks after the barrage: {[l for l in rep.splitlines() if 'leaks for' in l]}")
                 failed += 1
 
-    zb.psql("DELETE FROM public.zebridge_invites WHERE principal LIKE 'adv%'", quiet=True)
-    zb.psql("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='zb_probe' AND NOT active) "
-            "THEN PERFORM pg_drop_replication_slot('zb_probe'); END IF; END $$", quiet=True)
-
-    print("PASS" if failed == 0 else f"FAIL ({failed})")
+    # No zebridge_invites cleanup: /enroll only REDEEMS invites, this scenario never
+    # inserts one, so there is nothing of ours to delete.
     return failed
 
 

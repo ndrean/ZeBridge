@@ -23,7 +23,7 @@ Two things worth reading side by side in the report:
   2. **Memory.** Settled RSS before the load starts vs. peak RSS during/after it, next to
      the bridge's own "Event ring: N MB" boot log line. The delta between settled-RSS and
      the boot-computed ring size is everything else resident (libpq, the NATS client, the
-     snapshot/encode arenas) — worth knowing is roughly stable across runs, since a growing
+     generation-chain build buffers) — worth knowing is roughly stable across runs, since a growing
      gap would mean something *outside* the ring is the thing actually using more memory.
 
 ⚠️ **The slot is shared with every other `zb.Bridge`-based scenario**, and an inactive
@@ -158,12 +158,17 @@ def seed_table():
         f"SELECT 1 FROM pg_publication_tables WHERE pubname='{PUB}' AND tablename='{TABLE}'"
     ).strip()
     if not in_pub:
-        zb.psql(
-            "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
-            f"('{TABLE}', 'speed.py fixture') ON CONFLICT DO NOTHING; "
-            f"ALTER PUBLICATION {PUB} ADD TABLE public.{TABLE};",
+        # Through zebridge_enable, never by writing the catalogue and the publication by
+        # hand: the function is the one place the two are kept in step (catalogue row,
+        # width guard, publication membership), and the bridge reconciles from it live.
+        out = zb.psql(
+            f"SELECT step || ':' || status FROM zebridge_enable('public.{TABLE}', "
+            f"version_col => 'updated_at', public_reason => 'speed.py fixture', "
+            f"publication => '{PUB}', dry_run => false)",
             quiet=True,
         )
+        if "publication:done" not in out:
+            sys.exit(f"zebridge_enable did not publish '{TABLE}':\n{out}")
 
 
 def burst_sql(statements: int, per: int) -> str:
@@ -222,7 +227,7 @@ def main():
 
     print(f"seeding public.{TABLE} ({BRIDGE_ENV})")
     seed_table()
-    # The DROP/CREATE/ALTER PUBLICATION above is itself WAL the next bridge would
+    # The CREATE/zebridge_enable above is itself WAL the next bridge would
     # otherwise have to decode through before reaching the burst — skip it too.
     skip_wal()
 

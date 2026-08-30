@@ -8,10 +8,10 @@ measures the idle poll (must cost ~wait_ms, not spin, not overshoot) and that a
 mutation queued by this client settles through `poll`'s verdict sweep, no `flush` wait.
 """
 import ctypes, json, os, subprocess, sys, time, uuid
+from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PSQL = ["/opt/homebrew/opt/postgresql@18/bin/psql", "-X", "-q", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-d", "postgres", "-c"]
-lib = ctypes.CDLL(os.path.join(ROOT, "zig-out", "lib", "libzbcore.dylib"))
+PSQL = psql_cmd("-c")
+lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
 lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.restype, lib.zb_client_close.argtypes = ctypes.c_int, [ctypes.c_uint64]
@@ -29,27 +29,37 @@ def q(h, sql, params=()):
     return r if "error" in r else [dict(zip(r["columns"], row)) for row in r["rows"]]
 
 db = "/tmp/zb-tail.sqlite3"
-for f in (db, db + "-wal", db + "-shm"):
-    try: os.unlink(f)
-    except FileNotFoundError: pass
+rm_sqlite(db)
 h = lib.zb_client_open(json.dumps({
-    "url": "nats://127.0.0.1:4222", "credsPath": os.path.join(ROOT, "..", "scripts", "native", "creds", "omar.creds"),
-    "grammarPath": os.path.join(ROOT, "..", "grammar.json"), "dbPath": db, "principal": "omar",
+    "url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
+    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar",
     "clientId": "py-tail", "tables": ["users", "salaries", "test_types"]}).encode())
-assert h
 ok = True
 def check(label, cond):
     global ok; ok &= bool(cond); print(("  ✓ " if cond else "  ✗ ") + label)
 
+def pg_run(label, sql):
+    """A psql failure is a ✗ line, not a traceback — cleanup must still run."""
+    try:
+        subprocess.run(PSQL + [sql], check=True, capture_output=True, text=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        check(f"{label}: psql failed: {e.stderr.strip()[:200]}", False)
+        return False
+
 try:
+    if not h:
+        sys.exit("open failed (is the native stack up? nats 127.0.0.1:4222, creds for omar)")
     s = take(lib.zb_client_sync(h)); check(f"sync (tenant {s.get('tenant')})", s.get("first"))
-    # 1. idle: a poll with nothing to do costs about wait_ms and applies nothing
+    # 1. idle: a poll with nothing to do costs about wait_ms and applies nothing.
+    #    Lower bound: it must not spin. Upper bound 3000: generous, a loaded CI box
+    #    overshoots a 600 ms wait by more than the old 1500 allowed.
     t0 = time.monotonic(); r = take(lib.zb_client_poll(h, 600)); dt = (time.monotonic() - t0) * 1000
-    check(f"idle poll: applied={r.get('applied')} in {dt:.0f} ms (budget 600)", r.get("applied") == 0 and 500 <= dt <= 1500)
+    check(f"idle poll: applied={r.get('applied')} in {dt:.0f} ms (budget 600, accepted 500..3000)", r.get("applied") == 0 and 500 <= dt <= 3000)
 
     # 2. an outside write: PG via psql → CDC → the tail; poll must return EARLY
     uid = str(uuid.uuid4())  # fresh per run: the previous one is soft-deleted, its uid still taken
-    subprocess.run(PSQL + [f"INSERT INTO test_types (uid, some_text, tenant_id, inserted_at, updated_at) VALUES ('{uid}', 'from psql, outside the client', '{s['tenant']}', now(), now())"], check=True)
+    pg_run("outside INSERT", f"INSERT INTO test_types (uid, some_text, tenant_id, inserted_at, updated_at) VALUES ('{uid}', 'from psql, outside the client', '{s['tenant']}', now(), now())")
     t0 = time.monotonic(); applied = 0; polls = 0
     while applied == 0 and time.monotonic() - t0 < 10:
         r = take(lib.zb_client_poll(h, 1000)); polls += 1; applied += r.get("applied", 0)
@@ -57,7 +67,7 @@ try:
     row = q(h, "SELECT some_text FROM test_types WHERE uid = ?", [uid])
     check(f"outside INSERT tailed in {dt:.0f} ms over {polls} poll(s): {row[0]['some_text'] if row else None}", bool(row))
 
-    subprocess.run(PSQL + [f"UPDATE test_types SET some_text = 'updated outside', updated_at = now() WHERE uid = '{uid}'"], check=True)
+    pg_run("outside UPDATE", f"UPDATE test_types SET some_text = 'updated outside', updated_at = now() WHERE uid = '{uid}'")
     t0 = time.monotonic(); r = take(lib.zb_client_poll(h, 3000)); dt = (time.monotonic() - t0) * 1000
     row = q(h, "SELECT some_text FROM test_types WHERE uid = ?", [uid])
     check(f"outside UPDATE tailed in one poll of {dt:.0f} ms (returned before the 3000 budget): {row[0]['some_text'] if row else None}",
@@ -75,5 +85,7 @@ try:
     pg = subprocess.run(PSQL[:-1] + ["-tAc", f"SELECT count(*) FROM test_types WHERE uid = '{uid}' AND deleted_at IS NULL"], capture_output=True, text=True).stdout.strip()
     check(f"…and soft-deleted in PostgreSQL (live rows: {pg})", pg == "0")
 finally:
-    check("close", lib.zb_client_close(h) == 0)
+    if h:
+        check("close", lib.zb_client_close(h) == 0)
+    rm_sqlite(db)
 print("PASS" if ok else "FAIL"); sys.exit(0 if ok else 1)

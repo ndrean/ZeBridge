@@ -2,25 +2,27 @@
 """Cross-check the two env files, since nothing else can.
 
 `.env.admin` and `.env.bridge` are deliberately separate — admin credentials must not be
-in the shell that launches the bridge — but the split leaves one value that has to agree
-across the boundary and no component able to notice when it does not:
+in the shell that launches the bridge — but the split leaves values that have to agree
+across the boundary and no component able to notice when they do not:
 
-    .env.admin   PG_PUBLISH_PORT=55432        the port compose publishes Postgres on
-    .env.bridge  DATABASE_READER_URL=…@127.0.0.1:55432/…   the port the bridge dials
+    native stack   Postgres on 127.0.0.1:5432 (scripts/native/up.sh; ZB_PG_PORT to move it)
+    .env.bridge    DATABASE_READER_URL=…@127.0.0.1:5432/…   the port the bridge dials
 
 Change one and the bridge simply fails to connect, with an error naming a port that
 looks correct in whichever file you happen to open. The bridge cannot check this itself:
-it has no idea what compose published, and asking it to read `.env.admin` would undo
-the separation.
+it has no idea where the stack was brought up, and asking it to read `.env.admin` would
+undo the separation.
 
 This also catches the things a split file layout invites: a variable that moved but was
-left behind in the old file, and admin credentials creeping back into the bridge's.
+left behind in the old file, admin credentials creeping back into the bridge's, and a
+`NATS_CREDS` that names a file nobody minted.
 
 Runs offline — no bridge, no broker, no database.
 
 Usage:  python scripts/scenarios/envcheck.py
 """
 
+import os
 import pathlib
 import re
 import sys
@@ -31,13 +33,14 @@ import zb
 ADMIN = zb.ROOT / ".env.admin"
 BRIDGE = zb.ROOT / ".env.bridge"
 
-# Read by compose or by the init containers, never by the bridge. `bridge --help` is the
-# other half of this list.
+# Read by the DBA's tooling (init.sql, zb-derive-env.py), never by the bridge. `bridge
+# --help` is the other half of this list. The per-role POSTGRES_* pairs are derived
+# from the bridge's URLs now and belong in NEITHER file.
 ADMIN_ONLY = [
     "PG_HOST", "PG_PORT", "PG_USER", "PG_PASSWORD", "PG_DB", "TARGET_DB",
     "POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD",
     "POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD",
-    "PG_PUBLISH_PORT", "NATS_BRIDGE_NKEY_PUB",
+    "NATS_BRIDGE_NKEY_PUB",
 ]
 
 
@@ -59,11 +62,8 @@ async def main():
     admin, bridge = parse(ADMIN), parse(BRIDGE)
     failed = 0
 
-    published = admin.get("PG_PUBLISH_PORT")
-    if not published:
-        zb.bad("PG_PUBLISH_PORT is not in .env.admin — compose falls back to 55432 silently")
-        failed = 1
-
+    # ── the bridge's URLs against the native Postgres ──────────────────────────
+    native_port = os.environ.get("ZB_PG_PORT", "5432")
     for name in ("DATABASE_READER_URL", "DATABASE_WRITER_URL"):
         url = bridge.get(name)
         if not url:
@@ -74,11 +74,26 @@ async def main():
                 print(f"  ⓘ  {name} unset: ingress disabled")
             continue
         port = str(urlparse(url).port or 5432)
-        if published and port != published:
-            zb.bad(f"{name} dials :{port} but compose publishes :{published}")
+        if port != native_port:
+            zb.bad(f"{name} dials :{port} but the native Postgres listens on :{native_port} "
+                   "(ZB_PG_PORT if you moved it)")
             failed = 1
-        elif published:
-            zb.ok(f"{name} dials :{port}, the port compose publishes")
+        else:
+            zb.ok(f"{name} dials :{port}, the native Postgres port")
+
+    # ── the credential the shell names must exist ──────────────────────────────
+    creds = os.environ.get("NATS_CREDS") or bridge.get("NATS_CREDS")
+    if creds:
+        path = pathlib.Path(creds)
+        if not path.is_absolute():
+            path = zb.ROOT / path
+        if path.exists():
+            zb.ok(f"NATS_CREDS={creds} exists")
+        else:
+            zb.bad(f"NATS_CREDS={creds} does not exist — scripts/native/jwt-bootstrap.sh mints the creds")
+            failed = 1
+    else:
+        print("  ⓘ  NATS_CREDS unset in the shell and .env.bridge — the bridge needs one (bridge.creds)")
 
     strays = [k for k in ADMIN_ONLY if k in bridge]
     if strays:
@@ -88,19 +103,15 @@ async def main():
     else:
         zb.ok("no admin variable leaks into .env.bridge")
 
-    missing = [k for k in ADMIN_ONLY if k not in admin]
-    if missing:
-        print(f"  ⓘ  not set in .env.admin: {', '.join(missing)}")
-
     # Name collisions across the two files. This is the general form of the hazard: a
-    # shell that has sourced both — or a compose run given both — ends up with whichever
-    # was read last, and neither file shows which one won.
+    # shell that has sourced both ends up with whichever was read last, and neither
+    # file shows which one won.
     #
     # `DATABASE_READER_URL` is the sharp case. The admin legitimately needs a superuser
     # connection (init.sql, the Elixir emitter), but naming it `DATABASE_READER_URL` means
     # sourcing .env.admin hands the *bridge's* variable a superuser — the exact fallback
     # that was deliberately removed from the code. Give the admin's its own name.
-    BRIDGE_OWNED = ("DATABASE_READER_URL", "DATABASE_WRITER_URL", "NATS_URL", "BRIDGE_PORT")
+    BRIDGE_OWNED = ("DATABASE_READER_URL", "DATABASE_WRITER_URL", "NATS_URL", "NATS_CREDS", "BRIDGE_PORT")
     for name in sorted(set(admin) & set(bridge)):
         same = admin[name] == bridge[name]
         if name in BRIDGE_OWNED:

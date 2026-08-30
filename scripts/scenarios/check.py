@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """Drift — every place two copies of one fact can disagree, compared.
 
-Activation is spread over four places and two times (NOTES.md §4.5): SQL at bootstrap, SQL
-per table, bridge environment, NATS conf. Nothing compares them. Every hard-to-find bug in
-this project has been the same shape — two copies of one fact, disagreeing quietly, with
-both sides looking healthy:
+Activation is spread over several places and two times (NOTES.md §4.5): SQL at bootstrap,
+`zebridge_enable` per table (the catalogue), the bridge environment, the account JWTs.
+Nothing compares them. Every hard-to-find bug in this project has been the same shape —
+two copies of one fact, disagreeing quietly, with both sides looking healthy:
 
-  • `nats-server.conf` rendered with `${NATS_BOB_PASSWORD}` unsubstituted. The generator
-    printed `✓ Generated NATS config with credentials` and exited 0.
-  • `users` published with no `TENANT_RULES` entry, so it emitted `cdc.users.insert` — a
-    subject no tenant-scoped consumer filter can match. Counters incremented; nothing arrived.
+  • a NATS conf rendered with `${NATS_BOB_PASSWORD}` unsubstituted (the user/password
+    era). The generator printed `✓ Generated NATS config with credentials` and exited 0.
+  • `users` published with no tenant column declared, so it emitted `cdc.users.insert` —
+    a subject no tenant-scoped consumer filter can match. Counters incremented; nothing
+    arrived.
   • the catalogue still calling `test_types` public after it gained `tenant_id`.
-  • `BRIDGE_CDC_TABLES` in an env file, read by no code, free to disagree with the publication.
 
-This changes nothing. It reads what is *declared* (conf, env, grammar.json) and what is
-*actual* (PostgreSQL, NATS) and reports where they differ.
+This changes nothing. It reads what is *declared* (zebridge_catalogue, env, grammar.json,
+the live nats-server conf) and what is *actual* (PostgreSQL, NATS) and reports where
+they differ.
 
-⚠️ Exits non-zero on drift, but **nothing should `depends_on` it**. The exit code is how the
-verdict travels; `depends_on` is what decides whether anyone waits. Keeping those separate
-means individual checks can be promoted to gating by editing compose, not this file.
+⚠️ Under the JWT/operator stack the per-principal subject GRANTS live in account JWTs
+minted by `nsc` (scripts/native/jwt-bootstrap.sh), not in the server conf. The grant
+sections below are therefore SKIPPED, loudly, and counted in the summary — they are not
+silently green. `nsc describe user <p>` is where to read a grant today.
 
-⚠️ The declaration is often *legitimately* ahead of reality — you add a table, then migrate,
-then set TENANT_RULES, then reload NATS. Findings during that window are correct and not
-bugs. That is why this starts advisory.
+⚠️ The declaration is often *legitimately* ahead of reality — you add a table, then
+migrate, then `zebridge_enable` it. The bridge reloads the catalogue LIVE at the COMMIT
+of a catalogue row (NOTES §10bj), so the window is a commit, not a restart: drift that
+persists after the commit is the finding.
 
 Usage:
-    NATS_URL=nats://127.0.0.1:4222 NATS_BRIDGE_NKEY_SEED=SU... \
-        python scripts/scenarios/check.py
+    NATS_CREDS=scripts/native/creds/bridge.creds python scripts/scenarios/check.py
 
-    ZB_NATS_CONF=/config/nats-server.conf python scripts/scenarios/check.py   # in compose
+    ZB_NATS_CONF=<path> …   # else the conf is read from the running nats-server's argv
 """
 
 import json
@@ -39,10 +41,10 @@ import sys
 
 import zb
 
-# The rendered conf — the *live* one, not the template. They are different artifacts and
-# their disagreement is itself a finding (the bob password bug lived exactly there).
+# The conf — the *live* one the server was started with, not a template. ZB_NATS_CONF
+# names it; else it is read from the running nats-server's `-c` (up.sh historically
+# started nats-server.conf, the JWT stack runs nats-server-jwt.conf — never hardcode).
 NATS_CONF = os.environ.get("ZB_NATS_CONF", "")
-NATS_VOLUME = os.environ.get("ZB_NATS_VOLUME", "zebridge_nats-config")
 
 # Principals that are infrastructure, not clients. N-1 does not apply to them: the sweeper
 # is mapped to every tenant it may reap, and that N-ness *is* how its reach stays auditable
@@ -50,6 +52,12 @@ NATS_VOLUME = os.environ.get("ZB_NATS_VOLUME", "zebridge_nats-config")
 INFRA = set(filter(None, os.environ.get("ZB_INFRA_PRINCIPALS", "zb_sweeper").split(",")))
 
 findings = []
+skipped = []   # (section, why) — sections that could not be checked, reported in the summary
+
+
+def skip(section, why):
+    skipped.append((section, why))
+    print(f"  \033[33mSKIP\033[0m {section}: {why}")
 
 
 def bad(msg, detail=""):
@@ -60,39 +68,31 @@ def bad(msg, detail=""):
             print(f"      {line}")
 
 
+def running_nats_conf() -> str:
+    """The `-c <conf>` of the live nats-server, from its argv (`ps -o args=`)."""
+    pids = subprocess.run(["pgrep", "-x", "nats-server"], capture_output=True, text=True).stdout.split()
+    if not pids:
+        return ""
+    argv = subprocess.run(["ps", "-o", "args=", "-p", pids[0]], capture_output=True, text=True).stdout.split()
+    for i, a in enumerate(argv):
+        if a in ("-c", "--config") and i + 1 < len(argv):
+            path = argv[i + 1]
+            return path if os.path.isabs(path) else str(zb.ROOT / path)
+    return ""
+
+
 def read_conf() -> str:
-    if NATS_CONF and os.path.exists(NATS_CONF):
-        return open(NATS_CONF).read()
-    # Host case: the conf lives in a docker volume, not on this filesystem.
-    r = subprocess.run(
-        ["docker", "run", "--rm", "-v", f"{NATS_VOLUME}:/config", "alpine",
-         "cat", "/config/nats-server.conf"],
-        capture_output=True, text=True,
-    )
-    return r.stdout if r.returncode == 0 else ""
-
-
-def parse_grants(conf: str) -> dict:
-    """principal -> subscribe subjects.
-
-    ⚠️ Heuristic, and says so. The conf hoists each principal's read list into a
-    `<NAME>_READ = [...]` variable because NATS will not splice a variable into a list, so
-    the grants are not syntactically inside the user block. Matching the convention is
-    good enough to compare against the database and honest about being a convention.
-    """
-    lists = {
-        m.group(1).lower(): re.findall(r'"([^"]+)"', m.group(2))
-        for m in re.finditer(r"^(\w+)_READ\s*=\s*\[(.*?)^\]", conf, re.S | re.M)
-    }
-    users = re.findall(r'\{\s*user:\s*"([^"]+)"', conf)
-    return {u: lists.get(u.lower(), []) for u in users}
+    path = NATS_CONF or running_nats_conf()
+    if path and os.path.exists(path):
+        print(f"  conf: {path}")
+        return open(path).read()
+    return ""
 
 
 def main():
     conf = read_conf()
     if not conf:
-        print("⚠️  could not read the rendered NATS conf — NATS checks skipped")
-        print(f"    set ZB_NATS_CONF, or ensure the volume '{NATS_VOLUME}' exists\n")
+        skip("NATS conf", "could not find it — set ZB_NATS_CONF, or start nats-server with -c <conf>")
 
     # ── 1. the rendered conf actually rendered ────────────────────────────────
     if conf:
@@ -104,7 +104,9 @@ def main():
         else:
             zb.ok("rendered NATS conf has no unsubstituted variables")
 
-    grants = parse_grants(conf) if conf else {}
+    # Grants: under JWT auth the subject permissions are in the user JWTs (nsc), not
+    # in the conf — there is nothing to parse here, and pretending otherwise was
+    # exactly the "both sides look healthy" shape this file exists to catch.
     mapping = {}
     for line in zb.psql("SELECT principal || '|' || tenant_id FROM zebridge_user_tenants").splitlines():
         if "|" in line:
@@ -122,28 +124,21 @@ def main():
         zb.ok(f"every client principal holds at most one tenant (infrastructure exempt: {sorted(INFRA)})")
 
     # ── 3. CDC read grants are tenant-scoped ──────────────────────────────────
-    if grants:
-        wide = [p for p, subs in grants.items()
-                if any(s in ("cdc.>", "cdc.*.>") for s in subs) and p in mapping]
-        if wide:
-            bad(f"principal(s) granted the WHOLE change feed: {sorted(wide)}",
-                "Tenant isolation on reads is then enforced only by the client's own\n"
-                "filter_subject, which the client chooses. Verified: alice (acme) received\n"
-                "cdc.globex.test_types.insert using her own credentials.\n"
-                "Expected instead: cdc.<her tenant>.>")
-        else:
-            zb.ok("no principal is granted the whole change feed")
+    skip("CDC read grants tenant-scoped",
+         "grants live in account/user JWTs (nsc), not the conf; "
+         "`nsc describe user <p>` — expected: cdc.<tenant>.>, never cdc.> (crosstenant.py probes it live)")
 
-        # ── 4. RETIRED (2026-08-27): snapshot reach == subscribe reach ────────
-        # Snapshot-on-demand is gone (NOTES §10h/§10n) — clients seed from
-        # generation chains, whose objects carry no per-principal subjects to
-        # compare. The init.snap.* grant symmetry this checked no longer exists.
+    # ── 4. RETIRED (2026-08-27): snapshot reach == subscribe reach ────────────
+    # Snapshot-on-demand is gone (NOTES §10h/§10n) — clients seed from
+    # generation chains, whose objects carry no per-principal subjects to
+    # compare. The init.snap.* grant symmetry this checked no longer exists.
 
     # ── 5. the catalogue's public set vs CDC_PUBLIC's bound subjects ──────────
     #
     # The bridge reconciles CDC_PUBLIC's subject filter from `zebridge_catalogue`
-    # (tenant_col IS NULL) at BOOT, so drift here has exactly one meaning: the
-    # catalogue changed after the bridge booted, and a restart is due.
+    # (tenant_col IS NULL) at boot AND live at every catalogue COMMIT (NOTES §10bj),
+    # so drift here has exactly one meaning: the live reload did not happen — and
+    # that is the finding, not a restart reminder.
     publics = {r for r in zb.psql(
         "SELECT tbl FROM zebridge_catalogue WHERE tenant_col IS NULL").splitlines() if r}
     cdc_prefix = zb.TOPOLOGY["subjects"]["cdc_prefix"]
@@ -156,15 +151,17 @@ def main():
         unbound = {t for t in publics if f"{cdc_prefix}.{t}.>" not in bound}
         if unbound:
             bad(f"catalogue-public but not bound in CDC_PUBLIC: {sorted(unbound)}",
-                "Declared after the bridge booted. Restart the bridge — boot reconciles\n"
-                "CDC_PUBLIC's subjects from the catalogue.")
+                "The bridge reloads the catalogue live at the row's COMMIT and reconciles\n"
+                "CDC_PUBLIC's subjects — if it did not, THAT is the finding (is a bridge\n"
+                "running? see its log for the reload line).")
         else:
             zb.ok(f"CDC_PUBLIC binds every catalogue-public table ({len(publics)})")
         stale = sorted(x.split(".")[1] for x in bound
                        if x.count(".") >= 2 and x.split(".")[1] not in publics
                        and x.split(".")[1] != open_t)
         if stale:
-            print(f"  ⓘ  bound but no longer catalogue-public (stale until the next boot): {stale}")
+            bad(f"bound in CDC_PUBLIC but no longer catalogue-public: {stale}",
+                "A removed catalogue row is reconciled live too — the subject should be gone.")
 
     # The contradiction that matters: a catalogue row calling a table public while
     # the table HAS a tenant column. The CHECK constraint guarantees a reason was
@@ -224,44 +221,42 @@ def main():
             bad(f"'{tbl}' is published and has tenant_id, but no tenant rule anywhere",
                 f"It publishes to cdc.{tbl}.<op> with no tenant token, which no tenant-scoped\n"
                 f"consumer filter can match. Declare it: zebridge_enable(..., tenant_col =>\n"
-                f"'tenant_id', dry_run => false), then restart the bridge.")
+                f"'tenant_id', dry_run => false) — the bridge picks the row up at COMMIT.")
 
-    # ── 7. SYNC_RULES columns exist ───────────────────────────────────────────
-    for entry in os.environ.get("SYNC_RULES", "").split(";"):
-        if ":" not in entry:
-            continue
-        tbl, cols = entry.split(":", 1)
-        tbl = tbl.strip()
-        for col in [c.strip() for c in cols.split(",") if c.strip()]:
-            if not zb.psql("SELECT attname FROM pg_attribute "
-                           f"WHERE attrelid='public.{tbl}'::regclass AND attname='{col}' AND attnum>0").strip():
-                bad(f"SYNC_RULES names {tbl}.{col}, which does not exist",
-                    "Every mutation to this table fails permanently and dead-letters on first\n"
-                    "delivery — the client sees a rejection it cannot act on.")
-        else:
-            zb.ok(f"SYNC_RULES {tbl}: every named column exists")
-
-    # catalogue LWW columns: enable() validated them at write time, but a later
-    # DROP COLUMN invalidates the row silently — same failure shape as SYNC_RULES.
-    for r in zb.psql(
-            "SELECT tbl||'|'||version_col||'|'||COALESCE(tombstone_col::text,'')||'|'||"
-            "COALESCE(tiebreak_col::text,'') FROM zebridge_catalogue").splitlines():
-        parts = r.split("|")
-        if len(parts) != 4:
-            continue
-        tbl = parts[0]
+    # ── 7. the LWW columns every table is configured with exist ───────────────
+    #
+    # Catalogue-driven: zb.rules() gives the EFFECTIVE columns (zebridge_catalogue,
+    # with a legacy SYNC_RULES/TENANT_RULES entry overriding per table exactly as the
+    # bridge honours it). enable() validated them at write time, but a later DROP
+    # COLUMN invalidates the row silently, and an env override was never validated.
+    # (The old loop here had a for/else: `else` ran after a complete loop, i.e. also
+    # after a missing column, and reported success on a failure.)
+    configured = {r for r in zb.psql("SELECT tbl FROM zebridge_catalogue", quiet=True).splitlines() if r}
+    for entry in os.environ.get("SYNC_RULES", "").split(";") + os.environ.get("TENANT_RULES", "").split(";"):
+        if ":" in entry:
+            configured.add(entry.split(":", 1)[0].strip())
+    for tbl in sorted(configured):
         exists = zb.psql(
             f"SELECT 1 FROM pg_class WHERE relname='{tbl}' AND relkind='r'", quiet=True).strip()
         if not exists:
-            print(f"  ⓘ  catalogue row for '{tbl}' but no such table (dropped? delete the row)")
+            print(f"  ⓘ  rules for '{tbl}' but no such table (dropped? delete the catalogue row / env entry)")
             continue
-        for col in [c for c in parts[1:] if c]:
-            if not zb.psql(
+        r = zb.rules(tbl)
+        missing = []
+        for role in ("version", "tombstone", "tiebreak", "tenant"):
+            col = r.get(role)
+            if col and not zb.psql(
                     "SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid "
-                    f"WHERE c.relname='{tbl}' AND a.attname='{col}' AND a.attnum>0", quiet=True).strip():
-                bad(f"catalogue names {tbl}.{col}, which does not exist",
-                    "Every mutation to this table fails permanently and dead-letters on first\n"
-                    "delivery — fix the catalogue row or restore the column.")
+                    f"WHERE c.relname='{tbl}' AND a.attname='{col}' AND a.attnum>0 AND NOT a.attisdropped",
+                    quiet=True).strip():
+                missing.append(f"{role}={col}")
+        if missing:
+            bad(f"rules for '{tbl}' name column(s) that do not exist: {', '.join(missing)}",
+                "Every mutation to this table fails permanently and dead-letters on first\n"
+                "delivery — fix the catalogue row (or the legacy env override) or restore the column.")
+        elif r.get("version"):
+            zb.ok(f"rules for '{tbl}': every named column exists "
+                  f"(version={r['version']}" + (f", tenant={r['tenant']}" if r.get("tenant") else "") + ")")
 
     # ── 8. replication slots: orphans retain WAL for everyone ─────────────────
     #
@@ -293,8 +288,8 @@ def main():
         live = active in ("t", "true")
         if invalid:
             bad(f"slot '{name}' is INVALIDATED ({invalid})",
-                "It can no longer resume. Whatever it fed needs a full resnapshot; the slot "
-                "itself is now only holding a name.")
+                "It can no longer resume. Whatever it fed needs a full re-seed from the "
+                "generation chain; the slot itself is now only holding a name.")
         elif not live and declared_slot and name != declared_slot:
             bad(f"orphaned slot '{name}': inactive, retaining {retained}"
                 + (f", idle for {idle}" if idle else ""),
@@ -317,11 +312,11 @@ def main():
     # `OPEN_TENANT` names the shared/open tenant. It is NOT what the guard writes any more —
     # the guard derives a missing tenant from the WRITER'S identity, so the open tenant is
     # simply what a principal *mapped to it* carries (e.g. `(pub, _default)`). But the name
-    # still has to agree in two rendered places plus the mapping: the CDC_PUBLIC stream's
-    # subjects (nats-init) and every principal's read grant (nats-config-gen), each rendered
-    # from whatever .env.admin said at ITS run. Change the value, re-run one container, and
-    # rows carrying the old open tenant land on a subject no stream captures — no PubAck,
-    # the bridge FATALs. This checks the two renders agree with the env.
+    # still has to agree in the places that render it: the CDC_PUBLIC stream's subjects
+    # (the bridge's reconciliation) and every principal's read grant (the user JWTs from
+    # jwt-bootstrap.sh). Change the value, re-mint one side, and rows carrying the old open
+    # tenant land on a subject no stream captures — no PubAck, the bridge FATALs. This
+    # checks the stream against the env; the JWT side is a SKIP (see the docstring).
     open_tenant = os.environ.get("OPEN_TENANT", "").strip()
     if not open_tenant:
         print("  ⓘ  OPEN_TENANT unset — comparing against '_default', the .env.admin default")
@@ -348,23 +343,14 @@ def main():
             if open_subject not in bound:
                 bad(f"stream {public_stream} does not bind {open_subject} (bound: {bound})",
                     "Rows that opted into no tenant publish there and NO stream captures them.\n"
-                    "Restart the bridge; boot reconciles CDC_PUBLIC from the catalogue + OPEN_TENANT.")
+                    "The bridge reconciles CDC_PUBLIC from the catalogue + OPEN_TENANT at boot and\n"
+                    "live at every catalogue commit — if it did not, that is the finding.")
             else:
                 zb.ok(f"stream {public_stream} binds {open_subject}")
 
-        # what the principals may READ: the rendered conf
-        if grants:
-            lacking = sorted(
-                p for p, subs in grants.items()
-                if p in mapping and open_subject not in subs
-                and not any(s in ("cdc.>", "cdc.*.>") for s in subs))
-            if lacking:
-                bad(f"principal(s) not granted the open tenant {open_subject}: {lacking}",
-                    "They hold CDC_PUBLIC, so a JetStream consumer still delivers those rows —\n"
-                    "but a core subscription is refused, and the conf no longer says what it\n"
-                    "means. Add the line to each <NAME>_READ list and reload NATS.")
-            else:
-                zb.ok(f"every mapped principal is granted {open_subject}")
+        # what the principals may READ: their JWTs — not readable from here
+        skip(f"every mapped principal granted {open_subject}",
+             "grants live in user JWTs (nsc); `nsc describe user <p>` should list it")
 
     # ── 10. tenant-CAPABLE tables are fully wired, not just configured ────────
     #
@@ -389,7 +375,8 @@ def main():
         problems = []
         # (a) routed by the bridge — else events publish bare, invisible to tenant consumers
         if tbl not in tenant_rules:
-            problems.append(f"no TENANT_RULES entry (set TENANT_RULES={tbl}:tenant_id)")
+            problems.append("no tenant column declared in zebridge_catalogue "
+                            f"(zebridge_enable('{tbl}', ..., tenant_col => 'tenant_id'))")
         # (b) the guard trigger — else omission/malformed is not corrected at the source
         if zb.psql("SELECT count(*) FROM pg_trigger WHERE tgname='zebridge_guard_tenant_t' "
                    f"AND tgrelid='public.{tbl}'::regclass").strip() == "0":
@@ -421,10 +408,14 @@ def main():
             zb.ok(f"tenant-capable table '{tbl}': routed, guarded, RLS-scoped, tenant in replica identity")
 
     print()
+    if skipped:
+        print(f"\033[33m{len(skipped)} section(s) SKIPPED\033[0m — not checked, not passed:")
+        for section, why in skipped:
+            print(f"    - {section}: {why}")
     if findings:
         print(f"\033[31m{len(findings)} disagreement(s)\033[0m — declared and actual differ\n")
         return 1
-    print("\033[32mno drift\033[0m\n")
+    print("\033[32mno drift\033[0m in the checked sections\n")
     return 0
 
 

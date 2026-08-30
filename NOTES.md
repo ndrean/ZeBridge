@@ -7401,6 +7401,157 @@ optimistic apply shows), and the 2 ms poll granularity of the measurement itself
 127/127 TS tests, `tsc` clean. Whether the web-consumer's own UI adds anything on top
 was not measured — this is the shell, which is what every JS host gets.
 
+## 10bl. The test estate reviewed, cleaned, run — and `zebridge_check` (2026-08-29)
+
+After a day that closed §10be's list, the tests themselves were the last thing still
+describing the past: chains as "msgpack / JSON", snapshots, compose, user/password
+auth, "restart the bridge". Five reviews (one per slice of the 45 scenarios, the
+harness, the doctor, the helpers, TEST_SCENARIOS.md) and five fix passes later, this is
+what changed and what running everything found.
+
+**One root under most of it: the harness.** `zb.py` defaulted `ZB_PSQL` to a docker
+exec — every scenario read `""` from a dead connection and scored it "no rows"; its
+`connect()` put user/password first and a per-file `principal()` fell back to the
+literal `"alice"`, which under creds auth published on a subject the connection could
+not use and turned every check into a timeout; six scripts `sys.exit`ed on an empty
+`SYNC_RULES` because the catalogue is the config now. The harness carries the
+answers once: native `psql`, creds-first `connect()`, `connect_as(principal)`,
+`principal()` without a default, `rules(table)` from `zebridge_catalogue` with the env
+as override, `tenant_of`, `kv_get`, the ports, `leaks_available()`,
+`another_bridge_running()` (anchored — the sweeper is `bridge_sweeper`). And a driver:
+`scripts/scenarios/run.py` with `offline` / `live` / `owns` / `manual` groups, one
+exit code, per-scenario logs. Retired: `objgrants.py` (password-conf grants), `poison.py`
+(print-only, `race.py` asserts the property), `measure_snapshot_size.sh`.
+TEST_SCENARIOS.md rewritten as property → script; the scenarios README to the native
+stack; `topology.zig`'s snapshot-era render test and comments; the "nats.zig has no
+TLS" claim (it has — `tls.py` proves it; the bridge's `tls://` refusal is a guard).
+
+**What the battery found once it could run** (offline 7/7, live 19/19, owns 11/11,
+`speed` excluded by request):
+- The driver's first live run passed 14/19 **as the bridge**: `.env.bridge` carries
+  `NATS_CREDS=bridge.creds` and the client role only `setdefault`ed it. `crosstenant`
+  reported the whole world reachable, `mutate`/`replies`/`writable` passed proving
+  nothing. The role overrides now; `ZB_CLIENT_CREDS` picks the client.
+- **A bridge crash.** `chaos.py`'s backend kill: after PostgreSQL severs the stream the
+  bridge reconnects from the slot's confirmed LSN and replays commits it had seen —
+  `commit_lsn - last_lsn` underflowed (`integer overflow` panic, `bridge.zig:1573`) and
+  the process died on every backend loss. Signed now.
+- **Dev-DB drift** (`check.py` §10, then `zebridge_check`): `test_types` and `salaries`
+  had no tenant guard trigger — enabled before `zebridge_enable` passed `tenant_col` to
+  the write guards; an orphaned `zb_probe` slot from an aborted probe pinned WAL. Both
+  are what those checks exist for; re-enabling the fixtures and dropping the slot fixed
+  the database, not the tests.
+- `widthguard` sized a `test_types` row from the fixture's 16 KB budget (PostgreSQL
+  refused the setup row); its edge case expected 23514 while the ingress now refuses
+  the same row first (`RowTooLargeToReplicate`, §10bb's cheaper refusal, same outcome).
+- `mutate` pinned its delete to 2026-08-16: the tombstone was 13 days old and the
+  running sweeper reaped it before the read. The delete is `now()` — newer than the
+  three pinned writes is all LWW needs.
+- `crosstenant` scored a *denied* `CONSUMER.CREATE` (a timeout) as "created but empty".
+  A timeout from the create is the grant holding; only one from a later fetch is a reach.
+- `livebirth` waited with a blocking `time.sleep` inside the event loop, so the NATS
+  callback that collects CDC never ran: "declared, keyed, published, yet unrouted"
+  while the rows were routed. `wait_for` is async.
+- `pubname` expected three internal tables in a fresh publication; `zebridge_catalogue`
+  is the fourth since §10bj. `reaps` took the sweeper's principal from whoever ran it;
+  it is `zb_sweeper`. `sweeper.py` used to reap every catalogued table — a scoped run
+  now (`SWEEP_ONLY_TABLES`, a test knob in `bridge_sweeper.zig`, unset in production).
+
+**`zebridge_check(tbl, intent, version_col, tombstone_col, tiebreak_col, tenant_col,
+allow_physical_deletes)`** and **`zebridge_check_all(jsonb, partial)`** — the doctor
+that lives in PostgreSQL. After a migration, with or without a bridge, `psql` asks the
+same questions preflight asks from the same source of truth: catalogue row; who holds
+INSERT+UPDATE against the declared intent (`zebridge_gc_watermark` is bridge-owned);
+primary key and sequence-backed keys; replica identity and the tenant column in it;
+publication; the version column's existence, type, precision, nullability, and the
+creation-stamp trap; the tombstone (an ERROR for a writable table, a WARNING when the
+operator states `physical_deletes`); the tiebreak; the width and write guards (a
+statically bounded table needs no trigger); width against the narrowest registered
+bridge; the chain. The column NAMES are the part to declare — with them it is a
+pre-migration check (a table with no row yet is checked against what you meant; a
+declared name that disagrees with the catalogue is a finding), without them the
+catalogue is taken at its word. `zebridge_check_all` treats every catalogue table you
+did not name as an ERROR unless `partial`. `scripts/zbdoctor.py --intent map.json`
+runs the map and adds the live gates. On the dev fixtures it reads: four tables with
+accepted physical deletes (WARNING), `memo` writable with no tombstone (ERROR — a
+fixture's choice, now visible), everything else ok.
+
+**Left as they are, deliberately:** `speed.py`, `burst.py`, `leaksoak.py`,
+`objstore_race.py`, `tls.py` in the `manual` group — benchmarks and soaks report, they
+do not assert. `check.py`'s grant sections SKIP loudly (grants live in user JWTs;
+`nsc describe`). `crosstenant.py` keeps its known JetStream-consumer hole marked
+`enforced=False`.
+
+## 10bm. Three outages the suite did not cover: broker gone, slot lost, client away (2026-08-29/30)
+
+Asked after `chaos.py` passed: PostgreSQL retains while the bridge is down (the slot
+pins WAL) and everything lands on return — proven by `downtime.py`. What was NOT
+covered was where "recovers nicely" stops being automatic. Three scenarios, three
+findings, two of them product changes.
+
+**1. `nats_outage.py` — the broker gone for minutes.** The first draft asserted the
+documented contract: `Retry.publish_max_retries` exhausted → FATAL exit → supervisor →
+resume. Measured: the bridge did NOT exit in 180 s, and every row landed afterwards
+with 0 duplicates. Two different budgets: the retry budget is for a publish that FAILS
+on a connected broker; a broker that is GONE is the publisher's reconnect loop, which
+never gives up. The bridge stays on the WAL stream, confirms no LSN (asserted:
+`confirmed_flush_lsn` held for 45 s), and the SAME process resumes when the broker
+returns. That is the better behaviour and now the asserted one. (The first run of the
+scenario passed for the wrong reason: it imported two helpers from `chaos.py`, whose
+`zb.run(main)` sat at module level — importing it RAN chaos. Guarded now.)
+
+**2. `slot_loss.py` — the slot invalidated (bridge down past `max_slot_wal_keep_size`).**
+The one outage PostgreSQL cannot retain through, and the product had no answer:
+`createSlot` reported a lost slot as "already exists", START_REPLICATION failed, and
+the reconnect loop retried a dead slot every two seconds forever. Worse, the WAL hole
+is invisible: the CDC streams' numbering shows no gap for changes that were never
+published, so a client resuming by position would miss them silently. Built:
+- boot refuses a slot with `wal_status = lost` — FATAL naming the slot and the
+  recovery (`replication_setup.refuseLostSlot`; `unreserved` is a warning);
+- **a new slot is a new feed**, opt-in: started once with `ZB_FEED_RESTART=1` after the
+  slot is recreated, the bridge deletes the CDC streams (reconciliation recreates them,
+  numbering from 1), clears `zebridge_generations` (the producer's next tick is a FULL
+  for every table, `cutoff_seq` on the new feed) and drops the manifests bucket.
+  Opt-in because a new slot alone cannot tell recovery from a second bridge with its
+  own slot — the first probe bridge to boot on a fresh slot wiped the shared streams
+  under a client. Without the flag a new slot boots and says what it risks;
+- **the gap rule's third shape** (PROTOCOL §5, both cores, 2 fixtures): a position
+  BEYOND the stream's `last_seq` is a gap — the stream restarted under the client.
+  Both shells reset that position to 0 before planning, or `fullPredatesReplica`
+  reads the fresh chain's small `cutoff_seq` as "older than where I am" and refuses
+  the very full the gap needs;
+- **a rebuilt chain is unreachable** (`planFromManifest`, both cores, 2 fixtures): with
+  a watermark and no applicable deltas the plan used to be "nothing to apply" — right
+  when the chain continues from the watermark, wrong when it was rebuilt after it (a
+  fresh `g1` full, no deltas). Reachable now means the first applicable delta starts at
+  or before the watermark, or the full itself is not newer than it.
+Live: slot invalidated with the probe down → boot refused (exit 1) → slot dropped →
+`ZB_FEED_RESTART=1` → `CDC_kilo` recreated → fresh chain → the client at position 1
+takes the gap and re-seeds: 3/3 hole rows, 24 = 24 live rows.
+Two things the run also produced: `max_slot_wal_keep_size` moved off `up.sh`'s
+postmaster command line (a `-c` flag beats ALTER SYSTEM; it is `ALTER SYSTEM` at start
+now, so a test or an operator can change it with a reload) — and the setting is
+cluster-wide, so a stopped long-running bridge's slot is lost with the probe's; the
+scenario says so and prints the recovery. The dev feed was recovered that way, twice.
+Also an early-exit leak on the FATAL path: the enroll conninfo lived forever
+(main-scope `defer` now).
+
+**3. `client_gap.py` — the CLIENT away past retention.** libzb through the C ABI:
+sync (position P), stop; five rows written and captured by the producer; the tenant
+stream purged past P (retention, made instant); sync again → the gap rule fires, the
+tenant-routed tables re-seed from the chain, 5/5 rows, 25 = 25 live rows. Passed once
+the harness knew the generations bucket lives under `generations.kv` in grammar.json.
+
+**A hazard seen on the way, not fixed:** open-tenant (`_default`) rows of a
+tenant-scoped table ride `CDC_PUBLIC` and are seeded from nowhere — a client seeds
+that table from its TENANT's chain only. While the dev bridge had `test_types`
+suspended (it replayed `legacybait`'s 20 KB bait on restart — a suspension lifts only
+at boot or on DDL), the physical deletes of 23 `_default` rows were dropped, and a
+fresh omar replica showed 23 phantom `_default` rows PostgreSQL no longer has. Two
+open items: a table suspended by a row that no longer exists should re-check on the
+next event, not only at boot; and open-tenant rows of a tenant-scoped table need a
+seed path (the `_default` chain, or none at all — decide).
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

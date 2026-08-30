@@ -25,28 +25,72 @@ The 5s clamp margin means a write can echo into one extra build on the following
 tick (a duplicate delta, absorbed by the guarded upsert — never a gap), so checks
 are structural (bounds, kinds, windows), never tick-counting.
 
+Chain objects on the wire are msgpack under zstd (NOTES §10w/§10x): fulls a plain
+frame, deltas compressed against the era's dictionary — a `<table>-g<N>-dict` object
+the manifest names per delta. So every object read here is checked for the zstd
+magic first and decoded through `zstd` (the CLI, or the `zstandard` module) with the
+dictionary the manifest points at; a raw-msgpack or JSON object would be a regression.
+
 Usage:  python scripts/scenarios/genproducer.py   (⚠️ owns the only bridge)
-Needs the probe-bridge env (`set -a && . ./.env.bridge && set +a`, NATS_BRIDGE_NKEY_SEED)
-plus ZB_PSQL admin access for the row touches. Cleans up its rows, objects and
-pointer; the shared `generations` KV bucket and `gen-_default` store remain.
+Needs the probe-bridge env (`set -a && . ./.env.bridge && set +a`, NATS_CREDS) plus
+ZB_PSQL admin access for the row touches. Cleans up its rows, objects and pointer;
+the shared `generations` KV bucket and `gen-<open tenant>` store remain.
 """
 
 import asyncio
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+
+import msgpack
 
 import zb
 
-TENANT, TABLE = "_default", "users"
+TENANT, TABLE = zb.TOPOLOGY["open_tenant"], "users"
 GEN_TOPO = zb.TOPOLOGY["generations"]          # kv bucket + object-bucket prefix
 BUCKET, KEY = f"{GEN_TOPO['bucket_prefix']}{TENANT}", f"{TENANT}.{TABLE}"
 KV_BUCKET = GEN_TOPO["kv"]
 CADENCE = 5          # GENERATION_CADENCE_SECONDS minimum
 DEPTH = 3            # GENERATION_CHAIN_DEPTH for the probe
 LOG = "/tmp/zb_genproducer_bridge.log"
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+PROBE_EMAIL = "probe@zb"   # the row seeded when the fixture is empty; removed in finally
+
+
+def zstd_decode(data: bytes, dictionary: bytes | None = None) -> bytes:
+    """One zstd frame → bytes, through the `zstandard` module or the `zstd` CLI."""
+    try:
+        import zstandard  # type: ignore
+        d = zstandard.ZstdCompressionDict(dictionary) if dictionary else None
+        return zstandard.ZstdDecompressor(dict_data=d).decompress(data, max_output_size=1 << 30)
+    except ImportError:
+        pass
+    if not shutil.which("zstd"):
+        sys.exit("chain objects are zstd frames: install the `zstd` CLI or `pip install zstandard`")
+    with tempfile.TemporaryDirectory() as tmp:
+        args = ["zstd", "-d", "-c", "-q"]
+        if dictionary:
+            dpath = f"{tmp}/dict"
+            open(dpath, "wb").write(dictionary)
+            args += ["-D", dpath]
+        r = subprocess.run(args, input=data, capture_output=True)
+        if r.returncode != 0:
+            raise ValueError(f"zstd: {r.stderr.decode(errors='replace').strip()}")
+        return r.stdout
+
+
+def decode_chain(body: bytes | None, dictionary: bytes | None = None):
+    """A chain object → its document, insisting on the wire shape: zstd outside,
+    msgpack inside. Returns None for a missing object; raises on the wrong shape."""
+    if body is None:
+        return None
+    if not body.startswith(ZSTD_MAGIC):
+        raise ValueError(f"chain object is not a zstd frame (starts {body[:4]!r})")
+    return msgpack.unpackb(zstd_decode(body, dictionary), raw=False, strict_map_key=False)
 
 
 def gens():
@@ -76,7 +120,7 @@ async def main():
     # production bridge would produce this scenario's pair too and race its
     # controlled cadence. The probe scopes itself with GENERATION_RULES (now a
     # RESTRICTION intersected with the derived set).
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
+    running = subprocess.run(["pgrep", "-f", r"zig-out/bin/bridge$"], capture_output=True, text=True)
     if running.stdout.strip():
         sys.exit("another bridge is already running — it would produce this scenario's "
                  "chain concurrently; stop it first")
@@ -90,7 +134,7 @@ async def main():
     # so the idle check sees a margin-echo delta and calls skip-if-unchanged
     # broken (measured: gens=[1, 2] while idle).
     zb.psql(f"INSERT INTO public.{TABLE} (name, email, inserted_at, updated_at) "
-            f"SELECT 'genproducer probe', 'probe@zb', now(), now() - interval '1 minute' "
+            f"SELECT 'genproducer probe', '{PROBE_EMAIL}', now(), now() - interval '1 minute' "
             f"WHERE NOT EXISTS (SELECT 1 FROM public.{TABLE})", quiet=True)
 
     nc = await zb.connect()
@@ -106,6 +150,14 @@ async def main():
     async def manifest():
         kv = await js.key_value(KV_BUCKET)
         return json.loads((await kv.get(KEY)).value)
+
+    async def delta_doc(entry):
+        """A manifest delta entry → its decoded document, through the dictionary the
+        entry names (deltas are compressed against the era's dict; a full is not)."""
+        dictionary = await obj_get(entry["dict"]) if entry.get("dict") else None
+        if entry.get("dict") and dictionary is None:
+            raise ValueError(f"manifest names dictionary {entry['dict']} but the store has none")
+        return decode_chain(await obj_get(entry["object"]), dictionary)
 
     def chain_ok(man):
         """Continuity + client walk, structurally: bounds meet, full reaches head."""
@@ -143,12 +195,17 @@ async def main():
             nrows = int(zb.psql(f"SELECT count(*) FROM public.{TABLE}"))
             man = await manifest()
             body = await obj_get(f"{TABLE}-g1-full")
-            doc = zb.decode(body) if body else None
+            try:
+                doc = decode_chain(body)          # a full: zstd, no dictionary
+            except ValueError as e:
+                zb.bad(f"g1 full is not zstd-wrapped msgpack: {e}")
+                failed += 1
+                doc = None
             if man["full"] == {"gen": 1, "object": f"{TABLE}-g1-full", "cutoff": man["cutoff_version"]} \
                     and man["deltas"] == [] and doc and doc["kind"] == "full" \
                     and len(doc["rows"]) == nrows and doc["gen"] == 1 \
                     and re.fullmatch(r"[0-9A-F]+/[0-9A-F]+", man["cutoff_lsn"]):
-                zb.ok(f"g1: full only ({nrows} row(s)), manifest jump-in point set, no deltas")
+                zb.ok(f"g1: full only ({nrows} row(s)), zstd-wrapped msgpack, manifest jump-in point set, no deltas")
             else:
                 zb.bad(f"g1 wrong: man={man}, doc={str(doc)[:200]}")
                 failed += 1
@@ -169,12 +226,18 @@ async def main():
             else:
                 man = await manifest()
                 head = man["deltas"][-1] if man["deltas"] else None
-                doc = zb.decode(await obj_get(head["object"])) if head else None
+                try:
+                    doc = await delta_doc(head) if head else None
+                except ValueError as e:
+                    zb.bad(f"delta {head and head['object']} does not decode as dictionary-zstd msgpack: {e}")
+                    failed += 1
+                    doc = None
                 if doc and doc["kind"] == "delta" and len(doc["rows"]) == 1 \
                         and doc["prev_cutoff"] == head["prev_cutoff"] \
                         and doc["cutoff"] == head["cutoff"]:
                     zb.ok(f"touch rode {head['object']}: kind=delta, exactly 1 row, "
-                          f"bounds match the manifest")
+                          f"bounds match the manifest"
+                          + (f", decoded through {head['dict']}" if head.get("dict") else ""))
                 else:
                     zb.bad(f"delta wrong: head={head}, doc={str(doc)[:200]}")
                     failed += 1
@@ -206,8 +269,11 @@ async def main():
             # ignore_deletes: a pruned object leaves an ADR-20 tombstone (zero-size
             # meta) that plain list() still shows — deleted IS the state we assert.
             names = [i.name for i in await store.list(ignore_deletes=True)]
+            # full/delta only: a pruned full's DICTIONARY legitimately outlives it while
+            # a kept delta still references it (the producer deletes it when the last
+            # reference is pruned) — it is a chain member, not a stale object.
             stale = [n for n in names
-                     if (m := re.match(rf"{TABLE}-g(\d+)-", n)) and int(m.group(1)) <= top - DEPTH]
+                     if (m := re.match(rf"{TABLE}-g(\d+)-(full|delta)$", n)) and int(m.group(1)) <= top - DEPTH]
             err = chain_ok(man)
             if chain == list(range(top - DEPTH + 1, top + 1)) and not stale \
                     and err is None and await obj_get(man["full"]["object"]) is not None:
@@ -219,6 +285,9 @@ async def main():
 
     finally:
         zb.psql(f"DELETE FROM public.zebridge_generations WHERE tenant='{TENANT}' AND tbl='{TABLE}'")
+        # The row seeded above when the fixture was empty — gone, or every later run
+        # (and every consumer of `users`) inherits a probe row nobody asked for.
+        zb.psql(f"DELETE FROM public.{TABLE} WHERE email = '{PROBE_EMAIL}'", quiet=True)
         try:
             store = await js.object_store(BUCKET)
             for info in await store.list(ignore_deletes=True):

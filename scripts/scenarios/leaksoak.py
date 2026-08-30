@@ -16,14 +16,19 @@ Load between samples: CDC write bursts (memo updates), bogus /enroll bursts
 (permit pool + refusal paths), /metrics scrapes — the per-event paths a
 long-runner grinds.
 
+Needs the fixture tables `memo`, `note_t` and `counter_public` (init.core seeds them)
+— absent, this exits rather than soaking nothing and calling it clean. macOS only
+(`leaks`); run by hand, never by the battery.
+
 Env: SOAK_SECONDS (default 60), ZB_RSS_DRIFT_MB (default 64).
-Usage:  python scripts/scenarios/leaksoak.py   (admin ZB_PSQL; bridge on :9090)
+Usage:  python scripts/scenarios/leaksoak.py   (admin ZB_PSQL; bridge on :9090; NATS_CREDS)
 """
 
 import datetime
 import os
 import re
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -31,9 +36,11 @@ import msgpack
 
 import zb
 
-HTTP = os.environ.get("ZB_BRIDGE_HTTP", "http://127.0.0.1:9090")
+HTTP = os.environ.get("ZB_BRIDGE_HTTP", zb.http_base())
 SOAK = int(os.environ.get("SOAK_SECONDS", "60"))
 DRIFT_MB = int(os.environ.get("ZB_RSS_DRIFT_MB", "64"))
+MUT = zb.TOPOLOGY["subjects"]["mutations_prefix"]
+FIXTURES = ("memo", "note_t", "counter_public")
 
 
 def bridge_pid() -> str:
@@ -104,12 +111,49 @@ def churn(rnd: int):
             pass
 
 
+def cleanup():
+    """The soak's own debris, gone — in `finally`, so an assertion or a Ctrl-C
+    mid-soak does not leave soak rows, invites and KV keys for the next run."""
+    zb.psql("DELETE FROM public.memo WHERE txt LIKE 'soak-%'", quiet=True)
+    zb.psql("DELETE FROM public.note_t WHERE txt = 'soak'", quiet=True)
+    zb.psql("DELETE FROM public.zebridge_user_tenants WHERE principal LIKE 'soak_%'", quiet=True)
+    zb.psql("DELETE FROM public.zebridge_invites WHERE principal LIKE 'soak_%'", quiet=True)
+    for rnd in range(0, 1000, 10):
+        zb.nats_cli("kv", "purge", zb.TOPOLOGY["kv"]["tenants"], f"soak_{rnd + 5}", "-f")
+
+
 async def main():
     failed = 0
+    if not zb.leaks_available():
+        sys.exit("macOS `leaks` is not available — this audit has nothing to sample with")
     pid = bridge_pid()
     if not pid:
         zb.bad("no running bridge to soak")
         return 1
+    if not zb.SWEEPER.exists():
+        sys.exit(f"{zb.SWEEPER} not found — run `zig build -Doptimize=ReleaseFast`")
+
+    # Every churn kind writes a fixture table; a missing one turns its `quiet=True`
+    # psql into a silent no-op and the soak into a measurement of nothing.
+    present = set(zb.psql(
+        "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename = ANY(ARRAY["
+        + ",".join(f"'{t}'" for t in FIXTURES) + "])", quiet=True).split())
+    missing = [t for t in FIXTURES if t not in present]
+    if missing:
+        sys.exit(f"fixture table(s) missing: {', '.join(missing)} — init.core seeds them; "
+                 "without them the churn grinds nothing")
+    counter_uid = zb.psql("SELECT uid FROM public.counter_public LIMIT 1", quiet=True).strip()
+    if not counter_uid:
+        sys.exit("counter_public has no row — the edge-write churn needs one to UPDATE")
+    # Connected as the bridge (run.py's role here — the churn also purges $KV.tenants
+    # keys, which no client may), the edge write is addressed AS a mapped client
+    # principal: ZB_PRINCIPAL, else the first one in zebridge_user_tenants. Data, not
+    # a literal: an unmapped name is refused by RLS and grinds no apply path at all.
+    who = os.environ.get("ZB_PRINCIPAL") or zb.psql(
+        "SELECT principal FROM public.zebridge_user_tenants ORDER BY principal LIMIT 1", quiet=True
+    ).strip()
+    if not who:
+        sys.exit("no principal to write as: set ZB_PRINCIPAL, or map one in zebridge_user_tenants")
 
     before = sample(pid)
     print(f"  ⓘ  before: {before['nodes']} malloc nodes / {before['malloc_kb']} KB, "
@@ -117,36 +161,38 @@ async def main():
 
     nc = await zb.connect()
     js = nc.jetstream()
-    counter_uid = zb.psql("SELECT uid FROM public.counter_public LIMIT 1", quiet=True).strip()
     deadline = time.time() + SOAK
     rounds = 0
     swept = False
-    while time.time() < deadline:
-        churn(rounds)
-        if counter_uid and rounds % 20 == 10:
-            # the mutation listener's full path: decode → LWW guard → apply →
-            # verdict publish. UPDATE with a fresh version: converges, no growth.
-            version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-            envelope = msgpack.packb({
-                "key": {"uid": counter_uid}, "version": version, "client_id": "c-soak",
-                "data": {"uid": counter_uid, "value": rounds, "updated_at": version},
-            })
-            try:
-                await js.publish(f"mutation.omar.counter_public.update", envelope,
-                                 headers={"Nats-Msg-Id": f"soak-{rounds}-{version}"})
-            except Exception:
-                pass
-        if not swept and time.time() > deadline - SOAK / 2:
-            swept = True
-            try:
-                subprocess.run(["./zig-out/bin/bridge_sweeper"],
-                               env={**os.environ, "GC_DRY_RUN": "1", "GC_THRESHOLD_MS": "3600000"},
-                               capture_output=True, timeout=6)
-            except subprocess.TimeoutExpired:
-                pass  # one pass completed within the window; the kill is the exit
-        rounds += 1
-        time.sleep(2)
-    await nc.close()
+    try:
+        while time.time() < deadline:
+            churn(rounds)
+            if rounds % 20 == 10:
+                # the mutation listener's full path: decode → LWW guard → apply →
+                # verdict publish. UPDATE with a fresh version: converges, no growth.
+                version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+                envelope = msgpack.packb({
+                    "key": {"uid": counter_uid}, "version": version, "client_id": "c-soak",
+                    "data": {"uid": counter_uid, "value": rounds, "updated_at": version},
+                })
+                try:
+                    await js.publish(zb.subject(MUT, who, "counter_public", "update"), envelope,
+                                     headers={"Nats-Msg-Id": f"soak-{rounds}-{version}"})
+                except Exception:
+                    pass
+            if not swept and time.time() > deadline - SOAK / 2:
+                swept = True
+                try:
+                    subprocess.run([str(zb.SWEEPER)],
+                                   env={**os.environ, "GC_DRY_RUN": "1", "GC_THRESHOLD_MS": "3600000"},
+                                   capture_output=True, timeout=6)
+                except subprocess.TimeoutExpired:
+                    pass  # one pass completed within the window; the kill is the exit
+            rounds += 1
+            time.sleep(2)
+    finally:
+        await nc.close()
+        cleanup()
 
     after = sample(pid)
     print(f"  ⓘ  after {rounds} churn rounds: {after['nodes']} nodes / {after['malloc_kb']} KB, "
@@ -170,14 +216,6 @@ async def main():
     if after["nodes"] > before["nodes"] * 2 and after["malloc_kb"] > before["malloc_kb"] * 2:
         print(f"  ⓘ  malloc node count doubled ({before['nodes']} → {after['nodes']}) — "
               "not failed (caches warm), but worth a longer soak if it keeps climbing")
-
-    # ── the soak's own debris, gone ───────────────────────────────────────────
-    zb.psql("DELETE FROM public.memo WHERE txt LIKE 'soak-%'", quiet=True)
-    zb.psql("DELETE FROM public.note_t WHERE txt = 'soak'", quiet=True)
-    zb.psql("DELETE FROM public.zebridge_user_tenants WHERE principal LIKE 'soak_%'", quiet=True)
-    zb.psql("DELETE FROM public.zebridge_invites WHERE principal LIKE 'soak_%'", quiet=True)
-    for rnd in range(0, 1000, 10):
-        zb.nats_cli("kv", "purge", zb.TOPOLOGY["kv"]["tenants"], f"soak_{rnd + 5}", "-f")
 
     print("PASS" if failed == 0 else f"FAIL ({failed})")
     return failed

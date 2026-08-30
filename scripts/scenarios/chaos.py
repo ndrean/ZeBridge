@@ -16,7 +16,8 @@ the bridge either recovers by itself or exits by contract, never limps.
   3  PG loss: pg_terminate_backend on every bridge_reader/bridge_writer
      backend (walsender included) — pg reconnect machinery re-attaches, the
      slot resumes, and both a CDC write and a mutation round-trip land after;
-  4  :9090 exhaustion: hold max_connections idle sockets — scrapes fail while
+  4  HTTP exhaustion (the probe's port, zb.http_base(probe=True)): hold
+     max_connections idle sockets — scrapes fail while
      held, then the receive watchdog reaps them and /metrics answers again
      WITHOUT any help from this side (recovery is the server's, not ours);
   5  the audit: macOS `leaks` reports 0 on the still-running probe.
@@ -26,14 +27,16 @@ consumer WILL disconnect during phase 2). Destructive to comfort, not to data:
 JetStream state is file-backed and the PG slot retains WAL through every phase.
 
 Env: ZB_HTTP_RECV_GRACE seconds to wait for the watchdog (default 8).
-Usage:  python scripts/scenarios/chaos.py   (admin ZB_PSQL; NATS_CREDS env)
+Usage:  python scripts/scenarios/chaos.py   (admin ZB_PSQL; NATS_CREDS=bridge.creds)
 """
 
 import datetime
 import json
 import os
+import pathlib
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 
@@ -41,11 +44,45 @@ import msgpack
 
 import zb
 
-HTTP = "http://127.0.0.1:9096"   # the probe's port (ZB_BRIDGE_ARGS default)
-NATS_PID_FILE = "scripts/native/nats-server.pid"
-NATS_CONF = "scripts/native/nats-server-jwt.conf"
+HTTP = zb.http_base(probe=True)   # the probe's --port, from zb.BRIDGE_ARGS
+NATS_PID_FILE = zb.ROOT / "scripts" / "native" / "nats-server.pid"
 GRACE = int(os.environ.get("ZB_HTTP_RECV_GRACE", "8"))
-LOG = "/tmp/zb_chaos_bridge.log"
+LOG = str(pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_chaos_bridge.log")
+MUT = zb.TOPOLOGY["subjects"]["mutations_prefix"]
+PRINCIPAL = os.environ.get("ZB_MUTATION_PRINCIPAL", "omar")   # a client principal mapped to counter_public's tenant
+
+
+def running_nats() -> tuple[str, list[str]]:
+    """(pid, argv) of the live nats-server. The conf it was started with is read
+    from ITS argv (`ps -o args=`), never hardcoded: up.sh historically started
+    nats-server.conf and the JWT stack runs nats-server-jwt.conf — restarting with
+    the wrong one would turn phase 2 into an auth test."""
+    pid = ""
+    if NATS_PID_FILE.exists():
+        pid = NATS_PID_FILE.read_text().strip()
+    if not pid or subprocess.run(["kill", "-0", pid], capture_output=True).returncode != 0:
+        pid = subprocess.run(["pgrep", "-x", "nats-server"], capture_output=True, text=True).stdout.split()[:1]
+        pid = pid[0] if pid else ""
+    if not pid:
+        sys.exit("no running nats-server found (pid file stale, pgrep empty) — phase 2 restarts it and cannot")
+    argv = subprocess.run(["ps", "-o", "args=", "-p", pid], capture_output=True, text=True).stdout.split()
+    if not argv:
+        sys.exit(f"cannot read nats-server {pid}'s argv")
+    return pid, argv
+
+
+def nats_conf_and_log(argv: list[str]) -> tuple[pathlib.Path, pathlib.Path]:
+    """The conf from `-c <path>` in the running argv (relative to zb.ROOT, which is
+    where up.sh runs it), and the log named after it (`<stem>.log` beside it)."""
+    conf = None
+    for i, a in enumerate(argv):
+        if a in ("-c", "--config") and i + 1 < len(argv):
+            conf = pathlib.Path(argv[i + 1])
+    if conf is None:
+        sys.exit(f"running nats-server has no -c <conf> in its argv: {' '.join(argv)}")
+    if not conf.is_absolute():
+        conf = zb.ROOT / conf
+    return conf, conf.with_suffix(".log")
 
 
 def status(field):
@@ -95,15 +132,19 @@ def write_flows(tag, timeout=20):
 async def main():
     failed = 0
 
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
-    if running.stdout.strip():
-        import sys
+    if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge (and restarts NATS)")
 
+    # Phase 3's mutation round-trip overwrites counter_public.value; restore it at exit.
+    value_before = zb.psql("SELECT value FROM public.counter_public LIMIT 1", quiet=True).strip()
+
     # ── 0. wrong NATS creds: clean refusal, audit-silent ──────────────────────
+    # NATS_CREDS=/dev/null is an EMPTY creds file: no JWT, no seed. Under the JWT
+    # stack that is a credential the server cannot accept, which is the boot path
+    # being tested — a clean refusal, not a hang and not an allocator report.
     bad = subprocess.run(
         [str(zb.BRIDGE), *zb.BRIDGE_ARGS],
-        env={**zb.bridge_env(), "NATS_CREDS": "/dev/null", "NATS_BRIDGE_NKEY_SEED": None and "" or "SUINVALIDSEED"},
+        env={**zb.bridge_env(), "NATS_CREDS": "/dev/null"},
         capture_output=True, text=True, timeout=60,
     )
     out = bad.stderr + bad.stdout
@@ -134,12 +175,17 @@ async def main():
 
           # ── 2. NATS jitter ────────────────────────────────────────────────────
           before_rc = status("nats_reconnect_count") or 0
-          nats_pid = open(NATS_PID_FILE).read().strip()
+          nats_pid, nats_argv = running_nats()
+          conf, nats_log = nats_conf_and_log(nats_argv)
           subprocess.run(["kill", nats_pid])
-          time.sleep(3)
-          with open("scripts/native/nats-server-jwt.log", "a") as lg:
-              p = subprocess.Popen(["nats-server", "-js", "-c", NATS_CONF], stdout=lg, stderr=lg)
-          open(NATS_PID_FILE, "w").write(str(p.pid))
+          # wait for the port to actually free, bounded, instead of a fixed sleep
+          deadline = time.time() + 15
+          while time.time() < deadline and subprocess.run(["kill", "-0", nats_pid], capture_output=True).returncode == 0:
+              time.sleep(0.2)
+          with open(nats_log, "a") as lg:
+              # the SAME argv the server was running with (conf included), from zb.ROOT as up.sh does
+              p = subprocess.Popen(nats_argv, cwd=zb.ROOT, stdout=lg, stderr=lg)
+          NATS_PID_FILE.write_text(str(p.pid))
           deadline = time.time() + 40
           while time.time() < deadline and (status("nats_reconnect_count") or 0) <= before_rc:
               time.sleep(1)
@@ -173,8 +219,9 @@ async def main():
               version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
               env_bytes = msgpack.packb({"key": {"uid": uid}, "version": version, "client_id": "c-chaos",
                                          "data": {"uid": uid, "value": 777, "updated_at": version}})
-              nc = await zb.connect()
-              await nc.jetstream().publish("mutation.omar.counter_public.update", env_bytes,
+              # as a CLIENT principal: the mutation lane is confined per principal by JWT
+              nc = await zb.connect_as(PRINCIPAL)
+              await nc.jetstream().publish(zb.subject(MUT, PRINCIPAL, "counter_public", "update"), env_bytes,
                                            headers={"Nats-Msg-Id": "chaos-" + version})
               await nc.close()
               deadline = time.time() + 20
@@ -188,11 +235,11 @@ async def main():
               zb.bad(f"PG loss not absorbed: reconnects {before_pg}→{pg_after}, cdc={flowed}, mutation={mut_ok}")
               failed += 1
 
-          # ── 4. :9090 exhaustion, recovery unassisted ──────────────────────────
+          # ── 4. HTTP exhaustion on the probe's port, recovery unassisted ───────
           socks = []
           try:
               for _ in range(16):
-                  s = socket.create_connection(("127.0.0.1", 9096), timeout=3)
+                  s = socket.create_connection(("127.0.0.1", zb.bridge_port()), timeout=3)
                   socks.append(s)
               during = http_code("/metrics", timeout=3)
               time.sleep(GRACE)  # the receive watchdog's window, from the OTHER side
@@ -211,9 +258,10 @@ async def main():
                   except Exception: pass
 
           # ── 5. the audit on the survivor ──────────────────────────────────────
-          pid = subprocess.run(["pgrep", "-f", "bridge --slot zb_probe"], capture_output=True, text=True).stdout.split()
-          if pid:
-              rep = subprocess.run(["leaks", "--nocontext", pid[0]], capture_output=True, text=True).stdout
+          if not zb.leaks_available():
+              print("  ⓘ  `leaks` not available (macOS only) — the memory audit is skipped, not passed")
+          elif bridge.proc.poll() is None:
+              rep = subprocess.run(["leaks", "--nocontext", str(bridge.proc.pid)], capture_output=True, text=True).stdout
               if "0 leaks for 0 total leaked bytes" in rep:
                   zb.ok("after all of it: `leaks` reports 0 on the still-running bridge")
               else:
@@ -222,6 +270,8 @@ async def main():
                   failed += 1
     finally:
       zb.psql("DELETE FROM public.memo WHERE txt LIKE 'chaos %'", quiet=True)
+      if value_before:
+          zb.psql(f"UPDATE public.counter_public SET value = {int(value_before)}, updated_at = now()", quiet=True)
       zb.psql("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='zb_probe' AND NOT active) "
             "THEN PERFORM pg_drop_replication_slot('zb_probe'); END IF; END $$", quiet=True)
 
@@ -229,4 +279,5 @@ async def main():
     return failed
 
 
-zb.run(main)
+if __name__ == "__main__":  # importable: nats_outage.py borrows running_nats()
+    zb.run(main)

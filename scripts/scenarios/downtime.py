@@ -44,7 +44,8 @@ Usage:  python scripts/scenarios/downtime.py     (admin ZB_PSQL; NATS_CREDS=brid
 """
 
 import asyncio
-import subprocess
+import os
+import pathlib
 import sys
 import uuid
 
@@ -52,7 +53,7 @@ from nats.js.api import ConsumerConfig, DeliverPolicy
 
 import zb
 
-LOG = "/tmp/zb_downtime_bridge.log"
+LOG = str(pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_downtime_bridge.log")
 TABLE = "memo"
 CDC_STREAM = zb.TOPOLOGY["cdc_streams"]["public"]
 FILTER = f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{TABLE}.>"
@@ -100,11 +101,32 @@ async def events_since(js, start_seq: int) -> list[tuple[str, str]]:
     return out
 
 
+async def wait_for_uids(js, start_seq: int, wanted: set, timeout: float = 30) -> list[tuple[str, str]]:
+    """Poll events_since until every wanted uid has appeared, or the deadline —
+    bounded, instead of a fixed sleep guessing how long the replay takes."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    seen: list[tuple[str, str]] = []
+    while asyncio.get_event_loop().time() < deadline:
+        seen = await events_since(js, start_seq)
+        if wanted <= {uid for _, uid in seen}:
+            break
+        await asyncio.sleep(0.5)
+    return seen
+
+
+async def wait_for_seq_past(js, seq: int, timeout: float = 15) -> None:
+    """Wait until CDC_STREAM has published past `seq` (rows landing), bounded."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if (await js.stream_info(CDC_STREAM)).state.last_seq > seq:
+            return
+        await asyncio.sleep(0.5)
+
+
 async def main():
     failed = 0
 
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
-    if running.stdout.strip():
+    if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
 
     # A LEFTOVER slot would carry an old position and replay unrelated history into
@@ -116,12 +138,13 @@ async def main():
         quiet=True,
     )
 
+    nc = await zb.connect()
+    js = nc.jetstream()
+    fixture_mark = (await js.stream_info(CDC_STREAM)).state.last_seq + 1
+
     keep = mk_row("downtime keep")       # will be UPDATEd while the bridge is down
     doomed = mk_row("downtime doomed")   # will be DELETEd while the bridge is down
     born = None                          # will be INSERTed while the bridge is down
-
-    nc = await zb.connect()
-    js = nc.jetstream()
 
     # ── 1. bridge A: stream, and mark where "during the outage" begins ──────────
     with zb.Bridge(LOG) as bridge:
@@ -129,14 +152,14 @@ async def main():
             zb.bad("bridge A never started — see " + LOG)
             await nc.close()
             return 1
-        await asyncio.sleep(4)  # let the two fixture rows land
+        # the two fixture rows must land before the mark is taken — observable, so polled
+        await wait_for_uids(js, fixture_mark, {keep, doomed}, timeout=30)
 
         info = await js.stream_info(CDC_STREAM)
         mark = info.state.last_seq + 1   # everything from here on is "after the mark"
 
         baseline = mk_row("downtime baseline")
-        await asyncio.sleep(4)
-        seen = await events_since(js, mark)
+        seen = await wait_for_uids(js, mark, {baseline}, timeout=30)
         if any(uid == baseline for _, uid in seen):
             zb.ok("baseline: with the bridge UP, a write reaches CDC (the pipeline is live)")
         else:
@@ -157,9 +180,7 @@ async def main():
             zb.bad("bridge B never started — see " + LOG + ".2")
             await nc.close()
             return 1
-        await asyncio.sleep(8)
-
-        replayed = await events_since(js, gap_mark)
+        replayed = await wait_for_uids(js, gap_mark, {born, keep, doomed}, timeout=40)
         got = {(op, uid) for op, uid in replayed}
 
         for verb, uid, label in (
@@ -180,7 +201,9 @@ async def main():
             zb.bad("bridge C never started — see " + LOG + ".3")
             failed += 1
         else:
-            await asyncio.sleep(3)
+            # "streaming" is the observable: let bridge C catch up on any tail before
+            # the mark is taken (bounded; nothing may be pending, hence the short cap)
+            await wait_for_seq_past(js, (await js.stream_info(CDC_STREAM)).state.last_seq, timeout=3)
             crash_mark = (await js.stream_info(CDC_STREAM)).state.last_seq + 1
             # SIGKILL: no signal handler runs, no final status update is sent. Whatever
             # PostgreSQL has on the slot is all that survives.
@@ -193,8 +216,7 @@ async def main():
             zb.bad("bridge D never started — see " + LOG + ".4")
             failed += 1
         else:
-            await asyncio.sleep(8)
-            after_crash = {uid for _, uid in await events_since(js, crash_mark)}
+            after_crash = {uid for _, uid in await wait_for_uids(js, crash_mark, {crash_born}, timeout=40)}
             if crash_born in after_crash:
                 zb.ok("a write made after `kill -9` is replayed — the position lives in the slot, not the process")
             else:

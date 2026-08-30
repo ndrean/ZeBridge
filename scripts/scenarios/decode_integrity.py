@@ -28,13 +28,14 @@ pg_copy_binary.zig's COPY-binary decode, retired with snapshot-on-demand — NOT
 §10h/§10n. NUMERIC stays compared by decimal value, which still catches a wrong
 value regardless of scale padding.)
 
-⚠️ `decode_fixture` is a table this script invents. Its catalogue row is written
-BEFORE the probe bridge starts: the bridge derives the public set from
-`zebridge_catalogue` at boot and reconciles CDC_PUBLIC's subject filter itself, so
-the row IS the registration — the `nats stream edit` half this scenario used to do
-by hand (and once lost several hours to, when it was skipped and every publish
-timed out unacked) is now the bridge's own boot step, and check 0 asserts it
-happened rather than performing it.
+⚠️ `decode_fixture` is a table this script invents. Its catalogue row IS the
+registration: the bridge reloads `zebridge_catalogue` LIVE at the COMMIT of a
+catalogue row (NOTES §10bj) and reconciles CDC_PUBLIC's subject filter itself —
+the `nats stream edit` half this scenario used to do by hand (and once lost
+several hours to, when it was skipped and every publish timed out unacked) is the
+bridge's own job now. The row is written before the probe boots here only so that
+one boot covers it; check 0 asserts the subject is bound rather than binding it.
+Deleting the row at the end reconciles CDC_PUBLIC live too — no restart needed.
 
 Usage:  python scripts/scenarios/decode_integrity.py [row_count]
 
@@ -47,18 +48,17 @@ import decimal
 import json
 import os
 import pathlib
-import subprocess
 import sys
 
 import zb
-from nats.js.api import ConsumerConfig, DeliverPolicy
 
 TABLE = "decode_fixture"
 KIND_TYPE = "decode_fixture_kind"
 PUB = zb.publication()
 SCRATCH = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
-CDC_PUBLIC_STREAM = "CDC_PUBLIC"
-FIXTURE_SUBJECT = f"cdc.{TABLE}.>"
+CDC_PREFIX = zb.TOPOLOGY["subjects"]["cdc_prefix"]
+CDC_PUBLIC_STREAM = zb.TOPOLOGY["cdc_streams"]["public"]
+FIXTURE_SUBJECT = f"{CDC_PREFIX}.{TABLE}.>"
 
 
 # Comfortably past one page, so a run of these forces the WAL-message arena
@@ -150,7 +150,7 @@ def check_rows(got: dict[int, dict], expected: dict[int, dict], source: str) -> 
 
 async def collect_cdc(nc, n: int, timeout: float) -> dict[int, dict]:
     """Subscribe to cdc.>, seed, and collect every decode_fixture INSERT — batched or not."""
-    sub = await nc.subscribe("cdc.>")
+    sub = await nc.subscribe(f"{CDC_PREFIX}.>")
     got: dict[int, dict] = {}
 
     async def drain():
@@ -187,18 +187,18 @@ async def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 400
     failed = 0
 
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
-    if running.stdout.strip():
+    if zb.another_bridge_running():
         sys.exit(
             "another bridge is already running — this scenario starts its own so the CDC "
             "subscription sees exactly this run's inserts.\n    pkill -f zig-out/bin/bridge"
         )
 
-    # ONE declaration makes a public table reachable now: its catalogue row,
-    # written BEFORE the probe boots. The bridge derives the public set from
-    # `zebridge_catalogue` at boot (grammar.json no longer carries a table list)
-    # and reconciles CDC_PUBLIC's subject filter to it — the temp-topology and
-    # stream-edit machinery this scenario used to need are both gone.
+    # ONE declaration makes a public table reachable: its catalogue row. The bridge
+    # reloads the catalogue live at the row's COMMIT (and at boot) and reconciles
+    # CDC_PUBLIC's subject filter to it — the temp-topology and stream-edit
+    # machinery this scenario used to need are both gone. Written before the probe
+    # boots so a single boot covers it; livebirth.py is the scenario for the
+    # while-running case.
     zb.psql(
         "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
         f"('{TABLE}', 'decode_integrity.py fixture') ON CONFLICT (tbl) DO NOTHING",
@@ -213,7 +213,7 @@ async def main():
             bound = json.loads(info.stdout)["config"]["subjects"] if info.returncode == 0 else []
             if FIXTURE_SUBJECT not in bound:
                 sys.exit(f"boot reconciliation did not bind {FIXTURE_SUBJECT} (bound: {bound})")
-            print(f"0. boot reconciliation bound {FIXTURE_SUBJECT} in {CDC_PUBLIC_STREAM}")
+            print(f"0. catalogue reconciliation bound {FIXTURE_SUBJECT} in {CDC_PUBLIC_STREAM}")
 
             nc = await zb.connect()
             try:
@@ -224,8 +224,9 @@ async def main():
             finally:
                 await nc.close()
     finally:
-        # CDC_PUBLIC keeps the fixture subject until the NEXT bridge boot reconciles
-        # it away — restart your bridge after this scenario.
+        # Deleting the catalogue row is a catalogue COMMIT: a running bridge reconciles
+        # CDC_PUBLIC live and unbinds the fixture subject — nothing to restart. (The
+        # probe above is already stopped; the next bridge's boot reconciles the same way.)
         zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
         zb.psql(f"DROP TYPE IF EXISTS {KIND_TYPE}", quiet=True)
         zb.psql(

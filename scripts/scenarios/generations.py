@@ -17,8 +17,9 @@ contract is more than a shape:
   5. **the writer holds nothing** — generation bookkeeping is not ingress.
 
 Usage:  python scripts/scenarios/generations.py
-Needs POSTGRES_READER_* / POSTGRES_WRITER_* creds in the env (source .env.admin).
-Cleans up its rows via the DELETE grant it is testing.
+Needs DATABASE_READER_URL / DATABASE_WRITER_URL in the env (`set -a && . ./.env.bridge
+&& set +a`) — the roles are exactly the connections the bridge itself makes — plus
+admin psql. Cleans up its rows via the DELETE grant it is testing.
 """
 
 import os
@@ -27,32 +28,31 @@ import sys
 
 import zb
 
-PGBIN = "/opt/homebrew/opt/postgresql@18/bin/psql"
-HOST = os.environ.get("ZB_PG_HOST", "127.0.0.1")
-PORT = os.environ.get("ZB_PG_PORT", "5432")
+# ZB_PGBIN overrides; the same binary the admin path uses, not a hardcoded Homebrew path.
+PSQL_BIN = zb._psql_binary()
 
 
-def as_role(user_env, pw_env, sql):
-    user = os.environ.get(user_env)
-    pw = os.environ.get(pw_env)
-    if not (user and pw):
-        sys.exit(f"{user_env}/{pw_env} not set — source .env.admin")
-    return subprocess.run([PGBIN, "-h", HOST, "-p", PORT, "-U", user, "-d", "postgres",
-                           "-tA", "-v", "ON_ERROR_STOP=1"],
-                          input=sql, capture_output=True, text=True,
-                          env={**os.environ, "PGPASSWORD": pw})
+def as_role(url_env, sql):
+    """Run `sql` as the role inside a bridge URL — user, password, host, port and
+    database all come from the URL, the way the bridge dials it."""
+    url = os.environ.get(url_env)
+    if not url:
+        sys.exit(f"{url_env} not set — set -a && . ./.env.bridge && set +a")
+    return subprocess.run([PSQL_BIN, url, "-tA", "-v", "ON_ERROR_STOP=1"],
+                          input=sql, capture_output=True, text=True)
 
 
 def reader(sql):
-    return as_role("POSTGRES_READER_USER", "POSTGRES_READER_PASSWORD", sql)
+    return as_role("DATABASE_READER_URL", sql)
 
 
 def writer(sql):
-    return as_role("POSTGRES_WRITER_USER", "POSTGRES_WRITER_PASSWORD", sql)
+    return as_role("DATABASE_WRITER_URL", sql)
 
 
 def main():
     failed = 0
+    open_tenant = zb.TOPOLOGY.get("open_tenant", "_default")
 
     # ── 1. shape ───────────────────────────────────────────────────────────────
     pk = zb.psql("SELECT string_agg(a.attname, ',' ORDER BY k.ord) FROM pg_index i "
@@ -70,33 +70,33 @@ def main():
     # ── 2. invisible to clients ────────────────────────────────────────────────
     ddl = zb.psql("SELECT count(*) FROM zebridge_ddl_events WHERE table_name='zebridge_generations'").strip()
     pub = zb.psql("SELECT count(*) FROM pg_publication_tables WHERE tablename='zebridge_generations'").strip()
-    kv = zb.nats_cli("kv", "get", zb.TOPOLOGY["kv"]["schemas"], "zebridge_generations", "--raw")
-    if ddl == "0" and pub == "0" and kv.returncode != 0:
+    kv = zb.kv_get("schemas", "zebridge_generations")
+    if ddl == "0" and pub == "0" and not kv:
         zb.ok("invisible to clients: no DDL event, not published, no $KV.schemas key")
     else:
-        zb.bad(f"leaked: ddl_events={ddl}, published={pub}, kv={'present' if kv.returncode == 0 else 'absent'}")
+        zb.bad(f"leaked: ddl_events={ddl}, published={pub}, kv={'present' if kv else 'absent'}")
         failed += 1
 
     try:
         # ── 3. the reader runs the build recipe, LSN-before-snapshot ──────────
-        r = reader("""
+        r = reader(f"""
 SELECT pg_current_wal_lsn() AS l \\gset
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 SELECT count(*) FROM public.users;
 INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn)
-VALUES ('_default', 'users', 900001, now(), :'l');
+VALUES ('{open_tenant}', 'users', 900001, now(), :'l');
 COMMIT;
-SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='_default' AND tbl='users' AND gen >= 900000;
+SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='{open_tenant}' AND tbl='users' AND gen >= 900000;
 """)
         if r.returncode == 0 and "900001@" in r.stdout:
             zb.ok(f"the reader built a generation with the LSN-before-content recipe ({r.stdout.strip().splitlines()[-1]})")
         else:
-            zb.bad(f"recipe failed as bridge_reader: {r.stderr.strip()[:160]}")
+            zb.bad(f"recipe failed as the reader role: {r.stderr.strip()[:160]}")
             failed += 1
 
         # ── PK: the chain cannot fork ──────────────────────────────────────────
         r = reader("INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn) "
-                   "VALUES ('_default', 'users', 900001, now(), pg_current_wal_lsn());")
+                   f"VALUES ('{open_tenant}', 'users', 900001, now(), pg_current_wal_lsn());")
         if r.returncode != 0 and "duplicate key" in r.stderr:
             zb.ok("a second generation 1 is refused by the primary key — the chain cannot fork")
         else:
@@ -113,15 +113,15 @@ SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='_
 
         # ── 5. the writer holds nothing here ───────────────────────────────────
         r = writer("INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn) "
-                   "VALUES ('_default', 'users', 900099, now(), pg_current_wal_lsn());")
+                   f"VALUES ('{open_tenant}', 'users', 900099, now(), pg_current_wal_lsn());")
         if r.returncode != 0 and "permission denied" in r.stderr:
-            zb.ok("bridge_writer is refused entirely — generation bookkeeping is not ingress")
+            zb.ok("the writer role is refused entirely — generation bookkeeping is not ingress")
         else:
             zb.bad(f"writer INSERT was not refused: {r.stderr.strip()[:120]}")
             failed += 1
     finally:
         # cleanup through the very grant that pruning will use
-        r = reader("DELETE FROM public.zebridge_generations WHERE tenant='_default' AND tbl='users' AND gen >= 900000;")
+        r = reader(f"DELETE FROM public.zebridge_generations WHERE tenant='{open_tenant}' AND tbl='users' AND gen >= 900000;")
         if r.returncode == 0:
             zb.ok("cleanup via the reader's DELETE grant — the pruning path works")
         else:

@@ -42,11 +42,11 @@ idempotent upsert, never on dedup.
 
 Usage:  python scripts/scenarios/offline.py [table]
 
-    NATS_URL=nats://alice:s3cret@127.0.0.1:4222 python scripts/scenarios/offline.py
+    NATS_CREDS=scripts/native/creds/omar.creds python scripts/scenarios/offline.py
 
-Needs the bridge running with a tiebreak column, for case 3:
-
-    SYNC_RULES=test_types:updated_at,deleted_at,last_writer
+Runs as a CLIENT principal (the creds file names it, or ZB_PRINCIPAL). The table's
+version and tombstone columns come from `zebridge_catalogue`; case 3 needs a tiebreak
+column declared there too and is skipped otherwise.
 """
 
 import asyncio
@@ -73,27 +73,13 @@ V_OLD, V_MID, V_NEW = f"{DAY}T09:00:00.000000", f"{DAY}T10:00:00.000000", f"{DAY
 SETTLE = float(os.environ.get("ZB_SETTLE", "2.5"))
 
 
-def principal() -> str:
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
-
-
 async def main():
     failed = 0
-    who = principal()
+    who = zb.require_principal()
 
     # ── configuration this scenario depends on ─────────────────────────────────
-    rules = os.environ.get("SYNC_RULES", "")
-    entry = next((r for r in rules.split(";") if r.strip().startswith(f"{TABLE}:")), None)
-    cols = entry.split(":", 1)[1].split(",") if entry else []
-    if len(cols) < 2:
-        sys.exit(
-            f"'{TABLE}' needs a version and a tombstone column in SYNC_RULES.\n"
-            f"    SYNC_RULES={TABLE}:updated_at,deleted_at,last_writer"
-        )
-    version_col = cols[0].strip()
-    tomb_col = cols[1].strip()
-    tie_col = cols[2].strip() if len(cols) > 2 else None
+    r = zb.require_rules(TABLE, "version", "tombstone")
+    version_col, tomb_col, tie_col = r["version"], r["tombstone"], r["tiebreak"]
     print(f"version={version_col}  tombstone={tomb_col}  tiebreak={tie_col or '(none)'}\n")
 
     # Read the shape from the catalog rather than assuming it — this table grew a NOT NULL
@@ -111,11 +97,9 @@ async def main():
             f"WHERE table_name='{TABLE}' AND is_nullable='NO' AND column_default IS NULL"
         ).splitlines() if c
     ]
-    tenant = zb.psql(
-        f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal='{who}' LIMIT 1"
-    ).strip()
+    tenant = zb.tenant_of(who)
 
-    nc = await zb.connect()
+    nc = await zb.connect_as(who)
     js = nc.jetstream()
     base = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], who, TABLE)
 
@@ -139,9 +123,9 @@ async def main():
             print("dedup window: not reported by this client (server default is 120s)\n")
     except Exception:
         # Expected as a client principal: `$JS.API.STREAM.INFO.<stream>` is not in a
-        # client's allow-list, and should not be. Re-run with the bridge nkey to see it.
-        print("dedup window: not readable as a client principal — re-run with "
-              "NATS_BRIDGE_NKEY_SEED to report it\n")
+        # client's allow-list, and should not be. `nats stream info` with bridge.creds shows it.
+        print("dedup window: not readable as a client principal — "
+              "`nats stream info` with bridge.creds reports it\n")
 
     def row(uid: str, text: str, version: str) -> dict:
         d = {
@@ -247,7 +231,7 @@ async def main():
                   f"'{writer}' won — must be '{HIGH}' regardless of arrival order")
             cleanup(uid)
     else:
-        print("  – equal-version case skipped: no tiebreak column in SYNC_RULES")
+        print("  – equal-version case skipped: no tiebreak column declared for this table")
 
     # ── 4. an offline DELETE with a newer version tombstones the row ───────────
     uid = str(uuid.uuid4())

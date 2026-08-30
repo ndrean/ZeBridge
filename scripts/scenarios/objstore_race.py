@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Concurrent get()/put() on NATS Object Store — can an in-flight read ever tear?
 
-Written to settle NOTES.md §1.12's "Object Store for the bulk path" open question: if a
-future reseed-on-cadence "leaf" ever overwrites a snapshot object in place, what does a
-client see if its get() is still mid-flight when a put() lands underneath it — the full old
-body, the full new body, an error, a hang, or (the dangerous one) a mix of both?
+The bulk path is NATS Object Store: the bridge writes generation chain objects (msgpack
+under a per-era zstd dictionary) into `OBJ gen-<tenant>`, and a client fetches them to
+bootstrap. Chain objects are append-only by design — a generation is never rewritten —
+but nothing enforces that at the store, so this asks what a client would see if one WERE
+overwritten while its get() is still mid-flight: the full old body, the full new body, an
+error, a hang, or (the dangerous one) a mix of both?
 
 Reading nats-py's own ObjectStore.put()/get() (nats/js/object_store.py) answers half of this
 without running anything: every put() writes its chunks under a BRAND NEW nuid-keyed subject,
@@ -26,17 +28,25 @@ Two checks:
      happen instead (spoiler, measured: the reader hangs forever, every time).
 
   2. Race a put() against a reader that instead watch()es the bucket first and only starts its
-     own get() once notified — the same discipline `App.tsx` already uses against
-     `$KV.snapshots` in `waitForDescriptor`, one level down on the object itself. Confirms that
-     discipline is what actually avoids check 1's hang, not luck: watch() is a JetStream
-     consumer on the object's META subject alone, published exactly once per put(), only after
-     every chunk is durably written — a native "available" signal, not something to hand-roll.
+     own get() once notified — the discipline the web client (zb-client-ts) follows: it waits
+     on the generation descriptor in KV before fetching the chain object it names, one level
+     down on the object itself. Confirms that discipline is what actually avoids check 1's
+     hang, not luck: watch() is a JetStream consumer on the object's META subject alone,
+     published exactly once per put(), only after every chunk is durably written — a native
+     "available" signal, not something to hand-roll.
+
+Manual — not in run.py's battery: it moves ~40 MB per round through the broker and takes
+minutes. Uses a scratch bucket of its own, never `gen-<tenant>`.
 
 Usage:
+    NATS_CREDS=scripts/native/creds/bridge.creds \\
     scripts/scenarios/.venv/bin/python scripts/scenarios/objstore_race.py
+
+    ZB_OBJECT_SIZE=<bytes>  ZB_ROUNDS=<n>  ZB_WATCH_ROUNDS=<n>  shrink it for a quick look.
 """
 
 import asyncio
+import os
 import random
 
 import zb
@@ -49,10 +59,10 @@ KEY = "leaf"
 # concurrent put() an actual window to land mid-transfer instead of always winning or losing
 # the race by construction alone.
 CHUNK_SIZE = 128 * 1024
-OBJECT_SIZE = CHUNK_SIZE * 320
-ROUNDS = 12
-GET_TIMEOUT_S = 8
-WATCH_ROUNDS = 5
+OBJECT_SIZE = int(os.environ.get("ZB_OBJECT_SIZE", CHUNK_SIZE * 320))
+ROUNDS = int(os.environ.get("ZB_ROUNDS", "12"))
+GET_TIMEOUT_S = float(os.environ.get("ZB_GET_TIMEOUT", "8"))
+WATCH_ROUNDS = int(os.environ.get("ZB_WATCH_ROUNDS", "5"))
 
 
 def payload(tag: bytes, size: int) -> bytes:

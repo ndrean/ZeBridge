@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """One process, one NATS address.
 
-Regression probe for a split brain: three components each resolved "where is NATS"
-their own way. The publisher parsed `NATS_URL`; the snapshot listener borrowed the
-publisher's parsed result; the mutation listener read `NATS_HOST` raw **and passed no
-port**, so it dialled `NATS_HOST:4222` whatever the URL said.
+Regression probe for a split brain: the components each resolved "where is NATS"
+their own way. The publisher parsed `NATS_URL`; the mutation listener read `NATS_HOST`
+raw **and passed no port**, so it dialled `NATS_HOST:4222` whatever the URL said.
 
-Set `NATS_HOST=nats-server` (a name that resolves only inside compose) beside a working
-`NATS_URL` and the bridge came up looking healthy — CDC flowing, snapshots served — with
+Set `NATS_HOST=nats-server` (a name that resolves nowhere on the native stack) beside
+a working `NATS_URL` and the bridge came up looking healthy — CDC flowing — with
 ingress alone dead on `HostResolutionFailed`. That is the configuration this reproduces.
 
-Needs a writer role for the mutation listener to start at all; without one the ingress
-half of the check is skipped rather than silently passing.
+The mutation listener — the component that had it wrong — only starts with a writer
+role, so `DATABASE_WRITER_URL` is REQUIRED here: without it the probe would pass on the
+publisher alone and prove nothing about the path under test.
 
-Usage:  python scripts/scenarios/endpoint.py
+Usage:  python scripts/scenarios/endpoint.py   (probe-bridge env: .env.bridge + bridge.creds)
 """
 
 import os
@@ -26,15 +26,21 @@ async def main():
     log = "/tmp/zb_endpoint.log"
     bogus = os.environ.get("ZB_BOGUS_HOST", "nats-server")
 
+    if not os.environ.get("DATABASE_WRITER_URL"):
+        sys.exit(
+            "DATABASE_WRITER_URL is not set — the mutation listener is the component this "
+            "probe exists for, and it does not start without a writer role.\n"
+            "  set -a && . ./.env.bridge && set +a"
+        )
+
     print(f"\nstarting a bridge with NATS_HOST={bogus} and NATS_URL={zb.NATS_URL}")
     with zb.Bridge(log, NATS_HOST=bogus, NATS_URL=zb.NATS_URL, LOG_LEVEL="debug") as br:
-        ingress = bool(os.environ.get("POSTGRES_WRITER_USER") or os.environ.get("DATABASE_WRITER_URL"))
-        needle = "Mutation listener: ✅ Ready" if ingress else "Snapshot listener: ✅ Consuming"
-        reached = br.wait_for_log(needle, timeout=40)
+        # The listener's own ready line; the endpoint line is checked separately below.
+        reached = br.wait_for_log("Mutation listener: ✅ Ready", timeout=40)
         text = br.text()
 
     failed = 0
-    if f"NATS endpoint: " not in text:
+    if "NATS endpoint:" not in text:
         zb.bad("the bridge never logged a resolved endpoint")
         return 1
 
@@ -64,9 +70,7 @@ async def main():
         zb.bad("HostResolutionFailed — a component is still resolving its own address")
         failed = 1
 
-    if not ingress:
-        print("  ⓘ  ingress skipped: no POSTGRES_WRITER_USER/DATABASE_WRITER_URL set")
-    elif reached:
+    if reached:
         zb.ok("the mutation listener — the component that had it wrong — connected")
     else:
         zb.bad("the mutation listener never became ready")

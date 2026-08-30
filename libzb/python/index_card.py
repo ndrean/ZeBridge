@@ -7,9 +7,9 @@ and out — against the native stack as `omar`. Asserts the write round-trips in
 read-only connection, and that a write THROUGH that connection is refused.
 """
 import ctypes, json, os, sys, time, uuid
+from _env import load_lib, creds, GRAMMAR, rm_sqlite
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-lib = ctypes.CDLL(os.path.join(ROOT, "zig-out", "lib", "libzbcore.dylib"))
+lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
 lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
 lib.zb_client_close.restype, lib.zb_client_close.argtypes = ctypes.c_int, [ctypes.c_uint64]
@@ -34,20 +34,17 @@ def query(h, sql, params=()):
     return [dict(zip(r["columns"], row)) for row in r["rows"]]
 
 db = "/tmp/zb-index-card.sqlite3"
-for f in (db, db + "-wal", db + "-shm"):
-    try: os.unlink(f)
-    except FileNotFoundError: pass
+rm_sqlite(db)
 
 h = lib.zb_client_open(json.dumps({
     "url": "nats://127.0.0.1:4222",
-    "credsPath": os.path.join(ROOT, "..", "scripts", "native", "creds", "omar.creds"),
-    "grammarPath": os.path.join(ROOT, "..", "grammar.json"),
+    "credsPath": creds("omar"),
+    "grammarPath": GRAMMAR,
     "dbPath": db,
     "principal": "omar",
     "clientId": "py-index-card",
     "tables": ["users", "salaries", "test_types"],
 }).encode())
-assert h, "open failed (is the native stack up?)"
 ok = True
 def check(label, cond):
     global ok
@@ -55,6 +52,8 @@ def check(label, cond):
     print(("  ✓ " if cond else "  ✗ ") + label)
 
 try:
+    if not h:
+        sys.exit("open failed (is the native stack up? nats 127.0.0.1:4222, creds for omar)")
     s = take(lib.zb_client_sync(h))
     check(f"sync: tenant resolved ({s.get('tenant')}), first pass", s.get("first") is True and s.get("tenant"))
     before = query(h, "SELECT count(*) AS n FROM test_types WHERE deleted_at IS NULL")[0]["n"]
@@ -83,6 +82,8 @@ try:
     bad = take(lib.zb_client_sync(0))
     check("a bad handle answers an error, not a crash", bad.get("error") == "UnknownHandle")
 finally:
-    check("close", lib.zb_client_close(h) == 0)
+    if h:
+        check("close", lib.zb_client_close(h) == 0)
+    rm_sqlite(db)
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

@@ -33,7 +33,6 @@ PG_FLAGS=(
   -c wal_level=logical
   -c max_replication_slots=10
   -c max_wal_senders=10
-  -c max_slot_wal_keep_size=10GB
   -c wal_sender_timeout=300s
   -c logical_decoding_work_mem=256MB
   -c wal_buffers=64MB
@@ -51,6 +50,13 @@ fi
 echo "[native] starting postgres on :$PGPORT"
 "$PGBIN/pg_ctl" -D "$PGDATA" -l "$PG_LOG" -o "-p $PGPORT ${PG_FLAGS[*]}" start
 "$PGBIN/pg_isready" -h 127.0.0.1 -p "$PGPORT" >/dev/null
+# ⚠️ Not a `-c` flag: a command-line setting beats postgresql.auto.conf, so nothing
+# short of a restart could change it — scripts/scenarios/slot_loss.py lowers it with
+# ALTER SYSTEM + pg_reload_conf to invalidate a slot on purpose, and an operator may
+# need the same knob live. Set once here; ALTER SYSTEM wins from then on.
+# (two statements: ALTER SYSTEM refuses to run inside a transaction block)
+"$PGBIN/psql" -h 127.0.0.1 -p "$PGPORT" -U postgres -d postgres -qc "ALTER SYSTEM SET max_slot_wal_keep_size = '10GB'" >/dev/null
+"$PGBIN/psql" -h 127.0.0.1 -p "$PGPORT" -U postgres -d postgres -qc "SELECT pg_reload_conf()" >/dev/null
 
 if [ "$FRESH_PG" = "1" ]; then
   echo "[native] applying init.core.template.sql + init.write.template.sql"

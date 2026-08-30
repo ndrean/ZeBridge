@@ -1515,13 +1515,23 @@ export class ZeBridge {
     // 1. Gap detection — asked of EVERY stream this client reads: a gap in any of
     // them means missing rows, and checking only one looks like an empty table.
     try {
-      const streamGaps: Record<string, { firstSeq: number; stored: number }> = {};
+      const streamGaps: Record<string, { firstSeq: number; stored: number; lastSeq: number }> = {};
       for (const streamName of this.cdcStreams()) {
         const info = await jsm.streams.info(streamName);
         streamGaps[streamName] = {
           firstSeq: info.state.first_seq,
+          lastSeq: info.state.last_seq,   // a position beyond it = the stream restarted (lost slot, NOTES §10bm)
           stored: this.globalSyncState.seq[streamName] ?? 0,
         };
+        if (streamGaps[streamName].stored > info.state.last_seq) {
+          // The feed restarted under us: the position is meaningless in the new
+          // numbering. Reset it, or fullPredates reads the fresh chain's small
+          // cutoff_seq as "older than where I am" and skips the full this gap needs.
+          this.appendLog('SYNC', `${streamName}: stream restarted (position ${streamGaps[streamName].stored} beyond last_seq ${info.state.last_seq}) — position reset`, 'GAP');
+          streamGaps[streamName].stored = 0;
+          this.globalSyncState.seq[streamName] = 0;
+          await this.run(`UPDATE _zebridge_stream_seq SET last_seq = 0 WHERE stream = ?`, streamName);
+        }
       }
 
       // D2 (NOTES §10n): seeding is SCOPED. A gap on one stream re-seeds only

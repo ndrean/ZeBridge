@@ -127,7 +127,7 @@ BEGIN
         ' USING (coalesce(current_setting(''zb.tenant'', true), '''') = '''' OR %I::text = current_setting(''zb.tenant'', true) OR %I::text = ''${OPEN_TENANT}'')',
         tbl, '${POSTGRES_READER_USER}', tenant_col, tenant_col);
 
-    RAISE NOTICE 'reads on % now filtered by % when zb.tenant is set — CDC is unaffected (RLS does not apply to replication); the snapshot connection sets zb.tenant to scope it',
+    RAISE NOTICE 'reads on % now filtered by % when zb.tenant is set — CDC is unaffected (RLS does not apply to replication); a client-scoped connection sets zb.tenant to scope it',
                  tbl, tenant_col;
 END;
 $$ LANGUAGE plpgsql;
@@ -1682,3 +1682,404 @@ BEGIN
     END IF;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- zebridge_check: does this table conform to what the bridge needs — and to what
+-- YOU intend for it? Run it after a migration, from psql, with no bridge running:
+--
+--     SELECT * FROM zebridge_check('orders', 'writable');
+--     SELECT * FROM zebridge_check('orders', 'writable', 'updated_at', 'deleted_at', 'last_writer', 'tenant_id');
+--     SELECT * FROM zebridge_check_all('{"users":"read_only",
+--         "orders":{"mode":"writable","version":"updated_at","tombstone":"deleted_at","tiebreak":"last_writer","tenant":"tenant_id"}}');
+--
+-- It asks pg_catalog and our own tables the same questions the bridge's preflight
+-- asks at boot and at every DDL event (preflight.zig, mutation_listener.zig), from
+-- the same source of truth, so a green run here is a green boot there. `intent` is
+-- what you MEAN the table to be; the checks compare it with what the grants and the
+-- catalogue actually say — the mismatch is the finding a doctor exists to make.
+-- Statuses: ok | NOTE | WARNING | ERROR. An ERROR is something the bridge refuses.
+-- ═══════════════════════════════════════════════════════════════════════════
+-- The column names are the part you must DECLARE for the check to mean anything
+-- before a migration: which column is the version, the tombstone, the tiebreak, the
+-- tenant. Name them and the check compares your naming with the schema AND with the
+-- catalogue (a disagreement is a finding); leave them NULL and the catalogue's row is
+-- taken at its word (`updated_at` when there is no row yet). The one thing it cannot
+-- see is a SYNC_RULES/TENANT_RULES override in the bridge's environment — those are
+-- legacy per-table overrides, and a table that needs one is a table to migrate.
+CREATE OR REPLACE FUNCTION public.zebridge_check(
+    tbl           regclass,
+    intent        text DEFAULT NULL,   -- 'read_only' | 'writable' | NULL = whatever the grants say
+    version_col   name DEFAULT NULL,
+    tombstone_col name DEFAULT NULL,
+    tiebreak_col  name DEFAULT NULL,
+    tenant_col    name DEFAULT NULL,
+    -- The operator's recorded acceptance of physical deletes (zebridge_enable's
+    -- allow_physical_deletes): the catalogue does not persist it, so say it here and a
+    -- missing tombstone is a WARNING — the resurrection risk stated — not an ERROR.
+    allow_physical_deletes boolean DEFAULT false
+) RETURNS TABLE (check_name text, status text, detail text) AS $$
+DECLARE
+    tname    text := (SELECT relname FROM pg_class WHERE oid = tbl);
+    owner    text := (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = tbl);
+    cat      public.zebridge_catalogue%ROWTYPE;
+    have_cat boolean;
+    pkcols   name[];
+    ident    "char";
+    idx_cols name[];
+    pubs     text[];
+    writers  text[];
+    want_writable boolean;
+    seq_key  boolean;
+    vname    name;
+    vcol     record;
+    tcol     record;
+    budget   integer;
+    widest   bigint;
+    errors   integer := 0;
+    warns    integer := 0;
+BEGIN
+    IF intent IS NOT NULL AND intent NOT IN ('read_only', 'writable') THEN
+        RAISE EXCEPTION 'zebridge_check: intent must be ''read_only'' or ''writable'' (got %)', intent;
+    END IF;
+
+    -- ── 1. the catalogue row: what the bridge routes by ─────────────────────
+    SELECT * INTO cat FROM public.zebridge_catalogue c WHERE c.tbl = tname;
+    have_cat := FOUND;
+    IF NOT have_cat THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'catalogue', 'ERROR',
+            format('%s has no zebridge_catalogue row: the bridge cannot route it (no_cdc_subject). '
+                   'Declare it with zebridge_enable(...)', tname);
+        -- No row: the declared names are the only ones there are.
+        cat.tbl := tname;
+        cat.version_col := coalesce(version_col, 'updated_at');
+        cat.tombstone_col := tombstone_col;
+        cat.tiebreak_col := tiebreak_col;
+        cat.tenant_col := tenant_col;
+        cat.generations := false;
+    ELSE
+        -- Declared names against the catalogue's: a disagreement means the migration
+        -- and the operator's intent have drifted apart, which is exactly what a
+        -- check after a migration exists to catch. The declared name wins for the
+        -- checks below, so the rest of the report is about what YOU meant.
+        IF version_col IS NOT NULL AND version_col IS DISTINCT FROM cat.version_col THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'naming', 'ERROR', format('you declared version_col %I, the catalogue says %I', version_col, cat.version_col);
+            cat.version_col := version_col;
+        END IF;
+        IF tombstone_col IS NOT NULL AND tombstone_col IS DISTINCT FROM cat.tombstone_col THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'naming', 'ERROR', format('you declared tombstone_col %I, the catalogue says %s', tombstone_col, coalesce(cat.tombstone_col::text, 'none'));
+            cat.tombstone_col := tombstone_col;
+        END IF;
+        IF tiebreak_col IS NOT NULL AND tiebreak_col IS DISTINCT FROM cat.tiebreak_col THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'naming', 'ERROR', format('you declared tiebreak_col %I, the catalogue says %s', tiebreak_col, coalesce(cat.tiebreak_col::text, 'none'));
+            cat.tiebreak_col := tiebreak_col;
+        END IF;
+        IF tenant_col IS NOT NULL AND tenant_col IS DISTINCT FROM cat.tenant_col THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'naming', 'ERROR', format('you declared tenant_col %I, the catalogue says %s', tenant_col, coalesce(cat.tenant_col::text, 'none (public)'));
+            cat.tenant_col := tenant_col;
+        END IF;
+        RETURN QUERY SELECT 'catalogue', 'ok',
+            format('%s: %s; version_col=%s tombstone_col=%s tiebreak_col=%s generations=%s', tname,
+                   CASE WHEN cat.tenant_col IS NULL THEN 'public (' || cat.public_reason || ')'
+                        ELSE 'tenant-scoped on ' || cat.tenant_col END,
+                   cat.version_col, coalesce(cat.tombstone_col::text, '∅'),
+                   coalesce(cat.tiebreak_col::text, '∅'), cat.generations);
+    END IF;
+
+    -- ── 2. writers: who holds INSERT AND UPDATE (the bridge's writability verdict) ─
+    SELECT array_agg(rolname ORDER BY rolname) INTO writers
+    FROM pg_roles r
+    WHERE NOT r.rolsuper AND r.rolcanlogin AND r.rolname <> owner
+      AND has_table_privilege(r.rolname, tbl, 'INSERT')
+      AND has_table_privilege(r.rolname, tbl, 'UPDATE');
+    want_writable := CASE intent WHEN 'writable' THEN true
+                                 WHEN 'read_only' THEN false
+                                 ELSE writers IS NOT NULL END;
+    IF tname = 'zebridge_gc_watermark' THEN
+        -- Bridge-owned: the sweeper writes it through the writer role, every client
+        -- reads it, nobody edge-writes it (the ingress refuses it by name).
+        RETURN QUERY SELECT 'writers', 'NOTE', 'bridge-owned: written by the sweeper, never edge-writable; the writer grant is by design';
+        want_writable := false;
+    ELSIF intent = 'writable' AND writers IS NULL THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'writers', 'ERROR',
+            'declared writable, but no login role holds INSERT+UPDATE on it: every edge write '
+            'will be refused. zebridge_enable(..., writable => true) grants the writer role';
+    ELSIF intent = 'read_only' AND writers IS NOT NULL THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'writers', 'ERROR',
+            format('declared read_only, but %s hold INSERT+UPDATE: the bridge would publish it as '
+                   'writable and accept edge writes. REVOKE, or declare it writable', writers);
+    ELSE
+        RETURN QUERY SELECT 'writers', 'ok',
+            CASE WHEN writers IS NULL THEN 'read-only: no login role holds INSERT+UPDATE'
+                 ELSE format('writable by %s', writers) END;
+    END IF;
+
+    -- ── 3. key and replica identity ─────────────────────────────────────────
+    SELECT array_agg(a.attname ORDER BY k.n) INTO pkcols
+    FROM pg_index i
+    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON true
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+    WHERE i.indrelid = tbl AND i.indisprimary;
+    ident := (SELECT relreplident FROM pg_class WHERE oid = tbl);
+    IF pkcols IS NULL THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'primary key', 'ERROR',
+            'no primary key: rows cannot be identified, so the bridge refuses the table '
+            '(no_primary_key) and publishes a suspension. Add one with a migration';
+    ELSE
+        RETURN QUERY SELECT 'primary key', 'ok', format('(%s)', array_to_string(pkcols, ', '));
+        seq_key := EXISTS (
+            SELECT 1 FROM pg_attribute a
+            LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+            WHERE a.attrelid = tbl AND a.attname = ANY (pkcols)
+              AND (a.attidentity <> '' OR pg_get_expr(d.adbin, d.adrelid) LIKE 'nextval%'));
+        IF seq_key AND want_writable THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'key allocation', 'ERROR',
+                'the primary key is database-allocated (serial/identity): a client-minted key does '
+                'not advance the sequence and would later collide with the application''s own inserts, '
+                'so edge writes are refused (DbAllocatedKey). Use a uuid key, or drop the DEFAULT';
+        ELSIF seq_key THEN
+            RETURN QUERY SELECT 'key allocation', 'NOTE',
+                'sequence-backed primary key: fine read-only; would refuse edge writes if made writable';
+        END IF;
+    END IF;
+    IF ident = 'n' THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'replica identity', 'ERROR',
+            'REPLICA IDENTITY NOTHING: UPDATE and DELETE carry no key on the wire. '
+            'ALTER TABLE ... REPLICA IDENTITY DEFAULT (or USING INDEX)';
+    ELSIF ident = 'd' AND pkcols IS NULL THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'replica identity', 'ERROR',
+            'REPLICA IDENTITY DEFAULT with no primary key is no identity at all';
+    ELSE
+        IF ident = 'i' THEN
+            SELECT array_agg(a.attname ORDER BY k.n) INTO idx_cols
+            FROM pg_index i
+            JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS k(attnum, n) ON true
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+            WHERE i.indrelid = tbl AND i.indisreplident;
+        END IF;
+        RETURN QUERY SELECT 'replica identity', 'ok',
+            CASE ident WHEN 'd' THEN 'DEFAULT (the primary key)'
+                       WHEN 'f' THEN 'FULL'
+                       WHEN 'i' THEN format('USING INDEX (%s)', array_to_string(idx_cols, ', ')) END;
+        -- A tenant-scoped table must carry its tenant in the identity, or UPDATE/DELETE
+        -- arrive without it and are refused at the source (NOTES §1.8).
+        IF cat.tenant_col IS NOT NULL THEN
+            IF ident = 'f' OR (ident = 'd' AND cat.tenant_col = ANY (pkcols))
+               OR (ident = 'i' AND cat.tenant_col = ANY (idx_cols)) THEN
+                RETURN QUERY SELECT 'tenant in identity', 'ok', format('%s is part of the replica identity', cat.tenant_col);
+            ELSE
+                errors := errors + 1;
+                RETURN QUERY SELECT 'tenant in identity', 'ERROR',
+                    format('%s is not in the replica identity: UPDATE/DELETE would arrive without a tenant '
+                           'and be refused. CREATE UNIQUE INDEX ... (%s, %s) and REPLICA IDENTITY USING INDEX',
+                           cat.tenant_col, cat.tenant_col, array_to_string(pkcols, ', '));
+            END IF;
+        END IF;
+    END IF;
+
+    IF cat.tenant_col IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM pg_attribute WHERE attrelid = tbl AND attname = cat.tenant_col AND NOT attisdropped) THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'tenant column', 'ERROR', format('%s has no column %I', tname, cat.tenant_col);
+    END IF;
+
+    -- ── 4. publication ──────────────────────────────────────────────────────
+    SELECT array_agg(pubname ORDER BY pubname) INTO pubs
+    FROM pg_publication_tables WHERE schemaname = 'public' AND tablename = tname;
+    IF pubs IS NULL THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'publication', 'ERROR',
+            'in no publication: no WAL row ever reaches a bridge. zebridge_enable(..., publication => ''<name>'')';
+    ELSE
+        RETURN QUERY SELECT 'publication', 'ok', format('published by %s', pubs);
+    END IF;
+
+    -- ── 5. the version column (last-write-wins) ─────────────────────────────
+    vname := coalesce(cat.version_col, 'updated_at');
+    SELECT a.attname, t.typname, a.atttypmod, a.attnotnull INTO vcol
+    FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = tbl AND a.attname = vname AND NOT a.attisdropped;
+    IF NOT FOUND THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'version column', 'ERROR',
+            format('%s has no column %I: the table is outbound-only, and a writable one refuses every write', tname, vname);
+    ELSIF vcol.typname NOT IN ('timestamp', 'timestamptz', 'int4', 'int8') THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'version column', 'ERROR',
+            format('%I is %s: a version must be a timestamp or an integer to be compared', vname, vcol.typname);
+    ELSE
+        IF vname IN ('inserted_at', 'created_at') THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'version column', 'ERROR',
+                format('%I is a creation stamp: it never changes, so no update can ever win', vname);
+        ELSE
+            RETURN QUERY SELECT 'version column', 'ok', format('%I %s%s', vname, vcol.typname,
+                CASE WHEN vcol.attnotnull THEN ' NOT NULL' ELSE '' END);
+        END IF;
+        IF vcol.typname = 'timestamp' THEN
+            warns := warns + 1;
+            RETURN QUERY SELECT 'version column', 'WARNING',
+                format('%I is a naive timestamp: two clients in two zones disagree on order. Prefer timestamptz', vname);
+        END IF;
+        IF vcol.typname IN ('timestamp', 'timestamptz') AND vcol.atttypmod BETWEEN 0 AND 5 THEN
+            warns := warns + 1;
+            RETURN QUERY SELECT 'version column', 'WARNING',
+                format('%I keeps %s fractional digits: versions issued within the same instant collide. Use precision 6', vname, vcol.atttypmod);
+        END IF;
+        IF NOT vcol.attnotnull THEN
+            warns := warns + 1;
+            RETURN QUERY SELECT 'version column', 'WARNING',
+                format('%I is nullable: a NULL version never wins a comparison. Add NOT NULL DEFAULT now()', vname);
+        END IF;
+    END IF;
+
+    -- ── 6. the tombstone (soft delete, PROTOCOL §7.5) ───────────────────────
+    IF cat.tombstone_col IS NOT NULL THEN
+        SELECT a.attname, t.typname, a.attnotnull INTO tcol
+        FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+        WHERE a.attrelid = tbl AND a.attname = cat.tombstone_col AND NOT a.attisdropped;
+        IF NOT FOUND THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'tombstone', 'ERROR', format('tombstone_col %I does not exist on %s', cat.tombstone_col, tname);
+        ELSIF tcol.attnotnull THEN
+            errors := errors + 1;
+            RETURN QUERY SELECT 'tombstone', 'ERROR', format('%I is NOT NULL: a tombstone must be NULL for a live row', cat.tombstone_col);
+        ELSE
+            RETURN QUERY SELECT 'tombstone', 'ok', format('%I %s', cat.tombstone_col, tcol.typname);
+        END IF;
+    ELSIF want_writable AND allow_physical_deletes THEN
+        warns := warns + 1;
+        RETURN QUERY SELECT 'tombstone', 'WARNING',
+            'physical deletes ACCEPTED: a hard-deleted row resurrects on a fresh seed until the next full '
+            '(the producer forces one when rows were deleted, §10bb) — stated, not refused';
+    ELSIF want_writable THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'tombstone', 'ERROR',
+            'writable without a tombstone_col: DELETEs are physical, inexpressible in a generation delta, '
+            'and hard-deleted rows resurrect on every fresh seed. Add deleted_at timestamptz and declare it '
+            '(or accept it explicitly: allow_physical_deletes => true, and say so in the intent)';
+    ELSE
+        RETURN QUERY SELECT 'tombstone', 'NOTE', 'none: read-only, physical deletes forwarded as deletes';
+    END IF;
+
+    -- ── 7. the tiebreak column ──────────────────────────────────────────────
+    IF cat.tiebreak_col IS NOT NULL THEN
+        IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = tbl AND attname = cat.tiebreak_col AND NOT attisdropped) THEN
+            RETURN QUERY SELECT 'tiebreak', 'ok', format('%I (equal versions resolved by writer id)', cat.tiebreak_col);
+        ELSE
+            errors := errors + 1;
+            RETURN QUERY SELECT 'tiebreak', 'ERROR', format('tiebreak_col %I does not exist on %s', cat.tiebreak_col, tname);
+        END IF;
+    ELSIF want_writable THEN
+        RETURN QUERY SELECT 'tiebreak', 'NOTE', 'none: two writes with the same version are refused rather than resolved';
+    END IF;
+
+    -- ── 8. the guards zebridge_enable installs ──────────────────────────────
+    -- The width guard is a trigger only where a row CAN outgrow the budget; a table whose
+    -- widest possible row already fits is statically safe and zebridge_install_width_guard
+    -- leaves it alone on purpose (no hot-path cost) — so "no trigger" is a finding only on
+    -- an unbounded table. The width check (9) computes the same number.
+    SELECT min(max_row_bytes) INTO budget FROM public.zebridge_limits;
+    widest := public.zebridge_widest_row(tbl);
+    IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = tbl AND tgname = 'zebridge_width_guard') THEN
+        RETURN QUERY SELECT 'width guard', 'ok', 'zebridge_width_guard trigger present';
+    ELSIF budget IS NOT NULL AND widest <= budget THEN
+        RETURN QUERY SELECT 'width guard', 'NOTE', format('bounded (widest possible row %s ≤ %s): statically safe, no trigger needed', widest, budget);
+    ELSE
+        warns := warns + 1;
+        RETURN QUERY SELECT 'width guard', 'WARNING',
+            'no zebridge_width_guard trigger on an unbounded table: an oversized row is caught by the bridge '
+            '(table suspended) instead of by PostgreSQL (statement refused). zebridge_enable installs it';
+    END IF;
+    IF want_writable AND cat.tombstone_col IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = tbl AND tgname = 'zebridge_soft_delete_t') THEN
+        warns := warns + 1;
+        RETURN QUERY SELECT 'write guards', 'WARNING',
+            'no zebridge_soft_delete_t trigger: a DELETE from psql is physical here even though the table has a '
+            'tombstone. zebridge_install_write_guards(...) turns it into a soft delete';
+    END IF;
+
+    -- ── 9. width against the narrowest registered bridge ────────────────────
+    IF budget IS NULL THEN
+        RETURN QUERY SELECT 'row width', 'NOTE',
+            format('widest possible row %s bytes; no bridge has registered its budget yet (zebridge_limits is empty)', widest);
+    ELSIF widest > budget THEN
+        errors := errors + 1;
+        RETURN QUERY SELECT 'row width', 'ERROR',
+            format('widest possible row %s bytes exceeds the narrowest bridge budget %s (BASE_BUF): such a row suspends the table', widest, budget);
+    ELSE
+        RETURN QUERY SELECT 'row width', 'ok', format('widest possible row %s bytes within the %s budget', widest, budget);
+    END IF;
+
+    -- ── 10. the chain ───────────────────────────────────────────────────────
+    IF have_cat AND cat.generations THEN
+        IF EXISTS (SELECT 1 FROM public.zebridge_generations g WHERE g.tbl = tname) THEN
+            RETURN QUERY SELECT 'generations', 'ok', 'a chain exists: fresh clients seed from it';
+        ELSE
+            RETURN QUERY SELECT 'generations', 'NOTE', 'no chain yet: the producer builds one at its next tick, once a bridge runs';
+        END IF;
+    END IF;
+
+    RETURN QUERY SELECT 'summary', CASE WHEN errors > 0 THEN 'ERROR' WHEN warns > 0 THEN 'WARNING' ELSE 'ok' END,
+        format('%s: %s error(s), %s warning(s)%s', tname, errors, warns,
+               CASE WHEN intent IS NOT NULL THEN ' against intent ' || intent ELSE '' END);
+END $$ LANGUAGE plpgsql STABLE;
+
+-- The intent map, in one call. Every table you name is checked against what you
+-- said; every catalogue table you did NOT name is an ERROR — the map is the whole
+-- intent unless `partial` says it is a subset. Exits are the caller's: in psql,
+--   SELECT * FROM zebridge_check_all('{"users":"read_only","orders":"writable"}')
+--   WHERE status = 'ERROR';   -- an empty result is a clean bill
+CREATE OR REPLACE FUNCTION public.zebridge_check_all(
+    spec    jsonb,
+    partial boolean DEFAULT false
+) RETURNS TABLE (tbl text, check_name text, status text, detail text) AS $$
+DECLARE
+    k text;
+    v text;
+    rc regclass;
+BEGIN
+    IF jsonb_typeof(spec) <> 'object' THEN
+        RAISE EXCEPTION 'zebridge_check_all: spec must be a JSON object {"table": "read_only"|"writable"}';
+    END IF;
+    -- A value is either the mode as a string — "writable" — or an object naming the
+    -- columns too: {"mode":"writable","version":"updated_at","tombstone":"deleted_at",
+    -- "tiebreak":"last_writer","tenant":"tenant_id","physical_deletes":true}.
+    FOR k, v IN SELECT key, value::text FROM jsonb_each(spec) ORDER BY key LOOP
+        rc := to_regclass(k);
+        IF rc IS NULL THEN
+            RETURN QUERY SELECT k, 'exists'::text, 'ERROR'::text, format('no such table %s', k);
+            CONTINUE;
+        END IF;
+        IF jsonb_typeof(spec -> k) = 'object' THEN
+            RETURN QUERY SELECT k, c.check_name, c.status, c.detail
+            FROM public.zebridge_check(rc,
+                spec -> k ->> 'mode',
+                (spec -> k ->> 'version')::name,
+                (spec -> k ->> 'tombstone')::name,
+                (spec -> k ->> 'tiebreak')::name,
+                (spec -> k ->> 'tenant')::name,
+                coalesce((spec -> k ->> 'physical_deletes')::boolean, false)) c;
+        ELSE
+            RETURN QUERY SELECT k, c.check_name, c.status, c.detail FROM public.zebridge_check(rc, spec ->> k) c;
+        END IF;
+    END LOOP;
+    IF NOT partial THEN
+        RETURN QUERY
+            SELECT c.tbl, 'declared'::text, 'ERROR'::text,
+                   format('%s is in zebridge_catalogue but not in your intent map: undeclared tables are the ones people forget', c.tbl)
+            FROM public.zebridge_catalogue c
+            WHERE NOT spec ? c.tbl AND NOT public.zebridge_is_internal_table(c.tbl)
+            ORDER BY c.tbl;
+    END IF;
+END $$ LANGUAGE plpgsql STABLE;

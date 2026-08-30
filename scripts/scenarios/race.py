@@ -36,23 +36,28 @@ Usage:  python scripts/scenarios/race.py   (admin ZB_PSQL; NATS_CREDS=bridge)
 
 import asyncio
 import datetime
-import json
 import os
+import pathlib
 import subprocess
+import sys
+import time
 
 import msgpack
 
 import zb
 
-import time
 RUN = str(int(time.time()))  # msgid namespace: JetStream dedups Nats-Msg-Id inside the
 # duplicate window — static ids made every rerun's publishes silent no-ops (PubAck
 # duplicate=true, nothing stored) and scored 24/24-wrong with zero real writes.
 
 LOG = "/tmp/zb_race_bridge.log"
-NATS_PID_FILE = "scripts/native/nats-server.pid"
-NATS_CONF = "scripts/native/nats-server-jwt.conf"
 N_WRITERS = 24
+TABLE = "counter_public"
+# The writers' identity: the creds file names the principal, and the subject must carry
+# the same name or NATS refuses the publish (a refusal that surfaces as a timeout).
+ADVERSARY_CREDS = os.environ.get("ADVERSARY_CREDS", "scripts/native/creds/omar.creds")
+ADVERSARY = pathlib.Path(ADVERSARY_CREDS).stem
+SUBJECT = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], ADVERSARY, TABLE, "update")
 
 
 def now_v():
@@ -64,7 +69,7 @@ async def one_write(js, uid, value, msgid, raw=None):
         {"key": {"uid": uid}, "version": now_v(), "client_id": f"c-{value}",
          "data": {"uid": uid, "value": value, "updated_at": now_v()}})
     try:
-        ack = await js.publish("mutation.omar.counter_public.update", payload, headers={"Nats-Msg-Id": msgid})
+        ack = await js.publish(SUBJECT, payload, headers={"Nats-Msg-Id": msgid})
         if getattr(ack, "duplicate", False):
             return f"duplicate msgid {msgid}: PubAck ok but message NOT stored"
         return None
@@ -74,9 +79,7 @@ async def one_write(js, uid, value, msgid, raw=None):
 
 async def main():
     failed = 0
-    running = subprocess.run(["pgrep", "-f", "zig-out/bin/bridge"], capture_output=True, text=True)
-    if running.stdout.strip():
-        import sys
+    if zb.another_bridge_running():
         sys.exit("another bridge is already running — this scenario owns the only bridge")
 
     zb.psql("DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='zb_probe' AND NOT active) "
@@ -103,20 +106,18 @@ async def main():
                           "VALUES (gen_random_uuid(), 0, now(), now()) RETURNING uid", quiet=True).strip()
             uid = out.splitlines()[0].strip() if out else ""
             if not uid:
-                import sys; sys.exit("could not mint a counter_public key — check the table")
+                sys.exit("could not mint a counter_public key — check the table")
             keys.append(uid)
 
-        os.environ["NATS_CREDS"] = os.environ.get("ADVERSARY_CREDS", "scripts/native/creds/omar.creds")
-        os.environ["NATS_URL"] = "nats://127.0.0.1:4222"
         # the shared broker may still be settling from a prior scenario's restart —
         # wait for it before the writers connect (a ConnectionRefused here scored
         # the concurrency test 24/24-wrong when the real cause was "broker not up").
         for _ in range(20):
             try:
-                probe = await zb.connect(); await probe.close(); break
+                probe = await zb.connect_as(ADVERSARY); await probe.close(); break
             except Exception:
                 await asyncio.sleep(1)
-        nc = await zb.connect()
+        nc = await zb.connect_as(ADVERSARY)
         js = nc.jetstream()
 
         # ── 1. concurrent writers, distinct keys, each its final value ────────
@@ -183,9 +184,11 @@ async def main():
         await nc.close()
 
         # ── 4. the audit ──────────────────────────────────────────────────────
-        pids = subprocess.run(["pgrep", "-f", "bridge --slot zb_probe"], capture_output=True, text=True).stdout.split()
-        if pids:
-            rep = subprocess.run(["leaks", "--nocontext", pids[0]], capture_output=True, text=True).stdout
+        if not zb.leaks_available():
+            print("  ⓘ  `leaks` not available on this host — memory audit skipped")
+        else:
+            rep = subprocess.run(["leaks", "--nocontext", str(bridge.proc.pid)],
+                                 capture_output=True, text=True).stdout
             if "0 leaks for 0 total leaked bytes" in rep:
                 zb.ok("after the concurrency storm: `leaks` reports 0")
             else:

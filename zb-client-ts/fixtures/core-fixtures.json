@@ -275,6 +275,49 @@
           "dict": "t-g1-dict"
         }
       ]
+    },
+    {
+      "name": "a chain rebuilt AFTER the watermark (fresh full, no deltas) is unreachable: walk from its full",
+      "manifest": {
+        "gen": 1,
+        "bucket": "gen-kilo",
+        "cutoff_seq": 3,
+        "cdc_stream": "CDC_kilo",
+        "cutoff_version": "2026-08-30 00:10:00+00",
+        "version_column": "updated_at",
+        "full": {
+          "gen": 1,
+          "object": "test_types-g1-full",
+          "cutoff": "2026-08-30 00:10:00+00"
+        },
+        "deltas": []
+      },
+      "watermark": "2026-08-29 20:00:00+00",
+      "plan": [
+        {
+          "name": "test_types-g1-full",
+          "kind": "full"
+        }
+      ]
+    },
+    {
+      "name": "a chain whose full predates the watermark with nothing newer is reached: nothing to apply",
+      "manifest": {
+        "gen": 4,
+        "bucket": "gen-kilo",
+        "cutoff_seq": 900,
+        "cdc_stream": "CDC_kilo",
+        "cutoff_version": "2026-08-29 19:00:00+00",
+        "version_column": "updated_at",
+        "full": {
+          "gen": 4,
+          "object": "test_types-g4-full",
+          "cutoff": "2026-08-29 19:00:00+00"
+        },
+        "deltas": []
+      },
+      "watermark": "2026-08-29 20:00:00+00",
+      "plan": []
     }
   ],
   "fullPredates": [
@@ -526,6 +569,59 @@
       ],
       "tablesToSeed": [
         "users"
+      ]
+    },
+    {
+      "name": "stream recreated under the client (lost slot): position beyond last_seq is a gap",
+      "streams": {
+        "CDC_kilo": {
+          "firstSeq": 1,
+          "stored": 2828,
+          "lastSeq": 12
+        },
+        "CDC_PUBLIC": {
+          "firstSeq": 62174,
+          "stored": 62179,
+          "lastSeq": 62300
+        }
+      },
+      "tables": {
+        "salaries": {
+          "route": "CDC_kilo",
+          "seeded": true
+        },
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_kilo"
+      ],
+      "tablesToSeed": [
+        "salaries"
+      ]
+    },
+    {
+      "name": "an empty recreated stream (last_seq 0) with a position is a gap too",
+      "streams": {
+        "CDC_kilo": {
+          "firstSeq": 0,
+          "stored": 7,
+          "lastSeq": 0
+        }
+      },
+      "tables": {
+        "salaries": {
+          "route": "CDC_kilo",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_kilo"
+      ],
+      "tablesToSeed": [
+        "salaries"
       ]
     }
   ],

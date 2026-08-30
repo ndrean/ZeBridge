@@ -1323,6 +1323,29 @@ and its clients get a suspension, never a bare subject that blocks the publisher
 `zebridge_enable` prints the bridge side as its `T3 bridge LIVE` step; `T4 nats conf`
 is the one step that stays outside the database.
 
+### Checking a table against the bridge's rules
+
+After a migration, before (or without) a bridge, ask the database itself — the same
+questions the bridge's preflight asks, from the same source of truth:
+
+```sql
+SELECT * FROM zebridge_check('orders', 'writable');
+SELECT * FROM zebridge_check('orders', 'writable', 'updated_at', 'deleted_at', 'last_writer', 'tenant_id');
+SELECT * FROM zebridge_check_all('{"users": "read_only",
+  "orders": {"mode": "writable", "version": "updated_at", "tombstone": "deleted_at",
+             "tiebreak": "last_writer", "tenant": "tenant_id"},
+  "audit":  {"mode": "writable", "physical_deletes": true}}')   -- accepted, so a WARNING not an ERROR
+WHERE status = 'ERROR';           -- an empty result is a clean bill
+```
+
+`intent` is what you *mean* the table to be; the check compares it with the grants (who
+holds INSERT+UPDATE) and with the catalogue row. Naming the columns makes it a
+pre-migration check: a declared name that disagrees with the catalogue is a finding, and
+a table with no row yet is checked against the names you gave. `zebridge_check_all`
+treats every catalogue table you did not name as an ERROR — the ones people forget —
+unless you pass `partial => true`. `scripts/zbdoctor.py --intent intent.json` runs the
+same map and adds the live gates (bridge, streams, KV, chains).
+
 ## Monitoring & Telemetry
 
 The bridge provides telemetry through multiple channels:

@@ -23,12 +23,15 @@ The three, and why the difference is not cosmetic:
 
 Usage:  python scripts/scenarios/replies.py [table]
 
-Needs the bridge running with the table's SYNC_RULES entry (a tombstone column is required
-to produce `row_deleted` without a physical delete).
+    NATS_CREDS=scripts/native/creds/omar.creds python scripts/scenarios/replies.py
+
+Runs as a CLIENT principal. Needs the bridge running and the table's version and
+tombstone columns declared in `zebridge_catalogue` — the tombstone is what produces
+`row_deleted` without a physical delete.
 """
 
 import asyncio
-import os
+import json
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,19 +40,6 @@ import msgpack
 import zb
 
 TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
-
-
-def principal() -> str:
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
-
-
-def rules() -> list[str]:
-    entry = next(
-        (r for r in os.environ.get("SYNC_RULES", "").split(";") if r.strip().startswith(f"{TABLE}:")),
-        None,
-    )
-    return [c.strip() for c in entry.split(":", 1)[1].split(",")] if entry else []
 
 
 def iso(dt: datetime) -> str:
@@ -64,15 +54,9 @@ def pg_now() -> datetime:
 
 async def main():
     failed = 0
-    who = principal()
-    cols = rules()
-    if len(cols) < 2:
-        sys.exit(
-            f"'{TABLE}' has no tombstone column in SYNC_RULES, so `row_deleted` cannot be\n"
-            f"  produced without a physical delete.\n"
-            f"    SYNC_RULES={TABLE}:updated_at,deleted_at,last_writer"
-        )
-    version_col, tombstone_col = cols[0], cols[1]
+    who = zb.require_principal()
+    r = zb.require_rules(TABLE, "version", "tombstone")
+    version_col, tombstone_col = r["version"], r["tombstone"]
 
     required = [
         c for c in zb.psql(
@@ -80,22 +64,23 @@ async def main():
             f"WHERE table_name='{TABLE}' AND is_nullable='NO' AND column_default IS NULL"
         ).splitlines() if c
     ]
-    tenant = zb.psql(
-        f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal='{who}' LIMIT 1"
-    ).strip()
+    tenant = zb.tenant_of(who)
 
-    nc = await zb.connect()
+    nc = await zb.connect_as(who)
     js = nc.jetstream()
     verdicts: dict[str, dict] = {}
     ack_prefix = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
     sub = await nc.subscribe(f"{ack_prefix}.{who}.*")
 
     async def collect():
+        # Verdicts are JSON on the wire (PROTOCOL.md): accepted / stale / row_deleted /
+        # rejected / failed. An undecodable one is recorded, not dropped — silence and a
+        # garbled reply are different failures.
         async for m in sub.messages:
             try:
-                verdicts[m.subject.rsplit(".", 1)[-1]] = zb.decode(m.data)
-            except Exception:  # noqa: BLE001
-                pass
+                verdicts[m.subject.rsplit(".", 1)[-1]] = json.loads(m.data.decode())
+            except Exception as err:  # noqa: BLE001
+                verdicts[m.subject.rsplit(".", 1)[-1]] = {"status": "<undecodable>", "error": str(err)}
 
     task = asyncio.create_task(collect())
     await asyncio.sleep(0.5)

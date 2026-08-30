@@ -20,7 +20,7 @@ Four things, in order of what they would cost if wrong:
 
 Usage:  python scripts/scenarios/telemetry.py [base_url]
 
-  telemetry.py                        # http://127.0.0.1:9090
+  telemetry.py                        # the long-running bridge (zb.http_base(): BRIDGE_PORT, default 9090)
   telemetry.py http://otherhost:9090
 """
 
@@ -33,7 +33,7 @@ import urllib.request
 
 import zb
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9090"
+BASE = sys.argv[1] if len(sys.argv) > 1 else zb.http_base()
 HOST = BASE.split("://")[1].split(":")[0]
 PORT = int(BASE.rsplit(":", 1)[1])
 
@@ -190,15 +190,9 @@ async def main():
             failed += 1
         else:
             print("  ⓘ  prometheus is running but has no zebridge job")
-
-        # ⚠️ Not a failure. telemetry/prometheus.yml lists both `bridge:9090` (in-compose)
-        # and `host.docker.internal:9090` (bridge on the host), so exactly one is always
-        # down by design. Reporting it would train an operator to ignore this check.
-        down = [t for t in zb_targets if t["health"] != "up"]
-        if down and up:
-            print(f"  ⓘ  {len(down)} other target(s) down, as expected: the config lists both the")
-            print("     in-compose and on-host addresses, and only one can be right at a time")
     except Exception:  # noqa: BLE001
+        # Skip, not fail: Prometheus is the deploy's concern (a VPS process behind
+        # HAProxy), not the bridge's, and this check only reports on it when it is here.
         print("  ⓘ  prometheus not reachable on :9091 — skipping (not a bridge failure)")
 
     return 1 if failed else 0

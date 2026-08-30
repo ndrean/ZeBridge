@@ -3,23 +3,31 @@
 
 Loads the Zig-built C library (zig-out/lib/libzbcore.*) and runs
 zb-client-ts/fixtures/core-fixtures.json against it: the SAME file the
-TypeScript core is pinned by. A section the library does not implement yet is
-reported as SKIP, loudly — silence is how ports rot.
+TypeScript core is pinned by. A section the library does not implement — no
+dispatcher here, or "unknown fn" from the library — is a FAILURE: silence is how
+ports rot. `--allow-skip` downgrades that to a loud SKIP for exploratory runs.
 
-    cd libzb && zig build && python3 python/runner.py
+    cd libzb && zig build && python3 python/runner.py [--allow-skip]
 """
+import argparse
 import ctypes
 import json
-import platform
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-LIB_DIR = HERE.parent / "zig-out" / "lib"
-FIXTURES = HERE.parent.parent / "zb-client-ts" / "fixtures" / "core-fixtures.json"
+from _env import load_lib
 
-ext = {"Darwin": ".dylib", "Linux": ".so", "Windows": ".dll"}[platform.system()]
-lib = ctypes.CDLL(str(LIB_DIR / f"libzbcore{ext}"))
+ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument("--allow-skip", action="store_true",
+                help="report an unported section as SKIP instead of failing (exploratory use)")
+ALLOW_SKIP = ap.parse_args().allow_skip
+
+HERE = Path(__file__).resolve().parent
+FIXTURES = HERE.parent.parent / "zb-client-ts" / "fixtures" / "core-fixtures.json"
+if not FIXTURES.exists():
+    sys.exit(f"fixtures missing: {FIXTURES}")
+
+lib = load_lib()
 lib.zb_call.restype = ctypes.c_void_p
 lib.zb_call.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 lib.zb_free.argtypes = [ctypes.c_void_p]
@@ -79,17 +87,28 @@ def _norm(section, v):
 
 passed = failed = 0
 skipped: list[str] = []
+
+
+def unported(label: str) -> None:
+    """An unported section fails the run unless --allow-skip asked for a SKIP."""
+    global failed
+    skipped.append(label)
+    if not ALLOW_SKIP:
+        failed += 1
+        print(f"✗ not ported: {label}")
+
+
 for section, cases in fx.items():
     if section.startswith("_"):
         continue
     if section not in SECTIONS:
-        skipped.append(f"{section} ({len(cases)})")
+        unported(f"{section} ({len(cases)}) [no dispatcher in runner.py]")
         continue
     build, expect = SECTIONS[section]
     for c in cases:
         got = call(section, build(c))
         if isinstance(got, dict) and got.get("error") == "unknown fn":
-            skipped.append(f"{section} ({len(cases)}) [lib]")
+            unported(f"{section} ({len(cases)}) [unknown fn in the library]")
             break
         want = expect(c)
         got = _norm(section, got)
@@ -105,5 +124,6 @@ for section, cases in fx.items():
 print(f"\n# pass {passed}")
 print(f"# fail {failed}")
 if skipped:
-    print(f"# SKIP (not yet ported): {', '.join(skipped)}")
+    tag = "SKIP (--allow-skip)" if ALLOW_SKIP else "FAILED as not ported"
+    print(f"# {tag}: {', '.join(skipped)}")
 sys.exit(1 if failed else 0)

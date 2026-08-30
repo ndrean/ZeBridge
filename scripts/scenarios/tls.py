@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """`nats.zig` speaks TLS — the capability that makes bridge/NATS colocation a choice.
 
+OPTIONAL. The shipped topology colocates the bridge and `nats-server` on one VPS, so
+TLS between them is unused for now; this stays as the proof that a remote topology is
+available when wanted. Listed under `manual` in run.py, never in the battery.
+
 The v1.0 topology colocates the bridge and `nats-server` on one VPS because the Zig
 client historically had no TLS ("no link to encrypt" was the mitigation, not the goal).
 Upstream `nats.zig` now ships TLS (server-authenticated and mutual, via tls.zig), which
 reopens remote topologies: a bridge publishing to a distant NATS — e.g. a per-tenant
-leaf holding cadence-built snapshots (NOTES.md §1.12, "Delta generations") — over a
+leaf holding cadence-built generation chains (NOTES.md §1.12, "Delta generations") — over a
 link that is actually encrypted.
 
 ⚠️ The library's own e2e suite already proves core pub/sub over TLS

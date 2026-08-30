@@ -552,14 +552,19 @@ pub fn main(init: std.process.Init) !void {
     // Enrollment/mint (NOTES: the JWT mint flow): armed only when the operator
     // handed over the scoped client signing seed — the bridge is a signer, not a
     // key store: no file I/O, the seed arrives like NATS_BRIDGE_NKEY_SEED always did.
+    // Main-scope lifetime, main-scope release: this used to live forever, which the
+    // allocator audit only reported on an early exit (the lost-slot FATAL, 2026-08-29).
+    var enroll_conninfo: ?[:0]u8 = null;
+    defer if (enroll_conninfo) |p| allocator.free(p);
     if (init.minimal.environ.getPosix("ZB_SIGNING_SEED")) |seed| {
         if (init.minimal.environ.getPosix("ZB_ACCOUNT_PUB")) |acct| {
             if (runtime_config.pg_writer_url) |wurl| {
                 // connect_timeout: a hung PG must cost an enroll permit for
                 // seconds, not forever — the permits are the flood bound.
                 const sep: []const u8 = if (std.mem.indexOfScalar(u8, wurl, '?') != null) "&" else "?";
+                enroll_conninfo = try std.fmt.allocPrintSentinel(allocator, "{s}{s}connect_timeout={d}", .{ wurl, sep, Config.Http.enroll_pg_connect_timeout_seconds }, 0);
                 http_srv.enroll = .{
-                    .writer_conninfo = try std.fmt.allocPrintSentinel(allocator, "{s}{s}connect_timeout={d}", .{ wurl, sep, Config.Http.enroll_pg_connect_timeout_seconds }, 0),
+                    .writer_conninfo = enroll_conninfo.?,
                     .signing_seed = seed,
                     .account_pub = acct,
                 };
@@ -797,6 +802,23 @@ pub fn main(init: std.process.Init) !void {
     // open tenant. That closes the declared half of the routing hole at boot; a
     // tenant born AFTER boot keeps the dyntenant contract — whoever onboards it
     // provisions its streams before the first row.
+    // A NEW slot is a NEW feed (NOTES §10bm). Before the streams are reconciled into
+    // existence: the old ones are deleted, so their numbering restarts and every
+    // client's stored position lands beyond last_seq — the gap rule's third shape.
+    if (replication_ctx.slot_created) {
+        // ⚠️ Opt-in. A new slot alone cannot tell "recovery from a lost slot" from "a
+        // second bridge with its own slot on a live feed" — and the first probe bridge
+        // to boot on a fresh slot wiped the shared streams under a client (measured
+        // 2026-08-29). The lost-slot FATAL names the flag; without it a new slot boots
+        // on the existing streams and says what that risks.
+        if (init.minimal.environ.getPosix("ZB_FEED_RESTART")) |v| if (v.len > 0 and v[0] != '0') {
+            restartFeed(allocator, &publisher, &runtime_config.topology, &pg_config);
+        } else {
+            log.warn("🔁 new replication slot '{s}' on existing streams (ZB_FEED_RESTART=0): if this slot REPLACES a lost one, every change since its loss is missing from the feed and clients resume past the hole — start once with ZB_FEED_RESTART=1 to restart the feed (NOTES §10bm)", .{parsed_args.slot_name});
+        } else {
+            log.warn("🔁 new replication slot '{s}' on existing streams: if this slot REPLACES a lost one, every change since its loss is missing from the feed and clients resume past the hole — start once with ZB_FEED_RESTART=1 to restart the feed (NOTES §10bm)", .{parsed_args.slot_name});
+        }
+    }
     reconcileCdcStreams(allocator, &publisher, &runtime_config.topology) catch |err| {
         log.err("🔴 FATAL: stream reconciliation failed ({s}) — refusing to start rather than FATAL under load.", .{@errorName(err)});
         should_stop.store(true, .seq_cst);
@@ -1570,8 +1592,14 @@ pub fn main(init: std.process.Init) !void {
                                 }
 
                                 if (commit.commit_lsn != last_lsn) {
-                                    const lsn_diff = commit.commit_lsn - last_lsn;
-                                    log.debug("COMMIT: lsn={x} (delta: +{d}, {d} events released)", .{ commit.commit_lsn, lsn_diff, events_released_in_tx });
+                                    // ⚠️ SIGNED. After PostgreSQL severs the stream and the bridge
+                                    // reconnects, replication resumes from the slot's confirmed LSN
+                                    // and replays commits the loop had already seen — commit_lsn
+                                    // BELOW last_lsn. As an unsigned subtraction this was an
+                                    // integer-overflow panic that took the bridge down on every
+                                    // backend kill (found by scripts/scenarios/chaos.py, 2026-08-29).
+                                    const lsn_diff: i128 = @as(i128, commit.commit_lsn) - @as(i128, last_lsn);
+                                    log.debug("COMMIT: lsn={x} (delta: {d}, {d} events released)", .{ commit.commit_lsn, lsn_diff, events_released_in_tx });
                                     last_lsn = commit.commit_lsn;
                                 } else {
                                     log.debug("COMMIT: lsn={x}", .{commit.commit_lsn});
@@ -1872,6 +1900,71 @@ const LiveCatalogue = struct {
         log.info("🗂️ '{s}' is routable now — refusal lifted", .{table});
     }
 };
+
+/// The feed restarts with the slot. When this boot CREATED the replication slot,
+/// nothing between the previous slot's last confirmed LSN and now was ever published
+/// (a lost slot, or an operator's drop), and the CDC streams' numbering would show no
+/// hole for it — a client resuming by position would silently miss every change in
+/// that window. So the streams are deleted (reconcileCdcStreams recreates them, seq 1),
+/// the chain bookkeeping is cleared (the producer's next tick builds a FULL for every
+/// table, with cutoff_seq on the new feed), and the stale manifests are purged so no
+/// client seeds against the old feed's cutoffs in the meantime. Every client then sees
+/// its stored position beyond last_seq, takes the gap, and re-seeds from a fresh full.
+/// Loud, never fatal: a step that fails leaves the previous state, and says so.
+fn restartFeed(
+    allocator: std.mem.Allocator,
+    publisher: anytype,
+    topo: *const topology_mod.Topology,
+    pg_config: *const pg_conn.PgConf,
+) void {
+    const js = if (publisher.js) |*j| j else {
+        log.err("🔁 new replication slot → new feed, but JetStream is unreachable: streams NOT restarted — clients may resume past a hole", .{});
+        return;
+    };
+    var deleted: usize = 0;
+    for (topo.tenants) |tenant| {
+        var name_buf: [256]u8 = undefined;
+        const prefix = topo.cdc_stream_prefix;
+        @memcpy(name_buf[0..prefix.len], prefix);
+        @memcpy(name_buf[prefix.len..][0..tenant.len], tenant);
+        const stream_name = name_buf[0 .. prefix.len + tenant.len];
+        if (publisher.streamExists(stream_name)) {
+            js.deleteStream(stream_name) catch |err| {
+                log.err("🔁 new feed: could not delete {s} ({s}) — its numbering continues, clients on it may miss the hole", .{ stream_name, @errorName(err) });
+                continue;
+            };
+            deleted += 1;
+        }
+    }
+    if (publisher.streamExists(topo.cdc_stream_public)) {
+        js.deleteStream(topo.cdc_stream_public) catch |err| {
+            log.err("🔁 new feed: could not delete {s} ({s})", .{ topo.cdc_stream_public, @errorName(err) });
+        };
+        deleted += 1;
+    }
+    // The producer's memory: no rows → its next tick is a FULL for every table.
+    var rows_cleared = false;
+    if (pg_config.connInfo(allocator, false)) |conninfo| {
+        defer allocator.free(conninfo);
+        if (c.PQconnectdb(conninfo.ptr)) |conn| {
+            defer c.PQfinish(conn);
+            if (c.PQstatus(conn) == c.CONNECTION_OK) {
+                const res = c.PQexec(conn, "DELETE FROM public.zebridge_generations");
+                defer c.PQclear(res);
+                rows_cleared = c.PQresultStatus(res) == c.PGRES_COMMAND_OK;
+                if (!rows_cleared) log.err("🔁 new feed: could not clear zebridge_generations ({s}) — the next chain is a delta against the old feed's cutoff", .{c.PQerrorMessage(conn)});
+            }
+        }
+    } else |_| {}
+    // The stale manifests: gone until the producer republishes on the new feed.
+    var manifests_cleared = false;
+    if (js.kvManager().deleteBucket(topo.kv_generations)) |_| {
+        manifests_cleared = true;
+    } else |err| log.warn("🔁 new feed: could not drop the {s} bucket ({s}) — clients may read a manifest whose cutoff_seq belongs to the old feed until the next tick", .{ topo.kv_generations, @errorName(err) });
+    log.warn("🔁 new replication slot → new feed: {d} CDC stream(s) deleted and recreated below, chain rows {s}, manifests {s} — every client re-seeds from a fresh full (NOTES §10bm)", .{
+        deleted, if (rows_cleared) "cleared" else "KEPT", if (manifests_cleared) "purged" else "KEPT",
+    });
+}
 
 fn reconcileCdcStreams(
     allocator: std.mem.Allocator,

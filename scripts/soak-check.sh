@@ -14,6 +14,7 @@
 #   ALIVE        present with deleted_at IS NULL — a DELETE was dropped, or a row was
 #                resurrected. This is the failure the GC watermark exists to prevent.
 set -euo pipefail
+cd "$(dirname "$0")/.."          # the default ledger path is relative to the repo root
 LEDGER="${1:-libzb/soak-uids.txt}"
 URL="${ADMIN_DATABASE_URL:-postgres://postgres:postgres_password@127.0.0.1:5432/postgres}"
 TABLE="${ZB_SOAK_TABLE:-test_types}"

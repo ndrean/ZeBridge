@@ -31,20 +31,19 @@ the trigger, the WAL, the ring buffer and the KV — which no unit test crosses.
 
 Usage:  python scripts/scenarios/invalidate.py
 
-Needs the bridge running, a live NATS, and admin psql. Restores every schema it changes,
-including on failure.
+Needs the bridge running, a live NATS, admin psql, and NATS_CREDS=bridge.creds (it
+watches `cdc.>`); writes are addressed as ZB_PRINCIPAL or the first mapped principal.
+Restores every schema it changes, including on failure.
 
-⚠️ Act 3's `SCRATCH` fixture stays suspended after its no-PK refusal lifts — for a
-*different* reason (`no_cdc_subject`), not a bug. It was never declared in
-`grammar.json`'s `public_tables`, so its CDC subject has no stream to reach it, and the
-bridge now refuses that at the source instead of hanging on the first publish attempt
-(`src/refused_tables.zig`, found live via this exact scenario). Making it fully resume
-would need `grammar.json` changed and the bridge restarted, which defeats the "no
-restart needed" point this act is making about the no-PK refusal specifically.
+Act 3's `SCRATCH` fixture is declared in `zebridge_catalogue` AFTER the bridge booted:
+the bridge reloads the catalogue live at the commit of any catalogue row (NOTES §10bj),
+so the fixture must be fully routable — CDC_PUBLIC's filter reconciled, its refusal
+lifted, its schema published — with no restart anywhere in this act.
 """
 
 import asyncio
 import json
+import os
 import sys
 import urllib.request
 import uuid
@@ -56,26 +55,27 @@ import zb
 TABLE = "test_types"
 PROBE = "zb_probe"          # the column added and dropped on the live table
 SCRATCH = "zb_invalidate"   # created without a key, fixed, then dropped
-PUB = "my_pub"
-METRICS = "http://127.0.0.1:9090/metrics"
+METRICS = zb.http_base() + "/metrics"
+CDC = zb.TOPOLOGY["subjects"]["cdc_prefix"]
+CDC_PUBLIC = zb.TOPOLOGY["cdc_streams"]["public"]
 
 SETTLE = 3.0  # DDL → trigger → WAL → ring buffer → KV
 
 
-def principal() -> str:
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
-
-
 def kv_get(key: str) -> dict | None:
     """The schemas bucket, read the way a client reads it."""
-    res = zb.nats_cli("kv", "get", "schemas", key, "--raw")
-    if res.returncode != 0 or not res.stdout.strip():
+    raw = zb.kv_get("schemas", key)
+    if not raw:
         return None
     try:
-        return json.loads(res.stdout)
+        return json.loads(raw)
     except json.JSONDecodeError:
         return None
+
+
+def cdc_public_subjects() -> list[str]:
+    r = zb.nats_cli("stream", "info", CDC_PUBLIC, "--json")
+    return json.loads(r.stdout)["config"]["subjects"] if r.returncode == 0 else []
 
 
 def kv_columns(key: str) -> list[str]:
@@ -102,7 +102,16 @@ def version_now() -> str:
 
 async def main():
     failed = 0
-    who = principal()
+    # Connected as the bridge (run.py's role for this scenario: it watches `cdc.>`,
+    # which no client may). The writes are addressed AS a mapped client principal —
+    # ZB_PRINCIPAL, else the first one in zebridge_user_tenants: a name that is data,
+    # never a guessed literal, because an unmapped principal's write is refused by RLS
+    # and every act would then report a cache bug that is not there.
+    who = os.environ.get("ZB_PRINCIPAL") or zb.psql(
+        "SELECT principal FROM public.zebridge_user_tenants ORDER BY principal LIMIT 1", quiet=True
+    ).strip()
+    if not who:
+        sys.exit("no principal to write as: set ZB_PRINCIPAL, or map one in zebridge_user_tenants")
     nc = await zb.connect()
     js = nc.jetstream()
 
@@ -131,7 +140,7 @@ async def main():
 
     cdc_seen: list[str] = []
     cdc_events: list[dict] = []
-    cdc_sub = await nc.subscribe("cdc.>")
+    cdc_sub = await nc.subscribe(f"{CDC}.>")
 
     async def collect_cdc():
         async for m in cdc_sub.messages:
@@ -169,22 +178,21 @@ async def main():
                 d[c] = v
         return d
 
-    # `SCRATCH` is created dynamically here, not declared in `grammar.json:public_tables`
-    # and not tenant-scoped — so `cdc.<SCRATCH>.*` matches no stream's subject filter, and
-    # never can without editing `grammar.json` and restarting the bridge (its own config
-    # is read once at boot, never re-read live — editing `CDC_PUBLIC`'s live subjects
-    # alone does not make the bridge believe the table is routable, and rightly so: an
-    # operator manually widening a stream is not the same as *declaring* a table public).
+    # `SCRATCH` is created dynamically here and declared public in `zebridge_catalogue`
+    # while the bridge runs. A table the catalogue does not carry has no stream its
+    # CDC subject can reach, and the bridge refuses it at the source (`no_cdc_subject`,
+    # `src/refused_tables.zig`) rather than publishing into nothing.
     #
-    # ⚠️ Found live: before the bridge refused this at the source, publishing to an
-    # unrouted subject did not fail fast — it blocked for the full publish timeout, then
-    # reconnected, and retried the identical dead end until the retry budget exhausted
-    # and the bridge self-terminated (`FATAL: stopping bridge to prevent WAL overflow`).
-    # That was the empirical version of the risk SECURITY.md §1.4's migration checklist
-    # warns about. The bridge now refuses such a table immediately
-    # (`no_cdc_subject`, `src/refused_tables.zig`) instead of ever attempting the
-    # publish — which is why act 3 below does not expect `SCRATCH` to resume CDC after
-    # gaining a primary key: it correctly stays suspended, for a different reason.
+    # ⚠️ Found live: before that refusal existed, publishing to an unrouted subject did
+    # not fail fast — it blocked for the full publish timeout, reconnected, and retried
+    # the identical dead end until the retry budget exhausted and the bridge
+    # self-terminated (`FATAL: stopping bridge to prevent WAL overflow`). The empirical
+    # version of the risk SECURITY.md §1.4's migration checklist warns about.
+    #
+    # The catalogue row is the declaration, and the bridge reads it LIVE: the commit of
+    # any `zebridge_catalogue` row reloads the routing, reconciles CDC_PUBLIC's subject
+    # filter, lifts a standing `no_cdc_subject` refusal and publishes the schema
+    # (NOTES §10bj). So act 3 declares `SCRATCH` after boot and expects it fully routed.
 
     try:
         # ══ 0. warm the write path's cache ══════════════════════════════════════
@@ -349,16 +357,28 @@ async def main():
         zb.psql(
             f"CREATE TABLE public.{SCRATCH} (id bigint NOT NULL, name text)", quiet=True
         )
-        # The publication guard refuses an unscoped table; this one is a fixture, and
-        # saying so in `zebridge_public_tables` is the documented way to say it.
+        # The publication guard refuses a table the catalogue does not carry; a
+        # `public_reason` row in `zebridge_catalogue` is the declaration — and the
+        # commit of that row is what the running bridge reloads on.
         zb.psql(
             "INSERT INTO public.zebridge_catalogue (tbl, public_reason) VALUES "
             f"('{SCRATCH}', 'invalidate.py fixture') "
             "ON CONFLICT DO NOTHING",
             quiet=True,
         )
-        zb.psql(f"ALTER PUBLICATION {PUB} ADD TABLE public.{SCRATCH}", quiet=True)
+        zb.psql(f"ALTER PUBLICATION {zb.publication()} ADD TABLE public.{SCRATCH}", quiet=True)
         await asyncio.sleep(SETTLE)
+
+        # The live reload's first visible effect: the stream filter now routes the
+        # fixture, before any question of its key arises.
+        if f"{CDC}.{SCRATCH}.>" in cdc_public_subjects():
+            zb.ok(f"{CDC}.{SCRATCH}.> is in {CDC_PUBLIC}'s subjects — the catalogue row reconciled the stream live")
+        else:
+            zb.bad(
+                f"{CDC}.{SCRATCH}.> missing from {CDC_PUBLIC} after the catalogue INSERT: the "
+                f"bridge did not reload on the row (subjects: {cdc_public_subjects()})"
+            )
+            failed += 1
 
         doc = kv_get(SCRATCH)
         if doc and doc.get("suspended") and doc.get("reason") == "no_primary_key":
@@ -379,34 +399,40 @@ async def main():
         else:
             zb.ok("its events were dropped while refused")
 
-        # The migration that fixes it. No restart, no signal: the DDL event is the signal.
-        #
-        # ⚠️ `SCRATCH`'s catalogue row was written after the bridge booted — deliberately,
-        # it is a throwaway fixture, not a real table anyone should add to the static
-        # config for. So gaining a primary key lifts the `no_primary_key` refusal, but the
-        # table correctly *stays* suspended, now for `no_cdc_subject` (its CDC subject
-        # still has no stream to reach — see the note above `try:`). Expecting it to fully
-        # resume here would mean expecting the bridge to trust a table it was never told
-        # about, which is the exact hole `no_cdc_subject` exists to close.
+        # The migration that fixes it. No restart, no signal: the DDL event is the
+        # signal. The table is declared (catalogue) and routable (stream), so gaining
+        # a key must lift the refusal ENTIRELY — a live schema in KV, nothing
+        # suspended for any reason.
         zb.psql(f"ALTER TABLE public.{SCRATCH} ADD PRIMARY KEY (id)", quiet=True)
         await asyncio.sleep(SETTLE)
 
         doc = kv_get(SCRATCH)
-        if doc and doc.get("suspended") and doc.get("reason") == "no_cdc_subject":
+        if doc and not doc.get("suspended") and "pg" in doc:
+            cols = [c["name"] for c in doc["pg"]["columns"]]
             zb.ok(
-                "the no_primary_key refusal lifted on the fixing migration — no restart "
-                "needed — and it now correctly stays suspended for a different reason: "
-                "declared in the catalogue only after this bridge booted (boot-level derivation)"
+                "the refusal lifted on the fixing migration — no restart — and a live "
+                f"schema was published ({', '.join(cols)})"
             )
-        elif doc and doc.get("suspended") and doc.get("reason") == "no_primary_key":
-            zb.bad(f"'{SCRATCH}' is still suspended for no_primary_key after gaining one: the fix did not take")
+        elif doc and doc.get("suspended"):
+            zb.bad(
+                f"'{SCRATCH}' is still suspended ({doc.get('reason')!r}) after gaining a key: "
+                + ("the fix did not take" if doc.get("reason") == "no_primary_key" else
+                   "the catalogue row was committed while the bridge ran, so it must have "
+                   "reloaded and lifted this itself (NOTES §10bj)")
+            )
             failed += 1
         else:
-            zb.bad(
-                f"'{SCRATCH}' is not suspended for no_cdc_subject as expected (KV said "
-                f"{str(doc)[:80]}) — an undeclared table's CDC subject still has nowhere "
-                "to reach, and should be refused for it"
-            )
+            zb.bad(f"no live schema for '{SCRATCH}' in KV after the fix (KV said {str(doc)[:80]})")
+            failed += 1
+
+        # And the proof that routing is real: a row written now reaches the wire.
+        mark = len(cdc_seen)
+        zb.psql(f"INSERT INTO public.{SCRATCH} (id, name) VALUES (2, 'after the fix')", quiet=True)
+        await asyncio.sleep(SETTLE)
+        if any(s.startswith(f"{CDC}.{SCRATCH}.") for s in cdc_seen[mark:]):
+            zb.ok(f"a row written after the fix arrived on {CDC}.{SCRATCH}.* — routed, live")
+        else:
+            zb.bad(f"no CDC for '{SCRATCH}' after its refusal lifted — declared and keyed, yet unrouted")
             failed += 1
 
         # ══ 4. the table disappears ═════════════════════════════════════════════

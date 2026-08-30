@@ -25,17 +25,18 @@ Three things checked:
 
 Usage:  python scripts/scenarios/tiebreak.py [table]
 
-Needs the table's `SYNC_RULES` entry to carry a third column, and the bridge running with
-it:
-
-    SYNC_RULES=test_types:updated_at,deleted_at,last_writer
+Needs the table's catalogue row to declare a tiebreak column — `zebridge_enable(...,
+tiebreak_col => 'last_writer')` — which the bridge picks up live, no restart. Runs as a
+client principal (`NATS_CREDS=scripts/native/creds/<p>.creds`).
 """
 
 import asyncio
-import os
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
+
+import json
 
 import msgpack
 import zb
@@ -44,31 +45,19 @@ TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
 LOW, HIGH = "c-aaa", "c-zzz"
 
 
-def principal() -> str:
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
-
-
 def version_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
 async def main():
     failed = 0
-    who = principal()
+    who = zb.require_principal()
 
     # ── the configuration this scenario is about ───────────────────────────────
-    rules = os.environ.get("SYNC_RULES", "")
-    entry = next((r for r in rules.split(";") if r.strip().startswith(f"{TABLE}:")), None)
-    cols = entry.split(":", 1)[1].split(",") if entry else []
-    if len(cols) < 3:
-        sys.exit(
-            f"'{TABLE}' has no tiebreak column in SYNC_RULES, so equal versions are refused\n"
-            f"  rather than resolved — which is the safe default, not a bug.\n"
-            f"    SYNC_RULES={TABLE}:updated_at,deleted_at,last_writer\n"
-            "  Add the column, restart the bridge with that value, and re-run."
-        )
-    version_col, client_col = cols[0].strip(), cols[2].strip()
+    # Without a tiebreak column equal versions are REFUSED rather than resolved — the
+    # safe default, not a bug — and require_rules says so and exits.
+    r = zb.require_rules(TABLE, "version", "tiebreak")
+    version_col, client_col = r["version"], r["tiebreak"]
     print(f"version column: {version_col}   tiebreak column: {client_col}\n")
 
     have = zb.psql(
@@ -76,7 +65,7 @@ async def main():
         f"WHERE table_name='{TABLE}' AND column_name='{client_col}'"
     ).strip()
     if not have:
-        sys.exit(f"SYNC_RULES names '{client_col}' but '{TABLE}' has no such column")
+        sys.exit(f"the catalogue names '{client_col}' but '{TABLE}' has no such column")
 
     # Every NOT NULL column with no default must be supplied, or the write is refused for
     # a reason that has nothing to do with ties. Read from the catalog: a hardcoded list
@@ -87,15 +76,23 @@ async def main():
             f"WHERE table_name='{TABLE}' AND is_nullable='NO' AND column_default IS NULL"
         ).splitlines() if c
     ]
-    tenant = zb.psql(
-        f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal='{who}' LIMIT 1"
-    ).strip()
+    tenant = zb.tenant_of(who)
 
-    nc = await zb.connect()
+    nc = await zb.connect_as(who)
     js = nc.jetstream()
     subject = zb.subject(
         zb.TOPOLOGY["subjects"]["mutations_prefix"], who, TABLE, "insert"
     )
+
+    # Every write gets a verdict on `mutation_ack.<who>.<msg_id>` (replies.py); waiting
+    # on it is a bounded wait for THIS write to be judged, not a sleep sized by hope.
+    verdicts: dict[str, dict] = {}
+    ack_prefix = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
+
+    async def on_ack(m):
+        verdicts[m.subject.rsplit(".", 1)[-1]] = json.loads(m.data.decode())
+
+    await nc.subscribe(f"{ack_prefix}.{who}.>", cb=on_ack)
 
     async def write(uid: str, version: str, client_id: str, text: str, forged: str | None = None):
         data = {"uid": uid, "some_text": text, version_col: version, "inserted_at": version}
@@ -107,17 +104,22 @@ async def main():
         # The forgery case: `client_id` set inside `data`, which the bridge must ignore.
         if forged is not None:
             data[client_col] = forged
+        msg_id = f"tie-{client_id}-{uid}"
         await js.publish(
             subject,
             msgpack.packb({"key": {"uid": uid}, "data": data, "version": version, "client_id": client_id}),
-            headers={"Nats-Msg-Id": f"tie-{client_id}-{uid}"},
+            headers={"Nats-Msg-Id": msg_id},
         )
-        await asyncio.sleep(2.5)
+        deadline = time.monotonic() + 10
+        while msg_id not in verdicts and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        if msg_id not in verdicts:
+            zb.bad(f"no verdict for {msg_id} within 10s — the write was never judged")
 
     async def winner(uid: str):
         row = zb.psql(
             f"SELECT some_text || '|' || coalesce({client_col},'(none)') "
-            f"FROM public.{TABLE} WHERE uid = '{uid}'"
+            f"FROM public.{TABLE} WHERE uid = '{uid}'", quiet=True
         ).strip()
         return row.split("|") if "|" in row else (row, "")
 

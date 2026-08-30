@@ -5,8 +5,12 @@ file is that one rename moves the bridge, `nats-init` and every client together,
 test harness that hardcodes `cdc.` is one more place to forget.
 
 Python because the decode side needs MessagePack and these grew out of live debugging.
-The natural alternative is `emitter/`, which already has `gnat` and a Postgres pool, and
-would not need the `psql` shell-out below; if this harness grows, that is where it goes.
+
+The stack is the NATIVE one (`scripts/native/up.sh`: Postgres 127.0.0.1:5432, NATS
+127.0.0.1:4222, JWT/operator auth with `scripts/native/creds/<principal>.creds`).
+Everything below derives from that, and from `grammar.json`, `zebridge_catalogue` and
+`zebridge_user_tenants` — never from literals in a scenario. Run a battery with
+`scripts/scenarios/run.py`.
 """
 
 import asyncio
@@ -23,10 +27,113 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOPOLOGY = json.loads((ROOT / "grammar.json").read_text())
 
 NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
-NKEY_SEED = os.environ.get("NATS_BRIDGE_NKEY_SEED")
+NKEY_SEED = os.environ.get("NATS_BRIDGE_NKEY_SEED")  # legacy; creds win when present
+CREDS_DIR = ROOT / "scripts" / "native" / "creds"
 
-# How to reach psql. Defaults to the compose stack; override for a remote database.
-PSQL = os.environ.get("ZB_PSQL", "docker exec -i postgres-primary psql -U postgres")
+
+def _psql_binary() -> str:
+    """`ZB_PGBIN/psql` if set, else the Homebrew PostgreSQL 18 the native stack uses when
+    it exists, else whatever `psql` is on PATH."""
+    pgbin = os.environ.get("ZB_PGBIN")
+    if pgbin:
+        return str(pathlib.Path(pgbin) / "psql")
+    brew = pathlib.Path("/opt/homebrew/opt/postgresql@18/bin/psql")
+    return str(brew) if brew.exists() else "psql"
+
+
+# How to reach psql AS ADMIN. The native stack, unless `ZB_PSQL` says otherwise — the
+# docker default this used to carry made every scenario read "" from a dead
+# connection and score it as "no rows".
+PSQL = os.environ.get(
+    "ZB_PSQL",
+    f"{_psql_binary()} -h {os.environ.get('ZB_PG_HOST', '127.0.0.1')} "
+    f"-p {os.environ.get('ZB_PG_PORT', '5432')} -U {os.environ.get('ZB_PG_USER', 'postgres')} -d postgres",
+)
+
+
+def nats_server() -> str:
+    """`NATS_URL` without any userinfo — the creds file is the credential."""
+    scheme, _, rest = NATS_URL.partition("://")
+    address = rest.rsplit("@", 1)[-1] if "@" in rest else rest
+    return f"{scheme}://{address}" if scheme else address
+
+
+def principal() -> str | None:
+    """Who a scenario acts as: `ZB_PRINCIPAL`, else the creds file's name
+    (`scripts/native/creds/<principal>.creds`), else the URL's userinfo (legacy),
+    else None. Every scenario used to carry its own copy of this — and default to
+    "alice", which under creds auth published on a subject the connection was not
+    allowed to use and turned every check into a timeout."""
+    if os.environ.get("ZB_PRINCIPAL"):
+        return os.environ["ZB_PRINCIPAL"]
+    creds = os.environ.get("NATS_CREDS")
+    if creds:
+        return pathlib.Path(creds).stem
+    rest = NATS_URL.split("://", 1)[-1]
+    if "@" in rest:
+        return rest.rsplit("@", 1)[0].split(":", 1)[0]
+    return None
+
+
+def require_principal() -> str:
+    who = principal()
+    if not who:
+        sys.exit(
+            "This scenario acts as a CLIENT principal and cannot tell which.\n"
+            "  export NATS_CREDS=scripts/native/creds/omar.creds   # or alice/bob/mary/nina\n"
+            "  export ZB_PRINCIPAL=omar                             # when the creds file is named otherwise"
+        )
+    return who
+
+
+def creds_for(who: str) -> str:
+    path = CREDS_DIR / f"{who}.creds"
+    if not path.exists():
+        sys.exit(f"no creds for '{who}': {path} — scripts/native/jwt-bootstrap.sh mints them")
+    return str(path)
+
+
+async def connect_as(who: str):
+    """Connect as one named principal, confined exactly as a real client is."""
+    return await nats.connect(nats_server(), user_credentials=creds_for(who))
+
+
+def tenant_of(who: str) -> str:
+    """The tenant a principal is mapped to (zebridge_user_tenants), or the open tenant."""
+    out = psql(f"SELECT tenant_id FROM public.zebridge_user_tenants WHERE principal = '{who}'", quiet=True)
+    return out.splitlines()[0] if out else TOPOLOGY.get("open_tenant", "_default")
+
+
+def rules(table: str) -> dict:
+    """The LWW columns for a table: version, tombstone, tiebreak, tenant — from
+    `zebridge_catalogue`, with a `SYNC_RULES`/`TENANT_RULES` env entry overriding per
+    table exactly as the bridge honours it. Absent keys are None. Scenarios used to
+    read the env alone and `sys.exit` when it was empty, which on a catalogue-configured
+    stack is always."""
+    r = {"version": None, "tombstone": None, "tiebreak": None, "tenant": None}
+    out = psql(
+        "SELECT version_col::text, COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, ''), "
+        f"COALESCE(tenant_col::text, '') FROM public.zebridge_catalogue WHERE tbl = '{table}'", quiet=True)
+    if out:
+        v, t, k, tc = (out.splitlines()[0].split("|") + ["", "", "", ""])[:4]
+        r.update(version=v or None, tombstone=t or None, tiebreak=k or None, tenant=tc or None)
+    for entry in os.environ.get("SYNC_RULES", "").split(";"):
+        if entry.strip().startswith(table + ":"):
+            cols = (entry.split(":", 1)[1].split(",") + ["", "", ""])[:3]
+            r.update(version=cols[0] or r["version"], tombstone=cols[1] or None, tiebreak=cols[2] or None)
+    for entry in os.environ.get("TENANT_RULES", "").split(";"):
+        if entry.strip().startswith(table + ":"):
+            r["tenant"] = entry.split(":", 1)[1].split(",")[0] or r["tenant"]
+    return r
+
+
+def require_rules(table: str, *needed: str) -> dict:
+    r = rules(table)
+    missing = [n for n in needed if not r.get(n)]
+    if missing:
+        sys.exit(f"'{table}' has no {', '.join(missing)} column declared — "
+                 f"zebridge_enable('{table}', ...) declares them in zebridge_catalogue")
+    return r
 
 
 def publication() -> str:
@@ -53,34 +160,30 @@ def tenants() -> list[str]:
 
 
 async def connect():
-    """Connect with whichever credential the server is configured for.
+    """Connect with the credential in `NATS_CREDS` — the JWT/operator stack's one shape.
 
-    Two shapes now, because the server carries per-principal permissions:
+    `scripts/native/creds/bridge.creds` is the bridge's own identity (inspect streams,
+    act as the bridge); `<principal>.creds` is a client, confined to `mutation.<p>.>`
+    exactly as a real client is. ⚠️ A scenario that means to exercise a CLIENT's
+    permissions must connect as that client (`connect_as(require_principal())`):
+    connected as the bridge it passes while proving nothing, because every violation it
+    exists to catch is one the bridge is allowed to perform.
 
-      nkey            `NATS_BRIDGE_NKEY_SEED` — the bridge's own key, authorised for everything.
-                      Right for scenarios that inspect streams or act as the bridge.
-      user/password   userinfo in `NATS_URL`, e.g.
-                      `NATS_URL=nats://alice:s3cret@127.0.0.1:4222`. Right for anything
-                      testing what a *client* can do, because it is confined to
-                      `mutation.alice.>` exactly as a real client is.
-
-    ⚠️ Prefer the URL when it carries credentials: a scenario that means to exercise a
-    client's permissions but silently connects as the bridge would pass while proving
-    nothing — every permissions violation it exists to catch is one the bridge is allowed
-    to perform.
+    Legacy shapes, kept only for a pre-JWT server: userinfo in `NATS_URL`, or the nkey
+    seed in `NATS_BRIDGE_NKEY_SEED`.
     """
     creds = os.environ.get("NATS_CREDS")
     if creds:
-        return await nats.connect(NATS_URL.split("://")[0] + "://" +
-                                  NATS_URL.split("://", 1)[-1].rsplit("@", 1)[-1],
-                                  user_credentials=creds)
+        if not pathlib.Path(creds).exists():
+            sys.exit(f"NATS_CREDS={creds} does not exist")
+        return await nats.connect(nats_server(), user_credentials=creds)
     if "@" in NATS_URL.split("://", 1)[-1]:
         return await nats.connect(NATS_URL)
     if not NKEY_SEED:
         sys.exit(
             "No NATS credentials.\n"
-            "  set -a && . ./.env && set +a          # bridge nkey, full access\n"
-            "  NATS_URL=nats://alice:s3cret@127.0.0.1:4222   # as a client principal"
+            "  export NATS_CREDS=scripts/native/creds/bridge.creds   # as the bridge\n"
+            "  export NATS_CREDS=scripts/native/creds/omar.creds     # as a client principal"
         )
     return await nats.connect(NATS_URL, nkeys_seed_str=NKEY_SEED)
 
@@ -94,7 +197,9 @@ def psql(sql: str, quiet: bool = False) -> str:
 
 
 def decode(data: bytes):
-    """CDC and snapshot payloads are MessagePack unless the bridge ran with --json."""
+    """CDC events and mutation payloads are MessagePack; verdicts and KV descriptors are
+    JSON. Chain objects are msgpack under zstd (a per-era dictionary) — decode those with
+    the chain's dictionary, not with this."""
     try:
         return msgpack.unpackb(data, raw=False, strict_map_key=False)
     except Exception:
@@ -120,9 +225,38 @@ def run(main):
 # broker under it, which no long-running instance should have to survive.
 
 BRIDGE = ROOT / "zig-out" / "bin" / "bridge"
-BRIDGE_ARGS = os.environ.get(
-    "ZB_BRIDGE_ARGS", "--slot zb_probe --pub my_pub --port 9096"
-).split()
+SWEEPER = ROOT / "zig-out" / "bin" / "bridge_sweeper"
+# `--pub` comes from BRIDGE_CDC_PUBLICATION (publication(), no default): the literal
+# `my_pub` this used to carry was the very defaulting the bridge stopped doing.
+BRIDGE_ARGS = os.environ.get("ZB_BRIDGE_ARGS", "--slot zb_probe --port 9096").split()
+if "--pub" not in BRIDGE_ARGS:
+    BRIDGE_ARGS += ["--pub", os.environ.get("BRIDGE_CDC_PUBLICATION", "")]
+
+
+def bridge_port() -> int:
+    """The HTTP port of the bridge a scenario drives: `--port` in ZB_BRIDGE_ARGS for a
+    probe, else `BRIDGE_PORT`, else the long-running bridge's 9090."""
+    if "--port" in BRIDGE_ARGS:
+        return int(BRIDGE_ARGS[BRIDGE_ARGS.index("--port") + 1])
+    return int(os.environ.get("BRIDGE_PORT", "9090"))
+
+
+def http_base(probe: bool = False) -> str:
+    port = bridge_port() if probe else int(os.environ.get("BRIDGE_PORT", "9090"))
+    return f"http://127.0.0.1:{port}"
+
+
+def leaks_available() -> bool:
+    """macOS `leaks` — the scenarios that audit memory skip loudly elsewhere."""
+    import shutil
+    return sys.platform == "darwin" and shutil.which("leaks") is not None
+
+
+def another_bridge_running() -> bool:
+    # Anchored: `zig-out/bin/bridge_sweeper` is always running and is not a bridge —
+    # unanchored, every owns-group scenario refused to start (measured 2026-08-29).
+    r = subprocess.run(["pgrep", "-f", r"zig-out/bin/bridge$"], capture_output=True, text=True)
+    return bool(r.stdout.strip())
 
 
 def bridge_env(**overrides) -> dict:
@@ -137,8 +271,10 @@ def bridge_env(**overrides) -> dict:
         sys.exit(
             "DATABASE_READER_URL is not set — the probes start a real bridge.\n"
             "  set -a && . ./.env.bridge && set +a\n"
-            '  export NATS_BRIDGE_NKEY_SEED="SU..."'
+            "  export NATS_CREDS=scripts/native/creds/bridge.creds"
         )
+    if not os.environ.get("BRIDGE_CDC_PUBLICATION"):
+        sys.exit("BRIDGE_CDC_PUBLICATION is not set — the publication is named, never guessed (NOTES §10ad)")
     env = dict(os.environ)
     env.setdefault("LOG_LEVEL", "info")
     env.update({k: v for k, v in overrides.items() if v is not None})
@@ -202,22 +338,38 @@ def nats_cli(*args, seed_file=None) -> subprocess.CompletedProcess:
     """Shell out to the `nats` CLI, which is the only thing that can create a stream
     with the exact config nats-init uses — nats-py's add_stream would round-trip it
     through its own defaults."""
-    if seed_file is None:
-        seed_file = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_seed.nk"
-        seed_file.write_text(NKEY_SEED or "")
-    # ⚠️ Strip credentials from the URL. This passes `--nkey`, so the seed *is* the
-    # credential — but if NATS_URL also carries `user:pass@` (which it does whenever a
-    # scenario is run as a client principal), those win and every administrative command
-    # is denied. The failure is opaque: `could not pick a Stream to operate on: context
-    # deadline exceeded`, because a denied JetStream API publish never answers.
-    scheme, _, rest = NATS_URL.partition("://")
-    address = rest.rsplit("@", 1)[-1] if "@" in rest else rest
-    server = f"{scheme}://{address}" if scheme else address
-
     creds = os.environ.get("NATS_CREDS")
-    auth = ["--creds", creds] if creds else ["--nkey", str(seed_file)]
+    if creds:
+        auth = ["--creds", creds]
+    else:
+        # Legacy nkey path: the seed file is a secret — 0600, and gone at exit.
+        if seed_file is None:
+            import atexit
+            seed_file = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / f"zb_seed_{os.getpid()}.nk"
+            seed_file.write_text(NKEY_SEED or "")
+            seed_file.chmod(0o600)
+            atexit.register(lambda: seed_file.unlink(missing_ok=True))
+        auth = ["--nkey", str(seed_file)]
+    # ⚠️ The server address only: userinfo in NATS_URL would win over the credential
+    # and every administrative command would be denied with an opaque timeout.
     return subprocess.run(
-        ["nats", "--server", server, *auth, *args],
+        ["nats", "--server", nats_server(), *auth, *args],
         capture_output=True,
         text=True,
     )
+
+
+def kv_bucket(bucket_key: str) -> str:
+    """A KV bucket's name from grammar.json: `kv.<key>` (schemas, tenants) or the
+    generations bucket, which the grammar keeps under `generations.kv`."""
+    if bucket_key in TOPOLOGY.get("kv", {}):
+        return TOPOLOGY["kv"][bucket_key]
+    if bucket_key == "generations":
+        return TOPOLOGY["generations"]["kv"]
+    raise KeyError(f"no KV bucket named {bucket_key!r} in grammar.json")
+
+
+def kv_get(bucket_key: str, key: str) -> str:
+    """`$KV.<bucket>.<key>` raw, with `bucket_key` resolved by `kv_bucket`."""
+    r = nats_cli("kv", "get", kv_bucket(bucket_key), key, "--raw")
+    return r.stdout.strip() if r.returncode == 0 else ""

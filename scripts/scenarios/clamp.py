@@ -27,11 +27,10 @@ Four things checked:
 ⚠️ Checked against **PostgreSQL's** `now()`, never this script's clock: that is the clock
 the bridge compares with, and the two machines need not agree.
 
-Usage:  python scripts/scenarios/clamp.py [table]
+Usage:  python scripts/scenarios/clamp.py [table]   (NATS_CREDS=<client>.creds or ZB_PRINCIPAL)
 """
 
 import asyncio
-import os
 import re
 import sys
 import uuid
@@ -46,11 +45,7 @@ TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
 # jitter cannot explain the difference.
 FUTURE = timedelta(days=365)
 TOLERANCE_S = 5.0
-
-
-def principal() -> str:
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
+VERDICT_WAIT_S = 10.0     # bounded wait for a verdict, polled every 0.2 s
 
 
 def pg_now() -> datetime:
@@ -64,15 +59,10 @@ def iso(dt: datetime) -> str:
 
 async def main():
     failed = 0
-    who = principal()
+    who = zb.require_principal()
 
-    version_col = "updated_at"
-    entry = next(
-        (r for r in os.environ.get("SYNC_RULES", "").split(";") if r.strip().startswith(f"{TABLE}:")),
-        None,
-    )
-    if entry:
-        version_col = entry.split(":", 1)[1].split(",")[0].strip()
+    # the version column is what zebridge_catalogue declares (SYNC_RULES only overrides)
+    version_col = zb.require_rules(TABLE, "version")["version"]
 
     coltype = zb.psql(
         "SELECT data_type FROM information_schema.columns "
@@ -95,7 +85,7 @@ async def main():
         f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal='{who}' LIMIT 1"
     ).strip()
 
-    nc = await zb.connect()
+    nc = await zb.connect_as(who)   # confined exactly as the client is; verdicts arrive on its ack lane
     js = nc.jetstream()
     verdicts: dict[str, dict] = {}
     ack_prefix = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
@@ -124,7 +114,10 @@ async def main():
             msgpack.packb({"key": {"uid": uid}, "data": data, "version": version, "client_id": "c-clamp"}),
             headers={"Nats-Msg-Id": msg_id},
         )
-        await asyncio.sleep(3.0)
+        # bounded wait for THIS write's verdict — not a fixed sleep
+        deadline = asyncio.get_event_loop().time() + VERDICT_WAIT_S
+        while msg_id not in verdicts and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.2)
         return verdicts.get(msg_id)
 
     def stored_version(uid: str) -> datetime | None:

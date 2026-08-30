@@ -101,19 +101,25 @@ def main():
         # the guard was fine — found on the catalogue-era re-sweep.
         created_probe = not zb.psql(
             "SELECT 1 FROM pg_class WHERE relname='schema_migrations'", quiet=True).strip()
+        probe_ok = True
         if created_probe:
             r0 = run_sql("CREATE TABLE public.schema_migrations (version bigint PRIMARY KEY, inserted_at timestamp(0) without time zone);")
-            if r0.returncode != 0:
+            probe_ok = r0.returncode == 0
+            if not probe_ok:
+                # One failure, reported once: the ALTER below would fail too (no table),
+                # and a second "exemption broken" line would be the same defect twice.
                 zb.bad(f"the exemption is broken at CREATE: {r0.stderr.strip()[:140]}")
                 failed += 1
-        r = run_sql("ALTER TABLE public.schema_migrations ADD COLUMN tzguard_probe timestamp;")
-        if r.returncode == 0:
-            zb.psql("ALTER TABLE public.schema_migrations DROP COLUMN tzguard_probe", quiet=True)
-            zb.ok("`schema_migrations` is exempt — `mix ecto.migrate` can still bootstrap")
-        else:
-            zb.bad(f"the exemption is broken; migrations cannot run on a fresh database: {r.stderr.strip()[:140]}")
-            failed += 1
-        if created_probe:
+        if probe_ok:
+            r = run_sql("ALTER TABLE public.schema_migrations ADD COLUMN tzguard_probe timestamp;")
+            if r.returncode == 0:
+                zb.psql("ALTER TABLE public.schema_migrations DROP COLUMN tzguard_probe", quiet=True)
+                zb.ok("`schema_migrations` is exempt — `mix ecto.migrate` can still bootstrap")
+            else:
+                zb.bad(f"the exemption is broken; migrations cannot run on a fresh database: {r.stderr.strip()[:140]}")
+                failed += 1
+        # Drop only what THIS run created — never a real project's migration table.
+        if created_probe and probe_ok:
             zb.psql("DROP TABLE IF EXISTS public.schema_migrations", quiet=True)
     finally:
         for t in ("tzguard_bad", "tzguard_ok", "tzguard_half", "tzguard_bad2"):

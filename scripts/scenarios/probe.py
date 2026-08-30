@@ -21,10 +21,11 @@ other half:
      an attacker's single message. Either way the prober pays once and the system pays
      indefinitely.
 
-⚠️ Deliberately runs as a **client principal**, not the bridge nkey — the bridge is allowed
-to do everything this scenario exists to catch:
+⚠️ Deliberately runs as a **client principal**, not the bridge identity — the bridge is
+allowed to do everything this scenario exists to catch:
 
-    NATS_URL=nats://alice:s3cret@127.0.0.1:4222 python scripts/scenarios/probe.py [table]
+    NATS_CREDS=scripts/native/creds/omar.creds python scripts/scenarios/probe.py [table]
+    ZB_PRINCIPAL=<name>   # when the creds file is not named after the principal
 
 Defaults to `users`, the outbound-only fixture: published (so its schema is disclosed),
 never granted (so every write must be refused).
@@ -50,19 +51,32 @@ WINDOW = float(os.environ.get("ZB_PROBE_WINDOW", "12"))
 QUIET = float(os.environ.get("ZB_PROBE_QUIET", "8"))
 
 
-def principal() -> str:
-    rest = zb.NATS_URL.split("://", 1)[-1]
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] if "@" in rest else "alice"
+def identity_column(table: str) -> str:
+    """The table's primary key — the column the probe keys on. Derived from the catalog:
+    `users` happens to have `name`, but a probe that hardcodes it cannot be pointed at any
+    other outbound-only table."""
+    rows = [
+        line for line in zb.psql(
+            "SELECT a.attname FROM pg_index i "
+            "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+            f"WHERE i.indrelid = 'public.{table}'::regclass AND i.indisprimary",
+            quiet=True,
+        ).splitlines() if line
+    ]
+    if len(rows) != 1:
+        sys.exit(f"'{table}' needs exactly one primary key column for this scenario (found {rows})")
+    return rows[0]
 
 
 async def main():
     failed = 0
-    who = principal()
-    if not any(c in zb.NATS_URL for c in "@"):
-        print("⚠️  No principal in NATS_URL — this scenario is meaningless as the bridge.\n"
-              "    NATS_URL=nats://alice:s3cret@127.0.0.1:4222\n")
+    who = zb.require_principal()
+    if who == "bridge":
+        print("⚠️  Running as the bridge identity — this scenario is meaningless as the bridge.\n"
+              "    NATS_CREDS=scripts/native/creds/omar.creds\n")
 
-    nc = await zb.connect()
+    id_col = identity_column(TABLE)
+    nc = await zb.connect_as(who)
     js = nc.jetstream()
 
     # ── 1. the premise: is the schema actually disclosed to this principal? ────
@@ -104,12 +118,16 @@ async def main():
     subject = zb.subject(
         zb.TOPOLOGY["subjects"]["mutations_prefix"], who, TABLE, "insert"
     )
+    # Keyed on the table's real primary key; the rest is the `users` fixture's shape. A
+    # column the table lacks is not what is under test — the refusal must come from the
+    # grant, and it must come once.
+    data = {id_col: row_id, "name": "probe", "email": "probe@example.com",
+            "inserted_at": version, "updated_at": version}
     await js.publish(
         subject,
         msgpack.packb({
-            "key": {"id": row_id},
-            "data": {"id": row_id, "name": "probe", "email": "probe@example.com",
-                     "inserted_at": version, "updated_at": version},
+            "key": {id_col: row_id},
+            "data": data,
             "version": version,
             "client_id": "probe",
         }),
@@ -157,13 +175,14 @@ async def main():
         zb.ok("answered exactly once, and stayed quiet afterwards")
 
     # ── 4. and it changed nothing ─────────────────────────────────────────────
-    landed = zb.psql(f"SELECT count(*) FROM public.{TABLE} WHERE name = 'probe'").strip()
+    where = f"WHERE \"{id_col}\"::text = '{row_id}'"
+    landed = zb.psql(f"SELECT count(*) FROM public.{TABLE} {where}").strip()
     if landed == "0":
         zb.ok(f"no row reached '{TABLE}'")
     else:
         zb.bad(f"{landed} probe row(s) reached '{TABLE}'")
         failed += 1
-        zb.psql(f"DELETE FROM public.{TABLE} WHERE name = 'probe'", quiet=True)
+        zb.psql(f"DELETE FROM public.{TABLE} {where}", quiet=True)
 
     return 1 if failed else 0
 

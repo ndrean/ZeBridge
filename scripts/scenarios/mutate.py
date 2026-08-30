@@ -18,15 +18,15 @@ Full rows on the wire: an upsert that turns into an INSERT must satisfy NOT NULL
 columns, so a partial payload fails on the insert path and succeeds on the update path —
 the asymmetry PROTOCOL.md §7 forbids.
 
-Prerequisites:
-    SELECT zebridge_grant_edge_writes('public.<table>');   -- as the DBA
-    SYNC_RULES=<table>:<version_col>[,<tombstone_col>]     -- on the bridge
+Prerequisites: the table is edge-writable (`zebridge_enable(..., edge_writes => true)`),
+which also declares its version/tombstone columns in `zebridge_catalogue` — that is where
+this scenario reads them from.
 
 Usage:  python scripts/scenarios/mutate.py [table] [id]
 """
 
 import asyncio
-import os
+import datetime
 import uuid
 import sys
 
@@ -37,20 +37,14 @@ import zb
 # id. NATS grants `mutation.<user>.>`, so publishing under any other principal is refused
 # — and a denied JetStream publish never acks, so it surfaces as a *timeout*, not as a
 # permission error. A hardcoded "a3f9c1" here made this scenario hang for 10s and fail with
-# `nats: timeout`, which reads like a broker problem.
-#
-# Taken from the connection URL, so the subject and the credential cannot disagree.
-def _principal_from_url(url: str) -> str:
-    rest = url.split("://", 1)[-1]
-    if "@" not in rest:
-        return "alice"
-    return rest.rsplit("@", 1)[0].split(":", 1)[0] or "alice"
-
-
-PRINCIPAL = os.environ.get("ZB_PRINCIPAL") or _principal_from_url(zb.NATS_URL)
+# `nats: timeout`, which reads like a broker problem. zb.require_principal() ties the
+# subject to the credential the connection actually carries.
+PRINCIPAL = zb.require_principal()
 
 # NOT NULL columns with no default, resolved from the catalog at startup.
 REQUIRED: dict = {}
+# The LWW columns, from zebridge_catalogue (set in main).
+VERSION_COL, TOMB_COL = "updated_at", None
 
 
 def required_defaults(table: str) -> dict:
@@ -70,9 +64,7 @@ def required_defaults(table: str) -> dict:
     ]
     # The tenant must match what the principal is mapped to, or RLS refuses the write —
     # that mapping is the point of the policy.
-    tenant = zb.psql(
-        f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal='{PRINCIPAL}' LIMIT 1"
-    ).strip()
+    tenant = zb.tenant_of(PRINCIPAL)
     out = {}
     for c in cols:
         if c == "tenant_id" and tenant:
@@ -96,6 +88,9 @@ def full_row(columns, row_id, text, version):
         "updated_at": version,
         "deleted_at": None,
     }
+    defaults[VERSION_COL] = version
+    if TOMB_COL:
+        defaults[TOMB_COL] = None
     defaults.update(REQUIRED)
     return {c: defaults.get(c) for c in columns}
 
@@ -119,11 +114,17 @@ async def main():
         sys.exit(f"'{table}' needs exactly one primary key column for this scenario")
     pk_col, pk_type = pk_rows[0]
 
+    # A fresh key per run: a fixed default collides with whatever a previous run left
+    # behind and turns "the insert was refused" into "the old row is still there".
     if pk_type == "uuid":
         row_id = sys.argv[2] if len(sys.argv) > 2 else str(uuid.uuid4())
     else:
-        row_id = int(sys.argv[2]) if len(sys.argv) > 2 else 7001
+        row_id = int(sys.argv[2]) if len(sys.argv) > 2 else 2_000_000_000 + uuid.uuid4().int % 100_000_000
     print(f"key: {pk_col} ({pk_type}) = {row_id}")
+
+    r = zb.require_rules(table, "version")
+    version_col, tomb_col = r["version"], r["tombstone"]
+    print(f"version={version_col}  tombstone={tomb_col or '(none — deletes are physical)'}")
 
     global REQUIRED
     REQUIRED = required_defaults(table)
@@ -137,49 +138,94 @@ async def main():
     if not columns:
         sys.exit(f"table '{table}' not found — run the emitter's migrations first")
 
-    nc = await zb.connect()
-    js = nc.jetstream()
-    base = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], PRINCIPAL, table)
+    global VERSION_COL, TOMB_COL
+    VERSION_COL, TOMB_COL = version_col, tomb_col
 
-    print()
-    for op, text, hhmmss, expect in [
-        ("insert", "from the edge", "10:00:00", "applied"),
-        ("update", "STALE must not win", "09:00:00", "rejected as stale"),
-        ("update", "NEWER wins", "11:00:00", "applied"),
-    ]:
-        version = f"2026-08-16T{hhmmss}.000000"
-        await js.publish(
-            f"{base}.{op}",
-            msgpack.packb({
-                "key": {pk_col: row_id},
-                "data": full_row(columns, row_id, text, version),
-                "version": version,
-                "client_id": "c1",
-            }),
-        )
-        print(f"  {op:6} version {hhmmss} — expect {expect}")
-        await asyncio.sleep(2)
-
-    await js.publish(
-        f"{base}.delete",
-        msgpack.packb({"key": {pk_col: row_id}, "version": "2026-08-16T12:00:00.000000"}),
-    )
-    print("  delete version 12:00:00 — expect a tombstone, or a physical delete")
-    await asyncio.sleep(2)
-    await nc.close()
-
-    cols = f'"{pk_col}", some_text' + (", deleted_at" if "deleted_at" in columns else "")
     # Quoted and keyed on the real column: an unquoted uuid is a syntax error, and the
     # failure printed as "trailing junk after numeric literal" rather than as "this
     # scenario assumes an integer key".
-    row = zb.psql(f"SELECT {cols} FROM public.{table} WHERE \"{pk_col}\" = '{row_id}'")
-    print(f"\nrow in PostgreSQL: {row or '(absent — physical delete)'}")
+    where = f"WHERE \"{pk_col}\" = '{row_id}'"
 
-    if "STALE" in row:
-        zb.bad("the stale write won — the version guard is not being applied")
-        return 1
-    zb.ok("the stale write lost; the newer version is stored")
-    return 0
+    def read():
+        """(some_text, tombstoned) — or (None, None) when there is no row."""
+        tomb = f"CASE WHEN {tomb_col} IS NULL THEN 'live' ELSE 'dead' END" if tomb_col else "'live'"
+        out = zb.psql(f"SELECT coalesce(some_text,'') || '|' || {tomb} FROM public.{table} {where}")
+        if "|" not in out:
+            return None, None
+        text, state = out.split("|", 1)
+        return text, state
+
+    failed = 0
+
+    def check(label: str, cond: bool, detail: str):
+        nonlocal failed
+        if cond:
+            zb.ok(f"{label}: {detail}")
+        else:
+            zb.bad(f"{label}: {detail}")
+            failed += 1
+
+    nc = await zb.connect_as(PRINCIPAL)
+    js = nc.jetstream()
+    base = zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], PRINCIPAL, table)
+
+    try:
+        print()
+        for op, text, hhmmss, expect in [
+            ("insert", "from the edge", "10:00:00", "applied"),
+            ("update", "STALE must not win", "09:00:00", "rejected as stale"),
+            ("update", "NEWER wins", "11:00:00", "applied"),
+        ]:
+            version = f"2026-08-16T{hhmmss}.000000"
+            await js.publish(
+                f"{base}.{op}",
+                msgpack.packb({
+                    "key": {pk_col: row_id},
+                    "data": full_row(columns, row_id, text, version),
+                    "version": version,
+                    "client_id": "c1",
+                }),
+            )
+            print(f"  {op:6} version {hhmmss} — expect {expect}")
+            await asyncio.sleep(2)
+
+        # ⚠️ An empty row here is a FAILURE, not a physical delete: nothing has deleted
+        # yet, so "no row" means the insert never landed (RLS, a NOT NULL column, a
+        # refused publish) and the LWW verdict below would be about nothing.
+        text, state = read()
+        print(f"\nrow after the three writes: {text!r} ({state})")
+        check("row exists", text is not None,
+              "the insert landed" if text is not None else "NO ROW — the writes never applied")
+        check("newer wins", text == "NEWER wins",
+              f"some_text is {text!r} — the stale write lost and the newer version is stored"
+              if text == "NEWER wins" else
+              f"some_text is {text!r}, expected 'NEWER wins'"
+              + (" — the stale write WON; the version guard is not applied" if text and "STALE" in text else ""))
+
+        await js.publish(
+            f"{base}.delete",
+            # The delete's version is the tombstone's timestamp, and the sweeper reaps
+            # tombstones older than GC_THRESHOLD: a delete pinned to 2026-08-16 was reaped
+            # within seconds of landing and read back as "no row" (measured). Newer than the
+            # three pinned writes is all LWW needs — now() is.
+            msgpack.packb({"key": {pk_col: row_id},
+                           "version": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"}),
+        )
+        print(f"\n  delete version 12:00:00 — expect {'a tombstone' if tomb_col else 'a physical delete'}")
+        await asyncio.sleep(2)
+
+        text, state = read()
+        if tomb_col:
+            check("delete", state == "dead",
+                  f"row tombstoned ({tomb_col} set)" if state == "dead" else f"row is {state!r}, expected tombstoned")
+        else:
+            check("delete", text is None,
+                  "row physically deleted" if text is None else "row still present after the delete")
+    finally:
+        await nc.close()
+        zb.psql(f"DELETE FROM public.{table} {where}", quiet=True)
+
+    return 1 if failed else 0
 
 
 zb.run(main)

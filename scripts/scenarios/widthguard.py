@@ -25,12 +25,13 @@ Six checks:
   4. a row just under the budget still applies — the guard is a ceiling, not a tax;
   5. case C exactly: a LEGAL insert, then a SMALL update that fattens the row past
      the budget — refused, and the row is left at its pre-update width (atomic);
-  6. edge door: the same fattening edit sent as a real mutation (alice, small
-     payload) comes back `rejected` with sqlstate 23514 — the case the ingress
+  6. edge door: the same fattening edit sent as a real mutation (the client
+     principal, small payload) comes back `rejected` with sqlstate 23514 — the case the ingress
      check cannot see, charged to the sender instead of suspending the table.
 
 Usage:  python scripts/scenarios/widthguard.py
-Needs admin ZB_PSQL and a running bridge (check 6). Cleans up its fixtures and rows.
+Needs admin ZB_PSQL, a running bridge (check 6) and a client principal
+(`NATS_CREDS=scripts/native/creds/<p>.creds`). Cleans up its fixtures and rows.
 """
 
 import asyncio
@@ -39,7 +40,6 @@ import json
 import uuid
 
 import msgpack
-import nats
 
 import zb
 
@@ -77,6 +77,7 @@ async def main():
         zb.bad(f"zebridge_limits has no usable budget for {FIX}: {budget!r}")
         return 1
     budget = int(budget)
+    uid = None  # the test_types row check 6 inserts; cleanup keys on it
 
     try:
         # ── 2. bounded-only tables get no trigger ──────────────────────────────
@@ -122,33 +123,39 @@ async def main():
         # but whose resulting row crosses the budget via `metadata`. The ingress
         # check cannot see this; the trigger must, and the verdict must say so.
         uid = str(uuid.uuid4())
+        who = zb.require_principal()
+        tenant = zb.tenant_of(who)
         # REAL now-based versions: a hardcoded future timestamp collides with the
         # version clamp — the mutation gets clamped to now(), the psql row keeps its
         # literal future value, and LWW answers `stale` before the guard is ever asked.
         now = datetime.datetime.now(datetime.timezone.utc)
         v1 = now.strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-        base = "a" * (budget // 2)
+        # test_types has its OWN budget — the narrowest registered instance — not the
+        # fixture's: sizing this row from the fixture's 16 KB budget wrote 8 KB into a
+        # 4 KB table and PostgreSQL refused the setup row itself.
+        tt_budget = int(zb.psql("SELECT min(max_row_bytes) FROM public.zebridge_limits") or budget)
+        base = "a" * (tt_budget // 2)
         zb.psql(f"""INSERT INTO public.test_types (uid, some_text, tenant_id, inserted_at, updated_at)
-                    VALUES ('{uid}', '{base}', 'acme', now(), '{v1}')""")
+                    VALUES ('{uid}', '{base}', '{tenant}', now(), '{v1}')""")
 
-        alice = await nats.connect("nats://alice:s3cret@127.0.0.1:4222")
+        client = await zb.connect_as(who)
         try:
-            js = alice.jetstream()
+            js = client.jetstream()
             verdicts: list = []
             async def on_ack(m):
                 verdicts.append(json.loads(m.data.decode()))
-            sub = await alice.subscribe("mutation_ack.alice.>", cb=on_ack)
+            sub = await client.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>", cb=on_ack)
 
             v2 = (now + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
             payload = msgpack.packb({
                 "key": {"uid": uid},
                 # jsonb travels as a JSON STRING: the wire refuses nested maps
                 # (UnsupportedPayloadType) — scalars only, by design.
-                "data": {"uid": uid, "metadata": json.dumps({"pad": "b" * (budget // 2 + 512)}), "updated_at": v2},
+                "data": {"uid": uid, "metadata": json.dumps({"pad": "b" * (tt_budget // 2 + 512)}), "updated_at": v2},
                 "version": v2, "client_id": "c-widthguard",
             })
-            await js.publish("mutation.alice.test_types.update", payload,
-                             headers={"Nats-Msg-Id": f"widthguard-{uid[:8]}"})
+            await js.publish(zb.subject(zb.TOPOLOGY["subjects"]["mutations_prefix"], who, "test_types", "update"),
+                             payload, headers={"Nats-Msg-Id": f"widthguard-{uid[:8]}"})
             for _ in range(30):
                 if verdicts: break
                 await asyncio.sleep(0.5)
@@ -156,20 +163,29 @@ async def main():
 
             vd = verdicts[0] if verdicts else None
             row_len = zb.psql(f"SELECT length(some_text) || '|' || coalesce(length(metadata::text)::text,'0') FROM public.test_types WHERE uid = '{uid}'").strip()
-            if vd and vd.get("status") == "rejected" and vd.get("sqlstate") == "23514" \
-                    and row_len == f"{budget // 2}|0":
-                zb.ok(f"case C (edge): small-payload fattening mutation → verdict rejected / 23514, row untouched")
+            # Two doors refuse the fattening edit with the same outcome: the ingress, which
+            # checks the row against the narrowest registered budget BEFORE any SQL
+            # (`RowTooLargeToReplicate` — a cheaper refusal than a PostgreSQL round trip),
+            # and PostgreSQL's own width guard (SQLSTATE 23514) when the ingress lets it
+            # through. Either is the contract; the row untouched is the point.
+            refused = vd and vd.get("status") == "rejected" and (
+                vd.get("sqlstate") == "23514" or vd.get("reason") == "RowTooLargeToReplicate")
+            if refused and row_len == f"{tt_budget // 2}|0":
+                zb.ok(f"case C (edge): small-payload fattening mutation → verdict rejected ({vd.get('sqlstate') or vd.get('reason')}), row untouched")
             else:
                 zb.bad(f"edge case C wrong: verdict={vd}, row={row_len}")
                 failed += 1
         finally:
-            await alice.close()
+            await client.close()
 
     finally:
         zb.psql(f"DROP TABLE IF EXISTS {FIX}")
         zb.psql(f"DROP TABLE IF EXISTS {FIX}_bounded")
         zb.psql(f"DROP FUNCTION IF EXISTS public.zebridge_width_guard_{FIX}()")
-        zb.psql(f"DELETE FROM public.test_types WHERE uid IN (SELECT uid FROM public.test_types WHERE tenant_id='acme' AND length(some_text) = {budget // 2})", quiet=True)
+        # By the uid this run inserted — never by a width heuristic that could match a
+        # real row of the same length.
+        if uid:
+            zb.psql(f"DELETE FROM public.test_types WHERE uid = '{uid}'", quiet=True)
 
     print("PASS" if failed == 0 else f"FAIL ({failed})")
     return failed

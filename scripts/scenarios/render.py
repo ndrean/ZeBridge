@@ -67,7 +67,7 @@ REQUIRED_VARS = [
 ]
 
 ADMIN_URL = os.environ.get(
-    "ADMIN_DATABASE_URL", "postgres://postgres:postgres_password@127.0.0.1:55432/postgres"
+    "ADMIN_DATABASE_URL", "postgres://postgres@127.0.0.1:5432/postgres"
 )
 
 
@@ -146,6 +146,7 @@ async def main():
     if admin(f"CREATE DATABASE {SCRATCH_DB}").returncode != 0:
         sys.exit(f"could not create the scratch database {SCRATCH_DB}")
 
+    path = None
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".sql", delete=False) as fh:
             fh.write(rendered)
@@ -192,6 +193,8 @@ async def main():
             zb.ok("every declared event trigger exists")
     finally:
         admin(f"DROP DATABASE IF EXISTS {SCRATCH_DB}", stop_on_error=False)
+        if path:
+            os.unlink(path)
 
     return 1 if failed else 0
 

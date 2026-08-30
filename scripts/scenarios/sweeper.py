@@ -15,15 +15,23 @@ So the sweeper has two ways to be wrong, and only one of them is visible:
 
 This seeds tombstones either side of the threshold and asserts exactly which survive.
 
-⚠️ It also asserts the sweeper's *sources*: the set of tables comes from `SYNC_RULES`, the
-same variable the bridge reads, so the two cannot disagree about which column is the
-tombstone. An earlier version read `GC_TABLES` and deleted `WHERE _deleted = true AND
-_hlc < $1` — columns no table has — so it matched nothing and the guarantee above was not
-enforced at all, silently, for as long as it existed.
+⚠️ It also asserts the sweeper's *sources*: the table and its tombstone column come from
+`zebridge_catalogue` — written by `zebridge_enable` in the same transaction as the
+soft-delete trigger, and read by the bridge and the sweeper alike, so the two cannot
+disagree about which column is the tombstone. An earlier version read `GC_TABLES` and
+deleted `WHERE _deleted = true AND _hlc < $1` — columns no table has — so it matched
+nothing and the guarantee above was not enforced at all, silently, for as long as it
+existed.
 
-Usage:  python scripts/scenarios/sweeper.py [table]
+⚠️ A sweeper pass reaps EVERY catalogued table's tombstones, and there is no undo. This
+scenario therefore runs the sweeper SCOPED: `SWEEP_ONLY_TABLES` (a filter the sidecar
+honours, see src/bridge_sweeper.zig) is set to a throwaway fixture this scenario creates,
+registers through `zebridge_enable`, and drops — so a test pass never touches a real
+table's tombstones, however old.
 
-Needs a table with a tombstone column, and `DATABASE_WRITER_URL` set:
+Usage:  python scripts/scenarios/sweeper.py
+
+Needs `DATABASE_WRITER_URL` (the sweeper's own connection) and admin psql:
 
     set -a && . ./.env.bridge && set +a
 """
@@ -35,29 +43,49 @@ import sys
 
 import zb
 
-TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
-TOMBSTONE = "deleted_at"
-VERSION = "updated_at"
-THRESHOLD_MS = 3_600_000  # 1 hour
+FIX = "zb_sweeper_probe"      # a table this scenario owns: created, enabled, dropped
+THRESHOLD_MS = 3_600_000      # 1 hour
 MARK = "sweeper-scenario"
 
-SWEEPER = zb.ROOT / "zig-out" / "bin" / "bridge_sweeper"
+
+def setup_fixture():
+    zb.psql(f"DROP TABLE IF EXISTS public.{FIX} CASCADE", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
+    out = zb.psql(f"""
+        CREATE TABLE public.{FIX} (uid uuid PRIMARY KEY, some_text text,
+            inserted_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL, deleted_at timestamptz);
+        SELECT step || ':' || status FROM zebridge_enable('public.{FIX}',
+            writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at',
+            public_reason => 'sweeper scenario fixture',
+            publication => '{zb.publication()}', dry_run => false);
+    """)
+    if "catalogue:done" not in out:
+        sys.exit(f"zebridge_enable did not register the fixture:\n{out}")
+
+
+def teardown_fixture():
+    zb.psql(f"DROP TABLE IF EXISTS public.{FIX} CASCADE", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
 
 
 async def main():
-    if not SWEEPER.exists():
-        sys.exit(f"{SWEEPER} not built — run `zig build`")
+    if not zb.SWEEPER.exists():
+        sys.exit(f"{zb.SWEEPER} not built — run `zig build`")
     if not os.environ.get("DATABASE_WRITER_URL"):
         sys.exit("DATABASE_WRITER_URL is not set.\n  set -a && . ./.env.bridge && set +a")
 
-    cols = zb.psql(
-        "SELECT column_name FROM information_schema.columns "
-        f"WHERE table_name='{TABLE}' AND column_name IN ('{TOMBSTONE}','{VERSION}')"
-    ).split()
-    if TOMBSTONE not in cols:
-        sys.exit(f"'{TABLE}' has no '{TOMBSTONE}' column — nothing to sweep")
+    setup_fixture()
+    try:
+        return await run()
+    finally:
+        teardown_fixture()
 
-    zb.psql(f"DELETE FROM public.{TABLE} WHERE some_text LIKE '{MARK}%'", quiet=True)
+
+async def run():
+    # The columns the sweeper will use, from the same place it reads them.
+    r = zb.require_rules(FIX, "version", "tombstone")
+    version, tombstone = r["version"], r["tombstone"]
 
     # Ages chosen around the boundary rather than far from it: a sweeper that compares the
     # wrong column, or the right column against the wrong clock, still passes a test whose
@@ -68,80 +96,51 @@ async def main():
         ("just inside", "59 minutes", True),
         ("live row", None, True),
     ]
-    # Every NOT NULL column without a DEFAULT has to be supplied, and the set is read from
-    # the catalog rather than hardcoded: `test_types` grew a NOT NULL `tenant_id` for the
-    # RLS work, and a hardcoded column list silently inserted *nothing* — every row was
-    # rejected, the sweep found an empty table, and the scenario reported "reaped TOO
-    # EARLY" for rows that had never existed. A seeding failure must not look like a
-    # verdict about the thing under test.
-    required = [
-        line for line in zb.psql(
-            "SELECT column_name FROM information_schema.columns "
-            f"WHERE table_name='{TABLE}' AND is_nullable='NO' AND column_default IS NULL "
-            f"AND column_name NOT IN ('uid','inserted_at','{VERSION}')"
-        ).splitlines() if line
-    ]
-    # ⚠️ A tenant the SWEEPER is mapped to, not a literal.
-    #
-    # The sweeper is a principal like any other and is bounded by `zebridge_user_tenants`
-    # — it has no blanket rights. Seeding rows under a tenant nobody granted it produced a
-    # correct refusal that read as a bug: rows inserted fine (as admin), the sweep found
-    # nothing it was allowed to touch, and the scenario reported "reaped too little".
-    #
-    # That refusal is the design working. To test the *reaping*, the fixture has to sit
-    # inside the sweeper's reach — which is also a check that the mapping exists at all.
-    sweeper_tenant = zb.psql(
-        "SELECT tenant_id FROM zebridge_user_tenants WHERE principal='zb_sweeper' LIMIT 1"
-    ).strip()
-    if required and not sweeper_tenant:
-        sys.exit(
-            "zb_sweeper is not mapped to any tenant, so it can reap nothing.\n"
-            "  INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('zb_sweeper', '<tenant>');\n"
-            "  SELECT * FROM zebridge_audit_sweeper();   -- lists tenants with no mapping"
-        )
-
-    extra_cols = "".join(f", {c}" for c in required)
-    extra_vals = "".join(f", '{sweeper_tenant}'" for _ in required)
-
     for label, age, _ in seeds:
         ts = "NULL" if age is None else f"now() - interval '{age}'"
-        out = zb.psql(
-            f"INSERT INTO public.{TABLE} (uid, some_text, inserted_at, {VERSION}, {TOMBSTONE}{extra_cols}) "
-            f"VALUES (gen_random_uuid(), '{MARK}: {label}', now(), now(), {ts}{extra_vals})",
+        zb.psql(
+            f"INSERT INTO public.{FIX} (uid, some_text, inserted_at, {version}, {tombstone}) "
+            f"VALUES (gen_random_uuid(), '{MARK}: {label}', now(), now(), {ts})",
             quiet=True,
         )
-        _ = out
 
-    seeded = zb.psql(f"SELECT count(*) FROM public.{TABLE} WHERE some_text LIKE '{MARK}%'").strip()
+    seeded = zb.psql(f"SELECT count(*) FROM public.{FIX} WHERE some_text LIKE '{MARK}%'").strip()
     if seeded != str(len(seeds)):
         sys.exit(
-            f"seeding failed: {seeded} of {len(seeds)} rows inserted into '{TABLE}'.\n"
-            f"  Required columns detected: {required or '(none)'}\n"
+            f"seeding failed: {seeded} of {len(seeds)} rows inserted into '{FIX}'.\n"
             "  Fix the fixture before reading anything below as a sweeper verdict."
         )
 
-    print(f"seeded 4 rows in '{TABLE}' (threshold {THRESHOLD_MS // 60000} min)\n")
+    print(f"seeded {len(seeds)} rows in '{FIX}' (threshold {THRESHOLD_MS // 60000} min)\n")
 
     env = dict(os.environ)
-    env["SYNC_RULES"] = f"{TABLE}:{VERSION},{TOMBSTONE}"
+    env.pop("SYNC_RULES", None)  # the catalogue is the source under test
+    env["SWEEP_ONLY_TABLES"] = FIX  # ⚠️ the scope: nothing else is swept
     env["GC_THRESHOLD_MS"] = str(THRESHOLD_MS)
     env["GC_INTERVAL_MS"] = "999999999"  # one pass, then it sleeps
     # The sweeper is a daemon: one pass, then it sleeps for GC_INTERVAL_MS. Timing out is
     # the expected end of a single-pass run, not a failure — the work is already done and
     # the output is on the pipe.
     try:
-        run = subprocess.run([str(SWEEPER)], env=env, capture_output=True, text=True, timeout=15)
-        out = run.stdout + run.stderr
+        proc = subprocess.run([str(zb.SWEEPER)], env=env, capture_output=True, text=True, timeout=15)
+        out = proc.stdout + proc.stderr
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode() + (e.stderr or b"").decode()
 
     failed = 0
-    if f"sweeping {TABLE} on tombstone column '{TOMBSTONE}'" not in out:
-        zb.bad("the sweeper did not derive the table/column from SYNC_RULES")
+    if f"sweeping {FIX} on tombstone column '{tombstone}'" not in out:
+        zb.bad("the sweeper did not derive the table/column from the catalogue")
         print("   ", out.strip().splitlines()[:3])
         failed += 1
     else:
-        zb.ok("table and tombstone column derived from SYNC_RULES")
+        zb.ok("table and tombstone column derived from zebridge_catalogue")
+
+    swept = re.findall(r"GC: sweeping (\S+) on", out)
+    if swept == [FIX]:
+        zb.ok(f"SWEEP_ONLY_TABLES scoped the pass to '{FIX}' alone")
+    else:
+        zb.bad(f"the pass was not scoped to the fixture — swept: {swept}")
+        failed += 1
 
     if "permission denied" in out:
         zb.bad("permission denied — bridge_writer needs DELETE (zebridge_grant_edge_writes)")
@@ -149,7 +148,7 @@ async def main():
 
     survivors = [
         line for line in zb.psql(
-            f"SELECT some_text FROM public.{TABLE} WHERE some_text LIKE '{MARK}%' ORDER BY some_text"
+            f"SELECT some_text FROM public.{FIX} WHERE some_text LIKE '{MARK}%' ORDER BY some_text"
         ).splitlines() if line
     ]
     expected = sorted(f"{MARK}: {label}" for label, _, keep in seeds if keep)
@@ -173,8 +172,6 @@ async def main():
 
     reaped = re.search(r"reaped (\d+) tombstone", out)
     print(f"\n  sweeper reported: {reaped.group(0) if reaped else '(nothing reaped)'}")
-
-    zb.psql(f"DELETE FROM public.{TABLE} WHERE some_text LIKE '{MARK}%'", quiet=True)
     return 1 if failed else 0
 
 
