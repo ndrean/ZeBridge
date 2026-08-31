@@ -288,6 +288,18 @@ pub const EventProcessor = struct {
         rel: pgoutput.RelationMessage,
         wal_end: u64,
     ) !u32 {
+        // ⚠️ Already suspended for exactly this: the table is being PROBED (every event
+        // is retried so the refusal can lift by itself — Reason.probesEveryEvent), and
+        // this one still does not fit. Count it and say nothing: re-publishing a
+        // suspension per oversized row would put one KV write and four log lines on the
+        // wire for every event, and the client already holds the suspension that matters.
+        if (self.refused.reasonFor(rel.name)) |r| {
+            if (r == .row_too_large) {
+                self.refused.countDrop(rel.name);
+                return error.EventDropped;
+            }
+        }
+
         const buffer_bytes = self.batch_publisher.events[0].data_buffer.len;
 
         log.err(
@@ -592,6 +604,18 @@ pub const EventProcessor = struct {
         // NOT counted here any more: this point is "packed into a ring-buffer slot",
         // which is a different event from "NATS accepted it". The counter moved to the
         // batch publisher's post-ack path — see the note there.
+
+        // The row FIT. If this table was suspended for `row_too_large`, the row that
+        // suspended it is gone or has narrowed, and the suspension has outlived its
+        // cause — lift it here rather than at the next boot, and republish the
+        // descriptor, because every client is holding a suspension and will not resume
+        // on CDC alone. One atomic load per event when nothing is refused.
+        if (self.refused.liftIfProbing(rel.name)) {
+            log.info("✅ '{s}': a row fits again — suspension lifted live, republishing its schema", .{rel.name});
+            self.publishBootSchemas(self.allocator, &.{rel.name}) catch |err| {
+                log.err("🔴 '{s}': lifted, but its schema could not be republished ({s}) — clients stay suspended until the next DDL event or restart", .{ rel.name, @errorName(err) });
+            };
+        }
 
         if (is_transition and transition_column_name != null) {
             if (id_str) |id| {

@@ -623,6 +623,71 @@
       "tablesToSeed": [
         "salaries"
       ]
+    },
+    {
+      "name": "§10bq: a gap on CDC_PUBLIC re-seeds tenant-scoped tables too — their shared rows ride it",
+      "streams": {
+        "CDC_kilo": {
+          "firstSeq": 10,
+          "stored": 40,
+          "lastSeq": 40
+        },
+        "CDC_PUBLIC": {
+          "firstSeq": 900,
+          "stored": 100,
+          "lastSeq": 1200
+        }
+      },
+      "tables": {
+        "test_types": {
+          "route": "CDC_kilo",
+          "sharedRoute": "CDC_PUBLIC",
+          "seeded": true
+        },
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_PUBLIC"
+      ],
+      "tablesToSeed": [
+        "test_types",
+        "users"
+      ]
+    },
+    {
+      "name": "§10bq: a gap on the TENANT stream still leaves public tables alone",
+      "streams": {
+        "CDC_kilo": {
+          "firstSeq": 900,
+          "stored": 100,
+          "lastSeq": 1200
+        },
+        "CDC_PUBLIC": {
+          "firstSeq": 10,
+          "stored": 40,
+          "lastSeq": 40
+        }
+      },
+      "tables": {
+        "test_types": {
+          "route": "CDC_kilo",
+          "sharedRoute": "CDC_PUBLIC",
+          "seeded": true
+        },
+        "users": {
+          "route": "CDC_PUBLIC",
+          "seeded": true
+        }
+      },
+      "gapped": [
+        "CDC_kilo"
+      ],
+      "tablesToSeed": [
+        "test_types"
+      ]
     }
   ],
   "position": [

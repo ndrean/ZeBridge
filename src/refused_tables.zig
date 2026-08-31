@@ -33,6 +33,7 @@
 //! realloc the backing array under a reader mid-scan.
 
 const std = @import("std");
+const utils = @import("utils.zig");
 
 const log = std.log.scoped(.refused);
 
@@ -79,6 +80,24 @@ pub const Reason = enum {
     }
 
     /// What the operator has to change to lift the refusal.
+    /// Whether a refusal for this reason must be RE-TESTED on every event instead of
+    /// being held until the next boot or DDL event.
+    ///
+    /// `row_too_large` is the only DATA-dependent verdict here: nothing is wrong with
+    /// the table, one ROW was wider than the event buffer — and that row may be deleted
+    /// or narrowed a minute later. Held until boot (as it was), the table stayed frozen
+    /// for its clients long after the cause was gone; `legacybait.py`'s 20 KB bait left
+    /// `test_types` suspended with the bait already deleted, and only a restart lifted it
+    /// (NOTES §10bm/§10bp).
+    ///
+    /// The others are STRUCTURAL and no event can change the answer: a table with no
+    /// primary key has no keyable row, and one with no CDC subject has nowhere to
+    /// publish. Re-testing those would burn a decode per event, forever, to learn
+    /// nothing.
+    pub fn probesEveryEvent(self: Reason) bool {
+        return self == .row_too_large;
+    }
+
     pub fn fixHint(self: Reason) []const u8 {
         return switch (self) {
             .no_primary_key => "add a primary key to replicate this table",
@@ -100,7 +119,25 @@ const Entry = struct {
     active: std.atomic.Value(bool) = .init(false),
     /// Why. Written only by the replication thread (or preflight, before it starts).
     reason: Reason = .no_primary_key,
+    /// When this refusal was (re)raised, for the probe cooldown. Replication thread only.
+    suspended_at_ms: i64 = 0,
 };
+
+/// How long a probed table stays suspended before a fitting row may lift it.
+///
+/// ⚠️ Hysteresis, not politeness. Lifting on the FIRST fit is correct for the case this
+/// exists for — one oversized row, deleted — but a table whose rows straddle the buffer
+/// (a text column with the occasional large document) would otherwise lift and
+/// re-suspend per event, and each flap costs a schema publish plus a suspension publish:
+/// two KV writes per row. Thirty seconds bounds that to two writes a minute while still
+/// recovering a genuinely-fixed table long before the restart it used to need.
+const lift_cooldown_ms: i64 = 30_000;
+
+/// Monotonic, in milliseconds. A cooldown measured on the wall clock would jump with
+/// NTP; `utils.nanoTimestamp` is CLOCK_MONOTONIC.
+fn nowMs() i64 {
+    return @intCast(utils.nanoTimestamp() / std.time.ns_per_ms);
+}
 
 pub const Registry = struct {
     allocator: std.mem.Allocator,
@@ -147,6 +184,11 @@ pub const Registry = struct {
             // gain an hstore column), so the reason is refreshed even when already active.
             e.reason = reason;
             if (!e.active.load(.acquire)) {
+                // Stamped only on the transition into refusal, not on every re-refusal:
+                // the cooldown measures how long the table has been suspended, and
+                // re-stamping would let a stream of oversized rows hold the lift off
+                // forever (the flap this bounds is the opposite problem).
+                e.suspended_at_ms = nowMs();
                 e.active.store(true, .release);
                 _ = self.refused_count.fetchAdd(1, .acq_rel);
             }
@@ -176,7 +218,7 @@ pub const Registry = struct {
             return error.RefusalRegistryFull;
         }
 
-        self.entries[n] = .{ .name = owned, .dropped = 0, .active = .init(true), .reason = reason };
+        self.entries[n] = .{ .name = owned, .dropped = 0, .active = .init(true), .reason = reason, .suspended_at_ms = nowMs() };
 
         // Publish last, and in reservation order: `len` may only advance to n + 1 once
         // every slot below n has published, or a reader walking `entries[0..len]` would
@@ -210,6 +252,72 @@ pub const Registry = struct {
     pub fn reasonFor(self: *const Registry, table: []const u8) ?Reason {
         const e = self.find(table) orelse return null;
         return if (e.active.load(.acquire)) e.reason else null;
+    }
+
+    /// What the replication loop must do with an event for this table.
+    pub const Verdict = enum {
+        /// Not refused — pack it.
+        pass,
+        /// Refused structurally: skip it, counted.
+        drop,
+        /// Refused for a data-dependent reason: TRY to pack it. Fitting lifts the
+        /// refusal (`liftIfProbing`); not fitting drops it, counted at that point
+        /// (`countDrop`) rather than here, because only the pack knows which it was.
+        probe,
+    };
+
+    /// The hot-path question, in one call: same single atomic load as `shouldDrop` when
+    /// nothing is refused, which is every event on a healthy bridge.
+    pub fn verdictFor(self: *Registry, table: []const u8) Verdict {
+        if (self.refused_count.load(.acquire) == 0) return .pass;
+
+        const e = self.find(table) orelse return .pass;
+        if (!e.active.load(.acquire)) return .pass;
+
+        // ⚠️ The cooldown gates the PROBE, not the lift. Inside it the table behaves
+        // exactly as a suspended table always did — events dropped and counted — because
+        // an event that packed while the table was still refused would publish CDC for a
+        // table whose clients are holding a suspension for it, which is the one state
+        // this must never produce. Outside it, every event is a probe.
+        if (e.reason.probesEveryEvent() and nowMs() - e.suspended_at_ms >= lift_cooldown_ms) {
+            return .probe;
+        }
+
+        self.recordDrop(e);
+        return .drop;
+    }
+
+    /// Count one dropped event for a table already known to be refused. Used by the
+    /// probe path, where the drop is decided after the attempt, not before it.
+    pub fn countDrop(self: *Registry, table: []const u8) void {
+        const e = self.find(table) orelse return;
+        if (!e.active.load(.acquire)) return;
+        self.recordDrop(e);
+    }
+
+    fn recordDrop(self: *Registry, e: *Entry) void {
+        e.dropped +|= 1;
+        // Saturating, not wrapping: a counter that rolls over to zero would read as
+        // "nothing was dropped", which is the one thing this must never say.
+        self.dropped_total.store(self.dropped_total.raw +| 1, .release);
+    }
+
+    /// A probed event packed successfully, so the row that suspended this table is gone
+    /// or has narrowed: lift the refusal.
+    ///
+    /// ⚠️ Call only after `verdictFor` answered `.probe` for this table — the cooldown
+    /// lives there, and this does not re-check it. Returns true when it actually cleared one, so
+    /// the caller knows to republish the descriptor its clients are still holding a
+    /// suspension for. Same cheap fast path as `verdictFor`.
+    pub fn liftIfProbing(self: *Registry, table: []const u8) bool {
+        if (self.refused_count.load(.acquire) == 0) return false;
+        const e = self.find(table) orelse return false;
+        if (!e.active.load(.acquire)) return false;
+        if (!e.reason.probesEveryEvent()) return false;
+        // No cooldown check here: `verdictFor` refuses to probe inside it, so reaching
+        // this point means an event was let through and fitted.
+        self.clear(table);
+        return true;
     }
 
     /// True if this table is refused; also counts the event as dropped.
@@ -434,4 +542,71 @@ test "refuse: concurrent writers each get their own slot" {
         try std.testing.expect(r.isRefused(try std.fmt.bufPrint(&buf, "t{d}", .{i})));
         try std.testing.expect(r.isRefused(try std.fmt.bufPrint(&buf, "t{d}", .{100 + i})));
     }
+}
+
+test "verdict: a structural refusal drops every event, a size refusal is probed once it may lift" {
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    try std.testing.expectEqual(Registry.Verdict.pass, r.verdictFor("users"));
+
+    // Structural: no event can change the answer, so it is dropped and counted forever.
+    try r.refuse("t_nopk", .no_primary_key);
+    try std.testing.expectEqual(Registry.Verdict.drop, r.verdictFor("t_nopk"));
+    try std.testing.expectEqual(Registry.Verdict.drop, r.verdictFor("t_nopk"));
+    try std.testing.expectEqual(@as(u64, 2), r.dropped_total.load(.acquire));
+
+    // Data-dependent: inside the cooldown it behaves identically — nothing may flow for
+    // a table whose clients hold a suspension.
+    try r.refuse("t_big", .row_too_large);
+    try std.testing.expectEqual(Registry.Verdict.drop, r.verdictFor("t_big"));
+    try std.testing.expect(r.isRefused("t_big"));
+
+    // Past the cooldown the next event is a probe (the clock is monotonic, so the test
+    // moves the stamp back rather than sleeping).
+    r.find("t_big").?.suspended_at_ms -= lift_cooldown_ms;
+    try std.testing.expectEqual(Registry.Verdict.probe, r.verdictFor("t_big"));
+    // A probe is NOT a drop: whether it counts is decided by whether it packed.
+    try std.testing.expectEqual(@as(u64, 3), r.dropped_total.load(.acquire));
+}
+
+test "liftIfProbing lifts only a size suspension, and only once" {
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    try r.refuse("t_nopk", .no_primary_key);
+    r.find("t_nopk").?.suspended_at_ms -= lift_cooldown_ms;
+    // Structural refusals are never lifted by data — that needs a migration (a DDL event).
+    try std.testing.expect(!r.liftIfProbing("t_nopk"));
+    try std.testing.expect(r.isRefused("t_nopk"));
+
+    try r.refuse("t_big", .row_too_large);
+    r.find("t_big").?.suspended_at_ms -= lift_cooldown_ms;
+    try std.testing.expect(r.liftIfProbing("t_big"));
+    try std.testing.expect(!r.isRefused("t_big"));
+    try std.testing.expectEqual(Registry.Verdict.pass, r.verdictFor("t_big"));
+    // Idempotent: a second fitting row in the same transaction must not republish.
+    try std.testing.expect(!r.liftIfProbing("t_big"));
+}
+
+test "countDrop records a probe that did not fit, and the history survives a lift" {
+    var r = Registry.init(std.testing.allocator);
+    defer r.deinit();
+
+    try r.refuse("t_big", .row_too_large);
+    r.countDrop("t_big");
+    r.countDrop("t_big");
+    try std.testing.expectEqual(@as(u64, 2), r.dropped_total.load(.acquire));
+
+    // An unrefused table cannot accrue drops — the probe path only calls this when the
+    // pack failed for a table it already knew was suspended.
+    r.countDrop("never_refused");
+    try std.testing.expectEqual(@as(u64, 2), r.dropped_total.load(.acquire));
+
+    r.find("t_big").?.suspended_at_ms -= lift_cooldown_ms;
+    try std.testing.expect(r.liftIfProbing("t_big"));
+    // The count is the operator's running total, so a lift must not reset it (same rule
+    // as re-refusing).
+    try std.testing.expectEqual(@as(u64, 2), r.dropped_total.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), r.find("t_big").?.dropped);
 }

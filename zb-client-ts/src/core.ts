@@ -139,14 +139,22 @@ export function streamHasGap(g: StreamGap): boolean {
 /// stream must not rebuild its whole replica.
 export function scopeSeeding(
   streams: Record<string, StreamGap>,
-  tables: Record<string, { route: string; seeded: boolean }>,
+  tables: Record<string, { route: string; sharedRoute?: string; seeded: boolean }>,
 ): { gapped: string[]; tablesToSeed: string[] } {
   const gapped = Object.entries(streams)
     .filter(([, g]) => streamHasGap(g))
     .map(([name]) => name);
   const gappedSet = new Set(gapped);
+  // ⚠️ TWO routes, for a tenant-scoped table. Its own rows ride `CDC_<tenant>`, but its
+  // OPEN-TENANT rows — the shared ones every tenant may read (`zb_reader_all` admits
+  // `tenant_col = <open tenant>`, and the producer's chain carries them because it reads
+  // under that policy) — ride `CDC_PUBLIC`. Scoping such a table to its tenant stream
+  // alone meant a gap on CDC_PUBLIC re-seeded the public TABLES and left every
+  // tenant-scoped table's shared rows silently stale (NOTES §10bq).
   const tablesToSeed = Object.entries(tables)
-    .filter(([, t]) => gappedSet.has(t.route) || !t.seeded)
+    .filter(([, t]) => gappedSet.has(t.route) ||
+                       (t.sharedRoute != null && gappedSet.has(t.sharedRoute)) ||
+                       !t.seeded)
     .map(([name]) => name);
   return { gapped, tablesToSeed };
 }

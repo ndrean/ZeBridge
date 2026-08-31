@@ -315,6 +315,15 @@ async def main():
             failed += 1
 
     finally:
+        # ⚠️ The probe bridge above created a replication slot, and an inactive slot pins
+        # WAL for the whole cluster until `max_slot_wal_keep_size` invalidates it — which
+        # is how the LIVE bridge's own slot got invalidated during a long suite run.
+        # `check.py` flags the orphan; leaving it for a human to drop makes every later
+        # full-battery run report a finding this scenario caused (2026-08-31).
+        slot = zb.BRIDGE_ARGS[zb.BRIDGE_ARGS.index("--slot") + 1] if "--slot" in zb.BRIDGE_ARGS else "zb_probe"
+        zb.psql(f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots "
+                f"WHERE slot_name = '{slot}' AND NOT active", quiet=True)
+        zb.psql(f"DELETE FROM public.zebridge_limits WHERE slot = '{slot}'", quiet=True)
         zb.psql(f"REVOKE INSERT ON public.{TABLE} FROM {writer}", quiet=True)
         still = zb.psql(
             f"SELECT count(*) FROM information_schema.role_table_grants "

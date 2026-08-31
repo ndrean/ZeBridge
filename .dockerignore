@@ -2,25 +2,43 @@
 zig-out/
 zig-cache/
 .zig-cache/
+.gitmodules
+chaos_test.sh
 
-# NATS data
-nats-data/
-
-# Dependencies (vendored)
 
 
 # IDE
 .vscode/
 .idea/
 .DS_Store
+.agents/
+.claude/
+.expert/
+.superpowers/
+docs/
 
 # Docker
+
+emitter/
+examples/
+int-test/
+libzb/
+nats-data/
+notes/
 postgres-data/
-/consumer/
+proxy/
+scripts/
+spike/
+telemetry/
+web-consumer/
+z-tests/
+zb-client-ts/
 src/test_files/
 src/proto/
 scripts/
 .lexical/
+*.patch
+LICENSE
 *.md
 *.tar.gz
 .dockerignore

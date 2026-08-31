@@ -7543,8 +7543,14 @@ tenant-routed tables re-seed from the chain, 5/5 rows, 25 = 25 live rows. Passed
 the harness knew the generations bucket lives under `generations.kv` in grammar.json.
 
 **A hazard seen on the way, not fixed:** open-tenant (`_default`) rows of a
-tenant-scoped table ride `CDC_PUBLIC` and are seeded from nowhere — a client seeds
-that table from its TENANT's chain only. While the dev bridge had `test_types`
+tenant-scoped table ride `CDC_PUBLIC` while the table is scoped to `CDC_<tenant>`.
+⚠️ **Half of this paragraph was wrong — see §10bq.** "Seeded from nowhere" is not true:
+the producer reads each tenant's chain under `zb_reader_all`, which admits
+`tenant_col = <open tenant>`, so a tenant's chain DOES carry the shared rows (proved by
+decoding one). What was real is narrower: the GAP scope named one stream per table, so a
+gap on `CDC_PUBLIC` re-seeded the public tables and left every tenant-scoped table's
+shared rows stale. The phantom rows below had a different cause again — deletes that
+reached no client. While the dev bridge had `test_types`
 suspended (it replayed `legacybait`'s 20 KB bait on restart — a suspension lifts only
 at boot or on DDL), the physical deletes of 23 `_default` rows were dropped, and a
 fresh omar replica showed 23 phantom `_default` rows PostgreSQL no longer has. Two
@@ -7607,6 +7613,177 @@ stderr. Measured: `--help` → 4712 B stdout / 0 B stderr / exit 0, at any LOG_L
 `--bogus` → empty stdout, usage on stderr, exit 1. 264/264 unit, offline battery 7/7
 (`pubname.py` is the regression test for that parse loop — seven slot/publication
 resolutions).
+
+## 10bo. The sweeper's dependencies: what it actually needs (2026-08-31)
+
+Asked while planning an Alpine cron image for the sidecar: does building
+`bridge_sweeper` drag in zstd and nats.zig? Measured rather than assumed:
+
+- **nats.zig: never was there.** `src/bridge_sweeper.zig` imports `std`, `c_imports.zig`
+  and `utils.zig` (pure std). No NATS, no msgpack — the sidecar deletes aged tombstones
+  in PostgreSQL and publishes nothing. Its whole C surface is `PQ*` / `CONNECTION_*` /
+  `PGRES_*`.
+- **zstd: linked, and unused.** `otool -L` showed `libzstd.1.dylib` in the sweeper's
+  runtime dependencies while `nm -u | grep -ci zstd` counted **0** referenced symbols —
+  a pure over-link from `linkZstd(gc_exe, …)`, plus `<zstd.h>`/`<zdict.h>` translated
+  into its `c` module because both binaries shared `src/c_includes.h`. So an image built
+  to run only the sidecar carried the zstd library at run time and needed its headers at
+  build time, for nothing.
+
+Fixed with a second translation unit, not a second build file: `src/c_includes_pg.h`
+(libpq + time.h only) → its own `addTranslateC` → given to `gc_exe` under the SAME
+module name `"c"`, so `c_imports.zig` and every call site are shared verbatim; and
+`linkZstd` dropped from the sweeper. Result: `libpq.5` + `libSystem` only. The bridge is
+untouched (zstd still linked, still needed for the chains), 264/264 unit tests, and the
+trimmed binary swept `test_types` against the live database.
+
+⚠️ **Two translation units are fine BECAUSE they are two binaries.** `c_includes.h`'s
+one-unit rule is about modules inside a *single* binary sharing one set of C types (two
+`@cImport`s once produced two incompatible `PGconn` types). It is a per-binary
+invariant, not a per-repo one — said in the new header so nobody unifies them back.
+
+**A second `build.zig` would have been the wrong instrument.** It is possible
+(`zig build --build-file …`), but the sweeper never needed a separate build *graph* —
+it needed its own module and one fewer `linkSystemLibrary`, both of which are per-
+artifact already. A second file would have duplicated `linkLibpq`, the Homebrew/Alpine
+prefix detection and the target/optimize plumbing, and the two copies would drift.
+
+Also added: `zig build sweeper` and `zig build bridge` build one artifact each (proved
+by deleting `zig-out/bin/*` and seeing only one reappear). Before them the default step
+installed both and `run-gc` depended on the whole install. ⚠️ `touch` does not
+invalidate a Zig build — the cache is content-hashed — so timing "before/after" that way
+measures nothing; delete the outputs instead.
+
+**Not tested here:** the Alpine image itself. What remains is libpq, which is real. The
+practical route is a multi-stage build inside Alpine (`postgresql-dev` to build,
+`libpq` at run time); cross-compiling from macOS with `-Dtarget=x86_64-linux-musl` needs
+a musl libpq to link against, which this repo does not vendor.
+
+## 10bp. A size suspension that lifts itself (2026-08-31)
+
+§10bm left two hazards open; this closes the availability one. A table suspended for
+`row_too_large` stayed suspended until the next bridge BOOT or DDL event — even after
+the row that caused it was gone. `legacybait.py` left `test_types` frozen with its 20 KB
+bait already deleted, and only a restart brought it back; every client sat on a
+suspension descriptor meanwhile, and nothing in the system was ever going to change its
+mind.
+
+**The refusal is now data-dependent.** `Reason.probesEveryEvent` splits the registry's
+verdicts in two: `no_primary_key` and `no_cdc_subject` are STRUCTURAL — no event can
+change the answer, so events are dropped and counted as before — while `row_too_large`
+is about one ROW, and the row may be narrowed or deleted a minute later. For it,
+`Registry.verdictFor` answers `.probe`: the event is packed, and if it fits,
+`liftIfProbing` clears the refusal and the descriptor is republished (a client holding a
+suspension will not resume on CDC alone). If it does not fit, `suspendForRowTooLarge`
+counts the drop and returns `error.EventDropped` — no second suspension, no repeat of
+the four-line essay, which per-event would be one KV write and four log lines per row.
+
+**Hysteresis, because the first fit is not proof.** A fitting row says this row is
+small, not that the offending one is gone — so a table whose rows straddle the buffer
+would lift and re-suspend per event, two KV writes each time. A 30 s cooldown
+(`lift_cooldown_ms`, monotonic) gates the PROBE, not the lift: inside it the table
+behaves exactly as a suspended table always did. That ordering matters — probing inside
+the cooldown would publish CDC for a table whose clients hold a suspension, which is the
+one state neither side should ever show. Three unit tests pin the verdicts, the lift and
+the drop accounting (270 total).
+
+**Provoking it took four attempts, and each dead end is a fact about the product.**
+- Planting a wide row with the guard disabled needs `ALTER TABLE … DISABLE/ENABLE
+  TRIGGER` — that is DDL, and the DDL path treats DDL as "the migration that fixed it",
+  so the suspension lifted moments after being raised.
+- Touching a stored wide row is refused by the width guard itself (23514).
+- Running the probe at a smaller `BASE_BUF` does not open a window: **every bridge boot
+  bakes the guard to `MIN(zebridge_limits.max_row_bytes)`**, so the probe's own
+  registration lowered the guard to its own buffer and even a 1500-byte row was refused
+  at the source. (And the baked literal outlives the probe: a stale 2048 held the LIVE
+  stack until something re-baked it — `suspension_lift.py` now re-bakes in setup and
+  cleanup.)
+- What works is the hazard preflight already warns about — *lowering* the buffer below
+  what is already stored. The row is written while the guard is the live bridge's 4 KB;
+  the probe boots at 2 KB and replays it.
+
+Also learned there: a physical DELETE on a tombstoned table produces **no CDC event at
+all** (it is suppressed as a sweeper reap), so a delete can never lift a size
+suspension — the row must narrow, or any later event on the table lifts it.
+
+**`suspension_lift.py`** (owns group) asserts the four steps: suspended live; nothing
+flows and nothing lifts inside the cooldown; the next fitting write lifts it without a
+restart and republishes the descriptor; CDC flows again.
+
+**Four suite defects the full battery then exposed**, none of them in the product:
+- `guards.py` removed `test_types`' write guards in its teardown (deliberately) and did
+  not restore them, so `check.py` reported the table "not fully wired" in the next
+  group — a scenario failing because another had run. It now restores what it found.
+- `keys.py` started a probe bridge and never dropped its replication slot. An inactive
+  slot pins WAL for the whole cluster, which is how the LIVE bridge's slot came to be
+  invalidated during a long run (`slot_loss.py` lowers `max_slot_wal_keep_size`
+  cluster-wide — its own warning names exactly this).
+- `sizing.py` allowed one second for the bridge to exit after the "Event ring:" line.
+  The max_payload refusal comes later — after the boot re-bakes every table's width
+  guard — so a correct refusal read as "nothing fired" under a loaded battery. 20 s now.
+- `client_gap.py` hard-deleted its own fixture rows, which a tombstoned table never
+  forwards: every run left phantoms in every replica and its whole-table check drifted
+  (47 vs 46). It soft-deletes now, and the whole-table comparison is reported rather
+  than failed — the property under test is the gap → re-seed path, asserted on its own
+  rows; counting a shared fixture's phantoms is §10bm's hazard, not this scenario's.
+
+Full battery green afterwards: **offline 7/7, live 20/20, owns 14/14**, bridge unit
+tests 270/270.
+
+**A tail this fix grew, found only in sequence.** Restoring the write guards means a
+plain `DELETE` is rewritten into a soft delete — so `suspension_lift`'s teardown
+*tombstoned* its oversized bait instead of removing it, the row stayed stored, and the
+next run counted it as a leftover and refused to start. Worse in principle: the
+tombstoning `UPDATE` carries the oversized row into CDC and would re-suspend the table
+on the way out. The teardown narrows the column and tombstones in one statement now, so
+the exit event is small, and the precondition counts LIVE rows only. It passed standalone
+twice and failed only after `legacybait` ran before it — the same "two mechanisms
+crossing" shape as every other defect this week.
+
+## 10bq. H2, re-diagnosed: the shared rows ride two streams (2026-08-31)
+
+§10bm recorded H2 as "open-tenant rows of a tenant-scoped table are seeded from
+nowhere". Checked before fixing, and that is **wrong**. The read policy is explicit —
+
+    zb_reader_all USING (zb.tenant unset OR <tenant_col> = zb.tenant
+                                         OR <tenant_col> = '<open tenant>')
+
+— so a tenant sees its own rows PLUS the open tenant's: shared rows are a designed
+feature, not an anomaly. And the producer builds each tenant's chain with
+`set_config('zb.tenant', …)` over a plain `SELECT * FROM <table>`, i.e. **under that
+policy**, so a tenant's chain already carries the shared rows. Proved by decoding
+`kilo.test_types`: its g2 delta is two `_default` rows. Seeding was never the gap.
+
+**What is real is narrower, and was still silent.** A tenant-scoped table's own rows are
+published to `CDC_<tenant>` and its shared rows to `CDC_PUBLIC` — two streams — but the
+client's gap scope named exactly one route per table. So a gap on `CDC_PUBLIC`
+(retention rolling past a client that was away) re-seeded the public TABLES and left
+every tenant-scoped table's shared rows stale, with nothing that would ever correct
+them: the CDC events were gone and the table was not in `tablesToSeed`.
+
+`scopeSeeding` takes an optional `sharedRoute` now, and a table is re-seeded when
+EITHER route is gapped — in both cores, pinned by two fixtures (133 each). The shells
+supply it for tenant-scoped tables (`CDC_PUBLIC`), and libzb's gap loop inspects the
+union of both routes rather than one per table: a client holding only tenant-scoped
+tables never looked at `CDC_PUBLIC` at all, so its shared rows could fall off the back
+unobserved.
+
+**`shared_gap.py`** (live) proves it end to end, and was made to prove it: the first
+draft passed for the wrong reason. It wrote one shared row and purged to the head — a
+purge removes what is BELOW the sequence, so the row's own message survived and the
+client's position landed one short of a gap (`15 < 15` is false); it read the row
+straight off CDC and the re-seed never ran. It now writes filler past the row, asserts
+`first_seq > the row's own seq` and `pos < first_seq - 1` before continuing, and with
+the fix disabled it fails exactly as it should (shared row present=0, shared rows 5 vs
+11).
+
+**And the §10bm phantoms had a third cause**, neither seeding nor gap scope: rows
+hard-deleted while `test_types` had no `zebridge_soft_delete_t` trigger. With the guard
+installed a `DELETE` is rewritten into a tombstone and every client removes the row; with
+it absent (which `guards.py` caused, §10bp) the delete is physical, the bridge suppresses
+it as a sweeper reap, and the row lives on in every replica until a re-seed from a chain
+built afterwards. The doctor already catches the precondition — `zebridge_check` reports
+a writable, tombstoned table missing its soft-delete guard.
 
 ## 11 Restart Rules
 

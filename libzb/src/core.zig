@@ -696,6 +696,10 @@ pub fn scopeSeeding(a: std.mem.Allocator, streams: Value, tables: Value) !Value 
         var it = tables.object.iterator();
         while (it.next()) |e| {
             const route = getStr(e.value_ptr.*, "route") orelse "";
+            // A tenant-scoped table's OPEN-TENANT rows ride CDC_PUBLIC while its own ride
+            // CDC_<tenant>: both must be gap-free, or a gap on one silently leaves half
+            // the table stale (NOTES §10bq).
+            const shared = getStr(e.value_ptr.*, "sharedRoute") orelse "";
             const seeded = if (e.value_ptr.* == .object)
                 (if (e.value_ptr.object.get("seeded")) |s| (s == .bool and s.bool) else false)
             else
@@ -703,6 +707,7 @@ pub fn scopeSeeding(a: std.mem.Allocator, streams: Value, tables: Value) !Value 
             var route_gapped = false;
             for (gapped.items) |g| {
                 if (std.mem.eql(u8, g.string, route)) route_gapped = true;
+                if (shared.len > 0 and std.mem.eql(u8, g.string, shared)) route_gapped = true;
             }
             if (route_gapped or !seeded) try to_seed.append(.{ .string = e.key_ptr.* });
         }

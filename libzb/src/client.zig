@@ -43,6 +43,13 @@ const TableState = struct {
     /// seed, on CDC and on the local optimistic apply alike. See `tombstoned`.
     tombstone_col: ?[]const u8,
     route: []const u8, // the CDC stream this table's events ride
+    /// For a tenant-scoped table: the stream its OPEN-TENANT rows ride (CDC_PUBLIC).
+    /// Those are the shared rows every tenant may read — `zb_reader_all` admits
+    /// `tenant_col = <open tenant>`, and the chain carries them because the producer
+    /// reads under that policy — so the table depends on TWO streams, and a gap on
+    /// either leaves half of it stale (NOTES §10bq). Null for a public table, whose
+    /// only route already IS that stream.
+    shared_route: ?[]const u8 = null,
     seed_seq: ?u64 = null,
     seed_stream: ?[]const u8 = null,
     seed_lsn: ?i64 = null,
@@ -425,6 +432,7 @@ pub const SyncClient = struct {
                 try std.fmt.allocPrint(ca, "{s}{s}", .{ self.cdc_prefix, self.tenant })
             else
                 self.cdc_public;
+            const shared_route: ?[]const u8 = if (tenant_col != null) self.cdc_public else null;
             const fresh: TableState = .{
                 .pk = try dupeStrings(ca, pk),
                 .cols = try dupeStrings(ca, names.items),
@@ -432,6 +440,7 @@ pub const SyncClient = struct {
                 .tenant_col = if (tenant_col) |v| try ca.dupe(u8, v) else null,
                 .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
                 .route = route,
+                .shared_route = shared_route,
             };
             if (self.states.getPtr(table)) |st| {
                 // In place: the seed gate (`seed_seq/seed_stream/seed_lsn`) belongs to
@@ -442,6 +451,7 @@ pub const SyncClient = struct {
                 st.tenant_col = fresh.tenant_col;
                 st.tombstone_col = fresh.tombstone_col;
                 st.route = fresh.route;
+                st.shared_route = fresh.shared_route;
             } else {
                 try self.states.put(ca, try ca.dupe(u8, table), fresh);
             }
@@ -491,9 +501,18 @@ pub const SyncClient = struct {
         defer ca.deinit();
         const a = ca.allocator();
         var gapped: std.StringArrayHashMapUnmanaged(void) = .empty;
-        var it = self.states.iterator();
+        // Every stream any table depends on — a tenant-scoped table names two (§10bq),
+        // and a client with no public table would otherwise never inspect CDC_PUBLIC at
+        // all, so its shared rows could fall off the back unnoticed.
+        var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var sit = self.states.iterator();
+        while (sit.next()) |e| {
+            try streams.put(a, e.value_ptr.route, {});
+            if (e.value_ptr.shared_route) |sr| try streams.put(a, sr, {});
+        }
+        var it = streams.iterator();
         while (it.next()) |e| {
-            const stream = e.value_ptr.route;
+            const stream = e.key_ptr.*;
             if (gapped.contains(stream)) continue;
             var info = self.t.js.getStreamInfo(stream) catch continue;
             defer info.deinit();
@@ -520,7 +539,8 @@ pub const SyncClient = struct {
             // locked database with a full re-seed (the same trap as `storedSeq`).
             const seeded = (try self.st.query(a,
                 "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }})).len > 0;
-            if (gapped.contains(st.route) or !seeded) {
+            const shared_gapped = if (st.shared_route) |sr| gapped.contains(sr) else false;
+            if (gapped.contains(st.route) or shared_gapped or !seeded) {
                 try self.applyChain(table);
             }
         }

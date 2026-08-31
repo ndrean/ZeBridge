@@ -32,10 +32,22 @@ import uuid
 
 import zb
 
+HAD_GUARDS = [False]
+
+
+def _lit(v):
+    """A SQL literal or NULL — the guards take three optional column names."""
+    return f"'{v}'" if v else "NULL"
+
 TABLE = sys.argv[1] if len(sys.argv) > 1 else "test_types"
 
 
 async def main():
+    # Did this fixture arrive guarded? Restored verbatim in the finally.
+    HAD_GUARDS[0] = zb.psql(
+        "SELECT count(*) FROM pg_trigger WHERE tgname = 'zebridge_bump_version_t' "
+        f"AND tgrelid = 'public.{TABLE}'::regclass").strip() not in ("", "0")
+
     failed = 0
     # From zebridge_catalogue (SYNC_RULES is only an override), exactly as the bridge
     # resolves them — reading the env alone exits on every catalogue-configured stack.
@@ -176,6 +188,17 @@ async def main():
         # ⚠️ Not optional. Left installed, every other scenario's cleanup DELETE becomes a
         # tombstone and rows accumulate across the suite.
         zb.psql(f"SELECT public.zebridge_remove_write_guards('public.{TABLE}'::regclass)", quiet=True)
+        # ⚠️ …but restore what was there BEFORE. A fixture that arrives guarded must leave
+        # guarded: removing them unconditionally left `test_types` without its version,
+        # soft-delete and tenant triggers, and `check.py` then reported the table "not
+        # fully wired" in the next group — a scenario failing because another had run
+        # (measured 2026-08-31).
+        if HAD_GUARDS[0]:
+            zb.psql(
+                f"SELECT public.zebridge_install_write_guards('public.{TABLE}'::regclass, "
+                f"{_lit(cols['version'])}, {_lit(cols['tombstone'])}, {_lit(cols['tenant'])})",
+                quiet=True,
+            )
         as_sweeper(f"DELETE FROM public.{TABLE} WHERE some_text LIKE 'guards:%' OR some_text='changed by a cron job' OR some_text='explicit'")
 
     return 1 if failed else 0

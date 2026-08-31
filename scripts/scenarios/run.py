@@ -68,6 +68,7 @@ GROUPS = {
         "connbudget":    ("bridge", "connection limits"),
         "sweeper":       ("bridge", "tombstone GC boundary"),
         "client_gap":    ("bridge", "a client returns after the tail is gone: gap → re-seed → converge"),
+        "shared_gap":    ("bridge", "a CDC_PUBLIC gap re-seeds tenant-scoped tables too — their shared rows ride it"),
     },
     "owns": {
         "sizing":        ("bridge", "BASE_BUF / ring sizing refusals"),
@@ -77,6 +78,7 @@ GROUPS = {
         "decode_integrity": ("bridge", "zero-copy decode never aliases"),
         "genproducer":   ("bridge", "chains: full, delta, prune"),
         "legacybait":    ("bridge", "pre-guard oversized rows"),
+        "suspension_lift": ("bridge", "a row_too_large suspension lifts live once its cause is gone"),
         "livebirth":     ("bridge", "a table born and enabled while running"),
         "race":          ("bridge", "24 writers against ingress"),
         "adversarial":   ("bridge", "fuzz the two untrusted entry points"),

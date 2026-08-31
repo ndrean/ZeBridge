@@ -80,6 +80,8 @@ The daemon is connected to Postgres with all the migrations up, and NATS up with
 
 A consumer connects to the NATS server, or to a [leaf node](https://docs.nats.io/learn/topologies/leaf-nodes#what-a-leaf-node-is) per tenant.
 
+A simplified example of a mobile connection:
+
 ```mermaid
 flowchart LR
      subgraph VPN["VPN"]
@@ -92,24 +94,17 @@ flowchart LR
         Bridge <--> |"TCP"| NATS
     end
 
-    NATS <-- "TLS" --> NATS_L
-    NATS <-- "TLS / WSS" --> Lib
+    NATS <-- "WSS" --> Lib
 
-
-     subgraph Edge["Server-side consumers (per tenant)"]
-        NATS_L["NATS Leaf<br>(tenant-scoped creds)"]
-        NATS_L <--> Svc["microservice<br>(zb-client-ts, or<br>libzb via FFI)"]
-    end
 
     subgraph Mobile["Mobile consumer"]
-        Lib["libzb<br>applier + SQLite"]
-        Lib -- "query · mutate · onChange<br>(C ABI, read-only handle)" --> App["App"]
+        Lib["libzb<br> SQLite"]
+        Lib --> App["App"]
     end
 
     style Bridge fill:#f59e0b,stroke:#d97706,color:#000
     style Lib fill:#fbbf24,stroke:#f59e0b,color:#000
     style NATS fill:#10b981,stroke:#059669,color:#000
-    style NATS_L fill:#b8f8e3,stroke:#059669,stroke-dasharray:5 5,color:#000
 ```
 
 | artifact | what it is | who uses it |
@@ -125,6 +120,79 @@ The C-ABI `libzb` library for FFI users - and the `zb-client-ts` library for Jav
 It abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, and local state tables for reconnection.
 
 The client library shrinks this orchestration down to two primitives: `query()` to read data and `mutate()` to propagate local optimistic writes back to the Postgres server, and `onChange()`.
+
+**An example of a deployed system**:
+
+```mermaid
+graph TD
+    %% Styling and Definitions
+    classDef external fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef proxy fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef internal fill:#dfd,stroke:#333,stroke-width:1px;
+    classDef secure fill:#fdd,stroke:#333,stroke-width:1px;
+    classDef telemetry fill:#fff2cc,stroke:#d6b656,stroke-width:1px;
+    classDef bridge fill:##bdf3ff,stroke:#ac0100,stroke-with:2px;
+
+    %% External Clients
+    User([mobile / SQLite <br> browser PGlite / SQLite]):::external
+    LocalDB[(localDB <br>PG/lite<br>SQLite)]:::secure
+    RemoteLeaf[NATS Leaf Node]:::internal
+    Consumer([Service]):::external
+
+    %% Cloudflare Edge
+    subgraph Cloudflare_Network  [Cloudflare Edge Proxy]
+        CF([Cloudflare Reverse Proxy <br> https://my-domain]):::proxy
+        CF@{ shape: cloud}
+    end
+
+    %% VPS Boundary
+    subgraph VPS [Your VPS Server]
+        HA([HAProxy <br>Reverse Proxy<br>:443]):::proxy
+        
+        %% Internal Apps
+        Bridge[[ZeBridge-1<br> :27434]]:::bridge
+        PG[(Postgres <br> :5432)]:::secure
+        PGREP[(StandBy<br>Replica<br>:5433)]:::secure
+        NATS[NATS Server<br> :4222]:::internal
+        
+        %% Telemetry & Monitoring Stack
+        Grafana([Grafana <br> :3000]):::telemetry
+        Prom[(Prometheus<br> :9090)]:::telemetry
+        NatsExp([NATS Exporter<br>Port :7777]):::telemetry
+    end
+
+    subgraph Consumer Service
+      Consumer
+      LocalDB
+      RemoteLeaf
+    end
+    %% External Connections to Cloudflare
+    User <==>|HTTPS <br> WSS| CF
+    RemoteLeaf <==>|Outbound Connect| CF
+    Consumer <==>|Connects Local| RemoteLeaf
+    Consumer -->LocalDB
+
+    %% Cloudflare to HAProxy Subdomain Routing
+    CF -.->|grafana.my-domain| HA
+    CF -.->|bridge.my-domain| HA
+    CF <==>|nats.my-domain| HA
+
+    %% HAProxy Internal Layer 7 Routing
+    HA -.->|localhost:3000| Grafana
+    HA -.->|localhost:27434/enroll| Bridge
+    HA <==>|wss://localhost:4222| NATS
+
+    %% Internal Component Dependencies
+    Bridge ==>|W| PG
+    PGREP ==>|R|Bridge
+    Bridge <==>|Publish / Subscribe <br> TCP| NATS
+    
+    %% Telemetry Data Flow
+    Prom -.->|Scrapes /metrics| Bridge
+    Prom -.->|Scrapes /metrics| NatsExp
+    NatsExp -.->|Monitors| NATS
+    Grafana -.->|Queries Data| Prom
+```
 
 ## Opinionated
 
@@ -226,6 +294,78 @@ That is the whole contract for an app author. The wire format — the NATS subje
 
 **Examples [TODO]**: [App.tsx](/web-consumer/src/App.tsx) (browser, live), a [Flutter](/flutter) example, and planned Node, Go, Python and Elixir microservices.
 
+## Safety & Guarantees
+
+### At-Least-Once Delivery
+
+The full mechanism — bridge ACKs PostgreSQL only after JetStream confirms, what happens if the bridge crashes, what happens if NATS crashes — is covered in [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages). The guarantee in one line: **no data loss between Postgres and NATS**, because the ACK to PostgreSQL only happens after JetStream has durably persisted the message, and JetStream's Msg-ID deduplication absorbs any retry.
+
+### Zero-Consumer Protection & Storage Bounds
+
+**What happens if PostgreSQL emits CDC events when no NATS clients are connected?** Nothing accumulates unbounded on either side. The bridge keeps ACKing PostgreSQL as normal — that only depends on JetStream, not on a consumer being present — so PostgreSQL's WAL stays bounded regardless. On the NATS side, the `CDC` stream's own retention policy (`--max-age`, `--max-bytes` — see [The NATS streams and buckets](#the-nats-streams-and-buckets)) purges old events even with zero subscribers. A client that reconnects after being offline re-seeds from the latest **generation chain** and resumes from `CDC`.
+
+### Idempotent Delivery
+
+**Message ID pattern:** `{lsn}-{table}-{operation}`
+
+* Example: `25cb3c8-users-insert`
+
+**NATS JetStream deduplication:**
+
+* Duplicate Msg-IDs are rejected
+* Ensures exactly-once semantics even with retries
+
+### Durability
+
+**PostgreSQL side:**
+
+* Logical replication slot preserves WAL
+* `max_slot_wal_keep_size=10GB` prevents unbounded growth
+
+**NATS JetStream side:**
+
+* File storage (`.storage=file`) survives restarts
+* Durable consumers track position across restarts
+
+**Consumer side:**
+
+* Durable consumer name persists progress
+* Survives consumer restarts
+
+### Schema Consistency
+
+Each chain manifest carries its cutoff — `cutoff_lsn`, and `cutoff_seq`, the CDC stream sequence captured before the build — so a consumer knows exactly which events its seed already contains and discards them (the library handles this — [the consumer side](#the-consumer-side--use-the-library)).
+
+Event ordering follows from [one WAL-reading thread per bridge](#design-overview): PostgreSQL hands the bridge a strict total order — transactions in **commit** order, and each transaction's changes in execution order — and the bridge reads it sequentially.
+
+⚠️ **Order is preserved WITHIN a table, not ACROSS tables.** A flush is grouped by subject before publishing, which collapses interleaving: when a run begins mid-pair, a child's batch can be published before the batch carrying its parents. Measured. Most consumers never notice — rows are applied by primary key, last-write-wins, idempotent — but a consumer holding a constraint that spans tables (a foreign key) must be order-tolerant, which is why `libzb` holds a row whose parent has not arrived and retries it after the next batch.
+
+⚠️ **Do not sort by `lsn` to "restore" order.** LSNs are not monotonic in delivery order: a transaction that begins earlier but commits later arrives later carrying a _lower_ LSN (measured: `lsn=8700486880` delivered before `lsn=8700486488`). Delivery order is the truth; `lsn` is a legacy watermark, nothing more — the commit-ordered `cutoff_seq` is the gate.
+
+### Graceful Shutdown
+
+**Shutdown sequence:**
+
+1. Signal handler (SIGINT/SIGTERM) sets stop flag
+2. Main thread finishes processing current WAL message
+3. Batch publisher drains internal queue
+4. Bridge sends final ACK to PostgreSQL (last confirmed LSN)
+5. All threads join cleanly
+
+```sh
+CTRL-C
+
+systemctl stop zebridge | pkill ./bridge | docker stop bridge
+```
+
+**Guarantees:**
+
+* No in-flight events lost
+* PostgreSQL knows exact resume point
+* Clean restart from last ACK'd LSN
+
+---
+
 ## Authentication between the parties
 
 Four separate keys, four separate boundaries.
@@ -239,53 +379,31 @@ Four separate keys, four separate boundaries.
 
 ### ZeBridge with Postgres
 
-<details><summary>The DBA credentials and psql access for Postgres</summary>
-
-```sh
-export ADMIN_DATABASE_URL=postgres://<role>:<password>@<host>:<port>/<dbname> \
-psql  -d $ADMIN_DATABASE_URL -c "...;"
-unset ADMIN_URL
-```
-
-or by reading the password from the file _~/.pgpass_ with the STRICT ordering below, so that `psql` will extract the password when the other credentials match:
-
-```sh
-#~/.pgpass 
-hostname:port:database:username:password.  #<- strict ordering
-#<- chmod 0600
-```
-
-```sh
-psql -h PG_HOST -p PG_PORT -U PG_USER -d PG_DB -c "...;"
-```
-
-</details>
-<br>
-
 **DBA creates two USER profils in .env.bridge for the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils.
 
 ```sh
-
-# .env.admin — the DBA sets the role names and passwords; the templates interpolate them
+# .env.admin — the DBA sets the role names and passwords; 
+# the templates interpolate them
 POSTGRES_READER_USER=bridge_reader      # created by init.core.template.sql
 POSTGRES_READER_PASSWORD=reader_password_changeme
 
 POSTGRES_WRITER_USER=bridge_writer      # created by init.write.template.sql
 POSTGRES_WRITER_PASSWORD=writer_password_changeme
-
-set -a && source .env.admin && source .env.bridge && set +a
 ```
 
 ### ZeBridge with NATS
 
-**DBA creates nkey pair for ZeBridge ↔ NATS**: mint the nkey pair a DBA installs between NATS and the bridge by using the bridge as a CLI:
+**DBA mints the nkey pair for ZeBridge ↔ NATS**: mint the nkey pair a DBA installs between NATS and the bridge by using the bridge as a CLI:
 
 ```sh
 ./bridge --gen-nkey >> .env.bridge
+```
 
-# NATS_BRIDGE_NKEY_PUB=UDZXDNW7BZUWYV3Y3WVV2NRG5ERSXZOPNQDVMVNSSMUC4OBGXRO3UTJ4
-# NATS_BRIDGE_NKEY_SEED=SUAPVJBFH7MWPQA4SJQTSP3QGXSZMWAWDOPKUIUAUALFS66X2DBIXQGVME
-# ⚠️ the seed IS the credential...
+appends to .env.bridge:
+
+```diff
++ NATS_BRIDGE_NKEY_PUB=UDZXDNW7BZUWYV3Y3WVV2NRG5ERSXZOPNQDVMVNSSMUC4OBGXRO3UTJ4
++ NATS_BRIDGE_NKEY_SEED=SUAPVJBFH7MWPQA4SJQTSP3QGXSZMWAWDOPKUIUAUALFS66X2DBIXQGVME
 ```
 
 Set the public key `NATS_BRIDGE_NKEY_PUB=UD...` in the NATS config to start the NATS server.
@@ -293,7 +411,7 @@ Set the public key `NATS_BRIDGE_NKEY_PUB=UD...` in the NATS config to start the 
 ```json
 authorization {
   users: [
-    { nkey: $NATS_BRIDGE_NKEY_PUB}
+    { nkey: $NATS_BRIDGE_NKEY_PUB }
   ]
 }
 ```
@@ -455,7 +573,7 @@ Seeding — reading the manifest, applying the chain, the two-clock bookkeeping 
 
 ### Memory Management
 
-The ring buffer is pre-allocated once at startup, in three parts: a fixed-size event slab, a data slab for row bytes, and a columns slab for column descriptors. Decoding a WAL message writes column values **directly into that pre-allocated space** — there is no per-column heap allocation on the hot path, and nothing to free afterward. The SPSC queue between the two threads carries only slot **indices**, not owned data; a slot is returned to the free pool once its batch is published, and the next event reuses the same memory.
+The ring buffer is pre-allocated once at startup, in three parts: a fixed-size event slab, a data slab for row bytes, and a columns slab for column descriptors. Decoding a WAL message writes column values directly into that pre-allocated space — there is no per-column heap allocation on the hot path, and nothing to free afterward. The SPSC queue between the two threads carries only slot indices, not owned data; a slot is returned to the free pool once its batch is published, and the next event reuses the same memory.
 
 **Arena allocator** (a separate, smaller one, for the encode/publish step):
 
@@ -497,93 +615,65 @@ The ring buffer is pre-allocated once at startup, in three parts: a fixed-size e
 * Wait between attempts: 2 seconds
 * Flush timeout: 10 seconds
 
-## Safety & Guarantees
+## Local PG, Daemon, NATS Deployment & Setup
 
-### At-Least-Once Delivery
+ZeBridge runs in three contexts:
 
-The full mechanism — bridge ACKs PostgreSQL only after JetStream confirms, what happens if the bridge crashes, what happens if NATS crashes — is covered in [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages). The guarantee in one line: **no data loss between Postgres and NATS**, because the ACK to PostgreSQL only happens after JetStream has durably persisted the message, and JetStream's Msg-ID deduplication absorbs any retry.
+* **the test suite** runs Postgres and NATS natively on the host — fast to iterate, and driven by the test scenarios. For development only.
+* **the docker compose evaluation** — trying ZeBridge out — is best as a `docker compose` stack: it mimics a production setup: Postgres via TCP, NATS via TCP, NATS-exporter (telemetry), Prometheus (TSDB pulling from ZeBridge), Grafana, bridge_sweeper, ZeBridge and the reverse proxy HAProxy in one file.  so a fresh environment comes up identically every time (fully Infrastructure-as-Code).
 
-### Zero-Consumer Protection & Storage Bounds
+  NATS-exporter, Prometheus, Grafana and ZeBridge are behind HAProxy.
+  You can access a prebuilt Grafana dashboard for a nice monitoring.
+  Rate limiting is delegated to the HAProxy.
+  NATS goes through HAProxy so serve consumers over WS (normally over WSS).
 
-**What happens if PostgreSQL emits CDC events when no NATS clients are connected?** Nothing accumulates unbounded on either side. The bridge keeps ACKing PostgreSQL as normal — that only depends on JetStream, not on a consumer being present — so PostgreSQL's WAL stays bounded regardless. On the NATS side, the `CDC` stream's own retention policy (`--max-age`, `--max-bytes` — see [The NATS streams and buckets](#the-nats-streams-and-buckets)) purges old events even with zero subscribers. A client that reconnects after being offline re-seeds from the latest **generation chain** and resumes from `CDC`.
+* **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for performance, the bridge should sit to the `nats-server` and communicate by _plain text_, over TCP.
 
-### Idempotent Delivery
+  For example, when all three run on host, during a spike (800 k writes/s), CPU usage is largely dominated by Postgres with around 70% of the host CPU, delivering 300 kCDC/s whilst ZeBridge uses ~20-25% and NATS ~5-10%.
+  * So what actually matters is **colocation**: the bridge should sit next to `nats-server` — their hop is plain TCP for speed, so it must not cross a network
+  * the strong setup puts **Postgres + zebridge + nats-server + Prometheus scrapper + Grafana + nats-exporter+bridge_sweeper + HAProxy** together behind one boundary, one domain. Consumers connect directly to NATS via WSS and the reverse proxy fronts the NATS-exporter, Prometheus and ZeBridge's HTTP surface over TLS — for **Grafana** and the consumer **JWT enrollment dance** (`/enroll`) — with a domain and whatever auth you put in front. The bridge holds no certificates of its own, and HAProxy should terminate the SSL (or sligntly less secure, the DNS Cloudflare).
 
-**Message ID pattern:** `{lsn}-{table}-{operation}`
 
-* Example: `25cb3c8-users-insert`
+### Docker compose setup
 
-**NATS JetStream deduplication:**
+You have the files [grammar.json, .env.docker, Dockerfile, docker-compose.full.yml], at the folders _/telemetry_ and _/proxy_ aside.
 
-* Duplicate Msg-IDs are rejected
-* Ensures exactly-once semantics even with retries
-
-### Durability
-
-**PostgreSQL side:**
-
-* Logical replication slot preserves WAL
-* `max_slot_wal_keep_size=10GB` prevents unbounded growth
-
-**NATS JetStream side:**
-
-* File storage (`.storage=file`) survives restarts
-* Durable consumers track position across restarts
-
-**Consumer side:**
-
-* Durable consumer name persists progress
-* Survives consumer restarts
-
-### Schema Consistency
-
-Each chain manifest carries its cutoff — `cutoff_lsn`, and `cutoff_seq`, the CDC stream sequence captured before the build — so a consumer knows exactly which events its seed already contains and discards them (the library handles this — [the consumer side](#the-consumer-side--use-the-library)).
-
-Event ordering follows from [one WAL-reading thread per bridge](#design-overview): PostgreSQL hands the bridge a strict total order — transactions in **commit** order, and each transaction's changes in execution order — and the bridge reads it sequentially.
-
-⚠️ **Order is preserved WITHIN a table, not ACROSS tables.** A flush is grouped by subject before publishing, which collapses interleaving: when a run begins mid-pair, a child's batch can be published before the batch carrying its parents. Measured. Most consumers never notice — rows are applied by primary key, last-write-wins, idempotent — but a consumer holding a constraint that spans tables (a foreign key) must be order-tolerant, which is why `libzb` holds a row whose parent has not arrived and retries it after the next batch.
-
-⚠️ **Do not sort by `lsn` to "restore" order.** LSNs are not monotonic in delivery order: a transaction that begins earlier but commits later arrives later carrying a _lower_ LSN (measured: `lsn=8700486880` delivered before `lsn=8700486488`). Delivery order is the truth; `lsn` is a legacy watermark, nothing more — the commit-ordered `cutoff_seq` is the gate.
-
-### Graceful Shutdown
-
-**Shutdown sequence:**
-
-1. Signal handler (SIGINT/SIGTERM) sets stop flag
-2. Main thread finishes processing current WAL message
-3. Batch publisher drains internal queue
-4. Bridge sends final ACK to PostgreSQL (last confirmed LSN)
-5. All threads join cleanly
+You must be a bit patient the first time you run:
 
 ```sh
-CTRL-C
-
-systemctl stop zebridge | pkill ./bridge | docker stop bridge
+docker compose -f docker-compose.full.yml --env-file .env.docker up -d
 ```
 
-**Guarantees:**
+The bridge is 30MB. The sweeper is 185kB
 
-* No in-flight events lost
-* PostgreSQL knows exact resume point
-* Clean restart from last ACK'd LSN
+> The NATS setup is a bit acrobatic. The image "nats-box" already contains `jq` (to substitute _grammar.json_).
+> Postgres is setup with `wal_level=logical`, and then we run a on-shot PG server initialization (it does not contain ``gettext-base` for `envsubst` so the image brings it in).
 
----
+You now have access to a Grafana dashboard at <http://localhost:3000> (admin|admin) and query the bridge at <http://localhost:8090/status>, <http://localhost:8090/metrics>.
 
-## Deployment & Setup
+It remains to run a client.
 
-### Server setup side
+### Host setup
 
-ZeBridge runs in three contexts, and they are not the same:
+You have `zstd`, `libpq` available on your host.
 
-* **The test suite** runs Postgres and NATS natively on the host — fast to iterate, and driven by the test scenarios. For development only.
-* **Evaluation** — trying ZeBridge out — is best as a **docker compose** stack: Postgres, NATS, and the bridge in one file, so a fresh environment comes up identically every time (fully Infrastructure-as-Code).
-* **Production** is your own topology, and here compose is _not_ a recommendation. Postgres may be a managed or remote instance; NATS may be remote too.
-* What actually matters is **colocation**: the bridge should sit next to `nats-server` — their hop is plain TCP for speed, so it must not cross a network
-* the strong setup puts **Postgres + zebridge + nats-server + Prometheus scrapper + HAProxy** together behind one boundary. Consumers connect directly to NATS via WSS and the reverse proxy fronts the ZeBridge's HTTP surface over TLS — for **Grafana** and the **JWT enrollment dance** (`/enroll`) — with a domain and whatever auth you put in front. The bridge holds no certificates of its own.
+We suppose the DBA credentials are:
 
-The DBA jobs:
+  ```sh
+  export ADMIN_DATABASE_URL=postgres://admin:s3cret@l127.0.0.1:5432/my_db
 
-* **Enable PG Logical Replication**: on host, `postgresql.conf` or in Docker command:
+  #or, in ~/.pgpass, 127.0.0.1:5432:my_db:admin:s3cret, and
+  ```
+
+You have a copy the files _.env.bridge, .env.admin, grammar.json_  next to the ZeBridge binary,
+
+You have generated the keychain for NATS and ZeBridge:
+
+  ```sh
+  ./bridge --gen-nkey >> .env.bridge
+  ```
+
+You have enabled PG Logical Replication. On host, in `postgresql.conf`:
 
   ```sh
   wal_level = logical
@@ -593,20 +683,82 @@ The DBA jobs:
   wal_sender_timeout = 300s  # 5 minutes
   ```
 
-* **Copy the files** _.env.bridge, .env.admin, grammar.json_  next to the ZeBridge binary.
+The SQL and config templates carry `${VAR}` placeholders, so they are rendered with `envsubst` from the admin environment first.
+
+```sh
+envsubst < init.core.template.sql  | psql -d "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -f -
+envsubst < init.write.template.sql | psql -d "$ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -f -
+# read/write only
+# The templates create no publication. Make it by name — this is the only supported
+# way, because it also attaches the three tables every bridge needs in its own
+# publication (zebridge_ddl_events, zebridge_gc_watermark, zebridge_user_tenants)
+
+unset ADMIN_DATABASE_URL
+```
+
 * **Read-only setup** — run `init.core.sql`. It creates the reader role, the publication, the catalogue, the schema/DDL triggers and the read-side guards. The bridge now streams changes and consumers read them; nothing can be written from the edge. This is the base, and for many uses it is the whole thing.
+
+A read-only deployment never touches `init.write.sql`; a read/write one runs both, in order.
+
 * **Read/write setup** — also run `init.write.sql`. It adds the writer role, the per-table write guards (version stamping, soft-delete, tenant guard), RLS scoping and the enrollment table. Now a consumer can push writes, resolved last-write-wins.
+
+* **create the publication**, by name. The templates create none — the name used to be substituted into them, which made it a second spelling of the bridge's own `--pub` with nothing checking that the two agreed:
+
+```sh
+psql "$ADMIN_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
+```
+
+⚠️ Do not hand-write `CREATE PUBLICATION`. Three tables have to be in **every** publication a bridge attaches to — `zebridge_ddl_events` (schema changes), `zebridge_gc_watermark` (the offline window), `zebridge_user_tenants` (tenant resolution) — and a publication missing them still boots a bridge, still carries user rows, and still passes every health check.
+
+➡ `zebridge_create_publication` attaches them; nothing else will.
+
+**Declare your tables** — the important step. Run your own migrations to create the application tables, and call `zebridge_enable(...)` for each table you want replicated. One call writes the `zebridge_catalogue` row, installs the guards, scopes RLS and adds the table to the publication, atomically:
+
+```sql
+SELECT zebridge_enable('public.notes', 
+  writable => true,
+  version_col => 'updated_at',
+  tenant_col => 'tenant_id',
+  -- named, never defaulted: this argument decides which feed carries the table.
+  -- Add create_publication => true to make the publication in the same call.
+  publication => 'my_pub',
+  dry_run => false
+);
+```
+
 * **Database diagnose**: the conformance of the database with regards to the targets (public/private with tenants, read-only or writable, user-tenants enrollment), once the two previous steps are up.
 
-A read-only deployment never touches `init.write.sql`; a read/write one runs both, in order. Everything else involves configuration settings with sensible defaults — the one dimension you usually set by hand is the memory buffer ([below](#the-memory-setting)).
+**Place the wire grammar.** ❗️ Copy `grammar.json` where the bridge and the NATS setup can read it — it holds the static names both sides share.
 
-#### Database diagnose
+**Configure and start NATS with JetStream.** Render the server config from its template, then start it:
+
+```sh
+envsubst < nats-server.conf.template > nats-server.conf
+nats-server -js -c nats-server.conf
+```
+
+**Operator/JWT** world (consumers): run `scripts/native/jwt-bootstrap.sh` once to build the operator, accounts and scoped signing keys, and start NATS with the operator config it emits instead.
+
+**Configure the bridge.** Fill in `.env.bridge`: the connection strings (`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL`), the credential (`NATS_CREDS` for JWT, or `NATS_BRIDGE_NKEY_SEED`), and `BASE_BUF` if the default is too small for your widest table.
+
+**Start the bridge.**
+
+```sh
+set -a && source .env.bridge && set +a
+./bridge --slot my_slot --pub my_pub --port 27434
+```
+
+At boot it reads the catalogue, reconciles the CDC streams, publishes every table's schema, and begins streaming.
+
+#### Verify the wiring
+
+— `python3 scripts/zbdoctor.py`. One command, one verdict (exit 0 green / 1 red, `--json` for CI). It checks the bridge's own health (`/health`, `/status`), the PostgreSQL posture (the `zebridge_audit_*()` functions, read _through_ the catalogue so a declared-public table is not flagged for being unscoped), the NATS topology (CDC streams, KV buckets), and the property that actually matters after boot: that a **fresh client** can resolve its tenant, read every schema, and seed from a chain whose objects are really there. Its last gate delegates to [`scripts/scenarios/check.py`](scripts/scenarios/check.py) for declared-vs-actual drift. Stdlib-only: it runs wherever `psql`, `nats` and python3 do.
 
 ??
 
 ```sh
 # "how is my database conforming?"
-PGPASSWORD=changeme psql -h localhost -U user -d my_db \
+PGPASSWORD=s3cret psql -h localhost -U admin -d my_db -p 5432 \
   -v ON_ERROR=1 \
   -v schemas=... \
   -1 \
@@ -616,7 +768,7 @@ PGPASSWORD=changeme psql -h localhost -U user -d my_db \
 **"What would enabling the table 'users' in the publication 'my_pub' do?"**:
 
   ```sh
-  PGPASSWORD=changeme psql -h localhost -p 5432 -U admin -d my_db -c \
+  PGPASSWORD=s3cret psql -h localhost -p 5432 -U admin -d my_db -c \
     "SELECT zebridge_enable('public.users'::regclass, publication => 'my_pub', dry_run => true);"
   ```
 
@@ -662,96 +814,6 @@ PGPASSWORD=changeme psql -h localhost -U user -d my_db \
   <br>
 
 > The `zebridge_enable(dry_run => false)` is the function that connects a table to the publication when the various checkups are all green.
-
-### The setup sequence
-
-On a fresh VPS, in order. Drive it with whatever you like — a shell script, your migration tool, Ansible; the steps are the same, and the compose stack simply does them for you.
-
-The SQL and config templates carry `${VAR}` placeholders, so they are rendered with `envsubst` from the admin environment first.
-
-```sh
-set -a && source .env.admin && source .env.bridge && set +a \
-```
-
-**Create the bridge's database objects.** Read side, then write side (write side only if you want edge writes):
-
-```sh
-export ADMIN_URL=postgres://admin:s3cret@127.0.0.1:5432/py_db 
-#or more secure, in ~/.pgpass, 127.0.0.1:5432:py_db:admin:s3cret, 
-# and ADMIN_URL without the password
-
-envsubst < init.core.template.sql  | psql -d "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -
-envsubst < init.write.template.sql | psql -d "$ADMIN_URL" -v ON_ERROR_STOP=1 -f -
-# read/write only
-# The templates create no publication. Make it by name — this is the only supported
-# way, because it also attaches the three tables every bridge needs in its own
-# publication (zebridge_ddl_events, zebridge_gc_watermark, zebridge_user_tenants)
-
-psql -d $ADMIN_URL -c "SELECT * FROM zebridge_create_publication('my_pub')"
-unset ADMIN_URL
-```
-
-Then create the publication, by name. The templates create none — the name used to be substituted into them, which made it a second spelling of the bridge's own `--pub` with nothing checking that the two agreed:
-
-```sh
-psql "$ADMIN_URL" -c "SELECT * FROM zebridge_create_publication('my_pub')"
-```
-
-⚠️ Do not hand-write `CREATE PUBLICATION`. Three tables have to be in **every** publication a bridge attaches to — `zebridge_ddl_events` (schema changes), `zebridge_gc_watermark` (the offline window), `zebridge_user_tenants` (tenant resolution) — and a publication missing them still boots a bridge, still carries user rows, and still passes every health check.
-
-➡ `zebridge_create_publication` attaches them; nothing else will.
-
-**Declare your tables** — the important step. Run your own migrations to create the application tables, and call `zebridge_enable(...)` for each table you want replicated. One call writes the `zebridge_catalogue` row, installs the guards, scopes RLS and adds the table to the publication, atomically:
-
-```sql
-SELECT zebridge_enable('public.notes', 
-  writable => true,
-  version_col => 'updated_at',
-  tenant_col => 'tenant_id',
-  -- named, never defaulted: this argument decides which feed carries the table.
-  -- Add create_publication => true to make the publication in the same call.
-  publication => 'my_pub',
-  dry_run => false
-);
-```
-
-**Place the wire grammar.** ❗️ Copy `grammar.json` where the bridge and the NATS setup can read it — it holds the static names both sides share.
-
-**Configure and start NATS with JetStream.** Render the server config from its template, then start it:
-
-```sh
-envsubst < nats-server.conf.template > nats-server.conf
-nats-server -js -c nats-server.conf
-
-#via Docker:
-docker run -p 4222:4222 -p 8222:8222 nats:latest -js -m 8222
-```
-
-**Operator/JWT** world (consumers): run `scripts/native/jwt-bootstrap.sh` once to build the operator, accounts and scoped signing keys, and start NATS with the operator config it emits instead.
-
-**Configure the bridge.** Fill in `.env.bridge`: the connection strings (`DATABASE_READER_URL`, `DATABASE_WRITER_URL`, `NATS_URL`), the credential (`NATS_CREDS` for JWT, or `NATS_BRIDGE_NKEY_SEED`), and `BASE_BUF` if the default is too small for your widest table.
-
-**Start the bridge.**
-
-```sh
-set -a && source .env.bridge && set +a
-./bridge --slot my_slot --pub my_pub --port 9090
-```
-
-At boot it reads the catalogue, reconciles the CDC streams, publishes every table's schema, and begins streaming.
-
-**Verify the wiring** — `python3 scripts/zbdoctor.py`. One command, one verdict (exit 0 green / 1 red, `--json` for CI). It checks the bridge's own health (`/health`, `/status`), the PostgreSQL posture (the `zebridge_audit_*()` functions, read _through_ the catalogue so a declared-public table is not flagged for being unscoped), the NATS topology (CDC streams, KV buckets), and the property that actually matters after boot: that a **fresh client** can resolve its tenant, read every schema, and seed from a chain whose objects are really there. Its last gate delegates to [`scripts/scenarios/check.py`](scripts/scenarios/check.py) for declared-vs-actual drift. Stdlib-only: it runs wherever `psql`, `nats` and python3 do.
-
-### Roles and privileges
-
-ZeBridge uses two PostgreSQL roles:
-
-* `bridge_reader` — SELECT + REPLICATION, physically unable to write (the read side, `init.core.sql`).
-* `bridge_writer` — no table privilege until a table is opened one at a time (the write side, `init.write.sql`).
-
-The superuser credentials create these roles **once**, at the init step; the bridge never connects as the superuser at runtime. Each role carries a connection-limit budget, so the bridge cannot exhaust the database.
-
-📖 **[SECURITY.md](SECURITY.md) is the reference**: what each role holds, what the schema must satisfy to be writable or tenant-scoped, what to do after a migration, and what is _not_ protected — with a table of where every claim is tested.
 
 ### NATS streams and buckets
 
@@ -897,7 +959,7 @@ accounts {
 The bridge is told which slot and which publication to use, and refuses to start without both.
 
 ```bash
-bridge --slot my_slot --pub my_pub          # flags
+./bridge --slot my_slot --pub my_pub          # flags
 BRIDGE_CDC_SLOT=my_slot BRIDGE_CDC_PUBLICATION=my_pub bridge   # or the environment
 ```
 
@@ -916,148 +978,6 @@ The slot is created by the bridge if it does not exist; the publication is not �
   --help, -h        Show this help message
 ```
 
-### Local Development (Bridge on Host Machine, the infra on Docker)
-
-**Use case**: Development workflow where you run the bridge binary locally and connect to containerized PostgreSQL + NATS.
-
-**Prerequisites**:
-
-* PostgreSQL admin has created the publication (`my_pub` below) and the bridge user (`bridge_reader`)
-* NATS admin has created the MUTATIONS stream, KV buckets, and credentials — the bridge creates the CDC streams at boot
-
-**Step 1**: Start infrastructure containers:
-
-```bash
-docker compose \
-  -f docker-compose.prod.yml \
-  --env-file .env.prod up  -d
-```
-
-**Step 2**: Build the bridge locally:
-
-```bash
-zig build -Doptimize=ReleaseFast
-```
-
-**Step 3**: Run the bridge with environment variables:
-
-```bash
-set -a && source .env.bridge && set +a && \
-NATS_NKEY_SEED=SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q \
-./zig-out/bin/bridge --slot my_slot --pub cdc_pub
-```
-
-#### Two families of credentials, two files
-
-The variables above are the bridge's. A second family — `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DB` `POSTGRES_BRIDGE_*`, `POSTGRES_WRITER_*` — is the **admin** set: the superuser that `bridge-init` uses to run `init.sql` and the passwords it assigns to the roles it creates.
-They live in `.env.admin` — together with `PG_PUBLISH_PORT` and
-the nkey's public half `NATS_BRIDGE_NKEY_PUB`, all of which are read by compose or by the init containers and
-
-The bridge does not read any of them. The bridge reads `.env.bridge`. The bridge refuses to start without `DATABASE_READER_URL`:
-
-```bash
-# the stack — .env.admin only: every service compose starts is an admin task
-NATS_BRIDGE_NKEY_SEED="SU..." docker compose -f docker-compose.full.yml \
-  --env-file .env.admin up -d
-
-# the bridge — .env.bridge only, so no superuser password enters this shell
-set -a && source .env.bridge && set +a
-NATS_BRIDGE_NKEY_SEED="SU..." ./zig-out/bin/bridge --slot my_slot --pub my_pub
-```
-
----
-
-### Local Build Instructions
-
-### Quick first run
-
-* Zig 0.16.0 or later
-* Docker & Docker Compose (for PostgreSQL and NATS)
-* `libpq` **14 or later** — the only C dependency, linked from the system
-  (`brew install libpq` on macOS, `apk add postgresql-dev` / `apt install libpq-dev` on Linux). Override its location with `zig build -Dlibpq-prefix=/path`.
-
-  ⚠️ The version floor is on **libpq at build time, not on the PostgreSQL server**.
-  The write path uses pipeline mode (`PQenterPipelineMode`, libpq 14+), which the libpq documentation describes as _"client-side and compatible with any server supporting the v3 extended query protocol"_ — so the database itself can be older (Postgres ≧ 14).
-  It buys a mutation costing **one** network round trip instead of four, which is the difference between ~20 ms and ~80 ms per row against a remote database and is invisible when PostgreSQL is on the same host.
-
-There is no vendored-library build step: the NATS client is pure Zig and lives in `/nats.zig`.
-
-**NKEY**: a test public key is already supplied in `.env.admin`, and its corresponding seed is used below. See [Notes on nkeys](#notes-on-nkeys) to generate your own.
-
-**Start Docker Infrastructure**: (PG, NATS, Prometheus, Grafana)
-
-```bash
-# Start PostgreSQL with logical replication enabled
-docker compose -f docker-compose.full.yml --env-file .env.admin up -d postgres
-```
-
-**Build and run ZeBridge on host**:
-
-```bash
-zig build (-Doptimize=ReleaseFast)
-#output -> ./zig-out/bin/bridge
-```
-
-```sh
-set -a && source .env.bridge && set +a && \
-NATS_BRIDGE_NKEY_SEED="SUAPSL67RKOUDZFREHHDWUXDXLYZKEHMWEXMIUC35Z4Z2LXWP55SWVJS4Q" \
-LOG_LEVEL=info \
-./zig-out/bin/bridge --slot my_slot --pub my_pub
-```
-
-**Run the test consumer webapp**:
-
-```sh
-cd web-consumer
-pnpm run dev
-# localhost:5173
-```
-
-**Monitoring**:
-
-Open localhost:3000
-
-( _admin|admin_, then set the password of your choice)
-
-**Run Tests**:
-
-```bash
-zig build test
-```
-
-`Python` and `envsubt` on host to play _/scripts/scenarios_
-
----
-
-### Notes on nkeys
-
-ZeBridge authenticates to NATS with **nkey**, signed with `std.crypto.sign.Ed25519` — pure Zig, no OpenSSL linked.
-
-**How to generate nkey for NATS**:
-
-```sh
-./bridge --gen-nkey
-
-# NATS_BRIDGE_NKEY_PUB=U...
-# NATS_BRIDGE_NKEY_SEED=S...
-```
-
-In _nats-server.conf_, set the **public** key:
-
-```json
-authorization {
-  users: [
-   { nkey: "UD..."}
-  ]
-}
-```
-
-Use the **seed** nkey to start the daemon.
-
----
-
-**Contributions welcome!** If you find it useful (or find gaps), feedback is valuable.
-
 ## Configuration & Tuning
 
 ### Configuration
@@ -1065,6 +985,8 @@ Use the **seed** nkey to start the daemon.
 All configuration constants are centralized in `src/config.zig` and `grammar.json`. Per-table replication rules (tenant column, LWW columns, tombstone) live in `zebridge_catalogue`.
 
 ### Key Settings
+
+**bridge-sweeper configuartion**:
 
 **Generation configuration:**
 
@@ -1102,7 +1024,7 @@ See `src/config.zig` for all tunables.
 
 ### Sizing `BASE_BUF` and `RING_BUFFER_COUNT`
 
-⚠️ read this one
+⚠️ Read this one
 
 These values are not independent, and getting them wrong has a visible consequence rather than a silent one.
 
@@ -1275,7 +1197,7 @@ Raising `max_payload` in `nats-server.conf` is possible but affects every client
 
 ---
 
-### Restart rules
+## ZeBridge Restart rules
 
 One rule covers almost everything:
 

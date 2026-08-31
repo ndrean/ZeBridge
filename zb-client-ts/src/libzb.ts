@@ -1545,15 +1545,21 @@ export class ZeBridge {
         const rows: any[] = (await this.run(`SELECT tbl FROM _zebridge_generations`)) ?? [];
         seededBefore = new Set(rows.map((r: any) => r.tbl));
       } catch { /* fresh replica */ }
-      const tableRoutes: Record<string, { route: string; seeded: boolean }> = {};
+      const tableRoutes: Record<string, { route: string; sharedRoute?: string; seeded: boolean }> = {};
       for (const table of this.syncedTables.keys()) {
         // Same null as above: a tenant-scoped table this principal cannot route is
         // left out of the seeding decision entirely rather than routed to a stream
         // name built from an empty token.
         const t = this.effectiveTenantFor(table);
         if (t === null) continue;
+        const route = this.cdcStreamForTenant(t);
+        const publicStream = this.config.grammar.cdc_streams?.public;
         tableRoutes[table] = {
-          route: this.cdcStreamForTenant(t),
+          route,
+          // A tenant-scoped table's OPEN-TENANT rows — the shared ones every tenant may
+          // read — ride CDC_PUBLIC while its own ride CDC_<tenant> (§10bq). Both streams
+          // must be gap-free or half the table goes quietly stale.
+          ...(publicStream && route !== publicStream ? { sharedRoute: publicStream } : {}),
           seeded: seededBefore.has(table),
         };
       }

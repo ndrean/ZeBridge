@@ -1,7 +1,7 @@
 services:
   # 1. Primary PostgreSQL (Source DB with Logical Replication)
   postgres-primary:
-    image: postgres:18
+    image: postgres:18.6-alpine3.24
     container_name: postgres-primary
     # The server's own superuser bootstrap — admin territory, same as bridge-init.
     env_file:
@@ -137,6 +137,36 @@ services:
   # a `depends_on` here, not by editing the script.
   #
   #     docker compose -f docker-compose.full.yml --env-file .env.admin run --rm zb-check
+  sweeper:
+    build:
+      context: .
+      dockerfile: Dockerfile.sweeper
+    container_name: zb_sweeper
+    # ports:
+    # Published on its own knob: the host dev loop usually holds 9090 already.
+    # - "${BRIDGE_PUBLISH_PORT}:${BRIDGE_PORT}" #<--
+    depends_on:
+      bridge-init:
+        condition: service_completed_successfully
+      postgres-primary:
+        condition: service_healthy
+      # nats-init:
+      #   condition: service_completed_successfully
+    env_file:
+      - .env.docker
+    volumes:
+      # The wire grammar is NOT in the image — stream, subject and KV names are
+      # deployment data, and baking them in would make the image deployment-specific.
+      - ./grammar.json:/grammar.json:ro
+    environment:
+      # ⚠️ No PG_HOST/PG_PORT here. They used to be, pointing at 55432 (the PUBLISHED
+      # port) from inside the network where it is 5432 — harmless only because the
+      # bridge stopped assembling connections out of parts: DATABASE_READER_URL in
+      # .env.docker is the single source, and it already names postgres-primary:5432.
+      TOPOLOGY_PATH: /grammar.json
+    networks:
+      - cdc-net
+    restart: unless-stopped
   zb-check:
     image: python:3.12-slim
     container_name: zb-check
@@ -350,7 +380,7 @@ services:
 
   # 6. Primary Postgres Initialization (Creates publication, users, test tables)
   bridge-init:
-    image: postgres:18
+    image: postgres:18.6
     container_name: bridge-init
     depends_on:
       postgres-primary:
@@ -421,7 +451,7 @@ services:
     # profiles: [ "bridge" ]
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.bridge
     container_name: bridge
     # ports:
     # Published on its own knob: the host dev loop usually holds 9090 already.
@@ -477,7 +507,7 @@ services:
   # moment either moved. One port in front of both, so the client knows one URL.
   proxy:
     # profiles: [ "bridge" ]
-    image: haproxy:latest
+    image: haproxy:3.4.4-alpine
     container_name: zb_proxy
     depends_on:
       bridge:
@@ -515,7 +545,7 @@ services:
       - cdc-net
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:nightly-slim
     container_name: zebridge_grafana
     ports:
       # Loopback, same reasoning as Prometheus above — Grafana ships with a known

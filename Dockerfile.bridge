@@ -40,8 +40,11 @@ RUN ARCH=$(uname -m) && \
 
 WORKDIR /build
 COPY . .
+# COPY build.zig build.zig.zon ./
+# COPY src/ ./src/
+# COPY nats.zig/ ./nats.zig/
 
-RUN zig build -Doptimize=ReleaseFast
+RUN zig build bridge -Doptimize=ReleaseFast
 
 FROM ${BASE_IMAGE}
 

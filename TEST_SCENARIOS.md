@@ -78,9 +78,11 @@ listed and never run by it — those report, they do not assert.
 | writes committed while the bridge was down — and after a `kill -9` — replay from the slot | `downtime.py` |
 | a row written outside the client is in its replica in single-digit ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
+| a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished | `suspension_lift.py` |
 | the broker gone for minutes: the bridge waits, ACKs nothing (`confirmed_flush_lsn` holds), the same process resumes, every row lands | `nats_outage.py` |
 | the slot invalidated: boot refuses with the recovery; `ZB_FEED_RESTART=1` restarts the feed (streams, chains, manifests); a client's position beyond `last_seq` is a gap and it re-seeds from a fresh full | `slot_loss.py` |
 | the client away past retention: the tail it needs is gone → gap → re-seed from the chain → converge | `client_gap.py` |
+| a tenant-scoped table's SHARED (open-tenant) rows ride `CDC_PUBLIC`: a gap there re-seeds that table too, not just the public ones | `shared_gap.py` |
 
 ### The write path (PROTOCOL §7)
 

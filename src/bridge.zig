@@ -1429,17 +1429,23 @@ pub fn main(init: std.process.Init) !void {
                                             tx_slots_count += 1;
                                             cdc_events += 1;
                                         }
-                                    } else if (!event_proc.refused.shouldDrop(rel.name)) {
-                                        // Refused: no schema was published for this table, so a
-                                        // client receiving the row would have nowhere to put it.
-                                        const slot_idx = try event_proc.packMutationToSlot(
+                                    } else if (event_proc.refused.verdictFor(rel.name) != .drop) {
+                                        // Refused structurally: no schema was published for this
+                                        // table, so a client receiving the row would have nowhere
+                                        // to put it. A `row_too_large` suspension is PROBED
+                                        // instead (§10bp) — the pack decides, and lifts it if the
+                                        // row fits; `EventDropped` is that probe failing again.
+                                        const slot_idx = event_proc.packMutationToSlot(
                                             arena_allocator,
                                             rel,
                                             ins.tuple_data,
                                             null,
                                             "INSERT",
                                             wal_msg.wal_end,
-                                        );
+                                        ) catch |err| switch (err) {
+                                            error.EventDropped => continue,
+                                            else => return err,
+                                        };
                                         tx_slots_buf[tx_slots_count] = slot_idx;
                                         tx_slots_count += 1;
                                         cdc_events += 1;
@@ -1477,20 +1483,23 @@ pub fn main(init: std.process.Init) !void {
                                         }
                                         break :blk_upd;
                                     }
-                                    if (event_proc.refused.shouldDrop(rel.name)) break :blk_upd;
+                                    if (event_proc.refused.verdictFor(rel.name) == .drop) break :blk_upd;
                                     if (tx_slots_count >= tx_slots_buf.len) {
                                         // Long transaction: hand this batch over so the publisher can drain
                                         // and slots return to the pool. The LSN is still acked at .commit.
                                         try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
                                     }
-                                    const slot_idx = try event_proc.packMutationToSlot(
+                                    const slot_idx = event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
                                         upd.new_tuple,
                                         upd.old_tuple,
                                         "UPDATE",
                                         wal_msg.wal_end,
-                                    );
+                                    ) catch |err| switch (err) {
+                                        error.EventDropped => break :blk_upd,
+                                        else => return err,
+                                    };
                                     tx_slots_buf[tx_slots_count] = slot_idx;
                                     tx_slots_count += 1;
                                     cdc_events += 1;
@@ -1528,7 +1537,7 @@ pub fn main(init: std.process.Init) !void {
                                         } else |err| log.warn("revoked tenant mapping: could not decode the key: {s}", .{@errorName(err)});
                                         break :blk_del;
                                     }
-                                    if (event_proc.refused.shouldDrop(rel.name)) break :blk_del;
+                                    if (event_proc.refused.verdictFor(rel.name) == .drop) break :blk_del;
 
                                     // ── The sweeper's reaps are not client data ──────────
                                     //
@@ -1566,14 +1575,21 @@ pub fn main(init: std.process.Init) !void {
                                         // and slots return to the pool. The LSN is still acked at .commit.
                                         try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
                                     }
-                                    const slot_idx = try event_proc.packMutationToSlot(
+                                    // A DELETE carries only the replica identity, so it is
+                                    // the SMALLEST event a table produces — and therefore
+                                    // the one most likely to lift a `row_too_large`
+                                    // suspension whose cause is the row being deleted.
+                                    const slot_idx = event_proc.packMutationToSlot(
                                         arena_allocator,
                                         rel,
                                         del.old_tuple,
                                         null,
                                         "DELETE",
                                         wal_msg.wal_end,
-                                    );
+                                    ) catch |err| switch (err) {
+                                        error.EventDropped => break :blk_del,
+                                        else => return err,
+                                    };
                                     tx_slots_buf[tx_slots_count] = slot_idx;
                                     tx_slots_count += 1;
                                     cdc_events += 1;

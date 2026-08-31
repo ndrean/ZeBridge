@@ -55,7 +55,13 @@ def boot(name: str, **env) -> tuple[int | None, str]:
         br.wait_for_log("Event ring:", timeout=25)
         code = br.proc.poll()
         if code is None:
-            code = br.wait_for_exit(timeout=1)
+            # ⚠️ Generous, and it has to be. "Event ring:" is logged BEFORE the
+            # max_payload refusal, and between them the bridge registers its row-width
+            # budget — which re-bakes the width guard of every published table (DDL per
+            # table) when the budget changed. One second was enough by hand and not
+            # under a loaded battery: the run reported "exit None, nothing fired" for a
+            # bridge that refused correctly a moment later (measured 2026-08-31).
+            code = br.wait_for_exit(timeout=20)
         return code, br.text()
 
 

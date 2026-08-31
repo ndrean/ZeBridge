@@ -59,6 +59,20 @@ pub fn build(b: *std.Build) void {
     translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
     const c_mod = translate_c.createModule();
 
+    // The sweeper's own, PostgreSQL only (src/c_includes_pg.h): it is a separate
+    // binary, so it needs neither zstd's headers at build time nor libzstd at run
+    // time. Exposed to it under the SAME module name "c", so src/c_imports.zig and
+    // every call site are shared verbatim between the two executables.
+    const pg_translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/c_includes_pg.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    pg_translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+    pg_translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include", "postgresql" }) });
+    const pg_c_mod = pg_translate_c.createModule();
+
     const mod = b.addModule("bridge", .{
         .root_source_file = b.path("src/bridge.zig"),
         .target = target,
@@ -112,8 +126,6 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // `bridge_sweeper`, not `gc`: a two-letter binary on PATH is asking to collide with
-    // something else (git's `gc`, among others), and the name should say what it sweeps.
     const gc_exe = b.addExecutable(.{
         .name = "bridge_sweeper",
         .root_module = b.createModule(.{
@@ -121,14 +133,26 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "c", .module = c_mod },
+                .{ .name = "c", .module = pg_c_mod },
             },
         }),
     });
     gc_exe.root_module.link_libc = true;
     linkLibpq(gc_exe, b, prefix);
-    linkZstd(gc_exe, b, zstd_prefix);
+    // ⚠️ No linkZstd here: the sweeper references no zstd symbol (it only runs
+    // DELETEs against PostgreSQL), and linking it put libzstd in the runtime
+    // dependencies of every image built to run the sidecar alone.
     b.installArtifact(gc_exe);
+
+    // `zig build sweeper` — the sidecar alone. The default step installs both binaries
+    // and `run-gc` depends on the whole install, so a loop that only touches
+    // src/bridge_sweeper.zig was paying for the bridge's compile every time.
+    const sweeper_step = b.step("sweeper", "Build only bridge_sweeper (the GC sidecar)");
+    sweeper_step.dependOn(&b.addInstallArtifact(gc_exe, .{}).step);
+
+    // The same for the daemon, so the pair reads symmetrically: `zig build bridge`.
+    const bridge_step = b.step("bridge", "Build only the bridge daemon");
+    bridge_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
     const gc_run_cmd = b.addRunArtifact(gc_exe);
     gc_run_cmd.step.dependOn(b.getInstallStep());
