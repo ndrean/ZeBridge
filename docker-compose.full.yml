@@ -418,14 +418,14 @@ services:
   # A commented-out service is an untested service; a profile keeps it out of the
   # default `up` while still building and running on demand.
   bridge:
-    profiles: ["bridge"]
+    # profiles: [ "bridge" ]
     build:
       context: .
       dockerfile: Dockerfile
     container_name: bridge
-    ports:
-      # Published on its own knob: the host dev loop usually holds 9090 already.
-      - "${BRIDGE_PUBLISH_PORT}:${BRIDGE_PORT}"
+    # ports:
+    # Published on its own knob: the host dev loop usually holds 9090 already.
+    # - "${BRIDGE_PUBLISH_PORT}:${BRIDGE_PORT}" #<--
     depends_on:
       bridge-init:
         condition: service_completed_successfully
@@ -452,7 +452,7 @@ services:
       # browser client could not reach /enroll. The README's warning about 0.0.0.0
       # exposing unauthenticated telemetry is about a HOST process; here the namespace
       # is the boundary and the published port is the deliberate exposure.
-      BRIDGE_BIND: 0.0.0.0
+      # BRIDGE_BIND: 0.0.0.0 #<--
       # No seed mapping here. The bridge reads NATS_BRIDGE_NKEY_SEED — the same name
       # nats-init and nats-config-gen use — so .env.docker's copy reaches it through
       # env_file with nothing in between. A translation line
@@ -462,9 +462,9 @@ services:
       # ⚠️ Direction check, since it is the one that matters: the SERVER holds the
       # PUBLIC key (nats-server.conf renders `nkey: "U…"` from NATS_BRIDGE_NKEY_PUB and
       # contains no seed at all), and the CLIENTS hold the seed. Never the reverse.
-    # No --slot/--pub: BRIDGE_CDC_SLOT and BRIDGE_CDC_PUBLICATION are in .env.docker,
-    # and this is exactly the flagless boot they exist for. Neither has a default, so
-    # removing them from the env file stops the container rather than guessing.
+      # No --slot/--pub: BRIDGE_CDC_SLOT and BRIDGE_CDC_PUBLICATION are in .env.docker,
+      # and this is exactly the flagless boot they exist for. Neither has a default, so
+      # removing them from the env file stops the container rather than guessing.
     networks:
       - cdc-net
     restart: unless-stopped
@@ -475,29 +475,29 @@ services:
   # websocket — and they live on two ports that compose is free to move. The client
   # hardcoded both (`ws://localhost:8080`, `http://localhost:9090`) and broke the
   # moment either moved. One port in front of both, so the client knows one URL.
-  edge:
-    profiles: ["bridge"]
-    image: nginx:alpine
-    container_name: edge
+  proxy:
+    # profiles: [ "bridge" ]
+    image: haproxy:latest
+    container_name: zb_proxy
     depends_on:
       bridge:
         condition: service_started
-      nats-server:
+      prometheus:
         condition: service_started
     ports:
-      - "${EDGE_PUBLISH_PORT}:8090"
+      - "${REV_PROXY_PUBLISH_PORT:-8090}:8090"
     volumes:
-      - ./edge/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./proxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     networks:
       - cdc-net
     restart: unless-stopped
 
   prometheus:
     image: prom/prometheus:latest
-    container_name: zebridge_prometheus
+    container_name: zb_prometheus
     volumes:
       - ./telemetry/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    ports:
+      # ports:
       # ⚠️ 127.0.0.1, not the default. A bare "9091:9090" binds EVERY interface, so
       # this reaches anything that can route to the machine — a café network, a
       # colleague's laptop, a VPN peer. Prometheus, Grafana and the NATS exporter are
@@ -508,7 +508,7 @@ services:
       #
       # Scraping is unaffected: Prometheus reaches `bridge:9090` and
       # `nats-exporter:7777` over the compose network, not through a published port.
-      - "127.0.0.1:9091:9090"
+      # - "127.0.0.1:9091:9090"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:

@@ -5,19 +5,21 @@ history of how each scenario was found is in NOTES.md.
 
 ## The stack under test
 
-The native stack (`scripts/native/up.sh`): PostgreSQL 18 on 127.0.0.1:5432, nats-server
-on 127.0.0.1:4222 in JWT/operator mode, the bridge on :9090. Credentials are files:
-`scripts/native/creds/<principal>.creds` (`bridge`, `zbdoctor`, and the client
-principals `alice bob mary nina omar`, each mapped to a tenant in
-`zebridge_user_tenants`). Configuration is the catalogue: `zebridge_enable(...)` writes
-`zebridge_catalogue`, and a running bridge reloads it live (NOTES §10bj). Seeding is
-generation chains (msgpack under zstd, OBJ `gen-<tenant>`, KV `generations`).
+The native stack (`scripts/native/up.sh`):
+
+* PostgreSQL 18 on 127.0.0.1:5432,
+* nats-server on 127.0.0.1:4222 in JWT/operator mode,
+* the bridge on :9090.
+
+Credentials are files: `scripts/native/creds/<principal>.creds` (`bridge`, `zbdoctor`, and the client principals `alice bob mary nina omar`, each mapped to a tenant in `zebridge_user_tenants`).
+Configuration is the catalogue: `zebridge_enable(...)` writes `zebridge_catalogue`, and a running bridge reloads it live (NOTES §10bj).
+Seeding is generation chains (msgpack under zstd, OBJ `gen-<tenant>`, KV `generations`).
 
 Three clients exist, and the same protocol is asserted through each:
 
 | client | where | its suite |
 | --- | --- | --- |
-| `zb-client-ts` (TS shell + pure core) | `zb-client-ts/` | `pnpm test` — 127 fixture cases in `fixtures/core-fixtures.json` |
+| `zb-client-ts` <br> (TS shell + pure core) | `zb-client-ts/` | `pnpm test` — 127 fixture cases in `fixtures/core-fixtures.json` |
 | `libzb` (Zig, C ABI) | `libzb/` | `zig build test`; `python/runner.py` runs the SAME 127 fixtures through the C ABI |
 | `web-consumer` (vite, OPFS/PGlite) | `web-consumer/` | driven by hand; `window.zb` exposes the index card for scripted checks |
 

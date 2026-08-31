@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
     const prefix = b.option([]const u8, "libpq-prefix", "System libpq prefix (default: /opt/homebrew/opt/libpq on macOS, /usr on Linux)") orelse default_prefix;
 
     std.debug.print("Using system libpq from {s}\n", .{prefix});
+    std.debug.print("Using system zstd", .{});
 
     // Translate the C headers once into a real module. Replaces @cImport, which
     // gave every import site its own incompatible copy of the C types and does not

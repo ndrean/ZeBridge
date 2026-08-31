@@ -19,6 +19,12 @@ const usage =
     \\                  stream, subject and KV name; missing file or key is fatal.
     \\  --strict-tables Refuse to start if any published table lacks a primary key
     \\                  (default: skip the table, keep replicating the rest)
+    \\  --gen-nkey      Mint one nkey pair and exit, without starting anything.
+    \\                  Prints NATS_BRIDGE_NKEY_PUB / NATS_BRIDGE_NKEY_SEED on
+    \\                  stdout (the warning goes to stderr, so it pipes:
+    \\                  `bridge --gen-nkey >> .env.bridge`). The PUB line goes in
+    \\                  nats-server.conf, the SEED is the bridge's credential —
+    \\                  it is shown once and never stored by this command.
     \\  --help, -h      Show this message
     \\
     \\Environment:
@@ -75,8 +81,41 @@ const usage =
     \\
 ;
 
-/// Signals that `--help` was handled and the process should exit cleanly.
-pub const HelpRequested = error{HelpRequested};
+/// The one spelling of each early flag, so the scan below and any future parse cannot
+/// drift apart.
+pub const help_flags = [_][]const u8{ "--help", "-h" };
+pub const gen_nkey_flag = "--gen-nkey";
+
+/// Flags that REPLACE the program instead of configuring it: they read no environment,
+/// open nothing, and their whole output IS the answer.
+pub const EarlyExit = enum { help, gen_nkey };
+
+/// Answered from argv by `main` BEFORE the log level is resolved and before anything
+/// else prints — boot noise on stderr is noise in a command meant to be piped
+/// (`bridge --gen-nkey >> .env.bridge`, `bridge --help | less`). Reads argv, nothing else.
+///
+/// ⚠️ A flat scan, so `bridge --slot --help` answers help rather than "--slot requires a
+/// value". Every CLI that honours `--help` anywhere on the line has that edge; the
+/// alternative is resolving configuration first, which is exactly what this avoids.
+pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
+    var it = init.minimal.args.iterate();
+    _ = it.next(); // argv[0]
+    while (it.next()) |arg| {
+        for (help_flags) |flag| {
+            if (std.mem.eql(u8, arg, flag)) return .help;
+        }
+        if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
+    }
+    return null;
+}
+
+/// The usage text on STDOUT: help that was ASKED FOR is output, and output belongs in
+/// the pipe (`bridge --help | less`, `bridge --help > usage.txt`). A usage printed
+/// because an argument was WRONG stays on stderr below, where a diagnostic belongs —
+/// that difference is the whole reason these are two call sites and not one.
+pub fn printUsage(io: std.Io) !void {
+    try std.Io.File.stdout().writeStreamingAll(io, usage);
+}
 
 /// Read an unsigned integer from the environment. Never fails: a bad tunable should warn
 /// and carry on, not stop the bridge from starting.
@@ -199,10 +238,11 @@ pub const Args = struct {
                 topology_path = try requireValue(&args_iter, "--top");
             } else if (std.mem.eql(u8, arg, "--strict-tables")) {
                 strict_tables = true;
-            } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-                std.debug.print("{s}", .{usage});
-                return error.HelpRequested;
             } else {
+                // `--help`/`-h` and `--gen-nkey` never reach here: `earlyExit` answered
+                // them from argv before main resolved anything (see above). They are
+                // absent from this loop deliberately — one place decides, not two.
+                //
                 // Reject rather than ignore: silently skipping unknown flags is how a
                 // stale --zstd survived in deployment configs after the flag was removed.
                 log.err("unknown argument: {s}", .{arg});

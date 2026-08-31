@@ -1,6 +1,6 @@
 # Multi-stage build for production
 # Using alpine:3.22 for minimal footprint with musl libc
-ARG BASE_IMAGE=alpine:3.22
+ARG BASE_IMAGE=alpine:latest
 
 FROM ${BASE_IMAGE} AS builder
 

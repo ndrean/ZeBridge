@@ -7552,6 +7552,62 @@ open items: a table suspended by a row that no longer exists should re-check on 
 next event, not only at boot; and open-tenant rows of a tenant-scoped table need a
 seed path (the `_default` chain, or none at all — decide).
 
+## 10bn. `--gen-nkey`, and the writer that formatted into nothing (2026-08-31)
+
+`bridge --gen-nkey` mints the nkey pair a DBA installs between NATS and the bridge.
+Its first draft printed with `std.debug.print` because this did not work:
+
+```zig
+var buffer: [256]u8 = undefined;
+var writer = std.Io.Writer.fixed(&buffer);
+writer.print("NATS_BRIDGE_NKEY_PUB={s}\n…", .{ public, seed }) catch unreachable;
+```
+
+It worked perfectly — into `buffer`. A **fixed writer's sink IS the array**: it formats
+and stops, there is no file descriptor anywhere in it (you would read the bytes back
+with `writer.buffered()`). Then the frame ended and the keys went with it. 0.16 split
+the two roles on purpose — a `Writer` is a formatting front-end over *some* sink;
+`fixed` makes that sink memory, `File.writerStreaming(io, &buf)` makes it an fd plus a
+buffer that `flush()` drains. `std.debug.print` is neither: it takes stderr, locks, and
+writes, which is why it "just worked".
+
+Now: **stdout** via a `File.Writer` (streaming, not positional — stdout is a pipe as
+often as a file, and a positional write on a pipe is a syscall that must fail first),
+with the warning left on stderr. That makes the command pipe, which was the point:
+
+    bridge --gen-nkey >> .env.bridge      # two KEY=value lines land in the file,
+                                          # "the seed IS the credential" stays on the terminal
+
+**What the crypto actually is** (asked, worth writing down): the keys are std's, the
+FORMAT is nats.zig's. `Ed25519.KeyPair.generate` draws 32 random bytes; in Ed25519 that
+seed *is* the private key, the public key being derived from it — which is exactly why
+the seed is the credential. `nkeys.encodeSeed` generates nothing: it renders those same
+bytes as `base32(prefix || seed || crc16)`, where the prefix is two bytes because `'S'`
+(seed) and the type `'U'` (user) are packed across them, so every user seed reads `SU…`
+(58 chars; the public key is one prefix byte + 32 + crc → 56). The round trip through
+`SeedKeyPair.fromSeed` is kept even though `kp.public_key` is right there: it decodes
+the very text about to be printed, so a seed that cannot be read back never leaves the
+function. Verified against NATS's own `nk -pubout` — same public key.
+
+**And the flags moved ahead of the boot.** `--gen-nkey` and `--help` were handled inside
+`parseArgs`, so they inherited everything printed before it — on a host with
+`LOG_LEVEL=debug`, a CPU warning about a hot path the command never enters, in front of
+two lines. The fix is not to move the log-level assignment after `parseArgs` (the first
+instinct, and wrong: `parseArgs` is one of the noisiest loggers in the boot — the port
+resolution, BASE_BUF, the publish budgets, and the two `log.debug` lines about ignored
+`PG_HOST`/`NATS_HOST` that exist for exactly the operator running at debug level; below
+the assignment they would all be judged at the default). Flags that **replace** the
+program belong before configuration because they consume none of it, so `args.earlyExit`
+scans argv in `main` before the log level is resolved, and the branches are gone from
+the parse loop — one place decides, not two.
+
+`--help` goes to stdout with it: help that was ASKED FOR is output (`bridge --help |
+less`), while a usage printed because an argument was WRONG stays a diagnostic on
+stderr. Measured: `--help` → 4712 B stdout / 0 B stderr / exit 0, at any LOG_LEVEL;
+`--bogus` → empty stdout, usage on stderr, exit 1. 264/264 unit, offline battery 7/7
+(`pubname.py` is the regression test for that parse loop — seven slot/publication
+resolutions).
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

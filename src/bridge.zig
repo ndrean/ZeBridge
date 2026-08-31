@@ -15,6 +15,7 @@ const metrics_mod = @import("metrics.zig");
 const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
+const nkey_gen = @import("nkey_gen.zig");
 const publication_mod = @import("publication.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
@@ -457,6 +458,16 @@ fn initReplicationStream(
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Flags that REPLACE the program are answered here, from argv, before the log level
+    // is even resolved: their whole output is the answer, and a boot line on stderr is
+    // noise in something meant to be piped. `--gen-nkey` reads no config at all — the
+    // CPU warning below, on a host with LOG_LEVEL=debug, was pure noise in front of two
+    // KEY=value lines.
+    if (args.earlyExit(&init)) |what| switch (what) {
+        .help => return args.printUsage(init.io),
+        .gen_nkey => return nkey_gen.genNkey(init.io),
+    };
+
     // Assign first, then report: customLogFn filters against runtime_log_level, so a
     // line logged inside getDefaultLogLevel is judged by the level it is about to
     // replace and disappears at exactly the setting that asked to see it.
@@ -491,10 +502,9 @@ pub fn main(init: std.process.Init) !void {
 
     // Parse command-line arguments and build runtime config.
     // --help prints usage and exits 0; anything unparseable exits non-zero.
-    const parsed = args.Args.parseArgs(&init) catch |err| switch (err) {
-        error.HelpRequested => return,
-        else => return err,
-    };
+    // `--help` and `--gen-nkey` are already handled above, so anything unparseable here
+    // is a real error: it exits non-zero, with usage on stderr.
+    const parsed = try args.Args.parseArgs(&init);
     const parsed_args = parsed.args;
     var runtime_config = parsed.runtime_config;
 

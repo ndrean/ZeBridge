@@ -41,53 +41,13 @@ Published at bridge startup. Consumers fetch before requesting snapshots.
 }
 ```
 
-### Snapshot Metadata (INIT Stream: `init.meta.{table}`)
+### ~~Snapshot Metadata (INIT Stream: `init.meta.{table}`)~~
 
-Published after all chunks. Tells consumer how many chunks to expect.
+~~Published after all chunks. Tells consumer how many chunks to expect.~~
 
-```json
-{
-  "snapshot_id": "snap-1765208480",
-  "lsn": "0/191BFD0",
-  "timestamp": 1765208480,
-  "batch_count": 4,
-  "row_count": 4000,
-  "table": "users"
-}
-```
+### ~~Snapshot Chunk (INIT Stream: `init.snap.{table}.{snapshot_id}.{chunk}`)~~
 
-### Snapshot Chunk (INIT Stream: `init.snap.{table}.{snapshot_id}.{chunk}`)
-
-Chunked by **bytes**, not rows: the bridge asks Postgres for the longest prefix of rows
-whose cumulative size fits one NATS message (`max_payload` minus envelope). `chunk_size`
-in `config.zig` is only a row _ceiling_ — a narrow table hits it, a table of 256 KiB rows
-gets three rows a chunk. A row too large to publish at all suspends the table rather than
-being split.
-
-```json
-{
-  "table": "users",
-  "operation": "snapshot",
-  "snapshot_id": "snap-1765208480",
-  "chunk": 3,
-  "lsn": "0/191BFD0",
-  "data": [
-    {
-      "id": "3001",
-      "name": "User-3001",
-      "email": "user3001@example.com",
-      "created_at": "2025-12-08 13:45:21.719719+00"
-    },
-    {
-      "id": "3002",
-      "name": "User-3002",
-      "email": "user3002@example.com",
-      "created_at": "2025-12-08 13:45:22.123456+00"
-    }
-    // ... as many rows as fit one message
-  ]
-}
-```
+~~Chunked by bytes, not rows: the bridge asks Postgres for the longest prefix of rows whose cumulative size fits one NATS message (`max_payload` minus envelope). `chunk_size` in `config.zig` is only a row _ceiling_ — a narrow table hits it, a table of 256 KiB rows gets three rows a chunk. A row too large to publish at all suspends the table rather than being split.~~
 
 ### CDC Event (CDC Stream: `cdc.{table}.{operation}.{batch}`)
 
