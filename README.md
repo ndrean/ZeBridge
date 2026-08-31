@@ -9,7 +9,7 @@
 It is **one bridge with two components** and a consumer builds on the client library:
 
 ```txt
-PG ←→ zebridge ←→ NATS ←→ libzb(.js) ← consumer 
+PG ←→ ZeBridge ←→ NATS ←→ libzb(.js) ← consumer 
                                  ↘    ↙
                                 local_db
                            (SQLite, PGlite, PG)
@@ -17,7 +17,7 @@ PG ←→ zebridge ←→ NATS ←→ libzb(.js) ← consumer
 
 **How does it work?**: two parts, a daemon and a client library.
 
-* the background executable `zebridge` is connected to PostgreSQL and NATS/JS and streams PostgreSQL changes onto NATS/JetStream and applies writes coming back.
+* the background executable `zebridge` is connected to PostgreSQL and NATS/JS and streams PostgreSQL changes onto NATS/JetStream and applies writes coming back. This is lightweight process, can be started / stopped on the fly.
 * the client library `libzb` handles the incoming data (seeds and CDCs) from NATS into the local database, and pushes optimistic consumer writes to NATS, echoed back after conflict resolution. The library comes in two flavours: a JavaScript library and a dynamic linked library (FFI).
 
 **Consumers**: can be used by browsers (OPFS & sqlite-wasm | PGlite), mobile apps (native SQLite) and backend services (PGlite, native SQLite, PostgreSQL).
@@ -151,14 +151,15 @@ graph TD
         
         %% Internal Apps
         Bridge[[ZeBridge-1<br> :27434]]:::bridge
-        PG[(Postgres <br> :5432)]:::secure
-        PGREP[(StandBy<br>Replica<br>:5433)]:::secure
+        PG[(Postgres Master <br> :5432)]:::secure
+        PGREP[(PG StandBy<br>Replica<br>:5433)]:::secure
         NATS[NATS Server<br> :4222]:::internal
         
         %% Telemetry & Monitoring Stack
         Grafana([Grafana <br> :3000]):::telemetry
         Prom[(Prometheus<br> :9090)]:::telemetry
         NatsExp([NATS Exporter<br>Port :7777]):::telemetry
+        Sweeper[[Sweeper]]:::bridge
     end
 
     subgraph Consumer Service
@@ -185,7 +186,7 @@ graph TD
     %% Internal Component Dependencies
     Bridge ==>|W| PG
     PGREP ==>|R|Bridge
-    Bridge <==>|Publish / Subscribe <br> TCP| NATS
+    Bridge <==>|Pub / Sub <br> TCP| NATS
     
     %% Telemetry Data Flow
     Prom -.->|Scrapes /metrics| Bridge
