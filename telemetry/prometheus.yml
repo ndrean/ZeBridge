@@ -6,8 +6,8 @@ scrape_configs:
   - job_name: "zebridge"
     metrics_path: "/metrics"
     static_configs:
-      # Scrapes ZeBridge whether running in Docker container ('bridge:9090') or on host ('host.docker.internal:9090')
-      - targets: ["bridge:9090", "host.docker.internal:9090"]
+      # Scrapes ZeBridge whether running in Docker container ('bridge:27434') or on host ('host.docker.internal:27434')
+      - targets: ["bridge:27434", "host.docker.internal:27434"]
         labels:
           environment: "development"
           service: "cdc-bridge"

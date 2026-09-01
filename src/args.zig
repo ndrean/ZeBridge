@@ -186,7 +186,7 @@ pub const Args = struct {
         // Sentinel, not a value: the env fallback must only apply when --port was
         // absent, and 0 is not a usable port so it cannot be confused with one. The
         // literal default used to be 6543 here while Config.Http.default_port said
-        // 9090 — two answers, and the one that won was the one nobody had written down.
+        // 27434 — two answers, and the one that won was the one nobody had written down.
         var http_port: ?u16 = null;
         // Precedence: CLI flag > env > NOTHING. There is no compiled default for
         // either name, and adding one back would be a mistake:

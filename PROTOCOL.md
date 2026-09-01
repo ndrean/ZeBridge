@@ -451,24 +451,13 @@ A replica that **does** declare foreign keys must handle this itself, and both
 engines make it a consumer-side rule with no wire change:
 
 * declare the constraints `DEFERRABLE INITIALLY DEFERRED` (PostgreSQL and SQLite
-  both accept this in DDL), or in SQLite enable `PRAGMA defer_foreign_keys = ON` at
-  the start of **each** apply transaction (it resets at every COMMIT — and never set
+  both accept this in DDL), or in SQLite enable `PRAGMA defer_foreign_keys = ON` at the start of **each** apply transaction (it resets at every COMMIT — and never set
   it to `0` mid-transaction, which discards the tracked violations);
-* apply CDC in transactions batched so a parent and its child land before the same
-  COMMIT. Every event carries `lsn`, and commit order **is** `lsn` order, so the
-  robust form is a small `lsn`-sorted reorder window — the interleave distance is
-  bounded by one flush run (at most a few thousand events, occasionally spanning
-  two adjacent runs), never unbounded;
-* a deferred violation surfacing at COMMIT means the batch was cut between a child
-  and its parent: widen the batch (pull more messages) and retry, rather than
-  treating it as data corruption.
+* apply CDC in transactions batched so a parent and its child land before the same COMMIT. Every event carries `lsn`, and commit order **is** `lsn` order, so the robust form is a small `lsn`-sorted reorder window — the interleave distance is bounded by one flush run (at most a few thousand events, occasionally spanning two adjacent runs), never unbounded;
+* a deferred violation surfacing at COMMIT means the batch was cut between a child and its parent: widen the batch (pull more messages) and retry, rather than treating it as data corruption.
 
-The simplest correct choice remains not declaring foreign keys on the replica at
-all — the source database already enforces them, and a replica's job is to converge
-on what the source accepted. The reference clients do declare them (the descriptor
-carries `foreign_keys`, §3): each apply transaction defers the check to COMMIT, and a
-child whose parent has not arrived is parked durably in `_zebridge_inbox` and retried
-after later batches (§7.1).
+The simplest correct choice remains not declaring foreign keys on the replica at all — the source database already enforces them, and a replica's job is to converge
+on what the source accepted. The reference clients do declare them (the descriptor carries `foreign_keys`, §3): each apply transaction defers the check to COMMIT, and a child whose parent has not arrived is parked durably in `_zebridge_inbox` and retried after later batches (§7.1).
 
 ### Event payload
 
@@ -487,8 +476,7 @@ after later batches (§7.1).
 `operation` is uppercase in the payload and lowercase in the subject.
 
 `msg_id` is `<lsn-hex>-<table>-<operation>` and is set as `Nats-Msg-Id`, so
-JetStream deduplicates retries. Batches use
-`batch-<first msg_id>-to-<last msg_id>`.
+JetStream deduplicates retries. Batches use `batch-<first msg_id>-to-<last msg_id>`.
 
 ### What `data` contains, by operation
 
@@ -499,33 +487,16 @@ JetStream deduplicates retries. Batches use
 | DELETE | ⚠️ under `REPLICA IDENTITY DEFAULT`: **the primary key populated, every other column `null`** |
 
 ⚠️ **A table with a tombstone column emits no `cdc.<table>.delete` at all.** If its
-catalogue row names a tombstone (`tombstone_col`, §7.5), the bridge **drops every physical DELETE** for
-that table — not only the sweeper's reaps. Deletes reach clients as an `update` setting the
-tombstone, and the physical removal that follows once the tombstone ages out is
-deliberately not forwarded: the client already removed the row when the soft delete
-arrived, and re-sending it would cost one message per reaped row per client for a row they
-know is gone.
+catalogue row names a tombstone (`tombstone_col`, §7.5), the bridge **drops every physical DELETE** for that table — not only the sweeper's reaps. Deletes reach clients as an `update` setting the tombstone, and the physical removal that follows once the tombstone ages out is deliberately not forwarded: the client already removed the row when the soft delete arrived, and re-sending it would cost one message per reaped row per client for a row they know is gone.
 
-So a `cdc.test_types.delete` handler on such a table is a handler that never fires. Verified
-by `scripts/scenarios/reaps.py`, which also asserts the converse — a table **without** a
-tombstone still emits real deletes, since suppressing those would strand rows in every
-replica with no later event able to remove them.
+So a `cdc.test_types.delete` handler on such a table is a handler that never fires. Verified by `scripts/scenarios/reaps.py`, which also asserts the converse — a table **without** a tombstone still emits real deletes, since suppressing those would strand rows in every replica with no later event able to remove them.
 
-⚠️ A DELETE with nulls everywhere but the PK is **not** data loss — it is what
-`REPLICA IDENTITY DEFAULT` sends, and it is sufficient to delete by key. Do not treat
-it as a malformed event.
+⚠️ A DELETE with nulls everywhere but the PK is **not** data loss — it is what `REPLICA IDENTITY DEFAULT` sends, and it is sufficient to delete by key. Do not treat it as a malformed event.
 
-⚠️ `old.*` keys are present on every UPDATE for a FULL table. On a DEFAULT table they
-are **usually** absent — but they **do** appear when the UPDATE changes the primary key,
-because the old key is the only way to locate the row. A client must not assume they
-exist, and must not assume they don't.
+⚠️ `old.*` keys are present on every UPDATE for a FULL table. On a DEFAULT table they are **usually** absent — but they **do** appear when the UPDATE changes the primary key, because the old key is the only way to locate the row. A client must not assume they exist, and must not assume they don't.
 
 ⚠️ **A changed primary key arrives as one UPDATE, not as a DELETE plus an INSERT.** A
-client that upserts on the new key alone inserts a second row and keeps the old one
-forever — measured: `UPDATE test_types SET id = 888001 WHERE id = 777006` left
-PostgreSQL with one row and an unpatched replica with two. Delete `old.<pk>` before
-applying the row, and see §7.2 on why an editable primary key is a poor choice in the
-first place.
+client that upserts on the new key alone inserts a second row and keeps the old one forever — measured: `UPDATE test_types SET id = 888001 WHERE id = 777006` left PostgreSQL with one row and an unpatched replica with two. Delete `old.<pk>` before applying the row, and see §7.2 on why an editable primary key is a poor choice in the first place.
 
 #### An absent key on an UPDATE means "unchanged", never "null"
 
@@ -773,11 +744,9 @@ the hint reads the rename as drop-plus-add and loses that column's values.
 
 ## 6. Seeding — generation chains ✅
 
-Seeding gives a fresh or fallen-behind client its starting point. There is no
-snapshot-on-demand: the generation producer builds, on a cadence
-(`GENERATION_CADENCE_SECONDS`), a *full* plus a series of *deltas* per table — the
-chain — and publishes it to object storage. Clients only ever read what is already
-built; Postgres is never queried per consumer.
+Seeding gives a fresh or fallen-behind client its starting point. 
+Postgres is never queried per consumer. The `generation_producer.zig` builds, on a cadence `GENERATION_CADENCE_SECONDS`, a *full* plus a series of *deltas* per table — the chain — and publishes it to object storage.
+Clients only ever read what is already built; 
 
 ### The storage architecture
 
@@ -786,37 +755,71 @@ built; Postgres is never queried per consumer.
 | **Manifest** | `generations` KV, key `<tenant>.<table>` | One small JSON document naming the chain: the full, the deltas, the cutoff. Last-value-per-key makes discovery one read. |
 | **Objects** | `gen-<tenant>` object store | The full and delta payloads: MessagePack rows, normally wrapped in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. Chunked by the object store itself (128 KB) — no NATS `max_payload` limit applies to a seed. |
 
-The manifest carries `gen` (the chain number), `full` (object name + gen), `deltas`
-(object, `cutoff`, `prev_cutoff`, gen — newest last; plus `dict` naming the
-dictionary object a delta was compressed with, §10x, absent for plain frames), `cutoff_version` (the row-timestamp
-watermark), `cutoff_lsn`, and — the splice point — **`cutoff_seq`** with `cdc_stream`:
-the CDC stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction
-begins. Everything at or below `cutoff_seq` on that stream is in the chain; everything
-above it is not. The direction is overlap-never-gap: a transaction still in flight when
-the chain was built shows up as a duplicate to absorb, never as a hole. (`lsn` cannot do
-this job — it is not monotonic in delivery order, §8.)
+The manifest carries:
 
-A tenant with no rows for a table still gets a manifest (an explicit empty full), so a
-client can distinguish "empty" from "not built yet".
+*  `gen` (the chain number),
+*  `full` (object name + gen),
+*  `deltas` (object, `cutoff`, `prev_cutoff`, gen — newest last; plus `dict` naming the dictionary object a delta was compressed with,
+  
+```sh
+> nats kv ls
+╭──────────────────────────────────────────────────────────────────────────────────╮
+│                                 Key-Value Buckets                                │
+├─────────────┬─────────────┬─────────────────────┬─────────┬────────┬─────────────┤
+│ Bucket      │ Description │ Created             │ Size    │ Values │ Last Update │
+├─────────────┼─────────────┼─────────────────────┼─────────┼────────┼─────────────┤
+│ generations │             │ 2026-09-01 02:28:56 │ 8.8 KiB │ 27     │ 1h56m4s     │
+│ tenants     │             │ 2026-08-25 18:17:37 │ 12 KiB  │ 118    │ 1h53m1s     │
+│ schemas     │             │ 2026-08-25 18:17:37 │ 156 KiB │ 257    │ 1h52m48s    │
+╰─────────────┴─────────────┴─────────────────────┴─────────┴────────┴─────────────╯
+> nats kv ls generations
+# list of all keys of <bucket_name>='generations'
+
+> nats kv get generations _default.test_types --raw
+# list of value of the key '_default.test_types' of the bucket 'generations'
+``` 
+
+```json
+{
+  "gen":2,
+  "bucket":"gen-_default",
+  "cutoff_version":"2026-09-01 14:55:10.327995+00",
+  "cutoff_lsn":"3/59C55798",
+  "version_column":"updated_at",
+  "full":{
+    "gen":1,
+    "object":"test_types-g1-full",
+    "cutoff":"2026-09-01 00:28:57.815815+00"
+  },
+  "deltas":[
+    {
+      "gen":2,
+      "object":"test_types-g2-delta",
+      "prev_cutoff":"2026-09-01 00:28:57.815815+00",
+      "cutoff":"2026-09-01 14:55:10.327995+00"
+    }
+  ]
+}
+```
+
+  §10x, absent for plain frames), `cutoff_version` (the row-timestamp watermark), `cutoff_lsn`, and — the splice point — **`cutoff_seq`** with `cdc_stream`: the CDC stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction begins.
+  
+  Everything at or below `cutoff_seq` on that stream is in the chain; everything above it is not. The direction is overlap-never-gap: a transaction still in flight when the chain was built shows up as a duplicate to absorb, never as a hole. (`lsn` cannot do this job — it is not monotonic in delivery order, §8.)
+
+A tenant with no rows for a table still gets a manifest (an explicit empty full), so a client can distinguish "empty" from "not built yet".
 
 ### Applying a chain
 
-1. **Read the manifest.** No manifest, or no `full` object → the table has no chain yet
-   (the ordinary case is a table enabled between two cadence ticks). Poll — the producer
-   builds every cadence. Bound the wait (`GENERATION_WAIT_MS`) and mark the table failed
-   rather than following CDC unseeded: an unseeded table that follows CDC diverges
-   silently, which is strictly worse than being visibly absent.
-2. **Plan from the local watermark** (the last applied `cutoff_version`): if the deltas
-   reach it, apply only the newer deltas — idempotent upserts guarded by the version
-   column. Otherwise apply the full, then the deltas after it.
-3. **A full is `DELETE FROM` + replay, in one transaction.** Two rules make that
+1. **Read the manifest.** No manifest, or no `full` object → the table has no chain yet (the ordinary case is a table enabled between two cadence ticks). Poll — the producer builds every cadence. Bound the wait (`GENERATION_WAIT_MS`) and mark the table failed rather than following CDC unseeded: an unseeded table that follows CDC diverges silently, which is strictly worse than being visibly absent.
+1. **Plan from the local watermark** (the last applied `cutoff_version`): if the deltas reach it, apply only the newer deltas — idempotent upserts guarded by the version column. Otherwise apply the full, then the deltas after it.
+1. **A full is `DELETE FROM` + replay, in one transaction.** Two rules make that
    destruction safe:
    * ⚠️ **Never apply a full whose `cutoff_seq` is below the replica's stored position
      for that stream.** Such a chain predates rows CDC already delivered and will never
      re-deliver; refuse it and wait for the next cadence build.
    * The DELETE shares the transaction with the rows, so a crash mid-apply cannot leave
      an empty table.
-4. **Record the cutoff** (`cutoff_version`/`cutoff_lsn`) as the new watermark, and anchor
+2. **Record the cutoff** (`cutoff_version`/`cutoff_lsn`) as the new watermark, and anchor
    the seed gate: on the manifest's `cdc_stream`, drop CDC events with
    `seq <= cutoff_seq` — they are in the chain. ⚠️ The lsn fallback (a manifest without
    `cutoff_seq`) must anchor only to a lsn a SEED set — never to a schema event's lsn,

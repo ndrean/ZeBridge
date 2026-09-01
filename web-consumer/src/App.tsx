@@ -93,6 +93,7 @@ const AUTH = _qs.get('auth') ?? (import.meta.env.VITE_AUTH as string | undefined
 /// when the mint refuses.
 async function enroll(code: string): Promise<string | undefined> {
   if (!code.trim()) return 'enter an invite code';
+  console.log({code: code.trim()});
   const kp = nkeys.createUser();
   const seed = new TextDecoder().decode(kp.getSeed());
   // GET with params: a CORS "simple request" — no preflight, no body parsing.

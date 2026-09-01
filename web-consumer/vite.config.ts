@@ -13,7 +13,7 @@ import solidPlugin from 'vite-plugin-solid';
 /// same services on 8081 and 9098 and the page simply failed to connect, with
 /// nothing a browser can report beyond "connection refused". Measured 2026-08-28:
 /// both of those host ports were FREE while the services ran one number away.
-const BRIDGE_ORIGIN = process.env.ZB_BRIDGE_ORIGIN ?? 'http://127.0.0.1:9090';
+const BRIDGE_ORIGIN = process.env.ZB_BRIDGE_ORIGIN ?? 'http://127.0.0.1:27434';
 const NATS_WS_ORIGIN = process.env.ZB_NATS_WS_ORIGIN ?? 'ws://127.0.0.1:8080';
 
 export default defineConfig({
@@ -26,7 +26,7 @@ export default defineConfig({
     // no CORS headers (only `/enroll` does) — but this page also sets
     // `Cross-Origin-Embedder-Policy: require-corp` below, which OPFS needs, and under
     // COEP a cross-origin response must either carry `Cross-Origin-Resource-Policy` or
-    // be fetched with CORS. Making `fetch('http://127.0.0.1:9090/health')` work would
+    // be fetched with CORS. Making `fetch('http://127.0.0.1:27434/health')` work would
     // mean putting those headers on an endpoint set that includes an unauthenticated
     // `/metrics`.
     //
