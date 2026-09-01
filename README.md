@@ -4,44 +4,66 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-**What is it?**:  An opinionated, bidirectional bridge to synchronize a single PostgreSQL(14+) database with a local replica (SQLite, PGlite) via the message broker [NATS/JetStream](https://nats.io/) (2.10+).
+**What is it?**:  An opinionated, bidirectional bridge to synchronize a single PostgreSQL(14+) database with a _local replica_ (SQLite, PGlite) via the message broker NATS/JetStream (2.10+).
 
-It is **one bridge with two components** and a consumer builds on the client library:
+**One bridge with two components** and a consumer builds on the client library.
 
-```txt
-PG ←→ ZeBridge ←→ NATS ←→ libzb(.js) ← consumer 
-                                 ↘    ↙
-                                local_db
-                           (SQLite, PGlite, PG)
+```mermaid
+flowchart LR
+     subgraph VPN["VPN"]
+        PG[("Postgres")]
+        subgraph Localhost ["VPS localhost"]
+            Bridge(("ZeBridge <br> daemon"))
+            NATS[("NATS")]
+        end
+        PG <--> Bridge
+        Bridge <-->  NATS
+    end
+
+    NATS <--> |WSS| Lib
+
+
+    subgraph Edge["Consumer"]
+        Lib(("libzb(.js)"))
+        SQL[("SQLite<br>PGLite")]
+        App["mobile<br>browser<br>service"]
+        SQL -->App
+        App <-->Lib
+        Lib <-->SQL
+    end
+
+    style Bridge fill:#f59e0b,stroke:#d97706,color:#000
+    style Lib fill:#fbbf24,stroke:#f59e0b,color:#000
+    style NATS fill:#10b981,stroke:#059669,color:#000
 ```
 
 **How does it work?**: two parts, a daemon and a client library.
 
-* the background executable `zebridge` is connected to PostgreSQL and NATS/JS and streams PostgreSQL changes onto NATS/JetStream and applies writes coming back. This is lightweight process, can be started / stopped on the fly.
+* the background executable `ZeBridge` (ZB) is connected to PostgreSQL (PG) and NATS/JetStream (NATS) and streams PG changes onto NATS and applies writes coming back. This is lightweight process, can be started / stopped on the fly.
 * the client library `libzb` handles the incoming data (seeds and CDCs) from NATS into the local database, and pushes optimistic consumer writes to NATS, echoed back after conflict resolution. The library comes in two flavours: a JavaScript library and a dynamic linked library (FFI).
 
-**Consumers**: can be used by browsers (OPFS & sqlite-wasm | PGlite), mobile apps (native SQLite) and backend services (PGlite, native SQLite, PostgreSQL).
+**Consumers**: can be used by browsers (OPFS & sqlite-wasm | PGlite), mobile apps (native SQLite) and backend services (PGlite, native SQLite, PG).
 
 **Local_DB**: standard SQLite, PGlite or PostgreSQL.
 
-**Design**: This tool is built to serve a large number of small to medium consumers via the NATS/JS message broker. It aims to be light, fast, have a quick startup while safe.
+**Design**: This tool is built to serve a large number of small to medium consumers via the NATS message broker. It aims to be light (3.5 MB executable), fast, quick startup while safe.
 
 In order to favour mobile usage, we use aggressive delta compression when reseeding. This reduces the need for lengthy CDC catchups.
 
-⚠️ ZeBridge moves rows, not files. This means it is NOT designed for very large tables or tables containing large objects. NATS/JS forbids large payloads (> 1 MB by default), and on the other side, the memory consumption of ZeBridge would explode.
+⚠️ ZB moves rows, not files. This means it is NOT designed for very large tables or tables containing large objects. NATS forbids large payloads (> 1 MB by default), and on the other side, the memory consumption of ZeBridge would explode.
 > Large payloads belong in object storage: database tables should only contain metadata or a reference (e.g., a bucket URL) to the blob.
 
-**Opinionated**: the current ZeBridge version makes decisions for you that other sync engines leave you to: conflict resolution, via LWW.
+**Opinionated**: the current ZB version makes decisions for you that other sync engines leave you to: conflict resolution, via LWW.
 
 This imposes constraints -mostly mechanical- on the database schemas but buys guarantees.
 
 On the consumer side, we expect a standard SQLite engine. The client can read freely the local database, but writes **must** go through the library. How it is enforced depends upon the local engine.
 
-**Configuration**: the most important configuration used by ZeBridge concerns its **fixed-size buffer**. ➡ Total buffer size can be set anything from 16MB to 4GB+, depending upon of the published tables you wish to track.
-The daemon itself is a 3.5MB executable.
+**Configuration**: the most important configuration used by ZeBridge concerns its **fixed-size buffer**. 
+➡ Total buffer size can be set anything from 16MB to 4GB+, depending upon of the published tables you wish to track.
 
-**Monitoring**: ZeBridge exports metrics (TSDB Prometheus pull) and logs (Loki) for Grafana dashboards.
-ZeBridge internally monitors the payload size and quarantines trespassing tables that exceed NATS/JS limits and buffer limits. Conversely, it also prevents sending large payloads to Postgres as the echoed change would fail to pass.
+**Monitoring**: ZB exports metrics in the format for the Prometheus format and logs (Loki) for Grafana dashboards.
+ZB internally monitors the payload size and quarantines trespassing tables that exceed NATS limits and buffer limits. Conversely, it also prevents sending large payloads to PG as the echoed change would fail to pass.
 
 **Sweeper**: because consumers apply _soft-deletion_, we have a garbage collector which runs as a cron job. The executable `bridge_sweeper` prunes rows marked for deletion, and these are echoed via CDCs to consumers who applied soft-deletion.
 
@@ -74,38 +96,7 @@ ZeBridge internally monitors the payload size and quarantines trespassing tables
 
 ## Overview
 
-**Example of Architecture**:
-
-The daemon is connected to Postgres with all the migrations up, and NATS up with JetStream enabled and configured.
-
-A consumer connects to the NATS server, or to a [leaf node](https://docs.nats.io/learn/topologies/leaf-nodes#what-a-leaf-node-is) per tenant.
-
-A simplified example of a mobile connection:
-
-```mermaid
-flowchart LR
-     subgraph VPN["VPN"]
-        PG[("Postgres<br>Master")]
-        subgraph Localhost ["VPS localhost"]
-            Bridge(("ZeBridge <br> daemon"))
-            NATS[("NATS <br>hub")]
-        end
-        PG <-- "TCP<br>SSL (opt)" --> Bridge
-        Bridge <--> |"TCP"| NATS
-    end
-
-    NATS <-- "WSS" --> Lib
-
-
-    subgraph Mobile["Mobile consumer"]
-        Lib["libzb<br> SQLite"]
-        Lib --> App["App"]
-    end
-
-    style Bridge fill:#f59e0b,stroke:#d97706,color:#000
-    style Lib fill:#fbbf24,stroke:#f59e0b,color:#000
-    style NATS fill:#10b981,stroke:#059669,color:#000
-```
+The daemon is connected to PostgreSQL with all the migrations up, and NATS up with JetStream enabled and configured. A consumer connects to the NATS server, or to a [leaf node](https://docs.nats.io/learn/topologies/leaf-nodes#what-a-leaf-node-is) per tenant and his local database via the library.
 
 | artifact | what it is | who uses it |
 | -- | -- | -- |
@@ -113,13 +104,13 @@ flowchart LR
 | libzb | native library, C ABI | FFI Consumers: mobile apps, desktop apps, microservices via FFI |
 | zb-client-ts | npm package (self-contained TypeScript) | JS Consumers: browsers, Node, Electron, Deno, Bun |
 
-`ZeBridge` projects Postgres into NATS and back. It defines a protocol—a set of rules and workflows—for a consumer to connect to NATS and to the local database.
+`ZeBridge` projects PG into NATS and back. It defines a protocol—a set of rules and workflows—for a consumer to connect to NATS and to the local database.
 
 The C-ABI `libzb` library for FFI users - and the `zb-client-ts` library for JavaScript-based consumers - implements this protocol.
 
 It abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, and local state tables for reconnection.
 
-The client library shrinks this orchestration down to two primitives: `query()` to read data and `mutate()` to propagate local optimistic writes back to the Postgres server, and `onChange()`.
+The client library shrinks this orchestration down to three primitives: `query()` to read, `mutate()` to propagate local optimistic writes back to the Postgres server, and `onChange()`.
 
 **An example of a deployed system**:
 
@@ -134,26 +125,29 @@ graph TD
     classDef bridge fill:##bdf3ff,stroke:#ac0100,stroke-with:2px;
 
     %% External Clients
-    User([mobile / SQLite <br> browser PGlite / SQLite]):::external
+    User([mobile / browser <br> ---libzb --- <br>SQLite / PGlite]):::external
     LocalDB[(localDB <br>PG/lite<br>SQLite)]:::secure
+    LocalDB@{shape: lin-cyl}
     RemoteLeaf[NATS Leaf Node]:::internal
-    Consumer([Service]):::external
+    Consumer([Service <br> --libbz--]):::external
 
     %% Cloudflare Edge
     subgraph Cloudflare_Network  [Cloudflare Edge Proxy]
-        CF([Cloudflare Reverse Proxy <br> https://my-domain]):::proxy
+        CF([https://my-domain]):::proxy
         CF@{ shape: cloud}
     end
 
     %% VPS Boundary
     subgraph VPS [Your VPS Server]
-        HA([HAProxy <br>Reverse Proxy<br>:443]):::proxy
+        HA([HAProxy<br>:443]):::proxy
         
         %% Internal Apps
         Bridge[[ZeBridge-1<br> :27434]]:::bridge
+        Bridge@{shape: st-rect}
         PG[(Postgres Master <br> :5432)]:::secure
         PGREP[(PG StandBy<br>Replica<br>:5433)]:::secure
         NATS[NATS Server<br> :4222]:::internal
+        NATS@{shape: data-store}
         
         %% Telemetry & Monitoring Stack
         Grafana([Grafana <br> :3000]):::telemetry
@@ -189,10 +183,10 @@ graph TD
     Bridge <==>|Pub / Sub <br> TCP| NATS
     
     %% Telemetry Data Flow
-    Prom -.->|Scrapes /metrics| Bridge
-    Prom -.->|Scrapes /metrics| NatsExp
+    Prom -.->|Scrapes| Bridge
+    Prom -.->|Scrapes| NatsExp
     NatsExp -.->|Monitors| NATS
-    Grafana -.->|Queries Data| Prom
+    Grafana -.->|Queries| Prom
 ```
 
 ## Opinionated

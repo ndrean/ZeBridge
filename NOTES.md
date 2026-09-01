@@ -7785,6 +7785,124 @@ it as a sweeper reap, and the row lives on in every replica until a re-seed from
 built afterwards. The doctor already catches the precondition — `zebridge_check` reports
 a writable, tombstoned table missing its soft-delete guard.
 
+## 10br. Where the defects actually live: crossings, and the ones only a sequence shows (2026-08-31)
+
+Worth stating on its own, because it changed how the suite is run. Not one defect found
+this week was a single mechanism being wrong in isolation. Every one of them sat where
+**two mechanisms crossed**, and a third of them were invisible to a scenario running by
+itself — they appeared only because something else had run first.
+
+**Crossings (each was a correct mechanism meeting another correct mechanism):**
+
+| what crossed what | what it produced |
+| --- | --- |
+| a suspension × the DDL path | `ALTER TABLE` is "the migration that fixed it", so disabling the width guard to plant a bait lifted the suspension moments after raising it (§10bp) |
+| a lost slot × JetStream's numbering | WAL never published leaves no hole in the stream, so a client resumed *past* the gap; the fix is the third shape of the gap rule and a feed restart (§10bm) |
+| a tenant-scoped table × two CDC streams | its shared rows ride CDC_PUBLIC while the table names CDC_&lt;tenant&gt;, so a gap on the first left half the table stale forever (§10bq) |
+| the width guard × the bridge's own boot | every boot bakes the guard to `MIN(zebridge_limits)`, so a probe at a smaller BASE_BUF silently lowered the ceiling for the LIVE stack, and its baked literal outlived the probe (§10bp) |
+| a tombstoned table × a physical DELETE | suppressed as a sweeper reap, so a hard delete reaches no client at all and the row lives on in every replica (§10bm, §10bq) |
+| the publisher's reconnect × the retry budget | "exhausted retries" is for a publish that FAILS, not for a broker that is GONE — the documented FATAL never fires in an outage (§10bm) |
+
+**Visible only in sequence.** These passed standalone, sometimes repeatedly, and failed
+only when the battery ran in order:
+
+- `suspension_lift` passed twice alone and failed after `legacybait`: restoring the write
+  guards (§10bp) turned its teardown `DELETE` into a SOFT delete, so its oversized bait
+  stayed stored and the next run read it as a leftover. The tombstoning `UPDATE` would
+  also have carried the oversized row into CDC and re-suspended the table on the way out.
+  The teardown narrows the column and tombstones in one statement now.
+- `guards.py` removed `test_types`' write guards and did not restore them, so `check.py`
+  reported "not fully wired" in the NEXT group.
+- `keys.py` left a probe replication slot behind; an inactive slot pins WAL, which is how
+  the LIVE bridge's own slot came to be invalidated during a long run.
+- `sizing.py` allowed one second for an exit that arrives after the boot re-bakes every
+  guard — correct behaviour read as "nothing fired" under a loaded battery.
+- `client_gap` hard-deleted its fixtures, which a tombstoned table never forwards, so
+  each run left phantoms and its whole-table check drifted.
+
+**Two consequences, both now habits.**
+
+1. **Run the battery whole and in order, not scenario by scenario.** A green scenario is
+   not evidence; a green *sequence* is. `run.py` exists for that and the groups are
+   ordered deliberately.
+2. **A scenario must leave the stack as it found it — measured, not assumed.** Restoring
+   what you removed (guards), dropping what you created (slots, budgets, streams),
+   re-baking what your boot changed (the width guard), and cleaning in a way the product
+   actually honours (a soft delete on a tombstoned table, not a `DELETE` that becomes
+   one silently).
+
+And a third, about the tests themselves: **two scenarios passed for the wrong reason**
+and were only caught by asking "would this fail if the fix were absent?" — `shared_gap`
+(a purge removes what is BELOW the sequence, so the row it needed gone was still there
+and the client read it off CDC) and the first `nats_outage` (which asserted an exit that
+never happens). Both now assert their own preconditions before testing anything, and
+`shared_gap` was verified by disabling the fix and watching it fail.
+
+## 10bs. `kill -9` mid-chain-build: the invariant behind the swap order (2026-09-01)
+
+The producer writes a generation in three steps — **immutable objects first, then the
+PostgreSQL row, then the KV manifest, swapped last**. That order IS the safety argument:
+the manifest is the only pointer a client follows, so it may appear only once everything
+it names exists. Killed in between, the worst case must be orphan objects nobody
+references — never a manifest with a dangling pointer, because a client that reads one
+cannot seed at all, and every FRESH client fails the same way until the next tick. It
+had never been tested.
+
+`chain_kill.py` (owns) builds a 120 000-row, ~40 MB fixture in one tenant — big enough
+that a build takes seconds, which is what makes the window hittable — and kills the
+bridge eight times: five aimed at the window that matters (0–0.9 s after the `🗜️`
+compression line, i.e. while the object uploads and the manifest has not been swapped)
+and three at random points. After every kill it asserts the two structural invariants:
+every object the manifest names exists in the bucket, and no generation row the manifest
+still references has lost its objects. Then a clean tick, and a fresh libzb client
+seeding the whole table.
+
+**Result: the invariant held every time.** Eight kills, manifest reached g8 with all 9
+objects present, and a fresh client rebuilt all 120 000 rows matching PostgreSQL. The
+swap order does what its comment claims — now with evidence rather than an argument.
+
+**One thing the scenario had to learn:** a static table gives the producer nothing to
+build, so after the first generation the fourth kill waited for a compression that never
+came. Each iteration now churns 25 000 rows first — a kill needs something to interrupt.
+
+**And a battery-wide fix fell out of it.** `.env.bridge` carries `LOG_LEVEL=debug`, at
+which the client logs raw payloads: 5.4 MiB of compressed chain object landed in the
+scenario log as binary and made it ungreppable. `run.py` now runs every scenario at
+`info` (override with `ZB_LOG_LEVEL`), which also removes the ~4x hot-path CPU cost the
+bridge itself warns about — and which would have invalidated any timing a scenario
+measured.
+
+## 10bt. `kill -9` mid-transaction: the LSN is the line (2026-09-01)
+
+The second untested atomicity claim. ⚠️ And the obvious phrasing of it — "nothing
+partial escapes" — is **wrong by design**: a long transaction is handed to the publisher
+in batches as it is decoded (`releaseTxSlots`, "hand this batch over so the publisher can
+drain"), precisely so one huge transaction cannot exhaust the ring. Part of it IS on the
+wire before the commit is seen. What holds the line is the LSN, acked only at `.commit`:
+kill the bridge mid-delivery and PostgreSQL replays the WHOLE transaction from the slot.
+
+So the contract is the one the producer's header states — *"duplicates are absorbed by
+the client's version-guarded upsert, gaps are unrecoverable"* — and `txn_kill.py` (owns)
+asserts both halves against a 30 000-row single transaction, with a client connected
+throughout:
+
+    killed mid-delivery      client had  3,619 / 30,000 rows, CDC_acme at 359
+    after the restart        client has 30,000 / 30,000, PostgreSQL 30,000  — NO LOSS
+    distinct uids           30,000 — the replay landed on the same keys, not beside them
+    stream                  320 → 359 (kill) → 379
+
+**The stream numbers are the interesting part.** 39 messages carried the first 3,619
+rows; the replay of all 30,000 added only 20 more. The republished half was rejected by
+**JetStream's own dedup** (the msg ids are LSN-derived, so a replayed event carries the
+id it had the first time) — the broker absorbed it before the client ever saw it, and the
+client's version-guarded upsert is the second line rather than the only one. Both work,
+and the dedup window (120 s) is what bounds the first.
+
+Also worth stating for what it does NOT prove: a bridge down longer than that window
+would republish beyond dedup's reach and the client's upsert would carry it alone —
+which is exactly the case `nats_outage.py` measured from the other side (12/12 rows, 0
+duplicates, because the outage stayed inside the window).
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

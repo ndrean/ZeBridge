@@ -77,6 +77,8 @@ GROUPS = {
         "downtime":      ("bridge", "slot resume across kills"),
         "decode_integrity": ("bridge", "zero-copy decode never aliases"),
         "genproducer":   ("bridge", "chains: full, delta, prune"),
+        "chain_kill":    ("bridge", "kill -9 mid-chain-build: the manifest never names a missing object"),
+        "txn_kill":      ("bridge", "kill -9 mid-transaction: the unacked transaction replays whole, no loss"),
         "legacybait":    ("bridge", "pre-guard oversized rows"),
         "suspension_lift": ("bridge", "a row_too_large suspension lifts live once its cause is gone"),
         "livebirth":     ("bridge", "a table born and enabled while running"),
@@ -129,6 +131,11 @@ def env_for(role: str) -> dict:
     env = dict(os.environ)
     for k, v in DERIVED.items():
         env.setdefault(k, v)
+    # ⚠️ `info`, overriding whatever .env.bridge carries. At debug the bridge warns that
+    # per-event hot-path logging costs ~4x CPU (so any timing a scenario measures is
+    # invalid), and the client dumps raw payloads — a 5.4 MiB compressed chain object
+    # landed in a scenario log as binary and made it ungreppable. ZB_LOG_LEVEL overrides.
+    env["LOG_LEVEL"] = os.environ.get("ZB_LOG_LEVEL", "info")
     if role == "bridge":
         env["NATS_CREDS"] = str(CREDS / "bridge.creds")
         env.pop("ZB_PRINCIPAL", None)
