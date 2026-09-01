@@ -42,7 +42,7 @@ flowchart LR
 * the background executable `ZeBridge` (ZB) is connected to PostgreSQL (PG) and NATS/JetStream (NATS) and streams PG changes onto NATS and applies writes coming back. This is lightweight process, can be started / stopped on the fly.
 * the client library `libzb` handles the incoming data (seeds and CDCs) from NATS into the local database, and pushes optimistic consumer writes to NATS, echoed back after conflict resolution. The library comes in two flavours: a JavaScript library and a dynamic linked library (FFI).
 
-**Consumers**: can be used by browsers (OPFS & sqlite-wasm | PGlite), mobile apps (native SQLite) and backend services (PGlite, native SQLite, PG).
+**Consumers**: can be used by mobile native apps (native SQLite with FS), browsers/webapps (with OPFS support for sqlite-wasm | PGlite),  and backend services (PGlite, native SQLite, PG).
 
 **Local_DB**: standard SQLite, PGlite or PostgreSQL.
 
@@ -54,9 +54,7 @@ In order to favour mobile usage, we use aggressive delta compression when reseed
 > Large payloads belong in object storage: database tables should only contain metadata or a reference (e.g., a bucket URL) to the blob.
 
 **Opinionated**: the current ZB version makes decisions for you that other sync engines leave you to: conflict resolution, via LWW.
-
 This imposes constraints -mostly mechanical- on the database schemas but buys guarantees.
-
 On the consumer side, we expect a standard SQLite engine. The client can read freely the local database, but writes **must** go through the library. How it is enforced depends upon the local engine.
 
 **Configuration**: the most important configuration used by ZeBridge concerns its **fixed-size buffer**. 
@@ -68,6 +66,7 @@ ZB internally monitors the payload size and quarantines trespassing tables that 
 **Sweeper**: because consumers apply _soft-deletion_, we have a garbage collector which runs as a cron job. The executable `bridge_sweeper` prunes rows marked for deletion, and these are echoed via CDCs to consumers who applied soft-deletion.
 
 **Status**: Dev stage. Chaos tested but not battle tested.
+**Planned**: daemon column scoped, client DuckDB support (Parquet over OPFS), server-side rendering (Nuxt, Next, Remix) hydratation watermark.
 
 ## Table of Contents
 
@@ -146,7 +145,7 @@ graph TD
         Bridge@{shape: st-rect}
         PG[(Postgres Master <br> :5432)]:::secure
         PGREP[(PG StandBy<br>Replica<br>:5433)]:::secure
-        NATS[NATS Server<br> :4222]:::internal
+        NATS[NATS Server<br> TPC :4222 <br> wss :8080]:::internal
         NATS@{shape: data-store}
         
         %% Telemetry & Monitoring Stack
@@ -175,7 +174,7 @@ graph TD
     %% HAProxy Internal Layer 7 Routing
     HA -.->|localhost:3000| Grafana
     HA -.->|localhost:27434/enroll| Bridge
-    HA <==>|wss://localhost:4222| NATS
+    HA <==>|wss://localhost:8080| NATS
 
     %% Internal Component Dependencies
     Bridge ==>|W| PG
