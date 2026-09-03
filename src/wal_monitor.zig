@@ -23,6 +23,12 @@ pub const WalMonitor = struct {
     metrics: *metrics_mod.Metrics,
     config: WalConfig,
     should_stop: *std.atomic.Value(bool),
+    /// Raised when a monitor connection is refused with "the database system is
+    /// shutting down". The replication loop consumes it and STEPS ASIDE — closes the
+    /// COPY connection so the walsender (which waits for flush confirmation the bridge
+    /// cannot honestly give while its publisher is parked) may exit and PostgreSQL's
+    /// fast shutdown completes. Nullable so tests and old call sites need no flag.
+    pg_shutting_down: ?*std.atomic.Value(bool) = null,
     allocator: std.mem.Allocator,
     thread: ?std.Thread = null,
 
@@ -77,6 +83,7 @@ pub const WalMonitor = struct {
                 self.metrics,
                 self.config,
                 self.allocator,
+                self.pg_shutting_down,
             ) catch |err| {
                 log.warn(
                     "⚠️ Failed to check WAL lag: {}",
@@ -147,6 +154,7 @@ fn checkWalLag(
     metrics: *metrics_mod.Metrics,
     config: WalConfig,
     allocator: std.mem.Allocator,
+    shutting_down: ?*std.atomic.Value(bool),
 ) !void {
     // Build connection string
     const conninfo = try config.pg_config.connInfo(allocator, false);
@@ -157,7 +165,14 @@ fn checkWalLag(
     defer c.PQfinish(conn);
 
     if (c.PQstatus(conn) != c.CONNECTION_OK) {
-        log.warn("⚠️ WAL monitor connection failed: {s}", .{c.PQerrorMessage(conn)});
+        const emsg = std.mem.span(c.PQerrorMessage(conn));
+        // The one refusal that is a SIGNAL, not an outage: PostgreSQL announcing its
+        // own shutdown. The replication loop cannot see it (its connection is parked
+        // in COPY), so this side channel is how the bridge learns to step aside.
+        if (shutting_down) |flag| {
+            if (std.mem.indexOf(u8, emsg, "shutting down") != null) flag.store(true, .release);
+        }
+        log.warn("⚠️ WAL monitor connection failed: {s}", .{emsg});
         return error.ConnectionFailed;
     }
 

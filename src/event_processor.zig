@@ -782,6 +782,14 @@ pub const EventProcessor = struct {
                     log.err("🔴 Flush thread has fatal error - aborting event processing", .{});
                     return error.PublisherFatalError;
                 }
+                // The queue gauge is otherwise written only AFTER a successful flush —
+                // so the one state an operator most needs to see (the ring full, the
+                // bridge halted on backpressure, the publisher parked on a dead broker)
+                // froze the gauge at its pre-outage value. /metrics read 0% while WAL
+                // dammed behind the slot (measured: cascade.py, 892 rows held, 810 KB
+                // of retained WAL, queue gauge flat 0). Refresh it from the halt loop
+                // itself, on the same cadence as the fatal check.
+                if (self.metrics) |m| m.updateQueueUsage(self.batch_publisher.getQueueUsage());
             }
 
             // 2. Watchdog: Hard timeout if flush thread is completely stuck (NATS client hung)
@@ -1679,9 +1687,11 @@ pub const EventProcessor = struct {
     /// tenant string, never a JSON payload. Mirrors `packDdlToSlot`, with two
     /// differences: the value is a plain string a client reads directly (no JSON
     /// wrapping — `$KV.tenants` is not a schema-shaped bucket), and there is no
-    /// tombstone case, because a DELETE from this table is not handled here at all
-    /// (see the caller in bridge.zig) — a revoked mapping leaves a stale KV entry
-    /// rather than a fresh one, a known, deliberately deferred gap.
+    /// tombstone case, because a DELETE from this table takes a different path: the
+    /// caller in bridge.zig routes it to `purgeTenantKey`, which deletes the
+    /// principal's KV key outright — a revoked mapping reads as "no mapping" on the
+    /// client's next connect. (An earlier version left the entry stale; that gap is
+    /// closed, this comment used to document it.)
     ///
     /// Called only for INSERT and UPDATE (the caller passes the NEW row's tuple data
     /// either way) — both mean "this principal's tenant is now this value", which is

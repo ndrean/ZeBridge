@@ -84,6 +84,11 @@ listed and never run by it — those report, they do not assert.
 | two bridges on one slot: the loser refuses in its own words within seconds, no fight, no half-start — and `leaks` reads 0 bytes on the refusal path | `slot_contest.py` |
 | a CDC stream deleted wholesale under a live client: deliberate stop, boot recreates, slot replays, client resets to the fresh numbering and converges | `stream_wipe.py` |
 | PostgreSQL stopped and restarted under the bridge: refused connections waited out (connected=0 on /metrics), self-reconnect, durable slot, no loss — and `pg_ctl stop` completes in ~1 s, not wal_sender_timeout | `pg_restart.py` |
+| the permutation matrix: NATS and PostgreSQL down together in both orders, restored in both orders, plus both down with the bridge killed on top — one process survives four double outages, the 3 a.m. case reboots from the slot | `matrix.py` |
+| PostgreSQL restarts under a FIRING sweeper: it warns and retries, and the reconnect re-arms the whole session (prepared statements, principal, UTC pin) — fresh ripe tombstones reaped after | `sweeper_restart.py` |
+| the backpressure cascade, observable end to end: broker dies under a steady feed → queue climbs to ~86%, WAL dams behind the slot (~1 MB), bridge halts — then the broker returns and the same process drains it all, 1,199/1,199 rows | `cascade.py` |
+| the CLIENT's host SIGKILLed mid-seed, twice: the torn SQLite file reopens, the seed re-applies idempotently — 120k rows, all distinct, equal to PostgreSQL | `client_kill.py` |
+| revoking a principal (DELETE its mapping) purges `$KV.tenants` live; writes die immediately, resolution dies on reconnect — and reads honestly survive until the JWT expires | `revoke.py` |
 | a row written outside the client is in its replica in single-digit ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
 | a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished | `suspension_lift.py` |

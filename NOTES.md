@@ -8198,6 +8198,128 @@ up.sh's command line, so a flagless `pg_ctl start` REFUSES to boot a cluster tha
 logical slots — the first run left the whole environment down. The scenario now carries
 up.sh's exact flags and an unconditional, retrying `ensure_pg_up` in its finally.
 
+## 10cc. The matrix, the 3 a.m. case, and the sweeper under a restart (2026-09-03)
+
+Chaos item 7 closes the program. `matrix.py` (owns — it owns the bridge, the broker AND
+the cluster) runs the double outages in every order — NATS↓ PG↓ and PG↓ NATS↓, each
+restored in both orders — with a write attempted at every stage, and demands the client
+converge to EXACTLY PostgreSQL's count. One bridge process survives all four cases.
+Case 5 is the 3 a.m. shape: both components down, the bridge `kill -9`'d on top, both
+restored, and a FRESH boot resumes from the slot — including the row committed during
+the NATS half of the outage, which only the slot remembered.
+
+**Its first run found a semantic edge worth an operator rule.** In the NATS-first
+orderings `pg_ctl stop -m fast` hangs — CORRECTLY, on both sides: the walsender waits
+for the logical client's flush confirmation (PostgreSQL protecting undelivered
+changes), and the bridge's drained fast-ack refuses to confirm events it has not
+delivered (our §10cb rule protecting the same thing). Both are right, and together
+they deadlock the stop — and NOT merely until wal_sender_timeout: that timeout kills
+UNRESPONSIVE clients, and the bridge keeps answering keepalives (with its honest,
+stale flush position), so the wait can outlast it and hold until something dies
+(measured ≥90 s before the matrix aborted; the full duration is unbounded in
+principle). The deadlock is also not absolute — the bridge is reconnecting to NATS
+throughout, so if the broker returns mid-stop the queue drains, the fast-ack confirms,
+and the stop completes by itself; killing the bridge releases it instantly. For
+ZeBridge the wait is pointless either way — the slot replays everything after any
+restart — but PostgreSQL cannot know that, and the walsender cannot distinguish a
+bridge waiting on a dead broker from a slow one. The rule: **with NATS down, stop the
+bridge before a fast PostgreSQL stop, or use `-m immediate`; the slot makes either
+safe.** The matrix crash-stops, which also drags crash recovery into every case.
+
+**`sweeper_restart.py`** answers the review question "what does a PostgreSQL restart do
+to a FIRING sweeper?" — the sweeper's whole working state is per-session (the UTC pin,
+`zb.principal`, and since the PQprepare refactor its prepared statements, which die
+with the connection), so a reconnect that skipped session setup would reap as nobody,
+reap on the wrong clock, or error every pass with "prepared statement does not exist" —
+all silent in §7.5's sense. Measured: a scoped daemon (1.5 s cadence) reaps a baseline
+batch, survives 8 s of refused connections warning-and-retrying, and after the restart
+reaps a FRESH ripe batch — possible only because `setup_connection` re-runs whole on
+reconnect — with no prepared-statement errors and the watermark row carrying the pass
+(reaped=4). The refactor's reconnect path is now pinned by a scenario, not an argument.
+
+Suite: 54 scenarios. Chaos items 1–7 all closed, each with at least one finding.
+
+## 10cd. The step-aside, and the cascade that found two lying gauges (2026-09-03)
+
+§10cc's operator rule ("with NATS down, stop the bridge before a fast PostgreSQL
+stop") was review-rejected on the right grounds: rules in NOTES are forgotten in the
+jungle. It is code now.
+
+**Step-aside on a PostgreSQL shutdown.** The replication connection is parked in COPY
+and cannot hear a shutdown coming — but the WAL monitor's periodic connection can: it
+is refused with `FATAL: the database system is shutting down`. That refusal now raises
+a flag the replication loop consumes: with the publisher UNDRAINED (or a transaction
+open) it logs the step-aside and drops ONLY the COPY connection — the walsender exits
+the instant its client is gone, the fast stop completes, the process stays up and the
+reconnect loop waits out the restart. Nothing is lost by construction: the LSN was
+never acked past the undelivered events, so the slot replays them. Drained, the flag
+is consumed and ignored — §10cb's CopyDone handshake already ends a drained stream.
+Measured: fast stop with NATS down + an undrained bridge went from DEADLOCK (≥90 s,
+aborted) to **14 s** (bounded by the monitor's 30 s cadence). The matrix runs
+`-m fast` again in all four double-outage cases, making it the standing regression:
+a fast stop completing IS the assertion, a hang past `-t 90` means the step-aside
+regressed. Case 5 keeps `-m immediate` for crash-recovery flavour.
+
+**`cascade.py`** is the review-designed pressure test: a steady 20 rows/s feed,
+`RING_BUFFER_COUNT=1024` so pressure is visible, `max_slot_wal_keep_size` bounded at
+512 MB (the valve must NOT fire — crossing it is slot_loss.py's test). The broker dies
+under the feed and the whole column is watched through /metrics: queue to 86%, WAL
+confirmed lag damming to ~1 MB, the slot never leaving `reserved`, the bridge HALTING —
+never stopping — then the broker returns and the same process drains everything: queue
+0%, lag 0, all 1,199 committed rows on the client. The halt costs latency, never data.
+
+**It took three runs to see the climb, and each miss was a finding:**
+- both pressure gauges tick on slow clocks (WAL monitor 30 s; queue on the metrics
+  tick), so a 25 s watch window read stale zeros while 341 rows converged — the
+  scenario's window now outlives both cadences;
+- `bridge_queue_usage_percent` was written only AFTER a successful flush — frozen at
+  its pre-outage value in the exact state it exists to expose (§10bu's lying /health,
+  the gauge edition). It has three writers now: post-flush (healthy), the
+  slot-acquisition halt loop (ring full), and the main loop's periodic metrics tick —
+  which covers the common outage shape the other two miss (publisher parked, ring
+  PARTIALLY full: 894 events queued, both original writers silent, gauge flat 0%).
+
+## 10ce. The client killed at last, revocation stated honestly, and the metrics truth table (2026-09-03)
+
+Review named the largest untested surface after the chaos program closed: every kill
+had been server-side. **You cannot kill a library — you kill its HOST**, and libzb's
+hosts (a Python or Node process, a browser tab) die without cleanup. The client's only
+durable organ is its SQLite file, so the claims are the file's.
+
+**`client_kill.py`** (owns): a 120k-row fixture makes the seed take seconds — the kill
+window — and a tiny host script opens the client and syncs. Two hosts are SIGKILLed
+mid-`applyChain` (uncatchable, no destructors, faithfully a dead tab), then a FRESH
+host opens the same file. Green on the first run: the torn database opens (SQLite's
+journal makes the interrupted write invisible), the seed re-applies idempotently — 
+120,000 rows, all DISTINCT, equal to PostgreSQL — never doubled.
+
+**`revoke.py`** (live) gives `purgeTenantKey` its first test ever — and retires a stale
+comment that still described the purge as a "known, deliberately deferred gap" (it was
+closed; the comment wasn't). Verified live: inserting a mapping projects
+`$KV.tenants.<principal>` within seconds; DELETEing it purges the key, so the next
+`resolveTenant()` reads "no mapping" — the same state a principal that never existed
+has. The scenario's docstring states the honest scope of revocation-by-row-deletion:
+- **writes** die immediately, mid-session — the guard and RLS read the table live;
+- **tenant resolution** dies on the next connect — the KV key is gone;
+- **reads do NOT die**: the JWT is self-contained, NATS authorizes subjects from the
+  signature alone, so old creds keep reading the old tenant's CDC until the token
+  EXPIRES. Read revocation is the TTL's job (or a NATS revocation list) — the
+  operator/JWT endpoint the identity plan already names.
+
+**`OBSERVABILITY.md`** is the review-requested truth table for the Grafana rebuild:
+every /metrics gauge and counter → what it claims → which failure moves it → which
+scenario PROVES it moves, prefaced by the two convicted liars (§10bu /health, §10cd
+queue gauge) and the rule they teach: a metric only written on the happy path goes
+silent during the failure it exists for. A metric with no proving scenario is a
+candidate liar. Includes the alerting notes: bridge_connected==0 plus
+wal_confirmed_lag growth over /health; the 30 s-class gauge cadences that alias
+sub-minute panels; and the cascade's two-panel signature (queue climbs, then the lag
+takes the overflow).
+
+Housekeeping the same day: `my_slot2` (the two-bridge experiment's slot, long `lost`)
+dropped with its budget row — one slot again. Suite: 56 scenarios; the full seal ran
+offline 7/7, owns 24/24, live 22/22.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

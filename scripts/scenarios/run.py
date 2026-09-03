@@ -50,6 +50,7 @@ GROUPS = {
     "live": {
         "check":         ("bridge", "declared vs actual drift"),
         "diagnose":      ("none",   "bridge --diagnose: the pre-run doctor says everything, changes nothing"),
+        "revoke":        ("bridge", "deleting a principal's mapping purges its $KV.tenants key live"),
         "telemetry":     ("none",   "HTTP surface"),
         "writable":      ("client", "grants vs published write contract"),
         "mutate":        ("client", "LWW round trip"),
@@ -93,6 +94,10 @@ GROUPS = {
         "slot_contest":  ("bridge", "two bridges, one slot: the loser refuses cleanly and leaks nothing"),
         "stream_wipe":   ("bridge", "a CDC stream deleted wholesale: bridge stops, boot recreates, client resets and converges"),
         "pg_restart":    ("bridge", "PostgreSQL stopped and restarted: patient retry, resume from the slot, no loss"),
+        "matrix":        ("bridge", "PG and NATS failing and returning in every order; the 3am case on top"),
+        "sweeper_restart": ("bridge", "PostgreSQL restarts under a running sweeper: reconnect re-arms statements, principal, UTC"),
+        "cascade":       ("bridge", "NATS gone under a steady feed: ring fills, bridge halts, WAL dams behind the slot, then drains"),
+        "client_kill":   ("bridge", "kill -9 the client's HOST mid-seed: the SQLite file survives, the re-seed converges"),
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),

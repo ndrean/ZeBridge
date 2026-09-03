@@ -88,6 +88,9 @@ var should_stop = std.atomic.Value(bool).init(false);
 /// opposed to Ctrl+C. Only the exit code distinguishes the two for whatever
 /// supervises this process, and "misconfigured" must not look like "finished".
 var boot_fatal = std.atomic.Value(bool).init(false);
+/// Raised by the WAL monitor when PostgreSQL refuses a connection with "the database
+/// system is shutting down"; consumed by the replication loop's step-aside (§10cd).
+var pg_shutting_down = std.atomic.Value(bool).init(false);
 
 // Derive signal handler parameter type from posix.Sigaction.
 // On macOS Zig 0.16 the handler takes an anonymous enum(u32), not c_int.
@@ -970,6 +973,7 @@ pub fn main(init: std.process.Init) !void {
         wal_monitor_config,
         &should_stop,
     );
+    wal_mon.pg_shutting_down = &pg_shutting_down;
     try wal_mon.start();
     defer wal_mon.join();
     defer wal_mon.deinit();
@@ -1494,6 +1498,14 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // Periodic structured metric logging for Alloy/Loki
+        // The queue gauge's third writer, and the one that covers the common outage
+        // shape: publisher parked on a dead broker, ring PARTIALLY full — the flush
+        // thread (its post-flush writer) is parked and the producer (the halt-loop
+        // writer) never blocks, so both stayed silent and /metrics froze at 0% while
+        // hundreds of events queued (measured: cascade.py, 894 queued, gauge flat 0).
+        // This tick runs whenever the main loop is alive, which is exactly the claim
+        // the gauge should be making.
+        metrics.updateQueueUsage(batch_pub.getQueueUsage());
         if (now_s - last_metric_log_time >= metric_log_interval_seconds) {
             const snap = try metrics.snapshot(allocator);
             defer allocator.free(snap.last_ack_lsn_str);
@@ -1538,6 +1550,23 @@ pub fn main(init: std.process.Init) !void {
             });
 
             last_metric_log_time = now_s;
+        }
+
+        // ── Step aside on a PostgreSQL shutdown (§10cd) ─────────────────────
+        // The monitor learned PostgreSQL is shutting down. A fast shutdown's walsender
+        // waits for this client to confirm its send position — which the bridge, with
+        // an UNDRAINED publisher (NATS down, events queued), honestly cannot do. Two
+        // correct guards would deadlock the stop until something is killed. So: drop
+        // the COPY connection — the walsender exits the instant its client is gone —
+        // and let the reconnect loop wait out the restart. Nothing is lost: the LSN
+        // was never acked past the undelivered events, so the slot replays them.
+        // When the publisher IS drained the flag is consumed and ignored — the normal
+        // CopyDone handshake (§10cb) already ends a drained stream cleanly.
+        if (pg_shutting_down.swap(false, .seq_cst)) {
+            if (!batch_pub.isDrained() or tx_slots_count > 0) {
+                log.warn("🪧 PostgreSQL is shutting down and the publisher is not drained — stepping aside: closing the replication stream so the walsender can exit; the slot replays everything undelivered on reconnect", .{});
+                pg_stream.disconnect();
+            }
         }
 
         // Check for fatal NATS errors (e.g., reconnection timeout exceeded)

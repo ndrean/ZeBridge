@@ -140,6 +140,17 @@ pub const ReplicationStream = struct {
         return c.PQsocket(self.conn);
     }
 
+    /// Deliberately drop the replication connection (the step-aside on a PostgreSQL
+    /// shutdown, §10cd): the walsender exits the moment its client is gone, the COPY
+    /// state dies with the connection, and the next receiveMessage returns
+    /// NotConnected — which the main loop's reconnect path already handles.
+    pub fn disconnect(self: *ReplicationStream) void {
+        if (self.conn) |cn| {
+            c.PQfinish(cn);
+            self.conn = null;
+        }
+    }
+
     pub fn receiveMessage(self: *ReplicationStream) !?WalMessage {
         if (self.conn == null) {
             return error.NotConnected;

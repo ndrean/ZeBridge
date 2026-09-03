@@ -242,7 +242,10 @@ async def run(marker: str) -> int:
                         f"INSERT INTO public.{TABLE} (uid, some_text, tenant_id, inserted_at, updated_at) "
                         f"VALUES (gen_random_uuid(), 'pgr {marker} fire{i}', '{TENANT}', now(), now()) RETURNING 1",
                         quiet=True)
-                    if out == "1":
+                    # psql -tA still prints the command tag: a committed insert answers
+                    # "1\nINSERT 0 1", so match the RETURNING tuple, not the whole blob
+                    # (the first run counted "~0 committed" while PostgreSQL held 8).
+                    if out.splitlines() and out.splitlines()[0] == "1":
                         landed[0] += 1
                     time.sleep(0.1)
 
