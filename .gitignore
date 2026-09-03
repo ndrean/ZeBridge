@@ -35,6 +35,7 @@ src/test_files/
 .DS_Store
 docs/
 /zold/
+zz-changes/
 
 examples/01-micro_vm-nodejs/node_modules/
 examples/02-micro_vm-python/__pycache__/
