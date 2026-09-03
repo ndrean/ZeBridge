@@ -8320,6 +8320,77 @@ Housekeeping the same day: `my_slot2` (the two-bridge experiment's slot, long `l
 dropped with its budget row — one slot again. Suite: 56 scenarios; the full seal ran
 offline 7/7, owns 24/24, live 22/22.
 
+## 10cf. "Which tables are refused?" now has a psql answer (2026-09-03)
+
+Review caught the gap while reading OBSERVABILITY.md: an operator who missed the log
+warning had NO PostgreSQL answer to "which tables are suspended?" — the registry is
+bridge MEMORY, `$KV.schemas` is the client-facing projection (and querying it means
+one `nats kv get` per table), and /metrics carries only a count. The review's framing
+settled the design: NATS is authoritative FOR CLIENTS — that is why it exists — but
+this is BRIDGE state, and psql is where the operator already stands.
+
+The review's design, adopted: columns on `zebridge_catalogue` rather than a new table —
+`suspended boolean NOT NULL DEFAULT false` plus `suspended_reason text` (the first
+question after "which?" is "why?"). Written through SECURITY DEFINER setters
+(`zebridge_set_suspended`, `zebridge_clear_suspensions`) on the register-limits
+pattern: the reader role executes a narrow function, never holds UPDATE.
+
+The registry mirrors every transition from exactly three places — `refuse()`'s two
+activation sites and `clear()` (every lift routes through it: the §10bp probe lift,
+the DDL lift, the catalogue-reload lift). Best-effort, short-lived connection,
+transitions only; a mirror failure logs at debug and never fails the refusal itself.
+And the review's second question — "what reactivates a suspension?" — fixed the boot
+rule: the registry is memory, a restart forgets, so the columns are cleared WHOLESALE
+at boot; a surviving `true` would lie in the opposite direction. A published-but-
+undeclared table has no catalogue row and mirrors nothing — its doctor is
+`zebridge_check`, as before.
+
+Two deliberate side effects: the catalogue rides the publication, so each flip costs
+one cheap catalogue reload at commit — and clients could observe suspension state
+through the catalogue's own CDC if they ever care to.
+
+Review probed the boot rule from both sides and surfaced a subtlety worth pinning:
+**the sweeper's reap does NOT lift a ban.** Its physical DELETE is suppressed on the
+CDC path BEFORE anything is packed (clients removed the row at the tombstone; a
+million-row sweep must not be a million messages), and the §10bp probe fires only
+after a successful pack — so reaping the offending row leaves the ban standing until
+the next ORDINARY write probes it. A sweeper-cleaned but write-quiet table therefore
+keeps its ban until a write or a restart: zero data cost (quiet tables deliver
+nothing), but clients hold a descriptor for a hazard that is gone. And the same
+review round confirmed why boot CLEARS the mirror rather than loading it: truth flows
+registry → catalogue only. A cache projected from PG would boot pre-banned on
+evidence the world may have removed while the bridge was off (the sweeper's reap
+being the perfect example) — and boot would then republish a SUSPENDED descriptor for
+a row that no longer exists. Cleared, the failure mode is benign both ways: clients
+thaw, and a still-present wide row re-earns its quarantine from the data on the next
+touch. The mirror is a projection, never a source — one owner per fact. `suspension_lift.py` asserts the
+mirror at both transitions (true+reason on suspend, false on lift). One test-mechanics
+footnote for the file: `boolean::text` casts to 'true'/'false'; psql's bare-column
+`t`/`f` is display formatting, and asserting the display form fails the cast form.
+
+## 10cg. The named refusal series, and the design settling where it belongs (2026-09-03)
+
+Review closed the §10cf thread with the right frame: the ban is CDC business, the
+restart is its universal clear (cheap since §13, and it propagates completely — empty
+registry, healthy boot schemas, every client thaws at once), and what remained was
+TELEMETRY — a Prometheus entry with the NAME, on the condition that the lift
+propagates properly. Both projections now carry names:
+
+- **`bridge_refused_table{table="…",reason="…"}`** — rendered from the registry's
+  CURRENT state on every scrape, so lift propagation is by construction: 1 while
+  refused, an explicit 0 after a lift in this process (the entry survives `clear`, so
+  dashboards see the 1 → 0 edge instead of a series silently going stale), and the
+  whole family vanishes on restart — which also cleared every ban, so absence and
+  truth agree. Unit test pins the edge; suspension_lift.py asserts both values live.
+- **the catalogue columns (§10cf)**, which review named for what they are: a bridge
+  DUMP — live truth while the bridge runs, frozen when it is off, pruned at boot.
+  Kept on `zebridge_catalogue` rather than a separate zb_ban_dump table: same
+  contract, one fewer table, and the row is where the table's contract already lives.
+
+One correction kept on the record: a restart is NOT the only lift — §10bp's
+fitting-write lift is live and tested. The restart is the universal one, and the only
+one for the closed circle (edge-only writers, wide row already reaped).
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

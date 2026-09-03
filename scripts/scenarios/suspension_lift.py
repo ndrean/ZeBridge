@@ -54,6 +54,14 @@ def slot_name() -> str:
     return zb.BRIDGE_ARGS[zb.BRIDGE_ARGS.index("--slot") + 1] if "--slot" in zb.BRIDGE_ARGS else "zb_probe"
 
 
+def metrics_text() -> str:
+    try:
+        with urllib.request.urlopen(zb.http_base(probe=True) + "/metrics", timeout=3) as r:
+            return r.read().decode()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def refused_count() -> int:
     """`bridge_refused_tables` from the probe's own /metrics — the registry as the bridge
     sees it, with no publish latency between the decision and the observation."""
@@ -178,6 +186,28 @@ async def run() -> int:
             return 1
         t_suspend = time.monotonic()
 
+        # ── 1b. the psql answer (§10cf): the catalogue mirrors the registry ──
+        # An operator who missed the log line asks PostgreSQL, not NATS:
+        #     SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;
+        row = wait_for(lambda: zb.psql(
+            f"SELECT suspended || '|' || coalesce(suspended_reason,'') "
+            f"FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'").strip() == "true|row_too_large", 15)
+        if row:
+            zb.ok("and psql knows: zebridge_catalogue.suspended = true, reason row_too_large "
+                  "— the bridge's verdict, queryable where the operator already stands")
+        else:
+            zb.bad(f"the catalogue mirror never went true (got "
+                   f"{zb.psql(f"SELECT suspended || '|' || coalesce(suspended_reason,'') FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'").strip()!r})")
+            failed += 1
+        named = wait_for(lambda: 'bridge_refused_table{table="test_types",reason="row_too_large"} 1'
+                         in metrics_text(), 15)
+        if named:
+            zb.ok('and Grafana knows: bridge_refused_table{table="test_types",...} = 1 — the NAME, '
+                  'not just the count (§10cg)')
+        else:
+            zb.bad("the named refusal series never appeared on /metrics")
+            failed += 1
+
         # ── 2. inside the cooldown: nothing flows, nothing lifts ─────────────
         small_write(f"cooldown {marker}")
         await asyncio.sleep(3)
@@ -196,6 +226,18 @@ async def run() -> int:
         lifted = bridge.wait_for_log("a row fits again", timeout=30)
         cleared = wait_for(lambda: refused_count() == 0, 15)
         republished = wait_for(lambda: schema_state() == "live", 20)
+        mirror_cleared = wait_for(lambda: zb.psql(
+            f"SELECT suspended::text FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'").strip() == "false", 15)
+        named_lifted = wait_for(lambda: 'bridge_refused_table{table="test_types",reason="row_too_large"} 0'
+                                in metrics_text(), 15)
+        if not named_lifted:
+            zb.bad("the named series never dropped to 0 on the lift — a dashboard would show "
+                   "a refusal that no longer exists")
+            failed += 1
+        if not mirror_cleared:
+            zb.bad("the catalogue mirror never cleared on the lift — psql would report a "
+                   "suspension that no longer exists")
+            failed += 1
         if lifted and cleared and republished:
             zb.ok("the next fitting write lifted the suspension WITHOUT a restart, and the descriptor "
                   "was republished")

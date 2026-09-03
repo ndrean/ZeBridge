@@ -33,6 +33,8 @@
 //! realloc the backing array under a reader mid-scan.
 
 const std = @import("std");
+const c = @import("c_imports.zig").c;
+const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 
 const log = std.log.scoped(.refused);
@@ -160,6 +162,12 @@ pub const Registry = struct {
     /// Set once if a refusal could not be recorded for want of capacity. A table we
     /// failed to record would silently keep streaming, so this must be loud.
     overflowed: std.atomic.Value(bool) = .init(false),
+    /// When set (the live bridge wires it after boot; unit tests and --diagnose leave
+    /// it null), every refusal transition is MIRRORED into `zebridge_catalogue`'s
+    /// `suspended`/`suspended_reason` columns via the SECURITY DEFINER setter — the
+    /// psql answer to "which tables are refused?" (§10cf). The registry stays the
+    /// authority; the columns are its projection, cleared wholesale at boot.
+    pg_config: ?*const pg_conn.PgConf = null,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
         return .{ .allocator = allocator };
@@ -181,6 +189,37 @@ pub const Registry = struct {
 
     /// Mark a table refused. Idempotent: re-refusing keeps the running drop count, so a
     /// re-announced DDL event does not reset the number the operator is watching.
+    /// When set (the live bridge wires it after boot; unit tests and --diagnose leave
+    /// it null), every refusal transition is MIRRORED into `zebridge_catalogue`'s
+    /// `suspended`/`suspended_reason` columns via the SECURITY DEFINER setter — the
+    /// psql answer to "which tables are refused?" (§10cf). The registry stays the
+    /// authority; the columns are its projection, cleared wholesale at boot because
+    /// the registry is memory and a restart forgets.
+    /// Best-effort, short-lived connection, transitions only (suspensions and lifts
+    /// are rare). A failure logs at debug and the registry stays correct — the mirror
+    /// must never make a refusal itself fail.
+    fn mirrorToCatalogue(self: *Registry, table: []const u8, reason: ?Reason) void {
+        const cfg = self.pg_config orelse return;
+        const conninfo = cfg.connInfo(self.allocator, false) catch return;
+        defer self.allocator.free(conninfo);
+        const conn = c.PQconnectdb(conninfo.ptr) orelse return;
+        defer c.PQfinish(conn);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) return;
+        var tbl_buf: [256]u8 = undefined;
+        const tbl_z = std.fmt.bufPrintZ(&tbl_buf, "{s}", .{table}) catch return;
+        var reason_buf: [64]u8 = undefined;
+        const reason_z: ?[*:0]const u8 = if (reason) |r|
+            (std.fmt.bufPrintZ(&reason_buf, "{s}", .{r.wireName()}) catch return).ptr
+        else
+            null;
+        const params = [_]?[*:0]const u8{ tbl_z.ptr, reason_z };
+        const res = c.PQexecParams(conn, "SELECT public.zebridge_set_suspended($1, $2)", 2, null, &params[0], null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+            log.debug("catalogue mirror not written for '{s}': {s}", .{ table, c.PQerrorMessage(conn) });
+        }
+    }
+
     pub fn refuse(self: *Registry, table: []const u8, reason: Reason) !void {
         if (self.find(table)) |e| {
             // A table can fail a second check after passing the first (gain a key, then
@@ -194,6 +233,7 @@ pub const Registry = struct {
                 e.suspended_at_ms = nowMs();
                 e.active.store(true, .release);
                 _ = self.refused_count.fetchAdd(1, .acq_rel);
+                self.mirrorToCatalogue(table, reason);
             }
             return;
         }
@@ -231,6 +271,7 @@ pub const Registry = struct {
             std.atomic.spinLoopHint();
         }
         _ = self.refused_count.fetchAdd(1, .acq_rel);
+        self.mirrorToCatalogue(table, reason);
     }
 
     /// Lift a refusal — the table's shape was fixed. The entry stays (its name may
@@ -242,6 +283,7 @@ pub const Registry = struct {
             // "was", not "resolved": this is also the path a DROP TABLE takes, where
             // nothing was fixed — the table simply stopped existing.
             log.info("✅ '{s}' is no longer refused (was: {s})", .{ e.name, e.reason.wireName() });
+            self.mirrorToCatalogue(table, null);
         }
     }
 
@@ -383,6 +425,27 @@ pub const Registry = struct {
         try w.print("# HELP bridge_refused_events_dropped_total Events dropped for refused tables\n", .{});
         try w.print("# TYPE bridge_refused_events_dropped_total counter\n", .{});
         try w.print("bridge_refused_events_dropped_total {d}\n", .{self.dropped_total.load(.acquire)});
+
+        // The NAMED series (§10cg) — the count above says "one table is refused",
+        // this says WHICH, straight into a Grafana panel or alert label. Rendered from
+        // the registry's CURRENT state on every scrape, so the lift propagates by
+        // construction: 1 while refused, an explicit 0 after a lift in this process
+        // (the entry survives `clear`, so the drop 1 → 0 is a visible edge rather
+        // than a series silently going stale), and the whole family vanishes on a
+        // restart — which also cleared every ban, so absence and truth agree. Labels
+        // are safe unquoted-in-content: table names are SQL identifiers, reasons a
+        // fixed enum.
+        if (self.len.load(.acquire) > 0) {
+            try w.print("# HELP bridge_refused_table Per-table refusal state (1 refused, 0 lifted this process)\n", .{});
+            try w.print("# TYPE bridge_refused_table gauge\n", .{});
+            for (self.entries[0..self.len.load(.acquire)]) |*e| {
+                try w.print("bridge_refused_table{{table=\"{s}\",reason=\"{s}\"}} {d}\n", .{
+                    e.name,
+                    e.reason.wireName(),
+                    @as(u8, if (e.active.load(.acquire)) 1 else 0),
+                });
+            }
+        }
     }
 };
 
@@ -405,11 +468,19 @@ test "refused tables drop and count" {
     try std.testing.expect(r.shouldDrop("t_nopk"));
     try std.testing.expect(r.shouldDrop("t_nopk"));
 
-    var buf: [512]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try r.writePrometheus(&w);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_tables 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_events_dropped_total 3") != null);
+    // The NAMED series (§10cg): 1 while refused…
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_table{table=\"t_nopk\",reason=\"no_primary_key\"} 1") != null);
+    // …and an explicit 0 after the lift — the visible edge, not a vanished series.
+    r.clear("t_nopk");
+    var buf2: [1024]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&buf2);
+    try r.writePrometheus(&w2);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "bridge_refused_table{table=\"t_nopk\",reason=\"no_primary_key\"} 0") != null);
 }
 
 test "re-refusing keeps the running count" {
@@ -426,7 +497,7 @@ test "re-refusing keeps the running count" {
     try std.testing.expectEqual(@as(usize, 1), r.count());
     try std.testing.expect(r.shouldDrop("t_nopk"));
 
-    var buf: [512]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try r.writePrometheus(&w);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "bridge_refused_events_dropped_total 3") != null);

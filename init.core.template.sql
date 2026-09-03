@@ -241,6 +241,44 @@ CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
     CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
 GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_READER_USER};
+
+-- The bridge's runtime verdicts, made queryable (NOTES §10cf). A row_too_large
+-- suspension lived only in the bridge's MEMORY plus the client-facing KV descriptor —
+-- an operator who missed the log line had no psql answer to "which tables are
+-- refused?". These two columns are that answer:
+--
+--     SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;
+--
+-- Written by the bridge through the SECURITY DEFINER setters below (the
+-- zebridge_register_limits pattern — the reader role executes a narrow function
+-- rather than holding UPDATE on the table). Semantics mirror the in-memory registry
+-- exactly: set on every refusal transition, cleared on every lift — and cleared
+-- WHOLESALE at boot, because the registry is memory and a restart forgets (§13/§10bw:
+-- the quarantine is lazily re-earned on the next touch, so a surviving true would lie
+-- in the opposite direction). One deliberate side effect: the catalogue rides the
+-- publication, so each flip triggers one cheap catalogue reload at commit — and
+-- clients can observe suspension state through the catalogue's own CDC if they care.
+ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS suspended boolean NOT NULL DEFAULT false;
+ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS suspended_reason text;
+
+CREATE OR REPLACE FUNCTION public.zebridge_set_suspended(p_tbl text, p_reason text)
+RETURNS void AS $$
+    -- p_reason NULL = lifted. A table with no catalogue row (published but never
+    -- declared) updates nothing, which is right: the doctor for those is zebridge_check.
+    UPDATE public.zebridge_catalogue
+       SET suspended = (p_reason IS NOT NULL), suspended_reason = p_reason
+     WHERE tbl = p_tbl;
+$$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
+
+CREATE OR REPLACE FUNCTION public.zebridge_clear_suspensions()
+RETURNS void AS $$
+    UPDATE public.zebridge_catalogue
+       SET suspended = false, suspended_reason = NULL
+     WHERE suspended;
+$$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
+
+GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_READER_USER};
+GRANT EXECUTE ON FUNCTION public.zebridge_clear_suspensions() TO ${POSTGRES_READER_USER};
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
