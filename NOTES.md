@@ -5378,8 +5378,8 @@ and a wrong one costs you a curl; these two names decide WHICH ROWS get
 replicated and WHOSE WAL position is kept. Unset is not ambiguous — it means
 nobody said — so it is no longer guessed at:
 
-    bridge                     ->  🔴 no replication slot named: pass --slot <name>,
-                                   or set BRIDGE_CDC_SLOT (there is no default …)
+    bridge     ->  🔴 no replication slot named: pass --slot <name>,
+                  or set BRIDGE_CDC_SLOT (there is no default …)
 
 Deleted: `Postgres.default_slot_name`, `Postgres.default_publication_name`, the
 `StreamConfig` field defaults (one caller, and it passes both), and the
@@ -7903,6 +7903,196 @@ would republish beyond dedup's reach and the client's upsert would carry it alon
 which is exactly the case `nats_outage.py` measured from the other side (12/12 rows, 0
 duplicates, because the outage stayed inside the window).
 
+## 10bu. A full stream, and the FATAL that did not stop the bridge (2026-09-03)
+
+The last untested arm of the publish path. `nats_outage` (§10bm) proved a broker that is
+GONE parks the publisher in reconnect and the retry budget never burns — so the
+documented deliberate stop ("Exhausted retries … stopping bridge to prevent WAL
+overflow") had never fired anywhere. The budget is for a publish that FAILS on a
+CONNECTED broker, and the realistic trigger is storage: a stream at `max_bytes` with
+`discard: new` answers every publish `503 err_code=10077 maximum bytes exceeded`.
+(Our streams run `discard: old`, where a full stream silently evicts the tail instead —
+that is the retention that `client_gap` exercises; the refusal arm needs `new`.)
+
+`stream_full.py` (owns) caps `CDC_<tenant>` ~2 KB above its current size with
+`discard: new` — boot reconciliation is create-when-missing only, so the drift persists
+until the scenario restores it — writes past the cap, and asserts the whole arc:
+refused attempts with backoff, the FATAL, a deliberate exit, the slot left inactive but
+RETAINING, and after restoring the config a restart that replays everything (40/40 rows
+on a client, including the batch that burned the budget — LSN acked only on PubAck, so
+the refused batch was never acked past).
+
+**First run found a real defect: the FATAL did not stop the bridge.** The whole
+sequence fired — 18 refused attempts (3 batches × 6), both FATAL lines, the flush
+thread drained and "Batch publisher stopped cleanly" — and then the process hung
+forever. The fatal path `break`s out of the replication loop and the teardown stops the
+BATCH PUBLISHER's own flag, but nothing set the global `should_stop`, which only the
+signal handler writes. The deferred `wal_mon.join()` then waits on a thread looping on
+that flag: a zombie bridge — replication dead, `wal_monitor` logging "slot INACTIVE"
+every pass, and `/health` still answering 200, so monitoring sees a healthy process
+while WAL piles up behind a stopped feed. The operator's first hint would have been
+disk pressure. One line fixes it: the fatal branch stores `should_stop` before the
+break, so the stop it announces is the stop that happens — and under a supervisor the
+exit becomes a visible crash loop until the stream is repaired, which is the correct
+shape for "storage is full".
+
+## 10bv. The sweeper's reach, granted at the door (2026-09-03)
+
+The sweeper is a named principal bounded by `zebridge_user_tenants` like every writer —
+deliberately, so its reach fails closed and is auditable (§7.5). The cost was pointed
+out in review: a NEW tenant starts life unswept until someone remembers the mapping,
+the failure is silent accumulation, and `zebridge_audit_sweeper()` can only report it
+after the fact. The audit is a post-mortem; the gap needed closing at the door.
+
+Every tenant enters through one door — a row in `zebridge_user_tenants`, whether from a
+DBA's INSERT or `/enroll` redeeming an invite — so one trigger covers both:
+`zebridge_sweeper_autogrant_t` AFTER INSERT maps `zb_sweeper` to the new row's tenant,
+`ON CONFLICT DO NOTHING` (atomic — concurrent enrollments of the same tenant cannot
+race; the reviewer's SELECT-then-INSERT sketch would), guarded with
+`WHEN (NEW.principal <> 'zb_sweeper')` so the auto-grant row does not re-fire it. A
+backfill in the same migration covers tenants already inside — and applying it to the
+live database inserted one row immediately: the gap was not hypothetical.
+
+What the trigger cannot see is a tenant that exists only as DATA — rows an admin
+inserted under a tenant_id nobody is mapped to. No mapping insert, no trigger; that
+remains the audit's job, and it caught exactly one live: `dynten`, scenario residue on
+`test_types`, now mapped. Verified end to end: a brand-new tenant's first mapping
+auto-grants the sweeper, and `zebridge_audit_sweeper()` returns empty.
+
+One side effect, measured and harmless: the mapping table rides the publication, so a
+`$KV.tenants.zb_sweeper` key appears. The bucket holds ONE bare tenant per principal —
+for a many-tenant principal it shows whichever mapping was written last, which is
+meaningless and inert: the sweeper is not a NATS client and nothing resolves that key.
+
+**And the first full battery after it found a §10br crossing — the trigger × boot
+reconciliation.** An offline scenario mapped a principal to the OPEN tenant; the
+trigger copied it; boot then derived `_default` from `DISTINCT tenant_id`, tried to
+create `CDC__default`, whose subject overlaps `CDC_PUBLIC` — StreamSubjectOverlap, and
+the boot refusal took every bridge start down. Three fixes, one of them pre-existing:
+
+- the trigger's WHEN guard adds `NEW.tenant_id <> '<open tenant>'` (and the backfill a
+  matching WHERE) — the sweeper reaches open-tenant rows through the policy's own
+  `tenant_id = '<open>'` arm, so the mapping added nothing and subtracted the boot;
+- **`reconcileCdcStreams` now skips the open tenant** — this bug predates the trigger:
+  ANY `_default` row in `zebridge_user_tenants` (a DBA enrolling someone into the open
+  tenant) already made every boot fail the same way. The trigger just made someone
+  write one;
+- `tenant_writes.py` cleans by TENANT as well as principal — cleaning by principal
+  alone now leaves the sweeper's copied rows behind, and boot would create `CDC_tw_*`
+  streams for tenants that no longer exist. (The same residue rule as dyntenant's.)
+
+## 10bw. What §13 actually costs, measured (2026-09-03)
+
+`checkStoredRowsFit` is disabled (§13) and the argument for it holds — ingress, mutation
+and egress guards all still apply. But `legacybait.py` asserted the removed behaviour in
+two phases, and rewriting them to the new reality is what makes the trade explicit:
+
+**The quarantine is MEMORY, so a reboot forgets it.** The registry is in-process; the
+boot scan was what re-derived a suspension from the data. Without it a fresh bridge
+starts clean and republishes a HEALTHY schema — clients thaw — until the wide row is
+touched again, and then the decode guard re-quarantines it. Containment is not lost, it
+is deferred to the next touch. Both halves are now pinned: the schema key is not
+suspended after a fresh boot, and the very next touch re-raises it.
+
+**And a repair does not stop one last suspension, because the WAL is a log, not a
+snapshot.** Deleting the oversized row leaves the UPDATE that CARRIED it in the backlog
+the slot still holds, so the repaired bridge decodes it again and suspends — before it
+publishes its boot schemas (the FATAL row-size lines land ahead of the first "Published
+KV schema"). A repair can therefore never be judged by "does it ever suspend again",
+only by whether it RECOVERS. It does, and by §10bp's route: once past the 30 s anti-flap
+cooldown a fitting write lifts the suspension by itself, no restart. That interaction —
+§13 removing the boot re-derivation, §10bp supplying the live lift instead — is the real
+current shape of the legacy-row story, and the scenario now walks exactly it.
+
+**Two test-mechanics lessons, both §10br shapes.**
+- `wait_for_log` scans the WHOLE file, so a needle from BOOT satisfies a check meant for
+  an event AFTER a write. The rewritten phase asserts on `$KV.schemas` state instead of
+  a log line — state is a fact about now, a log line is a fact about ever.
+- A `kv del` in a scenario's teardown plants a DELETE TOMBSTONE, and a Direct Get
+  returns the newest revision — so the NEXT run's client reads the tombstone, concludes
+  "schema missing", and fails a precondition on a phantom. `txn_kill` did this to itself
+  (found 2026-09-03, revision 5443 DEL read while 5453 PUT existed one second later).
+  Fixtures are recreated with the same shape every run and boot re-publishes the schema,
+  so leaving a stale PUT is harmless — a tombstone is not. Never `kv del` a schema key.
+- A COLOCATED sweeper joins every race. `offline.py` pins its versions weeks in the past
+  (deliberately, so cleanup can sweep by date and nothing legitimate collides) — which
+  makes every tombstone it writes GC-ripe the instant it lands. The first battery run
+  beside a long-running `bridge_sweeper` saw one reaped mid-phase: state None instead of
+  'dead', and the "no resurrection" check failed on a row that had in fact stayed
+  deleted. The check now names both passing paths — tombstone overruled the late writer,
+  or the sweeper reaped the ripe tombstone and the stale UPDATE matched nothing — and
+  fails only on the one outcome that is actually wrong: a live row with the stale value.
+  A battery that requires the sweeper to be OFF would be the wrong fix; production runs
+  one, so the scenarios must survive beside it.
+
+## 10bx. The shrink-gated scan: §13's lost detector, restored for its one real case (2026-09-03)
+
+§13 removed the per-boot stored-rows scan and §10bw measured what that costs. Review
+pinned the residual precisely: **lowering BASE_BUF under stored data** lost its
+detector. Adoption is probed at enable time, new writes are guarded at ingress — but a
+budget dropped after data exists was now discovered at first touch, under load, as a
+surprise suspension.
+
+The fix is the reviewer's design: remember the admissible budget, scan only when the
+new one is smaller. And the memory already existed — `zebridge_limits` holds each
+slot's registered `max_row_bytes`. `registerRowWidthBudget` now reads the slot's
+previous row in a CTE (materialized BEFORE the upsert overwrites it — a bare subselect
+in the same target list has no ordering guarantee against the function call) and, only
+when this boot's budget is smaller, revives `checkStoredRowsFit` — un-commented, `pub`,
+called from exactly one place. Raised or unchanged budgets — every normal boot, and
+every recovery restart — stay scan-free, which was §13's whole point.
+
+Policy unchanged from the function's own doc: **reported, never refused.** The rows
+already exist; refusing to start would turn the warning into the outage it is trying
+to prevent. Containment stays §13's lazy suspension — what the scan restores is the
+operator's early sight of it, at boot, named per table, before traffic touches it.
+
+`shrink.py` (owns) walks the matrix: boot at 4 KB (no scan) → store a 3 KB row → boot
+at 2 KB (shrink detected, scan names the table) → boot at 2 KB again (no shrink, no
+scan) → boot back at 4 KB (raise, no scan). Each phase writes a fresh log file, so the
+needle cannot be satisfied by an earlier boot — §10bw's `wait_for_log` lesson applied.
+
+And §10bw's lesson recursed once more: the rewritten SUSPENDING block (the operator
+diagnosis, same day) QUOTES the shrink warning — 'the boot would have logged "row-width
+budget SHRANK"' — and the phases that decode the replayed oversized event print that
+block, so the scenario's bare substring matched a diagnostic quoting a diagnostic and
+failed phase c on its own explanation. The needle carries the warning's trailing colon
+now. When one message names another, every log assertion on either needs an anchor the
+quotation cannot carry.
+
+## 10by. `bridge --diagnose`: guarded beforehand, because once running it is complicated (2026-09-03)
+
+Review framed it exactly: every §10bw/§10bx guard speaks at the moment of failure — a
+suspension under load, a SHRANK line mid-boot — but the first-time operator's problem
+is BEFORE any of that: an empty database, init maybe not applied, a publication maybe
+half-built, a BASE_BUF chosen blind. "Maybe look into the logs" is advice without
+context there. Once running, everything is harder — pruning WAL, filtering a table,
+unpicking a wrong migration. So: a dry run that says everything and changes nothing.
+
+`bridge --diagnose` (alias `--run-diagnose`) runs the checks in the order a first
+installation actually fails, and exits 0/1 (CI-able):
+
+  0. is init applied at ALL — the headline when it is not, with the fix, instead of a
+     cascade of "function does not exist" from every later probe (core and write
+     reported separately: read-only replication runs without init.write, edge writes
+     do not);
+  1. the publication exists and carries tables;
+  2. the SAME preflight the boot runs — pk, writability trio, tenant scoping, DDL
+     pipeline — so the doctor can never drift from what the bridge will decide;
+  3. the width scan against THIS BASE_BUF, plus the number the operator actually
+     wants: the minimum BASE_BUF the stored data needs (widest row + envelope margin);
+  4. the §10bx shrink pre-check, as a FINDING instead of a boot-time surprise.
+
+**Read-only by construction, which took a boot reorder.** The slot init ran before the
+config was even fully parsed, so a dry run's fork point either created slots or came
+too late. Boot order is now: parse everything (pure) → the --diagnose fork →
+`initReplication` → budget registration — with the register kept AFTER slot creation,
+because its GC deletes limits rows for absent slots and a not-yet-created slot's row
+would be another bridge's GC fodder (the constraint the old comment already named).
+Under --diagnose the HTTP thread is never started either. `diagnose.py` (live) proves
+the contract: exit 0 healthy, exit 1 with the shrink named under BASE_BUF=11, and slot
+count + zebridge_limits byte-identical after both runs.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
@@ -8026,3 +8216,123 @@ compose-era variables and are NOT what the bridge dials — `DATABASE_READER_URL
 reader (§10p); `SYNC_RULES`/`TENANT_RULES` are overridden by `zebridge_catalogue` where a
 row exists (§10k). `RING_BUFFER_COUNT=4096` × `2^BASE_BUF=4096` B = 16 MiB of ring —
 the dev size, not §1.3's 32768.
+
+---
+## §13 Preflight stopped
+
+The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:
+
+1. **Direct PG ingress into the bridge (The Trigger)**
+   When a table is added via `zebridge_enable`, the `zebridge_width_guard` trigger is installed (`BEFORE INSERT OR UPDATE FOR EACH ROW`). Any direct write via `psql` or a backend service is evaluated before it is stored. If it exceeds the budget, Postgres raises a `check_violation` exception and aborts the transaction.
+
+2. **Bridge mutation process (from NATS)**
+   The bridge executes `INSERT ... ON CONFLICT DO UPDATE` during edge writes via `mutation_listener.zig`. This standard SQL execution fires the exact same `zebridge_width_guard` trigger. If a mutation payload is too large, the database rejects it and the row never enters the WAL.
+
+3. **Decoder guard (`suspendForRowTooLarge`)**
+   If a row inserted before the trigger was added, or changed by a DDL migration, exceeds the buffer, it is cleanly caught by the CDC decoding loop (`event_processor.zig`). When `event.addColumn` throws `error.BufferOverflow`, the decoder explicitly skips the row, registers the table as `.row_too_large` in memory, and publishes a `schema-suspend-size` NATS message with `"suspended": true`.
+
+4. **Generation producer guard**
+   During the snapshot phase, `encodeContent` tracks `widest_row`. If it exceeds the CDC event buffer size, the snapshot completes safely (via NATS chunking) but prints a proactive warning that the table will suspend on its next CDC touch.
+
+Because oversized rows are entirely prevented at ingress and gracefully quarantined at egress, the boot-time preflight scan is redundant and has been commented out to speed up the boot process.
+
+**Addendum (2026-09-03, §10bx):** one detector did go with the scan — lowering BASE_BUF
+under stored data. The scan is revived for exactly that transition: the bridge compares
+this boot's budget against the one its slot registered last boot (`zebridge_limits`) and
+scans only on a SHRINK, reported never refused. Normal boots stay scan-free.
+
+## §14 Knowledge: Live DDL and Schema Authorization
+
+The authorization rules (which tables the bridge monitors and broadcasts schemas for) are not merely cached on boot—they are governed entirely by the PostgreSQL Publication and synced to NATS in real-time. PostgreSQL does not natively send schema changes over logical replication, so ZeBridge bridges this gap using an event pipeline.
+
+1. **The Event Triggers**
+   When a DBA or a migration script executes an `ALTER TABLE`, `CREATE TABLE`, or `DROP TABLE`, Postgres fires ZeBridge's event triggers (e.g., `zebridge_ddl_trigger` or `zebridge_drop_trigger`).
+
+2. **The `zebridge_ddl_events` Table**
+   These triggers intercept the DDL command, capture the new schema shape as JSON, and insert it as a row into the internal `zebridge_ddl_events` table. 
+
+3. **Real-time WAL Decoding**
+   Because `zebridge_ddl_events` is part of the publication, its rows are streamed to the bridge via the standard CDC WAL stream. The `EventProcessor` intercepts these rows and does **not** forward them to edge clients as CDC data. Instead:
+   - It parses the captured DDL JSON.
+   - It runs the exact same authorization filters as the boot process (ignoring internal tables like `zebridge_catalogue` and `zebridge_user_tenants`, and withholding schemas for quarantined/refused tables).
+   - If the table passes, it publishes the updated schema directly to the NATS `$KV.schemas.<table>` bucket.
+
+This means if you run `zebridge_enable('new_table')` on a running database, the table is added to the publication, the trigger writes the schema to `zebridge_ddl_events`, and the running bridge instantly creates a `$KV.schemas.new_table` key in NATS. Edge clients see the new schema, build their local replicas, and consume CDC events immediately without requiring a bridge restart.
+
+## §15 Knowledge: The Generation Chain Architecture
+
+The generation chain is ZeBridge's mechanism for seeding new clients or recovering clients that have fallen hopelessly behind the WAL. It acts as a bulk-catchup bridge, avoiding the cost of replaying thousands of single-row CDC events.
+It uses the table `zebridge_generations` for its control plan.
+
+### 1. The PostgreSQL Source & The Tracking Table (`generation_producer.zig`)
+Every `GENERATION_CADENCE_SECONDS` (e.g., 5 minutes), the bridge spins up a fresh Postgres connection and checks for new mutations per tenant. It strictly enters a `REPEATABLE READ` transaction and sets `zb.principal = <tenant>` to enforce Row-Level Security (RLS). 
+
+To know exactly where it stands, the producer relies completely on its control-plane memory: the **`zebridge_generations`** table. 
+
+**Table fields:**
+- `tenant`, `tbl`: The exact partition being built.
+- `gen` (bigint): The absolute tick number for this chain (e.g., `124`).
+- `has_full` (boolean): Whether this specific tick included a Full generation.
+- `cutoff_version`, `cutoff_lsn`: The exact timestamp and WAL position of the snapshot.
+- `row_count`, `del_count`: The table state at this tick (used to detect hard deletes).
+
+**Determining the Tick & Rolling Window:**
+1. The producer queries the highest `gen` for this table/tenant to find `last_gen`. The new tick will be `gen = last_gen + 1`.
+2. It queries the highest `gen` where `has_full = true` to find `last_full_gen`. 
+3. It subtracts: `(gen - last_full_gen)`. If this distance is `>= chain_depth - 1`, it forces a **Full** generation.
+4. If the distance is smaller, and no hard deletes occurred, it builds a **Delta** (`SELECT * FROM table WHERE updated_at > last_cutoff`).
+5. Finally, it enforces the rolling window by aggressively pruning history: `DELETE FROM zebridge_generations WHERE gen <= (gen - chain_depth)`, deleting the corresponding objects from NATS.
+### 2. NATS Object Storage (The Payload)
+The SQL result is encoded into MessagePack, compressed with Zstd with a dictionary, and uploaded to the NATS JetStream Object Store as a discrete file.
+- Example Full: `gen-tenant.test_types-g1-full` (Contains all 10,000 rows)
+- Example Delta: `gen-tenant.test_types-g2-delta` (Contains only the 50 modified rows)
+
+Because Deltas are limited by `GENERATION_CHAIN_DEPTH` (e.g., max 6 objects before forcing a new Full), the Object Store is tightly bounded. When `g7` is built, `g1` is permanently deleted.
+Therefore, NATS holds almost exactly one physical copy of the database, partitioned by tenant.
+
+### 3. The NATS KV Manifest (The Menu)
+A tiny JSON manifest is written to the NATS KV bucket under the key `<tenant>.<table>`. It lists the cutoff timestamp for the Full and every available Delta in the rolling window.
+
+```json
+{
+  "gen": 6,
+  "cutoff_version": "2026-09-02T19:00:00Z",
+  "full": { "gen": 1, "object": "test_types-g1-full", "cutoff": "2026-09-02T18:35:00Z" },
+  "deltas": [
+    { "gen": 2, "object": "test_types-g2-delta", "cutoff": "2026-09-02T18:40:00Z" },
+    ...
+  ]
+}
+```
+
+### 4. Client Consumption & The CDC Complement
+When an edge client connects, it evaluates its local SQLite `watermark` against the KV Manifest (`planFromManifest`):
+- **Brand New Client (Empty DB):** Downloads the Full and all subsequent Deltas, bulk-upserting them into SQLite to rapidly build the replica.
+- **Short Disconnect (e.g., 10 minutes offline):** The client's watermark falls within the Delta window! It completely skips the Full, cherry-picks only the 2 Deltas it missed, bulk-upserts them, and resumes.
+- **Connected (Live):** The client uses the NATS **CDC Stream** (`cdc.*`). The CDC stream is configured with a very short retention (e.g., 2 ticks) because historical events are already bulk-compressed in the Deltas. NATS avoids storing millions of single-row CDC events, acting solely as an ephemeral, low-latency live pipe!
+
+## § Scenarios: Catch-Up, Eras, and Dictionaries
+
+The interaction between `GENERATION_CHAIN_DEPTH`, Zstd dictionaries, and client reconnects is tightly mathematically bounded. A Full generation is forced at a distance of `chain_depth - 1`. This guarantees that a rolling window of size `chain_depth` can straddle **at most one era boundary**.
+
+### 1. The Dictionary Lifecycle
+Because Zstd dictionaries are static, they are trained exactly once per era:
+- **On a Full (e.g., Gen 6):** The producer trains `g6-dict` from the Full payload, saves it to PostgreSQL, and uploads it to NATS.
+- **On a Delta (e.g., Gen 7-10):** The producer reads `g6-dict` from PostgreSQL and uses it to compress the Delta. The NATS Manifest explicitly pairs the Delta with its dictionary: `{"object": "g7-delta", "dict": "g6-dict"}`.
+- **The Mathematical Upper Bound:** Because the rolling window straddles at most one era boundary, the NATS Manifest will reference **a maximum of 2 dictionaries** at any given time. The client only ever needs to cache 2 dictionaries per table to decompress any valid chain.
+
+### Scenario A: The Graceful Catch-Up (Inside the Window)
+Assume `chain_depth = 6`. 
+- **State:** A client goes offline at Gen 3. The client's watermark is `cutoff(gen-3)`.
+- **Event:** The client reconnects at Gen 7.
+- **Manifest Window:** Gen 2, 3, 4, 5, 6 (Full), 7.
+- **Resolution:** The client checks if the chain "reaches" its watermark. Delta 4 requires `cutoff(gen-3)`. The chain perfectly reaches!
+- **Action:** The client skips the heavy Gen 6 Full entirely. It downloads Deltas 4 & 5 (decompressing with `g1-dict`) and Deltas 6 & 7 (decompressing with `g6-dict`). It bulk-upserts them and resumes the live CDC stream.
+
+### Scenario B: The Disaster Recovery (Outside the Window)
+Assume `chain_depth = 6`.
+- **State:** A client goes offline at Gen 3, and stays offline for a long time.
+- **Event:** The client reconnects at Gen 15.
+- **Manifest Window:** Gen 10, 11 (Full), 12, 13, 14, 15.
+- **Resolution:** The client looks for a Delta that requires `cutoff(gen-3)`. The oldest available Delta is Gen 10, which requires `cutoff(gen-9)`. The chain does **not** reach. 
+- **Action:** The client degrades to a Full rebuild. It executes `DELETE FROM table`, downloads the Gen 11 Full (applying `g11-dict`), downloads Deltas 12-15, applies them, and then resumes the live CDC stream. 

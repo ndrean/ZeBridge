@@ -252,8 +252,24 @@ async def main():
     await send("update", uid, "remote deleted it", V_NEW, tombstone=True)
     await send("update", uid, "OFFLINE resurrects?", V_MID)
     _, state, _ = read(uid)
-    check("no resurrection", state == "dead",
-          f"row stayed deleted against a stale offline update (state '{state}')")
+    # ⚠️ Two ways to stay dead, and a colocated sweeper decides which one this run sees.
+    # The tombstones here are BACKDATED (DAY is weeks old, deliberately — see above), so
+    # they are GC-ripe the instant they land; a running bridge_sweeper's next pass may
+    # reap the row between the delete and this read (measured 2026-09-03: reaped=2 on
+    # the watermark, state None). Reaped is still "stayed deleted" — the stale UPDATE
+    # then matches no row and writes nothing — but through a different mechanism than
+    # the tombstone-overrules-late-writer one this phase is really about, so say which
+    # path this run took. Only a LIVE row with the stale value is a failure.
+    if state == "dead":
+        check("no resurrection", True,
+              "row stayed deleted against a stale offline update (tombstone overruled it)")
+    elif state is None:
+        check("no resurrection", True,
+              "row stayed deleted — the sweeper reaped the ripe tombstone mid-test and "
+              "the stale update then matched nothing (colocated sweeper; both paths hold)")
+    else:
+        check("no resurrection", False,
+              f"the stale offline update RESURRECTED the row (state '{state}')")
     cleanup(uid)
 
     # ── 6. replaying the same write twice writes one row ───────────────────────

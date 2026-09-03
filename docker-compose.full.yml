@@ -146,8 +146,8 @@ services:
     # Published on its own knob: the host dev loop usually holds 9090 already.
     # - "${BRIDGE_PUBLISH_PORT}:${BRIDGE_PORT}" #<--
     depends_on:
-      bridge-init:
-        condition: service_completed_successfully
+      bridge:
+        condition: service_healthy
       postgres-primary:
         condition: service_healthy
       # nats-init:
@@ -167,42 +167,42 @@ services:
     networks:
       - cdc-net
     restart: unless-stopped
-  zb-check:
-    image: python:3.12-slim
-    container_name: zb-check
-    profiles: [ "check" ] # never starts with a plain `up`; ask for it by name
-    depends_on:
-      postgres-primary:
-        condition: service_healthy
-    env_file:
-      - .env.docker
-      - .env.bridge
-    environment:
-      # zb.py shells out to psql. Inside a container there is no docker socket, so it
-      # connects over the network instead of `docker exec`.
-      - ZB_PSQL=psql -h postgres-primary -p 5432 -U ${PG_USER} -d ${PG_DB}
-      - PGPASSWORD=${PG_PASSWORD}
-      - NATS_URL=nats://nats-server:4222
-      - NATS_BRIDGE_NKEY_SEED=${NATS_BRIDGE_NKEY_SEED}
-      # The LIVE rendered conf, mounted read-only — not the template. Their disagreement is
-      # itself a finding.
-      - ZB_NATS_CONF=/config/nats-server.conf
-    volumes:
-      - ./scripts:/scripts:ro
-      - ./grammar.json:/grammar.json:ro
-      - nats-config:/config:ro
-    working_dir: /scripts/scenarios
-    command:
-      - sh
-      - -c
-      - |
-        set -e
-        apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
-        pip install --quiet --no-cache-dir -r requirements.txt
-        python check.py
-    networks:
-      - cdc-net
-    restart: "no"
+  # zb-check:
+  #   image: python:3.12-slim
+  #   container_name: zb-check
+  #   profiles: [ "check" ] # never starts with a plain `up`; ask for it by name
+  #   depends_on:
+  #     postgres-primary:
+  #       condition: service_healthy
+  #   env_file:
+  #     - .env.docker
+  #     - .env.bridge
+  #   environment:
+  #     # zb.py shells out to psql. Inside a container there is no docker socket, so it
+  #     # connects over the network instead of `docker exec`.
+  #     - ZB_PSQL=psql -h postgres-primary -p 5432 -U ${PG_USER} -d ${PG_DB}
+  #     - PGPASSWORD=${PG_PASSWORD}
+  #     - NATS_URL=nats://nats-server:4222
+  #     - NATS_BRIDGE_NKEY_SEED=${NATS_BRIDGE_NKEY_SEED}
+  #     # The LIVE rendered conf, mounted read-only — not the template. Their disagreement is
+  #     # itself a finding.
+  #     - ZB_NATS_CONF=/config/nats-server.conf
+  #   volumes:
+  #     - ./scripts:/scripts:ro
+  #     - ./grammar.json:/grammar.json:ro
+  #     - nats-config:/config:ro
+  #   working_dir: /scripts/scenarios
+  #   command:
+  #     - sh
+  #     - -c
+  #     - |
+  #       set -e
+  #       apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+  #       pip install --quiet --no-cache-dir -r requirements.txt
+  #       python check.py
+  #   networks:
+  #     - cdc-net
+  #   restart: "no"
 
   # 5. NATS Stream & KV Bucket Initializer
   nats-init:
@@ -454,7 +454,7 @@ services:
       dockerfile: Dockerfile.bridge
     container_name: bridge
     # ports:
-    # Published on its own knob: the host dev loop usually holds 9090 already.
+    # Published on its own knob: the host dev loop usually holds 27434 already.
     # - "${BRIDGE_PUBLISH_PORT}:${BRIDGE_PORT}" #<--
     depends_on:
       bridge-init:
@@ -495,6 +495,11 @@ services:
       # No --slot/--pub: BRIDGE_CDC_SLOT and BRIDGE_CDC_PUBLICATION are in .env.docker,
       # and this is exactly the flagless boot they exist for. Neither has a default, so
       # removing them from the env file stops the container rather than guessing.
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:${BRIDGE_PUBLISH_PORT}/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
     networks:
       - cdc-net
     restart: unless-stopped

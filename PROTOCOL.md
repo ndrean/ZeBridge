@@ -814,49 +814,34 @@ A tenant with no rows for a table still gets a manifest (an explicit empty full)
 1. **Plan from the local watermark** (the last applied `cutoff_version`): if the deltas reach it, apply only the newer deltas — idempotent upserts guarded by the version column. Otherwise apply the full, then the deltas after it.
 1. **A full is `DELETE FROM` + replay, in one transaction.** Two rules make that
    destruction safe:
-   * ⚠️ **Never apply a full whose `cutoff_seq` is below the replica's stored position
-     for that stream.** Such a chain predates rows CDC already delivered and will never
-     re-deliver; refuse it and wait for the next cadence build.
-   * The DELETE shares the transaction with the rows, so a crash mid-apply cannot leave
-     an empty table.
-2. **Record the cutoff** (`cutoff_version`/`cutoff_lsn`) as the new watermark, and anchor
-   the seed gate: on the manifest's `cdc_stream`, drop CDC events with
-   `seq <= cutoff_seq` — they are in the chain. ⚠️ The lsn fallback (a manifest without
-   `cutoff_seq`) must anchor only to a lsn a SEED set — never to a schema event's lsn,
-   which a bridge restart advances to the WAL head and which would then eat every event
-   the new bridge replays.
+   * ⚠️ **Never apply a full whose `cutoff_seq` is below the replica's stored position for that stream.** Such a chain predates rows CDC already delivered and will never re-deliver; refuse it and wait for the next cadence build.
+   * The DELETE shares the transaction with the rows, so a crash mid-apply cannot leave an empty table.
+1. **Record the cutoff** (`cutoff_version`/`cutoff_lsn`) as the new watermark, and anchor the seed gate: on the manifest's `cdc_stream`, drop CDC events with `seq <= cutoff_seq` — they are in the chain. ⚠️ The lsn fallback (a manifest without `cutoff_seq`) must anchor only to a lsn a SEED set — never to a schema event's lsn, which a bridge restart advances to the WAL head and which would then eat every event the new bridge replays.
 
-If an object 404s mid-walk (pruned under you), re-read the manifest once and restart from
-*its* full — overlap, never a gap.
+If an object 404s mid-walk (pruned under you), re-read the manifest once and restart from *its* full — overlap, never a gap.
 
 ### The Connection Flow (Resolving the Gap)
 
 Run on every connect and reconnect, once **per stream** the client reads, not once
-overall. A consumer's tenant-scoped tables live on `CDC_<tenant>`; its public tables on
-`CDC_PUBLIC`. These are independent streams with unrelated sequence numbers — a consumer
-reading both tracks two independent gap decisions, not one.
+overall. A consumer's tenant-scoped tables live on `CDC_<tenant>`; its public tables on `CDC_PUBLIC`. These are independent streams with unrelated sequence numbers — a consumer reading both tracks two independent gap decisions, not one.
 
 #### Step 0: know your tenant
 
-Everything below needs a tenant token to build subject and bucket names. A client holds
-only its principal ID (issuing that ID is a separate, out-of-scope bootstrap problem —
-assume the client already has it), and resolves its tenant by asking NATS, not by
-guessing or embedding a build-time constant:
+Everything below needs a tenant token to build subject and bucket names. A client holds only its principal ID (issuing that ID is a separate, out-of-scope bootstrap problem — assume the client already has it), and resolves its tenant by asking NATS:
 
 ```
-tenant ← KV.tenants.get(<principal>)
+tenant ← KV.tenants.get(<principal>) or `nats kv get tenants <principal>`
 ```
 
 This reads `$KV.tenants.<principal>` — a single value, populated live from
-`zebridge_user_tenants` over the WAL (mirroring exactly how `$KV.schemas` is kept current
-from DDL, §1): an INSERT or UPDATE writes the key, a DELETE purges it, so a revoked
-principal resolves to no mapping — the open tenant — on its next connect. **Resolved fresh on every connect, never cached client-side across sessions**: the
-bucket is what lets a tenant reassignment take effect without restarting anything. The
-NATS grant on this key is scoped to the client's own principal (`$KV.tenants.alice`,
-never a wildcard) — a leaked credential discloses only that principal's own tenant.
+`zebridge_user_tenants` over the WAL (mirroring exactly how `$KV.schemas` is kept current from DDL, §1).
+An INSERT or UPDATE writes the key, a DELETE purges it, so a revoked principal resolves to no mapping — the open tenant — on its next connect. 
+**Resolved fresh on every connect, never cached client-side across sessions**: the
+bucket is what lets a tenant reassignment take effect without restarting anything. 
 
-A client with no tenant-scoped tables skips this step: its reach is `CDC_PUBLIC` only,
-and every `<tenant>` token below is the fixed `OPEN_TENANT` value.
+The NATS grant on this key is scoped to the client's own principal (`$KV.tenants.alice`, never a wildcard) ➡ a leaked credential discloses only that principal's own tenant.
+
+A client with no tenant-scoped tables skips this step: its reach is `CDC_PUBLIC` only, and every `<tenant>` token below is the fixed `OPEN_TENANT` value.
 
 #### The Gap Rule, per stream
 
@@ -864,20 +849,13 @@ The client durably stores one position per stream — `stored_seq[stream]`, the 
 JetStream sequence it has accounted for on that stream — and compares it against the
 stream's `first_seq`:
 
-* `stored_seq == 0` (first run) or `stored_seq < first_seq - 1` (the stream pruned past
-  the stored position) → **gap** on that stream.
+* `stored_seq == 0` (first run) or `stored_seq < first_seq - 1` (the stream pruned past the stored position) → **gap** on that stream.
 * Otherwise resume that stream from `stored_seq + 1`.
 
-⚠️ **The position is per stream, never per table.** A per-table check hits the
-"abandoned table paradox": a table that never changes falls behind the stream's horizon
-and looks gapped forever. One stream position covers every table the stream carries,
-including the ones that have not changed in months.
+⚠️ **The position is per stream, never per table.** Indeed, a per-table check hits the "abandoned table paradox": a table that never changes falls behind the stream's horizon and looks gapped forever. One stream position covers every table the stream carries, including the ones that have not changed in months.
 
 ⚠️ **Re-seeding is SCOPED.** A gap on one stream re-seeds only the tables *routed* to
-that stream (a table's route is its effective tenant's CDC stream), plus any table with
-no generations watermark at all (never seeded: a brand-new replica, or a table enabled
-between connects). Every other table resumes untouched — a mobile client reconnecting
-with one stale stream must not rebuild its whole replica.
+that stream (a table's route is its effective tenant's CDC stream), plus any table with no generations watermark at all (never seeded: a brand-new replica, or a table enabled between connects). Every other table resumes untouched — a mobile client reconnecting with one stale stream must not rebuild its whole replica.
 
 ```mermaid
 flowchart TD
@@ -887,7 +865,7 @@ flowchart TD
     C -->|yes| Z["resume that stream from<br/>stored_seq[stream] + 1"]
     C -->|"no — first run, or gap"| D["for each table ROUTED to this stream,<br/>plus never-seeded tables:<br/>apply the generation chain (§6)"]
     D --> Z
-    Z --> Y["per-event rule (§5), gated by<br/>seq &le; cutoff_seq on the seed stream"]
+    Z --> Y["per-event (§5), gated by:<br/>seq &le; cutoff_seq <br>on the seed stream"]
 ```
 
 In pseudocode:
@@ -915,23 +893,11 @@ for stream in streams_this_client_reads:
 
 **Notes that matter for a correct port:**
 
-* ⚠️ **Resolve tenant before constructing any name below.** Every `<tenant>` token in
-  `cdc.<tenant>.>`, `$KV.generations.<tenant>.<table>` and `gen-<tenant>` is the value
-  from Step 0 — never a guess, never a build-time constant, and never derived from data
-  already in the local replica (that reasoning is circular).
-* ⚠️ **Chains are tenant-keyed, not principal-keyed.** A chain is shared by every
-  principal in a tenant; the manifests of tenant-agnostic tables live under the open
-  tenant, so every principal converges on one shared entry.
-* ⚠️ **`stored_seq` advances on accounting, not only on application.** An applied event
-  is in the tables; a gated one is provably in the seeded chain; a held one is durably
-  in the FK inbox. All three account for the message — persist the batch's max seq after
-  processing it. A position that only advances on the applied path reads as a permanent
-  gap for a stream whose traffic was 100% gated or held, and re-seeds on every connect.
-* ⚠️ **Never let a full move a table backwards** — the `cutoff_seq >= stored_seq` rule
-  in "Applying a chain". A chain older than the replica is not a baseline, it is a
-  regression.
-* A schema change **never** triggers this flow. Migrations apply in place (§5);
-  re-seeding is for a CDC gap only.
+* ⚠️ **Resolve tenant before constructing any name below.** Every `<tenant>` token in `cdc.<tenant>.>`, `$KV.generations.<tenant>.<table>` and `gen-<tenant>` is the value from Step 0 — never a build-time constant, and never derived from data already in the local replica (this is circular).
+* ⚠️ **Chains are tenant-keyed, not principal-keyed.** A chain is shared by every principal in a tenant; the manifests of tenant-agnostic tables live under the open tenant, so every principal converges on one shared entry.
+* ⚠️ **`stored_seq` advances on accounting, not only on application.** An applied event is in the tables; a gated one is provably in the seeded chain; a held one is durably in the FK inbox. All three account for the message — persist the batch's max seq after processing it. A position that only advances on the applied path reads as a permanent gap for a stream whose traffic was 100% gated or held, and re-seeds on every connect.
+* ⚠️ **Never let a full move a table backwards** — the `cutoff_seq >= stored_seq` rule in "Applying a chain". A chain older than the replica is not a baseline, it is a regression.
+* A schema change **never** triggers this flow. Migrations apply in place (§5); re-seeding is for a CDC gap only.
 
 ### Resuming in practice
 
@@ -941,10 +907,7 @@ Keeping the sequence client-side allows **ephemeral** consumers. A durable consu
 
 ### Chain values converge with CDC values
 
-Chain rows come from the producer's ordinary text-mode queries; CDC values come from
-pgoutput. The client normalizes the one shape difference — text-mode `timestamptz`
-(`2026-01-01 00:00:00+00`) to the CDC wire form (`2026-01-01T00:00:00Z`), microseconds
-preserved — so the version guard compares like against like.
+Chain rows come from the producer's ordinary text-mode queries; CDC values come from `pgoutput`. The client normalizes the one shape difference — text-mode `timestamptz`(`2026-01-01 00:00:00+00`) to the CDC wire form (`2026-01-01T00:00:00Z`), microseconds preserved — so the version guard compares like against like.
 
 Two consequences worth knowing:
 
@@ -955,9 +918,8 @@ Two consequences worth knowing:
   elements slightly more eagerly than Postgres does — `{"x","y,z"}` where Postgres
   writes `{x,"y,z"}`. Both parse identically as array literals; they are not byte-equal.
 
-**Unsupported column types are refused, not guessed.** Extension and user-defined types
-get per-database OIDs, so they can never be constants in the decoder. `pg_type.typtype`
-decides what happens:
+**Unsupported column types are refused, not guessed.** Extension and user-defined types get per-database OIDs, so they can never be constants in the decoder.
+`pg_type.typtype` decides what happens:
 
 | typtype | example | behaviour |
 | --- | --- | --- |
@@ -969,50 +931,28 @@ was emitting its binary wire form — `\0\0\0\1\0\0\0\1k\0\0\0\1v` — as a stri
 behind nothing but a warning. Plausible-looking, entirely wrong, and undetectable
 downstream.
 
-CDC cannot query the catalog on the
-replication hot path, so the **DDL event carries `oid` and `typtype` for every column**
-and the bridge keeps an OID → typtype registry. That registry needs no invalidation: a
-type's OID lives as long as the type, so dropping and recreating one yields a *new* OID
-on a *new* DDL event. Tables that have had no DDL since startup are covered by the boot
-schema pass.
+CDC cannot query the catalog on the replication hot path, so the **DDL event carries `oid` and `typtype` for every column** and the bridge keeps an OID → typtype registry. That registry needs no invalidation: a type's OID lives as long as the type, so dropping and recreating one yields a *new* OID on a *new* DDL event. Tables that have had no DDL since startup are covered by the boot schema pass.
 
-A column Postgres sends in **text format** is never affected: the bytes are already its
-text output, so no OID knowledge is needed and none is required.
+A column Postgres sends in **text format** is never affected: the bytes are already its text output, so no OID knowledge is needed and none is required.
 
-The CDC decoder is handed the same registry: a `RELATION` message carries OIDs and no
-`typtype`, so the decoder looks each OID up and refuses what the registry does not know
-as an enum, suspending the table (§3) rather than emitting bytes that look like a value.
+The CDC decoder is handed the same registry: a `RELATION` message carries OIDs and no `typtype`, so the decoder looks each OID up and refuses what the registry does not know as an enum, suspending the table (§3) rather than emitting bytes that look like a value.
 
 ---
 
 ## 7. Writing from the edge — stream `MUTATIONS` ✅
 
-> ✅ **Implemented and verified against a running stack.** All three caveats that stood
-> here — no authorization, no reply, none of the guarantees below — are gone:
-> the principal is a subject token the broker vouches for and RLS resolves
-> (`scripts/scenarios/credentials.py`), every write receives a definitive reply (§7.4b,
-> `replies.py`), and last-write-wins, version clamping and tombstones are each covered by
-> a scenario (`mutate.py`, `clamp.py`, `reaps.py`, `guards.py`, `writable.py`).
+> ✅ **Implemented and verified against a running stack.** All three caveats that stood here — no authorization, no reply, none of the guarantees below — are gone:
+> the principal is a subject token the broker vouches for and RLS resolves (`scripts/scenarios/credentials.py`), every write receives a definitive reply (§7.4b, `replies.py`), and last-write-wins, version clamping and tombstones are each covered by a scenario (`mutate.py`, `clamp.py`, `reaps.py`, `guards.py`, `writable.py`).
 
 ### Why reading is nearly free and writing is not
 
-Reading this protocol, the asymmetry is the first thing to explain. §3–§6 ask a client for
-perhaps five rules. §7 asks for most of the rest of this document. That looks like the
-write path is badly designed. It is not — the two sides are solving different problems.
+Reading this protocol, the asymmetry is the first thing to explain. §3–§6 ask a client for perhaps five rules. §7 asks for most of the rest of this document. This happens because the two sides are solving different problems.
 
-**Reading, PostgreSQL has already decided.** Every event is a fact that happened, in an
-order that is already fixed, delivered by a broker that keeps order and retention. The
-client applies it. The only rules that remain are the ones NATS itself imposes: the
-history is finite (so detect a gap, §5), and delivery is at-least-once (so be idempotent,
-§8).
+**Reading, PostgreSQL has already decided.** Every event is a fact that happened, in an order that is already fixed, delivered by a broker that keeps order and retention. The client applies it. The only rules that remain are the ones NATS itself imposes: the history is finite (so detect a gap, §5), and delivery is at-least-once (so be idempotent, §8).
 
-**Writing, nothing has been decided yet.** A client is *proposing* a change to a database
-that is the source of truth, shared with other writers, enforcing its own constraints — and
-it is proposing it across an asynchronous broker, with no transaction spanning the two and
-no connection to answer on.
+**Writing, nothing has been decided yet.** A client is *proposing* a change to a database that is the source of truth, shared with other writers, enforcing its own constraints — and it is proposing it across an asynchronous broker, with no transaction spanning the two and no connection to answer on.
 
-⚠️ **So every rule in §7 buys back one thing an ordinary database connection gives you for
-free.** That is the whole list, and it is why it is as long as it is:
+⚠️ **So every rule in §7 buys back one thing an ordinary database connection gives you for free.** That is the whole list, and it is why it is as long as it is:
 
 | what a DB connection gives you | what replaces it here |
 | --- | --- |
@@ -1024,64 +964,33 @@ free.** That is the whole list, and it is why it is as long as it is:
 | a session identity the server already knows | the principal as a subject token the broker vouched for (§7.1) |
 | a server that knows your schema | `zebridge_catalogue` and the write contract in the schema (§3) |
 
-None of these is a preference. Remove any one and the failure is not an error — it is a
-replica that quietly stops matching the database, which is the failure this whole protocol
-exists to prevent.
+None of these is a preference. Remove any one and the failure is not an error — it is a replica that quietly stops matching the database, which is the failure this whole protocol exists to prevent.
 
 **And the bill is opt-in.** A deployment that never grants edge writes never leaves the
-five-rule world: no version column, no tombstones, no principal
-mapping — outbound replication only, and §7 does not apply to it. The rules arrive with the
-capability, and they are the price of *offline-capable writes onto an ordinary PostgreSQL
-schema*. Give up either half of that and most of them disappear:
+five-rule world: no version column, no tombstones, no principal mapping — outbound replication only, and §7 does not apply to it. The rules arrive with the capability, and they are the price of *offline-capable writes onto an ordinary PostgreSQL schema*.
+Give up either half of that and most of them disappear:
 
-* a synchronous API in front of PostgreSQL needs none of this — and cannot accept a write
-  from a client that is offline;
-* CRDTs need no version column — and cannot replicate an ordinary schema, because every
-  column has to become a CRDT type.
+* a synchronous API in front of PostgreSQL needs none of this — and cannot accept a write from a client that is offline;
+* CRDTs need no version column — and cannot replicate an ordinary schema, because every column has to become a CRDT type.
 
-⚠️ The rigidity elsewhere has the same shape. The event ring is a **fixed** pre-allocated
-buffer because a dynamic one would allocate on the hot path; the cost is that a row wider
-than `BASE_BUF` cannot be carried at all, and the knob is memory (README, "Sizing
-`BASE_BUF` and `RING_BUFFER_COUNT`"). Nothing here adapts to what arrives. That is the
-trade taken deliberately, and it is worth knowing which side of it you are on.
+⚠️ The rigidity elsewhere has the same shape. The event ring is a **fixed** pre-allocated buffer because a dynamic one would allocate on the hot path; the cost is that a row wider than `BASE_BUF` cannot be carried at all, and the knob is memory (README, "Sizing `BASE_BUF` and `RING_BUFFER_COUNT`"). Nothing here adapts to what arrives. That is the trade taken deliberately, and it is worth knowing which side of it you are on.
 
 ### 7.0 The rule everything else follows from
 
 > **A client never writes. It asks, and state arrives through CDC.**
 
-The write path carries a *request*. The replica is a projection of what PostgreSQL
-actually did, and the only thing that writes to it is the CDC applier. Nothing else
+The write path carries a *request*. The replica is a projection of what PostgreSQL actually did, and the only thing that writes to it is the CDC applier. Nothing else
 should ever write to a synced table — not the UI, not a migration, not a repair script.
 
-That single constraint is what makes the edge safe, and it is worth being explicit about
-why, because it removes a class of work rather than adding one:
+That single constraint is what makes the edge safe, and it is worth being explicit about why, because it removes a class of work rather than adding one:
 
-* **A forbidden write cannot produce forbidden state.** Authorization is enforced where
-  the data lives. A refused mutation writes nothing, so it emits no CDC event, so the
-  replica simply never changes. There is no phantom row to detect and no undo to apply —
-  measured: a mutation to a table the writer has no grant on leaves the client with no
-  row, no error, and no echo.
-* **It holds against a hostile client, not just a buggy one.** A tampered payload, a
-  forged `data` map, a client written by someone else — none of them can put a row into a
-  replica that PostgreSQL did not emit. So the bridge does not have to defend the client
-  from itself, and a client author cannot get this wrong by accident.
-* **Two independent layers, each doing what it is good at.** NATS subject permissions
-  decide *who may ask* (§7.1); PostgreSQL grants, constraints and the version guard decide
-  *what actually happens*. Neither has to model the other, and a gap in one is not a
-  breach of the other.
+* **A forbidden write cannot produce forbidden state.** Authorization is enforced where the data lives. A refused mutation writes nothing, so it emits no CDC event, so the replica simply never changes. There is no phantom row to detect and no undo to apply — measured: a mutation to a table the writer has no grant on leaves the client with no row, no error, and no echo.
+* **It holds against a hostile client, not just a buggy one.** A tampered payload, a forged `data` map, a client written by someone else — none of them can put a row into a replica that PostgreSQL did not emit. So the bridge does not have to defend the client from itself, and a client author cannot get this wrong by accident.
+* **Two independent layers, each doing what it is good at.** NATS subject permissions decide *who may ask* (§7.1); PostgreSQL grants, constraints and the version guard decide *what actually happens*. Neither has to model the other, and a gap in one is not a breach of the other.
 
-⚠️ **Optimistic apply is the one deliberate exception.** An optimistic apply writes a row
-PostgreSQL has not emitted — exactly what the rule forbids — so it is allowed only under
-three conditions, which the reference clients keep: the row's prior state is captured in
-the outbox entry (`before`, §7.1) in the same transaction as the apply; a refusal
-(`rejected`, `row_deleted`) reverts it; and only the CDC echo confirms it — the verdict
-is a signal, never data. A client that cannot keep all three should keep optimistic rows
-in a separate table and union them in a view, so "is this confirmed?" stays answerable by
-*where the row is*.
+⚠️ **Optimistic apply is the one deliberate exception.** An optimistic apply writes a row PostgreSQL has not emitted — exactly what the rule forbids — so it is allowed only under three conditions, which the reference clients keep: the row's prior state is captured in the outbox entry (`before`, §7.1) in the same transaction as the apply; a refusal (`rejected`, `row_deleted`) reverts it; and only the CDC echo confirms it — the verdict is a signal, never data. A client that cannot keep all three should keep optimistic rows in a separate table and union them in a view, so "is this confirmed?" stays answerable by *where the row is*.
 
-⚠️ **This is a guarantee about writes only.** Its mirror image is not free: every client
-subscribed to `cdc.>` sees every published table's changes. Read authorization — which
-rows a principal may *receive* — is a separate problem this rule does not touch.
+⚠️ **This is a guarantee about writes only.** Its mirror image is not free: every client subscribed to `cdc.>` sees every published table's changes. Read authorization — which rows a principal may *receive* — is a separate problem this rule does not touch.
 
 ### 7.1 Subject grammar — the principal is a token, not a field
 
@@ -1089,33 +998,19 @@ rows a principal may *receive* — is a separate problem this rule does not touc
 mutation.<principal>.<table>.<operation>      e.g. mutation.a3f9c1.users.insert
 ```
 
-`<operation>` is `insert` | `update` | `delete` — the same verbs as `cdc.<table>.<op>`. The
-verb is a **subject token** so that "may create, may not delete" is expressible as a broker
-permission. ⚠️ **`insert` and `update` are different operations server-side** — an `update` on a
-missing key is `row_deleted`, never a creation; see §7.4.
+`<operation>` is `insert` | `update` | `delete` — the same verbs as `cdc.<table>.<op>`. The verb is a **subject token** so that "may create, may not delete" is expressible as a broker permission. ⚠️ **`insert` and `update` are different operations server-side** — an `update` on a missing key is `row_deleted`, never a creation; see §7.4.
 
-**The principal is in the subject because NATS authorizes subjects, not payloads.** A
-client issued `publish: ["mutation.a3f9c1.>"]` physically cannot write as anyone else,
-and the bridge reading the principal off the subject is not trusting the client — it is
-reading a claim the broker already checked. An identity in the payload would be worth
-nothing, because the payload is whatever the client says it is.
+**The principal is in the subject because NATS authorizes subjects, not payloads.** A client issued `publish: ["mutation.a3f9c1.>"]` physically cannot write as anyone else, and the bridge reading the principal off the subject is not trusting the client — it is reading a claim the broker already checked. An identity in the payload would be worth nothing, because the payload is whatever the client says it is.
 
-The principal comes first so that a per-user grant is a single wildcard rule rather than
-one rule per table.
+The principal comes first so that a per-user grant is a single wildcard rule rather than one rule per table.
 
-**The principal is the application's own internal user id** — the primary key of your
-users table, uuid or integer. ZeBridge neither issues nor validates it: authenticating a
-consumer and deciding what its id is are the application's business. The bridge only
-reads the token the broker already vouched for.
+**The principal is the application's own internal user id** — the primary key of your users table, uuid or integer. ZeBridge neither issues nor validates it: authenticating a consumer and deciding what its id is are the application's business. ➡ The bridge only reads the token the broker already vouched for.
 
-⚠️ **It must be a legal NATS token** — no `.`, space, `*` or `>`. An email address is
-therefore not usable, and a hash of one is worse: unsalted it is brute-forceable, and it
-inherits the email's mutability.
+🔔 **The principal must be a legal NATS token**: ❌  no `.` , no space `' '`, no `*` nor `>` so:
+➡ 🛑 An email address is therefore **not usable**,
+❌ a **hash of an email is worse**: unsalted it is brute-forceable, and it inherits the email's mutability.
 
-⚠️ **This is a provisioning rule, not a client one.** A client cannot choose its principal
-at runtime — the broker's allow-list pins it (`publish: ["mutation.alice.>"]`), so the value
-is fixed when the account is created. Which means a bad one is a *deployment* mistake, and
-it fails at the far end where nobody is looking. Measured, publishing each as the principal:
+⚠️ **This is a provisioning rule, not a client one.** ❗️ A client cannot choose its principal at runtime — the broker's allow-list pins it (`publish: ["mutation.alice.>"]`), so the value is fixed when the account is created. Which means a bad one is a *deployment* mistake, and it fails at the far end where nobody is looking. Measured, publishing each as the principal:
 
 | principal | what happens |
 | --- | --- |
@@ -1123,15 +1018,9 @@ it fails at the far end where nobody is looking. Measured, publishing each as th
 | `a.b` (dot) | publish **succeeds**. The subject now has five tokens, so the bridge reads it as `MalformedSubject`, dead-letters it, and logs *"no verdict is addressable"* — the reply subject is unusable too |
 | `a*` / `a>` | publish **succeeds** and the write is attempted under that principal. But the reply subject `mutation_ack.a*.…` contains a wildcard, which is illegal to publish to, so the verdict fails with `InvalidSubject` |
 
-In three of the four cases the write leaves the client, is correctly refused, and **the
-client is never told** — the reply channel is broken by the same character that broke the
-write. §7.1's outbox says "pop only on a definitive reply", so such a client retries
-forever against an account that can never answer it.
+In three of the four cases the write leaves the client, is correctly refused, and **the client is never told** — the reply channel is broken by the same character that broke the write. §7.1's outbox says "pop only on a definitive reply", so such a client retries forever against an account that can never answer it.
 
-⚠️ Note what the last row implies: if that principal *were* mapped in
-`zebridge_user_tenants`, the write would **succeed** and the client still get no verdict —
-so this is not "invalid identities are rejected", it is "the reply channel silently stops
-working". Validate principals when you create the account.
+⚠️ Note what the last row implies: if that principal *were* mapped in `zebridge_user_tenants`, the write would **succeed** and the client still get no verdict — so this is not "invalid identities are rejected", it is "the reply channel silently stops working". 🔔 Validate principals when you create the account.
 
 ⚠️ **It must be immutable for the life of the account.** The same value ends up in four
 places at once — the NATS credential, every subject the client publishes, the row-level

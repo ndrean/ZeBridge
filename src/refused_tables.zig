@@ -102,7 +102,10 @@ pub const Reason = enum {
         return switch (self) {
             .no_primary_key => "add a primary key to replicate this table",
             .unsupported_column_type => "change the column to a type the bridge can decode (or drop it from the table)",
-            .row_too_large => "restart with a larger BASE_BUF, or move the oversized column out of the replicated table",
+            // No "restart" here: since §10bp the suspension lifts itself, and the stored
+            // wide row cannot be the operator's fresh mistake (the width guard refuses
+            // those at write time) — say what is being waited for, not what to fear.
+            .row_too_large => "waiting for a write that fits — it lifts itself then (30 s cooldown), no restart; the row predates the guard, a triggers-off load, or a BASE_BUF shrink. See the SUSPENDING block above, or SELECT public.zebridge_widest_row('<table>')",
             .no_tenant_column => "add the column the catalogue/TENANT_RULES names, or correct the rule",
             .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
             .no_cdc_subject => "declare the table in zebridge_catalogue (zebridge_enable with public_reason or tenant_col) — the bridge reloads on the catalogue row and lifts this itself, no restart",

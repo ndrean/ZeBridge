@@ -699,6 +699,64 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- The sweeper's reach, granted automatically — the audit below is the net, this is the fix.
+--
+-- Every tenant enters the system through one door: a row in `zebridge_user_tenants`
+-- (a DBA's INSERT, or `/enroll` redeeming an invite — both land here). The sweeper is
+-- bounded by that same table, so a new tenant used to start life UNSWEPT until someone
+-- remembered the mapping; the failure is silent accumulation, and `zebridge_audit_sweeper`
+-- can only report it after the fact. This trigger closes the gap at the door: mapping any
+-- principal to a tenant also maps the sweeper to it.
+--
+--   • `ON CONFLICT DO NOTHING`, not SELECT-then-INSERT: atomic, so two concurrent
+--     enrollments of the same new tenant cannot race.
+--   • `WHEN (NEW.principal <> 'zb_sweeper')`: the auto-grant row must not re-fire the
+--     trigger. (It would terminate anyway — the second pass conflicts and inserts
+--     nothing — but a guarded trigger says the intent.)
+--   • ⚠️ Never the OPEN tenant. The sweeper reaches `${OPEN_TENANT}` rows through the
+--     policy's own arm (`%I = '${OPEN_TENANT}'` above) — a mapping adds nothing. And it
+--     subtracts: boot derives the tenant-stream list from DISTINCT tenant_id here, and a
+--     `${OPEN_TENANT}` entry makes it try to create CDC_${OPEN_TENANT}, whose subject
+--     overlaps CDC_PUBLIC — the bridge refuses to start (measured 2026-09-03, and true
+--     of ANY open-tenant mapping, not just the sweeper's — the reconciler now skips the
+--     open tenant too, but the mapping stays pointless).
+--   • 'zb_sweeper' is spelled here, matching the tombstone guard's carve-out above. An
+--     operator running a renamed SWEEPER_PRINCIPAL must adjust both — the audit takes
+--     the name as a parameter and will say so.
+--   • Side effect, harmless: `zebridge_user_tenants` rides the publication, so the
+--     bridge projects a `$KV.tenants.zb_sweeper` key like any other principal's. The
+--     bucket holds ONE bare tenant string per principal, so for a many-tenant principal
+--     like the sweeper it just shows whichever mapping was written last — meaningless,
+--     and inert: the sweeper is not a NATS client and nothing resolves that key.
+--
+-- What this does NOT cover: a tenant that exists only as data (rows inserted by an admin
+-- with a tenant_id nobody is mapped to). No mapping insert ever happens, so no trigger
+-- fires; that remains the audit's job.
+CREATE OR REPLACE FUNCTION public.zebridge_sweeper_autogrant()
+RETURNS trigger AS $$
+BEGIN
+    INSERT INTO public.zebridge_user_tenants (principal, tenant_id)
+    VALUES ('zb_sweeper', NEW.tenant_id)
+    ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
+
+DROP TRIGGER IF EXISTS zebridge_sweeper_autogrant_t ON public.zebridge_user_tenants;
+CREATE TRIGGER zebridge_sweeper_autogrant_t
+    AFTER INSERT ON public.zebridge_user_tenants
+    FOR EACH ROW
+    WHEN (NEW.principal <> 'zb_sweeper' AND NEW.tenant_id <> '${OPEN_TENANT}')
+    EXECUTE FUNCTION public.zebridge_sweeper_autogrant();
+
+-- Backfill: the trigger only guards the door from now on. Tenants already inside —
+-- mapped to some principal but never to the sweeper — are exactly the ones the audit
+-- would have caught too late.
+INSERT INTO public.zebridge_user_tenants (principal, tenant_id)
+SELECT DISTINCT 'zb_sweeper', tenant_id FROM public.zebridge_user_tenants
+WHERE tenant_id <> '${OPEN_TENANT}'
+ON CONFLICT DO NOTHING;
+
 -- Answers "which tenants will never have their tombstones reaped?"
 --
 -- The sweeper acts as a named principal (`zb_sweeper` by default) and is therefore bounded

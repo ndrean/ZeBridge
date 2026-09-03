@@ -18,6 +18,7 @@ const usage =
     \\  --top <PATH>    grammar.json to read (default: ./grammar.json). Carries every
     \\                  stream, subject and KV name; missing file or key is fatal.
     \\  --strict-tables Refuse to start if any published table lacks a primary key
+    \\  --diagnose           Pre-run doctor: report everything boot would decide, write nothing, exit
     \\                  (default: skip the table, keep replicating the rest)
     \\  --gen-nkey      Mint one nkey pair and exit, without starting anything.
     \\                  Prints NATS_BRIDGE_NKEY_PUB / NATS_BRIDGE_NKEY_SEED on
@@ -157,6 +158,13 @@ fn envUint(
 
 /// Command-line arguments structure
 pub const Args = struct {
+    /// `--diagnose` / `--run-diagnose`: the pre-run doctor. Everything the boot would
+    /// DECIDE, said before anything is DONE — no slot, no budget registration, no guard
+    /// re-bake, no NATS connection, no stream creation. For the operator standing in
+    /// front of a database that has never run the bridge: is init applied, is the
+    /// publication whole, which tables would be refused and why, does the stored data
+    /// fit this BASE_BUF, and what is the smallest BASE_BUF that would fit it.
+    diagnose: bool = false,
     /// Where grammar.json is. See `--top`.
     topology_path: []const u8,
     http_port: u16,
@@ -209,6 +217,7 @@ pub const Args = struct {
         // Off by default: one keyless table should not stop every other table from
         // replicating. See preflight.zig for the full argument.
         var strict_tables: bool = false;
+        var diagnose = false;
         // Null means "not given", so TOPOLOGY_PATH can still speak before the default.
         var topology_path: ?[]const u8 = null;
 
@@ -238,6 +247,8 @@ pub const Args = struct {
                 topology_path = try requireValue(&args_iter, "--top");
             } else if (std.mem.eql(u8, arg, "--strict-tables")) {
                 strict_tables = true;
+            } else if (std.mem.eql(u8, arg, "--diagnose") or std.mem.eql(u8, arg, "--run-diagnose")) {
+                diagnose = true;
             } else {
                 // `--help`/`-h` and `--gen-nkey` never reach here: `earlyExit` answered
                 // them from argv before main resolved anything (see above). They are
@@ -309,6 +320,7 @@ pub const Args = struct {
             .http_bind = resolved_bind,
             .slot_name = resolved_slot,
             .publication_name = resolved_publication,
+            .diagnose = diagnose,
         };
 
         // Build runtime configuration by merging CLI args with compile-time defaults

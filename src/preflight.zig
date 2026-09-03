@@ -718,26 +718,31 @@ pub const Summary = struct {
 /// the TOAST pointer without fetching the value — measured at 2 shared buffers and 0.07 ms
 /// for a 50 MB table. Reported, never refused: the rows already exist, and refusing to
 /// start would turn a warning into the outage it is trying to prevent.
-fn checkStoredRowsFit(
+/// What the stored-rows scan found: `flagged` drives the caller's verdict, `widest`
+/// lets `--diagnose` compute the minimum BASE_BUF the data actually needs.
+pub const Fit = struct { flagged: usize = 0, widest: usize = 0 };
+
+pub fn checkStoredRowsFit(
     allocator: std.mem.Allocator,
     conn: ?*c.PGconn,
     publication_name: []const u8,
     event_buf_bytes: usize,
-) void {
+) Fit {
     // ⚠️ Asked per table rather than in one statement: reaching a table's own columns
     // needs its name in the query text, and the published list is normally a handful.
     const list_q = utils.allocPrintZ(
         allocator,
         "SELECT tablename FROM pg_publication_tables WHERE pubname = '{s}' AND schemaname = 'public'",
         .{publication_name},
-    ) catch return;
+    ) catch return .{};
     defer allocator.free(list_q);
 
     const list = c.PQexec(conn, list_q.ptr);
     defer c.PQclear(list);
-    if (c.PQresultStatus(list) != c.PGRES_TUPLES_OK) return;
+    if (c.PQresultStatus(list) != c.PGRES_TUPLES_OK) return .{};
 
     var flagged: usize = 0;
+    var max_widest: usize = 0;
     var r: c_int = 0;
     while (r < c.PQntuples(list)) : (r += 1) {
         const table = std.mem.span(c.PQgetvalue(list, r, 0));
@@ -761,6 +766,7 @@ fn checkStoredRowsFit(
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) == 0) continue;
 
         const widest = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch continue;
+        if (widest > max_widest) max_widest = widest;
         if (widest >= event_buf_bytes) {
             flagged += 1;
             log.err(
@@ -797,6 +803,7 @@ fn checkStoredRowsFit(
     if (flagged == 0) {
         log.info("📏 Stored rows and column defaults fit the {d}-byte event buffer", .{event_buf_bytes});
     }
+    return .{ .flagged = flagged, .widest = max_widest };
 }
 
 /// Is the DDL pipeline actually wired up? — see PROTOCOL.md §0
@@ -887,7 +894,11 @@ pub fn run(
     defer c.PQfinish(conn);
 
     checkDdlPipeline(allocator, conn, publication_name);
-    checkStoredRowsFit(allocator, conn, publication_name, event_buf_bytes);
+    // NOT called here any more (§13): the per-boot scan is gone. It runs only on the
+    // one transition that can strand stored rows — a budget SHRINK, detected against
+    // the slot's previous zebridge_limits row (bridge.zig, registerRowWidthBudget).
+    _ = event_buf_bytes;
+
 
     // array_length(indkey,1) counts the PK's columns; 0 rows means no PK at all.
     const query = try utils.allocPrintZ(

@@ -51,6 +51,10 @@ pub const Metrics = struct {
     // counter existed.
     schema_events_published: std.atomic.Value(u64),
 
+    // Sweeper Telemetry (intercepted from zebridge_gc_watermark WAL events)
+    gc_total_reaped: std.atomic.Value(u64),
+    gc_last_sweep_time: std.atomic.Value(i64),
+
     /// Initialize metrics struct with zeroed atomic counters
     pub fn init() Metrics {
         return .{
@@ -71,6 +75,8 @@ pub const Metrics = struct {
             .nats_publish_ack_ns = std.atomic.Value(u64).init(0),
             .nats_publishes = std.atomic.Value(u64).init(0),
             .schema_events_published = std.atomic.Value(u64).init(0),
+            .gc_total_reaped = std.atomic.Value(u64).init(0),
+            .gc_last_sweep_time = std.atomic.Value(i64).init(0),
         };
     }
 
@@ -122,6 +128,12 @@ pub const Metrics = struct {
         self.queue_usage_percent.store(percent, .monotonic);
     }
 
+    /// Lock-free update of GC stats intercepted from WAL
+    pub fn updateGcStats(self: *Metrics, reaped: u64) void {
+        _ = self.gc_total_reaped.fetchAdd(reaped, .monotonic);
+        self.gc_last_sweep_time.store(@as(i64, @intCast(c.time(null))), .monotonic);
+    }
+
     /// Lock-free increment of the SCHEMA/KV events counter
     pub fn incrementSchemaEvents(self: *Metrics) void {
         _ = self.schema_events_published.fetchAdd(1, .monotonic);
@@ -164,6 +176,8 @@ pub const Metrics = struct {
         nats_publish_ack_ns: u64,
         nats_publishes: u64,
         schema_events_published: u64,
+        gc_total_reaped: u64,
+        gc_last_sweep_time: i64,
     };
 
     /// Get a lock-free snapshot of all metrics
@@ -197,6 +211,8 @@ pub const Metrics = struct {
             .nats_publish_ack_ns = self.nats_publish_ack_ns.load(.monotonic),
             .nats_publishes = self.nats_publishes.load(.monotonic),
             .schema_events_published = self.schema_events_published.load(.monotonic),
+            .gc_total_reaped = self.gc_total_reaped.load(.monotonic),
+            .gc_last_sweep_time = self.gc_last_sweep_time.load(.monotonic),
         };
     }
 };

@@ -5,7 +5,11 @@ defmodule User do
     field(:name, :string)
     field(:email, :string)
 
-    timestamps()
+    timestamps(type: :timestamptz)
+  end
+
+  def changeset( %User{} = user, attrs \\ %{}) do
+    cast(users, [:name, :email])
   end
 end
 
@@ -23,24 +27,18 @@ defmodule TestType do
     field(:tags, {:array, :string})
     field(:matrix, {:array, {:array, :integer}})
     field(:metadata, :map)
+    field(:deleted_at, :timestamptz)
+    field(:tenant_id, :string, null: false)
+    field(:last_writer, :string)
 
-    timestamps(type: :utc_datetime_usec)
+    timestamps(type: :timestamptz)
   end
 
   @doc false
-  def changeset(test_type, _attrs) do
+  def changeset(%TestType{} = test_type, attrs \\ %{}) do
     test_type
-    # |> cast(attrs, [
-    #   :string_field,
-    #   :integer_field,
-    #   :float_field,
-    #   :boolean_field,
-    #   :decimal_field,
-    #   :date_field,
-    #   :time_field,
-    #   :naive_datetime_field,
-    #   :utc_datetime_field
-    # ])
-    # |> validate_required([:string_field, :integer_field])
+    |> cast(attrs, [
+      :age, :temperature, :price, :is_true, :some_text, :tags, :atrix, :metadata, :deleted_at, :tenant_id, :last_writer
+    ])
   end
 end

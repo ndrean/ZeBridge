@@ -306,17 +306,26 @@ pub const EventProcessor = struct {
             "🔴 SUSPENDING '{s}': a row does not fit in the {d} KB per-event buffer (BASE_BUF={d}).",
             .{ rel.name, buffer_bytes / 1024, std.math.log2_int(usize, buffer_bytes) },
         );
+        // The block answers, in order, the questions an operator actually has: did I do
+        // something wrong (usually not — and a guarded write CANNOT have caused this, so
+        // the causes are enumerable), what does it cost, how does it end, what can I do.
+        // The old block led with "restart with a larger BASE_BUF", which predates §10bp:
+        // the suspension lifts itself now, and a restart is the one remedy nobody needs.
         log.err(
-            "    Fix: restart with a larger BASE_BUF (each +1 doubles it, max 20 = 1 MB). The data slab is 2^BASE_BUF x RING_BUFFER_COUNT, so raise BASE_BUF and lower RING_BUFFER_COUNT together to hold memory steady.",
+            "    You likely did nothing wrong: a normal write this size is REFUSED by the width guard before it is stored, so this row got in one of three ways — it predates zebridge_enable (adoption), it was loaded with triggers off (pg_restore --disable-triggers, session_replication_role=replica), or BASE_BUF was lowered after it was stored (the boot would have logged \"row-width budget SHRANK\").",
             .{},
         );
         log.err(
-            "    If the row exceeds 1 MB it cannot be replicated at any setting — NATS's default max_payload is 1 MB. Move the oversized column out of the replicated table (store a reference, not the blob).",
+            "    Cost: THIS table's live CDC pauses; every other table keeps flowing. No data is lost — clients are told to hold, and re-seed from the generation chain, which has no per-event limit and carries this row fine.",
             .{},
         );
         log.err(
-            "    Every other table keeps replicating. This one resumes automatically once the bridge restarts with a buffer that fits, and its clients re-seed from the generation chain.",
+            "    It ends by itself: the first write that fits (after a 30 s anti-flap cooldown) lifts the suspension and clients resume — no restart. Narrowing or soft-deleting the oversized row IS such a write.",
             .{},
+        );
+        log.err(
+            "    To see the row: SELECT public.zebridge_widest_row('{s}');  To keep rows this size instead: restart with a larger BASE_BUF (each +1 doubles the buffer, max 20 = 1 MB — NATS's payload ceiling; above that, store a reference, not the blob).",
+            .{rel.name},
         );
 
         self.refused.refuse(rel.name, .row_too_large) catch |err| {
@@ -428,6 +437,22 @@ pub const EventProcessor = struct {
                 return error.TupleDecodeFailed;
             };
             try all_columns.appendSlice(arena_allocator, main_decoded.items);
+        }
+
+        // Intercept GC telemetry from the sweeper
+        if (operation[0] == 'U' and std.mem.eql(u8, rel.name, "zebridge_gc_watermark")) {
+            var reaped_val: u64 = 0;
+            for (all_columns.items) |col| {
+                if (std.mem.eql(u8, col.name, "reaped")) {
+                    if (col.value == .int64 and col.value.int64 > 0) {
+                        reaped_val = @as(u64, @intCast(col.value.int64));
+                    }
+                    break;
+                }
+            }
+            if (reaped_val > 0) {
+                if (self.metrics) |m| m.updateGcStats(reaped_val);
+            }
         }
 
         // Extract ID value for logging (scan for "id" column in the combined list)

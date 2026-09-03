@@ -48,6 +48,11 @@ def stream_msgs(name):
 def main():
     failed = 0
     topo = zb.TOPOLOGY
+    # A leftover `zb_sweeper` mapping is autogrant residue from a previous run (§10bv:
+    # mapping ANY principal to a tenant also maps the sweeper, and this scenario's own
+    # step 2 does exactly that). Clean it silently; only a REAL principal disqualifies.
+    zb.psql(f"DELETE FROM public.zebridge_user_tenants "
+            f"WHERE tenant_id = '{TENANT}' AND principal = 'zb_sweeper'", quiet=True)
     if TENANT in zb.tenants():
         sys.exit(f"'{TENANT}' is already mapped in zebridge_user_tenants — the whole point is that it is not")
     cdc_stream = topo["cdc_streams"]["tenant_prefix"] + TENANT
@@ -69,6 +74,22 @@ def main():
         # ── 2. the mapping propagates live to $KV.tenants ────────────────────────
         zb.psql(f"INSERT INTO public.zebridge_user_tenants (principal, tenant_id) "
                 f"VALUES ('{PRINCIPAL}', '{TENANT}') ON CONFLICT DO NOTHING", quiet=True)
+
+        # ── 2b. the tenant is born SWEEPABLE (§10bv) ─────────────────────────────
+        # The autogrant trigger maps `zb_sweeper` in the same transaction as the first
+        # mapping — a tenant must never exist unswept-by-construction. Before the
+        # trigger, this was the hole the audit could only report after the fact.
+        swept = zb.psql(f"SELECT count(*) FROM public.zebridge_user_tenants "
+                        f"WHERE principal = 'zb_sweeper' AND tenant_id = '{TENANT}'").strip()
+        unreaped = zb.psql(f"SELECT count(*) FROM zebridge_audit_sweeper() "
+                           f"WHERE tenant_id = '{TENANT}'").strip()
+        if swept == "1" and unreaped == "0":
+            zb.ok(f"born sweepable: mapping {PRINCIPAL} auto-granted zb_sweeper to '{TENANT}' "
+                  "in the same transaction, and the audit has nothing to say")
+        else:
+            zb.bad(f"the newborn tenant is UNSWEPT (autogrant={swept}, audit rows={unreaped}) "
+                   "— its tombstones would accumulate until a DBA notices")
+            failed += 1
         deadline = time.time() + 15
         got = None
         while time.time() < deadline:
@@ -109,7 +130,9 @@ def main():
             failed += 1
     finally:
         zb.psql(f"DELETE FROM public.test_types WHERE uid='{uid}'", quiet=True)
-        zb.psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal='{PRINCIPAL}'", quiet=True)
+        # Both mappings: ours, and the one the autogrant trigger created from it.
+        zb.psql(f"DELETE FROM public.zebridge_user_tenants WHERE principal='{PRINCIPAL}' "
+                f"OR (principal = 'zb_sweeper' AND tenant_id = '{TENANT}')", quiet=True)
         time.sleep(1.5)  # let the delete's own events publish before the stream goes
         zb.nats_cli("stream", "rm", cdc_stream, "-f")
 

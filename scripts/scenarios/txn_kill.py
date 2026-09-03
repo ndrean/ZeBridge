@@ -64,7 +64,12 @@ def cleanup() -> None:
     zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{TABLE}'", quiet=True)
     zb.nats_cli("kv", "del", zb.kv_bucket("generations"), f"{TENANT}.{TABLE}", "-f")
-    zb.nats_cli("kv", "del", zb.kv_bucket("schemas"), TABLE, "-f")
+    # ⚠️ NOT the schema key. `kv del` writes a DELETE tombstone, and a Direct Get returns
+    # the newest revision — so the NEXT run's client, reading between this tombstone and
+    # its own boot's fresh PUT, gets the tombstone, treats the schema as missing, and its
+    # "fixture is empty" precondition fails on a phantom (measured 2026-09-03). The table
+    # is recreated with the same shape every run and boot re-publishes the schema, so a
+    # left-behind PUT is harmless and overwritten; a tombstone is not.
     # ⚠️ And the fixture's own CDC events. The table is dropped and recreated with the
     # SAME NAME every run, so a client starting at position 0 replays the PREVIOUS run's
     # inserts for it and its replica is not empty — measured: txn_kill failed its "the

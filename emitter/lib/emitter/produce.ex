@@ -42,7 +42,7 @@ defmodule Produce do
     end
   end
 
-  def bulk_insert_in(nb, i, table \\ "users") do
+  def bulk_ins(nb, i, tenant \\ "_default", table \\ "users") do
     now = DateTime.utc_now() |> DateTime.truncate(:microsecond)
 
     values =
@@ -63,14 +63,14 @@ defmodule Produce do
               age: 30 + idx,
               temperature: 39.0 + idx * 0.1,
               is_true: Enum.random([true, false]),
-              some_text: "bulk-#{i}-#{idx}",
+              some_text: String.duplicate("bulk-#{i}-#{idx}", 3),
               tags: ["a", "b", "c"],
               matrix: [[1, 2], [3, 4]],
               metadata: %{"batch" => i, "idx" => idx},
               price: 10.5 * idx,
               inserted_at: now,
               updated_at: now,
-              tenant_id: "_default"
+              tenant_id: tenant
             }
           end
       end
@@ -78,12 +78,12 @@ defmodule Produce do
     Repo.insert_all(table, values)
   end
 
-  def stream(every, take, nb, table \\ "users") do
+  def stream(every_ms, take, nb, table \\ "users") do
     # Task.start(fn ->
-    Stream.interval(every)
+    Stream.interval(every_ms)
     |> Stream.take(take)
     |> Task.async_stream(
-      fn i -> bulk_insert_in(nb, i, table) end,
+      fn i -> bulk_ins(nb, i, table) end,
       ordered: false
     )
     |> Stream.run()
@@ -100,7 +100,7 @@ defmodule Produce do
           age: 30 + idx,
           temperature: 39.0 + idx * 0.1,
           is_true: Enum.random([true, false]),
-          some_text: "bulk-#{i}-#{idx}",
+          some_text: String.duplicate("bulk-#{i}-#{idx}",3),
           tags: ["a", "b", "c"],
           matrix: [[1, 2], [3, 4]],
           metadata: %{"batch" => i, "idx" => idx},

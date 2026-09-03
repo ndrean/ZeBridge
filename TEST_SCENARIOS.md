@@ -78,6 +78,9 @@ listed and never run by it — those report, they do not assert.
 | a full is forced when rows were deleted since the cutoff (no resurrection) | `genproducer.py`, bridge unit tests |
 | writes committed while the bridge was down — and after a `kill -9` — replay from the slot | `downtime.py` |
 | a bridge `kill -9`'d MID-delivery of one large transaction: the unacked transaction replays whole, no row lost, the replayed half deduped at the broker | `txn_kill.py` |
+| a stream at `max_bytes` refusing publishes: retry budget burns, the bridge stops itself (really — the zombie it used to leave is §10bu), the slot retains, a restart after repair loses nothing | `stream_full.py` |
+| BASE_BUF lowered under stored data: the shrink-gated scan (§10bx) warns at boot, names the table, and stays silent on every non-shrinking boot | `shrink.py` |
+| `bridge --diagnose` says everything the boot would decide and changes nothing: exit 0/1, init presence the headline, minimum BASE_BUF computed, shrink a finding | `diagnose.py` |
 | a row written outside the client is in its replica in single-digit ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
 | a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished | `suspension_lift.py` |

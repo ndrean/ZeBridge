@@ -86,7 +86,11 @@ def main():
     finally:
         # ── cleanup, whatever happened above ───────────────────────────────────
         sql(f"DROP TABLE IF EXISTS public.{T} CASCADE")
-        sql(f"DELETE FROM public.zebridge_user_tenants WHERE principal IN ('{A}','{B}','{P}')")
+        # Their principals AND the sweeper rows the autogrant trigger copied from them
+        # (§10bv): cleaning by principal alone leaves zb_sweeper→tw_* behind, and boot
+        # then creates CDC_tw_* streams for tenants that no longer exist.
+        sql(f"DELETE FROM public.zebridge_user_tenants WHERE principal IN ('{A}','{B}','{P}') "
+            f"OR tenant_id IN ('{TA}','{TB}')")
         if os.environ.get("NATS_CREDS"):
             bucket = zb.TOPOLOGY["kv"]["tenants"]
             for who in (A, B, P):
@@ -98,7 +102,11 @@ def checks(carve: str) -> int:
     sql(f"DROP TABLE IF EXISTS public.{T} CASCADE")
     sql(f"CREATE TABLE public.{T} (uid uuid, tenant_id text NOT NULL, note text, "
         f"updated_at timestamptz NOT NULL, deleted_at timestamptz, PRIMARY KEY (tenant_id, uid))")
-    sql(f"DELETE FROM public.zebridge_user_tenants WHERE principal IN ('{A}','{B}','{P}')")
+    # Their principals AND the sweeper rows the autogrant trigger copied from them
+    # (§10bv): cleaning by principal alone leaves zb_sweeper→tw_* behind, and boot then
+    # creates CDC_tw_* streams for tenants that no longer exist.
+    sql(f"DELETE FROM public.zebridge_user_tenants WHERE principal IN ('{A}','{B}','{P}') "
+        f"OR tenant_id IN ('{TA}','{TB}')")
     sql(f"INSERT INTO public.zebridge_user_tenants VALUES "
         f"('{A}','{TA}'),('{B}','{TB}'),('{P}','{OPEN}')")
     sql(f"SELECT public.zebridge_grant_edge_writes('public.{T}')")

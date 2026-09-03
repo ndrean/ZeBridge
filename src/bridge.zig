@@ -336,6 +336,148 @@ fn releaseTxSlots(
 ///
 /// Not fatal. A bridge that cannot register still replicates correctly; what it
 /// loses is the guard's accuracy, so this warns loudly rather than refusing to boot.
+/// `--diagnose`: the pre-run doctor. Returns the process exit code — 0 when a bridge
+/// started right now would carry every published table, 1 when something needs fixing
+/// first. Read-only by construction: it is called before the slot, the budget row, the
+/// guard re-bake, and any NATS dial.
+fn runDiagnose(
+    allocator: std.mem.Allocator,
+    pg_config: *const pg_conn.PgConf,
+    pub_name: []const u8,
+    slot_name: []const u8,
+    event_buf: usize,
+    transition_rules: *const Config.EventClassification.TransitionRules,
+    sync_rules: *const Config.EventClassification.TransitionRules,
+    default_version_column: []const u8,
+    refused: *refused_tables.Registry,
+    writer_role: ?[]const u8,
+    tenant_rules: *const Config.EventClassification.TransitionRules,
+    writable: *writable_tables.Registry,
+    topo: *const topology_mod.Topology,
+) u8 {
+    var findings: usize = 0;
+    log.info("🩺 DIAGNOSE (dry run): BASE_BUF gives a {d}-byte event buffer; slot '{s}', publication '{s}'. Nothing will be created, registered, or dialled.", .{ event_buf, slot_name, pub_name });
+
+    var cfg = pg_config.*;
+    cfg.replication = false;
+    const conn = pg_conn.connect(allocator, cfg) catch |err| {
+        log.err("🔴 PostgreSQL is not reachable ({}): nothing else can be checked. Verify DATABASE_READER_URL / the POSTGRES_* variables.", .{err});
+        return 1;
+    };
+    defer c.PQfinish(conn);
+
+    // ── 0. is init.*.sql applied at all? ────────────────────────────────────────
+    // The first-time user WITHOUT init installed is this mode's main audience, so the
+    // missing template must be the headline — one finding with the exact fix — not a
+    // cascade of "function does not exist" from every later probe.
+    const init_q = "SELECT to_regclass('public.zebridge_catalogue') IS NOT NULL " ++
+        "AND EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'zebridge_widest_row'), " ++
+        "to_regclass('public.zebridge_user_tenants') IS NOT NULL " ++
+        "AND EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'zebridge_guard_tenant')";
+    var core_ok = false;
+    var write_ok = false;
+    {
+        const res = c.PQexec(conn, init_q);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) == 1) {
+            core_ok = c.PQgetvalue(res, 0, 0)[0] == 't';
+            write_ok = c.PQgetvalue(res, 0, 1)[0] == 't';
+        }
+    }
+    if (core_ok) {
+        log.info("✅ init.core is applied (catalogue + width probes present)", .{});
+    } else {
+        findings += 1;
+        log.err("🔴 init.core.sql is NOT applied: no zebridge_catalogue / width probes. Render and apply it first (scripts/render-init.sh or your migration pipeline) — every check below that depends on it is skipped, not failed.", .{});
+    }
+    if (write_ok) {
+        log.info("✅ init.write is applied (tenant guard + user_tenants present)", .{});
+    } else {
+        findings += 1;
+        log.err("🔴 init.write.sql is NOT applied: no write guards, no zebridge_user_tenants. Read-only replication would run, but no edge writes, no tenant mappings, no sweeper reach.", .{});
+    }
+
+    // ── 1. the publication ──────────────────────────────────────────────────────
+    {
+        var q_buf: [256]u8 = undefined;
+        const q = std.fmt.bufPrintZ(&q_buf, "SELECT count(*) FROM pg_publication_tables WHERE pubname = '{s}'", .{pub_name}) catch return 1;
+        const res = c.PQexec(conn, q.ptr);
+        defer c.PQclear(res);
+        const n: usize = if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) == 1)
+            std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0
+        else
+            0;
+        if (n == 0) {
+            findings += 1;
+            log.err("🔴 publication '{s}' has no tables (or does not exist). Create it and enable tables: SELECT zebridge_enable('mytable', ...);", .{pub_name});
+        } else {
+            log.info("✅ publication '{s}': {d} table(s)", .{ pub_name, n });
+        }
+    }
+
+    // ── 2. the boot's own per-table verdicts, verbatim ──────────────────────────
+    // The same preflight the real boot runs — pk, writability trio, tenant scoping,
+    // DDL pipeline — so the doctor can never drift from what the bridge will decide.
+    _ = preflight.run(
+        allocator,
+        pg_config,
+        pub_name,
+        transition_rules,
+        sync_rules,
+        default_version_column,
+        false, // never strict here: report everything, refuse nothing
+        refused,
+        writer_role,
+        tenant_rules,
+        event_buf,
+        writable,
+        topo,
+    ) catch |err| {
+        findings += 1;
+        log.err("🔴 preflight could not run: {}", .{err});
+    };
+    findings += refused.count();
+
+    // ── 3. does the stored data fit THIS buffer? ────────────────────────────────
+    if (core_ok) {
+        const fit = preflight.checkStoredRowsFit(allocator, conn, pub_name, event_buf);
+        findings += fit.flagged;
+        if (fit.widest > 0) {
+            // The smallest BASE_BUF whose buffer holds the widest stored row with the
+            // event envelope's overhead (measured ~78 bytes; 256 is the safe margin).
+            var need: u6 = 10;
+            while ((@as(usize, 1) << need) < fit.widest + 256 and need < 20) need += 1;
+            log.info("📐 widest stored row across the publication: {d} bytes — minimum BASE_BUF for this data: {d} ({d}-byte buffer). Ceiling is 20 (1 MB, NATS max_payload).", .{ fit.widest, need, @as(usize, 1) << need });
+        }
+    } else {
+        log.warn("⚠️  width scan skipped: it needs init.core's zebridge_widest_row", .{});
+    }
+
+    // ── 4. would this budget SHRINK what the slot ran with before? ──────────────
+    {
+        var q_buf: [256]u8 = undefined;
+        const q = std.fmt.bufPrintZ(&q_buf, "SELECT max_row_bytes FROM public.zebridge_limits WHERE slot = '{s}'", .{slot_name}) catch return 1;
+        const res = c.PQexec(conn, q.ptr);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK and c.PQntuples(res) == 1) {
+            const prev = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
+            if (event_buf < prev) {
+                findings += 1;
+                log.err("🔴 this BASE_BUF SHRINKS the slot's budget: {d} → {d} bytes. Rows stored legally under the old budget may stop fitting (the width scan above is the authority). BASE_BUF is one-way over stored data.", .{ prev, event_buf });
+            } else if (prev != 0) {
+                log.info("✅ budget vs last boot: {d} → {d} bytes (no shrink)", .{ prev, event_buf });
+            }
+        }
+    }
+
+    if (findings == 0) {
+        log.info("🩺 DIAGNOSE: all clear — a bridge started with this configuration carries every published table. Nothing was changed.", .{});
+        return 0;
+    }
+    log.err("🩺 DIAGNOSE: {d} finding(s) above. Nothing was changed — fix and re-run.", .{findings});
+    return 1;
+}
+
 fn registerRowWidthBudget(
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
@@ -371,10 +513,17 @@ fn registerRowWidthBudget(
     // accepting writes PostgreSQL will then refuse (measured: a 3352-byte edge write
     // passed a 4096 bridge and was rejected by a 2048 trigger — correct, but a wasted
     // round trip and a confusing log).
+    // Third column: the budget THIS slot registered LAST boot, read in a CTE so it is
+    // materialized BEFORE the upsert overwrites it (a bare subselect in the target list
+    // has no ordering guarantee against the function call). It is the memory the
+    // shrink check below compares against: BASE_BUF is one-way (§13 addendum), and the
+    // stored-rows scan runs ONLY when this boot's budget is smaller than that.
     const res = c.PQexecParams(
         conn,
-        "SELECT public.zebridge_register_limits($1, $2::name, $3::integer), " ++
-            "COALESCE((SELECT MIN(max_row_bytes) FROM public.zebridge_limits), $3::integer)",
+        "WITH prev AS (SELECT max_row_bytes FROM public.zebridge_limits WHERE slot = $1) " ++
+            "SELECT public.zebridge_register_limits($1, $2::name, $3::integer), " ++
+            "COALESCE((SELECT MIN(max_row_bytes) FROM public.zebridge_limits), $3::integer), " ++
+            "(SELECT max_row_bytes FROM prev)",
         3,
         null,
         &params[0],
@@ -393,6 +542,25 @@ fn registerRowWidthBudget(
 
     const n = std.mem.span(c.PQgetvalue(res, 0, 0));
     const effective = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 1)), 10) catch max_row_bytes;
+    // ── The shrink check (§13 addendum) ─────────────────────────────────────────
+    // A budget RAISED or unchanged proves nothing about stored data and costs nothing.
+    // A budget LOWERED below what this slot ran with before is the one transition that
+    // can strand rows: data written legally under the old budget may no longer fit the
+    // event buffer, and with the per-boot scan gone (§13) nothing would say so until
+    // the first touch suspends the table under load. So the scan is revived exactly
+    // here — on the rare transition that justifies its cost — and stays "reported,
+    // never refused": the rows already exist, and refusing to start would turn the
+    // warning into the outage it is trying to prevent.
+    if (c.PQgetisnull(res, 0, 2) == 0) {
+        const prev = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 2)), 10) catch max_row_bytes;
+        if (max_row_bytes < prev) {
+            log.warn(
+                "📏 row-width budget SHRANK: {d} → {d} bytes (slot '{s}'). BASE_BUF is one-way over stored data — scanning published tables for rows the new buffer cannot carry…",
+                .{ prev, max_row_bytes, slot_name },
+            );
+            _ = preflight.checkStoredRowsFit(allocator, conn, pub_name, max_row_bytes);
+        }
+    }
     if (effective < max_row_bytes) {
         log.info(
             "📏 row-width budget registered: {d} bytes (slot '{s}', publication '{s}'), {s} guard(s) re-baked — ingress capped at {d}, the NARROWEST instance carrying these tables",
@@ -586,7 +754,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Start HTTP server thread AFTER http_srv is at its final memory location
-    try http_srv.start();
+    // (not under --diagnose: a dry run serves nothing and must leave no thread behind)
+    if (!parsed_args.diagnose) try http_srv.start();
     defer http_srv.join();
     defer http_srv.deinit();
 
@@ -602,25 +771,7 @@ pub fn main(init: std.process.Init) !void {
     var pg_config = pg_conn.PgConf.from_runtime_config(&runtime_config);
 
     // Initialize replication: create slot + verify publication
-    var replication_ctx = try initReplication(
-        allocator,
-        &pg_config,
-        slot_name_z,
-        pub_name_z,
-    );
-    defer replication_ctx.deinit();
-
-    // The slot exists and the publication is verified, so the registrar's GC step
-    // cannot delete the rows it is about to write. Reader connection, SECURITY
-    // DEFINER function — works in the read-only profile too.
     const own_event_buf = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
-    const effective_row_budget = registerRowWidthBudget(
-        allocator,
-        &pg_config,
-        slot_name_z,
-        pub_name_z,
-        own_event_buf,
-    ) orelse own_event_buf;
 
     // === Parse transition rules from environment variable
     // Format: "table1:col1,col2;table2:col3,col4"
@@ -677,6 +828,66 @@ pub fn main(init: std.process.Init) !void {
     }
     const default_version_column = init.minimal.environ.getPosix("SYNC_VERSION_COLUMN") orelse
         Config.Sync.default_version_column;
+
+    // ── --diagnose: the pre-run doctor ──────────────────────────────────────────
+    // Everything the boot would DECIDE, said before anything is DONE. By this point the
+    // config, rules and catalogue are parsed (all reads), the budget was NOT registered
+    // (guarded above), no slot exists, and NATS has not been dialled — so the exit below
+    // leaves the system exactly as it was found. The checks run in the order a first
+    // installation actually fails: init applied at all → publication whole → per-table
+    // verdicts (the same preflight the boot runs) → does the stored data fit THIS
+    // BASE_BUF, and what is the smallest one that would fit it → would this budget
+    // SHRINK what the slot ran with before.
+    if (parsed_args.diagnose) {
+        // Local registries: the doctor forks BEFORE main's are declared, and borrowing
+        // them would force this block below the HTTP server and the replication init —
+        // the two boot steps a dry run exists to avoid (the first spawns a thread, the
+        // second CREATES the slot when it is missing).
+        var d_refused = refused_tables.Registry.init(allocator);
+        defer d_refused.deinit();
+        var d_writable = writable_tables.Registry.init(allocator);
+        defer d_writable.deinit();
+        const d_writer_role = if (runtime_config.pg_writer_url) |url| preflight.roleFromUrl(url) else null;
+        const code = runDiagnose(
+            allocator,
+            &pg_config,
+            parsed_args.publication_name,
+            parsed_args.slot_name,
+            own_event_buf,
+            &transition_rules,
+            &sync_rules,
+            default_version_column,
+            &d_refused,
+            d_writer_role,
+            &tenant_rules,
+            &d_writable,
+            &runtime_config.topology,
+        );
+        std.process.exit(code);
+    }
+
+
+
+
+    var replication_ctx = try initReplication(
+        allocator,
+        &pg_config,
+        slot_name_z,
+        pub_name_z,
+    );
+    defer replication_ctx.deinit();
+
+    // The slot exists and the publication is verified, so the registrar's GC step
+    // cannot delete the rows it is about to write. Reader connection, SECURITY
+    // DEFINER function — works in the read-only profile too. (The --diagnose fork
+    // exits above, so a dry run never reaches this write.)
+    const effective_row_budget = registerRowWidthBudget(
+        allocator,
+        &pg_config,
+        slot_name_z,
+        pub_name_z,
+        own_event_buf,
+    ) orelse own_event_buf;
 
     // Shared between preflight (boot) and the DDL path (runtime): both decide a table
     // has no primary key, and the mutation path must honour either verdict.
@@ -1301,6 +1512,14 @@ pub fn main(init: std.process.Init) !void {
         // Check for fatal NATS errors (e.g., reconnection timeout exceeded)
         if (batch_pub.hasFatalError()) {
             log.err("🔴 FATAL ERROR: NATS reconnection failed - shutting down bridge to prevent WAL overflow", .{});
+            // ⚠️ The global flag, not just the break. The break only leaves THIS loop;
+            // wal_monitor and the HTTP server loop on `should_stop`, and the deferred
+            // `wal_mon.join()` waits on it — without the store the process hung forever
+            // as a zombie: replication dead, /health answering 200, the wal_monitor
+            // logging "slot INACTIVE" every pass (found by stream_full.py: a stream at
+            // max_bytes with discard:new burned the retry budget, the publisher stopped
+            // cleanly, and the bridge never exited).
+            should_stop.store(true, .seq_cst);
             break;
         }
 
@@ -2003,6 +2222,16 @@ fn reconcileCdcStreams(
 
     // ── per-tenant streams: ensure, create when missing ─────────────────────────
     for (topo.tenants) |tenant| {
+        // ⚠️ The OPEN tenant's rows ride CDC_PUBLIC — `cdc.<open>.>` is already in its
+        // subject filter. A `_default` row in `zebridge_user_tenants` (a DBA enrolling
+        // someone into the open tenant, or any tool copying mappings) used to reach this
+        // loop and try to create CDC__default, whose subject overlaps CDC_PUBLIC —
+        // StreamSubjectOverlap, and the boot refusal below took the bridge down
+        // (measured 2026-09-03: one such mapping made every boot fail).
+        if (std.mem.eql(u8, tenant, topo.open_tenant)) {
+            log.info("↩️  tenant list contains the open tenant '{s}' — its stream is CDC_PUBLIC, skipping", .{tenant});
+            continue;
+        }
         var name_buf: [256]u8 = undefined;
         inline for (.{
             .{ topo.cdc_stream_prefix, "{s}.{s}.>", Config.Nats.reconciled_cdc_max_age_days },

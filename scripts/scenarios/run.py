@@ -49,6 +49,7 @@ GROUPS = {
     },
     "live": {
         "check":         ("bridge", "declared vs actual drift"),
+        "diagnose":      ("none",   "bridge --diagnose: the pre-run doctor says everything, changes nothing"),
         "telemetry":     ("none",   "HTTP surface"),
         "writable":      ("client", "grants vs published write contract"),
         "mutate":        ("client", "LWW round trip"),
@@ -79,6 +80,8 @@ GROUPS = {
         "genproducer":   ("bridge", "chains: full, delta, prune"),
         "chain_kill":    ("bridge", "kill -9 mid-chain-build: the manifest never names a missing object"),
         "txn_kill":      ("bridge", "kill -9 mid-transaction: the unacked transaction replays whole, no loss"),
+        "stream_full":   ("bridge", "a full stream refuses publishes: retry budget, deliberate stop, lossless restart"),
+        "shrink":        ("bridge", "BASE_BUF lowered under stored data: the shrink-gated scan warns at boot"),
         "legacybait":    ("bridge", "pre-guard oversized rows"),
         "suspension_lift": ("bridge", "a row_too_large suspension lifts live once its cause is gone"),
         "livebirth":     ("bridge", "a table born and enabled while running"),

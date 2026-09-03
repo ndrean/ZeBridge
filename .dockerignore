@@ -45,3 +45,4 @@ LICENSE
 .env.example
 *.yml
 /demo/
+*.py

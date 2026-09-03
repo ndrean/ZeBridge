@@ -44,7 +44,7 @@ COPY . .
 # COPY src/ ./src/
 # COPY nats.zig/ ./nats.zig/
 
-RUN zig build bridge -Doptimize=ReleaseFast
+RUN zig build bridge -Doptimize=ReleaseSafe
 
 FROM ${BASE_IMAGE}
 

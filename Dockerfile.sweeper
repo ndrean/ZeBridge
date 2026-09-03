@@ -43,7 +43,7 @@ COPY . .
 # COPY src/utils.zig src/bridge_sweeper.zig src/c_includes_pg.h ./src/
 
 
-RUN zig build sweeper -Doptimize=ReleaseSmall
+RUN zig build sweeper -Doptimize=ReleaseSafe
 
 FROM ${BASE_IMAGE}
 

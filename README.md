@@ -6,14 +6,14 @@
 
 **What is it?**:  An opinionated, bidirectional bridge to synchronize a single PostgreSQL(14+) database with a _local replica_ (SQLite, PGlite) via the message broker NATS/JetStream (2.10+).
 
-**One bridge with two components** and a consumer builds on the client library.
+**A bridge with two pillars** and a consumer builds on the client library.
 
 ```mermaid
 flowchart LR
      subgraph VPN["VPN"]
         PG[("Postgres")]
         subgraph Localhost ["VPS localhost"]
-            Bridge(("ZeBridge <br> daemon"))
+            Bridge(("ZeBridge"))
             NATS[("NATS")]
         end
         PG <--> Bridge
@@ -24,8 +24,8 @@ flowchart LR
 
 
     subgraph Edge["Consumer"]
-        Lib(("libzb(.js)"))
-        SQL[("SQLite<br>PGLite")]
+        Lib(("libzb(.ts)"))
+        SQL[("Local<br>DB")]
         App["mobile<br>browser<br>service"]
         SQL -->App
         App <-->Lib
@@ -37,42 +37,54 @@ flowchart LR
     style NATS fill:#10b981,stroke:#059669,color:#000
 ```
 
-**How does it work?**: two parts, a daemon and a client library.
+**Local_DB supported flavours**: standard SQLite, PGlite or PostgreSQL.
 
-* the background executable `ZeBridge` (ZB) is connected to PostgreSQL (PG) and NATS/JetStream (NATS) and streams PG changes onto NATS and applies writes coming back. This is lightweight process, can be started / stopped on the fly.
-* the client library `libzb` handles the incoming data (seeds and CDCs) from NATS into the local database, and pushes optimistic consumer writes to NATS, echoed back after conflict resolution. The library comes in two flavours: a JavaScript library and a dynamic linked library (FFI).
+**How does it work?**: The architecture consists of a single bridge split into two core components: a daemon and a client library..
 
-**Consumers**: can be used by mobile native apps (native SQLite with FS), browsers or webapps (with OPFS support for sqlite-wasm | PGlite),  and backend services (PGlite, native SQLite, PG).
+* `ZeBridge` (ZB) daemon: the background executable is connected to PostgreSQL (PG) and NATS/JetStream (NATS). It streams PG modifications using Change Data Capture (CDC)  onto NATS and applies writes coming back to the primary database. This is lightweight process, can be started / stopped seamlessly on the fly.
+* `libzb` client library: a client library that handles the incoming data (seeds and CDCs) from NATS, writting them to the local database. It also pushes optimistic consumer writes to NATS, which are echoed back to the client following server-side conflict resolution. The library comes in two flavours: a native TypeScript library and a dynamically linked library via FFI.
 
-**Local_DB**: standard SQLite, PGlite or PostgreSQL.
+**Consumers**: The library can be integrated across a wide range of runtime environments.
 
-**Design**: This tool is built to serve a large number of small to medium consumers via the NATS message broker. It aims to be light (3.5 MB executable), fast, quick startup while safe.
+* Mobile Native Apps: Utilizing native SQLite with file system storage.
+* Browsers and Webapps: Leveraging OPFS support for sqlite-wasm or PGlite.
+* Backend Services: Running PGlite, native SQLite, or standard PostgreSQL.
 
-In order to favour mobile usage, we use aggressive delta compression when reseeding. This reduces the need for lengthy CDC catchups.
+**Design**: This tool is built to serve a large volume of small to medium consumers via the NATS message broker. It is engineered to be light (~3.5 MB executable), fast, secure, and near instant startup.
 
-⚠️ ZB moves rows, not files. This means it is NOT designed for very large tables or tables containing large objects. NATS forbids large payloads (> 1 MB by default), and on the other side, the memory consumption of ZeBridge would explode.
-> Large payloads belong in object storage: database tables should only contain metadata or a reference (e.g., a bucket URL) to the blob.
+* **High performance ingestion**: With PG replication set to 'logical', we use a log-based CDC with the native  `pgoutput` (v1) logical decoding plugin to stream decoded WAL changes in binary format.
+* **Zero aollocation Hot Path**: To minimize memoery allocations during high throughput, the engine uses a pre-allocated ring buffer.
+* **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding. This mitigates the need for long, expensive unitary CDC catchups.
+* **SSR needed?** Frameworks like React, Next.js, Remix, Nuxt allows Server Components query the database. The client can query directly the local database, eliminating the need a netwrok round trip or a GraphQL layer, so just a CDN and the local persisted DB (OPFS for browsers/webapps, or file system for desktop/mobile).
 
-**Opinionated**: the current ZB version makes decisions for you that other sync engines leave you to: conflict resolution, via LWW.
+**Explicit limitations**: `ZeBrigde` is NOT designed for massive databases or tables storing large objects (BLOBs) or an extra large number of columns. NATS restricts payloads ($<2^{20}=1$ MB by default). This limit is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, the needed memory for ZB would start to be very large (eg ~6 GB if buffering 1 MB/evt @ 5000 evt/s).
+> Large payloads belong in object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data, not PDFs for instances.
+
+**Opinionated**: ZeBridge makes deliberate structural decisions to maximize performance and predictability, rather than offering endless configuration options:
+
+* **Strict Memory Boundaries:** Because ZB uses a fixed pre-allocated buffer, its memory footprint must be defined at runtime.  Overflows are detected, rolled back and the table is quarantined. To prevent misuse, the size of every data entry is strictly validated-wether originated from a consumer write, or directly loaded within Postgres, or after a schema migration.
+* **Opinionated Conflict Resolution (LWW)**: if client-side writes are enabled (`writable => true`), ZB version makes decisions for you that other sync engines leave you to : it enforces a Last-Write-Win (LWW) strategy server-side. Furthermore, the client uses a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
 This imposes constraints -mostly mechanical- on the database schemas but buys guarantees.
-On the consumer side, we expect a standard SQLite engine. The client can read freely the local database, but writes **must** go through the library. How it is enforced depends upon the local engine.
+* **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** route through the `libzb` library to ensure tracking. Enforcement depends upon the local engine.
+* **Tenant isolation**: we enforce a strict tenant model in PG: every principal -consumer- operates within a designated tenant boundary. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
+* **Detla-chain** generation: a snapshot of a table is not on-demand nor a full table per tenant. This would crush Postgres if thousands of consumers connect. Instead, a "generation" thread produces full/deltas in a time window with a max chain length and these are dictionary based Zstd compressed and pushed into NATS. The client library cherry picks whatever its needs on connection, and complements with the few remaining CDCs up to its watermark.
 
-**Configuration**: the most important configuration used by ZeBridge concerns its **fixed-size buffer**.  ➡ Total buffer size can be set anything from 16MB to 4GB+, depending upon of the published tables you wish to track.
+**Configuration**: once the database is migrate - you are expected to `zb_enable()`the tables you want to follow in a designated PG publication, the primary runtime configuration is the **fixed-size buffer** and the `MAX_COLUMNS` (per table). Depending on the write volume and schema sizes of your published tables, the total buffer allocation can be configured anywhere from 16 MB to over 4+ GB.
+Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`.
 
-**Monitoring**: ZB exports metrics in the format for the Prometheus format and logs (Loki) for Grafana dashboards.
-ZB internally monitors the payload size and quarantines trespassing tables that exceed NATS limits and buffer limits. Conversely, it also prevents sending large payloads to PG as the echoed change would fail to pass.
+**Observability**: ZeBridge includes production-ready observability out of the box; it exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards.
 
-**Sweeper**: because consumers can apply _soft-deletion_, we have a garbage collector which runs as a separate cron job. The executable `bridge_sweeper` prunes Postgres' rows marked for deletion, and these are echoed via CDCs to consumers who applied soft-deletion.
-[TODO] emit telemetry to ZB once done.
+**Sweeper**: because consumers can apply _soft-deletion_ thus can lead to bloated local databases, ZeBridge solves this with a companion garbage collection daemon `bridge_sweeper`.
 
 **Status**: Dev stage. Chaos tested but not battle tested.
 
 **Planned**: 
 
-* [x] Harden chaos testing
-* [ ] daemon column scoped,
-* [ ] client DuckDB support (Parquet over OPFS),
-* [ ] server-side rendering (Nuxt, Next, Remix) hydratation watermark.
+* [ ] Harden chaos testing
+* [ ] Coherence zb-client-ts, lizb.js, libzb
+* [ ] Onboarding `zb_doctor`, `zb_diagnose`, `./bridge --init-config`
+* [ ] Separate Writer / Reader Postgres instance
+* [ ] column scoped
 
 ## Table of Contents
 
@@ -149,7 +161,7 @@ graph TD
         Bridge[[ZeBridge-1<br> :27434]]:::bridge
         Bridge@{shape: st-rect}
         PG[(Postgres Master <br> :5432)]:::secure
-        PGREP[(PG StandBy<br>Replica<br>:5433)]:::secure
+        PGREP[(PG StandBy<br>Replica<br>Planned)]:::secure
         NATS[NATS Server<br> TPC :4222 <br> wss :8080]:::internal
         NATS@{shape: data-store}
         
@@ -184,7 +196,7 @@ graph TD
     %% Internal Component Dependencies
     Bridge ==>|W| PG
     PGREP ==>|R|Bridge
-    Bridge <==>|Pub / Sub <br> TCP| NATS
+    Bridge <==>|Pub Sub  <br> TCP| NATS
     
     %% Telemetry Data Flow
     Prom -.->|Scrapes| Bridge
@@ -193,22 +205,35 @@ graph TD
     Grafana -.->|Queries| Prom
 ```
 
+**OS**: the daemon is POSIX based, so runs on a Linux based VPS.
+
+**Hardware**: You can run very comfortably Postgres, NATS, ZeBridge, Prometheus, HAProxy on a 6-vCPU, 12 GB RAM, a high-IOPS 100GB NVMe SSD drive for less than 15€.
+
+You can tweek Postgres: give PG space with `shared-buffers=2GB`, and `logical_decoding_work_mem = 256MB`, whilst capping`max_slot_wal_keep_size = 10GB`.
+
+You can tweek ZeBridge by running several instances targeting different groups of tables, each in its own 'publication' (and 'slot' and 'port'), while using the same Postgres server and NATS server:
+
+* a first ZeBridge instance serving large/heavy/moderate producing rate tables. You can configure a big ~4.5 GB ring buffer: a very comfortable 2^17=128k per row, 32.000 slots for very long transactions or up to 4s buffering capacity of NATS at 8.000 evt/s).
+* a second ZeBridge instance dedicated to small fast emitting tables, like 2^11=2kB/row, 256.000 slots, buffering 2s @ 100.000 evt/s), which will consume another ~600MB.
+  
+Both instances will run nicely on the VPS.
+
 ## Opinionated
 
 ZeBridge makes choices that a general sync engine usually leaves to you. These choices act as constraints—though mostly mechanical—and that is the point: each one buys a specific guarantee.
-These opinions aim in one direction: many small consumers that read freely, write safely, and never cross the tenant line. It is a bridge with two ends you build on, not a bare pipe.
+These opinions aim in one direction: many small consumers that read freely, write safely, and never cross the tenant line.
 
 Here they are, so you can judge the fit before adopting it.
 
-| Action | colmun | type | note |
+| Action | column | type | note |
 | --  |  --    | --   | --   |
 |||||
-| public table | - | text | annotate in `zb_enable()`|
+| public table | - | text | annotate in `zebridge_enable()`|
 | private table| `tenant_id` | text | - |
 ||||
 |  Read  | uid    | **uuid** | composite pk |
-| Write  | version | **timestampz** | no bigserial, `updated_at` |
-| Write  | tombstone | **timestampz** | soft-deleted, `deleted_at` |
+| Write  | version | **timestamptz** | no bigserial, `updated_at` |
+| Write  | tombstone | **timestamptz** | soft-deleted, `deleted_at` |
 | Write | tiebreak | text | `last_writer` |
 
 
@@ -231,6 +256,7 @@ Here they are, so you can judge the fit before adopting it.
   -----------+------------+-----------+----------+------------------
   uid       | uuid       |           | not null | gen_random_uuid()
   ```
+
 * A public table must be declared as such with a column `public_reason`, you cannot miss it.
 * A non-public table has tenant scoped rows; it needs a `tenant_id` column.
 
@@ -265,15 +291,19 @@ Here they are, so you can judge the fit before adopting it.
   test_types | tenant_id  |               | updated_at  | deleted_at    | last_writer
   ```
 
-  **Writes are resolved, not merely accepted — last-write-wins.** The writes use three verbs (INSERT, DELETE, UPDATE), resolved via **last-write-wins** (LWW) using Hybrid-Logical-Clock (HLC) logic.
+**Writes are resolved, not merely accepted — last-write-wins.** The writes use three verbs (INSERT, DELETE, UPDATE), resolved via **last-write-wins** (LWW) using Hybrid-Logical-Clock (HLC) logic.
 
-  A write carries the version the client holds; ➡ the bridge applies it **only if it is newer** than what Postgres has, and rejects a stale one.
+**Clock drift**: the client uses a Hybrib Logical Clock (HLC) algorithm to neutralize the clock dirft / synchronization problem and disallow silent data overwrite issues.
 
-  This is a deliberate design choice, otherwise you observe whatever results.
+A write carries the version the client holds; ➡ the bridge applies it **only if it is newer** than what Postgres has, and rejects a stale one.
 
-  ZeBridge arbitrates at ingest, so a slow or offline client cannot silently clobber a newer edit, and a stale queued write cannot undo a delete.
+This is a deliberate design choice, otherwise you observe whatever results. ZeBridge arbitrates at ingest, so a slow or offline client cannot silently clobber a newer edit, and a stale queued write cannot undo a delete.
 
-  The cost is that LWW is the only resolution offered today.
+The cost is that LWW is the only resolution offered today.
+
+#### Sweeper
+
+The `bridge_sweeper` companion daemon scans periodically PostgreSQL to prune rows marked for deletion. By converting logical soft-deletes into physical hard-deletes in Postgres, it triggers a final CDC delete event. This event propagates down the network, instructing edge SQLite databases to drop the rows and immediately reclaim disk space. The Sweeper captures this lifecycle to emit lightweight telemetry about the garbage-collected records.
 
 #### Local database writes are owned
 
@@ -305,9 +335,157 @@ So a bridge is cheap to start, cheap to restart, cheap to colocate, and never it
 
 On the other side, the consumer's state is its local replica plus its NATS stream position, and everything the consumer needs comes from NATS streams, buckets and object storage.  using the client library primitives.
 
+## Schemas constraints examples
+
+
+#### Read-only table migration
+
+**A "Bad"** `read-only` table: 
+
+Only the prirmary key (PK) is missing:
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    -- ❗️ no PK
+    name varchar NOT NULL,
+    email varchar,
+    inserted_at timestamp NOT NULL,
+);
+```
+
+The migration to add a primary key:
+
+```diff
++ ALTER TABLE users 
++ ADD COLUMN id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY;
+```
+
+> since it is READ-ONLY, it can be a simple `bigint`, but necessarily `uuid` in the WRITABLE case.
+
+**A "Good"** `read-only` table ✚ 🔔 the magic  PG function `zb_enable()` to attach this table to the 'publication' of your choice.
+
+``` sql
+CREATE TABLE IF NOT EXISTS users (
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, -- ✅
+    name varchar NOT NULL,
+    email varchar,
+    inserted_at timestamp NOT NULL,
+);
+
+-- ❇️ the magic function that declares this table 'public' 
+-- ⚠️ needs a 'public_reason' field, NOT NULL, meaning deliberate)
+-- declare the publication to which this table will be added
+
+SELECT zb_enable(
+    'public.users'::regclass,
+    public_reason => 'no tenant column, readable by every consumer', -- ❗️needed
+    publication => 'my_pub',
+    dry_run => false
+);
+``` 
+
+#### Writable table
+
+**A Bad** writable table: it has a 'version' timestamp but tye is wrong, not `timestamp`**Z**, has no 'tombstone' (`deleted_at`), has no 'tiebreak' (`last_writer`), and has no `tenant_id` (RLS scope):
+
+```sql
+CREATE TABLE IF NOT EXISTS test_types (
+    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), -- ✅ PK with UUID for writable as set by client
+    -- ❗️no tenant_id
+    temperature double precision,
+    ...
+    inserted_at timestamp NOT NULL,
+    updated_at timestamp  NOT NULL -- ❗️no time zone
+     -- ❗️ no tiebreak
+     -- ❗️ no tombstone
+);
+```
+
+The migration:
+
+```diff
++ ALTER TABLE test_types 
++ ADD COLUMN tenant_id text NOT NULL,
++ ALTER COLUMN updated_at TYPE timestamp with time zone USING updated_at AT TIME ZONE 'UTC';
++ ADD COLUMN deleted_at timestamp with time zone;
++ ADD COLUMN last_writer text,
+```
+
+So the "good" writable ✚ 🔔 the magic PG function `zb_enable()` where we declare which columns will play which role, and link it to the 'pulication' and declare it 'writable'.
+
+```sql
+CREATE TABLE IF NOT EXISTS test_types (
+    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), -- ✅ PK with UUID for writable as set by client
+    tenant_id text NOT NULL,
+    temperature double precision,
+    ...
+    inserted_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL -- ✅ version
+    deleted_at timestamp with time zone, -- ✅ tombstone for soft-delete
+    last_writer varchar, -- ✅ tiebreak
+);
+
+-- ❇️ the magic function to declare:
+-- the tenant_id
+-- that it's 'writable'
+-- the SYNC RULES correspondance (tombstone_col, version_col, tiebreak_col)
+ -- declare the publication to which this table will be added
+
+SELECT zb_enable(
+    'public.test_types'::regclass,
+    writable => true,
+    tenant_col => 'tenant_id',
+    version_col => 'updated_at',
+    tombstone_col => 'deleted_at',
+    tiebreak_col => 'last_writer',
+    publication => 'my_pub',
+    dry_run => false
+);
+```
+
+A **Writable with wrong PK type**:
+
+```sql
+CREATE TABLE IF NOT EXISTS test_types (
+    -- ❗️ PK without UUID for writable
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    ...
+);
+
+SELECT zb_enable(...);
+```
+
+* If the table is **empty**, the change of the pirmary key type from 'bigint' -> 'uuid' to simple:
+
+```diff
++ ALTER TABLE users 
++ DROP CONSTRAINT users_pkey,
++ DROP COLUMN id,
++ ADD COLUMN uid uuid PRIMARY KEY DEFAULT gen_random_uuid();
+```
+
+* If the table is **already populated**, then we need a bit more efforts: add a new column with type 'uuid', populate it with UUIDs for every existing rows, drop the old pk column, and promote the new one as primary key, in this order.
+
+```sql
+-- 1. Add the new UUID column (without primary key or NOT NULL yet)
+ALTER TABLE users ADD COLUMN new_id uuid DEFAULT gen_random_uuid();
+-- 2. Populate existing rows with a UUID
+UPDATE users SET new_id = gen_random_uuid();
+-- 3. Make the new column NOT NULL
+ALTER TABLE users ALTER COLUMN new_id SET NOT NULL;
+-- 4. Drop the old primary key constraint and the old id column
+ALTER TABLE users DROP CONSTRAINT users_pkey;
+ALTER TABLE users DROP COLUMN id;
+-- 5. Rename new_id to id
+ALTER TABLE users RENAME COLUMN new_id TO id;
+-- 6. Add the primary key constraint to the new id column
+ALTER TABLE users ADD PRIMARY KEY (id);
+```
+
 ## The consumer side
 
-You do not talk to NATS: the library does all of it.
+**The rule**: you do not talk to NATS: the library does all of it.
+
 It watches the schema, seeds the local database (from the generation chain), follows the change feed, applies rows last-write-wins, and sends your writes. It owns the local SQLite, so a write can only go through the library.
 
 Two builds of the same core:
@@ -345,7 +523,8 @@ for (const row of orders) {
   await zb.mutate(
     'orders',               // table
     'UPDATE',               // op: 'INSERT' | 'UPDATE' | 'DELETE'
-    { id: row.id },         // key: the PRIMARY KEY column(s) — composite is fine: { org_id, id }
+    { id: row.id },         // key: the PRIMARY KEY column(s) 
+                            // — composite is fine: { org_id, id }
     { status: 'Expired' },  // values: ONLY the changed columns
   );
 }
@@ -354,7 +533,7 @@ for (const row of orders) {
 </details>
 <br>
 
-That is the whole contract for an app author. The wire format — the NATS subjects, the KV buckets, the chain layout, the tenant scoping — is the library's own business, not yours. It is written down in [PROTOCOL.md](PROTOCOL.md) for one reason: someone writing a **new** language binding. Building an app, you never read it.
+That is the whole contract for an app author. The wire format — the NATS subjects, the KV buckets, the chain layout, the tenant scoping — is the library's own business, not yours.
 
 **Getting a consumer connected** is enrollment: the app authenticates to your backend (or the bridge's mint endpoint), receives a JWT credential, and connects. The principal comes back _inside_ the credential — the consumer never types it. The same model works for every consumer type; see [Credentials & trust boundaries](#credentials--trust-boundaries).
 
@@ -362,26 +541,24 @@ That is the whole contract for an app author. The wire format — the NATS subje
 
 ## Safety & Guarantees
 
-### At-Least-Once Delivery
+#### At-Least-Once Delivery
 
-The full mechanism — bridge ACKs PostgreSQL only after JetStream confirms, what happens if the bridge crashes, what happens if NATS crashes — is covered in [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages). The guarantee in one line: **no data loss between Postgres and NATS**, because the ACK to PostgreSQL only happens after JetStream has durably persisted the message, and JetStream's Msg-ID deduplication absorbs any retry.
+The full mechanism — bridge ACKs Postgres only after JetStream confirms, what happens if the bridge crashes, what happens if NATS crashes — is covered in [Bridge ACK Flow and NATS outages](#bridge-ack-flow-and-nats-outages). The guarantee no data loss between Postgres and NATS, because the ACK to Postgres only happens after JetStream has durably persisted the message, and JetStream's Msg-ID deduplication absorbs any retry.
 
-### Zero-Consumer Protection & Storage Bounds
+#### Zero-Consumer Protection & Storage Bounds
 
 **What happens if PostgreSQL emits CDC events when no NATS clients are connected?** Nothing accumulates unbounded on either side. The bridge keeps ACKing PostgreSQL as normal — that only depends on JetStream, not on a consumer being present — so PostgreSQL's WAL stays bounded regardless. On the NATS side, the `CDC` stream's own retention policy (`--max-age`, `--max-bytes` — see [The NATS streams and buckets](#the-nats-streams-and-buckets)) purges old events even with zero subscribers. A client that reconnects after being offline re-seeds from the latest **generation chain** and resumes from `CDC`.
 
-### Idempotent Delivery
+#### Idempotent Delivery
 
-**Message ID pattern:** `{lsn}-{table}-{operation}`
-
-* Example: `25cb3c8-users-insert`
+The Message ID pattern is`{lsn}-{table}-{operation}`, eg `25cb3c8-users-insert`.
 
 **NATS JetStream deduplication:**
 
 * Duplicate Msg-IDs are rejected
 * Ensures exactly-once semantics even with retries
 
-### Durability
+#### Durability
 
 **PostgreSQL side:**
 
@@ -398,13 +575,13 @@ The full mechanism — bridge ACKs PostgreSQL only after JetStream confirms, wha
 * Durable consumer name persists progress
 * Survives consumer restarts
 
-### Schema Consistency
+#### Schema Consistency
 
 Each chain manifest carries its cutoff — `cutoff_lsn`, and `cutoff_seq`, the CDC stream sequence captured before the build — so a consumer knows exactly which events its seed already contains and discards them (the library handles this — [the consumer side](#the-consumer-side--use-the-library)).
 
 Event ordering follows from [one WAL-reading thread per bridge](#design-overview): PostgreSQL hands the bridge a strict total order — transactions in **commit** order, and each transaction's changes in execution order — and the bridge reads it sequentially.
 
-⚠️ **Order is preserved WITHIN a table, not ACROSS tables.** A flush is grouped by subject before publishing, which collapses interleaving: when a run begins mid-pair, a child's batch can be published before the batch carrying its parents. Measured. Most consumers never notice — rows are applied by primary key, last-write-wins, idempotent — but a consumer holding a constraint that spans tables (a foreign key) must be order-tolerant, which is why `libzb` holds a row whose parent has not arrived and retries it after the next batch.
+⚠️ **Order is preserved WITHIN a table, not ACROSS tables.** A flush is grouped by subject before publishing, which collapses interleaving: when a run begins mid-pair, a child's batch can be published before the batch carrying its parents. Most consumers never notice — rows are applied by primary key, last-write-wins, idempotent — but a consumer holding a constraint that spans tables (a foreign key) must be order-tolerant, which is why the client library `libzb` holds a row whose parent has not arrived and retries it after the next batch.
 
 ⚠️ **Do not sort by `lsn` to "restore" order.** LSNs are not monotonic in delivery order: a transaction that begins earlier but commits later arrives later carrying a _lower_ LSN (measured: `lsn=8700486880` delivered before `lsn=8700486488`). Delivery order is the truth; `lsn` is a legacy watermark, nothing more — the commit-ordered `cutoff_seq` is the gate.
 
@@ -503,47 +680,39 @@ NATS_BRIDGE_NKEY_SEED=SU... \
 ./bridge --pub my_pub --slot my_slot --port 27434
 ```
 
-### Client to NATS dance
+### Client to NATS dance (Authentication)
 
-A client never gets a password. It gets a **`.creds` file**, which holds two things:
+ZeBridge **completely decouples** your application's authentication (passwords, OAuth, session cookies) from the data-sync authentication (NATS). It does not know or care how you authenticate your users. It only handles the minting of **NATS JWTs**, which act as cryptographically secure database credentials for your edge clients.
 
-* a **user JWT** — public. It says "this public key is `omar`, tenant `kilo`", and it is signed by the account.
+A client never gets a password to connect to NATS. It gets a **`.creds` file** (in memory or on disk), which holds two things:
+* a **user JWT** — public. It says "this public key belongs to `omar`, tenant `kilo`", and it is cryptographically signed by the Account's scoped signing key.
 * a **user seed** — private. The client's own key. It never leaves the device.
 
-The DBA will create an invit token and send it to the client.
+**Step by step:**
 
-Once the client authenticates (any mean, biometric, Google account...), the client will connect to the domain serving the proxied bridge endpoint <https://my-user-bridge:27434/enroll> and send his invit and the NKEY_PUBLIC he generated. ZeBridge will return a JWT that the client will use to connect to NATS.
-
-**Step by step**:
-
-1. **The client makes its own keypair.** `nkeys.createUser()` in the browser, or the equivalent on mobile. It keeps the seed.
-2. **The DBA hands out an invite.** One row in `zebridge_invites`: a code, the principal it will become, and its tenant.
-3. **The client asks the bridge for a JWT.** It sends the invite code and its **public** key only:
-
+1. **App Authentication (Your Backend):** Your web/mobile backend authenticates the user however you prefer (passwords, biometrics, Google OAuth).
+2. **The Invite (Your Backend):** Once authenticated, your backend executes a query to authorize that user's device: `INSERT INTO zebridge_invites (code, tenant_id, expires_at)`. It hands this secure random `code` down to the client.
+3. **The NKey (Edge Client):** The client app locally generates a cryptographic **NKey pair** (a public key and a private seed). *The private seed never leaves the device.*
+4. **The Handshake (Edge Client to ZeBridge):** The client makes an HTTP request to the bridge's endpoint, providing the invite code and its *public* key:
    ```txt
    GET /enroll?code=<invite>&user_pubkey=U...
    ```
+5. **The Minting (ZeBridge):** 
+   * ZeBridge redeems the invite in PostgreSQL (stamps `used_at`) and permanently maps the user identity: `INSERT INTO zebridge_user_tenants (principal, tenant_id)`.
+   * ZeBridge then acts as a **Delegated Signer**. Because you provided it with a NATS Scoped Signing Key via the `ZB_SIGNING_SEED` environment variable, it mints a NATS 2.0 JWT embedding the client's public key, restricts their subjects to their specific `tenant_id`, signs it, and returns `{"jwt":"..."}` to the client.
+6. **The Credential Assembly (Edge Client):** The client app takes the JWT it received from the bridge and combines it with the private seed it already generated in step 3 to create the standard `.creds` file format. (Browser: memory/sessionStorage. Mobile: secure keychain).
+7. **Connection to NATS:** The client connects to NATS presenting this `.creds` format. The NATS server sends a cryptographic challenge (a nonce). The client signs the nonce with its private seed. The NATS server verifies the signature, verifies the JWT was officially signed by the `ZB_SIGNING_SEED`, and grants access. **No secret ever crosses the wire.**
+8. **Expiration:** Minted JWTs live 24 h (`enroll_jwt_ttl_seconds`). After that, the client quietly asks your backend for a new invite code and enrolls again.
 
-4. **The bridge mints it**: in one transaction it redeems the invite (stamps `used_at`, writes the `principal → tenant` row), then signs a user JWT for that public key with the account signing key (`ZB_SIGNING_SEED`). It answers `{"jwt":"..."}` — nothing else.
-5. **The client assembles the creds file** from the JWT it received and the seed it already had. Browser: `sessionStorage`. Mobile: the keychain. Service: a file or a secret mount.
-6. **It connects to NATS**: the NATS server sends a random nonce. The client sends its JWT plus a signature of that nonce made with its seed. The server checks the JWT against the account key it trusts, takes the public key out of the JWT, and verifies the signature. **No secret crosses the wire.**
-7. **It expires.** Minted JWTs live 24 h (`enroll_jwt_ttl_seconds`). After that the client enrolls again.
-
-The consumer boundary is one model for **every** consumer type — webapp, mobile, or microservice.
-
-The JWT and its check are the same everywhere; only the transport (WebSocket for the browser, TLS-TCP for native), where the credential is stored, and the client runtime differ.
-
-The permissions live once on the signing key's template (`mutation.{{name()}}.>`, `cdc.{{tag(tenant)}}.>`); a new consumer is one minted JWT plus one `zebridge_user_tenants` row, no server-config edit.
-
-On the PostgreSQL side, RLS and the tenant guard bound the rows a principal may read and write. See [SECURITY.md](SECURITY.md) for depth.
+The consumer boundary is one model for **every** consumer type — webapp, mobile, or microservice. The JWT and its verification are identical everywhere; only the transport (WebSocket for the browser, TLS-TCP for native) and the credential storage differ.
 
 **Who holds what:**
 
 | who | holds | can |
 | --- | --- | --- |
 | the client | its own seed + its JWT | be itself |
-| ZeBridge | the account signing seed (`ZB_SIGNING_SEED`) | mint JWTs for others |
-| the NATS server | the operator JWT | trust what the account signed |
+| ZeBridge | the account scoped signing seed (`ZB_SIGNING_SEED`) | mint client JWTs for others |
+| the NATS server | the operator JWT + account public key (`ZB_ACCOUNT_PUB`) | trust what the bridge signed |
 
 **Permissions are not in the JWT.** They come from the signing key's role template, which expands `{{name()}}` and `{{tag(tenant)}}` at connect time. That is why the JWT carries `tenant:kilo` as a tag, and why **onboarding a tenant needs no NATS config change**.
 
@@ -579,17 +748,19 @@ ZeBridge projects PostgreSQL onto NATS and never reads its own output back. **Po
 
 **Two sides, two patterns.** Egress (Postgres → NATS) is a **push**: the bridge publishes as changes happen. Bootstrap and ingress (consumer ↔ NATS) are **pull**: the consumer pulls CDC and chain objects at its own pace and pushes its writes on its own subject. The consumer controls replay.
 
-**Seeding: generation chains.** A fresh or fallen-behind consumer needs a starting point: a **generation chain**. The bridge periodically builds a _full_ plus a series of _deltas_ per table, stored as objects with a small manifest in KV. The consumer reads the manifest, applies the full, then only the deltas newer than its watermark — cheap and incremental, so a returning consumer usually just needs the latest delta.
+### Bulk Catch-Up & Edge Optimization (Generations)
 
-A brand-new table has no chain until the next cadence tick; the client waits for it (a bounded wait) instead of asking for a bespoke dump.
+Most sync engines rely on holding massive WAL logs or long CDC queues for disconnected clients. ZeBridge takes a radically different approach optimized for storage, edge bandwidth, and database load: **Short CDC, Long Deltas**.
 
-The manifest's `cutoff_seq` — the CDC stream sequence captured before the build — is the splice point: the consumer lands on it and follows CDC from there.
+**The Flow:**
+1. **Short CDC Stream:** The live JetStream `cdc.*` queue is kept intentionally short (e.g., retaining only the last 15 minutes of events). This prevents NATS from bloating with millions of single-row historical events.
+2. **Generation Chains (The Fallback):** The bridge periodically captures bulk snapshots (**Fulls**) and incremental changes (**Deltas**) per tenant/table, and stores them directly in the NATS Object Store. A tiny JSON Manifest in NATS KV tracks this rolling window.
+3. **Smart Catch-Up:** When a client goes offline and misses the CDC window, it doesn't do a full wipe. The client reads the Manifest, discovers the missing Deltas, and cherry-picks only what it needs. It bulk-upserts these Deltas into local SQLite (vastly outperforming single-row replays) and gracefully resumes tailing the live CDC stream. The manifest's `cutoff_seq` acts as the precise splice point.
 
-**Why generations** (and why there is no snapshot-on-demand):
-
-* **No connection storm on Postgres.** An on-demand dump is served _per request_, one at a time, from Postgres — a fleet reconnecting at once would queue against the database. A generation is built once by a background job (the producer, on a cadence) and pushed to object storage; any number of consumers then pull the same almost-fresh chain from storage, never touching Postgres. The storm hits object storage, which fans out cheaply.
-* **One copy, partitioned — not N dumps.** The chain slices the database by tenant and table, so storage holds a single partitioned copy, not a fresh full dump per consumer request. The data lives once.
-* **CDC stays small.** Because a consumer always seeds from a recent generation and only needs CDC back to the last cutoff, the CDC stream retains at most about two generation windows — bounding its size instead of letting it grow with the offline window.
+**Why this architecture wins:**
+* **No connection storm on Postgres.** An on-demand dump is served _per request_, queued against the database. A generation is built once by a background job and pushed to NATS object storage. A fleet of 10,000 edge clients reconnecting simultaneously hits Object Storage (which fans out cheaply), completely shielding PostgreSQL.
+* **One copy, partitioned.** The chain slices the database by tenant and table, so NATS holds a single partitioned copy of the database, not a fresh full dump per consumer request.
+* **Massive Edge Compression (Zstd Dictionaries):** To optimize edge bandwidth, ZeBridge trains a **Zstd Dictionary** on every Full generation. It then uses this specific dictionary to compress subsequent Deltas in that era. This allows tiny 50-row JSON Deltas to compress at massive ratios (often saving 80%+ bandwidth on mobile networks), saving battery and data for your edge users.
 
 **The message format.** CDC events and chain rows travel as **MessagePack** — compact, type-safe, fast (it keeps the int/float/binary distinctions JSON loses). Schemas travel as JSON in two shapes (PostgreSQL and SQLite), so a client builds its local tables in either. Every write carries a message id, for idempotent at-least-once delivery.
 
@@ -688,10 +859,10 @@ ZeBridge runs in three contexts:
 * **the test suite** runs Postgres and NATS natively on the host — fast to iterate, and driven by the test scenarios. For development only.
 * **the docker compose evaluation** — trying ZeBridge out — is best as a `docker compose` stack: it mimics a production setup: Postgres via TCP, NATS via TCP, NATS-exporter (telemetry), Prometheus (TSDB pulling from ZeBridge), Grafana, bridge_sweeper, ZeBridge and the reverse proxy HAProxy in one file.  so a fresh environment comes up identically every time (fully Infrastructure-as-Code).
 
-  NATS-exporter, Prometheus, Grafana and ZeBridge are behind HAProxy.
-  You can access a prebuilt Grafana dashboard for a nice monitoring.
-  Rate limiting is delegated to the HAProxy.
-  NATS goes through HAProxy so serve consumers over WS (normally over WSS).
+NATS-exporter, Prometheus, Grafana and ZeBridge are behind HAProxy.
+You can access a prebuilt Grafana dashboard for a nice monitoring.
+Rate limiting is delegated to the HAProxy.
+NATS goes through HAProxy so serve consumers over WS (normally over WSS).
 
 * **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for performance, the bridge should sit to the `nats-server` and communicate by _plain text_, over TCP.
 
@@ -1259,6 +1430,7 @@ info(bridge): NATS max_payload: 1024 KB (server-advertised) → CDC per-event bu
 ```
 
 and warns if the two cannot coexist.
+
 Raising `max_payload` in `nats-server.conf` is possible but affects every client and every subject on that server. JetStream's memory use scales with it — so for genuinely large values, prefer **keeping the blob out of the replicated table** and replicating a reference to it (URL object storage).
 
 ---
@@ -1565,8 +1737,7 @@ curl "http://localhost:9090/streams/info?stream=CDC" | jq
 ```
 
 ⚠️ **Known broken** (2026-08-15): this returns
-`500 Failed to get stream info: error.JsonParseError`. The failure is in the vendored
-NATS client's parse of JetStream's `STREAM.INFO` response, not in the endpoint itself.
+`500 Failed to get stream info: error.JsonParseError`. The failure is in the vendored NATS client's parse of JetStream's `STREAM.INFO` response, not in the endpoint itself.
 Use the `nats` CLI meanwhile:
 
 ```bash

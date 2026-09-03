@@ -145,10 +145,7 @@ pub fn main(init: std.process.Init) !void {
     // Pinned, so a naive tombstone column is read as UTC rather than as whatever the
     // server's default zone happens to be. Every writer is required to store UTC (§7.3);
     // this makes the sweeper agree with them instead of with the machine.
-    {
-        const tz = c.PQexec(pg_conn, "SET TIME ZONE 'UTC'");
-        defer c.PQclear(tz);
-    }
+
 
     // ── The sweep set, from the catalogue ───────────────────────────────────────
     //
@@ -242,19 +239,41 @@ pub fn main(init: std.process.Init) !void {
     // And it is still bounded — `zb_sweeper` writing into a tenant outside its mapping is
     // refused exactly as alice is.
     const principal = env.getPosix("SWEEPER_PRINCIPAL") orelse "zb_sweeper";
-    {
-        // Session-level, not `SET LOCAL`: this connection does one thing, and the setting
-        // must survive every sweep. `set_config(..., false)` is the session form.
-        const principal_z = utils.allocPrintZ(allocator, "{s}", .{principal}) catch return;
-        defer allocator.free(principal_z);
-        const params = [_]?[*:0]const u8{principal_z.ptr};
-        const res = c.PQexecParams(pg_conn, "SELECT set_config('zb.principal', $1, false)", 1, null, &params[0], null, null, 0);
-        defer c.PQclear(res);
-        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
-            std.debug.print("FATAL: could not set the sweeper principal: {s}\n", .{c.PQerrorMessage(pg_conn)});
-            return;
+
+    const setup_connection = struct {
+        fn do(a: std.mem.Allocator, conn: *c.PGconn, p: []const u8, swps: []const Sweep, drun: bool) !void {
+            const tz = c.PQexec(conn, "SET TIME ZONE 'UTC'");
+            defer c.PQclear(tz);
+            if (c.PQresultStatus(tz) != c.PGRES_COMMAND_OK) return error.InitFailed;
+            
+            const p_z = try utils.allocPrintZ(a, "{s}", .{p});
+            defer a.free(p_z);
+            const params = [_]?[*:0]const u8{p_z.ptr};
+            const p_res = c.PQexecParams(conn, "SELECT set_config('zb.principal', $1, false)", 1, null, &params[0], null, null, 0);
+            defer c.PQclear(p_res);
+            if (c.PQresultStatus(p_res) != c.PGRES_TUPLES_OK) return error.InitFailed;
+
+            for (swps, 0..) |sw, i| {
+                const stmt_name = try utils.allocPrintZ(a, "gc_sweep_{d}", .{i});
+                defer a.free(stmt_name);
+                const sql = if (drun)
+                    try utils.allocPrintZ(a, "SELECT count(*) FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision);", .{ sw.table, sw.tombstone, sw.tombstone })
+                else
+                    try utils.allocPrintZ(a, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision);", .{ sw.table, sw.tombstone, sw.tombstone });
+                defer a.free(sql);
+                const res = c.PQprepare(conn, stmt_name.ptr, sql.ptr, 1, null);
+                defer c.PQclear(res);
+                if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) return error.PrepareFailed;
+            }
+            const wm_res = c.PQprepare(conn, "gc_watermark_update", "UPDATE public.zebridge_gc_watermark SET watermark = now() - make_interval(secs => $1::double precision), threshold_ms = $2::bigint, reaped = $3::bigint, swept_at = now(), updated_at = now() WHERE id = 1", 3, null);
+            defer c.PQclear(wm_res);
+            if (c.PQresultStatus(wm_res) != c.PGRES_COMMAND_OK) return error.PrepareFailed;
         }
-    }
+    }.do;
+    setup_connection(allocator, pg_conn.?, principal, sweeps.items, dry_run) catch |err| {
+        std.debug.print("FATAL: failed to initialize connection: {any}\n", .{err});
+        return;
+    };
     std.debug.print("GC: acting as principal '{s}'\n", .{principal});
 
     // ⚠️ A tenant nobody mapped to the sweeper is invisible to it, and the symptom is
@@ -266,8 +285,13 @@ pub fn main(init: std.process.Init) !void {
     // them from the DELETE. Measured: the same query returned "0 unmapped tenants" as the
     // sweeper and "1" as the admin. A blind spot cannot survey itself.
     //
-    // So the audit lives where the reach is granted, not where it is used —
-    // `zebridge_audit_publications()`'s neighbour in init.{core,write}.template.sql, run by a DBA:
+    // The GRANT is automatic now: a trigger on `zebridge_user_tenants` maps this
+    // principal to every tenant the moment any principal is mapped to it
+    // (`zebridge_sweeper_autogrant_t`, init.write.template.sql), so a tenant entering
+    // through the normal door — a DBA INSERT or `/enroll` — is never unswept. What the
+    // trigger cannot see is a tenant that exists only as DATA (rows an admin inserted
+    // under a tenant_id nobody is mapped to): no mapping insert, no trigger. For those
+    // the audit remains, where the reach is granted, run by a DBA:
     //
     //     SELECT DISTINCT t.tenant_id FROM <table> t
     //     WHERE NOT EXISTS (SELECT 1 FROM zebridge_user_tenants m
@@ -283,7 +307,12 @@ pub fn main(init: std.process.Init) !void {
                 utils.sleep(5 * std.time.ns_per_s);
                 continue;
             }
-            std.debug.print("Reconnected.\n", .{});
+            setup_connection(allocator, pg_conn.?, principal, sweeps.items, dry_run) catch |err| {
+                std.debug.print("ERROR: failed to initialize reconnected session: {any}\n", .{err});
+                utils.sleep(5 * std.time.ns_per_s);
+                continue;
+            };
+            std.debug.print("Reconnected and initialized.\n", .{});
         }
 
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -292,7 +321,7 @@ pub fn main(init: std.process.Init) !void {
 
         var reaped_this_pass: u64 = 0;
 
-        for (sweeps.items) |sw| {
+        for (sweeps.items, 0..) |sw, i| {
             // The cutoff is computed by PostgreSQL, not here: `now()` on the server is the
             // only clock both sides agree on, and a sweeper whose host clock has drifted
             // would otherwise reap tombstones early — which is exactly the window a client
@@ -308,25 +337,10 @@ pub fn main(init: std.process.Init) !void {
             // `GC_DRY_RUN=1` counts instead of deleting. There is no undo on this path, so
             // the only safe way to change a threshold on a live database is to see what the
             // new one would take first.
-            const sql = if (dry_run)
-                try utils.allocPrintZ(
-                    aa,
-                    "SELECT count(*) FROM \"{s}\" WHERE \"{s}\" IS NOT NULL" ++
-                        " AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision);",
-                    .{ sw.table, sw.tombstone, sw.tombstone },
-                )
-            else
-                try utils.allocPrintZ(
-                    aa,
-                    "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL" ++
-                        " AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision);",
-                    .{ sw.table, sw.tombstone, sw.tombstone },
-                );
-
+            const stmt_name = try utils.allocPrintZ(aa, "gc_sweep_{d}", .{i});
             const secs = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
             const param_vals = [_]?[*:0]const u8{secs.ptr};
-
-            const res = c.PQexecParams(pg_conn, sql.ptr, 1, null, &param_vals[0], null, null, 0);
+            const res = c.PQexecPrepared(pg_conn, stmt_name.ptr, 1, &param_vals[0], null, null, 0);
             defer c.PQclear(res);
 
             if (dry_run) {
@@ -382,22 +396,7 @@ pub fn main(init: std.process.Init) !void {
             const wm_reaped = try utils.allocPrintZ(aa, "{d}", .{reaped_this_pass});
             const wm_params = [_]?[*:0]const u8{ wm_secs.ptr, wm_ms.ptr, wm_reaped.ptr };
 
-            const wm_res = c.PQexecParams(
-                pg_conn,
-                "UPDATE public.zebridge_gc_watermark SET" ++
-                    " watermark = now() - make_interval(secs => $1::double precision)," ++
-                    " threshold_ms = $2::bigint," ++
-                    " reaped = $3::bigint," ++
-                    " swept_at = now()," ++
-                    " updated_at = now()" ++
-                    " WHERE id = 1",
-                3,
-                null,
-                &wm_params[0],
-                null,
-                null,
-                0,
-            );
+            const wm_res = c.PQexecPrepared(pg_conn, "gc_watermark_update", 3, &wm_params[0], null, null, 0);
             defer c.PQclear(wm_res);
 
             if (c.PQresultStatus(wm_res) != c.PGRES_COMMAND_OK) {

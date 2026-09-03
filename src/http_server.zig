@@ -476,7 +476,9 @@ pub const Server = struct {
                 \\  "max_rss_mb": {d},
                 \\  "queue_usage_percent": {d},
                 \\  "refused_tables": {d},
-                \\  "refused_events_dropped": {d}
+                \\  "refused_events_dropped": {d},
+                \\  "gc_total_reaped": {d},
+                \\  "gc_last_sweep_time": {d}
                 \\}}
             , .{
                 if (snap.is_connected) "connected" else "disconnected",
@@ -497,6 +499,8 @@ pub const Server = struct {
                 snap.queue_usage_percent,
                 if (self.refused) |r| r.refused_count.load(.acquire) else 0,
                 if (self.refused) |r| r.dropped_total.load(.acquire) else 0,
+                snap.gc_total_reaped,
+                snap.gc_last_sweep_time,
             });
 
             try respond(req, .ok, "application/json", body);
@@ -543,6 +547,14 @@ pub const Server = struct {
                 \\# HELP bridge_schema_events_published_total SCHEMA/KV events published to NATS (DDL schemas, suspensions, drop tombstones) - kept out of the CDC counter so that one stays equal to row events
                 \\# TYPE bridge_schema_events_published_total counter
                 \\bridge_schema_events_published_total {d}
+                \\
+                \\# HELP bridge_gc_total_reaped_total Total soft-deleted rows reaped by the sweeper
+                \\# TYPE bridge_gc_total_reaped_total counter
+                \\bridge_gc_total_reaped_total {d}
+                \\
+                \\# HELP bridge_gc_last_sweep_timestamp_seconds Unix timestamp of the last sweep
+                \\# TYPE bridge_gc_last_sweep_timestamp_seconds gauge
+                \\bridge_gc_last_sweep_timestamp_seconds {d}
                 \\
                 \\# HELP bridge_last_ack_lsn Last acknowledged LSN position
                 \\# TYPE bridge_last_ack_lsn gauge
@@ -597,6 +609,8 @@ pub const Server = struct {
                 snap.wal_messages_received,
                 snap.cdc_events_published,
                 snap.schema_events_published,
+                snap.gc_total_reaped,
+                snap.gc_last_sweep_time,
                 snap.last_ack_lsn,
                 if (snap.is_connected) @as(u8, 1) else @as(u8, 0),
                 snap.reconnect_count,
