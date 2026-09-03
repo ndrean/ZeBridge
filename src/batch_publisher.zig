@@ -469,6 +469,10 @@ pub const BatchPublisher = struct {
     wake_read_fd: std.c.fd_t,
     wake_write_fd: std.c.fd_t,
     wake_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// True while the flush thread holds popped-but-unconfirmed events. `len()` alone
+    /// cannot see them — they left the queue — and the keepalive fast-ack below must
+    /// not fire while any exist (see isDrained).
+    draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Backing allocator for one flush's worth of encoding work: the msgpack/JSON value
     // trees built in publishSubjectGroup and the byte buffers doPublish/publishSubjectGroup
@@ -769,6 +773,15 @@ pub const BatchPublisher = struct {
         return self.pending_events.len();
     }
 
+    /// Nothing queued AND nothing popped-but-unconfirmed: every event this publisher
+    /// ever received is either PubAck'd (confirmed LSN advanced) or was never handed
+    /// over. The one caller is the keepalive fast-ack — PostgreSQL's shutdown waits
+    /// for the client to confirm the walsender's send position, and this is the proof
+    /// it is safe to.
+    pub fn isDrained(self: *BatchPublisher) bool {
+        return self.pending_events.len() == 0 and !self.draining.load(.acquire);
+    }
+
     /// Background thread that continuously drains events from lock-free queue and flushes to NATS
     fn flushLoop(self: *BatchPublisher) void {
         log.info("ℹ️ Lock-free flush thread started", .{});
@@ -818,6 +831,7 @@ pub const BatchPublisher = struct {
             const reason_max_payload = current_payload_size >= self.config.max_payload_bytes;
             const reason_timeout = time_elapsed >= self.config.max_wait_ms;
 
+            if (batch.items.len > 0) self.draining.store(true, .release);
             const should_flush = batch.items.len > 0 and (force or reason_max_events or reason_max_payload or reason_timeout);
 
             if (should_flush) {
@@ -1210,6 +1224,7 @@ pub const BatchPublisher = struct {
                 // SUCCESS - Update LSN and return slots to free queue
                 self.updateConfirmedLsn(batch.items);
                 batch.clearRetainingCapacity();
+                self.draining.store(false, .release);
 
                 // Log flush timing if it took longer than expected
                 const flush_elapsed = utils.getMilliTimestamp() - flush_start;

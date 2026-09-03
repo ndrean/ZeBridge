@@ -1,0 +1,39 @@
+Quiet the DELIBERATE close: close()'s "Closing connection" and the loop's no-error
+"Disconnected" drop to debug — NATS_ZIG_NOTES.md entry 5. (The middle hunk of the
+connection.zig working diff is entry 2's UNSUB fix, in nats.zig-connection.patch.)
+
+diff --git a/src/connection.zig b/src/connection.zig
+index 89ff6ca..310c2b8 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -796,9 +796,14 @@ pub const Connection = struct {
+     pub fn close(self: *Self) void {
+         var callback: @TypeOf(self.options.callbacks.closed_cb) = null;
+         defer if (callback) |cb| cb(self);
+ 
+-        log.info("Closing connection", .{});
++        // Debug, not info: this is the DELIBERATE close (the bridge's generation
++        // producer opens a fresh connection per tick and closes it on the way out), and
++        // at info the pair "Closing connection / Disconnected" reads like an incident
++        // every cadence. A real drop logs "Connection failed: {err}" and the reconnect
++        // machinery speaks at warn.
++        log.debug("Closing connection", .{});
+ 
+         self.mutex.lockUncancelable(self.io);
+         if (self.status == .closed) {
+             self.mutex.unlock(self.io);
+@@ -1409,9 +1423,12 @@ pub const Connection = struct {
+ 
+                 if (conn_err) |err| {
+                     log.info("Connection failed: {}", .{err});
+                 } else {
+-                    log.info("Disconnected", .{});
++                    // Debug for the same reason as close(): no error means this end hung
++                    // up on purpose. An unexpected server-side EOF lands here too, but
++                    // the reconnect path announces itself immediately after at warn.
++                    log.debug("Disconnected", .{});
+                 }
+ 
+                 // close() claims the terminal state before canceling the
+                 // manager. Never let a concurrently finishing connection
+

@@ -195,6 +195,50 @@ and an empty `messages` slice looks like a normal idle result.
 
 ---
 
+## 5. The deliberate close logged like an incident
+
+**How it appeared**
+
+Every generation-producer tick — the producer opens a fresh connection per tick and
+closes it on the way out — the bridge log gained:
+
+```
+info(nats): Closing connection
+info(nats): Disconnected
+```
+
+Reported from review: an operator saw the pair recurring, cross-checked
+`nats_reconnects=0` on /status, and reasonably asked whether NATS was reconnecting
+silently or the counter was broken. Neither — the counter was right and nothing was
+wrong, which is exactly the problem: a routine, caller-initiated close should not read
+as a connection event worth investigating.
+
+**Cause**
+
+`Connection.close()` logs "Closing connection" at info, and the connection loop's exit
+logs "Disconnected" at info whenever it ends without an error — including after a
+deliberate `close()`. Both lines are about an event the CALLER caused.
+
+**Change**
+
+`src/connection.zig` — both lines drop to `debug`. Real failures keep their voice:
+an unexpected drop logs `Connection failed: {err}` (still info, inside the same exit
+path but only when an error is present) and the reconnect machinery reports at warn.
+A server-initiated clean EOF also lands on the quieted line, but the reconnect path
+announces itself immediately after, so the signal is not lost.
+
+`nats.zig-quiet-deliberate-close.patch` (hunks 1 and 3 of the connection.zig diff; the
+middle hunk is entry 2's).
+
+**Verified**
+
+```bash
+cd nats.zig && zig build test        # 132 + 183 tests pass
+# live bridge, 65s at LOG_LEVEL=info: 0 occurrences of the pair (was 2 per cadence tick)
+```
+
+---
+
 ## 4. Submodule bumped to upstream `d4cd40d` (2026-08-24)
 
 `b3684bd` ("Retry JetStream publishes on no responders", #148) → `d4cd40d`

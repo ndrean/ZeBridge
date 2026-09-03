@@ -81,6 +81,9 @@ listed and never run by it — those report, they do not assert.
 | a stream at `max_bytes` refusing publishes: retry budget burns, the bridge stops itself (really — the zombie it used to leave is §10bu), the slot retains, a restart after repair loses nothing | `stream_full.py` |
 | BASE_BUF lowered under stored data: the shrink-gated scan (§10bx) warns at boot, names the table, and stays silent on every non-shrinking boot | `shrink.py` |
 | `bridge --diagnose` says everything the boot would decide and changes nothing: exit 0/1, init presence the headline, minimum BASE_BUF computed, shrink a finding | `diagnose.py` |
+| two bridges on one slot: the loser refuses in its own words within seconds, no fight, no half-start — and `leaks` reads 0 bytes on the refusal path | `slot_contest.py` |
+| a CDC stream deleted wholesale under a live client: deliberate stop, boot recreates, slot replays, client resets to the fresh numbering and converges | `stream_wipe.py` |
+| PostgreSQL stopped and restarted under the bridge: refused connections waited out (connected=0 on /metrics), self-reconnect, durable slot, no loss — and `pg_ctl stop` completes in ~1 s, not wal_sender_timeout | `pg_restart.py` |
 | a row written outside the client is in its replica in single-digit ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
 | a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished | `suspension_lift.py` |

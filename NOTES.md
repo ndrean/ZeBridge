@@ -8093,6 +8093,111 @@ Under --diagnose the HTTP thread is never started either. `diagnose.py` (live) p
 the contract: exit 0 healthy, exit 1 with the shrink named under BASE_BUF=11, and slot
 count + zebridge_limits byte-identical after both runs.
 
+## 10bz. Two bridges, one slot — and what `leaks` found on the way (2026-09-03)
+
+Chaos item 6, run with the memory audit on. The operator mistake is trivially easy — an
+overlapping deploy, a stray terminal, a second unit file — and before this the second
+bridge got PostgreSQL's generic "replication slot … is active for PID n" at
+START_REPLICATION, after its HTTP thread was already up.
+
+**The refusal is deliberate now, in three layers:**
+- `refuseHeldSlot` at boot, beside `refuseLostSlot`: a slot active under another PID is
+  refused in our own words — "HELD by another bridge (PID n) — one bridge per slot" —
+  before anything starts. With a SHORT GRACE (5×2 s re-checks) first: right after a
+  crash-restart the slot can appear held by our OWN dead walsender until PostgreSQL
+  reaps it, and downtime.py's rapid kill→restart cycles ride exactly that window.
+- START_REPLICATION's "is active for PID" maps to `error.SlotHeldByAnother` — the race
+  where a peer claims the slot between the check and the claim.
+- The reconnect loop tolerates a bounded streak of those (six, same reap-latency logic)
+  and then declares itself SUPERSEDED and exits — with the global `should_stop`,
+  because §10bu taught what a fatal without that flag leaves behind.
+
+`slot_contest.py` (owns) proves the shape: the loser exits within seconds, names the
+conflict, logs ZERO START_REPLICATION attempts, registers no budget row (the §10by boot
+order guarantees registration follows the slot claim), and the holder streams straight
+through the contest. The guard also caught its first stray before the scenario ever
+passed: a probe bridge orphaned by a timeout-killed test run was holding zb_probe, and
+the next boot refused it by name.
+
+**The `leaks` verdict: our refusal path leaks NOTHING.** The first run reported 4 leaks
+/ 176 bytes — all four stacks in libpq's Kerberos probe (`pg_GSS_have_cred_cache` →
+`krb5int_setspecific`), thread-local state krb5 parks on every PQconnectdb and never
+frees. `PGGSSENCMODE=disable` in the scenario removes the probe and the report reads 0
+leaked bytes, loser and holder both. Two test-mechanics notes: under `leaks --atExit --`
+the exit code is LEAKS' verdict (0 = clean), not the wrapped program's — an assertion
+on rc != 0 failed a run precisely because it did not leak; and a scenario killed by
+`timeout` dies past its context managers, so its probe bridge outlives it (the refusal
+caught it — but cleanups must not rely on Python living).
+
+## 10ca. A stream deleted wholesale: the third gap shape from the NATS side (2026-09-03)
+
+Chaos item 4. `slot_loss.py` reaches the "feed restarted" gap shape by dropping the
+SLOT; this deletes the STREAM under a live client instead — no data-loss window at all,
+since the slot survives, so the only wrong outcome is silent divergence.
+
+`stream_wipe.py` (owns) chains three proven behaviours end to end: the deleted stream
+refuses every publish → retry budget → the §10bu deliberate stop (second refusal shape:
+missing stream, not full stream) with the slot retaining 12 unacked rows → restart →
+boot reconciliation recreates the stream, EMPTY, numbering restarted → the slot replays
+the whole gap into it → the returning client's position is beyond the new tail → third
+gap shape, position reset (6 → 2 on fresh numbering), re-seed from the chain, tail from
+the start → all 13 rows, nothing lost, nothing phantom.
+
+**First run crashed the CLIENT — a double free in our own shared-inbox patch.**
+`PullInbox.fetch`'s all-consumers-gone path did an explicit `free(gone)` before
+`return error.NoResponders`, and the allocation's `errdefer` freed it again on that
+same return. Firing it needs EVERY consumer on the inbox to answer terminally-gone in
+one fetch — exactly what a deleted stream produces and nothing else in the suite ever
+had (libzb poll → SIGTRAP in malloc, found via the macOS crash report's triggered
+thread). One line: drop the explicit free, the errdefer owns the exit. The patch file
+and ledger updated; nats.zig 132+183 green.
+
+## 10cb. PostgreSQL stop → start: the bridge held the cluster's shutdown hostage (2026-09-03)
+
+Chaos item 5 — predicted "most common operationally, most likely to already work". It
+found three product defects, one of them embarrassing in production terms: **`pg_ctl
+stop -m fast` hung until `wal_sender_timeout` (300 s here) whenever the bridge was
+attached, and completed the instant the bridge was killed.** On a real host that means
+reboots stall until init loses patience and SIGKILLs postgres — a crash-recovery
+restart, caused by us.
+
+**Why.** A fast shutdown asks each walsender to finish; a logical walsender first waits
+for the CLIENT to confirm its send position, then sends CopyDone and waits for the
+client's CopyDone before exiting. The bridge failed both waits:
+- its keepalive replies confirmed only `last_ack_lsn` — the last PubAck'd commit — and
+  bookkeeping WAL keeps `wal_end` ahead of that forever on a quiet system. Worse, the
+  periodic keepalive of a bridge that had published nothing reported **LSN 0**:
+  "I have confirmed nothing", waited on indefinitely;
+- `PQgetCopyData == -1` (the server's CopyDone) was logged and abandoned — the answering
+  `PQputCopyEnd` was never sent.
+
+**The fix, three parts (wal_stream.zig, bridge.zig, batch_publisher.zig):**
+- a **drained fast-ack**: when nothing is queued, nothing is popped-but-unconfirmed
+  (`BatchPublisher.isDrained()`, a new `draining` flag — `len()` cannot see the flush
+  thread's in-flight batch) and no transaction is open (`tx_slots_count == 0`), a
+  keepalive that advances `wal_end` is confirmed IMMEDIATELY on receipt — not on the
+  30 s timer, and regardless of `reply_requested` (a shutting-down walsender sends
+  reply_requested=false). Safe by the slot's own semantics: logical decoding replays
+  whole transactions by COMMIT position, and with the pipeline drained everything
+  between our last commit and `wal_end` is WAL we would never publish;
+- the CopyDone answer: `PQputCopyEnd` + drain results, then into the reconnect loop;
+- and the crash the scenario found on its second run: every `sendStatusUpdate` in the
+  main loop was a `try`, so the periodic timer firing mid-outage killed the bridge
+  with error.NotConnected — pre-existing, reachable any time a disconnection outlives
+  30 s. All five sites now treat NotConnected as "the next tick's job".
+
+Measured: stop-with-bridge-attached went from 300 s (timeout) to **1 s**.
+
+**`pg_restart.py`** (owns, controls the cluster itself) pins the contract: 12 s of
+REFUSED connections (a different client path from chaos.py's backend kills) with the
+bridge alive and `/metrics` honestly answering connected=0; self-reconnect when the
+postmaster returns (pg_reconnects ticks); the slot durable across the restart — same
+feed, same numbering, no client gap; and the pre-outage row plus five post-restart rows
+converging with no re-seed. Its own hard lesson: `wal_level=logical` lives ONLY on
+up.sh's command line, so a flagless `pg_ctl start` REFUSES to boot a cluster that has
+logical slots — the first run left the whole environment down. The scenario now carries
+up.sh's exact flags and an unconditional, retrying `ensure_pg_up` in its finally.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

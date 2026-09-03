@@ -1324,6 +1324,11 @@ pub fn main(init: std.process.Init) !void {
     var cdc_events: u32 = 0;
     var last_lsn: u64 = 0;
     var last_ack_lsn: u64 = 0; // Track last acknowledged LSN for keepalives
+    // Consecutive reconnect attempts that found the slot held by a peer (see below).
+    var held_streak: usize = 0;
+    // The newest `wal_end` any primary keepalive carried. When the pipeline is fully
+    // drained this IS the position to confirm — see the keepalive fast-ack below.
+    var latest_wal_end: u64 = 0;
     var last_keepalive_time = present; // Track last keepalive sent
 
     // Status update batching to reduce PostgreSQL round trips
@@ -1435,7 +1440,14 @@ pub fn main(init: std.process.Init) !void {
         if (now_ms - last_status_update_time >= status_update_interval_ms) {
             const confirmed_lsn = batch_pub.getLastConfirmedLsn();
             if (confirmed_lsn > last_ack_lsn) {
-                try pg_stream.sendStatusUpdate(confirmed_lsn);
+                // Soft during an outage: the periodic timer keeps firing while the stream is
+                // down, and a `try` here killed the bridge mid-outage with error.NotConnected
+                // (pg_restart.py, 2026-09-03) — the reconnect loop owns recovery, an unsent
+                // status is just the next tick's job.
+                pg_stream.sendStatusUpdate(confirmed_lsn) catch |e| switch (e) {
+                    error.NotConnected => {},
+                    else => return e,
+                };
                 log.debug("✓ ACKed to PostgreSQL: LSN {x} (time-based)", .{confirmed_lsn});
                 last_ack_lsn = confirmed_lsn;
                 bytes_since_ack = 0;
@@ -1457,7 +1469,26 @@ pub fn main(init: std.process.Init) !void {
         // transaction — sent no heartbeat at all, which is exactly when it most needs to
         // say it is alive.
         if (now_s - last_keepalive_time >= keepalive_interval_seconds) {
-            try pg_stream.sendStatusUpdate(last_ack_lsn);
+            // ⚠️ Same drained fast-ack as the reply path — and it is THIS sender that
+            // releases a shutting-down walsender, whose keepalives arrive with
+            // reply_requested=false. Reporting a stale (or zero) flush position here
+            // told PostgreSQL "I have confirmed nothing", and its fast shutdown waits
+            // for the client to confirm the send position before the walsender may
+            // exit: `pg_ctl stop` hung to wal_sender_timeout with the bridge attached
+            // and completed the instant the bridge was killed (2026-09-03,
+            // pg_restart.py). Drained + no open transaction makes the confirmation
+            // safe: logical slots replay whole transactions by COMMIT position.
+            if (tx_slots_count == 0 and batch_pub.isDrained() and latest_wal_end > last_ack_lsn) {
+                last_ack_lsn = latest_wal_end;
+            }
+            // Soft during an outage: the periodic timer keeps firing while the stream is
+            // down, and a `try` here killed the bridge mid-outage with error.NotConnected
+            // (pg_restart.py, 2026-09-03) — the reconnect loop owns recovery, an unsent
+            // status is just the next tick's job.
+            pg_stream.sendStatusUpdate(last_ack_lsn) catch |e| switch (e) {
+                error.NotConnected => {},
+                else => return e,
+            };
             last_keepalive_time = now_s;
             log.debug("Sent keepalive (LSN: {x})", .{last_ack_lsn});
         }
@@ -1542,10 +1573,54 @@ pub fn main(init: std.process.Init) !void {
 
                 // Handle keepalive messages - reply immediately if requested
                 if (wal_msg.type == .keepalive) {
+                    if (wal_msg.wal_end > latest_wal_end) latest_wal_end = wal_msg.wal_end;
+                    // Confirm an advancing position IMMEDIATELY when drained, not on the
+                    // 30 s periodic timer: a fast shutdown's walsender sends keepalives
+                    // (reply_requested=false) and waits for the client's confirmation to
+                    // reach its send position before it may exit — every second we sit
+                    // on it is a second of `pg_ctl stop` hanging.
+                    if (tx_slots_count == 0 and batch_pub.isDrained() and latest_wal_end > last_ack_lsn) {
+                        last_ack_lsn = latest_wal_end;
+                        // Soft during an outage: the periodic timer keeps firing while the stream is
+                        // down, and a `try` here killed the bridge mid-outage with error.NotConnected
+                        // (pg_restart.py, 2026-09-03) — the reconnect loop owns recovery, an unsent
+                        // status is just the next tick's job.
+                        pg_stream.sendStatusUpdate(last_ack_lsn) catch |e| switch (e) {
+                            error.NotConnected => {},
+                            else => return e,
+                        };
+                        last_keepalive_time = @as(i64, @intCast(c.time(null)));
+                        log.debug("Confirmed drained position on keepalive (LSN: {x})", .{last_ack_lsn});
+                    }
                     if (wal_msg.reply_requested) {
-                        // PostgreSQL is requesting a reply - send status update immediately
-                        const reply_lsn = if (last_ack_lsn > 0) last_ack_lsn else wal_msg.wal_end;
-                        try pg_stream.sendStatusUpdate(reply_lsn);
+                        // ⚠️ When the pipeline is DRAINED, confirm the walsender's own
+                        // position (wal_end), not just our last published commit. The
+                        // conservative reply held PostgreSQL's fast shutdown hostage:
+                        // the walsender waits for the client to confirm its send
+                        // position before it will exit, bookkeeping WAL keeps wal_end
+                        // ahead of the last CDC commit forever, so `pg_ctl stop` sat
+                        // until wal_sender_timeout (300 s) and reported "server does
+                        // not shut down" — killing the bridge released it instantly
+                        // (measured 2026-09-03, found by pg_restart.py).
+                        //
+                        // Safe by the slot's own semantics: logical decoding replays
+                        // whole TRANSACTIONS whose commit is past confirmed_flush.
+                        // With nothing queued, nothing in flight and no transaction
+                        // open (tx_slots_count == 0), everything between our last
+                        // commit and wal_end is WAL we would never publish.
+                        const drained = tx_slots_count == 0 and batch_pub.isDrained();
+                        const reply_lsn = if (drained and wal_msg.wal_end > last_ack_lsn) blk: {
+                            last_ack_lsn = wal_msg.wal_end;
+                            break :blk wal_msg.wal_end;
+                        } else if (last_ack_lsn > 0) last_ack_lsn else wal_msg.wal_end;
+                        // Soft during an outage: the periodic timer keeps firing while the stream is
+                        // down, and a `try` here killed the bridge mid-outage with error.NotConnected
+                        // (pg_restart.py, 2026-09-03) — the reconnect loop owns recovery, an unsent
+                        // status is just the next tick's job.
+                        pg_stream.sendStatusUpdate(reply_lsn) catch |e| switch (e) {
+                            error.NotConnected => {},
+                            else => return e,
+                        };
                         last_keepalive_time = @as(i64, @intCast(c.time(null)));
                         log.debug("Replied to keepalive request (LSN: {x})", .{reply_lsn});
                     }
@@ -1871,7 +1946,14 @@ pub fn main(init: std.process.Init) !void {
                     // Only read atomic LSN when we're about to ACK
                     const confirmed_lsn = batch_pub.getLastConfirmedLsn();
                     if (confirmed_lsn > last_ack_lsn) {
-                        try pg_stream.sendStatusUpdate(confirmed_lsn);
+                        // Soft during an outage: the periodic timer keeps firing while the stream is
+                        // down, and a `try` here killed the bridge mid-outage with error.NotConnected
+                        // (pg_restart.py, 2026-09-03) — the reconnect loop owns recovery, an unsent
+                        // status is just the next tick's job.
+                        pg_stream.sendStatusUpdate(confirmed_lsn) catch |e| switch (e) {
+                            error.NotConnected => {},
+                            else => return e,
+                        };
                         log.debug("✓ ACKed to PostgreSQL: LSN {x} (NATS confirmed, {d} bytes)", .{ confirmed_lsn, bytes_since_ack });
                         last_ack_lsn = confirmed_lsn;
                         bytes_since_ack = 0;
@@ -1956,10 +2038,24 @@ pub fn main(init: std.process.Init) !void {
             // exactly when the walsender was severed (Finding 1's territory), the
             // moment changes are most likely to be in flight.
             pg_stream.startStreaming() catch |stream_err| {
+                // A HELD slot is not a transient. A few retries cover PostgreSQL
+                // reaping our own severed walsender; past that, another live bridge
+                // owns the identity and this one is superseded — exit (with the
+                // global flag, §10bu's lesson) rather than fight at reconnect
+                // cadence forever. Everything else stays a retry.
+                if (stream_err == error.SlotHeldByAnother) {
+                    held_streak += 1;
+                    if (held_streak >= 6) {
+                        log.err("🔴 FATAL: the slot is still held by another bridge after {d} reconnect attempts — superseded, shutting down.", .{held_streak});
+                        should_stop.store(true, .seq_cst);
+                        break;
+                    }
+                } else held_streak = 0;
                 log.err("Failed to restart streaming: {}", .{stream_err});
                 utils.sleep(Config.Retry.pg_reconnect_delay_seconds * std.time.ns_per_s);
                 continue;
             };
+            held_streak = 0;
 
             log.info("✓ Reconnected to WAL stream, resumed from the slot's confirmed position", .{});
             metrics.recordReconnect();

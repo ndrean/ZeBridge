@@ -90,6 +90,9 @@ GROUPS = {
         "chaos":         ("bridge", "broker kill, backend kill, socket exhaustion"),
         "nats_outage":   ("bridge", "broker down past the retry budget: bridge stops, resumes, nothing lost"),
         "slot_loss":     ("bridge", "slot invalidated: refused at boot, recovered as a new feed, clients re-seed"),
+        "slot_contest":  ("bridge", "two bridges, one slot: the loser refuses cleanly and leaks nothing"),
+        "stream_wipe":   ("bridge", "a CDC stream deleted wholesale: bridge stops, boot recreates, client resets and converges"),
+        "pg_restart":    ("bridge", "PostgreSQL stopped and restarted: patient retry, resume from the slot, no loss"),
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),

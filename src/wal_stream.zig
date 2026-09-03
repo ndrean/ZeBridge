@@ -97,7 +97,17 @@ pub const ReplicationStream = struct {
 
         const status = c.PQresultStatus(result);
         if (status != c.PGRES_COPY_BOTH) {
-            const err_msg = c.PQerrorMessage(self.conn);
+            const err_msg = std.mem.span(c.PQerrorMessage(self.conn));
+            // The boot pre-check (refuseHeldSlot) catches a held slot before anything
+            // starts; this covers the RACE — a peer that claimed the slot between that
+            // check and here, or during a mid-run reconnect. Distinguished because the
+            // answer differs: a held slot is not a transient, and retrying it means two
+            // bridges fighting at reconnect cadence forever.
+            if (std.mem.indexOf(u8, err_msg, "is active for PID") != null) {
+                log.err("🔴 FATAL: replication slot is HELD by another bridge — {s}", .{err_msg});
+                log.err("   One bridge per slot: stop the other instance, or give this one its own slot (--slot).", .{});
+                return error.SlotHeldByAnother;
+            }
             log.err("🔴 START_REPLICATION failed: {s}", .{err_msg});
             log.err("🔴 Expected COPY_BOTH mode, got status: {d}", .{status});
             return error.StartReplicationFailed;
@@ -163,8 +173,20 @@ pub const ReplicationStream = struct {
             self.needs_input = true;
             return null;
         } else if (result == -1) {
-            // End of copy stream
-            log.info("⚠️ Replication stream ended", .{});
+            // The walsender sent CopyDone — this is PostgreSQL SHUTTING DOWN (a fast
+            // shutdown asks every walsender to finish, and the walsender then WAITS for
+            // the client's own CopyDone before it exits). Not answering held the entire
+            // cluster's shutdown hostage for wal_sender_timeout (300 s here): pg_ctl
+            // reported "server does not shut down", and killing the bridge released it
+            // instantly (measured 2026-09-03, found by pg_restart.py). Answer, drain the
+            // command results, and let the reconnect loop wait out the restart.
+            log.info("⚠️ Replication stream ended by the server (CopyDone) — PostgreSQL is shutting down; acknowledging so it can", .{});
+            _ = c.PQputCopyEnd(self.conn, null);
+            while (true) {
+                const res = c.PQgetResult(self.conn);
+                if (res == null) break;
+                c.PQclear(res);
+            }
             return error.StreamEnded;
         } else {
             // Error (-2)

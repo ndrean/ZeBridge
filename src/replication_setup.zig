@@ -73,6 +73,39 @@ pub const ReplicationSetup = struct {
     /// row stays, so "exists" alone would let START_REPLICATION fail and the reconnect
     /// loop retry a dead slot every two seconds forever (found by
     /// scripts/scenarios/slot_loss.py, 2026-08-29). Say what happened and how to recover.
+    /// Refuse a slot another bridge is STREAMING FROM, before touching anything.
+    /// One bridge per slot is the identity model; PostgreSQL enforces it anyway
+    /// ("replication slot … is active for PID n"), but its refusal arrives at
+    /// START_REPLICATION with a generic error, after this boot has already spun up
+    /// its HTTP thread — and the operator mistake behind it (an overlapping deploy,
+    /// a stray terminal, a second unit file) deserves its own words, not a fight.
+    fn refuseHeldSlot(self: *const ReplicationSetup, conn: *c.PGconn, slot_name: []const u8) !void {
+        const q = try utils.allocPrintZ(self.allocator,
+            "SELECT active_pid::text FROM pg_replication_slots WHERE slot_name = '{s}' AND active",
+            .{slot_name});
+        defer self.allocator.free(q);
+        // ⚠️ A short grace before refusing: right after a crash-restart, the slot can
+        // appear held by OUR OWN dead walsender for the moment it takes PostgreSQL to
+        // notice the socket died. A genuine peer is still holding it after the grace;
+        // a corpse is not. (downtime.py's rapid kill→restart cycles ride this.)
+        var attempt: usize = 0;
+        while (attempt < 5) : (attempt += 1) {
+            const res = runQuery(conn, q) catch return;
+            defer c.PQclear(res);
+            if (c.PQntuples(res) == 0) return;
+            if (attempt == 0) {
+                log.warn("⚠️ replication slot '{s}' is currently active (PID {s}) — re-checking, in case that is our own just-severed walsender…", .{ slot_name, std.mem.span(c.PQgetvalue(res, 0, 0)) });
+            }
+            utils.sleep(2 * std.time.ns_per_s);
+        }
+        const res = runQuery(conn, q) catch return;
+        defer c.PQclear(res);
+        if (c.PQntuples(res) == 0) return;
+        const pid = std.mem.span(c.PQgetvalue(res, 0, 0));
+        log.err("🔴 FATAL: replication slot '{s}' is HELD by another bridge (PostgreSQL backend PID {s}) — one bridge per slot. Refusing to fight over it: stop the other instance, or give this one its own slot (--slot).", .{ slot_name, pid });
+        return error.SlotHeldByAnother;
+    }
+
     fn refuseLostSlot(self: *const ReplicationSetup, conn: *c.PGconn, slot_name: []const u8) !void {
         const q = try utils.allocPrintZ(self.allocator,
             "SELECT wal_status, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) " ++
@@ -118,6 +151,7 @@ pub const ReplicationSetup = struct {
         const exists = c.PQntuples(check_result) > 0;
 
         if (exists) {
+            try self.refuseHeldSlot(conn, slot_name);
             try self.refuseLostSlot(conn, slot_name);
             log.info("✅ Replication slot '{s}' already exists", .{slot_name});
             return false;

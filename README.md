@@ -62,12 +62,14 @@ flowchart LR
 
 **Opinionated**: ZeBridge makes deliberate structural decisions to maximize performance and predictability, rather than offering endless configuration options:
 
+* **Diagnose**: ZeBridge CLI proposes a `--diagnose` tool to run after having installed the triggers and functions needed by ZB inot Postgres. It will detect gaps in the database. 
 * **Strict Memory Boundaries:** Because ZB uses a fixed pre-allocated buffer, its memory footprint must be defined at runtime.  Overflows are detected, rolled back and the table is quarantined. To prevent misuse, the size of every data entry is strictly validated-wether originated from a consumer write, or directly loaded within Postgres, or after a schema migration.
 * **Opinionated Conflict Resolution (LWW)**: if client-side writes are enabled (`writable => true`), ZB version makes decisions for you that other sync engines leave you to : it enforces a Last-Write-Win (LWW) strategy server-side. Furthermore, the client uses a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
 This imposes constraints -mostly mechanical- on the database schemas but buys guarantees.
 * **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** route through the `libzb` library to ensure tracking. Enforcement depends upon the local engine.
 * **Tenant isolation**: we enforce a strict tenant model in PG: every principal -consumer- operates within a designated tenant boundary. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
 * **Detla-chain** generation: a snapshot of a table is not on-demand nor a full table per tenant. This would crush Postgres if thousands of consumers connect. Instead, a "generation" thread produces full/deltas in a time window with a max chain length and these are dictionary based Zstd compressed and pushed into NATS. The client library cherry picks whatever its needs on connection, and complements with the few remaining CDCs up to its watermark.
+* **Suspended table**: ZeBridge quarantines a table when criterias are not met. See [Suspended table](#suspended-table)
 
 **Configuration**: once the database is migrate - you are expected to `zb_enable()`the tables you want to follow in a designated PG publication, the primary runtime configuration is the **fixed-size buffer** and the `MAX_COLUMNS` (per table). Depending on the write volume and schema sizes of your published tables, the total buffer allocation can be configured anywhere from 16 MB to over 4+ GB.
 Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`.
@@ -337,7 +339,6 @@ On the other side, the consumer's state is its local replica plus its NATS strea
 
 ## Schemas constraints examples
 
-
 #### Read-only table migration
 
 **A "Bad"** `read-only` table: 
@@ -482,6 +483,30 @@ ALTER TABLE users RENAME COLUMN new_id TO id;
 ALTER TABLE users ADD PRIMARY KEY (id);
 ```
 
+## Suspended table
+
+ZeBridge has exactly 6 structural and sizing conditions that will cause a table to be quarantined. What's excellent about this design is that a refused table does not crash the bridge—it just drops that table's events and sends a "Suspension Notice" to the edge clients so they know the table is temporarily offline.
+
+
+**unsupported_column_type**: A column uses an exotic base type (like xml or hstore) that the Zig decoder cannot safely deserialize.
+➡ Why it's refused: Passing raw binary bytes through as text is silent data corruption. ZeBridge halts the table instead of corrupting edge databases.
+
+**no_primary_key**: The table has no Primary Key.
+➡ Why it's refused: Without a primary key, rows cannot be uniquely identified by the edge SQLite database An UPDATE or DELETE event would be ambiguous, so the table cannot be replicated.
+
+**row_too_large**: A single row's encoded MessagePack payload exceeds the bridge's pre-allocated per-event memory buffer.
+➡ Why it's refused: ZB allocates fixed memory at boot to prevent memory leaks and garbage collection pauses. If a row is massively wide (e.g., a massive JSONB blob) and breaches the limit, it's quarantined.
+> Note: Unlike the other errors which require a schema migration to fix, this one lifts automatically on restart, assuming the operator increases the bridge's buffer size).
+
+**no_tenant_column**: The table is declared as a tenant-scoped table in `zebridge_catalogue`, but it physically lacks the specified tenant column.
+➡ Why it's refused: ZB relies on this column to route the event to the correct NATS subject (e.g., cdc.acme-corp.orders.insert). If the column doesn't exist, every row would route to a broken fallback subject,completely breaking tenant isolation.
+
+**tenant_not_in_replica_identity**: The tenant column exists, but it sits outside PostgreSQL's Replica Identity (usually the Primary Key).
+➡ Why it's refused: When a DELETE happens in PostgreSQL, the WAL event only includes the columns that are part of the Replica Identity. If the tenant column isn't in it, the DELETE event arrives at the bridge with no tenant ID! The bridge wouldn't know which NATS stream to send the delete to, meaning the row would be permanently "stuck" (never deleted) on the edge devices.
+
+**no_cdc_subject**: The table exists, but it hasn't been declared as either tenant-scoped or public in the `zebridge_catalogue`.
+➡ Why it's refused: If the bridge tried to publish this event, it wouldn't match any configured NATS JetStream filter. JetStream would block the publish waiting for an ACK that will never come, which would eventually exhaust the bridge's retry budget and crash the entire daemon. Quarantining it immediately prevents a single misconfigured table from taking down the entire bridge.
+
 ## The consumer side
 
 **The rule**: you do not talk to NATS: the library does all of it.
@@ -540,6 +565,31 @@ That is the whole contract for an app author. The wire format — the NATS subje
 **Examples [TODO]**: [App.tsx](/web-consumer/src/App.tsx) (browser, live), a [Flutter](/flutter) example, and planned Node, Go, Python and Elixir microservices.
 
 ## Safety & Guarantees
+
+#### Schemas Postgres -> SQLite
+
+If it quite forgiving, given the SQLite types:
+
+* Integers/Booleans -> INTEGER
+* Floats (real, float4, float8) -> REAL
+* Everything else (including NUMERIC and unknown types) safely falls back to TEXT.
+
+#### ZeBridge WAL decoder and refused tables
+
+Supported Types:
+
+* Standard integers, floats, and booleans.
+* numeric / decimal
+* text, varchar, char
+*  date, timestamp, timestamptz
+*  uuid
+* json, jsonb
+* Arrays of any of the above (e.g. text[], int4[])
+* Custom ENUM types: (ZeBridge safely passes these through as TEXT because Postgres natively sends enums as their text label).
+
+**Refused Types**: If you try to replicate a table with exotic base types like hstore, xml, macaddr, geometric types (box, circle), or money, ZeBridge will ❗️ **refuse** the table.
+
+**Why?**: When PostgreSQL streams data in binary mode (pgoutput), an unknown base type arrives as raw, unformatted bytes. If ZeBridge just guessed and passed it as a UTF-8 string to your SQLite edge database,it would corrupt your data. Instead, it fails closed and refuses to replicate the table 🔔 until the column is either dropped or cast to a supported type.
 
 #### At-Least-Once Delivery
 
