@@ -89,6 +89,7 @@ listed and never run by it — those report, they do not assert.
 | the backpressure cascade, observable end to end: broker dies under a steady feed → queue climbs to ~86%, WAL dams behind the slot (~1 MB), bridge halts — then the broker returns and the same process drains it all, 1,199/1,199 rows | `cascade.py` |
 | the CLIENT's host SIGKILLed mid-seed, twice: the torn SQLite file reopens, the seed re-applies idempotently — 120k rows, all distinct, equal to PostgreSQL | `client_kill.py` |
 | revoking a principal (DELETE its mapping) purges `$KV.tenants` live; writes die immediately, resolution dies on reconnect — and reads honestly survive until the JWT expires | `revoke.py` |
+| `bridge --init-nats` generates the whole NATS stack (dev: open, 10 s; operator: full JWT, no nsc) — proven by BOOTING the generated conf and round-tripping JetStream on the generated creds | `init_nats.py` |
 | a row written outside the client is in its replica in single-digit ms; a 300-row transaction lands in one poll | `libzb/python/tail.py`, `bench_poll.py` (benchmark) |
 | a pre-guard oversized row quarantines the table, boot re-derives it, removing the row lifts it | `legacybait.py` |
 | a `row_too_large` suspension lifts LIVE once the table can be carried again — after a 30 s anti-flap cooldown — and the descriptor is republished; `zebridge_catalogue.suspended`/`suspended_reason` mirror both transitions for psql (§10cf) | `suspension_lift.py` |

@@ -45,6 +45,46 @@ pub const MintError = error{ BadSeed, OutOfMemory };
 /// signing key's seed ("SA..."), `account_pub` the account's public key ("A..."),
 /// `user_pub` the client-generated user public key ("U...") — the seed side of
 /// that pair never reaches this process.
+/// Sign an arbitrary claims document (operator and account JWTs for `--init-nats`;
+/// `mint` above stays the user-JWT path). `claims_pre` must contain `jti_token`
+/// exactly once: the jti is the base32(sha256) of the document with the token
+/// replaced by the empty string — the Go jwt library's convention, and the server
+/// treats it as opaque, so self-consistency is all that matters.
+pub fn signClaims(
+    allocator: std.mem.Allocator,
+    kp: *nats.nkeys.SeedKeyPair,
+    claims_pre: []const u8,
+    jti_token: []const u8,
+) ![]u8 {
+    const hashed = try std.mem.replaceOwned(u8, allocator, claims_pre, jti_token, "");
+    defer allocator.free(hashed);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(hashed, &digest, .{});
+    var jti_buf: [56]u8 = undefined;
+    const jti = base32Encode(&jti_buf, &digest);
+    const claims = try std.mem.replaceOwned(u8, allocator, claims_pre, jti_token, jti);
+    defer allocator.free(claims);
+
+    const header = "{\"typ\":\"JWT\",\"alg\":\"ed25519-nkey\"}";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const h64_len = b64.calcSize(header.len);
+    const c64_len = b64.calcSize(claims.len);
+    try out.ensureTotalCapacity(allocator, h64_len + 1 + c64_len + 1 + b64.calcSize(64));
+    out.items.len = h64_len;
+    _ = b64.encode(out.items[0..h64_len], header);
+    try out.append(allocator, '.');
+    const c_start = out.items.len;
+    out.items.len += c64_len;
+    _ = b64.encode(out.items[c_start..], claims);
+    const sig = try kp.sign(out.items);
+    try out.append(allocator, '.');
+    const s_start = out.items.len;
+    out.items.len += b64.calcSize(64);
+    _ = b64.encode(out.items[s_start..], &sig);
+    return out.toOwnedSlice(allocator);
+}
+
 pub fn mint(
     allocator: std.mem.Allocator,
     signing_seed_text: []const u8,

@@ -16,6 +16,7 @@ const wal_monitor = @import("wal_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const nkey_gen = @import("nkey_gen.zig");
+const nats_init = @import("nats_init.zig");
 const publication_mod = @import("publication.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
@@ -637,6 +638,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.earlyExit(&init)) |what| switch (what) {
         .help => return args.printUsage(init.io),
         .gen_nkey => return nkey_gen.genNkey(init.io),
+        .init_nats => return std.process.exit(nats_init.run(init.io, &init)),
     };
 
     // Assign first, then report: customLogFn filters against runtime_log_level, so a

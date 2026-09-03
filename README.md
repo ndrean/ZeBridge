@@ -52,7 +52,7 @@ flowchart LR
 
 **Design**: This tool is built to serve a large volume of small to medium consumers via the NATS message broker. It is engineered to be light (~3.5 MB executable), fast, secure, and near instant startup.
 
-* **High performance ingestion**: With PG replication set to 'logical', we use a log-based CDC with the native  `pgoutput` (v1) logical decoding plugin to stream decoded WAL changes in binary format.
+* **High performance ingestion**: With PG replication set to 'logical', we use a log-based CDC with the native  `pgoutput` (v1) logical decoding plugin to stream decoded WAL changes in _binary_ format. We use `REPLICA IDENTITY DEFAULT` to limit the volume, thus the speed of the emitted data by `pgoutput`. The price is the need, on every table, of a primary key, which is almost mechanical.
 * **Zero aollocation Hot Path**: To minimize memoery allocations during high throughput, the engine uses a pre-allocated ring buffer.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding. This mitigates the need for long, expensive unitary CDC catchups.
 * **SSR needed?** Frameworks like React, Next.js, Remix, Nuxt allows Server Components query the database. The client can query directly the local database, eliminating the need a netwrok round trip or a GraphQL layer, so just a CDN and the local persisted DB (OPFS for browsers/webapps, or file system for desktop/mobile).

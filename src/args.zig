@@ -19,6 +19,9 @@ const usage =
     \\                  stream, subject and KV name; missing file or key is fatal.
     \\  --strict-tables Refuse to start if any published table lacks a primary key
     \\  --diagnose           Pre-run doctor: report everything boot would decide, write nothing, exit
+    \\  --init-nats          Generate the NATS stack, no nsc: --mode dev (open server, 10s) or
+    \\                       --mode operator (full JWT: operator+account+scoped keys+creds);
+    \\                       --dir PATH, --force, --nats-port/--ws-port/--http-port, --top grammar.json
     \\                  (default: skip the table, keep replicating the rest)
     \\  --gen-nkey      Mint one nkey pair and exit, without starting anything.
     \\                  Prints NATS_BRIDGE_NKEY_PUB / NATS_BRIDGE_NKEY_SEED on
@@ -89,7 +92,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, gen_nkey };
+pub const EarlyExit = enum { help, gen_nkey, init_nats };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -106,6 +109,7 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
             if (std.mem.eql(u8, arg, flag)) return .help;
         }
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
+        if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
     }
     return null;
 }

@@ -8392,6 +8392,44 @@ One correction kept on the record: a restart is NOT the only lift — §10bp's
 fitting-write lift is live and tested. The restart is the universal one, and the only
 one for the closed circle (edge-only writers, wide row already reaped).
 
+## 10ch. `bridge --init-nats`: the NATS onion, peeled by the bridge itself (2026-09-03)
+
+Review named its friction point plainly: NATS is a wall for anyone who just wants to
+jump in — operator, account, signing keys, user JWTs, `nsc add` upon `nsc add`. And the
+review's design was two-tier: a local-dev bypass with no JWT in sight, and the full
+stack reserved for production — devs should never have to understand accounts or
+claims formats; enrollment should be the ONLY onboarding surface.
+
+`bridge --init-nats [dev|operator] [--force]` — deliberately no other flags (review:
+"if it is a self-contained module, no needs for these args"): ports, directory and
+names are well-known defaults, and the generated files are plain text and yours to
+edit.
+
+- **dev**: an OPEN server conf (JetStream on, no auth block, absolute store_dir — the
+  up.sh lesson kept) plus a matching .env.bridge. Ten seconds, no JWT. The bridge nkey
+  is still generated and placed so the upgrade to operator is a conf swap, not a
+  credential migration. `ZB_SIGNING_SEED` deliberately absent — /enroll stays dark,
+  which is the bridge's documented behaviour for a missing seed.
+- **operator**: the whole identity stack minted BY THE BRIDGE — operator JWT, the SYS
+  account, the ZEBRIDGE account with its TWO scoped signing keys (the client template's
+  grant list derived from the TOPOLOGY at generation time, so grammar renames propagate
+  instead of drifting from a shell script — comptime was considered and rejected for
+  exactly that reason), the bridge user under the service scope, creds file, resolver
+  preload, and .env.bridge with `ZB_SIGNING_SEED`/`ZB_ACCOUNT_PUB` wired for /enroll.
+  `jwt_mint.signClaims` is the new generic signer (operator/account claims; `mint`
+  stays the user path). jwt-bootstrap.sh remains for the dev fixtures; new deployments
+  never need it, or nsc.
+
+**The proof found the one thing the design missed on its first boot:** JetStream under
+operator mode REQUIRES a system account — "Can't start JetStream: system account not
+setup" — so the minimal-SYS omission became a generated SYS account (no JetStream on
+it, nothing ever connects to it). `init_nats.py` pins the whole contract by BOOTING
+the generated conf: dev has no auth block and no seed; a second run refuses to
+overwrite (seeds are credentials); the operator server boots; the generated
+bridge.creds pass a full JetStream round trip; a credless connection is refused; the
+enrollment pair is present. Never-overwrite, absolute store_dir, and the operator and
+account identity seeds land in .env.bridge COMMENTED OUT — offline keys, printed once.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
