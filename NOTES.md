@@ -8735,6 +8735,67 @@ libzb does NOT refresh zig-out/lib — a smoke ran against the stale dylib and
 
 The hour run is now unblocked.
 
+## 10cq. The FK web: composite keys, cascades — and the lifecycle bugs underneath (2026-09-04)
+
+The swarm gained the 1-N-1 topology: sw_suppliers (COMPOSITE pk country+name) ←
+sw_orders (two FKs) → sw_clients, all public, deletes physical. Per client cycle:
+an order born, re-pointed to another supplier (both FK columns moved in ONE
+update), deleted; the 1-side updated through its composite key; and at 70% the
+orchestrator deletes a seeded supplier — PostgreSQL cascades, logical replication
+emits every cascaded DELETE, and replicas whose local FKs also cascade must land
+on the same rows (idempotence, twice over).
+
+The topology itself passed almost immediately: NO client changes were needed for
+composite keys (the pk-join and multi-column paths were already general), and the
+first full-fault run converged 11/12 with zero orphans. Complexity did not grow
+with the queries; what the web flushed out was LIFECYCLE and RESILIENCE, seven
+more findings across seven smokes:
+
+1. **libzb reopenTail was not exception-safe.** deinit-first left the tail's sub
+   DANGLING when openConsumer timed out mid-outage; every later poll handed the
+   freed pointer to PullInbox.fetch → NotOnThisInbox forever, verdicts still
+   flowing — §10cp's "silent wedge", finally named by the worker's pollErrors
+   ({Timeout: 1, NotOnThisInbox: 154}). Open-then-swap; gone[] reopens by name.
+2. **libzb applied CDC row-by-row** — each an autocommitted fsync, ~7 events/s
+   against a 19/s feed, 76 s behind by audit time. One transaction per batch (the
+   TS client's written lesson), position riding the same transaction.
+3. **The producer never builds a chain for an EMPTY table**, and stale producer
+   memory (zebridge_generations rows surviving a table's drop+recreate) makes the
+   boot tick skip the reborn table as "unchanged" until the +300 s cadence tick.
+   Meanwhile the TS client waits 90 s for a manifest and then EXCLUDES the table
+   for its whole life. Scenario-side: producer memory cleaned in setup/teardown +
+   a manifest gate. Product question, OPEN: a newborn table should get its empty
+   g1 at the tick that first sees it, and exclusion should be retryable.
+4. **The funeral must happen while the bridge watches.** A teardown that drops
+   tables after its bridge stopped leaves the drop in the WAL; the NEXT boot
+   replays it and the drop prune purges the freshly recreated tables' manifests
+   the same second the producer builds them (a PURGE revision stamped 17:18:57
+   against a g1 built 17:18:57.2). Teardown now waits for the drop-prune log line
+   before stopping. Product caution, OPEN: drop-prune replay against a re-created
+   table could compare relation ids and spare the newborn.
+5. **libzb's sync drain died on a mid-drain consumer death** (a 409 under twelve
+   concurrently-seeding clients) — one reopen from the stored position now; and
+   the worker retries sync, because a corpse is not a retry policy.
+6. **A TS consumer born into reconnect churn goes deaf** — created "from seq N,
+   0 pending", never delivering again while the stream advances. The tail IIFE is
+   now a loop with an idle guard: provably-deaf iterator (idle 25 s, stream tail
+   past stored) → stopped and recreated from the stored position.
+7. **The TS status loop died with its iterator** at one client's first bounce —
+   catch swallowed, loop exited, and with it the re-sync trigger: that client
+   never healed while eleven siblings re-synced three times. Recreate until
+   close, defensive re-sync on restart.
+
+The recurring shape across 1, 6 and 7: a long-lived duty (a tail, a status watch)
+bound to the lifetime of a single fallible object (a consumer, an iterator). The
+rule both clients now encode: THE DUTY OUTLIVES THE INSTRUMENT.
+
+On the user's complexity worry, answered in-session: the sync protocol is
+per-row/per-table and knows nothing of joins — a 1-N-1 query costs it nothing.
+What grows with FK topology is bounded and one-time (FK-off seed, hold/retry,
+idempotent cascades — each a mechanism, not a per-case cost). The one true cliff:
+per-row LWW cannot protect a MULTI-ROW invariant; that logic belongs in the
+PostgreSQL functions the mutations dispatch to, never in the sync layer.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
