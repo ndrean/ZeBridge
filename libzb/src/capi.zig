@@ -334,6 +334,10 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     const creds = try a.dupeZ(u8, str.get(o, "credsPath", ""));
     errdefer a.free(creds);
     const grammar = try a.dupeZ(u8, str.get(o, "grammarPath", "grammar.json"));
+    // "grammarJson": the file-free path (§10ci) — the raw grammar object as a string,
+    // exactly what /enroll's `grammar` field or GET /grammar returns.
+    const gj_raw = str.get(o, "grammarJson", "");
+    const grammar_json: ?[]const u8 = if (gj_raw.len > 0) try a.dupe(u8, gj_raw) else null;
     errdefer a.free(grammar);
     const db = try a.dupeZ(u8, str.get(o, "dbPath", "zb.sqlite3"));
     errdefer a.free(db);
@@ -363,6 +367,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .url = url,
             .creds_path = creds,
             .grammar_path = grammar,
+            .grammar_json = grammar_json,
             .db_path = db,
             .principal = principal,
             .tables = tables,

@@ -7,6 +7,7 @@ const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
+const topology_mod = @import("topology.zig");
 
 // std.net was removed in Zig 0.16 "Juicy Main". Use C POSIX sockets directly.
 // No @cImport here any more.
@@ -160,6 +161,7 @@ pub const Server = struct {
         log.info("  GET  /health         - Health check", .{});
         log.info("  GET  /status         - Bridge status (JSON)", .{});
         log.info("  GET  /metrics        - Prometheus metrics", .{});
+        log.info("  GET  /grammar        - the embedded wire grammar (+ X-Grammar-Hash)", .{});
 
         // No poll timer. `accept` blocks until a client arrives *or* the listener is
         // closed — std documents `SocketNotListening` as exactly that: "shutdown was
@@ -315,6 +317,8 @@ pub const Server = struct {
             try self.handleStatus(req);
         } else if (method == .GET and std.mem.eql(u8, target, "/metrics")) {
             try self.handleMetrics(req);
+        } else if (method == .GET and std.mem.eql(u8, target, "/grammar")) {
+            try handleGrammar(req);
         } else if (method == .GET and std.mem.startsWith(u8, target, "/enroll?")) {
             try self.handleEnroll(req);
         } else {
@@ -425,7 +429,12 @@ pub const Server = struct {
         };
         defer self.allocator.free(jwt);
 
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\"}}\n", .{ jwt, principal });
+        // The grammar rides along (§10ci): identity and wire contract are one artifact
+        // — the grants inside the JWT were minted from these very names — so a client
+        // bootstraps from nothing but a URL and an invite code, no file to copy.
+        var ghash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &ghash, .{});
+        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\",\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, topology_mod.embedded_json });
         defer self.allocator.free(body);
         log.info("🎟️ enrolled '{s}' (tenant '{s}') — JWT minted, mapping registered", .{ principal, tenant });
         try req.respond(body, .{ .status = .ok, .extra_headers = cors });
@@ -445,6 +454,25 @@ pub const Server = struct {
     // -------------------------------------------------------------------------
     // Handlers
     // -------------------------------------------------------------------------
+
+    /// GET /grammar — the wire grammar, served from the binary (§10ci). Clients never
+    /// copy grammar.json: they receive it here (or in the /enroll payload) and pin the
+    /// hash. Names only, no secrets; CORS-open like /enroll so the web client can
+    /// bootstrap from nothing but a URL.
+    fn handleGrammar(req: *std.http.Server.Request) !void {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &digest, .{});
+        var hex_buf: [64]u8 = undefined;
+        const hex = std.fmt.bufPrint(&hex_buf, "{x}", .{&digest}) catch unreachable;
+        try req.respond(topology_mod.embedded_json, .{
+            .status = .ok,
+            .extra_headers = &.{
+                .{ .name = "content-type", .value = "application/json" },
+                .{ .name = "access-control-allow-origin", .value = "*" },
+                .{ .name = "x-grammar-hash", .value = hex },
+            },
+        });
+    }
 
     fn handleHealth(self: *Server, req: *std.http.Server.Request) !void {
         _ = self;

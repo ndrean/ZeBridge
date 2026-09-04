@@ -23,6 +23,11 @@ pub const Options = struct {
     url: []const u8,
     creds_path: []const u8,
     grammar_path: []const u8,
+    /// Inline grammar JSON (§10ci): when set it wins over `grammar_path`, and no file
+    /// is touched. This is how a client bootstraps from the /enroll payload or a
+    /// GET /grammar fetch — the file-free path; grammar_path remains for tools that
+    /// sit in the repo anyway.
+    grammar_json: ?[]const u8 = null,
     db_path: [*:0]const u8,
     principal: []const u8,
     /// Parents FIRST: seeding runs in this order with foreign_keys ON.
@@ -226,7 +231,10 @@ pub const SyncClient = struct {
         // the life of the client, and this runs once.
         const a = self.aa();
         const io = self.t.threaded.io();
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, self.opts.grammar_path, a, .limited(1 << 20));
+        const bytes = if (self.opts.grammar_json) |gj|
+            try a.dupe(u8, gj)
+        else
+            try std.Io.Dir.cwd().readFileAlloc(io, self.opts.grammar_path, a, .limited(1 << 20));
         const g = try std.json.parseFromSlice(Value, a, bytes, .{});
         const root = g.value;
         self.cdc_prefix = try grammarString(root, &.{ "cdc_streams", "tenant_prefix" });

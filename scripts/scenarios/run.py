@@ -52,6 +52,7 @@ GROUPS = {
         "diagnose":      ("none",   "bridge --diagnose: the pre-run doctor says everything, changes nothing"),
         "revoke":        ("bridge", "deleting a principal's mapping purges its $KV.tenants key live"),
         "init_nats":     ("none",   "bridge --init-nats: the whole NATS stack generated, then BOOTED and proven"),
+        "grammar_served": ("bridge", "the embedded grammar served at /grammar and /enroll; a file-free libzb client syncs"),
         "telemetry":     ("none",   "HTTP surface"),
         "writable":      ("client", "grants vs published write contract"),
         "mutate":        ("client", "LWW round trip"),
