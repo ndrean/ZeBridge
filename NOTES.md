@@ -8708,8 +8708,32 @@ puts the full swarm at ~3 GB.
 
 The test's value question answers itself: three client-resilience bugs and one
 contract clarification, from the SMOKE RUNS alone, before the hour was ever
-attempted. The full hour waits until 2–4 are closed — running it now would just
-re-measure known holes.
+attempted.
+
+**Closed 2026-09-04, seven smokes in — smoke 7 PASSED whole.** Finding 2 fixed
+(FK-deferred seed, the TS shape). On the way there the smokes surfaced two more:
+mutate() ABORTED when the optimistic local echo failed — an UPDATE whose values
+do not repeat the pk fails the upsert arm's NOT NULL — so every such update was
+LOST before the wire, 24 per client per run; the TS client logs and queues anyway
+(its identical core envelope, its applyEvent swallow), and libzb now matches. And
+the ~95 s consumer-setup stall that opened finding 1's window was mostly GHOSTS:
+~33 stale schema keys in $KV.schemas from months of scenario teardowns (the §10bw
+"never kv del" rule, faithfully followed, left every probe table's schema behind
+forever), each costing a fresh client an up-to-90 s wait for a generation chain
+that will never be built. Purged down to the publication's tables; scenario
+teardowns still must not kv del keys that RETURN, but one-shot probe tables
+should be purged — hygiene rule amended. Finding 3 (the silent wedge) has not
+recurred since the mutate-abort fix — both sightings coincided with its failure
+storm; watch for it in the hour run. Finding 4 dissolved with the ghosts.
+
+Smoke 7, all fixes live and KV clean: 12 clients / 8 processes, six faults, 2182
+mutations, ZERO local errors, every outbox drained, and EVERY replica equal to
+PostgreSQL — per-tenant counts {acme 957, globex 1714, kilo 700, tango 636} and
+orders 30, count and md5 alike. Also learned the hard way: `zig build test` in
+libzb does NOT refresh zig-out/lib — a smoke ran against the stale dylib and
+"disproved" a fix that was never loaded. Build, then test, then run.
+
+The hour run is now unblocked.
 
 ## 11 Restart Rules
 

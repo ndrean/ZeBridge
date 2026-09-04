@@ -47,7 +47,11 @@ async function runClient(c: (typeof SPEC)[number], stagger: number): Promise<voi
     if (/"status":"rejected"|"status":"failed"/.test(s)) {
       counters.rejections += 1;
       if (counters.rejections <= 3) console.error(`[${c.wid}] ${t}: ${s}`.slice(0, 200));
-    } else if (level === 'error') console.error(`[${c.wid}] ${t}: ${s}`.slice(0, 200));
+    } else if (level === 'error' || t === 'SYS') {
+      // SYS carries the load-bearing lifecycle lines — seeded gen, consumer floor,
+      // re-sync — without which a divergence postmortem is pure divination (§10cp).
+      console.error(`[${c.wid}] ${t}: ${s}`.slice(0, 220));
+    }
   });
 
   await zb.connect();

@@ -81,7 +81,7 @@ def main():
         "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"),
         "credsPath": creds, "grammarPath": _env.GRAMMAR, "dbPath": DB,
         "principal": P, "clientId": f"py-swarm-{WID}",
-        "tables": ["test_types", "orders", "users"]}).encode())
+        "tables": ["users", "orders", "test_types"]}).encode())
     if not h:
         json.dump({"worker": WID, "fatal": "open failed"}, open(REPORT, "w"))
         return 1
@@ -94,7 +94,7 @@ def main():
             return 1
 
         t0 = time.monotonic()
-        trio, order, tick, users_ready = [], None, 0, False
+        trio, order, tick, users_ready, applied_total = [], None, 0, False, 0
         while time.monotonic() - t0 < DURATION_S:
             tick_start = time.monotonic()
             i = tick % 5
@@ -134,6 +134,9 @@ def main():
                 send(h, "test_types", "DELETE", {"uid": trio[0]})
             take(lib.zb_client_flush(h, 200))
             tick += 1
+            if tick % 15 == 0:
+                print(f"[w{WID}] tick {tick} sent={counters['sent']} errs={counters['sendErrors']} "
+                      f"applied_total={applied_total}", flush=True)
             # poll returns EARLY when a batch applied (by design) — keep polling
             # until this tick's second is spent, so the cadence holds under load
             deadline_t = tick_start + 1.0
@@ -144,6 +147,8 @@ def main():
                         time.sleep(left)
                     break
                 r = take(lib.zb_client_poll(h, int(left * 1000) - 30))
+                if isinstance(r, dict):
+                    applied_total += r.get("applied", 0) or 0
                 if isinstance(r, dict) and "error" in r:
                     e = str(r["error"])[:60]
                     counters["pollErrors"][e] = counters["pollErrors"].get(e, 0) + 1
