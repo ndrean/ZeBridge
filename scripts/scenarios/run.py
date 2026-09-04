@@ -107,6 +107,7 @@ GROUPS = {
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),
+        "swarm":         ("bridge", "the 100-client hour: 50 node + 49 python + 1 PGlite, ~160 mut/s, faults, whole-replica equality"),
         "burst":         ("none",   "throughput driver, leaves rows behind"),
         "leaksoak":      ("bridge", "macOS leaks soak"),
         "objstore_race": ("bridge", "40 MB get/put race"),

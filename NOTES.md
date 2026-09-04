@@ -8653,6 +8653,64 @@ from ever splitting the replicas (one arbiter: the stored row, fanned out by CDC
 A design that cannot tolerate biased winners needs CRDTs or server-assigned
 versions, and pays their price instead. This closes the resilience shelf.
 
+## 10cp. The swarm: 100 clients, and what 12 found in six minutes (2026-09-04)
+
+`swarm.py` (manual group) — the scaled-up soak: 100 clients (Node/better-sqlite3
+grouped several to a process, Python/libzb, one Node/PGlite whose replica IS
+Postgres-in-process), each running a 5 s CRUD cycle at one mutation per second
+(three test_types INSERTs, UPDATE the last, soft-DELETE the first, an orders
+INSERT/UPDATE/physical-DELETE folded onto the first three ticks), faults woven
+through (NATS bounces 20/45/75%, PG fast stop/starts 33/66%, one bridge restart
+at 50%), and the verdict this suite has owed since the WAL-head bug: EVERY
+replica's (count, md5-of-sorted-uids) equal to PostgreSQL's, per tenant, plus the
+public orders table. Whole-replica equality, finally automated.
+
+Three 2-minute smoke runs with 12 clients found, in order:
+
+1. **zb-client-ts: the tail-as-floor hole (FIXED).** A fresh replica recorded the
+   CDC stream's current TAIL as its consumer floor, silently skipping every row
+   written between the chain's cutoff and the end of consumer setup — 95 s under
+   12-client seeding load, ~340 rows per replica, permanent, no fault required.
+   Invisible in quiet dev where tail ≈ cutoff. The floor now comes from the seed's
+   `cutoff_seq` (min across the stream's seeded tables), or deliver-all behind the
+   lsn gate when a manifest lacks it; only a stream with no chain-seeded tables
+   still takes the tail. 133/133 fixtures green.
+
+2. **libzb: seeding runs with foreign_keys ON (OPEN).** The moment a chain carried
+   orders rows, every fresh Python client died at sync: the orders full seeds
+   before/against users and the FK refuses row 1, rolling back the chain step —
+   `sync gave no tenant: StepFailed`. The TS client already does the standard
+   bulk-load shape (FKs off during seed, on + check after); libzb declares
+   "parents FIRST ... with foreign_keys ON" (client.zig:33) and the swarm proved
+   the ordering promise does not hold across chains. Deterministic; needs the
+   TS treatment.
+
+3. **libzb: a ~100 s silent wedge spanning a bounce (OPEN, one sighting).** After
+   one NATS bounce a client logged NOTHING for ~100 s — no EOF, no reconnect
+   attempt, no pull requests, no errors — then closed cleanly; its tail never
+   resumed (the two earlier bounces in the same run healed normally). Suspect
+   list: a half-open connection the keepalive did not catch in time, or collateral
+   of the concurrent local StepFailed storm (bug 2 was firing around the bounce).
+   Reproduce after 2 is fixed.
+
+4. **n1 off by two (OPEN, smallest).** One Node replica missed exactly two rows
+   written by a sibling in the run's first seconds — the startup window again,
+   with the floor fix already in. A race narrower than finding 1; needs the
+   workers to log their consumer floor to be observable.
+
+Also learned: orders is outbound-only until `zebridge_grant_edge_writes` (the
+scenario grants and restores); libzb's mutate contract is that the CALLER puts the
+version column in values (buildMutation keeps data verbatim — omit it and the
+local echo fails NOT NULL), while the TS client injects it; libzb query answers
+{columns, rows}, not row dicts; and 100 separate Node processes cost ~103 MB each
+on a 16 GB machine — grouping clients per process (own connections, shared V8)
+puts the full swarm at ~3 GB.
+
+The test's value question answers itself: three client-resilience bugs and one
+contract clarification, from the SMOKE RUNS alone, before the hour was ever
+attempted. The full hour waits until 2–4 are closed — running it now would just
+re-measure known holes.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
