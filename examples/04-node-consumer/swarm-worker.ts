@@ -152,7 +152,21 @@ async function runClient(c: (typeof SPEC)[number], stagger: number): Promise<voi
     if (outbox === 0) break;
     await sleep(2000);
   }
-  await sleep(10_000); // let the last CDC fan-out land locally
+  // quiesce, not a fixed nap: a replica still catching up on the last fan-out
+  // must not be audited mid-stride — done means table membership stable across
+  // three consecutive checks (same rule as the python worker's settle)
+  let prevTotal = -1;
+  let stable = 0;
+  const qEnd = Date.now() + SETTLE_S * 1000;
+  while (stable < 3 && Date.now() < qEnd) {
+    await sleep(3000);
+    let total = 0;
+    for (const t of ['test_types', 'sw_orders', 'sw_clients', 'sw_suppliers', 'orders']) {
+      try { total += Number((await zb.query(`SELECT COUNT(*) n FROM ${t}`))[0].n); } catch { /* not synced */ }
+    }
+    stable = total === prevTotal ? stable + 1 : 0;
+    prevTotal = total;
+  }
 
   const digest = async (sql: string) => {
     const rows = await zb.query(sql);

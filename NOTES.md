@@ -8789,6 +8789,14 @@ The recurring shape across 1, 6 and 7: a long-lived duty (a tail, a status watch
 bound to the lifetime of a single fallible object (a consumer, an iterator). The
 rule both clients now encode: THE DUTY OUTLIVES THE INSTRUMENT.
 
+An eighth, closing item: both workers' settle became QUIESCE-based (membership
+stable across three consecutive checks) — a fixed nap audits a replica
+mid-stride and reads the last fan-out's lag as divergence. Smoke 17, everything
+in: EVERY replica equal to PostgreSQL — per-tenant test_types, orders, and the
+whole FK web with the cascade, zero orphans, zero local errors, through two PG
+stops, three NATS bounces, one bridge restart and the cascade. Seventeen smokes,
+eight findings, both clients hardened by comparing them against each other.
+
 On the user's complexity worry, answered in-session: the sync protocol is
 per-row/per-table and knows nothing of joins — a 1-N-1 query costs it nothing.
 What grows with FK topology is bounded and one-time (FK-off seed, hold/retry,
