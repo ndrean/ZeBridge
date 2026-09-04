@@ -412,21 +412,36 @@ export class ZeBridge {
       // subscribeStreams: the gap check compares persisted positions, so a normal
       // reconnect just resumes CDC (upserts idempotent even if consumers double up).
       void (async () => {
-        try {
-          for await (const st of this.nc!.status()) {
-            const t = String((st as any).type);
-            if (t === 'reconnect') {
-              this.emitStatus('connected');
-              if (this.resyncing) continue;
-              this.resyncing = true;
-              this.appendLog('SYS', 'NATS reconnected — flushing outbox and re-syncing streams', 'INFO');
-              void this.flushOutbox();
-              void this.subscribeStreams().finally(() => { this.resyncing = false; });
-            } else if (t === 'disconnect') {
-              this.emitStatus('disconnected');
+        // The status loop is the RE-SYNC trigger, so it must outlive any single
+        // status() iterator: one client's loop died at the first broker bounce
+        // (the iterator threw, the catch swallowed, the loop exited) and that
+        // client never re-synced again — consumers born deaf stayed deaf while
+        // eleven siblings healed three times (§10cq). Same rule as the tails:
+        // recreate until close.
+        while (this.nc) {
+          try {
+            for await (const st of this.nc.status()) {
+              const t = String((st as any).type);
+              if (t === 'reconnect') {
+                this.emitStatus('connected');
+                if (this.resyncing) continue;
+                this.resyncing = true;
+                this.appendLog('SYS', 'NATS reconnected — flushing outbox and re-syncing streams', 'INFO');
+                void this.flushOutbox();
+                void this.subscribeStreams().finally(() => { this.resyncing = false; });
+              } else if (t === 'disconnect') {
+                this.emitStatus('disconnected');
+              }
             }
+          } catch { /* iterator died — recreate below */ }
+          if (!this.nc) break;
+          await new Promise((r) => setTimeout(r, 1000));
+          this.appendLog('SYS', 'status loop restarted — re-syncing in case a reconnect was missed', 'WARNING');
+          if (!this.resyncing) {
+            this.resyncing = true;
+            void this.subscribeStreams().finally(() => { this.resyncing = false; });
           }
-        } catch { /* connection closed; nothing to watch */ }
+        }
       })();
 
       this.sweepId = setInterval(() => this.sweepPendingWrites(), 1000);
@@ -1716,8 +1731,19 @@ export class ZeBridge {
 
         const iter = await consumer.consume();
         void (async () => {
+          // The tail must OUTLIVE its consumer. A consumer born into reconnect churn
+          // can go DEAF — created "from seq N, 0 pending" and never delivering again
+          // while the stream advances (measured §10cq: stored 3236, stream at 3353,
+          // sibling replicas on other streams healthy). Whether the iterator hangs or
+          // ends, this loop notices — an idle guard stops a deaf iterator when data
+          // is provably waiting — and recreates the consumer from the stored
+          // position. Duplicates are idempotent; silence is data loss.
+          let curIter = iter;
+          let curPending: number | null = ci.num_pending ?? null;
+          let attempt = 0;
+          while (this.nc) {
           let processedSinceStart = 0;
-          let caughtUpLogged = ci.num_pending === 0;
+          let caughtUpLogged = curPending === 0;
           const progressEvery = 2000;
 
           // Batched into ONE transaction per flush: N autocommits each pay OPFS
@@ -1788,12 +1814,29 @@ export class ZeBridge {
             await this.retryFkHeld(streamName);
           };
 
-          for await (const msg of iter) {
+          let lastMsgAt = Date.now();
+          const itRef = curIter;
+          const idleGuard = setInterval(() => {
+            if (Date.now() - lastMsgAt < 25_000) return;
+            void (async () => {
+              try {
+                const tail = (await jsm.streams.info(streamName))?.state?.last_seq ?? 0;
+                const stored = this.globalSyncState.seq[streamName] ?? 0;
+                if (tail > stored) {
+                  this.appendLog('SYS', `${streamName}: consumer idle 25s while the stream advanced (stored ${stored}, tail ${tail}) — deaf; recreating`, 'WARNING');
+                  try { itRef.stop(); } catch { /* already ended */ }
+                }
+              } catch { /* stream info unavailable mid-outage — keep waiting */ }
+            })();
+          }, 10_000);
+          try {
+          for await (const msg of curIter) {
+            lastMsgAt = Date.now();
             processedSinceStart++;
             if (processedSinceStart % progressEvery === 0) {
               this.appendLog('SYS', `${streamName} catch-up: ${processedSinceStart} messages processed so far, at seq ${msg.seq}`, 'INFO');
             }
-            if (!caughtUpLogged && ci.num_pending != null && processedSinceStart >= ci.num_pending) {
+            if (!caughtUpLogged && curPending != null && processedSinceStart >= curPending) {
               caughtUpLogged = true;
               const totalMs = Math.round(performance.now() - setupStart);
               this.appendLog('SYS', `${streamName} caught up (${processedSinceStart} messages, ${totalMs}ms total since consumer setup started) — now live`, 'INFO');
@@ -1834,7 +1877,28 @@ export class ZeBridge {
               flushTimer = setTimeout(() => { void flushBatch(); }, BATCH_MS);
             }
           }
+          } finally { clearInterval(idleGuard); }
           await flushBatch();
+          if (!this.nc) break;
+          attempt++;
+          await new Promise((r) => setTimeout(r, 1000));
+          try {
+            const resumeFrom = this.globalSyncState.seq[streamName] ?? 0;
+            const ci2 = await jsm.consumers.add(streamName, {
+              deliver_policy: resumeFrom > 0 ? this.transport.deliverPolicy.byStartSequence : this.transport.deliverPolicy.all,
+              opt_start_seq: resumeFrom > 0 ? resumeFrom + 1 : undefined,
+            });
+            const consumer2 = await js.consumers.get(streamName, ci2.name);
+            curPending = ci2.num_pending ?? null;
+            curIter = await consumer2.consume();
+            this.appendLog('SYS', `${streamName}: tail recreated (attempt ${attempt}) from seq ${resumeFrom}, ${curPending ?? '?'} pending`, 'WARNING');
+          } catch (e) {
+            this.appendLog('SYS', `${streamName}: tail recreate failed (${e}) — retrying`, 'ERROR');
+            await new Promise((r) => setTimeout(r, 4000));
+            // curIter already ended: the next lap's for-await exits at once and
+            // lands back here — self-throttled by the waits above.
+          }
+          }
         })();
       }
     } catch (e) {
