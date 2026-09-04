@@ -56,24 +56,25 @@ flowchart LR
 * **Zero aollocation Hot Path**: To minimize memory allocations during high throughput, the engine uses a pre-allocated ring buffer.
 * **Multiple instances**: you can run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independantly from small tables with heavy writes.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding. This mitigates the need for long, expensive unitary CDC catchups.
-* **SSR needed?** The client can query directly the local database, and pub/sub writes via the library, eliminating the need a network round trip or a GraphQL layer: just a CDN and the local persisted DB (OPFS for browsers/webapps, or file system for desktop/mobile).
-
-**Explicit limitations**: `ZeBrigde` is NOT designed for massive databases or tables storing large objects (BLOBs) or an extra large number of columns. NATS restricts payloads ($<2^{20}=1$ MB by default). This limit is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, the needed memory for ZB would start to be very large (eg ~6 GB if buffering 1 MB/evt @ 5000 evt/s).
-> Large payloads belong in object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data, not PDFs for instances.
 
 **Opinionated**: ZeBridge makes deliberate structural decisions to maximize performance and predictability, rather than offering endless configuration options:
 
-* **Diagnose**: ZeBridge CLI proposes a `--diagnose` tool to run after having installed the triggers and functions needed by ZB inot Postgres. It will detect gaps in the database. 
 * **Strict Memory Boundaries:** Because ZB uses a fixed pre-allocated buffer, its memory footprint must be defined at runtime.  Overflows are detected, rolled back and the table is quarantined. To prevent misuse, the size of every data entry is strictly validated-wether originated from a consumer write, or directly loaded within Postgres, or after a schema migration.
-* **Opinionated Conflict Resolution (LWW)**: if client-side writes are enabled (`writable => true`), ZB version makes decisions for you that other sync engines leave you to : it enforces a Last-Write-Win (LWW) strategy server-side. Furthermore, the client uses a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
-This imposes constraints -mostly mechanical- on the database schemas but buys guarantees.
+* **Opinionated Conflict Resolution (LWW)**: if client-side writes are enabled (`writable => true`), ZB version makes decisions for you that other sync engines leave you to : it enforces a Last-Write-Win (LWW) strategy server-side _per row_. Furthermore, the client uses a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
+This imposes constraints -mostly mechanical- on the database schemas but buys some guarantees.
 * **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** route through the `libzb` library to ensure tracking. Enforcement depends upon the local engine.
 * **Tenant isolation**: we enforce a strict tenant model in PG: every principal -consumer- operates within a designated tenant boundary. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
 * **Detla-chain** generation: a snapshot of a table is not on-demand nor a full table per tenant. This would crush Postgres if thousands of consumers connect. Instead, a "generation" thread produces full/deltas in a time window with a max chain length and these are dictionary based Zstd compressed and pushed into NATS. The client library cherry picks whatever its needs on connection, and complements with the few remaining CDCs up to its watermark.
 * **Suspended table**: ZeBridge quarantines a table when criterias are not met. See [Suspended table](#suspended-table)
+* **Diagnose**: ZeBridge CLI proposes a `--diagnose` tool to run after having installed the triggers and functions needed by ZB inot Postgres. It will detect gaps in the database. 
 
 **Configuration**: once the database is migrate - you are expected to `zb_enable()`the tables you want to follow in a designated PG publication, the primary runtime configuration is the **fixed-size buffer** and the `MAX_COLUMNS` (per table). Depending on the write volume and schema sizes of your published tables, the total buffer allocation can be configured anywhere from 16 MB to over 4+ GB.
 Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`.
+
+**Limitations**: `ZeBrigde` is NOT designed for massive databases or tables storing large objects (BLOBs) or an extra large number of columns. NATS restricts payloads ($<2^{20}=1$ MB by default). This limit is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, the needed memory for ZB would start to be very large (eg ~6 GB if buffering 1 MB/evt @ 5000 evt/s).
+> Large payloads belong in object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data, not PDFs for instances.
+
+Lasty, the main limitation of this LWW implementation is that is it per full row, not column granular. 
 
 **Observability**: ZeBridge includes production-ready observability out of the box; it exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards.
 
