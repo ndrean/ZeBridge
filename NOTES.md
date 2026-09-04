@@ -8862,7 +8862,41 @@ takes that path directly, so light load keeps the old semantics to the byte.
 
 Measured: 5,000 flooded mutations applied in 4.3 s — **~1,200/s, a 24× lift** —
 and the 12-client full-fault smoke passed whole on top of a 25k-row replica
-history. The 100-client soak re-run is the at-scale confirmation.
+history.
+
+**The rest of the ladder, same day.** ReleaseFast (all prior numbers were Debug —
+`zig build test` does not install, and neither had any bench run in the shipping
+mode): ~4,750/s, another 4×, ~95× from the start — and bridge RSS 36 MB where
+Debug idled at 200. Rungs 2+3 (ONE pipeline sync per batch replacing the explicit
+BEGIN/COMMIT, and the classify probe deferred to a second small round for
+zero-affected writes only): measured FLAT on colocated PG (~4.6k/s) and kept —
+round trips are the cost on a remote PostgreSQL, the production topology, and
+that is exactly what they eliminate. Three flat differentials (sync count,
+classify, fetch batch 64→256) isolate the remaining wall: the SERIAL LANE itself
+(~0.21 ms/mutation of single-connection statement execution plus per-message
+verdict+ack IO). Rung 4 — parallel listener lanes on one durable, LWW as the
+ordering license — is the scoped next arc; N=3 should clear the 10k/s target.
+
+The comparison soaks earned their keep by KILLING CLIENTS instead: two more
+process-fatal TS bugs, both the same species as §10cq's — (a) the tail-recreate
+loop re-iterated a CONSUMED @nats-io iterator, which throws
+InvalidOperationError even after ending, an unhandled rejection in the tail IIFE
+= process death, five clients per casualty; (b) subscribeStreams could throw
+ClosedConnectionError from BEFORE its try blocks while running as a floating
+promise — a PRE-EXISTING latent bug in the reconnect path that the status-loop
+restart merely made frequent. Consumed iterators are nulled and never touched;
+subscribeStreams is throw-proof from the first await. The third soak: ALL 100
+clients alive and reporting, every outbox drained, 75,245 mutations, zero local
+errors — residual divergence a smooth per-replica lag spread (no cohorts, no
+stalls) against a 240 s settle too short for 100-client fan-out over a 62k-row
+history; the patience run (ZB_SETTLE_S=600) is the confirmation.
+
+Instrument honesty, for the record: capacity numbers come from the FLOOD BENCH
+(no faults, no fan-out — slightly flattering, since no consumers pull CDC during
+it); soaks measure convergence under abuse at an offered load ~50× below
+ceiling, and their row-growth is client pacing, never bridge capacity. The
+missing third instrument is a HAMMER soak — real clients, no pacing, no faults —
+for any capacity claim that ships in a README.
 
 ## 11 Restart Rules
 
