@@ -8921,6 +8921,40 @@ ceiling, and their row-growth is client pacing, never bridge capacity. The
 missing third instrument is a HAMMER soak — real clients, no pacing, no faults —
 for any capacity claim that ships in a README.
 
+## 10ct. The stamp: 21,500 mutations/s flat for three minutes, a consumer drinking beside it (2026-09-04)
+
+`stamp.py` (manual group) — the third instrument, closing the §10cs honesty
+gap: SATURATED and FAULT-FREE, a feeder holding the MUTATIONS backlog deep for
+the whole window, the applied rate bucketed every 10 s, and — the part that
+makes it real — ONE libzb consumer applying the CDC egress simultaneously.
+Dedicated `zb_stamp` table (generations off), §10cq funeral teardown so the
+millions of events leave with it.
+
+Measured, 2 lanes, ReleaseFast, colocated laptop:
+
+* **Ingress: 4,001,000 mutations applied; steady mean 21,503/s; worst bucket
+  72% of the mean — flat.** The drain benches under-read even at 20k depth:
+  only a continuously-fed backlog keeps every fetch batch full. The day's
+  write-path ledger closes at **~50/s → ~21,500/s sustained: 430×.**
+* **Downstream: 10,388 rows/s sustained by one client** into SQLite while the
+  write river ran on the same broker — the axis Electric/PowerSync quote ~5k
+  on. It lagged the 21.5k ingress and would converge off-window: the honest
+  per-client ceiling, not a failure.
+
+Positioning, settled in discussion and worth keeping: Electric and PowerSync
+have no write path to benchmark — client writes go through YOUR backend
+directly into PostgreSQL. ZeBridge's 21.5k/s is the throughput of a component
+they ask you to build yourself: the brokered pipeline carrying the durable
+offline queue, per-write verdicts, server-side LWW, retry budgets,
+dead-letters, backpressure and the NATS auth boundary. A direct PG write is
+faster and is none of those things. The only shared axis is downstream, and
+there the one-client number is ~2× theirs while ingress saturates beside it.
+
+Bench-depth rule, twice-learned and now closed: a drain flood must be several
+seconds deep or it measures ramp (5k floods read 4.6k on a 9.5k lane; even 20k
+floods read half of what sustained feeding shows). The stamp is the capacity
+instrument; floods are for quick regressions only.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
