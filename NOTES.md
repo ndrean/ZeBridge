@@ -8580,6 +8580,42 @@ already clean, and the account-JWT amendment is exactly what it still has to do.
 SECURITY.md's revocation section updated: the hard kill is no longer the honest gap,
 it is the documented escalation.
 
+## 10cn. Reconnect churn: the counter that only saw its own heroics (2026-09-04)
+
+`churn.py` — 50 shuffled NATS bounces and 15 PG fast stop/starts over ~10 minutes,
+idle stretches alternating with wasp swarms (3 threads stinging PG), one libzb
+client converging at the end, RSS/fd/thread counts asserted flat against a
+post-warmup baseline. First verdict: memory flat, fds flat, no sting lost — and
+`bridge_nats_reconnects_total` at 7 after 50 broker restarts.
+
+Not a leak, a vantage point. The counter lived only in the publisher's hand-rolled
+reconnect path, which since the nats.zig migration is the OUTER guard — it runs when
+the library gives up. Short idle bounces heal inside the library (reconnect with a
+pending buffer, §the migration header), so the transport reconnected 50 times and
+the metric counted the 7 occasions the fallback had to act. A Grafana panel asking
+"how flaky was my broker?" got the answer to "how often did the fallback fire?" —
+§10bu/§10cd-class calm-during-failure, one layer up.
+
+Fix at the transport: nats.zig exposes `reconnected_cb` (fired under `was_reconnect`
+only, after subscriptions are restored). The callback carries no user-data pointer,
+so the process-singleton publisher parks its metrics in a module-level slot for the
+hook. The manual path KEEPS its own increment — disjoint by construction: the hook
+fires only on internal reconnects of an existing connection, the fallback only ever
+makes a fresh connection whose first connect never fires the hook.
+
+The second run taught the second lesson: with the hook wired the counter read 12,
+not ~50 — and the bridge log proved 12 is the TRUTH. Adjacent bounces merge: the
+broker's up-window between ~2 s cycles is shorter than the library's flat 2 s retry,
+so a cluster of bounces is ONE down period, one re-establishment. The run's log
+showed exactly 6 library self-heals (idle bounces) + 6 fallback fresh connections
+(a publish failing under wasp fire marks disconnected and abandons the healing
+connection) = 12. No counter on the bridge can count broker restarts it slept
+through; what it claims is SESSIONS. So the scenario stopped asserting a bounce
+ratio and now holds the metric to log ground truth — the hook logs each self-heal,
+churn asserts `metric == self-heals + fallbacks` and `self-heals >= 1` (the part
+that was invisible before this entry). `bridge_pg_reconnects_total` read 9/15 by
+the same merging, floor set at half. OBSERVABILITY.md row updated.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
