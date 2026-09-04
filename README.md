@@ -754,7 +754,7 @@ systemctl stop zebridge | pkill ./bridge | docker stop bridge
 
 ---
 
-## Client onboarding and revocation
+## Authentication between PG, ZB, NATS and the Consumer
 
 Four separate keys, four separate boundaries.
 
@@ -767,17 +767,13 @@ Four separate keys, four separate boundaries.
 
 ### Revoke a principal
 
-Three clocks, one aciton:
+One action: the DBA can revoke immediately a user's read and write access by removing the principal via the CLI:
 
-- The DBA can revoke immediately a user's read and write access by removing the principal via the CLI:
-  ```sh
-  ADMIN_DATABASE_URL=.... bridge --revoke <principal>
-  ```
-<!-- - After this, the client tenant is stil resolved, meaning he can read whatever his tenant grants. His tenant read scope is lost _on the next reconnection_.
+```sh
+ADMIN_DATABASE_URL=.... bridge --revoke <principal>
+```
 
-- The client looses his reads when the JWT expires, on the JWT TTL. -->
-
-### ZeBridge with Postgres
+### Authenticate ZeBridge with Postgres
 
 **DBA creates two USER profils in .env.bridge for the init scripts**:  each script _init.core.template.sql_ and _init.write.template.sql_ creates the two ZeBridge `USER` profils.
 
@@ -791,12 +787,12 @@ POSTGRES_WRITER_USER=bridge_writer      # created by init.write.template.sql
 POSTGRES_WRITER_PASSWORD=writer_password_changeme
 ```
 
-### ZeBridge with NATS
+### Authenticate ZeBridge with NATS
 
 **DBA mints the nkey pair for ZeBridge ↔ NATS**: mint the nkey pair a DBA installs between NATS and the bridge by using the bridge as a CLI:
 
 ```sh
-./bridge --gen-nkey >> .env.bridge
+bridge --gen-nkey >> .env.bridge
 ```
 
 appends to .env.bridge:
@@ -825,19 +821,7 @@ envsubst < nats-server.conf.template > nats-server.conf
 nats-server -js -m 8222 -c nats-server.conf
 ```
 
-Now that the two PG USER profils are created and the NKEY keypair in place, the DBA can run the database migrations and `zebridge_enable()` the tables on the publication.
-
-ZeBridge can now be started with the credentials:
-
-```sh
-set -a && source .env.bridge && set +a && \
-DATABASE_READER_URL=postgres://bridge_reader:reader_password_changeme@127.0.0.1:5432/postgres \
-DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres \
-NATS_BRIDGE_NKEY_SEED=SU... \
-./bridge --pub my_pub --slot my_slot --port 27434
-```
-
-### Client to NATS dance (Authentication)
+### Client Authentication
 
 ZeBridge **completely decouples** your application's authentication (passwords, OAuth, session cookies) from the data-sync authentication (NATS). It does not know or care how you authenticate your users.
 It only handles the minting of **NATS JWTs**, which act as cryptographically secure database credentials for your edge clients.

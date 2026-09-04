@@ -5,7 +5,7 @@
 /// deliberately does not own, the /bridge/health poll through the Vite proxy.
 
 import { createSignal, onCleanup, For } from 'solid-js';
-import grammar from '../../grammar.json';
+// import grammar from '../../grammar.json';
 import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
 import { makePgliteStorage } from 'zb-client-ts/pglite';
 import { init as zstdInit, decompress as zstdDecompress, createDCtx, decompressUsingDict } from '@bokuweb/zstd-wasm';
@@ -136,7 +136,7 @@ const zb = new ZeBridge({
   principal: PRINCIPAL,
   password: PASSWORD,
   creds: CREDS,
-  grammar,
+  grammar: null,
   durable: DURABLE,
   // Persistence follows the same switch as the SQLite file: DURABLE → `idb://`.
   storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: DURABLE }) : undefined,

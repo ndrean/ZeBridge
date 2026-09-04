@@ -1,7 +1,7 @@
 # Local changes to nats.zig
 
-Fixes made while migrating ZeBridge onto this library. Each entry: what broke, how it
-showed up, what changed. Upstream candidates unless noted.
+Fixes made while migrating my app onto this library.
+Each entry: what broke, how it showed up, what changed. Upstream candidates unless noted.
 
 ---
 
@@ -25,13 +25,12 @@ error: InvalidSubject
   src/jetstream.zig:468   fetch
 ```
 
-Misleading symptom: the subject was not malformed, it was **freed**. `validateSubject`
-was reading whatever the allocator had put back in that memory.
+Misleading symptom: the subject was not malformed, it was **freed**.
+`validateSubject` was reading whatever the allocator had put back in that memory.
 
 **Cause**
 
-`pullSubscribe` resolves the stream name, and frees it on return when it had to look it
-up:
+`pullSubscribe` resolves the stream name, and frees it on return when it had to look it up:
 
 ```zig
 const stream_name = if (options.stream) |s| s
@@ -41,31 +40,25 @@ const stream_name = if (options.stream) |s| s
 defer if (options.stream == null and subject != null) self.nc.allocator.free(stream_name);
 ```
 
-…but then stores that same pointer in the `PullSubscription`, which outlives the call:
+but then stores that same pointer in the `PullSubscription`, which outlives the call:
 
 ```zig
 pull_subscription.* = PullSubscription{ .stream_name = stream_name, ... };
 ```
 
-`fetch` later builds `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>` from it. Passing
-`.stream` explicitly avoids the path entirely, which is why it is easy to miss.
+`fetch` later builds `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>` from it.
+Passing `.stream` explicitly avoids the path entirely, which is why it is easy to miss.
 
 **Change**
 
 `src/jetstream.zig`:
 
-* `pullSubscribe` — `defer free` → `errdefer free`. Ownership moves to the subscription
-  once it is constructed; the `errdefer` still covers the failure paths before that.
-* `PullSubscription` — new `owns_stream_name: bool`, set from
-  `options.stream == null and subject != null`. Needed because by `deinit` time the
-  caller's `options` are long gone, so the struct has to remember whether the memory is
-  its own.
+* `pullSubscribe` — `defer free` → `errdefer free`.
+  Ownership moves to the subscription once it is constructed; the `errdefer` still covers the failure paths before that.
+* `PullSubscription` — new `owns_stream_name: bool`, set from `options.stream == null and subject != null`. Needed because by `deinit` time the caller's `options` are long gone, so the struct has to remember whether the memory is its own.
 * `PullSubscription.deinit` — frees `stream_name` when it owns it.
 
-⚠️ **`subscribe` (push) has the identical line and it is correct there** — that function
-only uses `stream_name` within its own body. I patched it first by matching on the text
-and had to revert: it would have leaked on every push subscription. The two lines look the
-same; only the lifetime differs.
+⚠️ **`subscribe` (push) has the identical line and it is correct there** — that function only uses `stream_name` within its own body. I patched it first by matching on the text and had to revert: it would have leaked on every push subscription. The two lines look the same; only the lifetime differs.
 
 **Verified**
 
@@ -74,9 +67,7 @@ cd spike && zig build && ./zig-out/bin/spike     # 12/12, on the path that used 
 cd nats.zig && zig build test                    # 104 + 167 tests pass
 ```
 
-The spike deliberately omits `.stream` so it takes the lookup path. A caller that passes
-`.stream` (as ZeBridge normally would, since grammar.json names it) never hits this,
-which is why it survived 249 commits.
+This survived 249 commits.
 
 
 ---
@@ -95,17 +86,14 @@ error(nats): Failed to send UNSUB for sid 1: error.Closed
 error(nats): Failed to send UNSUB for sid 1: error.Closed
 ```
 
-Note the ordering: the errors arrive *after* the connection is reported closed, which is
-the clue. Three of them because the bridge has three subscribers (publisher, snapshot
-listener, mutation listener).
+Note the ordering: the errors arrive *after* the connection is reported closed, which isthe clue.
+Three of them because my app has three subscribers.
 
 **Cause**
 
-`Connection.unsubscribe` (connection.zig ~:914) treats every failure of
-`unsubscribeInternal` as an error worth reporting. But sending `UNSUB` on a socket that is
-already closed cannot succeed *and does not need to* — the server drops all subscriptions
-for a connection when it goes away. It is an expected step in an ordinary shutdown, not a
-fault.
+`Connection.unsubscribe` (connection.zig ~:914) treats every failure of `unsubscribeInternal` as an error worth reporting.
+But sending `UNSUB` on a socket that is already closed cannot succeed *and does not need to* — the server drops all subscriptions for a connection when it goes away.
+It is an expected step in an ordinary shutdown, not a fault.
 
 Harmless in itself; the cost is that an operator learns to ignore `error(nats)`.
 
