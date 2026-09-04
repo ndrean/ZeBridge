@@ -61,6 +61,7 @@ GROUPS = {
         "offline":       ("client", "outbox replay by version"),
         "tiebreak":      ("client", "equal versions resolved by the tiebreak column"),
         "clamp":         ("client", "future versions clamped"),
+        "clockskew":     ("client", "LWW under a lying clock: theft bounded, loss audible, replicas convergent"),
         "widthguard":    ("client", "row width guard, psql and edge"),
         "rowsize":       ("client", "oversized row → verdict, not suspension"),
         "probe":         ("client", "read the schema, denied the write, once"),
