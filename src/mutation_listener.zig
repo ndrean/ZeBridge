@@ -370,6 +370,9 @@ pub const MutationListener = struct {
     /// What actually became of the last successfully-executed write — the three outcomes
     /// PROTOCOL.md §7.1 tells clients to key their outbox on.
     last_outcome: WriteOutcome = .applied,
+    /// Non-null while `applyBatched` has a pipeline open: routes `exec()` into
+    /// send-only mode. Always null on the per-message path.
+    batch_ctx: ?*BatchCtx = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -902,32 +905,54 @@ pub const MutationListener = struct {
                 msg.ack() catch {};
     }
 
-    /// The whole fetched batch inside ONE explicit transaction — the ingress-side
-    /// mirror of the clients' batched applies (§10cq finding 2): per-mutation
-    /// implicit transactions paid one WAL flush EACH, which is the ~50/s ceiling
-    /// §10cr measured while PostgreSQL coasted. Each mutation still re-scopes its
-    /// own principal — its trio begins with set_config(is_local), which re-sets
-    /// inside the shared transaction — so identities never bleed. Verdicts and
-    /// acks are DEFERRED until after COMMIT: a verdict issued earlier would vouch
-    /// for a write a later rollback erases. ANY failure rolls the whole batch
-    /// back and the caller replays per-message.
-    fn applyBatched(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msgs: []const *nats.JetStreamMessage) !void {
-        const Snap = struct {
+    const BatchCtx = struct {
+        arena: std.heap.ArenaAllocator,
+        pending: std.ArrayListUnmanaged(Pending) = .empty,
+        entered: bool = false,
+
+        const Pending = struct {
             msg: *nats.JetStreamMessage,
             principal: []const u8,
-            outcome: WriteOutcome,
-            clamped: bool,
-            version_buf: [64]u8,
-            version_len: usize,
+            table: []const u8,
+            classify_sql: [:0]const u8,
+            classify_params: []const ?[*:0]const u8,
+            affected0: bool = false,
+            outcome: WriteOutcome = .applied,
+            clamped: bool = false,
+            version_buf: [64]u8 = undefined,
+            version_len: usize = 0,
         };
-        var snaps: std.ArrayListUnmanaged(Snap) = .empty;
-        defer snaps.deinit(self.allocator);
+    };
 
-        if (!execSimple(conn, "BEGIN")) return error.BatchBegin;
-        var committed = false;
-        defer if (!committed) {
-            _ = execSimple(conn, "ROLLBACK");
-        };
+    /// The whole fetched batch behind ONE pipeline sync — one implicit
+    /// transaction, ONE WAL flush, one round trip for N mutations (§10cs rungs
+    /// 2+3; rung 1's explicit BEGIN/COMMIT still paid a pipeline sync per
+    /// mutation and measured ~1,200/s). The classify probe is DEFERRED: it only
+    /// disambiguates stale-from-deleted, which only matters when the write
+    /// touched zero rows — the rare case gets a small second round, the common
+    /// case never pays for it.
+    ///
+    /// Identities cannot bleed: every mutation's pair still begins with its own
+    /// `set_config(zb.principal, is_local)`, re-scoping RLS inside the shared
+    /// implicit transaction. Verdicts and acks come only after the sync — which
+    /// is also the COMMIT, so nothing ever vouches for a rolled-back write. Any
+    /// failure before or at the sync aborts the implicit transaction whole
+    /// (nothing persisted) and the caller replays per-message. A failure in the
+    /// classify round is different — the writes ARE committed by then — so its
+    /// messages are NAK'd to retry (a re-applied same-version write lands on the
+    /// same zero-affected question) while the rest get their verdicts.
+    ///
+    /// ⚠️ Metas are PRE-WARMED before the pipeline opens: a `tableMeta` cache
+    /// miss issues its own synchronous catalog query, which is illegal inside
+    /// pipeline mode.
+    fn applyBatched(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msgs: []const *nats.JetStreamMessage) !void {
+        var bc = BatchCtx{ .arena = std.heap.ArenaAllocator.init(self.allocator) };
+        defer bc.arena.deinit();
+        defer bc.pending.deinit(self.allocator);
+
+        const Parsed = struct { msg: *nats.JetStreamMessage, mutation: Mutation };
+        var parsed: std.ArrayListUnmanaged(Parsed) = .empty;
+        defer parsed.deinit(self.allocator);
 
         for (msgs) |msg| {
             const payload = msg.msg.data;
@@ -947,43 +972,314 @@ pub const MutationListener = struct {
                 msg.ack() catch {};
                 continue;
             }
-            self.clearFailure();
-            try self.handleMutation(mutation, payload, conn);
-            var snap = Snap{
-                .msg = msg,
-                .principal = mutation.principal,
-                .outcome = self.last_outcome,
-                .clamped = self.last_clamped,
-                .version_buf = undefined,
-                .version_len = self.last_version_len,
-            };
-            @memcpy(snap.version_buf[0..snap.version_len], self.last_version_buf[0..snap.version_len]);
-            try snaps.append(self.allocator, snap);
+            // Pre-warm the meta OUTSIDE pipeline mode; an error here fails the
+            // batch before anything was sent — the per-message replay owns the
+            // dead-letter/verdict semantics for it.
+            _ = try self.tableMeta(conn, mutation.table);
+            try parsed.append(self.allocator, .{ .msg = msg, .mutation = mutation });
+        }
+        if (parsed.items.len == 0) return;
+
+        self.batch_ctx = &bc;
+        {
+            defer self.batch_ctx = null;
+            for (parsed.items) |pm| {
+                self.clearFailure();
+                self.handleMutation(pm.mutation, pm.msg.msg.data, conn) catch |err| {
+                    self.abortOpenPipeline(conn, &bc);
+                    return err; // nothing committed — replay per-message
+                };
+                bc.pending.items[bc.pending.items.len - 1].msg = pm.msg;
+            }
+        }
+        if (!bc.entered or bc.pending.items.len == 0) {
+            self.abortOpenPipeline(conn, &bc);
+            return;
         }
 
-        if (!execSimple(conn, "COMMIT")) return error.BatchCommit;
-        committed = true;
+        try self.drainBatch(conn, &bc); // errors: implicit tx aborted at the sync — replay
 
-        for (snaps.items) |*snap| {
-            // The verdict body reads the listener's last_* fields — restore this
-            // message's snapshot before speaking for it.
+        // ── rung 3's second act: only the zero-affected need the classify ──
+        var need: usize = 0;
+        for (bc.pending.items) |*pnd| {
+            if (pnd.affected0) need += 1;
+        }
+        var classified = true;
+        if (need > 0) {
+            self.classifyRound(conn, &bc) catch {
+                // The writes are COMMITTED; replay would re-apply. The undecided
+                // messages retry instead — a same-version re-apply reaches the
+                // same zero-affected question with a healthy connection.
+                classified = false;
+            };
+        }
+
+        for (bc.pending.items) |*pnd| {
+            if (pnd.affected0 and !classified) {
+                pnd.msg.nak() catch {};
+                continue;
+            }
             self.last_sqlstate_len = 0;
             self.last_error_len = 0;
-            self.last_clamped = snap.clamped;
-            self.last_version_len = snap.version_len;
-            @memcpy(self.last_version_buf[0..snap.version_len], snap.version_buf[0..snap.version_len]);
-            if (snap.clamped) {
-                log.info("🕒 clamped a future version [{s}] → {s}", .{ snap.principal, self.lastVersion() });
+            self.last_clamped = pnd.clamped;
+            self.last_version_len = pnd.version_len;
+            @memcpy(self.last_version_buf[0..pnd.version_len], pnd.version_buf[0..pnd.version_len]);
+            if (pnd.clamped) {
+                log.info("🕒 clamped a future version [{s}] → {s}", .{ pnd.principal, self.lastVersion() });
             }
-            self.publishVerdict(conn_nats, snap.msg, snap.principal, snap.outcome.wireName(), if (snap.clamped) "version_clamped" else "");
-            snap.msg.ack() catch {};
+            self.publishVerdict(conn_nats, pnd.msg, pnd.principal, pnd.outcome.wireName(), if (pnd.clamped) "version_clamped" else "");
+            pnd.msg.ack() catch {};
         }
     }
 
-    fn execSimple(conn: ?*c.PGconn, sql: [*:0]const u8) bool {
-        const r = c.PQexec(conn, sql);
-        defer c.PQclear(r);
-        return c.PQresultStatus(r) == c.PGRES_COMMAND_OK;
+    /// exec()'s send-only half: the principal + the write, queued into the open
+    /// batch pipeline; the classify is copied aside for the deferred round.
+    fn execBatchSend(
+        self: *MutationListener,
+        bc: *BatchCtx,
+        conn: ?*c.PGconn,
+        mutation: Mutation,
+        sql_z: [:0]const u8,
+        params: []const ?[*:0]const u8,
+        classify_sql: []const u8,
+        classify_params: []const ?[*:0]const u8,
+    ) !void {
+        if (!bc.entered) {
+            if (c.PQenterPipelineMode(conn) != 1) {
+                const msg_ptr = c.PQerrorMessage(conn);
+                self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+                return error.MutationFailed;
+            }
+            bc.entered = true;
+        }
+        const a = bc.arena.allocator();
+        const principal_z = try a.dupeZ(u8, mutation.principal);
+        const set_params = [_]?[*:0]const u8{principal_z.ptr};
+        const set_sql = "SELECT set_config('" ++ config.Sync.principal_setting ++ "', $1, true)";
+        if (c.PQsendQueryParams(conn, set_sql, 1, null, &set_params[0], null, null, 0) != 1 or
+            c.PQsendQueryParams(
+                conn,
+                sql_z.ptr,
+                @intCast(params.len),
+                null,
+                if (params.len > 0) &params[0] else null,
+                null,
+                null,
+                0,
+            ) != 1)
+        {
+            const msg_ptr = c.PQerrorMessage(conn);
+            self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+            return error.MutationFailed;
+        }
+        // The classify materials outlive handleMutation's arena — copy them.
+        const csql = try a.dupeZ(u8, classify_sql);
+        const cps = try a.alloc(?[*:0]const u8, classify_params.len);
+        for (classify_params, 0..) |cp, k| {
+            cps[k] = if (cp) |v| (try a.dupeZ(u8, std.mem.span(v))).ptr else null;
+        }
+        try bc.pending.append(self.allocator, .{
+            .msg = undefined, // the caller stamps it right after handleMutation returns
+            .principal = mutation.principal,
+            .table = mutation.table,
+            .classify_sql = csql,
+            .classify_params = cps,
+        });
+    }
+
+    /// One sync for the whole batch, then N result-pairs read back in send order.
+    /// Every safety rule here is inherited from exec()'s drain: null separators
+    /// between statements, the trailing null AFTER the sync that must be consumed
+    /// or `PQexitPipelineMode` fails and the connection wedges, ABORTED results
+    /// for statements queued behind a failure, per-RESULT error messages.
+    fn drainBatch(self: *MutationListener, conn: ?*c.PGconn, bc: *BatchCtx) !void {
+        var exit_ok = true;
+        defer if (exit_ok and c.PQexitPipelineMode(conn) != 1) {
+            log.err("🔴 Could not leave pipeline mode ({s}) — the connection will be reset", .{c.PQerrorMessage(conn)});
+            c.PQreset(conn);
+        };
+
+        if (c.PQpipelineSync(conn) != 1) {
+            const msg_ptr = c.PQerrorMessage(conn);
+            self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
+            return error.MutationFailed;
+        }
+
+        var failed = false;
+        var pi: usize = 0; // which pending
+        var stmt: usize = 0; // 0 = set_config, 1 = the write
+        var nulls: usize = 0;
+        const expect_stmts = bc.pending.items.len * 2;
+        while (true) {
+            const r = c.PQgetResult(conn);
+            if (r == null) {
+                nulls += 1;
+                if (stmt == 1) {
+                    pi += 1;
+                    stmt = 0;
+                } else stmt = 1;
+                if (nulls > expect_stmts + 3) {
+                    failed = true;
+                    self.rememberFailure("", "connection closed while reading batch pipeline results");
+                    log.err("🔴 Batch pipeline drained without a sync point — connection lost?", .{});
+                    exit_ok = false;
+                    c.PQreset(conn);
+                    break;
+                }
+                continue;
+            }
+            defer c.PQclear(r);
+            const st = c.PQresultStatus(r);
+            if (st == c.PGRES_PIPELINE_SYNC) {
+                while (true) {
+                    const trailing = c.PQgetResult(conn);
+                    if (trailing == null) break;
+                    c.PQclear(trailing);
+                }
+                break;
+            }
+            if (st == c.PGRES_PIPELINE_ABORTED) {
+                failed = true;
+                continue;
+            }
+            if (st != c.PGRES_COMMAND_OK and st != c.PGRES_TUPLES_OK) {
+                failed = true;
+                const state = c.PQresultErrorField(r, c.PG_DIAG_SQLSTATE);
+                const sqlstate: []const u8 = if (state != null) std.mem.span(state) else "";
+                if (pi < bc.pending.items.len and (std.mem.eql(u8, sqlstate, "42703") or std.mem.eql(u8, sqlstate, "42P01"))) {
+                    self.invalidate(bc.pending.items[pi].table);
+                }
+                const msg_ptr = c.PQresultErrorMessage(r);
+                const msg_text: []const u8 = if (msg_ptr != null) std.mem.span(msg_ptr) else "";
+                self.rememberFailure(sqlstate, msg_text);
+                if (pi < bc.pending.items.len) {
+                    log.info("⛔ Batched mutation refused [{s}] on '{s}': {s} — the batch replays per-message", .{ bc.pending.items[pi].principal, bc.pending.items[pi].table, msg_text });
+                }
+                continue;
+            }
+            if (stmt == 1 and pi < bc.pending.items.len) {
+                const pnd = &bc.pending.items[pi];
+                const tuples = std.mem.span(c.PQcmdTuples(r));
+                pnd.affected0 = std.mem.eql(u8, tuples, "0");
+                if (c.PQntuples(r) > 0 and c.PQgetisnull(r, 0, 0) == 0) {
+                    const stored = std.mem.span(c.PQgetvalue(r, 0, 0));
+                    pnd.version_len = @min(stored.len, pnd.version_buf.len);
+                    @memcpy(pnd.version_buf[0..pnd.version_len], stored[0..pnd.version_len]);
+                    if (c.PQnfields(r) > 1 and c.PQgetisnull(r, 0, 1) == 0) {
+                        pnd.clamped = std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 1)), "t");
+                    }
+                }
+            }
+        }
+        if (failed) return error.MutationFailed;
+    }
+
+    /// The deferred stale-vs-deleted disambiguation, only for writes that touched
+    /// zero rows. Reads run AFTER the batch's commit, which is exactly what the
+    /// question means: what state did the row END in.
+    fn classifyRound(self: *MutationListener, conn: ?*c.PGconn, bc: *BatchCtx) !void {
+        _ = self;
+        if (c.PQenterPipelineMode(conn) != 1) return error.MutationFailed;
+        var exit_ok = true;
+        defer if (exit_ok and c.PQexitPipelineMode(conn) != 1) {
+            log.err("🔴 Could not leave pipeline mode after classify ({s}) — the connection will be reset", .{c.PQerrorMessage(conn)});
+            c.PQreset(conn);
+        };
+        var expected: usize = 0;
+        for (bc.pending.items) |*pnd| {
+            if (!pnd.affected0) continue;
+            if (c.PQsendQueryParams(
+                conn,
+                pnd.classify_sql.ptr,
+                @intCast(pnd.classify_params.len),
+                null,
+                if (pnd.classify_params.len > 0) &pnd.classify_params[0] else null,
+                null,
+                null,
+                0,
+            ) != 1) return error.MutationFailed;
+            expected += 1;
+        }
+        if (c.PQpipelineSync(conn) != 1) return error.MutationFailed;
+
+        var failed = false;
+        var idx: usize = 0; // walks the affected0 subset in order
+        var nulls: usize = 0;
+        while (true) {
+            const r = c.PQgetResult(conn);
+            if (r == null) {
+                nulls += 1;
+                idx += 1;
+                if (nulls > expected + 3) {
+                    failed = true;
+                    exit_ok = false;
+                    c.PQreset(conn);
+                    break;
+                }
+                continue;
+            }
+            defer c.PQclear(r);
+            const st = c.PQresultStatus(r);
+            if (st == c.PGRES_PIPELINE_SYNC) {
+                while (true) {
+                    const trailing = c.PQgetResult(conn);
+                    if (trailing == null) break;
+                    c.PQclear(trailing);
+                }
+                break;
+            }
+            if (st == c.PGRES_PIPELINE_ABORTED) {
+                failed = true;
+                continue;
+            }
+            if (st != c.PGRES_TUPLES_OK) {
+                failed = true;
+                continue;
+            }
+            // idx-th zero-affected pending, in send order
+            var seen: usize = 0;
+            for (bc.pending.items) |*pnd| {
+                if (!pnd.affected0) continue;
+                if (seen == idx) {
+                    const row_exists = c.PQntuples(r) > 0;
+                    const tombstoned = row_exists and c.PQgetisnull(r, 0, 0) == 0 and
+                        std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 0)), "t");
+                    pnd.outcome = if (!row_exists or tombstoned) .row_deleted else .stale;
+                    break;
+                }
+                seen += 1;
+            }
+        }
+        if (failed) return error.MutationFailed;
+    }
+
+    /// A batch that dies after entering pipeline mode but before its sync leaves
+    /// queued statements on the wire; the sync both delimits them and ROLLS BACK
+    /// the implicit transaction they began. Drain everything, then exit.
+    fn abortOpenPipeline(self: *MutationListener, conn: ?*c.PGconn, bc: *BatchCtx) void {
+        _ = self;
+        if (!bc.entered) return;
+        if (c.PQpipelineSync(conn) == 1) {
+            var guard: usize = 0;
+            while (guard < 4096) : (guard += 1) {
+                const r = c.PQgetResult(conn);
+                if (r == null) continue;
+                const st = c.PQresultStatus(r);
+                c.PQclear(r);
+                if (st == c.PGRES_PIPELINE_SYNC) {
+                    while (true) {
+                        const trailing = c.PQgetResult(conn);
+                        if (trailing == null) break;
+                        c.PQclear(trailing);
+                    }
+                    break;
+                }
+            }
+        }
+        if (c.PQexitPipelineMode(conn) != 1) {
+            log.err("🔴 Could not leave pipeline mode after an aborted batch ({s}) — the connection will be reset", .{c.PQerrorMessage(conn)});
+            c.PQreset(conn);
+        }
     }
 
     /// Copy the reason out of libpq before the next call overwrites it.
@@ -2174,6 +2470,15 @@ pub const MutationListener = struct {
         // ⚠️ Client-side only: libpq ≥ 14 to **build**, and works against any server
         // speaking the v3 extended query protocol. It does not raise the PostgreSQL
         // version floor.
+        // Batched pipelining (§10cs rungs 2+3): while a batch context is open,
+        // exec() only SENDS — set_config + the write, NO classify (deferred to a
+        // rare second round for zero-affected writes only) and NO sync. The whole
+        // batch shares one sync — one implicit transaction, one fsync, one round
+        // trip — and is drained by `drainBatch`.
+        if (self.batch_ctx) |bc| {
+            return self.execBatchSend(bc, conn, mutation, sql_z, params, classify_sql, classify_params);
+        }
+
         if (c.PQenterPipelineMode(conn) != 1) {
             const msg_ptr = c.PQerrorMessage(conn);
             self.rememberFailure("", if (msg_ptr != null) std.mem.span(msg_ptr) else "");
