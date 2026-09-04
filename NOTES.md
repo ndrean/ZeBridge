@@ -8840,6 +8840,30 @@ of scope — the sync layer needed NOTHING (the outbox, the stale verdict, the
 CDC echo were already the complete toolkit), which is itself the strongest
 argument that the layering is right.
 
+## 10cs. Ingress batch-apply: ~50/s → ~1,200/s, nothing about PostgreSQL changed (2026-09-04)
+
+§10cr's wall, dismantled with §10cq's own medicine. The listener fetched ONE
+message per JetStream pull and closed ONE implicit transaction per mutation —
+a pull round trip, a pipeline sync, a WAL fsync, a verdict and an ack, each,
+every time. ~20 ms of choreography per mutation is the whole ~50/s ceiling;
+PostgreSQL idled underneath it.
+
+Now: `fetch(mutation_pull_batch = 64)`, and at queue depth ≥ 2 the batch runs
+inside ONE explicit transaction — one fsync for the lot. Identities cannot
+bleed: every mutation's trio still begins with its own `set_config(zb.principal,
+is_local)`, re-scoping RLS inside the shared transaction (the old "one mutation,
+one transaction" comment was written for the naive sharing WITHOUT per-trio
+re-scoping, and now says so). Verdicts and acks are DEFERRED until after COMMIT —
+a verdict issued earlier would vouch for a write a later rollback erases. Any
+failure rolls the whole batch back and replays every message through the
+untouched per-message path (`processOne`, the old loop body verbatim): full
+retry budgets, dead-letters, rejection verdicts, exactly as before — and depth 1
+takes that path directly, so light load keeps the old semantics to the byte.
+
+Measured: 5,000 flooded mutations applied in 4.3 s — **~1,200/s, a 24× lift** —
+and the 12-client full-fault smoke passed whole on top of a 25k-row replica
+history. The 100-client soak re-run is the at-scale confirmation.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

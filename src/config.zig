@@ -37,6 +37,11 @@ pub const Nats = struct {
     /// fetch speed (the sleep once ran unconditionally and capped ingress at
     /// ~10 msg/s; see mutation_listener.zig).
     pub const mutation_pull_idle_ms = 100;
+    /// How many mutations one JetStream pull may return. Depth ≥ 2 engages the
+    /// batched apply (one explicit transaction, ONE WAL flush for the lot —
+    /// §10cr measured the per-mutation ceiling at ~50/s); depth 1 takes the
+    /// per-message path unchanged, so light load keeps today's exact semantics.
+    pub const mutation_pull_batch = 64;
 
     /// Derived, never written out again. Nothing in the live path builds a URL any more
     /// — `Endpoint` below is the address, and a URL is only ever an *input* — but the

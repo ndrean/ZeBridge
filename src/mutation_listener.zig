@@ -520,155 +520,28 @@ pub const MutationListener = struct {
                 log.info("Mutation listener: Reconnected to PostgreSQL.", .{});
             }
 
-            // One message at a time, with a short timeout so shutdown is responsive.
+            // One pull for a whole batch: at depth >= 2 the batched apply amortizes
+            // the WAL flush and the round trips (§10cr measured the one-at-a-time
+            // ceiling at ~50 mutations/s while PostgreSQL coasted); a single
+            // message takes the per-message path, so light load keeps today's
+            // exact semantics — and so does every failure, via the replay below.
             //
             // ⚠️ Status frames (408, 409, idle heartbeats) are handled by the library now
-            // — it recognises them and does not surface them as messages. The vendored
-            // client did not, and acking one panicked because `Consumer.ack` unwrapped a
-            // null ReplyTo; the guard for that lived here.
-            var batch = consumer.fetch(1, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } }) catch {
+            // — it recognises them and does not surface them as messages.
+            var batch = consumer.fetch(config.Nats.mutation_pull_batch, .{ .duration = .{ .raw = .fromMilliseconds(500), .clock = .awake } }) catch {
                 continue;
             };
             defer batch.deinit();
 
-            for (batch.messages) |msg| {
-                const payload = msg.msg.data;
-
-                // Subject first: it carries the identity, the table and the verb, and
-                // all three are refused before a byte of the payload is decoded.
-                const subject = msg.msg.subject;
-                const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
-                    // `warn`, not `err` — and not `info` either. Client-caused like the
-                    // refusals below, so it is not the operator's to fix. But it is the
-                    // one client fault where **nobody is told**: the principal lives in
-                    // the subject, and the subject is what failed to parse, so there is
-                    // no address to send a verdict to. Worth keeping visible for exactly
-                    // that reason.
-                    log.warn("⚠️  Malformed mutation subject '{s}' ({}): dead-lettering, and no verdict is addressable", .{ subject, err });
-                    self.deadLetter(conn_nats, msg, payload, err);
-                    msg.ack() catch {};
-                    continue;
+            if (batch.messages.len > 1) {
+                self.applyBatched(conn, conn_nats, batch.messages) catch {
+                    // The transaction rolled back whole; every message replays
+                    // through the per-message path — the full retry, dead-letter
+                    // and verdict machinery decides there. No delivery budget was
+                    // spent in the failed attempt (nothing was acked or NAK'd).
+                    for (batch.messages) |msg| self.processOne(conn, conn_nats, msg);
                 };
-
-                if (isForbiddenTable(mutation.table)) {
-                    // Policy, not a fault: a client reaching for this table is refused by
-                    // design. Worth tracing — it is the one refusal that would matter if
-                    // it ever *succeeded* — but it asks nothing of the operator.
-                    log.info(
-                        "⛔ '{s}' refused writes to '{s}': the bridge's own table, where a forged row would publish a fabricated schema to every client",
-                        .{ mutation.principal, mutation.table },
-                    );
-                    self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
-                    msg.ack() catch {};
-                    continue;
-                }
-
-                // Each attempt starts with no remembered reason, so a verdict can only
-                // ever quote a failure from *this* message.
-                self.clearFailure();
-                self.handleMutation(mutation, payload, conn) catch |err| {
-                    // Retrying a malformed payload cannot help: the bytes will not
-                    // improve. Before this split, one bad message NAK'd forever at one
-                    // attempt per second and the queue never advanced past it.
-                    if (isPermanent(err)) {
-                        if (isOperatorFault(err)) {
-                            // One line for every operator fault: the specific reason was
-                            // already logged where it was detected (`tableMeta`), and
-                            // `DbAllocatedKey` is not a SYNC_RULES disagreement — it is
-                            // the table's key shape — so this stays generic.
-                            log.err(
-                                "🔴 '{s}' cannot accept writes ({}): only a migration or a SYNC_RULES change can fix this. Preflight reports it at boot; see the line above for the reason.",
-                                .{ mutation.table, err },
-                            );
-                        } else {
-                            // Traced, not raised: the client is the only one who can fix a
-                            // payload, and the verdict below is how they are told.
-                            log.info("⛔ Mutation refused [{s}] on '{s}': {} (not retrying)", .{ mutation.principal, mutation.table, err });
-                        }
-                        self.deadLetter(conn_nats, msg, payload, err);
-                        self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", @errorName(err));
-                        // ACK, not NACK: the message is handled — badly, but finally.
-                        msg.ack() catch {};
-                        continue;
-                    }
-
-                    // Every SQL error lands here, because the bridge cannot tell a
-                    // dropped connection from `permission denied` — so both get the full
-                    // retry budget. That is the right default and it is also why a client
-                    // used to learn nothing: after the last attempt the server stops
-                    // redelivering and **nobody is told anything at all**.
-                    //
-                    // The delivery count is in the message's own ack subject, so the
-                    // bridge can tell when it is out of attempts. On that last one, stop
-                    // pretending it is transient: say why, and ACK. A genuinely transient
-                    // failure still gets all five tries first.
-                    // The library parses this off the ack subject for us, including the
-                    // JetStream-domain form where every token shifts by two — the case
-                    // the bridge's own parser had to special-case.
-                    const out_of_attempts = msg.metadata.num_delivered >= config.Nats.mutation_max_deliver;
-                    // A SQLSTATE the server returned and we recognise as permanent ends
-                    // the retries now: waiting cannot change a privilege or a constraint.
-                    const hopeless = sqlstateIsPermanent(self.lastSqlstate());
-                    const final = out_of_attempts or hopeless;
-
-                    if (final) {
-                        if (hopeless) {
-                            // `info`: PostgreSQL evaluated the statement and refused it,
-                            // which is the boundary doing its job. Nothing here is the
-                            // operator's to fix — if the *grant* were the mistake,
-                            // preflight would already have said so at boot, because
-                            // SYNC_RULES naming an ungrantable table is checked there.
-                            log.info(
-                                "⛔ Mutation refused [{s}] on '{s}': SQLSTATE {s} (not retrying)",
-                                .{ mutation.principal, mutation.table, self.lastSqlstate() },
-                            );
-                        } else {
-                            log.err(
-                                "🔴 Mutation failed on the last of {d} attempts [{s}] on '{s}': {} ({s})",
-                                .{ config.Nats.mutation_max_deliver, mutation.principal, mutation.table, err, self.lastSqlstate() },
-                            );
-                        }
-                        self.deadLetter(conn_nats, msg, payload, err);
-                        self.publishVerdict(conn_nats, msg, mutation.principal, if (hopeless) "rejected" else "failed", @errorName(err));
-                        msg.ack() catch {};
-                        continue;
-                    }
-
-                    log.err("Failed to handle mutation, will retry: {}", .{err});
-                    msg.nak() catch {};
-                    utils.sleep(1 * std.time.ns_per_s);
-                    continue;
-                };
-
-                // ⚠️ A verdict on **every** write that PostgreSQL accepted, not only the
-                // ones that changed something. PROTOCOL.md §7.1 makes a client's outbox
-                // rule "pop only on a definitive reply", and the three definitive replies
-                // are all successes at the SQL level — `accepted`, `stale`, `row_deleted`.
-                // Publishing only on failure, which is what this did before, left a
-                // correct client unable to ever pop a successful write: it would retry
-                // forever, idempotently and invisibly.
-                //
-                // This is the one place the bridge speaks per-message rather than
-                // per-table, so it doubles ingress message count by construction. That is
-                // the cost of the outbox protocol, not an accident of this
-                // implementation — the alternative is a client that cannot distinguish
-                // "applied" from "lost in transit".
-                if (self.last_clamped) {
-                    log.info(
-                        "🕒 clamped a future version [{s}] on '{s}' → {s}",
-                        .{ mutation.principal, mutation.table, self.lastVersion() },
-                    );
-                }
-                self.publishVerdict(
-                    conn_nats,
-                    msg,
-                    mutation.principal,
-                    self.last_outcome.wireName(),
-                    if (self.last_clamped) "version_clamped" else "",
-                );
-
-                msg.ack() catch {};
-            }
+            } else for (batch.messages) |msg| self.processOne(conn, conn_nats, msg);
 
             // Sleep ONLY when the fetch came back empty. This was a `for … else`,
             // meant as "sleep on timeout" — but Zig runs the else on every normal
@@ -884,6 +757,233 @@ pub const MutationListener = struct {
             return;
         };
         log.info("📮 verdict → {s}: {s}", .{ subject, body });
+    }
+
+    /// One message through the FULL per-message machinery: parse, refuse,
+    /// apply in its own implicit transaction, verdict, ack/NAK — extracted
+    /// verbatim from the pull loop when the batched path arrived (§10cr), and
+    /// still the path every message takes at queue depth 1 and on batch replay.
+    fn processOne(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage) void {
+                const payload = msg.msg.data;
+
+                // Subject first: it carries the identity, the table and the verb, and
+                // all three are refused before a byte of the payload is decoded.
+                const subject = msg.msg.subject;
+                const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
+                    // `warn`, not `err` — and not `info` either. Client-caused like the
+                    // refusals below, so it is not the operator's to fix. But it is the
+                    // one client fault where **nobody is told**: the principal lives in
+                    // the subject, and the subject is what failed to parse, so there is
+                    // no address to send a verdict to. Worth keeping visible for exactly
+                    // that reason.
+                    log.warn("⚠️  Malformed mutation subject '{s}' ({}): dead-lettering, and no verdict is addressable", .{ subject, err });
+                    self.deadLetter(conn_nats, msg, payload, err);
+                    msg.ack() catch {};
+                    return;
+                };
+
+                if (isForbiddenTable(mutation.table)) {
+                    // Policy, not a fault: a client reaching for this table is refused by
+                    // design. Worth tracing — it is the one refusal that would matter if
+                    // it ever *succeeded* — but it asks nothing of the operator.
+                    log.info(
+                        "⛔ '{s}' refused writes to '{s}': the bridge's own table, where a forged row would publish a fabricated schema to every client",
+                        .{ mutation.principal, mutation.table },
+                    );
+                    self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
+                    msg.ack() catch {};
+                    return;
+                }
+
+                // Each attempt starts with no remembered reason, so a verdict can only
+                // ever quote a failure from *this* message.
+                self.clearFailure();
+                self.handleMutation(mutation, payload, conn) catch |err| {
+                    // Retrying a malformed payload cannot help: the bytes will not
+                    // improve. Before this split, one bad message NAK'd forever at one
+                    // attempt per second and the queue never advanced past it.
+                    if (isPermanent(err)) {
+                        if (isOperatorFault(err)) {
+                            // One line for every operator fault: the specific reason was
+                            // already logged where it was detected (`tableMeta`), and
+                            // `DbAllocatedKey` is not a SYNC_RULES disagreement — it is
+                            // the table's key shape — so this stays generic.
+                            log.err(
+                                "🔴 '{s}' cannot accept writes ({}): only a migration or a SYNC_RULES change can fix this. Preflight reports it at boot; see the line above for the reason.",
+                                .{ mutation.table, err },
+                            );
+                        } else {
+                            // Traced, not raised: the client is the only one who can fix a
+                            // payload, and the verdict below is how they are told.
+                            log.info("⛔ Mutation refused [{s}] on '{s}': {} (not retrying)", .{ mutation.principal, mutation.table, err });
+                        }
+                        self.deadLetter(conn_nats, msg, payload, err);
+                        self.publishVerdict(conn_nats, msg, mutation.principal, "rejected", @errorName(err));
+                        // ACK, not NACK: the message is handled — badly, but finally.
+                        msg.ack() catch {};
+                        return;
+                    }
+
+                    // Every SQL error lands here, because the bridge cannot tell a
+                    // dropped connection from `permission denied` — so both get the full
+                    // retry budget. That is the right default and it is also why a client
+                    // used to learn nothing: after the last attempt the server stops
+                    // redelivering and **nobody is told anything at all**.
+                    //
+                    // The delivery count is in the message's own ack subject, so the
+                    // bridge can tell when it is out of attempts. On that last one, stop
+                    // pretending it is transient: say why, and ACK. A genuinely transient
+                    // failure still gets all five tries first.
+                    // The library parses this off the ack subject for us, including the
+                    // JetStream-domain form where every token shifts by two — the case
+                    // the bridge's own parser had to special-case.
+                    const out_of_attempts = msg.metadata.num_delivered >= config.Nats.mutation_max_deliver;
+                    // A SQLSTATE the server returned and we recognise as permanent ends
+                    // the retries now: waiting cannot change a privilege or a constraint.
+                    const hopeless = sqlstateIsPermanent(self.lastSqlstate());
+                    const final = out_of_attempts or hopeless;
+
+                    if (final) {
+                        if (hopeless) {
+                            // `info`: PostgreSQL evaluated the statement and refused it,
+                            // which is the boundary doing its job. Nothing here is the
+                            // operator's to fix — if the *grant* were the mistake,
+                            // preflight would already have said so at boot, because
+                            // SYNC_RULES naming an ungrantable table is checked there.
+                            log.info(
+                                "⛔ Mutation refused [{s}] on '{s}': SQLSTATE {s} (not retrying)",
+                                .{ mutation.principal, mutation.table, self.lastSqlstate() },
+                            );
+                        } else {
+                            log.err(
+                                "🔴 Mutation failed on the last of {d} attempts [{s}] on '{s}': {} ({s})",
+                                .{ config.Nats.mutation_max_deliver, mutation.principal, mutation.table, err, self.lastSqlstate() },
+                            );
+                        }
+                        self.deadLetter(conn_nats, msg, payload, err);
+                        self.publishVerdict(conn_nats, msg, mutation.principal, if (hopeless) "rejected" else "failed", @errorName(err));
+                        msg.ack() catch {};
+                        return;
+                    }
+
+                    log.err("Failed to handle mutation, will retry: {}", .{err});
+                    msg.nak() catch {};
+                    utils.sleep(1 * std.time.ns_per_s);
+                    return;
+                };
+
+                // ⚠️ A verdict on **every** write that PostgreSQL accepted, not only the
+                // ones that changed something. PROTOCOL.md §7.1 makes a client's outbox
+                // rule "pop only on a definitive reply", and the three definitive replies
+                // are all successes at the SQL level — `accepted`, `stale`, `row_deleted`.
+                // Publishing only on failure, which is what this did before, left a
+                // correct client unable to ever pop a successful write: it would retry
+                // forever, idempotently and invisibly.
+                //
+                // This is the one place the bridge speaks per-message rather than
+                // per-table, so it doubles ingress message count by construction. That is
+                // the cost of the outbox protocol, not an accident of this
+                // implementation — the alternative is a client that cannot distinguish
+                // "applied" from "lost in transit".
+                if (self.last_clamped) {
+                    log.info(
+                        "🕒 clamped a future version [{s}] on '{s}' → {s}",
+                        .{ mutation.principal, mutation.table, self.lastVersion() },
+                    );
+                }
+                self.publishVerdict(
+                    conn_nats,
+                    msg,
+                    mutation.principal,
+                    self.last_outcome.wireName(),
+                    if (self.last_clamped) "version_clamped" else "",
+                );
+
+                msg.ack() catch {};
+    }
+
+    /// The whole fetched batch inside ONE explicit transaction — the ingress-side
+    /// mirror of the clients' batched applies (§10cq finding 2): per-mutation
+    /// implicit transactions paid one WAL flush EACH, which is the ~50/s ceiling
+    /// §10cr measured while PostgreSQL coasted. Each mutation still re-scopes its
+    /// own principal — its trio begins with set_config(is_local), which re-sets
+    /// inside the shared transaction — so identities never bleed. Verdicts and
+    /// acks are DEFERRED until after COMMIT: a verdict issued earlier would vouch
+    /// for a write a later rollback erases. ANY failure rolls the whole batch
+    /// back and the caller replays per-message.
+    fn applyBatched(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msgs: []const *nats.JetStreamMessage) !void {
+        const Snap = struct {
+            msg: *nats.JetStreamMessage,
+            principal: []const u8,
+            outcome: WriteOutcome,
+            clamped: bool,
+            version_buf: [64]u8,
+            version_len: usize,
+        };
+        var snaps: std.ArrayListUnmanaged(Snap) = .empty;
+        defer snaps.deinit(self.allocator);
+
+        if (!execSimple(conn, "BEGIN")) return error.BatchBegin;
+        var committed = false;
+        defer if (!committed) {
+            _ = execSimple(conn, "ROLLBACK");
+        };
+
+        for (msgs) |msg| {
+            const payload = msg.msg.data;
+            const subject = msg.msg.subject;
+            const mutation = parseSubject(subject, self.endpoint_topology.subject_mutations_prefix) catch |err| {
+                log.warn("⚠️  Malformed mutation subject '{s}' ({}): dead-lettering, and no verdict is addressable", .{ subject, err });
+                self.deadLetter(conn_nats, msg, payload, err);
+                msg.ack() catch {};
+                continue;
+            };
+            if (isForbiddenTable(mutation.table)) {
+                log.info(
+                    "⛔ '{s}' refused writes to '{s}': the bridge's own table, where a forged row would publish a fabricated schema to every client",
+                    .{ mutation.principal, mutation.table },
+                );
+                self.deadLetter(conn_nats, msg, payload, error.ForbiddenTable);
+                msg.ack() catch {};
+                continue;
+            }
+            self.clearFailure();
+            try self.handleMutation(mutation, payload, conn);
+            var snap = Snap{
+                .msg = msg,
+                .principal = mutation.principal,
+                .outcome = self.last_outcome,
+                .clamped = self.last_clamped,
+                .version_buf = undefined,
+                .version_len = self.last_version_len,
+            };
+            @memcpy(snap.version_buf[0..snap.version_len], self.last_version_buf[0..snap.version_len]);
+            try snaps.append(self.allocator, snap);
+        }
+
+        if (!execSimple(conn, "COMMIT")) return error.BatchCommit;
+        committed = true;
+
+        for (snaps.items) |*snap| {
+            // The verdict body reads the listener's last_* fields — restore this
+            // message's snapshot before speaking for it.
+            self.last_sqlstate_len = 0;
+            self.last_error_len = 0;
+            self.last_clamped = snap.clamped;
+            self.last_version_len = snap.version_len;
+            @memcpy(self.last_version_buf[0..snap.version_len], snap.version_buf[0..snap.version_len]);
+            if (snap.clamped) {
+                log.info("🕒 clamped a future version [{s}] → {s}", .{ snap.principal, self.lastVersion() });
+            }
+            self.publishVerdict(conn_nats, snap.msg, snap.principal, snap.outcome.wireName(), if (snap.clamped) "version_clamped" else "");
+            snap.msg.ack() catch {};
+        }
+    }
+
+    fn execSimple(conn: ?*c.PGconn, sql: [*:0]const u8) bool {
+        const r = c.PQexec(conn, sql);
+        defer c.PQclear(r);
+        return c.PQresultStatus(r) == c.PGRES_COMMAND_OK;
     }
 
     /// Copy the reason out of libpq before the next call overwrites it.
@@ -2039,9 +2139,11 @@ pub const MutationListener = struct {
         // policy`. Enabling RLS would look like it broke the bridge.
         //
         // ⚠️ `SET LOCAL` is transaction-scoped, and outside a transaction PostgreSQL warns
-        // and does nothing — so the statement must be wrapped. One mutation, one
-        // transaction: a batch sharing a transaction would share the setting, and the
-        // second principal's rows would be written under the first one's identity.
+        // and does nothing — so the statement must be wrapped. Under the batched apply
+        // (§10cr) several mutations DO share one explicit transaction — safe only
+        // because every trio begins with its own set_config, re-scoping the principal
+        // before its statements run; drop that ordering and the second principal's
+        // rows would be written under the first one's identity.
         //
         // `set_config(..., is_local => true)` rather than `SET LOCAL zb.principal = '…'`
         // because it takes the value as a **parameter**. The principal comes from the
