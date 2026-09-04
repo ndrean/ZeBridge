@@ -8891,6 +8891,29 @@ errors — residual divergence a smooth per-replica lag spread (no cohorts, no
 stalls) against a 240 s settle too short for 100-client fan-out over a 62k-row
 history; the patience run (ZB_SETTLE_S=600) is the confirmation.
 
+**Rung 4, same night: `ZB_INGRESS_LANES`.** N fully isolated listeners — own
+PostgreSQL connection, own NATS connection, own meta cache and verdict state —
+pulling the ONE durable, which JetStream load-balances natively. LWW is the
+ordering license (out-of-order same-row applies converge; the doomed write
+learns `stale` a round early), and crossed-lock batch deadlocks self-heal
+through the rollback→per-message replay, where single-row transactions cannot
+deadlock. Default 1: byte-identical to the single-listener bridge, connbudget's
+arithmetic untouched.
+
+And a measurement lesson the first lane curve taught by lying: a 5,000-message
+flood drains in ~1.1 s, so ramp and fetch granularity dominated and THREE
+configurations measured "flat ~4.6k/s" — including 4 lanes. At 20,000 messages
+the truth surfaced: **1 lane ≈ 7.6k/s, 2 lanes ≈ 12.1k/s end-to-end, 4 flat vs
+2** (machine saturation — slow, RAM-tight, everything colocated). The 10k/s
+target falls at ZB_INGRESS_LANES=2. Full-fault smoke passed WHOLE with two
+lanes on a 99k-row world. The day's ingress ledger: ~50/s → ~12,000/s, 240×.
+
+Also from the patience soak (600 s settle, 100 clients): all alive, outboxes
+drained, zero errors — 22 replicas still lagged at audit because each now seeds
+a 94k-row ACCUMULATED history (the artifact of ~20 runs in one day) before
+absorbing the fan-out, on a saturated machine. Scenario debt: a residue-reset
+knob at swarm setup, so the audit measures the run, not the archaeology.
+
 Instrument honesty, for the record: capacity numbers come from the FLOOD BENCH
 (no faults, no fan-out — slightly flattering, since no consumers pull CDC during
 it); soaks measure convergence under abuse at an offered load ~50× below

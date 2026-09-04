@@ -1155,10 +1155,33 @@ pub fn main(init: std.process.Init) !void {
     var catalog_epoch: catalog_epoch_mod.CatalogEpoch = .{};
 
     var writer_config = pg_conn.PgConf.writer_from_runtime_config(&runtime_config);
-    var mut_listener: ?*mutation_listener.MutationListener = null;
+    // ── Rung 4 (§10cs): parallel ingress lanes ──────────────────────────────
+    // N independent listeners, each with its OWN PostgreSQL connection, NATS
+    // connection, table-meta cache and verdict state, all pulling from the ONE
+    // durable — JetStream load-balances the pullers, so lanes receive disjoint
+    // batches for free. LWW is the ordering license: two lanes applying the same
+    // row's writes out of order converge to the same winner (the older version
+    // is refused, which is the fate it had anyway). Two lanes' BATCHES can
+    // deadlock on crossed row locks — PostgreSQL kills one (40P01), the batch
+    // rolls back whole and replays per-message, where single-row transactions
+    // cannot deadlock. Self-healing, rare, and the price of the parallelism.
+    //
+    // Default 1: identical behavior to the single-listener bridge, and the
+    // connection-budget arithmetic the scenarios pin stays untouched. Raise it
+    // only where ingress throughput is the constraint (the serial lane measures
+    // ~4.6k mutations/s colocated).
+    const ingress_lanes: usize = blk: {
+        const raw = init.minimal.environ.getPosix("ZB_INGRESS_LANES") orelse break :blk 1;
+        const n = std.fmt.parseInt(usize, raw, 10) catch break :blk 1;
+        break :blk @min(@max(n, 1), 8);
+    };
+    var mut_listeners: std.ArrayListUnmanaged(*mutation_listener.MutationListener) = .empty;
+    defer mut_listeners.deinit(allocator);
     if (writer_config) |*wc| {
-        log.info("Starting mutation listener thread (role: {s})...", .{wc.role});
-        mut_listener = try mutation_listener.MutationListener.init(
+        log.info("Starting {d} mutation listener lane(s) (role: {s})...", .{ ingress_lanes, wc.role });
+        for (0..ingress_lanes) |lane_i| {
+            _ = lane_i;
+        const lane_ptr = try mutation_listener.MutationListener.init(
             allocator,
             wc,
             nats_endpoint,
@@ -1175,13 +1198,15 @@ pub fn main(init: std.process.Init) !void {
             // into an immediate, cheaper rejection with the same outcome.
             @min(own_event_buf, effective_row_budget),
         );
-        try mut_listener.?.start();
-        log.info("✅ Mutation listener thread started\n", .{});
+        try mut_listeners.append(allocator, lane_ptr);
+        try lane_ptr.start();
+        }
+        log.info("✅ Mutation listener lane(s) started\n", .{});
     } else {
         log.info("ℹ️  Ingress disabled: no POSTGRES_WRITER_USER/_PASSWORD configured", .{});
     }
-    defer if (mut_listener) |m| m.deinit();
-    defer if (mut_listener) |m| m.join();
+    defer for (mut_listeners.items) |m| m.deinit();
+    defer for (mut_listeners.items) |m| m.join();
     errdefer should_stop.store(true, .seq_cst);
 
     // ─── two startup checks on the ring buffer, before a byte of it is allocated ─────
