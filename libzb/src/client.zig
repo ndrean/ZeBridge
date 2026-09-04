@@ -820,10 +820,15 @@ pub const SyncClient = struct {
 
     fn drainStream(self: *SyncClient, stream: []const u8) !void {
         const last = try self.storedSeq(stream);
-        const sub = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
+        var sub = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
         defer sub.deinit(); // the server reaps the consumer itself — see openConsumer
 
         var max_seq: u64 = last;
+        // ONE reopen if the consumer dies under us mid-drain (a 409 under 12
+        // concurrent seeding clients, §10cq): the position is the client's, so a
+        // fresh consumer resumes exactly where the last batch left off. A second
+        // death is a real fault and propagates.
+        var reopened = false;
         while (true) {
             // ⚠️ Only a TIMEOUT means "caught up". A closed connection or a slow
             // consumer used to break here too — and then persist the position, which
@@ -838,6 +843,14 @@ pub const SyncClient = struct {
             // is a belt for a partial-batch `fetch` that returns nothing (it cannot).
             var batch = sub.fetch(100, .{ .duration = .{ .raw = .fromMilliseconds(900), .clock = .awake } }) catch |err| switch (err) {
                 error.Timeout => break, // the expiry: caught up to the tail
+                error.ConsumerSequenceMismatch, error.NoResponders => {
+                    if (reopened) return err;
+                    reopened = true;
+                    const fresh = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
+                    sub.deinit();
+                    sub = fresh;
+                    continue;
+                },
                 else => return err,
             };
             defer batch.deinit();
@@ -852,41 +865,65 @@ pub const SyncClient = struct {
     /// the bounded drain and the live tail. Returns the number of events offered to
     /// `applyEvent` (applied, gated or held — D1: all three ARE the position).
     fn applyBatch(self: *SyncClient, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, last: u64, max_seq: *u64) !usize {
-        var offered: usize = 0;
-        {
-            // Per-batch: every decoded event dies with the batch, except the FK-held
-            // ones, which are deep-copied into `held_arena` below.
-            var ba = std.heap.ArenaAllocator.init(self.a);
-            defer ba.deinit();
-            const a = ba.allocator();
-            for (messages) |m| {
-                const seq = m.metadata.sequence.stream;
-                const doc = decodeMsgpack(a, m.msg.data) catch {
-                    m.ack() catch {};
-                    continue;
-                };
-                const events: []const Value = if (doc == .array) doc.array.items else &.{doc};
-                for (events) |ev| {
-                    if (ev != .object) continue;
-                    const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
-                    if (self.states.get(table) == null) continue;
-                    offered += 1;
-                    self.applyEvent(table, ev, seq) catch |err| switch (err) {
-                        // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
-                        // event that is acked, positioned past, and never applied.
-                        error.FkHeld => {
-                            const ha = self.held_arena.allocator();
-                            try self.held.append(ha, .{ .table = try ha.dupe(u8, table), .ev = try cloneValue(ha, ev) });
-                        },
-                        else => {},
-                    };
+        // Per-batch: every decoded event dies with the batch, except the FK-held
+        // ones, which are deep-copied into `held_arena` below.
+        var ba = std.heap.ArenaAllocator.init(self.a);
+        defer ba.deinit();
+
+        // ONE transaction for the whole batch — the same lesson the TS client has
+        // in writing: N autocommits each pay a full SQLite commit/fsync, one
+        // transaction of N pays it once. Row-by-row, a swarm client applied ~7
+        // events/s against a 19/s feed and fell 76 s behind by the audit (§10cq);
+        // the position write rides the same transaction, so data and position
+        // cannot disagree across a crash. Acks stay OUTSIDE, after COMMIT: an
+        // acked-but-rolled-back batch would be lost, an unacked-but-committed one
+        // merely redelivers into idempotent upserts.
+        const Ctx = struct {
+            client: *SyncClient,
+            a: std.mem.Allocator,
+            stream: []const u8,
+            messages: []const *@import("nats").JetStreamMessage,
+            last: u64,
+            max_seq: *u64,
+            offered: *usize,
+            fn apply(cx: @This(), st_: *storage.Storage) !void {
+                _ = st_;
+                for (cx.messages) |m| {
+                    const seq = m.metadata.sequence.stream;
+                    const doc = decodeMsgpack(cx.a, m.msg.data) catch continue;
+                    const events: []const Value = if (doc == .array) doc.array.items else &.{doc};
+                    for (events) |ev| {
+                        if (ev != .object) continue;
+                        const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
+                        if (cx.client.states.get(table) == null) continue;
+                        cx.offered.* += 1;
+                        cx.client.applyEvent(table, ev, seq) catch |err| switch (err) {
+                            // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
+                            // event that is acked, positioned past, and never applied.
+                            error.FkHeld => {
+                                const ha = cx.client.held_arena.allocator();
+                                try cx.client.held.append(ha, .{ .table = try ha.dupe(u8, table), .ev = try cloneValue(ha, ev) });
+                            },
+                            else => {},
+                        };
+                    }
+                    if (seq > cx.max_seq.*) cx.max_seq.* = seq;
                 }
-                m.ack() catch {};
-                if (seq > max_seq.*) max_seq.* = seq;
+                // D1: delivery + accounting IS the position — applied, gated or held.
+                if (cx.max_seq.* > cx.last) try cx.client.persistSeq(cx.stream, cx.max_seq.*);
             }
-        }
-        // D1: delivery + accounting IS the position — applied, gated or held.
-        if (max_seq.* > last) try self.persistSeq(stream, max_seq.*);
+        };
+        var offered: usize = 0;
+        try self.st.transaction(Ctx{
+            .client = self,
+            .a = ba.allocator(),
+            .stream = stream,
+            .messages = messages,
+            .last = last,
+            .max_seq = max_seq,
+            .offered = &offered,
+        }, Ctx.apply);
+        for (messages) |m| m.ack() catch {};
         return offered;
     }
 
@@ -913,8 +950,16 @@ pub const SyncClient = struct {
     /// the stored position. Positions are the client's, not the consumer's (D1), so
     /// nothing is lost — the new consumer starts where the replica actually is.
     fn reopenTail(self: *SyncClient, t: *Tail) !void {
+        // OPEN-THEN-SWAP. Opening can fail — a JS API request mid-outage times out —
+        // and deinit-first left `t.sub` DANGLING on exactly that failure: every later
+        // poll handed the freed pointer to PullInbox.fetch, which refused it
+        // (NotOnThisInbox) for the rest of the process — the silent tail wedge of
+        // §10cp/§10cq, measured as one Timeout then 154 refusals while verdicts kept
+        // flowing on the same connection. The old consumer needs no explicit delete:
+        // the server reaps it via inactive_threshold.
+        const fresh = try self.openConsumer(t.stream, tail_inactive_ns, try self.tailInbox());
         t.sub.deinit();
-        t.sub = try self.openConsumer(t.stream, tail_inactive_ns, try self.tailInbox());
+        t.sub = fresh;
     }
 
     pub const PollReport = struct { applied: usize, settled: usize };
@@ -959,8 +1004,10 @@ pub const SyncClient = struct {
         };
         defer mb.deinit();
         // A consumer that went away while the others answered: re-open it alone.
+        // By NAME, not by index — `gone` is ordered like `streams`, and the tails
+        // list happens to match today only because states never change mid-life.
         for (mb.gone, 0..) |g, i| {
-            if (g) try self.reopenTail(&self.tails.items[i]);
+            if (g) try self.reopenTail(try self.tailFor(streams[i]));
         }
         // Messages come interleaved across streams; the applier positions per stream,
         // so group them (order within a stream is preserved).
