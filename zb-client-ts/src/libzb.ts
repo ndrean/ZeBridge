@@ -428,7 +428,7 @@ export class ZeBridge {
                 this.resyncing = true;
                 this.appendLog('SYS', 'NATS reconnected — flushing outbox and re-syncing streams', 'INFO');
                 void this.flushOutbox();
-                void this.subscribeStreams().finally(() => { this.resyncing = false; });
+                void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
               } else if (t === 'disconnect') {
                 this.emitStatus('disconnected');
               }
@@ -439,7 +439,7 @@ export class ZeBridge {
           this.appendLog('SYS', 'status loop restarted — re-syncing in case a reconnect was missed', 'WARNING');
           if (!this.resyncing) {
             this.resyncing = true;
-            void this.subscribeStreams().finally(() => { this.resyncing = false; });
+            void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
           }
         }
       })();
@@ -1524,8 +1524,20 @@ export class ZeBridge {
 
   private async subscribeStreams() {
     if (!this.nc) return;
-    const js = this.transport.jetstream(this.nc);
-    const jsm = await this.transport.jetstreamManager(this.nc);
+    // Throw-proof from the first await: this function runs as a floating
+    // promise from the reconnect handler and the status-loop restart, and an
+    // unhandled rejection here KILLED THE PROCESS when the connection happened
+    // to be closed at that instant (§10cs: ClosedConnectionError out of
+    // jetstreamManager, twenty clients gone). The next reconnect retries.
+    let js: ReturnType<typeof this.transport.jetstream>;
+    let jsm: Awaited<ReturnType<typeof this.transport.jetstreamManager>>;
+    try {
+      js = this.transport.jetstream(this.nc);
+      jsm = await this.transport.jetstreamManager(this.nc);
+    } catch (e) {
+      this.appendLog('SYS', `subscribeStreams: connection unavailable (${e}) — the next reconnect retries`, 'WARNING');
+      return;
+    }
 
     // 1. Gap detection — asked of EVERY stream this client reads: a gap in any of
     // them means missing rows, and checking only one looks like an empty table.
@@ -2209,7 +2221,7 @@ export class ZeBridge {
         if (!this.resyncing) {
           this.resyncing = true;
           void this.flushOutbox();
-          void this.subscribeStreams().finally(() => { this.resyncing = false; });
+          void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
         }
       }
     } catch (err) {
