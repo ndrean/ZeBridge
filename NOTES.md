@@ -8804,6 +8804,42 @@ idempotent cascades — each a mechanism, not a per-case cost). The one true cli
 per-row LWW cannot protect a MULTI-ROW invariant; that logic belongs in the
 PostgreSQL functions the mutations dispatch to, never in the sync layer.
 
+## 10cr. The 100-client quarter hour, and the CRDT that taught its own lesson (2026-09-04)
+
+**The scale run.** 100 clients (51 node incl. PGlite grouped 5/proc, 49 python),
+900 s at ~160 offered mutations/s, full faults plus the cascade: 60 processes at
+2.1 GB total — the grouping projection held. The wall it found: **the ingress
+applies ~50 mutations/s** (45,098 in 900 s, one at a time through the per-mutation
+pipeline). Above that the system backpressured EXACTLY as designed: zero local
+errors, zero losses, outboxes queuing patiently (median 300 pending at audit),
+and the replica cohorts within each implementation nearly identical to each
+other — deterministic depth into a shared backlog, not scatter (globex: twenty
+replicas at one count, twenty at another, nothing in between). The audit
+"failure" is a capacity finding wearing an equality suit. OPEN, product: the
+ingress wants the SAME fix its clients got this week — one PG transaction per
+fetched batch instead of per-mutation round trips (§10cq finding 2, mirrored);
+beyond that, horizontal slots. Also observed: post-bridge-restart throughput
+sagged further under the redelivery backlog — measure again after batch-apply.
+
+**The CRDT curiosity (`crdt.py`, live group)** — jsonb map-of-LWW-registers on
+test_types.metadata, two writers, one row, no schema or protocol changes. It
+PASSED (18/18 keys, one reconcile round) — but only after teaching, by failing,
+the three lessons that ARE the evaluation:
+
+1. Blind full-doc replace: both writes accepted, one intent gone. Row-level LWW
+   converged perfectly and still destroyed a key — the price, demonstrated.
+2. Merge-on-STALE is insufficient: with fresh clocks every overwrite is
+   ACCEPTED, so the stale hook never fires while writers erase each other
+   through lagging echoes. State-based semantics required — every write ships
+   the union of ALL the writer's own registers, so a laggy echo costs nothing.
+3. "Accepted" is not convergence. The stopping condition is `observed ⊇ mine` —
+   reconcile to a fixed point, which merge's monotonicity guarantees exists.
+
+The conclusion for the roadmap stands as decided: CRDT stays app-level and out
+of scope — the sync layer needed NOTHING (the outbox, the stale verdict, the
+CDC echo were already the complete toolkit), which is itself the strongest
+argument that the layering is right.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
