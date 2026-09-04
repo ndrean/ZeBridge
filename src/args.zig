@@ -14,6 +14,11 @@ const usage =
     \\  --pub <NAME>    PostgreSQL PUBLICATION to stream. REQUIRED here or as
     \\                  BRIDGE_CDC_PUBLICATION — there is no default.
     \\  --port <PORT>   HTTP telemetry port
+    \\  --gen-nkey      Mint the bridge<->NATS nkey pair (seed to stdout, once)
+    \\  --diagnose      Pre-run doctor: report everything boot would decide, write nothing
+    \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
+    \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
+    \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
     \\
     \\Environment:
     \\  DATABASE_READER_URL          REQUIRED. Read path, credentials included:
@@ -76,7 +81,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, gen_nkey, init_nats };
+pub const EarlyExit = enum { help, gen_nkey, init_nats, revoke };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -94,6 +99,7 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         }
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
         if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
+        if (std.mem.eql(u8, arg, "--revoke")) return .revoke;
     }
     return null;
 }

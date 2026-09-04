@@ -1,0 +1,108 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index 89ff6ca..0ebcd09 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -432,6 +432,10 @@ pub const Connection = struct {
+     options: ConnectionOptions,
+ 
+     status: ConnectionStatus = .initialized,
++    /// Set when the connection gave up because the server rejected the credentials
++    /// twice (expired/revoked/violation). Readable after close so callers can turn
++    /// "ConnectionClosed" into an actionable auth verdict.
++    final_auth_error: ?anyerror = null,
+     status_cond: xsync.Condition = .init,
+     /// Latched when the first NATS handshake and restoration complete, so
+     /// connect() cannot miss a short-lived `.connected` state if the socket
+@@ -793,11 +797,21 @@ pub const Connection = struct {
+     /// does not join manager_task: a callback may itself be running in that
+     /// task (or in a reader task the manager is joining). deinit() is the
+     /// synchronous join-and-destroy boundary.
++    /// The auth error that terminally closed this connection, if any.
++    pub fn lastAuthError(self: *Self) ?anyerror {
++        return self.final_auth_error;
++    }
++
+     pub fn close(self: *Self) void {
+         var callback: @TypeOf(self.options.callbacks.closed_cb) = null;
+         defer if (callback) |cb| cb(self);
+ 
+-        log.info("Closing connection", .{});
++        // Debug, not info: this is the DELIBERATE close (the bridge's generation
++        // producer opens a fresh connection per tick and closes it on the way out), and
++        // at info the pair "Closing connection / Disconnected" reads like an incident
++        // every cadence. A real drop logs "Connection failed: {err}" and the reconnect
++        // machinery speaks at warn.
++        log.debug("Closing connection", .{});
+ 
+         self.mutex.lockUncancelable(self.io);
+         if (self.status == .closed) {
+@@ -1196,15 +1210,24 @@ pub const Connection = struct {
+         // Try to send UNSUB command. Even if it fails internally,
+         // processMsg will keep sending UNSUB commands once
+         // it receives a message with unknown sid.
+-        self.unsubscribeInternal(sub.sid, null) catch |err| {
+-            if (err == error.Canceled) {
+-                // This is a void-returning cleanup path; re-arm the
+-                // cancelation so the caller's next cancelation point
+-                // still observes it.
+-                self.io.recancel();
+-            } else {
+-                log.err("Failed to send UNSUB for sid {d}: {}", .{ sub.sid, err });
+-            }
++        self.unsubscribeInternal(sub.sid, null) catch |err| switch (err) {
++            // This is a void-returning cleanup path; re-arm the cancelation so the
++            // caller's next cancelation point still observes it.
++            error.Canceled => self.io.recancel(),
++
++            // Expected during shutdown, and not a failure: UNSUB on a closed socket
++            // cannot succeed and does not need to — the server drops every subscription
++            // when the connection goes. Reported at error level, this printed once per
++            // subscription on every clean exit ("Failed to send UNSUB for sid 1:
++            // error.Closed", three times for a bridge with three subscribers), *after*
++            // the connection had already been logged as closed. An expected condition
++            // logged as an error trains operators to ignore the level.
++            error.Closed => log.debug(
++                "connection already closed; UNSUB for sid {d} not sent (the server drops it anyway)",
++                .{sub.sid},
++            ),
++
++            else => log.err("Failed to send UNSUB for sid {d}: {}", .{ sub.sid, err }),
+         };
+ 
+         log.debug("Unsubscribed from {s} with sid {d}", .{ sub.subject, sub.sid });
+@@ -1410,7 +1433,10 @@ pub const Connection = struct {
+                 if (conn_err) |err| {
+                     log.info("Connection failed: {}", .{err});
+                 } else {
+-                    log.info("Disconnected", .{});
++                    // Debug for the same reason as close(): no error means this end hung
++                    // up on purpose. An unexpected server-side EOF lands here too, but
++                    // the reconnect path announces itself immediately after at warn.
++                    log.debug("Disconnected", .{});
+                 }
+ 
+                 // close() claims the terminal state before canceling the
+@@ -1688,6 +1714,10 @@ pub const Connection = struct {
+             if (isAuthError(err)) {
+                 if (server.last_auth_error) |last| {
+                     if (last == err) {
++                        // Remember WHY before giving up: a caller that later finds the
++                        // connection closed can name the cause ("authentication
++                        // expired — re-enroll") instead of a generic ConnectionClosed.
++                        self.final_auth_error = err;
+                         self.mutex.unlock(self.io);
+                         log.err("Same authentication error twice from {s}, giving up: {}", .{ server.parsed_url.full_url, err });
+                         return error.ShouldClose;
+@@ -2473,6 +2503,12 @@ pub const Connection = struct {
+ 
+         log.err("Server protocol error: {} - {s}", .{ protocol_err, err_msg });
+ 
++        // Record an auth verdict the moment the server states it — a mid-session
++        // expiry/revocation arrives here on the live socket, not through the reconnect
++        // handshake, so a caller that later sees the closed connection can still name
++        // the cause (§10cj: JWT expired → re-enroll, not a bare "ConnectionClosed").
++        if (isAuthError(protocol_err)) self.final_auth_error = protocol_err;
++
+         // Handle handshake failure
+         if (self.handshake_state.isWaiting()) {
+             // Propagate specific protocol errors to client

@@ -487,7 +487,14 @@ export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
     const b = lookup(handle) orelse return errJson("UnknownHandle");
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
-    const out = pollJson(arena.allocator(), b, wait_ms) catch |err| return errJson(@errorName(err));
+    const out = pollJson(arena.allocator(), b, wait_ms) catch |err| {
+        // The single door every poll error passes — so the auth verdict is named
+        // HERE, once, whichever `try` inside poll surfaced the dead socket (§10cj:
+        // a mid-session JWT expiry may appear as ConnectionClosed, a read error or a
+        // timeout, but nats.zig recorded the server's "-ERR Authentication Expired").
+        if (b.c.authError()) |auth_err| return errJson(@errorName(auth_err));
+        return errJson(@errorName(err));
+    };
     return dupeZ(out);
 }
 

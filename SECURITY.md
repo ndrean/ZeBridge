@@ -564,6 +564,62 @@ drift away from it — the same property the subject invariant gives the namespa
 
 ---
 
+## Revocation — the three clocks
+
+Revoking a principal is one act with three different effect times, because three
+different systems enforce three different halves of the identity. Stated as a ladder,
+tightest to loosest:
+
+| door | closes | enforced by |
+| --- | --- | --- |
+| **writes** | **immediately, mid-session** | the tombstone guard and RLS read `zebridge_user_tenants` live, per mutation — the revoked principal's very next write is refused, connection untouched |
+| **tenant resolution** | **at the next connect** | the mapping DELETE rides the WAL and the running bridge purges `$KV.tenants.<principal>`; `resolveTenant()` then reads "no mapping", the same state a principal that never existed has |
+| **reads** | **at JWT expiry** | the CDC grants are baked into the token and NATS authorizes from the signature alone — no table, bucket, or bridge is consulted. The TTL set at mint (`ENROLL_JWT_TTL_SECONDS`) IS the read-side revocation |
+
+The operator command is `ADMIN_DATABASE_URL=postgres://… bridge --revoke <principal>`:
+it deletes the mapping AND the principal's **unused invites** (an unredeemed invite is
+a re-enrollment ticket — one GET and the principal is back with a fresh token), and
+narrates the ladder above in its output. `ADMIN_DATABASE_URL` is passed for the
+invocation only, never stored in `.env.bridge` — the capability is non-ambient; a
+machine holding the bridge's env cannot revoke anyone. The command needs no NATS
+access: it is a pure PostgreSQL client, and the running bridge performs the KV purge
+when the delete reaches it through the publication.
+
+When the read window closes, it closes **audibly**: the server tears the session down
+with `-ERR 'User Authentication Expired'`, a reconnect with the dead token is refused,
+and the client surfaces a NAMED auth error (`AuthorizationViolation` /
+`AuthExpired`) rather than a generic disconnect — an application knows to re-enroll,
+nothing retries silently forever.
+
+The **hard read kill** — cutting reads NOW instead of waiting for expiry — is wired:
+there is no per-JWT revoke command anywhere in NATS; the mechanism is a `revocations`
+map ({user_pubkey: timestamp}) INSIDE the account JWT, operator-signed and pushed to
+the resolver. `bridge --revoke` escalates to it automatically when the credentials
+allow: given `OPERATOR_SEED` and `--conf /path/to/nats-server.conf` (both for the
+invocation — the operator seed stays offline otherwise), it rebuilds the complete map
+from `zebridge_principal_keys.revoked_at` (PostgreSQL is the source of truth, so
+revoking B can never un-revoke A), re-signs the account JWT, splices the conf in
+place, and tells you to reload. On the reload the live session is KICKED and a
+reconnect with the dead token is refused. /enroll records every key at the door
+(`zebridge_principal_keys`, same transaction as the redemption) precisely so this map
+can always be built. Without the operator seed at hand, the command does everything
+DB-reachable and prints how to escalate — partial is a fallback dictated by the
+credentials present, never a choice. The TTL remains the passive bound: size
+`ENROLL_JWT_TTL_SECONDS` to the exposure you tolerate between revocation and reload.
+
+Two corollaries reviewers keep re-deriving, pinned here:
+- **restarting nats-server is not a revocation event — it is the opposite.** The
+  restart disconnects everyone, and every unexpired user JWT reconnects cleanly: the
+  token is self-contained, and the reload only re-reads the ACCOUNT JWT (signing
+  keys, not users). Restarting to flush a revoked reader does nothing but reset the
+  clock it was already racing.
+- **the enroll door is closed to a revoked principal.** /enroll is gated by the
+  invite code alone — the principal comes OUT of the redeemed invite row, and the
+  mapping insert is a consequence, not a precondition — and `bridge --revoke` voids
+  the unused invites. No code, no door.
+
+---
+
 ## What is not protected
 
 Stated plainly, because half of what was found while building this was assumed rather than

@@ -67,6 +67,13 @@ pub const Server = struct {
         /// users — the role template lives in the account JWT, not here.
         signing_seed: []const u8,
         account_pub: []const u8,
+        /// The minted JWT's lifetime — from ENROLL_JWT_TTL_SECONDS at boot, falling
+        /// back to the compiled default. ⚠️ Was NOT wired: handleEnroll passed the
+        /// constant directly, so the documented env var (present in .env.bridge and
+        /// --init-nats output) was read by nobody and every token got the 24h default
+        /// (found by jwt_expiry.py, 2026-09-04 — the minted exp was 86400 s under a
+        /// requested 5).
+        ttl_seconds: i64,
     };
 
     pub fn init(
@@ -389,7 +396,9 @@ pub const Server = struct {
 
         var code_buf: [Config.Http.enroll_code_max_len + 8]u8 = undefined;
         const code_z = std.fmt.bufPrintZ(&code_buf, "{s}", .{code}) catch unreachable;
-        const params = [_]?[*:0]const u8{code_z.ptr};
+        var pub_buf: [nats.nkeys.public_key_text_len + 1]u8 = undefined;
+        const pub_z = std.fmt.bufPrintZ(&pub_buf, "{s}", .{user_pub}) catch unreachable;
+        const params = [_]?[*:0]const u8{ code_z.ptr, pub_z.ptr };
         // Redeem + register, atomically: the row's used_at is the single-use latch
         // (the WHERE arm makes replays lose the race), and the user_tenants insert
         // is the same-event second projection — the bridge's own CDC then carries
@@ -403,8 +412,18 @@ pub const Server = struct {
             "  INSERT INTO public.zebridge_user_tenants (principal, tenant_id)" ++
             "  SELECT principal, tenant_id FROM redeemed" ++
             "  ON CONFLICT DO NOTHING" ++
+            // The key this principal enrolled with, remembered in the SAME transaction
+            // (§10cl): the future hard kill — the NATS account revocation list — is
+            // keyed by user pubkey, and a key never recorded can never be revoked.
+            // ON CONFLICT refreshes ownership: a pubkey can only belong to one
+            // principal, and re-enrolling with the same key updates the trail.
+            "), keyed AS (" ++
+            "  INSERT INTO public.zebridge_principal_keys (user_pubkey, principal, tenant_id)" ++
+            "  SELECT $2, principal, tenant_id FROM redeemed" ++
+            "  ON CONFLICT (user_pubkey) DO UPDATE SET principal = EXCLUDED.principal," ++
+            "    tenant_id = EXCLUDED.tenant_id, enrolled_at = now()" ++
             ") SELECT principal, tenant_id, role FROM redeemed";
-        const res = c.PQexecParams(conn, redeem_sql, 1, null, &params[0], null, null, 0);
+        const res = c.PQexecParams(conn, redeem_sql, 2, null, &params[0], null, null, 0);
         defer c.PQclear(res);
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
             log.warn("🎟️ enrollment refused (code invalid, used, or expired)", .{});
@@ -421,7 +440,7 @@ pub const Server = struct {
             principal,
             tenant,
             user_pub,
-            Config.Http.enroll_jwt_ttl_seconds,
+            ctx.ttl_seconds,
             @as(i64, @intCast(c.time(null))),
         ) catch {
             try req.respond("{\"error\":\"mint failed\"}\n", .{ .status = .internal_server_error, .extra_headers = cors });

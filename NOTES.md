@@ -3502,6 +3502,7 @@ zig build test-nats
 | `zebridge_catalogue` | **THE catalogue — one row per replicated table, the single source the bridge, the sweeper and the generation producer read.** `tenant_col NULL` = public (the CHECK forces a recorded `public_reason`, so an unscoped, unjustified row is unrepresentable), NOT NULL = tenant-scoped; `version_col`/`tombstone_col`/`tiebreak_col` are the LWW columns; `generations` opts a table out of chain building. UPSERTed by `zebridge_enable` in the same transaction as the guards it installs, loaded by the bridge at boot (rule maps, the public set for CDC_PUBLIC's subject reconciliation) and by the producer per tick. Absorbed and replaced `zebridge_public_tables` and `zebridge_generation_overrides` — both were projections of it. `SYNC_RULES`/`TENANT_RULES` env demoted to per-table emergency overrides. Since §10cf also the **ban dump**: `suspended boolean` + `suspended_reason text`, mirrored by the bridge on every refusal transition through `zebridge_set_suspended()` and pruned wholesale at boot by `zebridge_clear_suspensions()` — the psql answer to "which tables are refused?" (`SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;`). A projection of the in-memory registry, never a source: live truth while the bridge runs, a stale dump when it is off, honest again at boot. |
 | `zebridge_gc_watermark` | Tracks the oldest standing tombstone. Read by clients (via CDC) to determine the maximum allowed offline window before their soft-deleted rows are completely swept and discarded. |
 | `zebridge_user_tenants` | Maps NATS principals to their corresponding PostgreSQL tenant IDs. Used by RLS policies and triggers to ensure edge writes correspond to the principal's tenant and route deletes correctly. |
+| `zebridge_principal_keys` | The nkeys principals enrolled with (§10cl): `user_pubkey PK, principal, tenant_id, enrolled_at`, written by the /enroll CTE in the redemption's own transaction. One-to-many (each device its own pair). The future hard kill — NATS's account `revocations` map — is keyed by pubkey, and a key never recorded can never be revoked. Survives `bridge --revoke` on purpose: audit trail + the list's input. |
 | `zebridge_generations` | The delta-generation producer's own memory (§1.13): one row per built generation of a (tenant, table) pair — `gen`, `cutoff_version`, `cutoff_lsn` (`pg_lsn`), `prev_cutoff` (the delta's lower bound; stored, not derived — pruning removes the row it would be derived from), `has_full` (this gen also shipped a `-full` object, the chain's jump-in point), `built_at`, PK `(tenant, tbl, gen)`. Read back on restart instead of the NATS pointer ("the bridge never reads its own output back"); doubles as the audit trail; pruned past chain depth. Internal-listed and unpublished — clients never replicate producer bookkeeping. Carries the read role's **single** write grant: `INSERT`+`DELETE`, never `UPDATE` (append-only by privilege), because the content query must run as the reader and the bookkeeping row must share its transaction. Contract proven by `scripts/scenarios/generations.py`. Since §10bb also `row_count` (tenant-scoped `count(*)` inside the build's snapshot) and `del_count` (`pg_stat_user_tables.n_tup_del`, cumulative) at the cutoff: a hard delete is invisible to the version predicate, so the producer skips a tick only when the version predicate, the count AND the delete count all held; either moving forces a full, because only a full can carry an absence. NULL on rows from before the columns → built once. |
 | `zebridge_limits` | One row per INSTANCE (`slot` PK, `publication`, `max_row_bytes`, `updated_at`), registered by each bridge at boot from its own `2^BASE_BUF` via `zebridge_register_limits()` — never maintained by hand; rows whose slot has left `pg_replication_slots` are GC'd on the next boot. ⚠️ NOT read at write time: a table's budget (MIN over the instances whose publication carries it, via the `pg_publication_tables` join) is BAKED as a literal into its `zebridge_width_guard_<tbl>` body — §10b measured the literal free vs +4.81µs/row for a lookup and +22µs/row for the join — and re-derived at every bridge boot and at every `zebridge_enable` (§10l finding 8). The table is the source; the trigger body is the cache. |
 
@@ -8467,6 +8468,117 @@ with the hash header correct, and a libzb client that syncs from `grammarJson` a
 no file anywhere. The drift-detection story falls out for free: a client pins the hash
 it enrolled under; a mismatch on reconnect means the deployment forked the protocol,
 which also killed its creds — one diagnosis instead of mysterious permission errors.
+
+## 10cj. JWT expiry: the read door, and closing it audibly (2026-09-04)
+
+The last rung of the revocation ladder, and the piece review asked to name precisely.
+The ladder, tightest to loosest:
+- **writes die immediately, mid-session** — the guard and RLS read `zebridge_user_tenants`
+  live, per mutation; a revoked principal's next write is refused with the connection
+  untouched (not "on reconnection" — that was the imprecise version);
+- **tenant resolution dies on the next connect** — the §10ce KV purge;
+- **reads die at EXPIRY** — the CDC grants are baked into the JWT, and NATS authorizes
+  from the signature alone, so a live reader keeps reading until its token expires.
+
+Building the last rung uncovered a chain of three defects, each hiding the next:
+1. **`ENROLL_JWT_TTL_SECONDS` was read by nobody.** `handleEnroll` passed the compiled
+   24 h constant; the env var was in .env.bridge and --init-nats output but wired
+   nowhere, so every token got the default (found by decoding a mint: exp − iat =
+   86400 under a requested 5). Now on `EnrollCtx.ttl_seconds`, read at boot.
+2. **NATS does not proactively disconnect on exp**, and — the corrected belief — a live
+   session outlives its token: measured, a sub stayed connected 25 s past a 8 s TTL.
+   What the server DOES enforce is a fresh connect (refused) and, on a long-lived
+   session, an eventual `-ERR 'User Authentication Expired'` that tears the socket down.
+3. **The client swallowed it as `ConnectionClosed`.** nats.zig already gave up correctly
+   (same auth error twice → permanent close, nats.go's rule) but the REASON was not
+   retrievable. Added `Connection.final_auth_error` / `lastAuthError()` (set at the
+   reader's protocol-error site AND the reconnect two-strikes path), and libzb's C ABI
+   `zb_client_poll` — the single door every poll error passes — now names the verdict:
+   a dead credential surfaces as `AuthorizationViolation`, actionable, instead of a
+   bare transport error an app cannot reason about.
+
+`jwt_expiry.py` (owns) is also the full onboarding story finally run live: a probe armed
+with the scoped signing key + a tiny TTL, an invite row, `bridge --gen-nkey`, one
+GET /enroll returning jwt + grammar + grammar_hash (§10ci) — bootstrap from an invite
+code and a URL, no file, no nsc — an ordinary client inside the TTL, then the read door
+closing audibly past it. The nats.zig fix rides as nats.zig-auth-verdict.patch.
+
+## 10ck. `bridge --revoke`: revocation without hunting for the right psql (2026-09-04)
+
+Review's case, verbatim in spirit: the database may be RDS behind a VPC and an IAM
+dance, and revocation happens at the worst possible moment — it should be one command
+on a box that already has the bridge binary. `ADMIN_DATABASE_URL=… bridge --revoke
+<principal>` joins the operator toolbelt (--gen-nkey, --init-nats, --diagnose), with
+three design points:
+
+- **the capability is non-ambient**: the admin URL is passed for the invocation, never
+  stored in .env.bridge — a machine holding the bridge's env cannot revoke anyone, and
+  the command refuses with an explanation when the URL is absent;
+- **it voids the unused invites too** — the delete raw-psql revocations forget: an
+  unredeemed invite is a re-enrollment ticket, one GET from a fresh token;
+- **it narrates the three clocks** (writes NOW / resolution at next connect / reads at
+  expiry) in its output — the command is the teaching surface — and exits 1 with
+  "nothing to revoke" for a ghost, so scripts can tell.
+
+No NATS access, sweeper doctrine: a pure PG client; the running bridge purges
+$KV.tenants when the delete rides the publication. `revoke.py` upgraded to drive the
+CLI end to end: refusal without the URL, mapping + invite in one command, the narration
+present, KV purged downstream, double-revoke distinguishable. SECURITY.md gains the
+"Revocation — the three clocks" section: the clean picture, written where the next
+person will look for it.
+
+## 10cl. The pubkey, remembered at the door (2026-09-04)
+
+Review closed the revocation thread by pricing the hard kill precisely: NATS has no
+per-JWT revoke command — the mechanism is a `revocations` map ({user_pubkey:
+timestamp}) INSIDE the account JWT, operator-signed and resolver-pushed, which also
+kicks live sessions. Whatever it costs to wire someday, one prerequisite is cheap now
+and impossible to retrofit later: /enroll minted from the user's pubkey and FORGOT it.
+A key never recorded can never be revoked; adding the list later would have meant
+re-enrolling every client just to learn their keys.
+
+`zebridge_principal_keys` (user_pubkey PK, principal, tenant_id, enrolled_at) —
+one-to-many by design (laptop, phone, re-enrollments each carry their own pair), the
+PUBKEY as the key because that is what the revocation list is keyed by. Written by the
+enroll CTE in the SAME transaction as the invite redemption; ON CONFLICT refreshes
+ownership (a pubkey belongs to one principal); the writer role gets INSERT + UPDATE,
+never DELETE — and `bridge --revoke` deliberately leaves the rows: they are the audit
+trail and the future list's input, not part of the mapping.
+
+Two corollaries also pinned in SECURITY.md's revocation section, because reviewers
+keep re-deriving them: a nats-server RESTART is the opposite of a revocation event
+(every unexpired token reconnects cleanly — the reload re-reads the account JWT,
+signing keys not users); and the enroll door is code-gated, so a revoked principal
+whose invites were voided has no way back in. jwt_expiry.py asserts the key row lands
+at enrollment.
+
+## 10cm. The hard kill, wired: full revocation is a fallback ladder, not a flag (2026-09-04)
+
+Review pushed the revocation thread to its end: "I am not even sure we should have this
+partial revocation. It should always be full." Resolved as: **partial is never a
+CHOICE, only a fallback dictated by the credentials present.** `bridge --revoke
+<principal>` always does everything DB-reachable (mapping, unused invites, and now
+stamping `revoked_at` on the principal's keys) — and when handed `OPERATOR_SEED` and
+`--conf /path/to/nats-server.conf`, it escalates to the full kill automatically. It
+never silently stops at partial when full is possible, and it never refuses the
+possible parts because the operator seed is in a vault.
+
+The full path, all local machinery (no nsc): the complete `revocations` map is rebuilt
+from `zebridge_principal_keys.revoked_at` — PostgreSQL is the source of truth, so
+revoking B composes with A instead of un-revoking it — the account JWT's claims are
+amended by BYTE-PRECISE surgery (only the revocations object changes; everything else
+stays byte-identical, no JSON re-serialization risks), re-signed with the operator key
+via `jwt_mint.signClaims`, and spliced into the conf in place. On `kill -HUP` the
+server kicks the live session and refuses the dead token. Measured in
+`revoke_full.py` on a fully isolated `--init-nats` stack: live sub kicked on reload,
+reconnect → Authorization Violation. The read door closes in SECONDS, not at TTL.
+
+Two implementation lessons: `std.debug.print` writes STDERR (a scenario reading
+r.stdout saw empty output from a working command); and the "nothing to revoke" early
+exit must yield to full mode — a second, escalating invocation finds the DB side
+already clean, and the account-JWT amendment is exactly what it still has to do.
+SECURITY.md's revocation section updated: the hard kill is no longer the honest gap,
+it is the documented escalation.
 
 ## 11 Restart Rules
 

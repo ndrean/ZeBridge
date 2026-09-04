@@ -902,6 +902,13 @@ pub const SyncClient = struct {
     /// waiting. Blocks the calling thread only — the host owns the thread, which is
     /// the C-ABI-honest shape (§10bh). The wait is shared across the streams in turn;
     /// once anything arrives the remaining streams get a quick look, not the full wait.
+    /// The server's own auth verdict, if the connection was terminally closed for
+    /// one (§10cj). Consulted by the C ABI so a poll that fails on a dead socket is
+    /// named "AuthExpired"/"AuthRevoked" — actionable — not a bare transport error.
+    pub fn authError(self: *SyncClient) ?anyerror {
+        return self.t.conn.lastAuthError();
+    }
+
     pub fn poll(self: *SyncClient, wait_ms: u64) !PollReport {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();

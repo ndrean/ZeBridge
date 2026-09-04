@@ -17,6 +17,7 @@ const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const nkey_gen = @import("nkey_gen.zig");
 const nats_init = @import("nats_init.zig");
+const admin_revoke = @import("admin_revoke.zig");
 const publication_mod = @import("publication.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
@@ -639,6 +640,7 @@ pub fn main(init: std.process.Init) !void {
         .help => return args.printUsage(init.io),
         .gen_nkey => return nkey_gen.genNkey(init.io),
         .init_nats => return std.process.exit(nats_init.run(init.io, &init)),
+        .revoke => return std.process.exit(admin_revoke.run(&init)),
     };
 
     // Assign first, then report: customLogFn filters against runtime_log_level, so a
@@ -748,6 +750,10 @@ pub fn main(init: std.process.Init) !void {
                     .writer_conninfo = enroll_conninfo.?,
                     .signing_seed = seed,
                     .account_pub = acct,
+                    .ttl_seconds = if (init.minimal.environ.getPosix("ENROLL_JWT_TTL_SECONDS")) |v|
+                        (std.fmt.parseInt(i64, v, 10) catch Config.Http.enroll_jwt_ttl_seconds)
+                    else
+                        Config.Http.enroll_jwt_ttl_seconds,
                 };
                 log.info("🎟️ enrollment endpoint armed: GET /enroll (signer: scoped client key)", .{});
             } else {

@@ -543,6 +543,29 @@ CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
 );
 GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
 
+-- The keys a principal enrolled with (§10cl). /enroll used to mint from the pubkey
+-- and FORGET it — which made any future hard kill (the NATS account revocation list,
+-- keyed by user pubkey) impossible to retrofit: you cannot revoke a key you never
+-- recorded. One row per enrollment; a principal may hold several (laptop, phone,
+-- re-enrollments after expiry), so this is one-to-many and the PUBKEY is the key.
+-- Written by the enroll CTE in the same transaction as the invite redemption; kept
+-- after revocation (rows are the audit trail AND the future revocation list's input —
+-- `bridge --revoke` does not delete them).
+CREATE TABLE IF NOT EXISTS public.zebridge_principal_keys (
+    user_pubkey  text PRIMARY KEY,
+    principal    text NOT NULL,
+    tenant_id    text NOT NULL,
+    enrolled_at  timestamptz NOT NULL DEFAULT now(),
+    -- Stamped by `bridge --revoke` (§10cm). PG is the source of truth for the FULL
+    -- revocation map: the account JWT's `revocations` is re-derived from every row
+    -- with a revoked_at, so revoking B can never silently un-revoke A.
+    revoked_at   timestamptz
+);
+GRANT SELECT ON public.zebridge_principal_keys TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
+-- INSERT for enrollment, UPDATE for the ON CONFLICT arm (a re-enrolled key refreshes
+-- its ownership row). Never DELETE: the rows outlive revocation on purpose.
+GRANT INSERT, UPDATE ON public.zebridge_principal_keys TO ${POSTGRES_WRITER_USER};
+
 -- Enrollment invites — the pump-starter (NOTES: the JWT mint flow). One row per
 -- invitation: a high-entropy single-use code the operator hands out out-of-band;
 -- presenting it to the bridge's /enroll endpoint IS the authentication (a one-time

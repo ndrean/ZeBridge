@@ -275,3 +275,11 @@ is refused (`CertificateIssuerNotFound`). So `tls://` is real for
 both core NATS and JetStream, which reopens the door the colocation constraint closed —
 a bridge talking to a remote NATS (e.g. a per-tenant leaf) over TLS is now a client
 capability, not a wish.
+
+## 6. The terminal auth verdict, retrievable (2026-09-04)
+`Connection.final_auth_error` + `lastAuthError()`. When the server states an auth
+verdict — `-ERR 'User Authentication Expired'`, revoked, or violation — the reader and
+the two-strikes reconnect path both record it, so a caller that later finds the
+connection closed can NAME the cause instead of reporting a bare `ConnectionClosed`.
+libzb's C ABI consults it on any failed poll (ZeBridge NOTES §10cj). Patch:
+nats.zig-auth-verdict.patch. 132+183 tests pass.
