@@ -49,7 +49,7 @@ def main() -> int:
         finally: lib.zb_free(p)
 
     db = f"/tmp/zb-client-gap-{os.getpid()}.sqlite3"
-    h = lib.zb_client_open(json.dumps({"url": zb.nats_server(), "credsPath": zb.creds_for(who), "grammarPath": str(zb.ROOT / "grammar.json"),
+    h = lib.zb_client_open(json.dumps({"url": zb.nats_server(), "credsPath": zb.creds_for(who), "grammarPath": str(zb.ROOT / "src" / "grammar.json"),
                                        "dbPath": db, "principal": who, "clientId": "py-client-gap", "tables": ["users", TABLE]}).encode())
     if not h:
         sys.exit("libzb client could not open (cd libzb && zig build; is the stack up?)")

@@ -250,7 +250,7 @@ async def run() -> int:
         _env.rm_sqlite(db)
         h = lib.zb_client_open(json.dumps({
             "url": zb.nats_server(), "credsPath": zb.creds_for("alice"),   # alice → acme
-            "grammarPath": str(zb.ROOT / "grammar.json"), "dbPath": db,
+            "grammarPath": str(zb.ROOT / "src" / "grammar.json"), "dbPath": db,
             "principal": "alice", "clientId": "py-chain-kill", "tables": [TABLE]}).encode())
         if not h:
             zb.bad("libzb client could not open"); return failed + 1

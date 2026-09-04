@@ -24,7 +24,7 @@ import msgpack
 import nats
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-TOPOLOGY = json.loads((ROOT / "grammar.json").read_text())
+TOPOLOGY = json.loads((ROOT / "src" / "grammar.json").read_text())
 
 NATS_URL = os.environ.get("NATS_URL", "nats://127.0.0.1:4222")
 NKEY_SEED = os.environ.get("NATS_BRIDGE_NKEY_SEED")  # legacy; creds win when present

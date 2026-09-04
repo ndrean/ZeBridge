@@ -118,14 +118,14 @@ if [ "$FRESH_NATS" = "1" ]; then
   echo "$NATS_BRIDGE_NKEY_SEED" > "$ROOT/scripts/native/seed.txt"
   SEED="$ROOT/scripts/native/seed.txt"
 
-  CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' "$ROOT/grammar.json")
-  MUTATIONS_STREAM=$(jq -r '.streams.mutations' "$ROOT/grammar.json")
-  MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' "$ROOT/grammar.json")
-  MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' "$ROOT/grammar.json")
-  MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' "$ROOT/grammar.json")
-  SCHEMA_KV=$(jq -r '.kv.schemas' "$ROOT/grammar.json")
-  TENANTS_KV=$(jq -r '.kv.tenants' "$ROOT/grammar.json")
-  GENERATIONS_KV=$(jq -r '.generations.kv' "$ROOT/grammar.json")
+  CDC_PREFIX=$(jq -r '.subjects.cdc_prefix' "$ROOT/src/grammar.json")
+  MUTATIONS_STREAM=$(jq -r '.streams.mutations' "$ROOT/src/grammar.json")
+  MUTATIONS_PREFIX=$(jq -r '.subjects.mutations_prefix' "$ROOT/src/grammar.json")
+  MUTATION_ERROR_PREFIX=$(jq -r '.subjects.mutation_error_prefix' "$ROOT/src/grammar.json")
+  MUTATION_ACK_PREFIX=$(jq -r '.subjects.mutation_ack_prefix' "$ROOT/src/grammar.json")
+  SCHEMA_KV=$(jq -r '.kv.schemas' "$ROOT/src/grammar.json")
+  TENANTS_KV=$(jq -r '.kv.tenants' "$ROOT/src/grammar.json")
+  GENERATIONS_KV=$(jq -r '.generations.kv' "$ROOT/src/grammar.json")
   # CDC_<TENANT> and CDC_PUBLIC are no longer created here: the BRIDGE reconciles
   # them at boot — tenants from zebridge_user_tenants, the public subject set from
   # zebridge_catalogue. The catalogue is the config.

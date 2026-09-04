@@ -227,13 +227,19 @@ async def main():
         # Deleting the catalogue row is a catalogue COMMIT: a running bridge reconciles
         # CDC_PUBLIC live and unbinds the fixture subject — nothing to restart. (The
         # probe above is already stopped; the next bridge's boot reconciles the same way.)
-        zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
-        zb.psql(f"DROP TYPE IF EXISTS {KIND_TYPE}", quiet=True)
+        # ⚠️ Catalogue row FIRST, table second — the pointer before the target, the
+        # same discipline as the chain's objects-first/manifest-last. The old order
+        # left a window where the catalogue named a dropped table, and any bridge
+        # booting inside it warned "Failed to query schema for decode_fixture"
+        # (seen in review, 2026-09-04): publishBootSchemas correctly skips, but the
+        # warning is scenario residue an operator should never have to read.
         zb.psql(
             "DELETE FROM public.zebridge_catalogue WHERE public_reason = "
             "'decode_integrity.py fixture'",
             quiet=True,
         )
+        zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
+        zb.psql(f"DROP TYPE IF EXISTS {KIND_TYPE}", quiet=True)
 
     return 1 if failed else 0
 

@@ -57,7 +57,7 @@ def derive_into(env) -> dict:
     # and check.py exists partly to catch the two disagreeing.
     if not env.get("OPEN_TENANT"):
         try:
-            grammar = json.loads((ROOT / "grammar.json").read_text())
+            grammar = json.loads((ROOT / "src" / "grammar.json").read_text())
             if grammar.get("open_tenant"):
                 env["OPEN_TENANT"] = grammar["open_tenant"]
                 out["OPEN_TENANT"] = grammar["open_tenant"]

@@ -80,7 +80,7 @@ def main() -> int:
         with zb.Bridge(LOG) as bridge:
             if not bridge.wait_for_log("Replication started successfully", timeout=40):
                 zb.bad("probe bridge did not start"); return 1
-            h = lib.zb_client_open(json.dumps({"url": zb.nats_server(), "credsPath": zb.creds_for(who), "grammarPath": str(zb.ROOT / "grammar.json"),
+            h = lib.zb_client_open(json.dumps({"url": zb.nats_server(), "credsPath": zb.creds_for(who), "grammarPath": str(zb.ROOT / "src" / "grammar.json"),
                                                "dbPath": db, "principal": who, "clientId": "py-slot-loss", "tables": ["users", TABLE]}).encode())
             if not h:
                 zb.bad("libzb client could not open"); return 1

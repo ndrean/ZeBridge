@@ -64,7 +64,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-GRAMMAR = json.loads((ROOT / "grammar.json").read_text())
+GRAMMAR = json.loads((ROOT / "src" / "grammar.json").read_text())
 OPEN_TENANT = GRAMMAR.get("open_tenant", "_default")
 CDC_PREFIX = GRAMMAR.get("cdc_streams", {}).get("tenant_prefix", "CDC_")
 CDC_PUBLIC = GRAMMAR.get("cdc_streams", {}).get("public", "CDC_PUBLIC")

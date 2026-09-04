@@ -29,9 +29,6 @@ def main() -> int:
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="zb-init-nats-"))
     ns = None
     try:
-        # grammar.json must be reachable: operator mode derives the grants from it
-        (tmp / "grammar.json").symlink_to(zb.ROOT / "grammar.json")
-
         # ── dev mode: the ten-second path ────────────────────────────────────
         r = subprocess.run([str(BRIDGE), "--init-nats", "dev"], cwd=tmp, capture_output=True, text=True)
         conf = (tmp / "zb-nats" / "nats-server.conf").read_text()
