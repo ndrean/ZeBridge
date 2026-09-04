@@ -26,6 +26,8 @@ const SPEC: { wid: string; principal: string; tenant: string; db: string; engine
 const DURATION_S = Number(process.env.ZB_DURATION_S ?? 3600);
 const SETTLE_S = Number(process.env.ZB_SETTLE_S ?? 240);
 const USER_IDS = (process.env.ZB_USER_IDS ?? '').split(',').filter(Boolean).map(Number);
+const SUPPLIERS = (process.env.ZB_SUPPLIERS ?? '').split(',').filter((x) => x.includes('|'))
+  .map((x) => x.split('|', 2) as [string, string]);
 const GRAMMAR = JSON.parse(readFileSync(`${REPO}src/grammar.json`, 'utf8'));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -84,7 +86,8 @@ async function runClient(c: (typeof SPEC)[number], stagger: number): Promise<voi
   let trio: string[] = [];
   let order: string | null = null;
   let tick = 0;
-  let usersReady = false;
+  let webReady = false;
+  const myClient = randomUUID();
   while ((Date.now() - t0) / 1000 < DURATION_S) {
     const tickStart = Date.now();
     const i = tick % 5;
@@ -93,26 +96,43 @@ async function runClient(c: (typeof SPEC)[number], stagger: number): Promise<voi
       trio = [randomUUID()];
       await send('test_types', 'INSERT', { uid: trio[0] },
         { uid: trio[0], tenant_id: c.tenant, some_text: `${c.wid} c${Math.floor(tick / 5)} a`, inserted_at: now });
-      if (!usersReady) {
-        try { usersReady = Number((await zb.query('SELECT COUNT(*) n FROM users'))[0].n) > 0; } catch {}
-      }
-      if (USER_IDS.length && usersReady) {
+      if (!webReady) {
+        try {
+          if (Number((await zb.query('SELECT COUNT(*) n FROM sw_suppliers'))[0].n) > 0) {
+            await send('sw_clients', 'INSERT', { uid: myClient },
+              { uid: myClient, label: `client of ${c.wid}`, inserted_at: now });
+            await send('sw_suppliers', 'INSERT', { country: 'wland', name: `sup-${c.wid}` },
+              { country: 'wland', name: `sup-${c.wid}`, rating: 0, inserted_at: now });
+            webReady = true;
+          }
+        } catch {}
+      } else if (SUPPLIERS.length) {
         order = randomUUID();
-        await send('orders', 'INSERT', { uid: order },
-          { uid: order, user_id: USER_IDS[tick % USER_IDS.length], label: `${c.wid} o${tick}`, inserted_at: now });
+        const [sc, sn] = SUPPLIERS[tick % SUPPLIERS.length];
+        await send('sw_orders', 'INSERT', { uid: order },
+          { uid: order, client_id: myClient, supplier_country: sc, supplier_name: sn,
+            label: `${c.wid} o${tick}`, inserted_at: now });
       }
     } else if (i === 1) {
       trio.push(randomUUID());
       await send('test_types', 'INSERT', { uid: trio[1] },
         { uid: trio[1], tenant_id: c.tenant, some_text: `${c.wid} c${Math.floor(tick / 5)} b`, inserted_at: now });
-      if (order) await send('orders', 'UPDATE', { uid: order }, { label: `${c.wid} o${tick} touched` });
+      if (order) {
+        // the composite-FK re-point: BOTH columns move in one UPDATE
+        const [sc, sn] = SUPPLIERS[(tick + 3) % SUPPLIERS.length];
+        await send('sw_orders', 'UPDATE', { uid: order }, { supplier_country: sc, supplier_name: sn });
+      }
     } else if (i === 2) {
       trio.push(randomUUID());
       await send('test_types', 'INSERT', { uid: trio[2] },
         { uid: trio[2], tenant_id: c.tenant, some_text: `${c.wid} c${Math.floor(tick / 5)} c`, inserted_at: now });
-      if (order) { await send('orders', 'DELETE', { uid: order }); order = null; }
+      if (order) { await send('sw_orders', 'DELETE', { uid: order }); order = null; }
     } else if (i === 3) {
       await send('test_types', 'UPDATE', { uid: trio[2] }, { some_text: `${c.wid} touched` });
+      if (webReady && Math.floor(tick / 5) % 3 === 0) {
+        // composite-KEY update of the 1-side: key is {country, name}
+        await send('sw_suppliers', 'UPDATE', { country: 'wland', name: `sup-${c.wid}` }, { rating: tick });
+      }
     } else {
       await send('test_types', 'DELETE', { uid: trio[0] });
     }
@@ -145,6 +165,13 @@ async function runClient(c: (typeof SPEC)[number], stagger: number): Promise<voi
     test_types: await digest(
       `SELECT uid FROM test_types WHERE deleted_at IS NULL AND tenant_id = '${c.tenant}' ORDER BY uid`),
     orders: await digest('SELECT uid FROM orders ORDER BY uid'),
+    sw_orders: await digest('SELECT uid FROM sw_orders ORDER BY uid'),
+    sw_clients: await digest('SELECT uid FROM sw_clients ORDER BY uid'),
+    sw_suppliers: await digest(`SELECT country || '|' || name AS uid FROM sw_suppliers ORDER BY uid`),
+    orphans: Number((await zb.query(
+      `SELECT (SELECT COUNT(*) FROM sw_orders o LEFT JOIN sw_clients c ON c.uid = o.client_id WHERE c.uid IS NULL)
+            + (SELECT COUNT(*) FROM sw_orders o LEFT JOIN sw_suppliers s
+               ON s.country = o.supplier_country AND s.name = o.supplier_name WHERE s.country IS NULL) AS n`))[0].n),
   };
   writeFileSync(c.report, JSON.stringify(report));
   await zb.close();

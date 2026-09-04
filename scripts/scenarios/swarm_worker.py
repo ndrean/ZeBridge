@@ -29,6 +29,7 @@ DURATION_S = float(os.environ.get("ZB_DURATION_S", "3600"))
 SETTLE_S = float(os.environ.get("ZB_SETTLE_S", "240"))
 REPORT = os.environ.get("ZB_REPORT", f"/tmp/zb-swarm-report-py-{WID}.json")
 USER_IDS = [int(x) for x in os.environ.get("ZB_USER_IDS", "").split(",") if x]
+SUPPLIERS = [tuple(x.split("|", 1)) for x in os.environ.get("ZB_SUPPLIERS", "").split(",") if "|" in x]
 
 lib = _env.load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
@@ -81,20 +82,28 @@ def main():
         "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"),
         "credsPath": creds, "grammarPath": _env.GRAMMAR, "dbPath": DB,
         "principal": P, "clientId": f"py-swarm-{WID}",
-        "tables": ["users", "orders", "test_types"]}).encode())
+        "tables": ["users", "sw_suppliers", "sw_clients", "sw_orders", "orders", "test_types"]}).encode())
     if not h:
         json.dump({"worker": WID, "fatal": "open failed"}, open(REPORT, "w"))
         return 1
     tenant = ""
     try:
-        s = take(lib.zb_client_sync(h))
-        tenant = s.get("tenant") or ""
+        # sync is idempotent — a transient broker hiccup on the first attempt (12
+        # clients seeding at once) deserves a retry, not a corpse
+        s, tenant = {}, ""
+        for attempt in range(3):
+            s = take(lib.zb_client_sync(h))
+            tenant = s.get("tenant") or ""
+            if tenant:
+                break
+            time.sleep(5)
         if not tenant:
-            json.dump({"worker": WID, "fatal": f"sync gave no tenant: {s}"}, open(REPORT, "w"))
+            json.dump({"worker": WID, "fatal": f"sync gave no tenant after 3 tries: {s}"}, open(REPORT, "w"))
             return 1
 
         t0 = time.monotonic()
-        trio, order, tick, users_ready, applied_total = [], None, 0, False, 0
+        trio, order, tick, web_ready, applied_total = [], None, 0, False, 0
+        my_client = str(uuid.uuid4())
         while time.monotonic() - t0 < DURATION_S:
             tick_start = time.monotonic()
             i = tick % 5
@@ -105,13 +114,22 @@ def main():
                 send(h, "test_types", "INSERT", {"uid": trio[0]},
                      {"uid": trio[0], "tenant_id": tenant,
                       "some_text": f"w{WID} c{cyc} a", "inserted_at": now, "updated_at": now})
-                if not users_ready:
-                    r = query(h, "SELECT count(*) AS n FROM users")
-                    users_ready = bool(r) and r[0]["n"] > 0
-                if USER_IDS and users_ready:
+                if not web_ready:
+                    r = query(h, "SELECT count(*) AS n FROM sw_suppliers")
+                    if r and r[0]["n"] > 0:
+                        send(h, "sw_clients", "INSERT", {"uid": my_client},
+                             {"uid": my_client, "label": f"client of w{WID}",
+                              "inserted_at": now, "updated_at": now})
+                        send(h, "sw_suppliers", "INSERT", {"country": "wland", "name": f"sup-{WID}"},
+                             {"country": "wland", "name": f"sup-{WID}", "rating": 0,
+                              "inserted_at": now, "updated_at": now})
+                        web_ready = True
+                elif SUPPLIERS:
                     order = str(uuid.uuid4())
-                    send(h, "orders", "INSERT", {"uid": order},
-                         {"uid": order, "user_id": USER_IDS[tick % len(USER_IDS)],
+                    sc, sn = SUPPLIERS[tick % len(SUPPLIERS)]
+                    send(h, "sw_orders", "INSERT", {"uid": order},
+                         {"uid": order, "client_id": my_client,
+                          "supplier_country": sc, "supplier_name": sn,
                           "label": f"w{WID} o{tick}", "inserted_at": now, "updated_at": now})
             elif i == 1:
                 trio.append(str(uuid.uuid4()))
@@ -119,17 +137,24 @@ def main():
                      {"uid": trio[1], "tenant_id": tenant,
                       "some_text": f"w{WID} c{cyc} b", "inserted_at": now, "updated_at": now})
                 if order:
-                    send(h, "orders", "UPDATE", {"uid": order}, {"label": f"w{WID} o{tick} touched", "updated_at": now})
+                    # the composite-FK re-point: BOTH columns move in one UPDATE
+                    sc, sn = SUPPLIERS[(tick + 3) % len(SUPPLIERS)]
+                    send(h, "sw_orders", "UPDATE", {"uid": order},
+                         {"supplier_country": sc, "supplier_name": sn, "updated_at": now})
             elif i == 2:
                 trio.append(str(uuid.uuid4()))
                 send(h, "test_types", "INSERT", {"uid": trio[2]},
                      {"uid": trio[2], "tenant_id": tenant,
                       "some_text": f"w{WID} c{cyc} c", "inserted_at": now, "updated_at": now})
                 if order:
-                    send(h, "orders", "DELETE", {"uid": order})
+                    send(h, "sw_orders", "DELETE", {"uid": order})
                     order = None
             elif i == 3:
                 send(h, "test_types", "UPDATE", {"uid": trio[2]}, {"some_text": f"w{WID} touched", "updated_at": now})
+                if web_ready and (tick // 5) % 3 == 0:
+                    # composite-KEY update of the 1-side: key is {country, name}
+                    send(h, "sw_suppliers", "UPDATE", {"country": "wland", "name": f"sup-{WID}"},
+                         {"rating": tick, "updated_at": now})
             else:
                 send(h, "test_types", "DELETE", {"uid": trio[0]})
             take(lib.zb_client_flush(h, 200))
@@ -164,9 +189,13 @@ def main():
             outbox = r[0]["n"] if r else -1
             if outbox == 0:
                 break
-        end = time.monotonic() + 10
-        while time.monotonic() < end:
-            take(lib.zb_client_poll(h, 500))
+        # quiesce, not a fixed nap: a replica that fell behind mid-run needs to
+        # CATCH UP before it is compared — done means three empty polls in a row
+        quiet, end = 0, time.monotonic() + SETTLE_S
+        while quiet < 3 and time.monotonic() < end:
+            r = take(lib.zb_client_poll(h, 700))
+            applied = r.get("applied", 0) if isinstance(r, dict) else 0
+            quiet = quiet + 1 if applied == 0 else 0
 
         def digest(sql):
             uids = [str(r["uid"]) for r in query(h, sql)]
@@ -178,6 +207,14 @@ def main():
             "test_types": digest("SELECT uid FROM test_types WHERE deleted_at IS NULL "
                                  f"AND tenant_id = '{tenant}' ORDER BY uid"),
             "orders": digest("SELECT uid FROM orders ORDER BY uid"),
+            "sw_orders": digest("SELECT uid FROM sw_orders ORDER BY uid"),
+            "sw_clients": digest("SELECT uid FROM sw_clients ORDER BY uid"),
+            "sw_suppliers": digest("SELECT country || '|' || name AS uid FROM sw_suppliers ORDER BY uid"),
+            "orphans": (query(h, "SELECT (SELECT count(*) FROM sw_orders o LEFT JOIN sw_clients c "
+                                 "ON c.uid = o.client_id WHERE c.uid IS NULL) + "
+                                 "(SELECT count(*) FROM sw_orders o LEFT JOIN sw_suppliers s "
+                                 "ON s.country = o.supplier_country AND s.name = o.supplier_name "
+                                 "WHERE s.country IS NULL) AS n") or [{"n": -1}])[0]["n"],
         }, open(REPORT, "w"))
         return 0
     finally:

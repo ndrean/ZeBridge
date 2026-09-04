@@ -102,6 +102,55 @@ def main():
     if not user_ids:
         sys.exit("no users to reference — the orders dance needs parents")
 
+    # Defensive pre-clean: a previous run leaves producer MEMORY behind
+    # (zebridge_generations rows) and stale/DEL-marked manifests. The boot tick then
+    # compares the recreated EMPTY tables against that memory and can skip them as
+    # "unchanged" — no manifest until the +300s cadence tick, and clients exclude
+    # the tables (measured, §10cq). Clean slate, then create.
+    psql("DELETE FROM zebridge_generations WHERE tbl IN ('sw_orders','sw_clients','sw_suppliers')")
+    for t in ("sw_orders", "sw_clients", "sw_suppliers"):
+        subprocess.run(["nats", "--server", "nats://127.0.0.1:4222",
+                        "--creds", str(ROOT / "scripts" / "native" / "creds" / "bridge.creds"),
+                        "kv", "purge", "generations", f"_default.{t}", "-f"], capture_output=True)
+
+    # ── the FK web (§10cq): sw_suppliers (COMPOSITE pk country+name) ← sw_orders
+    # (two FKs) → sw_clients. No scenario had ever used a composite primary key;
+    # the whole point is to force mutationKeyId's pk-join, composite-key deletes,
+    # and FK-change updates that must move two columns atomically. All public, all
+    # writable, deletes physical (the cascade IS the test).
+    psql("""
+        CREATE TABLE IF NOT EXISTS sw_suppliers (
+            country varchar(40) NOT NULL, name varchar(60) NOT NULL,
+            rating int, inserted_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
+            PRIMARY KEY (country, name));
+        CREATE TABLE IF NOT EXISTS sw_clients (
+            uid uuid PRIMARY KEY, label varchar(80) NOT NULL,
+            inserted_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+        CREATE TABLE IF NOT EXISTS sw_orders (
+            uid uuid PRIMARY KEY,
+            client_id uuid NOT NULL REFERENCES sw_clients(uid) ON DELETE CASCADE,
+            supplier_country varchar(40) NOT NULL, supplier_name varchar(60) NOT NULL,
+            label varchar(80) NOT NULL,
+            inserted_at timestamptz NOT NULL, updated_at timestamptz NOT NULL,
+            FOREIGN KEY (supplier_country, supplier_name)
+                REFERENCES sw_suppliers(country, name) ON DELETE CASCADE);
+    """)
+    for t in ("sw_suppliers", "sw_clients", "sw_orders"):
+        out = psql(f"SELECT step || ':' || status FROM zebridge_enable('public.{t}', "
+                   "writable => true, version_col => 'updated_at', "
+                   "allow_physical_deletes => true, "
+                   "public_reason => 'swarm FK web - shared reference data', "
+                   f"publication => '{zb.publication()}', dry_run => false)")
+        if "error" in out.lower():
+            sys.exit(f"enable {t} failed: {out}")
+        psql(f"SELECT zebridge_grant_edge_writes('public.{t}')")
+    psql("INSERT INTO sw_suppliers (country, name, rating, inserted_at, updated_at) "
+         "SELECT c, 'sup-' || c || '-' || i, i, now(), now() "
+         "FROM unnest(ARRAY['fr','de','jp','br','ca']) c, generate_series(1, 2) i "
+         "ON CONFLICT DO NOTHING")
+    suppliers = ",".join(x for x in psql(
+        "SELECT country || '|' || name FROM sw_suppliers ORDER BY country, name").split() if x)
+
     # orders boots outbound-only (the writer has no INSERT on it — the bridge preflight
     # names the fix). Open it for the soak; restore the boot state at the end. There is
     # no revoke function, so the restore is the raw inverse of what grant_edge_writes did.
@@ -130,7 +179,7 @@ def main():
                          "db": str(SCRATCH / (f"pglite-{wid}" if i == 0 else f"{wid}.sqlite3")),
                          "report": str(SCRATCH / f"report-{wid}.json")})
         env = dict(os.environ)
-        env.update({"ZB_CLIENTS_SPEC": json.dumps(spec),
+        env.update({"ZB_CLIENTS_SPEC": json.dumps(spec), "ZB_SUPPLIERS": suppliers,
                     "ZB_DURATION_S": str(SOAK_S), "ZB_SETTLE_S": str(SETTLE_S),
                     "ZB_USER_IDS": user_ids})
         gname = f"n{ids[0]}-{ids[-1]}"
@@ -147,7 +196,8 @@ def main():
         env.update({"ZB_PRINCIPAL": p, "ZB_WORKER_ID": wid[0],
                     "ZB_DB": str(SCRATCH / f"{wid[0]}.sqlite3"),
                     "ZB_DURATION_S": str(SOAK_S), "ZB_SETTLE_S": str(SETTLE_S),
-                    "ZB_REPORT": str(SCRATCH / f"report-{wid[0]}.json"), "ZB_USER_IDS": user_ids})
+                    "ZB_REPORT": str(SCRATCH / f"report-{wid[0]}.json"), "ZB_USER_IDS": user_ids,
+                    "ZB_SUPPLIERS": suppliers})
         lf = open(SCRATCH / f"{wid[0]}.log", "w")
         return wid, subprocess.Popen(
             [sys.executable, str(ROOT / "scripts" / "scenarios" / "swarm_worker.py")],
@@ -163,6 +213,25 @@ def main():
         if not br.wait_for_log("Replication started successfully", timeout=90):
             zb.bad("bridge did not start")
             return 1
+
+        # The FK-web tables were born THIS run: their first generation manifests
+        # arrive with the producer's boot pass, and a client whose 90s patience
+        # loses that race EXCLUDES the table for its whole life (§10cq — the
+        # product-side question is recorded there; the scenario simply refuses to
+        # start clients against a feed that is not ready yet).
+        deadline = time.monotonic() + 240
+        while time.monotonic() < deadline:
+            r = subprocess.run(["nats", "--server", "nats://127.0.0.1:4222",
+                                "--creds", str(ROOT / "scripts" / "native" / "creds" / "bridge.creds"),
+                                "kv", "get", "generations", "_default.sw_orders", "--raw"],
+                               capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip().startswith("{"):
+                break
+            time.sleep(2)
+        else:
+            zb.bad("the producer never built the FK-web chains — clients would exclude the tables")
+            return 1
+        zb.ok(f"FK-web manifests ready {time.monotonic() - deadline + 240:.0f}s after boot")
 
         for lo in range(0, N_NODE, per_proc):
             procs.append(spawn_node_group(list(range(lo, min(lo + per_proc, N_NODE)))))
@@ -182,7 +251,8 @@ def main():
             (0.20 * SOAK_S, "nats"), (0.45 * SOAK_S, "nats"), (0.75 * SOAK_S, "nats"),
             (0.33 * SOAK_S, "pg"), (0.66 * SOAK_S, "pg"),
             (0.50 * SOAK_S, "bridge"),
-        ] if f[1] in kinds])
+            (0.70 * SOAK_S, "cascade"),
+        ] if f[1] in kinds or f[1] == "cascade"])
         t0 = time.monotonic()
         next_status = 60.0
         while time.monotonic() - t0 < SOAK_S + 30:
@@ -202,6 +272,15 @@ def main():
                     deadline = time.monotonic() + 60
                     while time.monotonic() < deadline and not pg_up():
                         time.sleep(0.5)
+                elif kind == "cascade":
+                    # Delete one seeded supplier the workers actively reference:
+                    # PostgreSQL cascades its sw_orders, logical replication emits
+                    # every cascaded DELETE, and each replica must apply them —
+                    # including replicas whose local FK also cascades (idempotent).
+                    gone = psql("DELETE FROM sw_suppliers WHERE country='fr' AND name='sup-fr-1' "
+                                "RETURNING country || '|' || name").splitlines()
+                    print(f"  ⚡ {el:5.0f}s CASCADE: supplier deleted ({gone[0] if gone else 'already gone'}) "
+                          "— its orders die with it, everywhere", flush=True)
                 else:
                     print(f"  ⚡ {el:5.0f}s bridge restart", flush=True)
                     br.__exit__(None, None, None)
@@ -258,12 +337,17 @@ def main():
         else:
             zb.ok("every outbox drained to zero — all writes definitively acked")
 
-        # the audit: whole-replica equality, per tenant and on the public table
+        # the audit: whole-replica equality, per tenant and on the public tables
+        truth_web = {
+            "sw_orders": pg_digest("SELECT uid FROM sw_orders"),
+            "sw_clients": pg_digest("SELECT uid FROM sw_clients"),
+            "sw_suppliers": pg_digest("SELECT country || '|' || name AS uid FROM sw_suppliers"),
+        }
         truth_orders = pg_digest("SELECT uid FROM orders")
         truth_tt = {t: pg_digest("SELECT uid FROM test_types WHERE deleted_at IS NULL "
                                  f"AND tenant_id = '{t}'")
                     for t in sorted(set(tenants.values()))}
-        bad_tt, bad_ord = [], []
+        bad_tt, bad_ord, bad_web = [], [], []
         for w, r in sorted(reports.items()):
             if "fatal" in r:
                 continue
@@ -272,6 +356,11 @@ def main():
                 bad_tt.append((w, r["kind"], r["tenant"], r.get("test_types"), want))
             if r.get("orders") != truth_orders:
                 bad_ord.append((w, r["kind"], r.get("orders"), truth_orders))
+            for t, want_w in truth_web.items():
+                if r.get(t) != want_w:
+                    bad_web.append((w, r["kind"], t, r.get(t), want_w))
+            if r.get("orphans", 0) != 0:
+                bad_web.append((w, r["kind"], "orphans", r.get("orphans"), 0))
         sent = sum(r.get("sent", 0) for r in reports.values())
         errs = sum(r.get("sendErrors", 0) for r in reports.values())
         if bad_tt:
@@ -285,14 +374,42 @@ def main():
             failed += 1
         else:
             zb.ok(f"orders: every replica equals PostgreSQL ({truth_orders['count']} rows)")
+        if bad_web:
+            zb.bad(f"the FK web DIVERGED in {len(bad_web)} place(s); first: {bad_web[0]}")
+            failed += 1
+        else:
+            zb.ok("the FK web holds on every replica: suppliers (composite pk, "
+                  f"{truth_web['sw_suppliers']['count']}) / clients ({truth_web['sw_clients']['count']}) / "
+                  f"orders ({truth_web['sw_orders']['count']}), cascade included, zero orphans")
         zb.ok(f"{sent} mutations sent by the swarm, {errs} local send errors")
     finally:
         for _, pr, _ in procs:
             if pr.poll() is None:
                 pr.kill()
+        # The funeral happens WHILE THE BRIDGE WATCHES (§10cq): catalogue rows out,
+        # tables dropped, and the bridge's own drop prune consumed from the WAL
+        # before it stops. Dropped after the stop, the funeral waits in the WAL and
+        # the NEXT boot replays it onto freshly recreated tables — purging their
+        # newborn chains the same second the producer builds them (measured: a
+        # PURGE revision stamped 17:18:57 against a g1 built 17:18:57.2).
+        psql("DELETE FROM zebridge_catalogue WHERE tbl IN ('sw_orders','sw_clients','sw_suppliers')")
+        psql("DROP TABLE IF EXISTS sw_orders; DROP TABLE IF EXISTS sw_clients; "
+             "DROP TABLE IF EXISTS sw_suppliers")
+        if br.proc is not None and br.proc.poll() is None:
+            br.wait_for_log("drop prune for 'sw_suppliers'", timeout=30)
         br.__exit__(None, None, None)
         if not orders_was_writable and writer_role:
             psql(f"REVOKE INSERT, UPDATE, DELETE ON public.orders FROM {writer_role}")
+        # FK-web teardown, the §10cp-amended hygiene: catalogue rows FIRST (the live
+        # bridge reconciles), then the tables, then the one-shot schema keys purged —
+        # ghosts cost every future fresh client a 90s chain wait.
+        psql("DELETE FROM zebridge_generations WHERE tbl IN ('sw_orders','sw_clients','sw_suppliers')")
+        for t in ("sw_orders", "sw_clients", "sw_suppliers"):
+            for bucket, key in (("schemas", t), ("generations", f"_default.{t}")):
+                subprocess.run(["nats", "--server", "nats://127.0.0.1:4222",
+                                "--creds", str(ROOT / "scripts" / "native" / "creds" / "bridge.creds"),
+                                "kv", "purge", bucket, key, "-f"],
+                               capture_output=True)
         if not failed:
             shutil.rmtree(SCRATCH, ignore_errors=True)
         else:
