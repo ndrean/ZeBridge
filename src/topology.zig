@@ -21,8 +21,18 @@ const std = @import("std");
 
 pub const log = std.log.scoped(.topology);
 
-/// Where grammar.json is, when `TOPOLOGY_PATH` does not say.
-pub const default_path = "grammar.json";
+/// The embedded grammar — the ONLY source (§10ci). grammar.json at the repo root is
+/// the build-time input; there is no runtime file and no path to pass. Review's
+/// argument, which retired the old read-at-startup doctrine: the grammar is a
+/// PROTOCOL CONSTANT — client JWT grants are minted from these names, so a client
+/// bound to creds is bound to the grammar, and a rename is a protocol fork whose
+/// correct cost is a rebuild. The historical drift scar came from the MIXED model
+/// (one component baked, one reading at runtime); with the runtime loader deleted,
+/// that split can no longer exist. Clients never copy the file either: they receive
+/// the grammar from /enroll or GET /grammar, hash-checked.
+/// Plain @embedFile: grammar.json LIVES IN src/ — it is source (review: "we can move
+/// grammar.json inside /src"), compiled into every binary that speaks the protocol.
+pub const embedded_json: []const u8 = @embedFile("grammar.json");
 
 pub const Error = error{
     MissingKey,
@@ -191,20 +201,15 @@ pub const Owned = struct {
 
 /// Read and parse `path`. Every string in the result is copied into the returned arena,
 /// so the file's bytes are not retained.
-pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Owned {
-    // 64 KiB is absurdly generous for a name table and still bounds a mistake.
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024)) catch |err| {
-        log.err(
-            "🔴 cannot read topology '{s}': {s}. It carries every stream and subject name the bridge, nats-init and the clients share; there is no built-in default, because one would silently disagree with the file nats-init read. Set TOPOLOGY_PATH, or run from the directory holding it.",
-            .{ path, @errorName(err) },
-        );
-        return err;
-    };
-    defer allocator.free(bytes);
+pub fn loadEmbedded(allocator: std.mem.Allocator) !Owned {
+    return parseBytes(allocator, embedded_json);
+}
+
+fn parseBytes(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
 
     var diag: Diagnostic = .{};
     return parse(allocator, bytes, &diag) catch |err| {
-        log.err("🔴 topology '{s}': {s} at \"{s}\".\"{s}\"", .{ path, @errorName(err), diag.context, diag.detail });
+        log.err("🔴 embedded grammar: {s} at \"{s}\".\"{s}\" — the build embedded a malformed grammar.json", .{ @errorName(err), diag.context, diag.detail });
         return err;
     };
 }
@@ -579,19 +584,11 @@ test "parse: a non-string name is rejected" {
 }
 
 test "the test fixture matches the repository's own grammar.json" {
-    // `Topology.for_tests` is a convenience, and a convenience that drifts from the real
-    // file is worse than none: unit tests would pass against names the bridge never uses.
-    var threaded: std.Io.Threaded = .init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, "grammar.json", testing.allocator, .limited(64 * 1024)) catch |err| {
-        // `zig build test` runs from the repository root; if that ever stops being true,
-        // skip rather than fail on a path.
-        if (err == error.FileNotFound) return error.SkipZigTest;
-        return err;
-    };
-    defer testing.allocator.free(bytes);
+    // `Topology.for_tests` is a convenience, and a convenience that drifts from the
+    // EMBEDDED grammar is worse than none: unit tests would pass against names the
+    // bridge never uses. Since §10ci the comparison target is the compiled-in bytes —
+    // no file read, no io, and the check runs wherever the test runs.
+    const bytes = embedded_json;
 
     var owned = try parse(testing.allocator, bytes, null);
     defer owned.deinit();

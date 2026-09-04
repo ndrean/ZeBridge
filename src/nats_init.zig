@@ -287,15 +287,10 @@ fn runDev(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8
 }
 
 fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8, force: bool, nats_port: u32, ws_port: u32, http_port: u32) u8 {
-    // ── the topology: the client template's names come from HERE ───────────────
-    // grammar.json is REQUIRED for operator mode — the grants embed the stream and
-    // bucket names, and topology.zig's own doctrine applies: a default silently
-    // substituting for a missing file is exactly the drift it exists to prevent.
-    const owned = topology_mod.load(a, io, topology_mod.default_path) catch {
-        out("🔴 operator mode needs {s} (the client grant template embeds its stream and\n" ++
-            "   bucket names). Run from the repo root, or start with --init-nats dev.\n", .{topology_mod.default_path});
-        return 1;
-    };
+    // ── the topology: BUILT IN (§10ci) — the grants and the running bridge mint
+    //    from the same embedded grammar, so they cannot disagree, and this command
+    //    needs no file present anywhere.
+    const owned = topology_mod.loadEmbedded(a) catch return 1;
     const topo: topology_mod.Topology = owned.topology;
 
     // ── every key, generated here ───────────────────────────────────────────────

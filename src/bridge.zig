@@ -685,11 +685,10 @@ pub fn main(init: std.process.Init) !void {
     // bridge here, with the key named — the same guarantee the compile-time version gave,
     // moved to where an operator error belongs. TOPOLOGY_PATH overrides the location for
     // a deployment that does not run from the directory holding the file.
-    const topology_path = parsed_args.topology_path;
-    var topology_owned = try topology_mod.load(allocator, io, topology_path);
+    var topology_owned = try topology_mod.loadEmbedded(allocator);
     defer topology_owned.deinit();
     runtime_config.topology = topology_owned.topology;
-    log.info("Topology: \x1b[1m {s} \x1b[0m (read at startup)", .{topology_path});
+    log.info("Topology: built in (grammar.json embedded at compile time, §10ci)", .{});
 
     // Create null-terminated versions for C APIs (kept alive for entire program)
     const slot_name_z = try allocator.dupeZ(u8, parsed_args.slot_name);
@@ -702,10 +701,9 @@ pub fn main(init: std.process.Init) !void {
     log.info("Slot name: \x1b[1m {s} \x1b[0m", .{parsed_args.slot_name});
     log.info("HTTP port: \x1b[1m {d} \x1b[0m", .{parsed_args.http_port});
     log.info("Wire format: \x1b[1m msgpack (CDC), JSON (schema) \x1b[0m — fixed, not configurable", .{});
-    log.info("Streams: \x1b[1m {s}, {s} \x1b[0m (from {s})", .{
+    log.info("Streams: \x1b[1m {s}, {s} \x1b[0m (embedded grammar)", .{
         runtime_config.topology.stream_cdc,
         runtime_config.topology.stream_mutations,
-        topology_path,
     });
 
     // Register signal handlers for graceful shutdown

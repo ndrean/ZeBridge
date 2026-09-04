@@ -1,7 +1,6 @@
 //! Command-line arguments parsing for CDC Bridge application
 const std = @import("std");
 const config = @import("config.zig");
-const topology_mod = @import("topology.zig");
 const log = std.log.scoped(.args);
 
 const usage =
@@ -15,21 +14,6 @@ const usage =
     \\  --pub <NAME>    PostgreSQL PUBLICATION to stream. REQUIRED here or as
     \\                  BRIDGE_CDC_PUBLICATION — there is no default.
     \\  --port <PORT>   HTTP telemetry port
-    \\  --top <PATH>    grammar.json to read (default: ./grammar.json). Carries every
-    \\                  stream, subject and KV name; missing file or key is fatal.
-    \\  --strict-tables Refuse to start if any published table lacks a primary key
-    \\  --diagnose           Pre-run doctor: report everything boot would decide, write nothing, exit
-    \\  --init-nats          Generate the NATS stack, no nsc: --mode dev (open server, 10s) or
-    \\                       --mode operator (full JWT: operator+account+scoped keys+creds);
-    \\                       --dir PATH, --force, --nats-port/--ws-port/--http-port, --top grammar.json
-    \\                  (default: skip the table, keep replicating the rest)
-    \\  --gen-nkey      Mint one nkey pair and exit, without starting anything.
-    \\                  Prints NATS_BRIDGE_NKEY_PUB / NATS_BRIDGE_NKEY_SEED on
-    \\                  stdout (the warning goes to stderr, so it pipes:
-    \\                  `bridge --gen-nkey >> .env.bridge`). The PUB line goes in
-    \\                  nats-server.conf, the SEED is the bridge's credential —
-    \\                  it is shown once and never stored by this command.
-    \\  --help, -h      Show this message
     \\
     \\Environment:
     \\  DATABASE_READER_URL          REQUIRED. Read path, credentials included:
@@ -170,7 +154,6 @@ pub const Args = struct {
     /// fit this BASE_BUF, and what is the smallest BASE_BUF that would fit it.
     diagnose: bool = false,
     /// Where grammar.json is. See `--top`.
-    topology_path: []const u8,
     http_port: u16,
     http_bind: []const u8,
     slot_name: []const u8,
@@ -222,8 +205,6 @@ pub const Args = struct {
         // replicating. See preflight.zig for the full argument.
         var strict_tables: bool = false;
         var diagnose = false;
-        // Null means "not given", so TOPOLOGY_PATH can still speak before the default.
-        var topology_path: ?[]const u8 = null;
 
         // ⚠️ A flag whose value is MISSING must fail, not fall back.
         // `--pub` at the end of the command line used to leave the compiled
@@ -247,8 +228,6 @@ pub const Args = struct {
                 slot_name = try requireValue(&args_iter, "--slot");
             } else if (std.mem.eql(u8, arg, "--pub")) {
                 publication_name = try requireValue(&args_iter, "--pub");
-            } else if (std.mem.eql(u8, arg, "--top")) {
-                topology_path = try requireValue(&args_iter, "--top");
             } else if (std.mem.eql(u8, arg, "--strict-tables")) {
                 strict_tables = true;
             } else if (std.mem.eql(u8, arg, "--diagnose") or std.mem.eql(u8, arg, "--run-diagnose")) {
@@ -310,16 +289,7 @@ pub const Args = struct {
                 "default",
         });
 
-        // `--top` beats TOPOLOGY_PATH beats ./grammar.json — the same precedence as
-        // `--port` over BRIDGE_PORT. Only the *path* is resolved here; reading it is
-        // `main`'s job, because a failure there must stop the process with a message,
-        // not be folded into argument parsing.
-        const resolved_topology = topology_path orelse
-            init.minimal.environ.getPosix("TOPOLOGY_PATH") orelse
-            topology_mod.default_path;
-
         const cli_args = Args{
-            .topology_path = resolved_topology,
             .http_port = resolved_port,
             .http_bind = resolved_bind,
             .slot_name = resolved_slot,
