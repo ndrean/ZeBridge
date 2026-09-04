@@ -22,6 +22,21 @@ const utils = @import("utils.zig");
 
 pub const log = std.log.scoped(.nats_pub);
 
+/// Transport-level reconnect counting (§10cn). nats.zig reconnects on its own under
+/// short broker bounces, so the publisher's manual reconnect path never runs and a
+/// counter incremented only there answered "how flaky was my broker?" with 7 after
+/// 50 restarts (churn.py). The connection's `reconnected_cb` fires on every
+/// re-establishment; it carries no user-data pointer, so the process-singleton
+/// publisher parks its metrics here for the hook to reach.
+var g_metrics: ?*Metrics = null;
+
+fn onTransportReconnected(_: *nats.Connection) void {
+    // The log line is load-bearing: churn.py holds the counter to log ground truth
+    // (metric == manual reconnects + these), so a silent count cannot drift.
+    log.info("🟢 NATS transport reconnected (library self-heal)", .{});
+    if (g_metrics) |m| m.recordNatsReconnect();
+}
+
 /// NATS Publisher Configuration
 pub const PublisherConfig = struct {
     /// Where NATS is. Resolved once by `Conf.Nats.Endpoint.resolve` and handed to every
@@ -122,11 +137,15 @@ pub const Publisher = struct {
         const conn = try self.allocator.create(nats.Connection);
         errdefer self.allocator.destroy(conn);
 
+        g_metrics = self.metrics;
         conn.* = nats.Connection.init(self.allocator, self.io, .{
             .user = ep.user,
             .password = ep.pass,
             .nkey_seed = ep.seed,
             .user_creds = ep.creds,
+            // Counted at the TRANSPORT (§10cn): the library's own reconnects are the
+            // ones an operator asks about, and only the hook sees them all.
+            .callbacks = .{ .reconnected_cb = onTransportReconnected },
             // The library reconnects on its own and buffers publishes while it does. The
             // hand-rolled reconnect below stays as the outer guard for the case it gives
             // up on, but it is no longer the first line of defence.
@@ -200,7 +219,10 @@ pub const Publisher = struct {
             self.is_connected.store(true, .seq_cst);
             const count = self.reconnect_count.fetchAdd(1, .monotonic) + 1;
 
-            // Update metrics if available
+            // Not a double count: the transport hook fires only on the library's
+            // internal reconnects (`was_reconnect` in connection.zig), and this path
+            // only runs after the library gave up and a FRESH connection was made —
+            // whose first connect never fires the hook. Disjoint by construction.
             if (self.metrics) |metrics| {
                 metrics.recordNatsReconnect();
             }
