@@ -283,3 +283,33 @@ the two-strikes reconnect path both record it, so a caller that later finds the
 connection closed can NAME the cause instead of reporting a bare `ConnectionClosed`.
 libzb's C ABI consults it on any failed poll (ZeBridge NOTES §10cj). Patch:
 nats.zig-auth-verdict.patch. 132+183 tests pass.
+
+---
+
+## 7. Three standing patches that never got their entry (ledgered 2026-09-04)
+
+All three shipped with libzb's live-tailing work (ZeBridge NOTES §10bh) and were
+referenced from there but never written up HERE — found when a review asked
+whether a submodule diff was recorded. Nothing new in the diff; this closes the
+bookkeeping gap.
+
+**`nats.zig-fetch-early-return-503.patch`** — `PullSubscription.fetch` parked
+terminal status frames (503 and friends) in `MessageBatch.err` and returned an
+EMPTY batch, so a caller's `catch` never fired and "the consumer is gone" looked
+identical to "nothing to read". A terminal status is now a returned error; the
+dead `batch.err` arm in libzb's drain loop became live the same day (see the
+comment at libzb client.zig's bounded drain).
+
+**`nats.zig-consumer-inactive-threshold.patch`** — `ConsumerConfig` gains
+`inactive_threshold`: the SERVER reaps an idle consumer after the given
+nanoseconds. libzb names its tail consumers and lets the server own their
+lifetime (30 s past any real fetch gap) instead of deleting them client-side —
+a client that dies uncleanly leaves nothing behind.
+
+**`nats.zig-shared-pull-inbox.patch`** — `PullInbox`: ONE wait over many pull
+subscriptions — one pull per tail into a shared inbox, first message from any
+of them ends the wait. Replaced libzb's 250 ms round-robin whose cost was a
+FIXED idle slice per stream (measured 265 ± 1 ms added latency on every write).
+Carries `owns_inbox` so a subscription on a shared inbox does not free it, and
+the addendum hunk: the all-consumers-gone path freed `gone` twice (errdefer +
+explicit) — a macOS SIGTRAP found by stream_wipe.py, 2026-09-03.
