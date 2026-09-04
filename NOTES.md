@@ -8616,6 +8616,43 @@ churn asserts `metric == self-heals + fallbacks` and `self-heals >= 1` (the part
 that was invisible before this entry). `bridge_pg_reconnects_total` read 9/15 by
 the same merging, floor set at half. OBSERVABILITY.md row updated.
 
+## 10co. Clock skew: the case against LWW, and what this design actually promises (2026-09-04)
+
+The most obvious argument against last-write-wins is that it lets a clock decide a
+data race. Two clients edit one row; the one whose laptop runs four seconds fast
+wins edits it did not make last. No attack, no bug — a browser's clock is set by
+its user, so this needs one misconfigured machine. `clockskew.py` stages it and
+holds the design to what it actually promises, which is not fairness:
+
+**The theft is real, bounded, and audible.** A writer 4 s fast (inside the 5 s
+tolerance, so the clamp stays out of it — clamp.py's exactness check is the other
+half) steals the row: an honest write later in REAL time verdicts `stale`. Measured:
+the freeze ended ~4.5 s later, the moment PostgreSQL's `now()` passed the stolen
+version. The stolen window is the skew itself, capped by the tolerance — never the
+year a broken clock would have taken (the clamp story, §7.3). And the loss is a
+definitive verdict, so the outbox pops and the winner arrives over CDC; nobody
+retries forever.
+
+**Starvation was never the skew — it was deriving versions from a clock.** A writer
+30 s slow, stamping from its wrist, is `stale` on every edit for as long as the lag
+lasts: wall-clock LWW has no mercy. The SAME lagging clock following §7.3's rule —
+version = max(now, newest-version-SEEN + 1 µs), which is libzb's `hlcVersion` with
+`seen_floor` fed by the CDC feed — writes through immediately. The scenario emulates
+the rule byte-for-byte rather than skewing a real client's clock: the wire cannot
+tell a skewed clock from a crafted version, which is the whole point.
+
+**Skew biases WHO wins, never WHAT replicas hold.** The CDC leg listens from before
+the first write; at the end the feed's last word equals PostgreSQL's row, and no
+stale write's payload ever reached the feed — losers leave verdicts, not traces.
+Divergence would be the disaster; unfairness is the documented price of LWW.
+
+What remains irreducible: within-tolerance theft during true concurrency. LWW's
+contract is that SOMEONE loses a concurrent race; skew biases who. The defenses do
+not remove the bias — they bound it (clamp), make it visible (verdicts), and keep it
+from ever splitting the replicas (one arbiter: the stored row, fanned out by CDC).
+A design that cannot tolerate biased winners needs CRDTs or server-assigned
+versions, and pays their price instead. This closes the resilience shelf.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
