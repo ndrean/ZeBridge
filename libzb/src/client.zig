@@ -30,7 +30,10 @@ pub const Options = struct {
     grammar_json: ?[]const u8 = null,
     db_path: [*:0]const u8,
     principal: []const u8,
-    /// Parents FIRST: seeding runs in this order with foreign_keys ON.
+    /// Parents FIRST is still the recommended order — but since §10cp the seed
+    /// runs with foreign_keys OFF (chains are per-table snapshots cut at different
+    /// moments, so no order can fully protect a child chain), re-enables them
+    /// after, and reports surviving violations loudly.
     tables: []const []const u8,
     /// This replica's identity, and it must be STABLE across restarts: it is the
     /// tiebreak value the bridge stores and the prefix of every msg_id, so a client
@@ -539,8 +542,20 @@ pub const SyncClient = struct {
                 }
             }
         }
-        // Seed in the CONFIGURED order (parents first) with foreign_keys ON:
-        // scoped to gapped routes plus never-seeded tables (§10n).
+        // Seed with foreign_keys OFF — the standard bulk-load shape, and the same
+        // one the TS client uses (dialect.deferForeignKeys + foreignKeyViolations).
+        // Order alone cannot save this: chains are per-table snapshots built at
+        // DIFFERENT cutoffs, so a child's chain can reference a parent born after
+        // the parent's chain was cut — a fresh client seeding an orders chain died
+        // at row 1 on the FK, rolling back the whole step (§10cp finding 2). A seed
+        // is a bulk load of almost-consistent snapshots; the tail reconciles the
+        // difference, and the post-load check makes any residue LOUD instead of
+        // fatal. The pragma sits OUTSIDE the per-step transactions because SQLite
+        // silently ignores it inside one.
+        try execSql(&self.st, a, "PRAGMA foreign_keys = OFF;");
+        defer execSql(&self.st, a, "PRAGMA foreign_keys = ON;") catch {};
+        // Still the CONFIGURED order (parents first — cheapest path to zero
+        // residue), scoped to gapped routes plus never-seeded tables (§10n).
         for (self.opts.tables) |table| {
             const st = self.states.get(table) orelse continue;
             // ⚠️ `try`, not "treat a failed read as never seeded": that would answer a
@@ -551,6 +566,13 @@ pub const SyncClient = struct {
             if (gapped.contains(st.route) or shared_gapped or !seeded) {
                 try self.applyChain(table);
             }
+        }
+        const orphans = try self.st.query(a, "PRAGMA foreign_key_check;", &.{});
+        if (orphans.len > 0) {
+            std.debug.print(
+                "⚠️ {d} foreign key violation(s) survive seeding — cross-chain skew; the tail reconciles or holds them\n",
+                .{orphans.len},
+            );
         }
     }
 
@@ -1102,7 +1124,14 @@ pub const SyncClient = struct {
         // BEFORE the optimistic apply overwrites it, obviously.
         const before = try self.beforeImage(a, table, st, key);
 
-        try self.applyOptimistic(table, st, env.object.get("optimistic").?);
+        // NON-FATAL, matching the TS client (its failed optimistic upsert is a log
+        // line and the write still queues): the payload is valid ON THE WIRE — the
+        // bridge builds the UPDATE from key + data — so a local echo that cannot
+        // apply (an UPDATE whose values do not repeat the pk fails the upsert arm's
+        // NOT NULL) must not abort the queueing. Aborting here LOST every such
+        // update: 24 per client per swarm smoke, audible but wrong (§10cp). The
+        // CDC echo applies the row properly moments later.
+        self.applyOptimistic(table, st, env.object.get("optimistic").?) catch {};
 
         const payload_json = try core.valueToString(a, payload);
         const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
