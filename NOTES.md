@@ -8430,6 +8430,44 @@ bridge.creds pass a full JetStream round trip; a credless connection is refused;
 enrollment pair is present. Never-overwrite, absolute store_dir, and the operator and
 account identity seeds land in .env.bridge COMMENTED OUT — offline keys, printed once.
 
+## 10ci. The grammar is the protocol: built in, served, never copied (2026-09-04)
+
+Review's chain of reasoning, thought aloud and followed to its end:
+
+1. A client library only works when its wire names match the bridge's byte-for-byte.
+2. Since §10ch the JWT grants are MINTED from those names — creds bind a client to a
+   grammar cryptographically. A client with valid creds and a different grammar is not
+   misconfigured, it is impossible.
+3. Therefore grammar.json is not configuration. It is a PROTOCOL CONSTANT — and a
+   rename is a protocol fork whose correct cost is a rebuild.
+
+That retires the read-at-startup doctrine, and honestly: the §topology drift scar came
+from the MIXED model (one component baked, one reading at runtime). With the runtime
+loader DELETED there is no second reader to disagree. `grammar.json` moved into `src/`
+(review: it is source) and `topology.zig` does a plain `@embedFile`; `--top` and
+`TOPOLOGY_PATH` are gone; `--init-nats` needs no file present (grants and bridge mint
+from the same embedded bytes, so they cannot disagree); the fixture-drift unit test
+now compares against the embedded bytes and runs anywhere. Review also considered and
+rejected full comptime-parsed constants — then talked itself back into this exact
+split, which is the right one: the BYTES are compile-time, the parse is one startup
+call, and nothing reads the filesystem.
+
+**And clients never copy the file** — they RECEIVE the grammar:
+- `GET /grammar`: the embedded bytes verbatim, `X-Grammar-Hash` = their sha256,
+  CORS-open so the web client bootstraps from a URL;
+- the `/enroll` payload now carries `grammar` + `grammar_hash` beside the JWT —
+  identity and wire contract are one artifact, delivered together by the authority
+  that minted both;
+- libzb takes `grammarJson` (raw bytes, wins over `grammarPath`; the path stays for
+  repo-resident tools); the TS client always took a parsed object, so its file-free
+  path is just `fetch(bridge + '/grammar')`.
+
+`grammar_served.py` (live) pins it: served bytes byte-identical to `src/grammar.json`
+with the hash header correct, and a libzb client that syncs from `grammarJson` alone —
+no file anywhere. The drift-detection story falls out for free: a client pins the hash
+it enrolled under; a mismatch on reconnect means the deployment forked the protocol,
+which also killed its creds — one diagnosis instead of mysterious permission errors.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
