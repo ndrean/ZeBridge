@@ -96,6 +96,7 @@ GROUPS = {
         "slot_loss":     ("bridge", "slot invalidated: refused at boot, recovered as a new feed, clients re-seed"),
         "slot_contest":  ("bridge", "two bridges, one slot: the loser refuses cleanly and leaks nothing"),
         "jwt_expiry":    ("bridge", "enroll with a tiny TTL: full invite-code bootstrap, then the read door closes audibly"),
+        "churn":         ("bridge", "65 reconnect cycles (50 NATS, 15 PG, wasp swarms): RSS/fd/threads flat, counters honest, one client converges"),
         "stream_wipe":   ("bridge", "a CDC stream deleted wholesale: bridge stops, boot recreates, client resets and converges"),
         "pg_restart":    ("bridge", "PostgreSQL stopped and restarted: patient retry, resume from the slot, no loss"),
         "matrix":        ("bridge", "PG and NATS failing and returning in every order; the 3am case on top"),
