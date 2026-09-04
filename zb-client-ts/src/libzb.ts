@@ -1738,10 +1738,36 @@ export class ZeBridge {
           // ends, this loop notices — an idle guard stops a deaf iterator when data
           // is provably waiting — and recreates the consumer from the stored
           // position. Duplicates are idempotent; silence is data loss.
-          let curIter = iter;
+          // ⚠️ A consumed iterator must NEVER be iterated again: @nats-io throws
+          // InvalidOperationError ("iterator is already yielding") on the second
+          // iterate() — even after the first ended — and inside this
+          // fire-and-forget IIFE that throw is an unhandled rejection that kills
+          // the whole PROCESS (measured: five clients per casualty, 25 of 100
+          // clients dead in the §10cs soak). `curIter` is nulled the moment its
+          // for-await returns; a null iterator means "recreate first".
+          let curIter: typeof iter | null = iter;
           let curPending: number | null = ci.num_pending ?? null;
           let attempt = 0;
           while (this.nc) {
+          if (!curIter) {
+            attempt++;
+            await new Promise((r) => setTimeout(r, 1000));
+            try {
+              const resumeFrom = this.globalSyncState.seq[streamName] ?? 0;
+              const ci2 = await jsm.consumers.add(streamName, {
+                deliver_policy: resumeFrom > 0 ? this.transport.deliverPolicy.byStartSequence : this.transport.deliverPolicy.all,
+                opt_start_seq: resumeFrom > 0 ? resumeFrom + 1 : undefined,
+              });
+              const consumer2 = await js.consumers.get(streamName, ci2.name);
+              curPending = ci2.num_pending ?? null;
+              curIter = await consumer2.consume();
+              this.appendLog('SYS', `${streamName}: tail recreated (attempt ${attempt}) from seq ${resumeFrom}, ${curPending ?? '?'} pending`, 'WARNING');
+            } catch (e) {
+              this.appendLog('SYS', `${streamName}: tail recreate failed (${e}) — retrying`, 'ERROR');
+              await new Promise((r) => setTimeout(r, 4000));
+              continue;
+            }
+          }
           let processedSinceStart = 0;
           let caughtUpLogged = curPending === 0;
           const progressEvery = 2000;
@@ -1877,27 +1903,14 @@ export class ZeBridge {
               flushTimer = setTimeout(() => { void flushBatch(); }, BATCH_MS);
             }
           }
+          } catch (e) {
+            // Contained, whatever it is: a tail must never take the process down.
+            this.appendLog('SYS', `${streamName}: tail iterator errored (${e}) — will recreate`, 'ERROR');
           } finally { clearInterval(idleGuard); }
           await flushBatch();
+          curIter = null; // consumed — never iterate it again (see above)
           if (!this.nc) break;
-          attempt++;
-          await new Promise((r) => setTimeout(r, 1000));
-          try {
-            const resumeFrom = this.globalSyncState.seq[streamName] ?? 0;
-            const ci2 = await jsm.consumers.add(streamName, {
-              deliver_policy: resumeFrom > 0 ? this.transport.deliverPolicy.byStartSequence : this.transport.deliverPolicy.all,
-              opt_start_seq: resumeFrom > 0 ? resumeFrom + 1 : undefined,
-            });
-            const consumer2 = await js.consumers.get(streamName, ci2.name);
-            curPending = ci2.num_pending ?? null;
-            curIter = await consumer2.consume();
-            this.appendLog('SYS', `${streamName}: tail recreated (attempt ${attempt}) from seq ${resumeFrom}, ${curPending ?? '?'} pending`, 'WARNING');
-          } catch (e) {
-            this.appendLog('SYS', `${streamName}: tail recreate failed (${e}) — retrying`, 'ERROR');
-            await new Promise((r) => setTimeout(r, 4000));
-            // curIter already ended: the next lap's for-await exits at once and
-            // lands back here — self-throttled by the waits above.
-          }
+          this.appendLog('SYS', `${streamName}: tail ended — recreating from the stored position`, 'WARNING');
           }
         })();
       }
