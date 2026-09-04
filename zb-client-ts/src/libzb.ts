@@ -1670,21 +1670,38 @@ export class ZeBridge {
       for (const streamName of this.cdcStreams()) {
         const setupStart = performance.now();
         // A stream that is fully consumed (or empty) delivers no message, so the
-        // per-batch persist below never fires — record its CURRENT tail now, or a
-        // quiet stream reads as `local 0` forever and re-seeds every reconnect.
+        // per-batch persist below never fires — record a floor now, or a quiet
+        // stream reads as `local 0` forever and re-seeds every reconnect.
+        //
+        // ⚠️ The floor comes from what the SEED proved, never from the stream's
+        // current tail. The chain's cutoff can be minutes older than "now", and
+        // every row written in between must REPLAY through this consumer: under
+        // a 12-client swarm writing 40 rows/s, consumer setup took 95 s and
+        // recording the tail silently skipped ~340 rows per replica — permanent
+        // holes that no reconnect heals (found by swarm.py, NOTES §10cp). The
+        // per-event gate (core seedSeq/seedStream, finding 10's lsn fallback)
+        // makes a floor that is too LOW merely cheap duplicates; a floor too
+        // HIGH is data loss. Only a stream with no chain-seeded tables still
+        // takes the tail — the quiet-stream case this block exists for.
         try {
-          const sinfo = await jsm.streams.info(streamName);
-          const tail = sinfo?.state?.last_seq ?? 0;
-          if (tail > (this.globalSyncState.seq[streamName] ?? 0) && (this.globalSyncState.seq[streamName] ?? 0) === 0) {
+          const seeded = [...this.syncedTables.values()].filter((st) => st.seedLsn != null);
+          const seedFloors = seeded
+            .filter((st) => st.seedStream === streamName && typeof st.seedSeq === 'number')
+            .map((st) => st.seedSeq as number);
+          // Seeded tables whose manifest carried no cutoff_seq: floor 0 — the
+          // consumer replays from the stream's start and the lsn gate drops what
+          // the seed covered. Cheap (retention is short), and never lossy.
+          const floor = seedFloors.length
+            ? Math.min(...seedFloors)
+            : (seeded.length ? 0 : ((await jsm.streams.info(streamName))?.state?.last_seq ?? 0));
+          if (floor > (this.globalSyncState.seq[streamName] ?? 0) && (this.globalSyncState.seq[streamName] ?? 0) === 0) {
             // Only when we hold NO position: a stored position must never jump
-            // forward past unconsumed messages. Zero means "fresh or gated-all",
-            // and in both cases seeding has just covered everything at or before
-            // the tail we are about to record.
-            this.globalSyncState.seq[streamName] = tail;
+            // forward past unconsumed messages.
+            this.globalSyncState.seq[streamName] = floor;
             await this.run(
               `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
                ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
-              streamName, tail,
+              streamName, floor,
             );
           }
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }
