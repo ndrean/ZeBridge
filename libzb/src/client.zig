@@ -282,6 +282,9 @@ pub const SyncClient = struct {
     /// Touches only `st`, so it is testable against a scratch SQLite with no NATS.
     /// (§10bi — the "increment 2" this file promised in §10v.)
     pub fn migrateTable(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, val: Value) !Migration {
+        // Schema surgery ahead (possibly): cached statements referencing this
+        // table would fail forever after a rebuild — clear first, cheap certainty.
+        st.clearStmtCache();
         // ⚠️ Never `.?` into a descriptor. A suspension (`{"table":…,"suspended":…}`,
         // §5) has no columns, and a host behind the C ABI cannot catch a Zig panic —
         // measured 2026-08-29: a refused table's 97-byte suspension reached this

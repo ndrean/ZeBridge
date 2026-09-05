@@ -51,6 +51,14 @@ const SpinLock = struct {
 pub const Storage = struct {
     db: *c.sqlite3,
     mutex: SpinLock = .{},
+    /// Prepared-statement cache (§10cu). The CDC wire carries FULL rows (§7's
+    /// asymmetry), so the apply path compiles the SAME SQL for every event of a
+    /// table — millions of prepares of identical text. Prepare once, rebind per
+    /// row: keyed by exact SQL text, capped, cleared on schema surgery (see
+    /// clearStmtCache) and finalized at close. A cached statement is RESET and
+    /// its bindings cleared after every use — an un-reset statement holds table
+    /// locks and pins the read snapshot.
+    stmt_cache: std.StringHashMapUnmanaged(*c.sqlite3_stmt) = .empty,
 
     /// Open (or create) a database. `":memory:"` works for tests.
     /// Applies the contract pragmas: foreign_keys ON (semantics) and WAL
@@ -84,7 +92,22 @@ pub const Storage = struct {
     }
 
     pub fn close(self: *Storage) void {
+        self.clearStmtCache();
         _ = c.sqlite3_close(self.db);
+    }
+
+    /// Finalize every cached statement and drop the keys. Called at close, and
+    /// before any schema surgery: prepare_v2 statements survive most schema
+    /// changes (SQLite recompiles internally), but a DROPped or rebuilt table's
+    /// statement fails forever after — clearing is cheap certainty.
+    pub fn clearStmtCache(self: *Storage) void {
+        var it = self.stmt_cache.iterator();
+        while (it.next()) |e| {
+            _ = c.sqlite3_finalize(e.value_ptr.*);
+            std.heap.c_allocator.free(e.key_ptr.*);
+        }
+        self.stmt_cache.deinit(std.heap.c_allocator);
+        self.stmt_cache = .empty;
     }
 
     /// The rows AND the column names, for a caller that renders results (the C ABI's
@@ -123,15 +146,36 @@ pub const Storage = struct {
     /// Prepare, bind, step. Rows (and their text/blob contents) are allocated
     /// from `a` — hand an arena and drop it wholesale.
     pub fn query(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value) Error![]Row {
-        var stmt: ?*c.sqlite3_stmt = null;
-        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
-            return Error.PrepareFailed;
-        }
-        defer _ = c.sqlite3_finalize(stmt);
-        // SQLITE_OK with a null statement means the SQL was empty or only a comment.
-        // That is never what a caller meant, so it fails the same way for every
-        // caller — it used to succeed silently when there were no params.
-        const s = stmt orelse return Error.PrepareFailed;
+        var transient: ?*c.sqlite3_stmt = null;
+        const s: *c.sqlite3_stmt = if (self.stmt_cache.get(sql)) |hit| hit else blk: {
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+                return Error.PrepareFailed;
+            }
+            // SQLITE_OK with a null statement means the SQL was empty or only a comment.
+            // That is never what a caller meant, so it fails the same way for every
+            // caller — it used to succeed silently when there were no params.
+            const fresh = stmt orelse return Error.PrepareFailed;
+            // Cache by exact text, capped; anything past the cap (or an OOM on the
+            // key) runs transient exactly as before.
+            if (self.stmt_cache.count() < 256) cache: {
+                const key = std.heap.c_allocator.dupe(u8, sql) catch {
+                    transient = fresh;
+                    break :cache;
+                };
+                self.stmt_cache.put(std.heap.c_allocator, key, fresh) catch {
+                    std.heap.c_allocator.free(key);
+                    transient = fresh;
+                };
+            } else transient = fresh;
+            break :blk fresh;
+        };
+        defer if (transient) |t| {
+            _ = c.sqlite3_finalize(t);
+        } else {
+            _ = c.sqlite3_reset(s);
+            _ = c.sqlite3_clear_bindings(s);
+        };
 
         for (params, 1..) |p, i| {
             const idx: c_int = @intCast(i);
