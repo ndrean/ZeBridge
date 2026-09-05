@@ -8997,6 +8997,52 @@ OPEN.
 Battery status: offline 7/7, live 28/28 (after residue cleanup), owns 26/27 —
 livebirth the one real, filed regression.
 
+## 10cw. livebirth, instrumented: not a reload race — a routing/registry disagreement (2026-09-05)
+
+§10cv guessed "reload race." Ten probe iterations disproved that and found the real
+shape, which I could characterize but did not fully close before stopping (the
+honest note: this became a rabbit hole and was halted at the don't-keep-digging
+line, tree cleaned).
+
+Ground truth from `[INSTR]` probes on a clean stack, in order:
+1. `refuse('zb_livebirth', .no_cdc_subject)` fires BEFORE the enable's catalogue
+   row is processed — a zb_livebirth event reaches the bridge ahead of its own
+   declaration. Origin is PG-side WAL/decode ordering, not a trigger in init.sql
+   (looked — none fits). This records the refusal.
+2. The enable's catalogue reload runs and LIFTS it — confirmed: `refused.clear`
+   ran, `active` went false. So verdictFor should read `.pass` afterwards.
+3. Both born-live INSERTs are RECEIVED after the lift, with NO refuse call between
+   the lift and them.
+4. Yet neither publishes (CDC_PUBLIC stays 0; the live core subscriber sees
+   nothing), and a SECOND `refuse('zb_livebirth', .no_cdc_subject)` fires AFTER
+   the inserts.
+
+So the inserts arrive with a genuinely-lifted refusal and STILL do not reach the
+wire, and the table is re-refused as unroutable. That means the two views of "is
+this table public" disagree at insert time: the refusal registry says lifted
+(`.pass`), but the routing decision in `packMutationToSlot` (or a schema-path
+event interleaved with the inserts) still finds it unroutable and re-refuses
+`no_cdc_subject`. Prime suspect: `topology.public_tables` is stale/aliased at pack
+time across the THREE rapid reloads the enable triggers — each `reload()` does
+`self.topo.public_tables = fresh.publics; self.cat.* = fresh; old.deinit()`, and
+a routing read taking the old slice would not see zb_livebirth. Not proven — the
+insert-path verdict probe failed to install (anchor mismatch) and I stopped rather
+than drill an eleventh time.
+
+Fix direction, unchanged in spirit but now better aimed: make the live-enable
+routing state consistent and ORDERED with the event stream. The clean end-state is
+still to apply the catalogue change IN-BAND from the WAL tuple (the declaration is
+then processed strictly before any data row, and the pre-enable refuse cannot
+happen). Separately, the pack-time routing view and the refusal registry must
+agree — one source of truth for "public," read once per event, not two that can
+diverge across reloads. The user's hold-the-loop idea is ruled out twice: the lift
+already precedes the inserts (so pausing on refuse changes nothing here), and
+holding a live-add's potentially-thousands of rows would collapse memory.
+
+Still OPEN. Better evidence, not yet fixed. The `[INSTR]` probe recipe is worth
+re-deriving next pass: refuse() calls, LIFT, RECV at .insert entry, and — the one
+that was missing — the verdict AND the routing decision inside packMutationToSlot.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
