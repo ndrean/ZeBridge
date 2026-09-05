@@ -98,7 +98,7 @@ async def main():
 
     # ── the probe ─────────────────────────────────────────────────────────────
     verdicts = []
-    sub = await nc.subscribe(
+    sub = await zb.subscribe(nc, 
         f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>"
     )
 

@@ -87,12 +87,12 @@ async def main():
 
     verdicts: dict[str, dict] = {}
     ack_prefix = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
-    ack_sub = await nc.subscribe(f"{ack_prefix}.{who}.*")
+    ack_sub = await zb.subscribe(nc, f"{ack_prefix}.{who}.*")
 
     # The CDC leg listens from BEFORE the first write: convergence is judged on what
     # the feed actually said, not on a read-back after the dust settles.
     cdc_events: list[dict] = []
-    cdc_sub = await nc.subscribe(
+    cdc_sub = await zb.subscribe(nc, 
         f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{tenant}.{TABLE}.>"
     )
 

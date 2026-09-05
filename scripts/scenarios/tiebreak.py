@@ -92,7 +92,7 @@ async def main():
     async def on_ack(m):
         verdicts[m.subject.rsplit(".", 1)[-1]] = json.loads(m.data.decode())
 
-    await nc.subscribe(f"{ack_prefix}.{who}.>", cb=on_ack)
+    await zb.subscribe(nc, f"{ack_prefix}.{who}.>", cb=on_ack)
 
     async def write(uid: str, version: str, client_id: str, text: str, forged: str | None = None):
         data = {"uid": uid, "some_text": text, version_col: version, "inserted_at": version}

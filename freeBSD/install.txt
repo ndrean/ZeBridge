@@ -1,0 +1,66 @@
+# freeBSD has the editor ee
+
+pkg update
+pkg install postgresql16-server postgresql16-client nats-server prometheus grafana10 haproxy prometheus-nats-exporter
+
+pkg install zig git zstd
+
+# ZeBridge
+touch /var/log/zebridge_fast.log
+touch /var/log/zebridge_large.log
+chown nobody:nobody /var/log/zebridge_fast.log
+chown nobody:nobody /var/log/zebridge_large.log
+
+
+
+
+# NATS-exporter
+# Configure nats-exporter arguments directly in rc.conf
+sysrc prometheus_nats_exporter_args="-varz -jsz=all http://localhost:8222"
+
+# Prometheus
+sysrc prometheus_ev="GOMEMLIMIT=750MiB"
+sysrc prometheus_args="--storage.tsdb.retention.time=1d --storage.tsdb.min-block-duration=2h --storage.tsdb.max-block-duration=2h"
+chown prometheus:prometheus /usr/local/etc/prometheus.yml
+# check Prometheus conf
+promtool check config /usr/local/etc/prometheus.yml
+
+# HAProxy
+# check HAProxy conf
+haproxy -c -f /usr/local/etc/haproxy.conf
+
+# Packet filter (firewall rules)
+sysrc pf_enable="YES"
+sysrc pf_rules="/etc/pf.conf"
+sysrc pflog_enable="YES" # Optional: enables logging of blocked packets
+# check pf
+pfctl -n -f /etc/pf.conf
+
+# Enable services
+sysrc postgresql_enable="YES"
+sysrc nats_enable="YES"
+sysrc prometheus_enable="YES"
+sysrc grafana_enable="YES"
+sysrc haproxy_enable="YES"
+sysrc prometheus_nats_exporter_enable="YES"
+
+# start
+service pf start
+service postgresql initdb # Only run this once to create the PG data directory!
+service postgresql start
+service nats start
+service prometheus start
+service grafana start
+service haproxy start
+service prometheus_nats_exporter start
+
+# install ZeBridge
+# Create a dedicated directory for your custom daemons
+mkdir -p /opt/zebridge
+cd /opt/zebridge
+
+# Clone your repository
+git clone https://github.com/your-username/zebridge.git .
+
+# Build for the native architecture with release optimizations
+zig build -Doptimize=ReleaseFast

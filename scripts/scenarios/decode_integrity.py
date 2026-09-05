@@ -150,7 +150,7 @@ def check_rows(got: dict[int, dict], expected: dict[int, dict], source: str) -> 
 
 async def collect_cdc(nc, n: int, timeout: float) -> dict[int, dict]:
     """Subscribe to cdc.>, seed, and collect every decode_fixture INSERT — batched or not."""
-    sub = await nc.subscribe(f"{CDC_PREFIX}.>")
+    sub = await zb.subscribe(nc, f"{CDC_PREFIX}.>")
     got: dict[int, dict] = {}
 
     async def drain():

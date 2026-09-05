@@ -902,8 +902,8 @@ pub fn main(init: std.process.Init) !void {
     // has no primary key, and the mutation path must honour either verdict.
     var refused = refused_tables.Registry.init(allocator);
     defer refused.deinit();
-    // The psql mirror (§10cf): every refusal transition is projected into
-    // zebridge_catalogue.suspended/suspended_reason — set BEFORE preflight so boot
+    // The psql mirror (§10cf, its own table since §10cy): every refusal transition
+    // is projected into zebridge_suspensions — set BEFORE preflight so boot
     // refusals are written too. And cleared wholesale first: the registry is memory,
     // a restart forgot everything, and a surviving `true` would lie the other way.
     refused.pg_config = &pg_config;

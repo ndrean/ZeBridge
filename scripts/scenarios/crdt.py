@@ -80,11 +80,11 @@ async def main():
     nc = await zb.connect_as(who)
     js = nc.jetstream()
     verdicts: dict[str, dict] = {}
-    ack_sub = await nc.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.*")
+    ack_sub = await zb.subscribe(nc, f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.*")
 
     # each writer's view of the row — fed by the CDC echo, the way a client's is
     seen: dict[str, dict] = {"doc": {}, "version": ""}
-    cdc_sub = await nc.subscribe(f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{tenant}.{TABLE}.>")
+    cdc_sub = await zb.subscribe(nc, f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{tenant}.{TABLE}.>")
     uid = str(uuid.uuid4())
 
     async def collect_acks():

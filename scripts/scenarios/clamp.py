@@ -89,7 +89,7 @@ async def main():
     js = nc.jetstream()
     verdicts: dict[str, dict] = {}
     ack_prefix = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
-    sub = await nc.subscribe(f"{ack_prefix}.{who}.*")
+    sub = await zb.subscribe(nc, f"{ack_prefix}.{who}.*")
 
     async def collect():
         async for m in sub.messages:

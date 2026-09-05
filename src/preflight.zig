@@ -681,6 +681,8 @@ fn isInternalTable(name: []const u8) bool {
         // CREATE fires the DDL trigger like any table, and without this line the DDL
         // path refused it and left a suspended $KV.schemas key in every client.
         std.mem.eql(u8, name, "zebridge_invites") or
+        // The refusal registry's psql mirror (§10cy): same story as the invites.
+        std.mem.eql(u8, name, "zebridge_suspensions") or
         std.mem.eql(u8, name, "schema_migrations");
 }
 
@@ -1113,6 +1115,7 @@ test "classify - a single-column PK is never refused, whatever the identity" {
 test "isInternalTable" {
     try std.testing.expect(isInternalTable("zebridge_ddl_events"));
     try std.testing.expect(isInternalTable("schema_migrations"));
+    try std.testing.expect(isInternalTable("zebridge_suspensions"));
     try std.testing.expect(!isInternalTable("users"));
 }
 

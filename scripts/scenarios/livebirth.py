@@ -78,7 +78,8 @@ async def main():
 
     nc = await zb.connect()
     cdc_seen: list[str] = []
-    cdc_sub = await nc.subscribe(f"{CDC}.{FIX}.>")
+    cdc_sub = await zb.subscribe(nc, f"{CDC}.{FIX}.>")
+    # zb.subscribe flushes: the SUB must be at the server before the birth (NOTES §10cx).
 
     async def watch():
         async for m in cdc_sub.messages:
@@ -159,6 +160,18 @@ async def main():
             else:
                 raw = zb.kv_get("schemas", FIX)
                 zb.bad(f"no live $KV.schemas key for the newborn within 30s (KV said {raw[:100]!r})")
+                failed += 1
+
+            # ── 3b. one birth, ONE reload ──────────────────────────────────────
+            # The enable is one commit, so one reload. It used to be three: the refusal
+            # registry mirrored the early DDL refusal and then its lift into two
+            # columns ON the catalogue, and each came back through the WAL as a
+            # catalogue move (§10cy). The mirror has its own table now.
+            reloads = bridge.text().count("catalogue reloaded live:")
+            if reloads == 1:
+                zb.ok("one enable, one live reload — the refusal mirror no longer echoes as a catalogue move")
+            else:
+                zb.bad(f"{reloads} live reloads for one enable (expected 1): something writes the catalogue back")
                 failed += 1
 
             # ── 4. rows reach the wire — routing is real ───────────────────────

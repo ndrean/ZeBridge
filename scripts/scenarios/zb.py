@@ -188,6 +188,22 @@ async def connect():
     return await nats.connect(NATS_URL, nkeys_seed_str=NKEY_SEED)
 
 
+async def subscribe(nc, subject: str, **kw):
+    """`nc.subscribe` + `nc.flush()`, and every scenario must use this one.
+
+    nats-py only WRITES the SUB command when the event loop next yields. A scenario
+    that subscribes, then does blocking work (`psql`, `wait_for_log`, `nats_cli`), then
+    waits on the subscription can wait on a SUB the server has not seen yet — the
+    bridge publishes to a subject nobody holds, and the check reads "unrouted". It
+    bit `livebirth` the day the bridge got fast enough to pass its first checks on
+    their first poll (NOTES §10cx); the other scenarios only passed because something
+    in them happened to yield first. The flush makes the subscription real before
+    this returns, whatever the caller does next."""
+    sub = await nc.subscribe(subject, **kw)
+    await nc.flush()
+    return sub
+
+
 def psql(sql: str, quiet: bool = False) -> str:
     """Run one statement and return stdout. Uses -tA so output is parseable."""
     res = subprocess.run(PSQL.split() + ["-tA", "-c", sql], capture_output=True, text=True)

@@ -214,6 +214,10 @@ async def main():
           flowed = write_flows("post-pg-kill", timeout=30)
           # a mutation round-trip proves the WRITER reconnected too
           uid = zb.psql("SELECT uid FROM public.counter_public LIMIT 1", quiet=True).strip()
+          if not uid:
+              # an empty fixture skipped the mutation round-trip and read as mutation=False
+              # psql -tA prints the RETURNING row, then the command tag: first line only (as race.py)
+              uid = zb.psql("INSERT INTO public.counter_public (value, inserted_at, updated_at) VALUES (0, now(), now()) RETURNING uid").strip().splitlines()[0].strip()
           mut_ok = False
           if uid:
               version = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"

@@ -129,7 +129,7 @@ async def main():
     # `mutation_ack.<principal>.<msg_id>`, and "refused" is as much a result as "ok".
     verdicts: dict[str, dict] = {}
     ack_pat = zb.TOPOLOGY["subjects"]["mutation_ack_prefix"]
-    ack_sub = await nc.subscribe(f"{ack_pat}.{who}.*")
+    ack_sub = await zb.subscribe(nc, f"{ack_pat}.{who}.*")
 
     async def collect_acks():
         async for m in ack_sub.messages:
@@ -140,7 +140,7 @@ async def main():
 
     cdc_seen: list[str] = []
     cdc_events: list[dict] = []
-    cdc_sub = await nc.subscribe(f"{CDC}.>")
+    cdc_sub = await zb.subscribe(nc, f"{CDC}.>")
 
     async def collect_cdc():
         async for m in cdc_sub.messages:

@@ -71,7 +71,7 @@ This imposes constraints -mostly mechanical- on the database schemas but buys so
 **Configuration**: once the database is migrate - you are expected to `zb_enable()`the tables you want to follow in a designated PG publication, the primary runtime configuration is the **fixed-size buffer** and the `MAX_COLUMNS` (per table). Depending on the write volume and schema sizes of your published tables, the total buffer allocation can be configured anywhere from 16 MB to over 4+ GB.
 Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`.
 
-**Limitations**: `ZeBrigde` is NOT designed for massive databases or tables storing large objects (BLOBs) or an extra large number of columns. NATS restricts payloads ($<2^{20}=1$ MB by default). This limit is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, the needed memory for ZB would start to be very large (eg ~6 GB if buffering 1 MB/evt @ 5000 evt/s).
+**Limitations**: `ZeBrigde` is NOT designed for massive databases or tables storing large objects (BLOBs) or an extra large number of columns. NATS restricts payloads ($<2^{20}=1$ MB by default, safe up to 4MB). This default limit of 1MB is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, the needed memory for ZB would start to be very large (eg ~6 GB if buffering 1 MB/evt @ 5000 evt/s).
 > Large payloads belong in object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data, not PDFs for instances.
 
 Lasty, the main limitation of this LWW implementation is that is it per full row, not column granular. 
@@ -135,6 +135,7 @@ The client library shrinks this orchestration down to a few primitives: `connect
 **An example of a deployed system**:
 
 ```mermaid
+
 graph TD
     %% Styling and Definitions
     classDef external fill:#f9f,stroke:#333,stroke-width:2px;
@@ -143,36 +144,42 @@ graph TD
     classDef secure fill:#fdd,stroke:#333,stroke-width:1px;
     classDef telemetry fill:#fff2cc,stroke:#d6b656,stroke-width:1px;
     classDef bridge fill:##bdf3ff,stroke:#ac0100,stroke-with:2px;
+    classDef maybe_external fill:#dfd,stroke:#333,stroke-width:2px,stroke-dasharray: 5 5;
 
     %% External Clients
     User([mobile / browser <br> ---libzb --- <br>SQLite / PGlite]):::external
     LocalDB[(localDB <br>PG/lite<br>SQLite)]:::secure
     LocalDB@{shape: lin-cyl}
-    RemoteLeaf[NATS Leaf Node]:::internal
+    RemoteLeaf[NATS<br>Leaf Node]:::internal
+    RemoteLeaf2[NATS<br>Leaf Node]:::maybe_external
     Consumer([Service <br> --libbz--]):::external
+    Grafana([Grafana]):::telemetry
+    Grafana@{ shape: cloud}
+
 
     %% Cloudflare Edge
-    subgraph Cloudflare_Network  [Cloudflare Edge Proxy]
+    %% subgraph Cloudflare_Network  [Cloudflare Edge Proxy]
         CF([https://my-domain]):::proxy
         CF@{ shape: cloud}
-    end
+    %% end 
 
     %% VPS Boundary
     subgraph VPS [Your VPS Server]
-        HA([HAProxy<br>:443]):::proxy
+        direction TB
         
+        HA([HAProxy<br>:443]):::proxy
         %% Internal Apps
+        Prom[(Prometheus<br> :9090)]:::telemetry
+        NatsExp([NATS Exporter<br>:7777]):::telemetry
+        PGREP[(PG StandBy<br>Replica<br>Planned)]:::secure
         Bridge[[ZeBridge-1<br> :27434]]:::bridge
         Bridge@{shape: st-rect}
         PG[(Postgres Master <br> :5432)]:::secure
-        PGREP[(PG StandBy<br>Replica<br>Planned)]:::secure
         NATS[NATS Server<br> TPC :4222 <br> wss :8080]:::internal
         NATS@{shape: data-store}
         
         %% Telemetry & Monitoring Stack
-        Grafana([Grafana <br> :3000]):::telemetry
-        Prom[(Prometheus<br> :9090)]:::telemetry
-        NatsExp([NATS Exporter<br>Port :7777]):::telemetry
+        
         Sweeper[[Sweeper]]:::bridge
     end
 
@@ -182,38 +189,38 @@ graph TD
       RemoteLeaf
     end
     %% External Connections to Cloudflare
-    User <==>|HTTPS <br> WSS| CF
-    RemoteLeaf <==>|Outbound Connect| CF
+    User <==>RemoteLeaf2
+    RemoteLeaf2 <==>CF
+    RemoteLeaf <==>|wss| CF
     Consumer <==>|Connects Local| RemoteLeaf
     Consumer -->LocalDB
 
     %% Cloudflare to HAProxy Subdomain Routing
-    CF -.->|grafana.my-domain| HA
-    CF -.->|bridge.my-domain| HA
-    CF <==>|nats.my-domain| HA
+    CF <==> HA
 
-    %% HAProxy Internal Layer 7 Routing
-    HA -.->|localhost:3000| Grafana
-    HA -.->|localhost:27434/enroll| Bridge
-    HA <==>|wss://localhost:8080| NATS
 
     %% Internal Component Dependencies
-    Bridge ==>|W| PG
     PGREP ==>|R|Bridge
+    Bridge ==>|W| PG
     Bridge <==>|Pub Sub  <br> TCP| NATS
     
+    %% HAProxy Internal Layer 7 Routing
+    HA -.->|:27434/enroll| Bridge
+    HA <==>|wss://localhost:8080| NATS
+
     %% Telemetry Data Flow
-    Prom -.->|Scrapes| Bridge
+    Prom -.-> |Queries| HA
     Prom -.->|Scrapes| NatsExp
+    Prom -.->|Scrapes<br>:27434/metrics| Bridge
     NatsExp -.->|Monitors| NATS
-    Grafana -.->|Queries| Prom
 ```
 
-**OS**: the daemon is POSIX based, so runs on a Linux based VPS.
 
-**Hardware**: You can run very comfortably Postgres, NATS, ZeBridge, Prometheus, HAProxy on a 6-vCPU, 12 GB RAM, a high-IOPS 100GB NVMe SSD drive for less than 15€.
+**OS**: the daemon is POSIX based, so runs on a Linux/FreeBSD based VPS.
 
-You can tweek Postgres with `shared-buffers=2GB`, and `logical_decoding_work_mem = 256MB`, whilst capping`max_slot_wal_keep_size = 10GB`.
+**Hardware**: You can run very comfortably Postgres, NATS, ZeBridge, Prometheus, HAProxy on a 6-vCPU, 16-24 GB RAM, a high-IOPS 100GB NVMe SSD.
+
+In the example, Postgres master has a `standby` replica for reads.
 
 You can tweek ZeBridge by running several instances targeting different groups of tables, each in its own 'publication' (and 'slot' and 'port'), while using the same Postgres server and NATS server:
 

@@ -9043,6 +9043,105 @@ Still OPEN. Better evidence, not yet fixed. The `[INSTR]` probe recipe is worth
 re-deriving next pass: refuse() calls, LIFT, RECV at .insert entry, and — the one
 that was missing — the verdict AND the routing decision inside packMutationToSlot.
 
+## 10cx. livebirth CLOSED: the bridge published every row; the probe was not subscribed yet (2026-09-05)
+
+§10cv called it a write-loss race. §10cw called it a routing/registry disagreement.
+Both were wrong, and one probe in the right place settled it.
+
+**The probe.** `Publisher.publish` and the async `PublishWindow.drain` now log the
+PubAck itself (`[INSTR] PubAck <subject> msg_id=… -> stream=… seq=… dup=…`, debug
+level). Everything before this looked at the event processor; nothing looked at what
+NATS answered.
+
+**What it said, first run, ReleaseFast, clean stack.** The two born-live INSERTs
+went out as ONE message, `cdc.zb_livebirth.insert.batch`, and CDC_PUBLIC stored it at
+seq 8, `dup=false`. The bridge's side of the birth is complete and correct: refuse the
+early DDL event, reload at the enable's commit, lift, reconcile the filter, publish
+the schema, route the rows. The three reloads all listed the newborn; the event
+processor and the live catalogue share ONE `Topology` (both hold
+`&runtime_config.topology`), so the "stale/aliased slice" of §10cw cannot happen. The
+"second refuse after the inserts" of §10cw did not reproduce in either run.
+
+**Where the rows went.** Nowhere wrong — nobody was listening. nats-py only WRITES a
+`SUB` to the socket when the event loop next yields. `livebirth.py` subscribes, then
+does only blocking work (`zb.psql`, `wait_for_log`), and its `wait_for` returns
+WITHOUT sleeping when the predicate holds on the first poll. Once the bridge got fast
+enough that checks 2 and 3 pass on their first poll, nothing between the `subscribe`
+and the born-live INSERTs yielded. The batch was published to a subject with no
+subscriber, and check 4 waited on a subscription that reached the server one second
+later. Reproduced in isolation: subscribe → blocking work → CLI publish = nothing
+seen; add `await nc.flush()` (or any yield) after the subscribe = seen. Iterator vs
+callback subscription makes no difference.
+
+**Fix.** One line in `livebirth.py`: `await nc.flush()` after the subscribe, with the
+reason beside it. 8/8 PASS on a Debug build. Owns is 27/27 again.
+
+**Left behind.** Every other scenario subscribes without a flush too (15 files). They
+pass because something in each yields before the message they wait for — by accident,
+not by design. The same speed-up that broke livebirth can break any of them. A
+`zb.subscribe()` helper that flushes is the cheap fix; not done in this pass.
+
+**The lesson, again.** When the writer says "sent" and the reader says "nothing",
+instrument the ACK before instrumenting the writer's decision tree. Two sections of
+routing theory were written about a subscription that had not left the client.
+
+## 10cy. The mirror leaves the catalogue; every scenario subscribes through one helper (2026-09-05)
+
+Three closes from the afternoon after §10cx, each proven the same way: a probe first,
+then the change, then the battery.
+
+**Every scenario subscribes through `zb.subscribe()`, which flushes.** §10cx's bug was
+latent in 15 other files: they subscribed with the raw client and passed only because
+something in them happened to yield before the message they waited for. One helper,
+`nc.subscribe` + `nc.flush`, and a mechanical rewrite of every plain-connection site
+(the two JetStream `js.subscribe` sites already round-trip a consumer create and were
+left). Live 28/28 on the rewrite.
+
+**Two scenarios seeded their fixture wrong and hid it.** `adversarial` and `chaos` both
+failed after `race` emptied `counter_public`. `adversarial`'s fallback INSERT supplied
+only `value`; `inserted_at`/`updated_at` are NOT NULL with no default, the INSERT
+failed, `quiet=True` swallowed it, and the legit mutation went out with `uid=''` —
+refused by PostgreSQL as a bad uuid, read by the check as "consumer wedged". `chaos`
+had no fallback and skipped its mutation round-trip, read as `mutation=False`. Both
+seed the row properly now (timestamps, first line of the RETURNING output as `race`
+does, loud on failure). Not the build mode, not log volume, not the bridge: a fixture
+bug and a silent helper. Owns 27/27 after.
+
+**Three reloads per live table birth, one useful — fixed.** §10cf put the refusal
+registry's psql mirror in two columns ON `zebridge_catalogue`. The catalogue rides
+the publication so the bridge reloads on every catalogue row; each refuse and each lift
+therefore came back through the WAL as a catalogue move and cost a reload that changed
+nothing. The mirror is its own table now, `zebridge_suspensions (tbl, reason, since)`,
+NOT in the publication; the two setters write there; the operator's question is
+`SELECT tbl, reason, since FROM zebridge_suspensions`. A fresh-install object only —
+no migration code (dev stage; the running dev DB got a one-off `DROP COLUMN` by hand).
+`livebirth` now asserts exactly ONE live reload per enable. The bridge's own commit
+comment on the old design called the extra reload "one deliberate side effect,
+cheap"; it was cheap and it was also wrong — a mirror write is not a declaration and
+must not look like one.
+
+**The lesson inside the fix: there are THREE internal-table lists, and the DDL trigger
+reads the SQL one.** I added `zebridge_suspensions` to `event_processor.isInternalTable`
+first and shipped; the ReleaseFast bench bridge then replayed the table's CREATE from
+the slot, the DDL path refused it (`no_cdc_subject`), and a suspended
+`$KV.schemas.zebridge_suspensions` key reached every client — the exact `zebridge_invites`
+accident, repeated. The gate that matters is `zebridge_is_internal_table()` in
+init.core.template.sql (the event trigger consults it and records nothing for a match);
+`preflight.isInternalTable` and the event processor's copy mirror it. All three carry
+the name now, the preflight unit test covers it, and an ALTER on the table under a
+live bridge produces no DDL event and no key. Stray key deleted.
+
+**Measured, ReleaseFast.** README burst (2,000,000 rows, native PG+NATS, no consumer):
+224k events/s end to end, PG write 2.5 s, 9.2 s from load start to the 2M ack — at
+the README's 200k+ reference, no drift (the hot path is untouched: the change only
+removes work when a refusal flips). Zero reloads and zero refusals during the burst;
+the ones in that log are slot replay of the day's scenario residue, before the load.
+`livebirth`, `suspension_lift`, `legacybait` pass on Debug and on ReleaseFast.
+ReleaseFast is what is installed.
+
+**Left behind.** `nats_publisher.zig` keeps the PubAck probe at debug level
+(`[INSTR] PubAck …`). Reprovisioned after the bench; the live bridge is stopped.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries

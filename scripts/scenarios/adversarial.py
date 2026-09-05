@@ -140,7 +140,13 @@ async def scenario() -> int:
 
         uid = zb.psql("SELECT uid FROM public.counter_public LIMIT 1", quiet=True).strip()
         if not uid:
-            uid = zb.psql("INSERT INTO public.counter_public (value) VALUES (0) RETURNING uid", quiet=True).strip()
+            # inserted_at/updated_at are NOT NULL with no default: a (value)-only INSERT
+            # fails, and quiet=True hid that — the legit mutation then carried uid=''
+            # and was refused as a bad uuid, read as "wedged" (2026-09-05).
+            # psql -tA prints the RETURNING row, then the command tag: first line only (as race.py)
+            uid = zb.psql("INSERT INTO public.counter_public (value, inserted_at, updated_at) VALUES (0, now(), now()) RETURNING uid").strip().splitlines()[0].strip()
+            if not uid:
+                sys.exit("could not seed a counter_public row — check the table")
 
         # connect as the ADVERSARY (a client principal) — its JWT confines this
         # exactly as a real client, so the mutation lane is all the reach it has.

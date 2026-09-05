@@ -100,7 +100,7 @@ async def main():
 
     nc = await zb.connect()
     seen: list[str] = []
-    sub = await nc.subscribe(f"{CDC}.>")
+    sub = await zb.subscribe(nc, f"{CDC}.>")
 
     async def collect():
         async for m in sub.messages:

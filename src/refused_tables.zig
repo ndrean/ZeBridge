@@ -164,7 +164,7 @@ pub const Registry = struct {
     overflowed: std.atomic.Value(bool) = .init(false),
     /// When set (the live bridge wires it after boot; unit tests and --diagnose leave
     /// it null), every refusal transition is MIRRORED into `zebridge_catalogue`'s
-    /// `suspended`/`suspended_reason` columns via the SECURITY DEFINER setter — the
+    /// `zebridge_suspensions` row via the SECURITY DEFINER setter — the
     /// psql answer to "which tables are refused?" (§10cf). The registry stays the
     /// authority; the columns are its projection, cleared wholesale at boot.
     pg_config: ?*const pg_conn.PgConf = null,
@@ -191,7 +191,7 @@ pub const Registry = struct {
     /// re-announced DDL event does not reset the number the operator is watching.
     /// When set (the live bridge wires it after boot; unit tests and --diagnose leave
     /// it null), every refusal transition is MIRRORED into `zebridge_catalogue`'s
-    /// `suspended`/`suspended_reason` columns via the SECURITY DEFINER setter — the
+    /// `zebridge_suspensions` row via the SECURITY DEFINER setter — the
     /// psql answer to "which tables are refused?" (§10cf). The registry stays the
     /// authority; the columns are its projection, cleared wholesale at boot because
     /// the registry is memory and a restart forgets.

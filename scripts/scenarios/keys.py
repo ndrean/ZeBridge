@@ -175,7 +175,7 @@ async def main():
         cdc_task = asyncio.create_task(watch_cdc())
         verdicts = {}
         # ⚠️ `mutation_ack.>` is denied — a client is granted only its own subtree.
-        sub = await nc.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who0}.*")
+        sub = await zb.subscribe(nc, f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who0}.*")
 
         async def collect():
             async for m in sub.messages:

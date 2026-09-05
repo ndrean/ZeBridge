@@ -188,16 +188,16 @@ async def run() -> int:
 
         # ── 1b. the psql answer (§10cf): the catalogue mirrors the registry ──
         # An operator who missed the log line asks PostgreSQL, not NATS:
-        #     SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;
+        #     SELECT tbl, reason FROM zebridge_suspensions;
+        # (its own table since §10cy — a mirror write must not look like a catalogue move)
         row = wait_for(lambda: zb.psql(
-            f"SELECT suspended || '|' || coalesce(suspended_reason,'') "
-            f"FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'").strip() == "true|row_too_large", 15)
+            f"SELECT reason FROM public.zebridge_suspensions WHERE tbl = '{TABLE}'").strip() == "row_too_large", 15)
         if row:
-            zb.ok("and psql knows: zebridge_catalogue.suspended = true, reason row_too_large "
+            zb.ok("and psql knows: zebridge_suspensions has test_types, reason row_too_large "
                   "— the bridge's verdict, queryable where the operator already stands")
         else:
-            zb.bad(f"the catalogue mirror never went true (got "
-                   f"{zb.psql(f"SELECT suspended || '|' || coalesce(suspended_reason,'') FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'").strip()!r})")
+            zb.bad(f"the psql mirror never recorded the suspension (got "
+                   f"{zb.psql(f"SELECT reason FROM public.zebridge_suspensions WHERE tbl = '{TABLE}'").strip()!r})")
             failed += 1
         named = wait_for(lambda: 'bridge_refused_table{table="test_types",reason="row_too_large"} 1'
                          in metrics_text(), 15)
@@ -227,7 +227,7 @@ async def run() -> int:
         cleared = wait_for(lambda: refused_count() == 0, 15)
         republished = wait_for(lambda: schema_state() == "live", 20)
         mirror_cleared = wait_for(lambda: zb.psql(
-            f"SELECT suspended::text FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'").strip() == "false", 15)
+            f"SELECT count(*) FROM public.zebridge_suspensions WHERE tbl = '{TABLE}'").strip() == "0", 15)
         named_lifted = wait_for(lambda: 'bridge_refused_table{table="test_types",reason="row_too_large"} 0'
                                 in metrics_text(), 15)
         if not named_lifted:

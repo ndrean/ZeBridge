@@ -245,36 +245,46 @@ GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_READER_USER};
 -- The bridge's runtime verdicts, made queryable (NOTES §10cf). A row_too_large
 -- suspension lived only in the bridge's MEMORY plus the client-facing KV descriptor —
 -- an operator who missed the log line had no psql answer to "which tables are
--- refused?". These two columns are that answer:
+-- refused?". This table is that answer:
 --
---     SELECT tbl, suspended_reason FROM zebridge_catalogue WHERE suspended;
+--     SELECT tbl, reason, since FROM zebridge_suspensions;
 --
 -- Written by the bridge through the SECURITY DEFINER setters below (the
 -- zebridge_register_limits pattern — the reader role executes a narrow function
--- rather than holding UPDATE on the table). Semantics mirror the in-memory registry
--- exactly: set on every refusal transition, cleared on every lift — and cleared
--- WHOLESALE at boot, because the registry is memory and a restart forgets (§13/§10bw:
--- the quarantine is lazily re-earned on the next touch, so a surviving true would lie
--- in the opposite direction). One deliberate side effect: the catalogue rides the
--- publication, so each flip triggers one cheap catalogue reload at commit — and
--- clients can observe suspension state through the catalogue's own CDC if they care.
-ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS suspended boolean NOT NULL DEFAULT false;
-ALTER TABLE public.zebridge_catalogue ADD COLUMN IF NOT EXISTS suspended_reason text;
+-- rather than holding write privilege on the table). Semantics mirror the in-memory
+-- registry exactly: a row per refused table, set on every refusal transition, deleted
+-- on every lift — and emptied WHOLESALE at boot, because the registry is memory and
+-- a restart forgets (§13/§10bw: the quarantine is lazily re-earned on the next touch,
+-- so a surviving row would lie in the opposite direction).
+--
+-- Its OWN table, deliberately NOT in the publication (NOTES §10cy). It used to be two
+-- columns on zebridge_catalogue, and the catalogue rides the publication so the bridge
+-- reloads on every catalogue row: each refuse and each lift therefore came back to the
+-- bridge as a catalogue move and cost a reload that changed nothing — three reloads
+-- per live table birth, one useful. A mirror write is not a declaration; it must not
+-- look like one.
+CREATE TABLE IF NOT EXISTS public.zebridge_suspensions (
+    tbl    name        PRIMARY KEY,
+    reason text        NOT NULL,
+    since  timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT ON public.zebridge_suspensions TO ${POSTGRES_READER_USER};
 
 CREATE OR REPLACE FUNCTION public.zebridge_set_suspended(p_tbl text, p_reason text)
 RETURNS void AS $$
     -- p_reason NULL = lifted. A table with no catalogue row (published but never
-    -- declared) updates nothing, which is right: the doctor for those is zebridge_check.
-    UPDATE public.zebridge_catalogue
-       SET suspended = (p_reason IS NOT NULL), suspended_reason = p_reason
-     WHERE tbl = p_tbl;
+    -- declared) records nothing, which is right: the doctor for those is zebridge_check.
+    DELETE FROM public.zebridge_suspensions WHERE tbl = p_tbl AND p_reason IS NULL;
+    INSERT INTO public.zebridge_suspensions (tbl, reason)
+    SELECT p_tbl, p_reason
+     WHERE p_reason IS NOT NULL
+       AND EXISTS (SELECT 1 FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl)
+    ON CONFLICT (tbl) DO UPDATE SET reason = EXCLUDED.reason, since = now();
 $$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
 
 CREATE OR REPLACE FUNCTION public.zebridge_clear_suspensions()
 RETURNS void AS $$
-    UPDATE public.zebridge_catalogue
-       SET suspended = false, suspended_reason = NULL
-     WHERE suspended;
+    DELETE FROM public.zebridge_suspensions;
 $$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
 
 GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_READER_USER};
@@ -636,6 +646,7 @@ RETURNS boolean AS $$
         'zebridge_generation_overrides',  -- superseded by zebridge_catalogue.generations
         'zebridge_catalogue',    -- THE catalogue: one row per replicated table
         'zebridge_invites',      -- enrollment codes: bridge infrastructure, never replicated
+        'zebridge_suspensions',  -- the refusal registry's psql mirror (§10cy): never replicated
         -- ⚠️ the principal→tenant roster: BRIDGE INPUT (its CDC feeds $KV.tenants),
         -- never client-replicated — replicating it would disclose the roster the
         -- per-key $KV.tenants grant exists to protect (NOTES.md §1.12 part 3).

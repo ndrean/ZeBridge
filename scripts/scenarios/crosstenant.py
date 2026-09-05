@@ -82,7 +82,7 @@ async def main():
     # ── A. core subscribe — the only primitive a subject ACL actually governs ──
     async_errors.clear()
     try:
-        await nc.subscribe(subject)
+        await zb.subscribe(nc, subject)
         await nc.flush(timeout=2)
     except Exception:
         pass

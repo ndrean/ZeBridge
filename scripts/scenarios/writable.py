@@ -178,7 +178,7 @@ async def main():
     # verdict is keyed by the client's own msg_id and scoped to the principal, which is
     # what makes it matchable to a queued write and safe to grant.
     verdicts = []
-    sub = await nc.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>")
+    sub = await zb.subscribe(nc, f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>")
 
     async def collect():
         async for msg in sub.messages:

@@ -312,11 +312,13 @@ pub const Publisher = struct {
 
                 if (self.js) |*js_retry| {
                     var retry = try js_retry.publish(subject, data, .{ .msg_id = msg_id });
+                    log.debug("[INSTR] PubAck(retry) {s} msg_id={s} -> stream={s} seq={d} dup={}", .{ subject, msg_id orelse "-", retry.value.stream, retry.value.seq, retry.value.duplicate });
                     retry.deinit();
                     return;
                 }
                 return error.NotConnected;
             };
+            log.debug("[INSTR] PubAck {s} msg_id={s} -> stream={s} seq={d} dup={}", .{ subject, msg_id orelse "-", res.value.stream, res.value.seq, res.value.duplicate });
             res.deinit();
             return;
         }
@@ -514,6 +516,7 @@ pub const PublishWindow = struct {
             };
             const entry = self.inflight.swapRemove(idx);
             if (self.publisher.metrics) |m| m.recordPublishAck(utils.nanoTimestamp() - entry.sent_ns);
+            log.debug("[INSTR] PubAck(async) token={d} status={d} raw={s}", .{ token, raw.status_code, raw.data });
             if (raw.status_code > 0) {
                 log.err("async publish {d} answered with status {d} — no stream listening?", .{ token, raw.status_code });
                 return error.NoStreamResponse;

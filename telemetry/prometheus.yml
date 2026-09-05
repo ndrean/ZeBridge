@@ -1,5 +1,5 @@
 global:
-  scrape_interval: 5s     # Scrape metrics every 5 seconds for responsive CDC dashboards
+  scrape_interval: 15s     # Scrape metrics every 5 seconds for responsive CDC dashboards
   evaluation_interval: 5s
 
 scrape_configs:

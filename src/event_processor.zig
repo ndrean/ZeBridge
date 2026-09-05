@@ -47,6 +47,10 @@ fn isInternalTable(name: []const u8) bool {
         // CREATE fires the DDL trigger like any table, and without this line the DDL
         // path refused it and left a suspended $KV.schemas key in every client.
         std.mem.eql(u8, name, "zebridge_invites") or
+        // The refusal registry's psql mirror (§10cy): its own table so a refuse/lift
+        // is not a catalogue move; not published, but its CREATE fires the DDL
+        // trigger — same story as zebridge_invites.
+        std.mem.eql(u8, name, "zebridge_suspensions") or
         std.mem.eql(u8, name, "schema_migrations");
 }
 

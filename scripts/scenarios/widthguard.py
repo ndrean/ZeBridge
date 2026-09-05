@@ -144,7 +144,7 @@ async def main():
             verdicts: list = []
             async def on_ack(m):
                 verdicts.append(json.loads(m.data.decode()))
-            sub = await client.subscribe(f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>", cb=on_ack)
+            sub = await zb.subscribe(client, f"{zb.TOPOLOGY['subjects']['mutation_ack_prefix']}.{who}.>", cb=on_ack)
 
             v2 = (now + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
             payload = msgpack.packb({
