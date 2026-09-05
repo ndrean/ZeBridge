@@ -1,6 +1,6 @@
 //! WAL monitoring background thread functionality.
 //!
-//! It monitoring WAL lag using `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`and includes getting current WAL LSN
+//! It monitoring WAL lag using `pg_wal_lsn_diff(public.zebridge_wal_head(), restart_lsn)`and includes getting current WAL LSN
 const std = @import("std");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
@@ -103,7 +103,7 @@ pub const WalMonitor = struct {
     }
 };
 
-/// Get current WAL LSN position with the query `SELECT pg_current_wal_lsn()::text`
+/// Get current WAL LSN position with the query `SELECT public.zebridge_wal_head()::text`
 ///
 /// Caller is responsible for freeing the returned LSN string
 pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgConf) ![]const u8 {
@@ -124,7 +124,7 @@ pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgCon
 
     defer c.PQfinish(conn);
 
-    const query = "SELECT pg_current_wal_lsn()::text";
+    const query = "SELECT public.zebridge_wal_head()::text";
 
     const result = c.PQexec(conn, query.ptr) orelse {
         log.err("🔴 Query execution failed: PQexec returned null", .{});
@@ -149,7 +149,7 @@ pub fn getCurrentLSN(allocator: std.mem.Allocator, pg_conf: *const pg_conn.PgCon
     return try allocator.dupe(u8, lsn);
 }
 
-/// Check WAL lag for the given replication slot and update metrics. Runs the query `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)`.
+/// Check WAL lag for the given replication slot and update metrics. Runs the query `pg_wal_lsn_diff(public.zebridge_wal_head(), restart_lsn)`.
 fn checkWalLag(
     metrics: *metrics_mod.Metrics,
     config: WalConfig,
@@ -183,10 +183,10 @@ fn checkWalLag(
         \\  active,
         \\  -- WAL PostgreSQL must retain for this slot. Moves only at checkpoints, so it
         \\  -- plateaus and is NOT a measure of how far behind the bridge is.
-        \\  COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) as lag_bytes,
+        \\  COALESCE(pg_wal_lsn_diff(public.zebridge_wal_head(), restart_lsn), 0) as lag_bytes,
         \\  -- What the bridge has actually confirmed. This is the backlog: if it grows,
         \\  -- the bridge is not keeping up or has stopped ACKing.
-        \\  COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0) as confirmed_lag_bytes
+        \\  COALESCE(pg_wal_lsn_diff(public.zebridge_wal_head(), confirmed_flush_lsn), 0) as confirmed_lag_bytes
         \\FROM pg_replication_slots
         \\WHERE slot_name = '{s}'
     ,

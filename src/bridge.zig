@@ -489,6 +489,7 @@ fn registerRowWidthBudget(
     slot_name: []const u8,
     pub_name: []const u8,
     max_row_bytes: usize,
+    on_standby: bool,
 ) ?usize {
     const conninfo = pg_config.connInfo(allocator, false) catch |err| {
         log.warn("⚠️  row-width budget not registered (conninfo: {}) — the guard keeps its previous value", .{err});
@@ -511,7 +512,10 @@ fn registerRowWidthBudget(
     const slot_z = std.fmt.bufPrintZ(&slot_buf, "{s}", .{slot_name}) catch return null;
     const pub_z = std.fmt.bufPrintZ(&pub_buf, "{s}", .{pub_name}) catch return null;
     const bytes_z = std.fmt.bufPrintZ(&bytes_buf, "{d}", .{max_row_bytes}) catch return null;
-    const params = [_]?[*:0]const u8{ slot_z.ptr, pub_z.ptr, bytes_z.ptr };
+    // on_standby (§10cz): this slot lives where the primary cannot list it, so the
+    // function's GC must never read its absence as "retired".
+    const standby_z: [*:0]const u8 = if (on_standby) "t" else "f";
+    const params = [_]?[*:0]const u8{ slot_z.ptr, pub_z.ptr, bytes_z.ptr, standby_z };
 
     // Second column: the EFFECTIVE budget — MIN over the instances carrying anything
     // in this publication. The ingress check below uses it so the bridge stops
@@ -526,10 +530,10 @@ fn registerRowWidthBudget(
     const res = c.PQexecParams(
         conn,
         "WITH prev AS (SELECT max_row_bytes FROM public.zebridge_limits WHERE slot = $1) " ++
-            "SELECT public.zebridge_register_limits($1, $2::name, $3::integer), " ++
+            "SELECT public.zebridge_register_limits($1, $2::name, $3::integer, $4::boolean), " ++
             "COALESCE((SELECT MIN(max_row_bytes) FROM public.zebridge_limits), $3::integer), " ++
             "(SELECT max_row_bytes FROM prev)",
-        3,
+        4,
         null,
         &params[0],
         null,
@@ -778,6 +782,27 @@ pub fn main(init: std.process.Init) !void {
 
     // PostgreSQL connection configuration from RuntimeConfig
     var pg_config = pg_conn.PgConf.from_runtime_config(&runtime_config);
+    var writer_config = pg_conn.PgConf.writer_from_runtime_config(&runtime_config);
+
+    // The reader may be a hot standby (§10cz): reads, preflight and the CDC slot all
+    // stay there — that is the point, the decode work leaves the primary — but a
+    // standby refuses every write, and the bridge records bookkeeping through the
+    // reader BY DESIGN (its width budget, the refusal mirror, zebridge_generations;
+    // the reader role holds EXECUTE on narrow SECURITY DEFINER setters so a read-only
+    // deployment can record them). On a standby that bookkeeping goes over the
+    // writer instead, which is the only way the bridge knows the primary.
+    const reader_mode = pg_conn.probeReaderMode(allocator, pg_config);
+    const book_config: *const pg_conn.PgConf = if (reader_mode.in_recovery) blk: {
+        if (writer_config) |*wc| {
+            log.info("🛰️  DATABASE_READER_URL is a STANDBY (pg_is_in_recovery): the CDC slot and every read stay on it; the width budget, refusal mirror and zebridge_generations go over DATABASE_WRITER_URL", .{});
+            if (!reader_mode.hot_standby_feedback) {
+                log.warn("⚠️  the standby has hot_standby_feedback=off: the primary may vacuum rows its logical slot still needs and INVALIDATE the slot — set hot_standby_feedback=on on the standby", .{});
+            }
+            break :blk wc;
+        }
+        log.err("🔴 DATABASE_READER_URL is a standby (pg_is_in_recovery) and no DATABASE_WRITER_URL is set: a standby refuses every write, so the bridge could record neither its width budget, nor refusals, nor generations. Point DATABASE_WRITER_URL at the primary.", .{});
+        return error.StandbyReaderNeedsWriter;
+    } else &pg_config;
 
     // Initialize replication: create slot + verify publication
     const own_event_buf = @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2);
@@ -892,10 +917,11 @@ pub fn main(init: std.process.Init) !void {
     // exits above, so a dry run never reaches this write.)
     const effective_row_budget = registerRowWidthBudget(
         allocator,
-        &pg_config,
+        book_config,
         slot_name_z,
         pub_name_z,
         own_event_buf,
+        reader_mode.in_recovery,
     ) orelse own_event_buf;
 
     // Shared between preflight (boot) and the DDL path (runtime): both decide a table
@@ -906,7 +932,7 @@ pub fn main(init: std.process.Init) !void {
     // is projected into zebridge_suspensions — set BEFORE preflight so boot
     // refusals are written too. And cleared wholesale first: the registry is memory,
     // a restart forgot everything, and a surviving `true` would lie the other way.
-    refused.pg_config = &pg_config;
+    refused.pg_config = book_config;
     {
         const conninfo = pg_config.connInfo(allocator, false) catch null;
         if (conninfo) |ci| {
@@ -1060,7 +1086,7 @@ pub fn main(init: std.process.Init) !void {
         // 2026-08-29). The lost-slot FATAL names the flag; without it a new slot boots
         // on the existing streams and says what that risks.
         if (init.minimal.environ.getPosix("ZB_FEED_RESTART")) |v| if (v.len > 0 and v[0] != '0') {
-            restartFeed(allocator, &publisher, &runtime_config.topology, &pg_config);
+            restartFeed(allocator, &publisher, &runtime_config.topology, book_config);
         } else {
             log.warn("🔁 new replication slot '{s}' on existing streams (ZB_FEED_RESTART=0): if this slot REPLACES a lost one, every change since its loss is missing from the feed and clients resume past the hole — start once with ZB_FEED_RESTART=1 to restart the feed (NOTES §10bm)", .{parsed_args.slot_name});
         } else {
@@ -1124,6 +1150,7 @@ pub fn main(init: std.process.Init) !void {
         gp.* = generation_producer.GenerationProducer.init(
             allocator,
             &pg_config,
+            book_config,
             &should_stop,
             io,
             nats_endpoint,
@@ -1154,7 +1181,6 @@ pub fn main(init: std.process.Init) !void {
     // comes from the WAL rather than from the schemas KV.
     var catalog_epoch: catalog_epoch_mod.CatalogEpoch = .{};
 
-    var writer_config = pg_conn.PgConf.writer_from_runtime_config(&runtime_config);
     // ── Rung 4 (§10cs): parallel ingress lanes ──────────────────────────────
     // N independent listeners, each with its OWN PostgreSQL connection, NATS
     // connection, table-meta cache and verdict state, all pulling from the ONE

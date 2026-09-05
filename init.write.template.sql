@@ -70,6 +70,17 @@ GRANT USAGE ON SCHEMA public TO ${POSTGRES_WRITER_USER};
 -- this role, or the read-only profile cannot apply on a fresh cluster).
 GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_WRITER_USER};
 
+-- Bookkeeping the bridge records THROUGH THE READER by design (its width budget, the
+-- refusal mirror, zebridge_generations) so a read-only deployment can record it at
+-- all. When DATABASE_READER_URL is a hot standby the server refuses every write
+-- there, and the bridge sends the same bookkeeping over DATABASE_WRITER_URL instead
+-- (NOTES §10cz) — so the writer needs exactly the reader's bookkeeping privileges.
+GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_WRITER_USER};
+GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_WRITER_USER};  -- the registration reads MIN and its previous row around the call
+GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer, boolean) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_WRITER_USER};
+GRANT EXECUTE ON FUNCTION public.zebridge_clear_suspensions() TO ${POSTGRES_WRITER_USER};
+
 
 -- Deliberately NOT granted: SELECT/INSERT/UPDATE on any table, and no ALTER DEFAULT
 -- PRIVILEGES. A new table is not edge-writable until someone says so.

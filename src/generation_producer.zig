@@ -60,6 +60,10 @@ const log = std.log.scoped(.generation_producer);
 pub const GenerationProducer = struct {
     allocator: std.mem.Allocator,
     pg_config: *const pg_conn.PgConf,
+    /// Where zebridge_generations is READ AND WRITTEN: the reader on a primary, the
+    /// writer when the reader is a standby (§10cz) — the chain's own rows must be
+    /// read back from where they were written, never through replication lag.
+    book_config: *const pg_conn.PgConf,
     should_stop: *std.atomic.Value(bool),
     io: std.Io,
     endpoint: config.Nats.Endpoint,
@@ -89,6 +93,7 @@ pub const GenerationProducer = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         pg_config: *const pg_conn.PgConf,
+        book_config: *const pg_conn.PgConf,
         should_stop: *std.atomic.Value(bool),
         io: std.Io,
         endpoint: config.Nats.Endpoint,
@@ -104,6 +109,7 @@ pub const GenerationProducer = struct {
         return .{
             .allocator = allocator,
             .pg_config = pg_config,
+            .book_config = book_config,
             .should_stop = should_stop,
             .io = io,
             .endpoint = endpoint,
@@ -166,6 +172,22 @@ pub const GenerationProducer = struct {
         // `+02` and `+00` strings inside one manifest (measured live in the
         // live-birth exercise: full.cutoff +02, delta cutoff +00). Chain bounds are
         // STRING-compared — one canonical form or nothing, same law as payloads.
+        // The bookkeeping connection: the same one on a primary, the writer's on a
+        // standby (§10cz). UTC on it too — cutoff_version::text is rendered in the
+        // session timezone, and a manifest must carry canonical `+00` (livebirth §5).
+        const bkc: *c.PGconn = if (self.book_config == self.pg_config) pgc else blk: {
+            const bk_info = try self.book_config.connInfo(alloc, false);
+            const bk = c.PQconnectdb(bk_info.ptr) orelse return error.ConnectionFailed;
+            if (c.PQstatus(bk) != c.CONNECTION_OK) {
+                log.err("🧬 PG connect failed (bookkeeping, DATABASE_WRITER_URL): {s}", .{c.PQerrorMessage(bk)});
+                c.PQfinish(bk);
+                return error.ConnectionFailed;
+            }
+            const tz = try queryOne(bk, "SET timezone TO 'UTC'", &.{});
+            c.PQclear(tz);
+            break :blk bk;
+        };
+        defer if (bkc != pgc) c.PQfinish(bkc);
         {
             const res = try queryOne(pgc, "SET timezone TO 'UTC'", &.{});
             c.PQclear(res);
@@ -266,7 +288,7 @@ pub const GenerationProducer = struct {
                         if (!ok) continue;
                     }
                     pairs += 1;
-                    self.buildOne(alloc, pgc, &js, table, tenant, vcol) catch |err| {
+                    self.buildOne(alloc, pgc, bkc, &js, table, tenant, vcol) catch |err| {
                         log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                     };
                 }
@@ -278,7 +300,7 @@ pub const GenerationProducer = struct {
                     if (!ok) continue;
                 }
                 pairs += 1;
-                self.buildOne(alloc, pgc, &js, table, tenant, vcol) catch |err| {
+                self.buildOne(alloc, pgc, bkc, &js, table, tenant, vcol) catch |err| {
                     log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                 };
             }
@@ -365,6 +387,7 @@ pub const GenerationProducer = struct {
         self: *GenerationProducer,
         alloc: std.mem.Allocator,
         pgc: *c.PGconn,
+        bkc: *c.PGconn,
         js: *nats.JetStream,
         table: []const u8,
         tenant: []const u8,
@@ -387,7 +410,7 @@ pub const GenerationProducer = struct {
         var last_del_count: ?i64 = null;
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(pgc, "SELECT gen, cutoff_version::text, row_count, del_count FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
@@ -402,7 +425,7 @@ pub const GenerationProducer = struct {
         }
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(pgc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(bkc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_full_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
@@ -440,7 +463,7 @@ pub const GenerationProducer = struct {
 
         // ── 1. LSN BEFORE the snapshot (overlap-never-gap) ───────────────────
         const lsn: []const u8 = blk: {
-            const res = try queryOne(pgc, "SELECT pg_current_wal_lsn()::text", &.{});
+            const res = try queryOne(pgc, "SELECT public.zebridge_wal_head()::text", &.{});
             defer c.PQclear(res);
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
         };
@@ -628,7 +651,7 @@ pub const GenerationProducer = struct {
             }
         } else if (build_delta) {
             const params_d = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res_d = try queryOne(pgc,
+            const res_d = try queryOne(bkc,
                 "SELECT gen, encode(dict, 'hex') FROM public.zebridge_generations " ++
                     "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_d);
             defer c.PQclear(res_d);
@@ -683,7 +706,7 @@ pub const GenerationProducer = struct {
         {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{gen - @as(i64, self.chain_depth)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
-            const res = try queryOne(pgc,
+            const res = try queryOne(bkc,
                 "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full, COALESCE(dict_object, '') " ++
                     "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 ORDER BY gen", &params);
             defer c.PQclear(res);
@@ -747,7 +770,7 @@ pub const GenerationProducer = struct {
             const count_z = try utils.allocPrintZ(alloc, "{d}", .{row_count_now});
             const del_z = try utils.allocPrintZ(alloc, "{d}", .{del_count_now});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr };
-            const res = try queryOne(pgc,
+            const res = try queryOne(bkc,
                 "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count) " ++
                     "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint) " ++
                     "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
@@ -758,7 +781,7 @@ pub const GenerationProducer = struct {
         if (gen > self.chain_depth) {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{gen - @as(i64, self.chain_depth)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
-            const res = try queryOne(pgc,
+            const res = try queryOne(bkc,
                 "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen <= $3 RETURNING gen", &params);
             defer c.PQclear(res);
             const pruned: usize = @intCast(c.PQntuples(res));
@@ -771,7 +794,7 @@ pub const GenerationProducer = struct {
             // `chain_depth` — the first such build after it (memo g9, 2026-08-29)
             // failed here, after its objects and manifest were already live.
             const ref_params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const still_ref = try queryOne(pgc,
+            const still_ref = try queryOne(bkc,
                 "SELECT DISTINCT dict_object FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND dict_object IS NOT NULL", &ref_params);
             defer c.PQclear(still_ref);
             for (0..pruned) |i| {

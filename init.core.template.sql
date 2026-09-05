@@ -289,6 +289,17 @@ $$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
 
 GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_READER_USER};
 GRANT EXECUTE ON FUNCTION public.zebridge_clear_suspensions() TO ${POSTGRES_READER_USER};
+
+-- Where the read side's WAL is, primary or standby (NOTES §10cz). DATABASE_READER_URL
+-- may point at a hot standby (PostgreSQL ≥ 16 decodes logically there): on it
+-- pg_current_wal_lsn() raises "recovery is in progress", and the honest head is what
+-- has been REPLAYED. One function, replicated with the rest of the schema, so the
+-- bridge asks the same question on either and carries no mode flag for it.
+CREATE OR REPLACE FUNCTION public.zebridge_wal_head() RETURNS pg_lsn AS $$
+    SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()
+                ELSE pg_current_wal_lsn() END;
+$$ LANGUAGE sql VOLATILE;
+GRANT EXECUTE ON FUNCTION public.zebridge_wal_head() TO ${POSTGRES_READER_USER};
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
@@ -1135,7 +1146,12 @@ CREATE TABLE IF NOT EXISTS public.zebridge_limits (
     slot          text PRIMARY KEY,
     publication   name    NOT NULL,
     max_row_bytes integer NOT NULL,
-    updated_at    timestamptz NOT NULL DEFAULT now()
+    updated_at    timestamptz NOT NULL DEFAULT now(),
+    -- The instance's slot lives on a STANDBY (§10cz): this primary never lists it, so
+    -- the GC below must not read its absence as "retired". Such a row is never reaped;
+    -- it is replaced when the same slot registers again. A stale one keeps the budget
+    -- at the MIN — the safe direction.
+    on_standby    boolean NOT NULL DEFAULT false
 );
 GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_READER_USER};
 
@@ -1164,7 +1180,8 @@ GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_READER_USER};
 CREATE OR REPLACE FUNCTION public.zebridge_register_limits(
     p_slot          text,
     p_publication   name,
-    p_max_row_bytes integer
+    p_max_row_bytes integer,
+    p_on_standby    boolean DEFAULT false
 ) RETURNS integer AS $$
 DECLARE
     r       record;
@@ -1179,16 +1196,19 @@ BEGIN
     --    constraining everyone else, and its slot vanishing is the signal. An
     --    INACTIVE slot is NOT gone — that bridge is down, its WAL is retained, and
     --    it will replay; its budget still binds.
+    --    A slot on a STANDBY is invisible from here and is not gone (on_standby).
     DELETE FROM public.zebridge_limits l
-     WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.slot_name = l.slot);
+     WHERE NOT l.on_standby
+       AND NOT EXISTS (SELECT 1 FROM pg_replication_slots s WHERE s.slot_name = l.slot);
 
     -- 2. this instance's own row.
-    INSERT INTO public.zebridge_limits (slot, publication, max_row_bytes, updated_at)
-    VALUES (p_slot, p_publication, p_max_row_bytes, now())
+    INSERT INTO public.zebridge_limits (slot, publication, max_row_bytes, updated_at, on_standby)
+    VALUES (p_slot, p_publication, p_max_row_bytes, now(), p_on_standby)
     ON CONFLICT (slot) DO UPDATE
        SET publication   = EXCLUDED.publication,
            max_row_bytes = EXCLUDED.max_row_bytes,
-           updated_at    = now();
+           updated_at    = now(),
+           on_standby    = EXCLUDED.on_standby;
 
     -- 3. bake the literal into every guard this instance carries.
     --
@@ -1288,7 +1308,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog;
 
-GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer)
+GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer, boolean)
     TO ${POSTGRES_READER_USER};
 
 

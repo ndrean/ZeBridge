@@ -9142,6 +9142,105 @@ ReleaseFast is what is installed.
 **Left behind.** `nats_publisher.zig` keeps the PubAck probe at debug level
 (`[INSTR] PubAck …`). Reprovisioned after the bench; the live bridge is stopped.
 
+## 10cz. The reader on a standby (2026-09-05)
+
+The queued "cheap win", done and measured against a real standby. `DATABASE_READER_URL`
+may now be a hot standby: the bridge probes `pg_is_in_recovery()` at boot, and the CDC
+slot, preflight, the catalogue reads and the chain snapshots all stay on it — the
+decode work leaves the primary, which was the point.
+
+**The LSN side is one SQL function.** `zebridge_wal_head()` returns
+`pg_last_wal_replay_lsn()` in recovery and `pg_current_wal_lsn()` otherwise. It is
+replicated with the schema, so the five call sites (boot LSN, chain cutoff, the WAL
+monitor's head and both lag diffs, the slot doctor) ask the same question on either
+and the bridge carries no mode flag for it. On a standby `pg_current_wal_lsn()` raises
+"recovery is in progress" — that was the concrete break.
+
+**The real work was the writes.** The bridge records bookkeeping THROUGH THE READER by
+design — its width budget (`zebridge_register_limits`), the refusal mirror
+(`zebridge_set_suspended` / `_clear_suspensions`), and `zebridge_generations` — via
+SECURITY DEFINER setters the reader role may execute, so a read-only deployment can
+record them at all (§10cf, NOTES 3551). A standby refuses every write at the server;
+no grant helps. Decision (the user's, offered two shapes): route that bookkeeping over
+`DATABASE_WRITER_URL` when the reader is in recovery, grant the writer role exactly the
+reader's bookkeeping privileges (init.write), and REFUSE boot when the reader is a
+standby and no writer URL is set — rather than a third URL to explain. So a standby
+deployment is never read-only. `book_config` in bridge.zig is that choice: `&pg_config`
+on a primary, the writer on a standby, handed to the width registration, the refusal
+registry, the feed restart and the generation producer — which opens a second
+connection for it and reads its own chain rows back from where it wrote them, never
+through replication lag (`bkc` beside `pgc`, both forced to UTC for the manifest).
+
+**The one semantic hole, plugged.** `zebridge_register_limits` GCs every row whose slot
+is not in `pg_replication_slots` — on the PRIMARY, where a standby-hosted slot never
+appears, so the next boot of any bridge would have reaped a standby bridge's budget and
+re-baked the guards wider than it can carry. `zebridge_limits.on_standby` marks such a
+row; the GC skips it; it is replaced when the same slot registers again and otherwise
+stays — a stale one keeps the budget at the MIN, the safe direction.
+
+**Two things the first boot taught.** The writer needs SELECT on `zebridge_limits` as
+well: the registration query reads MIN and its previous row AROUND the function call.
+And `hot_standby_feedback` is checked at boot and warned about when off — without it
+the primary may vacuum rows the standby's logical slot still needs and invalidate the
+slot (§10bx's path, self-inflicted).
+
+**Measured.** A real streaming standby on this machine: `pg_basebackup -R -C -S
+zb_standby -X stream` into `postgres-standby/` (git-ignored), started on 5433 with the
+primary's flags plus `hot_standby=on hot_standby_feedback=on`. Bridge with the reader
+on 5433, writer on 5432: standby detected, logical slot created ON the standby (PG 18),
+budget row on the primary with `on_standby=t`, a primary INSERT on CDC_PUBLIC through
+the standby. Live: check, writable, mutate, replies, widthguard, invalidate — 6/6.
+Owns with probe bridges on the standby: livebirth (one reload, through replicated WAL),
+genproducer (bookkeeping over the writer), suspension_lift (mirror over the writer) —
+3/3, Debug and ReleaseFast. Primary path unchanged: livebirth, genproducer,
+suspension_lift, legacybait, shrink — 5/5. Not measured: replay lag under load, and a
+standby that falls behind (the slot invalidation path is §10bx's, untouched).
+
+**Left running.** The standby on 5433 stays up on the dev machine (`pg_ctl -D
+postgres-standby stop` to end it; `up.sh`/`down.sh` know nothing of it). The dev DB got
+two one-off hand fixes (drop the 3-argument `zebridge_register_limits`, add
+`on_standby` to the existing `zebridge_limits`) — fresh-install objects in the
+template, no migration code, per the rule set in §10cy.
+
+## 10da. Slot cleanup, and why N bridges is N separate WAL retentions (2026-09-05)
+
+Asked directly: does running several bridge instances (several slots) multiply WAL
+retention, and how to drop an abandoned slot. Yes and here is the command.
+
+**Each slot retains WAL independently.** A logical replication slot pins the WAL at
+its own `confirmed_flush_lsn` — PostgreSQL will not recycle any WAL segment older than
+the OLDEST active slot's position, and it does this PER SLOT, not once for the
+cluster. Two bridges, two slots, means two independent retention floors: if bridge A
+is caught up and bridge B has been down for an hour, PostgreSQL keeps every WAL
+segment B's slot still needs, regardless of A. `max_slot_wal_keep_size` (README, §12)
+caps this PER SLOT too — past the cap PostgreSQL invalidates that one slot rather than
+filling the disk, and that bridge must re-seed from a fresh full. This is not a
+multi-instance bug; it is the tradeoff a physical/logical slot always makes (retain
+what a lagging reader still needs, or drop the reader), and it is why an operator with
+several bridges watches `bridge_wal_lag_bytes` PER INSTANCE, not as one cluster number.
+
+**A slot nobody is reading is a leak.** A bridge that is retired without ever running
+`--slot <name>` again (a redeploy under a new slot name, a decommissioned instance)
+leaves its slot in `pg_replication_slots` forever, retaining WAL for a reader that
+will never return, until `max_slot_wal_keep_size` eventually invalidates it. Nothing
+in the bridge drops a slot on shutdown — a clean stop is meant to be resumable, so
+"the process exited" is deliberately not "the slot is abandoned." Telling them apart
+is an operator judgment call, not something the bridge can infer.
+
+**The drop, once you've made that call:**
+
+    SELECT pg_drop_replication_slot('the_slot_name');
+
+Fails loudly if a bridge is still connected to it (`replication slot "..." is active
+for PID ...`) — stop that bridge first, or you would be dropping WAL a live reader
+still needs. `zebridge_limits` (the per-instance width-budget row, §10cf) is GC'd on
+its own schedule keyed to the SAME `pg_replication_slots` check
+(`zebridge_register_limits`, run by every OTHER bridge at its own boot) — dropping the
+slot is what lets that budget row disappear too, on the next boot of any instance.
+On a standby-reader bridge (§10cz) the slot itself lives wherever the reader
+connection does (the standby, PG 16+); `pg_drop_replication_slot` runs there, not on
+the primary the row's `on_standby` flag protects it from.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
@@ -9170,6 +9269,7 @@ ones `scripts/native/jwt-bootstrap.sh` and `up.sh` mint into the repo, not secre
     nats-server nats-server -js -c scripts/native/nats-server-jwt.conf                     (v2.14.5; up.sh's default is nats-server.conf, the JWT conf is the one running)
     bridge      env -i $(cat bridge.env) ./zig-out/bin/bridge                               (restarted with pid 470's exact env, log in the session scratchpad)
     sweeper     ./zig-out/bin/bridge_sweeper                                                GC_THRESHOLD_MS=180000 GC_INTERVAL_MS=180000
+    standby     pg_ctl -D $ROOT/postgres-standby -o "-p 5433 …primary's flags… -c hot_standby=on -c hot_standby_feedback=on"   (2026-09-05, §10cz; physical slot zb_standby on the primary; point DATABASE_READER_URL at :5433 to use it)
     vite        web-consumer: npm run dev → http://localhost:5173 (proxies /nats → ws://127.0.0.1:8080, /bridge → http://127.0.0.1:9090)
 
 ### PostgreSQL

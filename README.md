@@ -52,10 +52,11 @@ flowchart LR
 
 **Design**: This tool is built to serve a large volume of small to medium consumers via the NATS message broker. The daemon is engineered to be light (~3.5 MB executable), fast, secure, and near instant startup.
 
-* **High performance ingestion**: With PG replication set to 'logical', we use a log-based Change Data Capture (CDC) with the native  `pgoutput` (v1) logical decoding plugin to stream WAL changes in _binary_ format. We use `REPLICA IDENTITY DEFAULT` to limit the volume, thus the speed of the emitted data by `pgoutput`. The price is the need, on every table, of a _primary key_, which is almost mechanical.
+* **High performance**: You can expect reaching >200k evt/s PG → NATS, and a sustained >20k mut/s NATS → PG. The consumer ingress/egress depends a lot upon your device.
 * **Zero aollocation Hot Path**: To minimize memory allocations during high throughput, the engine uses a pre-allocated ring buffer.
 * **Multiple instances**: you can run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independantly from small tables with heavy writes.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding. This mitigates the need for long, expensive unitary CDC catchups.
+* **Standby replica ready**: you can use a dedicated Postgres standby replica for all the reads.
 
 **Opinionated**: ZeBridge makes deliberate structural decisions to maximize performance and predictability, rather than offering endless configuration options:
 
@@ -63,18 +64,26 @@ flowchart LR
 * **Opinionated Conflict Resolution (LWW)**: if client-side writes are enabled (`writable => true`), ZB version makes decisions for you that other sync engines leave you to : it enforces a Last-Write-Win (LWW) strategy server-side _per row_. Furthermore, the client uses a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
 This imposes constraints -mostly mechanical- on the database schemas but buys some guarantees.
 * **Controlled Local Writes**: On the consumer side, we expect a standard SQLite or PGlite engine. While clients are free to read from their local database, all writes **must** route through the `libzb` library to ensure tracking. Enforcement depends upon the local engine.
-* **Tenant isolation**: we enforce a strict tenant model in PG: every principal -consumer- operates within a designated tenant boundary. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
+* **Safety / Tenant isolation**: we enforce a strict tenant model in PG: every principal -consumer- operates within a designated tenant boundary. Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
+For these tasks, you can run `ZeBridge` as a CLI with a dedicated helpers  (`--init-nats`, `--gen-nkey`, `--revkoe`).
 * **Detla-chain** generation: a snapshot of a table is not on-demand nor a full table per tenant. This would crush Postgres if thousands of consumers connect. Instead, a "generation" thread produces full/deltas in a time window with a max chain length and these are dictionary based Zstd compressed and pushed into NATS. The client library cherry picks whatever its needs on connection, and complements with the few remaining CDCs up to its watermark.
-* **Suspended table**: ZeBridge quarantines a table when criterias are not met. See [Suspended table](#suspended-table)
-* **Diagnose**: ZeBridge CLI proposes a `--diagnose` tool to run after having installed the triggers and functions needed by ZB inot Postgres. It will detect gaps in the database. 
 
-**Configuration**: once the database is migrate - you are expected to `zb_enable()`the tables you want to follow in a designated PG publication, the primary runtime configuration is the **fixed-size buffer** and the `MAX_COLUMNS` (per table). Depending on the write volume and schema sizes of your published tables, the total buffer allocation can be configured anywhere from 16 MB to over 4+ GB.
+* **Tables must qualify thourhg their schemas**: ZeBridge run as a CLI proposes a `--diagnose` tool to run after having installed the triggers and functions needed by ZB inot Postgres. It will detect gaps in the database.
+If gaps are detecetd at runtime, ZeBridge suspends a table when criterias are not met because the data cannot be processed. The table needs to be corrected, and ZeBridge restarted. See [Suspended table](#suspended-table) 
+
+**Configuration**: once you have setup the functional migration, you will migrate the database; you are expected to tun `zb_enable()` all the tables you want to attach to a designated publication. The primary runtime configuration is the **fixed-size buffer** and the `MAX_COLUMNS` (per table). Depending on the write volume and schema sizes of your published tables, the total buffer allocation can be configured anywhere from 16 MB to 6+ GB.
 Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`.
 
-**Limitations**: `ZeBrigde` is NOT designed for massive databases or tables storing large objects (BLOBs) or an extra large number of columns. NATS restricts payloads ($<2^{20}=1$ MB by default, safe up to 4MB). This default limit of 1MB is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, the needed memory for ZB would start to be very large (eg ~6 GB if buffering 1 MB/evt @ 5000 evt/s).
-> Large payloads belong in object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data, not PDFs for instances.
+**Limitations**: We expose them directly so you can judge.
+`ZeBrigde` is not designed for massive databases or tables storing large objects (BLOBs) or an extra large number of columns.
+NATS restricts payloads (<$2^{20}$=1 MB by default, safe up to 8MB). This default limit of 1MB is already very large for text - 200.000 words, 400 pages, or a huge JSON.
+On the other side, the needed memory for ZB starts to be large, eg ~6.5 GB for buffering  5000 evt/s @ 1MB, or buffering 750 evt/s @ 8MB/evt.
+ZeBridge is still flexible: if you expect large transactions of small rows, you can run a daemon and set 1 kB with a capacity of 4M rows, you need around 5 GB memory to buffer, run it during ~20s to flush into NATS and stop it.
+> For any larger, payloads belong in object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data, not PDFs nor base64 encoded images for instance.
 
-Lasty, the main limitation of this LWW implementation is that is it per full row, not column granular. 
+The two main limitations of an LWW implementation on edges conccurent writes is that is it per full row, meaning not column granular, and suffers of lost ordering across tenants. For example, if two updates on different column are competing, the older one will be dropped. Furthermore, LWW does not preserve ordering when cross tenants: an order scoped on the tenant <accounting> referencing a document arriving as public data - and during a window, if the order arrives first, things look wrong. Only a Foreign Key can guarantee this and this is a choice when designed tables.
+
+Safety / RLS is enforced by tenant. This makes sense for B2B services, less for B2C operations because clients have basically all the same rights. By dividing the database by tenants, you can use advantageoulsy NATS leaf nodes and assign a tenant per node; the main benefit is that NATS contains only one full copy of the database. If you face clients, pratically meaning one tenant: your geogrphically distributed leaf nodes will all contain almost a copy of the database.
 
 **Observability**: ZeBridge includes production-ready observability out of the box; it exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards.
 
@@ -171,7 +180,7 @@ graph TD
         %% Internal Apps
         Prom[(Prometheus<br> :9090)]:::telemetry
         NatsExp([NATS Exporter<br>:7777]):::telemetry
-        PGREP[(PG StandBy<br>Replica<br>Planned)]:::secure
+        PGREP[(PG StandBy<br>Replica)]:::secure
         Bridge[[ZeBridge-1<br> :27434]]:::bridge
         Bridge@{shape: st-rect}
         PG[(Postgres Master <br> :5432)]:::secure
@@ -218,7 +227,13 @@ graph TD
 
 **OS**: the daemon is POSIX based, so runs on a Linux/FreeBSD based VPS.
 
-**Hardware**: You can run very comfortably Postgres, NATS, ZeBridge, Prometheus, HAProxy on a 6-vCPU, 16-24 GB RAM, a high-IOPS 100GB NVMe SSD.
+**Hardware**: On a 6-vCPU, 24 GB RAM, a high-IOPS 100GB NVMe SSD on ideally FreeBSD with ZSF, you can run comfortably the following stack: 
+
+* a master Postgres (≥17) for the writes and a standby replica for all reads (incl. generations),
+* a NATS server and a the NATS-exporter (telemetry)
+* two daemon ZeBridge, one for small tables 2kB-13k evt/s-Buf=300MB and one for larger tables 260kB-13k evt/s-Buf=4.5GB,
+* a TSDB Prometheus (scraping telementry and pushing to a cloud Grafana),
+* the reverse-proxy HAProxy for TLS termination and NATS wss pass-through.
 
 In the example, Postgres master has a `standby` replica for reads.
 
@@ -239,7 +254,7 @@ Here they are, so you can judge the fit before adopting it.
 
 ### Schema rules
 
-The DBA will migrate the tables into Postgres. The rules below are the ones needed in terms of column types and mandatory columns.
+The rules below are the ones needed in terms of column types and mandatory columns.
 
 > [!NOTE] Besides these rules, every table must be attached to a publication, and the PG function `zebridge_enable()` builds all this and needs inputs reflecting the table.
 
@@ -888,6 +903,8 @@ Same dance at connect time (step 6 is identical) — only steps 1–4 are replac
 ### Design overview
 
 ZeBridge projects PostgreSQL onto NATS and never reads its own output back. **Postgres is the source of truth for the bridge; NATS is the source of truth for consumers.** A consumer's state only ever arrives through the change feed.
+
+With PG replication set to 'logical', we use a log-based Change Data Capture (CDC) with the native  `pgoutput` (v1) logical decoding plugin to stream WAL changes in _binary_ format. We use `REPLICA IDENTITY DEFAULT` to limit the volume, thus the speed of the emitted data by `pgoutput`. The price is, on every table, a _primary key_.
 
 **The main loop, four steps:**
 
@@ -2091,7 +2108,7 @@ docker exec -it postgres psql -U postgres -c "CHECKPOINT;"
 
 * [x] **`libzb` native** — one sans-I/O core, now carved in TypeScript (`zb-client-ts/src/core.ts`) with a language-neutral conformance suite (`zb-client-ts/fixtures/core-fixtures.json`), to be ported to Zig and compiled native (`.so`/`.dylib`/`.dll`, C ABI) for FFI hosts — mobile (Swift/Kotlin/Dart), native microservices, Windows (.NET/C++). The port is correct when it passes the same fixtures. JavaScript hosts need none of it: `zb-client-ts` already _is_ the core.
 * [ ] **Auth callout** — the login rides the NATS connect (`$SYS.REQ.USER.AUTH`), so even the mint endpoint disappears; the bridge is the responder.
-* [ ] Split READ (CDC + bootstrap) onto a **standby replica** (PG ≧ 16) from WRITE on the primary, with chain building on the replica.
+* [x] Split READ (CDC + bootstrap) onto a **standby replica** (PG ≧ 16) from WRITE on the primary, with chain building on the replica. Point `DATABASE_READER_URL` at a hot standby; the bridge detects it (`pg_is_in_recovery()`) at boot. The CDC slot, preflight, the catalogue and the chain snapshots stay on the standby, so the decode work leaves the primary. `DATABASE_WRITER_URL` becomes required: a standby refuses every write, so the bridge's own bookkeeping (width budget, refusal mirror, `zebridge_generations`) goes over the writer instead. Set `hot_standby_feedback=on` on the standby, or the primary can vacuum away rows the standby's slot still needs and invalidate it (the bridge warns). Replay lag is added to CDC latency.
 * [ ] TLS on the NATS↔leaf and PG↔bridge links for cross-network deployments.
 * [ ] **Windows Server for the bridge daemon** — Zig targets `x86_64-windows`, but the daemon has Unix-isms to port first: POSIX signal handling for graceful shutdown (→ `SetConsoleCtrlHandler`) and the `poll()` WAL loop (→ `WSAPoll`), then the scenario suite re-run on Windows. Colocation with NATS is usually Linux, so this is for Windows-only shops. **Separate from the consumer**, which already runs on Windows today — native `libzb.dll` via P/Invoke, or `libzb.js` in a Node/Electron service, no wasm needed.
 * [ ] **Prove the write-path lock on every local engine** — enforced today for browser SQLite and PGlite (single owned connection, both); still to implement/verify the schema-migration lock (views + triggers) for mobile/microservice SQLite and local Postgres.

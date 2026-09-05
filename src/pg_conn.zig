@@ -93,6 +93,30 @@ pub const PgConf = struct {
 ///
 /// Returns a PGconn pointer that must be closed with PQfinish()
 /// Caller is responsible for calling c.PQfinish(conn) when done
+/// What the reader IS (NOTES §10cz). `in_recovery` — DATABASE_READER_URL is a hot
+/// standby: reads, preflight and the CDC slot stay there, every write must go to the
+/// primary. `hot_standby_feedback` — off on a standby means the primary may vacuum
+/// away rows the standby's slot still needs and invalidate it (§10bx's slot_loss
+/// path, but self-inflicted). A probe that cannot connect reports a primary: the
+/// connection error itself is reported by whichever step needs the reader next.
+pub const ReaderMode = struct { in_recovery: bool = false, hot_standby_feedback: bool = true };
+
+pub fn probeReaderMode(allocator: std.mem.Allocator, pg_conf: PgConf) ReaderMode {
+    var cfg = pg_conf;
+    cfg.replication = false;
+    const conn = connect(allocator, cfg) catch return .{};
+    defer c.PQfinish(conn);
+    const rec = c.PQexec(conn, "SELECT pg_is_in_recovery()");
+    defer c.PQclear(rec);
+    if (c.PQresultStatus(rec) != c.PGRES_TUPLES_OK or c.PQntuples(rec) != 1) return .{};
+    if (c.PQgetvalue(rec, 0, 0)[0] != 't') return .{};
+    const fb = c.PQexec(conn, "SHOW hot_standby_feedback");
+    defer c.PQclear(fb);
+    const on = c.PQresultStatus(fb) == c.PGRES_TUPLES_OK and c.PQntuples(fb) == 1 and
+        std.mem.eql(u8, std.mem.span(c.PQgetvalue(fb, 0, 0)), "on");
+    return .{ .in_recovery = true, .hot_standby_feedback = on };
+}
+
 pub fn connect(allocator: std.mem.Allocator, pg_conf: PgConf) !*c.PGconn {
     // Build connection string
     const conninfo = try pg_conf.connInfo(

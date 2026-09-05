@@ -23,6 +23,9 @@ const usage =
     \\Environment:
     \\  DATABASE_READER_URL          REQUIRED. Read path, credentials included:
     \\                        postgres://<role>:<pass>@<host>:<port>/<db>[?sslmode=…]
+    \\                        May be a hot standby (PG ≥ 16): detected at boot; the CDC
+    \\                        slot and every read stay there, and DATABASE_WRITER_URL
+    \\                        becomes REQUIRED (the bridge's bookkeeping goes over it).
     \\  BRIDGE_CDC_PUBLICATION  REQUIRED unless --pub is given (which overrides it).
     \\  BRIDGE_CDC_SLOT       REQUIRED unless --slot is given (which overrides it).
     \\  DATABASE_WRITER_URL   Ingress path, same form. Unset disables the mutation

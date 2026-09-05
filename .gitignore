@@ -24,6 +24,7 @@ libs/
 
 # Docker
 postgres-data/
+postgres-standby/
 *.tar.gz
 *.tar.xz
 

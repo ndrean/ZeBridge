@@ -1852,7 +1852,7 @@ pub const EventProcessor = struct {
         // consistent watermark, and taking it *before* publishing means the stamp can
         // only be older than reality — never claim to describe WAL we have not seen.
         const boot_lsn = blk: {
-            const lsn_res = c.PQexec(conn, "SELECT pg_current_wal_lsn()::text");
+            const lsn_res = c.PQexec(conn, "SELECT public.zebridge_wal_head()::text");
             defer c.PQclear(lsn_res);
             if (c.PQresultStatus(lsn_res) != c.PGRES_TUPLES_OK or c.PQntuples(lsn_res) == 0) {
                 log.warn("Could not read current WAL LSN for boot schemas; stamping 0", .{});
