@@ -8955,6 +8955,48 @@ seconds deep or it measures ramp (5k floods read 4.6k on a 9.5k lane; even 20k
 floods read half of what sustained feeding shows). The stamp is the capacity
 instrument; floods are for quick regressions only.
 
+## 10cv. SCOPE.md, the reprovision script, and a real write-loss race on live table birth (2026-09-05)
+
+Three things, from closing the full battery after the day's soaking.
+
+**SCOPE.md** — the fence, drawn on the map: replication is by TENANT not by query
+(B2B-shaped; `last_writer='me'` is a view, not a boundary), the client holds the
+whole tenant (no eviction — large-tenant mobile out of scope), the consistency
+model stated plainly (same-device RYW provisional, referential causality via
+FK-hold, general causal ordering NOT preserved), the outbox dies on reinstall,
+ADD COLUMN with a non-NULL default diverges until re-seed, a pk-type change forces
+a re-seed, and per-principal write rate-limiting belongs in the NATS JWT (data/sub
+limits), NOT HAProxy — mutations ride the WS tunnel the proxy treats as opaque.
+
+**`scripts/reprovision.py` + `scripts/baseline.schema.sql`** — the cure for the
+test-ordering/residue worries. Resets the native stack to a captured baseline:
+the 8 fixture tables' DDL, the canonical enables, the canonical tenant maps;
+strips orphan slots, leftover probe tables + their catalogue rows + KV keys, stray
+tenant mappings; truncates fixtures. `--list` dry-runs. Proven: `check`, `revoke`
+and `txn_kill` — the battery's residue failures — all pass after it. The base
+tables had NO single DDL source before this (they accreted by hand); now they do.
+
+**The real find: live table birth drops writes in the reload window.** `livebirth`
+failed on a CLEAN stack — not residue. The bridge RECEIVES the INSERT for a
+freshly-`zebridge_enable`d public table but the event_processor REFUSES it:
+"not tenant-scoped and no catalogue row marks it public." Timeline in the probe
+log is decisive — refusal at line 146, the live catalogue reload that marks it
+public at line 158, AFTER. It is a RACE: the CDC_PUBLIC subject-filter
+reconciliation and the event_processor's routing-map reload are two separate,
+unsynchronized steps, and a write landing between them is refused-and-DROPPED
+(the WAL event is consumed, never requeued) because an unrecognized table is
+treated as permanently undeclared. In the live-add window it is merely
+not-yet-reloaded — §10cd's disease (refuse-permanently what is transiently
+not-ready) on the egress side. Pre-existing (no egress file changed this session;
+this is the first full owns battery in many commits). Fix direction: on an
+unrecognized table whose catalog_epoch has advanced, reload once and re-evaluate
+before refusing — bounded by the epoch so writes to a genuinely-undeclared table
+cannot trigger a reload storm. Hot-path routing surgery; deserves its own pass.
+OPEN.
+
+Battery status: offline 7/7, live 28/28 (after residue cleanup), owns 26/27 —
+livebirth the one real, filed regression.
+
 ## 11 Restart Rules
 
 PROMOTED to README ("Restart rules", operator-facing) 2026-08-27 — README carries
