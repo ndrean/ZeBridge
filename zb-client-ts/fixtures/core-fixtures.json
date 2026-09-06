@@ -2335,5 +2335,97 @@
         "a"
       ]
     }
+  ],
+  "readOnlySql": [
+    {
+      "name": "a plain SELECT reads",
+      "sql": "SELECT uid, title FROM notes WHERE deleted_at IS NULL",
+      "allowed": true
+    },
+    {
+      "name": "lowercase, trailing semicolon, still a read",
+      "sql": "  select count(*) from _zebridge_outbox; ",
+      "allowed": true
+    },
+    {
+      "name": "a CTE that selects reads",
+      "sql": "WITH x AS (SELECT 1 AS n) SELECT n FROM x",
+      "allowed": true
+    },
+    {
+      "name": "EXPLAIN QUERY PLAN reads",
+      "sql": "EXPLAIN QUERY PLAN SELECT * FROM notes",
+      "allowed": true
+    },
+    {
+      "name": "PRAGMA table_info reads",
+      "sql": "PRAGMA table_info('notes')",
+      "allowed": true
+    },
+    {
+      "name": "PRAGMA foreign_key_check reads",
+      "sql": "PRAGMA foreign_key_check",
+      "allowed": true
+    },
+    {
+      "name": "a string literal containing a write word is a value, not a write",
+      "sql": "SELECT 1 FROM notes WHERE title = 'please delete me' OR body = 'x''; drop table y'",
+      "allowed": true
+    },
+    {
+      "name": "a column named like a write word, with an underscore, is a name",
+      "sql": "SELECT update_count, created_by FROM stats",
+      "allowed": true
+    },
+    {
+      "name": "a comment mentioning a write is a comment",
+      "sql": "-- delete later\nSELECT 1 /* insert nothing */",
+      "allowed": true
+    },
+    {
+      "name": "DELETE on the outbox is a write",
+      "sql": "DELETE FROM _zebridge_outbox",
+      "allowed": false
+    },
+    {
+      "name": "UPDATE on a position is a write",
+      "sql": "UPDATE _zebridge_stream_seq SET last_seq = 0",
+      "allowed": false
+    },
+    {
+      "name": "INSERT into a data table is a write (local theater is not offered)",
+      "sql": "INSERT INTO notes (uid) VALUES ('x')",
+      "allowed": false
+    },
+    {
+      "name": "a CTE feeding DML is a write",
+      "sql": "WITH x AS (SELECT 1) DELETE FROM _zebridge_outbox",
+      "allowed": false
+    },
+    {
+      "name": "a second statement after a semicolon is refused whole",
+      "sql": "SELECT 1; DELETE FROM _zebridge_outbox",
+      "allowed": false
+    },
+    {
+      "name": "DROP TABLE is a write",
+      "sql": "DROP TABLE _zebridge_inbox",
+      "allowed": false
+    },
+    {
+      "name": "a pragma that SETS is a write",
+      "sql": "PRAGMA foreign_keys = OFF",
+      "allowed": false
+    },
+    {
+      "name": "VACUUM and ATTACH are writes",
+      "sql": "ATTACH DATABASE '/tmp/x' AS y",
+      "allowed": false
+    },
+    {
+      "name": "empty is nothing to read",
+      "sql": "   ",
+      "allowed": false
+    }
   ]
 }

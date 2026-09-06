@@ -490,6 +490,32 @@ export function diffColumns(
   };
 }
 
+// ─── query() is read-only (§10di) ──────────────────────────────────────────
+//
+// libzb answers `query()` on a second SQLite connection opened READONLY, so no
+// write of any kind — data or bookkeeping (`_zebridge_outbox`, positions, the
+// shape record) — can come through the API. The TypeScript client has that
+// connection on Node (node.ts) and a single handle in the browser and on PGlite,
+// where this rule stands in: the statement must READ. Comments and string
+// literals are blanked first, so a value containing "delete" is not a write;
+// a second statement after a `;`, a CTE feeding DML, or a pragma that SETS
+// something is.
+
+const WRITE_WORDS = /\b(insert|update|delete|replace|drop|alter|create|attach|detach|vacuum|reindex|truncate)\b/;
+
+export function isReadOnlySql(sql: string): boolean {
+  let s = sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
+  s = s.replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""').toLowerCase().trim();
+  if (!s) return false;
+  s = s.replace(/;\s*$/, '');
+  if (s.includes(';')) return false;
+  const first = s.match(/^[a-z_]+/)?.[0] ?? '';
+  if (!['select', 'with', 'explain', 'values', 'pragma'].includes(first)) return false;
+  if (WRITE_WORDS.test(s)) return false;
+  if (first === 'pragma' && s.includes('=')) return false;
+  return true;
+}
+
 // ─── the shape record (§10dg: re-key and re-type) ────────────────────────
 //
 // `diffColumns` sees NAMES only. A primary-key column whose type changed

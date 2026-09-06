@@ -358,6 +358,8 @@ The `bridge_sweeper` companion daemon scans periodically PostgreSQL to prune row
 
 ### Local database writes are owned
 
+`query()` is read-only on both clients: libzb answers it on a second SQLite connection opened read-only, the TypeScript client does the same on Node and refuses by statement shape where it has one handle. The application cannot reach the outbox, the stream positions or the shape record through the API; writes go through `mutate()`.
+
 **The library owns the write path — reads are open, writes go through `mutate()`.** The consumer reads its local database freely — any SQL, joins, aggregates, offline — but changes only through the library, so every write gets the outbox, the version stamp and the LWW echo. A write that skips the library is a _bug_ you should not be able to make by accident.
 
 **How** that is enforced depends on the local engine, and here is how we approach it:

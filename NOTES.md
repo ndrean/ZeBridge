@@ -9722,6 +9722,52 @@ bumps with the transaction-local setting and skip the marked ones. Now exactly o
 each, and both clients converge with every child row joining both parents by the new
 keys (8/8).
 
+**Offline across the re-key (`scripts/scenarios/rekey_offline.py`, owns).** Both
+clients closed on their durable files; the parent re-keyed, rows written under the new
+key and an old row updated while they were away; the producer's full built under the
+new epoch before anyone returned. Reopened on the same files, each client met the new
+key shape, the new epoch and the new full at once: parent rebuilt empty from the shape
+record, child re-typed, both re-seeded, the offline-window rows present, CDC keyed by
+the uuid flowing — 12/12, first run, nothing to fix. The shape record and the epoch are
+durable on purpose, and this is the proof that a connected client's step-by-step path
+and an offline client's all-at-once path end in the same place.
+
+**Writes against an outdated table (`scripts/scenarios/write_stale.py`, owns).** Both
+clients write while the BRIDGE is down — optimistic copies applied, six writes parked in
+MUTATIONS with no verdict — and PostgreSQL migrates meanwhile: a column dropped, a NOT
+NULL column without default added, a second table's key grown to (tenant_id, uid). The
+bridge returns and every parked write is refused, each by the right gate and before any
+row is touched: `UnknownColumn` (the bridge, against the live catalogue), SQLSTATE 23502
+(PostgreSQL), `MissingPrimaryKey` (the bridge, against the new key). Every client
+reverted its optimistic copy, the re-keyed table was rebuilt empty and re-seeded, both
+replicas equalled PostgreSQL with no ghost and no resurrected row, and writes in the new
+shape landed from both — 12/12, first run. One cosmetic note: a principal's clients share
+`mutation_ack.<principal>.>`, so the Node client logs the libzb client's verdicts as
+"(not from this session)" at ERROR level; they are not its business and should be debug.
+
+**The two-level cascade with held middle rows (`scripts/scenarios/cascade_held.py`,
+owns, item 4).** Grandparent → parent → child with physical cascade deletes and
+DEFERRABLE INITIALLY DEFERRED foreign keys, so a family can be inserted CHILD FIRST in
+one transaction and reaches the stream in that order — the hold path, deterministic.
+Then the race: the same reverse insert and the grandparent's DELETE in one transaction
+(the cascade's deletes fire at COMMIT, after everything). Then both again with 1500
+children, more than the ring holds, so the family crosses message boundaries. The
+TypeScript client passed everything first time. libzb had three defects, all closed:
+(1) no FOREIGN KEY deferral inside a batch — CLIENTS.md's one ✗ row — so a cascade's
+parent-first deletes were refused by SQLite ("not applied: FOREIGN KEY constraint
+failed") and the parent stayed; the batch transaction now defers checks to COMMIT, and
+a COMMIT refused (a parent missing across batches) rolls back — SQLite leaves the
+transaction OPEN on that refusal, which `storage.transaction` now rolls back
+explicitly — and the batch replays with immediate checks and holds, the TS
+`applyBatchIsolated` shape; a DELETE refused by a FOREIGN KEY is held too. (2) One
+retry pass per batch: a child held behind a parent held behind a grandparent stayed
+in the inbox until an unrelated event arrived; passes now run to a fixpoint. (3) A held
+INSERT survived its row's DELETE and would have been replayed when the parent came —
+a ghost; both clients now discard held events whose key a DELETE names. Measured in
+the cross-batch run: libzb held 551 events and released them in one pass, a two-level
+hold released in two passes, 1587 held events discarded on delete; the TS client
+released 1501 held events once their parent arrived. 9/9 on both.
+
 **Proofs.** `libzb/python/migrate_rekey.py` (parent bigserial → uuid with a child, one
 transaction; 13/13), and `scripts/scenarios/migrate_both.py` (owns): a libzb polling
 client and a zb-client-ts Node client (`examples/04-node-consumer/query-worker.ts`,
@@ -9767,6 +9813,67 @@ for the event buffer … column 'schema'") — the scenario runs its bridges at
 `BASE_BUF=14`, and the README's restart rules now say that `2^BASE_BUF` bounds how wide
 a table can be described. (2) A replica reaps tombstoned rows on seed (§7.5), so a
 convergence check compares LIVE rows, or it reports the soft delete as a divergence.
+
+## 10di. The application cannot write through `query()` — on either client (2026-09-06)
+
+The question, from a review of the client tables: how is the bookkeeping a client keeps
+beside the data — `_zebridge_outbox`, the stream positions, `_zebridge_inbox`, the shape
+record — guarded against the application that shares the file? libzb had the answer
+since §10bg: `zb_client_query` runs on a second SQLite connection opened
+`SQLITE_OPEN_READONLY`, enforcement by the engine. The TypeScript client did not:
+`query()` ran on the same read-write storage as the core, documented as "local theater
+the feed will overwrite" — true for a data table, false for the bookkeeping, where a
+`DELETE FROM _zebridge_outbox` loses queued writes for good and an edited shape record
+empties a table.
+
+Closed the libzb way. `Storage` gained an optional `readOnly` Exec; the Node adapter
+opens a second better-sqlite3 handle `{ readonly: true }` lazily and `query()` answers
+on it. Where an adapter has ONE handle (OPFS in the browser, PGlite) the shell guards
+by statement shape — `core.isReadOnlySql`, in both cores, 18 fixture cases: comments
+and string literals blanked first, the first word must be SELECT/WITH/EXPLAIN/VALUES/
+PRAGMA, no write word anywhere, no second statement after a `;`, no pragma that sets.
+Two fixture traps worth keeping: a JSON fixture wants a real newline, not the two
+characters `\n` (a line comment then ate the SELECT), and Zig 0.16 spells
+`std.mem.trimEnd`, not `trimRight`.
+
+`scripts/scenarios/outbox_break.py` (owns) is the attack: bridge down, one write queued
+in each outbox, ten writes typed through `query()` on each client — the outbox, the
+positions, the shape record, the inbox, a data table, a semantic pragma, DML behind a
+CTE, a second statement, ATTACH. Every one refused on both, reads intact, and both
+queued writes landed in PostgreSQL when the bridge returned.
+
+## 10dj. A client killed in the middle of its own migration; and the ghost keys, finally (2026-09-06)
+
+**The states a kill leaves.** A migration on the replica is several SQLite statements
+in autocommit — drop the view, drop or rename the table, create, copy, rename, record
+the shape, drop the watermark — so a host killed between any two leaves a file no code
+path wrote on purpose. Those files are the PREFIXES of the sequence, and a scenario can
+build each one by hand on a closed replica and reopen the client on it:
+`scripts/scenarios/rebuild_kill.py` (owns), both clients, a rebuild that keeps the rows
+(a foreign key added, no epoch move) and a re-key (epoch moved) — killed after the
+DROP, killed before the RENAME (rows sitting in `<table>__migrating`), killed after the
+watermark went, the shape record missing altogether. 10/10 after three rules:
+1. *A table that does not exist cannot be seeded.* First sight now drops the watermark
+   too: killed after the DROP, a fresh empty table used to inherit the old watermark
+   and follow CDC empty — silent loss, and for a migration that moves no epoch nothing
+   would ever have corrected it.
+2. *Finish the rename.* `<table>__migrating` present and `<table>` absent means the
+   rows are right there: adopt them, do not start from nothing.
+3. *No record, the physical key decides.* With no shape record (a replica from before
+   §10dg, or a record lost) the physical pk column NAMES are compared with the
+   descriptor's — names only, never the engine's type text — so a re-key is still a
+   re-key. Without it a seed under the new key hit "ON CONFLICT does not match any
+   PRIMARY KEY" against the old table, forever.
+
+**The ghost keys.** Every fresh TypeScript client waited 90 s at connect on the dev
+broker. The cause was found here: a table dropped WITH the bridge up left
+`suspended: no_primary_key` over its own tombstone, because the catalogue DELETE that
+followed the DROP put it on the reload's republish list, and the boot-schema publisher
+suspended what it could not describe — with a hardcoded `no_primary_key` for every
+refusal reason, too. Now a table that no longer exists gets no descriptor of any kind
+(its tombstone stands), and a refused one is suspended with its OWN reason. Thirty
+ghost keys deleted from the dev bucket; the two-client scenarios went from five
+minutes to one, `rebuild_kill` runs in 30 s.
 
 ## §13 Preflight stopped
 

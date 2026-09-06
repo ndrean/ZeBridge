@@ -54,7 +54,8 @@ row a rule is named.
 | drop tombstone → local table dropped | ✓ | ✓ | |
 | CDC batch in one transaction, position in it | ✓ | ✓ | §10cq item 2 |
 | child before parent: held durably, retried, pruned by a seed past it or a drop | ✓ `_zbz_inbox` | ✓ `_zebridge_inbox` | §10m D1, §10de |
-| foreign keys deferred inside a batch | ✗ (hold/retry only) | ✓ `defer_foreign_keys` | §10e |
+| foreign keys deferred inside a batch, isolated replay with holds when COMMIT refuses | ✓ (2026-09-06) | ✓ `defer_foreign_keys` + `applyBatchIsolated` | §10e, §10dg |
+| held events discarded when their row's DELETE goes by; multi-level holds released to a fixpoint | ✓ | ✓ | §10dg `cascade_held` |
 | cascaded deletes idempotent | ✓ | ✓ | §10cq |
 | the duty outlives the instrument (tail, status watch) | reopen-then-swap; reopen from the stored position on a consumer death | tail loop with idle guard; status loop recreated until close | §10cq items 1, 5, 6, 7 |
 | outbox durable, optimistic apply + queue in one transaction | ✓ | ✓ | PROTOCOL MUST 1 |
@@ -71,6 +72,8 @@ row a rule is named.
 | chain dictionary cache | per process | persisted (`_zebridge_dicts`) | §10x |
 | zstd chain objects | built in | Node built in; browser needs `zstdDecompress` | §10w |
 | survives its host killed mid-seed | proven (`client_kill.py`) | not tested | §10ce |
+| killed mid-migration: first sight drops the watermark, a half-finished rebuild is adopted, no shape record → the physical key decides | ✓ | ✓ | §10dj `rebuild_kill` |
+| `query()` cannot write — the bookkeeping is out of the application's reach | ✓ a READONLY SQLite connection | ✓ a read-only connection on Node; `core.isReadOnlySql` where there is one handle (OPFS, PGlite) | §10di, `outbox_break` |
 
 ## Divergences that matter, ranked
 

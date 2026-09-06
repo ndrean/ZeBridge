@@ -1,7 +1,7 @@
 /// A ZeBridge client that answers SQL over stdin/stdout — the Node half of the
 /// two-client migration scenario (scripts/scenarios/migrate_both.py, NOTES §10dg).
 ///
-/// One JSON object per line in:  {"sql": "...", "params": [...]}  → one line out:
+/// One JSON object per line in:  {"sql": "...", "params": [...]} or {"mutate": {table, op, key, values}}  → one line out:
 /// {"rows": [...]} or {"error": "..."}. A line {"close": true} ends the process.
 /// The client is durable and follows every schema key, exactly like a service
 /// would; the scenario drives PostgreSQL and asks this replica what it holds.
@@ -45,6 +45,13 @@ for await (const line of rl) {
   try { req = JSON.parse(line); } catch { console.log(JSON.stringify({ error: 'bad json' })); continue; }
   if (req.close) break;
   try {
+    if (req.mutate) {
+      // {"mutate": {"table", "op", "key", "values"}} → the blessed write path
+      const m = req.mutate;
+      const r = await zb.mutate(m.table, m.op, m.key, m.values);
+      console.log(JSON.stringify({ rows: [r] }));
+      continue;
+    }
     const rows = await zb.query(req.sql, ...(req.params ?? []));
     console.log(JSON.stringify({ rows }));
   } catch (e: any) {

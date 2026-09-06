@@ -39,8 +39,29 @@ export const nodeStorage: StorageFactory = (dbName) => {
   // chain is the whole fix: each transaction waits for the previous to settle.
   let queue: Promise<void> = Promise.resolve();
 
+  // §10di: the application's `query()` answers on a SECOND connection, opened
+  // read-only — enforcement by the engine, not by convention (the libzb design).
+  // Opened lazily, after the first connection created the file and its WAL.
+  let ro: Database.Database | null = null;
+  const readOnly: Exec = async (q, ...params) => {
+    if (!ro) {
+      ro = new Database(dbName, { readonly: true, fileMustExist: true });
+      ro.pragma('foreign_keys = ON');
+    }
+    const text = q.trim().replace(/;\s*$/, '');
+    if (/^PRAGMA\b/i.test(text)) {
+      const r = ro.pragma(text.replace(/^PRAGMA\s+/i, ''));
+      return Array.isArray(r) ? r : [];
+    }
+    const stmt = ro.prepare(text);
+    const bound = params.map((p) =>
+      p === undefined ? null : typeof p === 'boolean' ? (p ? 1 : 0) : p);
+    return stmt.reader ? stmt.all(...bound) : (stmt.run(...bound), []);
+  };
+
   return {
     exec,
+    readOnly,
     // better-sqlite3's own .transaction() is synchronous-only; the core's apply
     // paths are async. One connection, sequential use → manual BEGIN/COMMIT.
     transaction: (fn) => {
@@ -53,6 +74,7 @@ export const nodeStorage: StorageFactory = (dbName) => {
       return run;
     },
     deleteDatabaseFile: async () => {
+      if (ro) { ro.close(); ro = null; }
       db.close();
       for (const f of [dbName, dbName + '-wal', dbName + '-shm']) {
         try { await unlink(f); } catch { /* absent is fine */ }

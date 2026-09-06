@@ -232,6 +232,9 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
     if (eq(u8, name, "rebuildSteps")) {
         return try core.valueToString(a, try core.rebuildSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array, try strArrField(a, args, "existing")));
     }
+    if (eq(u8, name, "readOnlySql")) {
+        return if (core.isReadOnlySql(args.object.get("sql").?.string)) "true" else "false";
+    }
     if (eq(u8, name, "shape")) {
         const cols = args.object.get("cols").?.array;
         const pk = try strArrField(a, args, "pkCols");
@@ -467,6 +470,10 @@ export fn zb_client_sync(handle: u64) ?[*:0]u8 {
 }
 
 fn queryJson(a: std.mem.Allocator, b: *ClientBox, sql: []const u8, params_text: []const u8) ![]const u8 {
+    // §10di: the read-only connection is the enforcement; the shape rule on top
+    // refuses what a read-only connection would merely ignore — a connection-local
+    // pragma, a second statement after a `;` — so the caller hears it.
+    if (!core.isReadOnlySql(sql)) return error.ReadOnlyQuery;
     const params = if (params_text.len == 0) Value{ .array = std.json.Array.init(a) } else (try std.json.parseFromSlice(Value, a, params_text, .{})).value;
     return try core.valueToString(a, try b.c.query(a, sql, params));
 }

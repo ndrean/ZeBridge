@@ -28,6 +28,12 @@ export interface Storage {
   /// MUST say so: the shell picks the descriptor's `pg` block, BIGINT bookkeeping
   /// and `session_replication_role` from it.
   dialect?: Dialect;
+  /// An Exec that CANNOT write (§10di): a second connection opened read-only, the
+  /// libzb design. `query()` runs on it when present; when absent (one handle —
+  /// the browser's OPFS, PGlite) the shell guards `query()` by statement shape
+  /// (`core.isReadOnlySql`) instead. Either way the application never reaches the
+  /// bookkeeping (`_zebridge_outbox`, positions, the shape record) through the API.
+  readOnly?: Exec;
 }
 
 import type { Dialect } from './dialect.ts';

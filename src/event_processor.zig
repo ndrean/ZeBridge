@@ -951,7 +951,6 @@ pub const EventProcessor = struct {
 
     /// Process a DDL event, query PostgreSQL for the new schema, perform SQLite transformation,
     /// and pack it into the ring buffer directly to the KV schemas subject.
-
     /// Does this table declare a tombstone column?
     ///
     /// Read from `SYNC_RULES`, the same source `mutation_listener` uses to decide whether a
@@ -1068,7 +1067,6 @@ pub const EventProcessor = struct {
                     keys += 1;
                 } else |err| log.warn("🧹 prune '{s}': generations purge of {s} failed: {s}", .{ table, key, @errorName(err) });
             } else |err| log.warn("🧹 prune '{s}': generations bucket unreachable: {s}", .{ table, @errorName(err) });
-
         }
 
         log.info("🧹 drop prune for '{s}': {d} stream purge(s), {d} chain object(s), {d} KV key(s)", .{ table, purges, objects, keys });
@@ -1711,7 +1709,7 @@ pub const EventProcessor = struct {
 
         // Create subject: $KV.schemas.{table}
         const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = clean_table }}, null);
-        const msg_id = try std.fmt.allocPrint(arena, "schema-{s}-{d}", .{clean_table, wal_end});
+        const msg_id = try std.fmt.allocPrint(arena, "schema-{s}-{d}", .{ clean_table, wal_end });
 
         var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
         try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });
@@ -1737,7 +1735,6 @@ pub const EventProcessor = struct {
         self.reportEdgeWritability(clean_table);
         return slot_idx;
     }
-
 
     /// Publish a suspension notice for a refused table.
     ///
@@ -1923,16 +1920,16 @@ pub const EventProcessor = struct {
         monitored_tables: []const []const u8,
     ) !void {
         if (monitored_tables.len == 0) return;
-        
+
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        
+
         log.info("📋 Extracting and publishing schemas for {d} monitored tables on boot...", .{monitored_tables.len});
-        
+
         var standard_pg_config = self.pg_config.*;
         standard_pg_config.replication = false;
-        
+
         const conn = pg_conn.connect(arena, standard_pg_config) catch |err| {
             log.err("Failed to connect to Postgres for boot schema fetch: {}", .{err});
             return error.PgConnectionFailed;
@@ -1976,15 +1973,34 @@ pub const EventProcessor = struct {
             // means its schema is withheld — publishing it here would hand clients a
             // table they can never receive rows for, and would contradict the refusal
             // message. This pass builds its own schema JSON and so needs its own guard.
+            // A table that no longer EXISTS gets no descriptor of any kind (§10dj): its
+            // tombstone stands. Measured: every probe table dropped with the bridge up
+            // left a `suspended: no_primary_key` over its tombstone — a ghost key each
+            // fresh TypeScript client waited 90 s on — because the catalogue DELETE
+            // that followed the DROP put it on this list.
+            {
+                const tbl_z = try arena.dupeZ(u8, clean_table);
+                const params = [_]?[*:0]const u8{tbl_z.ptr};
+                const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1)) IS NOT NULL", 1, null, &params[0], null, null, 0);
+                defer c.PQclear(pr);
+                if (c.PQresultStatus(pr) == c.PGRES_TUPLES_OK and c.PQntuples(pr) > 0 and std.mem.eql(u8, std.mem.span(c.PQgetvalue(pr, 0, 0)), "f")) {
+                    log.info("'{s}' no longer exists — no descriptor published, its tombstone stands", .{clean_table});
+                    continue;
+                }
+            }
+
             if (self.refused.isRefused(clean_table)) {
-                log.warn("⚠️  Withholding boot schema for refused table '{s}' — publishing suspension", .{clean_table});
+                // Its OWN reason (§10dj): this used to say `no_primary_key` for every
+                // refusal, and a client told the wrong reason fixes the wrong thing.
+                const reason = self.refused.reasonFor(clean_table) orelse RefusedTables.Reason.no_primary_key;
+                log.warn("⚠️  Withholding boot schema for refused table '{s}' — publishing suspension ({s})", .{ clean_table, reason.wireName() });
                 // No column or PK queries: we are not describing a shape, only saying
                 // the table is not replicating.
                 const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-boot-{s}", .{clean_table});
                 const slot_idx = try self.publishSuspension(
                     arena,
                     clean_table,
-                    RefusedTables.Reason.no_primary_key.wireName(),
+                    reason.wireName(),
                     msg_id,
                     0,
                     boot_lsn,
@@ -1992,7 +2008,7 @@ pub const EventProcessor = struct {
                 try self.releaseSlotToQueue(slot_idx);
                 continue;
             }
-            
+
             const query = try utils.allocPrintZ(
                 arena,
                 \\SELECT a.attname,
@@ -2011,28 +2027,28 @@ pub const EventProcessor = struct {
             ,
                 .{ "public", clean_table },
             );
-            
+
             const result = c.PQexec(conn, query.ptr);
             defer c.PQclear(result);
-            
+
             if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
-                log.warn("⚠️ Failed to query schema for {s}: {s}", .{clean_table, c.PQerrorMessage(conn)});
+                log.warn("⚠️ Failed to query schema for {s}: {s}", .{ clean_table, c.PQerrorMessage(conn) });
                 continue;
             }
-            
+
             const num_rows: i32 = c.PQntuples(result);
             if (num_rows == 0) {
                 log.warn("⚠️ No schema found for table {s}", .{clean_table});
                 continue;
             }
-            
+
             var json_str: std.ArrayList(u8) = .empty;
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
                 "{{\"table\":\"{s}\",\"pg\":{{\"columns\":[",
                 .{clean_table},
             ));
-            
+
             var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
             var r: i32 = 0;
             while (r < num_rows) : (r += 1) {
@@ -2072,9 +2088,9 @@ pub const EventProcessor = struct {
                 }
                 try json_str.append(arena, '}');
             }
-            
+
             try json_str.appendSlice(arena, "]},\"sqlite\":{\"columns\":[");
-            
+
             r = 0;
             while (r < num_rows) : (r += 1) {
                 if (r > 0) try json_str.appendSlice(arena, ",");
@@ -2098,7 +2114,7 @@ pub const EventProcessor = struct {
                 try json_str.append(arena, '}');
             }
             try json_str.appendSlice(arena, "] ");
-            
+
             // Close the sqlite object first: like the DDL path, the key lives at the
             // ROOT — it is a fact about the table (pg_index), not the SQLite dialect.
             try json_str.appendSlice(arena, "}");
@@ -2312,10 +2328,10 @@ pub const EventProcessor = struct {
             // silently deduplicated — the KV kept the previous boot's value, and a
             // schema-shape change deployed with a quick restart never reached clients.
             const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}-{d}", .{ clean_table, boot_lsn });
-            
+
             var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
             try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });
-            
+
             const slot_idx = try self.acquireAndFillSlot(
                 kv_subject,
                 clean_table,
@@ -2325,7 +2341,7 @@ pub const EventProcessor = struct {
                 dummy_cols,
                 0, // Dummy LSN
             );
-            
+
             try self.releaseSlotToQueue(slot_idx);
             log.info("✅ Boot schema published to KV for '{s}'", .{clean_table});
         }

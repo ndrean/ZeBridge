@@ -32,14 +32,27 @@ class Lib:
             "url": zb.nats_server(), "credsPath": zb.creds_for("omar"), "grammarPath": GRAMMAR, "dbPath": db,
             "principal": "omar", "clientId": client_id, "tables": list(tables), "heartbeatMs": 0}).encode())
         if not self.h: sys.exit("libzb open failed")
-        self.tenant = self.take(lib.zb_client_sync(self.h))["tenant"]
+        r = self.take(lib.zb_client_sync(self.h))
+        if "error" in r: sys.exit(f"libzb sync failed: {r['error']}")
+        self.tenant = r["tenant"]
     def take(self, p):
         try: return json.loads(ctypes.string_at(p).decode())
         finally: self.lib.zb_free(p)
     def poll(self): self.take(self.lib.zb_client_poll(self.h, 300))
     def q(self, sql, params=()):
-        return self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))["rows"]
+        r = self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
+        if "error" in r: raise RuntimeError(r["error"])
+        return r["rows"]
     def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
+    def mutate(self, table, op, key, values=None):
+        lib = self.lib
+        if not hasattr(lib, "_mutate_typed"):
+            lib.zb_client_mutate.restype, lib.zb_client_mutate.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+            lib.zb_client_flush.restype, lib.zb_client_flush.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_uint64]
+            lib._mutate_typed = True
+        return self.take(lib.zb_client_mutate(self.h, table.encode(), op.encode(), json.dumps(key).encode(), json.dumps(values).encode() if values is not None else None))
+    def flush(self, wait_ms=2000):
+        return self.take(self.lib.zb_client_flush(self.h, wait_ms))
     def close(self): self.lib.zb_client_close(self.h)
 
 
@@ -63,6 +76,13 @@ class Node:
         if "error" in r: raise RuntimeError(r["error"])
         return [list(row.values()) for row in r["rows"]]
     def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
+    def mutate(self, table, op, key, values=None):
+        self.p.stdin.write(json.dumps({"mutate": {"table": table, "op": op, "key": key, "values": values}}) + "\n"); self.p.stdin.flush()
+        if not select.select([self.p.stdout], [], [], 60)[0]:
+            raise RuntimeError("node worker silent for 60 s")
+        r = json.loads(self.p.stdout.readline())
+        if "error" in r: raise RuntimeError(r["error"])
+        return r["rows"][0]
     def close(self):
         try:
             self.p.stdin.write('{"close": true}\n'); self.p.stdin.flush(); self.p.wait(timeout=15)

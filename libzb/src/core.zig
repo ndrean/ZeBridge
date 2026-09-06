@@ -884,6 +884,77 @@ pub fn rebuildSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Arra
     return .{ .array = steps };
 }
 
+/// core.ts isReadOnlySql (§10di). libzb enforces read-only `query` with a READONLY
+/// SQLite connection; this is the same rule as a pure function, so the fixtures pin
+/// one meaning of "reads" for both clients.
+pub fn isReadOnlySql(sql: []const u8) bool {
+    var buf: [4096]u8 = undefined;
+    if (sql.len > buf.len) return false;
+    // blank block comments, line comments and string literals in one pass
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < sql.len) {
+        if (i + 1 < sql.len and sql[i] == '/' and sql[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < sql.len and !(sql[i] == '*' and sql[i + 1] == '/')) i += 1;
+            i = @min(i + 2, sql.len);
+            buf[n] = ' ';
+            n += 1;
+        } else if (i + 1 < sql.len and sql[i] == '-' and sql[i + 1] == '-') {
+            while (i < sql.len and sql[i] != '\n') i += 1;
+            buf[n] = ' ';
+            n += 1;
+        } else if (sql[i] == '\'' or sql[i] == '"') {
+            const q = sql[i];
+            i += 1;
+            while (i < sql.len) : (i += 1) {
+                if (sql[i] == q) {
+                    if (i + 1 < sql.len and sql[i + 1] == q) {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            i = @min(i + 1, sql.len);
+            buf[n] = q;
+            buf[n + 1] = q;
+            n += 2;
+        } else {
+            buf[n] = std.ascii.toLower(sql[i]);
+            n += 1;
+            i += 1;
+        }
+    }
+    var s = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    if (s.len == 0) return false;
+    s = std.mem.trimEnd(u8, s, "; \t\r\n");
+    if (std.mem.indexOfScalar(u8, s, ';') != null) return false;
+    var end: usize = 0;
+    while (end < s.len and (std.ascii.isAlphabetic(s[end]) or s[end] == '_')) end += 1;
+    const first = s[0..end];
+    const heads = [_][]const u8{ "select", "with", "explain", "values", "pragma" };
+    var ok = false;
+    for (heads) |h| ok = ok or std.mem.eql(u8, first, h);
+    if (!ok) return false;
+    const writes = [_][]const u8{ "insert", "update", "delete", "replace", "drop", "alter", "create", "attach", "detach", "vacuum", "reindex", "truncate" };
+    for (writes) |w| if (containsWord(s, w)) return false;
+    if (std.mem.eql(u8, first, "pragma") and std.mem.indexOfScalar(u8, s, '=') != null) return false;
+    return true;
+}
+
+fn containsWord(s: []const u8, w: []const u8) bool {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, s, from, w)) |at| {
+        const before_ok = at == 0 or !(std.ascii.isAlphanumeric(s[at - 1]) or s[at - 1] == '_');
+        const after = at + w.len;
+        const after_ok = after >= s.len or !(std.ascii.isAlphanumeric(s[after]) or s[after] == '_');
+        if (before_ok and after_ok) return true;
+        from = at + 1;
+    }
+    return false;
+}
+
 /// core.ts keyShape (§10dg): the pk columns in pk order with their dialect type,
 /// as canonical JSON `[["id","INTEGER"]]`. A pk column the descriptor does not
 /// list is skipped, not guessed.

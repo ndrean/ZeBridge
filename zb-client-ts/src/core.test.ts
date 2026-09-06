@@ -16,7 +16,7 @@ import {
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
   heartbeatPayload,
-  keyShape, typeShape, retypedColumns,
+  keyShape, typeShape, retypedColumns, isReadOnlySql,
 } from './core.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -105,6 +105,9 @@ for (const c of fx.createTable) {
 for (const c of fx.rebuildSteps) {
   test(`rebuildSteps: ${c.name}`, () =>
     assert.deepEqual(rebuildSteps(c.table, c.cols, c.pkCols, c.fks, c.existing), c.steps));
+}
+for (const c of fx.readOnlySql) {
+  test(`readOnlySql: ${c.name}`, () => assert.equal(isReadOnlySql(c.sql), c.allowed));
 }
 for (const c of fx.shape) {
   test(`shape: ${c.name}`, () => {

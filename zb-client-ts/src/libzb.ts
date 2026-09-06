@@ -33,7 +33,7 @@ import { heartbeatPayload,
   scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
-  fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns,
+  fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
@@ -268,9 +268,19 @@ export class ZeBridge {
 
   // ─── the index card ───────────────────────────────────────────────────────
 
-  /// Arbitrary SQL against the local replica. Reads are the intended use; a write
-  /// here is local theater the feed will overwrite — real writes go through mutate().
+  /// SQL against the local replica — READS ONLY (§10di). Writes go through
+  /// mutate(); the replica's data is the feed's, and its bookkeeping (the outbox,
+  /// the positions, the shape record) is the core's. On Node the statement runs on a
+  /// second connection the engine opened read-only; where the adapter has one
+  /// handle (OPFS, PGlite) the statement must read by shape (core.isReadOnlySql),
+  /// and anything else is refused before it runs.
   public async query(sqlText: string, ...params: any[]): Promise<any[]> {
+    // The shape rule runs on EVERY path: a read-only connection still lets a
+    // connection-local pragma "succeed" and drops a second statement in silence.
+    if (!isReadOnlySql(sqlText)) {
+      throw new Error(`query() is read-only: this statement writes (or is not a single SELECT/PRAGMA read) — use mutate() for writes`);
+    }
+    if (this.storage.readOnly) return this.storage.readOnly(sqlText, ...params);
     return this.run(sqlText, ...params);
   }
 
@@ -824,6 +834,17 @@ export class ZeBridge {
     // re-seeded what the drop had just emptied; and one run kept its users only
     // because the salaries FOREIGN KEY blocked the DROP. This single defect is the
     // vanished-cx-users and the 3750-of-4500 of §10j.
+    // §10dj: a host killed between a rebuild's DROP and its RENAME leaves the rows in
+    // `<table>__migrating` and no `<table>`. Finish the rename rather than start
+    // from nothing — the rows are right there.
+    try {
+      const tmpInfo = await this.dialect.tableInfo(this.run, `${table}__migrating`);
+      const realInfo = await this.dialect.tableInfo(this.run, table);
+      if (tmpInfo.length && !realInfo.length) {
+        await this.run(`ALTER TABLE ${table}__migrating RENAME TO ${table};`);
+        this.appendLog('SCHEMA', `${table}: a rebuild was interrupted before its rename — adopted ${table}__migrating`, 'MIGRATE');
+      }
+    } catch { /* no leftover */ }
     let existing = this.syncedTables.get(table);
     if (!existing) {
       try {
@@ -852,7 +873,13 @@ export class ZeBridge {
       const r = await this.run(`SELECT key_shape, type_shape FROM _zebridge_shape WHERE tbl = ?`, table);
       if (r?.length) { keyBefore = r[0].key_shape ?? null; typeBefore = r[0].type_shape ?? null; }
     } catch { /* no record yet */ }
-    const rekey = !!existing && keyBefore !== null && keyBefore !== keyNow;
+    // With no record (a replica from before §10dg, or a record lost to a kill) the
+    // PHYSICAL pk column names decide — names only, never the engine's type text.
+    let physPk: string[] = [];
+    if (existing && keyBefore === null) {
+      try { physPk = (await this.dialect.tableInfo(this.run, table)).filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk).map((c) => c.name); } catch { /* unknown */ }
+    }
+    const rekey = !!existing && (keyBefore !== null ? keyBefore !== keyNow : physPk.length > 0 && physPk.join(',') !== pkCols.join(','));
     const retyped = rekey ? [] : retypedColumns(typeBefore, cols);
     // Set when the rows had to go (a re-key, or a rebuild that could not carry them):
     // the watermark goes with them and a fresh full brings them back.
@@ -917,6 +944,10 @@ export class ZeBridge {
           await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
           this.appendLog('SCHEMA', `${table}: key shape changed (${keyBefore} → ${keyNow}) — rebuilt EMPTY, watermark dropped, re-seeding from a fresh full`, 'REKEY');
         } else {
+          // A table that did not exist cannot be seeded, whatever a watermark left
+          // behind by a kill says (§10dj): forget it, so the seed happens.
+          await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
+          emptied = true;
           this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
         }
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
@@ -1190,6 +1221,20 @@ export class ZeBridge {
   ///   constraint whose parent row the client may not read), and expiring the row
   ///   would silently discard data — the exact failure class this whole table
   ///   exists to end. It stays, it is counted, and it is loud.
+  private async pruneInboxKey(exec: Exec, table: string, pkCols: string[], data: any) {
+    if (!pkCols.length || !data) return;
+    const same = (d: any) => pkCols.every((c) => d?.[c] !== undefined && String(d[c]) === String(data[c]));
+    const before = this.fkHeld.length;
+    this.fkHeld = this.fkHeld.filter((h) => !(h.table === table && same(h.ev?.data)));
+    try {
+      const rows = await exec(`SELECT id, ev FROM _zebridge_inbox WHERE tbl = ?`, table);
+      const ids = (rows ?? []).filter((r: any) => { try { return same(JSON.parse(r.ev)?.data); } catch { return false; } }).map((r: any) => r.id);
+      if (ids.length) await exec(`DELETE FROM _zebridge_inbox WHERE id IN (${ids.map(() => '?').join(',')})`, ...ids);
+      const n = Math.max(ids.length, before - this.fkHeld.length);
+      if (n) this.appendLog('SYS', `${table}: ${n} held event(s) for a row deleted upstream discarded`, 'INFO');
+    } catch { /* inbox not initialized yet */ }
+  }
+
   private async pruneInboxSeeded(table: string, watermarkLsn: number) {
     try {
       await this.run(`DELETE FROM _zebridge_inbox WHERE tbl = ? AND lsn <= ?`, table, watermarkLsn);
@@ -1383,6 +1428,9 @@ export class ZeBridge {
           this.appendLog('SQLITE', `DELETE on ${table} failed: ${err}`, 'ERROR');
         }
       }
+      // §10dg: whatever was HELD for this key (an INSERT waiting for its parent) must
+      // not replay after the row's DELETE went by — it would resurrect the row.
+      await this.pruneInboxKey(exec, table, state.pkCols, ev.data);
     }
 
     // The echo is the success signal: a successful write produces no verdict (§7.0) —

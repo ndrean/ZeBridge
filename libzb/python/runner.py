@@ -74,6 +74,7 @@ SECTIONS = {
     "fkClauses":       (lambda c: {"fks": c["fks"]},                                 lambda c: c["text"]),
     "createTable":     (lambda c: {"table": c["table"], "cols": c["cols"], "pkCols": c["pkCols"], "fks": c["fks"]}, lambda c: c["steps"]),
     "rebuildSteps":    (lambda c: {"table": c["table"], "cols": c["cols"], "pkCols": c["pkCols"], "fks": c["fks"], "existing": c["existing"]}, lambda c: c["steps"]),
+    "readOnlySql":     (lambda c: {"sql": c["sql"]},                                lambda c: c["allowed"]),
     "shape":           (lambda c: {"pkCols": c["pkCols"], "cols": c["cols"]},      lambda c: {"key": c["key"], "types": c["types"]}),
     "retyped":         (lambda c: {"stored": c["stored"], "cols": c["cols"]},       lambda c: c["out"]),
     "diffColumns":     (lambda c: {"existing": c["existing"], "wanted": c["wanted"], "renamed": c["renamed"]}, lambda c: c["out"]),

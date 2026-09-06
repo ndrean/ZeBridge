@@ -315,6 +315,17 @@ pub const SyncClient = struct {
         const idx = val.object.get("indexes") orelse empty_arr;
         const renamed = val.object.get("renamed") orelse Value{ .object = .empty };
 
+        // §10dj: a host killed between a rebuild's DROP and its RENAME leaves the rows
+        // in `<table>__migrating` and no `<table>`: finish the rename, the rows are there.
+        {
+            const tmp = try std.fmt.allocPrint(a, "{s}__migrating", .{table});
+            const tmp_info = try st.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = tmp }});
+            const real_info = try st.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = table }});
+            if (tmp_info.len > 0 and real_info.len == 0) {
+                try execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE \"{s}\" RENAME TO \"{s}\";", .{ tmp, table }));
+                std.debug.print("{s}: a rebuild was interrupted before its rename — adopted {s}\n", .{ table, tmp });
+            }
+        }
         // FINDING 9: existence — and the existing columns — are the DATABASE's to answer.
         const info = try st.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = table }});
         var existing: ?[]const []const u8 = null;
@@ -335,7 +346,16 @@ pub const SyncClient = struct {
         const shape_rows = try st.query(a, "SELECT key_shape, type_shape FROM _zbz_shape WHERE tbl = ?", &.{.{ .text = table }});
         const key_before: ?[]const u8 = if (shape_rows.len > 0 and shape_rows[0][0] == .text) shape_rows[0][0].text else null;
         const type_before: ?[]const u8 = if (shape_rows.len > 0 and shape_rows[0][1] == .text) shape_rows[0][1].text else null;
-        const rekey = existing != null and key_before != null and !std.mem.eql(u8, key_before.?, key_now);
+        // With no record (a replica from before the record, or one lost to a kill) the
+        // PHYSICAL pk column names decide — names only, never the engine's type text.
+        const rekey = blk: {
+            if (existing == null) break :blk false;
+            if (key_before) |kb| break :blk !std.mem.eql(u8, kb, key_now);
+            const phys = try st.query(a, "SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk", &.{.{ .text = table }});
+            if (phys.len == 0 or phys.len != pk.len) break :blk phys.len > 0;
+            for (phys, 0..) |row, k| if (!std.mem.eql(u8, row[0].text, pk[k])) break :blk true;
+            break :blk false;
+        };
         const retyped = (try core.retypedColumns(a, if (rekey) null else type_before, cols_v.array)).array.items;
 
         var outcome: Migration = .unchanged;
@@ -528,12 +548,16 @@ pub const SyncClient = struct {
             else => return err,
         };
         if (outcome != .unchanged) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
-        if (outcome == .rekeyed or outcome == .emptied) {
+        if (outcome == .rekeyed or outcome == .emptied or outcome == .created) {
             // §10dg: the rows are gone (with the old key, or because the rebuild could
             // not carry them); so is everything that referred to them — the watermark
             // (the next gap check seeds a fresh full) and the events held for the
-            // table (keyed the old way, they can never apply).
-            _ = try self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
+            // table (keyed the old way, they can never apply). `.created` too (§10dj):
+            // a table that did not exist cannot be seeded, whatever a watermark left
+            // behind by a kill says.
+            // `catch`: on the very first sync the bookkeeping tables are created AFTER
+            // this loop, and a table with no bookkeeping has no watermark to drop.
+            _ = self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch {};
             pruneInboxDropped(&self.st, a, table) catch {};
             self.reseed_pending = true;
             std.debug.print("{s}: re-keyed — watermark dropped, re-seeding from a fresh full\n", .{table});
@@ -1000,12 +1024,34 @@ pub const SyncClient = struct {
     /// retry that lands it. Still missing its parent → attempts + 1, next pass. Any
     /// other failure → dropped, loudly: an event that can never apply must not sit
     /// forever pretending it will.
+    /// Passes until a pass resolves nothing (§10dg): a child held behind a parent that
+    /// is itself held behind a grandparent needs the second pass — measured, the
+    /// single pass left the child in the inbox until an unrelated event arrived.
     fn retryHeld(self: *SyncClient) void {
+        var total_len: usize = 0;
+        var total_resolved: usize = 0;
+        var total_dropped: usize = 0;
+        var passes: usize = 0;
+        while (passes < 16) : (passes += 1) {
+            const r = self.retryHeldPass() catch return;
+            if (passes == 0) total_len = r.len;
+            total_resolved += r.resolved;
+            total_dropped += r.dropped;
+            if (r.resolved == 0 or r.len == r.resolved + r.dropped) break;
+        }
+        if (total_resolved > 0 or total_dropped > 0) {
+            std.debug.print("fk held: {d}, applied on retry: {d}, dropped: {d}, still waiting: {d} ({d} pass(es))\n", .{ total_len, total_resolved, total_dropped, total_len -| (total_resolved + total_dropped), passes + 1 });
+        }
+    }
+
+    const RetryPass = struct { len: usize, resolved: usize, dropped: usize };
+
+    fn retryHeldPass(self: *SyncClient) !RetryPass {
         var ra = std.heap.ArenaAllocator.init(self.a);
         defer ra.deinit();
         const a = ra.allocator();
-        const rows = self.st.query(a, "SELECT id, tbl, ev FROM _zbz_inbox ORDER BY id", &.{}) catch return;
-        if (rows.len == 0) return;
+        const rows = try self.st.query(a, "SELECT id, tbl, ev FROM _zbz_inbox ORDER BY id", &.{});
+        if (rows.len == 0) return .{ .len = 0, .resolved = 0, .dropped = 0 };
         var resolved: usize = 0;
         var dropped: usize = 0;
         for (rows) |r| {
@@ -1030,9 +1076,7 @@ pub const SyncClient = struct {
                 },
             }
         }
-        if (resolved > 0 or dropped > 0) {
-            std.debug.print("fk held: {d}, applied on retry: {d}, dropped: {d}, still waiting: {d}\n", .{ rows.len, resolved, dropped, rows.len - resolved - dropped });
-        }
+        return .{ .len = rows.len, .resolved = resolved, .dropped = dropped };
     }
 
     /// A pull consumer on `stream` positioned just past the stored sequence, named
@@ -1136,7 +1180,14 @@ pub const SyncClient = struct {
             last: u64,
             max_seq: *u64,
             offered: *usize,
+            /// §10dg: FOREIGN KEY checks deferred to COMMIT for the whole batch (the TS
+            /// client's `defer_foreign_keys`): a family inserted child-first, or a
+            /// cascade's deletes arriving parent-first, lands as one unit with no hold at
+            /// all. A COMMIT refused (a parent missing across BATCHES) rolls back and the
+            /// caller replays with immediate checks, holding what cannot land.
+            deferred: bool,
             fn apply(cx: @This(), st_: *storage.Storage) !void {
+                if (cx.deferred) try st_.execSimple("PRAGMA defer_foreign_keys = ON;");
                 for (cx.messages) |m| {
                     const seq = m.metadata.sequence.stream;
                     const doc = decodeMsgpack(cx.a, m.msg.data) catch continue;
@@ -1169,7 +1220,7 @@ pub const SyncClient = struct {
             }
         };
         var offered: usize = 0;
-        try self.st.transaction(Ctx{
+        var ctx = Ctx{
             .client = self,
             .a = ba.allocator(),
             .stream = stream,
@@ -1177,7 +1228,15 @@ pub const SyncClient = struct {
             .last = last,
             .max_seq = max_seq,
             .offered = &offered,
-        }, Ctx.apply);
+            .deferred = true,
+        };
+        self.st.transaction(ctx, Ctx.apply) catch |err| {
+            std.debug.print("{s}: batch of {d} message(s) refused as a unit ({s}: {s}) — replaying event by event, holding what cannot land\n", .{ stream, messages.len, @errorName(err), self.st.commitErr() });
+            offered = 0;
+            max_seq.* = last;
+            ctx.deferred = false;
+            try self.st.transaction(ctx, Ctx.apply);
+        };
         for (messages) |m| m.ack() catch {};
         return offered;
     }
@@ -1338,8 +1397,16 @@ pub const SyncClient = struct {
         // update that SETS the tombstone, §7.5) end the same way here: the row goes.
         if (std.mem.eql(u8, op, "DELETE") or tombstoned(st, data)) {
             if (try core.planDelete(taa, table, st.pk, data)) |stp| {
-                _ = try self.stepExec(taa, stp);
+                // A parent's DELETE ahead of its children's (a cascade split across
+                // batches) is HELD like a child ahead of its parent, and lands on retry.
+                _ = self.stepExec(taa, stp) catch |err| {
+                    if (err == storage.Error.StepFailed and std.mem.indexOf(u8, self.st.errMsg(), "FOREIGN KEY") != null) return error.FkHeld;
+                    return err;
+                };
             }
+            // §10dg: whatever was held for this key (an INSERT waiting for its parent)
+            // must not replay after the row's DELETE went by — it would resurrect it.
+            pruneInboxKey(&self.st, taa, table, st.pk, data) catch {};
             return;
         }
         if (try core.planKeyChange(taa, table, st.pk, data)) |kc| _ = try self.stepExec(taa, kc);
@@ -1866,6 +1933,45 @@ pub fn ensureShape(st: *storage.Storage) !void {
 pub fn ensureInbox(st: *storage.Storage) !void {
     try st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, lsn INTEGER NOT NULL, ev TEXT NOT NULL, reason TEXT NOT NULL, held_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)");
     try st.execSimple("CREATE INDEX IF NOT EXISTS _zbz_inbox_tbl ON _zbz_inbox (tbl, lsn)");
+}
+
+/// Drop every held event of `table` whose key equals the deleted row's (§10dg).
+pub fn pruneInboxKey(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, pk: []const []const u8, data: Value) !void {
+    if (pk.len == 0 or data != .object) return;
+    const rows = try st.query(a, "SELECT id, ev FROM _zbz_inbox WHERE tbl = ?", &.{.{ .text = table }});
+    for (rows) |r| {
+        const ev = std.json.parseFromSliceLeaky(Value, a, r[1].text, .{}) catch continue;
+        const d = if (ev == .object) (ev.object.get("data") orelse continue) else continue;
+        if (d != .object) continue;
+        var same = true;
+        for (pk) |col| {
+            const x = data.object.get(col) orelse {
+                same = false;
+                break;
+            };
+            const y = d.object.get(col) orelse {
+                same = false;
+                break;
+            };
+            if (!valueEql(x, y)) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            _ = try st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{r[0]});
+            std.debug.print("{s}: a held event for a row deleted upstream was discarded\n", .{table});
+        }
+    }
+}
+
+fn valueEql(x: Value, y: Value) bool {
+    return switch (x) {
+        .string => |s| y == .string and std.mem.eql(u8, s, y.string),
+        .integer => |i| y == .integer and y.integer == i,
+        .bool => |b| y == .bool and y.bool == b,
+        else => false,
+    };
 }
 
 pub fn holdEvent(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, ev: Value, reason: []const u8) !void {

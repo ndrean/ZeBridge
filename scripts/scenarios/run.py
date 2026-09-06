@@ -109,6 +109,11 @@ GROUPS = {
         "migrate_both":  ("bridge", "every migration shape (add/rename/drop/volatile default/re-key/drop table) under libzb AND zb-client-ts at once"),
         "column_flood":  ("bridge", "a migration grows a table past MAX_COLUMNS: suspended not crashed, writes meanwhile dropped, the restart re-detects and re-seeds both clients"),
         "rekey_two_parents": ("bridge", "two parents re-keyed in one transaction, a child referencing both: one epoch bump each, both clients converge"),
+        "rekey_offline": ("bridge", "both clients OFFLINE across a re-key and the writes after it: reopen on the same files, meet the new key and epoch at once, converge"),
+        "cascade_held":  ("bridge", "a two-level cascade delete while the middle rows are HELD in the inbox: no ghost, no orphan, both replicas equal PostgreSQL"),
+        "rebuild_kill":  ("bridge", "a client killed at every point of a local rebuild and of a re-key: each leftover state converges on reopen, both clients"),
+        "outbox_break":  ("bridge", "the application tries to damage the client's bookkeeping through query(): every write refused on both clients, the queued write survives and lands"),
+        "write_stale":   ("bridge", "writes queued while the bridge is down, delivered after a DROP COLUMN, a new NOT NULL column and a re-key: verdicts, reverts, no ghost rows, both replicas equal PostgreSQL"),
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),

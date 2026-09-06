@@ -49,6 +49,8 @@ const SpinLock = struct {
 };
 
 pub const Storage = struct {
+    commit_err_buf: [256]u8 = undefined,
+    commit_err_len: usize = 0,
     db: *c.sqlite3,
     mutex: SpinLock = .{},
     /// Prepared-statement cache (§10cu). The CDC wire carries FULL rows (§7's
@@ -129,6 +131,11 @@ pub const Storage = struct {
 
     pub fn errMsg(self: *Storage) []const u8 {
         return std.mem.span(c.sqlite3_errmsg(self.db));
+    }
+
+    /// Why the last `transaction` COMMIT was refused (a deferred FOREIGN KEY check, §10dg).
+    pub fn commitErr(self: *Storage) []const u8 {
+        return self.commit_err_buf[0..self.commit_err_len];
     }
 
     /// Statement without parameters, whose results (if any) are discarded.
@@ -227,7 +234,19 @@ pub const Storage = struct {
         defer self.mutex.unlock();
         try self.execSimple("BEGIN IMMEDIATE;");
         if (func(ctx, self)) |_| {
-            try self.execSimple("COMMIT;");
+            // A COMMIT refused by a deferred FOREIGN KEY check (§10dg) leaves the
+            // transaction OPEN in SQLite; without the rollback every later statement
+            // would land inside it.
+            self.execSimple("COMMIT;") catch |err| {
+                // The refusal's text is gone once ROLLBACK ran ("not an error"): keep it.
+                const msg = self.errMsg();
+                const n = @min(msg.len, self.commit_err_buf.len - 1);
+                @memcpy(self.commit_err_buf[0..n], msg[0..n]);
+                self.commit_err_buf[n] = 0;
+                self.commit_err_len = n;
+                self.execSimple("ROLLBACK;") catch {};
+                return err;
+            };
         } else |err| {
             self.execSimple("ROLLBACK;") catch {};
             return err;
