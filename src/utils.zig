@@ -134,6 +134,15 @@ pub fn getMilliTimestamp() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 
+/// Wall-clock milliseconds since the Unix epoch — for anything compared with a clock
+/// that is not ours (a client's heartbeat `ts`) or exported as a timestamp. The
+/// monotonic one above is for durations only.
+pub fn unixMillis() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
 /// Convert days since Unix epoch (1970-01-01) to civil calendar date (year, month, day)
 ///
 /// This uses the proleptic Gregorian calendar algorithm from Howard Hinnant's date library,
@@ -279,3 +288,19 @@ test "isSubjectToken: empty and over-long are refused" {
     const at_limit = "a" ** max_subject_token_len;
     try std.testing.expect(isSubjectToken(at_limit));
 }
+
+/// A spin lock for snapshot registries (wal_monitor.SlotRegistry, fleet_monitor.Registry):
+/// one writer every few minutes swapping a pointer, one reader per /metrics scrape. The
+/// std mutex of this Zig needs an `Io` on every lock and the HTTP thread has none; a
+/// spin on an atomic is the honest tool for a critical section of a few instructions.
+pub const SpinLock = struct {
+    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn lock(self: *SpinLock) void {
+        while (self.locked.swap(true, .acquire)) std.atomic.spinLoopHint();
+    }
+
+    pub fn unlock(self: *SpinLock) void {
+        self.locked.store(false, .release);
+    }
+};

@@ -91,6 +91,7 @@ GROUPS = {
         "legacybait":    ("bridge", "pre-guard oversized rows"),
         "suspension_lift": ("bridge", "a row_too_large suspension lifts live once its cause is gone"),
         "livebirth":     ("bridge", "a table born and enabled while running"),
+        "fleet":         ("bridge", "clients' heartbeats → per-client lag on /metrics; every slot inventoried"),
         "race":          ("bridge", "24 writers against ingress"),
         "adversarial":   ("bridge", "fuzz the two untrusted entry points"),
         "chaos":         ("bridge", "broker kill, backend kill, socket exhaustion"),
@@ -105,6 +106,9 @@ GROUPS = {
         "sweeper_restart": ("bridge", "PostgreSQL restarts under a running sweeper: reconnect re-arms statements, principal, UTC"),
         "cascade":       ("bridge", "NATS gone under a steady feed: ring fills, bridge halts, WAL dams behind the slot, then drains"),
         "client_kill":   ("bridge", "kill -9 the client's HOST mid-seed: the SQLite file survives, the re-seed converges"),
+        "migrate_both":  ("bridge", "every migration shape (add/rename/drop/volatile default/re-key/drop table) under libzb AND zb-client-ts at once"),
+        "column_flood":  ("bridge", "a migration grows a table past MAX_COLUMNS: suspended not crashed, writes meanwhile dropped, the restart re-detects and re-seeds both clients"),
+        "rekey_two_parents": ("bridge", "two parents re-keyed in one transaction, a child referencing both: one epoch bump each, both clients converge"),
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),

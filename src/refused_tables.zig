@@ -76,6 +76,11 @@ pub const Reason = enum {
     /// immediate refusal instead of a bridge-wide outage.
     no_cdc_subject,
 
+    /// More columns than one CDC event can carry (MAX_COLUMNS, sized at boot from the
+    /// widest table, doubled — §10df). A migration grew the table past it. Not
+    /// probing: it lifts on restart (re-detected) or on a DDL event that fits.
+    too_many_columns,
+
     /// The string clients receive in a suspension payload.
     pub fn wireName(self: Reason) []const u8 {
         return @tagName(self);
@@ -110,6 +115,7 @@ pub const Reason = enum {
             .row_too_large => "waiting for a write that fits — it lifts itself then (30 s cooldown), no restart; the row predates the guard, a triggers-off load, or a BASE_BUF shrink. See the SUSPENDING block above, or SELECT public.zebridge_widest_row('<table>')",
             .no_tenant_column => "add the column the catalogue/TENANT_RULES names, or correct the rule",
             .tenant_not_in_replica_identity => "CREATE UNIQUE INDEX <t>_zb_ri ON <t> (<tenant>, <pk>); ALTER TABLE <t> REPLICA IDENTITY USING INDEX <t>_zb_ri",
+            .too_many_columns => "restart the bridge — MAX_COLUMNS re-detects from the widest table (doubled) — or set MAX_COLUMNS higher; dropping columns lifts it live",
             .no_cdc_subject => "declare the table in zebridge_catalogue (zebridge_enable with public_reason or tenant_col) — the bridge reloads on the catalogue row and lifts this itself, no restart",
         };
     }
@@ -284,6 +290,43 @@ pub const Registry = struct {
             // nothing was fixed — the table simply stopped existing.
             log.info("✅ '{s}' is no longer refused (was: {s})", .{ e.name, e.reason.wireName() });
             self.mirrorToCatalogue(table, null);
+            // §10dh: rows written while the table was suspended were dropped, not
+            // deferred — no replica has them, and CDC never will. The lift is a
+            // re-seed: the catalogue epoch moves, the producer's next build is a full,
+            // every replica of the table (and of its FK closure) seeds afresh.
+            if (e.dropped > 0) self.reseedAfterLift(table, e.dropped);
+        }
+    }
+
+    /// `SELECT zebridge_reseed(<table>)` over the bookkeeping connection. Best-effort
+    /// like the mirror: a failure is logged as a WARNING naming the manual call,
+    /// because the dropped rows are the operator's problem then.
+    pub fn reseedAfterLift(self: *Registry, table: []const u8, dropped: ?u64) void {
+        const cfg = self.pg_config orelse return;
+        const conninfo = cfg.connInfo(self.allocator, false) catch return;
+        defer self.allocator.free(conninfo);
+        const conn = c.PQconnectdb(conninfo.ptr) orelse return;
+        defer c.PQfinish(conn);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            log.warn("⚠️  '{s}': events were dropped while suspended, and the re-seed could not be asked for (no connection) — run SELECT zebridge_reseed('{s}')", .{ table, table });
+            return;
+        }
+        var why_buf: [64]u8 = undefined;
+        const why: []const u8 = if (dropped) |n| (std.fmt.bufPrint(&why_buf, "{d} event(s) were dropped while suspended", .{n}) catch "events were dropped while suspended") else "events were dropped while it was suspended across a restart (count unknown)";
+        var tbl_buf: [256]u8 = undefined;
+        const tbl_z = std.fmt.bufPrintZ(&tbl_buf, "{s}", .{table}) catch return;
+        const params = [_]?[*:0]const u8{tbl_z.ptr};
+        const res = c.PQexecParams(conn, "SELECT string_agg(tbl || '=' || seed_epoch, ',') FROM public.zebridge_reseed(to_regclass('public.' || quote_ident($1)))", 1, null, &params[0], null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+            log.warn("⚠️  '{s}': {s}, and the re-seed was refused ({s}) — run SELECT zebridge_reseed('{s}')", .{ table, why, c.PQerrorMessage(conn), table });
+            return;
+        }
+        const bumped: []const u8 = if (c.PQgetisnull(res, 0, 0) == 0) std.mem.span(c.PQgetvalue(res, 0, 0)) else "";
+        if (bumped.len == 0) {
+            log.info("🧬 '{s}': {s}, but it has no catalogue row — nothing to re-seed", .{ table, why });
+        } else {
+            log.info("🧬 '{s}': {s} — seed epoch bumped ({s}); the producer's next build is a full and every replica re-seeds", .{ table, why, bumped });
         }
     }
 

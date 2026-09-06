@@ -58,8 +58,14 @@ pub const Load = struct {
     /// Tables whose rules were added, replaced or removed by THIS read — what a live
     /// reload must (re)publish a schema for or lift a refusal on. Empty at boot.
     changed: []const []const u8 = &.{},
+    /// tbl → seed_epoch (§10df): a bump republishes the table's descriptor and tells
+    /// clients to forget their watermark.
+    epochs: std.StringHashMapUnmanaged(i64) = .empty,
 
     pub fn deinit(self: *Load, allocator: std.mem.Allocator) void {
+        var it = self.epochs.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        self.epochs.deinit(allocator);
         for (self.publics) |name| allocator.free(name);
         if (self.publics.len > 0) allocator.free(self.publics);
         for (self.tenants) |name| allocator.free(name);
@@ -178,7 +184,7 @@ pub fn loadRules(
 
     const res = c.PQexec(conn,
         "SELECT tbl, COALESCE(tenant_col::text, ''), version_col::text, " ++
-            "COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, '') " ++
+            "COALESCE(tombstone_col::text, ''), COALESCE(tiebreak_col::text, ''), seed_epoch " ++
             "FROM public.zebridge_catalogue ORDER BY tbl");
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
@@ -198,6 +204,10 @@ pub fn loadRules(
         const version_col = std.mem.span(c.PQgetvalue(res, @intCast(i), 2));
         const tombstone_col = std.mem.span(c.PQgetvalue(res, @intCast(i), 3));
         const tiebreak_col = std.mem.span(c.PQgetvalue(res, @intCast(i), 4));
+        const epoch = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 5)), 10) catch 0;
+        if (allocator.dupe(u8, tbl)) |k| {
+            out.epochs.put(allocator, k, epoch) catch allocator.free(k);
+        } else |_| {}
         var grew = false;
 
         if (tenant_col.len == 0) {

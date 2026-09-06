@@ -15,11 +15,16 @@ import {
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
+  heartbeatPayload,
+  keyShape, typeShape, retypedColumns,
 } from './core.ts';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = JSON.parse(readFileSync(join(here, '..', 'fixtures', 'core-fixtures.json'), 'utf8'));
 
+for (const c of fx.heartbeat) {
+  test(`heartbeat: ${c.name}`, () => assert.equal(heartbeatPayload(c.principal, c.tenant, c.ts, c.seqs), c.out));
+}
 for (const c of fx.seedGate) {
   test(`seedGate: ${c.name}`, () => assert.equal(seedGateDrops(c.ev, c.anchor), c.drops));
 }
@@ -100,6 +105,15 @@ for (const c of fx.createTable) {
 for (const c of fx.rebuildSteps) {
   test(`rebuildSteps: ${c.name}`, () =>
     assert.deepEqual(rebuildSteps(c.table, c.cols, c.pkCols, c.fks, c.existing), c.steps));
+}
+for (const c of fx.shape) {
+  test(`shape: ${c.name}`, () => {
+    assert.equal(keyShape(c.pkCols, c.cols), c.key);
+    assert.equal(typeShape(c.cols), c.types);
+  });
+}
+for (const c of fx.retyped) {
+  test(`retyped: ${c.name}`, () => assert.deepEqual(retypedColumns(c.stored, c.cols), c.out));
 }
 for (const c of fx.diffColumns) {
   test(`diffColumns: ${c.name}`, () =>

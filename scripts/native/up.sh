@@ -126,6 +126,7 @@ if [ "$FRESH_NATS" = "1" ]; then
   SCHEMA_KV=$(jq -r '.kv.schemas' "$ROOT/src/grammar.json")
   TENANTS_KV=$(jq -r '.kv.tenants' "$ROOT/src/grammar.json")
   GENERATIONS_KV=$(jq -r '.generations.kv' "$ROOT/src/grammar.json")
+  LIVE_KV=$(jq -r '.kv.live // "live"' "$ROOT/src/grammar.json")
   # CDC_<TENANT> and CDC_PUBLIC are no longer created here: the BRIDGE reconciles
   # them at boot — tenants from zebridge_user_tenants, the public subject set from
   # zebridge_catalogue. The catalogue is the config.
@@ -146,6 +147,9 @@ if [ "$FRESH_NATS" = "1" ]; then
   # object buckets are NOT pre-created here: the producer provisions them at runtime,
   # the same shape dyntenant streams have.
   nats --server "$NATS_URL" --nkey "$SEED" kv add "$GENERATIONS_KV" --history=1 --replicas=1 >/dev/null
+  # Fleet heartbeats (NOTES §10dc): last value per key, and a TTL — a client that
+  # stops beating drops out by itself. The bridge creates this too if it is missing.
+  nats --server "$NATS_URL" --nkey "$SEED" kv add "$LIVE_KV" --history=1 --ttl=90s --replicas=1 >/dev/null
   echo "[native] streams + KV buckets created"
 fi
 

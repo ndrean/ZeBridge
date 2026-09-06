@@ -39,6 +39,9 @@ pub const Options = struct {
     /// tiebreak value the bridge stores and the prefix of every msg_id, so a client
     /// that changes it loses idempotency on anything still unconfirmed.
     client_id: []const u8 = "zig-client",
+    /// Fleet heartbeat cadence (NOTES §10dc); 0 disables. The bridge's bucket TTL
+    /// defaults to three of these.
+    heartbeat_ms: u64 = 30_000,
 };
 
 const TableState = struct {
@@ -61,9 +64,9 @@ const TableState = struct {
     seed_seq: ?u64 = null,
     seed_stream: ?[]const u8 = null,
     seed_lsn: ?i64 = null,
+    /// The catalogue's seed_epoch the descriptor carried (§10df).
+    seed_epoch: i64 = 0,
 };
-
-const Held = struct { table: []const u8, ev: Value };
 
 pub const SyncClient = struct {
     a: std.mem.Allocator,
@@ -87,6 +90,8 @@ pub const SyncClient = struct {
     cdc_public: []const u8 = undefined, // cdc_streams.public
     kv_schemas: []const u8 = undefined, // kv.schemas
     kv_tenants: []const u8 = undefined, // kv.tenants
+    kv_live: []const u8 = "live", // kv.live — optional in the grammar (a bridge older than §10dc has no key)
+    last_heartbeat_ms: i64 = 0,
     kv_generations: []const u8 = undefined, // generations.kv
     gen_bucket_prefix: []const u8 = undefined, // generations.bucket_prefix
     open_tenant: []const u8 = undefined, // open_tenant
@@ -102,8 +107,6 @@ pub const SyncClient = struct {
     /// wait for `drainCdc`'s retry pass — but not the pass itself. So they get their
     /// own arena, reset after every pass: a third lifetime, between "this call" and
     /// "this client", and the only one that needs a deep copy (see `cloneValue`).
-    held_arena: std.heap.ArenaAllocator,
-    held: std.ArrayList(Held) = .empty,
     /// The HLC's two inputs (§7.2). `seen_floor` is the newest version this replica
     /// has OBSERVED (from CDC), `last_version` its own last stamp. A version is
     /// strictly after both, so a lagging clock cannot stamp under a row it has seen —
@@ -115,6 +118,13 @@ pub const SyncClient = struct {
     /// in every loop entry point — the arena is a LIFETIME, not a convenience).
     seen_floor: []const u8 = "",
     seen_floor_buf: [64]u8 = undefined,
+    /// Live schema (CLIENTS.md divergence 2, ported from the TS `watchSchemas`): a KV
+    /// watch on the schemas bucket, drained at the top of every poll, so a host that
+    /// only polls still follows a migration. Opened lazily on the first poll.
+    schema_kv: ?@import("nats").KV = null,
+    /// §10df: a descriptor arrived with a higher seed_epoch — seed on the next poll.
+    reseed_pending: bool = false,
+    schema_watch: ?@import("nats").KVWatcher = null,
     last_version: []const u8 = "",
     last_version_buf: [64]u8 = undefined,
     /// Held open across mutate/flush: a CORE subscription only delivers what arrives
@@ -156,14 +166,12 @@ pub const SyncClient = struct {
         self.* = .{
             .a = a,
             .arena = std.heap.ArenaAllocator.init(a),
-            .held_arena = std.heap.ArenaAllocator.init(a),
             .t = undefined,
             .st = undefined,
             .ro = undefined,
             .opts = opts,
         };
         errdefer self.arena.deinit();
-        errdefer self.held_arena.deinit();
 
         self.st = try storage.Storage.open(opts.db_path);
         errdefer self.st.close();
@@ -197,7 +205,6 @@ pub const SyncClient = struct {
         self.releaseHandles();
         self.ro.close();
         self.st.close();
-        self.held_arena.deinit(); // `held`'s backing array lives here too
         self.arena.deinit();
         self.a.destroy(self);
     }
@@ -207,6 +214,14 @@ pub const SyncClient = struct {
     /// `verdicts` was. (Only `deinit` calls it today; a reconnect that had to release
     /// and re-acquire this set would call the same function.)
     fn releaseHandles(self: *SyncClient) void {
+        if (self.schema_watch) |*w| {
+            w.deinit();
+            self.schema_watch = null;
+        }
+        if (self.schema_kv) |*kv| {
+            kv.deinit();
+            self.schema_kv = null;
+        }
         if (self.verdicts) |sub| {
             sub.deinit();
             self.verdicts = null;
@@ -244,6 +259,7 @@ pub const SyncClient = struct {
         self.cdc_public = try grammarString(root, &.{ "cdc_streams", "public" });
         self.kv_schemas = try grammarString(root, &.{ "kv", "schemas" });
         self.kv_tenants = try grammarString(root, &.{ "kv", "tenants" });
+        self.kv_live = grammarString(root, &.{ "kv", "live" }) catch "live";
         self.kv_generations = try grammarString(root, &.{ "generations", "kv" });
         self.gen_bucket_prefix = try grammarString(root, &.{ "generations", "bucket_prefix" });
         self.open_tenant = try grammarString(root, &.{"open_tenant"});
@@ -268,7 +284,7 @@ pub const SyncClient = struct {
 
     /// The outcome of one table's migration — what `syncSchemas` logs and what the
     /// unit test asserts.
-    pub const Migration = enum { created, unchanged, altered, rebuilt };
+    pub const Migration = enum { created, unchanged, altered, rebuilt, rekeyed, emptied };
 
     /// Bring one replica table in line with its published descriptor, deciding from
     /// the DATABASE (finding 9: `PRAGMA table_info`, `sqlite_master`), never from
@@ -308,11 +324,35 @@ pub const SyncClient = struct {
             existing = ex;
         }
 
+        // §10dg: the shape this replica BUILT — its own record, not an introspection
+        // (whose type text differs per engine). Key shape moved → re-key: the table
+        // is rebuilt EMPTY (rows keyed the old way cannot be re-keyed in place, and
+        // SQLite's INTEGER PRIMARY KEY refuses a uuid) and the caller re-seeds it.
+        // A non-key type moved → a rebuild that keeps the rows (below).
+        const key_now = try core.keyShape(a, pk, cols_v.array);
+        const type_now = try core.typeShape(a, cols_v.array);
+        try ensureShape(st);
+        const shape_rows = try st.query(a, "SELECT key_shape, type_shape FROM _zbz_shape WHERE tbl = ?", &.{.{ .text = table }});
+        const key_before: ?[]const u8 = if (shape_rows.len > 0 and shape_rows[0][0] == .text) shape_rows[0][0].text else null;
+        const type_before: ?[]const u8 = if (shape_rows.len > 0 and shape_rows[0][1] == .text) shape_rows[0][1].text else null;
+        const rekey = existing != null and key_before != null and !std.mem.eql(u8, key_before.?, key_now);
+        const retyped = (try core.retypedColumns(a, if (rekey) null else type_before, cols_v.array)).array.items;
+
         var outcome: Migration = .unchanged;
-        if (existing == null) {
+        if (existing == null or rekey) {
+            if (rekey) {
+                std.debug.print("{s}: key shape changed ({s} -> {s}) — rebuilding EMPTY\n", .{ table, key_before.?, key_now });
+                try execSql(st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS {s}_view;", .{table}));
+                try execSql(st, a, "PRAGMA foreign_keys = OFF;");
+            }
             const steps = try core.createTableSteps(a, table, cols_v.array, pk, fks.array);
             for (steps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
-            outcome = .created;
+            if (rekey) {
+                try execSql(st, a, "PRAGMA foreign_keys = ON;");
+                const vsteps = try core.viewSteps(a, table, names.items);
+                for (vsteps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+            }
+            outcome = if (rekey) .rekeyed else .created;
         } else {
             const diff = try core.diffColumns(a, existing, names.items, renamed);
             const renames = diff.object.get("renames").?.array.items;
@@ -322,7 +362,7 @@ pub const SyncClient = struct {
             const ddl_rows = try st.query(a, "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?", &.{.{ .text = table }});
             const ddl: []const u8 = if (ddl_rows.len > 0 and ddl_rows[0][0] == .text) ddl_rows[0][0].text else "";
             const fk_differs = try core.fkTextDiffers(a, ddl, fk_clauses);
-            const shape_changed = renames.len > 0 or added.len > 0 or removed.len > 0;
+            const shape_changed = renames.len > 0 or added.len > 0 or removed.len > 0 or retyped.len > 0;
 
             if (shape_changed or fk_differs) {
                 // The view goes FIRST (§1.17): DROP COLUMN re-validates every schema
@@ -342,10 +382,19 @@ pub const SyncClient = struct {
                     for (removed) |n| execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} DROP COLUMN \"{s}\";", .{ table, n.string })) catch break :blk false;
                     for (added) |n| {
                         const ty = columnType(cols_v.array, n.string) orelse "TEXT";
-                        execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} ADD COLUMN \"{s}\" {s};", .{ table, n.string, ty })) catch break :blk false;
+                        // A constant default rides along (§10df): SQLite fills the existing
+                        // rows with it, so PostgreSQL's old rows and ours converge.
+                        const dflt: []const u8 = if (columnDefault(cols_v.array, n.string)) |d| try std.fmt.allocPrint(a, " DEFAULT {s}", .{d}) else "";
+                        execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} ADD COLUMN \"{s}\" {s}{s};", .{ table, n.string, ty, dflt })) catch break :blk false;
                     }
                     // SQLite has no ALTER TABLE ADD/DROP CONSTRAINT: an FK change is a rebuild.
                     if (fk_differs) break :blk false;
+                    // Nor ALTER COLUMN TYPE (§10dg): a re-typed column is a rebuild that
+                    // copies the rows — affinity converts what converts.
+                    if (retyped.len > 0) {
+                        std.debug.print("{s}: {d} column(s) re-typed — rebuilding, rows kept\n", .{ table, retyped.len });
+                        break :blk false;
+                    }
                     break :blk true;
                 };
                 if (!altered) {
@@ -354,9 +403,28 @@ pub const SyncClient = struct {
                     // salaries' FK). Off for the surgery, on after — data is copied.
                     try execSql(st, a, "PRAGMA foreign_keys = OFF;");
                     const steps = try core.rebuildSteps(a, table, cols_v.array, pk, fks.array, existing.?);
-                    for (steps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+                    const carried = blk: {
+                        for (steps.array.items) |stp| {
+                            const sql = stp.object.get("sql").?.string;
+                            execSql(st, a, sql) catch {
+                                std.debug.print("{s}: rows could not be carried through the rebuild ({s}) at: {s}\n", .{ table, st.errMsg(), sql });
+                                break :blk false;
+                            };
+                        }
+                        break :blk true;
+                    };
+                    if (!carried) {
+                        // §10dg: a migration that cannot carry the rows degrades to a
+                        // re-seed, never to a table stuck in its old shape — measured on
+                        // a re-key: the parent stood empty (waiting for its full) while
+                        // the child's copy hit its FOREIGN KEY. Empty now; the caller
+                        // drops the watermark and the next full brings the rows back.
+                        try execSql(st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}__migrating\";", .{table}));
+                        const fresh = try core.createTableSteps(a, table, cols_v.array, pk, fks.array);
+                        for (fresh.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+                    }
                     try execSql(st, a, "PRAGMA foreign_keys = ON;");
-                    outcome = .rebuilt;
+                    outcome = if (carried) .rebuilt else .emptied;
                 }
                 const vsteps = try core.viewSteps(a, table, names.items);
                 for (vsteps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
@@ -367,6 +435,9 @@ pub const SyncClient = struct {
         const plan = try indexPlan(st, a, table, idx.array);
         for (plan.object.get("drops").?.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
         for (plan.object.get("creates").?.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
+        // The shape record, on every path (§10dg) — including the first sight, so the
+        // NEXT descriptor has something to be compared with.
+        _ = try st.query(a, "INSERT INTO _zbz_shape (tbl, key_shape, type_shape) VALUES (?, ?, ?) ON CONFLICT(tbl) DO UPDATE SET key_shape = excluded.key_shape, type_shape = excluded.type_shape", &.{ .{ .text = table }, .{ .text = key_now }, .{ .text = type_now } });
         return outcome;
     }
 
@@ -387,6 +458,17 @@ pub const SyncClient = struct {
         const cols = sq.object.get("columns") orelse return null;
         if (cols != .array) return null;
         return cols;
+    }
+
+    fn columnDefault(cols: std.json.Array, name: []const u8) ?[]const u8 {
+        for (cols.items) |c| {
+            if (c != .object) continue;
+            const n = c.object.get("name") orelse continue;
+            if (n != .string or !std.mem.eql(u8, n.string, name)) continue;
+            const d = c.object.get("default") orelse return null;
+            return if (d == .string and d.string.len > 0) d.string else null;
+        }
+        return null;
     }
 
     fn columnType(cols: std.json.Array, name: []const u8) ?[]const u8 {
@@ -415,63 +497,166 @@ pub const SyncClient = struct {
                 continue;
             };
             const val = (try std.json.parseFromSlice(Value, a, bytes, .{})).value;
-
-            const outcome = migrateTable(&self.st, a, table, val) catch |err| switch (err) {
-                error.SchemaUnusable => {
-                    // Suspended (no primary key, or unrouted — §5) or malformed: the
-                    // table stays as it is locally, and stays out of `states` if it was
-                    // never usable, so no CDC event is applied against a missing table.
-                    const why = if (val == .object) (val.object.get("suspended") orelse Value{ .null = {} }) else Value{ .null = {} };
-                    std.debug.print("{s}: schema unusable ({s}) — skipped\n", .{ table, if (why == .string) why.string else "no columns" });
-                    continue;
-                },
-                else => return err,
-            };
-            if (outcome != .unchanged) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
-
-            const pk = try jsonStrList(a, val.object.get("pk_columns"));
-            const cols_v = descriptorColumns(val).?; // checked by migrateTable above
-            var names: std.ArrayList([]const u8) = .empty;
-            for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
-            const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
-            const version_col: ?[]const u8 = if (val.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
-            const tombstone_col: ?[]const u8 = if (val.object.get("tombstone_column")) |v| (if (v == .string) v.string else null) else null;
-
-            if (self.states.getPtr(table)) |st| {
-                if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) continue;
-            }
-            // Changed, or first time: into the client-lifetime arena.
-            const ca = self.aa();
-            const route = if (tenant_col != null)
-                try std.fmt.allocPrint(ca, "{s}{s}", .{ self.cdc_prefix, self.tenant })
-            else
-                self.cdc_public;
-            const shared_route: ?[]const u8 = if (tenant_col != null) self.cdc_public else null;
-            const fresh: TableState = .{
-                .pk = try dupeStrings(ca, pk),
-                .cols = try dupeStrings(ca, names.items),
-                .version_col = if (version_col) |v| try ca.dupe(u8, v) else null,
-                .tenant_col = if (tenant_col) |v| try ca.dupe(u8, v) else null,
-                .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
-                .route = route,
-                .shared_route = shared_route,
-            };
-            if (self.states.getPtr(table)) |st| {
-                // In place: the seed gate (`seed_seq/seed_stream/seed_lsn`) belongs to
-                // the replica's history, not to the descriptor, and survives a migration.
-                st.pk = fresh.pk;
-                st.cols = fresh.cols;
-                st.version_col = fresh.version_col;
-                st.tenant_col = fresh.tenant_col;
-                st.tombstone_col = fresh.tombstone_col;
-                st.route = fresh.route;
-                st.shared_route = fresh.shared_route;
-            } else {
-                try self.states.put(ca, try ca.dupe(u8, table), fresh);
-            }
+            try self.applyDescriptor(a, table, val);
         }
         try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
-        try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER)");
+        try ensureInbox(&self.st);
+        try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0)");
+        try ensureShape(&self.st);
+        self.st.execSimple("ALTER TABLE _zbz_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0") catch {}; // a replica from before §10df
+        // A schema that just moved may be what a held event was waiting for.
+        self.retryHeld();
+    }
+
+    /// One descriptor onto one table: migrate the physical table and refresh the
+    /// TableState — or, on a tombstone, drop the local table (the TS `dropLocalTable`).
+    /// Shared by `syncSchemas` (every table, on sync) and `drainSchemaWatch` (whatever
+    /// moved, on poll).
+    fn applyDescriptor(self: *SyncClient, a: std.mem.Allocator, table: []const u8, val: Value) !void {
+        const outcome = migrateTable(&self.st, a, table, val) catch |err| switch (err) {
+            error.SchemaUnusable => {
+                // Suspended (no primary key, or unrouted — §5) or malformed: the
+                // table stays as it is locally, and stays out of `states` if it was
+                // never usable, so no CDC event is applied against a missing table.
+                const why = if (val == .object) (val.object.get("suspended") orelse Value{ .null = {} }) else Value{ .null = {} };
+                std.debug.print("{s}: schema unusable ({s}) — skipped\n", .{ table, if (why == .string) why.string else "no columns" });
+                // Dropped upstream: whatever was held for it will never find a parent.
+                const dropped = if (val == .object) (val.object.get("dropped") orelse Value{ .null = {} }) else Value{ .null = {} };
+                if (dropped == .bool and dropped.bool) try self.dropLocalTable(a, table);
+                return;
+            },
+            else => return err,
+        };
+        if (outcome != .unchanged) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
+        if (outcome == .rekeyed or outcome == .emptied) {
+            // §10dg: the rows are gone (with the old key, or because the rebuild could
+            // not carry them); so is everything that referred to them — the watermark
+            // (the next gap check seeds a fresh full) and the events held for the
+            // table (keyed the old way, they can never apply).
+            _ = try self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
+            pruneInboxDropped(&self.st, a, table) catch {};
+            self.reseed_pending = true;
+            std.debug.print("{s}: re-keyed — watermark dropped, re-seeding from a fresh full\n", .{table});
+        }
+
+        const pk = try jsonStrList(a, val.object.get("pk_columns"));
+        const cols_v = descriptorColumns(val).?; // checked by migrateTable above
+        var names: std.ArrayList([]const u8) = .empty;
+        for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
+        const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
+        const version_col: ?[]const u8 = if (val.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
+        const tombstone_col: ?[]const u8 = if (val.object.get("tombstone_column")) |v| (if (v == .string) v.string else null) else null;
+        const seed_epoch: i64 = if (val.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
+
+        if (self.states.getPtr(table)) |st| {
+            // §10df first: a republished descriptor is usually UNCHANGED in shape — the
+            // epoch is the whole message, and it must not be lost to the shortcut below.
+            st.seed_epoch = seed_epoch;
+            try self.reseedIfEpochMoved(a, table, seed_epoch);
+            if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) return;
+        }
+        // Changed, or first time: into the client-lifetime arena.
+        const ca = self.aa();
+        const route = if (tenant_col != null)
+            try std.fmt.allocPrint(ca, "{s}{s}", .{ self.cdc_prefix, self.tenant })
+        else
+            self.cdc_public;
+        const shared_route: ?[]const u8 = if (tenant_col != null) self.cdc_public else null;
+        const fresh: TableState = .{
+            .pk = try dupeStrings(ca, pk),
+            .cols = try dupeStrings(ca, names.items),
+            .version_col = if (version_col) |v| try ca.dupe(u8, v) else null,
+            .tenant_col = if (tenant_col) |v| try ca.dupe(u8, v) else null,
+            .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
+            .route = route,
+            .shared_route = shared_route,
+            .seed_epoch = seed_epoch,
+        };
+        if (self.states.getPtr(table)) |st| {
+            // In place: the seed gate (`seed_seq/seed_stream/seed_lsn`) belongs to
+            // the replica's history, not to the descriptor, and survives a migration.
+            st.pk = fresh.pk;
+            st.cols = fresh.cols;
+            st.version_col = fresh.version_col;
+            st.tenant_col = fresh.tenant_col;
+            st.tombstone_col = fresh.tombstone_col;
+            st.route = fresh.route;
+            st.shared_route = fresh.shared_route;
+            st.seed_epoch = fresh.seed_epoch;
+        } else {
+            try self.states.put(ca, try ca.dupe(u8, table), fresh);
+            // Born under the live watch (enabled after this client connected): it has
+            // no watermark and nothing asked for its seed — the next poll does.
+            self.reseed_pending = true;
+        }
+    }
+
+    /// §10df: the descriptor's seed_epoch is above the one this replica seeded at —
+    /// zebridge_reseed() ran upstream. Forget the watermark; `gapAndSeed` (next sync,
+    /// or the end of this poll's schema drain) seeds a fresh full.
+    fn reseedIfEpochMoved(self: *SyncClient, a: std.mem.Allocator, table: []const u8, epoch: i64) !void {
+        const rows = self.st.query(a, "SELECT seed_epoch FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch return;
+        if (rows.len == 0) {
+            // Never seeded (no chain at connect, or one the replica could not use):
+            // nothing to drop, but the next poll must ask again — measured: a table
+            // following CDC unseeded stayed that way through an epoch move.
+            self.reseed_pending = true;
+            return;
+        }
+        const stored: i64 = if (rows[0][0] == .integer) rows[0][0].integer else 0;
+        if (stored >= epoch) return;
+        _ = try self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
+        std.debug.print("{s}: seed epoch {d} -> {d} (zebridge_reseed) — watermark dropped, re-seeding from a fresh full\n", .{ table, stored, epoch });
+        self.reseed_pending = true;
+    }
+
+    /// The table is gone upstream: drop it here, forget its state, discard what was
+    /// held for it (the TS `dropLocalTable`). Stale rows must not stay readable as
+    /// if they were live.
+    fn dropLocalTable(self: *SyncClient, a: std.mem.Allocator, table: []const u8) !void {
+        pruneInboxDropped(&self.st, a, table) catch {};
+        try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS \"{s}_view\";", .{table}));
+        try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}\";", .{table}));
+        _ = self.states.orderedRemove(table);
+        std.debug.print("{s}: dropped locally — the table was dropped upstream\n", .{table});
+    }
+
+    /// Drain the schemas watch: every descriptor that changed since the last poll,
+    /// applied through the same path `sync()` uses. Non-blocking (1 ms). Opens the
+    /// watch on first use — after the grammar named the bucket.
+    fn drainSchemaWatch(self: *SyncClient) !void {
+        if (self.schema_watch == null) {
+            self.schema_kv = try self.t.js.kvBucket(self.kv_schemas);
+            self.schema_watch = try self.schema_kv.?.watchAll(.{ .updates_only = true });
+        }
+        var sa = std.heap.ArenaAllocator.init(self.a);
+        defer sa.deinit();
+        const a = sa.allocator();
+        var moved: usize = 0;
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } };
+        while (true) {
+            var entry = (self.schema_watch.?.next(t) catch |err| switch (err) {
+                error.Timeout => break,
+                else => return err,
+            }) orelse break;
+            defer entry.deinit();
+            const mine = for (self.opts.tables) |tb| {
+                if (std.mem.eql(u8, tb, entry.key)) break true;
+            } else false;
+            if (!mine or entry.isDeleted()) continue;
+            const val = std.json.parseFromSliceLeaky(Value, a, entry.value, .{}) catch continue;
+            const key = try a.dupe(u8, entry.key);
+            self.applyDescriptor(a, key, val) catch |err| {
+                std.debug.print("{s}: live schema not applied: {s}\n", .{ key, @errorName(err) });
+                continue;
+            };
+            moved += 1;
+        }
+        if (moved > 0) self.retryHeld();
+        if (self.reseed_pending) {
+            self.reseed_pending = false;
+            self.gapAndSeed() catch |err| std.debug.print("re-seed after epoch move: {s}\n", .{@errorName(err)});
+        }
     }
 
     /// DDL steps from core carry no params (unlike the DML plans `stepExec` runs).
@@ -489,8 +674,7 @@ pub const SyncClient = struct {
     fn storedSeq(self: *SyncClient, stream: []const u8) !u64 {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
-        const rows = try self.st.query(qa.allocator(),
-            "SELECT last_seq FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }});
+        const rows = try self.st.query(qa.allocator(), "SELECT last_seq FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }});
         if (rows.len == 0) return 0;
         return @intCast(rows[0][0].integer);
     }
@@ -498,9 +682,7 @@ pub const SyncClient = struct {
     fn persistSeq(self: *SyncClient, stream: []const u8, seq: u64) !void {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
-        _ = try self.st.query(qa.allocator(),
-            "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq",
-            &.{ .{ .text = stream }, .{ .integer = @intCast(seq) } });
+        _ = try self.st.query(qa.allocator(), "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq", &.{ .{ .text = stream }, .{ .integer = @intCast(seq) } });
     }
 
     fn effTenant(self: *SyncClient, table: []const u8) []const u8 {
@@ -563,11 +745,27 @@ pub const SyncClient = struct {
             const st = self.states.get(table) orelse continue;
             // ⚠️ `try`, not "treat a failed read as never seeded": that would answer a
             // locked database with a full re-seed (the same trap as `storedSeq`).
-            const seeded = (try self.st.query(a,
-                "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }})).len > 0;
+            const seeded = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }})).len > 0;
             const shared_gapped = if (st.shared_route) |sr| gapped.contains(sr) else false;
             if (gapped.contains(st.route) or shared_gapped or !seeded) {
-                try self.applyChain(table);
+                // One table's failure is one table's failure (the TS rule): the rest
+                // still seed, and the next poll's gap check retries this one.
+                self.applyChain(table) catch |err| {
+                    std.debug.print("{s}: seeding failed: {s} — retried at the next poll\n", .{ table, @errorName(err) });
+                    continue;
+                };
+            }
+        }
+        // §10dg: whatever kept a table unseeded — no chain yet, a chain that predates
+        // the replica or the re-seed, a shape the replica lacks, a failed step — the
+        // next poll asks again. Unseeded is not synced (the TS rule), and a poll loop
+        // that never re-asks would follow CDC on an empty table forever.
+        for (self.opts.tables) |table| {
+            if (self.states.get(table) == null) continue;
+            const seeded_now = (self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch continue).len > 0;
+            if (!seeded_now) {
+                self.reseed_pending = true;
+                break;
             }
         }
         const orphans = try self.st.query(a, "PRAGMA foreign_key_check;", &.{});
@@ -645,8 +843,19 @@ pub const SyncClient = struct {
         };
         const man = (try std.json.parseFromSlice(Value, a, man_bytes, .{})).value;
 
-        const wm_rows = try self.st.query(a,
-            "SELECT watermark FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
+        // §10df: a manifest built BEFORE the re-seed was asked for cannot serve it —
+        // seeding from it would record the new epoch over the old data. The descriptor
+        // (the epoch we hold) and the producer's full arrive on independent clocks;
+        // wait for the manifest to catch up, retried on the next poll or sync.
+        const man_epoch: i64 = if (man.object.get("seed_epoch")) |v| (if (v == .integer) v.integer else 0) else 0;
+        const want_epoch: i64 = if (self.states.get(table)) |s0| s0.seed_epoch else 0;
+        if (man_epoch < want_epoch) {
+            std.debug.print("{s}: chain g{d} predates the re-seed (epoch {d} < {d}) — waiting for the producer's full\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, man_epoch, want_epoch });
+            self.reseed_pending = true;
+            return;
+        }
+
+        const wm_rows = try self.st.query(a, "SELECT watermark FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
         const watermark: ?[]const u8 = if (wm_rows.len > 0 and wm_rows[0][0] == .text) wm_rows[0][0].text else null;
 
         const plan = try core.planFromManifest(a, man, watermark);
@@ -685,10 +894,24 @@ pub const SyncClient = struct {
             };
             const blob = try maybeZstd(step_a, raw, dict); // §10w: magic-sniffed, mixed chains fine
             const doc = try decodeMsgpack(step_a, blob);
+            // A chain object that is not the shape the producer writes (a corrupt or
+            // foreign object under the name) is an ERROR the host sees — never a union
+            // access that kills the host process (measured: five stray bytes decoded
+            // as an integer, then read as an object).
+            if (doc != .object) return error.ChainObjectMalformed;
+            const rows_v = doc.object.get("rows") orelse return error.ChainObjectMalformed;
+            if (rows_v != .array) return error.ChainObjectMalformed;
             const cols = try jsonStrList(step_a, doc.object.get("columns"));
+            // §10dg: a chain object built from an OLDER shape names columns this table
+            // no longer has (a table dropped and reborn under its name, a DROP/RENAME
+            // the producer has not rebuilt for yet). Not an error: wait for its full.
+            for (cols) |col| if (!contains(st.cols, col)) {
+                std.debug.print("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full\n", .{ table, step.object.get("name").?.string, col });
+                return;
+            };
             const vcol_v = doc.object.get("version_column") orelse (man.object.get("version_column") orelse @as(Value, .null));
             const vcol: ?[]const u8 = if (vcol_v == .string and contains(cols, vcol_v.string)) vcol_v.string else null;
-            const rows = doc.object.get("rows").?.array;
+            const rows = rows_v.array;
             const cs = ChainStep{
                 .client = self,
                 .a = step_a,
@@ -704,7 +927,7 @@ pub const SyncClient = struct {
                 // The SQLite text is the only thing that distinguishes a bad row from
                 // a bad schema; a bare StepFailed here cost a run to find out which.
                 std.debug.print("{s}: chain step {s} ({s}, {d} rows) rolled back: {any}\n", .{
-                    table, step.object.get("name").?.string, if (cs.is_full) "full" else "delta",
+                    table,          step.object.get("name").?.string, if (cs.is_full) "full" else "delta",
                     rows.items.len, err,
                 });
                 return err;
@@ -731,9 +954,10 @@ pub const SyncClient = struct {
                 self.seen_floor = self.seen_floor_buf[0..floor.len];
             }
         }
-        _ = try self.st.query(a,
-            "INSERT INTO _zbz_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?) ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn",
-            &.{ .{ .text = table }, .{ .text = cv }, .{ .integer = st.seed_lsn orelse 0 } });
+        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?) ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch", &.{ .{ .text = table }, .{ .text = cv }, .{ .integer = st.seed_lsn orelse 0 }, .{ .integer = st.seed_epoch } });
+        // A held event at or below the seed's LSN is inside the chain just applied:
+        // superseded, not waiting (the TS client's pruneInboxSeeded).
+        try pruneInboxSeeded(&self.st, a, table, st.seed_lsn orelse 0);
         std.debug.print("{s}: seeded {d} row(s) from chain g{d}\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0 });
     }
 
@@ -771,21 +995,44 @@ pub const SyncClient = struct {
     }
 
     /// FK hold/retry (§10h): one bulk retry pass after every stream had its turn.
+    /// The inbox is the truth (the TS client's `_zebridge_inbox`, ported — CLIENTS.md):
+    /// every held event lives in `_zbz_inbox` from the batch that held it until the
+    /// retry that lands it. Still missing its parent → attempts + 1, next pass. Any
+    /// other failure → dropped, loudly: an event that can never apply must not sit
+    /// forever pretending it will.
     fn retryHeld(self: *SyncClient) void {
+        var ra = std.heap.ArenaAllocator.init(self.a);
+        defer ra.deinit();
+        const a = ra.allocator();
+        const rows = self.st.query(a, "SELECT id, tbl, ev FROM _zbz_inbox ORDER BY id", &.{}) catch return;
+        if (rows.len == 0) return;
         var resolved: usize = 0;
-        for (self.held.items) |h| {
-            if (self.applyEvent(h.table, h.ev, 0)) |_| {
+        var dropped: usize = 0;
+        for (rows) |r| {
+            const id = r[0];
+            const table = r[1].text;
+            const ev = std.json.parseFromSliceLeaky(Value, a, r[2].text, .{}) catch {
+                _ = self.st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{id}) catch {};
+                dropped += 1;
+                continue;
+            };
+            if (self.applyEvent(table, ev, 0)) |_| {
+                _ = self.st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{id}) catch {};
                 resolved += 1;
-            } else |_| {}
+            } else |err| switch (err) {
+                error.FkHeld, error.SchemaBehind => {
+                    _ = self.st.query(a, "UPDATE _zbz_inbox SET attempts = attempts + 1 WHERE id = ?", &.{id}) catch {};
+                },
+                else => {
+                    std.debug.print("DROPPED held event on {s}: {s}\n", .{ table, @errorName(err) });
+                    _ = self.st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{id}) catch {};
+                    dropped += 1;
+                },
+            }
         }
-        if (self.held.items.len > 0) {
-            std.debug.print("fk held: {d}, resolved on retry: {d}\n", .{ self.held.items.len, resolved });
+        if (resolved > 0 or dropped > 0) {
+            std.debug.print("fk held: {d}, applied on retry: {d}, dropped: {d}, still waiting: {d}\n", .{ rows.len, resolved, dropped, rows.len - resolved - dropped });
         }
-        // The pass is over: drop the list AND its events in one reset. The list's
-        // backing array lives in the same arena, so it must be re-zeroed, not
-        // `clearRetainingCapacity`'d — that would keep a pointer into reset memory.
-        self.held = .empty;
-        _ = self.held_arena.reset(.retain_capacity);
     }
 
     /// A pull consumer on `stream` positioned just past the stored sequence, named
@@ -869,7 +1116,7 @@ pub const SyncClient = struct {
     /// `applyEvent` (applied, gated or held — D1: all three ARE the position).
     fn applyBatch(self: *SyncClient, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, last: u64, max_seq: *u64) !usize {
         // Per-batch: every decoded event dies with the batch, except the FK-held
-        // ones, which are deep-copied into `held_arena` below.
+        // ones, which are held DURABLY in `_zbz_inbox` below (§10de finding 1).
         var ba = std.heap.ArenaAllocator.init(self.a);
         defer ba.deinit();
 
@@ -890,7 +1137,6 @@ pub const SyncClient = struct {
             max_seq: *u64,
             offered: *usize,
             fn apply(cx: @This(), st_: *storage.Storage) !void {
-                _ = st_;
                 for (cx.messages) |m| {
                     const seq = m.metadata.sequence.stream;
                     const doc = decodeMsgpack(cx.a, m.msg.data) catch continue;
@@ -903,11 +1149,17 @@ pub const SyncClient = struct {
                         cx.client.applyEvent(table, ev, seq) catch |err| switch (err) {
                             // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
                             // event that is acked, positioned past, and never applied.
-                            error.FkHeld => {
-                                const ha = cx.client.held_arena.allocator();
-                                try cx.client.held.append(ha, .{ .table = try ha.dupe(u8, table), .ev = try cloneValue(ha, ev) });
-                            },
-                            else => {},
+                            // Held DURABLY, in this batch's transaction (CLIENTS.md, §10de
+                            // finding 1): the position below is persisted past this event,
+                            // so the inbox is the only thing that remembers it — a host
+                            // killed before the retry lands must not lose the row.
+                            error.FkHeld => try holdEvent(st_, cx.a, table, ev, "missing-parent"),
+                            error.SchemaBehind => try holdEvent(st_, cx.a, table, ev, "unknown-column"),
+                            // Anything else is an event acked, positioned past and never
+                            // applied — it must at least be SAID (measured: a child born
+                            // under the schema watch lost its first three rows to this
+                            // arm in silence). The SQLite text names the real cause.
+                            else => |e| std.debug.print("{s}: event at seq {d} not applied: {s} — sqlite: {s}\n", .{ table, seq, @errorName(e), st_.errMsg() }),
                         };
                     }
                     if (seq > cx.max_seq.*) cx.max_seq.* = seq;
@@ -980,6 +1232,8 @@ pub const SyncClient = struct {
     }
 
     pub fn poll(self: *SyncClient, wait_ms: u64) !PollReport {
+        // Schema first: a row in a new shape must find its table already moved.
+        self.drainSchemaWatch() catch |err| std.debug.print("schema watch: {s}\n", .{@errorName(err)});
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const streams = try self.cdcStreams(ca.allocator());
@@ -1026,6 +1280,7 @@ pub const SyncClient = struct {
         }
         if (applied > 0) self.retryHeld();
         const settled = try self.drainVerdictsWith(0, 1);
+        self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
         return .{ .applied = applied, .settled = settled };
     }
 
@@ -1042,6 +1297,22 @@ pub const SyncClient = struct {
         const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
         const data = ev.object.get("data") orelse return;
         if (data != .object) return;
+
+        // A column this table does not have yet: the row is newer than the schema
+        // (a migration whose descriptor has not reached us). Held — durably, in the
+        // inbox — never dropped, never upserted into the wrong shape (the TS client's
+        // unknown-column hold, CLIENTS.md divergence 2).
+        if (!std.mem.eql(u8, op, "DELETE")) {
+            var kit = data.object.iterator();
+            while (kit.next()) |e| {
+                const k = e.key_ptr.*;
+                if (std.mem.startsWith(u8, k, "old.")) continue;
+                const known = for (st.cols) |c| {
+                    if (std.mem.eql(u8, c, k)) break true;
+                } else false;
+                if (!known) return error.SchemaBehind;
+            }
+        }
 
         var ta = std.heap.ArenaAllocator.init(self.a);
         defer ta.deinit();
@@ -1190,8 +1461,8 @@ pub const SyncClient = struct {
             \\VALUES (?,?,?,?,?,?,?,0)
             \\ON CONFLICT(msg_id) DO UPDATE SET attempts = _zebridge_outbox.attempts + 1
         , &.{
-            .{ .text = msg_id }, .{ .text = subject }, .{ .text = payload_json },
-            .{ .text = table },  .{ .text = row_id },  before_json,
+            .{ .text = msg_id },         .{ .text = subject }, .{ .text = payload_json },
+            .{ .text = table },          .{ .text = row_id },  before_json,
             .{ .integer = nowMillis() },
         });
 
@@ -1223,8 +1494,7 @@ pub const SyncClient = struct {
         defer ca.deinit();
         const a = ca.allocator();
         try self.ensureOutbox();
-        const rows = try self.st.query(a,
-            "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox ORDER BY created_at", &.{});
+        const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox ORDER BY created_at", &.{});
         if (rows.len == 0) return 0;
 
         // ⚠️ Gated ONCE, before the first publish — one read of the watermark for the
@@ -1276,8 +1546,7 @@ pub const SyncClient = struct {
                     "outbox: {s}[{s}] {s} predates the GC watermark ({s}) and CANNOT be sent — " ++
                         "its tombstone was reaped, so sending it would resurrect a deleted row " ++
                         "(PROTOCOL MUST 6). Local copy reverted; this edit is lost.\n",
-                    .{ if (r[3] == .text) r[3].text else "?", if (r[4] == .text) r[4].text else "?",
-                       msg_id, watermark orelse "?" },
+                    .{ if (r[3] == .text) r[3].text else "?", if (r[4] == .text) r[4].text else "?", msg_id, watermark orelse "?" },
                 );
                 continue;
             }
@@ -1302,9 +1571,7 @@ pub const SyncClient = struct {
         const status = if (v == .object) (if (v.object.get("status")) |x| (if (x == .string) x.string else "") else "") else "";
         if (std.mem.eql(u8, status, "failed")) return false;
         if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
-            const rows = try self.st.query(a,
-                "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?",
-                &.{.{ .text = mid }});
+            const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
             if (rows.len == 1) try self.revertOptimistic(a, rows[0]);
         }
         // `stale` deliberately does NOT revert: the authoritative row is already on its
@@ -1462,6 +1729,27 @@ pub const SyncClient = struct {
         }
     }
 
+    /// Fleet observability (NOTES §10dc): once per `heartbeat_ms`, publish this client's
+    /// applied position per CDC stream to `$KV.<live>.<tenant>.<principal>` — last value
+    /// per key, TTL on the bucket, so a client that stops beating simply goes stale. The
+    /// bridge reads the bucket on its own cadence and turns head − applied into lag.
+    /// Cooperative: a failed beat is printed and retried on the next turn, never fatal.
+    fn heartbeatIfDue(self: *SyncClient) !void {
+        if (self.opts.heartbeat_ms == 0 or self.tenant.len == 0) return;
+        const now = nowMillis();
+        if (self.last_heartbeat_ms != 0 and now - self.last_heartbeat_ms < @as(i64, @intCast(self.opts.heartbeat_ms))) return;
+        var ha = std.heap.ArenaAllocator.init(self.a);
+        defer ha.deinit();
+        const a = ha.allocator();
+        const streams = try self.cdcStreams(a);
+        const seqs = try a.alloc(u64, streams.len);
+        for (streams, 0..) |s, i| seqs[i] = try self.storedSeq(s);
+        const payload = try core.heartbeatPayload(a, self.opts.principal, self.tenant, now, streams, seqs);
+        const subject = try std.fmt.allocPrint(a, "$KV.{s}.{s}.{s}", .{ self.kv_live, self.tenant, self.opts.principal });
+        try self.t.publish(subject, payload, null);
+        self.last_heartbeat_ms = now;
+    }
+
     fn publishEnvelope(self: *SyncClient, a: std.mem.Allocator, subject: []const u8, payload: Value, msg_id: []const u8) !void {
         const bytes = try encodeMsgpack(a, payload);
         try self.t.publish(subject, bytes, msg_id);
@@ -1519,6 +1807,8 @@ pub const SyncClient = struct {
         try self.syncSchemas();
         try self.gapAndSeed();
         try self.drainCdc();
+        // A host that syncs before it ever polls is a client too (PROTOCOL §9).
+        self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
         return .{ .tenant = self.tenant, .first = first };
     }
 
@@ -1564,16 +1854,89 @@ fn grammarMissing(path: []const []const u8) error{GrammarKeyMissing} {
     return error.GrammarKeyMissing;
 }
 
+/// `_zbz_inbox` — held child-before-parent events, durable (CLIENTS.md, §10de finding 1).
+/// Same shape as the TS client's `_zebridge_inbox`; standalone on `Storage` so a test
+/// needs no NATS and no client.
+/// §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
+/// the record a re-key or a re-type is detected against.
+pub fn ensureShape(st: *storage.Storage) !void {
+    try st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_shape (tbl TEXT PRIMARY KEY, key_shape TEXT NOT NULL, type_shape TEXT NOT NULL)");
+}
+
+pub fn ensureInbox(st: *storage.Storage) !void {
+    try st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, lsn INTEGER NOT NULL, ev TEXT NOT NULL, reason TEXT NOT NULL, held_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)");
+    try st.execSimple("CREATE INDEX IF NOT EXISTS _zbz_inbox_tbl ON _zbz_inbox (tbl, lsn)");
+}
+
+pub fn holdEvent(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, ev: Value, reason: []const u8) !void {
+    const lsn: i64 = if (ev == .object) (if (ev.object.get("lsn")) |v| (if (v == .integer) v.integer else 0) else 0) else 0;
+    const json = try core.valueToString(a, ev);
+    _ = try st.query(a, "INSERT INTO _zbz_inbox (tbl, lsn, ev, reason, held_at) VALUES (?, ?, ?, ?, ?)", &.{
+        .{ .text = table }, .{ .integer = lsn }, .{ .text = json }, .{ .text = reason }, .{ .integer = nowMillis() },
+    });
+}
+
+pub fn pruneInboxSeeded(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, watermark_lsn: i64) !void {
+    _ = try st.query(a, "DELETE FROM _zbz_inbox WHERE tbl = ? AND lsn <= ?", &.{ .{ .text = table }, .{ .integer = watermark_lsn } });
+}
+
+pub fn pruneInboxDropped(st: *storage.Storage, a: std.mem.Allocator, table: []const u8) !void {
+    const q = try st.query(a, "SELECT count(*) FROM _zbz_inbox WHERE tbl = ?", &.{.{ .text = table }});
+    const k: i64 = if (q.len > 0 and q[0][0] == .integer) q[0][0].integer else 0;
+    if (k > 0) std.debug.print("{s}: discarding {d} held event(s) — the table was dropped upstream\n", .{ table, k });
+    _ = try st.query(a, "DELETE FROM _zbz_inbox WHERE tbl = ?", &.{.{ .text = table }});
+}
+
+test "inbox: a held event survives closing the database, and a seed past it prunes it" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa_ = arena.allocator();
+    const path = "/tmp/zb-inbox-test.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    const ev = (try std.json.parseFromSlice(Value, aa_,
+        \\{"table":"child","operation":"INSERT","lsn":10,"data":{"uid":"c1","parent_id":"p1"}}
+    , .{})).value;
+    {
+        var st = try storage.Storage.open(path);
+        defer st.close();
+        try ensureInbox(&st);
+        try holdEvent(&st, aa_, "child", ev, "missing-parent");
+    }
+    // The host died here. A fresh open still holds the row.
+    var st = try storage.Storage.open(path);
+    defer st.close();
+    try ensureInbox(&st);
+    var rows = try st.query(aa_, "SELECT tbl, lsn, reason FROM _zbz_inbox", &.{});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("child", rows[0][0].text);
+    try std.testing.expectEqual(@as(i64, 10), rows[0][1].integer);
+    // A chain seeded short of it leaves it; one seeded past it supersedes it.
+    try pruneInboxSeeded(&st, aa_, "child", 9);
+    rows = try st.query(aa_, "SELECT id FROM _zbz_inbox", &.{});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try pruneInboxSeeded(&st, aa_, "child", 10);
+    rows = try st.query(aa_, "SELECT id FROM _zbz_inbox", &.{});
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+    // Dropped upstream: discarded.
+    try holdEvent(&st, aa_, "child", ev, "missing-parent");
+    try pruneInboxDropped(&st, aa_, "child");
+    rows = try st.query(aa_, "SELECT id FROM _zbz_inbox", &.{});
+    try std.testing.expectEqual(@as(usize, 0), rows.len);
+}
+
 test "grammar: a missing key fails naming its path, never a silent default" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const ok = try std.json.parseFromSlice(Value, a, \\{"kv":{"schemas":"schemas"}}
+    const ok = try std.json.parseFromSlice(Value, a,
+        \\{"kv":{"schemas":"schemas"}}
     , .{});
     try std.testing.expectEqualStrings("schemas", try grammarString(ok.value, &.{ "kv", "schemas" }));
     try std.testing.expectError(error.GrammarKeyMissing, grammarString(ok.value, &.{ "kv", "tenants" }));
     try std.testing.expectError(error.GrammarKeyMissing, grammarString(ok.value, &.{"open_tenant"}));
-    const empty = try std.json.parseFromSlice(Value, a, \\{"open_tenant":""}
+    const empty = try std.json.parseFromSlice(Value, a,
+        \\{"open_tenant":""}
     , .{});
     try std.testing.expectError(error.GrammarKeyMissing, grammarString(empty.value, &.{"open_tenant"}));
 }
@@ -1698,7 +2061,7 @@ fn encodeMsgpack(a: std.mem.Allocator, v: Value) ![]const u8 {
 }
 
 /// Deep copy of a Value into `a` — for the one case where a Value must outlive the
-/// arena it was decoded into (an FK-held event, see `held_arena`).
+/// arena it was decoded into (an FK-held event, before the inbox made holds durable).
 /// ⚠️ The error set is explicit because the function is recursive (as `jsonToMsgpack`).
 fn cloneValue(a: std.mem.Allocator, v: Value) error{OutOfMemory}!Value {
     return switch (v) {
@@ -1759,8 +2122,9 @@ fn nowWireIso(a: std.mem.Allocator) ![]const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
-        yd.year, md.month.numeric(), @as(u32, md.day_index) + 1,
-        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(), micros,
+        yd.year,              md.month.numeric(),      @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        micros,
     });
 }
 
@@ -1891,7 +2255,8 @@ test "msgpack encode/decode roundtrip allocates only what it writes" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const src = try std.json.parseFromSlice(Value, a, \\{"key":{"uid":"u1"},"version":"2026-01-01T00:00:00.000000Z","n":[1,2,3]}
+    const src = try std.json.parseFromSlice(Value, a,
+        \\{"key":{"uid":"u1"},"version":"2026-01-01T00:00:00.000000Z","n":[1,2,3]}
     , .{});
     const bytes = try encodeMsgpack(a, src.value);
     // The old fixed buffer was 1 MiB per call; the envelope is well under 100 bytes.
@@ -1928,7 +2293,6 @@ test "init that cannot read the grammar leaks nothing — including the open dat
     try std.testing.expect(std.meta.isError(r));
     _ = std.c.unlink("zbz-test-ownership.sqlite3");
 }
-
 
 test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds — the row survives each" {
     const a = std.testing.allocator;
@@ -1992,6 +2356,39 @@ test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds �
     try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d4));
     // and the FK is live again after the surgery
     try std.testing.expectError(error.StepFailed, st.query(aa_, "INSERT INTO t (uid, c, updated_at) VALUES ('orphan', 'x', 'v')", &.{}));
+
+    // 5. §10dg re-type: c TEXT → REAL, same names — invisible to diffColumns, caught by
+    // the shape record; SQLite has no ALTER COLUMN TYPE, so a rebuild that keeps the row.
+    const d5 = try desc.make(aa_,
+        \\{"pk_columns":["uid"],"sqlite":{"columns":[{"name":"uid","type":"TEXT"},{"name":"c","type":"REAL"},{"name":"updated_at","type":"TEXT"}]},
+        \\ "foreign_keys":[{"columns":["uid"],"references":"p","parent_columns":["uid"]}],"indexes":[{"name":"t_c","columns":["c"]}]}
+    );
+    try std.testing.expectEqual(SyncClient.Migration.rebuilt, try SyncClient.migrateTable(&st, aa_, "t", d5));
+    rows = try st.query(aa_, "SELECT c FROM t", &.{});
+    try std.testing.expectEqual(1, rows.len);
+    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "\"c\" REAL") != null);
+    try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d5));
+
+    // 6. §10dg re-key: the pk uid TEXT → INTEGER (the bigserial→uuid shape, mirrored).
+    // Same names again — but a key cannot move in place: rebuilt EMPTY, the row is gone,
+    // and the shape record now names the new key.
+    const d6 = try desc.make(aa_,
+        \\{"pk_columns":["uid"],"sqlite":{"columns":[{"name":"uid","type":"INTEGER"},{"name":"c","type":"REAL"},{"name":"updated_at","type":"TEXT"}]},
+        \\ "foreign_keys":[],"indexes":[]}
+    );
+    try std.testing.expectEqual(SyncClient.Migration.rekeyed, try SyncClient.migrateTable(&st, aa_, "t", d6));
+    try std.testing.expectEqual(0, (try st.query(aa_, "SELECT uid FROM t", &.{})).len);
+    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "\"uid\" INTEGER NOT NULL PRIMARY KEY") != null);
+    try std.testing.expectEqualStrings("[[\"uid\",\"INTEGER\"]]", (try st.query(aa_, "SELECT key_shape FROM _zbz_shape WHERE tbl='t'", &.{}))[0][0].text);
+    try std.testing.expectEqual(1, (try st.query(aa_, "SELECT name FROM sqlite_master WHERE type='view' AND name='t_view'", &.{})).len);
+    try std.testing.expectEqual(SyncClient.Migration.unchanged, try SyncClient.migrateTable(&st, aa_, "t", d6));
+    // 7. a composite key (uid, c) — the pk column SET moved: re-key again
+    const d7 = try desc.make(aa_,
+        \\{"pk_columns":["uid","c"],"sqlite":{"columns":[{"name":"uid","type":"INTEGER"},{"name":"c","type":"REAL"},{"name":"updated_at","type":"TEXT"}]},
+        \\ "foreign_keys":[],"indexes":[]}
+    );
+    try std.testing.expectEqual(SyncClient.Migration.rekeyed, try SyncClient.migrateTable(&st, aa_, "t", d7));
+    try std.testing.expect(std.mem.indexOf(u8, (try st.query(aa_, "SELECT sql FROM sqlite_master WHERE name='t'", &.{}))[0][0].text, "PRIMARY KEY (\"uid\", \"c\")") != null);
 }
 
 test "migrateTable: a suspension descriptor is an error, never a panic" {

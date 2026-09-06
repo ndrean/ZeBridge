@@ -389,6 +389,32 @@ pub fn planUpsert(a: std.mem.Allocator, table: []const u8, pk: []const []const u
     return .{ .object = obj };
 }
 
+/// core.ts heartbeatPayload (PROTOCOL §9): the fleet heartbeat, byte-identical across
+/// cores — stream keys sorted bytewise, fixed key order, integers verbatim. Pinned in
+/// fixtures/heartbeat. `names`/`seqs` are parallel; sorted here, not by the caller.
+pub fn heartbeatPayload(a: std.mem.Allocator, principal: []const u8, tenant: []const u8, ts: i64, names: []const []const u8, seqs: []const u64) ![]const u8 {
+    const idx = try a.alloc(usize, names.len);
+    for (idx, 0..) |*x, i| x.* = i;
+    std.mem.sort(usize, idx, names, struct {
+        fn lt(ctx: []const []const u8, x: usize, y: usize) bool {
+            return std.mem.lessThan(u8, ctx[x], ctx[y]);
+        }
+    }.lt);
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, "{\"principal\":");
+    try writeJsonString(a, &out, principal);
+    try out.appendSlice(a, ",\"tenant\":");
+    try writeJsonString(a, &out, tenant);
+    try out.appendSlice(a, try std.fmt.allocPrint(a, ",\"ts\":{d},\"streams\":{{", .{ts}));
+    for (idx, 0..) |i, n| {
+        if (n > 0) try out.append(a, ',');
+        try writeJsonString(a, &out, names[i]);
+        try out.appendSlice(a, try std.fmt.allocPrint(a, ":{d}", .{seqs[i]}));
+    }
+    try out.appendSlice(a, "}}");
+    return out.items;
+}
+
 /// core.ts pgArrayLiteral: a JSON array as PostgreSQL's array-literal text —
 /// `{a,b}`, nested `{{1,2},{3}}`, elements quoted when they need it, null → NULL.
 /// The form the CDC wire already carries for arrays; a replica on a PostgreSQL
@@ -784,6 +810,7 @@ pub fn columnDdl(a: std.mem.Allocator, col: Value, pk: []const []const u8) ![]co
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a, try std.fmt.allocPrint(a, "\"{s}\" {s}", .{ name, typ }));
     if (is_pk or required) try out.appendSlice(a, " NOT NULL");
+    if (getStr(col, "default")) |d| if (d.len > 0) try out.appendSlice(a, try std.fmt.allocPrint(a, " DEFAULT {s}", .{d}));
     if (inline_pk and std.mem.eql(u8, name, pk[0])) try out.appendSlice(a, " PRIMARY KEY");
     return out.items;
 }
@@ -855,6 +882,78 @@ pub fn rebuildSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Arra
     try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS {s};", .{table})));
     try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "ALTER TABLE {s} RENAME TO {s};", .{ tmp, table })));
     return .{ .array = steps };
+}
+
+/// core.ts keyShape (§10dg): the pk columns in pk order with their dialect type,
+/// as canonical JSON `[["id","INTEGER"]]`. A pk column the descriptor does not
+/// list is skipped, not guessed.
+pub fn keyShape(a: std.mem.Allocator, pk: []const []const u8, cols: std.json.Array) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '[');
+    var n: usize = 0;
+    for (pk) |name| {
+        const ty = columnTypeOf(cols, name) orelse continue;
+        if (n > 0) try out.append(a, ',');
+        try writePair(a, &out, name, ty);
+        n += 1;
+    }
+    try out.append(a, ']');
+    return out.items;
+}
+
+/// core.ts typeShape: every column with its type, sorted by name.
+pub fn typeShape(a: std.mem.Allocator, cols: std.json.Array) ![]const u8 {
+    const idx = try a.alloc(usize, cols.items.len);
+    for (idx, 0..) |*x, k| x.* = k;
+    const Ctx = struct {
+        cols: std.json.Array,
+        fn lessThan(ctx: @This(), x: usize, y: usize) bool {
+            return std.mem.lessThan(u8, colName(ctx.cols.items[x]), colName(ctx.cols.items[y]));
+        }
+    };
+    std.mem.sort(usize, idx, Ctx{ .cols = cols }, Ctx.lessThan);
+    var out: std.ArrayList(u8) = .empty;
+    try out.append(a, '[');
+    for (idx, 0..) |k, i| {
+        if (i > 0) try out.append(a, ',');
+        try writePair(a, &out, colName(cols.items[k]), getStr(cols.items[k], "type") orelse "");
+    }
+    try out.append(a, ']');
+    return out.items;
+}
+
+/// core.ts retypedColumns: columns present in BOTH the stored type shape and the
+/// descriptor whose type text differs, in descriptor order. An absent or
+/// unreadable record reads as "nothing known".
+pub fn retypedColumns(a: std.mem.Allocator, stored: ?[]const u8, cols: std.json.Array) !Value {
+    var out = std.json.Array.init(a);
+    const text = stored orelse return .{ .array = out };
+    const parsed = std.json.parseFromSliceLeaky(Value, a, text, .{}) catch return .{ .array = out };
+    if (parsed != .array) return .{ .array = out };
+    for (cols.items) |c| {
+        const name = colName(c);
+        const ty = getStr(c, "type") orelse "";
+        for (parsed.array.items) |e| {
+            if (e != .array or e.array.items.len != 2 or e.array.items[0] != .string or e.array.items[1] != .string) continue;
+            if (!std.mem.eql(u8, e.array.items[0].string, name)) continue;
+            if (!std.mem.eql(u8, e.array.items[1].string, ty)) try out.append(.{ .string = name });
+            break;
+        }
+    }
+    return .{ .array = out };
+}
+
+fn columnTypeOf(cols: std.json.Array, name: []const u8) ?[]const u8 {
+    for (cols.items) |c| if (std.mem.eql(u8, colName(c), name)) return getStr(c, "type") orelse "";
+    return null;
+}
+
+fn writePair(a: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, ty: []const u8) !void {
+    try out.append(a, '[');
+    try writeJsonString(a, out, name);
+    try out.append(a, ',');
+    try writeJsonString(a, out, ty);
+    try out.append(a, ']');
 }
 
 /// core.ts diffColumns (rename-aware; §1.2 as behaviour).

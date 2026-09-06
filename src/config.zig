@@ -320,6 +320,10 @@ pub const Batch = struct {
     /// without immediately hitting `TooManyColumns` and forcing a bridge reboot to
     /// re-detect. Reasonable slack without meaningfully inflating the slab.
     pub const column_headroom_rounding: u16 = 8;
+    /// §10df: the widest table is DOUBLED before rounding. A migration that adds a few
+    /// columns must not exceed a capacity sized to the table as it was at boot — that
+    /// exit was measured (17 columns against a limit of 16, an ADD COLUMN ×3).
+    pub const column_headroom_factor: u32 = 2;
     // NOTE: the ring buffer size lives in Buffers.default_ring_buffer_count, which is
     // what RuntimeConfig actually reads. A `Batch.ring_buffer_size` used to be
     // declared here with the sizing rationale attached, but nothing referenced it —
@@ -330,7 +334,24 @@ pub const Batch = struct {
 pub const WalMonitor = struct {
     /// Default check interval (seconds)
     pub const default_check_interval_seconds = 30;
+    /// The slot INVENTORY (§10db): every replication slot on the server, not just ours,
+    /// with its retained WAL — an operator signal on a slow cadence, never the hot loop.
+    pub const default_slot_inventory_seconds: u64 = 300;
+    pub const min_slot_inventory_seconds: u64 = 5;
+    pub const max_slot_inventory_seconds: u64 = 86_400;
+};
 
+/// Fleet observability (§10dc): clients heartbeat into a TTL'd KV bucket, the bridge
+/// reads it on its own cadence and renders per-client lag for /metrics.
+pub const Fleet = struct {
+    pub const default_poll_seconds: u64 = 60;
+    pub const min_poll_seconds: u64 = 2;
+    pub const max_poll_seconds: u64 = 3600;
+    /// The bucket's TTL: a client silent this long drops off the fleet metrics. Three
+    /// beats of libzb's default 30 s heartbeat.
+    pub const default_ttl_seconds: u64 = 90;
+    pub const min_ttl_seconds: u64 = 3;
+    pub const max_ttl_seconds: u64 = 86_400;
 };
 
 pub const Bridge = struct {
@@ -617,6 +638,9 @@ pub const RuntimeConfig = struct {
     publication_name: []const u8,
     generation_cadence_seconds: u64 = Generations.default_cadence_seconds,
     generation_chain_depth: u32 = Generations.default_chain_depth,
+    fleet_poll_seconds: u64 = Fleet.default_poll_seconds,
+    fleet_ttl_seconds: u64 = Fleet.default_ttl_seconds,
+    slot_inventory_seconds: u64 = WalMonitor.default_slot_inventory_seconds,
     /// Master switch: derive-and-produce for every published table. GENERATION_RULES
     /// alone also enables the producer, as a RESTRICTION (probes, dev subsets).
     generations_enabled: bool = false,

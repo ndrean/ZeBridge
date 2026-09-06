@@ -19,7 +19,8 @@
   },
   "kv": {
     "schemas": "schemas",
-    "tenants": "tenants"
+    "tenants": "tenants",
+    "live": "live"
   },
   "generations": {
     "kv": "generations",

@@ -16,6 +16,7 @@ const RefusedTables = @import("refused_tables.zig");
 const WritableTables = @import("writable_tables.zig");
 const TypeRegistry = @import("type_registry.zig");
 const Topology = @import("topology.zig");
+const catalogue = @import("catalogue.zig");
 const Preflight = @import("preflight.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const batch_publisher = @import("batch_publisher.zig");
@@ -37,6 +38,32 @@ pub const log = std.log.scoped(.event_processor);
 /// skip these, but the boot pass iterates the publication's table list — which contains
 /// zebridge_ddl_events, since its INSERTs are how schema events travel. Without this the
 /// two paths disagree and clients build a local replica of our own bookkeeping.
+/// JSON-escape a column default literal into the descriptor (quotes, backslashes,
+/// control bytes). Column names and types never needed this; a default can carry
+/// anything a DBA typed.
+fn appendJsonEscaped(arena: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |ch| switch (ch) {
+        '"' => try out.appendSlice(arena, "\\\""),
+        '\\' => try out.appendSlice(arena, "\\\\"),
+        '\n' => try out.appendSlice(arena, "\\n"),
+        '\r' => try out.appendSlice(arena, "\\r"),
+        '\t' => try out.appendSlice(arena, "\\t"),
+        else => if (ch < 0x20) {
+            try out.appendSlice(arena, try std.fmt.allocPrint(arena, "\\u{x:0>4}", .{ch}));
+        } else try out.append(arena, ch),
+    };
+}
+
+/// The trigger's `default` (a DDL-ready constant literal, §10df) forwarded verbatim.
+fn appendDefaultField(arena: std.mem.Allocator, out: *std.ArrayList(u8), col_val: std.json.Value) !void {
+    if (col_val != .object) return;
+    const d = col_val.object.get("default") orelse return;
+    if (d != .string) return;
+    try out.appendSlice(arena, ",\"default\":\"");
+    try appendJsonEscaped(arena, out, d.string);
+    try out.append(arena, '"');
+}
+
 fn isInternalTable(name: []const u8) bool {
     return std.mem.eql(u8, name, "zebridge_ddl_events") or
         // The catalogue rides the publication so the bridge learns of an enable
@@ -135,6 +162,9 @@ pub const EventProcessor = struct {
     /// OID → typtype, populated from DDL events and at boot. The CDC decoder consults
     /// it for any type its switch does not cover; see type_registry.zig.
     types: *TypeRegistry.Registry,
+    /// The live catalogue (§10df): `epochs` feeds `seed_epoch` into every descriptor.
+    /// Set after construction, like the publisher; null only in tests.
+    cat: ?*const catalogue.Load = null,
     /// Wire names, read from grammar.json at startup. See src/topology.zig.
     topology: *const Topology.Topology,
     /// Per-table version-column overrides and the global default, for the edge-writability
@@ -286,6 +316,41 @@ pub const EventProcessor = struct {
     /// The log is deliberately loud and arithmetic: the operator needs the value to set,
     /// not an adjective. It is also the line to alert on in Loki/Prometheus —
     /// `bridge_refused_tables` rises at the same moment.
+    /// §10df: the table grew past MAX_COLUMNS (a migration, after a boot that sized the
+    /// capacity from the widest table then). One table suspended, not the bridge
+    /// exited — that exit was measured. Lifts on restart (re-detected) or on a DDL
+    /// event whose column count fits.
+    fn suspendForTooManyColumns(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        rel: pgoutput.RelationMessage,
+        wal_end: u64,
+    ) !u32 {
+        if (self.refused.reasonFor(rel.name)) |r| {
+            if (r == .too_many_columns) {
+                self.refused.countDrop(rel.name);
+                return error.EventDropped;
+            }
+        }
+        const capacity = self.batch_publisher.events[0].columns.len;
+        log.err(
+            "🔴 SUSPENDING '{s}': {d} columns, more than the {d} one CDC event can carry (MAX_COLUMNS, sized at boot from the widest table). A migration grew it. This table's live CDC pauses; every other table keeps flowing; clients are told to hold and re-seed from the chain. Restart the bridge (MAX_COLUMNS re-detects, doubled for headroom) or set MAX_COLUMNS.",
+            .{ rel.name, rel.columns.len, capacity },
+        );
+        self.refused.refuse(rel.name, .too_many_columns) catch |err| {
+            log.err("🔴 Could not record refusal for '{s}': {}", .{ rel.name, err });
+        };
+        const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-cols-{s}-{d}", .{ rel.name, wal_end });
+        return self.publishSuspension(
+            arena,
+            rel.name,
+            RefusedTables.Reason.too_many_columns.wireName(),
+            msg_id,
+            rel.relation_id,
+            wal_end,
+        );
+    }
+
     fn suspendForRowTooLarge(
         self: *EventProcessor,
         arena: std.mem.Allocator,
@@ -627,6 +692,7 @@ pub const EventProcessor = struct {
             // The suspension takes this event's place in the stream, so ordering holds
             // and the client learns at the exact LSN where its copy stops being current.
             if (err == error.RowTooLarge) return self.suspendForRowTooLarge(arena_allocator, rel, wal_end);
+            if (err == error.TooManyColumns) return self.suspendForTooManyColumns(arena_allocator, rel, wal_end);
             return err;
         };
 
@@ -866,6 +932,12 @@ pub const EventProcessor = struct {
                     return error.RowTooLarge;
                 }
                 // Other errors - return slot and propagate
+                if (err == error.TooManyColumns) {
+                    // Suspended one level up, where the relation and arena live (§10df).
+                    event.reset();
+                    self.batch_publisher.free_slots.push(slot_idx) catch {};
+                    return err;
+                }
                 log.err("Failed to pack column '{s}': {}", .{ column.name, err });
                 event.reset();
                 self.batch_publisher.free_slots.push(slot_idx) catch {};
@@ -1071,6 +1143,11 @@ pub const EventProcessor = struct {
         table: []const u8,
         column_names: []const []const u8,
     ) !void {
+        // §10df: the table's seed epoch. A client compares it with the one it stored
+        // at seed time; higher means "forget your watermark, seed a fresh full".
+        const epoch: i64 = if (self.cat) |cat| (cat.epochs.get(table) orelse 0) else 0;
+        try json_str.appendSlice(arena, try std.fmt.allocPrint(arena, ",\"seed_epoch\":{d}", .{epoch}));
+
         var version_name: []const u8 = self.default_version_column;
         var tombstone_name: ?[]const u8 = null;
         if (self.sync_rules.get(table)) |cols| {
@@ -1376,9 +1453,11 @@ pub const EventProcessor = struct {
             try column_names.append(arena, name.?.string);
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
-                "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}",
                 .{ name.?.string, ty.?.string, if (is_required) "true" else "false" },
             ));
+            try appendDefaultField(arena, &json_str, col_val);
+            try json_str.append(arena, '}');
         }
 
         try json_str.appendSlice(arena, "]},\"sqlite\":{\"columns\":[");
@@ -1401,9 +1480,11 @@ pub const EventProcessor = struct {
             if (i > 0) try json_str.appendSlice(arena, ",");
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
                 arena,
-                "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}",
                 .{ name.?.string, schema_mapper.pgToSqliteType(ty.?.string), if (sq_is_required) "true" else "false" },
             ));
+            try appendDefaultField(arena, &json_str, col_val);
+            try json_str.append(arena, '}');
         }
         try json_str.appendSlice(arena, "] ");
 
@@ -1487,6 +1568,17 @@ pub const EventProcessor = struct {
                 rel.relation_id,
                 wal_end,
             );
+        }
+
+        // Wider than one event can carry (§10df): refuse here, on the descriptor, so the
+        // first row is never even attempted — and lift only when a later DDL fits.
+        if (columns.len > self.batch_publisher.events[0].columns.len) {
+            log.err("🔴 REFUSING '{s}': {d} columns, more than the {d} one CDC event can carry — restart the bridge (MAX_COLUMNS re-detects) or set MAX_COLUMNS", .{ clean_table, columns.len, self.batch_publisher.events[0].columns.len });
+            self.refused.refuse(clean_table, .too_many_columns) catch |err| {
+                log.err("🔴 Could not record refusal for '{s}': {}", .{ clean_table, err });
+            };
+            const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-{s}-{d}", .{ clean_table, wal_end });
+            return try self.publishSuspension(arena, clean_table, RefusedTables.Reason.too_many_columns.wireName(), msg_id, rel.relation_id, wal_end);
         }
 
         // Reaching here means the table has a key. If it was refused before, this DDL
@@ -1907,9 +1999,11 @@ pub const EventProcessor = struct {
                 \\       format_type(a.atttypid, a.atttypmod) AS data_type,
                 \\       a.atttypid,
                 \\       t.typtype,
-                \\       (a.attnotnull AND NOT a.atthasdef) AS required
+                \\       (a.attnotnull AND NOT a.atthasdef) AS required,
+                \\       public.zebridge_constant_default(pg_get_expr(d.adbin, d.adrelid)) AS dflt
                 \\FROM pg_attribute a
                 \\JOIN pg_type t ON t.oid = a.atttypid
+                \\LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
                 \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
                 \\  AND a.attnum > 0
                 \\  AND NOT a.attisdropped
@@ -1967,10 +2061,16 @@ pub const EventProcessor = struct {
                 const is_required = std.mem.eql(u8, required_txt, "t");
                 const col_json = try std.fmt.allocPrint(
                     arena,
-                    "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                    "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}",
                     .{ col_name, data_type, if (is_required) "true" else "false" },
                 );
                 try json_str.appendSlice(arena, col_json);
+                if (c.PQgetisnull(result, r, 5) == 0) {
+                    try json_str.appendSlice(arena, ",\"default\":\"");
+                    try appendJsonEscaped(arena, &json_str, std.mem.span(c.PQgetvalue(result, r, 5)));
+                    try json_str.append(arena, '"');
+                }
+                try json_str.append(arena, '}');
             }
             
             try json_str.appendSlice(arena, "]},\"sqlite\":{\"columns\":[");
@@ -1986,10 +2086,16 @@ pub const EventProcessor = struct {
 
                 const col_json = try std.fmt.allocPrint(
                     arena,
-                    "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}}}",
+                    "{{\"name\":\"{s}\",\"type\":\"{s}\",\"required\":{s}",
                     .{ col_name, schema_mapper.pgToSqliteType(data_type), if (sq_required) "true" else "false" },
                 );
                 try json_str.appendSlice(arena, col_json);
+                if (c.PQgetisnull(result, r, 5) == 0) {
+                    try json_str.appendSlice(arena, ",\"default\":\"");
+                    try appendJsonEscaped(arena, &json_str, std.mem.span(c.PQgetvalue(result, r, 5)));
+                    try json_str.append(arena, '"');
+                }
+                try json_str.append(arena, '}');
             }
             try json_str.appendSlice(arena, "] ");
             

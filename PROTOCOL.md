@@ -258,8 +258,12 @@ payloads (one per table, at boot and on DDL) where human-readability (`nats kv g
 <table>`) outweighs MessagePack's compactness, and worth stating explicitly rather than
 leaving a reader to infer it from the ` ```json ` fence below.
 
-Each entry in `pg.columns[]` also carries `required` — `true` when the column is `NOT NULL`
+Each entry in `pg.columns[]` (and `sqlite.columns[]`) may carry `default`: the column's CONSTANT default as a DDL-ready literal (`5`, `true`, `'plain'`), absent when there is no default or it is an expression (`now()`, `nextval(...)`). A client adds the column WITH it, so its engine fills the existing rows and an `ADD COLUMN ... DEFAULT x` converges without a re-seed; a volatile default cannot, and needs `zebridge_reseed`. Each entry also carries `required` — `true` when the column is `NOT NULL`
 with no default, so a mutation omitting it is refused (§7.2).
+
+Each descriptor carries `seed_epoch` (integer, from `zebridge_catalogue.seed_epoch`). A client stores the epoch it seeded at beside its watermark; a descriptor whose epoch is above it means `zebridge_reseed(table)` ran upstream (by hand, or by the DDL trigger on a key-shape or column-type change): the client drops the watermark and seeds from a fresh full — refusing any manifest whose `seed_epoch` is still below the descriptor's. `SELECT zebridge_reseed('t')` bumps `t` and every table reaching it by foreign key.
+
+A client also keeps the KEY SHAPE it built each table with (the `pk_columns` in order, each with its dialect type) and the type of every column. A descriptor with a different key shape is a re-key: the local table is rebuilt empty and re-seeded. A changed type on a non-key column is altered in place where the engine can, rebuilt keeping the rows where it cannot. Column names alone never decide either. The full table of shapes is `MIGRATIONS.md`.
 
 ⚠️ **`max_row_bytes` is the widest row this deployment can carry** — check a write against
 it before sending. A mutation above it is refused with `RowTooLargeToReplicate`, because
@@ -367,6 +371,7 @@ Published when the bridge refuses a table. The reasons:
 | `no_primary_key` | rows cannot be identified, so DELETE is ambiguous (§9) | add a primary key |
 | `unsupported_column_type` | a column's type cannot be decoded and is not an enum (§4) | change or drop that column |
 | `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | restart the bridge with a larger buffer, or move the oversized column out of the table |
+| `too_many_columns` | a migration grew the table past the columns one event can carry (`MAX_COLUMNS`, sized at boot from the widest table, doubled) | restart the bridge (it re-detects), or set `MAX_COLUMNS`; dropping columns lifts it live. Rows written while suspended were dropped: a lift after drops, live or across the restart, bumps the table's `seed_epoch` so every replica re-seeds |
 | `no_tenant_column` | the catalogue names a tenant column this table does not have | add the column, or correct the catalogue row |
 | `tenant_not_in_replica_identity` | the tenant column is outside the replica identity, so a DELETE could not be routed to a tenant at all | add a unique index covering `(tenant, pk)` and point `REPLICA IDENTITY` at it |
 
@@ -748,6 +753,10 @@ Seeding gives a fresh or fallen-behind client its starting point.
 Postgres is never queried per consumer. The `generation_producer.zig` builds, on a cadence `GENERATION_CADENCE_SECONDS`, a *full* plus a series of *deltas* per table — the chain — and publishes it to object storage.
 Clients only ever read what is already built; 
 
+### When a full is forced
+
+A delta suffices while nothing but versions moved. The producer builds a full, whatever the counts say, when: the chain has no full inside the kept window; hard deletes moved (`n_tup_del`); the catalogue's `seed_epoch` moved since the last generation; or the table's column shape (`name:type` list, recorded per generation as `col_shape`) moved — a chain object names its columns, and a full built before a `DROP`/`RENAME`/re-type would ask a replica for a column it no longer has. A (tenant, table) that left the publication has its chain swept on the next tick — objects, manifest, bookkeeping — so a table re-created under the same name starts at g1. A client reading a chain object that names a column it lacks treats it as "predates the schema" and waits for the next full.
+
 ### The storage architecture
 
 | | where | why |
@@ -758,6 +767,7 @@ Clients only ever read what is already built;
 The manifest carries:
 
 *  `gen` (the chain number),
+*  `seed_epoch` (the catalogue's `seed_epoch` the chain was built under — a client whose descriptor says more waits for the next build),
 *  `full` (object name + gen),
 *  `deltas` (object, `cutoff`, `prev_cutoff`, gen — newest last; plus `dict` naming the dictionary object a delta was compressed with,
   
@@ -2071,3 +2081,40 @@ PGlite).
 
 Restart and replay are exercised by the Node consumer's persisted replica (a second run
 resumes from its stored positions with nothing re-seeded) and by libzb's soak.
+
+## 9. Liveness — KV bucket `live` ✅
+
+The bridge cannot see its clients: it holds a slot and a lag, nothing about who is
+reading and how far behind. Clients say so themselves, cooperatively.
+
+**A client writes one key, its own:**
+
+    subject  $KV.<kv.live>.<tenant>.<principal>          (kv.live is "live" in grammar.json)
+    payload  {"principal":"omar","tenant":"acme","ts":1757150000123,
+              "streams":{"CDC_acme":1234,"CDC_PUBLIC":56}}
+
+- `<tenant>` is the tenant the client resolved (§6 "The Connection Flow"), `_default`
+  for an unmapped principal; `<principal>` is its NATS user name. The per-principal
+  grant allows exactly this key and no other (`$KV.live.{{tag(tenant)}}.{{name()}}`).
+- `ts` is the client's clock, unix milliseconds. `streams` maps each CDC stream the
+  client tails to the **last sequence it has applied** — the same number it persists
+  as its position (§5 "Two positions").
+- Cadence: libzb beats once per `heartbeatMs` (default 30 000; 0 disables) from
+  inside `poll`, so a host that polls is a host that beats. The bucket keeps ONE value
+  per key and carries a TTL (bridge `FLEET_TTL_SECONDS`, default 90): a client that
+  stops beating drops out by itself. Nothing is ever deleted by hand.
+- A failed beat is not an error a client should surface: it is retried on the next
+  turn. The beat is a report, never a request.
+
+**The bridge reads the whole bucket** on its own cadence (`FLEET_POLL_SECONDS`,
+default 60), asks JetStream for each named stream's head, and exposes on `/metrics`:
+
+| series | meaning |
+| --- | --- |
+| `bridge_fleet_clients_live{tenant}` | clients whose beat is inside the TTL, per tenant (`_total` across tenants) |
+| `bridge_fleet_client_last_seen_seconds{tenant,principal}` | seconds since that client's `ts`, at the last poll |
+| `bridge_fleet_client_lag_events{tenant,principal,stream}` | stream head − applied, in stream **messages** (a published batch is one) |
+| `bridge_fleet_poll_timestamp_seconds` | when the bucket was last read |
+
+The bridge never writes the bucket. It creates it if missing (with the TTL) and
+reads it. A client older than this section simply never beats, and never appears.

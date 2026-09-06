@@ -54,6 +54,9 @@ export interface Dialect {
   /// constraint. Absent (SQLite) → the shell rebuilds the table instead, which is
   /// the only way there — and which PostgreSQL would refuse for a referenced parent.
   alterForeignKeys?(exec: Exec, table: string, fks: ForeignKeySpec[]): Promise<void>;
+  /// Change one column's type in place (§10dg). Absent on SQLite, which has no
+  /// ALTER COLUMN TYPE — the shell rebuilds the table there, rows copied.
+  alterColumnType?(exec: Exec, table: string, column: string, type: string): Promise<void>;
 }
 
 export type ForeignKeySpec = { columns: string[]; references: string; parent_columns: string[] };
@@ -173,6 +176,9 @@ export const postgresDialect: Dialect = {
   /// ⚠️ Not a rebuild: `DROP TABLE` of a referenced parent is refused by PostgreSQL
   /// regardless of `session_replication_role`, which is about triggers, not
   /// dependencies. ALTER is the native path, and it keeps the table's identity.
+  async alterColumnType(exec, table, column, type) {
+    await exec(`ALTER TABLE ${table} ALTER COLUMN "${column}" TYPE ${type} USING "${column}"::${type}`);
+  },
   async alterForeignKeys(exec, table, fks) {
     const have: any[] = (await exec(
       `SELECT conname FROM pg_constraint WHERE contype = 'f' AND conrelid = to_regclass(?)`, table)) ?? [];

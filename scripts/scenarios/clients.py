@@ -1,0 +1,86 @@
+"""The two clients a migration scenario drives side by side (NOTES §10dg):
+`Lib` — libzb through its C ABI, host-driven (every observation is a poll);
+`Node` — zb-client-ts in a Node process (`examples/04-node-consumer/query-worker.ts`),
+event-driven, answering SQL over stdin/stdout. `both()` polls the first and asks
+both until a predicate holds on each."""
+import ctypes, json, os, select, subprocess, sys, time
+import zb
+
+NODE_DIR = zb.ROOT / "examples" / "04-node-consumer"
+LIBZB = zb.ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
+GRAMMAR = str(zb.ROOT / "src" / "grammar.json")
+
+
+def fresh_sqlite(path):
+    for f in (path, path + "-wal", path + "-shm"):
+        try: os.remove(f)
+        except FileNotFoundError: pass
+
+
+class Lib:
+    """The libzb client, host-driven: every observation is a poll."""
+    def __init__(self, db, tables, client_id="py-scenario"):
+        if not LIBZB.exists():
+            sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
+        self.lib = lib = ctypes.CDLL(str(LIBZB))
+        lib.zb_free.argtypes = [ctypes.c_void_p]
+        lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+        lib.zb_client_close.argtypes = [ctypes.c_uint64]
+        for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
+            f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
+        self.h = lib.zb_client_open(json.dumps({
+            "url": zb.nats_server(), "credsPath": zb.creds_for("omar"), "grammarPath": GRAMMAR, "dbPath": db,
+            "principal": "omar", "clientId": client_id, "tables": list(tables), "heartbeatMs": 0}).encode())
+        if not self.h: sys.exit("libzb open failed")
+        self.tenant = self.take(lib.zb_client_sync(self.h))["tenant"]
+    def take(self, p):
+        try: return json.loads(ctypes.string_at(p).decode())
+        finally: self.lib.zb_free(p)
+    def poll(self): self.take(self.lib.zb_client_poll(self.h, 300))
+    def q(self, sql, params=()):
+        return self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))["rows"]
+    def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
+    def close(self): self.lib.zb_client_close(self.h)
+
+
+class Node:
+    """The zb-client-ts client, event-driven, behind query-worker.ts."""
+    def __init__(self, db, log="/tmp/zb_node_worker.log"):
+        env = dict(os.environ, ZB_DB=db, ZB_PRINCIPAL="omar", NATS_URL=zb.nats_server())
+        self.log = open(log, "w")
+        self.p = subprocess.Popen(["node", "--experimental-strip-types", "query-worker.ts"], cwd=NODE_DIR, env=env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True)
+        first = json.loads(self.p.stdout.readline())
+        self.tenant = first.get("tenant")
+    def q(self, sql, params=()):
+        self.p.stdin.write(json.dumps({"sql": sql, "params": list(params)}) + "\n"); self.p.stdin.flush()
+        # a silent worker is a finding, not a hang: 60 s, then the scenario says so
+        if not select.select([self.p.stdout], [], [], 60)[0]:
+            raise RuntimeError("node worker silent for 60 s")
+        line = self.p.stdout.readline()
+        if not line: raise RuntimeError("node worker exited")
+        r = json.loads(line)
+        if "error" in r: raise RuntimeError(r["error"])
+        return [list(row.values()) for row in r["rows"]]
+    def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
+    def close(self):
+        try:
+            self.p.stdin.write('{"close": true}\n'); self.p.stdin.flush(); self.p.wait(timeout=15)
+        except Exception:
+            self.p.kill()
+        self.log.close()
+
+
+def both(py, nd, pred, budget=60):
+    """Poll libzb and ask both replicas until `pred(client)` holds for each; seconds or None."""
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < budget:
+        py.poll()
+        try:
+            if pred(py) and pred(nd): return round(time.monotonic() - t0, 2)
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return None
+
+

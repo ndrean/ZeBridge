@@ -63,6 +63,12 @@ const usage =
     \\  GENERATION_RULES      a RESTRICTION intersected with the derived set —
     \\                        probes/dev only; also enables the producer by itself:
     \\                        users:_default;test_types:acme,globex
+    \\  FLEET_POLL_SECONDS    how often the clients' heartbeats ($KV.live) are read
+    \\                        for /metrics (default: 60)
+    \\  FLEET_TTL_SECONDS     the live bucket's TTL: a client silent this long drops
+    \\                        off the fleet metrics (default: 90)
+    \\  SLOT_INVENTORY_SECONDS  how often EVERY replication slot on the server is
+    \\                        read for /metrics, not only ours (default: 300)
     \\  GENERATION_CADENCE_SECONDS  tick interval (default: 600). A CORRECTNESS
     \\                        parameter: depth × cadence must stay under the
     \\                        sweeper's tombstone retention.
@@ -499,6 +505,9 @@ pub const Args = struct {
             (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true"))
         else
             false;
+        runtime_config.fleet_poll_seconds = envUint(u64, init, "FLEET_POLL_SECONDS", config.Fleet.default_poll_seconds, config.Fleet.min_poll_seconds, config.Fleet.max_poll_seconds);
+        runtime_config.fleet_ttl_seconds = envUint(u64, init, "FLEET_TTL_SECONDS", config.Fleet.default_ttl_seconds, config.Fleet.min_ttl_seconds, config.Fleet.max_ttl_seconds);
+        runtime_config.slot_inventory_seconds = envUint(u64, init, "SLOT_INVENTORY_SECONDS", config.WalMonitor.default_slot_inventory_seconds, config.WalMonitor.min_slot_inventory_seconds, config.WalMonitor.max_slot_inventory_seconds);
         runtime_config.generation_cadence_seconds = envUint(
             u64,
             init,

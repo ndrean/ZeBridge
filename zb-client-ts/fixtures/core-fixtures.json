@@ -1,5 +1,5 @@
 {
-  "_": "The conformance spec for the sans-I/O core (NOTES §10s). Language-neutral: the TS runner is src/core.test.ts; a port (Zig, …) is correct exactly when it passes every case here. Each case that encodes a measured finding names it.",
+  "_": "The conformance spec for the sans-I/O core (NOTES \u00a710s). Language-neutral: the TS runner is src/core.test.ts; a port (Zig, \u2026) is correct exactly when it passes every case here. Each case that encodes a measured finding names it.",
   "seedGate": [
     {
       "name": "seq below cutoff drops",
@@ -51,7 +51,7 @@
       "drops": false
     },
     {
-      "name": "FINDING 7: in-flight txn — lower lsn but higher seq APPLIES when seq is primary",
+      "name": "FINDING 7: in-flight txn \u2014 lower lsn but higher seq APPLIES when seq is primary",
       "ev": {
         "seq": 900,
         "stream": "CDC_kilo",
@@ -65,7 +65,7 @@
       "drops": false
     },
     {
-      "name": "FINDING 10: no anchor at all — never drop by lsn (schema lsn must not gate data)",
+      "name": "FINDING 10: no anchor at all \u2014 never drop by lsn (schema lsn must not gate data)",
       "ev": {
         "seq": 5,
         "stream": "CDC_PUBLIC",
@@ -236,7 +236,7 @@
       ]
     },
     {
-      "name": "§10x: a delta naming its dictionary carries it on the step; others stay bare",
+      "name": "\u00a710x: a delta naming its dictionary carries it on the step; others stay bare",
       "manifest": {
         "gen": 3,
         "full": {
@@ -625,7 +625,7 @@
       ]
     },
     {
-      "name": "§10bq: a gap on CDC_PUBLIC re-seeds tenant-scoped tables too — their shared rows ride it",
+      "name": "\u00a710bq: a gap on CDC_PUBLIC re-seeds tenant-scoped tables too \u2014 their shared rows ride it",
       "streams": {
         "CDC_kilo": {
           "firstSeq": 10,
@@ -658,7 +658,7 @@
       ]
     },
     {
-      "name": "§10bq: a gap on the TENANT stream still leaves public tables alone",
+      "name": "\u00a710bq: a gap on the TENANT stream still leaves public tables alone",
       "streams": {
         "CDC_kilo": {
           "firstSeq": 900,
@@ -1005,7 +1005,7 @@
       ]
     },
     {
-      "name": "a boolean passes through as a boolean — the producer emits msgpack bools for bool columns, never t/f text (measured: a SQLite replica held TEXT 't' from chains and INTEGER 1 from CDC in one column)",
+      "name": "a boolean passes through as a boolean \u2014 the producer emits msgpack bools for bool columns, never t/f text (measured: a SQLite replica held TEXT 't' from chains and INTEGER 1 from CDC in one column)",
       "row": [
         "u1",
         true,
@@ -1066,6 +1066,31 @@
         "b"
       ],
       "ddl": "\"a\" TEXT NOT NULL"
+    },
+    {
+      "name": "constant default carried (a client's engine fills existing rows \u2014 \u00a710df)",
+      "col": {
+        "name": "n",
+        "type": "INTEGER",
+        "default": "5"
+      },
+      "pkCols": [
+        "id"
+      ],
+      "ddl": "\"n\" INTEGER DEFAULT 5"
+    },
+    {
+      "name": "quoted default kept quoted, NOT NULL before DEFAULT",
+      "col": {
+        "name": "kind",
+        "type": "TEXT",
+        "required": true,
+        "default": "'plain'"
+      },
+      "pkCols": [
+        "id"
+      ],
+      "ddl": "\"kind\" TEXT NOT NULL DEFAULT 'plain'"
     }
   ],
   "fkClauses": [
@@ -1322,7 +1347,7 @@
       }
     },
     {
-      "name": "§1.2: an unhinted rename degrades to add+remove (values lost, by protocol)",
+      "name": "\u00a71.2: an unhinted rename degrades to add+remove (values lost, by protocol)",
       "existing": [
         "a",
         "old_n"
@@ -1369,7 +1394,7 @@
       "differs": false
     },
     {
-      "name": "different parent: differs (forces a rebuild — SQLite has no ADD CONSTRAINT)",
+      "name": "different parent: differs (forces a rebuild \u2014 SQLite has no ADD CONSTRAINT)",
       "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES q (\"y\"))",
       "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
       "differs": true
@@ -1645,7 +1670,7 @@
   ],
   "hlcVersion": [
     {
-      "name": "THE lost-update killer: slow clock, newer floor seen via CDC -> floor + 1µs",
+      "name": "THE lost-update killer: slow clock, newer floor seen via CDC -> floor + 1\u00b5s",
       "now": "2026-08-27T10:00:00.000Z",
       "last": "2026-08-27T09:00:00.000000Z",
       "floor": "2026-08-27T10:00:30.500000Z",
@@ -1738,7 +1763,7 @@
       ]
     },
     {
-      "name": "an entry with no version is never refused — the server's version guard still fronts it",
+      "name": "an entry with no version is never refused \u2014 the server's version guard still fronts it",
       "entries": [
         {
           "msgId": "a",
@@ -1812,7 +1837,7 @@
   ],
   "tombstoned": [
     {
-      "name": "tombstone set drops the row (PROTOCOL §7.5: the soft delete IS the removal; the reap never arrives)",
+      "name": "tombstone set drops the row (PROTOCOL \u00a77.5: the soft delete IS the removal; the reap never arrives)",
       "tombstoneColumn": "deleted_at",
       "data": {
         "uid": "u1",
@@ -1848,7 +1873,7 @@
       "drops": false
     },
     {
-      "name": "empty string is a value, not null — the row is tombstoned (measured: libzb held 134 reaped rows)",
+      "name": "empty string is a value, not null \u2014 the row is tombstoned (measured: libzb held 134 reaped rows)",
       "tombstoneColumn": "deleted_at",
       "data": {
         "uid": "u1",
@@ -1865,7 +1890,7 @@
   ],
   "update": [
     {
-      "name": "partial payload on an existing row sets only what was sent (§7's asymmetry — the upsert's INSERT arm failed NOT NULL here)",
+      "name": "partial payload on an existing row sets only what was sent (\u00a77's asymmetry \u2014 the upsert's INSERT arm failed NOT NULL here)",
       "table": "test_types",
       "pkCols": [
         "uid"
@@ -1945,7 +1970,7 @@
       }
     },
     {
-      "name": "key only: nothing to set → null",
+      "name": "key only: nothing to set \u2192 null",
       "table": "t",
       "pkCols": [
         "id"
@@ -1956,7 +1981,7 @@
       "plan": null
     },
     {
-      "name": "incomplete key → null (cannot address one row)",
+      "name": "incomplete key \u2192 null (cannot address one row)",
       "table": "t",
       "pkCols": [
         "a",
@@ -1969,7 +1994,7 @@
       "plan": null
     },
     {
-      "name": "no primary key → null",
+      "name": "no primary key \u2192 null",
       "table": "t",
       "pkCols": [],
       "data": {
@@ -1981,7 +2006,7 @@
   ],
   "exists": [
     {
-      "name": "full key → SELECT 1 … LIMIT 1",
+      "name": "full key \u2192 SELECT 1 \u2026 LIMIT 1",
       "table": "t",
       "pkCols": [
         "id"
@@ -2017,7 +2042,7 @@
       }
     },
     {
-      "name": "null key column → null",
+      "name": "null key column \u2192 null",
       "table": "t",
       "pkCols": [
         "id"
@@ -2028,7 +2053,7 @@
       "plan": null
     },
     {
-      "name": "no primary key → null",
+      "name": "no primary key \u2192 null",
       "table": "t",
       "pkCols": [],
       "data": {
@@ -2047,7 +2072,7 @@
       "out": "{web,push-1}"
     },
     {
-      "name": "a comma inside a value is quoted (measured: the browser's INS on PGlite — malformed array literal on the JSON form)",
+      "name": "a comma inside a value is quoted (measured: the browser's INS on PGlite \u2014 malformed array literal on the JSON form)",
       "in": [
         "a",
         "with,comma"
@@ -2105,6 +2130,210 @@
       "name": "empty array",
       "in": [],
       "out": "{}"
+    }
+  ],
+  "heartbeat": [
+    {
+      "name": "streams sorted bytewise (uppercase before lowercase), integers verbatim",
+      "principal": "omar",
+      "tenant": "kilo",
+      "ts": 1757150000123,
+      "seqs": {
+        "CDC_kilo": 223,
+        "CDC_PUBLIC": 3190
+      },
+      "out": "{\"principal\":\"omar\",\"tenant\":\"kilo\",\"ts\":1757150000123,\"streams\":{\"CDC_PUBLIC\":3190,\"CDC_kilo\":223}}"
+    },
+    {
+      "name": "no streams yet (before the first sync)",
+      "principal": "alice",
+      "tenant": "_default",
+      "ts": 1,
+      "seqs": {},
+      "out": "{\"principal\":\"alice\",\"tenant\":\"_default\",\"ts\":1,\"streams\":{}}"
+    },
+    {
+      "name": "one stream, zero applied",
+      "principal": "nina",
+      "tenant": "acme",
+      "ts": 42,
+      "seqs": {
+        "CDC_acme": 0
+      },
+      "out": "{\"principal\":\"nina\",\"tenant\":\"acme\",\"ts\":42,\"streams\":{\"CDC_acme\":0}}"
+    }
+  ],
+  "shape": [
+    {
+      "name": "single pk keeps its dialect type; types sorted by name",
+      "pkCols": [
+        "id"
+      ],
+      "cols": [
+        {
+          "name": "name",
+          "type": "TEXT"
+        },
+        {
+          "name": "id",
+          "type": "INTEGER"
+        }
+      ],
+      "key": "[[\"id\",\"INTEGER\"]]",
+      "types": "[[\"id\",\"INTEGER\"],[\"name\",\"TEXT\"]]"
+    },
+    {
+      "name": "composite pk keeps PK ORDER (b before a), not name order (\u00a710dg)",
+      "pkCols": [
+        "b",
+        "a"
+      ],
+      "cols": [
+        {
+          "name": "a",
+          "type": "TEXT"
+        },
+        {
+          "name": "b",
+          "type": "INTEGER"
+        }
+      ],
+      "key": "[[\"b\",\"INTEGER\"],[\"a\",\"TEXT\"]]",
+      "types": "[[\"a\",\"TEXT\"],[\"b\",\"INTEGER\"]]"
+    },
+    {
+      "name": "no pk: empty key shape, types still recorded",
+      "pkCols": [],
+      "cols": [
+        {
+          "name": "a",
+          "type": "TEXT"
+        }
+      ],
+      "key": "[]",
+      "types": "[[\"a\",\"TEXT\"]]"
+    },
+    {
+      "name": "a pk column the descriptor does not list is skipped, not guessed",
+      "pkCols": [
+        "id",
+        "ghost"
+      ],
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        }
+      ],
+      "key": "[[\"id\",\"INTEGER\"]]",
+      "types": "[[\"id\",\"INTEGER\"]]"
+    },
+    {
+      "name": "bigserial\u2192uuid on the pk changes the key shape (INTEGER\u2192TEXT in the sqlite block)",
+      "pkCols": [
+        "id"
+      ],
+      "cols": [
+        {
+          "name": "id",
+          "type": "TEXT"
+        },
+        {
+          "name": "name",
+          "type": "TEXT"
+        }
+      ],
+      "key": "[[\"id\",\"TEXT\"]]",
+      "types": "[[\"id\",\"TEXT\"],[\"name\",\"TEXT\"]]"
+    }
+  ],
+  "retyped": [
+    {
+      "name": "no stored record: nothing known, nothing retyped",
+      "stored": null,
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        }
+      ],
+      "out": []
+    },
+    {
+      "name": "unreadable record reads as unknown, never as everything changed",
+      "stored": "not json",
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        }
+      ],
+      "out": []
+    },
+    {
+      "name": "same shape: nothing retyped",
+      "stored": "[[\"id\",\"INTEGER\"],[\"user_id\",\"INTEGER\"]]",
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        },
+        {
+          "name": "user_id",
+          "type": "INTEGER"
+        }
+      ],
+      "out": []
+    },
+    {
+      "name": "FK column follows its parent's re-key (bigint\u2192uuid): retyped",
+      "stored": "[[\"id\",\"INTEGER\"],[\"user_id\",\"INTEGER\"]]",
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        },
+        {
+          "name": "user_id",
+          "type": "TEXT"
+        }
+      ],
+      "out": [
+        "user_id"
+      ]
+    },
+    {
+      "name": "an added column is diffColumns' business, a removed one too",
+      "stored": "[[\"id\",\"INTEGER\"],[\"old\",\"TEXT\"]]",
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        },
+        {
+          "name": "new",
+          "type": "REAL"
+        }
+      ],
+      "out": []
+    },
+    {
+      "name": "order of the descriptor's columns is irrelevant; output follows descriptor order",
+      "stored": "[[\"a\",\"TEXT\"],[\"b\",\"TEXT\"]]",
+      "cols": [
+        {
+          "name": "b",
+          "type": "INTEGER"
+        },
+        {
+          "name": "a",
+          "type": "REAL"
+        }
+      ],
+      "out": [
+        "b",
+        "a"
+      ]
     }
   ]
 }

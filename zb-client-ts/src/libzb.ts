@@ -28,12 +28,12 @@ import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts'
 import { browserStorage } from './browser-storage.ts';
 import { sqliteDialect, type Dialect } from './dialect.ts';
 import { v7 as uuidv7 } from 'uuid';
-import {
+import { heartbeatPayload,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
   scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
-  fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
+  fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
@@ -58,6 +58,8 @@ export interface ZeBridgeConfig {
   /// (scoped signing key), so no server conf names this principal at all.
   creds?: string;
   grammar: any;   // the parsed grammar.json — wire names only; the consumer imports and passes it
+  /// PROTOCOL §9: the fleet heartbeat cadence in ms (default 30 000; 0 disables).
+  heartbeatMs?: number;
   durable?: boolean;
   /// The two seams (NOTES §10). Defaults are the browser: sqlocal/OPFS storage
   /// and a NATS WebSocket dial. A Node host injects better-sqlite3 + TCP
@@ -74,6 +76,8 @@ export type TableState = {
   /// The table's LWW version column (from the schema payload) — read to feed
   /// the HLC floor; the guard itself runs in SQL and in PG.
   versionColumn?: string | null;
+  /// The catalogue's seed_epoch the descriptor carried (§10df).
+  seedEpoch?: number;
   lsn: number;
   /// The seed gate's PRIMARY anchor (finding 7, NOTES §10i): the CDC stream's
   /// last_seq captured by the producer AT CHAIN BUILD TIME, and which stream it
@@ -203,7 +207,6 @@ export class ZeBridge {
   private failed = new Set<string>();
   private suspendedMap = new Map<string, string>();
   private globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, seq: {} };
-  private pendingEvents: { table: string; ev: any }[] = [];
   private pendingWrites = new Map<string, { table: string; id: number | string; at: number }>();
 
   private tenantValue = '';
@@ -235,6 +238,7 @@ export class ZeBridge {
   private fkHeld: { id?: number; table: string; ev: any }[] = [];
   private sweepId?: ReturnType<typeof setInterval>;
   private rttIntervalId?: ReturnType<typeof setInterval>;
+  private hbIntervalId?: ReturnType<typeof setInterval>;
   private recountTimer?: ReturnType<typeof setTimeout>;
 
   private config: ZeBridgeConfig;
@@ -334,7 +338,7 @@ export class ZeBridge {
   public get tenant(): string { return this.tenantValue; }
   public get clientId(): string { return this.clientIdValue; }
   /// Events held back waiting for a schema newer than they are.
-  public get heldCount(): number { return this.pendingEvents.length; }
+  public get heldCount(): number { return this.fkHeld.length; }
   /// Events held waiting for a PARENT ROW — a foreign key whose target has not
   /// arrived yet, which happens when one PostgreSQL transaction is split across
   /// batches. Non-zero for long is a real signal: the parent never came.
@@ -400,6 +404,14 @@ export class ZeBridge {
       await this.watchSchemas();
       await this.watchVerdicts();
       await this.resolveTenant();
+      // PROTOCOL §9: beat from HERE, before the seed — a client stuck seeding (a chain
+      // that never comes, a slow device) is exactly the one an operator must see, with
+      // its zero positions. libzb beats from its first poll for the same reason.
+      const hb = this.config.heartbeatMs ?? 30_000;
+      if (hb > 0) {
+        this.hbIntervalId = setInterval(() => void this.sendHeartbeat(), hb);
+        void this.sendHeartbeat();
+      }
       await this.subscribeStreams();
       this.reach('cdc');
 
@@ -456,6 +468,7 @@ export class ZeBridge {
   public async close(): Promise<void> {
     clearInterval(this.sweepId);
     clearInterval(this.rttIntervalId);
+    clearInterval(this.hbIntervalId);
     clearTimeout(this.recountTimer);
     if (this.nc) {
       await this.nc.close();
@@ -521,9 +534,15 @@ export class ZeBridge {
       CREATE TABLE IF NOT EXISTS _zebridge_generations (
         tbl TEXT PRIMARY KEY,
         watermark TEXT NOT NULL,
-        cutoff_lsn ${this.dialect.int64} NOT NULL
+        cutoff_lsn ${this.dialect.int64} NOT NULL,
+        seed_epoch INTEGER NOT NULL DEFAULT 0
       );
     `);
+    // A replica from before §10df: the column is added; refused, harmlessly, on one that has it.
+    try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0`); } catch { /* present */ }
+    // §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
+    // the record a re-key or a re-type is detected against.
+    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_shape (tbl TEXT PRIMARY KEY, key_shape TEXT NOT NULL, type_shape TEXT NOT NULL)`);
     await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_dicts (name TEXT PRIMARY KEY, bytes ${this.dialect.blobType} NOT NULL)`); // §10x dictionary cache
     await this.createOutboxTable();
     this.resolveOutboxInit();
@@ -748,23 +767,27 @@ export class ZeBridge {
       await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
       await this.run(`DROP TABLE IF EXISTS ${table};`);
       this.syncedTables.delete(table);
-      // Queued writes for a dropped table can never apply — the server would only
-      // answer row_deleted (or worse, land on an unrelated table that later reuses
-      // the name). Discard them LOUDLY: a silent queue that drains into a void is
-      // exactly what the outbox exists to prevent.
-      try {
-        const q = await this.run(`SELECT count(*) AS k FROM _zebridge_outbox WHERE tbl = ?`, table);
-        const k = q?.[0]?.k ?? 0;
-        if (k > 0) {
-          await this.run(`DELETE FROM _zebridge_outbox WHERE tbl = ?`, table);
-          this.appendLog('SCHEMA', `${k} queued write(s) for dropped table "${table}" discarded — surface this to the user`, 'WARNING');
-        }
-      } catch { /* outbox not initialized yet — nothing queued */ }
+      await this.discardOutbox(table, 'dropped');
       this.appendLog('SCHEMA', `Dropped local table "${table}" (${reason})`, 'DROP');
       this.scheduleRecount();
     } catch (err) {
       this.appendLog('SCHEMA', `Drop of ${table} failed: ${err}`, 'ERROR');
     }
+  }
+
+  /// Queued writes for a dropped or re-keyed table can never apply — the server
+  /// would only answer row_deleted (or worse, land on an unrelated table that later
+  /// reuses the name). Discard them LOUDLY: a silent queue that drains into a void
+  /// is exactly what the outbox exists to prevent.
+  private async discardOutbox(table: string, why: string) {
+    try {
+      const q = await this.run(`SELECT count(*) AS k FROM _zebridge_outbox WHERE tbl = ?`, table);
+      const k = q?.[0]?.k ?? 0;
+      if (k > 0) {
+        await this.run(`DELETE FROM _zebridge_outbox WHERE tbl = ?`, table);
+        this.appendLog('SCHEMA', `${k} queued write(s) for ${why} table "${table}" discarded — surface this to the user`, 'WARNING');
+      }
+    } catch { /* outbox not initialized yet — nothing queued */ }
   }
 
   private async applySchema(table: string, val: any) {
@@ -775,7 +798,7 @@ export class ZeBridge {
     // carried both since §10c, and this is the first consumer of `pg`. Column NAMES,
     // pk, indexes and FKs are dialect-neutral at the root.
     const block = val[this.dialect.schemaBlock] ?? val.sqlite;
-    const cols: { name: string; type: string; required?: boolean }[] = block.columns;
+    const cols: { name: string; type: string; required?: boolean; default?: string }[] = block.columns;
     // Dialect-neutral, at the root: CREATE [UNIQUE] INDEX is the same statement here
     // and in PGlite/local Postgres, so one list serves every consumer shape (§10c).
     const indexes: { name: string; unique?: boolean; columns: string[] }[] =
@@ -787,6 +810,7 @@ export class ZeBridge {
     const lsn: number = typeof val.lsn === 'number' ? val.lsn : 0;
     const tombstoneColumn: string | null = typeof val.tombstone_column === 'string' ? val.tombstone_column : null;
     const tenantColumn: string | null = typeof val.tenant_column === 'string' ? val.tenant_column : null;
+    const seedEpoch: number = typeof val.seed_epoch === 'number' ? val.seed_epoch : 0;
     const versionColumn: string | null = typeof val.version_column === 'string' ? val.version_column : null;
     const names = cols.map((c) => c.name);
 
@@ -815,6 +839,27 @@ export class ZeBridge {
         }
       } catch { /* introspection failed — behaves as before */ }
     }
+    // §10dg: the shape this replica BUILT — its own record, not an introspection
+    // (whose type text differs per engine). Key shape moved → re-key: the table is
+    // rebuilt EMPTY (rows keyed the old way cannot be re-keyed in place; SQLite's
+    // INTEGER PRIMARY KEY refuses a uuid) and re-seeded. A non-key type moved → an
+    // ALTER COLUMN TYPE where the engine has one, a row-keeping rebuild where not.
+    const keyNow = keyShape(pkCols, cols);
+    const typeNow = typeShape(cols);
+    let keyBefore: string | null = null;
+    let typeBefore: string | null = null;
+    try {
+      const r = await this.run(`SELECT key_shape, type_shape FROM _zebridge_shape WHERE tbl = ?`, table);
+      if (r?.length) { keyBefore = r[0].key_shape ?? null; typeBefore = r[0].type_shape ?? null; }
+    } catch { /* no record yet */ }
+    const rekey = !!existing && keyBefore !== null && keyBefore !== keyNow;
+    const retyped = rekey ? [] : retypedColumns(typeBefore, cols);
+    // Set when the rows had to go (a re-key, or a rebuild that could not carry them):
+    // the watermark goes with them and a fresh full brings them back.
+    let emptied = rekey;
+    const recordShape = () =>
+      this.run(this.dialect.insertReplace('_zebridge_shape', ['tbl', 'key_shape', 'type_shape'], ['tbl']), table, keyNow, typeNow);
+
     // core.diffColumns (§10s 2b): rename-aware — a hinted rename is neither
     // added nor removed; an unhinted one degrades to add+remove (§1.2).
     const { renames, added, removed } = diffColumns(
@@ -832,28 +877,60 @@ export class ZeBridge {
       // by salaries' FK). Off for the surgery, back on after — the data is copied,
       // not changed.
       try { await this.dialect.setForeignKeys(this.run, false); } catch { /* engine without it */ }
-      for (const st of rebuildSteps(table, cols, pkCols, foreignKeys, existing ? existing.columns : [], ddlOpts)) {
-        await this.run(st.sql, ...st.params);
+      try {
+        for (const st of rebuildSteps(table, cols, pkCols, foreignKeys, existing ? existing.columns : [], ddlOpts)) {
+          await this.run(st.sql, ...st.params);
+        }
+        this.appendLog('SCHEMA', `${table}: rebuilt preserving common columns (${why}), lsn=${lsn}`, 'MIGRATE');
+      } catch (carryErr) {
+        // §10dg: a migration that cannot carry the rows degrades to a re-seed, never
+        // to a table stuck in its old shape — measured on a re-key: the parent stood
+        // empty (waiting for its full) while the child's copy hit its FOREIGN KEY.
+        // Empty now; the watermark goes below, and the next full brings the rows back.
+        await this.run(`DROP TABLE IF EXISTS ${table}__migrating;`);
+        for (const st of createTableSteps(table, cols, pkCols, foreignKeys, ddlOpts)) await this.run(st.sql, ...st.params);
+        await this.pruneInboxDropped(table);
+        await this.discardOutbox(table, 'emptied');
+        await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
+        emptied = true;
+        this.appendLog('SCHEMA', `${table}: rows could not be carried through the rebuild (${carryErr}) — rebuilt EMPTY, watermark dropped, re-seeding from a fresh full`, 'REKEY');
+      } finally {
+        try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ }
       }
-      try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ }
-      this.appendLog('SCHEMA', `${table}: rebuilt preserving common columns (${why}), lsn=${lsn}`, 'MIGRATE');
     };
 
     try {
-      if (!existing) {
+      if (!existing || rekey) {
+        if (rekey) {
+          // Everything that referred to the old key goes with it: held events, queued
+          // writes, the view; the watermark below, once the empty table stands.
+          await this.pruneInboxDropped(table);
+          await this.discardOutbox(table, 're-keyed');
+          await this.run(`DROP VIEW IF EXISTS ${table}_view;`);
+          try { await this.dialect.setForeignKeys(this.run, false); } catch { /* engine without it */ }
+        }
         for (const st of createTableSteps(table, cols, pkCols, foreignKeys, ddlOpts)) {
           await this.run(st.sql, ...st.params);
         }
-        this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
-      } else if (added.length === 0 && removed.length === 0 && renames.length === 0 &&
+        if (rekey) {
+          try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ }
+          await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
+          this.appendLog('SCHEMA', `${table}: key shape changed (${keyBefore} → ${keyNow}) — rebuilt EMPTY, watermark dropped, re-seeding from a fresh full`, 'REKEY');
+        } else {
+          this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
+        }
+      } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses))) {
-        this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn });
+        await recordShape();
+        this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
         this.reach('migrated');
         this.scheduleRecount();
         // ⚠️ NOT a no-op path for indexes. Adding an index in PostgreSQL changes no
         // column, so the republish that carries it lands EXACTLY here — returning
         // without syncing would make `CREATE INDEX` upstream a silent no-op forever.
         await this.syncIndexes(table, indexes);
+        // §10df: a republish is usually identical in shape — the epoch is the message.
+        await this.reseedIfEpochMoved(table, seedEpoch);
         return; // identical schema, e.g. a boot republish
       } else {
         // The view goes FIRST (§1.17): DROP COLUMN re-validates every schema object
@@ -868,8 +945,19 @@ export class ZeBridge {
             await this.run(`ALTER TABLE ${table} DROP COLUMN "${name}";`);
           }
           for (const name of added) {
-            const type = cols.find((c) => c.name === name)!.type;
-            await this.run(`ALTER TABLE ${table} ADD COLUMN "${name}" ${type};`);
+            const c = cols.find((x) => x.name === name)!;
+            // A constant default rides along (§10df): SQLite and PGlite both fill the
+            // existing rows with it, so PostgreSQL's old rows and ours converge.
+            const dflt = c.default != null && c.default !== '' ? ` DEFAULT ${c.default}` : '';
+            await this.run(`ALTER TABLE ${table} ADD COLUMN "${name}" ${c.type}${dflt};`);
+          }
+          for (const name of retyped) {
+            const c = cols.find((x) => x.name === name)!;
+            // SQLite has no ALTER COLUMN TYPE: the throw lands in the rebuild below,
+            // which copies the rows (affinity converts what converts).
+            if (!this.dialect.alterColumnType) throw new Error(`column "${name}" re-typed to ${c.type}`);
+            await this.dialect.alterColumnType(this.run, table, name, c.type);
+            this.appendLog('SCHEMA', `${table}: column "${name}" re-typed to ${c.type} in place`, 'MIGRATE');
           }
           if (await this.foreignKeysDiffer(table, fkClauses)) {
             if (this.dialect.alterForeignKeys) {
@@ -892,12 +980,17 @@ export class ZeBridge {
       // After every shape change, because a rebuild DROPs the table and takes its
       // indexes with it.
       await this.syncIndexes(table, indexes);
+      await recordShape();
 
-      this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn });
+      this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
       this.scheduleRecount();
 
+      await this.reseedIfEpochMoved(table, seedEpoch);
+      // A re-key (or an emptied rebuild) dropped its own watermark above; the epoch
+      // check has nothing to compare, so the seed is kicked here.
+      if (emptied) this.kickReseed(table);
       await this.drainPending(table);
     } catch (err) {
       this.appendLog('SCHEMA', `Applying schema for ${table} failed: ${err}`, 'ERROR');
@@ -955,15 +1048,55 @@ export class ZeBridge {
     }
   }
 
+  /// §10df: the descriptor's seed_epoch is above the one this replica seeded at —
+  /// zebridge_reseed() ran upstream. Forget the watermark, so the table seeds a fresh
+  /// full (now, if connected; else at the next connect's gap check).
+  private async reseedIfEpochMoved(table: string, epoch: number) {
+    try {
+      const r = await this.run(`SELECT seed_epoch FROM _zebridge_generations WHERE tbl = ?`, table);
+      if (!r?.length) return;
+      const stored = Number(r[0].seed_epoch ?? 0);
+      if (stored >= epoch) return;
+      await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
+      this.appendLog('SYS', `${table}: seed epoch ${stored} → ${epoch} (zebridge_reseed) — watermark dropped, re-seeding from a fresh full`, 'RESEED');
+      this.kickReseed(table);
+    } catch { /* no watermark yet */ }
+  }
+
+  /// §10df/§10dg: a re-seed asked for by a descriptor (an epoch move, a re-key, a
+  /// rebuild that could not carry the rows) may precede the producer's full by up to
+  /// one cadence — `applyGenerations` answers false ("wait") until it lands. One
+  /// fire-and-forget call was measured to leave the table empty until the next
+  /// connect; this keeps asking, one loop per table, on the connect path's clock.
+  private reseedKicks = new Map<string, Promise<void>>();
+  /// How many re-seeds hold FK enforcement off (a parent's full replay DELETEs rows
+  /// its children still reference — measured: "FOREIGN KEY constraint failed" on
+  /// the first kick). Off at the first, back on after the last, like the connect path.
+  private fkHolds = 0;
+  private kickReseed(table: string) {
+    if (!this.nc || this.resyncing || this.reseedKicks.has(table)) return;
+    const loop = (async () => {
+      if (this.fkHolds++ === 0) { try { await this.dialect.setForeignKeys(this.run, false); } catch { /* engine without it */ } }
+      try {
+        const deadline = Date.now() + GENERATION_WAIT_MS;
+        while (Date.now() < deadline) {
+          if (await this.applyGenerations(table)) return;
+          await new Promise((r) => setTimeout(r, GENERATION_POLL_MS));
+        }
+        this.appendLog('SYS', `${table}: re-seed asked for, but no chain under the new epoch after ${GENERATION_WAIT_MS / 1000}s — retried at the next connect`, 'WARN');
+      } finally {
+        if (--this.fkHolds === 0) { try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ } }
+      }
+    })().catch((e) => this.appendLog('SYS', `${table}: re-seed failed: ${e}`, 'ERROR'))
+      .finally(() => this.reseedKicks.delete(table));
+    this.reseedKicks.set(table, loop);
+  }
+
   private async drainPending(table: string) {
-    if (!this.pendingEvents.length) return;
-    const mine = this.pendingEvents.filter((p) => p.table === table);
-    if (!mine.length) return;
-    for (let i = this.pendingEvents.length - 1; i >= 0; i--) {
-      if (this.pendingEvents[i].table === table) this.pendingEvents.splice(i, 1);
-    }
-    this.appendLog('CDC', `Replaying ${mine.length} held event(s) for ${table}`, 'DRAIN');
-    for (const p of mine) await this.applyEvent(p.table, p.ev);
+    // The schema moved: whatever was held for this table (unknown columns, a missing
+    // parent) gets its retry now, from the inbox.
+    if (!this.fkHeld.some((h) => h.table === table)) return;
+    await this.retryFkHeld(`schema:${table}`);
   }
 
   /// A batch failed as a unit — replay it event by event so one bad row cannot take
@@ -1081,8 +1214,19 @@ export class ZeBridge {
   /// a cross-batch split self-healing rather than a silent hole.
   private async retryFkHeld(streamName: string) {
     if (!this.fkHeld.length) return;
-    const pending = this.fkHeld;
-    this.fkHeld = [];
+    // An event still ahead of its table's schema is not retried, and not dropped:
+    // it waits for the descriptor (attempts + 1), the same as a missing parent.
+    const behind = (h: { table: string; ev: any }) => {
+      const st = this.syncedTables.get(h.table);
+      if (!st) return true;
+      const data = h.ev?.data ?? {};
+      return Object.keys(data).some((k) => !k.startsWith('old.') && !st.columns.includes(k));
+    };
+    const waiting = this.fkHeld.filter(behind);
+    const pending = this.fkHeld.filter((h) => !behind(h));
+    this.fkHeld = waiting;
+    for (const h of waiting) if (h.id != null) { try { await this.run(`UPDATE _zebridge_inbox SET attempts = attempts + 1 WHERE id = ?`, h.id); } catch { /* best effort */ } }
+    if (!pending.length) return;
     let applied = 0;
 
     // ⚠️ BULK FIRST, and this is the whole difference between converging and not.
@@ -1186,7 +1330,9 @@ export class ZeBridge {
       const keys = Object.keys(ev.data);
       const unknown = keys.filter((k) => !state.columns.includes(k) && !k.startsWith('old.'));
       if (unknown.length) {
-        this.pendingEvents.push({ table, ev });
+        // Durable, in the inbox (CLIENTS.md, §10de): a host killed while a migration
+        // is in flight must not lose the rows that arrived in the new shape.
+        await this.holdEvent(table, ev, `unknown column(s) [${unknown.join(', ')}]`);
         this.appendLog('CDC', `Holding ${op} on ${table}: unknown column(s) [${unknown.join(', ')}] — awaiting schema newer than lsn ${state.lsn}`, 'HOLD');
         this.scheduleRecount();
         return;
@@ -1389,11 +1535,21 @@ export class ZeBridge {
       try {
         const kv = await this.transport.kv(this.nc!, GEN.kv, { allow_direct: true });
         const entry = await kv.get(key);
-        return entry ? JSON.parse(td.decode(entry.value)) : null; // manifest is JSON
+        // A swept chain (§10dg) leaves a DEL marker with an empty value: no manifest.
+        if (!entry || entry.operation !== 'PUT' || !entry.value?.length) return null;
+        return JSON.parse(td.decode(entry.value)); // manifest is JSON
       } catch (e) { this.appendLog('SYS', `${table}: chain manifest unreadable: ${e}`, 'ERROR'); return null; }
     };
     let manifest = await readManifest();
     if (!manifest?.full?.object) return false;
+    // §10df: a manifest built BEFORE the re-seed was asked for cannot serve it — seeding
+    // from it would record the new epoch over the old data. The descriptor's epoch and
+    // the producer's full arrive on independent clocks; false here means "wait", and
+    // the caller's loop polls again.
+    if ((manifest.seed_epoch ?? 0) < (state.seedEpoch ?? 0)) {
+      this.appendLog('SYS', `${table}: chain g${manifest.gen} predates the re-seed (epoch ${manifest.seed_epoch ?? 0} < ${state.seedEpoch}) — waiting for the producer's full`, 'INFO');
+      return false;
+    }
 
     let os: any;
     try { os = await this.transport.objectStore(this.nc, manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
@@ -1511,9 +1667,9 @@ export class ZeBridge {
     }
     await this.pruneInboxSeeded(table, state.lsn);
     await this.run(
-      `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn) VALUES (?, ?, ?)
-       ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn`,
-      table, manifest.cutoff_version, state.lsn,
+      `INSERT INTO _zebridge_generations (tbl, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?)
+       ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch`,
+      table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0,
     );
     this.scheduleRecount();
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
@@ -2207,6 +2363,24 @@ export class ZeBridge {
   /// A real PING against a possibly-lying transport: a frozen server can leave the
   /// WebSocket believing it is open with no 'disconnect' ever fired. Acts only on
   /// transitions — the recovery transition is the one nc.status() might never report.
+  /// PROTOCOL §9: the fleet heartbeat — this client's applied position per CDC stream,
+  /// to `$KV.live.<tenant>.<principal>` (last value per key, TTL on the bucket, so a
+  /// client that stops beating drops off the bridge's fleet metrics by itself). The
+  /// payload is core.heartbeatPayload, fixture-pinned with libzb. Cooperative: a failed
+  /// beat is logged and the next interval tries again.
+  private async sendHeartbeat() {
+    if (!this.nc) return;
+    const tenant = this.tenantValue || this.config.grammar?.open_tenant || '_default';
+    const bucket = this.config.grammar?.kv?.live ?? 'live';
+    const subject = `$KV.${bucket}.${tenant}.${this.config.principal}`;
+    try {
+      const payload = heartbeatPayload(this.config.principal, tenant, Date.now(), this.globalSyncState.seq);
+      await this.transport.jetstream(this.nc).publish(subject, new TextEncoder().encode(payload));
+    } catch (err) {
+      this.appendLog('SYS', `heartbeat not accepted (${subject}): ${err}`, 'WARNING');
+    }
+  }
+
   private async pollNatsRtt() {
     if (!this.nc) return;
     try {

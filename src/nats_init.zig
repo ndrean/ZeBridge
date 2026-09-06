@@ -83,6 +83,7 @@ fn clientAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) !struc
     const kv_schemas = topo.kv_schemas;
     const kv_gens = topo.kv_generations;
     const kv_tenants = topo.kv_tenants;
+    const kv_live = topo.kv_live;
     const obj_pre = topo.generation_bucket_prefix; // "gen-"
     const open = topo.open_tenant; // "_default"
     const subj_cdc = topo.subject_cdc_prefix; // "cdc"
@@ -133,6 +134,9 @@ fn clientAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) !struc
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{{{{tag(tenant)}}}}.>", .{obj_pre});
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{s}.>", .{ obj_pre, open });
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{subj_ack});
+    // §10dc: the fleet heartbeat — a client may write ONLY its own key.
+    try P.add(&pubs, a, "$KV.{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}", .{kv_live});
+    try P.add(&pubs, a, "$KV.{s}.{s}.{{{{name()}}}}", .{ kv_live, open });
     try P.add(&pubs, a, "$JS.ACK.>", .{});
 
     try P.add(&subs, a, "{s}.{{{{name()}}}}.>", .{subj_ack});

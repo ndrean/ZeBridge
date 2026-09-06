@@ -13,6 +13,7 @@ const msgpack = @import("msgpack");
 const http_server = @import("http_server.zig");
 const metrics_mod = @import("metrics.zig");
 const wal_monitor = @import("wal_monitor.zig");
+const fleet_monitor = @import("fleet_monitor.zig");
 const pg_conn = @import("pg_conn.zig");
 const args = @import("args.zig");
 const nkey_gen = @import("nkey_gen.zig");
@@ -209,7 +210,7 @@ fn resolveMaxColumns(
         return Config.Batch.default_max_columns;
     }
 
-    const chunks = std.math.divCeil(u32, widest, Config.Batch.column_headroom_rounding) catch widest;
+    const chunks = std.math.divCeil(u32, widest * Config.Batch.column_headroom_factor, Config.Batch.column_headroom_rounding) catch widest;
     const headroomed: u32 = chunks * Config.Batch.column_headroom_rounding;
     const clamped: u16 = @intCast(std.math.clamp(
         headroomed,
@@ -217,7 +218,7 @@ fn resolveMaxColumns(
         @as(u32, Config.Batch.absolute_max_columns),
     ));
 
-    log.info("MAX_COLUMNS={d} (auto-detected: widest monitored table has {d} columns, rounded up to a multiple of {d})", .{
+    log.info("MAX_COLUMNS={d} (auto-detected: widest monitored table has {d} columns, doubled for migration headroom, rounded up to a multiple of {d})", .{
         clamped,
         widest,
         Config.Batch.column_headroom_rounding,
@@ -900,9 +901,6 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(code);
     }
 
-
-
-
     var replication_ctx = try initReplication(
         allocator,
         &pg_config,
@@ -940,6 +938,22 @@ pub fn main(init: std.process.Init) !void {
             const conn = c.PQconnectdb(ci.ptr);
             defer if (conn != null) c.PQfinish(conn);
             if (conn != null and c.PQstatus(conn) == c.CONNECTION_OK) {
+                // §10dh, BEFORE the wipe: a table suspended for `too_many_columns` or
+                // `row_too_large` was being followed, and every row written while it
+                // was suspended was dropped. This boot may lift it (MAX_COLUMNS
+                // re-detects, a BASE_BUF was raised) with no memory of the drops, so
+                // the re-seed is asked for here, for those two reasons only — a table
+                // refused for no key or no subject was never followed, and has
+                // nothing to re-seed.
+                const spanned = c.PQexec(conn, "SELECT string_agg(tbl, ',') FROM public.zebridge_suspensions WHERE reason IN ('too_many_columns', 'row_too_large')");
+                if (c.PQresultStatus(spanned) == c.PGRES_TUPLES_OK and c.PQntuples(spanned) > 0 and c.PQgetisnull(spanned, 0, 0) == 0) {
+                    var it = std.mem.splitScalar(u8, std.mem.span(c.PQgetvalue(spanned, 0, 0)), ',');
+                    while (it.next()) |tbl| {
+                        log.info("🧬 '{s}' was suspended when the last bridge stopped (events dropped meanwhile) — asking for a re-seed before this boot lifts it", .{tbl});
+                        refused.reseedAfterLift(tbl, null);
+                    }
+                }
+                c.PQclear(spanned);
                 const res = c.PQexec(conn, "SELECT public.zebridge_clear_suspensions()");
                 defer c.PQclear(res);
             }
@@ -1022,6 +1036,12 @@ pub fn main(init: std.process.Init) !void {
         wal_monitor_config,
         &should_stop,
     );
+    // §10db: the slot inventory — every slot on the reader's server, for /metrics.
+    var slot_registry = wal_monitor.SlotRegistry.init(allocator);
+    defer slot_registry.deinit();
+    wal_mon.config.slots = &slot_registry;
+    wal_mon.config.slot_inventory_seconds = @intCast(runtime_config.slot_inventory_seconds);
+    http_srv.slots = &slot_registry;
     wal_mon.pg_shutting_down = &pg_shutting_down;
     try wal_mon.start();
     defer wal_mon.join();
@@ -1045,6 +1065,21 @@ pub fn main(init: std.process.Init) !void {
 
     var publisher = try initNatsPublisher(allocator, &metrics, nats_endpoint, io);
     defer publisher.deinit();
+
+    // §10dc: fleet observability — the clients' heartbeats, read on their own cadence.
+    var fleet_mon = fleet_monitor.FleetMonitor.init(
+        allocator,
+        io,
+        nats_endpoint,
+        &runtime_config.topology,
+        &should_stop,
+        runtime_config.fleet_poll_seconds,
+        runtime_config.fleet_ttl_seconds,
+    );
+    defer fleet_mon.deinit();
+    http_srv.fleet = &fleet_mon.registry;
+    try fleet_mon.start();
+    defer fleet_mon.join();
 
     // What the server will accept, logged once. The check that acts on it runs below,
     // just before the slab is allocated — this is the observation, that is the decision.
@@ -1207,25 +1242,25 @@ pub fn main(init: std.process.Init) !void {
         log.info("Starting {d} mutation listener lane(s) (role: {s})...", .{ ingress_lanes, wc.role });
         for (0..ingress_lanes) |lane_i| {
             _ = lane_i;
-        const lane_ptr = try mutation_listener.MutationListener.init(
-            allocator,
-            wc,
-            nats_endpoint,
-            &runtime_config.topology,
-            &env_sync_rules,
-            default_version_column,
-            io,
-            &should_stop,
-            &catalog_epoch,
-            // min(my buffer, the narrowest instance carrying these tables). The first
-            // is physical — I cannot encode more than my own buffer. The second is the
-            // system constraint PostgreSQL's width guard enforces anyway, so refusing
-            // at ingress turns a wasted round trip (publish → apply → 23514 verdict)
-            // into an immediate, cheaper rejection with the same outcome.
-            @min(own_event_buf, effective_row_budget),
-        );
-        try mut_listeners.append(allocator, lane_ptr);
-        try lane_ptr.start();
+            const lane_ptr = try mutation_listener.MutationListener.init(
+                allocator,
+                wc,
+                nats_endpoint,
+                &runtime_config.topology,
+                &env_sync_rules,
+                default_version_column,
+                io,
+                &should_stop,
+                &catalog_epoch,
+                // min(my buffer, the narrowest instance carrying these tables). The first
+                // is physical — I cannot encode more than my own buffer. The second is the
+                // system constraint PostgreSQL's width guard enforces anyway, so refusing
+                // at ingress turns a wasted round trip (publish → apply → 23514 verdict)
+                // into an immediate, cheaper rejection with the same outcome.
+                @min(own_event_buf, effective_row_budget),
+            );
+            try mut_listeners.append(allocator, lane_ptr);
+            try lane_ptr.start();
         }
         log.info("✅ Mutation listener lane(s) started\n", .{});
     } else {
@@ -1358,6 +1393,7 @@ pub fn main(init: std.process.Init) !void {
         &writable,
         writer_role,
     );
+    event_proc.cat = &cat; // §10df: the descriptor carries each table's seed_epoch
 
     // The DROP-prune needs the shared publisher's JetStream context (assigned
     // here, not in init, because the publisher is built earlier in boot but the
@@ -2279,6 +2315,18 @@ const LiveCatalogue = struct {
         // tenant list came back empty the old one stays (boot kept the grammar's, and
         // an empty read is a degraded read, not a revocation).
         var old = self.cat.*;
+        // §10df: a table whose seed_epoch moved gets its descriptor republished below —
+        // that is how a running client learns to forget its watermark. Keys point
+        // into `fresh`, which becomes `self.cat` a few lines down.
+        var epoch_moved: std.ArrayList([]const u8) = .empty;
+        defer epoch_moved.deinit(self.allocator);
+        {
+            var it = fresh.epochs.iterator();
+            while (it.next()) |e| {
+                const was = old.epochs.get(e.key_ptr.*) orelse 0;
+                if (was != e.value_ptr.*) epoch_moved.append(self.allocator, e.key_ptr.*) catch {};
+            }
+        }
         self.topo.public_tables = fresh.publics;
         if (fresh.tenants.len > 0) {
             self.topo.tenants = fresh.tenants;
@@ -2302,6 +2350,10 @@ const LiveCatalogue = struct {
         // routable table, a suspension for a refused one.
         var republish: std.ArrayList([]const u8) = .empty;
         defer republish.deinit(self.allocator);
+        for (epoch_moved.items) |tbl| {
+            log.info("🗂️ '{s}': seed epoch moved to {d} — descriptor republished, clients re-seed", .{ tbl, self.cat.epochs.get(tbl) orelse 0 });
+            republish.append(self.allocator, tbl) catch {};
+        }
         for (self.cat.changed) |tbl| {
             if (self.topo.isCdcRoutable(tbl, self.tenant_rules.contains(tbl))) {
                 if (self.refused.reasonFor(tbl) == .no_cdc_subject) {

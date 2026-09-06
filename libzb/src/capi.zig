@@ -141,6 +141,23 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         try core.writeJsonString(a, &out, try core.pgArrayLiteral(a, args.object.get("in").?.array));
         return out.items;
     }
+    if (eq(u8, name, "heartbeat")) {
+        const seqs_v = args.object.get("seqs") orelse .null;
+        const n: usize = if (seqs_v == .object) seqs_v.object.count() else 0;
+        const names = try a.alloc([]const u8, n);
+        const seqs = try a.alloc(u64, n);
+        if (seqs_v == .object) {
+            var it = seqs_v.object.iterator();
+            var i: usize = 0;
+            while (it.next()) |e| : (i += 1) {
+                names[i] = e.key_ptr.*;
+                seqs[i] = if (e.value_ptr.* == .integer and e.value_ptr.integer >= 0) @intCast(e.value_ptr.integer) else 0;
+            }
+        }
+        const ts: i64 = if (args.object.get("ts")) |v| (if (v == .integer) v.integer else 0) else 0;
+        try core.writeJsonString(a, &out, try core.heartbeatPayload(a, args.object.get("principal").?.string, args.object.get("tenant").?.string, ts, names, seqs));
+        return out.items;
+    }
     if (eq(u8, name, "update")) {
         const table = args.object.get("table").?.string;
         const pk = try strArrField(a, args, "pkCols");
@@ -214,6 +231,21 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
     }
     if (eq(u8, name, "rebuildSteps")) {
         return try core.valueToString(a, try core.rebuildSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array, try strArrField(a, args, "existing")));
+    }
+    if (eq(u8, name, "shape")) {
+        const cols = args.object.get("cols").?.array;
+        const pk = try strArrField(a, args, "pkCols");
+        try out.appendSlice(a, "{\"key\":");
+        try core.writeJsonString(a, &out, try core.keyShape(a, pk, cols));
+        try out.appendSlice(a, ",\"types\":");
+        try core.writeJsonString(a, &out, try core.typeShape(a, cols));
+        try out.appendSlice(a, "}");
+        return out.items;
+    }
+    if (eq(u8, name, "retyped")) {
+        const st_v = args.object.get("stored") orelse .null;
+        const stored: ?[]const u8 = if (st_v == .string) st_v.string else null;
+        return try core.valueToString(a, try core.retypedColumns(a, stored, args.object.get("cols").?.array));
     }
     if (eq(u8, name, "diffColumns")) {
         const ex_v = args.object.get("existing") orelse .null;
@@ -345,6 +377,11 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     errdefer a.free(principal);
     const client_id = try a.dupeZ(u8, str.get(o, "clientId", "zig-client"));
     errdefer a.free(client_id);
+    // heartbeatMs: the fleet beat (§10dc); 0 disables. Default matches client.zig.
+    const heartbeat_ms: u64 = blk: {
+        const f = o.object.get("heartbeatMs") orelse break :blk 30_000;
+        break :blk if (f == .integer and f.integer >= 0) @intCast(f.integer) else 30_000;
+    };
     // The tables, parents first, each its own allocation so the box can free them.
     const tv = o.object.get("tables");
     const ntab: usize = if (tv != null and tv.? == .array) tv.?.array.items.len else 0;
@@ -368,6 +405,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .creds_path = creds,
             .grammar_path = grammar,
             .grammar_json = grammar_json,
+            .heartbeat_ms = heartbeat_ms,
             .db_path = db,
             .principal = principal,
             .tables = tables,

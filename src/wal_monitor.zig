@@ -16,6 +16,82 @@ pub const WalConfig = struct {
     pg_config: *const pg_conn.PgConf,
     slot_name: []const u8, // via CLI arg
     check_interval_seconds: u32 = Conf.WalMonitor.default_check_interval_seconds, // 30s
+    /// §10db: the slot INVENTORY cadence — every slot on the server, with its retained
+    /// WAL, on a cadence of minutes. `slots` null = the inventory is off.
+    slot_inventory_seconds: u32 = @intCast(Conf.WalMonitor.default_slot_inventory_seconds),
+    slots: ?*SlotRegistry = null,
+};
+
+/// Every replication slot the reader's server holds, as of the last inventory (§10db).
+/// The per-slot lag metric above watches OUR slot; this is the view the operator lacked:
+/// a sibling instance's abandoned slot, a standby's physical slot, a hand-made one —
+/// `active=false` with `retained_wal_bytes` climbing is §10da's leak, on a graph.
+/// Snapshot-swapped under a mutex: the monitor thread builds a fresh arena and swaps
+/// it in; the HTTP thread renders whatever snapshot is current.
+pub const SlotRegistry = struct {
+    pub const Slot = struct {
+        name: []const u8,
+        kind: []const u8,
+        active: bool,
+        retained_wal_bytes: i64,
+        is_self: bool,
+    };
+
+    allocator: std.mem.Allocator,
+    mutex: utils.SpinLock = .{},
+    arena: ?*std.heap.ArenaAllocator = null,
+    slots: []const Slot = &.{},
+    polled_at_unix: i64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator) SlotRegistry {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *SlotRegistry) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.arena) |ar| {
+            ar.deinit();
+            self.allocator.destroy(ar);
+            self.arena = null;
+            self.slots = &.{};
+        }
+    }
+
+    fn swap(self: *SlotRegistry, arena: *std.heap.ArenaAllocator, slots: []const Slot, now_unix: i64) void {
+        self.mutex.lock();
+        const old = self.arena;
+        self.arena = arena;
+        self.slots = slots;
+        self.polled_at_unix = now_unix;
+        self.mutex.unlock();
+        if (old) |o| {
+            o.deinit();
+            self.allocator.destroy(o);
+        }
+    }
+
+    pub fn writePrometheus(self: *SlotRegistry, w: *std.Io.Writer) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try w.print("# HELP bridge_replication_slots Replication slots on the reader's PostgreSQL server (every slot, not only this bridge's), as of the last inventory\n", .{});
+        try w.print("# TYPE bridge_replication_slots gauge\n", .{});
+        try w.print("bridge_replication_slots {d}\n", .{self.slots.len});
+        try w.print("# HELP bridge_replication_slot_inventory_timestamp_seconds Unix time of the last slot inventory (0 = none yet)\n", .{});
+        try w.print("# TYPE bridge_replication_slot_inventory_timestamp_seconds gauge\n", .{});
+        try w.print("bridge_replication_slot_inventory_timestamp_seconds {d}\n", .{self.polled_at_unix});
+        if (self.slots.len == 0) return;
+        try w.print("# HELP bridge_replication_slot_active Per-slot active flag (1 a reader is connected, 0 nobody is reading it — with retained WAL climbing, an abandoned slot)\n", .{});
+        try w.print("# TYPE bridge_replication_slot_active gauge\n", .{});
+        for (self.slots) |s| {
+            try w.print("bridge_replication_slot_active{{slot=\"{s}\",type=\"{s}\",self=\"{s}\"}} {d}\n", .{ s.name, s.kind, if (s.is_self) "true" else "false", @as(u8, if (s.active) 1 else 0) });
+        }
+        try w.print("# HELP bridge_replication_slot_retained_wal_bytes WAL PostgreSQL retains for the slot, from its restart_lsn to the WAL head\n", .{});
+        try w.print("# TYPE bridge_replication_slot_retained_wal_bytes gauge\n", .{});
+        for (self.slots) |s| {
+            try w.print("bridge_replication_slot_retained_wal_bytes{{slot=\"{s}\",type=\"{s}\",self=\"{s}\"}} {d}\n", .{ s.name, s.kind, if (s.is_self) "true" else "false", s.retained_wal_bytes });
+        }
+    }
 };
 
 /// WAL monitor with thread management
@@ -77,6 +153,11 @@ pub const WalMonitor = struct {
             .{self.config.check_interval_seconds},
         );
 
+        // The inventory keeps its OWN clock, counted in the one-second sleep below: it
+        // must not ride the 30 s lag tick, and its first pass waits one full interval —
+        // this loop starts before the WAL stream has attached, and an inventory taken
+        // then would show our own slot inactive for a whole interval.
+        var since_inventory: u32 = 0;
         while (!self.should_stop.load(.seq_cst)) {
             // Check WAL lag
             checkWalLag(
@@ -90,18 +171,70 @@ pub const WalMonitor = struct {
                     .{err},
                 );
             };
-
-            // Sleep for check interval
+            // Sleep for check interval, running the inventory on its own cadence meanwhile
             var remaining_seconds = self.config.check_interval_seconds;
             while (remaining_seconds > 0 and !self.should_stop.load(.seq_cst)) {
                 utils.sleep(1 * std.time.ns_per_s);
                 remaining_seconds -= 1;
+                since_inventory += 1;
+                if (self.config.slots != null and since_inventory >= self.config.slot_inventory_seconds) {
+                    since_inventory = 0;
+                    checkSlotInventory(self.config, self.allocator) catch |err| {
+                        log.warn("⚠️ slot inventory failed: {} — the previous snapshot stands", .{err});
+                    };
+                }
             }
         }
 
         log.info("🥁 WAL lag monitor stopped\n", .{});
     }
 };
+
+/// §10db: every slot on the reader's server, with what it retains. One catalog query on
+/// a slow cadence; a fresh arena per pass, swapped into the registry whole.
+fn checkSlotInventory(config: WalConfig, allocator: std.mem.Allocator) !void {
+    const registry = config.slots orelse return;
+    const conninfo = try config.pg_config.connInfo(allocator, false);
+    defer allocator.free(conninfo);
+    const conn = c.PQconnectdb(conninfo.ptr) orelse return error.ConnectionFailed;
+    defer c.PQfinish(conn);
+    if (c.PQstatus(conn) != c.CONNECTION_OK) return error.ConnectionFailed;
+
+    const res = c.PQexec(conn,
+        "SELECT slot_name, slot_type, active::text, " ++
+            "COALESCE(pg_wal_lsn_diff(public.zebridge_wal_head(), restart_lsn), 0)::bigint::text " ++
+            "FROM pg_replication_slots ORDER BY slot_name");
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) {
+        log.warn("⚠️ slot inventory query failed: {s}", .{c.PQerrorMessage(conn)});
+        return error.QueryFailed;
+    }
+
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+    const a = arena.allocator();
+    const n: usize = @intCast(c.PQntuples(res));
+    const slots = try a.alloc(SlotRegistry.Slot, n);
+    for (0..n) |i| {
+        const name = try a.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)));
+        const kind = try a.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1)));
+        const active = c.PQgetvalue(res, @intCast(i), 2)[0] == 't';
+        const retained = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 3)), 10) catch 0;
+        slots[i] = .{
+            .name = name,
+            .kind = kind,
+            .active = active,
+            .retained_wal_bytes = retained,
+            .is_self = std.mem.eql(u8, name, config.slot_name),
+        };
+    }
+    registry.swap(arena, slots, @divFloor(utils.unixMillis(), 1000));
+    log.debug("slot inventory: {d} slot(s)", .{n});
+}
 
 /// Get current WAL LSN position with the query `SELECT public.zebridge_wal_head()::text`
 ///

@@ -1,0 +1,70 @@
+diff --git a/src/jetstream_objstore.zig b/src/jetstream_objstore.zig
+index 701561d..c37ff29 100644
+--- a/src/jetstream_objstore.zig
++++ b/src/jetstream_objstore.zig
+@@ -518,7 +518,13 @@ pub const ObjectStore = struct {
+         const meta_msg = self.js.getMsg(self.stream_name, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| {
+             return if (err == error.MessageNotFound) ObjectStoreError.ObjectNotFound else err;
+         };
+-        errdefer meta_msg.deinit();
++        // Released exactly once: explicitly once parsed, or here on an earlier failure.
++        // An unconditional errdefer released it a SECOND time when a deleted object
++        // returned an error after the explicit release — the pool then freed a pointer
++        // it no longer owned at connection teardown (measured through libzb: the host
++        // process aborting in zb_client_close after a failed seed).
++        var meta_msg_owned = true;
++        errdefer if (meta_msg_owned) meta_msg.deinit();
+ 
+         // Create arena for the result
+         const arena = try self.allocator.create(std.heap.ArenaAllocator);
+@@ -547,6 +553,7 @@ pub const ObjectStore = struct {
+ 
+         // We can safely deinit the message now since all strings are owned by arena
+         meta_msg.deinit();
++        meta_msg_owned = false;
+ 
+         if (obj_info.deleted) {
+             return ObjectStoreError.ObjectNotFound;
+@@ -644,7 +651,13 @@ pub const ObjectStore = struct {
+         const meta_msg = self.js.getMsg(self.stream_name, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| {
+             return if (err == error.MessageNotFound) ObjectStoreError.ObjectNotFound else err;
+         };
+-        errdefer meta_msg.deinit();
++        // Released exactly once: explicitly once parsed, or here on an earlier failure.
++        // An unconditional errdefer released it a SECOND time when a deleted object
++        // returned an error after the explicit release — the pool then freed a pointer
++        // it no longer owned at connection teardown (measured through libzb: the host
++        // process aborting in zb_client_close after a failed seed).
++        var meta_msg_owned = true;
++        errdefer if (meta_msg_owned) meta_msg.deinit();
+ 
+         const arena = try self.allocator.create(std.heap.ArenaAllocator);
+         errdefer self.allocator.destroy(arena);
+@@ -672,6 +685,7 @@ pub const ObjectStore = struct {
+ 
+         // We can safely deinit the message now since all strings are owned by arena
+         meta_msg.deinit();
++        meta_msg_owned = false;
+ 
+         return Result(ObjectInfo){
+             .arena = arena,
+diff --git a/src/root.zig b/src/root.zig
+index 8e99099..c6017f5 100644
+--- a/src/root.zig
++++ b/src/root.zig
+@@ -52,11 +52,15 @@ pub const JetStreamSubscription = @import("jetstream.zig").JetStreamSubscription
+ pub const PullSubscription = @import("jetstream.zig").PullSubscription;
+ pub const FetchRequest = @import("jetstream.zig").FetchRequest;
+ pub const MessageBatch = @import("jetstream.zig").MessageBatch;
++pub const PullInbox = @import("jetstream.zig").PullInbox;
++pub const MultiBatch = @import("jetstream.zig").MultiBatch;
+ 
+ // JetStream KV types
+ pub const KV = @import("jetstream_kv.zig").KV;
+ pub const KVManager = @import("jetstream_kv.zig").KVManager;
+ pub const KVEntry = @import("jetstream_kv.zig").KVEntry;
++pub const KVWatcher = @import("jetstream_kv.zig").KVWatcher;
++pub const WatchOptions = @import("jetstream_kv.zig").WatchOptions;
+ pub const KVStatus = @import("jetstream_kv.zig").KVStatus;
+ pub const KVConfig = @import("jetstream_kv.zig").KVConfig;
+ pub const PutOptions = @import("jetstream_kv.zig").PutOptions;

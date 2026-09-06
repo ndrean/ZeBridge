@@ -393,7 +393,7 @@ export const chainRowParams = (row: any[]): any[] =>
 // executes, logs, and owns the runtime ALTER→rebuild fallback (that decision
 // is error-driven, not plannable).
 
-export type SchemaColumn = { name: string; type: string; required?: boolean };
+export type SchemaColumn = { name: string; type: string; required?: boolean; default?: string };
 export type SchemaIndex = { name: string; unique?: boolean; columns: string[] };
 export type SchemaForeignKey = { name?: string; columns: string[]; references: string; parent_columns: string[] };
 
@@ -405,6 +405,7 @@ export function columnDdl(c: SchemaColumn, pkCols: string[]): string {
   const inlinePk = pkCols.length === 1;
   return `"${c.name}" ${c.type}` +
     (pkCols.includes(c.name) || c.required ? ' NOT NULL' : '') +
+    (c.default != null && c.default !== '' ? ` DEFAULT ${c.default}` : '') +
     (inlinePk && c.name === pkCols[0] ? ' PRIMARY KEY' : '');
 }
 
@@ -489,6 +490,52 @@ export function diffColumns(
   };
 }
 
+// ─── the shape record (§10dg: re-key and re-type) ────────────────────────
+//
+// `diffColumns` sees NAMES only. A primary-key column whose type changed
+// (bigserial → uuid), or a pk that gained a column, has the same names before and
+// after — and a replica cannot ALTER its way there: SQLite's INTEGER PRIMARY KEY
+// is a rowid alias that refuses a uuid, and no engine re-keys rows in place. So
+// each replica records the shape it BUILT (its own descriptor's pk + dialect
+// types, not a physical introspection whose type text differs per engine), and
+// the next descriptor is compared with that record: key shape moved → the table
+// is rebuilt EMPTY and re-seeded; a non-key type moved → rebuilt/ALTERed keeping
+// the rows. Canonical JSON so the record compares byte-for-byte.
+
+/// The pk columns, in pk order, with the dialect type each carries: `[["id","INTEGER"]]`.
+/// A pk column the descriptor does not list (malformed) is skipped, not guessed.
+export function keyShape(pkCols: string[], cols: SchemaColumn[]): string {
+  const pairs: [string, string][] = [];
+  for (const pk of pkCols) {
+    const c = cols.find((x) => x.name === pk);
+    if (c) pairs.push([c.name, c.type]);
+  }
+  return JSON.stringify(pairs);
+}
+
+/// Every column with its type, sorted by name (a DROP+ADD reorders attnums; that
+/// is not a type change): `[["id","INTEGER"],["name","TEXT"]]`.
+export function typeShape(cols: SchemaColumn[]): string {
+  const pairs: [string, string][] = cols.map((c): [string, string] => [c.name, c.type]);
+  pairs.sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+  return JSON.stringify(pairs);
+}
+
+/// Columns present in BOTH the stored type shape and the descriptor whose type
+/// text differs. Added/removed columns belong to `diffColumns`; an absent or
+/// unreadable record reads as "nothing known" — never as "everything changed".
+export function retypedColumns(storedTypeShape: string | null, cols: SchemaColumn[]): string[] {
+  if (!storedTypeShape) return [];
+  let stored: unknown;
+  try { stored = JSON.parse(storedTypeShape); } catch { return []; }
+  if (!Array.isArray(stored)) return [];
+  const before = new Map<string, string>();
+  for (const e of stored) {
+    if (Array.isArray(e) && e.length === 2 && typeof e[0] === 'string' && typeof e[1] === 'string') before.set(e[0], e[1]);
+  }
+  return cols.filter((c) => before.has(c.name) && before.get(c.name) !== c.type).map((c) => c.name);
+}
+
 /// Does the stored CREATE TABLE text disagree with the FK clauses now wanted?
 /// Text-compared because SQLite keeps no queryable "expected constraints", and
 /// the stored DDL is our own generated text. Empty ddl → false (no table yet:
@@ -559,6 +606,15 @@ export const subjectSafeToken = (v: string): string => v.replace(/[.*>\s]/g, '-'
 
 /// `prefix` is grammar.json's `subjects.mutations_prefix`; the shell passes it, the
 /// fixtures rely on the protocol default.
+/// PROTOCOL §9: the fleet heartbeat a client writes to `$KV.live.<tenant>.<principal>`.
+/// Byte-identical across cores: stream keys sorted bytewise (JS default sort on ASCII
+/// names is bytewise), fixed key order, integers verbatim. Pinned in fixtures/heartbeat.
+export function heartbeatPayload(principal: string, tenant: string, ts: number, seqs: Record<string, number>): string {
+  const streams: Record<string, number> = {};
+  for (const k of Object.keys(seqs).sort()) streams[k] = seqs[k];
+  return JSON.stringify({ principal, tenant, ts, streams });
+}
+
 export function mutationSubject(principal: string, table: string, op: string, prefix = 'mutation'): string {
   return `${prefix}.${principal}.${table}.${op.toLowerCase()}`;
 }

@@ -19,7 +19,7 @@ import { makePgliteStorage } from 'zb-client-ts/pglite';
 const REPO = new URL('../../', import.meta.url).pathname;
 const PRINCIPAL = process.env.ZB_PRINCIPAL ?? 'omar';
 const CREDS = readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8');
-const GRAMMAR = JSON.parse(readFileSync(`${REPO}grammar.json`, 'utf8'));
+const GRAMMAR = JSON.parse(readFileSync(`${REPO}src/grammar.json`, 'utf8'));
 // ⚠️ Not `counter_public`: this example used to INSERT a fresh random uid there on
 // every run, which is exactly how that table accumulated 27 stray counter rows
 // (§10bc). `test_types` is the table built to take a full, typed row — and on the
@@ -33,6 +33,7 @@ const zb = new ZeBridge({
   principal: PRINCIPAL,
   creds: CREDS,
   grammar: GRAMMAR,
+  heartbeatMs: Number(process.env.ZB_HEARTBEAT_MS ?? 30_000), // PROTOCOL §9
   durable: true,
   // ── the two seams ──
   storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: '/tmp' }) : nodeStorage,

@@ -5,6 +5,8 @@ const jwt_mint = @import("jwt_mint.zig");
 const c = @import("c_imports.zig").c;
 const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
+const wal_monitor = @import("wal_monitor.zig");
+const fleet_monitor = @import("fleet_monitor.zig");
 const utils = @import("utils.zig");
 const Config = @import("config.zig");
 const topology_mod = @import("topology.zig");
@@ -45,6 +47,9 @@ pub const Server = struct {
     /// Set after construction, like nats_publisher. Only its atomic summaries are read
     /// here — the map belongs to the replication thread (see refused_tables.zig).
     refused: ?*const refused_tables.Registry = null,
+    /// §10db / §10dc: snapshot registries other threads swap whole; rendered as-is.
+    slots: ?*wal_monitor.SlotRegistry = null,
+    fleet: ?*fleet_monitor.Registry = null,
     /// Enrollment/mint context (NOTES: the JWT mint flow). Set after construction
     /// like nats_publisher; null leaves /enroll answering 404 — the bridge is only
     /// a signer when the operator handed it the scoped seed.
@@ -577,8 +582,11 @@ pub const Server = struct {
             const snap = try m.snapshot(self.allocator);
             defer self.allocator.free(snap.last_ack_lsn_str);
 
-            var buf: [8192]u8 = undefined;
-            const body = try std.fmt.bufPrint(&buf,
+            // Heap, not stack: the fleet and slot sections below are one line per client
+            // per stream and per slot, and a stack page could not hold a fleet.
+            const buf = try self.allocator.alloc(u8, 1 << 20);
+            defer self.allocator.free(buf);
+            const body = try std.fmt.bufPrint(buf,
                 \\# HELP bridge_uptime_seconds Time since bridge started
                 \\# TYPE bridge_uptime_seconds gauge
                 \\bridge_uptime_seconds {d}
@@ -678,6 +686,8 @@ pub const Server = struct {
             // own exposition text so the metric names stay next to the thing counting.
             var w = std.Io.Writer.fixed(buf[body.len..]);
             if (self.refused) |r| try r.writePrometheus(&w);
+            if (self.slots) |s| try s.writePrometheus(&w);
+            if (self.fleet) |f| try f.writePrometheus(&w);
 
             try respond(req, .ok, "text/plain", buf[0 .. body.len + w.buffered().len]);
         } else {

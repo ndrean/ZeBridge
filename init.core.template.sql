@@ -238,6 +238,10 @@ CREATE TABLE IF NOT EXISTS public.zebridge_catalogue (
     tombstone_col name,
     tiebreak_col  name,
     generations   boolean NOT NULL DEFAULT true,
+    -- The re-seed lever (NOTES §10df): bumped by zebridge_reseed(), carried in the
+    -- schema descriptor and the chain manifest; a client whose stored epoch is lower
+    -- forgets its watermark and seeds a fresh full. The producer builds that full.
+    seed_epoch    integer NOT NULL DEFAULT 0,
     CHECK ((tenant_col IS NULL) <> (public_reason IS NULL))
 );
 GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_READER_USER};
@@ -300,6 +304,44 @@ CREATE OR REPLACE FUNCTION public.zebridge_wal_head() RETURNS pg_lsn AS $$
                 ELSE pg_current_wal_lsn() END;
 $$ LANGUAGE sql VOLATILE;
 GRANT EXECUTE ON FUNCTION public.zebridge_wal_head() TO ${POSTGRES_READER_USER};
+
+-- Force every client to re-seed a table — and every table that REFERENCES it,
+-- transitively (NOTES §10df). The one lever for what CDC cannot carry: a volatile
+-- column default (now(), gen_random_uuid()), a primary-key re-key, a hand-fixed
+-- dataset. A parent re-keyed invalidates the foreign-key values its children hold,
+-- and PostgreSQL's rewrite of those children is just as invisible to decoding, so
+-- the closure is taken here, once, rather than remembered by hand. Returns what it
+-- bumped. SECURITY DEFINER on the zebridge_set_suspended pattern (§10dh): the
+-- bridge's reader role pulls it when a suspension that DROPPED events lifts — the
+-- rows written meanwhile reached no replica, and only a fresh full brings them —
+-- and the DDL trigger pulls it on a re-key whatever role migrates. EXECUTE is
+-- revoked from PUBLIC and granted to the reader only; the writer has no use for it.
+CREATE OR REPLACE FUNCTION public.zebridge_reseed(p_table regclass)
+RETURNS TABLE (tbl text, seed_epoch integer) AS $$
+    WITH RECURSIVE closure(oid) AS (
+        SELECT p_table::oid
+        UNION
+        SELECT con.conrelid FROM pg_constraint con JOIN closure ON con.confrelid = closure.oid
+         WHERE con.contype = 'f'
+    )
+    -- Once per table per TRANSACTION, closure members included: a transaction-local
+    -- setting marks every table this bumps, and a later call in the same transaction
+    -- (a second parent re-keyed, the child's own re-type) skips the marked ones. A
+    -- call outside a transaction marks nothing that outlives it. Measured before the
+    -- marker: a child of two re-keyed parents was bumped three times in one migration.
+    , bumped AS (
+        UPDATE public.zebridge_catalogue c
+           SET seed_epoch = c.seed_epoch + 1
+          FROM closure JOIN pg_class r ON r.oid = closure.oid
+         WHERE c.tbl = r.relname
+           AND current_setting('zebridge.reseeded_' || md5(c.tbl), true) IS DISTINCT FROM '1'
+        RETURNING c.tbl, c.seed_epoch
+    )
+    SELECT b.tbl, b.seed_epoch
+      FROM bumped b, LATERAL set_config('zebridge.reseeded_' || md5(b.tbl), '1', true) AS marked;
+$$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
+REVOKE ALL ON FUNCTION public.zebridge_reseed(regclass) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.zebridge_reseed(regclass) TO ${POSTGRES_READER_USER};
 -- The writer's grant lives in init.write.template.sql, NOT here: roles are
 -- cluster-wide, so this line passed silently on any cluster where the write half
 -- had ever run — and failed with `role does not exist` only on a fresh cluster
@@ -618,6 +660,13 @@ CREATE TABLE IF NOT EXISTS public.zebridge_generations (
     -- chain's jump-in point, refreshed before it can age out of the kept window.
     has_full       boolean NOT NULL DEFAULT false,
     built_at       timestamptz NOT NULL DEFAULT now(),
+    -- The catalogue's seed_epoch this generation was built under (§10df): a later
+    -- bump forces the next build to be a FULL, whatever the counts say.
+    seed_epoch     integer NOT NULL DEFAULT 0,
+    -- The table's column shape (`name:type,…` in attnum order) at this build (§10dg):
+    -- a later DROP/RENAME/re-type/ADD forces a FULL, so a chain object never names a
+    -- column the replica no longer has.
+    col_shape      text,
     PRIMARY KEY (tenant, tbl, gen)
 );
 -- §10x: the compression dictionary is a chain member. `dict` holds the trained
@@ -702,6 +751,37 @@ ALTER TABLE public.zebridge_ddl_events REPLICA IDENTITY FULL;
 GRANT SELECT ON TABLE public.zebridge_ddl_events TO ${POSTGRES_READER_USER};
 
 -- on ddl_command_end: writes the schema-change row — see PROTOCOL.md §5
+-- The DDL-ready literal of a CONSTANT column default, or NULL when the default is an
+-- expression (now(), nextval(), gen_random_uuid(), …). Numbers and booleans verbatim;
+-- a quoted literal keeps its quotes and loses PostgreSQL's ::cast suffix. Consumed by
+-- the DDL trigger below and by the bridge's boot descriptor (NOTES §10df).
+CREATE OR REPLACE FUNCTION public.zebridge_constant_default(expr text) RETURNS text AS $$
+    SELECT CASE
+        WHEN expr IS NULL THEN NULL
+        WHEN expr ~ '^-?[0-9]+(\.[0-9]+)?$' THEN expr
+        WHEN expr IN ('true', 'false') THEN expr
+        WHEN expr ~ '^''([^'']|'''')*''(::[a-zA-Z_ ]+(\([0-9, ]*\))?(\[\])?)?$' THEN regexp_replace(expr, '::.*$', '')
+        ELSE NULL
+    END;
+$$ LANGUAGE sql IMMUTABLE;
+GRANT EXECUTE ON FUNCTION public.zebridge_constant_default(text) TO ${POSTGRES_READER_USER};
+
+-- The KEY SHAPE of a schema_def (§10dg): the pk columns in pk order, each with its
+-- type — `id:bigint`, `tenant_id:uuid,seq:integer`. NULL for a table without a pk.
+-- Compared by the DDL trigger between the previous and the new definition: a
+-- changed key shape (a pk column re-typed, a column added to or taken from the pk)
+-- is a RE-KEY — every row's identity moves — and is treated as a re-seed.
+-- ⚠️ `pk` is the JSON scalar `null` for a keyless table, and jsonb_array_elements_text
+-- raises on a scalar — inside an event trigger that raise would fail the DDL itself
+-- (measured: a CREATE TABLE refused with "cannot extract elements from a scalar").
+CREATE OR REPLACE FUNCTION public.zebridge_key_shape(def jsonb) RETURNS text AS $$
+    SELECT CASE WHEN jsonb_typeof(def -> 'pk') = 'array' AND jsonb_typeof(def -> 'columns') = 'array' THEN (
+        SELECT string_agg(p.name || ':' || COALESCE(c.type, '?'), ',' ORDER BY p.ord)
+        FROM jsonb_array_elements_text(def -> 'pk') WITH ORDINALITY AS p(name, ord)
+        LEFT JOIN jsonb_to_recordset(def -> 'columns') AS c(name text, type text) ON c.name = p.name)
+    END;
+$$ LANGUAGE sql IMMUTABLE;
+
 CREATE OR REPLACE FUNCTION public.zebridge_ddl_trigger_fn()
 RETURNS event_trigger AS $$
 DECLARE
@@ -711,6 +791,8 @@ DECLARE
     cmd_tag     text   := 'UNKNOWN';
     schema_json jsonb;
     last_def    jsonb;
+    pre_def     jsonb;
+    reseed_why  text;
     renames     jsonb;
 BEGIN
     -- Pass 1: collect the distinct tables this command touched.
@@ -760,6 +842,12 @@ BEGIN
                               'nullable', (c.is_nullable = 'YES'),
                               'has_default', (c.column_default IS NOT NULL),
                               'required', (c.is_nullable = 'NO' AND c.column_default IS NULL),
+                              -- A CONSTANT default, as a DDL-ready literal (NOTES §10df):
+                              -- a client adds the column WITH it and its engine fills the
+                              -- existing rows, so an ADD COLUMN ... DEFAULT x converges
+                              -- without a re-seed. Volatile defaults (now(), nextval) are
+                              -- NULL here — those need zebridge_reseed.
+                              'default', public.zebridge_constant_default(c.column_default),
                               'oid', a.atttypid::int,
                               'typtype', t.typtype,
                               -- `attnum` is what survives a RENAME COLUMN: Postgres
@@ -950,6 +1038,48 @@ BEGIN
                 INSERT INTO public.zebridge_ddl_events
                        (schema_name, table_name, command_tag, schema_def)
                 VALUES ('public', tbl, cmd_tag, schema_json);
+            END IF;
+
+            -- §10dg: two shapes of DDL that rewrite VALUES a replica holds, without a
+            -- decoded event to carry them — so a re-seed is the only way back:
+            --   * a changed KEY SHAPE — a pk column re-typed (bigserial → uuid), a
+            --     column added to or taken from the pk: every row's identity moves;
+            --   * a RE-TYPED column — same name, different type (ALTER COLUMN TYPE …
+            --     USING rewrites the table with no row events at all).
+            -- Compared against the definition from BEFORE this transaction, not the
+            -- previous step's: a real re-key is many statements (add the new column,
+            -- populate, drop the old, rename, add the pk) whose per-step diffs read as
+            -- add/remove/rename and never as a re-type. Bumped ONCE per table per
+            -- transaction (a transaction-local setting remembers), through the FK
+            -- closure of zebridge_reseed: the producer's next build is a full, and each
+            -- replica rebuilds/re-types locally and seeds afresh. The DDL must not fail
+            -- on a role that may not touch the catalogue: the bump degrades to a
+            -- warning, and `SELECT zebridge_reseed('<table>')` by hand completes it.
+            SELECT e.schema_def INTO pre_def
+            FROM public.zebridge_ddl_events e
+            WHERE e.table_name = tbl AND e.emitted_at < now()
+            ORDER BY e.id DESC
+            LIMIT 1;
+            IF pre_def IS NOT NULL
+               AND current_setting('zebridge.reseeded_' || md5(tbl), true) IS DISTINCT FROM '1' THEN
+                reseed_why := NULL;
+                IF public.zebridge_key_shape(pre_def) IS DISTINCT FROM public.zebridge_key_shape(schema_json) THEN
+                    reseed_why := format('key shape %s -> %s', public.zebridge_key_shape(pre_def), public.zebridge_key_shape(schema_json));
+                ELSE
+                    SELECT string_agg(n.name || ' ' || o.type || ' -> ' || n.type, ', ') INTO reseed_why
+                    FROM jsonb_to_recordset(schema_json -> 'columns') AS n(name text, type text)
+                    JOIN jsonb_to_recordset(pre_def -> 'columns') AS o(name text, type text) ON o.name = n.name
+                    WHERE o.type IS DISTINCT FROM n.type;
+                    IF reseed_why IS NOT NULL THEN reseed_why := 're-typed: ' || reseed_why; END IF;
+                END IF;
+                IF reseed_why IS NOT NULL THEN
+                    BEGIN
+                        PERFORM public.zebridge_reseed(to_regclass(format('%I.%I', 'public', tbl)));
+                        RAISE NOTICE 'zebridge: % (%): seed epoch bumped, re-seed forced', tbl, reseed_why;
+                    EXCEPTION WHEN insufficient_privilege THEN
+                        RAISE WARNING 'zebridge: % (%) but this role may not bump its seed epoch — run SELECT public.zebridge_reseed(''%'') as the owner', tbl, reseed_why, tbl;
+                    END;
+                END IF;
             END IF;
         END IF;
     END LOOP;

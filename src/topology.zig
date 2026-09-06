@@ -110,6 +110,10 @@ pub const Topology = struct {
     // ─── KV buckets ─────────────────────────────────────────────────────────────
     kv_schemas: []const u8,
     kv_tenants: []const u8,
+    /// The fleet heartbeat bucket (§10dc): `$KV.<live>.<tenant>.<principal>`. Optional
+    /// in the grammar — a deployment older than the feature has no key, and absent
+    /// means the default the feature was built against.
+    kv_live: []const u8,
 
     /// The tenant token tenant-agnostic tables live under (`"_default"` unless
     /// grammar.json says otherwise) — generation manifests.
@@ -180,6 +184,7 @@ pub const Topology = struct {
         .mutation_ack_pattern = "mutation_ack.{[principal]s}.{[msg_id]s}",
         .kv_schemas = "schemas",
         .kv_tenants = "tenants",
+        .kv_live = "live",
         .open_tenant = "_default",
         .kv_generations = "generations",
         .generation_bucket_prefix = "gen-",
@@ -284,6 +289,10 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
 
     t.kv_schemas = try str(a, kv, "kv", "schemas", diag);
     t.kv_tenants = try str(a, kv, "kv", "tenants", diag);
+    t.kv_live = if (kv.get("live")) |v| (switch (v) {
+        .string => |x| try a.dupe(u8, x),
+        else => "live",
+    }) else "live";
 
     t.open_tenant = if (root.get("open_tenant")) |v| (switch (v) {
         .string => |x| try a.dupe(u8, x),

@@ -44,6 +44,8 @@ echo "service signing key: $SK_SERVICE"
 SK_CLIENT=$(nsc edit account ZEBRIDGE --sk generate 2>&1 | grep -o 'A[A-Z0-9]\{55\}' | tail -1)
 nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "mutation.{{name()}}.>" \
+    --allow-pub "\$KV.live.{{tag(tenant)}}.{{name()}}" \
+    --allow-pub "\$KV.live._default.{{name()}}" \
     --allow-pub "\$JS.API.INFO" \
     --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_{{tag(tenant)}}" \
     --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_{{tag(tenant)}}.>" \

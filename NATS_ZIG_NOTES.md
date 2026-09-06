@@ -301,3 +301,47 @@ FIXED idle slice per stream (measured 265 ± 1 ms added latency on every write).
 Carries `owns_inbox` so a subscription on a shared inbox does not free it, and
 the addendum hunk: the all-consumers-gone path freed `gone` twice (errdefer +
 explicit) — a macOS SIGTRAP found by stream_wipe.py, 2026-09-03.
+
+---
+
+## 8. Double release of the meta message on a deleted object (2026-09-06)
+
+**How it appeared**
+
+libzb's host (a Python process over the C ABI) aborted at `zb_client_close` after a
+seed that had failed on a chain object the producer had just deleted:
+
+```
+malloc: *** error for object 0x...: pointer being freed was not allocated
+```
+
+Found with `lldb -o "breakpoint set -n malloc_error_break"`: the second free came from
+`ObjectStore.get`, on the meta message of an object whose info said `deleted: true`.
+
+**Cause**
+
+`get()` and `infoIncludingDeleted()` fetch the object's meta message, and on the
+deleted path release it explicitly before returning `error.ObjectNotFound` — while an
+`errdefer meta_msg.deinit()` above releases it again on that same error return.
+Reachable by any caller that reads an object between the producer's delete and the
+manifest swap, which the generation chain does on every prune.
+
+**Change** (`nats.zig-objstore-double-release.patch`)
+
+`src/jetstream_objstore.zig`: an owned flag on the meta message —
+`var meta_msg_owned = true; errdefer if (meta_msg_owned) meta_msg.deinit();` — cleared
+right after the explicit release, in both functions.
+
+`src/root.zig`: exports `KVWatcher` and `WatchOptions`, which libzb's live schema
+watch needs (ZeBridge NOTES §10de); the types existed, only the re-export was missing.
+
+**Verified**
+
+```bash
+cd libzb && zig build test                    # unit tests
+libzb/python/migrate_reseed.py, migrate_rekey.py   # the seed-after-delete path, PASS
+```
+
+Upstream checked 2026-09-06 (`git fetch`, `d4cd40d` still the tip): none of entries 1–8
+are upstream. A PR bundling 1, 3, and 8 would carry the least ZeBridge-specific
+context; 6 and 7 are API additions and need a discussion first.

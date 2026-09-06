@@ -548,6 +548,8 @@ The endpoint is a **scoped signing key**:
 ```shell
 nsc edit signing-key --account APP --role client --sk A… \
   --allow-pub "mutation.{{name()}}.>" \
+  --allow-pub "$KV.live.{{tag(tenant)}}.{{name()}}" \   # its OWN heartbeat key, nothing else (PROTOCOL §9)
+  --allow-pub "$KV.live._default.{{name()}}" \
   --allow-sub "cdc.{{tag(tenant)}}.>" --allow-sub "_INBOX.>"
 ```
 
