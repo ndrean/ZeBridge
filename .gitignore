@@ -85,3 +85,5 @@ libzb/soak-uids.txt
 libzb/zbz-*.sqlite3*
 zb-client-ts/zebridge_*.sqlite3
 zb-client-ts/zebridge_*.sqlite3-*
+
+.env.grafana
