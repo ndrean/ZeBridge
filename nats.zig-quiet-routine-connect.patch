@@ -1,0 +1,42 @@
+Quiet the ROUTINE connect and the consumer add: a caller-initiated connect logged
+twice at info, and every CONSUMER.CREATE logged at info — all three drop to debug.
+NATS_ZIG_NOTES.md entry 9. Real events keep their voice: the reconnect machinery
+reports at warn, JetStream API errors at err.
+
+diff --git a/src/connection.zig b/src/connection.zig
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -739,7 +739,9 @@
+         while (true) {
+             if (self.status == .closed) return error.ConnectionClosed;
+             if (self.connected_once) {
+-                log.info("Connected successfully", .{});
++                // Routine: the caller asked to connect and it did. The URL form below
++                // says the same thing once more; both are debug (NATS_ZIG_NOTES entry 9).
++                log.debug("Connected successfully", .{});
+                 return;
+             }
+ 
+@@ -1757,7 +1759,9 @@
+ 
+         attempts.* = 0;
+ 
+-        log.info("Connected successfully to {s}", .{server.parsed_url.full_url});
++        // A caller-initiated connect is not an event; a RE-connect after a drop is,
++        // and the reconnect machinery announces that at warn on its own.
++        log.debug("Connected successfully to {s}", .{server.parsed_url.full_url});
+ 
+         // Invoke reconnected callback last, so it observes a connection with
+         // subscriptions restored and buffered publishes already queued ahead
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -1187,7 +1187,7 @@
+         if (config.name) |n| try validation.validateConsumerName(n);
+         if (config.durable_name) |n| try validation.validateConsumerName(n);
+ 
+-        log.info("adding consumer", .{});
++        log.debug("adding consumer", .{});
+         // LOCAL FIX (see NOTES.md): a NAMED consumer uses the modern
+         // CONSUMER.CREATE.<stream>.<name>[.<filter>] endpoint (server >= 2.9)
+         // instead of the legacy CONSUMER.DURABLE.CREATE API. Least-privilege

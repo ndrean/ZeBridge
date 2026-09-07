@@ -345,3 +345,47 @@ libzb/python/migrate_reseed.py, migrate_rekey.py   # the seed-after-delete path,
 Upstream checked 2026-09-06 (`git fetch`, `d4cd40d` still the tip): none of entries 1–8
 are upstream. A PR bundling 1, 3, and 8 would carry the least ZeBridge-specific
 context; 6 and 7 are API additions and need a discussion first.
+## 9. The routine connect logged twice, the consumer add logged like a decision (2026-09-07)
+
+**How it appeared**
+
+Every fleet-monitor tick — the monitor opens a fresh connection per pass, like the
+generation producer, and lists the `live` bucket's keys — the bridge log gained:
+
+```
+info(nats): Connected successfully to nats://127.0.0.1:4222
+info(nats): Connected successfully
+info(nats): adding consumer
+```
+
+Reported from the web-consumer session: an operator saw the trio recur every minute,
+next to a `JetStream error … 10058` that turned out to be the bridge's own
+create-then-open of the bucket (fixed on the bridge side, NOTES §10dr), and asked
+whether the bridge was reconnecting. It was not — it was connecting, on purpose, on
+schedule — and entry 5's reasoning applies unchanged: a routine, caller-initiated event
+should not read as one worth investigating.
+
+**Cause**
+
+`connect()` announces success twice at info: once with the URL in the per-server
+connect path, once more in the wait loop that returns to the caller. `addConsumer`
+logs "adding consumer" at info before every CONSUMER.CREATE, which a KV `keys()` issues
+each time it is called.
+
+**Change**
+
+`src/connection.zig` — both "Connected successfully" lines drop to `debug`.
+`src/jetstream.zig` — "adding consumer" drops to `debug`. Real events keep their
+voice: a drop and the re-connect after it are reported by the reconnect machinery at
+warn, and a JetStream API refusal stays at err (the caller gets the typed error too).
+
+`nats.zig-quiet-routine-connect.patch`.
+
+**Verified**
+
+```bash
+cd nats.zig && zig build test
+# bridge at LOG_LEVEL=info: the trio gone from the fleet tick; a forced drop still logs the reconnect
+```
+
+---
