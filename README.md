@@ -77,10 +77,11 @@ NATS restricts payloads (< $2^{20}$=1 MB by default, safe up to 8 MB). This defa
 
 > Any larger payloads belong to object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data; not PDF nor base64 encoded images for instance.
 
-* We adopted a last-write-wins (LWW) conflict resolution policy rather than leaving the result to chance. PostgreSQL judges a write by its version, per row: an edit stamped below the row's version is refused as `stale`. The client then looks at which columns the winner changed. If the refused edit touched none of them, it is resubmitted with a fresh stamp and lands; if both edited the same column, the edit is dropped and the loss is surfaced. So an edit is lost only on a column that was genuinely contested. Clock skew is absorbed the same way: a slow clock is judged stale, and its edit is rebased onto the row it was made on, stamped above what the client has seen (a hybrid logical clock).
   
 * Cross-tenant ordering. If fields are referenced acrross tenant without a foreign key, the result can look wrong for a moment.For example, an order scoped to the tenant `accounting` referencing a document that arrives as public data can, for a moment, arrive first and look wrong before the document lands. It is not related to LWW.
-➡ Only a **foreign key** guarantees that order, because the bridge knows that child must be hold until the parent lands when a foreign is declared. Without this, impossible to know. The solution belongs to "good pratice", a choice made when designing tables. This is 
+
+➡ Only a **foreign key** guarantees that order, because the bridge knows that child must be hold until the parent lands when a foreign is declared. Without this, impossible to know. The solution belongs to "good pratice", a choice made when designing tables.
+
 **Observability**: ZeBridge includes production-ready observability out of the box; it exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards.
 
 
@@ -260,6 +261,9 @@ For these tasks, you can run `ZeBridge` as a CLI with a dedicated helpers  (`--i
 This tenant structure makes sense for B2B services, less for B2C operations because clients have basically all the same rights. By dividing the database by tenants, you can use advantageoulsy NATS leaf nodes and assign a tenant per node; the main benefit is that NATS will contains only one full copy of the database.
 If you face clients, you have in pratice one tenant. Thanks to NATS leafs nodes, you can distribute geographically the load where each leaf nodes will contain a copy of the database close to the consumers.
 * **Detla-chain** generation: a snapshot of a table is not on-demand nor a full table per tenant. This would crush Postgres if thousands of consumers connect. Instead, a "generation" thread produces full/deltas in a time window with a max chain length and these are dictionary based Zstd compressed and pushed into NATS. The client library cherry picks whatever its needs on connection, and complements with the few remaining CDCs up to its watermark.
+
+
+* We adopted a last-write-wins (LWW) conflict resolution policy rather than leaving the result to chance. PostgreSQL judges a write by its version, per row: an edit stamped below the row's version is refused as `stale`. The client then looks at which columns the winner changed. If the refused edit touched none of them, it is resubmitted with a fresh stamp and lands; if both edited the same column, the edit is dropped and the loss is surfaced. So an edit is lost only on a column that was genuinely contested. Clock skew is absorbed the same way: a slow clock is judged stale, and its edit is rebased onto the row it was made on, stamped above what the client has seen (a hybrid logical clock).
 
 ### Good pratices - Schema rules
 
