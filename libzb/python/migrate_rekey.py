@@ -14,7 +14,7 @@ re-added — in ONE transaction. Expected, with no client restart:
   * CDC keyed by the NEW pk lands afterwards.
 """
 import ctypes, json, os, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c"); PSQLQ = psql_cmd("-At", "-c")
 PUB = os.environ.get("BRIDGE_CDC_PUBLICATION") or sys.exit("BRIDGE_CDC_PUBLICATION is not set (source .env.bridge)")
 lib = load_lib()
@@ -61,7 +61,7 @@ for t in ("rekey_probe", "rekey_child"):
 db = "/tmp/zb-migrate-rekey.sqlite3"; rm_sqlite(db)
 h = lib.zb_client_open(json.dumps({
     "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar", "clientId": "py-migrate-rekey",
+    "dbPath": db, "principal": "omar", "clientId": "py-migrate-rekey",
     "tables": ["rekey_probe", "rekey_child"], "heartbeatMs": 0}).encode())
 try:
     if not h: sys.exit("open failed")

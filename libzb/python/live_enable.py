@@ -10,7 +10,7 @@ without one it would pass vacuously. BRIDGE_CDC_PUBLICATION names the publicatio
 (default my_pub, announced when defaulted).
 """
 import argparse, ctypes, json, os, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--log", required=True, help="the running bridge's log file (for 'catalogue reloaded live')")
@@ -57,8 +57,7 @@ DBS = []
 def open_client(tables, tag):
     db = f"/tmp/zb-live-{tag}.sqlite3"
     rm_sqlite(db); DBS.append(db)
-    h = lib.zb_client_open(json.dumps({"url": NATS_URL, "credsPath": creds("omar"), "grammarPath": GRAMMAR,
-        "dbPath": db, "principal": "omar", "clientId": "py-live-" + tag, "tables": tables}).encode())
+    h = lib.zb_client_open(json.dumps({"url": NATS_URL, "credsPath": creds("omar"), "dbPath": db, "principal": "omar", "clientId": "py-live-" + tag, "tables": tables}).encode())
     if not h:
         sys.exit(f"open failed for client '{tag}' (is the native stack up?)")
     return h

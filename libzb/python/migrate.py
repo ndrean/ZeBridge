@@ -3,7 +3,7 @@ client runs; the bridge republishes the descriptor; the client's next `sync`
 migrates the replica in place. ADD → INSERT with the new column → RENAME (hint) →
 DROP, the value surviving the rename."""
 import ctypes, json, os, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
@@ -31,7 +31,7 @@ def check(label, cond):
 db = "/tmp/zb-migrate.sqlite3"
 rm_sqlite(db)
 h = lib.zb_client_open(json.dumps({"url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar", "clientId": "py-migrate", "tables": ["users", "salaries", "test_types"]}).encode())
+    "dbPath": db, "principal": "omar", "clientId": "py-migrate", "tables": ["users", "salaries", "test_types"]}).encode())
 uid = str(uuid.uuid4())
 try:
     if not h:

@@ -80,7 +80,7 @@ def main():
     creds = os.path.join(_env.CREDS_DIR, f"{P}.creds")
     h = lib.zb_client_open(json.dumps({
         "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"),
-        "credsPath": creds, "grammarPath": _env.GRAMMAR, "dbPath": DB,
+        "credsPath": creds, "dbPath": DB,
         "principal": P, "clientId": f"py-swarm-{WID}",
         "tables": ["users", "sw_suppliers", "sw_clients", "sw_orders", "orders", "test_types"]}).encode())
     if not h:

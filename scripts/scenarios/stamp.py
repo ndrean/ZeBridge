@@ -92,7 +92,7 @@ async def main():
                 pass
         h = lib.zb_client_open(json.dumps({
             "url": zb.nats_server(), "credsPath": zb.creds_for(who),
-            "grammarPath": str(zb.ROOT / "src" / "grammar.json"), "dbPath": cdb,
+            "dbPath": cdb,
             "principal": who, "clientId": "stamp-consumer",
             "tables": ["zb_stamp"]}).encode())
         if not h:

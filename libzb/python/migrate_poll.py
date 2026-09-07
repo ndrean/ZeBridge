@@ -4,7 +4,7 @@ the new shape → RENAME (hint) → DROP COLUMN must all reach the replica throu
 schema watch that `poll` drains; then a table DROPPED upstream must disappear locally.
 `migrate.py` proves the same moves through `sync`; this one proves them without it."""
 import ctypes, json, os, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
@@ -46,7 +46,7 @@ pg(f"CREATE TABLE public.{PROBE} (uid uuid PRIMARY KEY, txt text, updated_at tim
 time.sleep(2)  # the descriptor for the newborn reaches $KV.schemas
 h = lib.zb_client_open(json.dumps({
     "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar", "clientId": "py-migrate-poll",
+    "dbPath": db, "principal": "omar", "clientId": "py-migrate-poll",
     "tables": ["users", "test_types", PROBE], "heartbeatMs": 0}).encode())
 try:
     if not h: sys.exit("open failed (is the native stack up? nats 127.0.0.1:4222, creds for omar)")

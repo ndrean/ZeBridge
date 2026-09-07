@@ -21,8 +21,11 @@
 //!                          const char* key_json, const char* values_json);   // {"msgId":…}
 //!   char* zb_client_flush(uint64_t h, uint64_t wait_ms);           // {"sent":n,"settled":n}
 //!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n} — live tail, blocks ≤ wait_ms
-//! `opts_json`: url, credsPath, grammarPath, dbPath, principal, tables (array,
-//! parents first), clientId (stable across restarts — it is the msg_id prefix).
+//! `opts_json`: url, credsPath, dbPath, principal, tables (array, parents first),
+//! clientId (stable across restarts — it is the msg_id prefix), grammarHash
+//! (optional: the hash the host received from /enroll or GET /grammar; a mismatch
+//! refuses to open). The grammar itself is compiled in — `zb_grammar_hash()` says
+//! which (§10dq).
 //!
 //! `fn` names a fixture section of core-fixtures.json; `args_json` is that
 //! case's input fields verbatim; the return value is the expected output as
@@ -308,7 +311,7 @@ const ClientBox = struct {
     c: *client.SyncClient,
     url: [:0]u8,
     creds: [:0]u8,
-    grammar: [:0]u8,
+    grammar_hash: ?[]u8,
     db: [:0]u8,
     principal: [:0]u8,
     client_id: [:0]u8,
@@ -318,7 +321,7 @@ const ClientBox = struct {
         self.c.deinit();
         a.free(self.url);
         a.free(self.creds);
-        a.free(self.grammar);
+        if (self.grammar_hash) |g| a.free(g);
         a.free(self.db);
         a.free(self.principal);
         a.free(self.client_id);
@@ -369,12 +372,10 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     errdefer a.free(url);
     const creds = try a.dupeZ(u8, str.get(o, "credsPath", ""));
     errdefer a.free(creds);
-    const grammar = try a.dupeZ(u8, str.get(o, "grammarPath", "grammar.json"));
-    // "grammarJson": the file-free path (§10ci) — the raw grammar object as a string,
-    // exactly what /enroll's `grammar` field or GET /grammar returns.
-    const gj_raw = str.get(o, "grammarJson", "");
-    const grammar_json: ?[]const u8 = if (gj_raw.len > 0) try a.dupe(u8, gj_raw) else null;
-    errdefer a.free(grammar);
+    // "grammarHash": what the host received beside its creds (§10dq). Empty = unchecked.
+    const gh_raw = str.get(o, "grammarHash", "");
+    const grammar_hash: ?[]u8 = if (gh_raw.len > 0) try a.dupe(u8, gh_raw) else null;
+    errdefer if (grammar_hash) |g| a.free(g);
     const db = try a.dupeZ(u8, str.get(o, "dbPath", "zb.sqlite3"));
     errdefer a.free(db);
     const principal = try a.dupeZ(u8, str.get(o, "principal", ""));
@@ -407,8 +408,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .c = try client.SyncClient.init(a, .{
             .url = url,
             .creds_path = creds,
-            .grammar_path = grammar,
-            .grammar_json = grammar_json,
+            .grammar_hash = grammar_hash,
             .heartbeat_ms = heartbeat_ms,
             .db_path = db,
             .principal = principal,
@@ -417,7 +417,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         }),
         .url = url,
         .creds = creds,
-        .grammar = grammar,
+        .grammar_hash = grammar_hash,
         .db = db,
         .principal = principal,
         .client_id = client_id,
@@ -452,6 +452,21 @@ export fn zb_client_wipe(handle: u64) c_int {
 
 /// Open clients. Exists so a test can assert the table empties — a leak of a whole
 /// client is otherwise invisible from outside.
+/// The sha256 (lowercase hex) of the grammar this library was built with — compare
+/// it with the bridge's `X-Grammar-Hash` or the /enroll payload's `grammar_hash`;
+/// or pass that value as `grammarHash` at open and let the library refuse. Free
+/// with zb_free.
+export fn zb_grammar_hash() ?[*:0]u8 {
+    var buf: [64]u8 = undefined;
+    return dupeZ(client.grammarHashHex(&buf));
+}
+
+/// The grammar bytes themselves, for a host that needs a wire name (a NATS conf, a
+/// diagnostic). Free with zb_free.
+export fn zb_grammar_json() ?[*:0]u8 {
+    return dupeZ(client.grammar_json);
+}
+
 export fn zb_client_live() c_int {
     return @intCast(clients.liveCount());
 }

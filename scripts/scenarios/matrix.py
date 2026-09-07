@@ -195,7 +195,7 @@ async def run(markers: list[str], n: Nats) -> int:
                 zb.bad("probe bridge did not start"); return 1
             h = lib.zb_client_open(json.dumps({
                 "url": zb.nats_server(), "credsPath": zb.creds_for(PRINCIPAL),
-                "grammarPath": str(zb.ROOT / "src" / "grammar.json"), "dbPath": db,
+                "dbPath": db,
                 "principal": PRINCIPAL, "clientId": "py-matrix", "tables": [TABLE]}).encode())
             if not h:
                 zb.bad("libzb client could not open"); return 1

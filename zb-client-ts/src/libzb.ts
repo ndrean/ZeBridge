@@ -39,6 +39,22 @@ import { heartbeatPayload,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
+import GRAMMAR_JSON from './grammar.json' with { type: 'json' };
+
+/// §10dq: the wire grammar, compiled in — a copy of `src/grammar.json` pinned
+/// byte-for-byte by core.test.ts. Nothing fetches it, nothing is passed in; a
+/// rename is a protocol fork whose cost is a rebuild on both sides.
+export const GRAMMAR: any = GRAMMAR_JSON;
+
+/// sha256 of the embedded grammar (lowercase hex): the value the bridge serves as
+/// `X-Grammar-Hash` and in the /enroll payload's `grammar_hash` for the same bytes.
+/// Computed on the canonical text the bridge embeds, so the JSON is re-serialized
+/// the way the file is written: two-space indent, trailing newline.
+export async function grammarHashHex(): Promise<string> {
+  const text = JSON.stringify(GRAMMAR, null, 2) + '\n';
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 export interface ZeBridgeConfig {
   /// Replace the whole wire layer (NATS factories, headers, wire constants) —
@@ -57,7 +73,13 @@ export interface ZeBridgeConfig {
   /// When set it wins over user/password — the JWT carries the permissions
   /// (scoped signing key), so no server conf names this principal at all.
   creds?: string;
-  grammar: any;   // the parsed grammar.json — wire names only; the consumer imports and passes it
+  /// The grammar hash this client RECEIVED — from the /enroll payload beside the JWT,
+  /// or the bridge's `X-Grammar-Hash` header. When set, a mismatch refuses to connect:
+  /// this library is built for another protocol than the bridge it is pointed at.
+  /// Unset skips the check (a bridge that could not be reached is not a mismatch).
+  grammarHash?: string;
+  /** @internal The compiled-in grammar (§10dq). Not a consumer input: any value passed here is replaced. */
+  grammar?: any;
   /// PROTOCOL §9: the fleet heartbeat cadence in ms (default 30 000; 0 disables).
   heartbeatMs?: number;
   durable?: boolean;
@@ -253,6 +275,7 @@ export class ZeBridge {
 
   constructor(config: ZeBridgeConfig) {
     this.config = config;
+    config.grammar = GRAMMAR;
     // The creds win over the passed principal — kills the mismatch class where
     // config says bob but the JWT says omar (every publish would just bounce).
     if (config.creds) {
@@ -395,6 +418,7 @@ export class ZeBridge {
 
   public async connect(): Promise<void> {
     await this.initSyncState();
+    await this.refuseIfGrammarForked();
 
     if (this.nc) {
       try { await this.nc.close(); } catch { /* already closed */ }
@@ -501,6 +525,19 @@ export class ZeBridge {
   /// Close AND delete the replica files (§10dl). Never automatic: a revoked principal's
   /// device keeps its rows and simply stops receiving; the wipe is the application's
   /// explicit act, and this is the one verb for it (libzb: `zb_client_wipe`).
+  /// §10dq: the check that makes a fork loud. A client with valid creds and another
+  /// grammar is the "impossible" case of §10ci — it would subscribe to streams that do
+  /// not exist — so it is refused here, before a socket opens with the wrong names.
+  private async refuseIfGrammarForked(): Promise<void> {
+    const want = this.config.grammarHash?.trim().toLowerCase();
+    if (!want) return;
+    const have = await grammarHashHex();
+    if (have === want) return;
+    this.appendLog('SYS', `grammar mismatch: this library embeds ${have}, the bridge serves ${want} — built for another protocol; rebuild the client`, 'ERROR');
+    this.emitStatus('disconnected');
+    throw new Error(`GrammarMismatch: library ${have} vs bridge ${want}`);
+  }
+
   public async wipe(): Promise<void> {
     await this.close();
     await this.deleteDatabaseFile();

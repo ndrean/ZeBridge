@@ -8,7 +8,6 @@ import zb
 
 NODE_DIR = zb.ROOT / "examples" / "04-node-consumer"
 LIBZB = zb.ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
-GRAMMAR = str(zb.ROOT / "src" / "grammar.json")
 
 
 def fresh_sqlite(path):
@@ -35,7 +34,7 @@ class Lib:
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         lib.zb_client_wipe.restype, lib.zb_client_wipe.argtypes = ctypes.c_int, [ctypes.c_uint64]
         self.h = lib.zb_client_open(json.dumps({
-            "url": zb.nats_server(), "credsPath": str(creds) if creds else zb.creds_for(principal), "grammarPath": GRAMMAR, "dbPath": db,
+            "url": zb.nats_server(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
             "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0}).encode())
         if not self.h: sys.exit("libzb open failed")
         r = self.take(lib.zb_client_sync(self.h))

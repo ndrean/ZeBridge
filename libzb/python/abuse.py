@@ -19,7 +19,7 @@ a live pid works, which is what leaksoak.py already does and what the script abo
 uses. `--hold` keeps this process alive so it can be attached to.
 """
 import ctypes, json, os, sys, threading
-from _env import load_lib, GRAMMAR, rm_sqlite
+from _env import load_lib, rm_sqlite
 
 lib = load_lib()
 lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
@@ -39,7 +39,6 @@ def opts(db):
     return json.dumps({
         "url": "nats://127.0.0.1:1",           # nothing listening, on purpose
         "credsPath": "/nonexistent.creds",
-        "grammarPath": GRAMMAR,
         "dbPath": db,
         "principal": "abuse",
     }).encode()

@@ -62,6 +62,8 @@ row a rule is named.
 | version stamped by the client (HLC) | ✓ | ✓ | (NOTES §10cp said libzb's caller supplied it; no longer true) |
 | verdicts: accepted / stale / rejected / row_deleted, two revert targets | ✓ | ✓ | PROTOCOL MUST 4 |
 | a stale UPDATE rebased onto the winning row when the columns are disjoint, dropped and surfaced when they overlap; the winner before or after the verdict, a slow clock | ✓ `mutate_at` stamps a write explicitly | ✓ `mutate(…, { version })` | §10do, PROTOCOL §7.6, `rebase_stale` |
+| a write with no socket queues in the outbox and goes out on the next connect | ✓ (the host's flush) | ✓ (was a silent return) | §10dp |
+| the wire grammar compiled in; `grammarHash` at open refuses a fork; a bridge that cannot be reached does not block opening | ✓ `@embedFile`, `zb_grammar_hash()` | ✓ packaged copy, `grammarHashHex()`, pinned by test | §10dq, PROTOCOL §1, `grammar_served` |
 | missed verdicts recovered by direct get | ✓ | ✓ | §7.4b |
 | outbox watermark gate before a flush | ✓ | ✓ | §10at, §10au, fixture |
 | a failed optimistic echo still queues the write | ✓ | ✓ | §10cp |

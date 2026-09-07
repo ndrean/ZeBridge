@@ -23,8 +23,8 @@ fn nowIso(a: std.mem.Allocator) ![]const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
-        yd.year, md.month.numeric(), @as(u32, md.day_index) + 1,
-        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        yd.year,                                                md.month.numeric(),      @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(),                                   ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
         @as(u64, @intCast(@divTrunc(@as(i64, ts.nsec), 1000))),
     });
 }
@@ -47,7 +47,6 @@ pub fn main() !void {
     const c = try client.SyncClient.init(a, .{
         .url = "nats://127.0.0.1:4222",
         .creds_path = "../scripts/native/creds/omar.creds",
-        .grammar_path = "../grammar.json",
         .db_path = "zbz-demo.sqlite3",
         .principal = "omar",
         .tables = &.{ "users", "salaries", "test_types" }, // parents first
@@ -112,8 +111,7 @@ pub fn main() !void {
         std.debug.print("   mutate queued: {s}\n", .{msg_id});
     }
 
-    std.debug.print("   flushed: {d}, verdicts settled: {d}\n",
-        .{ try c.flushOutbox(), try c.drainVerdicts(4000) });
+    std.debug.print("   flushed: {d}, verdicts settled: {d}\n", .{ try c.flushOutbox(), try c.drainVerdicts(4000) });
 
     // ZB_POLL=n: n turns of the live tail (§10bh) — the shared inbox, the persistent
     // consumers, the per-stream grouping — so `leaks` sees that path too.

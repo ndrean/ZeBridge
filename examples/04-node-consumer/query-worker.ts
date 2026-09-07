@@ -23,7 +23,6 @@ const zb = new ZeBridge({
   natsUrl: process.env.NATS_URL ?? 'nats://127.0.0.1:4222',
   principal: PRINCIPAL,
   creds: readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
-  grammar: JSON.parse(readFileSync(`${REPO}src/grammar.json`, 'utf8')),
   heartbeatMs: 0,
   durable: true,
   storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: DB }) : (_: string) => nodeStorage(DB),

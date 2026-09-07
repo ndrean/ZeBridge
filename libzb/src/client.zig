@@ -19,15 +19,28 @@ const C = @import("c");
 
 const Value = std.json.Value;
 
+/// §10dq: the wire grammar, compiled in — the same `src/grammar.json` the bridge
+/// embeds (§10ci). A rename is a protocol fork whose cost is a rebuild, on both
+/// sides; nothing reads a file, nothing fetches, and a client opens with the bridge
+/// down (NATS holds everything a provisioned client needs).
+pub const grammar_json: []const u8 = @embedFile("grammar");
+
+/// sha256 of the embedded grammar, lowercase hex — what the bridge's `X-Grammar-Hash`
+/// header and the /enroll payload's `grammar_hash` carry for the same bytes.
+pub fn grammarHashHex(buf: *[64]u8) []const u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(grammar_json, &digest, .{});
+    return std.fmt.bufPrint(buf, "{x}", .{&digest}) catch unreachable;
+}
+
 pub const Options = struct {
     url: []const u8,
     creds_path: []const u8,
-    grammar_path: []const u8,
-    /// Inline grammar JSON (§10ci): when set it wins over `grammar_path`, and no file
-    /// is touched. This is how a client bootstraps from the /enroll payload or a
-    /// GET /grammar fetch — the file-free path; grammar_path remains for tools that
-    /// sit in the repo anyway.
-    grammar_json: ?[]const u8 = null,
+    /// The grammar hash the host RECEIVED — from the /enroll payload beside the JWT, or
+    /// GET /grammar's header. When set, a mismatch refuses to open: this library is
+    /// built for another protocol than the bridge it is pointed at. Unset skips the
+    /// check (a bridge that could not be reached is not a mismatch).
+    grammar_hash: ?[]const u8 = null,
     db_path: [*:0]const u8,
     principal: []const u8,
     /// Parents FIRST is still the recommended order — but since §10cp the seed
@@ -192,12 +205,12 @@ pub const SyncClient = struct {
         self.ro = try storage.Storage.openReadOnly(opts.db_path);
         errdefer self.ro.close();
 
+        // Before the transport: the grammar is compiled in (§10dq), and a hash
+        // mismatch must refuse before a socket is opened with the wrong names.
+        try self.loadGrammar();
+
         self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = opts.creds_path });
         errdefer self.t.deinit();
-
-        // After the transport: the grammar read borrows its Io rather than standing up
-        // a second thread pool for one file.
-        try self.loadGrammar();
 
         return self;
     }
@@ -261,12 +274,15 @@ pub const SyncClient = struct {
         // Client-lifetime arena, deliberately: the grammar strings below are read for
         // the life of the client, and this runs once.
         const a = self.aa();
-        const io = self.t.threaded.io();
-        const bytes = if (self.opts.grammar_json) |gj|
-            try a.dupe(u8, gj)
-        else
-            try std.Io.Dir.cwd().readFileAlloc(io, self.opts.grammar_path, a, .limited(1 << 20));
-        const g = try std.json.parseFromSlice(Value, a, bytes, .{});
+        if (self.opts.grammar_hash) |want| {
+            var buf: [64]u8 = undefined;
+            const have = grammarHashHex(&buf);
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, want, " \t\r\n"), have)) {
+                std.debug.print("grammar mismatch: this library embeds {s}, the bridge serves {s} — built for another protocol; rebuild the client\n", .{ have, want });
+                return error.GrammarMismatch;
+            }
+        }
+        const g = try std.json.parseFromSlice(Value, a, grammar_json, .{});
         const root = g.value;
         self.cdc_prefix = try grammarString(root, &.{ "cdc_streams", "tenant_prefix" });
         self.cdc_public = try grammarString(root, &.{ "cdc_streams", "public" });
@@ -2556,7 +2572,6 @@ test "init that cannot open the database leaks nothing" {
     const r = SyncClient.init(std.testing.allocator, .{
         .url = "nats://127.0.0.1:1",
         .creds_path = "/nonexistent.creds",
-        .grammar_path = "../grammar.json",
         .db_path = bad,
         .principal = "t",
         .tables = &.{},
@@ -2564,19 +2579,30 @@ test "init that cannot open the database leaks nothing" {
     try std.testing.expectError(storage.Error.OpenFailed, r);
 }
 
-test "init that cannot read the grammar leaks nothing — including the open database" {
+test "init with another protocol's grammar hash refuses, and leaks nothing — including the open database" {
     // The database DOES open here, so this is the case that used to leave a live
     // SQLite handle behind: errdefer destroyed the struct and closed nothing.
     const r = SyncClient.init(std.testing.allocator, .{
         .url = "nats://127.0.0.1:1",
         .creds_path = "/nonexistent.creds",
-        .grammar_path = "/nonexistent-grammar.json",
+        .grammar_hash = "0000000000000000000000000000000000000000000000000000000000000000",
         .db_path = "zbz-test-ownership.sqlite3",
         .principal = "t",
         .tables = &.{},
     });
-    try std.testing.expect(std.meta.isError(r));
+    try std.testing.expectError(error.GrammarMismatch, r);
     _ = std.c.unlink("zbz-test-ownership.sqlite3");
+}
+
+test "the embedded grammar parses and its hash is the bridge's form" {
+    const g = try std.json.parseFromSlice(Value, std.testing.allocator, grammar_json, .{});
+    defer g.deinit();
+    try std.testing.expect(g.value == .object);
+    try std.testing.expect(g.value.object.get("streams") != null);
+    var buf: [64]u8 = undefined;
+    const h = grammarHashHex(&buf);
+    try std.testing.expectEqual(@as(usize, 64), h.len);
+    for (h) |c| try std.testing.expect(std.ascii.isHex(c));
 }
 
 test "migrateTable: create, ALTER add/remove, rename hint, FK change rebuilds — the row survives each" {

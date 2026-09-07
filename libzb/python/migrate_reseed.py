@@ -5,7 +5,7 @@ republishes the descriptor with the new epoch, the polling client forgets its wa
 seeds the fresh full, and the NULLs become PostgreSQL's timestamps. Then the foreign-key
 closure: reseeding `users` bumps `salaries` too."""
 import ctypes, json, os, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c"); PSQLQ = psql_cmd("-At", "-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
@@ -33,7 +33,7 @@ db = "/tmp/zb-migrate-reseed.sqlite3"; rm_sqlite(db)
 uid = str(uuid.uuid4())
 h = lib.zb_client_open(json.dumps({
     "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar", "clientId": "py-migrate-reseed",
+    "dbPath": db, "principal": "omar", "clientId": "py-migrate-reseed",
     "tables": ["users", "test_types"], "heartbeatMs": 0}).encode())
 try:
     if not h: sys.exit("open failed")

@@ -4,7 +4,6 @@ import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
 const R = new URL('../../', import.meta.url).pathname;
 const zb = new ZeBridge({ natsUrl:'nats://127.0.0.1:4222', principal:'omar',
   creds: readFileSync(`${R}scripts/native/creds/omar.creds`,'utf8'),
-  grammar: JSON.parse(readFileSync(`${R}grammar.json`,'utf8')),
   durable:true, storage:nodeStorage, connect:nodeConnect });
 let held=0, res=0;
 zb.onLog((t:string,d:any)=>{const s=typeof d==='string'?d:'';

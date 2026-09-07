@@ -10,8 +10,9 @@ clients RECEIVE it: `GET /grammar` (bytes + `X-Grammar-Hash`) and the /enroll pa
 
   1. GET /grammar is byte-identical to src/grammar.json, and the hash header is the
      sha256 of exactly those bytes
-  2. a libzb client opens with `grammarJson` — the served bytes, NO file path — and
-     syncs against the live stack: the file-free client is real
+  2. libzb EMBEDS the same bytes (§10dq): `zb_grammar_hash()` equals the served hash;
+     a client opened with the served hash as `grammarHash` syncs; one opened with
+     another protocol's hash is refused before any socket opens
   3. the /enroll payload carries `grammar` + `grammar_hash` (skipped gracefully when
      enrollment is not armed, the house pattern)
 """
@@ -48,9 +49,10 @@ def main() -> int:
                f"{served_hash == hashlib.sha256(body.encode()).hexdigest()})")
         failed += 1
 
-    # ── 2. the file-free client ─────────────────────────────────────────────
+    # ── 2. the compiled-in client, checked against the served hash ──────────
     lib = _env.load_lib()
     lib.zb_free.argtypes = [ctypes.c_void_p]
+    lib.zb_grammar_hash.restype = ctypes.c_void_p
     lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
     for n, a in (("sync", []), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
@@ -60,26 +62,35 @@ def main() -> int:
         try: return json.loads(ctypes.string_at(p).decode())
         finally: lib.zb_free(p)
 
+    p = lib.zb_grammar_hash(); lib_hash = ctypes.string_at(p).decode(); lib.zb_free(p)
+    if lib_hash == served_hash:
+        zb.ok(f"libzb embeds the same grammar: zb_grammar_hash() == X-Grammar-Hash ({lib_hash[:16]}…)")
+    else:
+        zb.bad(f"libzb's embedded grammar differs from the bridge's ({lib_hash[:16]}… vs {served_hash[:16]}…)"); failed += 1
+
     db = "/tmp/zb-grammar-served.sqlite3"
     _env.rm_sqlite(db)
-    h = lib.zb_client_open(json.dumps({
-        "url": zb.nats_server(), "credsPath": zb.creds_for("omar"),
-        "grammarJson": body,                       # ← the served bytes; no grammarPath
-        "dbPath": db, "principal": "omar", "clientId": "py-grammar-served",
-        "tables": ["users"]}).encode())
+    opts = {"url": zb.nats_server(), "credsPath": zb.creds_for("omar"), "dbPath": db,
+            "principal": "omar", "clientId": "py-grammar-served", "tables": ["users"]}
+    h = lib.zb_client_open(json.dumps({**opts, "grammarHash": served_hash}).encode())
     if not h:
-        zb.bad("file-free client could not open"); return failed + 1
+        zb.bad("a client given the served hash could not open"); return failed + 1
     try:
         take(lib.zb_client_sync(h))
         rows = take(lib.zb_client_query(h, b"SELECT count(*) FROM users", b"[]")).get("rows")
         if rows and rows[0][0] >= 0:
-            zb.ok(f"a libzb client bootstrapped from the SERVED grammar alone (grammarJson, "
-                  f"no file) and synced: users has {rows[0][0]} row(s)")
+            zb.ok(f"a client opened with the served hash as grammarHash, nothing else, and synced: users has {rows[0][0]} row(s)")
         else:
-            zb.bad("the file-free client synced nothing"); failed += 1
+            zb.bad("the client synced nothing"); failed += 1
     finally:
         lib.zb_client_close(h)
         _env.rm_sqlite(db)
+    forked = lib.zb_client_open(json.dumps({**opts, "grammarHash": "f" * 64}).encode())
+    if forked == 0:
+        zb.ok("a client handed another protocol's hash is REFUSED at open — a fork is loud, not a silent subscription to nothing")
+    else:
+        zb.bad("a client with a foreign grammar hash opened anyway"); lib.zb_client_close(forked); failed += 1
+    _env.rm_sqlite(db)
 
     # ── 3. the enrollment payload ───────────────────────────────────────────
     r = subprocess.run(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",

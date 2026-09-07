@@ -22,6 +22,15 @@ import {
 const here = dirname(fileURLToPath(import.meta.url));
 const fx = JSON.parse(readFileSync(join(here, '..', 'fixtures', 'core-fixtures.json'), 'utf8'));
 
+// §10dq: the package's grammar is the bridge's, byte for byte. The bridge embeds
+// src/grammar.json; this copy ships inside the package because a file outside its
+// root cannot. A drift here is a protocol fork, and this is where it turns red.
+test('grammar: the packaged copy is byte-identical to src/grammar.json', () => {
+  const packaged = readFileSync(join(here, 'grammar.json'), 'utf8');
+  const source = readFileSync(join(here, '..', '..', 'src', 'grammar.json'), 'utf8');
+  assert.equal(packaged, source);
+});
+
 for (const c of fx.heartbeat) {
   test(`heartbeat: ${c.name}`, () => assert.equal(heartbeatPayload(c.principal, c.tenant, c.ts, c.seqs), c.out));
 }

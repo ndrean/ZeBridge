@@ -58,14 +58,24 @@ by `scripts/scenarios/invalidate.py`, which covers all four caches a migration m
 
 ## 1. Vocabulary — `grammar.json` is the single source
 
-Every stream, subject and bucket name comes from `grammar.json` at the repository
-root. The bridge reads it at startup (`src/topology.zig`, `--top` / `TOPOLOGY_PATH`); the
-NATS init scripts and the reference clients read the same file. It carries only the static
-wire grammar — `streams`, `subjects`, `kv`, `cdc_streams`, `open_tenant`,
-`generations`. Which tables replicate, and their tenancy and LWW columns, is not in this
-file: that lives in `zebridge_catalogue` (§8). The parser still accepts legacy
-`tenants`/`public_tables` keys for a pre-catalogue database — with no `zebridge_catalogue`
-present, the loader logs it and the file/env values stand.
+Every stream, subject and bucket name comes from `src/grammar.json`. It is a protocol
+constant, not configuration: the bridge compiles it in (`src/topology.zig`), the NATS
+grants are minted from its names, and both client libraries compile the same bytes in
+(libzb by `@embedFile`, zb-client-ts as a packaged copy pinned byte-for-byte by its
+tests). Nothing reads the file at runtime and no client is handed it. A rename is a
+protocol fork, and its cost is a rebuild on every side.
+
+The bridge serves the bytes at `GET /grammar` with `X-Grammar-Hash` (their sha256), and
+the `/enroll` payload carries `grammar_hash` beside the JWT. Clients use the hash, not the
+bytes: passed as `grammarHash` (zb-client-ts) or `grammarHash` in the open options
+(libzb, `zb_grammar_hash()` says what the library embeds), a mismatch refuses to open
+before any socket carries the wrong names. A bridge that cannot be reached is not a
+mismatch: the client opens on its own copy, since NATS holds everything a provisioned
+replica needs.
+
+The grammar carries only the static wire names — `streams`, `subjects`, `kv`,
+`cdc_streams`, `open_tenant`, `generations`. Which tables replicate, and their tenancy
+and LWW columns, is not in this file: that lives in `zebridge_catalogue` (§8).
 
 ```json
 {

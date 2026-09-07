@@ -36,6 +36,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mod.addImport("c", c_mod);
+    // §10dq: the wire grammar is compiled in — the same bytes the bridge embeds.
+    mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     mod.addImport("nats", nats_dep.module("nats"));
     mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
@@ -60,6 +62,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     demo_mod.addImport("c", c_mod);
+    // §10dq: the wire grammar is compiled in — the same bytes the bridge embeds.
+    demo_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     demo_mod.addImport("nats", nats_dep.module("nats"));
     demo_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
@@ -78,6 +82,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     soak_mod.addImport("c", c_mod);
+    // §10dq: the wire grammar is compiled in — the same bytes the bridge embeds.
+    soak_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     soak_mod.addImport("nats", nats_dep.module("nats"));
     soak_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });

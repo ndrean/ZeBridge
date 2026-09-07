@@ -111,7 +111,7 @@ async def main():
 
             h = lib.zb_client_open(json.dumps({
                 "url": zb.nats_server(), "credsPath": zb.creds_for(WHO),
-                "grammarPath": str(zb.ROOT / "src" / "grammar.json"), "dbPath": db,
+                "dbPath": db,
                 "principal": WHO, "clientId": "py-fleet", "tables": ["users", TABLE],
                 "heartbeatMs": 1000}).encode())
             if not h:

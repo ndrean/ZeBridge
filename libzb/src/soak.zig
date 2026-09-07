@@ -34,8 +34,8 @@ fn env(name: [*:0]const u8, dflt: u64) u64 {
 /// `std.crypto.random` wants one in 0.16, and this only has to not collide.
 fn soakUid(a: std.mem.Allocator, seed: u64, n: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "{x:0>8}-{x:0>4}-4{x:0>3}-8{x:0>3}-{x:0>12}", .{
-        @as(u32, @truncate(seed >> 16)), @as(u16, @truncate(seed)),
-        @as(u12, @truncate(n >> 12)),    @as(u12, @truncate(n)),
+        @as(u32, @truncate(seed >> 16)),      @as(u16, @truncate(seed)),
+        @as(u12, @truncate(n >> 12)),         @as(u12, @truncate(n)),
         @as(u48, @truncate(seed ^ (n << 8))),
     });
 }
@@ -48,8 +48,8 @@ fn nowIso(a: std.mem.Allocator) ![]const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>6}Z", .{
-        yd.year, md.month.numeric(), @as(u32, md.day_index) + 1,
-        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+        yd.year,                                                md.month.numeric(),      @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(),                                   ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
         @as(u64, @intCast(@divTrunc(@as(i64, ts.nsec), 1000))),
     });
 }
@@ -66,7 +66,6 @@ pub fn main() !void {
     const c = try client.SyncClient.init(a, .{
         .url = "nats://127.0.0.1:4222",
         .creds_path = "../scripts/native/creds/omar.creds",
-        .grammar_path = "../grammar.json",
         .db_path = "zbz-soak.sqlite3",
         .principal = "omar",
         .tables = &.{ "users", "salaries", "test_types" },
@@ -82,8 +81,7 @@ pub fn main() !void {
     // ⚠️ std.fs.cwd() is gone in 0.16 and std.Io.Dir.cwd() wants an Io. libc is
     // linked, so the posix layer is the one that exists — same call shape the bridge
     // uses to read cgroup files.
-    const ledger = try std.posix.openat(std.posix.AT.FDCWD, "soak-uids.txt",
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    const ledger = try std.posix.openat(std.posix.AT.FDCWD, "soak-uids.txt", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     defer _ = std.posix.system.close(ledger);
 
     // pid + start second: unique enough that two soaks never mint the same uid,
@@ -99,8 +97,7 @@ pub fn main() !void {
     var deleted: u64 = 0;
     var settled: usize = 0;
 
-    std.debug.print("zb-soak: {d}s at {d}s intervals on '{s}' — ledger: soak-uids.txt\n",
-        .{ seconds, interval, table });
+    std.debug.print("zb-soak: {d}s at {d}s intervals on '{s}' — ledger: soak-uids.txt\n", .{ seconds, interval, table });
 
     while (true) {
         _ = std.c.clock_gettime(.REALTIME, &ts);
@@ -207,8 +204,7 @@ pub fn main() !void {
         // deployment needs to.
         settled += c.drainVerdicts(verdict_ms) catch 0;
         if (cycle % 10 == 0 or cycle == 1) {
-            std.debug.print("  cycle {d}: ins={d} upd={d} del={d} verdicts={d} watermark={s}\n",
-                .{ cycle, inserted, updated, deleted, settled, c.gcWatermark(aa) orelse "(none)" });
+            std.debug.print("  cycle {d}: ins={d} upd={d} del={d} verdicts={d} watermark={s}\n", .{ cycle, inserted, updated, deleted, settled, c.gcWatermark(aa) orelse "(none)" });
         }
 
         // ⚠️ No std.c.sleep and no std.time.sleep in 0.16 — nanosleep is the one
@@ -221,6 +217,5 @@ pub fn main() !void {
     settled += c.drainVerdicts(5000) catch 0; // a generous last pass
     var fa = std.heap.ArenaAllocator.init(a);
     defer fa.deinit();
-    std.debug.print("zb-soak done: cycles={d} ins={d} upd={d} del={d} verdicts={d} watermark={s}\n",
-        .{ cycle, inserted, updated, deleted, settled, c.gcWatermark(fa.allocator()) orelse "(none)" });
+    std.debug.print("zb-soak done: cycles={d} ins={d} upd={d} del={d} verdicts={d} watermark={s}\n", .{ cycle, inserted, updated, deleted, settled, c.gcWatermark(fa.allocator()) orelse "(none)" });
 }

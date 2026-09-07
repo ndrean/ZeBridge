@@ -8,7 +8,7 @@ measures the idle poll (must cost ~wait_ms, not spin, not overshoot) and that a
 mutation queued by this client settles through `poll`'s verdict sweep, no `flush` wait.
 """
 import ctypes, json, os, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 
 PSQL = psql_cmd("-c")
 lib = load_lib()
@@ -32,7 +32,7 @@ db = "/tmp/zb-tail.sqlite3"
 rm_sqlite(db)
 h = lib.zb_client_open(json.dumps({
     "url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar",
+    "dbPath": db, "principal": "omar",
     "clientId": "py-tail", "tables": ["users", "salaries", "test_types"]}).encode())
 ok = True
 def check(label, cond):

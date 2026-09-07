@@ -15,7 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LIBZB = os.path.dirname(HERE)                 # libzb/
 REPO = os.path.dirname(LIBZB)                 # the repo root
 CREDS_DIR = os.path.join(REPO, "scripts", "native", "creds")
-GRAMMAR = os.path.join(REPO, "src", "grammar.json")  # grammar lives in src/ — it is SOURCE (§10ci)
+# The grammar is compiled into libzb (§10dq): no path to hand a client any more.
 
 _EXT = {"darwin": ".dylib", "linux": ".so", "win32": ".dll"}
 _HOMEBREW_PG = "/opt/homebrew/opt/postgresql@18/bin"

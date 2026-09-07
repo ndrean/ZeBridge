@@ -7,7 +7,7 @@ and out — against the native stack as `omar`. Asserts the write round-trips in
 read-only connection, and that a write THROUGH that connection is refused.
 """
 import ctypes, json, os, sys, time, uuid
-from _env import load_lib, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, creds, rm_sqlite
 
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
@@ -39,7 +39,6 @@ rm_sqlite(db)
 h = lib.zb_client_open(json.dumps({
     "url": "nats://127.0.0.1:4222",
     "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR,
     "dbPath": db,
     "principal": "omar",
     "clientId": "py-index-card",

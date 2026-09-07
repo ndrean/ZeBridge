@@ -3,7 +3,7 @@ fills its existing rows from the catalog without a single WAL row; the descripto
 carries the constant, the client adds the column WITH it, and its engine fills the
 existing local rows the same way — converged, no re-seed."""
 import ctypes, json, os, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 PSQL = psql_cmd("-v", "ON_ERROR_STOP=1", "-c")
 lib = load_lib()
 lib.zb_free.argtypes = [ctypes.c_void_p]
@@ -31,7 +31,7 @@ db = "/tmp/zb-migrate-default.sqlite3"; rm_sqlite(db)
 old_uid, new_uid = str(uuid.uuid4()), str(uuid.uuid4())
 h = lib.zb_client_open(json.dumps({
     "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar", "clientId": "py-migrate-default",
+    "dbPath": db, "principal": "omar", "clientId": "py-migrate-default",
     "tables": ["users", "test_types"], "heartbeatMs": 0}).encode())
 try:
     if not h: sys.exit("open failed")

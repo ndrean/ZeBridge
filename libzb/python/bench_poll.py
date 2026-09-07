@@ -8,7 +8,7 @@ cost is a constant on both sides. Every wait is bounded (10 s) so a stalled
 stack exits 1 instead of hanging.
 """
 import argparse, ctypes, json, statistics, subprocess, sys, time, uuid
-from _env import load_lib, psql_cmd, creds, GRAMMAR, rm_sqlite
+from _env import load_lib, psql_cmd, creds, rm_sqlite
 
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("-n", type=int, default=20, help="number of outside UPDATEs to time (default 20)")
@@ -33,7 +33,7 @@ def pg(sql):
 db = "/tmp/zb-bench-poll.sqlite3"
 rm_sqlite(db)
 h = lib.zb_client_open(json.dumps({"url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
-    "grammarPath": GRAMMAR, "dbPath": db, "principal": "omar", "clientId": "py-bench",
+    "dbPath": db, "principal": "omar", "clientId": "py-bench",
     "tables": ["users", "salaries", "test_types"]}).encode())
 uid = str(uuid.uuid4())
 inserted = False
