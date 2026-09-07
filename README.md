@@ -77,8 +77,10 @@ NATS restricts payloads (< $2^{20}$=1 MB by default, safe up to 8 MB). This defa
 
 > Any larger payloads belong to object storage: database tables should exclusively contain metadata or an external reference (e.g., an S3 bucket URL) to the blob data; not PDF nor base64 encoded images for instance.
 
-* We adopted a last-write-wins (LWW) conflict resolution policy rather than leaving the result to chance. PostgreSQL judges a write by its version, per row: an edit stamped below the row's version is refused as `stale`. The client then looks at which columns the winner changed. If the refused edit touched none of them, it is resubmitted with a fresh stamp and lands; if both edited the same column, the edit is dropped and the loss is surfaced. So an edit is lost only on a column that was genuinely contested. Clock skew is absorbed the same way: a slow clock is judged stale, and its edit is rebased onto the row it was made on, stamped above what the client has seen (a hybrid logical clock). What LWW does not give is ordering across tenants: an order scoped to the tenant `accounting` referencing a document that arrives as public data can, for a moment, arrive first and look wrong before the document lands. ➡ Only a foreign key guarantees that order, and it is a choice made when designing tables.
-
+* We adopted a last-write-wins (LWW) conflict resolution policy rather than leaving the result to chance. PostgreSQL judges a write by its version, per row: an edit stamped below the row's version is refused as `stale`. The client then looks at which columns the winner changed. If the refused edit touched none of them, it is resubmitted with a fresh stamp and lands; if both edited the same column, the edit is dropped and the loss is surfaced. So an edit is lost only on a column that was genuinely contested. Clock skew is absorbed the same way: a slow clock is judged stale, and its edit is rebased onto the row it was made on, stamped above what the client has seen (a hybrid logical clock).
+  
+* Cross-tenant ordering. If fields are referenced acrross tenant without a foreign key, the result can look wrong for a moment.For example, an order scoped to the tenant `accounting` referencing a document that arrives as public data can, for a moment, arrive first and look wrong before the document lands. It is not related to LWW.
+➡ Only a **foreign key** guarantees that order, because the bridge knows that child must be hold until the parent lands when a foreign is declared. Without this, impossible to know. The solution belongs to "good pratice", a choice made when designing tables. This is 
 **Observability**: ZeBridge includes production-ready observability out of the box; it exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards.
 
 
@@ -858,6 +860,8 @@ Four separate keys, four separate boundaries.
 
 ### Revoke a principal
 
+Source: <https://docs.nats.io/learn/security/decentralized-auth#revoking-a-user>
+
 One action: the DBA can revoke immediately a user's read and write access by removing the principal via the CLI:
 
 ```sh
@@ -918,10 +922,18 @@ envsubst < nats-server.conf.template > nats-server.conf
 nats-server -js -m 8222 -c nats-server.conf
 ```
 
-### Client Authentication
+### Client Authentication - Operator mode
 
 ZeBridge **completely decouples** your application's authentication (passwords, OAuth, session cookies) from the data-sync authentication (NATS). It does not know or care how you authenticate your users.
 It only handles the minting of **NATS JWTs**, which act as cryptographically secure database credentials for your edge clients.
+
+Nats proposes an [operator mode](https://docs.nats.io/learn/security/decentralized-auth#revoking-a-user).
+
+ZeBridge proposes this with its CLI for a dev operator:
+
+```sh
+bridge --init-nats
+```
 
 A client never gets a password to connect to NATS. It gets a **`.creds` file** (in memory or on disk), which holds two things:
 * a **user JWT** — public. It says "this public key belongs to `omar`, tenant `kilo`", and it is cryptographically signed by the Account's scoped signing key.
