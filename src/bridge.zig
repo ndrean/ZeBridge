@@ -476,6 +476,26 @@ fn runDiagnose(
         }
     }
 
+    // ── 5. a physical cascade into a table that keeps tombstones (§10dn) ────────
+    // zebridge_enable and the DDL guard refuse this now; a database from before them
+    // can still carry it, and the symptom is replicas keeping rows PostgreSQL deleted.
+    if (core_ok) {
+        const res = c.PQexec(conn, "SELECT cat.tbl, con.conname, con.confrelid::regclass::text FROM public.zebridge_catalogue cat " ++
+            "JOIN pg_constraint con ON con.conrelid = to_regclass(format('%I.%I', 'public', cat.tbl)) " ++
+            "WHERE cat.tombstone_col IS NOT NULL AND con.contype = 'f' AND con.confdeltype = 'c' ORDER BY 1, 2");
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) == c.PGRES_TUPLES_OK) {
+            const n: usize = @intCast(c.PQntuples(res));
+            for (0..n) |i| {
+                findings += 1;
+                log.err("🔴 '{s}' keeps tombstones, but foreign key '{s}' cascades physical deletes into it from '{s}': those deletes never reach a replica of a tombstone table. Declare it ON DELETE NO ACTION (delete children first), or enable the table without a tombstone.", .{
+                    std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), std.mem.span(c.PQgetvalue(res, @intCast(i), 1)), std.mem.span(c.PQgetvalue(res, @intCast(i), 2)),
+                });
+            }
+            if (n == 0) log.info("✅ no physical cascade reaches a table that keeps tombstones", .{});
+        }
+    }
+
     if (findings == 0) {
         log.info("🩺 DIAGNOSE: all clear — a bridge started with this configuration carries every published table. Nothing was changed.", .{});
         return 0;

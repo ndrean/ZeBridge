@@ -505,10 +505,10 @@ export fn zb_client_query(handle: u64, sql: ?[*:0]const u8, params_json: ?[*:0]c
     return dupeZ(out);
 }
 
-fn mutateJson(a: std.mem.Allocator, b: *ClientBox, table: []const u8, op: []const u8, key_text: []const u8, values_text: []const u8) ![]const u8 {
+fn mutateJson(a: std.mem.Allocator, b: *ClientBox, table: []const u8, op: []const u8, key_text: []const u8, values_text: []const u8, stamp: ?[]const u8) ![]const u8 {
     const key = (try std.json.parseFromSlice(Value, a, key_text, .{})).value;
     const values: ?Value = if (values_text.len == 0) null else (try std.json.parseFromSlice(Value, a, values_text, .{})).value;
-    const msg_id = try b.c.mutate(a, table, op, key, values);
+    const msg_id = try b.c.mutateAt(a, table, op, key, values, stamp);
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "msgId", .{ .string = msg_id });
     return try core.valueToString(a, .{ .object = out });
@@ -522,7 +522,22 @@ export fn zb_client_mutate(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u
     const v = if (values_json) |vj| std.mem.span(vj) else "";
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
-    const out = mutateJson(arena.allocator(), b, t, o, k, v) catch |err| return errJson(@errorName(err));
+    const out = mutateJson(arena.allocator(), b, t, o, k, v, null) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
+}
+
+/// `zb_client_mutate` with the caller's own version stamp (RFC 3339 UTC, the wire
+/// form): a host that keeps its own clock, or a test modelling a slow one.
+export fn zb_client_mutate_at(handle: u64, table: ?[*:0]const u8, op: ?[*:0]const u8, key_json: ?[*:0]const u8, values_json: ?[*:0]const u8, version: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const t = std.mem.span(table orelse return null);
+    const o = std.mem.span(op orelse return null);
+    const k = std.mem.span(key_json orelse return null);
+    const v = if (values_json) |vj| std.mem.span(vj) else "";
+    const stamp: ?[]const u8 = if (version) |vz| std.mem.span(vz) else null;
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = mutateJson(arena.allocator(), b, t, o, k, v, stamp) catch |err| return errJson(@errorName(err));
     return dupeZ(out);
 }
 

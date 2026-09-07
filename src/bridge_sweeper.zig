@@ -72,6 +72,20 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const dry_run = env.getPosix("GC_DRY_RUN") != null;
+    // §10dn: a reap is a physical DELETE, and one statement over a million expired
+    // tombstones is one transaction, one lock, one WAL spike — the cascade storm this
+    // design keeps off the clients, arriving on the server instead. Bounded batches by
+    // `ctid`, looped until a batch comes back short. 1000 rows is a size PostgreSQL
+    // absorbs without notice; the operator sets GC_BATCH_ROWS to taste.
+    const batch_rows_str = env.getPosix("GC_BATCH_ROWS") orelse "1000";
+    const batch_rows = std.fmt.parseInt(u32, batch_rows_str, 10) catch {
+        std.debug.print("FATAL: GC_BATCH_ROWS is not a number: '{s}'\n", .{batch_rows_str});
+        return;
+    };
+    if (batch_rows == 0) {
+        std.debug.print("FATAL: GC_BATCH_ROWS must be at least 1\n", .{});
+        return;
+    }
     if (dry_run) std.debug.print("GC: DRY RUN — counting only, nothing will be deleted\n", .{});
 
     const min_threshold_ms: u64 = 60_000; // one minute
@@ -107,27 +121,27 @@ pub fn main(init: std.process.Init) !void {
     defer sweeps.deinit(allocator);
 
     if (sync_rules_str) |srs| {
-    var rule_it = std.mem.splitScalar(u8, srs, ';');
-    while (rule_it.next()) |rule| {
-        const trimmed = std.mem.trim(u8, rule, " ");
-        if (trimmed.len == 0) continue;
-        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
-        const table = std.mem.trim(u8, trimmed[0..colon], " ");
-        const cols = trimmed[colon + 1 ..];
-        // First column is the version, the optional second is the tombstone.
-        // ⚠️ The SECOND field, bounded on both sides. This took everything after the first
-        // comma, which was correct while `SYNC_RULES` had at most two columns and broke
-        // silently the day a third (the tiebreak column) was added: it parsed
-        // `updated_at,deleted_at,last_writer` into a tombstone called
-        // "deleted_at,last_writer" and every sweep failed with
-        // `column "deleted_at,last_writer" does not exist` — visible only in the sidecar's
-        // own output, while the bridge looked healthy.
-        var field_it = std.mem.splitScalar(u8, cols, ',');
-        _ = field_it.next(); // the version column
-        const tombstone = std.mem.trim(u8, field_it.next() orelse continue, " ");
-        if (table.len == 0 or tombstone.len == 0) continue;
-        try sweeps.append(allocator, .{ .table = table, .tombstone = tombstone });
-    }
+        var rule_it = std.mem.splitScalar(u8, srs, ';');
+        while (rule_it.next()) |rule| {
+            const trimmed = std.mem.trim(u8, rule, " ");
+            if (trimmed.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+            const table = std.mem.trim(u8, trimmed[0..colon], " ");
+            const cols = trimmed[colon + 1 ..];
+            // First column is the version, the optional second is the tombstone.
+            // ⚠️ The SECOND field, bounded on both sides. This took everything after the first
+            // comma, which was correct while `SYNC_RULES` had at most two columns and broke
+            // silently the day a third (the tiebreak column) was added: it parsed
+            // `updated_at,deleted_at,last_writer` into a tombstone called
+            // "deleted_at,last_writer" and every sweep failed with
+            // `column "deleted_at,last_writer" does not exist` — visible only in the sidecar's
+            // own output, while the bridge looked healthy.
+            var field_it = std.mem.splitScalar(u8, cols, ',');
+            _ = field_it.next(); // the version column
+            const tombstone = std.mem.trim(u8, field_it.next() orelse continue, " ");
+            if (table.len == 0 or tombstone.len == 0) continue;
+            try sweeps.append(allocator, .{ .table = table, .tombstone = tombstone });
+        }
     }
 
     // Connect to PostgreSQL
@@ -146,7 +160,6 @@ pub fn main(init: std.process.Init) !void {
     // server's default zone happens to be. Every writer is required to store UTC (§7.3);
     // this makes the sweeper agree with them instead of with the machine.
 
-
     // ── The sweep set, from the catalogue ───────────────────────────────────────
     //
     // `zebridge_catalogue.tombstone_col` is written in the same transaction as the
@@ -155,8 +168,17 @@ pub fn main(init: std.process.Init) !void {
     // comes from here. A pre-catalogue database returns an error result and the env
     // set stands alone — graceful, like the bridge's own loader.
     {
-        const cres = c.PQexec(pg_conn, "SELECT tbl, tombstone_col::text FROM public.zebridge_catalogue" ++
-            " WHERE tombstone_col IS NOT NULL ORDER BY tbl");
+        // Children BEFORE parents (§10dn): a reap is a physical DELETE, and a parent whose
+        // tombstoned children are still rows is refused by NO ACTION — parent-first order
+        // costs one failed pass per level of the family. Ordered by the depth of the
+        // foreign-key chain above each table, deepest first.
+        const cres = c.PQexec(pg_conn, "SELECT cat.tbl, cat.tombstone_col::text FROM public.zebridge_catalogue cat" ++
+            " WHERE cat.tombstone_col IS NOT NULL" ++
+            " ORDER BY (WITH RECURSIVE up(oid, d) AS (" ++
+            "   SELECT to_regclass(format('%I.%I', 'public', cat.tbl))::oid, 0" ++
+            "   UNION ALL SELECT con.confrelid, up.d + 1 FROM pg_constraint con JOIN up ON con.conrelid = up.oid" ++
+            "   WHERE con.contype = 'f' AND con.confrelid <> up.oid AND up.d < 32)" ++
+            "   SELECT max(d) FROM up) DESC, cat.tbl");
         defer c.PQclear(cres);
         if (c.PQresultStatus(cres) == c.PGRES_TUPLES_OK) {
             const n: usize = @intCast(c.PQntuples(cres));
@@ -245,7 +267,7 @@ pub fn main(init: std.process.Init) !void {
             const tz = c.PQexec(conn, "SET TIME ZONE 'UTC'");
             defer c.PQclear(tz);
             if (c.PQresultStatus(tz) != c.PGRES_COMMAND_OK) return error.InitFailed;
-            
+
             const p_z = try utils.allocPrintZ(a, "{s}", .{p});
             defer a.free(p_z);
             const params = [_]?[*:0]const u8{p_z.ptr};
@@ -259,9 +281,9 @@ pub fn main(init: std.process.Init) !void {
                 const sql = if (drun)
                     try utils.allocPrintZ(a, "SELECT count(*) FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision);", .{ sw.table, sw.tombstone, sw.tombstone })
                 else
-                    try utils.allocPrintZ(a, "DELETE FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision);", .{ sw.table, sw.tombstone, sw.tombstone });
+                    try utils.allocPrintZ(a, "DELETE FROM \"{s}\" WHERE ctid IN (SELECT ctid FROM \"{s}\" WHERE \"{s}\" IS NOT NULL AND \"{s}\"::timestamptz < now() - make_interval(secs => $1::double precision) LIMIT $2::integer);", .{ sw.table, sw.table, sw.tombstone, sw.tombstone });
                 defer a.free(sql);
-                const res = c.PQprepare(conn, stmt_name.ptr, sql.ptr, 1, null);
+                const res = c.PQprepare(conn, stmt_name.ptr, sql.ptr, if (drun) 1 else 2, null);
                 defer c.PQclear(res);
                 if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) return error.PrepareFailed;
             }
@@ -339,8 +361,9 @@ pub fn main(init: std.process.Init) !void {
             // new one would take first.
             const stmt_name = try utils.allocPrintZ(aa, "gc_sweep_{d}", .{i});
             const secs = try utils.allocPrintZ(aa, "{d}", .{threshold_ms / 1000});
-            const param_vals = [_]?[*:0]const u8{secs.ptr};
-            const res = c.PQexecPrepared(pg_conn, stmt_name.ptr, 1, &param_vals[0], null, null, 0);
+            const batch_z = try utils.allocPrintZ(aa, "{d}", .{batch_rows});
+            const param_vals = [_]?[*:0]const u8{ secs.ptr, batch_z.ptr };
+            var res = c.PQexecPrepared(pg_conn, stmt_name.ptr, if (dry_run) 1 else 2, &param_vals[0], null, null, 0);
             defer c.PQclear(res);
 
             if (dry_run) {
@@ -356,12 +379,26 @@ pub fn main(init: std.process.Init) !void {
             if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
                 std.debug.print("ERROR: GC failed for table {s}: {s}\n", .{ sw.table, c.PQerrorMessage(pg_conn) });
             } else {
-                const rows_deleted = c.PQcmdTuples(res);
-                reaped_this_pass += std.fmt.parseInt(u64, std.mem.span(rows_deleted), 10) catch 0;
-                if (rows_deleted[0] != 0 and rows_deleted[0] != '0') {
+                // Batches until one comes back short. Each is its own statement and its
+                // own transaction, so a family of a million tombstones is a thousand
+                // small deletes, not one lock held for the duration.
+                var reaped_table: u64 = std.fmt.parseInt(u64, std.mem.span(c.PQcmdTuples(res)), 10) catch 0;
+                var batches: u32 = 1;
+                while (reaped_table == @as(u64, batch_rows) * batches and batches < 100_000) {
+                    c.PQclear(res);
+                    res = c.PQexecPrepared(pg_conn, stmt_name.ptr, 2, &param_vals[0], null, null, 0);
+                    if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
+                        std.debug.print("ERROR: GC failed for table {s} after {d} batch(es): {s}\n", .{ sw.table, batches, c.PQerrorMessage(pg_conn) });
+                        break;
+                    }
+                    reaped_table += std.fmt.parseInt(u64, std.mem.span(c.PQcmdTuples(res)), 10) catch 0;
+                    batches += 1;
+                }
+                reaped_this_pass += reaped_table;
+                if (reaped_table > 0) {
                     std.debug.print(
-                        "GC: reaped {s} tombstone(s) from {s} older than {d}ms\n",
-                        .{ rows_deleted, sw.table, threshold_ms },
+                        "GC: reaped {d} tombstone(s) from {s} older than {d}ms in {d} batch(es) of up to {d}\n",
+                        .{ reaped_table, sw.table, threshold_ms, batches, batch_rows },
                     );
                 }
             }

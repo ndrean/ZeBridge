@@ -1200,6 +1200,19 @@ BEGIN
                 'migration rejected: column "%" on table "%" is "timestamp without time zone" — use timestamptz (Ecto: timestamps(type: :timestamptz)). Version comparison and the §7.2 wire format need absolute instants.',
                 bad_col, rel;
         END IF;
+        -- §10dn: the same contradiction zebridge_enable refuses, caught when the
+        -- constraint arrives AFTER the enable — the catalogue names the tombstone.
+        IF EXISTS (SELECT 1 FROM public.zebridge_catalogue cat WHERE cat.tbl = rel AND cat.tombstone_col IS NOT NULL) THEN
+            SELECT con.conname INTO bad_col
+            FROM pg_constraint con
+            WHERE con.conrelid = r.objid AND con.contype = 'f' AND con.confdeltype = 'c'
+            LIMIT 1;
+            IF FOUND THEN
+                RAISE EXCEPTION
+                    'migration rejected: foreign key "%" on "%" is ON DELETE CASCADE, but the table keeps tombstones (zebridge_catalogue). A cascade removes rows the bridge never forwards for a tombstone table. Declare it ON DELETE NO ACTION.',
+                    bad_col, rel;
+            END IF;
+        END IF;
         rel := NULL;
     END LOOP;
 END;
@@ -1610,6 +1623,7 @@ CREATE OR REPLACE FUNCTION public.zebridge_enable(
     dry_run       boolean DEFAULT true
 ) RETURNS TABLE (step text, status text, detail text) AS $$
 DECLARE
+    bad_fks  text;
     short      text := (SELECT relname FROM pg_class WHERE oid = tbl);
     have_write boolean := to_regprocedure('public.zebridge_grant_edge_writes(regclass)') IS NOT NULL;
     published  boolean;
@@ -1699,6 +1713,23 @@ BEGIN
     -- Publishing first and scoping second leaves a window in which the change feed carries
     -- every tenant's rows, so the guard closes it at the source. Predicted here rather than
     -- discovered halfway through: an ERROR row costs nothing, a half-applied activation does.
+    -- §10dn: a foreign key ON DELETE CASCADE into a table that keeps tombstones is a
+    -- contradiction — the cascade removes rows physically, the bridge never forwards a
+    -- physical delete on a tombstone table, and every replica keeps them. Refused here,
+    -- and by the DDL guard for a constraint added later.
+    IF tombstone_col IS NOT NULL THEN
+        SELECT string_agg(con.conname || ' (from ' || con.confrelid::regclass::text || ')', ', ') INTO bad_fks
+        FROM pg_constraint con
+        WHERE con.conrelid = tbl AND con.contype = 'f' AND con.confdeltype = 'c';
+        IF bad_fks IS NOT NULL THEN
+            RETURN QUERY SELECT 'preflight', 'ERROR',
+                format('%s keeps tombstones, but a foreign key on it cascades physical deletes into it: %s. '
+                       'A cascade removes rows the bridge never forwards for a tombstone table, and every replica keeps them. '
+                       'Declare the constraint ON DELETE NO ACTION, or enable the table without a tombstone.', tbl, bad_fks);
+            RETURN;
+        END IF;
+    END IF;
+
     scoped := (SELECT relrowsecurity FROM pg_class WHERE oid = tbl)
               OR EXISTS (SELECT 1 FROM pg_publication_rel WHERE prrelid = tbl AND prqual IS NOT NULL)
               -- ⚠️ Aliased and qualified: the parameter is also named `tbl`, and this

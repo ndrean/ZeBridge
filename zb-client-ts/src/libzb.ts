@@ -208,6 +208,11 @@ export class ZeBridge {
   private suspendedMap = new Map<string, string>();
   private globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, seq: {} };
   private pendingWrites = new Map<string, { table: string; id: number | string; at: number }>();
+  /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
+  /// winning row. Held until that row is here (it may already be), then either
+  /// resubmitted with a fresh stamp or dropped and surfaced.
+  private rebase = new Map<string, { table: string; key: Record<string, unknown>; values: Record<string, unknown>; before: Record<string, unknown> | null; version: string; at: number }>();
+  private rebaseTimer: ReturnType<typeof setTimeout> | null = null;
 
   private tenantValue = '';
   /// Per instance, like the replica (see App.tsx's CLIENT_ID history): the LWW
@@ -667,6 +672,79 @@ export class ZeBridge {
   /// Undo an optimistic apply when a verdict says the write cannot land ('rejected' →
   /// restore the before-image; 'row_deleted' → the row is confirmed gone server-side).
   /// Guarded: only if the row still shows exactly what our own write applied.
+  // ─── §10do: rebase on stale ─────────────────────────────────────────────
+
+  /// A `stale` verdict names an UPDATE that lost to a newer version. Its columns
+  /// are not necessarily the columns the winner changed: when the two sets are
+  /// disjoint the edit is still right and is resubmitted with a fresh stamp (the
+  /// HLC floor puts it above the winner); when they overlap it is dropped and
+  /// surfaced — LWW's word stands. Only an UPDATE qualifies.
+  private async holdForRebase(msgId: string) {
+    await this.outboxInitPromise;
+    const rows = await this.run(`SELECT tbl, subject, payload, before FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
+    const entry = rows[0];
+    if (!entry || String(entry.subject).split('.').pop() !== 'update') return;
+    const sent = JSON.parse(entry.payload);
+    const values = sent?.data;
+    const key = sent?.key;
+    if (!values || typeof values !== 'object' || !key || typeof key !== 'object') return;
+    this.rebase.set(msgId, {
+      table: entry.tbl, key, values,
+      before: entry.before ? JSON.parse(entry.before) : null,
+      version: normalizeVersion(String(sent.version ?? '')),
+      at: Date.now(),
+    });
+  }
+
+  /// Runs outside any apply transaction: the resubmit is a full mutate().
+  private scheduleRebase() {
+    if (this.rebaseTimer || !this.rebase.size) return;
+    this.rebaseTimer = setTimeout(() => { this.rebaseTimer = null; void this.drainRebase(); }, 50);
+  }
+
+  private async drainRebase() {
+    for (const msgId of [...this.rebase.keys()]) {
+      try {
+        await this.tryRebase(msgId);
+      } catch (err) {
+        this.appendLog('SYS', `rebase of ${msgId} deferred: ${err}`, 'WARNING');
+        this.scheduleRebase();
+      }
+    }
+  }
+
+  /// Decides once the winning row is here: its version is above the refused stamp.
+  private async tryRebase(msgId: string) {
+    const e = this.rebase.get(msgId);
+    if (!e) return;
+    const state = this.syncedTables.get(e.table);
+    if (!state?.pkCols.length || !state.versionColumn) { this.rebase.delete(msgId); return; }
+    const where = state.pkCols.map((c) => `"${c}" = ?`).join(' AND ');
+    const cur = (await this.run(`SELECT * FROM ${e.table} WHERE ${where}`, ...state.pkCols.map((c) => e.key[c])))[0];
+    if (!cur) {
+      this.rebase.delete(msgId);
+      this.appendLog(e.table, `rebase of ${msgId} abandoned: the row is gone`, 'ERROR');
+      return;
+    }
+    if (!(normalizeVersion(String(cur[state.versionColumn] ?? '')) > e.version)) return; // the winner is not here yet
+    const mine = Object.keys(e.values).filter((c) => c !== state.versionColumn);
+    const winnerChanged = Object.keys(cur).filter(
+      (c) => c !== state.versionColumn && JSON.stringify(cur[c] ?? null) !== JSON.stringify(e.before?.[c] ?? null),
+    );
+    // The winner changed one of MY columns when the row here holds neither the
+    // pre-write value nor mine: the CDC row overwrote my optimistic copy.
+    const overlap = e.before
+      ? mine.filter((c) => winnerChanged.includes(c) && JSON.stringify(cur[c] ?? null) !== JSON.stringify(e.values[c] ?? null))
+      : mine;
+    this.rebase.delete(msgId);
+    if (overlap.length) {
+      this.appendLog(e.table, `edit LOST to a newer version on the same column(s) ${overlap.join(', ')} — the winning row stands; surface this to the user`, 'ERROR');
+      return;
+    }
+    const r = await this.mutate(e.table, 'UPDATE', e.key, e.values);
+    this.appendLog(e.table, `rebased ${mine.join(', ')} onto the newer row (the winner changed ${winnerChanged.filter((c) => c !== 'last_writer').join(', ') || 'nothing else'}) as ${r.version}`, 'INFO');
+  }
+
   private async revertOptimisticWrite(msgId: string, mode: 'restore' | 'delete') {
     await this.outboxInitPromise;
     const rows = await this.run(`SELECT tbl, payload, before FROM _zebridge_outbox WHERE msg_id = ?`, msgId);
@@ -1470,6 +1548,8 @@ export class ZeBridge {
         this.appendLog(table, `confirmed by CDC echo after ${Date.now() - w.at}ms`, 'CONFIRMED');
       }
     }
+    // §10do: a row arriving may be the winner a held edit waits for.
+    if (!ev.optimistic && this.rebase.size) this.scheduleRebase();
 
     const stream: string = ev.stream ?? '';
     const streamSeq = stream ? (this.globalSyncState.seq[stream] ?? 0) : 0;
@@ -2248,6 +2328,8 @@ export class ZeBridge {
         const definitive = verdict.status !== 'failed';
         ok = definitive;
         if (definitive) this.pendingWrites.delete(msgId);
+        // §10do: a stale UPDATE is read BEFORE its outbox row goes — it may be rebased.
+        if (verdict.status === 'stale') await this.holdForRebase(msgId);
         if (definitive && verdict.status !== 'rejected' && verdict.status !== 'row_deleted') {
           await this.outboxDrop(msgId);
         }
@@ -2262,8 +2344,14 @@ export class ZeBridge {
             }
             break;
           case 'stale':
-            // Pop and do NOT hand-revert: the winning row arrives via CDC.
-            this.appendLog(m.subject, `${where}: a newer version won — dropping this edit, the winning row arrives via CDC`, 'INFO');
+            // Pop and do NOT hand-revert: the winning row arrives via CDC. An UPDATE
+            // is held for a rebase (§10do); anything else is dropped.
+            if (this.rebase.has(msgId)) {
+              this.appendLog(m.subject, `${where}: a newer version won — held for a rebase onto the winning row`, 'INFO');
+              this.scheduleRebase();
+            } else {
+              this.appendLog(m.subject, `${where}: a newer version won — dropping this edit, the winning row arrives via CDC`, 'INFO');
+            }
             break;
           case 'row_deleted':
             // Nothing is coming via CDC to correct this one — revert by hand (§1.6d).

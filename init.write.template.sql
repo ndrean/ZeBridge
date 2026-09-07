@@ -296,6 +296,55 @@ BEGIN
 END $$ LANGUAGE plpgsql;
 
 
+-- A parent's tombstone while a live child still references it (§10dn). Every foreign
+-- key pointing at this table is looked up in pg_constraint; a referencing row counts
+-- as live unless the child's own tombstone column (from the catalogue) is set. Raised
+-- as foreign_key_violation (23503): the bridge turns the failed UPDATE into a
+-- `rejected` verdict naming the child table, exactly as a physical delete would have
+-- been refused by NO ACTION. Fresh tombstones only: an already-tombstoned row's
+-- update (a version bump, a reap-time touch) passes.
+CREATE OR REPLACE FUNCTION public.zebridge_tombstone_children_guard()
+RETURNS trigger AS $$
+DECLARE
+    tomb       text := TG_ARGV[0];
+    fk         record;
+    cond       text;
+    i          int;
+    child_tomb text;
+    n          bigint;
+BEGIN
+    IF (to_jsonb(NEW) ->> tomb) IS NULL OR (to_jsonb(OLD) ->> tomb) IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+    FOR fk IN SELECT con.conname, con.conrelid, con.conkey, con.confkey
+              FROM pg_constraint con
+              WHERE con.confrelid = TG_RELID AND con.contype = 'f'
+    LOOP
+        cond := '';
+        FOR i IN 1..array_length(fk.conkey, 1) LOOP
+            cond := cond || CASE WHEN i > 1 THEN ' AND ' ELSE '' END
+                 || format('%I = %L',
+                           (SELECT attname FROM pg_attribute WHERE attrelid = fk.conrelid AND attnum = fk.conkey[i]),
+                           to_jsonb(OLD) ->> (SELECT attname FROM pg_attribute WHERE attrelid = TG_RELID AND attnum = fk.confkey[i]));
+        END LOOP;
+        SELECT c.tombstone_col INTO child_tomb
+        FROM public.zebridge_catalogue c
+        WHERE c.tbl = (SELECT relname FROM pg_class WHERE oid = fk.conrelid);
+        IF child_tomb IS NOT NULL THEN
+            cond := cond || format(' AND %I IS NULL', child_tomb);
+        END IF;
+        EXECUTE format('SELECT count(*) FROM %s WHERE %s', fk.conrelid::regclass, cond) INTO n;
+        IF n > 0 THEN
+            RAISE EXCEPTION USING
+                ERRCODE = 'foreign_key_violation',
+                MESSAGE = format('cannot tombstone %s: %s live row(s) in %s still reference it (constraint %s) — delete the children first',
+                                 TG_TABLE_NAME, n, fk.conrelid::regclass, fk.conname);
+        END IF;
+    END LOOP;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION public.zebridge_install_write_guards(
     tbl regclass,
     version_col text,
@@ -330,6 +379,16 @@ BEGIN
             t, tombstone_col, version_col
         );
         RAISE NOTICE 'delete guard on %: DELETE writes % instead of removing the row', t, tombstone_col;
+        -- §10dn: a tombstone is a DELETE on every replica, and a replica cannot delete a
+        -- parent whose children are still there (its foreign keys have no cascade). So
+        -- the tombstone is refused HERE, where the truth lives, while a live child still
+        -- references the row: the client gets `rejected`, and deletes the children first.
+        EXECUTE format('DROP TRIGGER IF EXISTS zebridge_tombstone_children_t ON %s', t);
+        EXECUTE format(
+            'CREATE TRIGGER zebridge_tombstone_children_t BEFORE UPDATE OF %I ON %s '
+            'FOR EACH ROW EXECUTE FUNCTION public.zebridge_tombstone_children_guard(%L)',
+            tombstone_col, t, tombstone_col
+        );
     ELSE
         -- No tombstone column means deletes are physical for this table — the documented
         -- weaker guarantee, not an oversight. Saying so beats silence.

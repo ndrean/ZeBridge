@@ -30,7 +30,8 @@ class Lib:
         # with ctypes' default int return — a 64-bit pointer cut to 32 bits, then read as
         # a C string (SIGSEGV in the host, blamed on the library for an hour).
         for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
-                     ("flush", [ctypes.c_uint64]), ("mutate", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
+                     ("flush", [ctypes.c_uint64]), ("mutate", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]),
+                     ("mutate_at", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         lib.zb_client_wipe.restype, lib.zb_client_wipe.argtypes = ctypes.c_int, [ctypes.c_uint64]
         self.h = lib.zb_client_open(json.dumps({
@@ -53,9 +54,13 @@ class Lib:
         if "error" in r: raise RuntimeError(r["error"])
         return r["rows"]
     def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
-    def mutate(self, table, op, key, values=None):
+    def mutate(self, table, op, key, values=None, version=None):
+        """`version` stamps the write explicitly — a slow clock, in one argument. libzb
+        sends at once (one path for every send), so this is how a write is made late."""
         lib = self.lib
-        return self.take(lib.zb_client_mutate(self.h, table.encode(), op.encode(), json.dumps(key).encode(), json.dumps(values).encode() if values is not None else None))
+        args = (self.h, table.encode(), op.encode(), json.dumps(key).encode(), json.dumps(values).encode() if values is not None else None)
+        if version is None: return self.take(lib.zb_client_mutate(*args))
+        return self.take(lib.zb_client_mutate_at(*args, version.encode()))
     def flush(self, wait_ms=2000):
         return self.take(self.lib.zb_client_flush(self.h, wait_ms))
     def close(self): self.lib.zb_client_close(self.h)
@@ -92,8 +97,9 @@ class Node:
         if "error" in r: raise RuntimeError(r["error"])
         return [list(row.values()) for row in r["rows"]]
     def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
-    def mutate(self, table, op, key, values=None):
-        self.p.stdin.write(json.dumps({"mutate": {"table": table, "op": op, "key": key, "values": values}}) + "\n"); self.p.stdin.flush()
+    def mutate(self, table, op, key, values=None, version=None):
+        """`version` stamps the write explicitly — a slow clock, in one argument."""
+        self.p.stdin.write(json.dumps({"mutate": {"table": table, "op": op, "key": key, "values": values, "version": version}}) + "\n"); self.p.stdin.flush()
         if not select.select([self.p.stdout], [], [], 60)[0]:
             raise RuntimeError("node worker silent for 60 s")
         r = json.loads(self.p.stdout.readline())

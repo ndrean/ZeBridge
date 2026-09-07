@@ -9995,6 +9995,98 @@ C string — every verb is typed at open now. And a Node worker whose `connect()
 refused (the retained ban) must stay alive to answer the query and the explicit wipe,
 which is what a real application would want too. 18/18.
 
+## 10dn. Tombstones across a foreign key: refuse at the source, children first (2026-09-07)
+
+The question was how the sweeper copes with cascades, and the answer was that nothing
+did. A tombstone is an UPDATE in PostgreSQL and a DELETE on every replica; PostgreSQL
+never consults a foreign key for an update, SQLite consults it for the delete. So a
+parent tombstoned while its children lived was accepted upstream and refused on every
+replica (held since §10dg, forever), and PostgreSQL and the replicas disagreed by that
+family with nothing to reconcile them. At reap time a foreign key ON DELETE CASCADE
+into a tombstone table was worse: the cascade removed the children physically, the
+bridge dropped those deletes as it drops every physical delete on a tombstone table,
+and the replicas kept them for good.
+
+Two rules, both enforced by PostgreSQL on our behalf, none of them a schema property:
+1. **A parent cannot be tombstoned while a live child references it.** A BEFORE UPDATE
+   trigger on the tombstone column walks every foreign key pointing at the table in
+   `pg_constraint`, counts referencing rows (a child's own tombstone, from the
+   catalogue, makes it not live), and raises `foreign_key_violation` naming the child
+   table and the constraint. The bridge turns the failed UPDATE into a `rejected`
+   verdict, the client reverts, nothing is queued or held. The DBA's psql DELETE takes
+   the same door through the soft-delete trigger. Children first, then the parent.
+2. **No physical cascade into a table that keeps tombstones.** Refused by
+   `zebridge_enable`'s preflight (a `preflight ERROR` row naming the constraint) and by
+   the DDL guard when the constraint arrives later (`migration rejected`).
+Mixed pairs are fine; the contradiction is a cascade and a tombstone on the same key.
+The sweeper reaps children before parents now, ordered by the depth of the foreign-key
+chain above each table, so a family costs one pass rather than one failed pass per
+level. `scripts/scenarios/tombstone_children.py` (owns) proves all of it with both
+clients and the sweeper, 11/11 — after learning that the sweeper refuses a sub-minute
+window unless `GC_ALLOW_SHORT_THRESHOLD=1` says it is meant, a guard of its own.
+
+**Bounded batches, and the doctor.** The reap was one statement per table — a million
+expired tombstones, one transaction, one lock, one WAL spike: the cascade storm this
+design keeps off the clients, arriving on the server instead. The sweeper now deletes
+by `ctid` in batches of `GC_BATCH_ROWS` (1000 by default), each its own statement and
+transaction, looping until a batch comes back short; proven on 2,502 tombstoned
+children reaped in three batches, then their parent, one pass. `bridge --diagnose`
+gained the cascade rule as check 5, for databases from before the guards. The README's
+"Opinionated" section now states the two allowed designs, the refusal of the mix, and
+what the ring buffer is for: a cascade PostgreSQL does run lands in the ring and is
+published in order, a transaction larger than the ring as several batches (the 1,500-row
+family against a 1,024-slot ring), and a broker outage is five retries with a backoff
+from 100 ms doubling to 5 s, then a deliberate stop — never an acknowledged LSN whose
+data did not arrive.
+
+Also answered on the way, for the record (the questions of that discussion): reaps are
+not forwarded because the tombstone update already cleaned every replica; a soft
+delete cannot be resurrected by a concurrent later-stamped update, because the update
+sets only the columns it names and never the tombstone; and the CRDT probe failed on
+purpose — last-writer-wins sets a jsonb column as one value, so merging inside it is
+the application's job, which its second leg did with merge-on-stale.
+
+## 10do. Rebase on stale: an edit loses to a version, not to a column (2026-09-07)
+
+The README's paragraph on LWW's limits said "no column granularity": two clients edit
+different columns of one row, the later-stamped one lands first, and the other is
+judged `stale` and dropped — an edit lost that touched nothing the winner touched.
+That loss was the client's, not the server's. The server refuses on the version only,
+and the client already knew everything it needed to be smarter: its own sparse `data`
+(the columns it set), the before-image the outbox stores, and the winning row, which
+arrives over CDC with a version above the refused stamp — before the verdict or after
+it, either order happens (§10dn's echo/verdict discussion).
+
+So `stale` no longer drops an UPDATE. The client reads the outbox row before it goes
+(table, key, `data`, before-image, stamp) and keeps it aside. Whenever a row of that
+table arrives, and once right after the verdict, it looks at the local row: if its
+version is not above the refused stamp, the winner is not here yet and it waits. When
+it is, a column of the edit was overwritten by the winner exactly when the row here
+holds neither the pre-write value nor the edit's own — the CDC row replaced the
+optimistic copy with something else. Disjoint: the edit is resubmitted as a fresh
+`mutate()` with a new HLC stamp, which the floor puts above the winner, so it lands
+as a normal write and echoes back like one. Overlapping: the edit is dropped and the
+loss is printed as an error naming the column — last-writer-wins keeps its word on
+the one column that was actually contested. Only an UPDATE qualifies; an INSERT judged
+stale is a different row's business, and a before-image-less edit (the row was not
+here when it was made) counts every column as the winner's.
+
+The slow clock is the same case seen from the other side: a client whose stamp is
+minutes behind is judged stale on every edit against a row someone else touched, and
+each of those now rebases onto the row it was in fact made on, stamped by the HLC
+above what it has seen — the resubmission is above the winner because the winner
+was seen. That gave the scenario its lever: libzb sends the moment `mutate()` returns
+(one path for every send), so the late writer is made late by an explicit stamp,
+`zb_client_mutate_at` on the C card, the twin of the TypeScript `opts.version`.
+
+`scripts/scenarios/rebase_stale.py` (owns), 21/21, both clients: disjoint columns
+with the verdict arriving before the winning row (libzb, held until the host polls
+it in, then resent), the same column (dropped, surfaced, the winner stands), and
+Node with a stamp 5 s old against a winner already present (rebased at once, the
+resent stamp above the winner). PostgreSQL and both replicas equal at each step,
+both outboxes empty. The README paragraph now says what the policy does instead of
+what it cannot: an edit loses only on a column both sides changed.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

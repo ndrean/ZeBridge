@@ -61,6 +61,7 @@ row a rule is named.
 | outbox durable, optimistic apply + queue in one transaction | ✓ | ✓ | PROTOCOL MUST 1 |
 | version stamped by the client (HLC) | ✓ | ✓ | (NOTES §10cp said libzb's caller supplied it; no longer true) |
 | verdicts: accepted / stale / rejected / row_deleted, two revert targets | ✓ | ✓ | PROTOCOL MUST 4 |
+| a stale UPDATE rebased onto the winning row when the columns are disjoint, dropped and surfaced when they overlap; the winner before or after the verdict, a slow clock | ✓ `mutate_at` stamps a write explicitly | ✓ `mutate(…, { version })` | §10do, PROTOCOL §7.6, `rebase_stale` |
 | missed verdicts recovered by direct get | ✓ | ✓ | §7.4b |
 | outbox watermark gate before a flush | ✓ | ✓ | §10at, §10au, fixture |
 | a failed optimistic echo still queues the write | ✓ | ✓ | §10cp |

@@ -111,11 +111,13 @@ GROUPS = {
         "rekey_two_parents": ("bridge", "two parents re-keyed in one transaction, a child referencing both: one epoch bump each, both clients converge"),
         "rekey_offline": ("bridge", "both clients OFFLINE across a re-key and the writes after it: reopen on the same files, meet the new key and epoch at once, converge"),
         "cascade_held":  ("bridge", "a two-level cascade delete while the middle rows are HELD in the inbox: no ghost, no orphan, both replicas equal PostgreSQL"),
+        "tombstone_children": ("bridge", "a parent's tombstone is refused while a live child references it; children first, then the parent; a cascade into a tombstone table refused at enable and at DDL; the reap"),
         "revoke_midseed": ("bridge", "a principal revoked while its re-seed is in flight: the mapping rung (seed completes, writes die) and the full hammer (session kicked mid-download, no partial table, cause named); a witness untouched"),
         "suspension_reasons": ("bridge", "every refusal reason: the registry's row and the published descriptor say the same thing, live and at boot; each lifts when fixed"),
         "rebuild_kill":  ("bridge", "a client killed at every point of a local rebuild and of a re-key: each leftover state converges on reopen, both clients"),
         "outbox_break":  ("bridge", "the application tries to damage the client's bookkeeping through query(): every write refused on both clients, the queued write survives and lands"),
         "write_stale":   ("bridge", "writes queued while the bridge is down, delivered after a DROP COLUMN, a new NOT NULL column and a re-key: verdicts, reverts, no ghost rows, both replicas equal PostgreSQL"),
+        "rebase_stale":  ("bridge", "an UPDATE judged stale is rebased when its columns are disjoint from the winner's (both clients, verdict before and after the echo, a slow clock), dropped and surfaced when they overlap"),
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),

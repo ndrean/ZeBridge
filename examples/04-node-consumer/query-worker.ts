@@ -55,7 +55,8 @@ for await (const line of rl) {
     if (req.mutate) {
       // {"mutate": {"table", "op", "key", "values"}} → the blessed write path
       const m = req.mutate;
-      const r = await zb.mutate(m.table, m.op, m.key, m.values);
+      // an explicit version models a slow clock (§10do): the stamp is the caller's
+      const r = await zb.mutate(m.table, m.op, m.key, m.values, m.version ? { version: m.version } : undefined);
       console.log(JSON.stringify({ rows: [r] }));
       continue;
     }

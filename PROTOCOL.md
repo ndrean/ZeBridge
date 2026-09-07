@@ -1115,7 +1115,7 @@ Two things follow, and they are the whole reason this section is long:
    | reply | client |
    | --- | --- |
    | `accepted` | pop |
-   | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC |
+   | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC. An UPDATE is kept aside until that row is here (its version is above the refused stamp): resubmitted with a fresh stamp when the winner changed none of its columns, dropped and surfaced when they overlap (§7.6) |
    | `row_deleted` | pop, revert the local row to "deleted," and surface it to the user |
    | `revoked` | not a reply to a write: the ban (§10dm). Published as `mutation_ack.<principal>.revoked` when the principal's mapping is deleted, retained by the stream. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act |
    | `rejected` | pop, revert the local row to its pre-write state |
@@ -1792,6 +1792,8 @@ set, so that an offline client's later edit can be overruled instead of resurrec
 row. Tombstones are reaped after `GC_THRESHOLD_MS`, which is therefore **the maximum
 offline window with pending writes that this deployment supports**.
 
+⚠️ **A parent cannot be tombstoned while a live child references it.** A tombstone is a delete on every replica, and a replica's foreign keys have no cascade, so PostgreSQL refuses the tombstone at the source (a trigger on the tombstone column, `foreign_key_violation`) and the writer receives `rejected` naming the child table. Delete the children first. The converse contradiction, a foreign key `ON DELETE CASCADE` into a table that keeps tombstones, is refused by `zebridge_enable` and by the DDL guard: the cascade's physical deletes would never reach a replica. The sweeper reaps children before parents.
+
 ⚠️ **A client removes the row the moment the tombstone arrives.** The soft delete reaches
 a replica as an ordinary `update` whose tombstone column is set — on CDC, in a chain
 row, or as the client's own optimistic apply — and the physical reap that follows is
@@ -1862,6 +1864,26 @@ where it was and every queued write looks safe. That is correct — nothing was 
 it means the table is not evidence the sweeper works, only evidence of what it last did.
 
 ---
+
+### 7.6 Rebase on stale
+
+`stale` judges a version, not a column: the write's stamp is below the row's. The
+client holds the sparse `data` it sent, the before-image it stored with the outbox
+row, and — before or after the verdict — the winning row, which arrives over CDC
+with a version above the refused stamp. From those three it decides once the winner
+is here:
+
+- a column of the edit was changed by the winner when the local row holds neither
+  the pre-write value nor the edit's own value (the CDC row overwrote the optimistic
+  copy with something else);
+- none changed: resubmit the same `data` as a new UPDATE with a fresh HLC stamp. The
+  floor puts it above the winner, so it is accepted and echoes like any write;
+- any changed: drop, and surface the loss naming the column. Last-writer-wins stands
+  on the contested column.
+
+Only an UPDATE qualifies. An edit made while the row was not here (no before-image)
+counts every column as the winner's and is dropped. The resubmission is a normal
+write in every respect: outbox row, optimistic apply, watermark gate, verdict.
 
 ## 8. Ordering guarantees
 

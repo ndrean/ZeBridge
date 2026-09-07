@@ -112,6 +112,10 @@ pub const SyncClient = struct {
     /// §10x dictionaries by object name — immutable, so the cache cannot go stale.
     dicts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
+    /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
+    /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
+    rebase: std.StringArrayHashMapUnmanaged(Rebase) = .empty,
+    rebase_due: bool = false,
     /// FK-held events (§10h) outlive the `drainStream` call that decoded them — they
     /// wait for `drainCdc`'s retry pass — but not the pass itself. So they get their
     /// own arena, reset after every pass: a third lifetime, between "this call" and
@@ -1357,6 +1361,7 @@ pub const SyncClient = struct {
             applied += try self.applyBatch(stream, mine.items, last, &max_seq);
         }
         if (applied > 0) self.retryHeld();
+        self.drainRebase();
         const settled = try self.drainVerdictsWith(0, 1);
         self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
         return .{ .applied = applied, .settled = settled };
@@ -1438,6 +1443,8 @@ pub const SyncClient = struct {
             }
             return err;
         };
+        // §10do: a row arriving may be the winner a held edit waits for.
+        if (self.rebase.count() > 0) self.rebase_due = true;
     }
 
     /// An UPDATE for a row that is HERE is applied as an UPDATE (core.planUpdate —
@@ -1497,13 +1504,20 @@ pub const SyncClient = struct {
     /// `result_a` owns the returned msg_id and nothing else: everything this call
     /// builds — envelope, before-image, JSON, msgpack — is per-call and freed on return.
     pub fn mutate(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op: []const u8, key: Value, values: ?Value) ![]const u8 {
+        return self.mutateAt(result_a, table, op, key, values, null);
+    }
+
+    /// `mutate` with the caller's own stamp (the TypeScript client's `opts.version`):
+    /// a host that keeps its own clock, or a test modelling a slow one. The HLC is
+    /// still advanced past it, so the next unstamped write follows it.
+    pub fn mutateAt(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op: []const u8, key: Value, values: ?Value, stamp: ?[]const u8) ![]const u8 {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
         const st = self.states.get(table) orelse return error.UnknownTable;
         try self.ensureOutbox();
 
-        const version = try core.hlcVersion(a, try nowWireIso(a), self.last_version, self.seen_floor);
+        const version = stamp orelse try core.hlcVersion(a, try nowWireIso(a), self.last_version, self.seen_floor);
         if (version.len > self.last_version_buf.len) return error.VersionTooLong;
         @memcpy(self.last_version_buf[0..version.len], version);
         self.last_version = self.last_version_buf[0..version.len];
@@ -1660,10 +1674,108 @@ pub const SyncClient = struct {
             const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
             if (rows.len == 1) try self.revertOptimistic(a, rows[0]);
         }
-        // `stale` deliberately does NOT revert: the authoritative row is already on its
-        // way over CDC, and restoring a before-image could undo a newer value that has
-        // since been applied. Dropping the entry is the whole correction.
+        // `stale` does not revert: the authoritative row is already on its way over
+        // CDC, and restoring a before-image could undo a newer value. §10do: the edit
+        // is kept aside instead — resubmitted if its columns are disjoint from the
+        // winner's, dropped and surfaced otherwise (see `tryRebase`).
+        if (std.mem.eql(u8, status, "stale")) {
+            self.holdForRebase(a, mid) catch |err| std.debug.print("libzb: rebase hold for {s} failed: {any}\n", .{ mid, err });
+        }
         _ = try self.st.query(a, "DELETE FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        return true;
+    }
+
+    // ─── §10do: rebase on stale ───────────────────────────────────────────────
+
+    /// A `stale` verdict names an UPDATE that lost to a newer version. Its columns
+    /// are not necessarily the columns the winner changed: when the two sets are
+    /// disjoint the edit is still right and is resubmitted with a fresh stamp (the
+    /// HLC floor puts it above the winner); when they overlap it is dropped and
+    /// surfaced — LWW's word stands. Only an UPDATE qualifies; read BEFORE the
+    /// outbox row goes.
+    fn holdForRebase(self: *SyncClient, a: std.mem.Allocator, mid: []const u8) !void {
+        const rows = try self.st.query(a, "SELECT subject, payload, tbl, before FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
+        if (rows.len != 1) return;
+        const r = rows[0];
+        if (r[0] != .text or r[1] != .text or r[2] != .text) return;
+        const dot = std.mem.lastIndexOfScalar(u8, r[0].text, '.') orelse return;
+        if (!std.mem.eql(u8, r[0].text[dot + 1 ..], "update")) return;
+        const env = try parseStoredJson(a, r[1].text);
+        if (env != .object) return;
+        const key = env.object.get("key") orelse return;
+        const data = env.object.get("data") orelse return;
+        const ver = env.object.get("version") orelse return;
+        if (key != .object or data != .object or ver != .string) return;
+        const la = self.aa();
+        try self.rebase.put(la, try la.dupe(u8, mid), .{
+            .table = try la.dupe(u8, r[2].text),
+            .key = try la.dupe(u8, try core.valueToString(a, key)),
+            .values = try la.dupe(u8, try core.valueToString(a, data)),
+            .before = if (r[3] == .text) try la.dupe(u8, r[3].text) else null,
+            .version = try la.dupe(u8, try core.normalizeVersion(a, ver.string)),
+        });
+        self.rebase_due = true;
+    }
+
+    /// Runs at the end of poll() and flush(), outside any apply transaction: the
+    /// resubmit is a full mutate() (outbox + optimistic apply), sent by the host's
+    /// next flush like any other write.
+    fn drainRebase(self: *SyncClient) void {
+        if (!self.rebase_due or self.rebase.count() == 0) return;
+        self.rebase_due = false;
+        var ta = std.heap.ArenaAllocator.init(self.a);
+        defer ta.deinit();
+        var i: usize = 0;
+        while (i < self.rebase.count()) {
+            const mid = self.rebase.keys()[i];
+            const done = self.tryRebase(ta.allocator(), mid) catch |err| blk: {
+                std.debug.print("libzb: rebase of {s} deferred: {any}\n", .{ mid, err });
+                self.rebase_due = true;
+                break :blk false;
+            };
+            if (done) _ = self.rebase.swapRemoveAt(i) else i += 1;
+        }
+    }
+
+    /// True once the entry is settled (rebased or dropped); false while the winning
+    /// row is not here yet — it is, when its version is above the refused stamp.
+    fn tryRebase(self: *SyncClient, a: std.mem.Allocator, mid: []const u8) !bool {
+        const e = self.rebase.get(mid) orelse return true;
+        const st = self.states.get(e.table) orelse return true;
+        const vcol = st.version_col orelse return true;
+        const key = try parseStoredJson(a, e.key);
+        const cur = (try self.beforeImage(a, e.table, st, key)) orelse {
+            std.debug.print("libzb: rebase of {s} abandoned: the row is gone\n", .{mid});
+            return true;
+        };
+        if (cur != .object) return true;
+        const cur_ver = if (cur.object.get(vcol)) |v| (if (v == .string) try core.normalizeVersion(a, v.string) else "") else "";
+        if (std.mem.order(u8, cur_ver, e.version) != .gt) return false;
+        const values = try parseStoredJson(a, e.values);
+        const before: ?Value = if (e.before) |b| try parseStoredJson(a, b) else null;
+        var mine: std.ArrayList(u8) = .empty;
+        var overlap: std.ArrayList(u8) = .empty;
+        for (values.object.keys()) |c| {
+            if (std.mem.eql(u8, c, vcol)) continue;
+            if (mine.items.len > 0) try mine.appendSlice(a, ", ");
+            try mine.appendSlice(a, c);
+            // The winner changed c when the row here holds neither the pre-write value
+            // nor mine: the CDC row overwrote my optimistic copy with something else.
+            const winner_changed = if (before) |b|
+                (b != .object or (!sameJson(a, cur.object.get(c), b.object.get(c)) and !sameJson(a, cur.object.get(c), values.object.get(c))))
+            else
+                true;
+            if (winner_changed) {
+                if (overlap.items.len > 0) try overlap.appendSlice(a, ", ");
+                try overlap.appendSlice(a, c);
+            }
+        }
+        if (overlap.items.len > 0) {
+            std.debug.print("libzb: {s} edit LOST to a newer version on the same column(s) {s} — the winning row stands; surface this to the user\n", .{ e.table, overlap.items });
+            return true;
+        }
+        const ver = try self.mutate(a, e.table, "UPDATE", key, values);
+        std.debug.print("libzb: rebased {s} of {s} onto the newer row as {s}\n", .{ mine.items, e.table, ver });
         return true;
     }
 
@@ -1941,6 +2053,7 @@ pub const SyncClient = struct {
         try self.refuseIfRevoked();
         const sent = try self.flushOutbox();
         const settled = try self.drainVerdicts(wait_ms);
+        self.drainRebase();
         return .{ .sent = sent, .settled = settled };
     }
 
@@ -2173,6 +2286,17 @@ fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8
 ///
 /// `.value` is arena-owned by the caller's allocator here, which is the client arena —
 /// the same lifetime rule the rest of this file uses for parsed grammar and schemas.
+/// §10do: a stale UPDATE kept aside for a rebase. `before` is the pre-write image
+/// the outbox stored; null when the row was not here at write time (then every
+/// column counts as changed by the winner, and the edit is dropped).
+const Rebase = struct { table: []const u8, key: []const u8, values: []const u8, before: ?[]const u8, version: []const u8 };
+
+fn sameJson(a: std.mem.Allocator, x: ?Value, y: ?Value) bool {
+    const xs = core.valueToString(a, x orelse .null) catch return false;
+    const ys = core.valueToString(a, y orelse .null) catch return false;
+    return std.mem.eql(u8, xs, ys);
+}
+
 fn parseStoredJson(a: std.mem.Allocator, text: []const u8) !Value {
     const parsed = try std.json.parseFromSlice(Value, a, text, .{});
     return parsed.value;
