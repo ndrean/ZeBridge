@@ -7,6 +7,7 @@
 //!
 //!   uint64_t zb_client_open(const char* opts_json);   // 0 on failure
 //!   int      zb_client_close(uint64_t handle);        // 0 ok, 1 unknown handle
+//!   int      zb_client_wipe(uint64_t handle);         // close AND delete the replica files — explicit, never automatic (§10dl)
 //!   int      zb_client_live(void);                    // open clients, for tests
 //!
 //! The index card (NOTES §10), one JSON string in and one out, freed via zb_free.
@@ -430,6 +431,22 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
 export fn zb_client_close(handle: u64) c_int {
     const box = clients.remove(handle) orelse return 1;
     box.destroy(std.heap.c_allocator);
+    return 0;
+}
+
+/// Close the client AND delete its replica files (§10dl). The library never wipes on
+/// its own — a revoked principal's device keeps its rows and simply stops receiving;
+/// the wipe is the application's explicit act, and this is the one verb for it.
+export fn zb_client_wipe(handle: u64) c_int {
+    const box = clients.remove(handle) orelse return 1;
+    var path_buf: [1024]u8 = undefined;
+    const db = std.fmt.bufPrintZ(&path_buf, "{s}", .{box.db}) catch return 1;
+    box.destroy(std.heap.c_allocator);
+    for ([_][]const u8{ "", "-wal", "-shm" }) |suffix| {
+        var buf: [1040]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&buf, "{s}{s}", .{ db, suffix }) catch continue;
+        _ = std.c.unlink(p.ptr);
+    }
     return 0;
 }
 

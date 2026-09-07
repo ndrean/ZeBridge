@@ -39,11 +39,11 @@ flowchart LR
 
 **Local_DB supported flavours**: standard SQLite, PGlite or PostgreSQL.
 
-**How does it work?**: The architecture consists of bridge split into two core components: a daemon and a client library..
+**How does it work?**: The bridge architecture is split into two core components: a daemon and a client library..
 
-* `ZeBridge` (ZB) daemon: the background executable is connected to PostgreSQL (PG) and NATS/JetStream (NATS). It streams schemas, seeding chunks and PG changes onto NATS and applies writes coming back from the consumer to the primary database.
+* the daemon `ZeBridge` (ZB): the background executable connects to PostgreSQL (PG) and to NATS/JetStream (NATS). It streams schemas, seeds by chunks and sends PG changes onto NATS. It applies writes coming back from the consumer to the primary database.
 This is lightweight process, can be started / stopped seamlessly on the fly.
-* `libzb` client library: a client library that abstracts all the NATS and local database connection and storage. The consumer uses a tiny numbers of pirmitives from the library.
+* a client library `libzb` : it abstracts all the NATS and local database connection and storage. The consumer uses a tiny numbers of pirmitives from the library.
 The library comes in two flavours: a native TypeScript library and a dynamically linked library via FFI.
 
 **Consumers**: The library can be integrated across a wide range of runtime environments.
@@ -658,7 +658,7 @@ A table that breaks a rule is suspended, not the bridge: its events are dropped 
 | `no_tenant_column` | the catalogue names a tenant column the table lacks | add the column or fix the catalogue row |
 | `tenant_not_in_replica_identity` | a DELETE could not be routed to its tenant | a unique index on `(tenant, pk)` and `REPLICA IDENTITY USING INDEX` on it; `zebridge_enable` does this |
 | `unsupported_column_type` | a column's type cannot be decoded | change or drop the column |
-| `row_too_large` | a row exceeded the event buffer | lifts by itself once a row fits, or restart with a larger `BASE_BUF` |
+| `row_too_large` | a row exceeded the event buffer | lifts at the first write that fits after a 30 s cooldown; a restart re-measures the widest row and keeps the suspension while it still exceeds `BASE_BUF` |
 | `too_many_columns` | a migration grew the table past `MAX_COLUMNS` | drop columns (lifts live), or restart: the boot re-detects |
 
 Rows written while a table was suspended never reached any replica. A lift after such drops, live or across a restart, bumps the table's seed epoch, so every replica re-seeds from a fresh full. Nothing to do by hand.
@@ -851,6 +851,12 @@ One action: the DBA can revoke immediately a user's read and write access by rem
 
 ```sh
 ADMIN_DATABASE_URL=.... bridge --revoke <principal>
+```
+
+That closes writes now, and it publishes a `revoked` verdict on the principal's own channel: clients built on the libraries hang up on it at once, stay hung up on reconnect, and answer `Revoked` to every call. The rows on the device stay until the application calls `wipe()` (`zb_client_wipe` in libzb), which is explicit on purpose. A revoked principal is dead for good: an invite for that name is refused, so the operator creates a new one. That hang-up is cooperative, though: code that is not our library can keep reading with the same token until it expires. To close the token itself now, add the operator key and the server's config: the command rebuilds the account JWT's revocations map, re-signs it and splices it in place; a reload of the server (or `nats auth account push` where the server runs the full resolver) drops the principal's live sessions and refuses the token. Revocation pins the key, not the name: re-enrolling the same principal mints a new one. Proven mid-seed on both clients by `revoke_midseed` in the battery.
+
+```sh
+OPERATOR_SEED=SO... ZB_ACCOUNT_PUB=A... ADMIN_DATABASE_URL=.... bridge --revoke <principal> --conf /path/to/nats-server.conf
 ```
 
 ### Authenticate ZeBridge with Postgres

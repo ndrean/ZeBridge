@@ -8320,9 +8320,6 @@ wal_confirmed_lag growth over /health; the 30 s-class gauge cadences that alias
 sub-minute panels; and the cascade's two-panel signature (queue climbs, then the lag
 takes the overflow).
 
-Housekeeping the same day: `my_slot2` (the two-bridge experiment's slot, long `lost`)
-dropped with its budget row — one slot again. Suite: 56 scenarios; the full seal ran
-offline 7/7, owns 24/24, live 22/22.
 
 ## 10cf. "Which tables are refused?" now has a psql answer (2026-09-03)
 
@@ -9874,6 +9871,129 @@ refusal reason, too. Now a table that no longer exists gets no descriptor of any
 (its tombstone stands), and a refused one is suspended with its OWN reason. Thirty
 ghost keys deleted from the dev bucket; the two-client scenarios went from five
 minutes to one, `rebuild_kill` runs in 30 s.
+
+## 10dk. Every suspension reason, told the same way everywhere (2026-09-06)
+
+The README's "Suspended tables" table makes seven claims; §10dj had just shown one
+path lying about the reason. `scripts/scenarios/suspension_reasons.py` (owns) breaks
+one table per reason LIVE, restarts the bridge so each is judged at BOOT, and compares
+the two words a reader can find — the registry's row in `zebridge_suspensions` and the
+descriptor's `reason` in the schemas bucket — then fixes each and watches the lift. A
+Node client follows all seven and must hear each reason by name. First run: 5 of 22
+red. Each red was a claim that did not hold:
+
+1. `no_cdc_subject` had no registry row: `zebridge_set_suspended` recorded only
+   catalogued tables, and the reason that MEANS "no catalogue row" was the one it
+   skipped. Every refused table records a row now.
+2. `unsupported_column_type` was found at the table's first row after boot, so a
+   restart published a clean descriptor over a table whose next event suspends it.
+   The boot publisher now asks the decoder's verdict per column and suspends there.
+3. `too_many_columns`, the same shape: the DDL and relation paths checked, the boot
+   publisher did not. It does.
+4. `row_too_large` vanished across a restart: the registry is memory, the width scan
+   is shrink-gated, so the row was still there and the suspension was gone until that
+   row's next event. An inherited `row_too_large` is measured again at boot with
+   `zebridge_widest_row` (the parameter needed `$1::text` — untyped, PostgreSQL could
+   not infer it) and kept while the row still exceeds the buffer; only then is a
+   re-seed asked for. The wipe of stale rows runs BEFORE that, or it took the fresh
+   refusal with it.
+5. `no_tenant_column` never lifted live: the fix is a catalogue UPDATE, not DDL, and
+   the reload only cleared `no_cdc_subject`. The reload now re-runs preflight's tenant
+   checks for the changed tables, lifting first — so a fix lifts and a break refuses,
+   live, `tenant_not_in_replica_identity` included when its row changes.
+
+And one that only showed as a flake: the republish path named its suspension
+`schema-suspend-boot-<table>`, a constant, and JetStream's duplicate window dropped
+the second one within two minutes of the first — the bucket kept the clean descriptor
+published in between. The WAL position is in the id now. Two things the scenario had
+to learn: the width guard `zebridge_enable` installs refuses an oversized row in
+PostgreSQL itself (`SET session_replication_role = replica` to store one), and the
+`row_too_large` probe has a 30 s cooldown, so the lift comes with the first write that
+fits after it — the README says so now. 22/22, twice in a row.
+
+## 10dl. A principal revoked while its re-seed is in flight (2026-09-06)
+
+Item 6 of the client-test list. Revocation has two rungs (§10cj, §10ck, §10cm) and
+"in flight" means something different on each, so `scripts/scenarios/revoke_midseed.py`
+(owns) has two halves, both with a libzb client and a zb-client-ts client on a probe
+principal enrolled through GET /enroll like any device, on the dev server itself.
+
+**SOFT — `bridge --revoke <p>`, the mapping rung.** Fired one second into a re-seed of
+a 30,000-row table: the seed COMPLETED on both clients (the read door is a JWT, and it
+was open), the next write from the principal was refused by the guard with the
+connection untouched, `$KV.tenants.<p>` was gone, and a reconnect on the same files
+found no tenant. That reconnect exposed a libzb gap: a principal whose mapping is gone
+silently became the OPEN tenant and then hunted a `CDC_<open>` stream that does not
+exist (the open tenant's rows ride the public stream) until every call timed out.
+Now: no mapping → said out loud, tenant-scoped tables skipped, public tables followed
+— the TS rule; and a principal mapped to the open tenant routes to the public stream.
+The TS client had its own version: a purged mapping is a DEL marker with an empty
+value, which it read as a tenant named "".
+
+**HARD — the same with OPERATOR_SEED and --conf, the hammer.** The account JWT's
+`revocations` map rebuilt from `zebridge_principal_keys`, re-signed, spliced into the
+server's config, SIGHUP — one second into the re-seed. libzb's poll came back with
+`AuthorizationViolation` by name; both replicas held the OLD count exactly (the seed is
+one transaction; the kicked download rolled it back), inboxes empty; a witness on
+another principal re-seeded to completion on the same server; the dead token was
+refused on reconnect. The TS client heard only `ClosedConnectionError` — CLIENTS.md's
+"raw error surfaces" row — so it now logs the server's `error` status event and the
+reason `closed()` resolves with: "NATS connection closed by the server: Authorization
+Violation". Same mechanism as NATS's own docs (`nats auth user rm --revoke` + `nats
+auth account push`): the dev server preloads JWTs in memory, so the push is a splice
+and a reload; revocation pins the KEY, not the name — re-enrolling mints a new one.
+
+**What the runs found on the way.** (1) A table dropped and re-created under its
+name within one producer tick inherited the old chain — the departure sweep (§10dg)
+never saw the name leave — and both clients seeded the 40,001 rows of the previous
+incarnation into a table that had 30,000. `zebridge_generations` now records the
+table's OID per build; a build whose OID differs from the last row's sweeps the old
+chain, bumps the epoch and starts at g1. (2) The Node worker logged one line per CDC
+event, 184,000 lines for one seed; not any more. (3) A scenario killed by `timeout`
+runs no `finally`: the bridge stayed up and the amended config stayed amended, twice.
+`timeout -s INT` gives Python its KeyboardInterrupt and the cleanup runs. 15/15.
+
+## 10dm. The ban: a revocation the library obeys now, and a principal that stays dead (2026-09-07)
+
+§10dl left the soft rung with a gap the user named at once: reads live until the JWT
+expires, and the hammer needs the operator key. NATS's own `kick` closes a socket,
+but a valid token reconnects in a second. What closes the window for every client
+built on the libraries is a signal on a channel they already hold open: the verdict
+channel. `bridge --revoke <p>` deletes the mapping; the bridge, seeing that delete
+in the WAL, publishes `mutation_ack.<p>.revoked` (`{"status":"revoked"}`) — a subject
+every client subscribes to, retained by the MUTATIONS stream, no new grant. libzb
+closes its connection on it and answers `error.Revoked` from every later call; the
+TypeScript client closes and reports the same; both probe the retained verdict at
+connect (one direct get, the missed-verdict path), so a reconnecting client hangs up
+before it reads a row. The rows stay: the wipe is the application's explicit act —
+`zb_client_wipe` / `zb.wipe()`, both new, both proven.
+
+Stated plainly, because the word "ban" invites the wrong belief: this is COOPERATIVE.
+Code that is not our library, holding the same creds, reads the tenant's CDC stream
+until the token expires or the account JWT's revocation is pushed. The ladder is
+therefore: the ban — immediate, no operator key, for honest clients; the JWT
+revocation (`--revoke --conf`) — enforcement, immediate once pushed; expiry — the
+backstop. And a revoked principal is dead for good: `/enroll` refuses an invite for a
+name that has a revoked key (the operator creates a new principal), and the retained
+ban would hang up a re-enrolled client anyway.
+
+`revoke_midseed.py` (owns) now proves the ban on the soft rung: one second into a
+re-seed, libzb's poll answers `Revoked` and the Node client logs the hang-up, the
+tables are whole, a write attempt answers `Revoked` without being sent, the tenants
+key is gone, a reconnect on the same files finds the retained ban at once, the
+explicit wipe removes both files, and re-enrolling the name is refused. The hammer
+half stands as before; there the ban may reach the client a moment before the kick,
+so either name is accepted and §H6 proves the enforcement regardless.
+
+Three lessons from the runs. The scenario reused its principal names and the second
+run banned both clients at their first sync — the retained ban did exactly what the
+rule says, and fresh names per run were the fix, not a change to the rule. A SIGSEGV
+in the host right after the ban cost an hour and an lldb session before it read as
+the harness's fault: ctypes had never been told `zb_client_flush`'s return type on a
+client that had not mutated first, and a 64-bit pointer cut to 32 bits was read as a
+C string — every verb is typed at open now. And a Node worker whose `connect()` is
+refused (the retained ban) must stay alive to answer the query and the explicit wipe,
+which is what a real application would want too. 18/18.
 
 ## §13 Preflight stopped
 

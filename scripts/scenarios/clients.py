@@ -19,26 +19,35 @@ def fresh_sqlite(path):
 
 class Lib:
     """The libzb client, host-driven: every observation is a poll."""
-    def __init__(self, db, tables, client_id="py-scenario"):
+    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None):
         if not LIBZB.exists():
             sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
         self.lib = lib = ctypes.CDLL(str(LIBZB))
         lib.zb_free.argtypes = [ctypes.c_void_p]
         lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
-        for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
+        # ⚠️ Every verb's types, at open: a `flush` called before any `mutate` used to run
+        # with ctypes' default int return — a 64-bit pointer cut to 32 bits, then read as
+        # a C string (SIGSEGV in the host, blamed on the library for an hour).
+        for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
+                     ("flush", [ctypes.c_uint64]), ("mutate", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
+        lib.zb_client_wipe.restype, lib.zb_client_wipe.argtypes = ctypes.c_int, [ctypes.c_uint64]
         self.h = lib.zb_client_open(json.dumps({
-            "url": zb.nats_server(), "credsPath": zb.creds_for("omar"), "grammarPath": GRAMMAR, "dbPath": db,
-            "principal": "omar", "clientId": client_id, "tables": list(tables), "heartbeatMs": 0}).encode())
+            "url": zb.nats_server(), "credsPath": str(creds) if creds else zb.creds_for(principal), "grammarPath": GRAMMAR, "dbPath": db,
+            "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0}).encode())
         if not self.h: sys.exit("libzb open failed")
         r = self.take(lib.zb_client_sync(self.h))
-        if "error" in r: sys.exit(f"libzb sync failed: {r['error']}")
-        self.tenant = r["tenant"]
+        self.sync_error = r.get("error")
+        if self.sync_error and self.sync_error != "Revoked": sys.exit(f"libzb sync failed: {self.sync_error}")
+        self.tenant = r.get("tenant")
     def take(self, p):
         try: return json.loads(ctypes.string_at(p).decode())
         finally: self.lib.zb_free(p)
-    def poll(self): self.take(self.lib.zb_client_poll(self.h, 300))
+    def poll(self):
+        """One poll; the report dict, or {"error": name} once the connection is gone."""
+        self.last_poll = self.take(self.lib.zb_client_poll(self.h, 300))
+        return self.last_poll
     def q(self, sql, params=()):
         r = self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
         if "error" in r: raise RuntimeError(r["error"])
@@ -46,25 +55,32 @@ class Lib:
     def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
     def mutate(self, table, op, key, values=None):
         lib = self.lib
-        if not hasattr(lib, "_mutate_typed"):
-            lib.zb_client_mutate.restype, lib.zb_client_mutate.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
-            lib.zb_client_flush.restype, lib.zb_client_flush.argtypes = ctypes.c_void_p, [ctypes.c_uint64, ctypes.c_uint64]
-            lib._mutate_typed = True
         return self.take(lib.zb_client_mutate(self.h, table.encode(), op.encode(), json.dumps(key).encode(), json.dumps(values).encode() if values is not None else None))
     def flush(self, wait_ms=2000):
         return self.take(self.lib.zb_client_flush(self.h, wait_ms))
     def close(self): self.lib.zb_client_close(self.h)
+    def wipe(self):
+        """The explicit wipe (§10dl): close and delete the replica files."""
+        return self.lib.zb_client_wipe(self.h)
 
 
 class Node:
     """The zb-client-ts client, event-driven, behind query-worker.ts."""
-    def __init__(self, db, log="/tmp/zb_node_worker.log"):
-        env = dict(os.environ, ZB_DB=db, ZB_PRINCIPAL="omar", NATS_URL=zb.nats_server())
+    def __init__(self, db, log="/tmp/zb_node_worker.log", principal="omar", creds=None):
+        env = dict(os.environ, ZB_DB=db, ZB_PRINCIPAL=principal, NATS_URL=zb.nats_server())
+        if creds: env["ZB_CREDS"] = str(creds)
         self.log = open(log, "w")
         self.p = subprocess.Popen(["node", "--experimental-strip-types", "query-worker.ts"], cwd=NODE_DIR, env=env,
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, text=True)
-        first = json.loads(self.p.stdout.readline())
+        line = self.p.stdout.readline()
+        try:
+            first = json.loads(line)
+        except json.JSONDecodeError:
+            self.p.wait(timeout=10); self.log.close()
+            tail = open(log).read().splitlines()[-3:]
+            raise RuntimeError(f"node worker did not come up ({line.strip()[:80]!r}); last log lines: {tail}")
         self.tenant = first.get("tenant")
+        self.connect_error = first.get("error")
     def q(self, sql, params=()):
         self.p.stdin.write(json.dumps({"sql": sql, "params": list(params)}) + "\n"); self.p.stdin.flush()
         # a silent worker is a finding, not a hang: 60 s, then the scenario says so
@@ -83,6 +99,11 @@ class Node:
         r = json.loads(self.p.stdout.readline())
         if "error" in r: raise RuntimeError(r["error"])
         return r["rows"][0]
+    def wipe(self):
+        """The explicit wipe (§10dl): the worker closes its client, deletes the files, exits."""
+        self.p.stdin.write('{"wipe": true}\n'); self.p.stdin.flush()
+        line = self.p.stdout.readline(); self.p.wait(timeout=15); self.log.close()
+        return "wiped" in line
     def close(self):
         try:
             self.p.stdin.write('{"close": true}\n'); self.p.stdin.flush(); self.p.wait(timeout=15)

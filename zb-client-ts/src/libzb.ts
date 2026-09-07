@@ -236,6 +236,9 @@ export class ZeBridge {
   private statusHandlers = new Set<(s: ConnStatus) => void>();
 
   private fkHeld: { id?: number; table: string; ev: any }[] = [];
+  /// §10dm: the ban was seen (`mutation_ack.<principal>.revoked`) — closed, and staying
+  /// closed. The rows stay; the wipe is the application's explicit `wipe()`.
+  public revoked = false;
   private sweepId?: ReturnType<typeof setInterval>;
   private rttIntervalId?: ReturnType<typeof setInterval>;
   private hbIntervalId?: ReturnType<typeof setInterval>;
@@ -414,6 +417,9 @@ export class ZeBridge {
       await this.watchSchemas();
       await this.watchVerdicts();
       await this.resolveTenant();
+      // §10dm: a ban published while this client was away is retained — one direct get.
+      await this.collectMissedVerdicts([{ msg_id: 'revoked' }]);
+      if (this.revoked) throw new Error(`'${this.config.principal}' is revoked`);
       // PROTOCOL §9: beat from HERE, before the seed — a client stuck seeding (a chain
       // that never comes, a slow device) is exactly the one an operator must see, with
       // its zero positions. libzb beats from its first poll for the same reason.
@@ -453,6 +459,11 @@ export class ZeBridge {
                 void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
               } else if (t === 'disconnect') {
                 this.emitStatus('disconnected');
+              } else if (t === 'error') {
+                // The server's own verdict (§10dl): `-ERR 'Authentication Revoked'`,
+                // an authorization violation — the one line that says WHY the
+                // connection is going, before every later call says only "closed".
+                this.appendLog('SYS', `NATS server error: ${String((st as any).data ?? '')}`, 'ERROR');
               }
             }
           } catch { /* iterator died — recreate below */ }
@@ -466,6 +477,13 @@ export class ZeBridge {
         }
       })();
 
+      // The terminal reason, named (§10dl): closed() resolves with the error that
+      // ended the connection — an auth verdict reads as such, not as a bare close.
+      const closedP: Promise<unknown> | undefined = (this.nc as any).closed?.();
+      void closedP?.then((err: any) => {
+        if (err) this.appendLog('SYS', `NATS connection closed by the server: ${err?.message ?? err}`, 'ERROR');
+      });
+
       this.sweepId = setInterval(() => this.sweepPendingWrites(), 1000);
       this.rttIntervalId = setInterval(() => void this.pollNatsRtt(), 10_000);
     } catch (err) {
@@ -473,6 +491,14 @@ export class ZeBridge {
       this.appendLog('SYS', `Connection failed: ${err}`, 'ERROR');
       throw err;
     }
+  }
+
+  /// Close AND delete the replica files (§10dl). Never automatic: a revoked principal's
+  /// device keeps its rows and simply stops receiving; the wipe is the application's
+  /// explicit act, and this is the one verb for it (libzb: `zb_client_wipe`).
+  public async wipe(): Promise<void> {
+    await this.close();
+    await this.deleteDatabaseFile();
   }
 
   public async close(): Promise<void> {
@@ -1539,13 +1565,16 @@ export class ZeBridge {
       // grant covers ONLY the per-key Direct Get path (measured — App.tsx history).
       const kv = await this.transport.kv(this.nc, this.config.grammar.kv.tenants, { allow_direct: true });
       const entry = await kv.get(this.config.principal);
-      if (entry) {
+      // A purged mapping (§10ce: `bridge --revoke`) leaves a DEL marker with an empty
+      // value — that is "no mapping", not a tenant named "".
+      if (entry && entry.operation === 'PUT' && entry.value?.length) {
         let val: string;
         try { val = decode(entry.value) as string; } catch { val = td.decode(entry.value); }
         this.tenantValue = val;
         this.appendLog('SYS', `Resolved tenant for '${this.config.principal}': ${val}`, 'INFO');
       } else {
-        this.appendLog('SYS', `No tenant mapping for '${this.config.principal}' — public-only reads`, 'INFO');
+        this.tenantValue = '';
+        this.appendLog('SYS', `No tenant mapping for '${this.config.principal}' — revoked, or never enrolled: tenant-scoped tables are not followed, public tables are`, 'WARN');
       }
     } catch (err) {
       this.appendLog('SYS', `Tenant resolution failed: ${err}`, 'ERROR');
@@ -2203,6 +2232,15 @@ export class ZeBridge {
         const prefix = `${this.ackPrefix()}.${this.config.principal}.`;
         const msgId = m.subject.startsWith(prefix) ? m.subject.slice(prefix.length) : m.subject;
         const verdict = JSON.parse(new TextDecoder().decode(m.data));
+        if (msgId === 'revoked') {
+          // §10dm: the ban — hang up now, stay hung up. Cooperative: this library obeys;
+          // the account JWT's revocation is the enforcement.
+          this.revoked = true;
+          this.appendLog('SYS', `'${this.config.principal}' REVOKED by the operator (${verdict.reason ?? ''}) — hanging up now. The local rows stay; wipe() is the application's explicit act.`, 'ERROR');
+          this.emitStatus('disconnected');
+          void this.close();
+          return true;
+        }
         const pending = this.pendingWrites.get(msgId);
         const where = pending ? `${pending.table}#${pending.id}` : '(not from this session)';
 

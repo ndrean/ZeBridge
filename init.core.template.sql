@@ -276,13 +276,13 @@ GRANT SELECT ON public.zebridge_suspensions TO ${POSTGRES_READER_USER};
 
 CREATE OR REPLACE FUNCTION public.zebridge_set_suspended(p_tbl text, p_reason text)
 RETURNS void AS $$
-    -- p_reason NULL = lifted. A table with no catalogue row (published but never
-    -- declared) records nothing, which is right: the doctor for those is zebridge_check.
+    -- p_reason NULL = lifted. EVERY refused table records a row, catalogued or not
+    -- (§10dk): `no_cdc_subject` IS the table with no catalogue row, and a projection
+    -- that omitted it answered "which tables are refused?" with one missing.
     DELETE FROM public.zebridge_suspensions WHERE tbl = p_tbl AND p_reason IS NULL;
     INSERT INTO public.zebridge_suspensions (tbl, reason)
     SELECT p_tbl, p_reason
      WHERE p_reason IS NOT NULL
-       AND EXISTS (SELECT 1 FROM public.zebridge_catalogue c WHERE c.tbl = p_tbl)
     ON CONFLICT (tbl) DO UPDATE SET reason = EXCLUDED.reason, since = now();
 $$ LANGUAGE sql SECURITY DEFINER SET search_path = public, pg_catalog;
 
@@ -667,6 +667,10 @@ CREATE TABLE IF NOT EXISTS public.zebridge_generations (
     -- a later DROP/RENAME/re-type/ADD forces a FULL, so a chain object never names a
     -- column the replica no longer has.
     col_shape      text,
+    -- The table's OID at this build (§10dl): a table dropped and re-created under the
+    -- same name within one tick is a DIFFERENT table with the same chain name — the
+    -- producer sweeps the old chain, bumps the epoch, and starts it at g1.
+    relid          oid,
     PRIMARY KEY (tenant, tbl, gen)
 );
 -- §10x: the compression dictionary is a chain member. `dict` holds the trained

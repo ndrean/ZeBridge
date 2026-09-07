@@ -370,7 +370,7 @@ Published when the bridge refuses a table. The reasons:
 | --- | --- | --- |
 | `no_primary_key` | rows cannot be identified, so DELETE is ambiguous (§9) | add a primary key |
 | `unsupported_column_type` | a column's type cannot be decoded and is not an enum (§4) | change or drop that column |
-| `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | restart the bridge with a larger buffer, or move the oversized column out of the table |
+| `row_too_large` | a row exceeded the bridge's per-event buffer (`BASE_BUF`) | shrink the row: it lifts at the first write that fits after a 30 s cooldown; or restart with a larger buffer — a restart with the same buffer re-measures the widest row and keeps the suspension |
 | `too_many_columns` | a migration grew the table past the columns one event can carry (`MAX_COLUMNS`, sized at boot from the widest table, doubled) | restart the bridge (it re-detects), or set `MAX_COLUMNS`; dropping columns lifts it live. Rows written while suspended were dropped: a lift after drops, live or across the restart, bumps the table's `seed_epoch` so every replica re-seeds |
 | `no_tenant_column` | the catalogue names a tenant column this table does not have | add the column, or correct the catalogue row |
 | `tenant_not_in_replica_identity` | the tenant column is outside the replica identity, so a DELETE could not be routed to a tenant at all | add a unique index covering `(tenant, pk)` and point `REPLICA IDENTITY` at it |
@@ -1117,6 +1117,7 @@ Two things follow, and they are the whole reason this section is long:
    | `accepted` | pop |
    | `stale` | pop — do **not** hand-revert; the winning row arrives via CDC |
    | `row_deleted` | pop, revert the local row to "deleted," and surface it to the user |
+   | `revoked` | not a reply to a write: the ban (§10dm). Published as `mutation_ack.<principal>.revoked` when the principal's mapping is deleted, retained by the stream. Close the connection now, stay closed on reconnect (probe it by direct get before reading anything), answer `Revoked` to every call; leave the rows — the wipe is the application's explicit act |
    | `rejected` | pop, revert the local row to its pre-write state |
    | timeout / error | keep, retry (idempotent via `msg_id` for 2 minutes — §2) |
 

@@ -945,17 +945,47 @@ pub fn main(init: std.process.Init) !void {
                 // the re-seed is asked for here, for those two reasons only — a table
                 // refused for no key or no subject was never followed, and has
                 // nothing to re-seed.
-                const spanned = c.PQexec(conn, "SELECT string_agg(tbl, ',') FROM public.zebridge_suspensions WHERE reason IN ('too_many_columns', 'row_too_large')");
-                if (c.PQresultStatus(spanned) == c.PGRES_TUPLES_OK and c.PQntuples(spanned) > 0 and c.PQgetisnull(spanned, 0, 0) == 0) {
-                    var it = std.mem.splitScalar(u8, std.mem.span(c.PQgetvalue(spanned, 0, 0)), ',');
-                    while (it.next()) |tbl| {
-                        log.info("🧬 '{s}' was suspended when the last bridge stopped (events dropped meanwhile) — asking for a re-seed before this boot lifts it", .{tbl});
+                const spanned = c.PQexec(conn, "SELECT tbl, reason FROM public.zebridge_suspensions WHERE reason IN ('too_many_columns', 'row_too_large') ORDER BY tbl");
+                // Read BEFORE the wipe, act AFTER it: a refusal raised below writes its
+                // own row, and the wipe must not take that row with the stale ones.
+                {
+                    const res = c.PQexec(conn, "SELECT public.zebridge_clear_suspensions()");
+                    c.PQclear(res);
+                }
+                if (c.PQresultStatus(spanned) == c.PGRES_TUPLES_OK) {
+                    const n: usize = @intCast(c.PQntuples(spanned));
+                    for (0..n) |i| {
+                        const tbl = std.mem.span(c.PQgetvalue(spanned, @intCast(i), 0));
+                        const reason = std.mem.span(c.PQgetvalue(spanned, @intCast(i), 1));
+                        // §10dk: a `row_too_large` inherited across a restart is MEASURED
+                        // again before it is forgotten — the row is still there, and a
+                        // registry that is memory would otherwise lift it in silence and
+                        // suspend again at that row's next event.
+                        if (std.mem.eql(u8, reason, "row_too_large")) {
+                            const tbl_z = allocator.dupeZ(u8, tbl) catch continue;
+                            defer allocator.free(tbl_z);
+                            const params = [_]?[*:0]const u8{tbl_z.ptr};
+                            const wr = c.PQexecParams(conn, "SELECT COALESCE(public.zebridge_widest_row(to_regclass(format('%I.%I', 'public', $1::text))), 0)::text", 1, null, &params[0], null, null, 0);
+                            defer c.PQclear(wr);
+                            if (c.PQresultStatus(wr) != c.PGRES_TUPLES_OK) {
+                                log.warn("⚠️  '{s}': could not measure its widest row ({s}) — treating the inherited suspension as lifted", .{ tbl, c.PQerrorMessage(conn) });
+                            }
+                            const widest: usize = if (c.PQresultStatus(wr) == c.PGRES_TUPLES_OK and c.PQntuples(wr) > 0)
+                                std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(wr, 0, 0)), 10) catch 0
+                            else
+                                0;
+                            log.info("📏 '{s}': widest row {d} bytes against an event buffer of {d}", .{ tbl, widest, own_event_buf });
+                            if (widest > own_event_buf) {
+                                log.warn("⚠️  '{s}' was suspended (row_too_large) when the last bridge stopped and its widest row ({d} bytes) still exceeds this event buffer ({d}) — suspended again, not lifted", .{ tbl, widest, own_event_buf });
+                                refused.refuse(tbl, .row_too_large) catch {};
+                                continue;
+                            }
+                        }
+                        log.info("🧬 '{s}' was suspended ({s}) when the last bridge stopped (events dropped meanwhile) — asking for a re-seed before this boot lifts it", .{ tbl, reason });
                         refused.reseedAfterLift(tbl, null);
                     }
                 }
                 c.PQclear(spanned);
-                const res = c.PQexec(conn, "SELECT public.zebridge_clear_suspensions()");
-                defer c.PQclear(res);
             }
         }
     }
@@ -977,6 +1007,7 @@ pub fn main(init: std.process.Init) !void {
         .cat = &cat,
         .topo = &runtime_config.topology,
         .refused = &refused,
+        .publication_name = parsed_args.publication_name,
     };
 
     // OID → typtype for types the CDC decoder's switch does not cover. Populated from
@@ -1965,6 +1996,7 @@ pub fn main(init: std.process.Init) !void {
                                             for (cols.items) |col| {
                                                 if (std.mem.eql(u8, col.name, "principal") and col.value == .text) {
                                                     event_proc.purgeTenantKey(col.value.text);
+                                                    event_proc.publishRevoked(col.value.text);
                                                 }
                                             }
                                         } else |err| log.warn("revoked tenant mapping: could not decode the key: {s}", .{@errorName(err)});
@@ -2303,6 +2335,7 @@ const LiveCatalogue = struct {
     cat: *catalogue.Load,
     topo: *topology_mod.Topology,
     refused: *refused_tables.Registry,
+    publication_name: []const u8,
 
     fn reload(self: *LiveCatalogue, publisher: anytype, event_proc: anytype) void {
         var fresh = catalogue.loadRules(self.allocator, self.pg_config, self.tenant_rules, self.sync_rules, self.env);
@@ -2367,6 +2400,31 @@ const LiveCatalogue = struct {
                 log.warn("🗂️ '{s}' left the catalogue — refused (no CDC subject) until it is declared again", .{tbl});
             }
             republish.append(self.allocator, tbl) catch {};
+        }
+        // §10dk: a changed catalogue row can fix — or break — a table's tenant column
+        // (`no_tenant_column`, `tenant_not_in_replica_identity` were boot-only checks):
+        // re-run preflight's tenant checks for the changed tables, lifting first so a
+        // fix lifts and a break refuses, live.
+        {
+            var subset = Config.EventClassification.TransitionRules.init(self.allocator);
+            defer subset.deinit();
+            for (self.cat.changed) |tbl| {
+                const r = self.refused.reasonFor(tbl);
+                if (r == .no_tenant_column or r == .tenant_not_in_replica_identity) self.refused.clear(tbl);
+                if (self.tenant_rules.get(tbl)) |cols| subset.put(tbl, cols) catch {};
+            }
+            if (subset.count() > 0) {
+                var std_cfg = self.pg_config.*;
+                std_cfg.replication = false;
+                if (pg_conn.connect(self.allocator, std_cfg)) |conn| {
+                    defer c.PQfinish(conn);
+                    preflight.reportTenantColumns(self.allocator, conn, self.publication_name, &subset, self.refused) catch |err| {
+                        log.warn("🗂️ tenant re-check after the reload failed ({s}) — the boot check stands", .{@errorName(err)});
+                    };
+                } else |err| {
+                    log.warn("🗂️ tenant re-check after the reload skipped (no connection: {s})", .{@errorName(err)});
+                }
+            }
         }
         // And any table the catalogue routes that a DDL event refused BEFORE this
         // read (a CREATE TABLE ahead of its zebridge_enable, in another transaction).

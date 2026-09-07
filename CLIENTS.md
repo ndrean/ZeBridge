@@ -66,7 +66,10 @@ row a rule is named.
 | a failed optimistic echo still queues the write | ✓ | ✓ | §10cp |
 | liveness of the NATS connection | host-driven (`NoResponders` → reopen tails) | RTT poll every 10 s, re-sync on recovery | §10cn |
 | fleet heartbeat (PROTOCOL §9) | on every poll and at sync end | from tenant resolution, before the seed | §10dc |
-| auth error named | ✓ | raw error surfaces | |
+| auth error named | ✓ `AuthorizationViolation` / `AuthExpired` from `poll` | ✓ the server's `error` status and `closed()`'s reason logged by name (2026-09-06) | §10cj, §10dl `revoke_midseed` |
+| the ban (`mutation_ack.<p>.revoked`): hang up now, stay hung up on reconnect, every call answers Revoked | ✓ `error.Revoked` | ✓ `revoked`, logged, closed | §10dm |
+| the wipe is explicit, never automatic | ✓ `zb_client_wipe` | ✓ `wipe()` | §10dm |
+| a principal with no tenant mapping (revoked, never enrolled) | tenant-scoped tables skipped audibly, public followed | same; a purged mapping's DEL marker reads as none | §10dl |
 | tenant revoked while connected | next connect | next connect | |
 | inbox pruning | — (no inbox) | ✓ | |
 | chain dictionary cache | per process | persisted (`_zebridge_dicts`) | §10x |

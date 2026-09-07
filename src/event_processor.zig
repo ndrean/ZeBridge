@@ -999,6 +999,25 @@ pub const EventProcessor = struct {
         } else |err| log.warn("🧹 tenants bucket unreachable for a revoked mapping ({s}): {s}", .{ principal, @errorName(err) });
     }
 
+    /// §10dm: the ban. A revoked mapping is announced on the principal's OWN verdict
+    /// channel — `mutation_ack.<principal>.revoked`, a subject every client already
+    /// subscribes to and the MUTATIONS stream retains — so a live client hangs up NOW
+    /// and a reconnecting one finds the verdict again. Cooperative by nature: it is
+    /// the immediate rung for clients built on the libraries; the account JWT's
+    /// revocation (`--revoke --conf`) stays the enforcement, expiry the backstop.
+    pub fn publishRevoked(self: *EventProcessor, principal: []const u8) void {
+        const publ = self.publisher orelse return;
+        const js = if (publ.js) |*j| j else return;
+        var buf: [256]u8 = undefined;
+        const subject = std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.topology.mutation_ack_prefix, principal }) catch return;
+        const body = "{\"status\":\"revoked\",\"reason\":\"mapping removed by the operator\"}";
+        js.nc.publish(subject, body) catch |err| {
+            log.warn("⛔ '{s}': the ban could not be published on {s} ({s}) — its live clients read until expiry or the JWT revocation", .{ principal, subject, @errorName(err) });
+            return;
+        };
+        log.info("⛔ '{s}' revoked — the ban is on {s}: its live clients hang up, a reconnecting one finds it retained", .{ principal, subject });
+    }
+
     fn pruneDroppedTable(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8) void {
         const publ = self.publisher orelse return;
         const js = if (publ.js) |*j| j else return;
@@ -1996,7 +2015,10 @@ pub const EventProcessor = struct {
                 log.warn("⚠️  Withholding boot schema for refused table '{s}' — publishing suspension ({s})", .{ clean_table, reason.wireName() });
                 // No column or PK queries: we are not describing a shape, only saying
                 // the table is not replicating.
-                const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-boot-{s}", .{clean_table});
+                // The WAL position in the id (§10dk): the reload republishes through here too, and a
+                // constant id fell into JetStream's duplicate window — the second suspension was
+                // dropped as a repeat and the bucket kept the clean descriptor published between.
+                const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-boot-{s}-{d}", .{ clean_table, boot_lsn });
                 const slot_idx = try self.publishSuspension(
                     arena,
                     clean_table,
@@ -2041,6 +2063,19 @@ pub const EventProcessor = struct {
                 log.warn("⚠️ No schema found for table {s}", .{clean_table});
                 continue;
             }
+            // §10dk: wider than one event can carry — the same verdict the DDL path
+            // gives, HERE, so a restart does not publish a clean descriptor over a table
+            // whose first row will suspend it.
+            if (@as(usize, @intCast(num_rows)) > self.batch_publisher.events[0].columns.len) {
+                log.err("🔴 REFUSING '{s}' at boot: {d} columns, more than the {d} one CDC event can carry (MAX_COLUMNS) — drop columns, or restart with a larger MAX_COLUMNS", .{ clean_table, num_rows, self.batch_publisher.events[0].columns.len });
+                self.refused.refuse(clean_table, .too_many_columns) catch |err| {
+                    log.err("🔴 Could not record refusal for '{s}': {}", .{ clean_table, err });
+                };
+                const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-boot-cols-{s}-{d}", .{ clean_table, boot_lsn });
+                const slot_idx = try self.publishSuspension(arena, clean_table, RefusedTables.Reason.too_many_columns.wireName(), msg_id, 0, boot_lsn);
+                try self.releaseSlotToQueue(slot_idx);
+                continue;
+            }
 
             var json_str: std.ArrayList(u8) = .empty;
             try json_str.appendSlice(arena, try std.fmt.allocPrint(
@@ -2050,6 +2085,10 @@ pub const EventProcessor = struct {
             ));
 
             var column_names: std.ArrayListUnmanaged([]const u8) = .empty;
+            // §10dk: the decoder's verdict on every column, HERE — a column it refuses
+            // used to be found at the table's first row after boot, so a restart
+            // published a clean descriptor over a table whose next event suspends it.
+            var unsupported: ?[]const u8 = null;
             var r: i32 = 0;
             while (r < num_rows) : (r += 1) {
                 if (r > 0) try json_str.appendSlice(arena, ",");
@@ -2068,6 +2107,7 @@ pub const EventProcessor = struct {
                             log.warn("could not record type OID {d}: {}", .{ oid, err });
                         };
                     }
+                    if (unsupported == null and self.types.verdict(oid) == .refuse) unsupported = col_name;
                 } else |_| {}
 
                 try column_names.append(arena, col_name);
@@ -2087,6 +2127,17 @@ pub const EventProcessor = struct {
                     try json_str.append(arena, '"');
                 }
                 try json_str.append(arena, '}');
+            }
+
+            if (unsupported) |col| {
+                log.err("🔴 REFUSING '{s}' at boot: column '{s}' has a type the CDC decoder does not implement and that is not an enum — change or drop the column", .{ clean_table, col });
+                self.refused.refuse(clean_table, .unsupported_column_type) catch |err| {
+                    log.err("🔴 Could not record refusal for '{s}': {}", .{ clean_table, err });
+                };
+                const msg_id = try std.fmt.allocPrint(arena, "schema-suspend-boot-type-{s}-{d}", .{ clean_table, boot_lsn });
+                const slot_idx = try self.publishSuspension(arena, clean_table, RefusedTables.Reason.unsupported_column_type.wireName(), msg_id, 0, boot_lsn);
+                try self.releaseSlotToQueue(slot_idx);
+                continue;
             }
 
             try json_str.appendSlice(arena, "]},\"sqlite\":{\"columns\":[");

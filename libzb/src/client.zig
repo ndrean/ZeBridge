@@ -95,6 +95,15 @@ pub const SyncClient = struct {
     kv_generations: []const u8 = undefined, // generations.kv
     gen_bucket_prefix: []const u8 = undefined, // generations.bucket_prefix
     open_tenant: []const u8 = undefined, // open_tenant
+    /// §10dl: no `$KV.tenants.<principal>` key — the principal was never mapped, or was
+    /// revoked. Tenant-scoped tables are then unreadable (no stream to grant) and are
+    /// SKIPPED, audibly, the TS client's rule; public tables still follow.
+    tenant_missing: bool = false,
+    /// §10dm: the ban was seen (`mutation_ack.<principal>.revoked`): the connection is
+    /// closed and every later call answers `error.Revoked`. The rows stay; the wipe is
+    /// the application's explicit act (`zb_client_wipe`).
+    revoked: bool = false,
+    hung_up: bool = false,
     stream_mutations: []const u8 = undefined, // streams.mutations
     subject_mutations_prefix: []const u8 = undefined, // subjects.mutations_prefix
     subject_mutation_ack_prefix: []const u8 = undefined, // subjects.mutation_ack_prefix
@@ -273,8 +282,11 @@ pub const SyncClient = struct {
     pub fn resolveTenant(self: *SyncClient) !void {
         const bytes = (try self.t.kvGet(self.aa(), self.kv_tenants, self.opts.principal)) orelse {
             self.tenant = self.open_tenant;
+            self.tenant_missing = true;
+            std.debug.print("tenant: {s} has no mapping ($KV.tenants.{s}) — revoked, or never enrolled: tenant-scoped tables are skipped, public tables follow\n", .{ self.opts.principal, self.opts.principal });
             return;
         };
+        self.tenant_missing = false;
         // The value may be msgpack-encoded (the bridge's KV diversion) or raw.
         self.tenant = decodeMaybeMsgpackString(self.aa(), bytes) catch bytes;
         std.debug.print("tenant: {s} -> {s}\n", .{ self.opts.principal, self.tenant });
@@ -560,7 +572,7 @@ pub const SyncClient = struct {
             _ = self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch {};
             pruneInboxDropped(&self.st, a, table) catch {};
             self.reseed_pending = true;
-            std.debug.print("{s}: re-keyed — watermark dropped, re-seeding from a fresh full\n", .{table});
+            std.debug.print("{s}: {s} — watermark dropped, re-seeding from a fresh full\n", .{ table, @tagName(outcome) });
         }
 
         const pk = try jsonStrList(a, val.object.get("pk_columns"));
@@ -579,9 +591,15 @@ pub const SyncClient = struct {
             try self.reseedIfEpochMoved(a, table, seed_epoch);
             if (outcome == .unchanged and sameStrings(st.cols, names.items) and sameStrings(st.pk, pk)) return;
         }
+        if (tenant_col != null and self.tenant_missing) {
+            std.debug.print("{s}: tenant-scoped and '{s}' has no tenant — not followed (the local rows stay as they are)\n", .{ table, self.opts.principal });
+            return;
+        }
         // Changed, or first time: into the client-lifetime arena.
         const ca = self.aa();
-        const route = if (tenant_col != null)
+        // The OPEN tenant's rows ride the public stream (`cdc.<open>.>` is one of its
+        // subjects); a principal mapped to it must not look for a `CDC_<open>` stream.
+        const route = if (tenant_col != null and !std.mem.eql(u8, self.tenant, self.open_tenant))
             try std.fmt.allocPrint(ca, "{s}{s}", .{ self.cdc_prefix, self.tenant })
         else
             self.cdc_public;
@@ -1291,6 +1309,7 @@ pub const SyncClient = struct {
     }
 
     pub fn poll(self: *SyncClient, wait_ms: u64) !PollReport {
+        try self.refuseIfRevoked();
         // Schema first: a row in a new shape must find its table already moved.
         self.drainSchemaWatch() catch |err| std.debug.print("schema watch: {s}\n", .{@errorName(err)});
         var ca = std.heap.ArenaAllocator.init(self.a);
@@ -1715,6 +1734,7 @@ pub const SyncClient = struct {
                 break :blk last;
             };
             if (mid.len == 0) continue;
+            if (std.mem.eql(u8, mid, "revoked")) return self.hangUpRevoked();
 
             // ⚠️ JSON, not msgpack. CDC and mutations are msgpack; a verdict is JSON —
             // it is read by humans and by `nats sub` as often as by a client. The wire
@@ -1723,6 +1743,38 @@ pub const SyncClient = struct {
             if (try self.settleVerdict(a, mid, msg.data)) settled += 1;
         }
         return settled;
+    }
+
+    /// §10dm: the ban, acted on — the socket dropped now, the flag set for every later
+    /// call. Cooperative: this library obeys; the JWT revocation is the enforcement.
+    fn hangUpRevoked(self: *SyncClient) error{Revoked} {
+        self.revoked = true;
+        std.debug.print("{s}: REVOKED by the operator (mutation_ack.{s}.revoked) — hanging up now; every later call answers Revoked. The local rows stay; the wipe is the application's (zb_client_wipe).\n", .{ self.opts.principal, self.opts.principal });
+        // The socket is dropped at the NEXT entry point, not here: this runs inside the
+        // verdict drain, over a subscription the close would free under the loop's feet
+        // (measured: SIGSEGV in the host right after the ban).
+        return error.Revoked;
+    }
+
+    /// Every entry point: once revoked, drop the socket (once) and answer Revoked.
+    fn refuseIfRevoked(self: *SyncClient) !void {
+        if (!self.revoked) return;
+        if (!self.hung_up) {
+            self.hung_up = true;
+            self.t.conn.close();
+        }
+        return error.Revoked;
+    }
+
+    /// At connect: a ban published while this client was away is retained on the
+    /// MUTATIONS stream — one direct get, before anything is read.
+    fn probeRevoked(self: *SyncClient) !void {
+        var buf: [256]u8 = undefined;
+        const subject = try std.fmt.bufPrint(&buf, "{s}.{s}.revoked", .{ self.subject_mutation_ack_prefix, self.opts.principal });
+        if (self.t.lastBySubject(self.stream_mutations, subject) catch null) |m| {
+            m.deinit();
+            return self.hangUpRevoked();
+        }
     }
 
     /// The row as it stands, as a JSON object — or null when there is none.
@@ -1861,9 +1913,11 @@ pub const SyncClient = struct {
     /// the verdict channel) the first time, then seed-if-gapped and drain-to-tail every
     /// time. Idempotent by construction — a host calls it at boot and on a timer.
     pub fn syncOnce(self: *SyncClient) !SyncReport {
+        try self.refuseIfRevoked();
         const first = !self.schemas_synced;
         if (first) {
             try self.resolveTenant();
+            try self.probeRevoked();
             try self.ensureOutbox();
             try self.subscribeVerdicts();
             self.schemas_synced = true;
@@ -1884,6 +1938,7 @@ pub const SyncClient = struct {
     /// The write side's pump: collect and replay the outbox (§7.1), then wait up to
     /// `wait_ms` for the first verdict and drain what follows.
     pub fn flush(self: *SyncClient, wait_ms: u64) !FlushReport {
+        try self.refuseIfRevoked();
         const sent = try self.flushOutbox();
         const settled = try self.drainVerdicts(wait_ms);
         return .{ .sent = sent, .settled = settled };

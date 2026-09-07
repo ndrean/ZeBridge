@@ -22,7 +22,7 @@ if (ENGINE === 'pglite') mkdirSync(DB, { recursive: true });
 const zb = new ZeBridge({
   natsUrl: process.env.NATS_URL ?? 'nats://127.0.0.1:4222',
   principal: PRINCIPAL,
-  creds: readFileSync(`${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
+  creds: readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
   grammar: JSON.parse(readFileSync(`${REPO}src/grammar.json`, 'utf8')),
   heartbeatMs: 0,
   durable: true,
@@ -31,12 +31,18 @@ const zb = new ZeBridge({
 });
 // Lifecycle lines to stderr (the scenario greps them); CDC is one line per event.
 zb.onLog((t: string, d: any, level: string) => {
-  if (t === 'CDC') return;
+  if (t === 'CDC' || t.startsWith('cdc.')) return;  // one line per event would dwarf the seed itself
   console.error(`[${t} ${level}] ${typeof d === 'string' ? d : JSON.stringify(d)}`.slice(0, 300));
 });
 
-await zb.connect();
-console.log(JSON.stringify({ ready: true, tenant: zb.tenant }));
+// A refused connect (a revoked principal, §10dm) is reported, not fatal: the local
+// replica can still be queried and, explicitly, wiped.
+try {
+  await zb.connect();
+  console.log(JSON.stringify({ ready: true, tenant: zb.tenant }));
+} catch (e: any) {
+  console.log(JSON.stringify({ ready: false, error: String(e?.message ?? e) }));
+}
 
 const rl = createInterface({ input: process.stdin });
 for await (const line of rl) {
@@ -44,6 +50,7 @@ for await (const line of rl) {
   let req: any;
   try { req = JSON.parse(line); } catch { console.log(JSON.stringify({ error: 'bad json' })); continue; }
   if (req.close) break;
+  if (req.wipe) { await zb.wipe(); console.log(JSON.stringify({ wiped: true })); process.exit(0); }
   try {
     if (req.mutate) {
       // {"mutate": {"table", "op", "key", "values"}} → the blessed write path

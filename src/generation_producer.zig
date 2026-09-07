@@ -408,42 +408,47 @@ pub const GenerationProducer = struct {
         const gone = try queryOne(bkc, "SELECT DISTINCT tenant, tbl FROM public.zebridge_generations WHERE NOT (tbl = ANY($1::text[])) ORDER BY 1, 2", &params);
         defer c.PQclear(gone);
         const n: usize = @intCast(c.PQntuples(gone));
-        if (n == 0) return;
-        var kv = try js.kvBucket(self.topo.kv_generations);
-        defer kv.deinit();
-        var osm = js.objectStoreManager();
         for (0..n) |i| {
             const tenant = std.mem.span(c.PQgetvalue(gone, @intCast(i), 0));
             const table = std.mem.span(c.PQgetvalue(gone, @intCast(i), 1));
-            const tenant_z = try alloc.dupeZ(u8, tenant);
-            const table_z = try alloc.dupeZ(u8, table);
-            const pair = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
-            var deleted: usize = 0;
-            if (osm.openStore(bucket)) |*store_v| {
-                var store = store_v.*;
-                defer store.deinit();
-                const rows = try queryOne(bkc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen", &pair);
-                defer c.PQclear(rows);
-                const ng: usize = @intCast(c.PQntuples(rows));
-                for (0..ng) |k| {
-                    const g = std.mem.span(c.PQgetvalue(rows, @intCast(k), 0));
-                    for ([_][]const u8{ "delta", "full", "dict" }) |kind| {
-                        const name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
-                        store.delete(name) catch |err| {
-                            if (err != error.ObjectNotFound) log.warn("🧬 sweep: could not delete {s}: {}", .{ name, err });
-                            continue;
-                        };
-                        deleted += 1;
-                    }
-                }
-            } else |_| {}
-            const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
-            kv.delete(key) catch |err| log.warn("🧬 sweep: could not delete manifest {s}: {}", .{ key, err });
-            const del = try queryOne(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2", &pair);
-            c.PQclear(del);
-            log.info("🧬 '{s}'/'{s}' left the publication — chain swept ({d} object(s), manifest, bookkeeping); a table reborn under this name starts at g1", .{ tenant, table, deleted });
+            try self.sweepPair(alloc, bkc, js, tenant, table);
+            log.info("🧬 '{s}'/'{s}' left the publication — chain swept; a table reborn under this name starts at g1", .{ tenant, table });
         }
+    }
+
+    /// One (tenant, table) chain gone for good: its objects, its manifest, its rows.
+    fn sweepPair(self: *GenerationProducer, alloc: std.mem.Allocator, bkc: *c.PGconn, js: *nats.JetStream, tenant: []const u8, table: []const u8) !void {
+        const tenant_z = try alloc.dupeZ(u8, tenant);
+        const table_z = try alloc.dupeZ(u8, table);
+        const pair = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
+        var osm = js.objectStoreManager();
+        var deleted: usize = 0;
+        if (osm.openStore(bucket)) |*store_v| {
+            var store = store_v.*;
+            defer store.deinit();
+            const rows = try queryOne(bkc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen", &pair);
+            defer c.PQclear(rows);
+            const ng: usize = @intCast(c.PQntuples(rows));
+            for (0..ng) |k| {
+                const g = std.mem.span(c.PQgetvalue(rows, @intCast(k), 0));
+                for ([_][]const u8{ "delta", "full", "dict" }) |kind| {
+                    const name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
+                    store.delete(name) catch |err| {
+                        if (err != error.ObjectNotFound) log.warn("🧬 sweep: could not delete {s}: {}", .{ name, err });
+                        continue;
+                    };
+                    deleted += 1;
+                }
+            }
+        } else |_| {}
+        var kv = try js.kvBucket(self.topo.kv_generations);
+        defer kv.deinit();
+        const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
+        kv.delete(key) catch |err| log.warn("🧬 sweep: could not delete manifest {s}: {}", .{ key, err });
+        const del = try queryOne(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2", &pair);
+        c.PQclear(del);
+        log.debug("🧬 '{s}'/'{s}': {d} object(s), manifest and bookkeeping swept", .{ tenant, table, deleted });
     }
 
     fn buildOne(
@@ -473,9 +478,10 @@ pub const GenerationProducer = struct {
         var last_del_count: ?i64 = null;
         var last_epoch: i64 = 0;
         var last_col_shape: ?[]const u8 = null;
+        var last_relid: ?[]const u8 = null;
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape, relid::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
@@ -488,7 +494,35 @@ pub const GenerationProducer = struct {
                 }
                 last_epoch = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 4)), 10) catch 0;
                 if (c.PQgetisnull(res, 0, 5) == 0) last_col_shape = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 5)));
+                if (c.PQgetisnull(res, 0, 6) == 0) last_relid = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 6)));
             }
+        }
+        // §10dl: the table's OID now. Different from the last generation's → the table
+        // was dropped and re-created under the same name within one tick — a different
+        // table with the same chain name. Measured: two clients seeded the 40,001 rows
+        // of the old incarnation into a table that had 30,000. The departure sweep
+        // cannot see it (the name never left the publication), so it is done HERE:
+        // old chain swept, epoch bumped (every replica re-seeds), chain restarted at g1.
+        const cur_relid: []const u8 = blk: {
+            const params = [_]?[*:0]const u8{table_z.ptr};
+            const res = try queryOne(pgc, "SELECT COALESCE(to_regclass(format('%I.%I', 'public', $1::text))::oid::text, '')", &params);
+            defer c.PQclear(res);
+            break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+        };
+        if (last_gen != 0 and last_relid != null and cur_relid.len > 0 and !std.mem.eql(u8, last_relid.?, cur_relid)) {
+            log.warn("🧬 '{s}'/'{s}': the table was re-created under its name (oid {s} -> {s}) since g{d} — sweeping the old chain, bumping the seed epoch, starting at g1", .{ tenant, table, last_relid.?, cur_relid, last_gen });
+            self.sweepPair(alloc, bkc, js, tenant, table) catch |err| log.warn("🧬 sweep of the reborn table's chain failed: {}", .{err});
+            {
+                const params = [_]?[*:0]const u8{table_z.ptr};
+                const res = queryOne(bkc, "SELECT count(*) FROM public.zebridge_reseed(to_regclass(format('%I.%I', 'public', $1::text)))", &params) catch null;
+                if (res) |r| c.PQclear(r);
+            }
+            last_gen = 0;
+            last_cutoff = null;
+            last_row_count = null;
+            last_del_count = null;
+            last_epoch = 0;
+            last_col_shape = null;
         }
         // §10df: the catalogue's seed_epoch now. Different from the one the last
         // generation was built under → zebridge_reseed() ran → a FULL, whatever the
@@ -538,6 +572,53 @@ pub const GenerationProducer = struct {
         // after the full-building blocks once, it only flipped the label: bookkeeping
         // and manifest claimed a full that was never written (measured, a client
         // fetched a tombstone).
+        // §10dl: no bookkeeping for this pair, yet a manifest in the bucket — an orphan
+        // from a previous incarnation whose rows were removed by hand (a scenario
+        // teardown, an operator's cleanup). Measured: two clients seeded 40,001 rows of
+        // the old table from it. Its objects go, the key goes, and the epoch moves so
+        // any replica that drank from it re-seeds from this build.
+        if (last_gen == 0) {
+            const key0 = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
+            if (js.kvBucket(self.topo.kv_generations)) |*kv0_v| {
+                var kv0 = kv0_v.*;
+                defer kv0.deinit();
+                if (kv0.get(key0)) |entry_v| {
+                    var entry = entry_v;
+                    defer entry.deinit();
+                    {
+                        if (!entry.isDeleted() and entry.value.len > 0) {
+                            log.warn("🧬 '{s}'/'{s}': a chain manifest with no bookkeeping behind it — a previous incarnation's; sweeping it and bumping the seed epoch", .{ tenant, table });
+                            const bucket0 = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
+                            var osm0 = js.objectStoreManager();
+                            if (osm0.openStore(bucket0)) |*store_v| {
+                                var store0 = store_v.*;
+                                defer store0.deinit();
+                                if (std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{})) |man| {
+                                    if (man == .object) {
+                                        if (man.object.get("full")) |f| if (f == .object) {
+                                            if (f.object.get("object")) |o| if (o == .string) store0.delete(o.string) catch {};
+                                            if (f.object.get("gen")) |g| if (g == .integer) {
+                                                const dname = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, g.integer });
+                                                store0.delete(dname) catch {};
+                                            };
+                                        };
+                                        if (man.object.get("deltas")) |ds| if (ds == .array) for (ds.array.items) |d| if (d == .object) {
+                                            if (d.object.get("object")) |o| if (o == .string) store0.delete(o.string) catch {};
+                                            if (d.object.get("dict")) |o| if (o == .string) store0.delete(o.string) catch {};
+                                        };
+                                    }
+                                } else |_| {}
+                            } else |_| {}
+                            kv0.delete(key0) catch {};
+                            const params0 = [_]?[*:0]const u8{table_z.ptr};
+                            const r0 = queryOne(bkc, "SELECT count(*) FROM public.zebridge_reseed(to_regclass(format('%I.%I', 'public', $1::text)))", &params0) catch null;
+                            if (r0) |r| c.PQclear(r);
+                        }
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+
         const epoch_moved = last_gen != 0 and cat_epoch != last_epoch;
         if (epoch_moved) {
             log.info("🧬 '{s}'/'{s}': seed epoch moved ({d} -> {d}) since g{d} — zebridge_reseed(); forcing a full", .{ tenant, table, last_epoch, cat_epoch, last_gen });
@@ -865,9 +946,10 @@ pub const GenerationProducer = struct {
             const del_z = try utils.allocPrintZ(alloc, "{d}", .{del_count_now});
             const epoch_z = try utils.allocPrintZ(alloc, "{d}", .{cat_epoch});
             const shape_z = try alloc.dupeZ(u8, col_shape);
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr, epoch_z.ptr, shape_z.ptr };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13) " ++
+            const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z };
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }

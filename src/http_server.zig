@@ -411,7 +411,11 @@ pub const Server = struct {
         const redeem_sql =
             "WITH redeemed AS (" ++
             "  UPDATE public.zebridge_invites SET used_at = now()" ++
+            // §10dm: a revoked principal is dead for good — a name with a revoked key is
+            // never re-issued; the operator creates a NEW principal. The retained ban on
+            // its verdict channel would hang up a re-enrolled client anyway.
             "  WHERE code = $1 AND used_at IS NULL AND expires_at > now()" ++
+            "    AND NOT EXISTS (SELECT 1 FROM public.zebridge_principal_keys k WHERE k.principal = zebridge_invites.principal AND k.revoked_at IS NOT NULL)" ++
             "  RETURNING principal, tenant_id, role" ++
             "), registered AS (" ++
             "  INSERT INTO public.zebridge_user_tenants (principal, tenant_id)" ++
@@ -431,7 +435,7 @@ pub const Server = struct {
         const res = c.PQexecParams(conn, redeem_sql, 2, null, &params[0], null, null, 0);
         defer c.PQclear(res);
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) {
-            log.warn("🎟️ enrollment refused (code invalid, used, or expired)", .{});
+            log.warn("🎟️ enrollment refused (code invalid, used, or expired — or the principal was revoked, which is for good)", .{});
             try req.respond("{\"error\":\"invalid or used code\"}\n", .{ .status = .forbidden, .extra_headers = cors });
             return;
         }
