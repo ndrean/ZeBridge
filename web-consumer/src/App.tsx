@@ -1,151 +1,145 @@
-/// App.tsx — the theater. The subscription lives in `libzb.ts` (NOTES.md §10):
-/// this file is now the ZeBridge class's FIRST consumer, which makes the browser
-/// demo the regression test for the extraction. Everything here is UI: signals,
-/// badges, demo buttons, the SQL console — and the one platform concern the class
-/// deliberately does not own, the /bridge/health poll through the Vite proxy.
+/// App.tsx — a teaser and a teacher. The subscription lives in `zb-client-ts`
+/// (NOTES.md §10): this file is that class's FIRST consumer, which makes the browser
+/// demo the regression test for the library. Everything here is UI.
+///
+/// The page is built as claims. Each block states, in one sentence, the one fact it
+/// exists to prove; under its controls a "last events" line shows the library keeping
+/// that claim — or breaking it — live, from the log the library already emits.
+/// Nothing on this page teaches silently.
 
-import { createSignal, onCleanup, For } from 'solid-js';
-// import grammar from '../../grammar.json';
+import { createSignal, onCleanup, For, Show } from 'solid-js';
 import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
 import { makePgliteStorage } from 'zb-client-ts/pglite';
 import { init as zstdInit, decompress as zstdDecompress, createDCtx, decompressUsingDict } from '@bokuweb/zstd-wasm';
+import { nkeys } from '@nats-io/nats-core';
+
+/// ⚠️ This module owns ONE client, one socket, one replica. An edit to this file must
+/// therefore reload the page, not hot-swap the module: a hot update re-runs the module
+/// scope, which starts a SECOND client on a fresh database next to the first and
+/// re-initialises the wasm decoder under it (measured 2026-09-07: two seeds at once
+/// and "Failed to compress with code -20/-72" on objects whose digest had just been
+/// verified). Accepting the update and reloading is how a module opts out.
+if (import.meta.hot) import.meta.hot.accept(() => location.reload());
 
 /// §10x: chain objects are zstd frames, deltas may name a dictionary. One wasm
-/// decoder, initialized once; a dict frame decodes through a decompression
-/// context holding the dictionary bytes.
-let zstdReady: Promise<void> | null = null;
+/// decoder, initialized once per PAGE (kept on globalThis so nothing re-inits it);
+/// a dict frame decodes through a decompression context holding the dictionary.
+const g = globalThis as any;
 async function zstdDecode(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array> {
-  zstdReady ??= zstdInit();
-  await zstdReady;
+  g.__zbZstdReady ??= zstdInit();
+  await g.__zbZstdReady;
   if (!dict) return zstdDecompress(b);
   const dctx = createDCtx();
   try { return decompressUsingDict(dctx, b, dict); } finally { /* ctx freed by GC in this build */ }
 }
-import { nkeys } from '@nats-io/nats-core';
 
 /// ⚠️ No ports here, on purpose. Both of these are SAME-ORIGIN paths served by the
 /// Vite dev server, which proxies them to wherever the stack actually is —
 /// `ZB_BRIDGE_ORIGIN` and `ZB_NATS_WS_ORIGIN` in vite.config.ts, one file, two
-/// values. This file used to name `ws://localhost:8080` and `http://localhost:9090`
-/// and broke the moment compose published the same services on 8081 and 9098: the
-/// page just failed to connect, and a browser cannot tell you why.
-///
-/// Same-origin also settles COEP. The page sets `require-corp` for OPFS, under which
-/// a cross-origin response needs CORS or CORP headers; through the proxy the question
-/// never arises, for `/enroll` as much as for `/health`.
-///
-/// The escape hatch stays for a page served from somewhere other than the dev server
-/// (a built bundle behind the compose `edge` nginx, say).
+/// values. Same-origin also settles COEP: the page sets `require-corp` for OPFS.
 const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
 const NATS_URL = import.meta.env.VITE_NATS_URL ?? `${wsScheme}://${location.host}/nats`;
 const BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL ?? '/bridge';
 
+/// The dev accounts. Auth on this page is "pick who you are": each name has a creds
+/// file under /creds (a symlink to scripts/native/creds, minted by
+/// scripts/native/jwt-bootstrap.sh), and the JWT carries the permissions. The tenant
+/// is NOT in the file — it is the bridge's mapping (zebridge_user_tenants), which is
+/// why `guest` exists: a valid principal with no mapping follows public tables only.
+/// `alice` runs on PGlite (PostgreSQL in the browser) so the code shows how the
+/// storage adapter is chosen; the others on OPFS SQLite.
+///
+/// ⚠️ Dev only. Creds served to a browser is a demo convenience, never a deployment.
+const ACCOUNTS = [
+  { principal: 'guest', tenant: 'no tenant', engine: 'sqlite' },
+  { principal: 'alice', tenant: 'acme', engine: 'pglite' },
+  { principal: 'bob', tenant: 'globex', engine: 'sqlite' },
+  { principal: 'mary', tenant: 'globex', engine: 'sqlite' },
+] as const;
+
 /// `?principal=bob` beats the build-time env: one dev server serves several
-/// principals side by side (multi-browser demos, the generations staggered-seed
-/// test). The name must exist as a NATS user with a matching `mutation.<p>.>` grant.
+/// principals side by side (one tab per account, one database per tab).
 const _qs = new URLSearchParams(window.location.search);
 const PRINCIPAL = _qs.get('principal') ?? (import.meta.env.VITE_PRINCIPAL as string | undefined) ?? 'alice';
 const PASSWORD = _qs.get('password') ?? (import.meta.env.VITE_PASSWORD as string | undefined) ?? 's3cret';
+const ACCOUNT = ACCOUNTS.find((a) => a.principal === PRINCIPAL);
 
 /// Opt in to a stable per-principal OPFS file instead of a fresh one every load.
 /// Off by default — the timestamped name is the project's clean-room dev convention.
 const DURABLE = ['1', 'true'].includes(_qs.get('durable') ?? (import.meta.env.VITE_DURABLE as string | undefined) ?? '');
 
 /// `?engine=pglite`: PostgreSQL-in-the-browser as the replica engine instead of
-/// OPFS SQLite — "PG to PG". Same core, same protocol; the adapter brings the
-/// dialect (zb-client-ts/src/dialect.ts) and the descriptor's `pg` block is used for
-/// the DDL. In-memory, fresh per load, like the SQLite default.
-const ENGINE = (_qs.get('engine') ?? (import.meta.env.VITE_ENGINE as string | undefined) ?? 'sqlite') as 'sqlite' | 'pglite';
+/// OPFS SQLite. Same core, same protocol; the adapter brings the dialect
+/// (zb-client-ts/src/dialect.ts). Defaults from the account picked.
+const ENGINE = (_qs.get('engine') ?? (import.meta.env.VITE_ENGINE as string | undefined) ?? ACCOUNT?.engine ?? 'sqlite') as 'sqlite' | 'pglite';
 
-/// THE instance. One replica, one socket, one outbox — module-level like the
-/// SQLocal handle it wraps used to be.
-/// Operator/JWT mode: the dev server exposes scripts/native/creds/ under
-/// /creds (a public/ symlink), so each principal's tab fetches its own creds
-/// file — the JWT carries the permissions (scoped signing key), and no server
-/// conf names the principal. Missing file → fall back to user/password, so the
-/// same App works against a pre-operator server.
-/// Enrollment (?invite=<code>): the pump-starter, live. The app generates its
-/// OWN nkey pair, sends {code, user_pubkey} to the bridge's mint endpoint, and
-/// gets back a JWT — the seed never crosses the wire in either direction. The
-/// code is a one-time bearer secret (a password with hygiene); the principal is
-/// never sent — it comes back INSIDE the JWT, and libzb treats it as
-/// authoritative.
+/// Enrollment (?invite=<code>): the pump-starter, live. The app generates its OWN
+/// nkey pair, sends {code, user_pubkey} to the bridge's mint endpoint, and gets back
+/// a JWT — the seed never crosses the wire. The principal comes back INSIDE the JWT.
+/// Kept as a URL flow: the page's front door is the account picker.
 const INVITE = _qs.get('invite');
 
-/// Which credential the BROKER will accept — not a preference, a property of the
-/// stack you are pointed at, and the client cannot infer it.
-///
-///   'creds'    (default) operator/JWT: fetch /creds/<principal>.creds, or enrol
-///   'password' the pre-operator world: principal + password from the conf
-///
-/// ⚠️ Why this has to be explicit. `public/creds` is a symlink to
-/// `scripts/native/creds`, so the fetch SUCCEEDS (200, a real JWT) no matter which
-/// stack is running — and the code then chose JWT auth. Against the compose broker,
-/// which is `authorization { users: … }` with no operator and no resolver, that JWT
-/// is refused with `Authorization Violation` while `alice`/`s3cret` sitting right
-/// there would have connected. Measured 2026-08-28. The reachable file was never the
-/// question; the broker's opinion of it was.
+/// Which credential the BROKER will accept — a property of the stack you are pointed
+/// at, not a preference: 'creds' (operator/JWT, default) or 'password'.
 const AUTH = _qs.get('auth') ?? (import.meta.env.VITE_AUTH as string | undefined) ?? 'creds';
 
-/// The button's half of enrollment: generate a pair, send code + PUBLIC key,
-/// stash the assembled creds in sessionStorage (demo-tier storage — per tab,
-/// gone with it) and reload clean. Returns an error string instead of reloading
-/// when the mint refuses.
 async function enroll(code: string): Promise<string | undefined> {
   if (!code.trim()) return 'enter an invite code';
-  console.log({code: code.trim()});
   const kp = nkeys.createUser();
   const seed = new TextDecoder().decode(kp.getSeed());
-  // GET with params: a CORS "simple request" — no preflight, no body parsing.
-  const res = await fetch(
-    `${BRIDGE_URL}/enroll?code=${code.trim()}&user_pubkey=${kp.getPublicKey()}`,
-  ).catch(() => null);
+  const res = await fetch(`${BRIDGE_URL}/enroll?code=${code.trim()}&user_pubkey=${kp.getPublicKey()}`).catch(() => null);
   if (!res) return `bridge unreachable at ${BRIDGE_URL}`;
   if (!res.ok) return `refused (${res.status}) — invalid, used, or expired code`;
-  const { jwt } = await res.json();
+  const { jwt, grammar_hash } = await res.json();
   sessionStorage.setItem('zb_creds', credsFileText(jwt, seed));
-  location.href = location.pathname; // clean reload; the stash wins below
+  if (grammar_hash) sessionStorage.setItem('zb_grammar_hash', grammar_hash);
+  location.href = location.pathname;
   return undefined;
 }
 
 const CREDS = await (async () => {
-  // Password mode short-circuits BEFORE anything else, including a stashed JWT: a
-  // credential the broker cannot validate is worse than no credential, because the
-  // failure arrives as an authorization error rather than a missing file.
   if (AUTH === 'password') return undefined;
   const stashed = sessionStorage.getItem('zb_creds');
   if (stashed) return stashed;
   if (INVITE) {
-    const err = await enroll(INVITE); // URL flow reuses the button's path
+    const err = await enroll(INVITE);
     if (err) console.error('enrollment failed:', err);
-    return undefined; // success never reaches here — enroll() reloads
+    return undefined;
   }
   return fetch(`/creds/${PRINCIPAL}.creds`)
     .then((r) => (r.ok ? r.text() : undefined))
     .catch(() => undefined);
 })();
 
-/// The creds are authoritative for identity — the header must show who the JWT
-/// says we are, not what the URL guessed (measured: an enrolled pia labeled
-/// "alice" because the display used the URL default).
+/// The creds are authoritative for identity — the header shows who the JWT says we
+/// are, not what the URL guessed.
 const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
 
+/// The wire grammar is compiled into the library (§10dq) — the same bytes the bridge
+/// embeds. What the page asks the bridge for is only its HASH, to refuse loudly if
+/// this build and that bridge speak different protocols. A bridge that does not
+/// answer is not a mismatch: the page connects anyway, since NATS holds everything
+/// a provisioned replica needs. An enrolled tab already holds the hash from /enroll.
+const GRAMMAR_HASH: string | undefined = sessionStorage.getItem('zb_grammar_hash')
+  ?? (await fetch(`${BRIDGE_URL}/grammar`, { signal: AbortSignal.timeout(3000) })
+    .then((r) => (r.ok ? r.headers.get('x-grammar-hash') : null))
+    .catch(() => null))
+  ?? undefined;
+
+/// THE instance. One replica, one socket, one outbox.
 const zb = new ZeBridge({
-      zstdDecompress: zstdDecode,
+  zstdDecompress: zstdDecode,
   natsUrl: NATS_URL,
   principal: PRINCIPAL,
   password: PASSWORD,
   creds: CREDS,
-  grammar: null,
+  grammarHash: GRAMMAR_HASH,
   durable: DURABLE,
-  // Persistence follows the same switch as the SQLite file: DURABLE → `idb://`.
   storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: DURABLE }) : undefined,
 });
 
 // Console handle for inspecting the local replica directly — the database lives in
-// OPFS under a per-session name, so there is no file to open with the sqlite3 CLI
-// and no way to query it except through the worker. `zb.q(...)`, `zb.state()`,
-// `zb.orphans()`, `zb.purge()`, `zb.reset()` — deliberate, not left to a breakpoint.
+// OPFS under a per-session name, so there is no file to open with the sqlite3 CLI.
 declare global {
   interface Window { zb: any }
 }
@@ -153,29 +147,18 @@ if (typeof window !== 'undefined') {
   window.zb = {
     db: zb.dbName,
     uuid: () => zb.uuid(),
-    q: (text: string, ...params: any[]) => zb.query(text, ...params),   // params PASS THROUGH — a one-arg shim silently binds NULL
+    q: (text: string, ...params: any[]) => zb.query(text, ...params),
     count: async (table: string) => (await zb.query(`SELECT COUNT(*) AS n FROM ${table}`))[0],
     state: () => zb.syncState(),
-    ids: async (table: string, col = 'id') =>
-      (await zb.query(`SELECT ${col} FROM ${table} ORDER BY ${col}`)).map((r: any) => r[col]),
     outbox: () => zb.outboxAll(),
-    // The GC watermark as THIS replica sees it — the bound on how long a queued
-    // write stays sendable (PROTOCOL §MUST 6). null means the table is not
-    // replicated here, which is a normal deployment, not a fault.
     watermark: () => zb.gcWatermark(),
     flushOutbox: () => zb.flushOutbox(),
-    /** The blessed write path, exposed for console-driven tests (oversize probes,
-     *  scripted demos). Same rules as the buttons — verdicts and reverts included. */
     mutate: (table: string, op: 'INSERT' | 'UPDATE' | 'DELETE', key: any, values?: any, opts?: { version?: string }) =>
       zb.mutate(table, op, key, values, opts),
     newVersion: () => zb.newVersion(),
-    /** Delete this session's database file, then reload into a fresh one.
-     *  ("Clear site data" does not clear OPFS. Nothing in devtools does.) */
-    reset: async () => {
-      await zb.deleteDatabaseFile();
-      location.reload();
-    },
-    /** Every zebridge database left in OPFS — one per past page load. */
+    connect: () => zb.connect(),
+    close: () => zb.close(),
+    reset: async () => { await zb.deleteDatabaseFile(); location.reload(); },
     orphans: async () => {
       const root = await navigator.storage.getDirectory();
       const names: string[] = [];
@@ -184,292 +167,206 @@ if (typeof window !== 'undefined') {
       }
       return names.sort();
     },
-    /** Remove every zebridge database except the one this page is using. */
     purge: async () => {
       const root = await navigator.storage.getDirectory();
       const removed: string[] = [];
       for (const name of await window.zb.orphans()) {
         if (name === zb.dbName) continue;
-        try {
-          await root.removeEntry(name);
-          removed.push(name);
-        } catch { /* held by another tab, or already gone */ }
+        try { await root.removeEntry(name); removed.push(name); } catch { /* held by another tab */ }
       }
       return { removed: removed.length, kept: zb.dbName };
     },
   };
 }
 
+/// One well-known counter row per table, addressed by key: a fixed uid for the public
+/// counter, one uid per tenant for the tenant counter (uid is the PK, so tenants
+/// cannot share one).
+const counterUid = (table: 'counter_public' | 'counter_tenant'): string => {
+  if (table === 'counter_public') return '00000000-0000-4000-8000-00000000c0de';
+  let h = 0x811c9dc5;
+  for (const ch of zb.tenant || '_default') h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0;
+  return `00000000-0000-4000-8000-${h.toString(16).padStart(8, '0')}c0df`;
+};
+
+type Ev = { at: string; level: string; text: string };
+type CounterRow = { value: number; version: string; writer: string } | null;
+type UserRow = { uid: string; name: string };
+type OrderRow = { uid: string; user_id: string; item: string; note: string | null; version: string; writer: string };
+
 export default function App() {
   const [status, setStatus] = createSignal<'connected' | 'disconnected' | 'connecting'>('disconnected');
-  const [pendingCount, setPendingCount] = createSignal(0);
-  const [suspended, setSuspended] = createSignal<Record<string, string>>({});
-  const [phase, setPhase] = createSignal<Record<string, boolean>>({
-    connected: false, migrated: false, snapshot: false, cdc: false,
-  });
   const [health, setHealth] = createSignal<'up' | 'down' | 'unknown'>('unknown');
+  const [phase, setPhase] = createSignal<Record<string, boolean>>({ connected: false, migrated: false, snapshot: false, cdc: false });
+  const [suspended, setSuspended] = createSignal<Record<string, string>>({});
   const [tenant, setTenant] = createSignal<string>('—');
-  const [inviteCode, setInviteCode] = createSignal('');
-  const [enrollMsg, setEnrollMsg] = createSignal('');
-  const [counts, setCounts] = createSignal<Record<string, number>>({});
-  const [counterValues, setCounterValues] = createSignal<Record<string, number>>({});
-  const [lastVerb, setLastVerb] = createSignal<Record<string, string>>({});
-  const [logging, setLogging] = createSignal<Record<string, boolean>>({});
-  const [syncedTableNames, setSyncedTableNames] = createSignal<string[]>([]);
+  const [outboxCount, setOutboxCount] = createSignal(0);
+  const [heldCount, setHeldCount] = createSignal(0);
+  const [tables, setTables] = createSignal<string[]>([]);
+  const [counters, setCounters] = createSignal<Record<string, CounterRow>>({});
+  const [users, setUsers] = createSignal<UserRow[]>([]);
+  const [orders, setOrders] = createSignal<OrderRow[]>([]);
+  const [events, setEvents] = createSignal<Record<string, Ev[]>>({});
+  const has = (t: string) => tables().includes(t);
 
-  /// The same skip rule the old inline appendLog had: high-volume CDC noise stays out
-  /// of the console; everything else prints with a timestamp.
-  const appendLog = (topic: string, data: any, opType = '') => {
-    if (['INSERT', 'UPDATE', 'DELETE', 'snapshot', 'CDC'].includes(opType)) return;
-    const timestamp = new Date().toLocaleTimeString();
-    const bodyStr = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-    console.log(`[${timestamp}] ${topic} ${opType}:`, bodyStr);
+  // ── the last events, per block: the library's log, filtered by table ──────
+  //
+  // Verdicts name the write (`table#id`), echoes and holds name the table, the
+  // rebase and the loss name the table. Anything mentioning a block's table lands
+  // under that block; the newest three stay. High-volume CDC noise never shows.
+  const BLOCKS: Record<string, string[]> = {
+    counter_public: ['counter_public'],
+    counter_tenant: ['counter_tenant'],
+    shop: ['app_users', 'app_orders'],
+  };
+  const eventText = (topic: string, data: any, level: string): string => {
+    if (level === 'VERDICT' && data && typeof data === 'object') {
+      return `${data.write ?? topic}: ${data.status}${data.reason ? ` (${data.reason})` : ''}${data.detail ? ` — ${data.detail}` : ''}`;
+    }
+    if (level === 'MUTATION OUT' && data && typeof data === 'object') {
+      return `sent, stored by JetStream (seq ${data._ack?.seq}${data._ack?.duplicate ? ', duplicate' : ''})`;
+    }
+    return typeof data === 'string' ? data : JSON.stringify(data);
+  };
+  const onLog = (topic: string, data: any, level: string) => {
+    // A migration that landed is a change of the replica too: re-read the lists, so
+    // a renamed column shows up the moment it lands, not on the next row event.
+    if (level === 'SCHEMA') { void refresh(); return; }
+    if (['INSERT', 'UPDATE', 'DELETE', 'snapshot', 'CDC'].includes(level)) return;
+    const text = eventText(topic, data, level);
+    const hay = `${topic} ${text}`;
+    for (const [block, names] of Object.entries(BLOCKS)) {
+      if (!names.some((n) => hay.includes(n))) continue;
+      const ev: Ev = { at: new Date().toLocaleTimeString(), level, text };
+      setEvents((prev) => ({ ...prev, [block]: [ev, ...(prev[block] ?? [])].slice(0, 3) }));
+    }
+    if (['ERROR', 'WARNING', 'WARN', 'VERDICT', 'INFO', 'OUTBOX', 'CONFIRMED', 'HOLD', 'SYS'].includes(level)) {
+      console.log(`[${new Date().toLocaleTimeString()}] ${topic} ${level}:`, text);
+    }
   };
 
-  /// INS green, UP orange, DEL red — a soft delete arrives as an UPDATE with the
-  /// tombstone set (§7.5), so it shows as DEL: the verb a user cares about is the
-  /// intent, not the SQL. Held until the next event, deliberately not a flash.
-  const markVerb = (table: string, ev: any) => {
-    if (!ev?.operation) return;   // evless notifications (reverts, seeds) carry no verb
-    const state = zb.tableState(table);
-    const tombstoned = state?.tombstoneColumn && ev?.data?.[state.tombstoneColumn] != null;
-    const verb = tombstoned ? 'DEL'
-      : ev.operation === 'INSERT' ? 'INS'
-      : ev.operation === 'DELETE' ? 'DEL'
-      : 'UP';
-    setLastVerb((prev) => ({ ...prev, [table]: verb }));
-    if (logging()[table]) console.log(`[${table}] ${verb}`, ev.data);
-  };
-
-  /// Counts only — a row grid here is what used to make the UI thread the bottleneck.
-  const recount = async () => {
-    setSyncedTableNames(zb.tableNames().sort());
-    setPendingCount(zb.heldCount);
+  // ── reads: the replica IS the API ─────────────────────────────────────────
+  const refresh = async () => {
+    setTables(zb.tableNames().sort());
     setTenant(zb.tenant || '—');
+    setHeldCount(zb.heldCount);
+    try { setOutboxCount((await zb.outboxAll()).length); } catch { /* outbox not ready */ }
 
-    const next: Record<string, number> = {};
-    for (const table of zb.tableNames()) {
+    const next: Record<string, CounterRow> = {};
+    for (const t of ['counter_public', 'counter_tenant'] as const) {
+      if (!has(t)) continue;
       try {
-        const state = zb.tableState(table);
-        // Soft-deleted rows are present locally and must not be counted (§7.5).
-        const liveOnly = state?.tombstoneColumn ? ` WHERE "${state.tombstoneColumn}" IS NULL` : '';
-        const r = await zb.query(`SELECT COUNT(*) as count FROM ${table}${liveOnly}`);
-        next[table] = r[0]?.count ?? 0;
-      } catch { /* table not ready yet */ }
+        const r = await zb.query(`SELECT value, updated_at, last_writer FROM ${t} WHERE uid = ?`, counterUid(t));
+        next[t] = r[0] ? { value: r[0].value, version: String(r[0].updated_at ?? ''), writer: String(r[0].last_writer ?? '') } : null;
+      } catch { /* not ready */ }
     }
-    setCounts(next);
+    setCounters(next);
 
-    const nextCounters: Record<string, number> = {};
-    for (const table of ['counter_public', 'counter_tenant'] as const) {
-      if (!zb.tableNames().includes(table)) continue;
+    if (has('app_users')) {
+      try { setUsers(await zb.query(`SELECT uid, name FROM app_users WHERE deleted_at IS NULL ORDER BY name`)); } catch { /* not ready */ }
+    }
+    if (has('app_orders')) {
       try {
-        // By KEY, never `LIMIT 1` without an ORDER BY: that picked an arbitrary row,
-        // stable on SQLite (rowid order) and shifting on PostgreSQL, where an updated
-        // row moves to a new heap tuple — so the display and the bump below could
-        // address two different rows (measured on PGlite: +1 and -1 landed on two
-        // uids while the shown value never moved).
-        const r = await zb.query(`SELECT value FROM ${table} WHERE uid = ?`, counterUid(table));
-        nextCounters[table] = r[0]?.value ?? 0;
-      } catch { /* table not ready yet */ }
+        const r = await zb.query(`SELECT uid, user_id, item, note, updated_at, last_writer FROM app_orders WHERE deleted_at IS NULL ORDER BY updated_at DESC`);
+        setOrders(r.map((o: any) => ({ uid: o.uid, user_id: o.user_id, item: o.item, note: o.note, version: String(o.updated_at ?? ''), writer: String(o.last_writer ?? '') })));
+      } catch { /* not ready */ }
     }
-    setCounterValues(nextCounters);
-
-    // The SQL console's live mode rides the same trigger: CDC applied → recount →
-    // the last query re-runs against the fresh replica.
     if (sqlLive() && sqlHasRun) void runSql();
   };
 
-  // ── wire the theater to the subscription ──────────────────────────────────
   zb.onStatus((s) => setStatus(s));
   zb.onPhase((p) => setPhase((prev) => ({ ...prev, [p]: true })));
   zb.onSuspended((table, reason) => setSuspended((prev) => {
     const next = { ...prev };
-    if (reason === null) delete next[table];
-    else next[table] = reason;
+    if (reason === null) delete next[table]; else next[table] = reason;
     return next;
   }));
-  zb.onLog(appendLog);
-  zb.onTableEvent((table, ev) => markVerb(table, ev));
-  zb.onAnyChange(() => void recount());
+  zb.onLog(onLog);
+  zb.onAnyChange(() => void refresh());
 
-  // ── demo actions: three verbs, all through mutate() ───────────────────────
-
-  /// Each returns immediately — the count updates when the CDC echo is APPLIED,
-  /// because that is when the row actually exists locally.
-  const insertRandom = async () => {
-    const id = zb.uuid();
-    const version = zb.newVersion();
-    const n = Math.floor(Math.random() * 10_000);
-    await zb.mutate('test_types', 'INSERT', { uid: id }, {
-      uid: id,
-      some_text: `random ${n}`,
-      age: Math.floor(Math.random() * 90),
-      is_true: Math.random() > 0.5,
-      // The awkward columns, as NATIVE values — the same shape libzb's soak sends.
-      // The wire is msgpack, so these travel as an array, a nested array, a map, a
-      // float; the ingress renders each to the TEXT form its column's input function
-      // reads (`{a,b}` for text[], JSON for jsonb) and binds it as a text parameter —
-      // PostgreSQL parses. `price` is numeric(20,8): sent as a string on purpose,
-      // because a JS number cannot carry eight decimals faithfully.
-      // ⚠️ Until 2026-08-29 this button sent scalars only, so the typed ingress path
-      // had never been exercised from a browser.
-      tags: ['web', `push-${n}`, 'with,comma'],
-      matrix: [[n, n * 2], [1, 2]],
-      metadata: { source: 'web-consumer', n, nested: { ok: true } },
-      price: '1234.56789012',
-      temperature: 36.6,
-      tenant_id: zb.tenant || undefined,
-      updated_at: version,
-      inserted_at: version,
-    }, { version });
+  // ── writes: every one through mutate(), then a refresh for the outbox count ──
+  const write = async (table: string, op: 'INSERT' | 'UPDATE' | 'DELETE', key: Record<string, unknown>, values?: Record<string, unknown>) => {
+    await zb.mutate(table, op, key, values);
+    void refresh();
   };
 
-  /// The most recently touched LIVE row — a soft-deleted one is still here (§7.5),
-  /// and updating it would be writing to something the user already deleted.
-  const lastLiveUid = async (): Promise<string | null> => {
-    try {
-      const r = await zb.query(`SELECT uid FROM test_types WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1`);
-      return r[0]?.uid ?? null;
-    } catch {
-      return null;
+  /// INSERT on first click (no row yet), UPDATE after — only the column that changes.
+  const bump = async (table: 'counter_public' | 'counter_tenant', delta: number) => {
+    const uid = counterUid(table);
+    const row = counters()[table];
+    if (row) return write(table, 'UPDATE', { uid }, { value: row.value + delta });
+    const version = zb.newVersion();
+    const data: Record<string, unknown> = { uid, value: delta, inserted_at: version, updated_at: version };
+    if (table === 'counter_tenant') data.tenant_id = zb.tenant;
+    return write(table, 'INSERT', { uid }, data);
+  };
+
+  // the shop form: a user (datalist), the order's text (datalist of existing orders),
+  // a note. Picking an existing order — from the datalist or the list below — binds
+  // the form to that row (`pickedUid`); the text and the note are then editable, and
+  // UPDATE sends only what changed. Typing a text nobody has is a new order.
+  const [userName, setUserName] = createSignal('');
+  const [item, setItem] = createSignal('');
+  const [note, setNote] = createSignal('');
+  const [pickedUid, setPickedUid] = createSignal('');
+  const [formMsg, setFormMsg] = createSignal('');
+  /// Every request ends with an empty form: a datalist filters by what the field
+  /// holds, so a name left behind hides every other suggestion.
+  const clearForm = () => { setUserName(''); setItem(''); setNote(''); setPickedUid(''); };
+  const pickedUser = () => users().find((u) => u.name === userName().trim());
+  const pickedOrder = () => orders().find((o) => o.uid === pickedUid());
+  const pickOrder = (o: OrderRow) => { setPickedUid(o.uid); setItem(o.item); setNote(o.note ?? ''); setUserName(userOf(o)); };
+  const userOf = (o: OrderRow) => users().find((u) => u.uid === o.user_id)?.name ?? o.user_id.slice(0, 8);
+
+  /// CREATE: the user if the name is new, then the order for them.
+  const createOrder = async (): Promise<void> => {
+    setFormMsg('');
+    if (!userName().trim() || !item().trim()) { setFormMsg('a user and an order are needed'); return; }
+    let user = pickedUser();
+    if (!user) {
+      const uid = zb.uuid(); const version = zb.newVersion();
+      await write('app_users', 'INSERT', { uid }, { uid, name: userName().trim(), tenant_id: zb.tenant, inserted_at: version, updated_at: version });
+      user = { uid, name: userName().trim() };
     }
-  };
-
-  const updateLast = async () => {
-    const uid = await lastLiveUid();
-    if (!uid) return appendLog('SYS', 'nothing live to update', 'WARNING');
-    const version = zb.newVersion();
-    await zb.mutate('test_types', 'UPDATE', { uid }, {
-      uid, some_text: `updated ${new Date().toLocaleTimeString()}`, updated_at: version,
-    }, { version });
-  };
-
-  /// A delete from the edge is a SOFT delete (§7.5): it comes back as an UPDATE
-  /// setting the tombstone — which is why markVerb reads the tombstone, not the op.
-  const deleteLast = async () => {
-    const uid = await lastLiveUid();
-    if (!uid) return appendLog('SYS', 'nothing live to delete', 'WARNING');
-    await zb.mutate('test_types', 'DELETE', { uid });
-  };
-
-  // ── salaries: the FK table (user_id → users.id), same three verbs ──────────
-  //
-  // `users` is outbound-only, so the PARENT must exist server-side first (psql
-  // or a backend), and be replicated here — the optimistic apply enforces the FK
-  // locally with `foreign_keys = ON`, and a child with no local parent fails
-  // before it is queued. INS therefore picks a parent from the replica's `users`.
-  // Measured 2026-08-29: with a bogus user_id the local upsert failed
-  // (SQLITE_CONSTRAINT_FOREIGNKEY), the mutation was still sent, PostgreSQL
-  // refused it (23503) and the `rejected` verdict reverted — two guards, one
-  // answer. `salaries` has NO tombstone column, so DEL is a physical delete and
-  // comes back as a real `cdc.salaries.delete`.
-  const lastSalaryUid = async (): Promise<string | null> => {
-    try {
-      const r = await zb.query(`SELECT uid FROM salaries ORDER BY updated_at DESC LIMIT 1`);
-      return r[0]?.uid ?? null;
-    } catch {
-      return null;
-    }
-  };
-
-  const insertSalary = async () => {
-    let parent: number | null = null;
-    try {
-      const r = await zb.query(`SELECT id FROM users ORDER BY id LIMIT 1`);
-      parent = r[0]?.id ?? null;
-    } catch { /* not seeded yet */ }
-    if (parent == null) return appendLog('SYS', 'salaries INS: no user in the replica to reference — insert one in PostgreSQL first (users is outbound-only)', 'WARNING');
-    const uid = zb.uuid();
-    const version = zb.newVersion();
-    await zb.mutate('salaries', 'INSERT', { uid }, {
-      uid, user_id: parent, tenant_id: zb.tenant || undefined,
-      amount: 1000 + Math.floor(Math.random() * 9000),
-      inserted_at: version, updated_at: version,
-    }, { version });
-  };
-
-  const updateSalary = async () => {
-    const uid = await lastSalaryUid();
-    if (!uid) return appendLog('SYS', 'no salary to update', 'WARNING');
-    const version = zb.newVersion();
-    await zb.mutate('salaries', 'UPDATE', { uid }, {
-      uid, amount: 1000 + Math.floor(Math.random() * 9000), updated_at: version,
-    }, { version });
-  };
-
-  const deleteSalary = async () => {
-    const uid = await lastSalaryUid();
-    if (!uid) return appendLog('SYS', 'no salary to delete', 'WARNING');
-    await zb.mutate('salaries', 'DELETE', { uid });
-  };
-
-  /// ONE well-known counter row per table, addressed by key. The old shape read
-  /// `LIMIT 1` and minted a NEW uid whenever the read came back empty — which it does
-  /// on every click before the seed lands — so `counter_public` accumulated 27 rows
-  /// from one writer over three days, and on PostgreSQL the arbitrary `LIMIT 1` row
-  /// then shifted between clicks. A fixed uid for the public counter; for the tenant
-  /// counter one uid per tenant (uid is the PK, so tenants cannot share it).
-  const counterUid = (table: 'counter_public' | 'counter_tenant'): string => {
-    if (table === 'counter_public') return '00000000-0000-4000-8000-00000000c0de';
-    // A stable 48-bit tail from the tenant name (FNV-1a), in uuid shape.
-    let h = 0x811c9dc5;
-    for (const ch of zb.tenant || '_default') h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0;
-    return `00000000-0000-4000-8000-${h.toString(16).padStart(8, '0')}c0df`;
-  };
-
-  /// INSERT on first click (no row yet, needs inserted_at for the NOT NULL), UPDATE
-  /// after — sending only what each verb actually needs. ⚠️ A click before the seed
-  /// has landed still INSERTs a row PostgreSQL already has: that comes back as a
-  /// `rejected` verdict (duplicate key) and reverts — one lost click, not a stray row.
-  const bumpCounter = async (table: 'counter_public' | 'counter_tenant', delta: number) => {
-    const id = counterUid(table);
-    let row: { uid: string; value: number } | null = null;
-    try {
-      const r = await zb.query(`SELECT uid, value FROM ${table} WHERE uid = ?`, id);
-      row = r[0] ? { uid: r[0].uid, value: r[0].value } : null;
-    } catch { /* table not ready yet */ }
-
-    const version = zb.newVersion();
-    const data: Record<string, unknown> = { uid: id, value: (row?.value ?? 0) + delta, updated_at: version };
-    if (table === 'counter_tenant') data.tenant_id = zb.tenant || undefined;
-    if (!row) data.inserted_at = version;
-
-    await zb.mutate(table, row ? 'UPDATE' : 'INSERT', { uid: id }, data, { version });
-  };
-
-  /// `users` is outbound-only (no bridge_writer grant): expect ~4s of bridge retries,
-  /// then `{"status":"failed","reason":"MutationFailed","sqlstate":"42501",...}`.
-  const publishToReadOnlyTable = async () => {
-    const version = zb.newVersion();
-    const id = Math.floor(Date.now() / 1000);
-    await zb.mutate('users', 'INSERT', { id }, {
-      id, name: 'should not land', updated_at: version, inserted_at: version,
-    }, { version });
-  };
-
-  /// A payload with NO key — `MissingPrimaryKey` is permanent, dead-lettered on first
-  /// delivery, verdict `rejected` immediately. Deliberately bypasses mutate() (which
-  /// would refuse to build it): rawMutation is the escape hatch that exists for this.
-  const publishMalformed = async () => {
-    const version = zb.newVersion();
-    const id = zb.uuid();
-    await zb.rawMutation('test_types', 'INSERT', id, version, {
-      data: { uid: id, some_text: 'malformed on purpose', updated_at: version, inserted_at: version },
-      version,
-      client_id: zb.clientId,
+    const uid = zb.uuid(); const version = zb.newVersion();
+    await write('app_orders', 'INSERT', { uid }, {
+      uid, user_id: user.uid, item: item().trim(), note: note().trim() || null, tenant_id: zb.tenant, inserted_at: version, updated_at: version,
     });
+    clearForm();
   };
 
-  // ── SQL console — the replica IS the API ──────────────────────────────────
-  const [sqlText, setSqlText] = createSignal(
-    'SELECT name, email, updated_at FROM users ORDER BY updated_at DESC LIMIT 8',
-  );
+  /// UPDATE: only the columns that changed travel — the rebase needs the sparse form.
+  /// Two text columns, item and note, so two tabs can edit different columns of one row.
+  const updateOrder = async (): Promise<void> => {
+    setFormMsg('');
+    const o = pickedOrder();
+    if (!o) { setFormMsg('pick an existing order to update (from the list, or by its exact text)'); return; }
+    const values: Record<string, unknown> = {};
+    if (item().trim() && item().trim() !== o.item) values.item = item().trim();
+    if (note().trim() !== (o.note ?? '')) values.note = note().trim() || null;
+    if (!Object.keys(values).length) { setFormMsg('nothing changed'); return; }
+    await write('app_orders', 'UPDATE', { uid: o.uid }, values);
+    clearForm();
+  };
+
+  /// DELETE: the picked order; with no order picked, the picked user — refused by
+  /// PostgreSQL while a live order still references them.
+  const deleteOrder = async (): Promise<void> => {
+    setFormMsg('');
+    const o = pickedOrder();
+    if (o) { await write('app_orders', 'DELETE', { uid: o.uid }); clearForm(); return; }
+    const u = pickedUser();
+    if (u) { await write('app_users', 'DELETE', { uid: u.uid }); clearForm(); return; }
+    setFormMsg('pick an existing order, or a user, to delete');
+  };
+
+  // ── SQL console — arbitrary reads against THIS tab's own replica ───────────
+  const [sqlText, setSqlText] = createSignal('SELECT name, updated_at, last_writer FROM app_users ORDER BY updated_at DESC LIMIT 8');
   const [sqlRows, setSqlRows] = createSignal<any[] | null>(null);
   const [sqlError, setSqlError] = createSignal<string | null>(null);
   const [sqlLive, setSqlLive] = createSignal(true);
   const [sqlMs, setSqlMs] = createSignal<number | null>(null);
   let sqlHasRun = false;
-  const sqlIsRead = () => /^\s*(select|with|explain|pragma|values)\b/i.test(sqlText());
   const runSql = async () => {
     const q = sqlText().trim();
     if (!q) return;
@@ -477,244 +374,225 @@ export default function App() {
     const t0 = performance.now();
     try {
       const rows = await zb.query(q);
-      setSqlMs(Math.round(performance.now() - t0));
-      setSqlError(null);
+      setSqlMs(Math.round(performance.now() - t0)); setSqlError(null);
       setSqlRows(Array.isArray(rows) ? rows.slice(0, 200) : []);
     } catch (e: any) {
-      setSqlError(String(e?.message ?? e));
-      setSqlRows(null);
-      setSqlMs(null);
+      setSqlError(String(e?.message ?? e)); setSqlRows(null); setSqlMs(null);
     }
+  };
+
+  // ── the socket, as a button ───────────────────────────────────────────────
+  //
+  // close() hangs up; writes made meanwhile apply locally and wait in the outbox;
+  // connect() catches up on CDC and flushes them. The outbox count in the header is
+  // the number to watch.
+  const toggleSocket = async () => {
+    if (status() === 'connected') { await zb.close(); setStatus('disconnected'); void refresh(); }
+    else if (status() === 'disconnected') void zb.connect().catch(() => { /* logged by the class */ });
+  };
+  const switchAccount = (principal: string) => {
+    const a = ACCOUNTS.find((x) => x.principal === principal);
+    // The picker means operator/JWT auth: each account IS a creds file. This beats
+    // a dev server started with VITE_AUTH=password.
+    location.search = `?principal=${principal}&engine=${a?.engine ?? 'sqlite'}&auth=creds`;
   };
 
   // ── boot ──────────────────────────────────────────────────────────────────
   void zb.connect().catch(() => { /* logged by the class; badge shows disconnected */ });
-  void recount();
-
-  /// Fetched through the Vite proxy (`/bridge/*`) — under COEP a cross-origin
-  /// response needs CORS + CORP headers the bridge does not (and should not) send.
+  void refresh();
   let healthWarned = false;
   const pollHealth = async () => {
     try {
       const r = await fetch('/bridge/health', { signal: AbortSignal.timeout(3000) });
-      setHealth(r.ok ? 'up' : 'down');
-      healthWarned = false;
+      setHealth(r.ok ? 'up' : 'down'); healthWarned = false;
     } catch (err: any) {
       setHealth('down');
-      if (!healthWarned) {
-        healthWarned = true;
-        appendLog('SYS', `bridge /health unreachable: ${err?.message ?? err}`, 'WARNING');
-      }
+      if (!healthWarned) { healthWarned = true; onLog('SYS', `bridge /health unreachable: ${err?.message ?? err}`, 'WARNING'); }
     }
   };
   void pollHealth();
   const healthId = setInterval(pollHealth, 10_000);
+  onCleanup(() => { clearInterval(healthId); void zb.close(); });
 
-  onCleanup(() => {
-    clearInterval(healthId);
-    void zb.close();
-  });
+  const Events = (props: { block: string }) => (
+    <ul class="events">
+      <For each={events()[props.block] ?? []}>
+        {(e) => <li class={`event level-${e.level.toLowerCase().replace(' ', '-')}`}><span class="at">{e.at}</span> {e.text}</li>}
+      </For>
+    </ul>
+  );
+  const shortVersion = (v: string) => v.replace(/^\d{4}-\d{2}-\d{2}T/, '').replace(/Z$/, '');
 
   return (
     <>
       <header>
-        <h1>ZeBridge CDC Web Consumer</h1>
-        <div class="status-bar">
-          <span class={`badge ${status()}`}>{status().toUpperCase()}</span>
-          <span id="server-url">{NATS_URL}</span>
-          <span class={`badge ${health() === 'up' ? 'connected' : 'disconnected'}`}>
-            bridge {health()}
-          </span>
+        <div class="row">
+          <h1>ZeBridge web consumer</h1>
+          <div class="status-bar">
+            <label class="account">
+              <span>account</span>
+              <select value={PRINCIPAL} onChange={(e) => switchAccount(e.currentTarget.value)}>
+                <For each={ACCOUNTS}>{(a) => <option value={a.principal} selected={a.principal === PRINCIPAL}>{a.principal} | {a.tenant} · {a.engine}</option>}</For>
+              </select>
+            </label>
+            <button class={`badge ${status()}`} onClick={() => void toggleSocket()} title="connect / disconnect the socket">
+              NATS {status()}{status() === 'connected' ? ' — hang up' : status() === 'disconnected' ? ' — connect' : ''}
+            </button>
+            <span class={`badge ${health() === 'up' ? 'connected' : 'disconnected'}`}>bridge {health()}</span>
+          </div>
         </div>
-
         {/* The startup state machine. Each cell greens once and stays green — the
             useful signal is how FAR it got. */}
         <ul class="phases">
-          <For each={[
-            ['connected', 'NATS connected'],
-            ['migrated', 'schema migrated'],
-            ['snapshot', 'snapshot replayed'],
-            ['cdc', 'CDC active'],
-          ]}>
-            {([key, label]) => (
-              <li classList={{ done: phase()[key] }}>{label}</li>
-            )}
+          <li class="head">phases</li>
+          <For each={[['connected', 'NATS connected'], ['migrated', 'schema migrated'], ['snapshot', 'snapshot replayed'], ['cdc', 'CDC active']]}>
+            {([key, label]) => <li classList={{ done: phase()[key] }}>{label}</li>}
           </For>
         </ul>
+        <p class="identity">
+          principal <strong>{EFFECTIVE_PRINCIPAL}</strong> · tenant <strong>{tenant()}</strong> · client <strong>{zb.clientId}</strong>
+          {' '}· engine <strong>{ENGINE}</strong> · outbox <strong>{outboxCount()}</strong> pending · held <strong>{heldCount()}</strong>
+        </p>
       </header>
 
       <For each={Object.entries(suspended())}>
         {([table, reason]) => (
           <div class="suspended-banner">
-            ⏸ <strong>{table}</strong> is suspended upstream ({reason}). Local rows are frozen and
-            still valid, but no new events or snapshots will arrive, and writes are refused
-            client-side, until the shape is fixed.
+            ⏸ <strong>{table}</strong> is suspended upstream ({reason}). Local rows are frozen and still valid,
+            but no new events or snapshots will arrive, and writes are refused client-side, until the shape is fixed.
           </div>
         )}
       </For>
 
       <main>
-        <h3>Replica</h3>
-        <p id="sync-state">
-          principal <strong>{EFFECTIVE_PRINCIPAL}</strong> · client <strong>{zb.clientId}</strong>
-          {' '}· tenant <strong>{tenant()}</strong>
-          {' '}· held {pendingCount()}
-        </p>
-        <table class="tables-summary">
-          <thead>
-            <tr><th>table</th><th>rows</th><th>last CDC</th><th>log</th><th>actions</th></tr>
-          </thead>
-          <tbody>
-            <For each={syncedTableNames()}>
-              {(t) => (
-                <tr>
-                  <td><strong>{t}</strong></td>
-                  <td class="count">{counts()[t] ?? 0}</td>
-                  <td>
-                    <span class={`verb ${lastVerb()[t] ? 'verb-' + lastVerb()[t] : ''}`}>
-                      {lastVerb()[t] || ''}
-                    </span>
-                  </td>
-                  <td>
-                    <input
-                      type="checkbox"
-                      checked={!!logging()[t]}
-                      onChange={(e) =>
-                        setLogging((prev) => ({ ...prev, [t]: e.currentTarget.checked }))
-                      }
-                    />
-                  </td>
-                  <td>
-                    {t === 'test_types' ? (
-                      <span class="row-actions">
-                        <button onClick={() => void insertRandom()}>INS</button>
-                        <button onClick={() => void updateLast()}>UP</button>
-                        <button onClick={() => void deleteLast()}>DEL</button>
-                      </span>
-                    ) : t === 'salaries' ? (
-                      <span class="row-actions">
-                        <button onClick={() => void insertSalary()}>INS</button>
-                        <button onClick={() => void updateSalary()}>UP</button>
-                        <button onClick={() => void deleteSalary()}>DEL</button>
-                      </span>
-                    ) : (
-                      <em class="readonly">read-only</em>
-                    )}
-                  </td>
-                </tr>
-              )}
-            </For>
-          </tbody>
-        </table>
-
-        <div class="controls">
-          <button onClick={() => void recount()} style="background: #37474f;">Recount</button>
-        </div>
-
-        {/* SQL console — arbitrary SQL against THIS tab's own replica. Worst case you
-            wreck your copy; a reload rebuilds it from the generation chain. */}
-        <div class="controls" style="flex-direction: column; align-items: stretch; gap: 6px;">
-          <span>SQL console — your local replica, this tab only:</span>
-          <textarea
-            rows={3}
-            style="width: 100%; font-family: monospace; font-size: 12px; background: #263238; color: #eceff1; border: 1px solid #455a64; border-radius: 4px; padding: 6px; box-sizing: border-box;"
-            value={sqlText()}
-            onInput={(e) => setSqlText(e.currentTarget.value)}
-            onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); void runSql(); } }}
-          />
-          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-            <button onClick={() => void runSql()} style="background: #37474f;">Run (⌘⏎)</button>
-            <label style="display: flex; gap: 4px; align-items: center; font-size: 12px; cursor: pointer;">
-              <input type="checkbox" checked={sqlLive()} onInput={(e) => setSqlLive(e.currentTarget.checked)} />
-              live — re-run when CDC touches the replica
-            </label>
-            {sqlMs() != null && (
-              <span style="font-size: 12px; opacity: 0.7;">
-                {sqlRows()?.length ?? 0} row(s) · {sqlMs()}ms{(sqlRows()?.length ?? 0) === 200 ? ' · capped at 200' : ''}
-              </span>
-            )}
+        {/* ── counters ── */}
+        <section>
+          <h2>Two counters</h2>
+          <div class="cards">
+            <div class="card">
+              <h3>counter_public</h3>
+              <p class="claim">
+                One row, one column, shared by every tenant. Two tabs pressing + at once: the later stamp wins
+                and the other click is lost — this is last-writer-wins on a contested column, not a CRDT counter.
+              </p>
+              <Show when={has('counter_public')} fallback={<p class="muted">not replicated here</p>}>
+                <div class="counter">
+                  <button onClick={() => void bump('counter_public', -1)}>−</button>
+                  <strong class="value">{counters().counter_public?.value ?? 0}</strong>
+                  <button onClick={() => void bump('counter_public', +1)}>+</button>
+                </div>
+                <p class="meta">version {shortVersion(counters().counter_public?.version ?? '—')} · last writer {counters().counter_public?.writer || '—'}</p>
+              </Show>
+              <Events block="counter_public" />
+            </div>
+            <div class="card">
+              <h3>counter_tenant</h3>
+              <p class="claim">
+                The same widget, but this row travels on your tenant's stream and is filtered by row-level security.
+                Open a tab as another tenant: it never moves there. As <code>guest</code> it does not exist at all.
+              </p>
+              <Show when={has('counter_tenant')} fallback={<p class="muted">not replicated here — no tenant mapping for this principal</p>}>
+                <div class="counter">
+                  <button onClick={() => void bump('counter_tenant', -1)}>−</button>
+                  <strong class="value">{counters().counter_tenant?.value ?? 0}</strong>
+                  <button onClick={() => void bump('counter_tenant', +1)}>+</button>
+                </div>
+                <p class="meta">version {shortVersion(counters().counter_tenant?.version ?? '—')} · last writer {counters().counter_tenant?.writer || '—'}</p>
+              </Show>
+              <Events block="counter_tenant" />
+            </div>
           </div>
-          {!sqlIsRead() && (
-            <div style="font-size: 12px; color: #ffb74d;">
-              ⚠ not a read: this executes locally only — the feed owns these tables, so this
-              edit lasts exactly until the row next changes upstream. Real writes go through
-              the outbox, never SQL.
+        </section>
+
+        {/* ── users ⟶ orders ── */}
+        <section>
+          <h2>Users ⟶ orders</h2>
+          <p class="claim">
+            <code>app_orders.user_id</code> references <code>app_users.uid</code>. Delete a user who still has orders and
+            PostgreSQL refuses it, the verdict comes back <code>rejected</code>, the local copy is restored. Delete an order
+            and it vanishes on every replica: a tombstone, later reaped. Edit the order's text in one tab and its note in another:
+            both land, the later one rebased onto the earlier. Edit the same column in both: the later stamp wins.
+          </p>
+          <Show when={has('app_users') && has('app_orders')} fallback={<p class="muted">not replicated here — no tenant mapping for this principal</p>}>
+            <div class="form">
+              {/* The datalist ids change with the row count on purpose: Chrome does not
+                  re-read a datalist whose options changed under a focused input until the
+                  input is re-attached to it — a new `list` attribute does exactly that. */}
+              <label>user
+                <input list={`users-list-${users().length}`} value={userName()} onInput={(e) => setUserName(e.currentTarget.value)} placeholder="existing, or a new name" />
+                <datalist id={`users-list-${users().length}`}><For each={users()}>{(u) => <option value={u.name} />}</For></datalist>
+              </label>
+              <label>order{pickedOrder() ? ' (editing an existing one)' : ''}
+                <input list={`orders-list-${orders().length}`} value={item()} onInput={(e) => {
+                  setItem(e.currentTarget.value);
+                  // an exact match with an existing order's text picks that order
+                  const o = orders().find((x) => x.item === e.currentTarget.value.trim());
+                  if (o && o.uid !== pickedUid()) pickOrder(o);
+                }} placeholder="what was ordered — pick an existing one, or type a new one" />
+                <datalist id={`orders-list-${orders().length}`}><For each={orders()}>{(o) => <option value={o.item}>{userOf(o)} · {o.note ?? ''}</option>}</For></datalist>
+              </label>
+              <label>note <input value={note()} onInput={(e) => setNote(e.currentTarget.value)} placeholder="free text" /></label>
+              <div class="buttons">
+                <button class="create" onClick={() => void createOrder()}>CREATE</button>
+                <button class="update" onClick={() => void updateOrder()}>UPDATE</button>
+                <button class="delete" onClick={() => void deleteOrder()}>DELETE</button>
+                <span class="form-msg">{formMsg()}</span>
+              </div>
             </div>
-          )}
-          {sqlError() && (
-            <div style="font-size: 12px; color: #ef5350; font-family: monospace;">{sqlError()}</div>
-          )}
-          {sqlRows() && sqlRows()!.length > 0 && (
-            <div style="overflow-x: auto;">
-              <table class="tables-summary" style="font-size: 12px;">
-                <thead>
-                  <tr><For each={Object.keys(sqlRows()![0])}>{(c) => <th>{c}</th>}</For></tr>
-                </thead>
-                <tbody>
-                  <For each={sqlRows()!}>{(r) => (
-                    <tr>
-                      <For each={Object.keys(sqlRows()![0])}>{(c) => (
-                        <td>{r[c] === null ? 'NULL' : String(r[c])}</td>
-                      )}</For>
-                    </tr>
-                  )}</For>
-                </tbody>
-              </table>
+            <p class="meta">
+              users <strong>{users().length}</strong> · orders <strong>{orders().length}</strong>
+              <Show when={pickedOrder()}>{(o) => <> · picked: {o().item} by {userOf(o())}, version {shortVersion(o().version)}, last writer {o().writer || '—'}</>}</Show>
+            </p>
+            {/* The rows themselves — what the replica holds, live, no popup needed. */}
+            <div class="rows">
+              <ul class="rowlist">
+                <For each={users()}>{(u) => <li onClick={() => { clearForm(); setUserName(u.name); }}>{u.name}</li>}</For>
+              </ul>
+              <ul class="rowlist">
+                <For each={orders()}>{(o) => (
+                  <li classList={{ picked: o.uid === pickedUid() }} onClick={() => pickOrder(o)}>
+                    <strong>{o.item}</strong> · {userOf(o)}{o.note ? ` · ${o.note}` : ''} <span class="muted">{o.writer || ''}</span>
+                  </li>
+                )}</For>
+              </ul>
             </div>
-          )}
-          {sqlRows() && sqlRows()!.length === 0 && !sqlError() && (
-            <div style="font-size: 12px; opacity: 0.7;">0 rows</div>
-          )}
-        </div>
+          </Show>
+          <Events block="shop" />
+        </section>
 
-        {/* Enrollment: the pump-starter as a BUTTON. Paste the one-time code the
-            operator handed you; the click generates this tab's own nkey pair,
-            sends code + public key to the bridge's mint, and reloads connected
-            as whoever the returned JWT says you are. */}
-        <div class="controls">
-          <span>enroll:</span>
-          <input
-            id="invite-input"
-            value={inviteCode()}
-            onInput={(e) => setInviteCode(e.currentTarget.value)}
-            placeholder="one-time invite code"
-            style="width: 22rem; font-family: monospace;"
-          />
-          <button
-            onClick={() => void enroll(inviteCode()).then((err) => setEnrollMsg(err ?? ''))}
-            style="background: #6a1b9a;"
-          >Enroll → get JWT</button>
-          <span style="color: #ef6c00;">{enrollMsg()}</span>
-        </div>
-
-        {/* One row per demo: the three test_types buttons are a set (accepted /
-            refused-by-grant / refused-by-shape), the counters are the offline-first
-            walkthrough fixture — one public, one tenant-scoped. */}
-        <div class="controls">
-          <span>test_types:</span>
-          <button onClick={() => void insertRandom()} style="background: #2e7d32;">Push — accepted</button>
-          <button onClick={() => void updateLast()} style="background: #1565c0;">Update last row</button>
-          <button onClick={() => void deleteLast()} style="background: #ef6c00;">Delete last row</button>
-        </div>
-
-        <div class="controls">
-          <span>counter (public):</span>
-          <button onClick={() => void bumpCounter('counter_public', -1)} style="background: #ef6c00;">-</button>
-          <strong>{counterValues()['counter_public'] ?? 0}</strong>
-          <button onClick={() => void bumpCounter('counter_public', 1)} style="background: #2e7d32;">+</button>
-        </div>
-
-        <div class="controls">
-          <span>counter (tenant):</span>
-          <button onClick={() => void bumpCounter('counter_tenant', -1)} style="background: #ef6c00;">-</button>
-          <strong>{counterValues()['counter_tenant'] ?? 0}</strong>
-          <button onClick={() => void bumpCounter('counter_tenant', 1)} style="background: #2e7d32;">+</button>
-        </div>
-
-        <div class="controls">
-          <button onClick={() => void publishToReadOnlyTable()} style="background: #6a1b9a;">Push to users — refused</button>
-          <button onClick={() => void publishMalformed()} style="background: #b71c1c;">Push malformed — verdict now</button>
-        </div>
+        {/* ── SQL console ── */}
+        <section>
+          <h2>SQL console</h2>
+          <p class="claim">
+            Your local replica, this tab only. Reads are free: any SQL, joins, aggregates, offline. Writes are not SQL —
+            they go through <code>mutate()</code>, and <code>query()</code> refuses anything that is not a read.
+          </p>
+          <div class="sql">
+            <textarea rows={3} value={sqlText()} onInput={(e) => setSqlText(e.currentTarget.value)}
+              onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); void runSql(); } }} />
+            <div class="buttons">
+              <button onClick={() => void runSql()}>Run (⌘⏎)</button>
+              <label class="inline"><input type="checkbox" checked={sqlLive()} onInput={(e) => setSqlLive(e.currentTarget.checked)} /> live — re-run when CDC touches the replica</label>
+              <Show when={sqlMs() != null}>
+                <span class="muted">{sqlRows()?.length ?? 0} row(s) · {sqlMs()}ms{(sqlRows()?.length ?? 0) === 200 ? ' · capped at 200' : ''}</span>
+              </Show>
+            </div>
+            <Show when={sqlError()}><div class="sql-error">{sqlError()}</div></Show>
+            <Show when={sqlRows() && sqlRows()!.length > 0}>
+              <div class="scroll">
+                <table class="grid">
+                  <thead><tr><For each={Object.keys(sqlRows()![0])}>{(c) => <th>{c}</th>}</For></tr></thead>
+                  <tbody>
+                    <For each={sqlRows()!}>{(r) => (
+                      <tr><For each={Object.keys(sqlRows()![0])}>{(c) => <td>{r[c] === null ? 'NULL' : String(r[c])}</td>}</For></tr>
+                    )}</For>
+                  </tbody>
+                </table>
+              </div>
+            </Show>
+            <Show when={sqlRows() && sqlRows()!.length === 0 && !sqlError()}><div class="muted">0 rows</div></Show>
+          </div>
+        </section>
       </main>
     </>
   );

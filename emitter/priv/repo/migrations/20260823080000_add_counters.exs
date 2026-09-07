@@ -37,6 +37,8 @@ defmodule Emitter.PgProducer.Repo.AddCounters do
                 -- table is silently left unpublished — `PERFORM * FROM` discards the row,
                 -- so `mix ecto.migrate` reports success. Measured on a fresh database.
                 allow_physical_deletes => true,
+                -- Who won the last click: the web consumer shows it next to the value.
+                tiebreak_col => 'last_writer',
                 public_reason => 'demo counter — identical content for every tenant',
                 publication => '#{zb_publication()}',
                 dry_run => false
@@ -47,6 +49,7 @@ defmodule Emitter.PgProducer.Repo.AddCounters do
                 writable => true,
                 version_col => 'updated_at',
                 allow_physical_deletes => true,   -- same as its public sibling above
+                tiebreak_col => 'last_writer',
                 publication => '#{zb_publication()}',
                 dry_run => false
             );

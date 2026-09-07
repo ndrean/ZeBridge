@@ -103,6 +103,9 @@ for spec in alice:acme bob:globex mary:globex nina:tango omar:kilo; do
   u="${spec%%:*}"; t="${spec##*:}"
   nsc add user --account ZEBRIDGE --name "$u" -K "$SK_CLIENT" --tag "tenant:$t" 2>/dev/null || echo "$u exists"
 done
+# guest: a principal with NO tenant mapping — follows public tables only (§10dl).
+# The web consumer's account picker shows what "no mapping" looks like.
+nsc add user --account ZEBRIDGE --name guest -K "$SK_CLIENT" 2>/dev/null || echo "guest exists"
 
 # ── the auditor: zbdoctor's own principal, read-only by construction ────────
 #
@@ -132,7 +135,7 @@ nsc add user --account ZEBRIDGE --name zbdoctor \
     --allow-pub "\$JS.API.DIRECT.GET.>" \
     --allow-sub "_INBOX.>" 2>/dev/null || echo "zbdoctor exists"
 
-for u in bridge alice bob mary nina omar zbdoctor; do
+for u in bridge alice bob mary nina omar guest zbdoctor; do
   nsc generate creds --account ZEBRIDGE --name "$u" > "$CREDS/$u.creds"
 done
 chmod 600 "$CREDS"/*.creds
