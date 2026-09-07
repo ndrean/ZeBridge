@@ -1524,8 +1524,8 @@ pub const SyncClient = struct {
     }
 
     /// `mutate` with the caller's own stamp (the TypeScript client's `opts.version`):
-    /// a host that keeps its own clock, or a test modelling a slow one. The HLC is
-    /// still advanced past it, so the next unstamped write follows it.
+    /// a host that keeps its own clock, or a test modelling a slow one. The HLC only
+    /// advances: a stamp above it is followed, one below it is sent and forgotten.
     pub fn mutateAt(self: *SyncClient, result_a: std.mem.Allocator, table: []const u8, op: []const u8, key: Value, values: ?Value, stamp: ?[]const u8) ![]const u8 {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
@@ -1535,8 +1535,12 @@ pub const SyncClient = struct {
 
         const version = stamp orelse try core.hlcVersion(a, try nowWireIso(a), self.last_version, self.seen_floor);
         if (version.len > self.last_version_buf.len) return error.VersionTooLong;
-        @memcpy(self.last_version_buf[0..version.len], version);
-        self.last_version = self.last_version_buf[0..version.len];
+        // The clock only moves forward: a caller's stamp from the past is sent as
+        // given but never becomes what the next unstamped write follows.
+        if (stamp == null or std.mem.order(u8, version, self.last_version) == .gt) {
+            @memcpy(self.last_version_buf[0..version.len], version);
+            self.last_version = self.last_version_buf[0..version.len];
+        }
 
         var args: std.json.ObjectMap = .empty;
         try args.put(a, "principal", .{ .string = self.opts.principal });

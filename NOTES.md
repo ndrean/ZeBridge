@@ -10087,6 +10087,80 @@ resent stamp above the winner). PostgreSQL and both replicas equal at each step,
 both outboxes empty. The README paragraph now says what the policy does instead of
 what it cannot: an edit loses only on a column both sides changed.
 
+## 10dp. A write with no socket is a queued write, not a refused one (2026-09-07)
+
+Found while designing the web consumer's connect/hang-up button: the TypeScript
+client's write path began with `if (!this.nc) return;` — before the outbox row, before
+the optimistic apply. An application that called `close()` (a battery saver, an
+explicit offline mode) lost every edit made afterwards, silently, while the same edit
+made during a transport hiccup queued fine because the connection object survives a
+reconnect. libzb never had the hole: `mutate()` queues and the host's flush sends.
+Now the row is written and applied, the publish is skipped with an OUTBOX log line,
+and `connect()`'s existing outbox flush sends it. The page's NATS badge is that button.
+
+## 10dq. The grammar is compiled into the clients too (2026-09-07)
+
+§10ci established that the grammar is a protocol constant and that a rename is a fork
+whose cost is a rebuild, then stopped one step short: "clients receive it, never copy
+it". But a library built from the same source is not copying anything at runtime, and
+what §10ci actually retired was the runtime file reader — which libzb still had
+(`grammarPath`, read at open), the very mixed model the topology drift scar came from.
+The web page paid for it first: `grammar: null`, a fetch nobody had written, and a
+client that could not open with the bridge down although NATS held everything it
+needed.
+
+So both clients now embed `src/grammar.json`: libzb by an anonymous import in its
+build and `@embedFile`, zb-client-ts as a packaged copy that `core.test.ts` pins
+byte-for-byte against the source (a file outside the package root cannot ship). The
+served copy became a check instead of a source: the host passes the hash it received
+— `/enroll`'s `grammar_hash` beside the JWT, or `GET /grammar`'s `X-Grammar-Hash` —
+as `grammarHash`, and a mismatch refuses to open before any socket carries the wrong
+names (libzb `error.GrammarMismatch`, before the transport connects; the TS client
+throws from `connect()`). Unset skips the check: a bridge that cannot be reached is not
+a fork. `zb_grammar_hash()` and `grammarHashHex()` say what each library embeds; the
+three hashes agree (`a864504e…`). `grammarPath` and `grammarJson` are gone from the
+C card, and twenty-six Python hosts stopped passing a path they never needed.
+`grammar_served.py` (live) now proves the hash equality, a client opening on the
+served hash alone, and the refusal of a foreign hash, 4/4.
+
+## 10dr. The tenant before the schema watch (2026-09-07)
+
+The web page's first run as `alice` showed `counter_tenant` "not replicated here" with
+the log line "'alice' has no tenant (no tenants.alice entry) — skipping", while the
+mapping sat in `zebridge_user_tenants` and in `$KV.tenants.alice`. The first suspect
+was the account switch; it was not (a switch is a full reload into a fresh database).
+The Node client with the same creds reproduced it on a different table, `note_t`, in
+the same run that created `counter_tenant` fine — by arrival order. `connect()` opened
+the schema watch BEFORE resolving the tenant, and the watch replays every descriptor
+at once: a tenant-scoped table whose descriptor arrived before `$KV.tenants` was read
+was refused as "no tenant" and never revisited. Which tables lost depended on the
+replay order, so it read as flaky. The tenant is now resolved first; the watch opens
+after. libzb had the order right (step 0, then the schemas).
+
+Also seen in that run: `error(nats): JetStream error … 10058 stream name already in
+use with a different configuration` at boot. Benign and misleading: the fleet monitor
+CREATED the `live` bucket first and fell back to opening it, and the library logs the
+refused create at error level. A bucket that exists keeps its TTL by design; the
+monitor now opens first and creates only on `BucketNotFound`.
+
+## 10ds. The optimistic event carries the key (2026-09-07)
+
+The page's first +1 as alice on PGlite: verdict `accepted`, echo applied, value
+right — and one line before them, `UPSERT on counter_public failed: null value in
+column "uid"`. The wire payload is sparse by design (`data` is only the columns the
+edit sets, §7.2) and the optimistic event reused it as-is, so an UPDATE that did not
+repeat its key in `values` could not find its row locally and fell into the upsert's
+INSERT arm, which failed NOT NULL on the key. Every earlier caller had repeated the
+key inside `values` — the old page, the scenarios' INSERTs — which is why the fixture
+"UPDATE: full envelope" pinned the key-less shape and nobody met it. The rebase
+scenario had met it in both clients and not noticed: its assertions read the row
+after the echo, and the echo always repairs the copy.
+
+Fixed in the core, both ports, one fixture: the optimistic `data` is the key merged
+with the wire data (DELETE already carried the key). The wire is unchanged. The
+lesson for the fixtures is the one §10cp left: the local apply must be asserted
+BEFORE the echo, or the echo hides everything.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

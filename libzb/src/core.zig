@@ -605,10 +605,26 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
         try payload.put(a, "data", data);
     }
 
+    // §10ds: the local apply addresses the row by its KEY, so the optimistic data is
+    // the key merged with the (sparse) wire data — the wire payload stays sparse.
+    var opt_data: Value = key;
+    if (!is_delete) {
+        var merged: std.json.ObjectMap = .empty;
+        if (key == .object) {
+            var it = key.object.iterator();
+            while (it.next()) |e| try merged.put(a, e.key_ptr.*, e.value_ptr.*);
+        }
+        const d = payload.get("data").?;
+        if (d == .object) {
+            var it = d.object.iterator();
+            while (it.next()) |e| try merged.put(a, e.key_ptr.*, e.value_ptr.*);
+        }
+        opt_data = .{ .object = merged };
+    }
     var optimistic: std.json.ObjectMap = .empty;
     try optimistic.put(a, "table", .{ .string = table });
     try optimistic.put(a, "operation", .{ .string = op });
-    try optimistic.put(a, "data", if (is_delete) key else payload.get("data").?);
+    try optimistic.put(a, "data", opt_data);
     try optimistic.put(a, "lsn", .{ .integer = 9007199254740991 });
     try optimistic.put(a, "optimistic", .{ .bool = true });
 

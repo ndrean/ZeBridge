@@ -1556,6 +1556,7 @@
           "table": "test_types",
           "operation": "UPDATE",
           "data": {
+            "uid": "u-1",
             "note": "hi"
           },
           "lsn": 9007199254740991,
@@ -1634,7 +1635,9 @@
         "optimistic": {
           "table": "t",
           "operation": "INSERT",
-          "data": {},
+          "data": {
+            "id": 5
+          },
           "lsn": 9007199254740991,
           "optimistic": true
         }

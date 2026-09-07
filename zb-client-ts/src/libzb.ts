@@ -443,9 +443,13 @@ export class ZeBridge {
       this.reach('connected');
       this.appendLog('SYS', `Connected to NATS as '${this.config.principal}'`);
       await this.loadHeldEvents();
+      // The tenant FIRST (§10dr): the schema watch replays every descriptor at once,
+      // and a tenant-scoped table that arrives before the tenant is known is skipped
+      // as "no tenant" — and never created. Measured: counter_tenant missing for
+      // alice on the web page, note_t for the same creds in Node, by arrival order.
+      await this.resolveTenant();
       await this.watchSchemas();
       await this.watchVerdicts();
-      await this.resolveTenant();
       // §10dm: a ban published while this client was away is retained — one direct get.
       await this.collectMissedVerdicts([{ msg_id: 'revoked' }]);
       if (this.revoked) throw new Error(`'${this.config.principal}' is revoked`);
@@ -2427,7 +2431,9 @@ export class ZeBridge {
   /// escape hatch for demos that deliberately send broken payloads (no key, wrong
   /// grants) — mutate() is the blessed path and builds the payload correctly.
   public async rawMutation(table: string, op: string, id: string | number, version: string, payload: Record<string, unknown>) {
-    if (!this.nc) return;
+    // No socket is not a refusal: the write applies locally and waits in the outbox,
+    // and connect() flushes it (§10dp). Only a table without a shape cannot be written.
+    if (!this.syncedTables.has(table)) return;
 
     // A suspended table has no CDC path: an optimistic write here would never get a
     // confirming or correcting echo — permanently. Refused client-side.
@@ -2491,6 +2497,13 @@ export class ZeBridge {
           `The local copy has been reverted — this edit is lost.`,
         'ERROR',
       );
+      return;
+    }
+
+    // Closed on purpose (close(), a battery saver, an offline toggle): the row is
+    // queued and optimistic, and goes out with the outbox flush on the next connect().
+    if (!this.nc) {
+      this.appendLog(subject, `${table}[${id}] queued — no connection; sent on the next connect()`, 'OUTBOX');
       return;
     }
 

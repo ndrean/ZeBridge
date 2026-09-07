@@ -675,11 +675,19 @@ export function mutationPayload(
 /// applyEvent path as CDC: DELETE carries its key as data, lsn is pinned at
 /// MAX_SAFE_INTEGER (an optimistic row must never lose to any gate), and the
 /// `optimistic` flag keeps it out of position accounting and echo-confirm.
+///
+/// INSERT and UPDATE carry the KEY merged into the data (§10ds). The wire payload
+/// stays sparse — `data` is only the columns the edit sets — but the local apply
+/// addresses a row by its key like every CDC event does: without it an UPDATE that
+/// did not repeat the key could not find its row and fell into the upsert's INSERT
+/// arm, which failed NOT NULL on the key. The verdict and the echo were right, the
+/// optimistic copy was not.
 export function optimisticEvent(table: string, op: string, payload: Record<string, unknown>): Record<string, unknown> {
+  const key = (payload as any).key as Record<string, unknown>;
   return {
     table,
     operation: op,
-    data: op === 'DELETE' ? (payload as any).key : (payload as any).data,
+    data: op === 'DELETE' ? key : { ...key, ...((payload as any).data ?? {}) },
     lsn: Number.MAX_SAFE_INTEGER,
     optimistic: true,
   };

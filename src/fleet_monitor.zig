@@ -249,14 +249,21 @@ pub const FleetMonitor = struct {
         return h;
     }
 
-    /// Create the bucket with the configured TTL if it is missing; bind to it otherwise.
+    /// Bind to the bucket; create it with the configured TTL only when it is missing.
     /// A bucket that already exists keeps ITS TTL — the setting is applied at creation.
+    /// Open FIRST: creating over an existing bucket is refused by the server (10058,
+    /// "already in use with a different configuration") and the library logs that
+    /// refusal at error level, so create-then-open printed a misleading boot error
+    /// on every start (§10dr).
     fn openLive(self: *FleetMonitor, js: nats.JetStream) !nats.KV {
         const km = js.kvManager();
-        return km.createBucket(.{
-            .bucket = self.topo.kv_live,
-            .history = 1,
-            .ttl = .fromNanoseconds(@intCast(self.ttl_seconds * std.time.ns_per_s)),
-        }) catch km.openBucket(self.topo.kv_live);
+        return km.openBucket(self.topo.kv_live) catch |err| switch (err) {
+            error.BucketNotFound => km.createBucket(.{
+                .bucket = self.topo.kv_live,
+                .history = 1,
+                .ttl = .fromNanoseconds(@intCast(self.ttl_seconds * std.time.ns_per_s)),
+            }),
+            else => err,
+        };
     }
 };
