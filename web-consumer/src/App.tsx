@@ -249,15 +249,19 @@ export default function App() {
   };
 
   // ── reads: the replica IS the API ─────────────────────────────────────────
-  const refresh = async () => {
+  /// `changed` names the tables that moved since the last refresh; empty means "all"
+  /// (boot, a schema event, a status change).
+  const refresh = async (changed: string[] = []) => {
+    const all = changed.length === 0;
+    const touched = (t: string) => all || changed.includes(t);
     setTables(zb.tableNames().sort());
     setTenant(zb.tenant || '—');
     setHeldCount(zb.heldCount);
     try { setOutboxCount((await zb.outboxAll()).length); } catch { /* outbox not ready */ }
 
-    const next: Record<string, CounterRow> = {};
+    const next: Record<string, CounterRow> = { ...counters() };
     for (const t of ['counter_public', 'counter_tenant'] as const) {
-      if (!has(t)) continue;
+      if (!has(t) || !touched(t)) continue;
       try {
         const r = await zb.query(`SELECT value, updated_at, last_writer FROM ${t} WHERE uid = ?`, counterUid(t));
         next[t] = r[0] ? { value: r[0].value, version: String(r[0].updated_at ?? ''), writer: String(r[0].last_writer ?? '') } : null;
@@ -265,10 +269,10 @@ export default function App() {
     }
     setCounters(next);
 
-    if (has('app_users')) {
+    if (has('app_users') && touched('app_users')) {
       try { setUsers(await zb.query(`SELECT uid, name FROM app_users WHERE deleted_at IS NULL ORDER BY name`)); } catch { /* not ready */ }
     }
-    if (has('app_orders')) {
+    if (has('app_orders') && (touched('app_orders') || touched('app_users'))) {
       try {
         const pk = zb.tableState('app_orders')?.pkCols ?? ['uid'];
         const r = await zb.query(`SELECT * FROM app_orders WHERE deleted_at IS NULL ORDER BY updated_at DESC`);
@@ -278,7 +282,7 @@ export default function App() {
         }));
       } catch { /* not ready */ }
     }
-    if (sqlLive() && sqlHasRun) void runSql();
+    if (sqlLive() && sqlHasRun && (all || changed.some((t) => sqlText().includes(t)))) void runSql();
   };
 
   zb.onStatus((s) => setStatus(s));
@@ -289,7 +293,24 @@ export default function App() {
     return next;
   }));
   zb.onLog(onLog);
-  zb.onAnyChange(() => void refresh());
+  // Coalesced, not per event: under a steady stream (the wasp: 45 CDC events a second on
+  // this tenant) a refresh per applied event is a few hundred queries a second on the
+  // main thread, and a click's own echo queues behind them — measured as 0.5 to 60 s of
+  // latency on the counters. One refresh at most every 250 ms, for the tables that
+  // actually changed; the SQL console re-runs only when its text names one of them.
+  const dirty = new Set<string>();
+  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+  const scheduleRefresh = (table?: string) => {
+    if (table) dirty.add(table);
+    if (refreshTimer) return;
+    refreshTimer = setTimeout(() => {
+      refreshTimer = null;
+      const changed = [...dirty]; dirty.clear();
+      void refresh(changed);
+    }, 250);
+  };
+  zb.onTableEvent((table) => scheduleRefresh(table));
+  zb.onAnyChange(() => scheduleRefresh());
 
   // ── writes: every one through mutate(), then a refresh for the outbox count ──
   const write = async (table: string, op: 'INSERT' | 'UPDATE' | 'DELETE', key: Record<string, unknown>, values?: Record<string, unknown>) => {
