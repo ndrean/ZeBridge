@@ -10,10 +10,45 @@ const std = @import("std");
 const c = @import("c_imports.zig").c;
 const utils = @import("utils.zig");
 
+const usage =
+    \\Usage: bridge_sweeper [--once]
+    \\
+    \\The tombstone GC sidecar: reaps tombstones older than GC_THRESHOLD_MS from every
+    \\table the catalogue declares a tombstone column for, then publishes the watermark.
+    \\
+    \\  --once     one pass, then exit (a controlled run: check, sweep, check)
+    \\  --help     this text
+    \\
+    \\Environment: DATABASE_WRITER_URL (required), GC_THRESHOLD_MS (default 3600000),
+    \\  GC_INTERVAL_MS (default 60000), GC_BATCH_ROWS (default 1000), GC_DRY_RUN,
+    \\  GC_ALLOW_SHORT_THRESHOLD, SWEEP_ONLY_TABLES, SYNC_RULES.
+    \\
+;
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.c_allocator;
 
-    std.debug.print("ZeBridge GC Sidecar Starting...\n", .{});
+    // Arguments first, before anything touches the database: this process deletes
+    // rows, so an argument it does not know is a refusal, never a pass with defaults
+    // (measured 2026-09-07: `bridge_sweeper --help` ran a real sweep).
+    var once = false;
+    {
+        var it = init.minimal.args.iterate();
+        _ = it.next(); // argv[0]
+        while (it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                try std.Io.File.stdout().writeStreamingAll(init.io, usage);
+                return;
+            } else if (std.mem.eql(u8, arg, "--once")) {
+                once = true;
+            } else {
+                std.debug.print("bridge_sweeper: unknown argument '{s}'\n\n{s}", .{ arg, usage });
+                std.process.exit(2);
+            }
+        }
+    }
+
+    std.debug.print("ZeBridge GC Sidecar Starting...{s}\n", .{if (once) " (one pass)" else ""});
 
     // Read Env Vars
     //
@@ -450,6 +485,10 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
+        if (once) {
+            std.debug.print("GC: one pass done, exiting (--once)\n", .{});
+            return;
+        }
         utils.sleep(interval_ms * std.time.ns_per_ms);
     }
 }
