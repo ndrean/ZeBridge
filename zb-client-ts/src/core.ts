@@ -667,7 +667,17 @@ export function mutationPayload(
   clientId: string,
 ): Record<string, unknown> {
   const payload: Record<string, unknown> = { key, version, client_id: clientId };
-  if (op !== 'DELETE') payload.data = values ?? {};
+  if (op !== 'DELETE') {
+    // §10dv: a key column in `values` must equal the key. An UPDATE cannot move a row —
+    // the ingress refuses it (`KeyChange`) — and the optimistic apply must not pretend
+    // it can. Refused here, before an outbox row exists: rename = delete + create.
+    for (const k of Object.keys(key)) {
+      if (values && k in values && String(values[k]) !== String(key[k])) {
+        throw new Error(`KeyChange: ${op} cannot change key column "${k}" (${String(key[k])} → ${String(values[k])}) — delete and re-create`);
+      }
+    }
+    payload.data = values ?? {};
+  }
   return payload;
 }
 

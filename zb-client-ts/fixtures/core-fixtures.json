@@ -1642,6 +1642,73 @@
           "optimistic": true
         }
       }
+    },
+    {
+      "name": "\u00a710dv: an UPDATE whose values change a key column is refused before it is queued \u2014 rename is delete + create",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-40acde74",
+        "table": "test_types",
+        "op": "UPDATE",
+        "key": {
+          "uid": "u-1"
+        },
+        "values": {
+          "uid": "u-2",
+          "note": "moved?"
+        },
+        "pkCols": [
+          "uid"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "throws": "KeyChange"
+    },
+    {
+      "name": "\u00a710dv: repeating the key in values UNCHANGED is not a key change (the old page did it)",
+      "args": {
+        "principal": "omar",
+        "clientId": "c-40acde74",
+        "table": "test_types",
+        "op": "UPDATE",
+        "key": {
+          "uid": "u-1"
+        },
+        "values": {
+          "uid": "u-1",
+          "note": "hi"
+        },
+        "pkCols": [
+          "uid"
+        ],
+        "version": "2026-08-27T10:00:00.123000Z"
+      },
+      "out": {
+        "subject": "mutation.omar.test_types.update",
+        "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
+        "id": "u-1",
+        "payload": {
+          "key": {
+            "uid": "u-1"
+          },
+          "version": "2026-08-27T10:00:00.123000Z",
+          "client_id": "c-40acde74",
+          "data": {
+            "uid": "u-1",
+            "note": "hi"
+          }
+        },
+        "optimistic": {
+          "table": "test_types",
+          "operation": "UPDATE",
+          "data": {
+            "uid": "u-1",
+            "note": "hi"
+          },
+          "lsn": 9007199254740991,
+          "optimistic": true
+        }
+      }
     }
   ],
   "normalizeVersion": [

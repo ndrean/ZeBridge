@@ -149,7 +149,10 @@ for (const c of fx.subjectSafe) {
   test(`subjectSafe: ${c.name}`, () => assert.equal(subjectSafeToken(c.in), c.out));
 }
 for (const c of fx.envelope) {
-  test(`envelope: ${c.name}`, () => assert.deepEqual(buildMutation(c.args), c.out));
+  test(`envelope: ${c.name}`, () => {
+    if (c.throws) assert.throws(() => buildMutation(c.args), new RegExp(c.throws));
+    else assert.deepEqual(buildMutation(c.args), c.out);
+  });
 }
 
 for (const c of fx.normalizeVersion) {

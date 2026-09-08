@@ -1895,6 +1895,14 @@ Only an UPDATE qualifies. An edit made while the row was not here (no before-ima
 counts every column as the winner's and is dropped. The resubmission is a normal
 write in every respect: outbox row, optimistic apply, watermark gate, verdict.
 
+### 7.7 Key columns are immutable
+
+An UPDATE addresses a row by its key and may not move it: a key column present in
+`data` must carry the key's own value. A different value is refused by the ingress as
+`rejected` / `KeyChange`, and both client libraries refuse it before an outbox row
+exists. A rename is a DELETE of the old key and an INSERT under the new one, and the
+old key's tombstone keeps it occupied until the sweeper reaps it (§7.5).
+
 ## 8. Ordering guarantees
 
 What the bridge promises:

@@ -602,6 +602,18 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
     try payload.put(a, "client_id", .{ .string = client_id });
     if (!is_delete) {
         const data: Value = if (values) |v| (if (v == .null) Value{ .object = .empty } else v) else .{ .object = .empty };
+        // §10dv: a key column in the values must equal the key — an UPDATE cannot move
+        // a row (the ingress refuses `KeyChange`), so it is refused here, before an
+        // outbox row exists. Rename = delete + create.
+        if (key == .object and data == .object) {
+            var kit = key.object.iterator();
+            while (kit.next()) |e| {
+                const sent = data.object.get(e.key_ptr.*) orelse continue;
+                const ks = try valueToString(a, e.value_ptr.*);
+                const vs = try valueToString(a, sent);
+                if (!std.mem.eql(u8, std.mem.trim(u8, ks, "\""), std.mem.trim(u8, vs, "\""))) return error.KeyChange;
+            }
+        }
         try payload.put(a, "data", data);
     }
 
