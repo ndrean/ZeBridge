@@ -1267,58 +1267,6 @@ pub fn main(init: std.process.Init) !void {
     // comes from the WAL rather than from the schemas KV.
     var catalog_epoch: catalog_epoch_mod.CatalogEpoch = .{};
 
-    // ── Rung 4 (§10cs): parallel ingress lanes ──────────────────────────────
-    // N independent listeners, each with its OWN PostgreSQL connection, NATS
-    // connection, table-meta cache and verdict state, all pulling from the ONE
-    // durable — JetStream load-balances the pullers, so lanes receive disjoint
-    // batches for free. LWW is the ordering license: two lanes applying the same
-    // row's writes out of order converge to the same winner (the older version
-    // is refused, which is the fate it had anyway). Two lanes' BATCHES can
-    // deadlock on crossed row locks — PostgreSQL kills one (40P01), the batch
-    // rolls back whole and replays per-message, where single-row transactions
-    // cannot deadlock. Self-healing, rare, and the price of the parallelism.
-    //
-    // Default 1: identical behavior to the single-listener bridge, and the
-    // connection-budget arithmetic the scenarios pin stays untouched. Raise it
-    // only where ingress throughput is the constraint (the serial lane measures
-    // ~4.6k mutations/s colocated).
-    const ingress_lanes: usize = blk: {
-        const raw = init.minimal.environ.getPosix("ZB_INGRESS_LANES") orelse break :blk 1;
-        const n = std.fmt.parseInt(usize, raw, 10) catch break :blk 1;
-        break :blk @min(@max(n, 1), 8);
-    };
-    var mut_listeners: std.ArrayListUnmanaged(*mutation_listener.MutationListener) = .empty;
-    defer mut_listeners.deinit(allocator);
-    if (writer_config) |*wc| {
-        log.info("Starting {d} mutation listener lane(s) (role: {s})...", .{ ingress_lanes, wc.role });
-        for (0..ingress_lanes) |lane_i| {
-            _ = lane_i;
-            const lane_ptr = try mutation_listener.MutationListener.init(
-                allocator,
-                wc,
-                nats_endpoint,
-                &runtime_config.topology,
-                &env_sync_rules,
-                default_version_column,
-                io,
-                &should_stop,
-                &catalog_epoch,
-                // min(my buffer, the narrowest instance carrying these tables). The first
-                // is physical — I cannot encode more than my own buffer. The second is the
-                // system constraint PostgreSQL's width guard enforces anyway, so refusing
-                // at ingress turns a wasted round trip (publish → apply → 23514 verdict)
-                // into an immediate, cheaper rejection with the same outcome.
-                @min(own_event_buf, effective_row_budget),
-            );
-            try mut_listeners.append(allocator, lane_ptr);
-            try lane_ptr.start();
-        }
-        log.info("✅ Mutation listener lane(s) started\n", .{});
-    } else {
-        log.info("ℹ️  Ingress disabled: no POSTGRES_WRITER_USER/_PASSWORD configured", .{});
-    }
-    defer for (mut_listeners.items) |m| m.deinit();
-    defer for (mut_listeners.items) |m| m.join();
     errdefer should_stop.store(true, .seq_cst);
 
     // ─── two startup checks on the ring buffer, before a byte of it is allocated ─────
@@ -1480,6 +1428,65 @@ pub fn main(init: std.process.Init) !void {
 
     // Mark as connected in metrics
     metrics.setConnected(true);
+
+    // ── ingress, LAST (§10dz): only once the CDC side is up — batch publisher, event
+    // processor, replication stream — does the bridge start judging writes. A write
+    // applied before the slot exists (first boot, a slot lost) would commit without its
+    // CDC echo ever being captured; applied before the publisher runs, its echo would
+    // only be late. Every accepted write must be able to propagate back. On shutdown
+    // the defers run in reverse: the lanes stop taking writes first, the stream drains.
+    // ── Rung 4 (§10cs): parallel ingress lanes ──────────────────────────────
+    // N independent listeners, each with its OWN PostgreSQL connection, NATS
+    // connection, table-meta cache and verdict state, all pulling from the ONE
+    // durable — JetStream load-balances the pullers, so lanes receive disjoint
+    // batches for free. LWW is the ordering license: two lanes applying the same
+    // row's writes out of order converge to the same winner (the older version
+    // is refused, which is the fate it had anyway). Two lanes' BATCHES can
+    // deadlock on crossed row locks — PostgreSQL kills one (40P01), the batch
+    // rolls back whole and replays per-message, where single-row transactions
+    // cannot deadlock. Self-healing, rare, and the price of the parallelism.
+    //
+    // Default 1: identical behavior to the single-listener bridge, and the
+    // connection-budget arithmetic the scenarios pin stays untouched. Raise it
+    // only where ingress throughput is the constraint (the serial lane measures
+    // ~4.6k mutations/s colocated).
+    const ingress_lanes: usize = blk: {
+        const raw = init.minimal.environ.getPosix("ZB_INGRESS_LANES") orelse break :blk 1;
+        const n = std.fmt.parseInt(usize, raw, 10) catch break :blk 1;
+        break :blk @min(@max(n, 1), 8);
+    };
+    var mut_listeners: std.ArrayListUnmanaged(*mutation_listener.MutationListener) = .empty;
+    defer mut_listeners.deinit(allocator);
+    if (writer_config) |*wc| {
+        log.info("Starting {d} mutation listener lane(s) (role: {s})...", .{ ingress_lanes, wc.role });
+        for (0..ingress_lanes) |lane_i| {
+            _ = lane_i;
+            const lane_ptr = try mutation_listener.MutationListener.init(
+                allocator,
+                wc,
+                nats_endpoint,
+                &runtime_config.topology,
+                &env_sync_rules,
+                default_version_column,
+                io,
+                &should_stop,
+                &catalog_epoch,
+                // min(my buffer, the narrowest instance carrying these tables). The first
+                // is physical — I cannot encode more than my own buffer. The second is the
+                // system constraint PostgreSQL's width guard enforces anyway, so refusing
+                // at ingress turns a wasted round trip (publish → apply → 23514 verdict)
+                // into an immediate, cheaper rejection with the same outcome.
+                @min(own_event_buf, effective_row_budget),
+            );
+            try mut_listeners.append(allocator, lane_ptr);
+            try lane_ptr.start();
+        }
+        log.info("✅ Mutation listener lane(s) started\n", .{});
+    } else {
+        log.info("ℹ️  Ingress disabled: no POSTGRES_WRITER_USER/_PASSWORD configured", .{});
+    }
+    defer for (mut_listeners.items) |m| m.deinit();
+    defer for (mut_listeners.items) |m| m.join();
 
     log.info("ℹ️ CDC subject pattern: \x1b[1m {s}.<table>.<operation> \x1b[0m", .{runtime_config.topology.subject_cdc_prefix});
 
