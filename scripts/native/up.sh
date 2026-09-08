@@ -133,7 +133,12 @@ if [ "$FRESH_NATS" = "1" ]; then
 
   nats --server "$NATS_URL" --nkey "$SEED" stream add "$MUTATIONS_STREAM" \
     --subjects="$MUTATIONS_PREFIX.>,$MUTATION_ERROR_PREFIX.>,$MUTATION_ACK_PREFIX.>" \
-    --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults >/dev/null
+    --storage=file --retention=limits --max-age=2h --max-bytes=1G --replicas=1 --defaults >/dev/null
+  # 2h, not days: a mutation is consumed within seconds, and its verdict is kept only for
+  # a client that went offline between the send and the reply — on reconnect it collects
+  # the verdict, or, past this window, REPLAYS the write, which the ingress judges
+  # idempotently (NOTES §10dy: a write that already landed is accepted again). Acks
+  # retained for a week were 30 messages a second of dead weight under the wasp.
 
   nats --server "$NATS_URL" --nkey "$SEED" kv add "$SCHEMA_KV" --history=10 --replicas=1 >/dev/null
   # PROTOCOL.md "The Connection Flow" §Step 0. Not yet fed by a PG trigger — seed by
