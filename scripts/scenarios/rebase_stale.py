@@ -14,6 +14,10 @@ dropped that edit. Now it is kept aside until the winning row is here, and:
   C. the roles swapped: Node is B, with a stamp 5 s old. The winning row is
      already here when the write is made, so the rebase fires the moment the
      verdict lands and is stamped above the winner by the HLC floor.
+  D. Node OFFLINE: the socket closed, an edit queued in the outbox, libzb edits the
+     other column meanwhile, Node reconnects. The catch-up delivers the winner's row
+     on the queued write's key BEFORE the flush — which used to "confirm" the queued
+     write as its own echo and drop it unsent (§10dt). The echo must carry our stamp.
 
 What must hold: PostgreSQL and both replicas equal, both outboxes empty, and each
 client's log names what it did (rebased / lost).
@@ -165,6 +169,25 @@ def main():
             check(f"§C both replicas at {{Newer, Again}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
             turn(py, 2, lambda: False)
             check(f"§C outboxes empty: py {outbox_left(py, '%outbox%')}, node {outbox_left(nd, '_zebridge_outbox')}",
+                  outbox_left(py, '%outbox%') == 0 and outbox_left(nd, '_zebridge_outbox') == 0)
+
+            # ── D. Node offline: a queued edit meets the winner's row in the catch-up ──
+            nd.disconnect()
+            nd.mutate(T, "UPDATE", {"uid": uid}, {"status": "Queued"})          # stamped now, sent on connect
+            check(f"§D Node hung up and queued an edit: outbox {outbox_left(nd, '_zebridge_outbox')}", outbox_left(nd, '_zebridge_outbox') == 1)
+            time.sleep(0.5)
+            py.mutate(T, "UPDATE", {"uid": uid}, {"title": "Meanwhile"}); py.flush(5000)
+            dt = wait_pg(uid, ("Meanwhile", "Again"))
+            check(f"§D libzb's edit landed meanwhile: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
+            nd.connect()
+            dt = wait_pg(uid, ("Meanwhile", "Queued"))
+            check(f"§D reconnected: the queued edit was judged stale, rebased and landed: PostgreSQL {pg_row(uid)} ({dt} s)", dt is not None)
+            check("§D Node said so: 'rebased status onto the newer row'", said(NODE_LOG, "rebased status onto the newer row"))
+            check("§D the winner's row was NOT taken for the queued write's echo", "confirmed by CDC echo" not in open(NODE_LOG).read().split("replaying 1 unconfirmed")[-1].split("rebased status")[0])
+            dt = both(py, nd, lambda c: local(c, uid) == ("Meanwhile", "Queued"), 60)
+            check(f"§D both replicas at {{Meanwhile, Queued}} ({dt} s): py {local(py, uid)}, node {local(nd, uid)}", dt is not None)
+            turn(py, 2, lambda: False)
+            check(f"§D outboxes empty: py {outbox_left(py, '%outbox%')}, node {outbox_left(nd, '_zebridge_outbox')}",
                   outbox_left(py, '%outbox%') == 0 and outbox_left(nd, '_zebridge_outbox') == 0)
             py.close(); nd.close(); py = nd = None
             teardown()

@@ -2403,6 +2403,9 @@ const LiveCatalogue = struct {
         // routable table, a suspension for a refused one.
         var republish: std.ArrayList([]const u8) = .empty;
         defer republish.deinit(self.allocator);
+        // §10du: the clients are now empty and waiting for a full under the new epoch;
+        // the producer cuts it on its cadence (minutes) unless asked — so ask.
+        if (epoch_moved.items.len > 0) generation_producer.GenerationProducer.kick();
         for (epoch_moved.items) |tbl| {
             log.info("🗂️ '{s}': seed epoch moved to {d} — descriptor republished, clients re-seed", .{ tbl, self.cat.epochs.get(tbl) orelse 0 });
             republish.append(self.allocator, tbl) catch {};

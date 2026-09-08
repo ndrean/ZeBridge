@@ -51,6 +51,10 @@ for await (const line of rl) {
   if (req.close) break;
   if (req.wipe) { await zb.wipe(); console.log(JSON.stringify({ wiped: true })); process.exit(0); }
   try {
+    // {"disconnect": true} / {"connect": true}: the socket as a switch (§10dp) — writes
+    // made in between queue in the outbox and go out on connect.
+    if (req.disconnect) { await zb.close(); console.log(JSON.stringify({ rows: [{ disconnected: true }] })); continue; }
+    if (req.connect) { await zb.connect(); console.log(JSON.stringify({ rows: [{ connected: true, tenant: zb.tenant }] })); continue; }
     if (req.mutate) {
       // {"mutate": {"table", "op", "key", "values"}} → the blessed write path
       const m = req.mutate;

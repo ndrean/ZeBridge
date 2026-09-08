@@ -133,6 +133,16 @@ pub const GenerationProducer = struct {
         self.thread = null;
     }
 
+    /// §10du: a tick asked for out of cadence. Set by the catalogue reload when a
+    /// table's seed epoch moves — every client of that table is waiting, empty, for
+    /// the full under the new epoch, and the cadence is minutes. One producer per
+    /// process, so a module-level flag is the whole channel; the sleep loop checks it
+    /// once a second and ticks at once.
+    pub var kick_requested = std.atomic.Value(bool).init(false);
+    pub fn kick() void {
+        kick_requested.store(true, .release);
+    }
+
     fn run(self: *GenerationProducer) void {
         log.info("🧬 Generation producer started: deriving from publication '{s}' ({s}), cadence {d}s, chain depth {d}", .{
             self.publication_name,
@@ -146,6 +156,10 @@ pub const GenerationProducer = struct {
             self.tick() catch |err| log.err("🧬 generation tick failed: {}", .{err});
             var slept: u64 = 0;
             while (slept < self.cadence_seconds and !self.should_stop.load(.acquire)) : (slept += 1) {
+                if (kick_requested.swap(false, .acq_rel)) {
+                    log.info("🧬 kicked: a seed epoch moved — cutting the next generation now, not at the cadence", .{});
+                    break;
+                }
                 utils.sleep(1 * std.time.ns_per_s);
             }
         }

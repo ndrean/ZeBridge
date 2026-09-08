@@ -44,9 +44,9 @@ class Lib:
     def take(self, p):
         try: return json.loads(ctypes.string_at(p).decode())
         finally: self.lib.zb_free(p)
-    def poll(self):
+    def poll(self, wait_ms=300):
         """One poll; the report dict, or {"error": name} once the connection is gone."""
-        self.last_poll = self.take(self.lib.zb_client_poll(self.h, 300))
+        self.last_poll = self.take(self.lib.zb_client_poll(self.h, wait_ms))
         return self.last_poll
     def q(self, sql, params=()):
         r = self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
@@ -104,6 +104,19 @@ class Node:
         r = json.loads(self.p.stdout.readline())
         if "error" in r: raise RuntimeError(r["error"])
         return r["rows"][0]
+    def _op(self, req):
+        self.p.stdin.write(json.dumps(req) + "\n"); self.p.stdin.flush()
+        if not select.select([self.p.stdout], [], [], 60)[0]:
+            raise RuntimeError("node worker silent for 60 s")
+        r = json.loads(self.p.stdout.readline())
+        if "error" in r: raise RuntimeError(r["error"])
+        return r["rows"][0]
+    def disconnect(self):
+        """Hang up the socket (§10dp): writes made afterwards queue in the outbox."""
+        return self._op({"disconnect": True})
+    def connect(self):
+        """Reconnect: catch up on CDC, then flush the outbox."""
+        return self._op({"connect": True})
     def wipe(self):
         """The explicit wipe (§10dl): the worker closes its client, deletes the files, exits."""
         self.p.stdin.write('{"wipe": true}\n'); self.p.stdin.flush()

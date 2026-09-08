@@ -135,6 +135,7 @@ interface BucketEntry {
 /// declaring the table unseedable. Covers a fresh table between two cadence ticks;
 /// a table still chainless after this fails LOUDLY and seeds on the next connect.
 const GENERATION_WAIT_MS = 90_000;
+const GENERATION_SLOW_POLL_MS = 15_000; // after the first window: the producer's cadence is minutes
 const GENERATION_POLL_MS = 10_000;
 /// Derived from bridge-side max_deliver × retry sleep + batch window + slack; see the
 /// verdict-timeout discussion in PROTOCOL §7 — a guess kept in step by hand until it
@@ -229,7 +230,9 @@ export class ZeBridge {
   private failed = new Set<string>();
   private suspendedMap = new Map<string, string>();
   private globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, seq: {} };
-  private pendingWrites = new Map<string, { table: string; id: number | string; at: number }>();
+  /// `version` is the stamp the write carries: the CDC echo that confirms it is the
+  /// row bearing THAT stamp, not any row on the same key (§10dt).
+  private pendingWrites = new Map<string, { table: string; id: number | string; at: number; version?: string | null }>();
   /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
   /// winning row. Held until that row is here (it may already be), then either
   /// resubmitted with a fresh stamp or dropped and surfaced.
@@ -1254,12 +1257,22 @@ export class ZeBridge {
     const loop = (async () => {
       if (this.fkHolds++ === 0) { try { await this.dialect.setForeignKeys(this.run, false); } catch { /* engine without it */ } }
       try {
-        const deadline = Date.now() + GENERATION_WAIT_MS;
-        while (Date.now() < deadline) {
+        // §10du: no deadline. The producer cuts the full under the new epoch on ITS
+        // cadence, which this client does not know — a 90 s budget against a 300 s
+        // cadence lost by 25 s, measured on the re-key of app_orders, and "retried at
+        // the next connect" meant a reload. Poll fast for the first window, then slowly
+        // for as long as the connection lives; say so once a minute.
+        const started = Date.now();
+        let lastSaid = started;
+        while (this.nc) {
           if (await this.applyGenerations(table)) return;
-          await new Promise((r) => setTimeout(r, GENERATION_POLL_MS));
+          const waited = Date.now() - started;
+          if (Date.now() - lastSaid >= 60_000) {
+            lastSaid = Date.now();
+            this.appendLog('SYS', `${table}: still waiting for the producer's full under the new epoch (${Math.round(waited / 1000)}s) — it comes on the producer's cadence`, 'INFO');
+          }
+          await new Promise((r) => setTimeout(r, waited < GENERATION_WAIT_MS ? GENERATION_POLL_MS : GENERATION_SLOW_POLL_MS));
         }
-        this.appendLog('SYS', `${table}: re-seed asked for, but no chain under the new epoch after ${GENERATION_WAIT_MS / 1000}s — retried at the next connect`, 'WARN');
       } finally {
         if (--this.fkHolds === 0) { try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ } }
       }
@@ -1578,12 +1591,17 @@ export class ZeBridge {
       await this.pruneInboxKey(exec, table, state.pkCols, ev.data);
     }
 
-    // The echo is the success signal: a successful write produces no verdict (§7.0) —
-    // the CDC echo of our own key is what pops the outbox entry.
+    // The echo is the success signal: the CDC row that carries OUR stamp pops the
+    // outbox entry. §10dt: it must be our stamp, not merely our key — a queued
+    // offline write met another client's row on the same key arriving in the
+    // reconnect catch-up, was "confirmed" by it, and was dropped unsent (or, when the
+    // flush won the race, judged stale with no outbox row left to rebase from).
     if (!ev.optimistic && state.pkCols.length && this.pendingWrites.size) {
       const echoedKey = state.pkCols.map((c) => String(ev.data?.[c])).join('|');
+      const echoedVersion = state.versionColumn ? normalizeVersion(String(ev.data?.[state.versionColumn] ?? '')) : null;
       for (const [msgId, w] of this.pendingWrites) {
         if (w.table !== table || String(w.id) !== echoedKey) continue;
+        if (w.version && echoedVersion && normalizeVersion(w.version) !== echoedVersion) continue; // someone else's row on our key
         this.pendingWrites.delete(msgId);
         void this.outboxDrop(msgId);
         this.appendLog(table, `confirmed by CDC echo after ${Date.now() - w.at}ms`, 'CONFIRMED');
@@ -2450,7 +2468,7 @@ export class ZeBridge {
     const msgId = mutationMsgId(this.clientIdValue, table, id, version);
     const h = this.transport.headers();
     h.set('Nats-Msg-Id', msgId);
-    this.pendingWrites.set(msgId, { table, id, at: Date.now() });
+    this.pendingWrites.set(msgId, { table, id, at: Date.now(), version });
 
     // Outbox insert and optimistic apply in ONE transaction (§7.1), persisted BEFORE
     // the publish: a duplicate is collapsed by dedup, a loss is unrecoverable.
@@ -2575,7 +2593,7 @@ export class ZeBridge {
       try {
         const h = this.transport.headers();
         h.set('Nats-Msg-Id', r.msg_id);
-        this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now() });
+        this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now(), version: outboxVersionOf(r) });
         const ack = await this.transport.jetstream(this.nc).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
         this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
       } catch (err) {
