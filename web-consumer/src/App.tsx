@@ -192,7 +192,10 @@ const counterUid = (table: 'counter_public' | 'counter_tenant'): string => {
 type Ev = { at: string; level: string; text: string };
 type CounterRow = { value: number; version: string; writer: string } | null;
 type UserRow = { uid: string; name: string };
-type OrderRow = { uid: string; user_id: string; item: string; note: string | null; version: string; writer: string };
+/// An order is addressed by whatever its table's KEY is right now — `uid` before the
+/// composite re-key, (user_id, item) after — read from the table state, never assumed.
+/// `key` is that key's values; `keyId` its stable string form for picking.
+type OrderRow = { key: Record<string, unknown>; keyId: string; user_id: string; item: string; count: number; note: string | null; version: string; writer: string };
 
 export default function App() {
   const [status, setStatus] = createSignal<'connected' | 'disconnected' | 'connecting'>('disconnected');
@@ -267,8 +270,12 @@ export default function App() {
     }
     if (has('app_orders')) {
       try {
-        const r = await zb.query(`SELECT uid, user_id, item, note, updated_at, last_writer FROM app_orders WHERE deleted_at IS NULL ORDER BY updated_at DESC`);
-        setOrders(r.map((o: any) => ({ uid: o.uid, user_id: o.user_id, item: o.item, note: o.note, version: String(o.updated_at ?? ''), writer: String(o.last_writer ?? '') })));
+        const pk = zb.tableState('app_orders')?.pkCols ?? ['uid'];
+        const r = await zb.query(`SELECT * FROM app_orders WHERE deleted_at IS NULL ORDER BY updated_at DESC`);
+        setOrders(r.map((o: any) => {
+          const key = Object.fromEntries(pk.map((c) => [c, o[c]]));
+          return { key, keyId: JSON.stringify(key), user_id: o.user_id, item: o.item, count: Number(o.count ?? 1), note: o.note, version: String(o.updated_at ?? ''), writer: String(o.last_writer ?? '') };
+        }));
       } catch { /* not ready */ }
     }
     if (sqlLive() && sqlHasRun) void runSql();
@@ -302,20 +309,32 @@ export default function App() {
   };
 
   // the shop form: a user (datalist), the order's text (datalist of existing orders),
-  // a note. Picking an existing order — from the datalist or the list below — binds
-  // the form to that row (`pickedUid`); the text and the note are then editable, and
-  // UPDATE sends only what changed. Typing a text nobody has is a new order.
+  // a count and a note. The text is how an order is FOUND — with the user, its
+  // identity — and is never edited; count and note are the playground. Picking an
+  // existing order (datalist or the list below) binds the form to that row
+  // (`pickedKey`); UPDATE then sends only the column(s) that changed. Typing a text
+  // nobody has is a new order. Once the key is (user_id, item), editing the text of a
+  // picked order is a KEY change — sent as such, to see what the ingress makes of it.
   const [userName, setUserName] = createSignal('');
   const [item, setItem] = createSignal('');
+  const [count, setCount] = createSignal('1');
   const [note, setNote] = createSignal('');
-  const [pickedUid, setPickedUid] = createSignal('');
+  const [pickedKey, setPickedKey] = createSignal('');
   const [formMsg, setFormMsg] = createSignal('');
   /// Every request ends with an empty form: a datalist filters by what the field
   /// holds, so a name left behind hides every other suggestion.
-  const clearForm = () => { setUserName(''); setItem(''); setNote(''); setPickedUid(''); };
+  const clearForm = () => { setUserName(''); setItem(''); setCount('1'); setNote(''); setPickedKey(''); };
   const pickedUser = () => users().find((u) => u.name === userName().trim());
-  const pickedOrder = () => orders().find((o) => o.uid === pickedUid());
-  const pickOrder = (o: OrderRow) => { setPickedUid(o.uid); setItem(o.item); setNote(o.note ?? ''); setUserName(userOf(o)); };
+  const pickedOrder = () => orders().find((o) => o.keyId === pickedKey());
+  const pickOrder = (o: OrderRow) => { setPickedKey(o.keyId); setItem(o.item); setCount(String(o.count)); setNote(o.note ?? ''); setUserName(userOf(o)); };
+  const orderPk = () => zb.tableState('app_orders')?.pkCols ?? ['uid'];
+  /// Chrome re-reads a datalist only when the input's `list` attribute changes, so the
+  /// ids are keyed by CONTENT, not by count: a renamed order or user keeps the count.
+  const fnv = (t: string) => { let h = 0x811c9dc5; for (const ch of t) h = Math.imul(h ^ ch.charCodeAt(0), 0x01000193) >>> 0; return h.toString(16); };
+  const usersListId = () => `users-list-${fnv(users().map((u) => u.name).join('\u0001'))}`;
+  const ordersListId = () => `orders-list-${fnv(orders().map((o) => o.keyId + o.item).join('\u0001'))}`;
+  const keyIsComposite = () => !orderPk().includes('uid');
+  const countValue = () => { const n = parseInt(count(), 10); return Number.isFinite(n) ? n : 1; };
   const userOf = (o: OrderRow) => users().find((u) => u.uid === o.user_id)?.name ?? o.user_id.slice(0, 8);
 
   /// CREATE: the user if the name is new, then the order for them.
@@ -328,24 +347,38 @@ export default function App() {
       await write('app_users', 'INSERT', { uid }, { uid, name: userName().trim(), tenant_id: zb.tenant, inserted_at: version, updated_at: version });
       user = { uid, name: userName().trim() };
     }
-    const uid = zb.uuid(); const version = zb.newVersion();
-    await write('app_orders', 'INSERT', { uid }, {
-      uid, user_id: user.uid, item: item().trim(), note: note().trim() || null, tenant_id: zb.tenant, inserted_at: version, updated_at: version,
-    });
+    const version = zb.newVersion();
+    const row: Record<string, unknown> = { user_id: user.uid, item: item().trim(), count: countValue(), note: note().trim() || null, tenant_id: zb.tenant, inserted_at: version, updated_at: version };
+    if (!keyIsComposite()) row.uid = zb.uuid();
+    const key = Object.fromEntries(orderPk().map((c) => [c, row[c]]));
+    await write('app_orders', 'INSERT', key, row);
     clearForm();
   };
 
   /// UPDATE: only the columns that changed travel — the rebase needs the sparse form.
-  /// Two text columns, item and note, so two tabs can edit different columns of one row.
+  /// Two editable columns, count and note, so two tabs can edit different columns of
+  /// one row (rebase) or the same one (a contested column, the later stamp wins).
   const updateOrder = async (): Promise<void> => {
     setFormMsg('');
     const o = pickedOrder();
     if (!o) { setFormMsg('pick an existing order to update (from the list, or by its exact text)'); return; }
+    // A changed text is a RENAME, and the text is (half of) the key: an UPDATE cannot
+    // move a row — the library refuses a key change before it is queued, the ingress
+    // refuses it on the wire (§10dv) — so a rename is a delete and a create, carrying
+    // count and note. The old key's tombstone keeps that text unusable until reaped.
+    if (keyIsComposite() && item().trim() && item().trim() !== o.item) {
+      const version = zb.newVersion();
+      const row: Record<string, unknown> = { user_id: o.user_id, item: item().trim(), count: countValue(), note: note().trim() || null, tenant_id: zb.tenant, inserted_at: version, updated_at: version };
+      await write('app_orders', 'DELETE', o.key);
+      await write('app_orders', 'INSERT', Object.fromEntries(orderPk().map((c) => [c, row[c]])), row);
+      clearForm();
+      return;
+    }
     const values: Record<string, unknown> = {};
-    if (item().trim() && item().trim() !== o.item) values.item = item().trim();
+    if (countValue() !== o.count) values.count = countValue();
     if (note().trim() !== (o.note ?? '')) values.note = note().trim() || null;
     if (!Object.keys(values).length) { setFormMsg('nothing changed'); return; }
-    await write('app_orders', 'UPDATE', { uid: o.uid }, values);
+    await write('app_orders', 'UPDATE', o.key, values);
     clearForm();
   };
 
@@ -354,7 +387,7 @@ export default function App() {
   const deleteOrder = async (): Promise<void> => {
     setFormMsg('');
     const o = pickedOrder();
-    if (o) { await write('app_orders', 'DELETE', { uid: o.uid }); clearForm(); return; }
+    if (o) { await write('app_orders', 'DELETE', o.key); clearForm(); return; }
     const u = pickedUser();
     if (u) { await write('app_users', 'DELETE', { uid: u.uid }); clearForm(); return; }
     setFormMsg('pick an existing order, or a user, to delete');
@@ -510,27 +543,30 @@ export default function App() {
           <p class="claim">
             <code>app_orders.user_id</code> references <code>app_users.uid</code>. Delete a user who still has orders and
             PostgreSQL refuses it, the verdict comes back <code>rejected</code>, the local copy is restored. Delete an order
-            and it vanishes on every replica: a tombstone, later reaped. Edit the order's text in one tab and its note in another:
-            both land, the later one rebased onto the earlier. Edit the same column in both: the later stamp wins.
+            and it vanishes on every replica: a tombstone, later reaped. The order's text is half its key, with the user;
+            count and note are what you edit. Change the count in one tab and the note in another: both land, the later one
+            rebased onto the earlier. Change the count in both: the later stamp wins, and the other tab says <code>edit LOST</code>.
+            Change the text: a key is never reassigned, so the page deletes the old order and creates the new one.
           </p>
           <Show when={has('app_users') && has('app_orders')} fallback={<p class="muted">not replicated here — no tenant mapping for this principal</p>}>
             <div class="form">
-              {/* The datalist ids change with the row count on purpose: Chrome does not
+              {/* The datalist ids change with their CONTENT on purpose: Chrome does not
                   re-read a datalist whose options changed under a focused input until the
                   input is re-attached to it — a new `list` attribute does exactly that. */}
               <label>user
-                <input list={`users-list-${users().length}`} value={userName()} onInput={(e) => setUserName(e.currentTarget.value)} placeholder="existing, or a new name" />
-                <datalist id={`users-list-${users().length}`}><For each={users()}>{(u) => <option value={u.name} />}</For></datalist>
+                <input list={usersListId()} value={userName()} onInput={(e) => setUserName(e.currentTarget.value)} placeholder="existing, or a new name" />
+                <datalist id={usersListId()}><For each={users()}>{(u) => <option value={u.name} />}</For></datalist>
               </label>
               <label>order{pickedOrder() ? ' (editing an existing one)' : ''}
-                <input list={`orders-list-${orders().length}`} value={item()} onInput={(e) => {
+                <input list={ordersListId()} value={item()} onInput={(e) => {
                   setItem(e.currentTarget.value);
                   // an exact match with an existing order's text picks that order
                   const o = orders().find((x) => x.item === e.currentTarget.value.trim());
-                  if (o && o.uid !== pickedUid()) pickOrder(o);
+                  if (o && o.keyId !== pickedKey()) pickOrder(o);
                 }} placeholder="what was ordered — pick an existing one, or type a new one" />
-                <datalist id={`orders-list-${orders().length}`}><For each={orders()}>{(o) => <option value={o.item}>{userOf(o)} · {o.note ?? ''}</option>}</For></datalist>
+                <datalist id={ordersListId()}><For each={orders()}>{(o) => <option value={o.item}>{userOf(o)} · {o.note ?? ''}</option>}</For></datalist>
               </label>
+              <label>count <input type="number" min="0" step="1" value={count()} onInput={(e) => setCount(e.currentTarget.value)} /></label>
               <label>note <input value={note()} onInput={(e) => setNote(e.currentTarget.value)} placeholder="free text" /></label>
               <div class="buttons">
                 <button class="create" onClick={() => void createOrder()}>CREATE</button>
@@ -541,7 +577,8 @@ export default function App() {
             </div>
             <p class="meta">
               users <strong>{users().length}</strong> · orders <strong>{orders().length}</strong>
-              <Show when={pickedOrder()}>{(o) => <> · picked: {o().item} by {userOf(o())}, version {shortVersion(o().version)}, last writer {o().writer || '—'}</>}</Show>
+              <Show when={pickedOrder()}>{(o) => <> · picked: {o().item} × {o().count} by {userOf(o())}, version {shortVersion(o().version)}, last writer {o().writer || '—'}</>}</Show>
+              {' '}· key <code>({orderPk().join(', ')})</code>
             </p>
             {/* The rows themselves — what the replica holds, live, no popup needed. */}
             <div class="rows">
@@ -550,8 +587,8 @@ export default function App() {
               </ul>
               <ul class="rowlist">
                 <For each={orders()}>{(o) => (
-                  <li classList={{ picked: o.uid === pickedUid() }} onClick={() => pickOrder(o)}>
-                    <strong>{o.item}</strong> · {userOf(o)}{o.note ? ` · ${o.note}` : ''} <span class="muted">{o.writer || ''}</span>
+                  <li classList={{ picked: o.keyId === pickedKey() }} onClick={() => pickOrder(o)}>
+                    <strong>{o.item}</strong> × {o.count} · {userOf(o)}{o.note ? ` · ${o.note}` : ''} <span class="muted">{o.writer || ''}</span>
                   </li>
                 )}</For>
               </ul>

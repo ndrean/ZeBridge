@@ -57,16 +57,21 @@ CREATE TABLE IF NOT EXISTS public.app_users (
   updated_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- A composite, natural key: an order IS (who, what). No surrogate. The page addresses
+-- rows by whatever the key is, read from the table state, so this shape can also be
+-- reached live from a `uid` key (the re-key ladder, MIGRATIONS.md) — which is how
+-- it was built the first time.
 CREATE TABLE IF NOT EXISTS public.app_orders (
-  uid          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id      uuid NOT NULL REFERENCES public.app_users (uid),   -- no ON DELETE CASCADE
-  item         varchar(255) NOT NULL,
+  item         varchar(255) NOT NULL,          -- the order's text: half of its identity
+  count        integer NOT NULL DEFAULT 1,     -- the playground, with note: what two tabs edit
   note         varchar(255),
   tenant_id    varchar(255) NOT NULL,
   last_writer  varchar(255),
-  deleted_at   timestamptz,
+  deleted_at   timestamptz,                    -- a tombstone keeps its key until reaped
   inserted_at  timestamptz NOT NULL DEFAULT now(),
-  updated_at   timestamptz NOT NULL DEFAULT now()
+  updated_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, item)
 );
 CREATE INDEX IF NOT EXISTS app_orders_user_id_index ON public.app_orders (user_id);
 
