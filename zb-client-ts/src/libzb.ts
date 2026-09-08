@@ -2495,7 +2495,14 @@ export class ZeBridge {
           }
         }
         await this.outboxPut({ msgId, subject, payload, table, id, before }, txExec);
-        await this.applyEvent(table, optimisticEvent(table, op, payload), txExec);
+        // §10dx: the optimistic row carries the write's own stamp in the version column
+        // — the ingress sets it from `version` server-side, and locally a NOT NULL
+        // version column without it refused every optimistic INSERT.
+        const opt = optimisticEvent(table, op, payload);
+        if (op !== 'DELETE' && state?.versionColumn && opt.data && typeof opt.data === 'object' && !(state.versionColumn in (opt.data as any))) {
+          (opt.data as any)[state.versionColumn] = version;
+        }
+        await this.applyEvent(table, opt, txExec);
       });
     } catch (err) {
       this.pendingWrites.delete(msgId);

@@ -129,6 +129,9 @@ pub const SyncClient = struct {
     /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
     rebase: std.StringArrayHashMapUnmanaged(Rebase) = .empty,
     rebase_due: bool = false,
+    /// Cumulative verdict counts by status, for the host (the flush report carries
+    /// them): a single-writer run with anything but `accepted` here has a finding.
+    verdict_counts: VerdictCounts = .{},
     /// FK-held events (§10h) outlive the `drainStream` call that decoded them — they
     /// wait for `drainCdc`'s retry pass — but not the pass itself. So they get their
     /// own arena, reset after every pass: a third lifetime, between "this call" and
@@ -1572,7 +1575,22 @@ pub const SyncClient = struct {
         // NOT NULL) must not abort the queueing. Aborting here LOST every such
         // update: 24 per client per swarm smoke, audible but wrong (§10cp). The
         // CDC echo applies the row properly moments later.
-        self.applyOptimistic(table, st, env.object.get("optimistic").?) catch {};
+        // §10dx: the optimistic row carries the write's own stamp in the version column
+        // (the ingress sets it from `version`); without it a NOT NULL version column
+        // refused every optimistic INSERT locally.
+        var opt = env.object.get("optimistic").?;
+        if (st.version_col) |vc| {
+            if (opt == .object and !std.mem.eql(u8, op, "DELETE")) {
+                if (opt.object.get("data")) |d| {
+                    if (d == .object and d.object.get(vc) == null) {
+                        var stamped = d;
+                        try stamped.object.put(a, vc, .{ .string = version });
+                        try opt.object.put(a, "data", stamped);
+                    }
+                }
+            }
+        }
+        self.applyOptimistic(table, st, opt) catch {};
 
         const payload_json = try core.valueToString(a, payload);
         const before_json: storage.Value = if (before) |b| .{ .text = try core.valueToString(a, b) } else .null;
@@ -1689,6 +1707,14 @@ pub const SyncClient = struct {
     fn settleVerdict(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, data: []const u8) !bool {
         const v = parseStoredJson(a, data) catch return false;
         const status = if (v == .object) (if (v.object.get("status")) |x| (if (x == .string) x.string else "") else "") else "";
+        self.verdict_counts.count(status);
+        if (!std.mem.eql(u8, status, "accepted")) {
+            // Say it: a refusal that only the counters knew about was found by a run
+            // whose every INSERT was rejected in silence (§10dx).
+            const reason = if (v == .object) (if (v.object.get("reason")) |x| (if (x == .string) x.string else "") else "") else "";
+            const detail = if (v == .object) (if (v.object.get("detail")) |x| (if (x == .string) x.string else "") else "") else "";
+            std.debug.print("libzb: verdict {s} for {s}{s}{s}{s}{s}\n", .{ status, mid, if (reason.len > 0) " — " else "", reason, if (detail.len > 0) ": " else "", detail });
+        }
         if (std.mem.eql(u8, status, "failed")) return false;
         if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
             const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
@@ -2066,6 +2092,18 @@ pub const SyncClient = struct {
     }
 
     pub const FlushReport = struct { sent: usize, settled: usize };
+
+    pub const VerdictCounts = struct {
+        accepted: usize = 0,
+        stale: usize = 0,
+        rejected: usize = 0,
+        row_deleted: usize = 0,
+        failed: usize = 0,
+        other: usize = 0,
+        fn count(self: *VerdictCounts, status: []const u8) void {
+            if (std.mem.eql(u8, status, "accepted")) self.accepted += 1 else if (std.mem.eql(u8, status, "stale")) self.stale += 1 else if (std.mem.eql(u8, status, "rejected")) self.rejected += 1 else if (std.mem.eql(u8, status, "row_deleted")) self.row_deleted += 1 else if (std.mem.eql(u8, status, "failed")) self.failed += 1 else self.other += 1;
+        }
+    };
 
     /// The write side's pump: collect and replay the outbox (§7.1), then wait up to
     /// `wait_ms` for the first verdict and drain what follows.

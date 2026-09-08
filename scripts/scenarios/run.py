@@ -117,10 +117,11 @@ GROUPS = {
         "rebuild_kill":  ("bridge", "a client killed at every point of a local rebuild and of a re-key: each leftover state converges on reopen, both clients"),
         "outbox_break":  ("bridge", "the application tries to damage the client's bookkeeping through query(): every write refused on both clients, the queued write survives and lands"),
         "write_stale":   ("bridge", "writes queued while the bridge is down, delivered after a DROP COLUMN, a new NOT NULL column and a re-key: verdicts, reverts, no ghost rows, both replicas equal PostgreSQL"),
-        "rebase_stale":  ("bridge", "an UPDATE judged stale is rebased when its columns are disjoint from the winner's (both clients, verdict before and after the echo, a slow clock), dropped and surfaced when they overlap"),
+        "rebase_stale":  ("bridge", "an UPDATE judged stale is rebased when its columns are disjoint from the winner's (both clients, verdict before and after the echo, a slow clock, a queued offline write), dropped and surfaced when they overlap"),
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),
+        "drip":          ("live",   "the wasp: a create/update/delete trio on test_types every 200 ms for hours against the running stack, invariants checked every minute (PG == both replicas, outboxes empty, no refused verdict, RSS flat, tombstones bounded), the sweeper run hourly"),
         "swarm":         ("bridge", "the 100-client hour: 50 node + 49 python + 1 PGlite, ~160 mut/s, faults, whole-replica equality"),
         "stamp":         ("bridge", "the capacity stamp: saturated, fault-free, flat applied-rate for 3 minutes"),
         "burst":         ("none",   "throughput driver, leaves rows behind"),

@@ -561,6 +561,14 @@ fn flushJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "sent", .{ .integer = @intCast(r.sent) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
+    // Cumulative verdict counts by status: the host's view of refusals without
+    // parsing stderr (§10dx).
+    var vc: std.json.ObjectMap = .empty;
+    const c = b.c.verdict_counts;
+    inline for (.{ "accepted", "stale", "rejected", "row_deleted", "failed", "other" }) |name| {
+        try vc.put(a, name, .{ .integer = @intCast(@field(c, name)) });
+    }
+    try out.put(a, "verdicts", .{ .object = vc });
     return try core.valueToString(a, .{ .object = out });
 }
 
