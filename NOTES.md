@@ -10161,6 +10161,104 @@ with the wire data (DELETE already carried the key). The wire is unchanged. The
 lesson for the fixtures is the one §10cp left: the local apply must be asserted
 BEFORE the echo, or the echo hides everything.
 
+## 10dt. An echo is our stamp, not our key (2026-09-08)
+
+Found by hand on the page, the morning after the rebase shipped: B offline changes
+the count, A changes the note, B reconnects — and the count never lands. Two faces
+of one cause, reproduced with two Node workers on the live stack. On reconnect the
+CDC catch-up delivers A's row on the same key BEFORE the outbox flush; the echo
+confirmation matched pending writes by table and key alone, took A's row for B's
+echo, logged `confirmed by CDC echo` and dropped the outbox row — so the flush found
+nothing to send and the edit vanished without a verdict. When the flush won the race
+instead, the write was sent, judged stale, and `holdForRebase` found the outbox row
+already gone: "dropping this edit". The rebase machinery was fine; its input had been
+taken away by the echo.
+
+The echo that confirms a write is the CDC row carrying the write's OWN stamp: a
+pending write now records its version, and a row on its key with another version is
+someone else's and passes by. libzb never had the hole — it settles on verdicts only,
+which is why the Python probe the night before had not seen it. The Node worker
+gained `disconnect`/`connect` verbs, and `rebase_stale` gained §D, the queued offline
+edit meeting the winner in the catch-up, rebased and landed.
+
+## 10du. The re-seed waits for the producer, and the producer is told (2026-09-08)
+
+The composite re-key of `app_orders` (uid → (user_id, item), one transaction, epoch
+0 → 1, `zebridge_enable` re-run for the replica identity) went through the ladder as
+written — and both browser tabs gave up 25 s before the full arrived: "no chain under
+the new epoch after 90s — retried at the next connect". The client's budget was 90 s;
+the producer's cadence is 300 s. A budget against a cadence the client does not know
+is a race the client is built to lose, and "the next connect" meant a reload.
+
+Two ends, both fixed. The client no longer has a deadline: it polls every 10 s for
+the first window, then every 15 s for as long as the connection lives, saying once a
+minute that it is waiting. And the bridge asks the producer: when a catalogue reload
+sees a seed epoch move, it kicks the producer (a module-level flag its sleep loop reads
+once a second) so the full under the new epoch is cut within seconds of the DDL, not
+at the next cadence. libzb re-asks on every poll and needed nothing.
+
+## 10dv. A key is never reassigned — and now nobody pretends otherwise (2026-09-08)
+
+The experiment after the composite re-key: change a picked order's text from the
+page, which is now half its key. "Both tabs followed", it seemed — then an offline
+delete of the renamed order looked like a resurrection. The CDC stream told the
+truth: the ingress UPDATE builder skips every key column it finds in `data` ("the key
+it matched on — never reassigned"), so the rename was accepted, applied as an update
+of the OLD row with only its stamp changed, and echoed as such. The client's
+optimistic apply, since §10ds carrying the key merged with the data, took the new
+text at face value and inserted a local row under the new key next to the old one.
+Verdict `accepted`, two sides disagreeing in silence, and the "resurrected" order was
+the old row that had never gone anywhere.
+
+Decided: a key is never reassigned, and everybody says so. The ingress refuses a
+key column in `data` whose value differs from the key — `rejected` / `KeyChange`,
+permanent (repeating the key unchanged stays fine: old clients did). Both cores refuse
+the same thing before an outbox row exists, pinned by two envelope fixtures (refused
+when different, passed when equal; the runners learned a `throws` case). A rename on
+the page is what it always was underneath: a DELETE and an INSERT, count and note
+carried over — and the old text's tombstone keeps that key occupied until reaped,
+which is the natural key's honest price. PROTOCOL §7.7.
+
+## 10dw. A delete can lose, and that is the policy (2026-09-08)
+
+Mary deletes an order offline (stamp t1); bob edits the same order online (t2 > t1);
+mary reconnects. The server refuses her delete as stale — the row's version is newer
+— and bob's row reaches her tab in the catch-up, so the order she deleted is back,
+with bob's change. Reported as a resurrection; it is last-writer-wins applied to a
+delete, and every side agrees: PostgreSQL, both replicas, and her tab's log.
+
+Not rebased, on purpose. A delete touches every column, so there is no disjoint case,
+and re-issuing it with a fresh stamp ("delete wins") would erase an edit its author
+saw accepted, silently, on the say-so of a client that had not seen it. What the
+library owes the application is to say it plainly: the stale line now reads "your
+DELETE lost to a newer edit of the same row — the row is back with that edit", at
+warning level (the verb is read from the outbox row, since the verdict subject has
+none). Whether to delete again, or ask the user, is the application's call — which is
+the same boundary as the rebase's own "edit LOST" on a contested column.
+
+## 10dx. The wasp: hours, not seconds (2026-09-08)
+
+Everything the battery runs is fast and short, or wide and bounded. `drip.py` (live)
+is the slow sting: a create / update / delete trio on `test_types` — arrays, a nested
+array, jsonb, numeric, a float — every 200 ms for as long as asked, libzb as the
+emitter (bob), a passive Node replica (mary) following, against the RUNNING stack.
+Once a minute it checks, and stops on the first failure: PostgreSQL and both replicas
+agree on the live drip rows (count and the set of texts), the emitter's outbox is
+empty and nothing is held on the watcher, no verdict but `accepted` was seen, the
+resident memory of emitter, worker, bridge and NATS has not doubled from its first
+sample, and the sweeper (`--once`, every --sweep-every seconds) moves the watermark.
+
+Its two-minute smoke found two things before any hour did. Every INSERT of the first
+run was REJECTED — `23502 null value in column inserted_at` — and the run said
+"agree: 0, 0, 0" with a straight face, because libzb settled the verdicts in silence
+and reported only their count. Now the C card's flush report carries cumulative
+verdict counts by status, every refusal is printed with its reason and detail, and
+the wasp reads the counts. Then the optimistic apply: the local INSERT failed NOT NULL
+on `updated_at`, because the optimistic row did not carry the write's own stamp while
+the ingress sets that column from `version` — both shells now put the stamp in the
+version column of the optimistic row. Second smoke: 1,368 writes in two minutes, all
+accepted, three sides equal at every check, 455 tombstones growing as they should.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

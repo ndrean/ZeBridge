@@ -63,6 +63,10 @@ row a rule is named.
 | verdicts: accepted / stale / rejected / row_deleted, two revert targets | ✓ | ✓ | PROTOCOL MUST 4 |
 | a stale UPDATE rebased onto the winning row when the columns are disjoint, dropped and surfaced when they overlap; the winner before or after the verdict, a slow clock | ✓ `mutate_at` stamps a write explicitly | ✓ `mutate(…, { version })` | §10do, PROTOCOL §7.6, `rebase_stale` |
 | a write with no socket queues in the outbox and goes out on the next connect | ✓ (the host's flush) | ✓ (was a silent return) | §10dp |
+| the CDC echo that confirms a write carries the write's own stamp — another client's row on the same key is not our echo | — (settles on verdicts only) | ✓ (was by key alone) | §10dt, `rebase_stale` §D |
+| an UPDATE that changes a key column is refused before it is queued (`KeyChange`); rename = delete + create | ✓ core | ✓ core | §10dv, PROTOCOL §7.7, fixture |
+| the host can see refusals: cumulative verdict counts by status | ✓ `flush` report `verdicts{…}`; refusals printed with reason and detail | ✓ per-verdict log lines | §10dx, `drip` |
+| the optimistic row carries the write's own stamp in the version column | ✓ | ✓ | §10dx |
 | the wire grammar compiled in; `grammarHash` at open refuses a fork; a bridge that cannot be reached does not block opening | ✓ `@embedFile`, `zb_grammar_hash()` | ✓ packaged copy, `grammarHashHex()`, pinned by test | §10dq, PROTOCOL §1, `grammar_served` |
 | missed verdicts recovered by direct get | ✓ | ✓ | §7.4b |
 | outbox watermark gate before a flush | ✓ | ✓ | §10at, §10au, fixture |
