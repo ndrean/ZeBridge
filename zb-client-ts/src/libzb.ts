@@ -2388,7 +2388,12 @@ export class ZeBridge {
         ok = definitive;
         if (definitive) this.pendingWrites.delete(msgId);
         // §10do: a stale UPDATE is read BEFORE its outbox row goes — it may be rebased.
-        if (verdict.status === 'stale') await this.holdForRebase(msgId);
+        // The verb lives on the outbox row (the verdict subject has none): read it now.
+        let staleVerb = '';
+        if (verdict.status === 'stale') {
+          try { staleVerb = String((await this.run(`SELECT subject FROM _zebridge_outbox WHERE msg_id = ?`, msgId))[0]?.subject ?? '').split('.').pop() ?? ''; } catch { /* no row */ }
+          await this.holdForRebase(msgId);
+        }
         if (definitive && verdict.status !== 'rejected' && verdict.status !== 'row_deleted') {
           await this.outboxDrop(msgId);
         }
@@ -2408,6 +2413,10 @@ export class ZeBridge {
             if (this.rebase.has(msgId)) {
               this.appendLog(m.subject, `${where}: a newer version won — held for a rebase onto the winning row`, 'INFO');
               this.scheduleRebase();
+            } else if (staleVerb === 'delete') {
+              // §10dw: a delete that lost. Not rebased on purpose — a delete touches every
+              // column, and re-issuing it would erase an edit its author saw accepted.
+              this.appendLog(m.subject, `${where}: your DELETE lost to a newer edit of the same row — the row is back with that edit (surface this: delete again if it is still meant)`, 'WARNING');
             } else {
               this.appendLog(m.subject, `${where}: a newer version won — dropping this edit, the winning row arrives via CDC`, 'INFO');
             }
