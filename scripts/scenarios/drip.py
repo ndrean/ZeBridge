@@ -15,8 +15,12 @@ Once a minute, invariants — and the run stops on the first one that breaks:
     rows (count and the set of texts);
   · the emitter's outbox is empty, nothing is held on the watcher;
   · no verdict other than `accepted` was seen by either client (a single writer);
-  · resident memory of the emitter (this process), the Node worker, the bridge and the
-    NATS server is reported, and flagged when it doubles from its first sample;
+  · memory: the bridge's ALLOCATED bytes (macOS `heap`, the malloc total, which counts
+    its reserved-but-untouched ring buffer too) may not exceed the sample taken after a
+    15-minute warm-up by more than 2% — allocated is what a leak moves. Resident size is
+    only reported: it climbs as the ring's 128 MB slab is touched slot by slot and macOS
+    compresses idle pages at will (measured: 28 → 63 MB under load, 40 MB idle, `leaks`
+    clean). On macOS a `leaks` scan of the bridge runs at every hourly mark too;
   · tombstones stay bounded: the sweeper runs `--once` every --sweep-every seconds, and
     the watermark must move when it does.
 """
@@ -33,6 +37,29 @@ BAD_VERDICT = re.compile(r"rejected|row_deleted|\bstale\b|edit LOST|refused|fail
 def rss_kb(pid):
     try: return int(subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout.strip() or 0)
     except Exception: return 0
+
+
+def heap_bytes(pid):
+    """Allocated bytes in the process (macOS `heap`): the 'non-object' total. 0 elsewhere."""
+    try:
+        out = subprocess.run(["heap", "--quiet", str(pid)], capture_output=True, text=True, timeout=120).stdout
+        for l in out.splitlines():
+            parts = l.split()
+            if len(parts) >= 4 and parts[3] == "non-object": return int(parts[1])
+    except Exception: pass
+    return 0
+
+
+def nats_jsz():
+    """JetStream's own accounting from the monitor port (http_port 8222): file/memory store
+    bytes and message totals. '' when the port is not configured."""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:8222/jsz", timeout=3) as r:
+            j = json.loads(r.read())
+        return f"jetstream store {j.get('store', 0)/1048576:.0f} MB file, {j.get('memory', 0)/1048576:.0f} MB mem, {j.get('messages', 0)} msgs"
+    except Exception:
+        return ""
 
 
 def pid_of(pattern):
@@ -108,7 +135,10 @@ def main():
     stop = {"now": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("now", True))
     pids = {"emitter": os.getpid(), "node": wa.p.pid, "bridge": pid_of("zig-out/bin/bridge"), "nats": pid_of("nats-server")}
-    rss0 = {k: rss_kb(v) for k, v in pids.items()}
+    rss0 = {k: rss_kb(v) for k, v in pids.items()}     # cold; the baseline is re-taken after the warm-up
+    WARMUP_MIN = 15
+    baseline = None
+    warm_from = time.monotonic()
     live, i, failed, last_flush = [], 0, 0, {}
     ops = {"insert": 0, "update": 0, "delete": 0}
     deadline = time.monotonic() + a.minutes * 60
@@ -144,6 +174,10 @@ def main():
             wm = zb.psql("SELECT watermark FROM zebridge_gc_watermark", quiet=True).strip()
             check(f"sweeper --once ran: {'; '.join(reaped) or 'nothing to reap'}; watermark {last_watermark} → {wm}", r.returncode == 0 and wm != last_watermark)
             last_watermark = wm
+            if zb.leaks_available() and pids["bridge"]:
+                lk = subprocess.run(["leaks", "--quiet", str(pids["bridge"])], capture_output=True, text=True, timeout=300)
+                summary = next((l for l in lk.stdout.splitlines() if "leaks for" in l), lk.stdout[-200:])
+                check(f"leaks scan of the bridge: {summary.strip()}", "0 leaks for 0 total leaked bytes" in lk.stdout)
 
         if time.monotonic() >= next_check:
             next_check = time.monotonic() + 60
@@ -160,17 +194,34 @@ def main():
             e_t, w_t = replica_texts(em), replica_texts(wa)
             minutes = round((time.monotonic() - t0) / 60, 1)
             check(f"[{minutes} min, {i} ticks, {sum(ops.values())} writes] live drip rows agree: PG {len(pg)}, emitter {len(e_t)}, watcher {len(w_t)}", e_t == pg == w_t)
+            # A pending row is a failure only if it STAYS pending: across a bridge restart
+            # the listener is down for seconds and the outbox holds the writes meanwhile —
+            # which is the outbox doing its job. Up to a minute to drain.
+            drain = time.monotonic() + 60
             ob, held = count_where(em, "%outbox%"), count_where(wa, "_zebridge_inbox")
+            while (ob or held) and time.monotonic() < drain:
+                em.poll(50); em.flush(50); time.sleep(0.5)
+                ob, held = count_where(em, "%outbox%"), count_where(wa, "_zebridge_inbox")
             check(f"nothing pending: emitter outbox {ob}, watcher held {held}", ob == 0 and held == 0)
             vc = (last_flush or {}).get("verdicts", {})
             refused = sum(vc.get(k, 0) for k in ("stale", "rejected", "row_deleted", "failed", "other"))
             bad_w = sum(1 for l in open(WATCHER_LOG) if BAD_VERDICT.search(l) and "VERDICT" in l)
             check(f"no refused verdict: emitter accepted {vc.get('accepted', 0)}, refused {refused} {({k: v for k, v in vc.items() if v and k != 'accepted'}) or ''}; watcher {bad_w}", refused == 0 and bad_w == 0)
             tombs = zb.psql(f"SELECT count(*) FROM {T} WHERE deleted_at IS NOT NULL AND some_text LIKE 'drip-%'", quiet=True).strip()
+            # the bridge (and NATS) may be restarted under the wasp — that is a feature —
+            # so the pids are re-resolved every check, and a new bridge gets a new baseline
+            fresh = pid_of("zig-out/bin/bridge")
+            if fresh and fresh != pids["bridge"]:
+                print(f"  · the bridge was restarted (pid {pids['bridge']} → {fresh}): memory baseline reset, warm-up restarts")
+                pids["bridge"] = fresh; rss0["bridge"] = rss_kb(fresh); baseline = None; warm_from = time.monotonic()
+            pids["nats"] = pid_of("nats-server") or pids["nats"]
             rss = {k: rss_kb(v) for k, v in pids.items()}
-            grown = [k for k in rss if rss0[k] and rss[k] > 2 * rss0[k] and minutes >= 10]
-            print(f"  · tombstones {tombs} · rss MB: " + ", ".join(f"{k} {rss[k]//1024} (from {rss0[k]//1024})" for k in rss) + (f" · DOUBLED: {grown}" if grown else ""))
-            check("resident memory has not doubled", not grown)
+            heap = heap_bytes(pids["bridge"]) if pids["bridge"] else 0
+            if baseline is None and (time.monotonic() - warm_from) >= WARMUP_MIN * 60: baseline = heap
+            over = baseline and heap > baseline * 1.02
+            jsz = nats_jsz()
+            print(f"  · tombstones {tombs} · bridge allocated {heap/1e6:.1f} MB" + (f" (warm baseline {baseline/1e6:.1f})" if baseline else " (warming up)") + " · rss MB: " + ", ".join(f"{k} {rss[k]//1024} (cold {rss0[k]//1024})" for k in rss) + (f" · {jsz}" if jsz else ""))
+            check("bridge allocated bytes within 2% of the warmed-up baseline" if baseline else "bridge allocated bytes: warming up, no verdict yet", not over)
             sys.stdout.flush()
 
         left = a.interval_ms / 1000 - (time.monotonic() - tick_at)
