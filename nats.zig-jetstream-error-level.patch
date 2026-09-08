@@ -1,0 +1,20 @@
+The JetStream API error line drops to debug: the caller receives a typed error and
+decides whether it is an incident — a bucket that exists on a create, a consumer not
+found on a look-before-create, are answers. NATS_ZIG_NOTES.md entry 10.
+
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -905,7 +905,11 @@
+         }) catch return;
+ 
+         const info = response.@"error";
+-        log.err("JetStream error: code={d} err_code={d} description={s}", .{ info.code, info.err_code, info.description });
++        // The caller gets this as a TYPED error and decides whether it is an incident: a
++        // bucket that already exists on a create, a consumer not found on a
++        // look-before-create, are answers, not failures. Logging them here at error
++        // level reported every routine probe as an incident (NATS_ZIG_NOTES entry 10).
++        log.debug("JetStream error: code={d} err_code={d} description={s}", .{ info.code, info.err_code, info.description });
+         log.debug("Full response: {s}", .{msg.data});
+ 
+         // Map specific JetStream error codes to proper error types

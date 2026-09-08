@@ -389,3 +389,41 @@ cd nats.zig && zig build test
 ```
 
 ---
+## 10. Every JetStream API refusal logged as an incident (2026-09-08)
+
+**How it appeared**
+
+Two lines at error level on every libzb open and on every fleet-monitor tick:
+
+```
+error(nats): JetStream error: code=404 err_code=10014 description=consumer not found
+error(nats): JetStream error: code=400 err_code=10058 description=stream name already in use with a different configuration
+```
+
+The first is `pullSubscribe`'s look-before-create of the client's consumer, the
+second was the bridge's create-then-open of a bucket (fixed on the bridge side,
+NOTES §10dr). Both callers handle the typed error and go on; the log said otherwise.
+
+**Cause**
+
+`jetstream.zig`'s API response handler logs `JetStream error: …` at error level for
+every error response before mapping it to a typed error. The library cannot know
+whether the caller treats the answer as a failure, so the level is wrong by
+construction: a 404 on a probe is an answer.
+
+**Change**
+
+`src/jetstream.zig` — the line drops to `debug`. The typed error still reaches the
+caller, which reports at the level it means (the bridge's `ensureStream` logs its own
+"not reachable" at error, for instance).
+
+`nats.zig-jetstream-error-level.patch`.
+
+**Verified**
+
+```bash
+cd nats.zig && zig build test        # unit steps; the integration suite needs its services
+# libzb open + fleet tick at LOG_LEVEL=info: both lines gone
+```
+
+---
