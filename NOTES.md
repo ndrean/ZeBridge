@@ -10259,6 +10259,63 @@ the ingress sets that column from `version` — both shells now put the stamp in
 version column of the optimistic row. Second smoke: 1,368 writes in two minutes, all
 accepted, three sides equal at every check, 455 tombstones growing as they should.
 
+## 10dy. A redelivered write that landed is accepted again (2026-09-08)
+
+The wasp stopped at a bridge restart: "live drip rows agree: PG 2, emitter 3". The
+emitter's replica had one row more than PostgreSQL, and its log had one verdict
+`row_deleted` for an UPDATE. The MUTATIONS stream told the sequence: INSERT, UPDATE,
+DELETE of that row, in order, all three before the restart; the UPDATE's only verdict,
+`row_deleted`, thirty seconds later; no `accepted` for it anywhere. The old bridge had
+applied the writes and died in the window between the commit and the ack. After the
+restart the messages were redelivered and judged against the state they had
+themselves produced: the row was already tombstoned by its own later DELETE, so the
+redelivered UPDATE earned `row_deleted` — the at-least-once hole the troubleshooting
+table already named for `stale` ("a write that was in fact accepted").
+
+Two fixes. The classify probe now also asks whether the row carries THIS write's
+version; when it does, the zero-row outcome is `accepted` again, in both ingress
+paths ("redelivered write already applied"). And libzb's `row_deleted` revert
+restored the write's before-image, which resurrected on the emitter's own replica a
+row it had itself deleted a tick later; it now removes the local row, as the
+TypeScript client always did — the server's word is "deleted". The wasp's restart
+handling (re-resolved pid, new memory baseline) is what let it see this at all.
+
+## 10dz. Ingress starts last (2026-09-08)
+
+The user's question after §10dy: shouldn't the mutation listener start only once the
+event processor and the batch publisher are up, so that every write it accepts can
+propagate back? It started BEFORE them: lanes at boot step 4, the publisher, the
+event processor and the replication stream after. A write judged in that window
+commits to PostgreSQL before the CDC side consumes. With an existing slot the WAL is
+retained and the echo is merely late; on a first boot, or after a slot loss, the slot
+is created after those commits and their echo is never captured at all — the write
+is accepted, the writer's outbox pops on the verdict, and every other replica misses
+the row until a re-seed. The listener block moved below the replication stream's
+init; the defers run in reverse, so on shutdown the lanes stop taking writes before
+the stream drains.
+
+## 10ea. The dictionary: a bounded corpus, and kept while it earns its keep (2026-09-08)
+
+The wasp's resident-memory stair at 10:59 was a full plus its dictionary: the trainer
+took the WHOLE full as its corpus (2 KiB samples, all of them), so its CPU and memory
+grew with the table — 11 MB of rows, most of them the wasp's tombstones, and a 44 MB
+spike inside the tick — and it ran at every full, every thirty minutes. The user's
+question: does it train on every full, and shouldn't it stop?
+
+Two changes. The corpus is a bounded, evenly strided sample of the full, 8 MiB at
+most (zstd's guidance is ~100× the dictionary; 112 KiB × 100 is that), so training
+is flat whatever the table's size. And the previous era's dictionary is kept when a
+1 MiB probe of the new full compresses at least a quarter smaller with it than
+without: a dictionary that still fits the data teaches nothing new, and the
+expensive step is skipped; the new era's deltas simply name the old dictionary,
+immutable by name, already in every client's cache. A shape change forces a full and
+a drifted dictionary fails the probe, so retraining happens exactly when the data
+changed. The log says which: "keeps <dict> — a 1 MiB probe compresses to X% with it
+vs Y% without", or "trained from a bounded sample of the full".
+
+Left on the list from the same reading: a full includes tombstoned rows, which a
+fresh replica applies only to delete again; deltas need them, fulls do not.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

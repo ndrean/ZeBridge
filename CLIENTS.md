@@ -67,6 +67,7 @@ row a rule is named.
 | an UPDATE that changes a key column is refused before it is queued (`KeyChange`); rename = delete + create | ✓ core | ✓ core | §10dv, PROTOCOL §7.7, fixture |
 | the host can see refusals: cumulative verdict counts by status | ✓ `flush` report `verdicts{…}`; refusals printed with reason and detail | ✓ per-verdict log lines | §10dx, `drip` |
 | the optimistic row carries the write's own stamp in the version column | ✓ | ✓ | §10dx |
+| `row_deleted` removes the local row (the server's word is "deleted"); `rejected` restores the before-image | ✓ (restored both, until §10dy) | ✓ | §10dy |
 | the wire grammar compiled in; `grammarHash` at open refuses a fork; a bridge that cannot be reached does not block opening | ✓ `@embedFile`, `zb_grammar_hash()` | ✓ packaged copy, `grammarHashHex()`, pinned by test | §10dq, PROTOCOL §1, `grammar_served` |
 | missed verdicts recovered by direct get | ✓ | ✓ | §7.4b |
 | outbox watermark gate before a flush | ✓ | ✓ | §10at, §10au, fixture |
