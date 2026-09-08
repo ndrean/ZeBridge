@@ -760,7 +760,9 @@ pub const MutationListener = struct {
             log.err("verdict publish to {s} failed ({}): {s}", .{ subject, perr, body });
             return;
         };
-        log.info("📮 verdict → {s}: {s}", .{ subject, body });
+        // Per write, so debug: at production rates these two lines are the log (the
+        // decision of the wasp session, 2026-09-08). Refusals keep their info lines.
+        log.debug("📮 verdict → {s}: {s}", .{ subject, body });
     }
 
     /// One message through the FULL per-message machinery: parse, refuse,
@@ -1245,7 +1247,10 @@ pub const MutationListener = struct {
                     const row_exists = c.PQntuples(r) > 0;
                     const tombstoned = row_exists and c.PQgetisnull(r, 0, 0) == 0 and
                         std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 0)), "t");
-                    pnd.outcome = if (!row_exists or tombstoned) .row_deleted else .stale;
+                    const ours = row_exists and c.PQgetisnull(r, 0, 1) == 0 and
+                        std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 1)), "t");
+                    if (ours) log.info("🔁 redelivered write already applied [{s}] on '{s}' — accepted again (§10dy)", .{ pnd.principal, pnd.table });
+                    pnd.outcome = if (ours) .applied else if (!row_exists or tombstoned) .row_deleted else .stale;
                     break;
                 }
                 seen += 1;
@@ -1949,7 +1954,13 @@ pub const MutationListener = struct {
             // row being absent — which the empty result already says.
             try out.appendSlice(alloc, "false");
         }
-        try out.appendSlice(alloc, " AS zb_deleted FROM ");
+        try out.appendSlice(alloc, " AS zb_deleted, (");
+        // §10dy: does the row carry THIS write's version? Then the write already landed
+        // — a redelivery after the bridge died between commit and ack — and the honest
+        // verdict is `accepted` again, not `stale` / `row_deleted` judged against the
+        // state the write itself produced. Bound after the key, as $<pk count + 1>.
+        try appendIdent(&out, alloc, meta.version_col);
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " = ${d}::timestamptz) AS zb_ours FROM ", .{meta.pk_cols.len + 1}));
         try appendIdent(&out, alloc, table);
         try out.appendSlice(alloc, " WHERE ");
         for (meta.pk_cols, 0..) |col, i| {
@@ -1958,6 +1969,14 @@ pub const MutationListener = struct {
             try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " = ${d}", .{i + 1}));
         }
         return out.items;
+    }
+
+    /// The classify probe's parameters: the key, then the write's version (§10dy).
+    fn classifyParams(alloc: std.mem.Allocator, key_values: []const ?[*:0]const u8, version_text: [*:0]const u8) ![]const ?[*:0]const u8 {
+        const out = try alloc.alloc(?[*:0]const u8, key_values.len + 1);
+        @memcpy(out[0..key_values.len], key_values);
+        out[key_values.len] = version_text;
+        return out;
     }
 
     /// `RETURNING "version"` — plus, when the column can be clamped, a boolean saying
@@ -2191,7 +2210,7 @@ pub const MutationListener = struct {
             vals.items,
             try buildReturning(alloc, meta, version_param),
             try buildClassify(alloc, meta, mutation.table),
-            key_values,
+            try classifyParams(alloc, key_values, version_text),
         );
     }
 
@@ -2329,7 +2348,7 @@ pub const MutationListener = struct {
             vals.items,
             try buildReturning(alloc, meta, version_param),
             try buildClassify(alloc, meta, mutation.table),
-            key_values,
+            try classifyParams(alloc, key_values, version_text),
         );
     }
 
@@ -2408,7 +2427,7 @@ pub const MutationListener = struct {
             params.items,
             try buildReturning(alloc, meta, 1),
             try buildClassify(alloc, meta, mutation.table),
-            key_values,
+            try classifyParams(alloc, key_values, version_text),
         );
     }
 
@@ -2564,6 +2583,7 @@ pub const MutationListener = struct {
         var affected_len: usize = 0;
         var row_exists = false;
         var row_tombstoned = false;
+        var row_ours = false; // §10dy: the row carries this write's version already
 
         while (true) {
             const r = c.PQgetResult(conn);
@@ -2653,6 +2673,9 @@ pub const MutationListener = struct {
                 if (row_exists and c.PQgetisnull(r, 0, 0) == 0) {
                     row_tombstoned = std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 0)), "t");
                 }
+                if (row_exists and c.PQnfields(r) > 1 and c.PQgetisnull(r, 0, 1) == 0) {
+                    row_ours = std.mem.eql(u8, std.mem.span(c.PQgetvalue(r, 0, 1)), "t");
+                }
                 continue;
             }
 
@@ -2691,7 +2714,12 @@ pub const MutationListener = struct {
         const affected = affected_buf[0..affected_len];
         if (!std.mem.eql(u8, affected, "0")) {
             self.last_outcome = .applied;
-            log.info("✅ mutation applied [{s}] on '{s}' ({s} row)", .{ mutation.principal, mutation.table, affected });
+            log.debug("✅ mutation applied [{s}] on '{s}' ({s} row)", .{ mutation.principal, mutation.table, affected });
+        } else if (row_ours) {
+            // §10dy: zero rows because the row already carries THIS write's version — a
+            // redelivery after the bridge died between commit and ack. It landed.
+            self.last_outcome = .applied;
+            log.info("🔁 redelivered write already applied [{s}] on '{s}' — accepted again", .{ mutation.principal, mutation.table });
         } else if (!row_exists or row_tombstoned) {
             self.last_outcome = .row_deleted;
             log.info(

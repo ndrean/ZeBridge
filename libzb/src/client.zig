@@ -1718,7 +1718,13 @@ pub const SyncClient = struct {
         if (std.mem.eql(u8, status, "failed")) return false;
         if (std.mem.eql(u8, status, "rejected") or std.mem.eql(u8, status, "row_deleted")) {
             const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox WHERE msg_id = ?", &.{.{ .text = mid }});
-            if (rows.len == 1) try self.revertOptimistic(a, rows[0]);
+            // §10dy: `rejected` restores the before-image (nothing changed server-side);
+            // `row_deleted` REMOVES the local row — the server's word is "deleted", and
+            // restoring a before-image resurrected, on the emitter's own replica, a row
+            // it had itself deleted a tick later (the TS client always deleted here).
+            if (rows.len == 1) {
+                if (std.mem.eql(u8, status, "row_deleted")) try self.removeOptimistic(a, rows[0]) else try self.revertOptimistic(a, rows[0]);
+            }
         }
         // `stale` does not revert: the authoritative row is already on its way over
         // CDC, and restoring a before-image could undo a newer value. §10do: the edit
@@ -1991,6 +1997,15 @@ pub const SyncClient = struct {
 
     /// Undo an optimistic apply from the stored before-image: restore it if there was
     /// a row, delete ours if there was not.
+    /// The `row_deleted` revert: the row is gone upstream, so it goes here too.
+    fn removeOptimistic(self: *SyncClient, a: std.mem.Allocator, r: storage.Row) !void {
+        const table = if (r[3] == .text) r[3].text else return;
+        const st = self.states.get(table) orelse return;
+        const env = if (r[2] == .text) try parseStoredJson(a, r[2].text) else return;
+        const key = if (env == .object) env.object.get("key") orelse return else return;
+        if (try core.planDelete(a, table, st.pk, key)) |stp| _ = self.stepExec(a, stp) catch {};
+    }
+
     fn revertOptimistic(self: *SyncClient, a: std.mem.Allocator, r: storage.Row) !void {
         const table = if (r[3] == .text) r[3].text else return;
         const st = self.states.get(table) orelse return;
