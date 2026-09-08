@@ -839,12 +839,37 @@ pub const GenerationProducer = struct {
         // crosses eras: the next full trains a fresh one.
         var dict_bytes: ?[]u8 = null;
         var dict_name: ?[]const u8 = null;
+        var dict_kept = false;
         if (build_full) {
             if (full_payload) |p| {
-                if (try trainDict(alloc, p)) |d| {
+                // §10ea: the previous era's dictionary is KEPT when it still compresses a
+                // sample of this full well — at least a quarter smaller than no dictionary.
+                // Training is the expensive step, and a dictionary that still fits the
+                // data teaches nothing new. Immutable by name, so the new era's deltas
+                // simply name the old one. A shape change already forces a full, and a
+                // dictionary that drifted fails the probe and is retrained.
+                const params_p = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+                const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex') FROM public.zebridge_generations " ++
+                    "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_p);
+                defer c.PQclear(res_p);
+                if (c.PQntuples(res_p) > 0) {
+                    const old = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_p, 0, 1)));
+                    const probe = try strideCorpus(alloc, p, 1024 * 1024);
+                    if (probe.buf.len > 0) {
+                        const with = (try compressZstdDict(alloc, probe.buf, old, 3)).len;
+                        const without = (try compressZstd(alloc, probe.buf, 3)).len;
+                        if (with * 4 <= without * 3) {
+                            dict_bytes = old;
+                            dict_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, std.mem.span(c.PQgetvalue(res_p, 0, 0)) });
+                            dict_kept = true;
+                            log.info("📖 '{s}'/'{s}': g{d} keeps {s} — a 1 MiB probe compresses to {d}% with it vs {d}% without", .{ tenant, table, gen, dict_name.?, with * 100 / @max(probe.buf.len, 1), without * 100 / @max(probe.buf.len, 1) });
+                        }
+                    }
+                }
+                if (dict_bytes == null) if (try trainDict(alloc, p)) |d| {
                     dict_bytes = d;
                     dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen });
-                }
+                };
             }
         } else if (build_delta) {
             const params_d = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
@@ -880,10 +905,10 @@ pub const GenerationProducer = struct {
             var r = try store.putBytes(name, z);
             r.deinit();
         }
-        if (build_full) if (dict_bytes) |d| {
+        if (build_full and !dict_kept) if (dict_bytes) |d| {
             var r = try store.putBytes(dict_name.?, d);
             r.deinit();
-            log.info("📖 '{s}'/'{s}': g{d} dictionary {d} bytes trained from the full", .{ tenant, table, gen, d.len });
+            log.info("📖 '{s}'/'{s}': g{d} dictionary {d} bytes trained from a bounded sample of the full", .{ tenant, table, gen, d.len });
         };
         if (delta_payload) |p| {
             const z = if (dict_bytes) |d| try compressZstdDict(alloc, p, d, 3) else try compressZstd(alloc, p, 3);
@@ -1030,15 +1055,34 @@ fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
 /// delta-sized samples (2 KiB — the unit a dictionary will actually compress).
 /// Null when the full is too small to learn from: dictionaries earn nothing
 /// there, and zdict refuses tiny corpora anyway.
+/// A bounded corpus: up to `max_bytes` of 2 KiB samples spread EVENLY over the full,
+/// contiguous in one buffer (zdict wants that). Sampling instead of the whole full
+/// keeps training — and the compression probe below — flat in CPU and memory
+/// whatever the table's size; zstd's own guidance is ~100× the dictionary as corpus,
+/// which 8 MiB is for a 112 KiB dictionary (§10ea).
+fn strideCorpus(alloc: std.mem.Allocator, full: []const u8, max_bytes: usize) !struct { buf: []u8, sizes: []usize } {
+    const sample_len: usize = 2048;
+    const available = full.len / sample_len;
+    const want = @min(available, max_bytes / sample_len);
+    const buf = try alloc.alloc(u8, want * sample_len);
+    const sizes = try alloc.alloc(usize, want);
+    const stride = if (want > 0) available / want else 1;
+    for (0..want) |i| {
+        const off = i * stride * sample_len;
+        @memcpy(buf[i * sample_len ..][0..sample_len], full[off..][0..sample_len]);
+        sizes[i] = sample_len;
+    }
+    return .{ .buf = buf, .sizes = sizes };
+}
+
 fn trainDict(alloc: std.mem.Allocator, full: []const u8) !?[]u8 {
     const sample_len: usize = 2048;
-    const nsamples = full.len / sample_len;
-    if (full.len < 16 * 1024 or nsamples < 8) return null;
-    const sizes = try alloc.alloc(usize, nsamples);
-    for (sizes) |*sz| sz.* = sample_len;
-    const cap: usize = @max(@as(usize, 1024), @min(@as(usize, 112 * 1024), full.len / 4));
+    if (full.len < 16 * 1024 or full.len / sample_len < 8) return null;
+    const corpus = try strideCorpus(alloc, full, 8 * 1024 * 1024);
+    const nsamples = corpus.sizes.len;
+    const cap: usize = @max(@as(usize, 1024), @min(@as(usize, 112 * 1024), corpus.buf.len / 4));
     const dict = try alloc.alloc(u8, cap);
-    const n = c.ZDICT_trainFromBuffer(dict.ptr, cap, full.ptr, sizes.ptr, @intCast(nsamples));
+    const n = c.ZDICT_trainFromBuffer(dict.ptr, cap, corpus.buf.ptr, corpus.sizes.ptr, @intCast(nsamples));
     if (c.ZDICT_isError(n) != 0) {
         log.warn("📖 dictionary training failed: {s}", .{std.mem.span(c.ZDICT_getErrorName(n))});
         return null;
