@@ -39,11 +39,11 @@ flowchart LR
 
 **Local_DB supported flavours**: standard SQLite, PGlite or PostgreSQL.
 
-**How does it work?**: The bridge architecture is split into two core components: a daemon and a client library..
+**How does it work?**: The bridge architecture is split into two core components: a daemon and a client library.
 
 * the daemon `ZeBridge` (ZB): connects to PostgreSQL (PG) and to NATS/JetStream (NATS). It streams schemas, seeds by chunks and sends PG changes onto NATS. It applies writes coming back from the consumer to the primary database.
-This is lightweight process, can be started / stopped gracefully on the fly.
-* a client library `libzb` : it abstracts all the NATS connection and the storage into local database. The consumer gets offine-first by default with an optimitic write. When the connection is on, the final result comes back naturally, echoed. No retry, no digging NATS, almost thing to do. The API of the library is tiny and comes in two flavours: a native TypeScript library and a C ABI dynamically linked library via FFI. The `TS` library uses a push model for reactivity whilst the C ABI library uses a pull model as the host owns the library: a poll on every tick, 
+This is a lightweight process that can be started / stopped gracefully on the fly.
+* a client library `libzb`: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, no digging NATS, almost nothing to do. The API of the library is tiny and comes in two flavours: a native TypeScript library and a C ABI dynamically linked library via FFI. The `TS` library uses a push model for reactivity whilst the C ABI library uses a pull model as the host owns the library and polls on every tick. 
 
 **Consumers**: The library can be integrated across a wide range of runtime environments.
 
@@ -59,30 +59,30 @@ The consumer's local database ingress/egress depends a lot upon your device. Val
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 * **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independantly from small tables with heavy changes.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding. This mitigates the need for long, expensive unitary CDC catchups.
-* **Geographic or Tenant division**: with NATS leafs nodes, you can chose to use nodes by tenant, or geographically distributed, when it makes sense.
+* **Geographic or Tenant division**: with NATS leaf nodes, you can choose to use nodes by tenant, or geographically distributed, when it makes sense.
 * **Strict authentication**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA.
 * **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads.
-* **Schema translation**: the replica are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, primary key NOT NULL (even of composite type), foreign key references (`PRAGMA foreign_key='on'), on delete cascade/no action, and (multi-column) unique index are transcribed into SQLite schemas. 
+* **Schema translation**: the replicas are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, primary key NOT NULL (even of composite type), foreign key references (`PRAGMA foreign_key='on'), on delete cascade/no action, and (multi-column) unique index are transcribed into SQLite schemas. 
   
-**Opinionated**: Because we aim to sync Postgres databases locally and aim for predictability by not leaving concurrent writes happen by surpise, we have a few rules that we stamped 💡 _good pratices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema, table suspension, and controlled local writes propagation.
+**Opinionated**: Because we aim to sync Postgres databases locally and aim for predictability by not leaving concurrent writes happen by surprise, we have a few rules that we stamped 💡 _good pratices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema, table suspension, and controlled local writes propagation.
 
 Although they might seem rigorous, these rules are mostly standard and well known, almost mechanical, schemas.
 See [The daemon](#the-daemon) for more details.
 
 
-**Configuration**: Because the engine uses a pre-allocated ring buffer with zero alloction on the hot path, the primary runtime configuration of the engine is the **fixed-size buffer**. After this, the daemon takes a publication and a slot, and uses its default port. The rest are env variables: 
+**Configuration**: Because the engine uses a pre-allocated ring buffer with zero allocation on the hot path, the primary runtime configuration of the engine is the **fixed-size buffer**. After this, the daemon takes a publication and a slot, and uses its default port. The rest are env variables: 
 
 ❗️ Read [Sizing the ring](#️--sizing-the-ring).
 
 Depending on the write volume, the schema sizes of your published tables, and if you have lengthy cascading transcations, the total buffer allocation can be configured anywhere from 16 MB to 6+ GB.
 
-Any change in the buffer, for special live migrations that could enable larger tables than the current setting, or for tbles with numerous columns exceeding the max column expected to be larger than the current setting, needs a daemon restart: see [Restart Rules](#restart-rules).
+Any change in the buffer, for special live migrations that could enable larger tables than the current setting, or for tables with numerous columns exceeding the max column expected to be larger than the current setting, needs a daemon restart: see [Restart Rules](#restart-rules).
 
 Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`, consuming around 150MB.
 
-**Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the dameon, meaning metrics from its Postgres catalogue and self reflecting metrics.
+**Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
 
-See the detailled file [TELEMETRY.md](#telemetry.md)
+See the detailed file [TELEMETRY.md](#telemetry.md)
 
 **Status**: More than an experiment. Chaos and live tested, early adoption stage but not battle tested.
 
@@ -120,7 +120,7 @@ See [Suspended tables](#suspended-tables).
   
 ##### Cross-tenant ordering limitation
 
-If fields are referenced acrross tenant without a foreign key, the result can look wrong for a moment. For example, an order scoped to the tenant `accounting` referencing a document that arrives as public data can, for a moment, arrive first and look wrong before the document lands. It is not related to LWW.
+If fields are referenced across tenant without a foreign key, the result can look wrong for a moment. For example, an order scoped to the tenant `accounting` referencing a document that arrives as public data can, for a moment, arrive first and look wrong before the document lands. It is not related to LWW.
 
 >💡 _Good pratice_: the solution is a choice made when designing tables. Only a **foreign key** guarantees that order, because the bridge then knows the schema constraint so that a child must be hold until the parent lands when a foreign is declared. Without this, impossible to know. 
 
@@ -129,7 +129,7 @@ If fields are referenced acrross tenant without a foreign key, the result can lo
 ## Table of Contents
 
 * [Overview](#overview)
-  * [Two pillars](#tow-pillars)
+  * [Two pillars](#two-pillars)
   * [The backend and the frontend in short](#the-backend-and-the-front-end-in-short)
   * [Example of a deployed system](#example-of-a-deployed-system)
 * [The daemon](#the-daemon)
@@ -182,7 +182,7 @@ The client library shrinks this orchestration down to a few primitives: `connect
 ### The backend and the frontend in short
 
 * **Postgres**:
-  * the DBA defines tow Postgres USER,  READER and WRITER, and uses them to install the Postgres functions and triggers neede by ZeBridge,
+  * the DBA defines two Postgres USERs,  READER and WRITER, and uses them to install the Postgres functions and triggers neede by ZeBridge,
   * the DBA migrates the database, runs a diagnose to ensure the schemas follow the _good pratice rules_, and removes any deviation.
   * the DBA runs `SELECT zb_enable()` on each table attached to the desired publication,
   🔔 These three steps guarantees the sync of the engine.
@@ -190,12 +190,12 @@ The client library shrinks this orchestration down to a few primitives: `connect
   * the DBA generates an NKEY pair for authentication: `bridge --gen-nkey`.
   * the DBA starts NATS with the NKEY seed in the config, and enables JetStream,
 * **ZeBridge**: 
-  * the DBA sources the `.env.bridge` file that contain the READER and the WRITER and the public NKEY part, 
+  * the DBA sources the `.env.bridge` file that contains the READER and the WRITER and the public NKEY part, 
   * starts with `bridge --pub my_pub -slot my_slot`.
 * **Client Authentication**: since NATS is exposed to the internet, users are strictly authenticated.
   * the bridge is OAuth agnostic; the DBA assigns the user identity returned by the OAuth in a tenant in the table `'public.zb_user_tenants'`.
   * the JWT setup: see []
-*  **Frontend**: the dev builds on top of the library to interact with the storage, NO NATS incantation.
+*  **Frontend**: the dev builds on top of the library to interact with the storage, no NATS incantations.
    *  he sets up the `libzb` or `zb-client-ts` with the storage / database flavour (SQLite, PGlite) and the domain to reach NATS,
    *  he invokes the few primitives to interact with the database: `connect`,  `query`, `mutate` and `onChange`. 
 
@@ -1022,19 +1022,29 @@ That is the whole contract for an app author. A callback to implement by table, 
 
 `libzb` does nothing on its own. It moves only when the host calls `zb_client_poll`, which reads and applies what arrived, and `zb_client_flush`, which sends the outbox and collects verdicts.
 
-1. The dev writes a polling loop in a thread with these two primitives:
+1. The dev writes a polling loop in a background thread with these two primitives:
 
 ```dart
 while (appIsRunning) {
   // 1. Wait for CDC (blocks up to 1 second)
   final report = bindings.zb_client_poll(handle, 1000);
 
+  // 2. React to CDC changes: granular UI updates
   if (report.changedTables.isNotEmpty) {
-      // 2. Tell the Main UI Thread: "These tables moved!"
-      sendPort.send(report.changedTables);
+      sendPort.send({"type": "patch", "tables": report.changedTables});
+  }
+  
+  // 3. React to bulk seeds (e.g. after offline recovery or schema change): full UI reload
+  if (report.seeded.isNotEmpty) {
+      sendPort.send({"type": "reload", "tables": report.seeded});
+  }
+  
+  // 4. React to settled writes: local optimistic writes that successfully reached the server
+  if (report.settled > 0) {
+      sendPort.send({"type": "settled", "count": report.settled});
   }
 
-  // 3. Sweep the outbox for any offline writes that need retrying
+  // 5. Sweep the outbox for any offline writes that need retrying
   bindings.zb_client_flush(handle, 0);
 }
 ```
@@ -1055,8 +1065,18 @@ const startPolling = async () => {
     const report = await zb.poll(1000);
 
     if (report.changedTables.length > 0) {
-        // Fire an event that React components can listen to
+        // Granular UI updates
         DeviceEventEmitter.emit('zb_changes', report.changedTables);
+    }
+    
+    if (report.seeded.length > 0) {
+        // Bulk reload for specific tables
+        DeviceEventEmitter.emit('zb_seeds', report.seeded);
+    }
+    
+    if (report.settled > 0) {
+        // Pending writes succeeded
+        DeviceEventEmitter.emit('zb_settled', report.settled);
     }
 
     await zb.flush(0);
@@ -1098,14 +1118,23 @@ class ZeBridge {
   // 4. Poll
   PollReport poll(int waitMs) {
     final reportJson = bindings.zb_client_poll(_handle, waitMs);
+    // reportJson looks like this:
+    // {
+    //   "applied": 15,
+    //   "settled": 2,
+    //   "changed_tables": ["app_orders"],
+    //   "seeded": []
+    // }
     return PollReport.fromJson(jsonDecode(reportJson));
   }
 }
 ```
 
-A Python service, a Flutter app (via `dart.ffi`), React native (via JSI) or native iOS/Android or any other host owns that loop, can consume the library effortlessly.You implement a timer of a second or so while the app is in the foreground. When the app returns, `poll` catches up on what it missed and `flush` sends what was written meanwhile. The installed outbox is what makes the pause harmless.
+A Python service, a Flutter app (via `dart:ffi`), React Native (via JSI), or native iOS/Android can consume the library effortlessly because the host owns the polling loop.
 
-💡 One consequence to know when testing your client implementation: because `libzb` sends the moment `mutate()` returns, a test that needs a write to arrive late does it with an explicit stamp (`zb_client_mutate_at`), not by delaying a flush.
+You can implement a timer that fires every second or so while the app is in the foreground. When the app resumes from the background, `poll` automatically catches up on everything it missed, and `flush` sends whatever offline writes were created meanwhile. The durable outbox table makes network drops and app pauses completely harmless.
+
+💡 **One consequence to note when testing your client implementation**: because `libzb` sends a mutation to the outbox the moment `mutate()` returns, testing how your UI reacts to a "late arrival" (simulating a slow network) should be done by explicitly stamping the mutation into the future via `zb_client_mutate_at`, rather than trying to manually delay the flush.
 
 ### Code examples
 
