@@ -1710,6 +1710,51 @@ export class ZeBridge {
 
   /// zstd frame magic: 28 B5 2F FD. Our msgpack docs always start with a map
   /// marker, so the sniff is unambiguous and needs no wire-format field.
+  /// §10eh: a chain object is read as its chunk MESSAGES, with a pull consumer.
+  ///
+  /// The object store's own reader (`getBlob`, `get`) is an ordered PUSH consumer
+  /// with flow control, and it stops after exactly 2 MiB — sixteen 128 KiB chunks —
+  /// on @nats-io/obj 3.4.0 against nats-server 2.14: the server's flow-control
+  /// request is never answered and the 107 remaining chunks stay pending for ever,
+  /// at 0% CPU. Measured in isolation, in Node, three ways (getBlob, the stream
+  /// reader, two concurrent reads): a 15 MiB full never arrived; an 11-chunk delta
+  /// read in 26 ms. A client on a table whose full passes 2 MiB therefore never
+  /// seeded. The chunks are plain messages on `$O.<bucket>.C.<nuid>` in stream
+  /// `OBJ_<bucket>`, so they are fetched the way CDC is — a pull consumer, nothing
+  /// to answer — 16 MB in 78 ms, and the object's own SHA-256 is checked before
+  /// the blob is trusted.
+  private async objectBlob(os: any, bucket: string, name: string): Promise<Uint8Array | null> {
+    const info = await os.info(name);
+    if (!info || info.deleted) return null;
+    if (!info.chunks || !info.size) return new Uint8Array(0);
+    const js = this.transport.jetstream(this.nc!);
+    const c = await js.consumers.get(`OBJ_${bucket}`, { filter_subjects: [`$O.${bucket}.C.${info.nuid}`] });
+    const parts: Uint8Array[] = [];
+    let got = 0;
+    const iter = await c.fetch({ max_messages: info.chunks, expires: 30_000 });
+    for await (const m of iter) {
+      parts.push(m.data); got += m.data.length;
+      if (parts.length >= info.chunks) break;
+    }
+    // Stopped, not abandoned: an open fetch keeps its subscription until `expires`,
+    // and `close()` drains every subscription — eleven seeds left `close()` waiting
+    // most of a minute each (measured: a fifteen-minute hang-up on the wall).
+    try { (iter as any).stop(); } catch { /* already ended */ }
+    if (parts.length !== info.chunks || got !== info.size) {
+      throw new Error(`object ${name}: ${parts.length}/${info.chunks} chunks, ${got}/${info.size} bytes`);
+    }
+    const blob = new Uint8Array(got);
+    let o = 0;
+    for (const p of parts) { blob.set(p, o); o += p.length; }
+    if (info.digest) {
+      const want = String(info.digest).replace(/^SHA-256=/, '').replace(/=+$/, '');
+      const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', blob));
+      const have = btoa(String.fromCharCode(...hash)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      if (want !== have) throw new Error(`object ${name}: digest mismatch (${have} vs ${want})`);
+    }
+    return blob;
+  }
+
   private async maybeZstd(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array> {
     if (b.length < 4 || b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return b;
     if (this.config.zstdDecompress) return await this.config.zstdDecompress(b, dict);
@@ -1772,7 +1817,21 @@ export class ZeBridge {
   /// Returns false for every "not this way" outcome — the snapshot path is the
   /// fallback, not an error handler. Watermark-based walk, guarded upsert, one
   /// manifest re-read on a 404 mid-walk. Never throws.
-  private async applyGenerations(table: string): Promise<boolean> {
+  /// One seed per table at a time (§10eh). Two paths ask for a seed on a fresh
+  /// replica: the schema watch, as it creates each table at first sight, and the
+  /// stream subscribe, for every table without a watermark — and both asked at once,
+  /// so every table was seeded TWICE concurrently (every `Seeded` line printed twice;
+  /// two readers on the same 15 MiB object). A second request joins the one in flight.
+  private seedInFlight = new Map<string, Promise<boolean>>();
+  private applyGenerations(table: string): Promise<boolean> {
+    const inflight = this.seedInFlight.get(table);
+    if (inflight) return inflight;
+    const p = this.applyGenerationsOnce(table).finally(() => { this.seedInFlight.delete(table); });
+    this.seedInFlight.set(table, p);
+    return p;
+  }
+
+  private async applyGenerationsOnce(table: string): Promise<boolean> {
     const GEN = this.config.grammar.generations;
     if (!GEN || !this.nc) return false;
     const state = this.syncedTables.get(table);
@@ -1813,6 +1872,23 @@ export class ZeBridge {
       return false;
     }
 
+    // §10ei: a chain older than the STREAM cannot splice — the events between its
+    // cutoff and the oldest message the stream still holds are gone, and a replica
+    // seeded from it that read on would carry the hole for ever. The contract (§10eg)
+    // keeps the age above two cadences so this never happens in a healthy deployment;
+    // a size valve, a purge or a too-short age breaks it, and the honest move is to
+    // wait for the producer's next generation (the seed loop polls this again).
+    if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
+      try {
+        const jsm = await this.transport.jetstreamManager(this.nc!);
+        const first = (await jsm.streams.info(manifest.cdc_stream)).state.first_seq;
+        if (manifest.cutoff_seq + 1 < first) {
+          this.appendLog('SYS', `${table}: chain g${manifest.gen} predates the stream (cutoff seq ${manifest.cutoff_seq} < first ${first} on ${manifest.cdc_stream}) — the events between are gone; waiting for the producer's next generation`, 'WARNING');
+          return false;
+        }
+      } catch { /* stream info unavailable — the gap rule at the next connect covers it */ }
+    }
+
     let os: any;
     try { os = await this.transport.objectStore(this.nc, manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
     // §10x: a delta names the dictionary it was compressed with. Fetched once
@@ -1825,7 +1901,7 @@ export class ZeBridge {
         const rows = await this.run(`SELECT bytes FROM _zebridge_dicts WHERE name = ?`, name);
         if (rows?.[0]?.bytes) { const d = new Uint8Array(rows[0].bytes); this.dictCache.set(name, d); return d; }
       } catch { /* table absent on an older replica — fetch below */ }
-      const d = await os.getBlob(name);
+      const d = await this.objectBlob(os, manifest.bucket, name);
       if (!d) throw new Error(`dictionary ${name} missing from ${manifest.bucket}`);
       this.dictCache.set(name, d);
       try { await this.run(this.dialect.insertReplace('_zebridge_dicts', ['name', 'bytes'], ['name']), name, d); } catch { /* best effort */ }
@@ -1833,7 +1909,7 @@ export class ZeBridge {
     };
     const fetchDoc = async (name: string, dictName?: string): Promise<any | null> => {
       try {
-        let blob = await os.getBlob(name);
+        let blob = await this.objectBlob(os, manifest.bucket, name);
         if (!blob) return null;
         const dict = dictName ? await dictFor(dictName) : undefined;
         blob = await this.maybeZstd(blob, dict); // §10w: sniffed by magic, mixed chains fine
@@ -2139,9 +2215,20 @@ export class ZeBridge {
           const floor = seedFloors.length
             ? Math.min(...seedFloors)
             : (seeded.length ? 0 : ((await jsm.streams.info(streamName))?.state?.last_seq ?? 0));
-          if (floor > (this.globalSyncState.seq[streamName] ?? 0) && (this.globalSyncState.seq[streamName] ?? 0) === 0) {
-            // Only when we hold NO position: a stored position must never jump
-            // forward past unconsumed messages.
+          const stored0 = this.globalSyncState.seq[streamName] ?? 0;
+          // §10ei: a gap this pass healed — the position is below the stream's oldest
+          // message and every table routed here was re-seeded to a cutoff at or past
+          // it — takes the seeds' floor too. Left where it was, the tail asks for a
+          // sequence the stream no longer holds, the server continues from its
+          // oldest, and the live gap rule reads that as a fresh hole: re-seed,
+          // resume, hole, three gap passes in a minute on the wall.
+          let healedGap = false;
+          if (stored0 > 0 && seedFloors.length) {
+            try { healedGap = stored0 < ((await jsm.streams.info(streamName))?.state?.first_seq ?? 0) - 1; } catch { /* keep the position */ }
+          }
+          if (floor > stored0 && (stored0 === 0 || healedGap)) {
+            // Only when we hold NO position, or a position the stream no longer
+            // holds: a live position must never jump forward past unconsumed messages.
             this.globalSyncState.seq[streamName] = floor;
             await this.run(
               `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
@@ -2178,6 +2265,14 @@ export class ZeBridge {
           let curIter: typeof iter | null = iter;
           let curPending: number | null = ci.num_pending ?? null;
           let attempt = 0;
+          // §10ei: the last sequence this tail was handed — the gap rule, LIVE. Stream
+          // sequences are contiguous and the tail reads the whole stream, so the next
+          // message is `lastSeen + 1`; anything beyond it is a hole the stream pruned
+          // under the consumer (a tab throttled in the background, a slow apply), and
+          // the server says nothing. libzb measured it first: twelve messages, two
+          // deletes, a replica that disagreed until reopened.
+          let lastSeen = last;
+          let holeFound = false;
           while (this.nc) {
           if (!curIter) {
             attempt++;
@@ -2191,6 +2286,7 @@ export class ZeBridge {
               const consumer2 = await js.consumers.get(streamName, ci2.name);
               curPending = ci2.num_pending ?? null;
               curIter = await consumer2.consume();
+              lastSeen = resumeFrom;
               this.appendLog('SYS', `${streamName}: tail recreated (attempt ${attempt}) from seq ${resumeFrom}, ${curPending ?? '?'} pending`, 'WARNING');
             } catch (e) {
               this.appendLog('SYS', `${streamName}: tail recreate failed (${e}) — retrying`, 'ERROR');
@@ -2289,6 +2385,13 @@ export class ZeBridge {
           try {
           for await (const msg of curIter) {
             lastMsgAt = Date.now();
+            if (lastSeen > 0 && msg.seq > lastSeen + 1) {
+              this.appendLog('SYS', `${streamName}: ${msg.seq - lastSeen - 1} message(s) pruned under the live consumer (position ${lastSeen}, delivered ${msg.seq}) — taking the gap: re-seeding the tables routed to it`, 'WARNING');
+              holeFound = true;
+              try { itRef.stop(); } catch { /* already ended */ }
+              break;
+            }
+            lastSeen = msg.seq;
             processedSinceStart++;
             if (processedSinceStart % progressEvery === 0) {
               this.appendLog('SYS', `${streamName} catch-up: ${processedSinceStart} messages processed so far, at seq ${msg.seq}`, 'INFO');
@@ -2341,6 +2444,16 @@ export class ZeBridge {
           await flushBatch();
           curIter = null; // consumed — never iterate it again (see above)
           if (!this.nc) break;
+          if (holeFound) {
+            // The position stays below the hole, so the gap rule sees it: the resync
+            // seeds what rides this stream and opens a fresh tail from there. This
+            // loop ends — two tails on one stream would race the position.
+            if (!this.resyncing) {
+              this.resyncing = true;
+              void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
+            }
+            break;
+          }
           this.appendLog('SYS', `${streamName}: tail ended — recreating from the stored position`, 'WARNING');
           }
         })();

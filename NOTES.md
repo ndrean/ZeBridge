@@ -10506,8 +10506,11 @@ cadence, not a hole), the TypeScript client gives up for the process's life
   two cadences — the same shape as the sweeper's inequality.
 - The fleet monitor reads each CDC stream's state on its poll and publishes the window
   the stream REALLY holds, now minus its oldest message: `bridge_cdc_window_seconds`,
-  `bridge_cdc_window_short` (the floor breached on a stream that has pruned — a young
-  stream's small window is age, not loss), plus bytes and messages per stream. A
+  `bridge_cdc_window_short` (the floor breached on a stream that is PRUNING, its
+  `first_seq` moved since the last poll — a young stream's small window is age, not
+  loss, and an idle stream that pruned long ago is not short either; the first
+  rule, "has ever pruned", flagged both within the hour), plus bytes and messages
+  per stream. A
   short window is a warning every poll while it lasts, because the config cannot know
   the throughput and only the observable says which mark ended the window.
 
@@ -10521,6 +10524,148 @@ empty stream's `first_seq` is `last_seq + 1`, and their positions were the heads
 stream, with the chain inside the window (re-seed and agree) and with a chain that
 predates it (say so, wait one cadence, then agree); the emitter parked with writes
 queued; a bridge outage longer than the age. The scenario is next.
+
+## 10eh. A seed that never arrived: the object store's reader stops at 2 MiB (2026-09-10)
+
+The wall scenario (§10eg) never reached its first check. Its Node watcher, mary on
+globex, sat at 0% CPU for forty minutes "seeding 11 tables"; the two libzb emitters
+had seeded the same table — 339,393 rows, the fast sting's tombstones included — in
+seconds. The object store showed two consumers on the 15 MiB full, both stopped at
+consumer sequence 16 with 107 chunks pending, acked nothing, waiting for nothing.
+
+**Reproduced in isolation.** A twenty-line Node script with `@nats-io/obj` 3.4.0 (the
+latest, as are jetstream, nats-core and transport-node) against nats-server 2.14.6:
+`getBlob` of the full stalls; `get` with a stream reader stalls; two concurrent reads
+stall; every time at sixteen 128 KiB chunks — exactly 2 MiB. An 11-chunk delta reads
+in 26 ms. The reader is an ordered PUSH consumer with `flow_control: true`; after 2 MiB
+the server sends its flow-control request and the client never answers it, so the
+server never sends chunk 17. Whether the fault is the obj package or the jetstream
+package underneath it is upstream's question; ours is that a table whose full passes
+2 MiB could not be seeded by a browser or a Node client at all, and nothing said so.
+The slow wasp never saw it (its watcher seeded 25 k tombstones, under the line); the
+fast wasp's 330 k tombstones pushed the full over it.
+
+**The fix is to not use that reader.** A chain object's chunks are plain messages on
+`$O.<bucket>.C.<nuid>` in stream `OBJ_<bucket>`; the client reads them with a pull
+consumer — the path CDC already uses, nothing to answer — and checks the object's own
+SHA-256 digest before trusting the blob: 16 MB in 78 ms, digest matching. The object
+store library still serves the metadata (`info`). libzb has its own chunk reader and
+was never affected.
+
+**Found on the way: every table seeded twice.** Every `Seeded` line printed twice on a
+fresh replica, and the first hang showed two readers on the same object: two paths ask
+for a seed at first sight and both asked at once. `applyGenerations` now keeps one
+promise per table in flight and a second request joins it — eleven `Seeded` lines for
+eleven tables, once.
+
+## 10ei. The gap rule was a connect-time rule — the wall found the live hole (2026-09-10)
+
+The wall scenario's first honest run (§10eg, after §10eh) failed its first return
+check, and the failure was not the client that had been parked. The watcher, mary on
+the TypeScript client, hung up, waited past the window, reconnected, took the gap,
+re-seeded 546 rows from g218 and agreed with PostgreSQL row for row. The side that
+disagreed was the SECOND emitter: a libzb client that was never parked, only not
+polled for 267 s while the first emitter stung, against a window the count valve
+held at 263 s. Its pull consumer's position fell off the stream; on its next poll
+the server continued from the oldest message it still held and said nothing. Twelve
+messages gone, two deletes among them, two rows alive on a replica that PostgreSQL
+had deleted — and no line in any log, because the gap rule of PROTOCOL §7 compares
+`stored_seq` with `first_seq` at CONNECT, and this client never reconnected.
+
+**The numbering says it.** Stream sequences are contiguous and a tail reads the whole
+stream, so the next delivered sequence is always `stored + 1`. Anything beyond it is
+a hole the stream pruned under the consumer — a host that did not poll, a browser tab
+throttled in the background, a slow apply. Both clients now check it on every
+delivery and treat it as the gap, taken at once:
+
+- libzb, in `poll`: the batch's first sequence against the stored position; on a hole
+  it re-seeds what rides the stream (`gapAndSeed`, whose gap test already holds since
+  the position is below `first_seq`) and then applies the batch, the seed gate
+  dropping what the chain carried;
+- the TypeScript client, in the tail loop: `lastSeen` per delivered message; on a
+  hole it stops the tail, leaves the position below the hole, and kicks the resync
+  that runs the connect-time rule — which now sees the gap.
+
+**A chain older than the stream cannot splice.** The scoped re-seed resumes at the
+newest manifest's `cutoff_seq`; when the stream no longer holds it (`cutoff_seq + 1
+< first_seq`: a size valve, a purge, an age under the floor) the events between are
+gone and a client that seeded and read on would carry the hole for ever. Both clients
+now say `chain gN predates the stream` and wait for the next generation — libzb by
+leaving the batch unacked and asking again each poll, the TypeScript client through
+its seed loop. And the producer closes the loop from its side: a chain whose cutoff
+fell below its stream's oldest message forces a build even when the table did not
+move, or an idle table's returning client would wait for ever. PROTOCOL §7 carries
+both rules.
+
+**The healed gap must move the position.** The fourth run looped: the watcher took
+the gap, seeded, opened her tail from the OLD position (below `first_seq`), the
+server continued from its oldest message, and the live rule read that as a fresh
+hole — three gap passes in a minute. Both clients kept a stored position untouched
+after a scoped re-seed, on the sound rule that a live position must never jump past
+unconsumed messages; a position the stream no longer holds is not live. After a gap
+this pass healed, both now resume at the seeds' floor — libzb at the stream's oldest
+message, the TypeScript client at the minimum cutoff of the tables it seeded — which
+the predates-the-stream guard keeps at or past `first_seq - 1`.
+
+**Two more from the same afternoon.** JetStream refuses a stream whose max age is
+shorter than its duplicate-tracking window, and that window defaults to two minutes:
+an age under 120 s could neither be created nor reconciled (`StreamInvalidConfig`,
+the wall's phase 2 bridge refused to boot). The window now follows the age down. And
+the object reader of §10eh left each fetch iterator open until its 30 s expiry, and
+`close()` drains every subscription — eleven seeds cost a hang-up fifteen minutes on
+the wall. Stopped after the last chunk.
+
+**The wall's verdict (`cdc_wall`, six launches, the last two clean on substance).**
+Phase 1, the count valve with the chain inside the window: the parked watcher took
+the gap and re-seeded, the three sides agreed in 0.6 s, her three queued writes went
+out after the re-seed; the idle emitter took the gap LIVE on its next poll ("214
+message(s) pruned under the live consumer") and agreed; the reopened emitter
+re-seeded 617 rows and agreed in 0.1 s. Phase 2, the age at 30 s under a 120 s floor:
+the doctor's finding, the boot warning and the fleet monitor's `short=1` all fired;
+both clients parked past the window came back and agreed in 0.1 s without reading
+past the hole — the newest cutoff happened to be inside the window, so the seed
+spliced at once; the other honest outcome, `predates the stream` then the next
+generation, was measured in phase 1's watcher log. Phase 3, the bridge down 60 s
+against a 30 s age: nothing published, nothing fell off, the ten writes queued in
+MUTATIONS drained at boot, agreement in 0.1 s, outbox empty.
+
+**Also in this pass.** The wall's parks last until NATS says the position fell off,
+not a timer: a CDC message is a published batch, not a write, so the messages a
+sting puts on a stream per second is not knowable up front (the second run's first
+failure: after 260 s the stream still held her position).
+
+## 10ej. The repair is an empty delta, and the cut is verified after it is published (2026-09-10)
+
+§10ei left the producer's reaction to a fallen chain as a forced full. Wrong object:
+what the splice needs is a fresh cut point, and a delta carries one as well as a full
+does — an unchanged table needs an EMPTY delta, no rows, one small object, zero rows
+on every returning client. The full is for the two things only a full can carry, an
+absence and compaction, and it stays on the delete rule and the depth clock. The
+tables a repair hits are the large and quiet ones — their chain goes stale while the
+stream keeps moving for others — which is exactly where a full is the one expensive
+object in the system, on both sides (today's: 15 MiB, 123 chunks, a 331 MB peak in
+the bridge, seconds to apply per client).
+
+**Verified after publishing.** The cut is taken before the snapshot and the build
+takes time; under the burst that pushed the stream past the chain, the stream's
+oldest message can pass the new cut before the manifest is live, and then no client
+can splice on it. `buildOne` re-reads the stream after the manifest write and says
+so, with the build's duration; the tick retries at once, three times at most. Beyond
+that the stream prunes faster than this pair builds — a size valve under a burst, an
+age under a build — and no retry wins: the producer says so once and leaves it to
+the next cadence; clients wait for a splice (§10ei). The empty delta makes that
+regime rare: the repair build is milliseconds, so the race is lost only when the
+window is itself near zero. The back-pressure that would settle even that — publish
+paused for one build, the WAL absorbing — is the next step, with its own wall phase.
+
+**Measured (the wall, phase 2, age 30 s under a 60 s cadence).** For the three idle
+tables on globex the log reads `chain gN fell off CDC_globex … cutting a delta with a
+fresh cut point`, then `gN+1 … delta → gen-globex`, no full; both returning clients
+spliced at once and agreed in 0.1 s. Under the floor the idle chains fall off at every
+tick, so each idle pair rebuilds every minute and meets the depth clock's full every
+fifth build — the price of running under the floor, and one more reason the doctor
+refuses it. Each wall bridge now writes its own log; the wind-down bridge used to
+overwrite the phase's.
 
 ## §13 Preflight stopped
 

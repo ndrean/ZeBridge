@@ -70,6 +70,10 @@ row a rule is named.
 | `row_deleted` removes the local row (the server's word is "deleted"); `rejected` restores the before-image | ✓ (restored both, until §10dy) | ✓ | §10dy |
 | the wire grammar compiled in; `grammarHash` at open refuses a fork; a bridge that cannot be reached does not block opening | ✓ `@embedFile`, `zb_grammar_hash()` | ✓ packaged copy, `grammarHashHex()`, pinned by test | §10dq, PROTOCOL §1, `grammar_served` |
 | missed verdicts recovered by direct get | ✓ | ✓ | §7.4b |
+| a chain object past 2 MiB (a full with tombstones) | ✓ own chunk reader | ✓ pull-consumer reader with the object's SHA-256 checked (the object store's push reader stalls at 2 MiB, @nats-io/obj 3.4.0) | §10eh |
+| one seed per table at a time — a second request joins the one in flight | — (one sync path) | ✓ (was twice at first sight) | §10eh |
+| the gap rule LIVE: a delivered sequence beyond stored + 1 is a hole the stream pruned under the consumer — re-seed at once, never read past it | ✓ per poll (was connect-time only) | ✓ per delivery (was connect-time only) | §10ei, PROTOCOL §7, `cdc_wall` |
+| a chain whose cutoff fell off the stream is refused (`predates the stream`), the next generation awaited | ✓ | ✓ | §10ei |
 | outbox watermark gate before a flush | ✓ | ✓ | §10at, §10au, fixture |
 | a failed optimistic echo still queues the write | ✓ | ✓ | §10cp |
 | liveness of the NATS connection | host-driven (`NoResponders` → reopen tails) | RTT poll every 10 s, re-sync on recovery | §10cn |

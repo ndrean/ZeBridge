@@ -6,7 +6,7 @@
 
 **What is it?**:  An opinionated, bidirectional bridge to synchronize a single PostgreSQL database with a _local replica_ via the message broker NATS/JetStream.
 
-**A bridge with two pillars** and a consumer builds on the client library.
+A two-pillar architecture where consumers build upon the client library.
 
 ```mermaid
 flowchart LR
@@ -43,7 +43,7 @@ flowchart LR
 
 * the daemon `ZeBridge` (ZB): a Zig executable that connects to PostgreSQL (PG) and to NATS/JetStream (NATS). It streams schemas, seeds by chunks and sends PG changes onto NATS. It applies writes coming back from the consumer to the primary database.
 This is a lightweight process that can be started / stopped gracefully on the fly.
-* a client library: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, almost nothing to do. The API of the library is tiny and comes in two flavours: a TypeScript library `zb-clinet-ts` and a native dynamic Zig library `libzb` with a  C ABI  FFI-compatible. The `TS` library uses a push model for reactivity whilst the Zig C ABI library uses a pull model as the host owns the library and polls on every tick. 
+* a client library: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, almost nothing to do. The API of the library is tiny and comes in two flavours: a TypeScript library `zb-client-ts` and a native dynamic Zig library `libzb` with a  C ABI  FFI-compatible. The `TS` library uses a push model for reactivity whilst the Zig C ABI library uses a pull model as the host owns the library and polls on every tick. 
 
 **Consumers**: The library can be integrated across a wide range of runtime environments.
 
@@ -57,14 +57,14 @@ The daemon is engineered to be light (~4 MB executable), fast, secure, stateless
 * **Performance**: While Postgres is I/O bound, the daemon is CPU bound with minimal memory allocation. You can expect the flow PG → NATS to reach >200k evt/s, and a sustained  >20k mut/s flow NATS → PG, boundary scoped.
 The consumer's local database ingress/egress depends a lot upon your device. Values around 15 +/- 5 k evt/s can be reached.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
-* **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independantly from small tables with heavy changes.
+* **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independently from small tables with heavy changes.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding. This mitigates the need for long, expensive unitary CDC catchups.
 * **Geographic or Tenant division**: with NATS leaf nodes, you can choose to use nodes by tenant, or geographically distributed, when it makes sense.
 * **Strict authentication**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA.
 * **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads.
 * **Schema translation**: the replicas are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, primary key NOT NULL (even of composite type), foreign key references (`PRAGMA foreign_key='on'), on delete cascade/no action, and (multi-column) unique index are transcribed into SQLite schemas. 
   
-**Opinionated**: Because we aim to sync Postgres databases locally and aim for predictability by not leaving concurrent writes happen by surprise, we have a few rules that we stamped 💡 _good pratices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema, table suspension, and controlled local writes propagation.
+**Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema, table suspension, and controlled local writes propagation.
 
 Although they might seem rigorous, these rules are mostly standard and well known, almost mechanical, schemas.
 See [The daemon](#the-daemon) for more details.
@@ -74,7 +74,7 @@ See [The daemon](#the-daemon) for more details.
 
 ❗️ Read [Sizing the ring](#️--sizing-the-ring).
 
-Depending on the write volume, the schema sizes of your published tables, and if you have lengthy cascading transcations, the total buffer allocation can be configured anywhere from 16 MB to 6+ GB.
+Depending on the write volume, the schema sizes of your published tables, and if you have lengthy cascading transactions, the total buffer allocation can be configured anywhere from 16 MB to 6+ GB.
 
 Any change in the buffer, for special live migrations that could enable larger tables than the current setting, or for tables with numerous columns exceeding the max column expected to be larger than the current setting, needs a daemon restart: see [Restart Rules](#restart-rules).
 
@@ -95,7 +95,7 @@ We expose them directly so you can judge.
 
 ##### Type limitation
 
-PGlite will accept the native Postgres schena.
+PGlite will accept the native Postgres schema.
   
 SQLite has a limited number of storage class, `INTEGER`, `TEXT`, `REAL`, `BLOB`. We transcribe Postgres schemas into an SQLite schema using `STRICT` to enforce type casting (not by affinity).
 
@@ -110,7 +110,7 @@ See [Suspended tables](#suspended-tables).
 
 ##### Size limitation
 
-`ZeBrigde` is not designed for massive databases or tables storing large objects (BLOB) or an extra large number of columns. Firstly because NATS restricts payloads (< $2^{20}$=1 MB by default, safe up to 8 MB). This default limit of 1 MB is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, you have to adjust the fixed-size buffer used by ZeBridge to support such payloads.
+`ZeBridge` is not designed for massive databases or tables storing large objects (BLOB) or an extra large number of columns. Firstly because NATS restricts payloads (< $2^{20}$=1 MB by default, safe up to 8 MB). This default limit of 1 MB is already very large for text - 200.000 words, 400 pages, or a huge JSON. On the other side, you have to adjust the fixed-size buffer used by ZeBridge to support such payloads.
 
 🚦Because of our memory model, tables can get **suspended** _at runtime_ for `row_too_large`.
 See [Suspended tables](#suspended-tables).
@@ -324,7 +324,7 @@ The sweeper: reaps old tombstones _families_, in order, children first, in batch
 proven with a 1,500-row family against a 1,024-slot ring.
 * **Ring buffer**: the ring exists to buffer possible large transactions and naturally for the broker's ordinary jitter. It is not for a NATS outage: a publish that fails is retried five times with a backoff from 100 ms doubling to 5 s, and if the broker is still gone the bridge stops rather than acknowledge WAL it never delivered, and resumes from the slot when the broker returns.
 * **Attach tables to a publication**: when running a migration, the DBA must attach each table to a publication with `SELECT zb_enable;`. See [Good pratices](#good-pratices)
-* **Writable is not authomatic**: client-side writable tables are enabled `SELECT zebridge_enable(writable => true);` when running the database migration. See [Good pratices](#good-pratices)
+* **Writable is not automatic**: client-side writable tables are enabled `SELECT zebridge_enable(writable => true);` when running the database migration. See [Good pratices](#good-pratices)
 * **Writes with Conflict Resolution policy-LWW**: ZeBridge makes decisions for you that other sync engines leave you to : writes are not merely accepted, but enforced with Last-Write-Win (LWW) strategy server-side _per row_.
 Postgres judges a write by its version, per row: an edit stamped below the row's version is refused as `stale`. The client then looks at which columns the winner changed. If the refused edit touched none of them, it is resubmitted with a fresh stamp and lands; if both edited the same column, the edit is dropped and the loss is surfaced. So an edit is lost only on a column that was genuinely contested.
 Clock skew is absorbed the same way: a slow clock is judged stale, and its edit is rebased onto the row it was made on, stamped above what the client has seen (a hybrid logical clock). The client implements a Hybrid Logical Clock (HLC) to neutralize the clock drift problem.
@@ -334,9 +334,9 @@ See [Good pratices](#good-pratices) and [Understanding the LWW rules at a glance
 * **Safety enforced by Tenant isolation**: we enforce a strict tenant model in Postgres: every principal -consumer- operates within a designated tenant boundary.
 Access control - grants-  and permissions within  NATS are cryptographically secured and mapped via NATS JWT tokens tied to each tenant.
 For these tasks, you can run `ZeBridge` as a CLI with a dedicated helpers  (`--init-nats`, `--gen-nkey`, `--revoke`).
-This tenant structure makes sense for B2B services, less for B2C operations because clients have basically all the same rights. By dividing the database by tenants, you can use advantageoulsy NATS leaf nodes and assign a tenant per node; the main benefit is that NATS will contains only one full copy of the database.
+This tenant structure makes sense for B2B services, less for B2C operations because clients have basically all the same rights. By dividing the database by tenants, you can use advantageously NATS leaf nodes and assign a tenant per node; the main benefit is that NATS will contains only one full copy of the database.
 If you face clients, you have in pratice one tenant. Thanks to NATS leafs nodes, you can distribute geographically the load where each leaf nodes will contain a copy of the database close to the consumers.
-* **Detla-chain** generation: a snapshot of a table is not on-demand nor a full table per tenant. This would crush Postgres if thousands of consumers connect. Instead, a "generation" thread produces full/deltas in a time window with a max chain length and these are dictionary based Zstd compressed and pushed into NATS. The client library cherry picks whatever its needs on connection, and complements with the few remaining CDCs up to its watermark.
+* **Delta-chain** generation: a snapshot of a table is not on-demand nor a full table per tenant. This would crush Postgres if thousands of consumers connect. Instead, a "generation" thread produces full/deltas in a time window with a max chain length and these are dictionary based Zstd compressed and pushed into NATS. The client library cherry picks whatever its needs on connection, and complements with the few remaining CDCs up to its watermark.
 
 
 
@@ -606,7 +606,7 @@ PERFORM * FROM public.zebridge_enable(
 
 **Client writable tables**: The first general rule is that the table needs a **primary key** (can be composite) of type `uuid`. This is because clients mint this key so you will have ID collision.
 
-Furthremore, a writable table needs:
+Furthermore, a writable table needs:
 
 - as said, a `tenant_id`() column for scoping,
 - a version column (`updated_at`, or `modified_at` or `last_modified`...) of type `timestamp`**Z**,
@@ -630,7 +630,7 @@ PERFORM * FROM zb_enable(
     'public.test_types'::regclass,
     writable => true,
     tenant_col => 'tenant_id',
-    version_col => 'modifed_at',
+    version_col => 'modified_at',
     tombstone_col => 'deleted_at',
     tiebreak_col => 'last_writer',
     publication => 'my_pub',
@@ -641,7 +641,7 @@ PERFORM * FROM zb_enable(
 
 **A "Bad"** `read-only` table: 
 
-The prirmary key (PK) is missing:
+The primary key (PK) is missing:
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
@@ -911,7 +911,7 @@ The client libray comes in two flavours: TypeScript (for any JavaScript engine) 
 ### The TypeScript API
 
 The consumer app uses one websocket connection ot NATS, one storage (persisted or in-memory, storage defaults to SQLite, or declared PGlite)
-The dev has his own OAuth onboarding strategy. With the credentials, the dev builds a `zb = new ZeBridge()` object and calls `zb.connect()`. If the dev needs to query the replica, he uses `zb.query(sql)`. When we wants to mutate the replica, he uses `mutate(table, key, values)`. He gets the reactivity by implementing `onChange(table, cb)` and the callback takes a granular event.
+Developers handle their own OAuth onboarding strategy. With the credentials, the dev builds a `zb = new ZeBridge()` object and calls `zb.connect()`. If the dev needs to query the replica, he uses `zb.query(sql)`. When they want to mutate the replica, they use `mutate(table, key, values)`. You get reactivity by implementing `onChange(table, cb)` and the callback takes a granular event for smart rendering.
 
 
 **Constructor**: describe your infrastructure and the user in `new ZeBridge()` and `connect()`.
@@ -996,7 +996,7 @@ A change event arrives from NATS as:
 ```js
 ```
 
-You define the callback taylored to your table which mimics the mutations and action the signals accordingly to have granular rendering.
+You define the callback tailored to your table which mimics the mutations and action the signals accordingly to have granular rendering.
 The example in _App.tsx_ uses `SolidJS` and looks like:
 
 ```js

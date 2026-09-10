@@ -761,7 +761,8 @@ pub const SyncClient = struct {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
-        var gapped: std.StringArrayHashMapUnmanaged(void) = .empty;
+        // Gapped stream → its `first_seq`: the resume point once the gap is healed.
+        var gapped: std.StringArrayHashMapUnmanaged(i64) = .empty;
         // Every stream any table depends on — a tenant-scoped table names two (§10bq),
         // and a client with no public table would otherwise never inspect CDC_PUBLIC at
         // all, so its shared rows could fall off the back unnoticed.
@@ -781,7 +782,7 @@ pub const SyncClient = struct {
             const last: i64 = @intCast(info.value.state.last_seq);
             const stored: i64 = @intCast(try self.storedSeq(stream));
             if (core.streamHasGap(first, stored, last)) {
-                try gapped.put(a, stream, {});
+                try gapped.put(a, stream, first);
                 // The feed restarted under us (position beyond last_seq): the position is
                 // meaningless in the new numbering. Reset it, or `fullPredates` reads the
                 // fresh chain's small cutoff_seq as "older than where I am" and skips the
@@ -834,6 +835,24 @@ pub const SyncClient = struct {
             if (!seeded_now) {
                 self.reseed_pending = true;
                 break;
+            }
+        }
+        // §10ei: a gap healed by this pass resumes at the stream's OLDEST message.
+        // Every table routed to the gapped stream was just seeded to a cutoff at or
+        // past `first_seq - 1` (the predates-the-stream guard), so nothing between
+        // is owed and the seed gate drops what the chain carried. Left below
+        // `first_seq`, the tail would ask for a sequence the stream no longer holds,
+        // the server would continue from its oldest, and the live gap rule would read
+        // that as a fresh hole — a second seed at every poll after every gap.
+        if (!self.reseed_pending) {
+            var git = gapped.iterator();
+            while (git.next()) |ge| {
+                const first = ge.value_ptr.*;
+                const stored: i64 = @intCast(try self.storedSeq(ge.key_ptr.*));
+                if (first > 1 and stored < first - 1) {
+                    std.debug.print("{s}: gap healed — resuming at the stream's oldest message ({d}; was {d})\n", .{ ge.key_ptr.*, first - 1, stored });
+                    try self.persistSeq(ge.key_ptr.*, @intCast(first - 1));
+                }
             }
         }
         const orphans = try self.st.query(a, "PRAGMA foreign_key_check;", &.{});
@@ -934,6 +953,25 @@ pub const SyncClient = struct {
         if (core.fullPredatesReplica(man, plan.array, pos)) {
             std.debug.print("{s}: chain predates replica — refusing the full (D2)\n", .{table});
             return;
+        }
+        // §10ei: a chain older than the STREAM cannot splice — the events between its
+        // cutoff and the oldest message the stream still holds are gone, and a client
+        // that seeded from it and read on would carry the hole for ever. The contract
+        // (§10eg) keeps the age above two cadences so this never happens in a healthy
+        // deployment; a size valve, a purge or a too-short age breaks it, and then the
+        // honest move is to wait for the producer's next generation, polled each turn.
+        const cutoff_seq: i64 = if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else 0) else 0;
+        if (cdc_stream.len > 0 and cutoff_seq > 0) {
+            if (self.t.js.getStreamInfo(cdc_stream)) |info_c| {
+                var info = info_c;
+                defer info.deinit();
+                const first: i64 = @intCast(info.value.state.first_seq);
+                if (cutoff_seq + 1 < first) {
+                    std.debug.print("{s}: chain g{d} predates the stream (cutoff seq {d} < first {d} on {s}) — the events between are gone; waiting for the producer's next generation\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, first, cdc_stream });
+                    self.reseed_pending = true;
+                    return;
+                }
+            } else |_| {}
         }
 
         const st = self.states.getPtr(table).?;
@@ -1405,6 +1443,26 @@ pub const SyncClient = struct {
             }
             if (mine.items.len == 0) continue;
             const last = try self.storedSeq(stream);
+            // §10ei: the gap rule, LIVE. Stream sequences are contiguous and this tail
+            // reads the whole stream, so the next message is `last + 1` — unless the
+            // stream pruned under the consumer while the host did not poll. The server
+            // continues from the oldest it holds and says nothing; the numbering does.
+            // Measured: a client idle 267 s against a 263 s window resumed past twelve
+            // messages, two deletes among them, and disagreed with PostgreSQL until it
+            // was reopened. A hole is §7's gap taken now: re-seed what rides this stream,
+            // then apply the batch — the seed gate drops what the chain already carries.
+            // A chain that predates the stream leaves the hole OPEN: the position stays
+            // below it, the batch is not acked, and the next poll asks again.
+            const first_here = mine.items[0].metadata.sequence.stream;
+            if (last > 0 and first_here > last + 1) {
+                std.debug.print("{s}: {d} message(s) pruned under the live consumer (position {d}, delivered {d}) — taking the gap: re-seeding the tables routed to it\n", .{ stream, first_here - last - 1, last, first_here });
+                self.reseed_pending = false;
+                self.gapAndSeed(report_a, &seeded_map) catch |err| std.debug.print("{s}: re-seed after the hole failed: {s}\n", .{ stream, @errorName(err) });
+                if (self.reseed_pending) {
+                    std.debug.print("{s}: the hole stays open — waiting for the producer's next generation before moving past it\n", .{stream});
+                    continue;
+                }
+            }
             var max_seq = last;
             applied += try self.applyBatch(report_a, stream, mine.items, last, &max_seq, &changed_map);
         }

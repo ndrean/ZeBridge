@@ -360,6 +360,8 @@ fn runDiagnose(
     tenant_rules: *const Config.EventClassification.TransitionRules,
     writable: *writable_tables.Registry,
     topo: *const topology_mod.Topology,
+    cadence_seconds: u64,
+    cdc_max_age_seconds: u64,
 ) u8 {
     var findings: usize = 0;
     log.info("🩺 DIAGNOSE (dry run): BASE_BUF gives a {d}-byte event buffer; slot '{s}', publication '{s}'. Nothing will be created, registered, or dialled.", .{ event_buf, slot_name, pub_name });
@@ -494,6 +496,16 @@ fn runDiagnose(
             }
             if (n == 0) log.info("✅ no physical cascade reaches a table that keeps tombstones", .{});
         }
+    }
+
+    // The CDC window against the chain (§10eg): a finding here, not only a warning at
+    // boot — an operator who lowers the cadence or sets the age by hand should hear
+    // it from the doctor, before the log line passes by under load.
+    if (cdc_max_age_seconds < cadence_seconds * 2) {
+        findings += 1;
+        log.err("🔴 CDC_MAX_AGE_SECONDS {d}s is BELOW 2 × GENERATION_CADENCE_SECONDS = {d}s: a client that falls off a stream can find a chain that predates it. Keep the age above two cadences (the default is three), or lower the cadence.", .{ cdc_max_age_seconds, cadence_seconds * 2 });
+    } else {
+        log.info("✅ CDC window: streams keep {d}s of events ≥ 2 × cadence {d}s", .{ cdc_max_age_seconds, cadence_seconds * 2 });
     }
 
     if (findings == 0) {
@@ -917,6 +929,8 @@ pub fn main(init: std.process.Init) !void {
             &tenant_rules,
             &d_writable,
             &runtime_config.topology,
+                    runtime_config.generation_cadence_seconds,
+            runtime_config.cdc_max_age_seconds,
         );
         std.process.exit(code);
     }
@@ -2589,9 +2603,21 @@ fn reconcileLimits(js: anytype, info: anytype, limits: Config.StreamLimits, subj
     cfg.max_age = want_age;
     cfg.max_bytes = limits.max_bytes;
     cfg.max_msgs = limits.max_msgs;
+    cfg.duplicate_window = dupWindowFor(want_age, cfg.duplicate_window);
     var res = try js.updateStream(cfg);
     res.deinit();
     return true;
+}
+
+/// JetStream refuses a stream whose max_age is shorter than its duplicate-tracking
+/// window (StreamInvalidConfig), and that window defaults to two minutes — so an age
+/// under 120 s could neither be set nor reconciled (measured: the wall's phase 2,
+/// `CDC_MAX_AGE_SECONDS=30`, boot refused). The window follows the age down; it never
+/// needs to be longer than the messages live. `stored` 0 means the server default.
+fn dupWindowFor(max_age_ns: u64, stored: u64) u64 {
+    const default_ns: u64 = 2 * 60 * std.time.ns_per_s;
+    const current = if (stored == 0) default_ns else stored;
+    return if (max_age_ns > 0 and current > max_age_ns) max_age_ns else current;
 }
 
 fn reconcileCdcStreams(
@@ -2638,6 +2664,7 @@ fn reconcileCdcStreams(
                 .max_age = limits.max_age_seconds * std.time.ns_per_s,
                 .max_msgs = limits.max_msgs,
                 .max_bytes = limits.max_bytes,
+                .duplicate_window = dupWindowFor(limits.max_age_seconds * std.time.ns_per_s, 0),
                 .compression = .s2,
             });
             res.deinit();
@@ -2672,6 +2699,7 @@ fn reconcileCdcStreams(
             .max_age = limits.max_age_seconds * std.time.ns_per_s,
             .max_msgs = limits.max_msgs,
             .max_bytes = limits.max_bytes,
+            .duplicate_window = dupWindowFor(limits.max_age_seconds * std.time.ns_per_s, 0),
             .compression = .s2,
         });
         res.deinit();

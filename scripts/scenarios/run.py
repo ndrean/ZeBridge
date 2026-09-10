@@ -121,6 +121,7 @@ GROUPS = {
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),
+        "cdc_wall":      ("live",   "the wall: a client whose position fell off a pruned CDC stream — the count valve with the chain inside the window (re-seed, agree), the age under the 2 × cadence floor (doctor, boot and fleet monitor say so; no resume past the hole), the bridge down longer than the age; runs its own bridge on the live slot, stop yours first (§10eg)"),
         "drip":          ("live",   "the wasp: a create/update/delete trio on test_types every 200 ms for hours against the running stack, invariants checked every minute (PG == both replicas, outboxes empty, no refused verdict, RSS flat, tombstones bounded), the sweeper run hourly"),
         "swarm":         ("bridge", "the 100-client hour: 50 node + 49 python + 1 PGlite, ~160 mut/s, faults, whole-replica equality"),
         "stamp":         ("bridge", "the capacity stamp: saturated, fault-free, flat applied-rate for 3 minutes"),

@@ -25,8 +25,11 @@ pub const StreamLag = struct { stream: []const u8, applied: u64, head: u64, lag:
 /// What a CDC stream HOLDS, read on the same pass (§10eg): now minus its oldest
 /// message is the window a client can fall behind and still resume; the chain's
 /// newest cutoff is at most one cadence old, so the floor is two cadences. `short`
-/// is that floor breached on a stream that has PRUNED (`first_seq > 1`) — a young
-/// stream's small window is age, not loss.
+/// is that floor breached on a stream that is PRUNING — its `first_seq` advanced
+/// since the last poll. A young stream's small window is age, not loss, and an idle
+/// stream that pruned long ago holds a small window that only grows: neither is
+/// short (the first rule, `first_seq > 1`, flagged both — measured on CDC_acme and
+/// CDC_PUBLIC the morning it shipped).
 pub const StreamWindow = struct {
     stream: []const u8,
     messages: u64,
@@ -112,7 +115,7 @@ pub const Registry = struct {
             try w.print("# HELP bridge_cdc_window_seconds Seconds of events the CDC stream holds (now minus its oldest message); -1 when empty. A client further behind re-seeds from the chain, whose newest cutoff is at most one cadence old\n", .{});
             try w.print("# TYPE bridge_cdc_window_seconds gauge\n", .{});
             for (self.streams) |sw| try w.print("bridge_cdc_window_seconds{{stream=\"{s}\"}} {d}\n", .{ sw.stream, sw.window_seconds });
-            try w.print("# HELP bridge_cdc_window_short 1 when the stream has pruned and holds less than 2 × cadence: a size or message valve ends the window before the age, or CDC_MAX_AGE_SECONDS is too short\n", .{});
+            try w.print("# HELP bridge_cdc_window_short 1 when the stream is pruning (first_seq moved since the last poll) while it holds less than 2 × cadence: a size or message valve ends the window before the age, or CDC_MAX_AGE_SECONDS is too short\n", .{});
             try w.print("# TYPE bridge_cdc_window_short gauge\n", .{});
             for (self.streams) |sw| try w.print("bridge_cdc_window_short{{stream=\"{s}\"}} {d}\n", .{ sw.stream, @as(u8, if (sw.short) 1 else 0) });
             try w.print("# HELP bridge_cdc_stream_bytes Bytes the CDC stream holds\n", .{});
@@ -150,6 +153,8 @@ pub const FleetMonitor = struct {
     /// Two generation cadences: the least a CDC stream must hold (§10eg).
     min_window_seconds: u64,
     registry: Registry,
+    /// Each stream's `first_seq` at the previous poll: pruning is the sequence moving.
+    last_first: std.StringHashMapUnmanaged(u64) = .empty,
     thread: ?std.Thread = null,
 
     pub fn init(
@@ -188,6 +193,9 @@ pub const FleetMonitor = struct {
 
     pub fn deinit(self: *FleetMonitor) void {
         self.registry.deinit();
+        var it = self.last_first.iterator();
+        while (it.next()) |e| self.allocator.free(e.key_ptr.*);
+        self.last_first.deinit(self.allocator);
     }
 
     fn run(self: *FleetMonitor) void {
@@ -292,8 +300,15 @@ pub const FleetMonitor = struct {
         try heads.put(a, name, st.last_seq);
         const first_unix: ?i64 = if (st.messages > 0) unixSecondsOf(st.first_ts) else null;
         const window: i64 = if (first_unix) |f| @max(0, @divFloor(now_ms, 1000) - f) else -1;
-        const short = st.messages > 0 and st.first_seq > 1 and window >= 0 and window < @as(i64, @intCast(self.min_window_seconds));
-        if (short) log.warn("⚠️ {s} holds {d}s of events, under the 2 × cadence floor of {d}s: a client that falls off this stream can find a chain that predates it — CDC_MAX_BYTES or CDC_MAX_MSGS is ending the window before the age, or CDC_MAX_AGE_SECONDS is too short", .{ stream, window, self.min_window_seconds });
+        // Pruning is `first_seq` moving between two polls; the map owns its keys.
+        const pruning = if (self.last_first.get(stream)) |prev| st.first_seq > prev else false;
+        if (self.last_first.getPtr(stream)) |slot| {
+            slot.* = st.first_seq;
+        } else if (self.allocator.dupe(u8, stream)) |key| {
+            self.last_first.put(self.allocator, key, st.first_seq) catch self.allocator.free(key);
+        } else |_| {}
+        const short = st.messages > 0 and pruning and window >= 0 and window < @as(i64, @intCast(self.min_window_seconds));
+        if (short) log.warn("⚠️ {s} is pruning while it holds {d}s of events, under the 2 × cadence floor of {d}s: a client that falls off this stream can find a chain that predates it — CDC_MAX_BYTES or CDC_MAX_MSGS is ending the window before the age, or CDC_MAX_AGE_SECONDS is too short", .{ stream, window, self.min_window_seconds });
         try windows.append(a, .{ .stream = name, .messages = st.messages, .bytes = st.bytes, .first_seq = st.first_seq, .window_seconds = window, .short = short });
     }
 

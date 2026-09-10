@@ -83,6 +83,9 @@ pub const GenerationProducer = struct {
     publication_name: []const u8,
     cadence_seconds: u64,
     chain_depth: u32,
+    /// §10ej: set by `buildOne` when the cut it just published had already fallen
+    /// off the stream by the time the manifest was live — read by the tick's retry.
+    cut_fell_off: bool = false,
     /// The CDC per-event buffer (2^BASE_BUF). The chain has no per-row ceiling —
     /// object chunking removes it — so the producer is where a row too wide for
     /// CDC gets DETECTED (the retirement survivor of the snapshot path's
@@ -314,9 +317,7 @@ pub const GenerationProducer = struct {
                         if (!ok) continue;
                     }
                     pairs += 1;
-                    self.buildOne(alloc, pgc, bkc, &js, table, tenant, vcol) catch |err| {
-                        log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
-                    };
+                    self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol);
                 }
             } else {
                 const tenant = self.topo.open_tenant;
@@ -326,9 +327,7 @@ pub const GenerationProducer = struct {
                     if (!ok) continue;
                 }
                 pairs += 1;
-                self.buildOne(alloc, pgc, bkc, &js, table, tenant, vcol) catch |err| {
-                    log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
-                };
+                self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol);
             }
         }
         log.debug("🧬 tick: {d} published table(s) derived, {d} (table, tenant) pair(s) built or checked", .{ n_tables, pairs });
@@ -475,6 +474,7 @@ pub const GenerationProducer = struct {
         tenant: []const u8,
         vcol: []const u8,
     ) !void {
+        const build_started_ms = utils.unixMillis();
         const table_z = try alloc.dupeZ(u8, table);
         const tenant_z = try alloc.dupeZ(u8, tenant);
 
@@ -680,7 +680,7 @@ pub const GenerationProducer = struct {
         // 0 = unavailable (stream missing or NATS hiccup): the manifest then omits
         // the field and clients fall back to the legacy lsn gate — degraded, never
         // wrong-er than before this field existed.
-        const cutoff_seq: u64, const cdc_stream: []const u8 = blk: {
+        const cutoff_seq: u64, const cdc_stream: []const u8, const stream_first: u64 = blk: {
             const name = if (std.mem.eql(u8, tenant, self.topo.open_tenant))
                 self.topo.cdc_stream_public
             else
@@ -688,12 +688,32 @@ pub const GenerationProducer = struct {
             if (js.getStreamInfo(name)) |info_const| {
                 var info = info_const;
                 defer info.deinit();
-                break :blk .{ info.value.state.last_seq, try alloc.dupe(u8, name) };
+                break :blk .{ info.value.state.last_seq, try alloc.dupe(u8, name), info.value.state.first_seq };
             } else |err| {
                 log.warn("🧬 '{s}'/'{s}': stream info for {s} failed ({}) — manifest ships without cutoff_seq, clients use the legacy lsn gate", .{ tenant, table, name, err });
-                break :blk .{ 0, name };
+                break :blk .{ 0, name, 0 };
             }
         };
+        // §10ei: the chain must OVERLAP the stream. A client that fell off the stream
+        // seeds from the newest manifest and resumes at its cutoff_seq; when the stream
+        // no longer holds that sequence (a size valve, a purge, an age under the floor
+        // of §10eg) the client says "predates the stream" and waits for the NEXT
+        // generation — which an unchanged table would never get. So the previous
+        // cutoff is checked against the stream's oldest message here, and a chain that
+        // fell off forces a build even when nothing moved.
+        const chain_fell_off: bool = blk: {
+            if (last_gen == 0 or stream_first <= 1) break :blk false;
+            var kvb = js.kvBucket(self.topo.kv_generations) catch break :blk false;
+            defer kvb.deinit();
+            const mkey = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
+            var entry = kvb.get(mkey) catch break :blk false;
+            defer entry.deinit();
+            const man = std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{}) catch break :blk false;
+            if (man != .object) break :blk false;
+            const prev_cut: i64 = if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else 0) else 0;
+            break :blk prev_cut > 0 and prev_cut + 1 < @as(i64, @intCast(stream_first));
+        };
+        if (chain_fell_off) log.warn("🧬 '{s}'/'{s}': chain g{d} fell off {s} (its cutoff is below the stream's oldest message, seq {d}) — a returning client could not splice; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, cdc_stream, stream_first });
 
         // ── 2. REPEATABLE READ + tenant scoping, same policy as snapshots ────
         {
@@ -765,6 +785,7 @@ pub const GenerationProducer = struct {
             break :blk std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
         };
         const deletes_moved = if (last_del_count) |prev| del_count_now != prev else false;
+        var repair_only = false;
         if (unchanged_by_version) {
             if (last_row_count) |prev| if (last_del_count == null) {
                 log.info("🧬 '{s}'/'{s}': no delete count recorded for g{d} — building once to record {d}", .{ tenant, table, last_gen, del_count_now });
@@ -772,12 +793,19 @@ pub const GenerationProducer = struct {
                 // An epoch move is a change even when nothing else moved (§10df): the
                 // whole point of zebridge_reseed() is a full for data CDC never carried.
                 if (prev == row_count_now and !deletes_moved and !epoch_moved and !shape_moved) {
-                    log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows, {d} deletes) — skipped", .{ tenant, table, last_gen, prev, del_count_now });
-                    const rb = try queryOne(pgc, "ROLLBACK", &.{});
-                    c.PQclear(rb);
-                    return;
-                }
-                if (prev != row_count_now) {
+                    if (!chain_fell_off) {
+                        log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows, {d} deletes) — skipped", .{ tenant, table, last_gen, prev, del_count_now });
+                        const rb = try queryOne(pgc, "ROLLBACK", &.{});
+                        c.PQclear(rb);
+                        return;
+                    }
+                    // §10ej: nothing moved but the chain fell off the stream — the repair
+                    // is an EMPTY delta, a fresh cut point and no rows: one small object,
+                    // zero rows on every returning client. A full here would rebuild a
+                    // large idle table because the stream moved, on both sides. The
+                    // depth clock still decides a full when one is due.
+                    repair_only = true;
+                } else if (prev != row_count_now) {
                     log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the row count did ({d} -> {d}) — rows were deleted; forcing a full", .{ tenant, table, last_gen, prev, row_count_now });
                 } else {
                     log.info("🧬 '{s}'/'{s}': no version moved and the count held since g{d}, but n_tup_del moved ({d} -> {d}) — deletes offset by inserts; forcing a full", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
@@ -785,7 +813,7 @@ pub const GenerationProducer = struct {
             } else {
                 log.info("🧬 '{s}'/'{s}': no row count recorded for g{d} — building once to record {d}", .{ tenant, table, last_gen, row_count_now });
             }
-            build_full = true;
+            if (!repair_only) build_full = true;
         } else if (deletes_moved) {
             // Changed by version AND something was deleted: the delta carries what
             // moved, a full is the only thing that can carry an absence.
@@ -1065,6 +1093,44 @@ pub const GenerationProducer = struct {
         });
         if (build_delta) log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, delta_payload.?.len });
         if (build_full) log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, full_payload.?.len });
+
+        // §10ej: verify AFTER publishing that the cut is still inside the stream. The
+        // cut is taken before the snapshot and the build takes time; under the burst
+        // that pushed the stream past the chain in the first place, the stream's
+        // oldest message can pass the new cut before the manifest is live — and then
+        // no client can splice on it. Said here, retried at once by the tick (bounded).
+        if (cutoff_seq > 0) {
+            if (js.getStreamInfo(cdc_stream)) |info_c2| {
+                var info2 = info_c2;
+                defer info2.deinit();
+                const first_now = info2.value.state.first_seq;
+                if (cutoff_seq + 1 < first_now) {
+                    self.cut_fell_off = true;
+                    log.warn("🧬 '{s}'/'{s}': g{d}'s cut (seq {d}) fell off {s} during the build — the stream's oldest message is {d} now, the build took {d} ms; no client can splice on this generation", .{ tenant, table, gen, cutoff_seq, cdc_stream, first_now, utils.unixMillis() - build_started_ms });
+                }
+            } else |_| {}
+        }
+    }
+
+    /// §10ej: one pair's build with the bounded retry the post-publish check asks
+    /// for: the cut fell off during the build → build again at once, three times at
+    /// most. Beyond that the stream prunes faster than this pair builds — a size
+    /// valve under a burst, or an age under a build — and no retry can win: say so
+    /// and leave it to the next tick; clients wait for a splice rather than read past
+    /// the hole (§10ei). The back-pressure that would let the WAL absorb the burst
+    /// (pause publishing for one build) is the next step, not this one.
+    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8) void {
+        var attempt: u8 = 0;
+        while (attempt < 3) : (attempt += 1) {
+            self.cut_fell_off = false;
+            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol) catch |err| {
+                log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
+                return;
+            };
+            if (!self.cut_fell_off) return;
+            if (attempt < 2) log.warn("🧬 '{s}'/'{s}': rebuilding at once ({d}/3)", .{ tenant, table, attempt + 2 });
+        }
+        log.err("🧬 '{s}'/'{s}': the cut fell off the stream three builds in a row — the stream prunes faster than this pair builds (CDC_MAX_BYTES / CDC_MAX_MSGS under a burst, or CDC_MAX_AGE_SECONDS under a build); clients wait for a splice until the next cadence", .{ tenant, table });
     }
 };
 

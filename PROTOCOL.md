@@ -871,6 +871,8 @@ stream's `first_seq`:
 
 * `stored_seq == 0` (first run) or `stored_seq < first_seq - 1` (the stream pruned past the stored position) → **gap** on that stream.
 * Otherwise resume that stream from `stored_seq + 1`.
+* **Live, too.** Stream sequences are contiguous and a tail reads the whole stream, so the next delivered sequence is `stored_seq + 1`. A delivered sequence beyond that means the stream pruned under the consumer (a host that did not poll, a tab throttled in the background): the server continues from the oldest message it holds and says nothing. The client treats it as the gap above, taken at once — the position stays below the hole until the re-seed lands.
+* **A chain older than the stream cannot splice.** If the newest manifest's `cutoff_seq + 1 < first_seq`, the events between the cutoff and the stream's oldest message are gone; the client says so and waits for the producer's next generation rather than seed and read past the hole.
 
 The bridge keeps every CDC stream for at least two generation cadences (`CDC_MAX_AGE_SECONDS`, three by default): a gap re-seeds from the chain and resumes at the newest manifest's `cutoff_seq`, at most one cadence old, so the splice point is still in the stream. A stream that pruned harder than that (a size valve, a purge) leaves a chain that predates it; the client then waits for the next generation rather than resume past the hole.
 
