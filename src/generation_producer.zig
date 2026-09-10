@@ -234,7 +234,13 @@ pub const GenerationProducer = struct {
         // with no row yet falls back to the boot-time maps and defaults), which is
         // what makes chain onboarding fully LIVE: a table enabled mid-flight gets its
         // chain on the next tick with no restart and no env edit.
-        const derived = try queryOne(pgc, "SELECT pt.tablename, COALESCE(cat.tenant_col::text, ''), COALESCE(cat.version_col::text, '') " ++
+        const derived = try queryOne(pgc, "SELECT pt.tablename, COALESCE(cat.tenant_col::text, ''), COALESCE(cat.version_col::text, ''), " ++
+            "COALESCE(cat.tombstone_col::text, ''), " ++
+            // §10ek: the soft-delete guard (init.write, `zebridge_soft_delete_t`) turns a DELETE
+            // into a tombstone and lets only the sweeper through — on such a table a moving
+            // delete counter can only mean reaps, which every replica removed at the tombstone.
+            "EXISTS (SELECT 1 FROM pg_trigger g JOIN pg_class gc ON gc.oid = g.tgrelid JOIN pg_namespace gn ON gn.oid = gc.relnamespace " ++
+            "        WHERE gn.nspname = pt.schemaname AND gc.relname = pt.tablename AND g.tgname = 'zebridge_soft_delete_t') " ++
             "FROM pg_publication_tables pt " ++
             "LEFT JOIN public.zebridge_catalogue cat ON cat.tbl = pt.tablename " ++
             "WHERE pt.pubname = $1 " ++
@@ -272,6 +278,8 @@ pub const GenerationProducer = struct {
             const table = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(derived, @intCast(i), 0)));
             const cat_tenant_col = std.mem.span(c.PQgetvalue(derived, @intCast(i), 1));
             const cat_version_col = std.mem.span(c.PQgetvalue(derived, @intCast(i), 2));
+            const tcol = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(derived, @intCast(i), 3)));
+            const guarded = c.PQgetvalue(derived, @intCast(i), 4)[0] == 't';
 
             // Catalogue first (live), boot-time maps as fallback (env overrides
             // were already merged into those maps at boot — env still wins there).
@@ -317,7 +325,7 @@ pub const GenerationProducer = struct {
                         if (!ok) continue;
                     }
                     pairs += 1;
-                    self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol);
+                    self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded);
                 }
             } else {
                 const tenant = self.topo.open_tenant;
@@ -327,7 +335,7 @@ pub const GenerationProducer = struct {
                     if (!ok) continue;
                 }
                 pairs += 1;
-                self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol);
+                self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded);
             }
         }
         log.debug("🧬 tick: {d} published table(s) derived, {d} (table, tenant) pair(s) built or checked", .{ n_tables, pairs });
@@ -473,6 +481,11 @@ pub const GenerationProducer = struct {
         table: []const u8,
         tenant: []const u8,
         vcol: []const u8,
+        /// The tombstone column ('' when the table keeps none): a full carries only live
+        /// rows (§10ek), a delta carries the tombstoned ones — the delete signal.
+        tcol: []const u8,
+        /// The soft-delete guard is on the table: deletes are reaps, never a hole.
+        guarded: bool,
     ) !void {
         const build_started_ms = utils.unixMillis();
         const table_z = try alloc.dupeZ(u8, table);
@@ -784,7 +797,15 @@ pub const GenerationProducer = struct {
             if (c.PQntuples(res) == 0) break :blk 0;
             break :blk std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
         };
-        const deletes_moved = if (last_del_count) |prev| del_count_now != prev else false;
+        // §10ek: on a guarded table the counter can only move for the sweeper's reaps of
+        // rows every replica removed when their tombstone arrived (the delta object built
+        // at that tick carries it, immutably) — no full is owed. A shrinking count(*)
+        // on such a table is explained by the same reaps, UNLESS the counter did not
+        // move at all: then rows went without a delete (TRUNCATE), and a full must.
+        const counter_moved = if (last_del_count) |prev| del_count_now != prev else false;
+        const deletes_moved = counter_moved and !guarded;
+        const shrink_explained = guarded and counter_moved;
+        if (guarded and counter_moved) log.info("🧬 '{s}'/'{s}': deletes since g{d} ({d} -> {d}) are the sweeper's reaps — the guard tombstones every other DELETE; no full owed", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
         var repair_only = false;
         if (unchanged_by_version) {
             if (last_row_count) |prev| if (last_del_count == null) {
@@ -792,7 +813,7 @@ pub const GenerationProducer = struct {
             } else {
                 // An epoch move is a change even when nothing else moved (§10df): the
                 // whole point of zebridge_reseed() is a full for data CDC never carried.
-                if (prev == row_count_now and !deletes_moved and !epoch_moved and !shape_moved) {
+                if ((prev == row_count_now or shrink_explained) and !deletes_moved and !epoch_moved and !shape_moved) {
                     if (!chain_fell_off) {
                         log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows, {d} deletes) — skipped", .{ tenant, table, last_gen, prev, del_count_now });
                         const rb = try queryOne(pgc, "ROLLBACK", &.{});
@@ -805,6 +826,10 @@ pub const GenerationProducer = struct {
                     // large idle table because the stream moved, on both sides. The
                     // depth clock still decides a full when one is due.
                     repair_only = true;
+                } else if (epoch_moved) {
+                    log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the seed epoch did (§10df) — forcing a full", .{ tenant, table, last_gen });
+                } else if (shape_moved) {
+                    log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the column shape did (§10dg) — forcing a full", .{ tenant, table, last_gen });
                 } else if (prev != row_count_now) {
                     log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the row count did ({d} -> {d}) — rows were deleted; forcing a full", .{ tenant, table, last_gen, prev, row_count_now });
                 } else {
@@ -819,7 +844,7 @@ pub const GenerationProducer = struct {
             // moved, a full is the only thing that can carry an absence.
             log.info("🧬 '{s}'/'{s}': n_tup_del moved since g{d} ({d} -> {d}) — forcing a full alongside the delta", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
             build_full = true;
-        } else if (last_row_count) |prev| if (row_count_now < prev) {
+        } else if (last_row_count) |prev| if (row_count_now < prev and !shrink_explained) {
             // Changed by version AND shrunk: the delta will carry the survivors that
             // moved, but nothing can carry the rows that went — a full must.
             log.info("🧬 '{s}'/'{s}': row count shrank since g{d} ({d} -> {d}) — forcing a full alongside the delta", .{ tenant, table, last_gen, prev, row_count_now });
@@ -831,7 +856,16 @@ pub const GenerationProducer = struct {
         var full_rows: usize = 0;
         var widest_row: usize = 0;
         if (build_full) {
-            const sql = try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
+            // §10ek: a full carries LIVE rows only. Every client applies a full as a wipe
+            // and a reload inside one transaction, so a row absent from it is gone on the
+            // replica whether or not the full named it; a tombstoned row in a full only
+            // told the client to delete what it had already deleted. The fast sting's
+            // full was 15 MiB for four live rows. The DELTA keeps its tombstoned rows:
+            // that is the delete signal for a client catching up.
+            const sql = if (tcol.len > 0)
+                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ table, tcol })
+            else
+                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
             const res = try queryOne(pgc, sql, &.{});
             defer c.PQclear(res);
             full_payload = try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
@@ -1119,11 +1153,11 @@ pub const GenerationProducer = struct {
     /// and leave it to the next tick; clients wait for a splice rather than read past
     /// the hole (§10ei). The back-pressure that would let the WAL absorb the burst
     /// (pause publishing for one build) is the next step, not this one.
-    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8) void {
+    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool) void {
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
             self.cut_fell_off = false;
-            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol) catch |err| {
+            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, guarded) catch |err| {
                 log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                 return;
             };

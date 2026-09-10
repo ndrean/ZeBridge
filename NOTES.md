@@ -10667,6 +10667,40 @@ fifth build — the price of running under the floor, and one more reason the do
 refuses it. Each wall bridge now writes its own log; the wind-down bridge used to
 overwrite the phase's.
 
+## 10ek. Fulls carry live rows only, and a reap owes no full (2026-09-10)
+
+Two bandages agreed in prose after the wall, both on the producer, both measured on
+the live stack with a 60 s cadence.
+
+**A full without tombstones.** Every client applies a full as a wipe and a reload in
+one transaction, so a row absent from the full is gone on the replica whether or not
+the full named it; a tombstoned row in a full only told the client to delete what it
+had already deleted. The fast sting's full was 15 MiB for four live rows, and every
+returning client downloaded and re-applied it. The full's query now reads `WHERE
+<tombstone> IS NULL`; the DELTA keeps its tombstoned rows — that is the delete signal
+for a client catching up. Measured: six tombstoned rows and none live on kilo, a
+re-seed forcing a full: 217 bytes, zero rows, the same as an empty tenant's.
+
+**A reap owes no full.** The producer forces a full whenever the table's delete
+counter moves, because only a full can carry an absence. That rule was written for a
+DBA's `DELETE`, and on a table with a tombstone column that DELETE has not been
+physical for weeks: the write profile's `zebridge_soft_delete_t` turns it into a
+tombstone plus a version bump, and lets only the sweeper through (it identifies itself
+as `zb_sweeper` in the setting the RLS policies read). So on a guarded table the
+counter can only move for reaps of rows every replica removed when their tombstone
+arrived — the delta object built at that tick carries it, immutably — and no full is
+owed. The producer now reads the guard's presence with the catalogue (one `pg_trigger`
+EXISTS in the derive query) and, on a guarded table, treats a moving counter as reaps
+and a shrinking count as explained by them. The one hole left is a TRUNCATE, which
+moves no counter: a shrinking count with a still counter forces the full as before.
+Measured: a DBA `DELETE` of ten live rows became ten tombstones (`DELETE 0`), the next
+tick cut a 993-byte delta carrying them and no full; the sweeper reaped 3,371
+tombstones in four batches, the next tick read `deletes since gN … are the sweeper's
+reaps — no full owed` for every tenant and skipped; forced fulls in the run: none.
+
+The log's unchanged-table branch now names the epoch and the shape moves before the
+count rule, so a re-seed's full is no longer logged as "rows were deleted".
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

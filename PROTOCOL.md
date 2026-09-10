@@ -1809,11 +1809,13 @@ offline window with pending writes that this deployment supports**.
 ⚠️ **A parent cannot be tombstoned while a live child references it.** A tombstone is a delete on every replica, and a replica's foreign keys have no cascade, so PostgreSQL refuses the tombstone at the source (a trigger on the tombstone column, `foreign_key_violation`) and the writer receives `rejected` naming the child table. Delete the children first. The converse contradiction, a foreign key `ON DELETE CASCADE` into a table that keeps tombstones, is refused by `zebridge_enable` and by the DDL guard: the cascade's physical deletes would never reach a replica. The sweeper reaps children before parents.
 
 ⚠️ **A client removes the row the moment the tombstone arrives.** The soft delete reaches
-a replica as an ordinary `update` whose tombstone column is set — on CDC, in a chain
+a replica as an ordinary `update` whose tombstone column is set — on CDC, in a delta
 row, or as the client's own optimistic apply — and the physical reap that follows is
 never forwarded (§4). So the tombstone *is* the delete on the client side: a replica that
 keeps tombstoned rows holds them forever. The reference clients apply one rule at all
 three doors: tombstone present and not null → delete by key.
+
+A **full** carries live rows only: a client applies a full as a wipe and a reload in one transaction, so a row absent from it is gone on the replica whether or not the full named it. A **delta** keeps its tombstoned rows — that is the delete signal for a client catching up through deltas — and the delta object built at the tick the tombstone was set carries it for as long as the chain keeps that generation, whatever the sweeper reaps later. On a table with the soft-delete guard (`zebridge_soft_delete_t`) the only physical deletes are the sweeper's reaps, and the producer forces no full for them; a table without the guard still gets a full whenever its delete counter moves, since nothing else can carry an absence.
 
 > ### 🔴 **DBA — a table is created for this**
 >
