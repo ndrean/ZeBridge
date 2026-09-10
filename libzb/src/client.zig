@@ -124,6 +124,15 @@ pub const SyncClient = struct {
     tenant: []const u8 = "",
     /// §10x dictionaries by object name — immutable, so the cache cannot go stale.
     dicts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// §10el: when each pending write was last sent by THIS process (unix ms). A
+    /// `flush` used to run the reconnect pass — one direct get for the verdict, then
+    /// a replay — over every pending entry, including a write sent a millisecond
+    /// earlier: the direct get beat the verdict subscription and the log said the
+    /// client had been "away", and every entry cost a request per flush. An entry
+    /// sent within the grace window is left to the subscription. Empty at start, so a
+    /// fresh process (and a real outage, longer than the grace) still runs the full
+    /// pass, which is what PROTOCOL §7.4b asks. Keys owned here, freed on settle.
+    sent_at: std.StringHashMapUnmanaged(i64) = .empty,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
     /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
     /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
@@ -232,6 +241,9 @@ pub const SyncClient = struct {
     /// forgotten the same way — it is the one list, and both this and the test read it.
     pub fn deinit(self: *SyncClient) void {
         self.releaseHandles();
+        var sit = self.sent_at.iterator();
+        while (sit.next()) |e| self.a.free(e.key_ptr.*);
+        self.sent_at.deinit(self.a);
         self.ro.close();
         self.st.close();
         self.arena.deinit();
@@ -850,7 +862,8 @@ pub const SyncClient = struct {
                 const first = ge.value_ptr.*;
                 const stored: i64 = @intCast(try self.storedSeq(ge.key_ptr.*));
                 if (first > 1 and stored < first - 1) {
-                    std.debug.print("{s}: gap healed — resuming at the stream's oldest message ({d}; was {d})\n", .{ ge.key_ptr.*, first - 1, stored });
+                    // A first run (stored 0) resumes there too, silently: it is not a healed gap.
+                    if (stored > 0) std.debug.print("{s}: gap healed — resuming at the stream's oldest message ({d}; was {d})\n", .{ ge.key_ptr.*, first - 1, stored });
                     try self.persistSeq(ge.key_ptr.*, @intCast(first - 1));
                 }
             }
@@ -1739,6 +1752,11 @@ pub const SyncClient = struct {
 
         var refused: std.StringArrayHashMapUnmanaged(void) = .empty;
         for (gate.object.get("refuse").?.array.items) |v| try refused.put(a, v.string, {});
+        // §10el: the grace — the bridge answers in milliseconds and its ack wait is ten
+        // seconds; five leaves the subscription its turn and still replays a straggler
+        // well inside one poll of a slow host.
+        const grace_ms: i64 = 5_000;
+        const now_ms = nowMillis();
 
         var sent: usize = 0;
         var failed: usize = 0;
@@ -1746,6 +1764,7 @@ pub const SyncClient = struct {
         var collected: usize = 0;
         for (rows) |r| {
             const msg_id = if (r[0] == .text) r[0].text else continue;
+            if (self.sent_at.get(msg_id)) |t| if (now_ms - t < grace_ms) continue;
             // The verdicts this client MISSED (PROTOCOL §7.4b): one per-key direct get per
             // pending entry, settled through the same handler `drainVerdicts` uses. Until
             // 2026-08-29 nothing read a stored verdict — the replay earned a fresh one,
@@ -1783,6 +1802,11 @@ pub const SyncClient = struct {
                 continue;
             };
             sent += 1;
+            if (self.sent_at.getPtr(msg_id)) |slot| {
+                slot.* = now_ms;
+            } else if (self.a.dupe(u8, msg_id)) |key| {
+                self.sent_at.put(self.a, key, now_ms) catch self.a.free(key);
+            } else |_| {}
         }
         if (collected > 0) std.debug.print("outbox: collected {d} verdict(s) published while this client was away — settled without replay\n", .{collected});
         if (sent == 0 and failed > 0) return last_err.?;
@@ -1792,6 +1816,9 @@ pub const SyncClient = struct {
     /// One verdict, live or collected: true when definitive (the outbox entry is
     /// settled one way or another), false for `failed` (kept for retry).
     fn settleVerdict(self: *SyncClient, a: std.mem.Allocator, mid: []const u8, data: []const u8) !bool {
+        // §10el: settled or not, this entry's send time has served; a `failed` verdict
+        // keeps the entry queued and the next flush past the grace replays it.
+        if (self.sent_at.fetchRemove(mid)) |kv| self.a.free(kv.key);
         const v = parseStoredJson(a, data) catch return false;
         const status = if (v == .object) (if (v.object.get("status")) |x| (if (x == .string) x.string else "") else "") else "";
         self.verdict_counts.count(status);

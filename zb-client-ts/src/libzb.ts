@@ -1992,6 +1992,20 @@ export class ZeBridge {
       if (applied === null) return false;
     }
 
+    // §10el: the dictionary cache is bounded by the chain. `_zebridge_dicts` kept every
+    // dictionary this replica ever fetched — one per training era per table, never
+    // pruned, while the producer prunes its own once no kept generation references
+    // them. What this table's manifest still names stays; the rest goes.
+    try {
+      const keep = new Set<string>((manifest.deltas ?? []).map((d: any) => d.dict).filter(Boolean));
+      const rows: any[] = (await this.run(`SELECT name FROM _zebridge_dicts WHERE name LIKE ?`, `${table}-g%-dict`)) ?? [];
+      for (const r of rows) {
+        if (keep.has(r.name)) continue;
+        await this.run(`DELETE FROM _zebridge_dicts WHERE name = ?`, r.name);
+        this.dictCache.delete(r.name);
+      }
+    } catch { /* best effort — the cache is a cache */ }
+
     state.lsn = lsnToNumber(manifest.cutoff_lsn);
     state.seedLsn = state.lsn; // the ONE place the legacy data gate may anchor to (finding 10)
     if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {

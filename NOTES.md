@@ -10701,6 +10701,35 @@ reaps — no full owed` for every tenant and skipped; forced fulls in the run: n
 The log's unchanged-table branch now names the epoch and the shape moves before the
 count rule, so a re-seed's full is no longer logged as "rows were deleted".
 
+## 10el. The reconnect pass ran on every flush, and the dictionary cache had no bound (2026-09-10)
+
+**The line that said "away".** libzb's `flushOutbox` is the one send path (§10at): a
+`mutate` inserts the outbox row and calls it, a `flush` calls it, a reconnect calls it.
+It ran the reconnect pass of PROTOCOL §7.4b over EVERY pending entry — one direct get
+for the verdict, then a replay — including a write sent a millisecond earlier. In a
+fast loop (three `mutate`, one `flush(0)`) the direct get beat the client's own
+verdict subscription, the entry settled, and the log said `collected N verdict(s)
+published while this client was away` about a client that never left; when the
+bridge had not answered yet, the envelope went out a second time, which the bridge's
+message-id dedup absorbed (the wasp's MUTATIONS count suggests one write in ten). Now
+each pending entry remembers when THIS process last sent it, and an entry sent within
+a five-second grace is left to the subscription; a fresh process starts with nothing
+remembered, so the full pass — direct get, then replay — still runs after a restart
+or an outage longer than the grace, which is exactly the case the pass was written
+for. Measured: twenty writes with `flush(0)` after each, all accepted, outbox empty,
+no recovery line.
+
+**The dictionary cache.** The TypeScript client kept every dictionary it ever fetched
+in `_zebridge_dicts`, one per training era per table, never pruned — while the
+producer prunes its own the moment no kept generation references them. After a seed
+the cache now keeps what the table's manifest still names and drops the rest. libzb's
+cache lives in memory for the process's life, bounded by the eras it meets. The
+manifests themselves are bounded by construction: one KV key per (tenant, table) with
+history 1 on the broker, one watermark row per table on the replica.
+
+**And a fresh replica no longer reports a healed gap:** its first position is the
+stream's oldest message, set silently.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:
