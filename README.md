@@ -39,11 +39,11 @@ flowchart LR
 
 **Local_DB supported flavours**: standard SQLite, PGlite or PostgreSQL.
 
-**How does it work?**: The bridge architecture is split into two core components: a daemon and a client library.
+**How does it work?**: The bridge architecture is split into two core components: a daemon and a client library that makes syncing a breeze.
 
-* the daemon `ZeBridge` (ZB): connects to PostgreSQL (PG) and to NATS/JetStream (NATS). It streams schemas, seeds by chunks and sends PG changes onto NATS. It applies writes coming back from the consumer to the primary database.
+* the daemon `ZeBridge` (ZB): a Zig executable that connects to PostgreSQL (PG) and to NATS/JetStream (NATS). It streams schemas, seeds by chunks and sends PG changes onto NATS. It applies writes coming back from the consumer to the primary database.
 This is a lightweight process that can be started / stopped gracefully on the fly.
-* a client library `libzb`: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, no digging NATS, almost nothing to do. The API of the library is tiny and comes in two flavours: a native TypeScript library and a C ABI dynamically linked library via FFI. The `TS` library uses a push model for reactivity whilst the C ABI library uses a pull model as the host owns the library and polls on every tick. 
+* a client library: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, almost nothing to do. The API of the library is tiny and comes in two flavours: a TypeScript library `zb-clinet-ts` and a native dynamic Zig library `libzb` with a  C ABI  FFI-compatible. The `TS` library uses a push model for reactivity whilst the Zig C ABI library uses a pull model as the host owns the library and polls on every tick. 
 
 **Consumers**: The library can be integrated across a wide range of runtime environments.
 
@@ -54,7 +54,7 @@ This is a lightweight process that can be started / stopped gracefully on the fl
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
 
-* **Performance**: While Postgres is I/O bound, the daemon is CPU bound, no I/O, minimal memory allocation. You can expect the flow PG → NATS to reach >200k evt/s, and a sustained  >20k mut/s flow NATS → PG, boundary scoped.
+* **Performance**: While Postgres is I/O bound, the daemon is CPU bound with minimal memory allocation. You can expect the flow PG → NATS to reach >200k evt/s, and a sustained  >20k mut/s flow NATS → PG, boundary scoped.
 The consumer's local database ingress/egress depends a lot upon your device. Values around 15 +/- 5 k evt/s can be reached.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 * **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independantly from small tables with heavy changes.
@@ -901,16 +901,16 @@ Start from what you see. Each row names the check and the rule behind it.
 * you do not talk to NATS: the library does all of it. 
 * you talk to the replica via the library primitives.
 
-The client libray comes in two flavours: TypeScript (for any JavaScript engine) and a C ABI library `libzb` (mobile Flutter, Python/PHP/Elixir... services).
+The client libray comes in two flavours: TypeScript (for any JavaScript engine) and a native dynamic Zig library with a C ABI `libzb` (mobile Flutter, Python/PHP/Elixir... services).
 
 * **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in any JS runtime: browsers, Node, Electron, Deno, Bun. No wasm and no native library needed — a JavaScript host just uses this.
-* **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (via FFI).
+* **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (FFI-compatible).
 
 💡 One big difference: The TypeScript client drives itself, the C ABI library is driven by its host.
 
 ### The TypeScript API
 
-The consumer app is one websocket connection ot NATS, one storage (persisted or in-memory, storage defaults to SQLite, or declared PGlite)
+The consumer app uses one websocket connection ot NATS, one storage (persisted or in-memory, storage defaults to SQLite, or declared PGlite)
 The dev has his own OAuth onboarding strategy. With the credentials, the dev builds a `zb = new ZeBridge()` object and calls `zb.connect()`. If the dev needs to query the replica, he uses `zb.query(sql)`. When we wants to mutate the replica, he uses `mutate(table, key, values)`. He gets the reactivity by implementing `onChange(table, cb)` and the callback takes a granular event.
 
 
@@ -1932,6 +1932,8 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 
 * Cadence: `GENERATION_CADENCE_SECONDS` (chain depth × cadence must stay under the sweeper's `GC_THRESHOLD_MS`)
 * CDC retention: `CDC_MAX_AGE_SECONDS` (default 3 × cadence, must exceed 2 ×), `CDC_MAX_BYTES` and `CDC_MAX_MSGS` (disk valves; `bridge_cdc_window_short` says when one ends the window before the age does). Applied to existing streams at boot.
+
+Changing the cadence changes the CDC retention with it: the age defaults to three cadences and follows `GENERATION_CADENCE_SECONDS` unless you set it yourself, in which case keep it above two cadences. That is the contract a returning client relies on, so it is checked twice: `bridge --diagnose` reports a violation as a finding before anything runs, and boot warns. Read the doctor rather than wait for the warning to pass by in the log under load.
 * Manifests: `generations` KV, keyed `{tenant}.{table}`
 * Objects: per-tenant `gen-{tenant}` object stores
 
