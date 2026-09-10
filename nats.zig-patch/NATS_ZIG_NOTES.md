@@ -3,6 +3,11 @@
 Fixes made while migrating my app onto this library.
 Each entry: what broke, how it showed up, what changed. Upstream candidates unless noted.
 
+Since 2026-09-10 this ledger and the eleven `nats.zig-*.patch` files live together in
+`nats.zig-patch/`; the submodule itself stays at the upstream commit the parent records,
+with the patches applied in its working tree. To re-apply one from the repository root:
+`git -C nats.zig apply ../nats.zig-patch/<name>.patch`.
+
 ---
 
 ## 1. Use-after-free in `pullSubscribe` when the stream is derived from the subject

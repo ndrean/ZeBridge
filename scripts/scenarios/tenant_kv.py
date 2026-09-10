@@ -31,7 +31,7 @@ each a way this could silently regress:
 ⚠️ NOT covered here: the `@nats-io/kv` client's `Kvm.open()` defaulting to the
 unscopable `$JS.API.STREAM.MSG.GET.KV_tenants` path unless `{allow_direct: true}` is
 passed explicitly. This scenario drives the `nats-py` client, which stays on Direct Get
-regardless of that option — it cannot reproduce a regression in `web-consumer`'s own
+regardless of that option — it cannot reproduce a regression in `examples/06-web-consumer`'s own
 `resolveTenant()` call site. See that function's own comment in App.tsx.
 
 Usage:

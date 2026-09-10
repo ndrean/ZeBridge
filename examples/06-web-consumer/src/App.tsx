@@ -7,7 +7,7 @@
 /// that claim — or breaking it — live, from the log the library already emits.
 /// Nothing on this page teaches silently.
 
-import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
+import { ZeBridge, credsFileText, principalFromCreds } from '../../../zb-client-ts';
 import { nkeys } from '@nats-io/nats-core';
 import { createSignal, onCleanup, For, Show } from 'solid-js';
 

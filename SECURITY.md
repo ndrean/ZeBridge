@@ -406,7 +406,7 @@ principal is trustworthy because NATS authorises subjects. Delete the permission
 principal becomes a self-asserted string; the bridge cannot tell the difference and does
 not try.
 
-✅ `web-consumer/zb-probe.mjs` replays the client's startup against the real allow-list
+✅ `examples/06-web-consumer/zb-probe.mjs` replays the client's startup against the real allow-list
 and prints ok/FAIL per step — it is how the missing `$JS.API.INFO` and `CONSUMER.INFO.*`
 grants were found. The refusals (`mutation.bob.…`, `cdc.>`, `$KV.>`, `MUTATIONS`, `INIT`
 purge, `mutation_ack.bob.>`, forging a verdict) are manual, recorded in NOTES §1.8.
@@ -712,9 +712,9 @@ refactor, or a migration — and most of the defects found while building this w
 | a client cannot suspend a table for everyone with one oversized write; the limit is discoverable as `max_row_bytes` | ✅ `scripts/scenarios/rowsize.py` — the DoS was measured before the guard existed |
 | a row the change feed cannot carry is refused at WRITE time, both doors, atomically: edge writes get a `rejected` verdict (SQLSTATE 23514), psql an ordinary ERROR; bounded-only tables get no trigger at all | ✅ `scripts/scenarios/widthguard.py` — 6 assertions, including the small-payload fattening edit the ingress check cannot see |
 | a legacy oversized row (pre-guard data) is detected by the generation producer on its first build, quarantines the table on its first CDC touch (`$KV.schemas` says `"suspended": true`), is re-flagged by every boot's preflight from the stored data, and the de-quarantine recipe (repair, reboot) readmits mechanically | ✅ `scripts/scenarios/legacybait.py` — 7 assertions; owns the only bridge |
-| mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `web-consumer/zb-mutate.mjs` |
+| mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `examples/06-web-consumer/zb-mutate.mjs` |
 | the principal reaches RLS: `set_config` and the upsert share one transaction, now the pipeline's implicit one | ✅ `scripts/scenarios/writable.py`, `tiebreak.py`, `invalidate.py` — every RLS-scoped write would be refused if it did not |
-| client's JetStream permission set is complete | ✅ `web-consumer/zb-probe.mjs` |
+| client's JetStream permission set is complete | ✅ `examples/06-web-consumer/zb-probe.mjs` |
 | ~~the snapshot-serving invariants~~ | retired with snapshot-on-demand (NOTES §10o–§10p): `wide.py`, `snapshot.py`, `stampede.py` deleted with the path they tested |
 | a schema change reaches every cache: KV schema, relation decode, refusal registry, write-path catalog | ✅ `scripts/scenarios/invalidate.py` — found the added-column half unwritable until restart, and verified to *fail* before the fix |
 | a malformed mutation dead-letters and does not block the queue | ✅ `scripts/scenarios/poison.py` |
@@ -748,7 +748,7 @@ Run the automated set with:
 ```bash
 zig build test                                              # 366 unit tests
 NATS_URL=nats://alice:s3cret@127.0.0.1:4222   scripts/scenarios/.venv/bin/python scripts/scenarios/writable.py
-cd web-consumer && node zb-probe.mjs                        # permission set
+cd examples/06-web-consumer && node zb-probe.mjs                        # permission set
 
 set -a && . ./.env.admin && set +a
 scripts/scenarios/.venv/bin/python scripts/scenarios/render.py   # bootstrap integrity

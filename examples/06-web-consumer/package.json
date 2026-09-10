@@ -19,7 +19,7 @@
     "solid-js": "^1.9.14",
     "sqlocal": "^0.18.0",
     "uuid": "^14.0.1",
-    "zb-client-ts": "link:../zb-client-ts"
+    "zb-client-ts": "link:../../zb-client-ts"
   },
   "devDependencies": {
     "typescript": "^5.7.2",

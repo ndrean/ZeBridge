@@ -21,7 +21,7 @@ Three clients exist, and the same protocol is asserted through each:
 | --- | --- | --- |
 | `zb-client-ts` <br> (TS shell + pure core) | `zb-client-ts/` | `pnpm test` — 127 fixture cases in `fixtures/core-fixtures.json` |
 | `libzb` (Zig, C ABI) | `libzb/` | `zig build test`; `python/runner.py` runs the SAME 127 fixtures through the C ABI |
-| `web-consumer` (vite, OPFS/PGlite) | `web-consumer/` | driven by hand; `window.zb` exposes the index card for scripted checks |
+| `examples/06-web-consumer` (vite, OPFS/PGlite) | `examples/06-web-consumer/` | driven by hand; `window.zb` exposes the index card for scripted checks |
 
 ## How to run
 

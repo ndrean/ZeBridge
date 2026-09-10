@@ -1143,7 +1143,7 @@ startPolling();
 
 ### Code examples
 
-* [App.tsx](/web-consumer/src/App.tsx) (browser, live),
+* [App.tsx](/examples/06-web-consumer/src/App.tsx) (browser, live),
 * [Flutter](/flutter) example, 
 *  Node, Go, Python and Elixir microservices.
 
@@ -1196,7 +1196,7 @@ The one case it loses is when it arrives late with an older stamp than an edit t
 
 * **Browser SQLite (one OPFS connection)**: Enforced. the library owns the single connection and hands the app a **read-only** handle — a direct write is simply unreachable.  today.
 * **Mobile and microservice SQLite**: Enforced. SQLite is the only mobile engine, and there the library does not own the connection the same way — so the lock moves into the schema: an **initial migration** makes the app-facing tables read-only (views + triggers) and routes writes through the library's own path. ➡ Enforced by the schema, not the handle.
-* **PGlite:** a supported engine (`?engine=pglite` in web-consumer; adapter at `zb-client-ts/pglite`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single in-memory connection exactly as it owns the OPFS one, so the same handle-level lock applies; the schema-migration path on PGlite is not yet driven.
+* **PGlite:** a supported engine (`?engine=pglite` in examples/06-web-consumer; adapter at `zb-client-ts/pglite`, dialect seam in `zb-client-ts/src/dialect.ts`). The library owns PGlite's single in-memory connection exactly as it owns the OPFS one, so the same handle-level lock applies; the schema-migration path on PGlite is not yet driven.
 * **Local Postgres (microservice):** the same choice as PGlite, ➡ schema-enforced.
 
 The rule is the same everywhere; the _mechanism_ that guarantees it is engine-specific. It is why the library — not a set of naming conventions — is the API.

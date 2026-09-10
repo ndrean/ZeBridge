@@ -79,8 +79,8 @@ seed.txt
 # Vite's local overrides. `.env.local` is per-developer by convention and by name —
 # which stack you happen to be pointed at, and (via VITE_AUTH) which credential that
 # broker accepts. `.env.compose.example` is the tracked copy worth reading.
-web-consumer/.env.local
-web-consumer/.env.*.local
+examples/06-web-consumer/.env.local
+examples/06-web-consumer/.env.*.local
 libzb/soak-uids.txt
 libzb/zbz-*.sqlite3*
 zb-client-ts/zebridge_*.sqlite3
