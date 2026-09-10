@@ -427,3 +427,38 @@ cd nats.zig && zig build test        # unit steps; the integration suite needs i
 ```
 
 ---
+## 11. `PullSubscription.nextDelivered` — what a parked pull still delivers (2026-09-08)
+
+**How it appeared**
+
+A clean stop of ZeBridge's mutation listener left one or two writes "in flight": the
+next instance found them pending on the durable consumer and waited an ack wait for
+their redelivery (ZeBridge NOTES §10eb). The batch in hand had been committed and
+acked; what stayed open was the last pull request.
+
+**Cause**
+
+`fetch` returns as soon as it has something (entry 3's early return, nats.go's legacy
+contract), and the server keeps the request parked until its `expires`. Messages
+delivered into that window land on the wildcard inbox, which the NEXT `fetch` reads —
+fine while fetches keep coming. At shutdown nobody reads it, so those messages are
+delivered and unacked. Pulling "until empty" does not close the window either: under
+a steady publisher every pull returns something and parks in turn.
+
+**Change**
+
+`src/jetstream.zig` — `PullSubscription.nextDelivered(timeout)`: a data message already
+delivered to the consumer's inbox, without a new request; status frames skipped; null
+at the deadline. A caller stopping reads the inbox until it has been silent for longer
+than the parked request can live, then leaves with nothing in flight.
+
+`nats.zig-pull-next-delivered.patch`.
+
+**Verified**
+
+```bash
+# bridge stopped under a 15 writes/s publisher: "N write(s) the parked pull still
+# delivered, judged before exit"; the next boot: nothing in flight.
+```
+
+---

@@ -865,6 +865,7 @@ Start from what you see. Each row names the check and the rule behind it.
 | a table is missing on every client | `SELECT * FROM zebridge_suspensions`; the log line naming the table | suspended: see [Suspended tables](#suspended-tables). Or never enabled: `zebridge_enable` |
 | rows are missing on every client | `bridge_refused_events_dropped_total` on `/metrics`; the table's `seed_epoch` in `zebridge_catalogue` | the table was suspended for a while; the lift re-seeds. If the epoch did not move, `zebridge_reseed('t')` |
 | rows are missing on one client | `bridge_fleet_client_lag_events` for that client; its own log for `held`, `predates`, `waiting for the producer's full` | it is behind, or waiting for the next full after a re-seed; both resolve by themselves |
+| a client back from a pause says `chain predates` | `bridge_cdc_window_seconds` for its stream against 2 × cadence; `bridge_cdc_window_short` | the stream's window is shorter than the chain's reach: raise `CDC_MAX_AGE_SECONDS`, or a byte/message valve is ending the window first; the client re-seeds at the next generation by itself |
 | old rows hold NULL in a new column, PostgreSQL does not | the column's default in PostgreSQL | an expression default; `zebridge_reseed('t')` |
 | a client still shows the old shape after a migration | `nats kv get schemas <table>`; the client's log for `SCHEMA` | the descriptor did not publish (a suspension), or the client failed the ALTER and logged why |
 | a write is rejected with `stale` | the client's log: `rebased` or `edit LOST` | last-writer-wins on the version; the client resends an edit whose columns the winner did not touch, and drops one on a contested column, by design |
@@ -898,11 +899,11 @@ Start from what you see. Each row names the check and the rule behind it.
 **Two rules**: 
 
 * you do not talk to NATS: the library does all of it. 
-* you talk to the replica via the library fprimitives.
+* you talk to the replica via the library primitives.
 
 The client libray comes in two flavours: TypeScript (for any JavaScript engine) and a C ABI library `libzb` (mobile Flutter, Python/PHP/Elixir... services).
 
-* **`libzb.js`** — a self-contained TypeScript package that runs **as-is** in any JS runtime: browsers, Node, Electron, Deno, Bun. No wasm and no native library needed — a JavaScript host just uses this.
+* **`zb-client-ts`** — a self-contained TypeScript package that runs **as-is** in any JS runtime: browsers, Node, Electron, Deno, Bun. No wasm and no native library needed — a JavaScript host just uses this.
 * **`libzb`** — a native library with a C ABI for mobile apps, desktop apps and microservices (via FFI).
 
 💡 One big difference: The TypeScript client drives itself, the C ABI library is driven by its host.
@@ -921,13 +922,14 @@ const zb = new ZeBridge({
   engine: 'sqlite',
   durable: true,
   principal: "alice",
-  credentials: jwt,
-  oauth: ???
+  creds: credsText,   // the .creds file's text (JWT + seed), from your own onboarding
 })
 await zb.connect();
 ```
 
 Once you call `connect()`, it subscribes, receives, applies and fires your callbacks on its own: you do nothing. 
+
+`durable` defaults to true: the replica is a stable per-principal file that survives a reload, which is what an outbox needs — a write queued while the socket was down must still be there after the page comes back. `durable: false` gives a fresh replica per load, the shape a dev loop wants and nothing else. `engine` defaults to SQLite; `'pglite'` loads PostgreSQL-in-the-browser on demand, and a SQLite consumer never downloads it.
 
 **Query**: `query(sql)` — read your local database directly. Any SQL: joins, aggregates, offline. The replica _is_ the API.
 
@@ -937,7 +939,7 @@ const resp = await zb.query(q);
 ```
 
 
-**Mutation**: `mutate(table, key, values)` — one write, three verbs (insert, update, delete), resolved last-write-wins. This is the only way to change data.
+**Mutation**: `mutate(table, op, key, values)` — one write, three verbs (insert, update, delete), resolved last-write-wins. This is the only way to change data.
 
 <details><summary>An example of a mutation query</summary>
 
@@ -985,9 +987,13 @@ A change event arrives from NATS as:
 ```js
 {
   operation: 'INSERT' | 'UPDATE' | 'DELETE',
-  data: Record<string, any>, // The exact columns that were sent
-  old?: Record<string, any>  // (Optional) The prior values if this is an update
+  data: Record<string, any>, // the row's columns as sent
 }
+```
+
+💡 Two things to know when writing a handler. The same row rings twice for your own writes: once for the optimistic apply, once for the CDC echo, so an **INSERT handler must upsert**, never append blindly. And on a table that keeps tombstones, a delete arrives as an UPDATE whose tombstone column is set: treat that as the delete it is.
+
+```js
 ```
 
 You define the callback taylored to your table which mimics the mutations and action the signals accordingly to have granular rendering.
@@ -996,7 +1002,7 @@ The example in _App.tsx_ uses `SolidJS` and looks like:
 ```js
 const [counters, setCounters] = createSignal();
 
-zb.oncChange("counter_public", (ev) => {
+zb.onChange("counter_public", (ev) => {
   // seeding return ev = undefined, need a UI refresh
   if (!ev) {
     void refresh(['app_orders']); return;
@@ -1020,34 +1026,79 @@ That is the whole contract for an app author. A callback to implement by table, 
 
 ### The C ABI library
 
-`libzb` does nothing on its own. It moves only when the host calls `zb_client_poll`, which reads and applies what arrived, and `zb_client_flush`, which sends the outbox and collects verdicts.
+`libzb` does nothing on its own. It moves only when the host calls it. Seven verbs make the card:
 
-1. The dev writes a polling loop in a background thread with these two primitives:
+| verb | what it does | returns |
+| --- | --- | --- |
+| `zb_client_open(opts_json)` | opens the replica and the socket | a handle, `0` on failure |
+| `zb_client_sync(h)` | the first step after open: resolves the tenant, applies the schemas, seeds the tables, drains the streams | `{"tenant": …, "first": bool}` |
+| `zb_client_poll(h, wait_ms)` | waits up to `wait_ms` for CDC, applies what arrived, retries what was held, collects verdicts | `{"applied", "settled", "changed_tables", "seeded"}` |
+| `zb_client_flush(h, wait_ms)` | sends the outbox and waits up to `wait_ms` for verdicts | `{"sent", "settled", "verdicts": {…}}` |
+| `zb_client_query(h, sql, params_json)` | a read against the replica | `{"columns": […], "rows": [[…], …]}` |
+| `zb_client_mutate(h, table, op, key_json, values_json)` | one write: optimistic locally, sent at once | `{"msgId": …}` |
+| `zb_client_close(h)` | closes the socket and the replica | `0` |
+
+Beside them: `zb_client_mutate_at` (a write with the caller's own version stamp), `zb_client_wipe` (the explicit wipe: close and delete the replica files), `zb_grammar_hash` and `zb_grammar_json` (what this build of the library speaks), `zb_client_live` and `zb_abi_version`.
+
+**How data crosses.** Everything is a C string of JSON, in and out, so a binding is three declarations in any language with an FFI. Two ownership rules make it safe:
+
+* Strings you pass in are read during the call and never kept: free your own copies as soon as the call returns.
+* Every string the card returns is allocated by the library and is yours until you hand it back with `zb_free(p)`. Read it, decode it, free it — in that order, every time. A binding that forgets `zb_free` leaks one JSON document per call; the Dart, Swift and C++ bindings in `examples/05-mobile` free in the same line they decode.
+
+A failure comes back as `{"error": "<name>"}` on the same channel, and `open` returns `0`: check both before anything else. A query the replica refuses adds `"detail"` with SQLite's own words (`no such table: test_types`: a table this client does not follow).
+
+**Who holds the handle.** The client is single-threaded by contract: the host owns the thread, and only one thread ever calls into a handle. `zb_client_poll` BLOCKS that thread for up to `wait_ms` when nothing arrives, so the loop cannot live on a UI thread. The honest shape is one worker that owns the handle and everything that touches it — poll, flush, query, mutate, close — while the UI talks to it over messages. In Flutter that is an isolate; on iOS a background queue; in React Native a native thread behind a promise.
+
+The Flutter example does exactly this (`examples/05-mobile/flutter/lib/src/data/zebridge_worker.dart`):
 
 ```dart
-while (appIsRunning) {
-  // 1. Wait for CDC (blocks up to 1 second)
-  final report = bindings.zb_client_poll(handle, 1000);
+// UI side: the worker owns the handle; every call is a message with an answer.
+final zb = await ZeBridgeWorker.spawn({
+  "url": "nats://127.0.0.1:4222",       // plain NATS over TCP: libzb has no websocket
+  "credsPath": "/path/to/alice.creds",  // the operator-mode broker takes nothing else
+  "dbPath": "/a/writable/place/zb.sqlite3",
+  "principal": "alice",
+  "tables": ["counter_public", "counter_tenant", "app_users", "app_orders"],
+  "clientId": "flutter-client",
+});
+print(zb.tenant);                       // resolved by the worker's first sync
 
-  // 2. React to CDC changes: granular UI updates
-  if (report.changedTables.isNotEmpty) {
-      sendPort.send({"type": "patch", "tables": report.changedTables});
-  }
-  
-  // 3. React to bulk seeds (e.g. after offline recovery or schema change): full UI reload
-  if (report.seeded.isNotEmpty) {
-      sendPort.send({"type": "reload", "tables": report.seeded});
-  }
-  
-  // 4. React to settled writes: local optimistic writes that successfully reached the server
-  if (report.settled > 0) {
-      sendPort.send({"type": "settled", "count": report.settled});
-  }
+// One report per poll that changed something: re-read the tables it names.
+zb.reports.listen((report) {
+  if (report.error != null) return showError(report.error);
+  refresh([...report.changedTables, ...report.seeded]);
+});
 
-  // 5. Sweep the outbox for any offline writes that need retrying
-  bindings.zb_client_flush(handle, 0);
+final rows = await zb.query("SELECT item, count FROM app_orders WHERE deleted_at IS NULL");
+await zb.mutate('app_orders', 'UPDATE', {'user_id': uid, 'item': 'laptop'}, {'count': 2});
+
+// App lifecycle: nothing polls while the app is in the background.
+@override
+void didChangeAppLifecycleState(AppLifecycleState state) {
+  state == AppLifecycleState.resumed ? zb.resume() : zb.pause();
 }
 ```
+
+and the worker isolate is a loop over the card using `zb.sync`, `zb.poll`, `zb.flush`, `zb.close`, and the data as the key `changedTables`.
+
+```dart
+// Worker isolate: the only place the handle is ever used.
+ZeBridge.init();                          // the FFI lookups are per isolate
+final zb = ZeBridge(options);
+final info = zb.sync();                   // tenant, schemas, seed, drain
+toUi.send({'type': 'ready', 'tenant': info['tenant']});
+
+while (!closing) {
+  if (paused) { await Future.delayed(const Duration(milliseconds: 200)); continue; }
+  final report = zb.poll(100);            // blocks up to 100 ms on the broker
+  if (report.changedTables.isNotEmpty || report.seeded.isNotEmpty) toUi.send(report);
+  zb.flush(0);                            // the outbox, every turn
+  await Future.delayed(Duration.zero);    // the command port runs here: query, mutate…
+}
+zb.close();
+```
+
+The bound on a click is one poll's `wait_ms`: commands are served between two polls. When the app resumes, the next `poll` catches up on everything it missed and the next `flush` sends what was written meanwhile — the outbox is what makes the pause harmless. A Python service is the same loop without the isolate (`scripts/scenarios/clients.py`), and a Swift app puts it on a background queue (`examples/05-mobile/ios`).
 
 <details><summary>or in React Native</summary>
 
@@ -1087,52 +1138,6 @@ startPolling();
 ```
 </details>
 <br>
-
-2. and implements on top of the library's primitives `zb_client_open`, `zb_client_query`, `zb_client_mutate`:
-
-```dart
-class ZeBridge {
-  final int _handle; // The handle returned by Zig
-
-  // 1. Initialize
-  ZeBridge(Map<String, dynamic> options)
-    : _handle = bindings.zb_client_open(jsonEncode(options));
-
-  // 2. Query
-  dynamic query(String sql) {
-    final resultJson = bindings.zb_client_query(_handle, sql, "[]");
-    return jsonDecode(resultJson);
-  }
-
-  // 3. Mutate (Optimistic!)
-  void mutate(String table, String op, Map key, Map values) {
-    bindings.zb_client_mutate(
-      _handle,
-      table,
-      op,
-      jsonEncode(key),
-      jsonEncode(values)
-    );
-  }
-
-  // 4. Poll
-  PollReport poll(int waitMs) {
-    final reportJson = bindings.zb_client_poll(_handle, waitMs);
-    // reportJson looks like this:
-    // {
-    //   "applied": 15,
-    //   "settled": 2,
-    //   "changed_tables": ["app_orders"],
-    //   "seeded": []
-    // }
-    return PollReport.fromJson(jsonDecode(reportJson));
-  }
-}
-```
-
-A Python service, a Flutter app (via `dart:ffi`), React Native (via JSI), or native iOS/Android can consume the library effortlessly because the host owns the polling loop.
-
-You can implement a timer that fires every second or so while the app is in the foreground. When the app resumes from the background, `poll` automatically catches up on everything it missed, and `flush` sends whatever offline writes were created meanwhile. The durable outbox table makes network drops and app pauses completely harmless.
 
 💡 **One consequence to note when testing your client implementation**: because `libzb` sends a mutation to the outbox the moment `mutate()` returns, testing how your UI reacts to a "late arrival" (simulating a slow network) should be done by explicitly stamping the mutation into the future via `zb_client_mutate_at`, rather than trying to manually delay the flush.
 
@@ -1790,7 +1795,7 @@ The CDC stream family is owned by the bridge: at boot it creates any missing `CD
 
 ⚠️ **Retention is a correctness parameter.** A client offline past CDC's window re-seeds from the latest generation chain, so the chain — not the stream — bounds how long a consumer may be away.
 
-Two couplings matter: the product `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS` must stay under the sweeper's `GC_THRESHOLD_MS` (a tombstone must never be reaped before the delta that ships it — the bridge states the number at boot), and CDC retention should comfortably exceed one cadence, so a fresh chain always overlaps the stream it splices into (the manifest's `cutoff_seq` is the splice point).
+Two couplings matter: the product `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS` must stay under the sweeper's `GC_THRESHOLD_MS` (a tombstone must never be reaped before the delta that ships it — the bridge states the number at boot), and the CDC streams' age (`CDC_MAX_AGE_SECONDS`, default three cadences) must exceed two cadences, so a fresh chain always overlaps the stream it splices into (the manifest's `cutoff_seq` is the splice point). The bridge checks it at boot; the fleet monitor watches the window each stream really holds (`bridge_cdc_window_seconds`, `bridge_cdc_window_short`), because a size valve (`CDC_MAX_BYTES`, `CDC_MAX_MSGS`) can end the window before the age does.
 
 Consumers use these streams to interact with NATS; the exact names are declared in `grammar.json`.
 
@@ -1926,6 +1931,7 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 **Generation configuration:**
 
 * Cadence: `GENERATION_CADENCE_SECONDS` (chain depth × cadence must stay under the sweeper's `GC_THRESHOLD_MS`)
+* CDC retention: `CDC_MAX_AGE_SECONDS` (default 3 × cadence, must exceed 2 ×), `CDC_MAX_BYTES` and `CDC_MAX_MSGS` (disk valves; `bridge_cdc_window_short` says when one ends the window before the age does). Applied to existing streams at boot.
 * Manifests: `generations` KV, keyed `{tenant}.{table}`
 * Objects: per-tenant `gen-{tenant}` object stores
 

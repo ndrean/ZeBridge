@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@bokuweb/zstd-wasm':
+        specifier: ^0.0.27
+        version: 0.0.27
       '@electric-sql/pglite':
         specifier: 0.5.8
         version: 0.5.8
@@ -50,6 +53,9 @@ importers:
         version: 5.9.3
 
 packages:
+
+  '@bokuweb/zstd-wasm@0.0.27':
+    resolution: {integrity: sha512-GDm2uOTK3ESjnYmSeLQifJnBsRCWajKLvN32D2ZcQaaCIJI/Hse9s74f7APXjHit95S10UImsRGkTsbwHmrtmg==}
 
   '@electric-sql/pglite@0.5.8':
     resolution: {integrity: sha512-n9tsbUOhwx2epK1V0ZG9Ar4SHWUju04dhmzZXiSBXwBoleOvIfals33NAaWgagQVAL4Rbvx/Ptsu3P+pA09f6Q==}
@@ -291,6 +297,8 @@ packages:
         optional: true
 
 snapshots:
+
+  '@bokuweb/zstd-wasm@0.0.27': {}
 
   '@electric-sql/pglite@0.5.8': {}
 

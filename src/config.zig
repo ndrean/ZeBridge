@@ -139,9 +139,26 @@ pub const Nats = struct {
     /// is deliberately modest: JetStream treats it as a RESERVATION against the
     /// server's storage budget (the INIT_TANGO lesson — a 10G-per-tenant boot
     /// refuses to create anything on a small server).
-    pub const reconciled_cdc_max_age_days: u64 = 8;
-    pub const reconciled_stream_max_bytes: i64 = 1 << 30;
-    pub const reconciled_stream_max_msgs: i64 = 10_000_000;
+    ///
+    /// Three env vars (CDC_MAX_AGE_SECONDS, CDC_MAX_BYTES, CDC_MAX_MSGS) with these
+    /// defaults and bounds (§10eg). The AGE is the contract with the chain: a client
+    /// that fell off a stream re-seeds from the chain and resumes at the newest
+    /// manifest's cutoff sequence, so the stream must still hold it — the newest
+    /// cutoff is at most one cadence old, two cadences is the floor, three the
+    /// default. Bytes and messages are DISK VALVES, not retention: when one of them
+    /// ends the window before the age does, the fleet monitor's window metric says
+    /// so. They were 8 days / 1 GiB / 10 M as constants: 8 days of events is the
+    /// expensive way to do what the chain does for free, and the byte cap ended the
+    /// window in under an hour at 400 writes a second without a word.
+    pub const default_cdc_max_age_cadences: u64 = 3;
+    pub const min_cdc_max_age_seconds: u64 = 30;
+    pub const max_cdc_max_age_seconds: u64 = 30 * 24 * 60 * 60;
+    pub const default_cdc_max_bytes: u64 = 1 << 30;
+    pub const min_cdc_max_bytes: u64 = 1 << 20;
+    pub const max_cdc_max_bytes: u64 = 1 << 40;
+    pub const default_cdc_max_msgs: u64 = 10_000_000;
+    pub const min_cdc_max_msgs: u64 = 1_000;
+    pub const max_cdc_max_msgs: u64 = 1_000_000_000;
 
     /// Ceiling for the publisher's exponential reconnect backoff (milliseconds)
     pub const max_backoff_ms = 30_000;
@@ -189,6 +206,14 @@ pub const Nats = struct {
     /// while the classifier stays conservative: widen `sqlstateIsPermanent` before
     /// raising this further.
     pub const mutation_max_deliver: i32 = 15;
+
+    /// How long JetStream waits for an ack before it redelivers a mutation. 10 s, not
+    /// the library's 30 s default: the listener applies a message in milliseconds and
+    /// naks what it cannot, so a longer wait only lengthens the window after a crash
+    /// in which a write left in flight by the previous instance is redelivered AFTER
+    /// newer writes on the same row (§10eb). A redelivered write that already landed
+    /// is accepted again (§10dy), so a shorter wait costs nothing on a slow day.
+    pub const mutation_ack_wait_ns: u64 = 10 * std.time.ns_per_s;
 
     /// Token positions in the mutation subject, after splitting on '.'. The *shape* of
     /// `mutation.<principal>.<table>.<operation>` is fixed here while the prefix itself
@@ -273,7 +298,6 @@ pub const Http = struct {
     /// This constant said "0.0.0.0" and was read by nobody: the server hardcoded
     /// INADDR_ANY, so the declared default and the actual bind disagreed silently.
     pub const default_bind = "127.0.0.1";
-
 };
 
 /// Batch publishing configuration
@@ -423,7 +447,6 @@ pub const Sync = struct {
 
 /// Logging and metrics configuration
 pub const Metrics = struct {
-
     pub const metric_log_interval_seconds = 15;
 };
 
@@ -493,7 +516,6 @@ pub const Retry = struct {
     /// How many spins on a full ring buffer before checking whether the flush
     /// thread has died. Internal tuning, not worth exposing.
     pub const spins_before_fatal_check = 1_000;
-
 };
 
 /// Buffer sizes
@@ -611,6 +633,14 @@ pub const Generations = struct {
     // other wire name. Only pacing stays here.
 };
 
+/// What the bridge asks JetStream to keep on every CDC stream (Nats.default_cdc_*),
+/// applied at creation AND reconciled onto streams that already exist.
+pub const StreamLimits = struct {
+    max_age_seconds: u64,
+    max_bytes: i64,
+    max_msgs: i64,
+};
+
 pub const RuntimeConfig = struct {
     // HTTP
     http_port: u16,
@@ -638,6 +668,10 @@ pub const RuntimeConfig = struct {
     publication_name: []const u8,
     generation_cadence_seconds: u64 = Generations.default_cadence_seconds,
     generation_chain_depth: u32 = Generations.default_chain_depth,
+    /// CDC stream retention (StreamLimits, §10eg); the age defaults to three cadences.
+    cdc_max_age_seconds: u64 = Nats.default_cdc_max_age_cadences * Generations.default_cadence_seconds,
+    cdc_max_bytes: i64 = @intCast(Nats.default_cdc_max_bytes),
+    cdc_max_msgs: i64 = @intCast(Nats.default_cdc_max_msgs),
     fleet_poll_seconds: u64 = Fleet.default_poll_seconds,
     fleet_ttl_seconds: u64 = Fleet.default_ttl_seconds,
     slot_inventory_seconds: u64 = WalMonitor.default_slot_inventory_seconds,

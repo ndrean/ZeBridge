@@ -840,46 +840,70 @@ pub const GenerationProducer = struct {
         var dict_bytes: ?[]u8 = null;
         var dict_name: ?[]const u8 = null;
         var dict_kept = false;
+        var dict_ratio: ?i64 = null; // percent, on row-sized samples: the dictionary's own baseline
         if (build_full) {
             if (full_payload) |p| {
-                // §10ea: the previous era's dictionary is KEPT when it still compresses a
-                // sample of this full well — at least a quarter smaller than no dictionary.
-                // Training is the expensive step, and a dictionary that still fits the
-                // data teaches nothing new. Immutable by name, so the new era's deltas
-                // simply name the old one. A shape change already forces a full, and a
-                // dictionary that drifted fails the probe and is retrained.
+                // §10ea: the previous era's dictionary is KEPT while it still compresses
+                // row-sized samples of this full the way it did when it was fresh — within
+                // 10 points of the ratio recorded at its training. Drift is measured
+                // against the dictionary's OWN past, not against "no dictionary": rows
+                // that compress well on their own (the wasp's) made the latter test
+                // retrain on a seven-point difference. Training is the expensive step;
+                // immutable by name, a kept dictionary is simply named by the new era's
+                // deltas. A shape change forces a full, and a drifted one is retrained.
+                //
+                // The probe compresses samples ONE BY ONE and sums: a dictionary earns its
+                // keep on small inputs (a row, a few-KB delta), where zstd has no window to
+                // find repetition in. A single contiguous megabyte finds it by itself and
+                // made the dictionary look useless — retrained at every full for a whole
+                // afternoon before this was measured.
+                const probe = try strideCorpus(alloc, p, 128 * 1024);
                 const params_p = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-                const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex') FROM public.zebridge_generations " ++
+                // ⚠️ The dictionary's NAME is the row's `dict_object`, never rebuilt from
+                // the row's gen: a full that KEPT a dictionary stores the bytes under its
+                // own gen with the older name, and rebuilding "g<gen>-dict" from that row
+                // named an object nobody uploaded — every delta of two eras pointed at
+                // a phantom, and every fresh client failed to seed (§10ed).
+                const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(dict_object, '') FROM public.zebridge_generations " ++
                     "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_p);
                 defer c.PQclear(res_p);
-                if (c.PQntuples(res_p) > 0) {
+                if (c.PQntuples(res_p) > 0 and probe.sizes.len > 0 and c.PQgetlength(res_p, 0, 3) > 0) {
                     const old = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_p, 0, 1)));
-                    const probe = try strideCorpus(alloc, p, 1024 * 1024);
-                    if (probe.buf.len > 0) {
-                        const with = (try compressZstdDict(alloc, probe.buf, old, 3)).len;
-                        const without = (try compressZstd(alloc, probe.buf, 3)).len;
-                        if (with * 4 <= without * 3) {
-                            dict_bytes = old;
-                            dict_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, std.mem.span(c.PQgetvalue(res_p, 0, 0)) });
-                            dict_kept = true;
-                            log.info("📖 '{s}'/'{s}': g{d} keeps {s} — a 1 MiB probe compresses to {d}% with it vs {d}% without", .{ tenant, table, gen, dict_name.?, with * 100 / @max(probe.buf.len, 1), without * 100 / @max(probe.buf.len, 1) });
-                        }
+                    const old_gen = std.mem.span(c.PQgetvalue(res_p, 0, 0));
+                    const old_name = std.mem.span(c.PQgetvalue(res_p, 0, 3));
+                    const baseline: ?i64 = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res_p, 0, 2)), 10) catch null;
+                    const now_pct = try probeRatio(alloc, probe, old);
+                    // No baseline (a dictionary from before this column): a quarter smaller
+                    // than no dictionary is the fallback test.
+                    const keep = if (baseline) |b| now_pct <= b + 10 else blk: {
+                        const without = try probeRatio(alloc, probe, null);
+                        break :blk now_pct * 4 <= without * 3;
+                    };
+                    if (keep) {
+                        dict_bytes = old;
+                        dict_name = try alloc.dupe(u8, old_name);
+                        dict_kept = true;
+                        dict_ratio = baseline orelse now_pct;
+                        log.info("📖 '{s}'/'{s}': g{d} keeps {s} — {d} row-sized samples compress to {d}% (its baseline {d}%)", .{ tenant, table, gen, dict_name.?, probe.sizes.len, now_pct, dict_ratio.? });
+                    } else {
+                        log.info("📖 '{s}'/'{s}': g{d} retrains — {s} compresses {d} row-sized samples to {d}% against its baseline {s}%: it drifted", .{ tenant, table, gen, old_gen, probe.sizes.len, now_pct, if (baseline) |b| try std.fmt.allocPrint(alloc, "{d}", .{b}) else "(none)" });
                     }
                 }
                 if (dict_bytes == null) if (try trainDict(alloc, p)) |d| {
                     dict_bytes = d;
                     dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen });
+                    dict_ratio = if (probe.sizes.len > 0) try probeRatio(alloc, probe, d) else null;
                 };
             }
         } else if (build_delta) {
             const params_d = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res_d = try queryOne(bkc, "SELECT gen, encode(dict, 'hex') FROM public.zebridge_generations " ++
+            // The name is the row's `dict_object` (see the probe above, §10ed).
+            const res_d = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_object, '') FROM public.zebridge_generations " ++
                 "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_d);
             defer c.PQclear(res_d);
-            if (c.PQntuples(res_d) > 0) {
-                const g = std.mem.span(c.PQgetvalue(res_d, 0, 0));
+            if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 2) > 0) {
                 dict_bytes = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
-                dict_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g });
+                dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_d, 0, 2)));
             }
         }
 
@@ -986,9 +1010,10 @@ pub const GenerationProducer = struct {
             const epoch_z = try utils.allocPrintZ(alloc, "{d}", .{cat_epoch});
             const shape_z = try alloc.dupeZ(u8, col_shape);
             const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid) " ++
+            const ratio_z: ?[*:0]const u8 = if (build_full) (if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null) else null;
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z };
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -1073,6 +1098,18 @@ fn strideCorpus(alloc: std.mem.Allocator, full: []const u8, max_bytes: usize) !s
         sizes[i] = sample_len;
     }
     return .{ .buf = buf, .sizes = sizes };
+}
+
+/// Percent the row-sized samples compress to, one by one, with `dict` (or without).
+fn probeRatio(alloc: std.mem.Allocator, probe: anytype, dict: ?[]const u8) !i64 {
+    var total: usize = 0;
+    var off: usize = 0;
+    for (probe.sizes) |sz| {
+        const sample = probe.buf[off .. off + sz];
+        total += if (dict) |d| (try compressZstdDict(alloc, sample, d, 3)).len else (try compressZstd(alloc, sample, 3)).len;
+        off += sz;
+    }
+    return @intCast(total * 100 / @max(probe.buf.len, 1));
 }
 
 fn trainDict(alloc: std.mem.Allocator, full: []const u8) !?[]u8 {

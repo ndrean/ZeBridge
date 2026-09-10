@@ -61,7 +61,9 @@ export default defineConfig({
   optimizeDeps: {
     // PGlite ships its WASM/fs assets next to its module; pre-bundling breaks the
     // relative asset URLs, same class of problem as sqlocal's worker below.
-    exclude: ['sqlocal', '@electric-sql/pglite']
+    // zstd-wasm too (since the library imports it itself, 2026-09-10): its .wasm is
+    // fetched by `new URL('./zstd.wasm', import.meta.url)` next to the module.
+    exclude: ['sqlocal', '@electric-sql/pglite', '@bokuweb/zstd-wasm']
   },
   resolve: {
     // zb-client-ts is a linked (symlinked) package; without dedupe its imports
@@ -70,6 +72,9 @@ export default defineConfig({
     // — vite resolves that under /node_modules/ but serves the SPA index.html
     // (200, text/html) for the /@fs/ form, so the worker dies silently and every
     // DB call hangs. Dedupe pins the shared runtime deps to this package's copies.
-    dedupe: ['sqlocal', '@electric-sql/pglite', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
+    // zstd-wasm joined the list the day the library began importing it itself: its
+    // copy under zb-client-ts/node_modules/.pnpm is outside the serving allow list
+    // (403 on the .wasm, "wasm streaming compile failed"); this package's copy is not.
+    dedupe: ['sqlocal', '@electric-sql/pglite', '@bokuweb/zstd-wasm', '@nats-io/nats-core', '@nats-io/jetstream', '@nats-io/kv', '@nats-io/obj', '@msgpack/msgpack', 'uuid'],
   }
 });

@@ -61,7 +61,7 @@ pub fn main() !void {
     // that will not decode — stale objects in a long-lived dev store, say — does not
     // block testing writes.
     if (std.c.getenv("ZB_SKIP_SEED") == null) {
-        try c.gapAndSeed();
+        try c.gapAndSeed(null, null);
         try c.drainCdc();
         std.debug.print("=> users={d} salaries={d}\n", .{ c.count("users"), c.count("salaries") });
     }
@@ -118,7 +118,7 @@ pub fn main() !void {
     if (std.c.getenv("ZB_POLL")) |n_z| {
         const n = std.fmt.parseInt(usize, std.mem.span(n_z), 10) catch 3;
         var applied: usize = 0;
-        for (0..n) |_| applied += (try c.poll(300)).applied;
+        for (0..n) |_| applied += (try c.poll(a, 300)).applied;
         std.debug.print("   polled {d}x300 ms: {d} event(s) applied\n", .{ n, applied });
     }
 }

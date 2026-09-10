@@ -479,6 +479,20 @@ fn errJson(name: []const u8) ?[*:0]u8 {
     return dupeZ(msg);
 }
 
+/// `{"error":"<Name>","detail":"<SQLite's own words>"}` — for a storage error the
+/// name alone says nothing a caller can act on ("PrepareFailed"), the message does
+/// ("no such table: test_types"). Escaped by the JSON writer, never by hand.
+fn errJsonDetail(name: []const u8, detail: []const u8) ?[*:0]u8 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var out: std.json.ObjectMap = .empty;
+    out.put(a, "error", .{ .string = name }) catch return errJson(name);
+    out.put(a, "detail", .{ .string = detail }) catch return errJson(name);
+    const s = core.valueToString(a, .{ .object = out }) catch return errJson(name);
+    return dupeZ(s);
+}
+
 fn lookup(handle: u64) ?*ClientBox {
     return clients.get(handle);
 }
@@ -516,7 +530,13 @@ export fn zb_client_query(handle: u64, sql: ?[*:0]const u8, params_json: ?[*:0]c
     const p = if (params_json) |pj| std.mem.span(pj) else "";
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena.deinit();
-    const out = queryJson(arena.allocator(), b, q, p) catch |err| return errJson(@errorName(err));
+    const out = queryJson(arena.allocator(), b, q, p) catch |err| return switch (err) {
+        // The replica refused the statement: SQLite's message names the table, the
+        // column or the syntax; the error name alone does not. From the READ-ONLY
+        // connection the read ran on — the writer's says "not an error".
+        error.PrepareFailed, error.BindFailed, error.StepFailed => errJsonDetail(@errorName(err), b.c.ro.errMsg()),
+        else => errJson(@errorName(err)),
+    };
     return dupeZ(out);
 }
 
@@ -573,10 +593,19 @@ fn flushJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
 }
 
 fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
-    const r = try b.c.poll(wait_ms);
+    const r = try b.c.poll(a, wait_ms);
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "applied", .{ .integer = @intCast(r.applied) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
+    
+    var changed = std.json.Array.init(a);
+    for (r.changed_tables) |t| try changed.append(.{ .string = t });
+    try out.put(a, "changed_tables", .{ .array = changed });
+
+    var seeded = std.json.Array.init(a);
+    for (r.seeded) |t| try seeded.append(.{ .string = t });
+    try out.put(a, "seeded", .{ .array = seeded });
+
     return try core.valueToString(a, .{ .object = out });
 }
 

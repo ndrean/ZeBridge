@@ -498,6 +498,7 @@ pub const MutationListener = struct {
                     // bridge wrongly classifies as retryable stops after this many
                     // attempts.
                     .max_deliver = config.Nats.mutation_max_deliver,
+                    .ack_wait = config.Nats.mutation_ack_wait_ns,
                     .filter_subject = self.endpoint_topology.mutations_subject_wildcard,
                 },
             },
@@ -506,6 +507,27 @@ pub const MutationListener = struct {
             return;
         };
         defer consumer.deinit();
+
+        // §10eb: the previous instance may have died with writes in flight — fetched,
+        // applied or not, never acked. JetStream redelivers those only when their ack
+        // wait expires, while NEWER messages flow to this instance at once: a DELETE
+        // landed before the UPDATE of the same row that preceded it on the stream
+        // (measured under the wasp: row_deleted for a write published 260 ms before
+        // the delete). Per-row order across a crash holds only if the in-flight ones
+        // are redelivered FIRST — so, if any are pending, wait one ack wait before the
+        // first pull; they then come at the head of it, in stream order.
+        {
+            var ci = js.getConsumerInfo(self.endpoint_topology.stream_mutations, "bridge_mutations_worker") catch null;
+            if (ci) |*info| {
+                defer info.deinit();
+                if (info.value.num_ack_pending > 0) {
+                    const wait_ms = config.Nats.mutation_ack_wait_ns / std.time.ns_per_ms + 500;
+                    log.info("Mutation listener: {d} write(s) were in flight when the previous instance stopped — waiting {d} ms for their redelivery, so they are judged before anything newer (§10eb)", .{ info.value.num_ack_pending, wait_ms });
+                    var slept: u64 = 0;
+                    while (slept < wait_ms and !self.should_stop.load(.seq_cst)) : (slept += 100) utils.sleep(100 * std.time.ns_per_ms);
+                }
+            }
+        }
 
         log.info("Mutation listener: ✅ Ready! Pulling mutations from JetStream...", .{});
 
@@ -554,6 +576,27 @@ pub const MutationListener = struct {
             if (batch.messages.len == 0) {
                 utils.sleep(config.Nats.mutation_pull_idle_ms * std.time.ns_per_ms);
             }
+        }
+
+        // §10ec: a clean stop leaves nothing in flight. The batch in hand is committed
+        // and acked above; what can remain is the last PULL REQUEST, still parked at
+        // the server for up to its expiry after a fetch returned early — writes
+        // published into that window are delivered to a subscription nobody reads,
+        // and count as in flight until their ack wait runs out (two of them, measured
+        // under the wasp at 15 writes/s). So: NO new pull (a new one would park in
+        // turn — "until a pull comes back empty" never ends under a steady writer),
+        // and read the inbox for what the parked request still delivers, until it
+        // has been silent for longer than that request can live. A crash (kill -9)
+        // still leaves in-flight writes; the boot drain (§10eb) covers that.
+        if (c.PQstatus(conn) == c.CONNECTION_OK) {
+            var judged: usize = 0;
+            const quiet = std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(600), .clock = .awake } };
+            while (consumer.nextDelivered(quiet) catch null) |jm| {
+                self.processOne(conn, conn_nats, jm);
+                jm.deinit();
+                judged += 1;
+            }
+            if (judged > 0) log.info("Mutation listener: stopping — {d} write(s) the parked pull still delivered, judged before exit (§10ec)", .{judged});
         }
 
         // Every other thread announces its exit — a shutdown where one thread goes

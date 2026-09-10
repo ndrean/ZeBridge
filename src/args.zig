@@ -73,6 +73,15 @@ const usage =
     \\                        parameter: depth × cadence must stay under the
     \\                        sweeper's tombstone retention.
     \\  GENERATION_CHAIN_DEPTH  generations kept per pair (default: 6)
+    \\  CDC_MAX_AGE_SECONDS   how long a CDC stream keeps an event (default:
+    \\                        3 × cadence). The contract with the chain: a
+    \\                        client further behind re-seeds and resumes at
+    \\                        the newest cutoff, so this must exceed 2 × cadence.
+    \\                        Applied to streams that already exist, too.
+    \\  CDC_MAX_BYTES         a CDC stream's size cap (default: 1 GiB) — a disk
+    \\                        valve; when it ends the window before the age
+    \\                        does, bridge_cdc_window_short says so
+    \\  CDC_MAX_MSGS          a CDC stream's message cap (default: 10000000)
     \\  LOG_LEVEL             debug|info|warn|err (default: info).
     \\                        Log lines print "warning"/"error"; both
     \\                        spellings are accepted here.
@@ -524,6 +533,19 @@ pub const Args = struct {
             1,
             64,
         );
+        // The CDC streams' retention (config.Nats.default_cdc_*, §10eg). The age is
+        // the contract with the chain and defaults to three cadences — AFTER the
+        // cadence is known; bytes and messages are disk valves.
+        runtime_config.cdc_max_age_seconds = envUint(
+            u64,
+            init,
+            "CDC_MAX_AGE_SECONDS",
+            runtime_config.generation_cadence_seconds * config.Nats.default_cdc_max_age_cadences,
+            config.Nats.min_cdc_max_age_seconds,
+            config.Nats.max_cdc_max_age_seconds,
+        );
+        runtime_config.cdc_max_bytes = @intCast(envUint(u64, init, "CDC_MAX_BYTES", config.Nats.default_cdc_max_bytes, config.Nats.min_cdc_max_bytes, config.Nats.max_cdc_max_bytes));
+        runtime_config.cdc_max_msgs = @intCast(envUint(u64, init, "CDC_MAX_MSGS", config.Nats.default_cdc_max_msgs, config.Nats.min_cdc_max_msgs, config.Nats.max_cdc_max_msgs));
 
         return .{
             .args = cli_args,

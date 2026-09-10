@@ -872,6 +872,8 @@ stream's `first_seq`:
 * `stored_seq == 0` (first run) or `stored_seq < first_seq - 1` (the stream pruned past the stored position) → **gap** on that stream.
 * Otherwise resume that stream from `stored_seq + 1`.
 
+The bridge keeps every CDC stream for at least two generation cadences (`CDC_MAX_AGE_SECONDS`, three by default): a gap re-seeds from the chain and resumes at the newest manifest's `cutoff_seq`, at most one cadence old, so the splice point is still in the stream. A stream that pruned harder than that (a size valve, a purge) leaves a chain that predates it; the client then waits for the next generation rather than resume past the hole.
+
 ⚠️ **The position is per stream, never per table.** Indeed, a per-table check hits the "abandoned table paradox": a table that never changes falls behind the stream's horizon and looks gapped forever. One stream position covers every table the stream carries, including the ones that have not changed in months.
 
 ⚠️ **Re-seeding is SCOPED.** A gap on one stream re-seeds only the tables *routed* to

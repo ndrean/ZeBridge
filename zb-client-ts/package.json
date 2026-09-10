@@ -16,6 +16,7 @@
     "test": "node --experimental-strip-types --test src/core.test.ts"
   },
   "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27",
     "@electric-sql/pglite": "0.5.8",
     "@msgpack/msgpack": "^3.0.0-beta.1",
     "@nats-io/jetstream": "^3.4.0",

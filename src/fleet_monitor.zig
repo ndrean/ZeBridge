@@ -22,6 +22,21 @@ pub const log = std.log.scoped(.fleet);
 
 pub const StreamLag = struct { stream: []const u8, applied: u64, head: u64, lag: u64 };
 
+/// What a CDC stream HOLDS, read on the same pass (§10eg): now minus its oldest
+/// message is the window a client can fall behind and still resume; the chain's
+/// newest cutoff is at most one cadence old, so the floor is two cadences. `short`
+/// is that floor breached on a stream that has PRUNED (`first_seq > 1`) — a young
+/// stream's small window is age, not loss.
+pub const StreamWindow = struct {
+    stream: []const u8,
+    messages: u64,
+    bytes: u64,
+    first_seq: u64,
+    /// -1 when the stream is empty.
+    window_seconds: i64,
+    short: bool,
+};
+
 pub const Client = struct {
     tenant: []const u8,
     principal: []const u8,
@@ -37,6 +52,7 @@ pub const Registry = struct {
     mutex: utils.SpinLock = .{},
     arena: ?*std.heap.ArenaAllocator = null,
     clients: []const Client = &.{},
+    streams: []const StreamWindow = &.{},
     polled_at_unix: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Registry {
@@ -51,14 +67,16 @@ pub const Registry = struct {
             self.allocator.destroy(ar);
             self.arena = null;
             self.clients = &.{};
+            self.streams = &.{};
         }
     }
 
-    fn swap(self: *Registry, arena: *std.heap.ArenaAllocator, clients: []const Client, now_unix: i64) void {
+    fn swap(self: *Registry, arena: *std.heap.ArenaAllocator, clients: []const Client, streams: []const StreamWindow, now_unix: i64) void {
         self.mutex.lock();
         const old = self.arena;
         self.arena = arena;
         self.clients = clients;
+        self.streams = streams;
         self.polled_at_unix = now_unix;
         self.mutex.unlock();
         if (old) |o| {
@@ -90,6 +108,20 @@ pub const Registry = struct {
         for (counts.keys(), counts.values()) |tenant, n| {
             try w.print("bridge_fleet_clients_live{{tenant=\"{s}\"}} {d}\n", .{ tenant, n });
         }
+        if (self.streams.len > 0) {
+            try w.print("# HELP bridge_cdc_window_seconds Seconds of events the CDC stream holds (now minus its oldest message); -1 when empty. A client further behind re-seeds from the chain, whose newest cutoff is at most one cadence old\n", .{});
+            try w.print("# TYPE bridge_cdc_window_seconds gauge\n", .{});
+            for (self.streams) |sw| try w.print("bridge_cdc_window_seconds{{stream=\"{s}\"}} {d}\n", .{ sw.stream, sw.window_seconds });
+            try w.print("# HELP bridge_cdc_window_short 1 when the stream has pruned and holds less than 2 × cadence: a size or message valve ends the window before the age, or CDC_MAX_AGE_SECONDS is too short\n", .{});
+            try w.print("# TYPE bridge_cdc_window_short gauge\n", .{});
+            for (self.streams) |sw| try w.print("bridge_cdc_window_short{{stream=\"{s}\"}} {d}\n", .{ sw.stream, @as(u8, if (sw.short) 1 else 0) });
+            try w.print("# HELP bridge_cdc_stream_bytes Bytes the CDC stream holds\n", .{});
+            try w.print("# TYPE bridge_cdc_stream_bytes gauge\n", .{});
+            for (self.streams) |sw| try w.print("bridge_cdc_stream_bytes{{stream=\"{s}\"}} {d}\n", .{ sw.stream, sw.bytes });
+            try w.print("# HELP bridge_cdc_stream_messages Messages the CDC stream holds\n", .{});
+            try w.print("# TYPE bridge_cdc_stream_messages gauge\n", .{});
+            for (self.streams) |sw| try w.print("bridge_cdc_stream_messages{{stream=\"{s}\"}} {d}\n", .{ sw.stream, sw.messages });
+        }
         if (self.clients.len == 0) return;
 
         try w.print("# HELP bridge_fleet_client_last_seen_seconds Seconds since the client's last heartbeat, as of the last poll\n", .{});
@@ -115,6 +147,8 @@ pub const FleetMonitor = struct {
     should_stop: *std.atomic.Value(bool),
     poll_seconds: u64,
     ttl_seconds: u64,
+    /// Two generation cadences: the least a CDC stream must hold (§10eg).
+    min_window_seconds: u64,
     registry: Registry,
     thread: ?std.Thread = null,
 
@@ -126,6 +160,7 @@ pub const FleetMonitor = struct {
         should_stop: *std.atomic.Value(bool),
         poll_seconds: u64,
         ttl_seconds: u64,
+        min_window_seconds: u64,
     ) FleetMonitor {
         return .{
             .allocator = allocator,
@@ -135,6 +170,7 @@ pub const FleetMonitor = struct {
             .should_stop = should_stop,
             .poll_seconds = poll_seconds,
             .ttl_seconds = ttl_seconds,
+            .min_window_seconds = min_window_seconds,
             .registry = Registry.init(allocator),
         };
     }
@@ -204,6 +240,16 @@ pub const FleetMonitor = struct {
         var clients: std.ArrayList(Client) = .empty;
         const now_ms = utils.unixMillis();
 
+        // The streams first: one STREAM.INFO each gives the window AND the head the
+        // lag rows below need, so a client's stream costs nothing more.
+        var windows: std.ArrayList(StreamWindow) = .empty;
+        try self.windowOf(js, &heads, &windows, a, self.topo.cdc_stream_public, now_ms);
+        for (self.topo.tenants) |tenant| {
+            if (std.mem.eql(u8, tenant, self.topo.open_tenant)) continue;
+            const name = try std.fmt.allocPrint(a, "{s}{s}", .{ self.topo.cdc_stream_prefix, tenant });
+            try self.windowOf(js, &heads, &windows, a, name, now_ms);
+        }
+
         if (keys) |k| for (k.value) |key| {
             var entry = kv.get(key) catch continue;
             defer entry.deinit();
@@ -230,8 +276,25 @@ pub const FleetMonitor = struct {
             try clients.append(a, .{ .tenant = tenant, .principal = principal, .age_seconds = age, .streams = lags.items });
         };
 
-        self.registry.swap(arena, clients.items, @divFloor(now_ms, 1000));
-        log.debug("fleet poll: {d} live client(s)", .{clients.items.len});
+        self.registry.swap(arena, clients.items, windows.items, @divFloor(now_ms, 1000));
+        log.debug("fleet poll: {d} live client(s), {d} stream window(s)", .{ clients.items.len, windows.items.len });
+    }
+
+    /// One STREAM.INFO: the head for the lag rows and the window the stream holds.
+    /// A stream that does not exist yet (a tenant enrolled before its first row) is
+    /// skipped, not failed. Short windows are SAID every poll while they last: a
+    /// breached floor is not routine.
+    fn windowOf(self: *FleetMonitor, js: nats.JetStream, heads: *std.StringArrayHashMapUnmanaged(u64), windows: *std.ArrayList(StreamWindow), a: std.mem.Allocator, stream: []const u8, now_ms: i64) !void {
+        var info = js.getStreamInfo(stream) catch return;
+        defer info.deinit();
+        const st = info.value.state;
+        const name = try a.dupe(u8, stream);
+        try heads.put(a, name, st.last_seq);
+        const first_unix: ?i64 = if (st.messages > 0) unixSecondsOf(st.first_ts) else null;
+        const window: i64 = if (first_unix) |f| @max(0, @divFloor(now_ms, 1000) - f) else -1;
+        const short = st.messages > 0 and st.first_seq > 1 and window >= 0 and window < @as(i64, @intCast(self.min_window_seconds));
+        if (short) log.warn("⚠️ {s} holds {d}s of events, under the 2 × cadence floor of {d}s: a client that falls off this stream can find a chain that predates it — CDC_MAX_BYTES or CDC_MAX_MSGS is ending the window before the age, or CDC_MAX_AGE_SECONDS is too short", .{ stream, window, self.min_window_seconds });
+        try windows.append(a, .{ .stream = name, .messages = st.messages, .bytes = st.bytes, .first_seq = st.first_seq, .window_seconds = window, .short = short });
     }
 
     fn headOf(self: *FleetMonitor, js: nats.JetStream, heads: *std.StringArrayHashMapUnmanaged(u64), a: std.mem.Allocator, stream: []const u8) !u64 {
@@ -267,3 +330,32 @@ pub const FleetMonitor = struct {
         };
     }
 };
+
+/// "2026-09-10T08:03:12.608794123Z" → Unix seconds: JetStream's own timestamp shape
+/// (`first_ts`, `last_ts`). The fraction is ignored — a window is measured in
+/// seconds. Days from the civil date by Howard Hinnant's algorithm.
+fn unixSecondsOf(ts: []const u8) ?i64 {
+    if (ts.len < 19) return null;
+    const y = std.fmt.parseInt(i64, ts[0..4], 10) catch return null;
+    const m = std.fmt.parseInt(i64, ts[5..7], 10) catch return null;
+    const d = std.fmt.parseInt(i64, ts[8..10], 10) catch return null;
+    const hh = std.fmt.parseInt(i64, ts[11..13], 10) catch return null;
+    const mm = std.fmt.parseInt(i64, ts[14..16], 10) catch return null;
+    const ss = std.fmt.parseInt(i64, ts[17..19], 10) catch return null;
+    if (m < 1 or m > 12 or d < 1 or d > 31) return null;
+    const yy = if (m <= 2) y - 1 else y;
+    const era = @divFloor(yy, 400);
+    const yoe = yy - era * 400;
+    const mp = @mod(m + 9, 12);
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    return days * 86400 + hh * 3600 + mm * 60 + ss;
+}
+
+test "unixSecondsOf reads JetStream timestamps" {
+    try std.testing.expectEqual(@as(?i64, 0), unixSecondsOf("1970-01-01T00:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, 951868800), unixSecondsOf("2000-03-01T00:00:00Z"));
+    try std.testing.expectEqual(@as(?i64, 1789027392), unixSecondsOf("2026-09-10T08:03:12.608794123Z"));
+    try std.testing.expectEqual(@as(?i64, null), unixSecondsOf("0001-01-01"));
+}

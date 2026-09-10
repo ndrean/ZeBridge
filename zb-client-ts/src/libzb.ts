@@ -25,7 +25,7 @@ import { natsTransport } from './transport.ts';
 import type { Transport, TransportConnection } from './transport.ts';
 import { decode, encode } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
-import { browserStorage } from './browser-storage.ts';
+
 import { sqliteDialect, type Dialect } from './dialect.ts';
 import { v7 as uuidv7 } from 'uuid';
 import { heartbeatPayload,
@@ -78,11 +78,14 @@ export interface ZeBridgeConfig {
   /// this library is built for another protocol than the bridge it is pointed at.
   /// Unset skips the check (a bridge that could not be reached is not a mismatch).
   grammarHash?: string;
+  /// The bridge's HTTP url to fetch the grammar hash automatically.
+  bridgeUrl?: string;
   /** @internal The compiled-in grammar (§10dq). Not a consumer input: any value passed here is replaced. */
   grammar?: any;
   /// PROTOCOL §9: the fleet heartbeat cadence in ms (default 30 000; 0 disables).
   heartbeatMs?: number;
   durable?: boolean;
+  engine?: 'sqlite' | 'pglite';
   /// The two seams (NOTES §10). Defaults are the browser: sqlocal/OPFS storage
   /// and a NATS WebSocket dial. A Node host injects better-sqlite3 + TCP
   /// (`zb-client-ts/node`); any other host brings its own pair.
@@ -217,14 +220,14 @@ function outboxVersionOf(row: { payload?: string }): string | null {
 
 export class ZeBridge {
   public readonly dbName: string;
-  public sql: StorageExec;
-  public transaction: Storage['transaction'];
-  public deleteDatabaseFile: Storage['deleteDatabaseFile'];
+  public sql: StorageExec = async () => { throw new Error('Not connected'); };
+  public transaction: Storage['transaction'] = async () => { throw new Error('Not connected'); };
+  public deleteDatabaseFile: Storage['deleteDatabaseFile'] = async () => { throw new Error('Not connected'); };
 
   private nc: TransportConnection | null = null;
-  private storage: Storage;
+  private storage!: Storage;
   /// What the replica engine speaks (dialect.ts) — SQLite unless the adapter says otherwise.
-  private dialect: Dialect;
+  private dialect!: Dialect;
 
   private syncedTables = new Map<string, TableState>();
   private failed = new Set<string>();
@@ -279,6 +282,9 @@ export class ZeBridge {
   constructor(config: ZeBridgeConfig) {
     this.config = config;
     config.grammar = GRAMMAR;
+    if (config.durable === undefined) {
+      config.durable = true;
+    }
     // The creds win over the passed principal — kills the mismatch class where
     // config says bob but the JWT says omar (every publish would just bounce).
     if (config.creds) {
@@ -291,13 +297,30 @@ export class ZeBridge {
     this.dbName = config.durable
       ? `zebridge_${config.principal}.sqlite3`
       : `zebridge_${Date.now()}.sqlite3`;
-    this.storage = (config.storage ?? browserStorage)(this.dbName);
-    this.dialect = this.storage.dialect ?? sqliteDialect;
+    
     this.transport = config.transport ?? natsTransport;
+    this.outboxInitPromise = new Promise((resolve) => { this.resolveOutboxInit = resolve; });
+  }
+
+  private async initializeStorage() {
+    if (this.storage) return; // already initialized
+    
+    let factory = this.config.storage;
+    if (!factory) {
+      if (this.config.engine === 'pglite') {
+        const { makePgliteStorage } = await import('./pglite-storage.ts');
+        factory = makePgliteStorage({ persist: this.config.durable });
+      } else {
+        const { browserStorage } = await import('./browser-storage.ts');
+        factory = browserStorage;
+      }
+    }
+
+    this.storage = factory(this.dbName);
+    this.dialect = this.storage.dialect ?? sqliteDialect;
     this.sql = this.storage.exec;
     this.transaction = (fn) => this.storage.transaction(fn);
     this.deleteDatabaseFile = () => this.storage.deleteDatabaseFile();
-    this.outboxInitPromise = new Promise((resolve) => { this.resolveOutboxInit = resolve; });
   }
 
   // ─── the index card ───────────────────────────────────────────────────────
@@ -309,6 +332,7 @@ export class ZeBridge {
   /// handle (OPFS, PGlite) the statement must read by shape (core.isReadOnlySql),
   /// and anything else is refused before it runs.
   public async query(sqlText: string, ...params: any[]): Promise<any[]> {
+    await this.initializeStorage();
     // The shape rule runs on EVERY path: a read-only connection still lets a
     // connection-local pragma "succeed" and drops a second statement in silence.
     if (!isReadOnlySql(sqlText)) {
@@ -328,6 +352,7 @@ export class ZeBridge {
     values?: Record<string, unknown>,
     opts?: { version?: string },
   ): Promise<{ version: string }> {
+    await this.initializeStorage();
     const state = this.syncedTables.get(table);
     if (!state || !state.pkCols.length) throw new Error(`table ${table} is not synced or has no primary key`);
     const version = opts?.version ?? this.newVersion();
@@ -420,6 +445,13 @@ export class ZeBridge {
   // ─── lifecycle ────────────────────────────────────────────────────────────
 
   public async connect(): Promise<void> {
+    await this.initializeStorage();
+    if (!this.config.grammarHash && this.config.bridgeUrl) {
+      try {
+        const r = await fetch(`${this.config.bridgeUrl.replace(/\/$/, '')}/grammar`, { signal: AbortSignal.timeout(3000) });
+        if (r.ok) this.config.grammarHash = r.headers.get('x-grammar-hash') || undefined;
+      } catch { /* ignore fetch failure, will just skip grammar check if grammarHash is undefined */ }
+    }
     await this.initSyncState();
     await this.refuseIfGrammarForked();
 
@@ -555,6 +587,7 @@ export class ZeBridge {
     clearInterval(this.rttIntervalId);
     clearInterval(this.hbIntervalId);
     clearTimeout(this.recountTimer);
+    clearTimeout(this.rebaseTimer ?? undefined);
     if (this.nc) {
       await this.nc.close();
       this.nc = null;
@@ -1302,6 +1335,7 @@ export class ZeBridge {
           await this.applyEvent(table, ev, txExec);
         });
         applied++;
+        this.triggerChange(table, ev);
       } catch (e) {
         const kind = foreignKeyFailureKind(e);
         if (kind === 'missing-parent') {
@@ -1448,6 +1482,7 @@ export class ZeBridge {
         await this.deleteHeld(pending, txExec);
       });
       applied = pending.length;
+      for (const { table, ev } of pending) this.triggerChange(table, ev);
     } catch {
       // Some are still orphaned. NOW it is worth isolating, because only the ones
       // that individually fail go back on the queue.
@@ -1460,6 +1495,7 @@ export class ZeBridge {
             await this.deleteHeld([held], txExec);
           });
           applied++;
+          this.triggerChange(table, ev);
         } catch (e) {
           if (foreignKeyFailureKind(e) === 'missing-parent') {
             this.fkHeld.push(held);            // still waiting; try again next batch
@@ -1486,7 +1522,6 @@ export class ZeBridge {
   private async applyEvent(table: string, ev: any, exec: Exec = this.run, seed = false) {
     const state = this.syncedTables.get(table);
     if (!state || !ev?.data) return;
-    this.triggerChange(table, ev);
 
     // Strictly `<`, never `<=`: the first post-snapshot commit carries the watermark
     // LSN itself — skipping it loses exactly one row per snapshot (measured).
@@ -1686,7 +1721,18 @@ export class ZeBridge {
       const zlib = await dynImport('node:zlib');
       return new Uint8Array(zlib.zstdDecompressSync(b, dict ? { dictionary: dict } : undefined));
     }
-    throw new Error('chain object is zstd-compressed: pass config.zstdDecompress (e.g. fzstd.decompress in the browser)');
+    // Browser default
+    const g = globalThis as any;
+    if (!g.__zbZstd) {
+      g.__zbZstd = import('@bokuweb/zstd-wasm').then(async (mod) => {
+        await mod.init();
+        return mod;
+      });
+    }
+    const mod = await g.__zbZstd;
+    if (!dict) return mod.decompress(b);
+    const dctx = mod.createDCtx();
+    try { return mod.decompressUsingDict(dctx, b, dict); } finally { /* handled by GC or dctx.free() */ }
   }
 
   /// grammar.json's `subjects.mutation_ack_prefix` — the verdict channel's first token.
@@ -1887,7 +1933,7 @@ export class ZeBridge {
        ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch`,
       table, manifest.cutoff_version, state.lsn, state.seedEpoch ?? 0,
     );
-    this.scheduleRecount();
+    this.triggerChange(table);
     this.appendLog('SYS', `Seeded ${table} from generation chain g${manifest.gen} (${applied} row(s), watermark ${manifest.cutoff_version} @ ${manifest.cutoff_lsn})`, 'INFO');
     return true;
   }
@@ -2182,6 +2228,7 @@ export class ZeBridge {
                   await this.applyEvent(table, ev, txExec);
                 }
               });
+              for (const { table, ev } of toApply) this.triggerChange(table, ev);
             } catch (err) {
               // ⚠️ This used to log and fall through to the ack below, so ONE bad event
               // silently discarded the other 99 and the replica still reported itself
@@ -2481,6 +2528,7 @@ export class ZeBridge {
 
     // Outbox insert and optimistic apply in ONE transaction (§7.1), persisted BEFORE
     // the publish: a duplicate is collapsed by dedup, a loss is unrecoverable.
+    let applied: Record<string, unknown> | null = null;
     try {
       await this.transaction(async (txExec) => {
         const state = this.syncedTables.get(table);
@@ -2498,12 +2546,16 @@ export class ZeBridge {
         // §10dx: the optimistic row carries the write's own stamp in the version column
         // — the ingress sets it from `version` server-side, and locally a NOT NULL
         // version column without it refused every optimistic INSERT.
-        const opt = optimisticEvent(table, op, payload);
-        if (op !== 'DELETE' && state?.versionColumn && opt.data && typeof opt.data === 'object' && !(state.versionColumn in (opt.data as any))) {
-          (opt.data as any)[state.versionColumn] = version;
+        applied = optimisticEvent(table, op, payload);
+        if (op !== 'DELETE' && state?.versionColumn && applied.data && typeof applied.data === 'object' && !(state.versionColumn in (applied.data as any))) {
+          (applied.data as any)[state.versionColumn] = version;
         }
-        await this.applyEvent(table, opt, txExec);
+        await this.applyEvent(table, applied, txExec);
       });
+      // Fire the change event AFTER the local replica is successfully updated — with
+      // the event that WAS applied, stamp included, so a handler reading
+      // `ev.data.<version column>` sees the write's own version, not undefined.
+      if (applied) this.triggerChange(table, applied);
     } catch (err) {
       this.pendingWrites.delete(msgId);
       this.appendLog(subject, `optimistic apply failed, write not sent: ${err}`, 'ERROR');

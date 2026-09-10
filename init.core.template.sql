@@ -679,6 +679,10 @@ CREATE TABLE IF NOT EXISTS public.zebridge_generations (
 -- dictionary object this row's payload was compressed with (NULL = plain zstd).
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict bytea;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_object text;
+-- §10ea: the ratio (percent) the dictionary achieved on row-sized samples when it was
+-- fresh — its own baseline. At the next full the same probe against the SAME
+-- dictionary says whether the data drifted (kept while within 10 points of it).
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_ratio smallint;
 -- Databases created before the delta milestone: same columns, idempotently.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS prev_cutoff timestamptz;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolean NOT NULL DEFAULT false;

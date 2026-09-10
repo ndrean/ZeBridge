@@ -10313,8 +10313,214 @@ a drifted dictionary fails the probe, so retraining happens exactly when the dat
 changed. The log says which: "keeps <dict> — a 1 MiB probe compresses to X% with it
 vs Y% without", or "trained from a bounded sample of the full".
 
+The first probe was wrong, and measurably: every full of the afternoon (g115 to g139)
+still trained a dictionary. It compressed one contiguous 1 MiB sample with and without
+the dictionary, and on a megabyte of similar rows zstd's own window finds the
+repetition by itself, so the dictionary barely won and the probe said "retrain". A
+dictionary earns its keep on SMALL inputs — a row, a few-KB delta — where there is no
+window to find anything in. The probe now compresses 64 row-sized samples one by one
+and sums.
+
+The second probe was still the wrong question: "23% with it vs 30% without — it
+drifted", a retrain on a seven-point difference, because the wasp's rows compress
+well on their own and "beat no dictionary by a quarter" measures how much a
+dictionary helps this data, not whether THIS dictionary still fits it. Drift is
+measured against the dictionary's own past now: the ratio it achieved on row-sized
+samples when fresh is stored beside it (`zebridge_generations.dict_ratio`), and at
+the next full the same probe against the same dictionary keeps it while within 10
+points of that baseline. The log names both outcomes ("keeps … compress to X% (its
+baseline Y%)", or "retrains — … against its baseline Y%: it drifted"). A dictionary
+from before the column falls back to the quarter-smaller test once, then has a
+baseline.
+
 Left on the list from the same reading: a full includes tombstoned rows, which a
 fresh replica applies only to delete again; deltas need them, fulls do not.
+
+## 10eb. In flight when the bridge died: redelivered first, or out of order (2026-09-08)
+
+Another restart under the wasp, another refused verdict — and this time the stream
+showed a true reorder. INSERT at 12:39:59.846, accepted; UPDATE at 12:40:00.110, in
+flight when the old bridge died; DELETE at 12:40:00.374; the new bridge accepted the
+DELETE at 12:40:03; the UPDATE was redelivered at 12:40:30 and judged `row_deleted`.
+JetStream redelivers an unacked message only when its ack wait expires (30 s by
+default), while newer messages flow to the new instance at once. The final state was
+right — the delete was the later write — but per-row order across a crash was not.
+
+Two changes. The consumer's ack wait is 10 s (the listener applies in milliseconds
+and naks what it cannot; a redelivered write that already landed is accepted again
+since §10dy, so a shorter wait is free). And a listener that finds writes pending on
+its durable consumer at boot waits one ack wait before its first pull, so the
+previous instance's in-flight messages are redelivered at the head of it, in stream
+order, before anything newer. The wasp reports a refused verdict inside the 90 s
+after a bridge restart instead of failing on it — the old binary is still what a
+restart during this flight replays.
+
+## 10ec. A clean stop leaves nothing in flight (2026-09-08)
+
+The user's question at the next restart: two writes "in flight when the previous
+instance stopped" — after a clean SIGINT, why replay anything at boot rather than
+finish before leaving? The batch in hand IS finished: committed in PostgreSQL, then
+acked. What stayed open was the last pull request. A fetch returns as soon as
+messages are there while the server keeps the request open until its expiry
+(500 ms); writes published into that window are delivered to a subscription that no
+longer exists, and count as in flight until their ack wait runs out. Two writes in
+half a second is the wasp's rate. The first fix pulled "until a pull comes back
+empty", and the next stop showed why that is wrong under a steady writer: five rounds,
+each with one or two writes, and the last request parked anyway. No new pull, then:
+the stop path reads the inbox for what the parked request still delivers, through a
+new library call (`PullSubscription.nextDelivered`, NATS_ZIG_NOTES entry 11), until it
+has been silent for longer than the request can live, and leaves. The boot drain of
+§10eb remains for the case it was written for, a crash.
+
+## 10ed. A kept dictionary named by the wrong row — a phantom every fresh client tripped on (2026-09-08)
+
+The wasp's first check after a clean stop: "emitter 4, PG 2, watcher 2", every verdict
+accepted, nothing pending. The emitter's two extra rows were live rows from the
+PREVIOUS flight, tombstoned on PostgreSQL an hour earlier. Its log: "seeding failed:
+ObjectNotFound" three times, then "chain predates replica — refusing the full (D2)"
+forever; its `_zbz_generations` empty; its stream position at the head. It had never
+seeded — it followed CDC on an unseeded table from the stream's first message, and the
+bookkeeping named a dictionary that did not exist: `test_types-g156-dict`, then
+`g161-dict`, while the only object was `g151-dict`.
+
+§10ea's "keep the dictionary" stored the kept bytes on the new full's row (right, the
+next lookup needs them) but every lookup REBUILT the object name from that row's gen
+— "g<gen>-dict" — and a kept dictionary is never uploaded under the new gen. So the
+row for the full that kept g151's dictionary said gen 156, the deltas of that era were
+compressed with the right bytes under the name g156-dict, the next full kept it again
+under g161-dict, and two eras of deltas pointed at phantoms. The TypeScript watcher hit
+the same "dictionary missing" and fell back to the snapshot; libzb has no fallback and
+stayed unseeded. The name is the row's `dict_object` now, in both lookups; the dev
+stack was repaired by uploading g151's bytes under the two phantom names (immutable by
+name, same bytes) and pointing the rows at the real one. A fresh emitter then seeded
+2,552 rows from g163 on the first try.
+
+Left on the list: an UNSEEDED libzb table whose position has passed a chain's cutoff
+refuses that chain as "predating" and can never seed — D2's guard protects rows a
+full would destroy, and an unseeded table has none worth protecting beyond what a
+re-read from the cutoff would restore. Either apply the full and re-read the stream
+from the cutoff, or a snapshot fallback like the TypeScript client's.
+
+## 10ee. Push for the browser, pull for the host — and what a review of each found (2026-09-10)
+
+After the outage the user reshaped both clients' reactivity, and the README says it:
+the TypeScript client is a push model (`onChange(table, cb)` rings per applied event
+with the row, and once with no event after a seed), libzb stays a pull model whose
+poll report now names `changed_tables` and `seeded`, so a host patches its UI for the
+former and re-reads for the latter. The review against the README found:
+
+- **libzb, a dangling report.** The table names put in `changed_tables` were slices
+  into the per-batch arena (a decoded event's `table`) and the retry pass's arena — both
+  freed before the host reads the report. Duped into the report's allocator now, and
+  a held event no longer counts as "changed": only what was applied.
+- **TypeScript, the wrong event.** The optimistic `onChange` fired with a fresh
+  `optimisticEvent` rather than the one applied, so `ev.data.<version column>` was
+  undefined until the echo; it fires with the applied event now. The move of the
+  trigger from inside `applyEvent` to after the transaction commits is right: a
+  seed no longer rings per row.
+- **The page, three handler rules.** An INSERT rang twice for our own writes (the
+  optimistic apply, then the echo) and the handlers appended twice; a delete on a
+  tombstone table arrives as an UPDATE with the tombstone set and the handlers kept
+  the row; and the any-change block re-read the outbox and re-ran the SQL console per
+  event — yesterday's storm again. Handlers upsert, read the tombstone as a delete,
+  and the read-side block is coalesced to 250 ms. The README now states the first
+  two rules next to the event shape, and no longer promises an `old` field nobody
+  produces.
+- **A default flipped.** `durable` now defaults to true in the library (a stable
+  per-principal file); the page still asks for a fresh file per load unless
+  `?durable=1`. Right for a consumer, worth a sentence in the README's constructor.
+
+## 10ef. The verdict drain's gap was a fixed quarter second — every `flush` paid it (2026-09-10)
+
+The fast sting found it before the first minute was over. `drip.py --interval-ms 5`
+promised 600 writes a second and delivered 11: 226 ticks in the first minute, 265 ms
+each. Nothing in the tick explained it — three `mutate` calls, a `poll(0)`, a
+`flush(5)` — until the drain under `flush` did. `drainVerdicts(wait_ms)` waits up to
+`wait_ms` for the FIRST verdict (§10dx: a verdict is a PostgreSQL round trip, a
+single short wait gave up before it existed), then reads verdict after verdict with a
+250 ms wait each and stops at the first timeout. That per-message wait was a constant:
+the budget bounded the first verdict, and the gap that ended the drain cost 250 ms no
+matter what the caller asked. `flush(0)` — the loop's "send what is queued, take what
+is there" turn — blocked a quarter second after the last verdict, every turn.
+
+Two hosts paid without knowing:
+
+- the wasp, whose tick could never be shorter than 250 ms whatever `--interval-ms`
+  said (the slow sting at 200 ms never noticed: its tick was 265 ms and nobody
+  measured it);
+- the Flutter worker, whose turn is `poll(100)` then `flush(0)`: 350 ms, against the
+  100 ms the README states as the bound on a click.
+
+**The fix.** The gap follows the budget, capped at 250 ms: `flush(0)` drains with a
+1 ms gap (what it leaves behind, the next poll's sweep takes — `poll` already drains
+with a 1 ms gap), `flush(20)` with 20, `flush(2000)` with 250 as before. The wasp
+flushes with no wait when its interval is under 20 ms. Measured, same stack, same
+tick: 11 writes a second before, 258 with `flush(5)`, 422 with `flush(0)`. What is
+left of the tick is three synchronous publishes and a 1 ms fetch. The C card and the
+TypeScript client are untouched: the TypeScript client has no such drain, its verdicts
+arrive on a subscription.
+
+**The 40-minute sting at 5 ms, the first run of the fast wasp: clean.** 330,422
+ticks, 966,564 writes at 413 a second sustained, 967,927 verdicts accepted and none
+refused; the three sides agreed at every minute, nothing pending; the bridge's
+allocated bytes sat at 46.2 MB against a 45.6 MB warm baseline for the whole run, RSS
+58 MB cold and warm, 7% CPU. The web page and the Flutter app, on another tenant,
+stayed reactive throughout; the Flutter worker was restarted mid-run onto the new
+library without a hiccup. Two things to keep an eye on: the bridge's RSS climbed to
+331 MB and fell back to 81 during one generation — the producer building a 10.8 MB
+delta (five minutes of the sting, tombstones included) holds the libpq result, the
+encoded rows, the training corpus and the compression buffers at once, a multiple of
+the delta's size, freed after; and the table ended the run with 330 thousand
+tombstones, which every delta carries until the sweeper takes them (the hourly sweep
+never came due in a 40-minute run).
+
+## 10eg. The CDC streams' retention, from constants to a contract (2026-09-10)
+
+The fast sting left CDC_globex at 806 MB after 40 minutes, and the question of what
+bounds it found three compiled constants nobody had revisited since the streams were
+first reconciled from the catalogue: 8 days of age, 1 GiB, 10 million messages. The
+arithmetic said which one binds: at any realistic row size the byte cap fills long
+before the message cap, and at 400 writes a second it fills in under an hour — so the
+1 GiB, not the 8 days, ended the window, silently. And 8 days of events is the
+expensive way to do what the chain does for free.
+
+**The rule.** A client that fell off a stream re-seeds from the chain and resumes CDC
+at the newest manifest's cutoff sequence, so the stream must still hold that sequence.
+The newest cutoff is at most one cadence old while the producer runs: two cadences is
+the floor, three the default. Below the floor a returning client finds a chain that
+predates the stream — libzb waits for the producer's next full (a wait of one
+cadence, not a hole), the TypeScript client gives up for the process's life
+(CLIENTS item 4, still open).
+
+**What changed.**
+
+- Three env vars, `CDC_MAX_AGE_SECONDS` (default 3 × `GENERATION_CADENCE_SECONDS`),
+  `CDC_MAX_BYTES` and `CDC_MAX_MSGS` (today's values), read next to the cadence so
+  the age can follow it. The age is the retention; bytes and messages are disk
+  valves. JetStream's own defaults are no limit at all.
+- The reconcile applies them to streams that already exist — it used to rewrite only
+  the subjects, so a changed limit was visible in the env file and inert on the
+  server. Each move is a log line (`CDC_acme max_age 691200s → 900s`, five of them at
+  the first boot).
+- A boot line states the window against the floor, and warns when the age is under
+  two cadences — the same shape as the sweeper's inequality.
+- The fleet monitor reads each CDC stream's state on its poll and publishes the window
+  the stream REALLY holds, now minus its oldest message: `bridge_cdc_window_seconds`,
+  `bridge_cdc_window_short` (the floor breached on a stream that has pruned — a young
+  stream's small window is age, not loss), plus bytes and messages per stream. A
+  short window is a warning every poll while it lasts, because the config cannot know
+  the throughput and only the observable says which mark ended the window.
+
+**Measured at the first boot.** The five streams moved from 8 days to 900 s in one
+reconcile; fifteen minutes later every stream was empty (nothing had been written
+since the sting ended) and the store had fallen from 1.6 GB to 729 MB, the remainder
+being MUTATIONS under its own 2 h. The web page and the Flutter app saw no gap: an
+empty stream's `first_seq` is `last_seq + 1`, and their positions were the heads.
+
+**Not yet exercised.** The wall itself: a client whose position fell off a pruned
+stream, with the chain inside the window (re-seed and agree) and with a chain that
+predates it (say so, wait one cadence, then agree); the emitter parked with writes
+queued; a bridge outage longer than the age. The scenario is next.
 
 ## §13 Preflight stopped
 

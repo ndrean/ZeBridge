@@ -7,11 +7,9 @@
 /// that claim — or breaking it — live, from the log the library already emits.
 /// Nothing on this page teaches silently.
 
-import { createSignal, onCleanup, For, Show } from 'solid-js';
 import { ZeBridge, credsFileText, principalFromCreds } from 'zb-client-ts';
-import { makePgliteStorage } from 'zb-client-ts/pglite';
-import { init as zstdInit, decompress as zstdDecompress, createDCtx, decompressUsingDict } from '@bokuweb/zstd-wasm';
 import { nkeys } from '@nats-io/nats-core';
+import { createSignal, onCleanup, For, Show } from 'solid-js';
 
 /// ⚠️ This module owns ONE client, one socket, one replica. An edit to this file must
 /// therefore reload the page, not hot-swap the module: a hot update re-runs the module
@@ -20,18 +18,6 @@ import { nkeys } from '@nats-io/nats-core';
 /// and "Failed to compress with code -20/-72" on objects whose digest had just been
 /// verified). Accepting the update and reloading is how a module opts out.
 if (import.meta.hot) import.meta.hot.accept(() => location.reload());
-
-/// §10x: chain objects are zstd frames, deltas may name a dictionary. One wasm
-/// decoder, initialized once per PAGE (kept on globalThis so nothing re-inits it);
-/// a dict frame decodes through a decompression context holding the dictionary.
-const g = globalThis as any;
-async function zstdDecode(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array> {
-  g.__zbZstdReady ??= zstdInit();
-  await g.__zbZstdReady;
-  if (!dict) return zstdDecompress(b);
-  const dctx = createDCtx();
-  try { return decompressUsingDict(dctx, b, dict); } finally { /* ctx freed by GC in this build */ }
-}
 
 /// ⚠️ No ports here, on purpose. Both of these are SAME-ORIGIN paths served by the
 /// Vite dev server, which proxies them to wherever the stack actually is —
@@ -115,27 +101,15 @@ const CREDS = await (async () => {
 /// are, not what the URL guessed.
 const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
 
-/// The wire grammar is compiled into the library (§10dq) — the same bytes the bridge
-/// embeds. What the page asks the bridge for is only its HASH, to refuse loudly if
-/// this build and that bridge speak different protocols. A bridge that does not
-/// answer is not a mismatch: the page connects anyway, since NATS holds everything
-/// a provisioned replica needs. An enrolled tab already holds the hash from /enroll.
-const GRAMMAR_HASH: string | undefined = sessionStorage.getItem('zb_grammar_hash')
-  ?? (await fetch(`${BRIDGE_URL}/grammar`, { signal: AbortSignal.timeout(3000) })
-    .then((r) => (r.ok ? r.headers.get('x-grammar-hash') : null))
-    .catch(() => null))
-  ?? undefined;
-
 /// THE instance. One replica, one socket, one outbox.
 const zb = new ZeBridge({
-  zstdDecompress: zstdDecode,
   natsUrl: NATS_URL,
+  bridgeUrl: BRIDGE_URL,
   principal: PRINCIPAL,
   password: PASSWORD,
   creds: CREDS,
-  grammarHash: GRAMMAR_HASH,
   durable: DURABLE,
-  storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: DURABLE }) : undefined,
+  engine: ENGINE,
 });
 
 // Console handle for inspecting the local replica directly — the database lives in
@@ -298,19 +272,99 @@ export default function App() {
   // main thread, and a click's own echo queues behind them — measured as 0.5 to 60 s of
   // latency on the counters. One refresh at most every 250 ms, for the tables that
   // actually changed; the SQL console re-runs only when its text names one of them.
-  const dirty = new Set<string>();
-  let refreshTimer: ReturnType<typeof setTimeout> | null = null;
-  const scheduleRefresh = (table?: string) => {
-    if (table) dirty.add(table);
-    if (refreshTimer) return;
-    refreshTimer = setTimeout(() => {
-      refreshTimer = null;
-      const changed = [...dirty]; dirty.clear();
-      void refresh(changed);
-    }, 250);
+  // ── granular reactivity: the push model ───────────────────────────────────
+  //
+  // `onChange(table, cb)` rings per applied event with the row (`ev.data`), and once
+  // with no event after a bulk operation (a seed): patch the signals in memory for
+  // the former, re-read the table for the latter. Two rules every handler follows:
+  //   · the same row rings TWICE for our own writes — the optimistic apply, then the
+  //     CDC echo — so an INSERT is an upsert, never a blind append;
+  //   · a delete on a table with tombstones arrives as an UPDATE whose tombstone
+  //     column is set (§7.5): the verb the user cares about is the intent.
+  const isDelete = (table: string, ev: any) => {
+    const tc = zb.tableState(table)?.tombstoneColumn;
+    return ev.operation === 'DELETE' || (tc != null && ev.data?.[tc] != null);
   };
-  zb.onTableEvent((table) => scheduleRefresh(table));
-  zb.onAnyChange(() => scheduleRefresh());
+  zb.onChange('counter_public', (ev) => {
+    if (!ev) { void refresh(['counter_public']); return; }
+    if (ev.data.uid !== counterUid('counter_public')) return;
+    setCounters((prev) => ({
+      ...prev,
+      counter_public: {
+        value: ev.data.value !== undefined ? ev.data.value : prev.counter_public?.value ?? 0,
+        version: ev.data.updated_at !== undefined ? String(ev.data.updated_at) : prev.counter_public?.version ?? '',
+        writer: ev.data.last_writer !== undefined ? String(ev.data.last_writer) : prev.counter_public?.writer ?? ''
+      }
+    }));
+  });
+
+  zb.onChange('counter_tenant', (ev) => {
+    if (!ev) { void refresh(['counter_tenant']); return; }
+    if (ev.data.uid !== counterUid('counter_tenant')) return;
+    setCounters((prev) => ({
+      ...prev,
+      counter_tenant: {
+        value: ev.data.value !== undefined ? ev.data.value : prev.counter_tenant?.value ?? 0,
+        version: ev.data.updated_at !== undefined ? String(ev.data.updated_at) : prev.counter_tenant?.version ?? '',
+        writer: ev.data.last_writer !== undefined ? String(ev.data.last_writer) : prev.counter_tenant?.writer ?? ''
+      }
+    }));
+  });
+
+  zb.onChange('app_users', (ev) => {
+    if (!ev) { void refresh(['app_users']); return; }
+    setUsers((prev) => {
+      if (isDelete('app_users', ev)) return prev.filter((u) => u.uid !== ev.data.uid);
+      const known = prev.some((u) => u.uid === ev.data.uid);
+      const next = known
+        ? prev.map((u) => (u.uid === ev.data.uid ? { ...u, name: ev.data.name ?? u.name } : u))
+        : [...prev, { uid: ev.data.uid, name: ev.data.name }];
+      return next.sort((a, b) => a.name.localeCompare(b.name));
+    });
+  });
+
+  zb.onChange('app_orders', (ev) => {
+    if (!ev) { void refresh(['app_orders']); return; }
+    
+    const pk = zb.tableState('app_orders')?.pkCols ?? ['uid'];
+    const key = Object.fromEntries(pk.map((c) => [c, ev.data[c]]));
+    const keyId = JSON.stringify(key);
+
+    setOrders((prev) => {
+      if (isDelete('app_orders', ev)) return prev.filter((o) => o.keyId !== keyId);
+      const patch = (o: OrderRow): OrderRow => ({
+        ...o,
+        count: ev.data.count !== undefined ? Number(ev.data.count) : o.count,
+        note: ev.data.note !== undefined ? ev.data.note : o.note,
+        version: ev.data.updated_at !== undefined ? String(ev.data.updated_at) : o.version,
+        writer: ev.data.last_writer !== undefined ? String(ev.data.last_writer) : o.writer,
+      });
+      if (prev.some((o) => o.keyId === keyId)) return prev.map((o) => (o.keyId === keyId ? patch(o) : o));
+      const fresh: OrderRow = {
+        key, keyId, user_id: ev.data.user_id, item: ev.data.item,
+        count: Number(ev.data.count ?? 1), note: ev.data.note ?? null,
+        version: String(ev.data.updated_at ?? ''), writer: String(ev.data.last_writer ?? ''),
+      };
+      return [fresh, ...prev];
+    });
+  });
+
+  // The counts and the live SQL console are reads, so they stay COALESCED: once per
+  // 250 ms whatever the event rate (yesterday's lesson: per-event reads cost a click
+  // up to a minute under 45 CDC events a second). The per-table handlers above patch
+  // signals in memory and need no such guard.
+  let anyTimer: ReturnType<typeof setTimeout> | null = null;
+  zb.onAnyChange(() => {
+    if (anyTimer) return;
+    anyTimer = setTimeout(() => {
+      anyTimer = null;
+      if (sqlLive() && sqlHasRun) void runSql();
+      setTables(zb.tableNames().sort());
+      setTenant(zb.tenant || '—');
+      setHeldCount(zb.heldCount);
+      zb.outboxAll().then((o) => setOutboxCount(o.length)).catch(() => {});
+    }, 250);
+  });
 
   // ── writes: every one through mutate(), then a refresh for the outbox count ──
   const write = async (table: string, op: 'INSERT' | 'UPDATE' | 'DELETE', key: Record<string, unknown>, values?: Record<string, unknown>) => {
@@ -415,7 +469,7 @@ export default function App() {
   };
 
   // ── SQL console — arbitrary reads against THIS tab's own replica ───────────
-  const [sqlText, setSqlText] = createSignal('SELECT name, updated_at, last_writer FROM app_users ORDER BY updated_at DESC LIMIT 8');
+  const [sqlText, setSqlText] = createSignal('SELECT count, note, updated_at, last_writer FROM app_orders ORDER BY updated_at DESC LIMIT 3');
   const [sqlRows, setSqlRows] = createSignal<any[] | null>(null);
   const [sqlError, setSqlError] = createSignal<string | null>(null);
   const [sqlLive, setSqlLive] = createSignal(true);

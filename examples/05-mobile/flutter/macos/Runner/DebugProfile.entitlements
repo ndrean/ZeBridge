@@ -2,7 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Dev profile: libzb is loaded from the repository's zig-out, outside the bundle.
+	     The sandbox refuses that dlopen ("file system sandbox blocked open()"), and the
+	     hardened runtime refuses an unsigned library without disable-library-validation.
+	     A shipping build bundles and signs the dylib and keeps both defaults. -->
 	<key>com.apple.security.app-sandbox</key>
+	<false/>
+	<key>com.apple.security.cs.disable-library-validation</key>
 	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>

@@ -1,0 +1,41 @@
+PullSubscription.nextDelivered: read a data message a parked pull request still delivers,
+without issuing a new request — what a clean stop of a pull consumer needs.
+NATS_ZIG_NOTES.md entry 11.
+
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -468,6 +468,33 @@
+     }
+ 
+     /// Fetch a batch of messages from the pull consumer
++    /// A data message the server has ALREADY delivered to this consumer's inbox — the
++    /// reply to a pull request still parked at the server after `fetch` returned early —
++    /// without issuing a new request. Status frames are skipped; null at the deadline.
++    ///
++    /// What a clean stop needs: after the last `fetch`, its request stays parked for up
++    /// to its `expires`, and messages delivered into that window reach a subscription
++    /// nobody reads — in flight until their ack wait runs out. Reading the inbox for that
++    /// window, then leaving, is the difference between a restart that replays and one
++    /// that does not (ZeBridge NOTES §10ec).
++    pub fn nextDelivered(self: *PullSubscription, timeout: Io.Timeout) !?*JetStreamMessage {
++        if (!self.owns_inbox) return error.SharedInbox;
++        try self.mutex.lock(self.js.nc.io);
++        defer self.mutex.unlock(self.js.nc.io);
++        const deadline = timeout.toDeadline(self.js.nc.io);
++        while (true) {
++            const raw = self.inbox_subscription.nextMsgTimeout(deadline) catch |err| switch (err) {
++                error.Timeout => return null,
++                else => return err,
++            };
++            if (raw.status_code > 0) {
++                raw.deinit();
++                continue;
++            }
++            return try jetstream_message.createJetStreamMessage(self.js.nc, raw);
++        }
++    }
++
+     pub fn fetch(self: *PullSubscription, batch: usize, timeout: Io.Timeout) !MessageBatch {
+         if (batch == 0) return error.InvalidBatchSize;
+         // A shared inbox is read by `PullInbox.fetch` only: reading it here would

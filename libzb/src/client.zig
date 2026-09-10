@@ -560,7 +560,7 @@ pub const SyncClient = struct {
         try ensureShape(&self.st);
         self.st.execSimple("ALTER TABLE _zbz_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0") catch {}; // a replica from before §10df
         // A schema that just moved may be what a held event was waiting for.
-        self.retryHeld();
+        self.retryHeld(null, null);
     }
 
     /// One descriptor onto one table: migrate the physical table and refresh the
@@ -689,7 +689,7 @@ pub const SyncClient = struct {
     /// Drain the schemas watch: every descriptor that changed since the last poll,
     /// applied through the same path `sync()` uses. Non-blocking (1 ms). Opens the
     /// watch on first use — after the grammar named the bucket.
-    fn drainSchemaWatch(self: *SyncClient) !void {
+    fn drainSchemaWatch(self: *SyncClient, report_a: std.mem.Allocator, changed_map: *std.StringArrayHashMapUnmanaged(void), seeded_map: *std.StringArrayHashMapUnmanaged(void)) !void {
         if (self.schema_watch == null) {
             self.schema_kv = try self.t.js.kvBucket(self.kv_schemas);
             self.schema_watch = try self.schema_kv.?.watchAll(.{ .updates_only = true });
@@ -717,10 +717,10 @@ pub const SyncClient = struct {
             };
             moved += 1;
         }
-        if (moved > 0) self.retryHeld();
+        if (moved > 0) self.retryHeld(report_a, changed_map);
         if (self.reseed_pending) {
             self.reseed_pending = false;
-            self.gapAndSeed() catch |err| std.debug.print("re-seed after epoch move: {s}\n", .{@errorName(err)});
+            self.gapAndSeed(report_a, seeded_map) catch |err| std.debug.print("re-seed after epoch move: {s}\n", .{@errorName(err)});
         }
     }
 
@@ -757,7 +757,7 @@ pub const SyncClient = struct {
 
     // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
 
-    pub fn gapAndSeed(self: *SyncClient) !void {
+    pub fn gapAndSeed(self: *SyncClient, report_a: ?std.mem.Allocator, seeded_map: ?*std.StringArrayHashMapUnmanaged(void)) !void {
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
@@ -818,6 +818,9 @@ pub const SyncClient = struct {
                 self.applyChain(table) catch |err| {
                     std.debug.print("{s}: seeding failed: {s} — retried at the next poll\n", .{ table, @errorName(err) });
                     continue;
+                };
+                if (report_a) |ra_| if (seeded_map) |sm| {
+                    if (!sm.contains(table)) sm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
                 };
             }
         }
@@ -1043,7 +1046,7 @@ pub const SyncClient = struct {
 
         var sit = streams.iterator();
         while (sit.next()) |se| try self.drainStream(se.key_ptr.*);
-        self.retryHeld();
+        self.retryHeld(null, null);
     }
 
     /// The streams this client reads, public first: parents (users) ride
@@ -1068,13 +1071,14 @@ pub const SyncClient = struct {
     /// Passes until a pass resolves nothing (§10dg): a child held behind a parent that
     /// is itself held behind a grandparent needs the second pass — measured, the
     /// single pass left the child in the inbox until an unrelated event arrived.
-    fn retryHeld(self: *SyncClient) void {
+    fn retryHeld(self: *SyncClient, report_a: ?std.mem.Allocator, changed_map: ?*std.StringArrayHashMapUnmanaged(void)) void {
+        var passes: usize = 0;
         var total_len: usize = 0;
         var total_resolved: usize = 0;
         var total_dropped: usize = 0;
-        var passes: usize = 0;
+        // Limit passes to break cycles if two rows wait for each other.
         while (passes < 16) : (passes += 1) {
-            const r = self.retryHeldPass() catch return;
+            const r = self.retryHeldPass(report_a, changed_map) catch return;
             if (passes == 0) total_len = r.len;
             total_resolved += r.resolved;
             total_dropped += r.dropped;
@@ -1087,7 +1091,7 @@ pub const SyncClient = struct {
 
     const RetryPass = struct { len: usize, resolved: usize, dropped: usize };
 
-    fn retryHeldPass(self: *SyncClient) !RetryPass {
+    fn retryHeldPass(self: *SyncClient, report_a: ?std.mem.Allocator, changed_map: ?*std.StringArrayHashMapUnmanaged(void)) !RetryPass {
         var ra = std.heap.ArenaAllocator.init(self.a);
         defer ra.deinit();
         const a = ra.allocator();
@@ -1106,6 +1110,10 @@ pub const SyncClient = struct {
             if (self.applyEvent(table, ev, 0)) |_| {
                 _ = self.st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{id}) catch {};
                 resolved += 1;
+                // Duped: `table` is a row of this pass's arena (§10ee).
+                if (report_a) |ra_| if (changed_map) |cm| {
+                    if (!cm.contains(table)) cm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
+                };
             } else |err| switch (err) {
                 error.FkHeld, error.SchemaBehind => {
                     _ = self.st.query(a, "UPDATE _zbz_inbox SET attempts = attempts + 1 WHERE id = ?", &.{id}) catch {};
@@ -1190,7 +1198,7 @@ pub const SyncClient = struct {
             };
             defer batch.deinit();
             if (batch.messages.len == 0) break;
-            _ = try self.applyBatch(stream, batch.messages, last, &max_seq);
+            _ = try self.applyBatch(null, stream, batch.messages, last, &max_seq, null);
         }
         if (max_seq > last) try self.persistSeq(stream, max_seq);
         std.debug.print("{s}: drained to seq {d}\n", .{ stream, max_seq });
@@ -1199,7 +1207,7 @@ pub const SyncClient = struct {
     /// One fetched batch through the gate → apply → hold → position path, shared by
     /// the bounded drain and the live tail. Returns the number of events offered to
     /// `applyEvent` (applied, gated or held — D1: all three ARE the position).
-    fn applyBatch(self: *SyncClient, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, last: u64, max_seq: *u64) !usize {
+    fn applyBatch(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, last: u64, max_seq: *u64, changed_map: ?*std.StringArrayHashMapUnmanaged(void)) !usize {
         // Per-batch: every decoded event dies with the batch, except the FK-held
         // ones, which are held DURABLY in `_zbz_inbox` below (§10de finding 1).
         var ba = std.heap.ArenaAllocator.init(self.a);
@@ -1221,6 +1229,8 @@ pub const SyncClient = struct {
             last: u64,
             max_seq: *u64,
             offered: *usize,
+            report_a: ?std.mem.Allocator,
+            changed_map: ?*std.StringArrayHashMapUnmanaged(void),
             /// §10dg: FOREIGN KEY checks deferred to COMMIT for the whole batch (the TS
             /// client's `defer_foreign_keys`): a family inserted child-first, or a
             /// cascade's deletes arriving parent-first, lands as one unit with no hold at
@@ -1238,25 +1248,38 @@ pub const SyncClient = struct {
                         const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
                         if (cx.client.states.get(table) == null) continue;
                         cx.offered.* += 1;
+                        var applied_here = true;
                         cx.client.applyEvent(table, ev, seq) catch |err| switch (err) {
                             // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
                             // event that is acked, positioned past, and never applied.
                             // Held DURABLY, in this batch's transaction (CLIENTS.md, §10de
                             // finding 1): the position below is persisted past this event,
-                            // so the inbox is the only thing that remembers it — a host
-                            // killed before the retry lands must not lose the row.
-                            error.FkHeld => try holdEvent(st_, cx.a, table, ev, "missing-parent"),
-                            error.SchemaBehind => try holdEvent(st_, cx.a, table, ev, "unknown-column"),
+                            // so the inbox is the only thing that remembers it.
+                            error.FkHeld => {
+                                applied_here = false;
+                                try holdEvent(st_, cx.a, table, ev, "missing-parent");
+                            },
+                            error.SchemaBehind => {
+                                applied_here = false;
+                                try holdEvent(st_, cx.a, table, ev, "unknown-column");
+                            },
                             // Anything else is an event acked, positioned past and never
-                            // applied — it must at least be SAID (measured: a child born
-                            // under the schema watch lost its first three rows to this
-                            // arm in silence). The SQLite text names the real cause.
-                            else => |e| std.debug.print("{s}: event at seq {d} not applied: {s} — sqlite: {s}\n", .{ table, seq, @errorName(e), st_.errMsg() }),
+                            // applied — it must at least be SAID. The SQLite text names the cause.
+                            else => |e| {
+                                applied_here = false;
+                                std.debug.print("{s}: event at seq {d} not applied: {s} — sqlite: {s}\n", .{ table, seq, @errorName(e), st_.errMsg() });
+                            },
+                        };
+                        // The host's `changed_tables` (§10ee): only what was APPLIED — a
+                        // held event changed nothing yet — and the name DUPED into the
+                        // report's allocator: `table` lives in this batch's arena, which
+                        // dies before the host reads the report.
+                        if (applied_here) if (cx.report_a) |ra_| if (cx.changed_map) |cm| {
+                            if (!cm.contains(table)) cm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
                         };
                     }
                     if (seq > cx.max_seq.*) cx.max_seq.* = seq;
                 }
-                // D1: delivery + accounting IS the position — applied, gated or held.
                 if (cx.max_seq.* > cx.last) try cx.client.persistSeq(cx.stream, cx.max_seq.*);
             }
         };
@@ -1269,6 +1292,8 @@ pub const SyncClient = struct {
             .last = last,
             .max_seq = max_seq,
             .offered = &offered,
+            .report_a = report_a,
+            .changed_map = changed_map,
             .deferred = true,
         };
         self.st.transaction(ctx, Ctx.apply) catch |err| {
@@ -1317,7 +1342,7 @@ pub const SyncClient = struct {
         t.sub = fresh;
     }
 
-    pub const PollReport = struct { applied: usize, settled: usize };
+    pub const PollReport = struct { applied: usize, settled: usize, changed_tables: []const []const u8, seeded: []const []const u8 };
 
     /// One turn of the host's loop: wait up to `wait_ms` for CDC on the persistent
     /// tails, apply what arrived, retry the FK-held, then sweep verdicts without
@@ -1331,14 +1356,18 @@ pub const SyncClient = struct {
         return self.t.conn.lastAuthError();
     }
 
-    pub fn poll(self: *SyncClient, wait_ms: u64) !PollReport {
+    pub fn poll(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
         try self.refuseIfRevoked();
+
+        var changed_map: std.StringArrayHashMapUnmanaged(void) = .empty;
+        var seeded_map: std.StringArrayHashMapUnmanaged(void) = .empty;
+
         // Schema first: a row in a new shape must find its table already moved.
-        self.drainSchemaWatch() catch |err| std.debug.print("schema watch: {s}\n", .{@errorName(err)});
+        self.drainSchemaWatch(report_a, &changed_map, &seeded_map) catch |err| std.debug.print("schema watch: {s}\n", .{@errorName(err)});
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const streams = try self.cdcStreams(ca.allocator());
-        if (streams.len == 0) return .{ .applied = 0, .settled = 0 };
+        if (streams.len == 0) return .{ .applied = 0, .settled = 0, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
 
         // ONE wait over every stream (nats.zig `PullInbox`, §10bh): one pull per
         // tail into a shared inbox, and the first message from any of them ends the
@@ -1356,7 +1385,7 @@ pub const SyncClient = struct {
             // re-open them all at the stored positions; the next poll reads.
             error.NoResponders => {
                 for (self.tails.items) |*tl| try self.reopenTail(tl);
-                return .{ .applied = 0, .settled = try self.drainVerdictsWith(0, 1) };
+                return .{ .applied = 0, .settled = try self.drainVerdictsWith(0, 1), .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
             },
             else => return err,
         };
@@ -1377,13 +1406,13 @@ pub const SyncClient = struct {
             if (mine.items.len == 0) continue;
             const last = try self.storedSeq(stream);
             var max_seq = last;
-            applied += try self.applyBatch(stream, mine.items, last, &max_seq);
+            applied += try self.applyBatch(report_a, stream, mine.items, last, &max_seq, &changed_map);
         }
-        if (applied > 0) self.retryHeld();
+        if (applied > 0) self.retryHeld(report_a, &changed_map);
         self.drainRebase();
         const settled = try self.drainVerdictsWith(0, 1);
         self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
-        return .{ .applied = applied, .settled = settled };
+        return .{ .applied = applied, .settled = settled, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
     }
 
     fn applyEvent(self: *SyncClient, table: []const u8, ev: Value, seq: u64) !void {
@@ -1853,8 +1882,15 @@ pub const SyncClient = struct {
     /// up before the answer existed — measured: 0 of 1 settled while the row was
     /// already in PostgreSQL. Once messages start arriving the loop drains them all
     /// and stops at the first gap.
+    ///
+    /// The GAP follows the budget, capped at 250 ms (§10ef). It was a fixed 250 ms,
+    /// so `flush(0)` — the loop's "send what is queued, take what is there" turn —
+    /// blocked a quarter second after the last verdict, every turn: a 5 ms sting
+    /// ran at four ticks a second, and the Flutter worker's turn cost 350 ms against
+    /// the 100 ms the README promised. A short budget now means a short gap; what a
+    /// 1 ms gap leaves behind, the next poll's sweep takes.
     pub fn drainVerdicts(self: *SyncClient, wait_ms: u64) !usize {
-        return self.drainVerdictsWith(wait_ms, 250);
+        return self.drainVerdictsWith(wait_ms, @min(250, @max(1, wait_ms)));
     }
 
     /// `per_msg_ms` is the wait for EACH next message; `poll` passes 1 so a sweep with
@@ -2099,7 +2135,7 @@ pub const SyncClient = struct {
         // is a no-op on an identical descriptor, so a schema change published while
         // this client runs lands on its next sync (§10v's alter/rebuild path).
         try self.syncSchemas();
-        try self.gapAndSeed();
+        try self.gapAndSeed(null, null);
         try self.drainCdc();
         // A host that syncs before it ever polls is a client too (PROTOCOL §9).
         self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});

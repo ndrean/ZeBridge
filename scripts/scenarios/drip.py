@@ -57,7 +57,8 @@ def nats_jsz():
         import urllib.request
         with urllib.request.urlopen("http://127.0.0.1:8222/jsz", timeout=3) as r:
             j = json.loads(r.read())
-        return f"jetstream store {j.get('store', 0)/1048576:.0f} MB file, {j.get('memory', 0)/1048576:.0f} MB mem, {j.get('messages', 0)} msgs"
+        # /jsz names the file store `storage` (`store` read 0 MB for a 1.7 GB store, §10ef)
+        return f"jetstream store {j.get('storage', 0)/1048576:.0f} MB file, {j.get('memory', 0)/1048576:.0f} MB mem, {j.get('messages', 0)} msgs"
     except Exception:
         return ""
 
@@ -139,6 +140,9 @@ def main():
     WARMUP_MIN = 15
     baseline = None
     warm_from = time.monotonic()
+    restart_at = None           # a refused verdict within RESTART_GRACE of a bridge restart is reported, not failed
+    RESTART_GRACE = 90
+    refused_seen = 0
     live, i, failed, last_flush = [], 0, 0, {}
     ops = {"insert": 0, "update": 0, "delete": 0}
     deadline = time.monotonic() + a.minutes * 60
@@ -165,7 +169,11 @@ def main():
         if len(live) >= 3:
             em.mutate(T, "DELETE", {"uid": live.pop(0)})
             ops["delete"] += 1
-        em.poll(0); last_flush = em.flush(20)
+        # A slow sting waits 20 ms for its verdicts; a fast one (under 20 ms) waits not
+        # at all — the wait is also the gap that ends a drain (§10ef), and what a flush
+        # leaves behind, the next poll's sweep takes. The refusal counts are per flush
+        # report either way, so nothing is lost, only deferred a tick.
+        em.poll(0); last_flush = em.flush(20 if a.interval_ms >= 20 else 0)
 
         if time.monotonic() >= next_sweep:
             next_sweep = time.monotonic() + a.sweep_every
@@ -181,6 +189,14 @@ def main():
 
         if time.monotonic() >= next_check:
             next_check = time.monotonic() + 60
+            # FIRST: the bridge (and NATS) may be restarted under the wasp — that is a
+            # feature — so the pids are re-resolved before any verdict is read: a new
+            # bridge opens the restart window and gets a new memory baseline.
+            fresh = pid_of("zig-out/bin/bridge")
+            if fresh and fresh != pids["bridge"]:
+                print(f"  · the bridge was restarted (pid {pids['bridge']} → {fresh}): memory baseline reset, warm-up restarts")
+                pids["bridge"] = fresh; rss0["bridge"] = rss_kb(fresh); baseline = None; warm_from = time.monotonic(); restart_at = time.monotonic()
+            pids["nats"] = pid_of("nats-server") or pids["nats"]
             # let the last trio land, then compare the three sides
             settle = time.monotonic() + 10
             pg = pg_texts()
@@ -193,7 +209,8 @@ def main():
                 time.sleep(0.3)
             e_t, w_t = replica_texts(em), replica_texts(wa)
             minutes = round((time.monotonic() - t0) / 60, 1)
-            check(f"[{minutes} min, {i} ticks, {sum(ops.values())} writes] live drip rows agree: PG {len(pg)}, emitter {len(e_t)}, watcher {len(w_t)}", e_t == pg == w_t)
+            rate = round(sum(ops.values()) / max(time.monotonic() - t0, 1), 1)
+            check(f"[{minutes} min, {i} ticks, {sum(ops.values())} writes, {rate}/s] live drip rows agree: PG {len(pg)}, emitter {len(e_t)}, watcher {len(w_t)}", e_t == pg == w_t)
             # A pending row is a failure only if it STAYS pending: across a bridge restart
             # the listener is down for seconds and the outbox holds the writes meanwhile —
             # which is the outbox doing its job. Up to a minute to drain.
@@ -205,16 +222,13 @@ def main():
             check(f"nothing pending: emitter outbox {ob}, watcher held {held}", ob == 0 and held == 0)
             vc = (last_flush or {}).get("verdicts", {})
             refused = sum(vc.get(k, 0) for k in ("stale", "rejected", "row_deleted", "failed", "other"))
+            new_refused, refused_seen = refused - refused_seen, refused
             bad_w = sum(1 for l in open(WATCHER_LOG) if BAD_VERDICT.search(l) and "VERDICT" in l)
-            check(f"no refused verdict: emitter accepted {vc.get('accepted', 0)}, refused {refused} {({k: v for k, v in vc.items() if v and k != 'accepted'}) or ''}; watcher {bad_w}", refused == 0 and bad_w == 0)
+            in_grace = restart_at is not None and time.monotonic() - restart_at < RESTART_GRACE
+            if new_refused and in_grace:
+                print(f"  · {new_refused} refused verdict(s) inside the restart window — a write left in flight by the old bridge, redelivered after newer ones; the final state is the newer write's (§10eb)")
+            check(f"no refused verdict: emitter accepted {vc.get('accepted', 0)}, refused {refused} {({k: v for k, v in vc.items() if v and k != 'accepted'}) or ''}; watcher {bad_w}", (new_refused == 0 or in_grace) and bad_w == 0)
             tombs = zb.psql(f"SELECT count(*) FROM {T} WHERE deleted_at IS NOT NULL AND some_text LIKE 'drip-%'", quiet=True).strip()
-            # the bridge (and NATS) may be restarted under the wasp — that is a feature —
-            # so the pids are re-resolved every check, and a new bridge gets a new baseline
-            fresh = pid_of("zig-out/bin/bridge")
-            if fresh and fresh != pids["bridge"]:
-                print(f"  · the bridge was restarted (pid {pids['bridge']} → {fresh}): memory baseline reset, warm-up restarts")
-                pids["bridge"] = fresh; rss0["bridge"] = rss_kb(fresh); baseline = None; warm_from = time.monotonic()
-            pids["nats"] = pid_of("nats-server") or pids["nats"]
             rss = {k: rss_kb(v) for k, v in pids.items()}
             heap = heap_bytes(pids["bridge"]) if pids["bridge"] else 0
             if baseline is None and (time.monotonic() - warm_from) >= WARMUP_MIN * 60: baseline = heap

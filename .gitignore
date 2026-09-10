@@ -87,3 +87,4 @@ zb-client-ts/zebridge_*.sqlite3
 zb-client-ts/zebridge_*.sqlite3-*
 
 .env.grafana
+/node_modules/

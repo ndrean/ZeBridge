@@ -1028,6 +1028,7 @@ pub fn main(init: std.process.Init) !void {
         .topo = &runtime_config.topology,
         .refused = &refused,
         .publication_name = parsed_args.publication_name,
+        .stream_limits = cdcLimits(&runtime_config),
     };
 
     // OID → typtype for types the CDC decoder's switch does not cover. Populated from
@@ -1126,6 +1127,7 @@ pub fn main(init: std.process.Init) !void {
         &should_stop,
         runtime_config.fleet_poll_seconds,
         runtime_config.fleet_ttl_seconds,
+        runtime_config.generation_cadence_seconds * 2,
     );
     defer fleet_mon.deinit();
     http_srv.fleet = &fleet_mon.registry;
@@ -1179,7 +1181,7 @@ pub fn main(init: std.process.Init) !void {
             log.warn("🔁 new replication slot '{s}' on existing streams: if this slot REPLACES a lost one, every change since its loss is missing from the feed and clients resume past the hole — start once with ZB_FEED_RESTART=1 to restart the feed (NOTES §10bm)", .{parsed_args.slot_name});
         }
     }
-    reconcileCdcStreams(allocator, &publisher, &runtime_config.topology) catch |err| {
+    reconcileCdcStreams(allocator, &publisher, &runtime_config.topology, cdcLimits(&runtime_config)) catch |err| {
         log.err("🔴 FATAL: stream reconciliation failed ({s}) — refusing to start rather than FATAL under load.", .{@errorName(err)});
         should_stop.store(true, .seq_cst);
         return err;
@@ -1231,6 +1233,18 @@ pub fn main(init: std.process.Init) !void {
             }
         } else {
             log.info("🧬 delta catch-up window: depth × cadence = {d}s. The sweeper's GC_THRESHOLD_MS must stay above it (not visible in this env — checked when it is)", .{promise_s});
+        }
+        // The CDC window (§10eg): a client further behind than a stream holds
+        // re-seeds from the chain and resumes at the newest cutoff — at most one
+        // cadence old — so the streams' age must exceed two cadences, or a returning
+        // client finds a chain that predates the stream and waits for the next
+        // generation. Bytes and messages are valves; the fleet monitor watches the
+        // window each stream really holds.
+        const floor_s: u64 = runtime_config.generation_cadence_seconds * 2;
+        if (runtime_config.cdc_max_age_seconds < floor_s) {
+            log.warn("⚠️ CDC_MAX_AGE_SECONDS {d}s is BELOW 2 × cadence = {d}s: a client that falls off a stream can find a chain that predates it, and waits up to one cadence for the next generation before it can re-seed", .{ runtime_config.cdc_max_age_seconds, floor_s });
+        } else {
+            log.info("🧬 CDC window: streams keep {d}s of events ≥ 2 × cadence {d}s ✓ — CDC_MAX_BYTES {d} and CDC_MAX_MSGS {d} are disk valves; bridge_cdc_window_short says when one of them ends the window first", .{ runtime_config.cdc_max_age_seconds, floor_s, runtime_config.cdc_max_bytes, runtime_config.cdc_max_msgs });
         }
         const gp = try allocator.create(generation_producer.GenerationProducer);
         gp.* = generation_producer.GenerationProducer.init(
@@ -2262,7 +2276,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Graceful shutdown: signal flush thread to stop and wait for completion
-    log.info("\n🛑 Shutdown initiated - signaling flush thread to stop...", .{});
+    log.info("🛑 Shutdown initiated - signaling flush thread to stop...", .{});
 
     // CRITICAL: Signal should_stop BEFORE waiting for completion
     batch_pub.should_stop.store(true, .seq_cst);
@@ -2363,6 +2377,7 @@ const LiveCatalogue = struct {
     topo: *topology_mod.Topology,
     refused: *refused_tables.Registry,
     publication_name: []const u8,
+    stream_limits: Config.StreamLimits,
 
     fn reload(self: *LiveCatalogue, publisher: anytype, event_proc: anytype) void {
         var fresh = catalogue.loadRules(self.allocator, self.pg_config, self.tenant_rules, self.sync_rules, self.env);
@@ -2397,7 +2412,7 @@ const LiveCatalogue = struct {
         self.cat.* = fresh;
         old.deinit(self.allocator);
 
-        reconcileCdcStreams(self.allocator, publisher, self.topo) catch |err| {
+        reconcileCdcStreams(self.allocator, publisher, self.topo, self.stream_limits) catch |err| {
             log.err("🗂️ catalogue reloaded but the streams could not be reconciled ({s}) — a new public table stays unrouted until the next row", .{@errorName(err)});
         };
 
@@ -2550,14 +2565,42 @@ fn restartFeed(
     });
 }
 
+fn cdcLimits(rc: anytype) Config.StreamLimits {
+    return .{ .max_age_seconds = rc.cdc_max_age_seconds, .max_bytes = rc.cdc_max_bytes, .max_msgs = rc.cdc_max_msgs };
+}
+
+/// The stored config back WHOLE, with only what moved replaced — `updateStream`
+/// serializes everything, so a partial config would silently reset the rest to
+/// defaults. Limits are compared one by one and each move is said: a changed
+/// CDC_MAX_AGE_SECONDS used to be inert on a deployment whose streams already
+/// existed, visible in the env file and absent from the server (§10eg). Returns
+/// whether an update was sent.
+fn reconcileLimits(js: anytype, info: anytype, limits: Config.StreamLimits, subjects: ?[]const []const u8) !bool {
+    var cfg = info.config;
+    const want_age: u64 = limits.max_age_seconds * std.time.ns_per_s;
+    const age_moved = cfg.max_age != want_age;
+    const bytes_moved = cfg.max_bytes != limits.max_bytes;
+    const msgs_moved = cfg.max_msgs != limits.max_msgs;
+    if (subjects == null and !age_moved and !bytes_moved and !msgs_moved) return false;
+    if (subjects) |s| cfg.subjects = s;
+    if (age_moved) log.info("🛠️ {s} max_age {d}s → {d}s", .{ cfg.name, cfg.max_age / std.time.ns_per_s, limits.max_age_seconds });
+    if (bytes_moved) log.info("🛠️ {s} max_bytes {d} → {d}", .{ cfg.name, cfg.max_bytes, limits.max_bytes });
+    if (msgs_moved) log.info("🛠️ {s} max_msgs {d} → {d}", .{ cfg.name, cfg.max_msgs, limits.max_msgs });
+    cfg.max_age = want_age;
+    cfg.max_bytes = limits.max_bytes;
+    cfg.max_msgs = limits.max_msgs;
+    var res = try js.updateStream(cfg);
+    res.deinit();
+    return true;
+}
+
 fn reconcileCdcStreams(
     allocator: std.mem.Allocator,
     publisher: anytype,
     topo: *const topology_mod.Topology,
+    limits: Config.StreamLimits,
 ) !void {
     const js = if (publisher.js) |*j| j else return error.NotConnected;
-    const day_ns: u64 = 24 * 60 * 60 * std.time.ns_per_s;
-    const cap_bytes: i64 = Config.Nats.reconciled_stream_max_bytes;
 
     // ── per-tenant streams: ensure, create when missing ─────────────────────────
     for (topo.tenants) |tenant| {
@@ -2572,34 +2615,33 @@ fn reconcileCdcStreams(
             continue;
         }
         var name_buf: [256]u8 = undefined;
-        inline for (.{
-            .{ topo.cdc_stream_prefix, "{s}.{s}.>", Config.Nats.reconciled_cdc_max_age_days },
-        }) |shape| {
-            const prefix = shape[0];
-            // CDC_<tenant> — the tenant AS-IS, never upper-cased:
-            // the JWT signing key's role template renders CDC_{{tag(tenant)}}
-            // literally and nsc lowercases tags, so the stream name must match
-            // the tag byte-for-byte.
-            @memcpy(name_buf[0..prefix.len], prefix);
-            @memcpy(name_buf[prefix.len..][0..tenant.len], tenant);
-            const stream_name = name_buf[0 .. prefix.len + tenant.len];
-            if (publisher.streamExists(stream_name)) {
+        const prefix = topo.cdc_stream_prefix;
+        // CDC_<tenant> — the tenant AS-IS, never upper-cased:
+        // the JWT signing key's role template renders CDC_{{tag(tenant)}}
+        // literally and nsc lowercases tags, so the stream name must match
+        // the tag byte-for-byte.
+        @memcpy(name_buf[0..prefix.len], prefix);
+        @memcpy(name_buf[prefix.len..][0..tenant.len], tenant);
+        const stream_name = name_buf[0 .. prefix.len + tenant.len];
+        if (js.getStreamInfo(stream_name)) |info_const| {
+            var info = info_const;
+            defer info.deinit();
+            if (!try reconcileLimits(js, &info.value, limits, null)) {
                 log.info("✅ tenant '{s}' → stream {s}", .{ tenant, stream_name });
-            } else {
-                const prefix_val = topo.subject_cdc_prefix;
-                const subj = try std.fmt.allocPrint(allocator, shape[1], .{ prefix_val, tenant });
-                defer allocator.free(subj);
-                var res = try js.addStream(.{
-                    .name = stream_name,
-                    .subjects = &.{subj},
-                    .max_age = shape[2] * day_ns,
-                    .max_msgs = Config.Nats.reconciled_stream_max_msgs,
-                    .max_bytes = cap_bytes,
-                    .compression = .s2,
-                });
-                res.deinit();
-                log.info("🆕 tenant '{s}' → created stream {s} ({s})", .{ tenant, stream_name, subj });
             }
+        } else |_| {
+            const subj = try std.fmt.allocPrint(allocator, "{s}.{s}.>", .{ topo.subject_cdc_prefix, tenant });
+            defer allocator.free(subj);
+            var res = try js.addStream(.{
+                .name = stream_name,
+                .subjects = &.{subj},
+                .max_age = limits.max_age_seconds * std.time.ns_per_s,
+                .max_msgs = limits.max_msgs,
+                .max_bytes = limits.max_bytes,
+                .compression = .s2,
+            });
+            res.deinit();
+            log.info("🆕 tenant '{s}' → created stream {s} ({s})", .{ tenant, stream_name, subj });
         }
     }
 
@@ -2616,25 +2658,20 @@ fn reconcileCdcStreams(
     if (js.getStreamInfo(topo.cdc_stream_public)) |info_const| {
         var info = info_const;
         defer info.deinit();
-        if (streamSubjectsEqual(info.value.config.subjects, wanted.items)) {
-            log.info("✅ {s} subjects already match the catalogue ({d} subject(s))", .{ topo.cdc_stream_public, wanted.items.len });
-        } else {
-            // The FULL stored config back, with only the subjects replaced —
-            // updateStream serializes everything, so a partial config would silently
-            // reset retention and limits to defaults.
-            var cfg = info.value.config;
-            cfg.subjects = wanted.items;
-            var res = try js.updateStream(cfg);
-            res.deinit();
+        const subjects_moved = !streamSubjectsEqual(info.value.config.subjects, wanted.items);
+        const moved = try reconcileLimits(js, &info.value, limits, if (subjects_moved) wanted.items else null);
+        if (subjects_moved) {
             log.info("🛠️ {s} subjects reconciled to the catalogue ({d} subject(s))", .{ topo.cdc_stream_public, wanted.items.len });
+        } else if (!moved) {
+            log.info("✅ {s} subjects already match the catalogue ({d} subject(s))", .{ topo.cdc_stream_public, wanted.items.len });
         }
     } else |_| {
         var res = try js.addStream(.{
             .name = topo.cdc_stream_public,
             .subjects = wanted.items,
-            .max_age = Config.Nats.reconciled_cdc_max_age_days * day_ns,
-            .max_msgs = Config.Nats.reconciled_stream_max_msgs,
-            .max_bytes = cap_bytes,
+            .max_age = limits.max_age_seconds * std.time.ns_per_s,
+            .max_msgs = limits.max_msgs,
+            .max_bytes = limits.max_bytes,
             .compression = .s2,
         });
         res.deinit();
