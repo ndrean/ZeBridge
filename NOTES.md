@@ -10769,6 +10769,35 @@ to the last received LSN on a standby. The first inventory on the dev server fou
 scenarios' `zb_probe` slot inactive and holding 1289 MB of WAL — the abandoned-slot
 case the verb exists for, left to the user's decision.
 
+## 10eo. Where a build's time goes — and the full's compression level (2026-09-11)
+
+The 9 µs a row of §10em was measured before anyone asked which stage paid it, and
+the conversation that followed had three candidates: the query, the MessagePack
+encode, the compression. Every generation line now prints its breakdown. The
+75,000-row full of `test_types` on globex, full alone (the delta had no rows):
+
+| phase | level 9 | level 3 |
+| --- | --- | --- |
+| query (libpq text result, 19 MB) | 116 ms | 117 ms |
+| MessagePack encode | 31 ms | 31 ms |
+| dictionary (kept from the last era) | 6 ms | 5 ms |
+| zstd of the full | 138 ms | 24 ms |
+| upload, 21 chunks | 9 ms | 9 ms |
+| the build | 327 ms | 214 ms |
+| the object | 2,721,578 B | 2,716,134 B |
+
+So: the encode is 0.4 µs a row and "drop MessagePack, zstd compresses anyway" buys
+nothing; the compression level was the single largest cost and bought no bytes — the
+object at level 3 is 5 KB smaller than at level 9 on this data; the query is what is
+left, 1.5 µs a row of libpq text parsing, and the retired `pg_copy_binary.zig`
+(1,362 lines, deleted in aef33d8 with the on-demand snapshot path) is the known
+answer to it when it matters. Fulls compress at level 3 now, like the deltas. One
+producer thread is at 2.3 µs a row, about 430,000 rows a second, above the WAL
+reader's 200,000 events a second: the border of §10em moved past the stream's flow
+without parallelism. The three levers discussed for later — workers over pairs,
+halves of a big pair on one exported snapshot with parts in the manifest, and the
+proactive re-cut from the stream's margin — stay on the list, in that order.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

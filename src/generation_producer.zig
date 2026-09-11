@@ -855,6 +855,10 @@ pub const GenerationProducer = struct {
         var full_payload: ?[]const u8 = null;
         var full_rows: usize = 0;
         var widest_row: usize = 0;
+        // §10eo: where a build's time goes, one line per generation — the number that
+        // decides whether the producer's per-row cost is the query, the encode, the
+        // compression or the upload, before anyone parallelises the wrong stage.
+        var ph: struct { query: i64 = 0, encode: i64 = 0, train: i64 = 0, zstd: i64 = 0, upload: i64 = 0 } = .{};
         if (build_full) {
             // §10ek: a full carries LIVE rows only. Every client applies a full as a wipe
             // and a reload inside one transaction, so a row absent from it is gone on the
@@ -866,9 +870,13 @@ pub const GenerationProducer = struct {
                 try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ table, tcol })
             else
                 try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
+            const t_q = utils.unixMillis();
             const res = try queryOne(pgc, sql, &.{});
             defer c.PQclear(res);
+            ph.query += utils.unixMillis() - t_q;
+            const t_e = utils.unixMillis();
             full_payload = try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
+            ph.encode += utils.unixMillis() - t_e;
         }
         var delta_payload: ?[]const u8 = null;
         var delta_rows: usize = 0;
@@ -876,9 +884,13 @@ pub const GenerationProducer = struct {
             const sql = try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" > $1::timestamptz - interval '{s}'", .{ table, vcol, config.Sync.version_future_tolerance });
             const prev_z = try alloc.dupeZ(u8, last_cutoff.?);
             const params = [_]?[*:0]const u8{prev_z.ptr};
+            const t_q = utils.unixMillis();
             const res = try queryOne(pgc, sql, &params);
             defer c.PQclear(res);
+            ph.query += utils.unixMillis() - t_q;
+            const t_e = utils.unixMillis();
             delta_payload = try encodeContent(alloc, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
+            ph.encode += utils.unixMillis() - t_e;
         }
         {
             const res = try queryOne(pgc, "COMMIT", &.{});
@@ -903,6 +915,7 @@ pub const GenerationProducer = struct {
         var dict_name: ?[]const u8 = null;
         var dict_kept = false;
         var dict_ratio: ?i64 = null; // percent, on row-sized samples: the dictionary's own baseline
+        const t_d = utils.unixMillis();
         if (build_full) {
             if (full_payload) |p| {
                 // §10ea: the previous era's dictionary is KEPT while it still compresses
@@ -972,6 +985,7 @@ pub const GenerationProducer = struct {
         // ── 4. immutable objects first ───────────────────────────────────────
         const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
         var osm = js.objectStoreManager();
+        ph.train = utils.unixMillis() - t_d;
         var store = osm.openStore(bucket) catch |err| blk: {
             if (err == error.StoreNotFound or err == error.StreamNotFound) {
                 break :blk try osm.createStore(.{ .store_name = bucket, .description = "ZeBridge generations (NOTES.md §1.13)" });
@@ -983,13 +997,20 @@ pub const GenerationProducer = struct {
         // client forever — the one payload where compression amortizes fully.
         // Clients detect by the standard 4-byte magic, so mixed chains (older
         // uncompressed deltas referenced by the same manifest) keep working and
-        // no object is ever rewritten. Fulls take level 9 (read-many), deltas 3.
+        // no object is ever rewritten. Fulls took level 9 as "read-many"; measured on a
+        // 75,000-row full (§10eo) level 9 was 138 ms of a 327 ms build, 1.8 µs a row —
+        // the producer's single largest cost, and the producer is the side that races
+        // the stream (§10ej). Level 3 here, like the deltas; the ratio is compared below.
         if (full_payload) |p| {
-            const z = try compressZstd(alloc, p, 9);
+            const t_z = utils.unixMillis();
+            const z = try compressZstd(alloc, p, 3);
+            ph.zstd += utils.unixMillis() - t_z;
             log.info("🗜️ '{s}'/'{s}': g{d} full {d} -> {d} bytes ({d}%)", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1) });
             const name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen });
+            const t_u = utils.unixMillis();
             var r = try store.putBytes(name, z);
             r.deinit();
+            ph.upload += utils.unixMillis() - t_u;
         }
         if (build_full and !dict_kept) if (dict_bytes) |d| {
             var r = try store.putBytes(dict_name.?, d);
@@ -997,11 +1018,15 @@ pub const GenerationProducer = struct {
             log.info("📖 '{s}'/'{s}': g{d} dictionary {d} bytes trained from a bounded sample of the full", .{ tenant, table, gen, d.len });
         };
         if (delta_payload) |p| {
+            const t_z = utils.unixMillis();
             const z = if (dict_bytes) |d| try compressZstdDict(alloc, p, d, 3) else try compressZstd(alloc, p, 3);
+            ph.zstd += utils.unixMillis() - t_z;
             log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1), if (dict_bytes != null) " [dict]" else "" });
             const name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
+            const t_u = utils.unixMillis();
             var r = try store.putBytes(name, z);
             r.deinit();
+            ph.upload += utils.unixMillis() - t_u;
         }
 
         // ── 5. the chain manifest, swapped last ──────────────────────────────
@@ -1129,6 +1154,7 @@ pub const GenerationProducer = struct {
             bucket,                           cutoff_version,                              lsn,
             utils.unixMillis() - build_started_ms,
         });
+        log.info("🧬   phases: query {d} ms, encode {d} ms, dictionary {d} ms, zstd {d} ms, upload {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.query, ph.encode, ph.train, ph.zstd, ph.upload, full_rows, delta_rows });
         if (build_delta) log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, delta_payload.?.len });
         if (build_full) log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, full_payload.?.len });
 
