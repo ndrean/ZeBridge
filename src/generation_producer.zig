@@ -87,12 +87,32 @@ pub const GenerationProducer = struct {
     /// §10ej: set by `buildOne` when the cut it just published had already fallen
     /// off the stream by the time the manifest was live — read by the tick's retry.
     cut_fell_off: bool = false,
+    /// §10eq: the newest cut of every pair this producer built, with what a rebuild of
+    /// that pair alone needs. Written by the tick, read by the edge watch — both on
+    /// the producer's own thread, so no lock. Keys and strings owned by `allocator`.
+    cuts: std.StringArrayHashMapUnmanaged(Cut) = .empty,
+    /// Per CDC stream: `first_seq` at the previous edge check and when it was read —
+    /// the prune rate is the difference over the interval.
+    edges: std.StringArrayHashMapUnmanaged(Edge) = .empty,
+    edge_check_seconds: u64 = 5,
     /// The CDC per-event buffer (2^BASE_BUF). The chain has no per-row ceiling —
     /// object chunking removes it — so the producer is where a row too wide for
     /// CDC gets DETECTED (the retirement survivor of the snapshot path's
     /// measureWidestRow): measured for free while encoding, warned loudly.
     event_buf_bytes: usize,
     thread: ?std.Thread = null,
+
+    pub const Cut = struct {
+        tenant: []const u8,
+        table: []const u8,
+        vcol: []const u8,
+        tcol: []const u8,
+        guarded: bool,
+        stream: []const u8,
+        cutoff_seq: u64,
+        build_ms: i64,
+    };
+    pub const Edge = struct { first_seq: u64, at_ms: i64 };
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -164,6 +184,11 @@ pub const GenerationProducer = struct {
                     log.info("🧬 kicked: a seed epoch moved — cutting the next generation now, not at the cadence", .{});
                     break;
                 }
+                // §10eq: between ticks, watch the streams' edges and re-cut a pair whose
+                // splice is about to break — the cadence is no longer the reaction time.
+                if (slept > 0 and slept % self.edge_check_seconds == 0) {
+                    self.edgeCheck() catch |err| log.debug("🧬 edge check skipped: {}", .{err});
+                }
                 utils.sleep(1 * std.time.ns_per_s);
             }
         }
@@ -171,6 +196,91 @@ pub const GenerationProducer = struct {
     }
 
     fn tick(self: *GenerationProducer) !void {
+        return self.tickWith(null);
+    }
+
+    /// §10eq: the edge watch. Every CDC stream this producer has cut is asked for its
+    /// state; against each pair's newest cut, three questions, any one of which re-cuts
+    /// the pair NOW — an empty delta if nothing moved (§10ej) — so the splice never
+    /// breaks:
+    ///
+    ///   1. the RATE: `first_seq` against the previous reading is the prune rate; the
+    ///      messages between the cut and the oldest survivor, at that rate, are the
+    ///      seconds left; under three of the pair's own build times plus one check
+    ///      interval is too few;
+    ///   2. the FILL: the stream past 80% of its byte or message cap is about to be
+    ///      pruned by a valve, and a cut in the oldest quarter of what it holds is
+    ///      the part that goes first — whatever the rate of the last five seconds said,
+    ///      since a burst can arrive between two readings;
+    ///   3. the FLOOR: a cut within a tenth of the stream's span of its oldest message,
+    ///      while the stream prunes at all.
+    ///
+    /// A stream that is not pruning and not filling costs one STREAM.INFO per check.
+    fn edgeCheck(self: *GenerationProducer) !void {
+        if (self.cuts.count() == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var conn_nats = nats.Connection.init(self.allocator, self.io, .{
+            .user = self.endpoint.user,
+            .password = self.endpoint.pass,
+            .nkey_seed = self.endpoint.seed,
+            .user_creds = self.endpoint.creds,
+        });
+        defer conn_nats.deinit();
+        const url = try std.fmt.allocPrint(alloc, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port });
+        try conn_nats.connect(url);
+        var js = conn_nats.jetstream(.{});
+
+        const StreamRead = struct { first: u64, last: u64, rate: f64, fill: f64 };
+        var reads: std.StringArrayHashMapUnmanaged(StreamRead) = .empty;
+        const now_ms = utils.unixMillis();
+        for (self.cuts.values()) |cut| {
+            if (reads.contains(cut.stream)) continue;
+            var info = js.getStreamInfo(cut.stream) catch continue;
+            defer info.deinit();
+            const st = info.value.state;
+            const cfg = info.value.config;
+            var rate: f64 = 0;
+            if (self.edges.getPtr(cut.stream)) |e| {
+                const dt_s: f64 = @as(f64, @floatFromInt(now_ms - e.at_ms)) / 1000.0;
+                if (dt_s > 0 and st.first_seq > e.first_seq) rate = @as(f64, @floatFromInt(st.first_seq - e.first_seq)) / dt_s;
+                e.* = .{ .first_seq = st.first_seq, .at_ms = now_ms };
+            } else {
+                try self.edges.put(self.allocator, try self.allocator.dupe(u8, cut.stream), .{ .first_seq = st.first_seq, .at_ms = now_ms });
+            }
+            var fill: f64 = 0;
+            if (cfg.max_bytes > 0) fill = @max(fill, @as(f64, @floatFromInt(st.bytes)) / @as(f64, @floatFromInt(cfg.max_bytes)));
+            if (cfg.max_msgs > 0) fill = @max(fill, @as(f64, @floatFromInt(st.messages)) / @as(f64, @floatFromInt(cfg.max_msgs)));
+            try reads.put(alloc, cut.stream, .{ .first = st.first_seq, .last = st.last_seq, .rate = rate, .fill = fill });
+        }
+
+        var urgent: std.ArrayListUnmanaged(Cut) = .empty;
+        for (self.cuts.values()) |cut| {
+            const r = reads.get(cut.stream) orelse continue;
+            const margin_msgs: i64 = @as(i64, @intCast(cut.cutoff_seq)) - @as(i64, @intCast(r.first));
+            const span: i64 = @max(@as(i64, @intCast(r.last)) - @as(i64, @intCast(r.first)), 1);
+            const margin_s: f64 = if (margin_msgs <= 0) 0 else if (r.rate > 0) @as(f64, @floatFromInt(margin_msgs)) / r.rate else std.math.inf(f64);
+            const need_s: f64 = 3.0 * @as(f64, @floatFromInt(@max(cut.build_ms, 50))) / 1000.0 + @as(f64, @floatFromInt(self.edge_check_seconds));
+            const by_rate = r.rate > 0 and margin_s < need_s;
+            const by_fill = r.fill >= 0.8 and margin_msgs < @divTrunc(span, 4);
+            const by_floor = r.rate > 0 and margin_msgs < @divTrunc(span, 10);
+            if (by_rate or by_fill or by_floor) {
+                log.warn("🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest ({s}{s}{s})", .{
+                    cut.tenant,                                    cut.table, cut.stream, span, r.fill * 100, r.rate, @max(margin_msgs, 0),
+                    if (by_rate) "the rate leaves under the build time" else "",
+                    if (by_fill) "the fill is past 80% and the cut sits in the oldest quarter" else "",
+                    if (!by_rate and !by_fill) "the cut is within a tenth of the span" else "",
+                });
+                try urgent.append(alloc, cut);
+            }
+        }
+        if (urgent.items.len > 0) try self.tickWith(urgent.items);
+    }
+
+    /// The tick, or — with `only` — a rebuild of those pairs alone, forced to cut even
+    /// when nothing moved (the edge watch's early cut).
+    fn tickWith(self: *GenerationProducer, only: ?[]const Cut) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -229,6 +339,13 @@ pub const GenerationProducer = struct {
         // tenancy are decided per table below; GENERATION_RULES, when set, only
         // INTERSECTS what was derived.
         const pub_z = try alloc.dupeZ(u8, self.publication_name);
+        if (only) |pairs| {
+            for (pairs) |cut| {
+                if (self.should_stop.load(.acquire)) return;
+                self.buildWithRetry(alloc, pgc, bkc, &js, cut.table, cut.tenant, cut.vcol, cut.tcol, cut.guarded, true);
+            }
+            return;
+        }
         const derive_params = [_]?[*:0]const u8{pub_z.ptr};
         // The catalogue rides the derive query: per-tick tenant/version columns and
         // the generations opt-out come from `zebridge_catalogue` (LEFT JOIN — a table
@@ -326,7 +443,7 @@ pub const GenerationProducer = struct {
                         if (!ok) continue;
                     }
                     pairs += 1;
-                    self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded);
+                    self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded, false);
                 }
             } else {
                 const tenant = self.topo.open_tenant;
@@ -336,7 +453,7 @@ pub const GenerationProducer = struct {
                     if (!ok) continue;
                 }
                 pairs += 1;
-                self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded);
+                self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded, false);
             }
         }
         log.debug("🧬 tick: {d} published table(s) derived, {d} (table, tenant) pair(s) built or checked", .{ n_tables, pairs });
@@ -651,6 +768,9 @@ pub const GenerationProducer = struct {
         tcol: []const u8,
         /// The soft-delete guard is on the table: deletes are reaps, never a hole.
         guarded: bool,
+        /// §10eq: the edge watch asks for a cut whatever the table did — a fresh cut
+        /// point is the whole point, an empty delta is fine.
+        force_cut: bool,
     ) !void {
         const build_started_ms = utils.unixMillis();
         const table_z = try alloc.dupeZ(u8, table);
@@ -879,18 +999,20 @@ pub const GenerationProducer = struct {
         // generation — which an unchanged table would never get. So the previous
         // cutoff is checked against the stream's oldest message here, and a chain that
         // fell off forces a build even when nothing moved.
-        const chain_fell_off: bool = blk: {
-            if (last_gen == 0 or stream_first <= 1) break :blk false;
-            var kvb = js.kvBucket(self.topo.kv_generations) catch break :blk false;
+        // The previous manifest's cut: the edge watch's memory of a pair this tick does
+        // not rebuild (§10eq), and the fall-off test (§10ei).
+        const prev_cut: i64 = blk: {
+            if (last_gen == 0) break :blk 0;
+            var kvb = js.kvBucket(self.topo.kv_generations) catch break :blk 0;
             defer kvb.deinit();
             const mkey = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
-            var entry = kvb.get(mkey) catch break :blk false;
+            var entry = kvb.get(mkey) catch break :blk 0;
             defer entry.deinit();
-            const man = std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{}) catch break :blk false;
-            if (man != .object) break :blk false;
-            const prev_cut: i64 = if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else 0) else 0;
-            break :blk prev_cut > 0 and prev_cut + 1 < @as(i64, @intCast(stream_first));
+            const man = std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{}) catch break :blk 0;
+            if (man != .object) break :blk 0;
+            break :blk if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else 0) else 0;
         };
+        const chain_fell_off: bool = prev_cut > 0 and stream_first > 1 and prev_cut + 1 < @as(i64, @intCast(stream_first));
         if (chain_fell_off) log.warn("🧬 '{s}'/'{s}': chain g{d} fell off {s} (its cutoff is below the stream's oldest message, seq {d}) — a returning client could not splice; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, cdc_stream, stream_first });
 
         // ── 2. REPEATABLE READ + tenant scoping, same policy as snapshots ────
@@ -979,10 +1101,13 @@ pub const GenerationProducer = struct {
                 // An epoch move is a change even when nothing else moved (§10df): the
                 // whole point of zebridge_reseed() is a full for data CDC never carried.
                 if ((prev == row_count_now or shrink_explained) and !deletes_moved and !epoch_moved and !shape_moved) {
-                    if (!chain_fell_off) {
+                    if (!chain_fell_off and !force_cut) {
                         log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows, {d} deletes) — skipped", .{ tenant, table, last_gen, prev, del_count_now });
                         const rb = try queryOne(pgc, "ROLLBACK", &.{});
                         c.PQclear(rb);
+                        // §10eq: a skipped pair still has a cut to watch — the previous
+                        // one, with a conservative build time until this process builds it.
+                        if (prev_cut > 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100) catch {};
                         return;
                     }
                     // §10ej: nothing moved but the chain fell off the stream — the repair
@@ -1272,6 +1397,9 @@ pub const GenerationProducer = struct {
             c.PQclear(res);
         }
 
+        // §10eq: the edge watch's memory of this pair.
+        self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, cutoff_seq, utils.unixMillis() - build_started_ms) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
+
         // ── 6. prune past the chain depth: PG rows (authority), then objects ──
         if (gen > self.chain_depth) {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{gen - @as(i64, self.chain_depth)});
@@ -1343,6 +1471,27 @@ pub const GenerationProducer = struct {
         }
     }
 
+    fn recordCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, stream: []const u8, cutoff_seq: u64, build_ms: i64) !void {
+        if (cutoff_seq == 0 or stream.len == 0) return;
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ tenant, table });
+        if (self.cuts.getPtr(key)) |cut| {
+            self.allocator.free(key);
+            cut.cutoff_seq = cutoff_seq;
+            cut.build_ms = build_ms;
+            return;
+        }
+        try self.cuts.put(self.allocator, key, .{
+            .tenant = try self.allocator.dupe(u8, tenant),
+            .table = try self.allocator.dupe(u8, table),
+            .vcol = try self.allocator.dupe(u8, vcol),
+            .tcol = try self.allocator.dupe(u8, tcol),
+            .guarded = guarded,
+            .stream = try self.allocator.dupe(u8, stream),
+            .cutoff_seq = cutoff_seq,
+            .build_ms = build_ms,
+        });
+    }
+
     /// §10ej: one pair's build with the bounded retry the post-publish check asks
     /// for: the cut fell off during the build → build again at once, three times at
     /// most. Beyond that the stream prunes faster than this pair builds — a size
@@ -1350,11 +1499,11 @@ pub const GenerationProducer = struct {
     /// and leave it to the next tick; clients wait for a splice rather than read past
     /// the hole (§10ei). The back-pressure that would let the WAL absorb the burst
     /// (pause publishing for one build) is the next step, not this one.
-    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool) void {
+    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, force_cut: bool) void {
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
             self.cut_fell_off = false;
-            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, guarded) catch |err| {
+            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, guarded, force_cut) catch |err| {
                 log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
                 return;
             };

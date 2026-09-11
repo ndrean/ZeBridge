@@ -262,6 +262,7 @@ def main():
             open_clients()
             sting(em, 45, a.interval_ms, live, counter)
             check("warm-up: the three sides agree", agree([em, em2, wa], 60) is not None)
+            bridge_since = file_len(b.log_path)   # the boot tick may repair the previous bridge's chain; what counts is after
             # both park; the sting goes on for 90 s through the second emitter
             wa.disconnect(); em.close(); em = None
             parked_at = stream_state(stream)["last_seq"]
@@ -289,6 +290,12 @@ def main():
             # past the hole, and the agreement above is the proof of that. Evidence:
             waited = [l for l in ev_w + ev_e if "predates the stream" in l]
             print(f"  · {'waited for the next generation: ' + waited[0] if waited else 'the newest cutoff was inside the window: spliced at once'}")
+            # §10eq: the producer's edge watch re-cuts a pair before its cut falls off the
+            # stream, so under the floor the log must show early cuts and no fallen chain
+            # for the stung table.
+            early = log_lines(b.log_path, r"cutting early", bridge_since)
+            fell = [l for l in log_lines(b.log_path, r"chain g[0-9]+ fell off", bridge_since) if "test_types" in l and "globex" in l]
+            check(f"the edge watch cut early ({len(early)} time(s)) and the stung table's chain never fell off ({len(fell)})", bool(early) and not fell)
             print(f"  · watcher log: {ev_w[:4]}")
             print(f"  · emitter log: {ev_e[:4]}")
             close_clients(); em = em2 = wa = None

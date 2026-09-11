@@ -10843,6 +10843,50 @@ COPY_OUT result every time, the loop never ended, the producer thread never
 returned, and the bridge's graceful stop waited on it until it was killed. The COPY
 is now read until libpq itself reports the end, and the result loop is bounded.
 
+## 10eq. The edge watch: the producer re-cuts a pair before its cut falls off the stream (2026-09-11)
+
+The third step agreed after §10em, brought forward past the worker pool because a
+pair is cheap now (§10ep) and a cheap cut made early is worth more than a fast tick
+made late. Until today the cadence was the producer's reaction time: a cut that fell
+off the stream between two ticks was repaired at the next one, up to a cadence later,
+and a returning client waited that long (§10ei). The stream itself says when this is
+about to happen, and the producer reads it.
+
+**What it watches.** Every pair the producer built, or found unchanged at its first
+tick, has a cut on record: the stream it rides, the cut sequence, the last build's
+duration. Every five seconds of its sleep the producer asks each of those streams for
+its state and, against the previous reading, has the prune rate. Three questions per
+pair, any one of which re-cuts it now — an empty delta if nothing moved (§10ej):
+
+1. **the rate**: the messages between the cut and the stream's oldest survivor, at
+   the prune rate of the last five seconds, are the seconds left; under three of the
+   pair's own build times plus one check interval is too few;
+2. **the fill**: the stream past 80% of its byte or message cap, with the cut in the
+   oldest quarter of what it holds — a valve is about to bite and that cut goes
+   first, whatever the rate of the last five seconds said (the user's objection: a
+   burst can land between two readings);
+3. **the floor**: the cut within a tenth of the stream's span of the oldest message
+   while the stream prunes at all.
+
+The rebuild goes through the tick's own path with a `force_cut` flag, on the
+producer's thread, with its own connections; nothing is shared with another thread.
+
+**Measured (the wall's second phase, 30 s age under a 60 s cadence).** Seventeen
+early cuts in a minute and a half, pairs re-cut every twenty seconds or so on a stream
+that prunes at five messages a second; both parked clients spliced at once on their
+return, 0.2 s to agreement; the fleet flag still marked the window short, as it must,
+since the window is still under the floor — the difference is that nobody meets the
+hole. The first run showed one fallen chain: the boot tick repairing the previous
+bridge's cut, before this process had any cut on record; a skipped pair's cut is now
+recorded from its manifest at the first tick, with a conservative build time until
+this process builds it. Under the floor an idle pair costs an empty delta every
+twenty seconds — the price of running there; above the floor the margin is a cadence
+or more and the watch never fires.
+
+**What it cannot beat** is a burst that fills the whole cap inside one check
+interval, and that remains the pause's case (§10ej). The worker pool stays behind
+both as headroom.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:
