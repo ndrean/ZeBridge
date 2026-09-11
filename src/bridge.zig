@@ -951,7 +951,7 @@ pub fn main(init: std.process.Init) !void {
             &tenant_rules,
             &d_writable,
             &runtime_config.topology,
-                    runtime_config.generation_cadence_seconds,
+            runtime_config.generation_cadence_seconds,
             runtime_config.cdc_max_age_seconds,
             runtime_config.generation_chain_depth,
             if (init.minimal.environ.getPosix("GC_THRESHOLD_MS")) |t| (std.fmt.parseInt(u64, t, 10) catch null) else null,
@@ -1307,6 +1307,7 @@ pub fn main(init: std.process.Init) !void {
             runtime_config.generation_chain_depth,
             @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
             &hot,
+            runtime_config.generation_workers,
         );
         try gp.start();
         gen_producer = gp;

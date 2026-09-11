@@ -123,6 +123,7 @@ def main():
     ap.add_argument("--sweep-every", type=int, default=3600, help="seconds between `bridge_sweeper --once` runs; 0 = never")
     ap.add_argument("--emitter", default="bob")
     ap.add_argument("--watcher", default="mary")
+    ap.add_argument("--settle-s", type=float, default=10, help="seconds the minute check waits for the three sides to agree before it fails (§10eu: under a firehose a replica lags by more than ten seconds)")
     ap.add_argument("--mix", choices=["trio", "grow"], default="trio", help="trio: INSERT+UPDATE+DELETE, the live set stays small; grow: INSERT+UPDATE only, the table grows — fulls inflate, deltas stay a cadence's rows (§10eu)")
     a = ap.parse_args()
     # The LIVE stack: ask its health endpoint (BRIDGE_PORT), not the process table — a
@@ -214,7 +215,7 @@ def main():
                 pids["bridge"] = fresh; rss0["bridge"] = rss_kb(fresh); baseline = None; warm_from = time.monotonic(); restart_at = time.monotonic()
             pids["nats"] = pid_of("nats-server") or pids["nats"]
             # let the last trio land, then compare the three sides
-            settle = time.monotonic() + 10
+            settle = time.monotonic() + a.settle_s
             pg = pg_texts()
             while time.monotonic() < settle:
                 em.poll(50); em.flush(20)
@@ -227,6 +228,9 @@ def main():
             minutes = round((time.monotonic() - t0) / 60, 1)
             rate = round(sum(ops.values()) / max(time.monotonic() - t0, 1), 1)
             check(f"[{minutes} min, {i} ticks, {sum(ops.values())} writes, {rate}/s] live drip rows agree: PG {pg[0]}, emitter {e_t[0]}, watcher {w_t[0]} (count + the last 1000 names)", e_t == pg == w_t)
+            if not (e_t == pg == w_t):
+                newest = lambda v: (v[1].split(",")[-1] if v[1] else "-")
+                print(f"      newest drip row: PG {newest(pg)}, emitter {newest(e_t)}, watcher {newest(w_t)} — a side with an older name is behind, not wrong", flush=True)
             # A pending row is a failure only if it STAYS pending: across a bridge restart
             # the listener is down for seconds and the outbox holds the writes meanwhile —
             # which is the outbox doing its job. Up to a minute to drain.

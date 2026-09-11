@@ -77,6 +77,10 @@ const usage =
     \\                        parameter: depth × cadence must stay under the
     \\                        sweeper's tombstone retention.
     \\  GENERATION_CHAIN_DEPTH  generations kept per pair (default: 6)
+    \\  GENERATION_WORKERS    builders for the early cuts of bursting streams
+    \\                        (default: 1). More re-cut those pairs in parallel,
+    \\                        each on its own connections; the cadence tick builds
+    \\                        in turn. Memory: workers × the biggest full's bytes.
     \\  CDC_MAX_AGE_SECONDS   how long a CDC stream keeps an event (default:
     \\                        3 × cadence). The contract with the chain: a
     \\                        client further behind re-seeds and resumes at
@@ -539,6 +543,14 @@ pub const Args = struct {
             config.Generations.default_chain_depth,
             1,
             64,
+        );
+        runtime_config.generation_workers = envUint(
+            u32,
+            init,
+            "GENERATION_WORKERS",
+            config.Generations.default_workers,
+            1,
+            config.Generations.max_workers,
         );
         // The CDC streams' retention (config.Nats.default_cdc_*, §10eg). The age is
         // the contract with the chain and defaults to three cadences — AFTER the

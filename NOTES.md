@@ -10981,6 +10981,200 @@ the query answered the three rows. The first attempt of the test measured nothin
 for fifteen minutes because `zebridge_enable` defaults to a dry run — the summary line
 says so, and the eye skipped it.
 
+## 10eu. The firehose: 10,000 rows a second for five minutes, and the chain audited object by object (2026-09-11)
+
+The wasp writes one row at a time through a client, at most a few hundred a second.
+The question left after §10es was what a table that GROWS at thousands of rows a
+second does to the bridge, the streams, the chain and the clients. `inject.py` is the
+answer's instrument: one INSERT of 10,000 rows per second straight into PostgreSQL,
+then an UPDATE of the previous second's rows by their uids, for five minutes, on
+globex/test_types (rows `grow-<n>`, never deleted); the wasp trio at 5 ms alongside
+for its invariant. Cadence 300 s, CDC_MAX_AGE 900 s, CDC_MAX_BYTES 1 GiB,
+RING_BUFFER_COUNT 32768; the table started at 75,000 live rows.
+
+**What happened.**
+
+- PostgreSQL took it: 9,900 inserts/s and 9,867 updates/s for five minutes — the
+  insert of a second cost 270 ms, the update 360 ms, on one connection. 2,980,000
+  rows added; the table ended at 3,055,002 live rows (3,077,024 with tombstones),
+  1,248 MB.
+- The CDC stream carried some 20,000 events/s, about 9 MB/s. At that rate the 1 GiB
+  cap is a 120-second window: the byte cap is the valve that binds, the message cap
+  stayed at 0% (a message is a batch). The publisher marked the stream hot in its
+  first second (1,789 KB in one second). The fill trigger cut early about once a
+  minute — "80% of a cap, 22 s to the byte cap" — and no chain fell off during the
+  burst. The ring never pushed back: not one back-pressure line.
+- The producer, on the 75,000-row fixture until then: at 93 s in, g333 cut a
+  1,005,000-row full (214 MB → 33 MB) AND a 910,766-row delta (195 MB → 30 MB) in
+  3,996 ms; the next deltas of 650,000 / 620,000 / 610,000 rows took ~1.3 s each
+  (copy+decode+encode 0.7–1.0 s, zstd 0.19 s, upload 40 ms) — about 2 µs a row, the
+  §10ep figure holding at a million rows. After the run the chain-depth rule rebuilt
+  the full, g338: 3,055,002 rows, 666 MB → 102 MB, in 6,971 ms (COPY 5.3 s, zstd
+  1.1 s, upload 0.2 s): 1.7 µs a row for a full of three million.
+- The clients are the limit, not the bridge. The wasp's 60-second check failed 78 s
+  in: counts agreed (PG 4, emitter 4, watcher 4) but the newest drip names were on
+  neither replica yet — both were applying the 20,000-events/s tail and had fallen
+  behind by more than the check's ten-second settle; the emitter itself was slowed
+  to 30 writes/s by a PostgreSQL busy with the firehose. A SQLite replica applies
+  some 40,000 rows a second: the fresh seeds after the run — libzb 82.9 s, Node
+  66.5 s for 3,055,002 rows, chain g336 (2,865,002 rows) plus the 190,000-row tail
+  from the stream — landed on exactly PostgreSQL's live count.
+
+**Two things the run surfaced.**
+
+1. *A chain on a quiet table can fall off a stream that never pruned by size.* At the
+   wasp's start, before the firehose, both clients found "chain g331 predates the
+   stream (cutoff seq 1259212 < first 1259214)". test_types had been quiet, so
+   skip-if-unchanged kept g331 as the chain; its cut pointed at the stream's last
+   message of that moment. Other tables published two messages after the cut, and
+   the age valve took the older messages; the events between the cut and the oldest
+   survivor were other tables' — but a client cannot know that, and its rule (§10ei)
+   is right to wait. The producer's own fell-off check repaired it at its next cut,
+   which the firehose forced within seconds; without it the wait would have lasted
+   until the next tick, up to a cadence, because the scan's floor trigger asks for a
+   stream that is PRUNING and the age valve prunes an idle stream in one step. Fixed
+   in §10ev: the scan re-cuts a cut that already sits below the floor, and one whose
+   age approaches the stream's max_age while messages exist after it.
+2. *A table dropped in PostgreSQL leaves its cut in the producer's memory.* late_t
+   (the §10et test's residue) had left the publication, so the tick no longer derived
+   it and the departure sweep took its chain — but the edge watch keeps its own map
+   of cuts, and that pair's cut sat below the floor forever: a forced cut every
+   second for the whole run, each failing with `relation "late_t" does not exist`
+   (212 lines). A fresh process does not have the entry. §10ev holds a pair whose
+   forced cut failed for a minute before asking again. The catalogue row survives
+   the drop and should go by hand (`DELETE FROM zebridge_catalogue WHERE tbl =
+   'late_t'`); `--diagnose` could name a catalogue row whose table is gone.
+
+**The audit: `scripts/scenarios/chain_audit.py`.** Until now every check of the chain
+went through a client — a replica diffed against the table, counts, the object's
+SHA-256. This one opens the objects themselves: the manifest from the KV bucket, the
+full and every delta it names, decompressed with the dictionary the manifest names,
+msgpack-decoded, every cell compared with PostgreSQL rendered in the wire's own
+shapes (ISO `Z` timestamps, numeric text with its scale, array and jsonb text, real
+booleans). Two passes: per object, then the whole chain replayed — the full, then
+each delta with the client's version-guarded upsert, in SQLite — against the table
+at the chain's last cutoff. On the firehose's chain:
+
+- the full g338: 3,055,002 rows, every cell exact;
+- the replay: 3,077,018 table rows at the last cutoff — 3,055,002 cell-exact,
+  22,016 tombstoned on both sides, 0 missing, 0 in the replica only;
+- every delta exact on the rows the table still holds at the delta's version, with
+  10,000 rows per delta "changed since the cut" (the second the firehose updated
+  right after the cut) and, on two deltas, 10,000 "committed late": an UPDATE whose
+  transaction STARTED before the cutoff (`now()` is the transaction's start) and
+  committed after the snapshot, so the delta holds the row's older state — carried
+  by the next delta, whose predicate reaches back `version_future_tolerance` (5 s)
+  before its prev_cutoff. The replay is what proves the margin does its job.
+
+Two facts the audit made visible. The wire quotes every text element of an array
+(`{"grow","s-1"}` where PostgreSQL prints `{grow,s-1}`) — the same PostgreSQL
+literal, and CDC events carry the same form, so the audit normalises it. And the
+bucket held 14 dictionaries of test_types with one referenced: a full that KEEPS a
+dictionary (§10ed) names the older generation's object, and the prune deleted only
+the dictionary under the pruned generation's own name — a 112 KiB object leaked per
+retired full. Fixed in §10ev: the prune deletes the dictionaries the pruned rows
+named that no remaining row references.
+
+## 10ev. The producer's worker pool, two more edge triggers, and four tables at once (2026-09-11)
+
+**Two triggers the edge watch (§10eq) lacked**, both from §10eu's quiet-table case:
+
+- GONE: the cut already sits below the stream's oldest message. The age valve takes
+  an idle stream's messages in one step, so the floor trigger — which asks for a
+  stream that is pruning — never saw it coming, and the repair waited for the tick.
+  Now the scan re-cuts at once: an empty delta with a fresh cut point (§10ej).
+- AGE: a message published after the cut ages out no earlier than the cut's own age
+  reaches the stream's max_age. Two scans short of that, with messages after the cut
+  (an empty stream past its cut can lose nothing), the pair is re-cut. On a quiet
+  pair whose stream other tables keep alive that is an empty delta per max_age; on
+  a quiet stream, nothing. The clock is the cut's `at_ms`, set when a build
+  publishes the cut; a cut this process only observed (a skipped pair's, from an
+  earlier tick or process) starts its clock at the observation, late — GONE covers
+  what AGE then misses, within a scan.
+
+A forced cut whose build failed holds its pair for a minute (§10eu's dropped table
+asked every second). The prune deletes the dictionaries the pruned rows NAMED, not
+only the one under their own generation's name (§10eu's leak).
+
+**The pool.** `GENERATION_WORKERS` (default 1, the sequential producer as before).
+With more, the tick derives its pairs into a job list and spawns that many threads,
+each with its own PostgreSQL and NATS connections, taking the next job off a shared
+counter; the tick's thread drains what a worker that could not start or connect
+leaves, then joins them. The edge watch's early cuts go through the same pool. The
+cut records are under a spin lock now (workers write, the watch reads); the fell-off
+verdict of a build is an out-parameter, no longer a field. Each build has its own
+arena, freed when it is done: a tick holds the memory of the builds IN FLIGHT, where
+the tick's arena used to hold every build until the tick ended.
+
+**Measured: four tables, one stream.** crazy_1..4, shaped like test_types, enabled
+live on globex; four `inject.py` firehoses at 10,000 inserts/s + updates each, five
+minutes; GENERATION_WORKERS=4, cadence 300 s, CDC_MAX_BYTES 1 GiB, no wasp.
+
+- PostgreSQL was the ceiling, not the bridge: the four injectors got 3,800–4,600
+  inserts/s each — 17,300 inserts and 17,200 updates a second, some 35,000 events/s;
+  5,270,000 rows, 2.8 GB, in five minutes.
+- The bridge took 10,500,000 events with no back-pressure line and the queue at 0%.
+  The slot's retained WAL sawtoothed up to 1.2 GB during the burst — the WAL reader,
+  the publisher, four builders, four PostgreSQL writers and NATS on one machine — and
+  drained to nothing within a minute of the injectors stopping: the WAL absorbing,
+  as designed; the WAL monitor's fixed 512 MB / 1 GB thresholds shouted about 12% of
+  max_slot_wal_keep_size (the planned PG health monitor reads safe_wal_size instead).
+- One stream at ~19 MB/s: the 1 GiB cap was a 239-second window at the end. The
+  edge watch cut early 70 times (55 by fill, 15 by rate), every 20–50 s; no chain
+  fell off, no rebuild, no build failed.
+- The pool: the four pairs built together every round. Deltas of 170,000–260,000
+  rows in 1.7–5 s each; the size-rule fulls at g8 — 1,090,000–1,200,000 rows each,
+  all four at once — in 12–13 s (copy+decode+encode 6.2–6.6 s: 5.5 µs a row against
+  1.7 µs for one build alone on an idle machine; the four builders shared the cores
+  with everything above). A round of four fulls in 13 s where the sequential
+  producer would have taken about 30 s; the tick lasts as long as its longest build.
+- Memory is the pool's price: peak RSS 5,304 MB for four 1.2M-row fulls in flight —
+  about 1.1 KB per row (the encoder's value tree, the msgpack bytes, the compressed
+  bytes), so GENERATION_WORKERS × the biggest full's rows × 1.1 KB is what to
+  budget. Four 3M-row fulls at once would want 13 GB; the encoder building a tree
+  before it encodes is the thing to change if that ever matters.
+- A fresh libzb replica seeded crazy_1 in 23.5 s: 1,420,000 rows, chain g11
+  (1,520,000 rows applied), 65,000 rows/s. The audit of crazy_1's chain: the full
+  and six deltas cell-exact against PostgreSQL, the late-committed batches inside the
+  margin as in §10eu, 8 objects in the bucket and 8 referenced.
+
+The fixture the two runs leave behind: test_types at 3,055,002 live rows (1.2 GB)
+and crazy_1..4 at 1.15–1.42 M rows each (2.8 GB) — 5.3 M rows a fresh client of
+globex seeds in about two minutes. To be trimmed by hand when the day's experiments
+are over.
+
+## 10ew. Threads only for the crazy tables, and a build that costs its bytes (2026-09-11)
+
+Two corrections to §10ev, both from reading its numbers.
+
+**The pool serves the burst route only.** The cadence tick builds its pairs in turn
+again, on its own thread and connections: a quiet fleet of many tables costs one
+build's memory at a time, whatever GENERATION_WORKERS says. The workers take the
+edge watch's early cuts — the pairs of the streams that burst, the only builds that
+must not wait for each other. §10ev's run had every round go through the pool; the
+rounds that mattered were the early cuts anyway.
+
+**A build no longer holds a tree.** The COPY path built every row as encoder values
+and encoded the tree when COPY ended: about 1.1 KB per row held until the build was
+done, 5.3 GB for four 1.2M-row fulls in flight. Now the msgpack is WRITTEN as the
+rows arrive — a map header, the columns, an array32 header for the rows with its
+count patched in when COPY says how many, then each row's values straight from the
+CDC decoder into the buffer (`mp`, the five shapes a chain document uses, smallest
+encoding of each). The decoder's per-value copies go to a scratch arena reset after
+every row. The payload buffer is the C allocator's, not the build arena's — a buffer
+that doubles inside an arena leaves every earlier size behind — and buildOne frees
+it after the upload. The text path (the fallback when a type defeats the decoder)
+keeps its tree in the arena and hands the bytes over the same way.
+
+**Measured**, a full of crazy_4 (1,150,000 rows) forced by `zebridge_reseed` on the
+live bridge: 248 MB of msgpack → 38 MB in the store, built in 2,061 ms (the same
+rows took 12 s in §10ev's four-way round and about 2.6 s alone, tree included);
+peak RSS 310 MB against about 1.3 GB per build before — the bytes, the compressed
+bytes, and little else; `leaks` reports 0 for 0 bytes; a fresh libzb replica seeded
+1,150,000 rows from the new object in 23 s; the audit finds every cell exact. The
+budget is now GENERATION_WORKERS × the biggest full's msgpack size, roughly a quarter
+of a kilobyte a row here: four 3M-row fulls at once would want about 3 GB, not 13.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

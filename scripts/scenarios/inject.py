@@ -6,7 +6,7 @@ thousands of rows a second. The wasp (`drip.py`) runs alongside for the three-wa
 invariant on its own rows; this script only pushes and reports what PostgreSQL gave.
 
   set -a && . ./.env.bridge && set +a
-  scripts/scenarios/.venv/bin/python scripts/scenarios/inject.py --rate 10000 --minutes 10
+  scripts/scenarios/.venv/bin/python scripts/scenarios/inject.py --rate 10000 --minutes 10 [--table crazy_1]
 
 Rows are `grow-<n>` on one tenant, never deleted: the fixture the run leaves behind is
 the point — a fresh client's seed of it is the last measurement.
@@ -30,10 +30,13 @@ def main():
     ap.add_argument("--update", type=float, default=1.0, help="share of the previous second's rows updated (0..1)")
     ap.add_argument("--minutes", type=float, default=10)
     ap.add_argument("--tenant", default="globex")
+    ap.add_argument("--table", default="test_types", help="a table shaped like test_types")
     a = ap.parse_args()
+    global T
+    T = a.table
     start = int(psql(f"SELECT COALESCE(max(substr(some_text, 6)::bigint), 0) FROM {T} WHERE some_text LIKE 'grow-%'").strip() or 0) + 1
     n0 = int(psql(f"SELECT count(*) FROM {T}").strip() or 0)
-    print(f"  · firehose: {a.rate} inserts/s + {a.update:.0%} updates of the previous second, {a.minutes} min on {a.tenant}; the table has {n0} rows", flush=True)
+    print(f"  · firehose: {a.rate} inserts/s + {a.update:.0%} updates of the previous second, {a.minutes} min on {a.tenant}/{T}; the table has {n0} rows", flush=True)
     t0 = time.monotonic(); prev = []; sec = 0; ins_ms = upd_ms = 0.0; inserted = updated = 0; last_report = t0
     while time.monotonic() - t0 < a.minutes * 60:
         tick = time.monotonic()

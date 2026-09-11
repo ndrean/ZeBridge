@@ -628,6 +628,11 @@ pub const Generations = struct {
     /// Generations kept per (tenant, table) — the delta chain depth k. Coupled to the
     /// sweeper by the correctness inequality: sweeper retention ≥ k × cadence.
     pub const default_chain_depth: u32 = 6;
+    /// §10ev: builders per tick. One is the sequential producer; more build pairs in
+    /// parallel, each on its own connections — a tick then lasts as long as its
+    /// longest build. Memory follows: every builder holds one build's rows.
+    pub const default_workers: u32 = 1;
+    pub const max_workers: u32 = 32;
     // The KV bucket and per-tenant object-bucket prefix live in grammar.json
     // (`"generations": {kv, bucket_prefix}`) — one file, three readers, same as every
     // other wire name. Only pacing stays here.
@@ -668,6 +673,7 @@ pub const RuntimeConfig = struct {
     publication_name: []const u8,
     generation_cadence_seconds: u64 = Generations.default_cadence_seconds,
     generation_chain_depth: u32 = Generations.default_chain_depth,
+    generation_workers: u32 = Generations.default_workers,
     /// CDC stream retention (StreamLimits, §10eg); the age defaults to three cadences.
     cdc_max_age_seconds: u64 = Nats.default_cdc_max_age_cadences * Generations.default_cadence_seconds,
     cdc_max_bytes: i64 = @intCast(Nats.default_cdc_max_bytes),

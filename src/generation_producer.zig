@@ -85,13 +85,17 @@ pub const GenerationProducer = struct {
     publication_name: []const u8,
     cadence_seconds: u64,
     chain_depth: u32,
-    /// §10ej: set by `buildOne` when the cut it just published had already fallen
-    /// off the stream by the time the manifest was live — read by the tick's retry.
-    cut_fell_off: bool = false,
     /// §10eq: the newest cut of every pair this producer built, with what a rebuild of
-    /// that pair alone needs. Written by the tick, read by the edge watch — both on
-    /// the producer's own thread, so no lock. Keys and strings owned by `allocator`.
+    /// that pair alone needs. Written by the builds — on worker threads when
+    /// GENERATION_WORKERS > 1 (§10ev) — and read by the edge watch on the producer's
+    /// thread: `cuts_lock` guards the map, held for a lookup. Keys and strings are
+    /// owned by `allocator` and live until deinit, so a copy of a Cut stays valid.
     cuts: std.StringArrayHashMapUnmanaged(Cut) = .empty,
+    cuts_lock: utils.SpinLock = .{},
+    /// §10ev: builders per tick (GENERATION_WORKERS). One builds on the tick's own
+    /// thread and connections; more spawn that many threads, each with its own
+    /// connections, taking pairs off a shared counter.
+    workers: u32 = 1,
     /// Per CDC stream: `first_seq` at the previous edge check and when it was read —
     /// the prune rate is the difference over the interval.
     edges: std.StringArrayHashMapUnmanaged(Edge) = .empty,
@@ -116,8 +120,17 @@ pub const GenerationProducer = struct {
         stream: []const u8,
         cutoff_seq: u64,
         build_ms: i64,
+        /// §10ev: when the cut was taken. A message published after it ages out no
+        /// earlier than `at_ms` + the stream's max_age, so the cut's own age is the
+        /// clock of the age trigger. A cut this process only OBSERVED (a skipped
+        /// pair's, made by an earlier tick or process) starts the clock late; the
+        /// floor trigger covers what the clock misses.
+        at_ms: i64 = 0,
+        /// §10ev: a forced cut that failed is not asked for again before this.
+        hold_until_ms: i64 = 0,
     };
     pub const Edge = struct { first_seq: u64, at_ms: i64 };
+    pub const max_workers: u32 = 32;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -135,9 +148,11 @@ pub const GenerationProducer = struct {
         chain_depth: u32,
         event_buf_bytes: usize,
         hot: ?*hot_streams.HotStreams,
+        workers: u32,
     ) GenerationProducer {
         return .{
             .hot = hot,
+            .workers = @max(1, @min(workers, max_workers)),
             .edge_scan_seconds = @max(5, cadence_seconds / 4),
             .allocator = allocator,
             .pg_config = pg_config,
@@ -232,7 +247,14 @@ pub const GenerationProducer = struct {
     ///
     /// A stream that is not pruning and not filling costs one STREAM.INFO per check.
     fn edgeCheck(self: *GenerationProducer, only_streams: ?[]const []const u8) !void {
-        if (self.cuts.count() == 0) return;
+        var snap_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer snap_arena.deinit();
+        const cuts = blk: {
+            self.cuts_lock.lock();
+            defer self.cuts_lock.unlock();
+            break :blk try snap_arena.allocator().dupe(Cut, self.cuts.values());
+        };
+        if (cuts.len == 0) return;
         const wanted = struct {
             fn in(list: ?[]const []const u8, name: []const u8) bool {
                 const l = list orelse return true;
@@ -254,10 +276,10 @@ pub const GenerationProducer = struct {
         try conn_nats.connect(url);
         var js = conn_nats.jetstream(.{});
 
-        const StreamRead = struct { first: u64, last: u64, rate: f64, fill: f64, to_cap_s: f64 };
+        const StreamRead = struct { first: u64, last: u64, rate: f64, fill: f64, to_cap_s: f64, max_age_s: f64 };
         var reads: std.StringArrayHashMapUnmanaged(StreamRead) = .empty;
         const now_ms = utils.unixMillis();
-        for (self.cuts.values()) |cut| {
+        for (cuts) |cut| {
             if (reads.contains(cut.stream) or !wanted.in(only_streams, cut.stream)) continue;
             var info = js.getStreamInfo(cut.stream) catch continue;
             defer info.deinit();
@@ -285,12 +307,13 @@ pub const GenerationProducer = struct {
                     to_cap_s = if (left <= 0) 0 else @as(f64, @floatFromInt(left)) / @as(f64, @floatFromInt(fill_bps));
                 }
             };
-            try reads.put(alloc, cut.stream, .{ .first = st.first_seq, .last = st.last_seq, .rate = rate, .fill = fill, .to_cap_s = to_cap_s });
+            try reads.put(alloc, cut.stream, .{ .first = st.first_seq, .last = st.last_seq, .rate = rate, .fill = fill, .to_cap_s = to_cap_s, .max_age_s = @as(f64, @floatFromInt(cfg.max_age)) / 1e9 });
         }
 
         var urgent: std.ArrayListUnmanaged(Cut) = .empty;
-        for (self.cuts.values()) |cut| {
+        for (cuts) |cut| {
             const r = reads.get(cut.stream) orelse continue;
+            if (cut.hold_until_ms > now_ms) continue;
             const margin_msgs: i64 = @as(i64, @intCast(cut.cutoff_seq)) - @as(i64, @intCast(r.first));
             const span: i64 = @max(@as(i64, @intCast(r.last)) - @as(i64, @intCast(r.first)), 1);
             const margin_s: f64 = if (margin_msgs <= 0) 0 else if (r.rate > 0) @as(f64, @floatFromInt(margin_msgs)) / r.rate else std.math.inf(f64);
@@ -304,12 +327,35 @@ pub const GenerationProducer = struct {
             // cut sits in the half that goes first.
             const by_fill = (r.to_cap_s < need_s or r.fill >= 0.8) and margin_msgs < @divTrunc(span, 2);
             const by_floor = r.rate > 0 and margin_msgs < @divTrunc(span, 10);
-            if (by_rate or by_fill or by_floor) {
-                log.warn("🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, {d:.1} s to the byte cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest ({s}{s}{s})", .{
-                    cut.tenant,                                    cut.table, cut.stream, span, r.fill * 100, r.to_cap_s, r.rate, @max(margin_msgs, 0),
-                    if (by_rate) "the rate leaves under the build time" else "",
-                    if (by_rate and by_fill) "; " else "",
-                    if (by_fill) "the fill is past 80% and the cut sits in the oldest half" else if (!by_rate) "the cut is within a tenth of the span" else "",
+            // §10ev: two more, for the stream that never pruned by size.
+            //   4. GONE: the cut already sits below the oldest message — the age valve
+            //      took it in one step on a quiet stream (§10eu) — so every returning
+            //      client of this pair waits; the repair cut of §10ej, now, not at
+            //      the tick;
+            //   5. AGE: a message published after the cut ages out no earlier than the
+            //      cut's own age reaches max_age; two scans short of that, with
+            //      messages after the cut (an empty stream past its cut cannot lose
+            //      anything), re-cut — an empty delta on a quiet pair, once per
+            //      max_age, only while other tables keep its stream alive.
+            const by_gone = cut.cutoff_seq + 1 < r.first;
+            const age_s: f64 = if (cut.at_ms > 0) @as(f64, @floatFromInt(now_ms - cut.at_ms)) / 1000.0 else 0;
+            const by_age = r.max_age_s > 0 and cut.at_ms > 0 and r.last > cut.cutoff_seq and
+                age_s > r.max_age_s - 2.0 * @as(f64, @floatFromInt(self.edge_scan_seconds));
+            if (by_rate or by_fill or by_floor or by_gone or by_age) {
+                const why: []const u8 = if (by_gone)
+                    "the cut already sits below the stream's oldest message"
+                else if (by_age)
+                    "the cut is two scans short of the stream's max_age and messages follow it"
+                else if (by_rate and by_fill)
+                    "the rate leaves under the build time; the fill is past 80% and the cut sits in the oldest half"
+                else if (by_rate)
+                    "the rate leaves under the build time"
+                else if (by_fill)
+                    "the fill is past 80% and the cut sits in the oldest half"
+                else
+                    "the cut is within a tenth of the span";
+                log.warn("🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, {d:.1} s to the byte cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest and {d:.0} s old ({s})", .{
+                    cut.tenant, cut.table, cut.stream, span, r.fill * 100, r.to_cap_s, r.rate, @max(margin_msgs, 0), age_s, why,
                 });
                 try urgent.append(alloc, cut);
             }
@@ -326,50 +372,11 @@ pub const GenerationProducer = struct {
 
         // Fresh connections per tick: at generation cadence the handshake cost is
         // noise, and a tick can never inherit a half-dead connection from the last one.
-        const conninfo = try self.pg_config.connInfo(alloc, false);
-        const pgc = c.PQconnectdb(conninfo.ptr) orelse return error.ConnectionFailed;
-        defer c.PQfinish(pgc);
-        if (c.PQstatus(pgc) != c.CONNECTION_OK) {
-            log.err("🧬 PG connect failed: {s}", .{c.PQerrorMessage(pgc)});
-            return error.ConnectionFailed;
-        }
-        // The WHOLE connection renders timestamps in UTC, not just the snapshot
-        // transaction: the window query that rebuilds manifest entries reads stored
-        // cutoffs OUTSIDE the transaction, and a session-timezone render there mixed
-        // `+02` and `+00` strings inside one manifest (measured live in the
-        // live-birth exercise: full.cutoff +02, delta cutoff +00). Chain bounds are
-        // STRING-compared — one canonical form or nothing, same law as payloads.
-        // The bookkeeping connection: the same one on a primary, the writer's on a
-        // standby (§10cz). UTC on it too — cutoff_version::text is rendered in the
-        // session timezone, and a manifest must carry canonical `+00` (livebirth §5).
-        const bkc: *c.PGconn = if (self.book_config == self.pg_config) pgc else blk: {
-            const bk_info = try self.book_config.connInfo(alloc, false);
-            const bk = c.PQconnectdb(bk_info.ptr) orelse return error.ConnectionFailed;
-            if (c.PQstatus(bk) != c.CONNECTION_OK) {
-                log.err("🧬 PG connect failed (bookkeeping, DATABASE_WRITER_URL): {s}", .{c.PQerrorMessage(bk)});
-                c.PQfinish(bk);
-                return error.ConnectionFailed;
-            }
-            const tz = try queryOne(bk, "SET timezone TO 'UTC'", &.{});
-            c.PQclear(tz);
-            break :blk bk;
-        };
-        defer if (bkc != pgc) c.PQfinish(bkc);
-        {
-            const res = try queryOne(pgc, "SET timezone TO 'UTC'", &.{});
-            c.PQclear(res);
-        }
-
-        var conn_nats = nats.Connection.init(self.allocator, self.io, .{
-            .user = self.endpoint.user,
-            .password = self.endpoint.pass,
-            .nkey_seed = self.endpoint.seed,
-            .user_creds = self.endpoint.creds,
-        });
-        defer conn_nats.deinit();
-        const url = try std.fmt.allocPrint(alloc, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port });
-        try conn_nats.connect(url);
-        var js = conn_nats.jetstream(.{});
+        const cs = try self.openConns(alloc);
+        defer cs.close();
+        const pgc = cs.pgc;
+        const bkc = cs.bkc;
+        var js = cs.conn_nats.jetstream(.{});
 
         // ── derive the pair list: the publication IS the list ────────────────
         // Minus internals (zebridge_is_internal_table — one predicate, every door),
@@ -379,10 +386,9 @@ pub const GenerationProducer = struct {
         // INTERSECTS what was derived.
         const pub_z = try alloc.dupeZ(u8, self.publication_name);
         if (only) |pairs| {
-            for (pairs) |cut| {
-                if (self.should_stop.load(.acquire)) return;
-                self.buildWithRetry(alloc, pgc, bkc, &js, cut.table, cut.tenant, cut.vcol, cut.tcol, cut.guarded, true);
-            }
+            const jobs = try alloc.alloc(Job, pairs.len);
+            for (pairs, 0..) |cut, i| jobs[i] = .{ .table = cut.table, .tenant = cut.tenant, .vcol = cut.vcol, .tcol = cut.tcol, .guarded = cut.guarded, .force_cut = true };
+            self.runJobs(cs, jobs, true);
             return;
         }
         const derive_params = [_]?[*:0]const u8{pub_z.ptr};
@@ -416,6 +422,7 @@ pub const GenerationProducer = struct {
 
         const restricted = self.rules.count() > 0;
         var pairs: usize = 0;
+        var jobs: std.ArrayListUnmanaged(Job) = .empty;
         const n_tables: usize = @intCast(c.PQntuples(derived));
         // The published set, for the departure sweep below (§10dg).
         var published_lit: std.ArrayList(u8) = .empty;
@@ -482,7 +489,7 @@ pub const GenerationProducer = struct {
                         if (!ok) continue;
                     }
                     pairs += 1;
-                    self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded, false);
+                    try jobs.append(alloc, .{ .table = table, .tenant = tenant, .vcol = try alloc.dupe(u8, vcol), .tcol = tcol, .guarded = guarded, .force_cut = false });
                 }
             } else {
                 const tenant = self.topo.open_tenant;
@@ -492,10 +499,142 @@ pub const GenerationProducer = struct {
                     if (!ok) continue;
                 }
                 pairs += 1;
-                self.buildWithRetry(alloc, pgc, bkc, &js, table, tenant, vcol, tcol, guarded, false);
+                try jobs.append(alloc, .{ .table = table, .tenant = tenant, .vcol = try alloc.dupe(u8, vcol), .tcol = tcol, .guarded = guarded, .force_cut = false });
             }
         }
+        self.runJobs(cs, jobs.items, false);
         log.debug("🧬 tick: {d} published table(s) derived, {d} (table, tenant) pair(s) built or checked", .{ n_tables, pairs });
+    }
+
+    /// One (table, tenant) build for the pool: what `buildOne` needs, every string
+    /// living in the tick's arena.
+    const Job = struct { table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, force_cut: bool };
+
+    /// §10ev: the connections one builder holds — PostgreSQL for content and for
+    /// bookkeeping, both rendering UTC, and NATS. On the heap: JetStream keeps a
+    /// pointer to the connection.
+    const Conns = struct {
+        pgc: *c.PGconn,
+        bkc: *c.PGconn,
+        conn_nats: nats.Connection,
+
+        fn close(self: *Conns) void {
+            self.conn_nats.deinit();
+            if (self.bkc != self.pgc) c.PQfinish(self.bkc);
+            c.PQfinish(self.pgc);
+        }
+    };
+
+    fn openConns(self: *GenerationProducer, alloc: std.mem.Allocator) !*Conns {
+        const cs = try alloc.create(Conns);
+        const conninfo = try self.pg_config.connInfo(alloc, false);
+        const pgc = c.PQconnectdb(conninfo.ptr) orelse return error.ConnectionFailed;
+        errdefer c.PQfinish(pgc);
+        if (c.PQstatus(pgc) != c.CONNECTION_OK) {
+            log.err("🧬 PG connect failed: {s}", .{c.PQerrorMessage(pgc)});
+            return error.ConnectionFailed;
+        }
+        // The WHOLE connection renders timestamps in UTC, not just the snapshot
+        // transaction: the window query that rebuilds manifest entries reads stored
+        // cutoffs OUTSIDE the transaction, and a session-timezone render there mixed
+        // `+02` and `+00` strings inside one manifest (measured live in the
+        // live-birth exercise: full.cutoff +02, delta cutoff +00). Chain bounds are
+        // STRING-compared — one canonical form or nothing, same law as payloads.
+        // The bookkeeping connection: the same one on a primary, the writer's on a
+        // standby (§10cz). UTC on it too — cutoff_version::text is rendered in the
+        // session timezone, and a manifest must carry canonical `+00` (livebirth §5).
+        const bkc: *c.PGconn = if (self.book_config == self.pg_config) pgc else blk: {
+            const bk_info = try self.book_config.connInfo(alloc, false);
+            const bk = c.PQconnectdb(bk_info.ptr) orelse return error.ConnectionFailed;
+            if (c.PQstatus(bk) != c.CONNECTION_OK) {
+                log.err("🧬 PG connect failed (bookkeeping, DATABASE_WRITER_URL): {s}", .{c.PQerrorMessage(bk)});
+                c.PQfinish(bk);
+                return error.ConnectionFailed;
+            }
+            const tz = try queryOne(bk, "SET timezone TO 'UTC'", &.{});
+            c.PQclear(tz);
+            break :blk bk;
+        };
+        errdefer if (bkc != pgc) c.PQfinish(bkc);
+        {
+            const res = try queryOne(pgc, "SET timezone TO 'UTC'", &.{});
+            c.PQclear(res);
+        }
+
+        cs.* = .{ .pgc = pgc, .bkc = bkc, .conn_nats = nats.Connection.init(self.allocator, self.io, .{
+            .user = self.endpoint.user,
+            .password = self.endpoint.pass,
+            .nkey_seed = self.endpoint.seed,
+            .user_creds = self.endpoint.creds,
+        }) };
+        errdefer cs.conn_nats.deinit();
+        const url = try std.fmt.allocPrint(alloc, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port });
+        try cs.conn_nats.connect(url);
+        return cs;
+    }
+
+    /// §10ev: the builds of a tick, or of the edge watch's early cuts. The cadence
+    /// tick builds in turn on its own thread and connections — a quiet fleet of many
+    /// tables costs one build's memory at a time. The early cuts, which fire for the
+    /// streams that burst (§10ew: `parallel`), go over GENERATION_WORKERS threads —
+    /// each with its own connections and arena — taking the next job off a shared
+    /// counter, so the round lasts as long as its longest build, not the sum; the
+    /// caller's thread drains whatever a worker that could not start or connect left
+    /// on the counter, then waits for the rest. A forced cut whose build FAILED holds
+    /// its pair for a minute — a dropped table's pair was asked for every second
+    /// (§10eu).
+    fn runJobs(self: *GenerationProducer, cs: *Conns, jobs: []const Job, parallel: bool) void {
+        if (jobs.len == 0) return;
+        const n_workers: usize = if (parallel) @min(@as(usize, self.workers), jobs.len) else 1;
+        var next = std.atomic.Value(usize).init(0);
+        var threads: [max_workers]?std.Thread = .{null} ** max_workers;
+        if (n_workers > 1) {
+            log.debug("🧬 {d} job(s) over {d} worker(s)", .{ jobs.len, n_workers });
+            for (0..n_workers) |w| {
+                threads[w] = std.Thread.spawn(.{}, workerMain, .{ self, jobs, &next, w }) catch |err| blk: {
+                    log.warn("🧬 worker {d} could not start: {} — its share builds on the tick's thread", .{ w, err });
+                    break :blk null;
+                };
+            }
+        }
+        self.workLoop(cs, jobs, &next);
+        for (threads[0..n_workers]) |t| if (t) |th| th.join();
+    }
+
+    fn workerMain(self: *GenerationProducer, jobs: []const Job, next: *std.atomic.Value(usize), w: usize) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const cs = self.openConns(arena.allocator()) catch |err| {
+            log.err("🧬 worker {d}: could not connect: {} — its share builds on the tick's thread", .{ w, err });
+            return;
+        };
+        defer cs.close();
+        self.workLoop(cs, jobs, next);
+    }
+
+    /// Jobs off the counter until it runs out. Each build gets its own arena, freed
+    /// when it is done: a tick of several big tables holds the memory of the builds
+    /// IN FLIGHT, not of all its builds (the tick's arena used to hold every one of
+    /// them until the tick ended).
+    fn workLoop(self: *GenerationProducer, cs: *Conns, jobs: []const Job, next: *std.atomic.Value(usize)) void {
+        var js = cs.conn_nats.jetstream(.{});
+        while (true) {
+            const i = next.fetchAdd(1, .acq_rel);
+            if (i >= jobs.len or self.should_stop.load(.acquire)) return;
+            const j = jobs[i];
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const built = self.buildWithRetry(arena.allocator(), cs.pgc, cs.bkc, &js, j.table, j.tenant, j.vcol, j.tcol, j.guarded, j.force_cut);
+            if (!built and j.force_cut) self.holdCut(j.tenant, j.table, 60_000);
+        }
+    }
+
+    fn holdCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, for_ms: i64) void {
+        var key_buf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ tenant, table }) catch return;
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        if (self.cuts.getPtr(key)) |cut| cut.hold_until_ms = utils.unixMillis() + for_ms;
     }
 
     fn queryOne(pgc: *c.PGconn, sql: [:0]const u8, params: []const ?[*:0]const u8) !*c.PGresult {
@@ -526,6 +665,10 @@ pub const GenerationProducer = struct {
     /// anyway); the decision is per build and said in the log.
     fn encodeContentCopy(
         alloc: std.mem.Allocator,
+        /// The payload's own allocator (§10ew): the bytes outlive nothing but the
+        /// build, and a growing buffer in an arena leaves every earlier size behind.
+        /// The caller frees the returned slice with it.
+        payload_alloc: std.mem.Allocator,
         pgc: *c.PGconn,
         select_sql: []const u8,
         gen: i64,
@@ -560,13 +703,26 @@ pub const GenerationProducer = struct {
         }
         c.PQclear(started);
 
-        var enc = encoder_mod.Encoder.init(alloc, .msgpack);
-        var root = enc.createMap();
-        var cols_arr = try enc.createArray(ncols);
-        for (0..ncols) |i| try cols_arr.setIndex(i, try enc.createString(names[i]));
-        try root.put(enc.allocator, "columns", cols_arr);
+        // §10ew: the document is WRITTEN as the rows arrive — no value tree. The
+        // first version built every row as encoder values and encoded the tree at the
+        // end: about 1.1 KB per row held until the build ended, 5.3 GB for four
+        // 1.2M-row fulls in flight (§10ev). Now a row costs its msgpack bytes and
+        // nothing else: the decoder's per-value copies go to a scratch arena reset
+        // after every row. The `rows` array header is array32 with a count patched
+        // in at the end, since the count is known only when COPY says so.
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(payload_alloc);
+        try mp.mapHeader(&out, payload_alloc, if (prev_cutoff != null) 7 else 6);
+        try mp.str(&out, payload_alloc, "columns");
+        try mp.arrayHeader(&out, payload_alloc, ncols);
+        for (names) |n| try mp.str(&out, payload_alloc, n);
+        try mp.str(&out, payload_alloc, "rows");
+        const rows_hdr = out.items.len;
+        try out.appendSlice(payload_alloc, &.{ 0xdd, 0, 0, 0, 0 });
 
-        var rows: std.ArrayListUnmanaged(encoder_mod.Value) = .empty;
+        var row_scratch = std.heap.ArenaAllocator.init(alloc);
+        defer row_scratch.deinit();
+        var nrows: usize = 0;
         var header_seen = false;
         var failed: ?anyerror = null;
         copy: while (true) {
@@ -601,37 +757,39 @@ pub const GenerationProducer = struct {
                     failed = error.CopyShape;
                     break :copy;
                 }
-                var row_arr = try enc.createArray(ncols);
+                _ = row_scratch.reset(.retain_capacity);
+                const ra = row_scratch.allocator();
+                try mp.arrayHeader(&out, payload_alloc, ncols);
                 var row_bytes: usize = names_bytes + 256; // envelope margin, mirrors wireSize
                 for (0..ncols) |i| {
                     const flen = std.mem.readInt(i32, data[pos..][0..4], .big);
                     pos += 4;
                     if (flen == -1) {
-                        try row_arr.setIndex(i, enc.createNull());
+                        try out.append(payload_alloc, 0xc0);
                         continue;
                     }
                     const len: usize = @intCast(flen);
                     const bytes = data[pos..][0..len];
                     pos += len;
                     row_bytes += len;
-                    // `owns_bytes = false`: the decoder dupes what it keeps, since libpq's
-                    // buffer is freed at the end of this message.
-                    const v = pgoutput.decodeBinColumnData(alloc, oids[i], bytes, false) catch |err| {
+                    // `owns_bytes = false`: the decoder dupes what it keeps — into the
+                    // row's scratch, gone with the next row.
+                    const v = pgoutput.decodeBinColumnData(ra, oids[i], bytes, false) catch |err| {
                         log.warn("🧬 COPY: column {s} (oid {d}) is not decodable by the CDC decoder ({s}) — this build takes the text path", .{ names[i], oids[i], @errorName(err) });
                         failed = err;
                         break :copy;
                     };
-                    try row_arr.setIndex(i, switch (v) {
-                        .null, .unchanged => enc.createNull(),
-                        .boolean => |b| enc.createBool(b),
-                        .int32 => |x| enc.createInt(@intCast(x)),
-                        .int64 => |x| enc.createInt(x),
-                        .float64 => |f| enc.createFloat(f),
-                        .text, .numeric, .jsonb, .array, .bytea => |str| try enc.createString(str),
-                    });
+                    switch (v) {
+                        .null, .unchanged => try out.append(payload_alloc, 0xc0),
+                        .boolean => |b| try out.append(payload_alloc, if (b) 0xc3 else 0xc2),
+                        .int32 => |x| try mp.int(&out, payload_alloc, x),
+                        .int64 => |x| try mp.int(&out, payload_alloc, x),
+                        .float64 => |f| try mp.float(&out, payload_alloc, f),
+                        .text, .numeric, .jsonb, .array, .bytea => |str| try mp.str(&out, payload_alloc, str),
+                    }
                 }
                 if (row_bytes > out_widest.*) out_widest.* = row_bytes;
-                try rows.append(alloc, row_arr);
+                nrows += 1;
             }
         }
         // Whatever ended the COPY, the connection must be left clean: read the rest
@@ -661,21 +819,27 @@ pub const GenerationProducer = struct {
         }
         if (failed) |e| return e;
 
-        out_rows.* = rows.items.len;
-        var rows_arr = try enc.createArray(rows.items.len);
-        for (rows.items, 0..) |r, i| try rows_arr.setIndex(i, r);
-        try root.put(enc.allocator, "rows", rows_arr);
-        try root.put(enc.allocator, "gen", enc.createInt(gen));
-        try root.put(enc.allocator, "kind", try enc.createString(kind));
-        try root.put(enc.allocator, "cutoff", try enc.createString(cutoff));
-        try root.put(enc.allocator, "version_column", try enc.createString(vcol));
-        if (prev_cutoff) |p| try root.put(enc.allocator, "prev_cutoff", try enc.createString(p));
-        return try enc.encode(root);
+        out_rows.* = nrows;
+        std.mem.writeInt(u32, out.items[rows_hdr + 1 ..][0..4], @intCast(nrows), .big);
+        try mp.str(&out, payload_alloc, "gen");
+        try mp.int(&out, payload_alloc, gen);
+        try mp.str(&out, payload_alloc, "kind");
+        try mp.str(&out, payload_alloc, kind);
+        try mp.str(&out, payload_alloc, "cutoff");
+        try mp.str(&out, payload_alloc, cutoff);
+        try mp.str(&out, payload_alloc, "version_column");
+        try mp.str(&out, payload_alloc, vcol);
+        if (prev_cutoff) |pc| {
+            try mp.str(&out, payload_alloc, "prev_cutoff");
+            try mp.str(&out, payload_alloc, pc);
+        }
+        return try out.toOwnedSlice(payload_alloc);
     }
 
     /// msgpack `{columns, rows, gen, kind, cutoff, prev_cutoff?}` from a text-mode result.
     fn encodeContent(
         alloc: std.mem.Allocator,
+        payload_alloc: std.mem.Allocator,
         res: *c.PGresult,
         gen: i64,
         kind: []const u8,
@@ -734,7 +898,8 @@ pub const GenerationProducer = struct {
         // the producer is the one component that certainly knows it.
         try root.put(enc.allocator, "version_column", try enc.createString(vcol));
         if (prev_cutoff) |p| try root.put(enc.allocator, "prev_cutoff", try enc.createString(p));
-        return try enc.encode(root);
+        const bytes = try enc.encode(root);
+        return try payload_alloc.dupe(u8, bytes);
     }
 
     /// §10dg: a table that left the publication (dropped, or disabled) leaves its
@@ -810,6 +975,9 @@ pub const GenerationProducer = struct {
         /// §10eq: the edge watch asks for a cut whatever the table did — a fresh cut
         /// point is the whole point, an empty delta is fine.
         force_cut: bool,
+        /// §10ej: set when the cut just published had already fallen off the stream
+        /// by the time the manifest was live — read by the caller's bounded retry.
+        fell_off: *bool,
     ) !void {
         const build_started_ms = utils.unixMillis();
         const table_z = try alloc.dupeZ(u8, table);
@@ -1146,7 +1314,7 @@ pub const GenerationProducer = struct {
                         c.PQclear(rb);
                         // §10eq: a skipped pair still has a cut to watch — the previous
                         // one, with a conservative build time until this process builds it.
-                        if (prev_cut > 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100) catch {};
+                        if (prev_cut > 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100, false) catch {};
                         return;
                     }
                     // §10ej: nothing moved but the chain fell off the stream — the repair
@@ -1182,6 +1350,7 @@ pub const GenerationProducer = struct {
 
         // ── 3. content: full and/or delta against the SAME snapshot ──────────
         var full_payload: ?[]const u8 = null;
+        defer if (full_payload) |b| self.allocator.free(b);
         var full_rows: usize = 0;
         var widest_row: usize = 0;
         // §10eo: where a build's time goes, one line per generation — the number that
@@ -1200,14 +1369,15 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
             const t_q = utils.unixMillis();
-            full_payload = encodeContentCopy(alloc, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
+            full_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
                 const res = try queryOne(pgc, sql, &.{});
                 defer c.PQclear(res);
-                break :blk try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
+                break :blk try encodeContent(alloc, self.allocator, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
             };
             ph.query += utils.unixMillis() - t_q;
         }
         var delta_payload: ?[]const u8 = null;
+        defer if (delta_payload) |b| self.allocator.free(b);
         var delta_rows: usize = 0;
         if (build_delta) {
             // COPY takes no parameters: the previous cutoff is inlined as a literal. It is
@@ -1216,10 +1386,10 @@ pub const GenerationProducer = struct {
             const prev_lit = try std.mem.replaceOwned(u8, alloc, last_cutoff.?, "'", "''");
             const sql = try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" > '{s}'::timestamptz - interval '{s}'", .{ table, vcol, prev_lit, config.Sync.version_future_tolerance });
             const t_q = utils.unixMillis();
-            delta_payload = encodeContentCopy(alloc, pgc, sql, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row) catch blk: {
+            delta_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row) catch blk: {
                 const res = try queryOne(pgc, sql, &.{});
                 defer c.PQclear(res);
-                break :blk try encodeContent(alloc, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
+                break :blk try encodeContent(alloc, self.allocator, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
             };
             ph.query += utils.unixMillis() - t_q;
         }
@@ -1240,10 +1410,10 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
             const t_q = utils.unixMillis();
-            full_payload = encodeContentCopy(alloc, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
+            full_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
                 const res = try queryOne(pgc, sql, &.{});
                 defer c.PQclear(res);
-                break :blk try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
+                break :blk try encodeContent(alloc, self.allocator, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
             };
             ph.query += utils.unixMillis() - t_q;
         }
@@ -1461,13 +1631,13 @@ pub const GenerationProducer = struct {
         }
 
         // §10eq: the edge watch's memory of this pair.
-        self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, cutoff_seq, utils.unixMillis() - build_started_ms) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
+        self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
 
         // ── 6. prune past the chain depth: PG rows (authority), then objects ──
         if (gen > self.chain_depth) {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{gen - @as(i64, self.chain_depth)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
-            const res = try queryOne(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen <= $3 RETURNING gen", &params);
+            const res = try queryOne(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen <= $3 RETURNING gen, COALESCE(dict_object, '')", &params);
             defer c.PQclear(res);
             const pruned: usize = @intCast(c.PQntuples(res));
             // Dictionaries outlive their full's row: a pruned era's dictionary must
@@ -1491,15 +1661,25 @@ pub const GenerationProducer = struct {
                         if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
                     };
                 }
-                const dict_old = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g });
-                var referenced = false;
+                // Two names: the dictionary under this generation's own name, and the
+                // one the row NAMED — a full that kept a dictionary (§10ed) names an
+                // older generation's object, which outlived that generation's prune
+                // through the reference and must go when the last reference does. The
+                // prune deleted only the own name and leaked one dictionary per retired
+                // full (§10eu: 14 in a bucket, 1 referenced).
+                const dict_own = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g });
+                const dict_named = std.mem.span(c.PQgetvalue(res, @intCast(i), 1));
                 const nref: usize = @intCast(c.PQntuples(still_ref));
-                for (0..nref) |k| {
-                    if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(still_ref, @intCast(k), 0)), dict_old)) referenced = true;
+                for ([_][]const u8{ dict_own, dict_named }) |dict_old| {
+                    if (dict_old.len == 0) continue;
+                    var referenced = false;
+                    for (0..nref) |k| {
+                        if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(still_ref, @intCast(k), 0)), dict_old)) referenced = true;
+                    }
+                    if (!referenced) store.delete(dict_old) catch |err| {
+                        if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned dictionary {s}: {}", .{ dict_old, err });
+                    };
                 }
-                if (!referenced) store.delete(dict_old) catch |err| {
-                    if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned dictionary {s}: {}", .{ dict_old, err });
-                };
             }
         }
 
@@ -1507,9 +1687,9 @@ pub const GenerationProducer = struct {
         // window must cover two cadences AND this, since the cut is taken before the
         // build and must still be in the stream when the manifest is live.
         log.info("🧬 g{d} for '{s}'/'{s}': {s}{s}{s} → {s} (cutoff {s} @ {s}) in {d} ms", .{
-            gen,                              tenant,                                      table,
-            if (build_delta) "delta" else "", if (build_delta and build_full) "+" else "", if (build_full) "full" else "",
-            bucket,                           cutoff_version,                              lsn,
+            gen,                                   tenant,                                      table,
+            if (build_delta) "delta" else "",      if (build_delta and build_full) "+" else "", if (build_full) "full" else "",
+            bucket,                                cutoff_version,                              lsn,
             utils.unixMillis() - build_started_ms,
         });
         log.info("🧬   phases: copy+decode+encode {d} ms, dictionary {d} ms, zstd {d} ms, upload {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.query, ph.train, ph.zstd, ph.upload, full_rows, delta_rows });
@@ -1527,20 +1707,27 @@ pub const GenerationProducer = struct {
                 defer info2.deinit();
                 const first_now = info2.value.state.first_seq;
                 if (cutoff_seq + 1 < first_now) {
-                    self.cut_fell_off = true;
+                    fell_off.* = true;
                     log.warn("🧬 '{s}'/'{s}': g{d}'s cut (seq {d}) fell off {s} during the build — the stream's oldest message is {d} now, the build took {d} ms; no client can splice on this generation", .{ tenant, table, gen, cutoff_seq, cdc_stream, first_now, utils.unixMillis() - build_started_ms });
                 }
             } else |_| {}
         }
     }
 
-    fn recordCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, stream: []const u8, cutoff_seq: u64, build_ms: i64) !void {
+    /// `just_cut`: this build published the cut (the clock starts now, a hold is
+    /// lifted); false for a cut only observed on a skipped pair (the clock keeps
+    /// what it had, or starts now if this process never saw the pair).
+    fn recordCut(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, stream: []const u8, cutoff_seq: u64, build_ms: i64, just_cut: bool) !void {
         if (cutoff_seq == 0 or stream.len == 0) return;
         const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ tenant, table });
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
         if (self.cuts.getPtr(key)) |cut| {
             self.allocator.free(key);
+            if (just_cut or cut.cutoff_seq != cutoff_seq) cut.at_ms = utils.unixMillis();
             cut.cutoff_seq = cutoff_seq;
             cut.build_ms = build_ms;
+            if (just_cut) cut.hold_until_ms = 0;
             return;
         }
         try self.cuts.put(self.allocator, key, .{
@@ -1552,6 +1739,7 @@ pub const GenerationProducer = struct {
             .stream = try self.allocator.dupe(u8, stream),
             .cutoff_seq = cutoff_seq,
             .build_ms = build_ms,
+            .at_ms = utils.unixMillis(),
         });
     }
 
@@ -1562,20 +1750,113 @@ pub const GenerationProducer = struct {
     /// and leave it to the next tick; clients wait for a splice rather than read past
     /// the hole (§10ei). The back-pressure that would let the WAL absorb the burst
     /// (pause publishing for one build) is the next step, not this one.
-    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, force_cut: bool) void {
+    /// Returns false when the build itself failed (the pair is unchanged in NATS);
+    /// true when a generation was published, spliceable or not.
+    fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, force_cut: bool) bool {
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
-            self.cut_fell_off = false;
-            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, guarded, force_cut) catch |err| {
+            var fell_off = false;
+            self.buildOne(alloc, pgc, bkc, js, table, tenant, vcol, tcol, guarded, force_cut, &fell_off) catch |err| {
                 log.err("🧬 generation build failed for '{s}'/'{s}': {} — next cadence retries", .{ tenant, table, err });
-                return;
+                return false;
             };
-            if (!self.cut_fell_off) return;
+            if (!fell_off) return true;
             if (attempt < 2) log.warn("🧬 '{s}'/'{s}': rebuilding at once ({d}/3)", .{ tenant, table, attempt + 2 });
         }
         log.err("🧬 '{s}'/'{s}': the cut fell off the stream three builds in a row — the stream prunes faster than this pair builds (CDC_MAX_BYTES / CDC_MAX_MSGS under a burst, or CDC_MAX_AGE_SECONDS under a build); clients wait for a splice until the next cadence", .{ tenant, table });
+        return true;
     }
 };
+
+/// §10ew: MessagePack written straight into a byte buffer — the five shapes a
+/// chain document uses, the smallest encoding of each, as the decoders on every
+/// client already accept (they read any width).
+const mp = struct {
+    const List = std.ArrayListUnmanaged(u8);
+
+    fn be(out: *List, a: std.mem.Allocator, comptime T: type, v: T) !void {
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(T, v)));
+    }
+
+    fn mapHeader(out: *List, a: std.mem.Allocator, n: usize) !void {
+        if (n < 16) return out.append(a, 0x80 | @as(u8, @intCast(n)));
+        try out.append(a, 0xde);
+        try be(out, a, u16, @intCast(n));
+    }
+
+    fn arrayHeader(out: *List, a: std.mem.Allocator, n: usize) !void {
+        if (n < 16) return out.append(a, 0x90 | @as(u8, @intCast(n)));
+        if (n < 65_536) {
+            try out.append(a, 0xdc);
+            return be(out, a, u16, @intCast(n));
+        }
+        try out.append(a, 0xdd);
+        try be(out, a, u32, @intCast(n));
+    }
+
+    fn str(out: *List, a: std.mem.Allocator, s: []const u8) !void {
+        if (s.len < 32) {
+            try out.append(a, 0xa0 | @as(u8, @intCast(s.len)));
+        } else if (s.len < 256) {
+            try out.appendSlice(a, &.{ 0xd9, @intCast(s.len) });
+        } else if (s.len < 65_536) {
+            try out.append(a, 0xda);
+            try be(out, a, u16, @intCast(s.len));
+        } else {
+            try out.append(a, 0xdb);
+            try be(out, a, u32, @intCast(s.len));
+        }
+        try out.appendSlice(a, s);
+    }
+
+    fn int(out: *List, a: std.mem.Allocator, v: i64) !void {
+        if (v >= 0 and v < 128) return out.append(a, @intCast(v));
+        if (v < 0 and v >= -32) return out.append(a, @bitCast(@as(i8, @intCast(v))));
+        if (v >= -128 and v < 128) {
+            try out.append(a, 0xd0);
+            return out.append(a, @bitCast(@as(i8, @intCast(v))));
+        }
+        if (v >= -32_768 and v < 32_768) {
+            try out.append(a, 0xd1);
+            return be(out, a, i16, @intCast(v));
+        }
+        if (v >= -2_147_483_648 and v < 2_147_483_648) {
+            try out.append(a, 0xd2);
+            return be(out, a, i32, @intCast(v));
+        }
+        try out.append(a, 0xd3);
+        try be(out, a, i64, v);
+    }
+
+    fn float(out: *List, a: std.mem.Allocator, f: f64) !void {
+        try out.append(a, 0xcb);
+        try be(out, a, u64, @bitCast(f));
+    }
+};
+
+test "mp: the chain document's shapes decode as msgpack" {
+    const a = std.testing.allocator;
+    var out: mp.List = .empty;
+    defer out.deinit(a);
+    try mp.mapHeader(&out, a, 2);
+    try mp.str(&out, a, "rows");
+    try mp.arrayHeader(&out, a, 3);
+    try mp.int(&out, a, -5);
+    try mp.int(&out, a, 300);
+    try mp.float(&out, a, 1.5);
+    try mp.str(&out, a, "kind");
+    try mp.str(&out, a, "x" ** 40);
+    // fixmap(2) "rows" fixarray(3) negfixint(-5) int16(300) float64 "kind" str8(40)
+    try std.testing.expectEqual(@as(u8, 0x82), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 0xa4), out.items[1]);
+    try std.testing.expectEqual(@as(u8, 0x93), out.items[6]);
+    try std.testing.expectEqual(@as(u8, 0xfb), out.items[7]);
+    try std.testing.expectEqual(@as(u8, 0xd1), out.items[8]);
+    try std.testing.expectEqual(@as(u8, 0xcb), out.items[11]);
+    try std.testing.expectEqual(@as(u8, 0xd9), out.items[25]);
+    try std.testing.expectEqual(@as(u8, 40), out.items[26]);
+    try std.testing.expectEqual(@as(usize, 67), out.items.len);
+}
 
 fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
     const bound = c.ZSTD_compressBound(src.len);

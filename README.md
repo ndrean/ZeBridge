@@ -2030,6 +2030,7 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 | --- | --- | --- |
 | `GENERATION_CADENCE_SECONDS` | 600 (300 in `.env.bridge`) | how often the producer cuts a generation |
 | `GENERATION_CHAIN_DEPTH` | 6 | generations kept per table and tenant; a full at least every depth |
+| `GENERATION_WORKERS` | 1 | builders for the early cuts of bursting streams; more re-cut those pairs in parallel, each on its own connections, so a round lasts as long as its longest build. The cadence tick builds in turn whatever this says. Memory: workers × the biggest full's MessagePack size |
 | `GC_THRESHOLD_MS` | 3600000 | the sweeper's age: a tombstone older than this is reaped (floor 60000) |
 | `CDC_MAX_AGE_SECONDS` | 3 × cadence | how long a CDC stream keeps an event |
 | `CDC_MAX_BYTES` | 1 GiB | a CDC stream's size cap, a disk valve |
