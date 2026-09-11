@@ -68,13 +68,28 @@ def pid_of(pattern):
     return int(r.stdout.split()[0]) if r.stdout.split() else 0
 
 
+# The three sides are compared on a VIEW of bounded cost whatever the table's size
+# (§10eu: the grow mix passes a million rows within the hour, and a string_agg over
+# them once a minute would have been the sting's own bottleneck): the live count and
+# the last thousand names in order. Same invariant, fixed cost.
+def pg_view():
+    n = zb.psql(f"SELECT count(*) FROM {T} WHERE deleted_at IS NULL AND some_text LIKE 'drip-%'", quiet=True).strip()
+    tail = zb.psql(f"SELECT string_agg(some_text, ',' ORDER BY some_text) FROM (SELECT some_text FROM {T} WHERE deleted_at IS NULL AND some_text LIKE 'drip-%' ORDER BY some_text DESC LIMIT 1000) t", quiet=True).strip()
+    return (int(n or 0), tail)
+
+
+def replica_view(c):
+    n = c.q(f"SELECT count(*) FROM {T} WHERE deleted_at IS NULL AND some_text LIKE 'drip-%'")[0][0]
+    rows = c.q(f"SELECT some_text FROM {T} WHERE deleted_at IS NULL AND some_text LIKE 'drip-%' ORDER BY some_text DESC LIMIT 1000")
+    return (int(n), ",".join(sorted(r[0] for r in rows)))
+
+
 def pg_texts():
-    out = zb.psql(f"SELECT string_agg(some_text, ',' ORDER BY some_text) FROM {T} WHERE deleted_at IS NULL AND some_text LIKE 'drip-%'", quiet=True).strip()
-    return out.split(",") if out else []
+    return pg_view()
 
 
 def replica_texts(c):
-    return sorted(r[0] for r in c.q(f"SELECT some_text FROM {T} WHERE deleted_at IS NULL AND some_text LIKE 'drip-%'"))
+    return replica_view(c)
 
 
 def count_where(c, table_like):
@@ -108,6 +123,7 @@ def main():
     ap.add_argument("--sweep-every", type=int, default=3600, help="seconds between `bridge_sweeper --once` runs; 0 = never")
     ap.add_argument("--emitter", default="bob")
     ap.add_argument("--watcher", default="mary")
+    ap.add_argument("--mix", choices=["trio", "grow"], default="trio", help="trio: INSERT+UPDATE+DELETE, the live set stays small; grow: INSERT+UPDATE only, the table grows — fulls inflate, deltas stay a cadence's rows (§10eu)")
     a = ap.parse_args()
     # The LIVE stack: ask its health endpoint (BRIDGE_PORT), not the process table — a
     # bridge started with arguments does not match the harness's anchored pgrep.
@@ -166,7 +182,7 @@ def main():
         if len(live) >= 2:
             em.mutate(T, "UPDATE", {"uid": live[-2]}, {"some_text": f"drip-{i-1:08d}", "temperature": 30 + (i % 50) / 10, "tags": ["drip", "touched"], "metadata": {"source": "drip", "touched": i}})
             ops["update"] += 1
-        if len(live) >= 3:
+        if len(live) >= 3 and a.mix == "trio":
             em.mutate(T, "DELETE", {"uid": live.pop(0)})
             ops["delete"] += 1
         # A slow sting waits 20 ms for its verdicts; a fast one (under 20 ms) waits not
@@ -210,7 +226,7 @@ def main():
             e_t, w_t = replica_texts(em), replica_texts(wa)
             minutes = round((time.monotonic() - t0) / 60, 1)
             rate = round(sum(ops.values()) / max(time.monotonic() - t0, 1), 1)
-            check(f"[{minutes} min, {i} ticks, {sum(ops.values())} writes, {rate}/s] live drip rows agree: PG {len(pg)}, emitter {len(e_t)}, watcher {len(w_t)}", e_t == pg == w_t)
+            check(f"[{minutes} min, {i} ticks, {sum(ops.values())} writes, {rate}/s] live drip rows agree: PG {pg[0]}, emitter {e_t[0]}, watcher {w_t[0]} (count + the last 1000 names)", e_t == pg == w_t)
             # A pending row is a failure only if it STAYS pending: across a bridge restart
             # the listener is down for seconds and the outbox holds the writes meanwhile —
             # which is the outbox doing its job. Up to a minute to drain.
@@ -241,8 +257,9 @@ def main():
         left = a.interval_ms / 1000 - (time.monotonic() - tick_at)
         if left > 0: time.sleep(left)
 
-    # ── wind down: tombstone what is still live, leave the tombstones to the sweeper ──
-    for uid in live:
+    # ── wind down: tombstone what is still live, leave the tombstones to the sweeper —
+    # the grow mix leaves its rows as a fixture ──
+    for uid in (live if a.mix == "trio" else []):
         em.mutate(T, "DELETE", {"uid": uid})
     for _ in range(30):
         em.poll(50); em.flush(20)

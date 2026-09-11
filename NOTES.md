@@ -10953,6 +10953,34 @@ What none of this changes: a burst that fills a whole cap inside one check inter
 is still the pause's case, and the cap must hold at least a few seconds of the worst
 burst for any early cut to land.
 
+## 10et. The TypeScript client no longer gives up on a missing chain (2026-09-11)
+
+CLIENTS item 4, open since §10cq and urgent since §10ei: the TypeScript client waited
+90 s for a table's chain at connect and then gave up for the life of the process —
+`syncedTables.delete`, `failed.add`, "NOT following CDC for it" — while libzb simply
+asks again at every poll. On a 300 s cadence that lost every table enabled between
+two producer ticks, and every chain that predates its stream (the wait §10ei
+introduced), until a reload. libzb's re-seed loop (§10du) already had the honest
+shape, no deadline, poll fast then slowly, say so once a minute.
+
+**What changed.** Past the first window the table stays registered and marked
+`unseeded`; its CDC events are HELD in the FK inbox under their own reason instead of
+applied to an unseeded table or dropped (bounded at 50,000 per table, past which they
+are dropped and said — a table that busy with no chain is a misconfiguration); a
+background loop asks for the chain every 15 s for as long as the connection lives and
+says so once a minute; when the chain lands the table seeds, the held events replay
+through the seed gate, and the counts update. `this.failed` is left to genuine seed
+failures.
+
+**Measured live.** A table created and enabled between two ticks of the live bridge
+(300 s cadence), a Node client connected before any chain existed, three rows
+inserted while it waited: "no generation chain after 90s — its events are held"; "still
+no chain (60s); 6 event(s) held"; at the producer's tick, "Seeded late_t from generation
+chain g1 (3 row(s))" and "chain landed after 90s — seeded; replaying 6 held event(s)";
+the query answered the three rows. The first attempt of the test measured nothing
+for fifteen minutes because `zebridge_enable` defaults to a dry run — the summary line
+says so, and the eye skipped it.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

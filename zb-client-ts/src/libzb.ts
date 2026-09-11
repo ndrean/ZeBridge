@@ -116,6 +116,12 @@ export type TableState = {
   /// after any bridge restart every replayed data event carried an older lsn and was
   /// dropped as "already seeded" (measured: two rows consumed, accounted, and absent).
   seedLsn?: number;
+  /// §10et: followed but not yet seeded — the chain was not there when this client
+  /// connected (a table enabled between two producer ticks, or a chain that
+  /// predates the stream, §10ei). Its CDC events are HELD, not applied and not
+  /// dropped, until the chain lands; a background loop keeps asking for it.
+  unseeded?: boolean;
+  unseededHeld?: number;
 };
 
 /// 'snapshot' means "seeded" — the name predates the retirement of
@@ -140,6 +146,8 @@ interface BucketEntry {
 const GENERATION_WAIT_MS = 90_000;
 const GENERATION_SLOW_POLL_MS = 15_000; // after the first window: the producer's cadence is minutes
 const GENERATION_POLL_MS = 10_000;
+/// §10et: events held for a table waiting for its chain, at most, per table.
+const UNSEEDED_HOLD_MAX = 50_000;
 /// Derived from bridge-side max_deliver × retry sleep + batch window + slack; see the
 /// verdict-timeout discussion in PROTOCOL §7 — a guess kept in step by hand until it
 /// rides in the schema descriptor.
@@ -1285,6 +1293,39 @@ export class ZeBridge {
   /// its children still reference — measured: "FOREIGN KEY constraint failed" on
   /// the first kick). Off at the first, back on after the last, like the connect path.
   private fkHolds = 0;
+  /// §10et: keep asking for a table's chain after the connect-time wait ran out,
+  /// without a deadline; when it lands, seed, then replay what was held meanwhile.
+  private lateSeeds = new Set<string>();
+  private waitForChain(table: string) {
+    const state = this.syncedTables.get(table);
+    if (!state || this.lateSeeds.has(table)) return;
+    state.unseeded = true;
+    state.unseededHeld = 0;
+    this.lateSeeds.add(table);
+    void (async () => {
+      const started = Date.now();
+      let lastSaid = started;
+      while (this.nc && this.syncedTables.get(table)?.unseeded) {
+        await new Promise((r) => setTimeout(r, GENERATION_SLOW_POLL_MS));
+        if (!this.nc) return;
+        if (await this.applyGenerations(table)) {
+          const st = this.syncedTables.get(table);
+          if (st) { st.unseeded = false; }
+          this.reach('snapshot');
+          this.appendLog('SYS', `${table}: chain landed after ${Math.round((Date.now() - started) / 1000)}s — seeded; replaying ${st?.unseededHeld ?? 0} held event(s)`, 'INFO');
+          await this.drainPending(table);
+          this.scheduleRecount();
+          return;
+        }
+        if (Date.now() - lastSaid >= 60_000) {
+          lastSaid = Date.now();
+          this.appendLog('SYS', `${table}: still no chain (${Math.round((Date.now() - started) / 1000)}s); ${this.syncedTables.get(table)?.unseededHeld ?? 0} event(s) held`, 'INFO');
+        }
+      }
+    })().catch((e) => this.appendLog('SYS', `${table}: late seed failed: ${e}`, 'ERROR'))
+      .finally(() => this.lateSeeds.delete(table));
+  }
+
   private kickReseed(table: string) {
     if (!this.nc || this.resyncing || this.reseedKicks.has(table)) return;
     const loop = (async () => {
@@ -1522,6 +1563,19 @@ export class ZeBridge {
   private async applyEvent(table: string, ev: any, exec: Exec = this.run, seed = false) {
     const state = this.syncedTables.get(table);
     if (!state || !ev?.data) return;
+    // §10et: a table still waiting for its chain holds its events — applying them to
+    // an unseeded table diverges silently, dropping them loses them for good. The
+    // hold is the FK inbox with its own reason; the late seed replays it, and the
+    // seed gate then drops what the chain already carries. Bounded: past the cap the
+    // events are dropped and said, and the table needs a reconnect once its chain
+    // exists — a table this busy with no chain for this long is a misconfiguration.
+    if (state.unseeded && !seed) {
+      const held = (state.unseededHeld ?? 0) + 1;
+      state.unseededHeld = held;
+      if (held <= UNSEEDED_HOLD_MAX) { await this.holdEvent(table, ev, 'unseeded'); return; }
+      if (held === UNSEEDED_HOLD_MAX + 1) this.appendLog('SYS', `${table}: ${UNSEEDED_HOLD_MAX} events held while waiting for a chain that never came — dropping further events; reconnect once the producer has built one`, 'ERROR');
+      return;
+    }
 
     // Strictly `<`, never `<=`: the first post-snapshot commit carries the watermark
     // LSN itself — skipping it loses exactly one row per snapshot (measured).
@@ -2155,12 +2209,15 @@ export class ZeBridge {
                 return;
               }
             }
-            // Unseeded is NOT the same as synced: following CDC against an unseeded
-            // table diverges silently — strictly worse than being visibly absent.
-            this.syncedTables.delete(table);
-            this.failed.add(table);
-            this.scheduleRecount();
-            this.appendLog('SYS', `Giving up on ${table}: no generation chain after ${GENERATION_WAIT_MS / 1000}s — NOT following CDC for it. Check the producer (GENERATIONS_ENABLED, its cadence, and the gen-<tenant> object store); the table seeds on the next connect once a chain exists. Snapshot-on-demand is gone (NOTES §10h/§10p).`, 'ERROR');
+            // §10et: past the first window, the wait goes to the background — this
+            // used to give up for the life of the process ("NOT following CDC for
+            // it"), which on a 300 s cadence meant every table enabled between two
+            // ticks, and every chain that predates its stream (§10ei), was lost until
+            // a reload. Unseeded is NOT synced: the table stays registered, its
+            // events are held (applyEvent), and the loop below asks for the chain
+            // for as long as the connection lives, saying so once a minute.
+            this.appendLog('SYS', `${table}: no generation chain after ${GENERATION_WAIT_MS / 1000}s — its events are held and the chain is asked for every ${GENERATION_SLOW_POLL_MS / 1000}s; the table seeds the moment the producer builds one (GENERATIONS_ENABLED, its cadence, the gen-<tenant> object store)`, 'WARNING');
+            this.waitForChain(table);
             return;
           }
         })().catch((e) => {

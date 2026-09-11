@@ -103,9 +103,9 @@ row a rule is named.
    fresh client a 90 s wait and a permanent exclusion (item 3 of §10cq). libzb's
    explicit list is immune. Two fixes, not exclusive: a `tables` option, and the
    bridge purging keys for tables no longer in the publication at boot.
-4. **Missing chain: retry or exclude.** libzb retries on the next sync; the TypeScript
-   client gives up for the process's life. A retryable exclusion is the open product
-   question of §10cq item 3.
+4. ~~Missing chain: retry or exclude~~ — closed 2026-09-11 (§10et): the TypeScript client
+   keeps the table, holds its events (bounded) and asks for the chain without a deadline;
+   the late seed replays what was held. Measured live on a table enabled between two ticks.
 5. **Chain-orphan check** is built in neither. Retention ≥ cadence keeps it rare, not
    impossible.
 
