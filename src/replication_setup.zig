@@ -117,7 +117,7 @@ pub const ReplicationSetup = struct {
         const status = std.mem.span(c.PQgetvalue(res, 0, 0));
         if (std.mem.eql(u8, status, "lost")) {
             log.err("🔴 FATAL: replication slot '{s}' is INVALIDATED (wal_status = lost): PostgreSQL discarded the WAL it retained for this bridge (max_slot_wal_keep_size). Every change since is gone from the feed; no restart can recover it.", .{slot_name});
-            log.err("   Recovery: SELECT pg_drop_replication_slot('{s}'); then start the bridge ONCE with ZB_FEED_RESTART=1 — it creates a new slot, restarts the CDC streams and the chains, and every client re-seeds from a fresh full (NOTES §10bm).", .{slot_name});
+            log.err("   Recovery: ADMIN_DATABASE_URL=… bridge --drop-slot {s} (or SELECT pg_drop_replication_slot('{s}')); then start the bridge ONCE with ZB_FEED_RESTART=1 — it creates a new slot, restarts the CDC streams and the chains, and every client re-seeds from a fresh full (NOTES §10bm).", .{ slot_name, slot_name });
             return error.SlotInvalidated;
         }
         if (std.mem.eql(u8, status, "unreserved")) {

@@ -537,11 +537,15 @@ The Sweeper captures this lifecycle to emit lightweight telemetry about the garb
 
 ### Slots
 
-If you start an instance, it will create a slot to the WAL. When you stop the instance, it does not remove the slot by default. If left unattended, the WAL will grow until `max_slot_wal_keep_size`, invalidate the slot and recycle the WAL. ❗️ TO BE CHECKED.
+A bridge creates its replication slot at its first start and leaves it in place when it stops: the slot is the bridge's bookmark in the WAL, and a restart resumes from it without a client noticing. That bookmark is also a promise PostgreSQL keeps on the bridge's behalf. Every WAL segment written after the slot's `restart_lsn` is retained on disk until the slot confirms it, so a slot that nobody reads, an instance stopped for good or renamed, keeps the WAL growing at the database's full write rate while every dashboard of the bridge that matters stays green. Three settings decide how far that goes:
 
-💡 **Check your slots**: The DBA can use the CLI or check directly into Postgres:
+| setting | role | what it means for a slot |
+| --- | --- | --- |
+| `max_wal_size` | a checkpoint trigger, not a limit | PostgreSQL starts a checkpoint when WAL grows past it; a checkpoint recycles segments only if nothing still needs them. A slot needs them, so WAL grows past this value without a word |
+| `wal_keep_size` | a floor | segments kept for standbys that stream **without** a slot; `0` by default and irrelevant to the bridge, which has one |
+| `max_slot_wal_keep_size` | the hard limit | once a slot's retained WAL passes it, the next checkpoint discards those segments and marks the slot `lost`. The bridge refuses to start on a lost slot: drop it, start once with `ZB_FEED_RESTART=1`, and every client re-seeds from a fresh full |
 
-🔔 The bridge CLI helpers: (🛑 TODO)
+`-1`, PostgreSQL's default for the hard limit, means "retain for ever", which is a full disk instead of a lost slot; a value like `10GB` turns the worst case from an outage of the database into a re-seed of the clients. PostgreSQL also states the runway itself: `pg_replication_slots.safe_wal_size` is how many more bytes can be written before the slot is invalidated, and `wal_status` moves from `reserved` through `extended` and `unreserved` to `lost` on the way. The bridge's inventory publishes the retained bytes per slot on `/metrics`, warns at boot when its own slot reads `unreserved`, and gives an operator the whole picture from a shell:
 
 ```sh
 bridge --view-slots                                   # every slot: active, pid, LSNs, retained WAL
