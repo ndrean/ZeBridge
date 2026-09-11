@@ -13,6 +13,7 @@ const msgpack = @import("msgpack");
 const pgoutput = @import("pgoutput.zig");
 const SPSCQueue = @import("spsc_queue.zig").SPSCQueue;
 const Config = @import("config.zig");
+const hot_streams = @import("hot_streams.zig");
 const encoder_mod = @import("encoder.zig");
 const Metrics = @import("metrics.zig").Metrics;
 
@@ -409,6 +410,8 @@ pub const BatchPublisher = struct {
     publisher: *nats_publisher.Publisher,
     config: BatchConfig,
     metrics: ?*Metrics, // Optional metrics reference
+    /// §10er: the burst mark per stream, fed on every publish.
+    hot: ?*hot_streams.HotStreams = null,
 
     // Pre-allocated ring buffer of CDCEvent structs (zero malloc/free!)
     // Allocated once at startup, reused for entire lifetime
@@ -496,6 +499,7 @@ pub const BatchPublisher = struct {
         /// than read off `runtime_config.max_columns_override` because that field can
         /// be null (auto-detect); this parameter never is.
         max_columns: u16,
+        hot: ?*hot_streams.HotStreams,
     ) !*BatchPublisher {
         // 1. The actual number of events the user wants
         const event_count = runtime_config.batch_ring_buffer_size;
@@ -621,6 +625,7 @@ pub const BatchPublisher = struct {
             .publisher = publisher,
             .config = config,
             .metrics = metrics,
+            .hot = hot,
             .events = events,
             .data_slab = data_slab,
             .columns_slab = columns_slab,
@@ -968,6 +973,7 @@ pub const BatchPublisher = struct {
         try self.publisher.publish(subject, msg_id, data);
         const elapsed_ns = utils.nanoTimestamp() - t0;
         if (self.metrics) |m| m.recordPublishAck(elapsed_ns);
+        if (self.hot) |h| h.account(subject, data.len);
         log.debug("publish→ack {d} µs on {s}", .{ elapsed_ns / std.time.ns_per_us, subject });
     }
 

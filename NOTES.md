@@ -10887,6 +10887,43 @@ or more and the watch never fires.
 interval, and that remains the pause's case (§10ej). The worker pool stays behind
 both as headroom.
 
+## 10er. The burst trigger: the publisher marks a stream hot, the producer reads that stream within a second (2026-09-11)
+
+§10eq's edge watch polled every cut stream every five seconds — a `STREAM.INFO` per
+stream per five seconds, a cost that scales with tenants for a question that only
+matters on the streams that move. The user's cut: watch bursts, and let the one thread
+that causes them say so. The batch publisher pushes every byte of every stream; on
+each publish it now accounts the stream's bytes and messages for the current second
+(`hot_streams.zig`, a spin-locked map the flush thread writes and the producer's
+thread reads) and marks the stream hot past a threshold — what would fill a tenth of
+the cap within a minute, never under 1 MiB/s or 1,000 msg/s — for ten seconds past
+the last hot second. The producer's one-second wake-up reads the hot streams alone;
+the full scan of every cut stream drops to a quarter of the cadence, five seconds at
+least, as the safety net for the slow cases. Cost scales with bursts, not tenants.
+
+**Measured.** A 64 MiB cap, the 75,000-row pair re-stamped thirty times in sequence
+(each `UPDATE` of 75,000 rows takes ~30 s on this table — two row triggers and a
+bloated heap — so about 2.4 MB/s of events, and the cap full after half a minute):
+the mark fired in the first second ("1222 KB and 6 message(s) in one second — hot");
+the fill trigger read the stream at 100% of its cap, pruning 40 messages a second,
+and re-cut the pair four times at 200–230 ms each, plus the idle pairs riding the
+same stream; no chain fell off during the burst. Two lessons from the run itself:
+
+- **a CDC message is a batch**, up to 5,000 events, so a stream at its byte cap holds
+  a few hundred messages and "the oldest quarter" of that span was seconds of margin
+  at a burst's prune rate — the fill trigger now fires at half the span; and a 20,000-row
+  burst against a 10,000-MESSAGE cap made ten messages and pruned nothing, which is
+  why the byte cap is the one a burst meets;
+- **the ring's back-pressure warning was a log flood**: a 75,000-row transaction
+  against an 8,192-slot ring halts the reader nine times per transaction, the halt
+  loop spun ~100,000 yields a second, and "warn every hundred retries" wrote 924,000
+  lines in fifteen minutes. Once at the first retry, then once a second with the
+  time halted; past a thousand retries the loop sleeps a tenth of a millisecond
+  instead of yielding; the resume line only for a halt of a second or more.
+
+**Also seen:** thirty concurrent `UPDATE`s of the same rows deadlock each other in
+PostgreSQL, which was my test and not the bridge — sequential from then on.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

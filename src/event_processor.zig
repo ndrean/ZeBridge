@@ -837,6 +837,7 @@ pub const EventProcessor = struct {
         var retry_count: usize = 0;
         const max_retries_before_fatal_check = Config.Retry.spins_before_fatal_check;
         const timer_start: u64 = nanoNow();
+        var last_warn_ns: u64 = 0;
         const watchdog_timeout_ns = std.time.ns_per_s * 30; // 30 second hard timeout
 
         const slot_idx = while (true) {
@@ -872,21 +873,35 @@ pub const EventProcessor = struct {
                 }
             }
 
-            // Log warning on first retry, then periodically
-            if (retry_count == 1 or retry_count % 100 == 0) {
+            // Said once at the first retry, then once a SECOND — not every hundred
+            // retries. A 75,000-row transaction against an 8,192-slot ring halts the
+            // reader nine times per transaction and spins ~100,000 retries a second on
+            // the yield; "every hundred" wrote 924,000 lines in a fifteen-minute burst
+            // (§10er), a thousand a second, the one thing a log must never do.
+            const now_ns = nanoNow();
+            if (retry_count == 1 or now_ns - last_warn_ns >= std.time.ns_per_s) {
+                last_warn_ns = now_ns;
                 log.warn(
-                    "⚠️ Ring buffer full! Applying backpressure (retry #{d}). Capacity: {d}",
-                    .{ retry_count, self.batch_publisher.events.len },
+                    "⚠️ Ring buffer full ({d} slots): back-pressuring the WAL reader, {d} ms so far ({d} retries)",
+                    .{ self.batch_publisher.events.len, @divFloor(now_ns - timer_start, std.time.ns_per_ms), retry_count },
                 );
             }
 
-            // Yield CPU to flush thread
-            std.Thread.yield() catch {};
+            // Yield to the flush thread; past the first thousand retries the wait is
+            // the broker's, not a scheduling hiccup, and a spinning yield only heats
+            // a core — sleep a tenth of a millisecond instead.
+            if (retry_count < 1000) std.Thread.yield() catch {} else utils.sleep(100 * std.time.ns_per_us);
         };
 
-        // Success - got a free slot!
+        // Success - got a free slot! Worth a line only when the halt was long enough
+        // to have been said above; the routine nine-per-transaction halts stay at debug.
         if (retry_count > 0) {
-            log.info("Ring buffer slot available after {d} retries, resuming", .{retry_count});
+            const halted_ns = nanoNow() - timer_start;
+            if (halted_ns >= std.time.ns_per_s) {
+                log.info("Ring buffer slot available after {d} ms ({d} retries), resuming", .{ @divFloor(halted_ns, std.time.ns_per_ms), retry_count });
+            } else {
+                log.debug("ring: slot after {d} retries", .{retry_count});
+            }
         }
 
         // Get mutable reference to the pre-allocated event slot

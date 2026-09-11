@@ -20,6 +20,7 @@ const nkey_gen = @import("nkey_gen.zig");
 const nats_init = @import("nats_init.zig");
 const admin_revoke = @import("admin_revoke.zig");
 const admin_slots = @import("admin_slots.zig");
+const hot_streams = @import("hot_streams.zig");
 const publication_mod = @import("publication.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
@@ -262,6 +263,7 @@ fn initBatchPublisher(
     metrics: *metrics_mod.Metrics,
     runtime_config: *const Config.RuntimeConfig,
     max_columns: u16,
+    hot: *hot_streams.HotStreams,
 ) !*batch_publisher.BatchPublisher {
     const batch_config = batch_publisher.BatchConfig{
         .max_events = runtime_config.batch_max_events,
@@ -279,6 +281,7 @@ fn initBatchPublisher(
         metrics,
         runtime_config,
         max_columns,
+        hot,
     );
 }
 
@@ -1153,6 +1156,12 @@ pub fn main(init: std.process.Init) !void {
     var publisher = try initNatsPublisher(allocator, &metrics, nats_endpoint, io);
     defer publisher.deinit();
 
+    // §10er: which streams are bursting — written by the batch publisher on every
+    // publish, read by the producer's edge watch every second. Declared here because
+    // the producer is built before the batch publisher.
+    var hot = hot_streams.HotStreams.init(allocator, &runtime_config.topology, runtime_config.cdc_max_bytes, runtime_config.cdc_max_msgs);
+    defer hot.deinit();
+
     // §10dc: fleet observability — the clients' heartbeats, read on their own cadence.
     var fleet_mon = fleet_monitor.FleetMonitor.init(
         allocator,
@@ -1297,6 +1306,7 @@ pub fn main(init: std.process.Init) !void {
             runtime_config.generation_cadence_seconds,
             runtime_config.generation_chain_depth,
             @as(usize, 1) << @intCast(runtime_config.event_data_buffer_log2),
+            &hot,
         );
         try gp.start();
         gen_producer = gp;
@@ -1416,6 +1426,7 @@ pub fn main(init: std.process.Init) !void {
         &metrics,
         &runtime_config,
         resolved_max_columns,
+        &hot,
     );
     // Start flush thread - batch_pub is now at stable heap address
     try batch_pub.start();

@@ -54,6 +54,7 @@ const pgoutput = @import("pgoutput.zig");
 const nats = @import("nats");
 const topology_mod = @import("topology.zig");
 const c_imports = @import("c_imports.zig");
+const hot_streams = @import("hot_streams.zig");
 const c = c_imports.c;
 
 const log = std.log.scoped(.generation_producer);
@@ -94,7 +95,11 @@ pub const GenerationProducer = struct {
     /// Per CDC stream: `first_seq` at the previous edge check and when it was read —
     /// the prune rate is the difference over the interval.
     edges: std.StringArrayHashMapUnmanaged(Edge) = .empty,
-    edge_check_seconds: u64 = 5,
+    /// §10er: the full scan of every cut stream, a quarter of the cadence apart (five
+    /// seconds at least) — the safety net; the streams that burst are read within a
+    /// second, on the publisher's mark.
+    edge_scan_seconds: u64 = 5,
+    hot: ?*hot_streams.HotStreams = null,
     /// The CDC per-event buffer (2^BASE_BUF). The chain has no per-row ceiling —
     /// object chunking removes it — so the producer is where a row too wide for
     /// CDC gets DETECTED (the retirement survivor of the snapshot path's
@@ -129,8 +134,11 @@ pub const GenerationProducer = struct {
         cadence_seconds: u64,
         chain_depth: u32,
         event_buf_bytes: usize,
+        hot: ?*hot_streams.HotStreams,
     ) GenerationProducer {
         return .{
+            .hot = hot,
+            .edge_scan_seconds = @max(5, cadence_seconds / 4),
             .allocator = allocator,
             .pg_config = pg_config,
             .book_config = book_config,
@@ -184,10 +192,17 @@ pub const GenerationProducer = struct {
                     log.info("🧬 kicked: a seed epoch moved — cutting the next generation now, not at the cadence", .{});
                     break;
                 }
-                // §10eq: between ticks, watch the streams' edges and re-cut a pair whose
-                // splice is about to break — the cadence is no longer the reaction time.
-                if (slept > 0 and slept % self.edge_check_seconds == 0) {
-                    self.edgeCheck() catch |err| log.debug("🧬 edge check skipped: {}", .{err});
+                // §10eq/§10er: between ticks, watch the edges — the bursting streams every
+                // second on the publisher's mark, every cut stream on the slow scan — and
+                // re-cut a pair whose splice is about to break.
+                if (self.hot) |h| {
+                    var ha = std.heap.ArenaAllocator.init(self.allocator);
+                    defer ha.deinit();
+                    const names = h.hotNow(ha.allocator()) catch &.{};
+                    if (names.len > 0) self.edgeCheck(names) catch |err| log.debug("🧬 edge check skipped: {}", .{err});
+                }
+                if (slept > 0 and slept % self.edge_scan_seconds == 0) {
+                    self.edgeCheck(null) catch |err| log.debug("🧬 edge check skipped: {}", .{err});
                 }
                 utils.sleep(1 * std.time.ns_per_s);
             }
@@ -216,8 +231,15 @@ pub const GenerationProducer = struct {
     ///      while the stream prunes at all.
     ///
     /// A stream that is not pruning and not filling costs one STREAM.INFO per check.
-    fn edgeCheck(self: *GenerationProducer) !void {
+    fn edgeCheck(self: *GenerationProducer, only_streams: ?[]const []const u8) !void {
         if (self.cuts.count() == 0) return;
+        const wanted = struct {
+            fn in(list: ?[]const []const u8, name: []const u8) bool {
+                const l = list orelse return true;
+                for (l) |n| if (std.mem.eql(u8, n, name)) return true;
+                return false;
+            }
+        };
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
@@ -236,7 +258,7 @@ pub const GenerationProducer = struct {
         var reads: std.StringArrayHashMapUnmanaged(StreamRead) = .empty;
         const now_ms = utils.unixMillis();
         for (self.cuts.values()) |cut| {
-            if (reads.contains(cut.stream)) continue;
+            if (reads.contains(cut.stream) or !wanted.in(only_streams, cut.stream)) continue;
             var info = js.getStreamInfo(cut.stream) catch continue;
             defer info.deinit();
             const st = info.value.state;
@@ -261,16 +283,20 @@ pub const GenerationProducer = struct {
             const margin_msgs: i64 = @as(i64, @intCast(cut.cutoff_seq)) - @as(i64, @intCast(r.first));
             const span: i64 = @max(@as(i64, @intCast(r.last)) - @as(i64, @intCast(r.first)), 1);
             const margin_s: f64 = if (margin_msgs <= 0) 0 else if (r.rate > 0) @as(f64, @floatFromInt(margin_msgs)) / r.rate else std.math.inf(f64);
-            const need_s: f64 = 3.0 * @as(f64, @floatFromInt(@max(cut.build_ms, 50))) / 1000.0 + @as(f64, @floatFromInt(self.edge_check_seconds));
+            const need_s: f64 = 3.0 * @as(f64, @floatFromInt(@max(cut.build_ms, 50))) / 1000.0 + @as(f64, @floatFromInt(if (only_streams != null) 1 else self.edge_scan_seconds));
             const by_rate = r.rate > 0 and margin_s < need_s;
-            const by_fill = r.fill >= 0.8 and margin_msgs < @divTrunc(span, 4);
+            // Half the span, not a quarter: CDC messages are batches of up to 5,000
+            // events, so a stream at its byte cap holds a few hundred of them and a
+            // quarter is seconds of margin at a burst's prune rate — one early cut in
+            // a 15-minute burst still fell off between two one-second checks (§10er).
+            const by_fill = r.fill >= 0.8 and margin_msgs < @divTrunc(span, 2);
             const by_floor = r.rate > 0 and margin_msgs < @divTrunc(span, 10);
             if (by_rate or by_fill or by_floor) {
                 log.warn("🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest ({s}{s}{s})", .{
                     cut.tenant,                                    cut.table, cut.stream, span, r.fill * 100, r.rate, @max(margin_msgs, 0),
                     if (by_rate) "the rate leaves under the build time" else "",
-                    if (by_fill) "the fill is past 80% and the cut sits in the oldest quarter" else "",
-                    if (!by_rate and !by_fill) "the cut is within a tenth of the span" else "",
+                    if (by_rate and by_fill) "; " else "",
+                    if (by_fill) "the fill is past 80% and the cut sits in the oldest half" else if (!by_rate) "the cut is within a tenth of the span" else "",
                 });
                 try urgent.append(alloc, cut);
             }
