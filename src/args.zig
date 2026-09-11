@@ -18,6 +18,10 @@ const usage =
     \\  --diagnose      Pre-run doctor: report everything boot would decide, write nothing
     \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
+    \\  --view-slots    Every replication slot on the server: active, pid, LSNs, retained WAL
+    \\  --view-slot <slot>  The same for one slot
+    \\  --drop-slot <slot>  Drop an INACTIVE slot (frees its retained WAL). Needs
+    \\                  ADMIN_DATABASE_URL for the invocation, never stored in env
     \\                  Needs ADMIN_DATABASE_URL for the invocation (never stored in env)
     \\
     \\Environment:
@@ -99,7 +103,7 @@ pub const gen_nkey_flag = "--gen-nkey";
 
 /// Flags that REPLACE the program instead of configuring it: they read no environment,
 /// open nothing, and their whole output IS the answer.
-pub const EarlyExit = enum { help, gen_nkey, init_nats, revoke };
+pub const EarlyExit = enum { help, gen_nkey, init_nats, revoke, view_slots, view_slot, drop_slot };
 
 /// Answered from argv by `main` BEFORE the log level is resolved and before anything
 /// else prints — boot noise on stderr is noise in a command meant to be piped
@@ -118,6 +122,9 @@ pub fn earlyExit(init: *const std.process.Init) ?EarlyExit {
         if (std.mem.eql(u8, arg, gen_nkey_flag)) return .gen_nkey;
         if (std.mem.eql(u8, arg, "--init-nats")) return .init_nats;
         if (std.mem.eql(u8, arg, "--revoke")) return .revoke;
+        if (std.mem.eql(u8, arg, "--view-slots")) return .view_slots;
+        if (std.mem.eql(u8, arg, "--view-slot")) return .view_slot;
+        if (std.mem.eql(u8, arg, "--drop-slot")) return .drop_slot;
     }
     return null;
 }

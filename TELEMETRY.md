@@ -28,30 +28,8 @@ Data emitted by ZeBridge are self-reflection, or owned by ZeBridge (public.zebri
 Two exceptions: 
 
 * the consumer fleet count signaling themselves via NATS, a small complement to the NATS-exporter data connected to the NATS server, scraped by Prometheus, 
-* the number of slots on the owned publication (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandonned slot point).
+* the number of slots on the owned publication (for left-overs: Postgres will keep retaining all the WAL data generated beyond the possibly abandoned slot point). The same inventory from a shell: `bridge --view-slots`; the cure: `bridge --drop-slot <slot>` (README, [CLI](README.md#cli)).
 
-💡 **Check your slots**: The DBA can check directly into Postgres:
-
-```sql
-#psql>
-SELECT slot_name, active,
-         pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
-  FROM pg_replication_slots
-  WHERE slot_name = 'my_slot';
-```
-
-💡 Drop one if unused:
-
-```sql
-SELECT pg_drop_replication_slot('my_slot');
-```
-
-💡 Clean the WAL with:
-
-```sql
-#psql>
-CHECKPOINT;
-```
 
 ---
 
@@ -80,6 +58,11 @@ bridge_cpu_seconds_total 7.600
 bridge_max_rss_bytes 1526153216
 bridge_refused_tables 0
 bridge_refused_events_dropped_total 0
+bridge_schema_events_published_total 21
+bridge_nats_publishes_total 213
+bridge_nats_publish_ack_seconds_total 0.104422
+bridge_gc_total_reaped_total 3371
+bridge_gc_last_sweep_timestamp_seconds 1757170050
 bridge_fleet_poll_timestamp_seconds 1757170200
 bridge_fleet_clients_live_total 3
 bridge_fleet_clients_live{tenant="kilo"} 2
@@ -93,17 +76,25 @@ bridge_replication_slot_active{slot="my_slot",type="logical",self="true"} 1
 bridge_replication_slot_retained_wal_bytes{slot="my_slot",type="logical",self="true"} 51344
 bridge_replication_slot_active{slot="zb_standby",type="physical",self="false"} 0
 bridge_replication_slot_retained_wal_bytes{slot="zb_standby",type="physical",self="false"} 734003200
+bridge_cdc_window_seconds{stream="CDC_PUBLIC"} 812
+bridge_cdc_window_seconds{stream="CDC_kilo"} 263
+bridge_cdc_window_short{stream="CDC_PUBLIC"} 0
+bridge_cdc_window_short{stream="CDC_kilo"} 1
+bridge_cdc_stream_bytes{stream="CDC_kilo"} 806320080
+bridge_cdc_stream_messages{stream="CDC_kilo"} 1236512
 ```
 
 </details>
 <br>
 
-Two families come from the bridge's own schedules, not from the WAL loop (NOTES §10dc):
+Four families come from the bridge's own schedules or from events it intercepts, not from the WAL loop (NOTES §10dc, §10eg):
 
 | family | source | cadence | what to read |
 | --- | --- | --- | --- |
 | `bridge_fleet_*` | the clients' heartbeats in the `live` KV bucket (PROTOCOL §9): each client writes `{principal, tenant, ts, streams: {stream: applied seq}}` every `heartbeatMs` | read every `FLEET_POLL_SECONDS` (60); a client silent for `FLEET_TTL_SECONDS` (90) drops out of the bucket by itself | `clients_live` per tenant, `last_seen_seconds` per client, `lag_events` per client and stream: stream head minus the sequence the client applied, in **messages** (a published batch counts one, not one per row) |
 | `bridge_replication_slot_*` | `pg_replication_slots` on the reader's server — every slot, this bridge's marked `self="true"` | every `SLOT_INVENTORY_SECONDS` (300); the first pass lands one interval after boot | an inactive slot whose retained WAL climbs is an abandoned instance holding the disk; `bridge_replication_slots` is the count |
+| `bridge_cdc_window_*`, `bridge_cdc_stream_*` | each CDC stream's state, read by the same fleet poll | every `FLEET_POLL_SECONDS` | the window a stream really holds (now minus its oldest event, `-1` when empty) against the two-cadence floor the chain needs; `short = 1` means the stream is pruning under that floor, so a size or message valve, not the age, is ending the window — see README, [Catching up](README.md#catching-up-the-chain-and-the-stream) |
+| `bridge_gc_*` | the sweeper's `zebridge_gc_watermark` writes, seen on the WAL | at every sweep | rows reaped and when, counted since this bridge started (`0` until the first sweep it sees) |
 
 The four worth alerting on:
 
@@ -113,8 +104,9 @@ The four worth alerting on:
 | `bridge_refused_events_dropped_total` | `increase() > 0` | rows are being discarded right now for a suspended table |
 | `bridge_fleet_clients_live{tenant}` | drops | clients heartbeating inside the live bucket's TTL (PROTOCOL §9); a fleet going quiet is visible here before anyone complains |
 | `bridge_fleet_client_lag_events{tenant,principal,stream}` | `> N` for minutes | that client is falling behind on that stream — stream head minus what it applied, in messages |
-| `bridge_replication_slot_active{slot,type,self}` | `== 0` with retained WAL climbing | a slot nobody reads — an abandoned instance (NOTES §10da): `SELECT pg_drop_replication_slot(...)` once you are sure |
+| `bridge_replication_slot_active{slot,type,self}` | `== 0` with retained WAL climbing | a slot nobody reads — an abandoned instance (NOTES §10da): `bridge --view-slots` to see it from a shell, `ADMIN_DATABASE_URL=… bridge --drop-slot <slot>` once you are sure (it refuses an active slot); PostgreSQL frees the WAL at its next `CHECKPOINT` |
 | `bridge_replication_slot_retained_wal_bytes{slot,type,self}` | growing for an inactive slot | WAL PostgreSQL keeps for that slot; every slot on the server, not only this bridge's |
+| `bridge_cdc_window_short{stream}` | `== 1` | that stream holds less than two generation cadences and is pruning: a client that falls off it can find a chain that predates it and waits. Raise `CDC_MAX_BYTES` / `CDC_MAX_MSGS` if `bridge_cdc_stream_bytes` or `_messages` sits at a cap, `CDC_MAX_AGE_SECONDS` otherwise |
 | `bridge_wal_confirmed_lag_bytes` | rising steadily | **the bridge is behind**: WAL it has not confirmed yet. This is the backlog number. |
 | `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is _retaining_ on disk for the slot, until `max_slot_wal_keep_size` |
 | `bridge_connected` | `== 0` | the replication stream is down |
@@ -133,6 +125,7 @@ The four worth alerting on:
 * `bridge_cpu_seconds_total` is a counter over all threads, so `rate(bridge_cpu_seconds_total[1m])` gives cores used — `0.31` is a third of a core,
 `1.0` is one core saturated, and a single-threaded reader that pins a whole core is telling you it is the bottleneck.
 The same figure appears _in the log_ as `cpu=31%` on each `LOOP` line, which beats trying to isolate one process in `htop`.
+* `rate(bridge_nats_publish_ack_seconds_total[1m]) / rate(bridge_nats_publishes_total[1m])` is the mean time a JetStream publish waits for its PubAck — the NATS side of "who is slow" when `bridge_queue_usage_percent` climbs.
 * `bridge_max_rss_bytes` is peak RSS: expect it to sit near `2^BASE_BUF × RING_BUFFER_COUNT` plus metadata, since the slab is pre-allocated at startup.
 
 **Configure Prometheus to scrape this endpoint**:
@@ -169,7 +162,9 @@ scrape_configs:
   "max_rss_mb": 1455,
   "queue_usage_percent": 0,
   "refused_tables": 0,
-  "refused_events_dropped": 0
+  "refused_events_dropped": 0,
+  "gc_total_reaped": 3371,
+  "gc_last_sweep_time": 1757170050
 }
 ```
 
@@ -185,11 +180,11 @@ scrape_configs:
 Nothing is written to stdout, so `> logs.txt` captures an empty file. Redirect with `2>`:
 
 ```bash
-zebridge --slot my_slot --pub my_pub 2>> bridge.log
+bridge --slot my_slot --pub my_pub 2>> bridge.log
 ```
 
 `LOG_LEVEL` (`debug|info|warn|err`, default `info`) decides what reaches the file.
-At `info` the volume is small — the `METRICS` line every 15 s is ~5 700 lines/day — and everything worth keeping is included.
+At `info` the volume is small — the `METRICS` and `LOOP` lines every 15 s are ~11 500 lines/day, the generation producer adds a few per cadence — and everything worth keeping is included.
 **Do not point a file sink at `debug`.**
 
 ⚠️ The level _names_ differ between input and output: you set `LOG_LEVEL=warn` but the lines read `warning(scope):`.

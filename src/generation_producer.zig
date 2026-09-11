@@ -1120,10 +1120,14 @@ pub const GenerationProducer = struct {
             }
         }
 
-        log.info("🧬 g{d} for '{s}'/'{s}': {s}{s}{s} → {s} (cutoff {s} @ {s})", .{
+        // The duration is the number the retention contract needs (§10em): the CDC
+        // window must cover two cadences AND this, since the cut is taken before the
+        // build and must still be in the stream when the manifest is live.
+        log.info("🧬 g{d} for '{s}'/'{s}': {s}{s}{s} → {s} (cutoff {s} @ {s}) in {d} ms", .{
             gen,                              tenant,                                      table,
             if (build_delta) "delta" else "", if (build_delta and build_full) "+" else "", if (build_full) "full" else "",
             bucket,                           cutoff_version,                              lsn,
+            utils.unixMillis() - build_started_ms,
         });
         if (build_delta) log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, delta_payload.?.len });
         if (build_full) log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, full_payload.?.len });

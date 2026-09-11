@@ -10730,6 +10730,45 @@ history 1 on the broker, one watermark row per table on the replica.
 **And a fresh replica no longer reports a healed gap:** its first position is the
 stream's oldest message, set silently.
 
+## 10em. The build measured, and the README given one place to say it (2026-09-11)
+
+The retention contract of §10eg–§10ej was stated in cadences; the real floor is two
+cadences plus a build plus a seed, and nobody had timed a build end to end. Every
+generation's log line now carries its duration. Measured on the laptop over local
+TCP, a tenant of 75,000 rows of `test_types` (19 MB raw MessagePack, 2.7 MB
+compressed with the dictionary, 21 chunks): the producer's full plus delta — query,
+encode, train, compress, upload, manifest, bookkeeping — in 697 ms; a tenant with a
+handful of rows in 66–67 ms; a fresh libzb replica applied the full in 1.6 s
+(open, schemas, seed, drain); a fresh Node replica reached ready in 1.6 s with eleven
+tables seeding. About ten microseconds a row on the producer. Against a cadence of a
+minute the race of §10ej is not a concern; it is one only when a size cap brings the
+window under a few seconds, which a burst of large rows can do.
+
+The README had the chain in three places — a bullet under "The daemon", a literary
+paragraph buried in Architecture, a stale retention table under NATS (two cadences
+and seven days where the stack has three and two hours, an 8-day age that no longer
+exists) — and no place for the rule. It now has one: "Catching up: the chain and the
+stream", after "The daemon", with the numbers above; "Configuration" gathers the six
+knobs and the two inequalities under "Chain, sweeper and stream retention"; the
+sweeper, the NATS table and the Architecture paragraph point there; Troubleshooting
+gained the four symptoms of the window (`chain predates the stream`, `pruned under
+the live consumer`, `fell off … during the build`, a short window with a fine age).
+
+The 75,000 rows stay in `test_types` on globex as a standing fixture (`bulk-%`), so
+the next measurement compares like with like.
+
+## 10en. The slots from the shell: `--view-slots`, `--view-slot`, `--drop-slot` (2026-09-11)
+
+The README promised `bridge --drop-slot` before the binary had it, as a note not to
+forget. Three early-exit verbs now exist beside `--revoke`, on the same privilege
+posture: the views read with the bridge's own `DATABASE_READER_URL` (the reader role
+sees `pg_replication_slots`), the drop needs `ADMIN_DATABASE_URL` passed for the
+invocation and never stored, refuses an active slot with the pid that holds it, and
+reports the WAL it freed. Retained WAL is measured from the current head, falling back
+to the last received LSN on a standby. The first inventory on the dev server found the
+scenarios' `zb_probe` slot inactive and holding 1289 MB of WAL — the abandoned-slot
+case the verb exists for, left to the user's decision.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

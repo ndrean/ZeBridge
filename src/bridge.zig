@@ -19,6 +19,7 @@ const args = @import("args.zig");
 const nkey_gen = @import("nkey_gen.zig");
 const nats_init = @import("nats_init.zig");
 const admin_revoke = @import("admin_revoke.zig");
+const admin_slots = @import("admin_slots.zig");
 const publication_mod = @import("publication.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
@@ -362,6 +363,8 @@ fn runDiagnose(
     topo: *const topology_mod.Topology,
     cadence_seconds: u64,
     cdc_max_age_seconds: u64,
+    chain_depth: u32,
+    gc_threshold_ms: ?u64,
 ) u8 {
     var findings: usize = 0;
     log.info("🩺 DIAGNOSE (dry run): BASE_BUF gives a {d}-byte event buffer; slot '{s}', publication '{s}'. Nothing will be created, registered, or dialled.", .{ event_buf, slot_name, pub_name });
@@ -501,6 +504,19 @@ fn runDiagnose(
     // The CDC window against the chain (§10eg): a finding here, not only a warning at
     // boot — an operator who lowers the cadence or sets the age by hand should hear
     // it from the doctor, before the log line passes by under load.
+    // The sweeper's inequality too (NOTES §1.13): the doctor can only check it when
+    // GC_THRESHOLD_MS is in this environment, since the sweeper is a separate process.
+    const promise_s: u64 = cadence_seconds * chain_depth;
+    if (gc_threshold_ms) |thr| {
+        if (thr / 1000 < promise_s) {
+            findings += 1;
+            log.err("🔴 GC_THRESHOLD_MS ~{d}s is BELOW chain depth × cadence = {d}s: a tombstone can be reaped before the delta that ships it. Raise the sweeper's threshold or lower depth × cadence.", .{ thr / 1000, promise_s });
+        } else {
+            log.info("✅ sweeper window {d}s ≥ depth × cadence {d}s", .{ thr / 1000, promise_s });
+        }
+    } else {
+        log.info("ℹ️ depth × cadence = {d}s; the sweeper's GC_THRESHOLD_MS must stay above it (not in this environment — checked when it is)", .{promise_s});
+    }
     if (cdc_max_age_seconds < cadence_seconds * 2) {
         findings += 1;
         log.err("🔴 CDC_MAX_AGE_SECONDS {d}s is BELOW 2 × GENERATION_CADENCE_SECONDS = {d}s: a client that falls off a stream can find a chain that predates it. Keep the age above two cadences (the default is three), or lower the cadence.", .{ cdc_max_age_seconds, cadence_seconds * 2 });
@@ -678,6 +694,9 @@ pub fn main(init: std.process.Init) !void {
         .gen_nkey => return nkey_gen.genNkey(init.io),
         .init_nats => return std.process.exit(nats_init.run(init.io, &init)),
         .revoke => return std.process.exit(admin_revoke.run(&init)),
+        .view_slots => return std.process.exit(admin_slots.run(&init, .view_all)),
+        .view_slot => return std.process.exit(admin_slots.run(&init, .view_one)),
+        .drop_slot => return std.process.exit(admin_slots.run(&init, .drop)),
     };
 
     // Assign first, then report: customLogFn filters against runtime_log_level, so a
@@ -931,6 +950,8 @@ pub fn main(init: std.process.Init) !void {
             &runtime_config.topology,
                     runtime_config.generation_cadence_seconds,
             runtime_config.cdc_max_age_seconds,
+            runtime_config.generation_chain_depth,
+            if (init.minimal.environ.getPosix("GC_THRESHOLD_MS")) |t| (std.fmt.parseInt(u64, t, 10) catch null) else null,
         );
         std.process.exit(code);
     }
