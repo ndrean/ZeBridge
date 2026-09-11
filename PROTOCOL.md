@@ -931,13 +931,13 @@ Keeping the sequence client-side allows **ephemeral** consumers. A durable consu
 
 ### Chain values converge with CDC values
 
-Chain rows come from the producer's ordinary text-mode queries; CDC values come from `pgoutput`. The client normalizes the one shape difference — text-mode `timestamptz`(`2026-01-01 00:00:00+00`) to the CDC wire form (`2026-01-01T00:00:00Z`), microseconds preserved — so the version guard compares like against like.
+Chain rows and CDC values come through the same decoder: the producer reads its rows with `COPY (…) TO STDOUT (FORMAT binary)` and decodes them with the `pgoutput` binary decoder, so a value has one wire shape whichever path carried it — integers and floats as numbers, `timestamptz` in the wire form (`2026-01-01T00:00:00.000000Z`), everything else as strings. Chain objects built before 2026-09-11 carry PostgreSQL's text rendering instead (`2026-01-01 00:00:00+00`); the client still normalizes that one shape on the way in, so an old object in a kept chain applies the same.
 
 Two consequences worth knowing:
 
-* `NUMERIC` is padded to its **declared scale**, so `numeric(20,8)` holding `0.1`
-  arrives as `0.10000000`, matching what text `COPY` emitted. This matters because
-  NUMERIC maps to SQLite **TEXT** (§3), and in TEXT `'0.1000' = '0.10000000'` is false.
+* `NUMERIC` is rendered to its **stored scale** (`dscale`), the digits PostgreSQL itself prints, so `numeric(20,8)` holding `0.1`
+  arrives as `0.10000000` and `1.5` stored with scale 1 arrives as `1.5`. This matters because
+  NUMERIC maps to SQLite **TEXT** (§3), and in TEXT `'0.1000' = '0.10000000'` is false. (The decoder ignored the scale until 2026-09-11 and rendered the digit groups' padding, `0.1000`; fixed, NOTES §10ep.)
 * Arrays keep the Postgres literal form (`{x,"y,z"}`), not JSON. ⚠️ The bridge quotes
   elements slightly more eagerly than Postgres does — `{"x","y,z"}` where Postgres
   writes `{x,"y,z"}`. Both parse identically as array literals; they are not byte-equal.

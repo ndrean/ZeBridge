@@ -10798,6 +10798,51 @@ without parallelism. The three levers discussed for later — workers over pairs
 halves of a big pair on one exported snapshot with parts in the manifest, and the
 proactive re-cut from the stream's margin — stay on the list, in that order.
 
+## 10ep. The producer reads rows through binary COPY, with the CDC decoder — and the numeric scale (2026-09-11)
+
+The first of three steps agreed to move the producer's ceiling toward the WAL
+reader's: replace the text `SELECT` with `COPY (…) TO STDOUT (FORMAT binary)`, read
+through the CDC path's own `pgoutput.decodeBinColumnData`. Binary COPY and `pgoutput`
+in binary mode use the same per-type encoding, PostgreSQL's send functions, so the
+producer adds only the COPY framing — a signature, a field count per row, a length
+per field — and maps decoded values to wire values the way `decodePackedValue` does
+for events: integers and floats as numbers, everything else as strings. A type the
+decoder refuses fails the build over to the text path, said in the log; such a table
+is suspended on CDC anyway. The delta's cutoff is inlined as a literal, since COPY
+takes no parameters.
+
+**Measured, the 75,000-row full on globex, one build:**
+
+| | text, zstd 9 (morning) | text, zstd 3 | COPY, zstd 3 |
+| --- | --- | --- | --- |
+| rows stage | 116 + 31 ms | 117 + 31 ms | 115 ms |
+| zstd | 138 ms | 24 ms | 24 ms |
+| build | 327 ms | 214 ms | 185 ms |
+| object | 2,721,578 B | 2,716,134 B | 2,659,399 B |
+
+Less than the text parsing alone promised: the row stage is now the decoder's
+per-value allocations, the encoder's value tree and 75,000 `PQgetCopyData` calls,
+which is where a pipeline would go next. About 1.5 µs a row for the stage, 2.5 µs
+for the whole build; one thread near 400,000 rows a second.
+
+**What the unification found.** A chain row and a CDC row of the same PostgreSQL
+value are the same bytes now, and comparing a fresh replica with PostgreSQL column
+by column showed what the two conventions had hidden: the numeric decoder ignored
+`dscale`, the display scale PostgreSQL stores and prints, so `237.50000000` reached
+every client as `237.5000` and `1.5` would have reached it as `1.5000` — on every
+CDC event since the decoder was written, and on the chain from today. Fixed in
+`numeric.zig`: the groups are rendered as before and the fraction is fitted to the
+scale, padded or trimmed (the trimmed digits are zeros by construction), with tests
+in both directions. After the fix: 200 rows, every column equal, except arrays,
+which the chain now renders the decoder's way, every element quoted, as CDC always
+did — a PostgreSQL literal either way.
+
+**A trap on the way.** The first version stopped reading at COPY's trailer and asked
+for the result while libpq was still in COPY state; libpq answers that with a
+COPY_OUT result every time, the loop never ended, the producer thread never
+returned, and the bridge's graceful stop waited on it until it was killed. The COPY
+is now read until libpq itself reports the end, and the result loop is bounded.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

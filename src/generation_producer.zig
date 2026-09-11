@@ -50,6 +50,7 @@ const config = @import("config.zig");
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
 const encoder_mod = @import("encoder.zig");
+const pgoutput = @import("pgoutput.zig");
 const nats = @import("nats");
 const topology_mod = @import("topology.zig");
 const c_imports = @import("c_imports.zig");
@@ -350,6 +351,170 @@ pub const GenerationProducer = struct {
             return error.QueryFailed;
         }
         return res;
+    }
+
+    /// §10ep: the same document from `COPY (…) TO STDOUT (FORMAT binary)`, the rows
+    /// decoded by the CDC path's own decoder (`pgoutput.decodeBinColumnData`).
+    ///
+    /// `pgoutput` in binary mode and binary COPY use the same per-type encoding —
+    /// PostgreSQL's send functions — so a chain row arrives in the form the decoder
+    /// reads on every CDC event of every day; what this adds is the COPY framing (a
+    /// signature, a field count per row, a length per field) and the mapping to wire
+    /// values that `batch_publisher.decodePackedValue` uses for events: integers and
+    /// floats as numbers, everything else as strings. Two things follow. The text
+    /// result's 1.5 µs a row of rendering and parsing (§10eo) goes; and a chain row
+    /// and a CDC row of the same PostgreSQL value are now the same bytes on the wire,
+    /// where a timestamp used to reach a client as PostgreSQL's text through the chain
+    /// and as the decoder's ISO form through CDC. A type the decoder refuses fails the
+    /// whole build over to the text path (a table with such a type is suspended on CDC
+    /// anyway); the decision is per build and said in the log.
+    fn encodeContentCopy(
+        alloc: std.mem.Allocator,
+        pgc: *c.PGconn,
+        select_sql: []const u8,
+        gen: i64,
+        kind: []const u8,
+        cutoff: []const u8,
+        prev_cutoff: ?[]const u8,
+        vcol: []const u8,
+        out_rows: *usize,
+        out_widest: *usize,
+    ) ![]const u8 {
+        // Names and OIDs, from the same SELECT under LIMIT 0 — inside the same
+        // snapshot transaction, so the shape cannot differ from the rows that follow.
+        const probe_sql = try utils.allocPrintZ(alloc, "SELECT * FROM ({s}) AS q LIMIT 0", .{select_sql});
+        const meta = try queryOne(pgc, probe_sql, &.{});
+        defer c.PQclear(meta);
+        const ncols: usize = @intCast(c.PQnfields(meta));
+        const names = try alloc.alloc([]const u8, ncols);
+        const oids = try alloc.alloc(u32, ncols);
+        var names_bytes: usize = 0;
+        for (0..ncols) |i| {
+            names[i] = try alloc.dupe(u8, std.mem.span(c.PQfname(meta, @intCast(i))));
+            oids[i] = c.PQftype(meta, @intCast(i));
+            names_bytes += names[i].len;
+        }
+
+        const copy_sql = try utils.allocPrintZ(alloc, "COPY ({s}) TO STDOUT (FORMAT binary)", .{select_sql});
+        const started = c.PQexec(pgc, copy_sql.ptr) orelse return error.QueryFailed;
+        if (c.PQresultStatus(started) != c.PGRES_COPY_OUT) {
+            log.err("🧬 COPY refused: {s}", .{c.PQerrorMessage(pgc)});
+            c.PQclear(started);
+            return error.QueryFailed;
+        }
+        c.PQclear(started);
+
+        var enc = encoder_mod.Encoder.init(alloc, .msgpack);
+        var root = enc.createMap();
+        var cols_arr = try enc.createArray(ncols);
+        for (0..ncols) |i| try cols_arr.setIndex(i, try enc.createString(names[i]));
+        try root.put(enc.allocator, "columns", cols_arr);
+
+        var rows: std.ArrayListUnmanaged(encoder_mod.Value) = .empty;
+        var header_seen = false;
+        var failed: ?anyerror = null;
+        copy: while (true) {
+            var buf: [*c]u8 = undefined;
+            const n = c.PQgetCopyData(pgc, &buf, 0);
+            if (n == -1) break; // the server's end of COPY
+            if (n < 0) {
+                log.err("🧬 COPY read failed: {s}", .{c.PQerrorMessage(pgc)});
+                failed = error.QueryFailed;
+                break;
+            }
+            defer c.PQfreemem(buf);
+            const data = buf[0..@intCast(n)];
+            var pos: usize = 0;
+            if (!header_seen) {
+                // "PGCOPY\n\377\r\n\0", then int32 flags, then int32 extension length.
+                if (data.len < 19 or !std.mem.eql(u8, data[0..11], "PGCOPY\n\xff\r\n\x00")) {
+                    failed = error.CopyHeader;
+                    break;
+                }
+                const ext_len: usize = @intCast(std.mem.readInt(i32, data[15..19], .big));
+                pos = 19 + ext_len;
+                header_seen = true;
+            }
+            while (pos + 2 <= data.len) {
+                const nfields = std.mem.readInt(i16, data[pos..][0..2], .big);
+                pos += 2;
+                // The trailer: no more rows, but libpq is still in COPY state until it
+                // has seen the server's CopyDone — keep reading until it says -1.
+                if (nfields == -1) continue :copy;
+                if (@as(usize, @intCast(nfields)) != ncols) {
+                    failed = error.CopyShape;
+                    break :copy;
+                }
+                var row_arr = try enc.createArray(ncols);
+                var row_bytes: usize = names_bytes + 256; // envelope margin, mirrors wireSize
+                for (0..ncols) |i| {
+                    const flen = std.mem.readInt(i32, data[pos..][0..4], .big);
+                    pos += 4;
+                    if (flen == -1) {
+                        try row_arr.setIndex(i, enc.createNull());
+                        continue;
+                    }
+                    const len: usize = @intCast(flen);
+                    const bytes = data[pos..][0..len];
+                    pos += len;
+                    row_bytes += len;
+                    // `owns_bytes = false`: the decoder dupes what it keeps, since libpq's
+                    // buffer is freed at the end of this message.
+                    const v = pgoutput.decodeBinColumnData(alloc, oids[i], bytes, false) catch |err| {
+                        log.warn("🧬 COPY: column {s} (oid {d}) is not decodable by the CDC decoder ({s}) — this build takes the text path", .{ names[i], oids[i], @errorName(err) });
+                        failed = err;
+                        break :copy;
+                    };
+                    try row_arr.setIndex(i, switch (v) {
+                        .null, .unchanged => enc.createNull(),
+                        .boolean => |b| enc.createBool(b),
+                        .int32 => |x| enc.createInt(@intCast(x)),
+                        .int64 => |x| enc.createInt(x),
+                        .float64 => |f| enc.createFloat(f),
+                        .text, .numeric, .jsonb, .array, .bytea => |str| try enc.createString(str),
+                    });
+                }
+                if (row_bytes > out_widest.*) out_widest.* = row_bytes;
+                try rows.append(alloc, row_arr);
+            }
+        }
+        // Whatever ended the COPY, the connection must be left clean: read the rest
+        // of the data until libpq reports the end (-1, or -2 on a broken copy) and
+        // then collect the results, or the next statement of this transaction fails.
+        // ⚠️ Unconditional and BOUNDED. Asking for results while libpq is still in
+        // COPY state hands back a COPY_OUT result every time, for ever: the first
+        // version looped there, the producer thread never returned, and the bridge's
+        // graceful stop waited on it until it was killed (measured 2026-09-11).
+        {
+            var buf2: [*c]u8 = undefined;
+            while (c.PQgetCopyData(pgc, &buf2, 0) > 0) c.PQfreemem(buf2);
+        }
+        var guard: u8 = 0;
+        while (c.PQgetResult(pgc)) |r| : (guard += 1) {
+            const st = c.PQresultStatus(r);
+            c.PQclear(r);
+            if (st == c.PGRES_COPY_OUT or guard >= 8) {
+                log.err("🧬 COPY did not end cleanly (status {d} after {d} result(s)): {s}", .{ st, guard, c.PQerrorMessage(pgc) });
+                failed = failed orelse error.QueryFailed;
+                break;
+            }
+            if (failed == null and st != c.PGRES_COMMAND_OK) {
+                log.err("🧬 COPY ended badly: {s}", .{c.PQerrorMessage(pgc)});
+                failed = error.QueryFailed;
+            }
+        }
+        if (failed) |e| return e;
+
+        out_rows.* = rows.items.len;
+        var rows_arr = try enc.createArray(rows.items.len);
+        for (rows.items, 0..) |r, i| try rows_arr.setIndex(i, r);
+        try root.put(enc.allocator, "rows", rows_arr);
+        try root.put(enc.allocator, "gen", enc.createInt(gen));
+        try root.put(enc.allocator, "kind", try enc.createString(kind));
+        try root.put(enc.allocator, "cutoff", try enc.createString(cutoff));
+        try root.put(enc.allocator, "version_column", try enc.createString(vcol));
+        if (prev_cutoff) |p| try root.put(enc.allocator, "prev_cutoff", try enc.createString(p));
+        return try enc.encode(root);
     }
 
     /// msgpack `{columns, rows, gen, kind, cutoff, prev_cutoff?}` from a text-mode result.
@@ -858,7 +1023,7 @@ pub const GenerationProducer = struct {
         // §10eo: where a build's time goes, one line per generation — the number that
         // decides whether the producer's per-row cost is the query, the encode, the
         // compression or the upload, before anyone parallelises the wrong stage.
-        var ph: struct { query: i64 = 0, encode: i64 = 0, train: i64 = 0, zstd: i64 = 0, upload: i64 = 0 } = .{};
+        var ph: struct { query: i64 = 0, train: i64 = 0, zstd: i64 = 0, upload: i64 = 0 } = .{};
         if (build_full) {
             // §10ek: a full carries LIVE rows only. Every client applies a full as a wipe
             // and a reload inside one transaction, so a row absent from it is gone on the
@@ -871,26 +1036,28 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
             const t_q = utils.unixMillis();
-            const res = try queryOne(pgc, sql, &.{});
-            defer c.PQclear(res);
+            full_payload = encodeContentCopy(alloc, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
+                const res = try queryOne(pgc, sql, &.{});
+                defer c.PQclear(res);
+                break :blk try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
+            };
             ph.query += utils.unixMillis() - t_q;
-            const t_e = utils.unixMillis();
-            full_payload = try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
-            ph.encode += utils.unixMillis() - t_e;
         }
         var delta_payload: ?[]const u8 = null;
         var delta_rows: usize = 0;
         if (build_delta) {
-            const sql = try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" > $1::timestamptz - interval '{s}'", .{ table, vcol, config.Sync.version_future_tolerance });
-            const prev_z = try alloc.dupeZ(u8, last_cutoff.?);
-            const params = [_]?[*:0]const u8{prev_z.ptr};
+            // COPY takes no parameters: the previous cutoff is inlined as a literal. It is
+            // PostgreSQL's own rendering of a timestamptz read back from the bookkeeping
+            // row, quoted defensively all the same.
+            const prev_lit = try std.mem.replaceOwned(u8, alloc, last_cutoff.?, "'", "''");
+            const sql = try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" > '{s}'::timestamptz - interval '{s}'", .{ table, vcol, prev_lit, config.Sync.version_future_tolerance });
             const t_q = utils.unixMillis();
-            const res = try queryOne(pgc, sql, &params);
-            defer c.PQclear(res);
+            delta_payload = encodeContentCopy(alloc, pgc, sql, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row) catch blk: {
+                const res = try queryOne(pgc, sql, &.{});
+                defer c.PQclear(res);
+                break :blk try encodeContent(alloc, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
+            };
             ph.query += utils.unixMillis() - t_q;
-            const t_e = utils.unixMillis();
-            delta_payload = try encodeContent(alloc, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
-            ph.encode += utils.unixMillis() - t_e;
         }
         {
             const res = try queryOne(pgc, "COMMIT", &.{});
@@ -1154,7 +1321,7 @@ pub const GenerationProducer = struct {
             bucket,                           cutoff_version,                              lsn,
             utils.unixMillis() - build_started_ms,
         });
-        log.info("🧬   phases: query {d} ms, encode {d} ms, dictionary {d} ms, zstd {d} ms, upload {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.query, ph.encode, ph.train, ph.zstd, ph.upload, full_rows, delta_rows });
+        log.info("🧬   phases: copy+decode+encode {d} ms, dictionary {d} ms, zstd {d} ms, upload {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.query, ph.train, ph.zstd, ph.upload, full_rows, delta_rows });
         if (build_delta) log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, delta_payload.?.len });
         if (build_full) log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, full_payload.?.len });
 

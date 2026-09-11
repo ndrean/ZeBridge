@@ -28,6 +28,12 @@ pub fn parseNumeric(allocator: std.mem.Allocator, buf: []const u8) NumericDecode
     const ndigits = std.mem.readInt(u16, buf[0..2], .big);
     const weight = std.mem.readInt(i16, buf[2..4], .big);
     const sign = std.mem.readInt(u16, buf[4..6], .big);
+    // The display scale: PostgreSQL prints exactly this many digits after the point,
+    // whatever the base-10000 groups carry — `237.5` stored with scale 8 prints as
+    // `237.50000000`, `1.5` stored as the groups [1, 5000] with scale 1 prints as
+    // `1.5`. Ignored until 2026-09-11 (§10ep): every numeric reached the clients with
+    // the groups' padding instead, `237.5000`, on CDC and on the chain alike.
+    const dscale: usize = std.mem.readInt(u16, buf[6..8], .big);
 
     // Handle special values
     switch (sign) {
@@ -61,7 +67,7 @@ pub fn parseNumeric(allocator: std.mem.Allocator, buf: []const u8) NumericDecode
 
     const leading_zero_groups: usize = if (weight < -1) @intCast(-weight - 1) else 0;
     const int_groups: usize = if (weight >= 0) @intCast(weight + 1) else 0;
-    const max_size = 1 + 2 + leading_zero_groups * 4 + int_groups * 4 + 1 + n * 4;
+    const max_size = 1 + 2 + leading_zero_groups * 4 + int_groups * 4 + 1 + n * 4 + dscale + 1;
 
     var out = allocator.alloc(u8, max_size) catch return NumericDecodeError.OutOfMemory;
     var pos: usize = 0;
@@ -109,7 +115,26 @@ pub fn parseNumeric(allocator: std.mem.Allocator, buf: []const u8) NumericDecode
         }
     }
 
+    pos = fitScale(out, pos, dscale);
     return .{ .slice = out[0..pos], .allocated = out };
+}
+
+/// Fit the fraction to exactly `dscale` digits: pad with zeros, or trim — the digits
+/// trimmed are zeros by construction, since PostgreSQL rounds a numeric to its scale
+/// on input and the groups only pad to a multiple of four. Scale 0 drops the point.
+fn fitScale(out: []u8, len: usize, dscale: usize) usize {
+    const dot = std.mem.indexOfScalar(u8, out[0..len], '.');
+    if (dscale == 0) return if (dot) |d| d else len;
+    if (dot) |d| {
+        const frac = len - d - 1;
+        if (frac == dscale) return len;
+        if (frac > dscale) return d + 1 + dscale;
+        @memset(out[len .. len + (dscale - frac)], '0');
+        return len + (dscale - frac);
+    }
+    out[len] = '.';
+    @memset(out[len + 1 .. len + 1 + dscale], '0');
+    return len + 1 + dscale;
 }
 
 fn writeDigit(out: []u8, d: u16) usize {
@@ -140,11 +165,15 @@ fn writeDigitPadded(out: *[4]u8, d: u16) usize {
 }
 
 fn makeNumericBuf(comptime ndigits: u16, weight: i16, sign: u16, digits: []const u16) [8 + ndigits * 2]u8 {
+    return makeNumericBufScaled(ndigits, weight, sign, digits, 0);
+}
+
+fn makeNumericBufScaled(comptime ndigits: u16, weight: i16, sign: u16, digits: []const u16, dscale: u16) [8 + ndigits * 2]u8 {
     var buf: [8 + ndigits * 2]u8 = undefined;
     std.mem.writeInt(u16, buf[0..2], ndigits, .big);
     std.mem.writeInt(i16, buf[2..4], weight, .big);
     std.mem.writeInt(u16, buf[4..6], sign, .big);
-    std.mem.writeInt(u16, buf[6..8], 0, .big); // dscale
+    std.mem.writeInt(u16, buf[6..8], dscale, .big);
     for (digits, 0..) |d, i| {
         std.mem.writeInt(u16, buf[8 + i * 2 ..][0..2], d, .big);
     }
@@ -163,7 +192,7 @@ test "parseNumeric" {
 
     // 1234567.91011000
     {
-        const buf = makeNumericBuf(4, 1, 0, &[_]u16{ 123, 4567, 9101, 1000 });
+        const buf = makeNumericBufScaled(4, 1, 0, &[_]u16{ 123, 4567, 9101, 1000 }, 8);
         const result = try parseNumeric(alloc, &buf);
         defer result.deinit(alloc);
         try std.testing.expectEqualStrings("1234567.91011000", result.slice);
@@ -179,7 +208,7 @@ test "parseNumeric" {
 
     // -0.0042
     {
-        const buf = makeNumericBuf(1, -1, 0x4000, &[_]u16{42});
+        const buf = makeNumericBufScaled(1, -1, 0x4000, &[_]u16{42}, 4);
         const result = try parseNumeric(alloc, &buf);
         defer result.deinit(alloc);
         try std.testing.expectEqualStrings("-0.0042", result.slice);
@@ -189,5 +218,32 @@ test "parseNumeric" {
         const result = try parseNumeric(alloc, &[_]u8{ 0, 0, 0, 0, 0xC0, 0, 0, 0 });
         defer result.deinit(alloc);
         try std.testing.expectEqualStrings("NaN", result.slice);
+    }
+
+    // §10ep: the display scale, both directions — padded to the scale the groups
+    // fall short of, trimmed to the scale the groups exceed.
+    {
+        const buf = makeNumericBufScaled(2, 0, 0, &[_]u16{ 237, 5000 }, 8);
+        const result = try parseNumeric(alloc, &buf);
+        defer alloc.free(result.allocated);
+        try std.testing.expectEqualStrings("237.50000000", result.slice);
+    }
+    {
+        const buf = makeNumericBufScaled(2, 0, 0, &[_]u16{ 1, 5000 }, 1);
+        const result = try parseNumeric(alloc, &buf);
+        defer alloc.free(result.allocated);
+        try std.testing.expectEqualStrings("1.5", result.slice);
+    }
+    {
+        const buf = makeNumericBufScaled(1, 1, 0, &[_]u16{1}, 0);
+        const result = try parseNumeric(alloc, &buf);
+        defer alloc.free(result.allocated);
+        try std.testing.expectEqualStrings("10000", result.slice);
+    }
+    {
+        const buf = makeNumericBufScaled(1, 0, 0, &[_]u16{7}, 2);
+        const result = try parseNumeric(alloc, &buf);
+        defer alloc.free(result.allocated);
+        try std.testing.expectEqualStrings("7.00", result.slice);
     }
 }
