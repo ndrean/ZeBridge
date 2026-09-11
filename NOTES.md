@@ -11043,7 +11043,11 @@ RING_BUFFER_COUNT 32768; the table started at 75,000 live rows.
    (212 lines). A fresh process does not have the entry. §10ev holds a pair whose
    forced cut failed for a minute before asking again. The catalogue row survives
    the drop and should go by hand (`DELETE FROM zebridge_catalogue WHERE tbl =
-   'late_t'`); `--diagnose` could name a catalogue row whose table is gone.
+   'late_t'`); `--diagnose` could name a catalogue row whose table is gone. The
+   sweeper met the same row later that evening and died on it — a sweep prepared
+   against a table that does not exist fails, and the sidecar exited before reaping
+   anything anywhere. It leaves such rows out now, and a failed prepare names the
+   table and the error.
 
 **The audit: `scripts/scenarios/chain_audit.py`.** Until now every check of the chain
 went through a client — a replica diffed against the table, counts, the object's

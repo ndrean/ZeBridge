@@ -207,8 +207,12 @@ pub fn main(init: std.process.Init) !void {
         // tombstoned children are still rows is refused by NO ACTION — parent-first order
         // costs one failed pass per level of the family. Ordered by the depth of the
         // foreign-key chain above each table, deepest first.
+        // A catalogue row outlives its table (§10eu: late_t, dropped, still enabled):
+        // a sweep prepared against it fails, and the first version died there and
+        // reaped nothing anywhere. Rows whose table is gone are left out.
         const cres = c.PQexec(pg_conn, "SELECT cat.tbl, cat.tombstone_col::text FROM public.zebridge_catalogue cat" ++
             " WHERE cat.tombstone_col IS NOT NULL" ++
+            " AND to_regclass(format('%I.%I', 'public', cat.tbl)) IS NOT NULL" ++
             " ORDER BY (WITH RECURSIVE up(oid, d) AS (" ++
             "   SELECT to_regclass(format('%I.%I', 'public', cat.tbl))::oid, 0" ++
             "   UNION ALL SELECT con.confrelid, up.d + 1 FROM pg_constraint con JOIN up ON con.conrelid = up.oid" ++
@@ -320,7 +324,10 @@ pub fn main(init: std.process.Init) !void {
                 defer a.free(sql);
                 const res = c.PQprepare(conn, stmt_name.ptr, sql.ptr, if (drun) 1 else 2, null);
                 defer c.PQclear(res);
-                if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) return error.PrepareFailed;
+                if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) {
+                    std.debug.print("GC: cannot prepare the sweep of {s}: {s}", .{ sw.table, c.PQerrorMessage(conn) });
+                    return error.PrepareFailed;
+                }
             }
             const wm_res = c.PQprepare(conn, "gc_watermark_update", "UPDATE public.zebridge_gc_watermark SET watermark = now() - make_interval(secs => $1::double precision), threshold_ms = $2::bigint, reaped = $3::bigint, swept_at = now(), updated_at = now() WHERE id = 1", 3, null);
             defer c.PQclear(wm_res);
