@@ -10924,6 +10924,35 @@ same stream; no chain fell off during the burst. Two lessons from the run itself
 **Also seen:** thirty concurrent `UPDATE`s of the same rows deadlock each other in
 PostgreSQL, which was my test and not the bridge — sequential from then on.
 
+## 10es. The size rule: a fat delta comes with a full — and the cap measured in seconds (2026-09-11)
+
+The user's arithmetic after §10er: at a burst's pace an early cut every seven seconds
+carries every row re-stamped since the last one, so five deltas of 700,000 rows for a
+table of 75,000 live rows means a client catching up applies each row nine times —
+900 MB raw, about 75 s on libzb, where one full of the table is 19 MB and 1.6 s. A
+delta carries every row whose version moved; a burst that re-stamps the same rows
+puts them in every delta while it lasts. "Poor phone."
+
+**The rule.** Beside the depth clock: when the delta just built would carry more than
+half the table's rows, cut a full with it. A full costs the producer the same 200 ms
+and carries each row once; a client with an old watermark takes the full and never
+sees the fat deltas, one with a recent watermark takes the one delta it needs anyway.
+Measured on a 64 MiB cap with the 75,000 rows re-stamped eight times in sixteen
+seconds: seven early cuts, each `delta+full` at 470–610 ms, no chain fell off, and a
+fresh libzb replica opened after the burst seeded 75,002 rows from the newest full in
+two seconds — one object, not seven.
+
+**The cap in seconds.** The first run under the size rule lost one cut: at 11 MB/s a
+64 MiB cap fills in six seconds, and "80% of the cap" left about a second, less than
+a build. The publisher knows the fill rate exactly (§10er's accounting keeps the last
+complete second per stream), so the fill trigger now also fires when the seconds left
+to the byte cap at that rate fall under three builds plus the check interval — a
+time, not a share — with the 80% kept as the floor. Second run: seven cuts, none lost.
+
+What none of this changes: a burst that fills a whole cap inside one check interval
+is still the pause's case, and the cap must hold at least a few seconds of the worst
+burst for any early cut to land.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

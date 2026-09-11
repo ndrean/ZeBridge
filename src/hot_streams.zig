@@ -37,6 +37,8 @@ pub const HotStreams = struct {
         second: i64 = 0,
         bytes: u64 = 0,
         msgs: u64 = 0,
+        /// The last COMPLETE second's bytes: the fill rate the edge watch reads.
+        prev_bytes: u64 = 0,
         hot_until_ms: i64 = 0,
     };
 
@@ -91,6 +93,7 @@ pub const HotStreams = struct {
         }
         const e = gop.value_ptr;
         if (e.second != second) {
+            e.prev_bytes = if (e.second == second - 1) e.bytes else 0;
             e.second = second;
             e.bytes = 0;
             e.msgs = 0;
@@ -101,6 +104,18 @@ pub const HotStreams = struct {
             log.warn("🔥 {s}: {d} KB and {d} message(s) in one second — hot; the producer watches its edge", .{ stream, e.bytes / 1024, e.msgs });
         }
         if (e.bytes >= self.bytes_per_s or e.msgs >= self.msgs_per_s) e.hot_until_ms = now_ms + self.hot_ttl_ms;
+    }
+
+    /// The stream's fill rate in bytes per second: the larger of the last complete
+    /// second and the current one, so a burst that started this second counts.
+    pub fn fillRate(self: *HotStreams, stream: []const u8) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const e = self.streams.get(stream) orelse return 0;
+        const second = @divFloor(utils.unixMillis(), 1000);
+        const prev: u64 = if (e.second == second) e.prev_bytes else if (e.second == second - 1) e.bytes else 0;
+        const cur: u64 = if (e.second == second) e.bytes else 0;
+        return @max(prev, cur);
     }
 
     /// The streams hot right now, names duped into `a` — the producer's thread.

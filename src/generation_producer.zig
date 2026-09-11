@@ -254,7 +254,7 @@ pub const GenerationProducer = struct {
         try conn_nats.connect(url);
         var js = conn_nats.jetstream(.{});
 
-        const StreamRead = struct { first: u64, last: u64, rate: f64, fill: f64 };
+        const StreamRead = struct { first: u64, last: u64, rate: f64, fill: f64, to_cap_s: f64 };
         var reads: std.StringArrayHashMapUnmanaged(StreamRead) = .empty;
         const now_ms = utils.unixMillis();
         for (self.cuts.values()) |cut| {
@@ -274,7 +274,18 @@ pub const GenerationProducer = struct {
             var fill: f64 = 0;
             if (cfg.max_bytes > 0) fill = @max(fill, @as(f64, @floatFromInt(st.bytes)) / @as(f64, @floatFromInt(cfg.max_bytes)));
             if (cfg.max_msgs > 0) fill = @max(fill, @as(f64, @floatFromInt(st.messages)) / @as(f64, @floatFromInt(cfg.max_msgs)));
-            try reads.put(alloc, cut.stream, .{ .first = st.first_seq, .last = st.last_seq, .rate = rate, .fill = fill });
+            // §10es: seconds until the byte cap at the publisher's own fill rate — the
+            // one figure that does not depend on a threshold. Infinite when nothing
+            // fills or there is no cap; zero once the cap is reached and pruning.
+            var to_cap_s: f64 = std.math.inf(f64);
+            if (self.hot) |h| if (cfg.max_bytes > 0) {
+                const fill_bps = h.fillRate(cut.stream);
+                if (fill_bps > 0) {
+                    const left: i64 = cfg.max_bytes - @as(i64, @intCast(st.bytes));
+                    to_cap_s = if (left <= 0) 0 else @as(f64, @floatFromInt(left)) / @as(f64, @floatFromInt(fill_bps));
+                }
+            };
+            try reads.put(alloc, cut.stream, .{ .first = st.first_seq, .last = st.last_seq, .rate = rate, .fill = fill, .to_cap_s = to_cap_s });
         }
 
         var urgent: std.ArrayListUnmanaged(Cut) = .empty;
@@ -289,11 +300,13 @@ pub const GenerationProducer = struct {
             // events, so a stream at its byte cap holds a few hundred of them and a
             // quarter is seconds of margin at a burst's prune rate — one early cut in
             // a 15-minute burst still fell off between two one-second checks (§10er).
-            const by_fill = r.fill >= 0.8 and margin_msgs < @divTrunc(span, 2);
+            // The cap is near in TIME (at the publisher's fill rate) or in share, and the
+            // cut sits in the half that goes first.
+            const by_fill = (r.to_cap_s < need_s or r.fill >= 0.8) and margin_msgs < @divTrunc(span, 2);
             const by_floor = r.rate > 0 and margin_msgs < @divTrunc(span, 10);
             if (by_rate or by_fill or by_floor) {
-                log.warn("🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest ({s}{s}{s})", .{
-                    cut.tenant,                                    cut.table, cut.stream, span, r.fill * 100, r.rate, @max(margin_msgs, 0),
+                log.warn("🧬 '{s}'/'{s}': cutting early — {s} holds {d} message(s), {d:.0}% of a cap, {d:.1} s to the byte cap, pruning {d:.0} msg/s; this pair's cut is {d} message(s) from the oldest ({s}{s}{s})", .{
+                    cut.tenant,                                    cut.table, cut.stream, span, r.fill * 100, r.to_cap_s, r.rate, @max(margin_msgs, 0),
                     if (by_rate) "the rate leaves under the build time" else "",
                     if (by_rate and by_fill) "; " else "",
                     if (by_fill) "the fill is past 80% and the cut sits in the oldest half" else if (!by_rate) "the cut is within a tenth of the span" else "",
@@ -1207,6 +1220,30 @@ pub const GenerationProducer = struct {
                 const res = try queryOne(pgc, sql, &.{});
                 defer c.PQclear(res);
                 break :blk try encodeContent(alloc, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
+            };
+            ph.query += utils.unixMillis() - t_q;
+        }
+        // §10es: the size rule beside the depth rule. A delta carries every row whose
+        // version moved since the last cut, so a burst that re-stamps the same rows
+        // puts them into every delta cut while it lasts, and a client catching up
+        // applies them once per delta — five deltas of 700,000 rows for a table of
+        // 75,000 live rows, nine copies of each row, 900 MB raw where a full is 19 MB.
+        // A full costs the producer the same 200 ms and carries each row once: when
+        // the delta would carry more than half the table, cut the full with it. A
+        // client with an old watermark takes the full; one with a recent watermark
+        // takes the one delta it needs anyway.
+        if (build_delta and !build_full and delta_rows > 0 and delta_rows * 2 > @as(usize, @intCast(@max(row_count_now, 1)))) {
+            log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, row_count_now });
+            build_full = true;
+            const sql = if (tcol.len > 0)
+                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ table, tcol })
+            else
+                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
+            const t_q = utils.unixMillis();
+            full_payload = encodeContentCopy(alloc, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
+                const res = try queryOne(pgc, sql, &.{});
+                defer c.PQclear(res);
+                break :blk try encodeContent(alloc, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
             };
             ph.query += utils.unixMillis() - t_q;
         }

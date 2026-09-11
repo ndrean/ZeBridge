@@ -105,7 +105,7 @@ SQLite has a limited number of storage class, `INTEGER`, `TEXT`, `REAL`, `BLOB`.
 
 Postgres `NUMERIC` type is casted into `TEXT` to distinguish  2.3 from 2.30000.
 
-JSON/JSONB datatype from Postgres are stored as `TEXT` in SQLite. SQLite supports `json()` and `json_extract()`, `json_replace()`, `json_remove()` natively.
+JSON/JSONB datatype from Postgres are stored as `TEXT` in SQLite. SQLite supports `json()` and `json_*()` natively.
 
 We do not support the type `geometry` or `geography` and more generally as used by the extension `PostGis`, because the OID is dynamically set when you `CREATE EXTENSION postgis;`. You need to query the type 'pg_types' for eg 'geometry' to access it. However, if you have vector tiles stored in `bytea`, they can be sent into the corresponding SQLite type `blob`.
 
@@ -628,7 +628,7 @@ A table reaches a client by two paths. The **stream** carries every change as it
 
 Every `GENERATION_CADENCE_SECONDS` the bridge walks the published tables and, for each tenant of each table that moved, cuts a **delta**: the rows whose version moved since the last cut, tombstoned rows included, because a tombstone is how a delete travels.
 
-Every `GENERATION_CHAIN_DEPTH` generations, and whenever only a full can carry what happened (a hard delete on a table without the soft-delete guard, a changed column shape, a re-seed asked with `zebridge_reseed`), it also cuts a **full**: the live rows only, since a client applies a full as a wipe and a reload. The objects are MessagePack, compressed with zstd and a dictionary trained on the full, chunked into the tenant's object store; a manifest in the `generations` bucket names the chain.
+Every `GENERATION_CHAIN_DEPTH` generations, whenever a delta would carry more than half the table (a burst re-stamping the same rows would otherwise put them in every delta), and whenever only a full can carry what happened (a hard delete on a table without the soft-delete guard, a changed column shape, a re-seed asked with `zebridge_reseed`), it also cuts a **full**: the live rows only, since a client applies a full as a wipe and a reload. The objects are MessagePack, compressed with zstd and a dictionary trained on the full, chunked into the tenant's object store; a manifest in the `generations` bucket names the chain.
 
 A client that was away applies the deltas cut after its watermark when the oldest of them begins at or before it, so the chain continues from where the replica stands; when no kept delta reaches that far back (with depth 6 and a 300 s cadence, an absence of about half an hour), it reloads the full and the deltas cut after it. Either way it then resumes the stream at the sequence recorded in the manifest.
 
@@ -646,6 +646,8 @@ That resume works only if the stream still holds the manifest's cut. The newest 
 So a build costs about 60 ms plus 2.3 µs per row, and 60 ms + 75,000 × 2.3 µs is the 0.21 s above; a delta of the same rows costs the same again. Every generation's log line carries its build time and its breakdown (query, encode, dictionary, zstd, upload), so a deployment reads its own numbers and sums them per tick.
 
 Two other limits end the stream's window before the age does: `CDC_MAX_BYTES` and `CDC_MAX_MSGS`. They are disk valves, and a burst of large rows can make them cut the window to seconds while the age still reads as three comfortable cadences. The fleet monitor measures the window each stream really holds (`bridge_cdc_window_seconds`) and flags one that is pruning under two cadences (`bridge_cdc_window_short`).
+
+The producer does not wait for the cadence when a stream moves fast. The publisher marks a stream hot the second a burst starts, and the producer then re-cuts any table whose cut is about to fall off that stream, an empty delta if nothing moved, so a returning client always finds a cut it can splice on. The reaction time is a second; what it cannot beat is a burst that fills a whole cap inside that second, and a cap should therefore hold at least a few seconds of the worst burst you expect.
 
 ### When the rule breaks
 
