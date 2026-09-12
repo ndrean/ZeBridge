@@ -11608,6 +11608,55 @@ and echoes back as the same BLOB; the audit finds the chain exact, replay includ
 PostgreSQL replica with pgvector holds the native types, seeded through COPY and fed
 over CDC. The earlier type scenarios (blobs, arrays, pgreplica, collist) still pass.
 
+## 10fh. The streaming seed: a phone never holds the chain object inflated (2026-09-12)
+
+The lever named in §10fa: the libzb seed held the whole inflated document — 1.16 GB
+for 3 M rows — because the sort by key wanted every row in hand. Opt-in
+(`seedStreaming` on the C card), because the whole-object path is the fastest apply
+there is and a laptop or a micro-VM should keep it.
+
+**The read.** The object store's own reader (nats.zig `ObjectStore.get`) is a push
+subscription: the server sends every chunk at once and the client's pending queue
+(64 MB) drops the rest as SlowConsumer the moment the reader pauses to apply a chunk
+of rows — measured: the seed stopped after its first 50,000 rows. `ObjectPull`
+(transport.zig) reads the object the way CDC is read and the way the TypeScript
+client reads objects (@nats-io/obj #430): the meta from `$O.<bucket>.M.<name>`, then
+a pull consumer on `$O.<bucket>.C.<nuid>`, eight chunks per fetch, the digest checked
+at the end. `StreamInflate` (client.zig) feeds those 128 KB pieces to
+`ZSTD_decompressStream` (the dictionary loaded on the context for a delta) through a
+window; the document's keys are parsed from the window as they complete — a parse
+that runs out of bytes before the source is exhausted means "read more", after it
+means malformed. One trap: the `columns` value decoded into the scratch arena that
+the next parse resets, and the column list sliced into it — the key column was
+never found, every stage key was empty, and the apply ran in arrival order (94 s
+for what takes 10 s in order). Duped, now.
+
+**The apply, three cuts.** (1) Rows cut from the window into chunks of
+`seedChunkRows`, each sorted on its own and applied: 3 M rows in 127 s — 61 runs of
+random keys into a growing b-tree, every insert a cache miss past 1 M rows. (2) The
+rows STAGED in an unindexed temp table as they stream (batches of 64 in transactions
+of a chunk: 3 M rows in 2.7 s at 82 MB), one `CREATE INDEX` as the external sort,
+keyed pages read back in global key order and applied: 82 s, because an index on the
+key alone fetched each row from the stage by rowid — a random read per row. (3) The
+index carries the row (`(k, row)`), so the build IS the sort of the payloads and a
+page is a sequential read: the apply flat at 125–190 ms per 50,000-row page from the
+first page to the last, 10.3 s for the 62. The stage key is the row's key plus its
+ordinal, unique by construction, so a page is `k > last ORDER BY k LIMIT n` on the
+index — a row-value `(k, rowid) > (?, ?)` could not use it and re-sorted the stage
+per page. SQLite's sorter budgets itself on the MAIN database's `cache_size` per
+worker thread (128 MB × 3 measured 390 MB): one thread and a 32 MB cache for the
+build, the seed's 128 MB back for the apply. The temp database is a file with an
+8–32 MB cache of its own; the rows are written twice, which is disk, not memory. On
+PostgreSQL the chunks go in as they come — COPY into a heap needs no order.
+
+**Measured**, `scripts/scenarios/seed_stream.py`, two seeds of the 3 M-row
+test_types chain in their own processes: same 3,055,002 rows and checksum, the
+watermark written; the whole-object path 11.0 s at 1,138 MB peak, the streaming
+path 22.7 s at 329 MB — the seed's 128 MB page cache, the temp cache, one page of
+rows and its bindings. `ZB_SEED_TRACE=1` prints the phases and the peak RSS after
+each. Not built for the TypeScript client: the browser and Node hold the document
+today, and a phone runs libzb.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

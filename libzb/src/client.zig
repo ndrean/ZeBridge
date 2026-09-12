@@ -62,6 +62,16 @@ pub const Options = struct {
     /// for the whole step. Bounds what a seed holds in memory at once (a chunk's
     /// bindings, not the document) and how long the replica's lock is held.
     seed_chunk_rows: usize = 50_000,
+    /// §10fh: the streaming seed, for a host that cannot hold a chain object
+    /// inflated (a phone). Off, a step is fetched and inflated whole, its rows
+    /// indexed and sorted by key, then applied in chunks: the fastest apply, at the
+    /// cost of the inflated document in memory (1.16 GB for 3 M rows). On, the
+    /// object is read from the store chunk by chunk, inflated through a window, and
+    /// rows are cut from the window into chunks of `seed_chunk_rows`, each sorted by
+    /// key on its own and applied: what a step holds is one object-store chunk, the
+    /// window, one chunk of rows and its index. The sort is per chunk, so the b-tree
+    /// sees `seed_chunk_rows` runs of ordered keys instead of one — slower, bounded.
+    seed_streaming: bool = false,
 };
 
 const TableState = struct {
@@ -1322,6 +1332,11 @@ pub const SyncClient = struct {
             defer sa.deinit();
             const step_a = sa.allocator();
             var t_ph = msNow();
+            const is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full");
+            if (self.opts.seed_streaming) {
+                applied += try self.applyStepStreaming(step_a, table, st, man, step, bucket, is_full, &ph);
+                continue;
+            }
             const raw = try self.t.objectGetBytes(step_a, bucket, step.object.get("name").?.string);
             // §10x: a delta names the dictionary it was compressed with; fetch it
             // once per era from the same bucket and keep it (immutable by name, so
@@ -1353,7 +1368,6 @@ pub const SyncClient = struct {
             var cols: []const []const u8 = &.{};
             var index: ?RowIndex = null;
             var vcol_doc: ?[]const u8 = null;
-            const is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full");
             for (0..nkeys) |_| {
                 const mkey = cur.readStr() catch return error.ChainObjectMalformed;
                 if (std.mem.eql(u8, mkey, "columns")) {
@@ -1376,22 +1390,7 @@ pub const SyncClient = struct {
             const vcol_v: ?[]const u8 = vcol_doc orelse (if (man.object.get("version_column")) |v| (if (v == .string) v.string else null) else null);
             const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
             const order = try sortedByKeys(step_a, idx.keys);
-            var array_idx_list: std.ArrayListUnmanaged(usize) = .empty;
-            if (self.st.engine == .postgres) for (st.array_cols) |ac| {
-                if (indexOf(cols, ac)) |i| try array_idx_list.append(step_a, i);
-            };
-            const array_idx = array_idx_list.items;
-            var geom_idx_list: std.ArrayListUnmanaged(usize) = .empty;
-            if (self.st.engine == .postgres) for (st.geom_cols) |gc| {
-                if (indexOf(cols, gc)) |i| try geom_idx_list.append(step_a, i);
-            };
-            const geom_idx = geom_idx_list.items;
-            var vec_idx_list: std.ArrayListUnmanaged(VecIdx) = .empty;
-            if (self.st.engine == .postgres) for (st.vec_cols) |vc| {
-                if (indexOf(cols, vc.name)) |i| try vec_idx_list.append(step_a, .{ .i = i, .kind = vc.kind, .bits = vc.bits });
-            };
-            const vec_idx = vec_idx_list.items;
-            const copy_sql: []const u8 = if (self.st.engine == .postgres) try core.pgUpsertFromCopySql(step_a, table, cols, st.pk, vcol) else "";
+            const shape = try self.stepShape(step_a, table, st.*, cols, vcol, is_full);
             var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer copy_buf.deinit(self.a);
             ph[2] += msNow() - t_ph;
@@ -1400,28 +1399,7 @@ pub const SyncClient = struct {
             var from: usize = 0;
             while (from < idx.offsets.len or (from == 0 and is_full)) {
                 const to = @min(from + chunk, idx.offsets.len);
-                const cs = ChainStep{
-                    .client = self,
-                    .a = step_a,
-                    .table = table,
-                    .sql = if (is_full) try core.chainInsertSql(step_a, table, cols) else try core.chainUpsertSql(step_a, table, cols, st.pk, vcol),
-                    .bytes = blob,
-                    .offsets = idx.offsets,
-                    .order = order,
-                    .from = from,
-                    .to = to,
-                    .is_full = is_full,
-                    .first_chunk = from == 0,
-                    .cols = cols,
-                    .pk = st.pk,
-                    .tomb_idx = if (st.tombstone_col) |tc| indexOf(cols, tc) else null,
-                    .array_idx = array_idx,
-                    .geom_idx = geom_idx,
-                    .vec_idx = vec_idx,
-                    .copy = self.st.engine == .postgres,
-                    .copy_upsert_sql = copy_sql,
-                    .copy_buf = &copy_buf,
-                };
+                const cs = shape.step(self, step_a, blob, idx.offsets, order, from, to, from == 0, &copy_buf);
                 self.st.transaction(cs, ChainStep.apply) catch |err| {
                     std.debug.print("{s}: chain step {s} ({s}, rows {d}..{d} of {d}) rolled back: {any}\n", .{
                         table, step.object.get("name").?.string, if (is_full) "full" else "delta", from, to, idx.offsets.len, err,
@@ -1458,7 +1436,347 @@ pub const SyncClient = struct {
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, st.seed_lsn orelse 0);
-        std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3] });
+        std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms{s}\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], if (self.opts.seed_streaming) " (streaming: fetch+inflate as read, decode = index+sort per chunk)" else "" });
+    }
+
+    /// §10fh: one chain step, streamed. The object is read from the store a chunk at a
+    /// time and inflated through a window (StreamInflate); the document's keys are
+    /// parsed from the window as they complete — a parse that runs out of bytes before
+    /// the source is exhausted just means "read more", after it means malformed. Rows
+    /// are copied out of the window into a chunk buffer of `seed_chunk_rows`, indexed,
+    /// sorted by key and applied through the same ChainStep as the whole-object path;
+    /// the chunk buffer is reused, so a step never holds more than one chunk of rows.
+    /// Returns the rows applied.
+    fn applyStepStreaming(self: *SyncClient, step_a: std.mem.Allocator, table: []const u8, st: *TableState, man: Value, step: Value, bucket: []const u8, is_full: bool, ph: *[4]i64) !usize {
+        const name = step.object.get("name").?.string;
+        var dict: ?[]const u8 = null;
+        if (step.object.get("dict")) |dv| if (dv == .string) {
+            if (self.dicts.get(dv.string)) |d| {
+                dict = d;
+            } else {
+                const la = self.aa();
+                const d = try self.t.objectGetBytes(la, bucket, dv.string);
+                try self.dicts.put(la, try la.dupe(u8, dv.string), d);
+                dict = d;
+            }
+        };
+        var res = try transport.ObjectPull.open(self.t, step_a, bucket, name);
+        defer res.deinit();
+        var zs = try StreamInflate.init(self.a, &res, dict);
+        defer zs.deinit();
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+
+        var t_ph = msNow();
+        const nkeys = try zs.parse(&scratch, MpCursor.readMapLen);
+        var cols: []const []const u8 = &.{};
+        var nrows: ?usize = null;
+        var keys_after: usize = 0;
+        for (0..nkeys) |k| {
+            const mkey = try step_a.dupe(u8, try zs.parse(&scratch, MpCursor.readStr));
+            if (std.mem.eql(u8, mkey, "columns")) {
+                // ⚠️ Duped: the value lives in the scratch arena, reset at the next
+                // parse — the list sliced into it and read row bytes as column names
+                // (the key column was never found; the stage sorted by ordinal, and
+                // the apply ran in arrival order: 94 s for what takes 9 s in order).
+                const v = try zs.parseValue(&scratch);
+                cols = try dupeStrings(step_a, try jsonStrList(scratch.allocator(), try mpToJson(scratch.allocator(), v)));
+                for (cols) |col| if (!contains(st.cols, col)) {
+                    std.debug.print("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full\n", .{ table, name, col });
+                    return error.ChainObjectMalformed;
+                };
+            } else if (std.mem.eql(u8, mkey, "rows")) {
+                if (cols.len == 0) return error.ChainObjectMalformed;
+                nrows = try zs.parse(&scratch, MpCursor.readArrayLen);
+                keys_after = nkeys - k - 1;
+                break;
+            } else {
+                _ = try zs.parseValue(&scratch);
+            }
+        }
+        const total = nrows orelse return error.ChainObjectMalformed;
+        // The version column is needed before the rows, and the document names it
+        // after them: the manifest's is the same column, as of the chain's last step.
+        const vcol_v: ?[]const u8 = if (man.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
+        const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
+        const shape = try self.stepShape(step_a, table, st.*, cols, vcol, is_full);
+        var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer copy_buf.deinit(self.a);
+        const chunk_rows: usize = if (self.opts.seed_chunk_rows == 0) @max(total, 1) else self.opts.seed_chunk_rows;
+
+        // On SQLite the rows are STAGED: an unindexed temp table takes them in arrival
+        // order (batches of `stage_batch` in transactions of `chunk_rows`), one index
+        // build sorts them on disk, and keyed pages come back in GLOBAL key order for
+        // the apply. Sorting per chunk instead (the first cut) put 61 runs of random
+        // keys into a 3 M-entry b-tree and took 127 s where the whole-object seed takes
+        // 11 s; the staged sort keeps the order the b-tree wants, at the cost of the
+        // rows written twice. On PostgreSQL the chunks go in as they come — COPY into
+        // a heap needs no order.
+        const staged = self.st.engine == .sqlite;
+        const stage_batch: usize = 64;
+        if (staged) {
+            self.st.execSimple("DROP TABLE IF EXISTS temp._zbz_stage") catch {};
+            // The stage lives in the temp database: a file, with a cache of its own
+            // kept small — the sorter and the stage's pages are what a phone must not
+            // hold, the replica's cache (128 MB for the seed) is what the ordered
+            // apply wants.
+            self.st.execSimple("PRAGMA temp_store = FILE") catch {};
+            self.st.execSimple("PRAGMA temp.cache_size = -32768") catch {};
+            try self.st.execSimple("CREATE TEMP TABLE _zbz_stage (k BLOB, row BLOB)");
+        }
+        defer if (staged) self.st.execSimple("DROP TABLE IF EXISTS temp._zbz_stage") catch {};
+        const stage_sql = try stageInsertSql(step_a, stage_batch);
+
+        var chunk_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer chunk_buf.deinit(self.a);
+        var chunk_arena = std.heap.ArenaAllocator.init(self.a);
+        defer chunk_arena.deinit();
+        var batch_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        var batch_offs: std.ArrayListUnmanaged(usize) = .empty;
+        var in_chunk: usize = 0;
+        var chunk_no: usize = 0;
+        var applied: usize = 0;
+        var i: usize = 0;
+        if (staged and total > 0) try self.st.execSimple("BEGIN");
+        while (i < total or (total == 0 and is_full and chunk_no == 0 and !staged)) {
+            if (i < total) {
+                const len = try zs.parseRowLen(&scratch);
+                const row = zs.avail()[0..len];
+                if (staged) {
+                    // the key now, while the row is in the window; the row itself is
+                    // copied into the batch buffer — the window moves under it
+                    const ba = chunk_arena.allocator();
+                    var kc = MpCursor{ .bytes = row };
+                    const ki = try self.indexRows(ba, &kc, 1, cols, st.pk);
+                    // the key made unique by the row's ordinal, so a page is
+                    // `k > last` on the index — no row-value trick, no re-sort per page
+                    const kb = try ba.alloc(u8, ki.keys[0].len + 8);
+                    @memcpy(kb[0..ki.keys[0].len], ki.keys[0]);
+                    std.mem.writeInt(u64, kb[ki.keys[0].len..][0..8], @intCast(i), .big);
+                    try batch_keys.append(ba, kb);
+                    try batch_offs.append(ba, chunk_buf.items.len);
+                }
+                try chunk_buf.appendSlice(self.a, row);
+                zs.consumed += len;
+                in_chunk += 1;
+                i += 1;
+                if (staged and (batch_keys.items.len == stage_batch or i == total)) {
+                    const n = batch_keys.items.len;
+                    const ba = chunk_arena.allocator();
+                    const params = try ba.alloc(storage.Value, n * 2);
+                    for (0..n) |bi| {
+                        const end = if (bi + 1 < n) batch_offs.items[bi + 1] else chunk_buf.items.len;
+                        params[bi * 2] = .{ .blob = batch_keys.items[bi] };
+                        params[bi * 2 + 1] = .{ .blob = chunk_buf.items[batch_offs.items[bi]..end] };
+                    }
+                    _ = try self.st.query(ba, if (n == stage_batch) stage_sql else try stageInsertSql(ba, n), params);
+                    chunk_buf.clearRetainingCapacity();
+                    batch_keys = .empty;
+                    batch_offs = .empty;
+                    _ = chunk_arena.reset(.retain_capacity);
+                }
+            }
+            if (in_chunk == chunk_rows or i == total) {
+                if (staged) {
+                    try self.st.execSimple("COMMIT");
+                    if (i < total) try self.st.execSimple("BEGIN");
+                    in_chunk = 0;
+                    chunk_no += 1;
+                    continue;
+                }
+                ph[1] += msNow() - t_ph;
+                t_ph = msNow();
+                _ = chunk_arena.reset(.retain_capacity);
+                const ca = chunk_arena.allocator();
+                var cur = MpCursor{ .bytes = chunk_buf.items };
+                const idx = try self.indexRows(ca, &cur, in_chunk, cols, st.pk);
+                const order = try sortedByKeys(ca, idx.keys);
+                ph[2] += msNow() - t_ph;
+                t_ph = msNow();
+                const cs = shape.step(self, ca, chunk_buf.items, idx.offsets, order, 0, in_chunk, chunk_no == 0, &copy_buf);
+                self.st.transaction(cs, ChainStep.apply) catch |err| {
+                    std.debug.print("{s}: chain step {s} ({s}, streaming chunk {d}, {d} row(s), {d} of {d} read) rolled back: {any}\n", .{
+                        table, name, if (is_full) "full" else "delta", chunk_no, in_chunk, i, total, err,
+                    });
+                    return err;
+                };
+                ph[3] += msNow() - t_ph;
+                t_ph = msNow();
+                applied += in_chunk;
+                chunk_buf.clearRetainingCapacity();
+                in_chunk = 0;
+                chunk_no += 1;
+                if (total == 0) break;
+            }
+        }
+        // The keys after `rows` (gen, kind, cutoff, version_column, prev_cutoff):
+        // read to the end of the document, so a truncated object is an error here.
+        for (0..keys_after) |_| {
+            _ = try zs.parse(&scratch, MpCursor.readStr);
+            _ = try zs.parseValue(&scratch);
+        }
+        ph[1] += msNow() - t_ph;
+        t_ph = msNow();
+        try res.verify();
+        if (!staged) return applied;
+        const trace = std.c.getenv("ZB_SEED_TRACE") != null;
+        if (trace) std.debug.print("  trace: staged {d} rows in {d} ms, maxrss {d} MB\n", .{ total, msNow() - t_ph + ph[1], maxRssMb() });
+
+        // ── the staged apply: one sort, then pages in key order ──────────────────
+        // The index CARRIES the row: building it is the external sort of the rows
+        // themselves (SQLite's sorter, temp files, the temp cache's memory), and a
+        // page is then a sequential read of the index. An index on the key alone
+        // sorted the keys and fetched each row from the stage by rowid — a random
+        // read per row, 3 M of them, 60 s.
+        // SQLite's sorter budgets itself on the MAIN database's cache_size, per worker
+        // thread: 128 MB × 3 measured 390 MB. One thread and a 32 MB cache for the
+        // build; the seed's cache back for the apply, which is what wants it.
+        self.st.execSimple("PRAGMA threads = 0") catch {};
+        self.st.execSimple("PRAGMA cache_size = -32768") catch {};
+        try self.st.execSimple("CREATE INDEX _zbz_stage_k ON _zbz_stage (k, row)");
+        self.st.execSimple("PRAGMA cache_size = -131072") catch {};
+        ph[2] += msNow() - t_ph;
+        if (trace) std.debug.print("  trace: index built in {d} ms, maxrss {d} MB\n", .{ msNow() - t_ph, maxRssMb() });
+        t_ph = msNow();
+        var sel_ms: i64 = 0;
+        var app_ms: i64 = 0;
+        var inversions: usize = 0;
+        var prev_k: std.ArrayListUnmanaged(u8) = .empty;
+        defer prev_k.deinit(self.a);
+        var last_k: std.ArrayListUnmanaged(u8) = .empty;
+        defer last_k.deinit(self.a);
+        var page_no: usize = 0;
+        while (true) {
+            _ = chunk_arena.reset(.retain_capacity);
+            const ca = chunk_arena.allocator();
+            const t_sel = msNow();
+            const rows = try self.st.query(ca, "SELECT k, row FROM _zbz_stage WHERE k > ? ORDER BY k LIMIT ?", &.{ .{ .blob = last_k.items }, .{ .integer = @intCast(chunk_rows) } });
+            sel_ms += msNow() - t_sel;
+            if (rows.len == 0 and !(page_no == 0 and is_full)) break;
+            chunk_buf.clearRetainingCapacity();
+            const offsets = try ca.alloc(usize, rows.len);
+            const order = try ca.alloc(usize, rows.len);
+            for (rows, 0..) |r, ri| {
+                offsets[ri] = chunk_buf.items.len;
+                order[ri] = ri;
+                if (trace) {
+                    const kk: []const u8 = switch (r[0]) {
+                        .blob => |bb| bb,
+                        .text => |tt| tt,
+                        else => "",
+                    };
+                    if (prev_k.items.len > 0 and std.mem.order(u8, prev_k.items, kk) != .lt) inversions += 1;
+                    prev_k.clearRetainingCapacity();
+                    try prev_k.appendSlice(self.a, kk);
+                }
+                try chunk_buf.appendSlice(self.a, switch (r[1]) {
+                    .blob => |bb| bb,
+                    .text => |tt| tt,
+                    else => return error.ChainObjectMalformed,
+                });
+            }
+            if (rows.len > 0) {
+                last_k.clearRetainingCapacity();
+                try last_k.appendSlice(self.a, switch (rows[rows.len - 1][0]) {
+                    .blob => |bb| bb,
+                    .text => |tt| tt,
+                    else => "",
+                });
+            }
+            const cs = shape.step(self, ca, chunk_buf.items, offsets, order, 0, rows.len, page_no == 0, &copy_buf);
+            const t_app = msNow();
+            self.st.transaction(cs, ChainStep.apply) catch |err| {
+                std.debug.print("{s}: chain step {s} ({s}, staged page {d}, {d} row(s)) rolled back: {any}\n", .{
+                    table, name, if (is_full) "full" else "delta", page_no, rows.len, err,
+                });
+                return err;
+            };
+            app_ms += msNow() - t_app;
+            if (trace and (page_no < 3 or page_no % 20 == 0)) std.debug.print("  trace: page {d}: {d} rows, apply {d} ms, maxrss {d} MB, inversions so far {d}\n", .{ page_no, rows.len, msNow() - t_app, maxRssMb(), inversions });
+            applied += rows.len;
+            page_no += 1;
+            if (rows.len < chunk_rows) break;
+        }
+        ph[3] += msNow() - t_ph;
+        if (trace) std.debug.print("  trace: {d} page(s): select {d} ms, apply {d} ms, maxrss {d} MB\n", .{ page_no, sel_ms, app_ms, maxRssMb() });
+        return applied;
+    }
+
+    /// `INSERT INTO _zbz_stage (k, row) VALUES (?, ?), …` for `n` rows.
+    fn stageInsertSql(a: std.mem.Allocator, n: usize) ![]const u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.appendSlice(a, "INSERT INTO _zbz_stage (k, row) VALUES ");
+        for (0..n) |k| try out.appendSlice(a, if (k == 0) "(?, ?)" else ", (?, ?)");
+        return out.toOwnedSlice(a);
+    }
+
+    /// What every chunk of a step shares — the statement, the column indices a
+    /// PostgreSQL replica renders specially, the COPY upsert — built once per step.
+    const StepShape = struct {
+        table: []const u8,
+        sql: []const u8,
+        is_full: bool,
+        cols: []const []const u8,
+        pk: []const []const u8,
+        tomb_idx: ?usize,
+        array_idx: []const usize,
+        geom_idx: []const usize,
+        vec_idx: []const VecIdx,
+        copy: bool,
+        copy_upsert_sql: []const u8,
+
+        fn step(self: StepShape, client: *SyncClient, a: std.mem.Allocator, bytes: []const u8, offsets: []const usize, order: []const usize, from: usize, to: usize, first_chunk: bool, copy_buf: *std.ArrayListUnmanaged(u8)) ChainStep {
+            return .{
+                .client = client,
+                .a = a,
+                .table = self.table,
+                .sql = self.sql,
+                .bytes = bytes,
+                .offsets = offsets,
+                .order = order,
+                .from = from,
+                .to = to,
+                .is_full = self.is_full,
+                .first_chunk = first_chunk,
+                .cols = self.cols,
+                .pk = self.pk,
+                .tomb_idx = self.tomb_idx,
+                .array_idx = self.array_idx,
+                .geom_idx = self.geom_idx,
+                .vec_idx = self.vec_idx,
+                .copy = self.copy,
+                .copy_upsert_sql = self.copy_upsert_sql,
+                .copy_buf = copy_buf,
+            };
+        }
+    };
+
+    fn stepShape(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, cols: []const []const u8, vcol: ?[]const u8, is_full: bool) !StepShape {
+        var array_idx_list: std.ArrayListUnmanaged(usize) = .empty;
+        if (self.st.engine == .postgres) for (st.array_cols) |ac| {
+            if (indexOf(cols, ac)) |i| try array_idx_list.append(a, i);
+        };
+        var geom_idx_list: std.ArrayListUnmanaged(usize) = .empty;
+        if (self.st.engine == .postgres) for (st.geom_cols) |gc| {
+            if (indexOf(cols, gc)) |i| try geom_idx_list.append(a, i);
+        };
+        var vec_idx_list: std.ArrayListUnmanaged(VecIdx) = .empty;
+        if (self.st.engine == .postgres) for (st.vec_cols) |vc| {
+            if (indexOf(cols, vc.name)) |i| try vec_idx_list.append(a, .{ .i = i, .kind = vc.kind, .bits = vc.bits });
+        };
+        return .{
+            .table = table,
+            .sql = if (is_full) try core.chainInsertSql(a, table, cols) else try core.chainUpsertSql(a, table, cols, st.pk, vcol),
+            .is_full = is_full,
+            .cols = cols,
+            .pk = st.pk,
+            .tomb_idx = if (st.tombstone_col) |tc| indexOf(cols, tc) else null,
+            .array_idx = array_idx_list.items,
+            .geom_idx = geom_idx_list.items,
+            .vec_idx = vec_idx_list.items,
+            .copy = self.st.engine == .postgres,
+            .copy_upsert_sql = if (self.st.engine == .postgres) try core.pgUpsertFromCopySql(a, table, cols, st.pk, vcol) else "",
+        };
     }
 
     // ─── step 3: CDC catch-up (gate → apply → hold → positions) ─────────────
@@ -2998,6 +3316,14 @@ fn storageToJson(a: std.mem.Allocator, v: storage.Value) error{OutOfMemory}!Valu
 /// one that exists, and REALTIME is required rather than MONOTONIC: this is a wall
 /// clock stamp that another machine will compare against, not an interval.
 /// Milliseconds of wall clock, for the seed's phase timers.
+/// The process's peak resident set, in MB (getrusage; bytes on macOS, KB on Linux).
+fn maxRssMb() u64 {
+    var ru: std.c.rusage = undefined;
+    if (std.c.getrusage(0, &ru) != 0) return 0;
+    const raw: u64 = @intCast(ru.maxrss);
+    return if (@import("builtin").os.tag == .macos) raw / (1 << 20) else raw / 1024;
+}
+
 fn msNow() i64 {
     const ts = nowRealtime();
     return @as(i64, @intCast(ts.sec)) * 1000 + @divFloor(@as(i64, @intCast(ts.nsec)), 1_000_000);
@@ -3141,6 +3467,169 @@ const MpCursor = struct {
     /// Past one value, whatever it is (decoded into `a`, which should be a scratch).
     fn skipValue(self: *MpCursor, a: std.mem.Allocator) !void {
         _ = try self.readValue(a);
+    }
+
+    /// §10fh: skip one value and say how long it was — the streaming seed's row cut.
+    fn skipValueLen(self: *MpCursor, a: std.mem.Allocator) !usize {
+        const start = self.off;
+        _ = try self.readValue(a);
+        return self.off - start;
+    }
+};
+
+/// §10fh: a chain object inflated as it is read from the object store (ObjectPull,
+/// a batch of chunks at a time). Holds 128 KB of input, the zstd context, and a window of output
+/// that grows to fit the largest value parsed from it. Plain objects (no zstd
+/// magic — the producer writes zstd, but §10w keeps mixed chains legal) go through
+/// the same window. `parse` runs a cursor operation on the unread part of the
+/// window: when the operation runs out of bytes and the source has more, the window
+/// is filled and the operation retried; when the source is exhausted, the failure
+/// is the document's.
+const StreamInflate = struct {
+    res: *transport.ObjectPull,
+    a: std.mem.Allocator,
+    dctx: ?*C.ZSTD_DCtx = null,
+    dict: ?[]const u8,
+    in_buf: []u8,
+    in: C.ZSTD_inBuffer,
+    sniffed: bool = false,
+    plain: bool = false,
+    window: std.ArrayListUnmanaged(u8) = .empty,
+    consumed: usize = 0,
+    src_eof: bool = false,
+    eof: bool = false,
+
+    const in_size: usize = 128 * 1024;
+    const window_step: usize = 4 * 1024 * 1024;
+
+    fn init(a: std.mem.Allocator, res: *transport.ObjectPull, dict: ?[]const u8) !StreamInflate {
+        const in_buf = try a.alloc(u8, in_size);
+        return .{ .res = res, .a = a, .dict = dict, .in_buf = in_buf, .in = .{ .src = in_buf.ptr, .size = 0, .pos = 0 } };
+    }
+
+    fn deinit(self: *StreamInflate) void {
+        if (self.dctx) |d| _ = C.ZSTD_freeDCtx(d);
+        self.window.deinit(self.a);
+        self.a.free(self.in_buf);
+    }
+
+    fn avail(self: *StreamInflate) []const u8 {
+        return self.window.items[self.consumed..];
+    }
+
+    /// More input from the store into `in_buf`; false when the source is exhausted.
+    fn readInput(self: *StreamInflate) !bool {
+        if (self.src_eof) return false;
+        var n: usize = 0;
+        while (n < self.in_buf.len) {
+            const got = try self.res.read(self.in_buf[n..]);
+            if (got == 0) {
+                self.src_eof = true;
+                break;
+            }
+            n += got;
+        }
+        self.in = .{ .src = self.in_buf.ptr, .size = n, .pos = 0 };
+        return n > 0;
+    }
+
+    /// The window gains bytes, or `eof` is set. The consumed prefix is dropped first,
+    /// so the window holds only what is still unparsed plus what this call adds.
+    fn fill(self: *StreamInflate) !void {
+        if (self.eof) return;
+        if (self.consumed > 0) {
+            const rest = self.window.items.len - self.consumed;
+            std.mem.copyForwards(u8, self.window.items[0..rest], self.window.items[self.consumed..]);
+            self.window.items.len = rest;
+            self.consumed = 0;
+        }
+        if (!self.sniffed) {
+            _ = try self.readInput();
+            self.sniffed = true;
+            const b = self.in_buf[0..self.in.size];
+            self.plain = !(b.len >= 4 and b[0] == 0x28 and b[1] == 0xb5 and b[2] == 0x2f and b[3] == 0xfd);
+            if (!self.plain) {
+                const d = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
+                self.dctx = d;
+                if (self.dict) |dict| if (C.ZSTD_isError(C.ZSTD_DCtx_loadDictionary(d, dict.ptr, dict.len)) != 0) return error.ZstdDecompressFailed;
+            }
+        }
+        const before = self.window.items.len;
+        while (self.window.items.len == before and !self.eof) {
+            if (self.plain) {
+                if (self.in.pos < self.in.size) {
+                    try self.window.appendSlice(self.a, self.in_buf[self.in.pos..self.in.size]);
+                    self.in.pos = self.in.size;
+                } else if (!(try self.readInput())) {
+                    self.eof = true;
+                }
+                continue;
+            }
+            if (self.in.pos >= self.in.size and !(try self.readInput())) {
+                // the frame did not end and the source is dry: whatever is parsed
+                // from here on fails as malformed, which it is (a truncated object).
+                self.eof = true;
+                break;
+            }
+            try self.window.ensureUnusedCapacity(self.a, window_step);
+            var out: C.ZSTD_outBuffer = .{ .dst = self.window.items.ptr + self.window.items.len, .size = self.window.capacity - self.window.items.len, .pos = 0 };
+            const r = C.ZSTD_decompressStream(self.dctx.?, &out, &self.in);
+            if (C.ZSTD_isError(r) != 0) return error.ZstdDecompressFailed;
+            self.window.items.len += out.pos;
+            if (r == 0) self.eof = true; // the frame is complete
+        }
+    }
+
+    /// One header operation (`readMapLen`, `readStr`, `readArrayLen`) over the unread
+    /// window, retried with more bytes until it succeeds or the source is exhausted;
+    /// on success the bytes are consumed.
+    fn parse(self: *StreamInflate, scratch: *std.heap.ArenaAllocator, comptime op: anytype) !ReturnOf(op) {
+        while (true) {
+            _ = scratch.reset(.retain_capacity);
+            var cur = MpCursor{ .bytes = self.avail() };
+            if (op(&cur)) |v| {
+                self.consumed += cur.off;
+                return v;
+            } else |err| {
+                if (self.eof) return err;
+                try self.fill();
+            }
+        }
+    }
+
+    /// The length of the next value (a row), which is NOT consumed: the caller copies
+    /// `avail()[0..len]` out of the window first, then consumes.
+    fn parseRowLen(self: *StreamInflate, scratch: *std.heap.ArenaAllocator) !usize {
+        while (true) {
+            _ = scratch.reset(.retain_capacity);
+            var cur = MpCursor{ .bytes = self.avail() };
+            if (cur.skipValueLen(scratch.allocator())) |len| {
+                return len;
+            } else |err| {
+                if (self.eof) return err;
+                try self.fill();
+            }
+        }
+    }
+
+    /// A whole value, read through the library, consumed.
+    fn parseValue(self: *StreamInflate, scratch: *std.heap.ArenaAllocator) !msgpack.Payload {
+        while (true) {
+            _ = scratch.reset(.retain_capacity);
+            var cur = MpCursor{ .bytes = self.avail() };
+            if (cur.readValue(scratch.allocator())) |v| {
+                self.consumed += cur.off;
+                return v;
+            } else |err| {
+                if (self.eof) return err;
+                try self.fill();
+            }
+        }
+    }
+
+    fn ReturnOf(comptime op: anytype) type {
+        const ret = @typeInfo(@TypeOf(op)).@"fn".return_type.?;
+        return @typeInfo(ret).error_union.payload;
     }
 };
 

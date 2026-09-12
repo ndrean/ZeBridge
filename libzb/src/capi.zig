@@ -396,6 +396,12 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         const f = o.object.get("seedChunkRows") orelse break :blk 50_000;
         break :blk if (f == .integer and f.integer >= 0) @intCast(f.integer) else 50_000;
     };
+    // seedStreaming (§10fh): the chain object inflated as it is read, rows applied in
+    // chunks sorted on their own — bounded memory for a phone; off by default.
+    const seed_streaming: bool = blk: {
+        const f = o.object.get("seedStreaming") orelse break :blk false;
+        break :blk f == .bool and f.bool;
+    };
     // The tables, parents first, each its own allocation so the box can free them.
     const tv = o.object.get("tables");
     const ntab: usize = if (tv != null and tv.? == .array) tv.?.array.items.len else 0;
@@ -420,6 +426,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .grammar_hash = grammar_hash,
             .heartbeat_ms = heartbeat_ms,
             .seed_chunk_rows = seed_chunk_rows,
+            .seed_streaming = seed_streaming,
             .db_path = db,
             .db_url = if (db_url) |u| u.ptr else null,
             .principal = principal,

@@ -1218,6 +1218,7 @@ final zb = await ZeBridgeWorker.spawn({
   "tables": ["counter_public", "counter_tenant", "app_users", "app_orders"],
   "clientId": "flutter-client",
   "seedChunkRows": 50000,               // rows per transaction when a chain seeds a table (0 = one); bounds memory and the lock
+  "seedStreaming": false,               // true on a phone: the chain object is never held inflated (3 M rows: 329 MB peak instead of 1.1 GB, 23 s instead of 11)
   // "dbUrl": "postgres://user@host/db", // instead of dbPath: the replica on a PostgreSQL server (a libpq URL) — the micro-VM case
 });
 print(zb.tenant);                       // resolved by the worker's first sync

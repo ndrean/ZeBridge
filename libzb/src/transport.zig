@@ -16,6 +16,109 @@ pub const ConnectOptions = struct {
     password: ?[]const u8 = null,
 };
 
+/// §10fh: a chain object read through a PULL consumer, a few chunks at a time — the
+/// streaming seed's source. The object store's own reader is a push subscription:
+/// the server sends every chunk at once and the client's pending queue (64 MB)
+/// drops the rest as SlowConsumer the moment the reader pauses to apply a chunk of
+/// rows (measured: the seed stopped after its first 50,000 rows). A pull consumer
+/// asks for `batch` chunks when it wants them, the way CDC is read (§10bh) and the
+/// way the TypeScript client reads objects (@nats-io/obj #430). Memory held: one
+/// batch of chunk messages (8 × 128 KB). The digest is checked at the end, as the
+/// store's reader does.
+pub const ObjectPull = struct {
+    a: std.mem.Allocator,
+    sub: *nats.PullSubscription,
+    chunks: u32,
+    size: u64,
+    digest: []const u8,
+    batch: ?nats.MessageBatch = null,
+    bi: usize = 0,
+    pos: usize = 0,
+    chunk_index: u32 = 0,
+    hasher: std.crypto.hash.sha2.Sha256 = std.crypto.hash.sha2.Sha256.init(.{}),
+    eof: bool = false,
+
+    const batch_size: usize = 8;
+    const Ctr = struct {
+        var n = std.atomic.Value(u32).init(0);
+    };
+
+    pub fn open(t: *Transport, a: std.mem.Allocator, bucket: []const u8, name: []const u8) !ObjectPull {
+        const stream = try std.fmt.allocPrint(a, "OBJ_{s}", .{bucket});
+        const enc = try a.alloc(u8, std.base64.url_safe.Encoder.calcSize(name.len));
+        _ = std.base64.url_safe.Encoder.encode(enc, name);
+        const meta_subject = try std.fmt.allocPrint(a, "$O.{s}.M.{s}", .{ bucket, enc });
+        const msg = t.js.getMsg(stream, .{ .last_by_subj = meta_subject, .direct = true }) catch |err| switch (err) {
+            error.MessageNotFound => return error.ObjectNotFound,
+            else => return err,
+        };
+        defer msg.deinit();
+        const Info = struct { nuid: []const u8, size: u64 = 0, chunks: u32 = 0, digest: []const u8 = "", deleted: bool = false };
+        const info = (try std.json.parseFromSliceLeaky(Info, a, msg.data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }));
+        if (info.deleted) return error.ObjectNotFound;
+        const chunk_subject = try std.fmt.allocPrint(a, "$O.{s}.C.{s}", .{ bucket, info.nuid });
+        // Named like the CDC consumers (pid + counter), reaped by the server after
+        // 30 s idle: the client JWT has no CONSUMER.DELETE grant (see openConsumer).
+        const cname = try std.fmt.allocPrint(a, "zbo{d}x{d}", .{ std.c.getpid(), Ctr.n.fetchAdd(1, .monotonic) });
+        var cfg: nats.ConsumerConfig = .{ .ack_policy = .none, .deliver_policy = .all };
+        cfg.name = cname;
+        cfg.durable_name = cname;
+        cfg.inactive_threshold = 30 * std.time.ns_per_s;
+        const sub = try t.js.pullSubscribe(chunk_subject, cname, .{ .stream = stream, .config = cfg });
+        return .{ .a = a, .sub = sub, .chunks = info.chunks, .size = info.size, .digest = info.digest };
+    }
+
+    pub fn deinit(self: *ObjectPull) void {
+        if (self.batch) |*b| b.deinit();
+        self.sub.deinit();
+    }
+
+    /// The next bytes of the object into `dest`; 0 at the end.
+    pub fn read(self: *ObjectPull, dest: []u8) !usize {
+        while (!self.eof) {
+            if (self.batch) |*b| {
+                if (self.bi < b.messages.len) {
+                    const data = b.messages[self.bi].msg.data;
+                    const n = @min(dest.len, data.len - self.pos);
+                    @memcpy(dest[0..n], data[self.pos..][0..n]);
+                    self.pos += n;
+                    if (self.pos >= data.len) {
+                        self.hasher.update(data);
+                        self.bi += 1;
+                        self.pos = 0;
+                        self.chunk_index += 1;
+                        if (self.chunk_index >= self.chunks) self.eof = true;
+                    }
+                    return n;
+                }
+                b.deinit();
+                self.batch = null;
+                self.bi = 0;
+            }
+            if (self.chunk_index >= self.chunks) {
+                self.eof = true;
+                break;
+            }
+            const want: usize = @min(batch_size, self.chunks - self.chunk_index);
+            self.batch = try self.sub.fetch(want, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } });
+            if (self.batch.?.messages.len == 0) return error.ObjectTruncated;
+        }
+        return 0;
+    }
+
+    /// The object's digest against what was read — a chunk lost or replaced is an error.
+    pub fn verify(self: *ObjectPull) !void {
+        if (self.chunk_index < self.chunks) return error.ObjectTruncated;
+        if (self.digest.len == 0) return;
+        var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        self.hasher.final(&hash);
+        var text: [8 + std.base64.url_safe.Encoder.calcSize(32)]u8 = undefined;
+        @memcpy(text[0..8], "SHA-256=");
+        _ = std.base64.url_safe.Encoder.encode(text[8..], &hash);
+        if (!std.mem.eql(u8, &text, self.digest)) return error.ObjectDigestMismatch;
+    }
+};
+
 pub const Transport = struct {
     allocator: std.mem.Allocator,
     threaded: std.Io.Threaded,
