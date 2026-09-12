@@ -25,6 +25,12 @@ pub fn build(b: *std.Build) void {
     // id but cannot use one; plain frames still decode through std.
     const zstd_prefix: []const u8 = if (builtin.os.tag == .macos) "/opt/homebrew/opt/zstd" else "/usr";
     translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
+    // libpq for the PostgreSQL replica engine (§10fd): a client's storage may be a
+    // PostgreSQL server instead of a SQLite file — the micro-VM case.
+    const pq_prefix: []const u8 = b.option([]const u8, "libpq-prefix", "System libpq prefix") orelse
+        (if (builtin.os.tag == .macos) "/opt/homebrew/opt/libpq" else "/usr");
+    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include" }) });
+    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include", "postgresql" }) });
     const c_mod = translate_c.createModule();
 
     const nats_dep = b.dependency("nats", .{ .target = target, .optimize = optimize });
@@ -44,6 +50,8 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("sqlite3", .{});
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
     mod.linkSystemLibrary("zstd", .{});
+    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+    mod.linkSystemLibrary("pq", .{});
     mod.link_libc = true;
 
     // The C-ABI shared library: one JSON dispatch entrypoint (zb_call) +
@@ -70,6 +78,8 @@ pub fn build(b: *std.Build) void {
     demo_mod.linkSystemLibrary("sqlite3", .{});
     demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
     demo_mod.linkSystemLibrary("zstd", .{});
+    demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+    demo_mod.linkSystemLibrary("pq", .{});
     demo_mod.link_libc = true;
     const demo = b.addExecutable(.{ .name = "zb-demo", .root_module = demo_mod });
     b.installArtifact(demo);
@@ -90,6 +100,8 @@ pub fn build(b: *std.Build) void {
     soak_mod.linkSystemLibrary("sqlite3", .{});
     soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
     soak_mod.linkSystemLibrary("zstd", .{});
+    soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+    soak_mod.linkSystemLibrary("pq", .{});
     soak_mod.link_libc = true;
     b.installArtifact(b.addExecutable(.{ .name = "zb-soak", .root_module = soak_mod }));
 

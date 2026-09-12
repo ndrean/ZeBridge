@@ -378,6 +378,10 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     errdefer if (grammar_hash) |g| a.free(g);
     const db = try a.dupeZ(u8, str.get(o, "dbPath", "zb.sqlite3"));
     errdefer a.free(db);
+    // dbUrl (§10fd): a PostgreSQL replica instead of the SQLite file.
+    const db_url_raw = str.get(o, "dbUrl", "");
+    const db_url: ?[:0]u8 = if (db_url_raw.len > 0) try a.dupeZ(u8, db_url_raw) else null;
+    errdefer if (db_url) |u| a.free(u);
     const principal = try a.dupeZ(u8, str.get(o, "principal", ""));
     errdefer a.free(principal);
     const client_id = try a.dupeZ(u8, str.get(o, "clientId", "zig-client"));
@@ -417,6 +421,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .heartbeat_ms = heartbeat_ms,
             .seed_chunk_rows = seed_chunk_rows,
             .db_path = db,
+            .db_url = if (db_url) |u| u.ptr else null,
             .principal = principal,
             .tables = tables,
             .client_id = client_id,

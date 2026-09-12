@@ -42,6 +42,9 @@ pub const Options = struct {
     /// check (a bridge that could not be reached is not a mismatch).
     grammar_hash: ?[]const u8 = null,
     db_path: [*:0]const u8,
+    /// §10fd: a PostgreSQL replica instead of the SQLite file — a libpq URL. The
+    /// replica is then a database any PostgreSQL tool reads (the micro-VM case).
+    db_url: ?[*:0]const u8 = null,
     principal: []const u8,
     /// Parents FIRST is still the recommended order — but since §10cp the seed
     /// runs with foreign_keys OFF (chains are per-table snapshots cut at different
@@ -70,6 +73,13 @@ const TableState = struct {
     /// physical reap is never forwarded — so a row with it set is REMOVED here, on
     /// seed, on CDC and on the local optimistic apply alike. See `tombstoned`.
     tombstone_col: ?[]const u8,
+    /// §10fd: the columns whose PostgreSQL type is an array (the descriptor's `pg`
+    /// block). The wire carries them as JSON text (§10ey); a PostgreSQL replica binds
+    /// the array literal instead, on every apply path.
+    array_cols: []const []const u8 = &.{},
+    /// §10fe: the PostGIS columns (`pg` block, type geometry/geography): bytes into
+    /// them are bare EWKB hex in COPY text, where a bytea takes `\\x` hex.
+    geom_cols: []const []const u8 = &.{},
     route: []const u8, // the CDC stream this table's events ride
     /// For a tenant-scoped table: the stream its OPEN-TENANT rows ride (CDC_PUBLIC).
     /// Those are the shared rows every tenant may read — `zb_reader_all` admits
@@ -215,10 +225,10 @@ pub const SyncClient = struct {
         };
         errdefer self.arena.deinit();
 
-        self.st = try storage.Storage.open(opts.db_path);
+        self.st = if (opts.db_url) |url| try storage.Storage.openPostgres(url, false) else try storage.Storage.open(opts.db_path);
         errdefer self.st.close();
         // After the read-write open: that is what creates the file.
-        self.ro = try storage.Storage.openReadOnly(opts.db_path);
+        self.ro = if (opts.db_url) |url| try storage.Storage.openPostgres(url, true) else try storage.Storage.openReadOnly(opts.db_path);
         errdefer self.ro.close();
 
         // Before the transport: the grammar is compiled in (§10dq), and a hash
@@ -357,7 +367,7 @@ pub const SyncClient = struct {
         // measured 2026-08-29: a refused table's 97-byte suspension reached this
         // function and took a Python process down. Unusable → an error the caller
         // logs and skips; the replica keeps what it has.
-        const cols_v = descriptorColumns(val) orelse return error.SchemaUnusable;
+        const cols_v = descriptorColumns(val, st.engine) orelse return error.SchemaUnusable;
         const pk = try jsonStrList(a, val.object.get("pk_columns"));
         var names: std.ArrayList([]const u8) = .empty;
         for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
@@ -370,21 +380,16 @@ pub const SyncClient = struct {
         // in `<table>__migrating` and no `<table>`: finish the rename, the rows are there.
         {
             const tmp = try std.fmt.allocPrint(a, "{s}__migrating", .{table});
-            const tmp_info = try st.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = tmp }});
-            const real_info = try st.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = table }});
+            const tmp_info = try st.tableColumns(a, tmp);
+            const real_info = try st.tableColumns(a, table);
             if (tmp_info.len > 0 and real_info.len == 0) {
                 try execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE \"{s}\" RENAME TO \"{s}\";", .{ tmp, table }));
                 std.debug.print("{s}: a rebuild was interrupted before its rename — adopted {s}\n", .{ table, tmp });
             }
         }
         // FINDING 9: existence — and the existing columns — are the DATABASE's to answer.
-        const info = try st.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = table }});
-        var existing: ?[]const []const u8 = null;
-        if (info.len > 0) {
-            const ex = try a.alloc([]const u8, info.len);
-            for (info, 0..) |row, k| ex[k] = row[0].text;
-            existing = ex;
-        }
+        const info = try st.tableColumns(a, table);
+        const existing: ?[]const []const u8 = if (info.len > 0) info else null;
 
         // §10dg: the shape this replica BUILT — its own record, not an introspection
         // (whose type text differs per engine). Key shape moved → re-key: the table
@@ -402,9 +407,9 @@ pub const SyncClient = struct {
         const rekey = blk: {
             if (existing == null) break :blk false;
             if (key_before) |kb| break :blk !std.mem.eql(u8, kb, key_now);
-            const phys = try st.query(a, "SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk", &.{.{ .text = table }});
+            const phys = try st.tablePkColumns(a, table);
             if (phys.len == 0 or phys.len != pk.len) break :blk phys.len > 0;
-            for (phys, 0..) |row, k| if (!std.mem.eql(u8, row[0].text, pk[k])) break :blk true;
+            for (phys, 0..) |name, k| if (!std.mem.eql(u8, name, pk[k])) break :blk true;
             break :blk false;
         };
         const retyped = (try core.retypedColumns(a, if (rekey) null else type_before, cols_v.array)).array.items;
@@ -430,9 +435,9 @@ pub const SyncClient = struct {
             const added = diff.object.get("added").?.array.items;
             const removed = diff.object.get("removed").?.array.items;
             const fk_clauses = try core.fkClausesFor(a, fks.array);
-            const ddl_rows = try st.query(a, "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?", &.{.{ .text = table }});
-            const ddl: []const u8 = if (ddl_rows.len > 0 and ddl_rows[0][0] == .text) ddl_rows[0][0].text else "";
-            const fk_differs = try core.fkTextDiffers(a, ddl, fk_clauses);
+            // §10fd: PostgreSQL keeps no CREATE TABLE text; an FK change is not detected there.
+            const ddl: []const u8 = (try st.tableDdl(a, table)) orelse "";
+            const fk_differs = if (st.engine == .postgres) false else try core.fkTextDiffers(a, ddl, fk_clauses);
             const shape_changed = renames.len > 0 or added.len > 0 or removed.len > 0 or retyped.len > 0;
 
             if (shape_changed or fk_differs) {
@@ -514,21 +519,69 @@ pub const SyncClient = struct {
 
     /// `core.indexSyncPlan` over what the database actually holds (finding 9 again).
     fn indexPlan(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, want: std.json.Array) !Value {
-        const have_rows = try st.query(a, "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name = ? AND name NOT LIKE 'sqlite_%'", &.{.{ .text = table }});
-        const have = try a.alloc([]const u8, have_rows.len);
-        for (have_rows, 0..) |row, k| have[k] = row[0].text;
+        const have = try st.indexNames(a, table);
         return core.indexSyncPlan(a, table, have, want);
     }
 
     /// The `sqlite.columns` array of a descriptor, or null for anything that is not a
     /// usable descriptor (a suspension, a non-object, a missing key).
-    fn descriptorColumns(val: Value) ?Value {
+    /// The descriptor's column block for this engine: `sqlite` (its types are SQLite's)
+    /// or `pg` (PostgreSQL's own `format_type` spellings — usable in CREATE TABLE as
+    /// they are, PostGIS and arrays included).
+    fn descriptorColumns(val: Value, engine: storage.Engine) ?Value {
         if (val != .object) return null;
-        const sq = val.object.get("sqlite") orelse return null;
+        const sq = val.object.get(if (engine == .postgres) "pg" else "sqlite") orelse return null;
         if (sq != .object) return null;
         const cols = sq.object.get("columns") orelse return null;
         if (cols != .array) return null;
         return cols;
+    }
+
+    /// §10fe: the PostGIS columns named by the descriptor's `pg` block.
+    fn geomColsOf(a: std.mem.Allocator, val: Value) ![]const []const u8 {
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        const pg = if (val == .object) (val.object.get("pg") orelse Value.null) else Value.null;
+        if (pg != .object) return out.items;
+        const cols = pg.object.get("columns") orelse return out.items;
+        if (cols != .array) return out.items;
+        for (cols.array.items) |c| {
+            if (c != .object) continue;
+            const n = c.object.get("name") orelse continue;
+            const t = c.object.get("type") orelse continue;
+            if (n == .string and t == .string and (std.mem.startsWith(u8, t.string, "geometry") or std.mem.startsWith(u8, t.string, "geography"))) try out.append(a, n.string);
+        }
+        return out.items;
+    }
+
+    /// §10fd: the array columns named by the descriptor's `pg` block (`type` ending in `[]`).
+    fn arrayColsOf(a: std.mem.Allocator, val: Value) ![]const []const u8 {
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        const pg = if (val == .object) (val.object.get("pg") orelse Value.null) else Value.null;
+        if (pg != .object) return out.items;
+        const cols = pg.object.get("columns") orelse return out.items;
+        if (cols != .array) return out.items;
+        for (cols.array.items) |c| {
+            if (c != .object) continue;
+            const n = c.object.get("name") orelse continue;
+            const t = c.object.get("type") orelse continue;
+            if (n == .string and t == .string and std.mem.endsWith(u8, t.string, "[]")) try out.append(a, n.string);
+        }
+        return out.items;
+    }
+
+    /// §10fd: on a PostgreSQL replica, the array columns of a row object become the
+    /// literal — in place, on the copy the caller holds.
+    fn pgArrayFixup(self: *SyncClient, a: std.mem.Allocator, st: TableState, data: *Value) !void {
+        if (self.st.engine != .postgres or data.* != .object) return;
+        for (st.array_cols) |col| {
+            const v = data.object.get(col) orelse continue;
+            const lit: []const u8 = switch (v) {
+                .string => |txt| try jsonArrayToLiteral(a, txt),
+                .array => |arr| try core.pgArrayLiteral(a, arr),
+                else => continue,
+            };
+            try data.object.put(a, col, .{ .string = lit });
+        }
     }
 
     fn columnDefault(cols: std.json.Array, name: []const u8) ?[]const u8 {
@@ -552,6 +605,13 @@ pub const SyncClient = struct {
     }
 
     fn execSql(st: *storage.Storage, a: std.mem.Allocator, sql: []const u8) !void {
+        // §10fd: a rebuild drops a table other tables may reference; PostgreSQL wants
+        // that said (SQLite has the FK pragma off for the duration instead).
+        if (st.engine == .postgres and std.mem.startsWith(u8, sql, "DROP TABLE IF EXISTS ") and std.mem.indexOf(u8, sql, "CASCADE") == null) {
+            const body = std.mem.trimEnd(u8, sql, "; ");
+            _ = try st.query(a, try std.fmt.allocPrint(a, "{s} CASCADE;", .{body}), &.{});
+            return;
+        }
         _ = try st.query(a, sql, &.{});
     }
 
@@ -570,11 +630,11 @@ pub const SyncClient = struct {
             const val = (try std.json.parseFromSlice(Value, a, bytes, .{})).value;
             try self.applyDescriptor(a, table, val);
         }
-        try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
         try ensureInbox(&self.st);
-        try self.st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0)");
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0)");
         try ensureShape(&self.st);
-        self.st.execSimple("ALTER TABLE _zbz_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0") catch {}; // a replica from before §10df
+        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0") catch {}; // a replica from before §10df
         // A schema that just moved may be what a held event was waiting for.
         self.retryHeld(null, null);
     }
@@ -615,7 +675,7 @@ pub const SyncClient = struct {
         }
 
         const pk = try jsonStrList(a, val.object.get("pk_columns"));
-        const cols_v = descriptorColumns(val).?; // checked by migrateTable above
+        const cols_v = descriptorColumns(val, self.st.engine).?; // checked by migrateTable above
         var names: std.ArrayList([]const u8) = .empty;
         for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
         const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
@@ -649,6 +709,8 @@ pub const SyncClient = struct {
             .version_col = if (version_col) |v| try ca.dupe(u8, v) else null,
             .tenant_col = if (tenant_col) |v| try ca.dupe(u8, v) else null,
             .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
+            .array_cols = try dupeStrings(ca, try arrayColsOf(a, val)),
+            .geom_cols = try dupeStrings(ca, try geomColsOf(a, val)),
             .route = route,
             .shared_route = shared_route,
             .seed_epoch = seed_epoch,
@@ -661,6 +723,8 @@ pub const SyncClient = struct {
             st.version_col = fresh.version_col;
             st.tenant_col = fresh.tenant_col;
             st.tombstone_col = fresh.tombstone_col;
+            st.array_cols = fresh.array_cols;
+            st.geom_cols = fresh.geom_cols;
             st.route = fresh.route;
             st.shared_route = fresh.shared_route;
             st.seed_epoch = fresh.seed_epoch;
@@ -904,6 +968,22 @@ pub const SyncClient = struct {
         cols: []const []const u8,
         pk: []const []const u8,
         tomb_idx: ?usize,
+        /// §10fd: the array columns' indices, for a PostgreSQL replica's literal.
+        array_idx: []const usize,
+        /// §10fe: the PostGIS columns' indices (bare EWKB hex in COPY text).
+        geom_idx: []const usize,
+        /// §10fe: on PostgreSQL, a chunk goes in through COPY FROM STDIN — straight into
+        /// the emptied table for a full, through a temporary table and the upsert for
+        /// a delta, so the version guard holds. Tombstones keep their per-row DELETE.
+        copy: bool,
+        /// §10fe: the delta's upsert from the COPY's temporary table (core.pgUpsertFromCopySql).
+        copy_upsert_sql: []const u8,
+        /// §10fe: the step's COPY text buffer, reused across its chunks.
+        copy_buf: *std.ArrayListUnmanaged(u8),
+
+        fn applyCopy(cs: ChainStep, st: *storage.Storage, row_arena: *std.heap.ArenaAllocator) !void {
+            return applyCopyStep(cs, st, row_arena);
+        }
 
         fn apply(cs: ChainStep, st: *storage.Storage) !void {
             if (cs.is_full and cs.first_chunk) {
@@ -912,6 +992,7 @@ pub const SyncClient = struct {
             }
             var row_arena = std.heap.ArenaAllocator.init(cs.client.a);
             defer row_arena.deinit();
+            if (cs.copy) return cs.applyCopy(st, &row_arena);
             for (cs.order[cs.from..cs.to]) |ri| {
                 _ = row_arena.reset(.retain_capacity);
                 const ra = row_arena.allocator();
@@ -936,6 +1017,9 @@ pub const SyncClient = struct {
                 };
                 const params = try ra.alloc(storage.Value, cells.len);
                 for (cells, 0..) |cell, i| params[i] = try payloadToStorage(ra, cell);
+                for (cs.array_idx) |i| if (i < params.len and params[i] == .text) {
+                    params[i] = .{ .text = try jsonArrayToLiteral(ra, params[i].text) };
+                };
                 _ = st.query(ra, cs.sql, params) catch |err| {
                     // Read the SQLite text HERE, before the rollback clears it: it is
                     // what tells an FK refusal from a bad column apart.
@@ -947,6 +1031,95 @@ pub const SyncClient = struct {
             }
         }
     };
+
+    /// §10fe: the chunk as COPY text — one line per live row, tab-separated, `\\N` for
+    /// null, backslash, tab, newline and return escaped — into the table itself for
+    /// a full, into a temporary table then the upsert for a delta.
+    fn applyCopyStep(cs: ChainStep, st: *storage.Storage, row_arena: *std.heap.ArenaAllocator) !void {
+        // One text buffer for the whole step, reused chunk after chunk: a buffer built
+        // fresh per chunk by doubling left every freed size behind in the allocator's
+        // cache — measured 590 MB over the document at 50,000 rows a chunk, 43 MB at
+        // 10,000 — until the step ended. Retained capacity, one block.
+        const buf = cs.copy_buf;
+        buf.clearRetainingCapacity();
+        var n_live: usize = 0;
+        for (cs.order[cs.from..cs.to]) |ri| {
+            _ = row_arena.reset(.retain_capacity);
+            const ra = row_arena.allocator();
+            var cur = MpCursor{ .bytes = cs.bytes, .off = cs.offsets[ri] };
+            const row = try cur.readValue(ra);
+            if (row != .arr) return error.ChainObjectMalformed;
+            const cells = row.arr;
+            if (cs.tomb_idx) |ti| if (ti < cells.len and cells[ti] != .nil) {
+                var keyed: std.json.ObjectMap = .empty;
+                for (cs.pk) |pc| {
+                    for (cs.cols, 0..) |c, i| if (std.mem.eql(u8, c, pc) and i < cells.len) {
+                        try keyed.put(ra, pc, try mpToJson(ra, cells[i]));
+                    };
+                }
+                if (try core.planDelete(ra, cs.table, cs.pk, .{ .object = keyed })) |stp| {
+                    _ = try cs.client.stepExec(ra, stp);
+                }
+                continue;
+            };
+            for (cells, 0..) |cell, i| {
+                if (i > 0) try buf.append(cs.client.a, '\t');
+                const is_array = for (cs.array_idx) |ai| {
+                    if (ai == i) break true;
+                } else false;
+                const is_geom = for (cs.geom_idx) |gi| {
+                    if (gi == i) break true;
+                } else false;
+                try writeCopyCell(buf, cs.client.a, ra, cell, is_array, is_geom);
+            }
+            try buf.append(cs.client.a, '\n');
+            n_live += 1;
+        }
+        if (n_live == 0) return;
+        const col_list = try core.quotedJoin(cs.a, cs.cols);
+        if (cs.is_full) {
+            const copy_sql = try std.fmt.allocPrintSentinel(cs.a, "COPY {s} ({s}) FROM STDIN", .{ cs.table, col_list }, 0);
+            try st.pgCopy(copy_sql, buf.items);
+            return;
+        }
+        // A delta: through a temporary table, then the upsert's own conflict clause.
+        try st.execSimple(try std.fmt.allocPrint(cs.a, "CREATE TEMP TABLE _zbz_copy (LIKE {s}) ON COMMIT DROP", .{cs.table}));
+        const copy_sql = try std.fmt.allocPrintSentinel(cs.a, "COPY _zbz_copy ({s}) FROM STDIN", .{col_list}, 0);
+        try st.pgCopy(copy_sql, buf.items);
+        try st.execSimple(cs.copy_upsert_sql);
+    }
+
+    /// One cell in COPY text. Bytes are bytea's `\\x` hex, or bare EWKB hex into a
+    /// PostGIS column; a JSON array text becomes the literal for an array column.
+    fn writeCopyCell(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, ra: std.mem.Allocator, p: msgpack.Payload, is_array: bool, is_geom: bool) !void {
+        switch (p) {
+            .nil => try out.appendSlice(a, "\\N"),
+            .bool => |b| try out.append(a, if (b) 't' else 'f'),
+            .int => |i| try out.print(a, "{d}", .{i}),
+            .uint => |u| try out.print(a, "{d}", .{u}),
+            .float => |f| try out.print(a, "{d}", .{f}),
+            .str => |v| {
+                var txt: []const u8 = try core.pgTsToWire(ra, v.value());
+                if (is_array) txt = try jsonArrayToLiteral(ra, txt);
+                try copyEscape(out, a, txt);
+            },
+            .bin => |b| {
+                if (!is_geom) try out.appendSlice(a, "\\\\x");
+                for (b.value()) |byte| try out.print(a, "{x:0>2}", .{byte});
+            },
+            else => try copyEscape(out, a, try core.valueToString(ra, try mpToJson(ra, p))),
+        }
+    }
+
+    fn copyEscape(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, s: []const u8) !void {
+        for (s) |ch| switch (ch) {
+            '\\' => try out.appendSlice(a, "\\\\"),
+            '\t' => try out.appendSlice(a, "\\t"),
+            '\n' => try out.appendSlice(a, "\\n"),
+            '\r' => try out.appendSlice(a, "\\r"),
+            else => try out.append(a, ch),
+        };
+    }
 
     /// A chain cell, straight from its msgpack payload to a bind: the shapes
     /// `chainCellToStorage` gives a JSON value, without the JSON value.
@@ -1146,6 +1319,19 @@ pub const SyncClient = struct {
             const vcol_v: ?[]const u8 = vcol_doc orelse (if (man.object.get("version_column")) |v| (if (v == .string) v.string else null) else null);
             const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
             const order = try sortedByKeys(step_a, idx.keys);
+            var array_idx_list: std.ArrayListUnmanaged(usize) = .empty;
+            if (self.st.engine == .postgres) for (st.array_cols) |ac| {
+                if (indexOf(cols, ac)) |i| try array_idx_list.append(step_a, i);
+            };
+            const array_idx = array_idx_list.items;
+            var geom_idx_list: std.ArrayListUnmanaged(usize) = .empty;
+            if (self.st.engine == .postgres) for (st.geom_cols) |gc| {
+                if (indexOf(cols, gc)) |i| try geom_idx_list.append(step_a, i);
+            };
+            const geom_idx = geom_idx_list.items;
+            const copy_sql: []const u8 = if (self.st.engine == .postgres) try core.pgUpsertFromCopySql(step_a, table, cols, st.pk, vcol) else "";
+            var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer copy_buf.deinit(self.a);
             ph[2] += msNow() - t_ph;
             t_ph = msNow();
             const chunk: usize = if (self.opts.seed_chunk_rows == 0) @max(idx.offsets.len, 1) else self.opts.seed_chunk_rows;
@@ -1167,6 +1353,11 @@ pub const SyncClient = struct {
                     .cols = cols,
                     .pk = st.pk,
                     .tomb_idx = if (st.tombstone_col) |tc| indexOf(cols, tc) else null,
+                    .array_idx = array_idx,
+                    .geom_idx = geom_idx,
+                    .copy = self.st.engine == .postgres,
+                    .copy_upsert_sql = copy_sql,
+                    .copy_buf = &copy_buf,
                 };
                 self.st.transaction(cs, ChainStep.apply) catch |err| {
                     std.debug.print("{s}: chain step {s} ({s}, rows {d}..{d} of {d}) rolled back: {any}\n", .{
@@ -1624,7 +1815,7 @@ pub const SyncClient = struct {
         }
 
         const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
-        const data = ev.object.get("data") orelse return;
+        var data = ev.object.get("data") orelse return;
         if (data != .object) return;
 
         // A column this table does not have yet: the row is newer than the schema
@@ -1646,6 +1837,7 @@ pub const SyncClient = struct {
         var ta = std.heap.ArenaAllocator.init(self.a);
         defer ta.deinit();
         const taa = ta.allocator();
+        try self.pgArrayFixup(taa, st, &data);
 
         // ⚠️ The HLC floor (§7.2, NOTES §10q), fed from every arriving row's version
         // column — OBSERVED remote versions, never our own stamps. This field was
@@ -1716,7 +1908,7 @@ pub const SyncClient = struct {
     /// a definitive verdict — never on a send failure, which is why a flush is safe to
     /// repeat and why the original msg_id must survive a restart.
     pub fn ensureOutbox(self: *SyncClient) !void {
-        try self.st.execSimple(
+        try execDdl(&self.st,
             \\CREATE TABLE IF NOT EXISTS _zebridge_outbox (
             \\  msg_id     TEXT PRIMARY KEY,
             \\  subject    TEXT NOT NULL,
@@ -2226,7 +2418,8 @@ pub const SyncClient = struct {
         defer ta.deinit();
         const taa = ta.allocator();
         const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
-        const data = ev.object.get("data") orelse return;
+        var data = ev.object.get("data") orelse return;
+        try self.pgArrayFixup(taa, st, &data);
         // The same §7.5 rule as the CDC path: our own edit that sets the tombstone
         // removes the row locally, exactly as the server's echo of it would.
         if (std.mem.eql(u8, op, "DELETE") or tombstoned(st, data)) {
@@ -2416,12 +2609,34 @@ fn grammarMissing(path: []const []const u8) error{GrammarKeyMissing} {
 /// §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
 /// the record a re-key or a re-type is detected against.
 pub fn ensureShape(st: *storage.Storage) !void {
-    try st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_shape (tbl TEXT PRIMARY KEY, key_shape TEXT NOT NULL, type_shape TEXT NOT NULL)");
+    try execDdl(st, "CREATE TABLE IF NOT EXISTS _zbz_shape (tbl TEXT PRIMARY KEY, key_shape TEXT NOT NULL, type_shape TEXT NOT NULL)");
 }
 
 pub fn ensureInbox(st: *storage.Storage) !void {
-    try st.execSimple("CREATE TABLE IF NOT EXISTS _zbz_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, lsn INTEGER NOT NULL, ev TEXT NOT NULL, reason TEXT NOT NULL, held_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)");
-    try st.execSimple("CREATE INDEX IF NOT EXISTS _zbz_inbox_tbl ON _zbz_inbox (tbl, lsn)");
+    try execDdl(st, "CREATE TABLE IF NOT EXISTS _zbz_inbox (id INTEGER PRIMARY KEY AUTOINCREMENT, tbl TEXT NOT NULL, lsn INTEGER NOT NULL, ev TEXT NOT NULL, reason TEXT NOT NULL, held_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)");
+    try execDdl(st, "CREATE INDEX IF NOT EXISTS _zbz_inbox_tbl ON _zbz_inbox (tbl, lsn)");
+}
+
+/// §10fd: the bookkeeping tables' DDL is written for SQLite; on PostgreSQL the
+/// autoincrement key is a BIGSERIAL and every INTEGER a BIGINT (an LSN as a number
+/// does not fit int4).
+pub fn execDdl(st: *storage.Storage, sql: []const u8) !void {
+    if (st.engine != .postgres) return st.execSimple(sql);
+    const a = std.heap.c_allocator;
+    const s1 = try std.mem.replaceOwned(u8, a, sql, "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY");
+    defer a.free(s1);
+    const s2 = try std.mem.replaceOwned(u8, a, s1, " INTEGER", " BIGINT");
+    defer a.free(s2);
+    return st.execSimple(s2);
+}
+
+/// §10fd: a JSON array text (the wire's array form, §10ey) as PostgreSQL's array
+/// literal; anything that is not one is returned as it came.
+fn jsonArrayToLiteral(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (text.len == 0 or text[0] != '[') return text;
+    const parsed = std.json.parseFromSliceLeaky(Value, a, text, .{}) catch return text;
+    if (parsed != .array) return text;
+    return core.pgArrayLiteral(a, parsed.array);
 }
 
 /// Drop every held event of `table` whose key equals the deleted row's (§10dg).

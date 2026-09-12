@@ -7,7 +7,7 @@ lifecycle lesson learned in one is not silently missing from the other.
 | --- | --- | --- |
 | language | Zig core + shell, C ABI | TypeScript core + shell |
 | hosts | Python, Node (ctypes/FFI), Flutter (Dart FFI) | browser, Node |
-| local engine | SQLite | SQLite (sqlocal, better-sqlite3), PGlite |
+| local engine | SQLite (a file), or PostgreSQL (`dbUrl`, §10fd; seeds through COPY, §10fe) | SQLite (sqlocal, better-sqlite3), PGlite |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
 | tables followed | the explicit `tables` list | every key in the `schemas` bucket, or the `tables` list when given (§10fb) |
 
@@ -38,7 +38,7 @@ row a rule is named.
 | seed with foreign keys off, on again after | ✓ | ✓ | §10cp |
 | consumer floor from the seed's cutoff, not the tail | ✓ | ✓ | §10cp |
 | chain-orphan check (cutoff vs stream first seq) | ✗ | ✗ | §10n residual, designed not built |
-| a table with no chain yet | re-asks at every poll until seeded | waits 90 s, then excludes the table for the process's life; a re-seed kick retries for 90 s | §10cq item 3, §10dg |
+| a table with no chain yet | re-asks at every poll until seeded | the table stays registered and marked unseeded, its events held in the inbox; asked again every 15 s for as long as the connection lives (§10et) | §10cq item 3, §10dg, §10et |
 | position persisted per batch, held and gated events included | ✓ | ✓ | §10m D1 |
 | quiet stream: stored 0 takes the tail | ✓ | ✓ | §10m |
 | position beyond the stream's last seq = restart, reset | ✓ | ✓ | §10bm, fixture |
@@ -83,7 +83,7 @@ row a rule is named.
 | the wipe is explicit, never automatic | ✓ `zb_client_wipe` | ✓ `wipe()` | §10dm |
 | a principal with no tenant mapping (revoked, never enrolled) | tenant-scoped tables skipped audibly, public followed | same; a purged mapping's DEL marker reads as none | §10dl |
 | tenant revoked while connected | next connect | next connect | |
-| inbox pruning | — (no inbox) | ✓ | |
+| inbox pruning | ✓ (`_zbz_inbox`, pruned at the seed's lsn) | ✓ | |
 | chain dictionary cache | per process | persisted (`_zebridge_dicts`) | §10x |
 | zstd chain objects | built in | Node built in; browser needs `zstdDecompress` | §10w |
 | a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload, a 128 MB page cache while the seed lasts; 3 M rows in 11 s | the same sort, chunks and page cache (§10fb) over the decoded document; on SQLite a chunk is one statement through `json_each` (§10fc), row by row for a table with a BLOB and on PGlite; 3 M rows in 26 s | §10ez, §10fa, §10fb, §10fc |

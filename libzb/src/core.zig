@@ -304,7 +304,7 @@ fn cdcValue(a: std.mem.Allocator, v: Value) !Value {
     };
 }
 
-fn quotedJoin(a: std.mem.Allocator, names: []const []const u8) ![]const u8 {
+pub fn quotedJoin(a: std.mem.Allocator, names: []const []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     for (names, 0..) |n, i| {
         if (i > 0) try out.appendSlice(a, ", ");
@@ -536,6 +536,29 @@ pub fn planDelete(a: std.mem.Allocator, table: []const u8, pk: []const []const u
 }
 
 /// core.ts chainUpsertSql.
+/// §10fe: the delta upsert from the COPY's temporary table — `INSERT INTO t (cols)
+/// SELECT cols FROM _zbz_copy WHERE true ON CONFLICT …`, the same clauses as
+/// chainUpsertSql; `WHERE true` disambiguates INSERT … SELECT … ON CONFLICT.
+pub fn pgUpsertFromCopySql(a: std.mem.Allocator, table: []const u8, cols: []const []const u8, pk: []const []const u8, version_col: ?[]const u8) ![]const u8 {
+    var sets: std.ArrayList(u8) = .empty;
+    var first = true;
+    for (cols) |c| {
+        if (containsStr(pk, c)) continue;
+        if (!first) try sets.appendSlice(a, ", ");
+        first = false;
+        try sets.appendSlice(a, try std.fmt.allocPrint(a, "\"{s}\" = excluded.\"{s}\"", .{ c, c }));
+    }
+    const conflict = try quotedJoin(a, pk);
+    var tail: std.ArrayList(u8) = .empty;
+    if (sets.items.len > 0) {
+        try tail.appendSlice(a, try std.fmt.allocPrint(a, " ON CONFLICT({s}) DO UPDATE SET {s}", .{ conflict, sets.items }));
+        if (version_col) |vc| try tail.appendSlice(a, try std.fmt.allocPrint(a, " WHERE excluded.\"{s}\" > {s}.\"{s}\"", .{ vc, table, vc }));
+    } else {
+        try tail.appendSlice(a, try std.fmt.allocPrint(a, " ON CONFLICT({s}) DO NOTHING", .{conflict}));
+    }
+    return std.fmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM _zbz_copy WHERE true{s}", .{ table, try quotedJoin(a, cols), try quotedJoin(a, cols), tail.items });
+}
+
 /// §10ez: the INSERT a full's rows take — the table was emptied first, so no conflict
 /// clause and no version guard: every row is new.
 pub fn chainInsertSql(a: std.mem.Allocator, table: []const u8, cols: []const []const u8) ![]const u8 {

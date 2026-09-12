@@ -11416,6 +11416,98 @@ Node had 17 µs of per-row statement cost to trade for it and libzb had none. So
 one-statement form is the JavaScript client's tool, and libzb keeps its binds. Not
 assumed: measured, and the port removed.
 
+## 10fd. libzb on PostgreSQL: the replica as a database any tool reads (2026-09-12)
+
+The micro-VM case: a warm or cold machine whose replica syncs continuously, fired on
+demand, with a PostgreSQL server in it rather than a SQLite file — for the job that
+wants PostgreSQL semantics, or a tool that speaks nothing else. libzb targeted SQLite
+alone until today; the TypeScript client had PGlite. Now `dbUrl` on the C card (a
+libpq connection string) opens the replica on a PostgreSQL server, and the same
+client runs unchanged above it.
+
+**Where the difference lives.** `storage.zig` dispatches on an engine. The
+PostgreSQL side: libpq, `?` rewritten to `$n` outside quotes, a cache of server-side
+prepared statements (deallocated with the SQLite cache before schema surgery, and a
+plan the server refuses after a DDL is forgotten and prepared again), params as text
+and bytes as a binary param, results typed by their column's OID — bool, the
+integers, the floats, bytea — and everything else as text, numeric included, by the
+contract. A PRAGMA answers nothing there, `BEGIN IMMEDIATE` is `BEGIN`, the second
+connection the C card's `query` uses is `default_transaction_read_only`. The four
+questions the migration asked SQLite's catalogue — a table's columns, its key, its
+CREATE TABLE text, its indexes — are `Storage` methods now, answered per engine from
+`information_schema`, `pg_index` and `pg_indexes`; PostgreSQL keeps no CREATE TABLE
+text, so an FK change is not detected there (the one v1 gap). The bookkeeping tables'
+DDL is written for SQLite and rewritten for PostgreSQL (BIGSERIAL, BIGINT: an LSN as
+a number does not fit int4). A rebuild's `DROP TABLE` says CASCADE.
+
+**Types.** The replica table is created from the descriptor's `pg` block —
+PostgreSQL's own `format_type` spellings, usable in CREATE TABLE as they are:
+`numeric(12,4)`, `text[]`, `jsonb`, `bytea`, `geometry(Point,4326)` when PostGIS is
+installed in the replica database. The wire's shapes bind as they are, PostgreSQL
+reading its own text forms: booleans as `t`/`f`, ISO timestamps, numeric digits,
+JSON text into jsonb, bytes as a binary param into bytea and geometry (EWKB is the
+binary input). Arrays are the one conversion: the wire carries JSON text (§10ey), a
+PostgreSQL column wants the literal, so the table state records the array columns
+from the `pg` block and every apply path — chain rows, CDC events, the optimistic
+local write — turns the JSON text into the literal (`core.pgArrayLiteral`), as the
+TypeScript postgres dialect does.
+
+**Measured**, `scripts/scenarios/pgreplica.py` on a second database of the dev
+server with PostGIS: a table with int, numeric, boolean, text[] and int[][], jsonb,
+bytea, a point and timestamps; the replica table has PostgreSQL's own types; the seed
+lands natively (`tags[2]`, `matrix[2][1]`, `meta->>'src'`, the bytea length,
+`ST_AsText`, numeric with its scale); a row over CDC the same; the client's write
+with arrays, bytes and a point lands in the master and echoes natively; the C card's
+query returns typed cells. Seven checks. And at scale: test_types, 3,055,002 rows,
+seeded into the replica database in 102 s (apply 99 s, 32 µs a row — one libpq round
+trip per row), no duplicate key, 957 MB in the replica, the host's peak 996 MB (the
+inflated document, as on SQLite), `leaks` 0. The per-row round trip is the cost to
+take next: `COPY FROM STDIN` per chunk is PostgreSQL's bulk load and would put this
+near the SQLite figure. The storage test for the engine runs when `ZB_PG_TEST_URL`
+names a database and skips otherwise.
+
+## 10fe. COPY FROM STDIN: the PostgreSQL replica's bulk load (2026-09-12)
+
+§10fd left the PostgreSQL replica at 32 µs a row, one libpq round trip per row, and
+99 s for three million. PostgreSQL's bulk load is COPY, and it is now what a chain
+chunk takes on that engine: the live rows written as COPY text — one line per row,
+tab-separated, `\N` for null, backslash, tab, newline and return escaped, booleans
+`t`/`f`, bytes as bytea's `\\x` hex or as bare EWKB hex into a PostGIS column (the
+table state records those columns from the `pg` block as it does the array ones),
+a JSON array text as the literal — then `COPY t (cols) FROM STDIN` through
+`PQputCopyData`. A full copies straight into the emptied table; a delta copies into
+a temporary table (`CREATE TEMP TABLE _zbz_copy (LIKE t) ON COMMIT DROP`) and runs
+the upsert from it — `INSERT … SELECT … FROM _zbz_copy WHERE true ON CONFLICT … DO
+UPDATE … WHERE excluded.v > t.v` — so the version guard holds row by row.
+Tombstones keep their per-row DELETE. The chunk's text buffer is freed per chunk.
+
+**Measured**, test_types into the replica database:
+
+| | apply | total |
+| --- | --- | --- |
+| §10fd, one INSERT per row | 99.2 s | 102 s |
+| §10fe, COPY per chunk | 14.6 s | 17.1 s |
+
+3,055,002 rows, no duplicate key, the booleans split as the fixture has them, the
+scenario's seven checks green on the COPY path (a delta's CDC row, the client's
+write and its echo go through the temporary table). 4.8 µs a row — between the
+SQLite engine's 2.7 and where the per-row path was, and the rows now land in a
+database PostgreSQL itself indexes and vacuums. `leaks` reports 0 on the host with
+the client open after the seed.
+
+**A memory ramp, traced and closed.** The host's peak read 1.56 GB on this path
+against 1.13 GB on SQLite for the same seed, and a trace every half second showed
+it: flat at 942 MB once the document was inflated and indexed, then a climb of some
+30 MB a second through the apply, all given back when the step ended. Chunks of
+10,000 rows grew 43 MB, chunks of 50,000 grew 590 MB — proportional to the chunk,
+not to the count — so it was the chunk's COPY text buffer, built fresh each chunk by
+doubling and freed each chunk, whose freed sizes the allocator kept in its cache
+rather than reusing promptly. Not a leak (the tool agreed); waste. One buffer per
+step now, its capacity retained across chunks: peak 1,006 MB, the inflated document
+plus the compressed object plus the host, the same figure as SQLite without its page
+cache. The streaming inflate of §10fa's note would take the document itself down on
+both engines.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:
