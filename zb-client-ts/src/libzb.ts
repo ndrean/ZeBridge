@@ -37,7 +37,7 @@ import { heartbeatPayload,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
-  isBytes, pgArrayValues, pgArrayLiteral,
+  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
 import GRAMMAR_JSON from './grammar.json' with { type: 'json' };
@@ -85,6 +85,13 @@ export interface ZeBridgeConfig {
   grammar?: any;
   /// PROTOCOL §9: the fleet heartbeat cadence in ms (default 30 000; 0 disables).
   heartbeatMs?: number;
+  /// §10fb: follow only these tables. Default: every table the schemas bucket names
+  /// (a job that wants one table of a tenant with a big one should say so — libzb
+  /// takes the same list).
+  tables?: string[];
+  /// §10fb: rows per transaction when a chain step seeds a table (default 50 000;
+  /// 0 = one transaction for the step). Bounds memory and how long the lock is held.
+  seedChunkRows?: number;
   durable?: boolean;
   engine?: 'sqlite' | 'pglite';
   /// The two seams (NOTES §10). Defaults are the browser: sqlocal/OPFS storage
@@ -100,6 +107,9 @@ export type TableState = {
   /// §10ey: the columns whose PostgreSQL type is an array — the wire carries them as
   /// JSON text, and a PostgreSQL engine binds them from the literal on apply.
   arrayCols?: string[];
+  /// §10fc: the columns declared BLOB in the sqlite block — a table with one seeds
+  /// row by row (JSON has no bytes); the rest seed a chunk per statement.
+  blobCols?: string[];
   tombstoneColumn: string | null;
   tenantColumn: string | null;
   /// The table's LWW version column (from the schema payload) — read to feed
@@ -919,6 +929,9 @@ export class ZeBridge {
               const isLastOfInitialReplay = !initialized && (!entry || entry.delta === 0);
               try {
                 if (!entry || !entry.key) continue;
+                // §10fb: a table not in the caller's list is never created, seeded or
+                // followed — its descriptor, tombstone and suspension are all skipped.
+                if (this.config.tables?.length && !this.config.tables.includes(entry.key)) continue;
 
                 if (entry.operation === 'DEL' || entry.operation === 'PURGE') {
                   await this.dropLocalTable(entry.key, 'KV key removed');
@@ -1006,6 +1019,8 @@ export class ZeBridge {
     // §10ey: array columns, from the `pg` block whatever the engine (the sqlite block says TEXT).
     const arrayCols: string[] = ((val.pg?.columns ?? []) as { name: string; type?: string }[])
       .filter((c) => typeof c.type === 'string' && c.type.endsWith('[]')).map((c) => c.name);
+    const blobCols: string[] = ((val.sqlite?.columns ?? []) as { name: string; type?: string }[])
+      .filter((c) => typeof c.type === 'string' && c.type.toUpperCase() === 'BLOB').map((c) => c.name);
     // Dialect-neutral, at the root: CREATE [UNIQUE] INDEX is the same statement here
     // and in PGlite/local Postgres, so one list serves every consumer shape (§10c).
     const indexes: { name: string; unique?: boolean; columns: string[] }[] =
@@ -1150,7 +1165,7 @@ export class ZeBridge {
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses))) {
         await recordShape();
-        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
         this.reach('migrated');
         this.scheduleRecount();
         // ⚠️ NOT a no-op path for indexes. Adding an index in PostgreSQL changes no
@@ -1210,7 +1225,7 @@ export class ZeBridge {
       await this.syncIndexes(table, indexes);
       await recordShape();
 
-      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
       this.scheduleRecount();
@@ -2014,26 +2029,51 @@ export class ZeBridge {
         const pkIdx = state.pkCols.map((c) => cols.indexOf(c));
         // §10ey: chain cells carry arrays as JSON text too; the PostgreSQL engine wants the literal.
         const arrIdx = this.dialect.name === 'postgres' ? (state.arrayCols ?? []).map((c) => cols.indexOf(c)).filter((i) => i >= 0) : [];
-        await this.transaction(async (txExec) => {
-          // A full replaces the baseline wholesale; the DELETE shares the transaction
-          // so a crash mid-apply cannot leave an empty table.
-          if (step.kind === 'full') await txExec(`DELETE FROM ${table}`);
-          for (const row of doc.rows) {
-            if (tombIdx >= 0 && tombstoned(state.tombstoneColumn, { [cols[tombIdx]]: row[tombIdx] })) {
-              const keyed: Record<string, unknown> = {};
-              state.pkCols.forEach((c, i) => { if (pkIdx[i] >= 0) keyed[c] = row[pkIdx[i]]; });
-              const del = planDelete(table, state.pkCols, keyed);
-              if (del) await txExec(del.sql, ...del.params);
-              continue;
-            }
-            const params = chainRowParams(row);
-            for (const i of arrIdx) {
-              const v = params[i];
-              if (typeof v === 'string' && v.startsWith('[')) { try { params[i] = pgArrayLiteral(JSON.parse(v)); } catch { /* not JSON: as is */ } }
-            }
-            await txExec(q, ...params);
+        // §10fb (libzb §10ez/§10fa on this side): rows in key order, applied in chunks
+        // of one transaction each, and a page cache the seed's b-tree fits in while it
+        // lasts. The first chunk of a full runs the DELETE; a kill between chunks is
+        // safe by the watermark rule (written after the last chunk, so a restart
+        // plans the full again and begins with the DELETE).
+        const rows: any[][] = sortRowsByKey(doc.rows, pkIdx[0] ?? -1);
+        const chunk = this.config.seedChunkRows ?? 50_000;
+        const size = chunk > 0 ? chunk : Math.max(rows.length, 1);
+        const sqlite = this.dialect.name === 'sqlite';
+        // §10fc: on SQLite, a chunk is ONE statement — the live rows as JSON text through
+        // json_each — unless a column is a BLOB (JSON has no bytes: row by row then).
+        const bulk = sqlite && !(state.blobCols?.length) ? chainBulkSql(table, cols, state.pkCols, vcol && cols.includes(vcol) ? vcol : null) : null;
+        if (sqlite) { try { await this.run('PRAGMA cache_size = -131072'); } catch { /* an adapter that refuses PRAGMA: the default cache */ } }
+        try {
+          for (let from = 0; from < rows.length || (from === 0 && step.kind === 'full'); from += size) {
+            const to = Math.min(from + size, rows.length);
+            await this.transaction(async (txExec) => {
+              // A full replaces the baseline wholesale; the DELETE shares the first
+              // chunk's transaction so a crash mid-apply cannot leave an empty table.
+              if (step.kind === 'full' && from === 0) await txExec(`DELETE FROM ${table}`);
+              const live: any[][] = [];
+              for (let n = from; n < to; n++) {
+                const row = rows[n];
+                if (tombIdx >= 0 && tombstoned(state.tombstoneColumn, { [cols[tombIdx]]: row[tombIdx] })) {
+                  const keyed: Record<string, unknown> = {};
+                  state.pkCols.forEach((c, i) => { if (pkIdx[i] >= 0) keyed[c] = row[pkIdx[i]]; });
+                  const del = planDelete(table, state.pkCols, keyed);
+                  if (del) await txExec(del.sql, ...del.params);
+                  continue;
+                }
+                if (bulk) { live.push(row); continue; }
+                const params = chainRowParams(row);
+                for (const i of arrIdx) {
+                  const v = params[i];
+                  if (typeof v === 'string' && v.startsWith('[')) { try { params[i] = pgArrayLiteral(JSON.parse(v)); } catch { /* not JSON: as is */ } }
+                }
+                await txExec(q, ...params);
+              }
+              if (bulk && live.length) await txExec(bulk, JSON.stringify(live));
+            });
+            if (to === from) break;
           }
-        });
+        } finally {
+          if (sqlite) { try { await this.run('PRAGMA cache_size = -2000'); } catch { /* as above */ } }
+        }
         applied += doc.rows.length;
       }
       return applied;

@@ -6,7 +6,7 @@
 /// The client is durable and follows every schema key, exactly like a service
 /// would; the scenario drives PostgreSQL and asks this replica what it holds.
 ///
-/// Env: NATS_URL ZB_PRINCIPAL ZB_DB ZB_ENGINE (sqlite|pglite)
+/// Env: NATS_URL ZB_PRINCIPAL ZB_DB ZB_ENGINE (sqlite|pglite) ZB_TABLES (comma list; default every table)
 import { createInterface } from 'node:readline';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { ZeBridge } from 'zb-client-ts';
@@ -30,6 +30,7 @@ const zb = new ZeBridge({
   creds: readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
   heartbeatMs: 0,
   durable: true,
+  tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : undefined,
   storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: DB }) : (_: string) => nodeStorage(DB),
   connect: nodeConnect,
 });

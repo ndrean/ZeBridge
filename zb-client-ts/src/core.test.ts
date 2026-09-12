@@ -2,7 +2,21 @@
 /// the TS core. A port (Zig, …) writes its own thin runner over the SAME file —
 /// the fixtures are the spec, this file is just plumbing.
 import { test } from 'node:test';
-import { cdcValue, pgEngineValues, isBytes, pgArrayValues } from './core.ts';
+import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql } from './core.ts';
+
+test('a chunk in one statement through json_each, version-guarded (§10fc)', () => {
+  const sql = chainBulkSql('t', ['uid', 'n', 'updated_at'], ['uid'], 'updated_at');
+  assert.equal(sql, `INSERT INTO t ("uid", "n", "updated_at") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?) WHERE true ON CONFLICT("uid") DO UPDATE SET "n" = excluded."n", "updated_at" = excluded."updated_at" WHERE excluded."updated_at" > t."updated_at"`);
+  assert.ok(chainBulkSql('t', ['uid'], ['uid'], null).endsWith('DO NOTHING'));
+});
+
+test('chain rows sort by their key cell, stable for the rest (§10fb)', () => {
+  const rows = [['c', 1], ['a', 2], ['b', 3]];
+  assert.deepEqual(sortRowsByKey(rows, 0).map((r) => r[0]), ['a', 'b', 'c']);
+  assert.deepEqual(sortRowsByKey([[3, 'x'], [1, 'y'], [2, 'z']], 0).map((r) => r[0]), [1, 2, 3]);
+  assert.deepEqual(sortRowsByKey(rows, -1), rows);
+  assert.deepEqual(rows.map((r) => r[0]), ['c', 'a', 'b']); // the input is untouched
+});
 
 test('JSON array text becomes the PostgreSQL literal for array columns only (§10ey)', () => {
   const data = { tags: '["a","b c",null]', matrix: '[[1,2],[3,4]]', note: '[not an array column]', n: 3 };

@@ -11353,6 +11353,69 @@ is not. Bounding that too means inflating in a streaming window and walking the
 stream, which is the next lever if a phone must seed a table this size — a phone's
 tables are two orders of magnitude smaller, where the peak is tens of megabytes.
 
+## 10fb. The TypeScript client's seed brought level, and a `tables` list (2026-09-12)
+
+Two parity items the last two days opened on the TypeScript side.
+
+**The seed.** What §10ez and §10fa did in libzb — rows in primary-key order, the
+apply in chunks of one transaction each, SQLite's page cache raised while the seed
+lasts — ported to `applyPlan`: `sortRowsByKey` in the core (strings by code unit,
+numbers numerically, the rest stable), `seedChunkRows` in the config (default
+50,000; 0 = one transaction), `PRAGMA cache_size` at 128 MB around the chunks on the
+SQLite dialect and the default restored after, the first chunk of a full carrying
+the `DELETE FROM`. The document is still decoded whole (msgpack's `decode` gives the
+rows as JS arrays; there is no cursor to walk), so the memory point of §10fa does
+not carry over yet. Measured with the Node worker seeding every table of globex,
+test_types at 3,058,085 rows: ready in 109.8 s before, 52.3 s after. The rest of
+that time is JavaScript's per-row statement cost through better-sqlite3 — 17 µs a
+row against libzb's 2.7 — and a multi-row INSERT per chunk is the next lever there.
+
+**`tables`.** The client followed every key in the schemas bucket; a job that wants
+one table of a tenant with a big one seeded the big one too (the arrays scenario's
+PGlite half would have seeded three million rows to check four). `tables?: string[]`
+in the config names the tables to follow; every other descriptor, tombstone and
+suspension is skipped at the watch, so nothing else is created, seeded or
+subscribed. libzb had the list from the start; the Node worker reads `ZB_TABLES`.
+
+## 10fc. A chunk in one statement: json_each (2026-09-12)
+
+After §10fb the Node client seeded test_types in 52 s, 17 µs a row, and the profile
+said the rest was JavaScript's per-row statement through better-sqlite3, not the
+format: decoding 1 M rows costs 1.0–1.3 s with `@msgpack/msgpack` and 0.6 s with
+`JSON.parse` (native), so leaving msgpack would have saved a second and a half of
+the fifty-two. The statement shape was the lever.
+
+**What changed.** On the SQLite dialect a chunk of 50,000 rows is ONE statement:
+the live rows as a JSON array text bound once, exploded by SQLite's own `json_each`,
+each cell picked with `json_extract` — a JSON string is TEXT, a number INTEGER or
+REAL, `true`/`false` 1/0, `null` NULL, a nested value its JSON text, the shapes
+`chainRowParams` bound one at a time. The conflict clause is the upsert's, so a
+delta's version guard holds row by row; `WHERE true` is SQLite's disambiguation of
+INSERT … SELECT … ON CONFLICT. Tombstoned rows still go through their per-row
+DELETE. A table with a BLOB column keeps the per-row path (JSON has no bytes), and
+so does PGlite. The wire is untouched: msgpack plus zstd, one shape for both paths.
+
+**Measured**, the Node worker seeding every table of globex:
+
+| | ready after |
+| --- | --- |
+| the morning's baseline | 109.8 s |
+| §10fb: sorted, chunked, page cache | 52.3 s |
+| §10fc: one statement per chunk | 26.0 s |
+
+The seeded columns are typed as the binds typed them (`typeof`: integer for
+booleans and ints, text for numerics), the count is the table's live count, the
+wasp ran clean on the replica.
+
+**And ported to libzb, then reverted.** The same statement, the chunk written as JSON
+straight from the msgpack payloads, took the apply from 8.2 s to 22.9 s on the same
+seed (the rows still exact, the count right). The bind loop was never libzb's cost:
+2.7 µs a row is SQLite's own insert work, and `json_each` adds a parse of each row's
+JSON text per column picked — fourteen here — which is the price Node pays too, but
+Node had 17 µs of per-row statement cost to trade for it and libzb had none. So the
+one-statement form is the JavaScript client's tool, and libzb keeps its binds. Not
+assumed: measured, and the port removed.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

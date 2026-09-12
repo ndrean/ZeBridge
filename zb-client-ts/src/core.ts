@@ -246,6 +246,23 @@ export function pgArrayLiteral(v: any[]): string {
   return `{${v.map(elem).join(',')}}`;
 }
 
+/// §10fb: a chain step's rows in primary-key order before they are applied. A chain
+/// comes in the table's physical order — random uuids — and each insert then lands
+/// on a random b-tree page; sorted, the inserts append (libzb §10ez: the apply
+/// halved). Strings compare by code unit, numbers numerically; anything else keeps
+/// its place (the sort is stable). A copy of the row references, not of the rows.
+export function sortRowsByKey(rows: any[][], keyIdx: number): any[][] {
+  if (keyIdx < 0 || rows.length < 2) return rows;
+  const out = rows.slice();
+  out.sort((x, y) => {
+    const a = x[keyIdx], b = y[keyIdx];
+    if (typeof a === 'string' && typeof b === 'string') return a < b ? -1 : a > b ? 1 : 0;
+    if (typeof a === 'number' && typeof b === 'number') return a - b;
+    return 0;
+  });
+  return out;
+}
+
 /// §10ey: the wire carries an array as JSON text (`["a","b"]`). A PostgreSQL engine
 /// binds an array column from PostgreSQL's literal, so on apply the JSON text of each
 /// array column becomes that literal — `pgArrayLiteral` of the parsed list. A value
@@ -391,6 +408,32 @@ export function chainUpsertSql(
   const sets = cols.filter((c) => !pkCols.includes(c))
                    .map((c) => `"${c}" = excluded."${c}"`).join(', ');
   let sql = `INSERT INTO ${table} (${colList}) VALUES (${ph})`;
+  sql += sets
+    ? ` ON CONFLICT(${conflict}) DO UPDATE SET ${sets}` +
+      (versionCol ? ` WHERE excluded."${versionCol}" > ${table}."${versionCol}"` : '')
+    : ` ON CONFLICT(${conflict}) DO NOTHING`;
+  return sql;
+}
+
+/// §10fc: a whole chunk of chain rows in ONE statement — the rows as a JSON array
+/// text bound once, exploded by SQLite's own `json_each`, each cell picked with
+/// `json_extract` (a JSON string is TEXT, a number INTEGER or REAL, true/false 1/0,
+/// null NULL, a nested value its JSON text — the shapes `chainRowParams` binds).
+/// The conflict clause is the upsert's, so the version guard holds row by row. The
+/// `WHERE true` is SQLite's disambiguation of INSERT … SELECT … ON CONFLICT.
+/// Not for a table with a BLOB column (JSON has no bytes) nor for PostgreSQL.
+export function chainBulkSql(
+  table: string,
+  cols: string[],
+  pkCols: string[],
+  versionCol: string | null,
+): string {
+  const colList = cols.map((c) => `"${c}"`).join(', ');
+  const picks = cols.map((_, i) => `json_extract(value, '$[${i}]')`).join(', ');
+  const conflict = pkCols.map((c) => `"${c}"`).join(', ');
+  const sets = cols.filter((c) => !pkCols.includes(c))
+                   .map((c) => `"${c}" = excluded."${c}"`).join(', ');
+  let sql = `INSERT INTO ${table} (${colList}) SELECT ${picks} FROM json_each(?) WHERE true`;
   sql += sets
     ? ` ON CONFLICT(${conflict}) DO UPDATE SET ${sets}` +
       (versionCol ? ` WHERE excluded."${versionCol}" > ${table}."${versionCol}"` : '')

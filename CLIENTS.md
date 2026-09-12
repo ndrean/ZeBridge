@@ -9,7 +9,7 @@ lifecycle lesson learned in one is not silently missing from the other.
 | hosts | Python, Node (ctypes/FFI), Flutter (Dart FFI) | browser, Node |
 | local engine | SQLite | SQLite (sqlocal, better-sqlite3), PGlite |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
-| tables followed | the explicit `tables` list | every key in the `schemas` bucket |
+| tables followed | the explicit `tables` list | every key in the `schemas` bucket, or the `tables` list when given (§10fb) |
 
 ## Pinned by fixtures — identical by construction
 
@@ -86,7 +86,7 @@ row a rule is named.
 | inbox pruning | — (no inbox) | ✓ | |
 | chain dictionary cache | per process | persisted (`_zebridge_dicts`) | §10x |
 | zstd chain objects | built in | Node built in; browser needs `zstdDecompress` | §10w |
-| a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload; 3 M rows in 11 s | the document decoded, one transaction per step; the same sort and chunking are the next parity item | §10ez, §10fa |
+| a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload, a 128 MB page cache while the seed lasts; 3 M rows in 11 s | the same sort, chunks and page cache (§10fb) over the decoded document; on SQLite a chunk is one statement through `json_each` (§10fc), row by row for a table with a BLOB and on PGlite; 3 M rows in 26 s | §10ez, §10fa, §10fb, §10fc |
 | arrays | JSON text as the wire carries it (`json_extract` reads it); a local write stores JSON text too | SQLite: same; PGlite: the JSON text becomes the array literal on apply (`pgArrayValues`), native arrays in the replica | §10ey |
 | bytes (`bytea`, PostGIS) | BLOB; the host sees and sends `{"$bin": "<base64>"}` on the JSON card | BLOB; `Uint8Array` in and out (the Node example prints the same `$bin` marker) | §10ex |
 | survives its host killed mid-seed | proven (`client_kill.py`) | not tested | §10ce |
