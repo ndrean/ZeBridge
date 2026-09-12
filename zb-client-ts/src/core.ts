@@ -212,11 +212,15 @@ export const lsnToNumber = (lsn: string): number => {
 export type SqlStep = { sql: string; params: any[] };
 export type KeyChangeStep = SqlStep & { oldKey: any[]; newKey: any[] };
 
+/// §10ex: a bytea (or EWKB) cell arrives as msgpack `bin`, decoded as a Uint8Array.
+/// It is an object to `typeof`, and must never be stringified: it binds as a BLOB.
+export const isBytes = (v: any): v is Uint8Array => v instanceof Uint8Array;
+
 /// One CDC value → one bound parameter: structured values travel as JSON text
-/// (SQLite has no object affinity); everything else binds as-is (the CDC wire
-/// already normalizes timestamps).
+/// (SQLite has no object affinity); bytes bind as bytes; everything else binds
+/// as-is (the CDC wire already normalizes timestamps).
 export const cdcValue = (v: any): any =>
-  v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+  isBytes(v) ? v : v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
 
 /// A JS array as PostgreSQL's array-literal TEXT: `{a,b}`, nested `{{1,2},{3}}`,
 /// elements quoted when they need it (comma, brace, quote, backslash, whitespace,
@@ -242,13 +246,29 @@ export function pgArrayLiteral(v: any[]): string {
   return `{${v.map(elem).join(',')}}`;
 }
 
+/// §10ey: the wire carries an array as JSON text (`["a","b"]`). A PostgreSQL engine
+/// binds an array column from PostgreSQL's literal, so on apply the JSON text of each
+/// array column becomes that literal — `pgArrayLiteral` of the parsed list. A value
+/// that is not JSON-array text (already a literal, NULL, a scalar) is left alone.
+export function pgArrayValues(data: Record<string, any>, arrayCols: readonly string[]): Record<string, any> {
+  if (!arrayCols.length) return data;
+  const out: Record<string, any> = { ...data };
+  for (const k of arrayCols) {
+    const v = out[k];
+    if (typeof v === 'string' && v.startsWith('[')) {
+      try { out[k] = pgArrayLiteral(JSON.parse(v)); } catch { /* not JSON: leave it */ }
+    } else if (Array.isArray(v)) out[k] = pgArrayLiteral(v);
+  }
+  return out;
+}
+
 /// The payload of a LOCAL write as a PostgreSQL engine must bind it: arrays as
 /// array literals, plain objects as JSON (jsonb reads that), scalars unchanged. CDC
 /// events need none of this — the wire is already in these forms.
 export function pgEngineValues(data: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(data)) {
-    out[k] = Array.isArray(v) ? pgArrayLiteral(v) : v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
+    out[k] = isBytes(v) ? v : Array.isArray(v) ? pgArrayLiteral(v) : v !== null && typeof v === 'object' ? JSON.stringify(v) : v;
   }
   return out;
 }
@@ -382,7 +402,7 @@ export function chainUpsertSql(
 /// timestamps normalized to the CDC wire shape so the version guard compares
 /// like against like (NOTES §1.13).
 export const chainRowParams = (row: any[]): any[] =>
-  row.map((v) => (v !== null && typeof v === 'object' ? JSON.stringify(v) : pgTsToWire(v)));
+  row.map((v) => (isBytes(v) ? v : v !== null && typeof v === 'object' ? JSON.stringify(v) : pgTsToWire(v)));
 
 // ─── the schema migration planner (§10s increment 2b — finding 9's home) ────
 //

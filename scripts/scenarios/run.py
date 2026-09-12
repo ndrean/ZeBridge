@@ -121,6 +121,8 @@ GROUPS = {
     },
     "manual": {
         "speed":         ("bridge", "2M-row benchmark — hours of machine, not a verdict"),
+        "arrays":        ("live",   "arrays as JSON text on the wire: a SQLite replica reads them with json_extract, a PGlite replica holds native arrays from the same wire, writes with arrays from both clients land as native arrays and echo in each engine's shape, the audit agrees (§10ey)"),
+        "blobs":         ("live",   "bytes end to end: a bytea tile and a PostGIS point — BLOB in the replica, seed and CDC byte-exact, a client's write lands as the same bytea and point, the Node client and the audit agree; needs PostGIS (§10ex)"),
         "cdc_wall":      ("live",   "the wall: a client whose position fell off a pruned CDC stream — the count valve with the chain inside the window (re-seed, agree), the age under the 2 × cadence floor (doctor, boot and fleet monitor say so; no resume past the hole), the bridge down longer than the age; runs its own bridge on the live slot, stop yours first (§10eg)"),
         "drip":          ("live",   "the wasp: a create/update/delete trio on test_types every 200 ms for hours against the running stack, invariants checked every minute (PG == both replicas, outboxes empty, no refused verdict, RSS flat, tombstones bounded), the sweeper run hourly"),
         "swarm":         ("bridge", "the 100-client hour: 50 node + 49 python + 1 PGlite, ~160 mut/s, faults, whole-replica equality"),

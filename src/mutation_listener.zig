@@ -138,7 +138,25 @@ const ColKind = enum {
     json,
     /// A PostgreSQL array type: `{…}` literal, quoted per element.
     array,
+    /// §10ex: bytea — a client's `bin` binds as the `\x…` hex text bytea's input reads.
+    bytea,
+    /// §10ex: PostGIS geometry/geography — a client's `bin` (EWKB) binds as bare hex,
+    /// which the geometry input function reads as EWKB.
+    geometry,
 };
+
+/// Bytes as hex text, with an optional prefix — the text form PostgreSQL's bytea
+/// (`\x…`) and geometry (bare EWKB hex) input functions read.
+fn hexText(alloc: std.mem.Allocator, prefix: []const u8, bytes: []const u8) error{OutOfMemory}![:0]u8 {
+    const digits = "0123456789abcdef";
+    var out = try alloc.allocSentinel(u8, prefix.len + bytes.len * 2, 0);
+    @memcpy(out[0..prefix.len], prefix);
+    for (bytes, 0..) |b, i| {
+        out[prefix.len + i * 2] = digits[b >> 4];
+        out[prefix.len + i * 2 + 1] = digits[b & 0x0f];
+    }
+    return out;
+}
 
 /// A msgpack payload as JSON, for a json/jsonb column.
 fn writeJsonPayload(
@@ -1700,6 +1718,10 @@ pub const MutationListener = struct {
                 .json
             else if (std.mem.eql(u8, cat, "A"))
                 .array
+            else if (std.mem.eql(u8, tname, "bytea"))
+                .bytea
+            else if (std.mem.eql(u8, tname, "geometry") or std.mem.eql(u8, tname, "geography"))
+                .geometry
             else
                 .scalar;
 
@@ -2797,6 +2819,16 @@ pub const MutationListener = struct {
     ) !?[*:0]const u8 {
         return switch (kind) {
             .scalar => self.payloadToString(alloc, payload),
+            // §10ex: bytes into a bytea column as `\x` hex; a client that already sends
+            // the text form passes through payloadToString unchanged.
+            .bytea => switch (payload) {
+                .bin => |v| (try hexText(alloc, "\\x", v.value())).ptr,
+                else => self.payloadToString(alloc, payload),
+            },
+            .geometry => switch (payload) {
+                .bin => |v| (try hexText(alloc, "", v.value())).ptr,
+                else => self.payloadToString(alloc, payload),
+            },
             .json => switch (payload) {
                 .nil => null,
                 else => blk: {
@@ -2842,10 +2874,23 @@ pub const MutationListener = struct {
                 const s = try alloc.dupeZ(u8, str.value());
                 return s.ptr;
             },
+            // §10ex: bytes into a column that is not bytea — text as they are; PostgreSQL
+            // judges them like any other text.
+            .bin => |b| {
+                const s = try alloc.dupeZ(u8, b.value());
+                return s.ptr;
+            },
             else => return error.UnsupportedPayloadType,
         }
     }
 };
+
+test "hexText - bytea input form" {
+    const a = std.testing.allocator;
+    const h = try hexText(a, "\\x", &.{ 0x00, 0xde, 0xad, 0xff });
+    defer a.free(h);
+    try std.testing.expectEqualStrings("\\x00deadff", h);
+}
 
 const testing = std.testing;
 

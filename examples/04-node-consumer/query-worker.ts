@@ -10,6 +10,11 @@
 import { createInterface } from 'node:readline';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { ZeBridge } from 'zb-client-ts';
+
+// §10ex: a BLOB cell comes back as bytes; on this JSON line it is the same
+// `{"$bin": "<base64>"}` marker the C ABI uses, so a host reads both clients alike.
+const bytesAsMarker = (row: any) =>
+  Object.fromEntries(Object.entries(row).map(([k, v]) => [k, v instanceof Uint8Array ? { $bin: Buffer.from(v).toString('base64') } : v]));
 import { nodeStorage, nodeConnect } from 'zb-client-ts/node';
 import { makePgliteStorage } from 'zb-client-ts/pglite';
 
@@ -64,7 +69,7 @@ for await (const line of rl) {
       continue;
     }
     const rows = await zb.query(req.sql, ...(req.params ?? []));
-    console.log(JSON.stringify({ rows }));
+    console.log(JSON.stringify({ rows: rows.map(bytesAsMarker) }));
   } catch (e: any) {
     console.log(JSON.stringify({ error: String(e?.message ?? e) }));
   }

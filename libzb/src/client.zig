@@ -2080,7 +2080,7 @@ pub const SyncClient = struct {
         var obj: std.json.ObjectMap = .empty;
         for (st.cols, 0..) |c, i| {
             if (i >= rows[0].len) break;
-            try obj.put(a, c, storageToJson(rows[0][i]));
+            try obj.put(a, c, try storageToJson(a, rows[0][i]));
         }
         return .{ .object = obj };
     }
@@ -2192,7 +2192,7 @@ pub const SyncClient = struct {
         var rows = std.json.Array.init(a);
         for (res.rows) |r| {
             var row = std.json.Array.init(a);
-            for (r) |cell| try row.append(storageToJson(cell));
+            for (r) |cell| try row.append(try storageToJson(a, cell));
             try rows.append(.{ .array = row });
         }
         var out: std.json.ObjectMap = .empty;
@@ -2517,6 +2517,8 @@ fn jsonToMsgpack(a: std.mem.Allocator, v: Value) error{ OutOfMemory, NotMap, Not
             break :blk pl;
         },
         .object => |obj| blk: {
+            // §10ex: the bytes marker is msgpack `bin` on the wire, never a map.
+            if (try binOf(a, v)) |b| break :blk try msgpack.Payload.binToPayload(b, a);
             var pl = msgpack.Payload.mapPayload(a);
             var it = obj.iterator();
             while (it.next()) |e| try pl.mapPut(e.key_ptr.*, try jsonToMsgpack(a, e.value_ptr.*));
@@ -2565,13 +2567,13 @@ fn cloneValue(a: std.mem.Allocator, v: Value) error{OutOfMemory}!Value {
 }
 
 /// A stored cell → the JSON the core speaks (for the before-image).
-fn storageToJson(v: storage.Value) Value {
+fn storageToJson(a: std.mem.Allocator, v: storage.Value) error{OutOfMemory}!Value {
     return switch (v) {
         .null => .null,
         .integer => |i| .{ .integer = i },
         .real => |f| .{ .float = f },
         .text => |t| .{ .string = t },
-        .blob => |b| .{ .string = b },
+        .blob => |b| try binMarker(a, b),
         .boolean => |b| .{ .bool = b },
     };
 }
@@ -2653,6 +2655,35 @@ fn decodeMaybeMsgpackString(a: std.mem.Allocator, bytes: []const u8) ![]const u8
     return if (v == .string) v.string else bytes;
 }
 
+/// §10ex: bytes inside the JSON the core speaks. `std.json.Value` has no binary, and
+/// a JSON text with raw bytes in a string is not valid JSON (the outbox stores
+/// payloads as JSON text) — so bytes travel as `{"$bin": "<base64>"}` everywhere
+/// JSON is the shape: the CDC value on its way to a bind, a chain cell, the
+/// before-image, a query result handed to the host, a host's write. The host sees
+/// and sends the same marker.
+pub const BIN_KEY = "$bin";
+
+fn binMarker(a: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!Value {
+    const enc = std.base64.standard.Encoder;
+    const buf = try a.alloc(u8, enc.calcSize(bytes.len));
+    _ = enc.encode(buf, bytes);
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, BIN_KEY, .{ .string = buf });
+    return .{ .object = obj };
+}
+
+/// The bytes of a `{"$bin": …}` marker, or null when `v` is anything else.
+fn binOf(a: std.mem.Allocator, v: Value) error{OutOfMemory}!?[]u8 {
+    if (v != .object or v.object.count() != 1) return null;
+    const s = v.object.get(BIN_KEY) orelse return null;
+    if (s != .string) return null;
+    const dec = std.base64.standard.Decoder;
+    const n = dec.calcSizeForSlice(s.string) catch return null;
+    const out = try a.alloc(u8, n);
+    dec.decode(out, s.string) catch return null;
+    return out;
+}
+
 fn mpToJson(a: std.mem.Allocator, p: msgpack.Payload) error{OutOfMemory}!Value {
     return switch (p) {
         .nil => .null,
@@ -2661,7 +2692,7 @@ fn mpToJson(a: std.mem.Allocator, p: msgpack.Payload) error{OutOfMemory}!Value {
         .uint => |u| if (u <= std.math.maxInt(i64)) Value{ .integer = @intCast(u) } else Value{ .float = @floatFromInt(u) },
         .float => |f| .{ .float = f },
         .str => |s| .{ .string = s.value() },
-        .bin => |b| .{ .string = b.value() },
+        .bin => |b| try binMarker(a, b.value()),
         .arr => |items| blk: {
             var arr = std.json.Array.init(a);
             for (items) |item| try arr.append(try mpToJson(a, item));
@@ -2689,7 +2720,7 @@ fn jsonToStorage(a: std.mem.Allocator, v: Value) !storage.Value {
         .integer => |i| .{ .integer = i },
         .float => |f| .{ .real = f },
         .string => |s| .{ .text = s },
-        else => .{ .text = try core.valueToString(a, v) },
+        else => if (try binOf(a, v)) |b| .{ .blob = b } else .{ .text = try core.valueToString(a, v) },
     };
 }
 
@@ -2698,9 +2729,36 @@ fn jsonToStorage(a: std.mem.Allocator, v: Value) !storage.Value {
 fn chainCellToStorage(a: std.mem.Allocator, v: Value) !storage.Value {
     return switch (v) {
         .string => |s| .{ .text = try core.pgTsToWire(a, s) },
-        .object, .array => .{ .text = try core.valueToString(a, v) },
+        .object, .array => if (try binOf(a, v)) |b| .{ .blob = b } else .{ .text = try core.valueToString(a, v) },
         else => jsonToStorage(a, v),
     };
+}
+
+test "bytes round the JSON world as a base64 marker and bind as a blob (§10ex)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = [_]u8{ 0, 0xff, 0xfe, 'A' };
+    // the wire's bin → the core's JSON → a BLOB bind
+    const pl = try msgpack.Payload.binToPayload(&raw, a);
+    const j = try mpToJson(a, pl);
+    try std.testing.expect(j == .object);
+    try std.testing.expectEqualStrings("AP/+QQ==", j.object.get(BIN_KEY).?.string);
+    const cell = try chainCellToStorage(a, j);
+    try std.testing.expect(cell == .blob);
+    try std.testing.expectEqualSlices(u8, &raw, cell.blob);
+    const bound = try jsonToStorage(a, j);
+    try std.testing.expect(bound == .blob);
+    // a stored blob → the host's JSON → the outbox's msgpack bin
+    const back = try storageToJson(a, .{ .blob = &raw });
+    const mp = try jsonToMsgpack(a, back);
+    try std.testing.expect(mp == .bin);
+    try std.testing.expectEqualSlices(u8, &raw, mp.bin.value());
+    // a plain object is still JSON text
+    var plain: std.json.ObjectMap = .empty;
+    try plain.put(a, "k", .{ .integer = 1 });
+    const t = try jsonToStorage(a, .{ .object = plain });
+    try std.testing.expect(t == .text);
 }
 
 // ─── ownership tests ────────────────────────────────────────────────────────

@@ -31,12 +31,31 @@ pub const sqlite_type_map = std.StaticStringMap([]const u8).initComptime(.{
     // and consistent; SQLite has no decimal type, so the client does the arithmetic.
     .{ "numeric", "TEXT" },
     .{ "decimal", "TEXT" },
+
+    // §10ex: bytes. bytea, and the PostGIS types, which PostgreSQL sends as EWKB
+    // bytes in binary mode — the bridge carries them as msgpack `bin` and never
+    // looks inside; the client that renders a map decodes EWKB itself.
+    .{ "bytea", "BLOB" },
+    .{ "geometry", "BLOB" },
+    .{ "geography", "BLOB" },
 });
 
 /// Translates a PostgreSQL type to an SQLite type
 /// Defaults to "TEXT" for types like character varying, timestamp, jsonb, arrays, etc.
 pub fn pgToSqliteType(pg_type: []const u8) []const u8 {
-    return sqlite_type_map.get(pg_type) orelse "TEXT";
+    // `format_type` spells modifiers — `numeric(20,8)`, `geometry(Point,4326)`,
+    // `character varying(255)` — and the map is keyed by the bare name.
+    const bare = if (std.mem.indexOfScalar(u8, pg_type, '(')) |i| pg_type[0..i] else pg_type;
+    return sqlite_type_map.get(bare) orelse "TEXT";
+}
+
+test "pgToSqliteType - bytes are BLOB, modifiers do not hide the type" {
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("bytea"));
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("geometry"));
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("geometry(Point,4326)"));
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("geography"));
+    try std.testing.expectEqualStrings("TEXT", pgToSqliteType("numeric(20,8)"));
+    try std.testing.expectEqualStrings("TEXT", pgToSqliteType("bytea[]"));
 }
 
 test "pgToSqliteType - exact types must not become REAL" {

@@ -29,6 +29,7 @@ const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
+const pgoutput = @import("pgoutput.zig");
 const Config = @import("config.zig");
 const RefusedTables = @import("refused_tables.zig");
 const WritableTables = @import("writable_tables.zig");
@@ -96,7 +97,6 @@ pub fn classify(pk_columns: u32, identity: ReplicaIdentity, has_transition_rules
     return f;
 }
 
-
 // ---------------------------------------------------------------------------
 // Version column — what makes a table writable from the edge
 // ---------------------------------------------------------------------------
@@ -157,7 +157,6 @@ pub fn classifyVersionColumn(
 
     return .{ .usable = .{ .naive = is_naive, .coarse = coarse, .nullable = !notnull } };
 }
-
 
 /// Report, per tenant-scoped table, whether its tenant column can actually reach the
 /// subject — and refuse the table if it cannot.
@@ -290,6 +289,21 @@ pub fn reportTenantColumns(
 /// Pure and separately tested: a URL with no userinfo, or one whose password contains an
 /// `@` or a `:`, must not silently yield a wrong role name and turn every grant check
 /// into a false negative.
+/// §10ex: the PostGIS types, if the extension is installed, decode as bytes (EWKB)
+/// and map to BLOB. Their OIDs are per database, so they are looked up here, once,
+/// on the boot connection. Nothing to do when the extension is absent.
+pub fn registerExtensionBinaryTypes(conn: *c.PGconn) void {
+    const res = c.PQexec(conn, "SELECT oid::int, typname::text FROM pg_type WHERE typname IN ('geometry', 'geography') AND typtype = 'b'");
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return;
+    const n: usize = @intCast(c.PQntuples(res));
+    for (0..n) |i| {
+        const oid = std.fmt.parseInt(u32, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), 10) catch continue;
+        pgoutput.registerExtensionBytea(oid);
+        log.info("🗺️  '{s}' (oid {d}) rides as bytes: EWKB on the wire, BLOB in the replica — the client decodes it", .{ std.mem.span(c.PQgetvalue(res, @intCast(i), 1)), oid });
+    }
+}
+
 pub fn roleFromUrl(url: []const u8) ?[]const u8 {
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return null;
     var rest = url[scheme_end + 3 ..];
@@ -895,12 +909,12 @@ pub fn run(
     };
     defer c.PQfinish(conn);
 
+    registerExtensionBinaryTypes(conn);
     checkDdlPipeline(allocator, conn, publication_name);
     // NOT called here any more (§13): the per-boot scan is gone. It runs only on the
     // one transition that can strand stored rows — a budget SHRINK, detected against
     // the slot's previous zebridge_limits row (bridge.zig, registerRowWidthBudget).
     _ = event_buf_bytes;
-
 
     // array_length(indkey,1) counts the PK's columns; 0 rows means no PK at all.
     const query = try utils.allocPrintZ(
@@ -1216,11 +1230,9 @@ fn reportConnectionBudget(conn: *c.PGconn, writer_role: ?[]const u8) !void {
     const wr = writer_role orelse "";
     const wr_z = std.fmt.bufPrintZ(&wr_buf, "{s}", .{wr}) catch return;
     const params = [_]?[*:0]const u8{wr_z.ptr};
-    const res = c.PQexecParams(conn,
-        "SELECT current_setting('max_connections')::int, " ++
-            "COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = current_user), -1), " ++
-            "COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = $1), -1)",
-        1, null, &params[0], null, null, 0);
+    const res = c.PQexecParams(conn, "SELECT current_setting('max_connections')::int, " ++
+        "COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = current_user), -1), " ++
+        "COALESCE((SELECT rolconnlimit FROM pg_roles WHERE rolname = $1), -1)", 1, null, &params[0], null, null, 0);
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK or c.PQntuples(res) != 1) return error.QueryFailed;
 
@@ -1229,9 +1241,8 @@ fn reportConnectionBudget(conn: *c.PGconn, writer_role: ?[]const u8) !void {
     const writer_lim = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 2)), 10) catch return;
 
     log.info("🔌 connection budget: reader limit {d}, writer limit {d}, cluster max {d} — bridge worst case {d} (headroom {d})", .{
-        reader_lim, writer_lim, max_conn,
-        if (reader_lim > 0 and writer_lim > 0) reader_lim + writer_lim else -1,
-        if (reader_lim > 0 and writer_lim > 0) max_conn - reader_lim - writer_lim else -1,
+        reader_lim,                                                             writer_lim,                                                                        max_conn,
+        if (reader_lim > 0 and writer_lim > 0) reader_lim + writer_lim else -1, if (reader_lim > 0 and writer_lim > 0) max_conn - reader_lim - writer_lim else -1,
     });
 
     if (reader_lim < 0)

@@ -19,8 +19,6 @@ const Metrics = @import("metrics.zig").Metrics;
 
 pub const log = std.log.scoped(.batch_publisher);
 
-
-
 /// Initialize memory slab for event ring buffer with optional memory locking
 /// Returns a contiguous block of memory sized for `slot_count` events of `slot_size` bytes each
 ///
@@ -842,16 +840,10 @@ pub const BatchPublisher = struct {
             if (should_flush) {
                 batches_processed += 1;
                 if (batch.items.len < self.config.max_events) {
-                    log.debug("Flush triggered early! events={d}/{d}, payload={d}/{d}, time={d}/{d}ms. Reasons: forced={}, max_events={}, max_payload={}, timeout={}", .{
-                        batch.items.len, self.config.max_events,
-                        current_payload_size, self.config.max_payload_bytes,
-                        time_elapsed, self.config.max_wait_ms,
-                        force, reason_max_events, reason_max_payload, reason_timeout
-                    });
+                    log.debug("Flush triggered early! events={d}/{d}, payload={d}/{d}, time={d}/{d}ms. Reasons: forced={}, max_events={}, max_payload={}, timeout={}", .{ batch.items.len, self.config.max_events, current_payload_size, self.config.max_payload_bytes, time_elapsed, self.config.max_wait_ms, force, reason_max_events, reason_max_payload, reason_timeout });
                 } else {
                     log.debug("Flush thread processing batch #{d} with {d} events", .{ batches_processed, batch.items.len });
                 }
-
 
                 // Log the msg_ids of events being flushed
                 if (batch.items.len > 0) {
@@ -1003,20 +995,20 @@ pub const BatchPublisher = struct {
                     try self.publishCDCSubBatch(cdc_indices.items);
                     cdc_indices.clearRetainingCapacity();
                 }
-                
+
                 // Publish KV event directly as raw JSON
                 if (event.column_count > 0) {
                     const col_view = event.columns[0];
                     const raw_json = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
-                    
+
                     const msg_id = event.getMsgId();
-                    
+
                     try self.timedPublish(event.getSubject(), msg_id, raw_json);
                     // §1.7's undercount, resolved sideways: SCHEMA events get their own
                     // counter rather than joining `cdc_events_published`, whose value is
                     // trusted to equal row events (README burst method, speed.py).
                     if (self.metrics) |m| m.incrementSchemaEvents();
-                    log.info("📤 Published KV schema: {d} bytes to {s}", .{raw_json.len, event.getSubject()});
+                    log.info("📤 Published KV schema: {d} bytes to {s}", .{ raw_json.len, event.getSubject() });
                 }
             } else {
                 try cdc_indices.append(flush_alloc, slot_idx);
@@ -1301,9 +1293,16 @@ pub const BatchPublisher = struct {
                 const val: f64 = @bitCast(bytes.*);
                 break :blk encoder.createFloat(val);
             },
-            .text, .numeric, .array, .bytea, .jsonb => blk: {
+            .text, .numeric, .array, .jsonb => blk: {
                 const str = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
                 break :blk try encoder.createString(str);
+            },
+            // §10ex: bytes, not text. Inside a msgpack string a client that decodes
+            // strings as UTF-8 corrupted every non-text bytea; as `bin` it lands as bytes
+            // and binds as a BLOB.
+            .bytea => blk: {
+                const bytes = event.data_buffer[col_view.valueOffset()..][0..col_view.value_len];
+                break :blk try encoder.createBin(bytes);
             },
         };
     }
@@ -1423,6 +1422,3 @@ test "addColumn: the column ceiling is reported, not crashed into" {
     try std.testing.expectEqual(@as(u16, test_max_columns), ev.column_count);
     try std.testing.expectError(error.TooManyColumns, ev.addColumn("one_too_many", .{ .int64 = 1 }));
 }
-
-
-

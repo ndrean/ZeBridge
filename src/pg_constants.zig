@@ -2,7 +2,9 @@ const std = @import("std");
 
 /// PostgreSQL built-in Type OIDs (Object IDs).
 ///
-/// These values are standard and obtained from PostgreSQL with: `docker exec postgres psql -U postgres -d postgres -c "SELECT oid, typname FROM pg_type WHERE typname IN ('bool', 'int2', 'int4', 'int8', 'float4', 'float8', 'text', 'varchar', 'bpchar', 'date', 'timestamptz', 'uuid', 'bytea', 'jsonb', 'numeric', '_int4', '_text', '_jsonb') ORDER BY oid;"`
+/// These values are standard and obtained from PostgreSQL with:
+/// `docker exec postgres psql -U postgres -d postgres -c
+/// "SELECT oid, typname FROM pg_type WHERE typname IN ('bool', 'int2', 'int4', 'int8', 'float4', 'float8', 'text', 'varchar', 'bpchar', 'date', 'timestamptz', 'uuid', 'bytea', 'jsonb', 'numeric', '_int4', '_text', '_jsonb') ORDER BY oid;"`
 pub const PgOid = enum(u32) {
     // Numeric Types
     BOOL = 16,
@@ -54,7 +56,6 @@ pub fn isKnownOid(oid: u32) bool {
     }
     return false;
 }
-
 
 pub const NUMERIC_POS: u16 = 0x0000;
 pub const NUMERIC_NEG: u16 = 0x4000;

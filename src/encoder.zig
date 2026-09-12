@@ -68,6 +68,16 @@ pub const Encoder = struct {
         };
     }
 
+    /// §10ex: bytes that are not text — bytea, and the extension types that ride as
+    /// bytes (PostGIS EWKB). msgpack `bin`, which every client decoder hands back as
+    /// bytes; JSON has no binary, so there they are a string of the raw bytes.
+    pub fn createBin(self: *Encoder, b: []const u8) !Value {
+        return switch (self.format) {
+            .msgpack => .{ .msgpack = try msgpack.Payload.binToPayload(b, self.allocator) },
+            .json => .{ .json = std.json.Value{ .string = try self.allocator.dupe(u8, b) } },
+        };
+    }
+
     /// Create an integer value
     pub fn createInt(self: *Encoder, i: i64) Value {
         return switch (self.format) {

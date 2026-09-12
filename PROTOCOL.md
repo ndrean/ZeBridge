@@ -337,7 +337,11 @@ would otherwise accept it. Check `suspended` before `writable`.
 arbitrary precision; SQLite `REAL` is float64, so money silently loses digits. The
 CDC path also delivers numerics as **strings**, so `REAL` would contradict the data.
 `float4`/`float8`/`real`/`double precision` do map to `REAL` — those are genuine
-IEEE-754. Everything unrecognised falls back to `TEXT`.
+IEEE-754. **`bytea` maps to `BLOB`**, and so do PostGIS `geometry` and `geography`:
+the bytes PostgreSQL sends (EWKB for the PostGIS types) are carried untouched and
+stored as bytes; a map client decodes EWKB itself. Type modifiers are ignored for
+the mapping (`geometry(Point,4326)` is `geometry`). Everything unrecognised falls
+back to `TEXT`.
 
 ### Three states, and a client must distinguish all three
 
@@ -553,7 +557,22 @@ that only obscures a genuine decode failure (`NOTES.md` §2.16).
   verbatim — no type-specific decoding is applied or needed.
 * `jsonb` arrives as its JSON text — a string, which a PostgreSQL replica parses back
   into a document and a SQLite replica stores as text.
-* arrays and `bytea` arrive as strings (arrays in PostgreSQL's literal form, `{a,b}`).
+* **arrays arrive as JSON text**: `["a","b"]`, nested arrays nested, `NULL` elements
+  as `null`, integer and float elements as numbers, booleans as `true`/`false`,
+  everything else (text, uuid, timestamps, numeric — which keeps its digits — jsonb,
+  bytea as `\x` hex) as JSON strings. A SQLite replica stores the text and reads it
+  with `json_each`, `json_extract`, `json_array_length`; a PostgreSQL-engine replica
+  converts it to the array literal on apply (`pgArrayLiteral` of the parsed list).
+  Until 2026-09-12 the wire carried PostgreSQL's literal, `{a,b}`, which no SQLite
+  function reads. A client WRITING an array column sends a real array in the payload,
+  as before; the bridge renders the literal for PostgreSQL.
+* **`bytea` arrives as MessagePack `bin`** — bytes, never a string — and so do the
+  PostGIS `geometry`/`geography` types, as EWKB. A client binds them as a BLOB. A
+  client WRITING such a column sends `bin` too (the TypeScript client: a
+  `Uint8Array`; the C ABI: the `{"$bin": "<base64>"}` marker); the bridge renders it
+  as the hex text PostgreSQL's input functions read (`\x…` for bytea, bare EWKB hex
+  for geometry). The row-width guard measures a row's TEXT form, so a bytea counts
+  twice against the change-feed budget: a 300 KB tile needs `BASE_BUF` 19 or more.
 * **`timestamptz` arrives as ISO-8601 with `Z`; `timestamp` arrives without it.** The
   suffix is not decoration — `timestamptz` is stored as UTC, so `Z` states a recorded
   fact, while `timestamp` is a naive wall-clock reading with no zone. A client must

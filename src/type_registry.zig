@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const pg_constants = @import("pg_constants.zig");
+const pgoutput = @import("pgoutput.zig");
 
 pub const log = std.log.scoped(.type_registry);
 
@@ -79,6 +80,8 @@ pub const Registry = struct {
     /// shipped hstore's bytes as a string.
     pub fn verdict(self: *Registry, oid: u32) Verdict {
         if (pg_constants.isKnownOid(oid)) return .decode;
+        // §10ex: an extension type registered at boot as bytes (PostGIS) decodes.
+        if (pgoutput.isExtensionBytea(oid)) return .decode;
 
         const typtype = self.map.get(oid) orelse return .refuse;
         return if (typtype == 'e') .text_passthrough else .refuse;
@@ -98,6 +101,14 @@ test "verdict - a built-in OID is decodable without ever being recorded" {
     try testing.expectEqual(Verdict.decode, reg.verdict(23)); // int4
     try testing.expectEqual(Verdict.decode, reg.verdict(1700)); // numeric
     try testing.expectEqual(@as(usize, 0), reg.count());
+}
+
+test "verdict - an extension OID registered as bytes decodes (§10ex)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    try testing.expectEqual(Verdict.refuse, reg.verdict(55394));
+    pgoutput.registerExtensionBytea(55394);
+    try testing.expectEqual(Verdict.decode, reg.verdict(55394));
 }
 
 test "verdict - an unknown OID with no entry refuses rather than guessing" {

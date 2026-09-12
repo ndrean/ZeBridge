@@ -11179,6 +11179,120 @@ bytes, and little else; `leaks` reports 0 for 0 bytes; a fresh libzb replica see
 budget is now GENERATION_WORKERS × the biggest full's msgpack size, roughly a quarter
 of a kilobyte a row here: four 3M-row fulls at once would want about 3 GB, not 13.
 
+## 10ex. Bytes are bytes: bytea and PostGIS as BLOB, end to end (2026-09-12)
+
+The type table, read against good practice (the conversation that started this):
+numeric as TEXT is right, SQLite has no decimal type and REAL would lose money's
+digits; jsonb as TEXT is exactly what SQLite's `json_*` functions take; timestamps as
+ISO text and booleans as 0/1 are SQLite's own conventions. Two things were wrong.
+Arrays ride as PostgreSQL's literal, which nothing in SQLite reads — left for its own
+item, because both clients' shared core renders that literal for the optimistic write
+and a PostgreSQL-engine replica wants it. And bytea was worse than TEXT: the decoder
+put the raw bytes inside a msgpack STRING, the TypeScript client decodes strings as
+UTF-8, so any non-text bytea was corrupted on that client, and libzb bound the bytes
+as text. No fixture had a bytea column, so no test had met it.
+
+**What changed, on the wire and in the replica.** `bytea` is msgpack `bin` on both
+paths — the CDC event (`encoder.createBin`) and the chain (`mp.bin`) — and the mapper
+says BLOB. PostGIS `geometry` and `geography` ride the same way: their OIDs differ
+per database, so preflight reads them from `pg_type` at boot and registers them with
+the decoder (`pgoutput.extension_bytea_oids`), which returns their EWKB bytes as it
+does bytea; the type registry's fail-closed verdict consults the same list, or the
+table is suspended as `unsupported_column_type` before a byte is read (measured: it
+was). The bridge never looks inside the EWKB; a map client decodes it. The mapper
+strips modifiers, so `geometry(Point,4326)` is `geometry`. The DDL trigger rendered a
+column's type from information_schema's `data_type` — `USER-DEFINED` for every
+extension type, `ARRAY` for every array — while the boot path used `format_type`:
+a PostGIS column was TEXT at CREATE TABLE and BLOB at the next boot, and every
+replica rebuilt the table between the two. The trigger says `format_type` now, the
+form PROTOCOL §3 promised all along.
+
+**The clients.** TypeScript: a `bin` decodes to a `Uint8Array`, which `typeof` calls
+an object, so every place that turns objects into JSON text (`cdcValue`,
+`chainRowParams`, `pgEngineValues`, the revert's comparison) lets bytes through
+(`isBytes`); the drivers bind a `Uint8Array` as a BLOB. libzb speaks JSON inside
+(`std.json.Value`, which has no binary) and its outbox stores payloads as JSON text,
+where raw bytes in a string are not valid JSON — so bytes travel as `{"$bin":
+"<base64>"}` everywhere JSON is the shape: the CDC value on its way to a bind, a
+chain cell, the before-image, a query result to the host, a host's write; the core's
+structured→text conversions let the marker through, the shell binds it as a BLOB
+and turns it back into msgpack `bin` for the outbox. The host sees and sends the
+same marker on the C card; the Node example prints it too, so a scenario reads both
+clients alike.
+
+**Writing bytes.** The mutation listener binds a client's `bin` as the hex text
+PostgreSQL's input functions read: `\x…` for a bytea column, bare EWKB hex for
+geometry/geography (two new column kinds), the raw bytes as text anywhere else.
+
+**Measured**, `scripts/scenarios/blobs.py` on the live bridge with PostGIS 3.6: a
+table with a bytea tile and a `geometry(Point,4326)`; the replica declares BLOB for
+both; a fresh libzb seed carries a 1,500-byte tile, the 256 byte values, an empty
+tile and two points byte for byte (`typeof` blob); a row inserted after the seed
+arrives over CDC identical; the client's write — a 1,026-byte tile and an EWKB point
+as the marker — lands as the same bytea and `POINT(4.9041 52.3676)` SRID 4326, and
+its echo is byte-identical in the replica; the Node client holds the same bytes; the
+audit finds the full and deltas exact (bytea as `\x` hex, geometry as EWKB hex).
+
+Two things the run taught. The row-width guard measures a row's TEXT form against
+the change-feed budget, so a bytea counts twice: the first version of the test
+inserted a 300 KB tile and PostgreSQL refused the row at 600,525 bytes against the
+4,096-byte budget of the dev bridge (BASE_BUF 12). The guard measures a bytea as
+its bytes plus five now (the bin header's worst case), and geometry/geography —
+which fell in no branch and were unguarded — by `pg_column_size`, so the guard needs
+no PostGIS function; both installer and re-budget functions, applied to the dev
+database by hand and the eight guards re-baked. Tiles that size over CDC still need
+BASE_BUF 19 or more, with the ring sized to match — the reason the tiles of the map
+use case stay on a CDN and only the POI layer rides the bridge. And on an insert the
+key column must be in the VALUES as well as the key: the key names the row for the
+outbox and the local apply, the values are the row PostgreSQL inserts, and a uuid
+left out of the values takes the column default.
+
+## 10ey. Arrays as JSON text on the wire (2026-09-12)
+
+An array crossed the wire as PostgreSQL's literal, `{a,b}`. A SQLite replica stored
+it as opaque text that no SQLite function reads, so every consumer parsed the
+literal by hand — quoting rules, `NULL`, nesting. And the literal writer rendered
+only integers, floats, text, uuid and bytea elements; anything else (booleans,
+numerics, timestamps) was appended as its raw binary bytes, a latent bug no fixture
+had reached.
+
+**The wire.** An array is JSON text now: `["a","b c",null]`, nested arrays nested,
+integers and floats bare, booleans `true`/`false`, everything else a JSON string —
+numeric keeps its digits (`["1.50","2"]`, the scalar rule), jsonb elements embedded,
+bytea as `\x` hex. Every element goes through `decodeBinColumnData`, the same decoder
+as a scalar of its type, which is what fixes the latent bug. An empty array is `[]`.
+PROTOCOL §4 says so.
+
+**The engines.** SQLite stores the text and reads it with `json_extract`,
+`json_array_length`, `json_each`; a client's optimistic local write already stored
+`JSON.stringify(array)`, so it now matches the echo where before it differed from
+the literal the echo brought (a phantom difference the revert check had to absorb).
+A PostgreSQL engine wants the literal, so the TypeScript client's postgres dialect
+converts on apply — `pgArrayValues` for CDC events, the same for chain cells — with
+`pgArrayLiteral`, the function that already rendered the optimistic write; it knows
+the array columns from the descriptor's `pg` block (`type` ending in `[]`). Mutations
+do not change: a client sends real arrays in the payload and the bridge renders the
+literal for PostgreSQL, as before. libzb changes nothing (SQLite only). The audit
+compares arrays with PostgreSQL's `to_json`, quotes stripped on both sides.
+
+**Measured**, `scripts/scenarios/arrays.py`: a table with text[], int[][], bool[] and
+numeric[]; a libzb replica on globex reads `json_extract(tags, '$[1]')` = `b c`,
+`json_array_length(matrix)` = 2, flags `[true,false]`, prices `["1.50","2"]`, on the
+seed and over CDC; its write with arrays lands as `{p,"q r"}|{{5,6}}|{f}|{3.25}` and
+echoes as the same JSON text the optimistic write stored; the Node worker on PGlite
+(tenant acme) holds native arrays from the same wire — `tags[2]`, `matrix[2][1]`,
+`flags[1]`, `prices[1]` — on the seed and over CDC, and its own write lands and reads
+back natively; the audit finds the objects exact. Nine checks, both engines.
+
+**And the side job, `examples/07-duckdb`.** PostgreSQL → SQLite → DuckDB in one
+script: the C card in twenty lines of ctypes opens the replica and seeds it, DuckDB
+attaches the file (`TYPE sqlite, READ_ONLY`) and runs the analytical query while the
+replica keeps syncing. Measured on test_types: the replica ready in 105 s
+(3,055,002 rows, one chain object plus deltas), a group-by with a `DECIMAL` cast over
+the three million rows in 856 ms, the whole-table scan in 164 ms, PostgreSQL never
+asked anything. The same shape is the warm micro-VM: the file synced continuously,
+the job fired on demand.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

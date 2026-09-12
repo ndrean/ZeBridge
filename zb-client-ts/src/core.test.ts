@@ -2,6 +2,29 @@
 /// the TS core. A port (Zig, …) writes its own thin runner over the SAME file —
 /// the fixtures are the spec, this file is just plumbing.
 import { test } from 'node:test';
+import { cdcValue, pgEngineValues, isBytes, pgArrayValues } from './core.ts';
+
+test('JSON array text becomes the PostgreSQL literal for array columns only (§10ey)', () => {
+  const data = { tags: '["a","b c",null]', matrix: '[[1,2],[3,4]]', note: '[not an array column]', n: 3 };
+  const out = pgArrayValues(data, ['tags', 'matrix']);
+  assert.equal(out.tags, '{a,"b c",NULL}');
+  assert.equal(out.matrix, '{{1,2},{3,4}}');
+  assert.equal(out.note, '[not an array column]');
+  assert.equal(out.n, 3);
+  assert.equal(pgArrayValues({ tags: null }, ['tags']).tags, null);
+  assert.equal(pgArrayValues({ tags: ['x'] }, ['tags']).tags, '{x}');
+});
+
+test('bytes stay bytes on every bind path (§10ex)', () => {
+  const b = new Uint8Array([0, 255, 254, 65]);
+  assert.equal(isBytes(b), true);
+  assert.equal(isBytes('x'), false);
+  assert.equal(cdcValue(b), b);
+  assert.equal(chainRowParams([b, { a: 1 }, null])[0], b);
+  assert.equal(chainRowParams([b, { a: 1 }, null])[1], '{"a":1}');
+  assert.equal(pgEngineValues({ tile: b, tags: ['a'] }).tile, b);
+  assert.equal(pgEngineValues({ tile: b, tags: ['a'] }).tags, '{a}');
+});
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';

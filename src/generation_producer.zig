@@ -785,7 +785,8 @@ pub const GenerationProducer = struct {
                         .int32 => |x| try mp.int(&out, payload_alloc, x),
                         .int64 => |x| try mp.int(&out, payload_alloc, x),
                         .float64 => |f| try mp.float(&out, payload_alloc, f),
-                        .text, .numeric, .jsonb, .array, .bytea => |str| try mp.str(&out, payload_alloc, str),
+                        .text, .numeric, .jsonb, .array => |str| try mp.str(&out, payload_alloc, str),
+                        .bytea => |b| try mp.bin(&out, payload_alloc, b),
                     }
                 }
                 if (row_bytes > out_widest.*) out_widest.* = row_bytes;
@@ -1832,6 +1833,20 @@ const mp = struct {
         try out.append(a, 0xcb);
         try be(out, a, u64, @bitCast(f));
     }
+
+    /// §10ex: bytes as msgpack `bin`, the shape a bytea (or EWKB) cell takes.
+    fn bin(out: *List, a: std.mem.Allocator, b: []const u8) !void {
+        if (b.len < 256) {
+            try out.appendSlice(a, &.{ 0xc4, @intCast(b.len) });
+        } else if (b.len < 65_536) {
+            try out.append(a, 0xc5);
+            try be(out, a, u16, @intCast(b.len));
+        } else {
+            try out.append(a, 0xc6);
+            try be(out, a, u32, @intCast(b.len));
+        }
+        try out.appendSlice(a, b);
+    }
 };
 
 test "mp: the chain document's shapes decode as msgpack" {
@@ -1856,6 +1871,11 @@ test "mp: the chain document's shapes decode as msgpack" {
     try std.testing.expectEqual(@as(u8, 0xd9), out.items[25]);
     try std.testing.expectEqual(@as(u8, 40), out.items[26]);
     try std.testing.expectEqual(@as(usize, 67), out.items.len);
+    // bin8: 0xc4 len bytes — a bytea cell, never a string
+    try mp.bin(&out, a, &.{ 0x00, 0xff, 0xfe });
+    try std.testing.expectEqual(@as(u8, 0xc4), out.items[67]);
+    try std.testing.expectEqual(@as(u8, 3), out.items[68]);
+    try std.testing.expectEqual(@as(u8, 0xff), out.items[70]);
 }
 
 fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {

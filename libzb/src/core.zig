@@ -286,8 +286,18 @@ pub fn advancePosition(stored: i64, batch: std.json.Array) i64 {
 
 // ─── the apply SQL builders ─────────────────────────────────────────────────
 
-/// core.ts cdcValue: structured values become compact JSON text.
+/// §10ex: the one object that is NOT JSON text — bytes, as `{"$bin": "<base64>"}`
+/// (client.zig binMarker). It passes through every structured→text conversion here
+/// and binds as a BLOB in the shell (client.zig jsonToStorage). core.ts isBytes.
+pub fn isBinMarker(v: Value) bool {
+    if (v != .object or v.object.count() != 1) return false;
+    const s = v.object.get("$bin") orelse return false;
+    return s == .string;
+}
+
+/// core.ts cdcValue: structured values become compact JSON text; bytes stay bytes.
 fn cdcValue(a: std.mem.Allocator, v: Value) !Value {
+    if (isBinMarker(v)) return v;
     return switch (v) {
         .object, .array => .{ .string = try valueToString(a, v) },
         else => v,
@@ -560,6 +570,10 @@ pub fn chainUpsertSql(a: std.mem.Allocator, table: []const u8, cols: []const []c
 pub fn chainRowParams(a: std.mem.Allocator, row: std.json.Array) !Value {
     var out = std.json.Array.init(a);
     for (row.items) |v| {
+        if (isBinMarker(v)) {
+            try out.append(v);
+            continue;
+        }
         switch (v) {
             .object, .array => try out.append(.{ .string = try valueToString(a, v) }),
             .string => |s| try out.append(.{ .string = try pgTsToWire(a, s) }),

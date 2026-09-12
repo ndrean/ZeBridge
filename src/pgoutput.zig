@@ -95,12 +95,40 @@ pub const Column = struct {
 /// come from the same arena, reclaimed together). The passthrough branches then return
 /// slices of `raw_bytes` directly instead of copying it — false keeps the defensive
 /// copy, for a caller like a test that hands in a stack buffer.
+/// §10ex: OIDs of extension types whose binary send format is bytes the bridge
+/// carries untouched — PostGIS `geometry` and `geography` (EWKB). Extension OIDs
+/// differ per database, so they are read from `pg_type` at boot (preflight) rather
+/// than known. Zero slots are empty. Written once at boot, read by the decoder.
+pub var extension_bytea_oids: [8]u32 = [_]u32{0} ** 8;
+
+pub fn registerExtensionBytea(oid: u32) void {
+    for (&extension_bytea_oids) |*slot| {
+        if (slot.* == oid) return;
+        if (slot.* == 0) {
+            slot.* = oid;
+            return;
+        }
+    }
+}
+
+pub fn isExtensionBytea(oid: u32) bool {
+    if (oid == 0) return false;
+    for (extension_bytea_oids) |o| {
+        if (o == 0) return false;
+        if (o == oid) return true;
+    }
+    return false;
+}
+
 pub fn decodeBinColumnData(
     allocator: std.mem.Allocator,
     type_id: u32,
     raw_bytes: []const u8,
     owns_bytes: bool,
 ) !DecodedValue {
+    if (isExtensionBytea(type_id)) {
+        return .{ .bytea = if (owns_bytes) raw_bytes else try allocator.dupe(u8, raw_bytes) };
+    }
     const oid: PgOid = @enumFromInt(type_id);
 
     return switch (oid) {
@@ -317,7 +345,7 @@ pub fn decodeBinColumnData(
 }
 
 /// Convert ArrayResult to PostgreSQL array style text format '{{1,2}, {3,4}}'
-pub fn arrayToText(allocator: std.mem.Allocator, arr: ArrayResult) ![]u8 {
+pub fn arrayToText(allocator: std.mem.Allocator, arr: ArrayResult) anyerror![]u8 {
     // An empty array — `'{}'::text[]` — has **ndim = 0**, so `dimensions` is empty and
     // there is no dimension 0 to read. `writeArrayRecursive` indexed `dims[0]`
     // unconditionally, which panicked in Debug and read out of bounds in ReleaseFast,
@@ -325,7 +353,7 @@ pub fn arrayToText(allocator: std.mem.Allocator, arr: ArrayResult) ![]u8 {
     // nothing in the log. Any table with an array column an application ever leaves
     // empty was one INSERT away from this.
     if (arr.ndim == 0 or arr.dimensions.len == 0) {
-        return allocator.dupe(u8, "{}");
+        return allocator.dupe(u8, "[]");
     }
 
     var res: std.ArrayList(u8) = .empty;
@@ -333,13 +361,22 @@ pub fn arrayToText(allocator: std.mem.Allocator, arr: ArrayResult) ![]u8 {
     return res.toOwnedSlice(allocator);
 }
 
+/// §10ey: a PostgreSQL array as JSON text — `["a","b"]`, nested arrays nested,
+/// NULL elements `null`, integers and floats bare, booleans `true`/`false`, every
+/// other element (text, uuid, timestamps, numeric with its digits, jsonb, bytea as
+/// `\x` hex) a JSON string. Until 2026-09-12 this wrote PostgreSQL's own literal,
+/// `{a,b}`, which no SQLite function reads and every client parsed by hand; a
+/// PostgreSQL-engine replica turns the JSON back into the literal on apply. Each
+/// element goes through `decodeBinColumnData` — the same decoder as a scalar of its
+/// type — where the literal writer had rendered only ints, floats, text, uuid and
+/// bytea and appended anything else (booleans, numerics, timestamps) as raw bytes.
 fn writeArrayRecursive(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     arr: ArrayResult,
     dim: usize,
     index: usize,
-) !usize {
+) anyerror!usize {
     const dims = arr.dimensions;
     const ndim = arr.ndim;
 
@@ -347,7 +384,7 @@ fn writeArrayRecursive(
 
     var flat_index = index;
 
-    try out.append(allocator, '{');
+    try out.append(allocator, '[');
 
     var i: usize = 0;
     while (i < count) : (i += 1) {
@@ -357,46 +394,26 @@ fn writeArrayRecursive(
             // leaf element
             const elem = arr.elements[flat_index];
             switch (elem) {
-                .null_value => try out.appendSlice(allocator, "NULL"),
-                .data => blk: {
-                    const pg_oid: PgOid = @enumFromInt(arr.element_oid);
-
-                    // BYTEA: \xHEXSTRING format
-                    if (pg_oid == PgOid.BYTEA) {
-                        const hex = try elementToText(allocator, pg_oid, elem.data);
-                        defer allocator.free(hex);
-                        try out.appendSlice(allocator, "\\x");
-                        try out.appendSlice(allocator, hex);
-                        break :blk;
+                .null_value => try out.appendSlice(allocator, "null"),
+                .data => {
+                    const v = try decodeBinColumnData(allocator, arr.element_oid, elem.data, false);
+                    defer freeDecoded(allocator, v);
+                    switch (v) {
+                        .null, .unchanged => try out.appendSlice(allocator, "null"),
+                        .boolean => |b| try out.appendSlice(allocator, if (b) "true" else "false"),
+                        .int32 => |x| try out.print(allocator, "{d}", .{x}),
+                        .int64 => |x| try out.print(allocator, "{d}", .{x}),
+                        .float64 => |f| {
+                            if (std.math.isFinite(f)) try out.print(allocator, "{d}", .{f}) else try out.appendSlice(allocator, "null");
+                        },
+                        .jsonb => |j| try out.appendSlice(allocator, j),
+                        .text, .numeric, .array => |str| try writeJsonString(out, allocator, str),
+                        .bytea => |b| {
+                            try out.appendSlice(allocator, "\"\\\\x");
+                            for (b) |byte| try out.print(allocator, "{x:0>2}", .{byte});
+                            try out.append(allocator, '"');
+                        },
                     }
-
-                    // UUID: formatted string (no quotes needed in array)
-                    if (pg_oid == PgOid.UUID) {
-                        const uuid_str = try elementToText(allocator, pg_oid, elem.data);
-                        defer allocator.free(uuid_str);
-                        try out.appendSlice(allocator, uuid_str);
-                        break :blk;
-                    }
-
-                    // TEXT/VARCHAR: requires quotes and escaping
-                    if (pg_oid == PgOid.TEXT or pg_oid == PgOid.VARCHAR) {
-                        const txt = try elementToText(allocator, pg_oid, elem.data);
-                        defer allocator.free(txt);
-
-                        try out.append(allocator, '"');
-                        for (txt) |c| {
-                            if (c == '"' or c == '\\')
-                                try out.append(allocator, '\\');
-                            try out.append(allocator, c);
-                        }
-                        try out.append(allocator, '"');
-                        break :blk;
-                    }
-
-                    // All other types (INT, FLOAT, BOOL, etc.): just append as-is
-                    const s = try elementToText(allocator, pg_oid, elem.data);
-                    defer allocator.free(s);
-                    try out.appendSlice(allocator, s);
                 },
             }
             flat_index += 1;
@@ -406,9 +423,32 @@ fn writeArrayRecursive(
         }
     }
 
-    try out.append(allocator, '}');
+    try out.append(allocator, ']');
 
     return flat_index;
+}
+
+/// A JSON string: quoted, `"` and `\` escaped, control characters as `\uXXXX`.
+fn writeJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |ch| switch (ch) {
+        '"' => try out.appendSlice(allocator, "\\\""),
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        '\r' => try out.appendSlice(allocator, "\\r"),
+        '\t' => try out.appendSlice(allocator, "\\t"),
+        0...8, 11, 12, 14...31 => try out.print(allocator, "\\u{x:0>4}", .{ch}),
+        else => try out.append(allocator, ch),
+    };
+    try out.append(allocator, '"');
+}
+
+/// What `decodeBinColumnData(…, owns_bytes = false)` allocated for one value.
+fn freeDecoded(allocator: std.mem.Allocator, v: DecodedValue) void {
+    switch (v) {
+        .text, .numeric, .jsonb, .array, .bytea => |str| allocator.free(str),
+        else => {},
+    }
 }
 
 // Array element decoding
@@ -1082,10 +1122,10 @@ test "1D int4 → {1,2,3,4}" {
     const txt = try arrayToText(alloc, arr);
     defer alloc.free(txt);
 
-    try std.testing.expectEqualStrings("{1,2,3,4}", txt);
+    try std.testing.expectEqualStrings("[1,2,3,4]", txt);
 }
 
-test "2D int4 → {{1,2},{3,4}}" {
+test "2D int4 → [[1,2],[3,4]]" {
     const alloc = std.testing.allocator;
 
     const buf = [_]u8{
@@ -1111,10 +1151,10 @@ test "2D int4 → {{1,2},{3,4}}" {
     const txt = try arrayToText(alloc, arr);
     defer alloc.free(txt);
 
-    try std.testing.expectEqualStrings("{{1,2},{3,4}}", txt);
+    try std.testing.expectEqualStrings("[[1,2],[3,4]]", txt);
 }
 
-test "3D int4 → {{{1,2},{3,4}},{{5,6},{7,8}}}" {
+test "3D int4 → [[[1,2],[3,4]],[[5,6],[7,8]]]" {
     const alloc = std.testing.allocator;
 
     // 3D: dims = [2,2,2], flattened [1..8]
@@ -1169,19 +1209,19 @@ test "3D int4 → {{{1,2},{3,4}},{{5,6},{7,8}}}" {
     defer alloc.free(txt);
 
     try std.testing.expectEqualStrings(
-        "{{{1,2},{3,4}},{{5,6},{7,8}}}",
+        "[[[1,2],[3,4]],[[5,6],[7,8]]]",
         txt,
     );
 }
 
-test "NULL elements → {1,NULL,3}" {
+test "NULL elements → [1,null,3]" {
     const alloc = std.testing.allocator;
 
     const buf = [_]u8{
-        0,   0,   0,   1, // ndim = 1
-        0,   0,   0,   0, // flags
-        0,   0,   0,   23, // INT4
-        0,   0,   0,   3, // dim_len = 3 elements
+        0, 0, 0, 1, // ndim = 1
+        0, 0, 0, 0, // flags
+        0, 0, 0, 23, // INT4
+        0, 0, 0, 3, // dim_len = 3 elements
         0,   0,   0,   1, // dim_lower = 1
         // Element 1: length=4, value=1
         0,   0,   0,   4,
@@ -1199,10 +1239,10 @@ test "NULL elements → {1,NULL,3}" {
     const txt = try arrayToText(alloc, arr);
     defer alloc.free(txt);
 
-    try std.testing.expectEqualStrings("{1,NULL,3}", txt);
+    try std.testing.expectEqualStrings("[1,null,3]", txt);
 }
 
-test "TEXT array escaping → {\"a\",\"b c\",\"d\\\"e\"}" {
+test "TEXT array escaping → [\"a\",\"b c\",\"d\\\"e\"]" {
     const alloc = std.testing.allocator;
 
     const buf = [_]u8{
@@ -1229,12 +1269,12 @@ test "TEXT array escaping → {\"a\",\"b c\",\"d\\\"e\"}" {
     defer alloc.free(txt);
 
     try std.testing.expectEqualStrings(
-        "{\"a\",\"b c\",\"d\\\"e\"}",
+        "[\"a\",\"b c\",\"d\\\"e\"]",
         txt,
     );
 }
 
-test "BYTEA array → {\\xdeadbeef,\\x01020304}" {
+test "BYTEA array → [\"\\xdeadbeef\",\"\\x01020304\"]" {
     const alloc = std.testing.allocator;
 
     const buf = [_]u8{
@@ -1260,12 +1300,12 @@ test "BYTEA array → {\\xdeadbeef,\\x01020304}" {
     defer alloc.free(txt);
 
     try std.testing.expectEqualStrings(
-        "{\\xdeadbeef,\\x01020304}",
+        "[\"\\\\xdeadbeef\",\"\\\\x01020304\"]",
         txt,
     );
 }
 
-test "FLOAT8 array → {1.5,2.25,3.75}" {
+test "FLOAT8 array → [1.5,2.25,3.75]" {
     const alloc = std.testing.allocator;
 
     var buf: [4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8]u8 = undefined;
@@ -1300,10 +1340,10 @@ test "FLOAT8 array → {1.5,2.25,3.75}" {
     const txt = try arrayToText(alloc, arr);
     defer alloc.free(txt);
 
-    try std.testing.expectEqualStrings("{1.5,2.25,3.75}", txt);
+    try std.testing.expectEqualStrings("[1.5,2.25,3.75]", txt);
 }
 
-test "UUID array → {uuid1,uuid2}" {
+test "UUID array → [\"uuid1\",\"uuid2\"]" {
     const alloc = std.testing.allocator;
 
     const uuid1 = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF };
@@ -1341,7 +1381,7 @@ test "UUID array → {uuid1,uuid2}" {
 
     // PostgreSQL format
     try std.testing.expectEqualStrings(
-        "{00010203-0405-0607-0809-aabbccddeeff,10203040-5060-7080-90a0-b0c0d0e0f0ff}",
+        "[\"00010203-0405-0607-0809-aabbccddeeff\",\"10203040-5060-7080-90a0-b0c0d0e0f0ff\"]",
         out,
     );
 }
@@ -1472,7 +1512,7 @@ test "elementToText refuses a truncated fixed-width element" {
     try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .UUID, &[_]u8{ 0, 1, 2 }));
 }
 
-test "empty array renders as {} instead of crashing" {
+test "empty array renders as [] instead of crashing" {
     // `'{}'::int4[]` on the wire: ndim = 0, so there is no dimension to walk. This
     // panicked in Debug and read out of bounds in ReleaseFast — the bridge simply
     // disappeared, with the last log line being whatever preceded the row.
@@ -1488,5 +1528,5 @@ test "empty array renders as {} instead of crashing" {
 
     const txt = try arrayToText(alloc, arr);
     defer alloc.free(txt);
-    try std.testing.expectEqualStrings("{}", txt);
+    try std.testing.expectEqualStrings("[]", txt);
 }

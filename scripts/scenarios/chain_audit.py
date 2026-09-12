@@ -21,9 +21,9 @@ tolerates such a row within the margin and the second pass proves the claim: the
 whole chain replayed — full, then each delta with the client's version-guarded
 upsert — must equal the table at the chain's last cutoff.
 
-Known, deliberate shape differences the audit normalises: the wire quotes every
-text element of an array (`{"grow","s-1"}` where PostgreSQL prints `{grow,s-1}`);
-both are the same PostgreSQL array literal, and CDC events carry the same form.
+One shape difference the audit normalises: arrays ride as JSON text
+(`["grow","s-1"]`, §10ey) and are compared with PostgreSQL's `to_json` rendering,
+quotes stripped on both sides (the wire keeps numeric elements as strings).
 """
 import argparse, json, pathlib, sqlite3, subprocess, sys, tempfile, time
 import msgpack, zstandard
@@ -48,7 +48,11 @@ def render(col, udt):
     if udt == "timestamp": return f"to_char({col}, 'YYYY-MM-DD\"T\"HH24:MI:SS.US')"
     if udt == "date": return f"to_char({col}, 'YYYY-MM-DD')"
     if udt == "bool": return f"CASE WHEN {col} THEN 't' ELSE 'f' END"
-    if udt.startswith("_"): return f"replace({col}::text, '\"', '')"
+    # PostGIS renders geometry::text as UPPERCASE EWKB hex; the wire carries the bytes.
+    if udt in ("geometry", "geography"): return f"encode(ST_AsEWKB({col}), 'hex')"
+    # §10ey: arrays ride as JSON text; PostgreSQL's to_json renders the same list, with
+    # numbers bare where the wire keeps numerics as strings — quotes stripped on both sides.
+    if udt.startswith("_"): return f"replace(to_json({col})::text, '\"', '')"
     return f"{col}::text"
 
 
@@ -56,7 +60,7 @@ def cell_text(v, udt):
     """A decoded chain cell as the text PostgreSQL renders — the comparison key."""
     if v is None: return "\\N"
     if isinstance(v, bool): return "t" if v else "f"
-    if isinstance(v, bytes): return "\\x" + v.hex()
+    if isinstance(v, bytes): return v.hex() if udt in ("geometry", "geography") else "\\x" + v.hex()
     if isinstance(v, float): return repr(v)
     s = str(v)
     return s.replace('"', "") if udt.startswith("_") else s

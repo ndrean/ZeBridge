@@ -37,6 +37,7 @@ import { heartbeatPayload,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
+  isBytes, pgArrayValues, pgArrayLiteral,
 } from './core.ts';
 import type { PlanStep } from './core.ts';
 import GRAMMAR_JSON from './grammar.json' with { type: 'json' };
@@ -96,6 +97,9 @@ export interface ZeBridgeConfig {
 export type TableState = {
   pkCols: string[];
   columns: string[];
+  /// §10ey: the columns whose PostgreSQL type is an array — the wire carries them as
+  /// JSON text, and a PostgreSQL engine binds them from the literal on apply.
+  arrayCols?: string[];
   tombstoneColumn: string | null;
   tenantColumn: string | null;
   /// The table's LWW version column (from the schema payload) — read to feed
@@ -859,11 +863,12 @@ export class ZeBridge {
       // never matches and the revert declines forever (the oversize test's ghost).
       const asStored = (v: unknown): string =>
         typeof v === 'boolean' ? (v ? '1' : '0')
+        : isBytes(v) ? Array.from(v, (b) => b.toString(16).padStart(2, '0')).join('')
         : v !== null && typeof v === 'object' ? JSON.stringify(v)
         : String(v);
       const stillOurs = sent.data
         ? currentRow != null && Object.entries(sent.data as Record<string, unknown>)
-            .every(([k, v]) => String(currentRow[k]) === asStored(v))
+            .every(([k, v]) => asStored(currentRow[k]) === asStored(v))
         : currentRow == null;
 
       if (stillOurs) {
@@ -998,6 +1003,9 @@ export class ZeBridge {
     // pk, indexes and FKs are dialect-neutral at the root.
     const block = val[this.dialect.schemaBlock] ?? val.sqlite;
     const cols: { name: string; type: string; required?: boolean; default?: string }[] = block.columns;
+    // §10ey: array columns, from the `pg` block whatever the engine (the sqlite block says TEXT).
+    const arrayCols: string[] = ((val.pg?.columns ?? []) as { name: string; type?: string }[])
+      .filter((c) => typeof c.type === 'string' && c.type.endsWith('[]')).map((c) => c.name);
     // Dialect-neutral, at the root: CREATE [UNIQUE] INDEX is the same statement here
     // and in PGlite/local Postgres, so one list serves every consumer shape (§10c).
     const indexes: { name: string; unique?: boolean; columns: string[] }[] =
@@ -1142,7 +1150,7 @@ export class ZeBridge {
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses))) {
         await recordShape();
-        this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
         this.reach('migrated');
         this.scheduleRecount();
         // ⚠️ NOT a no-op path for indexes. Adding an index in PostgreSQL changes no
@@ -1202,7 +1210,7 @@ export class ZeBridge {
       await this.syncIndexes(table, indexes);
       await recordShape();
 
-      this.syncedTables.set(table, { pkCols, columns: names, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
       this.scheduleRecount();
@@ -1617,6 +1625,8 @@ export class ZeBridge {
     // PGlite, the row appearing only with the echo). CDC events already carry
     // PostgreSQL's text forms and are left alone; SQLite stores either as text.
     if (ev.optimistic && this.dialect.name === 'postgres') ev = { ...ev, data: pgEngineValues(ev.data) };
+    // §10ey: a CDC event carries an array as JSON text; a PostgreSQL engine binds the literal.
+    if (!ev.optimistic && this.dialect.name === 'postgres' && state.arrayCols?.length) ev = { ...ev, data: pgArrayValues(ev.data, state.arrayCols) };
 
     if (op === 'INSERT' || op === 'UPDATE') {
       const keys = Object.keys(ev.data);
@@ -2002,6 +2012,8 @@ export class ZeBridge {
         // core.tombstoned on a keyed view of the row.
         const tombIdx = state.tombstoneColumn ? cols.indexOf(state.tombstoneColumn) : -1;
         const pkIdx = state.pkCols.map((c) => cols.indexOf(c));
+        // §10ey: chain cells carry arrays as JSON text too; the PostgreSQL engine wants the literal.
+        const arrIdx = this.dialect.name === 'postgres' ? (state.arrayCols ?? []).map((c) => cols.indexOf(c)).filter((i) => i >= 0) : [];
         await this.transaction(async (txExec) => {
           // A full replaces the baseline wholesale; the DELETE shares the transaction
           // so a crash mid-apply cannot leave an empty table.
@@ -2014,7 +2026,12 @@ export class ZeBridge {
               if (del) await txExec(del.sql, ...del.params);
               continue;
             }
-            await txExec(q, ...chainRowParams(row));
+            const params = chainRowParams(row);
+            for (const i of arrIdx) {
+              const v = params[i];
+              if (typeof v === 'string' && v.startsWith('[')) { try { params[i] = pgArrayLiteral(JSON.parse(v)); } catch { /* not JSON: as is */ } }
+            }
+            await txExec(q, ...params);
           }
         });
         applied += doc.rows.length;

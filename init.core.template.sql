@@ -833,12 +833,16 @@ BEGIN
                  -- enum (safe to pass through as text) from anything else (must refuse).
                  -- Produced here because the event trigger already runs inside Postgres
                  -- with the catalog open — the alternative was a blocking pg_type query
-                 -- on the replication hot path. `type` stays information_schema's
-                 -- data_type verbatim, which is what PROTOCOL.md promises clients.
+                 -- on the replication hot path. `type` is `format_type` with modifiers —
+                 -- the form PROTOCOL.md §3 promises and the boot path publishes.
+                 -- information_schema's data_type said `USER-DEFINED` for every
+                 -- extension type and `ARRAY` for every array (§10ex): a PostGIS column
+                 -- mapped to TEXT at CREATE TABLE and to BLOB at the next boot, and every
+                 -- replica rebuilt the table between the two.
                  'columns', COALESCE((
                      SELECT jsonb_agg(jsonb_build_object(
                               'name', c.column_name,
-                              'type', c.data_type,
+                              'type', format_type(a.atttypid, a.atttypmod),
                               -- Required-ness, so a client can build a valid INSERT.
                               -- Without these the descriptor said which columns exist and
                               -- not which ones a write must carry: an omitted NOT NULL
@@ -1424,9 +1428,17 @@ BEGIN
         WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
     LOOP
         n_cols := n_cols + 1;
+        -- Bytes ride the feed as MessagePack bin (§10ex): the bytes plus a header of at
+        -- most five. The hex form (2 per byte + 2) this measured until 2026-09-12 counted
+        -- every bytea twice and refused a 300 KB tile at 600 KB. PostGIS geometry and
+        -- geography ride as EWKB, which pg_column_size approximates from above without
+        -- calling a PostGIS function from a guard that must work without the extension.
         IF col.typname = 'bytea' THEN
             n_unbounded := n_unbounded + 1;
-            expr := expr || format(' + coalesce(octet_length(NEW.%I) * 2 + 2, 0)', col.attname);
+            expr := expr || format(' + coalesce(octet_length(NEW.%I) + 5, 0)', col.attname);
+        ELSIF col.typname IN ('geometry', 'geography') THEN
+            n_unbounded := n_unbounded + 1;
+            expr := expr || format(' + coalesce(pg_column_size(NEW.%I), 0)', col.attname);
         ELSIF col.typname IN ('text', 'json', 'jsonb', 'xml')
               OR (col.typname = 'varchar' AND col.atttypmod = -1)
               OR col.typcategory = 'A' THEN
@@ -1526,9 +1538,17 @@ BEGIN
         WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
     LOOP
         n_cols := n_cols + 1;
+        -- Bytes ride the feed as MessagePack bin (§10ex): the bytes plus a header of at
+        -- most five. The hex form (2 per byte + 2) this measured until 2026-09-12 counted
+        -- every bytea twice and refused a 300 KB tile at 600 KB. PostGIS geometry and
+        -- geography ride as EWKB, which pg_column_size approximates from above without
+        -- calling a PostGIS function from a guard that must work without the extension.
         IF col.typname = 'bytea' THEN
             n_unbounded := n_unbounded + 1;
-            expr := expr || format(' + coalesce(octet_length(NEW.%I) * 2 + 2, 0)', col.attname);
+            expr := expr || format(' + coalesce(octet_length(NEW.%I) + 5, 0)', col.attname);
+        ELSIF col.typname IN ('geometry', 'geography') THEN
+            n_unbounded := n_unbounded + 1;
+            expr := expr || format(' + coalesce(pg_column_size(NEW.%I), 0)', col.attname);
         ELSIF col.typname IN ('text', 'json', 'jsonb', 'xml')
               OR (col.typname = 'varchar' AND col.atttypmod = -1)
               OR col.typcategory = 'A' THEN

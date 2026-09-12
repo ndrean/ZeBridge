@@ -86,6 +86,8 @@ row a rule is named.
 | inbox pruning | — (no inbox) | ✓ | |
 | chain dictionary cache | per process | persisted (`_zebridge_dicts`) | §10x |
 | zstd chain objects | built in | Node built in; browser needs `zstdDecompress` | §10w |
+| arrays | JSON text as the wire carries it (`json_extract` reads it); a local write stores JSON text too | SQLite: same; PGlite: the JSON text becomes the array literal on apply (`pgArrayValues`), native arrays in the replica | §10ey |
+| bytes (`bytea`, PostGIS) | BLOB; the host sees and sends `{"$bin": "<base64>"}` on the JSON card | BLOB; `Uint8Array` in and out (the Node example prints the same `$bin` marker) | §10ex |
 | survives its host killed mid-seed | proven (`client_kill.py`) | not tested | §10ce |
 | killed mid-migration: first sight drops the watermark, a half-finished rebuild is adopted, no shape record → the physical key decides | ✓ | ✓ | §10dj `rebuild_kill` |
 | `query()` cannot write — the bookkeeping is out of the application's reach | ✓ a READONLY SQLite connection | ✓ a read-only connection on Node; `core.isReadOnlySql` where there is one handle (OPFS, PGlite) | §10di, `outbox_break` |
