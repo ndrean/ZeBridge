@@ -387,6 +387,11 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         const f = o.object.get("heartbeatMs") orelse break :blk 30_000;
         break :blk if (f == .integer and f.integer >= 0) @intCast(f.integer) else 30_000;
     };
+    // seedChunkRows (§10fa): rows per transaction when a chain step is applied; 0 = one.
+    const seed_chunk_rows: usize = blk: {
+        const f = o.object.get("seedChunkRows") orelse break :blk 50_000;
+        break :blk if (f == .integer and f.integer >= 0) @intCast(f.integer) else 50_000;
+    };
     // The tables, parents first, each its own allocation so the box can free them.
     const tv = o.object.get("tables");
     const ntab: usize = if (tv != null and tv.? == .array) tv.?.array.items.len else 0;
@@ -410,6 +415,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .creds_path = creds,
             .grammar_hash = grammar_hash,
             .heartbeat_ms = heartbeat_ms,
+            .seed_chunk_rows = seed_chunk_rows,
             .db_path = db,
             .principal = principal,
             .tables = tables,
@@ -597,7 +603,7 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "applied", .{ .integer = @intCast(r.applied) });
     try out.put(a, "settled", .{ .integer = @intCast(r.settled) });
-    
+
     var changed = std.json.Array.init(a);
     for (r.changed_tables) |t| try changed.append(.{ .string = t });
     try out.put(a, "changed_tables", .{ .array = changed });

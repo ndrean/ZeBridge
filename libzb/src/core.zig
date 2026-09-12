@@ -536,6 +536,17 @@ pub fn planDelete(a: std.mem.Allocator, table: []const u8, pk: []const []const u
 }
 
 /// core.ts chainUpsertSql.
+/// §10ez: the INSERT a full's rows take — the table was emptied first, so no conflict
+/// clause and no version guard: every row is new.
+pub fn chainInsertSql(a: std.mem.Allocator, table: []const u8, cols: []const []const u8) ![]const u8 {
+    var ph: std.ArrayList(u8) = .empty;
+    for (cols, 0..) |_, i| {
+        if (i > 0) try ph.appendSlice(a, ", ");
+        try ph.append(a, '?');
+    }
+    return std.fmt.allocPrint(a, "INSERT INTO {s} ({s}) VALUES ({s})", .{ table, try quotedJoin(a, cols), ph.items });
+}
+
 pub fn chainUpsertSql(a: std.mem.Allocator, table: []const u8, cols: []const []const u8, pk: []const []const u8, version_col: ?[]const u8) ![]const u8 {
     var ph: std.ArrayList(u8) = .empty;
     for (cols, 0..) |_, i| {

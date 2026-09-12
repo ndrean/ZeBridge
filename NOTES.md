@@ -11293,6 +11293,66 @@ the three million rows in 856 ms, the whole-table scan in 164 ms, PostgreSQL nev
 asked anything. The same shape is the warm micro-VM: the file synced continuously,
 the job fired on demand.
 
+## 10ez. The seed profiled: 56 s to 18 s for three million rows (2026-09-12)
+
+A fresh libzb replica of test_types (3,055,002 rows, one 102 MB chain object) took 105 s in the DuckDB example and 56 s alone — 29,000 to 55,000 rows a second, a tenth of what SQLite inserts in one transaction.
+Phase timers on the seed (fetch, inflate, decode, apply) said where it went, and four changes, each measured alone on the same seed, took it to 17.7 s:
+
+| step | fetch | inflate | decode | apply | total |
+| --- | --- | --- | --- | --- | --- |
+| as found | 114 ms | 4,180 ms | 2,873 ms | 47,509 ms | 56.0 s |
+| page cache 128 MB for the seed | 86 | 4,163 | 1,755 | 26,036 | 33.3 s |
+| + libzstd for the plain frame, a plain INSERT for a full, a per-row arena | 84 | 291 | 1,858 | 27,203 | 30.7 s |
+| + rows inserted in primary-key order | 90 | 291 | 1,789 | 14,033 | 17.7 s |
+
+What each one was. SQLite's default page cache is 2 MB; a seed inserts millions of random uuid keys into a growing b-tree and every insert touched a cold page — `PRAGMA cache_size` at 128 MB for the seed, the default back after, halved the apply by itself.
+The plain frame (a full, no dictionary) went through `std.compress.zstd`, which inflated 102 MB in 4.2 s; libzstd, already linked for the dictionary path, does it in 0.3 s.
+A full follows `DELETE FROM`, so its rows take a plain INSERT instead of the upsert with the version guard; and one row's bindings live one row in a scratch arena where the step's arena held three million rows' worth — the two together bought nothing measurable, which said the rest was inside SQLite. It was insertion order: a chain comes in the table's physical order, random uuids, and each row landed on a random leaf; sorted by the first primary-key column before the transaction, the inserts append, and the apply halved again. The sort of three million uuids is inside the 1.8 s decode-to-apply gap.
+
+Where it stands: 4.6 µs a row in the apply, 218,000 rows a second, on a table with two indexes. What is left, in order of expected return: the decode builds two trees (msgpack's, then std.json's) before the first insert, 1.8 s that a cursor binding straight from msgpack would remove; the replica identity index could be dropped for a full and rebuilt after; and a full of this size would apply in chunks of one transaction each, so a phone's memory holds one chunk, not the document.
+
+## 10fa. The seed applied from the document: a cursor, sorted offsets, chunks (2026-09-12)
+
+§10ez left the seed at 17.7 s with two known costs: the document decoded into two
+trees (msgpack's, then std.json's) before the first insert, and one transaction over
+every row, which held the whole decoded document in memory — about a kilobyte a row,
+gigabytes for three million, and the reason a table that size could not seed on a
+phone whatever the speed.
+
+**What changed.** The chain document is walked, not decoded. A small msgpack cursor
+(`MpCursor`) reads the headers a chain document uses by hand — maps, arrays,
+strings — and hands one whole value at a time to the library at an offset. The walk
+over `rows` records each row's offset and its first primary-key cell (a string's
+bytes sliced from the document, an integer rendered), and that index is what the
+sort of §10ez orders; nothing else of the rows is kept. The apply then takes the
+rows in chunks — `seedChunkRows` on the C card, default 50,000, 0 for one
+transaction — each chunk one transaction that decodes its rows one at a time into a
+scratch arena and binds straight from the msgpack payload (`payloadToStorage`: the
+shapes of `chainCellToStorage` without the JSON value). The first chunk of a full
+runs the `DELETE FROM`. A kill between chunks is safe by the existing rule: the
+watermark row is written after the last chunk, so a restart plans the full again and
+starts with the DELETE; a delta re-applied is idempotent.
+
+**Measured**, the same 3,055,002-row seed of test_types:
+
+| | fetch | inflate | index + sort | apply | total |
+| --- | --- | --- | --- | --- | --- |
+| §10ez (trees, one transaction) | 90 ms | 291 | 1,789 | 14,033 | 17.7 s |
+| §10fa (cursor, chunks of 50,000) | 89 | 291 | 1,203 | 8,174 | 11.1 s |
+
+2.7 µs a row in the apply, 374,000 rows a second; 56 s when the day started. The
+replica holds 3,055,002 rows with no duplicate key, thirty random rows compared cell
+by cell with PostgreSQL are exact, the wasp ran three minutes clean on the build, and
+`leaks` reports 0 for 0 bytes on the Python host with the client open after the seed
+and after close.
+
+**Memory, honestly.** The host's peak during the seed is 1.16 GB, back to 232 MB
+after: the inflated document (666 MB of msgpack for this table) is the peak now, plus
+the compressed object and the 128 MB page cache. The row trees are gone; the document
+is not. Bounding that too means inflating in a streaming window and walking the
+stream, which is the next lever if a phone must seed a table this size — a phone's
+tables are two orders of magnitude smaller, where the peak is tens of megabytes.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

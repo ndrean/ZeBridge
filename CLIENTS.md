@@ -86,6 +86,7 @@ row a rule is named.
 | inbox pruning | — (no inbox) | ✓ | |
 | chain dictionary cache | per process | persisted (`_zebridge_dicts`) | §10x |
 | zstd chain objects | built in | Node built in; browser needs `zstdDecompress` | §10w |
+| a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload; 3 M rows in 11 s | the document decoded, one transaction per step; the same sort and chunking are the next parity item | §10ez, §10fa |
 | arrays | JSON text as the wire carries it (`json_extract` reads it); a local write stores JSON text too | SQLite: same; PGlite: the JSON text becomes the array literal on apply (`pgArrayValues`), native arrays in the replica | §10ey |
 | bytes (`bytea`, PostGIS) | BLOB; the host sees and sends `{"$bin": "<base64>"}` on the JSON card | BLOB; `Uint8Array` in and out (the Node example prints the same `$bin` marker) | §10ex |
 | survives its host killed mid-seed | proven (`client_kill.py`) | not tested | §10ce |

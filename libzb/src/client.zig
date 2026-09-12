@@ -55,6 +55,10 @@ pub const Options = struct {
     /// Fleet heartbeat cadence (NOTES §10dc); 0 disables. The bridge's bucket TTL
     /// defaults to three of these.
     heartbeat_ms: u64 = 30_000,
+    /// §10fa: rows per transaction when a chain step is applied; 0 = one transaction
+    /// for the whole step. Bounds what a seed holds in memory at once (a chunk's
+    /// bindings, not the document) and how long the replica's lock is held.
+    seed_chunk_rows: usize = 50_000,
 };
 
 const TableState = struct {
@@ -881,53 +885,137 @@ pub const SyncClient = struct {
     /// full shares the transaction so a crash mid-apply cannot leave an empty table
     /// (§10n). A struct because `transaction` takes `(ctx, fn)`, and the fn needs
     /// everything the step decoded.
+    /// §10fa: one chain step applied from the msgpack document itself — no value
+    /// tree. `offsets[order[i]]` is where row i starts in `bytes`; a chunk decodes
+    /// its rows one at a time into a scratch arena, binds straight from the payload,
+    /// and commits. The first chunk of a full runs the DELETE FROM.
     const ChainStep = struct {
         client: *SyncClient,
         a: std.mem.Allocator,
         table: []const u8,
         sql: []const u8,
-        rows: std.json.Array,
+        bytes: []const u8,
+        offsets: []const usize,
+        order: []const usize,
+        from: usize,
+        to: usize,
         is_full: bool,
+        first_chunk: bool,
         cols: []const []const u8,
         pk: []const []const u8,
-        /// Index of the tombstone column in `cols`, when the table has one and the
-        /// chain carries it.
         tomb_idx: ?usize,
 
         fn apply(cs: ChainStep, st: *storage.Storage) !void {
-            if (cs.is_full) {
+            if (cs.is_full and cs.first_chunk) {
                 const del = try std.fmt.allocPrint(cs.a, "DELETE FROM {s}", .{cs.table});
                 _ = try st.query(cs.a, del, &.{});
             }
-            for (cs.rows.items, 0..) |row, n| {
+            var row_arena = std.heap.ArenaAllocator.init(cs.client.a);
+            defer row_arena.deinit();
+            for (cs.order[cs.from..cs.to]) |ri| {
+                _ = row_arena.reset(.retain_capacity);
+                const ra = row_arena.allocator();
+                var cur = MpCursor{ .bytes = cs.bytes, .off = cs.offsets[ri] };
+                const row = try cur.readValue(ra);
+                if (row != .arr) return error.ChainObjectMalformed;
+                const cells = row.arr;
                 // §7.5: a tombstoned row in a chain is a row this replica must NOT hold.
                 // A chain is built from the table as it stands, so it carries every
                 // tombstone not yet reaped; the reap itself never reaches a client.
-                if (cs.tomb_idx) |ti| if (ti < row.array.items.len and row.array.items[ti] != .null) {
+                if (cs.tomb_idx) |ti| if (ti < cells.len and cells[ti] != .nil) {
                     var keyed: std.json.ObjectMap = .empty;
                     for (cs.pk) |pc| {
-                        for (cs.cols, 0..) |c, i| if (std.mem.eql(u8, c, pc) and i < row.array.items.len) {
-                            try keyed.put(cs.a, pc, row.array.items[i]);
+                        for (cs.cols, 0..) |c, i| if (std.mem.eql(u8, c, pc) and i < cells.len) {
+                            try keyed.put(ra, pc, try mpToJson(ra, cells[i]));
                         };
                     }
-                    if (try core.planDelete(cs.a, cs.table, cs.pk, .{ .object = keyed })) |stp| {
-                        _ = try cs.client.stepExec(cs.a, stp);
+                    if (try core.planDelete(ra, cs.table, cs.pk, .{ .object = keyed })) |stp| {
+                        _ = try cs.client.stepExec(ra, stp);
                     }
                     continue;
                 };
-                const params = try cs.a.alloc(storage.Value, row.array.items.len);
-                for (row.array.items, 0..) |cell, i| params[i] = try chainCellToStorage(cs.a, cell);
-                _ = st.query(cs.a, cs.sql, params) catch |err| {
+                const params = try ra.alloc(storage.Value, cells.len);
+                for (cells, 0..) |cell, i| params[i] = try payloadToStorage(ra, cell);
+                _ = st.query(ra, cs.sql, params) catch |err| {
                     // Read the SQLite text HERE, before the rollback clears it: it is
                     // what tells an FK refusal from a bad column apart.
                     std.debug.print("{s}: row {d} of {d} refused: {any} — sqlite: {s}\n", .{
-                        cs.table, n + 1, cs.rows.items.len, err, st.errMsg(),
+                        cs.table, ri + 1, cs.offsets.len, err, st.errMsg(),
                     });
                     return err;
                 };
             }
         }
     };
+
+    /// A chain cell, straight from its msgpack payload to a bind: the shapes
+    /// `chainCellToStorage` gives a JSON value, without the JSON value.
+    fn payloadToStorage(a: std.mem.Allocator, p: msgpack.Payload) !storage.Value {
+        return switch (p) {
+            .nil => .null,
+            .bool => |b| .{ .boolean = b },
+            .int => |i| .{ .integer = i },
+            .uint => |u| if (u <= std.math.maxInt(i64)) storage.Value{ .integer = @intCast(u) } else storage.Value{ .real = @floatFromInt(u) },
+            .float => |f| .{ .real = f },
+            .str => |v| .{ .text = try core.pgTsToWire(a, v.value()) },
+            .bin => |b| .{ .blob = b.value() },
+            else => .{ .text = try core.valueToString(a, try mpToJson(a, p)) },
+        };
+    }
+
+    /// The walk over a step's `rows` (§10fa): every row's offset, and the first
+    /// primary-key cell as text (a str's bytes sliced from the document, an integer
+    /// rendered), for the sort. Each row is decoded once into a scratch arena.
+    const RowIndex = struct { offsets: []usize, keys: []const []const u8 };
+
+    fn indexRows(self: *SyncClient, a: std.mem.Allocator, cur: *MpCursor, nrows: usize, cols: []const []const u8, pk: []const []const u8) !RowIndex {
+        const offsets = try a.alloc(usize, nrows);
+        const keys = try a.alloc([]const u8, nrows);
+        const ki: ?usize = if (pk.len > 0) indexOf(cols, pk[0]) else null;
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        for (0..nrows) |i| {
+            offsets[i] = cur.off;
+            keys[i] = "";
+            _ = scratch.reset(.retain_capacity);
+            const sa = scratch.allocator();
+            // The key cell without decoding the row: array header, then the cells
+            // before it skipped, then its bytes; the lib decodes what the peek cannot.
+            var peek = cur.*;
+            const ncells = peek.readArrayLen() catch null;
+            if (ki) |k| if (ncells != null and k < ncells.?) {
+                var ok = true;
+                for (0..k) |_| peek.skipValue(sa) catch {
+                    ok = false;
+                    break;
+                };
+                if (ok) {
+                    if (peek.peekStr()) |sl| {
+                        keys[i] = sl;
+                    } else {
+                        const v = peek.readValue(sa) catch msgpack.Payload{ .nil = {} };
+                        if (v == .int) keys[i] = try std.fmt.allocPrint(a, "{d:0>20}", .{v.int}) else if (v == .uint) keys[i] = try std.fmt.allocPrint(a, "{d:0>20}", .{v.uint});
+                    }
+                }
+            };
+            try cur.skipValue(sa);
+        }
+        return .{ .offsets = offsets, .keys = keys };
+    }
+
+    /// Row indices ordered by key (the sort of §10ez), on the index above.
+    fn sortedByKeys(a: std.mem.Allocator, keys: []const []const u8) ![]usize {
+        const order = try a.alloc(usize, keys.len);
+        for (order, 0..) |*o, i| o.* = i;
+        const Ctx = struct {
+            keys: []const []const u8,
+            fn lessThan(self: @This(), x: usize, y: usize) bool {
+                return std.mem.order(u8, self.keys[x], self.keys[y]) == .lt;
+            }
+        };
+        std.sort.pdq(usize, order, Ctx{ .keys = keys }, Ctx.lessThan);
+        return order;
+    }
 
     fn applyChain(self: *SyncClient, table: []const u8) !void {
         // Per-call: a seed can be megabytes, and it is dead the moment it is applied.
@@ -990,12 +1078,20 @@ pub const SyncClient = struct {
         const st = self.states.getPtr(table).?;
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
         var applied: usize = 0;
+        // Phase timers (§10ez): where a seed's time goes — fetch, inflate, decode, apply.
+        var ph = [_]i64{ 0, 0, 0, 0 };
+        // §10ez: a seed inserts millions of random keys into a b-tree; SQLite's default
+        // page cache is 2 MB, so nearly every insert touched a cold page. 128 MB for the
+        // seed, the default back after — the replica's steady state is small.
+        self.st.execSimple("PRAGMA cache_size = -131072") catch {};
+        defer self.st.execSimple("PRAGMA cache_size = -2000") catch {};
         for (plan.array.items) |step| {
             // Per-step: `raw`, `blob` and `doc` are three copies of the same seed at
             // their largest; freeing them per step bounds the peak at one step's worth.
             var sa = std.heap.ArenaAllocator.init(self.a);
             defer sa.deinit();
             const step_a = sa.allocator();
+            var t_ph = msNow();
             const raw = try self.t.objectGetBytes(step_a, bucket, step.object.get("name").?.string);
             // §10x: a delta names the dictionary it was compressed with; fetch it
             // once per era from the same bucket and keep it (immutable by name, so
@@ -1011,47 +1107,78 @@ pub const SyncClient = struct {
                     dict = d;
                 }
             };
+            ph[0] += msNow() - t_ph;
+            t_ph = msNow();
             const blob = try maybeZstd(step_a, raw, dict); // §10w: magic-sniffed, mixed chains fine
-            const doc = try decodeMsgpack(step_a, blob);
-            // A chain object that is not the shape the producer writes (a corrupt or
-            // foreign object under the name) is an ERROR the host sees — never a union
-            // access that kills the host process (measured: five stray bytes decoded
-            // as an integer, then read as an object).
-            if (doc != .object) return error.ChainObjectMalformed;
-            const rows_v = doc.object.get("rows") orelse return error.ChainObjectMalformed;
-            if (rows_v != .array) return error.ChainObjectMalformed;
-            const cols = try jsonStrList(step_a, doc.object.get("columns"));
-            // §10dg: a chain object built from an OLDER shape names columns this table
-            // no longer has (a table dropped and reborn under its name, a DROP/RENAME
-            // the producer has not rebuilt for yet). Not an error: wait for its full.
-            for (cols) |col| if (!contains(st.cols, col)) {
-                std.debug.print("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full\n", .{ table, step.object.get("name").?.string, col });
-                return;
-            };
-            const vcol_v = doc.object.get("version_column") orelse (man.object.get("version_column") orelse @as(Value, .null));
-            const vcol: ?[]const u8 = if (vcol_v == .string and contains(cols, vcol_v.string)) vcol_v.string else null;
-            const rows = rows_v.array;
-            const cs = ChainStep{
-                .client = self,
-                .a = step_a,
-                .table = table,
-                .sql = try core.chainUpsertSql(step_a, table, cols, st.pk, vcol),
-                .rows = rows,
-                .is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full"),
-                .cols = cols,
-                .pk = st.pk,
-                .tomb_idx = if (st.tombstone_col) |tc| indexOf(cols, tc) else null,
-            };
-            self.st.transaction(cs, ChainStep.apply) catch |err| {
-                // The SQLite text is the only thing that distinguishes a bad row from
-                // a bad schema; a bare StepFailed here cost a run to find out which.
-                std.debug.print("{s}: chain step {s} ({s}, {d} rows) rolled back: {any}\n", .{
-                    table,          step.object.get("name").?.string, if (cs.is_full) "full" else "delta",
-                    rows.items.len, err,
-                });
-                return err;
-            };
-            applied += rows.items.len;
+            ph[1] += msNow() - t_ph;
+            t_ph = msNow();
+            // §10fa: the document is walked, not decoded. Its keys in the producer's
+            // order — columns, rows, then the small ones; `rows` is indexed (offset and
+            // key per row) in one pass, everything else read as a value. A document
+            // that is not the shape the producer writes (a corrupt or foreign object
+            // under the name) is an ERROR the host sees — never a union access that
+            // kills the host process.
+            var cur = MpCursor{ .bytes = blob };
+            const nkeys = cur.readMapLen() catch return error.ChainObjectMalformed;
+            var cols: []const []const u8 = &.{};
+            var index: ?RowIndex = null;
+            var vcol_doc: ?[]const u8 = null;
+            const is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full");
+            for (0..nkeys) |_| {
+                const mkey = cur.readStr() catch return error.ChainObjectMalformed;
+                if (std.mem.eql(u8, mkey, "columns")) {
+                    const v = cur.readValue(step_a) catch return error.ChainObjectMalformed;
+                    cols = try jsonStrList(step_a, try mpToJson(step_a, v));
+                    for (cols) |col| if (!contains(st.cols, col)) {
+                        std.debug.print("{s}: chain object {s} names column {s}, which the replica lacks — predates the schema, waiting for the producer's full\n", .{ table, step.object.get("name").?.string, col });
+                        return;
+                    };
+                } else if (std.mem.eql(u8, mkey, "rows")) {
+                    if (cols.len == 0) return error.ChainObjectMalformed;
+                    const nrows = cur.readArrayLen() catch return error.ChainObjectMalformed;
+                    index = try self.indexRows(step_a, &cur, nrows, cols, st.pk);
+                } else {
+                    const v = cur.readValue(step_a) catch return error.ChainObjectMalformed;
+                    if (std.mem.eql(u8, mkey, "version_column") and v == .str) vcol_doc = v.str.value();
+                }
+            }
+            const idx = index orelse return error.ChainObjectMalformed;
+            const vcol_v: ?[]const u8 = vcol_doc orelse (if (man.object.get("version_column")) |v| (if (v == .string) v.string else null) else null);
+            const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
+            const order = try sortedByKeys(step_a, idx.keys);
+            ph[2] += msNow() - t_ph;
+            t_ph = msNow();
+            const chunk: usize = if (self.opts.seed_chunk_rows == 0) @max(idx.offsets.len, 1) else self.opts.seed_chunk_rows;
+            var from: usize = 0;
+            while (from < idx.offsets.len or (from == 0 and is_full)) {
+                const to = @min(from + chunk, idx.offsets.len);
+                const cs = ChainStep{
+                    .client = self,
+                    .a = step_a,
+                    .table = table,
+                    .sql = if (is_full) try core.chainInsertSql(step_a, table, cols) else try core.chainUpsertSql(step_a, table, cols, st.pk, vcol),
+                    .bytes = blob,
+                    .offsets = idx.offsets,
+                    .order = order,
+                    .from = from,
+                    .to = to,
+                    .is_full = is_full,
+                    .first_chunk = from == 0,
+                    .cols = cols,
+                    .pk = st.pk,
+                    .tomb_idx = if (st.tombstone_col) |tc| indexOf(cols, tc) else null,
+                };
+                self.st.transaction(cs, ChainStep.apply) catch |err| {
+                    std.debug.print("{s}: chain step {s} ({s}, rows {d}..{d} of {d}) rolled back: {any}\n", .{
+                        table, step.object.get("name").?.string, if (is_full) "full" else "delta", from, to, idx.offsets.len, err,
+                    });
+                    return err;
+                };
+                if (to == from) break;
+                from = to;
+            }
+            applied += idx.offsets.len;
+            ph[3] += msNow() - t_ph;
         }
 
         // Anchors (findings 7 + 10): the ONE place the gate may anchor to.
@@ -1077,7 +1204,7 @@ pub const SyncClient = struct {
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, st.seed_lsn orelse 0);
-        std.debug.print("{s}: seeded {d} row(s) from chain g{d}\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0 });
+        std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3] });
     }
 
     // ─── step 3: CDC catch-up (gate → apply → hold → positions) ─────────────
@@ -2468,6 +2595,16 @@ fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8
         if (C.ZSTD_isError(n) != 0) return error.ZstdDecompressFailed;
         return out[0..n];
     }
+    // §10ez: a frame that states its content size goes through libzstd — a 102 MB
+    // full inflated in 4.2 s through std.compress.zstd and in a fraction of that here.
+    // A frame without the size (not what the producer writes) takes the streaming path.
+    const unknown: c_ulonglong = std.math.maxInt(c_ulonglong);
+    const size = C.ZSTD_getFrameContentSize(b.ptr, b.len);
+    if (size != unknown and size != unknown - 1) {
+        const out = try a.alloc(u8, @intCast(size));
+        const n = C.ZSTD_decompress(out.ptr, out.len, b.ptr, b.len);
+        if (C.ZSTD_isError(n) == 0) return out[0..n];
+    }
     var out: std.Io.Writer.Allocating = .init(a);
     defer out.deinit();
     var in: std.Io.Reader = .fixed(b);
@@ -2582,6 +2719,12 @@ fn storageToJson(a: std.mem.Allocator, v: storage.Value) error{OutOfMemory}!Valu
 /// `milliTimestamp`. libc is linked here (SQLite needs it), so `clock_gettime` is the
 /// one that exists, and REALTIME is required rather than MONOTONIC: this is a wall
 /// clock stamp that another machine will compare against, not an interval.
+/// Milliseconds of wall clock, for the seed's phase timers.
+fn msNow() i64 {
+    const ts = nowRealtime();
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divFloor(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 fn nowRealtime() std.c.timespec {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.REALTIME, &ts);
@@ -2639,6 +2782,116 @@ const WidePack = msgpack.PackWithLimits(
     WideReaderCtx.read,
     .{ .max_array_length = 1 << 31, .max_map_size = 1 << 31 },
 );
+
+/// §10fa: a cursor over msgpack bytes. The headers a chain document uses — maps,
+/// arrays, strings — are read by hand so the walk can index rows without building
+/// them; a whole value is read through the library at the cursor's offset.
+const MpCursor = struct {
+    bytes: []const u8,
+    off: usize = 0,
+
+    fn byte(self: *MpCursor) !u8 {
+        if (self.off >= self.bytes.len) return error.ChainObjectMalformed;
+        const b = self.bytes[self.off];
+        self.off += 1;
+        return b;
+    }
+
+    fn be(self: *MpCursor, comptime T: type) !T {
+        const n = @sizeOf(T);
+        if (self.off + n > self.bytes.len) return error.ChainObjectMalformed;
+        const v = std.mem.readInt(T, self.bytes[self.off..][0..n], .big);
+        self.off += n;
+        return v;
+    }
+
+    fn readMapLen(self: *MpCursor) !usize {
+        const b = try self.byte();
+        if (b >= 0x80 and b <= 0x8f) return b & 0x0f;
+        if (b == 0xde) return try self.be(u16);
+        if (b == 0xdf) return try self.be(u32);
+        return error.ChainObjectMalformed;
+    }
+
+    fn readArrayLen(self: *MpCursor) !usize {
+        const b = try self.byte();
+        if (b >= 0x90 and b <= 0x9f) return b & 0x0f;
+        if (b == 0xdc) return try self.be(u16);
+        if (b == 0xdd) return try self.be(u32);
+        return error.ChainObjectMalformed;
+    }
+
+    /// A string's bytes, sliced from the document — or null when the next value is
+    /// not a string (the cursor does not move then).
+    fn peekStr(self: *MpCursor) ?[]const u8 {
+        const save = self.off;
+        const b = self.byte() catch return null;
+        const n: usize = blk: {
+            if (b >= 0xa0 and b <= 0xbf) break :blk b & 0x1f;
+            if (b == 0xd9) break :blk self.be(u8) catch return null;
+            if (b == 0xda) break :blk self.be(u16) catch return null;
+            if (b == 0xdb) break :blk self.be(u32) catch return null;
+            self.off = save;
+            return null;
+        };
+        if (self.off + n > self.bytes.len) {
+            self.off = save;
+            return null;
+        }
+        const sl = self.bytes[self.off..][0..n];
+        self.off += n;
+        return sl;
+    }
+
+    fn readStr(self: *MpCursor) ![]const u8 {
+        return self.peekStr() orelse error.ChainObjectMalformed;
+    }
+
+    /// One whole value through the library, from the cursor's offset; the cursor
+    /// moves past it.
+    fn readValue(self: *MpCursor, a: std.mem.Allocator) !msgpack.Payload {
+        if (self.off > self.bytes.len) return error.ChainObjectMalformed;
+        var reader = std.Io.Reader.fixed(self.bytes[self.off..]);
+        var dummy: [0]u8 = .{};
+        var writer = std.Io.Writer.fixed(&dummy);
+        var packer = WidePack.init(.{ .writer = &writer }, .{ .reader = &reader });
+        const v = try packer.read(a);
+        self.off += reader.seek;
+        return v;
+    }
+
+    /// Past one value, whatever it is (decoded into `a`, which should be a scratch).
+    fn skipValue(self: *MpCursor, a: std.mem.Allocator) !void {
+        _ = try self.readValue(a);
+    }
+};
+
+test "MpCursor: headers by hand, values through the library, offsets exact (§10fa)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // {"columns":["uid","n"],"rows":[["b",2],["a",1]],"kind":"full"}
+    const doc = [_]u8{ 0x83, 0xa7, 'c', 'o', 'l', 'u', 'm', 'n', 's', 0x92, 0xa3, 'u', 'i', 'd', 0xa1, 'n', 0xa4, 'r', 'o', 'w', 's', 0x92, 0x92, 0xa1, 'b', 0x02, 0x92, 0xa1, 'a', 0x01, 0xa4, 'k', 'i', 'n', 'd', 0xa4, 'f', 'u', 'l', 'l' };
+    var cur = MpCursor{ .bytes = &doc };
+    try std.testing.expectEqual(@as(usize, 3), try cur.readMapLen());
+    try std.testing.expectEqualStrings("columns", try cur.readStr());
+    const cols = try cur.readValue(a);
+    try std.testing.expectEqual(@as(usize, 2), try cols.getArrLen());
+    try std.testing.expectEqualStrings("rows", try cur.readStr());
+    try std.testing.expectEqual(@as(usize, 2), try cur.readArrayLen());
+    const off0 = cur.off;
+    var peek = cur;
+    try std.testing.expectEqual(@as(usize, 2), try peek.readArrayLen());
+    try std.testing.expectEqualStrings("b", peek.peekStr().?);
+    try cur.skipValue(a);
+    const off1 = cur.off;
+    try std.testing.expect(off1 == off0 + 4);
+    try cur.skipValue(a);
+    try std.testing.expectEqualStrings("kind", try cur.readStr());
+    const kind = try cur.readValue(a);
+    try std.testing.expectEqualStrings("full", kind.str.value());
+    try std.testing.expectEqual(doc.len, cur.off);
+}
 
 /// msgpack bytes → std.json.Value (the shape core.zig speaks).
 fn decodeMsgpack(a: std.mem.Allocator, bytes: []const u8) !Value {
