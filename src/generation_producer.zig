@@ -983,6 +983,17 @@ pub const GenerationProducer = struct {
         const build_started_ms = utils.unixMillis();
         const table_z = try alloc.dupeZ(u8, table);
         const tenant_z = try alloc.dupeZ(u8, tenant);
+        // §10ff: a table with a publication column list has columns CDC never sends; the
+        // chain must not carry them either, or a replica holds values no event updates.
+        // The select list is the publication's, `*` when it has none.
+        const cols_sel: []const u8 = blk: {
+            const pub_z = try alloc.dupeZ(u8, self.publication_name);
+            const params = [_]?[*:0]const u8{ pub_z.ptr, table_z.ptr };
+            const res = try queryOne(pgc, "SELECT COALESCE((SELECT string_agg(quote_ident(n), ', ' ORDER BY ord) FROM unnest(pt.attnames) WITH ORDINALITY AS u(n, ord)), '*') " ++
+                "FROM pg_publication_tables pt WHERE pt.pubname = $1 AND pt.tablename = $2 AND pt.schemaname = 'public'", &params);
+            defer c.PQclear(res);
+            break :blk if (c.PQntuples(res) > 0) try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0))) else "*";
+        };
 
         // ── last generation and last full, from the producer's own memory ────
         var last_gen: i64 = 0;
@@ -1366,9 +1377,9 @@ pub const GenerationProducer = struct {
             // full was 15 MiB for four live rows. The DELTA keeps its tombstoned rows:
             // that is the delete signal for a client catching up.
             const sql = if (tcol.len > 0)
-                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ table, tcol })
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
             else
-                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
             const t_q = utils.unixMillis();
             full_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
                 const res = try queryOne(pgc, sql, &.{});
@@ -1385,7 +1396,7 @@ pub const GenerationProducer = struct {
             // PostgreSQL's own rendering of a timestamptz read back from the bookkeeping
             // row, quoted defensively all the same.
             const prev_lit = try std.mem.replaceOwned(u8, alloc, last_cutoff.?, "'", "''");
-            const sql = try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" > '{s}'::timestamptz - interval '{s}'", .{ table, vcol, prev_lit, config.Sync.version_future_tolerance });
+            const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" > '{s}'::timestamptz - interval '{s}'", .{ cols_sel, table, vcol, prev_lit, config.Sync.version_future_tolerance });
             const t_q = utils.unixMillis();
             delta_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row) catch blk: {
                 const res = try queryOne(pgc, sql, &.{});
@@ -1407,9 +1418,9 @@ pub const GenerationProducer = struct {
             log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, row_count_now });
             build_full = true;
             const sql = if (tcol.len > 0)
-                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ table, tcol })
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
             else
-                try utils.allocPrintZ(alloc, "SELECT * FROM \"{s}\"", .{table});
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
             const t_q = utils.unixMillis();
             full_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
                 const res = try queryOne(pgc, sql, &.{});

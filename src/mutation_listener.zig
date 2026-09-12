@@ -132,7 +132,7 @@ const VersionType = enum {
 /// as `{a,b}` and the SAME array destined for `jsonb` must arrive as `["a","b"]`.
 /// Those literals are not interchangeable, so the target type decides, and the value
 /// alone cannot.
-const ColKind = enum {
+const ColKind = union(enum) {
     scalar,
     /// json / jsonb: any msgpack value serialises, objects included.
     json,
@@ -143,6 +143,15 @@ const ColKind = enum {
     /// §10ex: PostGIS geometry/geography — a client's `bin` (EWKB) binds as bare hex,
     /// which the geometry input function reads as EWKB.
     geometry,
+    /// §10fg: pgvector — a client's `bin` is the wire shape (little-endian, no header,
+    /// see pgoutput.BinShape) and binds as the text form pgvector's input reads:
+    /// `[1,2,3]`, `{1:0.5,3:2}/5` (1-based indices in the text form).
+    vector,
+    halfvec,
+    sparsevec,
+    /// §10fg: bit(n) — a client's `bin` is the packed bits; the text form is '0101',
+    /// trimmed to the declared length (the payload), since bit(3) refuses eight bits.
+    bit: i32,
 };
 
 /// Bytes as hex text, with an optional prefix — the text form PostgreSQL's bytea
@@ -156,6 +165,75 @@ fn hexText(alloc: std.mem.Allocator, prefix: []const u8, bytes: []const u8) erro
         out[prefix.len + i * 2 + 1] = digits[b & 0x0f];
     }
     return out;
+}
+
+/// §10fg: little-endian floats (f32 for `vector`, f16 for `halfvec`) as `[1,2.5,-3]`.
+/// A blob whose length is not a whole number of elements is a client bug, refused by
+/// the shape rather than read past its end.
+fn vectorText(alloc: std.mem.Allocator, bytes: []const u8, comptime F: type) ![:0]u8 {
+    const size = @sizeOf(F);
+    if (bytes.len % size != 0) return error.InvalidVector;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var i: usize = 0;
+    while (i < bytes.len) : (i += size) {
+        if (i > 0) try out.append(alloc, ',');
+        const bits = std.mem.readInt(std.meta.Int(.unsigned, size * 8), bytes[i..][0..size], .little);
+        try out.print(alloc, "{d}", .{@as(F, @bitCast(bits))});
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// §10fg: the sparsevec wire shape (u32 dim, u32 nnz, indices, float32s) as pgvector's
+/// `{i:v,...}/dim` — indices 1-based in the text form, 0-based on the wire.
+fn sparsevecText(alloc: std.mem.Allocator, bytes: []const u8) ![:0]u8 {
+    if (bytes.len < 8) return error.InvalidVector;
+    const dim = std.mem.readInt(u32, bytes[0..4], .little);
+    const nnz: usize = std.mem.readInt(u32, bytes[4..8], .little);
+    if (bytes.len != 8 + nnz * 8) return error.InvalidVector;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '{');
+    for (0..nnz) |k| {
+        if (k > 0) try out.append(alloc, ',');
+        const idx = std.mem.readInt(u32, bytes[8 + k * 4 ..][0..4], .little);
+        const val: f32 = @bitCast(std.mem.readInt(u32, bytes[8 + nnz * 4 + k * 4 ..][0..4], .little));
+        try out.print(alloc, "{d}:{d}", .{ idx + 1, val });
+    }
+    try out.print(alloc, "}}/{d}", .{dim});
+    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// §10fg: packed bits (MSB first) as '0101…', trimmed to the column's declared length
+/// when it has one — the wire pads bit(3) to a byte, and bit(3) refuses eight.
+fn bitText(alloc: std.mem.Allocator, bytes: []const u8, nbits: i32) ![:0]u8 {
+    const all = bytes.len * 8;
+    const n: usize = if (nbits > 0 and @as(usize, @intCast(nbits)) < all) @intCast(nbits) else all;
+    var out = try alloc.allocSentinel(u8, n, 0);
+    for (0..n) |i| out[i] = if ((bytes[i / 8] >> @intCast(7 - (i % 8))) & 1 == 1) '1' else '0';
+    return out;
+}
+
+test "§10fg: a client's vector blob binds as pgvector's text form" {
+    const a = std.testing.allocator;
+    const v = try vectorText(a, &[_]u8{ 0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0 }, f32);
+    defer a.free(v);
+    try std.testing.expectEqualStrings("[1,-2.5]", v);
+    const h = try vectorText(a, &[_]u8{ 0x00, 0x3e, 0x00, 0xbc }, f16);
+    defer a.free(h);
+    try std.testing.expectEqualStrings("[1.5,-1]", h);
+    try std.testing.expectError(error.InvalidVector, vectorText(a, &[_]u8{ 1, 2, 3 }, f32));
+    const s = try sparsevecText(a, &[_]u8{ 5, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x3f });
+    defer a.free(s);
+    try std.testing.expectEqualStrings("{3:0.5}/5", s);
+    const b = try bitText(a, &[_]u8{0xa5}, 8);
+    defer a.free(b);
+    try std.testing.expectEqualStrings("10100101", b);
+    const b3 = try bitText(a, &[_]u8{0xa0}, 3);
+    defer a.free(b3);
+    try std.testing.expectEqualStrings("101", b3);
 }
 
 /// A msgpack payload as JSON, for a json/jsonb column.
@@ -1654,7 +1732,8 @@ pub const MutationListener = struct {
             \\       t.typname::text AS type_name,
             \\       (k.ord IS NOT NULL
             \\        AND pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) IS NOT NULL)
-            \\         AS key_from_sequence
+            \\         AS key_from_sequence,
+            \\       a.atttypmod AS type_mod
             \\FROM pg_attribute a
             \\JOIN pg_type t ON t.oid = a.atttypid
             \\LEFT JOIN pg_index i ON i.indrelid = a.attrelid AND i.indisprimary
@@ -1703,10 +1782,10 @@ pub const MutationListener = struct {
         var r: usize = 0;
         while (r < rows) : (r += 1) {
             // ⚠️ Column indices, in the query's own order: 0 attname, 1 pk_ord,
-            // 2 type_oid, 3 type_cat, 4 type_name, 5 key_from_sequence. Adding the two
-            // type columns SHIFTED key_from_sequence from 3 to 5 — read positionally,
-            // so a new column in the middle silently changes what every later index
-            // means.
+            // 2 type_oid, 3 type_cat, 4 type_name, 5 key_from_sequence, 6 type_mod.
+            // Adding the two type columns SHIFTED key_from_sequence from 3 to 5 — read
+            // positionally, so a new column in the middle silently changes what every
+            // later index means. New columns go at the END.
             const name = std.mem.span(c.PQgetvalue(res, @intCast(r), 0));
             const ord = std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, @intCast(r), 1)), 10) catch 0;
             const oid = std.fmt.parseInt(u32, std.mem.span(c.PQgetvalue(res, @intCast(r), 2)), 10) catch 0;
@@ -1722,6 +1801,14 @@ pub const MutationListener = struct {
                 .bytea
             else if (std.mem.eql(u8, tname, "geometry") or std.mem.eql(u8, tname, "geography"))
                 .geometry
+            else if (std.mem.eql(u8, tname, "vector"))
+                .vector
+            else if (std.mem.eql(u8, tname, "halfvec"))
+                .halfvec
+            else if (std.mem.eql(u8, tname, "sparsevec"))
+                .sparsevec
+            else if (std.mem.eql(u8, tname, "bit"))
+                .{ .bit = std.fmt.parseInt(i32, std.mem.span(c.PQgetvalue(res, @intCast(r), 6)), 10) catch -1 }
             else
                 .scalar;
 
@@ -2827,6 +2914,24 @@ pub const MutationListener = struct {
             },
             .geometry => switch (payload) {
                 .bin => |v| (try hexText(alloc, "", v.value())).ptr,
+                else => self.payloadToString(alloc, payload),
+            },
+            // §10fg: the wire shape back to pgvector's text form. A client that sends
+            // the text form itself passes through.
+            .vector => switch (payload) {
+                .bin => |v| (try vectorText(alloc, v.value(), f32)).ptr,
+                else => self.payloadToString(alloc, payload),
+            },
+            .halfvec => switch (payload) {
+                .bin => |v| (try vectorText(alloc, v.value(), f16)).ptr,
+                else => self.payloadToString(alloc, payload),
+            },
+            .sparsevec => switch (payload) {
+                .bin => |v| (try sparsevecText(alloc, v.value())).ptr,
+                else => self.payloadToString(alloc, payload),
+            },
+            .bit => |nbits| switch (payload) {
+                .bin => |v| (try bitText(alloc, v.value(), nbits)).ptr,
                 else => self.payloadToString(alloc, payload),
             },
             .json => switch (payload) {

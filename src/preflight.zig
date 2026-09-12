@@ -289,18 +289,33 @@ pub fn reportTenantColumns(
 /// Pure and separately tested: a URL with no userinfo, or one whose password contains an
 /// `@` or a `:`, must not silently yield a wrong role name and turn every grant check
 /// into a false negative.
-/// §10ex: the PostGIS types, if the extension is installed, decode as bytes (EWKB)
-/// and map to BLOB. Their OIDs are per database, so they are looked up here, once,
-/// on the boot connection. Nothing to do when the extension is absent.
+/// §10ex/§10fg: the PostGIS and pgvector types, if the extensions are installed,
+/// decode as bytes and map to BLOB — EWKB as sent for PostGIS, pgvector normalised to
+/// the little-endian, header-less shape sqlite-vec reads (see `pgoutput.BinShape`).
+/// Their OIDs are per database, so they are looked up here, once, on the boot
+/// connection. Nothing to do when an extension is absent. These two are the
+/// supported extensions; a type of any other is refused by the type registry.
 pub fn registerExtensionBinaryTypes(conn: *c.PGconn) void {
-    const res = c.PQexec(conn, "SELECT oid::int, typname::text FROM pg_type WHERE typname IN ('geometry', 'geography') AND typtype = 'b'");
+    const res = c.PQexec(conn, "SELECT oid::int, typname::text FROM pg_type WHERE typname IN ('geometry', 'geography', 'vector', 'halfvec', 'sparsevec') AND typtype = 'b'");
     defer c.PQclear(res);
     if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return;
     const n: usize = @intCast(c.PQntuples(res));
     for (0..n) |i| {
         const oid = std.fmt.parseInt(u32, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), 10) catch continue;
-        pgoutput.registerExtensionBytea(oid);
-        log.info("🗺️  '{s}' (oid {d}) rides as bytes: EWKB on the wire, BLOB in the replica — the client decodes it", .{ std.mem.span(c.PQgetvalue(res, @intCast(i), 1)), oid });
+        const name = std.mem.span(c.PQgetvalue(res, @intCast(i), 1));
+        if (std.mem.eql(u8, name, "vector")) {
+            pgoutput.registerExtensionType(oid, .vector);
+            log.info("🧭 'vector' (oid {d}) rides as bytes: little-endian float32s, no header — sqlite-vec reads the BLOB as is", .{oid});
+        } else if (std.mem.eql(u8, name, "halfvec")) {
+            pgoutput.registerExtensionType(oid, .halfvec);
+            log.info("🧭 'halfvec' (oid {d}) rides as bytes: little-endian float16s, no header", .{oid});
+        } else if (std.mem.eql(u8, name, "sparsevec")) {
+            pgoutput.registerExtensionType(oid, .sparsevec);
+            log.info("🧭 'sparsevec' (oid {d}) rides as bytes: u32 dim, u32 nnz, indices, float32s, little-endian", .{oid});
+        } else {
+            pgoutput.registerExtensionType(oid, .raw);
+            log.info("🗺️  '{s}' (oid {d}) rides as bytes: EWKB on the wire, BLOB in the replica — the client decodes it", .{ name, oid });
+        }
     }
 }
 

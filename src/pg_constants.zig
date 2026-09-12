@@ -9,6 +9,8 @@ pub const PgOid = enum(u32) {
     // Numeric Types
     BOOL = 16,
     BYTEA = 17,
+    BIT = 1560, // bit(n): packed bits, the shape pgvector's binary_quantize produces (§10fg)
+    VARBIT = 1562, // bit varying: its text form, the length is part of the value (§10fg)
     INT2 = 21, // smallint
     INT4 = 23, // integer
     INT8 = 20, // bigint

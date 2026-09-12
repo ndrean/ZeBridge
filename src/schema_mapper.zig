@@ -38,6 +38,12 @@ pub const sqlite_type_map = std.StaticStringMap([]const u8).initComptime(.{
     .{ "bytea", "BLOB" },
     .{ "geometry", "BLOB" },
     .{ "geography", "BLOB" },
+    // §10fg: pgvector, normalised on the wire to what sqlite-vec reads (little-endian,
+    // no header), and bit(n) as its packed bytes. bit varying stays TEXT ('0101').
+    .{ "vector", "BLOB" },
+    .{ "halfvec", "BLOB" },
+    .{ "sparsevec", "BLOB" },
+    .{ "bit", "BLOB" },
 });
 
 /// Translates a PostgreSQL type to an SQLite type
@@ -56,6 +62,11 @@ test "pgToSqliteType - bytes are BLOB, modifiers do not hide the type" {
     try std.testing.expectEqualStrings("BLOB", pgToSqliteType("geography"));
     try std.testing.expectEqualStrings("TEXT", pgToSqliteType("numeric(20,8)"));
     try std.testing.expectEqualStrings("TEXT", pgToSqliteType("bytea[]"));
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("vector(1536)"));
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("halfvec(3)"));
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("sparsevec(5)"));
+    try std.testing.expectEqualStrings("BLOB", pgToSqliteType("bit(8)"));
+    try std.testing.expectEqualStrings("TEXT", pgToSqliteType("bit varying(12)"));
 }
 
 test "pgToSqliteType - exact types must not become REAL" {

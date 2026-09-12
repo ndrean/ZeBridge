@@ -37,8 +37,9 @@ import { heartbeatPayload,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
-  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql,
+  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, vecColsOf, pgVectorValues, vecLiteral,
 } from './core.ts';
+import type { VecCol } from './core.ts';
 import type { PlanStep } from './core.ts';
 import GRAMMAR_JSON from './grammar.json' with { type: 'json' };
 
@@ -110,6 +111,9 @@ export type TableState = {
   /// §10fc: the columns declared BLOB in the sqlite block — a table with one seeds
   /// row by row (JSON has no bytes); the rest seed a chunk per statement.
   blobCols?: string[];
+  /// §10fg: the pgvector/bit columns (`pg` block) — a PostgreSQL engine binds the
+  /// text form of the wire BLOB; SQLite keeps the BLOB.
+  vecCols?: VecCol[];
   tombstoneColumn: string | null;
   tenantColumn: string | null;
   /// The table's LWW version column (from the schema payload) — read to feed
@@ -1021,6 +1025,7 @@ export class ZeBridge {
       .filter((c) => typeof c.type === 'string' && c.type.endsWith('[]')).map((c) => c.name);
     const blobCols: string[] = ((val.sqlite?.columns ?? []) as { name: string; type?: string }[])
       .filter((c) => typeof c.type === 'string' && c.type.toUpperCase() === 'BLOB').map((c) => c.name);
+    const vecCols = vecColsOf((val.pg?.columns ?? []) as { name: string; type?: string }[]);
     // Dialect-neutral, at the root: CREATE [UNIQUE] INDEX is the same statement here
     // and in PGlite/local Postgres, so one list serves every consumer shape (§10c).
     const indexes: { name: string; unique?: boolean; columns: string[] }[] =
@@ -1165,7 +1170,7 @@ export class ZeBridge {
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
                  !(await this.foreignKeysDiffer(table, fkClauses))) {
         await recordShape();
-        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+        this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
         this.reach('migrated');
         this.scheduleRecount();
         // ⚠️ NOT a no-op path for indexes. Adding an index in PostgreSQL changes no
@@ -1225,7 +1230,7 @@ export class ZeBridge {
       await this.syncIndexes(table, indexes);
       await recordShape();
 
-      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
+      this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
       // Both registration paths mark the phase — a strip that lies is worse than none.
       this.reach('migrated');
       this.scheduleRecount();
@@ -1642,6 +1647,8 @@ export class ZeBridge {
     if (ev.optimistic && this.dialect.name === 'postgres') ev = { ...ev, data: pgEngineValues(ev.data) };
     // §10ey: a CDC event carries an array as JSON text; a PostgreSQL engine binds the literal.
     if (!ev.optimistic && this.dialect.name === 'postgres' && state.arrayCols?.length) ev = { ...ev, data: pgArrayValues(ev.data, state.arrayCols) };
+    // §10fg: a pgvector/bit column's bytes, local or CDC, bind as the text form on PostgreSQL.
+    if (this.dialect.name === 'postgres' && state.vecCols?.length) ev = { ...ev, data: pgVectorValues(ev.data, state.vecCols) };
 
     if (op === 'INSERT' || op === 'UPDATE') {
       const keys = Object.keys(ev.data);
@@ -2029,6 +2036,8 @@ export class ZeBridge {
         const pkIdx = state.pkCols.map((c) => cols.indexOf(c));
         // §10ey: chain cells carry arrays as JSON text too; the PostgreSQL engine wants the literal.
         const arrIdx = this.dialect.name === 'postgres' ? (state.arrayCols ?? []).map((c) => cols.indexOf(c)).filter((i) => i >= 0) : [];
+        // §10fg: and pgvector/bit cells as their text form.
+        const vecIdx = this.dialect.name === 'postgres' ? (state.vecCols ?? []).map((vc) => ({ i: cols.indexOf(vc.name), vc })).filter((x) => x.i >= 0) : [];
         // §10fb (libzb §10ez/§10fa on this side): rows in key order, applied in chunks
         // of one transaction each, and a page cache the seed's b-tree fits in while it
         // lasts. The first chunk of a full runs the DELETE; a kill between chunks is
@@ -2065,6 +2074,7 @@ export class ZeBridge {
                   const v = params[i];
                   if (typeof v === 'string' && v.startsWith('[')) { try { params[i] = pgArrayLiteral(JSON.parse(v)); } catch { /* not JSON: as is */ } }
                 }
+                for (const { i, vc } of vecIdx) if (isBytes(params[i])) params[i] = vecLiteral(vc.kind, params[i], vc.bits);
                 await txExec(q, ...params);
               }
               if (bulk && live.length) await txExec(bulk, JSON.stringify(live));

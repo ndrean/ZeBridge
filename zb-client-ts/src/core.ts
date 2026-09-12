@@ -279,6 +279,70 @@ export function pgArrayValues(data: Record<string, any>, arrayCols: readonly str
   return out;
 }
 
+/// §10fg: the pgvector wire shapes — the bridge's normalised BLOBs: `vector` as
+/// little-endian float32s, `halfvec` as little-endian float16s, `sparsevec` as u32 dim,
+/// u32 nnz, nnz u32 indices (0-based), nnz float32s, `bit` as packed bits MSB first.
+/// A SQLite replica stores them as they are (sqlite-vec reads them); a PostgreSQL
+/// engine binds pgvector's text form, which `vecLiteral` renders. `bits` is a bit(n)
+/// column's declared length (0 when unknown): the wire pads to a byte, bit(3) refuses eight.
+export type VecKind = 'vector' | 'halfvec' | 'sparsevec' | 'bit';
+export type VecCol = { name: string; kind: VecKind; bits: number };
+
+/// The pgvector/bit columns of a descriptor's `pg` block, with a bit(n)'s length.
+export function vecColsOf(cols: readonly { name: string; type?: string }[]): VecCol[] {
+  const out: VecCol[] = [];
+  for (const c of cols) {
+    if (typeof c.type !== 'string') continue;
+    const bare = c.type.split('(')[0];
+    if (bare !== 'vector' && bare !== 'halfvec' && bare !== 'sparsevec' && bare !== 'bit') continue;
+    const m = bare === 'bit' ? /\((\d+)\)/.exec(c.type) : null;
+    out.push({ name: c.name, kind: bare, bits: m ? Number(m[1]) : 0 });
+  }
+  return out;
+}
+
+const halfToNumber = (h: number): number => {
+  const s = h >> 15 ? -1 : 1, e = (h >> 10) & 0x1f, f = h & 0x3ff;
+  if (e === 0) return s * f * 2 ** -24;
+  if (e === 31) return f ? NaN : s * Infinity;
+  return s * (1 + f / 1024) * 2 ** (e - 15);
+};
+
+export function vecLiteral(kind: VecKind, bytes: Uint8Array, bits = 0): string {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (kind === 'vector' || kind === 'halfvec') {
+    const size = kind === 'vector' ? 4 : 2;
+    if (bytes.byteLength % size) throw new Error(`${kind}: ${bytes.byteLength} bytes is not a whole number of elements`);
+    const parts: string[] = [];
+    for (let i = 0; i < bytes.byteLength; i += size) parts.push(String(size === 4 ? dv.getFloat32(i, true) : halfToNumber(dv.getUint16(i, true))));
+    return `[${parts.join(',')}]`;
+  }
+  if (kind === 'sparsevec') {
+    if (bytes.byteLength < 8) throw new Error('sparsevec: no header');
+    const dim = dv.getUint32(0, true), nnz = dv.getUint32(4, true);
+    if (bytes.byteLength !== 8 + nnz * 8) throw new Error(`sparsevec: ${bytes.byteLength} bytes for nnz ${nnz}`);
+    const parts: string[] = [];
+    for (let k = 0; k < nnz; k++) parts.push(`${dv.getUint32(8 + k * 4, true) + 1}:${dv.getFloat32(8 + nnz * 4 + k * 4, true)}`);
+    return `{${parts.join(',')}}/${dim}`;
+  }
+  const all = bytes.byteLength * 8;
+  const n = bits > 0 && bits < all ? bits : all;
+  let s = '';
+  for (let i = 0; i < n; i++) s += (bytes[i >> 3] >> (7 - (i & 7))) & 1 ? '1' : '0';
+  return s;
+}
+
+/// On a PostgreSQL engine, the bytes of each pgvector/bit column become the text form.
+export function pgVectorValues(data: Record<string, any>, vecCols: readonly VecCol[]): Record<string, any> {
+  if (!vecCols.length) return data;
+  const out: Record<string, any> = { ...data };
+  for (const vc of vecCols) {
+    const v = out[vc.name];
+    if (isBytes(v)) out[vc.name] = vecLiteral(vc.kind, v, vc.bits);
+  }
+  return out;
+}
+
 /// The payload of a LOCAL write as a PostgreSQL engine must bind it: arrays as
 /// array literals, plain objects as JSON (jsonb reads that), scalars unchanged. CDC
 /// events need none of this — the wire is already in these forms.

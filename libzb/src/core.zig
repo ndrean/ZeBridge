@@ -429,6 +429,73 @@ pub fn heartbeatPayload(a: std.mem.Allocator, principal: []const u8, tenant: []c
 /// `{a,b}`, nested `{{1,2},{3}}`, elements quoted when they need it, null → NULL.
 /// The form the CDC wire already carries for arrays; a replica on a PostgreSQL
 /// engine binds its own optimistic write in it. Pinned in fixtures/pgArrayLiteral.
+/// §10fg: the pgvector wire shapes — the bridge's normalised BLOBs: `vector` as
+/// little-endian float32s, `halfvec` as little-endian float16s, `sparsevec` as u32 dim,
+/// u32 nnz, nnz u32 indices (0-based), nnz float32s, `bit` as packed bits MSB first.
+/// A SQLite replica stores them as they are; a PostgreSQL replica binds pgvector's
+/// text form, which this renders. `bits` is a bit(n) column's declared length (0 when
+/// unknown) — the wire pads to a byte and bit(3) refuses eight.
+pub const VecKind = enum { vector, halfvec, sparsevec, bit };
+
+pub fn vecLiteral(a: std.mem.Allocator, kind: VecKind, bytes: []const u8, bits: u32) error{ OutOfMemory, InvalidVector }![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(a);
+    switch (kind) {
+        .vector, .halfvec => {
+            const size: usize = if (kind == .vector) 4 else 2;
+            if (bytes.len % size != 0) return error.InvalidVector;
+            try out.append(a, '[');
+            var i: usize = 0;
+            while (i < bytes.len) : (i += size) {
+                if (i > 0) try out.append(a, ',');
+                if (kind == .vector) {
+                    try out.print(a, "{d}", .{@as(f32, @bitCast(std.mem.readInt(u32, bytes[i..][0..4], .little)))});
+                } else {
+                    try out.print(a, "{d}", .{@as(f16, @bitCast(std.mem.readInt(u16, bytes[i..][0..2], .little)))});
+                }
+            }
+            try out.append(a, ']');
+        },
+        .sparsevec => {
+            if (bytes.len < 8) return error.InvalidVector;
+            const dim = std.mem.readInt(u32, bytes[0..4], .little);
+            const nnz: usize = std.mem.readInt(u32, bytes[4..8], .little);
+            if (bytes.len != 8 + nnz * 8) return error.InvalidVector;
+            try out.append(a, '{');
+            for (0..nnz) |k| {
+                if (k > 0) try out.append(a, ',');
+                const idx = std.mem.readInt(u32, bytes[8 + k * 4 ..][0..4], .little);
+                const val: f32 = @bitCast(std.mem.readInt(u32, bytes[8 + nnz * 4 + k * 4 ..][0..4], .little));
+                try out.print(a, "{d}:{d}", .{ idx + 1, val });
+            }
+            try out.print(a, "}}/{d}", .{dim});
+        },
+        .bit => {
+            const all = bytes.len * 8;
+            const n: usize = if (bits > 0 and bits < all) bits else all;
+            for (0..n) |i| try out.append(a, if ((bytes[i / 8] >> @intCast(7 - (i % 8))) & 1 == 1) '1' else '0');
+        },
+    }
+    return out.toOwnedSlice(a);
+}
+
+test "vecLiteral: the wire shapes back to pgvector's text (§10fg)" {
+    const a = std.testing.allocator;
+    const v = try vecLiteral(a, .vector, &[_]u8{ 0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0 }, 0);
+    defer a.free(v);
+    try std.testing.expectEqualStrings("[1,-2.5]", v);
+    const h = try vecLiteral(a, .halfvec, &[_]u8{ 0x00, 0x3e, 0x00, 0xbc }, 0);
+    defer a.free(h);
+    try std.testing.expectEqualStrings("[1.5,-1]", h);
+    const s = try vecLiteral(a, .sparsevec, &[_]u8{ 5, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x3f }, 0);
+    defer a.free(s);
+    try std.testing.expectEqualStrings("{3:0.5}/5", s);
+    const b = try vecLiteral(a, .bit, &[_]u8{0xa0}, 3);
+    defer a.free(b);
+    try std.testing.expectEqualStrings("101", b);
+    try std.testing.expectError(error.InvalidVector, vecLiteral(a, .vector, &[_]u8{ 1, 2, 3 }, 0));
+}
+
 pub fn pgArrayLiteral(a: std.mem.Allocator, arr: std.json.Array) error{OutOfMemory}![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(a, '{');

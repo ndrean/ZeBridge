@@ -326,6 +326,11 @@ would otherwise accept it. Check `suspended` before `writable`.
   and which differs materially: it reports `numeric` for `numeric(20,8)` and — the one that
   breaks clients — a bare **`ARRAY`** for every array type, losing the element type
   entirely. A client written against the old description mis-maps every array column.
+* Both blocks name the columns the publication carries — a table with a column
+  list (`ALTER PUBLICATION … ADD TABLE t (a, b)`; `zebridge_enable` builds one that
+  leaves out tsvector, tsquery, xml and range columns, and whatever the caller's
+  `columns` left out) is that list to every replica, on the descriptor, the chain and
+  CDC alike.
 * `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
 * `lsn` is the WAL position this schema is valid from. For DDL-driven schemas it is
   the exact position of the DDL event; for boot-time schemas it is the WAL position
@@ -339,9 +344,18 @@ CDC path also delivers numerics as **strings**, so `REAL` would contradict the d
 `float4`/`float8`/`real`/`double precision` do map to `REAL` — those are genuine
 IEEE-754. **`bytea` maps to `BLOB`**, and so do PostGIS `geometry` and `geography`:
 the bytes PostgreSQL sends (EWKB for the PostGIS types) are carried untouched and
-stored as bytes; a map client decodes EWKB itself. Type modifiers are ignored for
-the mapping (`geometry(Point,4326)` is `geometry`). Everything unrecognised falls
-back to `TEXT`.
+stored as bytes; a map client decodes EWKB itself. **pgvector's `vector`, `halfvec`
+and `sparsevec` map to `BLOB` too, and so does `bit(n)`**, in a shape a client reads
+with no conversion (see §4). `bit varying` stays `TEXT`, as `'0101'`. Type modifiers
+are ignored for the mapping (`geometry(Point,4326)` is `geometry`, `vector(1536)` is
+`vector`). Everything unrecognised falls back to `TEXT`.
+
+PostGIS and pgvector are the two supported extensions: their type OIDs are read
+from `pg_type` at boot, since an extension type's OID differs per database. A column
+of any other extension type, or of a built-in type the decoder does not implement,
+refuses the table at boot rather than shipping bytes it cannot name. `tsvector`,
+`tsquery`, `xml` and the range types are left out of the publication by
+`zebridge_enable` (a column list, §3 above): they never travel.
 
 ### Three states, and a client must distinguish all three
 
@@ -571,8 +585,24 @@ that only obscures a genuine decode failure (`NOTES.md` §2.16).
   client WRITING such a column sends `bin` too (the TypeScript client: a
   `Uint8Array`; the C ABI: the `{"$bin": "<base64>"}` marker); the bridge renders it
   as the hex text PostgreSQL's input functions read (`\x…` for bytea, bare EWKB hex
-  for geometry). The row-width guard measures a row's TEXT form, so a bytea counts
-  twice against the change-feed budget: a 300 KB tile needs `BASE_BUF` 19 or more.
+  for geometry). The row-width guard measures a bytea as its length plus a five-byte
+  header, and a geometry, a vector or a `bit(n)` by `pg_column_size` — the stored
+  size, an approximation from above of the wire's.
+* **pgvector arrives as MessagePack `bin`, normalised.** pgvector's own binary form
+  carries a dimension header and big-endian floats, which nothing on a device reads
+  as is; the bridge strips the header and turns the numbers little-endian, so the
+  BLOB is exactly what sqlite-vec's `vec_f32`, a `Float32Array` or
+  `struct.unpack('<3f')` read. `vector` is `dim × float32`; `halfvec` is `dim ×
+  float16`; the dimension is the length over the element size. `sparsevec` keeps a
+  header, since its dimension is not its length: `u32 dim, u32 nnz, nnz × u32 index
+  (0-based), nnz × float32`, all little-endian. `bit(n)` is its packed bits, MSB
+  first, zero-padded to a byte and without PostgreSQL's length word — what
+  `binary_quantize` produces and what sqlite-vec's `vec_bit` reads; `bit varying`
+  travels as `'0101'` text, since its length is part of the value. A client WRITING
+  such a column sends the same BLOB; the bridge renders pgvector's text form
+  (`[1,2,3]`, `{1:0.5,3:2}/5` with 1-based indices, `'101'` trimmed to a `bit(n)`'s
+  declared length). A PostgreSQL-engine replica binds that text form on apply too
+  (`vecLiteral` in both clients); a SQLite replica stores the BLOB as it is.
 * **`timestamptz` arrives as ISO-8601 with `Z`; `timestamp` arrives without it.** The
   suffix is not decoration — `timestamptz` is stored as UTC, so `Z` states a recorded
   fact, while `timestamp` is a naive wall-clock reading with no zone. A client must

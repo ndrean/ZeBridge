@@ -879,6 +879,12 @@ BEGIN
                      JOIN pg_type t ON t.oid = a.atttypid
                      WHERE c.table_schema = 'public'
                        AND c.table_name   = tbl
+                       -- §10ff: only the columns the publication carries — a column
+                       -- outside the table's column list is not the table's, to any
+                       -- replica; every publication carrying the table must agree.
+                       AND COALESCE((SELECT bool_and(pt.attnames IS NULL OR c.column_name = ANY(pt.attnames))
+                                       FROM pg_publication_tables pt
+                                      WHERE pt.schemaname = 'public' AND pt.tablename = tbl), true)
                  ), '[]'::jsonb),
                  -- Every primary key column, in key order — NOT just single-column
                  -- keys. This used to filter on array_length(indkey,1) = 1, which made
@@ -1436,7 +1442,9 @@ BEGIN
         IF col.typname = 'bytea' THEN
             n_unbounded := n_unbounded + 1;
             expr := expr || format(' + coalesce(octet_length(NEW.%I) + 5, 0)', col.attname);
-        ELSIF col.typname IN ('geometry', 'geography') THEN
+        -- §10fg: pgvector and bit(n) ride as bytes too, a header lighter than the
+        -- stored form pg_column_size reports — again an approximation from above.
+        ELSIF col.typname IN ('geometry', 'geography', 'vector', 'halfvec', 'sparsevec', 'bit') THEN
             n_unbounded := n_unbounded + 1;
             expr := expr || format(' + coalesce(pg_column_size(NEW.%I), 0)', col.attname);
         ELSIF col.typname IN ('text', 'json', 'jsonb', 'xml')
@@ -1546,7 +1554,9 @@ BEGIN
         IF col.typname = 'bytea' THEN
             n_unbounded := n_unbounded + 1;
             expr := expr || format(' + coalesce(octet_length(NEW.%I) + 5, 0)', col.attname);
-        ELSIF col.typname IN ('geometry', 'geography') THEN
+        -- §10fg: pgvector and bit(n) ride as bytes too, a header lighter than the
+        -- stored form pg_column_size reports — again an approximation from above.
+        ELSIF col.typname IN ('geometry', 'geography', 'vector', 'halfvec', 'sparsevec', 'bit') THEN
             n_unbounded := n_unbounded + 1;
             expr := expr || format(' + coalesce(pg_column_size(NEW.%I), 0)', col.attname);
         ELSIF col.typname IN ('text', 'json', 'jsonb', 'xml')
@@ -1653,6 +1663,8 @@ DECLARE
     published  boolean;
     scoped     boolean;
     col_list   text;
+    excluded   name[];
+    cur_list   name[];
     verb       text := CASE WHEN dry_run THEN 'would' ELSE 'done' END;
     r           record;
 BEGIN
@@ -1841,15 +1853,49 @@ BEGIN
                COALESCE(tenant_col::text, 'NULL(public)'), COALESCE(version_col::text, 'updated_at'),
                COALESCE(tombstone_col::text, '-'), COALESCE(tiebreak_col::text, '-'), generations);
 
+    -- ── the column list (§10ff): index-like types never travel ────────────────
+    -- A tsvector, tsquery, xml or range column is an index representation of other
+    -- columns, not data a replica can use — FTS5 builds its own from the text. They
+    -- are left out of the publication's column list, with whatever the caller left
+    -- out through `columns`; the descriptor, the chain and CDC then agree on what a
+    -- table is. A column added later to a table WITH a list is not published until
+    -- zebridge_enable runs again (it refreshes the list below).
+    SELECT array_agg(a.attname ORDER BY a.attnum) INTO excluded
+      FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+     WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+       AND (t.typname IN ('tsvector', 'tsquery', 'xml') OR t.typtype IN ('r', 'm'))
+       AND (columns IS NULL OR a.attname = ANY(columns));
+    IF excluded IS NOT NULL THEN
+        SELECT array_agg(a.attname ORDER BY a.attnum) INTO columns
+          FROM pg_attribute a
+         WHERE a.attrelid = tbl AND a.attnum > 0 AND NOT a.attisdropped
+           AND (columns IS NULL OR a.attname = ANY(columns))
+           AND NOT (a.attname = ANY(excluded));
+        RETURN QUERY SELECT 'columns', verb,
+            format('%s column(s) left out of the publication — index-like types never travel: %s',
+                   array_length(excluded, 1), array_to_string(excluded, ', '));
+    END IF;
+    col_list := CASE WHEN columns IS NULL THEN ''
+                ELSE ' (' || array_to_string(
+                     ARRAY(SELECT quote_ident(c) FROM unnest(columns) c), ', ') || ')' END;
+
     -- ── publication LAST ──────────────────────────────────────────────────────
     SELECT EXISTS (SELECT 1 FROM pg_publication_tables
                    WHERE pubname = publication AND tablename = short) INTO published;
     IF published THEN
-        RETURN QUERY SELECT 'publication', 'already', format('%I already carries %s', publication, tbl);
+        SELECT attnames INTO cur_list FROM pg_publication_tables
+         WHERE pubname = publication AND tablename = short;
+        IF columns IS NOT NULL AND (cur_list IS NULL OR cur_list <> columns) THEN
+            IF NOT dry_run THEN
+                EXECUTE format('ALTER PUBLICATION %I DROP TABLE %s', publication, tbl);
+                EXECUTE format('ALTER PUBLICATION %I ADD TABLE %s%s', publication, tbl, col_list);
+            END IF;
+            RETURN QUERY SELECT 'publication', verb,
+                format('%I: column list refreshed — ALTER PUBLICATION %I ADD TABLE %s%s', publication, publication, tbl, col_list);
+        ELSE
+            RETURN QUERY SELECT 'publication', 'already', format('%I already carries %s', publication, tbl);
+        END IF;
     ELSE
-        col_list := CASE WHEN columns IS NULL THEN ''
-                    ELSE ' (' || array_to_string(
-                         ARRAY(SELECT quote_ident(c) FROM unnest(columns) c), ', ') || ')' END;
         IF NOT dry_run THEN
             EXECUTE format('ALTER PUBLICATION %I ADD TABLE %s%s', publication, tbl, col_list);
         END IF;

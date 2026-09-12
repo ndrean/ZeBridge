@@ -11508,6 +11508,99 @@ plus the compressed object plus the host, the same figure as SQLite without its 
 cache. The streaming inflate of §10fa's note would take the document itself down on
 both engines.
 
+## 10ff. Publication column lists: index-like types never travel (2026-09-12)
+
+The tsvector question (the type table of 2026-09-12): a tsvector is an index
+representation of other columns, not data a replica can use — FTS5 builds its own
+from the text — and a table carrying one was refused whole, its OID unknown to the
+decoder. The answer is not to decode it but to leave it out at the source.
+PostgreSQL publications take a column list per table (`ALTER PUBLICATION p ADD
+TABLE t (a, b, c)`, PostgreSQL 15+), and `zebridge_enable` already rendered one
+from its `columns` argument. What was missing was the default and the consumers.
+
+**The default.** `zebridge_enable` leaves out every column of type tsvector,
+tsquery, xml, and every range or multirange, with whatever the caller left out
+through `columns`, and says so as a step (`columns: 1 column(s) left out …`). The
+column list must carry the replica identity; those types never are. A table already
+in the publication has its list refreshed (DROP TABLE, ADD TABLE with the list) when
+the computed list differs — which is how a column added later joins: a column list
+does not grow on its own, and `zebridge_enable` run again after ADD COLUMN is the
+refresh. The caller's own exclusions are not remembered by the catalogue: pass
+`columns` again, or they rejoin.
+
+**The consumers.** Four paths enumerated a table's columns and all four now honour
+`pg_publication_tables.attnames`, with the rule "a column every publication carrying
+the table publishes" (`bool_and`): the DDL trigger's descriptor, the bridge's boot
+descriptor, the producer's SELECT (the chain must not carry what CDC never sends,
+or a replica holds values no event updates), and the audit. CDC needed nothing:
+pgoutput sends the published columns only. One race the scenario found: the DDL
+trigger describes a table inside its own transaction, and `zebridge_enable` issues
+ALTER TABLEs before its ADD TABLE, so those events carried every column and
+whichever descriptor landed last in KV won — the bridge applies the list at publish
+time on the DDL path too now, where the publication is settled.
+
+**Measured**, `scripts/scenarios/collist.py`, twice: a table with a body, a STORED
+tsvector over it and a column the caller leaves out; the enable reports the
+tsvector; the publication's list has neither; the descriptor names the published
+columns only; a libzb replica has neither and seeds the body; a row over CDC arrives
+without them; the client's write of a body lands and the master computes its
+tsvector; the audit finds the chain exact over the published columns; ADD COLUMN
+then `zebridge_enable` again refreshes the list. Nine checks. A side effect worth
+knowing: the scenario's DROP TABLE purges the table's subjects from the streams,
+which moves every stream's oldest message past every other pair's cut, and the GONE
+trigger of §10ev re-cut all of them within the scan — as designed.
+
+## 10fg. pgvector and bit(n): normalised on the bridge, read as is by sqlite-vec (2026-09-12)
+
+The type table's last row. A `vector` column refused its table whole — an OID the
+decoder did not know — and the user's line was that pgvector's types are real
+functionality a bridge must not drop, and that sqlite-vec reads them on a device.
+PostGIS and pgvector are the two extensions whose types have a life outside
+PostgreSQL; they are the supported ones, and the rest are refused (or, for the
+index-like built-ins, left out of the publication, §10ff).
+
+**The shape.** pgvector's binary send format is a dimension header and big-endian
+floats (`vector_send`: int16 dim, int16 unused, then `pq_sendfloat4` per element;
+`halfvec` the same with halves; `sparsevec`: int32 dim, nnz, unused, then the
+0-based indices, then the values). Nothing on a device reads that as is — sqlite-vec's
+`vec_f32` wants a bare little-endian float32 array, so does a `Float32Array`. So the
+bridge normalises rather than carries: the registry of extension OIDs (§10ex) now
+holds a shape per OID (`pgoutput.BinShape`: raw for PostGIS, vector, halfvec,
+sparsevec), and the decoder drops the header and byte-swaps into a fresh buffer,
+which the COPY producer and the CDC publisher then write as msgpack `bin` like any
+bytea. `sparsevec` keeps a header (u32 dim, u32 nnz, then indices, then values, all
+little-endian) since its dimension is not its length. `bit(n)` is built in (OID
+1560): PostgreSQL sends an int32 bit count and the packed bits, MSB first; the count
+is the column's declared length, so only the bytes travel — what `binary_quantize`
+produces and `vec_bit` reads. `bit varying` keeps its text form: its length is part
+of the value, and dropping the length word would lose it. The mapper says BLOB for
+the four and TEXT for varbit; the width guard measures them by `pg_column_size`.
+
+**The way back.** A client writes such a column as the same BLOB. The mutation
+listener knows the column's kind from the catalogue (`ColKind` is a tagged union
+now: `bit` carries `atttypmod`, the declared length) and renders pgvector's text
+form — `[1,-2.5]`, `{3:0.5}/5` with 1-based indices, `'101'` trimmed to the length,
+since the wire pads `bit(3)` to a byte and `bit(3)` refuses eight bits. The two
+clients do the same on a PostgreSQL engine (libzb `core.vecLiteral` on the COPY
+seed, the per-row seed, CDC and the optimistic apply; the TypeScript client
+`vecLiteral` on the postgres dialect's three paths), reading the descriptor's `pg`
+block for the kinds and a `bit(n)`'s length. A SQLite replica stores the BLOB as it
+is. Float rendering is `{d}` on the f32 or f16 itself — the shortest decimal that
+reads back to the same value, which is what pgvector prints.
+
+**Measured**, `scripts/scenarios/vectors.py`, fifteen checks: the descriptor maps
+the four to BLOB and varbit to TEXT and keeps pgvector's own types in the `pg`
+block; in a libzb SQLite replica the seed's vector is 12 bytes of little-endian
+float32, the halfvec float16s, the sparsevec the header shape, bit(8) and bit(3)
+their packed bytes, varbit its text; Python's sqlite3 opens the same file with
+sqlite-vec loaded and `vec_to_json`, `vec_distance_L2` and `vec_distance_hamming(vec_bit(…))`
+read the columns with no conversion; a row over CDC arrives in the same shapes; a
+client's write of all six as bytes lands in the master as `[7,8,9]|[0.25,0.5,0.75]|{3:2.5}/5|00001111|111|11`
+and echoes back as the same BLOB; the audit finds the chain exact, replay included
+(it renders the blobs as pgvector prints them, shortest float32 decimals); a
+PostgreSQL replica with pgvector holds the native types, seeded through COPY and fed
+over CDC. The earlier type scenarios (blobs, arrays, pgreplica, collist) still pass.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

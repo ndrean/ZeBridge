@@ -123,6 +123,10 @@ If fields are referenced across tenant without a foreign key, the result can loo
 
 >💡 _Good practice_: the solution is a choice made when designing tables. Only a **foreign key** guarantees that order, because the bridge then knows the schema constraint so that a child must be hold until the parent lands when a foreign is declared. Without this, impossible to know. 
 
+##### Restricted columns on tables
+
+ZeBridge supports restricting the columns in a publication. Currently, this will affect **every tenant**.
+
 ---
 
 ## Table of Contents
@@ -186,7 +190,7 @@ The client library shrinks this orchestration down to a few primitives: `connect
 * **Postgres**:
   * the DBA defines two Postgres USERs,  READER and WRITER, and uses them to install the Postgres functions and triggers neede by ZeBridge,
   * the DBA migrates the database, runs a diagnose to ensure the schemas follow the _good practice rules_, and removes any deviation.
-  * the DBA runs `SELECT zb_enable()` on each table attached to the desired publication,
+  * the DBA runs `SELECT zebridge_enable()` on each table attached to the desired publication,
   🔔 These three steps guarantees the sync of the engine.
 * **NATS**:
   * the DBA generates an NKEY pair for authentication: `bridge --gen-nkey`.
@@ -360,6 +364,11 @@ SQlite uses the following type casting:
 | arrays              | JSON text `["a","b"]`    | TEXT       | as is: `json_each`, `json_extract` read it; a PostgreSQL-engine replica gets the native array |
 | bytea               | msgpack `bin` (bytes)    | BLOB       | as is                       |
 | PostGIS geometry/geography | msgpack `bin` (EWKB) | BLOB   | as is; the client decodes EWKB |
+| pgvector vector / halfvec | msgpack `bin`, little-endian float32 / float16, no header | BLOB | as is: sqlite-vec's `vec_f32`, a `Float32Array` read it |
+| pgvector sparsevec  | msgpack `bin`: u32 dim, u32 nnz, indices, float32s | BLOB | as is |
+| bit(n)              | msgpack `bin`, packed bits | BLOB     | as is: sqlite-vec's `vec_bit` reads it |
+| bit varying         | text `'0101'`            | TEXT       | as is                       |
+| tsvector, tsquery, xml, ranges | never travel      | —          | left out of the publication by `zebridge_enable` |
 
 
 **Numeric**: SQLite has no decimal type, and its own documentation says: store exact decimals as TEXT, or as INTEGER in minor units when the scale is fixed. REAL is the one wrong answer, since money loses digits silently, and it would contradict the data the wire already carries as digits. 💡 So TEXT is the good practice.
@@ -369,11 +378,22 @@ The cost is that TEXT compares lexicographically, so ORDER BY price puts '9.5' a
 **jsonb**: TEXT is exactly what SQLite's `json_*()` family wants as input, so a replica can run `json_extract(metadata, '$.src')`. SQLite's newer internal JSONB format is a storage optimisation you opt into with `jsonb()`, and it changes what a plain SELECT returns.
 => leave that to the application
 
-**bytea**: if the `PostGis` extension is installed, the OIDs of the dynamic types `geometry` aand `geography` are detected at boot time (_dynamic OID is per database_) and the EWBK bytes are mapped into a BLOB in SQLite for the client using SQLite to decode the EWBK itself.
+**Extensions**: PostGIS and pgvector are the two supported extensions. Their type OIDs are per database, so the bridge reads them from `pg_type` at boot. PostGIS `geometry` and `geography` travel as the EWKB bytes PostgreSQL sends, a BLOB the client decodes itself. pgvector's types are normalised on the bridge: pgvector sends a dimension header and big-endian floats, which nothing on a device reads as is, so the bridge drops the header and turns the numbers little-endian. The BLOB a replica holds is then exactly what [sqlite-vec](https://github.com/asg017/sqlite-vec) reads (`vec_distance_L2(emb, '[1,2,3]')` on the column as it is), and what a `Float32Array` or `struct.unpack` reads. A client writes such a column with the same BLOB; the bridge renders pgvector's text form for PostgreSQL. A column of any other extension type refuses the table at boot.
+
+#### Private Columns on Tables
+
+The bridge can handle partial tables by column, and the cut applies for **every tenant**. You need to inform the bridge infrastructure by `zebridge_enable(...)`
+
+
+
+Have several publications, and one slot follow several publications.
+
+🔔 [TODO]
+
 
 #### Schemas and zebridge_enable
 
-> [!WARNING] Every table must be attached to a publication with `zb_enable()`.
+> [!WARNING] Every table must be attached to a publication with `zebridge_enable()`.
 
 The schema rules below are the ones needed in terms of column types and mandatory columns.
 
@@ -384,6 +404,8 @@ Tables are either public or private/tenant-scoped:
 |||||
 | public table | no column, but a public reason is declared | text | ✚ `zebridge_enable(public_reason => 'this table is public')` for example|
 | private table| `tenant_id` | text | ✚ `zebridge_enable(tenant_col => 'tenant_id')` |
+
+**Columns that never travel.** `zebridge_enable` gives the table a publication column list when it has columns no replica can use: `tsvector`, `tsquery`, `xml`, ranges. They stay in PostgreSQL; the descriptor, the chain and the change feed carry the rest. Leave out more with `columns => ARRAY['id', 'title', …]`. A column list does not grow on its own: after `ALTER TABLE … ADD COLUMN`, run `zebridge_enable` again to refresh it.
 
 Tables are either read-only or writable with a LWW conflict resolution policy.
 
@@ -775,7 +797,7 @@ CREATE TABLE IF NOT EXISTS test_types (
     last_writer varchar, -- ✅ tiebreak: which principal wrote
 );
 
-PERFORM * FROM zb_enable(
+PERFORM * FROM zebridge_enable(
     'public.test_types'::regclass,
     writable => true,
     tenant_col => 'tenant_id',
@@ -810,7 +832,7 @@ The migration to add a primary key:
 
 > since it is READ-ONLY, it can be a simple `bigint`, but necessarily `uuid` in the WRITABLE case.
 
-**A "Good"** `read-only` table ✚ 🔔 the magic  PG function `zb_enable()` to attach this table to the 'publication' of your choice.
+**A "Good"** `read-only` table ✚ 🔔 the magic  PG function `zebridge_enable()` to attach this table to the 'publication' of your choice.
 
 ``` sql
 CREATE TABLE IF NOT EXISTS users (
@@ -824,7 +846,7 @@ CREATE TABLE IF NOT EXISTS users (
 -- ⚠️ needs a 'public_reason' field, NOT NULL, meaning deliberate)
 -- declare the publication to which this table will be added
 
-SELECT zb_enable(
+SELECT zebridge_enable(
     'public.users'::regclass,
     public_reason => 'no tenant column, readable by every consumer', -- ❗️needed
     publication => 'my_pub',
@@ -866,7 +888,7 @@ The migration:
 + ADD COLUMN last_writer text,
 ```
 
-So the "good" writable ✚ 🔔 the magic PG function `zb_enable()` where we declare which columns will play which role, and link it to the 'publication' and declare it 'writable'.
+So the "good" writable ✚ 🔔 the magic PG function `zebridge_enable()` where we declare which columns will play which role, and link it to the 'publication' and declare it 'writable'.
 
 ```sql
 CREATE TABLE IF NOT EXISTS test_types (
@@ -886,7 +908,7 @@ CREATE TABLE IF NOT EXISTS test_types (
 -- the SYNC RULES correspondance (tombstone_col, version_col, tiebreak_col)
  -- declare the publication to which this table will be added
 
-PERFORM * FROM zb_enable(
+PERFORM * FROM zebridge_enable(
     'public.test_types'::regclass,
     writable => true,
     tenant_col => 'tenant_id',
@@ -907,7 +929,7 @@ CREATE TABLE IF NOT EXISTS test_types (
     ...
 );
 
-SELECT zb_enable(...);
+SELECT zebridge_enable(...);
 ```
 
 * If the table is **empty**, the change of the primary key type from 'bigint' -> 'uuid' to simple:

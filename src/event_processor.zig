@@ -258,6 +258,39 @@ pub const EventProcessor = struct {
     /// these fields existed simply leaves the registry empty for its types, and the
     /// decoder then refuses anything exotic rather than guessing. Failing to record is
     /// never fatal: the registry only ever widens what can be decoded.
+    /// §10ff: `cols` without the columns every publication carrying the table leaves
+    /// out of its column list. On any failure to ask, all of them — a descriptor that
+    /// says too much is what the bridge said before column lists existed.
+    fn publishedColumns(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8, cols: []std.json.Value) []std.json.Value {
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+        const conn = pg_conn.connect(arena, standard_pg_config) catch return cols;
+        defer c.PQfinish(conn);
+        const table_z = arena.dupeZ(u8, table) catch return cols;
+        const params = [_]?[*:0]const u8{table_z.ptr};
+        const res = c.PQexecParams(conn, "SELECT a.attname::text FROM pg_attribute a WHERE a.attrelid = to_regclass(format('%I.%I', 'public', $1::text)) " ++
+            "AND a.attnum > 0 AND NOT a.attisdropped " ++
+            "AND NOT COALESCE((SELECT bool_and(a.attname = ANY(pt.attnames)) FROM pg_publication_tables pt WHERE pt.schemaname = 'public' AND pt.tablename = $1::text), true)", 1, null, &params[0], null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return cols;
+        const n_out: usize = @intCast(c.PQntuples(res));
+        if (n_out == 0) return cols;
+        var kept = std.ArrayListUnmanaged(std.json.Value).empty;
+        for (cols) |col_val| {
+            const name = if (col_val == .object) col_val.object.get("name") else null;
+            if (name != null and name.? == .string) {
+                var out = false;
+                for (0..n_out) |i| if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), name.?.string)) {
+                    out = true;
+                };
+                if (out) continue;
+            }
+            kept.append(arena, col_val) catch return cols;
+        }
+        log.info("🗂️ '{s}': {d} column(s) outside the publication's column list left out of the descriptor", .{ table, n_out });
+        return kept.items;
+    }
+
     fn recordColumnType(self: *EventProcessor, col_val: std.json.Value) void {
         if (col_val != .object) return;
         const oid_v = col_val.object.get("oid") orelse return;
@@ -1417,7 +1450,12 @@ pub const EventProcessor = struct {
             log.warn("⚠️ schema_def for '{s}' has an empty column list — skipping", .{clean_table});
             return null;
         }
-        const columns = cols_val.array.items;
+        // §10ff: only the columns the publication carries. The DDL trigger describes
+        // the table as it stood inside its own transaction — for the ALTERs that
+        // zebridge_enable issues, before its ADD TABLE ran — so the column list is
+        // applied here, at publish time, where the publication is settled. (The boot
+        // descriptor filters the same way in its query.)
+        const columns = self.publishedColumns(arena, clean_table, cols_val.array.items);
 
         // Re-emit as `{ pg: {...}, sqlite: {...}, pk }`. The Postgres shape is copied
         // through as captured; the SQLite dialect is derived here so the mapping stays
@@ -2060,9 +2098,12 @@ pub const EventProcessor = struct {
                 \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
                 \\  AND a.attnum > 0
                 \\  AND NOT a.attisdropped
+                \\  AND COALESCE((SELECT bool_and(pt.attnames IS NULL OR a.attname = ANY(pt.attnames))
+                \\                  FROM pg_publication_tables pt
+                \\                 WHERE pt.schemaname = '{s}' AND pt.tablename = '{s}'), true)
                 \\ORDER BY a.attnum;
             ,
-                .{ "public", clean_table },
+                .{ "public", clean_table, "public", clean_table },
             );
 
             const result = c.PQexec(conn, query.ptr);

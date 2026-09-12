@@ -95,29 +95,99 @@ pub const Column = struct {
 /// come from the same arena, reclaimed together). The passthrough branches then return
 /// slices of `raw_bytes` directly instead of copying it — false keeps the defensive
 /// copy, for a caller like a test that hands in a stack buffer.
-/// §10ex: OIDs of extension types whose binary send format is bytes the bridge
-/// carries untouched — PostGIS `geometry` and `geography` (EWKB). Extension OIDs
-/// differ per database, so they are read from `pg_type` at boot (preflight) rather
-/// than known. Zero slots are empty. Written once at boot, read by the decoder.
-pub var extension_bytea_oids: [8]u32 = [_]u32{0} ** 8;
+/// §10ex/§10fg: extension types whose binary send format the bridge carries as bytes
+/// — msgpack `bin` on the wire, BLOB in a replica. Extension OIDs differ per database,
+/// so they are read from `pg_type` at boot (preflight) rather than known. Zero slots
+/// are empty. Written once at boot, read by the decoder.
+///
+/// PostGIS is carried as sent (EWKB). pgvector's types are NORMALISED: pgvector sends
+/// a dimension header and big-endian floats, which nothing on a device reads as is;
+/// the bridge strips the header and turns the floats little-endian, so the BLOB is
+/// exactly what sqlite-vec's `vec_f32`, a `Float32Array`, or `struct.unpack('<3f')`
+/// read. The dimension is the length over the element size.
+pub const BinShape = enum(u8) {
+    none = 0,
+    /// Bytes as sent: PostGIS geometry/geography (EWKB).
+    raw,
+    /// pgvector `vector`: u16 dim, u16 unused, dim × big-endian float32
+    /// → dim × little-endian float32.
+    vector,
+    /// pgvector `halfvec`: u16 dim, u16 unused, dim × big-endian float16
+    /// → dim × little-endian float16.
+    halfvec,
+    /// pgvector `sparsevec`: i32 dim, i32 nnz, i32 unused, nnz × i32 index (0-based),
+    /// nnz × float32 → u32 dim, u32 nnz, nnz × u32 index (0-based), nnz × float32,
+    /// all little-endian. The one shape that keeps a header, since the dimension is
+    /// not the length.
+    sparsevec,
+};
 
-pub fn registerExtensionBytea(oid: u32) void {
-    for (&extension_bytea_oids) |*slot| {
-        if (slot.* == oid) return;
-        if (slot.* == 0) {
-            slot.* = oid;
+const ExtType = struct { oid: u32 = 0, shape: BinShape = .none };
+pub var extension_types: [8]ExtType = [_]ExtType{.{}} ** 8;
+
+pub fn registerExtensionType(oid: u32, shape: BinShape) void {
+    for (&extension_types) |*slot| {
+        if (slot.oid == oid) {
+            slot.shape = shape;
+            return;
+        }
+        if (slot.oid == 0) {
+            slot.* = .{ .oid = oid, .shape = shape };
             return;
         }
     }
 }
 
-pub fn isExtensionBytea(oid: u32) bool {
-    if (oid == 0) return false;
-    for (extension_bytea_oids) |o| {
-        if (o == 0) return false;
-        if (o == oid) return true;
+/// PostGIS's registration, and the tests': bytes as sent.
+pub fn registerExtensionBytea(oid: u32) void {
+    registerExtensionType(oid, .raw);
+}
+
+pub fn extensionShape(oid: u32) BinShape {
+    if (oid == 0) return .none;
+    for (extension_types) |t| {
+        if (t.oid == 0) return .none;
+        if (t.oid == oid) return t.shape;
     }
-    return false;
+    return .none;
+}
+
+/// "Is this an extension type the bridge carries as bytes?" — the type registry's verdict.
+pub fn isExtensionBytea(oid: u32) bool {
+    return extensionShape(oid) != .none;
+}
+
+/// pgvector's `vector`/`halfvec` send format to the bare little-endian element array.
+fn normaliseVector(allocator: std.mem.Allocator, raw: []const u8, comptime elem: usize) ![]const u8 {
+    if (raw.len < 4) return error.InvalidDataLength;
+    const dim: usize = std.mem.readInt(u16, raw[0..2], .big);
+    if (raw.len != 4 + dim * elem) return error.InvalidDataLength;
+    const out = try allocator.alloc(u8, dim * elem);
+    var i: usize = 0;
+    while (i < dim) : (i += 1) {
+        const src = raw[4 + i * elem ..][0..elem];
+        const dst = out[i * elem ..][0..elem];
+        inline for (0..elem) |k| dst[k] = src[elem - 1 - k];
+    }
+    return out;
+}
+
+/// pgvector's `sparsevec` send format to the little-endian header + pairs shape.
+fn normaliseSparsevec(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    if (raw.len < 12) return error.InvalidDataLength;
+    const dim = std.mem.readInt(u32, raw[0..4], .big);
+    const nnz: usize = std.mem.readInt(u32, raw[4..8], .big);
+    if (raw.len != 12 + nnz * 8) return error.InvalidDataLength;
+    const out = try allocator.alloc(u8, 8 + nnz * 8);
+    std.mem.writeInt(u32, out[0..4], dim, .little);
+    std.mem.writeInt(u32, out[4..8], @intCast(nnz), .little);
+    // nnz indices then nnz values: 32-bit words either way, swapped one by one.
+    var i: usize = 0;
+    while (i < nnz * 2) : (i += 1) {
+        const w = std.mem.readInt(u32, raw[12 + i * 4 ..][0..4], .big);
+        std.mem.writeInt(u32, out[8 + i * 4 ..][0..4], w, .little);
+    }
+    return out;
 }
 
 pub fn decodeBinColumnData(
@@ -126,8 +196,12 @@ pub fn decodeBinColumnData(
     raw_bytes: []const u8,
     owns_bytes: bool,
 ) !DecodedValue {
-    if (isExtensionBytea(type_id)) {
-        return .{ .bytea = if (owns_bytes) raw_bytes else try allocator.dupe(u8, raw_bytes) };
+    switch (extensionShape(type_id)) {
+        .none => {},
+        .raw => return .{ .bytea = if (owns_bytes) raw_bytes else try allocator.dupe(u8, raw_bytes) },
+        .vector => return .{ .bytea = try normaliseVector(allocator, raw_bytes, 4) },
+        .halfvec => return .{ .bytea = try normaliseVector(allocator, raw_bytes, 2) },
+        .sparsevec => return .{ .bytea = try normaliseSparsevec(allocator, raw_bytes) },
     }
     const oid: PgOid = @enumFromInt(type_id);
 
@@ -262,6 +336,25 @@ pub fn decodeBinColumnData(
         },
         .BYTEA => {
             return .{ .bytea = if (owns_bytes) raw_bytes else try allocator.dupe(u8, raw_bytes) };
+        },
+        // §10fg: bit(n) sends an i32 bit count then the packed bits, MSB first, zero
+        // padded to a byte. The count is the column's declared length, so only the
+        // bytes travel — the shape sqlite-vec's `vec_bit` reads, and what pgvector's
+        // binary_quantize produces. A declared length that is not a multiple of 8
+        // pads on the wire; the mutation listener trims a written value back to it.
+        .BIT => {
+            if (raw_bytes.len < 4) return error.InvalidDataLength;
+            return .{ .bytea = if (owns_bytes) raw_bytes[4..] else try allocator.dupe(u8, raw_bytes[4..]) };
+        },
+        // bit varying keeps its text form ('0101'): the length is part of the value,
+        // and there is no fixed length to trim back to.
+        .VARBIT => {
+            if (raw_bytes.len < 4) return error.InvalidDataLength;
+            const nbits: usize = std.mem.readInt(u32, raw_bytes[0..4], .big);
+            if (raw_bytes.len < 4 + (nbits + 7) / 8) return error.InvalidDataLength;
+            const out = try allocator.alloc(u8, nbits);
+            for (0..nbits) |i| out[i] = if ((raw_bytes[4 + i / 8] >> @intCast(7 - (i % 8))) & 1 == 1) '1' else '0';
+            return .{ .text = out };
         },
 
         // --- NUMERIC (Binary format - use numeric.zig) ---
@@ -1510,6 +1603,45 @@ test "elementToText refuses a truncated fixed-width element" {
     try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .INT4, &[_]u8{ 0, 1 }));
     try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .INT8, &[_]u8{ 0, 1, 2, 3 }));
     try std.testing.expectError(error.InvalidDataLength, elementToText(alloc, .UUID, &[_]u8{ 0, 1, 2 }));
+}
+
+test "§10fg: a vector is normalised to little-endian float32s, no header" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    registerExtensionType(77001, .vector);
+    // dim 2, unused 0, 1.0f and -2.5f big-endian
+    const raw = [_]u8{ 0, 2, 0, 0, 0x3f, 0x80, 0, 0, 0xc0, 0x20, 0, 0 };
+    const v = try decodeBinColumnData(arena.allocator(), 77001, &raw, false);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0 }, v.bytea);
+    try std.testing.expectEqual(@as(f32, 1.0), @as(f32, @bitCast(std.mem.readInt(u32, v.bytea[0..4], .little))));
+    try std.testing.expectEqual(@as(f32, -2.5), @as(f32, @bitCast(std.mem.readInt(u32, v.bytea[4..8], .little))));
+    try std.testing.expectError(error.InvalidDataLength, decodeBinColumnData(arena.allocator(), 77001, raw[0..7], false));
+}
+
+test "§10fg: a halfvec is little-endian float16s; a sparsevec keeps dim and nnz" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    registerExtensionType(77002, .halfvec);
+    registerExtensionType(77003, .sparsevec);
+    // halfvec dim 1: 1.5 = 0x3e00
+    const h = try decodeBinColumnData(arena.allocator(), 77002, &[_]u8{ 0, 1, 0, 0, 0x3e, 0x00 }, false);
+    try std.testing.expectEqual(@as(f16, 1.5), @as(f16, @bitCast(std.mem.readInt(u16, h.bytea[0..2], .little))));
+    // sparsevec dim 5, nnz 1, unused 0, index 2, value 0.5f
+    const s = try decodeBinColumnData(arena.allocator(), 77003, &[_]u8{ 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0x3f, 0, 0, 0 }, false);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 5, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x3f }, s.bytea);
+}
+
+test "§10fg: bit(n) is its packed bytes, varbit its text form" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // B'10100101': 8 bits, 0xa5
+    const b = try decodeBinColumnData(arena.allocator(), 1560, &[_]u8{ 0, 0, 0, 8, 0xa5 }, false);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xa5}, b.bytea);
+    // B'101' as bit(3): 3 bits, 0xa0 (padded on the right)
+    const b3 = try decodeBinColumnData(arena.allocator(), 1560, &[_]u8{ 0, 0, 0, 3, 0xa0 }, false);
+    try std.testing.expectEqualSlices(u8, &[_]u8{0xa0}, b3.bytea);
+    const vb = try decodeBinColumnData(arena.allocator(), 1562, &[_]u8{ 0, 0, 0, 10, 0xa5, 0x40 }, false);
+    try std.testing.expectEqualStrings("1010010101", vb.text);
 }
 
 test "empty array renders as [] instead of crashing" {

@@ -2,7 +2,7 @@
 /// the TS core. A port (Zig, …) writes its own thin runner over the SAME file —
 /// the fixtures are the spec, this file is just plumbing.
 import { test } from 'node:test';
-import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql } from './core.ts';
+import { cdcValue, pgEngineValues, isBytes, pgArrayValues, sortRowsByKey, chainBulkSql, vecColsOf, vecLiteral, pgVectorValues } from './core.ts';
 
 test('a chunk in one statement through json_each, version-guarded (§10fc)', () => {
   const sql = chainBulkSql('t', ['uid', 'n', 'updated_at'], ['uid'], 'updated_at');
@@ -16,6 +16,19 @@ test('chain rows sort by their key cell, stable for the rest (§10fb)', () => {
   assert.deepEqual(sortRowsByKey([[3, 'x'], [1, 'y'], [2, 'z']], 0).map((r) => r[0]), [1, 2, 3]);
   assert.deepEqual(sortRowsByKey(rows, -1), rows);
   assert.deepEqual(rows.map((r) => r[0]), ['c', 'a', 'b']); // the input is untouched
+});
+
+test('pgvector wire shapes render as pgvector text on a PostgreSQL engine (§10fg)', () => {
+  assert.equal(vecLiteral('vector', new Uint8Array([0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0])), '[1,-2.5]');
+  assert.equal(vecLiteral('halfvec', new Uint8Array([0x00, 0x3e, 0x00, 0xbc])), '[1.5,-1]');
+  assert.equal(vecLiteral('sparsevec', new Uint8Array([5, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0x3f])), '{3:0.5}/5');
+  assert.equal(vecLiteral('bit', new Uint8Array([0xa5]), 8), '10100101');
+  assert.equal(vecLiteral('bit', new Uint8Array([0xa0]), 3), '101');
+  assert.throws(() => vecLiteral('vector', new Uint8Array([1, 2, 3])));
+  const cols = vecColsOf([{ name: 'emb', type: 'vector(3)' }, { name: 'b3', type: 'bit(3)' }, { name: 'vb', type: 'bit varying(12)' }, { name: 'n', type: 'integer' }]);
+  assert.deepEqual(cols, [{ name: 'emb', kind: 'vector', bits: 0 }, { name: 'b3', kind: 'bit', bits: 3 }]);
+  const out = pgVectorValues({ emb: new Uint8Array([0, 0, 0x80, 0x3f]), b3: new Uint8Array([0xa0]), n: 1, vb: '1010' }, cols);
+  assert.deepEqual(out, { emb: '[1]', b3: '101', n: 1, vb: '1010' });
 });
 
 test('JSON array text becomes the PostgreSQL literal for array columns only (§10ey)', () => {

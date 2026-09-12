@@ -80,6 +80,10 @@ const TableState = struct {
     /// §10fe: the PostGIS columns (`pg` block, type geometry/geography): bytes into
     /// them are bare EWKB hex in COPY text, where a bytea takes `\\x` hex.
     geom_cols: []const []const u8 = &.{},
+    /// §10fg: the pgvector and bit(n) columns (`pg` block): a PostgreSQL replica
+    /// binds pgvector's text form of the wire BLOB (core.vecLiteral); SQLite keeps
+    /// the BLOB.
+    vec_cols: []const VecCol = &.{},
     route: []const u8, // the CDC stream this table's events ride
     /// For a tenant-scoped table: the stream its OPEN-TENANT rows ride (CDC_PUBLIC).
     /// Those are the shared rows every tenant may read — `zb_reader_all` admits
@@ -553,6 +557,38 @@ pub const SyncClient = struct {
         return out.items;
     }
 
+    /// §10fg: the pgvector and bit(n) columns named by the descriptor's `pg` block,
+    /// with a bit(n)'s declared length. `bit varying` is not one: it travels as text.
+    fn vecColsOf(a: std.mem.Allocator, val: Value) ![]const VecCol {
+        var out: std.ArrayListUnmanaged(VecCol) = .empty;
+        const pg = if (val == .object) (val.object.get("pg") orelse Value.null) else Value.null;
+        if (pg != .object) return out.items;
+        const cols = pg.object.get("columns") orelse return out.items;
+        if (cols != .array) return out.items;
+        for (cols.array.items) |c| {
+            if (c != .object) continue;
+            const n = c.object.get("name") orelse continue;
+            const t = c.object.get("type") orelse continue;
+            if (n != .string or t != .string) continue;
+            const ty = t.string;
+            const bare = if (std.mem.indexOfScalar(u8, ty, '(')) |i| ty[0..i] else ty;
+            const kind: core.VecKind = if (std.mem.eql(u8, bare, "vector")) .vector else if (std.mem.eql(u8, bare, "halfvec")) .halfvec else if (std.mem.eql(u8, bare, "sparsevec")) .sparsevec else if (std.mem.eql(u8, bare, "bit")) .bit else continue;
+            var bits: u32 = 0;
+            if (kind == .bit) if (std.mem.indexOfScalar(u8, ty, '(')) |i| {
+                const close = std.mem.indexOfScalar(u8, ty, ')') orelse ty.len;
+                bits = std.fmt.parseInt(u32, ty[i + 1 .. close], 10) catch 0;
+            };
+            try out.append(a, .{ .name = n.string, .kind = kind, .bits = bits });
+        }
+        return out.items;
+    }
+
+    fn dupeVecCols(a: std.mem.Allocator, src: []const VecCol) ![]const VecCol {
+        const out = try a.alloc(VecCol, src.len);
+        for (src, 0..) |v, i| out[i] = .{ .name = try a.dupe(u8, v.name), .kind = v.kind, .bits = v.bits };
+        return out;
+    }
+
     /// §10fd: the array columns named by the descriptor's `pg` block (`type` ending in `[]`).
     fn arrayColsOf(a: std.mem.Allocator, val: Value) ![]const []const u8 {
         var out: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -570,7 +606,8 @@ pub const SyncClient = struct {
     }
 
     /// §10fd: on a PostgreSQL replica, the array columns of a row object become the
-    /// literal — in place, on the copy the caller holds.
+    /// literal — in place, on the copy the caller holds. §10fg: and the pgvector
+    /// columns' bytes (the `$bin` marker) become pgvector's text form.
     fn pgArrayFixup(self: *SyncClient, a: std.mem.Allocator, st: TableState, data: *Value) !void {
         if (self.st.engine != .postgres or data.* != .object) return;
         for (st.array_cols) |col| {
@@ -581,6 +618,11 @@ pub const SyncClient = struct {
                 else => continue,
             };
             try data.object.put(a, col, .{ .string = lit });
+        }
+        for (st.vec_cols) |vc| {
+            const v = data.object.get(vc.name) orelse continue;
+            const bytes = try binOf(a, v) orelse continue;
+            try data.object.put(a, vc.name, .{ .string = try core.vecLiteral(a, vc.kind, bytes, vc.bits) });
         }
     }
 
@@ -711,6 +753,7 @@ pub const SyncClient = struct {
             .tombstone_col = if (tombstone_col) |v| try ca.dupe(u8, v) else null,
             .array_cols = try dupeStrings(ca, try arrayColsOf(a, val)),
             .geom_cols = try dupeStrings(ca, try geomColsOf(a, val)),
+            .vec_cols = try dupeVecCols(ca, try vecColsOf(a, val)),
             .route = route,
             .shared_route = shared_route,
             .seed_epoch = seed_epoch,
@@ -725,6 +768,7 @@ pub const SyncClient = struct {
             st.tombstone_col = fresh.tombstone_col;
             st.array_cols = fresh.array_cols;
             st.geom_cols = fresh.geom_cols;
+            st.vec_cols = fresh.vec_cols;
             st.route = fresh.route;
             st.shared_route = fresh.shared_route;
             st.seed_epoch = fresh.seed_epoch;
@@ -972,6 +1016,8 @@ pub const SyncClient = struct {
         array_idx: []const usize,
         /// §10fe: the PostGIS columns' indices (bare EWKB hex in COPY text).
         geom_idx: []const usize,
+        /// §10fg: the pgvector/bit columns' indices and shapes (text form on PostgreSQL).
+        vec_idx: []const VecIdx,
         /// §10fe: on PostgreSQL, a chunk goes in through COPY FROM STDIN — straight into
         /// the emptied table for a full, through a temporary table and the upsert for
         /// a delta, so the version guard holds. Tombstones keep their per-row DELETE.
@@ -1019,6 +1065,9 @@ pub const SyncClient = struct {
                 for (cells, 0..) |cell, i| params[i] = try payloadToStorage(ra, cell);
                 for (cs.array_idx) |i| if (i < params.len and params[i] == .text) {
                     params[i] = .{ .text = try jsonArrayToLiteral(ra, params[i].text) };
+                };
+                for (cs.vec_idx) |vi| if (vi.i < params.len and params[vi.i] == .blob) {
+                    params[vi.i] = .{ .text = try core.vecLiteral(ra, vi.kind, params[vi.i].blob, vi.bits) };
                 };
                 _ = st.query(ra, cs.sql, params) catch |err| {
                     // Read the SQLite text HERE, before the rollback clears it: it is
@@ -1070,7 +1119,10 @@ pub const SyncClient = struct {
                 const is_geom = for (cs.geom_idx) |gi| {
                     if (gi == i) break true;
                 } else false;
-                try writeCopyCell(buf, cs.client.a, ra, cell, is_array, is_geom);
+                const vec: ?VecIdx = for (cs.vec_idx) |vi| {
+                    if (vi.i == i) break vi;
+                } else null;
+                try writeCopyCell(buf, cs.client.a, ra, cell, is_array, is_geom, vec);
             }
             try buf.append(cs.client.a, '\n');
             n_live += 1;
@@ -1091,7 +1143,7 @@ pub const SyncClient = struct {
 
     /// One cell in COPY text. Bytes are bytea's `\\x` hex, or bare EWKB hex into a
     /// PostGIS column; a JSON array text becomes the literal for an array column.
-    fn writeCopyCell(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, ra: std.mem.Allocator, p: msgpack.Payload, is_array: bool, is_geom: bool) !void {
+    fn writeCopyCell(out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, ra: std.mem.Allocator, p: msgpack.Payload, is_array: bool, is_geom: bool, vec: ?VecIdx) !void {
         switch (p) {
             .nil => try out.appendSlice(a, "\\N"),
             .bool => |b| try out.append(a, if (b) 't' else 'f'),
@@ -1104,6 +1156,11 @@ pub const SyncClient = struct {
                 try copyEscape(out, a, txt);
             },
             .bin => |b| {
+                // §10fg: a pgvector/bit cell goes in as its text form.
+                if (vec) |vi| {
+                    try copyEscape(out, a, try core.vecLiteral(ra, vi.kind, b.value(), vi.bits));
+                    return;
+                }
                 if (!is_geom) try out.appendSlice(a, "\\\\x");
                 for (b.value()) |byte| try out.print(a, "{x:0>2}", .{byte});
             },
@@ -1329,6 +1386,11 @@ pub const SyncClient = struct {
                 if (indexOf(cols, gc)) |i| try geom_idx_list.append(step_a, i);
             };
             const geom_idx = geom_idx_list.items;
+            var vec_idx_list: std.ArrayListUnmanaged(VecIdx) = .empty;
+            if (self.st.engine == .postgres) for (st.vec_cols) |vc| {
+                if (indexOf(cols, vc.name)) |i| try vec_idx_list.append(step_a, .{ .i = i, .kind = vc.kind, .bits = vc.bits });
+            };
+            const vec_idx = vec_idx_list.items;
             const copy_sql: []const u8 = if (self.st.engine == .postgres) try core.pgUpsertFromCopySql(step_a, table, cols, st.pk, vcol) else "";
             var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer copy_buf.deinit(self.a);
@@ -1355,6 +1417,7 @@ pub const SyncClient = struct {
                     .tomb_idx = if (st.tombstone_col) |tc| indexOf(cols, tc) else null,
                     .array_idx = array_idx,
                     .geom_idx = geom_idx,
+                    .vec_idx = vec_idx,
                     .copy = self.st.engine == .postgres,
                     .copy_upsert_sql = copy_sql,
                     .copy_buf = &copy_buf,
@@ -3141,6 +3204,11 @@ fn binMarker(a: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}!Value {
 }
 
 /// The bytes of a `{"$bin": …}` marker, or null when `v` is anything else.
+/// §10fg: a pgvector/bit column as the descriptor names it, with a bit(n)'s length.
+pub const VecCol = struct { name: []const u8, kind: core.VecKind, bits: u32 };
+/// The same, by column index in a chain step.
+pub const VecIdx = struct { i: usize, kind: core.VecKind, bits: u32 };
+
 fn binOf(a: std.mem.Allocator, v: Value) error{OutOfMemory}!?[]u8 {
     if (v != .object or v.object.count() != 1) return null;
     const s = v.object.get(BIN_KEY) orelse return null;

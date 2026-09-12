@@ -25,7 +25,7 @@ One shape difference the audit normalises: arrays ride as JSON text
 (`["grow","s-1"]`, §10ey) and are compared with PostgreSQL's `to_json` rendering,
 quotes stripped on both sides (the wire keeps numeric elements as strings).
 """
-import argparse, json, pathlib, sqlite3, subprocess, sys, tempfile, time
+import argparse, json, pathlib, sqlite3, struct, subprocess, sys, tempfile, time
 import msgpack, zstandard
 import zb
 
@@ -56,11 +56,32 @@ def render(col, udt):
     return f"{col}::text"
 
 
+def f32_text(x):
+    """pgvector's rendering of a float32: the shortest decimal that reads back to it."""
+    packed = struct.pack("<f", x)
+    for p in range(1, 10):
+        s = f"{x:.{p}g}"
+        if struct.pack("<f", float(s)) == packed: return s
+    return repr(x)
+
+
 def cell_text(v, udt):
     """A decoded chain cell as the text PostgreSQL renders — the comparison key."""
     if v is None: return "\\N"
     if isinstance(v, bool): return "t" if v else "f"
-    if isinstance(v, bytes): return v.hex() if udt in ("geometry", "geography") else "\\x" + v.hex()
+    if isinstance(v, bytes):
+        # §10fg: pgvector and bit(n) ride as normalised BLOBs; PostgreSQL's ::text is
+        # pgvector's own form, so the bytes are rendered the way pgvector prints them.
+        if udt == "vector": return "[" + ",".join(f32_text(f) for f in struct.unpack(f"<{len(v) // 4}f", v)) + "]"
+        if udt == "halfvec": return "[" + ",".join(f32_text(f) for f in struct.unpack(f"<{len(v) // 2}e", v)) + "]"
+        if udt == "sparsevec":
+            dim, nnz = struct.unpack_from("<II", v)
+            idx = struct.unpack_from(f"<{nnz}I", v, 8); vals = struct.unpack_from(f"<{nnz}f", v, 8 + 4 * nnz)
+            return "{" + ",".join(f"{i + 1}:{f32_text(x)}" for i, x in zip(idx, vals)) + "}/" + str(dim)
+        if udt.startswith("bit"):
+            n = int(udt[4:-1]) if udt.startswith("bit(") else len(v) * 8
+            return "".join("1" if (v[i >> 3] >> (7 - (i & 7))) & 1 else "0" for i in range(n))
+        return v.hex() if udt in ("geometry", "geography") else "\\x" + v.hex()
     if isinstance(v, float): return repr(v)
     s = str(v)
     return s.replace('"', "") if udt.startswith("_") else s
@@ -295,7 +316,11 @@ def main():
     bucket = m["bucket"]
     print(f"  · manifest g{m['gen']} on {bucket}: full g{m['full']['gen']} (cutoff {m['full']['cutoff']}), {len(m['deltas'])} delta(s), cutoff_seq {m.get('cutoff_seq')} on {m.get('cdc_stream')}")
 
-    cols = zb.psql(f"SELECT string_agg(column_name || ':' || udt_name, ',' ORDER BY ordinal_position) FROM information_schema.columns WHERE table_name = '{a.table}'", quiet=True).strip()
+    # §10ff: the columns the publication carries — a column outside the table's column
+    # list is not on the wire, so it is not in the chain either.
+    # a bit(n) column carries its length — the wire pads to a byte, the text form does not
+    cols = zb.psql(f"SELECT string_agg(column_name || ':' || udt_name || CASE WHEN udt_name = 'bit' THEN '(' || character_maximum_length || ')' ELSE '' END, ',' ORDER BY ordinal_position) FROM information_schema.columns c WHERE table_name = '{a.table}' "
+                   f"AND COALESCE((SELECT bool_and(attnames IS NULL OR c.column_name = ANY(attnames)) FROM pg_publication_tables WHERE tablename = '{a.table}'), true)", quiet=True).strip()
     cols_udt = dict(c.split(":") for c in cols.split(","))
     pk = zb.psql(f"SELECT string_agg(kcu.column_name, ',' ORDER BY kcu.ordinal_position) FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_name = '{a.table}' AND tc.constraint_type = 'PRIMARY KEY'", quiet=True).strip().split(",")
     cat = zb.psql(f"SELECT tenant_col || '|' || coalesce(tombstone_col, '') FROM zebridge_catalogue WHERE tbl = '{a.table}'", quiet=True).strip()
