@@ -116,7 +116,7 @@ async def main():
     # ── the audit: the chain mirrors PostgreSQL, vectors compared in pgvector's text ──
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not zb.kv_get("generations", f"{TENANT}.{T}"): time.sleep(2)
-    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T], capture_output=True, text=True)
+    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--pub", "my_pub"], capture_output=True, text=True)
     check("the audit finds the chain exact, replay included", "✓ the chain mirrors PostgreSQL" in a.stdout)
     if "✓ the chain mirrors PostgreSQL" not in a.stdout: print(a.stdout[-1200:])
 

@@ -879,12 +879,10 @@ BEGIN
                      JOIN pg_type t ON t.oid = a.atttypid
                      WHERE c.table_schema = 'public'
                        AND c.table_name   = tbl
-                       -- §10ff: only the columns the publication carries — a column
-                       -- outside the table's column list is not the table's, to any
-                       -- replica; every publication carrying the table must agree.
-                       AND COALESCE((SELECT bool_and(pt.attnames IS NULL OR c.column_name = ANY(pt.attnames))
-                                       FROM pg_publication_tables pt
-                                      WHERE pt.schemaname = 'public' AND pt.tablename = tbl), true)
+                       -- §10ff: every column, column list or not. The trigger does
+                       -- not know which publication a bridge follows, so it does not
+                       -- guess: the bridge narrows the list to its own publication's
+                       -- when it publishes the descriptor (publishedColumns).
                  ), '[]'::jsonb),
                  -- Every primary key column, in key order — NOT just single-column
                  -- keys. This used to filter on array_length(indkey,1) = 1, which made

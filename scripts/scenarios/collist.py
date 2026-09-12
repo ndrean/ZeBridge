@@ -14,7 +14,10 @@ column list lacks both; the descriptor in KV names neither; a libzb replica has
 neither column, and seeds the body; a row over CDC arrives without them; a write of
 the body from the client lands and the master recomputes its tsvector; the audit
 finds the chain exact over the published columns; re-running zebridge_enable after
-ADD COLUMN refreshes the list.
+ADD COLUMN refreshes the list. A stray second publication naming the table with a
+narrower list (uid, tenant_id, secret) exists throughout — another bridge's, or a leftover —
+and must not shrink this bridge's descriptor: the filters key on the bridge's
+publication, not on every publication that names the table.
 """
 import json, sys, time, uuid
 import zb
@@ -38,6 +41,10 @@ async def main():
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), body text, fts tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body, ''))) STORED, "
             f"secret text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
+    zb.psql("DROP PUBLICATION IF EXISTS col_stray", quiet=True)
+    # (uid, tenant_id, secret): a column list must cover the replica identity, which
+    # zebridge_enable sets to the (key, tenant) index, or PostgreSQL refuses every UPDATE.
+    zb.psql(f"CREATE PUBLICATION col_stray FOR TABLE public.{T} (uid, tenant_id, secret)", quiet=True)
     en = zb.psql(f"SELECT step || ': ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, "
                  f"columns => ARRAY['uid', 'body', 'fts', 'tenant_id', 'inserted_at', 'updated_at', 'deleted_at']::name[], "
                  f"version_col => 'updated_at', tombstone_col => 'deleted_at', tiebreak_col => NULL, publication => 'my_pub', dry_run => false)", quiet=True)
@@ -49,7 +56,7 @@ async def main():
 
     desc = json.loads(zb.kv_get("schemas", T) or "{}")
     dcols = [c["name"] for c in desc.get("sqlite", {}).get("columns", [])]
-    check(f"the descriptor names the published columns only: {dcols}", dcols == ["uid", "body", "tenant_id", "inserted_at", "updated_at", "deleted_at"])
+    check(f"the descriptor names the bridge's publication's columns only, the stray publication's narrower list ignored: {dcols}", dcols == ["uid", "body", "tenant_id", "inserted_at", "updated_at", "deleted_at"])
 
     db = "/tmp/zb-collist.sqlite3"; fresh_sqlite(db)
     em = Lib(db, [T], "py-collist", principal="bob")
@@ -76,7 +83,7 @@ async def main():
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not zb.kv_get("generations", f"{TENANT}.{T}"): time.sleep(2)
     import os, subprocess
-    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--no-replay"], capture_output=True, text=True)
+    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--pub", "my_pub", "--no-replay"], capture_output=True, text=True)
     check("the audit finds the chain exact over the published columns", "✓ the chain mirrors PostgreSQL" in a.stdout)
     if "✓ the chain mirrors PostgreSQL" not in a.stdout: print(a.stdout[-800:])
 
@@ -88,6 +95,7 @@ async def main():
     after = attnames()
     check(f"ADD COLUMN, then zebridge_enable again: the list refreshed ({before} → {after})", "extra" not in before and "extra" in after and "fts" not in after)
     zb.psql(f"DROP TABLE public.{T}", quiet=True)
+    zb.psql("DROP PUBLICATION col_stray", quiet=True)
     fresh_sqlite(db)
     return 1 if FAILED else 0
 

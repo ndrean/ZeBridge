@@ -11528,11 +11528,18 @@ does not grow on its own, and `zebridge_enable` run again after ADD COLUMN is th
 refresh. The caller's own exclusions are not remembered by the catalogue: pass
 `columns` again, or they rejoin.
 
-**The consumers.** Four paths enumerated a table's columns and all four now honour
-`pg_publication_tables.attnames`, with the rule "a column every publication carrying
-the table publishes" (`bool_and`): the DDL trigger's descriptor, the bridge's boot
-descriptor, the producer's SELECT (the chain must not carry what CDC never sends,
-or a replica holds values no event updates), and the audit. CDC needed nothing:
+**The consumers.** Four paths enumerated a table's columns and all now honour
+`pg_publication_tables.attnames` — the list of THE BRIDGE'S publication: the
+bridge's boot descriptor, the DDL-path descriptor, the producer's SELECT (the chain
+must not carry what CDC never sends, or a replica holds values no event updates),
+and the audit (`BRIDGE_CDC_PUBLICATION`). The first cut intersected the lists of
+every publication naming the table (`bool_and`), including in the DDL trigger; a
+stray second publication with a narrower list — another bridge's, or a leftover —
+shrank the descriptor to the intersection. Fixed the same day, once the live test
+of two publications on one slot (`cannot use different column lists for table …
+in different publications`, pgoutput's own check) settled that such a publication
+can only ever belong to another slot. The DDL trigger now describes every column
+and does not guess a publication; the bridge narrows at publish time. CDC needed nothing:
 pgoutput sends the published columns only. One race the scenario found: the DDL
 trigger describes a table inside its own transaction, and `zebridge_enable` issues
 ALTER TABLEs before its ADD TABLE, so those events carried every column and

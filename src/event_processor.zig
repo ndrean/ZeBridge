@@ -167,6 +167,12 @@ pub const EventProcessor = struct {
     cat: ?*const catalogue.Load = null,
     /// Wire names, read from grammar.json at startup. See src/topology.zig.
     topology: *const Topology.Topology,
+    /// The publication this bridge follows (`--pub`). The two column-list filters
+    /// below key on it: a table's columns are what THIS publication carries, not the
+    /// intersection over every publication that happens to name the table — a stray
+    /// second publication with a narrower list (another bridge's, or a leftover)
+    /// must not shrink this bridge's descriptor. Set after construction, like `cat`.
+    publication: []const u8 = "",
     /// Per-table version-column overrides and the global default, for the edge-writability
     /// report a table gets when it appears after boot. Same two values preflight uses.
     sync_rules: *const Config.EventClassification.TransitionRules,
@@ -258,8 +264,8 @@ pub const EventProcessor = struct {
     /// these fields existed simply leaves the registry empty for its types, and the
     /// decoder then refuses anything exotic rather than guessing. Failing to record is
     /// never fatal: the registry only ever widens what can be decoded.
-    /// §10ff: `cols` without the columns every publication carrying the table leaves
-    /// out of its column list. On any failure to ask, all of them — a descriptor that
+    /// §10ff: `cols` without the columns this bridge's publication leaves out of the
+    /// table's column list. On any failure to ask, all of them — a descriptor that
     /// says too much is what the bridge said before column lists existed.
     fn publishedColumns(self: *EventProcessor, arena: std.mem.Allocator, table: []const u8, cols: []std.json.Value) []std.json.Value {
         var standard_pg_config = self.pg_config.*;
@@ -267,10 +273,11 @@ pub const EventProcessor = struct {
         const conn = pg_conn.connect(arena, standard_pg_config) catch return cols;
         defer c.PQfinish(conn);
         const table_z = arena.dupeZ(u8, table) catch return cols;
-        const params = [_]?[*:0]const u8{table_z.ptr};
+        const pub_z = arena.dupeZ(u8, self.publication) catch return cols;
+        const params = [_]?[*:0]const u8{ table_z.ptr, pub_z.ptr };
         const res = c.PQexecParams(conn, "SELECT a.attname::text FROM pg_attribute a WHERE a.attrelid = to_regclass(format('%I.%I', 'public', $1::text)) " ++
             "AND a.attnum > 0 AND NOT a.attisdropped " ++
-            "AND NOT COALESCE((SELECT bool_and(a.attname = ANY(pt.attnames)) FROM pg_publication_tables pt WHERE pt.schemaname = 'public' AND pt.tablename = $1::text), true)", 1, null, &params[0], null, null, 0);
+            "AND NOT COALESCE((SELECT pt.attnames IS NULL OR a.attname = ANY(pt.attnames) FROM pg_publication_tables pt WHERE pt.pubname = $2::text AND pt.schemaname = 'public' AND pt.tablename = $1::text), true)", 2, null, &params[0], null, null, 0);
         defer c.PQclear(res);
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return cols;
         const n_out: usize = @intCast(c.PQntuples(res));
@@ -2098,12 +2105,12 @@ pub const EventProcessor = struct {
                 \\WHERE a.attrelid = '"{s}"."{s}"'::regclass
                 \\  AND a.attnum > 0
                 \\  AND NOT a.attisdropped
-                \\  AND COALESCE((SELECT bool_and(pt.attnames IS NULL OR a.attname = ANY(pt.attnames))
+                \\  AND COALESCE((SELECT pt.attnames IS NULL OR a.attname = ANY(pt.attnames)
                 \\                  FROM pg_publication_tables pt
-                \\                 WHERE pt.schemaname = '{s}' AND pt.tablename = '{s}'), true)
+                \\                 WHERE pt.pubname = '{s}' AND pt.schemaname = '{s}' AND pt.tablename = '{s}'), true)
                 \\ORDER BY a.attnum;
             ,
-                .{ "public", clean_table, "public", clean_table },
+                .{ "public", clean_table, self.publication, "public", clean_table },
             );
 
             const result = c.PQexec(conn, query.ptr);

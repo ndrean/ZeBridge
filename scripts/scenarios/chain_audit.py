@@ -25,7 +25,7 @@ One shape difference the audit normalises: arrays ride as JSON text
 (`["grow","s-1"]`, §10ey) and are compared with PostgreSQL's `to_json` rendering,
 quotes stripped on both sides (the wire keeps numeric elements as strings).
 """
-import argparse, json, pathlib, sqlite3, struct, subprocess, sys, tempfile, time
+import argparse, json, os, pathlib, sqlite3, struct, subprocess, sys, tempfile, time
 import msgpack, zstandard
 import zb
 
@@ -308,7 +308,9 @@ def main():
     ap.add_argument("--tenant", default="globex"); ap.add_argument("--table", default="test_types")
     ap.add_argument("--only", choices=["full", "deltas", "all"], default="all")
     ap.add_argument("--no-replay", action="store_true", help="skip the whole-chain replay")
+    ap.add_argument("--pub", default=os.environ.get("BRIDGE_CDC_PUBLICATION"), help="the bridge's publication (default: BRIDGE_CDC_PUBLICATION)")
     a = ap.parse_args()
+    if not a.pub: sys.exit("--pub or BRIDGE_CDC_PUBLICATION: the publication is named, never guessed")
     raw = zb.kv_get("generations", f"{a.tenant}.{a.table}")
     if not raw:
         print(f"  ✗ no manifest for {a.tenant}.{a.table}"); return 1
@@ -320,7 +322,7 @@ def main():
     # list is not on the wire, so it is not in the chain either.
     # a bit(n) column carries its length — the wire pads to a byte, the text form does not
     cols = zb.psql(f"SELECT string_agg(column_name || ':' || udt_name || CASE WHEN udt_name = 'bit' THEN '(' || character_maximum_length || ')' ELSE '' END, ',' ORDER BY ordinal_position) FROM information_schema.columns c WHERE table_name = '{a.table}' "
-                   f"AND COALESCE((SELECT bool_and(attnames IS NULL OR c.column_name = ANY(attnames)) FROM pg_publication_tables WHERE tablename = '{a.table}'), true)", quiet=True).strip()
+                   f"AND COALESCE((SELECT attnames IS NULL OR c.column_name = ANY(attnames) FROM pg_publication_tables WHERE pubname = '{a.pub}' AND tablename = '{a.table}'), true)", quiet=True).strip()
     cols_udt = dict(c.split(":") for c in cols.split(","))
     pk = zb.psql(f"SELECT string_agg(kcu.column_name, ',' ORDER BY kcu.ordinal_position) FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema WHERE tc.table_name = '{a.table}' AND tc.constraint_type = 'PRIMARY KEY'", quiet=True).strip().split(",")
     cat = zb.psql(f"SELECT tenant_col || '|' || coalesce(tombstone_col, '') FROM zebridge_catalogue WHERE tbl = '{a.table}'", quiet=True).strip()

@@ -1454,6 +1454,7 @@ pub fn main(init: std.process.Init) !void {
         writer_role,
     );
     event_proc.cat = &cat; // §10df: the descriptor carries each table's seed_epoch
+    event_proc.publication = pub_name_z; // §10ff: column lists are this publication's
 
     // The DROP-prune needs the shared publisher's JetStream context (assigned
     // here, not in init, because the publisher is built earlier in boot but the

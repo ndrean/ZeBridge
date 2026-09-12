@@ -330,7 +330,13 @@ would otherwise accept it. Check `suspended` before `writable`.
   list (`ALTER PUBLICATION … ADD TABLE t (a, b)`; `zebridge_enable` builds one that
   leaves out tsvector, tsquery, xml and range columns, and whatever the caller's
   `columns` left out) is that list to every replica, on the descriptor, the chain and
-  CDC alike.
+  CDC alike. The list is the one in the bridge's own publication (`--pub`); another
+  publication naming the table does not narrow it. Two rules of PostgreSQL's apply:
+  a column list must cover the replica identity — the key and, for a tenant-scoped
+  table, the tenant column — or PostgreSQL refuses every UPDATE on the table; and
+  one slot cannot follow two publications that name the same table with different
+  column lists (`cannot use different column lists for table … in different
+  publications`), so a second list for a table is another bridge's.
 * `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
 * `lsn` is the WAL position this schema is valid from. For DDL-driven schemas it is
   the exact position of the DDL event; for boot-time schemas it is the WAL position

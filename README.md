@@ -64,7 +64,7 @@ Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 * **Strict authentication**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA.
 * **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads.
 * **Schema translation**: the replicas are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, primary key NOT NULL (even of composite type), foreign key references (`PRAGMA foreign_key='on'), on delete cascade/no action, and (multi-column) unique index are transcribed into SQLite schemas. 
-* **Types**: support of`PostGis` (binary EWKB as BLOB) and `pgvector` types out of the box, via dynamic type read at boot time.
+* **Support for PostGIS and pgvector**: support of`PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box, via dynamic type read at boot time.
   
 **Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema, table suspension, and controlled local writes propagation.
 
@@ -405,7 +405,7 @@ Tables are either public or private/tenant-scoped:
 | public table | no column, but a public reason is declared | text | ✚ `zebridge_enable(public_reason => 'this table is public')` for example|
 | private table| `tenant_id` | text | ✚ `zebridge_enable(tenant_col => 'tenant_id')` |
 
-**Columns that never travel.** `zebridge_enable` gives the table a publication column list when it has columns no replica can use: `tsvector`, `tsquery`, `xml`, ranges. They stay in PostgreSQL; the descriptor, the chain and the change feed carry the rest. Leave out more with `columns => ARRAY['id', 'title', …]`. A column list does not grow on its own: after `ALTER TABLE … ADD COLUMN`, run `zebridge_enable` again to refresh it.
+**Columns that never travel.** `zebridge_enable` gives the table a publication column list when it has columns no replica can use: `tsvector`, `tsquery`, `xml`, ranges. They stay in PostgreSQL; the descriptor, the chain and the change feed carry the rest. Leave out more with `columns => ARRAY['id', 'title', …]`. A column list does not grow on its own: after `ALTER TABLE … ADD COLUMN`, run `zebridge_enable` again to refresh it. Keep the key and the tenant column in the list: PostgreSQL requires a column list to cover the replica identity, or it refuses every UPDATE on the table.
 
 Tables are either read-only or writable with a LWW conflict resolution policy.
 
