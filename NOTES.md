@@ -11965,3 +11965,36 @@ Assume `chain_depth = 6`.
 - **Manifest Window:** Gen 10, 11 (Full), 12, 13, 14, 15.
 - **Resolution:** The client looks for a Delta that requires `cutoff(gen-3)`. The oldest available Delta is Gen 10, which requires `cutoff(gen-9)`. The chain does **not** reach. 
 - **Action:** The client degrades to a Full rebuild. It executes `DELETE FROM table`, downloads the Gen 11 Full (applying `g11-dict`), downloads Deltas 12-15, applies them, and then resumes the live CDC stream. 
+
+## 10fm. The map example: `pois` on a screen, one tenant (2026-09-13)
+
+`examples/08-map/flutter`, the user's skeleton made honest. The table belongs to
+PostgreSQL and libzb creates the replica from the descriptor, so the app's `CREATE
+TABLE` went; `pois` (uid uuid, lat, lng, note, tenant_id, inserted_at, updated_at,
+deleted_at) is enabled writable with `updated_at` as the version and `deleted_at` as
+the tombstone, under `my_pub`; the app runs as alice, tenant acme, three landmarks
+seeded by hand.
+
+**Threading.** The skeleton wrapped each poll in `Isolate.run` — a fresh isolate, so a
+fresh thread, per poll — while the UI isolate kept calling query and mutate on the
+same handle: two threads on one handle, the one thing capi.zig's contract forbids
+("one thread drives one client"). The user's point was right (the poll loop must
+leave the UI thread) and the 05-mobile worker is already that shape: `Isolate.spawn`
+once, the handle born and dying in that isolate, the loop there, commands served
+between polls by id, reports as a stream, pause/resume on the app lifecycle. Both
+files copied as they are; `main.dart` rewritten on top.
+
+**What the app sends.** INSERT carries the key, `tenant_id` from the worker's
+resolved tenant, `inserted_at` and `updated_at` (the bridge clamps the version);
+UPDATE carries `note`; erase is DELETE, a tombstone upstream. Proven through libzb as
+alice from Python before any click: accepted, accepted, accepted; the master keeps
+the row with `deleted_at` set. The replica does NOT keep it — §7.5, a tombstoned row
+is a row a replica must not hold, on seed, CDC and the optimistic apply alike — so the
+marker query has no `deleted_at` filter (the first draft had one, harmless and
+wrong). A row inserted on the master reached the app's replica on the next poll.
+
+**Two skeleton bugs.** The Protomaps light theme names its source `protomaps`; the
+skeleton registered the pmtiles provider as `openmaptiles`, the layer asserted and
+the map silently fell back to OSM raster tiles. And `.gitignore` covered
+`examples/08-map/.env` while the file sits one level down: widened to
+`examples/08-map/**/.env*` (the API keys never entered git; the folder is untracked).
