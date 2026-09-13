@@ -2094,7 +2094,9 @@ pub const EventProcessor = struct {
             const query = try utils.allocPrintZ(
                 arena,
                 \\SELECT a.attname,
-                \\       format_type(a.atttypid, a.atttypmod) AS data_type,
+                \\       -- §10fl: the declared dimensions (`int[][]` is `integer[]` to
+                \\       -- format_type; attndims keeps the count) — a DuckDB list is typed by depth
+                \\       format_type(a.atttypid, a.atttypmod) || repeat('[]', greatest(a.attndims - 1, 0)) AS data_type,
                 \\       a.atttypid,
                 \\       t.typtype,
                 \\       (a.attnotnull AND NOT a.atthasdef) AS required,

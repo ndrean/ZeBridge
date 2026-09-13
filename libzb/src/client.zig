@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const core = @import("core.zig");
-const storage = @import("storage.zig");
+pub const storage = @import("storage.zig");
 const transport = @import("transport.zig");
 const msgpack = @import("msgpack");
 const C = @import("c");
@@ -45,6 +45,10 @@ pub const Options = struct {
     /// §10fd: a PostgreSQL replica instead of the SQLite file — a libpq URL. The
     /// replica is then a database any PostgreSQL tool reads (the micro-VM case).
     db_url: ?[*:0]const u8 = null,
+    /// §10fl: the storage engine. `sqlite` (the default) and `duckdb` take
+    /// `db_path`; `postgres` is implied by `db_url`. DuckDB is the analytical
+    /// replica of the micro-VM worker, built in with `-Dduckdb=true`.
+    engine: storage.Engine = .sqlite,
     principal: []const u8,
     /// Parents FIRST is still the recommended order — but since §10cp the seed
     /// runs with foreign_keys OFF (chains are per-table snapshots cut at different
@@ -248,10 +252,22 @@ pub const SyncClient = struct {
         };
         errdefer self.arena.deinit();
 
-        self.st = if (opts.db_url) |url| try storage.Storage.openPostgres(url, false) else try storage.Storage.open(opts.db_path);
+        self.st = if (opts.db_url) |url|
+            try storage.Storage.openPostgres(url, false)
+        else if (opts.engine == .duckdb)
+            try storage.Storage.openDuckdb(opts.db_path)
+        else
+            try storage.Storage.open(opts.db_path);
         errdefer self.st.close();
-        // After the read-write open: that is what creates the file.
-        self.ro = if (opts.db_url) |url| try storage.Storage.openPostgres(url, true) else try storage.Storage.openReadOnly(opts.db_path);
+        // After the read-write open: that is what creates the file. DuckDB allows one
+        // open of a file per process, so the card's handle is a second connection on
+        // the same database (the read-only rule is the SQL guard, core.isReadOnlySql).
+        self.ro = if (opts.db_url) |url|
+            try storage.Storage.openPostgres(url, true)
+        else if (opts.engine == .duckdb)
+            try storage.Storage.openDuckdbShared(&self.st)
+        else
+            try storage.Storage.openReadOnly(opts.db_path);
         errdefer self.ro.close();
 
         // Before the transport: the grammar is compiled in (§10dq), and a hash
@@ -390,7 +406,7 @@ pub const SyncClient = struct {
         // measured 2026-08-29: a refused table's 97-byte suspension reached this
         // function and took a Python process down. Unusable → an error the caller
         // logs and skips; the replica keeps what it has.
-        const cols_v = descriptorColumns(val, st.engine) orelse return error.SchemaUnusable;
+        const cols_v = (try descriptorColumns(a, val, st.engine)) orelse return error.SchemaUnusable;
         const pk = try jsonStrList(a, val.object.get("pk_columns"));
         var names: std.ArrayList([]const u8) = .empty;
         for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
@@ -554,13 +570,44 @@ pub const SyncClient = struct {
     /// The descriptor's column block for this engine: `sqlite` (its types are SQLite's)
     /// or `pg` (PostgreSQL's own `format_type` spellings — usable in CREATE TABLE as
     /// they are, PostGIS and arrays included).
-    fn descriptorColumns(val: Value, engine: storage.Engine) ?Value {
+    fn descriptorColumns(a: std.mem.Allocator, val: Value, engine: storage.Engine) !?Value {
         if (val != .object) return null;
-        const sq = val.object.get(if (engine == .postgres) "pg" else "sqlite") orelse return null;
+        const sq = val.object.get(if (engine == .sqlite) "sqlite" else "pg") orelse return null;
         if (sq != .object) return null;
         const cols = sq.object.get("columns") orelse return null;
         if (cols != .array) return null;
-        return cols;
+        if (engine != .duckdb) return cols;
+        // §10fl: DuckDB reads PostgreSQL's type names for most types; the few it
+        // does not are mapped here on a copy of the column list.
+        var out = std.json.Array.init(a);
+        for (cols.array.items) |c| {
+            if (c != .object) {
+                try out.append(c);
+                continue;
+            }
+            var copy = try c.object.clone(a);
+            if (c.object.get("type")) |t| if (t == .string) try copy.put(a, "type", .{ .string = try duckdbType(a, t.string) });
+            try out.append(.{ .object = copy });
+        }
+        return .{ .array = out };
+    }
+
+    /// §10fl: a PostgreSQL type (format_type's spelling) as DuckDB's. Most names
+    /// are DuckDB's too (integer, bigint, boolean, text, uuid, timestamp with time
+    /// zone, double precision, text[]); the rest: bytes and PostGIS as BLOB, pgvector
+    /// as a fixed FLOAT array (sparsevec as the wire's BLOB), json as JSON, a
+    /// numeric with a modifier as the same DECIMAL, one without as DECIMAL(38,10)
+    /// (DuckDB has no unbounded decimal), bit as BIT.
+    pub fn duckdbType(a: std.mem.Allocator, pg: []const u8) ![]const u8 {
+        const bare = if (std.mem.indexOfScalar(u8, pg, '(')) |i| pg[0..i] else pg;
+        const mod: ?[]const u8 = if (std.mem.indexOfScalar(u8, pg, '(')) |i| pg[i + 1 .. (std.mem.lastIndexOfScalar(u8, pg, ')') orelse pg.len)] else null;
+        if (std.mem.eql(u8, bare, "bytea") or std.mem.eql(u8, bare, "geometry") or std.mem.eql(u8, bare, "geography") or std.mem.eql(u8, bare, "sparsevec")) return "BLOB";
+        if (std.mem.eql(u8, bare, "vector") or std.mem.eql(u8, bare, "halfvec")) return if (mod) |m| try std.fmt.allocPrint(a, "FLOAT[{s}]", .{m}) else "FLOAT[]";
+        if (std.mem.eql(u8, bare, "json") or std.mem.eql(u8, bare, "jsonb")) return "JSON";
+        if (std.mem.eql(u8, bare, "numeric") or std.mem.eql(u8, bare, "decimal")) return if (mod) |m| try std.fmt.allocPrint(a, "DECIMAL({s})", .{m}) else "DECIMAL(38,10)";
+        if (std.mem.eql(u8, bare, "bit") or std.mem.eql(u8, bare, "bit varying")) return "BIT";
+        if (std.mem.eql(u8, bare, "tsvector") or std.mem.eql(u8, bare, "xml")) return "TEXT";
+        return pg;
     }
 
     /// §10fe: the PostGIS columns named by the descriptor's `pg` block.
@@ -631,8 +678,8 @@ pub const SyncClient = struct {
     /// literal — in place, on the copy the caller holds. §10fg: and the pgvector
     /// columns' bytes (the `$bin` marker) become pgvector's text form.
     fn pgArrayFixup(self: *SyncClient, a: std.mem.Allocator, st: TableState, data: *Value) !void {
-        if (self.st.engine != .postgres or data.* != .object) return;
-        for (st.array_cols) |col| {
+        if ((self.st.engine != .postgres and self.st.engine != .duckdb) or data.* != .object) return;
+        if (self.st.engine == .postgres) for (st.array_cols) |col| {
             const v = data.object.get(col) orelse continue;
             const lit: []const u8 = switch (v) {
                 .string => |txt| try jsonArrayToLiteral(a, txt),
@@ -640,8 +687,9 @@ pub const SyncClient = struct {
                 else => continue,
             };
             try data.object.put(a, col, .{ .string = lit });
-        }
+        };
         for (st.vec_cols) |vc| {
+            if (self.st.engine == .duckdb and vc.kind == .sparsevec) continue;
             const v = data.object.get(vc.name) orelse continue;
             const bytes = try binOf(a, v) orelse continue;
             try data.object.put(a, vc.name, .{ .string = try core.vecLiteral(a, vc.kind, bytes, vc.bits) });
@@ -671,7 +719,7 @@ pub const SyncClient = struct {
     fn execSql(st: *storage.Storage, a: std.mem.Allocator, sql: []const u8) !void {
         // §10fd: a rebuild drops a table other tables may reference; PostgreSQL wants
         // that said (SQLite has the FK pragma off for the duration instead).
-        if (st.engine == .postgres and std.mem.startsWith(u8, sql, "DROP TABLE IF EXISTS ") and std.mem.indexOf(u8, sql, "CASCADE") == null) {
+        if ((st.engine == .postgres or st.engine == .duckdb) and std.mem.startsWith(u8, sql, "DROP TABLE IF EXISTS ") and std.mem.indexOf(u8, sql, "CASCADE") == null) {
             const body = std.mem.trimEnd(u8, sql, "; ");
             _ = try st.query(a, try std.fmt.allocPrint(a, "{s} CASCADE;", .{body}), &.{});
             return;
@@ -739,7 +787,7 @@ pub const SyncClient = struct {
         }
 
         const pk = try jsonStrList(a, val.object.get("pk_columns"));
-        const cols_v = descriptorColumns(val, self.st.engine).?; // checked by migrateTable above
+        const cols_v = (try descriptorColumns(a, val, self.st.engine)).?; // checked by migrateTable above
         var names: std.ArrayList([]const u8) = .empty;
         for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
         const tenant_col: ?[]const u8 = if (val.object.get("tenant_column")) |v| (if (v == .string) v.string else null) else null;
@@ -1106,7 +1154,66 @@ pub const SyncClient = struct {
     /// §10fe: the chunk as COPY text — one line per live row, tab-separated, `\\N` for
     /// null, backslash, tab, newline and return escaped — into the table itself for
     /// a full, into a temporary table then the upsert for a delta.
+    /// §10fl: DuckDB's bulk path — the appender, through a temp table of the chain's
+    /// column order, then one INSERT … SELECT (a full) or the upsert (a delta). The
+    /// appender wants rows in the target's column order, and `_zbz_copy` is created
+    /// in the chain's, so no mapping; it casts text into lists, arrays, timestamps
+    /// and decimals itself (measured). Tombstones keep their per-row DELETE.
+    fn applyAppendStep(cs: ChainStep, st: *storage.Storage, row_arena: *std.heap.ArenaAllocator) !void {
+        var chunk_arena = std.heap.ArenaAllocator.init(cs.client.a);
+        defer chunk_arena.deinit();
+        const ca = chunk_arena.allocator();
+        var rows: std.ArrayListUnmanaged([]const storage.Value) = .empty;
+        for (cs.order[cs.from..cs.to]) |ri| {
+            _ = row_arena.reset(.retain_capacity);
+            const ra = row_arena.allocator();
+            var cur = MpCursor{ .bytes = cs.bytes, .off = cs.offsets[ri] };
+            const row = try cur.readValue(ra);
+            if (row != .arr) return error.ChainObjectMalformed;
+            const cells = row.arr;
+            if (cs.tomb_idx) |ti| if (ti < cells.len and cells[ti] != .nil) {
+                var keyed: std.json.ObjectMap = .empty;
+                for (cs.pk) |pc| {
+                    for (cs.cols, 0..) |c, i| if (std.mem.eql(u8, c, pc) and i < cells.len) {
+                        try keyed.put(ra, pc, try mpToJson(ra, cells[i]));
+                    };
+                }
+                if (try core.planDelete(ra, cs.table, cs.pk, .{ .object = keyed })) |stp| {
+                    _ = try cs.client.stepExec(ra, stp);
+                }
+                continue;
+            };
+            // ⚠️ Copied into the chunk arena: a text or blob value from the payload is a
+            // slice into the row arena, which the next row resets (measured: a chain
+            // row's JSON array reached the appender truncated).
+            const params = try ca.alloc(storage.Value, cs.cols.len);
+            for (params, 0..) |*p, i| {
+                const v: storage.Value = if (i < cells.len) try payloadToStorage(ra, cells[i]) else .null;
+                p.* = switch (v) {
+                    .text => |t| .{ .text = try ca.dupe(u8, t) },
+                    .blob => |b| .{ .blob = try ca.dupe(u8, b) },
+                    else => v,
+                };
+            }
+            for (cs.vec_idx) |vi| if (vi.i < params.len and params[vi.i] == .blob) {
+                params[vi.i] = .{ .text = try core.vecLiteral(ca, vi.kind, params[vi.i].blob, vi.bits) };
+            };
+            try rows.append(ca, params);
+        }
+        if (rows.items.len == 0) return;
+        const col_list = try core.quotedJoin(cs.a, cs.cols);
+        try st.execSimple(try std.fmt.allocPrint(ca, "CREATE OR REPLACE TEMP TABLE _zbz_copy AS SELECT {s} FROM {s} LIMIT 0", .{ col_list, cs.table }));
+        try st.dkAppend("_zbz_copy", rows.items);
+        if (cs.is_full) {
+            try st.execSimple(try std.fmt.allocPrint(ca, "INSERT INTO {s} ({s}) SELECT {s} FROM _zbz_copy", .{ cs.table, col_list, col_list }));
+        } else {
+            try st.execSimple(cs.copy_upsert_sql);
+        }
+        try st.execSimple("DROP TABLE _zbz_copy");
+    }
+
     fn applyCopyStep(cs: ChainStep, st: *storage.Storage, row_arena: *std.heap.ArenaAllocator) !void {
+        if (st.engine == .duckdb) return applyAppendStep(cs, st, row_arena);
         // One text buffer for the whole step, reused chunk after chunk: a buffer built
         // fresh per chunk by doubling left every freed size behind in the allocator's
         // cache — measured 590 MB over the document at 50,000 rows a chunk, 43 MB at
@@ -1422,8 +1529,8 @@ pub const SyncClient = struct {
                 const to = @min(from + chunk, idx.offsets.len);
                 const cs = shape.step(self, step_a, blob, idx.offsets, order, from, to, from == 0, &copy_buf);
                 self.st.transaction(cs, ChainStep.apply) catch |err| {
-                    std.debug.print("{s}: chain step {s} ({s}, rows {d}..{d} of {d}) rolled back: {any}\n", .{
-                        table, step.object.get("name").?.string, if (is_full) "full" else "delta", from, to, idx.offsets.len, err,
+                    std.debug.print("{s}: chain step {s} ({s}, rows {d}..{d} of {d}) rolled back: {any} — {s}\n", .{
+                        table, step.object.get("name").?.string, if (is_full) "full" else "delta", from, to, idx.offsets.len, err, self.st.errMsg(),
                     });
                     return err;
                 };
@@ -1786,9 +1893,14 @@ pub const SyncClient = struct {
             if (indexOf(cols, gc)) |i| try geom_idx_list.append(a, i);
         };
         var vec_idx_list: std.ArrayListUnmanaged(VecIdx) = .empty;
-        if (self.st.engine == .postgres) for (st.vec_cols) |vc| {
+        // §10fl: DuckDB takes a vector as its list text (`[1,2,3]` into FLOAT[n], '101'
+        // into BIT) and keeps a sparsevec as the wire's BLOB; arrays stay JSON text,
+        // which DuckDB casts to a list itself.
+        if (self.st.engine == .postgres or self.st.engine == .duckdb) for (st.vec_cols) |vc| {
+            if (self.st.engine == .duckdb and vc.kind == .sparsevec) continue;
             if (indexOf(cols, vc.name)) |i| try vec_idx_list.append(a, .{ .i = i, .kind = vc.kind, .bits = vc.bits });
         };
+        const bulk = self.st.engine == .postgres or self.st.engine == .duckdb;
         return .{
             .table = table,
             .sql = if (is_full) try core.chainInsertSql(a, table, cols) else try core.chainUpsertSql(a, table, cols, st.pk, vcol),
@@ -1799,8 +1911,8 @@ pub const SyncClient = struct {
             .array_idx = array_idx_list.items,
             .geom_idx = geom_idx_list.items,
             .vec_idx = vec_idx_list.items,
-            .copy = self.st.engine == .postgres,
-            .copy_upsert_sql = if (self.st.engine == .postgres) try core.pgUpsertFromCopySql(a, table, cols, st.pk, vcol) else "",
+            .copy = bulk,
+            .copy_upsert_sql = if (bulk) try core.pgUpsertFromCopySql(a, table, cols, st.pk, vcol) else "",
         };
     }
 
@@ -3038,13 +3150,37 @@ pub fn ensureInbox(st: *storage.Storage) !void {
 /// autoincrement key is a BIGSERIAL and every INTEGER a BIGINT (an LSN as a number
 /// does not fit int4).
 pub fn execDdl(st: *storage.Storage, sql: []const u8) !void {
-    if (st.engine != .postgres) return st.execSimple(sql);
+    if (st.engine == .sqlite) return st.execSimple(sql);
     const a = std.heap.c_allocator;
+    if (st.engine == .duckdb) {
+        // §10fl: no serial — a sequence, created first when the inbox needs one.
+        if (std.mem.indexOf(u8, sql, "INTEGER PRIMARY KEY AUTOINCREMENT") != null) try st.execSimple("CREATE SEQUENCE IF NOT EXISTS _zbz_inbox_seq");
+        const d1 = try std.mem.replaceOwned(u8, a, sql, "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGINT PRIMARY KEY DEFAULT nextval('_zbz_inbox_seq')");
+        defer a.free(d1);
+        const d2 = try std.mem.replaceOwned(u8, a, d1, " INTEGER", " BIGINT");
+        defer a.free(d2);
+        return st.execSimple(d2);
+    }
     const s1 = try std.mem.replaceOwned(u8, a, sql, "INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY");
     defer a.free(s1);
     const s2 = try std.mem.replaceOwned(u8, a, s1, " INTEGER", " BIGINT");
     defer a.free(s2);
     return st.execSimple(s2);
+}
+
+test "duckdbType: PostgreSQL's spellings as DuckDB's (§10fl)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("BLOB", try SyncClient.duckdbType(a, "bytea"));
+    try std.testing.expectEqualStrings("BLOB", try SyncClient.duckdbType(a, "geometry(Point,4326)"));
+    try std.testing.expectEqualStrings("FLOAT[3]", try SyncClient.duckdbType(a, "vector(3)"));
+    try std.testing.expectEqualStrings("JSON", try SyncClient.duckdbType(a, "jsonb"));
+    try std.testing.expectEqualStrings("DECIMAL(12,4)", try SyncClient.duckdbType(a, "numeric(12,4)"));
+    try std.testing.expectEqualStrings("DECIMAL(38,10)", try SyncClient.duckdbType(a, "numeric"));
+    try std.testing.expectEqualStrings("BIT", try SyncClient.duckdbType(a, "bit(8)"));
+    try std.testing.expectEqualStrings("text[]", try SyncClient.duckdbType(a, "text[]"));
+    try std.testing.expectEqualStrings("timestamp with time zone", try SyncClient.duckdbType(a, "timestamp with time zone"));
 }
 
 /// §10fd: a JSON array text (the wire's array form, §10ey) as PostgreSQL's array

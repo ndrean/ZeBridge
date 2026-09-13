@@ -842,7 +842,9 @@ BEGIN
                  'columns', COALESCE((
                      SELECT jsonb_agg(jsonb_build_object(
                               'name', c.column_name,
-                              'type', format_type(a.atttypid, a.atttypmod),
+                              -- §10fl: with the declared dimensions (`int[][]` is `integer[]` to
+                              -- format_type; attndims keeps the count) — a DuckDB list is typed by depth
+                              'type', format_type(a.atttypid, a.atttypmod) || repeat('[]', greatest(a.attndims - 1, 0)),
                               -- Required-ness, so a client can build a valid INSERT.
                               -- Without these the descriptor said which columns exist and
                               -- not which ones a write must carry: an omitted NOT NULL

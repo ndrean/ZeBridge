@@ -63,6 +63,9 @@ bridge_nats_publishes_total 213
 bridge_nats_publish_ack_seconds_total 0.104422
 bridge_gc_total_reaped_total 3371
 bridge_gc_last_sweep_timestamp_seconds 1757170050
+bridge_ingress_rate_per_principal 20
+bridge_ingress_rate_burst 20
+bridge_ingress_rate_limited_total 180
 bridge_fleet_poll_timestamp_seconds 1757170200
 bridge_fleet_clients_live_total 3
 bridge_fleet_clients_live{tenant="kilo"} 2
@@ -108,6 +111,7 @@ The four worth alerting on:
 | `bridge_replication_slot_retained_wal_bytes{slot,type,self}` | growing for an inactive slot | WAL PostgreSQL keeps for that slot; every slot on the server, not only this bridge's |
 | `bridge_cdc_window_short{stream}` | `== 1` | that stream holds less than two generation cadences and is pruning: a client that falls off it can find a chain that predates it and waits. Raise `CDC_MAX_BYTES` / `CDC_MAX_MSGS` if `bridge_cdc_stream_bytes` or `_messages` sits at a cap, `CDC_MAX_AGE_SECONDS` otherwise |
 | `bridge_wal_confirmed_lag_bytes` | rising steadily | **the bridge is behind**: WAL it has not confirmed yet. This is the backlog number. |
+| `bridge_ingress_rate_limited_total` | `increase()` for minutes | a principal is living at its write ceiling (`MUTATION_RATE_PER_PRINCIPAL`, §10fk); its writes are still served, at the rate, and the log line names it. Minutes of it from one principal is the evidence a revocation is made on. `bridge_ingress_rate_per_principal` and `_burst` are the knobs as the bridge runs them, 0 when the limit is off |
 | `bridge_wal_lag_bytes` | large and growing across checkpoints | WAL PostgreSQL is _retaining_ on disk for the slot, until `max_slot_wal_keep_size` |
 | `bridge_connected` | `== 0` | the replication stream is down |
 
@@ -164,9 +168,14 @@ scrape_configs:
   "refused_tables": 0,
   "refused_events_dropped": 0,
   "gc_total_reaped": 3371,
-  "gc_last_sweep_time": 1757170050
+  "gc_last_sweep_time": 1757170050,
+  "ingress_rate_per_principal": 20,
+  "ingress_rate_burst": 20,
+  "ingress_rate_limited_total": 180
 }
 ```
+
+The three `ingress_*` fields are what `zbdoctor` reads to check the MUTATIONS stream's own policy (`MUTATION_BACKLOG_PER_PRINCIPAL`, set where NATS is set up) against the rate the bridge declares: how long a full backlog drains.
 
 </details>
 

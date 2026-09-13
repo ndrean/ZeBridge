@@ -33,6 +33,26 @@ pub fn build(b: *std.Build) void {
     translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include", "postgresql" }) });
     const c_mod = translate_c.createModule();
 
+    // §10fl: the DuckDB engine, a build-time switch. Off by default and always off
+    // on a phone: libduckdb is a 50 MB analytics library the micro-VM worker links
+    // (Homebrew keg on macOS, the release zip unpacked under a prefix on Linux) and
+    // nothing else needs. On, `duckdb.h` is translated as its own module.
+    const with_duckdb = b.option(bool, "duckdb", "Build the DuckDB storage engine (needs libduckdb)") orelse false;
+    const duckdb_prefix: []const u8 = b.option([]const u8, "duckdb-prefix", "System DuckDB prefix") orelse
+        (if (builtin.os.tag == .macos) "/opt/homebrew/opt/duckdb" else "/usr/local");
+    const build_opts = b.addOptions();
+    build_opts.addOption(bool, "duckdb", with_duckdb);
+    const duckdb_mod: *std.Build.Module = if (with_duckdb) blk: {
+        const tc = b.addTranslateC(.{
+            .root_source_file = b.path("src/duckdb_includes.h"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        tc.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "include" }) });
+        break :blk tc.createModule();
+    } else b.createModule(.{ .root_source_file = b.path("src/duckdb_stub.zig"), .target = target, .optimize = optimize });
+
     const nats_dep = b.dependency("nats", .{ .target = target, .optimize = optimize });
     const msgpack_dep = b.dependency("zig_msgpack", .{ .target = target, .optimize = optimize });
 
@@ -53,6 +73,12 @@ pub fn build(b: *std.Build) void {
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
     mod.linkSystemLibrary("pq", .{});
     mod.link_libc = true;
+    mod.addImport("duckdb", duckdb_mod);
+    mod.addOptions("build_options", build_opts);
+    if (with_duckdb) {
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
+        mod.linkSystemLibrary("duckdb", .{});
+    }
 
     // The C-ABI shared library: one JSON dispatch entrypoint (zb_call) +
     // zb_free. Hosts: Python (ctypes), and later Dart/Swift/Kotlin/.NET FFI.
@@ -81,6 +107,12 @@ pub fn build(b: *std.Build) void {
     demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
     demo_mod.linkSystemLibrary("pq", .{});
     demo_mod.link_libc = true;
+    demo_mod.addImport("duckdb", duckdb_mod);
+    demo_mod.addOptions("build_options", build_opts);
+    if (with_duckdb) {
+        demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
+        demo_mod.linkSystemLibrary("duckdb", .{});
+    }
     const demo = b.addExecutable(.{ .name = "zb-demo", .root_module = demo_mod });
     b.installArtifact(demo);
 
@@ -103,7 +135,38 @@ pub fn build(b: *std.Build) void {
     soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
     soak_mod.linkSystemLibrary("pq", .{});
     soak_mod.link_libc = true;
+    soak_mod.addImport("duckdb", duckdb_mod);
+    soak_mod.addOptions("build_options", build_opts);
+    if (with_duckdb) {
+        soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
+        soak_mod.linkSystemLibrary("duckdb", .{});
+    }
     b.installArtifact(b.addExecutable(.{ .name = "zb-soak", .root_module = soak_mod }));
+
+    // `zb sync` (§10fl): the replica as a command — the micro-VM worker's boot.
+    const zb_mod = b.createModule(.{
+        .root_source_file = b.path("src/zb.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zb_mod.addImport("c", c_mod);
+    zb_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
+    zb_mod.addImport("nats", nats_dep.module("nats"));
+    zb_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
+    zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+    zb_mod.linkSystemLibrary("sqlite3", .{});
+    zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+    zb_mod.linkSystemLibrary("zstd", .{});
+    zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+    zb_mod.linkSystemLibrary("pq", .{});
+    zb_mod.link_libc = true;
+    zb_mod.addImport("duckdb", duckdb_mod);
+    zb_mod.addOptions("build_options", build_opts);
+    if (with_duckdb) {
+        zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ duckdb_prefix, "lib" }) });
+        zb_mod.linkSystemLibrary("duckdb", .{});
+    }
+    b.installArtifact(b.addExecutable(.{ .name = "zb", .root_module = zb_mod }));
 
     const tests = b.addTest(.{ .root_module = mod });
     const run_tests = b.addRunArtifact(tests);

@@ -7,7 +7,7 @@ lifecycle lesson learned in one is not silently missing from the other.
 | --- | --- | --- |
 | language | Zig core + shell, C ABI | TypeScript core + shell |
 | hosts | Python, Node (ctypes/FFI), Flutter (Dart FFI) | browser, Node |
-| local engine | SQLite (a file), or PostgreSQL (`dbUrl`, §10fd; seeds through COPY, §10fe) | SQLite (sqlocal, better-sqlite3), PGlite |
+| local engine | SQLite (a file), PostgreSQL (`dbUrl`, §10fd; seeds through COPY, §10fe), or DuckDB (`engine: "duckdb"`, §10fl; built in with `-Dduckdb=true`; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
 | tables followed | the explicit `tables` list | every key in the `schemas` bucket, or the `tables` list when given (§10fb) |
 
@@ -92,7 +92,7 @@ row a rule is named.
 | the streaming seed (`seedStreaming`) | opt-in: the object read through a pull consumer eight chunks at a time and inflated through a window; on SQLite the rows are staged in a temp table, one index build sorts them on disk, pages come back in key order; 3 M rows in 23 s at 329 MB peak (the whole-object path: 11 s, 1.1 GB); a step below `seedStreamingAboveBytes` compressed (8 MiB) takes the whole-object path, so a delta never streams | not built: the browser and Node hold the document (a phone runs libzb) | §10fh |
 | arrays | JSON text as the wire carries it (`json_extract` reads it); a local write stores JSON text too | SQLite: same; PGlite: the JSON text becomes the array literal on apply (`pgArrayValues`), native arrays in the replica | §10ey |
 | bytes (`bytea`, PostGIS) | BLOB; the host sees and sends `{"$bin": "<base64>"}` on the JSON card | BLOB; `Uint8Array` in and out (the Node example prints the same `$bin` marker) | §10ex |
-| pgvector (`vector`, `halfvec`, `sparsevec`), `bit(n)` | BLOB in the wire's normalised shape (sqlite-vec reads it); on the PostgreSQL engine, pgvector's text form on every apply (`core.vecLiteral`) | BLOB (`Uint8Array`); on the postgres dialect, the text form on apply (`vecLiteral`) | §10fg |
+| pgvector (`vector`, `halfvec`, `sparsevec`), `bit(n)` | BLOB in the wire's normalised shape (sqlite-vec reads it); on the PostgreSQL engine, pgvector's text form on every apply (`core.vecLiteral`); on DuckDB `vector`/`halfvec` are `FLOAT[n]` from the list text, `bit` is `BIT`, `sparsevec` stays the BLOB | BLOB (`Uint8Array`); on the postgres dialect, the text form on apply (`vecLiteral`) | §10fg, §10fl |
 | survives its host killed mid-seed | proven (`client_kill.py`) | not tested | §10ce |
 | killed mid-migration: first sight drops the watermark, a half-finished rebuild is adopted, no shape record → the physical key decides | ✓ | ✓ | §10dj `rebuild_kill` |
 | `query()` cannot write — the bookkeeping is out of the application's reach | ✓ a READONLY SQLite connection | ✓ a read-only connection on Node; `core.isReadOnlySql` where there is one handle (OPFS, PGlite) | §10di, `outbox_break` |

@@ -50,7 +50,7 @@ The `TS` library uses a push model for reactivity whilst the Zig C ABI library u
 
 * Mobile Native Apps: Utilizing native SQLite with file system storage.
 * Browsers and Webapps: Leveraging OPFS support for sqlite-wasm or PGlite.
-* Backend Services /  micro-VM: Running native SQLite or standard PostgreSQL with their local database. For example, a micro-VM seeds (or is kept warm in sync) and can start a DuckDB analytical job against a local SQLite replica that keeps syncing.
+* Backend Services /  micro-VM: Running native SQLite, standard PostgreSQL or DuckDB with their local database. For example, a micro-VM seeds (or is kept warm in sync) into a DuckDB file straight from the wire, runs its analytical job and exports Parquet, without PostgreSQL ever seeing the fleet.
 
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
@@ -1222,6 +1222,7 @@ final zb = await ZeBridgeWorker.spawn({
   "seedStreaming": false,               // true on a phone: the chain object is never held inflated (3 M rows: 329 MB peak instead of 1.1 GB, 23 s instead of 11)
   "seedStreamingAboveBytes": 8388608,   // with seedStreaming: a step whose compressed object is smaller takes the faster whole-object path (deltas always do)
   // "dbUrl": "postgres://user@host/db", // instead of dbPath: the replica on a PostgreSQL server (a libpq URL) — the micro-VM case
+  // "engine": "duckdb",                 // dbPath is a .duckdb file: the analytical replica (libzb built with -Dduckdb=true; DuckDB opens the file once the client closes it)
 });
 print(zb.tenant);                       // resolved by the worker's first sync
 

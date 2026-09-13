@@ -320,7 +320,10 @@ would otherwise accept it. Check `suspended` before `writable`.
   logs, caches, forwarding.
 * `pg.columns[].type` is **`format_type(atttypid, atttypmod)`** — the type as PostgreSQL
   spells it, *with* modifiers: `bigint`, `character varying(255)`, `numeric(20,8)`,
-  `timestamp with time zone`, `integer[]`.
+  `timestamp with time zone`, `integer[]` — and with the declared array dimensions,
+  which `format_type` drops: a column declared `int[][]` is `integer[][]` here
+  (`attndims`). A PostgreSQL replica reads that as it reads `integer[]`; a DuckDB
+  replica needs the depth, its lists being typed by it.
 
   ⚠️ **Not `information_schema.data_type`**, which this document claimed for a long time
   and which differs materially: it reports `numeric` for `numeric(20,8)` and — the one that

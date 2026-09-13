@@ -387,6 +387,9 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     const db_url_raw = str.get(o, "dbUrl", "");
     const db_url: ?[:0]u8 = if (db_url_raw.len > 0) try a.dupeZ(u8, db_url_raw) else null;
     errdefer if (db_url) |u| a.free(u);
+    // engine (§10fl): "sqlite" (default) or "duckdb", both on dbPath; dbUrl implies postgres.
+    const engine_s = str.get(o, "engine", "sqlite");
+    const engine: client.storage.Engine = if (std.mem.eql(u8, engine_s, "duckdb")) .duckdb else .sqlite;
     const principal = try a.dupeZ(u8, str.get(o, "principal", ""));
     errdefer a.free(principal);
     const client_id = try a.dupeZ(u8, str.get(o, "clientId", "zig-client"));
@@ -441,6 +444,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .seed_streaming_above = seed_streaming_above,
             .db_path = db,
             .db_url = if (db_url) |u| u.ptr else null,
+            .engine = engine,
             .principal = principal,
             .tables = tables,
             .client_id = client_id,

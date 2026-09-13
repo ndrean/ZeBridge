@@ -11779,6 +11779,74 @@ cannot be edited on an existing stream: an existing deployment recreates MUTATIO
 (two hours of stored verdicts and dead letters go with it; the mutations themselves
 are consumed within seconds).
 
+## 10fl. The DuckDB engine and `zb sync --once`: the micro-VM worker (2026-09-13)
+
+The user's vision (2026-09-12): a micro-VM boots, seeds DuckDB from the chain
+through libzb, runs one analytic job, exits — PostgreSQL never sees the fleet, the
+chain object is read once per worker from the object store. Two pieces: a third
+storage engine, and the replica as a command.
+
+**The engine.** `duckdb.h` comes from the host like sqlite3, zstd and libpq (the
+Homebrew keg on macOS, the release zip under a prefix on Linux), behind
+`-Dduckdb=true`: off by default and always off on a phone, libduckdb being a 50 MB
+analytics library; every DuckDB path sits behind `build_options.duckdb`, the header
+is translated as its own module, a stub stands in otherwise. `storage.Engine.duckdb`:
+one database, two connections (DuckDB allows one open of a file per process, the
+card's handle is a second connection on the same database, the read-only rule is
+`core.isReadOnlySql`); `?` placeholders are DuckDB's own; a parameterless statement
+runs as a plain `duckdb_query` — a prepared `CREATE OR REPLACE … AS SELECT` executed
+but left the old table in place, and the appender then saw the old column count
+("Too many appends for chunk!", a morning's hunt); `BEGIN IMMEDIATE` is `BEGIN
+TRANSACTION`, PRAGMAs answer nothing, the session is UTC. The reader is
+`duckdb_read.zig`, on the chunk and vector API: the `duckdb_value_*` family is
+marked for removal in the header and was not safe (an empty string for a
+TIMESTAMP_TZ, zeros for a UUID from `duckdb_column_data`, then a crash in
+`duckdb_value_is_null`). Every type the wire produces is read from the vectors —
+decimals from their unscaled integer and scale, timestamps in PostgreSQL's text
+shape, UUIDs from the flipped hugeint, BIT from its padded string — and a list, a
+fixed array or a struct is rendered as JSON text, the wire's own array form, so a
+DuckDB replica reads its lists the way a SQLite one does.
+
+**The types.** The descriptor's `pg` block, most of whose names DuckDB reads as
+they are; `duckdbType` maps the rest: bytea, PostGIS and sparsevec to BLOB,
+vector/halfvec to `FLOAT[n]`, json to JSON, `numeric(p,s)` to `DECIMAL(p,s)` and a
+bare numeric to `DECIMAL(38,10)`, bit to BIT. One gap the first run found:
+`format_type` drops array dimensions, so `int[][]` was `integer[]` and DuckDB got a
+one-level list for the wire's nested JSON; the descriptor now spells the declared
+dimensions from `attndims` (`integer[][]`), which every consumer already handled.
+Arrays stay the wire's JSON text — DuckDB casts VARCHAR into a list itself, nested
+too — vectors go in as list text, sparsevec stays the BLOB.
+
+**The apply.** A seed goes through the appender: rows into a temp table created
+`AS SELECT <the chain's columns> FROM t LIMIT 0` (so the appender's column order is
+the chain's, no mapping), then `INSERT … SELECT` for a full or the same
+upsert-from-copy SQL the PostgreSQL engine uses for a delta — `excluded` and the
+version guard's WHERE are DuckDB's too. The appender casts text into lists, arrays,
+timestamps, decimals and UUIDs (measured), and one row must own its bytes: a
+payload slice into the row arena reached the appender truncated after the next
+row's reset. CDC and the optimistic apply take the per-row prepared INSERT.
+
+**The command.** `zb sync --creds … --principal … --tables … --db x.duckdb --engine
+duckdb --once` (libzb/src/zb.zig, a fourth binary): connect, `syncOnce`, then poll
+until every table has its watermark and no chain is pending, print one JSON line
+(tenant, engine, seconds, rows per table) and exit; without `--once` it follows.
+`--stream` takes the streaming seed, `--db-url` the PostgreSQL engine. No Python,
+no nats CLI.
+
+**Measured.** `scripts/scenarios/duckdb_replica.py`, nine checks: DuckDB's types
+from the `pg` block (VARCHAR[], INTEGER[][], JSON, BLOB, FLOAT[3], DECIMAL(12,4),
+TIMESTAMP WITH TIME ZONE), the seed through the appender (a nested list element, a
+JSON field, the bytes' lengths, the vector's element), CDC, a client write with
+arrays, bytes and a vector landing in the master and echoing back natively, typed
+cells on the card; then libzb closes and DuckDB opens the file for a group-by and a
+Parquet export that reads back whole. And the worker itself: `zb sync --once` on the
+3 M-row test_types chain — 3,055,002 rows in 32 s (apply 28.6 s through the
+appender), peak RSS 1.09 GB (the whole-object seed; `--stream` for a small VM), a
+484 MB `.duckdb` file; DuckDB then answers the group-by in 41 ms (856 ms on the
+SQLite attach of example 07) and exports 150 MB of Parquet in 0.7 s. The
+PostgreSQL replica and arrays scenarios unchanged by the dimension change. Not the
+TypeScript client: DuckDB-WASM is a natural fourth dialect there, later.
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

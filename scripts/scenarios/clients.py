@@ -18,7 +18,7 @@ def fresh_sqlite(path):
 
 class Lib:
     """The libzb client, host-driven: every observation is a poll."""
-    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None):
+    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None, engine=None):
         if not LIBZB.exists():
             sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
         self.lib = lib = ctypes.CDLL(str(LIBZB))
@@ -38,7 +38,8 @@ class Lib:
             "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0,
             **({"dbUrl": db_url} if db_url else {}), **({"seedStreaming": True} if seed_streaming else {}),
             **({"seedChunkRows": seed_chunk_rows} if seed_chunk_rows is not None else {}),
-            **({"seedStreamingAboveBytes": seed_streaming_above} if seed_streaming_above is not None else {})}).encode())
+            **({"seedStreamingAboveBytes": seed_streaming_above} if seed_streaming_above is not None else {}),
+            **({"engine": engine} if engine else {})}).encode())
         if not self.h: sys.exit("libzb open failed")
         r = self.take(lib.zb_client_sync(self.h))
         self.sync_error = r.get("error")
@@ -53,7 +54,7 @@ class Lib:
         return self.last_poll
     def q(self, sql, params=()):
         r = self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
-        if "error" in r: raise RuntimeError(r["error"])
+        if "error" in r: raise RuntimeError(f"{r['error']}: {r['detail']}" if r.get("detail") else r["error"])
         return r["rows"]
     def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
     def mutate(self, table, op, key, values=None, version=None):
@@ -96,7 +97,7 @@ class Node:
         line = self.p.stdout.readline()
         if not line: raise RuntimeError("node worker exited")
         r = json.loads(line)
-        if "error" in r: raise RuntimeError(r["error"])
+        if "error" in r: raise RuntimeError(f"{r['error']}: {r['detail']}" if r.get("detail") else r["error"])
         return [list(row.values()) for row in r["rows"]]
     def cols(self, t): return [r[0] for r in self.q(f"SELECT name FROM pragma_table_info('{t}')")]
     def mutate(self, table, op, key, values=None, version=None):
@@ -105,14 +106,14 @@ class Node:
         if not select.select([self.p.stdout], [], [], 60)[0]:
             raise RuntimeError("node worker silent for 60 s")
         r = json.loads(self.p.stdout.readline())
-        if "error" in r: raise RuntimeError(r["error"])
+        if "error" in r: raise RuntimeError(f"{r['error']}: {r['detail']}" if r.get("detail") else r["error"])
         return r["rows"][0]
     def _op(self, req):
         self.p.stdin.write(json.dumps(req) + "\n"); self.p.stdin.flush()
         if not select.select([self.p.stdout], [], [], 60)[0]:
             raise RuntimeError("node worker silent for 60 s")
         r = json.loads(self.p.stdout.readline())
-        if "error" in r: raise RuntimeError(r["error"])
+        if "error" in r: raise RuntimeError(f"{r['error']}: {r['detail']}" if r.get("detail") else r["error"])
         return r["rows"][0]
     def disconnect(self):
         """Hang up the socket (§10dp): writes made afterwards queue in the outbox."""

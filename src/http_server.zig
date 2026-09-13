@@ -507,6 +507,24 @@ pub const Server = struct {
         });
     }
 
+    /// §10fk: the ingress rate limit as the bridge runs it — the two knobs as gauges
+    /// (0 when off) and the refusals as a counter. `increase()` on the counter for
+    /// minutes is a principal living at its ceiling; the log names it.
+    fn writeIngressPrometheus(w: *std.Io.Writer, l: *const rate_limit.Limiter) !void {
+        try w.print(
+            \\# HELP bridge_ingress_rate_per_principal Writes per second one principal (and one tenant) may send; 0 = the limit is off
+            \\# TYPE bridge_ingress_rate_per_principal gauge
+            \\bridge_ingress_rate_per_principal {d}
+            \\# HELP bridge_ingress_rate_burst Writes a quiet principal may send at once
+            \\# TYPE bridge_ingress_rate_burst gauge
+            \\bridge_ingress_rate_burst {d}
+            \\# HELP bridge_ingress_rate_limited_total Writes the rate limit sent back to the queue (NAK with delay) or, past the delivery limit, answered rate_limited
+            \\# TYPE bridge_ingress_rate_limited_total counter
+            \\bridge_ingress_rate_limited_total {d}
+            \\
+        , .{ @as(u64, @intFromFloat(l.rate_per_s)), @as(u64, @intFromFloat(l.burst)), l.limited_total.load(.monotonic) });
+    }
+
     fn handleHealth(self: *Server, req: *std.http.Server.Request) !void {
         _ = self;
         try respond(req, .ok, "application/json", "{\"status\":\"ok\"}\n");
@@ -703,6 +721,7 @@ pub const Server = struct {
             if (self.refused) |r| try r.writePrometheus(&w);
             if (self.slots) |s| try s.writePrometheus(&w);
             if (self.fleet) |f| try f.writePrometheus(&w);
+            if (self.limiter) |l| try writeIngressPrometheus(&w, l);
 
             try respond(req, .ok, "text/plain", buf[0 .. body.len + w.buffered().len]);
         } else {

@@ -54,7 +54,13 @@ fn quietNotice(_: ?*anyopaque, _: [*c]const u8) callconv(.c) void {}
 /// host points at with a URL (the micro-VM case: a replica any PostgreSQL tool
 /// reads). One `Storage`, the client speaks one SQL to it, and the differences
 /// live here: placeholders, PRAGMAs, the catalogue questions, typed results.
-pub const Engine = enum { sqlite, postgres };
+/// §10fl: `duckdb` is the third engine — an analytical replica in a `.duckdb` file
+/// (the micro-VM worker's), built in with `-Dduckdb=true`. Every DuckDB path is
+/// behind `build_options.duckdb`, so the default build never references libduckdb.
+pub const Engine = enum { sqlite, postgres, duckdb };
+const build_options = @import("build_options");
+const dk = @import("duckdb");
+const duckdb_read = @import("duckdb_read.zig");
 
 pub const Storage = struct {
     engine: Engine = .sqlite,
@@ -69,6 +75,13 @@ pub const Storage = struct {
     pg_next: usize = 0,
     pg_err_buf: [512]u8 = undefined,
     pg_err_len: usize = 0,
+    // ── DuckDB (§10fl) ── opaque here so the struct compiles without the header.
+    dk_db: ?*anyopaque = null,
+    dk_con: ?*anyopaque = null,
+    /// The card's second connection shares the primary's database handle and must
+    /// not close it: DuckDB allows one open of a file per process, many connections.
+    dk_owns_db: bool = true,
+    dk_stmts: std.StringHashMapUnmanaged(*anyopaque) = .empty,
     /// Prepared-statement cache (§10cu). The CDC wire carries FULL rows (§7's
     /// asymmetry), so the apply path compiles the SAME SQL for every event of a
     /// table — millions of prepares of identical text. Prepare once, rebind per
@@ -128,11 +141,51 @@ pub const Storage = struct {
         return self;
     }
 
+    /// §10fl: a DuckDB replica — `path` is the database file (`:memory:` for a
+    /// test). One connection; the card's read-only handle comes from
+    /// `openDuckdbShared` on the same database.
+    pub fn openDuckdb(path: [*:0]const u8) Error!Storage {
+        if (!build_options.duckdb) return Error.OpenFailed;
+        var db: dk.duckdb_database = null;
+        if (dk.duckdb_open(path, &db) != dk.DuckDBSuccess) return Error.OpenFailed;
+        var con: dk.duckdb_connection = null;
+        if (dk.duckdb_connect(db, &con) != dk.DuckDBSuccess) {
+            dk.duckdb_close(&db);
+            return Error.OpenFailed;
+        }
+        var self = Storage{ .engine = .duckdb, .dk_db = @ptrCast(db), .dk_con = @ptrCast(con) };
+        // A TIMESTAMPTZ prints in the session's zone once ICU is loaded (Homebrew's
+        // build bundles it): UTC, as the PostgreSQL engine sets, so the text shape is
+        // PostgreSQL's own and the wire's `Z` reading holds. Without ICU there is no
+        // zone to set and the value is UTC already — the failure is ignored.
+        self.execSimple("SET TimeZone = 'UTC'") catch {};
+        return self;
+    }
+
+    /// A second connection on `primary`'s database (the card's query handle).
+    pub fn openDuckdbShared(primary: *Storage) Error!Storage {
+        if (!build_options.duckdb) return Error.OpenFailed;
+        const db: dk.duckdb_database = @ptrCast(@alignCast(primary.dk_db orelse return Error.OpenFailed));
+        var con: dk.duckdb_connection = null;
+        if (dk.duckdb_connect(db, &con) != dk.DuckDBSuccess) return Error.OpenFailed;
+        return Storage{ .engine = .duckdb, .dk_db = @ptrCast(db), .dk_con = @ptrCast(con), .dk_owns_db = false };
+    }
+
     pub fn close(self: *Storage) void {
         self.clearStmtCache();
         switch (self.engine) {
             .sqlite => _ = c.sqlite3_close(self.db),
             .postgres => if (self.pg) |conn| c.PQfinish(conn),
+            .duckdb => if (build_options.duckdb) {
+                if (self.dk_con) |cp| {
+                    var con: dk.duckdb_connection = @ptrCast(@alignCast(cp));
+                    dk.duckdb_disconnect(&con);
+                }
+                if (self.dk_owns_db) if (self.dk_db) |dp| {
+                    var db: dk.duckdb_database = @ptrCast(@alignCast(dp));
+                    dk.duckdb_close(&db);
+                };
+            },
         }
     }
 
@@ -156,6 +209,19 @@ pub const Storage = struct {
             }
             return;
         }
+        if (self.engine == .duckdb) {
+            if (build_options.duckdb) {
+                var dit = self.dk_stmts.iterator();
+                while (dit.next()) |e| {
+                    var st: dk.duckdb_prepared_statement = @ptrCast(@alignCast(e.value_ptr.*));
+                    dk.duckdb_destroy_prepare(&st);
+                    std.heap.c_allocator.free(e.key_ptr.*);
+                }
+                self.dk_stmts.deinit(std.heap.c_allocator);
+                self.dk_stmts = .empty;
+            }
+            return;
+        }
         var it = self.stmt_cache.iterator();
         while (it.next()) |e| {
             _ = c.sqlite3_finalize(e.value_ptr.*);
@@ -171,6 +237,7 @@ pub const Storage = struct {
 
     pub fn queryNamed(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value) Error!Named {
         if (self.engine == .postgres) return self.pgExec(a, sql, params, true);
+        if (self.engine == .duckdb) return self.dkExec(a, sql, params, true);
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return Error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
@@ -184,7 +251,7 @@ pub const Storage = struct {
     }
 
     pub fn errMsg(self: *Storage) []const u8 {
-        if (self.engine == .postgres) return self.pg_err_buf[0..self.pg_err_len];
+        if (self.engine == .postgres or self.engine == .duckdb) return self.pg_err_buf[0..self.pg_err_len];
         return std.mem.span(c.sqlite3_errmsg(self.db));
     }
 
@@ -216,6 +283,7 @@ pub const Storage = struct {
     /// from `a` — hand an arena and drop it wholesale.
     pub fn query(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value) Error![]Row {
         if (self.engine == .postgres) return (try self.pgExec(a, sql, params, false)).rows;
+        if (self.engine == .duckdb) return (try self.dkExec(a, sql, params, false)).rows;
         var transient: ?*c.sqlite3_stmt = null;
         const s: *c.sqlite3_stmt = if (self.stmt_cache.get(sql)) |hit| hit else blk: {
             var stmt: ?*c.sqlite3_stmt = null;
@@ -429,6 +497,128 @@ pub const Storage = struct {
         }
     }
 
+    // ─── DuckDB (§10fl) ───────────────────────────────────────────────────────
+
+    fn dkRecordError(self: *Storage, msg: []const u8) void {
+        const n = @min(msg.len, self.pg_err_buf.len - 1);
+        @memcpy(self.pg_err_buf[0..n], msg[0..n]);
+        self.pg_err_buf[n] = 0;
+        self.pg_err_len = n;
+    }
+
+    /// DuckDB's SQL is close enough to the shell's that only two things move: SQLite's
+    /// PRAGMAs answer nothing, and `BEGIN IMMEDIATE` is `BEGIN TRANSACTION`. `?` is a
+    /// DuckDB placeholder as it is; a prepared statement is cached by text.
+    fn dkExec(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value, want_names: bool) Error!Named {
+        if (!build_options.duckdb) return Error.ExecFailed;
+        const con: dk.duckdb_connection = @ptrCast(@alignCast(self.dk_con orelse return Error.ExecFailed));
+        const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
+        if (std.ascii.startsWithIgnoreCase(trimmed, "PRAGMA")) return .{ .columns = &.{}, .rows = try a.alloc(Row, 0) };
+        const zsql: [:0]const u8 = if (std.ascii.eqlIgnoreCase(trimmed, "BEGIN IMMEDIATE")) "BEGIN TRANSACTION" else try a.dupeZ(u8, trimmed);
+        // A statement without parameters runs as a plain query: DDL in particular —
+        // a prepared `CREATE OR REPLACE … AS SELECT` executed but left the old table
+        // in place (measured: the appender then saw the old column count), and a
+        // one-off DDL text has no business in the statement cache anyway.
+        if (params.len == 0) {
+            var qres: dk.duckdb_result = undefined;
+            if (dk.duckdb_query(con, zsql.ptr, &qres) != dk.DuckDBSuccess) {
+                const msg = dk.duckdb_result_error(&qres);
+                self.dkRecordError(if (msg != null) std.mem.span(msg) else "query failed");
+                dk.duckdb_destroy_result(&qres);
+                return Error.StepFailed;
+            }
+            defer dk.duckdb_destroy_result(&qres);
+            return duckdb_read.readResult(a, &qres, want_names);
+        }
+        const stmt: dk.duckdb_prepared_statement = blk: {
+            if (self.dk_stmts.get(zsql)) |hit| break :blk @ptrCast(@alignCast(hit));
+            var st: dk.duckdb_prepared_statement = null;
+            if (dk.duckdb_prepare(con, zsql.ptr, &st) != dk.DuckDBSuccess) {
+                const msg = dk.duckdb_prepare_error(st);
+                self.dkRecordError(if (msg != null) std.mem.span(msg) else "prepare failed");
+                dk.duckdb_destroy_prepare(&st);
+                return Error.PrepareFailed;
+            }
+            if (self.dk_stmts.count() < 256) cache: {
+                const key = std.heap.c_allocator.dupe(u8, zsql) catch break :cache;
+                self.dk_stmts.put(std.heap.c_allocator, key, @ptrCast(st.?)) catch {
+                    std.heap.c_allocator.free(key);
+                    break :cache;
+                };
+            }
+            break :blk st;
+        };
+        for (params, 0..) |p, i| {
+            const idx: dk.idx_t = @intCast(i + 1);
+            const ok = switch (p) {
+                .null => dk.duckdb_bind_null(stmt, idx),
+                .integer => |v| dk.duckdb_bind_int64(stmt, idx, v),
+                .real => |v| dk.duckdb_bind_double(stmt, idx, v),
+                .boolean => |v| dk.duckdb_bind_boolean(stmt, idx, v),
+                .text => |v| dk.duckdb_bind_varchar_length(stmt, idx, v.ptr, v.len),
+                .blob => |v| dk.duckdb_bind_blob(stmt, idx, v.ptr, v.len),
+            };
+            if (ok != dk.DuckDBSuccess) {
+                self.dkRecordError("bind failed");
+                return Error.BindFailed;
+            }
+        }
+        var res: dk.duckdb_result = undefined;
+        if (dk.duckdb_execute_prepared(stmt, &res) != dk.DuckDBSuccess) {
+            const msg = dk.duckdb_result_error(&res);
+            self.dkRecordError(if (msg != null) std.mem.span(msg) else "execute failed");
+            dk.duckdb_destroy_result(&res);
+            return Error.StepFailed;
+        }
+        defer dk.duckdb_destroy_result(&res);
+        // The supported reader: chunks and vectors (duckdb_read.zig) — the legacy
+        // `duckdb_value_*` family is marked for removal and was not safe here.
+        return duckdb_read.readResult(a, &res, want_names);
+    }
+
+    /// §10fl: DuckDB's appender — the bulk path a seed takes. Rows are appended in
+    /// TABLE column order (the caller maps the chain's columns to it, NULL for one
+    /// the chain lacks); every value type the shell has binds directly.
+    pub fn dkAppend(self: *Storage, table: [:0]const u8, rows: []const []const Value) Error!void {
+        if (!build_options.duckdb) return Error.ExecFailed;
+        const con: dk.duckdb_connection = @ptrCast(@alignCast(self.dk_con orelse return Error.ExecFailed));
+        var app: dk.duckdb_appender = null;
+        if (dk.duckdb_appender_create(con, null, table.ptr, &app) != dk.DuckDBSuccess) {
+            const msg = dk.duckdb_appender_error(app);
+            self.dkRecordError(if (msg != null) std.mem.span(msg) else "appender failed");
+            _ = dk.duckdb_appender_destroy(&app);
+            return Error.ExecFailed;
+        }
+        defer _ = dk.duckdb_appender_destroy(&app);
+        for (rows) |row| {
+            for (row) |v| {
+                const ok = switch (v) {
+                    .null => dk.duckdb_append_null(app),
+                    .integer => |x| dk.duckdb_append_int64(app, x),
+                    .real => |x| dk.duckdb_append_double(app, x),
+                    .boolean => |x| dk.duckdb_append_bool(app, x),
+                    .text => |x| dk.duckdb_append_varchar_length(app, x.ptr, x.len),
+                    .blob => |x| dk.duckdb_append_blob(app, x.ptr, x.len),
+                };
+                if (ok != dk.DuckDBSuccess) {
+                    const msg = dk.duckdb_appender_error(app);
+                    self.dkRecordError(if (msg != null) std.mem.span(msg) else "append failed");
+                    return Error.StepFailed;
+                }
+            }
+            if (dk.duckdb_appender_end_row(app) != dk.DuckDBSuccess) {
+                const msg = dk.duckdb_appender_error(app);
+                self.dkRecordError(if (msg != null) std.mem.span(msg) else "append failed");
+                return Error.StepFailed;
+            }
+        }
+        if (dk.duckdb_appender_close(app) != dk.DuckDBSuccess) {
+            const msg = dk.duckdb_appender_error(app);
+            self.dkRecordError(if (msg != null) std.mem.span(msg) else "appender close failed");
+            return Error.StepFailed;
+        }
+    }
+
     /// §10fe: COPY FROM STDIN — the statement, then the rows as one text buffer.
     pub fn pgCopy(self: *Storage, copy_sql: [:0]const u8, data: []const u8) Error!void {
         const conn = self.pg orelse return Error.ExecFailed;
@@ -467,6 +657,7 @@ pub const Storage = struct {
         const rows = switch (self.engine) {
             .sqlite => try self.query(a, "SELECT name FROM pragma_table_info(?)", &.{.{ .text = table }}),
             .postgres => try self.query(a, "SELECT column_name::text FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? ORDER BY ordinal_position", &.{.{ .text = table }}),
+            .duckdb => try self.query(a, "SELECT column_name FROM information_schema.columns WHERE table_name = ? ORDER BY ordinal_position", &.{.{ .text = table }}),
         };
         const out = try a.alloc([]const u8, rows.len);
         for (rows, 0..) |row, i| out[i] = row[0].text;
@@ -479,6 +670,7 @@ pub const Storage = struct {
             .sqlite => try self.query(a, "SELECT name FROM pragma_table_info(?) WHERE pk > 0 ORDER BY pk", &.{.{ .text = table }}),
             .postgres => try self.query(a, "SELECT a.attname::text FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) " ++
                 "WHERE i.indrelid = to_regclass(?) AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)", &.{.{ .text = table }}),
+            .duckdb => try self.query(a, "SELECT unnest(constraint_column_names) FROM duckdb_constraints() WHERE table_name = ? AND constraint_type = 'PRIMARY KEY'", &.{.{ .text = table }}),
         };
         const out = try a.alloc([]const u8, rows.len);
         for (rows, 0..) |row, i| out[i] = row[0].text;
@@ -493,7 +685,7 @@ pub const Storage = struct {
                 const rows = try self.query(a, "SELECT sql FROM sqlite_master WHERE type='table' AND name = ?", &.{.{ .text = table }});
                 return if (rows.len > 0 and rows[0][0] == .text) rows[0][0].text else null;
             },
-            .postgres => return null,
+            .postgres, .duckdb => return null,
         }
     }
 
@@ -502,6 +694,7 @@ pub const Storage = struct {
         const rows = switch (self.engine) {
             .sqlite => try self.query(a, "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name = ? AND name NOT LIKE 'sqlite_%'", &.{.{ .text = table }}),
             .postgres => try self.query(a, "SELECT indexname::text FROM pg_indexes WHERE schemaname = current_schema() AND tablename = ? AND indexname NOT LIKE '%_pkey'", &.{.{ .text = table }}),
+            .duckdb => try self.query(a, "SELECT index_name FROM duckdb_indexes() WHERE table_name = ? AND NOT is_primary", &.{.{ .text = table }}),
         };
         const out = try a.alloc([]const u8, rows.len);
         for (rows, 0..) |row, i| out[i] = row[0].text;
@@ -534,6 +727,91 @@ pub const Storage = struct {
 };
 
 // ─── tests (offline; :memory:) ──────────────────────────────────────────────
+
+test "DuckDB engine: typed cells, bytes, lists from JSON text, the appender, BEGIN IMMEDIATE, a PRAGMA answers nothing (§10fl)" {
+    if (!build_options.duckdb) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = try Storage.openDuckdb(":memory:");
+    defer st.close();
+    try st.execSimple("PRAGMA journal_mode = WAL;");
+    st.execSimple("CREATE TABLE t (id BIGINT PRIMARY KEY, flag BOOLEAN, note TEXT, bytes BLOB, amount DECIMAL(8,2), ratio DOUBLE, ts TIMESTAMPTZ, tags TEXT[], emb FLOAT[3])") catch |err| {
+        std.debug.print("duckdb: {s}\n", .{st.errMsg()});
+        return err;
+    };
+    try st.execSimple("BEGIN IMMEDIATE;");
+    _ = try st.query(a, "INSERT INTO t VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", &.{ .{ .integer = 1 }, .{ .boolean = true }, .{ .text = "hi ? there" }, .{ .blob = &.{ 0, 255, 1 } }, .{ .text = "12.50" }, .{ .real = 0.25 }, .{ .text = "2026-09-12T16:51:10.307895Z" }, .{ .text = "[\"a\",\"b c\"]" }, .{ .text = "[1.0,2.0,3.0]" } });
+    try st.execSimple("COMMIT;");
+    const rows = try st.query(a, "SELECT id, flag, note, bytes, amount, ratio, ts, tags[2], emb[3], list_count(tags) FROM t WHERE id = ?", &.{.{ .integer = 1 }});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0][0].integer);
+    try std.testing.expect(rows[0][1].boolean);
+    try std.testing.expectEqualStrings("hi ? there", rows[0][2].text);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 255, 1 }, rows[0][3].blob);
+    try std.testing.expectEqualStrings("12.50", rows[0][4].text);
+    try std.testing.expectEqual(@as(f64, 0.25), rows[0][5].real);
+    try std.testing.expectEqualStrings("b c", rows[0][7].text);
+    try std.testing.expectEqual(@as(f64, 3.0), rows[0][8].real);
+    try std.testing.expectEqual(@as(i64, 2), rows[0][9].integer);
+    // the timestamptz comes back in PostgreSQL's own text shape (UTC session)
+    try std.testing.expect(std.mem.startsWith(u8, rows[0][6].text, "2026-09-12 16:51:10.307895"));
+    // the appender, then the upsert-from-copy SQL the PostgreSQL path uses
+    try st.execSimple("CREATE TEMP TABLE _zbz_copy AS SELECT * FROM t LIMIT 0");
+    const r2 = [_]Value{ .{ .integer = 1 }, .{ .boolean = false }, .{ .text = "newer" }, .null, .{ .text = "1.00" }, .{ .real = 1 }, .{ .text = "2026-09-13 00:00:00+00" }, .null, .null };
+    const r3 = [_]Value{ .{ .integer = 2 }, .{ .boolean = false }, .{ .text = "two" }, .null, .null, .null, .{ .text = "2026-09-13 00:00:00+00" }, .null, .null };
+    try st.dkAppend("_zbz_copy", &.{ &r2, &r3 });
+    _ = try st.query(a, "INSERT INTO t (\"id\", \"flag\", \"note\", \"bytes\", \"amount\", \"ratio\", \"ts\", \"tags\", \"emb\") SELECT \"id\", \"flag\", \"note\", \"bytes\", \"amount\", \"ratio\", \"ts\", \"tags\", \"emb\" FROM _zbz_copy WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"note\" = excluded.\"note\", \"ts\" = excluded.\"ts\" WHERE excluded.\"ts\" > t.\"ts\"", &.{});
+    const after = try st.query(a, "SELECT id, note FROM t ORDER BY id", &.{});
+    try std.testing.expectEqual(@as(usize, 2), after.len);
+    try std.testing.expectEqualStrings("newer", after[0][1].text);
+    try std.testing.expectEqualStrings("two", after[1][1].text);
+    // does the appender cast text into a list, a fixed array, a timestamptz, a decimal, a uuid?
+    try st.execSimple("CREATE TABLE u (id BIGINT, tags TEXT[], emb FLOAT[3], ts TIMESTAMPTZ, amount DECIMAL(8,2), uid UUID)");
+    const r4 = [_]Value{ .{ .integer = 7 }, .{ .text = "[\"x\",\"y z\"]" }, .{ .text = "[1.5,2.5,3.5]" }, .{ .text = "2026-09-12T16:51:10.307895Z" }, .{ .text = "12.50" }, .{ .text = "0f2a3c4e-1b2d-4e5f-8a9b-0c1d2e3f4a5b" } };
+    st.dkAppend("u", &.{&r4}) catch |err| {
+        std.debug.print("duckdb appender casts: {s}\n", .{st.errMsg()});
+        return err;
+    };
+    const u = try st.query(a, "SELECT tags[2], emb[2], ts, amount, uid, tags, emb FROM u", &.{});
+    try std.testing.expectEqualStrings("[\"x\",\"y z\"]", u[0][5].text);
+    try std.testing.expectEqualStrings("[1.5,2.5,3.5]", u[0][6].text);
+    try std.testing.expectEqualStrings("y z", u[0][0].text);
+    try std.testing.expectEqual(@as(f64, 2.5), u[0][1].real);
+    try std.testing.expectEqualStrings("2026-09-12 16:51:10.307895+00", u[0][2].text);
+    try std.testing.expectEqualStrings("12.50", u[0][3].text);
+    try std.testing.expectEqualStrings("0f2a3c4e-1b2d-4e5f-8a9b-0c1d2e3f4a5b", u[0][4].text);
+    // many rows through the appender, past its internal chunk of 2048
+    try st.execSimple("CREATE TEMP TABLE _zbz_copy2 AS SELECT id, note, tags FROM t LIMIT 0");
+    const many = try a.alloc([]const Value, 5000);
+    for (many, 0..) |*row, i| {
+        const r = try a.alloc(Value, 3);
+        r[0] = .{ .integer = @intCast(100 + i) };
+        r[1] = .{ .text = "n" };
+        r[2] = .{ .text = "[\"a\"]" };
+        row.* = r;
+    }
+    st.dkAppend("_zbz_copy2", many) catch |err| {
+        std.debug.print("duckdb appender 5000 rows: {s}\n", .{st.errMsg()});
+        return err;
+    };
+    try std.testing.expectEqual(@as(i64, 5000), (try st.query(a, "SELECT count(*) FROM _zbz_copy2", &.{}))[0][0].integer);
+    // test_types' own shape, through the staging sequence the seed uses
+    try st.execSimple("CREATE TABLE tt (uid UUID PRIMARY KEY, age INTEGER, temperature REAL, price DECIMAL(38,10), is_true BOOLEAN, some_text TEXT, tags TEXT[], matrix INTEGER[][], metadata JSON, deleted_at TIMESTAMPTZ, tenant_id TEXT, last_writer TEXT, inserted_at TIMESTAMPTZ, updated_at TIMESTAMPTZ)");
+    try st.execSimple("CREATE OR REPLACE TEMP TABLE _zbz_copy AS SELECT \"uid\", \"age\", \"temperature\", \"price\", \"is_true\", \"some_text\", \"tags\", \"matrix\", \"metadata\", \"deleted_at\", \"tenant_id\", \"last_writer\", \"inserted_at\", \"updated_at\" FROM tt LIMIT 0");
+    const tr = [_]Value{ .{ .text = "0f2a3c4e-1b2d-4e5f-8a9b-0c1d2e3f4a5c" }, .{ .integer = 30 }, .{ .real = 21.5 }, .{ .text = "12.50" }, .{ .boolean = true }, .{ .text = "hello" }, .{ .text = "[\"a\",\"b\"]" }, .{ .text = "[[1,2],[3,4]]" }, .{ .text = "{\"k\":1}" }, .null, .{ .text = "globex" }, .null, .{ .text = "2026-09-12T16:51:10.307895Z" }, .{ .text = "2026-09-12T16:51:10.307895Z" } };
+    st.dkAppend("_zbz_copy", &.{ &tr, &tr }) catch |err| {
+        std.debug.print("duckdb appender test_types shape: {s}\n", .{st.errMsg()});
+        return err;
+    };
+    try st.execSimple("INSERT INTO tt SELECT * FROM _zbz_copy WHERE age = 30 LIMIT 1");
+    try std.testing.expectEqual(@as(i64, 1), (try st.query(a, "SELECT count(*) FROM tt", &.{}))[0][0].integer);
+    // the catalogue helpers
+    const pk = try st.tablePkColumns(a, "t");
+    try std.testing.expectEqual(@as(usize, 1), pk.len);
+    try std.testing.expectEqualStrings("id", pk[0]);
+    try std.testing.expectEqual(@as(usize, 9), (try st.tableColumns(a, "t")).len);
+}
 
 test "pgSql: placeholders become $n outside quotes, BEGIN IMMEDIATE becomes BEGIN (§10fd)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
