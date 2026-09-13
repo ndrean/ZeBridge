@@ -4,7 +4,7 @@
 
 ![Zig support](https://img.shields.io/badge/Zig-0.16.0-color?logo=zig&color=%23f3ab20)
 
-**What is it?**: ZeBridge is a bidirectional single PostgreSQL-to-local-SQL synchronization layer for offline-first applications. PostgreSQL remains authoritative; consumers optimistically mutate local state and eventually converge with PostgreSQL through durable, replayable change distribution. It uses NATS/JetSteam to solve the distribution problem..
+**What is it?**: ZeBridge is a bidirectional single PostgreSQL-to-local-database synchronization layer for offline-first applications. PostgreSQL remains authoritative; consumers optimistically mutate local state and eventually converge with PostgreSQL through durable, replayable change distribution. It uses NATS/JetSteam to solve the distribution problem.
 
 A two-pillar architecture where consumers build upon the client library.
 
@@ -20,7 +20,7 @@ flowchart LR
         Bridge <--> |TCP| NATS
     end
 
-    NATS <--> |WSS| Lib
+    NATS <--> |WSS <br> TLS| Lib
 
 
     subgraph Edge["Consumer"]
@@ -37,35 +37,39 @@ flowchart LR
     style NATS fill:#10b981,stroke:#059669,color:#000
 ```
 
-**Local_DB supported flavours**: standard SQLite, PGlite or PostgreSQL.
+**Local_DB supported flavours**: standard SQLite, PGlite or PostgreSQL, DuckDB.
 
 **How does it work?**: The bridge architecture is split into two core components: a daemon and a client library that makes syncing a breeze.
 
 * the daemon `ZeBridge` (ZB): a Zig executable that connects to PostgreSQL (PG) and to NATS/JetStream (NATS). It streams schemas, seeds by chunks and sends PG changes onto NATS. It applies writes coming back from the consumer to the primary database.
 This is a lightweight process that can be started / stopped gracefully on the fly.
-* a client library: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, almost nothing to do. The API of the library is tiny and comes in two flavours: a TypeScript library `zb-client-ts` and a native dynamic Zig library `libzb` with a  C ABI  FFI-compatible.
-The `TS` library uses a push model for reactivity whilst the Zig C ABI library uses a pull model as the host owns the library and polls on every tick. 
+* a client library: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, almost nothing to do.
+The API of the library is tiny and comes in two flavours: a TypeScript library `zb-client-ts` and a native dynamic Zig library `libzb` with a  C ABI  FFI-compatible.
+The `TS` library uses a push model for reactivity whilst the Zig C ABI library uses a pull model because the host owns the library and polls on every tick. 
 
 **Consumers**: The client library can be integrated across a wide range of runtime environments.
 
 * Mobile Native Apps: Utilizing native SQLite with file system storage.
-* Browsers and Webapps: Leveraging OPFS support for sqlite-wasm or PGlite.
-* Backend Services /  micro-VM: Running native SQLite, standard PostgreSQL or DuckDB with their local database. For example, a micro-VM seeds (or is kept warm in sync) into a DuckDB file straight from the wire, runs its analytical job and exports Parquet, without PostgreSQL ever seeing the fleet.
+* Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite.
+* Backend Services /  micro-VM: For example, a warm micro-VM  with DuckDB following Postgres. One command to send and it runs analytics that responds via NATS. Zero cost for PostgreSQL.
 
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
 
-* **Performance**: While Postgres is I/O bound, the daemon is CPU bound with minimal memory allocation. You can expect the flow PG → NATS to reach >200k evt/s, and a sustained  >20k mut/s flow NATS → PG, boundary scoped.
-The consumer's local database ingress/egress depends a lot upon your device. Values around 15 +/- 5 k evt/s can be reached.
+* **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-150.000 req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
+The consumer's local database ingress/egress for events depends a lot upon your device. Values around 15 +/- 5 k evt/s can be reached.
+The client library can seed at rates around 150-200.000 rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
-* **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independently from small tables with heavy changes.
+* **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independently from small tables with heavy changes and optimize memory usage.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding, and streaming when needed. This mitigates the need for long, expensive unitary CDC catchups.
-* **Geographic or Tenant division**: with NATS leaf nodes, you can choose to use nodes by tenant, or geographically distributed, when it makes sense.
+* **Geographic or Tenant division**: along with NATS leaf nodes, you can choose to use a fix tenant division by  business, or a dynamic geographic tenant mode (like mobile apps).
 * **Strict authentication**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA.
+* **Encryption**: the Postgres disk can be encrypted at rest, but the replicas are normally not encrypted (the native SQLite does not propose it). The data that matters for ZeBridge are encrypted.
 * **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads.
-* **Schema translation**: the replicas are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, primary key NOT NULL (even of composite type uuid-v7), foreign key references (`PRAGMA foreign_key='on'), on delete cascade/no action, and (multi-column) unique index are transcribed into SQLite schemas. 
+* **Schema translation**: the replicas are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, schemas are STRICT.
 * **PostGIS and pgvector ready**: support of`PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
-* **anti-client flood**: writes per client can be controlled in rate and backlog size, designed to evict new messages that overflow the buffer.
+* **anti-client flood**: writes per client can be controlled in rate and backlog size, designed to evict new messages that could overflow the NATS buffer.
+* **replicas**: besides SQLite and PGlite/Postgres, the columnar database DuckDB can mirror Postgres (reads only).
   
 **Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema, table suspension, and controlled local writes propagation.
 
@@ -167,13 +171,11 @@ ZeBridge supports restricting the columns in a publication. Currently, this will
 
 ## Overview
 
-### Two pillars
-
 | artifact | what it is | who uses it |
 | -- | -- | -- |
 | zebridge |  POSIX based executable <br>- Linux, FreeBSD, OSX | daemon running  next to Postgres and  NATS |
 |||
-| libzb | native library, C ABI | FFI Consumers: mobile apps, desktop apps, microservices via FFI |
+| libzb | native library, C ABI | FFI Consumers: mobile apps, desktop apps, microservices |
 | zb-client | npm package <br>(self-contained TS) | JS Consumers: browsers, Node, Electron, Deno, Bun |
 
 
@@ -181,29 +183,29 @@ ZeBridge supports restricting the columns in a publication. Currently, this will
 
 The C-ABI `libzb` library - for FFI users - and the `zb-client-ts` library (no WASM) - for any JavaScript-based consumers - implements this protocol.
 
-The library abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, and local tables which contains the state of a client.
+The library abstracts away the complex choreography required to manage NATS streams, KV buckets, data decompression and deserialization, retries, holding queries with foreing keys...and sets up the local tables needed to hold the state of a client.
 
 The client library shrinks this orchestration down to a few primitives: `connect()`, `close()`, `newVersion()`, `query()`, `mutate()` and `onChange()`.
 
-### The backend and the frontend in short
+### The complete setup steps at a glance
 
 * **Postgres**:
-  * the DBA defines two Postgres USERs,  READER and WRITER, and uses them to install the Postgres functions and triggers neede by ZeBridge,
-  * the DBA migrates the database, runs a diagnose to ensure the schemas follow the _good practice rules_, and removes any deviation.
-  * the DBA runs `SELECT zebridge_enable()` on each table attached to the desired publication,
+  * the DBA defines two Postgres USERs,  READER and WRITER, and uses them to install the Postgres functions and triggers needed by ZeBridge,
+  * the DBA migrates the database, runs a diagnose to ensure the schemas follow the 💡 _good practice rules_, and removes any deviation.
+  * the DBA finalze and runs `SELECT zebridge_enable()` on each table attached to the desired publication with the sync rules,
   🔔 These three steps guarantees the sync of the engine.
 * **NATS**:
   * the DBA generates an NKEY pair for authentication: `bridge --gen-nkey`.
   * the DBA starts NATS with the NKEY seed in the config, and enables JetStream,
 * **ZeBridge**: 
   * the DBA sources the `.env.bridge` file that contains the READER and the WRITER and the public NKEY part, 
-  * starts with `bridge --pub my_pub -slot my_slot`.
+  * starts with `bridge --pub my_pub -slot my_slot`,
+  * start the `bridge_sweeper` daemon,
 * **Client Authentication**: since NATS is exposed to the internet, users are strictly authenticated.
   * the bridge is OAuth agnostic; the DBA assigns the user identity returned by the OAuth in a tenant in the table `'public.zb_user_tenants'`.
   * the JWT setup: see []
-*  **Frontend**: the dev builds on top of the library to interact with the storage, no NATS incantations.
-   *  he sets up the `libzb` or `zb-client-ts` with the storage / database flavour (SQLite, PGlite) and the domain to reach NATS,
-   *  he invokes the few primitives to interact with the database: `connect`,  `query`, `mutate` and `onChange`. 
+*  **Frontend**: the dev builds on top of the library, `libzb` or `zb-client`. He will interact only with the storage, no NATS incantations.
+   *  he sets up the `ZeBrdige()` class with the storage / database flavour (SQLite, PGlite, DuckDB) and the domain to reach NATS,
 
 ### Example of a deployed system
 
@@ -222,14 +224,29 @@ graph TD
     classDef maybe_external fill:#dfd,stroke:#333,stroke-width:2px,stroke-dasharray: 5 5;
 
     %% External Clients
-    User([mobile / browser <br> ---libzb --- <br>SQLite / PGlite]):::external
-    LocalDB[(localDB <br>PG/lite<br>SQLite)]:::secure
-    LocalDB@{shape: lin-cyl}
-    RemoteLeaf[NATS<br>Leaf Node]:::internal
-    RemoteLeaf2[NATS<br>Leaf Node]:::maybe_external
-    Consumer([Service <br> --libzb--]):::external
+    MicroVM([micro-VM<br> --- libzb ---]):::external
+    UserBrowser([browser <br> ---zb-client ---]):::external
+    UserMobile([Mobile <br> --- libzb --- ]):::external
+
+    LocalDuckDB[(DuckDB)]:::secure
+    LocalSQLite[(SQLite)]:::secure
+    LocalPGlite[(PGlite)]:::secure
+
     Grafana([Grafana]):::telemetry
     Grafana@{ shape: cloud}
+
+    %% External Connections to Cloudflare
+    %%CF <==> |:8080 browser| NATS
+    MicroVM <==> |TLS| NATS
+    MicroVM <==>LocalDuckDB
+    %%PG -->|hot standby| PGREP
+    UserBrowser <==>|WSS| NATS
+    UserBrowser <==>LocalPGlite
+    UserMobile <==> |TLS| NATS
+    UserMobile <==>LocalSQLite
+    %%UserBrowser --> CF
+    %%UserMobile --> CF
+    %%MicroVM --> CF
 
 
     %% Cloudflare Edge
@@ -237,15 +254,15 @@ graph TD
         CF([https://my-domain]):::proxy
         CF@{ shape: cloud}
     %% end 
-    subgraph VPS-2 [Optional VPS-2]
-      PGREP[(Postgres<br>Replica <br>hot_standby = on)]:::secure
-    end
+    %%subgraph VPS-2 [Optional VPS-2]
+      %%PGREP[(Postgres<br>Replica <br>hot_standby = on)]:::secure
+    %%end
 
     %% VPS Boundary
     subgraph VPS [Your VPS Server]
         direction TB
         
-        HA([HAProxy<br>:8090]):::proxy
+        HA([HAProxy<br>:8443]):::proxy
         %% Internal Apps
         Prom[(Prometheus<br> :9090)]:::telemetry
         NatsExp([NATS Exporter<br>:7777]):::telemetry
@@ -256,35 +273,21 @@ graph TD
         NATS@{shape: data-store}
         
         %% Telemetry & Monitoring Stack
+        HA -.->|:27434/enroll| Bridge
         
         Sweeper[[Sweeper]]:::bridge
     end
 
-    subgraph Consumer Service
-      Consumer
-      LocalDB
-      RemoteLeaf
-    end
-    %% External Connections to Cloudflare
-    PG -->|hot standby| PGREP
-    User <==>RemoteLeaf2
-    RemoteLeaf2 <==>CF
-    CF <==> |:4222| NATS
-    RemoteLeaf <==>|wss| CF
-    Consumer <==>|Connects Local| RemoteLeaf
-    Consumer -->LocalDB
 
     %% Cloudflare to HAProxy Subdomain Routing
     CF <==> HA
 
-
     %% Internal Component Dependencies
-    PGREP ==>|R|Bridge
-    Bridge ==>|W| PG
+    %%PG ==>|R|Bridge
+    PG <==> Bridge
     Bridge <==>|Pub Sub  <br> TCP:4222| NATS
     
     %% HAProxy Internal Layer 7 Routing
-    HA -.->|:27434/enroll| Bridge
     %%HA <==>|wss://localhost:8080| NATS
 
     %% Telemetry Data Flow
@@ -296,13 +299,19 @@ graph TD
 <!-- </details> -->
 <br>
 
-Performance is I/O driven. You can test on a VPS with for example 6-vCPU, 24 GB RAM and 200GB NVMe SSD, and run comfortably the following stack: 
+You can test on a VPS with for example 6-vCPU, 24 GB RAM and 200GB NVMe SSD, and run comfortably the following stack: 
 
-* a master Postgres (≥16 if you want to launch a standby replica on another VPS),
-* a NATS server (≥ 2.10) and his companion NATS-exporter for telemetry,
-* two daemon ZeBridge, one slot for small tables 2kB-128.000 evt/s, ~ 300 MB and another slot for larger tables 128kB-4.000 evt/s, ~ 600 MB,
-* a TSDB Prometheus (scraping telemetry from ZB and nats-exporter and pushing to a cloud Grafana),
-* the reverse-proxy HAProxy for TLS termination of the internal ZeBridge endpoint '/enroll', and let Prometheus push to a Grafana cloud, and let NATS websockets pass-through.
+* a master `PostgreSQL`,
+* a `NATS` server and his companion `NATS-exporter` for telemetry,
+* a daemon `ZeBridge` on one publication, one slot
+* a TSDB `Prometheus` (scraping telemetry from ZeBridge and NATS-exporter and pushing to a cloud `Grafana`),
+* the reverse-proxy `HAProxy` for TLS termination of the internal ZeBridge endpoint '/enroll', and let Prometheus push to a Grafana cloud,
+
+This can serve the following clients:
+
+* browsers with a local `PGlite` replica connects over WSS (via Cloudflare) to NATS,
+* mobiles with its native `SQLite` replica connects (via eg Cloudflare) to NATS over TLS,
+* a warm micro-VM with a `DuckDB` replica connects (via eg Cloudflare) to NATS over TLS.
 
 ## The daemon
 
@@ -488,7 +497,7 @@ test_types | tenant_id  |               | updated_at  | deleted_at    | last_wri
 
 #### Scoped by tenant, authorized by grants
 
-**Every consumer is an identity in a tenant.** A consumer connects as a _principal_ — a stable, unique name — that belongs to exactly one tenant.
+**Every consumer is an identity in a tenant.** A consumer connects as a _principal_ — a stable, unique name — that belongs to one or more tenants (`zebridge_user_tenants`, a set; a second invite for a known principal is a join).
 
 Reads are scoped to that tenant by Postgres' RLS. Postgres RLS and the tenant guard decide which rows it may read and write.
 
@@ -1581,7 +1590,7 @@ The consumer boundary is one model for **every** consumer type — webapp, mobil
 | ZeBridge | the account scoped signing seed (`ZB_SIGNING_SEED`) | mint client JWTs for others |
 | the NATS server | the operator JWT + account public key (`ZB_ACCOUNT_PUB`) | trust what the bridge signed |
 
-**Permissions are not in the JWT.** They come from the signing key's role template, which expands `{{name()}}` and `{{tag(tenant)}}` at connect time. That is why the JWT carries `tenant:kilo` as a tag, and why **onboarding a tenant needs no NATS config change**.
+**Permissions are not in the JWT.** They come from the signing key's role template, which expands `{{name()}}` and `{{tag(tenant)}}` at connect time. That is why the JWT carries `tenant:kilo` as a tag — one tag per membership, the template expanding once per tag — and why **onboarding a tenant needs no NATS config change**.
 
 **⚠️ In local dev it is simpler — there is no enrollment.** `scripts/native/jwt-bootstrap.sh` pre-mints the fixed principals with `nsc` and writes their creds to disk:
 
