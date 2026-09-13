@@ -352,8 +352,13 @@ services:
         # are durable for as long as the stream keeps them, so a client that was offline
         # when its write failed collects the verdict on reconnect. A NAK or a JetStream
         # advisory is ephemeral and would be gone.
-        nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>,$$MUTATION_ACK_PREFIX.>" --storage=file --retention=limits --max-age=7d --max-bytes=1G --replicas=1 --defaults \
-          || nats stream edit $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>,$$MUTATION_ACK_PREFIX.>" -f \
+        # §10fk: the anti-flood cap is the STREAM's (the subject carries the principal, so
+        # max-msgs-per-subject is a per-principal backlog; discard=new refuses rather than
+        # evicting; workqueue retention drops a mutation once the bridge acks it, so the
+        # cap counts what is queued). The same policy as scripts/native/up.sh; the bridge
+        # declares its rate on /status and zbdoctor gate C checks the two.
+        nats stream add $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>,$$MUTATION_ACK_PREFIX.>" --storage=file --retention=work --max-age=2h --max-bytes=1G --replicas=1 --discard=new --max-msgs-per-subject=$${MUTATION_BACKLOG_PER_PRINCIPAL:-5000} --discard-per-subject --defaults \
+          || nats stream edit $$MUTATIONS_STREAM --subjects="$$MUTATIONS_PREFIX.>,$$MUTATION_ERROR_PREFIX.>,$$MUTATION_ACK_PREFIX.>" --discard=new --max-msgs-per-subject=$${MUTATION_BACKLOG_PER_PRINCIPAL:-5000} --discard-per-subject -f \
           || true
 
         echo "Creating NATS KV bucket: $$SCHEMA_KV"
