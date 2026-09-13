@@ -5,6 +5,7 @@ const jwt_mint = @import("jwt_mint.zig");
 const c = @import("c_imports.zig").c;
 const nats = @import("nats");
 const refused_tables = @import("refused_tables.zig");
+const rate_limit = @import("rate_limit.zig");
 const wal_monitor = @import("wal_monitor.zig");
 const fleet_monitor = @import("fleet_monitor.zig");
 const utils = @import("utils.zig");
@@ -47,6 +48,10 @@ pub const Server = struct {
     /// Set after construction, like nats_publisher. Only its atomic summaries are read
     /// here — the map belongs to the replication thread (see refused_tables.zig).
     refused: ?*const refused_tables.Registry = null,
+    /// §10fk: the ingress rate limit, declared on /status so the operator tool can
+    /// check the MUTATIONS stream's own policy against it (the bridge never edits
+    /// that stream — NATS policy is the deployment's, not the bridge's).
+    limiter: ?*const rate_limit.Limiter = null,
     /// §10db / §10dc: snapshot registries other threads swap whole; rendered as-is.
     slots: ?*wal_monitor.SlotRegistry = null,
     fleet: ?*fleet_monitor.Registry = null,
@@ -534,7 +539,10 @@ pub const Server = struct {
                 \\  "refused_tables": {d},
                 \\  "refused_events_dropped": {d},
                 \\  "gc_total_reaped": {d},
-                \\  "gc_last_sweep_time": {d}
+                \\  "gc_last_sweep_time": {d},
+                \\  "ingress_rate_per_principal": {d},
+                \\  "ingress_rate_burst": {d},
+                \\  "ingress_rate_limited_total": {d}
                 \\}}
             , .{
                 if (snap.is_connected) "connected" else "disconnected",
@@ -557,6 +565,9 @@ pub const Server = struct {
                 if (self.refused) |r| r.dropped_total.load(.acquire) else 0,
                 snap.gc_total_reaped,
                 snap.gc_last_sweep_time,
+                if (self.limiter) |l| @as(u64, @intFromFloat(l.rate_per_s)) else 0,
+                if (self.limiter) |l| @as(u64, @intFromFloat(l.burst)) else 0,
+                if (self.limiter) |l| l.limited_total.load(.monotonic) else 0,
             });
 
             try respond(req, .ok, "application/json", body);

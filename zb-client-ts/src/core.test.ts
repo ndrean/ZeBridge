@@ -159,11 +159,11 @@ for (const c of fx.fkClauses) {
 }
 for (const c of fx.createTable) {
   test(`createTable: ${c.name}`, () =>
-    assert.deepEqual(createTableSteps(c.table, c.cols, c.pkCols, c.fks), c.steps));
+    assert.deepEqual(createTableSteps(c.table, c.cols, c.pkCols, c.fks, c.strict ? { strict: true } : {}), c.steps));
 }
 for (const c of fx.rebuildSteps) {
   test(`rebuildSteps: ${c.name}`, () =>
-    assert.deepEqual(rebuildSteps(c.table, c.cols, c.pkCols, c.fks, c.existing), c.steps));
+    assert.deepEqual(rebuildSteps(c.table, c.cols, c.pkCols, c.fks, c.existing, c.strict ? { strict: true } : {}), c.steps));
 }
 for (const c of fx.readOnlySql) {
   test(`readOnlySql: ${c.name}`, () => assert.equal(isReadOnlySql(c.sql), c.allowed));

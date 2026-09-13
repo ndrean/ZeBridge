@@ -131,9 +131,22 @@ if [ "$FRESH_NATS" = "1" ]; then
   # them at boot — tenants from zebridge_user_tenants, the public subject set from
   # zebridge_catalogue. The catalogue is the config.
 
+  # §10fk: the anti-flood cap is the STREAM's, not the bridge's. The subject carries
+  # the principal (mutation.<principal>.<table>.<op>), so a per-subject cap is a
+  # per-principal backlog: past it that principal's publish is refused at the door
+  # (its PubAck errors, the client keeps the entry and retries after its grace) and
+  # nobody else notices. `discard=new` refuses rather than evicting — with the old
+  # policy a flood evicted the oldest: honest queued writes, stored verdicts, dead
+  # letters. Workqueue retention deletes a mutation once the bridge acks it, so the
+  # cap counts what is QUEUED; with `limits` it would count every write of the last
+  # max-age, a quota per two hours. Verdicts and dead letters have no consumer and
+  # stay until max-age, as before. The bridge declares its rate on /status; zbdoctor
+  # checks the two against each other.
+  MUTATION_BACKLOG_PER_PRINCIPAL="${MUTATION_BACKLOG_PER_PRINCIPAL:-5000}"
   nats --server "$NATS_URL" --nkey "$SEED" stream add "$MUTATIONS_STREAM" \
     --subjects="$MUTATIONS_PREFIX.>,$MUTATION_ERROR_PREFIX.>,$MUTATION_ACK_PREFIX.>" \
-    --storage=file --retention=limits --max-age=2h --max-bytes=1G --replicas=1 --defaults >/dev/null
+    --storage=file --retention=work --max-age=2h --max-bytes=1G --replicas=1 \
+    --discard=new --max-msgs-per-subject="$MUTATION_BACKLOG_PER_PRINCIPAL" --discard-per-subject --defaults >/dev/null
   # 2h, not days: a mutation is consumed within seconds, and its verdict is kept only for
   # a client that went offline between the send and the reply — on reconnect it collects
   # the verdict, or, past this window, REPLAYS the write, which the ingress judges

@@ -11657,6 +11657,128 @@ rows and its bindings. `ZB_SEED_TRACE=1` prints the phases and the peak RSS afte
 each. Not built for the TypeScript client: the browser and Node hold the document
 today, and a phone runs libzb.
 
+**The threshold (2026-09-13).** The pull reader has the object's compressed size
+from its meta before it reads a chunk, so a streaming client decides per step:
+below `seedStreamingAboveBytes` (default 8 MiB compressed — test_types' full is
+98 MiB for 1.1 GB inflated, a delta a few hundred bytes) the step is read whole
+through the same pull reader and applied by the whole-object path, which is twice as
+fast and small anyway. The seed line now says how many steps streamed (`1 of 4
+step(s) streamed` on the test_types chain: the full, not the three deltas). The
+scenario's third run raises the threshold above the full and gets the whole-object
+path's peak back. Eight checks.
+
+## 10fi. STRICT tables (2026-09-13)
+
+Queued since the type table of 2026-09-12: with every PostgreSQL type mapping to one
+of INTEGER, REAL, TEXT or BLOB, the replica's tables can be `STRICT`, and a value
+of another type is refused at the bind instead of stored — the failure mode this
+closes is the one measured in §10dl, a SQLite column holding TEXT `'t'` from chains
+and INTEGER 1 from CDC at once. STRICT converts a number into a TEXT column and
+refuses TEXT into INTEGER, REAL or BLOB (measured on 3.53), which is the direction
+that matters: a `$bin` marker that was not decoded, a boolean rendered as text, a
+numeric sent as a float, all surface as an error naming the column.
+
+Both cores: `createTableSteps`/`rebuildSteps` take a `strict` flag (SQLite only; a
+PostgreSQL engine types its own columns), pinned by two new fixture cases. One
+consequence the migration test found: the re-type rebuild copied rows with `INSERT
+… SELECT` and let affinity convert, and a STRICT target refuses TEXT `'1.5'` into
+REAL — the copy now casts every carried column to its declared type when the target
+is STRICT. A replica created before this is rebuilt once, rows carried through the
+same cast (`strictMissing` on the stored DDL, both clients), so an existing
+installation upgrades on its next sync without a re-seed.
+
+**Measured**: the four type scenarios (blobs, arrays, vectors, collist — the last
+checks `sqlite_master` ends in STRICT) green on libzb and, for arrays, the
+TypeScript client on SQLite and PGlite; the 3 M-row test_types replica of §10fh,
+created before STRICT, rebuilt in place on open with its rows kept.
+
+## 10fj. The integer-version clamp: no eternal winner (2026-09-13)
+
+The eternal-winner hole, named on 2026-09-12: a timestamp version too far ahead is
+clamped to `now()` + 5 s (§7.2), an integer version was not clamped at all —
+"future is meaningless for a counter", the code said — so a client writing 2^62
+froze the row for every other writer, with no error anywhere. The shape of the fix
+is the timestamp clamp's: the write wins if it is newer, what is STORED is bounded,
+and the verdict says what was stored (`version_clamped`).
+
+**The bound.** A fresh row stores at most 1 (`LEAST($n::bigint, 1)` in VALUES); an
+update or a delete stores at most `stored + 1`. One trap decided the shape: in `ON
+CONFLICT DO UPDATE`, `EXCLUDED` holds the row as VALUES produced it — the fresh-row
+cap — so an update that compared or stored `EXCLUDED.ver` would see at most 1 and
+call every write stale. The integer path therefore compares with the raw parameter
+(`$n::bigint`) and stores `LEAST($n::bigint, t.ver + 1)`; the timestamp path keeps
+`EXCLUDED`, whose clamp is the same in both halves. Two older gaps surfaced on the
+way and are closed with it: the classify probe cast the version parameter
+`::timestamptz` for every column type, so a zero-row outcome on an integer-version
+table was a SQL error rather than `stale`/`row_deleted` (it now casts by the
+column's type); and a delete stamped the tombstone with the version expression, a
+bigint into `timestamptz` — the tombstone takes `now()` when the version is a
+counter, an instant the sweeper can age.
+
+**Measured**, `scripts/scenarios/intclamp.py` as bob, nine checks on a table whose
+version is a bigint: 1 stored as sent; five billion wins and is stored as 2, the
+verdict naming 2; 3 lands (not frozen); 2 is `stale`; a fresh row at five billion
+is stored as 1; an UPDATE at 99 is stored as 4; a DELETE at 1000 tombstones at 5
+with `deleted_at = now()`; a later stale write on the tombstoned row is
+`row_deleted`. The timestamp scenarios (clamp, clockskew, replies) unchanged.
+
+## 10fk. The ingress rate limit: a flood is served at the rate, not dropped (2026-09-13)
+
+Queued since 2026-09-12: one phone in a loop, or one stolen credential, could flood
+`mutation.>` and put every other writer's verdict behind its backlog — the lanes
+pull in order, and nothing refused a write for being one of too many. A token
+bucket per principal and per tenant (`rate_limit.zig`, one instance shared by the
+lanes under a spinlock), `MUTATION_RATE_PER_PRINCIPAL` and `MUTATION_RATE_BURST`,
+off by default.
+
+**The shape that did not work.** The first cut acknowledged a refused write and
+answered it `failed`/`rate_limited` with `retry_after_ms`, the client holding its
+outbox until then — never a NAK, to avoid a redelivery storm. Measured: bob's 60
+writes through libzb, 21 accepted and 351 `rate_limited` verdicts in 40 s, the
+outbox never draining. The stream's duplicate window (120 s) drops a re-publish
+of the same `Nats-Msg-Id` silently, and the client's "missed verdict" read finds
+the old refusal by subject, so a client-side retry inside the window cannot
+happen at all. The retry has to be the server's.
+
+**The shape that does.** A refused write is NAK'd with a delay and the bucket goes
+into DEBT for it: the k-th refused write waits k steps, JetStream redelivers it
+once when its token exists, and a redelivery is not charged again. A flood is
+serialised at the rate by the server's own scheduling, one redelivery per
+message, no storm; the client sees a slower `accepted` and nothing else. Only
+past the delivery limit is a write answered `failed`/`rate_limited` with
+`retry_after_ms`, which both clients honour by holding the outbox (the code from
+the first cut, kept for that case). The verdict grew an optional field
+(`publishVerdictExtra`).
+
+**Measured**, `scripts/scenarios/ratelimit.py`, owning the only bridge at 20/s
+with a burst of 20: bob floods 200 inserts in 0.4 s — 200 accepted, none twice,
+none dropped, the last verdict after 9.2 s (expected 9); alice, in another tenant,
+writes 300 ms into the flood and is answered in 52 ms; libzb as bob lands 60 writes
+in 2.2 s (2 at the rate), nothing re-sent. Six checks. The write-path scenarios
+with the limit off (replies, mutate, keys, intclamp) unchanged.
+
+**The pile, and whose it is (the user's question the same evening).** A flood still
+fills the stream, and MUTATIONS was `limits`, 1 GB, `discard old`: full, it evicted
+the oldest — honest queued writes, stored verdicts, dead letters — and kept the
+flooder's newest. The answer is the stream's, not the bridge's: `discard new` and a
+per-subject cap with `discard-per-subject`, which is a per-PRINCIPAL cap because the
+subject carries the principal (`mutation.<principal>.<table>.<op>`); past it that
+principal's publish is refused at the door (its PubAck errors; both clients keep the
+entry and try again after their grace) and nobody else notices. Retention becomes
+workqueue so an acked mutation leaves the stream and the cap counts what is QUEUED;
+with `limits` it counted every write of the last two hours, a quota, hostile to a
+legitimate 20/s client. Verdicts and dead letters have no consumer and stay until
+max-age as before. The user drew the scope line ("we are using NATS config in the
+bridge — mixing scopes"): the bridge does not own or edit this — it is
+`MUTATION_BACKLOG_PER_PRINCIPAL` in `scripts/native/up.sh` (default 5000), the
+bridge declares its rate on `/status`, and `zbdoctor` gate C checks the stream's
+policy against it (red on discard old or no cap, amber on limits retention, and the
+drain time of a full backlog at the declared rate). The scenario's cap phase is
+opt-in (`ZB_RATELIMIT_CAP_PHASE=1`) on a stack created with a small cap. Retention
+cannot be edited on an existing stream: an existing deployment recreates MUTATIONS
+(two hours of stored verdicts and dead letters go with it; the mutations themselves
+are consumed within seconds).
+
 ## §13 Preflight stopped
 
 The boot-time `checkStoredRowsFit` function has been disabled because row size is already strictly process-enforced throughout the pipeline. Scanning the table at boot is a massive performance bottleneck that duplicates runtime defenses:

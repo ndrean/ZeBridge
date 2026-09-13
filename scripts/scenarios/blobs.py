@@ -129,7 +129,7 @@ async def main():
     nd.close(); em.close()
 
     # ── the objects themselves ──────────────────────────────────────────────────
-    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", TENANT, "--table", T, "--no-replay"], capture_output=True, text=True)
+    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--pub", "my_pub", "--tenant", TENANT, "--table", T, "--no-replay"], capture_output=True, text=True)
     check("the chain audit finds the full and deltas exact (bytea as \\x hex, geometry as EWKB hex)", "✓ the chain mirrors PostgreSQL" in r.stdout)
     if "✓ the chain mirrors PostgreSQL" not in r.stdout: print(r.stdout[-1500:])
     zb.psql(f"DROP TABLE public.{T}", quiet=True)

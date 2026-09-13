@@ -37,7 +37,7 @@ import { heartbeatPayload,
   mutationSubject, mutationMsgId, mutationKeyId, mutationPayload, optimisticEvent,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
-  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, vecColsOf, pgVectorValues, vecLiteral,
+  isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
 } from './core.ts';
 import type { VecCol } from './core.ts';
 import type { PlanStep } from './core.ts';
@@ -262,6 +262,8 @@ export class ZeBridge {
   /// `version` is the stamp the write carries: the CDC echo that confirms it is the
   /// row bearing THAT stamp, not any row on the same key (§10dt).
   private pendingWrites = new Map<string, { table: string; id: number | string; at: number; version?: string | null }>();
+  /// §10fk: a `rate_limited` verdict names `retry_after_ms`; the outbox is not flushed before then.
+  private holdUntil = 0;
   /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
   /// winning row. Held until that row is here (it may already be), then either
   /// resubmitted with a fresh stamp or dropped and surfaced.
@@ -1112,7 +1114,7 @@ export class ZeBridge {
     // DDL text and constraints come from core (columnDdl/fkClausesFor, §10s 2b).
     // SQLite has no ALTER TABLE ADD CONSTRAINT, so an FK change forces a rebuild
     // below while an index change stays a cheap CREATE/DROP.
-    const ddlOpts = { deferrable: this.dialect.deferrableForeignKeys };
+    const ddlOpts = { deferrable: this.dialect.deferrableForeignKeys, strict: this.dialect.name === 'sqlite' };
     const fkClauses = fkClausesFor(foreignKeys, ddlOpts);
 
     const rebuildPreservingData = async (why: string) => {
@@ -1168,7 +1170,7 @@ export class ZeBridge {
           this.appendLog('SCHEMA', `${table}: created (first sight), lsn=${lsn}`, 'MIGRATE');
         }
       } else if (added.length === 0 && removed.length === 0 && renames.length === 0 && retyped.length === 0 &&
-                 !(await this.foreignKeysDiffer(table, fkClauses))) {
+                 !(await this.foreignKeysDiffer(table, fkClauses)) && !(await this.strictMissing(table))) {
         await recordShape();
         this.syncedTables.set(table, { pkCols, columns: names, arrayCols, blobCols, vecCols, lsn, tombstoneColumn, tenantColumn, versionColumn, seedEpoch });
         this.reach('migrated');
@@ -1207,6 +1209,8 @@ export class ZeBridge {
             await this.dialect.alterColumnType(this.run, table, name, c.type);
             this.appendLog('SCHEMA', `${table}: column "${name}" re-typed to ${c.type} in place`, 'MIGRATE');
           }
+          // §10fi: a table from before STRICT is rebuilt once, rows carried.
+          if (await this.strictMissing(table)) throw new Error('table is not STRICT');
           if (await this.foreignKeysDiffer(table, fkClauses)) {
             if (this.dialect.alterForeignKeys) {
               // PostgreSQL: constraints are ALTERable, and a rebuild would be refused
@@ -1252,6 +1256,17 @@ export class ZeBridge {
   /// and comparing that back to clauses is more fragile than comparing the clauses
   /// themselves. A mismatch forces `rebuildPreservingData`, since ALTER cannot add
   /// or drop a constraint.
+  /// §10fi: on SQLite, is the stored table not STRICT (created before §10fi)?
+  private async strictMissing(table: string): Promise<boolean> {
+    if (this.dialect.name !== 'sqlite') return false;
+    try {
+      const ddl = await this.dialect.tableDdl(this.run, table);
+      return ddl === null ? false : strictMissing(ddl);
+    } catch {
+      return false;
+    }
+  }
+
   private async foreignKeysDiffer(table: string, fkClauses: string): Promise<boolean> {
     try {
       const ddl = await this.dialect.tableDdl(this.run, table);
@@ -2729,7 +2744,14 @@ export class ZeBridge {
             this.appendLog(m.subject, `${where}: refused permanently (${verdict.reason}${verdict.sqlstate ? ` / SQLSTATE ${verdict.sqlstate}` : ''}) — ${verdict.detail || 'no detail'} — reverting the local copy`, 'ERROR');
             break;
           case 'failed':
-            this.appendLog(m.subject, `${where}: failed after the bridge's delivery limit (${verdict.reason}) — kept for retry`, 'WARNING');
+            if (verdict.reason === 'rate_limited') {
+              // §10fk: kept, and the outbox holds for what the bridge asked.
+              const wait = Number((verdict as { retry_after_ms?: number }).retry_after_ms ?? 1000);
+              this.holdUntil = Math.max(this.holdUntil, Date.now() + wait);
+              this.appendLog(m.subject, `${where}: rate limited by the bridge — kept, outbox held for ${wait} ms`, 'WARNING');
+            } else {
+              this.appendLog(m.subject, `${where}: failed after the bridge's delivery limit (${verdict.reason}) — kept for retry`, 'WARNING');
+            }
             break;
           default:
             ok = false;
@@ -2866,6 +2888,7 @@ export class ZeBridge {
       return;
     }
     if (!rows.length) return;
+    if (Date.now() < this.holdUntil) return; // §10fk: rate limited — not yet
 
     // ── first, the verdicts already waiting for us (PROTOCOL §7.4b) ──────────
     const settled = await this.collectMissedVerdicts(rows);

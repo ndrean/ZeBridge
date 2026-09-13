@@ -8,11 +8,15 @@ never the inflated chain object — measured on the 3 M-row test_types chain.
 Needs NATS with a chain for the table (the bridge need not be running: a seed reads
 the manifest and the objects, nothing else). Two seeds into fresh SQLite files, each
 in its own process so its peak RSS is its own: the whole-object path, then the
-streaming path. What is checked: both replicas hold the same rows (count and a
-checksum over every column), the streaming seed wrote its watermark, and its peak
-RSS is a fraction of the other's — the inflated document is what the streaming
-path never holds. Times are printed; the streaming apply is expected slower (the
-sort is per chunk, not global).
+streaming path, then the streaming path with a threshold above the object's size.
+What is checked: both replicas hold the same rows (count and a checksum over every
+column), the streaming seed wrote its watermark, its peak RSS is a fraction of the
+other's — the inflated document is what the streaming path never holds — and its
+log says which steps streamed (the full; the deltas, a few hundred bytes, take the
+whole-object path under the default threshold); with the threshold raised above
+the full's size no step streams and the peak is the whole-object path's again.
+Times are printed; the streaming seed is expected about twice as slow (the rows
+are written twice, and sorted on disk).
 """
 import argparse, json, os, resource, subprocess, sys, time
 import zb
@@ -25,11 +29,11 @@ def check(msg, cond):
     if not cond: FAILED.append(msg)
 
 
-def child(table, principal, streaming):
+def child(table, principal, streaming, above=None):
     from clients import Lib, fresh_sqlite
     db = f"/tmp/zb-seed-{'stream' if streaming else 'whole'}.sqlite3"; fresh_sqlite(db)
     t0 = time.monotonic()
-    em = Lib(db, [table], f"py-seed-{'stream' if streaming else 'whole'}", principal=principal, seed_streaming=streaming)
+    em = Lib(db, [table], f"py-seed-{'stream' if streaming else 'whole'}", principal=principal, seed_streaming=streaming, seed_streaming_above=above)
     # the seed runs inside a poll once the manifest is usable (a chain that predates
     # the stream waits for the producer's next generation)
     deadline = time.monotonic() + 600
@@ -44,13 +48,16 @@ def child(table, principal, streaming):
     print(json.dumps({"rows": n, "checksum": chk, "elapsed_s": round(elapsed, 1), "peak_mb": round(peak), "watermark": wm[0][0] if wm else None}))
 
 
-def run_child(table, principal, streaming):
-    r = subprocess.run([sys.executable, __file__, "--child", "--table", table, "--principal", principal] + (["--streaming"] if streaming else []),
+def run_child(table, principal, streaming, above=None):
+    r = subprocess.run([sys.executable, __file__, "--child", "--table", table, "--principal", principal] + (["--streaming"] if streaming else []) + (["--above", str(above)] if above is not None else []),
                        capture_output=True, text=True, env=os.environ)
     lines = [l for l in r.stdout.splitlines() if l.startswith("{")]
     if r.returncode != 0 or not lines:
         print(r.stderr[-1500:]); return None
-    return json.loads(lines[-1])
+    out = json.loads(lines[-1])
+    seeded = [l for l in r.stderr.splitlines() if "seeded" in l and table in l]
+    out["log"] = seeded[-1] if seeded else ""
+    return out
 
 
 async def main(table, principal):
@@ -63,14 +70,19 @@ async def main(table, principal):
     check(f"the streaming seed wrote its watermark ({stream['watermark']})", bool(stream["watermark"]) and stream["watermark"] == whole["watermark"])
     ratio = stream["peak_mb"] / max(whole["peak_mb"], 1)
     check(f"peak RSS: whole {whole['peak_mb']} MB, streaming {stream['peak_mb']} MB ({ratio:.0%}); time: whole {whole['elapsed_s']} s, streaming {stream['elapsed_s']} s", ratio < 0.5)
+    check(f"the log says the full streamed and the deltas did not: {stream['log'].split(' — ')[-1]}", "1 of" in stream["log"] and "step(s) streamed" in stream["log"])
+    check("the whole-object log names no streamed step", "streamed" not in whole["log"])
+    high = run_child(table, principal, True, above=1 << 30)
+    check(f"streaming with the threshold above the full's size: no step streams, the whole-object path's peak ({high['peak_mb'] if high else '?'} MB)",
+          high is not None and high["rows"] == whole["rows"] and "streamed" not in high["log"] and high["peak_mb"] > whole["peak_mb"] * 0.7)
     return 1 if FAILED else 0
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--table", default="test_types"); ap.add_argument("--principal", default=os.environ.get("ZB_PRINCIPAL", "bob"))
-    ap.add_argument("--child", action="store_true"); ap.add_argument("--streaming", action="store_true")
+    ap.add_argument("--child", action="store_true"); ap.add_argument("--streaming", action="store_true"); ap.add_argument("--above", type=int, default=None)
     a = ap.parse_args()
     if a.child:
-        child(a.table, a.principal, a.streaming); sys.exit(0)
+        child(a.table, a.principal, a.streaming, a.above); sys.exit(0)
     sys.exit(zb.run(lambda: main(a.table, a.principal)))

@@ -71,6 +71,7 @@ CDC_PUBLIC = GRAMMAR.get("cdc_streams", {}).get("public", "CDC_PUBLIC")
 KV_SCHEMAS = GRAMMAR.get("kv", {}).get("schemas", "schemas")
 KV_TENANTS = GRAMMAR.get("kv", {}).get("tenants", "tenants")
 KV_GENERATIONS = GRAMMAR.get("generations", {}).get("kv", "generations")
+MUTATIONS = GRAMMAR.get("streams", {}).get("mutations", "MUTATIONS")
 GEN_PREFIX = GRAMMAR.get("generations", {}).get("bucket_prefix", "gen-")
 
 BRIDGE_URL = os.environ.get("BRIDGE_URL", "http://127.0.0.1:9090").rstrip("/")
@@ -437,6 +438,35 @@ def gate_nats(tenants: list[str]) -> set[str]:
                 f"{'schemas' if bucket == KV_SCHEMAS else 'their tenant / chain manifests'}")
     if all(f"KV_{b}" in streams for b in (KV_SCHEMAS, KV_TENANTS, KV_GENERATIONS)):
         ok("every KV bucket exists (schemas, tenants, generations)")
+
+    # §10fk: the MUTATIONS stream's own anti-flood policy, against the rate the bridge
+    # declares. The bridge never edits this stream (NATS policy is the deployment's).
+    if MUTATIONS in streams:
+        r = nats("stream", "info", MUTATIONS, "--json")
+        try:
+            cfg = json.loads(r.stdout)["config"] if r.returncode == 0 else {}
+        except Exception:  # noqa: BLE001
+            cfg = {}
+        if cfg:
+            cap = int(cfg.get("max_msgs_per_subject") or -1)
+            per_subject = bool(cfg.get("discard_new_per_subject"))
+            if cfg.get("discard") != "new":
+                red("C", f"{MUTATIONS} discards OLD messages when full: a flood evicts honest queued writes, stored verdicts and dead letters",
+                    "scripts/native/up.sh creates it with --discard=new; `nats stream edit` an existing one")
+            if cap <= 0 or not per_subject:
+                red("C", f"{MUTATIONS} has no per-principal backlog cap (max_msgs_per_subject {cap}, discard-per-subject {per_subject})",
+                    "up.sh: --max-msgs-per-subject=$MUTATION_BACKLOG_PER_PRINCIPAL --discard-per-subject — the subject carries the principal, so the cap is per principal")
+            if cfg.get("retention") == "limits" and cap > 0:
+                amber("C", f"{MUTATIONS} keeps applied mutations until max-age, so the per-subject cap ({cap}) is a quota per {int(cfg.get('max_age', 0)) // 3_600_000_000_000} h, not a backlog",
+                      "workqueue retention deletes a mutation once acked (up.sh creates new stacks that way); retention cannot be edited — recreate the stream")
+            if cfg.get("discard") == "new" and cap > 0 and per_subject:
+                rate = 0
+                try:
+                    rate = int((http_json("/status") or {}).get("ingress_rate_per_principal") or 0)
+                except Exception:  # noqa: BLE001
+                    pass
+                worst = f", a full backlog drains in {cap // rate} s at the bridge's {rate}/s" if rate else " (the bridge declares no rate limit: MUTATION_RATE_PER_PRINCIPAL is off)"
+                ok(f"{MUTATIONS}: discard new, {cap} queued write(s) per principal and verb{worst}")
 
     # Retired by §10p — present means an old deployment was upgraded in place.
     retired = sorted(s for s in streams if s.startswith("INIT_") or s in ("INIT", "REQUESTS", "KV_snapshots"))

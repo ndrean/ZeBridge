@@ -6,6 +6,7 @@ const log = std.log.scoped(.mutation_listener);
 const config = @import("config.zig");
 const pg_conn = @import("pg_conn.zig");
 const utils = @import("utils.zig");
+const rate_limit = @import("rate_limit.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
 
@@ -53,14 +54,21 @@ const VersionType = enum {
     /// because the protocol requires clients to send UTC for this column (§7.2) and
     /// comparing against local `now()` would clamp by the server's offset.
     timestamp_naive,
-    /// Integer, or anything else. Not clamped: "future" is meaningless for a counter, and
-    /// silently capping one would corrupt a perfectly sound version scheme.
+    /// §10fj: an integer counter (int2/int4/int8). Its "future" is a value far above
+    /// the stored one — the eternal winner: a client that writes 2^62 freezes the row
+    /// for everyone, since nothing is ever greater. Capped, like a timestamp, at one
+    /// step: a fresh row stores at most 1, an update or a delete at most stored + 1.
+    /// The write still wins if it is newer; only the value recorded is bounded, and
+    /// the verdict says what was stored (`version_clamped`).
+    integer,
+    /// Anything else. Not clamped: no notion of a future to bound.
     other,
 
     fn fromOid(oid: u32) VersionType {
         return switch (oid) {
             1184 => .timestamptz,
             1114 => .timestamp_naive,
+            20, 21, 23 => .integer,
             else => .other,
         };
     }
@@ -88,7 +96,7 @@ const VersionType = enum {
                 .suffix = ", 'YYYY-MM-DD\"T\"HH24:MI:SS.US')",
             },
             // An integer version has no notation question: it is already its own text.
-            .other => null,
+            .integer, .other => null,
         };
     }
 
@@ -97,6 +105,7 @@ const VersionType = enum {
         return switch (self) {
             .timestamptz => "::timestamptz",
             .timestamp_naive => "::timestamp",
+            .integer => "::bigint",
             .other => null,
         };
     }
@@ -119,6 +128,8 @@ const VersionType = enum {
                 .suffix = "::timestamp, (now() AT TIME ZONE 'UTC') + interval '" ++
                     config.Sync.version_future_tolerance ++ "')",
             },
+            // §10fj: a fresh row is one step ahead of nothing.
+            .integer => .{ .prefix = "LEAST(", .suffix = "::bigint, 1)" },
             .other => null,
         };
     }
@@ -451,6 +462,14 @@ pub const MutationListener = struct {
     /// not itself be able to fail, and read a few microseconds later on the same thread.
     /// `PQerrorMessage` points into the connection and is overwritten by the next call,
     /// so it has to be copied *now* or not at all.
+    /// §10fk: the ingress rate limit, shared by every lane; and the principal →
+    /// tenant memory it keys the second bucket on (read from
+    /// `zebridge_user_tenants` on first sight, "" when the principal has none).
+    limiter: *rate_limit.Limiter,
+    tenant_cache: std.StringHashMap([]const u8),
+    /// Throttle for the refusal log line: one per second at most, with the count.
+    limit_log_ms: i64 = 0,
+    limit_log_n: u64 = 0,
     last_sqlstate_buf: [8]u8 = undefined,
     last_sqlstate_len: usize = 0,
     last_error_buf: [220]u8 = undefined,
@@ -481,6 +500,7 @@ pub const MutationListener = struct {
         should_stop: *std.atomic.Value(bool),
         catalog_epoch: *const CatalogEpoch,
         event_buf_bytes: usize,
+        limiter: *rate_limit.Limiter,
     ) !*MutationListener {
         const self = try allocator.create(MutationListener);
 
@@ -496,6 +516,8 @@ pub const MutationListener = struct {
             .meta_cache = std.StringHashMap(TableMeta).init(allocator),
             .catalog_epoch = catalog_epoch,
             .event_buf_bytes = event_buf_bytes,
+            .limiter = limiter,
+            .tenant_cache = std.StringHashMap([]const u8).init(allocator),
         };
 
         return self;
@@ -508,6 +530,12 @@ pub const MutationListener = struct {
             e.value_ptr.deinit(self.allocator);
         }
         self.meta_cache.deinit();
+        var tit = self.tenant_cache.iterator();
+        while (tit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.*);
+        }
+        self.tenant_cache.deinit();
         self.allocator.destroy(self);
     }
 
@@ -849,6 +877,21 @@ pub const MutationListener = struct {
         status: []const u8,
         reason: []const u8,
     ) void {
+        self.publishVerdictExtra(conn_nats, msg, principal, status, reason, "");
+    }
+
+    /// `publishVerdict` with `extra` spliced into the body — a leading comma and a
+    /// field, like `,"retry_after_ms":250` — for a verdict that says more than the
+    /// fixed set (§10fk).
+    fn publishVerdictExtra(
+        self: *MutationListener,
+        conn_nats: *nats.Connection,
+        msg: *nats.JetStreamMessage,
+        principal: []const u8,
+        status: []const u8,
+        reason: []const u8,
+        extra: []const u8,
+    ) void {
         const msg_id = msgIdOf(msg) orelse {
             log.debug("no Nats-Msg-Id on this mutation; no verdict addressable", .{});
             return;
@@ -887,8 +930,8 @@ pub const MutationListener = struct {
 
         const body = std.fmt.allocPrint(
             alloc,
-            "{{\"status\":\"{s}\",\"reason\":\"{s}\",\"sqlstate\":\"{s}\",\"detail\":\"{s}\",\"seq\":{d},\"version\":\"{s}\"}}",
-            .{ status, reason, self.lastSqlstate(), self.lastError(), seq, self.lastVersion() },
+            "{{\"status\":\"{s}\",\"reason\":\"{s}\",\"sqlstate\":\"{s}\",\"detail\":\"{s}\",\"seq\":{d},\"version\":\"{s}\"{s}}}",
+            .{ status, reason, self.lastSqlstate(), self.lastError(), seq, self.lastVersion(), extra },
         ) catch return;
 
         // ⚠️ Outside `mutation.>`, like the dead-letter subject and for the same reason:
@@ -902,6 +945,75 @@ pub const MutationListener = struct {
         // Per write, so debug: at production rates these two lines are the log (the
         // decision of the wasp session, 2026-09-08). Refusals keep their info lines.
         log.debug("📮 verdict → {s}: {s}", .{ subject, body });
+    }
+
+    /// §10fk: the ingress rate limit. A write with no token is NAK'd with the delay
+    /// of its place in the queue (rate_limit.zig: the bucket's debt), and JetStream
+    /// redelivers it once, then — the client sees nothing but a slower verdict.
+    /// Past the delivery limit it is acknowledged and answered `failed`, reason
+    /// `rate_limited`, with `retry_after_ms`. Not "ack and tell the client to retry":
+    /// its re-publish of the same Nats-Msg-Id inside the stream's duplicate window
+    /// is dropped silently (measured: the outbox stuck on its old verdict for the
+    /// whole window). Two buckets, the principal's and its tenant's, so one loud
+    /// phone cannot spend a whole tenant's budget alone and a tenant cannot crowd
+    /// out the others. True when the message was handled here.
+    fn rateLimited(self: *MutationListener, conn: ?*c.PGconn, conn_nats: *nats.Connection, msg: *nats.JetStreamMessage, mutation: Mutation) bool {
+        if (!self.limiter.enabled()) return false;
+        // A redelivery was charged when it was refused (the bucket's debt), and a
+        // redelivery for any other reason was admitted once already: no second toll.
+        if (msg.metadata.num_delivered > 1) return false;
+        const now_ms = utils.unixMillis();
+        var tenant_key_buf: [160]u8 = undefined;
+        const tenant = self.tenantOf(conn, mutation.principal);
+        const tenant_key: []const u8 = if (tenant.len > 0)
+            std.fmt.bufPrint(&tenant_key_buf, "tenant:{s}", .{tenant}) catch mutation.principal
+        else
+            mutation.principal;
+        const wait = self.limiter.takeTwo(mutation.principal, tenant_key, now_ms) orelse return false;
+        if (msg.metadata.num_delivered >= config.Nats.mutation_max_deliver) {
+            var extra_buf: [48]u8 = undefined;
+            const extra = std.fmt.bufPrint(&extra_buf, ",\"retry_after_ms\":{d}", .{wait}) catch "";
+            self.clearFailure();
+            self.publishVerdictExtra(conn_nats, msg, mutation.principal, "failed", "rate_limited", extra);
+            msg.ack() catch {};
+        } else {
+            msg.nakWithDelay(std.Io.Duration.fromMilliseconds(@intCast(wait))) catch {
+                msg.nak() catch {};
+            };
+        }
+        // one line per second at most, with the count since the last one
+        self.limit_log_n += 1;
+        if (now_ms - self.limit_log_ms >= 1000) {
+            log.info("🚦 rate limited {d} write(s) in the last second (latest: [{s}] on '{s}', retry after {d} ms; {d} in total)", .{ self.limit_log_n, mutation.principal, mutation.table, wait, self.limiter.limited_total.load(.monotonic) });
+            self.limit_log_ms = now_ms;
+            self.limit_log_n = 0;
+        }
+        return true;
+    }
+
+    /// The principal's tenant from `zebridge_user_tenants`, remembered per lane;
+    /// "" when it has none (or the catalogue cannot be asked right now).
+    fn tenantOf(self: *MutationListener, conn: ?*c.PGconn, principal: []const u8) []const u8 {
+        if (self.tenant_cache.get(principal)) |t| return t;
+        const cn = conn orelse return "";
+        var pbuf: [128]u8 = undefined;
+        const pz = std.fmt.bufPrintZ(&pbuf, "{s}", .{principal}) catch return "";
+        const params = [_]?[*:0]const u8{pz.ptr};
+        const res = c.PQexecParams(cn, "SELECT tenant_id::text FROM public.zebridge_user_tenants WHERE principal = $1 LIMIT 1", 1, null, &params[0], null, null, 0);
+        defer c.PQclear(res);
+        if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return "";
+        const t: []const u8 = if (c.PQntuples(res) > 0) std.mem.span(c.PQgetvalue(res, 0, 0)) else "";
+        const key = self.allocator.dupe(u8, principal) catch return "";
+        const val = self.allocator.dupe(u8, t) catch {
+            self.allocator.free(key);
+            return "";
+        };
+        self.tenant_cache.put(key, val) catch {
+            self.allocator.free(key);
+            self.allocator.free(val);
+            return "";
+        };
+        return val;
     }
 
     /// One message through the FULL per-message machinery: parse, refuse,
@@ -939,6 +1051,7 @@ pub const MutationListener = struct {
             msg.ack() catch {};
             return;
         }
+        if (self.rateLimited(conn, conn_nats, msg, mutation)) return;
 
         // Each attempt starts with no remembered reason, so a verdict can only
         // ever quote a failure from *this* message.
@@ -1032,7 +1145,7 @@ pub const MutationListener = struct {
         // "applied" from "lost in transit".
         if (self.last_clamped) {
             log.info(
-                "🕒 clamped a future version [{s}] on '{s}' → {s}",
+                "🕒 clamped a version too far ahead [{s}] on '{s}' → {s}",
                 .{ mutation.principal, mutation.table, self.lastVersion() },
             );
         }
@@ -1114,6 +1227,7 @@ pub const MutationListener = struct {
                 msg.ack() catch {};
                 continue;
             }
+            if (self.rateLimited(conn, conn_nats, msg, mutation)) continue;
             // Pre-warm the meta OUTSIDE pipeline mode; an error here fails the
             // batch before anything was sent — the per-message replay owns the
             // dead-letter/verdict semantics for it.
@@ -2112,7 +2226,7 @@ pub const MutationListener = struct {
         // verdict is `accepted` again, not `stale` / `row_deleted` judged against the
         // state the write itself produced. Bound after the key, as $<pk count + 1>.
         try appendIdent(&out, alloc, meta.version_col);
-        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " = ${d}::timestamptz) AS zb_ours FROM ", .{meta.pk_cols.len + 1}));
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " = ${d}{s}) AS zb_ours FROM ", .{ meta.pk_cols.len + 1, meta.version_type.castSuffix() orelse "" }));
         try appendIdent(&out, alloc, table);
         try out.appendSlice(alloc, " WHERE ");
         for (meta.pk_cols, 0..) |col, i| {
@@ -2198,6 +2312,31 @@ pub const MutationListener = struct {
         const placeholder = try std.fmt.allocPrint(alloc, "${d}", .{n});
         const clamp = meta.version_type.clampExpr() orelse return placeholder;
         return try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ clamp.prefix, placeholder, clamp.suffix });
+    }
+
+    /// §10fj: the value the last-write-wins guard compares the stored version WITH.
+    /// A timestamp compares with its clamped self (what it would store); an integer
+    /// compares with the raw value — the write wins if it is newer — and what it
+    /// stores is bounded separately (`versionStoreExpr`).
+    fn versionGuardExpr(alloc: std.mem.Allocator, meta: *const TableMeta, n: usize) ![]const u8 {
+        if (meta.version_type == .integer) return try std.fmt.allocPrint(alloc, "${d}::bigint", .{n});
+        return renderVersionExpr(alloc, meta, n);
+    }
+
+    /// §10fj: what an UPDATE stores in the version column: the clamped timestamp, or
+    /// for an integer at most one step above the stored value (`qualifier` names the
+    /// existing row — the table in `ON CONFLICT DO UPDATE`, nothing in a plain UPDATE).
+    fn versionStoreExpr(alloc: std.mem.Allocator, meta: *const TableMeta, qualifier: ?[]const u8, n: usize) ![]const u8 {
+        if (meta.version_type != .integer) return renderVersionExpr(alloc, meta, n);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, "LEAST(${d}::bigint, ", .{n}));
+        if (qualifier) |q| {
+            try appendIdent(&out, alloc, q);
+            try out.appendSlice(alloc, ".");
+        }
+        try appendIdent(&out, alloc, meta.version_col);
+        try out.appendSlice(alloc, " + 1)");
+        return out.items;
     }
 
     /// INSERT … ON CONFLICT (<catalog pk>) DO UPDATE … WHERE stored.version < incoming.
@@ -2289,13 +2428,32 @@ pub const MutationListener = struct {
             try appendIdent(&sql, alloc, col);
         }
         try sql.appendSlice(alloc, ") DO UPDATE SET ");
+        var version_param: usize = 0;
+        for (cols.items, 0..) |col, i| {
+            if (std.mem.eql(u8, col, meta.version_col)) {
+                version_param = i + 1;
+                break;
+            }
+        }
+        // §10fj: an integer version is compared raw and stored at most one step up —
+        // EXCLUDED holds the VALUES clamp (at most 1, the fresh-row cap), which is
+        // the wrong bound for an update, so the parameter itself is used here.
+        const incoming: []const u8 = if (meta.version_type == .integer)
+            try versionGuardExpr(alloc, meta, version_param)
+        else
+            try std.fmt.allocPrint(alloc, "EXCLUDED.\"{s}\"", .{meta.version_col});
         var set_count: usize = 0;
         for (cols.items) |col| {
             if (meta.isPk(col)) continue; // never reassign the key it matched on
             if (set_count > 0) try sql.appendSlice(alloc, ", ");
             try appendIdent(&sql, alloc, col);
-            try sql.appendSlice(alloc, " = EXCLUDED.");
-            try appendIdent(&sql, alloc, col);
+            try sql.appendSlice(alloc, " = ");
+            if (std.mem.eql(u8, col, meta.version_col) and meta.version_type == .integer) {
+                try sql.appendSlice(alloc, try versionStoreExpr(alloc, meta, mutation.table, version_param));
+            } else {
+                try sql.appendSlice(alloc, "EXCLUDED.");
+                try appendIdent(&sql, alloc, col);
+            }
             set_count += 1;
         }
         // `IS NULL OR` because a NULL stored version makes the comparison NULL, which
@@ -2308,8 +2466,8 @@ pub const MutationListener = struct {
         try appendIdent(&sql, alloc, mutation.table);
         try sql.appendSlice(alloc, ".");
         try appendIdent(&sql, alloc, meta.version_col);
-        try sql.appendSlice(alloc, " < EXCLUDED.");
-        try appendIdent(&sql, alloc, meta.version_col);
+        try sql.appendSlice(alloc, " < ");
+        try sql.appendSlice(alloc, incoming);
 
         // ── The tie ────────────────────────────────────────────────────────────────
         //
@@ -2336,8 +2494,8 @@ pub const MutationListener = struct {
             try appendIdent(&sql, alloc, mutation.table);
             try sql.appendSlice(alloc, ".");
             try appendIdent(&sql, alloc, meta.version_col);
-            try sql.appendSlice(alloc, " = EXCLUDED.");
-            try appendIdent(&sql, alloc, meta.version_col);
+            try sql.appendSlice(alloc, " = ");
+            try sql.appendSlice(alloc, incoming);
             try sql.appendSlice(alloc, " AND coalesce(");
             try appendIdent(&sql, alloc, mutation.table);
             try sql.appendSlice(alloc, ".");
@@ -2347,13 +2505,6 @@ pub const MutationListener = struct {
             try sql.appendSlice(alloc, ", ''))");
         }
 
-        var version_param: usize = 0;
-        for (cols.items, 0..) |col, i| {
-            if (std.mem.eql(u8, col, meta.version_col)) {
-                version_param = i + 1;
-                break;
-            }
-        }
         try self.exec(
             alloc,
             conn,
@@ -2452,7 +2603,9 @@ pub const MutationListener = struct {
                 if (std.mem.eql(u8, col, cc)) client_param = i + 1;
             }
         }
-        const version_expr = try renderVersionExpr(alloc, meta, version_param);
+        // §10fj: the guard compares with the raw (integer) or clamped (timestamp)
+        // value; the version column stores at most one step up.
+        const version_expr = try versionGuardExpr(alloc, meta, version_param);
 
         var sql: std.ArrayListUnmanaged(u8) = .empty;
         try sql.appendSlice(alloc, "UPDATE ");
@@ -2462,7 +2615,11 @@ pub const MutationListener = struct {
             if (i > 0) try sql.appendSlice(alloc, ", ");
             try appendIdent(&sql, alloc, col);
             try sql.appendSlice(alloc, " = ");
-            try sql.appendSlice(alloc, try renderValuePlaceholder(alloc, meta, col, i + 1));
+            if (std.mem.eql(u8, col, meta.version_col)) {
+                try sql.appendSlice(alloc, try versionStoreExpr(alloc, meta, null, i + 1));
+            } else {
+                try sql.appendSlice(alloc, try renderValuePlaceholder(alloc, meta, col, i + 1));
+            }
         }
         try sql.appendSlice(alloc, " WHERE ");
         for (meta.pk_cols, key_values, 0..) |col, val, i| {
@@ -2535,7 +2692,10 @@ pub const MutationListener = struct {
         // ⚠️ The tombstone gets the same clamped expression. A future `deleted_at` is not
         // cosmetic: the sweeper reaps on `deleted_at < now() - threshold`, so a row
         // tombstoned a year ahead is never reaped and the soft delete never completes.
-        const version_expr = try renderVersionExpr(alloc, meta, 1);
+        // §10fj: an integer version compares raw and stores at most one step up; its
+        // tombstone is stamped `now()` — a counter is not an instant the sweeper can
+        // age (and `deleted_at = 5` was a type error before this existed).
+        const version_expr = try versionGuardExpr(alloc, meta, 1);
 
         if (meta.tombstone_col) |tombstone| {
             try sql.appendSlice(alloc, "UPDATE ");
@@ -2543,11 +2703,11 @@ pub const MutationListener = struct {
             try sql.appendSlice(alloc, " SET ");
             try appendIdent(&sql, alloc, tombstone);
             try sql.appendSlice(alloc, " = ");
-            try sql.appendSlice(alloc, version_expr);
+            try sql.appendSlice(alloc, if (meta.version_type == .integer) "now()" else version_expr);
             try sql.appendSlice(alloc, ", ");
             try appendIdent(&sql, alloc, meta.version_col);
             try sql.appendSlice(alloc, " = ");
-            try sql.appendSlice(alloc, version_expr);
+            try sql.appendSlice(alloc, try versionStoreExpr(alloc, meta, null, 1));
             try params.append(alloc, version_text);
         } else {
             try sql.appendSlice(alloc, "DELETE FROM ");

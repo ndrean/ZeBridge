@@ -67,6 +67,11 @@ fn dupeZ(s: []const u8) ?[*:0]u8 {
     return @ptrCast(out);
 }
 
+fn boolField(args: Value, key: []const u8) bool {
+    const v = args.object.get(key) orelse return false;
+    return v == .bool and v.bool;
+}
+
 fn strArrField(a: std.mem.Allocator, args: Value, key: []const u8) ![]const []const u8 {
     const f = if (args == .object) args.object.get(key) else null;
     if (f == null or f.? != .array) return &.{};
@@ -231,10 +236,10 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         return out.items;
     }
     if (eq(u8, name, "createTable")) {
-        return try core.valueToString(a, try core.createTableSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array));
+        return try core.valueToString(a, try core.createTableSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array, boolField(args, "strict")));
     }
     if (eq(u8, name, "rebuildSteps")) {
-        return try core.valueToString(a, try core.rebuildSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array, try strArrField(a, args, "existing")));
+        return try core.valueToString(a, try core.rebuildSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array, try strArrField(a, args, "existing"), boolField(args, "strict")));
     }
     if (eq(u8, name, "readOnlySql")) {
         return if (core.isReadOnlySql(args.object.get("sql").?.string)) "true" else "false";
@@ -402,6 +407,12 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         const f = o.object.get("seedStreaming") orelse break :blk false;
         break :blk f == .bool and f.bool;
     };
+    // seedStreamingAboveBytes (§10fh): with seedStreaming, a step whose compressed
+    // object is smaller takes the whole-object path anyway. Default 8 MiB.
+    const seed_streaming_above: usize = blk: {
+        const f = o.object.get("seedStreamingAboveBytes") orelse break :blk 8 * 1024 * 1024;
+        break :blk if (f == .integer and f.integer >= 0) @intCast(f.integer) else 8 * 1024 * 1024;
+    };
     // The tables, parents first, each its own allocation so the box can free them.
     const tv = o.object.get("tables");
     const ntab: usize = if (tv != null and tv.? == .array) tv.?.array.items.len else 0;
@@ -427,6 +438,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .heartbeat_ms = heartbeat_ms,
             .seed_chunk_rows = seed_chunk_rows,
             .seed_streaming = seed_streaming,
+            .seed_streaming_above = seed_streaming_above,
             .db_path = db,
             .db_url = if (db_url) |u| u.ptr else null,
             .principal = principal,
@@ -603,7 +615,7 @@ fn flushJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     // parsing stderr (§10dx).
     var vc: std.json.ObjectMap = .empty;
     const c = b.c.verdict_counts;
-    inline for (.{ "accepted", "stale", "rejected", "row_deleted", "failed", "other" }) |name| {
+    inline for (.{ "accepted", "stale", "rejected", "row_deleted", "failed", "rate_limited", "other" }) |name| {
         try vc.put(a, name, .{ .integer = @intCast(@field(c, name)) });
     }
     try out.put(a, "verdicts", .{ .object = vc });

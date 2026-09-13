@@ -337,7 +337,11 @@ would otherwise accept it. Check `suspended` before `writable`.
   one slot cannot follow two publications that name the same table with different
   column lists (`cannot use different column lists for table … in different
   publications`), so a second list for a table is another bridge's.
-* `sqlite.columns[].type` is the SQLite dialect derived by the bridge.
+* `sqlite.columns[].type` is the SQLite dialect derived by the bridge — one of
+  `INTEGER`, `REAL`, `TEXT`, `BLOB`, so a client creates the table `STRICT`: a value
+  that is not of the column's type is refused at the bind, never stored as whatever
+  arrived (both clients do; a replica created before this is rebuilt once, its rows
+  cast to the declared types).
 * `lsn` is the WAL position this schema is valid from. For DDL-driven schemas it is
   the exact position of the DDL event; for boot-time schemas it is the WAL position
   read once at bridge startup.
@@ -1520,8 +1524,17 @@ output rather than the wire produces a value the bridge never emits.
   PostgreSQL does not have, and every comparison you make with it will be against a value
   that exists nowhere.
 
-  ⚠️ Timestamp version columns only. An integer version has no future, and capping one
-  would corrupt a sound scheme. Tested by `scripts/scenarios/clamp.py`.
+  Tested by `scripts/scenarios/clamp.py`.
+* ⚠️ **An integer version is capped at one step.** A counter has the same hole in a
+  different coat: a client that writes 2^62 wins once and nothing is ever greater,
+  so the row is frozen for everyone. The bridge compares with the value you sent —
+  the write wins if it is newer — but STORES at most one step: a fresh row at most
+  `1`, an update or a delete at most `stored + 1`. When the two differ the verdict
+  says so, `reason: "version_clamped"` with `version` carrying the value stored;
+  adopt it, and send `stored + 1` on your next write as a counter is meant to be
+  advanced. A delete on such a table stamps the tombstone with the database's
+  `now()`, since a counter is not an instant the sweeper can age. Tested by
+  `scripts/scenarios/intclamp.py`.
 
 #### The column's *type* decides whether last-write-wins is sound
 
@@ -1815,7 +1828,9 @@ reply published under it would be read back by the bridge as if it were a write.
 | field | meaning |
 | --- | --- |
 | `status` | what to do with the outbox entry — the table in §7.1 |
-| `reason` | machine-readable qualifier; `version_clamped` on an accepted write whose version was capped (§7.3), the error name otherwise |
+| `reason` | machine-readable qualifier; `version_clamped` on an accepted write whose version was capped (§7.3), `rate_limited` on a `failed` write refused by the ingress rate limit past the delivery limit, the error name otherwise |
+| — | a publish itself may be refused by the MUTATIONS stream (`maximum messages per subject exceeded`): the principal has that many writes queued. Not a verdict — the `PubAck` is the error. Both clients keep the entry and try again after their grace |
+| `retry_after_ms` | only with `rate_limited`: how long to hold the outbox before sending again. Both clients honour it. Rare: a write refused by the rate limit is normally NAK'd with a delay and redelivered by JetStream when its turn comes, so the client sees a slower `accepted` and nothing else; this verdict comes only after the delivery limit (fifteen refusals) |
 | `sqlstate` | PostgreSQL's code when it refused; empty on success |
 | `detail` | **first line only** of the server's message. Its `DETAIL` can quote rows written by other tenants, so the rest is kept to the operator's log |
 | `seq` | the `MUTATIONS` stream sequence — the number the client already got in its `PubAck`, so it can correlate without having stored its own `msg_id` |

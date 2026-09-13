@@ -106,6 +106,22 @@ pub const ObjectPull = struct {
         return 0;
     }
 
+    /// The whole object, read through the same pull consumer and verified — for a
+    /// step below the streaming threshold, where the whole-object apply is faster and
+    /// the memory is small anyway.
+    pub fn readAll(self: *ObjectPull, a: std.mem.Allocator) ![]u8 {
+        const out = try a.alloc(u8, @intCast(self.size));
+        var n: usize = 0;
+        while (n < out.len) {
+            const got = try self.read(out[n..]);
+            if (got == 0) break;
+            n += got;
+        }
+        if (n != out.len) return error.ObjectTruncated;
+        try self.verify();
+        return out;
+    }
+
     /// The object's digest against what was read — a chunk lost or replaced is an error.
     pub fn verify(self: *ObjectPull) !void {
         if (self.chunk_index < self.chunks) return error.ObjectTruncated;

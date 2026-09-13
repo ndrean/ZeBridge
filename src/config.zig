@@ -674,6 +674,11 @@ pub const RuntimeConfig = struct {
     generation_cadence_seconds: u64 = Generations.default_cadence_seconds,
     generation_chain_depth: u32 = Generations.default_chain_depth,
     generation_workers: u32 = Generations.default_workers,
+    /// §10fk: the mutation ingress rate limit, writes per second per principal (and
+    /// per tenant); 0 is off. `mutation_rate_burst` is the bucket's size — what a
+    /// client may send at once after a quiet spell; 0 means one second's worth.
+    mutation_rate_per_principal: u32 = 0,
+    mutation_rate_burst: u32 = 0,
     /// CDC stream retention (StreamLimits, §10eg); the age defaults to three cadences.
     cdc_max_age_seconds: u64 = Nats.default_cdc_max_age_cadences * Generations.default_cadence_seconds,
     cdc_max_bytes: i64 = @intCast(Nats.default_cdc_max_bytes),

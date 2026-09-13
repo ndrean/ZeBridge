@@ -61,6 +61,8 @@ GROUPS = {
         "offline":       ("client", "outbox replay by version"),
         "tiebreak":      ("client", "equal versions resolved by the tiebreak column"),
         "clamp":         ("client", "future versions clamped"),
+        "ratelimit":     ("bridge", "the ingress rate limit: bob floods 200 writes, the excess gets a failed/rate_limited verdict with retry_after_ms and no redelivery, alice in another tenant is answered within 2 s during the flood, libzb holds its outbox and loses nothing; owns the only bridge (§10fk)"),
+        "intclamp":      ("client", "an integer version column cannot be frozen by one write: a fresh row stores at most 1, an update or a delete at most stored + 1, the verdict says what was stored; the tombstone takes now() (§10fj)"),
         "clockskew":     ("client", "LWW under a lying clock: theft bounded, loss audible, replicas convergent"),
         "crdt":          ("client", "map-of-registers on jsonb: blind replace loses intents, merge-on-stale loses none"),
         "widthguard":    ("client", "row width guard, psql and edge"),

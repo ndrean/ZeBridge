@@ -1183,6 +1183,50 @@
           "params": []
         }
       ]
+    },
+    {
+      "name": "the same, STRICT (SQLite): the keyword after the body (\u00a710fi)",
+      "table": "salaries",
+      "cols": [
+        {
+          "name": "uid",
+          "type": "TEXT"
+        },
+        {
+          "name": "user_id",
+          "type": "INTEGER",
+          "required": true
+        },
+        {
+          "name": "tenant_id",
+          "type": "TEXT"
+        }
+      ],
+      "pkCols": [
+        "uid"
+      ],
+      "fks": [
+        {
+          "columns": [
+            "user_id"
+          ],
+          "references": "users",
+          "parent_columns": [
+            "id"
+          ]
+        }
+      ],
+      "steps": [
+        {
+          "sql": "DROP TABLE IF EXISTS salaries;",
+          "params": []
+        },
+        {
+          "sql": "CREATE TABLE salaries (\"uid\" TEXT NOT NULL PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"tenant_id\" TEXT, FOREIGN KEY (\"user_id\") REFERENCES users (\"id\")) STRICT;",
+          "params": []
+        }
+      ],
+      "strict": true
     }
   ],
   "rebuildSteps": [
@@ -1263,6 +1307,52 @@
           "params": []
         }
       ]
+    },
+    {
+      "name": "FINDING 9's legitimate path: tmp, copy COMMON columns, swap \u2014 STRICT (\u00a710fi)",
+      "table": "t",
+      "cols": [
+        {
+          "name": "id",
+          "type": "INTEGER"
+        },
+        {
+          "name": "v",
+          "type": "TEXT"
+        }
+      ],
+      "pkCols": [
+        "id"
+      ],
+      "fks": [],
+      "existing": [
+        "id",
+        "v",
+        "gone"
+      ],
+      "steps": [
+        {
+          "sql": "DROP TABLE IF EXISTS t__migrating;",
+          "params": []
+        },
+        {
+          "sql": "CREATE TABLE t__migrating (\"id\" INTEGER NOT NULL PRIMARY KEY, \"v\" TEXT) STRICT;",
+          "params": []
+        },
+        {
+          "sql": "INSERT INTO t__migrating (\"id\", \"v\") SELECT CAST(\"id\" AS INTEGER), CAST(\"v\" AS TEXT) FROM t;",
+          "params": []
+        },
+        {
+          "sql": "DROP TABLE IF EXISTS t;",
+          "params": []
+        },
+        {
+          "sql": "ALTER TABLE t__migrating RENAME TO t;",
+          "params": []
+        }
+      ],
+      "strict": true
     }
   ],
   "diffColumns": [

@@ -1000,27 +1000,53 @@ fn sqlStep(a: std.mem.Allocator, sql: []const u8) !Value {
 }
 
 /// core.ts createTableSteps.
-pub fn createTableSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Array, pk: []const []const u8, fks: std.json.Array) !Value {
+/// `strict` (§10fi): SQLite's STRICT tables — a bind that is not of the column's
+/// declared type is refused, never stored as whatever arrived. SQLite only.
+pub fn createTableSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Array, pk: []const []const u8, fks: std.json.Array, strict: bool) !Value {
     var steps = std.json.Array.init(a);
     try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS {s};", .{table})));
-    try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "CREATE TABLE {s} ({s});", .{ table, try tableBody(a, cols, pk, fks) })));
+    try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "CREATE TABLE {s} ({s}){s};", .{ table, try tableBody(a, cols, pk, fks), if (strict) " STRICT" else "" })));
     return .{ .array = steps };
 }
 
+/// §10fi: a SQLite table created before STRICT existed is rebuilt once (rows kept).
+/// Empty ddl → false: no table yet, the create path owns it.
+pub fn strictMissing(ddl: []const u8) bool {
+    if (ddl.len == 0) return false;
+    var t = std.mem.trim(u8, ddl, " \t\r\n;");
+    t = std.mem.trimEnd(u8, t, " \t\r\n");
+    if (t.len < 6) return true;
+    return !std.ascii.eqlIgnoreCase(t[t.len - 6 ..], "STRICT");
+}
+
+test "strictMissing: only a trailing STRICT counts (§10fi)" {
+    try std.testing.expect(!strictMissing(""));
+    try std.testing.expect(strictMissing("CREATE TABLE t (\"a\" TEXT)"));
+    try std.testing.expect(!strictMissing("CREATE TABLE t (\"a\" TEXT) STRICT"));
+    try std.testing.expect(!strictMissing("CREATE TABLE t (\"a\" TEXT) strict;\n"));
+}
+
 /// core.ts rebuildSteps (finding 9's legitimate drop/recreate).
-pub fn rebuildSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Array, pk: []const []const u8, fks: std.json.Array, existing: []const []const u8) !Value {
+pub fn rebuildSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Array, pk: []const []const u8, fks: std.json.Array, existing: []const []const u8, strict: bool) !Value {
     const tmp = try std.fmt.allocPrint(a, "{s}__migrating", .{table});
     var steps = std.json.Array.init(a);
     try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS {s};", .{tmp})));
-    try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "CREATE TABLE {s} ({s});", .{ tmp, try tableBody(a, cols, pk, fks) })));
+    try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "CREATE TABLE {s} ({s}){s};", .{ tmp, try tableBody(a, cols, pk, fks), if (strict) " STRICT" else "" })));
     var common: std.ArrayList([]const u8) = .empty;
+    var select: std.ArrayList([]const u8) = .empty;
     for (cols.items) |c| {
         const n = colName(c);
-        if (containsStr(existing, n)) try common.append(a, n);
+        if (!containsStr(existing, n)) continue;
+        try common.append(a, n);
+        // A STRICT target refuses a value of another type where affinity used to
+        // convert it (a re-typed column: TEXT '1.5' into REAL): the copy casts.
+        const ty: []const u8 = if (c == .object) (if (c.object.get("type")) |t| (if (t == .string) t.string else "TEXT") else "TEXT") else "TEXT";
+        try select.append(a, if (strict) try std.fmt.allocPrint(a, "CAST(\"{s}\" AS {s})", .{ n, ty }) else try std.fmt.allocPrint(a, "\"{s}\"", .{n}));
     }
     if (common.items.len > 0) {
         const list = try quotedJoin(a, common.items);
-        try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s};", .{ tmp, list, list, table })));
+        const sel = try std.mem.join(a, ", ", select.items);
+        try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s};", .{ tmp, list, sel, table })));
     }
     try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS {s};", .{table})));
     try steps.append(try sqlStep(a, try std.fmt.allocPrint(a, "ALTER TABLE {s} RENAME TO {s};", .{ tmp, table })));

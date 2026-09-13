@@ -64,6 +64,8 @@ async def main():
     while time.monotonic() < deadline and not em.q(f"SELECT 1 FROM {T}"): em.poll(300)
     rcols = em.cols(T)
     check(f"the replica has neither column: {rcols}", "fts" not in rcols and "secret" not in rcols and "body" in rcols)
+    ddl = em.q(f"SELECT sql FROM sqlite_master WHERE name = '{T}'")
+    check("the replica's table is STRICT (§10fi)", bool(ddl) and ddl[0][0].rstrip().upper().endswith("STRICT"))
     r = em.q(f"SELECT body FROM {T}")
     check("the seed carried the body", bool(r) and r[0][0] == "the quick brown fox")
     zb.psql(f"INSERT INTO {T} (body, secret, tenant_id) VALUES ('lazy dog', 'hush 2', '{TENANT}')", quiet=True)

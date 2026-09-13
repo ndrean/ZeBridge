@@ -72,6 +72,12 @@ pub const Options = struct {
     /// window, one chunk of rows and its index. The sort is per chunk, so the b-tree
     /// sees `seed_chunk_rows` runs of ordered keys instead of one — slower, bounded.
     seed_streaming: bool = false,
+    /// §10fh: with `seed_streaming` on, a step whose COMPRESSED object is smaller than
+    /// this takes the whole-object path anyway — its inflated size is small, and the
+    /// whole-object apply is twice as fast. The pull reader knows the size from the
+    /// object's meta before reading a chunk. 8 MiB compressed is roughly 90 MB
+    /// inflated (test_types: 98 MiB → 1.1 GB); a delta is a few hundred bytes.
+    seed_streaming_above: usize = 8 * 1024 * 1024,
 };
 
 const TableState = struct {
@@ -161,6 +167,9 @@ pub const SyncClient = struct {
     /// fresh process (and a real outage, longer than the grace) still runs the full
     /// pass, which is what PROTOCOL §7.4b asks. Keys owned here, freed on settle.
     sent_at: std.StringHashMapUnmanaged(i64) = .empty,
+    /// §10fk: a `rate_limited` verdict names `retry_after_ms`; the outbox is not
+    /// flushed before then. The write stays queued, exactly as after `failed`.
+    hold_until_ms: i64 = 0,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
     /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
     /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
@@ -435,7 +444,7 @@ pub const SyncClient = struct {
                 try execSql(st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS {s}_view;", .{table}));
                 try execSql(st, a, "PRAGMA foreign_keys = OFF;");
             }
-            const steps = try core.createTableSteps(a, table, cols_v.array, pk, fks.array);
+            const steps = try core.createTableSteps(a, table, cols_v.array, pk, fks.array, st.engine == .sqlite);
             for (steps.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
             if (rekey) {
                 try execSql(st, a, "PRAGMA foreign_keys = ON;");
@@ -452,9 +461,12 @@ pub const SyncClient = struct {
             // §10fd: PostgreSQL keeps no CREATE TABLE text; an FK change is not detected there.
             const ddl: []const u8 = (try st.tableDdl(a, table)) orelse "";
             const fk_differs = if (st.engine == .postgres) false else try core.fkTextDiffers(a, ddl, fk_clauses);
+            // §10fi: a table from before STRICT is rebuilt once, rows carried.
+            const strict_missing = st.engine == .sqlite and core.strictMissing(ddl);
+            if (strict_missing) std.debug.print("{s}: not a STRICT table — rebuilding, rows kept\n", .{table});
             const shape_changed = renames.len > 0 or added.len > 0 or removed.len > 0 or retyped.len > 0;
 
-            if (shape_changed or fk_differs) {
+            if (shape_changed or fk_differs or strict_missing) {
                 // The view goes FIRST (§1.17): DROP COLUMN re-validates every schema
                 // object referencing the table, and a stale view kills the ALTER.
                 try execSql(st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS {s}_view;", .{table}));
@@ -478,7 +490,7 @@ pub const SyncClient = struct {
                         execSql(st, a, try std.fmt.allocPrint(a, "ALTER TABLE {s} ADD COLUMN \"{s}\" {s}{s};", .{ table, n.string, ty, dflt })) catch break :blk false;
                     }
                     // SQLite has no ALTER TABLE ADD/DROP CONSTRAINT: an FK change is a rebuild.
-                    if (fk_differs) break :blk false;
+                    if (fk_differs or strict_missing) break :blk false;
                     // Nor ALTER COLUMN TYPE (§10dg): a re-typed column is a rebuild that
                     // copies the rows — affinity converts what converts.
                     if (retyped.len > 0) {
@@ -492,7 +504,7 @@ pub const SyncClient = struct {
                     // of a referenced parent is refused (measured: users, blocked by
                     // salaries' FK). Off for the surgery, on after — data is copied.
                     try execSql(st, a, "PRAGMA foreign_keys = OFF;");
-                    const steps = try core.rebuildSteps(a, table, cols_v.array, pk, fks.array, existing.?);
+                    const steps = try core.rebuildSteps(a, table, cols_v.array, pk, fks.array, existing.?, st.engine == .sqlite);
                     const carried = blk: {
                         for (steps.array.items) |stp| {
                             const sql = stp.object.get("sql").?.string;
@@ -510,7 +522,7 @@ pub const SyncClient = struct {
                         // the child's copy hit its FOREIGN KEY. Empty now; the caller
                         // drops the watermark and the next full brings the rows back.
                         try execSql(st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}__migrating\";", .{table}));
-                        const fresh = try core.createTableSteps(a, table, cols_v.array, pk, fks.array);
+                        const fresh = try core.createTableSteps(a, table, cols_v.array, pk, fks.array, st.engine == .sqlite);
                         for (fresh.array.items) |stp| try execSql(st, a, stp.object.get("sql").?.string);
                     }
                     try execSql(st, a, "PRAGMA foreign_keys = ON;");
@@ -1318,6 +1330,7 @@ pub const SyncClient = struct {
         const st = self.states.getPtr(table).?;
         const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
         var applied: usize = 0;
+        var streamed: usize = 0;
         // Phase timers (§10ez): where a seed's time goes — fetch, inflate, decode, apply.
         var ph = [_]i64{ 0, 0, 0, 0 };
         // §10ez: a seed inserts millions of random keys into a b-tree; SQLite's default
@@ -1333,11 +1346,19 @@ pub const SyncClient = struct {
             const step_a = sa.allocator();
             var t_ph = msNow();
             const is_full = std.mem.eql(u8, step.object.get("kind").?.string, "full");
-            if (self.opts.seed_streaming) {
-                applied += try self.applyStepStreaming(step_a, table, st, man, step, bucket, is_full, &ph);
-                continue;
-            }
-            const raw = try self.t.objectGetBytes(step_a, bucket, step.object.get("name").?.string);
+            const raw: []const u8 = if (self.opts.seed_streaming) blk: {
+                // The object's size is in its meta, read before any chunk: a small
+                // step takes the whole-object path through the same pull reader.
+                var pull = try transport.ObjectPull.open(self.t, step_a, bucket, step.object.get("name").?.string);
+                if (pull.size >= self.opts.seed_streaming_above) {
+                    defer pull.deinit();
+                    applied += try self.applyStepStreaming(step_a, table, st, man, step, &pull, is_full, &ph);
+                    streamed += 1;
+                    continue;
+                }
+                defer pull.deinit();
+                break :blk try pull.readAll(step_a);
+            } else try self.t.objectGetBytes(step_a, bucket, step.object.get("name").?.string);
             // §10x: a delta names the dictionary it was compressed with; fetch it
             // once per era from the same bucket and keep it (immutable by name, so
             // client-lifetime is the RIGHT arena here — the one place in this fn).
@@ -1436,7 +1457,11 @@ pub const SyncClient = struct {
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
         try pruneInboxSeeded(&self.st, a, table, st.seed_lsn orelse 0);
-        std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms{s}\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], if (self.opts.seed_streaming) " (streaming: fetch+inflate as read, decode = index+sort per chunk)" else "" });
+        if (streamed > 0) {
+            std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms ({d} of {d} step(s) streamed: fetch+inflate as read, decode = the stage's sort)\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], streamed, plan.array.items.len });
+        } else {
+            std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3] });
+        }
     }
 
     /// §10fh: one chain step, streamed. The object is read from the store a chunk at a
@@ -1447,8 +1472,9 @@ pub const SyncClient = struct {
     /// sorted by key and applied through the same ChainStep as the whole-object path;
     /// the chunk buffer is reused, so a step never holds more than one chunk of rows.
     /// Returns the rows applied.
-    fn applyStepStreaming(self: *SyncClient, step_a: std.mem.Allocator, table: []const u8, st: *TableState, man: Value, step: Value, bucket: []const u8, is_full: bool, ph: *[4]i64) !usize {
+    fn applyStepStreaming(self: *SyncClient, step_a: std.mem.Allocator, table: []const u8, st: *TableState, man: Value, step: Value, pull: *transport.ObjectPull, is_full: bool, ph: *[4]i64) !usize {
         const name = step.object.get("name").?.string;
+        const bucket = try std.fmt.allocPrint(step_a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
         var dict: ?[]const u8 = null;
         if (step.object.get("dict")) |dv| if (dv == .string) {
             if (self.dicts.get(dv.string)) |d| {
@@ -1460,9 +1486,8 @@ pub const SyncClient = struct {
                 dict = d;
             }
         };
-        var res = try transport.ObjectPull.open(self.t, step_a, bucket, name);
-        defer res.deinit();
-        var zs = try StreamInflate.init(self.a, &res, dict);
+        const res = pull;
+        var zs = try StreamInflate.init(self.a, res, dict);
         defer zs.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
@@ -2434,6 +2459,7 @@ pub const SyncClient = struct {
         try self.ensureOutbox();
         const rows = try self.st.query(a, "SELECT msg_id, subject, payload, tbl, row_id, before FROM _zebridge_outbox ORDER BY created_at", &.{});
         if (rows.len == 0) return 0;
+        if (nowMillis() < self.hold_until_ms) return 0; // §10fk: rate limited — not yet
 
         // ⚠️ Gated ONCE, before the first publish — one read of the watermark for the
         // whole pass, and an entry that must not be sent is not sent even if an
@@ -2521,11 +2547,19 @@ pub const SyncClient = struct {
         if (self.sent_at.fetchRemove(mid)) |kv| self.a.free(kv.key);
         const v = parseStoredJson(a, data) catch return false;
         const status = if (v == .object) (if (v.object.get("status")) |x| (if (x == .string) x.string else "") else "") else "";
+        const reason0 = if (v == .object) (if (v.object.get("reason")) |x| (if (x == .string) x.string else "") else "") else "";
+        // §10fk: rate limited — keep the write, hold the outbox for what the verdict says.
+        if (std.mem.eql(u8, status, "failed") and std.mem.eql(u8, reason0, "rate_limited")) {
+            const wait: i64 = if (v.object.get("retry_after_ms")) |x| (if (x == .integer) x.integer else 1000) else 1000;
+            self.hold_until_ms = @max(self.hold_until_ms, nowMillis() + wait);
+            self.verdict_counts.rate_limited += 1;
+            return false;
+        }
         self.verdict_counts.count(status);
         if (!std.mem.eql(u8, status, "accepted")) {
             // Say it: a refusal that only the counters knew about was found by a run
             // whose every INSERT was rejected in silence (§10dx).
-            const reason = if (v == .object) (if (v.object.get("reason")) |x| (if (x == .string) x.string else "") else "") else "";
+            const reason = reason0;
             const detail = if (v == .object) (if (v.object.get("detail")) |x| (if (x == .string) x.string else "") else "") else "";
             std.debug.print("libzb: verdict {s} for {s}{s}{s}{s}{s}\n", .{ status, mid, if (reason.len > 0) " — " else "", reason, if (detail.len > 0) ": " else "", detail });
         }
@@ -2936,6 +2970,8 @@ pub const SyncClient = struct {
         rejected: usize = 0,
         row_deleted: usize = 0,
         failed: usize = 0,
+        /// §10fk: `failed` with reason `rate_limited` — counted here, not as failed.
+        rate_limited: usize = 0,
         other: usize = 0,
         fn count(self: *VerdictCounts, status: []const u8) void {
             if (std.mem.eql(u8, status, "accepted")) self.accepted += 1 else if (std.mem.eql(u8, status, "stale")) self.stale += 1 else if (std.mem.eql(u8, status, "rejected")) self.rejected += 1 else if (std.mem.eql(u8, status, "row_deleted")) self.row_deleted += 1 else if (std.mem.eql(u8, status, "failed")) self.failed += 1 else self.other += 1;

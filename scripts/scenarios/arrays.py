@@ -98,7 +98,7 @@ async def main():
 
     # ── the objects ─────────────────────────────────────────────────────────────
     import subprocess
-    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--tenant", "globex", "--table", T, "--no-replay"], capture_output=True, text=True)
+    a = subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "chain_audit.py"), "--pub", "my_pub", "--tenant", "globex", "--table", T, "--no-replay"], capture_output=True, text=True)
     check("the chain audit finds the objects exact (arrays against PostgreSQL's to_json)", "✓ the chain mirrors PostgreSQL" in a.stdout)
     if "✓ the chain mirrors PostgreSQL" not in a.stdout: print(a.stdout[-1200:])
     zb.psql(f"DROP TABLE public.{T}", quiet=True)

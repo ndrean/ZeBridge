@@ -309,31 +309,53 @@ ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
    tables. The seeding side needs nothing extra: the producer derives its table set from
    the publication and writes public tables under the open tenant's manifests.
 
-### 1.4b ⚠️ One table, two publications: the narrowest bridge sets the ceiling
+### 1.4b One bridge, one NATS, one table each — and columns are all or nothing
 
-Publishing a table into more than one publication is legitimate — two NATS
-deployments, or a staged migration — and it has one sharp edge worth knowing
-before you do it.
+Four rules decide what a table can and cannot hide. They come from how PostgreSQL
+publications, the bridge and NATS fit together, not from policy, so there is no
+configuration that gets around them.
 
-The row-width guard bakes `MIN(max_row_bytes)` across **every instance whose
-publication carries that table**. So the bridge with the smallest `BASE_BUF`
-sets the write ceiling for *all* writers of that table, including those who only
-talk to the wider feed. Worse, it is retroactive in one direction: rows already
-stored above the new ceiling remain perfectly valid in PostgreSQL and on the
-wider feed, but the narrow bridge cannot encode them — so **it quarantines the
-table on its own feed** (boot preflight, or `suspendForRowTooLarge` on the next
-touch) while the other bridge carries on. A partial, per-feed outage.
+1. **One NATS, one bridge.** A bridge discovers its tenants from the rows it sees and
+   creates a stream per tenant it meets; `zebridge_user_tenants` is database-wide, not
+   per bridge. Two bridges on one NATS would meet the same tenants and write the same
+   subjects, so a tenant cannot be "assigned" to a bridge. Several bridges on one NATS
+   is a realm feature (a runtime prefix outside the grammar hash), not a configuration.
+2. **A table is published by at most one bridge.** A publication column list is the
+   only way to leave columns out, and PostgreSQL refuses one slot that follows two
+   publications naming the same table with different lists (`cannot use different
+   column lists for table … in different publications`, pgoutput's own check). So a
+   second list for a table can only belong to another slot, another bridge, and rule 1
+   says there is not one. The bridge's descriptors, chain and audit read the column
+   list of the bridge's own publication (`--pub`); another publication naming the
+   table does not narrow them.
+3. **A bridge is all or nothing on a table's columns.** A column list hides a column
+   from every tenant and every principal the bridge serves; there is no per-principal
+   projection. Views by the bridge were considered and rejected: a chain, a bucket, a
+   descriptor, a seed, a tombstone fan-out and a version per view and tenant, all
+   imitating what a real table gets from PostgreSQL for free.
+4. **A column with a narrower audience is a migration, not a setting.** Move it into
+   its own table keyed by the same id, under the tenant that decides who reads it — a
+   field inside a `jsonb` included. Grants, RLS, tombstones and versions then apply to
+   it as to any table, and the client joins. `zebridge_enable` keeps `tsvector`,
+   `tsquery`, `xml` and range columns out of every list by default; the caller's
+   `columns` leaves out more. A column list must cover the replica identity — the key
+   and, for a tenant-scoped table, the tenant column — or PostgreSQL refuses every
+   UPDATE on the table, for everyone.
 
-That is the correct behaviour — a row must fit the narrowest carrier, and the
-alternative is a silent quarantine instead of a loud refusal — but it is silent
-about its *cause*. Two things now say it out loud: `zebridge_enable` returns a
-`WARNING` row when the table is already in another publication, and
-`scripts/zbdoctor.py` reports instances that disagree on the budget, naming each
-slot. Keep their `BASE_BUF` equal, or keep the publications disjoint.
-
-⚠️ Column lists (`zebridge_enable(..., columns => …)`) do **not** soften this:
-the guard is per-table, not per-projection, so a narrow bridge constrains writes
-to columns it does not carry. See NOTES §10ab.
+Publishing a table into a second publication for another NATS deployment or a
+staged migration is still legitimate, and it has one sharp edge. The row-width
+guard bakes `MIN(max_row_bytes)` across **every instance whose publication carries
+that table**, so the bridge with the smallest `BASE_BUF` sets the write ceiling for
+all writers of that table, including those who only talk to the wider feed. It is
+retroactive in one direction: rows already stored above the new ceiling remain
+valid in PostgreSQL and on the wider feed, but the narrow bridge cannot encode them,
+so it quarantines the table on its own feed (boot preflight, or
+`suspendForRowTooLarge` on the next touch) while the other bridge carries on — a
+partial, per-feed outage, correct but silent about its cause. `zebridge_enable`
+returns a `WARNING` row when the table is already in another publication, and
+`scripts/zbdoctor.py` reports instances that disagree on the budget. Keep their
+`BASE_BUF` equal, or keep the publications disjoint. Column lists do not soften
+this: the guard is per table, not per projection.
 
 ### 1.5 PostgreSQL: maintenance — tombstone GC, and why
 
@@ -628,11 +650,30 @@ Stated plainly, because half of what was found while building this was assumed r
 written down.
 
 * **A stolen credential** — full access to that identity. No subject grammar helps.
+  What it cannot do is crowd the others out: with `MUTATION_RATE_PER_PRINCIPAL` set,
+  its writes are served at the rate (NAK'd with the delay of their place in the queue,
+  redelivered by JetStream once each), its tenant's budget is a second bucket, and
+  another tenant's verdict latency does not move. Off by default; set it in
+  production. What bounds the pile itself is the stream's own policy, set where NATS
+  is set up (`up.sh`): `discard new`, workqueue retention and a per-subject cap
+  (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5000) — the subject carries the principal, so a
+  flooder's publishes are refused at the door past its backlog while everyone else's
+  go through. `zbdoctor` gate C reports a stream without it. What remains is the
+  floor: a refused publish still costs the server one small reply, because an honest
+  client must be told whether its write landed and the door cannot tell the two
+  apart. It is not amplification (the reply is smaller than the request, nothing is
+  stored, one credential is one socket), and a flood that persists is ended by
+  revoking the credential, not by anything in the protocol.
 * **A publisher bug** 🚧 — NATS enforces who may *subscribe*; nothing verifies the bridge
   tagged a row with the right tenant. That is the cost of one bridge serving many tenants.
   A publication and slot per tenant moves that guarantee back into PostgreSQL.
 * **Reads, today** — every client subscribed to `cdc.>` receives every published table's
   changes. Tenant routing is ✅ built for CDC and for the per-tenant generation buckets.
+* **Secrecy inside a tenant** — the chain bucket and the CDC stream are per tenant, so
+  every principal of a tenant can read every table the tenant is served. Restricting a
+  table to some principals of one tenant is not a supported statement; the unit of
+  read access is the tenant, and a narrower audience is a narrower tenant (rule 4 of
+  §1.4b).
 * **Schema metadata** — `$KV.schemas.<table>` is readable by every client: table names and
   column names, never row values. A deliberate trade; per-tenant schema copies would cost
   more than they protect.
@@ -704,12 +745,15 @@ refactor, or a migration — and most of the defects found while building this w
 | claim | where |
 | --- | --- |
 | grant vs schema disagreement; refusal reports SQLSTATE 42501 | ✅ `scripts/scenarios/writable.py` |
+| a column list is the bridge's own publication's: a stray second publication with a narrower list does not shrink the descriptor, the chain or the audit; the tsvector never travels; the list refreshes after ADD COLUMN | ✅ `scripts/scenarios/collist.py` — 9 assertions; the one-slot-two-lists refusal was proven by hand on PostgreSQL 18 |
 | a future-dated version is clamped to `now()` + tolerance, and the client is told what was stored | ✅ `scripts/scenarios/clamp.py` — asserts the cap, that the row unfreezes once the window passes, the verdict's wire format, and that a within-tolerance version is left untouched |
+| an integer version cannot freeze a row: a fresh row stores at most 1, an update or a delete at most stored + 1, the verdict names the value stored; the tombstone takes `now()`; the classify probe casts by the column's type | ✅ `scripts/scenarios/intclamp.py` — 9 assertions across insert, upsert, UPDATE, DELETE, `stale` and `row_deleted` |
 | every accepted write gets one definitive reply, and `stale` is distinguished from `row_deleted` | ✅ `scripts/scenarios/replies.py` — both zero-row outcomes produced deliberately, plus the first-write case that must not be mistaken for a grave |
 | a writer that bypasses the bridge still stamps the version and still soft-deletes; the sweeper alone may reap | ✅ `scripts/scenarios/guards.py` — 6 assertions, including both halves of the sweeper bypass |
 | a sequence-backed primary key on an edge-writable table is **refused** on the write path (`DbAllocatedKey`), not merely warned about — the one hazard whose damage is invisible when it happens | ✅ `scripts/scenarios/keys.py` |
 | a refused write costs the client **one message, not its subscription**: the same connection still receives CDC for the table it was refused on, no `suspended` schema is published, the shared registry is untouched, and other tables are unaffected | ✅ `scripts/scenarios/keys.py` — asserted on the refused client's own connection |
 | a client cannot suspend a table for everyone with one oversized write; the limit is discoverable as `max_row_bytes` | ✅ `scripts/scenarios/rowsize.py` — the DoS was measured before the guard existed |
+| one principal's flood is served at the configured rate, every write answered exactly once and none dropped; another tenant's write during the flood is answered within milliseconds; libzb loses nothing | ✅ `scripts/scenarios/ratelimit.py` — 6 assertions; owns the only bridge |
 | a row the change feed cannot carry is refused at WRITE time, both doors, atomically: edge writes get a `rejected` verdict (SQLSTATE 23514), psql an ordinary ERROR; bounded-only tables get no trigger at all | ✅ `scripts/scenarios/widthguard.py` — 6 assertions, including the small-payload fattening edit the ingress check cannot see |
 | a legacy oversized row (pre-guard data) is detected by the generation producer on its first build, quarantines the table on its first CDC touch (`$KV.schemas` says `"suspended": true`), is re-flagged by every boot's preflight from the stored data, and the de-quarantine recipe (repair, reboot) readmits mechanically | ✅ `scripts/scenarios/legacybait.py` — 7 assertions; owns the only bridge |
 | mutation envelope round trip, and the verdict it returns | ✅ `scripts/scenarios/mutate.py`, `examples/06-web-consumer/zb-mutate.mjs` |

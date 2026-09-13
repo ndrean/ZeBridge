@@ -18,7 +18,7 @@ def fresh_sqlite(path):
 
 class Lib:
     """The libzb client, host-driven: every observation is a poll."""
-    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None):
+    def __init__(self, db, tables, client_id="py-scenario", principal="omar", creds=None, db_url=None, seed_streaming=False, seed_chunk_rows=None, seed_streaming_above=None):
         if not LIBZB.exists():
             sys.exit(f"{LIBZB} missing — cd libzb && zig build -Doptimize=ReleaseFast")
         self.lib = lib = ctypes.CDLL(str(LIBZB))
@@ -37,7 +37,8 @@ class Lib:
             "url": zb.nats_server(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
             "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0,
             **({"dbUrl": db_url} if db_url else {}), **({"seedStreaming": True} if seed_streaming else {}),
-            **({"seedChunkRows": seed_chunk_rows} if seed_chunk_rows is not None else {})}).encode())
+            **({"seedChunkRows": seed_chunk_rows} if seed_chunk_rows is not None else {}),
+            **({"seedStreamingAboveBytes": seed_streaming_above} if seed_streaming_above is not None else {})}).encode())
         if not self.h: sys.exit("libzb open failed")
         r = self.take(lib.zb_client_sync(self.h))
         self.sync_error = r.get("error")

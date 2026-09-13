@@ -25,6 +25,7 @@ const publication_mod = @import("publication.zig");
 const catalogue = @import("catalogue.zig");
 const generation_producer = @import("generation_producer.zig");
 const mutation_listener = @import("mutation_listener.zig");
+const rate_limit = @import("rate_limit.zig");
 const catalog_epoch_mod = @import("catalog_epoch.zig");
 const c_imports = @import("c_imports.zig");
 const c = c_imports.c;
@@ -45,6 +46,7 @@ comptime {
     _ = @import("encoder.zig");
     _ = @import("numeric.zig");
     _ = @import("mutation_listener.zig");
+    _ = @import("rate_limit.zig");
     _ = @import("pg_conn.zig");
     _ = @import("pgoutput.zig");
     _ = @import("publication.zig");
@@ -1512,6 +1514,12 @@ pub fn main(init: std.process.Init) !void {
     // connection-budget arithmetic the scenarios pin stays untouched. Raise it
     // only where ingress throughput is the constraint (the serial lane measures
     // ~4.6k mutations/s colocated).
+    // §10fk: one token bucket table for every lane, so the limit is per principal
+    // across the bridge, not per lane.
+    var rate_limiter = rate_limit.Limiter.init(allocator, runtime_config.mutation_rate_per_principal, runtime_config.mutation_rate_burst);
+    defer rate_limiter.deinit();
+    if (rate_limiter.enabled()) log.info("🚦 ingress rate limit: {d} write(s)/s per principal and per tenant, burst {d}", .{ runtime_config.mutation_rate_per_principal, @as(u32, @intFromFloat(rate_limiter.burst)) });
+    http_srv.limiter = &rate_limiter;
     const ingress_lanes: usize = blk: {
         const raw = init.minimal.environ.getPosix("ZB_INGRESS_LANES") orelse break :blk 1;
         const n = std.fmt.parseInt(usize, raw, 10) catch break :blk 1;
@@ -1539,6 +1547,7 @@ pub fn main(init: std.process.Init) !void {
                 // at ingress turns a wasted round trip (publish → apply → 23514 verdict)
                 // into an immediate, cheaper rejection with the same outcome.
                 @min(own_event_buf, effective_row_budget),
+                &rate_limiter,
             );
             try mut_listeners.append(allocator, lane_ptr);
             try lane_ptr.start();

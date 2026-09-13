@@ -544,7 +544,12 @@ export function columnDdl(c: SchemaColumn, pkCols: string[]): string {
 /// IMMEDIATE`, so `SET CONSTRAINTS ALL DEFERRED` can hold the check to COMMIT the way
 /// SQLite's `PRAGMA defer_foreign_keys` does. Off by default — the fixtures pin the
 /// SQLite text, and SQLite would reject the clause.
-export type DdlOptions = { deferrable?: boolean };
+/// `strict` (§10fi): SQLite's `STRICT` tables — a value that is not of the column's
+/// declared type is refused at the bind instead of stored as whatever arrived. The
+/// type table is exact now (every PostgreSQL type maps to one of INTEGER, REAL, TEXT,
+/// BLOB), so a refusal is a bug surfacing, never a legitimate value. SQLite only;
+/// PostgreSQL types its columns itself.
+export type DdlOptions = { deferrable?: boolean; strict?: boolean };
 
 export function fkClausesFor(foreignKeys: SchemaForeignKey[], opts: DdlOptions = {}): string {
   return foreignKeys
@@ -570,7 +575,7 @@ export function createTableSteps(
 ): SqlStep[] {
   return [
     { sql: `DROP TABLE IF EXISTS ${table};`, params: [] },
-    { sql: `CREATE TABLE ${table} (${tableBody(cols, pkCols, foreignKeys, opts)});`, params: [] },
+    { sql: `CREATE TABLE ${table} (${tableBody(cols, pkCols, foreignKeys, opts)})${opts.strict ? ' STRICT' : ''};`, params: [] },
   ];
 }
 
@@ -585,11 +590,15 @@ export function rebuildSteps(
   const tmp = `${table}__migrating`;
   const steps: SqlStep[] = [
     { sql: `DROP TABLE IF EXISTS ${tmp};`, params: [] },
-    { sql: `CREATE TABLE ${tmp} (${tableBody(cols, pkCols, foreignKeys, opts)});`, params: [] },
+    { sql: `CREATE TABLE ${tmp} (${tableBody(cols, pkCols, foreignKeys, opts)})${opts.strict ? ' STRICT' : ''};`, params: [] },
   ];
-  const common = cols.map((c) => c.name).filter((n) => existingColumns.includes(n)).map((n) => `"${n}"`);
+  const kept = cols.filter((c) => existingColumns.includes(c.name));
+  const common = kept.map((c) => `"${c.name}"`);
+  // A STRICT target refuses a value of another type where affinity used to convert
+  // it (a re-typed column: TEXT '1.5' into REAL), so the copy casts to the new type.
+  const select = opts.strict ? kept.map((c) => `CAST("${c.name}" AS ${c.type})`) : common;
   if (common.length) {
-    steps.push({ sql: `INSERT INTO ${tmp} (${common.join(', ')}) SELECT ${common.join(', ')} FROM ${table};`, params: [] });
+    steps.push({ sql: `INSERT INTO ${tmp} (${common.join(', ')}) SELECT ${select.join(', ')} FROM ${table};`, params: [] });
   }
   steps.push({ sql: `DROP TABLE IF EXISTS ${table};`, params: [] });
   steps.push({ sql: `ALTER TABLE ${tmp} RENAME TO ${table};`, params: [] });
@@ -693,6 +702,12 @@ export function retypedColumns(storedTypeShape: string | null, cols: SchemaColum
 /// Text-compared because SQLite keeps no queryable "expected constraints", and
 /// the stored DDL is our own generated text. Empty ddl → false (no table yet:
 /// the create path owns it).
+/// §10fi: a SQLite table created before STRICT existed is rebuilt once (rows kept).
+/// Empty ddl → false: no table yet, the create path owns it.
+export function strictMissing(ddl: string): boolean {
+  return !!ddl && !/\)\s*STRICT\s*;?\s*$/i.test(ddl.trim());
+}
+
 export function fkTextDiffers(ddl: string, fkClauses: string): boolean {
   if (!ddl) return false;
   const hasAny = /FOREIGN KEY/i.test(ddl);

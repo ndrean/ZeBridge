@@ -81,6 +81,11 @@ const usage =
     \\                        (default: 1). More re-cut those pairs in parallel,
     \\                        each on its own connections; the cadence tick builds
     \\                        in turn. Memory: workers × the biggest full's bytes.
+    \\  MUTATION_RATE_PER_PRINCIPAL  writes per second one principal (and one
+    \\                        tenant) may send; the rest are redelivered by
+    \\                        JetStream when their turn comes (default: 0 = off)
+    \\  MUTATION_RATE_BURST   how many writes a quiet client may send at once
+    \\                        (default: one second's worth)
     \\  CDC_MAX_AGE_SECONDS   how long a CDC stream keeps an event (default:
     \\                        3 × cadence). The contract with the chain: a
     \\                        client further behind re-seeds and resumes at
@@ -552,6 +557,10 @@ pub const Args = struct {
             1,
             config.Generations.max_workers,
         );
+        // §10fk: the ingress rate limit. Off (0) unless set — an existing deployment
+        // sees no change, and the burst scenarios publish above any sane limit.
+        runtime_config.mutation_rate_per_principal = envUint(u32, init, "MUTATION_RATE_PER_PRINCIPAL", 0, 0, 1_000_000);
+        runtime_config.mutation_rate_burst = envUint(u32, init, "MUTATION_RATE_BURST", 0, 0, 1_000_000);
         // The CDC streams' retention (config.Nats.default_cdc_*, §10eg). The age is
         // the contract with the chain and defaults to three cadences — AFTER the
         // cadence is known; bytes and messages are disk valves.
