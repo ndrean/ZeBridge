@@ -26,49 +26,26 @@ buggy one (PROTOCOL.md §7.0).
 | **`bridge_reader`** | `SELECT` + `REPLICATION` — plus one deliberate exception: `INSERT`+`DELETE` (never `UPDATE`) on `zebridge_generations`, the generation producer's own bookkeeping, because the content query must run as the reader (SELECT-everywhere + `zb.tenant` RLS), and the bookkeeping row is written by that same connection — after the objects and manifest are live, so it never vouches for artifacts that don't exist (append-only by privilege; `scripts/scenarios/generations.py` proves the boundary) | any write privilege on user data. It is *physically* unable to write anything a client reads |
 | **`bridge_writer`** | per-table `SELECT, INSERT, UPDATE`, granted one table at a time | `BYPASSRLS`. That attribute is what makes RLS enforce writes |
 
-There is **no tenant role.** A tenant is a column value, not a login. One writer role
-serves every principal; who they are arrives as a session setting, and PostgreSQL resolves
-the tenant from it. Adding a tenant is a row in a mapping table, never a `CREATE ROLE`.
+There is **no tenant role.** A tenant is a column value, not a login. One writer role serves every principal; who they are arrives as a session setting, and PostgreSQL resolves the tenant from it. Adding a tenant is a row in a mapping table, never a `CREATE ROLE`.
 
-✅ `scripts/scenarios/writable.py` — asserts the refusal *and* the SQLSTATE, so a verdict
-naming the wrong reason fails the test.
+✅ `scripts/scenarios/writable.py` — asserts the refusal *and* the SQLSTATE, so a verdict naming the wrong reason fails the test.
 
-✅ Row-level refusal verified end to end: the bridge stamps the authenticated principal
-into the session (`set_config('zb.principal', $1, true)`, one mutation per transaction),
-PostgreSQL resolves it to a tenant through `zebridge_user_tenants`, and a row belonging to
-another tenant is refused — `42501 new row violates row-level security policy` — with the
-verdict reaching the client immediately, since that SQLSTATE is classified permanent.
+✅ Row-level refusal verified end to end: the bridge stamps the authenticated principal into the session (`set_config('zb.principal', $1, true)`, one mutation per transaction), PostgreSQL resolves it to a tenant through `zebridge_user_tenants`, and a row belonging to another tenant is refused — `42501 new row violates row-level security policy` — with the verdict reaching the client immediately, since that SQLSTATE is classified permanent.
 
-**Granting a principal a tenant needs no restart.** The mapping is resolved *inside the
-policy*, as a subquery evaluated per statement, against a `zb.principal` the bridge sets
-per transaction. No Zig code reads `zebridge_user_tenants` and nothing caches it, so
+**Granting a principal a tenant needs no restart.** The mapping is resolved *inside the policy*, as a subquery evaluated per statement, against a `zb.principal` the bridge sets per transaction. No Zig code reads `zebridge_user_tenants` and nothing caches it, so
 
     INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('carol', 'acme');
 
-takes effect on the very next mutation. Restarting the bridge for it is harmless and
-pointless. What *does* need a restart is a different axis, and confusing the two is easy:
-adding a NATS **principal** means regenerating `nats-server.conf` and reloading **NATS**
-(not the bridge), while the per-table rules are `zebridge_catalogue` rows read at
-boot, so changing *which tables* are tenant-routed does need the bridge to come back.
+takes effect on the very next mutation.
+Restarting the bridge for it is harmless and pointless. What *does* need a restart is a different axis, and confusing the two is easy: ~~adding a NATS **principal** means regenerating `nats-server.conf` and reloading **NATS** (not the bridge)~~, while the per-table rules are `zebridge_catalogue` rows read at boot, so changing *which tables* are tenant-routed does need the bridge to come back.
 
-⚠️ Before this the bridge never set the session variable, so any policy reading it saw
-NULL and refused **every** write. The design was validated in psql and inert in the
-bridge — enabling RLS would have looked like the bridge breaking.
+⚠️ Before this the bridge never set the session variable, so any policy reading it saw NULL and refused **every** write. The design was validated in psql and inert in the bridge — enabling RLS would have looked like the bridge breaking.
 
-**Risk if wrong.** `bridge_writer` with `BYPASSRLS` silently disables every row policy —
-writes still succeed, so nothing looks broken. `bridge_reader` with a write grant makes
-"the read path cannot write" false while the logs stay identical. Neither failure is
-visible at runtime; both are visible in `pg_roles`.
+**Risk if wrong.** `bridge_writer` with `BYPASSRLS` silently disables every row policy — writes still succeed, so nothing looks broken. `bridge_reader` with a write grant makes "the read path cannot write" false while the logs stay identical. Neither failure is visible at runtime; both are visible in `pg_roles`.
 
 ### 1.2 PostgreSQL: opening a table, and the only supported way
 
-`bridge_writer` starts with **no table privileges**. Ingress is closed until a DBA opens a
-table, so a new table is never silently writable. Three shapes, each a fixed sequence of
-calls — not one function each, because the calls compose (a writable table is also
-tenant-scoped; a public table is neither) and skipping one leaves a table that *looks*
-finished but silently isn't. Every function referenced below is defined once, in
-`init.write.template.sql` (or `init.core.template.sql` for `zebridge_catalogue`) —
-`grep` for the name rather than a line number, which drifts.
+`bridge_writer` starts with **no table privileges**. Ingress is closed until a DBA opens a table, so a new table is never silently writable. Three shapes, each a fixed sequence of calls — not one function each, because the calls compose (a writable table is also tenant-scoped; a public table is neither) and skipping one leaves a table that *looks* finished but silently isn't. Every function referenced below is defined once, in `init.write.template.sql` (or `init.core.template.sql` for `zebridge_catalogue`) — `grep` for the name.
 
 **Readable via CDC (public — every tenant, every subscriber sees it).**
 
@@ -81,20 +58,12 @@ SELECT * FROM zebridge_enable(
 );
 ```
 
-⚠️ **The reason is mandatory.** A public table is a `zebridge_catalogue` row with
-`tenant_col IS NULL`, and the table's CHECK forces a recorded `public_reason` — who decided
-this table is public, and why. The event trigger refuses a bare
-`ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped nor in the
-catalogue. Deliberately: a bare `ALTER PUBLICATION`
-publishes with no row filter and no RLS, sending every row to every subscriber, and nothing
-in the bridge can detect that — it is a pass-through by design.
+⚠️ **The reason is mandatory.** A public table is a `zebridge_catalogue` row with `tenant_col IS NULL`, and the table's CHECK forces a recorded `public_reason` — who decided this table is public, and why. The event trigger refuses a bare `ALTER PUBLICATION ... ADD TABLE` for a table that is neither tenant-scoped nor in the catalogue. Deliberately: a bare `ALTER PUBLICATION` publishes with no row filter and no RLS, sending every row to every subscriber, and nothing in the bridge can detect that — it is a pass-through by design.
 
-✅ Manual for the refusal itself (NOTES §1.8); ✅ `scripts/scenarios/render.py` proves the
-guard **exists** after a render, which is the failure that actually happened — the trigger
-vanished along with six functions when `envsubst` ate a dollar tag.
+✅ Manual for the refusal itself (NOTES §1.8); 
+✅ `scripts/scenarios/render.py` proves the guard **exists** after a render, which is the failure that actually happened — the trigger vanished along with six functions when `envsubst` ate a dollar tag.
 
-`SELECT * FROM zebridge_audit_publications();` answers *is anything published without being
-scoped?* — the invariant a pass-through bridge cannot check for itself.
+`SELECT * FROM zebridge_audit_publications();` answers *is anything published without being scoped?* — the invariant a pass-through bridge cannot check for itself.
 
 **Writable from the edge.**
 
@@ -134,7 +103,8 @@ atomically, and prints what it did as its own return table:
 
 ```sql
 -- The table needs a NOT NULL tenant column, and every writer needs to be in this table —
--- N-1: exactly one tenant per client principal.
+-- one row per membership: a principal may belong to several tenants, and then every
+-- write must name its tenant (an omitted value is filled only from a single membership).
 INSERT INTO zebridge_user_tenants (principal, tenant_id) VALUES ('alice', 'acme');
 
 SELECT * FROM zebridge_enable(
@@ -650,33 +620,12 @@ Stated plainly, because half of what was found while building this was assumed r
 written down.
 
 * **A stolen credential** — full access to that identity. No subject grammar helps.
-  What it cannot do is crowd the others out: with `MUTATION_RATE_PER_PRINCIPAL` set,
-  its writes are served at the rate (NAK'd with the delay of their place in the queue,
-  redelivered by JetStream once each), its tenant's budget is a second bucket, and
-  another tenant's verdict latency does not move. Off by default; set it in
-  production. What bounds the pile itself is the stream's own policy, set where NATS
-  is set up (`up.sh`): `discard new`, workqueue retention and a per-subject cap
-  (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5000) — the subject carries the principal, so a
-  flooder's publishes are refused at the door past its backlog while everyone else's
-  go through. `zbdoctor` gate C reports a stream without it. What remains is the
-  floor: a refused publish still costs the server one small reply, because an honest
-  client must be told whether its write landed and the door cannot tell the two
-  apart. It is not amplification (the reply is smaller than the request, nothing is
-  stored, one credential is one socket), and a flood that persists is ended by
-  revoking the credential, not by anything in the protocol.
-* **A publisher bug** 🚧 — NATS enforces who may *subscribe*; nothing verifies the bridge
-  tagged a row with the right tenant. That is the cost of one bridge serving many tenants.
-  A publication and slot per tenant moves that guarantee back into PostgreSQL.
-* **Reads, today** — every client subscribed to `cdc.>` receives every published table's
-  changes. Tenant routing is ✅ built for CDC and for the per-tenant generation buckets.
-* **Secrecy inside a tenant** — the chain bucket and the CDC stream are per tenant, so
-  every principal of a tenant can read every table the tenant is served. Restricting a
-  table to some principals of one tenant is not a supported statement; the unit of
-  read access is the tenant, and a narrower audience is a narrower tenant (rule 4 of
-  §1.4b).
-* **Schema metadata** — `$KV.schemas.<table>` is readable by every client: table names and
-  column names, never row values. A deliberate trade; per-tenant schema copies would cost
-  more than they protect.
+What it cannot do is crowd the others out: with `MUTATION_RATE_PER_PRINCIPAL` set, its writes are served at the rate (NAK'd with the delay of their place in the queue, redelivered by JetStream once each), its tenant's budget is a second bucket, and another tenant's verdict latency does not move. Off by default; set it in production. What bounds the pile itself is the stream's own policy, set where NATS is set up (`up.sh`): `discard new`, workqueue retention and a per-subject cap (`MUTATION_BACKLOG_PER_PRINCIPAL`, 5000) — the subject carries the principal, so a flooder's publishes are refused at the door past its backlog while everyone else's go through. `zbdoctor` gate C reports a stream without it. What remains is the floor: a refused publish still costs the server one small reply, because an honest client must be told whether its write landed and the door cannot tell the two apart. It is not amplification (the reply is smaller than the request, nothing is stored, one credential is one socket), and a flood that persists is ended by revoking the credential, not by anything in the protocol.
+* **A publisher bug** 🚧 — NATS enforces who may *subscribe*; nothing verifies the bridge tagged a row with the right tenant. That is the cost of one bridge serving many tenants.
+A publication and slot per tenant moves that guarantee back into PostgreSQL.
+* **Reads, today** — every client subscribed to `cdc.>` receives every published table's changes. Tenant routing is ✅ built for CDC and for the per-tenant generation buckets.
+* **Secrecy inside a tenant** — the chain bucket and the CDC stream are per tenant, so every principal of a tenant can read every table the tenant is served. Restricting a table to some principals of one tenant is not a supported statement; the unit of read access is the tenant, and a narrower audience is a narrower tenant (rule 4 of §1.4b).
+* **Schema metadata** — `$KV.schemas.<table>` is readable by every client: table names and column names, never row values. A deliberate trade; per-tenant schema copies would cost more than they protect.
 * **Credentials in git** ⚠️ — `.env.bridge` and `.env.admin` are tracked, and contain
   `DATABASE_WRITER_URL`, `DATABASE_READER_URL` and the superuser password. They are `*_changeme`
   dev values today, but the *shape* is the exposure: rotating them later does not remove
@@ -699,14 +648,12 @@ written down.
   The NKEY seed already gets this treatment — deliberately in no env file, passed on the
   command line. The database credentials should get the same.
 
-* **The HTTP telemetry server** ⚠️ — it binds `0.0.0.0:9090` (`INADDR_ANY`) with no
-  authentication on any endpoint. Verified reachable: `/metrics` and
-  `/streams/info?stream=CDC` both answer `200` to an unauthenticated caller.
+* **The HTTP telemetry server** ⚠️ — it binds `0.0.0.0:9090` (`INADDR_ANY`) with no authentication on any endpoint. Verified reachable: `/metrics` and `/streams/info?stream=CDC` both answer `200` to an unauthenticated caller.
 
   | endpoint | exposure |
   | --- | --- |
   | ~~`POST /shutdown`~~ | ~~stops CDC in one request. It duplicates SIGTERM, which the bridge already handles (`bridge.zig:304`) — but SIGTERM needs process ownership, this needs a socket. Removing it is safer than authenticating or rate-limiting it, because a limiter still permits the kill~~ |
-  | `GET /streams/info?stream=` | one **NATS round trip per HTTP request** (amplification), and it discloses stream names and configuration |
+  | ~~`GET /streams/info?stream=`~~ | ~~one **NATS round trip per HTTP request** (amplification), and it discloses stream names and configuration~~ |
   | `GET /metrics`, `/status`, `/health` | disclosure of table names, lag and throughput; cheap to serve |
 
   In order: drop `/shutdown`, bind `127.0.0.1` by default (configurable for a remote

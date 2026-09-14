@@ -98,8 +98,8 @@ def main():
                 got = r.stdout.strip()
                 break
             time.sleep(0.5)
-        if got == TENANT:
-            zb.ok(f"$KV.tenants.{PRINCIPAL} → '{TENANT}' with no restart — the roster path is live")
+        if zb.parse_tenants(got) == [TENANT]:
+            zb.ok(f"$KV.tenants.{PRINCIPAL} → {got} with no restart — the roster path is live")
         else:
             zb.bad(f"mapping did not propagate (got {got!r}) — is the bridge running?")
             failed += 1

@@ -149,6 +149,11 @@ fn valuesEqual(a: pgoutput.DecodedValue, b: pgoutput.DecodedValue) bool {
 /// Decodes pgoutput tuples, creates CDC events, and enqueues them to the SPSC queue
 pub const EventProcessor = struct {
     allocator: std.mem.Allocator,
+    /// §10fn: the roster, principal → tenants, as the WAL keeps it. `$KV.tenants.<p>`
+    /// holds the WHOLE set (a JSON array), so one roster row's change needs the rest
+    /// of the set: filled at boot from the table, then kept by every INSERT/UPDATE/
+    /// DELETE the slot sees. Strings live for the process (the roster is small).
+    roster: std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
     batch_publisher: *batch_publisher.BatchPublisher,
     /// The shared NATS publisher, for the DROP-prune below. Optional and assigned
     /// after construction (bridge.zig), because the publisher outlives this struct
@@ -1884,8 +1889,43 @@ pub const EventProcessor = struct {
         tuple_data: pgoutput.TupleData,
         wal_end: u64,
     ) !?u32 {
-        const decoded = try pgoutput.decodeTuple(arena, tuple_data, rel.columns, self.types);
+        const row = try rosterRow(arena, rel, tuple_data, self.types) orelse return null;
+        try self.rosterAdd(row.principal, row.tenant);
+        const slot_idx = try self.packRosterSet(arena, row.principal, rel.relation_id, wal_end);
+        log.info("✅ tenant mapping published to KV: '{s}' ∋ '{s}' ({d} membership(s))", .{ row.principal, row.tenant, self.rosterLen(row.principal) });
+        return slot_idx;
+    }
 
+    /// §10fn: a roster row is gone (DELETE, or the OLD side of a key UPDATE). One
+    /// membership fewer is a LEAVE — the set is republished without it; the last one
+    /// gone is the revocation the DELETE always meant: the key is purged and the ban
+    /// published on the principal's verdict channel (§10dm).
+    pub fn packTenantRemoval(
+        self: *EventProcessor,
+        arena: std.mem.Allocator,
+        rel: pgoutput.RelationMessage,
+        tuple_data: pgoutput.TupleData,
+        wal_end: u64,
+        revoke_when_empty: bool,
+    ) !?u32 {
+        const row = try rosterRow(arena, rel, tuple_data, self.types) orelse return null;
+        self.rosterRemove(row.principal, row.tenant);
+        if (self.rosterLen(row.principal) > 0) {
+            const slot_idx = try self.packRosterSet(arena, row.principal, rel.relation_id, wal_end);
+            log.info("✅ tenant mapping published to KV: '{s}' ∌ '{s}' ({d} membership(s) left)", .{ row.principal, row.tenant, self.rosterLen(row.principal) });
+            return slot_idx;
+        }
+        if (revoke_when_empty) {
+            self.purgeTenantKey(row.principal);
+            self.publishRevoked(row.principal);
+        }
+        return null;
+    }
+
+    const RosterRow = struct { principal: []const u8, tenant: []const u8 };
+
+    fn rosterRow(arena: std.mem.Allocator, rel: pgoutput.RelationMessage, tuple_data: pgoutput.TupleData, types: anytype) !?RosterRow {
+        const decoded = try pgoutput.decodeTuple(arena, tuple_data, rel.columns, types);
         var principal: ?[]const u8 = null;
         var tenant_id: ?[]const u8 = null;
         for (decoded.items) |col| {
@@ -1895,32 +1935,60 @@ pub const EventProcessor = struct {
                 if (col.value == .text) tenant_id = col.value.text;
             }
         }
-
         if (principal == null or tenant_id == null) return null;
+        return .{ .principal = principal.?, .tenant = tenant_id.? };
+    }
 
+    fn rosterAdd(self: *EventProcessor, principal: []const u8, tenant: []const u8) !void {
+        const gop = try self.roster.getOrPut(self.allocator, principal);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, principal);
+            gop.value_ptr.* = .empty;
+        }
+        for (gop.value_ptr.items) |t| if (std.mem.eql(u8, t, tenant)) return;
+        try gop.value_ptr.append(self.allocator, try self.allocator.dupe(u8, tenant));
+        std.mem.sort([]const u8, gop.value_ptr.items, {}, lessStr);
+    }
+
+    fn rosterRemove(self: *EventProcessor, principal: []const u8, tenant: []const u8) void {
+        const list = self.roster.getPtr(principal) orelse return;
+        for (list.items, 0..) |t, i| if (std.mem.eql(u8, t, tenant)) {
+            _ = list.orderedRemove(i);
+            return;
+        };
+    }
+
+    fn rosterLen(self: *EventProcessor, principal: []const u8) usize {
+        return if (self.roster.get(principal)) |l| l.items.len else 0;
+    }
+
+    fn lessStr(_: void, x: []const u8, y: []const u8) bool {
+        return std.mem.lessThan(u8, x, y);
+    }
+
+    /// The principal's set as the KV value: a JSON array, sorted, `["acme","globex"]`.
+    /// A client follows every tenant listed; the JWT's tags are minted from the same
+    /// roster, so what it may read and what it is told to read agree.
+    fn packRosterSet(self: *EventProcessor, arena: std.mem.Allocator, principal: []const u8, relation_id: u32, wal_end: u64) !u32 {
+        var value: std.ArrayListUnmanaged(u8) = .empty;
+        try value.append(arena, '[');
+        if (self.roster.get(principal)) |list| for (list.items, 0..) |t, i| {
+            if (i > 0) try value.append(arena, ',');
+            try value.append(arena, '"');
+            try value.appendSlice(arena, t);
+            try value.append(arena, '"');
+        };
+        try value.append(arena, ']');
         const kv_subject = try Topology.render(
             arena,
             self.topology.kv_tenants_subject_pattern,
-            &.{.{ .name = "principal", .value = principal.? }},
+            &.{.{ .name = "principal", .value = principal }},
             null,
         );
-        const msg_id = try std.fmt.allocPrint(arena, "tenant-{s}-{d}", .{ principal.?, wal_end });
-
+        const msg_id = try std.fmt.allocPrint(arena, "tenant-{s}-{d}", .{ principal, wal_end });
         var cols: std.ArrayList(pgoutput.Column) = .empty;
-        try cols.append(arena, .{ .name = "tenant_id", .value = .{ .text = tenant_id.? } });
-
-        const slot_idx = try self.acquireAndFillSlot(
-            kv_subject,
-            principal.?,
-            "TENANT",
-            msg_id,
-            rel.relation_id,
-            cols,
-            wal_end,
-        );
-
-        log.info("✅ tenant mapping published to KV: '{s}' → '{s}'", .{ principal.?, tenant_id.? });
-        return slot_idx;
+        try cols.append(arena, .{ .name = "tenants", .value = .{ .text = value.items } });
+        return try self.acquireAndFillSlot(kv_subject, principal, "TENANT", msg_id, relation_id, cols, wal_end);
     }
 
     /// One-shot boot backfill of `$KV.tenants.*` from every row already in
@@ -1969,27 +2037,30 @@ pub const EventProcessor = struct {
             return;
         }
 
+        // Stamped with the boot LSN like the schema backfill: a bare per-principal id
+        // is the same Nats-Msg-Id on every boot, and a restart inside the duplicate
+        // window would keep the previous boot's set.
+        const boot_lsn: u64 = blk: {
+            const lsn_res = c.PQexec(conn, "SELECT public.zebridge_wal_head()::text");
+            defer c.PQclear(lsn_res);
+            if (c.PQresultStatus(lsn_res) != c.PGRES_TUPLES_OK or c.PQntuples(lsn_res) == 0) break :blk 0;
+            break :blk parsePgLsnText(std.mem.span(c.PQgetvalue(lsn_res, 0, 0)));
+        };
+        // §10fn: the whole roster first, then ONE put per principal with its set.
         var r: i32 = 0;
         while (r < num_rows) : (r += 1) {
-            const principal = std.mem.span(c.PQgetvalue(result, r, 0));
-            const tenant_id = std.mem.span(c.PQgetvalue(result, r, 1));
-
-            const kv_subject = try Topology.render(
-                arena,
-                self.topology.kv_tenants_subject_pattern,
-                &.{.{ .name = "principal", .value = principal }},
-                null,
-            );
-            const msg_id = try std.fmt.allocPrint(arena, "tenant-boot-{s}", .{principal});
-
-            var cols: std.ArrayList(pgoutput.Column) = .empty;
-            try cols.append(arena, .{ .name = "tenant_id", .value = .{ .text = tenant_id } });
-
-            const slot_idx = try self.acquireAndFillSlot(kv_subject, principal, "TENANT", msg_id, 0, cols, 0);
+            try self.rosterAdd(std.mem.span(c.PQgetvalue(result, r, 0)), std.mem.span(c.PQgetvalue(result, r, 1)));
+        }
+        var published: usize = 0;
+        var pit = self.roster.iterator();
+        while (pit.next()) |e| {
+            if (e.value_ptr.items.len == 0) continue;
+            const slot_idx = try self.packRosterSet(arena, e.key_ptr.*, 0, boot_lsn);
             try self.releaseSlotToQueue(slot_idx);
+            published += 1;
         }
 
-        log.info("✅ Boot tenant backfill published to KV for {d} principal(s)", .{num_rows});
+        log.info("✅ Boot tenant backfill published to KV for {d} principal(s) ({d} membership row(s))", .{ published, num_rows });
     }
 
     /// Publish schemas for all monitored tables on boot.

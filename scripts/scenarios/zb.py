@@ -389,3 +389,19 @@ def kv_get(bucket_key: str, key: str) -> str:
     """`$KV.<bucket>.<key>` raw, with `bucket_key` resolved by `kv_bucket`."""
     r = nats_cli("kv", "get", kv_bucket(bucket_key), key, "--raw")
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def parse_tenants(value: str) -> list[str]:
+    """§10fn: the `$KV.tenants.<principal>` value — a JSON array of tenants (sorted),
+    or the pre-§10fn bare string (one tenant). "" (purged, absent) is no membership."""
+    v = (value or "").strip()
+    if not v:
+        return []
+    if v.startswith("["):
+        return [t for t in json.loads(v) if isinstance(t, str) and t]
+    return [v]
+
+
+def kv_tenants(principal: str) -> list[str]:
+    """The principal's memberships as the bucket states them."""
+    return parse_tenants(kv_get("tenants", principal))

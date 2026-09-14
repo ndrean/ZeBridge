@@ -347,7 +347,7 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
 
     // ── the bridge user: a scoped user under the SERVICE key ────────────────────
     // Ten years: the bridge's own credential rotates with a redeploy, not a TTL.
-    const bridge_jwt = jwt_mint.mint(a, sk_service.seed(), acct_kp.public(), "bridge", "service", bridge_user.public(), 10 * 365 * 24 * 3600, now) catch |err| {
+    const bridge_jwt = jwt_mint.mint(a, sk_service.seed(), acct_kp.public(), "bridge", &.{"service"}, bridge_user.public(), 10 * 365 * 24 * 3600, now) catch |err| {
         out("🔴 bridge user mint failed: {}\n", .{err});
         return 1;
     };

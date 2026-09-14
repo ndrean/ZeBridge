@@ -992,14 +992,17 @@ pub const MutationListener = struct {
     }
 
     /// The principal's tenant from `zebridge_user_tenants`, remembered per lane;
-    /// "" when it has none (or the catalogue cannot be asked right now).
+    /// "" when it has none (or the catalogue cannot be asked right now). §10fn: a
+    /// member of several tenants is charged on its FIRST (sorted) — the bucket is a
+    /// flood limit, not a permission, and one principal drawing on one shared
+    /// bucket is the honest shape (the roster is a set; the limiter keys one string).
     fn tenantOf(self: *MutationListener, conn: ?*c.PGconn, principal: []const u8) []const u8 {
         if (self.tenant_cache.get(principal)) |t| return t;
         const cn = conn orelse return "";
         var pbuf: [128]u8 = undefined;
         const pz = std.fmt.bufPrintZ(&pbuf, "{s}", .{principal}) catch return "";
         const params = [_]?[*:0]const u8{pz.ptr};
-        const res = c.PQexecParams(cn, "SELECT tenant_id::text FROM public.zebridge_user_tenants WHERE principal = $1 LIMIT 1", 1, null, &params[0], null, null, 0);
+        const res = c.PQexecParams(cn, "SELECT tenant_id::text FROM public.zebridge_user_tenants WHERE principal = $1 ORDER BY tenant_id LIMIT 1", 1, null, &params[0], null, null, 0);
         defer c.PQclear(res);
         if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return "";
         const t: []const u8 = if (c.PQntuples(res) > 0) std.mem.span(c.PQgetvalue(res, 0, 0)) else "";

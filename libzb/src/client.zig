@@ -84,6 +84,8 @@ pub const Options = struct {
     seed_streaming_above: usize = 8 * 1024 * 1024,
 };
 
+const SeedAnchor = struct { stream: []const u8, seq: u64, lsn: i64 };
+
 const TableState = struct {
     pk: []const []const u8,
     cols: []const []const u8,
@@ -104,7 +106,11 @@ const TableState = struct {
     /// binds pgvector's text form of the wire BLOB (core.vecLiteral); SQLite keeps
     /// the BLOB.
     vec_cols: []const VecCol = &.{},
-    route: []const u8, // the CDC stream this table's events ride
+    /// §10fn: the CDC streams this table's events ride — one `CDC_<tenant>` per
+    /// tenant the client belongs to for a tenant-scoped table, `CDC_PUBLIC` alone
+    /// for a public one. Empty for a tenant-scoped table while the client has no
+    /// tenant (its shared rows still ride `shared_route`).
+    routes: []const []const u8,
     /// For a tenant-scoped table: the stream its OPEN-TENANT rows ride (CDC_PUBLIC).
     /// Those are the shared rows every tenant may read — `zb_reader_all` admits
     /// `tenant_col = <open tenant>`, and the chain carries them because the producer
@@ -112,9 +118,11 @@ const TableState = struct {
     /// either leaves half of it stale (NOTES §10bq). Null for a public table, whose
     /// only route already IS that stream.
     shared_route: ?[]const u8 = null,
-    seed_seq: ?u64 = null,
-    seed_stream: ?[]const u8 = null,
-    seed_lsn: ?i64 = null,
+    /// The seed gate's anchors (findings 7 + 10), one per stream a chain of this
+    /// table was cut on: events at or below `seq` on that stream are inside the chain
+    /// already applied. §10fn: a tenant-scoped table has one chain per tenant, each
+    /// on its own stream, so the gate is per stream.
+    anchors: std.ArrayListUnmanaged(SeedAnchor) = .empty,
     /// The catalogue's seed_epoch the descriptor carried (§10df).
     seed_epoch: i64 = 0,
 };
@@ -150,6 +158,8 @@ pub const SyncClient = struct {
     /// revoked. Tenant-scoped tables are then unreadable (no stream to grant) and are
     /// SKIPPED, audibly, the TS client's rule; public tables still follow.
     tenant_missing: bool = false,
+    /// `open_tenant` as a one-element list (what `tenantsFor` hands out for a public table).
+    open_tenants: []const []const u8 = &.{},
     /// §10dm: the ban was seen (`mutation_ack.<principal>.revoked`): the connection is
     /// closed and every later call answers `error.Revoked`. The rows stay; the wipe is
     /// the application's explicit act (`zb_client_wipe`).
@@ -159,7 +169,14 @@ pub const SyncClient = struct {
     subject_mutations_prefix: []const u8 = undefined, // subjects.mutations_prefix
     subject_mutation_ack_prefix: []const u8 = undefined, // subjects.mutation_ack_prefix
 
+    /// The FIRST tenant (sorted), or the open tenant when the principal has none:
+    /// the sync report's `tenant`, and the shape every single-tenant host knows.
     tenant: []const u8 = "",
+    /// §10fn: every tenant this client follows — the roster's set from
+    /// `$KV.tenants.<principal>` (a JSON array; a bare string is one tenant), then
+    /// `join`/`leave` at runtime. Tenant-scoped tables seed one chain per entry and
+    /// read one `CDC_<tenant>` stream per entry. Client arena.
+    tenants: []const []const u8 = &.{},
     /// §10x dictionaries by object name — immutable, so the cache cannot go stale.
     dicts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// §10el: when each pending write was last sent by THIS process (unix ms). A
@@ -214,6 +231,12 @@ pub const SyncClient = struct {
     /// the first `poll` and kept across calls. `stream` points into `states`' routes
     /// (client-lifetime memory).
     tails: std.ArrayListUnmanaged(Tail) = .empty,
+    /// §10fq: streams set aside because they cannot be read right now — deleted under
+    /// a live tail, denied after an account update, not created yet. A dark stream is
+    /// left out of the shared fetch and the seed pass, so the others keep being
+    /// served; it is retried after `retry_at_ms` with a doubling backoff, and the poll
+    /// report names its tenant (`unreadable`). Keys in the client arena.
+    dark: std.StringArrayHashMapUnmanaged(Dark) = .empty,
     /// The ONE inbox every tail answers into (nats.zig `PullInbox`): `poll` is a single
     /// wait over all streams, ended by the first message from any of them.
     tail_inbox: ?*@import("nats").PullInbox = null,
@@ -222,6 +245,9 @@ pub const SyncClient = struct {
         stream: []const u8,
         sub: *@import("nats").PullSubscription,
     };
+    const Dark = struct { retry_at_ms: i64, backoff_ms: i64 };
+    const dark_backoff_first_ms: i64 = 5_000;
+    const dark_backoff_max_ms: i64 = 60_000;
     /// The server reaps a tail consumer idle this long (`inactive_threshold`). A host
     /// that stops polling for longer gets a fresh consumer at the stored position —
     /// the reaped one answers the next fetch with `NoResponders` (nats.zig patch).
@@ -360,6 +386,7 @@ pub const SyncClient = struct {
         self.kv_generations = try grammarString(root, &.{ "generations", "kv" });
         self.gen_bucket_prefix = try grammarString(root, &.{ "generations", "bucket_prefix" });
         self.open_tenant = try grammarString(root, &.{"open_tenant"});
+        self.open_tenants = try self.aa().dupe([]const u8, &.{self.open_tenant});
         self.stream_mutations = try grammarString(root, &.{ "streams", "mutations" });
         self.subject_mutations_prefix = try grammarString(root, &.{ "subjects", "mutations_prefix" });
         self.subject_mutation_ack_prefix = try grammarString(root, &.{ "subjects", "mutation_ack_prefix" });
@@ -369,15 +396,76 @@ pub const SyncClient = struct {
 
     pub fn resolveTenant(self: *SyncClient) !void {
         const bytes = (try self.t.kvGet(self.aa(), self.kv_tenants, self.opts.principal)) orelse {
+            self.tenants = &.{};
             self.tenant = self.open_tenant;
             self.tenant_missing = true;
             std.debug.print("tenant: {s} has no mapping ($KV.tenants.{s}) — revoked, or never enrolled: tenant-scoped tables are skipped, public tables follow\n", .{ self.opts.principal, self.opts.principal });
             return;
         };
-        self.tenant_missing = false;
-        // The value may be msgpack-encoded (the bridge's KV diversion) or raw.
-        self.tenant = decodeMaybeMsgpackString(self.aa(), bytes) catch bytes;
-        std.debug.print("tenant: {s} -> {s}\n", .{ self.opts.principal, self.tenant });
+        self.tenants = try parseTenantList(self.aa(), decodeMaybeMsgpackString(self.aa(), bytes) catch bytes);
+        self.tenant_missing = self.tenants.len == 0;
+        self.tenant = if (self.tenants.len > 0) self.tenants[0] else self.open_tenant;
+        if (self.tenants.len == 1) {
+            std.debug.print("tenant: {s} -> {s}\n", .{ self.opts.principal, self.tenant });
+        } else {
+            std.debug.print("tenant: {s} -> {d} membership(s)", .{ self.opts.principal, self.tenants.len });
+            for (self.tenants) |t| std.debug.print(" {s}", .{t});
+            std.debug.print("\n", .{});
+        }
+    }
+
+    /// §10fn: the roster set as the bridge writes it — `["acme","globex"]` — or a
+    /// bare tenant string (one tenant, the pre-§10fn value). Sorted, deduplicated.
+    fn parseTenantList(a: std.mem.Allocator, text: []const u8) ![]const []const u8 {
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len > 0 and trimmed[0] == '[') {
+            const v = std.json.parseFromSliceLeaky(Value, a, trimmed, .{}) catch return error.TenantListMalformed;
+            if (v != .array) return error.TenantListMalformed;
+            for (v.array.items) |it| if (it == .string and it.string.len > 0) try appendUnique(a, &list, it.string);
+        } else if (trimmed.len > 0) {
+            try appendUnique(a, &list, trimmed);
+        }
+        std.mem.sort([]const u8, list.items, {}, lessStr);
+        return list.items;
+    }
+
+    fn appendUnique(a: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8), t: []const u8) !void {
+        for (list.items) |x| if (std.mem.eql(u8, x, t)) return;
+        try list.append(a, try a.dupe(u8, t));
+    }
+
+    fn lessStr(_: void, x: []const u8, y: []const u8) bool {
+        return std.mem.lessThan(u8, x, y);
+    }
+
+    /// The tenants a table's chains are keyed on: every membership for a
+    /// tenant-scoped table, the open tenant alone for a public one.
+    fn tenantsFor(self: *SyncClient, st: TableState) []const []const u8 {
+        return if (st.tenant_col != null) self.tenants else self.open_tenants[0..1];
+    }
+
+    /// The stream a tenant's rows of a table ride: `CDC_<tenant>`, or CDC_PUBLIC for
+    /// the open tenant (its rows ride the public stream; there is no `CDC_<open>`).
+    fn routeFor(self: *SyncClient, a: std.mem.Allocator, tenant: []const u8) ![]const u8 {
+        if (std.mem.eql(u8, tenant, self.open_tenant)) return self.cdc_public;
+        return try std.fmt.allocPrint(a, "{s}{s}", .{ self.cdc_prefix, tenant });
+    }
+
+    /// §10fn: the routes of a table under the current membership. Client arena.
+    fn routesFor(self: *SyncClient, tenant_col: ?[]const u8) ![]const []const u8 {
+        const ca = self.aa();
+        if (tenant_col == null) return try ca.dupe([]const u8, &.{self.cdc_public});
+        var routes: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (self.tenants) |t| try routes.append(ca, try self.routeFor(ca, t));
+        return routes.items;
+    }
+
+    /// The table is tenant-scoped and the client follows several tenants: a full
+    /// chain of one tenant may only clear THAT tenant's rows, and its rows go in as
+    /// upserts (the open rows it carries are already there from a sibling's chain).
+    fn multiTenant(self: *SyncClient, st: TableState) bool {
+        return st.tenant_col != null and self.tenants.len > 1;
     }
 
     // ─── step 1: schemas → local DDL, existence from the DATABASE (finding 9) ─
@@ -744,11 +832,39 @@ pub const SyncClient = struct {
         }
         try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
         try ensureInbox(&self.st);
-        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT PRIMARY KEY, watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0)");
+        try self.ensureGenerations(a);
         try ensureShape(&self.st);
-        execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0") catch {}; // a replica from before §10df
         // A schema that just moved may be what a held event was waiting for.
         self.retryHeld(null, null);
+    }
+
+    /// §10fn: the watermark table, keyed by (table, tenant) — one chain per tenant of
+    /// a tenant-scoped table, the open tenant for a public one. A replica from before
+    /// (keyed by table alone) is carried over under the tenant it followed then, so
+    /// the upgrade costs no re-seed.
+    fn ensureGenerations(self: *SyncClient, a: std.mem.Allocator) !void {
+        const cols = try self.st.query(a, "SELECT name FROM pragma_table_info('_zbz_generations')", &.{});
+        var has_tenant = false;
+        for (cols) |r| if (r.len > 0 and r[0] == .text and std.mem.eql(u8, r[0].text, "tenant")) {
+            has_tenant = true;
+        };
+        if (cols.len > 0 and !has_tenant) {
+            execDdl(&self.st, "ALTER TABLE _zbz_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0") catch {}; // a replica from before §10df
+            try execDdl(&self.st, "ALTER TABLE _zbz_generations RENAME TO _zbz_generations_v1");
+        }
+        try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_generations (tbl TEXT NOT NULL, tenant TEXT NOT NULL DEFAULT '', watermark TEXT, cutoff_lsn INTEGER, seed_epoch INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (tbl, tenant))");
+        if (cols.len > 0 and !has_tenant) {
+            const old = try self.st.query(a, "SELECT tbl, watermark, cutoff_lsn, seed_epoch FROM _zbz_generations_v1", &.{});
+            for (old) |r| {
+                if (r.len < 4 or r[0] != .text) continue;
+                const st = self.states.get(r[0].text) orelse continue;
+                const tenant = self.tenantsFor(st);
+                if (tenant.len != 1) continue; // several: seeded again, per tenant
+                _ = try self.st.query(a, "INSERT OR REPLACE INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?, ?)", &.{ r[0], .{ .text = tenant[0] }, r[1], r[2], r[3] });
+            }
+            try execDdl(&self.st, "DROP TABLE _zbz_generations_v1");
+            std.debug.print("_zbz_generations: keyed by (table, tenant) now — {d} watermark(s) carried over\n", .{old.len});
+        }
     }
 
     /// One descriptor onto one table: migrate the physical table and refresh the
@@ -810,10 +926,7 @@ pub const SyncClient = struct {
         const ca = self.aa();
         // The OPEN tenant's rows ride the public stream (`cdc.<open>.>` is one of its
         // subjects); a principal mapped to it must not look for a `CDC_<open>` stream.
-        const route = if (tenant_col != null and !std.mem.eql(u8, self.tenant, self.open_tenant))
-            try std.fmt.allocPrint(ca, "{s}{s}", .{ self.cdc_prefix, self.tenant })
-        else
-            self.cdc_public;
+        const routes = try self.routesFor(tenant_col);
         const shared_route: ?[]const u8 = if (tenant_col != null) self.cdc_public else null;
         const fresh: TableState = .{
             .pk = try dupeStrings(ca, pk),
@@ -824,13 +937,13 @@ pub const SyncClient = struct {
             .array_cols = try dupeStrings(ca, try arrayColsOf(a, val)),
             .geom_cols = try dupeStrings(ca, try geomColsOf(a, val)),
             .vec_cols = try dupeVecCols(ca, try vecColsOf(a, val)),
-            .route = route,
+            .routes = routes,
             .shared_route = shared_route,
             .seed_epoch = seed_epoch,
         };
         if (self.states.getPtr(table)) |st| {
-            // In place: the seed gate (`seed_seq/seed_stream/seed_lsn`) belongs to
-            // the replica's history, not to the descriptor, and survives a migration.
+            // In place: the seed gate (`anchors`) belongs to the replica's history,
+            // not to the descriptor, and survives a migration.
             st.pk = fresh.pk;
             st.cols = fresh.cols;
             st.version_col = fresh.version_col;
@@ -839,7 +952,7 @@ pub const SyncClient = struct {
             st.array_cols = fresh.array_cols;
             st.geom_cols = fresh.geom_cols;
             st.vec_cols = fresh.vec_cols;
-            st.route = fresh.route;
+            st.routes = fresh.routes;
             st.shared_route = fresh.shared_route;
             st.seed_epoch = fresh.seed_epoch;
         } else {
@@ -854,7 +967,7 @@ pub const SyncClient = struct {
     /// zebridge_reseed() ran upstream. Forget the watermark; `gapAndSeed` (next sync,
     /// or the end of this poll's schema drain) seeds a fresh full.
     fn reseedIfEpochMoved(self: *SyncClient, a: std.mem.Allocator, table: []const u8, epoch: i64) !void {
-        const rows = self.st.query(a, "SELECT seed_epoch FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch return;
+        const rows = self.st.query(a, "SELECT seed_epoch FROM _zbz_generations WHERE tbl = ? ORDER BY seed_epoch LIMIT 1", &.{.{ .text = table }}) catch return;
         if (rows.len == 0) {
             // Never seeded (no chain at connect, or one the replica could not use):
             // nothing to drop, but the next poll must ask again — measured: a table
@@ -944,11 +1057,6 @@ pub const SyncClient = struct {
         _ = try self.st.query(qa.allocator(), "INSERT INTO _zbz_stream_seq (stream, last_seq) VALUES (?, ?) ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq", &.{ .{ .text = stream }, .{ .integer = @intCast(seq) } });
     }
 
-    fn effTenant(self: *SyncClient, table: []const u8) []const u8 {
-        const st = self.states.get(table) orelse return self.open_tenant;
-        return if (st.tenant_col != null) self.tenant else self.open_tenant;
-    }
-
     // ─── step 2: the gap rule (per stream) + scoped seeding (§10n) ──────────
 
     pub fn gapAndSeed(self: *SyncClient, report_a: ?std.mem.Allocator, seeded_map: ?*std.StringArrayHashMapUnmanaged(void)) !void {
@@ -963,14 +1071,20 @@ pub const SyncClient = struct {
         var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
         var sit = self.states.iterator();
         while (sit.next()) |e| {
-            try streams.put(a, e.value_ptr.route, {});
+            for (e.value_ptr.routes) |r| try streams.put(a, r, {});
             if (e.value_ptr.shared_route) |sr| try streams.put(a, sr, {});
         }
         var it = streams.iterator();
         while (it.next()) |e| {
             const stream = e.key_ptr.*;
             if (gapped.contains(stream)) continue;
-            var info = self.t.js.getStreamInfo(stream) catch continue;
+            if (self.isDark(stream)) continue;
+            // §10fq: an unreadable stream costs a request timeout on every pass; set
+            // it aside instead, so an unseeded tenant behind it does not slow each poll.
+            var info = self.t.js.getStreamInfo(stream) catch |err| {
+                self.markDark(stream, err);
+                continue;
+            };
             defer info.deinit();
             const first: i64 = @intCast(info.value.state.first_seq);
             const last: i64 = @intCast(info.value.state.last_seq);
@@ -1001,34 +1115,63 @@ pub const SyncClient = struct {
         defer execSql(&self.st, a, "PRAGMA foreign_keys = ON;") catch {};
         // Still the CONFIGURED order (parents first — cheapest path to zero
         // residue), scoped to gapped routes plus never-seeded tables (§10n).
+        // §10fq: which gapped streams this pass may heal. A tenant's own stream heals
+        // only when that (table, tenant) pair seeded; the shared stream a tenant-scoped
+        // table's open rows ride heals when ANY of the table's pairs holds a chain past
+        // the gap — every chain carries the open rows. The heal used to wait for the
+        // whole pass (`reseed_pending`), so one tenant with no chain yet kept the shared
+        // stream "gapped" for ever, and every sibling re-seeded on every poll.
+        var blocked: std.StringArrayHashMapUnmanaged(void) = .empty;
         for (self.opts.tables) |table| {
             const st = self.states.get(table) orelse continue;
-            // ⚠️ `try`, not "treat a failed read as never seeded": that would answer a
-            // locked database with a full re-seed (the same trap as `storedSeq`).
-            const seeded = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }})).len > 0;
             const shared_gapped = if (st.shared_route) |sr| gapped.contains(sr) else false;
-            if (gapped.contains(st.route) or shared_gapped or !seeded) {
-                // One table's failure is one table's failure (the TS rule): the rest
-                // still seed, and the next poll's gap check retries this one.
-                self.applyChain(table) catch |err| {
-                    std.debug.print("{s}: seeding failed: {s} — retried at the next poll\n", .{ table, @errorName(err) });
+            var covered = false;
+            // §10fn: one chain per tenant of the table, each judged on its own stream.
+            for (self.tenantsFor(st)) |tenant| {
+                const route = try self.routeFor(a, tenant);
+                if (self.dark.contains(route)) continue; // back when readable (clearDark re-asks)
+                // ⚠️ `try`, not "treat a failed read as never seeded": that would answer a
+                // locked database with a full re-seed (the same trap as `storedSeq`).
+                const seeded = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
+                if (!(gapped.contains(route) or shared_gapped or !seeded)) {
+                    covered = true;
                     continue;
+                }
+                // One table's failure is one table's failure (the TS rule): the rest
+                // still seed, and the next poll's gap check retries this one. A chain
+                // that is not there yet, or cannot splice, leaves `reseed_pending` set.
+                const pending_before = self.reseed_pending;
+                self.reseed_pending = false;
+                const ok = if (self.applyChain(table, tenant)) |_| !self.reseed_pending else |err| blk: {
+                    std.debug.print("{s}: seeding failed: {s} — retried at the next poll\n", .{ table, @errorName(err) });
+                    break :blk false;
                 };
-                if (report_a) |ra_| if (seeded_map) |sm| {
-                    if (!sm.contains(table)) sm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
-                };
+                self.reseed_pending = pending_before or self.reseed_pending or !ok;
+                const has_chain = (try self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } })).len > 0;
+                if (ok and has_chain) {
+                    covered = true;
+                    if (report_a) |ra_| if (seeded_map) |sm| {
+                        if (!sm.contains(table)) sm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
+                    };
+                } else {
+                    try blocked.put(a, route, {});
+                }
             }
+            if (!covered) if (st.shared_route) |sr| try blocked.put(a, sr, {});
         }
         // §10dg: whatever kept a table unseeded — no chain yet, a chain that predates
         // the replica or the re-seed, a shape the replica lacks, a failed step — the
         // next poll asks again. Unseeded is not synced (the TS rule), and a poll loop
         // that never re-asks would follow CDC on an empty table forever.
-        for (self.opts.tables) |table| {
-            if (self.states.get(table) == null) continue;
-            const seeded_now = (self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch continue).len > 0;
-            if (!seeded_now) {
-                self.reseed_pending = true;
-                break;
+        outer: for (self.opts.tables) |table| {
+            const st = self.states.get(table) orelse continue;
+            for (self.tenantsFor(st)) |tenant| {
+                if (self.dark.contains(try self.routeFor(a, tenant))) continue;
+                const seeded_now = (self.st.query(a, "SELECT tbl FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } }) catch continue).len > 0;
+                if (!seeded_now) {
+                    self.reseed_pending = true;
+                    break :outer;
+                }
             }
         }
         // §10ei: a gap healed by this pass resumes at the stream's OLDEST message.
@@ -1038,9 +1181,10 @@ pub const SyncClient = struct {
         // `first_seq`, the tail would ask for a sequence the stream no longer holds,
         // the server would continue from its oldest, and the live gap rule would read
         // that as a fresh hole — a second seed at every poll after every gap.
-        if (!self.reseed_pending) {
+        {
             var git = gapped.iterator();
             while (git.next()) |ge| {
+                if (blocked.contains(ge.key_ptr.*)) continue;
                 const first = ge.value_ptr.*;
                 const stored: i64 = @intCast(try self.storedSeq(ge.key_ptr.*));
                 if (first > 1 and stored < first - 1) {
@@ -1096,6 +1240,12 @@ pub const SyncClient = struct {
         copy_upsert_sql: []const u8,
         /// §10fe: the step's COPY text buffer, reused across its chunks.
         copy_buf: *std.ArrayListUnmanaged(u8),
+        /// §10fn: what a full clears before its first chunk — the whole table, or,
+        /// for a tenant-scoped table under several memberships, only this tenant's
+        /// rows (`wipe_arg`), the rest going in as upserts (`wipe_whole` false).
+        wipe_sql: []const u8,
+        wipe_arg: ?[]const u8,
+        wipe_whole: bool,
 
         fn applyCopy(cs: ChainStep, st: *storage.Storage, row_arena: *std.heap.ArenaAllocator) !void {
             return applyCopyStep(cs, st, row_arena);
@@ -1103,8 +1253,11 @@ pub const SyncClient = struct {
 
         fn apply(cs: ChainStep, st: *storage.Storage) !void {
             if (cs.is_full and cs.first_chunk) {
-                const del = try std.fmt.allocPrint(cs.a, "DELETE FROM {s}", .{cs.table});
-                _ = try st.query(cs.a, del, &.{});
+                if (cs.wipe_arg) |arg| {
+                    _ = try st.query(cs.a, cs.wipe_sql, &.{.{ .text = arg }});
+                } else {
+                    _ = try st.query(cs.a, cs.wipe_sql, &.{});
+                }
             }
             var row_arena = std.heap.ArenaAllocator.init(cs.client.a);
             defer row_arena.deinit();
@@ -1204,7 +1357,7 @@ pub const SyncClient = struct {
         const col_list = try core.quotedJoin(cs.a, cs.cols);
         try st.execSimple(try std.fmt.allocPrint(ca, "CREATE OR REPLACE TEMP TABLE _zbz_copy AS SELECT {s} FROM {s} LIMIT 0", .{ col_list, cs.table }));
         try st.dkAppend("_zbz_copy", rows.items);
-        if (cs.is_full) {
+        if (cs.is_full and cs.wipe_whole) {
             try st.execSimple(try std.fmt.allocPrint(ca, "INSERT INTO {s} ({s}) SELECT {s} FROM _zbz_copy", .{ cs.table, col_list, col_list }));
         } else {
             try st.execSimple(cs.copy_upsert_sql);
@@ -1258,7 +1411,7 @@ pub const SyncClient = struct {
         }
         if (n_live == 0) return;
         const col_list = try core.quotedJoin(cs.a, cs.cols);
-        if (cs.is_full) {
+        if (cs.is_full and cs.wipe_whole) {
             const copy_sql = try std.fmt.allocPrintSentinel(cs.a, "COPY {s} ({s}) FROM STDIN", .{ cs.table, col_list }, 0);
             try st.pgCopy(copy_sql, buf.items);
             return;
@@ -1376,16 +1529,16 @@ pub const SyncClient = struct {
         return order;
     }
 
-    fn applyChain(self: *SyncClient, table: []const u8) !void {
+    fn applyChain(self: *SyncClient, table: []const u8, tenant: []const u8) !void {
         // Per-call: a seed can be megabytes, and it is dead the moment it is applied.
         // Only two things leave this arena — the dictionary cache and `seed_stream` —
         // and both are duped into the client arena explicitly below.
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
-        const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ self.effTenant(table), table });
+        const key = try std.fmt.allocPrint(a, "{s}.{s}", .{ tenant, table });
         const man_bytes = (try self.t.kvGet(a, self.kv_generations, key)) orelse {
-            std.debug.print("{s}: no chain yet\n", .{table});
+            std.debug.print("{s}: no chain yet ({s})\n", .{ table, tenant });
             return;
         };
         const man = (try std.json.parseFromSlice(Value, a, man_bytes, .{})).value;
@@ -1402,7 +1555,7 @@ pub const SyncClient = struct {
             return;
         }
 
-        const wm_rows = try self.st.query(a, "SELECT watermark FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
+        const wm_rows = try self.st.query(a, "SELECT watermark FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = table }, .{ .text = tenant } });
         const watermark: ?[]const u8 = if (wm_rows.len > 0 and wm_rows[0][0] == .text) wm_rows[0][0].text else null;
 
         const plan = try core.planFromManifest(a, man, watermark);
@@ -1435,7 +1588,7 @@ pub const SyncClient = struct {
         }
 
         const st = self.states.getPtr(table).?;
-        const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
+        const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var applied: usize = 0;
         var streamed: usize = 0;
         // Phase timers (§10ez): where a seed's time goes — fetch, inflate, decode, apply.
@@ -1459,7 +1612,7 @@ pub const SyncClient = struct {
                 var pull = try transport.ObjectPull.open(self.t, step_a, bucket, step.object.get("name").?.string);
                 if (pull.size >= self.opts.seed_streaming_above) {
                     defer pull.deinit();
-                    applied += try self.applyStepStreaming(step_a, table, st, man, step, &pull, is_full, &ph);
+                    applied += try self.applyStepStreaming(step_a, table, tenant, st, man, step, &pull, is_full, &ph);
                     streamed += 1;
                     continue;
                 }
@@ -1518,7 +1671,7 @@ pub const SyncClient = struct {
             const vcol_v: ?[]const u8 = vcol_doc orelse (if (man.object.get("version_column")) |v| (if (v == .string) v.string else null) else null);
             const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
             const order = try sortedByKeys(step_a, idx.keys);
-            const shape = try self.stepShape(step_a, table, st.*, cols, vcol, is_full);
+            const shape = try self.stepShape(step_a, table, tenant, st.*, cols, vcol, is_full);
             var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
             defer copy_buf.deinit(self.a);
             ph[2] += msNow() - t_ph;
@@ -1541,14 +1694,21 @@ pub const SyncClient = struct {
             ph[3] += msNow() - t_ph;
         }
 
-        // Anchors (findings 7 + 10): the ONE place the gate may anchor to.
-        if (man.object.get("cutoff_seq")) |v| if (v == .integer and v.integer > 0) {
-            st.seed_seq = @intCast(v.integer);
-            st.seed_stream = if (cdc_stream.len > 0) try self.aa().dupe(u8, cdc_stream) else null;
-        };
-        if (man.object.get("cutoff_lsn")) |v| if (v == .string) {
-            st.seed_lsn = core.lsnToNumber(v.string);
-        };
+        // Anchors (findings 7 + 10): the ONE place the gate may anchor to — per
+        // stream (§10fn): this chain's cutoff on the stream it was cut on.
+        const seed_lsn: i64 = if (man.object.get("cutoff_lsn")) |v| (if (v == .string) core.lsnToNumber(v.string) else 0) else 0;
+        if (cdc_stream.len > 0) {
+            var anchor: SeedAnchor = .{ .stream = try self.aa().dupe(u8, cdc_stream), .seq = 0, .lsn = seed_lsn };
+            if (man.object.get("cutoff_seq")) |v| if (v == .integer and v.integer > 0) {
+                anchor.seq = @intCast(v.integer);
+            };
+            var replaced = false;
+            for (st.anchors.items) |*an| if (std.mem.eql(u8, an.stream, cdc_stream)) {
+                an.* = anchor;
+                replaced = true;
+            };
+            if (!replaced) try st.anchors.append(self.aa(), anchor);
+        }
         const cv = if (man.object.get("cutoff_version")) |v| (if (v == .string) v.string else "") else "";
         // The chain's cutoff is a version this replica has now seen (every seeded row is
         // at or below it): feed the HLC floor, as the TS client does.
@@ -1560,14 +1720,14 @@ pub const SyncClient = struct {
                 self.seen_floor = self.seen_floor_buf[0..floor.len];
             }
         }
-        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?) ON CONFLICT(tbl) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch", &.{ .{ .text = table }, .{ .text = cv }, .{ .integer = st.seed_lsn orelse 0 }, .{ .integer = st.seed_epoch } });
+        _ = try self.st.query(a, "INSERT INTO _zbz_generations (tbl, tenant, watermark, cutoff_lsn, seed_epoch) VALUES (?, ?, ?, ?, ?) ON CONFLICT(tbl, tenant) DO UPDATE SET watermark = excluded.watermark, cutoff_lsn = excluded.cutoff_lsn, seed_epoch = excluded.seed_epoch", &.{ .{ .text = table }, .{ .text = tenant }, .{ .text = cv }, .{ .integer = seed_lsn }, .{ .integer = st.seed_epoch } });
         // A held event at or below the seed's LSN is inside the chain just applied:
         // superseded, not waiting (the TS client's pruneInboxSeeded).
-        try pruneInboxSeeded(&self.st, a, table, st.seed_lsn orelse 0);
+        try pruneInboxSeeded(&self.st, a, table, seed_lsn);
         if (streamed > 0) {
             std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms ({d} of {d} step(s) streamed: fetch+inflate as read, decode = the stage's sort)\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3], streamed, plan.array.items.len });
         } else {
-            std.debug.print("{s}: seeded {d} row(s) from chain g{d} — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, ph[0], ph[1], ph[2], ph[3] });
+            std.debug.print("{s}: seeded {d} row(s) from chain g{d} ({s}) — fetch {d} ms, inflate {d} ms, decode {d} ms, apply {d} ms\n", .{ table, applied, if (man.object.get("gen")) |v| v.integer else 0, tenant, ph[0], ph[1], ph[2], ph[3] });
         }
     }
 
@@ -1579,9 +1739,9 @@ pub const SyncClient = struct {
     /// sorted by key and applied through the same ChainStep as the whole-object path;
     /// the chunk buffer is reused, so a step never holds more than one chunk of rows.
     /// Returns the rows applied.
-    fn applyStepStreaming(self: *SyncClient, step_a: std.mem.Allocator, table: []const u8, st: *TableState, man: Value, step: Value, pull: *transport.ObjectPull, is_full: bool, ph: *[4]i64) !usize {
+    fn applyStepStreaming(self: *SyncClient, step_a: std.mem.Allocator, table: []const u8, tenant: []const u8, st: *TableState, man: Value, step: Value, pull: *transport.ObjectPull, is_full: bool, ph: *[4]i64) !usize {
         const name = step.object.get("name").?.string;
-        const bucket = try std.fmt.allocPrint(step_a, "{s}{s}", .{ self.gen_bucket_prefix, self.effTenant(table) });
+        const bucket = try std.fmt.allocPrint(step_a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
         var dict: ?[]const u8 = null;
         if (step.object.get("dict")) |dv| if (dv == .string) {
             if (self.dicts.get(dv.string)) |d| {
@@ -1631,7 +1791,7 @@ pub const SyncClient = struct {
         // after them: the manifest's is the same column, as of the chain's last step.
         const vcol_v: ?[]const u8 = if (man.object.get("version_column")) |v| (if (v == .string) v.string else null) else null;
         const vcol: ?[]const u8 = if (vcol_v != null and contains(cols, vcol_v.?)) vcol_v else null;
-        const shape = try self.stepShape(step_a, table, st.*, cols, vcol, is_full);
+        const shape = try self.stepShape(step_a, table, tenant, st.*, cols, vcol, is_full);
         var copy_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer copy_buf.deinit(self.a);
         const chunk_rows: usize = if (self.opts.seed_chunk_rows == 0) @max(total, 1) else self.opts.seed_chunk_rows;
@@ -1856,6 +2016,9 @@ pub const SyncClient = struct {
         vec_idx: []const VecIdx,
         copy: bool,
         copy_upsert_sql: []const u8,
+        wipe_sql: []const u8,
+        wipe_arg: ?[]const u8,
+        wipe_whole: bool,
 
         fn step(self: StepShape, client: *SyncClient, a: std.mem.Allocator, bytes: []const u8, offsets: []const usize, order: []const usize, from: usize, to: usize, first_chunk: bool, copy_buf: *std.ArrayListUnmanaged(u8)) ChainStep {
             return .{
@@ -1879,11 +2042,15 @@ pub const SyncClient = struct {
                 .copy = self.copy,
                 .copy_upsert_sql = self.copy_upsert_sql,
                 .copy_buf = copy_buf,
+                .wipe_sql = self.wipe_sql,
+                .wipe_arg = self.wipe_arg,
+                .wipe_whole = self.wipe_whole,
             };
         }
     };
 
-    fn stepShape(self: *SyncClient, a: std.mem.Allocator, table: []const u8, st: TableState, cols: []const []const u8, vcol: ?[]const u8, is_full: bool) !StepShape {
+    fn stepShape(self: *SyncClient, a: std.mem.Allocator, table: []const u8, tenant: []const u8, st: TableState, cols: []const []const u8, vcol: ?[]const u8, is_full: bool) !StepShape {
+        const whole = !self.multiTenant(st);
         var array_idx_list: std.ArrayListUnmanaged(usize) = .empty;
         if (self.st.engine == .postgres) for (st.array_cols) |ac| {
             if (indexOf(cols, ac)) |i| try array_idx_list.append(a, i);
@@ -1903,7 +2070,10 @@ pub const SyncClient = struct {
         const bulk = self.st.engine == .postgres or self.st.engine == .duckdb;
         return .{
             .table = table,
-            .sql = if (is_full) try core.chainInsertSql(a, table, cols) else try core.chainUpsertSql(a, table, cols, st.pk, vcol),
+            .sql = if (is_full and whole) try core.chainInsertSql(a, table, cols) else try core.chainUpsertSql(a, table, cols, st.pk, vcol),
+            .wipe_sql = if (whole) try std.fmt.allocPrint(a, "DELETE FROM {s}", .{table}) else try std.fmt.allocPrint(a, "DELETE FROM {s} WHERE \"{s}\" = ?", .{ table, st.tenant_col.? }),
+            .wipe_arg = if (whole) null else tenant,
+            .wipe_whole = whole,
             .is_full = is_full,
             .cols = cols,
             .pk = st.pk,
@@ -1926,10 +2096,11 @@ pub const SyncClient = struct {
         // Public first: parents (users) ride CDC_PUBLIC — fewer FK holds.
         var it = self.states.iterator();
         while (it.next()) |e| {
-            if (std.mem.eql(u8, e.value_ptr.route, self.cdc_public)) try streams.put(a, e.value_ptr.route, {});
+            for (e.value_ptr.routes) |r| if (std.mem.eql(u8, r, self.cdc_public)) try streams.put(a, r, {});
+            if (e.value_ptr.shared_route) |sr| try streams.put(a, sr, {});
         }
         it = self.states.iterator();
-        while (it.next()) |e| try streams.put(a, e.value_ptr.route, {});
+        while (it.next()) |e| for (e.value_ptr.routes) |r| try streams.put(a, r, {});
 
         var sit = streams.iterator();
         while (sit.next()) |se| try self.drainStream(se.key_ptr.*);
@@ -1942,10 +2113,11 @@ pub const SyncClient = struct {
         var streams: std.StringArrayHashMapUnmanaged(void) = .empty;
         var it = self.states.iterator();
         while (it.next()) |e| {
-            if (std.mem.eql(u8, e.value_ptr.route, self.cdc_public)) try streams.put(a, e.value_ptr.route, {});
+            for (e.value_ptr.routes) |r| if (std.mem.eql(u8, r, self.cdc_public)) try streams.put(a, r, {});
+            if (e.value_ptr.shared_route) |sr| try streams.put(a, sr, {});
         }
         it = self.states.iterator();
-        while (it.next()) |e| try streams.put(a, e.value_ptr.route, {});
+        while (it.next()) |e| for (e.value_ptr.routes) |r| try streams.put(a, r, {});
         return try a.dupe([]const u8, streams.keys());
     }
 
@@ -1994,7 +2166,7 @@ pub const SyncClient = struct {
                 dropped += 1;
                 continue;
             };
-            if (self.applyEvent(table, ev, 0)) |_| {
+            if (self.applyEvent(table, ev, "", 0)) |_| {
                 _ = self.st.query(a, "DELETE FROM _zbz_inbox WHERE id = ?", &.{id}) catch {};
                 resolved += 1;
                 // Duped: `table` is a row of this pass's arena (§10ee).
@@ -2136,7 +2308,7 @@ pub const SyncClient = struct {
                         if (cx.client.states.get(table) == null) continue;
                         cx.offered.* += 1;
                         var applied_here = true;
-                        cx.client.applyEvent(table, ev, seq) catch |err| switch (err) {
+                        cx.client.applyEvent(table, ev, m.metadata.stream, seq) catch |err| switch (err) {
                             // An OOM here is a `try`, not a `catch {}`: a dropped hold is an
                             // event that is acked, positioned past, and never applied.
                             // Held DURABLY, in this batch's transaction (CLIENTS.md, §10de
@@ -2203,6 +2375,57 @@ pub const SyncClient = struct {
         return self.tail_inbox.?;
     }
 
+    /// Set aside and not yet due for a retry.
+    fn isDark(self: *SyncClient, stream: []const u8) bool {
+        const d = self.dark.get(stream) orelse return false;
+        return nowMillis() < d.retry_at_ms;
+    }
+
+    /// The stream could not be read: set it aside, say so once, back off. Its tail, if
+    /// any, is closed — a consumer that cannot be re-opened would otherwise be handed
+    /// to every fetch again.
+    fn markDark(self: *SyncClient, stream: []const u8, err: anyerror) void {
+        const now = nowMillis();
+        if (self.dark.getPtr(stream)) |d| {
+            d.backoff_ms = @min(d.backoff_ms * 2, dark_backoff_max_ms);
+            d.retry_at_ms = now + d.backoff_ms;
+        } else {
+            const key = self.aa().dupe(u8, stream) catch return;
+            self.dark.put(self.aa(), key, .{ .retry_at_ms = now + dark_backoff_first_ms, .backoff_ms = dark_backoff_first_ms }) catch return;
+            std.debug.print("⚠️ {s}: unreadable ({s}) — set aside, the other streams go on; retried with backoff\n", .{ stream, @errorName(err) });
+        }
+        self.dropTail(stream);
+    }
+
+    /// Readable again: back into the fetch, and whatever it left unseeded is asked for.
+    fn clearDark(self: *SyncClient, stream: []const u8) void {
+        if (self.dark.fetchOrderedRemove(stream) != null) {
+            std.debug.print("✅ {s}: readable again — back in the tail\n", .{stream});
+            self.reseed_pending = true;
+        }
+    }
+
+    fn dropTail(self: *SyncClient, stream: []const u8) void {
+        var k: usize = 0;
+        while (k < self.tails.items.len) {
+            if (std.mem.eql(u8, self.tails.items[k].stream, stream)) {
+                self.tails.items[k].sub.deinit();
+                _ = self.tails.orderedRemove(k);
+            } else k += 1;
+        }
+    }
+
+    /// The tenants whose streams are set aside, for the host (a stream's tenant is its
+    /// name past the prefix; CDC_PUBLIC's is the open tenant).
+    fn unreadableTenants(self: *SyncClient, a: std.mem.Allocator) ![]const []const u8 {
+        var out: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (self.dark.keys()) |stream| {
+            const t = if (std.mem.eql(u8, stream, self.cdc_public)) self.open_tenant else if (std.mem.startsWith(u8, stream, self.cdc_prefix)) stream[self.cdc_prefix.len..] else stream;
+            try out.append(a, try a.dupe(u8, t));
+        }
+        return out.items;
+    }
+
     fn tailFor(self: *SyncClient, stream: []const u8) !*Tail {
         for (self.tails.items) |*t| {
             if (std.mem.eql(u8, t.stream, stream)) return t;
@@ -2229,7 +2452,15 @@ pub const SyncClient = struct {
         t.sub = fresh;
     }
 
-    pub const PollReport = struct { applied: usize, settled: usize, changed_tables: []const []const u8, seeded: []const []const u8 };
+    pub const PollReport = struct {
+        applied: usize,
+        settled: usize,
+        changed_tables: []const []const u8,
+        seeded: []const []const u8,
+        /// §10fq: tenants whose streams are set aside (unreadable now, retried with
+        /// backoff). A host that followed them by choice may `leave` them.
+        unreadable: []const []const u8 = &.{},
+    };
 
     /// One turn of the host's loop: wait up to `wait_ms` for CDC on the persistent
     /// tails, apply what arrived, retry the FK-held, then sweep verdicts without
@@ -2263,25 +2494,58 @@ pub const SyncClient = struct {
         // began with CDC_PUBLIC's full idle slice, and the row waited 265 ± 1 ms on
         // every one of 20 runs. Idle now costs one pull per stream per `wait_ms`.
         const a = ca.allocator();
-        const subs = try a.alloc(*@import("nats").PullSubscription, streams.len);
-        for (streams, 0..) |stream, i| subs[i] = (try self.tailFor(stream)).sub;
+        // §10fq: one unreadable stream must not stall the others. A tail that cannot be
+        // opened sets its stream aside instead of failing the poll; the fetch runs over
+        // what is readable, in the same order as `live`.
+        var live: std.ArrayListUnmanaged([]const u8) = .empty;
+        var subs_list: std.ArrayListUnmanaged(*@import("nats").PullSubscription) = .empty;
+        for (streams) |stream| {
+            if (self.isDark(stream)) continue;
+            const tl = self.tailFor(stream) catch |err| {
+                self.markDark(stream, err);
+                continue;
+            };
+            self.clearDark(stream);
+            try live.append(a, stream);
+            try subs_list.append(a, tl.sub);
+        }
+        const unreadable = try self.unreadableTenants(report_a);
+        if (subs_list.items.len == 0) {
+            // Everything is dark: the wait still costs `wait_ms` (spent on verdicts), so
+            // a host's loop does not spin against the backoff.
+            const settled0 = try self.drainVerdictsWith(wait_ms, 1);
+            return .{ .applied = 0, .settled = settled0, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys(), .unreadable = unreadable };
+        }
+        const subs = subs_list.items;
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@max(1, wait_ms))), .clock = .awake } };
         var applied: usize = 0;
         var mb = (try self.tailInbox()).fetch(subs, 100, t) catch |err| switch (err) {
             // EVERY tail's consumer is gone (a long pause past inactive_threshold):
-            // re-open them all at the stored positions; the next poll reads.
+            // re-open them all at the stored positions; the next poll reads. One that
+            // cannot be re-opened is set aside rather than failing the rest.
             error.NoResponders => {
-                for (self.tails.items) |*tl| try self.reopenTail(tl);
-                return .{ .applied = 0, .settled = try self.drainVerdictsWith(0, 1), .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
+                for (live.items) |stream| {
+                    const tl = self.tailFor(stream) catch |e| {
+                        self.markDark(stream, e);
+                        continue;
+                    };
+                    self.reopenTail(tl) catch |e| self.markDark(stream, e);
+                }
+                return .{ .applied = 0, .settled = try self.drainVerdictsWith(0, 1), .changed_tables = changed_map.keys(), .seeded = seeded_map.keys(), .unreadable = try self.unreadableTenants(report_a) };
             },
             else => return err,
         };
         defer mb.deinit();
         // A consumer that went away while the others answered: re-open it alone.
-        // By NAME, not by index — `gone` is ordered like `streams`, and the tails
-        // list happens to match today only because states never change mid-life.
+        // By NAME, not by index — `gone` is ordered like `live`. A re-open that fails
+        // (the stream was deleted, the grant withdrawn) sets that stream aside.
         for (mb.gone, 0..) |g, i| {
-            if (g) try self.reopenTail(try self.tailFor(streams[i]));
+            if (!g) continue;
+            const tl = self.tailFor(live.items[i]) catch |e| {
+                self.markDark(live.items[i], e);
+                continue;
+            };
+            self.reopenTail(tl) catch |e| self.markDark(live.items[i], e);
         }
         // Messages come interleaved across streams; the applier positions per stream,
         // so group them (order within a stream is preserved).
@@ -2319,15 +2583,21 @@ pub const SyncClient = struct {
         self.drainRebase();
         const settled = try self.drainVerdictsWith(0, 1);
         self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
-        return .{ .applied = applied, .settled = settled, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys() };
+        return .{ .applied = applied, .settled = settled, .changed_tables = changed_map.keys(), .seeded = seeded_map.keys(), .unreadable = try self.unreadableTenants(report_a) };
     }
 
-    fn applyEvent(self: *SyncClient, table: []const u8, ev: Value, seq: u64) !void {
+    fn applyEvent(self: *SyncClient, table: []const u8, ev: Value, stream: []const u8, seq: u64) !void {
         const st = self.states.get(table).?;
-        // The seed gate (findings 7 + 10) — seq primary, seed-anchored lsn fallback.
-        if (st.seed_seq != null and st.seed_stream != null) {
-            if (seq != 0 and std.mem.eql(u8, st.seed_stream.?, st.route) and seq <= st.seed_seq.?) return;
-        } else if (st.seed_lsn) |floor| {
+        // The seed gate (findings 7 + 10) — seq primary on the event's own stream,
+        // seed-anchored lsn fallback (the lowest anchor: the strictest floor that is
+        // still inside every chain applied).
+        if (seq != 0) {
+            for (st.anchors.items) |an| if (an.seq > 0 and std.mem.eql(u8, an.stream, stream)) {
+                if (seq <= an.seq) return;
+            };
+        } else if (st.anchors.items.len > 0) {
+            var floor: i64 = std.math.maxInt(i64);
+            for (st.anchors.items) |an| floor = @min(floor, an.lsn);
             const lsn: i64 = if (ev.object.get("lsn")) |v| (if (v == .integer) v.integer else 0) else 0;
             if (lsn != 0 and lsn < floor) return;
         }
@@ -3004,9 +3274,14 @@ pub const SyncClient = struct {
         const streams = try self.cdcStreams(a);
         const seqs = try a.alloc(u64, streams.len);
         for (streams, 0..) |s, i| seqs[i] = try self.storedSeq(s);
-        const payload = try core.heartbeatPayload(a, self.opts.principal, self.tenant, now, streams, seqs);
-        const subject = try std.fmt.allocPrint(a, "$KV.{s}.{s}.{s}", .{ self.kv_live, self.tenant, self.opts.principal });
-        try self.t.publish(subject, payload, null);
+        // §10fn: one beat per membership — the grant is `$KV.live.<tenant>.<principal>`
+        // per tag, and each tenant's fleet view lists this client under its own key.
+        const beats: []const []const u8 = if (self.tenants.len > 0) self.tenants else self.open_tenants;
+        for (beats) |tenant| {
+            const payload = try core.heartbeatPayload(a, self.opts.principal, tenant, now, streams, seqs);
+            const subject = try std.fmt.allocPrint(a, "$KV.{s}.{s}.{s}", .{ self.kv_live, tenant, self.opts.principal });
+            try self.t.publish(subject, payload, null);
+        }
         self.last_heartbeat_ms = now;
     }
 
@@ -3048,7 +3323,7 @@ pub const SyncClient = struct {
         return .{ .object = out };
     }
 
-    pub const SyncReport = struct { tenant: []const u8, first: bool };
+    pub const SyncReport = struct { tenant: []const u8, tenants: []const []const u8, first: bool };
 
     /// One pass of the read side: the one-time steps (tenant, schemas, outbox table,
     /// the verdict channel) the first time, then seed-if-gapped and drain-to-tail every
@@ -3071,7 +3346,104 @@ pub const SyncClient = struct {
         try self.drainCdc();
         // A host that syncs before it ever polls is a client too (PROTOCOL §9).
         self.heartbeatIfDue() catch |err| std.debug.print("heartbeat: {s}\n", .{@errorName(err)});
-        return .{ .tenant = self.tenant, .first = first };
+        return .{ .tenant = self.tenant, .tenants = self.tenants, .first = first };
+    }
+
+    /// §10fn: follow one more tenant at runtime — subscribe to its stream and seed
+    /// its chain for every tenant-scoped table, into the same local tables (every row
+    /// carries its tenant). Whether the broker lets it happen is the JWT's decision:
+    /// a `region` principal's wildcard grant covers any cell, a `client` principal
+    /// needs the tenant among its tags — a join outside the grant fails at the
+    /// consumer, loudly, and is retried at the next poll like any unseeded table.
+    pub fn join(self: *SyncClient, tenant: []const u8) !void {
+        if (tenant.len == 0 or std.mem.indexOfAny(u8, tenant, ".*> ") != null) return error.TenantMalformed;
+        for (self.tenants) |t| if (std.mem.eql(u8, t, tenant)) return;
+        // Ask the broker FIRST (§10fo): a tenant outside the JWT's tags, or one whose
+        // stream does not exist yet, answers here and the membership is never taken.
+        // Taken anyway, the denied tail wedged every later poll — the permitted
+        // tenants' included (measured: a join of an unenrolled cell, then Timeout on
+        // every poll).
+        {
+            var qa = std.heap.ArenaAllocator.init(self.a);
+            defer qa.deinit();
+            const route = try self.routeFor(qa.allocator(), tenant);
+            var info = self.t.js.getStreamInfo(route) catch |err| {
+                std.debug.print("tenant: join {s} refused — {s} is not readable with these credentials ({s}): not among the JWT's tenants, or its stream does not exist yet\n", .{ tenant, route, @errorName(err) });
+                return error.JoinRefused;
+            };
+            info.deinit();
+        }
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        try list.appendSlice(self.aa(), self.tenants);
+        try list.append(self.aa(), try self.aa().dupe(u8, tenant));
+        std.mem.sort([]const u8, list.items, {}, lessStr);
+        self.tenants = list.items;
+        self.tenant_missing = false;
+        self.tenant = self.tenants[0];
+        try self.refreshRoutes();
+        std.debug.print("tenant: joined {s} ({d} membership(s))\n", .{ tenant, self.tenants.len });
+        // Tables skipped for want of a tenant get their descriptor applied now; then
+        // the unseeded (table, tenant) pairs seed. The tail opens at the next poll.
+        try self.syncSchemas();
+        self.reseed_pending = false;
+        try self.gapAndSeed(null, null);
+    }
+
+    /// §10fn: stop following a tenant — its rows leave the local tables, its
+    /// watermarks and positions are forgotten, its tail is closed. A rejoin seeds it
+    /// afresh. The client's own writes to it that are still in the outbox stay there:
+    /// the verdict, not the membership, settles a write.
+    pub fn leave(self: *SyncClient, tenant: []const u8) !void {
+        var found = false;
+        var list: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (self.tenants) |t| {
+            if (std.mem.eql(u8, t, tenant)) {
+                found = true;
+            } else try list.append(self.aa(), t);
+        }
+        if (!found) return;
+        self.tenants = list.items;
+        self.tenant_missing = self.tenants.len == 0;
+        self.tenant = if (self.tenants.len > 0) self.tenants[0] else self.open_tenant;
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        const a = qa.allocator();
+        const route = try self.routeFor(a, tenant);
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            const st = e.value_ptr;
+            const tc = st.tenant_col orelse continue;
+            _ = try self.st.query(a, try std.fmt.allocPrint(a, "DELETE FROM {s} WHERE \"{s}\" = ?", .{ e.key_ptr.*, tc }), &.{.{ .text = tenant }});
+            _ = try self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ? AND tenant = ?", &.{ .{ .text = e.key_ptr.* }, .{ .text = tenant } });
+            var k: usize = 0;
+            while (k < st.anchors.items.len) {
+                if (std.mem.eql(u8, st.anchors.items[k].stream, route)) {
+                    _ = st.anchors.orderedRemove(k);
+                } else k += 1;
+            }
+        }
+        try self.refreshRoutes();
+        // The stream is nobody's now: close its tail and forget its position.
+        var k: usize = 0;
+        while (k < self.tails.items.len) {
+            if (std.mem.eql(u8, self.tails.items[k].stream, route)) {
+                self.tails.items[k].sub.deinit();
+                _ = self.tails.orderedRemove(k);
+            } else k += 1;
+        }
+        _ = try self.st.query(a, "DELETE FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = route }});
+        _ = self.dark.fetchOrderedRemove(route);
+        std.debug.print("tenant: left {s} ({d} membership(s) left)\n", .{ tenant, self.tenants.len });
+    }
+
+    /// The membership moved: every tenant-scoped table's routes follow it.
+    fn refreshRoutes(self: *SyncClient) !void {
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            const st = e.value_ptr;
+            if (st.tenant_col == null) continue;
+            st.routes = try self.routesFor(st.tenant_col);
+        }
     }
 
     pub const FlushReport = struct { sent: usize, settled: usize };

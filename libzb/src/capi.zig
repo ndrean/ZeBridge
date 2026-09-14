@@ -14,13 +14,15 @@
 //! Every call answers `{"error":"<Name>"}` on failure and never a NULL except for a
 //! NULL argument or a failed malloc. A handle is NOT thread-safe: one thread drives
 //! one client; the table only makes the WRONG thread's mistakes non-fatal.
-//!   char* zb_client_sync(uint64_t h);                              // {"tenant":…,"first":bool}
+//!   char* zb_client_sync(uint64_t h);                              // {"tenant":…,"tenants":[…],"first":bool}
 //!   char* zb_client_query(uint64_t h, const char* sql, const char* params_json);
 //!                                                                  // {"columns":[…],"rows":[[…],…]} — read-only connection
 //!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
 //!                          const char* key_json, const char* values_json);   // {"msgId":…}
 //!   char* zb_client_flush(uint64_t h, uint64_t wait_ms);           // {"sent":n,"settled":n}
-//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n} — live tail, blocks ≤ wait_ms
+//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"unreadable":[…]?} — live tail, blocks ≤ wait_ms
+//!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
+//!   char* zb_client_leave(uint64_t h, const char* tenant);         // {"tenants":[…]} — drop one: its rows, watermarks, tail
 //! `opts_json`: url, credsPath, dbPath, principal, tables (array, parents first),
 //! clientId (stable across restarts — it is the msg_id prefix), grammarHash
 //! (optional: the hash the host received from /enroll or GET /grammar; a mismatch
@@ -537,8 +539,46 @@ fn syncJson(a: std.mem.Allocator, b: *ClientBox) ![]const u8 {
     const r = try b.c.syncOnce();
     var out: std.json.ObjectMap = .empty;
     try out.put(a, "tenant", .{ .string = r.tenant });
+    try out.put(a, "tenants", try tenantsJson(a, r.tenants));
     try out.put(a, "first", .{ .bool = r.first });
     return try core.valueToString(a, .{ .object = out });
+}
+
+fn tenantsJson(a: std.mem.Allocator, tenants: []const []const u8) !std.json.Value {
+    var arr = std.json.Array.init(a);
+    for (tenants) |t| try arr.append(.{ .string = t });
+    return .{ .array = arr };
+}
+
+/// §10fn: `{"tenants":[…]}` after a join or a leave — the memberships followed now.
+fn membershipJson(a: std.mem.Allocator, b: *ClientBox, tenant: []const u8, joining: bool) ![]const u8 {
+    if (joining) try b.c.join(tenant) else try b.c.leave(tenant);
+    var out: std.json.ObjectMap = .empty;
+    try out.put(a, "tenants", try tenantsJson(a, b.c.tenants));
+    return try core.valueToString(a, .{ .object = out });
+}
+
+/// Follow one more tenant: subscribe to its stream, seed its chains into the same
+/// local tables. The JWT decides whether the broker allows it. Returns
+/// `{"tenants":[…]}` or `{"error":…}`.
+export fn zb_client_join(handle: u64, tenant: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const t = std.mem.span(tenant orelse return errJson("NullArgument"));
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = membershipJson(arena.allocator(), b, t, true) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
+}
+
+/// Stop following a tenant: its rows leave the local tables, its watermarks and
+/// positions are forgotten, its tail is closed. Returns `{"tenants":[…]}`.
+export fn zb_client_leave(handle: u64, tenant: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const t = std.mem.span(tenant orelse return errJson("NullArgument"));
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = membershipJson(arena.allocator(), b, t, false) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
 }
 
 export fn zb_client_sync(handle: u64) ?[*:0]u8 {
@@ -639,6 +679,13 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     var seeded = std.json.Array.init(a);
     for (r.seeded) |t| try seeded.append(.{ .string = t });
     try out.put(a, "seeded", .{ .array = seeded });
+
+    // §10fq: tenants whose streams are set aside — present only when there are some.
+    if (r.unreadable.len > 0) {
+        var unreadable = std.json.Array.init(a);
+        for (r.unreadable) |t| try unreadable.append(.{ .string = t });
+        try out.put(a, "unreadable", .{ .array = unreadable });
+    }
 
     return try core.valueToString(a, .{ .object = out });
 }

@@ -62,7 +62,7 @@ The client library can seed at rates around 150-200.000 rows/s, and  it applies 
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 * **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independently from small tables with heavy changes and optimize memory usage.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding, and streaming when needed. This mitigates the need for long, expensive unitary CDC catchups.
-* **Geographic or Tenant division**: along with NATS leaf nodes, you can choose to use a fix tenant division by  business, or a dynamic geographic tenant mode (like mobile apps).
+* **Geographic or Tenant division**: a tenant is in practice a column in a table and a consumer brings his identity, and Postgres resolves the tenant from it. Tenants serves to set a division, along with define NATS grants, by  business, or dynamically, a geography (like mobile apps).
 * **Strict authentication**: because NATS is exposed to the internet and contains data, users are strictly tenant scoped and access grants are encoded in a JWT, immediately revokable by the DBA.
 * **Encryption**: the Postgres disk can be encrypted at rest, but the replicas are normally not encrypted (the native SQLite does not propose it). The data that matters for ZeBridge are encrypted.
 * **Standby Read Replica ready**: you can use a dedicated Postgres standby replica for all the reads.
@@ -2283,6 +2283,7 @@ Raising `max_payload` in `nats-server.conf` is possible but affects every client
 
 * `libpq` ≧ 14  at build time (pipeline mode). License MIT
 * `libzstd`, License BSD 3-Clause
+* `duckdb`, License MIT
 * `Zig` to compile `zebridge`, `libzb` and `bridge_sweeper`.
 
 **Version Requirements**:

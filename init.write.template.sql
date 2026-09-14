@@ -228,8 +228,9 @@ $$ LANGUAGE plpgsql;
 --   1. **absence** — omitted, NULL, or empty → **the writer's own tenant**, looked up from
 --      `zebridge_user_tenants` by `zb.principal`. This is the correction that matters: a
 --      tenanted client that forgets the column must NOT have its (sensitive) row silently
---      published to everyone. Omission means "mine", never "open". N-1 (one tenant per
---      client principal) makes the lookup unambiguous.
+--      published to everyone. Omission means "mine", never "open" — and only while
+--      "mine" is one tenant: a member of several (§10fn) must name it, the omission
+--      is refused rather than guessed.
 --
 --      ⚠️ **Fail-CLOSED on no derivable tenant.** If `zb.principal` is unset or unmapped,
 --      there is no tenant to stamp and the write is REJECTED — a row on a tenant-routed
@@ -267,14 +268,23 @@ DECLARE
     col  text := TG_ARGV[0];
     val  text;
     mine text;
+    n    bigint;
     who  text := current_setting('zb.principal', true);
 BEGIN
     EXECUTE format('SELECT ($1).%I::text', col) USING NEW INTO val;
 
     IF val IS NULL OR val = '' THEN
-        -- Derive from identity. N-1: one tenant per client principal, so LIMIT 1 is exact.
-        SELECT tenant_id INTO mine FROM public.zebridge_user_tenants
-            WHERE principal = who LIMIT 1;
+        -- Derive from identity — exact only when the principal belongs to ONE tenant.
+        -- A member of several (§10fn) must say which: guessing one would route the row
+        -- to a tenant the writer did not name, so the omission is refused, not filled.
+        SELECT min(tenant_id), count(*) INTO mine, n FROM public.zebridge_user_tenants
+            WHERE principal = who;
+        IF n > 1 THEN
+            RAISE EXCEPTION 'no tenant for a write to %: principal % belongs to % tenants, '
+                'so % must be supplied explicitly.',
+                TG_TABLE_NAME, quote_literal(who), n, col
+                USING ERRCODE = 'check_violation';
+        END IF;
         IF mine IS NULL THEN
             RAISE EXCEPTION 'no tenant for a write to %: principal % is unset or not in '
                 'zebridge_user_tenants, and a tenant-routed row cannot be left unrouted. '
@@ -608,9 +618,15 @@ $$ LANGUAGE sql STABLE;
 -- principal → tenant, the mapping RLS resolves against — see PROTOCOL.md §7.4
 CREATE TABLE IF NOT EXISTS public.zebridge_user_tenants (
     principal text NOT NULL,
-    tenant_id text NOT NULL,
+    -- A tenant is a NATS subject token (§10fo): no `.`, `*`, `>` or space — the
+    -- application-table guard checks a row's value, this checks the roster's, and
+    -- the invite below the DBA's, so a wildcard can never become a stream name, a
+    -- KV entry or a JWT tag.
+    tenant_id text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]'),
     PRIMARY KEY (principal, tenant_id)
 );
+ALTER TABLE public.zebridge_user_tenants DROP CONSTRAINT IF EXISTS zebridge_user_tenants_tenant_id_check;
+ALTER TABLE public.zebridge_user_tenants ADD CONSTRAINT zebridge_user_tenants_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
 GRANT SELECT ON public.zebridge_user_tenants TO ${POSTGRES_READER_USER}, ${POSTGRES_WRITER_USER};
 
 -- The keys a principal enrolled with (§10cl). /enroll used to mint from the pubkey
@@ -646,12 +662,14 @@ GRANT INSERT, UPDATE ON public.zebridge_principal_keys TO ${POSTGRES_WRITER_USER
 CREATE TABLE IF NOT EXISTS public.zebridge_invites (
     code       text PRIMARY KEY,
     principal  text NOT NULL CHECK (principal ~ '^[A-Za-z0-9_-]+$'),
-    tenant_id  text NOT NULL,
+    tenant_id  text NOT NULL CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]'),
     role       text NOT NULL DEFAULT 'client',
     created_at timestamptz NOT NULL DEFAULT now(),
     expires_at timestamptz NOT NULL DEFAULT now() + interval '7 days',
     used_at    timestamptz
 );
+ALTER TABLE public.zebridge_invites DROP CONSTRAINT IF EXISTS zebridge_invites_tenant_id_check;
+ALTER TABLE public.zebridge_invites ADD CONSTRAINT zebridge_invites_tenant_id_check CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]');
 -- The bridge redeems invites over its WRITER connection: read the row, stamp
 -- used_at, and register the principal→tenant mapping in the same transaction.
 GRANT SELECT, UPDATE ON public.zebridge_invites TO ${POSTGRES_WRITER_USER};

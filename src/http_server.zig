@@ -447,12 +447,21 @@ pub const Server = struct {
         const principal = std.mem.span(c.PQgetvalue(res, 0, 0));
         const tenant = std.mem.span(c.PQgetvalue(res, 0, 1));
 
+        // §10fn: the JWT carries EVERY tenant the roster lists for the principal, not
+        // only the invite's — a second invite for a known principal is a join, and the
+        // read grants (one per tag) must match the write set (the roster) or the client
+        // writes rows it can never read back. Read after the redeem committed: a
+        // data-modifying CTE's rows are invisible to the statement that wrote them.
+        var tenants_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer tenants_arena.deinit();
+        const tenants = rosterTenants(tenants_arena.allocator(), conn, principal) catch &.{tenant};
+
         const jwt = jwt_mint.mint(
             self.allocator,
             ctx.signing_seed,
             ctx.account_pub,
             principal,
-            tenant,
+            if (tenants.len > 0) tenants else &.{tenant},
             user_pub,
             ctx.ttl_seconds,
             @as(i64, @intCast(c.time(null))),
@@ -469,7 +478,7 @@ pub const Server = struct {
         std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &ghash, .{});
         const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\",\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, topology_mod.embedded_json });
         defer self.allocator.free(body);
-        log.info("🎟️ enrolled '{s}' (tenant '{s}') — JWT minted, mapping registered", .{ principal, tenant });
+        log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
         try req.respond(body, .{ .status = .ok, .extra_headers = cors });
     }
 
@@ -781,3 +790,17 @@ pub const Server = struct {
     // `purgeStream`, one `else if` away from being live again. Dead code that deletes
     // data is worth removing rather than leaving for someone to rediscover.
 };
+
+/// §10fn: the principal's memberships, sorted — what the JWT's tags and a client's
+/// `$KV.tenants.<principal>` list both come from.
+fn rosterTenants(a: std.mem.Allocator, conn: *c.PGconn, principal: []const u8) ![]const []const u8 {
+    const pz = try a.dupeZ(u8, principal);
+    const params = [_]?[*:0]const u8{pz.ptr};
+    const res = c.PQexecParams(conn, "SELECT tenant_id::text FROM public.zebridge_user_tenants WHERE principal = $1 ORDER BY tenant_id", 1, null, &params[0], null, null, 0);
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_TUPLES_OK) return error.RosterUnavailable;
+    const n: usize = @intCast(c.PQntuples(res));
+    const out = try a.alloc([]const u8, n);
+    for (0..n) |i| out[i] = try a.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)));
+    return out;
+}

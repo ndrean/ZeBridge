@@ -1901,8 +1901,18 @@ export class ZeBridge {
       if (entry && entry.operation === 'PUT' && entry.value?.length) {
         let val: string;
         try { val = decode(entry.value) as string; } catch { val = td.decode(entry.value); }
-        this.tenantValue = val;
-        this.appendLog('SYS', `Resolved tenant for '${this.config.principal}': ${val}`, 'INFO');
+        if (typeof val !== 'string') val = td.decode(entry.value);
+        // §10fn: the value is the roster's SET, a JSON array (`["acme","globex"]`); a
+        // bare string is one tenant. This client follows ONE tenant — the first — and
+        // says so when there are more (membership across several is libzb's, parity
+        // queued).
+        const list = parseTenantList(val);
+        this.tenantValue = list[0] ?? '';
+        if (list.length > 1) {
+          this.appendLog('SYS', `'${this.config.principal}' belongs to ${list.length} tenants (${list.join(', ')}) — this client follows '${list[0]}' only`, 'WARN');
+        } else {
+          this.appendLog('SYS', `Resolved tenant for '${this.config.principal}': ${this.tenantValue}`, 'INFO');
+        }
       } else {
         this.tenantValue = '';
         this.appendLog('SYS', `No tenant mapping for '${this.config.principal}' — revoked, or never enrolled: tenant-scoped tables are not followed, public tables are`, 'WARN');
@@ -2990,4 +3000,18 @@ export class ZeBridge {
       }
     }
   }
+}
+
+
+/** §10fn: `$KV.tenants.<principal>` — a JSON array of tenants, or one bare tenant. */
+export function parseTenantList(value: string): string[] {
+  const v = (value ?? '').trim();
+  if (!v) return [];
+  if (v.startsWith('[')) {
+    try {
+      const arr = JSON.parse(v);
+      if (Array.isArray(arr)) return arr.filter((t): t is string => typeof t === 'string' && t.length > 0);
+    } catch { /* fall through: not a list */ }
+  }
+  return [v];
 }

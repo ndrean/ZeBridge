@@ -166,7 +166,7 @@ flowchart TD
 | channel | kind | direction | why |
 | --- | --- | --- | --- |
 | `schemas` | **KV bucket** | bridge → client | Last-value-per-key. A client connecting at any time gets the current schema without replay. Schema is *state*, not an event. |
-| `tenants` | **KV bucket** | bridge → client | `$KV.tenants.<principal>` → the principal's tenant, kept current from `zebridge_user_tenants` (§6, Step 0). One key per principal, granted per principal. |
+| `tenants` | **KV bucket** | bridge → client | `$KV.tenants.<principal>` → the principal's memberships, a JSON array, kept current from `zebridge_user_tenants` (§6, Step 0). One key per principal, granted per principal. |
 | `CDC_PUBLIC`, `CDC_<tenant>` | **streams** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*: public tables on `CDC_PUBLIC`, a tenant's tables on its own stream (§4). |
 | `generations` + `gen-<tenant>` | **KV + object store** | bridge → client | The seed source (§6): one chain manifest per `<tenant>.<table>`, objects chunked by the store itself — a seed is *state*, built on a cadence, never served per request. |
 | `MUTATIONS` | **stream** | client → bridge → client | Edge writes (§7), the verdicts answering them (`mutation_ack.>`), and the dead-letter copies of refused writes (`mutation_error.<table>`) for the operator. |
@@ -915,11 +915,40 @@ Everything below needs a tenant token to build subject and bucket names. A clien
 tenant ← KV.tenants.get(<principal>) or `nats kv get tenants <principal>`
 ```
 
-This reads `$KV.tenants.<principal>` — a single value, populated live from
-`zebridge_user_tenants` over the WAL (mirroring exactly how `$KV.schemas` is kept current from DDL, §1).
-An INSERT or UPDATE writes the key, a DELETE purges it, so a revoked principal resolves to no mapping — the open tenant — on its next connect. 
+This reads `$KV.tenants.<principal>` — the principal's memberships as a JSON array,
+sorted, `["acme","globex"]`, populated live from `zebridge_user_tenants` over the WAL
+(mirroring exactly how `$KV.schemas` is kept current from DDL, §1). A principal belongs
+to one or more tenants; the bridge mirrors `zebridge_user_tenants` and writes the whole set on every
+change. An INSERT adds a membership, a DELETE removes one and republishes the smaller
+set; the LAST membership deleted purges the key and publishes the ban
+(`mutation_ack.<principal>.revoked`), so a revoked principal resolves to no mapping —
+the open tenant — on its next connect.
 **Resolved fresh on every connect, never cached client-side across sessions**: the
-bucket is what lets a tenant reassignment take effect without restarting anything. 
+bucket is what lets a membership change take effect without restarting anything.
+
+A client follows EVERY tenant listed: for each tenant-scoped table, one chain per
+tenant (`$KV.generations.<tenant>.<table>`, bucket `gen-<tenant>`) seeded into the
+same local table — every row carries its tenant column — and one `CDC_<tenant>`
+stream per tenant on the tail. Watermarks are kept per (table, tenant), the seed gate
+per stream. A client may also `join` and `leave` a tenant at runtime (libzb
+`zb_client_join`/`zb_client_leave`): a join seeds the tenant's chains and opens its
+tail, a leave deletes its rows, forgets its watermarks and position and closes its
+tail. A join first asks the broker for the tenant's stream and is refused
+(`JoinRefused`) when the credentials cannot read it, before the membership is taken.
+A stream that becomes unreadable later — deleted, or no longer granted — is set aside
+on its own: the client keeps serving its other streams, retries that one with a
+doubling backoff (5 s up to 60 s), and names its tenant in the poll report
+(`unreadable`) until it is readable again or left.
+Whether a join is allowed is the JWT's decision — the mint tags every
+row of `zebridge_user_tenants` for the principal (`tenant:<t>`, one tag each) and the role template expands to one grant
+per tag — so a `client` principal joins by being re-enrolled after a row is added,
+and a wildcard never works inside a tag: NATS wildcards are whole tokens, so
+`tenant:r_*` expands to no valid subject and grants nothing. A tenant value is a
+subject token, and `zebridge_user_tenants` and `zebridge_invites` refuse `.`, `*`, `>` and space.
+
+A write must name its tenant when the principal belongs to several: the tenant guard
+fills an omitted value only from a single membership and refuses the ambiguous case
+(`check_violation`).
 
 The NATS grant on this key is scoped to the client's own principal (`$KV.tenants.alice`, never a wildcard) ➡ a leaked credential discloses only that principal's own tenant.
 

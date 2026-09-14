@@ -30,6 +30,11 @@ typedef zb_client_mutate_Dart = ffi.Pointer<Utf8> Function(
     ffi.Pointer<Utf8> key_json,
     ffi.Pointer<Utf8> values_json);
 
+typedef zb_client_tenant_C = ffi.Pointer<Utf8> Function(
+    ffi.Uint64 handle, ffi.Pointer<Utf8> tenant);
+typedef zb_client_tenant_Dart = ffi.Pointer<Utf8> Function(
+    int handle, ffi.Pointer<Utf8> tenant);
+
 typedef zb_client_flush_C = ffi.Pointer<Utf8> Function(
     ffi.Uint64 handle, ffi.Uint64 wait_ms);
 typedef zb_client_flush_Dart = ffi.Pointer<Utf8> Function(
@@ -48,6 +53,9 @@ class PollReport {
   final int settled;
   final List<String> changedTables;
   final List<String> seeded;
+  /// §10fq: tenants whose streams cannot be read right now (deleted, or denied) —
+  /// set aside by libzb and retried with backoff; the others keep being served.
+  final List<String> unreadable;
   /// Set by the worker when a poll itself failed (connection gone, principal
   /// revoked): the loop backs off and says why; the lists are then empty.
   final String? error;
@@ -57,6 +65,7 @@ class PollReport {
       required this.settled,
       required this.changedTables,
       required this.seeded,
+      this.unreadable = const [],
       this.error});
 
   factory PollReport.fromJson(Map<String, dynamic> json) {
@@ -65,6 +74,7 @@ class PollReport {
       settled: json['settled'] ?? 0,
       changedTables: List<String>.from(json['changed_tables'] ?? []),
       seeded: List<String>.from(json['seeded'] ?? []),
+      unreadable: List<String>.from(json['unreadable'] ?? []),
       error: json['error'] as String?,
     );
   }
@@ -84,6 +94,8 @@ class ZeBridge {
   static late zb_client_query_Dart _query;
   static late zb_client_mutate_Dart _mutate;
   static late zb_client_flush_Dart _flush;
+  static late zb_client_tenant_Dart _join;
+  static late zb_client_tenant_Dart _leave;
   static late zb_client_poll_Dart _poll;
   static late zb_free_Dart _free;
 
@@ -113,6 +125,10 @@ class ZeBridge {
         'zb_client_mutate');
     _flush = _lib.lookupFunction<zb_client_flush_C, zb_client_flush_Dart>(
         'zb_client_flush');
+    _join = _lib.lookupFunction<zb_client_tenant_C, zb_client_tenant_Dart>(
+        'zb_client_join');
+    _leave = _lib.lookupFunction<zb_client_tenant_C, zb_client_tenant_Dart>(
+        'zb_client_leave');
     _poll = _lib.lookupFunction<zb_client_poll_C, zb_client_poll_Dart>(
         'zb_client_poll');
     _free = _lib.lookupFunction<zb_free_C, zb_free_Dart>('zb_free');
@@ -213,6 +229,28 @@ class ZeBridge {
       throw Exception(_reason(decoded));
     }
     return PollReport.fromJson(decoded);
+  }
+
+  /// §10fn: follow one more tenant (its chains seed into the same tables, its
+  /// stream joins the tail at the next poll). The JWT decides whether the broker
+  /// allows it. Returns the memberships followed now.
+  List<String> join(String tenant) => _membership(_join, tenant);
+
+  /// Stop following a tenant: its rows, watermarks and tail go.
+  List<String> leave(String tenant) => _membership(_leave, tenant);
+
+  List<String> _membership(zb_client_tenant_Dart fn, String tenant) {
+    final tenantC = tenant.toNativeUtf8();
+    final resPtr = fn(_handle, tenantC);
+    malloc.free(tenantC);
+    if (resPtr == ffi.nullptr) throw Exception('membership call failed');
+    final resStr = resPtr.toDartString();
+    _free(resPtr);
+    final decoded = jsonDecode(resStr);
+    if (decoded is Map && decoded.containsKey('error')) {
+      throw Exception(_reason(decoded));
+    }
+    return List<String>.from(decoded['tenants'] ?? const []);
   }
 
   Map<String, dynamic> flush(int waitMs) {

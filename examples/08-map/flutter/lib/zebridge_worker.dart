@@ -24,11 +24,14 @@ import 'dart:isolate';
 import 'zebridge.dart';
 
 class ZeBridgeWorker {
-  ZeBridgeWorker._(this._toWorker, this._fromWorker, this.tenant);
+  ZeBridgeWorker._(this._toWorker, this._fromWorker, this.tenant, this.tenants);
 
   final SendPort _toWorker;
   final ReceivePort _fromWorker;
+  /// The first membership (sorted), or the open tenant.
   final String tenant;
+  /// Every membership resolved at connect (§10fn); `join`/`leave` move it from here on.
+  final List<String> tenants;
 
   final _reports = StreamController<PollReport>.broadcast();
   final _pending = <int, Completer<dynamic>>{};
@@ -77,7 +80,8 @@ class ZeBridgeWorker {
 
     await Isolate.spawn(_workerMain, _Boot(fromWorker.sendPort, options, pollWaitMs));
     final info = await ready.future;
-    worker = ZeBridgeWorker._(toWorker!, fromWorker, (info['tenant'] as String?) ?? '—');
+    worker = ZeBridgeWorker._(toWorker!, fromWorker, (info['tenant'] as String?) ?? '—',
+        List<String>.from((info['tenants'] as List?) ?? const []));
     // keep the subscription alive with the worker
     worker._sub = sub;
     return worker;
@@ -109,6 +113,13 @@ class ZeBridgeWorker {
   /// it yourself to wait for a verdict).
   Future<Map<String, dynamic>> flush(int waitMs) async =>
       Map<String, dynamic>.from(await _call<dynamic>('flush', {'waitMs': waitMs}) as Map);
+
+  /// §10fn: follow one more tenant / drop one. Served between polls like the rest;
+  /// a join seeds the tenant's chains before it answers, so it takes a moment.
+  Future<List<String>> join(String tenant) async =>
+      List<String>.from(await _call<dynamic>('join', {'tenant': tenant}) as List);
+  Future<List<String>> leave(String tenant) async =>
+      List<String>.from(await _call<dynamic>('leave', {'tenant': tenant}) as List);
 
   /// Stop polling while the app is in the background; nothing touches the broker.
   void pause() => _toWorker.send({'op': 'pause'});
@@ -147,7 +158,7 @@ Future<void> _workerMain(_Boot boot) async {
     ZeBridge.init();
     zb = ZeBridge(boot.options);
     final info = zb.sync();
-    toUi.send({'type': 'ready', 'tenant': info['tenant']});
+    toUi.send({'type': 'ready', 'tenant': info['tenant'], 'tenants': info['tenants']});
   } catch (e) {
     toUi.send({'type': 'fatal', 'error': e.toString()});
     commands.close();
@@ -184,6 +195,12 @@ Future<void> _workerMain(_Boot boot) async {
         case 'flush':
           reply(zb.flush(m['waitMs'] as int));
           break;
+        case 'join':
+          reply(zb.join(m['tenant'] as String));
+          break;
+        case 'leave':
+          reply(zb.leave(m['tenant'] as String));
+          break;
         case 'pause':
           paused = true;
           break;
@@ -209,7 +226,7 @@ Future<void> _workerMain(_Boot boot) async {
     }
     try {
       final report = zb.poll(boot.pollWaitMs);
-      if (report.changedTables.isNotEmpty || report.seeded.isNotEmpty) {
+      if (report.changedTables.isNotEmpty || report.seeded.isNotEmpty || report.unreadable.isNotEmpty) {
         toUi.send({
           'type': 'report',
           'report': {
@@ -217,6 +234,7 @@ Future<void> _workerMain(_Boot boot) async {
             'settled': report.settled,
             'changed_tables': report.changedTables,
             'seeded': report.seeded,
+            'unreadable': report.unreadable,
           },
         });
       }

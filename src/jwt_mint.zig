@@ -90,7 +90,10 @@ pub fn mint(
     signing_seed_text: []const u8,
     account_pub: []const u8,
     principal: []const u8,
-    tenant: []const u8,
+    /// §10fn: every tenant the principal belongs to — one `tenant:<t>` tag each. The
+    /// server expands `{{tag(tenant)}}` once per value (a Cartesian product over the
+    /// template), so a principal in two tenants reads both streams from ONE template.
+    tenants: []const []const u8,
     user_pub: []const u8,
     ttl_seconds: i64,
     now_unix: i64,
@@ -108,16 +111,22 @@ pub fn mint(
     const claims_fmt =
         "{{\"jti\":\"{s}\",\"iat\":{d},\"exp\":{d},\"iss\":\"{s}\",\"name\":\"{s}\",\"sub\":\"{s}\"," ++
         "\"nats\":{{\"pub\":{{}},\"sub\":{{}}," ++
-        "\"issuer_account\":\"{s}\",\"tags\":[\"tenant:{s}\"],\"type\":\"user\",\"version\":2}}}}";
+        "\"issuer_account\":\"{s}\",\"tags\":[{s}],\"type\":\"user\",\"version\":2}}}}";
 
-    const hashed = try std.fmt.allocPrint(allocator, claims_fmt, .{ "", iat, exp, iss, principal, user_pub, account_pub, tenant });
+    var tags: std.ArrayListUnmanaged(u8) = .empty;
+    defer tags.deinit(allocator);
+    for (tenants, 0..) |t, i| {
+        if (i > 0) try tags.append(allocator, ',');
+        try tags.print(allocator, "\"tenant:{s}\"", .{t});
+    }
+    const hashed = try std.fmt.allocPrint(allocator, claims_fmt, .{ "", iat, exp, iss, principal, user_pub, account_pub, tags.items });
     defer allocator.free(hashed);
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(hashed, &digest, .{});
     var jti_buf: [56]u8 = undefined;
     const jti = base32Encode(&jti_buf, &digest);
 
-    const claims = try std.fmt.allocPrint(allocator, claims_fmt, .{ jti, iat, exp, iss, principal, user_pub, account_pub, tenant });
+    const claims = try std.fmt.allocPrint(allocator, claims_fmt, .{ jti, iat, exp, iss, principal, user_pub, account_pub, tags.items });
     defer allocator.free(claims);
 
     const header = "{\"typ\":\"JWT\",\"alg\":\"ed25519-nkey\"}";

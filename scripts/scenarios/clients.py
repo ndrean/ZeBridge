@@ -30,6 +30,7 @@ class Lib:
         # a C string (SIGSEGV in the host, blamed on the library for an hour).
         for n, a in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
                      ("flush", [ctypes.c_uint64]), ("mutate", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]),
+                     ("join", [ctypes.c_char_p]), ("leave", [ctypes.c_char_p]),
                      ("mutate_at", [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         lib.zb_client_wipe.restype, lib.zb_client_wipe.argtypes = ctypes.c_int, [ctypes.c_uint64]
@@ -45,7 +46,16 @@ class Lib:
         self.sync_error = r.get("error")
         if self.sync_error and self.sync_error != "Revoked": sys.exit(f"libzb sync failed: {self.sync_error}")
         self.tenant = r.get("tenant")
+        self.tenants = r.get("tenants", [])
     def take(self, p):
+        try: return json.loads(ctypes.string_at(p).decode())
+        finally: self.lib.zb_free(p)
+    def join(self, tenant):
+        """§10fn: follow one more tenant — {"tenants": [...]} or {"error": ...}."""
+        r = self.take(self.lib.zb_client_join(self.h, tenant.encode())); self.tenants = r.get("tenants", self.tenants); return r
+    def leave(self, tenant):
+        r = self.take(self.lib.zb_client_leave(self.h, tenant.encode())); self.tenants = r.get("tenants", self.tenants); return r
+    def _take_unused(self, p):
         try: return json.loads(ctypes.string_at(p).decode())
         finally: self.lib.zb_free(p)
     def poll(self, wait_ms=300):

@@ -57,7 +57,7 @@ def enroll(principal):
     # the mapping the enroll wrote rides the WAL to $KV.tenants: a client opened before
     # it lands resolves the OPEN tenant instead (§10ce's "resolution at the next connect")
     t0 = time.monotonic()
-    while time.monotonic() - t0 < 20 and zb.kv_get("tenants", principal) != TENANT:
+    while time.monotonic() - t0 < 20 and zb.kv_tenants(principal) != [TENANT]:
         time.sleep(0.3)
     path = TMP / f"zb_{principal}.creds"
     path.write_text("-----BEGIN NATS USER JWT-----\n" + payload["jwt"] + "\n------END NATS USER JWT------\n\n"

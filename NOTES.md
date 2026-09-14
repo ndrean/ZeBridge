@@ -11998,3 +11998,298 @@ skeleton registered the pmtiles provider as `openmaptiles`, the layer asserted a
 the map silently fell back to OSM raster tiles. And `.gitignore` covered
 `examples/08-map/.env` while the file sits one level down: widened to
 `examples/08-map/**/.env*` (the API keys never entered git; the folder is untracked).
+
+## 10fn. Tenant membership as a set: several tenants per principal, join and leave (2026-09-13)
+
+The map needs a phone that follows the region it is in and its neighbours, and moves.
+Before any region key, the general thing: a principal may belong to SEVERAL tenants,
+and a client may join and leave one at runtime. The inventory first (an agent swept
+the tree): the server side was set-shaped where it counts — `zebridge_user_tenants`
+has the composite key `(principal, tenant_id)`, `zb_tenant_write` is already an `IN`
+over the roster, the producer cuts one chain per tenant present in the data — and
+everything downstream assumed one: the KV divert wrote one bare tenant string per
+principal (the sweeper's comment admitted it was meaningless for a many-tenant
+principal), the mint wrote one `tenant:` tag, the tenant-fill trigger took `LIMIT 1`,
+and libzb held one `tenant` that built every name: the route, the chain key, the
+bucket, the watermark row, the heartbeat key.
+
+**Two facts settled the design before a line was written.** nats-server's
+`processUserPermissionsTemplate` expands `{{tag(tenant)}}` into one subject PER TAG
+VALUE — a Cartesian product over the template — so a JWT tagged `tenant:acme` and
+`tenant:globex` gets both streams' grants from the ONE client template: no second
+role, no template change for B2B membership. And the enrol path already returns the
+invite's `role` without using it: the region role (a wildcard template under a
+second scoped key) is chosen there, by the DBA, per invite — not by the client.
+
+**Server.** The bridge keeps the roster in memory (filled at boot from the table,
+kept by every INSERT/UPDATE/DELETE the slot sees) and `$KV.tenants.<principal>` holds
+the SET as a JSON array, sorted: an INSERT adds and republishes, a DELETE removes and
+republishes the smaller set — a leave — and the LAST row gone is the revocation the
+DELETE branch always meant (purge + the ban on the verdict channel). A key UPDATE
+forgets the old side first. The boot backfill is stamped with the WAL head like the
+schema one (a bare id deduplicated a restart inside the window). The mint takes a
+list and writes one tag per membership; the enrol path reads the roster AFTER the
+redeem committed (a data-modifying CTE's rows are invisible to its own statement)
+and tags every membership — a second invite for a known principal is a join, and
+the read grants come from the same rows as the write set, so they cannot drift.
+The tenant-fill trigger fills an omitted value only from a single membership and
+refuses the ambiguous case (`check_violation`, "belongs to N tenants, so tenant_id
+must be supplied explicitly"). The rate limiter's tenant bucket charges the first
+membership (sorted) — a flood limit, not a permission.
+
+**libzb.** `tenants` (a sorted list; the value parses as a JSON array or the old
+bare string), `tenant` kept as the first for the report and every single-tenant
+host. A table's `route` became `routes`, one `CDC_<tenant>` per membership;
+`gapAndSeed` judges one chain per (table, tenant), each on its own stream;
+`_zbz_generations` is keyed `(tbl, tenant)` (an old replica's rows are carried over
+under the tenant it followed, no re-seed on upgrade); the seed gate is a list of
+anchors per stream (a tenant-scoped table has one chain per tenant, each with its
+own cutoff on its own stream). A full chain under several memberships clears only
+ITS tenant's rows and goes in as upserts — the open rows it carries are already
+there from a sibling's chain, and a whole-table wipe would have thrown the sibling
+away. One heartbeat per membership (`$KV.live.<tenant>.<principal>` is granted per
+tag). `join` re-applies the descriptors (a table skipped for want of a tenant is
+followed now), seeds the new pairs, and the tail opens at the next poll; `leave`
+deletes the tenant's rows, its watermarks, its anchors, closes its tail and forgets
+its position. Both are on the C ABI (`zb_client_join`/`zb_client_leave`, answering
+`{"tenants":[…]}`) and the sync report carries `tenants`. The TS client parses the
+list and follows the FIRST, saying so — parity queued.
+
+**Proof.** `membership.py` (live, 12 checks, on the map's `pois`): two invites for
+one throwaway principal — the second JWT carries both tags and the KV value is the
+set; libzb resolves both, seeds one chain per tenant into one table with one CDC
+stream per tenant; a write to each member accepted, to a stranger rejected by RLS,
+with no tenant rejected by the trigger; `leave` drops the rows, watermark and
+position and the tenant's live change stops arriving while the other's still does;
+`join` seeds it again with the row written meanwhile; one roster row deleted is a
+leave (the set shrinks, the client polls on), the last is the ban (key purged,
+`Revoked`). `tenant_kv`, `dyntenant`, `revoke`, `revoke_midseed` read the value
+through `zb.parse_tenants` now.
+
+**Left for the map.** The region role: a second scoped signing key whose template
+reads `cdc.r_*.>` and the matching consumer/chain wildcards, ideally in its own NATS
+account so the wildcard cannot spell a B2B stream; the enrol path picking the seed by
+the invite's `role`; the app's ring of geohash cells joining and leaving as the
+viewport moves. And the open-row edge the multi-tenant seed accepts: a re-seed of one
+tenant's chain re-applies the open rows at that chain's cutoff (unconditional
+upsert), so an open row changed after that cutoff and already applied live is set
+back until its next change — one cadence at most, and only across a gap.
+
+## 10fo. The map's cells as tenants: option A, and a wildcard that grants nothing (2026-09-14)
+
+**The experiment that decided it.** The region role was sketched as "the client
+template with a family tag": invite a principal with `tenant_id = 'r_*'`, let the
+mint write `tenant:r_*`, and let `cdc.{{tag(tenant)}}.>` expand to a wildcard grant.
+Tried live with a throwaway principal: it enrolled, connected and read its own KV key,
+and was refused on `cdc.r_test.>` and on `$JS.API.STREAM.INFO.CDC_r_test` (alice as
+the control read her own stream and was refused globex's). A NATS wildcard is a whole
+token, so `cdc.r_*.>` is not a subject and the server drops the expanded line; the
+same holds for a stream name inside an API subject, so `CDC_r_*` can never be granted.
+A region family needs its own shape: pre-provisioned cells as tenants (option A), or a
+family stream with filtered consumers and a second scoped key (option B, about two
+days across bridge, template and libzb — the live gap rule assumes an unfiltered
+tail). The user chose A, "start small".
+
+**Hardening from the same probe.** `r_*` went straight into the roster, the KV value
+and the sweeper's autogrant: the subject-token guard lived on application tables
+only. `zebridge_user_tenants.tenant_id` and `zebridge_invites.tenant_id` now carry
+`CHECK (tenant_id <> '' AND tenant_id !~ '[.*> ]')` (template, and the dev database by
+hand); the probe's rows were removed first.
+
+**Option A.** A geohash-5 cell (about 4.9 km by 3.3 km at Nantes) is an ordinary tenant
+`c_<geohash>`. `examples/08-map/provision.py` makes `mapper` a member of the 5×5 grid
+around the centre (25 roster rows, one invite, one GET /enroll, one tag per cell, creds
+at 0600) and with `--seed` puts a few POIs each in its cell; the bridge's next boot
+creates the 25 CDC streams and the producer cuts a `pois` chain per cell. No server
+code. The app follows the 3×3 ring around the viewport's centre: debounced on the
+camera, one move at a time, leaves before joins, the grid drawn with the ring in teal;
+an insert outside the ring is refused in the app, since its echo would never return.
+The Dart card and the worker gained `join`/`leave`, and the worker's ready message
+carries the tenants.
+
+**Measured on the dev stack.** The app resolved 25 memberships, seeded three cells'
+POIs, then left 16 cells down to the ring; a POI inserted on the master in a ring cell
+reached the replica, one outside did not. From Python as `mapper`: joining a cell
+outside the ring seeded its two rows and the next live row arrived.
+
+**A bug the probe found.** A join of a cell the JWT does not carry was refused by the
+broker — the security held — but libzb had already taken the membership, and the
+denied tail made every later poll time out, the permitted cells' included. `join` now
+asks for the tenant's stream first and answers `JoinRefused` without touching the
+membership (not in the tags, or the stream does not exist yet); the permitted tenants
+keep tailing. `membership.py` pins it (13 checks now). Still true and noted: one
+denied stream among a client's tails wedges the shared fetch; the join guard keeps a
+client from asking for one, but a grant revoked under a live tail would do the same.
+
+**The limits of A.** The reach is fixed at enrolment: growing the grid is provisioning
+the cells and re-enrolling. Every cell is a stream, a chain and a KV entry per table,
+so A suits a city, not a country. Option B stays queued for when the map outgrows it.
+
+## 10fp. Option B for the map, written down: one stream for the region family (queued, 2026-09-14)
+
+In these notes "the roster" is `zebridge_user_tenants`: the table with one row per
+(principal, tenant) membership, which the bridge mirrors in memory to publish
+`$KV.tenants.<principal>`.
+
+Option A (§10fo) makes every cell a tenant: a stream, a chain and a KV entry per cell
+per table, and the reach frozen in the JWT's tags at enrolment. It fits a city. Option
+B is the shape for a country, where cells number in the thousands and a phone must be
+able to reach any of them without re-enrolling.
+
+**The stream.** One CDC stream for the whole family, `CDC_REGIONS`, whose subjects are
+`cdc.r_<cell>.>`. The bridge already reconciles `CDC_PUBLIC`'s subject list against
+the catalogue at boot; the family stream gets one subject per cell the same way, or a
+single `cdc.r_*.>`-shaped list is avoided altogether by giving the family its own
+prefix token, `cdc_r.<cell>.>`, so the stream holds `cdc_r.>` once and never grows.
+The second form is simpler and is the one to build.
+
+**The chains.** One object bucket for the family, `gen-regions`, with objects named by
+cell, and manifests at `$KV.generations.regions.<cell>.<table>`. The producer already
+cuts a chain per tenant value present in the data; for the family it writes into the
+shared bucket instead of `gen-<tenant>`.
+
+**The grants.** A second scoped signing key, role `region`, whose template names the
+family's few fixed objects and wildcards only inside them: subscribe `cdc_r.>`,
+consumer create and next on `CDC_REGIONS`, direct get on
+`KV_generations.$KV.generations.regions.>`, stream info and next on `OBJ_gen-regions`.
+None of these can spell a B2B stream, so the wall between the families is the key the
+JWT was signed with. Better still in its own NATS account, where the B2B streams do not
+exist at all. The enrol path picks the seed by the invite's `role`, which it already
+returns and ignores. Writes stay as they are: the row names its cell, and the write
+policy checks it, by membership or by the geometry of the point.
+
+**libzb, the real work.** A phone's tail becomes a FILTERED consumer on the family
+stream, one filter subject per followed cell (JetStream accepts several filters on
+one consumer), and join and leave change the filter list instead of opening and
+closing tails. The live gap rule assumes an unfiltered tail, where the next message is
+always `last + 1`; on a filtered consumer the stream sequence jumps over other cells'
+messages, so a jump is no longer a gap. The rule needs a second form: the consumer's
+`num_pending` and the stream's `first_seq` against the stored position, per filter.
+The seed gate per stream still works, keyed by the cell's manifest cutoff.
+
+**Cost.** About two days: the family prefix in the grammar and the producer, the role
+key and template with the enrol switch, and the filtered tail with its gap rule in
+libzb, then the TS parity. Nothing of option A is thrown away: a cell tenant and a
+family cell differ only in `routeFor` and in where the chain lives.
+
+**What stays open from A, explained.** `poll` waits on every tail at once through one
+shared inbox, and the first message from any stream ends the wait. When one of those
+streams becomes unreadable while the client runs, its pull request is answered with a
+permissions error instead of messages, and the measured effect on a join was that every
+later poll ended in a timeout, the readable streams' included: one bad tail stalls the
+whole client. The join now checks first, so a client cannot ask for such a stream; but
+a stream can still become unreadable under a live tail — deleted by an operator
+decommissioning a tenant, or denied after an account update narrows the template. That
+case is inferred from the same path, not measured. The fix is isolation per tail: a
+tail whose fetch fails is set aside, the others keep being served, and the poll report
+names the tenant that went dark so the host can leave it.
+
+## 10fq. One dark stream no longer stalls the client; the gap heal decides per stream; tiles from R2 (2026-09-14)
+
+**The stall, closed.** §10fp left it open: `poll` waits on every tail through one shared
+inbox, and three places in it used a bare `try` — opening a missing tail, re-opening
+one whose consumer went away, and the re-open-all branch after `NoResponders`. Any one
+failing aborted the whole poll, so a stream deleted under a live tail made every poll
+fail, the readable streams' included. Now a stream that cannot be read is SET ASIDE:
+its tail is closed, it is left out of the fetch and out of the seed pass, it is retried
+with a doubling backoff (5 s up to 60 s), and the poll report names its tenant
+(`unreadable`, on the C ABI only when non-empty). When it reads again it rejoins the
+tail and whatever it left unseeded is asked for. With every stream dark the poll still
+waits `wait_ms` (on verdicts), so a host's loop does not spin. The seed pass needed the
+same treatment: an unseeded tenant makes each poll re-run it, and a stream-info request
+on a denied stream costs the 5 s request timeout, so the pass skips a dark stream and
+marks one it finds unreadable. `leave` forgets a dark stream too.
+
+`darktail.py` (live, 5 checks) creates a throwaway tenant's stream itself, follows it
+with acme, deletes it under the live tail: acme's row still arrives, no poll fails, the
+slowest poll takes its wait, the report says `unreadable = ['dtail']`, and after the
+stream is recreated the tenant reads again with nothing for the host to do. It never
+writes a row to the throwaway tenant (the dyntenant hazard, §10fn). The Dart report
+carries `unreadable`, and the map app drops a dark cell from its ring (a leave).
+
+**The heal, found on the way.** The first run said acme's row never arrived. It had:
+the scenario's lookup by uid was wrong, because `psql` printed the uid and then the
+command tag (`membership.py` had the same line, harmless there). But the trace showed a
+real fault behind it: acme was re-seeded on EVERY poll and reported `seeded` each time.
+A fresh client's position on CDC_PUBLIC is 0 while the stream's first sequence is far
+above, which reads as a gap until the pass heals it — and the heal waited for the whole
+pass to succeed (`reseed_pending` false). One tenant with no chain yet (a tenant born a
+minute ago, before the producer's cadence) kept every pass "incomplete", so the shared
+stream stayed gapped and every sibling re-seeded on every poll: no data lost (the plan
+was empty), but round trips each poll, and a host refreshing on `seeded` refreshed
+forever. The heal now decides per stream: a tenant's own stream heals when that
+(table, tenant) pair seeded; the shared stream heals when ANY of the table's pairs holds
+a chain, since every chain carries the open rows. Measured: the positions healed on the
+first pass and eight polls reported nothing seeded. `client_gap`, `shared_gap`, `reaps`,
+`offline`, `mutate`, `replies`, `membership` green.
+
+**Tiles.** The user put France at zoom 14 on Cloudflare R2 (3.4 GB); R2 answers range
+requests (checked: `206`, `Accept-Ranges: bytes`, the `PMTiles` magic in the first
+bytes). The app opens it with `PmTilesArchive.from(url)`, which reads through HTTP
+ranges, so only the tiles in view travel; the local extract stays as the fallback.
+
+## 10fr. Where we stand, and the deployment findings not written down yet (2026-09-14)
+
+**Uncommitted: §10fn to §10fq.** Tenant membership as a set, the map's cells as
+tenants, option B written down, the dark-stream isolation and the per-stream heal.
+Files: `src/{bridge,event_processor,http_server,jwt_mint,mutation_listener,nats_init}.zig`,
+`init.write.template.sql` (the guard's ambiguity refusal and the tenant-token CHECKs,
+both applied to the dev database by hand), `libzb/src/{client,capi}.zig`,
+`zb-client-ts/src/libzb.ts`, the scenarios `membership.py` and `darktail.py` (new),
+`clients.py`, `zb.py`, `run.py`, `dyntenant.py`, `revoke.py`, `revoke_midseed.py`,
+`tenant_kv.py`, the map example (`provision.py`, `lib/geohash.dart`, `main.dart`, the
+Dart card and worker, its README), and PROTOCOL, README, SECURITY, CLIENTS. Green at the
+last runs: bridge unit tests, libzb 25 passed / 3 skipped, TS 177, `membership` 13,
+`darktail` 5, `client_gap`, `shared_gap`, `reaps`, `offline`, `mutate`, `replies`,
+`keys`, `crosstenant`, `clockskew`, `collist`, `seed_stream`, `tenant_writes`,
+`tenant_kv`, `dyntenant`, `revoke`, `revoke_midseed`, `jwt_expiry`.
+
+**The dev stack as left.** The bridge runs on `my_pub`/`my_slot`, port 27434, with the
+enrol endpoint armed from the nsc store's scoped key. The 25 cell streams `CDC_c_*`
+exist and `mapper` is a member of all of them (`scripts/native/creds/mapper.creds`,
+git-ignored). The acme landmarks from §10fm are tombstoned; six POIs live in their
+cells. The map app runs as `mapper` on the R2 tiles.
+
+**Deployment findings (2026-09-13), for the two setups to come.** The user wants two:
+compose for a local evaluation, and a VPS behind Cloudflare for the demo.
+- Cloudflare's proxy carries HTTP and websockets only, on a fixed list of ports. A
+  browser reaches nats-server's websocket listener through it; a native client
+  (libzb: Flutter, C, Python, `zb`) speaks NATS over TCP and needs a DNS-only record
+  straight to the VPS on 4222.
+- That native hop can be encrypted today. nats.zig depends on tls.zig, built in by
+  default, so the bridge and libzb both link it; a `tls://` URL turns it on with the
+  system trust store. libzb passes the URL through; only the bridge refuses `tls://`,
+  a config guard for the colocated topology where its hop never leaves localhost. The
+  VPS needs a certificate on nats-server's 4222 listener.
+- Cloudflare drops a websocket idle for about 100 s, and nats-server pings every 2
+  minutes by default. Set `ping_interval: "30s"` and `ping_max: 3` in the server
+  config; the ping is server-driven, clients need nothing.
+- HAProxy's public bind of 8090 belongs to the compose setup with hostnames faked in
+  `/etc/hosts`. Behind Cloudflare it binds 443, one of the ports Cloudflare forwards.
+  Websockets stay off HAProxy and go to nats-server directly, which then holds the
+  certificate for Cloudflare's "Full" mode.
+- HAProxy's rate limit keys on `CF-Connecting-IP`, a header anyone reaching the origin
+  around Cloudflare can forge. Without a firewall that admits only Cloudflare's IP
+  ranges to the origin, that limit protects nothing.
+
+**The queue, in order.**
+1. Commit §10fn to §10fq when the user asks.
+2. The TS client's membership parity: follow every tenant, join and leave, the
+   per-stream isolation and heal.
+3. The two deployment setups above, with the settings as listed.
+4. Option B (§10fp) when the map outgrows a city.
+5. The analytics request lane (`query.<tenant>.>`, a service role, `zb --serve`), then
+   `zb export` (Parquet from a live follower).
+6. Secrets polish: seeds and creds as 0600 files outside the repo, the operator seed off
+   the VPS, invite codes hashed at rest, `.env.example`, a "Secrets" section in SECURITY.
+7. A per-principal "at the rate ceiling for N minutes" advisory, so a revoke is decided
+   on evidence.
+8. README review, Grafana dashboards, the streaming seed measured on DuckDB.
+
+**Known edges, accepted for now.** Under several memberships, re-seeding one tenant's
+chain re-applies the open rows at that chain's cutoff, so an open row changed later and
+already applied live is set back until its next change: one cadence at most, and only
+across a gap (§10fn). A pull the broker denies without answering yields nothing for
+that stream and does not stall the others, but it is not detected as dark until its
+consumer is re-opened (§10fq). A scenario that creates and deletes a tenant stream
+must never write a row to that tenant, or the bridge dies replaying it (§10fn).

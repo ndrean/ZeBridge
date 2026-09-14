@@ -2038,6 +2038,11 @@ pub fn main(init: std.process.Init) !void {
                                             // and slots return to the pool. The LSN is still acked at .commit.
                                             try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
                                         }
+                                        // §10fn: a key change carries the OLD row too — that
+                                        // membership leaves the set before the new one joins.
+                                        if (upd.old_tuple) |old_t| {
+                                            _ = try event_proc.packTenantRemoval(arena_allocator, rel, old_t, wal_msg.wal_end, false);
+                                        }
                                         if (try event_proc.packTenantToKvSlot(arena_allocator, rel, upd.new_tuple, wal_msg.wal_end)) |slot_idx| {
                                             tx_slots_buf[tx_slots_count] = slot_idx;
                                             tx_slots_count += 1;
@@ -2081,23 +2086,25 @@ pub fn main(init: std.process.Init) !void {
                                         catalogue_moved = true;
                                         break :blk_del;
                                     }
-                                    // A revoked mapping (DELETE FROM zebridge_user_tenants):
-                                    // purge the principal's $KV.tenants key, so the next
-                                    // resolveTenant() reads "no mapping" → the open tenant,
-                                    // the same state a principal with no row has. No client
-                                    // change needed: both already treat an absent key that
-                                    // way. Never a cdc.zebridge_user_tenants.* event either.
+                                    // §10fn: one roster row gone. A principal with other
+                                    // memberships left gets its smaller set republished (a
+                                    // leave); the LAST membership gone is the revocation this
+                                    // branch always meant — the key is purged and the ban
+                                    // published, so the next resolve reads "no mapping" → the
+                                    // open tenant. Never a cdc.zebridge_user_tenants.* event.
                                     // The DELETE carries the key columns (REPLICA IDENTITY
-                                    // DEFAULT, PK = principal) — enough to name the key.
+                                    // DEFAULT, PK = (principal, tenant_id)) — enough to name both.
                                     if (std.mem.eql(u8, rel.name, "zebridge_user_tenants")) {
-                                        if (pgoutput.decodeTuple(arena_allocator, del.old_tuple, rel.columns, event_proc.types)) |cols| {
-                                            for (cols.items) |col| {
-                                                if (std.mem.eql(u8, col.name, "principal") and col.value == .text) {
-                                                    event_proc.purgeTenantKey(col.value.text);
-                                                    event_proc.publishRevoked(col.value.text);
-                                                }
+                                        if (tx_slots_count >= tx_slots_buf.len) {
+                                            try releaseTxSlots(&event_proc, tx_slots_buf, &tx_slots_count);
+                                        }
+                                        if (event_proc.packTenantRemoval(arena_allocator, rel, del.old_tuple, wal_msg.wal_end, true)) |maybe| {
+                                            if (maybe) |slot_idx| {
+                                                tx_slots_buf[tx_slots_count] = slot_idx;
+                                                tx_slots_count += 1;
+                                                cdc_events += 1;
                                             }
-                                        } else |err| log.warn("revoked tenant mapping: could not decode the key: {s}", .{@errorName(err)});
+                                        } else |err| log.warn("tenant mapping removed: could not decode the key: {s}", .{@errorName(err)});
                                         break :blk_del;
                                     }
                                     if (event_proc.refused.verdictFor(rel.name) == .drop) break :blk_del;

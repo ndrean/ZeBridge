@@ -27,8 +27,10 @@ ADMIN_URL = "postgres://postgres@127.0.0.1:5432/postgres"
 
 
 def kv_key() -> str:
-    r = zb.nats_cli("kv", "get", zb.TOPOLOGY["kv"]["tenants"], PRINCIPAL, "--raw")
-    return r.stdout.strip() if r.returncode == 0 else ""
+    """The mapping as ONE tenant string — the pre-§10fn shape this scenario asserts on;
+    the bucket holds a JSON array now, and a single membership parses back to it."""
+    tenants = zb.kv_tenants(PRINCIPAL)
+    return tenants[0] if len(tenants) == 1 else ("" if not tenants else ",".join(tenants))
 
 
 def revoke(env_url: str | None):

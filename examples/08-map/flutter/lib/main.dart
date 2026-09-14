@@ -7,6 +7,13 @@
 /// the row); every replica applies it as a delete, so the local table never holds a
 /// tombstoned row and the marker query needs no filter.
 ///
+/// Cells (NOTES §10fo): the map is cut into geohash-5 cells and every cell is a
+/// tenant, `c_<geohash>`; a POI belongs to the cell of its coordinates. The `mapper`
+/// principal is enrolled into a 5×5 grid of them (examples/08-map/provision.py) and
+/// the phone FOLLOWS only the 3×3 ring around the viewport: as you pan, cells are
+/// joined and left through libzb (`zb_client_join`/`zb_client_leave`) — their rows
+/// seed in and out of the same local table. The ring is drawn so you can see it.
+///
 /// Threading: the libzb handle is NOT thread-safe (one thread drives one client), so
 /// every call on it — sync, the blocking poll loop, query, mutate, flush, close — runs
 /// on ONE long-lived worker isolate (`zebridge_worker.dart`, the 05-mobile design).
@@ -20,6 +27,7 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
+import 'geohash.dart';
 import 'package:pmtiles/pmtiles.dart';
 import 'package:vector_map_tiles/vector_map_tiles.dart';
 import 'package:vector_map_tiles_pmtiles/vector_map_tiles_pmtiles.dart';
@@ -30,9 +38,12 @@ import 'zebridge_worker.dart';
 // Dev copy: the repository paths, like 05-mobile. A shipped app bundles the creds it
 // enrolled and the pmtiles it downloaded.
 const _repo = '/Users/nevendrean/code/zig/ZeBridge';
-const _credsPath = '$_repo/scripts/native/creds/alice.creds';
+const _credsPath = '$_repo/scripts/native/creds/mapper.creds';
 const _pmtilesPath = '$_repo/examples/08-map/flutter/test_region.pmtiles';
-final _dbPath = '${Directory.systemTemp.path}/zb-flutter-map-alice.sqlite3';
+/// France at zoom 14 (3.4 GB) on Cloudflare R2: read through HTTP range requests, so
+/// only the tiles in view travel. The local extract is the offline fallback.
+const _pmtilesUrl = 'https://pub-4f6882e07ada4c5299238a846f397030.r2.dev/france.pmtiles';
+final _dbPath = '${Directory.systemTemp.path}/zb-flutter-map-mapper.sqlite3';
 
 void main() => runApp(const ZeMapApp());
 
@@ -61,6 +72,14 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   List<Map<String, dynamic>> pois = const [];
   bool addingMode = false;
   VectorTileLayer? vectorLayer;
+  /// The cells the phone may follow (the JWT's tags), the ones it follows now, and
+  /// the ring the viewport asks for; a move is applied once the previous one landed.
+  Set<String> enrolled = const {};
+  Set<String> following = const {};
+  Set<String> wanted = const {};
+  bool moving = false;
+  Timer? ringDebounce;
+  final mapController = MapController();
 
   @override
   void initState() {
@@ -85,7 +104,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   Future<void> _initTiles() async {
     try {
-      final archive = await PmTilesArchive.fromFile(File(_pmtilesPath));
+      final archive = await PmTilesArchive.from(_pmtilesUrl).catchError((Object e) {
+        debugPrint('pmtiles: $_pmtilesUrl unreachable ($e) — the local extract instead');
+        return PmTilesArchive.fromFile(File(_pmtilesPath));
+      });
       if (!mounted) return;
       setState(() {
         vectorLayer = VectorTileLayer(
@@ -104,7 +126,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         'url': 'nats://127.0.0.1:4222',
         'credsPath': _credsPath,
         'dbPath': _dbPath,
-        'principal': 'alice',
+        'principal': 'mapper',
         'tables': ['pois'],
         'clientId': 'flutter-map',
       });
@@ -113,13 +135,26 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         return;
       }
       zb = worker;
-      setState(() => status = 'tenant ${worker.tenant}');
+      enrolled = worker.tenants.where((t) => t.startsWith('c_')).map((t) => t.substring(2)).toSet();
+      following = Set.of(enrolled);
+      setState(() => status = 'enrolled in ${enrolled.length} cells');
+      // The first sync followed every enrolled cell; keep only the ring.
+      _wantRing(const LatLng(47.22, -1.585));
       await _refresh();
       // One report per poll that changed something; re-read when pois moved.
       reportsSub = worker.reports.listen((r) {
         if (r.error != null) {
           setState(() => status = 'offline: ${r.error}');
           return;
+        }
+        // A cell whose stream went dark (retired upstream, or no longer granted):
+        // stop asking for it. libzb already keeps serving the other cells.
+        final dark = r.unreadable.where((t) => t.startsWith('c_')).map((t) => t.substring(2)).toSet();
+        if (dark.isNotEmpty) {
+          enrolled = enrolled.difference(dark);
+          wanted = wanted.difference(dark);
+          _applyRing();
+          setState(() => status = 'cell(s) ${dark.join(', ')} unreadable — dropped from the ring');
         }
         if (r.changedTables.contains('pois') || r.seeded.contains('pois')) _refresh();
       });
@@ -133,21 +168,64 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     final w = zb;
     if (w == null) return;
     try {
-      final rows = await w.query('SELECT uid, lat, lng, note FROM pois ORDER BY inserted_at');
+      final rows = await w.query('SELECT uid, lat, lng, note, tenant_id FROM pois ORDER BY inserted_at');
       if (!mounted) return;
       setState(() {
         pois = rows;
-        status = 'tenant ${w.tenant} · ${rows.length} POI(s)';
+        status = 'ring ${following.length} of ${enrolled.length} cells · ${rows.length} POI(s)';
       });
     } catch (e) {
       if (mounted) setState(() => status = 'query: $e');
     }
   }
 
+  /// The viewport moved: the ring around its centre is what the phone should
+  /// follow. Debounced — a pan is many events — and applied one move at a time.
+  void _wantRing(LatLng centre) {
+    wanted = ring(centre).intersection(enrolled);
+    ringDebounce?.cancel();
+    ringDebounce = Timer(const Duration(milliseconds: 400), _applyRing);
+  }
+
+  Future<void> _applyRing() async {
+    final w = zb;
+    if (w == null || moving) return;
+    final toJoin = wanted.difference(following).toList()..sort();
+    final toLeave = following.difference(wanted).toList()..sort();
+    if (toJoin.isEmpty && toLeave.isEmpty) return;
+    moving = true;
+    try {
+      for (final c in toLeave) {
+        await w.leave('c_$c');
+        following = Set.of(following)..remove(c);
+      }
+      for (final c in toJoin) {
+        // A join seeds the cell's chain before it answers: the rows are there when
+        // the refresh below runs.
+        await w.join('c_$c');
+        following = Set.of(following)..add(c);
+      }
+    } catch (e) {
+      if (mounted) setState(() => status = 'ring: $e');
+    } finally {
+      moving = false;
+    }
+    await _refresh();
+    // The viewport may have moved on while this move landed.
+    if (wanted.difference(following).isNotEmpty || following.difference(wanted).isNotEmpty) _applyRing();
+  }
+
   Future<void> _addPoi(LatLng at) async {
     final w = zb;
     if (w == null) return;
     setState(() => addingMode = false);
+    // A POI belongs to the cell of its coordinates — a tenant this phone must follow,
+    // or its echo would never come back to the screen.
+    final cell = geohash(at.latitude, at.longitude);
+    if (!following.contains(cell)) {
+      setState(() => status = 'cell $cell is outside the ring — pan there first');
+      return;
+    }
     final uid = newUuid();
     final now = DateTime.now().toUtc().toIso8601String();
     try {
@@ -158,7 +236,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         'lat': at.latitude,
         'lng': at.longitude,
         'note': 'New POI',
-        'tenant_id': w.tenant,
+        'tenant_id': 'c_$cell',
         'inserted_at': now,
         'updated_at': now,
       });
@@ -219,6 +297,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    ringDebounce?.cancel();
     reportsSub?.cancel();
     zb?.close();
     super.dispose();
@@ -235,18 +314,32 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         ),
       ),
       body: FlutterMap(
+        mapController: mapController,
         options: MapOptions(
           initialCenter: const LatLng(47.22, -1.585), // Nantes
           initialZoom: 13,
           onTap: (_, at) {
             if (addingMode) _addPoi(at);
           },
+          onPositionChanged: (camera, _) => _wantRing(camera.center),
         ),
         children: [
           if (vectorLayer != null)
             vectorLayer!
           else
             TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'zemap'),
+          // The cells: enrolled ones faint, the followed ring stronger.
+          PolygonLayer(
+            polygons: [
+              for (final c in enrolled)
+                Polygon(
+                  points: _corners(cellBox(c)),
+                  color: following.contains(c) ? Colors.teal.withValues(alpha: 0.10) : Colors.transparent,
+                  borderColor: following.contains(c) ? Colors.teal : Colors.grey.withValues(alpha: 0.5),
+                  borderStrokeWidth: following.contains(c) ? 1.5 : 0.7,
+                ),
+            ],
+          ),
           MarkerLayer(
             markers: [
               for (final poi in pois)
@@ -275,6 +368,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     );
   }
 }
+
+List<LatLng> _corners(CellBox b) =>
+    [LatLng(b.south, b.west), LatLng(b.south, b.east), LatLng(b.north, b.east), LatLng(b.north, b.west)];
 
 /// A random UUID v4 (the table's key is `uuid`): 122 random bits, version and variant
 /// nibbles set, no package needed.

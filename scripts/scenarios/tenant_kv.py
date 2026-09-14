@@ -115,10 +115,12 @@ async def main():
         nc = await connect_as(principal)
         value, err = await own_key(nc, principal)
         await nc.close()
+        # §10fn: the value is the roster's set, a JSON array; one membership is `["acme"]`.
+        got = zb.parse_tenants(value) if value else []
         check(
             f"{principal} resolves own tenant",
-            value == expected,
-            f"'{value}'" + ("" if value == expected else f" — expected '{expected}', err={err!r}"),
+            got == [expected],
+            f"'{value}'" + ("" if got == [expected] else f" — expected ['{expected}'], err={err!r}"),
         )
 
     # ── 1b. a genuinely unmapped key gets a clean 'not found', never a violation ─
@@ -170,7 +172,7 @@ async def main():
         while time.time() < deadline:
             try:
                 entry = await admin_kv.get(PROBE)
-                if entry.value.decode() == expected:
+                if zb.parse_tenants(entry.value.decode()) == [expected]:
                     return True
             except Exception:
                 pass
