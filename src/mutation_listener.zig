@@ -1,5 +1,6 @@
 const std = @import("std");
 const nats = @import("nats");
+const nats_endpoint = @import("nats_endpoint.zig");
 const Topology = @import("topology.zig");
 const CatalogEpoch = @import("catalog_epoch.zig").CatalogEpoch;
 const log = std.log.scoped(.mutation_listener);
@@ -595,10 +596,11 @@ pub const MutationListener = struct {
             .password = self.endpoint.pass,
             .nkey_seed = self.endpoint.seed,
             .user_creds = self.endpoint.creds,
+            .tls = nats_endpoint.tlsOptions(self.endpoint),
         });
         defer conn_nats.deinit();
 
-        const url = std.fmt.allocPrint(self.allocator, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port }) catch return;
+        const url = self.endpoint.dialUrl(self.allocator) catch return;
         defer self.allocator.free(url);
         conn_nats.connect(url) catch |err| {
             log.err("Mutation listener: Failed to connect to NATS: {}", .{err});

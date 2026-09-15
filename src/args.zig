@@ -38,9 +38,13 @@ const usage =
     \\  BRIDGE_BIND           telemetry bind address (default 127.0.0.1). Every
     \\                        endpoint is unauthenticated, so 0.0.0.0 exposes table
     \\                        names, lag and throughput to anything that can reach it.
-    \\  NATS_URL              nats://[user:pass@]host[:port] (default: localhost)
+    \\  NATS_URL              nats://[user:pass@]host[:port] or tls://… (default: localhost)
     \\  NATS_BRIDGE_NKEY_SEED        NATS nkey seed
     \\  NATS_CREDS            path to a .creds file (operator/JWT mode; wins over the seed)
+    \\  NATS_TLS_CA           with tls://: a PEM CA bundle (default: the system trust store)
+    \\  NATS_TLS_CERT, NATS_TLS_KEY  with tls://: a client certificate, both or neither (mTLS)
+    \\  NATS_TLS_SERVER_NAME  with tls://: the name the server certificate must carry, when
+    \\                        it differs from the dialed host (a public name, dialed on 127.0.0.1)
     \\  BASE_BUF              log2 of per-event data buffer (10-20 by default)
     \\  BASE_BUF_MAX          Raise BASE_BUF's ceiling past 20 (to at most 24), for a
     \\                        deployment that has also raised NATS's own max_payload.
@@ -522,6 +526,18 @@ pub const Args = struct {
         }
         runtime_config.nats_seed = init.minimal.environ.getPosix("NATS_BRIDGE_NKEY_SEED");
         runtime_config.nats_creds = init.minimal.environ.getPosix("NATS_CREDS");
+        runtime_config.nats_tls_ca = init.minimal.environ.getPosix("NATS_TLS_CA");
+        runtime_config.nats_tls_cert = init.minimal.environ.getPosix("NATS_TLS_CERT");
+        runtime_config.nats_tls_key = init.minimal.environ.getPosix("NATS_TLS_KEY");
+        runtime_config.nats_tls_server_name = init.minimal.environ.getPosix("NATS_TLS_SERVER_NAME");
+        if ((runtime_config.nats_tls_cert == null) != (runtime_config.nats_tls_key == null)) {
+            log.err("NATS_TLS_CERT and NATS_TLS_KEY go together: set both or neither", .{});
+            return error.InvalidConfig;
+        }
+        const tls_url = std.mem.startsWith(u8, runtime_config.nats_url.?, "tls://");
+        if (!tls_url and (runtime_config.nats_tls_ca != null or runtime_config.nats_tls_cert != null or runtime_config.nats_tls_server_name != null)) {
+            log.warn("NATS_TLS_* is set but NATS_URL is not tls:// — the connection stays plain; use tls:// to encrypt it", .{});
+        }
 
         // Generation producer pacing. ⚠️ The cadence is a CORRECTNESS parameter, not a
         // freshness knob: chain depth × cadence must stay under the sweeper's tombstone

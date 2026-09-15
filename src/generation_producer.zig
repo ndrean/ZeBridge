@@ -52,6 +52,7 @@ const utils = @import("utils.zig");
 const encoder_mod = @import("encoder.zig");
 const pgoutput = @import("pgoutput.zig");
 const nats = @import("nats");
+const nats_endpoint = @import("nats_endpoint.zig");
 const topology_mod = @import("topology.zig");
 const c_imports = @import("c_imports.zig");
 const hot_streams = @import("hot_streams.zig");
@@ -270,9 +271,10 @@ pub const GenerationProducer = struct {
             .password = self.endpoint.pass,
             .nkey_seed = self.endpoint.seed,
             .user_creds = self.endpoint.creds,
+            .tls = nats_endpoint.tlsOptions(self.endpoint),
         });
         defer conn_nats.deinit();
-        const url = try std.fmt.allocPrint(alloc, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port });
+        const url = try self.endpoint.dialUrl(alloc);
         try conn_nats.connect(url);
         var js = conn_nats.jetstream(.{});
 
@@ -566,9 +568,10 @@ pub const GenerationProducer = struct {
             .password = self.endpoint.pass,
             .nkey_seed = self.endpoint.seed,
             .user_creds = self.endpoint.creds,
+            .tls = nats_endpoint.tlsOptions(self.endpoint),
         }) };
         errdefer cs.conn_nats.deinit();
-        const url = try std.fmt.allocPrint(alloc, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port });
+        const url = try self.endpoint.dialUrl(alloc);
         try cs.conn_nats.connect(url);
         return cs;
     }

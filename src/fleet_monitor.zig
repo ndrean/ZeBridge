@@ -14,6 +14,7 @@
 //! FLEET_TTL_SECONDS) and reads it.
 const std = @import("std");
 const nats = @import("nats");
+const nats_endpoint = @import("nats_endpoint.zig");
 const config = @import("config.zig");
 const topology_mod = @import("topology.zig");
 const utils = @import("utils.zig");
@@ -229,9 +230,10 @@ pub const FleetMonitor = struct {
             .password = self.endpoint.pass,
             .nkey_seed = self.endpoint.seed,
             .user_creds = self.endpoint.creds,
+            .tls = nats_endpoint.tlsOptions(self.endpoint),
         });
         defer conn.deinit();
-        const url = try std.fmt.allocPrint(a, "nats://{s}:{d}", .{ self.endpoint.host, self.endpoint.port });
+        const url = try self.endpoint.dialUrl(a);
         try conn.connect(url);
         const js = conn.jetstream(.{});
 

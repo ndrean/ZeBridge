@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const nats = @import("nats");
+const nats_endpoint = @import("nats_endpoint.zig");
 const Conf = @import("config.zig");
 const Metrics = @import("metrics.zig").Metrics;
 const utils = @import("utils.zig");
@@ -143,6 +144,7 @@ pub const Publisher = struct {
             .password = ep.pass,
             .nkey_seed = ep.seed,
             .user_creds = ep.creds,
+            .tls = nats_endpoint.tlsOptions(ep),
             // Counted at the TRANSPORT (§10cn): the library's own reconnects are the
             // ones an operator asks about, and only the hook sees them all.
             .callbacks = .{ .reconnected_cb = onTransportReconnected },
@@ -159,7 +161,7 @@ pub const Publisher = struct {
         });
         errdefer conn.deinit();
 
-        const url = try std.fmt.allocPrint(self.allocator, "nats://{s}:{d}", .{ ep.host, ep.port });
+        const url = try ep.dialUrl(self.allocator);
         defer self.allocator.free(url);
         try conn.connect(url);
 

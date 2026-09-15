@@ -393,6 +393,16 @@ Two credential shapes, on purpose:
 | the bridge | nkey, seed passed on the command line, in no env file | `publish: >`, `subscribe: >` — it is the trusted writer and already holds replication rights |
 | a client | user/password today, JWT next | allow-listed to its own subtree |
 
+**The transport.** The bridge dials `nats://` (plain TCP) or `tls://`. With `tls://` it
+verifies the server certificate against `NATS_TLS_CA`, or the system trust store when that
+is unset, presents a client certificate when `NATS_TLS_CERT` and `NATS_TLS_KEY` are set,
+and checks the certificate against `NATS_TLS_SERVER_NAME` when it dials another name (a
+public certificate, dialed on 127.0.0.1). A nats-server client port with TLS refuses
+plaintext from every client, so when that port also serves phones the bridge uses
+`tls://` too. On a colocated broker TLS costs about 4 % per acknowledged publish at event
+size and leaves the burst rate unchanged (`scripts/scenarios/tls_cost.py`,
+`scripts/scenarios/burst_tls.py`).
+
 **The permission block is what makes the protocol true.** PROTOCOL.md §7.1 says a
 principal is trustworthy because NATS authorises subjects. Delete the permissions and the
 principal becomes a self-asserted string; the bridge cannot tell the difference and does

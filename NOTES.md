@@ -12496,3 +12496,201 @@ the empty-table re-key. All behave as written. The populated re-key now points a
 MIGRATIONS.md recipe: the old six-statement version failed at `DROP CONSTRAINT` as soon
 as another table referenced the key, ran outside a transaction, and never re-ran
 `zebridge_enable`.
+
+## 10fy. The VPS edge written down: proxy/haproxy.cfg (2026-09-15)
+
+`proxy/haproxy.cfg` now describes the VPS behind Cloudflare, not the compose setup with
+hostnames faked in `/etc/hosts` (that one needs its own file). HAProxy guards one thing,
+the bridge's HTTP endpoint; the header of the file lists the three paths that never cross
+it: phones and native clients on `tls://nats.my-domain.com:4222` through a DNS-only
+record; browsers on `wss://ws.my-domain.com` at Cloudflare's edge on 443, forwarded to
+nats-server's websocket listener on 8080 by an Origin Rule (8080 is on Cloudflare's
+plain-HTTP port list, so a secure websocket cannot use it at the edge; Cloudflare's docs
+confirm the destination-port override); Prometheus pushing to Grafana Cloud with
+`remote_write`, outbound, so no inbound rule at all, `/metrics` never exposed.
+
+**The `CF-Connecting-IP` rate key made real.** It was cosmetic: anyone reaching the
+origin directly could write any address into the header. The frontend now accepts
+connections only from Cloudflare's published ranges (`proxy/cloudflare-ips.lst`, fetched
+2026-09-15, with the refresh command in its header), and only then reads the client
+address from the header, for the stick table and `X-Forwarded-For`. Only `GET /enroll`
+(3 per 10 s per client address) and `GET /status` (20 per 10 s) reach the bridge, on the
+bridge hostname only. A firewall admitting only those ranges on 443 and 8080 remains the
+recommended second layer. Validated with `haproxy -c` in the compose image (3.4.4) against
+a throwaway certificate; a deliberately broken copy was rejected by the same check.
+
+**Local variant and a counter fix, same day.** No Cloudflare or domain exists yet, so the
+VPS file cannot run anywhere today. `proxy/haproxy.local.cfg` carries the same bridge rules
+on plain HTTP at 127.0.0.1:8090, with no Cloudflare or hostname check and the rate counted
+per TCP peer (`src`, unforgeable). Run on the host's HAProxy 3.4.4 against the live bridge,
+it showed a flaw shared by both files: one counter per address for every path, so four
+earlier requests had already spent `/enroll`'s budget of 3 and every enrolment got 429 —
+on the VPS a browser polling `/status` would have locked out its own enrolment. `/enroll`
+now has its own counter (sc1, its own table); `/status`'s limit still counts every request
+of the address. Retested: `/status` 200, `/metrics` 404, `POST` 405, `/enroll` three times
+to the bridge (its own 400 for a bad code) then 429, and 429 from the 21st request in the
+window. Both files pass `haproxy -c` on the host. HAProxy was stopped after the test.
+
+**Port 4222 is TLS or plain, not both (found checking the README diagram).** Once the
+client port has a `tls` block, nats-server requires TLS from every client on it (its docs:
+a plaintext client "gets refused at the handshake"), and nats-server has one client port.
+The bridge reaches NATS in plain TCP on localhost and refuses `tls://` by design, so it
+cannot share a TLS 4222 with the phones as the stack stands. Three shapes, none built:
+(1) `allow_non_tls: true` — the bridge stays plain, but the server then accepts plaintext
+from anyone, so a phone misconfigured with `nats://` travels in clear; (2) the bridge
+speaks TLS to localhost — lift its `tls://` refusal and pass nats.zig's TLS options
+through, a certificate valid for the name it dials; (3) HAProxy terminates TLS for the
+outside on 4222 in TCP mode and forwards plain to nats-server on a loopback-only port the
+bridge also uses — this needs a TLS-first handshake from clients (NATS sends its INFO in
+clear before upgrading), which nats.zig has (`handshake_first`) and libzb would have to
+expose, and nats-server then sees HAProxy as every client's address. The belief that the
+plain local hop is essential for speed was never measured: no TLS throughput number exists
+in these notes, and `tls.py` proves correctness only.
+
+**What TLS costs on the bridge's hop, measured (2026-09-15).** `tls_cost.py` (manual
+group) builds a ReleaseFast probe on the vendored nats.zig and publishes to a file-backed
+JetStream stream the way the bridge does, one acknowledged publish at a time, against two
+nats-server 2.14.6 instances on localhost that differ only in TLS (the submodule's test
+certificates). Median of three runs, on the Mac:
+
+| message | plain | TLS | TLS / plain (time, probe CPU, server CPU) |
+|---|---|---|---|
+| 400 B (one event), 60,000 | 18,432 msg/s, 7.4 MB/s | 17,793 msg/s, 7.1 MB/s | ×1.04, ×1.03, ×1.05 |
+| 16 KB (a batch), 12,000 | 15,284 msg/s, 245 MB/s | 13,139 msg/s, 210 MB/s | ×1.16, ×1.21, ×1.12 |
+| 256 KB, 1,500 | 4,814 msg/s, 1,233 MB/s | 3,152 msg/s, 807 MB/s | ×1.53, ×3.50, ×1.66 |
+
+For small messages the acknowledgement round trip dominates and TLS costs 4%; the cost
+grows with message size because encryption then dominates, but even the 256 KB case moves
+800 MB/s. The bridge's burst of 100–200k events a second at a few hundred bytes each is
+tens of MB/s, well inside the TLS numbers. The plain local hop is not essential for speed.
+
+Also checked the same day: nats-server 2.14.6 accepts `proxy_protocol: true` on the client
+port (validated with `-t`; a misspelled field is rejected), so a TLS-terminating HAProxy
+with `send-proxy-v2` keeps each client's real address. The bridge's fleet count does not
+depend on addresses at all: it reads the clients' heartbeats in the `live` KV bucket.
+
+## 10fz. The bridge speaks TLS to NATS; the burst measured both ways (2026-09-15)
+
+The `tls://` refusal is gone. `Nats.Endpoint` carries a TLS flag set by the scheme and
+four optional paths from the environment (`NATS_TLS_CA`, `NATS_TLS_CERT`, `NATS_TLS_KEY`,
+`NATS_TLS_SERVER_NAME`; a certificate without its key is a boot error, TLS variables with a
+`nats://` URL a warning). The five places that open a NATS connection — publisher,
+ingress, generation producer and its workers, fleet monitor — each formatted
+`nats://host:port` themselves; they now take the dial URL and TLS options from one helper,
+`src/nats_endpoint.zig`, so no connection can keep the old scheme by accident. Unit test
+for the parse and the dial URL; `zig build test` green.
+
+**Why now.** A nats-server client port with TLS refuses plaintext from every client, and
+the port that serves phones must be TLS, so the colocated bridge must speak TLS too, or the
+server must allow non-TLS for everyone (§10fy). The belief that the plain local hop was
+essential for speed was measured instead of kept.
+
+**The burst, isolated.** `burst_tls.py` (manual): a scratch database rendered from the
+templates, a `users`-shaped table enabled public, its own publication and slot, two
+scratch nats-servers 2.14.6 identical but for TLS (with the buckets and MUTATIONS stream
+up.sh creates), the ReleaseFast bridge with generations on at a 20 s cadence, the
+SPEED_TEST load of 2,000 × 1,000 rows. The dev bridge was stopped for the runs and
+restarted after; nothing of the dev stack was written. Two pairs of runs:
+
+| run | plain events/s | TLS events/s | bridge CPU TLS/plain | NATS CPU TLS/plain | chain upload plain → TLS |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 201,765 | 207,493 | ×1.01 | ×1.41 | 188 → 239 ms |
+| 2 | 219,093 | 207,705 | ×1.08 | ×1.25 | 183 → 238 ms |
+
+TLS moves the event rate by less than plain moves between its own runs. The full chain of
+the 2M rows (57.8 MB) builds in about 2.5 s either way, its upload a tenth of that: the
+producer outruns the events by far on this table, which answers the owner's concern that
+uploads over TLS must stay faster than the stream fills. Two harness lessons: the first
+smoke run waited five minutes per run for a chain because the pattern matched `full` and
+the producer cuts `delta+full` after a burst; and the chain wait is now configurable
+(`ZB_CHAIN_WAIT`), files kept with `ZB_KEEP`.
+
+**Also fixed on the way:** four `SELECTance` in the README (a replace of "perform" that hit
+"performance"), and the bridge's `--help` lists the TLS variables. SECURITY.md §1.6 states
+the transport. SPEED_TEST.md carries the TLS table. The README still says three times that
+the bridge's hop is plain TCP by design and for speed (the credentials table, the
+production paragraph, the colocation sentence): the owner is rewriting those.
+
+## 10ga. The chain under the firehose, plain vs TLS: TLS does not move the edge the cap sets (2026-09-15)
+
+The owner's follow-up to §10fz: the event rate is safe over TLS, but the generation
+producer uploads over the same link, and if its cuts slow down the CDC stream prunes past
+the newest chain — a client seeding from it cannot splice. `firehose_tls.py` (manual)
+reruns the §10eu firehose isolated on `burst_tls.py`'s scratch database and nats-servers:
+10,000 rows a second inserted into a test_types-shaped table and the previous second's rows
+updated, for 180 s, cadence 60 s, the stream's byte cap small so it prunes all along. Once a
+second it samples the stream's oldest sequence and the newest manifest's cutoff:
+margin = cutoff + 1 − oldest, negative is the hole. Plain then TLS, identical otherwise.
+
+| cap | link | cuts (early) | fell off (log) | build ms median / max | upload ms median / max | margin min, negative samples |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256 MiB | plain | 11 (7) | 0 | 432 / 1,911 | 12 / 77 | 639, 0 of 136 |
+| 256 MiB | TLS | 11 (7) | 0 | 484 / 1,939 | 16 / 89 | 636, 0 of 136 |
+| 64 MiB | plain | 33 (30) | 0 | 262 / 2,666 | 6 / 110 | 65, 0 of 136 |
+| 64 MiB | TLS | 34 (31) | 0 | 254 / 2,495 | 7 / 122 | 40, 0 of 135 |
+| 32 MiB | plain | 58 (55) | 0 for the table, 2 for `zebridge_gc_watermark` | 224 / 2,645 | 5 / 103 | −14, 3 of 134 |
+| 32 MiB | TLS | 58 (55) | 2 | 214 / 2,569 | 6 / 123 | −15, 8 of 136 |
+
+**What it says.** The upload is a few milliseconds of a cut that takes a quarter of a second
+(COPY, encode and zstd are the cut), so TLS leaves the producer's behaviour unchanged: the
+same number of cuts and early cuts, build times within noise. The edge is set by the cap in
+SECONDS of the burst, as §10es said. At 32 MiB the stream held about 172 messages while
+pruning 35–52 a second, 3.5 to 5 s of history, against builds of up to 2.6 s: both links
+met holes, TLS slightly more often in this single pair (8 samples against 3; at 64 MiB its
+smallest margin was also lower, 40 against 65). At 64 MiB, about 8 s of history, neither did;
+at 256 MiB the margin was hundreds of messages. The default `CDC_MAX_BYTES` of 1 GiB holds
+about two minutes at this rate. Rule, unchanged: size the cap for ten seconds or more of the
+worst burst, and TLS does not change that rule. The one-second sampling can miss a hole
+shorter than a second; the producer's own "fell off" line is the second witness.
+
+**Harness bug found on the way.** Both runs share one scratch database, and the producer's
+bookkeeping (`zebridge_generations`) lives in PostgreSQL: after the plain run it held the
+table as already cut, and the fresh TLS server received no first chain. Both harnesses now
+clear it between runs.
+
+**An incident this caused on the dev stack, and the lesson.** The dev bridge was stopped
+for the benchmarks, which wrote millions of rows and their updates into the same PostgreSQL
+cluster — more than 10 GB of WAL in all. An INACTIVE logical slot retains WAL for the
+whole cluster, not only its own database, and `max_slot_wal_keep_size` is 10 GB here: both
+dev slots, `my_slot` and `zb_probe`, were invalidated (`wal_status = lost`,
+`wal_removed`). The dev bridge refuses to start on the lost slot, as designed. Recovery
+is the documented one (§10bm): drop the slot, start once with `ZB_FEED_RESTART=1`.
+Lesson: a WAL-heavy benchmark on a shared cluster must run in its own PostgreSQL, or with
+the other bridges running so their slots advance, never with them stopped.
+
+## 10gb. The two edge topologies with clients attached: HAProxy's termination costs more (2026-09-15)
+
+The owner's question after §10ga: with phones connected, is it safer for the chain to
+terminate their TLS in HAProxy (topology 1: nats-server plain on localhost, the bridge on
+`nats://`) than on nats-server itself (topology 2: TLS on the client port, the bridge on
+`tls://`)? The argument for 1: nats-server, which acknowledges the producer's uploads and
+stores the events, would not spend its time encrypting deliveries.
+
+`firehose_topology.py` (manual) runs the §10ga firehose — 10,000 rows a second inserted and
+the previous second's updated, 180 s, cap 64 MiB, cadence 60 s — with 20 consumers attached
+(`nats bench js ordered`, each tailing CDC_PUBLIC, so each receives the whole stream),
+over TLS in both: to nats-server in topology 2, to HAProxy (TCP mode, TLS-first) in
+topology 1. One run each, on the Mac.
+
+| | nats-server CPU | HAProxy CPU | server side total | bridge CPU | consumers CPU | cuts (early) | margin min, holes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| topology 2 | 42.4 s | — | 42.4 s | 36.4 s | 38.6 s | 35 (33) | 65, 0 of 139 |
+| topology 1 | 20.6 s | 44.4 s | 65.0 s | 36.0 s | 46.8 s | 34 (32) | 38, 0 of 139 |
+
+**What it says.** Terminating in HAProxy halves nats-server's CPU but costs HAProxy twice
+what nats-server saved: 65 CPU-seconds on the server side against 42, because HAProxy does
+the TLS and also copies every byte between two sockets. The chain was no safer: the same
+cuts, the same build times, no hole in either, and the smallest margin lower in topology 1
+(38 against 65) — a single pair, so only "not better" is supported, not "worse". On one
+machine the TLS work does not leave the cores the producer needs; it only moves between
+processes. Topology 1 keeps its other merit — one gate that caps connections per address
+— and costs a third more CPU for it. Not tested: a machine with its cores saturated (the Mac
+had headroom), and a real phone count.
+
+**A configuration finding for topology 1.** The first run's consumers refused to connect
+through HAProxy: "secure connection not available". A client that asked for TLS reads the
+server's INFO after the handshake, and a plain nats-server says TLS is not available, so
+the client gives up. nats-server behind a TLS-terminating proxy needs its TLS block AND
+`allow_non_tls: true`: it then advertises TLS while accepting the proxy's and the bridge's
+plain connections. Listening on localhost only keeps that safe. Whether nats.zig's
+`handshake_first` makes the same check was not tested.

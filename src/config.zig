@@ -75,20 +75,37 @@ pub const Nats = struct {
         /// client over the bare seed; the file is re-read on every reconnect,
         /// so rotation needs no restart.
         creds: ?[]const u8 = null,
+        /// `tls://` (§10fz): the connection is TLS, verified against `tls_ca` or, when
+        /// null, the system trust store. The bridge's own hop to a colocated broker
+        /// costs 4 % at event size over TLS (measured, `tls_cost.py`), so a broker whose
+        /// client port is TLS-only — the one that also serves phones — is reachable.
+        tls: bool = false,
+        /// NATS_TLS_CA: a PEM CA bundle; null = the system trust store.
+        tls_ca: ?[]const u8 = null,
+        /// NATS_TLS_CERT / NATS_TLS_KEY: a client certificate, for a server that
+        /// verifies clients (mTLS). Both or neither.
+        tls_cert: ?[]const u8 = null,
+        tls_key: ?[]const u8 = null,
+        /// NATS_TLS_SERVER_NAME: the name to verify the server certificate against when
+        /// the dialed host differs (a certificate for nats.my-domain.com, dialed on
+        /// 127.0.0.1).
+        tls_server_name: ?[]const u8 = null,
 
         pub const ParseError = error{ MissingScheme, BadPort };
 
-        /// Parse `nats://[user:pass@]host[:port]`.
+        /// Parse `nats://[user:pass@]host[:port]` or `tls://[user:pass@]host[:port]`.
         pub fn parseUrl(url: []const u8) ParseError!Endpoint {
-            const scheme = "nats://";
-            if (!std.mem.startsWith(u8, url, scheme)) return error.MissingScheme;
-            var rest = url[scheme.len..];
+            const plain = "nats://";
+            const secure = "tls://";
+            const is_tls = std.mem.startsWith(u8, url, secure);
+            if (!is_tls and !std.mem.startsWith(u8, url, plain)) return error.MissingScheme;
+            var rest = url[(if (is_tls) secure.len else plain.len)..];
 
             // A trailing path is not part of the address. `nats://host:4222/` is a URL a
             // person will reasonably type, and parsing "4222/" as a port fails.
             if (std.mem.indexOfScalar(u8, rest, '/')) |slash| rest = rest[0..slash];
 
-            var out = Endpoint{};
+            var out = Endpoint{ .tls = is_tls };
 
             // Rightmost '@': a password may legally contain one.
             if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| {
@@ -122,7 +139,17 @@ pub const Nats = struct {
             // its own variable, not in a string that gets logged by accident.
             out.seed = rc.nats_seed;
             out.creds = rc.nats_creds;
+            out.tls_ca = rc.nats_tls_ca;
+            out.tls_cert = rc.nats_tls_cert;
+            out.tls_key = rc.nats_tls_key;
+            out.tls_server_name = rc.nats_tls_server_name;
             return out;
+        }
+
+        /// The URL nats.zig dials: the scheme carries the TLS decision, the userinfo
+        /// stays out (credentials go through the options, never a string that gets logged).
+        pub fn dialUrl(self: Endpoint, a: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
+            return std.fmt.allocPrint(a, "{s}://{s}:{d}", .{ if (self.tls) "tls" else "nats", self.host, self.port });
         }
     };
 
@@ -702,6 +729,10 @@ pub const RuntimeConfig = struct {
     nats_url: ?[]const u8,
     nats_seed: ?[]const u8, // Optional NKey Seed
     nats_creds: ?[]const u8, // Optional .creds path (operator/JWT mode; wins over the seed)
+    nats_tls_ca: ?[]const u8 = null, // NATS_TLS_CA, for a tls:// URL (null = system trust store)
+    nats_tls_cert: ?[]const u8 = null, // NATS_TLS_CERT, client certificate (mTLS)
+    nats_tls_key: ?[]const u8 = null, // NATS_TLS_KEY
+    nats_tls_server_name: ?[]const u8 = null, // NATS_TLS_SERVER_NAME, when the dialed host differs
 
     // Batch settings
     batch_max_events: usize,
@@ -850,14 +881,24 @@ test "Endpoint.parseUrl: a trailing path is not part of the address" {
 
 test "Endpoint.parseUrl: rejects what it cannot resolve" {
     try std.testing.expectError(error.MissingScheme, Nats.Endpoint.parseUrl("127.0.0.1:4222"));
-    // `tls://` is refused rather than silently downgraded to plaintext. The client
-    // (nats.zig) does speak TLS — scripts/scenarios/tls.py proves JetStream over a
-    // CA-verified `tls://` with it — but this bridge is not wired to pass it the TLS
-    // options: the shipped topology colocates bridge and broker over loopback, and
-    // accepting the scheme would promise encryption the connection does not have.
-    // Unparking a remote broker means wiring those options, then lifting this.
-    try std.testing.expectError(error.MissingScheme, Nats.Endpoint.parseUrl("tls://host:4222"));
+    try std.testing.expectError(error.MissingScheme, Nats.Endpoint.parseUrl("https://host:4222"));
     try std.testing.expectError(error.BadPort, Nats.Endpoint.parseUrl("nats://host:not-a-port"));
+}
+
+test "Endpoint.parseUrl: tls:// is TLS, nats:// is not, and the dial URL keeps the scheme (§10fz)" {
+    const secure = try Nats.Endpoint.parseUrl("tls://bob:pw@nats.example.com:4222");
+    try std.testing.expect(secure.tls);
+    try std.testing.expectEqualStrings("nats.example.com", secure.host);
+    try std.testing.expectEqualStrings("bob", secure.user.?);
+    const plain = try Nats.Endpoint.parseUrl("nats://127.0.0.1:4222");
+    try std.testing.expect(!plain.tls);
+    const a = std.testing.allocator;
+    const url_tls = try secure.dialUrl(a);
+    defer a.free(url_tls);
+    try std.testing.expectEqualStrings("tls://nats.example.com:4222", url_tls);
+    const url_plain = try plain.dialUrl(a);
+    defer a.free(url_plain);
+    try std.testing.expectEqualStrings("nats://127.0.0.1:4222", url_plain);
 }
 
 test "Endpoint.resolve: the URL is the address" {
