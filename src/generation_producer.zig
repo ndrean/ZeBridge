@@ -718,162 +718,101 @@ pub const GenerationProducer = struct {
         out_rows: *usize,
         out_widest: *usize,
     ) ![]const u8 {
-        // Names and OIDs, from the same SELECT under LIMIT 0 — inside the same
-        // snapshot transaction, so the shape cannot differ from the rows that follow.
-        const probe_sql = try utils.allocPrintZ(alloc, "SELECT * FROM ({s}) AS q LIMIT 0", .{select_sql});
-        const meta = try queryOne(pgc, probe_sql, &.{});
-        defer c.PQclear(meta);
-        const ncols: usize = @intCast(c.PQnfields(meta));
-        const names = try alloc.alloc([]const u8, ncols);
-        const oids = try alloc.alloc(u32, ncols);
-        var names_bytes: usize = 0;
-        for (0..ncols) |i| {
-            names[i] = try alloc.dupe(u8, std.mem.span(c.PQfname(meta, @intCast(i))));
-            oids[i] = c.PQftype(meta, @intCast(i));
-            names_bytes += names[i].len;
-        }
-
-        const copy_sql = try utils.allocPrintZ(alloc, "COPY ({s}) TO STDOUT (FORMAT binary)", .{select_sql});
-        const started = c.PQexec(pgc, copy_sql.ptr) orelse return error.QueryFailed;
-        if (c.PQresultStatus(started) != c.PGRES_COPY_OUT) {
-            log.err("🧬 COPY refused: {s}", .{c.PQerrorMessage(pgc)});
-            c.PQclear(started);
-            return error.QueryFailed;
-        }
-        c.PQclear(started);
+        var cr = try CopyReader.init(alloc, pgc, select_sql);
+        defer cr.deinit();
 
         // §10ew: the document is WRITTEN as the rows arrive — no value tree. The
         // first version built every row as encoder values and encoded the tree at the
         // end: about 1.1 KB per row held until the build ended, 5.3 GB for four
         // 1.2M-row fulls in flight (§10ev). Now a row costs its msgpack bytes and
-        // nothing else: the decoder's per-value copies go to a scratch arena reset
-        // after every row. The `rows` array header is array32 with a count patched
-        // in at the end, since the count is known only when COPY says so.
+        // nothing else. The `rows` array header is array32 with a count patched in at
+        // the end, since the count is known only when COPY says so.
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(payload_alloc);
-        try mp.mapHeader(&out, payload_alloc, if (prev_cutoff != null) 7 else 6);
-        try mp.str(&out, payload_alloc, "columns");
-        try mp.arrayHeader(&out, payload_alloc, ncols);
-        for (names) |n| try mp.str(&out, payload_alloc, n);
-        try mp.str(&out, payload_alloc, "rows");
-        const rows_hdr = out.items.len;
-        try out.appendSlice(payload_alloc, &.{ 0xdd, 0, 0, 0, 0 });
+        const rows_hdr = try docHead(&out, payload_alloc, cr.names, prev_cutoff != null, 0);
+        while (true) {
+            const more = cr.next(&out, payload_alloc) catch |err| {
+                try cr.finish(err);
+                unreachable;
+            };
+            if (!more) break;
+        }
+        try cr.finish(null);
 
-        var row_scratch = std.heap.ArenaAllocator.init(alloc);
-        defer row_scratch.deinit();
-        var nrows: usize = 0;
-        var header_seen = false;
-        var failed: ?anyerror = null;
-        copy: while (true) {
-            var buf: [*c]u8 = undefined;
-            const n = c.PQgetCopyData(pgc, &buf, 0);
-            if (n == -1) break; // the server's end of COPY
-            if (n < 0) {
-                log.err("🧬 COPY read failed: {s}", .{c.PQerrorMessage(pgc)});
-                failed = error.QueryFailed;
-                break;
-            }
-            defer c.PQfreemem(buf);
-            const data = buf[0..@intCast(n)];
-            var pos: usize = 0;
-            if (!header_seen) {
-                // "PGCOPY\n\377\r\n\0", then int32 flags, then int32 extension length.
-                if (data.len < 19 or !std.mem.eql(u8, data[0..11], "PGCOPY\n\xff\r\n\x00")) {
-                    failed = error.CopyHeader;
-                    break;
-                }
-                const ext_len: usize = @intCast(std.mem.readInt(i32, data[15..19], .big));
-                pos = 19 + ext_len;
-                header_seen = true;
-            }
-            while (pos + 2 <= data.len) {
-                const nfields = std.mem.readInt(i16, data[pos..][0..2], .big);
-                pos += 2;
-                // The trailer: no more rows, but libpq is still in COPY state until it
-                // has seen the server's CopyDone — keep reading until it says -1.
-                if (nfields == -1) continue :copy;
-                if (@as(usize, @intCast(nfields)) != ncols) {
-                    failed = error.CopyShape;
-                    break :copy;
-                }
-                _ = row_scratch.reset(.retain_capacity);
-                const ra = row_scratch.allocator();
-                try mp.arrayHeader(&out, payload_alloc, ncols);
-                var row_bytes: usize = names_bytes + 256; // envelope margin, mirrors wireSize
-                for (0..ncols) |i| {
-                    const flen = std.mem.readInt(i32, data[pos..][0..4], .big);
-                    pos += 4;
-                    if (flen == -1) {
-                        try out.append(payload_alloc, 0xc0);
-                        continue;
-                    }
-                    const len: usize = @intCast(flen);
-                    const bytes = data[pos..][0..len];
-                    pos += len;
-                    row_bytes += len;
-                    // `owns_bytes = false`: the decoder dupes what it keeps — into the
-                    // row's scratch, gone with the next row.
-                    const v = pgoutput.decodeBinColumnData(ra, oids[i], bytes, false) catch |err| {
-                        log.warn("🧬 COPY: column {s} (oid {d}) is not decodable by the CDC decoder ({s}) — this build takes the text path", .{ names[i], oids[i], @errorName(err) });
-                        failed = err;
-                        break :copy;
-                    };
-                    switch (v) {
-                        .null, .unchanged => try out.append(payload_alloc, 0xc0),
-                        .boolean => |b| try out.append(payload_alloc, if (b) 0xc3 else 0xc2),
-                        .int32 => |x| try mp.int(&out, payload_alloc, x),
-                        .int64 => |x| try mp.int(&out, payload_alloc, x),
-                        .float64 => |f| try mp.float(&out, payload_alloc, f),
-                        .text, .numeric, .jsonb, .array => |str| try mp.str(&out, payload_alloc, str),
-                        .bytea => |b| try mp.bin(&out, payload_alloc, b),
-                    }
-                }
-                if (row_bytes > out_widest.*) out_widest.* = row_bytes;
-                nrows += 1;
-            }
-        }
-        // Whatever ended the COPY, the connection must be left clean: read the rest
-        // of the data until libpq reports the end (-1, or -2 on a broken copy) and
-        // then collect the results, or the next statement of this transaction fails.
-        // ⚠️ Unconditional and BOUNDED. Asking for results while libpq is still in
-        // COPY state hands back a COPY_OUT result every time, for ever: the first
-        // version looped there, the producer thread never returned, and the bridge's
-        // graceful stop waited on it until it was killed (measured 2026-09-11).
-        {
-            var buf2: [*c]u8 = undefined;
-            while (c.PQgetCopyData(pgc, &buf2, 0) > 0) c.PQfreemem(buf2);
-        }
-        var guard: u8 = 0;
-        while (c.PQgetResult(pgc)) |r| : (guard += 1) {
-            const st = c.PQresultStatus(r);
-            c.PQclear(r);
-            if (st == c.PGRES_COPY_OUT or guard >= 8) {
-                log.err("🧬 COPY did not end cleanly (status {d} after {d} result(s)): {s}", .{ st, guard, c.PQerrorMessage(pgc) });
-                failed = failed orelse error.QueryFailed;
-                break;
-            }
-            if (failed == null and st != c.PGRES_COMMAND_OK) {
-                log.err("🧬 COPY ended badly: {s}", .{c.PQerrorMessage(pgc)});
-                failed = error.QueryFailed;
-            }
-        }
-        if (failed) |e| return e;
-
-        out_rows.* = nrows;
-        std.mem.writeInt(u32, out.items[rows_hdr + 1 ..][0..4], @intCast(nrows), .big);
-        try mp.str(&out, payload_alloc, "gen");
-        try mp.int(&out, payload_alloc, gen);
-        try mp.str(&out, payload_alloc, "kind");
-        try mp.str(&out, payload_alloc, kind);
-        try mp.str(&out, payload_alloc, "cutoff");
-        try mp.str(&out, payload_alloc, cutoff);
-        try mp.str(&out, payload_alloc, "version_column");
-        try mp.str(&out, payload_alloc, vcol);
-        if (prev_cutoff) |pc| {
-            try mp.str(&out, payload_alloc, "prev_cutoff");
-            try mp.str(&out, payload_alloc, pc);
-        }
+        out_rows.* = cr.nrows;
+        if (cr.widest > out_widest.*) out_widest.* = cr.widest;
+        std.mem.writeInt(u32, out.items[rows_hdr + 1 ..][0..4], @intCast(cr.nrows), .big);
+        try docTail(&out, payload_alloc, gen, kind, cutoff, vcol, prev_cutoff);
         return try out.toOwnedSlice(payload_alloc);
+    }
+
+    /// What a full's upload left behind: the counts for the bookkeeping and the logs,
+    /// and a bounded sample of its msgpack bytes for the dictionary (§10x).
+    const FullObject = struct {
+        rows: usize,
+        widest: usize,
+        raw_bytes: u64,
+        z_bytes: u64,
+        corpus: Corpus,
+        streamed: bool,
+    };
+
+    /// §10gi: a full, from the transaction's snapshot to the object `name`, as a stream
+    /// (`FullStream`). The row count leads the document, so it is read first in the same
+    /// snapshot: one more scan, the price of never holding the table. A COPY the CDC
+    /// decoder refuses falls back to the text path, which holds the document (as every
+    /// full did before); a NATS failure is returned.
+    fn putFullObject(
+        alloc: std.mem.Allocator,
+        payload_alloc: std.mem.Allocator,
+        pgc: *c.PGconn,
+        store: *nats.ObjectStore,
+        name: []const u8,
+        select_sql: [:0]const u8,
+        gen: i64,
+        cutoff: []const u8,
+        vcol: []const u8,
+    ) !FullObject {
+        const expect: usize = blk: {
+            const sql = try utils.allocPrintZ(alloc, "SELECT count(*) FROM ({s}) AS q", .{select_sql});
+            const res = try queryOne(pgc, sql, &.{});
+            defer c.PQclear(res);
+            break :blk try std.fmt.parseInt(usize, std.mem.span(c.PQgetvalue(res, 0, 0)), 10);
+        };
+        streamed: {
+            var cr = CopyReader.init(alloc, pgc, select_sql) catch break :streamed;
+            defer cr.deinit();
+            var sampler = try Sampler.init(alloc, 8 * 1024 * 1024);
+            const cctx = c.ZSTD_createCCtx() orelse return error.ZstdCompressFailed;
+            defer _ = c.ZSTD_freeCCtx(cctx);
+            if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, 3)) != 0) return error.ZstdCompressFailed;
+            var fs: FullStream = .{ .cr = &cr, .oa = payload_alloc, .cctx = cctx, .sampler = &sampler, .expect_rows = expect, .gen = gen, .cutoff = cutoff, .vcol = vcol };
+            defer fs.raw.deinit(payload_alloc);
+            _ = try docHead(&fs.raw, payload_alloc, cr.names, false, @intCast(expect));
+            sampler.feed(fs.raw.items);
+            var info = store.put(.{ .name = name, .opts = .{ .max_chunk_size = store.chunk_size } }, &fs) catch |err| {
+                // `put` removed the chunks it had published; the COPY is drained either way.
+                cr.finish(err) catch {};
+                if (fs.failed == null) return err;
+                break :streamed;
+            };
+            defer info.deinit();
+            cr.finish(null) catch |err| {
+                store.delete(name) catch {};
+                return err;
+            };
+            return .{ .rows = cr.nrows, .widest = cr.widest, .raw_bytes = sampler.seen, .z_bytes = info.value.size, .corpus = try sampler.corpus(alloc), .streamed = true };
+        }
+        const res = try queryOne(pgc, select_sql, &.{});
+        defer c.PQclear(res);
+        var rows: usize = 0;
+        var widest: usize = 0;
+        const payload = try encodeContent(alloc, payload_alloc, res, gen, "full", cutoff, null, vcol, &rows, &widest);
+        defer payload_alloc.free(payload);
+        const z = try compressZstd(alloc, payload, 3);
+        var r = try store.putBytes(name, z);
+        r.deinit();
+        return .{ .rows = rows, .widest = widest, .raw_bytes = payload.len, .z_bytes = z.len, .corpus = try strideCorpus(alloc, payload, 8 * 1024 * 1024), .streamed = false };
     }
 
     /// msgpack `{columns, rows, gen, kind, cutoff, prev_cutoff?}` from a text-mode result.
@@ -1429,14 +1368,25 @@ pub const GenerationProducer = struct {
         }
 
         // ── 3. content: full and/or delta against the SAME snapshot ──────────
-        var full_payload: ?[]const u8 = null;
-        defer if (full_payload) |b| self.allocator.free(b);
+        // §10gi: the store is opened before the content, since a full is written to it
+        // while COPY reads (the snapshot stays open for the upload).
+        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
+        var osm = js.objectStoreManager();
+        var store = osm.openStore(bucket) catch |err| blk: {
+            if (err == error.StoreNotFound or err == error.StreamNotFound) {
+                break :blk try osm.createStore(.{ .store_name = bucket, .description = "ZeBridge generations (NOTES.md §1.13)" });
+            }
+            return err;
+        };
+        defer store.deinit();
+        const full_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen });
+        var full_obj: ?FullObject = null;
         var full_rows: usize = 0;
         var widest_row: usize = 0;
         // §10eo: where a build's time goes, one line per generation — the number that
         // decides whether the producer's per-row cost is the query, the encode, the
         // compression or the upload, before anyone parallelises the wrong stage.
-        var ph: struct { query: i64 = 0, train: i64 = 0, zstd: i64 = 0, upload: i64 = 0 } = .{};
+        var ph: struct { query: i64 = 0, full: i64 = 0, train: i64 = 0, zstd: i64 = 0, upload: i64 = 0 } = .{};
         if (build_full) {
             // §10ek: a full carries LIVE rows only. Every client applies a full as a wipe
             // and a reload inside one transaction, so a row absent from it is gone on the
@@ -1448,13 +1398,11 @@ pub const GenerationProducer = struct {
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
-            const t_q = utils.unixMillis();
-            full_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
-                const res = try queryOne(pgc, sql, &.{});
-                defer c.PQclear(res);
-                break :blk try encodeContent(alloc, self.allocator, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
-            };
-            ph.query += utils.unixMillis() - t_q;
+            const t_f = utils.unixMillis();
+            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol);
+            ph.full += utils.unixMillis() - t_f;
+            full_rows = full_obj.?.rows;
+            widest_row = @max(widest_row, full_obj.?.widest);
         }
         var delta_payload: ?[]const u8 = null;
         defer if (delta_payload) |b| self.allocator.free(b);
@@ -1489,13 +1437,11 @@ pub const GenerationProducer = struct {
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
-            const t_q = utils.unixMillis();
-            full_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row) catch blk: {
-                const res = try queryOne(pgc, sql, &.{});
-                defer c.PQclear(res);
-                break :blk try encodeContent(alloc, self.allocator, res, gen, "full", cutoff_version, null, vcol, &full_rows, &widest_row);
-            };
-            ph.query += utils.unixMillis() - t_q;
+            const t_f = utils.unixMillis();
+            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol);
+            ph.full += utils.unixMillis() - t_f;
+            full_rows = full_obj.?.rows;
+            widest_row = @max(widest_row, full_obj.?.widest);
         }
         {
             const res = try queryOne(pgc, "COMMIT", &.{});
@@ -1522,7 +1468,7 @@ pub const GenerationProducer = struct {
         var dict_ratio: ?i64 = null; // percent, on row-sized samples: the dictionary's own baseline
         const t_d = utils.unixMillis();
         if (build_full) {
-            if (full_payload) |p| {
+            if (full_obj) |fo| {
                 // §10ea: the previous era's dictionary is KEPT while it still compresses
                 // row-sized samples of this full the way it did when it was fresh — within
                 // 10 points of the ratio recorded at its training. Drift is measured
@@ -1537,7 +1483,7 @@ pub const GenerationProducer = struct {
                 // find repetition in. A single contiguous megabyte finds it by itself and
                 // made the dictionary look useless — retrained at every full for a whole
                 // afternoon before this was measured.
-                const probe = try strideCorpus(alloc, p, 128 * 1024);
+                const probe = try probeFrom(alloc, fo.corpus, 128 * 1024);
                 const params_p = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
                 // ⚠️ The dictionary's NAME is the row's `dict_object`, never rebuilt from
                 // the row's gen: a full that KEPT a dictionary stores the bytes under its
@@ -1569,7 +1515,7 @@ pub const GenerationProducer = struct {
                         log.info("📖 '{s}'/'{s}': g{d} retrains — {s} compresses {d} row-sized samples to {d}% against its baseline {s}%: it drifted", .{ tenant, table, gen, old_gen, probe.sizes.len, now_pct, if (baseline) |b| try std.fmt.allocPrint(alloc, "{d}", .{b}) else "(none)" });
                     }
                 }
-                if (dict_bytes == null) if (try trainDict(alloc, p)) |d| {
+                if (dict_bytes == null) if (try trainDict(alloc, fo.corpus, fo.raw_bytes)) |d| {
                     dict_bytes = d;
                     dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen });
                     dict_ratio = if (probe.sizes.len > 0) try probeRatio(alloc, probe, d) else null;
@@ -1587,17 +1533,8 @@ pub const GenerationProducer = struct {
             }
         }
 
-        // ── 4. immutable objects first ───────────────────────────────────────
-        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
-        var osm = js.objectStoreManager();
+        // ── 4. immutable objects first (the full is already written, §10gi) ──
         ph.train = utils.unixMillis() - t_d;
-        var store = osm.openStore(bucket) catch |err| blk: {
-            if (err == error.StoreNotFound or err == error.StreamNotFound) {
-                break :blk try osm.createStore(.{ .store_name = bucket, .description = "ZeBridge generations (NOTES.md §1.13)" });
-            }
-            return err;
-        };
-        defer store.deinit();
         // Chain objects ship as zstd frames (§10w): built once, read by every
         // client forever — the one payload where compression amortizes fully.
         // Clients detect by the standard 4-byte magic, so mixed chains (older
@@ -1606,16 +1543,8 @@ pub const GenerationProducer = struct {
         // 75,000-row full (§10eo) level 9 was 138 ms of a 327 ms build, 1.8 µs a row —
         // the producer's single largest cost, and the producer is the side that races
         // the stream (§10ej). Level 3 here, like the deltas; the ratio is compared below.
-        if (full_payload) |p| {
-            const t_z = utils.unixMillis();
-            const z = try compressZstd(alloc, p, 3);
-            ph.zstd += utils.unixMillis() - t_z;
-            log.info("🗜️ '{s}'/'{s}': g{d} full {d} -> {d} bytes ({d}%)", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1) });
-            const name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen });
-            const t_u = utils.unixMillis();
-            var r = try store.putBytes(name, z);
-            r.deinit();
-            ph.upload += utils.unixMillis() - t_u;
+        if (full_obj) |fo| {
+            log.info("🗜️ '{s}'/'{s}': g{d} full {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, fo.raw_bytes, fo.z_bytes, fo.z_bytes * 100 / @max(fo.raw_bytes, 1), if (fo.streamed) " [streamed]" else "" });
         }
         if (build_full and !dict_kept) if (dict_bytes) |d| {
             var r = try store.putBytes(dict_name.?, d);
@@ -1727,9 +1656,9 @@ pub const GenerationProducer = struct {
             bucket,                                cutoff_version,                              lsn,
             utils.unixMillis() - build_started_ms,
         });
-        log.info("🧬   phases: copy+decode+encode {d} ms, dictionary {d} ms, zstd {d} ms, upload {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.query, ph.train, ph.zstd, ph.upload, full_rows, delta_rows });
+        log.info("🧬   phases: full (count+copy+encode+zstd+upload) {d} ms, delta copy+decode+encode {d} ms, dictionary {d} ms, delta zstd {d} ms, delta upload {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.full, ph.query, ph.train, ph.zstd, ph.upload, full_rows, delta_rows });
         if (build_delta) log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, delta_payload.?.len });
-        if (build_full) log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, full_payload.?.len });
+        if (full_obj) |fo| log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, fo.raw_bytes });
 
         // §10ej: verify AFTER publishing that the cut is still inside the stream. The
         // cut is taken before the snapshot and the build takes time; under the burst
@@ -1993,14 +1922,15 @@ pub const GenerationProducer = struct {
         else
             try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
         var full_rows: usize = 0;
-        var widest_row: usize = 0;
+        // §10gi: written to the store while COPY reads, inside the snapshot.
+        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
+        var osm = js.objectStoreManager();
+        var store = try osm.openStore(bucket);
+        defer store.deinit();
+        const full_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen_l });
         const t_q = utils.unixMillis();
-        const payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen_l, "full", cutoff_l, null, j.vcol, &full_rows, &widest_row) catch blk: {
-            const res = try queryOne(pgc, sql, &.{});
-            defer c.PQclear(res);
-            break :blk try encodeContent(alloc, self.allocator, res, gen_l, "full", cutoff_l, null, j.vcol, &full_rows, &widest_row);
-        };
-        defer self.allocator.free(payload);
+        const fo = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen_l, cutoff_l, j.vcol);
+        full_rows = fo.rows;
         const query_ms = utils.unixMillis() - t_q;
         {
             const res = try queryOne(pgc, "COMMIT", &.{});
@@ -2014,7 +1944,7 @@ pub const GenerationProducer = struct {
         var dict_kept = false;
         var dict_ratio: ?i64 = null;
         {
-            const probe = try strideCorpus(alloc, payload, 128 * 1024);
+            const probe = try probeFrom(alloc, fo.corpus, 128 * 1024);
             const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
                 "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &pair);
             defer c.PQclear(res_p);
@@ -2033,7 +1963,7 @@ pub const GenerationProducer = struct {
                     dict_ratio = baseline orelse now_pct;
                 }
             }
-            if (dict_bytes == null) if (try trainDict(alloc, payload)) |d| {
+            if (dict_bytes == null) if (try trainDict(alloc, fo.corpus, fo.raw_bytes)) |d| {
                 dict_bytes = d;
                 dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen_l });
                 dict_ratio = if (probe.sizes.len > 0) try probeRatio(alloc, probe, d) else null;
@@ -2041,20 +1971,8 @@ pub const GenerationProducer = struct {
         }
         const train_ms = utils.unixMillis() - t_d;
 
-        // ── objects ───────────────────────────────────────────────────────────
-        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
-        var osm = js.objectStoreManager();
-        var store = try osm.openStore(bucket);
-        defer store.deinit();
-        const t_z = utils.unixMillis();
-        const z = try compressZstd(alloc, payload, 3);
-        const zstd_ms = utils.unixMillis() - t_z;
-        const full_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen_l });
+        // ── the dictionary object ─────────────────────────────────────────────
         const t_u = utils.unixMillis();
-        {
-            var r = try store.putBytes(full_name, z);
-            r.deinit();
-        }
         if (!dict_kept) if (dict_bytes) |d| {
             var r = try store.putBytes(dict_name.?, d);
             r.deinit();
@@ -2144,8 +2062,8 @@ pub const GenerationProducer = struct {
         try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from);
         const total_ms = utils.unixMillis() - started_ms;
         self.recordFullBuild(tenant, table, total_ms);
-        log.info("🧬 '{s}'/'{s}': background full attached to g{d} (newest g{d}) — {d} row(s) in {d} ms: query {d}, dictionary {d}{s}, zstd {d}, upload {d}; deltas kept cutting meanwhile", .{
-            tenant, table, gen_l, newest.gen, full_rows, total_ms, query_ms, train_ms, if (dict_kept) " (kept)" else "", zstd_ms, upload_ms,
+        log.info("🧬 '{s}'/'{s}': background full attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: full (count+copy+encode+zstd+upload) {d}, dictionary {d}{s}, dictionary upload {d}; deltas kept cutting meanwhile", .{
+            tenant, table, gen_l, newest.gen, full_rows, fo.raw_bytes, fo.z_bytes, if (fo.streamed) " [streamed]" else "", total_ms, query_ms, train_ms, if (dict_kept) " (kept)" else "", upload_ms,
         });
     }
 
@@ -2286,6 +2204,345 @@ test "mp: the chain document's shapes decode as msgpack" {
     try std.testing.expectEqual(@as(u8, 0xff), out.items[70]);
 }
 
+/// §10ep: `COPY (…) TO STDOUT (FORMAT binary)`, read one CopyData message at a time
+/// and written as msgpack rows.
+///
+/// `pgoutput` in binary mode and binary COPY use the same per-type encoding —
+/// PostgreSQL's send functions — so a chain row is decoded by the CDC path's own
+/// decoder (`pgoutput.decodeBinColumnData`) and reaches a client as the same bytes a
+/// CDC event of the same value does: integers and floats as numbers, everything else
+/// as strings. A type the decoder refuses fails the read; the caller takes the text
+/// path for that build (a table with such a type is suspended on CDC anyway).
+const CopyReader = struct {
+    pgc: *c.PGconn,
+    names: []const []const u8,
+    oids: []const u32,
+    names_bytes: usize,
+    header_seen: bool = false,
+    ended: bool = false,
+    nrows: usize = 0,
+    /// The widest row, measured the way `wireSize` does: the chain carries any width,
+    /// CDC does not (the build warns).
+    widest: usize = 0,
+    /// The decoder's per-value copies, reset after every row.
+    scratch: std.heap.ArenaAllocator,
+
+    fn init(alloc: std.mem.Allocator, pgc: *c.PGconn, select_sql: []const u8) !CopyReader {
+        // Names and OIDs, from the same SELECT under LIMIT 0 — inside the same
+        // snapshot transaction, so the shape cannot differ from the rows that follow.
+        const probe_sql = try utils.allocPrintZ(alloc, "SELECT * FROM ({s}) AS q LIMIT 0", .{select_sql});
+        const meta = try GenerationProducer.queryOnePub(pgc, probe_sql, &.{});
+        defer c.PQclear(meta);
+        const ncols: usize = @intCast(c.PQnfields(meta));
+        const names = try alloc.alloc([]const u8, ncols);
+        const oids = try alloc.alloc(u32, ncols);
+        var names_bytes: usize = 0;
+        for (0..ncols) |i| {
+            names[i] = try alloc.dupe(u8, std.mem.span(c.PQfname(meta, @intCast(i))));
+            oids[i] = c.PQftype(meta, @intCast(i));
+            names_bytes += names[i].len;
+        }
+
+        const copy_sql = try utils.allocPrintZ(alloc, "COPY ({s}) TO STDOUT (FORMAT binary)", .{select_sql});
+        const started = c.PQexec(pgc, copy_sql.ptr) orelse return error.QueryFailed;
+        defer c.PQclear(started);
+        if (c.PQresultStatus(started) != c.PGRES_COPY_OUT) {
+            log.err("🧬 COPY refused: {s}", .{c.PQerrorMessage(pgc)});
+            return error.QueryFailed;
+        }
+        return .{ .pgc = pgc, .names = names, .oids = oids, .names_bytes = names_bytes, .scratch = .init(alloc) };
+    }
+
+    fn deinit(self: *CopyReader) void {
+        self.scratch.deinit();
+    }
+
+    /// The rows of the next CopyData message, appended to `out`. False once the server
+    /// has ended the COPY; the caller then calls `finish`.
+    fn next(self: *CopyReader, out: *mp.List, oa: std.mem.Allocator) !bool {
+        if (self.ended) return false;
+        var buf: [*c]u8 = undefined;
+        const n = c.PQgetCopyData(self.pgc, &buf, 0);
+        if (n == -1) {
+            self.ended = true;
+            return false;
+        }
+        if (n < 0) {
+            log.err("🧬 COPY read failed: {s}", .{c.PQerrorMessage(self.pgc)});
+            return error.QueryFailed;
+        }
+        defer c.PQfreemem(buf);
+        const data = buf[0..@intCast(n)];
+        var pos: usize = 0;
+        if (!self.header_seen) {
+            // "PGCOPY\n\377\r\n\0", then int32 flags, then int32 extension length.
+            if (data.len < 19 or !std.mem.eql(u8, data[0..11], "PGCOPY\n\xff\r\n\x00")) return error.CopyHeader;
+            const ext_len: usize = @intCast(std.mem.readInt(i32, data[15..19], .big));
+            pos = 19 + ext_len;
+            self.header_seen = true;
+        }
+        const ncols = self.names.len;
+        while (pos + 2 <= data.len) {
+            const nfields = std.mem.readInt(i16, data[pos..][0..2], .big);
+            pos += 2;
+            // The trailer: no more rows, but libpq is still in COPY state until it has
+            // seen the server's CopyDone — the next call reads the -1.
+            if (nfields == -1) return true;
+            if (@as(usize, @intCast(nfields)) != ncols) return error.CopyShape;
+            _ = self.scratch.reset(.retain_capacity);
+            const ra = self.scratch.allocator();
+            try mp.arrayHeader(out, oa, ncols);
+            var row_bytes: usize = self.names_bytes + 256; // envelope margin, mirrors wireSize
+            for (0..ncols) |i| {
+                const flen = std.mem.readInt(i32, data[pos..][0..4], .big);
+                pos += 4;
+                if (flen == -1) {
+                    try out.append(oa, 0xc0);
+                    continue;
+                }
+                const len: usize = @intCast(flen);
+                const bytes = data[pos..][0..len];
+                pos += len;
+                row_bytes += len;
+                // `owns_bytes = false`: the decoder dupes what it keeps — into the
+                // row's scratch, gone with the next row.
+                const v = pgoutput.decodeBinColumnData(ra, self.oids[i], bytes, false) catch |err| {
+                    log.warn("🧬 COPY: column {s} (oid {d}) is not decodable by the CDC decoder ({s}) — this build takes the text path", .{ self.names[i], self.oids[i], @errorName(err) });
+                    return err;
+                };
+                switch (v) {
+                    .null, .unchanged => try out.append(oa, 0xc0),
+                    .boolean => |b| try out.append(oa, if (b) 0xc3 else 0xc2),
+                    .int32 => |x| try mp.int(out, oa, x),
+                    .int64 => |x| try mp.int(out, oa, x),
+                    .float64 => |f| try mp.float(out, oa, f),
+                    .text, .numeric, .jsonb, .array => |str| try mp.str(out, oa, str),
+                    .bytea => |b| try mp.bin(out, oa, b),
+                }
+            }
+            if (row_bytes > self.widest) self.widest = row_bytes;
+            self.nrows += 1;
+        }
+        return true;
+    }
+
+    /// Leaves the connection clean, whatever ended the read: the rest of the data is
+    /// read until libpq reports the end, then the results are collected, or the next
+    /// statement of this transaction fails. Returns `failed` when given.
+    /// ⚠️ Unconditional and BOUNDED. Asking for results while libpq is still in COPY
+    /// state hands back a COPY_OUT result every time, for ever: the first version
+    /// looped there, the producer thread never returned, and the bridge's graceful stop
+    /// waited on it until it was killed (measured 2026-09-11).
+    fn finish(self: *CopyReader, failed: ?anyerror) !void {
+        var err = failed;
+        {
+            var buf2: [*c]u8 = undefined;
+            while (c.PQgetCopyData(self.pgc, &buf2, 0) > 0) c.PQfreemem(buf2);
+        }
+        var guard: u8 = 0;
+        while (c.PQgetResult(self.pgc)) |r| : (guard += 1) {
+            const st = c.PQresultStatus(r);
+            c.PQclear(r);
+            if (st == c.PGRES_COPY_OUT or guard >= 8) {
+                log.err("🧬 COPY did not end cleanly (status {d} after {d} result(s)): {s}", .{ st, guard, c.PQerrorMessage(self.pgc) });
+                err = err orelse error.QueryFailed;
+                break;
+            }
+            if (err == null and st != c.PGRES_COMMAND_OK) {
+                log.err("🧬 COPY ended badly: {s}", .{c.PQerrorMessage(self.pgc)});
+                err = error.QueryFailed;
+            }
+        }
+        if (err) |e| return e;
+    }
+};
+
+/// A chain document's head: `{columns, rows: [` with an array32 row count, and the
+/// offset of that header (patched later when the count was not known).
+fn docHead(out: *mp.List, a: std.mem.Allocator, names: []const []const u8, has_prev: bool, nrows: u32) !usize {
+    try mp.mapHeader(out, a, if (has_prev) 7 else 6);
+    try mp.str(out, a, "columns");
+    try mp.arrayHeader(out, a, names.len);
+    for (names) |n| try mp.str(out, a, n);
+    try mp.str(out, a, "rows");
+    const at = out.items.len;
+    try out.append(a, 0xdd);
+    try mp.be(out, a, u32, nrows);
+    return at;
+}
+
+/// A chain document's tail, after the rows: `gen, kind, cutoff, version_column, prev_cutoff?}`.
+fn docTail(out: *mp.List, a: std.mem.Allocator, gen: i64, kind: []const u8, cutoff: []const u8, vcol: []const u8, prev_cutoff: ?[]const u8) !void {
+    try mp.str(out, a, "gen");
+    try mp.int(out, a, gen);
+    try mp.str(out, a, "kind");
+    try mp.str(out, a, kind);
+    try mp.str(out, a, "cutoff");
+    try mp.str(out, a, cutoff);
+    try mp.str(out, a, "version_column");
+    try mp.str(out, a, vcol);
+    if (prev_cutoff) |pc| {
+        try mp.str(out, a, "prev_cutoff");
+        try mp.str(out, a, pc);
+    }
+}
+
+/// Samples of a document, contiguous in one buffer (zdict wants that).
+const Corpus = struct { buf: []u8, sizes: []usize };
+
+/// §10gi: `strideCorpus` for a document seen once, front to back, whose length is not
+/// known in advance. It keeps 2 KiB windows at every `stride`-th window position;
+/// when the buffer is full, every other sample goes and the stride doubles. The
+/// samples stay evenly spaced over what was seen, between half and all of the buffer.
+const Sampler = struct {
+    const sample_len: usize = 2048;
+    buf: []u8,
+    cap: usize,
+    count: usize = 0,
+    stride: u64 = 1,
+    seen: u64 = 0,
+
+    fn init(alloc: std.mem.Allocator, max_bytes: usize) !Sampler {
+        const cap = @max(2, (max_bytes / sample_len) & ~@as(usize, 1));
+        return .{ .buf = try alloc.alloc(u8, cap * sample_len), .cap = cap };
+    }
+
+    fn feed(self: *Sampler, bytes: []const u8) void {
+        var off = self.seen;
+        var rest = bytes;
+        self.seen += bytes.len;
+        while (rest.len > 0) {
+            const w_start = self.count * self.stride * sample_len;
+            const w_end = w_start + sample_len;
+            if (off + rest.len <= w_start) return;
+            if (off < w_start) {
+                rest = rest[@intCast(w_start - off)..];
+                off = w_start;
+            }
+            const take: usize = @intCast(@min(rest.len, w_end - off));
+            @memcpy(self.buf[self.count * sample_len + @as(usize, @intCast(off - w_start)) ..][0..take], rest[0..take]);
+            off += take;
+            rest = rest[take..];
+            if (off == w_end) {
+                self.count += 1;
+                if (self.count == self.cap) {
+                    // Keep the even samples: window positions 0, 2·stride, 4·stride…
+                    for (0..self.cap / 2) |i| {
+                        if (i == 0) continue;
+                        @memcpy(self.buf[i * sample_len ..][0..sample_len], self.buf[2 * i * sample_len ..][0..sample_len]);
+                    }
+                    self.count = self.cap / 2;
+                    self.stride *= 2;
+                }
+            }
+        }
+    }
+
+    fn corpus(self: *const Sampler, alloc: std.mem.Allocator) !Corpus {
+        const sizes = try alloc.alloc(usize, self.count);
+        @memset(sizes, sample_len);
+        return .{ .buf = self.buf[0 .. self.count * sample_len], .sizes = sizes };
+    }
+};
+
+/// Up to `max_bytes` of a corpus's samples, evenly spread: the dictionary probe's
+/// row-sized samples, taken from the training corpus.
+fn probeFrom(alloc: std.mem.Allocator, corpus: Corpus, max_bytes: usize) !Corpus {
+    const sample_len = Sampler.sample_len;
+    const want = @min(corpus.sizes.len, max_bytes / sample_len);
+    const buf = try alloc.alloc(u8, want * sample_len);
+    const sizes = try alloc.alloc(usize, want);
+    const stride = if (want > 0) corpus.sizes.len / want else 1;
+    for (0..want) |i| {
+        @memcpy(buf[i * sample_len ..][0..sample_len], corpus.buf[i * stride * sample_len ..][0..sample_len]);
+        sizes[i] = sample_len;
+    }
+    return .{ .buf = buf, .sizes = sizes };
+}
+
+/// §10gi: a full, written to the object store as it is read. Rows come from COPY in
+/// batches of about 256 KiB of msgpack, go through one zstd stream, and leave as
+/// object chunks: the bridge holds one batch, the compressor's window and one chunk,
+/// whatever the table's size. The object store's `put` pulls through `read`.
+///
+/// The frame states no content size (it is not known when the header is written):
+/// every client reader handles that (libzb streams it, the browser client retries
+/// with a larger buffer).
+///
+/// Generic over the row source (`next`, `nrows`) so a test can drive it without
+/// PostgreSQL; the bridge uses `CopyReader`.
+fn FullStreamOf(comptime Source: type) type {
+    return struct {
+    const Self = @This();
+    const batch: usize = 256 * 1024;
+    cr: *Source,
+    oa: std.mem.Allocator,
+    cctx: *c.ZSTD_CCtx,
+    sampler: *Sampler,
+    raw: mp.List = .empty,
+    raw_off: usize = 0,
+    expect_rows: usize,
+    gen: i64,
+    cutoff: []const u8,
+    vcol: []const u8,
+    copy_done: bool = false,
+    flushed: bool = false,
+    /// The reader's own error, when `put` failed because of it (and not NATS).
+    failed: ?anyerror = null,
+
+    pub fn read(self: *Self, dest: []u8) anyerror!usize {
+        return self.fill(dest) catch |err| {
+            self.failed = err;
+            return err;
+        };
+    }
+
+    fn fill(self: *Self, dest: []u8) !usize {
+        var out: c.ZSTD_outBuffer = .{ .dst = dest.ptr, .size = dest.len, .pos = 0 };
+        while (out.pos < out.size) {
+            if (self.raw_off < self.raw.items.len) {
+                var in: c.ZSTD_inBuffer = .{ .src = self.raw.items.ptr, .size = self.raw.items.len, .pos = self.raw_off };
+                const r = c.ZSTD_compressStream2(self.cctx, &out, &in, c.ZSTD_e_continue);
+                if (c.ZSTD_isError(r) != 0) return error.ZstdCompressFailed;
+                self.raw_off = in.pos;
+                if (self.raw_off == self.raw.items.len) {
+                    self.raw.clearRetainingCapacity();
+                    self.raw_off = 0;
+                }
+                continue;
+            }
+            if (!self.copy_done) {
+                while (self.raw.items.len < batch) {
+                    const start = self.raw.items.len;
+                    const more = try self.cr.next(&self.raw, self.oa);
+                    self.sampler.feed(self.raw.items[start..]);
+                    if (more) continue;
+                    // The count was read in the same snapshot: a difference is a bug,
+                    // and the object would carry a wrong row count.
+                    if (self.cr.nrows != self.expect_rows) {
+                        log.err("🧬 full stream: COPY gave {d} row(s), the snapshot's count said {d}", .{ self.cr.nrows, self.expect_rows });
+                        return error.CopyCountMoved;
+                    }
+                    const tail = self.raw.items.len;
+                    try docTail(&self.raw, self.oa, self.gen, "full", self.cutoff, self.vcol, null);
+                    self.sampler.feed(self.raw.items[tail..]);
+                    self.copy_done = true;
+                    break;
+                }
+                continue;
+            }
+            if (self.flushed) break;
+            var in: c.ZSTD_inBuffer = .{ .src = null, .size = 0, .pos = 0 };
+            const r = c.ZSTD_compressStream2(self.cctx, &out, &in, c.ZSTD_e_end);
+            if (c.ZSTD_isError(r) != 0) return error.ZstdCompressFailed;
+            if (r == 0) self.flushed = true;
+        }
+        return out.pos;
+    }
+    };
+}
+const FullStream = FullStreamOf(CopyReader);
+
 fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
     const bound = c.ZSTD_compressBound(src.len);
     const dst = try alloc.alloc(u8, bound);
@@ -2303,7 +2560,7 @@ fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
 /// keeps training — and the compression probe below — flat in CPU and memory
 /// whatever the table's size; zstd's own guidance is ~100× the dictionary as corpus,
 /// which 8 MiB is for a 112 KiB dictionary (§10ea).
-fn strideCorpus(alloc: std.mem.Allocator, full: []const u8, max_bytes: usize) !struct { buf: []u8, sizes: []usize } {
+fn strideCorpus(alloc: std.mem.Allocator, full: []const u8, max_bytes: usize) !Corpus {
     const sample_len: usize = 2048;
     const available = full.len / sample_len;
     const want = @min(available, max_bytes / sample_len);
@@ -2330,10 +2587,9 @@ fn probeRatio(alloc: std.mem.Allocator, probe: anytype, dict: ?[]const u8) !i64 
     return @intCast(total * 100 / @max(probe.buf.len, 1));
 }
 
-fn trainDict(alloc: std.mem.Allocator, full: []const u8) !?[]u8 {
-    const sample_len: usize = 2048;
-    if (full.len < 16 * 1024 or full.len / sample_len < 8) return null;
-    const corpus = try strideCorpus(alloc, full, 8 * 1024 * 1024);
+/// `corpus` is up to 8 MiB of 2 KiB samples of a document of `doc_len` bytes.
+fn trainDict(alloc: std.mem.Allocator, corpus: Corpus, doc_len: u64) !?[]u8 {
+    if (doc_len < 16 * 1024 or corpus.sizes.len < 8) return null;
     const nsamples = corpus.sizes.len;
     const cap: usize = @max(@as(usize, 1024), @min(@as(usize, 112 * 1024), corpus.buf.len / 4));
     const dict = try alloc.alloc(u8, cap);
@@ -2464,4 +2720,102 @@ test "keepFrom: the last depth, stretched back to the newest full (§10ge)" {
     // young chains keep everything
     try std.testing.expectEqual(@as(i64, 0), keepFrom(3, 6, 1));
     try std.testing.expectEqual(@as(i64, 0), keepFrom(8, 6, 1));
+}
+
+test "Sampler: evenly spaced 2 KiB windows of a stream of unknown length (§10gi)" {
+    const a = std.testing.allocator;
+    const sl = Sampler.sample_len;
+    for ([_]usize{ 3, 7, 40, 1000 }) |nwin| {
+        // Every window starts with its own index, so a sample names where it came from.
+        const doc = try a.alloc(u8, nwin * sl + 1234);
+        defer a.free(doc);
+        for (doc, 0..) |*b, i| b.* = @truncate(i *% 31);
+        for (0..nwin) |k| std.mem.writeInt(u32, doc[k * sl ..][0..4], @intCast(k), .little);
+        var s = try Sampler.init(a, 16 * sl); // 16 samples at most
+        defer a.free(s.buf);
+        // Fed in uneven pieces, the way COPY batches arrive.
+        var off: usize = 0;
+        var step: usize = 1;
+        while (off < doc.len) : (step = (step * 7 + 13) % 5000 + 1) {
+            const n = @min(step, doc.len - off);
+            s.feed(doc[off..][0..n]);
+            off += n;
+        }
+        try std.testing.expectEqual(@as(u64, doc.len), s.seen);
+        if (nwin <= 16) try std.testing.expectEqual(@as(u64, 1), s.stride);
+        try std.testing.expect(s.count <= 16 and (nwin < 8 or s.count >= 8));
+        // Every complete window at a multiple of the stride, and nothing else.
+        try std.testing.expectEqual((nwin + s.stride - 1) / s.stride, s.count);
+        for (0..s.count) |j| {
+            const k = j * s.stride;
+            try std.testing.expectEqualSlices(u8, doc[k * sl ..][0..sl], s.buf[j * sl ..][0..sl]);
+        }
+        const corp = try s.corpus(a);
+        defer a.free(corp.sizes);
+        const probe = try probeFrom(a, corp, 4 * sl);
+        defer a.free(probe.buf);
+        defer a.free(probe.sizes);
+        try std.testing.expectEqual(@min(s.count, 4), probe.sizes.len);
+    }
+}
+
+test "FullStreamOf: one zstd frame with no content size, the document intact, in chunk-sized reads (§10gi)" {
+    const a = std.testing.allocator;
+    const Rows = struct {
+        nrows: usize = 0,
+        total: usize,
+        fn next(self: *@This(), out: *mp.List, oa: std.mem.Allocator) !bool {
+            if (self.nrows == self.total) return false;
+            // A few rows per call, like a CopyData message.
+            var i: usize = 0;
+            while (i < 3 and self.nrows < self.total) : (i += 1) {
+                try mp.arrayHeader(out, oa, 2);
+                try mp.int(out, oa, @intCast(self.nrows));
+                try mp.str(out, oa, "some text that repeats a little, row after row");
+                self.nrows += 1;
+            }
+            return true;
+        }
+    };
+    const total = 50_000;
+    var rows: Rows = .{ .total = total };
+    var s = try Sampler.init(a, 64 * Sampler.sample_len);
+    defer a.free(s.buf);
+    const cctx = c.ZSTD_createCCtx().?;
+    defer _ = c.ZSTD_freeCCtx(cctx);
+    _ = c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, 3);
+    var fs: FullStreamOf(Rows) = .{ .cr = &rows, .oa = a, .cctx = cctx, .sampler = &s, .expect_rows = total, .gen = 7, .cutoff = "2026-09-15 00:00:00+00", .vcol = "updated_at" };
+    defer fs.raw.deinit(a);
+    const names = [_][]const u8{ "id", "note" };
+    _ = try docHead(&fs.raw, a, &names, false, total);
+    s.feed(fs.raw.items);
+
+    var z: std.ArrayListUnmanaged(u8) = .empty;
+    defer z.deinit(a);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = try fs.read(&chunk);
+        if (n == 0) break;
+        // Every read but the last fills its chunk: an object store publishes one per read.
+        try z.appendSlice(a, chunk[0..n]);
+        if (n < chunk.len) try std.testing.expectEqual(@as(usize, 0), try fs.read(&chunk));
+        if (n < chunk.len) break;
+    }
+    const unknown: c_ulonglong = std.math.maxInt(c_ulonglong);
+    try std.testing.expectEqual(unknown, c.ZSTD_getFrameContentSize(z.items.ptr, z.items.len));
+
+    // The document, as a reader without the size decodes it.
+    var in: std.Io.Reader = .fixed(z.items);
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var zs: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
+    _ = try zs.reader.streamRemaining(&out.writer);
+    const doc = out.written();
+    try std.testing.expectEqual(s.seen, doc.len);
+    // {columns, rows: array32(total) …, gen, kind, cutoff, version_column}
+    try std.testing.expectEqual(@as(u8, 0x86), doc[0]);
+    const rows_at = std.mem.indexOf(u8, doc, "\xa4rows").? + 5;
+    try std.testing.expectEqual(@as(u8, 0xdd), doc[rows_at]);
+    try std.testing.expectEqual(@as(u32, total), std.mem.readInt(u32, doc[rows_at + 1 ..][0..4], .big));
+    try std.testing.expect(std.mem.endsWith(u8, doc, "\xaeversion_column\xaaupdated_at"));
 }

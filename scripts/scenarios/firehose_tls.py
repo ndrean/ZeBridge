@@ -172,6 +172,7 @@ class Sampler(threading.Thread):
         super().__init__(daemon=True)
         self.cli, self.stop_flag, self.samples, self.bridge_pid = cli, threading.Event(), [], bridge_pid
         self.rss_kib: list = []
+        self.rss_t: list = []  # §10gi: when each RSS sample was taken, for rss.csv
         self.slot_lag: list = []
 
     def run(self):
@@ -193,6 +194,7 @@ class Sampler(threading.Thread):
             try:
                 if self.bridge_pid:
                     self.rss_kib.append(int(subprocess.run(["ps", "-o", "rss=", "-p", str(self.bridge_pid)], capture_output=True, text=True, timeout=5).stdout.strip() or 0))
+                    self.rss_t.append(t)
                 lag = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-XtAc",
                                       f"SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint FROM pg_replication_slots WHERE slot_name = '{bt.SLOT}'"],
                                      capture_output=True, text=True, timeout=5).stdout.strip()
@@ -276,15 +278,17 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         fell_before = sum(1 for l in lines if "fell off" in l and "cutting a delta with a fresh cut point" in l and f"'{TABLE}'" in l)
         fell_during = sum(1 for l in lines if "fell off" in l and "during the build" in l and f"'{TABLE}'" in l)
         cut_pat = re.compile(rf"g(\d+) for '_default'/'{TABLE}': ([a-z+]+) → .* in (\d+) ms")
-        ph_pat = re.compile(r"phases: copy\+decode\+encode (\d+) ms, dictionary (\d+) ms, zstd (\d+) ms, upload (\d+) ms — (\d+) full row\(s\), (\d+) delta row")
+        # §10gi: a full is one streamed phase (count, copy, encode, zstd, upload); the delta keeps its own.
+        ph_pat = re.compile(r"phases: full \(count\+copy\+encode\+zstd\+upload\) (\d+) ms, delta copy\+decode\+encode (\d+) ms, dictionary (\d+) ms, delta zstd (\d+) ms, delta upload (\d+) ms — (\d+) full row\(s\), (\d+) delta row")
         cuts = []
         for i, l in enumerate(lines):
             m = cut_pat.search(l)
             if m and i + 1 < len(lines):
                 ph = ph_pat.search(lines[i + 1])
                 if ph:
-                    cuts.append({"gen": int(m.group(1)), "kind": m.group(2), "build": int(m.group(3)), "upload": int(ph.group(4)), "query": int(ph.group(1)),
-                                 "full_rows": int(ph.group(5)), "delta_rows": int(ph.group(6))})
+                    cuts.append({"gen": int(m.group(1)), "kind": m.group(2), "build": int(m.group(3)), "upload": int(ph.group(5)), "query": int(ph.group(2)),
+                                 "full": int(ph.group(1)), "full_rows": int(ph.group(6)), "delta_rows": int(ph.group(7))})
+        (run_dir / "rss.csv").write_text("unix_s,rss_kib\n" + "".join(f"{t:.1f},{k}\n" for t, k in zip(sampler.rss_t, sampler.rss_kib)))
         verified = verify_chain(cli, run_dir, load_end) if VERIFY else None
         schema_raw = subprocess.run(cli + ["kv", "get", "schemas", TABLE, "--raw"], capture_output=True, text=True).stdout
         try:

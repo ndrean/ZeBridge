@@ -12918,3 +12918,42 @@ The generation count stops deciding anything: depth rotation and the §10ge defe
 A base or checkpoint of a big table must be built as a stream first (§10gg). The plan, with
 the manifest, planner cases, producer rules, bookkeeping options, tests and order:
 `docs/plans/2026-09-15-incremental-fulls.md` (local, gitignored).
+
+## 10gi. The full as a stream (2026-09-15)
+
+Step 0 of the incremental fulls plan. `putFullObject` writes a full to the object store
+while COPY reads it: `CopyReader` turns one CopyData message into msgpack rows (the §10ep
+decoder, now shared with the in-memory delta path), `FullStream` gathers about 256 KiB of
+rows, feeds one zstd stream, and fills each chunk the object store's `put` pulls. The
+bridge holds one batch, the compressor's window, one chunk and an 8 MiB sample for the
+dictionary.
+
+Two things had to change around it.
+
+- **The row count comes first.** msgpack has no open-ended array, and every client reads
+  the `rows` count before the rows. It is read with `count(*)` in the same snapshot; COPY
+  must give exactly that many rows or the stream fails. The dictionary sample, taken from
+  the whole full before, is taken as the stream passes (`Sampler`: evenly spaced 2 KiB
+  windows, every other one dropped and the stride doubled when the buffer is full).
+- **The frame states no content size.** It is unknown when the header is written. Checked
+  every reader: libzb's streaming seed, Node's `zlib` and the Python tools were fine;
+  libzb's whole-object path fell to `std.compress.zstd` (slow, §10ez), now libzstd's
+  streaming decoder; the browser client's `zstd-wasm` sizes its output at 1 MiB and fails
+  past it (measured: code -70 on a 14.6 MB document), now it starts at 8× the compressed
+  size and doubles until the document fits (two tries there). PROTOCOL §6 says a reader
+  must not size its output from the frame header.
+
+A decoder failure still falls back to the text path, which holds the document. The full's
+snapshot now stays open during the upload. A full uploaded by a build that then fails is
+left behind under its gen's name and replaced by the retry.
+
+**Measured** (SPEED_TEST.md): a 9.5M-row full alone, 1.93 GB raw and 312 MB compressed,
+built in 9.9 s with the bridge at 59 MiB peak (about 2.2 GB before). The 50k events/s run
+again: 49,912 events/s, no hole, four background fulls of 5.6 to 12.1 s, every row
+verified, RSS median 1,285 MiB and peak 2,169 MiB against 2,530 and 4,211. What remains is
+the load's, not the full's; not yet traced.
+
+Tests: `Sampler` against a document fed in uneven pieces; `FullStreamOf` over a fake row
+source (one frame, no size, the document intact, chunk-sized reads); libzb's `maybeZstd` on
+sizeless frames with and without a dictionary, and a truncated frame. The module's test
+binary now links libzstd.

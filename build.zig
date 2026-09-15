@@ -174,6 +174,9 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     linkLibpq(mod_tests, b, prefix);
+    // The producer's tests compress (§10gi): the module's test binary links libzstd
+    // like the bridge does.
+    linkZstd(mod_tests, b, zstd_prefix);
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);

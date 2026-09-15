@@ -379,3 +379,43 @@ is memory: a full is encoded whole before it is compressed and uploaded, about 2
 row raw (the 2M-row full was 403.6 MB raw, 65 MB compressed), so a 9.3M-row full is about
 1.9 GB of rows in the bridge, and the peak reached 4.2 GB. On a VPS with 4 GB of memory
 this run would have failed at its third or fourth full.
+
+## The full as a stream (2026-09-15)
+
+A full is now written to the object store while COPY reads it: rows are encoded in
+batches of about 256 KiB, go through one zstd stream, and leave as object chunks. The row
+count leads the document, so it is read first, in the same snapshot.
+
+**The full alone.** 9.5M static rows, 1 row a second, 120 s: the first generation is a
+full of the whole table.
+
+```sh
+python scripts/scenarios/firehose_tls.py --seconds 120 --rate 1 --cap-mib 128 --preload 9500000 --runs tls:on:defer:async
+```
+
+| measure | value |
+| --- | --- |
+| full | 9,500,000 rows, 1,925,232,995 bytes raw, 312,178,857 compressed (16%) |
+| build | 9,929 ms (count, COPY, encode, zstd and upload 9,622 ms; dictionary 201 ms) |
+| bridge memory (RSS) | max 59 MiB, median 41 MiB |
+
+Before, the same full needed its raw bytes and its compressed bytes in memory at once:
+about 2.2 GB.
+
+**50,000 events a second, again.** The run above ("50,000 events a second for 5 minutes"),
+same command, with `--verify`.
+
+| measure | before | streamed |
+| --- | --- | --- |
+| events published | 49,208/s | 49,912/s |
+| holes | 0 of 254 | 0 of 251; smallest margin 177 |
+| background fulls | 4: 5.4, 8.6, 10.7, 13.3 s | 4: 5.6, 6.9, 9.8, 12.1 s |
+| slot lag | median 8 MiB, max 120 MiB | median 10 MiB, max 324 MiB |
+| bridge CPU | 137 s | 132 s |
+| bridge memory (RSS) | median 2,530 MiB, max 4,211 MiB | median 1,285 MiB, max 2,169 MiB |
+| chain check (9.5M rows) | — | fresh seed and replay of every delta: 0 missing, 0 extra, 0 wrong |
+
+**What it says.** A full no longer costs memory: 59 MiB for 9.5M rows. Build time is
+unchanged, even with the extra count. The 1.3 to 2.2 GB left at 50,000 events a second
+comes from the load itself, not from the full; where exactly (the CDC publish path, the
+deltas, which are still built in memory, or allocator retention) is not measured yet.

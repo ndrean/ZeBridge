@@ -842,7 +842,7 @@ The fulls above are built with the delta of the same generation, from one snapsh
 | | where | why |
 | --- | --- | --- |
 | **Manifest** | `generations` KV, key `<tenant>.<table>` | One small JSON document naming the chain: the full, the deltas, the cutoff. Last-value-per-key makes discovery one read. |
-| **Objects** | `gen-<tenant>` object store | The full and delta payloads: MessagePack rows, normally wrapped in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. Chunked by the object store itself (128 KB) — no NATS `max_payload` limit applies to a seed. |
+| **Objects** | `gen-<tenant>` object store | The full and delta payloads: MessagePack rows, normally wrapped in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. A full is written as a stream, so its frame does **not state its content size**: a reader must not size its output from the frame header (stream it, or grow the buffer). Chunked by the object store itself (128 KB) — no NATS `max_payload` limit applies to a seed. |
 
 The manifest carries:
 

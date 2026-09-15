@@ -3717,40 +3717,46 @@ fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
     return out;
 }
 
-/// Chain objects may be zstd frames (§10w) — sniffed by the standard 4-byte
-/// magic; decompression is pure std (std.compress.zstd), no C on the client.
+/// Chain objects may be zstd frames (§10w) — sniffed by the standard 4-byte magic.
 fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8 {
     if (b.len < 4 or b[0] != 0x28 or b[1] != 0xb5 or b[2] != 0x2f or b[3] != 0xfd) return b;
-    if (dict) |d| {
-        // Dictionary frame: libzstd (std.compress.zstd cannot take a dictionary).
-        // ZSTD_CONTENTSIZE_UNKNOWN/ERROR are (0ULL-1)/(0ULL-2): translate-c
-        // overflows on the macros, so spell them out.
-        const unknown: c_ulonglong = std.math.maxInt(c_ulonglong);
-        const size = C.ZSTD_getFrameContentSize(b.ptr, b.len);
-        if (size == unknown or size == unknown - 1) return error.ZstdSizeUnknown;
-        const out = try a.alloc(u8, @intCast(size));
-        const dctx = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
-        defer _ = C.ZSTD_freeDCtx(dctx);
-        const n = C.ZSTD_decompress_usingDict(dctx, out.ptr, out.len, b.ptr, b.len, d.ptr, d.len);
-        if (C.ZSTD_isError(n) != 0) return error.ZstdDecompressFailed;
-        return out[0..n];
-    }
-    // §10ez: a frame that states its content size goes through libzstd — a 102 MB
-    // full inflated in 4.2 s through std.compress.zstd and in a fraction of that here.
-    // A frame without the size (not what the producer writes) takes the streaming path.
+    // §10ez: a frame that states its content size is inflated in one call — a 102 MB
+    // full took 4.2 s through std.compress.zstd and a fraction of that here.
+    // ZSTD_CONTENTSIZE_UNKNOWN/ERROR are (0ULL-1)/(0ULL-2): translate-c overflows on
+    // the macros, so they are spelled out.
     const unknown: c_ulonglong = std.math.maxInt(c_ulonglong);
     const size = C.ZSTD_getFrameContentSize(b.ptr, b.len);
     if (size != unknown and size != unknown - 1) {
         const out = try a.alloc(u8, @intCast(size));
-        const n = C.ZSTD_decompress(out.ptr, out.len, b.ptr, b.len);
-        if (C.ZSTD_isError(n) == 0) return out[0..n];
+        const n = if (dict) |d| blk: {
+            const dctx = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
+            defer _ = C.ZSTD_freeDCtx(dctx);
+            break :blk C.ZSTD_decompress_usingDict(dctx, out.ptr, out.len, b.ptr, b.len, d.ptr, d.len);
+        } else C.ZSTD_decompress(out.ptr, out.len, b.ptr, b.len);
+        if (C.ZSTD_isError(n) != 0) return error.ZstdDecompressFailed;
+        return out[0..n];
     }
-    var out: std.Io.Writer.Allocating = .init(a);
-    defer out.deinit();
-    var in: std.Io.Reader = .fixed(b);
-    var zs: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
-    _ = try zs.reader.streamRemaining(&out.writer);
-    return try out.toOwnedSlice();
+    // §10gi: a frame without its size — the producer writes a full as a stream, and
+    // the size is not known when the header goes out. libzstd's streaming decoder, the
+    // output grown as it fills.
+    const dctx = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
+    defer _ = C.ZSTD_freeDCtx(dctx);
+    if (dict) |d| if (C.ZSTD_isError(C.ZSTD_DCtx_loadDictionary(dctx, d.ptr, d.len)) != 0) return error.ZstdDecompressFailed;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.ensureTotalCapacity(a, @max(b.len * 4, 64 * 1024));
+    var in: C.ZSTD_inBuffer = .{ .src = b.ptr, .size = b.len, .pos = 0 };
+    while (true) {
+        if (out.unusedCapacitySlice().len == 0) try out.ensureUnusedCapacity(a, out.capacity);
+        const spare = out.unusedCapacitySlice();
+        var ob: C.ZSTD_outBuffer = .{ .dst = spare.ptr, .size = spare.len, .pos = 0 };
+        const r = C.ZSTD_decompressStream(dctx, &ob, &in);
+        if (C.ZSTD_isError(r) != 0) return error.ZstdDecompressFailed;
+        out.items.len += ob.pos;
+        if (r == 0 and in.pos == in.size) break; // the frame is complete and flushed
+        if (in.pos == in.size and ob.pos < spare.len) return error.ZstdDecompressFailed; // truncated
+    }
+    return try out.toOwnedSlice(a);
 }
 
 /// Stored JSON (an outbox payload or before-image) → the core's Value.
@@ -4519,4 +4525,44 @@ test "migrateTable: a suspension descriptor is an error, never a panic" {
     try std.testing.expectError(error.SchemaUnusable, SyncClient.migrateTable(&st, arena.allocator(), "t", susp));
     const junk = (try std.json.parseFromSlice(Value, arena.allocator(), "[1,2]", .{})).value;
     try std.testing.expectError(error.SchemaUnusable, SyncClient.migrateTable(&st, arena.allocator(), "t", junk));
+}
+
+test "maybeZstd: a frame without its content size inflates, with and without a dictionary (§10gi)" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const doc = try aa.alloc(u8, 3 * 1024 * 1024 + 17);
+    for (doc, 0..) |*b, i| b.* = "chain rows repeat, a little"[i % 27] ^ @as(u8, @truncate(i / 4096));
+    const dict = "chain rows repeat, a little" ** 64;
+    for ([_]?[]const u8{ null, dict }) |d| {
+        const cctx = C.ZSTD_createCCtx().?;
+        defer _ = C.ZSTD_freeCCtx(cctx);
+        if (d) |dd| try std.testing.expect(C.ZSTD_isError(C.ZSTD_CCtx_loadDictionary(cctx, dd.ptr, dd.len)) == 0);
+        // Streamed in small pieces, like the producer's full: no size in the header.
+        var z: std.ArrayListUnmanaged(u8) = .empty;
+        // (A first call with ZSTD_e_end and all the input would state the size.)
+        var chunk: [4096]u8 = undefined;
+        var fed: usize = 0;
+        while (true) {
+            const piece = @min(doc.len - fed, 64 * 1024);
+            var in: C.ZSTD_inBuffer = .{ .src = doc[fed..].ptr, .size = piece, .pos = 0 };
+            const end = fed + piece == doc.len;
+            while (true) {
+                var ob: C.ZSTD_outBuffer = .{ .dst = &chunk, .size = chunk.len, .pos = 0 };
+                const r = C.ZSTD_compressStream2(cctx, &ob, &in, if (end) C.ZSTD_e_end else C.ZSTD_e_continue);
+                try std.testing.expect(C.ZSTD_isError(r) == 0);
+                try z.appendSlice(aa, chunk[0..ob.pos]);
+                if (end and r == 0) break;
+                if (!end and in.pos == in.size and ob.pos < chunk.len) break;
+            }
+            fed += piece;
+            if (end) break;
+        }
+        const unknown: c_ulonglong = std.math.maxInt(c_ulonglong);
+        try std.testing.expectEqual(unknown, C.ZSTD_getFrameContentSize(z.items.ptr, z.items.len));
+        try std.testing.expectEqualSlices(u8, doc, try maybeZstd(aa, z.items, d));
+        // Truncated: an error, never a short document.
+        try std.testing.expectError(error.ZstdDecompressFailed, maybeZstd(aa, z.items[0 .. z.items.len - 9], d));
+    }
 }

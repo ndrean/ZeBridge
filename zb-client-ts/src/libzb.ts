@@ -1876,9 +1876,20 @@ export class ZeBridge {
       });
     }
     const mod = await g.__zbZstd;
-    if (!dict) return mod.decompress(b);
-    const dctx = mod.createDCtx();
-    try { return mod.decompressUsingDict(dctx, b, dict); } finally { /* handled by GC or dctx.free() */ }
+    // §10gi: a full is written as a stream, so its frame states no content size, and
+    // zstd-wasm then sizes the output at `defaultHeapSize` (1 MiB by default) and fails
+    // past it. It has no streaming decoder: start at 8× the compressed size and double
+    // until the document fits. A frame that states its size ignores the option.
+    const limit = 2 ** 31;
+    for (let heap = Math.max(1 << 20, b.length * 8); ; heap *= 2) {
+      try {
+        if (!dict) return mod.decompress(b, { defaultHeapSize: heap });
+        const dctx = mod.createDCtx();
+        try { return mod.decompressUsingDict(dctx, b, dict, { defaultHeapSize: heap }); } finally { mod.freeDCtx?.(dctx); }
+      } catch (e) {
+        if (heap * 2 > limit) throw e;
+      }
+    }
   }
 
   /// grammar.json's `subjects.mutation_ack_prefix` — the verdict channel's first token.
