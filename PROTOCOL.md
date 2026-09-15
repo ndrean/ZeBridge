@@ -829,6 +829,14 @@ Clients only ever read what is already built;
 
 A delta suffices while nothing but versions moved. The producer builds a full, whatever the counts say, when: the chain has no full inside the kept window; hard deletes moved (`n_tup_del`); the catalogue's `seed_epoch` moved since the last generation; or the table's column shape (`name:type` list, recorded per generation as `col_shape`) moved — a chain object names its columns, and a full built before a `DROP`/`RENAME`/re-type would ask a replica for a column it no longer has. A (tenant, table) that left the publication has its chain swept on the next tick — objects, manifest, bookkeeping — so a table re-created under the same name starts at g1. A client reading a chain object that names a column it lacks treats it as "predates the schema" and waits for the next full.
 
+### A full can sit behind newer deltas
+
+The fulls above are built with the delta of the same generation, from one snapshot. The routine full, the one that keeps a full inside the kept window, is not: it is built in the background while deltas keep being cut (`GENERATION_ASYNC_FULLS`, on by default), because a full takes seconds and the cut must stay fresh while the stream prunes.
+
+* The background full takes its snapshot right after the newest generation, call it L, and is attached to L when it is done. By then the manifest may list deltas above L. The manifest's `full.gen` is L and `full.cutoff` is L's cutoff.
+* The full's rows can be newer than that cutoff. A client applies the full, then **every delta with a gen above `full.gen`**. Those deltas cover everything after L's cutoff, so nothing is missed; the rows they repeat are version-guarded upserts and deletes by key, so nothing goes backwards.
+* The routine full also waits while the stream has less time left than three builds of the table's full (`GENERATION_DEFER_FULLS`), up to 4 × `GENERATION_CHAIN_DEPTH` generations. The kept window then stretches back to that full, so a chain can list more than `GENERATION_CHAIN_DEPTH` deltas.
+
 ### The storage architecture
 
 | | where | why |

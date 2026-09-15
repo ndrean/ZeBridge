@@ -81,6 +81,8 @@ const usage =
     \\                        parameter: depth × cadence must stay under the
     \\                        sweeper's tombstone retention.
     \\  GENERATION_CHAIN_DEPTH  generations kept per pair (default: 6)
+    \\  GENERATION_ASYNC_FULLS  build the depth rotation's full in the background while deltas keep cutting (default: true)
+    \\  GENERATION_DEFER_FULLS  wait with the depth rotation's full while the stream is short of time (default: true)
     \\  GENERATION_WORKERS    builders for the early cuts of bursting streams
     \\                        (default: 1). More re-cut those pairs in parallel,
     \\                        each on its own connections; the cadence tick builds
@@ -546,6 +548,12 @@ pub const Args = struct {
             (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true"))
         else
             false;
+        if (init.minimal.environ.getPosix("GENERATION_ASYNC_FULLS")) |v| {
+            runtime_config.generation_async_fulls = !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false"));
+        }
+        if (init.minimal.environ.getPosix("GENERATION_DEFER_FULLS")) |v| {
+            runtime_config.generation_defer_fulls = !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false"));
+        }
         runtime_config.fleet_poll_seconds = envUint(u64, init, "FLEET_POLL_SECONDS", config.Fleet.default_poll_seconds, config.Fleet.min_poll_seconds, config.Fleet.max_poll_seconds);
         runtime_config.fleet_ttl_seconds = envUint(u64, init, "FLEET_TTL_SECONDS", config.Fleet.default_ttl_seconds, config.Fleet.min_ttl_seconds, config.Fleet.max_ttl_seconds);
         runtime_config.slot_inventory_seconds = envUint(u64, init, "SLOT_INVENTORY_SECONDS", config.WalMonitor.default_slot_inventory_seconds, config.WalMonitor.min_slot_inventory_seconds, config.WalMonitor.max_slot_inventory_seconds);

@@ -2356,7 +2356,9 @@ pub const EventProcessor = struct {
             //
             // Same exclusions as the trigger: the PK is inline, and partial /
             // expression / non-btree indexes carry PostgreSQL syntax with no SQLite
-            // equivalent. Dropping one costs a scan, never a wrong row.
+            // equivalent. Dropping one costs a scan, never a wrong row. And
+            // `<table>_zb_version`, zebridge_enable's index for the producer's delta
+            // query (§10gc): a replica never reads by version (§10gd).
             const ix_query = try utils.allocPrintZ(
                 arena,
                 \\SELECT ci.relname, i.indisunique,
@@ -2369,6 +2371,7 @@ pub const EventProcessor = struct {
                 \\WHERE i.indrelid = '"{s}"."{s}"'::regclass
                 \\  AND NOT i.indisprimary AND i.indpred IS NULL AND i.indexprs IS NULL
                 \\  AND am.amname = 'btree'
+                \\  AND ci.relname NOT LIKE '%\_zb\_version'
                 \\ORDER BY ci.relname;
             ,
                 .{ "public", clean_table },

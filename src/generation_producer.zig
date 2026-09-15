@@ -105,6 +105,16 @@ pub const GenerationProducer = struct {
     /// second, on the publisher's mark.
     edge_scan_seconds: u64 = 5,
     hot: ?*hot_streams.HotStreams = null,
+    /// §10ge: GENERATION_DEFER_FULLS.
+    defer_fulls: bool = true,
+    /// §10gf: GENERATION_ASYNC_FULLS, and the lane's state. `cuts_lock` guards the three
+    /// maps and the queue. `pair_busy`: a build of the pair holds it (every delta build
+    /// whole; the full lane only while it takes its snapshot and while it attaches).
+    async_fulls: bool = true,
+    pair_busy: std.StringArrayHashMapUnmanaged(bool) = .empty,
+    full_pending: std.StringArrayHashMapUnmanaged(void) = .empty,
+    full_queue: std.ArrayListUnmanaged(FullJob) = .empty,
+    full_thread: ?std.Thread = null,
     /// The CDC per-event buffer (2^BASE_BUF). The chain has no per-row ceiling —
     /// object chunking removes it — so the producer is where a row too wide for
     /// CDC gets DETECTED (the retirement survivor of the snapshot path's
@@ -129,6 +139,13 @@ pub const GenerationProducer = struct {
         at_ms: i64 = 0,
         /// §10ev: a forced cut that failed is not asked for again before this.
         hold_until_ms: i64 = 0,
+        /// §10ge: how long this pair's last build that carried a full took (0: none
+        /// seen by this process) — what a deferred full would cost.
+        full_build_ms: i64 = 0,
+        /// §10ge: the edge watch's last reading of the seconds left before the stream
+        /// prunes past this cut, and when it was read (0: never read).
+        margin_s: f64 = std.math.inf(f64),
+        margin_at_ms: i64 = 0,
     };
     pub const Edge = struct { first_seq: u64, at_ms: i64 };
     pub const max_workers: u32 = 32;
@@ -174,11 +191,14 @@ pub const GenerationProducer = struct {
 
     pub fn start(self: *GenerationProducer) !void {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
+        if (self.async_fulls) self.full_thread = try std.Thread.spawn(.{}, fullLaneMain, .{self});
     }
 
     pub fn join(self: *GenerationProducer) void {
         if (self.thread) |t| t.join();
         self.thread = null;
+        if (self.full_thread) |t| t.join();
+        self.full_thread = null;
     }
 
     /// §10du: a tick asked for out of cadence. Set by the catalogue reload when a
@@ -321,6 +341,18 @@ pub const GenerationProducer = struct {
             const margin_s: f64 = if (margin_msgs <= 0) 0 else if (r.rate > 0) @as(f64, @floatFromInt(margin_msgs)) / r.rate else std.math.inf(f64);
             const need_s: f64 = 3.0 * @as(f64, @floatFromInt(@max(cut.build_ms, 50))) / 1000.0 + @as(f64, @floatFromInt(if (only_streams != null) 1 else self.edge_scan_seconds));
             const by_rate = r.rate > 0 and margin_s < need_s;
+            // §10ge: keep the reading — a build deciding whether to defer a full asks it.
+            {
+                self.cuts_lock.lock();
+                defer self.cuts_lock.unlock();
+                var key_buf: [512]u8 = undefined;
+                if (std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ cut.tenant, cut.table })) |key| {
+                    if (self.cuts.getPtr(key)) |live| {
+                        live.margin_s = if (r.rate > 0) margin_s else std.math.inf(f64);
+                        live.margin_at_ms = now_ms;
+                    }
+                } else |_| {}
+            }
             // Half the span, not a quarter: CDC messages are batches of up to 5,000
             // events, so a stream at its byte cap holds a few hundred of them and a
             // quarter is seconds of margin at a burst's prune rate — one early cut in
@@ -638,6 +670,10 @@ pub const GenerationProducer = struct {
         self.cuts_lock.lock();
         defer self.cuts_lock.unlock();
         if (self.cuts.getPtr(key)) |cut| cut.hold_until_ms = utils.unixMillis() + for_ms;
+    }
+
+    fn queryOnePub(pgc: *c.PGconn, sql: [:0]const u8, params: []const ?[*:0]const u8) !*c.PGresult {
+        return queryOne(pgc, sql, params);
     }
 
     fn queryOne(pgc: *c.PGconn, sql: [:0]const u8, params: []const ?[*:0]const u8) !*c.PGresult {
@@ -1101,7 +1137,10 @@ pub const GenerationProducer = struct {
         // point), then refreshed BEFORE the last one can age out of the kept window
         // (gen > N − depth): rebuild at distance depth − 1 keeps it always inside.
         const build_delta = last_gen > 0;
-        var build_full = last_full_gen == 0 or (gen - last_full_gen) >= @as(i64, self.chain_depth) - 1;
+        var build_full = last_full_gen == 0;
+        // The depth rotation: the only full no correctness asks for — it bounds the chain
+        // a returning client applies. §10ge decides below whether it waits.
+        const depth_due = last_full_gen != 0 and (gen - last_full_gen) >= @as(i64, self.chain_depth) - 1;
         // §10df, decided HERE — before anything below builds or names the full. Placed
         // after the full-building blocks once, it only flipped the label: bookkeeping
         // and manifest claimed a full that was never written (measured, a client
@@ -1363,6 +1402,32 @@ pub const GenerationProducer = struct {
             build_full = true;
         };
 
+        // ── §10ge: the depth rotation's full, now or later ───────────────────
+        // Every full above this line is owed (first, epoch, shape, deletes, repair).
+        // The rotation's is not: while the stream holds fewer seconds past this pair's
+        // cut than three of its full builds, a full here is the build most likely to
+        // be pruned past (§10gd: fulls set the edge, deltas are cheap), so the chain
+        // continues on deltas — up to depth × full_defer_factor generations.
+        if (depth_due and !build_full) {
+            const since = gen - last_full_gen;
+            const limit: i64 = @as(i64, self.chain_depth) * config.Generations.full_defer_factor - 1;
+            const reading = self.deferReading(tenant, table);
+            const decision = fullDecision(self.defer_fulls, since, limit, reading.margin_s, utils.unixMillis() - reading.margin_at_ms, reading.margin_at_ms != 0, reading.full_build_ms, self.edge_scan_seconds);
+            switch (decision) {
+                .build, .build_at_limit => {
+                    if (decision == .build_at_limit)
+                        log.warn("🧬 '{s}'/'{s}': the full was deferred {d} generation(s), the limit — building it now, {d:.1} s of margin against a {d} ms full", .{ tenant, table, since, reading.margin_s, reading.full_build_ms });
+                    // §10gf: in the background, behind the deltas, unless the lane has
+                    // fallen twice the limit behind (a full it keeps discarding) — then here.
+                    if (self.async_fulls and since < 2 * limit) {
+                        if (self.requestFull(tenant, table, vcol, tcol))
+                            log.info("🧬 '{s}'/'{s}': the depth rotation's full goes to the background lane (g{d} is the last full, {d} generation(s) since); this build cuts the delta", .{ tenant, table, last_full_gen, since });
+                    } else build_full = true;
+                },
+                .defer_full => log.info("🧬 '{s}'/'{s}': deferring the depth rotation's full — {d:.1} s of margin, under 3 × the last full's {d} ms + {d} s; g{d} stays the full ({d} of {d} generations)", .{ tenant, table, reading.margin_s, reading.full_build_ms, self.edge_scan_seconds, last_full_gen, since, limit }),
+            }
+        }
+
         // ── 3. content: full and/or delta against the SAME snapshot ──────────
         var full_payload: ?[]const u8 = null;
         defer if (full_payload) |b| self.allocator.free(b);
@@ -1479,7 +1544,7 @@ pub const GenerationProducer = struct {
                 // own gen with the older name, and rebuilding "g<gen>-dict" from that row
                 // named an object nobody uploaded — every delta of two eras pointed at
                 // a phantom, and every fresh client failed to seed (§10ed).
-                const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(dict_object, '') FROM public.zebridge_generations " ++
+                const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
                     "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_p);
                 defer c.PQclear(res_p);
                 if (c.PQntuples(res_p) > 0 and probe.sizes.len > 0 and c.PQgetlength(res_p, 0, 3) > 0) {
@@ -1513,7 +1578,7 @@ pub const GenerationProducer = struct {
         } else if (build_delta) {
             const params_d = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
             // The name is the row's `dict_object` (see the probe above, §10ed).
-            const res_d = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_object, '') FROM public.zebridge_generations " ++
+            const res_d = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
                 "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_d);
             defer c.PQclear(res_d);
             if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 2) > 0) {
@@ -1576,7 +1641,7 @@ pub const GenerationProducer = struct {
         var full_cutoff_m: []const u8 = "";
         var deltas_json: std.ArrayList(u8) = .empty;
         {
-            const keep_from = try utils.allocPrintZ(alloc, "{d}", .{gen - @as(i64, self.chain_depth)});
+            const keep_from = try utils.allocPrintZ(alloc, "{d}", .{keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
             const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full, COALESCE(dict_object, '') " ++
                 "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 ORDER BY gen", &params);
@@ -1638,65 +1703,20 @@ pub const GenerationProducer = struct {
             const shape_z = try alloc.dupeZ(u8, col_shape);
             const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
             const ratio_z: ?[*:0]const u8 = if (build_full) (if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null) else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint) " ++
+            const full_dict_z: ?[*:0]const u8 = if (build_full) dict_obj_z else null;
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z, full_dict_z };
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio, full_dict_object) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint, $16) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
 
         // §10eq: the edge watch's memory of this pair.
         self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
+        if (build_full) self.recordFullBuild(tenant, table, utils.unixMillis() - build_started_ms);
 
         // ── 6. prune past the chain depth: PG rows (authority), then objects ──
-        if (gen > self.chain_depth) {
-            const keep_from = try utils.allocPrintZ(alloc, "{d}", .{gen - @as(i64, self.chain_depth)});
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
-            const res = try queryOne(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen <= $3 RETURNING gen, COALESCE(dict_object, '')", &params);
-            defer c.PQclear(res);
-            const pruned: usize = @intCast(c.PQntuples(res));
-            // Dictionaries outlive their full's row: a pruned era's dictionary must
-            // survive while any REMAINING row was compressed with it (§10x).
-            // ⚠️ Its OWN two parameters. This reused the DELETE's three-element array
-            // above for a two-placeholder statement, and libpq refuses that: "bind
-            // message supplies 3 parameters, but prepared statement requires 2". Latent
-            // since §10x landed, because it only runs when a chain is deeper than
-            // `chain_depth` — the first such build after it (memo g9, 2026-08-29)
-            // failed here, after its objects and manifest were already live.
-            const ref_params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const still_ref = try queryOne(bkc, "SELECT DISTINCT dict_object FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND dict_object IS NOT NULL", &ref_params);
-            defer c.PQclear(still_ref);
-            for (0..pruned) |i| {
-                const g = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
-                // A generation has a delta, a full, or both; delete both names and let
-                // the one that never existed 404 quietly.
-                for ([_][]const u8{ "delta", "full" }) |kind| {
-                    const old_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
-                    store.delete(old_name) catch |err| {
-                        if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
-                    };
-                }
-                // Two names: the dictionary under this generation's own name, and the
-                // one the row NAMED — a full that kept a dictionary (§10ed) names an
-                // older generation's object, which outlived that generation's prune
-                // through the reference and must go when the last reference does. The
-                // prune deleted only the own name and leaked one dictionary per retired
-                // full (§10eu: 14 in a bucket, 1 referenced).
-                const dict_own = try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g });
-                const dict_named = std.mem.span(c.PQgetvalue(res, @intCast(i), 1));
-                const nref: usize = @intCast(c.PQntuples(still_ref));
-                for ([_][]const u8{ dict_own, dict_named }) |dict_old| {
-                    if (dict_old.len == 0) continue;
-                    var referenced = false;
-                    for (0..nref) |k| {
-                        if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(still_ref, @intCast(k), 0)), dict_old)) referenced = true;
-                    }
-                    if (!referenced) store.delete(dict_old) catch |err| {
-                        if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned dictionary {s}: {}", .{ dict_old, err });
-                    };
-                }
-            }
-        }
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen));
 
         // The duration is the number the retention contract needs (§10em): the CDC
         // window must cover two cadences AND this, since the cut is taken before the
@@ -1758,6 +1778,377 @@ pub const GenerationProducer = struct {
         });
     }
 
+    /// §10ge: what the deferral decision reads from the pair's cut record.
+    const DeferReading = struct { margin_s: f64 = std.math.inf(f64), margin_at_ms: i64 = 0, full_build_ms: i64 = 0 };
+
+    fn deferReading(self: *GenerationProducer, tenant: []const u8, table: []const u8) DeferReading {
+        var key_buf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ tenant, table }) catch return .{};
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        const cut = self.cuts.get(key) orelse return .{};
+        return .{ .margin_s = cut.margin_s, .margin_at_ms = cut.margin_at_ms, .full_build_ms = cut.full_build_ms };
+    }
+
+    fn recordFullBuild(self: *GenerationProducer, tenant: []const u8, table: []const u8, ms: i64) void {
+        var key_buf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ tenant, table }) catch return;
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        if (self.cuts.getPtr(key)) |cut| cut.full_build_ms = ms;
+    }
+
+
+    // ── §10gf: the background full lane ─────────────────────────────────────
+    //
+    // A full does not have to move the cut: deltas keep the cut fresh, and a full only
+    // gives a client a nearer place to start. Built in the build path it did move it —
+    // the pair's next delta waited for it, and (one worker) so did the edge watch — so a
+    // full's build time was the chain's blind time, and under a pruning stream the hole
+    // (§10ge: every remaining hole sat inside a full's build). Here the depth rotation's
+    // full is built on its own thread and connections, from a snapshot taken right after
+    // the pair's newest generation L, while deltas keep cutting; it is then attached to
+    // L's row. A client that takes it applies every delta above L (core.planFromManifest):
+    // those cover everything after L's cutoff, hence after the full's snapshot, and the
+    // overlap is version-guarded upserts and deletes by key. The manifest names L's
+    // cutoff for it, older than its snapshot: a watermark that only errs early.
+    // Every full a correctness rule asks for (first, epoch, shape, deletes) stays in the
+    // build path, from the delta's own snapshot.
+
+    pub const FullJob = struct { tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8 };
+
+    fn pairKey(buf: []u8, tenant: []const u8, table: []const u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}.{s}", .{ tenant, table }) catch null;
+    }
+
+    /// Blocks until no other build holds the pair. A sleep, not a spin: a synchronous
+    /// full holds a pair for seconds.
+    fn pairAcquire(self: *GenerationProducer, tenant: []const u8, table: []const u8) void {
+        var buf: [512]u8 = undefined;
+        const key = pairKey(&buf, tenant, table) orelse return;
+        while (true) {
+            self.cuts_lock.lock();
+            const got = blk: {
+                if (self.pair_busy.getPtr(key)) |b| {
+                    if (b.*) break :blk false;
+                    b.* = true;
+                    break :blk true;
+                }
+                const owned = self.allocator.dupe(u8, key) catch break :blk true;
+                self.pair_busy.put(self.allocator, owned, true) catch {
+                    self.allocator.free(owned);
+                };
+                break :blk true;
+            };
+            self.cuts_lock.unlock();
+            if (got) return;
+            utils.sleep(5 * std.time.ns_per_ms);
+        }
+    }
+
+    fn pairRelease(self: *GenerationProducer, tenant: []const u8, table: []const u8) void {
+        var buf: [512]u8 = undefined;
+        const key = pairKey(&buf, tenant, table) orelse return;
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        if (self.pair_busy.getPtr(key)) |b| b.* = false;
+    }
+
+    /// Queues the pair's full unless one is queued or building. True when queued now.
+    fn requestFull(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8) bool {
+        var buf: [512]u8 = undefined;
+        const key = pairKey(&buf, tenant, table) orelse return false;
+        self.cuts_lock.lock();
+        defer self.cuts_lock.unlock();
+        if (self.full_pending.contains(key)) return false;
+        const a = self.allocator;
+        const job: FullJob = .{
+            .tenant = a.dupe(u8, tenant) catch return false,
+            .table = a.dupe(u8, table) catch return false,
+            .vcol = a.dupe(u8, vcol) catch return false,
+            .tcol = a.dupe(u8, tcol) catch return false,
+        };
+        const owned = a.dupe(u8, key) catch return false;
+        self.full_pending.put(a, owned, {}) catch return false;
+        self.full_queue.append(a, job) catch {
+            _ = self.full_pending.swapRemove(key);
+            return false;
+        };
+        return true;
+    }
+
+    fn fullLaneMain(self: *GenerationProducer) void {
+        log.info("🧬 background full lane started", .{});
+        while (!self.should_stop.load(.acquire)) {
+            const job: ?FullJob = blk: {
+                self.cuts_lock.lock();
+                defer self.cuts_lock.unlock();
+                if (self.full_queue.items.len == 0) break :blk null;
+                break :blk self.full_queue.orderedRemove(0);
+            };
+            const j = job orelse {
+                utils.sleep(200 * std.time.ns_per_ms);
+                continue;
+            };
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            self.buildFullBehind(arena.allocator(), j) catch |err| log.err("🧬 '{s}'/'{s}': background full failed: {} — the next due delta asks again", .{ j.tenant, j.table, err });
+            arena.deinit();
+            var buf: [512]u8 = undefined;
+            if (pairKey(&buf, j.tenant, j.table)) |key| {
+                self.cuts_lock.lock();
+                if (self.full_pending.fetchSwapRemove(key)) |kv| self.allocator.free(kv.key);
+                self.cuts_lock.unlock();
+            }
+            self.allocator.free(j.tenant);
+            self.allocator.free(j.table);
+            self.allocator.free(j.vcol);
+            self.allocator.free(j.tcol);
+        }
+        log.info("🛑 background full lane stopped", .{});
+    }
+
+    fn buildFullBehind(self: *GenerationProducer, alloc: std.mem.Allocator, j: FullJob) !void {
+        const started_ms = utils.unixMillis();
+        const cs = try self.openConns(alloc);
+        defer cs.close();
+        const pgc = cs.pgc;
+        const bkc = cs.bkc;
+        var js = cs.conn_nats.jetstream(.{});
+        const table = j.table;
+        const tenant = j.tenant;
+        const table_z = try alloc.dupeZ(u8, table);
+        const tenant_z = try alloc.dupeZ(u8, tenant);
+        const pair = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+
+        const cols_sel: []const u8 = blk: {
+            const pub_z = try alloc.dupeZ(u8, self.publication_name);
+            const params = [_]?[*:0]const u8{ pub_z.ptr, table_z.ptr };
+            const res = try queryOne(pgc, "SELECT COALESCE((SELECT string_agg(quote_ident(n), ', ' ORDER BY ord) FROM unnest(pt.attnames) WITH ORDINALITY AS u(n, ord)), '*') " ++
+                "FROM pg_publication_tables pt WHERE pt.pubname = $1 AND pt.tablename = $2 AND pt.schemaname = 'public'", &params);
+            defer c.PQclear(res);
+            break :blk if (c.PQntuples(res) > 0) try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0))) else "*";
+        };
+
+        // ── the snapshot, taken right after the pair's newest generation ──────
+        var gen_l: i64 = 0;
+        var epoch_l: []const u8 = "";
+        var shape_l: []const u8 = "";
+        var relid_l: []const u8 = "";
+        {
+            self.pairAcquire(tenant, table);
+            defer self.pairRelease(tenant, table);
+            {
+                const res = try queryOne(bkc, "SELECT gen, seed_epoch::text, COALESCE(col_shape, ''), COALESCE(relid::text, ''), " ++
+                    "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full), 0) " ++
+                    "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &pair);
+                defer c.PQclear(res);
+                if (c.PQntuples(res) == 0) return;
+                gen_l = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch return;
+                epoch_l = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 1)));
+                shape_l = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 2)));
+                relid_l = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 3)));
+                const full_now = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 4)), 10) catch 0;
+                if (full_now >= gen_l) return; // the newest generation already carries a full
+            }
+            const b = try queryOne(pgc, "BEGIN ISOLATION LEVEL REPEATABLE READ", &.{});
+            c.PQclear(b);
+            errdefer {
+                const rb = c.PQexec(pgc, "ROLLBACK");
+                c.PQclear(rb);
+            }
+            const tz = try queryOne(pgc, "SET LOCAL timezone TO 'UTC'", &.{});
+            c.PQclear(tz);
+            const set_sql = "SELECT set_config('" ++ config.Sync.tenant_setting ++ "', $1, true)";
+            const tp = [_]?[*:0]const u8{tenant_z.ptr};
+            const st = try queryOne(pgc, set_sql, &tp); // the first statement: the snapshot is taken here
+            c.PQclear(st);
+        }
+        errdefer {
+            const rb = c.PQexec(pgc, "ROLLBACK");
+            c.PQclear(rb);
+        }
+
+        // ── content, outside the gate: deltas keep cutting meanwhile ──────────
+        const shape_now: []const u8 = blk: {
+            const res = try queryOne(pgc, "SELECT COALESCE(string_agg(attname || ':' || format_type(atttypid, atttypmod), ',' ORDER BY attnum), '') " ++
+                "FROM pg_attribute WHERE attrelid = to_regclass('public.' || quote_ident($1)) AND attnum > 0 AND NOT attisdropped", &.{table_z.ptr});
+            defer c.PQclear(res);
+            break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+        };
+        if (shape_l.len > 0 and !std.mem.eql(u8, shape_l, shape_now)) {
+            log.info("🧬 '{s}'/'{s}': background full dropped — the column shape moved since g{d}; the build path owes that full", .{ tenant, table, gen_l });
+            const rb = try queryOne(pgc, "ROLLBACK", &.{});
+            c.PQclear(rb);
+            return;
+        }
+        const cutoff_l: []const u8 = blk: {
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{gen_l})).ptr };
+            const res = try queryOne(bkc, "SELECT cutoff_version::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
+            defer c.PQclear(res);
+            if (c.PQntuples(res) == 0) return;
+            break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+        };
+        const sql = if (j.tcol.len > 0)
+            try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, j.tcol })
+        else
+            try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
+        var full_rows: usize = 0;
+        var widest_row: usize = 0;
+        const t_q = utils.unixMillis();
+        const payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen_l, "full", cutoff_l, null, j.vcol, &full_rows, &widest_row) catch blk: {
+            const res = try queryOne(pgc, sql, &.{});
+            defer c.PQclear(res);
+            break :blk try encodeContent(alloc, self.allocator, res, gen_l, "full", cutoff_l, null, j.vcol, &full_rows, &widest_row);
+        };
+        defer self.allocator.free(payload);
+        const query_ms = utils.unixMillis() - t_q;
+        {
+            const res = try queryOne(pgc, "COMMIT", &.{});
+            c.PQclear(res);
+        }
+
+        // ── the dictionary: kept while it still fits, else trained (§10x, §10ea) ──
+        const t_d = utils.unixMillis();
+        var dict_bytes: ?[]u8 = null;
+        var dict_name: ?[]const u8 = null;
+        var dict_kept = false;
+        var dict_ratio: ?i64 = null;
+        {
+            const probe = try strideCorpus(alloc, payload, 128 * 1024);
+            const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
+                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &pair);
+            defer c.PQclear(res_p);
+            if (c.PQntuples(res_p) > 0 and probe.sizes.len > 0 and c.PQgetlength(res_p, 0, 3) > 0) {
+                const old = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_p, 0, 1)));
+                const baseline: ?i64 = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res_p, 0, 2)), 10) catch null;
+                const now_pct = try probeRatio(alloc, probe, old);
+                const keep = if (baseline) |bl| now_pct <= bl + 10 else blk: {
+                    const without = try probeRatio(alloc, probe, null);
+                    break :blk now_pct * 4 <= without * 3;
+                };
+                if (keep) {
+                    dict_bytes = old;
+                    dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_p, 0, 3)));
+                    dict_kept = true;
+                    dict_ratio = baseline orelse now_pct;
+                }
+            }
+            if (dict_bytes == null) if (try trainDict(alloc, payload)) |d| {
+                dict_bytes = d;
+                dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen_l });
+                dict_ratio = if (probe.sizes.len > 0) try probeRatio(alloc, probe, d) else null;
+            };
+        }
+        const train_ms = utils.unixMillis() - t_d;
+
+        // ── objects ───────────────────────────────────────────────────────────
+        const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
+        var osm = js.objectStoreManager();
+        var store = try osm.openStore(bucket);
+        defer store.deinit();
+        const t_z = utils.unixMillis();
+        const z = try compressZstd(alloc, payload, 3);
+        const zstd_ms = utils.unixMillis() - t_z;
+        const full_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen_l });
+        const t_u = utils.unixMillis();
+        {
+            var r = try store.putBytes(full_name, z);
+            r.deinit();
+        }
+        if (!dict_kept) if (dict_bytes) |d| {
+            var r = try store.putBytes(dict_name.?, d);
+            r.deinit();
+        };
+        const upload_ms = utils.unixMillis() - t_u;
+
+        // ── attach, under the gate: still the same chain? ─────────────────────
+        self.pairAcquire(tenant, table);
+        defer self.pairRelease(tenant, table);
+        const gen_l_z = try utils.allocPrintZ(alloc, "{d}", .{gen_l});
+        const newest: struct { gen: i64, epoch: []const u8, shape: []const u8, relid: []const u8, full: i64, l_exists: bool } = blk: {
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr };
+            const res = try queryOne(bkc, "SELECT gen, seed_epoch::text, COALESCE(col_shape, ''), COALESCE(relid::text, ''), " ++
+                "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full), 0), " ++
+                "EXISTS (SELECT 1 FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen=$3) " ++
+                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+            defer c.PQclear(res);
+            if (c.PQntuples(res) == 0) break :blk .{ .gen = 0, .epoch = "", .shape = "", .relid = "", .full = 0, .l_exists = false };
+            break :blk .{
+                .gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0,
+                .epoch = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 1))),
+                .shape = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 2))),
+                .relid = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 3))),
+                .full = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 4)), 10) catch 0,
+                .l_exists = c.PQgetvalue(res, 0, 5)[0] == 't',
+            };
+        };
+        const same_chain = newest.l_exists and newest.full < gen_l and std.mem.eql(u8, newest.epoch, epoch_l) and
+            std.mem.eql(u8, newest.shape, shape_l) and std.mem.eql(u8, newest.relid, relid_l);
+        if (!same_chain) {
+            log.info("🧬 '{s}'/'{s}': background full for g{d} discarded — the chain moved while it built (newest g{d}, full g{d}, g{d} kept: {})", .{ tenant, table, gen_l, newest.gen, newest.full, gen_l, newest.l_exists });
+            store.delete(full_name) catch {};
+            if (!dict_kept) if (dict_name) |dn| store.delete(dn) catch {};
+            return;
+        }
+        {
+            const dict_hex_z: ?[*:0]const u8 = if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null;
+            const dict_name_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
+            const ratio_z: ?[*:0]const u8 = if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null;
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, dict_hex_z, dict_name_z, ratio_z };
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_full = true, dict = decode($4, 'hex'), full_dict_object = $5, dict_ratio = $6::smallint " ++
+                "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
+            c.PQclear(res);
+        }
+
+        // The manifest: the newest generation's own fields as they stand, the full
+        // replaced, the deltas listed from the kept rows.
+        const keep_from = keepFrom(newest.gen, self.chain_depth, gen_l);
+        var kv = try js.kvBucket(self.topo.kv_generations);
+        defer kv.deinit();
+        const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
+        var entry = try kv.get(key);
+        defer entry.deinit();
+        const man = try std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{});
+        if (man != .object) return error.ManifestUnreadable;
+        var deltas: std.json.Array = .init(alloc);
+        {
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{keep_from})).ptr };
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), COALESCE(dict_object, '') " ++
+                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 ORDER BY gen", &params);
+            defer c.PQclear(res);
+            for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
+                const prev = std.mem.span(c.PQgetvalue(res, @intCast(i), 2));
+                if (prev.len == 0) continue;
+                const g = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), 10) catch continue;
+                var d: std.json.ObjectMap = .empty;
+                try d.put(alloc, "gen", .{ .integer = g });
+                try d.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, g }) });
+                try d.put(alloc, "prev_cutoff", .{ .string = try alloc.dupe(u8, prev) });
+                try d.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
+                const dref = std.mem.span(c.PQgetvalue(res, @intCast(i), 3));
+                if (dref.len > 0) try d.put(alloc, "dict", .{ .string = try alloc.dupe(u8, dref) });
+                try deltas.append(.{ .object = d });
+            }
+        }
+        var full_obj: std.json.ObjectMap = .empty;
+        try full_obj.put(alloc, "gen", .{ .integer = gen_l });
+        try full_obj.put(alloc, "object", .{ .string = full_name });
+        try full_obj.put(alloc, "cutoff", .{ .string = cutoff_l });
+        var root = man.object;
+        try root.put(alloc, "full", .{ .object = full_obj });
+        try root.put(alloc, "deltas", .{ .array = deltas });
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &out.writer);
+        _ = try kv.put(key, out.written(), .{});
+
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from);
+        const total_ms = utils.unixMillis() - started_ms;
+        self.recordFullBuild(tenant, table, total_ms);
+        log.info("🧬 '{s}'/'{s}': background full attached to g{d} (newest g{d}) — {d} row(s) in {d} ms: query {d}, dictionary {d}{s}, zstd {d}, upload {d}; deltas kept cutting meanwhile", .{
+            tenant, table, gen_l, newest.gen, full_rows, total_ms, query_ms, train_ms, if (dict_kept) " (kept)" else "", zstd_ms, upload_ms,
+        });
+    }
+
     /// §10ej: one pair's build with the bounded retry the post-publish check asks
     /// for: the cut fell off during the build → build again at once, three times at
     /// most. Beyond that the stream prunes faster than this pair builds — a size
@@ -1768,6 +2159,9 @@ pub const GenerationProducer = struct {
     /// Returns false when the build itself failed (the pair is unchanged in NATS);
     /// true when a generation was published, spliceable or not.
     fn buildWithRetry(self: *GenerationProducer, alloc: std.mem.Allocator, pgc: *c.PGconn, bkc: *c.PGconn, js: *nats.JetStream, table: []const u8, tenant: []const u8, vcol: []const u8, tcol: []const u8, guarded: bool, force_cut: bool) bool {
+        // §10gf: one build of a pair at a time, the full lane's snapshot and attach included.
+        self.pairAcquire(tenant, table);
+        defer self.pairRelease(tenant, table);
         var attempt: u8 = 0;
         while (attempt < 3) : (attempt += 1) {
             var fell_off = false;
@@ -1971,4 +2365,103 @@ fn hexDecode(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, hex.len / 2);
     for (out, 0..) |*b, i| b.* = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16);
     return out;
+}
+
+
+
+/// Prunes a chain's generations at or below `keep_from`: PostgreSQL rows first (the
+/// authority), then their objects, then dictionaries no remaining row names — as the
+/// delta's dictionary (`dict_object`) or as a full's (`full_dict_object`, §10gf).
+fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z: [:0]const u8, table_z: [:0]const u8, table: []const u8, keep_from: i64) !void {
+    if (keep_from <= 0) return;
+    const keep_z = try utils.allocPrintZ(alloc, "{d}", .{keep_from});
+    const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_z.ptr };
+    const res = try GenerationProducer.queryOnePub(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen <= $3 RETURNING gen, COALESCE(dict_object, ''), COALESCE(full_dict_object, '')", &params);
+    defer c.PQclear(res);
+    const pruned: usize = @intCast(c.PQntuples(res));
+    if (pruned == 0) return;
+    const ref_params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+    const still_ref = try GenerationProducer.queryOnePub(bkc, "SELECT DISTINCT d FROM (SELECT dict_object AS d FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 " ++
+        "UNION SELECT full_dict_object FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2) s WHERE d IS NOT NULL", &ref_params);
+    defer c.PQclear(still_ref);
+    const nref: usize = @intCast(c.PQntuples(still_ref));
+    for (0..pruned) |i| {
+        const g = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
+        for ([_][]const u8{ "delta", "full" }) |kind| {
+            const old_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
+            store.delete(old_name) catch |err| {
+                if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
+            };
+        }
+        const names = [_][]const u8{
+            try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g }),
+            std.mem.span(c.PQgetvalue(res, @intCast(i), 1)),
+            std.mem.span(c.PQgetvalue(res, @intCast(i), 2)),
+        };
+        for (names) |dict_old| {
+            if (dict_old.len == 0) continue;
+            var referenced = false;
+            for (0..nref) |k| {
+                if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(still_ref, @intCast(k), 0)), dict_old)) referenced = true;
+            }
+            if (!referenced) store.delete(dict_old) catch |err| {
+                if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned dictionary {s}: {}", .{ dict_old, err });
+            };
+        }
+    }
+}
+
+/// §10ge: the depth rotation's full, now or later. Pure, for the tests.
+///   * `since`: generations since the last full, this one included; `limit`: the bound;
+///   * the margin: seconds left before the stream prunes past the pair's cut, read by
+///     the edge watch `age_ms` ago (`read` false: never read);
+///   * `full_ms`: the pair's last full build (0: none seen, nothing to weigh against).
+/// It waits only on a FRESH reading (within one slow scan and two seconds) that says
+/// the margin is under three full builds plus one scan: the same weighing as the edge
+/// watch's early cut, applied to the build that costs the most.
+pub const FullDecision = enum { build, defer_full, build_at_limit };
+
+pub fn fullDecision(enabled: bool, since: i64, limit: i64, margin_s: f64, age_ms: i64, read: bool, full_ms: i64, scan_s: u64) FullDecision {
+    if (!enabled or !read or full_ms <= 0) return .build;
+    if (age_ms > @as(i64, @intCast(scan_s)) * 1000 + 2000) return .build;
+    const need_s = 3.0 * @as(f64, @floatFromInt(full_ms)) / 1000.0 + @as(f64, @floatFromInt(scan_s));
+    if (!(margin_s < need_s)) return .build;
+    return if (since >= limit) .build_at_limit else .defer_full;
+}
+
+/// §10ge: the generations kept (pruning) and listed (manifest) are those ABOVE this:
+/// the last `depth`, stretched back to keep the newest full and every delta after it.
+/// `newest_full` is this generation when it carries a full.
+pub fn keepFrom(gen: i64, depth: u32, newest_full: i64) i64 {
+    const by_depth = gen - @as(i64, depth);
+    if (newest_full <= 0) return @max(by_depth, 0);
+    return @max(@min(by_depth, newest_full - 1), 0);
+}
+
+test "fullDecision: builds unless a fresh, short margin says wait; the limit wins (§10ge)" {
+    // margin 5 s, full 2 s → need 3×2 + 5 = 11 s: defer
+    try std.testing.expectEqual(FullDecision.defer_full, fullDecision(true, 5, 23, 5.0, 1000, true, 2000, 5));
+    // same, at the limit
+    try std.testing.expectEqual(FullDecision.build_at_limit, fullDecision(true, 23, 23, 5.0, 1000, true, 2000, 5));
+    // plenty of margin
+    try std.testing.expectEqual(FullDecision.build, fullDecision(true, 5, 23, 60.0, 1000, true, 2000, 5));
+    // no pruning (infinite margin)
+    try std.testing.expectEqual(FullDecision.build, fullDecision(true, 5, 23, std.math.inf(f64), 1000, true, 2000, 5));
+    // a stale reading, never read, no full measured, or turned off
+    try std.testing.expectEqual(FullDecision.build, fullDecision(true, 5, 23, 5.0, 60_000, true, 2000, 5));
+    try std.testing.expectEqual(FullDecision.build, fullDecision(true, 5, 23, 5.0, 1000, false, 2000, 5));
+    try std.testing.expectEqual(FullDecision.build, fullDecision(true, 5, 23, 5.0, 1000, true, 0, 5));
+    try std.testing.expectEqual(FullDecision.build, fullDecision(false, 5, 23, 5.0, 1000, true, 2000, 5));
+}
+
+test "keepFrom: the last depth, stretched back to the newest full (§10ge)" {
+    // no deferral: full at gen 10, gen 12, depth 6 → keep > 6
+    try std.testing.expectEqual(@as(i64, 6), keepFrom(12, 6, 10));
+    // deferred: gen 20, last full 10 → keep > 9 (the full and every delta after it)
+    try std.testing.expectEqual(@as(i64, 9), keepFrom(20, 6, 10));
+    // this generation carries the full → the plain window
+    try std.testing.expectEqual(@as(i64, 14), keepFrom(20, 6, 20));
+    // young chains keep everything
+    try std.testing.expectEqual(@as(i64, 0), keepFrom(3, 6, 1));
+    try std.testing.expectEqual(@as(i64, 0), keepFrom(8, 6, 1));
 }

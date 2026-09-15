@@ -1311,6 +1311,8 @@ pub fn main(init: std.process.Init) !void {
             &hot,
             runtime_config.generation_workers,
         );
+        gp.defer_fulls = runtime_config.generation_defer_fulls;
+        gp.async_fulls = runtime_config.generation_async_fulls;
         try gp.start();
         gen_producer = gp;
         log.info("🧬 Generation producer thread started", .{});
@@ -2755,4 +2757,31 @@ fn reconcileCdcStreams(
         res.deinit();
         log.info("🆕 created stream {s} with {d} subject(s)", .{ topo.cdc_stream_public, wanted.items.len });
     }
+}
+
+// The producer's own tests (§10ge): a test block must reference a file for `zig build test`
+// to collect its tests. Without it, generation_producer.zig's never ran (§10ge); every
+// file with tests is listed so none is left out again.
+test {
+    _ = @import("array.zig");
+    _ = @import("batch_publisher.zig");
+    _ = @import("catalog_epoch.zig");
+    _ = @import("config.zig");
+    _ = @import("encoder.zig");
+    _ = @import("fleet_monitor.zig");
+    _ = @import("generation_producer.zig");
+    _ = @import("mutation_listener.zig");
+    _ = @import("numeric.zig");
+    _ = @import("pg_conn.zig");
+    _ = @import("pgoutput.zig");
+    _ = @import("preflight.zig");
+    _ = @import("publication.zig");
+    _ = @import("rate_limit.zig");
+    _ = @import("refused_tables.zig");
+    _ = @import("schema_mapper.zig");
+    _ = @import("spsc_queue.zig");
+    _ = @import("topology.zig");
+    _ = @import("type_registry.zig");
+    _ = @import("utils.zig");
+    _ = @import("writable_tables.zig");
 }

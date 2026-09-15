@@ -683,6 +683,10 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_object tex
 -- fresh — its own baseline. At the next full the same probe against the SAME
 -- dictionary says whether the data drifted (kept while within 10 points of it).
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_ratio smallint;
+-- §10gf: the dictionary a full on this row trained or kept — the one the deltas AFTER it
+-- compress with. A background full attaches to an existing delta row, whose own
+-- `dict_object` names the dictionary its delta was compressed with and must not change.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS full_dict_object text;
 -- Databases created before the delta milestone: same columns, idempotently.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS prev_cutoff timestamptz;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolean NOT NULL DEFAULT false;
@@ -700,9 +704,14 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS del_count bigin
 -- "the read role is physically unable to write": the generation's content query MUST
 -- run as the reader (SELECT-everywhere + `zb.tenant` RLS scoping belong to it), and
 -- the bookkeeping row MUST commit in that same transaction — so the same connection
--- writes it. The grant is INSERT + DELETE (pruning) on THIS table only; no UPDATE, so
--- history is append-only by privilege, not by convention.
+-- writes it. The grant is INSERT + DELETE (pruning) on THIS table only; no UPDATE of the
+-- history, so a cut is append-only by privilege, not by convention.
 GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER_USER};
+-- §10gf: the one column-level UPDATE — the four columns that say a generation also carries
+-- a full and which dictionary goes with it. The background full lane attaches a full to an
+-- existing generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the
+-- counts, the epoch, the shape) stays unwritable once inserted.
+GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
 
 -- keeps the tracker's own rows out of the DDL feed — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)
@@ -919,6 +928,9 @@ BEGIN
                  --   indpred IS NULL  — partial indexes carry a PG WHERE expression
                  --   indexprs IS NULL — expression indexes carry PG expressions
                  --   amname = 'btree' — gin/gist/brin have no SQLite equivalent
+                 --   not <table>_zb_version — zebridge_enable's index for the producer's
+                 --     delta query (§10gc); a replica never reads by version, and the
+                 --     index would slow its seed and every applied update (§10gd)
                  -- Anything excluded is a performance loss on the replica, never a
                  -- correctness one: an index is never the reason a row is right.
                  'indexes', COALESCE((
@@ -940,6 +952,7 @@ BEGIN
                        AND i.indpred IS NULL
                        AND i.indexprs IS NULL
                        AND am.amname = 'btree'
+                       AND ci.relname NOT LIKE '%\_zb\_version'
                  ), '[]'::jsonb),
                  -- Foreign keys, so a replica can enforce referential integrity
                  -- rather than merely resemble it (PROTOCOL §4; NOTES §10d).
@@ -1629,6 +1642,7 @@ $$ LANGUAGE plpgsql;
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, boolean, text, name, boolean);
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, text, name, boolean);
 DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, boolean, text, name, boolean);
+DROP FUNCTION IF EXISTS public.zebridge_enable(regclass, name, boolean, name[], name, name, name, boolean, boolean, text, name, boolean, boolean);
 CREATE OR REPLACE FUNCTION public.zebridge_enable(
     tbl           regclass,
     tenant_col    name    DEFAULT NULL,
@@ -1644,6 +1658,10 @@ CREATE OR REPLACE FUNCTION public.zebridge_enable(
     -- NOTES §10i/§10j). Setting this true says the operator accepts that.
     allow_physical_deletes boolean DEFAULT false,
     generations   boolean DEFAULT true,
+    -- The index on the version column that keeps a delta from scanning the table (§10gc).
+    -- On by default; false is a decision for a table of hot rows updated again and again,
+    -- where the index costs up to a fifth more WAL and every HOT update (§10gd).
+    version_index boolean DEFAULT true,
     public_reason text    DEFAULT NULL,
     -- ⚠️ No default. It used to render BRIDGE_CDC_PUBLICATION here, which made
     -- this name a SECOND source of truth against the bridge's own `--pub` —
@@ -1658,6 +1676,9 @@ CREATE OR REPLACE FUNCTION public.zebridge_enable(
 ) RETURNS TABLE (step text, status text, detail text) AS $$
 DECLARE
     bad_fks  text;
+    vcol_eff   name;
+    vcol_num   smallint;
+    vidx       text;
     short      text := (SELECT relname FROM pg_class WHERE oid = tbl);
     have_write boolean := to_regprocedure('public.zebridge_grant_edge_writes(regclass)') IS NOT NULL;
     published  boolean;
@@ -1868,6 +1889,51 @@ BEGIN
                'generation producer per tick', short,
                COALESCE(tenant_col::text, 'NULL(public)'), COALESCE(version_col::text, 'updated_at'),
                COALESCE(tombstone_col::text, '-'), COALESCE(tiebreak_col::text, '-'), generations);
+
+    -- ── the version index (§10gc): a delta must not read the whole table ──────
+    -- The generation producer selects a delta's rows `WHERE version > previous cutoff`.
+    -- Without an index that leads with the version column, that is a scan of the whole
+    -- table on every cut, however few rows moved: 587 ms on a 3M-row table where the
+    -- index answers in 0.011 ms (measured 2026-09-15). A cut that grows with the table
+    -- is what lets a pruning CDC stream slide past the chain. The index has costs, said
+    -- in the detail: its build blocks writes on the table, and an update that changes an
+    -- indexed column is no longer HOT, so every update also writes every index.
+    IF generations AND NOT version_index THEN
+        RETURN QUERY SELECT 'version index', 'skipped',
+            'version_index => false: every delta and every "did anything change" check scans the whole table, '
+            'once per tenant per tick (330 ms on 2M rows, §10gd). enable never drops an index: one built earlier stays until DROP INDEX.';
+    ELSIF generations THEN
+        vcol_eff := COALESCE(version_col, 'updated_at');
+        SELECT attnum INTO vcol_num FROM pg_attribute
+         WHERE attrelid = tbl AND attname = vcol_eff AND attnum > 0 AND NOT attisdropped;
+        IF vcol_num IS NULL THEN
+            RETURN QUERY SELECT 'version index', 'skipped',
+                format('%s has no column %I — the producer cuts fulls only for it', tbl, vcol_eff);
+        ELSE
+            SELECT i.indexrelid::regclass::text INTO vidx FROM pg_index i
+             WHERE i.indrelid = tbl AND i.indkey[0] = vcol_num
+             ORDER BY i.indnatts LIMIT 1;
+            IF vidx IS NOT NULL THEN
+                RETURN QUERY SELECT 'version index', 'already',
+                    format('%s leads with %I — deltas read only the rows since the last cut.%s', vidx, vcol_eff,
+                           CASE WHEN vidx LIKE '%\_zb\_version' THEN ''
+                                ELSE ' Its name does not end in _zb_version, so clients receive it and build it too.' END);
+            ELSE
+                IF NOT dry_run THEN
+                    EXECUTE format('CREATE INDEX %I ON %s (%I)', left(short, 48) || '_zb_version', tbl, vcol_eff);
+                END IF;
+                RETURN QUERY SELECT 'version index', verb,
+                    format('CREATE INDEX %I ON %s (%I) — a delta then reads the rows since the last cut instead '
+                           'of the whole table. Costs: the build blocks writes on the table (on a large live table, '
+                           'run CREATE INDEX CONCURRENTLY %I ON %s (%I) first and this step finds it), and updates that '
+                           'change %I are no longer HOT, so each update also writes every index. Clients do not '
+                           'receive this index: they never read by version.',
+                           left(short, 48) || '_zb_version', tbl, vcol_eff, left(short, 48) || '_zb_version', tbl, vcol_eff, vcol_eff);
+            END IF;
+        END IF;
+    ELSE
+        RETURN QUERY SELECT 'version index', 'skipped', 'generations => false: no chain is cut for this table';
+    END IF;
 
     -- ── the column list (§10ff): index-like types never travel ────────────────
     -- A tsvector, tsquery, xml or range column is an index representation of other

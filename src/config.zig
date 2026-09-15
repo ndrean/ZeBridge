@@ -655,6 +655,10 @@ pub const Generations = struct {
     /// Generations kept per (tenant, table) — the delta chain depth k. Coupled to the
     /// sweeper by the correctness inequality: sweeper retention ≥ k × cadence.
     pub const default_chain_depth: u32 = 6;
+    /// §10ge: a full owed only to the depth rotation waits while its pair's stream is
+    /// short of time, but no longer than `depth × full_defer_factor` generations after
+    /// the last full: the chain a returning client applies stays bounded.
+    pub const full_defer_factor: u32 = 4;
     /// §10ev: builders per tick. One is the sequential producer; more build pairs in
     /// parallel, each on its own connections — a tick then lasts as long as its
     /// longest build. Memory follows: every builder holds one build's rows.
@@ -701,6 +705,12 @@ pub const RuntimeConfig = struct {
     generation_cadence_seconds: u64 = Generations.default_cadence_seconds,
     generation_chain_depth: u32 = Generations.default_chain_depth,
     generation_workers: u32 = Generations.default_workers,
+    /// §10ge: GENERATION_DEFER_FULLS (default on) — defer the depth rotation's full
+    /// while the stream's time margin is under three of that pair's full builds.
+    generation_defer_fulls: bool = true,
+    /// §10gf: GENERATION_ASYNC_FULLS (default on) — build the depth rotation's full in
+    /// a background lane while deltas keep cutting, and attach it behind them.
+    generation_async_fulls: bool = true,
     /// §10fk: the mutation ingress rate limit, writes per second per principal (and
     /// per tenant); 0 is off. `mutation_rate_burst` is the bucket's size — what a
     /// client may send at once after a quiet spell; 0 means one second's worth.

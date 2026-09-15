@@ -18,10 +18,14 @@ Per run:
     and the object size — the large-message side, where TLS costs most, and the one that
     must stay faster than events arrive or clients fall off the stream.
 
+§10ge: `--runs tls:off,tls:on` chooses each run's transport and whether bench_users keeps
+the version index zebridge_enable builds (§10gc), and each run reports the WAL the load
+wrote — the index adds WAL the walsender must read even though decoding skips it.
+
 Needs nats-server, the nats CLI, envsubst, psql, a ReleaseFast bridge, `.env.admin` and
 `.env.bridge` sourced (for the role URLs and the template variables).
 """
-import os, pathlib, re, shutil, subprocess, sys, tempfile, time, urllib.request, importlib.util
+import json, os, pathlib, re, shutil, subprocess, sys, tempfile, time, urllib.request, importlib.util
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BRIDGE = ROOT / "zig-out" / "bin" / "bridge"
@@ -60,6 +64,26 @@ def published() -> int:
             return int(m.group(1)) if m else -1
     except Exception:
         return -1
+
+
+def keep_awake():
+    """§10ge: macOS idle sleep froze three benchmark runs mid-load (pmset log: sleep at
+    14:54:04, wake 14:57:39, inside a firehose run). PostgreSQL's pacing follows the wall
+    clock while the harness's monotonic clock stops, so a slept run looks like a short
+    load that then bursts. `caffeinate -i -w <this pid>` holds the machine awake for as
+    long as the harness lives. No-op where caffeinate does not exist."""
+    if shutil.which("caffeinate"):
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+class SleepWatch:
+    """Wall time against monotonic time over a run: on macOS the monotonic clock stops
+    while the system sleeps, so a gap between the two is time the machine was asleep."""
+    def __init__(self):
+        self.wall, self.mono = time.time(), time.monotonic()
+
+    def slept_s(self) -> float:
+        return (time.time() - self.wall) - (time.monotonic() - self.mono)
 
 
 def setup_database():
@@ -118,14 +142,19 @@ def start_nats(tmp: pathlib.Path, tls: bool, allow_non_tls: bool = False) -> tup
     return proc, url, cli
 
 
-def run(tmp: pathlib.Path, tls: bool) -> dict:
-    name = "TLS" if tls else "plain"
+def run(tmp: pathlib.Path, tls: bool, index: bool | None = None) -> dict:
+    name = ("TLS" if tls else "plain") + ("" if index is None else (" + index" if index else " no index"))
     psql("TRUNCATE public.bench_users")
+    if index is True:
+        psql("CREATE INDEX IF NOT EXISTS bench_users_zb_version ON public.bench_users (updated_at)")
+    elif index is False:
+        psql("DROP INDEX IF EXISTS public.bench_users_zb_version")
     # The producer's bookkeeping lives in PostgreSQL: left from the previous run it says
     # the chains are already cut, and the fresh nats-server would get only deltas.
     psql("DELETE FROM public.zebridge_generations")
     psql(f"SELECT pg_drop_replication_slot('{SLOT}') FROM pg_replication_slots WHERE slot_name = '{SLOT}'", db=None, stop=False)
-    nats_proc, url, _ = start_nats(tmp, tls)
+    run_dir = pathlib.Path(tempfile.mkdtemp(prefix=re.sub(r"[^a-z0-9]+", "-", name.lower()) + "-", dir=tmp))
+    nats_proc, url, _ = start_nats(run_dir, tls)
     env = {k: v for k, v in os.environ.items() if k not in ("NATS_BRIDGE_NKEY_SEED", "NATS_CREDS", "ZB_SIGNING_SEED", "NATS_TLS_CA")}
     env.update({
         "DATABASE_READER_URL": db_url(os.environ["DATABASE_READER_URL"], DB),
@@ -135,7 +164,7 @@ def run(tmp: pathlib.Path, tls: bool) -> dict:
     })
     if tls:
         env["NATS_TLS_CA"] = str(CERTS / "ca.pem")
-    log = tmp / f"bridge-{name}.log"
+    log = run_dir / "bridge.log"
     bridge = subprocess.Popen([str(BRIDGE), "--pub", PUB, "--slot", SLOT, "--port", str(HTTP_PORT)],
                               env=env, stdout=log.open("w"), stderr=subprocess.STDOUT)
     try:
@@ -153,7 +182,9 @@ def run(tmp: pathlib.Path, tls: bool) -> dict:
             f"INSERT INTO public.bench_users (name,email,inserted_at,updated_at) "
             f"SELECT 'User-{i}-'||i2, 'u{i}-'||i2||'@example.com', now(), now() FROM generate_series(1,{PER}) i2;"
             for i in range(STATEMENTS)))
+        watch = SleepWatch()
         b0, n0 = cpu_seconds(bridge.pid), cpu_seconds(nats_proc.pid)
+        lsn0 = psql("SELECT pg_current_wal_lsn()").stdout.strip()
         t_load = time.perf_counter()
         loader = subprocess.Popen([PSQL, db_url(ADMIN_URL, DB), "-q", "-f", str(load)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         t_first = t_last = None
@@ -169,6 +200,7 @@ def run(tmp: pathlib.Path, tls: bool) -> dict:
             time.sleep(0.25)
         loader.wait()
         load_s = time.perf_counter() - t_load
+        wal = int(psql(f"SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{lsn0}')").stdout.strip())
         b1, n1 = cpu_seconds(bridge.pid), cpu_seconds(nats_proc.pid)
         if t_last is None:
             sys.exit(f"{name}: only {published() - base} of {TOTAL} events published within 15 min")
@@ -198,7 +230,7 @@ def run(tmp: pathlib.Path, tls: bool) -> dict:
             time.sleep(1)
         loop = [l for l in log.read_text(errors="replace").splitlines() if "LOOP " in l][-3:]
         return {"name": name, "rate": TOTAL / (t_last - t_first), "drain_s": t_last - t_first, "load_s": load_s,
-                "bridge_cpu": b1 - b0, "nats_cpu": n1 - n0, "full": full, "loop": loop, "log": str(log)}
+                "bridge_cpu": b1 - b0, "nats_cpu": n1 - n0, "full": full, "loop": loop, "log": str(log), "wal": wal, "slept_s": watch.slept_s()}
     finally:
         bridge.terminate()
         try: bridge.wait(timeout=20)
@@ -215,20 +247,29 @@ def main() -> int:
             sys.exit(f"{tool} not on PATH")
     if not BRIDGE.exists():
         sys.exit("build the bridge first: zig build -Doptimize=ReleaseFast")
+    keep_awake()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="zb_burst_tls_"))
     keep = os.environ.get("ZB_KEEP")
     try:
         setup_database()
-        results = [run(tmp, tls=False), run(tmp, tls=True)]
+        runs = next((a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--runs=")), None)
+        if runs:
+            results = []
+            for spec in runs.split(","):
+                transport, _, ix = spec.partition(":")
+                results.append(run(tmp, tls=(transport == "tls"), index=(ix == "on") if ix else None))
+                print("RESULT " + json.dumps(results[-1]), flush=True)
+        else:
+            results = [run(tmp, tls=False), run(tmp, tls=True)]
         print(f"\n{TOTAL:,} rows, {STATEMENTS} transactions of {PER}")
-        print(f"{'':6} {'events/s':>10} {'drain':>8} {'bridge CPU':>11} {'NATS CPU':>9} | {'full chain':>10} {'upload':>9} {'object':>9}")
+        print(f"{'':16} {'events/s':>10} {'drain':>8} {'bridge CPU':>11} {'NATS CPU':>9} {'WAL':>9} | {'full chain':>10} {'upload':>9} {'object':>9}")
         for r in results:
             f = r["full"] or {}
             obj = f"{f['bytes'] / 1e6:.1f} MB" if f.get("bytes") else "?"
-            print(f"{r['name']:6} {r['rate']:>10,.0f} {r['drain_s']:>7.1f}s {r['bridge_cpu']:>10.1f}s {r['nats_cpu']:>8.1f}s | "
+            print(f"{r['name']:16} {r['rate']:>10,.0f} {r['drain_s']:>7.1f}s {r['bridge_cpu']:>10.1f}s {r['nats_cpu']:>8.1f}s {r['wal'] / 2**20:>6.0f} MB | "
                   f"{(str(f.get('build_ms')) + ' ms') if f else 'not seen':>10} {(str(f.get('upload_ms')) + ' ms') if f else '':>9} {obj:>9}")
-        p, t = results
-        print(f"TLS/plain: rate x{t['rate'] / p['rate']:.2f}, bridge CPU x{t['bridge_cpu'] / max(p['bridge_cpu'], 0.01):.2f}, "
+        p, t = results[0], results[-1]
+        if not runs: print(f"TLS/plain: rate x{t['rate'] / p['rate']:.2f}, bridge CPU x{t['bridge_cpu'] / max(p['bridge_cpu'], 0.01):.2f}, "
               f"NATS CPU x{t['nats_cpu'] / max(p['nats_cpu'], 0.01):.2f}"
               + (f", chain upload x{t['full']['upload_ms'] / max(p['full']['upload_ms'], 1):.2f}" if p["full"] and t["full"] else ""))
         for r in results:

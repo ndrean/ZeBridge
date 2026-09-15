@@ -12,8 +12,8 @@ contract is more than a shape:
   3. **the reader can run the build recipe** — LSN read BEFORE the REPEATABLE READ
      snapshot, content query and bookkeeping INSERT in that same transaction, on the
      read role's single deliberate write grant;
-  4. **append-only by privilege** — the reader holds INSERT+DELETE (pruning) but no
-     UPDATE: history cannot be rewritten, only extended and pruned;
+  4. **append-only by privilege** — the reader holds INSERT+DELETE (pruning) and UPDATE
+     of only the four columns that attach a full (§10gf): a cut cannot be rewritten;
   5. **the writer mirrors the reader's bookkeeping grant, append-only too** — when
      DATABASE_READER_URL is a hot standby the bridge records generations over the
      writer (NOTES §10cz, `443ce17`), so the writer may INSERT; it may not UPDATE

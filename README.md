@@ -56,7 +56,7 @@ The `TS` library uses a push model for reactivity whilst the Zig C ABI library u
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
 
-* **SELECTance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-150.000 req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
+* **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-150.000 req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
 The consumer's local database ingress/egress for events depends a lot upon your device. Values around 15 +/- 5 k evt/s can be reached.
 The client library can seed at rates around 150-200.000 rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
@@ -87,7 +87,7 @@ Any change in the buffer, for special live migrations that could enable larger t
 
 Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`, consuming around 150MB.
 
-**Observability**: production-ready out of the box. It exposes standard Prometheus metrics for SELECTance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
+**Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
 
 See the detailed file [TELEMETRY.md](#telemetry.md)
 
@@ -392,7 +392,7 @@ Tables are either read-only or writable with a LWW conflict resolution policy.
 
 (1) _in a writable table, a client mints its own keys offline, so a writable table's key must be **client-generable** — a `uuid-v7` (time-ordered), NOT a `bigserial` that the database hands out (an edge write to a sequence key would collide with the server's next insert, so the bridge refuses it)_.
 
-(2) _without a PK, the replica doesn't know which row to apply a mutation from the backend and we use `REPLICA IDENTITY DEFAULT` for SELECTance_.
+(2) _without a PK, the replica doesn't know which row to apply a mutation from the backend and we use `REPLICA IDENTITY DEFAULT` for performance_.
 
 For example:
 
@@ -1712,7 +1712,7 @@ ZeBridge runs in three contexts:
 
 * **the test suite** runs Postgres and NATS natively on the host — fast to iterate, and driven by the test scenarios. For development only.
 * **the docker compose evaluation** — trying ZeBridge out — is best as a `docker compose` stack: all the infrastructure in one code file, Postgres, NATS, NATS-exporter, Prometheus, Grafana, bridge_sweeper, ZeBridge and the reverse proxy HAProxy.
-* **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for SELECTance, the bridge should sit to the `nats-server` and communicate by _plain text_, over TCP.
+* **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for performance, the bridge should sit to the `nats-server` and communicate by _plain text_, over TCP.
 
 For example, when all three run on host, during a spike (800 k writes/s), CPU usage is largely dominated by Postgres with around 70% of the host CPU, delivering 300 kCDC/s whilst ZeBridge uses ~20-25% and NATS ~5-10%.
 
@@ -1947,6 +1947,7 @@ Depending on the size of the published tables you wish to track, the maximum row
 
 **CDC**: The `RING_BUFFER_COUNT` is designed to buffer the received events during potential NATS jitters or outages. Its count depends naturally upon the emitting rate.
 The `BASE_BUF` is the max payload size, capped at 1MB.
+  | version index | would | CREATE INDEX users_zb_version ON users (updated_at) — a delta then reads the rows since the last cut instead of the whole table. Costs: the build blocks writes on the table (on a large live table, run CREATE INDEX CONCURRENTLY on updated_at first and this step finds it), and updates that change updated_at are no longer HOT, so each update also writes every index. |
 The `MAX_COLUMNS` is the maximum number of possible columns per table. Unset (the normal case), it is **auto-detected at boot** from the widest table in the publication, rounded up for migration headroom — not a fixed compile-time guess. Set it explicitly only to override that.
 
 ➡ It caps the event size, suspends a table and drives the total memory used.
@@ -2069,7 +2070,9 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 | variable | default | what it sets |
 | --- | --- | --- |
 | `GENERATION_CADENCE_SECONDS` | 600 (300 in `.env.bridge`) | how often the producer cuts a generation |
-| `GENERATION_CHAIN_DEPTH` | 6 | generations kept per table and tenant; a full at least every depth |
+| `GENERATION_CHAIN_DEPTH` | 6 | generations kept per table and tenant; a full at least every depth, unless deferred |
+| `GENERATION_ASYNC_FULLS` | true | the routine full (every depth) is built in the background while deltas keep being cut, then attached behind them; fulls a correctness rule asks for stay with their delta |
+| `GENERATION_DEFER_FULLS` | true | while a stream has less time left than three builds of a table's full, that full waits and deltas continue; at 4 × depth generations it is built anyway |
 | `GENERATION_WORKERS` | 1 | builders for the early cuts of bursting streams; more re-cut those pairs in parallel, each on its own connections, so a round lasts as long as its longest build. The cadence tick builds in turn whatever this says. Memory: workers × the biggest full's MessagePack size |
 | `MUTATION_BACKLOG_PER_PRINCIPAL` | 5000 | **a variable of the NATS setup, not of the bridge** (`scripts/native/up.sh` for the native stack, the `nats-init` service in `docker-compose.full.yml` for Docker): the MUTATIONS stream's `max_msgs_per_subject` with `discard new per subject` and workqueue retention. The subject carries the principal, so this is how many writes one principal may have queued before its publishes are refused at the door; nobody else notices. The bridge never edits the stream (NATS policy is the deployment's); `zbdoctor` checks the stream against the rate the bridge declares on `/status` |
 | `MUTATION_RATE_PER_PRINCIPAL` | 0 (off) | writes per second one principal, and one tenant, may send. Beyond it a write is NAK'd with the delay of its place in the queue and redelivered by JetStream when its turn comes: a flood is served at the rate, other tenants' writes are answered as if it were not there, nothing is dropped. `MUTATION_RATE_BURST` (default: one second's worth) is what a quiet client may send at once |

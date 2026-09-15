@@ -213,3 +213,169 @@ client's link is the sound default. Its cost is CPU on nats-server, which grows 
 number of connected clients, so that is the margin to watch on a VPS; the event rate and
 the chain's safety do not depend on the choice of link, the chain's safety depends on the
 stream cap.
+
+## The version index: what it costs the writes, what it saves the chain (2026-09-15)
+
+`zebridge_enable` builds `<table>_zb_version`, a B-tree on the version column, so the
+generation producer reads only the rows changed since its last cut. The index is not
+sent to clients. Two benchmarks, both on the Mac (10 cores, 16 GB), both manual.
+
+### 1. PostgreSQL alone — `scripts/scenarios/version_index.py`
+
+A scratch PostgreSQL 18 cluster of its own (wal_level logical, shared_buffers 128 MB),
+so its WAL cannot touch another cluster's slots. A table of 2,000,000 rows with a primary
+key and `(tenant_id, id)`, the read policy enable installs, and three variants: no version
+index, a B-tree, a BRIN. Three write loads, each 2,000,000 updates in statements of 10,000.
+Two runs per variant, interleaved; the two runs agree.
+
+```sh
+scripts/scenarios/.venv/bin/python scripts/scenarios/version_index.py --rows 2000000 --runs 2
+```
+
+| write load | no index | B-tree | BRIN |
+| --- | --- | --- | --- |
+| firehose (insert 10k, update the previous 10k), seconds | 14.1–14.7 | 16.0 | 14.2–14.4 |
+| firehose, WAL | 1,479 MB | 1,730–1,736 MB | 1,481–1,483 MB |
+| scattered (each row once), seconds | 12.8–18.3 | 13.1–15.0 | 12.1–13.0 |
+| scattered, WAL | 1,435 MB | 1,560 MB | 1,425–1,435 MB |
+| repeat (same 10k rows 200 times), seconds | 6.9–7.0 | 8.7–9.5 | 6.8–6.9 |
+| repeat, WAL | 765 MB | 926 MB | 765 MB |
+| repeat, updates kept HOT | 10 % | 0 % | 10 % |
+| indexes on disk after | 362 MB | 425 MB | 362 MB |
+
+| read, as the producer runs it | no index | B-tree | BRIN |
+| --- | --- | --- | --- |
+| "did anything change", nothing did | 329–332 ms | 0.013 ms | 302–308 ms |
+| delta of 10,000 rows | 139–142 ms | 4.2–4.3 ms | 288–290 ms |
+| delta of 100,000 rows | 143–145 ms | 23–24 ms | 180 ms |
+
+### 2. The chain over TLS — `scripts/scenarios/firehose_tls.py --runs`
+
+The bridge speaks TLS to its own nats-server. CDC stream cap 64 MiB, cadence 60 s, 180 s
+of load, the index dropped or kept before the bridge boots. The firehose ran four times,
+in the order with, without, without, with.
+
+```sh
+python scripts/scenarios/firehose_tls.py --seconds 180 --rate 10000 --cap-mib 64 --runs tls:on,tls:off,tls:off,tls:on
+python scripts/scenarios/firehose_tls.py --seconds 180 --rate 10000 --cap-mib 64 --preload 2000000 --runs tls:off,tls:on
+python scripts/scenarios/firehose_tls.py --seconds 180 --rate 500   --cap-mib 64 --preload 2000000 --runs tls:off,tls:on
+```
+
+| load | index | delta query ms, median | delta build ms, median | full-carrying build ms, median | cuts (early) | smallest margin, holes |
+| --- | --- | --- | --- | --- | --- | --- |
+| firehose 10k/s | no | 131, 128 | 240, 237 | 1,771, 1,886 | 35 (32), 34 (31) | 64, 0 |
+| firehose 10k/s | yes | 102, 99 | 208, 195 | 1,957, 1,963 | 34 (31), 34 (31) | 64, 0 |
+| 2M static rows + firehose | no | 192 | 362 | 4,811 | 31 (28) | −76, 7 samples |
+| 2M static rows + firehose | yes | 99 | 253 | 4,637 | 31 (28) | −30, 3 samples |
+| 2M static rows + 500/s | no | 91 | 170 | 2,859 (the first full) | 4 (0) | 360, 0 |
+| 2M static rows + 500/s | yes | 35 | 87 | 2,788 (the first full) | 4 (0) | 360, 0 |
+
+**What it says.** The index makes every delta cheaper, by about a quarter when each delta
+carries 100,000 rows and by half or more when the table is large next to its changes. It
+makes the idle check almost free: without it, every tick scans the whole table once per
+tenant. It does not make a full cheaper, and fulls set the edge: in the firehose the cuts,
+the margins and the holes were the same with and without it. With 2M static rows both runs
+met holes at 64 MiB; one pair, so "fewer holes" is not proven. The price is on the writes:
+up to a fifth more WAL and a third more time when the same rows are updated again and
+again, and no HOT update on the table. BRIN costs the writes nothing but reads worse than
+no index here, because updated rows lose the link between position and time.
+
+**Harness notes.** Two early runs had a load that ended far before 180 s (98 s and 15 s)
+and did not reproduce; they are left out. The harness now prints each run's result as
+soon as it ends, and the load's error lines.
+
+## The burst with the version index, over TLS (2026-09-15)
+
+`burst_tls.py --runs=tls:on,tls:off,tls:off,tls:on`: the 2M-row burst, the bridge on TLS,
+`bench_users` with and without `bench_users_zb_version`, in that order.
+
+| run | events/s | PostgreSQL load | drain | WAL | full chain build / upload |
+| --- | --- | --- | --- | --- | --- |
+| index | 192,666 | 10.6 s | 10.4 s | 656 MB | 2,640 ms / 244 ms |
+| no index | 219,564 | 9.4 s | 9.1 s | 449 MB | 2,749 ms / 241 ms |
+| no index | 207,597 | 9.9 s | 9.6 s | 443 MB | 2,678 ms / 296 ms |
+| index | 192,874 | 10.6 s | 10.4 s | 563 MB | 2,755 ms / 237 ms |
+
+**What it says.** The drain equals PostgreSQL's own load time in every run, within 0.3 s:
+the bridge publishes each transaction as it commits and its loop is idle more than a third
+of the time. The burst rate is PostgreSQL's insert rate on this Mac, not the bridge's
+ceiling. The index slows the inserts by about 8 % (27–46 % more WAL), and the event rate
+follows. Publish the rate as "what the bridge kept up with", not as its limit.
+
+## Deferring the depth rotation's full (2026-09-15)
+
+`firehose_tls.py --preload 2000000 --runs tls:on:nodefer,tls:on:defer,...`: 2M static
+rows, then 10,000 rows a second inserted and the previous second's updated, 180 s, CDC
+cap 64 MiB, TLS, the version index on. `GENERATION_DEFER_FULLS` off or on.
+
+| deferral | fulls after the boot full | fulls deferred | holes (samples) | smallest margin | bridge CPU |
+| --- | --- | --- | --- | --- | --- |
+| off | 5 | 0 | 6 of 133 | −76 | 42 s |
+| on | 2 | 18, one built at the limit | 2 of 133 | −29 | 31 s |
+| off | 6 | 0 | 8 of 134 | −122 | 47 s |
+| on | 2 | 18, one built at the limit | 2 of 133 | −25 | 32 s |
+| off | 6 | 0 | 7 of 134 | −77 | 46 s |
+| on (log kept) | 2 | 18, one built at the limit | 4 of 133 | — | — |
+
+**What it says.** Deferral cuts the holes by about 70 % and the bridge's CPU by about 30 %.
+The kept log places every remaining hole inside a full's build: g6, the first rotation,
+before the stream pruned (nothing to defer yet), and g29, the full the limit forced after
+23 deferred generations, built in 5.2 s with 2.8 s of margin. A full that takes 5 s cannot
+fit a stream holding about 8 s of history; no scheduling fixes that, only the cap does:
+cap ≥ peak MB/s × 3 × the longest full build.
+
+**Discarded runs.** Three runs across the day had loads that ended early (98 s, 15 s,
+83 s). `pmset -g log` places a system sleep inside each: macOS froze the benchmark, the
+wall clock PostgreSQL paces on kept running, and the load burst on wake. The harnesses now
+hold `caffeinate -i` and mark a run INVALID when wall and monotonic time drift apart.
+
+## The routine full in the background (2026-09-15)
+
+`firehose_tls.py --preload 2000000 --verify --runs tls:on:defer:async,tls:on:defer:sync,tls:on:defer:sync,tls:on:defer:async`:
+2M static rows, then 10,000 rows a second inserted and the previous second's updated,
+180 s, CDC cap 64 MiB, TLS, version index on, deferral on. `sync` builds every full with
+its delta (as before); `async` builds the routine full in the background lane.
+`--verify` then seeds from the published chain in Python, the clients' plan rule, and
+compares every row with PostgreSQL.
+
+| run | fulls | full builds | holes (samples) | smallest margin | bridge CPU | chain check |
+| --- | --- | --- | --- | --- | --- | --- |
+| async | 2 in the background | 3,678 and 4,836 ms | 0 of 133 | 131 | 32 s | 3,800,000 rows, 0 missing, 0 extra, 0 wrong |
+| sync | 2 with their delta | 3,849 and 5,074 ms | 3 of 133 | −77 | 30 s | same |
+| sync | 2 with their delta | 3,769 and 5,074 ms | 3 of 133 | −77 | 31 s | same |
+| async | 2 in the background | 3,527 and 4,949 ms | 0 of 133 | 132 | 31 s | same |
+
+**What it says.** The same fulls, taking the same time, stop making holes once they no
+longer hold the cut: 3 holes in each synchronous run, none in either background run, and
+the smallest margin goes from 77 messages short to 131 to spare. CPU is unchanged. Every
+chain, both ways, seeds to exactly PostgreSQL's rows and survives replaying all its deltas.
+
+## 50,000 events a second for 5 minutes (2026-09-15)
+
+```sh
+python scripts/scenarios/firehose_tls.py --seconds 300 --rate 25000 --cap-mib 128 --preload 2000000 --runs tls:on:defer:async
+```
+
+2M static rows, then 25,000 rows a second inserted and the previous second's 25,000
+updated; CDC cap 128 MiB (about 6 s of events at this rate), TLS, version index, full
+deferral and background fulls on. One run, on the Mac.
+
+| measure | value |
+| --- | --- |
+| events published during the load | 14,949,793 in 304 s, 49,208/s |
+| PostgreSQL pacing | 304 s for a 300 s load: it kept up |
+| WAL written | 17.3 GiB |
+| slot lag (WAL not yet confirmed) | median 8 MiB, max 120 MiB |
+| holes | 0 of 254 samples; smallest margin 166 messages |
+| cuts | 77 deltas (73 early), median 225,000 rows, build median 595 ms, max 3,596 ms |
+| background fulls | 4, of 3.9M, 5.6M, 7.5M and 9.3M rows: 5.4, 8.6, 10.7 and 13.3 s; deltas cut during each |
+| bridge CPU / nats-server CPU | 137 s / 33 s over 304 s |
+| bridge memory (RSS) | median 2,530 MiB, max 4,211 MiB |
+
+**What it says.** The bridge keeps up at 50,000 events a second: the slot lag stays at a
+few megabytes, so PostgreSQL holds almost none of the 17 GiB it writes. The chain holds:
+no hole, with fulls up to 13 s long, because they no longer hold the cut. The limit found
+is memory: a full is encoded whole before it is compressed and uploaded, about 200 bytes a
+row raw (the 2M-row full was 403.6 MB raw, 65 MB compressed), so a 9.3M-row full is about
+1.9 GB of rows in the bridge, and the peak reached 4.2 GB. On a VPS with 4 GB of memory
+this run would have failed at its third or fourth full.

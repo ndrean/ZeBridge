@@ -16,7 +16,13 @@ a scratch database rendered from the templates:
   3. a nullable tenant column is refused up front, with nothing applied;
   4. a table with no tenant, no public reason and no write grant is still refused;
   5. a writable tenant table still enables with its guards and write scoping;
-  6. a public read-only table still enables.
+  6. a public read-only table still enables;
+  7. enable builds an index that leads with the version column (NOTES §10gc), and the
+     dry run of check 2 built none;
+  8. an index that already leads with the version column is reused, not duplicated;
+  9. the schema a DDL publishes lists the table's other indexes but not <table>_zb_version:
+     clients never read by version (§10gd);
+ 10. version_index => false builds no index and says the step was skipped.
 
 Needs `envsubst`, psql, the template variables (`.env.admin`, `.env.bridge`) and
 ADMIN_DATABASE_URL (default the local postgres superuser).
@@ -98,6 +104,9 @@ async def main():
             CREATE TABLE public.ro_bare   (uid uuid PRIMARY KEY, v int, updated_at timestamptz NOT NULL);
             CREATE TABLE public.rw_tenant (uid uuid PRIMARY KEY, tenant_id text NOT NULL, v int, updated_at timestamptz NOT NULL, deleted_at timestamptz);
             CREATE TABLE public.ro_public (uid uuid PRIMARY KEY, v int, updated_at timestamptz NOT NULL);
+            CREATE TABLE public.ro_indexed (uid uuid PRIMARY KEY, tenant_id text NOT NULL, v int, updated_at timestamptz NOT NULL);
+            CREATE INDEX ro_indexed_mine ON public.ro_indexed (updated_at, uid);
+            CREATE TABLE public.ro_optout (uid uuid PRIMARY KEY, tenant_id text NOT NULL, v int, updated_at timestamptz NOT NULL);
         """)
 
         # 1. read-only tenant table
@@ -142,6 +151,42 @@ async def main():
         rows = enable("ro_public", f"public_reason => 'scenario: readable by every consumer', publication => '{PUB}', dry_run => false")
         errors = [r for r in rows if r[1] in ("ERROR", "EXCEPTION")]
         check("6. a public read-only table still enables", not errors and published("ro_public"), f"errors={errors}")
+
+        # 7. the version index
+        def version_indexes(table: str) -> list[str]:
+            out = sql(f"""SELECT i.indexrelid::regclass FROM pg_index i
+                           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+                          WHERE i.indrelid = 'public.{table}'::regclass AND a.attname = 'updated_at'""").stdout
+            return [l for l in out.splitlines() if l]
+        check("7. enable built the version index; the dry run built none",
+              version_indexes("ro_tenant") == ["ro_tenant_zb_version"] and version_indexes("rw_tenant") == ["rw_tenant_zb_version"]
+              and version_indexes("ro_dry") == [],
+              f"ro_tenant={version_indexes('ro_tenant')} rw_tenant={version_indexes('rw_tenant')} ro_dry={version_indexes('ro_dry')}")
+
+        # 8. an existing index is reused
+        rows = enable("ro_indexed", f"tenant_col => 'tenant_id', publication => '{PUB}', dry_run => false")
+        step = [r for r in rows if r[0] == "version index"]
+        check("8. an index already leading with the version column is reported and not duplicated",
+              step and step[0][1] == "already" and "ro_indexed_mine" in step[0][2]
+              and version_indexes("ro_indexed") == ["ro_indexed_mine"],
+              f"step={step} indexes={version_indexes('ro_indexed')}")
+
+        # 9. the schema sent to clients leaves the version index out
+        sql("CREATE INDEX ro_tenant_by_v ON public.ro_tenant (v); ALTER TABLE public.ro_tenant ADD COLUMN extra int")
+        names = sql("""SELECT string_agg(ix->>'name', ',' ORDER BY ix->>'name') FROM (
+                          SELECT schema_def FROM public.zebridge_ddl_events WHERE table_name = 'ro_tenant'
+                          ORDER BY id DESC LIMIT 1) e, jsonb_array_elements(e.schema_def->'indexes') ix""").stdout.strip()
+        check("9. the published schema lists ro_tenant_by_v and not ro_tenant_zb_version",
+              "ro_tenant_by_v" in names.split(",") and "ro_tenant_zb_version" not in names.split(","),
+              f"indexes published: {names!r}")
+
+        # 10. the opt-out
+        rows = enable("ro_optout", f"tenant_col => 'tenant_id', version_index => false, publication => '{PUB}', dry_run => false")
+        step = [r for r in rows if r[0] == "version index"]
+        errors = [r for r in rows if r[1] in ("ERROR", "EXCEPTION")]
+        check("10. version_index => false: enabled, step skipped, no index built",
+              not errors and step and step[0][1] == "skipped" and version_indexes("ro_optout") == [] and published("ro_optout"),
+              f"errors={errors} step={step} indexes={version_indexes('ro_optout')}")
     finally:
         sql(f"DROP DATABASE IF EXISTS {SCRATCH}", db=None, stop=False)
     return 1 if failed else 0

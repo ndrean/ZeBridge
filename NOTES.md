@@ -12694,3 +12694,227 @@ the client gives up. nats-server behind a TLS-terminating proxy needs its TLS bl
 `allow_non_tls: true`: it then advertises TLS while accepting the proxy's and the bridge's
 plain connections. Listening on localhost only keeps that safe. Whether nats.zig's
 `handshake_first` makes the same check was not tested.
+
+## 10gc. zebridge_enable builds the version index (2026-09-15)
+
+**Why.** The producer reads a delta as `WHERE version > previous cutoff − margin`. Without an
+index that leads with the version column, that is a scan of the whole table on every cut,
+however few rows moved. Measured on the dev `test_types` (3M rows): 587 ms without, 0.011 ms
+with an index on `updated_at`. A delta that grows with the table eats the time a full needs
+to finish before the CDC stream slides past the chain (§10eq–§10es, §10ga). Cheap deltas are
+the margin a full builds in.
+
+**What.** A new step, `version index`, after the width guard and before the catalogue, only
+with `generations => true`:
+
+- the effective version column is `COALESCE(version_col, 'updated_at')`; if the table lacks
+  it, the step says `skipped`;
+- any index whose FIRST column is the version column counts, a composite one included: the
+  step says `already` and names it;
+- otherwise `CREATE INDEX <table>_zb_version ON <table> (<version>)`, reported `would` in a
+  dry run and `done` when applied.
+
+A single-column index, not `(tenant_id, version)`: the producer cuts per tenant under RLS,
+but the rows since the last cut are few, so a range on the version alone is already small.
+Not measured against the composite.
+
+**The costs, said in the step's detail.** `CREATE INDEX` blocks writes on the table while it
+builds, so on a large live table the operator runs `CREATE INDEX CONCURRENTLY` first and the
+step finds it. The version column changes on every update, so no update is HOT any more:
+each update writes every index of the table, more WAL and more bloat. That cost is NOT
+measured yet (the firehose updates 10,000 rows a second and is the tool for it).
+
+**Tables enabled before today** get the index by re-running `zebridge_enable` (it is
+idempotent). The dev database has the new function; `test_types` was not re-enabled.
+
+**Proof.** `enable_scoping.py` (offline) checks 7 and 8: enable built `ro_tenant_zb_version`
+and `rw_tenant_zb_version`, the dry run built none, and a table with its own
+`(updated_at, uid)` index is reported `already` and gets no second one. 8/8 pass.
+
+## 10gd. The version index measured, and kept off the clients (2026-09-15)
+
+§10gc left the write cost unmeasured. Measured now; full tables and commands in
+SPEED_TEST.md, "The version index".
+
+**Writes** (`version_index.py`, its own scratch cluster, 2M rows, two runs that agree):
+up to 21 % more WAL and 24–36 % more time when the same rows are updated again and again;
+17 % more WAL on the insert-then-update firehose; 63 MB more index on disk. HOT fell from
+10 % to 0 %, and only on the repeat load: a row updated once on a packed page is never HOT,
+index or not, so the HOT argument matters only for rows updated often.
+
+**Reads, as the producer runs them:** the idle "did anything change" check went from
+330 ms to 0.013 ms on 2M rows. It runs once per tenant and table per tick, so without the
+index a quiet big table costs a full scan per tenant every cadence. A delta of 10,000 rows:
+140 ms to 4 ms.
+
+**The chain, over TLS** (`firehose_tls.py --runs`, `--preload`): delta queries a quarter
+cheaper under the firehose (130 to 100 ms, four runs in the order with, without, without,
+with), half with 2M static rows (192 to 99 ms), and 91 to 35 ms on a trickle. Fulls do not
+change, and fulls set the edge: cuts, margins and holes were the same with and without the
+index under the pure firehose. So the index buys cheap deltas and a free idle check, not a
+safer edge. That is still the producer's deferral idea's precondition: cheap deltas are
+what let a full wait for a better moment.
+
+**BRIN rejected, on facts.** PostgreSQL 16+ keeps HOT with BRIN, and it did (writes equal to
+no index), but its reads were worse than a sequential scan (290 ms for 10,000 rows):
+updates break the order between a row's page and its time.
+
+**Not sent to clients.** The bridge forwards every plain B-tree to the replicas, and both
+clients create them before the seed. A replica never reads by version, so the index would
+only slow its seed and every applied update. Both index lists now leave out a name ending
+in `_zb_version`: the DDL trigger's (init.core.template.sql) and the bridge's boot query
+(src/event_processor.zig). A replica that already built it drops it at the next schema
+message, because both clients drop indexes no longer published. `enable_scoping.py` check 9
+asserts the trigger's list; every firehose run printed the bridge's list for `fire_types`
+without the index. The enable step says so, and names the index to build CONCURRENTLY
+beforehand, so the name matches the filter.
+
+**Harness fixes found on the way.** `firehose_tls.py` collided on repeated run names (and
+lost the finished results when a later run crashed), and it never reported the load's
+error lines because psql without ON_ERROR_STOP exits 0. Fixed: a directory per run, a
+RESULT line per run, the error lines counted. Two early runs whose load ended at 98 s and
+15 s instead of 180 s did not reproduce and are discarded. While chasing that, a throwaway
+`fire_types` created and dropped in the dev database left two rows in
+`zebridge_ddl_events` (ids 2377, 2378); deleted.
+
+**Not measured:** the seed time the index would have cost a client (moot now), and a VPS.
+
+## 10ge. The opt-out, the burst with the index, and the full deferral (2026-09-15)
+
+**`version_index => false`.** A new parameter of `zebridge_enable`, default true. False
+skips the step and says what it costs; enable never drops an index built earlier. The old
+13-argument signature is dropped first (two signatures would make every named call
+ambiguous). `enable_scoping.py` check 10.
+
+**The burst over TLS, with and without the index** (SPEED_TEST.md): 193k events/s with
+it, 208–220k without, but the drain equals PostgreSQL's load time in every run. The rate
+is PostgreSQL's insert rate on the Mac; the bridge's loop is idle a third of the time. The
+index costs the inserts about 8 %. Do not publish 200k as the bridge's limit.
+
+**The deferral rule.** The depth rotation (a full every `depth − 1` generations) counts
+generations, not seconds, so early cuts made for safety spent the depth budget faster and
+forced a full exactly when time was short. Now:
+
+- the edge watch stores each pair's time margin (seconds before the stream prunes past its
+  cut) and when it read it; the cut record keeps the last full's build time;
+- a full owed ONLY to the rotation waits while a reading younger than one slow scan + 2 s
+  says the margin is under 3 × that full's build + one scan (`fullDecision`, pure);
+- every other full is untouched: the first, a moved seed epoch or column shape, deletes,
+  a repair, a delta carrying more than half the table;
+- the bound: `depth × full_defer_factor (4) − 1` generations since the last full, then the
+  full is built (a warning says so);
+- pruning and the manifest keep everything from the newest full on (`keepFrom`), so a
+  deferred chain never loses its full;
+- `GENERATION_DEFER_FULLS=false` turns it off (README configuration table).
+
+The sweeper's inequality holds: it asks that a delta be cut before a tombstone is reaped,
+and deferral cuts deltas no less often and keeps more of the chain, not less.
+
+**Measured** (SPEED_TEST.md): 2M static rows + the firehose at 64 MiB, three runs without,
+two with (plus one whose log was kept). Holes 6/8/7 samples → 2/2; fulls after boot 5/6/6
+→ 2/2; bridge CPU 42–47 s → 31–32 s. The kept log puts every remaining hole inside a full's
+build: the first rotation (before any pruning) and the full forced at the limit (5.2 s
+build, 2.8 s margin). What deferral cannot do is fit a 5 s full into 8 s of stream: the cap
+still has to be sized on the longest full (§10es).
+
+**Found on the way: the producer's tests never ran.** `zig build test` collects tests only
+from files a test block references, and none referenced `generation_producer.zig` (a
+deliberately broken assertion passed). `bridge.zig` now references every source file with
+tests: 157 tests run per binary (was 146), all green. Which of the 11 newly collected
+tests were silent before, beyond the producer's three, was not traced.
+
+**Found on the way: macOS slept through benchmarks.** Three runs with early-ending loads
+(98 s, 15 s, 83 s) each contain a system sleep in `pmset -g log`. PostgreSQL's pacing
+follows the wall clock, the harness's monotonic clock stops in sleep, and the load bursts
+on wake. `burst_tls.py`, `firehose_tls.py` and `version_index.py` now hold
+`caffeinate -i -w <pid>`; the firehose flags a run INVALID when the clocks drift over 5 s.
+Every run kept in §10gd and here loaded for its full 180 s monotonic.
+
+## 10gf. The routine full leaves the build path (2026-09-15)
+
+**The owner's question:** is the full wrong to be built as it is? Its content is right; its
+coupling to the cut was not. A full was built from its delta's snapshot, so the pair's
+newest cut stayed the previous one until the full was published, and with one worker the
+edge watch could not cut anything meanwhile. §10ge placed every remaining hole inside a
+full's build. A full does not need to move the cut: deltas do that. It only gives a client
+a nearer start.
+
+**What changed.**
+
+- The routine full (the depth rotation, deferred or not) goes to a background lane with
+  its own thread and connections (`GENERATION_ASYNC_FULLS`, default on). Every full a
+  correctness rule asks for still builds with its delta: the first, a moved seed epoch or
+  column shape, deletes on a table without the guard, a delta over half the table.
+- The lane takes its snapshot right after the pair's newest generation L, holding the
+  pair's gate (every delta build holds it whole), then builds outside the gate while
+  deltas keep cutting, then attaches under the gate: `has_full`, the dictionary, on L's
+  row, and the manifest's `full` set to L. It discards its work if the chain moved: L
+  pruned, a newer full, another epoch, shape or table identity.
+- Clients need no change: `planFromManifest` applies the full, then every delta above its
+  gen, and those cover everything after L's cutoff. The manifest gives L's cutoff for the
+  full, older than its snapshot: a watermark that only errs early. PROTOCOL §6 says so.
+- `full_dict_object`, a new column: the dictionary a full trained or kept, which the deltas
+  after it use. L's own `dict_object` names what L's delta was compressed with and must not
+  change. Readers take `COALESCE(full_dict_object, dict_object)`; the prune keeps a
+  dictionary either column still names (`pruneChain`, now shared).
+- **A privilege change, deliberate.** The reader and the writer held no UPDATE on
+  `zebridge_generations` ("append-only by privilege"). They now hold UPDATE on exactly the
+  four columns that attach a full: `has_full`, `dict`, `full_dict_object`, `dict_ratio`.
+  A cut (cutoffs, lsn, counts, epoch, shape) is still unwritable once inserted: checked on
+  the dev database for both roles, an UPDATE of `cutoff_version` refused, of `has_full`
+  allowed. `generations.py` check 4 still asserts the cutoff refusal. SECURITY.md updated.
+  The first smoke run met the refusal ("permission denied for table zebridge_generations")
+  before the grant existed.
+- The dev database got the column and the grants by hand.
+
+**Measured** (SPEED_TEST.md, "The routine full in the background"): 64 MiB, 2M static rows
++ the firehose, four runs in the order async, sync, sync, async. Holes 0/3/3/0 samples,
+smallest margin 131/−77/−77/132, CPU equal. `firehose_tls.py --verify` seeds each final
+chain in Python by the clients' plan rule and compares with PostgreSQL: 3,800,000 rows,
+0 missing, 0 extra, 0 wrong, for all four, and replaying every kept delta changes nothing.
+A depth-3 smoke run attached three background fulls (3.4–4.2 s) with the same check.
+
+**Not covered.** No real client (libzb, zb-client-ts) seeded a chain with a background full;
+the Python check follows their rule, it is not their code. A client seeding from a deferred
+chain of up to 23 deltas is also still untested (§10ge). `generations.py` was not rerun
+(the dev bridge is down).
+
+## 10gg. 50k events a second: the chain holds, memory does not (2026-09-15)
+
+Five minutes at 25,000 inserts + 25,000 updates a second on 2M static rows, 128 MiB cap,
+TLS, index, deferral and background fulls (SPEED_TEST.md). 49,208 events/s published,
+PostgreSQL paced (304 s for 300 s), slot lag median 8 MiB (the owner's point: the bridge
+confirms after NATS stores, so the 17.3 GiB of WAL written is recycled, not retained), no
+hole in 254 samples, 4 background fulls of 5 to 13 s with deltas cut during each.
+
+The harness now samples, every second, the bridge's RSS and the slot's unconfirmed WAL, and
+reports the events published and the WAL written during the load.
+
+**The limit is the full's memory.** `encodeContentCopy` returns the whole full as one
+msgpack buffer, then `compressZstd` makes a second, then it is uploaded: raw about 200
+bytes a row (g1: 403,557,996 bytes for 2M rows, 65,461,084 compressed). The 9.3M-row full
+is about 1.9 GB raw; RSS peaked at 4,211 MiB, median 2,530 MiB. Why the median stays that
+high between fulls (allocator retention, or the lane's arena) was not traced.
+
+**Next:** stream the full: encode a chunk, compress it into a running zstd stream, send the
+compressed bytes to the object store chunk by chunk, so memory is one chunk, not the table.
+Clients already read fulls as a stream (§10fh); the object is unchanged.
+
+## 10gh. Decided: incremental fulls, a base and a chain of checkpoints (2026-09-15)
+
+The owner's objection to fulls: after six months a full is the whole table, and a client
+away ten minutes should not reload it. Agreed design: a **base** (every live row, built
+rarely), a chain of **checkpoints** (every row moved since the previous checkpoint,
+tombstones included, every 30 minutes, in the background), and **deltas** since the newest
+checkpoint; CDC after. A returning client applies only what is after its watermark: deltas,
+or checkpoints then deltas, and the base only when it is older than every kept checkpoint.
+
+The rule that makes it correct: a checkpoint built at T from lower bound B holds every
+delete since B when T − B < `GC_THRESHOLD_MS`, because the sweeper cannot reap a tombstone
+younger than the threshold; once built, the object keeps them. Overlap between levels is
+harmless (version-guarded upserts, deletes by key).
+
+The generation count stops deciding anything: depth rotation and the §10ge deferral retire.
+A base or checkpoint of a big table must be built as a stream first (§10gg). The plan, with
+the manifest, planner cases, producer rules, bookkeeping options, tests and order:
+`docs/plans/2026-09-15-incremental-fulls.md` (local, gitignored).
