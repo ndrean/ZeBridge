@@ -46,6 +46,7 @@ GROUPS = {
         "generations":   ("none",   "zebridge_generations contract"),
         "envcheck":      ("none",   ".env.bridge vs .env.admin"),
         "pubname":       ("none",   "the publication is named, never defaulted"),
+        "enable_scoping": ("none",  "zebridge_enable's scoping choices: a read-only tenant table enables (§10fx), a dry run changes nothing, a nullable tenant column and an unscoped table are refused, writable and public still work"),
     },
     "live": {
         "check":         ("bridge", "declared vs actual drift"),

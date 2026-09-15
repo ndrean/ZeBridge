@@ -56,7 +56,7 @@ The `TS` library uses a push model for reactivity whilst the Zig C ABI library u
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
 
-* **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-150.000 req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
+* **SELECTance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-150.000 req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
 The consumer's local database ingress/egress for events depends a lot upon your device. Values around 15 +/- 5 k evt/s can be reached.
 The client library can seed at rates around 150-200.000 rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
@@ -87,7 +87,7 @@ Any change in the buffer, for special live migrations that could enable larger t
 
 Defaults are `BASE_BUF=12` (4 KB/row), `RING_BUFFER_COUNT=32768`and `MAX_COLUMNS=128`, consuming around 150MB.
 
-**Observability**: production-ready out of the box. It exposes standard Prometheus metrics for performance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
+**Observability**: production-ready out of the box. It exposes standard Prometheus metrics for SELECTance tracking and structured logs optimized for Loki and Grafana dashboards. The metrics are all owned by the daemon, meaning metrics from its Postgres catalogue and self reflecting metrics.
 
 See the detailed file [TELEMETRY.md](#telemetry.md)
 
@@ -192,7 +192,11 @@ The client library shrinks this orchestration down to a few primitives: `connect
 * **Postgres**:
   * the DBA defines two Postgres USERs,  READER and WRITER, and uses them to install the Postgres functions and triggers needed by ZeBridge,
   * the DBA migrates the database, runs a diagnose to ensure the schemas follow the 💡 _good practice rules_, and removes any deviation.
-  * the DBA finalze and runs `SELECT zebridge_enable()` on each table attached to the desired publication with the sync rules,
+  * the DBA finalizes and runs:
+   ```sql
+   SELECT * FROM zebridge_enable('public.orders', tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'my_pub', dry_run => false);
+   ```
+   on each table attached to the desired publication with the sync rules,
   🔔 These three steps guarantees the sync of the engine.
 * **NATS**:
   * the DBA generates an NKEY pair for authentication: `bridge --gen-nkey`.
@@ -330,7 +334,11 @@ Here they are, so you can judge the fit before adopting it.
 * **Strict Memory Boundaries**: Because ZB uses a **fixed pre-allocated buffer**, its memory footprint must be defined at runtime. 
 🚦 Overflows are detected, wether originated from a consumer write, or directly loaded within Postgres, or after a schema migration. They are rolled back and the table is suspended. See [Suspended tables](#suspended-tables)
 * **💡 Enforcement of Good practices on Schemas**:  Because we are syncing databases, the schema rules are enforced, not suggested: a primary key, `uuid` keys and `timestamptz` columns on writable tables, and a deliberate choice about deletes across a foreign key.
-We have added tools in Postgres to diagnose tables as `SELECT zebridge_enable(dry_run => true)`. This reports every rule before touching anything, and `bridge --diagnose` checks a whole database, the cascade rule included. See [diagnose](#diagnose).
+We have added tools in Postgres to diagnose tables as:
+```sql
+SELECT * FROM zebridge_enable('public.orders', tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'my_pub', dry_run => false);
+```
+This reports every rule before touching anything, and `bridge --diagnose` checks a whole database, the cascade rule included. See [diagnose](#diagnose).
 * **Suspension**: 🚦 When a table stops meeting a rule while the bridge runs, the bridge **suspends** it and keeps everything else flowing. Fix the table and most suspensions lift by themselves; two cases need a restart, [Suspended tables](#suspended-tables) and [Restart rules](#restart-rules).
 * **Soft-delete Cascade Transaction Mitigation with Sweeper**: when consumers apply _soft-deletion_ this can lead to bloated databases. Soft deletion is enforced by using a `tombstone` column in the schema.
 The client library always applies a local HARD DELETE, but a _soft delete_ (via the `tombstone` timestampz) is sent to Postgres. ZeBridge solves the Postgres bloat with a companion garbage collector, the `bridge_sweeper` daemon which runs with a WRITER privilege.
@@ -369,7 +377,7 @@ Tables are either public or private/tenant-scoped:
 | public table | no column, but a public reason is declared | text | ✚ `zebridge_enable(public_reason => 'this table is public')` for example|
 | private table| `tenant_id` | text | ✚ `zebridge_enable(tenant_col => 'tenant_id')` |
 
-**Columns that never travel.** `zebridge_enable` gives the table a publication column list when it has columns no replica can use: `tsvector`, `tsquery`, `xml`, ranges. They stay in PostgreSQL; the descriptor, the chain and the change feed carry the rest. Leave out more with `columns => ARRAY['id', 'title', …]`. A column list does not grow on its own: after `ALTER TABLE … ADD COLUMN`, run `zebridge_enable` again to refresh it. Keep the key and the tenant column in the list: PostgreSQL requires a column list to cover the replica identity, or it refuses every UPDATE on the table.
+**Columns that never travel.** `zebridge_enable()` gives the table a publication column list when it has columns no replica can use: `tsvector`, `tsquery`, `xml`, ranges. They stay in PostgreSQL; the descriptor, the chain and the change feed carry the rest. Leave out more with `columns => ARRAY['id', 'title', …]`. A column list does not grow on its own: after `ALTER TABLE … ADD COLUMN`, run `zebridge_enable()` again to refresh it. Keep the key and the tenant column in the list: PostgreSQL requires a column list to cover the replica identity, or it refuses every UPDATE on the table.
 
 Tables are either read-only or writable with a LWW conflict resolution policy.
 
@@ -378,13 +386,13 @@ Tables are either read-only or writable with a LWW conflict resolution policy.
 |  Read  | id    | **bigint** or **uuid** | composite pk possible (2)|
 |  Write  | id    | **uuid** (1)| composite pk possible (2)|
 |||||
-| Write  | updated_at | **timestamptz**  (3)| no bigserial ✚ `zebridge_enable(version => 'updated_at')` or with your prefered field identifier|
+| Write  | updated_at | **timestamptz**  (3)| no bigserial ✚ `zebridge_enable(version_col => 'updated_at')` or with your prefered field identifier|
 | Write  | delete_at | **timestamptz** | soft-deleted ✚ `zebridge_enable(tombstone_col => 'deleted_at')` or with your prefered field identifier |
 | Write | last_writer | text | `zebridge_enable(tiebreak_col => 'last_writer')` or with your prefered field identifier|
 
 (1) _in a writable table, a client mints its own keys offline, so a writable table's key must be **client-generable** — a `uuid-v7` (time-ordered), NOT a `bigserial` that the database hands out (an edge write to a sequence key would collide with the server's next insert, so the bridge refuses it)_.
 
-(2) _without a PK, the replica doesn't know which row to apply a mutation from the backend and we use `REPLICA IDENTITY DEFAULT` for performance_.
+(2) _without a PK, the replica doesn't know which row to apply a mutation from the backend and we use `REPLICA IDENTITY DEFAULT` for SELECTance_.
 
 For example:
 
@@ -732,7 +740,8 @@ The rules a table must meet, what each migration does to the replicas, and the o
 ### What a migration does
 
 Every schema change reaches every replica live, through the descriptor the DDL trigger publishes. No client restart, no bridge restart.
-One exception: too large number of columns, 
+
+🔔 One exception: a table that grows past `MAX_COLUMNS` columns is suspended, until columns are dropped or the bridge restarts and re-detects the limit (see [Restart rules](#restart-rules)).
 
 | you run | the replicas | rows |
 | --- | --- | --- |
@@ -748,66 +757,67 @@ One exception: too large number of columns,
 Two things only PostgreSQL knows, so the replica must be re-seeded: values an expression default wrote into old rows, and rows whose identity moved. The lever is one call:
 
 ```sql
-SELECT * FROM zebridge_reseed('orders');   -- bumps orders and every table referencing it
+SELECT * FROM zebridge_reseed('orders');
+-- bumps orders and every table referencing it
 ```
 
 The DDL trigger pulls it by itself on a key change or a type change. After a key change, re-run `zebridge_enable` for the table: the old key took the replica identity with it. Every replica of the table downloads one full generation, so plan a re-key like a downtime, not like an `ALTER`.
 
 ### Examples
 
-Two main rules:
+Three main rules:
 
-- ❗️ Any table must have a **primary key**. This is because clients create locally tables from Postgres' schemas. Since the backend can modify rows (but not clients if read-only), clients can't replay the modifications if they don't have a primary key.
-- ⚠️ Any table which enters a publication must be registered with `zebridge_enable()`.
+- ❗️ Every table needs a **primary key**. Clients build their local tables from PostgreSQL's schemas, and a change to a row reaches them keyed by that row's primary key: without one, a client cannot tell which row changed.
+- ❗️ Timestamps have the type `timestamptz`. The DDL guard refuses any `CREATE TABLE` or `ALTER TABLE` that leaves a `timestamp` (without time zone) column, read-only tables included.
+- ⚠️ A table enters a publication only through `zebridge_enable()`.
 
-**Client read-only tables**: tables can be public (everyone can read every row) or private (rows are scoped by tenant, RLS scope).
+**Client read-only tables** are either public (everyone reads every row) or private (each tenant reads its own rows).
 
-When you declare a read-only table "public", you **must** add a value to the field `public_reason`, so being public is intentional and there is no tenant column. The migration running `zebridge_enable()` that attaches the table to the publication is for example:
+A public table **must** say why it is public, in `public_reason`: being public is then a recorded decision, and the table has no tenant column.
 
 ```sql
-PERFORM * FROM public.zebridge_enable(
+SELECT * FROM zebridge_enable(
   'public.users'::regclass,
-  public_reason => 'no tenant column, readable by every consumer', -- ❗️needed
-  publication => 'my_pub', -- or env var subsitution BRIDGE_CDC_PUBLICATION
+  public_reason => 'no tenant column, readable by every consumer', -- ❗️ needed
+  publication => 'my_pub',
   dry_run => false
 );
 ```
 
-A read-only table is made "private" by adding a tenant column. The tenant_id is assigned by the DBA when registering the user and it is propagated to the client via the client library automatically on-the-fly.
-You declare the field name in the 'tenant_col' of `zebridge_enable()`. The migration running `zebridge_enable()` that makes this table writable and attached to a publication is:
+A private table has a tenant column, declared `NOT NULL`. The DBA assigns each user a tenant when registering them, and the client library follows that tenant by itself. You name the column in `tenant_col`:
 
 ```sql
-PERFORM * FROM public.zebridge_enable(
+SELECT * FROM zebridge_enable(
   'public.counter_tenant'::regclass,
   tenant_col => 'tenant_id',
-  publication => 'my_pub', -- or env var subsitution BRIDGE_CDC_PUBLICATION
+  publication => 'my_pub',
   dry_run => false
 );
 ```
 
-**Client writable tables**: The first general rule is that the table needs a **primary key** (can be composite) of type `uuid`. This is because clients mint this key so you will have ID collision.
+**Client writable tables** need a **primary key** that the client creates, so a `uuid`: clients mint keys offline, and a key from a database sequence would collide with the rows PostgreSQL creates itself. A writable table also needs:
 
-Furthermore, a writable table needs:
-
-- as said, a `tenant_id`() column for scoping,
-- a version column (`updated_at`, or `modified_at` or `last_modified`...) of type `timestamp`**Z**,
-- a tombstone column (`deleted_at` or `removed_at`) of type `timestamp`**Z** when you want soft-deletes,
-- optionally, a tiebreak column, `last_writer`, of type TEXT.
-
+- a tenant column, `tenant_id`, for scoping,
+- a version column (`updated_at`, `modified_at`, `last_modified`…) of type `timestamptz`,
+- a tombstone column (`deleted_at`, `removed_at`…) of type `timestamptz`, for soft deletes,
+- optionally, a tiebreak column, `last_writer`, of type `text`: without it, two writes carrying the same version are both refused.
 
 ```sql
 CREATE TABLE IF NOT EXISTS test_types (
-    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), -- ✅ PK with UUID
-    tenant_id text NOT NULL, -- ✅ RLS scope
-    ...
-    created_at timestamp with time zone NOT NULL, -- or inserted_at..
-
-    modified_at timestamp with time zone NOT NULL -- ✅ version with timestampz (or `updated_at`)
-    deleted_at timestamp with time zone, -- ✅ tombstone for soft-delete with timestampz
-    last_writer varchar, -- ✅ tiebreak: which principal wrote
+    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), -- ✅ a key the client can mint
+    tenant_id text NOT NULL,                        -- ✅ the tenant scope
+    -- … your columns …
+    created_at timestamptz NOT NULL,
+    modified_at timestamptz NOT NULL,               -- ✅ the version
+    deleted_at timestamptz,                         -- ✅ the tombstone
+    last_writer text                                -- ✅ the tiebreak, optional
 );
+```
 
-PERFORM * FROM zebridge_enable(
+and you declare its _sync rules_ in `zebridge_enable()`:
+
+```sql
+SELECT * FROM zebridge_enable(
     'public.test_types'::regclass,
     writable => true,
     tenant_col => 'tenant_id',
@@ -818,111 +828,93 @@ PERFORM * FROM zebridge_enable(
     dry_run => false
 );
 ```
-#### Read-only table
 
-**A "Bad"** `read-only` table: 
+#### Fixing a "bad" read-only table
 
-The primary key (PK) is missing:
+This table has no primary key and a `timestamp` column. The DDL guard refuses to create it today, so think of it as a table that existed before ZeBridge was installed:
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
-    -- ❗️ no PK
+    -- ❗️ no primary key
     name varchar NOT NULL,
     email varchar,
-    inserted_at timestamp NOT NULL,
+    inserted_at timestamp NOT NULL -- ❗️ no time zone
 );
 ```
 
-The migration to add a primary key:
+The migration adds the key and converts the column **in one statement**. The guard checks after each statement, so adding the key alone would be refused while `inserted_at` is still `timestamp`. `AT TIME ZONE 'UTC'` says which zone the old values were written in:
 
 ```diff
-+ ALTER TABLE users 
-+ ADD COLUMN id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY;
++ ALTER TABLE users
++   ALTER COLUMN inserted_at TYPE timestamptz USING inserted_at AT TIME ZONE 'UTC',
++   ADD COLUMN id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY;
 ```
 
-> since it is READ-ONLY, it can be a simple `bigint`, but necessarily `uuid` in the WRITABLE case.
+Existing rows get an `id` automatically. Since the table is read-only, a `bigint` identity is fine; a writable table needs a `uuid`.
 
-**A "Good"** `read-only` table ✚ 🔔 the magic  PG function `zebridge_enable()` to attach this table to the 'publication' of your choice.
+Then the table enters the publication:
 
-``` sql
-CREATE TABLE IF NOT EXISTS users (
-    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, -- ✅
-    name varchar NOT NULL,
-    email varchar,
-    inserted_at timestamp NOT NULL,
-);
-
--- ❇️ the magic function that declares this table 'public' 
--- ⚠️ needs a 'public_reason' field, NOT NULL, meaning deliberate)
--- declare the publication to which this table will be added
-
-SELECT zebridge_enable(
+```sql
+SELECT * FROM zebridge_enable(
     'public.users'::regclass,
-    public_reason => 'no tenant column, readable by every consumer', -- ❗️needed
+    public_reason => 'no tenant column, readable by every consumer', -- ❗️ needed
     publication => 'my_pub',
     dry_run => false
 );
-``` 
+```
 
-#### Writable table
+#### Fixing a "bad" writable table
 
-The following example has several defects. 
+Again an existing table, with three defects:
+
 ```sql
 CREATE TABLE IF NOT EXISTS test_types (
-    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), -- ✅ PK with UUID for writable as set by client
-    -- ❗️no tenant_id
+    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), -- ✅ a key the client can mint
+    -- ❗️ no tenant column
     temperature double precision,
-    ...
-    inserted_at timestamp NOT NULL,
-    modified_at timestamp  NOT NULL -- ❗️the 'version' but no time zone
-     -- ❗️ no tiebreak
-     -- ❗️ no tombstone
+    inserted_at timestamptz NOT NULL,
+    modified_at timestamp NOT NULL                  -- ❗️ the version, without time zone
+    -- ❗️ no tombstone
 );
 ```
 
-This example fails to be accepted for the following reasons: 
+- the version column `modified_at` is `timestamp`, not `timestamptz`,
+- there is no tenant column,
+- there is no tombstone column.
 
-- it has a 'version' timestamp (`modified_at`, `updated_at`...) but the _type_ is wrong, 
-- not a `timestamp`**Z**, 
-- has no `tenant_id` (RLS scope), 
-- has no 'tombstone' (`deleted_at`), 
-- has no 'tiebreak' (`last_writer`):
-
-The migration:
+The migration, in one statement. A new `NOT NULL` column on a table that has rows needs a value for those rows: the default gives them one, and is dropped right after, so every new row must name its tenant:
 
 ```diff
-+ ALTER TABLE test_types 
-+ ADD COLUMN tenant_id text NOT NULL,
-+ ALTER COLUMN modifed_at TYPE timestamp with time zone USING updated_at AT TIME ZONE 'UTC';
-+ ADD COLUMN deleted_at timestamp with time zone;
-+ ADD COLUMN last_writer text,
++ ALTER TABLE test_types
++   ADD COLUMN tenant_id text NOT NULL DEFAULT 'acme',
++   ALTER COLUMN modified_at TYPE timestamptz USING modified_at AT TIME ZONE 'UTC',
++   ADD COLUMN deleted_at timestamptz,
++   ADD COLUMN last_writer text; -- optional tiebreak
++ ALTER TABLE test_types ALTER COLUMN tenant_id DROP DEFAULT;
 ```
 
-So the "good" writable ✚ 🔔 the magic PG function `zebridge_enable()` where we declare which columns will play which role, and link it to the 'publication' and declare it 'writable'.
+The table is now:
 
 ```sql
 CREATE TABLE IF NOT EXISTS test_types (
-    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), -- ✅ PK with UUID for writable as set by client
-    tenant_id text NOT NULL,
+    uid uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     temperature double precision,
-    ...
-    inserted_at timestamp with time zone NOT NULL,
-    modified_at timestamp with time zone NOT NULL -- ✅ version
-    deleted_at timestamp with time zone, -- ✅ tombstone for soft-delete
-    last_writer varchar, -- ✅ tiebreak
+    inserted_at timestamptz NOT NULL,
+    modified_at timestamptz NOT NULL, -- ✅ the version
+    tenant_id text NOT NULL,          -- ✅ the tenant scope
+    deleted_at timestamptz,           -- ✅ the tombstone
+    last_writer text                  -- ✅ the tiebreak, optional
 );
+```
 
--- ❇️ the magic function to map field identifers and attach the table to a publication:
--- the tenant_id
--- that it's 'writable'
--- the SYNC RULES correspondance (tombstone_col, version_col, tiebreak_col)
- -- declare the publication to which this table will be added
+and `zebridge_enable()` maps each column to its role, marks the table writable and attaches it to the publication:
 
-PERFORM * FROM zebridge_enable(
+```sql
+SELECT * FROM zebridge_enable(
     'public.test_types'::regclass,
     writable => true,
     tenant_col => 'tenant_id',
-    version_col => 'modifed_at',
+    version_col => 'modified_at',
     tombstone_col => 'deleted_at',
     tiebreak_col => 'last_writer',
     publication => 'my_pub',
@@ -930,44 +922,27 @@ PERFORM * FROM zebridge_enable(
 );
 ```
 
-A **Writable with wrong PK type**:
+The type change re-seeds the table on every replica once, automatically.
+
+#### Changing a writable table's key from `bigint` to `uuid`
 
 ```sql
 CREATE TABLE IF NOT EXISTS test_types (
-    -- ❗️ PK without UUID for writable
-    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    ...
+    id bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY -- ❗️ a key the database allocates
+    -- , … the other columns …
 );
-
-SELECT zebridge_enable(...);
 ```
 
-* If the table is **empty**, the change of the primary key type from 'bigint' -> 'uuid' to simple:
+If the table is **empty**, one statement swaps the key, and `zebridge_enable` runs again with the same arguments, because the old key took the replica identity with it:
 
 ```diff
-+ ALTER TABLE users 
-+ DROP CONSTRAINT users_pkey,
-+ DROP COLUMN id,
-+ ADD COLUMN uid uuid PRIMARY KEY DEFAULT gen_random_uuid();
++ ALTER TABLE test_types
++   DROP CONSTRAINT test_types_pkey,
++   DROP COLUMN id,
++   ADD COLUMN uid uuid PRIMARY KEY DEFAULT gen_random_uuid();
 ```
 
-* If the table is **already populated**, then we need a bit more efforts: add a new column with type 'uuid', populate it with UUIDs for every existing rows, drop the old pk column, and promote the new one as primary key, in this order.
-
-```sql
--- 1. Add the new UUID column (without primary key or NOT NULL yet)
-ALTER TABLE users ADD COLUMN new_id uuid DEFAULT gen_random_uuid();
--- 2. Populate existing rows with a UUID
-UPDATE users SET new_id = gen_random_uuid();
--- 3. Make the new column NOT NULL
-ALTER TABLE users ALTER COLUMN new_id SET NOT NULL;
--- 4. Drop the old primary key constraint and the old id column
-ALTER TABLE users DROP CONSTRAINT users_pkey;
-ALTER TABLE users DROP COLUMN id;
--- 5. Rename new_id to id
-ALTER TABLE users RENAME COLUMN new_id TO id;
--- 6. Add the primary key constraint to the new id column
-ALTER TABLE users ADD PRIMARY KEY (id);
-```
+If the table **has rows**, the other tables that reference the key must move with it, in one transaction, and `zebridge_enable` runs again at the end. Follow [the re-key recipe in MIGRATIONS.md](MIGRATIONS.md#the-re-key-recipe).
 
 ## Suspended tables
 
@@ -1737,7 +1712,7 @@ ZeBridge runs in three contexts:
 
 * **the test suite** runs Postgres and NATS natively on the host — fast to iterate, and driven by the test scenarios. For development only.
 * **the docker compose evaluation** — trying ZeBridge out — is best as a `docker compose` stack: all the infrastructure in one code file, Postgres, NATS, NATS-exporter, Prometheus, Grafana, bridge_sweeper, ZeBridge and the reverse proxy HAProxy.
-* **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for performance, the bridge should sit to the `nats-server` and communicate by _plain text_, over TCP.
+* **Production** is your own topology, and here compose is not a recommendation to avoid any overhead. Postgres may be a managed or remote instance and the system will inevitably suffer from latency. NATS may be remote too, although for SELECTance, the bridge should sit to the `nats-server` and communicate by _plain text_, over TCP.
 
 For example, when all three run on host, during a spike (800 k writes/s), CPU usage is largely dominated by Postgres with around 70% of the host CPU, delivering 300 kCDC/s whilst ZeBridge uses ~20-25% and NATS ~5-10%.
 

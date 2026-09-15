@@ -14,7 +14,11 @@ contract is more than a shape:
      read role's single deliberate write grant;
   4. **append-only by privilege** — the reader holds INSERT+DELETE (pruning) but no
      UPDATE: history cannot be rewritten, only extended and pruned;
-  5. **the writer holds nothing** — generation bookkeeping is not ingress.
+  5. **the writer mirrors the reader's bookkeeping grant, append-only too** — when
+     DATABASE_READER_URL is a hot standby the bridge records generations over the
+     writer (NOTES §10cz, `443ce17`), so the writer may INSERT; it may not UPDATE
+     either. (Until 2026-09-14 this check still expected the writer to be refused,
+     which the standby work had made false on purpose — NOTES §10fx.)
 
 Usage:  python scripts/scenarios/generations.py
 Needs DATABASE_READER_URL / DATABASE_WRITER_URL in the env (`set -a && . ./.env.bridge
@@ -111,13 +115,21 @@ SELECT gen || '@' || cutoff_lsn FROM public.zebridge_generations WHERE tenant='{
             zb.bad(f"reader UPDATE was not refused: {r.stderr.strip()[:120]}")
             failed += 1
 
-        # ── 5. the writer holds nothing here ───────────────────────────────────
+        # ── 5. the writer: the reader's bookkeeping grant, append-only too ─────
+        # The standby path (§10cz): with a hot-standby reader the bridge records its
+        # generations over the writer, so the writer holds SELECT, INSERT, DELETE here.
         r = writer("INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn) "
                    f"VALUES ('{open_tenant}', 'users', 900099, now(), pg_current_wal_lsn());")
-        if r.returncode != 0 and "permission denied" in r.stderr:
-            zb.ok("the writer role is refused entirely — generation bookkeeping is not ingress")
+        if r.returncode == 0:
+            zb.ok("the writer can record a generation — the standby path's bookkeeping grant")
         else:
-            zb.bad(f"writer INSERT was not refused: {r.stderr.strip()[:120]}")
+            zb.bad(f"writer INSERT was refused, so a hot-standby deployment cannot record generations: {r.stderr.strip()[:120]}")
+            failed += 1
+        r = writer("UPDATE public.zebridge_generations SET cutoff_version = now() WHERE gen = 900099;")
+        if r.returncode != 0 and "permission denied" in r.stderr:
+            zb.ok("the writer cannot UPDATE either — history stays append-only whichever role records it")
+        else:
+            zb.bad(f"writer UPDATE was not refused: {r.stderr.strip()[:120]}")
             failed += 1
     finally:
         # cleanup through the very grant that pruning will use

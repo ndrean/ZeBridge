@@ -12293,3 +12293,206 @@ across a gap (§10fn). A pull the broker denies without answering yields nothing
 that stream and does not stall the others, but it is not detected as dark until its
 consumer is re-opened (§10fq). A scenario that creates and deletes a tenant stream
 must never write a row to that tenant, or the bridge dies replaying it (§10fn).
+
+## 10fs. Cross-tenant read through the reply inbox (found and probed, 2026-09-14)
+
+While designing the analytics request lane (a client asks on `query.<tenant>.<name>`, a
+DuckDB follower answers on the asker's reply inbox), the reply grant came under the
+lens. Every client JWT may subscribe to `_INBOX.>` — the role template in
+`src/nats_init.zig` and `jwt-bootstrap.sh`, and SECURITY.md shows it — and a JetStream
+pull consumer delivers its messages to the reader's reply inbox. So the per-tenant
+stream stops the wrong principal from CREATING a consumer (§crosstenant), but not from
+LISTENING where another principal's consumer delivers.
+
+Probed on the dev stack: bob (tenant globex) subscribed to `_INBOX.>` with the nats CLI
+for 25 s while alice (acme) followed `pois` through libzb and a row with a marked note
+was inserted under acme. Bob received 200 messages (the capture's cap), among them
+`cdc.acme.pois.insert` and the tombstone `update`, both carrying the marked row. The
+capture was deleted after reading. The same path carries every other reply: KV direct
+gets (chain manifests, `$KV.tenants`), object-store chunks (whole seeds), JetStream API
+answers. `crosstenant.py` never probed it: its model was "who may create a consumer on
+which stream", and the delivery subject was assumed private.
+
+**Fix, not yet built.** A reply prefix per principal, granted as `_INBOX.{{name()}}.>`
+in place of `_INBOX.>`, so a principal can only listen to its own replies. nats.js has
+`inboxPrefix`; nats.zig hardcodes `_INBOX.` in `inbox.zig` and `response_manager.zig`
+and needs a small patch (a connection option), ledgered like the others. Then libzb and
+the TS client pass the prefix, the template and `jwt-bootstrap.sh` change, the dev creds
+are re-minted, and a scenario repeats this probe and expects nothing. The analytics
+lane's answers would have leaked the same way, so this comes before it.
+
+## 10ft. The analytics lane, planned (2026-09-14)
+
+The plan is `docs/plans/2026-09-14-analytics-lane.md`. In short: the inbox fix of §10fs
+first; the insurance CSV loaded with `\copy` into a table of its own tenant
+(`analytics`), then enabled, so the producer cuts one chain instead of 1,338 change
+events; the grammar gains `query.<tenant>.<name>` and a `res-<tenant>` object store
+for answers above 256 KB (10 minutes max age); asking and serving are tag families of
+their own (`ask:<t>`, `serve:<t>`, minted from a new `zebridge_query_grants` table), so a
+principal that may ask does not thereby read the dataset; `zb serve` answers NAMED
+queries on the read-only DuckDB connection (raw SQL off: DuckDB reads local files and
+URLs); `zb_client_ask` and TS `ask` read an object answer transparently. Two things to
+verify before building: that a scoped template carries response permissions, and that
+a template line with an absent tag is dropped rather than refusing the user.
+
+## 10fu. "counter_tenant is not live in the browser": the TS seed cannot fetch a 102 MB chain (2026-09-14)
+
+The user opened the web demo as bob and mary (both globex) and alice (acme). Alice was
+live; bob and mary each missed the other's clicks, wrote from stale values, then
+"suddenly converged", and a reload started it over. Two wrong explanations first,
+recorded because both were plausible: a UI refresh problem (ruled out by the writes
+carrying stale values), then the tail consumers' 5 s inactivity threshold (ruled out by
+sampling `/jsz` every 2 s: no consumer was deleted; a globex tab simply opened its first
+consumer 30 s after connecting, and the previous one never did).
+
+**Found in the browser console** (Claude in Chrome, one tab as bob). The web demo passes
+no `tables`, so it follows all 16 tables, `test_types` among them, and globex holds
+3,055,002 `test_types` rows (acme none — why alice was fine). The TS client seeds every
+table before it opens any tail. Its object reader stalled on the 102 MB full,
+`test_types-g438-full`: "130/785 chunks, 17 MB" at 18:08:56, then "476/785 chunks" 30 s
+later. While it downloaded, the websocket was saturated and nine chain-manifest reads
+timed out at once (5 s), which started another seed pass. After more than a minute the
+tab held no stream position at all (`syncState().global.seq` empty): deaf the whole
+time, while its writes still went out through the outbox. The log line "still waiting
+for the producer's full under the new epoch" names the wrong reason.
+
+**Reproduced with two panels** (bob and mary, 18:10). Both loaded 14 with no stream
+position. Bob's minus at 18:10:49: PostgreSQL 13, bob 13 (his optimistic write), mary 14.
+At 18:13:06, 2 min 17 s later, mary still showed 14, both tabs still had no position,
+and mary's download of the same object kept failing every 30 s at a different point
+(226, 415, 166, 226 of 785 chunks) — a timeout on the whole read, not a missing chunk.
+Convergence was not observed in that window; the user saw it after longer.
+
+**What is wrong, in order.** (1) The TS client's object read is the ordered push reader
+that libzb abandoned for the pull reader (§10fh); a large chain does not come through in
+a browser. (2) One table's seed holds every table's live tail hostage: tails open only
+after the whole pass. (3) A failed large download starves the other requests on the
+same connection and triggers repeated passes. (4) The demo follows tables it never
+shows. Not wrong: tenant isolation (alice never moved with globex), the bridge (zero lag,
+every click published at once), the TS tail itself (headless in Node with
+`tables: ['counter_tenant']`, bob and mary saw each other within 0.1 s, three times).
+
+**Fixes, not applied.** The demo passes `tables` for what the page shows. The TS client
+gets the pull-based object reader and the streaming seed (the parity item queued since
+§10fh), opens tails independently of large seeds (each table goes live when its own seed
+lands; the per-stream seed gate drops what a chain covers), and names the real reason when
+a chain object cannot be read. Raising the tails' inactivity threshold to 120 s, as libzb
+does, is still worth doing for background tabs, but it was not this.
+
+## 10fv. PGlite seeds test_types at 480 rows a second (measured in Node, 2026-09-14)
+
+Asked after §10fu: how long would the browser take on `test_types`, on SQLite and on
+PGlite (alice's engine)? The browser could not be timed (its object read never finishes),
+so the insert was measured in Node, where the download works: a script following only
+`test_types` as bob, a fresh replica, the client's own log with elapsed seconds, peak RSS
+sampled every 250 ms (scratchpad `seed-bench.ts`, not in the tree).
+
+| engine (TS client, Node) | result |
+|---|---|
+| SQLite (better-sqlite3) | 3,055,002 rows, live at 24.2 s, peak RSS 2.6 GB |
+| PGlite (persisted, NODEFS) | stopped at 29 min 35 s: 850,000 rows committed, 1,176 MB for that table, about 480 rows/s, one CPU core pinned |
+
+At that pace the whole table is about 1 h 45 min and over 4 GB. Two side effects: the
+script's own 20-minute cap never fired, because PGlite's work holds Node's single thread
+and no timer runs; and at 595 s a read of the next chain step timed out for the same
+reason. In a browser tab the same thread also runs the page.
+
+**Why.** On SQLite a 50,000-row chunk is one statement (`json_each`, §10fc). The PGlite
+dialect never got a bulk path: `libzb.ts` ~2077 sets `bulk` only when
+`dialect.name === 'sqlite'`, so every row is its own INSERT, parsed and planned by
+PostgreSQL in wasm: about 2.1 ms a row. The row count was read afterwards by opening
+the data directory with a separate PGlite (16 s to open and count).
+
+**Levers, not applied.** A bulk statement for the PostgreSQL dialect
+(`INSERT … SELECT … FROM jsonb_to_recordset($1)` per chunk, or PGlite's `COPY FROM
+'/dev/blob'` with the chunk as CSV); yielding to the event loop between chunks so the
+tab and the connection stay alive; and, whatever the speed, the rule of §10fu — a large
+table must not hold the small ones' live tails hostage.
+
+## 10fw. State of the art: seeding a large table, per client and engine (2026-09-14)
+
+The reference table is `test_types` in globex: 3,055,002 rows, 14 columns, one full chain
+object of 102 MB (msgpack + zstd, about 33 bytes a row on the wire). Stored uncompressed
+it is about 1 GB everywhere: PostgreSQL 931 MB of data plus 317 MB of indexes, the libzb
+SQLite replica 993 MB.
+
+| client | engine | where it ran | result | memory | status |
+|---|---|---|---|---|---|
+| libzb | SQLite, whole object | Flutter app on the Mac (§10fh) | about 10–11 s | about 1.1 GB | works |
+| libzb | SQLite, streaming seed | Flutter app on the Mac (§10fh) | about 22 s | about 330 MB | works |
+| libzb | DuckDB | `zb sync --once` on the Mac (§10fl) | 32 s, 462 MB file | 1.09 GB | works |
+| TS client | SQLite (better-sqlite3) | Node on the Mac (§10fv) | live at 24.2 s | 2.6 GB | works |
+| TS client | PGlite (NODEFS) | Node on the Mac (§10fv) | 850,000 rows in 29.5 min, about 480 rows/s; about 1 h 45 min projected | 2.2 GB, 3.1 GB on disk at the stop | inserts correct, unusably slow: one INSERT per row, no bulk path; blocks the thread |
+| TS client | SQLite (OPFS) | Chrome, normal profile (§10fu) | download never completes | | broken: object reader gives up after 30 s |
+| TS client | SQLite (OPFS) | Chrome, incognito (this section) | download never completes; storage quota exceeded | | broken, and the table cannot fit |
+| TS client | PGlite (IndexedDB) | browser | not measured | | would hit both the download and the per-row insert |
+| libzb | SQLite | a real phone | not measured | | the Mac numbers are the only ones |
+
+**What the browser does meanwhile, from the user's console (incognito, bob).** The 102 MB
+object read fails every 30 s at a different point (441, 322, 113, 158, 166, 324 of 785
+chunks). After 90 s the client stops waiting for that table, holds its events, asks for
+its chain every 15 s, and opens the tails: "CDC active" turns green about three minutes
+after load, and only then do the other tables go live. The log calls the failure "still
+waiting for the producer's full under the new epoch", which is not the reason. In the
+same window OPFS answered `QuotaExceededError`: SQLite reported `SQLITE_IOERR` on the
+position write (`INSERT INTO _zebridge_stream_seq …`), and the client swallowed it in a
+bare `catch`, so the replica silently kept no position. Incognito gives an origin a small
+memory-backed quota; the normal profile showed 10.5 GB of quota for localhost:5173, with
+307 MB used, 305 MB of it three partial databases left by the diagnostic tabs (deleted).
+
+**What any fix must keep.** Whatever makes the seed faster, a large table must not hold
+the others hostage. The client needs readiness per table (seeding with progress, live,
+failed with the real reason), the page a spinner only where data is missing, and write
+controls disabled on a table that is not live yet: the stale `+1` of §10fu came from
+writing to a table whose tail was not open. Today `onPhase` only reports four
+whole-client phases (`connected`, `migrated`, `snapshot`, `cdc`). And a storage write
+that fails must surface, not vanish in a `catch`.
+
+## 10fx. A read-only tenant table could not be enabled (fixed, 2026-09-14)
+
+Found while checking the README's migration examples, each run inside a rolled-back
+transaction: `zebridge_enable('public.t', tenant_col => 'tenant_id', publication => …,
+dry_run => false)` on a fresh table answered `preflight ERROR … would be published
+unscoped`. The scoping check read `… OR (writable AND tenant_col IS NOT NULL)`, so a
+tenant column counted only on a writable table, and the `ELSIF tenant_col IS NOT NULL`
+branch just below it — the one that calls `zebridge_scope_reads_by_tenant` for a
+read-only table — could never run on a fresh table.
+
+**Missed, not decided.** The design said the opposite from the start: this file records
+`zebridge_scope_reads_by_tenant()` as "wired into `zebridge_enable()` for every
+tenant-scoped table, read-only or writable". The refusal was even seen once, in the
+salaries run, where a first attempt with `tenant_col` and no `writable` was refused and
+the note wrote it down as "the approval doors verified themselves". The check and the
+branch arrived together in `831306d` (2026-08-20), and no scenario ever enabled a
+read-only tenant table.
+
+**Fix.** The check accepts `tenant_col IS NOT NULL` for both kinds (writable scopes
+writes, read-only scopes reads; both enable RLS before the publication step), the
+refusal names read-only tenant tables among the ways out, and a nullable tenant column
+is refused up front with an ERROR row instead of an exception halfway through the
+activation. Applied to the dev database by hand (`CREATE OR REPLACE` of the function
+alone; it has no template variables).
+
+**Proof.** `enable_scoping.py` (offline, a scratch database rendered from the templates,
+6 checks): a read-only tenant table enables with RLS on, the catalogue naming the column
+and the table published; the dry run changes nothing; a nullable tenant column and an
+unscoped table are refused with nothing applied; writable tenant and public tables still
+enable. Run against the committed template first, checks 1 to 4 failed; with the fix all
+six pass. `render`, `tzguard`, `tenant_writes`, `guards`, `envcheck`, `pubname` green.
+`generations` fails on its fifth check, "writer INSERT was not refused", which predates
+this: since the standby work (`443ce17`, 2026-09-05) the writer is deliberately granted
+the reader's bookkeeping privileges on `zebridge_generations`, and the scenario still
+expects the old refusal. Stale test — fixed the next day: check 5 now asserts the
+writer CAN insert (the standby grant) and, like the reader, cannot update (8/8).
+
+**The README's migration examples, rewritten on the same evidence (2026-09-15).** Every
+SQL block of `README.md` "Migrations → Examples" was extracted and run in rolled-back
+transactions against the dev database, table names prefixed: the public and the private
+read-only enables, the writable table and its enable, both "bad" tables (each refused by
+the timestamp guard on the column the text names), both migrations on legacy copies
+holding rows (a single `ALTER TABLE` each; the writable one gives the new `NOT NULL`
+tenant column a default for the existing rows, then drops it), the resulting table, and
+the empty-table re-key. All behave as written. The populated re-key now points at the
+MIGRATIONS.md recipe: the old six-statement version failed at `DROP CONSTRAINT` as soon
+as another table referenced the key, ran outside a transaction, and never re-ran
+`zebridge_enable`.

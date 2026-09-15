@@ -1742,6 +1742,17 @@ BEGIN
         RETURN QUERY SELECT 'preflight', 'ERROR', format('%s has no column %I', tbl, tenant_col);
         RETURN;
     END IF;
+    -- A nullable tenant column cannot route a row (NULL has no stream) and the scoping
+    -- functions refuse it; said here, before anything is applied, rather than as an
+    -- exception halfway through the activation.
+    IF tenant_col IS NOT NULL AND EXISTS (
+        SELECT 1 FROM pg_attribute WHERE attrelid = tbl AND attname = tenant_col
+          AND attnum > 0 AND NOT attisdropped AND NOT attnotnull
+    ) THEN
+        RETURN QUERY SELECT 'preflight', 'ERROR',
+            format('%s.%I is nullable: a tenant column must be NOT NULL (a row with no tenant has no stream to ride)', tbl, tenant_col);
+        RETURN;
+    END IF;
 
     -- ⚠️ **Scoping must exist BEFORE the table is published**, and that ordering is not a
     -- preference — `zebridge_publication_guard` is an event trigger that refuses
@@ -1773,11 +1784,16 @@ BEGIN
               OR EXISTS (SELECT 1 FROM public.zebridge_catalogue cat
                          WHERE cat.tbl = short AND cat.tenant_col IS NULL)
               OR public_reason IS NOT NULL
-              OR (writable AND tenant_col IS NOT NULL);   -- scope_writes_by_tenant enables RLS
+              -- A tenant column scopes the table either way: writable, through
+              -- scope_writes_by_tenant; read-only, through scope_reads_by_tenant (the
+              -- ELSIF branch below). Both enable RLS before the publication step.
+              -- §10fx: this used to read `(writable AND tenant_col IS NOT NULL)`, which
+              -- refused every read-only tenant table and left that branch unreachable.
+              OR tenant_col IS NOT NULL;
     IF NOT scoped THEN
         RETURN QUERY SELECT 'preflight', 'ERROR',
             format('%s would be published unscoped, which zebridge_publication_guard refuses. '
-                   'Pick one: (a) writable => true with tenant_col, which enables RLS; '
+                   'Pick one: (a) tenant_col => ''<column>'', which enables RLS (writable or read-only); '
                    '(b) public_reason => ''why everyone may read this'', recorded in '
                    'zebridge_catalogue; (c) call zebridge_scope_publication_to_one_tenant() '
                    'first for a one-bridge-per-tenant deployment.', tbl);
