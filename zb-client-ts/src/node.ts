@@ -14,13 +14,29 @@ export const nodeStorage: StorageFactory = (dbName) => {
   // from not holding, and the browser adapter had the opposite default.
   db.pragma('foreign_keys = ON');
 
+  // §10gp: prepared statements, kept by their text. better-sqlite3 compiles the SQL on
+  // every `prepare`, and the CDC path runs the same handful of statements — one per
+  // (table, operation, column set) — thousands of times a second. libzb's storage has
+  // had this cache for as long; this side was paying the compile on every event. Cleared
+  // wholesale past the cap: a replica has few shapes, and a DDL change makes new text.
+  const stmts = new Map<string, any>();
+  const prepared = (text: string) => {
+    let st = stmts.get(text);
+    if (st === undefined) {
+      if (stmts.size >= 512) stmts.clear();
+      st = db.prepare(text);
+      stmts.set(text, st);
+    }
+    return st;
+  };
+
   const exec: Exec = async (q, ...params) => {
     const text = q.trim().replace(/;\s*$/, '');
     if (/^PRAGMA\b/i.test(text)) {
       const r = db.pragma(text.replace(/^PRAGMA\s+/i, ''));
       return Array.isArray(r) ? r : [];
     }
-    const stmt = db.prepare(text);
+    const stmt = prepared(text);
     // Binding is SEMANTICS, so it belongs to the contract (storage.ts): sqlocal's
     // wasm SQLite binds JS booleans as 0/1 and undefined as NULL; better-sqlite3
     // REFUSES both ("can only bind numbers, strings, bigints, buffers, and

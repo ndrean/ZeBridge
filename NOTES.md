@@ -13297,3 +13297,45 @@ behind, take the gap, re-seed from a chain that covers it, and end equal to Post
 zb-client-ts follows live to 20k events a second on this Mac (0 gaps); libzb to 60k. The TS
 apply path is the slower of the two and has never been optimised — the same per-event shape
 as libzb's, one statement at a time.
+
+## 10gp. Making the clients apply faster: one win, one revert (2026-09-16)
+
+The harness now samples each client's replica every 5 s while the load runs and reports the
+rows it applied per second (`apply_rows_s`), so a change can be judged by a number instead
+of pass/fail at a rate. ⚠️ The number is only meaningful while the client is NOT re-seeding:
+a seed wipes and refills, the per-sample rate collapses, and the median follows it (a 60k
+run reported 305 rows/s while applying 1.8M rows correctly). Read it beside `gaps`.
+
+**Run-to-run variance is about 15%.** The same libzb configuration measured 34,088 and
+28,761 rows/s on two clean runs. Nothing under ~20% counts as a result here — and every
+measurement needs the machine to itself: one run of mine was polluted by a `tsc` and a test
+suite started beside it, and I nearly drew a conclusion from it.
+
+**Reverted: skipping the existence probe in libzb.** `updateOrUpsert` probes with a SELECT
+before choosing UPDATE or upsert; the probe exists for a PARTIAL payload, whose INSERT arm
+would fail before the conflict resolves. CDC sends the whole tuple, so I let a full payload
+go straight to the upsert: one statement instead of two. Measured twice, cleanly: the client
+ended with 2.58M of 3M rows and 28 of 60 batches wrong — the row counts right and `sum(age)`
+short, so UPDATES were lost, not rows. The likely mechanism is the one the original comment
+names: the INSERT arm fails on the replica's own shape (my `whole` test asked the
+descriptor's columns, not the table's), the batch's transaction rolls back, and the isolated
+replay drops what cannot land. The apply rate had not moved beyond noise either
+(36,502 against a 34,088 baseline). Reverted; the probe stays, and the comment now has a
+measurement behind it.
+
+**Kept: prepared statements in the TS client's Node storage.** `better-sqlite3` compiles the
+SQL on every `db.prepare`, and the Node adapter called it per statement — while libzb's
+`storage.zig` has cached by SQL text all along (256 entries). The CDC path runs the same
+handful of statements, one per (table, operation, column set), thousands of times a second.
+A `Map<string, Statement>` in `nodeStorage`, cleared wholesale past 512:
+
+| zb-client-ts, 60 s loads | before | with the cache |
+| --- | --- | --- |
+| 40k events/s | 11,939 rows/s, 9 gaps, caught up 77.1 s | **19,391 rows/s, 0 gaps, 70.5 s** |
+| 60k events/s | 13 gaps, correct | 11 gaps, correct, 83.7 s |
+
+So the TS client follows 40,000 events a second live where it followed 20,000, and its
+ceiling moved to between 40k and 60k. libzb still follows 60k. Both remain per-event
+appliers: the bulk path each of them already uses for chain chunks (libzb's `ChainStep`,
+the TS `json_each` apply) is the next lever, and the only one left that can reach the
+chain's own ~90,000 rows/s.

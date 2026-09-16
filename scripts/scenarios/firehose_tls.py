@@ -108,6 +108,13 @@ def load_sql(path: pathlib.Path, seconds: int, rate: int):
     path.write_text("\n".join(lines) + "\n")
 
 
+def apply_rate(marks: list) -> int | None:
+    """§10gp: rows a client applied per second while the load ran — the median of the
+    per-sample rates, so one stall (a re-seed, a checkpoint) does not set the number."""
+    rates = [(b[1] - a[1]) / (b[0] - a[0]) for a, b in zip(marks, marks[1:]) if b[0] > a[0] and b[1] >= a[1]]
+    return int(statistics.median(rates)) if rates else None
+
+
 def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done: threading.Event, catch_up_s: int = 900) -> dict:
     """§10gn: the same measurement for zb-client-ts (Node, SQLite through
     `examples/04-node-consumer/follow-worker.ts`). The follower writes its own replica file;
@@ -144,13 +151,25 @@ def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done:
         except Exception:
             return {}
 
+    def rows_now() -> int:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            try: return int(con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0])
+            finally: con.close()
+        except Exception:
+            return -1
+
     pg: dict = {}
     end = time.time() + catch_up_s
     got: dict = {}
+    marks: list = []  # §10gp: (t, rows) during the load — the apply rate to optimise against
     while time.time() < end:
         if not load_done.is_set():
             end = time.time() + catch_up_s  # the budget runs from the end of the load
-            time.sleep(1)
+            n = rows_now()
+            if n >= 0:
+                marks.append((time.time(), n))
+            time.sleep(5)
             continue
         if not pg:
             time.sleep(15)  # the bridge publishes the load's tail
@@ -172,6 +191,7 @@ def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done:
     text = (run_dir / "ts-client.log").read_text(errors="replace")
     diff = sorted(b for b in set(pg) | set(got) if pg.get(b) != got.get(b))
     return {"connect_s": round(connect_s, 1), "caught_up_s": round(caught, 1) if not diff else None,
+            "apply_rows_s": apply_rate(marks),
             "pg_rows": sum(n for n, _ in pg.values()), "client_rows": sum(n for n, _ in got.values()),
             "batches": len(pg), "batches_wrong": len(diff), "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]],
             "gaps": text.count("pruned"), "reseeds": text.count("seeded"),
@@ -246,6 +266,8 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
         polls, errors, got = 0, [], {}
         end = time.time() + catch_up_s
         next_check = 0.0
+        next_mark = 0.0
+        marks: list = []  # §10gp: (t, rows) during the load
         during_load_polls = 0
         while time.time() < end:
             p = take(lib.zb_client_poll(h, 1000))
@@ -257,6 +279,11 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
             if load_done is not None and not load_done.is_set():
                 during_load_polls += 1
                 end = time.time() + catch_up_s  # the budget runs from the end of the load
+                if time.time() >= next_mark:
+                    next_mark = time.time() + 5
+                    r = take(lib.zb_client_query(h, f"SELECT count(*) FROM {TABLE}".encode(), b"[]"))
+                    if "rows" in r:
+                        marks.append((time.time(), int(r["rows"][0][0])))
                 continue
             if load_done is not None and not pg:
                 time.sleep(15)  # the bridge publishes the load's tail
@@ -270,7 +297,7 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
         got = got or local()
         diff = sorted(b for b in set(pg) | set(got) if pg.get(b) != got.get(b))
         return {"sync_error": sync_error, "seed_s": round(seed_s, 1), "caught_up_s": round(caught_s, 1) if not diff else None, "polls": polls,
-                "polls_during_load": during_load_polls,
+                "polls_during_load": during_load_polls, "apply_rows_s": apply_rate(marks),
                 "pg_rows": sum(n for n, _ in pg.values()), "client_rows": sum(n for n, _ in got.values()),
                 "batches": len(pg), "batches_wrong": len(diff),
                 "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]], "poll_errors": errors[:5],
