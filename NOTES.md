@@ -13567,3 +13567,51 @@ a row PostgreSQL no longer has, for ever. It takes the base instead, and the row
   the promise a client actually feels — NO base, no reload — plus that the chain holds a
   checkpoint covering the absence. When retention is by checkpoints the same client will
   take `['checkpoint', …, 'delta']` and the assertion still holds.
+
+## 10gw. Retention by the chain's levels — the generation count stops deciding (2026-09-16)
+
+Step 3, and the point of the whole design. Retention no longer counts generations:
+
+  * the newest **base** is kept, and everything older than it goes;
+  * **checkpoints** are kept from that base on — they are how a returning client walks the
+    distance the deltas no longer cover;
+  * a **delta** is kept only above the newest checkpoint: below it the checkpoint carries
+    the same rows in one object.
+
+A pair whose lane has STALLED keeps its deltas: with no checkpoint above the base, the
+checkpoint mark IS the base and nothing between them is pruned. Pruning deltas down to a
+checkpoint that never came would strand every returning client on the base.
+
+**The base is rebuilt when the checkpoints since it outweigh it** (`obj_bytes` on the row,
+`GENERATION_BASE_REBUILD_PERCENT`, default 100): past that a client applying them pays more
+than a reload. Otherwise a base comes only from a correctness rule (epoch, shape, TRUNCATE,
+deletes on an unguarded table) or the size rule. The depth rotation is a VALVE now, and
+only opens when the lane has stalled — no checkpoint above the base at all.
+
+**⚠️ The valve on generation count alone undid the design.** First written as "depth ×
+factor generations since the base", it fired every ~50 s at 100k events a second and
+rebuilt six whole-table fulls in five minutes while the lane was cutting checkpoints
+perfectly well — exactly what checkpoints exist to stop. It now asks whether there IS a
+checkpoint, not how many generations have passed.
+
+**Measured, 300 s at 100k events/s, 2M preloaded rows, checkpoints every 30 s:**
+
+| | depth rotation (§10gr) | valve on count | valve on a stalled lane |
+| --- | --- | --- | --- |
+| whole-table fulls | 7 | 6 | **2** (the outweigh rule) |
+| "built at the limit" | 48 | 46 | **0** |
+| holes | 0 of 251 | 0 of 252 | 0 of 250, margin +83 |
+| events published | 99,213/s | 98,983/s | 99,734/s |
+| bridge RSS median / max | 1,656 / 3,074 MiB | 999 / 2,136 MiB | 1,445 / 2,728 MiB |
+
+And what a returning client now fetches, from `incremental.py` (12/12):
+
+| the client | before step 3 | after |
+| --- | --- | --- |
+| away past the old chain | `['full', 'checkpoint', 'checkpoint', 'delta'×6]` | `['full', 'checkpoint', 'delta'×3]` |
+| past the gc watermark | `['full', 'checkpoint'×2, 'delta'×8]` | `['full', 'checkpoint', 'delta'×4]` |
+
+The case that used to prove "away past the chain → the base" no longer can: with checkpoints
+the same client is carried incrementally, which is the improvement. It now drives the base
+through §10gw's own rule — the checkpoints outweigh the base, the lane rebuilds it, the
+checkpoints below it retire — and asserts the base from there.

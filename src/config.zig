@@ -682,6 +682,11 @@ pub const Generations = struct {
     /// young table's full is cheap, which is this rule's whole premise) but surprising:
     /// `incremental.py` waited three minutes for a checkpoint that was never coming.
     pub const min_checkpoint_rows: i64 = 100_000;
+    /// §10gw: rebuild the base when the checkpoints since it weigh more than this percent
+    /// of it. Past that a returning client would apply more bytes walking the chain than
+    /// reloading the table, which is the only reason a base is ever rebuilt once the
+    /// generation count stops deciding.
+    pub const default_base_rebuild_percent: u32 = 100;
     /// §10ge: a full owed only to the depth rotation waits while its pair's stream is
     /// short of time, but no longer than `depth × full_defer_factor` generations after
     /// the last full: the chain a returning client applies stays bounded.
@@ -744,6 +749,8 @@ pub const RuntimeConfig = struct {
     generation_retire_windows: u32 = Generations.default_retire_windows,
     /// §10gt: seconds between checkpoints (GENERATION_CHECKPOINT_SECONDS); 0 disables them.
     generation_checkpoint_seconds: u64 = Generations.default_checkpoint_seconds,
+    /// §10gw: GENERATION_BASE_REBUILD_PERCENT.
+    generation_base_rebuild_percent: u32 = Generations.default_base_rebuild_percent,
     /// §10fk: the mutation ingress rate limit, writes per second per principal (and
     /// per tenant); 0 is off. `mutation_rate_burst` is the bucket's size — what a
     /// client may send at once after a quiet spell; 0 means one second's worth.

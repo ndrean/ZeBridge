@@ -563,6 +563,7 @@ pub const Args = struct {
         runtime_config.generation_retire_windows = envUint(u32, init, "GENERATION_RETIRE_WINDOWS", config.Generations.default_retire_windows, 1, 64);
         // §10gt: 0 turns checkpoints off (the chain is then a full and its deltas, as before).
         runtime_config.generation_checkpoint_seconds = envUint(u64, init, "GENERATION_CHECKPOINT_SECONDS", config.Generations.default_checkpoint_seconds, 0, 86_400);
+        runtime_config.generation_base_rebuild_percent = envUint(u32, init, "GENERATION_BASE_REBUILD_PERCENT", config.Generations.default_base_rebuild_percent, 1, 10_000);
         runtime_config.fleet_poll_seconds = envUint(u64, init, "FLEET_POLL_SECONDS", config.Fleet.default_poll_seconds, config.Fleet.min_poll_seconds, config.Fleet.max_poll_seconds);
         runtime_config.fleet_ttl_seconds = envUint(u64, init, "FLEET_TTL_SECONDS", config.Fleet.default_ttl_seconds, config.Fleet.min_ttl_seconds, config.Fleet.max_ttl_seconds);
         runtime_config.slot_inventory_seconds = envUint(u64, init, "SLOT_INVENTORY_SECONDS", config.WalMonitor.default_slot_inventory_seconds, config.WalMonitor.min_slot_inventory_seconds, config.WalMonitor.max_slot_inventory_seconds);

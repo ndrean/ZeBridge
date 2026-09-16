@@ -221,6 +221,11 @@ def main() -> int:
             "NATS_URL": url, "LOG_LEVEL": "debug", "GENERATIONS_ENABLED": "true",
             "GENERATION_CADENCE_SECONDS": str(CADENCE),
             "GENERATION_CHECKPOINT_SECONDS": str(CHECKPOINT_S),
+            # ⚠️ 1%: the base here is ~3 MB and a checkpoint ~25 KB, so the production
+            # default (100%) would need a hundred of them — half an hour — before the base
+            # is rebuilt. Case 3 needs that rebuild, and it is the §10gw rule itself that
+            # must produce it, not a TRUNCATE standing in for one.
+            "GENERATION_BASE_REBUILD_PERCENT": "1",
             # ⚠️ Deep enough that the depth rotation does NOT rebuild a full every few
             # cuts: a checkpoint is due `CHECKPOINT_S` after the last checkpoint OR FULL,
             # so a chain that keeps making fulls never makes a checkpoint. At depth 3 and a
@@ -300,20 +305,26 @@ def main() -> int:
         check(got == want, "away across checkpoints: the replica equals PostgreSQL", f"{len(got)} rows")
         c2.close()
 
-        # ── 3. away past the chain: the base ──────────────────────────────────
+        # ── 3. away until the base is REBUILT: the base ───────────────────────
+        # With retention by levels a client away a long time is carried by checkpoints —
+        # §10gw's whole point, and what this case asserted before it. The base comes back
+        # only when the base itself is replaced: the checkpoints since it outweigh it, the
+        # lane rebuilds it, and the checkpoints below it retire with everything else older.
         c3, wm3 = away("stale")
         # The chain rebuilds its full and prunes past this watermark (depth 3 here).
         for i in range(14):  # past the depth, so the chain's full is rebuilt beyond this client
             insert(300, 40_001 + i * 1000)
             time.sleep(CADENCE)
-        wait_for(lambda: (manifest(cli).get("full") or {}).get("cutoff", "") > wm3, "a full newer than the client", timeout=120)
+        wait_for(lambda: (manifest(cli).get("full") or {}).get("cutoff", "") > wm3,
+                 "the base to be rebuilt past the client", timeout=180,
+                 diagnose=lambda: checkpoint_state(cli, wm3), each=write_a_little)
         steps = plan_for(lib, manifest(cli), wm3)
-        check(steps[:1] == ["full"], "away past the chain: the base", f"plan {steps}")
+        check(steps[:1] == ["full"], "away past the rebuilt base: the base", f"plan {steps}")
         c3 = Client(lib, url, tmp / "stale.sqlite3", "stale")
         c3.sync()
         want = rows_in_pg()
         got = catch_up(c3, want)
-        check(got == want, "away past the chain: the replica equals PostgreSQL", f"{len(got)} rows")
+        check(got == want, "away past the rebuilt base: the replica equals PostgreSQL", f"{len(got)} rows")
         c3.close()
 
         # ── 4. away past the gc watermark, with a reaped delete ───────────────

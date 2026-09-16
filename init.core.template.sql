@@ -700,6 +700,10 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS open_xact_floor
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_checkpoint boolean NOT NULL DEFAULT false;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_lower timestamptz;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_dict_object text;
+-- §10gw: the compressed size of the full or checkpoint attached to this row. The base is
+-- rebuilt when the checkpoints since it outweigh it — a client applying them would
+-- otherwise pay more than a reload — and that comparison needs both sides on the record.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS obj_bytes bigint;
 -- §10gq: when this generation left the manifest. Its objects stay in the store for
 -- GENERATION_RETIRE_GRACE_SECONDS after it, because a client may be READING them: a seed
 -- of a big full takes minutes while a busy pair replaces its full every few seconds. One
@@ -733,7 +737,7 @@ GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER
 -- a full and which dictionary goes with it. The background full lane attaches a full to an
 -- existing generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the
 -- counts, the epoch, the shape) stays unwritable once inserted.
-GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at, has_checkpoint, ckpt_lower, ckpt_dict_object) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
+GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at, has_checkpoint, ckpt_lower, ckpt_dict_object, obj_bytes) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
 
 -- §10gl: the start of the oldest transaction open in this database, for the generation
 -- producer's delta floor. pg_stat_activity hides other roles' sessions from the reader

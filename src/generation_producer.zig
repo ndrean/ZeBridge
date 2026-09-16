@@ -121,6 +121,8 @@ pub const GenerationProducer = struct {
     retire_windows: u32 = config.Generations.default_retire_windows,
     /// §10gt: seconds between checkpoints; 0 turns the middle level off.
     checkpoint_s: u64 = config.Generations.default_checkpoint_seconds,
+    /// §10gw: the base is rebuilt when the checkpoints since it weigh this much of it.
+    base_rebuild_percent: u32 = config.Generations.default_base_rebuild_percent,
     /// §10gl: preflight's edge-writability verdicts. A table the edge writes keeps the
     /// fixed version tolerance under its delta floor: a client's version can trail the
     /// database clock by that much. Null (tests), or a table it does not know: kept too.
@@ -1106,7 +1108,44 @@ pub const GenerationProducer = struct {
         var build_full = last_full_gen == 0;
         // The depth rotation: the only full no correctness asks for — it bounds the chain
         // a returning client applies. §10ge decides below whether it waits.
-        const depth_due = last_full_gen != 0 and (gen - last_full_gen) >= @as(i64, self.chain_depth) - 1;
+        // §10gw: the chain's shape in one read — what the base weighs, what the
+        // checkpoints above it weigh, and whether there are any at all. Both rules below
+        // need it, and a second query would let them disagree.
+        var base_bytes: i64 = 0;
+        var ckpt_bytes: i64 = 0;
+        var ckpt_above: i64 = 0;
+        if (self.checkpoint_s > 0 and last_gen > 0) {
+            const shape_params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+            const res = queryOne(bkc, "WITH base AS (SELECT COALESCE(max(gen), 0) AS gen FROM public.zebridge_generations " ++
+                "                      WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL) " ++
+                "SELECT COALESCE((SELECT obj_bytes FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen = (SELECT gen FROM base)), 0), " ++
+                "       COALESCE(sum(obj_bytes), 0), count(*) " ++
+                "FROM public.zebridge_generations " ++
+                "WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL AND gen > (SELECT gen FROM base)", &shape_params) catch null;
+            if (res) |r| {
+                defer c.PQclear(r);
+                base_bytes = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 0)), 10) catch 0;
+                ckpt_bytes = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 1)), 10) catch 0;
+                ckpt_above = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(r, 0, 2)), 10) catch 0;
+            }
+        }
+
+        // §10gw: with checkpoints on, the generation COUNT no longer asks for a full — the
+        // base is rebuilt by a correctness rule, by the size rule, or when the checkpoints
+        // outweigh it (above), never on a clock. The depth rule stays as a VALVE at four
+        // times the depth: a lane that has stalled leaves the chain growing with no
+        // checkpoint to prune against, and this bounds that without undoing the design.
+        const depth_reach: i64 = if (self.checkpoint_s > 0)
+            @as(i64, self.chain_depth) * config.Generations.full_defer_factor
+        else
+            @as(i64, self.chain_depth) - 1;
+        // ⚠️ And the valve only opens when the lane has actually STALLED — no checkpoint
+        // above the base at all. Measured without this: at 100k events a second the valve
+        // fired every 24 generations (~50 s) and rebuilt six whole-table fulls in five
+        // minutes, while the lane was cutting checkpoints perfectly well. That is the very
+        // thing checkpoints exist to stop.
+        const lane_stalled = self.checkpoint_s == 0 or ckpt_above == 0;
+        const depth_due = last_full_gen != 0 and (gen - last_full_gen) >= depth_reach and lane_stalled;
         // §10df, decided HERE — before anything below builds or names the full. Placed
         // after the full-building blocks once, it only flipped the label: bookkeeping
         // and manifest claimed a full that was never written (measured, a client
@@ -1485,6 +1524,17 @@ pub const GenerationProducer = struct {
             }
         }
 
+        // ── §10gw: has the base been outweighed? ─────────────────────────────
+        // Once the generation count stops deciding, this is the only reason a base is
+        // rebuilt without a correctness rule asking: when the checkpoints since it weigh
+        // more than it does, a returning client applying them pays more than a reload.
+        if (self.checkpoint_s > 0 and self.async_fulls and !build_full and
+            base_bytes > 0 and ckpt_bytes * 100 > base_bytes * @as(i64, self.base_rebuild_percent))
+        {
+            if (self.requestFull(tenant, table, vcol, tcol, .full))
+                log.info("🧬 '{s}'/'{s}': the {d} checkpoint(s) since the base weigh {d} bytes against its {d} ({d}% is the bar) — the lane rebuilds the base", .{ tenant, table, ckpt_above, ckpt_bytes, base_bytes, self.base_rebuild_percent });
+        }
+
         // ── 3. content: full and/or delta against the SAME snapshot ──────────
         // §10gi: the store is opened before the content, since a full is written to it
         // while COPY reads (the snapshot stays open for the upload).
@@ -1774,15 +1824,17 @@ pub const GenerationProducer = struct {
             const count_z: ?[*:0]const u8 = if (row_count_now) |n| (try utils.allocPrintZ(alloc, "{d}", .{n})).ptr else null;
             const floor_z: ?[*:0]const u8 = if (floor_now) |f| (try alloc.dupeZ(u8, f)).ptr else null;
             const filenode_z: ?[*:0]const u8 = if (filenode_now.len > 0) (try alloc.dupeZ(u8, filenode_now)).ptr else null;
+            // §10gw: what this row's full weighs, for the rule that decides the next base.
+            const obj_bytes_z: ?[*:0]const u8 = if (full_obj) |fo| (try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes})).ptr else null;
             const del_z = try utils.allocPrintZ(alloc, "{d}", .{del_count_now});
             const epoch_z = try utils.allocPrintZ(alloc, "{d}", .{cat_epoch});
             const shape_z = try alloc.dupeZ(u8, col_shape);
             const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
             const ratio_z: ?[*:0]const u8 = if (build_full) (if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null) else null;
             const full_dict_z: ?[*:0]const u8 = if (build_full) dict_obj_z else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z, full_dict_z, floor_z, filenode_z };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio, full_dict_object, open_xact_floor, filenode) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint, $16, $17::timestamptz, $18::oid) " ++
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z, full_dict_z, floor_z, filenode_z, obj_bytes_z };
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio, full_dict_object, open_xact_floor, filenode, obj_bytes) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint, $16, $17::timestamptz, $18::oid, $19::bigint) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -1792,7 +1844,7 @@ pub const GenerationProducer = struct {
         if (build_full) self.recordFullBuild(tenant, table, utils.unixMillis() - build_started_ms);
 
         // ── 6. prune past the chain depth: PG rows (authority), then objects ──
-        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen), self.retire_grace_s, self.retire_windows);
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen), self.retire_grace_s, self.retire_windows, self.checkpoint_s > 0);
 
         // The duration is the number the retention contract needs (§10em): the CDC
         // window must cover two cadences AND this, since the cut is taken before the
@@ -2227,16 +2279,18 @@ pub const GenerationProducer = struct {
         if (j.kind == .checkpoint) {
             const lower_z = try alloc.dupeZ(u8, ckpt_lower);
             const dict_name_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, lower_z.ptr, dict_name_z };
-            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_lower = $4::timestamptz, ckpt_dict_object = $5 " ++
+            const bytes_z = try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes});
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, lower_z.ptr, dict_name_z, bytes_z.ptr };
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_lower = $4::timestamptz, ckpt_dict_object = $5, obj_bytes = $6::bigint " ++
                 "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
             c.PQclear(res);
         } else {
             const dict_hex_z: ?[*:0]const u8 = if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null;
             const dict_name_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
             const ratio_z: ?[*:0]const u8 = if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, dict_hex_z, dict_name_z, ratio_z };
-            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_full = true, dict = decode($4, 'hex'), full_dict_object = $5, dict_ratio = $6::smallint " ++
+            const bytes_z = try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes});
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, dict_hex_z, dict_name_z, ratio_z, bytes_z.ptr };
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_full = true, dict = decode($4, 'hex'), full_dict_object = $5, dict_ratio = $6::smallint, obj_bytes = $7::bigint " ++
                 "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
             c.PQclear(res);
         }
@@ -2288,7 +2342,7 @@ pub const GenerationProducer = struct {
         try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &out.writer);
         _ = try kv.put(key, out.written(), .{});
 
-        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from, self.retire_grace_s, self.retire_windows);
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from, self.retire_grace_s, self.retire_windows, self.checkpoint_s > 0);
         const total_ms = utils.unixMillis() - started_ms;
         self.recordFullBuild(tenant, table, total_ms);
         log.info("🧬 '{s}'/'{s}': background {s} attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: build (count+copy+encode+zstd+upload) {d}, dictionary {d}{s}, dictionary upload {d}; deltas kept cutting meanwhile{s}", .{
@@ -2879,15 +2933,37 @@ fn hexDecode(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// — min(grace, windows x replacement interval) — and the storage is bounded at
 /// `keep_windows` fulls. A pair that replaces its full every few seconds is the case
 /// incremental fulls remove: a base is replaced rarely, and then the grace alone binds.
-fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z: [:0]const u8, table_z: [:0]const u8, table: []const u8, keep_from: i64, grace_s: u64, keep_windows: u32) !void {
-    if (keep_from <= 0) return;
-    const keep_z = try utils.allocPrintZ(alloc, "{d}", .{keep_from});
-    {
+fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z: [:0]const u8, table_z: [:0]const u8, table: []const u8, keep_from: i64, grace_s: u64, keep_windows: u32, by_levels: bool) !void {
+    if (by_levels) {
+        // §10gw: retention by the chain's LEVELS, not by counting generations.
+        //   * the newest base is kept, and everything older than it goes;
+        //   * checkpoints are kept from that base on — they are how a returning client
+        //     walks the distance the deltas no longer cover;
+        //   * a delta is kept only above the newest checkpoint: below it the checkpoint
+        //     carries the same rows in one object.
+        // ⚠️ A pair whose lane has STALLED keeps its deltas: with no checkpoint above the
+        // base, `ckpt` IS the base and nothing between them is pruned. That is the safe
+        // direction — pruning deltas down to a checkpoint that never came would strand
+        // every returning client on the base.
+        const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+        const res = try GenerationProducer.queryOnePub(bkc,
+            "WITH base AS (SELECT COALESCE(max(gen), 0) AS gen FROM public.zebridge_generations " ++
+            "              WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL), " ++
+            "     ckpt AS (SELECT COALESCE(max(gen), (SELECT gen FROM base)) AS gen FROM public.zebridge_generations " ++
+            "              WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL " ++
+            "                AND gen >= (SELECT gen FROM base)) " ++
+            "UPDATE public.zebridge_generations g SET retired_at = now() " ++
+            "WHERE g.tenant=$1 AND g.tbl=$2 AND g.retired_at IS NULL AND (SELECT gen FROM base) > 0 " ++
+            "  AND (g.gen < (SELECT gen FROM base) " ++
+            "       OR (g.gen < (SELECT gen FROM ckpt) AND NOT g.has_checkpoint AND g.gen <> (SELECT gen FROM base)))", &params);
+        c.PQclear(res);
+    } else if (keep_from > 0) {
+        const keep_z = try utils.allocPrintZ(alloc, "{d}", .{keep_from});
         const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_z.ptr };
         const res = try GenerationProducer.queryOnePub(bkc, "UPDATE public.zebridge_generations SET retired_at = now() " ++
             "WHERE tenant=$1 AND tbl=$2 AND gen <= $3 AND retired_at IS NULL", &params);
         c.PQclear(res);
-    }
+    } else return;
     // Gone: past the grace, or superseded by a newer retirement (the one-window bound).
     const grace_z = try utils.allocPrintZ(alloc, "{d}", .{grace_s});
     const windows_z = try utils.allocPrintZ(alloc, "{d}", .{keep_windows});
