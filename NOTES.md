@@ -13399,3 +13399,36 @@ for the pair, which serves the same purpose — either way nothing is built inli
 The memory is the price: two more fulls in the lane's lifetime, and the retirement grace
 (§10gq) keeping four windows of objects. Deltas are still built in memory (§10gj) and remain
 the next thing to stream.
+
+## 10gs. Both planners speak the incremental chain (2026-09-16)
+
+Step 1 of the incremental fulls plan, and it needs no producer: the manifest may now carry
+a `base` (the whole table — `full` under the older name is read as the same thing),
+`checkpoints` (rows whose version moved in each one's window, tombstones included) and the
+`deltas` as before, plus the live `gc_watermark` at the cut. Seven cases added to
+`fixtures/core-fixtures.json`, the spec both cores answer to, and both now satisfy them.
+
+The walk, in order — the first rule is the one that matters:
+
+1. **`watermark < gc_watermark` → the base.** Before any arithmetic on cutoffs. A row
+   deleted while this replica was away may have been REAPED since, and no checkpoint or
+   delta carries an absence; only a wipe-and-reload can remove it. The sweeper cannot reap
+   a tombstone newer than the watermark, which is exactly what makes the rules below sound.
+2. **The deltas reach the watermark** → those deltas alone (as before).
+3. **The checkpoints reach it** (the oldest kept checkpoint's `lower` is at or before the
+   watermark) → every checkpoint whose cutoff is newer, then the deltas. Overlap between
+   the two is harmless: version-guarded upserts, tombstones deleting by key. So the rule is
+   "everything newer than the watermark", not "exactly the gap".
+4. **Otherwise the base**, then the checkpoints and deltas above its generation.
+
+A checkpoint applies exactly as a delta does, so it is a new step kind (`checkpoint`) that
+an applier can treat as one; only the base wipes, and it keeps the step kind `full` that
+both clients already act on — nothing in the apply path had to change for this.
+
+Measured by the runner: without the Zig half, 7 fixture failures (5 of them the new cases);
+with it, 176 pass and the only 2 failures are `createTable`/`rebuildSteps` on SQLite STRICT,
+which predate this work. TS: 184 pass.
+
+Not done here: the producer builds no checkpoint yet (step 2), and the manifest carries no
+`gc_watermark` yet — the planner reads it when it is there and behaves exactly as before
+when it is not, so this lands safely ahead of the producer.

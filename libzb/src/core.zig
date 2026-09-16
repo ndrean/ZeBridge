@@ -769,10 +769,17 @@ pub fn buildMutation(a: std.mem.Allocator, args: Value) !Value {
 
 // ─── chain planning (§10n) ──────────────────────────────────────────────────
 
-/// core.ts planFromManifest.
+/// core.ts planFromManifest. The incremental chain (§10gs): a base (the whole table, the
+/// manifest's `base` or, under the older name, `full`), checkpoints (rows whose version
+/// moved inside each one's window, tombstones included) and deltas. A checkpoint applies
+/// exactly as a delta does; only the base wipes and reloads, so it keeps the step kind
+/// `full` the clients already act on.
 pub fn planFromManifest(a: std.mem.Allocator, man: Value, watermark: ?[]const u8) !Value {
     var plan = std.json.Array.init(a);
     const deltas: std.json.Array = getArr(man, "deltas") orelse std.json.Array.init(a);
+    const checkpoints: std.json.Array = getArr(man, "checkpoints") orelse std.json.Array.init(a);
+    const base_v = if (man == .object) (man.object.get("base") orelse man.object.get("full")) else null;
+    const base: ?Value = if (base_v != null and base_v.? == .object) base_v.? else null;
 
     var applicable = std.json.Array.init(a);
     for (deltas.items) |d| {
@@ -781,34 +788,72 @@ pub fn planFromManifest(a: std.mem.Allocator, man: Value, watermark: ?[]const u8
             try applicable.append(d);
         }
     }
+
+    // ⚠️ FIRST, before any arithmetic on cutoffs: a replica older than the gc watermark
+    // cannot be caught up incrementally. A row deleted while it was away may have been
+    // REAPED since, and no checkpoint or delta carries an absence — only the base. (The
+    // sweeper cannot reap a tombstone newer than the watermark: that is what makes the
+    // other branches sound. PROTOCOL §7.5.)
+    const gc = getStr(man, "gc_watermark");
+    const gc_too_old = watermark != null and gc != null and std.mem.order(u8, watermark.?, gc.?) == .lt;
+
     // "Reaches" = the chain continues from where this replica stands: the first
     // applicable delta starts at or before the watermark — or nothing is newer AND the
-    // chain's full itself is not newer than the watermark. A chain REBUILT after the
+    // chain's base itself is not newer than the watermark. A chain REBUILT after the
     // watermark (a fresh g1 full, no deltas: what a feed restart produces, NOTES §10bm)
-    // is unreachable, not "already applied"; the walk starts from its full.
-    const full_v = if (man == .object) man.object.get("full") else null;
-    const full_cutoff: ?[]const u8 = if (full_v != null and full_v.? == .object) getStr(full_v.?, "cutoff") else null;
-    const reaches = watermark != null and
+    // is unreachable, not "already applied"; the walk starts from its base.
+    const base_cutoff: ?[]const u8 = if (base) |b| getStr(b, "cutoff") else null;
+    const reaches = !gc_too_old and watermark != null and
         (if (applicable.items.len > 0)
             std.mem.order(u8, getStr(applicable.items[0], "prev_cutoff") orelse "", watermark.?) != .gt
         else
-            (full_cutoff == null or std.mem.order(u8, full_cutoff.?, watermark.?) != .gt));
+            (base_cutoff == null or std.mem.order(u8, base_cutoff.?, watermark.?) != .gt));
 
     if (reaches) {
         for (applicable.items) |d| try plan.append(try deltaStep(a, d));
         return .{ .array = plan };
     }
-    const full = if (man == .object) man.object.get("full") else null;
-    if (full == null or full.? == .null) return .{ .array = plan };
+
+    // The deltas do not reach it, but the checkpoints may: every checkpoint whose window
+    // ends after the watermark, then the deltas. Overlap between the two is harmless —
+    // version-guarded upserts, tombstones deleting by key — so the rule is "everything
+    // newer than the watermark", not "exactly the gap".
+    if (!gc_too_old and watermark != null and checkpoints.items.len > 0) {
+        const oldest_lower = getStr(checkpoints.items[0], "lower") orelse "";
+        if (std.mem.order(u8, oldest_lower, watermark.?) != .gt) {
+            for (checkpoints.items) |ck| {
+                if (std.mem.order(u8, getStr(ck, "cutoff") orelse "", watermark.?) == .gt) {
+                    try plan.append(try checkpointStep(a, ck));
+                }
+            }
+            for (applicable.items) |d| try plan.append(try deltaStep(a, d));
+            return .{ .array = plan };
+        }
+    }
+
+    // The base, then everything it does not already carry.
+    const b = base orelse return .{ .array = plan };
     var fstep: std.json.ObjectMap = .empty;
-    try fstep.put(a, "name", .{ .string = getStr(full.?, "object") orelse "" });
+    try fstep.put(a, "name", .{ .string = getStr(b, "object") orelse "" });
     try fstep.put(a, "kind", .{ .string = "full" });
     try plan.append(.{ .object = fstep });
-    const full_gen = getInt(full.?, "gen") orelse 0;
+    const base_gen = getInt(b, "gen") orelse 0;
+    for (checkpoints.items) |ck| {
+        if ((getInt(ck, "gen") orelse 0) > base_gen) try plan.append(try checkpointStep(a, ck));
+    }
     for (deltas.items) |d| {
-        if ((getInt(d, "gen") orelse 0) > full_gen) try plan.append(try deltaStep(a, d));
+        if ((getInt(d, "gen") orelse 0) > base_gen) try plan.append(try deltaStep(a, d));
     }
     return .{ .array = plan };
+}
+
+/// A checkpoint step: applied like a delta, named so a client can say which it took.
+fn checkpointStep(a: std.mem.Allocator, ck: Value) !Value {
+    var step: std.json.ObjectMap = .empty;
+    try step.put(a, "name", .{ .string = getStr(ck, "object") orelse "" });
+    try step.put(a, "kind", .{ .string = "checkpoint" });
+    if (getStr(ck, "dict")) |dn| try step.put(a, "dict", .{ .string = dn });
+    return .{ .object = step };
 }
 
 /// A delta step carries its dictionary name when the manifest names one (§10x).

@@ -1,2591 +1,2973 @@
 {
-  "_": "The conformance spec for the sans-I/O core (NOTES \u00a710s). Language-neutral: the TS runner is src/core.test.ts; a port (Zig, \u2026) is correct exactly when it passes every case here. Each case that encodes a measured finding names it.",
-  "seedGate": [
+ "_": "The conformance spec for the sans-I/O core (NOTES §10s). Language-neutral: the TS runner is src/core.test.ts; a port (Zig, …) is correct exactly when it passes every case here. Each case that encodes a measured finding names it.",
+ "seedGate": [
+  {
+   "name": "seq below cutoff drops",
+   "ev": {
+    "seq": 100,
+    "stream": "CDC_kilo",
+    "lsn": 999
+   },
+   "anchor": {
+    "seedSeq": 862,
+    "seedStream": "CDC_kilo"
+   },
+   "drops": true
+  },
+  {
+   "name": "seq equal to cutoff drops (<= is safe in commit order)",
+   "ev": {
+    "seq": 862,
+    "stream": "CDC_kilo"
+   },
+   "anchor": {
+    "seedSeq": 862,
+    "seedStream": "CDC_kilo"
+   },
+   "drops": true
+  },
+  {
+   "name": "seq above cutoff applies",
+   "ev": {
+    "seq": 863,
+    "stream": "CDC_kilo"
+   },
+   "anchor": {
+    "seedSeq": 862,
+    "seedStream": "CDC_kilo"
+   },
+   "drops": false
+  },
+  {
+   "name": "other stream never gated by this anchor",
+   "ev": {
+    "seq": 1,
+    "stream": "CDC_PUBLIC"
+   },
+   "anchor": {
+    "seedSeq": 862,
+    "seedStream": "CDC_kilo"
+   },
+   "drops": false
+  },
+  {
+   "name": "FINDING 7: in-flight txn — lower lsn but higher seq APPLIES when seq is primary",
+   "ev": {
+    "seq": 900,
+    "stream": "CDC_kilo",
+    "lsn": 1000
+   },
+   "anchor": {
+    "seedSeq": 862,
+    "seedStream": "CDC_kilo",
+    "seedLsn": 5000
+   },
+   "drops": false
+  },
+  {
+   "name": "FINDING 10: no anchor at all — never drop by lsn (schema lsn must not gate data)",
+   "ev": {
+    "seq": 5,
+    "stream": "CDC_PUBLIC",
+    "lsn": 10
+   },
+   "anchor": {},
+   "drops": false
+  },
+  {
+   "name": "legacy seedLsn: strictly below drops",
+   "ev": {
+    "lsn": 4999
+   },
+   "anchor": {
+    "seedLsn": 5000
+   },
+   "drops": true
+  },
+  {
+   "name": "legacy seedLsn boundary: equal APPLIES (<= loses exactly one row per seed)",
+   "ev": {
+    "lsn": 5000
+   },
+   "anchor": {
+    "seedLsn": 5000
+   },
+   "drops": false
+  },
+  {
+   "name": "legacy seedLsn: above applies",
+   "ev": {
+    "lsn": 5001
+   },
+   "anchor": {
+    "seedLsn": 5000
+   },
+   "drops": false
+  },
+  {
+   "name": "event without lsn is never dropped by the lsn fallback",
+   "ev": {
+    "seq": 7
+   },
+   "anchor": {
+    "seedLsn": 5000
+   },
+   "drops": false
+  }
+ ],
+ "chainPlan": [
+  {
+   "name": "fresh table: full plus deltas after the full's gen",
+   "manifest": {
+    "gen": 3,
+    "full": {
+     "object": "t-g1-full",
+     "gen": 1
+    },
+    "deltas": [
+     {
+      "object": "t-g2-delta",
+      "cutoff": "B",
+      "prev_cutoff": "A",
+      "gen": 2
+     },
+     {
+      "object": "t-g3-delta",
+      "cutoff": "C",
+      "prev_cutoff": "B",
+      "gen": 3
+     }
+    ]
+   },
+   "watermark": null,
+   "plan": [
     {
-      "name": "seq below cutoff drops",
-      "ev": {
-        "seq": 100,
-        "stream": "CDC_kilo",
-        "lsn": 999
-      },
-      "anchor": {
-        "seedSeq": 862,
-        "seedStream": "CDC_kilo"
-      },
-      "drops": true
+     "name": "t-g1-full",
+     "kind": "full"
     },
     {
-      "name": "seq equal to cutoff drops (<= is safe in commit order)",
-      "ev": {
-        "seq": 862,
-        "stream": "CDC_kilo"
-      },
-      "anchor": {
-        "seedSeq": 862,
-        "seedStream": "CDC_kilo"
-      },
-      "drops": true
+     "name": "t-g2-delta",
+     "kind": "delta"
     },
     {
-      "name": "seq above cutoff applies",
-      "ev": {
-        "seq": 863,
-        "stream": "CDC_kilo"
-      },
-      "anchor": {
-        "seedSeq": 862,
-        "seedStream": "CDC_kilo"
-      },
-      "drops": false
-    },
-    {
-      "name": "other stream never gated by this anchor",
-      "ev": {
-        "seq": 1,
-        "stream": "CDC_PUBLIC"
-      },
-      "anchor": {
-        "seedSeq": 862,
-        "seedStream": "CDC_kilo"
-      },
-      "drops": false
-    },
-    {
-      "name": "FINDING 7: in-flight txn \u2014 lower lsn but higher seq APPLIES when seq is primary",
-      "ev": {
-        "seq": 900,
-        "stream": "CDC_kilo",
-        "lsn": 1000
-      },
-      "anchor": {
-        "seedSeq": 862,
-        "seedStream": "CDC_kilo",
-        "seedLsn": 5000
-      },
-      "drops": false
-    },
-    {
-      "name": "FINDING 10: no anchor at all \u2014 never drop by lsn (schema lsn must not gate data)",
-      "ev": {
-        "seq": 5,
-        "stream": "CDC_PUBLIC",
-        "lsn": 10
-      },
-      "anchor": {},
-      "drops": false
-    },
-    {
-      "name": "legacy seedLsn: strictly below drops",
-      "ev": {
-        "lsn": 4999
-      },
-      "anchor": {
-        "seedLsn": 5000
-      },
-      "drops": true
-    },
-    {
-      "name": "legacy seedLsn boundary: equal APPLIES (<= loses exactly one row per seed)",
-      "ev": {
-        "lsn": 5000
-      },
-      "anchor": {
-        "seedLsn": 5000
-      },
-      "drops": false
-    },
-    {
-      "name": "legacy seedLsn: above applies",
-      "ev": {
-        "lsn": 5001
-      },
-      "anchor": {
-        "seedLsn": 5000
-      },
-      "drops": false
-    },
-    {
-      "name": "event without lsn is never dropped by the lsn fallback",
-      "ev": {
-        "seq": 7
-      },
-      "anchor": {
-        "seedLsn": 5000
-      },
-      "drops": false
+     "name": "t-g3-delta",
+     "kind": "delta"
     }
-  ],
-  "chainPlan": [
-    {
-      "name": "fresh table: full plus deltas after the full's gen",
-      "manifest": {
-        "gen": 3,
-        "full": {
-          "object": "t-g1-full",
-          "gen": 1
-        },
-        "deltas": [
-          {
-            "object": "t-g2-delta",
-            "cutoff": "B",
-            "prev_cutoff": "A",
-            "gen": 2
-          },
-          {
-            "object": "t-g3-delta",
-            "cutoff": "C",
-            "prev_cutoff": "B",
-            "gen": 3
-          }
-        ]
-      },
-      "watermark": null,
-      "plan": [
-        {
-          "name": "t-g1-full",
-          "kind": "full"
-        },
-        {
-          "name": "t-g2-delta",
-          "kind": "delta"
-        },
-        {
-          "name": "t-g3-delta",
-          "kind": "delta"
-        }
-      ]
+   ]
+  },
+  {
+   "name": "watermark reached: only newer deltas, no full",
+   "manifest": {
+    "gen": 3,
+    "full": {
+     "object": "t-g1-full",
+     "gen": 1
     },
+    "deltas": [
+     {
+      "object": "t-g2-delta",
+      "cutoff": "B",
+      "prev_cutoff": "A",
+      "gen": 2
+     },
+     {
+      "object": "t-g3-delta",
+      "cutoff": "C",
+      "prev_cutoff": "B",
+      "gen": 3
+     }
+    ]
+   },
+   "watermark": "B",
+   "plan": [
     {
-      "name": "watermark reached: only newer deltas, no full",
-      "manifest": {
-        "gen": 3,
-        "full": {
-          "object": "t-g1-full",
-          "gen": 1
-        },
-        "deltas": [
-          {
-            "object": "t-g2-delta",
-            "cutoff": "B",
-            "prev_cutoff": "A",
-            "gen": 2
-          },
-          {
-            "object": "t-g3-delta",
-            "cutoff": "C",
-            "prev_cutoff": "B",
-            "gen": 3
-          }
-        ]
-      },
-      "watermark": "B",
-      "plan": [
-        {
-          "name": "t-g3-delta",
-          "kind": "delta"
-        }
-      ]
-    },
-    {
-      "name": "watermark newer than every delta: empty plan (nothing to do)",
-      "manifest": {
-        "gen": 3,
-        "full": {
-          "object": "t-g1-full",
-          "gen": 1
-        },
-        "deltas": [
-          {
-            "object": "t-g3-delta",
-            "cutoff": "C",
-            "prev_cutoff": "B",
-            "gen": 3
-          }
-        ]
-      },
-      "watermark": "Z",
-      "plan": []
-    },
-    {
-      "name": "stale watermark the deltas cannot reach: back to the full",
-      "manifest": {
-        "gen": 4,
-        "full": {
-          "object": "t-g2-full",
-          "gen": 2
-        },
-        "deltas": [
-          {
-            "object": "t-g4-delta",
-            "cutoff": "E",
-            "prev_cutoff": "D",
-            "gen": 4
-          }
-        ]
-      },
-      "watermark": "A",
-      "plan": [
-        {
-          "name": "t-g2-full",
-          "kind": "full"
-        },
-        {
-          "name": "t-g4-delta",
-          "kind": "delta"
-        }
-      ]
-    },
-    {
-      "name": "\u00a710x: a delta naming its dictionary carries it on the step; others stay bare",
-      "manifest": {
-        "gen": 3,
-        "full": {
-          "object": "t-g1-full",
-          "gen": 1
-        },
-        "deltas": [
-          {
-            "object": "t-g2-delta",
-            "cutoff": "B",
-            "prev_cutoff": "A",
-            "gen": 2
-          },
-          {
-            "object": "t-g3-delta",
-            "cutoff": "C",
-            "prev_cutoff": "B",
-            "gen": 3,
-            "dict": "t-g1-dict"
-          }
-        ]
-      },
-      "watermark": null,
-      "plan": [
-        {
-          "name": "t-g1-full",
-          "kind": "full"
-        },
-        {
-          "name": "t-g2-delta",
-          "kind": "delta"
-        },
-        {
-          "name": "t-g3-delta",
-          "kind": "delta",
-          "dict": "t-g1-dict"
-        }
-      ]
-    },
-    {
-      "name": "a chain rebuilt AFTER the watermark (fresh full, no deltas) is unreachable: walk from its full",
-      "manifest": {
-        "gen": 1,
-        "bucket": "gen-kilo",
-        "cutoff_seq": 3,
-        "cdc_stream": "CDC_kilo",
-        "cutoff_version": "2026-08-30 00:10:00+00",
-        "version_column": "updated_at",
-        "full": {
-          "gen": 1,
-          "object": "test_types-g1-full",
-          "cutoff": "2026-08-30 00:10:00+00"
-        },
-        "deltas": []
-      },
-      "watermark": "2026-08-29 20:00:00+00",
-      "plan": [
-        {
-          "name": "test_types-g1-full",
-          "kind": "full"
-        }
-      ]
-    },
-    {
-      "name": "a chain whose full predates the watermark with nothing newer is reached: nothing to apply",
-      "manifest": {
-        "gen": 4,
-        "bucket": "gen-kilo",
-        "cutoff_seq": 900,
-        "cdc_stream": "CDC_kilo",
-        "cutoff_version": "2026-08-29 19:00:00+00",
-        "version_column": "updated_at",
-        "full": {
-          "gen": 4,
-          "object": "test_types-g4-full",
-          "cutoff": "2026-08-29 19:00:00+00"
-        },
-        "deltas": []
-      },
-      "watermark": "2026-08-29 20:00:00+00",
-      "plan": []
+     "name": "t-g3-delta",
+     "kind": "delta"
     }
-  ],
-  "fullPredates": [
+   ]
+  },
+  {
+   "name": "watermark newer than every delta: empty plan (nothing to do)",
+   "manifest": {
+    "gen": 3,
+    "full": {
+     "object": "t-g1-full",
+     "gen": 1
+    },
+    "deltas": [
+     {
+      "object": "t-g3-delta",
+      "cutoff": "C",
+      "prev_cutoff": "B",
+      "gen": 3
+     }
+    ]
+   },
+   "watermark": "Z",
+   "plan": []
+  },
+  {
+   "name": "stale watermark the deltas cannot reach: back to the full",
+   "manifest": {
+    "gen": 4,
+    "full": {
+     "object": "t-g2-full",
+     "gen": 2
+    },
+    "deltas": [
+     {
+      "object": "t-g4-delta",
+      "cutoff": "E",
+      "prev_cutoff": "D",
+      "gen": 4
+     }
+    ]
+   },
+   "watermark": "A",
+   "plan": [
     {
-      "name": "D2 RED (measured): chain cutoff 862 below stored 100861 REFUSED",
-      "manifest": {
-        "gen": 6,
-        "full": {
-          "object": "f",
-          "gen": 6
-        },
-        "cutoff_seq": 862,
-        "cdc_stream": "CDC_kilo"
-      },
-      "plan": [
-        {
-          "name": "f",
-          "kind": "full"
-        }
-      ],
-      "storedSeq": 100861,
-      "predates": true
+     "name": "t-g2-full",
+     "kind": "full"
     },
     {
-      "name": "cutoff equal to stored allows (same data replayed, safe)",
-      "manifest": {
-        "gen": 6,
-        "full": {
-          "object": "f",
-          "gen": 6
-        },
-        "cutoff_seq": 862,
-        "cdc_stream": "CDC_kilo"
-      },
-      "plan": [
-        {
-          "name": "f",
-          "kind": "full"
-        }
-      ],
-      "storedSeq": 862,
-      "predates": false
-    },
-    {
-      "name": "cutoff above stored allows",
-      "manifest": {
-        "gen": 7,
-        "full": {
-          "object": "f",
-          "gen": 7
-        },
-        "cutoff_seq": 900,
-        "cdc_stream": "CDC_kilo"
-      },
-      "plan": [
-        {
-          "name": "f",
-          "kind": "full"
-        }
-      ],
-      "storedSeq": 862,
-      "predates": false
-    },
-    {
-      "name": "delta-only plan is never gated (upserts destroy nothing)",
-      "manifest": {
-        "gen": 6,
-        "full": {
-          "object": "f",
-          "gen": 6
-        },
-        "cutoff_seq": 1,
-        "cdc_stream": "CDC_kilo"
-      },
-      "plan": [
-        {
-          "name": "d",
-          "kind": "delta"
-        }
-      ],
-      "storedSeq": 100861,
-      "predates": false
-    },
-    {
-      "name": "legacy manifest without cutoff_seq stays ungated",
-      "manifest": {
-        "gen": 6,
-        "full": {
-          "object": "f",
-          "gen": 6
-        }
-      },
-      "plan": [
-        {
-          "name": "f",
-          "kind": "full"
-        }
-      ],
-      "storedSeq": 100861,
-      "predates": false
-    },
-    {
-      "name": "fresh replica (stored 0) is never refused",
-      "manifest": {
-        "gen": 6,
-        "full": {
-          "object": "f",
-          "gen": 6
-        },
-        "cutoff_seq": 862,
-        "cdc_stream": "CDC_kilo"
-      },
-      "plan": [
-        {
-          "name": "f",
-          "kind": "full"
-        }
-      ],
-      "storedSeq": 0,
-      "predates": false
+     "name": "t-g4-delta",
+     "kind": "delta"
     }
-  ],
-  "scope": [
+   ]
+  },
+  {
+   "name": "§10x: a delta naming its dictionary carries it on the step; others stay bare",
+   "manifest": {
+    "gen": 3,
+    "full": {
+     "object": "t-g1-full",
+     "gen": 1
+    },
+    "deltas": [
+     {
+      "object": "t-g2-delta",
+      "cutoff": "B",
+      "prev_cutoff": "A",
+      "gen": 2
+     },
+     {
+      "object": "t-g3-delta",
+      "cutoff": "C",
+      "prev_cutoff": "B",
+      "gen": 3,
+      "dict": "t-g1-dict"
+     }
+    ]
+   },
+   "watermark": null,
+   "plan": [
     {
-      "name": "D2 (measured): gap on CDC_kilo re-seeds only kilo-routed tables",
-      "streams": {
-        "CDC_kilo": {
-          "firstSeq": 863,
-          "stored": 861
-        },
-        "CDC_PUBLIC": {
-          "firstSeq": 62174,
-          "stored": 62179
-        }
-      },
-      "tables": {
-        "salaries": {
-          "route": "CDC_kilo",
-          "seeded": true
-        },
-        "note_t": {
-          "route": "CDC_kilo",
-          "seeded": true
-        },
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        },
-        "orders": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        }
-      },
-      "gapped": [
-        "CDC_kilo"
-      ],
-      "tablesToSeed": [
-        "salaries",
-        "note_t"
-      ]
+     "name": "t-g1-full",
+     "kind": "full"
     },
     {
-      "name": "never-seeded table seeds even with zero gaps",
-      "streams": {
-        "CDC_PUBLIC": {
-          "firstSeq": 100,
-          "stored": 120
-        }
-      },
-      "tables": {
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        },
-        "newborn": {
-          "route": "CDC_PUBLIC",
-          "seeded": false
-        }
-      },
-      "gapped": [],
-      "tablesToSeed": [
-        "newborn"
-      ]
+     "name": "t-g2-delta",
+     "kind": "delta"
     },
     {
-      "name": "first run: stored 0 gaps every stream, everything seeds",
-      "streams": {
-        "CDC_kilo": {
-          "firstSeq": 863,
-          "stored": 0
-        },
-        "CDC_PUBLIC": {
-          "firstSeq": 62174,
-          "stored": 0
-        }
-      },
-      "tables": {
-        "salaries": {
-          "route": "CDC_kilo",
-          "seeded": false
-        },
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": false
-        }
-      },
-      "gapped": [
-        "CDC_kilo",
-        "CDC_PUBLIC"
-      ],
-      "tablesToSeed": [
-        "salaries",
-        "users"
-      ]
-    },
-    {
-      "name": "stored == firstSeq - 1 is NOT a gap (the next message needed still exists)",
-      "streams": {
-        "CDC_PUBLIC": {
-          "firstSeq": 100,
-          "stored": 99
-        }
-      },
-      "tables": {
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        }
-      },
-      "gapped": [],
-      "tablesToSeed": []
-    },
-    {
-      "name": "stored == firstSeq - 2 IS a gap (one message lost)",
-      "streams": {
-        "CDC_PUBLIC": {
-          "firstSeq": 100,
-          "stored": 98
-        }
-      },
-      "tables": {
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        }
-      },
-      "gapped": [
-        "CDC_PUBLIC"
-      ],
-      "tablesToSeed": [
-        "users"
-      ]
-    },
-    {
-      "name": "stream recreated under the client (lost slot): position beyond last_seq is a gap",
-      "streams": {
-        "CDC_kilo": {
-          "firstSeq": 1,
-          "stored": 2828,
-          "lastSeq": 12
-        },
-        "CDC_PUBLIC": {
-          "firstSeq": 62174,
-          "stored": 62179,
-          "lastSeq": 62300
-        }
-      },
-      "tables": {
-        "salaries": {
-          "route": "CDC_kilo",
-          "seeded": true
-        },
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        }
-      },
-      "gapped": [
-        "CDC_kilo"
-      ],
-      "tablesToSeed": [
-        "salaries"
-      ]
-    },
-    {
-      "name": "an empty recreated stream (last_seq 0) with a position is a gap too",
-      "streams": {
-        "CDC_kilo": {
-          "firstSeq": 0,
-          "stored": 7,
-          "lastSeq": 0
-        }
-      },
-      "tables": {
-        "salaries": {
-          "route": "CDC_kilo",
-          "seeded": true
-        }
-      },
-      "gapped": [
-        "CDC_kilo"
-      ],
-      "tablesToSeed": [
-        "salaries"
-      ]
-    },
-    {
-      "name": "\u00a710bq: a gap on CDC_PUBLIC re-seeds tenant-scoped tables too \u2014 their shared rows ride it",
-      "streams": {
-        "CDC_kilo": {
-          "firstSeq": 10,
-          "stored": 40,
-          "lastSeq": 40
-        },
-        "CDC_PUBLIC": {
-          "firstSeq": 900,
-          "stored": 100,
-          "lastSeq": 1200
-        }
-      },
-      "tables": {
-        "test_types": {
-          "route": "CDC_kilo",
-          "sharedRoute": "CDC_PUBLIC",
-          "seeded": true
-        },
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        }
-      },
-      "gapped": [
-        "CDC_PUBLIC"
-      ],
-      "tablesToSeed": [
-        "test_types",
-        "users"
-      ]
-    },
-    {
-      "name": "\u00a710bq: a gap on the TENANT stream still leaves public tables alone",
-      "streams": {
-        "CDC_kilo": {
-          "firstSeq": 900,
-          "stored": 100,
-          "lastSeq": 1200
-        },
-        "CDC_PUBLIC": {
-          "firstSeq": 10,
-          "stored": 40,
-          "lastSeq": 40
-        }
-      },
-      "tables": {
-        "test_types": {
-          "route": "CDC_kilo",
-          "sharedRoute": "CDC_PUBLIC",
-          "seeded": true
-        },
-        "users": {
-          "route": "CDC_PUBLIC",
-          "seeded": true
-        }
-      },
-      "gapped": [
-        "CDC_kilo"
-      ],
-      "tablesToSeed": [
-        "test_types"
-      ]
+     "name": "t-g3-delta",
+     "kind": "delta",
+     "dict": "t-g1-dict"
     }
-  ],
-  "position": [
-    {
-      "name": "advances to the batch max",
-      "stored": 861,
-      "batch": [
-        862,
-        863
-      ],
-      "next": 863
+   ]
+  },
+  {
+   "name": "a chain rebuilt AFTER the watermark (fresh full, no deltas) is unreachable: walk from its full",
+   "manifest": {
+    "gen": 1,
+    "bucket": "gen-kilo",
+    "cutoff_seq": 3,
+    "cdc_stream": "CDC_kilo",
+    "cutoff_version": "2026-08-30 00:10:00+00",
+    "version_column": "updated_at",
+    "full": {
+     "gen": 1,
+     "object": "test_types-g1-full",
+     "cutoff": "2026-08-30 00:10:00+00"
     },
+    "deltas": []
+   },
+   "watermark": "2026-08-29 20:00:00+00",
+   "plan": [
     {
-      "name": "never moves backwards",
-      "stored": 863,
-      "batch": [
-        100,
-        200
-      ],
-      "next": 863
-    },
-    {
-      "name": "empty batch leaves it alone",
-      "stored": 863,
-      "batch": [],
-      "next": 863
+     "name": "test_types-g1-full",
+     "kind": "full"
     }
-  ],
-  "fkKind": [
+   ]
+  },
+  {
+   "name": "a chain whose full predates the watermark with nothing newer is reached: nothing to apply",
+   "manifest": {
+    "gen": 4,
+    "bucket": "gen-kilo",
+    "cutoff_seq": 900,
+    "cdc_stream": "CDC_kilo",
+    "cutoff_version": "2026-08-29 19:00:00+00",
+    "version_column": "updated_at",
+    "full": {
+     "gen": 4,
+     "object": "test_types-g4-full",
+     "cutoff": "2026-08-29 19:00:00+00"
+    },
+    "deltas": []
+   },
+   "watermark": "2026-08-29 20:00:00+00",
+   "plan": []
+  },
+  {
+   "name": "incremental: the watermark is inside the deltas — deltas alone",
+   "manifest": {
+    "gen": 9,
+    "gc_watermark": "2026-09-16T09:00:00Z",
+    "base": {
+     "object": "t-g1-base",
+     "gen": 1,
+     "cutoff": "2026-09-16T08:00:00Z"
+    },
+    "checkpoints": [
+     {
+      "object": "t-g4-ckpt",
+      "gen": 4,
+      "lower": "2026-09-16T08:00:00Z",
+      "cutoff": "2026-09-16T09:30:00Z"
+     },
+     {
+      "object": "t-g7-ckpt",
+      "gen": 7,
+      "lower": "2026-09-16T09:30:00Z",
+      "cutoff": "2026-09-16T10:00:00Z"
+     }
+    ],
+    "deltas": [
+     {
+      "object": "t-g8-delta",
+      "gen": 8,
+      "prev_cutoff": "2026-09-16T10:00:00Z",
+      "cutoff": "2026-09-16T10:01:00Z"
+     },
+     {
+      "object": "t-g9-delta",
+      "gen": 9,
+      "prev_cutoff": "2026-09-16T10:01:00Z",
+      "cutoff": "2026-09-16T10:02:00Z"
+     }
+    ]
+   },
+   "watermark": "2026-09-16T10:00:00Z",
+   "plan": [
     {
-      "name": "missing parent row",
-      "message": "FOREIGN KEY constraint failed",
-      "kind": "missing-parent"
+     "name": "t-g8-delta",
+     "kind": "delta"
     },
     {
-      "name": "missing parent table (lazy DDL, strict DML)",
-      "message": "no such table: main.users",
-      "kind": "missing-parent"
-    },
-    {
-      "name": "schema-level mismatch drops loudly",
-      "message": "foreign key mismatch - \"salaries\" referencing \"users\"",
-      "kind": "mismatch"
-    },
-    {
-      "name": "unrelated error is not an FK hold",
-      "message": "UNIQUE constraint failed: memo.id",
-      "kind": null
+     "name": "t-g9-delta",
+     "kind": "delta"
     }
-  ],
-  "pgTsToWire": [
+   ]
+  },
+  {
+   "name": "incremental: the watermark is inside the checkpoints — checkpoints after it, then deltas, no base",
+   "manifest": {
+    "gen": 9,
+    "gc_watermark": "2026-09-16T09:00:00Z",
+    "base": {
+     "object": "t-g1-base",
+     "gen": 1,
+     "cutoff": "2026-09-16T08:00:00Z"
+    },
+    "checkpoints": [
+     {
+      "object": "t-g4-ckpt",
+      "gen": 4,
+      "lower": "2026-09-16T08:00:00Z",
+      "cutoff": "2026-09-16T09:30:00Z"
+     },
+     {
+      "object": "t-g7-ckpt",
+      "gen": 7,
+      "lower": "2026-09-16T09:30:00Z",
+      "cutoff": "2026-09-16T10:00:00Z"
+     }
+    ],
+    "deltas": [
+     {
+      "object": "t-g8-delta",
+      "gen": 8,
+      "prev_cutoff": "2026-09-16T10:00:00Z",
+      "cutoff": "2026-09-16T10:01:00Z"
+     },
+     {
+      "object": "t-g9-delta",
+      "gen": 9,
+      "prev_cutoff": "2026-09-16T10:01:00Z",
+      "cutoff": "2026-09-16T10:02:00Z"
+     }
+    ]
+   },
+   "watermark": "2026-09-16T09:40:00Z",
+   "plan": [
     {
-      "name": "space + offset become T + Z, microseconds preserved",
-      "in": "2026-08-27 10:09:49.685820+00",
-      "out": "2026-08-27T10:09:49.685820Z"
+     "name": "t-g7-ckpt",
+     "kind": "checkpoint"
     },
     {
-      "name": "colon-form offset too",
-      "in": "2026-08-27 10:09:49+00:00",
-      "out": "2026-08-27T10:09:49Z"
+     "name": "t-g8-delta",
+     "kind": "delta"
     },
     {
-      "name": "non-timestamp strings pass through untouched",
-      "in": "hello world",
-      "out": "hello world"
+     "name": "t-g9-delta",
+     "kind": "delta"
     }
-  ],
-  "lsnToNumber": [
+   ]
+  },
+  {
+   "name": "incremental: the watermark sits between two checkpoints — the one covering it, then the rest",
+   "manifest": {
+    "gen": 9,
+    "gc_watermark": "2026-09-16T09:00:00Z",
+    "base": {
+     "object": "t-g1-base",
+     "gen": 1,
+     "cutoff": "2026-09-16T08:00:00Z"
+    },
+    "checkpoints": [
+     {
+      "object": "t-g4-ckpt",
+      "gen": 4,
+      "lower": "2026-09-16T08:00:00Z",
+      "cutoff": "2026-09-16T09:30:00Z"
+     },
+     {
+      "object": "t-g7-ckpt",
+      "gen": 7,
+      "lower": "2026-09-16T09:30:00Z",
+      "cutoff": "2026-09-16T10:00:00Z"
+     }
+    ],
+    "deltas": [
+     {
+      "object": "t-g8-delta",
+      "gen": 8,
+      "prev_cutoff": "2026-09-16T10:00:00Z",
+      "cutoff": "2026-09-16T10:01:00Z"
+     },
+     {
+      "object": "t-g9-delta",
+      "gen": 9,
+      "prev_cutoff": "2026-09-16T10:01:00Z",
+      "cutoff": "2026-09-16T10:02:00Z"
+     }
+    ]
+   },
+   "watermark": "2026-09-16T09:29:00Z",
+   "plan": [
     {
-      "name": "hi/lo compose",
-      "in": "2/97B6ED8",
-      "out": 8749018840
+     "name": "t-g4-ckpt",
+     "kind": "checkpoint"
     },
     {
-      "name": "zero page",
-      "in": "0/C5793FD0",
-      "out": 3313057744
+     "name": "t-g7-ckpt",
+     "kind": "checkpoint"
+    },
+    {
+     "name": "t-g8-delta",
+     "kind": "delta"
+    },
+    {
+     "name": "t-g9-delta",
+     "kind": "delta"
     }
-  ],
-  "keyChange": [
+   ]
+  },
+  {
+   "name": "incremental: the watermark is older than the oldest checkpoint's lower bound — the base",
+   "manifest": {
+    "gen": 9,
+    "gc_watermark": "2026-09-16T09:00:00Z",
+    "base": {
+     "object": "t-g1-base",
+     "gen": 1,
+     "cutoff": "2026-09-16T08:00:00Z"
+    },
+    "checkpoints": [
+     {
+      "object": "t-g4-ckpt",
+      "gen": 4,
+      "lower": "2026-09-16T08:00:00Z",
+      "cutoff": "2026-09-16T09:30:00Z"
+     },
+     {
+      "object": "t-g7-ckpt",
+      "gen": 7,
+      "lower": "2026-09-16T09:30:00Z",
+      "cutoff": "2026-09-16T10:00:00Z"
+     }
+    ],
+    "deltas": [
+     {
+      "object": "t-g8-delta",
+      "gen": 8,
+      "prev_cutoff": "2026-09-16T10:00:00Z",
+      "cutoff": "2026-09-16T10:01:00Z"
+     },
+     {
+      "object": "t-g9-delta",
+      "gen": 9,
+      "prev_cutoff": "2026-09-16T10:01:00Z",
+      "cutoff": "2026-09-16T10:02:00Z"
+     }
+    ]
+   },
+   "watermark": "2026-09-16T07:30:00Z",
+   "plan": [
     {
-      "name": "changed key deletes the old one first (measured: row lived under both keys)",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "old.id": 1,
-        "id": 2,
-        "v": "x"
-      },
-      "step": {
-        "sql": "DELETE FROM t WHERE \"id\" = ?",
-        "params": [
-          1
-        ],
-        "oldKey": [
-          1
-        ],
-        "newKey": [
-          2
-        ]
-      }
+     "name": "t-g1-base",
+     "kind": "full"
     },
     {
-      "name": "same key: no delete",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "old.id": 2,
-        "id": 2
-      },
-      "step": null
+     "name": "t-g4-ckpt",
+     "kind": "checkpoint"
     },
     {
-      "name": "no old.* on the event: no delete",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": 2
-      },
-      "step": null
+     "name": "t-g7-ckpt",
+     "kind": "checkpoint"
     },
     {
-      "name": "composite: any old column missing means no delete",
-      "table": "t",
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "data": {
-        "old.a": 1,
-        "a": 9,
-        "b": 9
-      },
-      "step": null
+     "name": "t-g8-delta",
+     "kind": "delta"
+    },
+    {
+     "name": "t-g9-delta",
+     "kind": "delta"
     }
-  ],
-  "upsert": [
+   ]
+  },
+  {
+   "name": "incremental: no watermark — the base and everything after it",
+   "manifest": {
+    "gen": 9,
+    "gc_watermark": "2026-09-16T09:00:00Z",
+    "base": {
+     "object": "t-g1-base",
+     "gen": 1,
+     "cutoff": "2026-09-16T08:00:00Z"
+    },
+    "checkpoints": [
+     {
+      "object": "t-g4-ckpt",
+      "gen": 4,
+      "lower": "2026-09-16T08:00:00Z",
+      "cutoff": "2026-09-16T09:30:00Z"
+     },
+     {
+      "object": "t-g7-ckpt",
+      "gen": 7,
+      "lower": "2026-09-16T09:30:00Z",
+      "cutoff": "2026-09-16T10:00:00Z"
+     }
+    ],
+    "deltas": [
+     {
+      "object": "t-g8-delta",
+      "gen": 8,
+      "prev_cutoff": "2026-09-16T10:00:00Z",
+      "cutoff": "2026-09-16T10:01:00Z"
+     },
+     {
+      "object": "t-g9-delta",
+      "gen": 9,
+      "prev_cutoff": "2026-09-16T10:01:00Z",
+      "cutoff": "2026-09-16T10:02:00Z"
+     }
+    ]
+   },
+   "watermark": null,
+   "plan": [
     {
-      "name": "ordinary two-column upsert",
-      "table": "users",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": 7,
-        "name": "n1"
-      },
-      "step": {
-        "sql": "INSERT INTO users (\"id\", \"name\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\"",
-        "params": [
-          7,
-          "n1"
-        ]
-      }
+     "name": "t-g1-base",
+     "kind": "full"
     },
     {
-      "name": "all columns in the key: DO NOTHING (redelivery must converge, not throw)",
-      "table": "m",
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "data": {
-        "a": 1,
-        "b": 2
-      },
-      "step": {
-        "sql": "INSERT INTO m (\"a\", \"b\") VALUES (?, ?) ON CONFLICT(\"a\", \"b\") DO NOTHING",
-        "params": [
-          1,
-          2
-        ]
-      }
+     "name": "t-g4-ckpt",
+     "kind": "checkpoint"
     },
     {
-      "name": "keyless table: plain INSERT (refused upstream anyway)",
-      "table": "k",
-      "pkCols": [],
-      "data": {
-        "x": 1
-      },
-      "step": {
-        "sql": "INSERT INTO k (\"x\") VALUES (?)",
-        "params": [
-          1
-        ]
-      }
+     "name": "t-g7-ckpt",
+     "kind": "checkpoint"
     },
     {
-      "name": "structured values bind as JSON text; old.* never lands in columns",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "old.id": 1,
-        "id": 2,
-        "meta": {
-          "k": "v"
-        }
-      },
-      "step": {
-        "sql": "INSERT INTO t (\"id\", \"meta\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"meta\" = excluded.\"meta\"",
-        "params": [
-          2,
-          "{\"k\":\"v\"}"
-        ]
-      }
+     "name": "t-g8-delta",
+     "kind": "delta"
+    },
+    {
+     "name": "t-g9-delta",
+     "kind": "delta"
     }
-  ],
-  "delete": [
+   ]
+  },
+  {
+   "name": "incremental: the watermark predates the gc watermark — the base, whatever the checkpoints say (a delete may have been reaped)",
+   "manifest": {
+    "gen": 9,
+    "gc_watermark": "2026-09-16T09:00:00Z",
+    "base": {
+     "object": "t-g1-base",
+     "gen": 1,
+     "cutoff": "2026-09-16T08:00:00Z"
+    },
+    "checkpoints": [
+     {
+      "object": "t-g4-ckpt",
+      "gen": 4,
+      "lower": "2026-09-16T08:00:00Z",
+      "cutoff": "2026-09-16T09:30:00Z"
+     },
+     {
+      "object": "t-g7-ckpt",
+      "gen": 7,
+      "lower": "2026-09-16T09:30:00Z",
+      "cutoff": "2026-09-16T10:00:00Z"
+     }
+    ],
+    "deltas": [
+     {
+      "object": "t-g8-delta",
+      "gen": 8,
+      "prev_cutoff": "2026-09-16T10:00:00Z",
+      "cutoff": "2026-09-16T10:01:00Z"
+     },
+     {
+      "object": "t-g9-delta",
+      "gen": 9,
+      "prev_cutoff": "2026-09-16T10:01:00Z",
+      "cutoff": "2026-09-16T10:02:00Z"
+     }
+    ]
+   },
+   "watermark": "2026-09-16T08:59:00Z",
+   "plan": [
     {
-      "name": "full key deletes",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": 5
-      },
-      "step": {
-        "sql": "DELETE FROM t WHERE \"id\" = ?",
-        "params": [
-          5
-        ]
-      }
+     "name": "t-g1-base",
+     "kind": "full"
     },
     {
-      "name": "partial composite key SKIPS (would match more rows than PG deleted)",
-      "table": "t",
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "data": {
-        "a": 1
-      },
-      "step": null
+     "name": "t-g4-ckpt",
+     "kind": "checkpoint"
     },
     {
-      "name": "keyless table skips",
-      "table": "t",
-      "pkCols": [],
-      "data": {
-        "x": 1
-      },
-      "step": null
+     "name": "t-g7-ckpt",
+     "kind": "checkpoint"
+    },
+    {
+     "name": "t-g8-delta",
+     "kind": "delta"
+    },
+    {
+     "name": "t-g9-delta",
+     "kind": "delta"
     }
-  ],
-  "chainUpsert": [
-    {
-      "name": "version-guarded: a chain row never overwrites a newer CDC value",
-      "table": "salaries",
-      "cols": [
-        "uid",
-        "amount",
-        "updated_at"
-      ],
-      "pkCols": [
-        "uid"
-      ],
-      "versionCol": "updated_at",
-      "sql": "INSERT INTO salaries (\"uid\", \"amount\", \"updated_at\") VALUES (?, ?, ?) ON CONFLICT(\"uid\") DO UPDATE SET \"amount\" = excluded.\"amount\", \"updated_at\" = excluded.\"updated_at\" WHERE excluded.\"updated_at\" > salaries.\"updated_at\""
+   ]
+  },
+  {
+   "name": "incremental: a chain with no checkpoint yet behaves exactly as the old one",
+   "manifest": {
+    "gen": 3,
+    "gc_watermark": "2026-09-16T09:00:00Z",
+    "base": {
+     "object": "t-g1-base",
+     "gen": 1,
+     "cutoff": "2026-09-16T09:10:00Z"
     },
+    "checkpoints": [],
+    "deltas": [
+     {
+      "object": "t-g3-delta",
+      "gen": 3,
+      "prev_cutoff": "2026-09-16T09:10:00Z",
+      "cutoff": "2026-09-16T09:20:00Z"
+     }
+    ]
+   },
+   "watermark": "2026-09-16T09:10:00Z",
+   "plan": [
     {
-      "name": "no version column: unguarded update",
-      "table": "t",
-      "cols": [
-        "id",
-        "v"
-      ],
-      "pkCols": [
-        "id"
-      ],
-      "versionCol": null,
-      "sql": "INSERT INTO t (\"id\", \"v\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"v\" = excluded.\"v\""
-    },
-    {
-      "name": "all-key row: DO NOTHING",
-      "table": "t",
-      "cols": [
-        "a",
-        "b"
-      ],
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "versionCol": null,
-      "sql": "INSERT INTO t (\"a\", \"b\") VALUES (?, ?) ON CONFLICT(\"a\", \"b\") DO NOTHING"
+     "name": "t-g3-delta",
+     "kind": "delta"
     }
-  ],
-  "chainRowParams": [
-    {
-      "name": "timestamps normalize to the wire shape, objects to JSON, scalars pass",
-      "row": [
-        "2026-08-27 10:09:49.685820+00",
-        {
-          "k": 1
-        },
-        42,
-        null
-      ],
-      "params": [
-        "2026-08-27T10:09:49.685820Z",
-        "{\"k\":1}",
-        42,
-        null
-      ]
+   ]
+  }
+ ],
+ "fullPredates": [
+  {
+   "name": "D2 RED (measured): chain cutoff 862 below stored 100861 REFUSED",
+   "manifest": {
+    "gen": 6,
+    "full": {
+     "object": "f",
+     "gen": 6
     },
+    "cutoff_seq": 862,
+    "cdc_stream": "CDC_kilo"
+   },
+   "plan": [
     {
-      "name": "a boolean passes through as a boolean \u2014 the producer emits msgpack bools for bool columns, never t/f text (measured: a SQLite replica held TEXT 't' from chains and INTEGER 1 from CDC in one column)",
-      "row": [
-        "u1",
-        true,
-        false,
-        null
-      ],
-      "params": [
-        "u1",
-        true,
-        false,
-        null
-      ]
+     "name": "f",
+     "kind": "full"
     }
-  ],
-  "columnDdl": [
-    {
-      "name": "single-column pk is inline PRIMARY KEY and NOT NULL",
-      "col": {
-        "name": "id",
-        "type": "INTEGER"
-      },
-      "pkCols": [
-        "id"
-      ],
-      "ddl": "\"id\" INTEGER NOT NULL PRIMARY KEY"
+   ],
+   "storedSeq": 100861,
+   "predates": true
+  },
+  {
+   "name": "cutoff equal to stored allows (same data replayed, safe)",
+   "manifest": {
+    "gen": 6,
+    "full": {
+     "object": "f",
+     "gen": 6
     },
+    "cutoff_seq": 862,
+    "cdc_stream": "CDC_kilo"
+   },
+   "plan": [
     {
-      "name": "required column is NOT NULL (a bad optimistic write fails locally)",
-      "col": {
-        "name": "inserted_at",
-        "type": "TEXT",
-        "required": true
-      },
-      "pkCols": [
-        "id"
-      ],
-      "ddl": "\"inserted_at\" TEXT NOT NULL"
-    },
-    {
-      "name": "plain nullable column",
-      "col": {
-        "name": "note",
-        "type": "TEXT"
-      },
-      "pkCols": [
-        "id"
-      ],
-      "ddl": "\"note\" TEXT"
-    },
-    {
-      "name": "composite pk member: NOT NULL but not inline (constraint carries the key)",
-      "col": {
-        "name": "a",
-        "type": "TEXT"
-      },
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "ddl": "\"a\" TEXT NOT NULL"
-    },
-    {
-      "name": "constant default carried (a client's engine fills existing rows \u2014 \u00a710df)",
-      "col": {
-        "name": "n",
-        "type": "INTEGER",
-        "default": "5"
-      },
-      "pkCols": [
-        "id"
-      ],
-      "ddl": "\"n\" INTEGER DEFAULT 5"
-    },
-    {
-      "name": "quoted default kept quoted, NOT NULL before DEFAULT",
-      "col": {
-        "name": "kind",
-        "type": "TEXT",
-        "required": true,
-        "default": "'plain'"
-      },
-      "pkCols": [
-        "id"
-      ],
-      "ddl": "\"kind\" TEXT NOT NULL DEFAULT 'plain'"
+     "name": "f",
+     "kind": "full"
     }
-  ],
-  "fkClauses": [
-    {
-      "name": "well-formed FK renders",
-      "fks": [
-        {
-          "columns": [
-            "user_id"
-          ],
-          "references": "users",
-          "parent_columns": [
-            "id"
-          ]
-        }
-      ],
-      "text": ", FOREIGN KEY (\"user_id\") REFERENCES users (\"id\")"
+   ],
+   "storedSeq": 862,
+   "predates": false
+  },
+  {
+   "name": "cutoff above stored allows",
+   "manifest": {
+    "gen": 7,
+    "full": {
+     "object": "f",
+     "gen": 7
     },
+    "cutoff_seq": 900,
+    "cdc_stream": "CDC_kilo"
+   },
+   "plan": [
     {
-      "name": "arity mismatch is dropped, not guessed",
-      "fks": [
-        {
-          "columns": [
-            "a",
-            "b"
-          ],
-          "references": "p",
-          "parent_columns": [
-            "x"
-          ]
-        }
-      ],
-      "text": ""
-    },
-    {
-      "name": "missing references is dropped",
-      "fks": [
-        {
-          "columns": [
-            "a"
-          ],
-          "parent_columns": [
-            "x"
-          ]
-        }
-      ],
-      "text": ""
+     "name": "f",
+     "kind": "full"
     }
-  ],
-  "createTable": [
-    {
-      "name": "composite pk + fk: the full statement",
-      "table": "salaries",
-      "cols": [
-        {
-          "name": "uid",
-          "type": "TEXT"
-        },
-        {
-          "name": "user_id",
-          "type": "INTEGER",
-          "required": true
-        },
-        {
-          "name": "tenant_id",
-          "type": "TEXT"
-        }
-      ],
-      "pkCols": [
-        "uid"
-      ],
-      "fks": [
-        {
-          "columns": [
-            "user_id"
-          ],
-          "references": "users",
-          "parent_columns": [
-            "id"
-          ]
-        }
-      ],
-      "steps": [
-        {
-          "sql": "DROP TABLE IF EXISTS salaries;",
-          "params": []
-        },
-        {
-          "sql": "CREATE TABLE salaries (\"uid\" TEXT NOT NULL PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"tenant_id\" TEXT, FOREIGN KEY (\"user_id\") REFERENCES users (\"id\"));",
-          "params": []
-        }
-      ]
+   ],
+   "storedSeq": 862,
+   "predates": false
+  },
+  {
+   "name": "delta-only plan is never gated (upserts destroy nothing)",
+   "manifest": {
+    "gen": 6,
+    "full": {
+     "object": "f",
+     "gen": 6
     },
+    "cutoff_seq": 1,
+    "cdc_stream": "CDC_kilo"
+   },
+   "plan": [
     {
-      "name": "the same, STRICT (SQLite): the keyword after the body (\u00a710fi)",
-      "table": "salaries",
-      "cols": [
-        {
-          "name": "uid",
-          "type": "TEXT"
-        },
-        {
-          "name": "user_id",
-          "type": "INTEGER",
-          "required": true
-        },
-        {
-          "name": "tenant_id",
-          "type": "TEXT"
-        }
-      ],
-      "pkCols": [
-        "uid"
-      ],
-      "fks": [
-        {
-          "columns": [
-            "user_id"
-          ],
-          "references": "users",
-          "parent_columns": [
-            "id"
-          ]
-        }
-      ],
-      "steps": [
-        {
-          "sql": "DROP TABLE IF EXISTS salaries;",
-          "params": []
-        },
-        {
-          "sql": "CREATE TABLE salaries (\"uid\" TEXT NOT NULL PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"tenant_id\" TEXT, FOREIGN KEY (\"user_id\") REFERENCES users (\"id\")) STRICT;",
-          "params": []
-        }
-      ],
-      "strict": true
+     "name": "d",
+     "kind": "delta"
     }
-  ],
-  "rebuildSteps": [
-    {
-      "name": "FINDING 9's legitimate path: tmp, copy COMMON columns, swap",
-      "table": "t",
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        },
-        {
-          "name": "v",
-          "type": "TEXT"
-        }
-      ],
-      "pkCols": [
-        "id"
-      ],
-      "fks": [],
-      "existing": [
-        "id",
-        "v",
-        "gone"
-      ],
-      "steps": [
-        {
-          "sql": "DROP TABLE IF EXISTS t__migrating;",
-          "params": []
-        },
-        {
-          "sql": "CREATE TABLE t__migrating (\"id\" INTEGER NOT NULL PRIMARY KEY, \"v\" TEXT);",
-          "params": []
-        },
-        {
-          "sql": "INSERT INTO t__migrating (\"id\", \"v\") SELECT \"id\", \"v\" FROM t;",
-          "params": []
-        },
-        {
-          "sql": "DROP TABLE IF EXISTS t;",
-          "params": []
-        },
-        {
-          "sql": "ALTER TABLE t__migrating RENAME TO t;",
-          "params": []
-        }
-      ]
-    },
-    {
-      "name": "no common columns: no copy step (nothing to preserve)",
-      "table": "t",
-      "cols": [
-        {
-          "name": "x",
-          "type": "TEXT"
-        }
-      ],
-      "pkCols": [],
-      "fks": [],
-      "existing": [
-        "a"
-      ],
-      "steps": [
-        {
-          "sql": "DROP TABLE IF EXISTS t__migrating;",
-          "params": []
-        },
-        {
-          "sql": "CREATE TABLE t__migrating (\"x\" TEXT);",
-          "params": []
-        },
-        {
-          "sql": "DROP TABLE IF EXISTS t;",
-          "params": []
-        },
-        {
-          "sql": "ALTER TABLE t__migrating RENAME TO t;",
-          "params": []
-        }
-      ]
-    },
-    {
-      "name": "FINDING 9's legitimate path: tmp, copy COMMON columns, swap \u2014 STRICT (\u00a710fi)",
-      "table": "t",
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        },
-        {
-          "name": "v",
-          "type": "TEXT"
-        }
-      ],
-      "pkCols": [
-        "id"
-      ],
-      "fks": [],
-      "existing": [
-        "id",
-        "v",
-        "gone"
-      ],
-      "steps": [
-        {
-          "sql": "DROP TABLE IF EXISTS t__migrating;",
-          "params": []
-        },
-        {
-          "sql": "CREATE TABLE t__migrating (\"id\" INTEGER NOT NULL PRIMARY KEY, \"v\" TEXT) STRICT;",
-          "params": []
-        },
-        {
-          "sql": "INSERT INTO t__migrating (\"id\", \"v\") SELECT CAST(\"id\" AS INTEGER), CAST(\"v\" AS TEXT) FROM t;",
-          "params": []
-        },
-        {
-          "sql": "DROP TABLE IF EXISTS t;",
-          "params": []
-        },
-        {
-          "sql": "ALTER TABLE t__migrating RENAME TO t;",
-          "params": []
-        }
-      ],
-      "strict": true
+   ],
+   "storedSeq": 100861,
+   "predates": false
+  },
+  {
+   "name": "legacy manifest without cutoff_seq stays ungated",
+   "manifest": {
+    "gen": 6,
+    "full": {
+     "object": "f",
+     "gen": 6
     }
-  ],
-  "diffColumns": [
+   },
+   "plan": [
     {
-      "name": "no existing table: nothing to diff (create path owns it)",
-      "existing": null,
-      "wanted": [
-        "a"
-      ],
-      "renamed": {},
-      "out": {
-        "renames": [],
-        "added": [],
-        "removed": []
-      }
-    },
-    {
-      "name": "plain add and remove",
-      "existing": [
-        "a",
-        "b"
-      ],
-      "wanted": [
-        "a",
-        "c"
-      ],
-      "renamed": {},
-      "out": {
-        "renames": [],
-        "added": [
-          "c"
-        ],
-        "removed": [
-          "b"
-        ]
-      }
-    },
-    {
-      "name": "a hinted rename is neither added nor removed",
-      "existing": [
-        "a",
-        "old_n"
-      ],
-      "wanted": [
-        "a",
-        "new_n"
-      ],
-      "renamed": {
-        "new_n": "old_n"
-      },
-      "out": {
-        "renames": [
-          [
-            "old_n",
-            "new_n"
-          ]
-        ],
-        "added": [],
-        "removed": []
-      }
-    },
-    {
-      "name": "rename hint ignored when the target already exists",
-      "existing": [
-        "a",
-        "old_n",
-        "new_n"
-      ],
-      "wanted": [
-        "a",
-        "new_n"
-      ],
-      "renamed": {
-        "new_n": "old_n"
-      },
-      "out": {
-        "renames": [],
-        "added": [],
-        "removed": [
-          "old_n"
-        ]
-      }
-    },
-    {
-      "name": "\u00a71.2: an unhinted rename degrades to add+remove (values lost, by protocol)",
-      "existing": [
-        "a",
-        "old_n"
-      ],
-      "wanted": [
-        "a",
-        "new_n"
-      ],
-      "renamed": {},
-      "out": {
-        "renames": [],
-        "added": [
-          "new_n"
-        ],
-        "removed": [
-          "old_n"
-        ]
-      }
+     "name": "f",
+     "kind": "full"
     }
-  ],
-  "fkDiffer": [
-    {
-      "name": "no stored ddl: create path owns it",
-      "ddl": "",
-      "want": ", FOREIGN KEY (\"x\") REFERENCES p (\"y\")",
-      "differs": false
+   ],
+   "storedSeq": 100861,
+   "predates": false
+  },
+  {
+   "name": "fresh replica (stored 0) is never refused",
+   "manifest": {
+    "gen": 6,
+    "full": {
+     "object": "f",
+     "gen": 6
     },
+    "cutoff_seq": 862,
+    "cdc_stream": "CDC_kilo"
+   },
+   "plan": [
     {
-      "name": "wanted none, has some: differs",
-      "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES p (\"y\"))",
-      "want": "",
-      "differs": true
-    },
-    {
-      "name": "wanted none, has none: same",
-      "ddl": "CREATE TABLE t (\"a\" TEXT)",
-      "want": "",
-      "differs": false
-    },
-    {
-      "name": "clause present (whitespace-normalized): same",
-      "ddl": "CREATE TABLE t (\"a\" TEXT,\n  FOREIGN KEY (\"a\")  REFERENCES p (\"y\"))",
-      "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
-      "differs": false
-    },
-    {
-      "name": "different parent: differs (forces a rebuild \u2014 SQLite has no ADD CONSTRAINT)",
-      "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES q (\"y\"))",
-      "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
-      "differs": true
+     "name": "f",
+     "kind": "full"
     }
-  ],
-  "viewSteps": [
-    {
-      "name": "plumbing columns excluded from the app view",
-      "table": "t",
-      "names": [
-        "uid",
-        "name",
-        "updated_at"
-      ],
-      "steps": [
-        {
-          "sql": "DROP VIEW IF EXISTS t_view;",
-          "params": []
-        },
-        {
-          "sql": "CREATE VIEW t_view AS SELECT \"name\" FROM t;",
-          "params": []
-        }
-      ]
+   ],
+   "storedSeq": 0,
+   "predates": false
+  }
+ ],
+ "scope": [
+  {
+   "name": "D2 (measured): gap on CDC_kilo re-seeds only kilo-routed tables",
+   "streams": {
+    "CDC_kilo": {
+     "firstSeq": 863,
+     "stored": 861
     },
-    {
-      "name": "all columns excluded: drop only, no view",
-      "table": "t",
-      "names": [
-        "uid",
-        "updated_at"
-      ],
-      "steps": [
-        {
-          "sql": "DROP VIEW IF EXISTS t_view;",
-          "params": []
-        }
-      ]
+    "CDC_PUBLIC": {
+     "firstSeq": 62174,
+     "stored": 62179
     }
-  ],
-  "indexPlan": [
-    {
-      "name": "create the missing, drop the unpublished, keep the matching",
-      "table": "t",
-      "have": [
-        "ix_keep",
-        "ix_stale"
-      ],
-      "want": [
-        {
-          "name": "ix_keep",
-          "columns": [
-            "a"
-          ]
-        },
-        {
-          "name": "ix_new",
-          "unique": true,
-          "columns": [
-            "b",
-            "c"
-          ]
-        }
-      ],
-      "drops": [
-        {
-          "sql": "DROP INDEX IF EXISTS \"ix_stale\";",
-          "params": []
-        }
-      ],
-      "creates": [
-        {
-          "sql": "CREATE UNIQUE INDEX IF NOT EXISTS \"ix_new\" ON t (\"b\", \"c\");",
-          "params": []
-        }
-      ]
+   },
+   "tables": {
+    "salaries": {
+     "route": "CDC_kilo",
+     "seeded": true
     },
-    {
-      "name": "malformed entries skip",
-      "table": "t",
-      "have": [],
-      "want": [
-        {
-          "name": "",
-          "columns": [
-            "a"
-          ]
-        },
-        {
-          "name": "x",
-          "columns": []
-        }
-      ],
-      "drops": [],
-      "creates": []
+    "note_t": {
+     "route": "CDC_kilo",
+     "seeded": true
+    },
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
+    },
+    "orders": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
     }
-  ],
-  "nextVersion": [
-    {
-      "name": "clock ahead: wall time widened to microseconds",
-      "now": "2026-08-27T10:00:00.123Z",
-      "last": "2026-08-27T09:59:59.000000Z",
-      "out": "2026-08-27T10:00:00.123000Z"
-    },
-    {
-      "name": "clock tied: bump one microsecond past the last stamp",
-      "now": "2026-08-27T10:00:00.123Z",
-      "last": "2026-08-27T10:00:00.123000Z",
-      "out": "2026-08-27T10:00:00.123001Z"
-    },
-    {
-      "name": "clock behind (skew): still strictly after the last stamp",
-      "now": "2026-08-27T09:00:00.000Z",
-      "last": "2026-08-27T10:00:00.123456Z",
-      "out": "2026-08-27T10:00:00.123457Z"
+   },
+   "gapped": [
+    "CDC_kilo"
+   ],
+   "tablesToSeed": [
+    "salaries",
+    "note_t"
+   ]
+  },
+  {
+   "name": "never-seeded table seeds even with zero gaps",
+   "streams": {
+    "CDC_PUBLIC": {
+     "firstSeq": 100,
+     "stored": 120
     }
-  ],
-  "subjectSafe": [
-    {
-      "name": "dots, wildcards and spaces become dashes",
-      "in": "c-1.users.*>x y",
-      "out": "c-1-users---x-y"
+   },
+   "tables": {
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
+    },
+    "newborn": {
+     "route": "CDC_PUBLIC",
+     "seeded": false
     }
-  ],
-  "envelope": [
-    {
-      "name": "UPDATE: full envelope",
-      "args": {
-        "principal": "omar",
-        "clientId": "c-40acde74",
-        "table": "test_types",
-        "op": "UPDATE",
-        "key": {
-          "uid": "u-1"
-        },
-        "values": {
-          "note": "hi"
-        },
-        "pkCols": [
-          "uid"
-        ],
-        "version": "2026-08-27T10:00:00.123000Z"
-      },
-      "out": {
-        "subject": "mutation.omar.test_types.update",
-        "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
-        "id": "u-1",
-        "payload": {
-          "key": {
-            "uid": "u-1"
-          },
-          "version": "2026-08-27T10:00:00.123000Z",
-          "client_id": "c-40acde74",
-          "data": {
-            "note": "hi"
-          }
-        },
-        "optimistic": {
-          "table": "test_types",
-          "operation": "UPDATE",
-          "data": {
-            "uid": "u-1",
-            "note": "hi"
-          },
-          "lsn": 9007199254740991,
-          "optimistic": true
-        }
-      }
+   },
+   "gapped": [],
+   "tablesToSeed": [
+    "newborn"
+   ]
+  },
+  {
+   "name": "first run: stored 0 gaps every stream, everything seeds",
+   "streams": {
+    "CDC_kilo": {
+     "firstSeq": 863,
+     "stored": 0
     },
-    {
-      "name": "DELETE: no data on the wire; the optimistic event carries the key",
-      "args": {
-        "principal": "omar",
-        "clientId": "c-1",
-        "table": "t",
-        "op": "DELETE",
-        "key": {
-          "a": 1,
-          "b": 2
-        },
-        "pkCols": [
-          "a",
-          "b"
-        ],
-        "version": "2026-08-27T10:00:00.000000Z"
-      },
-      "out": {
-        "subject": "mutation.omar.t.delete",
-        "msgId": "c-1-t-1|2-2026-08-27T10:00:00-000000Z",
-        "id": "1|2",
-        "payload": {
-          "key": {
-            "a": 1,
-            "b": 2
-          },
-          "version": "2026-08-27T10:00:00.000000Z",
-          "client_id": "c-1"
-        },
-        "optimistic": {
-          "table": "t",
-          "operation": "DELETE",
-          "data": {
-            "a": 1,
-            "b": 2
-          },
-          "lsn": 9007199254740991,
-          "optimistic": true
-        }
-      }
-    },
-    {
-      "name": "INSERT with no values still ships an empty data object",
-      "args": {
-        "principal": "p",
-        "clientId": "c",
-        "table": "t",
-        "op": "INSERT",
-        "key": {
-          "id": 5
-        },
-        "pkCols": [
-          "id"
-        ],
-        "version": "2026-08-27T10:00:00.000000Z"
-      },
-      "out": {
-        "subject": "mutation.p.t.insert",
-        "msgId": "c-t-5-2026-08-27T10:00:00-000000Z",
-        "id": "5",
-        "payload": {
-          "key": {
-            "id": 5
-          },
-          "version": "2026-08-27T10:00:00.000000Z",
-          "client_id": "c",
-          "data": {}
-        },
-        "optimistic": {
-          "table": "t",
-          "operation": "INSERT",
-          "data": {
-            "id": 5
-          },
-          "lsn": 9007199254740991,
-          "optimistic": true
-        }
-      }
-    },
-    {
-      "name": "\u00a710dv: an UPDATE whose values change a key column is refused before it is queued \u2014 rename is delete + create",
-      "args": {
-        "principal": "omar",
-        "clientId": "c-40acde74",
-        "table": "test_types",
-        "op": "UPDATE",
-        "key": {
-          "uid": "u-1"
-        },
-        "values": {
-          "uid": "u-2",
-          "note": "moved?"
-        },
-        "pkCols": [
-          "uid"
-        ],
-        "version": "2026-08-27T10:00:00.123000Z"
-      },
-      "throws": "KeyChange"
-    },
-    {
-      "name": "\u00a710dv: repeating the key in values UNCHANGED is not a key change (the old page did it)",
-      "args": {
-        "principal": "omar",
-        "clientId": "c-40acde74",
-        "table": "test_types",
-        "op": "UPDATE",
-        "key": {
-          "uid": "u-1"
-        },
-        "values": {
-          "uid": "u-1",
-          "note": "hi"
-        },
-        "pkCols": [
-          "uid"
-        ],
-        "version": "2026-08-27T10:00:00.123000Z"
-      },
-      "out": {
-        "subject": "mutation.omar.test_types.update",
-        "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
-        "id": "u-1",
-        "payload": {
-          "key": {
-            "uid": "u-1"
-          },
-          "version": "2026-08-27T10:00:00.123000Z",
-          "client_id": "c-40acde74",
-          "data": {
-            "uid": "u-1",
-            "note": "hi"
-          }
-        },
-        "optimistic": {
-          "table": "test_types",
-          "operation": "UPDATE",
-          "data": {
-            "uid": "u-1",
-            "note": "hi"
-          },
-          "lsn": 9007199254740991,
-          "optimistic": true
-        }
-      }
+    "CDC_PUBLIC": {
+     "firstSeq": 62174,
+     "stored": 0
     }
-  ],
-  "normalizeVersion": [
-    {
-      "name": "PG-trimmed micros pad to six digits",
-      "in": "2026-08-27T10:09:49.68582Z",
-      "out": "2026-08-27T10:09:49.685820Z"
+   },
+   "tables": {
+    "salaries": {
+     "route": "CDC_kilo",
+     "seeded": false
     },
-    {
-      "name": "no fraction gains .000000",
-      "in": "2026-08-27T10:09:49Z",
-      "out": "2026-08-27T10:09:49.000000Z"
-    },
-    {
-      "name": "already canonical passes through",
-      "in": "2026-08-27T10:09:49.123456Z",
-      "out": "2026-08-27T10:09:49.123456Z"
-    },
-    {
-      "name": "nanosecond overshoot truncates to micros",
-      "in": "2026-08-27T10:09:49.123456789Z",
-      "out": "2026-08-27T10:09:49.123456Z"
-    },
-    {
-      "name": "non-timestamp version untouched (integer version columns)",
-      "in": "42",
-      "out": "42"
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": false
     }
-  ],
-  "hlcVersion": [
-    {
-      "name": "THE lost-update killer: slow clock, newer floor seen via CDC -> floor + 1\u00b5s",
-      "now": "2026-08-27T10:00:00.000Z",
-      "last": "2026-08-27T09:00:00.000000Z",
-      "floor": "2026-08-27T10:00:30.500000Z",
-      "out": "2026-08-27T10:00:30.500001Z"
-    },
-    {
-      "name": "accurate clock ahead of everything: wall time wins",
-      "now": "2026-08-27T11:00:00.123Z",
-      "last": "2026-08-27T10:59:00.000000Z",
-      "floor": "2026-08-27T10:58:00.000000Z",
-      "out": "2026-08-27T11:00:00.123000Z"
-    },
-    {
-      "name": "own last stamp still the highest: bump past it, not the floor",
-      "now": "2026-08-27T10:00:00.000Z",
-      "last": "2026-08-27T10:00:05.000009Z",
-      "floor": "2026-08-27T10:00:01.000000Z",
-      "out": "2026-08-27T10:00:05.000010Z"
+   },
+   "gapped": [
+    "CDC_kilo",
+    "CDC_PUBLIC"
+   ],
+   "tablesToSeed": [
+    "salaries",
+    "users"
+   ]
+  },
+  {
+   "name": "stored == firstSeq - 1 is NOT a gap (the next message needed still exists)",
+   "streams": {
+    "CDC_PUBLIC": {
+     "firstSeq": 100,
+     "stored": 99
     }
-  ],
-  "outboxWatermark": [
-    {
-      "name": "no watermark known -> everything sends (GC may simply be off)",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": "2020-01-01T00:00:00.000000Z"
-        }
-      ],
-      "watermark": null,
-      "send": [
-        "a"
-      ],
-      "refuse": []
-    },
-    {
-      "name": "empty-string watermark is treated as unknown, not as the epoch",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": "2020-01-01T00:00:00.000000Z"
-        }
-      ],
-      "watermark": "",
-      "send": [
-        "a"
-      ],
-      "refuse": []
-    },
-    {
-      "name": "newer than the watermark -> sends",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": "2026-08-28T12:00:00.000000Z"
-        }
-      ],
-      "watermark": "2026-08-01T00:00:00.000000Z",
-      "send": [
-        "a"
-      ],
-      "refuse": []
-    },
-    {
-      "name": "older than the watermark -> REFUSED, its tombstone was reaped",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": "2026-07-01T00:00:00.000000Z"
-        }
-      ],
-      "watermark": "2026-08-01T00:00:00.000000Z",
-      "send": [],
-      "refuse": [
-        "a"
-      ]
-    },
-    {
-      "name": "exactly AT the watermark -> refused; the oldest standing tombstone is not a safe boundary",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": "2026-08-01T00:00:00.000000Z"
-        }
-      ],
-      "watermark": "2026-08-01T00:00:00.000000Z",
-      "send": [],
-      "refuse": [
-        "a"
-      ]
-    },
-    {
-      "name": "an entry with no version is never refused \u2014 the server's version guard still fronts it",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": null
-        }
-      ],
-      "watermark": "2026-08-01T00:00:00.000000Z",
-      "send": [
-        "a"
-      ],
-      "refuse": []
-    },
-    {
-      "name": "mixed queue splits, and order within each side is preserved",
-      "entries": [
-        {
-          "msgId": "old1",
-          "version": "2026-01-01T00:00:00.000000Z"
-        },
-        {
-          "msgId": "new1",
-          "version": "2026-09-01T00:00:00.000000Z"
-        },
-        {
-          "msgId": "old2",
-          "version": "2026-02-01T00:00:00.000000Z"
-        },
-        {
-          "msgId": "new2",
-          "version": "2026-10-01T00:00:00.000000Z"
-        }
-      ],
-      "watermark": "2026-08-01T00:00:00.000000Z",
-      "send": [
-        "new1",
-        "new2"
-      ],
-      "refuse": [
-        "old1",
-        "old2"
-      ]
-    },
-    {
-      "name": "trimmed PG fractional digits compare correctly once normalized",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": "2026-08-01T00:00:00.5Z"
-        }
-      ],
-      "watermark": "2026-08-01T00:00:00.50001Z",
-      "send": [],
-      "refuse": [
-        "a"
-      ]
-    },
-    {
-      "name": "and the same pair the other way round",
-      "entries": [
-        {
-          "msgId": "a",
-          "version": "2026-08-01T00:00:00.50001Z"
-        }
-      ],
-      "watermark": "2026-08-01T00:00:00.5Z",
-      "send": [
-        "a"
-      ],
-      "refuse": []
+   },
+   "tables": {
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
     }
-  ],
-  "tombstoned": [
-    {
-      "name": "tombstone set drops the row (PROTOCOL \u00a77.5: the soft delete IS the removal; the reap never arrives)",
-      "tombstoneColumn": "deleted_at",
-      "data": {
-        "uid": "u1",
-        "deleted_at": "2026-08-28T21:39:17.279256Z"
-      },
-      "drops": true
-    },
-    {
-      "name": "tombstone null keeps the row",
-      "tombstoneColumn": "deleted_at",
-      "data": {
-        "uid": "u1",
-        "deleted_at": null
-      },
-      "drops": false
-    },
-    {
-      "name": "tombstone column absent from the payload keeps the row (partial UPDATE)",
-      "tombstoneColumn": "deleted_at",
-      "data": {
-        "uid": "u1",
-        "age": 3
-      },
-      "drops": false
-    },
-    {
-      "name": "a table without a tombstone column is never tombstoned (its deletes are physical)",
-      "tombstoneColumn": null,
-      "data": {
-        "uid": "u1",
-        "deleted_at": "2026-08-28T21:39:17.279256Z"
-      },
-      "drops": false
-    },
-    {
-      "name": "empty string is a value, not null \u2014 the row is tombstoned (measured: libzb held 134 reaped rows)",
-      "tombstoneColumn": "deleted_at",
-      "data": {
-        "uid": "u1",
-        "deleted_at": ""
-      },
-      "drops": true
-    },
-    {
-      "name": "non-object data keeps nothing to decide on",
-      "tombstoneColumn": "deleted_at",
-      "data": null,
-      "drops": false
+   },
+   "gapped": [],
+   "tablesToSeed": []
+  },
+  {
+   "name": "stored == firstSeq - 2 IS a gap (one message lost)",
+   "streams": {
+    "CDC_PUBLIC": {
+     "firstSeq": 100,
+     "stored": 98
     }
-  ],
-  "update": [
-    {
-      "name": "partial payload on an existing row sets only what was sent (\u00a77's asymmetry \u2014 the upsert's INSERT arm failed NOT NULL here)",
-      "table": "test_types",
-      "pkCols": [
-        "uid"
-      ],
-      "data": {
-        "uid": "u1",
-        "some_text": "updated",
-        "updated_at": "2026-01-01T00:00:00.000000Z"
-      },
-      "plan": {
-        "sql": "UPDATE test_types SET \"some_text\" = ?, \"updated_at\" = ? WHERE \"uid\" = ?",
-        "params": [
-          "updated",
-          "2026-01-01T00:00:00.000000Z",
-          "u1"
-        ]
-      }
-    },
-    {
-      "name": "composite key: every key column in the WHERE, none in the SET",
-      "table": "t",
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "data": {
-        "a": 1,
-        "b": 2,
-        "v": "x"
-      },
-      "plan": {
-        "sql": "UPDATE t SET \"v\" = ? WHERE \"a\" = ? AND \"b\" = ?",
-        "params": [
-          "x",
-          1,
-          2
-        ]
-      }
-    },
-    {
-      "name": "old.* columns are never set (a key change is planKeyChange's job)",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": 7,
-        "old.id": 6,
-        "v": "x"
-      },
-      "plan": {
-        "sql": "UPDATE t SET \"v\" = ? WHERE \"id\" = ?",
-        "params": [
-          "x",
-          7
-        ]
-      }
-    },
-    {
-      "name": "structured values are JSON text, as in the upsert",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": 1,
-        "meta": {
-          "k": 1
-        }
-      },
-      "plan": {
-        "sql": "UPDATE t SET \"meta\" = ? WHERE \"id\" = ?",
-        "params": [
-          "{\"k\":1}",
-          1
-        ]
-      }
-    },
-    {
-      "name": "key only: nothing to set \u2192 null",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": 1
-      },
-      "plan": null
-    },
-    {
-      "name": "incomplete key \u2192 null (cannot address one row)",
-      "table": "t",
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "data": {
-        "a": 1,
-        "v": "x"
-      },
-      "plan": null
-    },
-    {
-      "name": "no primary key \u2192 null",
-      "table": "t",
-      "pkCols": [],
-      "data": {
-        "id": 1,
-        "v": "x"
-      },
-      "plan": null
+   },
+   "tables": {
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
     }
-  ],
-  "exists": [
-    {
-      "name": "full key \u2192 SELECT 1 \u2026 LIMIT 1",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": 7,
-        "v": "x"
-      },
-      "plan": {
-        "sql": "SELECT 1 FROM t WHERE \"id\" = ? LIMIT 1",
-        "params": [
-          7
-        ]
-      }
+   },
+   "gapped": [
+    "CDC_PUBLIC"
+   ],
+   "tablesToSeed": [
+    "users"
+   ]
+  },
+  {
+   "name": "stream recreated under the client (lost slot): position beyond last_seq is a gap",
+   "streams": {
+    "CDC_kilo": {
+     "firstSeq": 1,
+     "stored": 2828,
+     "lastSeq": 12
     },
-    {
-      "name": "composite key",
-      "table": "t",
-      "pkCols": [
-        "a",
-        "b"
-      ],
-      "data": {
-        "a": 1,
-        "b": 2
-      },
-      "plan": {
-        "sql": "SELECT 1 FROM t WHERE \"a\" = ? AND \"b\" = ? LIMIT 1",
-        "params": [
-          1,
-          2
-        ]
-      }
-    },
-    {
-      "name": "null key column \u2192 null",
-      "table": "t",
-      "pkCols": [
-        "id"
-      ],
-      "data": {
-        "id": null
-      },
-      "plan": null
-    },
-    {
-      "name": "no primary key \u2192 null",
-      "table": "t",
-      "pkCols": [],
-      "data": {
-        "id": 1
-      },
-      "plan": null
+    "CDC_PUBLIC": {
+     "firstSeq": 62174,
+     "stored": 62179,
+     "lastSeq": 62300
     }
-  ],
-  "pgArrayLiteral": [
-    {
-      "name": "plain strings",
-      "in": [
-        "web",
-        "push-1"
-      ],
-      "out": "{web,push-1}"
+   },
+   "tables": {
+    "salaries": {
+     "route": "CDC_kilo",
+     "seeded": true
     },
-    {
-      "name": "a comma inside a value is quoted (measured: the browser's INS on PGlite \u2014 malformed array literal on the JSON form)",
-      "in": [
-        "a",
-        "with,comma"
-      ],
-      "out": "{a,\"with,comma\"}"
-    },
-    {
-      "name": "nested integer arrays",
-      "in": [
-        [
-          1,
-          2
-        ],
-        [
-          3,
-          4
-        ]
-      ],
-      "out": "{{1,2},{3,4}}"
-    },
-    {
-      "name": "quote and backslash are escaped",
-      "in": [
-        "say \"hi\"",
-        "back\\slash"
-      ],
-      "out": "{\"say \\\"hi\\\"\",\"back\\\\slash\"}"
-    },
-    {
-      "name": "empty string and the word NULL are quoted; a null element is NULL",
-      "in": [
-        "",
-        "null",
-        null
-      ],
-      "out": "{\"\",\"null\",NULL}"
-    },
-    {
-      "name": "booleans and numbers",
-      "in": [
-        true,
-        false,
-        1.5
-      ],
-      "out": "{t,f,1.5}"
-    },
-    {
-      "name": "whitespace inside a value is quoted",
-      "in": [
-        "two words"
-      ],
-      "out": "{\"two words\"}"
-    },
-    {
-      "name": "empty array",
-      "in": [],
-      "out": "{}"
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
     }
-  ],
-  "heartbeat": [
-    {
-      "name": "streams sorted bytewise (uppercase before lowercase), integers verbatim",
-      "principal": "omar",
-      "tenant": "kilo",
-      "ts": 1757150000123,
-      "seqs": {
-        "CDC_kilo": 223,
-        "CDC_PUBLIC": 3190
-      },
-      "out": "{\"principal\":\"omar\",\"tenant\":\"kilo\",\"ts\":1757150000123,\"streams\":{\"CDC_PUBLIC\":3190,\"CDC_kilo\":223}}"
-    },
-    {
-      "name": "no streams yet (before the first sync)",
-      "principal": "alice",
-      "tenant": "_default",
-      "ts": 1,
-      "seqs": {},
-      "out": "{\"principal\":\"alice\",\"tenant\":\"_default\",\"ts\":1,\"streams\":{}}"
-    },
-    {
-      "name": "one stream, zero applied",
-      "principal": "nina",
-      "tenant": "acme",
-      "ts": 42,
-      "seqs": {
-        "CDC_acme": 0
-      },
-      "out": "{\"principal\":\"nina\",\"tenant\":\"acme\",\"ts\":42,\"streams\":{\"CDC_acme\":0}}"
+   },
+   "gapped": [
+    "CDC_kilo"
+   ],
+   "tablesToSeed": [
+    "salaries"
+   ]
+  },
+  {
+   "name": "an empty recreated stream (last_seq 0) with a position is a gap too",
+   "streams": {
+    "CDC_kilo": {
+     "firstSeq": 0,
+     "stored": 7,
+     "lastSeq": 0
     }
-  ],
-  "shape": [
-    {
-      "name": "single pk keeps its dialect type; types sorted by name",
-      "pkCols": [
-        "id"
-      ],
-      "cols": [
-        {
-          "name": "name",
-          "type": "TEXT"
-        },
-        {
-          "name": "id",
-          "type": "INTEGER"
-        }
-      ],
-      "key": "[[\"id\",\"INTEGER\"]]",
-      "types": "[[\"id\",\"INTEGER\"],[\"name\",\"TEXT\"]]"
-    },
-    {
-      "name": "composite pk keeps PK ORDER (b before a), not name order (\u00a710dg)",
-      "pkCols": [
-        "b",
-        "a"
-      ],
-      "cols": [
-        {
-          "name": "a",
-          "type": "TEXT"
-        },
-        {
-          "name": "b",
-          "type": "INTEGER"
-        }
-      ],
-      "key": "[[\"b\",\"INTEGER\"],[\"a\",\"TEXT\"]]",
-      "types": "[[\"a\",\"TEXT\"],[\"b\",\"INTEGER\"]]"
-    },
-    {
-      "name": "no pk: empty key shape, types still recorded",
-      "pkCols": [],
-      "cols": [
-        {
-          "name": "a",
-          "type": "TEXT"
-        }
-      ],
-      "key": "[]",
-      "types": "[[\"a\",\"TEXT\"]]"
-    },
-    {
-      "name": "a pk column the descriptor does not list is skipped, not guessed",
-      "pkCols": [
-        "id",
-        "ghost"
-      ],
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        }
-      ],
-      "key": "[[\"id\",\"INTEGER\"]]",
-      "types": "[[\"id\",\"INTEGER\"]]"
-    },
-    {
-      "name": "bigserial\u2192uuid on the pk changes the key shape (INTEGER\u2192TEXT in the sqlite block)",
-      "pkCols": [
-        "id"
-      ],
-      "cols": [
-        {
-          "name": "id",
-          "type": "TEXT"
-        },
-        {
-          "name": "name",
-          "type": "TEXT"
-        }
-      ],
-      "key": "[[\"id\",\"TEXT\"]]",
-      "types": "[[\"id\",\"TEXT\"],[\"name\",\"TEXT\"]]"
+   },
+   "tables": {
+    "salaries": {
+     "route": "CDC_kilo",
+     "seeded": true
     }
-  ],
-  "retyped": [
-    {
-      "name": "no stored record: nothing known, nothing retyped",
-      "stored": null,
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        }
-      ],
-      "out": []
+   },
+   "gapped": [
+    "CDC_kilo"
+   ],
+   "tablesToSeed": [
+    "salaries"
+   ]
+  },
+  {
+   "name": "§10bq: a gap on CDC_PUBLIC re-seeds tenant-scoped tables too — their shared rows ride it",
+   "streams": {
+    "CDC_kilo": {
+     "firstSeq": 10,
+     "stored": 40,
+     "lastSeq": 40
     },
-    {
-      "name": "unreadable record reads as unknown, never as everything changed",
-      "stored": "not json",
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        }
-      ],
-      "out": []
-    },
-    {
-      "name": "same shape: nothing retyped",
-      "stored": "[[\"id\",\"INTEGER\"],[\"user_id\",\"INTEGER\"]]",
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        },
-        {
-          "name": "user_id",
-          "type": "INTEGER"
-        }
-      ],
-      "out": []
-    },
-    {
-      "name": "FK column follows its parent's re-key (bigint\u2192uuid): retyped",
-      "stored": "[[\"id\",\"INTEGER\"],[\"user_id\",\"INTEGER\"]]",
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        },
-        {
-          "name": "user_id",
-          "type": "TEXT"
-        }
-      ],
-      "out": [
-        "user_id"
-      ]
-    },
-    {
-      "name": "an added column is diffColumns' business, a removed one too",
-      "stored": "[[\"id\",\"INTEGER\"],[\"old\",\"TEXT\"]]",
-      "cols": [
-        {
-          "name": "id",
-          "type": "INTEGER"
-        },
-        {
-          "name": "new",
-          "type": "REAL"
-        }
-      ],
-      "out": []
-    },
-    {
-      "name": "order of the descriptor's columns is irrelevant; output follows descriptor order",
-      "stored": "[[\"a\",\"TEXT\"],[\"b\",\"TEXT\"]]",
-      "cols": [
-        {
-          "name": "b",
-          "type": "INTEGER"
-        },
-        {
-          "name": "a",
-          "type": "REAL"
-        }
-      ],
-      "out": [
-        "b",
-        "a"
-      ]
+    "CDC_PUBLIC": {
+     "firstSeq": 900,
+     "stored": 100,
+     "lastSeq": 1200
     }
-  ],
-  "readOnlySql": [
-    {
-      "name": "a plain SELECT reads",
-      "sql": "SELECT uid, title FROM notes WHERE deleted_at IS NULL",
-      "allowed": true
+   },
+   "tables": {
+    "test_types": {
+     "route": "CDC_kilo",
+     "sharedRoute": "CDC_PUBLIC",
+     "seeded": true
     },
-    {
-      "name": "lowercase, trailing semicolon, still a read",
-      "sql": "  select count(*) from _zebridge_outbox; ",
-      "allowed": true
-    },
-    {
-      "name": "a CTE that selects reads",
-      "sql": "WITH x AS (SELECT 1 AS n) SELECT n FROM x",
-      "allowed": true
-    },
-    {
-      "name": "EXPLAIN QUERY PLAN reads",
-      "sql": "EXPLAIN QUERY PLAN SELECT * FROM notes",
-      "allowed": true
-    },
-    {
-      "name": "PRAGMA table_info reads",
-      "sql": "PRAGMA table_info('notes')",
-      "allowed": true
-    },
-    {
-      "name": "PRAGMA foreign_key_check reads",
-      "sql": "PRAGMA foreign_key_check",
-      "allowed": true
-    },
-    {
-      "name": "a string literal containing a write word is a value, not a write",
-      "sql": "SELECT 1 FROM notes WHERE title = 'please delete me' OR body = 'x''; drop table y'",
-      "allowed": true
-    },
-    {
-      "name": "a column named like a write word, with an underscore, is a name",
-      "sql": "SELECT update_count, created_by FROM stats",
-      "allowed": true
-    },
-    {
-      "name": "a comment mentioning a write is a comment",
-      "sql": "-- delete later\nSELECT 1 /* insert nothing */",
-      "allowed": true
-    },
-    {
-      "name": "DELETE on the outbox is a write",
-      "sql": "DELETE FROM _zebridge_outbox",
-      "allowed": false
-    },
-    {
-      "name": "UPDATE on a position is a write",
-      "sql": "UPDATE _zebridge_stream_seq SET last_seq = 0",
-      "allowed": false
-    },
-    {
-      "name": "INSERT into a data table is a write (local theater is not offered)",
-      "sql": "INSERT INTO notes (uid) VALUES ('x')",
-      "allowed": false
-    },
-    {
-      "name": "a CTE feeding DML is a write",
-      "sql": "WITH x AS (SELECT 1) DELETE FROM _zebridge_outbox",
-      "allowed": false
-    },
-    {
-      "name": "a second statement after a semicolon is refused whole",
-      "sql": "SELECT 1; DELETE FROM _zebridge_outbox",
-      "allowed": false
-    },
-    {
-      "name": "DROP TABLE is a write",
-      "sql": "DROP TABLE _zebridge_inbox",
-      "allowed": false
-    },
-    {
-      "name": "a pragma that SETS is a write",
-      "sql": "PRAGMA foreign_keys = OFF",
-      "allowed": false
-    },
-    {
-      "name": "VACUUM and ATTACH are writes",
-      "sql": "ATTACH DATABASE '/tmp/x' AS y",
-      "allowed": false
-    },
-    {
-      "name": "empty is nothing to read",
-      "sql": "   ",
-      "allowed": false
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
     }
-  ]
+   },
+   "gapped": [
+    "CDC_PUBLIC"
+   ],
+   "tablesToSeed": [
+    "test_types",
+    "users"
+   ]
+  },
+  {
+   "name": "§10bq: a gap on the TENANT stream still leaves public tables alone",
+   "streams": {
+    "CDC_kilo": {
+     "firstSeq": 900,
+     "stored": 100,
+     "lastSeq": 1200
+    },
+    "CDC_PUBLIC": {
+     "firstSeq": 10,
+     "stored": 40,
+     "lastSeq": 40
+    }
+   },
+   "tables": {
+    "test_types": {
+     "route": "CDC_kilo",
+     "sharedRoute": "CDC_PUBLIC",
+     "seeded": true
+    },
+    "users": {
+     "route": "CDC_PUBLIC",
+     "seeded": true
+    }
+   },
+   "gapped": [
+    "CDC_kilo"
+   ],
+   "tablesToSeed": [
+    "test_types"
+   ]
+  }
+ ],
+ "position": [
+  {
+   "name": "advances to the batch max",
+   "stored": 861,
+   "batch": [
+    862,
+    863
+   ],
+   "next": 863
+  },
+  {
+   "name": "never moves backwards",
+   "stored": 863,
+   "batch": [
+    100,
+    200
+   ],
+   "next": 863
+  },
+  {
+   "name": "empty batch leaves it alone",
+   "stored": 863,
+   "batch": [],
+   "next": 863
+  }
+ ],
+ "fkKind": [
+  {
+   "name": "missing parent row",
+   "message": "FOREIGN KEY constraint failed",
+   "kind": "missing-parent"
+  },
+  {
+   "name": "missing parent table (lazy DDL, strict DML)",
+   "message": "no such table: main.users",
+   "kind": "missing-parent"
+  },
+  {
+   "name": "schema-level mismatch drops loudly",
+   "message": "foreign key mismatch - \"salaries\" referencing \"users\"",
+   "kind": "mismatch"
+  },
+  {
+   "name": "unrelated error is not an FK hold",
+   "message": "UNIQUE constraint failed: memo.id",
+   "kind": null
+  }
+ ],
+ "pgTsToWire": [
+  {
+   "name": "space + offset become T + Z, microseconds preserved",
+   "in": "2026-08-27 10:09:49.685820+00",
+   "out": "2026-08-27T10:09:49.685820Z"
+  },
+  {
+   "name": "colon-form offset too",
+   "in": "2026-08-27 10:09:49+00:00",
+   "out": "2026-08-27T10:09:49Z"
+  },
+  {
+   "name": "non-timestamp strings pass through untouched",
+   "in": "hello world",
+   "out": "hello world"
+  }
+ ],
+ "lsnToNumber": [
+  {
+   "name": "hi/lo compose",
+   "in": "2/97B6ED8",
+   "out": 8749018840
+  },
+  {
+   "name": "zero page",
+   "in": "0/C5793FD0",
+   "out": 3313057744
+  }
+ ],
+ "keyChange": [
+  {
+   "name": "changed key deletes the old one first (measured: row lived under both keys)",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "old.id": 1,
+    "id": 2,
+    "v": "x"
+   },
+   "step": {
+    "sql": "DELETE FROM t WHERE \"id\" = ?",
+    "params": [
+     1
+    ],
+    "oldKey": [
+     1
+    ],
+    "newKey": [
+     2
+    ]
+   }
+  },
+  {
+   "name": "same key: no delete",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "old.id": 2,
+    "id": 2
+   },
+   "step": null
+  },
+  {
+   "name": "no old.* on the event: no delete",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": 2
+   },
+   "step": null
+  },
+  {
+   "name": "composite: any old column missing means no delete",
+   "table": "t",
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "data": {
+    "old.a": 1,
+    "a": 9,
+    "b": 9
+   },
+   "step": null
+  }
+ ],
+ "upsert": [
+  {
+   "name": "ordinary two-column upsert",
+   "table": "users",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": 7,
+    "name": "n1"
+   },
+   "step": {
+    "sql": "INSERT INTO users (\"id\", \"name\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\"",
+    "params": [
+     7,
+     "n1"
+    ]
+   }
+  },
+  {
+   "name": "all columns in the key: DO NOTHING (redelivery must converge, not throw)",
+   "table": "m",
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "data": {
+    "a": 1,
+    "b": 2
+   },
+   "step": {
+    "sql": "INSERT INTO m (\"a\", \"b\") VALUES (?, ?) ON CONFLICT(\"a\", \"b\") DO NOTHING",
+    "params": [
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "name": "keyless table: plain INSERT (refused upstream anyway)",
+   "table": "k",
+   "pkCols": [],
+   "data": {
+    "x": 1
+   },
+   "step": {
+    "sql": "INSERT INTO k (\"x\") VALUES (?)",
+    "params": [
+     1
+    ]
+   }
+  },
+  {
+   "name": "structured values bind as JSON text; old.* never lands in columns",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "old.id": 1,
+    "id": 2,
+    "meta": {
+     "k": "v"
+    }
+   },
+   "step": {
+    "sql": "INSERT INTO t (\"id\", \"meta\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"meta\" = excluded.\"meta\"",
+    "params": [
+     2,
+     "{\"k\":\"v\"}"
+    ]
+   }
+  }
+ ],
+ "delete": [
+  {
+   "name": "full key deletes",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": 5
+   },
+   "step": {
+    "sql": "DELETE FROM t WHERE \"id\" = ?",
+    "params": [
+     5
+    ]
+   }
+  },
+  {
+   "name": "partial composite key SKIPS (would match more rows than PG deleted)",
+   "table": "t",
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "data": {
+    "a": 1
+   },
+   "step": null
+  },
+  {
+   "name": "keyless table skips",
+   "table": "t",
+   "pkCols": [],
+   "data": {
+    "x": 1
+   },
+   "step": null
+  }
+ ],
+ "chainUpsert": [
+  {
+   "name": "version-guarded: a chain row never overwrites a newer CDC value",
+   "table": "salaries",
+   "cols": [
+    "uid",
+    "amount",
+    "updated_at"
+   ],
+   "pkCols": [
+    "uid"
+   ],
+   "versionCol": "updated_at",
+   "sql": "INSERT INTO salaries (\"uid\", \"amount\", \"updated_at\") VALUES (?, ?, ?) ON CONFLICT(\"uid\") DO UPDATE SET \"amount\" = excluded.\"amount\", \"updated_at\" = excluded.\"updated_at\" WHERE excluded.\"updated_at\" > salaries.\"updated_at\""
+  },
+  {
+   "name": "no version column: unguarded update",
+   "table": "t",
+   "cols": [
+    "id",
+    "v"
+   ],
+   "pkCols": [
+    "id"
+   ],
+   "versionCol": null,
+   "sql": "INSERT INTO t (\"id\", \"v\") VALUES (?, ?) ON CONFLICT(\"id\") DO UPDATE SET \"v\" = excluded.\"v\""
+  },
+  {
+   "name": "all-key row: DO NOTHING",
+   "table": "t",
+   "cols": [
+    "a",
+    "b"
+   ],
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "versionCol": null,
+   "sql": "INSERT INTO t (\"a\", \"b\") VALUES (?, ?) ON CONFLICT(\"a\", \"b\") DO NOTHING"
+  }
+ ],
+ "chainRowParams": [
+  {
+   "name": "timestamps normalize to the wire shape, objects to JSON, scalars pass",
+   "row": [
+    "2026-08-27 10:09:49.685820+00",
+    {
+     "k": 1
+    },
+    42,
+    null
+   ],
+   "params": [
+    "2026-08-27T10:09:49.685820Z",
+    "{\"k\":1}",
+    42,
+    null
+   ]
+  },
+  {
+   "name": "a boolean passes through as a boolean — the producer emits msgpack bools for bool columns, never t/f text (measured: a SQLite replica held TEXT 't' from chains and INTEGER 1 from CDC in one column)",
+   "row": [
+    "u1",
+    true,
+    false,
+    null
+   ],
+   "params": [
+    "u1",
+    true,
+    false,
+    null
+   ]
+  }
+ ],
+ "columnDdl": [
+  {
+   "name": "single-column pk is inline PRIMARY KEY and NOT NULL",
+   "col": {
+    "name": "id",
+    "type": "INTEGER"
+   },
+   "pkCols": [
+    "id"
+   ],
+   "ddl": "\"id\" INTEGER NOT NULL PRIMARY KEY"
+  },
+  {
+   "name": "required column is NOT NULL (a bad optimistic write fails locally)",
+   "col": {
+    "name": "inserted_at",
+    "type": "TEXT",
+    "required": true
+   },
+   "pkCols": [
+    "id"
+   ],
+   "ddl": "\"inserted_at\" TEXT NOT NULL"
+  },
+  {
+   "name": "plain nullable column",
+   "col": {
+    "name": "note",
+    "type": "TEXT"
+   },
+   "pkCols": [
+    "id"
+   ],
+   "ddl": "\"note\" TEXT"
+  },
+  {
+   "name": "composite pk member: NOT NULL but not inline (constraint carries the key)",
+   "col": {
+    "name": "a",
+    "type": "TEXT"
+   },
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "ddl": "\"a\" TEXT NOT NULL"
+  },
+  {
+   "name": "constant default carried (a client's engine fills existing rows — §10df)",
+   "col": {
+    "name": "n",
+    "type": "INTEGER",
+    "default": "5"
+   },
+   "pkCols": [
+    "id"
+   ],
+   "ddl": "\"n\" INTEGER DEFAULT 5"
+  },
+  {
+   "name": "quoted default kept quoted, NOT NULL before DEFAULT",
+   "col": {
+    "name": "kind",
+    "type": "TEXT",
+    "required": true,
+    "default": "'plain'"
+   },
+   "pkCols": [
+    "id"
+   ],
+   "ddl": "\"kind\" TEXT NOT NULL DEFAULT 'plain'"
+  }
+ ],
+ "fkClauses": [
+  {
+   "name": "well-formed FK renders",
+   "fks": [
+    {
+     "columns": [
+      "user_id"
+     ],
+     "references": "users",
+     "parent_columns": [
+      "id"
+     ]
+    }
+   ],
+   "text": ", FOREIGN KEY (\"user_id\") REFERENCES users (\"id\")"
+  },
+  {
+   "name": "arity mismatch is dropped, not guessed",
+   "fks": [
+    {
+     "columns": [
+      "a",
+      "b"
+     ],
+     "references": "p",
+     "parent_columns": [
+      "x"
+     ]
+    }
+   ],
+   "text": ""
+  },
+  {
+   "name": "missing references is dropped",
+   "fks": [
+    {
+     "columns": [
+      "a"
+     ],
+     "parent_columns": [
+      "x"
+     ]
+    }
+   ],
+   "text": ""
+  }
+ ],
+ "createTable": [
+  {
+   "name": "composite pk + fk: the full statement",
+   "table": "salaries",
+   "cols": [
+    {
+     "name": "uid",
+     "type": "TEXT"
+    },
+    {
+     "name": "user_id",
+     "type": "INTEGER",
+     "required": true
+    },
+    {
+     "name": "tenant_id",
+     "type": "TEXT"
+    }
+   ],
+   "pkCols": [
+    "uid"
+   ],
+   "fks": [
+    {
+     "columns": [
+      "user_id"
+     ],
+     "references": "users",
+     "parent_columns": [
+      "id"
+     ]
+    }
+   ],
+   "steps": [
+    {
+     "sql": "DROP TABLE IF EXISTS salaries;",
+     "params": []
+    },
+    {
+     "sql": "CREATE TABLE salaries (\"uid\" TEXT NOT NULL PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"tenant_id\" TEXT, FOREIGN KEY (\"user_id\") REFERENCES users (\"id\"));",
+     "params": []
+    }
+   ]
+  },
+  {
+   "name": "the same, STRICT (SQLite): the keyword after the body (§10fi)",
+   "table": "salaries",
+   "cols": [
+    {
+     "name": "uid",
+     "type": "TEXT"
+    },
+    {
+     "name": "user_id",
+     "type": "INTEGER",
+     "required": true
+    },
+    {
+     "name": "tenant_id",
+     "type": "TEXT"
+    }
+   ],
+   "pkCols": [
+    "uid"
+   ],
+   "fks": [
+    {
+     "columns": [
+      "user_id"
+     ],
+     "references": "users",
+     "parent_columns": [
+      "id"
+     ]
+    }
+   ],
+   "steps": [
+    {
+     "sql": "DROP TABLE IF EXISTS salaries;",
+     "params": []
+    },
+    {
+     "sql": "CREATE TABLE salaries (\"uid\" TEXT NOT NULL PRIMARY KEY, \"user_id\" INTEGER NOT NULL, \"tenant_id\" TEXT, FOREIGN KEY (\"user_id\") REFERENCES users (\"id\")) STRICT;",
+     "params": []
+    }
+   ],
+   "strict": true
+  }
+ ],
+ "rebuildSteps": [
+  {
+   "name": "FINDING 9's legitimate path: tmp, copy COMMON columns, swap",
+   "table": "t",
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    },
+    {
+     "name": "v",
+     "type": "TEXT"
+    }
+   ],
+   "pkCols": [
+    "id"
+   ],
+   "fks": [],
+   "existing": [
+    "id",
+    "v",
+    "gone"
+   ],
+   "steps": [
+    {
+     "sql": "DROP TABLE IF EXISTS t__migrating;",
+     "params": []
+    },
+    {
+     "sql": "CREATE TABLE t__migrating (\"id\" INTEGER NOT NULL PRIMARY KEY, \"v\" TEXT);",
+     "params": []
+    },
+    {
+     "sql": "INSERT INTO t__migrating (\"id\", \"v\") SELECT \"id\", \"v\" FROM t;",
+     "params": []
+    },
+    {
+     "sql": "DROP TABLE IF EXISTS t;",
+     "params": []
+    },
+    {
+     "sql": "ALTER TABLE t__migrating RENAME TO t;",
+     "params": []
+    }
+   ]
+  },
+  {
+   "name": "no common columns: no copy step (nothing to preserve)",
+   "table": "t",
+   "cols": [
+    {
+     "name": "x",
+     "type": "TEXT"
+    }
+   ],
+   "pkCols": [],
+   "fks": [],
+   "existing": [
+    "a"
+   ],
+   "steps": [
+    {
+     "sql": "DROP TABLE IF EXISTS t__migrating;",
+     "params": []
+    },
+    {
+     "sql": "CREATE TABLE t__migrating (\"x\" TEXT);",
+     "params": []
+    },
+    {
+     "sql": "DROP TABLE IF EXISTS t;",
+     "params": []
+    },
+    {
+     "sql": "ALTER TABLE t__migrating RENAME TO t;",
+     "params": []
+    }
+   ]
+  },
+  {
+   "name": "FINDING 9's legitimate path: tmp, copy COMMON columns, swap — STRICT (§10fi)",
+   "table": "t",
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    },
+    {
+     "name": "v",
+     "type": "TEXT"
+    }
+   ],
+   "pkCols": [
+    "id"
+   ],
+   "fks": [],
+   "existing": [
+    "id",
+    "v",
+    "gone"
+   ],
+   "steps": [
+    {
+     "sql": "DROP TABLE IF EXISTS t__migrating;",
+     "params": []
+    },
+    {
+     "sql": "CREATE TABLE t__migrating (\"id\" INTEGER NOT NULL PRIMARY KEY, \"v\" TEXT) STRICT;",
+     "params": []
+    },
+    {
+     "sql": "INSERT INTO t__migrating (\"id\", \"v\") SELECT CAST(\"id\" AS INTEGER), CAST(\"v\" AS TEXT) FROM t;",
+     "params": []
+    },
+    {
+     "sql": "DROP TABLE IF EXISTS t;",
+     "params": []
+    },
+    {
+     "sql": "ALTER TABLE t__migrating RENAME TO t;",
+     "params": []
+    }
+   ],
+   "strict": true
+  }
+ ],
+ "diffColumns": [
+  {
+   "name": "no existing table: nothing to diff (create path owns it)",
+   "existing": null,
+   "wanted": [
+    "a"
+   ],
+   "renamed": {},
+   "out": {
+    "renames": [],
+    "added": [],
+    "removed": []
+   }
+  },
+  {
+   "name": "plain add and remove",
+   "existing": [
+    "a",
+    "b"
+   ],
+   "wanted": [
+    "a",
+    "c"
+   ],
+   "renamed": {},
+   "out": {
+    "renames": [],
+    "added": [
+     "c"
+    ],
+    "removed": [
+     "b"
+    ]
+   }
+  },
+  {
+   "name": "a hinted rename is neither added nor removed",
+   "existing": [
+    "a",
+    "old_n"
+   ],
+   "wanted": [
+    "a",
+    "new_n"
+   ],
+   "renamed": {
+    "new_n": "old_n"
+   },
+   "out": {
+    "renames": [
+     [
+      "old_n",
+      "new_n"
+     ]
+    ],
+    "added": [],
+    "removed": []
+   }
+  },
+  {
+   "name": "rename hint ignored when the target already exists",
+   "existing": [
+    "a",
+    "old_n",
+    "new_n"
+   ],
+   "wanted": [
+    "a",
+    "new_n"
+   ],
+   "renamed": {
+    "new_n": "old_n"
+   },
+   "out": {
+    "renames": [],
+    "added": [],
+    "removed": [
+     "old_n"
+    ]
+   }
+  },
+  {
+   "name": "§1.2: an unhinted rename degrades to add+remove (values lost, by protocol)",
+   "existing": [
+    "a",
+    "old_n"
+   ],
+   "wanted": [
+    "a",
+    "new_n"
+   ],
+   "renamed": {},
+   "out": {
+    "renames": [],
+    "added": [
+     "new_n"
+    ],
+    "removed": [
+     "old_n"
+    ]
+   }
+  }
+ ],
+ "fkDiffer": [
+  {
+   "name": "no stored ddl: create path owns it",
+   "ddl": "",
+   "want": ", FOREIGN KEY (\"x\") REFERENCES p (\"y\")",
+   "differs": false
+  },
+  {
+   "name": "wanted none, has some: differs",
+   "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES p (\"y\"))",
+   "want": "",
+   "differs": true
+  },
+  {
+   "name": "wanted none, has none: same",
+   "ddl": "CREATE TABLE t (\"a\" TEXT)",
+   "want": "",
+   "differs": false
+  },
+  {
+   "name": "clause present (whitespace-normalized): same",
+   "ddl": "CREATE TABLE t (\"a\" TEXT,\n  FOREIGN KEY (\"a\")  REFERENCES p (\"y\"))",
+   "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
+   "differs": false
+  },
+  {
+   "name": "different parent: differs (forces a rebuild — SQLite has no ADD CONSTRAINT)",
+   "ddl": "CREATE TABLE t (\"a\" TEXT, FOREIGN KEY (\"a\") REFERENCES q (\"y\"))",
+   "want": ", FOREIGN KEY (\"a\") REFERENCES p (\"y\")",
+   "differs": true
+  }
+ ],
+ "viewSteps": [
+  {
+   "name": "plumbing columns excluded from the app view",
+   "table": "t",
+   "names": [
+    "uid",
+    "name",
+    "updated_at"
+   ],
+   "steps": [
+    {
+     "sql": "DROP VIEW IF EXISTS t_view;",
+     "params": []
+    },
+    {
+     "sql": "CREATE VIEW t_view AS SELECT \"name\" FROM t;",
+     "params": []
+    }
+   ]
+  },
+  {
+   "name": "all columns excluded: drop only, no view",
+   "table": "t",
+   "names": [
+    "uid",
+    "updated_at"
+   ],
+   "steps": [
+    {
+     "sql": "DROP VIEW IF EXISTS t_view;",
+     "params": []
+    }
+   ]
+  }
+ ],
+ "indexPlan": [
+  {
+   "name": "create the missing, drop the unpublished, keep the matching",
+   "table": "t",
+   "have": [
+    "ix_keep",
+    "ix_stale"
+   ],
+   "want": [
+    {
+     "name": "ix_keep",
+     "columns": [
+      "a"
+     ]
+    },
+    {
+     "name": "ix_new",
+     "unique": true,
+     "columns": [
+      "b",
+      "c"
+     ]
+    }
+   ],
+   "drops": [
+    {
+     "sql": "DROP INDEX IF EXISTS \"ix_stale\";",
+     "params": []
+    }
+   ],
+   "creates": [
+    {
+     "sql": "CREATE UNIQUE INDEX IF NOT EXISTS \"ix_new\" ON t (\"b\", \"c\");",
+     "params": []
+    }
+   ]
+  },
+  {
+   "name": "malformed entries skip",
+   "table": "t",
+   "have": [],
+   "want": [
+    {
+     "name": "",
+     "columns": [
+      "a"
+     ]
+    },
+    {
+     "name": "x",
+     "columns": []
+    }
+   ],
+   "drops": [],
+   "creates": []
+  }
+ ],
+ "nextVersion": [
+  {
+   "name": "clock ahead: wall time widened to microseconds",
+   "now": "2026-08-27T10:00:00.123Z",
+   "last": "2026-08-27T09:59:59.000000Z",
+   "out": "2026-08-27T10:00:00.123000Z"
+  },
+  {
+   "name": "clock tied: bump one microsecond past the last stamp",
+   "now": "2026-08-27T10:00:00.123Z",
+   "last": "2026-08-27T10:00:00.123000Z",
+   "out": "2026-08-27T10:00:00.123001Z"
+  },
+  {
+   "name": "clock behind (skew): still strictly after the last stamp",
+   "now": "2026-08-27T09:00:00.000Z",
+   "last": "2026-08-27T10:00:00.123456Z",
+   "out": "2026-08-27T10:00:00.123457Z"
+  }
+ ],
+ "subjectSafe": [
+  {
+   "name": "dots, wildcards and spaces become dashes",
+   "in": "c-1.users.*>x y",
+   "out": "c-1-users---x-y"
+  }
+ ],
+ "envelope": [
+  {
+   "name": "UPDATE: full envelope",
+   "args": {
+    "principal": "omar",
+    "clientId": "c-40acde74",
+    "table": "test_types",
+    "op": "UPDATE",
+    "key": {
+     "uid": "u-1"
+    },
+    "values": {
+     "note": "hi"
+    },
+    "pkCols": [
+     "uid"
+    ],
+    "version": "2026-08-27T10:00:00.123000Z"
+   },
+   "out": {
+    "subject": "mutation.omar.test_types.update",
+    "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
+    "id": "u-1",
+    "payload": {
+     "key": {
+      "uid": "u-1"
+     },
+     "version": "2026-08-27T10:00:00.123000Z",
+     "client_id": "c-40acde74",
+     "data": {
+      "note": "hi"
+     }
+    },
+    "optimistic": {
+     "table": "test_types",
+     "operation": "UPDATE",
+     "data": {
+      "uid": "u-1",
+      "note": "hi"
+     },
+     "lsn": 9007199254740991,
+     "optimistic": true
+    }
+   }
+  },
+  {
+   "name": "DELETE: no data on the wire; the optimistic event carries the key",
+   "args": {
+    "principal": "omar",
+    "clientId": "c-1",
+    "table": "t",
+    "op": "DELETE",
+    "key": {
+     "a": 1,
+     "b": 2
+    },
+    "pkCols": [
+     "a",
+     "b"
+    ],
+    "version": "2026-08-27T10:00:00.000000Z"
+   },
+   "out": {
+    "subject": "mutation.omar.t.delete",
+    "msgId": "c-1-t-1|2-2026-08-27T10:00:00-000000Z",
+    "id": "1|2",
+    "payload": {
+     "key": {
+      "a": 1,
+      "b": 2
+     },
+     "version": "2026-08-27T10:00:00.000000Z",
+     "client_id": "c-1"
+    },
+    "optimistic": {
+     "table": "t",
+     "operation": "DELETE",
+     "data": {
+      "a": 1,
+      "b": 2
+     },
+     "lsn": 9007199254740991,
+     "optimistic": true
+    }
+   }
+  },
+  {
+   "name": "INSERT with no values still ships an empty data object",
+   "args": {
+    "principal": "p",
+    "clientId": "c",
+    "table": "t",
+    "op": "INSERT",
+    "key": {
+     "id": 5
+    },
+    "pkCols": [
+     "id"
+    ],
+    "version": "2026-08-27T10:00:00.000000Z"
+   },
+   "out": {
+    "subject": "mutation.p.t.insert",
+    "msgId": "c-t-5-2026-08-27T10:00:00-000000Z",
+    "id": "5",
+    "payload": {
+     "key": {
+      "id": 5
+     },
+     "version": "2026-08-27T10:00:00.000000Z",
+     "client_id": "c",
+     "data": {}
+    },
+    "optimistic": {
+     "table": "t",
+     "operation": "INSERT",
+     "data": {
+      "id": 5
+     },
+     "lsn": 9007199254740991,
+     "optimistic": true
+    }
+   }
+  },
+  {
+   "name": "§10dv: an UPDATE whose values change a key column is refused before it is queued — rename is delete + create",
+   "args": {
+    "principal": "omar",
+    "clientId": "c-40acde74",
+    "table": "test_types",
+    "op": "UPDATE",
+    "key": {
+     "uid": "u-1"
+    },
+    "values": {
+     "uid": "u-2",
+     "note": "moved?"
+    },
+    "pkCols": [
+     "uid"
+    ],
+    "version": "2026-08-27T10:00:00.123000Z"
+   },
+   "throws": "KeyChange"
+  },
+  {
+   "name": "§10dv: repeating the key in values UNCHANGED is not a key change (the old page did it)",
+   "args": {
+    "principal": "omar",
+    "clientId": "c-40acde74",
+    "table": "test_types",
+    "op": "UPDATE",
+    "key": {
+     "uid": "u-1"
+    },
+    "values": {
+     "uid": "u-1",
+     "note": "hi"
+    },
+    "pkCols": [
+     "uid"
+    ],
+    "version": "2026-08-27T10:00:00.123000Z"
+   },
+   "out": {
+    "subject": "mutation.omar.test_types.update",
+    "msgId": "c-40acde74-test_types-u-1-2026-08-27T10:00:00-123000Z",
+    "id": "u-1",
+    "payload": {
+     "key": {
+      "uid": "u-1"
+     },
+     "version": "2026-08-27T10:00:00.123000Z",
+     "client_id": "c-40acde74",
+     "data": {
+      "uid": "u-1",
+      "note": "hi"
+     }
+    },
+    "optimistic": {
+     "table": "test_types",
+     "operation": "UPDATE",
+     "data": {
+      "uid": "u-1",
+      "note": "hi"
+     },
+     "lsn": 9007199254740991,
+     "optimistic": true
+    }
+   }
+  }
+ ],
+ "normalizeVersion": [
+  {
+   "name": "PG-trimmed micros pad to six digits",
+   "in": "2026-08-27T10:09:49.68582Z",
+   "out": "2026-08-27T10:09:49.685820Z"
+  },
+  {
+   "name": "no fraction gains .000000",
+   "in": "2026-08-27T10:09:49Z",
+   "out": "2026-08-27T10:09:49.000000Z"
+  },
+  {
+   "name": "already canonical passes through",
+   "in": "2026-08-27T10:09:49.123456Z",
+   "out": "2026-08-27T10:09:49.123456Z"
+  },
+  {
+   "name": "nanosecond overshoot truncates to micros",
+   "in": "2026-08-27T10:09:49.123456789Z",
+   "out": "2026-08-27T10:09:49.123456Z"
+  },
+  {
+   "name": "non-timestamp version untouched (integer version columns)",
+   "in": "42",
+   "out": "42"
+  }
+ ],
+ "hlcVersion": [
+  {
+   "name": "THE lost-update killer: slow clock, newer floor seen via CDC -> floor + 1µs",
+   "now": "2026-08-27T10:00:00.000Z",
+   "last": "2026-08-27T09:00:00.000000Z",
+   "floor": "2026-08-27T10:00:30.500000Z",
+   "out": "2026-08-27T10:00:30.500001Z"
+  },
+  {
+   "name": "accurate clock ahead of everything: wall time wins",
+   "now": "2026-08-27T11:00:00.123Z",
+   "last": "2026-08-27T10:59:00.000000Z",
+   "floor": "2026-08-27T10:58:00.000000Z",
+   "out": "2026-08-27T11:00:00.123000Z"
+  },
+  {
+   "name": "own last stamp still the highest: bump past it, not the floor",
+   "now": "2026-08-27T10:00:00.000Z",
+   "last": "2026-08-27T10:00:05.000009Z",
+   "floor": "2026-08-27T10:00:01.000000Z",
+   "out": "2026-08-27T10:00:05.000010Z"
+  }
+ ],
+ "outboxWatermark": [
+  {
+   "name": "no watermark known -> everything sends (GC may simply be off)",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": "2020-01-01T00:00:00.000000Z"
+    }
+   ],
+   "watermark": null,
+   "send": [
+    "a"
+   ],
+   "refuse": []
+  },
+  {
+   "name": "empty-string watermark is treated as unknown, not as the epoch",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": "2020-01-01T00:00:00.000000Z"
+    }
+   ],
+   "watermark": "",
+   "send": [
+    "a"
+   ],
+   "refuse": []
+  },
+  {
+   "name": "newer than the watermark -> sends",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": "2026-08-28T12:00:00.000000Z"
+    }
+   ],
+   "watermark": "2026-08-01T00:00:00.000000Z",
+   "send": [
+    "a"
+   ],
+   "refuse": []
+  },
+  {
+   "name": "older than the watermark -> REFUSED, its tombstone was reaped",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": "2026-07-01T00:00:00.000000Z"
+    }
+   ],
+   "watermark": "2026-08-01T00:00:00.000000Z",
+   "send": [],
+   "refuse": [
+    "a"
+   ]
+  },
+  {
+   "name": "exactly AT the watermark -> refused; the oldest standing tombstone is not a safe boundary",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": "2026-08-01T00:00:00.000000Z"
+    }
+   ],
+   "watermark": "2026-08-01T00:00:00.000000Z",
+   "send": [],
+   "refuse": [
+    "a"
+   ]
+  },
+  {
+   "name": "an entry with no version is never refused — the server's version guard still fronts it",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": null
+    }
+   ],
+   "watermark": "2026-08-01T00:00:00.000000Z",
+   "send": [
+    "a"
+   ],
+   "refuse": []
+  },
+  {
+   "name": "mixed queue splits, and order within each side is preserved",
+   "entries": [
+    {
+     "msgId": "old1",
+     "version": "2026-01-01T00:00:00.000000Z"
+    },
+    {
+     "msgId": "new1",
+     "version": "2026-09-01T00:00:00.000000Z"
+    },
+    {
+     "msgId": "old2",
+     "version": "2026-02-01T00:00:00.000000Z"
+    },
+    {
+     "msgId": "new2",
+     "version": "2026-10-01T00:00:00.000000Z"
+    }
+   ],
+   "watermark": "2026-08-01T00:00:00.000000Z",
+   "send": [
+    "new1",
+    "new2"
+   ],
+   "refuse": [
+    "old1",
+    "old2"
+   ]
+  },
+  {
+   "name": "trimmed PG fractional digits compare correctly once normalized",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": "2026-08-01T00:00:00.5Z"
+    }
+   ],
+   "watermark": "2026-08-01T00:00:00.50001Z",
+   "send": [],
+   "refuse": [
+    "a"
+   ]
+  },
+  {
+   "name": "and the same pair the other way round",
+   "entries": [
+    {
+     "msgId": "a",
+     "version": "2026-08-01T00:00:00.50001Z"
+    }
+   ],
+   "watermark": "2026-08-01T00:00:00.5Z",
+   "send": [
+    "a"
+   ],
+   "refuse": []
+  }
+ ],
+ "tombstoned": [
+  {
+   "name": "tombstone set drops the row (PROTOCOL §7.5: the soft delete IS the removal; the reap never arrives)",
+   "tombstoneColumn": "deleted_at",
+   "data": {
+    "uid": "u1",
+    "deleted_at": "2026-08-28T21:39:17.279256Z"
+   },
+   "drops": true
+  },
+  {
+   "name": "tombstone null keeps the row",
+   "tombstoneColumn": "deleted_at",
+   "data": {
+    "uid": "u1",
+    "deleted_at": null
+   },
+   "drops": false
+  },
+  {
+   "name": "tombstone column absent from the payload keeps the row (partial UPDATE)",
+   "tombstoneColumn": "deleted_at",
+   "data": {
+    "uid": "u1",
+    "age": 3
+   },
+   "drops": false
+  },
+  {
+   "name": "a table without a tombstone column is never tombstoned (its deletes are physical)",
+   "tombstoneColumn": null,
+   "data": {
+    "uid": "u1",
+    "deleted_at": "2026-08-28T21:39:17.279256Z"
+   },
+   "drops": false
+  },
+  {
+   "name": "empty string is a value, not null — the row is tombstoned (measured: libzb held 134 reaped rows)",
+   "tombstoneColumn": "deleted_at",
+   "data": {
+    "uid": "u1",
+    "deleted_at": ""
+   },
+   "drops": true
+  },
+  {
+   "name": "non-object data keeps nothing to decide on",
+   "tombstoneColumn": "deleted_at",
+   "data": null,
+   "drops": false
+  }
+ ],
+ "update": [
+  {
+   "name": "partial payload on an existing row sets only what was sent (§7's asymmetry — the upsert's INSERT arm failed NOT NULL here)",
+   "table": "test_types",
+   "pkCols": [
+    "uid"
+   ],
+   "data": {
+    "uid": "u1",
+    "some_text": "updated",
+    "updated_at": "2026-01-01T00:00:00.000000Z"
+   },
+   "plan": {
+    "sql": "UPDATE test_types SET \"some_text\" = ?, \"updated_at\" = ? WHERE \"uid\" = ?",
+    "params": [
+     "updated",
+     "2026-01-01T00:00:00.000000Z",
+     "u1"
+    ]
+   }
+  },
+  {
+   "name": "composite key: every key column in the WHERE, none in the SET",
+   "table": "t",
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "data": {
+    "a": 1,
+    "b": 2,
+    "v": "x"
+   },
+   "plan": {
+    "sql": "UPDATE t SET \"v\" = ? WHERE \"a\" = ? AND \"b\" = ?",
+    "params": [
+     "x",
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "name": "old.* columns are never set (a key change is planKeyChange's job)",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": 7,
+    "old.id": 6,
+    "v": "x"
+   },
+   "plan": {
+    "sql": "UPDATE t SET \"v\" = ? WHERE \"id\" = ?",
+    "params": [
+     "x",
+     7
+    ]
+   }
+  },
+  {
+   "name": "structured values are JSON text, as in the upsert",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": 1,
+    "meta": {
+     "k": 1
+    }
+   },
+   "plan": {
+    "sql": "UPDATE t SET \"meta\" = ? WHERE \"id\" = ?",
+    "params": [
+     "{\"k\":1}",
+     1
+    ]
+   }
+  },
+  {
+   "name": "key only: nothing to set → null",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": 1
+   },
+   "plan": null
+  },
+  {
+   "name": "incomplete key → null (cannot address one row)",
+   "table": "t",
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "data": {
+    "a": 1,
+    "v": "x"
+   },
+   "plan": null
+  },
+  {
+   "name": "no primary key → null",
+   "table": "t",
+   "pkCols": [],
+   "data": {
+    "id": 1,
+    "v": "x"
+   },
+   "plan": null
+  }
+ ],
+ "exists": [
+  {
+   "name": "full key → SELECT 1 … LIMIT 1",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": 7,
+    "v": "x"
+   },
+   "plan": {
+    "sql": "SELECT 1 FROM t WHERE \"id\" = ? LIMIT 1",
+    "params": [
+     7
+    ]
+   }
+  },
+  {
+   "name": "composite key",
+   "table": "t",
+   "pkCols": [
+    "a",
+    "b"
+   ],
+   "data": {
+    "a": 1,
+    "b": 2
+   },
+   "plan": {
+    "sql": "SELECT 1 FROM t WHERE \"a\" = ? AND \"b\" = ? LIMIT 1",
+    "params": [
+     1,
+     2
+    ]
+   }
+  },
+  {
+   "name": "null key column → null",
+   "table": "t",
+   "pkCols": [
+    "id"
+   ],
+   "data": {
+    "id": null
+   },
+   "plan": null
+  },
+  {
+   "name": "no primary key → null",
+   "table": "t",
+   "pkCols": [],
+   "data": {
+    "id": 1
+   },
+   "plan": null
+  }
+ ],
+ "pgArrayLiteral": [
+  {
+   "name": "plain strings",
+   "in": [
+    "web",
+    "push-1"
+   ],
+   "out": "{web,push-1}"
+  },
+  {
+   "name": "a comma inside a value is quoted (measured: the browser's INS on PGlite — malformed array literal on the JSON form)",
+   "in": [
+    "a",
+    "with,comma"
+   ],
+   "out": "{a,\"with,comma\"}"
+  },
+  {
+   "name": "nested integer arrays",
+   "in": [
+    [
+     1,
+     2
+    ],
+    [
+     3,
+     4
+    ]
+   ],
+   "out": "{{1,2},{3,4}}"
+  },
+  {
+   "name": "quote and backslash are escaped",
+   "in": [
+    "say \"hi\"",
+    "back\\slash"
+   ],
+   "out": "{\"say \\\"hi\\\"\",\"back\\\\slash\"}"
+  },
+  {
+   "name": "empty string and the word NULL are quoted; a null element is NULL",
+   "in": [
+    "",
+    "null",
+    null
+   ],
+   "out": "{\"\",\"null\",NULL}"
+  },
+  {
+   "name": "booleans and numbers",
+   "in": [
+    true,
+    false,
+    1.5
+   ],
+   "out": "{t,f,1.5}"
+  },
+  {
+   "name": "whitespace inside a value is quoted",
+   "in": [
+    "two words"
+   ],
+   "out": "{\"two words\"}"
+  },
+  {
+   "name": "empty array",
+   "in": [],
+   "out": "{}"
+  }
+ ],
+ "heartbeat": [
+  {
+   "name": "streams sorted bytewise (uppercase before lowercase), integers verbatim",
+   "principal": "omar",
+   "tenant": "kilo",
+   "ts": 1757150000123,
+   "seqs": {
+    "CDC_kilo": 223,
+    "CDC_PUBLIC": 3190
+   },
+   "out": "{\"principal\":\"omar\",\"tenant\":\"kilo\",\"ts\":1757150000123,\"streams\":{\"CDC_PUBLIC\":3190,\"CDC_kilo\":223}}"
+  },
+  {
+   "name": "no streams yet (before the first sync)",
+   "principal": "alice",
+   "tenant": "_default",
+   "ts": 1,
+   "seqs": {},
+   "out": "{\"principal\":\"alice\",\"tenant\":\"_default\",\"ts\":1,\"streams\":{}}"
+  },
+  {
+   "name": "one stream, zero applied",
+   "principal": "nina",
+   "tenant": "acme",
+   "ts": 42,
+   "seqs": {
+    "CDC_acme": 0
+   },
+   "out": "{\"principal\":\"nina\",\"tenant\":\"acme\",\"ts\":42,\"streams\":{\"CDC_acme\":0}}"
+  }
+ ],
+ "shape": [
+  {
+   "name": "single pk keeps its dialect type; types sorted by name",
+   "pkCols": [
+    "id"
+   ],
+   "cols": [
+    {
+     "name": "name",
+     "type": "TEXT"
+    },
+    {
+     "name": "id",
+     "type": "INTEGER"
+    }
+   ],
+   "key": "[[\"id\",\"INTEGER\"]]",
+   "types": "[[\"id\",\"INTEGER\"],[\"name\",\"TEXT\"]]"
+  },
+  {
+   "name": "composite pk keeps PK ORDER (b before a), not name order (§10dg)",
+   "pkCols": [
+    "b",
+    "a"
+   ],
+   "cols": [
+    {
+     "name": "a",
+     "type": "TEXT"
+    },
+    {
+     "name": "b",
+     "type": "INTEGER"
+    }
+   ],
+   "key": "[[\"b\",\"INTEGER\"],[\"a\",\"TEXT\"]]",
+   "types": "[[\"a\",\"TEXT\"],[\"b\",\"INTEGER\"]]"
+  },
+  {
+   "name": "no pk: empty key shape, types still recorded",
+   "pkCols": [],
+   "cols": [
+    {
+     "name": "a",
+     "type": "TEXT"
+    }
+   ],
+   "key": "[]",
+   "types": "[[\"a\",\"TEXT\"]]"
+  },
+  {
+   "name": "a pk column the descriptor does not list is skipped, not guessed",
+   "pkCols": [
+    "id",
+    "ghost"
+   ],
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    }
+   ],
+   "key": "[[\"id\",\"INTEGER\"]]",
+   "types": "[[\"id\",\"INTEGER\"]]"
+  },
+  {
+   "name": "bigserial→uuid on the pk changes the key shape (INTEGER→TEXT in the sqlite block)",
+   "pkCols": [
+    "id"
+   ],
+   "cols": [
+    {
+     "name": "id",
+     "type": "TEXT"
+    },
+    {
+     "name": "name",
+     "type": "TEXT"
+    }
+   ],
+   "key": "[[\"id\",\"TEXT\"]]",
+   "types": "[[\"id\",\"TEXT\"],[\"name\",\"TEXT\"]]"
+  }
+ ],
+ "retyped": [
+  {
+   "name": "no stored record: nothing known, nothing retyped",
+   "stored": null,
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    }
+   ],
+   "out": []
+  },
+  {
+   "name": "unreadable record reads as unknown, never as everything changed",
+   "stored": "not json",
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    }
+   ],
+   "out": []
+  },
+  {
+   "name": "same shape: nothing retyped",
+   "stored": "[[\"id\",\"INTEGER\"],[\"user_id\",\"INTEGER\"]]",
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    },
+    {
+     "name": "user_id",
+     "type": "INTEGER"
+    }
+   ],
+   "out": []
+  },
+  {
+   "name": "FK column follows its parent's re-key (bigint→uuid): retyped",
+   "stored": "[[\"id\",\"INTEGER\"],[\"user_id\",\"INTEGER\"]]",
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    },
+    {
+     "name": "user_id",
+     "type": "TEXT"
+    }
+   ],
+   "out": [
+    "user_id"
+   ]
+  },
+  {
+   "name": "an added column is diffColumns' business, a removed one too",
+   "stored": "[[\"id\",\"INTEGER\"],[\"old\",\"TEXT\"]]",
+   "cols": [
+    {
+     "name": "id",
+     "type": "INTEGER"
+    },
+    {
+     "name": "new",
+     "type": "REAL"
+    }
+   ],
+   "out": []
+  },
+  {
+   "name": "order of the descriptor's columns is irrelevant; output follows descriptor order",
+   "stored": "[[\"a\",\"TEXT\"],[\"b\",\"TEXT\"]]",
+   "cols": [
+    {
+     "name": "b",
+     "type": "INTEGER"
+    },
+    {
+     "name": "a",
+     "type": "REAL"
+    }
+   ],
+   "out": [
+    "b",
+    "a"
+   ]
+  }
+ ],
+ "readOnlySql": [
+  {
+   "name": "a plain SELECT reads",
+   "sql": "SELECT uid, title FROM notes WHERE deleted_at IS NULL",
+   "allowed": true
+  },
+  {
+   "name": "lowercase, trailing semicolon, still a read",
+   "sql": "  select count(*) from _zebridge_outbox; ",
+   "allowed": true
+  },
+  {
+   "name": "a CTE that selects reads",
+   "sql": "WITH x AS (SELECT 1 AS n) SELECT n FROM x",
+   "allowed": true
+  },
+  {
+   "name": "EXPLAIN QUERY PLAN reads",
+   "sql": "EXPLAIN QUERY PLAN SELECT * FROM notes",
+   "allowed": true
+  },
+  {
+   "name": "PRAGMA table_info reads",
+   "sql": "PRAGMA table_info('notes')",
+   "allowed": true
+  },
+  {
+   "name": "PRAGMA foreign_key_check reads",
+   "sql": "PRAGMA foreign_key_check",
+   "allowed": true
+  },
+  {
+   "name": "a string literal containing a write word is a value, not a write",
+   "sql": "SELECT 1 FROM notes WHERE title = 'please delete me' OR body = 'x''; drop table y'",
+   "allowed": true
+  },
+  {
+   "name": "a column named like a write word, with an underscore, is a name",
+   "sql": "SELECT update_count, created_by FROM stats",
+   "allowed": true
+  },
+  {
+   "name": "a comment mentioning a write is a comment",
+   "sql": "-- delete later\nSELECT 1 /* insert nothing */",
+   "allowed": true
+  },
+  {
+   "name": "DELETE on the outbox is a write",
+   "sql": "DELETE FROM _zebridge_outbox",
+   "allowed": false
+  },
+  {
+   "name": "UPDATE on a position is a write",
+   "sql": "UPDATE _zebridge_stream_seq SET last_seq = 0",
+   "allowed": false
+  },
+  {
+   "name": "INSERT into a data table is a write (local theater is not offered)",
+   "sql": "INSERT INTO notes (uid) VALUES ('x')",
+   "allowed": false
+  },
+  {
+   "name": "a CTE feeding DML is a write",
+   "sql": "WITH x AS (SELECT 1) DELETE FROM _zebridge_outbox",
+   "allowed": false
+  },
+  {
+   "name": "a second statement after a semicolon is refused whole",
+   "sql": "SELECT 1; DELETE FROM _zebridge_outbox",
+   "allowed": false
+  },
+  {
+   "name": "DROP TABLE is a write",
+   "sql": "DROP TABLE _zebridge_inbox",
+   "allowed": false
+  },
+  {
+   "name": "a pragma that SETS is a write",
+   "sql": "PRAGMA foreign_keys = OFF",
+   "allowed": false
+  },
+  {
+   "name": "VACUUM and ATTACH are writes",
+   "sql": "ATTACH DATABASE '/tmp/x' AS y",
+   "allowed": false
+  },
+  {
+   "name": "empty is nothing to read",
+   "sql": "   ",
+   "allowed": false
+  }
+ ]
 }

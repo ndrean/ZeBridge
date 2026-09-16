@@ -25,16 +25,30 @@ export type SeedAnchor = {
 export type CoreEvent = { lsn?: number; seq?: number; stream?: string };
 
 export type ManifestDelta = { object: string; cutoff: string; prev_cutoff: string; gen: number; dict?: string };
+export type ManifestCheckpoint = { object: string; gen: number; lower?: string; cutoff: string; dict?: string };
 export type ChainManifest = {
   gen: number;
+  /// The whole table. `base` is the incremental chain's name for it; `full` is the same
+  /// thing under the older name, and a manifest may carry either.
   full?: { object: string; gen: number; cutoff?: string } | null;
+  base?: { object: string; gen: number; cutoff?: string } | null;
+  /// Rows whose version moved inside each checkpoint's window, tombstones included.
+  checkpoints?: ManifestCheckpoint[];
   deltas?: ManifestDelta[];
   cutoff_seq?: number;
   cdc_stream?: string;
+  /// `zebridge_gc_watermark` as it stood at the cut: nothing soft-deleted before it is
+  /// guaranteed to still exist. A replica older than this cannot catch up incrementally,
+  /// because a row may have been deleted AND reaped while it was away and no artifact
+  /// carries an absence — only the base does (PROTOCOL §7.5).
+  gc_watermark?: string;
 };
 /// `dict` names the dictionary object a delta was compressed with (§10x) —
 /// carried through so the applier fetches it before decoding.
-export type PlanStep = { name: string; kind: 'full' | 'delta'; dict?: string };
+/// A checkpoint applies exactly as a delta does (version-guarded upserts, tombstones
+/// delete by key); only the base wipes and reloads, which is why it keeps the name the
+/// clients already act on.
+export type PlanStep = { name: string; kind: 'full' | 'delta' | 'checkpoint'; dict?: string };
 
 // ─── the seed gate (findings 7 and 10) ───────────────────────────────────────
 
@@ -74,24 +88,57 @@ export function seedGateDrops(ev: CoreEvent, anchor: SeedAnchor): boolean {
 /// when they reach the watermark, otherwise the full plus every delta after it.
 export function planFromManifest(man: ChainManifest, watermark: string | null): PlanStep[] {
   const deltas: ManifestDelta[] = man.deltas ?? [];
+  const checkpoints: ManifestCheckpoint[] = man.checkpoints ?? [];
+  const base = man.base ?? man.full ?? null;
+  const step = (d: ManifestDelta): PlanStep => ({ name: d.object, kind: 'delta', ...(d.dict ? { dict: d.dict } : {}) });
+  const ckptStep = (c: ManifestCheckpoint): PlanStep => ({ name: c.object, kind: 'checkpoint', ...(c.dict ? { dict: c.dict } : {}) });
   const applicable = watermark ? deltas.filter((d) => d.cutoff > watermark) : deltas;
+
+  // The base, then everything the base does not already carry. One path, three callers.
+  const fromBase = (): PlanStep[] => {
+    if (!base) return [];
+    return [
+      { name: base.object, kind: 'full' as const },
+      ...checkpoints.filter((c) => c.gen > base.gen).map(ckptStep),
+      ...deltas.filter((d) => d.gen > base.gen).map(step),
+    ];
+  };
+
+  // ⚠️ FIRST, before any arithmetic on cutoffs: a replica older than the gc watermark
+  // cannot be caught up incrementally at all. A row deleted while it was away may have
+  // been REAPED since — the tombstone that would have carried the delete is gone from
+  // every checkpoint and delta, and only a wipe-and-reload can remove the row from this
+  // replica (the sweeper cannot reap a tombstone newer than the watermark, which is what
+  // makes the other branches sound).
+  if (watermark != null && man.gc_watermark != null && watermark < man.gc_watermark) return fromBase();
+
   // "Reaches" = the chain continues from where this replica stands: either the first
   // applicable delta starts at or before the watermark, or there is nothing newer AND
-  // the chain's full itself is not newer than the watermark. The second half is the
+  // the chain's base itself is not newer than the watermark. The second half is the
   // part that was missing: a chain REBUILT after the watermark (a fresh g1 full, no
   // deltas — what a feed restart produces, NOTES §10bm) is not "already applied", it
-  // is unreachable, and the walk must start from its full.
+  // is unreachable, and the walk must start from its base.
   const reaches = watermark != null && (
     applicable.length > 0
       ? applicable[0].prev_cutoff <= watermark
-      : (man.full == null || man.full.cutoff == null || man.full.cutoff <= watermark));  // a legacy full without a cutoff is taken as reached, as the Zig core does
-  const step = (d: ManifestDelta): PlanStep => ({ name: d.object, kind: 'delta', ...(d.dict ? { dict: d.dict } : {}) });
+      : (base == null || base.cutoff == null || base.cutoff <= watermark));  // a legacy full without a cutoff is taken as reached, as the Zig core does
   if (reaches) return applicable.map(step);
-  if (!man.full) return [];
-  return [
-    { name: man.full.object, kind: 'full' as const },
-    ...deltas.filter((d) => d.gen > man.full!.gen).map(step),
-  ];
+
+  // The deltas do not reach it, but the checkpoints may: apply every checkpoint whose
+  // window ends after the watermark, then the deltas. Overlap between the two is
+  // harmless — rows are version-guarded upserts and tombstones delete by key — so the
+  // cheap rule is "everything newer than the watermark", not "exactly the gap".
+  if (watermark != null && checkpoints.length > 0) {
+    const oldest = checkpoints[0];
+    const covered = (oldest.lower ?? '') <= watermark;
+    if (covered) {
+      return [
+        ...checkpoints.filter((c) => c.cutoff > watermark).map(ckptStep),
+        ...applicable.map(step),
+      ];
+    }
+  }
+  return fromBase();
 }
 
 /// D2's destruction guard: a chain-full is DELETE FROM + replay, so a chain
