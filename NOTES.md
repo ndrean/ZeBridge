@@ -13202,3 +13202,31 @@ Measured: a stream of 117 messages for `fire_types` plus 50 published on
 `filter_subject=cdc.fire_types.>`, `delivered stream_seq=117`, `num_pending=0` — the 50
 were never sent. The same client seeds and matches PostgreSQL as before. The TypeScript
 side compiles and its suite passes; it has not been run live yet.
+
+## 10gn. What a client's CDC apply actually costs (2026-09-16)
+
+§10gm said "a client applies about 4,500 events a second". That number is wrong: it came
+from the mid-load 100k run, where the client was re-seeding a 17M-row table and racing the
+prune at the same time. Measured properly — `--client-at 5` on a 60 s load, no preload, so
+the client only follows CDC (it seeds 0 rows from the boot chain):
+
+| load | events published | the client |
+| --- | --- | --- |
+| 10k/s | 595,000 | keeps up, caught up 71.7 s, 300,000 rows, 60/60 batches |
+| 20k/s | 1,190,000 | keeps up, 71.8 s, 600,000 rows, all right |
+| 40k/s | 2,380,000 | keeps up, 72.1 s, 1,200,000 rows, all right |
+| 60k/s | 3,569,869 | keeps up, 73.2 s, 1,800,000 rows, all right; no prune |
+| 100k/s | 5,869,886 | falls behind: 3 then 97 messages pruned under the drain, two re-seeds, caught up 106.7 s — 3,000,000 rows, all right |
+
+So libzb on SQLite (this Mac, 13-column rows) follows **60,000 events a second** live and
+breaks somewhere below 100,000. The apply path is still per-event — a `planExists` probe on
+every UPDATE, then SQL built with `allocPrint` and prepared afresh — so there is room left
+(a prepared-statement cache keyed by table+op+column set, and the chain's bulk apply for a
+message's ~450 events), but the client was never the 4,500/s bottleneck that number
+suggested.
+
+The chain remains the answer for a client that did fall behind: a seed applies ~90,000
+rows/s, and at 100k the client above recovered exactly that way, ending equal to PostgreSQL.
+
+Not measured: zb-client-ts. Same question, and it applies chain chunks as one `json_each`
+statement already (§10fc), so its CDC path is the one to measure next.
