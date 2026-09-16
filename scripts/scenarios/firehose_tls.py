@@ -109,10 +109,24 @@ def load_sql(path: pathlib.Path, seconds: int, rate: int):
 
 
 def apply_rate(marks: list) -> int | None:
-    """§10gp: rows a client applied per second while the load ran — the median of the
-    per-sample rates, so one stall (a re-seed, a checkpoint) does not set the number."""
-    rates = [(b[1] - a[1]) / (b[0] - a[0]) for a, b in zip(marks, marks[1:]) if b[0] > a[0] and b[1] >= a[1]]
-    return int(statistics.median(rates)) if rates else None
+    """§10gp/§10gu: rows a client applied per second while the load ran, over the longest
+    stretch in which its replica only GREW.
+
+    ⚠️ Not the median of the per-sample rates, which is what this was: a re-seed wipes the
+    table, the samples around it read as zero or negative, and the median follows them — a
+    client applying 1.8M rows correctly reported 305 rows/s. A wipe splits the samples into
+    runs; the longest run is the one that measures applying rather than recovering."""
+    runs, cur = [], []
+    for m in marks:
+        if cur and m[1] < cur[-1][1]:
+            runs.append(cur)
+            cur = []
+        cur.append(m)
+    runs.append(cur)
+    best = max(runs, key=lambda r: (r[-1][0] - r[0][0]) if len(r) > 1 else 0)
+    if len(best) < 2 or best[-1][0] <= best[0][0]:
+        return None
+    return int((best[-1][1] - best[0][1]) / (best[-1][0] - best[0][0]))
 
 
 def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done: threading.Event, catch_up_s: int = 900) -> dict:
@@ -169,7 +183,7 @@ def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done:
             n = rows_now()
             if n >= 0:
                 marks.append((time.time(), n))
-            time.sleep(5)
+            time.sleep(2)
             continue
         if not pg:
             time.sleep(15)  # the bridge publishes the load's tail
@@ -252,6 +266,29 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
         return {int(b): (int(n), int(sa)) for b, n, sa in r["rows"]}
 
     db = run_dir / "client.sqlite3"
+    # §10gu: the replica is sampled from OUTSIDE, on its own read-only connection. The C
+    # ABI is synchronous — `zb_client_sync` holds the thread for the whole seed — so a
+    # sampler living in the poll loop saw nothing at all while a client seeded through the
+    # load (apply_rows_s: None, every time it mattered). The TS follower is measured this
+    # way already.
+    marks: list = []
+    sampling = threading.Event()
+    sampling.set()
+
+    def sample_file():
+        import sqlite3 as sq
+        while sampling.is_set():
+            try:
+                con = sq.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+                try:
+                    marks.append((time.time(), int(con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0])))
+                finally:
+                    con.close()
+            except Exception:
+                pass  # not created yet, or locked mid-seed: the next sample catches it
+            time.sleep(2)
+
+    threading.Thread(target=sample_file, daemon=True).start()
     t0 = time.time()
     h = lib.zb_client_open(json.dumps({"url": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0,
                                        "clientId": "firehose-check", "principal": "firehose", "seedStreaming": True}).encode())
@@ -266,8 +303,6 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
         polls, errors, got = 0, [], {}
         end = time.time() + catch_up_s
         next_check = 0.0
-        next_mark = 0.0
-        marks: list = []  # §10gp: (t, rows) during the load
         during_load_polls = 0
         while time.time() < end:
             p = take(lib.zb_client_poll(h, 1000))
@@ -279,11 +314,6 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
             if load_done is not None and not load_done.is_set():
                 during_load_polls += 1
                 end = time.time() + catch_up_s  # the budget runs from the end of the load
-                if time.time() >= next_mark:
-                    next_mark = time.time() + 5
-                    r = take(lib.zb_client_query(h, f"SELECT count(*) FROM {TABLE}".encode(), b"[]"))
-                    if "rows" in r:
-                        marks.append((time.time(), int(r["rows"][0][0])))
                 continue
             if load_done is not None and not pg:
                 time.sleep(15)  # the bridge publishes the load's tail
@@ -303,6 +333,7 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
                 "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]], "poll_errors": errors[:5],
                 "sqlite_mib": db.stat().st_size // 2**20 if db.exists() else 0}
     finally:
+        sampling.clear()
         lib.zb_client_close(h)
 
 

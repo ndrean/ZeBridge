@@ -1465,7 +1465,9 @@ pub const GenerationProducer = struct {
         // deltas — like the depth rotation's full, and for the same reason: it must never
         // hold a cut. A full already queued for this pair wins (it carries everything a
         // checkpoint would), which `requestFull` settles by keeping one job per pair.
-        if (self.checkpoint_s > 0 and self.async_fulls and !build_full and last_gen > 0) {
+        if (self.checkpoint_s > 0 and self.async_fulls and !build_full and last_gen > 0 and
+            table_rows >= config.Generations.min_checkpoint_rows)
+        {
             const params_ck = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{self.checkpoint_s})).ptr };
             const due = queryOne(bkc, "SELECT COALESCE(max(cutoff_version) < now() - ($3 || ' seconds')::interval, false) " ++
                 "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND (has_checkpoint OR has_full) AND retired_at IS NULL", &params_ck) catch null;

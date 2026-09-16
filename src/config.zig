@@ -670,6 +670,12 @@ pub const Generations = struct {
     /// retention: a checkpoint is complete only while no tombstone inside its window can
     /// have been reaped (the producer refuses one whose window reaches past it).
     pub const default_checkpoint_seconds: u64 = 1800;
+    /// §10gu: below this many rows a table is not checkpointed at all. A checkpoint exists
+    /// to spare a returning client the BASE; when the base itself is small the client
+    /// applies it in a moment, and the checkpoint costs an object, a manifest entry and a
+    /// lane slot for nothing. Measured: the single-row `zebridge_gc_watermark` was getting
+    /// a 153-byte checkpoint every cadence.
+    pub const min_checkpoint_rows: i64 = 100_000;
     /// §10ge: a full owed only to the depth rotation waits while its pair's stream is
     /// short of time, but no longer than `depth × full_defer_factor` generations after
     /// the last full: the chain a returning client applies stays bounded.

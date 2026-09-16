@@ -13499,3 +13499,27 @@ few deltas, not for the table. The last row is §10gs's first rule doing its job
 
 Also fixed: the lane's attach line said "background full" whatever it built, so the
 harness counted two checkpoints as fulls. It names the kind now.
+
+## 10gu. Two small corrections before retention (2026-09-16)
+
+**A tiny table is not checkpointed.** The lane was cutting a 153-byte checkpoint for
+`zebridge_gc_watermark` — one row — every cadence. A checkpoint exists to spare a returning
+client the BASE; when the base is small the client applies it in a moment and the checkpoint
+costs an object, a manifest entry and a lane slot for nothing. Below
+`Generations.min_checkpoint_rows` (100,000) a pair is left to its full.
+
+**`apply_rows_s` measured the wrong thing, twice.** It was the median of the per-sample
+rates, so a re-seed's wipe — the samples around it reading zero or negative — dragged the
+median down: a client applying 1.8M rows correctly reported 305 rows/s (§10gp). And it was
+sampled inside the poll loop, which a libzb client never reaches while `zb_client_sync`
+holds its thread for a whole seed: `None` in exactly the runs that mattered. Now the
+replica is sampled from OUTSIDE on a read-only connection every 2 s (the way the TS
+follower always was), and the rate is taken over the longest stretch in which the replica
+only GREW — a wipe splits the samples into runs and the longest one measures applying
+rather than recovering. Unit-checked: 1,000 rows/s on clean samples, 1,498 across a wipe,
+None when there is nothing to measure.
+
+Measured after both: the same 120 s run reports 2,530 rows/s for a client seeding through
+the load (it reported nothing before), 440,000 rows, 121 of 121 batches equal to
+PostgreSQL, and the only checkpoints built are `fire_types`' — 116,000 and 120,000 rows,
+24 MB raw to 4 MB. The lane's attach line names the kind now.
