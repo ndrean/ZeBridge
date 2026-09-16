@@ -13523,3 +13523,47 @@ Measured after both: the same 120 s run reports 2,530 rows/s for a client seedin
 the load (it reported nothing before), 440,000 rows, 121 of 121 batches equal to
 PostgreSQL, and the only checkpoints built are `fire_types`' — 116,000 and 120,000 rows,
 24 MB raw to 4 MB. The lane's attach line names the kind now.
+
+## 10gv. incremental.py: the returning client, tested (2026-09-16)
+
+The scenario the plan asks for, before retention changes. Four clients seed, leave for
+different lengths of time and come back; each is compared with PostgreSQL row by row, and
+each one's PLAN is read from the core itself (`chainPlan` over the live manifest and that
+client's own stored watermark) — because "the rows matched" does not say HOW, and a client
+that quietly reloaded the table would pass a row comparison. 12 checks, about two minutes,
+its own scratch database and nats-server, short clocks (5 s cadence, 15 s checkpoints, a
+5 s GC threshold through the sweeper's `GC_ALLOW_SHORT_THRESHOLD`).
+
+    ✅ away a moment: deltas alone — plan ['delta']
+    ✅ away across checkpoints: the chain HAS one covering the absence
+    ✅ away across checkpoints: no base — the client does not reload
+    ✅ away past the chain: the base — plan ['full', 'checkpoint', 'checkpoint', 'delta'…]
+    ✅ the sweeper reaped the tombstone
+    ✅ away past the gc watermark: the base, whatever the checkpoints say
+    ✅ the reaped row is gone from the replica — no ghost
+
+The last two are the ones the whole watermark rule exists for: a tombstone the sweeper
+reaped is in no checkpoint and no delta, so a client taking the incremental path would keep
+a row PostgreSQL no longer has, for ever. It takes the base instead, and the row is gone.
+
+**What the test taught, in the order it hurt:**
+
+* **A read-only table's tombstones cannot be swept.** The sweeper refused every pass with
+  `permission denied for table inc_rows` while reporting a clean run — it needs DELETE, and
+  only an edge-writable table grants it. The scenario now calls
+  `zebridge_grant_edge_writes`. Worth noting as a product edge: the bridge declares a
+  tombstone column for a read-only table and then cannot reap it.
+* **An idle table cuts no checkpoint** — the tick skips a pair nothing has written to
+  ("unchanged since gN"), so the checkpoint decision is never reached. Correct (an empty
+  checkpoint carries nothing) and invisible until a test waits three minutes for one. The
+  wait now writes while it waits, as any real table does.
+* **A freshly loaded table looks empty.** The "is this table big enough to checkpoint"
+  test reads `n_live_tup`, which is 0 until ANALYZE, so the first minutes of a table's life
+  cut no checkpoint. Harmless — a young table's full is cheap — but the scenario analyses
+  after loading, and the constant now says so.
+* **The checkpoint case cannot assert step 3 yet.** With retention still counting
+  generations the deltas reach back past the client's watermark, so the planner prefers
+  them (rule 2 before rule 3) and the plan is deltas alone. What the case asserts today is
+  the promise a client actually feels — NO base, no reload — plus that the chain holds a
+  checkpoint covering the absence. When retention is by checkpoints the same client will
+  take `['checkpoint', …, 'delta']` and the assertion still holds.

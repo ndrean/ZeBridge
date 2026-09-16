@@ -1466,6 +1466,11 @@ pub const GenerationProducer = struct {
         // hold a cut. A full already queued for this pair wins (it carries everything a
         // checkpoint would), which `requestFull` settles by keeping one job per pair.
         if (self.checkpoint_s > 0 and self.async_fulls and !build_full and last_gen > 0 and
+            table_rows < config.Generations.min_checkpoint_rows)
+        {
+            log.debug("🧬 '{s}'/'{s}': no checkpoint — {d} row(s) is under the {d} the middle level is worth cutting for (a guarded table reads the collector's estimate, which is 0 until ANALYZE)", .{ tenant, table, table_rows, config.Generations.min_checkpoint_rows });
+        }
+        if (self.checkpoint_s > 0 and self.async_fulls and !build_full and last_gen > 0 and
             table_rows >= config.Generations.min_checkpoint_rows)
         {
             const params_ck = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{self.checkpoint_s})).ptr };

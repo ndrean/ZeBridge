@@ -675,6 +675,12 @@ pub const Generations = struct {
     /// applies it in a moment, and the checkpoint costs an object, a manifest entry and a
     /// lane slot for nothing. Measured: the single-row `zebridge_gc_watermark` was getting
     /// a 153-byte checkpoint every cadence.
+    ///
+    /// ⚠️ On a guarded table the row count is the collector's ESTIMATE (§10gl skips the
+    /// exact count there), and that estimate is zero until the table has been analysed —
+    /// so a freshly loaded table cuts no checkpoint for its first minutes. Harmless (a
+    /// young table's full is cheap, which is this rule's whole premise) but surprising:
+    /// `incremental.py` waited three minutes for a checkpoint that was never coming.
     pub const min_checkpoint_rows: i64 = 100_000;
     /// §10ge: a full owed only to the depth rotation waits while its pair's stream is
     /// short of time, but no longer than `depth × full_defer_factor` generations after
