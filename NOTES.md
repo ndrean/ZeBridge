@@ -13432,3 +13432,47 @@ which predate this work. TS: 184 pass.
 Not done here: the producer builds no checkpoint yet (step 2), and the manifest carries no
 `gc_watermark` yet — the planner reads it when it is there and behaves exactly as before
 when it is not, so this lands safely ahead of the producer.
+
+## 10gt. The producer builds checkpoints, and the manifest carries the gc watermark (2026-09-16)
+
+Step 2 of the plan, the producer's half of §10gs.
+
+**The gc watermark travels with the chain.** Read inside the cut's snapshot
+(`zebridge_gc_watermark`) and written into the manifest. A returning client cannot trust
+its own copy — that row is as old as its last sync — and this is the value its FIRST
+planning rule compares against: below it, a row it holds may have been deleted AND reaped
+while it was away, and only the base carries an absence. Empty when no sweeper has ever
+run, which the planner reads as "no such limit", exactly as before.
+
+**Checkpoints.** A new job kind for the background lane (§10gf), asked for by the build
+path when `GENERATION_CHECKPOINT_SECONDS` have passed since the pair's last checkpoint or
+full, built behind the deltas like the depth rotation's full and attached to the newest
+generation. It reads `version >= lower` — `lower` being the previous checkpoint's cutoff,
+or the full's — and, unlike a full, it KEEPS the tombstoned rows: that is how a returning
+client learns about a delete without reloading the table. New columns: `has_checkpoint`,
+`ckpt_lower`, `ckpt_dict_object` (bookkeeping stays columns on `zebridge_generations`; the
+child-table option in the plan is not needed yet). The dictionary is the era's, never a
+fresh one — training belongs to the base (§10x).
+
+**The completeness guard, and the bug in it.** A checkpoint holds every delete of its
+window only while no tombstone inside it can have been reaped, so a window opening past
+the sweeper's retention is refused and a full asked for instead. Written first as
+`lower < now() - threshold_ms`, it refused EVERY checkpoint: the watermark row ships with
+`threshold_ms = 0` and the sweeper stamps the real value the first time it runs, so zero
+read as "zero retention" when it means "nothing has ever been reaped". Now the guard
+applies only when `threshold_ms > 0`.
+
+**Measured** (120 s at 4k events/s, `GENERATION_CHECKPOINT_SECONDS=20`): two checkpoints
+attached to g2 and g3, 3.8 and 4.0 MiB, and the manifest carries all three levels with the
+windows chaining exactly — g3's `lower` is g2's `cutoff`, g2's `lower` is the full's:
+
+    full:        {gen 1, fire_types-g1-full,  cutoff 15:19:00.990813}
+    checkpoints: [{gen 2, …-g2-ckpt, lower 15:19:00.990813, cutoff 15:20:01.791349, dict …-g1-dict},
+                  {gen 3, …-g3-ckpt, lower 15:20:01.791349, cutoff 15:21:00.944462, dict …-g1-dict}]
+    deltas:      [2, 3, 4]
+
+Left for step 3: retention still counts generations (`GENERATION_CHAIN_DEPTH`), so deltas
+are not yet pruned to the newest checkpoint nor checkpoints kept to the newest base — a
+chain therefore carries checkpoints AND the deltas they cover. No client applies a
+checkpoint yet either (the planner plans them, the appliers treat the kind as a delta —
+the fixtures say they must, but no live client has been run against a real one).

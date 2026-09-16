@@ -1315,6 +1315,7 @@ pub fn main(init: std.process.Init) !void {
         gp.async_fulls = runtime_config.generation_async_fulls;
         gp.retire_grace_s = runtime_config.generation_retire_grace_seconds;
         gp.retire_windows = runtime_config.generation_retire_windows;
+        gp.checkpoint_s = runtime_config.generation_checkpoint_seconds;
         gp.writable = &writable;
         try gp.start();
         gen_producer = gp;

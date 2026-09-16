@@ -468,6 +468,9 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         "GENERATION_CADENCE_SECONDS": str(CADENCE), "CDC_MAX_BYTES": str(CAP_BYTES),
         "GENERATION_DEFER_FULLS": "true" if defer else "false",
         "GENERATION_ASYNC_FULLS": "true" if async_fulls else "false",
+        # §10gt: the harness runs minutes, not hours — a checkpoint cadence in seconds, from
+        # the environment, so a run can exercise the middle level at all.
+        **({"GENERATION_CHECKPOINT_SECONDS": os.environ["ZB_CHECKPOINT_SECONDS"]} if os.environ.get("ZB_CHECKPOINT_SECONDS") else {}),
     })
     if tls:
         env["NATS_TLS_CA"] = str(bt.CERTS / "ca.pem")

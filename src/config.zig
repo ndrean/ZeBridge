@@ -665,6 +665,11 @@ pub const Generations = struct {
     /// its full every few seconds, this is what binds, and that is deliberate — the disk
     /// filled when only the grace did.
     pub const default_retire_windows: u32 = 4;
+    /// §10gt: how often a checkpoint is cut — the incremental chain's middle level, built
+    /// in the background like a full. It must stay well inside the sweeper's tombstone
+    /// retention: a checkpoint is complete only while no tombstone inside its window can
+    /// have been reaped (the producer refuses one whose window reaches past it).
+    pub const default_checkpoint_seconds: u64 = 1800;
     /// §10ge: a full owed only to the depth rotation waits while its pair's stream is
     /// short of time, but no longer than `depth × full_defer_factor` generations after
     /// the last full: the chain a returning client applies stays bounded.
@@ -725,6 +730,8 @@ pub const RuntimeConfig = struct {
     generation_retire_grace_seconds: u64 = Generations.default_retire_grace_seconds,
     /// §10gq: retirements kept at most (GENERATION_RETIRE_WINDOWS).
     generation_retire_windows: u32 = Generations.default_retire_windows,
+    /// §10gt: seconds between checkpoints (GENERATION_CHECKPOINT_SECONDS); 0 disables them.
+    generation_checkpoint_seconds: u64 = Generations.default_checkpoint_seconds,
     /// §10fk: the mutation ingress rate limit, writes per second per principal (and
     /// per tenant); 0 is off. `mutation_rate_burst` is the bucket's size — what a
     /// client may send at once after a quiet spell; 0 means one second's worth.

@@ -119,6 +119,8 @@ pub const GenerationProducer = struct {
     /// §10gq: how many retirements are kept at most, whatever the grace says — the storage
     /// bound, in fulls. The disk filled without it.
     retire_windows: u32 = config.Generations.default_retire_windows,
+    /// §10gt: seconds between checkpoints; 0 turns the middle level off.
+    checkpoint_s: u64 = config.Generations.default_checkpoint_seconds,
     /// §10gl: preflight's edge-writability verdicts. A table the edge writes keeps the
     /// fixed version tolerance under its delta floor: a client's version can trail the
     /// database clock by that much. Null (tests), or a table it does not know: kept too.
@@ -785,6 +787,9 @@ pub const GenerationProducer = struct {
         gen: i64,
         cutoff: []const u8,
         vcol: []const u8,
+        /// §10gt: "full" (live rows) or "checkpoint" (rows moved in a window, tombstones
+        /// included) — the document says which, and a client applies them differently.
+        kind: []const u8,
     ) !FullObject {
         const expect: usize = blk: {
             const sql = try utils.allocPrintZ(alloc, "SELECT count(*) FROM ({s}) AS q", .{select_sql});
@@ -799,7 +804,7 @@ pub const GenerationProducer = struct {
             const cctx = c.ZSTD_createCCtx() orelse return error.ZstdCompressFailed;
             defer _ = c.ZSTD_freeCCtx(cctx);
             if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, 3)) != 0) return error.ZstdCompressFailed;
-            var fs: FullStream = .{ .cr = &cr, .oa = payload_alloc, .cctx = cctx, .sampler = &sampler, .expect_rows = expect, .gen = gen, .cutoff = cutoff, .vcol = vcol };
+            var fs: FullStream = .{ .cr = &cr, .oa = payload_alloc, .cctx = cctx, .sampler = &sampler, .expect_rows = expect, .gen = gen, .kind = kind, .cutoff = cutoff, .vcol = vcol };
             defer fs.raw.deinit(payload_alloc);
             _ = try docHead(&fs.raw, payload_alloc, cr.names, false, @intCast(expect));
             sampler.feed(fs.raw.items);
@@ -820,7 +825,7 @@ pub const GenerationProducer = struct {
         defer c.PQclear(res);
         var rows: usize = 0;
         var widest: usize = 0;
-        const payload = try encodeContent(alloc, payload_alloc, res, gen, "full", cutoff, null, vcol, &rows, &widest);
+        const payload = try encodeContent(alloc, payload_alloc, res, gen, kind, cutoff, null, vcol, &rows, &widest);
         defer payload_alloc.free(payload);
         const z = try compressZstd(alloc, payload, 3);
         var r = try store.putBytes(name, z);
@@ -1292,6 +1297,20 @@ pub const GenerationProducer = struct {
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
         };
 
+        // §10gt: the sweeper's watermark as it stands, carried in the manifest. A
+        // returning client compares its own against it FIRST (§10gs): below it, a row it
+        // holds may have been deleted AND reaped while it was away, and no delta or
+        // checkpoint carries an absence — only the base does. Its own copy of
+        // zebridge_gc_watermark is as old as its last sync, so the answer has to travel
+        // with the chain. Empty when the sweeper has never run: the planner then treats
+        // the chain as it did before, which is what a deployment without a sweeper wants.
+        const gc_watermark: []const u8 = blk: {
+            const res = queryOne(pgc, "SELECT watermark::text FROM public.zebridge_gc_watermark LIMIT 1", &.{}) catch break :blk "";
+            defer c.PQclear(res);
+            if (c.PQntuples(res) == 0) break :blk "";
+            break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+        };
+
         // ── the count-at-cutoff check (NOTES §10bb): inside the snapshot, under the
         // tenant scope, so it is the same count the content queries see ──────
         //
@@ -1431,11 +1450,31 @@ pub const GenerationProducer = struct {
                     // §10gf: in the background, behind the deltas, unless the lane has
                     // fallen twice the limit behind (a full it keeps discarding) — then here.
                     if (self.async_fulls and since < 2 * limit) {
-                        if (self.requestFull(tenant, table, vcol, tcol))
+                        if (self.requestFull(tenant, table, vcol, tcol, .full))
                             log.info("🧬 '{s}'/'{s}': the depth rotation's full goes to the background lane (g{d} is the last full, {d} generation(s) since); this build cuts the delta", .{ tenant, table, last_full_gen, since });
                     } else build_full = true;
                 },
                 .defer_full => log.info("🧬 '{s}'/'{s}': deferring the depth rotation's full — {d:.1} s of margin, under 3 × the last full's {d} ms + {d} s; g{d} stays the full ({d} of {d} generations)", .{ tenant, table, reading.margin_s, reading.full_build_ms, self.edge_scan_seconds, last_full_gen, since, limit }),
+            }
+        }
+
+        // ── §10gt: is a checkpoint due? ──────────────────────────────────────
+        // The middle level: every `checkpoint_s` the lane cuts one covering the rows that
+        // moved since the last checkpoint (or the last full), tombstones included. It is
+        // asked for here, where the pair's state is already in hand, and built behind the
+        // deltas — like the depth rotation's full, and for the same reason: it must never
+        // hold a cut. A full already queued for this pair wins (it carries everything a
+        // checkpoint would), which `requestFull` settles by keeping one job per pair.
+        if (self.checkpoint_s > 0 and self.async_fulls and !build_full and last_gen > 0) {
+            const params_ck = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{self.checkpoint_s})).ptr };
+            const due = queryOne(bkc, "SELECT COALESCE(max(cutoff_version) < now() - ($3 || ' seconds')::interval, false) " ++
+                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND (has_checkpoint OR has_full) AND retired_at IS NULL", &params_ck) catch null;
+            if (due) |d| {
+                defer c.PQclear(d);
+                if (c.PQntuples(d) > 0 and c.PQgetvalue(d, 0, 0)[0] == 't') {
+                    if (self.requestFull(tenant, table, vcol, tcol, .checkpoint))
+                        log.info("🧬 '{s}'/'{s}': a checkpoint is due ({d} s since the last one) — the background lane cuts it behind the deltas", .{ tenant, table, self.checkpoint_s });
+                }
             }
         }
 
@@ -1471,7 +1510,7 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
             const t_f = utils.unixMillis();
-            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol);
+            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full");
             ph.full += utils.unixMillis() - t_f;
             full_rows = full_obj.?.rows;
             widest_row = @max(widest_row, full_obj.?.widest);
@@ -1510,7 +1549,7 @@ pub const GenerationProducer = struct {
             if (self.async_fulls) {
                 // A refused request means one is already queued for this pair, which
                 // serves the same purpose: either way this cut publishes its delta alone.
-                if (self.requestFull(tenant, table, vcol, tcol)) {
+                if (self.requestFull(tenant, table, vcol, tcol, .full)) {
                     log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for a client catching up; the background lane builds one, this cut publishes the delta alone", .{ tenant, table, delta_rows, table_rows });
                 } else {
                     log.debug("🧬 '{s}'/'{s}': the delta carries {d} of {d} row(s); a full is already queued for the lane", .{ tenant, table, delta_rows, table_rows });
@@ -1524,7 +1563,7 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
             const t_f = utils.unixMillis();
-            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol);
+            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full");
             ph.full += utils.unixMillis() - t_f;
             full_rows = full_obj.?.rows;
             widest_row = @max(widest_row, full_obj.?.widest);
@@ -1690,6 +1729,14 @@ pub const GenerationProducer = struct {
             try deltas_json.appendSlice(alloc, frag);
         }
 
+        // §10gt: the checkpoints above the chain's full, rendered from the same rows the
+        // background lane attaches them to.
+        const ckpts_json: []const u8 = blk: {
+            const arr = checkpointsJson(alloc, bkc, table, tenant_z, table_z, full_gen_m) catch break :blk "[]";
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            std.json.Stringify.value(std.json.Value{ .array = arr }, .{}, &out.writer) catch break :blk "[]";
+            break :blk out.written();
+        };
         var kv = js.kvBucket(self.topo.kv_generations) catch blk: {
             var km = js.kvManager();
             break :blk try km.createBucket(.{ .bucket = self.topo.kv_generations, .history = 1 });
@@ -1700,9 +1747,13 @@ pub const GenerationProducer = struct {
             try std.fmt.allocPrint(alloc, "\"cutoff_seq\":{d},\"cdc_stream\":\"{s}\",", .{ cutoff_seq, cdc_stream })
         else
             "";
-        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
+        const gc_frag: []const u8 = if (gc_watermark.len > 0)
+            try std.fmt.allocPrint(alloc, "\"gc_watermark\":\"{s}\",", .{gc_watermark})
+        else
+            "";
+        const manifest = try std.fmt.allocPrint(alloc, "{{\"gen\":{d},\"seed_epoch\":{d},\"bucket\":\"{s}\",{s}{s}\"cutoff_version\":\"{s}\",\"cutoff_lsn\":\"{s}\"," ++
             "\"version_column\":\"{s}\"," ++
-            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"}},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, deltas_json.items });
+            "\"full\":{{\"gen\":{d},\"object\":\"{s}-g{d}-full\",\"cutoff\":\"{s}\"}},\"checkpoints\":{s},\"deltas\":[{s}]}}", .{ gen, cat_epoch, bucket, seq_frag, gc_frag, cutoff_version, lsn, vcol, full_gen_m, table, full_gen_m, full_cutoff_m, ckpts_json, deltas_json.items });
         _ = try kv.put(key, manifest, .{});
 
         // ── objects and manifest live: NOW the row becomes the producer's memory ──
@@ -1833,7 +1884,11 @@ pub const GenerationProducer = struct {
     // Every full a correctness rule asks for (first, epoch, shape, deletes) stays in the
     // build path, from the delta's own snapshot.
 
-    pub const FullJob = struct { tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8 };
+    /// §10gt: what the lane is asked to build. A full carries every live row; a
+    /// checkpoint carries the rows whose version moved since the last checkpoint (or the
+    /// last full), tombstones included — the incremental chain's middle level.
+    pub const JobKind = enum { full, checkpoint };
+    pub const FullJob = struct { tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, kind: JobKind = .full };
 
     fn pairKey(buf: []u8, tenant: []const u8, table: []const u8) ?[]const u8 {
         return std.fmt.bufPrint(buf, "{s}.{s}", .{ tenant, table }) catch null;
@@ -1873,7 +1928,7 @@ pub const GenerationProducer = struct {
     }
 
     /// Queues the pair's full unless one is queued or building. True when queued now.
-    fn requestFull(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8) bool {
+    fn requestFull(self: *GenerationProducer, tenant: []const u8, table: []const u8, vcol: []const u8, tcol: []const u8, kind: JobKind) bool {
         var buf: [512]u8 = undefined;
         const key = pairKey(&buf, tenant, table) orelse return false;
         self.cuts_lock.lock();
@@ -1885,6 +1940,7 @@ pub const GenerationProducer = struct {
             .table = a.dupe(u8, table) catch return false,
             .vcol = a.dupe(u8, vcol) catch return false,
             .tcol = a.dupe(u8, tcol) catch return false,
+            .kind = kind,
         };
         const owned = a.dupe(u8, key) catch return false;
         self.full_pending.put(a, owned, {}) catch return false;
@@ -1967,6 +2023,13 @@ pub const GenerationProducer = struct {
                 relid_l = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 3)));
                 const full_now = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 4)), 10) catch 0;
                 if (full_now >= gen_l) return; // the newest generation already carries a full
+                if (j.kind == .checkpoint) {
+                    // §10gt: and it must not already carry a checkpoint either.
+                    const ck = try queryOne(bkc, "SELECT COALESCE((SELECT max(gen) FROM public.zebridge_generations " ++
+                        "WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL), 0)", &pair);
+                    defer c.PQclear(ck);
+                    if ((std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(ck, 0, 0)), 10) catch 0) >= gen_l) return;
+                }
             }
             const b = try queryOne(pgc, "BEGIN ISOLATION LEVEL REPEATABLE READ", &.{});
             c.PQclear(b);
@@ -2006,7 +2069,54 @@ pub const GenerationProducer = struct {
             if (c.PQntuples(res) == 0) return;
             break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
         };
-        const sql = if (j.tcol.len > 0)
+        // §10gt: what this build reads, and under which name it is published.
+        //   * a FULL: every live row (the tombstoned ones are already gone from every
+        //     replica — a full is applied as a wipe and a reload);
+        //   * a CHECKPOINT: every row whose version moved since the last checkpoint or
+        //     full, TOMBSTONES INCLUDED — that is the whole point, since a tombstoned row
+        //     is how a returning client learns about a delete without reloading.
+        var ckpt_lower: []const u8 = "";
+        if (j.kind == .checkpoint) {
+            const res = try queryOne(bkc, "SELECT COALESCE(max(cutoff_version)::text, '') FROM public.zebridge_generations " ++
+                "WHERE tenant=$1 AND tbl=$2 AND (has_checkpoint OR has_full) AND retired_at IS NULL", &pair);
+            defer c.PQclear(res);
+            ckpt_lower = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+            if (ckpt_lower.len == 0) {
+                log.info("🧬 '{s}'/'{s}': no full to checkpoint against yet — the depth rotation owes one first", .{ tenant, table });
+                const rb = try queryOne(pgc, "ROLLBACK", &.{});
+                c.PQclear(rb);
+                return;
+            }
+            // ⚠️ Completeness (the plan's rule): a checkpoint holds every delete of its
+            // window only while no tombstone inside it can have been reaped. The sweeper
+            // reaps at `now() - threshold`, so a window reaching past that proves nothing
+            // and a FULL is owed instead — said, not silently built.
+            const lower_z = try alloc.dupeZ(u8, ckpt_lower);
+            const gp = [_]?[*:0]const u8{lower_z.ptr};
+            // ⚠️ `threshold_ms > 0` is the whole guard's precondition: the row ships with
+            // 0 and the SWEEPER stamps its real retention the first time it runs. Zero
+            // therefore means "nothing has ever been reaped", under which every window is
+            // complete — read as "zero retention" instead, this refused every checkpoint
+            // ever asked for (measured: a 20 s window rejected as past a 0 ms retention).
+            const guard = queryOne(pgc, "SELECT COALESCE((SELECT max(threshold_ms) FROM public.zebridge_gc_watermark), 0) > 0 " ++
+                "AND $1::timestamptz < now() - ((SELECT COALESCE(max(threshold_ms), 0) FROM public.zebridge_gc_watermark) || ' milliseconds')::interval", &gp) catch null;
+            if (guard) |g| {
+                defer c.PQclear(g);
+                if (c.PQgetvalue(g, 0, 0)[0] == 't') {
+                    log.warn("⚠️ 🧬 '{s}'/'{s}': the checkpoint's window opens at {s}, past the sweeper's tombstone retention — a delete inside it may already be reaped, so a full is owed instead of a checkpoint", .{ tenant, table, ckpt_lower });
+                    const rb = try queryOne(pgc, "ROLLBACK", &.{});
+                    c.PQclear(rb);
+                    _ = self.requestFull(tenant, table, j.vcol, j.tcol, .full);
+                    return;
+                }
+            }
+        }
+        const kind_str: []const u8 = if (j.kind == .checkpoint) "checkpoint" else "full";
+        const obj_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-{s}", .{ table, gen_l, if (j.kind == .checkpoint) "ckpt" else "full" });
+        const sql = if (j.kind == .checkpoint) blk: {
+            const lower_lit = try std.mem.replaceOwned(u8, alloc, ckpt_lower, "'", "''");
+            break :blk try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= '{s}'::timestamptz", .{ cols_sel, table, j.vcol, lower_lit });
+        } else if (j.tcol.len > 0)
             try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, j.tcol })
         else
             try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
@@ -2016,9 +2126,8 @@ pub const GenerationProducer = struct {
         var osm = js.objectStoreManager();
         var store = try osm.openStore(bucket);
         defer store.deinit();
-        const full_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-full", .{ table, gen_l });
         const t_q = utils.unixMillis();
-        const fo = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen_l, cutoff_l, j.vcol);
+        const fo = try putFullObject(alloc, self.allocator, pgc, &store, obj_name, sql, gen_l, cutoff_l, j.vcol, kind_str);
         full_rows = fo.rows;
         const query_ms = utils.unixMillis() - t_q;
         {
@@ -2032,7 +2141,18 @@ pub const GenerationProducer = struct {
         var dict_name: ?[]const u8 = null;
         var dict_kept = false;
         var dict_ratio: ?i64 = null;
-        {
+        if (j.kind == .checkpoint) {
+            // §10x: a checkpoint compresses with the era's dictionary — the one the full
+            // trained — and never trains its own. Training belongs to the base.
+            const res_d = try queryOne(bkc, "SELECT encode(dict, 'hex'), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
+                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
+            defer c.PQclear(res_d);
+            if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 1) > 0) {
+                dict_bytes = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 0)));
+                dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
+                dict_kept = true;
+            }
+        } else {
             const probe = try probeFrom(alloc, fo.corpus, 128 * 1024);
             const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
                 "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
@@ -2092,12 +2212,19 @@ pub const GenerationProducer = struct {
         const same_chain = newest.l_exists and newest.full < gen_l and std.mem.eql(u8, newest.epoch, epoch_l) and
             std.mem.eql(u8, newest.shape, shape_l) and std.mem.eql(u8, newest.relid, relid_l);
         if (!same_chain) {
-            log.info("🧬 '{s}'/'{s}': background full for g{d} discarded — the chain moved while it built (newest g{d}, full g{d}, g{d} kept: {})", .{ tenant, table, gen_l, newest.gen, newest.full, gen_l, newest.l_exists });
-            store.delete(full_name) catch {};
+            log.info("🧬 '{s}'/'{s}': background {s} for g{d} discarded — the chain moved while it built (newest g{d}, full g{d}, g{d} kept: {})", .{ tenant, table, kind_str, gen_l, newest.gen, newest.full, gen_l, newest.l_exists });
+            store.delete(obj_name) catch {};
             if (!dict_kept) if (dict_name) |dn| store.delete(dn) catch {};
             return;
         }
-        {
+        if (j.kind == .checkpoint) {
+            const lower_z = try alloc.dupeZ(u8, ckpt_lower);
+            const dict_name_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, lower_z.ptr, dict_name_z };
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_lower = $4::timestamptz, ckpt_dict_object = $5 " ++
+                "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
+            c.PQclear(res);
+        } else {
             const dict_hex_z: ?[*:0]const u8 = if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null;
             const dict_name_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
             const ratio_z: ?[*:0]const u8 = if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null;
@@ -2137,12 +2264,18 @@ pub const GenerationProducer = struct {
                 try deltas.append(.{ .object = d });
             }
         }
-        var full_obj: std.json.ObjectMap = .empty;
-        try full_obj.put(alloc, "gen", .{ .integer = gen_l });
-        try full_obj.put(alloc, "object", .{ .string = full_name });
-        try full_obj.put(alloc, "cutoff", .{ .string = cutoff_l });
         var root = man.object;
-        try root.put(alloc, "full", .{ .object = full_obj });
+        if (j.kind == .full) {
+            var full_obj: std.json.ObjectMap = .empty;
+            try full_obj.put(alloc, "gen", .{ .integer = gen_l });
+            try full_obj.put(alloc, "object", .{ .string = obj_name });
+            try full_obj.put(alloc, "cutoff", .{ .string = cutoff_l });
+            try root.put(alloc, "full", .{ .object = full_obj });
+        }
+        // §10gt: the checkpoints above the chain's full, oldest first — the middle level a
+        // returning client walks instead of reloading the table (§10gs).
+        const full_gen_now: i64 = if (j.kind == .full) gen_l else newest.full;
+        try root.put(alloc, "checkpoints", .{ .array = try checkpointsJson(alloc, bkc, table, tenant_z, table_z, full_gen_now) });
         try root.put(alloc, "deltas", .{ .array = deltas });
         var out: std.Io.Writer.Allocating = .init(alloc);
         try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &out.writer);
@@ -2572,6 +2705,8 @@ fn FullStreamOf(comptime Source: type) type {
     raw_off: usize = 0,
     expect_rows: usize,
     gen: i64,
+    /// "full" or "checkpoint" — what the document says it is (§10gt).
+    kind: []const u8 = "full",
     cutoff: []const u8,
     vcol: []const u8,
     copy_done: bool = false,
@@ -2613,7 +2748,7 @@ fn FullStreamOf(comptime Source: type) type {
                         return error.CopyCountMoved;
                     }
                     const tail = self.raw.items.len;
-                    try docTail(&self.raw, self.oa, self.gen, "full", self.cutoff, self.vcol, null);
+                    try docTail(&self.raw, self.oa, self.gen, self.kind, self.cutoff, self.vcol, null);
                     self.sampler.feed(self.raw.items[tail..]);
                     self.copy_done = true;
                     break;
@@ -2784,6 +2919,30 @@ fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z
             };
         }
     }
+}
+
+/// §10gt: the manifest's `checkpoints`, oldest first: every generation above the chain's
+/// full that carries one. `lower` is the window's start — what a returning client compares
+/// its watermark against before deciding it can skip the base (§10gs).
+fn checkpointsJson(alloc: std.mem.Allocator, bkc: *c.PGconn, table: []const u8, tenant_z: [:0]const u8, table_z: [:0]const u8, full_gen: i64) !std.json.Array {
+    var out: std.json.Array = .init(alloc);
+    const gen_z = try utils.allocPrintZ(alloc, "{d}", .{full_gen});
+    const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_z.ptr };
+    const res = GenerationProducer.queryOnePub(bkc, "SELECT gen, cutoff_version::text, COALESCE(ckpt_lower::text, ''), COALESCE(ckpt_dict_object, '') " ++
+        "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL AND gen > $3 ORDER BY gen", &params) catch return out;
+    defer c.PQclear(res);
+    for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
+        const g = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, @intCast(i), 0)), 10) catch continue;
+        var ck: std.json.ObjectMap = .empty;
+        try ck.put(alloc, "gen", .{ .integer = g });
+        try ck.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-ckpt", .{ table, g }) });
+        try ck.put(alloc, "lower", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 2))) });
+        try ck.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
+        const dref = std.mem.span(c.PQgetvalue(res, @intCast(i), 3));
+        if (dref.len > 0) try ck.put(alloc, "dict", .{ .string = try alloc.dupe(u8, dref) });
+        try out.append(.{ .object = ck });
+    }
+    return out;
 }
 
 /// §10ge: the depth rotation's full, now or later. Pure, for the tests.

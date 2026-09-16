@@ -692,6 +692,14 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS full_dict_objec
 -- transaction already open when the cut was read. The floor is the start of the oldest
 -- of those (or the cut itself), and the next delta reads `version >= floor`.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS open_xact_floor timestamptz;
+-- §10gt: the incremental chain's middle level. A checkpoint carries every row whose
+-- version moved inside its window — tombstoned rows included, which is what lets a
+-- returning client learn about a delete without reloading the table — and attaches to an
+-- existing generation, like a background full. `ckpt_lower` is the window's lower bound:
+-- the previous checkpoint's cutoff, or the base's.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_checkpoint boolean NOT NULL DEFAULT false;
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_lower timestamptz;
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_dict_object text;
 -- §10gq: when this generation left the manifest. Its objects stay in the store for
 -- GENERATION_RETIRE_GRACE_SECONDS after it, because a client may be READING them: a seed
 -- of a big full takes minutes while a busy pair replaces its full every few seconds. One
@@ -725,7 +733,7 @@ GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER
 -- a full and which dictionary goes with it. The background full lane attaches a full to an
 -- existing generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the
 -- counts, the epoch, the shape) stays unwritable once inserted.
-GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
+GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at, has_checkpoint, ckpt_lower, ckpt_dict_object) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
 
 -- §10gl: the start of the oldest transaction open in this database, for the generation
 -- producer's delta floor. pg_stat_activity hides other roles' sessions from the reader

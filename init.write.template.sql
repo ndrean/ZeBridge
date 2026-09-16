@@ -76,7 +76,7 @@ GRANT SELECT ON public.zebridge_catalogue TO ${POSTGRES_WRITER_USER};
 -- there, and the bridge sends the same bookkeeping over DATABASE_WRITER_URL instead
 -- (NOTES §10cz) — so the writer needs exactly the reader's bookkeeping privileges.
 GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_WRITER_USER};
-GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at) ON public.zebridge_generations TO ${POSTGRES_WRITER_USER};  -- §10gf/§10gq, the reader's column grant
+GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at, has_checkpoint, ckpt_lower, ckpt_dict_object) ON public.zebridge_generations TO ${POSTGRES_WRITER_USER};  -- §10gf/§10gq, the reader's column grant
 GRANT SELECT ON public.zebridge_limits TO ${POSTGRES_WRITER_USER};  -- the registration reads MIN and its previous row around the call
 GRANT EXECUTE ON FUNCTION public.zebridge_register_limits(text, name, integer, boolean) TO ${POSTGRES_WRITER_USER};
 GRANT EXECUTE ON FUNCTION public.zebridge_set_suspended(text, text) TO ${POSTGRES_WRITER_USER};
