@@ -2902,7 +2902,9 @@ fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z
     const nref: usize = @intCast(c.PQntuples(still_ref));
     for (0..pruned) |i| {
         const g = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
-        for ([_][]const u8{ "delta", "full" }) |kind| {
+        // §10gu: "ckpt" among them — a pruned checkpoint's object was left in the store
+        // for ever, since only the delta and the full were ever named here.
+        for ([_][]const u8{ "delta", "full", "ckpt" }) |kind| {
             const old_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
             store.delete(old_name) catch |err| {
                 if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
