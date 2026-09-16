@@ -13230,3 +13230,45 @@ rows/s, and at 100k the client above recovered exactly that way, ending equal to
 
 Not measured: zb-client-ts. Same question, and it applies chain chunks as one `json_each`
 statement already (§10fc), so its CDC path is the one to measure next.
+
+## 10go. The same measurement for zb-client-ts: it livelocks above 20k (2026-09-16)
+
+`firehose_tls.py --ts-client-at 5` (new): the Node follower
+(`examples/04-node-consumer/follow-worker.ts`, anonymous — a benchmark's scratch
+nats-server has no auth) opens 5 s into the load, seeds from whatever chain is live and
+follows CDC; the harness reads its SQLite replica and compares per batch, as for libzb.
+The run is `plain:` because nats.js upgrades to TLS whenever the server offers it and the
+scratch certificate is self-signed for `localhost` while the follower connects by address
+(Node resolves `localhost` to ::1 first, which the server does not listen on).
+
+| load | zb-client-ts | libzb, same load |
+| --- | --- | --- |
+| 10k/s | keeps up, caught up 70.7 s, 300,000 rows right, 0 gaps | keeps up, 71.7 s |
+| 20k/s | keeps up, 70.6 s, 600,000 rows right, 0 gaps | keeps up, 71.8 s |
+| 40k/s | **3,737 gaps, 3,738 re-seeds**, 76.8 s | keeps up, 72.1 s, no gap |
+| 60k/s | **6,829 gaps**, 85.2 s | keeps up, 73.2 s, no gap |
+| 100k/s | **7,550 gaps**, 115.8 s | falls behind, 2 re-seeds, 106.7 s |
+
+Every run ended equal to PostgreSQL. What the counters say, though, is that above 20k the
+TS client is not following at all — it is looping:
+
+    CDC_PUBLIC: 363 message(s) pruned under the live consumer (position 250, delivered 614)
+    Seeded fire_types from generation chain g1 (0 row(s), …)          ×7550, position still 250
+
+**The position never rises.** The client takes the gap, re-seeds from the boot chain g1 —
+which is empty, cut before the load — and its floor comes from that chain's cutoff, so the
+tail reopens below the hole and the same gap fires again. It escaped only when the load
+ended and the producer cut g2 with 2,850,000 rows: one seed from it, and the replica was
+right.
+
+libzb healed the same situation in §10ei: "a gap healed by this pass resumes at the
+stream's OLDEST message … Left below `first_seq`, the tail would ask for a sequence the
+stream no longer holds … and the live gap rule would read that as a fresh hole — a second
+seed at every poll after every gap." The TS client has the seed and the gap rule but not
+that heal.
+
+- [ ] TS: after a gap re-seed, when every table routed to the stream is seeded to a cutoff
+      at or past `first_seq - 1`, set the position to `first_seq - 1` (libzb's guard: a
+      stream whose tables are NOT covered stays blocked and retries).
+- [ ] Then re-run this ladder: the expectation is 40k and 60k with no gaps, and a graceful
+      fall-behind at 100k like libzb's.

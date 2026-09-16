@@ -65,6 +65,8 @@ CAP_BYTES = 256 * 1024 * 1024
 VERIFY = False
 CLIENT = False
 CLIENT_AT = None  # seconds into the load (--client-at)
+TS_CLIENT_AT = None  # the same for zb-client-ts (--ts-client-at)
+NODE_DIR = pathlib.Path(__file__).resolve().parents[2] / "examples" / "04-node-consumer"
 LIBZB = pathlib.Path(__file__).resolve().parents[2] / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
 CADENCE = 60
 
@@ -104,6 +106,76 @@ def load_sql(path: pathlib.Path, seconds: int, rate: int):
             lines.append(f"UPDATE public.{TABLE} SET age = age + 1, updated_at = now() WHERE batch = {sec - 1};")
         lines.append(f"SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (:'t0'::timestamptz + interval '{sec + 1} seconds') - clock_timestamp())));")
     path.write_text("\n".join(lines) + "\n")
+
+
+def ts_client_check(url: str, run_dir: pathlib.Path, start_at: float, load_done: threading.Event, catch_up_s: int = 900) -> dict:
+    """§10gn: the same measurement for zb-client-ts (Node, SQLite through
+    `examples/04-node-consumer/follow-worker.ts`). The follower writes its own replica file;
+    this reads it directly and compares with PostgreSQL per batch, as for libzb."""
+    import sqlite3
+    time.sleep(start_at)
+    db = run_dir / "ts-client.sqlite3"
+    log = (run_dir / "ts-client.log").open("w")
+    # Node resolves "localhost" to ::1 first and the scratch server listens on 127.0.0.1
+    # only: "connection refused" with the server plainly up.
+    env = dict(os.environ, NATS_URL=url.replace("localhost", "127.0.0.1"), ZB_DB=str(db), ZB_TABLES=TABLE, ZB_PRINCIPAL="firehose")
+    env.pop("ZB_CREDS", None)
+    t0 = time.time()
+    proc = subprocess.Popen(["node", "--experimental-strip-types", "follow-worker.ts"], cwd=NODE_DIR, env=env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log, text=True)
+    ready = proc.stdout.readline()
+    try:
+        first = json.loads(ready)
+    except json.JSONDecodeError:
+        proc.kill(); log.close()
+        return {"error": f"follower did not come up: {ready.strip()[:120]!r}"}
+    if not first.get("ready"):
+        proc.kill(); log.close()
+        return {"error": f"connect: {first.get('error')}"}
+    connect_s = time.time() - t0
+
+    def local() -> dict:
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            try:
+                return {int(b): (int(n), int(sa)) for b, n, sa in con.execute(f"SELECT batch, count(*), sum(age) FROM {TABLE} GROUP BY batch")}
+            finally:
+                con.close()
+        except Exception:
+            return {}
+
+    pg: dict = {}
+    end = time.time() + catch_up_s
+    got: dict = {}
+    while time.time() < end:
+        if not load_done.is_set():
+            end = time.time() + catch_up_s  # the budget runs from the end of the load
+            time.sleep(1)
+            continue
+        if not pg:
+            time.sleep(15)  # the bridge publishes the load's tail
+            out = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-XtA", "-F", "|", "-c",
+                                  f"SELECT batch, count(*), sum(age) FROM public.{TABLE} WHERE deleted_at IS NULL GROUP BY batch"], capture_output=True, text=True).stdout
+            for line in out.splitlines():
+                if line:
+                    b, n, sa = line.split("|")
+                    pg[int(b)] = (int(n), int(sa))
+        got = local()
+        if got and got == pg:
+            break
+        time.sleep(5)
+    caught = time.time() - t0
+    proc.terminate()
+    try: proc.wait(timeout=20)
+    except subprocess.TimeoutExpired: proc.kill()
+    log.close()
+    text = (run_dir / "ts-client.log").read_text(errors="replace")
+    diff = sorted(b for b in set(pg) | set(got) if pg.get(b) != got.get(b))
+    return {"connect_s": round(connect_s, 1), "caught_up_s": round(caught, 1) if not diff else None,
+            "pg_rows": sum(n for n, _ in pg.values()), "client_rows": sum(n for n, _ in got.values()),
+            "batches": len(pg), "batches_wrong": len(diff), "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]],
+            "gaps": text.count("pruned"), "reseeds": text.count("seeded"),
+            "sqlite_mib": db.stat().st_size // 2**20 if db.exists() else 0}
 
 
 def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wait_s: int = 150, catch_up_s: int = 900,
@@ -397,6 +469,13 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         load_done = threading.Event()
         client_box: dict = {}
         client_thread = None
+        ts_box: dict = {}
+        ts_thread = None
+        if TS_CLIENT_AT is not None:
+            def ts_mid_load():
+                ts_box["r"] = ts_client_check(client_url, run_dir, TS_CLIENT_AT, load_done)
+            ts_thread = threading.Thread(target=ts_mid_load, daemon=True)
+            ts_thread.start()
         if CLIENT_AT is not None:
             def client_mid_load():
                 time.sleep(CLIENT_AT)
@@ -443,6 +522,10 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
             client = client_box.get("r")
         else:
             client = client_check(cli, client_url, run_dir, load_end) if CLIENT else None
+        ts_client = None
+        if ts_thread is not None:
+            ts_thread.join()
+            ts_client = ts_box.get("r")
         leak_lines = []
         if os.environ.get("ZB_LEAKS"):
             # Idle: the last builds are done after a cadence; a second scan a cadence later
@@ -461,7 +544,7 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         pruned = [s for s in good if s["first"] > 1]
         load_errors = [l for l in r.stderr.splitlines() if "ERROR" in l or "FATAL" in l]
         return {"name": name, "load_s": load_s, "events": pub1 - pub0, "wal_written": wal_written,
-                "leaks": leak_lines, "run_dir": str(run_dir), "client": client,
+                "leaks": leak_lines, "run_dir": str(run_dir), "client": client, "ts_client": ts_client,
                 "rss_max_mib": max(sampler.rss_kib, default=0) // 1024, "rss_med_mib": (statistics.median(sampler.rss_kib) // 1024) if sampler.rss_kib else 0,
                 "slot_lag_max_mib": max(sampler.slot_lag, default=0) // 2**20, "slot_lag_med_mib": (statistics.median(sampler.slot_lag) // 2**20) if sampler.slot_lag else 0, "load_errors": load_errors, "slept_s": watch.slept_s(), "rows": rows, "bridge_cpu": b1 - b0, "nats_cpu": n1 - n0,
                 "early": early, "bg_attached": bg_attached, "bg_discarded": bg_discarded, "bg_ms": bg_ms, "deferred": deferred, "at_limit": at_limit, "fell_before": fell_before, "fell_during": fell_during, "cuts": cuts,
@@ -488,6 +571,7 @@ def main() -> int:
     ap.add_argument("--rate", type=int, default=10_000)
     ap.add_argument("--cap-mib", type=int, default=256, help="CDC_MAX_BYTES in MiB: the smaller, the less time the producer has")
     ap.add_argument("--runs", default="plain:off,tls:off", help="comma-separated transport:index, e.g. tls:off,tls:on (§10gd)")
+    ap.add_argument("--ts-client-at", type=float, default=None, help="the same for zb-client-ts, through examples/04-node-consumer/follow-worker.ts (§10gn)")
     ap.add_argument("--client-at", type=float, default=None, help="open the libzb client this many seconds into the load: it seeds mid-load and follows CDC (§10gm)")
     ap.add_argument("--client", action="store_true", help="after the load, a libzb client seeds and follows, compared with PostgreSQL per batch (§10gl)")
     ap.add_argument("--verify", action="store_true", help="after the load, seed from the chain in Python and compare with PostgreSQL (§10gf)")
@@ -497,7 +581,9 @@ def main() -> int:
     VERIFY = a.verify
     global CLIENT, CLIENT_AT
     CLIENT_AT = a.client_at
-    CLIENT = a.client or a.client_at is not None
+    global TS_CLIENT_AT
+    TS_CLIENT_AT = a.ts_client_at
+    CLIENT = a.client or a.client_at is not None or a.ts_client_at is not None
     CAP_BYTES = a.cap_mib * 1024 * 1024
     bt.keep_awake()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="zb_firehose_tls_"))
@@ -538,6 +624,8 @@ def main() -> int:
                 print(f"  chain check: {r['verified']}")
             if r.get("client") is not None:
                 print(f"  libzb client: {r['client']}")
+            if r.get("ts_client") is not None:
+                print(f"  zb-client-ts: {r['ts_client']}")
             print(f"  margin (cutoff + 1 - oldest), {r['pruning_samples']} of {r['samples']} samples while the stream pruned: "
                   f"min {r['min_margin']}, negative {r['holes']}; sampler errors {r['errors']}")
         return 0
