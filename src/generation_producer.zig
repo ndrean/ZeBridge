@@ -1490,6 +1490,7 @@ pub const GenerationProducer = struct {
             };
             ph.query += utils.unixMillis() - t_q;
         }
+        size_rule: {
         // §10es: the size rule beside the depth rule. A delta carries every row whose
         // version moved since the last cut, so a burst that re-stamps the same rows
         // puts them into every delta cut while it lasts, and a client catching up
@@ -1500,6 +1501,22 @@ pub const GenerationProducer = struct {
         // client with an old watermark takes the full; one with a recent watermark
         // takes the one delta it needs anyway.
         if (build_delta and !build_full and delta_rows > 0 and delta_rows * 2 > @as(usize, @intCast(@max(table_rows, 1)))) {
+            // §10gr: to the background lane, like the depth rotation's (§10gf). This full
+            // is an ECONOMY for a client catching up, never a correctness debt — the delta
+            // beside it carries every row that moved — so it must not hold the cut. Built
+            // here it was the last hole left in every firehose run: 9.7 s at 100k events a
+            // second, 14.1 s at 150k, and the cut fell off the stream while it ran. A
+            // client that seeds a few seconds later gets the same economy from the lane.
+            if (self.async_fulls) {
+                // A refused request means one is already queued for this pair, which
+                // serves the same purpose: either way this cut publishes its delta alone.
+                if (self.requestFull(tenant, table, vcol, tcol)) {
+                    log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for a client catching up; the background lane builds one, this cut publishes the delta alone", .{ tenant, table, delta_rows, table_rows });
+                } else {
+                    log.debug("🧬 '{s}'/'{s}': the delta carries {d} of {d} row(s); a full is already queued for the lane", .{ tenant, table, delta_rows, table_rows });
+                }
+                break :size_rule;
+            }
             log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, table_rows });
             build_full = true;
             const sql = if (tcol.len > 0)
@@ -1511,6 +1528,7 @@ pub const GenerationProducer = struct {
             ph.full += utils.unixMillis() - t_f;
             full_rows = full_obj.?.rows;
             widest_row = @max(widest_row, full_obj.?.widest);
+        }
         }
         {
             const res = try queryOne(pgc, "COMMIT", &.{});

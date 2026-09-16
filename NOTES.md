@@ -13371,3 +13371,31 @@ incremental fulls remove.
 at the end): 0 ObjectNotFound, 0 StepFailed, 121 of 121 batches equal to PostgreSQL, the
 client caught up 268.7 s after it opened. Before the change, the same shape of run lost its
 seed twice.
+
+## 10gr. The size rule's full goes to the lane too — no holes left (2026-09-16)
+
+§10es cuts a full beside the delta when the delta would carry more than half the table: a
+burst re-stamps the same rows, so five deltas of 700,000 rows each cost a catching-up client
+nine copies of every row where one full costs one. The economy is real — but it was built
+inside the cut, and it was the last hole in every firehose run: 9.7 s at 100k events a
+second, 14.1 s at 150k, the cut falling off the stream while it ran.
+
+It is an economy, never a correctness debt: the delta beside it already carries every row
+that moved. So it goes to the background lane like the depth rotation's full (§10gf), and
+the cut publishes its delta alone. A request the lane refuses means a full is already queued
+for the pair, which serves the same purpose — either way nothing is built inline.
+
+**Measured**, 300 s at 100k events/s on 2M preloaded rows, against the same run before:
+
+| | before | now |
+| --- | --- | --- |
+| holes | 1 (of 249) | **0 of 251** |
+| smallest margin | −1,436 | **+75** |
+| cuts | 143 delta, 1 delta+full | 143 delta, no delta+full |
+| background fulls | 5 (9.3–20.7 s) | 7 (7.6–20.5 s) |
+| events published | 97,730/s | 99,213/s |
+| bridge RSS median / max | 842 / 1,576 MiB | 1,656 / 3,074 MiB |
+
+The memory is the price: two more fulls in the lane's lifetime, and the retirement grace
+(§10gq) keeping four windows of objects. Deltas are still built in memory (§10gj) and remain
+the next thing to stream.
