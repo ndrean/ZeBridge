@@ -1783,6 +1783,29 @@ export class ZeBridge {
     return [`${cfg.tenant_prefix}${this.tenantValue}`, cfg.public];
   }
 
+  /// §10gm: the subjects this client wants on `streamName` — one per followed table
+  /// (`cdc.<table>.>` public, `cdc.<tenant>.<table>.>` tenant-scoped). Efficiency, NOT a
+  /// boundary: the stream stays the ACL (a filter is reader-chosen, so it can only ever
+  /// narrow what this reader pulls). Without it a client that follows one table still
+  /// downloads every table of the stream and drops the rest — the whole feed, on a phone.
+  /// Empty (no schema yet) means no filter, the behaviour before.
+  private cdcFilters(streamName: string): string[] {
+    const cfg = this.config.grammar.cdc_streams;
+    const prefix = this.config.grammar.subjects?.cdc_prefix ?? 'cdc';
+    const open = this.config.grammar.open_tenant || '_default';
+    const out = new Set<string>();
+    for (const [table, st] of this.syncedTables) {
+      if (!st.tenantColumn) {
+        if (!cfg || streamName === cfg.public) out.add(`${prefix}.${table}.>`);
+        continue;
+      }
+      const tenant = this.tenantValue;
+      if (tenant && this.cdcStreamForTenant(tenant) === streamName) out.add(`${prefix}.${tenant}.${table}.>`);
+      if (!cfg || streamName === cfg.public) out.add(`${prefix}.${open}.${table}.>`);
+    }
+    return [...out];
+  }
+
   private cdcStreamForTenant(tenant: string): string {
     const cfg = this.config.grammar.cdc_streams;
     if (!cfg) return this.config.grammar.streams.cdc;
@@ -2360,7 +2383,9 @@ export class ZeBridge {
 
     // 2. CDC consumers, ONLY AFTER seeding is resolved — one consumer per stream,
     // because a consumer belongs to exactly one stream and the stream is the ACL
-    // boundary. No filter: narrowing here would re-introduce a reader-chosen boundary.
+    // boundary. The subject filter below is efficiency only (§10gm): it narrows what
+    // THIS reader pulls to its own tables and can never widen it, so the boundary is
+    // still the stream's name.
     try {
       for (const streamName of this.cdcStreams()) {
         const setupStart = performance.now();
@@ -2412,9 +2437,13 @@ export class ZeBridge {
           }
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }
         const last = this.globalSyncState.seq[streamName] ?? 0;
+        const filters = this.cdcFilters(streamName);
         const ci = await jsm.consumers.add(streamName, {
           deliver_policy: last > 0 ? this.transport.deliverPolicy.byStartSequence : this.transport.deliverPolicy.all,
           opt_start_seq: last > 0 ? last + 1 : undefined,
+          // One filter is understood by every server; several need nats-server >= 2.10.
+          ...(filters.length === 1 ? { filter_subject: filters[0] } : {}),
+          ...(filters.length > 1 ? { filter_subjects: filters } : {}),
         });
         const consumer = await js.consumers.get(streamName, ci.name);
         const setupMs = Math.round(performance.now() - setupStart);

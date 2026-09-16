@@ -13183,3 +13183,22 @@ A client applies about 4,500 events a second and a chain seed about 90,000 rows 
 (17.35M in ~190 s): catching up through a chain is twenty times faster than through CDC, so
 the answer for a client that fell behind is the chain, not the stream. The gap rule is what
 makes it take that answer instead of drifting.
+
+**The CDC consumer follows the declared tables now.** Both clients take a table list
+(libzb `"tables"`, zb-client-ts `tables`), and both used it for seeding, schemas and
+apply — but not for the consumer: `pullSubscribe(null, …)` and `consumers.add(stream, {…})`
+pulled every table of the stream and dropped the foreign events after downloading them. A
+phone following one table paid for the whole feed, and so would a DuckDB job reading one
+table of a busy tenant.
+
+Each consumer now carries a subject filter per followed table — `cdc.<table>.>` for a
+public table, `cdc.<tenant>.<table>.>` for a tenant-scoped one (`filter_subject` for one,
+`filter_subjects` for several, nats-server >= 2.10). Nothing else rides a CDC stream
+(PROTOCOL §4), so nothing is lost. It is efficiency, not a boundary: the stream name is
+still the ACL, and a filter can only narrow what a reader already may read.
+
+Measured: a stream of 117 messages for `fire_types` plus 50 published on
+`cdc.bench_users.>`; the client's consumer came up
+`filter_subject=cdc.fire_types.>`, `delivered stream_seq=117`, `num_pending=0` — the 50
+were never sent. The same client seeds and matches PostgreSQL as before. The TypeScript
+side compiles and its suite passes; it has not been run live yet.

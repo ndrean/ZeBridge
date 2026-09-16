@@ -146,6 +146,8 @@ pub const SyncClient = struct {
     // with no error on either side. `undefined` until `loadGrammar` has run; `init`
     // does not return without it.
     cdc_prefix: []const u8 = undefined, // cdc_streams.tenant_prefix — the CDC_<tenant> STREAM prefix
+    /// subjects.cdc_prefix — the SUBJECT token (`cdc`), for the consumer's filters.
+    subject_cdc_prefix: []const u8 = undefined,
     cdc_public: []const u8 = undefined, // cdc_streams.public
     kv_schemas: []const u8 = undefined, // kv.schemas
     kv_tenants: []const u8 = undefined, // kv.tenants
@@ -382,6 +384,7 @@ pub const SyncClient = struct {
         const root = g.value;
         self.cdc_prefix = try grammarString(root, &.{ "cdc_streams", "tenant_prefix" });
         self.cdc_public = try grammarString(root, &.{ "cdc_streams", "public" });
+        self.subject_cdc_prefix = grammarString(root, &.{ "subjects", "cdc_prefix" }) catch "cdc";
         self.kv_schemas = try grammarString(root, &.{ "kv", "schemas" });
         self.kv_tenants = try grammarString(root, &.{ "kv", "tenants" });
         self.kv_live = grammarString(root, &.{ "kv", "live" }) catch "live";
@@ -2194,6 +2197,39 @@ pub const SyncClient = struct {
         return .{ .len = rows.len, .resolved = resolved, .dropped = dropped };
     }
 
+    /// §10gm: the subjects this client wants on `stream` — one per followed table:
+    /// `cdc.<table>.>` for a public table, `cdc.<tenant>.<table>.>` for a tenant-scoped
+    /// one (its open-tenant rows ride the public stream under the open tenant's name).
+    /// Without them the consumer downloads every table of the stream and drops what the
+    /// client does not follow: a phone that follows one table pays for the whole feed.
+    /// Nothing else rides a CDC stream (PROTOCOL §4), so the filters lose nothing.
+    fn cdcFilters(self: *SyncClient, a: std.mem.Allocator, stream: []const u8) ![]const []const u8 {
+        var subs: std.ArrayListUnmanaged([]const u8) = .empty;
+        var it = self.states.iterator();
+        while (it.next()) |e| {
+            const table = e.key_ptr.*;
+            const st = e.value_ptr.*;
+            if (st.tenant_col == null) {
+                for (st.routes) |r| if (std.mem.eql(u8, r, stream)) {
+                    try subs.append(a, try std.fmt.allocPrint(a, "{s}.{s}.>", .{ self.subject_cdc_prefix, table }));
+                };
+                continue;
+            }
+            for (self.tenantsFor(st)) |tenant| {
+                const route = try self.routeFor(a, tenant);
+                if (!std.mem.eql(u8, route, stream)) continue;
+                try subs.append(a, try std.fmt.allocPrint(a, "{s}.{s}.{s}.>", .{ self.subject_cdc_prefix, tenant, table }));
+            }
+            if (st.shared_route) |sr| if (std.mem.eql(u8, sr, stream)) {
+                const open = try std.fmt.allocPrint(a, "{s}.{s}.{s}.>", .{ self.subject_cdc_prefix, self.open_tenant, table });
+                for (subs.items) |have| {
+                    if (std.mem.eql(u8, have, open)) break;
+                } else try subs.append(a, open);
+            };
+        }
+        return subs.items;
+    }
+
     /// A pull consumer on `stream` positioned just past the stored sequence, named
     /// uniquely per process, reaped by the server after `inactive_ns` idle.
     fn openConsumer(self: *SyncClient, stream: []const u8, inactive_ns: u64, shared: ?*@import("nats").PullInbox) !*@import("nats").PullSubscription {
@@ -2209,6 +2245,12 @@ pub const SyncClient = struct {
         var cfg = transportConsumerConfig();
         cfg.name = cname;
         cfg.durable_name = cname;
+        // §10gm: only this client's tables. `filter_subject` for one (every server
+        // understands it), `filter_subjects` for several (nats-server >= 2.10).
+        var fa = std.heap.ArenaAllocator.init(self.a);
+        defer fa.deinit();
+        const filters = try self.cdcFilters(fa.allocator(), stream);
+        if (filters.len == 1) cfg.filter_subject = filters[0] else if (filters.len > 1) cfg.filter_subjects = filters;
         // ⚠️ Reaped by the SERVER, not deleted by us. The consumer is named (nats.zig's
         // `pullSubscribe` requires it, and sets it durable), and the client JWT has no
         // `$JS.API.CONSUMER.DELETE` grant — by design — so deleting it from here was
