@@ -38,6 +38,14 @@ PG_FLAGS=(
   -c wal_buffers=64MB
   -c commit_delay=1000
   -c commit_siblings=5
+  # NOTES §10gk: initdb's defaults (128MB buffers, 1GB of WAL between checkpoints) made
+  # the 100k firehose a disk benchmark — the client backend wrote its own evicted pages,
+  # 687 checkpoints were forced by WAL volume, and full-page writes doubled the WAL.
+  # Sized for a 16 GB Mac.
+  -c shared_buffers=4GB
+  -c max_wal_size=16GB
+  -c checkpoint_timeout=15min
+  -c wal_compression=zstd
 )
 
 FRESH_PG=0

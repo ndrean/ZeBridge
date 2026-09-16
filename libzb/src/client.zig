@@ -300,7 +300,9 @@ pub const SyncClient = struct {
         // mismatch must refuse before a socket is opened with the wrong names.
         try self.loadGrammar();
 
-        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = opts.creds_path });
+        // An empty credsPath is "no creds" (an anonymous server), not a file named "": the
+        // C ABI defaults the field to "" and nats.zig opened it — FileNotFound at open.
+        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null });
         errdefer self.t.deinit();
 
         return self;
@@ -1830,6 +1832,11 @@ pub const SyncClient = struct {
         var applied: usize = 0;
         var i: usize = 0;
         if (staged and total > 0) try self.st.execSimple("BEGIN");
+        // §10gm: an error while staging (the object stream timing out, a full pruned while
+        // it was read) left this transaction open, and every later BEGIN on the connection
+        // failed — each seed retry and each CDC batch refused with StepFailed until the
+        // client was closed. A ROLLBACK outside a transaction is an error, ignored.
+        errdefer if (staged) self.st.execSimple("ROLLBACK") catch {};
         while (i < total or (total == 0 and is_full and chunk_no == 0 and !staged)) {
             if (i < total) {
                 const len = try zs.parseRowLen(&scratch);
@@ -2220,7 +2227,30 @@ pub const SyncClient = struct {
         return try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
     }
 
+    /// §10gm: the drain, with the gap rule the live tail already had. A stream that
+    /// prunes faster than this client applies leaves the drain reading the oldest message
+    /// the server still holds, and the server says nothing — measured at 100k events a
+    /// second: 3.8M of 17M rows, no error, no re-seed. A gap here is the same answer as in
+    /// the tail (§10ei): re-seed the tables routed to this stream from their chains, which
+    /// moves the position to their cutoff, and drain again. Bounded: a client slower than
+    /// the stream's retention would loop for ever, so after three tries the drain leaves
+    /// the rest to the live tail, which takes the gap on its own terms and says so.
     fn drainStream(self: *SyncClient, stream: []const u8) !void {
+        var attempt: u8 = 0;
+        while (true) {
+            if (!try self.drainStreamOnce(stream)) return;
+            attempt += 1;
+            if (attempt >= 3) {
+                std.debug.print("{s}: pruned under the drain three times — this client applies slower than the stream prunes; the live tail continues from the chain's cutoff\n", .{stream});
+                return;
+            }
+            std.debug.print("{s}: re-seeding the tables routed to it, then draining again ({d}/3)\n", .{ stream, attempt });
+            try self.gapAndSeed(null, null);
+        }
+    }
+
+    /// One pass of the drain. True when the stream pruned under it (the caller re-seeds).
+    fn drainStreamOnce(self: *SyncClient, stream: []const u8) !bool {
         const last = try self.storedSeq(stream);
         var sub = try self.openConsumer(stream, 30 * std.time.ns_per_s, null);
         defer sub.deinit(); // the server reaps the consumer itself — see openConsumer
@@ -2257,10 +2287,19 @@ pub const SyncClient = struct {
             };
             defer batch.deinit();
             if (batch.messages.len == 0) break;
+            // The gap rule (§10ei), here too: sequences are contiguous, so the next
+            // message is the position + 1 unless the stream pruned under the consumer.
+            const first_here = batch.messages[0].metadata.sequence.stream;
+            if (max_seq > 0 and first_here > max_seq + 1) {
+                if (max_seq > last) try self.persistSeq(stream, max_seq);
+                std.debug.print("{s}: {d} message(s) pruned under the drain (position {d}, delivered {d})\n", .{ stream, first_here - max_seq - 1, max_seq, first_here });
+                return true;
+            }
             _ = try self.applyBatch(null, stream, batch.messages, last, &max_seq, null);
         }
         if (max_seq > last) try self.persistSeq(stream, max_seq);
         std.debug.print("{s}: drained to seq {d}\n", .{ stream, max_seq });
+        return false;
     }
 
     /// One fetched batch through the gate → apply → hold → position path, shared by

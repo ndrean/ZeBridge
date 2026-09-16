@@ -1313,6 +1313,7 @@ pub fn main(init: std.process.Init) !void {
         );
         gp.defer_fulls = runtime_config.generation_defer_fulls;
         gp.async_fulls = runtime_config.generation_async_fulls;
+        gp.writable = &writable;
         try gp.start();
         gen_producer = gp;
         log.info("🧬 Generation producer thread started", .{});

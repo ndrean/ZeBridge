@@ -53,6 +53,7 @@ const encoder_mod = @import("encoder.zig");
 const pgoutput = @import("pgoutput.zig");
 const nats = @import("nats");
 const nats_endpoint = @import("nats_endpoint.zig");
+const writable_tables = @import("writable_tables.zig");
 const topology_mod = @import("topology.zig");
 const c_imports = @import("c_imports.zig");
 const hot_streams = @import("hot_streams.zig");
@@ -111,6 +112,11 @@ pub const GenerationProducer = struct {
     /// maps and the queue. `pair_busy`: a build of the pair holds it (every delta build
     /// whole; the full lane only while it takes its snapshot and while it attaches).
     async_fulls: bool = true,
+    /// §10gl: preflight's edge-writability verdicts. A table the edge writes keeps the
+    /// fixed version tolerance under its delta floor: a client's version can trail the
+    /// database clock by that much. Null (tests), or a table it does not know: kept too.
+    writable: ?*const writable_tables.Registry = null,
+    floor_warned: std.atomic.Value(bool) = .init(false),
     pair_busy: std.StringArrayHashMapUnmanaged(bool) = .empty,
     full_pending: std.StringArrayHashMapUnmanaged(void) = .empty,
     full_queue: std.ArrayListUnmanaged(FullJob) = .empty,
@@ -988,9 +994,13 @@ pub const GenerationProducer = struct {
         var last_epoch: i64 = 0;
         var last_col_shape: ?[]const u8 = null;
         var last_relid: ?[]const u8 = null;
+        // §10gl: the next delta's floor (null on rows from before the column: the old
+        // tolerance applies once) and the table's relfilenode at the last cut.
+        var last_floor: ?[]const u8 = null;
+        var last_filenode: ?[]const u8 = null;
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape, relid::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape, relid::text, open_xact_floor::text, filenode::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
@@ -1004,6 +1014,8 @@ pub const GenerationProducer = struct {
                 last_epoch = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 4)), 10) catch 0;
                 if (c.PQgetisnull(res, 0, 5) == 0) last_col_shape = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 5)));
                 if (c.PQgetisnull(res, 0, 6) == 0) last_relid = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 6)));
+                if (c.PQgetisnull(res, 0, 7) == 0) last_floor = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 7)));
+                if (c.PQgetisnull(res, 0, 8) == 0) last_filenode = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 8)));
             }
         }
         // §10dl: the table's OID now. Different from the last generation's → the table
@@ -1032,6 +1044,8 @@ pub const GenerationProducer = struct {
             last_del_count = null;
             last_epoch = 0;
             last_col_shape = null;
+            last_floor = null;
+            last_filenode = null;
         }
         // §10df: the catalogue's seed_epoch now. Different from the one the last
         // generation was built under → zebridge_reseed() ran → a FULL, whatever the
@@ -1062,11 +1076,12 @@ pub const GenerationProducer = struct {
         // decision is therefore NOT taken here: it is completed inside the snapshot
         // below, where the row count can be compared under the same tenant scope.
         var unchanged_by_version = false;
-        if (last_cutoff) |cut| {
-            const cut_z = try alloc.dupeZ(u8, cut);
-            const check = try utils.allocPrintZ(alloc, "SELECT EXISTS(SELECT 1 FROM \"{s}\" WHERE \"{s}\" > $1::timestamptz - interval '{s}')", .{ table, vcol, config.Sync.version_future_tolerance });
-            const params = [_]?[*:0]const u8{cut_z.ptr};
-            const res = try queryOne(pgc, check, &params);
+        // §10gl: what the next delta reads, and what "a version moved" means here.
+        const edge_writable = if (self.writable) |w| (w.get(table) orelse true) else true;
+        const lower_bound: ?[]const u8 = if (last_cutoff) |cut| try deltaLowerBound(alloc, cut, last_floor, edge_writable) else null;
+        if (lower_bound) |lb| {
+            const check = try utils.allocPrintZ(alloc, "SELECT EXISTS(SELECT 1 FROM \"{s}\" WHERE \"{s}\" >= {s})", .{ table, vcol, lb });
+            const res = try queryOne(pgc, check, &.{});
             defer c.PQclear(res);
             unchanged_by_version = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "f");
         }
@@ -1215,6 +1230,27 @@ pub const GenerationProducer = struct {
         const chain_fell_off: bool = prev_cut > 0 and stream_first > 1 and prev_cut + 1 < @as(i64, @intCast(stream_first));
         if (chain_fell_off) log.warn("🧬 '{s}'/'{s}': chain g{d} fell off {s} (its cutoff is below the stream's oldest message, seq {d}) — a returning client could not splice; cutting a delta with a fresh cut point", .{ tenant, table, last_gen, cdc_stream, stream_first });
 
+        // ── §10gl: the next delta's floor, read JUST BEFORE the snapshot ────
+        // A row this snapshot cannot see and a later commit makes visible comes from a
+        // transaction that was open when the snapshot was taken, or began after it; its
+        // `now()` is its start, so its version is at least the start of the oldest
+        // transaction open at this instant, or this instant. Read inside the snapshot
+        // instead, a transaction that committed between the two would already be gone
+        // from pg_stat_activity. Null when the database predates the function: the next
+        // delta keeps the old fixed tolerance.
+        const floor_now: ?[]const u8 = blk: {
+            const probe = try queryOne(pgc, "SELECT to_regprocedure('public.zebridge_oldest_open_xact()') IS NOT NULL", &.{});
+            const present = c.PQgetvalue(probe, 0, 0)[0] == 't';
+            c.PQclear(probe);
+            if (!present) {
+                if (!self.floor_warned.swap(true, .acquire)) log.warn("🧬 public.zebridge_oldest_open_xact() is missing — deltas keep the fixed {s} overlap, and a transaction open longer than that across a cut can be missed; apply init.core.template.sql", .{config.Sync.version_future_tolerance});
+                break :blk null;
+            }
+            const res = try queryOne(pgc, "SELECT LEAST(now(), COALESCE(public.zebridge_oldest_open_xact(), now()))::text", &.{});
+            defer c.PQclear(res);
+            break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+        };
+
         // ── 2. REPEATABLE READ + tenant scoping, same policy as snapshots ────
         {
             const res = try queryOne(pgc, "BEGIN ISOLATION LEVEL REPEATABLE READ", &.{});
@@ -1265,12 +1301,30 @@ pub const GenerationProducer = struct {
         // delete of a row NOT touched since the last cutoff, exactly offset by a new
         // row, escapes. The tombstone-column route has no such gap; this one is for
         // tables that do not have it.
-        const row_count_now: i64 = blk: {
+        //
+        // §10gl: only on a table WITHOUT the delete guard. On a guarded table every DELETE
+        // is a tombstone (a version move) and the counter below only moves for the
+        // sweeper's reaps, so the count told nothing but a TRUNCATE — which the table's
+        // relfilenode tells exactly, for free. The count was a full scan per cut: 236 ms
+        // at 17M rows, the largest part of a 100k-events/s delta after its rows. It stays
+        // where hard deletes are real: n_tup_del is no substitute there, since a backend
+        // publishes it only between transactions (measured: a DELETE followed by a 20 s
+        // statement in the same session was still invisible after 19 s).
+        const row_count_now: ?i64 = if (guarded) null else blk: {
             const sql = try utils.allocPrintZ(alloc, "SELECT count(*) FROM \"{s}\"", .{table});
             const res = try queryOne(pgc, sql, &.{});
             defer c.PQclear(res);
             break :blk std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
         };
+        // The table's storage at the cut, from pg_class under this snapshot.
+        const filenode_now: []const u8 = blk: {
+            if (cur_relid.len == 0) break :blk "";
+            const res = try queryOne(pgc, "SELECT relfilenode::text FROM pg_class WHERE oid = $1::oid", &.{(try alloc.dupeZ(u8, cur_relid)).ptr});
+            defer c.PQclear(res);
+            if (c.PQntuples(res) == 0) break :blk "";
+            break :blk try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, 0, 0)));
+        };
+        const filenode_moved = guarded and last_filenode != null and filenode_now.len > 0 and !std.mem.eql(u8, last_filenode.?, filenode_now);
         // ⚠️ The count's blind spot, closed: N inserts exactly offset by N deletes of
         // rows untouched since the cutoff leave count(*) unchanged. The statistics
         // collector's n_tup_del is cumulative per table and only ever grows — if it
@@ -1278,10 +1332,14 @@ pub const GenerationProducer = struct {
         // up to ~500 ms, far inside a cadence; a stats reset drops it to 0, which reads
         // as "moved" and costs one extra full. NULL for a table the collector has not
         // seen yet: treated as 0.
+        // `table_rows`: the size the §10es rule compares a delta with — the count where
+        // one was taken, the collector's estimate on a guarded table (a heuristic either way).
+        var table_rows: i64 = row_count_now orelse 0;
         const del_count_now: i64 = blk: {
-            const res = try queryOne(pgc, "SELECT COALESCE(n_tup_del, 0) FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = $1", &.{table_z.ptr});
+            const res = try queryOne(pgc, "SELECT COALESCE(n_tup_del, 0), COALESCE(n_live_tup, 0) FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = $1", &.{table_z.ptr});
             defer c.PQclear(res);
             if (c.PQntuples(res) == 0) break :blk 0;
+            if (row_count_now == null) table_rows = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 1)), 10) catch 0;
             break :blk std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
         };
         // §10ek: on a guarded table the counter can only move for the sweeper's reaps of
@@ -1294,39 +1352,43 @@ pub const GenerationProducer = struct {
         const shrink_explained = guarded and counter_moved;
         if (guarded and counter_moved) log.info("🧬 '{s}'/'{s}': deletes since g{d} ({d} -> {d}) are the sweeper's reaps — the guard tombstones every other DELETE; no full owed", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
         var repair_only = false;
+        // What the last cut recorded to compare with: its delete count, and its row
+        // count (unguarded) or its relfilenode (guarded). Missing on rows from before
+        // those columns: build once to record them.
+        const recorded = last_del_count != null and (if (guarded) last_filenode != null else last_row_count != null);
+        // No row went without a version move since the last cut.
+        const rows_held = if (guarded) !filenode_moved else (recorded and (last_row_count.? == row_count_now.? or shrink_explained));
         if (unchanged_by_version) {
-            if (last_row_count) |prev| if (last_del_count == null) {
-                log.info("🧬 '{s}'/'{s}': no delete count recorded for g{d} — building once to record {d}", .{ tenant, table, last_gen, del_count_now });
-            } else {
+            if (!recorded) {
+                log.info("🧬 '{s}'/'{s}': nothing recorded to compare with at g{d} ({s}) — building once to record it", .{ tenant, table, last_gen, if (guarded) "relfilenode or delete count" else "row count or delete count" });
+            } else if (rows_held and !deletes_moved and !epoch_moved and !shape_moved) {
                 // An epoch move is a change even when nothing else moved (§10df): the
                 // whole point of zebridge_reseed() is a full for data CDC never carried.
-                if ((prev == row_count_now or shrink_explained) and !deletes_moved and !epoch_moved and !shape_moved) {
-                    if (!chain_fell_off and !force_cut) {
-                        log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} rows, {d} deletes) — skipped", .{ tenant, table, last_gen, prev, del_count_now });
-                        const rb = try queryOne(pgc, "ROLLBACK", &.{});
-                        c.PQclear(rb);
-                        // §10eq: a skipped pair still has a cut to watch — the previous
-                        // one, with a conservative build time until this process builds it.
-                        if (prev_cut > 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100, false) catch {};
-                        return;
-                    }
-                    // §10ej: nothing moved but the chain fell off the stream — the repair
-                    // is an EMPTY delta, a fresh cut point and no rows: one small object,
-                    // zero rows on every returning client. A full here would rebuild a
-                    // large idle table because the stream moved, on both sides. The
-                    // depth clock still decides a full when one is due.
-                    repair_only = true;
-                } else if (epoch_moved) {
-                    log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the seed epoch did (§10df) — forcing a full", .{ tenant, table, last_gen });
-                } else if (shape_moved) {
-                    log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the column shape did (§10dg) — forcing a full", .{ tenant, table, last_gen });
-                } else if (prev != row_count_now) {
-                    log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the row count did ({d} -> {d}) — rows were deleted; forcing a full", .{ tenant, table, last_gen, prev, row_count_now });
-                } else {
-                    log.info("🧬 '{s}'/'{s}': no version moved and the count held since g{d}, but n_tup_del moved ({d} -> {d}) — deletes offset by inserts; forcing a full", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
+                if (!chain_fell_off and !force_cut) {
+                    log.debug("🧬 '{s}'/'{s}': unchanged since g{d} ({d} deletes) — skipped", .{ tenant, table, last_gen, del_count_now });
+                    const rb = try queryOne(pgc, "ROLLBACK", &.{});
+                    c.PQclear(rb);
+                    // §10eq: a skipped pair still has a cut to watch — the previous
+                    // one, with a conservative build time until this process builds it.
+                    if (prev_cut > 0) self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, @intCast(prev_cut), 100, false) catch {};
+                    return;
                 }
+                // §10ej: nothing moved but the chain fell off the stream — the repair
+                // is an EMPTY delta, a fresh cut point and no rows: one small object,
+                // zero rows on every returning client. A full here would rebuild a
+                // large idle table because the stream moved, on both sides. The
+                // depth clock still decides a full when one is due.
+                repair_only = true;
+            } else if (epoch_moved) {
+                log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the seed epoch did (§10df) — forcing a full", .{ tenant, table, last_gen });
+            } else if (shape_moved) {
+                log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the column shape did (§10dg) — forcing a full", .{ tenant, table, last_gen });
+            } else if (filenode_moved) {
+                log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the table's storage was replaced (relfilenode {s} -> {s}: TRUNCATE, or a rewrite) — forcing a full", .{ tenant, table, last_gen, last_filenode.?, filenode_now });
+            } else if (!guarded and last_row_count.? != row_count_now.?) {
+                log.info("🧬 '{s}'/'{s}': no version moved since g{d} but the row count did ({d} -> {d}) — forcing a full", .{ tenant, table, last_gen, last_row_count.?, row_count_now.? });
             } else {
-                log.info("🧬 '{s}'/'{s}': no row count recorded for g{d} — building once to record {d}", .{ tenant, table, last_gen, row_count_now });
+                log.info("🧬 '{s}'/'{s}': no version moved and the count held since g{d}, but n_tup_del moved ({d} -> {d}) — deletes offset by inserts; forcing a full", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
             }
             if (!repair_only) build_full = true;
         } else if (deletes_moved) {
@@ -1334,12 +1396,15 @@ pub const GenerationProducer = struct {
             // moved, a full is the only thing that can carry an absence.
             log.info("🧬 '{s}'/'{s}': n_tup_del moved since g{d} ({d} -> {d}) — forcing a full alongside the delta", .{ tenant, table, last_gen, last_del_count.?, del_count_now });
             build_full = true;
-        } else if (last_row_count) |prev| if (row_count_now < prev and !shrink_explained) {
+        } else if (filenode_moved) {
+            log.info("🧬 '{s}'/'{s}': the table's storage was replaced since g{d} (relfilenode {s} -> {s}: TRUNCATE, or a rewrite) — forcing a full alongside the delta", .{ tenant, table, last_gen, last_filenode.?, filenode_now });
+            build_full = true;
+        } else if (!guarded and last_row_count != null and row_count_now.? < last_row_count.? and !shrink_explained) {
             // Changed by version AND shrunk: the delta will carry the survivors that
             // moved, but nothing can carry the rows that went — a full must.
-            log.info("🧬 '{s}'/'{s}': row count shrank since g{d} ({d} -> {d}) — forcing a full alongside the delta", .{ tenant, table, last_gen, prev, row_count_now });
+            log.info("🧬 '{s}'/'{s}': row count shrank since g{d} ({d} -> {d}) — forcing a full alongside the delta", .{ tenant, table, last_gen, last_row_count.?, row_count_now.? });
             build_full = true;
-        };
+        }
 
         // ── §10ge: the depth rotation's full, now or later ───────────────────
         // Every full above this line is owed (first, epoch, shape, deletes, repair).
@@ -1408,11 +1473,8 @@ pub const GenerationProducer = struct {
         defer if (delta_payload) |b| self.allocator.free(b);
         var delta_rows: usize = 0;
         if (build_delta) {
-            // COPY takes no parameters: the previous cutoff is inlined as a literal. It is
-            // PostgreSQL's own rendering of a timestamptz read back from the bookkeeping
-            // row, quoted defensively all the same.
-            const prev_lit = try std.mem.replaceOwned(u8, alloc, last_cutoff.?, "'", "''");
-            const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" > '{s}'::timestamptz - interval '{s}'", .{ cols_sel, table, vcol, prev_lit, config.Sync.version_future_tolerance });
+            // COPY takes no parameters: the bound is inlined (`deltaLowerBound`, §10gl).
+            const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= {s}", .{ cols_sel, table, vcol, lower_bound.? });
             const t_q = utils.unixMillis();
             delta_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row) catch blk: {
                 const res = try queryOne(pgc, sql, &.{});
@@ -1430,8 +1492,8 @@ pub const GenerationProducer = struct {
         // the delta would carry more than half the table, cut the full with it. A
         // client with an old watermark takes the full; one with a recent watermark
         // takes the one delta it needs anyway.
-        if (build_delta and !build_full and delta_rows > 0 and delta_rows * 2 > @as(usize, @intCast(@max(row_count_now, 1)))) {
-            log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, row_count_now });
+        if (build_delta and !build_full and delta_rows > 0 and delta_rows * 2 > @as(usize, @intCast(@max(table_rows, 1)))) {
+            log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, table_rows });
             build_full = true;
             const sql = if (tcol.len > 0)
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
@@ -1626,16 +1688,18 @@ pub const GenerationProducer = struct {
             const prev_z: ?[*:0]const u8 = if (last_cutoff) |p| (try alloc.dupeZ(u8, p)).ptr else null;
             const dict_hex_z: ?[*:0]const u8 = if (build_full) (if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null) else null;
             const dict_obj_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
-            const count_z = try utils.allocPrintZ(alloc, "{d}", .{row_count_now});
+            const count_z: ?[*:0]const u8 = if (row_count_now) |n| (try utils.allocPrintZ(alloc, "{d}", .{n})).ptr else null;
+            const floor_z: ?[*:0]const u8 = if (floor_now) |f| (try alloc.dupeZ(u8, f)).ptr else null;
+            const filenode_z: ?[*:0]const u8 = if (filenode_now.len > 0) (try alloc.dupeZ(u8, filenode_now)).ptr else null;
             const del_z = try utils.allocPrintZ(alloc, "{d}", .{del_count_now});
             const epoch_z = try utils.allocPrintZ(alloc, "{d}", .{cat_epoch});
             const shape_z = try alloc.dupeZ(u8, col_shape);
             const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
             const ratio_z: ?[*:0]const u8 = if (build_full) (if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null) else null;
             const full_dict_z: ?[*:0]const u8 = if (build_full) dict_obj_z else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z.ptr, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z, full_dict_z };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio, full_dict_object) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint, $16) " ++
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z, full_dict_z, floor_z, filenode_z };
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio, full_dict_object, open_xact_floor, filenode) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint, $16, $17::timestamptz, $18::oid) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -2677,6 +2741,26 @@ fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z
 /// watch's early cut, applied to the build that costs the most.
 pub const FullDecision = enum { build, defer_full, build_at_limit };
 
+/// §10gl: the SQL expression a delta's rows must be at or above (`version >= …`), as
+/// literals: COPY takes no parameters. `cut` and `floor` are PostgreSQL's own renderings
+/// of timestamptz values from the bookkeeping row, quoted all the same.
+///
+/// - `floor` known, table not written by the edge: the floor. Every row a later commit
+///   makes visible carries a version at or above it (the oldest open transaction's start,
+///   or the cut), so nothing is re-read that the previous delta already carried, except
+///   the rows of transactions open across the cut.
+/// - `floor` known, edge-writable: the lower of the floor and the cut minus the version
+///   tolerance, since a client's version may trail the database clock by that much.
+/// - `floor` unknown (a row from before the column): the cut minus the tolerance, as before.
+pub fn deltaLowerBound(alloc: std.mem.Allocator, cut: []const u8, floor: ?[]const u8, edge_writable: bool) ![]const u8 {
+    const cut_lit = try std.mem.replaceOwned(u8, alloc, cut, "'", "''");
+    const tol = config.Sync.version_future_tolerance;
+    const f = floor orelse return std.fmt.allocPrint(alloc, "'{s}'::timestamptz - interval '{s}'", .{ cut_lit, tol });
+    const floor_lit = try std.mem.replaceOwned(u8, alloc, f, "'", "''");
+    if (!edge_writable) return std.fmt.allocPrint(alloc, "'{s}'::timestamptz", .{floor_lit});
+    return std.fmt.allocPrint(alloc, "LEAST('{s}'::timestamptz - interval '{s}', '{s}'::timestamptz)", .{ cut_lit, tol, floor_lit });
+}
+
 pub fn fullDecision(enabled: bool, since: i64, limit: i64, margin_s: f64, age_ms: i64, read: bool, full_ms: i64, scan_s: u64) FullDecision {
     if (!enabled or !read or full_ms <= 0) return .build;
     if (age_ms > @as(i64, @intCast(scan_s)) * 1000 + 2000) return .build;
@@ -2818,4 +2902,17 @@ test "FullStreamOf: one zstd frame with no content size, the document intact, in
     try std.testing.expectEqual(@as(u8, 0xdd), doc[rows_at]);
     try std.testing.expectEqual(@as(u32, total), std.mem.readInt(u32, doc[rows_at + 1 ..][0..4], .big));
     try std.testing.expect(std.mem.endsWith(u8, doc, "\xaeversion_column\xaaupdated_at"));
+}
+
+test "deltaLowerBound: the floor alone, the tolerance only where the edge writes or nothing was recorded (§10gl)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cut = "2026-09-15 18:49:53.04047+00";
+    const floor = "2026-09-15 18:49:52.9+00";
+    try std.testing.expectEqualStrings("'2026-09-15 18:49:52.9+00'::timestamptz", try deltaLowerBound(a, cut, floor, false));
+    try std.testing.expectEqualStrings("LEAST('2026-09-15 18:49:53.04047+00'::timestamptz - interval '5 seconds', '2026-09-15 18:49:52.9+00'::timestamptz)", try deltaLowerBound(a, cut, floor, true));
+    try std.testing.expectEqualStrings("'2026-09-15 18:49:53.04047+00'::timestamptz - interval '5 seconds'", try deltaLowerBound(a, cut, null, false));
+    // quoted, never closed
+    try std.testing.expectEqualStrings("'x'' OR 1=1 --'::timestamptz", try deltaLowerBound(a, cut, "x' OR 1=1 --", false));
 }

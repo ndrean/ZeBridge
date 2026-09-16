@@ -71,9 +71,12 @@ def keep_awake():
     14:54:04, wake 14:57:39, inside a firehose run). PostgreSQL's pacing follows the wall
     clock while the harness's monotonic clock stops, so a slept run looks like a short
     load that then bursts. `caffeinate -i -w <this pid>` holds the machine awake for as
-    long as the harness lives. No-op where caffeinate does not exist."""
+    long as the harness lives. No-op where caffeinate does not exist.
+    §10gj: `-i` alone did not hold it: a run started during a maintenance dark wake (the
+    owner away) went back to 'Maintenance Sleep' for 271 s with the assertion held, and
+    woke at the owner's keyboard. `-s` (no system sleep on AC power) is added."""
     if shutil.which("caffeinate"):
-        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.Popen(["caffeinate", "-i", "-s", "-w", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 class SleepWatch:

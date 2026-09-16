@@ -687,6 +687,15 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_ratio smal
 -- compress with. A background full attaches to an existing delta row, whose own
 -- `dict_object` names the dictionary its delta was compressed with and must not change.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS full_dict_object text;
+-- §10gl: the lower bound of the NEXT delta. `now()` is a transaction's start, so a row
+-- committed after this cut can carry a version older than the cutoff; it came from a
+-- transaction already open when the cut was read. The floor is the start of the oldest
+-- of those (or the cut itself), and the next delta reads `version >= floor`.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS open_xact_floor timestamptz;
+-- §10gl: the table's relfilenode at the cut. TRUNCATE changes it (transactionally, so the
+-- snapshot sees it exactly); on a guarded table it replaces count(*) as the sign that rows
+-- went without a DELETE.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS filenode oid;
 -- Databases created before the delta milestone: same columns, idempotently.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS prev_cutoff timestamptz;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_full boolean NOT NULL DEFAULT false;
@@ -712,6 +721,28 @@ GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER
 -- existing generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the
 -- counts, the epoch, the shape) stays unwritable once inserted.
 GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
+
+-- §10gl: the start of the oldest transaction open in this database, for the generation
+-- producer's delta floor. pg_stat_activity hides other roles' sessions from the reader
+-- (measured: it saw none), and pg_read_all_stats would also show it every session's query
+-- text; this returns one timestamp and nothing else. The caller's own sessions are left
+-- out: the reader role never writes a published table, and its snapshot transactions (a
+-- background full holds one for tens of seconds) would pull the floor down for nothing.
+-- The wal sender and autovacuum write no rows a delta reads.
+CREATE OR REPLACE FUNCTION public.zebridge_oldest_open_xact()
+RETURNS timestamptz
+LANGUAGE sql STABLE SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+    SELECT min(xact_start) FROM pg_stat_activity
+    WHERE datname = current_database()
+      AND xact_start IS NOT NULL
+      AND pid <> pg_backend_pid()
+      AND usename IS DISTINCT FROM session_user
+      AND backend_type NOT IN ('walsender', 'autovacuum worker', 'autovacuum launcher')
+$$;
+REVOKE ALL ON FUNCTION public.zebridge_oldest_open_xact() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.zebridge_oldest_open_xact() TO ${POSTGRES_READER_USER};
 
 -- keeps the tracker's own rows out of the DDL feed — see PROTOCOL.md §5
 CREATE OR REPLACE FUNCTION public.zebridge_is_internal_table(tbl text)

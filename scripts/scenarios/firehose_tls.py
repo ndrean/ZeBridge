@@ -31,6 +31,21 @@ Measured per run, plain then TLS, identical otherwise:
                           §10gf); `async` or nothing keeps the background full lane.
   --runs tls:on:nodefer   a third field turns the §10ge full deferral off for that run
                           (GENERATION_DEFER_FULLS=false); `defer` or nothing keeps it on.
+  --runs tls:on:defer:async:nogen a fifth field turns the generation producer off (§10gi: the
+                          CDC path's memory alone).
+  ZB_VMMAP=1              every 20 s, `vmmap -summary` of the bridge into the run directory
+                          (with ZB_KEEP=1 to keep it): which regions hold the resident memory.
+  ZB_LEAKS=1               the bridge runs with MallocStackLogging, and once the load is over and a
+                          cadence has passed, `leaks` scans it twice, a cadence apart, into the
+                          run directory (§10gi). Slower bridge: never together with a measured run.
+  --client                a real libzb client (C ABI, SQLite, streaming seed) opens once the load is
+                          over and a cut after it exists, seeds, follows CDC until it has caught
+                          up, and is compared with PostgreSQL per batch: count and sum(age) (every
+                          update adds 1). The scratch nats-server then also accepts plain clients
+                          (libzb takes no CA); the bridge stays on tls:// (§10gl).
+  --client-at S           the same client, opened S seconds into the load: it seeds from the chain
+                          live then, follows CDC through the rest of the load, and is compared
+                          after it — the only check where CDC carries rows the chain never had.
   --preload N             N static rows loaded before the bridge boots and never updated:
                           every full carries them, every delta should not have to scan them.
 §10gf/§10gg: `--verify` seeds the final chain in Python by the clients' plan rule and compares
@@ -48,6 +63,9 @@ import burst_tls as bt  # the isolation helpers: scratch database, nats-servers,
 TABLE = "fire_types"
 CAP_BYTES = 256 * 1024 * 1024
 VERIFY = False
+CLIENT = False
+CLIENT_AT = None  # seconds into the load (--client-at)
+LIBZB = pathlib.Path(__file__).resolve().parents[2] / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
 CADENCE = 60
 
 
@@ -56,12 +74,21 @@ def setup_table():
         uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), batch integer NOT NULL, age integer,
         temperature double precision, price numeric(20,8), is_true boolean, some_text text,
         tags text[], matrix integer[], metadata jsonb, last_writer varchar(255),
-        inserted_at timestamptz NOT NULL, updated_at timestamptz NOT NULL)""")
+        inserted_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, deleted_at timestamptz)""")
     bt.psql(f"CREATE INDEX ON public.{TABLE} (batch)")
     r = bt.psql(f"SELECT step, status, detail FROM zebridge_enable('public.{TABLE}'::regclass, public_reason => 'firehose benchmark', "
-                f"publication => '{bt.PUB}', dry_run => false) WHERE status = 'ERROR'")
+                f"tombstone_col => 'deleted_at', publication => '{bt.PUB}', dry_run => false) WHERE status = 'ERROR'")
     if r.stdout.strip():
         sys.exit(f"enable refused: {r.stdout}")
+    # §10gl: the delete guard, which zebridge_enable installs only on a writable table (with
+    # zebridge_install_write_guards, whose per-row UPDATE trigger would add a PL/pgSQL call
+    # to every one of the load's updates). With it a DELETE writes deleted_at, and the
+    # producer takes no count(*) per cut; a TRUNCATE is read from the relfilenode. The load
+    # never deletes.
+    r = bt.psql(f"CREATE TRIGGER zebridge_soft_delete_t BEFORE DELETE ON public.{TABLE} "
+                f"FOR EACH ROW EXECUTE FUNCTION public.zebridge_soft_delete('deleted_at', 'updated_at')")
+    if r.returncode != 0:
+        sys.exit(f"delete guard: {r.stderr.strip()}")
 
 
 def load_sql(path: pathlib.Path, seconds: int, rate: int):
@@ -77,6 +104,107 @@ def load_sql(path: pathlib.Path, seconds: int, rate: int):
             lines.append(f"UPDATE public.{TABLE} SET age = age + 1, updated_at = now() WHERE batch = {sec - 1};")
         lines.append(f"SELECT pg_sleep(GREATEST(0, EXTRACT(EPOCH FROM (:'t0'::timestamptz + interval '{sec + 1} seconds') - clock_timestamp())));")
     path.write_text("\n".join(lines) + "\n")
+
+
+def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wait_s: int = 150, catch_up_s: int = 900,
+                 load_done: threading.Event | None = None) -> dict:
+    """§10gl: what a real client gets. libzb through its C ABI (the Flutter/iOS path),
+    SQLite, streaming seed; opened once a cut after the load exists, so the chain covers
+    every write and CDC carries only what came after. Seed time is `sync`; then `poll`
+    until every batch's count and sum(age) match PostgreSQL — the age of a row moves on
+    every update, so a missed update shows as well as a missed row.
+
+    With `load_done` (`--client-at`) the client opens during the load instead: it seeds
+    from whatever chain is live, follows CDC while the load runs, and is compared once the
+    load is over — the rows after its cut come only through CDC."""
+    import ctypes
+    if not LIBZB.exists():
+        return {"error": f"{LIBZB} missing: cd libzb && zig build -Doptimize=ReleaseFast"}
+    deadline = time.time() + wait_s
+    while load_done is None and time.time() < deadline:
+        raw = subprocess.run(cli + ["kv", "get", "generations", f"_default.{TABLE}", "--raw"], capture_output=True, text=True).stdout
+        if raw.strip().startswith("{"):
+            man = json.loads(raw)
+            if subprocess.run(bt_psql_cutoff_after(man["cutoff_version"], load_end), capture_output=True, text=True).stdout.strip() == "t":
+                break
+        time.sleep(1)
+    else:
+        if load_done is None:
+            return {"error": "no cut after the load"}
+
+    def pg_now() -> dict:
+        agg = {}
+        out = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-XtA", "-F", "|", "-c",
+                              f"SELECT batch, count(*), sum(age) FROM public.{TABLE} WHERE deleted_at IS NULL GROUP BY batch"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if line:
+                b, n, sa = line.split("|")
+                agg[int(b)] = (int(n), int(sa))
+        return agg
+    pg = pg_now() if load_done is None else {}
+    lib = ctypes.CDLL(str(LIBZB))
+    lib.zb_free.argtypes = [ctypes.c_void_p]
+    lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
+    lib.zb_client_close.argtypes = [ctypes.c_uint64]
+    for n, extra in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
+        f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + extra
+
+    def take(ptr):
+        try: return json.loads(ctypes.string_at(ptr).decode())
+        finally: lib.zb_free(ptr)
+
+    def local() -> dict:
+        r = take(lib.zb_client_query(h, f"SELECT batch, count(*), sum(age) FROM {TABLE} GROUP BY batch".encode(), b"[]"))
+        if "error" in r:
+            raise RuntimeError(r["error"])
+        return {int(b): (int(n), int(sa)) for b, n, sa in r["rows"]}
+
+    db = run_dir / "client.sqlite3"
+    t0 = time.time()
+    h = lib.zb_client_open(json.dumps({"url": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0,
+                                       "clientId": "firehose-check", "principal": "firehose", "seedStreaming": True}).encode())
+    if not h:
+        return {"error": "open failed"}
+    try:
+        synced = take(lib.zb_client_sync(h))
+        seed_s = time.time() - t0
+        # A failed seed is retried by libzb at the next poll, the way an app sees it: keep
+        # polling and say it happened (§10gl: a full pruned while the client read it).
+        sync_error = synced.get("error")
+        polls, errors, got = 0, [], {}
+        end = time.time() + catch_up_s
+        next_check = 0.0
+        during_load_polls = 0
+        while time.time() < end:
+            p = take(lib.zb_client_poll(h, 1000))
+            polls += 1
+            if p.get("error"):
+                errors.append(p["error"])
+                if len(errors) > 5:
+                    break
+            if load_done is not None and not load_done.is_set():
+                during_load_polls += 1
+                end = time.time() + catch_up_s  # the budget runs from the end of the load
+                continue
+            if load_done is not None and not pg:
+                time.sleep(15)  # the bridge publishes the load's tail
+                pg = pg_now()
+            if time.time() >= next_check:
+                next_check = time.time() + 5
+                got = local()
+                if got == pg:
+                    break
+        caught_s = time.time() - t0
+        got = got or local()
+        diff = sorted(b for b in set(pg) | set(got) if pg.get(b) != got.get(b))
+        return {"sync_error": sync_error, "seed_s": round(seed_s, 1), "caught_up_s": round(caught_s, 1) if not diff else None, "polls": polls,
+                "polls_during_load": during_load_polls,
+                "pg_rows": sum(n for n, _ in pg.values()), "client_rows": sum(n for n, _ in got.values()),
+                "batches": len(pg), "batches_wrong": len(diff),
+                "first_wrong": [(b, pg.get(b), got.get(b)) for b in diff[:5]], "poll_errors": errors[:5],
+                "sqlite_mib": db.stat().st_size // 2**20 if db.exists() else 0}
+    finally:
+        lib.zb_client_close(h)
 
 
 def verify_chain(cli: list, tmp: pathlib.Path, load_end: float, wait_s: int = 150) -> dict:
@@ -168,9 +296,10 @@ def bt_psql_cutoff_after(cutoff: str, load_end: float) -> list:
 
 class Sampler(threading.Thread):
     """Once a second: the stream's oldest sequence and the newest manifest's cutoff."""
-    def __init__(self, cli, bridge_pid: int = 0):
+    def __init__(self, cli, bridge_pid: int = 0, vmmap_dir: pathlib.Path | None = None):
         super().__init__(daemon=True)
         self.cli, self.stop_flag, self.samples, self.bridge_pid = cli, threading.Event(), [], bridge_pid
+        self.vmmap_dir, self.vmmap_next = vmmap_dir, 0.0
         self.rss_kib: list = []
         self.rss_t: list = []  # §10gi: when each RSS sample was taken, for rss.csv
         self.slot_lag: list = []
@@ -195,6 +324,10 @@ class Sampler(threading.Thread):
                 if self.bridge_pid:
                     self.rss_kib.append(int(subprocess.run(["ps", "-o", "rss=", "-p", str(self.bridge_pid)], capture_output=True, text=True, timeout=5).stdout.strip() or 0))
                     self.rss_t.append(t)
+                if self.vmmap_dir and self.bridge_pid and t >= self.vmmap_next:
+                    self.vmmap_next = t + 20
+                    out = subprocess.run(["vmmap", "-summary", str(self.bridge_pid)], capture_output=True, text=True, timeout=15).stdout
+                    (self.vmmap_dir / f"vmmap-{int(t)}.txt").write_text(out)
                 lag = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-XtAc",
                                       f"SELECT COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint FROM pg_replication_slots WHERE slot_name = '{bt.SLOT}'"],
                                      capture_output=True, text=True, timeout=5).stdout.strip()
@@ -205,8 +338,8 @@ class Sampler(threading.Thread):
             self.stop_flag.wait(max(0.0, 1.0 - (time.time() - t)))
 
 
-def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = False, preload: int = 0, defer: bool = True, async_fulls: bool = True) -> dict:
-    name = ("TLS" if tls else "plain") + (" + version index" if index else ", no version index") + ("" if defer else ", no full deferral") + ("" if async_fulls else ", fulls in the build path")
+def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = False, preload: int = 0, defer: bool = True, async_fulls: bool = True, generations: bool = True) -> dict:
+    name = ("TLS" if tls else "plain") + (" + version index" if index else ", no version index") + ("" if defer else ", no full deferral") + ("" if async_fulls else ", fulls in the build path") + ("" if generations else ", no generations")
     bt.psql(f"TRUNCATE public.{TABLE}")
     if index:
         bt.psql(f"CREATE INDEX IF NOT EXISTS {TABLE}_zb_version ON public.{TABLE} (updated_at)")
@@ -224,22 +357,27 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
     bt.psql("DELETE FROM public.zebridge_generations")
     bt.psql(f"SELECT pg_drop_replication_slot('{bt.SLOT}') FROM pg_replication_slots WHERE slot_name = '{bt.SLOT}'", db=None, stop=False)
     run_dir = pathlib.Path(tempfile.mkdtemp(prefix=re.sub(r"[^a-z0-9]+", "-", name.lower()) + "-", dir=tmp))  # runs may repeat
-    nats_proc, url, cli = bt.start_nats(run_dir, tls)
+    nats_proc, url, cli = bt.start_nats(run_dir, tls, allow_non_tls=CLIENT and tls)
+    client_url = url
+    if CLIENT and tls:
+        url = "tls://localhost:14271"  # the bridge keeps TLS; plain is for the client only
     env = {k: v for k, v in os.environ.items() if k not in ("NATS_BRIDGE_NKEY_SEED", "NATS_CREDS", "ZB_SIGNING_SEED", "NATS_TLS_CA")}
     env.update({
         "DATABASE_READER_URL": bt.db_url(os.environ["DATABASE_READER_URL"], bt.DB),
         "DATABASE_WRITER_URL": bt.db_url(os.environ["DATABASE_WRITER_URL"], bt.DB),
-        "NATS_URL": url, "LOG_LEVEL": "info", "GENERATIONS_ENABLED": "true",
+        "NATS_URL": url, "LOG_LEVEL": "info", "GENERATIONS_ENABLED": "true" if generations else "false",
         "GENERATION_CADENCE_SECONDS": str(CADENCE), "CDC_MAX_BYTES": str(CAP_BYTES),
         "GENERATION_DEFER_FULLS": "true" if defer else "false",
         "GENERATION_ASYNC_FULLS": "true" if async_fulls else "false",
     })
     if tls:
         env["NATS_TLS_CA"] = str(bt.CERTS / "ca.pem")
+    if os.environ.get("ZB_LEAKS"):
+        env["MallocStackLogging"] = "1"  # leaks names the allocation stack of each leaked block
     log = run_dir / "bridge.log"
     bridge = subprocess.Popen([str(bt.BRIDGE), "--pub", bt.PUB, "--slot", bt.SLOT, "--port", str(bt.HTTP_PORT)],
                               env=env, stdout=log.open("w"), stderr=subprocess.STDOUT)
-    sampler = Sampler(cli, bridge.pid)
+    sampler = Sampler(cli, bridge.pid, run_dir if os.environ.get("ZB_VMMAP") else None)
     try:
         for _ in range(300):
             if bt.published() >= 0 and "Replication started" in log.read_text(errors="replace"):
@@ -256,7 +394,17 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         lsn0 = bt.psql("SELECT pg_current_wal_lsn()").stdout.strip()
         b0, n0 = bt.cpu_seconds(bridge.pid), bt.cpu_seconds(nats_proc.pid)
         t0 = time.perf_counter()
+        load_done = threading.Event()
+        client_box: dict = {}
+        client_thread = None
+        if CLIENT_AT is not None:
+            def client_mid_load():
+                time.sleep(CLIENT_AT)
+                client_box["r"] = client_check(cli, client_url, run_dir, 0.0, load_done=load_done)
+            client_thread = threading.Thread(target=client_mid_load, daemon=True)
+            client_thread.start()
         r = subprocess.run([bt.PSQL, bt.db_url(bt.ADMIN_URL, bt.DB), "-X", "-f", str(sql)], capture_output=True, text=True)
+        load_done.set()
         load_s = time.perf_counter() - t0
         if r.returncode != 0:
             sys.exit(f"{name}: the load failed: {r.stderr[-600:]}")
@@ -290,6 +438,20 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
                                  "full": int(ph.group(1)), "full_rows": int(ph.group(6)), "delta_rows": int(ph.group(7))})
         (run_dir / "rss.csv").write_text("unix_s,rss_kib\n" + "".join(f"{t:.1f},{k}\n" for t, k in zip(sampler.rss_t, sampler.rss_kib)))
         verified = verify_chain(cli, run_dir, load_end) if VERIFY else None
+        if client_thread is not None:
+            client_thread.join()
+            client = client_box.get("r")
+        else:
+            client = client_check(cli, client_url, run_dir, load_end) if CLIENT else None
+        leak_lines = []
+        if os.environ.get("ZB_LEAKS"):
+            # Idle: the last builds are done after a cadence; a second scan a cadence later
+            # tells a one-off from a leak that grows.
+            for i in (1, 2):
+                time.sleep(CADENCE + 10)
+                out = subprocess.run(["leaks", str(bridge.pid)], capture_output=True, text=True, timeout=600).stdout
+                (run_dir / f"leaks-{i}.txt").write_text(out)
+                leak_lines.append(next((l.strip() for l in out.splitlines() if "leaks for" in l), out[-200:].strip()))
         schema_raw = subprocess.run(cli + ["kv", "get", "schemas", TABLE, "--raw"], capture_output=True, text=True).stdout
         try:
             published_indexes = [ix["name"] for ix in json.loads(schema_raw).get("indexes", [])]
@@ -299,6 +461,7 @@ def run(tmp: pathlib.Path, tls: bool, seconds: int, rate: int, index: bool = Fal
         pruned = [s for s in good if s["first"] > 1]
         load_errors = [l for l in r.stderr.splitlines() if "ERROR" in l or "FATAL" in l]
         return {"name": name, "load_s": load_s, "events": pub1 - pub0, "wal_written": wal_written,
+                "leaks": leak_lines, "run_dir": str(run_dir), "client": client,
                 "rss_max_mib": max(sampler.rss_kib, default=0) // 1024, "rss_med_mib": (statistics.median(sampler.rss_kib) // 1024) if sampler.rss_kib else 0,
                 "slot_lag_max_mib": max(sampler.slot_lag, default=0) // 2**20, "slot_lag_med_mib": (statistics.median(sampler.slot_lag) // 2**20) if sampler.slot_lag else 0, "load_errors": load_errors, "slept_s": watch.slept_s(), "rows": rows, "bridge_cpu": b1 - b0, "nats_cpu": n1 - n0,
                 "early": early, "bg_attached": bg_attached, "bg_discarded": bg_discarded, "bg_ms": bg_ms, "deferred": deferred, "at_limit": at_limit, "fell_before": fell_before, "fell_during": fell_during, "cuts": cuts,
@@ -325,11 +488,16 @@ def main() -> int:
     ap.add_argument("--rate", type=int, default=10_000)
     ap.add_argument("--cap-mib", type=int, default=256, help="CDC_MAX_BYTES in MiB: the smaller, the less time the producer has")
     ap.add_argument("--runs", default="plain:off,tls:off", help="comma-separated transport:index, e.g. tls:off,tls:on (§10gd)")
+    ap.add_argument("--client-at", type=float, default=None, help="open the libzb client this many seconds into the load: it seeds mid-load and follows CDC (§10gm)")
+    ap.add_argument("--client", action="store_true", help="after the load, a libzb client seeds and follows, compared with PostgreSQL per batch (§10gl)")
     ap.add_argument("--verify", action="store_true", help="after the load, seed from the chain in Python and compare with PostgreSQL (§10gf)")
     ap.add_argument("--preload", type=int, default=0, help="static rows in the table before the bridge boots (§10gd)")
     a = ap.parse_args()
     global CAP_BYTES, VERIFY
     VERIFY = a.verify
+    global CLIENT, CLIENT_AT
+    CLIENT_AT = a.client_at
+    CLIENT = a.client or a.client_at is not None
     CAP_BYTES = a.cap_mib * 1024 * 1024
     bt.keep_awake()
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="zb_firehose_tls_"))
@@ -338,8 +506,8 @@ def main() -> int:
         setup_table()
         results = []
         for spec in a.runs.split(","):
-            transport, ix, dfr, asy = (spec.split(":") + ["", "", ""])[:4]
-            results.append(run(tmp, transport == "tls", a.seconds, a.rate, index=(ix == "on"), preload=a.preload, defer=(dfr != "nodefer"), async_fulls=(asy != "sync")))
+            transport, ix, dfr, asy, gen = (spec.split(":") + ["", "", "", ""])[:5]
+            results.append(run(tmp, transport == "tls", a.seconds, a.rate, index=(ix == "on"), preload=a.preload, defer=(dfr != "nodefer"), async_fulls=(asy != "sync"), generations=(gen != "nogen")))
             print("RESULT " + json.dumps(results[-1]), flush=True)  # kept even if a later run fails
         print(f"\nfirehose: {a.rate:,} rows/s inserted + the previous second's updated, {a.seconds} s; CDC cap {CAP_BYTES // 2**20} MiB, cadence {CADENCE} s; preload {a.preload:,} static rows")
         for r in results:
@@ -368,6 +536,8 @@ def main() -> int:
             print(f"  indexes in the published schema: {r['published_indexes']}")
             if r.get("verified") is not None:
                 print(f"  chain check: {r['verified']}")
+            if r.get("client") is not None:
+                print(f"  libzb client: {r['client']}")
             print(f"  margin (cutoff + 1 - oldest), {r['pruning_samples']} of {r['samples']} samples while the stream pruned: "
                   f"min {r['min_margin']}, negative {r['holes']}; sampler errors {r['errors']}")
         return 0

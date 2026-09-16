@@ -419,3 +419,46 @@ same command, with `--verify`.
 unchanged, even with the extra count. The 1.3 to 2.2 GB left at 50,000 events a second
 comes from the load itself, not from the full; where exactly (the CDC publish path, the
 deltas, which are still built in memory, or allocator retention) is not measured yet.
+
+## 100,000 events a second, and PostgreSQL's own settings (2026-09-15)
+
+```sh
+RING_BUFFER_COUNT=132000 python scripts/scenarios/firehose_tls.py --seconds 300 --rate 50000 --cap-mib 128 --preload 2000000 --runs tls:on:defer:async
+```
+
+50,000 inserts + 50,000 updates a second on 2M static rows, TLS, streamed fulls.
+
+| | initdb defaults, ring 32,768 | `shared_buffers=4GB`, `max_wal_size=16GB`, `checkpoint_timeout=15min`, `wal_compression=zstd`; ring 132,000 |
+| --- | --- | --- |
+| load (300 s script) | 933 s | 302 s |
+| events published | 32,042/s | 99,007/s |
+| WAL written | 58.2 GiB | 15.7 GiB |
+| slot lag median / max | 85 MiB / 8,852 MiB | 28 MiB / 79 MiB |
+| ring full | 33,704 times | 0 |
+| holes | 18 | 16; min margin −1,598 |
+| bridge CPU / NATS CPU | 345 s / 81 s | 299 s / 73 s |
+| bridge RSS median / max | 1,708 / 2,336 MiB | 1,470 / 4,016 MiB |
+
+**What it says.** With initdb's 128 MB of buffers and 1 GB of WAL between checkpoints, the
+load's own backend wrote its evicted pages and full-page writes quadrupled the WAL: the
+first run measured the disk. Sized, PostgreSQL runs the script in time and the bridge
+publishes 99,007 events a second with 79 MiB of lag at most. The chain is the limit at a
+128 MiB cap: about a second of margin per cut, and whole-table fulls of 10 to 30 s rebuilt
+back to back by the depth rotation. Memory peaks at 4 GB: 589 MB of ring, the rest deltas
+built in memory (§10gj).
+
+## 100,000 events a second: the delta floor (2026-09-15)
+
+Same command as above, after NOTES §10gl (a delta reads from the oldest open transaction's
+start instead of the cutoff minus 5 s; no `count(*)` per cut on a table with the delete
+guard, which the firehose table now has).
+
+| | 5 s overlap, count per cut | floor, no count |
+| --- | --- | --- |
+| events published | 99,007/s | 99,118/s |
+| delta rows, median | 400,000 | 150,000 |
+| delta build, median / max | 834 / 4,682 ms | 250 / 1,000 ms |
+| holes | 16; min margin −1,598 | 1 (the size rule's full, 12 s in the build path) |
+| slot lag median / max | 28 / 79 MiB | 29 / 93 MiB |
+| bridge RSS median / max | 1,470 / 4,016 MiB | 864 / 1,668 MiB |
+| bridge CPU / NATS CPU | 299 s / 73 s | 277 s / 71 s |

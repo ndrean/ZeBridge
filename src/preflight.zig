@@ -174,20 +174,34 @@ pub fn classifyVersionColumn(
 ///
 /// Refusal, not a warning: a table whose deletes cannot be addressed would leave rows in
 /// every replica that ever held them, and no later event could remove them.
-/// Generation-enabled tables WITHOUT a tombstone column: their deletes are hard, so the
-/// producer's version predicate cannot see them and it falls back to count(*) and
-/// `pg_stat_user_tables.n_tup_del`, forcing a FULL whenever either moved (NOTES §10bb).
-/// Correct, but a full per delete batch where a tombstone column would make each
-/// delete an ordinary versioned row. Said once at boot and on every DDL event, like
-/// the other shape reports — a catalogue choice, not a fault.
+/// Generation-enabled tables, by how their deletes reach a chain. Two facts decide it, and
+/// the bridge reads them in two places:
+///   * the catalogue's `tombstone_col` — the producer's fulls leave out rows it marks;
+///   * the `zebridge_soft_delete_t` trigger — what makes a DELETE write that column, and
+///     what the producer calls "guarded" (§10ek, §10gl: no count(*) per cut, a TRUNCATE
+///     read from the relfilenode).
+/// `zebridge_enable` installs both. The report says which one is missing:
+///   * neither: deletes are hard, and the producer falls back to count(*) and
+///     `pg_stat_user_tables.n_tup_del`, forcing a FULL whenever either moved (NOTES §10bb)
+///     — correct, but a full per delete batch; a catalogue choice, not a fault;
+///   * the trigger without the column: deletes are tombstoned but every full carries the
+///     tombstoned rows, and a client that seeds from one keeps them until a delta says;
+///   * the column without the trigger: a DELETE outside the bridge is physical, and the
+///     producer counts rows per cut as for a table without a column — what
+///     `zebridge_enable` leaves on a read-only table, so said as information.
+/// Said once at boot and on every DDL event, like the other shape reports.
 pub fn reportTombstoneColumns(allocator: std.mem.Allocator, conn: *c.PGconn, publication_name: []const u8) void {
     const query = utils.allocPrintZ(allocator,
-        \\SELECT pt.tablename
+        \\SELECT pt.tablename, cat.tombstone_col IS NOT NULL,
+        \\       EXISTS (SELECT 1 FROM pg_trigger g JOIN pg_class gc ON gc.oid = g.tgrelid
+        \\               JOIN pg_namespace gn ON gn.oid = gc.relnamespace
+        \\               WHERE gn.nspname = pt.schemaname AND gc.relname = pt.tablename
+        \\                 AND g.tgname = 'zebridge_soft_delete_t'),
+        \\       COALESCE(cat.tombstone_col::text, '')
         \\FROM pg_publication_tables pt
         \\LEFT JOIN public.zebridge_catalogue cat ON cat.tbl = pt.tablename
         \\WHERE pt.pubname = '{s}'
         \\  AND COALESCE(cat.generations, true)
-        \\  AND cat.tombstone_col IS NULL
         \\  AND NOT public.zebridge_is_internal_table(pt.tablename)
         \\  AND pt.tablename <> 'zebridge_gc_watermark'
         \\ORDER BY 1;
@@ -202,7 +216,18 @@ pub fn reportTombstoneColumns(allocator: std.mem.Allocator, conn: *c.PGconn, pub
     const n: usize = @intCast(c.PQntuples(res));
     for (0..n) |i| {
         const table = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
-        log.info("🪦 '{s}': no tombstone column — deletes are hard, detected by row count and n_tup_del, each costing a full generation; a tombstone column makes them ordinary versioned rows", .{table});
+        const has_col = c.PQgetvalue(res, @intCast(i), 1)[0] == 't';
+        const has_trigger = c.PQgetvalue(res, @intCast(i), 2)[0] == 't';
+        const col = std.mem.span(c.PQgetvalue(res, @intCast(i), 3));
+        if (!has_col and !has_trigger) {
+            log.info("🪦 '{s}': no tombstone column — deletes are hard, detected by row count and n_tup_del, each costing a full generation; a tombstone column makes them ordinary versioned rows", .{table});
+        } else if (!has_col) {
+            log.warn("⚠️  🪦 '{s}': the delete guard (zebridge_soft_delete_t) is installed but the catalogue names no tombstone_col — deletes are tombstoned, yet every full carries the tombstoned rows. Declare it: zebridge_enable(..., tombstone_col => '<column>')", .{table});
+        } else if (!has_trigger) {
+            // zebridge_enable installs the guard only on a writable table; read-only with a
+            // tombstone column is a legitimate setup (the doctor warns for writable ones).
+            log.info("🪦 '{s}': tombstone_col '{s}' without the delete guard — a DELETE outside the bridge stays physical, so generations count rows per cut to catch one; zebridge_install_write_guards(...) makes every DELETE a tombstone", .{ table, col });
+        }
     }
 }
 

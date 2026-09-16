@@ -12957,3 +12957,229 @@ Tests: `Sampler` against a document fed in uneven pieces; `FullStreamOf` over a 
 source (one frame, no size, the document intact, chunk-sized reads); libzb's `maybeZstd` on
 sizeless frames with and without a dictionary, and a truncated frame. The module's test
 binary now links libzstd.
+
+## 10gj. Where the rest of the memory goes, and no leak (2026-09-15)
+
+After §10gi the 50k events/s run still showed about 1 GB of RSS at peak. Traced on the Mac
+with `vmmap -summary` every 20 s (`ZB_VMMAP=1`) and a run with the producer off (`nogen`).
+
+| run (50k events/s, 300 s) | RSS median | RSS max |
+| --- | --- | --- |
+| generations off | 179 MiB | 180 MiB, flat |
+| generations on | 413 MiB | 1,011 MiB |
+
+**Live memory stays flat.** With generations on, the malloc blocks in use (`MALLOC_LARGE`)
+are 150–194 MiB in every snapshot: the 128 MiB ring slab and the rest of the CDC path. The
+peak is freed memory macOS malloc keeps resident for reuse: 530 MiB of `MALLOC_LARGE
+(empty)` and 180 MiB of `MALLOC_REALLOC (empty)` at the 877 MiB snapshot.
+
+**What made it: a delta built in memory.** The peak falls on g2, the first delta of the
+load, 299 MB raw (later early-cut deltas are about 50 MB). Three copies of it overlap: the
+payload buffer grown by doubling (at the 256 → 512 MB step both are live), the
+`compressBound`-sized buffer `compressZstd` allocates, and the tick's arena, which frees
+nothing until the tick ends. That is about 1 GB, the peak measured.
+
+**No leak.** `leaks` on the bridge (`ZB_LEAKS=1`: `MallocStackLogging`, two scans a cadence
+apart once the load is over): 0 leaks both times, 163,962 KB in use both times (2,286 and
+2,292 blocks), footprint back to 170 MiB after a 942 MiB peak. That run's load figures are
+invalid (the Mac slept 269 s despite `caffeinate`); the idle scans are not affected.
+
+**Next:** build deltas as a stream too (a checkpoint is a big delta: step 2 of the plan
+needs it anyway). The dictionary is known before a delta starts, so the stream only has to
+load it into the compressor.
+
+## 10gk. 100k events a second: PostgreSQL falls behind, and a delta misses late commits (2026-09-15)
+
+`firehose_tls.py --seconds 300 --rate 50000 --cap-mib 128 --preload 2000000 --runs tls:on:defer:async`
+(50,000 inserts + 50,000 updates a second, TLS, streamed fulls; no `--verify`: a 17M-row
+full does not fit the Python checker on 16 GiB).
+
+**The Mac's PostgreSQL does not keep 100k.** The 300 s script took 933 s: 29,900,000 events,
+all published, 32,042/s, the pace PostgreSQL wrote at. Slot lag median 85 MiB, max
+8,852 MiB; the ring filled 33,704 times (one warning line each). Bridge CPU 345 s, NATS 81 s.
+18 holes in 870 samples (min margin −914): every one inside a 12–14 s full built in the
+build path, not the background lane. RSS median 1,708 MiB, max 2,336 MiB (deltas in memory,
+§10gj: g2 was a 590 MB delta).
+
+**The finding: a timestamp lower bound misses a late commit.** g52's log:
+
+    no version moved since g51 but the row count did (9150000 -> 9200000) — rows were deleted; forcing a full
+    phases: … 9200000 full row(s), 0 delta row(s)
+
+Inside g52's snapshot, 50,000 rows existed that g51's snapshot did not see, and not one has
+`updated_at > g51.cutoff − 5 s`. They are an INSERT whose `now()` (its transaction's start)
+was more than 5 s before g51's cut and which committed after it: under the overload a
+statement ran that long. Here the count check forced a full and nothing was lost. An
+UPDATE that commits late changes no count: the next delta skips it, and a client that seeds
+from a full older than it plus the deltas never gets it once CDC has pruned the event.
+Only the next full repairs it — and the incremental fulls plan removes the periodic full.
+
+The same hole for a version the client supplies (§7.2): an edit made offline and replayed
+later carries its old version.
+
+Two more things from the run: a full forced by the count or size rule is still built in the
+build path (the holes), and "rows were deleted" is the wrong message for a count that grew.
+Not fixed; the lower bound is decided first.
+
+**Rerun on a sized PostgreSQL (same day).** `scripts/native/up.sh` now starts PostgreSQL with
+`shared_buffers=4GB`, `max_wal_size=16GB`, `checkpoint_timeout=15min`,
+`wal_compression=zstd` (the run above sampled the load's backend in `IO:DataFileWrite`, 687
+checkpoints forced by WAL volume, client backends doing 104M of the 119M relation writes).
+Same command, `RING_BUFFER_COUNT=132000`:
+
+| | initdb defaults, ring 32,768 | sized, ring 132,000 |
+| --- | --- | --- |
+| load (300 s script) | 933 s | 302 s |
+| events published | 32,042/s | 99,007/s |
+| WAL written | 58.2 GiB | 15.7 GiB |
+| slot lag median / max | 85 MiB / 8,852 MiB | 28 MiB / 79 MiB |
+| ring full | 33,704 times | 0 |
+| holes | 18 of 870 | 16 of 247; min margin −1,598 |
+| bridge CPU / NATS CPU | 345 s / 81 s | 299 s / 73 s |
+| RSS median / max | 1,708 / 2,336 MiB | 1,470 / 4,016 MiB (ring 589 MB of it) |
+
+The CDC path holds 100k events a second on the Mac. The chain does not, at a 128 MiB cap:
+the margin logged before each cut is about 1 s. The holes come from three things, in
+order: g2's size-rule full in the build path (9.7 s); the depth rotation asking for a full
+at every cut past its limit, so the background lane rebuilds the whole table without pause
+(fulls of 7.3M to 15.6M rows, 10 to 30 s); and the last of them, 30 s long, slowing the
+deltas beside it from 1.0 s to 2.6–4.7 s until two cuts fell off. The first two are what
+the incremental fulls plan removes. The ring made no difference to the chain; its size
+decides only the fixed memory.
+
+## 10gl. The delta floor, and no count on a guarded table (2026-09-15)
+
+At 100k events a second a delta carried 350–400k rows for a cut every 2.3 s: its lower
+bound was the previous cutoff minus the 5 s version tolerance, so each delta re-read 5 s
+the previous one had carried, and each cut counted the whole table (236 ms at 17M rows).
+
+**The floor.** Just before the snapshot, the producer reads the start of the oldest
+transaction open in the database (`zebridge_oldest_open_xact()`, SECURITY DEFINER: the
+reader saw no other session in pg_stat_activity) and stores `LEAST(now(), that)` as
+`open_xact_floor`. The next delta reads `version >= floor`. A row the snapshot cannot see
+and a later commit makes visible came from a transaction open at that instant or begun
+after it, and its `now()` is its start: it is at or above the floor. Read inside the
+snapshot instead, a transaction that committed between the two would be missed. The
+reader's own sessions, the wal sender and autovacuum are left out. Tables the edge writes
+keep the 5 s under the floor (a client's version can trail the database clock); rows from
+before the column keep the old bound. This also closes §10gk's late commit for
+server-stamped versions; a version replayed from an offline client is still open.
+
+**The count.** Skipped on a guarded table (the delete trigger): every DELETE there is a
+version move, and the delete counter only moves for reaps. A TRUNCATE, which the count
+used to reveal, is read from the table's `relfilenode` under the snapshot (new column
+`filenode`). Kept on an unguarded table: `n_tup_del` is published by a backend only
+between transactions (measured: a DELETE followed by a 20 s statement in the same session
+was invisible after 19 s), so it cannot replace the count where hard deletes happen.
+
+**100k again** (same command, ring 132,000; the firehose table now has the delete guard):
+
+| | before | floor, no count |
+| --- | --- | --- |
+| delta rows, median | 400,000 | 150,000 |
+| delta build, median / max | 834 / 4,682 ms | 250 / 1,000 ms |
+| holes | 16 | 1 (g2's size-rule full in the build path, 12 s) |
+| bridge RSS median / max | 1,470 / 4,016 MiB | 864 / 1,668 MiB |
+| bridge CPU | 299 s | 277 s |
+| events published | 99,007/s | 99,118/s |
+
+Cuts still come every 2.1 s: the early-cut trigger waits for the cut to be a second old.
+The one hole left is the size rule's full, still built with the delta. Preflight's boot
+line still says "no tombstone column" for the firehose table: it reads the catalogue's
+tombstone column, the producer reads the trigger.
+
+Dev database, by hand: the two `ALTER TABLE … ADD COLUMN` and the function with its grant
+from `init.core.template.sql`.
+
+## 10gm. A libzb client on the 100k chain: the rows are right, a replaced full is not kept (2026-09-15)
+
+`firehose_tls.py --client`: once the load is over and a cut after it exists, libzb through
+its C ABI (SQLite, streaming seed) seeds and follows CDC, and is compared with PostgreSQL
+per batch (count and sum(age): every update adds 1). The scratch nats-server accepts plain
+clients beside TLS (libzb takes no CA); the bridge stays on tls://.
+
+Two things fixed on the way: libzb passed an empty `credsPath` to nats.zig as a file named
+"" (every anonymous open failed with FileNotFound); the harness's `zebridge_enable` call
+now names the tombstone column, which it had reset to NULL after the hand-made catalogue
+row (preflight's new report caught it: a delete guard without a tombstone column).
+
+**100k, 5 minutes.** The client's first seed failed after 31 s (`Timeout`, then
+`StepFailed`). The run's JetStream store, restarted alone, seeded the same client from
+g140's full: 17,000,000 rows in 186 s (inflate 18 s, decode and sort 86 s, apply 76 s),
+CDC drained, and every one of the 301 batches equal to PostgreSQL.
+
+**The failure:** g140's background full was written at 23:19:24, about when the seed
+failed. When a full attaches, `pruneChain` deletes the rows at or below the kept window and
+their objects, the previous full with them: the client was reading it. At 100k a full
+replaces the last every ~46 s and a 17M-row seed takes ~186 s, so a new client can restart
+its seed without end. A replaced full needs a grace period before its objects go (longer
+than a seed of it), or the incremental fulls' base, replaced rarely.
+
+**150k, 256 MiB cap** (`--rate 75000`, `RING_BUFFER_COUNT=200000`, `BASE_BUF=11`):
+
+| | 100k, 128 MiB | 150k, 256 MiB |
+| --- | --- | --- |
+| load (300 s script) | 302 s | 353 s |
+| events published | 99,012/s | 127,089/s |
+| slot lag median / max | 27 / 92 MiB | 65 / 140 MiB |
+| ring full | 0 | 0 |
+| delta rows / build, median | 150,000 / 249 ms | 300,000 / 449 ms |
+| holes | 2 | 1 (g2's size-rule full, 14 s) |
+| background fulls | 9–21 s | 16–31 s |
+| bridge CPU / NATS CPU | 260 / 70 s | 387 / 108 s |
+| bridge RSS median / max | 782 / 1,700 MiB | 1,016 / 2,533 MiB |
+
+The bridge followed PostgreSQL (lag under 140 MiB); PostgreSQL did not follow the script:
+one psql session ran 75k inserts and 75k updates a second in 353 s instead of 300, so the
+rate reached was 127k. The chain held with one hole, the size rule's full again.
+
+The client failed differently: its first seed timed out (the pruned full, above), and every
+retry and every CDC batch after it was refused with StepFailed. The streaming seed's staging
+loop opens `BEGIN` and an error from the object stream left through `try` with no
+`ROLLBACK`: the SQLite connection stayed in the transaction, and every later `BEGIN` on it
+failed. Fixed with an `errdefer` rollback.
+
+**BASE_BUF=10 does not boot on this schema.** The rows are 240 bytes, but the bridge
+publishes each table's schema descriptor through the same event buffer at boot, and
+`zebridge_gc_watermark`'s needs 1,085 bytes: `RowTooLarge`, exit. BASE_BUF=11 boots; the
+floor is the widest descriptor, not the widest row. The README's example with BASE_BUF=10
+would stop the same way on a publication carrying the internal tables.
+
+**A client opened during the load (`--client-at 60`), 100k.** The most useful client run yet.
+It seeded 2,000,000 rows from the boot chain in 13 s, then followed CDC — and ended with
+3,818,110 of 17,000,000 rows, 293 of 301 batches wrong, without one error line.
+
+Two facts behind it:
+
+* **The client applies about 4,500 events a second** where the bridge publishes 98,000. No
+  client follows this rate live; that is what the chain is for, and a lagging client is
+  expected to fall off and re-seed.
+* **`drainStream` does not take the gap.** The poll path has the §10ei rule (the first
+  delivered sequence must be `last + 1`, else the stream pruned under the consumer:
+  re-seed). `sync`'s drain has no such check — it fetches and applies whatever the server
+  hands it, and the server, having pruned, simply continues at its oldest message. The
+  client went on as if nothing was missing. At a rate the drain keeps up with, the hole
+  never appears; at 100k it is certain.
+
+**Fixed, and rerun.** The drain now takes the gap the way the tail does: a batch whose first
+sequence is past the position means the stream pruned under it, so the tables routed to that
+stream are re-seeded from their chains and the drain starts again — three times at most,
+after which the live tail continues (a client slower than the stream's retention would loop
+for ever). The same run again, with the fix:
+
+    fire_types: seeded 2000000 row(s) from chain g1
+    CDC_PUBLIC: 52537 message(s) pruned under the drain (position 3355, delivered 55893)
+    CDC_PUBLIC: re-seeding the tables routed to it, then draining again (1/3)
+    fire_types: seeded 3800000 row(s) …
+    CDC_PUBLIC: pruned under the drain three times — this client applies slower than the
+                stream prunes; the live tail continues from the chain's cutoff
+    fire_types: seeded 17350000 row(s) …
+
+17,000,000 rows, 301 of 301 batches equal to PostgreSQL, caught up 689 s after it opened.
+Two seeds failed with ObjectNotFound on the way (the full replaced while it was read) and
+the retry recovered — the staging rollback above is what lets a retry work at all.
+
+A client applies about 4,500 events a second and a chain seed about 90,000 rows a second
+(17.35M in ~190 s): catching up through a chain is twenty times faster than through CDC, so
+the answer for a client that fell behind is the chain, not the stream. The gap rule is what
+makes it take that answer instead of drifting.
