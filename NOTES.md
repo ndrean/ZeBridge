@@ -13476,3 +13476,26 @@ are not yet pruned to the newest checkpoint nor checkpoints kept to the newest b
 chain therefore carries checkpoints AND the deltas they cover. No client applies a
 checkpoint yet either (the planner plans them, the appliers treat the kind as a delta —
 the fixtures say they must, but no live client has been run against a real one).
+
+**A client on a real checkpointed chain.** `--client` with `ZB_CHECKPOINT_SECONDS=20`, 120 s
+at 4k events/s: the chain ended as a full (g1), three checkpoints (g2, g3, g5) and four
+deltas (g2–g5), and the libzb client seeded from it to 440,000 rows — 121 of 121 batches
+equal to PostgreSQL. It applied 690,000 rows into a 440,000-row table, which is the overlap
+working as designed: a checkpoint and the deltas over the same window carry the same rows,
+and a version-guarded upsert absorbs the repeat. Neither applier needed a change — both
+branch on `kind == "full"` for the wipe and treat anything else as a delta, which is what
+the fixtures say a checkpoint is.
+
+That manifest, put back through the Zig core:
+
+| the client's state | the plan |
+| --- | --- |
+| fresh | full + 3 checkpoints + 4 deltas |
+| at the first checkpoint's cutoff | 3 deltas, no base and no checkpoint |
+| older than the gc watermark | the full again |
+
+The middle row is the point of the whole design: a client that was away a little pays for a
+few deltas, not for the table. The last row is §10gs's first rule doing its job.
+
+Also fixed: the lane's attach line said "background full" whatever it built, so the
+harness counted two checkpoints as fulls. It names the kind now.

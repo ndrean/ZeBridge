@@ -2284,8 +2284,11 @@ pub const GenerationProducer = struct {
         try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from, self.retire_grace_s, self.retire_windows);
         const total_ms = utils.unixMillis() - started_ms;
         self.recordFullBuild(tenant, table, total_ms);
-        log.info("🧬 '{s}'/'{s}': background full attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: full (count+copy+encode+zstd+upload) {d}, dictionary {d}{s}, dictionary upload {d}; deltas kept cutting meanwhile", .{
-            tenant, table, gen_l, newest.gen, full_rows, fo.raw_bytes, fo.z_bytes, if (fo.streamed) " [streamed]" else "", total_ms, query_ms, train_ms, if (dict_kept) " (kept)" else "", upload_ms,
+        log.info("🧬 '{s}'/'{s}': background {s} attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: build (count+copy+encode+zstd+upload) {d}, dictionary {d}{s}, dictionary upload {d}; deltas kept cutting meanwhile{s}", .{
+            tenant, table, kind_str,                        gen_l,           newest.gen, full_rows, fo.raw_bytes, fo.z_bytes,
+            if (fo.streamed) " [streamed]" else "",     total_ms,        query_ms,   train_ms,
+            if (dict_kept) " (kept)" else "",           upload_ms,
+            if (j.kind == .checkpoint) " (window opens at its predecessor's cutoff)" else "",
         });
     }
 
