@@ -112,6 +112,13 @@ pub const GenerationProducer = struct {
     /// maps and the queue. `pair_busy`: a build of the pair holds it (every delta build
     /// whole; the full lane only while it takes its snapshot and while it attaches).
     async_fulls: bool = true,
+    /// §10gq: how long a retired generation's objects survive in the store — longer than
+    /// the slowest client's seed of a full, since a seed holds the object open while it
+    /// applies. The bridge knows its build time, not a phone's apply speed: a setting.
+    retire_grace_s: u64 = config.Generations.default_retire_grace_seconds,
+    /// §10gq: how many retirements are kept at most, whatever the grace says — the storage
+    /// bound, in fulls. The disk filled without it.
+    retire_windows: u32 = config.Generations.default_retire_windows,
     /// §10gl: preflight's edge-writability verdicts. A table the edge writes keeps the
     /// fixed version tolerance under its delta floor: a client's version can trail the
     /// database clock by that much. Null (tests), or a table it does not know: kept too.
@@ -1000,7 +1007,7 @@ pub const GenerationProducer = struct {
         var last_filenode: ?[]const u8 = null;
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape, relid::text, open_xact_floor::text, filenode::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, row_count, del_count, seed_epoch, col_shape, relid::text, open_xact_floor::text, filenode::text FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
@@ -1058,7 +1065,7 @@ pub const GenerationProducer = struct {
         };
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            const res = try queryOne(bkc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full ORDER BY gen DESC LIMIT 1", &params);
+            const res = try queryOne(bkc, "SELECT gen FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) > 0) {
                 last_full_gen = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0;
@@ -1553,7 +1560,7 @@ pub const GenerationProducer = struct {
                 // named an object nobody uploaded — every delta of two eras pointed at
                 // a phantom, and every fresh client failed to seed (§10ed).
                 const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                    "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_p);
+                    "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params_p);
                 defer c.PQclear(res_p);
                 if (c.PQntuples(res_p) > 0 and probe.sizes.len > 0 and c.PQgetlength(res_p, 0, 3) > 0) {
                     const old = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_p, 0, 1)));
@@ -1587,7 +1594,7 @@ pub const GenerationProducer = struct {
             const params_d = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
             // The name is the row's `dict_object` (see the probe above, §10ed).
             const res_d = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &params_d);
+                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params_d);
             defer c.PQclear(res_d);
             if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 2) > 0) {
                 dict_bytes = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
@@ -1635,7 +1642,7 @@ pub const GenerationProducer = struct {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
             const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full, COALESCE(dict_object, '') " ++
-                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 ORDER BY gen", &params);
+                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 AND retired_at IS NULL ORDER BY gen", &params);
             defer c.PQclear(res);
             const n: usize = @intCast(c.PQntuples(res));
             for (0..n) |i| {
@@ -1709,7 +1716,7 @@ pub const GenerationProducer = struct {
         if (build_full) self.recordFullBuild(tenant, table, utils.unixMillis() - build_started_ms);
 
         // ── 6. prune past the chain depth: PG rows (authority), then objects ──
-        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen));
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen), self.retire_grace_s, self.retire_windows);
 
         // The duration is the number the retention contract needs (§10em): the CDC
         // window must cover two cadences AND this, since the cut is taken before the
@@ -1932,8 +1939,8 @@ pub const GenerationProducer = struct {
             defer self.pairRelease(tenant, table);
             {
                 const res = try queryOne(bkc, "SELECT gen, seed_epoch::text, COALESCE(col_shape, ''), COALESCE(relid::text, ''), " ++
-                    "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full), 0) " ++
-                    "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &pair);
+                    "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL), 0) " ++
+                    "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
                 defer c.PQclear(res);
                 if (c.PQntuples(res) == 0) return;
                 gen_l = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch return;
@@ -2010,7 +2017,7 @@ pub const GenerationProducer = struct {
         {
             const probe = try probeFrom(alloc, fo.corpus, 128 * 1024);
             const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL ORDER BY gen DESC LIMIT 1", &pair);
+                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
             defer c.PQclear(res_p);
             if (c.PQntuples(res_p) > 0 and probe.sizes.len > 0 and c.PQgetlength(res_p, 0, 3) > 0) {
                 const old = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_p, 0, 1)));
@@ -2050,9 +2057,9 @@ pub const GenerationProducer = struct {
         const newest: struct { gen: i64, epoch: []const u8, shape: []const u8, relid: []const u8, full: i64, l_exists: bool } = blk: {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr };
             const res = try queryOne(bkc, "SELECT gen, seed_epoch::text, COALESCE(col_shape, ''), COALESCE(relid::text, ''), " ++
-                "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full), 0), " ++
-                "EXISTS (SELECT 1 FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen=$3) " ++
-                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 ORDER BY gen DESC LIMIT 1", &params);
+                "COALESCE((SELECT max(gen) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL), 0), " ++
+                "EXISTS (SELECT 1 FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen=$3 AND retired_at IS NULL) " ++
+                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params);
             defer c.PQclear(res);
             if (c.PQntuples(res) == 0) break :blk .{ .gen = 0, .epoch = "", .shape = "", .relid = "", .full = 0, .l_exists = false };
             break :blk .{
@@ -2096,7 +2103,7 @@ pub const GenerationProducer = struct {
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{keep_from})).ptr };
             const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), COALESCE(dict_object, '') " ++
-                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 ORDER BY gen", &params);
+                "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 AND retired_at IS NULL ORDER BY gen", &params);
             defer c.PQclear(res);
             for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
                 const prev = std.mem.span(c.PQgetvalue(res, @intCast(i), 2));
@@ -2123,7 +2130,7 @@ pub const GenerationProducer = struct {
         try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &out.writer);
         _ = try kv.put(key, out.written(), .{});
 
-        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from);
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from, self.retire_grace_s, self.retire_windows);
         const total_ms = utils.unixMillis() - started_ms;
         self.recordFullBuild(tenant, table, total_ms);
         log.info("🧬 '{s}'/'{s}': background full attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: full (count+copy+encode+zstd+upload) {d}, dictionary {d}{s}, dictionary upload {d}; deltas kept cutting meanwhile", .{
@@ -2692,11 +2699,41 @@ fn hexDecode(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// Prunes a chain's generations at or below `keep_from`: PostgreSQL rows first (the
 /// authority), then their objects, then dictionaries no remaining row names — as the
 /// delta's dictionary (`dict_object`) or as a full's (`full_dict_object`, §10gf).
-fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z: [:0]const u8, table_z: [:0]const u8, table: []const u8, keep_from: i64) !void {
+/// §10gq: retire, then delete. A generation at or below the kept window leaves the
+/// manifest AT ONCE — no new client can plan from it — but its objects stay for
+/// `grace_s`, because a client may be READING them: a seed of a 17M-row full takes about
+/// 190 s while, at 100k events a second, a background full replaced the last one every
+/// ~45 s. Measured before this: two seeds died with ObjectNotFound mid-read, and the
+/// client had to start over (§10gm).
+///
+/// ⚠️ TWO bounds, and both are needed. Keeping only the newest retired window (the first
+/// version) cancelled the grace outright: a background full attaches every ~45 s under the
+/// firehose, so each retirement deleted the last and a 190 s seed still lost its objects.
+/// Keeping everything within the grace (the second) filled the disk — thirteen fulls at a
+/// 600 s grace, nats-server logging "Critical write error: no space", seeds failing for
+/// want of a store rather than an object. So: the newest `keep_windows` retirements, none
+/// older than `grace_s`. The protection a client actually gets is whichever binds first
+/// — min(grace, windows x replacement interval) — and the storage is bounded at
+/// `keep_windows` fulls. A pair that replaces its full every few seconds is the case
+/// incremental fulls remove: a base is replaced rarely, and then the grace alone binds.
+fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z: [:0]const u8, table_z: [:0]const u8, table: []const u8, keep_from: i64, grace_s: u64, keep_windows: u32) !void {
     if (keep_from <= 0) return;
     const keep_z = try utils.allocPrintZ(alloc, "{d}", .{keep_from});
-    const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_z.ptr };
-    const res = try GenerationProducer.queryOnePub(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen <= $3 RETURNING gen, COALESCE(dict_object, ''), COALESCE(full_dict_object, '')", &params);
+    {
+        const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_z.ptr };
+        const res = try GenerationProducer.queryOnePub(bkc, "UPDATE public.zebridge_generations SET retired_at = now() " ++
+            "WHERE tenant=$1 AND tbl=$2 AND gen <= $3 AND retired_at IS NULL", &params);
+        c.PQclear(res);
+    }
+    // Gone: past the grace, or superseded by a newer retirement (the one-window bound).
+    const grace_z = try utils.allocPrintZ(alloc, "{d}", .{grace_s});
+    const windows_z = try utils.allocPrintZ(alloc, "{d}", .{keep_windows});
+    const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, grace_z.ptr, windows_z.ptr };
+    const res = try GenerationProducer.queryOnePub(bkc, "DELETE FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND retired_at IS NOT NULL " ++
+        "AND (retired_at < now() - ($3 || ' seconds')::interval " ++
+        "     OR retired_at NOT IN (SELECT DISTINCT retired_at FROM public.zebridge_generations " ++
+        "                           WHERE tenant=$1 AND tbl=$2 AND retired_at IS NOT NULL ORDER BY retired_at DESC LIMIT $4)) " ++
+        "RETURNING gen, COALESCE(dict_object, ''), COALESCE(full_dict_object, '')", &params);
     defer c.PQclear(res);
     const pruned: usize = @intCast(c.PQntuples(res));
     if (pruned == 0) return;

@@ -655,6 +655,16 @@ pub const Generations = struct {
     /// Generations kept per (tenant, table) — the delta chain depth k. Coupled to the
     /// sweeper by the correctness inequality: sweeper retention ≥ k × cadence.
     pub const default_chain_depth: u32 = 6;
+    /// §10gq: a generation the chain no longer names keeps its OBJECTS this long, because
+    /// a client may be reading them — a 17M-row seed runs about 190 s while, under a
+    /// firehose, a background full replaced the last one every ~45 s. One retired window
+    /// per pair is kept, so the cost is one full and its deltas.
+    pub const default_retire_grace_seconds: u64 = 600;
+    /// §10gq: the storage bound on the above, counted in retirements (so, in fulls). Four
+    /// covers a seed several times over at a sane cadence; under a firehose that replaces
+    /// its full every few seconds, this is what binds, and that is deliberate — the disk
+    /// filled when only the grace did.
+    pub const default_retire_windows: u32 = 4;
     /// §10ge: a full owed only to the depth rotation waits while its pair's stream is
     /// short of time, but no longer than `depth × full_defer_factor` generations after
     /// the last full: the chain a returning client applies stays bounded.
@@ -711,6 +721,10 @@ pub const RuntimeConfig = struct {
     /// §10gf: GENERATION_ASYNC_FULLS (default on) — build the depth rotation's full in
     /// a background lane while deltas keep cutting, and attach it behind them.
     generation_async_fulls: bool = true,
+    /// §10gq: seconds a retired generation's objects stay in the store (GENERATION_RETIRE_GRACE_SECONDS).
+    generation_retire_grace_seconds: u64 = Generations.default_retire_grace_seconds,
+    /// §10gq: retirements kept at most (GENERATION_RETIRE_WINDOWS).
+    generation_retire_windows: u32 = Generations.default_retire_windows,
     /// §10fk: the mutation ingress rate limit, writes per second per principal (and
     /// per tenant); 0 is off. `mutation_rate_burst` is the bucket's size — what a
     /// client may send at once after a quiet spell; 0 means one second's worth.

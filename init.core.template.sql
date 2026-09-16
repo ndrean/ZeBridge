@@ -692,6 +692,11 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS full_dict_objec
 -- transaction already open when the cut was read. The floor is the start of the oldest
 -- of those (or the cut itself), and the next delta reads `version >= floor`.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS open_xact_floor timestamptz;
+-- §10gq: when this generation left the manifest. Its objects stay in the store for
+-- GENERATION_RETIRE_GRACE_SECONDS after it, because a client may be READING them: a seed
+-- of a big full takes minutes while a busy pair replaces its full every few seconds. One
+-- retired window per pair is kept — the newest — so the cost is one full and its deltas.
+ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS retired_at timestamptz;
 -- §10gl: the table's relfilenode at the cut. TRUNCATE changes it (transactionally, so the
 -- snapshot sees it exactly); on a guarded table it replaces count(*) as the sign that rows
 -- went without a DELETE.
@@ -720,7 +725,7 @@ GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER
 -- a full and which dictionary goes with it. The background full lane attaches a full to an
 -- existing generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the
 -- counts, the epoch, the shape) stays unwritable once inserted.
-GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
+GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
 
 -- §10gl: the start of the oldest transaction open in this database, for the generation
 -- producer's delta floor. pg_stat_activity hides other roles' sessions from the reader

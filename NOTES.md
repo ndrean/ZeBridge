@@ -13339,3 +13339,35 @@ ceiling moved to between 40k and 60k. libzb still follows 60k. Both remain per-e
 appliers: the bulk path each of them already uses for chain chunks (libzb's `ChainStep`,
 the TS `json_each` apply) is the next lever, and the only one left that can reach the
 chain's own ~90,000 rows/s.
+
+## 10gq. A replaced generation keeps its objects for a while (2026-09-16)
+
+§10gm's finding: when a full attaches, `pruneChain` deleted the rows at or below the kept
+window AND their objects in one pass — while a client was reading them. At 100k events a
+second a full is replaced every ~45 s and a 17M-row seed takes ~190 s, so seeds died with
+`ObjectNotFound` and started over, twice in one run.
+
+Now the prune RETIRES: `retired_at = now()` on those rows, so the manifest stops naming them
+at once (every chain read excludes retired rows — the last generation, the last full, the
+dictionary lookups, the deltas list), and the objects are deleted later. Two bounds, both
+learnt the hard way:
+
+* **Keep only the newest retired window** (the first version): the grace was cancelled
+  outright. Each retirement deleted the previous one, so at 45 s of churn a 190 s seed still
+  lost its objects. The bookkeeping looked exactly as designed — 6 live generations, 1
+  retired — while giving a client 45 s of protection.
+* **Keep everything inside the grace** (the second): the disk filled. Thirteen fulls at a
+  600 s grace, `nats-server` logging `Critical write error: no space` and refusing to create
+  consumers; seeds then failed for want of a store. (46 GB of my own `ZB_KEEP` run
+  directories had made the machine's margin thin — deleted.)
+
+So both: the newest `GENERATION_RETIRE_WINDOWS` retirements (default 4), none older than
+`GENERATION_RETIRE_GRACE_SECONDS` (default 600). What a client gets is whichever binds
+first; what the store pays is bounded in fulls. Under a firehose the window count binds, and
+that is the point — the case where a full is replaced every few seconds is the one
+incremental fulls remove.
+
+**Measured** (120 s at 100k events/s on 2M preloaded rows, a client opening 20 s in, 8M rows
+at the end): 0 ObjectNotFound, 0 StepFailed, 121 of 121 batches equal to PostgreSQL, the
+client caught up 268.7 s after it opened. Before the change, the same shape of run lost its
+seed twice.

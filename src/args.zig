@@ -82,6 +82,7 @@ const usage =
     \\                        sweeper's tombstone retention.
     \\  GENERATION_CHAIN_DEPTH  generations kept per pair (default: 6)
     \\  GENERATION_ASYNC_FULLS  build the depth rotation's full in the background while deltas keep cutting (default: true)
+    \\  GENERATION_RETIRE_GRACE_SECONDS  how long a retired generation's objects stay readable for a client mid-seed (default: 600)
     \\  GENERATION_DEFER_FULLS  wait with the depth rotation's full while the stream is short of time (default: true)
     \\  GENERATION_WORKERS    builders for the early cuts of bursting streams
     \\                        (default: 1). More re-cut those pairs in parallel,
@@ -554,6 +555,11 @@ pub const Args = struct {
         if (init.minimal.environ.getPosix("GENERATION_DEFER_FULLS")) |v| {
             runtime_config.generation_defer_fulls = !(std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false"));
         }
+        // §10gq: a retired generation's objects outlive the manifest by this much, so a
+        // client reading one is not cut off mid-seed. Must exceed the slowest client's
+        // seed of a full; 0 restores the old behaviour (delete with the manifest swap).
+        runtime_config.generation_retire_grace_seconds = envUint(u64, init, "GENERATION_RETIRE_GRACE_SECONDS", config.Generations.default_retire_grace_seconds, 0, 86_400);
+        runtime_config.generation_retire_windows = envUint(u32, init, "GENERATION_RETIRE_WINDOWS", config.Generations.default_retire_windows, 1, 64);
         runtime_config.fleet_poll_seconds = envUint(u64, init, "FLEET_POLL_SECONDS", config.Fleet.default_poll_seconds, config.Fleet.min_poll_seconds, config.Fleet.max_poll_seconds);
         runtime_config.fleet_ttl_seconds = envUint(u64, init, "FLEET_TTL_SECONDS", config.Fleet.default_ttl_seconds, config.Fleet.min_ttl_seconds, config.Fleet.max_ttl_seconds);
         runtime_config.slot_inventory_seconds = envUint(u64, init, "SLOT_INVENTORY_SECONDS", config.WalMonitor.default_slot_inventory_seconds, config.WalMonitor.min_slot_inventory_seconds, config.WalMonitor.max_slot_inventory_seconds);
