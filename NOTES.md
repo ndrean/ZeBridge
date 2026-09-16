@@ -13272,3 +13272,28 @@ that heal.
       stream whose tables are NOT covered stays blocked and retries).
 - [ ] Then re-run this ladder: the expectation is 40k and 60k with no gaps, and a graceful
       fall-behind at 100k like libzb's.
+
+**Fixed, in two steps — the second is the lesson.** The heal itself is libzb's: a gap
+healed by this pass resumes at `first_seq - 1`, which cannot skip a message the stream
+still holds. Written that way it removed the livelock (3,737 gaps → 10 at 40k) and broke
+correctness at 60k and 100k: 1,081,522 of 1,800,000 rows, 32 batches wrong. The first guard
+asked "is this table seeded?", and a table seeded long ago from a chain older than the hole
+certifies nothing about the messages the stream dropped — moving the position past them
+loses those rows for good. The guard has to ask for COVERAGE: the chain just applied must
+reach at or past `first_seq - 1` (libzb's predates-the-stream guard). A chain with no
+`cutoff_seq` at all — cut while the stream was empty, which is exactly the boot chain this
+client kept re-seeding — proves nothing and leaves the stream blocked until the producer
+cuts a newer one. A blocked stream now also backs off (250 ms doubling to 5 s) instead of
+re-opening the tail into the same hole.
+
+| load | before | heal without coverage | heal with coverage |
+| --- | --- | --- | --- |
+| 40k/s | 3,737 gaps, correct | 10 gaps, correct | 9 gaps, 1,200,000 rows, correct |
+| 60k/s | 6,829 gaps, correct | 13 gaps, **32 batches wrong** | 13 gaps, 1,800,000 rows, correct |
+| 100k/s | 7,550 gaps, correct | 67 gaps, **53 batches wrong** | 15 gaps, 3,000,000 rows, correct |
+
+So both clients now behave the same way under a firehose they cannot follow: they fall
+behind, take the gap, re-seed from a chain that covers it, and end equal to PostgreSQL.
+zb-client-ts follows live to 20k events a second on this Mac (0 gaps); libzb to 60k. The TS
+apply path is the slower of the two and has never been optimised — the same per-event shape
+as libzb's, one statement at a time.

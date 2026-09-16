@@ -256,6 +256,9 @@ export class ZeBridge {
   private dialect!: Dialect;
 
   private syncedTables = new Map<string, TableState>();
+  /// §10go: how long to wait before re-opening a tail on a stream whose gap could not be
+  /// healed (no chain past the hole yet). Doubles while it stays blocked, cleared once healed.
+  private gapBackoffMs = 0;
   private failed = new Set<string>();
   private suspendedMap = new Map<string, string>();
   private globalSyncState: { lsn: number; seq: Record<string, number> } = { lsn: 0, seq: {} };
@@ -2422,17 +2425,61 @@ export class ZeBridge {
           // oldest, and the live gap rule reads that as a fresh hole: re-seed,
           // resume, hole, three gap passes in a minute on the wall.
           let healedGap = false;
-          if (stored0 > 0 && seedFloors.length) {
-            try { healedGap = stored0 < ((await jsm.streams.info(streamName))?.state?.first_seq ?? 0) - 1; } catch { /* keep the position */ }
+          let firstSeq = 0;
+          if (stored0 > 0) {
+            try {
+              firstSeq = (await jsm.streams.info(streamName))?.state?.first_seq ?? 0;
+              healedGap = firstSeq > 0 && stored0 < firstSeq - 1;
+            } catch { /* keep the position */ }
           }
-          if (floor > stored0 && (stored0 === 0 || healedGap)) {
+          // §10go: the seeds' floor can be BELOW the stream's oldest message. A chain cut
+          // while the stream was empty carries no cutoff_seq at all, so `floor` is 0 and
+          // the position never rises: the tail reopens under the hole, the live gap rule
+          // fires on the next message, and the client re-seeds again — measured at 40k
+          // events a second as 7,550 re-seeds in one 60 s run with the position frozen at
+          // 250, the replica standing still until the load stopped (libzb heals this in
+          // §10ei). `first_seq - 1` cannot skip a message the stream still holds, so a
+          // healed gap takes whichever is higher — but only when every table routed here
+          // is seeded, so a table still waiting for its chain keeps the stream blocked
+          // and the next pass retries it.
+          // ⚠️ The guard is COVERAGE, not "seeded at some point". A table seeded long ago
+          // from a chain whose cutoff is below the hole certifies nothing about the
+          // messages the stream dropped: moving the position past them then loses rows
+          // for good — measured, on the first version of this heal, as 1,081,522 of
+          // 1,800,000 rows at 60k events a second, 32 batches wrong. The chain just
+          // applied must reach at or past `first_seq - 1` (libzb's predates-the-stream
+          // guard). A chain with no cutoff_seq at all — cut while the stream was empty —
+          // proves nothing and blocks the stream until the producer cuts a newer one.
+          let blockedHere = false;
+          if (healedGap) {
+            for (const table of this.syncedTables.keys()) {
+              const t = this.effectiveTenantFor(table);
+              if (t === null) continue;
+              const route = this.cdcStreamForTenant(t);
+              const pub = this.config.grammar.cdc_streams?.public;
+              const here = route === streamName || (route !== pub && pub === streamName);
+              if (!here) continue;
+              const st = this.syncedTables.get(table);
+              const covered = typeof st?.seedSeq === 'number' && st.seedSeq >= firstSeq - 1;
+              if (this.failed.has(table) || !covered) blockedHere = true;
+            }
+            if (blockedHere) {
+              this.appendLog('SYS', `${streamName}: the gap stays open — no chain past the stream's oldest message (${firstSeq}) yet; waiting for the producer's next generation`, 'WARNING');
+            }
+          }
+          // A blocked gap retries on the next pass, not in a tight loop: without a pause
+          // the tail re-opens, meets the same hole and re-seeds immediately (§10go).
+          this.gapBackoffMs = blockedHere ? Math.min(5_000, (this.gapBackoffMs || 250) * 2) : 0;
+          const healTo = healedGap && !blockedHere ? Math.max(floor, firstSeq - 1) : floor;
+          if (healTo > stored0 && (stored0 === 0 || (healedGap && !blockedHere))) {
+            if (healedGap) this.appendLog('SYS', `${streamName}: gap healed — resuming at ${healTo} (was ${stored0}, stream holds from ${firstSeq})`, 'INFO');
             // Only when we hold NO position, or a position the stream no longer
             // holds: a live position must never jump forward past unconsumed messages.
-            this.globalSyncState.seq[streamName] = floor;
+            this.globalSyncState.seq[streamName] = healTo;
             await this.run(
               `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
                ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
-              streamName, floor,
+              streamName, healTo,
             );
           }
         } catch { /* stream info unavailable — the per-batch persist still covers it */ }
@@ -2653,7 +2700,11 @@ export class ZeBridge {
             // loop ends — two tails on one stream would race the position.
             if (!this.resyncing) {
               this.resyncing = true;
-              void this.subscribeStreams().catch(() => {}).finally(() => { this.resyncing = false; });
+              const wait = this.gapBackoffMs;
+              void (async () => {
+                if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+                await this.subscribeStreams();
+              })().catch(() => {}).finally(() => { this.resyncing = false; });
             }
             break;
           }
