@@ -13650,3 +13650,171 @@ of a 590 MB delta are gone, and with them the reason a VPS needed gigabytes.
 
 `incremental.py` 12/12 against streamed deltas: a client reads them exactly as before,
 which is the point — the object is the same document, written differently.
+
+## 10gy. The sweeper's window follows the chain's levels (2026-09-17)
+
+The boot and the doctor asked whether `GC_THRESHOLD_MS` outlived `depth × cadence`.
+With checkpoints on that is the wrong window: a client's catch-up rests on a checkpoint,
+which holds every delete of its window only while no tombstone inside it can have been
+reaped. The promise is now `2 × GENERATION_CHECKPOINT_SECONDS` (doubled so the build
+that follows a window still lands inside the threshold), and `depth × cadence` only when
+the middle level is off. Two silent couplings are checked in both places: checkpoints
+asked for with `GENERATION_ASYNC_FULLS` off (the lane cuts them, so none is ever
+written, and retention keeps every delta waiting for one — a finding), and a checkpoint
+window under two cadences (a warning). Proven with the doctor over five configurations
+and the boot over three.
+
+## 10gz. The mirrors reconcile both ways at boot; a row no stream can carry is dropped (2026-09-17)
+
+`$KV.tenants` and `$KV.schemas` were reconciled additively at boot: what exists was
+published, what had vanished stood for ever. A membership deleted, or a table dropped,
+while no bridge read the WAL — a stopped bridge, a restarted feed — left its key behind:
+a revoked principal kept resolving its old tenant, and every client kept a dropped table
+and waited on a chain that would never be built (53 such keys on the dev stack). Boot
+now purges memberships the roster does not back and tombstones schema keys whose table
+`to_regclass` cannot find. Both existence checks passed `$1` untyped to `format`, whose
+arguments are VARIADIC "any": the statement failed and the §10dj guard fell through,
+republishing the descriptor of a table that no longer existed — `$1::text`, like every
+other call site.
+
+Two rows no stream binds killed the bridge by WAL replay after a restart: a table with
+no route as the catalogue is NOW rendered the bare `cdc.<table>.<op>`, and a
+tenant-scoped row with no tenant value was "quarantined" to an `.unrouted` subject.
+The publisher got no response, read it as a lost connection, retried, and the batch
+publisher stopped the bridge — every table's replication, for one row. Both are refused
+or quarantined AND dropped now, with the audit line kept. A failed publish names its
+subject.
+
+## 10ha. Running the battery: the conditions, learned the hard way (2026-09-17)
+
+The whole battery was replayed for the first time in weeks — 78 scenarios, three
+groups — and most of the first day's reds were the harness, the builds or the dev stack,
+not the bridge. What must be true before a result means anything, in the order it bites:
+
+1. **ReleaseFast, both binaries.** `zig build` defaults to Debug and overwrites
+   `zig-out/bin/bridge`; so does libzb's. Before any scenario:
+   `zig build -Doptimize=ReleaseFast` at the root AND in `libzb/`. A Debug bridge builds
+   a chain in ~750 ms where ReleaseFast takes a few, and timing scenarios fail for no
+   reason. Check the sizes: bridge ~4.4 MB, `libzbcore.dylib` ~2.1 MB; 11 MB / 7 MB is
+   Debug.
+
+2. **The environment.** `set -a && . ./.env.bridge && set +a` and
+   `export BRIDGE_CDC_PUBLICATION=my_pub`. `offline/render` alone also needs
+   `.env.admin` and `eval "$(python3 scripts/zb-derive-env.py)"` (TARGET_DB). The
+   long-running bridge for `live` listens on `.env.bridge`'s `BRIDGE_PORT` (27434) —
+   not 9090 — with `GENERATIONS_ENABLED=1`.
+
+3. **PostgreSQL on up.sh's flags.** Three scenarios stop and restart the cluster
+   (`pg_restart`, `matrix`, `sweeper_restart`); they read `PG_FLAGS` from
+   `scripts/native/up.sh` now (`zb.pg_opts()`), where they used to carry their own stale
+   copy and left the cluster on 128 MB of shared_buffers for everything after. Verify
+   with `SELECT name, setting, source FROM pg_settings WHERE name IN ('shared_buffers',
+   'max_wal_size', 'wal_compression')` — `source = command line`, 4 GB / 16 GB / zstd.
+
+4. **The slots.** `owns` runs with the long-running bridge stopped, and an idle
+   `my_slot` does not survive an hour of battery WAL under up.sh's deliberate
+   `max_slot_wal_keep_size = 10GB`. After `owns`: `bridge --drop-slot my_slot`, then boot
+   once with `ZB_FEED_RESTART=1` (every client re-seeds). `zb_probe` is the probes' own
+   slot; run.py drops it, inactive, around each group — before that, `check.py` reported
+   it as the orphan it was, the one red in an otherwise green live group.
+
+5. **Order and bridge state.** `offline` (no stack) → `live` (the long-running bridge
+   up) → `owns` (no bridge at all: every owns scenario starts its own on `zb_probe`,
+   port 9096, and refuses to run beside another — the guard matches
+   `zig-out/bin/bridge( |$)`; the old `…bridge$` matched only a bridge started with no
+   arguments, which is none of them, and `ratelimit` measured "no rate limit" against
+   two bridges drinking from one workqueue). About 50 minutes in all: offline seconds,
+   live ~10 (client_gap alone is 260 s), owns ~40.
+
+6. **What is NOT residue.** The `c_<geohash>` tenants are the map example's cells
+   (§10fo), not junk; deleting them revokes `mapper`. Everything else that accumulates —
+   `$KV.schemas` keys for dropped fixtures, `$KV.tenants` keys for gone principals,
+   `zebridge_ddl_events` rows wider than the event buffer — is now cleaned by the
+   teardowns (`zb.forget_table`) and by the next boot (§10gz).
+
+7. **Things that look like bridge bugs and are not.** `fleet.py` deletes the `live`
+   KV bucket on purpose and expects the bridge to recreate it. The `nats-server.pid`
+   file goes stale after `chaos`/`nats_outage`/`matrix` restart the server
+   (`revoke_midseed` verifies the pid is alive, else finds it). A publication column
+   list is changed with `DROP TABLE` + `ADD TABLE t (cols)` — `ALTER PUBLICATION … SET
+   TABLE t (cols)` REPLACES the whole table list, which emptied `my_pub` and voided a
+   full run. `import`ing a scenario module runs it — check syntax with `py_compile`. And
+   never wait on a scenario with `pgrep -f <its file name>`: a `bash -c "…"` whose
+   command line names the file is itself a match, so a waiter sees the scenario as
+   running for ever, and a chained "run B after A" built that way never starts B —
+   twice on 2026-09-17, once reporting a result from the run BEFORE a fix as if it were
+   after. Chain runs with `;` in one shell and read the runner's pid or its log.
+
+8. **Read the reds against the logs, not the summaries.** Every probe writes its bridge
+   log under `$TMPDIR` (not `/tmp`), the scenario's own log under
+   `$TMPDIR/zb-scenario-<name>.log`, and a second bridge to `….2.log`. The client's
+   prints (libzb's `std.debug.print`, the Node worker's `[SYS]` lines) are in the
+   scenario log; that is where "seeded 0 row(s) from chain g14" and "position 3 reset"
+   live.
+
+Where it stood at the end of 2026-09-17: offline 8/8, live 28/29, owns 36/41 on the
+restored stack — and the five owns reds each turned out real (`stream_wipe`'s gate
+anchored to a pre-restart `cutoff_seq`, its restart detection blind once the new stream
+outgrew the old position, and a dead tail kept after a recreate; `rebase_stale`'s Node
+hold that never released when the winner had arrived before the write; `write_stale`
+pinned to a flush that no longer sends; `column_flood`'s republished descriptor
+deduplicated against the boot one; `revoke_midseed`'s dead pid). Their fixes are §10hb.
+
+## 10hb. The six reds, each real, each fixed (2026-09-18)
+
+What §10ha's replay left: five owns reds and one live red. Every one was a defect —
+three in the clients, two in the bridge, one in a scenario — and every one now passes
+on the final build, most of them re-run twice.
+
+**`stream_wipe` — three client defects, both clients.** A CDC stream deleted and
+recreated restarts its numbering, and the client's "third gap shape" (§10bm, `stored >
+last_seq`) can only notice that while the new stream is still shorter than the old
+position — once it has refilled past it, the client reads on as if nothing happened and
+skips the new stream's first rows. Now the stream's `created` is persisted beside the
+position (`_zbz_stream_seq.created`, `_zebridge_stream_seq.created`) and a different
+one under the same name is a restart whatever the numbers say. Second: the reset kept
+the seed gate's anchor, the pre-wipe manifest's `cutoff_seq` on the OLD numbering, and
+every event of the new stream (all below it) was dropped as "in the chain" — replica 1
+row, PostgreSQL 13. The producer now writes `cdc_stream_created` into the manifest
+beside `cutoff_seq` (it already holds the stream info at that moment), and a client
+gates on `cutoff_seq` only while it reads that incarnation; a manifest cut before the
+recreate seeds but gates nothing, and the log says so ("chain g27 was cut on a
+previous incarnation of CDC_acme"). Third: the tail's consumer, dead with the old
+stream, stayed cached — dropped on the reset now. PROTOCOL §6 carries the field.
+
+**`rebase_stale` — TypeScript.** Node held a stale edit for a rebase and waited for
+"the winner to be here" by the local row's version — but its own optimistic apply had
+just stamped that row with the slow clock's older version, and the winner that had
+arrived BEFORE the write could never raise it again. The pre-write row's version counts
+now (§10do); libzb's same-shape rebase was fine because its winner arrives after.
+
+**`column_flood` — bridge.** The boot descriptor's `Nats-Msg-Id` is
+`schema-boot-<table>-<boot lsn>`; the catalogue reload republishes through the same
+pass, and with no WAL written since boot the head is the same LSN — so the descriptor
+carrying the bumped seed epoch, the one telling every client to re-seed, was dropped by
+JetStream as a duplicate of the boot one. `$KV.schemas` said epoch 0 while the catalogue
+said 1, on both clients. The id carries the epoch now, and the scenario reads the epoch
+back from the KV at §3 so this cannot regress silently.
+
+**`write_stale` — scenario, twice.** libzb sends at mutate time (one path for every
+send), so the flush after it reports `sent 0`; the scenario pinned `sent 3` from the
+era when the flush did the sending. Then its after-node INSERT minted two different
+uuids for key and row, which the client's key guard rightly refuses — a latent bug the
+old failure had always masked.
+
+**`collist` — scenario, and a bridge improvement it exposed.** Its teardown never
+deleted the catalogue row, so the next run's `zebridge_enable` changed nothing — "0
+table(s) changed" — no republish, no kick, and the first chain waited for the 300 s
+cadence while the scenario waited 120 s ("no chain yet (globex)"). The teardown deletes
+the row; and the reload now kicks the producer for a newly declared table, not only for
+a moved epoch, so a table enabled on a running bridge has its first chain within
+seconds instead of a cadence. Running as the bridge, not a client: the audit reads every
+tenant's chain.
+
+**`check` — harness.** The orphan `zb_probe` slot it reported was ours to clean;
+run.py drops it, inactive, around each group.
+
+Two traces stay in libzb from the chase, cheap and rare: the tail consumer's name and
+start sequence when it opens, and a line when a descriptor carries an older seed epoch
+than the replica was seeded under.
+

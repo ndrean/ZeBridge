@@ -943,6 +943,7 @@ client can tell "empty" from "not built yet".
   "bucket": "gen-acme",
   "cutoff_seq": 9812774,
   "cdc_stream": "CDC_acme",
+  "cdc_stream_created": "2026-09-17T05:12:40.118Z",
   "gc_watermark": "2026-09-17 06:31:02.114+00",
   "cutoff_version": "2026-09-17 07:44:51.201+00",
   "cutoff_lsn": "5/E018960",
@@ -974,6 +975,7 @@ client can tell "empty" from "not built yet".
 | `cutoff_lsn` | its lsn |
 | `gc_watermark` | the sweeper's floor: nothing soft-deleted before this is still guaranteed to exist (§7.5). It travels in the manifest because a returning client's own copy of the watermark row is as old as the client — the first planning rule needs the current one. |
 | `cutoff_seq` + `cdc_stream` | the splice point: that stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction begins |
+| `cdc_stream_created` | the `created` timestamp of the stream incarnation `cutoff_seq` was read on. A client gates CDC events on `cutoff_seq` only while it reads that incarnation: a stream deleted and recreated restarts its numbering, and a manifest cut before that must seed but gate nothing until a newer generation |
 
 Everything at or below `cutoff_seq` on that stream is in the chain; everything above it is
 not. The direction is overlap-never-gap: a transaction still in flight when the chain was

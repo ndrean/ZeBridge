@@ -193,6 +193,14 @@ pub const SyncClient = struct {
     /// §10fk: a `rate_limited` verdict names `retry_after_ms`; the outbox is not
     /// flushed before then. The write stays queued, exactly as after `failed`.
     hold_until_ms: i64 = 0,
+    /// Streams the gap rule found RESTARTED (position beyond last_seq, NOTES §10bm's
+    /// third shape) and no manifest has re-anchored on since. While a stream is here, a
+    /// manifest whose `cutoff_seq` is beyond the stream's last_seq was cut on the previous
+    /// numbering and must not gate: its seq means nothing on this stream. Measured
+    /// (stream_wipe.py, 2026-09-17): the position was reset but the seed gate kept the
+    /// old anchor (163), and every event of the recreated stream (seq 3–14) was dropped
+    /// as "in the chain" — replica 1 row, PostgreSQL 13.
+    restarted: std.StringHashMapUnmanaged(void) = .empty,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
     /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
     /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
@@ -840,6 +848,12 @@ pub const SyncClient = struct {
             try self.applyDescriptor(a, table, val);
         }
         try execDdl(&self.st, "CREATE TABLE IF NOT EXISTS _zbz_stream_seq (stream TEXT PRIMARY KEY, last_seq INTEGER NOT NULL)");
+        // The stream's identity beside its position (§10bm's third shape, made exact): a
+        // position is only meaningful on the stream it was taken on, and `stored >
+        // last_seq` can only notice a restart while the new stream is still shorter
+        // than the old position. A replica from before this column has NULL and learns
+        // the identity on its next sync.
+        execDdl(&self.st, "ALTER TABLE _zbz_stream_seq ADD COLUMN created TEXT") catch {};
         try ensureInbox(&self.st);
         try self.ensureGenerations(a);
         try ensureShape(&self.st);
@@ -985,7 +999,10 @@ pub const SyncClient = struct {
             return;
         }
         const stored: i64 = if (rows[0][0] == .integer) rows[0][0].integer else 0;
-        if (stored >= epoch) return;
+        if (stored >= epoch) {
+            if (stored > epoch) std.debug.print("{s}: descriptor carries seed epoch {d}, the replica was seeded under {d} — nothing to do\n", .{ table, epoch, stored });
+            return;
+        }
         _ = try self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }});
         std.debug.print("{s}: seed epoch {d} -> {d} (zebridge_reseed) — watermark dropped, re-seeding from a fresh full\n", .{ table, stored, epoch });
         self.reseed_pending = true;
@@ -1060,6 +1077,20 @@ pub const SyncClient = struct {
         return @intCast(rows[0][0].integer);
     }
 
+    /// The `created` timestamp of the stream this position was taken on, or null for a
+    /// stream never seen (or a replica from before the column).
+    fn storedCreated(self: *SyncClient, a: std.mem.Allocator, stream: []const u8) !?[]const u8 {
+        const rows = try self.st.query(a, "SELECT created FROM _zbz_stream_seq WHERE stream = ?", &.{.{ .text = stream }});
+        if (rows.len == 0 or rows[0][0] != .text) return null;
+        return rows[0][0].text;
+    }
+
+    fn persistCreated(self: *SyncClient, stream: []const u8, created: []const u8) !void {
+        var qa = std.heap.ArenaAllocator.init(self.a);
+        defer qa.deinit();
+        _ = try self.st.query(qa.allocator(), "INSERT INTO _zbz_stream_seq (stream, last_seq, created) VALUES (?, 0, ?) ON CONFLICT(stream) DO UPDATE SET created = excluded.created", &.{ .{ .text = stream }, .{ .text = created } });
+    }
+
     fn persistSeq(self: *SyncClient, stream: []const u8, seq: u64) !void {
         var qa = std.heap.ArenaAllocator.init(self.a);
         defer qa.deinit();
@@ -1098,17 +1129,35 @@ pub const SyncClient = struct {
             const first: i64 = @intCast(info.value.state.first_seq);
             const last: i64 = @intCast(info.value.state.last_seq);
             const stored: i64 = @intCast(try self.storedSeq(stream));
-            if (core.streamHasGap(first, stored, last)) {
+            // The stream's identity: a different `created` under the same name is a
+            // stream recreated (a wipe, a lost slot) — a restart whatever the numbers say.
+            // Measured (stream_wipe.py, 2026-09-17): position 1, the recreated stream
+            // already at last_seq 2, `stored > last_seq` never fired, and the client read
+            // on from 2 — one row of the new numbering skipped for ever.
+            const created: []const u8 = info.value.created;
+            const known_created = try self.storedCreated(a, stream);
+            const recreated = if (known_created) |kc| (created.len > 0 and !std.mem.eql(u8, kc, created)) else false;
+            if (core.streamHasGap(first, stored, last) or recreated) {
                 try gapped.put(a, stream, first);
                 // The feed restarted under us (position beyond last_seq): the position is
                 // meaningless in the new numbering. Reset it, or `fullPredates` reads the
                 // fresh chain's small cutoff_seq as "older than where I am" and skips the
                 // very full this gap needs (measured: slot_loss.py, 2026-08-29).
-                if (last >= 0 and stored > last) {
-                    std.debug.print("{s}: stream restarted (position {d} beyond last_seq {d}) — position reset\n", .{ stream, stored, last });
+                if (recreated or (last >= 0 and stored > last)) {
+                    if (recreated) {
+                        std.debug.print("{s}: stream recreated (created {s}, was {s}) — position {d} reset\n", .{ stream, created, known_created.?, stored });
+                    } else {
+                        std.debug.print("{s}: stream restarted (position {d} beyond last_seq {d}) — position reset\n", .{ stream, stored, last });
+                    }
                     try self.persistSeq(stream, 0);
+                    if (!self.restarted.contains(stream)) try self.restarted.put(self.aa(), try self.aa().dupe(u8, stream), {});
+                    // The tail's consumer died with the old stream; `tailFor` would keep
+                    // handing back the cached, dead one and every fetch would answer
+                    // nothing. Drop it — the next poll opens one from the reset position.
+                    self.dropTail(stream);
                 }
             }
+            if (created.len > 0 and (known_created == null or recreated)) try self.persistCreated(stream, created);
         }
         // Seed with foreign_keys OFF — the standard bulk-load shape, and the same
         // one the TS client uses (dialect.deferForeignKeys + foreignKeyViolations).
@@ -1583,11 +1632,35 @@ pub const SyncClient = struct {
         // deployment; a size valve, a purge or a too-short age breaks it, and then the
         // honest move is to wait for the producer's next generation, polled each turn.
         const cutoff_seq: i64 = if (man.object.get("cutoff_seq")) |v| (if (v == .integer) v.integer else 0) else 0;
+        // The incarnation of the stream this manifest was cut on (its `created`); absent
+        // in manifests from before the field.
+        const man_created = if (man.object.get("cdc_stream_created")) |v| (if (v == .string) v.string else "") else "";
+        // What the seed gate may anchor on: the manifest's cutoff_seq — but only on the
+        // stream incarnation it was cut on. A manifest naming another incarnation was
+        // cut before a recreate: its seq means nothing here and gates nothing. Without
+        // the field, the `restarted` heuristic (cutoff beyond last_seq) stands in.
+        var gate_seq: i64 = cutoff_seq;
         if (cdc_stream.len > 0 and cutoff_seq > 0) {
             if (self.t.js.getStreamInfo(cdc_stream)) |info_c| {
                 var info = info_c;
                 defer info.deinit();
                 const first: i64 = @intCast(info.value.state.first_seq);
+                const last: i64 = @intCast(info.value.state.last_seq);
+                if (man_created.len > 0 and info.value.created.len > 0) {
+                    if (!std.mem.eql(u8, man_created, info.value.created)) {
+                        std.debug.print("{s}: chain g{d} was cut on a previous incarnation of {s} (created {s}, now {s}) — seeding it, gating nothing until a newer generation\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, man_created, info.value.created });
+                        gate_seq = 0;
+                    } else {
+                        _ = self.restarted.remove(cdc_stream);
+                    }
+                } else if (self.restarted.contains(cdc_stream)) {
+                    if (cutoff_seq > last) {
+                        std.debug.print("{s}: chain g{d} was cut before {s} restarted (cutoff seq {d} beyond last_seq {d}) — seeding it, gating nothing until a newer generation\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cdc_stream, cutoff_seq, last });
+                        gate_seq = 0;
+                    } else {
+                        _ = self.restarted.remove(cdc_stream);
+                    }
+                }
                 if (cutoff_seq + 1 < first) {
                     std.debug.print("{s}: chain g{d} predates the stream (cutoff seq {d} < first {d} on {s}) — the events between are gone; waiting for the producer's next generation\n", .{ table, if (man.object.get("gen")) |v| v.integer else 0, cutoff_seq, first, cdc_stream });
                     self.reseed_pending = true;
@@ -1708,9 +1781,7 @@ pub const SyncClient = struct {
         const seed_lsn: i64 = if (man.object.get("cutoff_lsn")) |v| (if (v == .string) core.lsnToNumber(v.string) else 0) else 0;
         if (cdc_stream.len > 0) {
             var anchor: SeedAnchor = .{ .stream = try self.aa().dupe(u8, cdc_stream), .seq = 0, .lsn = seed_lsn };
-            if (man.object.get("cutoff_seq")) |v| if (v == .integer and v.integer > 0) {
-                anchor.seq = @intCast(v.integer);
-            };
+            if (gate_seq > 0) anchor.seq = @intCast(gate_seq);
             var replaced = false;
             for (st.anchors.items) |*an| if (std.mem.eql(u8, an.stream, cdc_stream)) {
                 an.* = anchor;
@@ -2270,6 +2341,7 @@ pub const SyncClient = struct {
         } else {
             cfg.deliver_policy = .all;
         }
+        std.debug.print("{s}: tail consumer {s} from seq {d}\n", .{ stream, cname, cfg.opt_start_seq orelse 0 });
         return try self.t.js.pullSubscribe(null, cname, .{ .stream = stream, .config = cfg, .inbox = shared });
     }
 
@@ -2494,6 +2566,7 @@ pub const SyncClient = struct {
         var k: usize = 0;
         while (k < self.tails.items.len) {
             if (std.mem.eql(u8, self.tails.items[k].stream, stream)) {
+                std.debug.print("{s}: tail dropped\n", .{stream});
                 self.tails.items[k].sub.deinit();
                 _ = self.tails.orderedRemove(k);
             } else k += 1;
@@ -2626,6 +2699,7 @@ pub const SyncClient = struct {
         // (the stream was deleted, the grant withdrawn) sets that stream aside.
         for (mb.gone, 0..) |g, i| {
             if (!g) continue;
+            std.debug.print("{s}: tail consumer gone — reopening\n", .{live.items[i]});
             const tl = self.tailFor(live.items[i]) catch |e| {
                 self.markDark(live.items[i], e);
                 continue;

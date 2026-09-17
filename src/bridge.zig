@@ -2546,7 +2546,12 @@ const LiveCatalogue = struct {
         defer republish.deinit(self.allocator);
         // §10du: the clients are now empty and waiting for a full under the new epoch;
         // the producer cuts it on its cadence (minutes) unless asked — so ask.
-        if (epoch_moved.items.len > 0) generation_producer.GenerationProducer.kick();
+        // …and when a table is newly declared: a fresh `zebridge_enable` has epoch 0, which
+        // "moves" nothing, and its first chain then waited for the cadence — up to
+        // GENERATION_CADENCE_SECONDS with no manifest for a table clients are already
+        // told about (collist.py measured it: the replica said "no chain yet" for the
+        // whole 120 s wait, the producer cut it at the 300 s tick). Ask now.
+        if (epoch_moved.items.len > 0 or self.cat.changed.len > 0) generation_producer.GenerationProducer.kick();
         for (epoch_moved.items) |tbl| {
             log.info("🗂️ '{s}': seed epoch moved to {d} — descriptor republished, clients re-seed", .{ tbl, self.cat.epochs.get(tbl) orelse 0 });
             republish.append(self.allocator, tbl) catch {};

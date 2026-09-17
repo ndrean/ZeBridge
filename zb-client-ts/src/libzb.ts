@@ -272,6 +272,16 @@ export class ZeBridge {
   /// resubmitted with a fresh stamp or dropped and surfaced.
   private rebase = new Map<string, { table: string; key: Record<string, unknown>; values: Record<string, unknown>; before: Record<string, unknown> | null; version: string; at: number }>();
   private rebaseTimer: ReturnType<typeof setTimeout> | null = null;
+  /// Streams the gap rule found RESTARTED (position beyond last_seq, §10bm's third
+  /// shape) and no manifest has re-anchored on since. A manifest whose cutoff_seq is
+  /// beyond such a stream's last_seq was cut on the previous numbering: it must not
+  /// gate, or every event of the recreated stream is dropped as "in the chain"
+  /// (measured in libzb, stream_wipe.py 2026-09-17: replica 1 row, PostgreSQL 13).
+  private restarted = new Set<string>();
+  /// The `created` timestamp of each stream this replica holds a position on: a
+  /// different one under the same name is a recreated stream — a restart whatever the
+  /// sequence numbers say (`stored > last_seq` misses it once the new stream is longer).
+  private streamCreated = new Map<string, string>();
 
   private tenantValue = '';
   /// Per instance, like the replica (see App.tsx's CLIENT_ID history): the LWW
@@ -689,6 +699,8 @@ export class ZeBridge {
     `);
     // A replica from before §10df: the column is added; refused, harmlessly, on one that has it.
     try { await this.run(`ALTER TABLE _zebridge_generations ADD COLUMN seed_epoch INTEGER NOT NULL DEFAULT 0`); } catch { /* present */ }
+    try { await this.run(`ALTER TABLE _zebridge_stream_seq ADD COLUMN created TEXT`); } catch { /* present */ }
+    for (const r of await this.run(`SELECT stream, created FROM _zebridge_stream_seq WHERE created IS NOT NULL`)) this.streamCreated.set(String(r.stream), String(r.created));
     // §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
     // the record a re-key or a re-type is detected against.
     await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_shape (tbl TEXT PRIMARY KEY, key_shape TEXT NOT NULL, type_shape TEXT NOT NULL)`);
@@ -834,7 +846,16 @@ export class ZeBridge {
       this.appendLog(e.table, `rebase of ${msgId} abandoned: the row is gone`, 'ERROR');
       return;
     }
-    if (!(normalizeVersion(String(cur[state.versionColumn] ?? '')) > e.version)) return; // the winner is not here yet
+    // "The winner is here" — by the row's version now, OR by the version the row carried
+    // BEFORE this write. The second case is a slow clock (§10do): the winner had already
+    // arrived when the write was made, the optimistic apply then stamped the row with
+    // the slow clock's older version, and no CDC echo will ever raise it again — the
+    // hold waited for an arrival that had happened before it was set (measured:
+    // rebase_stale.py §C, Node held the edit for ever; libzb's same-shape rebase in §A
+    // works because its winner arrives after the write).
+    const verNow = normalizeVersion(String(cur[state.versionColumn] ?? ''));
+    const verBefore = e.before ? normalizeVersion(String(e.before[state.versionColumn] ?? '')) : '';
+    if (!(verNow > e.version || verBefore > e.version)) return; // the winner is not here yet
     const mine = Object.keys(e.values).filter((c) => c !== state.versionColumn);
     const winnerChanged = Object.keys(cur).filter(
       (c) => c !== state.versionColumn && JSON.stringify(cur[c] ?? null) !== JSON.stringify(e.before?.[c] ?? null),
@@ -2026,10 +2047,31 @@ export class ZeBridge {
     // keeps the age above two cadences so this never happens in a healthy deployment;
     // a size valve, a purge or a too-short age breaks it, and the honest move is to
     // wait for the producer's next generation (the seed loop polls this again).
+    // What the seed gate may anchor on: the manifest's cutoff_seq — unless the stream
+    // restarted under us and this manifest predates the restart (see `restarted`).
+    let gateSeq = typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 ? manifest.cutoff_seq : 0;
     if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
       try {
         const jsm = await this.transport.jetstreamManager(this.nc!);
-        const first = (await jsm.streams.info(manifest.cdc_stream)).state.first_seq;
+        const info = await jsm.streams.info(manifest.cdc_stream);
+        const st = info.state;
+        const first = st.first_seq;
+        const nowCreated = String((info as { created?: unknown }).created ?? '');
+        if (manifest.cdc_stream_created && nowCreated) {
+          if (manifest.cdc_stream_created !== nowCreated) {
+            this.appendLog('SYS', `${table}: chain g${manifest.gen} was cut on a previous incarnation of ${manifest.cdc_stream} (created ${manifest.cdc_stream_created}, now ${nowCreated}) — seeding it, gating nothing until a newer generation`);
+            gateSeq = 0;
+          } else {
+            this.restarted.delete(manifest.cdc_stream);
+          }
+        } else if (this.restarted.has(manifest.cdc_stream)) {
+          if (manifest.cutoff_seq > st.last_seq) {
+            this.appendLog('SYS', `${table}: chain g${manifest.gen} was cut before ${manifest.cdc_stream} restarted (cutoff seq ${manifest.cutoff_seq} beyond last_seq ${st.last_seq}) — seeding it, gating nothing until a newer generation`);
+            gateSeq = 0;
+          } else {
+            this.restarted.delete(manifest.cdc_stream);
+          }
+        }
         if (manifest.cutoff_seq + 1 < first) {
           this.appendLog('SYS', `${table}: chain g${manifest.gen} predates the stream (cutoff seq ${manifest.cutoff_seq} < first ${first} on ${manifest.cdc_stream}) — the events between are gone; waiting for the producer's next generation`, 'WARNING');
           return false;
@@ -2191,8 +2233,8 @@ export class ZeBridge {
 
     state.lsn = lsnToNumber(manifest.cutoff_lsn);
     state.seedLsn = state.lsn; // the ONE place the legacy data gate may anchor to (finding 10)
-    if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
-      state.seedSeq = manifest.cutoff_seq;
+    if (gateSeq > 0 && manifest.cdc_stream) {
+      state.seedSeq = gateSeq;
       state.seedStream = manifest.cdc_stream;
     }
     // The chain's cutoff_version is an observed version watermark: floor the HLC
@@ -2241,14 +2283,23 @@ export class ZeBridge {
           lastSeq: info.state.last_seq,   // a position beyond it = the stream restarted (lost slot, NOTES §10bm)
           stored: this.globalSyncState.seq[streamName] ?? 0,
         };
-        if (streamGaps[streamName].stored > info.state.last_seq) {
+        const created = String((info as { created?: unknown }).created ?? '');
+        const knownCreated = this.streamCreated.get(streamName);
+        const recreated = !!knownCreated && created !== '' && knownCreated !== created;
+        if (recreated) this.appendLog('SYNC', `${streamName}: stream recreated (created ${created}, was ${knownCreated}) — position ${streamGaps[streamName].stored} reset`);
+        if (recreated || streamGaps[streamName].stored > info.state.last_seq) {
           // The feed restarted under us: the position is meaningless in the new
           // numbering. Reset it, or fullPredates reads the fresh chain's small
           // cutoff_seq as "older than where I am" and skips the full this gap needs.
           this.appendLog('SYNC', `${streamName}: stream restarted (position ${streamGaps[streamName].stored} beyond last_seq ${info.state.last_seq}) — position reset`, 'GAP');
           streamGaps[streamName].stored = 0;
           this.globalSyncState.seq[streamName] = 0;
+          this.restarted.add(streamName);
           await this.run(`UPDATE _zebridge_stream_seq SET last_seq = 0 WHERE stream = ?`, streamName);
+        }
+        if (created !== '' && (!knownCreated || recreated)) {
+          this.streamCreated.set(streamName, created);
+          await this.run(`INSERT INTO _zebridge_stream_seq (stream, last_seq, created) VALUES (?, 0, ?) ON CONFLICT(stream) DO UPDATE SET created = excluded.created`, streamName, created);
         }
       }
 

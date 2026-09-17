@@ -1252,7 +1252,12 @@ pub const GenerationProducer = struct {
         // 0 = unavailable (stream missing or NATS hiccup): the manifest then omits
         // the field and clients fall back to the legacy lsn gate — degraded, never
         // wrong-er than before this field existed.
-        const cutoff_seq: u64, const cdc_stream: []const u8, const stream_first: u64 = blk: {
+        // …and the stream's `created`: a client gates on `cutoff_seq` only while it reads
+        // the SAME incarnation of the stream. A stream deleted and recreated (a wipe, a
+        // lost slot) restarts its numbering, and a manifest cut before that carries a
+        // seq that means nothing on it — the numbers alone cannot say so (measured:
+        // stream_wipe.py, every replayed event dropped as "in the chain").
+        const cutoff_seq: u64, const cdc_stream: []const u8, const stream_first: u64, const stream_created: []const u8 = blk: {
             const name = if (std.mem.eql(u8, tenant, self.topo.open_tenant))
                 self.topo.cdc_stream_public
             else
@@ -1260,10 +1265,10 @@ pub const GenerationProducer = struct {
             if (js.getStreamInfo(name)) |info_const| {
                 var info = info_const;
                 defer info.deinit();
-                break :blk .{ info.value.state.last_seq, try alloc.dupe(u8, name), info.value.state.first_seq };
+                break :blk .{ info.value.state.last_seq, try alloc.dupe(u8, name), info.value.state.first_seq, try alloc.dupe(u8, info.value.created) };
             } else |err| {
                 log.warn("🧬 '{s}'/'{s}': stream info for {s} failed ({}) — manifest ships without cutoff_seq, clients use the legacy lsn gate", .{ tenant, table, name, err });
-                break :blk .{ 0, name, 0 };
+                break :blk .{ 0, name, 0, "" };
             }
         };
         // §10ei: the chain must OVERLAP the stream. A client that fell off the stream
@@ -1805,7 +1810,7 @@ pub const GenerationProducer = struct {
         defer kv.deinit();
         const key = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ tenant, table });
         const seq_frag: []const u8 = if (cutoff_seq > 0)
-            try std.fmt.allocPrint(alloc, "\"cutoff_seq\":{d},\"cdc_stream\":\"{s}\",", .{ cutoff_seq, cdc_stream })
+            try std.fmt.allocPrint(alloc, "\"cutoff_seq\":{d},\"cdc_stream\":\"{s}\",\"cdc_stream_created\":\"{s}\",", .{ cutoff_seq, cdc_stream, stream_created })
         else
             "";
         const gc_frag: []const u8 = if (gc_watermark.len > 0)

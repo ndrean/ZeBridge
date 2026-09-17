@@ -2668,7 +2668,15 @@ pub const EventProcessor = struct {
             // bridge restart inside the stream's duplicate window had its boot schemas
             // silently deduplicated — the KV kept the previous boot's value, and a
             // schema-shape change deployed with a quick restart never reached clients.
-            const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}-{d}", .{ clean_table, boot_lsn });
+            // ⚠️ …and with the table's seed epoch. The catalogue reload republishes through
+            // this pass too (§10df: "seed epoch moved — descriptor republished"), and
+            // when nothing has written WAL since the boot pass the head is the SAME LSN:
+            // the republished descriptor — the one telling clients to re-seed — carried
+            // the boot descriptor's id and was dropped as a duplicate. Measured
+            // 2026-09-17 (column_flood.py): `$KV.schemas` said seed_epoch 0 while the
+            // catalogue said 1, and neither client ever re-seeded.
+            const epoch_for_id: i64 = if (self.cat) |cat| (cat.epochs.get(clean_table) orelse 0) else 0;
+            const msg_id = try std.fmt.allocPrint(arena, "schema-boot-{s}-{d}-e{d}", .{ clean_table, boot_lsn, epoch_for_id });
 
             var dummy_cols: std.ArrayList(pgoutput.Column) = .empty;
             try dummy_cols.append(arena, .{ .name = "schema", .value = .{ .text = json_str.items } });

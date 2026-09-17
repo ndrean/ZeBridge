@@ -40,6 +40,12 @@ def attnames():
 async def main():
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
     zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
+    # ⚠️ And the catalogue row: left behind, the next run's zebridge_enable changes NOTHING
+    # ("0 table(s) changed"), so the reload neither republishes nor kicks the producer, and
+    # the first chain waits for the cadence — longer than this scenario waits (measured
+    # 2026-09-18: "no chain yet (globex)" for the whole 120 s, the row carrying epoch 5).
+    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), body text, fts tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body, ''))) STORED, "
             f"secret text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     zb.psql("DROP PUBLICATION IF EXISTS col_stray", quiet=True)
@@ -82,11 +88,11 @@ async def main():
     check(f"the client's write landed and the master computed its tsvector: {m} (verdicts {fl.get('verdicts')})", m == "jumps quickly|'jump':1 'quick':2")
     em.close()
 
-    # The chain comes at the producer's next tick — in the live group that is
-    # GENERATION_CADENCE_SECONDS (300 in .env.bridge), longer than this wait. Ask for it:
-    # zebridge_reseed bumps the seed epoch, the catalogue reload kicks the producer
-    # (§10du), and the full for every tenant of the table is cut within seconds.
-    zb.psql(f"SELECT count(*) FROM public.zebridge_reseed('public.{T}'::regclass)", quiet=True)
+    # The chain is cut within seconds of the enable (the catalogue reload kicks the
+    # producer) — this only waits for the manifest to be readable. ⚠️ Readable by THIS
+    # process: the audit reads every tenant's chain, which a client principal's grants
+    # do not cover, so the scenario runs as the bridge (run.py: role "bridge"). As a
+    # client it saw "no manifest" for a chain the replica had just seeded from.
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not zb.kv_get("generations", f"{TENANT}.{T}"): time.sleep(2)
     import os, subprocess
@@ -103,6 +109,9 @@ async def main():
     check(f"ADD COLUMN, then zebridge_enable again: the list refreshed ({before} → {after})", "extra" not in before and "extra" in after and "fts" not in after)
     zb.psql(f"DROP TABLE public.{T}", quiet=True)
     zb.psql("DROP PUBLICATION col_stray", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
+    zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
+    zb.forget_table(T)
     fresh_sqlite(db)
     return 1 if FAILED else 0
 

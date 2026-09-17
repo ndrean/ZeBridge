@@ -87,8 +87,13 @@ def main():
         nd.mutate(W, "INSERT", {"uid": new_nd}, {"uid": new_nd, "title": "new-node", "tenant_id": tenant})
         nd.mutate(K, "UPDATE", {"uid": rows[K][1]}, {"title": "k1-node"})
         time.sleep(2)
-        check(f"§1 six writes queued with the bridge down: libzb flush sent={f.get('sent')} settled={f.get('settled')}; optimistic copies applied (py {counts(py)}, node {counts(nd)})",
-              f.get("sent") == 3 and f.get("settled") == 0 and counts(py) == (4, 3) and counts(nd) == (4, 3))
+        # libzb sends at mutate time (one path for every send — the outbox row is written
+        # and published at once), so the flush that follows finds nothing left to SEND and
+        # nothing SETTLED: the bridge is down, no verdict can come. `sent == 3` here was
+        # the older shape, where the flush did the sending; it was proven wrong on
+        # 2026-09-17 with the mutation already on the MUTATIONS stream 3 ms after its stamp.
+        check(f"§1 six writes queued with the bridge down: libzb flush sent={f.get('sent')} settled={f.get('settled')} (sent at mutate time); optimistic copies applied (py {counts(py)}, node {counts(nd)})",
+              f.get("sent") == 0 and f.get("settled") == 0 and counts(py) == (4, 3) and counts(nd) == (4, 3))
         check(f"§1 outboxes hold them: py {outbox_left(py, '%outbox%')}, node {outbox_left(nd, '_zebridge_outbox')}",
               outbox_left(py, '%outbox%') == 3 and outbox_left(nd, '_zebridge_outbox') == 3)
 
@@ -126,7 +131,8 @@ def main():
             # a fresh, correct write goes through afterwards
             good = str(uuid.uuid4())
             py.mutate(W, "INSERT", {"uid": good}, {"uid": good, "title": "after-py", "priority": 7, "tenant_id": tenant}); py.flush(5000)
-            nd.mutate(W, "INSERT", {"uid": str(uuid.uuid4())}, {"uid": str(uuid.uuid4()), "title": "after-node", "priority": 8, "tenant_id": tenant})
+            after_nd = str(uuid.uuid4())   # ONE id: key and row must agree, or the client's key guard refuses the INSERT
+            nd.mutate(W, "INSERT", {"uid": after_nd}, {"uid": after_nd, "title": "after-node", "priority": 8, "tenant_id": tenant})
             dt = both(py, nd, lambda c: c.q(f"SELECT count(*) FROM {W} WHERE title LIKE 'after-%'")[0][0] == 2, 60)
             pg_after = zb.psql(f"SELECT count(*) FROM {W} WHERE title LIKE 'after-%'").strip()
             check(f"§5 writes in the NEW shape land on both, from both ({dt} s); PostgreSQL has {pg_after}", dt is not None)

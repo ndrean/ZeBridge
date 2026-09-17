@@ -37,6 +37,10 @@ export type ChainManifest = {
   deltas?: ManifestDelta[];
   cutoff_seq?: number;
   cdc_stream?: string;
+  /// The `created` of the stream incarnation `cutoff_seq` was read on: the gate
+  /// anchors only while the client reads that incarnation (a recreated stream
+  /// restarts its numbering).
+  cdc_stream_created?: string;
   /// `zebridge_gc_watermark` as it stood at the cut: nothing soft-deleted before it is
   /// guaranteed to still exist. A replica older than this cannot catch up incrementally,
   /// because a row may have been deleted AND reaped while it was away and no artifact
