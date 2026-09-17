@@ -3,7 +3,7 @@
 Fixes made while migrating my app onto this library.
 Each entry: what broke, how it showed up, what changed. Upstream candidates unless noted.
 
-Since 2026-09-10 this ledger and the eleven `nats.zig-*.patch` files live together in
+Since 2026-09-10 this ledger and the twelve `nats.zig-*.patch` files live together in
 `nats.zig-patch/`; the submodule itself stays at the upstream commit the parent records,
 with the patches applied in its working tree. To re-apply one from the repository root:
 `git -C nats.zig apply ../nats.zig-patch/<name>.patch`.
@@ -465,5 +465,66 @@ than the parked request can live, then leaves with nothing in flight.
 # bridge stopped under a 15 writes/s publisher: "N write(s) the parked pull still
 # delivered, judged before exit"; the next boot: nothing in flight.
 ```
+
+---
+
+## 12. Which TLS versions the ClientHello offers is now the caller's choice (2026-09-17)
+
+**How it appeared**
+
+A question, not a fault: "what would it take to move the bridge's NATS hop to TLS 1.3,
+and would the shorter handshake help?" Measured before touching anything, against a
+throwaway `nats-server` with a `tls{}` listener and the server's own `/connz`:
+
+```json
+{"name": "nats.zig", "lang": "zig", "tls_version": "1.3", "tls_cipher_suite": "TLS_AES_128_GCM_SHA256"}
+```
+
+It was TLS 1.3 already. `connection.zig` builds `tls.nonblock.Client.init(.{ ... })`
+without naming `cipher_suites`, so tls.zig's default applies — `cipher_suites.all`:
+the 1.3 suites first, then 1.2's recommended ones, then 1.2's CBC ones — and a Go
+`nats-server` picks the highest both sides speak. The handshake saving is per
+*connection*, and the bridge holds one for the life of the process; steady-state cost
+is record encryption, which 1.3 does not change. No performance work to do.
+
+What the library could not do was say *"1.3 only"*: `TlsOptions` had no field for the
+suites, so the ClientHello always carried the 1.2 fallback, CBC suites included, and a
+downgrade could always be offered. Hygiene, not speed — but real, and one field away.
+
+**Change** (`nats.zig-tls13-ciphers.patch`, 4 hunks)
+
+`src/connection.zig` — `pub const CipherSuites = enum { default, secure, tls13 }` and a
+`cipher_suites: CipherSuites = .default` field on `TlsOptions`, mapped in the
+handshake to `tls.config.cipher_suites.{all, secure, tls13}`. An enum rather than
+tls.zig's own `[]const CipherSuite`: `TlsOptions` is public surface and is compiled
+with `use_tls` off too, where `tls` is `tls_stub.zig` — a type from the dependency
+would leak into every caller's build. `.default` maps to exactly the slice tls.zig
+used when nothing was said, so nothing changes unless asked.
+
+`src/tls_stub.zig` — the mirror of `config.CipherSuite`, `config.cipher_suites` and
+the `Client.cipher_suites` field, nine lines, so the stub still type-checks.
+
+ZeBridge does not set it yet: the colocated `nats-server` speaks 1.3, but pinning the
+bridge's hop is a deployment decision (an old TLS-terminating proxy would refuse), not
+a library one. When it is taken, it is `.tls = .{ .cipher_suites = .tls13 }`.
+
+**Verified**
+
+```bash
+cd nats.zig && zig build test-unit          # 132/132, 20 consecutive runs on a quiet machine
+# probe client with .cipher_suites = .tls13 against a tls{} nats-server, read on /connz:
+#   tls_version "1.3", tls_cipher_suite "TLS_AES_128_GCM_SHA256"
+```
+
+One caution recorded rather than hidden: over 30 runs with the patch and 30 without,
+`tls: server key updates are handled and answered` (a 5 s timing test) failed once —
+with the patch, on a run that shared the machine with the scenario battery. The
+patch cannot reach that test (`.default` is the same slice), so it is filed as the
+timing flake it looks like, and watched.
+
+Not in this change, and worth knowing before anyone asks for resumption: tls.zig
+supports TLS 1.3 session tickets (`Options.session_resumption`, reachable from the
+nonblock path), nats.zig passes none — and in the probe the server issued no ticket,
+so check `nats-server` before building on it. Go's TLS server implements no 0-RTT.
 
 ---
