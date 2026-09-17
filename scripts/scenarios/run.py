@@ -78,7 +78,7 @@ GROUPS = {
         "sweeper":       ("bridge", "tombstone GC boundary"),
         "client_gap":    ("bridge", "a client returns after the tail is gone: gap → re-seed → converge"),
         "shared_gap":    ("bridge", "a CDC_PUBLIC gap re-seeds tenant-scoped tables too — their shared rows ride it"),
-        "collist":       ("client", "publication column lists (§10ff): a STORED tsvector and a column the DBA leaves out never travel — publication, descriptor, a libzb replica, CDC, a client write and the audit agree; a stray second publication with a narrower list cannot shrink the descriptor; zebridge_enable refreshes the list after ADD COLUMN. SECURITY.md's column-list claim is proven HERE — it asserts, so it belongs in the battery, not in manual"),
+        "collist":       ("bridge", "publication column lists (§10ff): a STORED tsvector and a column the DBA leaves out never travel — publication, descriptor, a libzb replica, CDC, a client write and the audit agree; a stray second publication with a narrower list cannot shrink the descriptor; zebridge_enable refreshes the list after ADD COLUMN. SECURITY.md's column-list claim is proven HERE — it asserts, so it belongs in the battery, not in manual"),
     },
     "owns": {
         "ratelimit":     ("bridge", "the ingress rate limit: bob floods 200 writes, the excess is served at the rate (NAK'd and redelivered, one verdict each), alice in another tenant is answered within 2 s during the flood, libzb holds its outbox and loses nothing; starts its own probe with the limit set, so it OWNS the only bridge (§10fk)"),
@@ -211,10 +211,22 @@ def main() -> int:
                 print(f"  {n:18s} {role:7s} {note}")
         return 0
     groups = ["offline", "live", "owns"] if a.group == "all" else [a.group]
+
+    def drop_probe_slot() -> None:
+        """The probes' slot, `zb_probe`, is left behind by every owns scenario. Inactive,
+        it retains WAL until PostgreSQL invalidates it (10 GB here), and check.py reports
+        it as the orphan it is — the one red in an otherwise green live group. The
+        runner owns the probes, so it owns their slot: dropped, when inactive, before
+        and after each group. Never the long-running bridge's."""
+        subprocess.run([PY, "-c", "import zb; zb.psql(\"SELECT pg_drop_replication_slot('zb_probe') "
+                        "FROM pg_replication_slots WHERE slot_name = 'zb_probe' AND NOT active\", quiet=True)"],
+                       cwd=HERE, env=env_for("bridge"), capture_output=True)
     if a.group == "manual":
         print("manual scenarios are listed, not run: see --list"); return 0
     results = []
     for g in groups:
+        if g != "offline":
+            drop_probe_slot()
         for name, (role, note) in GROUPS[g].items():
             if a.k and not any(k in name for k in a.k):
                 continue
@@ -225,6 +237,8 @@ def main() -> int:
             dt = time.monotonic() - t0
             results.append((g, name, rc, dt, log))
             print(f"  {'✓' if rc == 0 else '✗'} {g}/{name:18s} rc={rc:<3d} {dt:6.1f}s  {log}", flush=True)
+    if any(g != "offline" for g in groups):
+        drop_probe_slot()
     failed = [r for r in results if r[2] != 0]
     print(f"\n{len(results) - len(failed)}/{len(results)} passed" + (f"; failed: {', '.join(r[1] for r in failed)}" if failed else ""))
     return 1 if failed else 0
