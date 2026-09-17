@@ -30,6 +30,7 @@ ENABLE = ("tenant_col => 'tenant_id', writable => true, version_col => 'updated_
 
 
 def teardown():
+    zb.forget_table(BAD, C, P)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
     for sql in (f"DROP TABLE IF EXISTS public.{BAD}", f"DROP TABLE IF EXISTS public.{C}", f"DROP TABLE IF EXISTS public.{P}",
                 f"DELETE FROM public.zebridge_catalogue WHERE tbl IN ('{P}','{C}','{BAD}')",
                 f"DELETE FROM public.zebridge_generations WHERE tbl IN ('{P}','{C}','{BAD}')"):

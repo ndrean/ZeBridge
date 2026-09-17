@@ -1066,6 +1066,28 @@ must exceed `2 × GENERATION_CHECKPOINT_SECONDS` (or, with the middle level off,
 `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS`). `bridge --diagnose` refuses a
 configuration that breaks this, and the boot warns.
 
+### A client slower than the source
+
+The stream carries **history** — every event; the chain carries **state** — each row once
+per window. A client that cannot apply events as fast as the source emits them
+**converges through the chain and cannot stay on the stream**: it re-seeds from the
+checkpoints and deltas, lands at most a cadence or so behind, attaches at `cutoff_seq`,
+drifts, falls off the stream's window, and re-seeds again. Its staleness is bounded; its
+lag on the stream is not. That is the contract — not "keeps up".
+
+What decides whether even the chain converges is one ratio: the client's **bulk apply rate
+against the rate of distinct rows changed** per window. Measured on the reference clients:
+a chain object applies at ~90,000 rows/s; CDC one event at a time at 19,000 (TypeScript) to
+34,000 (libzb) rows/s; a single client stays live up to ~40,000 (TypeScript) / ~60,000
+(libzb) events/s. At 100,000 events/s the producer's cuts carried ~65,000 distinct rows/s,
+so the chain converged while the stream could not; an insert-only load at that rate would
+be 100,000 distinct rows/s and nothing would.
+
+⚠️ **The bridge's rate is the aggregate; a client's rate is its slice.** A phone reads
+`CDC_<tenant>`, so the number to size a client against is the churn of *its* tenant and
+tables, not the bridge's total. The producer's 100,000 events/s stamp says the chain stays
+fresh while PostgreSQL floods — it is a promise about the producer, never about a client.
+
 ### The Connection Flow (Resolving the Gap)
 
 Run on every connect and reconnect, once **per stream** the client reads, not once

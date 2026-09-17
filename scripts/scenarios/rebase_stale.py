@@ -39,6 +39,7 @@ PY_DB, NODE_DB = "/tmp/zb-rebase-py.sqlite3", "/tmp/zb-rebase-node.sqlite3"
 
 
 def teardown():
+    zb.forget_table(T)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
     for sql in (f"DROP TABLE IF EXISTS public.{T}", f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'",
                 f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'"):
         zb.psql(sql, quiet=True)

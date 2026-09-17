@@ -124,6 +124,7 @@ def main():
     finally:
         for t in ("tzguard_bad", "tzguard_ok", "tzguard_half", "tzguard_bad2"):
             zb.psql(f"DROP TABLE IF EXISTS public.{t}", quiet=True)
+            zb.forget_table(t)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
 
     return 1 if failed else 0
 

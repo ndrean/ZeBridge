@@ -69,6 +69,7 @@ LABEL_BYTES = 2048
 
 def seed(n: int):
     """One transaction, N rows, every variable-length column carrying `idx`."""
+    zb.forget_table(TABLE)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
     zb.psql(
         f"DROP TABLE IF EXISTS public.{TABLE}; "
         f"DROP TYPE IF EXISTS {KIND_TYPE}; "
@@ -239,6 +240,7 @@ async def main():
             quiet=True,
         )
         zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
+        zb.forget_table(TABLE)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
         zb.psql(f"DROP TYPE IF EXISTS {KIND_TYPE}", quiet=True)
 
     return 1 if failed else 0

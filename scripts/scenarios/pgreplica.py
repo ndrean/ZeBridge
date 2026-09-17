@@ -46,6 +46,7 @@ def ewkb_point(lon, lat, srid=4326):
 
 async def main():
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
+    zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), n int, price numeric(12,4), ok boolean, tags text[], matrix int[][], "
             f"meta jsonb, tile bytea, geom geometry(Point, 4326), note text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), "
             f"updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)

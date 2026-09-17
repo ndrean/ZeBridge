@@ -29,6 +29,7 @@ def epochs():
 
 
 def teardown():
+    zb.forget_table(C, A, B)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
     for sql in (f"DROP TABLE IF EXISTS public.{C}", f"DROP TABLE IF EXISTS public.{A}", f"DROP TABLE IF EXISTS public.{B}",
                 f"DELETE FROM public.zebridge_catalogue WHERE tbl IN ('{A}','{B}','{C}')",
                 f"DELETE FROM public.zebridge_generations WHERE tbl IN ('{A}','{B}','{C}')"):

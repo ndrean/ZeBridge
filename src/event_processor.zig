@@ -661,7 +661,7 @@ pub const EventProcessor = struct {
         // `unrouted` keeps the four-token shape, so `cdc.*.*.<tenant>` cannot match it and
         // no tenant-scoped client receives it, while an operator can subscribe to
         // `cdc.*.*.unrouted` on purpose and see exactly what failed to route.
-        const routed: ?[]const u8 = if (tenant) |t| t else if (self.tenant_rules.contains(rel.name)) blk: {
+        const routed: ?[]const u8 = if (tenant) |t| t else if (self.tenant_rules.contains(rel.name)) {
             const named: []const u8 = if (self.tenant_rules.get(rel.name)) |r|
                 (if (r.len > 0) r[0] else "?")
             else
@@ -670,8 +670,39 @@ pub const EventProcessor = struct {
                 "🔴 Quarantining {s} on '{s}' to '.unrouted': TENANT_RULES names '{s}' but this event carries no value for it. Check that the replica identity still covers it.",
                 .{ operation_lower, rel.name, named },
             );
-            break :blk "unrouted";
+            // ⚠️ Not published, even quarantined: no stream binds an `unrouted` subject, so
+            // a JetStream publish to it gets no response, the publisher reads that as a
+            // lost connection, and the batch publisher stops the bridge — every table's
+            // replication, for one row that could not be routed. The loud line above is
+            // the audit trail, one per row. (Binding the quarantine to CDC_PUBLIC would
+            // hand tenant rows to the public stream, which is worse.)
+            return error.EventDropped;
         } else null;
+
+        // ── Unroutable → refuse and drop, never publish ──────────────────────────
+        // A row whose table is neither tenant-scoped nor public in the catalogue AS IT IS
+        // NOW renders the bare `cdc.<table>.<op>` — a subject no stream binds. The DDL
+        // path refuses that table when its CREATE arrives; this path did not, and a row
+        // reaching it was published anyway: the publisher got no stream response, read
+        // it as a lost connection, retried, and the batch publisher stopped the bridge.
+        // Reached in practice by WAL REPLAY: a table dropped — and its catalogue row
+        // deleted — while the bridge was down leaves its rows in the slot's backlog with
+        // no rule to route them (measured 2026-09-17: `cdc.mig_w.insert`, every probe
+        // bridge dead within a minute). Refuse it with the reason that exists for this,
+        // drop the row the way every caller already expects (`EventDropped`), and let
+        // the catalogue reload lift it if a row ever declares the table again. No
+        // suspension is published from here: for a dropped table that would resurrect
+        // the very key its tombstone just closed (§10dj).
+        if (!self.topology.isCdcRoutable(rel.name, self.tenant_rules.contains(rel.name))) {
+            if (self.refused.reasonFor(rel.name) == null) {
+                self.refused.refuse(rel.name, .no_cdc_subject) catch |err| {
+                    log.err("🔴 '{s}': a row with no CDC subject could not be refused ({s}) — dropping it anyway", .{ rel.name, @errorName(err) });
+                };
+                log.warn("🔴 REFUSING '{s}' on a row: not tenant-scoped and no catalogue row marks it public — its CDC subject matches no stream, so its rows are dropped, not published. A table dropped while the bridge was down looks like this while its backlog replays; declare it (zebridge_enable) if it is meant to live.", .{rel.name});
+            }
+            _ = self.refused.shouldDrop(rel.name); // counts it — the caller's gate does not
+            return error.EventDropped;
+        }
 
         // Create NATS subject
         var subject_buf: [Config.Buffers.subject_buffer_size]u8 = undefined;

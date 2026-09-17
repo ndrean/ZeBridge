@@ -45,6 +45,7 @@ async def main():
     who = zb.require_principal()
     tenant = zb.psql(f"SELECT tenant_id FROM zebridge_user_tenants WHERE principal = '{who}' LIMIT 1").strip()
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
+    zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), note text, ver bigint NOT NULL DEFAULT 1, tenant_id text NOT NULL, "
             f"inserted_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     en = zb.psql(f"SELECT step || ': ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'ver', "

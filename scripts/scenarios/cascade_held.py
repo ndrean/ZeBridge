@@ -29,6 +29,7 @@ PY_DB, NODE_DB = "/tmp/zb-cascade-held-py.sqlite3", "/tmp/zb-cascade-held-node.s
 
 
 def teardown():
+    zb.forget_table(C, P, G)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
     for sql in (f"DROP TABLE IF EXISTS public.{C}", f"DROP TABLE IF EXISTS public.{P}", f"DROP TABLE IF EXISTS public.{G}",
                 f"DELETE FROM public.zebridge_catalogue WHERE tbl IN ('{G}','{P}','{C}')",
                 f"DELETE FROM public.zebridge_generations WHERE tbl IN ('{G}','{P}','{C}')"):

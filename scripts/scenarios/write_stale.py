@@ -30,6 +30,7 @@ PY_DB, NODE_DB = "/tmp/zb-write-stale-py.sqlite3", "/tmp/zb-write-stale-node.sql
 
 
 def teardown():
+    zb.forget_table(W, K)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
     for sql in (f"DROP TABLE IF EXISTS public.{W}", f"DROP TABLE IF EXISTS public.{K}",
                 f"DELETE FROM public.zebridge_catalogue WHERE tbl IN ('{W}','{K}')",
                 f"DELETE FROM public.zebridge_generations WHERE tbl IN ('{W}','{K}')"):

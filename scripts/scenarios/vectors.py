@@ -53,6 +53,7 @@ def sparsevec(dim, pairs):
 
 async def main():
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
+    zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), emb vector(3), half halfvec(3), sv sparsevec(5), bits bit(8), b3 bit(3), vb varbit(12), "
             f"note text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     en = zb.psql(f"SELECT step || ': ' || detail FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', "

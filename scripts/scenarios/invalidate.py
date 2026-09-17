@@ -354,6 +354,7 @@ async def main():
         print(f"\n3. a table with no primary key, then one with")
         before_refused = metric("bridge_refused_tables") or 0
         zb.psql(f"DROP TABLE IF EXISTS public.{SCRATCH}", quiet=True)
+        zb.forget_table(SCRATCH)  # the schema keys too — a DROP after the probe bridge exits tombstones nobody
         zb.psql(
             f"CREATE TABLE public.{SCRATCH} (id bigint NOT NULL, name text)", quiet=True
         )
@@ -465,6 +466,7 @@ async def main():
         # next scenario in the suite inherits a half-migrated table.
         zb.psql(f"ALTER TABLE public.{TABLE} DROP COLUMN IF EXISTS {PROBE}", quiet=True)
         zb.psql(f"DROP TABLE IF EXISTS public.{SCRATCH}", quiet=True)
+        zb.forget_table(SCRATCH)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
         zb.psql(
             "DELETE FROM public.zebridge_catalogue WHERE public_reason = 'invalidate.py fixture'",
             quiet=True,

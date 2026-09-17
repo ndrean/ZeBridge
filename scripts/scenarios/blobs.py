@@ -48,6 +48,7 @@ async def main():
     if "postgis" not in zb.psql("SELECT extname FROM pg_extension", quiet=True):
         zb.bad("PostGIS is not installed (CREATE EXTENSION postgis)"); return 1
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
+    zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), tile bytea, geom geometry(Point, 4326), note text, "
             f"tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     en = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM public.zebridge_enable('public.{T}'::regclass, tenant_col => 'tenant_id', writable => true, "

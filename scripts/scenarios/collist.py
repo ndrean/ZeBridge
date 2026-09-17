@@ -39,6 +39,7 @@ def attnames():
 
 async def main():
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
+    zb.forget_table(T)  # the schema key too — a DROP after the probe bridge exits tombstones nobody
     zb.psql(f"CREATE TABLE public.{T} (uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), body text, fts tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body, ''))) STORED, "
             f"secret text, tenant_id text NOT NULL, inserted_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), deleted_at timestamptz)", quiet=True)
     zb.psql("DROP PUBLICATION IF EXISTS col_stray", quiet=True)
