@@ -821,36 +821,165 @@ the hint reads the rename as drop-plus-add and loses that column's values.
 
 ## 6. Seeding — generation chains ✅
 
-Seeding gives a fresh or fallen-behind client its starting point. 
-Postgres is never queried per consumer. The `generation_producer.zig` builds, on a cadence `GENERATION_CADENCE_SECONDS`, a *full* plus a series of *deltas* per table — the chain — and publishes it to object storage.
-Clients only ever read what is already built; 
+Seeding gives a fresh or fallen-behind client its starting point. Postgres is never
+queried per consumer: `generation_producer.zig` builds one chain per (tenant, table) and
+publishes it to object storage, and clients only ever read what is already built.
 
-### When a full is forced
+A chain has **three levels**. A returning client walks the shortest prefix that reaches
+where it stands, so what it pays is proportional to how long it was away — not to the
+size of the table.
 
-A delta suffices while nothing but versions moved. The producer builds a full, whatever the counts say, when: the chain has no full inside the kept window; hard deletes moved (`n_tup_del`); the catalogue's `seed_epoch` moved since the last generation; or the table's column shape (`name:type` list, recorded per generation as `col_shape`) moved — a chain object names its columns, and a full built before a `DROP`/`RENAME`/re-type would ask a replica for a column it no longer has. A (tenant, table) that left the publication has its chain swept on the next tick — objects, manifest, bookkeeping — so a table re-created under the same name starts at g1. A client reading a chain object that names a column it lacks treats it as "predates the schema" and waits for the next full.
+### The three levels
 
-### A full can sit behind newer deltas
+| level | object | what it carries | cut |
+| --- | --- | --- | --- |
+| **base** | `T-gN-full` | every live row; tombstoned rows left out | rarely, in the background — see below |
+| **checkpoint** | `T-gN-ckpt` | every row that moved since the previous checkpoint (or since the base), **tombstones included** | every `GENERATION_CHECKPOINT_SECONDS`, in the background lane |
+| **delta** | `T-gN-delta` | every row that moved since the previous cut, **tombstones included** | every `GENERATION_CADENCE_SECONDS`, with the cut |
 
-The fulls above are built with the delta of the same generation, from one snapshot. The routine full, the one that keeps a full inside the kept window, is not: it is built in the background while deltas keep being cut (`GENERATION_ASYNC_FULLS`, on by default), because a full takes seconds and the cut must stay fresh while the stream prunes.
+The manifest names the base `full`; a client accepts `base` as a synonym for that field.
 
-* The background full takes its snapshot right after the newest generation, call it L, and is attached to L when it is done. By then the manifest may list deltas above L. The manifest's `full.gen` is L and `full.cutoff` is L's cutoff.
-* The full's rows can be newer than that cutoff. A client applies the full, then **every delta with a gen above `full.gen`**. Those deltas cover everything after L's cutoff, so nothing is missed; the rows they repeat are version-guarded upserts and deletes by key, so nothing goes backwards.
-* The routine full also waits while the stream has less time left than three builds of the table's full (`GENERATION_DEFER_FULLS`), up to 4 × `GENERATION_CHAIN_DEPTH` generations. The kept window then stretches back to that full, so a chain can list more than `GENERATION_CHAIN_DEPTH` deltas.
+A base is a **reload**: applying it is `DELETE FROM` + replay, because it is the only
+level that says what no longer exists — by leaving it out. A checkpoint and a delta are
+**repairs**: version-guarded upserts, plus a delete by key for every row whose tombstone
+column is set. Nothing but a base ever empties a table.
+
+`GENERATION_CHECKPOINT_SECONDS=0` turns the middle level off, and a chain is a base and
+its deltas. The level is only worth cutting for a table that has rows to cut it from: a
+table under `min_checkpoint_rows` (100 000, read from the collector's `n_live_tup`,
+which is 0 until the first `ANALYZE`) keeps to two levels.
+
+### When a base is built
+
+A delta suffices while nothing but versions moved. Whatever the counts say, the producer
+builds a base when:
+
+* the chain has no base inside the kept window;
+* hard deletes moved (`n_tup_del`) — a delete that left no tombstone is visible only as
+  an absence, and only a base states absence;
+* the table was truncated (its `relfilenode` moved);
+* the catalogue's `seed_epoch` moved since the last generation;
+* the table's column shape (the `name:type` list, recorded per generation as
+  `col_shape`) moved — a chain object names its columns, and a base built before a
+  `DROP`/`RENAME`/re-type would ask a replica for a column it no longer has.
+
+One more rule asks for a base at any time, and it is an economy rather than a
+correctness debt: **when a delta would carry more than half the table**, a base carries
+each row once where a burst of re-stamped rows would otherwise sit in every delta of the
+burst. That base goes to the background lane and the cut publishes its delta alone.
+
+With the middle level on, one rule decides the *routine* rebuild: **a base is rebuilt
+when the checkpoints above it weigh more than it does** (`GENERATION_BASE_REBUILD_PERCENT`,
+100 by default, comparing the stored bytes of the objects). Past that bar a returning
+client pays more walking the checkpoints than reloading, so the lane cuts a new base and
+everything below it is pruned.
+
+Generation *count* no longer forces one while the middle level works:
+`GENERATION_CHAIN_DEPTH` rotates a base in only when the lane has **stalled** — no
+checkpoint above the base at all. A table whose checkpoints keep coming is rebuilt by
+weight, not by age.
+
+A (tenant, table) that left the publication has its chain swept on the next tick —
+objects, manifest, bookkeeping — so a table re-created under the same name starts at g1.
+A client reading a chain object that names a column it lacks treats it as "predates the
+schema" and waits for the next base.
+
+### A base can sit behind newer deltas
+
+A base forced by the rules above is built with the delta of the same generation, from one
+snapshot. The routine base is not: it is built in the background while deltas keep being
+cut (`GENERATION_ASYNC_FULLS`, on by default), because a base takes seconds and the cut
+must stay fresh while the stream prunes. Checkpoints are cut in that same lane, for the
+same reason.
+
+* The background base takes its snapshot right after the newest generation, call it L,
+  and is attached to L when it is done. By then the manifest may list deltas above L. The
+  manifest's `full.gen` is L and `full.cutoff` is L's cutoff.
+* The base's rows can be newer than that cutoff. A client applies the base, then
+  **every checkpoint and every delta with a gen above `full.gen`**. Those cover everything
+  after L's cutoff, so nothing is missed; the rows they repeat are version-guarded upserts
+  and deletes by key, so nothing goes backwards.
+* The routine base also waits while the stream has less time left than three builds of the
+  table's base (`GENERATION_DEFER_FULLS`), up to 4 × `GENERATION_CHAIN_DEPTH` generations.
+  The kept window then stretches back to that base, so a chain can list more than
+  `GENERATION_CHAIN_DEPTH` deltas.
+
+### Why a delta reaches back before its own cut
+
+A cut's `now()` is the *start* of the producer's transaction, so a transaction that began
+before the cut and committed after it carries versions **older than the cut** — rows the
+next delta would skip if it started at the previous cutoff. Each generation therefore
+records `open_xact_floor`, the oldest transaction open at the cut
+(`zebridge_oldest_open_xact()`, SECURITY DEFINER), and the next delta reads from that
+floor rather than from the cutoff. On an edge-writable table the bound is lowered further,
+to the cut minus the version tolerance, since a client's clock may trail the database's.
+
+The direction is always **overlap, never a gap**: a delta may repeat rows a previous one
+carried, and repetition is free — every row is a version-guarded upsert or a delete by key.
 
 ### The storage architecture
 
 | | where | why |
 | --- | --- | --- |
-| **Manifest** | `generations` KV, key `<tenant>.<table>` | One small JSON document naming the chain: the full, the deltas, the cutoff. Last-value-per-key makes discovery one read. |
-| **Objects** | `gen-<tenant>` object store | The full and delta payloads: MessagePack rows, normally wrapped in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. A full is written as a stream, so its frame does **not state its content size**: a reader must not size its output from the frame header (stream it, or grow the buffer). Chunked by the object store itself (128 KB) — no NATS `max_payload` limit applies to a seed. |
+| **Manifest** | `generations` KV, key `<tenant>.<table>` | One small JSON document naming the chain: the base, the checkpoints, the deltas, the cutoff. Last-value-per-key makes discovery one read. |
+| **Objects** | `gen-<tenant>` object store | The payloads: MessagePack rows in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. Chunked by the object store itself (128 KB): no NATS `max_payload` limit applies to a seed. |
+| **Dictionaries** | `gen-<tenant>`, `T-gN-dict` | A zstd dictionary trained on samples of the base, named by the checkpoints and deltas compressed with it (`dict`). It is deleted only when no generation row still references it. |
 
-The manifest carries:
+⚠️ **Every level is written as a stream** — COPY reads, MessagePack encodes, zstd
+compresses and the object store uploads, all at once, so the producer never holds a whole
+table in memory. A streamed frame does **not state its content size**: a reader must not
+size its output buffer from the frame header. Stream the decompression, or grow the
+buffer and retry.
 
-*  `gen` (the chain number),
-*  `seed_epoch` (the catalogue's `seed_epoch` the chain was built under — a client whose descriptor says more waits for the next build),
-*  `full` (object name + gen),
-*  `deltas` (object, `cutoff`, `prev_cutoff`, gen — newest last; plus `dict` naming the dictionary object a delta was compressed with,
-  
+### The manifest
+
+A tenant with no rows for a table still gets a manifest (an explicit empty base), so a
+client can tell "empty" from "not built yet".
+
+```json
+{
+  "gen": 412,
+  "seed_epoch": 3,
+  "bucket": "gen-acme",
+  "cutoff_seq": 9812774,
+  "cdc_stream": "CDC_acme",
+  "gc_watermark": "2026-09-17 06:31:02.114+00",
+  "cutoff_version": "2026-09-17 07:44:51.201+00",
+  "cutoff_lsn": "5/E018960",
+  "version_column": "updated_at",
+  "full": { "gen": 370, "object": "orders-g370-full", "cutoff": "2026-09-17 06:02:10.880+00" },
+  "checkpoints": [
+    { "gen": 395, "object": "orders-g395-ckpt", "lower": "2026-09-17 06:02:10.880+00",
+      "cutoff": "2026-09-17 06:32:11.004+00", "dict": "orders-g370-dict" },
+    { "gen": 409, "object": "orders-g409-ckpt", "lower": "2026-09-17 06:32:11.004+00",
+      "cutoff": "2026-09-17 07:02:12.550+00", "dict": "orders-g370-dict" }
+  ],
+  "deltas": [
+    { "gen": 411, "object": "orders-g411-delta", "prev_cutoff": "2026-09-17 07:02:12.550+00",
+      "cutoff": "2026-09-17 07:29:50.700+00", "dict": "orders-g370-dict" },
+    { "gen": 412, "object": "orders-g412-delta", "prev_cutoff": "2026-09-17 07:29:50.700+00",
+      "cutoff": "2026-09-17 07:44:51.201+00", "dict": "orders-g370-dict" }
+  ]
+}
+```
+
+| field | what it is |
+| --- | --- |
+| `gen` | the chain number of the newest generation |
+| `seed_epoch` | the catalogue's `seed_epoch` this chain was built under — a client whose descriptor says more waits for the next build |
+| `full` | the base: `object`, the `gen` it is attached to, and its `cutoff` |
+| `checkpoints` | the checkpoints **above the base**, oldest first: `object`, `gen`, `lower` (where its window starts), `cutoff` (where it ends), and `dict` |
+| `deltas` | the deltas, oldest first: `object`, `gen`, `prev_cutoff`, `cutoff`, and `dict` |
+| `cutoff_version` | the row-timestamp watermark of the newest cut |
+| `cutoff_lsn` | its lsn |
+| `gc_watermark` | the sweeper's floor: nothing soft-deleted before this is still guaranteed to exist (§7.5). It travels in the manifest because a returning client's own copy of the watermark row is as old as the client — the first planning rule needs the current one. |
+| `cutoff_seq` + `cdc_stream` | the splice point: that stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction begins |
+
+Everything at or below `cutoff_seq` on that stream is in the chain; everything above it is
+not. The direction is overlap-never-gap: a transaction still in flight when the chain was
+built shows up as a duplicate to absorb, never as a hole. (`lsn` cannot do this job — it
+is not monotonic in delivery order, §8.)
+
 ```sh
 > nats kv ls
 ╭──────────────────────────────────────────────────────────────────────────────────╮
@@ -863,52 +992,79 @@ The manifest carries:
 │ schemas     │             │ 2026-08-25 18:17:37 │ 156 KiB │ 257    │ 1h52m48s    │
 ╰─────────────┴─────────────┴─────────────────────┴─────────┴────────┴─────────────╯
 > nats kv ls generations
-# list of all keys of <bucket_name>='generations'
+# every key of the bucket 'generations'
 
 > nats kv get generations _default.test_types --raw
-# list of value of the key '_default.test_types' of the bucket 'generations'
-``` 
-
-```json
-{
-  "gen":2,
-  "bucket":"gen-_default",
-  "cutoff_version":"2026-09-01 14:55:10.327995+00",
-  "cutoff_lsn":"3/59C55798",
-  "version_column":"updated_at",
-  "full":{
-    "gen":1,
-    "object":"test_types-g1-full",
-    "cutoff":"2026-09-01 00:28:57.815815+00"
-  },
-  "deltas":[
-    {
-      "gen":2,
-      "object":"test_types-g2-delta",
-      "prev_cutoff":"2026-09-01 00:28:57.815815+00",
-      "cutoff":"2026-09-01 14:55:10.327995+00"
-    }
-  ]
-}
+# the manifest for that (tenant, table)
 ```
 
-  §10x, absent for plain frames), `cutoff_version` (the row-timestamp watermark), `cutoff_lsn`, and — the splice point — **`cutoff_seq`** with `cdc_stream`: the CDC stream's `last_seq`, captured *before* the build's REPEATABLE READ transaction begins.
-  
-  Everything at or below `cutoff_seq` on that stream is in the chain; everything above it is not. The direction is overlap-never-gap: a transaction still in flight when the chain was built shows up as a duplicate to absorb, never as a hole. (`lsn` cannot do this job — it is not monotonic in delivery order, §8.)
+### Planning a chain
 
-A tenant with no rows for a table still gets a manifest (an explicit empty full), so a client can distinguish "empty" from "not built yet".
+A client holds one watermark per (table, tenant): the `cutoff_version` it last applied.
+The plan is decided from the manifest and that watermark alone, in this order — the first
+rule that matches wins.
+
+1. ⚠️ **Older than the `gc_watermark` → the base.** If the watermark is below the
+   manifest's `gc_watermark`, a row deleted while this client was away may have had its
+   tombstone **reaped**: no checkpoint and no delta still carries that delete, and nothing
+   incremental can remove the row from this replica. Reload. This rule runs *first*,
+   before any arithmetic on cutoffs.
+2. **The deltas reach the watermark → the deltas alone.** They reach it when the oldest
+   applicable delta's `prev_cutoff` is at or below the watermark; when no delta is newer
+   than the watermark, the base must not be newer than it either (a chain rebuilt from g1
+   after a feed restart is not "already applied", it is unreachable).
+3. **A checkpoint covers the absence → checkpoints, then deltas.** If the oldest
+   checkpoint's `lower` is at or below the watermark, apply every checkpoint whose
+   `cutoff` is above it, then the applicable deltas. Overlap between the two is harmless,
+   so the rule is "everything newer than the watermark", not "exactly the hole".
+4. **Otherwise the base**, then every checkpoint and every delta above `full.gen`.
+
+A client with no watermark at all (a fresh replica) takes rule 4.
 
 ### Applying a chain
 
-1. **Read the manifest.** No manifest, or no `full` object → the table has no chain yet (the ordinary case is a table enabled between two cadence ticks). Poll — the producer builds every cadence. Bound the wait (`GENERATION_WAIT_MS`) and mark the table failed rather than following CDC unseeded: an unseeded table that follows CDC diverges silently, which is strictly worse than being visibly absent.
-1. **Plan from the local watermark** (the last applied `cutoff_version`): if the deltas reach it, apply only the newer deltas — idempotent upserts guarded by the version column. Otherwise apply the full, then the deltas after it.
-1. **A full is `DELETE FROM` + replay, in one transaction.** Two rules make that
+1. **Read the manifest.** No manifest, or no base object → the table has no chain yet (the
+   ordinary case is a table enabled between two cadence ticks). Poll — the producer builds
+   every cadence. Bound the wait (`GENERATION_WAIT_MS`) and mark the table failed rather
+   than following CDC unseeded: an unseeded table that follows CDC diverges silently,
+   which is strictly worse than being visibly absent.
+1. **Plan** with the four rules above.
+1. **Apply each step in order.** A checkpoint and a delta are idempotent: upsert every
+   live row under the version guard, delete by key every row whose tombstone column is set.
+1. **A base step is `DELETE FROM` + replay, in one transaction.** Two rules make that
    destruction safe:
-   * ⚠️ **Never apply a full whose `cutoff_seq` is below the replica's stored position for that stream.** Such a chain predates rows CDC already delivered and will never re-deliver; refuse it and wait for the next cadence build.
+   * ⚠️ **Never apply a base whose `cutoff_seq` is below the replica's stored position for that stream.** Such a chain predates rows CDC already delivered and will never re-deliver; refuse it and wait for the next cadence build.
    * The DELETE shares the transaction with the rows, so a crash mid-apply cannot leave an empty table.
 1. **Record the cutoff** (`cutoff_version`/`cutoff_lsn`) as the new watermark, and anchor the seed gate: on the manifest's `cdc_stream`, drop CDC events with `seq <= cutoff_seq` — they are in the chain. ⚠️ The lsn fallback (a manifest without `cutoff_seq`) must anchor only to a lsn a SEED set — never to a schema event's lsn, which a bridge restart advances to the WAL head and which would then eat every event the new bridge replays.
 
-If an object 404s mid-walk (pruned under you), re-read the manifest once and restart from *its* full — overlap, never a gap.
+If an object 404s mid-walk (pruned under you), re-read the manifest once and restart from
+*its* base — overlap, never a gap.
+
+### What the producer keeps
+
+With the middle level on, retention follows the **levels**, not a count of generations:
+
+* the newest base is kept, and everything older than it goes;
+* checkpoints are kept from that base on — they are how a returning client walks the
+  distance the deltas no longer cover;
+* a delta is kept only above the newest checkpoint: below it the checkpoint carries the
+  same rows in one object.
+
+⚠️ A pair whose lane has **stalled** keeps its deltas. With no checkpoint above the base
+there is nothing to prune down to, and pruning to a checkpoint that never came would
+strand every returning client on the base.
+
+Retiring and deleting are two steps. A retired generation (`retired_at`) leaves the
+manifest at once, so no new client is sent to it; its objects survive
+`GENERATION_RETIRE_GRACE_SECONDS` — long enough for a client mid-walk to finish — and the
+newest `GENERATION_RETIRE_WINDOWS` retirements are kept whatever the clock says, so the
+grace cannot let a slow store fill the disk.
+
+⚠️ **The sweeper's window must outlive what the chain promises.** A client catching up
+through checkpoints needs every tombstone inside the window it walks, so `GC_THRESHOLD_MS`
+must exceed `2 × GENERATION_CHECKPOINT_SECONDS` (or, with the middle level off,
+`GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS`). `bridge --diagnose` refuses a
+configuration that breaks this, and the boot warns.
 
 ### The Connection Flow (Resolving the Gap)
 
@@ -1318,7 +1474,7 @@ CREATE TABLE _zebridge_inbox (      -- the FK hold (§4): a child whose parent h
   attempts INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE _zebridge_dicts (      -- zstd dictionaries named by chain deltas (§6),
+CREATE TABLE _zebridge_dicts (      -- zstd dictionaries named by chain objects (§6),
   name  TEXT PRIMARY KEY,           -- fetched once, immutable by name
   bytes BLOB NOT NULL
 );
@@ -1925,7 +2081,7 @@ never forwarded (§4). So the tombstone *is* the delete on the client side: a re
 keeps tombstoned rows holds them forever. The reference clients apply one rule at all
 three doors: tombstone present and not null → delete by key.
 
-A **full** carries live rows only: a client applies a full as a wipe and a reload in one transaction, so a row absent from it is gone on the replica whether or not the full named it. A **delta** keeps its tombstoned rows — that is the delete signal for a client catching up through deltas — and the delta object built at the tick the tombstone was set carries it for as long as the chain keeps that generation, whatever the sweeper reaps later. On a table with the soft-delete guard (`zebridge_soft_delete_t`) the only physical deletes are the sweeper's reaps, and the producer forces no full for them; a table without the guard still gets a full whenever its delete counter moves, since nothing else can carry an absence.
+A **base** carries live rows only: a client applies it as a wipe and a reload in one transaction, so a row absent from it is gone on the replica whether or not the base named it. A **checkpoint** and a **delta** keep their tombstoned rows — that is the delete signal for a client catching up through the chain (§6) — and the object built at the tick the tombstone was set carries it for as long as the chain keeps that generation, whatever the sweeper reaps later. This is the whole reason `GC_THRESHOLD_MS` must outlive what the chain promises: past it, a delete exists only as an absence, and only a base states absence. On a table with the soft-delete guard (`zebridge_soft_delete_t`) the only physical deletes are the sweeper's reaps, and the producer forces no base for them; a table without the guard still gets a base whenever its delete counter moves, since nothing else can carry an absence.
 
 > ### 🔴 **DBA — a table is created for this**
 >

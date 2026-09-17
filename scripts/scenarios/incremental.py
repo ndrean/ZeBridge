@@ -290,12 +290,11 @@ def main() -> int:
         check(bool(covering), "away across checkpoints: the chain HAS one covering the absence",
               f"checkpoints {[(ck['gen'], ck['lower']) for ck in covering]}")
         steps = plan_for(lib, man2, wm2)
-        # ⚠️ Today the plan is deltas alone, and that is RIGHT: retention still counts
-        # generations, so the deltas themselves reach back past this watermark and the
-        # planner prefers them (§10gs rule 2 before rule 3). The promise this case makes
-        # either way is the one a client feels — NO base, no reload. When retention is by
-        # checkpoints (plan step 3) the deltas stop reaching and the same client will take
-        # `['checkpoint', …, 'delta']` here; the assertion below holds for both.
+        # ⚠️ Two plans pass here, and both keep the promise a client feels — NO base, no
+        # reload. Deltas alone, when the deltas themselves still reach back past this
+        # watermark (the planner prefers them, §10gs rule 2 before rule 3); or
+        # `['checkpoint', …, 'delta']`, once retention by levels has pruned the deltas
+        # below the newest checkpoint and only the checkpoint reaches that far.
         check("full" not in steps, "away across checkpoints: no base — the client does not reload",
               f"plan {steps}")
         c2 = Client(lib, url, tmp / "checkpoints.sqlite3", "checkpoints")

@@ -370,6 +370,8 @@ fn runDiagnose(
     cdc_max_age_seconds: u64,
     chain_depth: u32,
     gc_threshold_ms: ?u64,
+    checkpoint_seconds: u64,
+    async_fulls: bool,
 ) u8 {
     var findings: usize = 0;
     log.info("🩺 DIAGNOSE (dry run): BASE_BUF gives a {d}-byte event buffer; slot '{s}', publication '{s}'. Nothing will be created, registered, or dialled.", .{ event_buf, slot_name, pub_name });
@@ -511,16 +513,38 @@ fn runDiagnose(
     // it from the doctor, before the log line passes by under load.
     // The sweeper's inequality too (NOTES §1.13): the doctor can only check it when
     // GC_THRESHOLD_MS is in this environment, since the sweeper is a separate process.
-    const promise_s: u64 = cadence_seconds * chain_depth;
+    // §10gy: WHICH window a client's catch-up rests on, and therefore which one the
+    // sweeper must outlive. With checkpoints the chain no longer promises `depth` cuts of
+    // deltas: it promises a CHECKPOINT, and a checkpoint holds every delete of its window
+    // only while no tombstone inside it can have been reaped. Twice the cadence, so the
+    // build that follows a window still lands inside the threshold.
+    const promise_s: u64 = if (checkpoint_seconds > 0) checkpoint_seconds * 2 else cadence_seconds * chain_depth;
+    const promise_what: []const u8 = if (checkpoint_seconds > 0) "2 × GENERATION_CHECKPOINT_SECONDS" else "chain depth × cadence";
     if (gc_threshold_ms) |thr| {
         if (thr / 1000 < promise_s) {
             findings += 1;
-            log.err("🔴 GC_THRESHOLD_MS ~{d}s is BELOW chain depth × cadence = {d}s: a tombstone can be reaped before the delta that ships it. Raise the sweeper's threshold or lower depth × cadence.", .{ thr / 1000, promise_s });
+            log.err("🔴 GC_THRESHOLD_MS ~{d}s is BELOW {s} = {d}s: a tombstone can be reaped inside the window the chain still ships, and a deleted row survives on every client that catches up through it. Raise the sweeper's threshold, or lower {s}.", .{ thr / 1000, promise_what, promise_s, if (checkpoint_seconds > 0) "the checkpoint cadence" else "depth × cadence" });
         } else {
-            log.info("✅ sweeper window {d}s ≥ depth × cadence {d}s", .{ thr / 1000, promise_s });
+            log.info("✅ sweeper window {d}s ≥ {s} {d}s", .{ thr / 1000, promise_what, promise_s });
         }
     } else {
-        log.info("ℹ️ depth × cadence = {d}s; the sweeper's GC_THRESHOLD_MS must stay above it (not in this environment — checked when it is)", .{promise_s});
+        log.info("ℹ️ {s} = {d}s; the sweeper's GC_THRESHOLD_MS must stay above it (not in this environment — checked when it is)", .{ promise_what, promise_s });
+    }
+
+    // §10gy: the middle level only exists if the background lane can cut it. Asking for
+    // checkpoints with the lane off is silent: no checkpoint is ever written, the chain
+    // falls back to deltas only, and retention — which prunes by levels the moment
+    // checkpoints are asked for — finds no checkpoint to prune against and keeps every
+    // delta it has. A finding, not a warning: the store grows and nobody is told.
+    if (checkpoint_seconds > 0 and !async_fulls) {
+        findings += 1;
+        log.err("🔴 GENERATION_CHECKPOINT_SECONDS is {d}s but GENERATION_ASYNC_FULLS is off: the background lane cuts checkpoints, so none is ever written, and retention keeps every delta waiting for one. Turn the lane on, or set GENERATION_CHECKPOINT_SECONDS=0.", .{checkpoint_seconds});
+    }
+    // A window shorter than a cut means a checkpoint is due at nearly every generation:
+    // the middle level replaces the delta lane instead of standing behind it. Correct,
+    // and a waste of the store.
+    if (checkpoint_seconds > 0 and checkpoint_seconds < cadence_seconds * 2) {
+        log.warn("⚠️ GENERATION_CHECKPOINT_SECONDS {d}s is under two cadences ({d}s): a checkpoint falls due at nearly every cut, so the deltas above it never accumulate and the middle level pays for what a delta already ships", .{ checkpoint_seconds, cadence_seconds * 2 });
     }
     if (cdc_max_age_seconds < cadence_seconds * 2) {
         findings += 1;
@@ -957,6 +981,8 @@ pub fn main(init: std.process.Init) !void {
             runtime_config.cdc_max_age_seconds,
             runtime_config.generation_chain_depth,
             if (init.minimal.environ.getPosix("GC_THRESHOLD_MS")) |t| (std.fmt.parseInt(u64, t, 10) catch null) else null,
+            runtime_config.generation_checkpoint_seconds,
+            runtime_config.generation_async_fulls,
         );
         std.process.exit(code);
     }
@@ -1269,16 +1295,32 @@ pub fn main(init: std.process.Init) !void {
         // the row silently survives on that client. The sweeper is a separate
         // process; when its GC_THRESHOLD_MS is visible here, check it, otherwise
         // state the number the operator must hold it above.
-        const promise_s: u64 = runtime_config.generation_cadence_seconds * runtime_config.generation_chain_depth;
+        // §10gy: the same rule at boot — with checkpoints on, it is the checkpoint window
+        // the sweeper must outlive, not depth cuts of deltas.
+        const ckpt_s = runtime_config.generation_checkpoint_seconds;
+        const promise_s: u64 = if (ckpt_s > 0) ckpt_s * 2 else runtime_config.generation_cadence_seconds * runtime_config.generation_chain_depth;
+        const promise_what: []const u8 = if (ckpt_s > 0) "2 × GENERATION_CHECKPOINT_SECONDS" else "chain depth × cadence";
         if (init.minimal.environ.getPosix("GC_THRESHOLD_MS")) |thr_str| {
             const thr_ms = std.fmt.parseInt(u64, thr_str, 10) catch 0;
             if (thr_ms / 1000 < promise_s) {
-                log.warn("⚠️ GC_THRESHOLD_MS ~{d}s is BELOW chain depth × cadence = {d}s: a tombstone can be reaped before the delta that ships it, and a hard-deleted row silently survives on a catching-up client (NOTES.md §1.13)", .{ thr_ms / 1000, promise_s });
+                log.warn("⚠️ GC_THRESHOLD_MS ~{d}s is BELOW {s} = {d}s: a tombstone can be reaped inside the window the chain still ships, and a deleted row silently survives on a client that catches up through it. Raise the sweeper's threshold, or lower {s}.", .{ thr_ms / 1000, promise_what, promise_s, if (ckpt_s > 0) "GENERATION_CHECKPOINT_SECONDS" else "GENERATION_CADENCE_SECONDS / GENERATION_CHAIN_DEPTH" });
             } else {
-                log.info("🧬 retention: sweeper window {d}s ≥ depth × cadence {d}s ✓", .{ thr_ms / 1000, promise_s });
+                log.info("🧬 retention: sweeper window {d}s ≥ {s} {d}s ✓", .{ thr_ms / 1000, promise_what, promise_s });
             }
         } else {
-            log.info("🧬 delta catch-up window: depth × cadence = {d}s. The sweeper's GC_THRESHOLD_MS must stay above it (not visible in this env — checked when it is)", .{promise_s});
+            log.info("🧬 catch-up window: {s} = {d}s. The sweeper's GC_THRESHOLD_MS must stay above it (not visible in this env — checked when it is)", .{ promise_what, promise_s });
+        }
+        // §10gy: the same two couplings the doctor checks — a lane that cannot cut the
+        // level that was asked for, and a window so short the level has nothing to stand
+        // behind. Both are silent at run time.
+        if (ckpt_s > 0 and !runtime_config.generation_async_fulls) {
+            log.warn("⚠️ GENERATION_CHECKPOINT_SECONDS is {d}s but GENERATION_ASYNC_FULLS is off: the background lane cuts checkpoints, so none will be written, and retention keeps every delta waiting for one. Turn the lane on, or set GENERATION_CHECKPOINT_SECONDS=0.", .{ckpt_s});
+        } else if (ckpt_s > 0 and ckpt_s < runtime_config.generation_cadence_seconds * 2) {
+            log.warn("⚠️ GENERATION_CHECKPOINT_SECONDS {d}s is under two cadences ({d}s): a checkpoint falls due at nearly every cut, and the deltas above it never accumulate", .{ ckpt_s, runtime_config.generation_cadence_seconds * 2 });
+        } else if (ckpt_s > 0) {
+            log.info("🧬 chain: base + checkpoint every {d}s + deltas above it; retention prunes by level", .{ckpt_s});
+        } else {
+            log.info("🧬 chain: base + deltas, {d} cut(s) deep; retention prunes by generation count", .{runtime_config.generation_chain_depth});
         }
         // The CDC window (§10eg): a client further behind than a stream holds
         // re-seeds from the chain and resumes at the newest cutoff — at most one

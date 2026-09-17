@@ -695,9 +695,11 @@ A table reaches a client by two paths. The **stream** carries every change as it
 
 Every `GENERATION_CADENCE_SECONDS` the bridge walks the published tables and, for each tenant of each table that moved, cuts a **delta**: the rows whose version moved since the last cut, tombstoned rows included, because a tombstone is how a delete travels.
 
-Every `GENERATION_CHAIN_DEPTH` generations, whenever a delta would carry more than half the table (a burst re-stamping the same rows would otherwise put them in every delta), and whenever only a full can carry what happened (a hard delete on a table without the soft-delete guard, a changed column shape, a re-seed asked with `zebridge_reseed`), it also cuts a **full**: the live rows only, since a client applies a full as a wipe and a reload. The objects are MessagePack, compressed with zstd and a dictionary trained on the full, chunked into the tenant's object store; a manifest in the `generations` bucket names the chain.
+Every `GENERATION_CHECKPOINT_SECONDS` a background lane cuts a **checkpoint**: every row that moved since the previous checkpoint, tombstones included. It is the middle level — one object that covers a whole window of deltas, so a client that was away for hours walks a handful of checkpoints instead of hundreds of deltas, and never reloads the table for being away.
 
-A client that was away applies the deltas cut after its watermark when the oldest of them begins at or before it, so the chain continues from where the replica stands; when no kept delta reaches that far back (with depth 6 and a 300 s cadence, an absence of about half an hour), it reloads the full and the deltas cut after it. Either way it then resumes the stream at the sequence recorded in the manifest.
+A **base** — the live rows only, since a client applies it as a wipe and a reload — is cut when only a base can carry what happened (a hard delete on a table without the soft-delete guard, a truncate, a changed column shape, a re-seed asked with `zebridge_reseed`), when a delta would carry more than half the table (a burst re-stamping the same rows would otherwise put them in every delta), and, routinely, when the checkpoints above it weigh more than it does (`GENERATION_BASE_REBUILD_PERCENT`): past that bar a returning client pays more to walk them than to reload. `GENERATION_CHAIN_DEPTH` rotates a base in only when the lane has stalled and no checkpoint stands above the base. The objects are MessagePack, compressed with zstd and a dictionary trained on the base, streamed straight into the tenant's object store — the producer never holds a table in memory — and a manifest in the `generations` bucket names the chain.
+
+A client that was away applies the deltas cut after its watermark when the oldest of them begins at or before it, so the chain continues from where the replica stands; when no kept delta reaches that far back, it applies the checkpoints that cover the absence and then those deltas; and it reloads the base only when nothing covers the absence, or when its watermark is older than the sweeper's `gc_watermark` — past that, a delete it missed may have had its tombstone reaped, and only a base states absence. Either way it then resumes the stream at the sequence recorded in the manifest.
 
 ### The one rule
 
@@ -720,7 +722,7 @@ The producer does not wait for the cadence when a stream moves fast. The publish
 
 Nothing resumes past a hole. A client whose manifest's cut is older than the stream's oldest message says `chain predates the stream` and waits; the producer sees the same thing at its next tick and cuts a delta with a fresh cut, empty if the table did not move, so the wait is at most one cadence. A client that stayed connected but stopped reading for longer than the window, a phone in the background, a throttled tab, sees the jump in sequence numbers on its next message and reloads from the chain at once. If the stream prunes faster than a build, the producer retries the build three times and then says so; the next step, pausing publication for one build while the WAL absorbs the burst, is not built yet.
 
-The sweeper's clock is coupled to the same chain: `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS` must stay under `GC_THRESHOLD_MS`, or a tombstone can be reaped before the delta that would carry it. The knobs are together in [Configuration](#chain-sweeper-and-stream-retention).
+The sweeper's clock is coupled to the same chain: what the chain promises must stay under `GC_THRESHOLD_MS`, or a tombstone can be reaped inside the window a client still catches up through. With checkpoints on, the promise is `2 × GENERATION_CHECKPOINT_SECONDS`; with them off, `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS`. `bridge --diagnose` refuses a configuration that breaks it and the boot warns. The knobs are together in [Configuration](#chain-sweeper-and-stream-retention).
 
 ## State
 
@@ -2070,7 +2072,11 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 | variable | default | what it sets |
 | --- | --- | --- |
 | `GENERATION_CADENCE_SECONDS` | 600 (300 in `.env.bridge`) | how often the producer cuts a generation |
-| `GENERATION_CHAIN_DEPTH` | 6 | generations kept per table and tenant; a full at least every depth, unless deferred |
+| `GENERATION_CHAIN_DEPTH` | 6 | generations kept per table and tenant when there are no checkpoints; with them, only how far a stalled lane may drift before a base is rotated in |
+| `GENERATION_CHECKPOINT_SECONDS` | 1800 (0 turns the level off) | how often the lane cuts a checkpoint — the middle level a returning client walks instead of every delta. Only for tables of at least 100,000 rows |
+| `GENERATION_BASE_REBUILD_PERCENT` | 100 | rebuild the base once the checkpoints above it weigh this percentage of it |
+| `GENERATION_RETIRE_GRACE_SECONDS` | 600 | a pruned generation leaves the manifest at once; its objects survive this long, for clients mid-walk |
+| `GENERATION_RETIRE_WINDOWS` | 4 | how many retirements the grace may hold at once — the bound that keeps a slow store from filling the disk |
 | `GENERATION_ASYNC_FULLS` | true | the routine full (every depth) is built in the background while deltas keep being cut, then attached behind them; fulls a correctness rule asks for stay with their delta |
 | `GENERATION_DEFER_FULLS` | true | while a stream has less time left than three builds of a table's full, that full waits and deltas continue; at 4 × depth generations it is built anyway |
 | `GENERATION_WORKERS` | 1 | builders for the early cuts of bursting streams; more re-cut those pairs in parallel, each on its own connections, so a round lasts as long as its longest build. The cadence tick builds in turn whatever this says. Memory: workers × the biggest full's MessagePack size |
@@ -2083,7 +2089,7 @@ All configuration constants are centralized in `src/config.zig` and `grammar.jso
 
 Two inequalities hold them together, both checked by `bridge --diagnose` and at boot:
 
-* `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS < GC_THRESHOLD_MS / 1000`, or a tombstone is reaped before the delta that carries it;
+* `2 × GENERATION_CHECKPOINT_SECONDS < GC_THRESHOLD_MS / 1000` (with checkpoints off: `GENERATION_CHAIN_DEPTH × GENERATION_CADENCE_SECONDS`), or a tombstone is reaped inside the window the chain still ships;
 * `CDC_MAX_AGE_SECONDS ≥ 2 × GENERATION_CADENCE_SECONDS`, plus a build and a seed of the largest table, or a returning client finds a chain the stream no longer overlaps. Changing the cadence moves the age with it unless you set the age yourself.
 
 The manifests live in the `generations` KV bucket, keyed `{tenant}.{table}`; the objects in per-tenant `gen-{tenant}` object stores. Why the rules are what they are: [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream).
