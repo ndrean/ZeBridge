@@ -82,7 +82,11 @@ async def main():
     check(f"the client's write landed and the master computed its tsvector: {m} (verdicts {fl.get('verdicts')})", m == "jumps quickly|'jump':1 'quick':2")
     em.close()
 
-    # The chain comes at the producer's next tick — wait for its manifest before the audit.
+    # The chain comes at the producer's next tick — in the live group that is
+    # GENERATION_CADENCE_SECONDS (300 in .env.bridge), longer than this wait. Ask for it:
+    # zebridge_reseed bumps the seed epoch, the catalogue reload kicks the producer
+    # (§10du), and the full for every tenant of the table is cut within seconds.
+    zb.psql(f"SELECT count(*) FROM public.zebridge_reseed('public.{T}'::regclass)", quiet=True)
     deadline = time.monotonic() + 120
     while time.monotonic() < deadline and not zb.kv_get("generations", f"{TENANT}.{T}"): time.sleep(2)
     import os, subprocess

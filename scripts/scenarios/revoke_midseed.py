@@ -27,6 +27,28 @@ OP_FILE = zb.ROOT / "scripts/native/nsc-store/data/nats/nsc/keys/keys/O/CZ/OCZZM
 ACCOUNT_PUB = "ABSDAXPW56ON5USFCTUQSWSQWTNLZL3DDDVZAPUH3244HU4NM7QFQD5L"
 CONF = zb.ROOT / "scripts/native/nats-server-jwt.conf"
 PID_FILE = zb.ROOT / "scripts/native/nats-server.pid"
+
+
+def nats_pid() -> int:
+    """The running nats-server's pid — the pid FILE is not trusted on its own.
+
+    ⚠️ chaos, nats_outage and matrix restart the server without rewriting up.sh's pid
+    file, so by the time this scenario runs the file names a dead process (measured
+    2026-09-17: file 93524, server 123). SIGHUP to a dead pid raises, the hard-revocation
+    step returns None, and §H2/§H3/§H6 fail for a reason that has nothing to do with
+    revocation. Use the file when its process is alive, else find the server.
+    """
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        pass
+    r = subprocess.run(["pgrep", "-f", "nats-server -js"], capture_output=True, text=True)
+    pids = [int(x) for x in r.stdout.split()]
+    if not pids:
+        sys.exit("no nats-server running — cannot SIGHUP it")
+    return pids[0]
 ADMIN_URL = "postgres://postgres@127.0.0.1:5432/postgres"
 LOG = "/tmp/zb_revoke_midseed_bridge.log"
 T = "mig_rv"
@@ -74,7 +96,7 @@ def revoke(principal, hard):
     r = subprocess.run(args, env=env, capture_output=True, text=True)
     out = r.stdout + r.stderr
     if hard and r.returncode == 0:
-        os.kill(int(PID_FILE.read_text().strip()), 1)   # SIGHUP: the server reloads the amended JWT
+        os.kill(nats_pid(), 1)   # SIGHUP: the server reloads the amended JWT
     return r.returncode, out
 
 
