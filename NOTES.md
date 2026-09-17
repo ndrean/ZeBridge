@@ -13818,3 +13818,7 @@ Two traces stay in libzb from the chase, cheap and rare: the tail consumer's nam
 start sequence when it opens, and a line when a descriptor carries an older seed epoch
 than the replica was seeded under.
 
+Confirmed on the committed state, 2026-09-18: the whole battery green for the first time
+— offline 8/8, live 30/30 (collist now among them), owns 41/41 — ReleaseFast builds,
+restored publication, the checklist of §10ha followed to the letter.
+
