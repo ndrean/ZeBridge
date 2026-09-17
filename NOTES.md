@@ -13615,3 +13615,38 @@ The case that used to prove "away past the chain → the base" no longer can: wi
 the same client is carried incrementally, which is the improvement. It now drives the base
 through §10gw's own rule — the checkpoints outweigh the base, the lane rebuilds it, the
 checkpoints below it retire — and asserts the base from there.
+
+## 10gx. The delta streams too — the bridge's memory goes flat (2026-09-17)
+
+The last artifact built whole in memory. `putChainObject` (§10gi's full writer, generalised)
+now writes deltas as well: COPY straight through the compressor into the object store, with
+two additions — a delta names its window's opener in the document (`prev_cutoff`), and it
+compresses with the era's DICTIONARY, loaded into the compressor before the first byte.
+
+That forced an order change worth stating: the dictionary is decided BEFORE the delta is
+built, not after. A full trains one from its own bytes, so the decision only needs the
+full's corpus — which exists by then — and a delta then streams with it. The old order
+(encode both, then decide, then compress) is what made in-memory deltas necessary.
+
+**A lie fixed on the way.** A checkpoint recorded `ckpt_dict_object` but was compressed
+WITHOUT that dictionary — the lane fetched it after building. Harmless to a reader (zstd
+ignores a dictionary a frame does not reference) but the compression it promised never
+happened. The lane now fetches it first, like the delta.
+
+**Measured, 300 s at 100k events/s, 2M preloaded rows:**
+
+| | in-memory deltas | streamed |
+| --- | --- | --- |
+| bridge RSS median / max | 1,445 / 2,728 MiB | **587 / 597 MiB** |
+| spread between them | 1,283 MiB | **10 MiB** |
+| holes | 0 of 250 | 0 of 252, margin +86 |
+| events published | 99,734/s | 99,150/s |
+| delta build, median | 242 ms | 213 ms |
+
+The ring buffer is 586 MB of that 587 (200,000 slots at BASE_BUF=11), so everything the
+bridge does besides holding its ring now fits in about ten megabytes — at a hundred
+thousand events a second, on a table of 17 million rows. §10gj's three overlapping copies
+of a 590 MB delta are gone, and with them the reason a VPS needed gigabytes.
+
+`incremental.py` 12/12 against streamed deltas: a client reads them exactly as before,
+which is the point — the object is the same document, written differently.

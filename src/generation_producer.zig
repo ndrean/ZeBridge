@@ -779,7 +779,7 @@ pub const GenerationProducer = struct {
     /// snapshot: one more scan, the price of never holding the table. A COPY the CDC
     /// decoder refuses falls back to the text path, which holds the document (as every
     /// full did before); a NATS failure is returned.
-    fn putFullObject(
+    fn putChainObject(
         alloc: std.mem.Allocator,
         payload_alloc: std.mem.Allocator,
         pgc: *c.PGconn,
@@ -789,9 +789,16 @@ pub const GenerationProducer = struct {
         gen: i64,
         cutoff: []const u8,
         vcol: []const u8,
-        /// §10gt: "full" (live rows) or "checkpoint" (rows moved in a window, tombstones
-        /// included) — the document says which, and a client applies them differently.
+        /// §10gt: "full" (live rows), "checkpoint" (rows moved in a window, tombstones
+        /// included) or "delta" — the document says which, and a client applies them
+        /// differently.
         kind: []const u8,
+        /// A delta's window opener; null for a full or a checkpoint.
+        prev_cutoff: ?[]const u8,
+        /// §10gx: the era's dictionary, loaded into the compressor. A delta and a
+        /// checkpoint are compressed WITH it — the manifest names it and the client
+        /// fetches it — while a full trains one from its own bytes and takes none here.
+        dict: ?[]const u8,
     ) !FullObject {
         const expect: usize = blk: {
             const sql = try utils.allocPrintZ(alloc, "SELECT count(*) FROM ({s}) AS q", .{select_sql});
@@ -806,9 +813,10 @@ pub const GenerationProducer = struct {
             const cctx = c.ZSTD_createCCtx() orelse return error.ZstdCompressFailed;
             defer _ = c.ZSTD_freeCCtx(cctx);
             if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, 3)) != 0) return error.ZstdCompressFailed;
-            var fs: FullStream = .{ .cr = &cr, .oa = payload_alloc, .cctx = cctx, .sampler = &sampler, .expect_rows = expect, .gen = gen, .kind = kind, .cutoff = cutoff, .vcol = vcol };
+            if (dict) |d| if (c.ZSTD_isError(c.ZSTD_CCtx_loadDictionary(cctx, d.ptr, d.len)) != 0) return error.ZstdCompressFailed;
+            var fs: FullStream = .{ .cr = &cr, .oa = payload_alloc, .cctx = cctx, .sampler = &sampler, .expect_rows = expect, .gen = gen, .kind = kind, .cutoff = cutoff, .prev_cutoff = prev_cutoff, .vcol = vcol };
             defer fs.raw.deinit(payload_alloc);
-            _ = try docHead(&fs.raw, payload_alloc, cr.names, false, @intCast(expect));
+            _ = try docHead(&fs.raw, payload_alloc, cr.names, prev_cutoff != null, @intCast(expect));
             sampler.feed(fs.raw.items);
             var info = store.put(.{ .name = name, .opts = .{ .max_chunk_size = store.chunk_size } }, &fs) catch |err| {
                 // `put` removed the chunks it had published; the COPY is drained either way.
@@ -827,9 +835,9 @@ pub const GenerationProducer = struct {
         defer c.PQclear(res);
         var rows: usize = 0;
         var widest: usize = 0;
-        const payload = try encodeContent(alloc, payload_alloc, res, gen, kind, cutoff, null, vcol, &rows, &widest);
+        const payload = try encodeContent(alloc, payload_alloc, res, gen, kind, cutoff, prev_cutoff, vcol, &rows, &widest);
         defer payload_alloc.free(payload);
-        const z = try compressZstd(alloc, payload, 3);
+        const z = if (dict) |d| try compressZstdDict(alloc, payload, d, 3) else try compressZstd(alloc, payload, 3);
         var r = try store.putBytes(name, z);
         r.deinit();
         return .{ .rows = rows, .widest = widest, .raw_bytes = payload.len, .z_bytes = z.len, .corpus = try strideCorpus(alloc, payload, 8 * 1024 * 1024), .streamed = false };
@@ -1567,79 +1575,11 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
             const t_f = utils.unixMillis();
-            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full");
+            full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null, null);
             ph.full += utils.unixMillis() - t_f;
             full_rows = full_obj.?.rows;
             widest_row = @max(widest_row, full_obj.?.widest);
         }
-        var delta_payload: ?[]const u8 = null;
-        defer if (delta_payload) |b| self.allocator.free(b);
-        var delta_rows: usize = 0;
-        if (build_delta) {
-            // COPY takes no parameters: the bound is inlined (`deltaLowerBound`, §10gl).
-            const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= {s}", .{ cols_sel, table, vcol, lower_bound.? });
-            const t_q = utils.unixMillis();
-            delta_payload = encodeContentCopy(alloc, self.allocator, pgc, sql, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row) catch blk: {
-                const res = try queryOne(pgc, sql, &.{});
-                defer c.PQclear(res);
-                break :blk try encodeContent(alloc, self.allocator, res, gen, "delta", cutoff_version, last_cutoff, vcol, &delta_rows, &widest_row);
-            };
-            ph.query += utils.unixMillis() - t_q;
-        }
-        size_rule: {
-        // §10es: the size rule beside the depth rule. A delta carries every row whose
-        // version moved since the last cut, so a burst that re-stamps the same rows
-        // puts them into every delta cut while it lasts, and a client catching up
-        // applies them once per delta — five deltas of 700,000 rows for a table of
-        // 75,000 live rows, nine copies of each row, 900 MB raw where a full is 19 MB.
-        // A full costs the producer the same 200 ms and carries each row once: when
-        // the delta would carry more than half the table, cut the full with it. A
-        // client with an old watermark takes the full; one with a recent watermark
-        // takes the one delta it needs anyway.
-        if (build_delta and !build_full and delta_rows > 0 and delta_rows * 2 > @as(usize, @intCast(@max(table_rows, 1)))) {
-            // §10gr: to the background lane, like the depth rotation's (§10gf). This full
-            // is an ECONOMY for a client catching up, never a correctness debt — the delta
-            // beside it carries every row that moved — so it must not hold the cut. Built
-            // here it was the last hole left in every firehose run: 9.7 s at 100k events a
-            // second, 14.1 s at 150k, and the cut fell off the stream while it ran. A
-            // client that seeds a few seconds later gets the same economy from the lane.
-            if (self.async_fulls) {
-                // A refused request means one is already queued for this pair, which
-                // serves the same purpose: either way this cut publishes its delta alone.
-                if (self.requestFull(tenant, table, vcol, tcol, .full)) {
-                    log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for a client catching up; the background lane builds one, this cut publishes the delta alone", .{ tenant, table, delta_rows, table_rows });
-                } else {
-                    log.debug("🧬 '{s}'/'{s}': the delta carries {d} of {d} row(s); a full is already queued for the lane", .{ tenant, table, delta_rows, table_rows });
-                }
-                break :size_rule;
-            }
-            log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, table_rows });
-            build_full = true;
-            const sql = if (tcol.len > 0)
-                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
-            else
-                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
-            const t_f = utils.unixMillis();
-            full_obj = try putFullObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full");
-            ph.full += utils.unixMillis() - t_f;
-            full_rows = full_obj.?.rows;
-            widest_row = @max(widest_row, full_obj.?.widest);
-        }
-        }
-        {
-            const res = try queryOne(pgc, "COMMIT", &.{});
-            c.PQclear(res);
-        }
-
-        // The retirement survivor of measureWidestRow (NOTES.md §1.13): the chain
-        // carries any width (object chunking), but CDC cannot — a row at or over the
-        // event buffer will suspend this table the moment ANY writer touches it. Say
-        // so on every build, before it happens; the width-guard trigger stops NEW
-        // rows, this catches the legacy ones already seeded to clients.
-        if (widest_row >= self.event_buf_bytes) {
-            log.warn("⚠️ '{s}'/'{s}': widest row ~{d} bytes is at or over the {d}-byte CDC event buffer. Chains carry it; CDC will SUSPEND this table on its next touch. Shrink the row (store a reference, not the blob) or raise BASE_BUF.", .{ tenant, table, widest_row, self.event_buf_bytes });
-        }
-
         // ── 3b. the dictionary (§10x): a chain member, trained ONLY at a full ──
         // build from the full's own msgpack bytes. The producer's memory is PG:
         // the dictionary persists on the full's bookkeeping row and is read back
@@ -1715,9 +1655,79 @@ pub const GenerationProducer = struct {
                 dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_d, 0, 2)));
             }
         }
-
-        // ── 4. immutable objects first (the full is already written, §10gi) ──
         ph.train = utils.unixMillis() - t_d;
+
+        // §10gx: the delta streams too — COPY straight through the compressor into the
+        // object store, with the era's dictionary loaded first. It was the last artifact
+        // built whole in memory: three copies of it overlapped at the peak (the buffer
+        // doubling as it grew, the `compressBound` destination, and the tick's arena),
+        // which is where the gigabytes at 100k events a second came from (§10gj).
+        var delta_obj: ?FullObject = null;
+        var delta_rows: usize = 0;
+        if (build_delta) {
+            const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= {s}", .{ cols_sel, table, vcol, lower_bound.? });
+            const delta_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
+            const t_q = utils.unixMillis();
+            delta_obj = try putChainObject(alloc, self.allocator, pgc, &store, delta_name, sql, gen, cutoff_version, vcol, "delta", last_cutoff, dict_bytes);
+            delta_rows = delta_obj.?.rows;
+            widest_row = @max(widest_row, delta_obj.?.widest);
+            ph.query += utils.unixMillis() - t_q;
+        }
+        size_rule: {
+        // §10es: the size rule beside the depth rule. A delta carries every row whose
+        // version moved since the last cut, so a burst that re-stamps the same rows
+        // puts them into every delta cut while it lasts, and a client catching up
+        // applies them once per delta — five deltas of 700,000 rows for a table of
+        // 75,000 live rows, nine copies of each row, 900 MB raw where a full is 19 MB.
+        // A full costs the producer the same 200 ms and carries each row once: when
+        // the delta would carry more than half the table, cut the full with it. A
+        // client with an old watermark takes the full; one with a recent watermark
+        // takes the one delta it needs anyway.
+        if (build_delta and !build_full and delta_rows > 0 and delta_rows * 2 > @as(usize, @intCast(@max(table_rows, 1)))) {
+            // §10gr: to the background lane, like the depth rotation's (§10gf). This full
+            // is an ECONOMY for a client catching up, never a correctness debt — the delta
+            // beside it carries every row that moved — so it must not hold the cut. Built
+            // here it was the last hole left in every firehose run: 9.7 s at 100k events a
+            // second, 14.1 s at 150k, and the cut fell off the stream while it ran. A
+            // client that seeds a few seconds later gets the same economy from the lane.
+            if (self.async_fulls) {
+                // A refused request means one is already queued for this pair, which
+                // serves the same purpose: either way this cut publishes its delta alone.
+                if (self.requestFull(tenant, table, vcol, tcol, .full)) {
+                    log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for a client catching up; the background lane builds one, this cut publishes the delta alone", .{ tenant, table, delta_rows, table_rows });
+                } else {
+                    log.debug("🧬 '{s}'/'{s}': the delta carries {d} of {d} row(s); a full is already queued for the lane", .{ tenant, table, delta_rows, table_rows });
+                }
+                break :size_rule;
+            }
+            log.info("🧬 '{s}'/'{s}': the delta carries {d} of the table's {d} row(s) — a full is cheaper for every client catching up; cutting one alongside", .{ tenant, table, delta_rows, table_rows });
+            build_full = true;
+            const sql = if (tcol.len > 0)
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, tcol })
+            else
+                try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
+            const t_f = utils.unixMillis();
+            full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null, null);
+            ph.full += utils.unixMillis() - t_f;
+            full_rows = full_obj.?.rows;
+            widest_row = @max(widest_row, full_obj.?.widest);
+        }
+        }
+        {
+            const res = try queryOne(pgc, "COMMIT", &.{});
+            c.PQclear(res);
+        }
+
+        // The retirement survivor of measureWidestRow (NOTES.md §1.13): the chain
+        // carries any width (object chunking), but CDC cannot — a row at or over the
+        // event buffer will suspend this table the moment ANY writer touches it. Say
+        // so on every build, before it happens; the width-guard trigger stops NEW
+        // rows, this catches the legacy ones already seeded to clients.
+        if (widest_row >= self.event_buf_bytes) {
+            log.warn("⚠️ '{s}'/'{s}': widest row ~{d} bytes is at or over the {d}-byte CDC event buffer. Chains carry it; CDC will SUSPEND this table on its next touch. Shrink the row (store a reference, not the blob) or raise BASE_BUF.", .{ tenant, table, widest_row, self.event_buf_bytes });
+        }
+
+        // ── 4. immutable objects first (the full and the delta are written, §10gi/§10gx) ──
         // Chain objects ship as zstd frames (§10w): built once, read by every
         // client forever — the one payload where compression amortizes fully.
         // Clients detect by the standard 4-byte magic, so mixed chains (older
@@ -1734,16 +1744,8 @@ pub const GenerationProducer = struct {
             r.deinit();
             log.info("📖 '{s}'/'{s}': g{d} dictionary {d} bytes trained from a bounded sample of the full", .{ tenant, table, gen, d.len });
         };
-        if (delta_payload) |p| {
-            const t_z = utils.unixMillis();
-            const z = if (dict_bytes) |d| try compressZstdDict(alloc, p, d, 3) else try compressZstd(alloc, p, 3);
-            ph.zstd += utils.unixMillis() - t_z;
-            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, p.len, z.len, z.len * 100 / @max(p.len, 1), if (dict_bytes != null) " [dict]" else "" });
-            const name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
-            const t_u = utils.unixMillis();
-            var r = try store.putBytes(name, z);
-            r.deinit();
-            ph.upload += utils.unixMillis() - t_u;
+        if (delta_obj) |d| {
+            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}{s}", .{ tenant, table, gen, d.raw_bytes, d.z_bytes, d.z_bytes * 100 / @max(d.raw_bytes, 1), if (dict_bytes != null) " [dict]" else "", if (d.streamed) " [streamed]" else "" });
         }
 
         // ── 5. the chain manifest, swapped last ──────────────────────────────
@@ -1855,8 +1857,10 @@ pub const GenerationProducer = struct {
             bucket,                                cutoff_version,                              lsn,
             utils.unixMillis() - build_started_ms,
         });
-        log.info("🧬   phases: full (count+copy+encode+zstd+upload) {d} ms, delta copy+decode+encode {d} ms, dictionary {d} ms, delta zstd {d} ms, delta upload {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.full, ph.query, ph.train, ph.zstd, ph.upload, full_rows, delta_rows });
-        if (build_delta) log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, delta_payload.?.len });
+        // §10gx: both artifacts are one streamed phase now — COPY, encode, zstd and the
+        // upload happen together, so there is nothing left to time apart.
+        log.info("🧬   phases: full (count+copy+encode+zstd+upload) {d} ms, delta (count+copy+encode+zstd+upload) {d} ms, dictionary {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.full, ph.query, ph.train, full_rows, delta_rows });
+        if (delta_obj) |d| log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, d.raw_bytes });
         if (full_obj) |fo| log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, fo.raw_bytes });
 
         // §10ej: verify AFTER publishing that the cut is still inside the stream. The
@@ -2179,6 +2183,23 @@ pub const GenerationProducer = struct {
             try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, j.tcol })
         else
             try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
+        // §10gx: a checkpoint compresses with the era's dictionary, so it has to be in
+        // hand BEFORE the stream starts — the compressor takes it at the first byte. Until
+        // this, the manifest named a dictionary the object had not been compressed with:
+        // harmless to a reader (zstd ignores a dictionary a frame does not reference) but
+        // a lie, and the compression it promised never happened. A full trains its own
+        // from the bytes it writes, so it takes none here.
+        var lane_dict: ?[]const u8 = null;
+        var lane_dict_name: ?[]const u8 = null;
+        if (j.kind == .checkpoint) {
+            const res_d = try queryOne(bkc, "SELECT encode(dict, 'hex'), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
+                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
+            defer c.PQclear(res_d);
+            if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 1) > 0) {
+                lane_dict = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 0)));
+                lane_dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
+            }
+        }
         var full_rows: usize = 0;
         // §10gi: written to the store while COPY reads, inside the snapshot.
         const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
@@ -2186,7 +2207,7 @@ pub const GenerationProducer = struct {
         var store = try osm.openStore(bucket);
         defer store.deinit();
         const t_q = utils.unixMillis();
-        const fo = try putFullObject(alloc, self.allocator, pgc, &store, obj_name, sql, gen_l, cutoff_l, j.vcol, kind_str);
+        const fo = try putChainObject(alloc, self.allocator, pgc, &store, obj_name, sql, gen_l, cutoff_l, j.vcol, kind_str, null, lane_dict);
         full_rows = fo.rows;
         const query_ms = utils.unixMillis() - t_q;
         {
@@ -2201,16 +2222,11 @@ pub const GenerationProducer = struct {
         var dict_kept = false;
         var dict_ratio: ?i64 = null;
         if (j.kind == .checkpoint) {
-            // §10x: a checkpoint compresses with the era's dictionary — the one the full
-            // trained — and never trains its own. Training belongs to the base.
-            const res_d = try queryOne(bkc, "SELECT encode(dict, 'hex'), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
-            defer c.PQclear(res_d);
-            if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 1) > 0) {
-                dict_bytes = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 0)));
-                dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
-                dict_kept = true;
-            }
+            // §10x: the era's dictionary, fetched above and already in the object's frame.
+            // It is KEPT, never retrained: training belongs to the base.
+            dict_bytes = if (lane_dict) |d| @constCast(d) else null;
+            dict_name = lane_dict_name;
+            dict_kept = true;
         } else {
             const probe = try probeFrom(alloc, fo.corpus, 128 * 1024);
             const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
@@ -2769,9 +2785,11 @@ fn FullStreamOf(comptime Source: type) type {
     raw_off: usize = 0,
     expect_rows: usize,
     gen: i64,
-    /// "full" or "checkpoint" — what the document says it is (§10gt).
+    /// "full", "checkpoint" or "delta" — what the document says it is (§10gt).
     kind: []const u8 = "full",
     cutoff: []const u8,
+    /// A delta names where its window opens; a full and a checkpoint do not (§10gx).
+    prev_cutoff: ?[]const u8 = null,
     vcol: []const u8,
     copy_done: bool = false,
     flushed: bool = false,
@@ -2812,7 +2830,7 @@ fn FullStreamOf(comptime Source: type) type {
                         return error.CopyCountMoved;
                     }
                     const tail = self.raw.items.len;
-                    try docTail(&self.raw, self.oa, self.gen, self.kind, self.cutoff, self.vcol, null);
+                    try docTail(&self.raw, self.oa, self.gen, self.kind, self.cutoff, self.vcol, self.prev_cutoff);
                     self.sampler.feed(self.raw.items[tail..]);
                     self.copy_done = true;
                     break;
