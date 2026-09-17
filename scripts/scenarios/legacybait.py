@@ -109,34 +109,38 @@ def main_sync():
         # ── 4. a fresh boot FORGETS the quarantine — and re-earns it ───────────
         # ⚠️ This phase used to assert the opposite. `checkStoredRowsFit` scanned every
         # published table at boot and re-flagged a stored oversized row, so a reboot
-        # preserved the quarantine. That scan is disabled (NOTES §13): it is an O(table)
-        # read on every start, duplicating guards that already hold at ingress (the width
-        # trigger, on direct writes AND on the bridge's own mutations) and at egress (the
-        # decode-time suspension). What it cost is exactly what this phase now pins: the
-        # suspension lives in the registry, which is MEMORY, so a fresh bridge starts
-        # clean and republishes a HEALTHY schema — clients thaw — until the wide row is
-        # touched again, and then the decode guard re-quarantines it. Containment is not
-        # lost, it is deferred to the next touch.
+        # preserved the quarantine. The O(table) boot scan is gone (NOTES §13), but the
+        # quarantine is NOT forgotten with it: the suspension is recorded in PostgreSQL
+        # when the bridge stops, and a fresh boot re-checks the table's WIDEST STORED ROW
+        # against this event buffer (the shrink-gated check `shrink.py` pins). While the
+        # wide row is still stored, a fresh bridge withholds the schema and republishes
+        # the suspension — clients stay quarantined, no touch needed. Until 2026-09-17
+        # this phase asserted the opposite ("a fresh boot starts clean and thaws"), the
+        # behaviour of an earlier bridge that kept the registry in memory only.
         with zb.Bridge(LOG_B) as b:
-            if not b.wait_for_log("Boot schema published to KV for 'test_types'", timeout=40):
-                zb.bad("the fresh bridge never republished test_types' schema")
+            if b.wait_for_log("Withholding boot schema for refused table 'test_types'", timeout=40):
+                zb.ok("a fresh boot REMEMBERS the quarantine: the stored widest row still exceeds "
+                      "the buffer, so the schema is withheld and the suspension republished")
+            else:
+                zb.bad("the fresh bridge neither withheld nor republished test_types' suspension")
                 failed += 1
             time.sleep(2)
             kv = zb.nats_cli("kv", "get", zb.TOPOLOGY["kv"]["schemas"], "test_types", "--raw")
-            if '"suspended":true' not in kv.stdout.replace(" ", ""):
-                zb.ok("a fresh boot does NOT remember the quarantine (§13: no boot scan) — "
-                      "the schema republishes healthy and clients thaw")
+            if '"suspended":true' in kv.stdout.replace(" ", ""):
+                zb.ok("$KV.schemas.test_types still says suspended after the fresh boot — clients stay quarantined")
             else:
-                zb.bad("the schema key is still suspended after a fresh boot — "
-                       "with the boot scan gone, nothing should re-raise it before a touch")
+                zb.bad("the schema key came back HEALTHY after a fresh boot while the wide row is still stored")
                 failed += 1
 
             # …and the touch re-earns it, which is the containment that remains.
             zb.psql("ALTER TABLE public.test_types DISABLE TRIGGER zebridge_width_guard")
             zb.psql(f"UPDATE public.test_types SET age = 98, updated_at = now() WHERE uid = '{uid}'")
             zb.psql("ALTER TABLE public.test_types ENABLE TRIGGER zebridge_width_guard")
-            if b.wait_for_log("SUSPENDING 'test_types'", timeout=30):
-                zb.ok("and the next touch re-quarantines it: the decode guard is derived from "
+            # A table refused at boot never reaches the decoder: its events are DROPPED at
+            # the door, and the refusal's status line counts them. That count is the proof
+            # the touch was contained.
+            if b.wait_for_log("REFUSED 'test_types' (row_too_large): 1 event(s) dropped", timeout=60):
+                zb.ok("and a touch of the wide row is dropped at the door — the refusal counts it: the containment is derived from "
                       "the data every time, so the containment survives the scan's removal")
             else:
                 zb.bad("the wide row was touched again and the table was NOT re-suspended")

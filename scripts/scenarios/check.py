@@ -113,15 +113,21 @@ def main():
             p, t = line.split("|", 1)
             mapping.setdefault(p, set()).add(t)
 
-    # ── 2. N-1 for client principals ──────────────────────────────────────────
+    # ── 2. memberships per principal ──────────────────────────────────────────
+    # ⚠️ This was an N-1 ASSERTION — "a client principal holds exactly one tenant" — and
+    # it is not the rule any more (§10fn). A principal may belong to several tenants:
+    # `$KV.tenants.<principal>` carries the sorted SET, the JWT is tagged per tenant, both
+    # clients seed one chain per tenant and read one stream per tenant, and a write that
+    # does not name its tenant is refused as ambiguous rather than guessed (PROTOCOL §6
+    # Step 0, §7.1). So this reports the shape; it no longer calls it drift.
     multi = {p: t for p, t in mapping.items() if len(t) > 1 and p not in INFRA}
     if multi:
-        bad(f"client principal(s) hold more than one tenant: "
-            + ", ".join(f"{p}={sorted(t)}" for p, t in multi.items()),
-            "N-1 is the rule for clients (NOTES.md §1.12). Broaden access by moving the\n"
-            "principal to a wider tenant, not by accumulating tenants against its name.")
+        zb.ok(f"{len(multi)} client principal(s) hold several tenants — supported since §10fn "
+              f"(reach is per tenant in the JWT): "
+              + ", ".join(f"{p}={sorted(t)}" for p, t in sorted(multi.items())[:5])
+              + (" …" if len(multi) > 5 else ""))
     else:
-        zb.ok(f"every client principal holds at most one tenant (infrastructure exempt: {sorted(INFRA)})")
+        zb.ok(f"every client principal holds one tenant (infrastructure exempt: {sorted(INFRA)})")
 
     # ── 3. CDC read grants are tenant-scoped ──────────────────────────────────
     skip("CDC read grants tenant-scoped",
@@ -193,12 +199,23 @@ def main():
             tenant_rules.setdefault(t.strip(), c.strip())
 
     for tbl, col in tenant_rules.items():
+        # ⚠️ A rule for a table that does not exist and a rule naming a column that does
+        # not exist are NOT the same finding, and conflating them made this check
+        # permanently red: TENANT_RULES pre-declares the scratch tables the manual
+        # scenarios create and drop (vec_t, blob_t, rl_t …), and a rule for an absent
+        # table is INERT — nothing routes through it until the table is there. A rule
+        # naming a missing COLUMN on a table that IS there is the drift worth failing on:
+        # the rows travel, and the tenant they claim comes from nowhere.
+        exists = zb.psql(f"SELECT to_regclass('public.{tbl}') IS NOT NULL").strip()
+        if exists not in ("t", "true"):
+            zb.ok(f"tenant rule {tbl}:{col} names a table that is not here — inert until it is")
+            continue
         info = zb.psql(
             "SELECT attnotnull::text FROM pg_attribute "
             f"WHERE attrelid='public.{tbl}'::regclass AND attname='{col}' AND attnum>0"
         ).strip()
         if not info:
-            bad(f"tenant rule names {tbl}.{col}, which does not exist")
+            bad(f"tenant rule names {tbl}.{col}, and {tbl} has no such column")
         # ⚠️ `attnotnull::text` renders as 'true'/'false', not psql's usual 't'/'f'. Comparing
         # against 't' reported every NOT NULL column as nullable — a checker that cries wolf
         # is worse than no checker, so accept both spellings.

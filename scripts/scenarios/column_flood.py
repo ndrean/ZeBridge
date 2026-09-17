@@ -29,7 +29,14 @@ ENABLE = (f"tenant_col => 'tenant_id', writable => true, version_col => 'updated
 def teardown():
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
+    zb.forget_table(T)
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
+    # ⚠️ And the DDL events this scenario emitted. A table grown past MAX_COLUMNS leaves a
+    # `schema_def` WIDER than the event buffer (measured: 5,937 bytes against BASE_BUF's
+    # 4,096), and that row outlives the table: `bridge --diagnose` then reports a stored
+    # row it could never carry, for ever, on a table nobody can fix — which is how
+    # `live/diagnose` went red hours after this scenario had finished.
+    zb.psql(f"DELETE FROM public.zebridge_ddl_events WHERE table_name = '{T}'", quiet=True)
 
 
 def suspended_reason():

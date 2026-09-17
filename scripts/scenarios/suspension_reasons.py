@@ -61,6 +61,11 @@ def teardown():
     for t in CASES:
         zb.psql(f"DROP TABLE IF EXISTS public.{t}", quiet=True)
         zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{t}'", quiet=True)
+        zb.forget_table(t)
+        # The too_many_columns case leaves a `schema_def` wider than the event buffer, and
+        # the row outlives its table — `bridge --diagnose` reports it for ever otherwise
+        # (same shape as column_flood's).
+        zb.psql(f"DELETE FROM public.zebridge_ddl_events WHERE table_name = '{t}'", quiet=True)
         zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{t}'", quiet=True)
 
 

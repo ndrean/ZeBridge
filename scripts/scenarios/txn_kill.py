@@ -60,6 +60,7 @@ def stream_of_tenant() -> str:
 
 def cleanup() -> None:
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{TABLE}'", quiet=True)
+    zb.forget_table(TABLE)
     zb.psql(f"ALTER PUBLICATION {zb.publication()} DROP TABLE public.{TABLE}", quiet=True)
     zb.psql(f"DROP TABLE IF EXISTS public.{TABLE}", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{TABLE}'", quiet=True)

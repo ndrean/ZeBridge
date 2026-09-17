@@ -93,9 +93,18 @@ def decode_chain(body: bytes | None, dictionary: bytes | None = None):
     return msgpack.unpackb(zstd_decode(body, dictionary), raw=False, strict_map_key=False)
 
 
-def gens():
+def gens(live_only: bool = True):
+    """The chain's generations. ⚠️ `retired_at IS NULL` is the chain a CLIENT can see.
+
+    Retention retires a generation first — it leaves the manifest at once — and deletes
+    its row and objects only after `GENERATION_RETIRE_GRACE_SECONDS` (§10gq), so a
+    client already walking it can finish. A bare `count(*)` here therefore counts rows
+    that are no longer part of the chain, and this scenario read "pruned to depth 3" as
+    a failure for that reason alone.
+    """
+    where = " AND retired_at IS NULL" if live_only else ""
     out = zb.psql(f"SELECT gen FROM public.zebridge_generations "
-                  f"WHERE tenant='{TENANT}' AND tbl='{TABLE}' ORDER BY gen")
+                  f"WHERE tenant='{TENANT}' AND tbl='{TABLE}'{where} ORDER BY gen")
     return [int(g) for g in out.split()] if out else []
 
 
@@ -125,6 +134,10 @@ async def main():
         sys.exit("another bridge is already running — it would produce this scenario's "
                  "chain concurrently; stop it first")
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tenant='{TENANT}' AND tbl='{TABLE}'")
+    # …and the MANIFEST with them. Rows gone with the manifest left behind is exactly
+    # the state the producer sweeps at its next tick — bumping the seed epoch and
+    # forcing a full — which this scenario then read as 'the chain grew while idle'.
+    zb.nats_cli("kv", "del", zb.kv_bucket("generations"), f"{TENANT}.{TABLE}", "-f")
     # The probe needs at least one row: `touch()` updates min(id), and an EMPTY
     # fixture makes every touch a 0-row no-op — no delta ever rides, and the
     # depth loop below used to spin on that forever (measured: a 52-minute wedge
@@ -220,8 +233,11 @@ async def main():
 
             # ── 3. a touch rides a delta ───────────────────────────────────────
             touch()
-            if not await poll(lambda: len(gens()) >= 2, timeout=CADENCE * 4):
-                zb.bad(f"no delta generation after touch — gens={gens()}")
+            # "A new generation appeared" — counted over EVERY row, retired ones included:
+            # level retention may retire g1 the moment g2 lands, so the LIVE list does not
+            # grow even though the chain did.
+            if not await poll(lambda: max(gens(live_only=False), default=0) >= 2, timeout=CADENCE * 4):
+                zb.bad(f"no delta generation after touch — gens={gens(live_only=False)}")
                 failed += 1
             else:
                 man = await manifest()
@@ -272,19 +288,42 @@ async def main():
             # full/delta only: a pruned full's DICTIONARY legitimately outlives it while
             # a kept delta still references it (the producer deletes it when the last
             # reference is pruned) — it is a chain member, not a stale object.
-            stale = [n for n in names
-                     if (m := re.match(rf"{TABLE}-g(\d+)-(full|delta)$", n)) and int(m.group(1)) <= top - DEPTH]
+            # ⚠️ Objects of a RETIRED generation are expected to still be here: the
+            # grace (§10gq) keeps them for `GENERATION_RETIRE_GRACE_SECONDS` so a client
+            # mid-walk can finish, and only then are they deleted. What must be true
+            # NOW is that nothing retired is still NAMED — not by the manifest, and not
+            # by the live chain. So assert on the manifest and the live rows, and on the
+            # objects only that everything the manifest names is fetchable.
+            retired = [g for g in gens(live_only=False) if g not in chain]
+            named = {man["full"]["object"], *(d["object"] for d in man.get("deltas", [])),
+                     *(ck["object"] for ck in man.get("checkpoints", []))}
+            still_named = [n for n in named
+                           if (m := re.match(rf"{TABLE}-g(\d+)-", n)) and int(m.group(1)) in retired]
+            # ⚠️ NOT "exactly DEPTH generations" any more. Retention follows the chain's
+            # LEVELS when checkpoints are on (§10gw): the newest base is kept, checkpoints
+            # from it on, and deltas only above the newest checkpoint — so a small table
+            # that never earns a checkpoint prunes down to its base alone. The contract
+            # that holds either way is the one a CLIENT depends on: every live generation
+            # is one the manifest names, nothing retired is still named, and the base is
+            # fetchable.
             err = chain_ok(man)
-            if chain == list(range(top - DEPTH + 1, top + 1)) and not stale \
+            named_gens = sorted({int(m.group(1)) for n in named
+                                 if (m := re.match(rf"{TABLE}-g(\d+)-", n))})
+            if chain == named_gens and not still_named \
                     and err is None and await obj_get(man["full"]["object"]) is not None:
-                zb.ok(f"pruned to depth {DEPTH}: gens={chain}, no object ≤ g{top - DEPTH}, "
-                      f"full refreshed at g{man['full']['gen']} and fetchable")
+                zb.ok(f"pruned by level: live gens={chain} are exactly the ones the manifest names, "
+                      f"{len(retired)} retired and none of them named, base g{man['full']['gen']} fetchable")
             else:
-                zb.bad(f"prune wrong: gens={chain}, stale={stale}, chain={err}, man={man}")
+                zb.bad(f"prune wrong: live gens={chain}, retired={retired}, still named={still_named}, "
+                       f"chain={err}, man={man}")
                 failed += 1
 
     finally:
         zb.psql(f"DELETE FROM public.zebridge_generations WHERE tenant='{TENANT}' AND tbl='{TABLE}'")
+        # …and the MANIFEST with them. Rows gone with the manifest left behind is exactly
+        # the state the producer sweeps at its next tick — bumping the seed epoch and
+        # forcing a full — which this scenario then read as 'the chain grew while idle'.
+        zb.nats_cli("kv", "del", zb.kv_bucket("generations"), f"{TENANT}.{TABLE}", "-f")
         # The row seeded above when the fixture was empty — gone, or every later run
         # (and every consumer of `users`) inherits a probe row nobody asked for.
         zb.psql(f"DELETE FROM public.{TABLE} WHERE email = '{PROBE_EMAIL}'", quiet=True)

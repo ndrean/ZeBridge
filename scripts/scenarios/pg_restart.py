@@ -47,9 +47,7 @@ DOWNTIME_S = 12
 # `pg_ctl start` REFUSES to boot the cluster the moment any logical slot exists:
 # 'logical replication slot "zb_probe" exists, but "wal_level" < "logical"'. Measured
 # the hard way — the first run of this scenario left the whole environment down.
-PG_OPTS = ("-p 5432 -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10 "
-           "-c wal_sender_timeout=300s -c logical_decoding_work_mem=256MB -c wal_buffers=64MB "
-           "-c commit_delay=1000 -c commit_siblings=5")
+PG_OPTS = zb.pg_opts()
 LOG = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_pg_restart_bridge.log"
 
 

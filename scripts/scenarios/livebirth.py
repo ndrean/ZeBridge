@@ -75,6 +75,7 @@ async def main():
 
     zb.psql(f"DROP TABLE IF EXISTS public.{FIX}", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
+    zb.forget_table(FIX)
 
     nc = await zb.connect()
     cdc_seen: list[str] = []

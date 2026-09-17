@@ -58,6 +58,14 @@ def main():
             for t in (P, C):
                 out = zb.psql(f"SELECT string_agg(step || ':' || status, ' ') FROM zebridge_enable('public.{t}', {ENABLE})")
                 check(f"zebridge_enable({t}) live: {out.strip()[:50]}…", "error" not in out.lower())
+            # ⚠️ The clients read `$KV.schemas` the moment they open, and the descriptor
+            # is published by the reload the enable's WAL row drives — so connecting
+            # here without waiting is a race. It never showed because the key from the
+            # PREVIOUS run of this scenario was still in the bucket (the fixture names
+            # never change); on a fresh machine, or after the bucket is purged, both
+            # clients say `schema missing for mig_p` and every count below is 0.
+            late = zb.wait_for_schema(P, C, timeout=60)
+            check(f"the descriptors for {P} and {C} are published{(' — still missing: ' + ', '.join(late)) if late else ''}", not late)
             py = Lib(PY_DB, [P, C], "py-rekey-offline")
             nd = Node(NODE_DB, "/tmp/zb_rekey_offline_node.log")
             tenant = py.tenant

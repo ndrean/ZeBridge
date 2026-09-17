@@ -268,10 +268,45 @@ def leaks_available() -> bool:
     return sys.platform == "darwin" and shutil.which("leaks") is not None
 
 
+def pg_opts(port: str | int | None = None) -> str:
+    """The flags `scripts/native/up.sh` starts PostgreSQL with — READ FROM IT, never
+    copied.
+
+    ⚠️ Three scenarios stop and start the shared development cluster (pg_restart,
+    matrix, sweeper_restart) and each carried its own transcription of these flags.
+    The transcriptions were made before §10gk added the tuning four, so every run
+    silently restarted the cluster on 128 MB of shared_buffers and 1 GB of max_wal_size
+    — the configuration that made a 100k firehose a disk benchmark — and left it that
+    way for everything that ran afterwards. Measured on this machine, hours after the
+    fact: `shared_buffers = 128MB, source = configuration file`.
+
+    `wal_level=logical` lives ONLY on the command line here (postgresql.conf keeps the
+    default), so a flagless start REFUSES to boot the cluster once a logical slot
+    exists. That is why this must never silently fall back to a shorter list: it raises.
+    """
+    import re
+    text = (ROOT / "scripts" / "native" / "up.sh").read_text()
+    m = re.search(r"^PG_FLAGS=\(\s*$(.*?)^\)\s*$", text, re.S | re.M)
+    if not m:
+        sys.exit("could not read PG_FLAGS from scripts/native/up.sh — refusing to start "
+                 "PostgreSQL with a guessed configuration")
+    flags = [ln.strip() for ln in m.group(1).splitlines()
+             if ln.strip().startswith("-c ")]
+    if not flags:
+        sys.exit("PG_FLAGS in scripts/native/up.sh parsed to nothing — refusing to guess")
+    return f"-p {port or os.environ.get('NATIVE_PG_PORT', '5432')} " + " ".join(flags)
+
+
 def another_bridge_running() -> bool:
-    # Anchored: `zig-out/bin/bridge_sweeper` is always running and is not a bridge —
-    # unanchored, every owns-group scenario refused to start (measured 2026-08-29).
-    r = subprocess.run(["pgrep", "-f", r"zig-out/bin/bridge$"], capture_output=True, text=True)
+    # The pattern must exclude `zig-out/bin/bridge_sweeper`, which is always running and
+    # is not a bridge — unanchored, every owns-group scenario refused to start (measured
+    # 2026-08-29). ⚠️ Anchoring it with `$` alone was WORSE and silently so: it matched
+    # only a bridge started with NO arguments, and every bridge is started with `--slot`
+    # and `--port`, so the guard saw nothing and the scenario ran beside the long-running
+    # bridge — which is how ratelimit.py measured "no rate limit at all" (both bridges
+    # drank from one workqueue). `( |$)` matches the bridge with or without arguments and
+    # still stops at the sweeper's `_`.
+    r = subprocess.run(["pgrep", "-f", r"zig-out/bin/bridge( |$)"], capture_output=True, text=True)
     return bool(r.stdout.strip())
 
 
@@ -389,6 +424,44 @@ def kv_get(bucket_key: str, key: str) -> str:
     """`$KV.<bucket>.<key>` raw, with `bucket_key` resolved by `kv_bucket`."""
     r = nats_cli("kv", "get", kv_bucket(bucket_key), key, "--raw")
     return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def forget_table(*tables: str) -> None:
+    """Purge `$KV.schemas.<table>` for a fixture a scenario is tearing down.
+
+    ⚠️ A scenario drops its tables in a `finally:` that runs AFTER its probe bridge has
+    exited, so the DROP's tombstone is published to nobody and the key stands for ever.
+    Fifty-three such keys had accumulated here (2026-09-17): every client that connected
+    created fifty-three local tables and waited on chains that would never be built.
+    The bridge now reconciles this at boot (`reconcileDroppedSchemas`), but a scenario
+    should not leave the mess for the next one to clean — and a scratch fixture deserves
+    a PURGE rather than a tombstone: no client should be told a table "was dropped" when
+    it only ever existed for a test.
+    """
+    for t in tables:
+        nats_cli("kv", "del", kv_bucket("schemas"), t, "-f")
+
+
+def wait_for_schema(*tables: str, timeout: float = 30) -> list[str]:
+    """Block until `$KV.schemas.<table>` exists for each name, or the timeout.
+
+    ⚠️ A scenario that enables a table and connects a client IMMEDIATELY is racing the
+    bridge: the descriptor is published by the catalogue reload / DDL pipeline, which
+    the WAL drives, and the client reads the bucket the moment it opens. The race was
+    invisible for months because a key left by the PREVIOUS run of the same scenario
+    was already there — the fixture names are stable. Purge the bucket (or run on a
+    fresh machine) and the client says `schema missing for <table>` instead.
+
+    Returns the names that never appeared, so a caller can fail with a real message.
+    """
+    import time
+    deadline = time.time() + timeout
+    missing = list(tables)
+    while missing and time.time() < deadline:
+        missing = [t for t in missing if not kv_get("schemas", t)]
+        if missing:
+            time.sleep(0.5)
+    return missing
 
 
 def parse_tenants(value: str) -> list[str]:

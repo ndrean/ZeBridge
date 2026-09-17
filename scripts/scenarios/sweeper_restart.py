@@ -31,9 +31,7 @@ import zb  # noqa: E402
 FIX = "zb_sweeper_restart_probe"
 PG_CTL = "/opt/homebrew/opt/postgresql@18/bin/pg_ctl"
 DATADIR = str(zb.ROOT / "postgres-data")
-PG_OPTS = ("-p 5432 -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10 "
-           "-c wal_sender_timeout=300s -c logical_decoding_work_mem=256MB -c wal_buffers=64MB "
-           "-c commit_delay=1000 -c commit_siblings=5")
+PG_OPTS = zb.pg_opts()
 SWEEPER = zb.ROOT / "zig-out" / "bin" / "bridge_sweeper"
 LOG = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_sweeper_restart.log"
 
@@ -158,6 +156,7 @@ def main() -> int:
             logf.close()
         ensure_pg_up()
         zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
+        zb.forget_table(FIX)
         zb.psql(f"ALTER PUBLICATION {zb.publication()} DROP TABLE public.{FIX}", quiet=True)
         zb.psql(f"DROP TABLE IF EXISTS public.{FIX} CASCADE", quiet=True)
 

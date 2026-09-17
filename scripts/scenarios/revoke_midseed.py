@@ -86,6 +86,7 @@ def cleanup(principals):
         (TMP / f"zb_{p}.creds").unlink(missing_ok=True)
     zb.psql(f"DROP TABLE IF EXISTS public.{T}", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{T}'", quiet=True)
+    zb.forget_table(T)
     zb.psql(f"DELETE FROM public.zebridge_generations WHERE tbl = '{T}'", quiet=True)
 
 

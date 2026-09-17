@@ -51,6 +51,7 @@ MARK = "sweeper-scenario"
 def setup_fixture():
     zb.psql(f"DROP TABLE IF EXISTS public.{FIX} CASCADE", quiet=True)
     zb.psql(f"DELETE FROM public.zebridge_catalogue WHERE tbl = '{FIX}'", quiet=True)
+    zb.forget_table(FIX)
     out = zb.psql(f"""
         CREATE TABLE public.{FIX} (uid uuid PRIMARY KEY, some_text text,
             inserted_at timestamptz NOT NULL DEFAULT now(),
