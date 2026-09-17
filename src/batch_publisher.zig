@@ -962,7 +962,14 @@ pub const BatchPublisher = struct {
     /// per call for a live look; aggregated on /metrics either way.
     fn timedPublish(self: *BatchPublisher, subject: []const u8, msg_id: ?[]const u8, data: []const u8) !void {
         const t0 = utils.nanoTimestamp();
-        try self.publisher.publish(subject, msg_id, data);
+        // Name the subject when the publish itself fails: `NoStreamResponse` says only
+        // "nobody answered", and without the subject an operator cannot tell whether a
+        // stream is missing, a bucket was wiped, or one subject in a mixed batch is
+        // unrouted (diagnosed the hard way 2026-09-17).
+        self.publisher.publish(subject, msg_id, data) catch |err| {
+            log.err("❌ publish to '{s}' failed: {s}", .{ subject, @errorName(err) });
+            return err;
+        };
         const elapsed_ns = utils.nanoTimestamp() - t0;
         if (self.metrics) |m| m.recordPublishAck(elapsed_ns);
         if (self.hot) |h| h.account(subject, data.len);
@@ -1235,6 +1242,12 @@ pub const BatchPublisher = struct {
                 return;
             } else |err| {
                 // FAILURE - Log and retry with backoff
+                // Name the FIRST subject of the batch: `NoStreamResponse` means some
+                // subject in it matched no stream, and without the name an operator
+                // cannot tell which (diagnosing 2026-09-17 cost an hour of guessing).
+                if (batch.items.len > 0) {
+                    log.err("❌ publish failed on a batch of {d}, first subject '{s}'", .{ batch.items.len, self.events[batch.items[0]].getSubject() });
+                }
                 log.err("❌ NATS publish failed (attempt {d}/{d}): {}", .{
                     retry_count + 1,
                     max_retries + 1,

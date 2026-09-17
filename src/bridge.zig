@@ -1519,6 +1519,12 @@ pub fn main(init: std.process.Init) !void {
     // changes from here on; this catches mappings that existed before this boot.
     try event_proc.publishBootTenants(allocator);
 
+    // §10gz: and the same reconciliation for the schemas mirror — a table dropped
+    // while no bridge was reading the WAL left a key nothing will ever tombstone.
+    // Advisory: a failure here logs and boot goes on.
+    event_proc.reconcileDroppedSchemas(allocator) catch |err|
+        log.warn("🗑️ dropped-table reconciliation skipped ({s}) — a stale schema key would stand", .{@errorName(err)});
+
     const batch_config = batch_publisher.BatchConfig{
         .max_events = Config.Batch.max_events,
         .max_wait_ms = Config.Batch.max_age_ms,

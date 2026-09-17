@@ -2060,7 +2060,119 @@ pub const EventProcessor = struct {
             published += 1;
         }
 
-        log.info("✅ Boot tenant backfill published to KV for {d} principal(s) ({d} membership row(s))", .{ published, num_rows });
+        // §10gz: the other direction, which the boot pass never did. Publishing what
+        // EXISTS leaves a key for a principal whose LAST membership was deleted while
+        // this bridge was down: the purge rides that DELETE's WAL (`purgeTenantKey`),
+        // and WAL the bridge never read — or a restarted feed discarded — carries it to
+        // nobody. The stale key then resolves the revoked principal to its old tenant
+        // for ever, which is exactly the rung `--revoke`'s mapping step is supposed to
+        // pull. Measured on the dev stack: 25 tenants deleted with the bridge down,
+        // `$KV.tenants.mapper` still answered after the next boot.
+        var stale: usize = 0;
+        if (self.publisher) |publ| if (publ.js) |*js| {
+            if (js.kvBucket(self.topology.kv_tenants)) |kv_const| {
+                var kv = kv_const;
+                defer kv.deinit();
+                if (kv.keys()) |res| {
+                    defer res.deinit();
+                    for (res.value) |key| {
+                        const held = self.roster.get(key);
+                        if (held != null and held.?.items.len > 0) continue;
+                        self.purgeTenantKey(key);
+                        stale += 1;
+                    }
+                } else |err| log.warn("🧹 could not list $KV.{s} to reconcile deletions: {s} — a mapping deleted while this bridge was down would stand", .{ self.topology.kv_tenants, @errorName(err) });
+            } else |err| log.warn("🧹 tenants bucket unreachable at boot ({s}) — deletions not reconciled", .{@errorName(err)});
+        };
+
+        log.info("✅ Boot tenant backfill published to KV for {d} principal(s) ({d} membership row(s)), {d} stale key(s) purged", .{ published, num_rows, stale });
+    }
+
+    /// §10gz: the DELETING direction of the `$KV.schemas` mirror, which boot never had.
+    ///
+    /// A DROP TABLE publishes its tombstone from the DDL event — off the WAL. A table
+    /// dropped while this bridge was DOWN, or whose DROP rode WAL a restarted feed
+    /// discarded, tombstones nobody: the key stands for ever, and every client that
+    /// ever connects creates the table locally and then waits on a chain that will
+    /// never be built. A client that had already seeded it keeps its rows, so "dropped
+    /// upstream" never reaches the replica at all.
+    ///
+    /// Measured on the dev stack: 53 of 71 keys named tables that no longer existed,
+    /// and both reference clients logged `still no chain (480s)` for each of them.
+    ///
+    /// The rule is unambiguous — the key names a table `to_regclass` cannot find — and
+    /// the answer is the same tombstone the DDL path publishes, not a purge: a vanished
+    /// key is indistinguishable from "never seen", and a client that holds the table
+    /// needs to be TOLD.
+    pub fn reconcileDroppedSchemas(self: *EventProcessor, allocator: std.mem.Allocator) !void {
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const publ = self.publisher orelse return;
+        const js = if (publ.js) |*j| j else return;
+        var kv = js.kvBucket(self.topology.kv_schemas) catch |err| {
+            log.warn("🗑️ schemas bucket unreachable at boot ({s}) — drops not reconciled", .{@errorName(err)});
+            return;
+        };
+        defer kv.deinit();
+        const listed = kv.keys() catch |err| {
+            log.warn("🗑️ could not list $KV.{s} to reconcile drops: {s} — a table dropped while this bridge was down would stand", .{ self.topology.kv_schemas, @errorName(err) });
+            return;
+        };
+        defer listed.deinit();
+
+        var standard_pg_config = self.pg_config.*;
+        standard_pg_config.replication = false;
+        const conn = pg_conn.connect(arena, standard_pg_config) catch |err| {
+            log.warn("🗑️ no connection to check dropped tables ({s}) — drops not reconciled", .{@errorName(err)});
+            return;
+        };
+        defer c.PQfinish(conn);
+
+        const boot_lsn: u64 = blk: {
+            const lsn_res = c.PQexec(conn, "SELECT public.zebridge_wal_head()::text");
+            defer c.PQclear(lsn_res);
+            if (c.PQresultStatus(lsn_res) != c.PGRES_TUPLES_OK or c.PQntuples(lsn_res) == 0) break :blk 0;
+            break :blk parsePgLsnText(std.mem.span(c.PQgetvalue(lsn_res, 0, 0)));
+        };
+
+        var tombstoned: usize = 0;
+        log.debug("🗑️ reconcile: {d} key(s) in $KV.{s}", .{ listed.value.len, self.topology.kv_schemas });
+        for (listed.value) |key| {
+            if (isInternalTable(key)) continue;
+            // Already a tombstone: leave it. Re-publishing one every boot would hand
+            // every client the same death notice for ever and churn the bucket.
+            if (kv.get(key)) |entry_const| {
+                var entry = entry_const;
+                defer entry.deinit();
+                if (std.mem.indexOf(u8, entry.value, "\"dropped\":true") != null) continue;
+            } else |_| {}
+
+            const key_z = try arena.dupeZ(u8, key);
+            const params = [_]?[*:0]const u8{key_z.ptr};
+            const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL", 1, null, &params[0], null, null, 0);
+            defer c.PQclear(pr);
+            if (c.PQresultStatus(pr) != c.PGRES_TUPLES_OK or c.PQntuples(pr) == 0) continue;
+            if (!std.mem.eql(u8, std.mem.span(c.PQgetvalue(pr, 0, 0)), "f")) continue;
+
+            const tombstone = try std.fmt.allocPrint(arena, "{{\"table\":\"{s}\",\"dropped\":true,\"lsn\":{d}}}", .{ key, boot_lsn });
+            const kv_subject = try Topology.render(arena, self.topology.kv_schemas_subject_pattern, &.{.{ .name = "table", .value = key }}, null);
+            const msg_id = try std.fmt.allocPrint(arena, "schema-drop-boot-{s}-{d}", .{ key, boot_lsn });
+            var drop_cols: std.ArrayList(pgoutput.Column) = .empty;
+            try drop_cols.append(arena, .{ .name = "schema", .value = .{ .text = tombstone } });
+            const slot_idx = self.acquireAndFillSlot(kv_subject, key, "SCHEMA", msg_id, 0, drop_cols, boot_lsn) catch |err| {
+                log.warn("🗑️ '{s}' is gone but its tombstone could not be packed ({s})", .{ key, @errorName(err) });
+                continue;
+            };
+            try self.releaseSlotToQueue(slot_idx);
+            self.refused.clear(key);
+            self.pruneDroppedTable(arena, key);
+            tombstoned += 1;
+            log.info("🗑️ '{s}' is in $KV.{s} but no longer in PostgreSQL — tombstone published, chain and streams pruned", .{ key, self.topology.kv_schemas });
+        }
+        if (tombstoned > 0)
+            log.info("✅ {d} schema key(s) reconciled: their tables were dropped while no bridge was reading the WAL", .{tombstoned});
     }
 
     /// Publish schemas for all monitored tables on boot.
@@ -2129,9 +2241,17 @@ pub const EventProcessor = struct {
             // fresh TypeScript client waited 90 s on — because the catalogue DELETE
             // that followed the DROP put it on this list.
             {
+                // ⚠️ `$1::text`, and the cast is the whole check. `format`'s arguments are
+                // VARIADIC "any", so an untyped parameter cannot be resolved and the
+                // statement fails with `could not determine data type of parameter $1` —
+                // the result is then not TUPLES_OK, this guard falls through, and the
+                // descriptor of a table that no longer exists is published again. Which
+                // is one way a stale key came BACK after being tombstoned. Measured
+                // 2026-09-17 while adding `reconcileDroppedSchemas`, which hit the same
+                // wall and silently tombstoned nothing.
                 const tbl_z = try arena.dupeZ(u8, clean_table);
                 const params = [_]?[*:0]const u8{tbl_z.ptr};
-                const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1)) IS NOT NULL", 1, null, &params[0], null, null, 0);
+                const pr = c.PQexecParams(conn, "SELECT to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL", 1, null, &params[0], null, null, 0);
                 defer c.PQclear(pr);
                 if (c.PQresultStatus(pr) == c.PGRES_TUPLES_OK and c.PQntuples(pr) > 0 and std.mem.eql(u8, std.mem.span(c.PQgetvalue(pr, 0, 0)), "f")) {
                     log.info("'{s}' no longer exists — no descriptor published, its tombstone stands", .{clean_table});

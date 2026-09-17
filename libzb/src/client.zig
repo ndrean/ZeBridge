@@ -549,7 +549,11 @@ pub const SyncClient = struct {
         var outcome: Migration = .unchanged;
         if (existing == null or rekey) {
             if (rekey) {
-                std.debug.print("{s}: key shape changed ({s} -> {s}) — rebuilding EMPTY\n", .{ table, key_before.?, key_now });
+                // ⚠️ `key_before` is null on the very path this branch exists for: a
+                // replica with no recorded shape — one from before the record, or one a
+                // kill interrupted — where the PHYSICAL pk columns decided the re-key.
+                // Unwrapping it aborted the whole client process (measured: rebuild_kill).
+                std.debug.print("{s}: key shape changed ({s} -> {s}) — rebuilding EMPTY\n", .{ table, key_before orelse "no recorded shape; the physical key decided", key_now });
                 try execSql(st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS {s}_view;", .{table}));
                 try execSql(st, a, "PRAGMA foreign_keys = OFF;");
             }

@@ -1753,6 +1753,8 @@ pub const GenerationProducer = struct {
         // (its row does not exist yet — see the ordering note above).
         var full_gen_m: i64 = 0;
         var full_cutoff_m: []const u8 = "";
+        // Retire BEFORE rendering: the manifest below is built from the rows that survive.
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen), self.retire_grace_s, self.retire_windows, self.checkpoint_s > 0, if (build_full) gen else 0);
         var deltas_json: std.ArrayList(u8) = .empty;
         {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen)});
@@ -1845,8 +1847,7 @@ pub const GenerationProducer = struct {
         self.recordCut(tenant, table, vcol, tcol, guarded, cdc_stream, cutoff_seq, utils.unixMillis() - build_started_ms, true) catch |err| log.debug("🧬 cut not recorded: {}", .{err});
         if (build_full) self.recordFullBuild(tenant, table, utils.unixMillis() - build_started_ms);
 
-        // ── 6. prune past the chain depth: PG rows (authority), then objects ──
-        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen), self.retire_grace_s, self.retire_windows, self.checkpoint_s > 0);
+        // ── 6. (pruning ran before the manifest was rendered — see pruneChain) ──
 
         // The duration is the number the retention contract needs (§10em): the CDC
         // window must cover two cadences AND this, since the cut is taken before the
@@ -2321,6 +2322,9 @@ pub const GenerationProducer = struct {
         defer entry.deinit();
         const man = try std.json.parseFromSliceLeaky(std.json.Value, alloc, entry.value, .{});
         if (man != .object) return error.ManifestUnreadable;
+        // Retire BEFORE rendering (see pruneChain): the row this lane attached to already
+        // says has_full / has_checkpoint, so nothing is pending.
+        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from, self.retire_grace_s, self.retire_windows, self.checkpoint_s > 0, 0);
         var deltas: std.json.Array = .init(alloc);
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{keep_from})).ptr };
@@ -2358,7 +2362,6 @@ pub const GenerationProducer = struct {
         try std.json.Stringify.value(std.json.Value{ .object = root }, .{}, &out.writer);
         _ = try kv.put(key, out.written(), .{});
 
-        try pruneChain(alloc, bkc, &store, tenant_z, table_z, table, keep_from, self.retire_grace_s, self.retire_windows, self.checkpoint_s > 0);
         const total_ms = utils.unixMillis() - started_ms;
         self.recordFullBuild(tenant, table, total_ms);
         log.info("🧬 '{s}'/'{s}': background {s} attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: build (count+copy+encode+zstd+upload) {d}, dictionary {d}{s}, dictionary upload {d}; deltas kept cutting meanwhile{s}", .{
@@ -2951,7 +2954,16 @@ fn hexDecode(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
 /// — min(grace, windows x replacement interval) — and the storage is bounded at
 /// `keep_windows` fulls. A pair that replaces its full every few seconds is the case
 /// incremental fulls remove: a base is replaced rarely, and then the grace alone binds.
-fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z: [:0]const u8, table_z: [:0]const u8, table: []const u8, keep_from: i64, grace_s: u64, keep_windows: u32, by_levels: bool) !void {
+/// `pending_full_gen`: the generation whose FULL this cut is publishing but has not yet
+/// recorded (the row lands after the manifest, §10gi) — 0 when the cut carries none.
+///
+/// ⚠️ Called BEFORE the manifest is rendered, not after. Rendering first and retiring
+/// second left the manifest naming a generation that had just been retired, until the
+/// next cut rewrote it — on a quiet table, indefinitely; measured 2026-09-17 as
+/// `users-g4-delta` still in the manifest with g4 retired. Retiring first is safe in
+/// the other direction: a retired generation keeps its objects for the grace, so the
+/// previous manifest (live for the milliseconds until the put) still resolves.
+fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z: [:0]const u8, table_z: [:0]const u8, table: []const u8, keep_from: i64, grace_s: u64, keep_windows: u32, by_levels: bool, pending_full_gen: i64) !void {
     if (by_levels) {
         // §10gw: retention by the chain's LEVELS, not by counting generations.
         //   * the newest base is kept, and everything older than it goes;
@@ -2963,9 +2975,10 @@ fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z
         // base, `ckpt` IS the base and nothing between them is pruned. That is the safe
         // direction — pruning deltas down to a checkpoint that never came would strand
         // every returning client on the base.
-        const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+        const pending_z = try utils.allocPrintZ(alloc, "{d}", .{pending_full_gen});
+        const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, pending_z.ptr };
         const res = try GenerationProducer.queryOnePub(bkc,
-            "WITH base AS (SELECT COALESCE(max(gen), 0) AS gen FROM public.zebridge_generations " ++
+            "WITH base AS (SELECT GREATEST(COALESCE(max(gen), 0), $3::bigint) AS gen FROM public.zebridge_generations " ++
             "              WHERE tenant=$1 AND tbl=$2 AND has_full AND retired_at IS NULL), " ++
             "     ckpt AS (SELECT COALESCE(max(gen), (SELECT gen FROM base)) AS gen FROM public.zebridge_generations " ++
             "              WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL " ++

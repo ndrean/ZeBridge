@@ -337,8 +337,18 @@ pub const FleetMonitor = struct {
     /// on every start (§10dr).
     fn openLive(self: *FleetMonitor, js: nats.JetStream) !nats.KV {
         const km = js.kvManager();
+        // ⚠️ BOTH errors mean "it is not there". `openBucket` answers `BucketNotFound`
+        // when the KV exists to JetStream but not as a bucket, and `StreamNotFound`
+        // when the underlying `KV_<name>` stream is gone — which is what a wiped or
+        // never-provisioned broker looks like. Catching only the first left the monitor
+        // logging `fleet poll failed: StreamNotFound — the previous snapshot stands`
+        // every minute for ever: no heartbeats, no per-client lag, and every publish to
+        // `$KV.live.*` answered by no stream — which the publisher reads as a lost
+        // connection and retries until the batch publisher gives up and stops the
+        // bridge. Measured 2026-09-17: the bucket was gone, `fleet` failed, and
+        // `genproducer` died mid-run with `NoStreamResponse`.
         return km.openBucket(self.topo.kv_live) catch |err| switch (err) {
-            error.BucketNotFound => km.createBucket(.{
+            error.BucketNotFound, error.StreamNotFound => km.createBucket(.{
                 .bucket = self.topo.kv_live,
                 .history = 1,
                 .ttl = .fromNanoseconds(@intCast(self.ttl_seconds * std.time.ns_per_s)),
