@@ -65,3 +65,49 @@ The dev stack (PostgreSQL, nats-server, the bridge on `my_pub`/`my_slot`), the l
 The vector tiles come from `test_region.pmtiles` with the Protomaps light theme (the source is named `protomaps`); without the file the map falls back to OSM raster tiles.
 
 API keys, if any, live in `.env*` files, which git ignores.
+
+## Generate France PMTiles with Planetiler
+
+```sh
+mkdir -p data
+docker run -e JAVA_TOOL_OPTIONS="-Xmx8g" \
+  -v "$(pwd)/data":/data \
+  ghcr.io/onthegomap/planetiler:latest \
+  --area=france \
+  --output=/data/france.pmtiles
+```
+
+Configure `rclone`:
+
+```sh
+rclone config update r2 \
+> access_key_id "xxx" \
+> secret_access_key "xxx" \
+> endpoint "https://c0344d0aa37d230e463fd7e8ddd58f0b.r2.cloudflarestorage.com" \
+> regiion auto
+```
+
+Check:
+
+```sh
+rclone lsd r2:
+
+#         -1 2026-09-18 14:29:14        -1 ze-map
+```
+
+Copy via `rclone` the local file _france_pmtiles_  into the R2 bucket "ze-map":
+
+```sh
+rclone copyto france.pmtiles :s3:ze-map/france.pmtiles \
+  --s3-provider Cloudflare \
+  --s3-endpoint "https://c0344d0aa37d230e463fd7e8ddd58f0b.r2.cloudflarestorage.com" \
+  --s3-access-key-id "<ACCESS_KEY_ID>" \
+  --s3-secret-access-key "<SECRET_ACCESS_KEY>" \
+  --progress
+```
+
+From the /data folder:
+
+```sh
+rclone copy france.pmtiles r2:ze-map/ -P
+```

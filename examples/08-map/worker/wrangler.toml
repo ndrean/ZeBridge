@@ -1,0 +1,15 @@
+# The tiles' door: a Worker in front of the R2 bucket `ze-map` (NOTES §10hj).
+# No credentials anywhere — the bucket is a BINDING, granted at deploy time by the
+# account that owns both. Deploy: `npx wrangler deploy` (wrangler asks you to log in once).
+name = "ze-map-tiles"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[[r2_buckets]]
+binding = "TILES"
+bucket_name = "ze-map"
+
+[vars]
+# Which origins may read the tiles from a browser (the Flutter web build); native apps do
+# not care. "*" while developing, your app's origin in production.
+ALLOW_ORIGIN = "*"
