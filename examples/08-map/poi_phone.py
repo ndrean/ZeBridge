@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--twice", action="store_true")
     ap.add_argument("--edit", action="store_true", help="the edit story: add a POI here, rename it, remove it — asking the service after each")
     ap.add_argument("--tour", type=int, default=0, help="pick this many named POIs the phone holds and ask the service for the shortest round trip through them, with what lies along the way")
+    ap.add_argument("--fuel", default="", help="a fuel (SP95, Gazole, E10, SP98, E85, GPLc): the cheapest stations within 3 km, and the cheapest along the tour")
     a = ap.parse_args()
     lat, lng = (float(x) for x in a.at.split(","))
 
@@ -82,6 +83,8 @@ def main():
                 time.sleep(1)
         if a.edit:
             edit_story(lib, take, h, a, lat, lng)
+        if a.fuel:
+            fuel_story(lib, take, h, a, lat, lng)
         if a.tour:
             tour_story(lib, take, h, a, lat, lng)
     finally:
@@ -156,12 +159,28 @@ def edit_story(lib, take, h, a, lat, lng):
 
 
 
+def fuel_story(lib, take, h, a, lat, lng):
+    """The cheapest stations around, from the fuel feed the service's replica also follows."""
+    q = {"lat": lat, "lng": lng, "radius_m": 3000, "fuel": a.fuel, "sort": "price", "limit": 5}
+    t0 = time.time()
+    ans = take(lib.zb_client_request(h, f"query.{a.tenant}.fuel_near".encode(), json.dumps(q).encode(), 5000))
+    dt = (time.time() - t0) * 1000
+    if "error" in ans:
+        sys.exit(f"fuel_near: {ans}")
+    c = ans["columns"]
+    print(f"{a.fuel} within 3 km, cheapest first ({ans['count']} shown, {dt:.0f} ms round trip, {ans['ms']} ms in the service):")
+    for row in ans["rows"]:
+        print(f"    {float(row[c.index('price')]):.3f} €  {str(row[c.index('address')])[:30]:30} {str(row[c.index('city')])[:18]:18} {float(row[c.index('m')]):>6.0f} m" + (f"  ({row[c.index('outage')]} outage)" if row[c.index('outage')] else ""))
+
+
 def tour_story(lib, take, h, a, lat, lng):
     """The voyageur de commerce, from the phone: stops it already holds, the service's answer."""
     import random
     rows = take(lib.zb_client_query(h, "SELECT osm_id, name FROM osm_pois WHERE name IS NOT NULL AND amenity IS NOT NULL".encode(), b"[]"))["rows"]
     picks = random.Random(int(lat * 1e4)).sample(rows, min(a.tour, len(rows)))
     q = {"stops": [r[0] for r in picks], "closed": True, "along_m": 60, "along_limit": 200}
+    if a.fuel:
+        q["fuel"], q["fuel_m"] = a.fuel, 1500
     t0 = time.time()
     ans = take(lib.zb_client_request(h, f"query.{a.tenant}.tour".encode(), json.dumps(q).encode(), 10000))
     dt = (time.time() - t0) * 1000
@@ -170,6 +189,11 @@ def tour_story(lib, take, h, a, lat, lng):
     print(f"tour through {len(picks)} stops: {ans['total_m']} m round trip, {len(ans['legs'])} legs, {ans['along']['count']} POIs within 60 m of the way — {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
     for leg in ans["legs"]:
         print(f"    {str(leg['from'])[:34]:34} → {str(leg['to'])[:34]:34} {leg['m']:>6} m")
+    if ans.get("fuel"):
+        f = ans["fuel"]; c = f["columns"]
+        print(f"  {f['fuel']} along the way: {f['count']} station(s) within 1.5 km of a leg" + (":" if f["rows"] else ""))
+        for row in f["rows"][:3]:
+            print(f"    {float(row[c.index('price')]):.3f} €  {str(row[c.index('address')])[:30]:30} {str(row[c.index('city')])[:18]:18} detour {row[c.index('detour_m')]:>5} m" + (f"  ({row[c.index('outage')]} outage)" if row[c.index('outage')] else ""))
     if ans["along"]["count"]:
         ing = take(lib.zb_client_ingest(h, "osm_pois".encode(), json.dumps({"columns": ans["along"]["columns"], "rows": ans["along"]["rows"]}).encode(), b""))
         print(f"  kept what lies along the way: {ing}")

@@ -14238,3 +14238,15 @@ against every leg. Fine for a demo; a spatial index or DuckDB spatial's `ST_DWit
 route as a linestring is the next step when it matters, and the salesman itself is
 microseconds. The algorithm was never the point: the route is drawn from data that lives
 in a replica, the replica follows PostgreSQL, and PostgreSQL never saw the question.
+
+**The fuel query, the same day.** The service's replica follows the three fuel tables of
+§10hh beside the POIs — parents first, seeded in 1.7 s (9,800 stations, 31k live prices)
+— and a third named query, `fuel_near`: the stations selling one fuel within a radius,
+today's price, cheapest or nearest first, the feed's outage flag when the pump is dry; the
+two tables joined in DuckDB, PostgreSQL never asked. `fuel_stations` gained `lat`/`lng` as
+numbers like the POIs (the loader writes them). The tour takes `fuel` too: the stations
+within `fuel_m` of any leg, cheapest first, each with its detour from the nearest leg — the
+corridor idea over the second dataset. Measured from the phone: SP95 within 3 km of Nantes
+centre, 2 stations, 1.990 € the cheapest at 2.7 km, 96 ms round trip; Gazole around Rezé, 5
+stations from 2.250 €, 105 ms; the 6-stop centre tour found no SP95 within 1.5 km of a leg,
+which is true. Two datasets, one replica, three questions, zero reads on the source.

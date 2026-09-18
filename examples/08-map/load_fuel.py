@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS public.fuel_stations (
   address          text,
   city             text,
   geom             geometry(Point, 4326) NOT NULL,
+  lat              double precision NOT NULL,   -- the point as numbers too: a replica without spatial
+  lng              double precision NOT NULL,   -- functions asks "within this box" on a B-tree
   hours            jsonb,
   services         jsonb,
   automate         boolean,
@@ -104,17 +106,17 @@ unpivot_o AS (
   WHERE f.kind IS NOT NULL AND f.kind <> ''
 ),
 st AS (
-  INSERT INTO public.fuel_stations AS t (id, postcode, road_type, address, city, geom, hours, services, automate, departement, code_departement, region, code_region)
-  SELECT id, postcode, road_type, address, city, ST_SetSRID(ST_MakePoint(lon, lat), 4326), hours, services, automate, departement, code_departement, region, code_region
+  INSERT INTO public.fuel_stations AS t (id, postcode, road_type, address, city, geom, lat, lng, hours, services, automate, departement, code_departement, region, code_region)
+  SELECT id, postcode, road_type, address, city, ST_SetSRID(ST_MakePoint(lon, lat), 4326), lat, lon, hours, services, automate, departement, code_departement, region, code_region
   FROM stage
   ON CONFLICT (id) DO UPDATE SET
     postcode = excluded.postcode, road_type = excluded.road_type, address = excluded.address, city = excluded.city,
-    geom = excluded.geom, hours = excluded.hours, services = excluded.services, automate = excluded.automate,
+    geom = excluded.geom, lat = excluded.lat, lng = excluded.lng, hours = excluded.hours, services = excluded.services, automate = excluded.automate,
     departement = excluded.departement, code_departement = excluded.code_departement, region = excluded.region, code_region = excluded.code_region,
     updated_at = now(), deleted_at = NULL
-  WHERE (t.postcode, t.road_type, t.address, t.city, ST_AsEWKB(t.geom), t.hours, t.services, t.automate, t.departement, t.code_departement, t.region, t.code_region, t.deleted_at)
+  WHERE (t.postcode, t.road_type, t.address, t.city, ST_AsEWKB(t.geom), t.lat, t.lng, t.hours, t.services, t.automate, t.departement, t.code_departement, t.region, t.code_region, t.deleted_at)
         IS DISTINCT FROM
-        (excluded.postcode, excluded.road_type, excluded.address, excluded.city, ST_AsEWKB(excluded.geom), excluded.hours, excluded.services, excluded.automate, excluded.departement, excluded.code_departement, excluded.region, excluded.code_region, NULL::timestamptz)
+        (excluded.postcode, excluded.road_type, excluded.address, excluded.city, ST_AsEWKB(excluded.geom), excluded.lat, excluded.lng, excluded.hours, excluded.services, excluded.automate, excluded.departement, excluded.code_departement, excluded.region, excluded.code_region, NULL::timestamptz)
   RETURNING (xmax = 0) AS inserted
 ),
 st_gone AS (

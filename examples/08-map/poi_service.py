@@ -14,7 +14,9 @@ One process, two halves on one libzb card (DuckDB allows one writer per file):
 Named queries only — the SQL lives here, the client sends parameters:
   pois_near  {"lat": 47.21, "lng": -1.55, "radius_m": 800, "kinds": ["amenity"], "limit": 500}
     → {"columns": [...], "rows": [[...], ...], "count": n, "complete": bool, "ms": t}
-  tour       {"stops": [osm_id, ...], "closed": true, "along_m": 80}
+  fuel_near  {"lat", "lng", "radius_m": 3000, "fuel": "SP95", "sort": "price", "limit": 20}
+    → the stations selling that fuel within the radius, cheapest first, today's price
+  tour       {"stops": [osm_id, ...], "closed": true, "along_m": 80, "fuel": "SP95", "fuel_m": 1500}
     → the shortest round trip through the stops (exact to 9, 2-opt beyond, straight lines
       until Valhalla), its legs and polyline, and the POIs within along_m of the route
       as an answer a phone keeps like any other
@@ -28,6 +30,9 @@ import argparse, asyncio, ctypes, json, math, os, pathlib, sys, threading, time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
 TABLE = "osm_pois"
+# The replica follows the fuel feed too (load_fuel.py): parents first.
+TABLES = ["fuel_stations", "fuel_prices", "fuel_outages", TABLE]
+FUELS = ("Gazole", "SP95", "SP98", "E10", "E85", "GPLc")
 KINDS = ("amenity", "shop", "tourism", "man_made")
 
 
@@ -195,14 +200,68 @@ def tour(card: Card, q: dict) -> dict:
                     min(seg_distance_m((row[li], row[lo]), (path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])) for k in range(len(path) - 1)) <= along_m]
             near = near[: int(q.get("along_limit", 300))]
             along = {"columns": cols, "rows": near, "count": len(near)}
+    fuel = q.get("fuel")
+    cheapest = None
+    if fuel in FUELS:
+        # The stations selling that fuel within fuel_m of any leg — the same corridor idea
+        # over the fuel tables — the cheapest first, its detour from the nearest leg.
+        fuel_m = float(q.get("fuel_m", 1500))
+        lats, lngs = [s["lat"] for s in path], [s["lng"] for s in path]
+        dlat = fuel_m / 111_320.0
+        dlng = fuel_m / (111_320.0 * max(0.1, math.cos(math.radians(sum(lats) / len(lats)))))
+        r = card.query(fuel_sql("s.lat BETWEEN ? AND ? AND s.lng BETWEEN ? AND ?", "0", fuel, "p.price", 500),
+                       [min(lats) - dlat, max(lats) + dlat, min(lngs) - dlng, max(lngs) + dlng])
+        if "error" not in r:
+            c = r["columns"]; li, lo, pi = c.index("lat"), c.index("lng"), c.index("price")
+            near = []
+            for row in r["rows"]:
+                detour = min(seg_distance_m((row[li], row[lo]), (path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])) for k in range(len(path) - 1))
+                if detour <= fuel_m:
+                    near.append((row[pi], detour, row))
+            near.sort(key=lambda x: (x[0], x[1]))
+            cheapest = {"fuel": fuel, "columns": c + ["detour_m"], "rows": [row + [round(d)] for _, d, row in near[:5]], "count": len(near)}
     return {"order": [s["osm_id"] if s["osm_id"] is not None else [s["lat"], s["lng"]] for s in seq],
+            "fuel": cheapest,
             "stops": [{"name": s["name"], "lat": s["lat"], "lng": s["lng"]} for s in seq],
             "legs": legs, "total_m": sum(l["m"] for l in legs), "closed": closed,
             "polyline": [[p["lat"], p["lng"]] for p in path], "along": along,
             "ms": round((time.time() - t0) * 1000, 1)}
 
 
-QUERIES = {"pois_near": pois_near, "tour": tour}
+def fuel_sql(where: str, dist: str, fuel: str, order: str, limit: int) -> str:
+    """Stations with the price of one fuel: the two tables joined in the replica, live rows
+    only (a replica never holds a tombstoned row), the outage of that fuel if any."""
+    return (f"SELECT s.id, s.city, s.address, s.road_type, s.lat, s.lng, p.price, p.price_at, "
+            f"o.kind AS outage, {dist} AS m "
+            f"FROM fuel_stations s JOIN fuel_prices p ON p.station_id = s.id AND p.fuel = '{fuel}' "
+            f"LEFT JOIN fuel_outages o ON o.station_id = s.id AND o.fuel = '{fuel}' "
+            f"WHERE {where} ORDER BY {order} LIMIT {limit}")
+
+
+def fuel_near(card: Card, q: dict) -> dict:
+    """{"lat", "lng", "radius_m": 3000, "fuel": "SP95", "sort": "price"|"distance", "limit": 20}
+    → the stations selling that fuel within the radius, with today's price, nearest or
+      cheapest first, and an outage flag when the feed says the pump is dry."""
+    t0 = time.time()
+    lat, lng = float(q["lat"]), float(q["lng"])
+    radius = float(q.get("radius_m", 3000))
+    fuel = q.get("fuel", "SP95")
+    if fuel not in FUELS:
+        return {"error": f"unknown fuel {fuel!r}", "known": list(FUELS)}
+    limit = int(q.get("limit", 20))
+    dlat = radius / 111_320.0
+    dlng = radius / (111_320.0 * max(0.1, math.cos(math.radians(lat))))
+    dist = (f"2 * 6371000 * asin(sqrt(pow(sin(radians(s.lat - ({lat})) / 2), 2) + "
+            f"cos(radians({lat})) * cos(radians(s.lat)) * pow(sin(radians(s.lng - ({lng})) / 2), 2)))")
+    where = f"s.lat BETWEEN ? AND ? AND s.lng BETWEEN ? AND ? AND {dist} <= {radius}"
+    order = "p.price, m" if q.get("sort", "price") == "price" else "m"
+    r = card.query(fuel_sql(where, dist, fuel, order, limit), [lat - dlat, lat + dlat, lng - dlng, lng + dlng])
+    if "error" in r:
+        return {"error": r["error"]}
+    return {"fuel": fuel, "columns": r["columns"], "rows": r["rows"], "count": len(r["rows"]), "ms": round((time.time() - t0) * 1000, 1)}
+
+
+QUERIES = {"pois_near": pois_near, "tour": tour, "fuel_near": fuel_near}
 
 
 async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str):
@@ -244,7 +303,7 @@ def main():
     a = ap.parse_args()
     lib = load_lib()
     card = Card(lib, {"url": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db, "engine": a.engine,
-                      "tables": [TABLE], "clientId": "poi-service", "heartbeatMs": 0, "seedStreaming": True})
+                      "tables": TABLES, "clientId": "poi-service", "heartbeatMs": 0, "seedStreaming": True})
     t0 = time.time()
     s = card.sync()
     print(f"replica: {json.dumps(s)[:200]} in {time.time() - t0:.1f} s", flush=True)
