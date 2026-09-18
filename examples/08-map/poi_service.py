@@ -13,7 +13,11 @@ One process, two halves on one libzb card (DuckDB allows one writer per file):
 
 Named queries only — the SQL lives here, the client sends parameters:
   pois_near  {"lat": 47.21, "lng": -1.55, "radius_m": 800, "kinds": ["amenity"], "limit": 500}
-    → {"columns": [...], "rows": [[...], ...], "count": n, "ms": t}
+    → {"columns": [...], "rows": [[...], ...], "count": n, "complete": bool, "ms": t}
+  tour       {"stops": [osm_id, ...], "closed": true, "along_m": 80}
+    → the shortest round trip through the stops (exact to 9, 2-opt beyond, straight lines
+      until Valhalla), its legs and polyline, and the POIs within along_m of the route
+      as an answer a phone keeps like any other
 The answer is the chain object's shape, so a phone applies it with `zb_client_ingest`.
 A bounding box on (lat, lng) over the replica's index, then the haversine distance to
 order and cut at the radius. Every libzb call is serialized through one lock: the card
@@ -92,7 +96,113 @@ def pois_near(card: Card, q: dict) -> dict:
             "ms": round((time.time() - t0) * 1000, 1)}
 
 
-QUERIES = {"pois_near": pois_near}
+def haversine(a, b) -> float:
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * 6371000 * math.asin(math.sqrt(h))
+
+
+def tsp_order(points: list, closed: bool) -> list:
+    """The voyageur de commerce over a handful of stops: exact for up to 9 (every permutation
+    of the stops after the first), nearest-neighbour then 2-opt beyond. Straight-line
+    distances — a road network (Valhalla) is the planned replacement of `haversine` here."""
+    n = len(points)
+    if n <= 2:
+        return list(range(n))
+    d = [[haversine(points[i], points[j]) for j in range(n)] for i in range(n)]
+
+    def length(order):
+        t = sum(d[order[k]][order[k + 1]] for k in range(len(order) - 1))
+        return t + (d[order[-1]][order[0]] if closed else 0)
+
+    if n <= 9:
+        import itertools
+        best = min(itertools.permutations(range(1, n)), key=lambda perm: length((0,) + perm))
+        return [0] + list(best)
+    order, left = [0], set(range(1, n))
+    while left:
+        nxt = min(left, key=lambda j: d[order[-1]][j]); order.append(nxt); left.remove(nxt)
+    improved = True
+    while improved:
+        improved = False
+        for i in range(1, n - 1):
+            for j in range(i + 1, n if closed else n - 1 + 1):
+                if j >= n: continue
+                cand = order[:i] + order[i:j + 1][::-1] + order[j + 1:]
+                if length(cand) < length(order) - 1e-6:
+                    order, improved = cand, True
+    return order
+
+
+def seg_distance_m(p, a, b) -> float:
+    """Point to segment, metres, on a local flat approximation (fine over a few km)."""
+    k = math.cos(math.radians(a[0]))
+    px, py = (p[1] - a[1]) * k, p[0] - a[0]
+    bx, by = (b[1] - a[1]) * k, b[0] - a[0]
+    l2 = bx * bx + by * by
+    t = 0.0 if l2 == 0 else max(0.0, min(1.0, (px * bx + py * by) / l2))
+    dx, dy = px - t * bx, py - t * by
+    return math.sqrt(dx * dx + dy * dy) * 111_320.0
+
+
+def tour(card: Card, q: dict) -> dict:
+    """{"stops": [osm_id, …] or [{"lat","lng"}, …], "closed": true, "along_m": 80,
+        "along_kinds": [...], "along_limit": 300}
+    → {"order": [...], "legs": [{"from","to","m"}], "total_m", "polyline": [[lat,lng],…],
+       "along": {"columns","rows","count"} — the POIs within along_m of the route, the
+       answer's usual shape, so a phone keeps them like any answer."""
+    t0 = time.time()
+    raw = q.get("stops") or []
+    if len(raw) < 2:
+        return {"error": "at least two stops"}
+    stops = []
+    ids = [x for x in raw if isinstance(x, int)]
+    by_id = {}
+    if ids:
+        r = card.query(f"SELECT osm_id, name, lat, lng FROM {TABLE} WHERE osm_id IN ({', '.join('?' * len(ids))})", ids)
+        if "error" in r:
+            return {"error": r["error"]}
+        by_id = {row[0]: row for row in r["rows"]}
+    for x in raw:
+        if isinstance(x, int):
+            if x not in by_id:
+                return {"error": f"unknown stop {x}"}
+            _, name, lat, lng = by_id[x]
+            stops.append({"osm_id": x, "name": name, "lat": lat, "lng": lng})
+        else:
+            stops.append({"osm_id": None, "name": x.get("name"), "lat": float(x["lat"]), "lng": float(x["lng"])})
+    closed = bool(q.get("closed", True))
+    order = tsp_order([(s["lat"], s["lng"]) for s in stops], closed)
+    seq = [stops[i] for i in order]
+    path = seq + ([seq[0]] if closed else [])
+    legs = [{"from": path[k]["name"] or path[k]["osm_id"], "to": path[k + 1]["name"] or path[k + 1]["osm_id"],
+             "m": round(haversine((path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])))} for k in range(len(path) - 1)]
+    along_m = float(q.get("along_m", 80))
+    along = {"columns": [], "rows": [], "count": 0}
+    if along_m > 0:
+        lats, lngs = [s["lat"] for s in path], [s["lng"] for s in path]
+        dlat = along_m / 111_320.0
+        dlng = along_m / (111_320.0 * max(0.1, math.cos(math.radians(sum(lats) / len(lats)))))
+        kinds = [k for k in q.get("along_kinds", []) if k in KINDS]
+        where = "lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?" + (" AND (" + " OR ".join(f"{k} IS NOT NULL" for k in kinds) + ")" if kinds else "")
+        cols = ["osm_id", "cell", "amenity", "shop", "tourism", "man_made", "name", "name_en", "name_fr", "opening_hours",
+                "beds", "rooms", "addr_full", "addr_housenumber", "addr_street", "addr_city", "source", "lat", "lng", "geom", "updated_at"]
+        r = card.query(f"SELECT {', '.join(cols)} FROM {TABLE} WHERE {where} LIMIT 20000", [min(lats) - dlat, max(lats) + dlat, min(lngs) - dlng, max(lngs) + dlng])
+        if "error" not in r:
+            li, lo = cols.index("lat"), cols.index("lng")
+            stop_ids = {s["osm_id"] for s in stops}
+            near = [row for row in r["rows"] if row[0] not in stop_ids and
+                    min(seg_distance_m((row[li], row[lo]), (path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])) for k in range(len(path) - 1)) <= along_m]
+            near = near[: int(q.get("along_limit", 300))]
+            along = {"columns": cols, "rows": near, "count": len(near)}
+    return {"order": [s["osm_id"] if s["osm_id"] is not None else [s["lat"], s["lng"]] for s in seq],
+            "stops": [{"name": s["name"], "lat": s["lat"], "lng": s["lng"]} for s in seq],
+            "legs": legs, "total_m": sum(l["m"] for l in legs), "closed": closed,
+            "polyline": [[p["lat"], p["lng"]] for p in path], "along": along,
+            "ms": round((time.time() - t0) * 1000, 1)}
+
+
+QUERIES = {"pois_near": pois_near, "tour": tour}
 
 
 async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str):

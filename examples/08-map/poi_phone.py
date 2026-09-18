@@ -29,6 +29,7 @@ def main():
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     ap.add_argument("--twice", action="store_true")
     ap.add_argument("--edit", action="store_true", help="the edit story: add a POI here, rename it, remove it — asking the service after each")
+    ap.add_argument("--tour", type=int, default=0, help="pick this many named POIs the phone holds and ask the service for the shortest round trip through them, with what lies along the way")
     a = ap.parse_args()
     lat, lng = (float(x) for x in a.at.split(","))
 
@@ -81,6 +82,8 @@ def main():
                 time.sleep(1)
         if a.edit:
             edit_story(lib, take, h, a, lat, lng)
+        if a.tour:
+            tour_story(lib, take, h, a, lat, lng)
     finally:
         lib.zb_client_close(h)
 
@@ -148,6 +151,31 @@ def edit_story(lib, take, h, a, lat, lng):
     print(f"  the service sees: {in_answer(ask(), osm_id)!r}")
     local = take(lib.zb_client_query(h, "SELECT count(*) FROM osm_pois WHERE osm_id = ?".encode(), json.dumps([osm_id]).encode()))
     print(f"  the phone holds it: {bool(local['rows'][0][0])}")
+
+
+
+
+
+def tour_story(lib, take, h, a, lat, lng):
+    """The voyageur de commerce, from the phone: stops it already holds, the service's answer."""
+    import random
+    rows = take(lib.zb_client_query(h, "SELECT osm_id, name FROM osm_pois WHERE name IS NOT NULL AND amenity IS NOT NULL".encode(), b"[]"))["rows"]
+    picks = random.Random(int(lat * 1e4)).sample(rows, min(a.tour, len(rows)))
+    q = {"stops": [r[0] for r in picks], "closed": True, "along_m": 60, "along_limit": 200}
+    t0 = time.time()
+    ans = take(lib.zb_client_request(h, f"query.{a.tenant}.tour".encode(), json.dumps(q).encode(), 10000))
+    dt = (time.time() - t0) * 1000
+    if "error" in ans:
+        sys.exit(f"tour: {ans}")
+    print(f"tour through {len(picks)} stops: {ans['total_m']} m round trip, {len(ans['legs'])} legs, {ans['along']['count']} POIs within 60 m of the way — {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
+    for leg in ans["legs"]:
+        print(f"    {str(leg['from'])[:34]:34} → {str(leg['to'])[:34]:34} {leg['m']:>6} m")
+    if ans["along"]["count"]:
+        ing = take(lib.zb_client_ingest(h, "osm_pois".encode(), json.dumps({"columns": ans["along"]["columns"], "rows": ans["along"]["rows"]}).encode(), b""))
+        print(f"  kept what lies along the way: {ing}")
+        ni = ans["along"]["columns"].index("name"); ki = ans["along"]["columns"].index("amenity")
+        names = [f"{r[ni]} ({r[ki] or 'poi'})" for r in ans["along"]["rows"] if r[ni]][:6]
+        print("   ", "; ".join(names))
 
 
 if __name__ == "__main__":

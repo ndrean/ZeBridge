@@ -14225,3 +14225,16 @@ at the end. One convention learned the hard way, now in capi.zig's header: an IN
 `values` are the WHOLE row, key included — the bridge builds the statement from `data`, the
 key alone addresses UPDATE and DELETE — so the first attempt was refused with `osm_id` null.
 No write-only mode was needed: the on-demand table is local, `mutate` is `mutate`.
+
+**The tour, the same day.** A second named query, `tour`: stops as osm_ids the phone
+already holds (or bare points), the shortest round trip through them — exact over every
+permutation up to nine stops, nearest-neighbour then 2-opt beyond, straight-line distances
+until Valhalla — its legs and polyline, and the POIs within `along_m` of the route in the
+answer's usual shape, so the phone keeps them like any other. `poi_phone.py --tour 7`
+around Nantes centre: 1,140 m round trip, 7 legs, 200 POIs within 60 m (the limit), 500 ms
+in the service — of which nearly all is the corridor: the bounding box of the whole route
+pulled from the replica, then the point-to-segment distance in Python for every candidate
+against every leg. Fine for a demo; a spatial index or DuckDB spatial's `ST_DWithin` on the
+route as a linestring is the next step when it matters, and the salesman itself is
+microseconds. The algorithm was never the point: the route is drawn from data that lives
+in a replica, the replica follows PostgreSQL, and PostgreSQL never saw the question.
