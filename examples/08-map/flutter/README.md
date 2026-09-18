@@ -8,7 +8,7 @@ table on the phone: libzb creates it from the descriptor, nothing seeds it and n
 is tailed. On every move the map asks the POI service — `examples/08-map/poi_service.py`,
 a DuckDB replica of all of France answering `query._default.pois_near` from its own copy,
 PostgreSQL never asked — for the points around the centre (the radius follows the zoom,
-at most 2 km; below zoom 13 the map stops asking and draws what it holds), keeps the
+at most 5 km, the 2,000 nearest; below zoom 10 the map stops asking and draws what it holds), keeps the
 answer in its SQLite through the same version-guarded upsert a seed uses, and draws
 from the local table. Offline, every area visited is still there.
 

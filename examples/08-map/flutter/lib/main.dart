@@ -86,6 +86,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   /// The viewport last asked for; a move is asked once the previous ask landed.
   LatLng? wantedCentre;
   double wantedRadius = 0;
+  double wantedFuelRadius = 3000;
   bool asking = false;
   Timer? askDebounce;
   Timer? refreshDebounce;
@@ -234,11 +235,13 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   }
 
   /// The viewport moved: ask for what is around its centre. Debounced — a pan is many
-  /// events — and one ask at a time; the radius follows the zoom (half the diagonal,
-  /// at most 2 km). Below zoom 13 the service would answer thousands of points a
-  /// screen cannot show, so the map stops asking and draws what it holds.
+  /// events — and one ask at a time. The radius is half the visible diagonal, at most
+  /// 5 km for the POIs (the answer is the 2,000 nearest anyway: zoomed out, a disc
+  /// around the centre, never the whole screen) and 20 km for the stations, which are
+  /// sparse. Below zoom 10 (a département on screen) the map stops asking and draws
+  /// what it holds.
   void _wantArea(MapCamera camera) {
-    if (camera.zoom < 13) {
+    if (camera.zoom < 10) {
       wantedCentre = null;
       return;
     }
@@ -246,7 +249,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     final half =
         const Distance().as(LengthUnit.Meter, b.southWest, b.northEast) / 2;
     wantedCentre = camera.center;
-    wantedRadius = min(2000.0, max(150.0, half));
+    wantedRadius = min(5000.0, max(150.0, half));
+    wantedFuelRadius = min(20000.0, max(3000.0, half));
     askDebounce?.cancel();
     askDebounce = Timer(const Duration(milliseconds: 350), _ask);
   }
@@ -299,7 +303,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     if (again != null && again != at) _ask();
   }
 
-  /// The stations selling the chosen fuel within 3 km of the centre, nearest first — the
+  /// The stations selling the chosen fuel around the centre, nearest first — the
   /// service joins its fuel tables (load_fuel.py) in DuckDB; PostgreSQL is never asked.
   Future<void> _askFuel(LatLng at) async {
     final w = zb;
@@ -308,11 +312,12 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       if (stations.isNotEmpty && mounted) setState(() => stations = const []);
       return;
     }
+    final radius = wantedFuelRadius;
     try {
       final ans = await w.request('query.$_queryTenant.fuel_near', {
         'lat': at.latitude,
         'lng': at.longitude,
-        'radius_m': 3000,
+        'radius_m': radius,
         'fuel': f,
         'sort': 'distance',
         'limit': 40
@@ -326,7 +331,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         setState(() {
           stations = rows;
           status =
-              '${rows.length} station(s) selling $f within 3 km in ${ans['ms']} ms';
+              '${rows.length} station(s) selling $f within ${(radius / 1000).toStringAsFixed(0)} km in ${ans['ms']} ms';
         });
       }
     } catch (e) {
