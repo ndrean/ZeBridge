@@ -75,7 +75,7 @@ def setup_table():
     bt.psql(f"""CREATE TABLE public.{TABLE} (
         uid uuid PRIMARY KEY DEFAULT gen_random_uuid(), batch integer NOT NULL, age integer,
         temperature double precision, price numeric(20,8), is_true boolean, some_text text,
-        tags text[], matrix integer[], metadata jsonb, last_writer varchar(255),
+        tags text[], matrix integer[][], metadata jsonb, last_writer varchar(255),
         inserted_at timestamptz NOT NULL, updated_at timestamptz NOT NULL, deleted_at timestamptz)""")
     bt.psql(f"CREATE INDEX ON public.{TABLE} (batch)")
     r = bt.psql(f"SELECT step, status, detail FROM zebridge_enable('public.{TABLE}'::regclass, public_reason => 'firehose benchmark', "
@@ -265,7 +265,10 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
             raise RuntimeError(r["error"])
         return {int(b): (int(n), int(sa)) for b, n, sa in r["rows"]}
 
-    db = run_dir / "client.sqlite3"
+    # §10hf: ZB_CLIENT_ENGINE=duckdb opens the same client on libzb's DuckDB engine (a build
+    # with -Dduckdb=true); the replica is then a .duckdb file, sampled with the duckdb module.
+    engine = os.environ.get("ZB_CLIENT_ENGINE", "sqlite")
+    db = run_dir / ("client.duckdb" if engine == "duckdb" else "client.sqlite3")
     # §10gu: the replica is sampled from OUTSIDE, on its own read-only connection. The C
     # ABI is synchronous — `zb_client_sync` holds the thread for the whole seed — so a
     # sampler living in the poll loop saw nothing at all while a client seeded through the
@@ -279,7 +282,11 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
         import sqlite3 as sq
         while sampling.is_set():
             try:
-                con = sq.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
+                if engine == "duckdb":
+                    import duckdb as dk
+                    con = dk.connect(str(db), read_only=True)
+                else:
+                    con = sq.connect(f"file:{db}?mode=ro", uri=True, timeout=1)
                 try:
                     marks.append((time.time(), int(con.execute(f"SELECT count(*) FROM {TABLE}").fetchone()[0])))
                 finally:
@@ -290,7 +297,7 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
 
     threading.Thread(target=sample_file, daemon=True).start()
     t0 = time.time()
-    h = lib.zb_client_open(json.dumps({"url": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0,
+    h = lib.zb_client_open(json.dumps({"url": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0, "engine": engine,
                                        "clientId": "firehose-check", "principal": "firehose", "seedStreaming": True}).encode())
     if not h:
         return {"error": "open failed"}

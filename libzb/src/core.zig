@@ -773,7 +773,7 @@ pub fn planCdcBulk(a: std.mem.Allocator, engine: []const u8, tables: Value, even
                 try out.append(try segment(a, "drop", i, "gate"));
                 continue;
             };
-            if (!std.mem.eql(u8, engine, "sqlite")) break :blk "engine";
+            if (!std.mem.eql(u8, engine, "sqlite") and !std.mem.eql(u8, engine, "duckdb")) break :blk "engine";
             if (t.object.get("blobCols")) |bc| if (bc == .array and bc.array.items.len > 0) break :blk "blob-table";
             const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
             if (std.mem.eql(u8, op, "DELETE")) break :blk "delete";

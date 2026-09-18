@@ -624,7 +624,8 @@ const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
 /// one transaction with FK checks deferred, so tables may interleave). A gated event
 /// closes nothing: dropping it is a no-op wherever it falls.
 ///
-/// Eligible: a followed, seeded table on SQLite with no BLOB column; a CDC (not
+/// Eligible: a followed, seeded table on SQLite or DuckDB (§10hg: DuckDB's shell
+/// executes a segment through its appender and one set-based upsert) with no BLOB column; a CDC (not
 /// optimistic) INSERT or UPDATE that is not a tombstone, not a key change, carries a
 /// complete key and only known columns — and an UPDATE only when it carries EVERY
 /// column of the table: a partial UPDATE on an existing row fails the upsert's INSERT
@@ -652,7 +653,7 @@ export function planCdcBulk(
     if (ev.optimistic) return single('optimistic');
     if (t.unseeded) return single('unseeded');
     if (t.anchor && seedGateDrops(ev, t.anchor)) { out.push({ kind: 'drop', event: i, why: 'gate' }); return; }
-    if (engine !== 'sqlite') return single('engine');
+    if (engine !== 'sqlite' && engine !== 'duckdb') return single('engine');
     if (t.blobCols?.length) return single('blob-table');
     if (ev.operation === 'DELETE') return single('delete');
     if (tombstoned(t.tombstoneColumn ?? null, data)) return single('tombstone');

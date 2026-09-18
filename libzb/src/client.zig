@@ -86,6 +86,18 @@ pub const Options = struct {
 
 const SeedAnchor = struct { stream: []const u8, seq: u64, lsn: i64 };
 
+const BulkStats = struct {
+    bulked: usize = 0,
+    statements: usize = 0,
+    singles: usize = 0,
+    fn add(self: *BulkStats, b: usize, s: usize, one: usize) void {
+        self.bulked += b;
+        self.statements += s;
+        self.singles += one;
+        if ((self.statements % 50) == 0 and s > 0) std.debug.print("bulk cdc: {d} events in {d} statements, {d} per event\n", .{ self.bulked, self.statements, self.singles });
+    }
+};
+
 const TableState = struct {
     pk: []const []const u8,
     cols: []const []const u8,
@@ -224,6 +236,8 @@ pub const SyncClient = struct {
     /// in every loop entry point — the arena is a LIFETIME, not a convenience).
     seen_floor: []const u8 = "",
     seen_floor_buf: [64]u8 = undefined,
+    /// §10hg: what the planned batch path did — events bulked, statements, events through applyEvent.
+    bulk_stats: BulkStats = .{},
     /// Live schema (CLIENTS.md divergence 2, ported from the TS `watchSchemas`): a KV
     /// watch on the schemas bucket, drained at the top of every poll, so a host that
     /// only polls still follows a migration. Opened lazily on the first poll.
@@ -866,7 +880,11 @@ pub const SyncClient = struct {
     /// (keyed by table alone) is carried over under the tenant it followed then, so
     /// the upgrade costs no re-seed.
     fn ensureGenerations(self: *SyncClient, a: std.mem.Allocator) !void {
-        const cols = try self.st.query(a, "SELECT name FROM pragma_table_info('_zbz_generations')", &.{});
+        // §10hg: DuckDB RAISES on pragma_table_info of a table that does not exist, where
+        // SQLite answers no rows — on a fresh DuckDB replica this `try` ended the whole
+        // bookkeeping setup before the CREATE, and every seed then failed on the missing
+        // table ("Catalog Error: Table with name _zbz_generations does not exist").
+        const cols = self.st.query(a, "SELECT name FROM pragma_table_info('_zbz_generations')", &.{}) catch &.{};
         var has_tenant = false;
         for (cols) |r| if (r.len > 0 and r[0] == .text and std.mem.eql(u8, r[0].text, "tenant")) {
             has_tenant = true;
@@ -1053,7 +1071,7 @@ pub const SyncClient = struct {
         if (moved > 0) self.retryHeld(report_a, changed_map);
         if (self.reseed_pending) {
             self.reseed_pending = false;
-            self.gapAndSeed(report_a, seeded_map) catch |err| std.debug.print("re-seed after epoch move: {s}\n", .{@errorName(err)});
+            self.gapAndSeed(report_a, seeded_map) catch |err| std.debug.print("re-seed after epoch move: {s} — {s}\n", .{ @errorName(err), self.st.errMsg() });
         }
     }
 
@@ -2454,6 +2472,7 @@ pub const SyncClient = struct {
             /// caller replays with immediate checks, holding what cannot land.
             deferred: bool,
             fn apply(cx: @This(), st_: *storage.Storage) !void {
+                if (st_.engine == .duckdb) return cx.client.applyBatchPlanned(cx, st_);
                 if (cx.deferred) try st_.execSimple("PRAGMA defer_foreign_keys = ON;");
                 for (cx.messages) |m| {
                     const seq = m.metadata.sequence.stream;
@@ -2483,6 +2502,14 @@ pub const SyncClient = struct {
                             // applied — it must at least be SAID. The SQLite text names the cause.
                             else => |e| {
                                 applied_here = false;
+                                // §10hf: DuckDB aborts the whole transaction on a failed
+                                // statement — every later statement would fail too, and the
+                                // batch would be acked with nothing applied. Hand it to the
+                                // isolated replay instead.
+                                if (st_.engine == .duckdb) {
+                                    std.debug.print("{s}: event at seq {d} aborted the batch: {s} — duckdb: {s}\n", .{ table, seq, @errorName(e), st_.errMsg() });
+                                    return e;
+                                }
                                 std.debug.print("{s}: event at seq {d} not applied: {s} — sqlite: {s}\n", .{ table, seq, @errorName(e), st_.errMsg() });
                             },
                         };
@@ -2517,10 +2544,92 @@ pub const SyncClient = struct {
             offered = 0;
             max_seq.* = last;
             ctx.deferred = false;
-            try self.st.transaction(ctx, Ctx.apply);
+            self.st.transaction(ctx, Ctx.apply) catch |err2| {
+                // §10hf: refused even with immediate checks. On DuckDB one bad row aborts
+                // the transaction and takes every other row with it; the third pass is one
+                // transaction per EVENT, so only the bad event is lost — and said.
+                std.debug.print("{s}: batch refused again ({s}: {s}) — one transaction per event\n", .{ stream, @errorName(err2), self.st.commitErr() });
+                offered = 0;
+                max_seq.* = last;
+                try self.applyBatchIsolated(report_a, stream, messages, max_seq, changed_map, &offered);
+            };
         };
         for (messages) |m| m.ack() catch {};
         return offered;
+    }
+
+    /// §10hf: the batch one event per transaction — the TS client's `applyBatchIsolated`.
+    /// A held event is held durably as in the batch path; a refused one is printed and
+    /// skipped, never poisoning its neighbours. The position is persisted last.
+    fn applyBatchIsolated(self: *SyncClient, report_a: ?std.mem.Allocator, stream: []const u8, messages: []const *@import("nats").JetStreamMessage, max_seq: *u64, changed_map: ?*std.StringArrayHashMapUnmanaged(void), offered: *usize) !void {
+        var ba = std.heap.ArenaAllocator.init(self.a);
+        defer ba.deinit();
+        const a = ba.allocator();
+        const Outcome = enum { applied, held, refused };
+        const One = struct {
+            client: *SyncClient,
+            a: std.mem.Allocator,
+            table: []const u8,
+            ev: Value,
+            stream: []const u8,
+            seq: u64,
+            outcome: *Outcome,
+            fn apply(cx: @This(), st_: *storage.Storage) !void {
+                cx.client.applyEvent(cx.table, cx.ev, cx.stream, cx.seq) catch |err| switch (err) {
+                    error.FkHeld => {
+                        cx.outcome.* = .held;
+                        try holdEvent(st_, cx.a, cx.table, cx.ev, "missing-parent");
+                    },
+                    error.SchemaBehind => {
+                        cx.outcome.* = .held;
+                        try holdEvent(st_, cx.a, cx.table, cx.ev, "unknown-column");
+                    },
+                    else => return err,
+                };
+            }
+        };
+        var applied: usize = 0;
+        var held: usize = 0;
+        var refused: usize = 0;
+        for (messages) |m| {
+            const seq = m.metadata.sequence.stream;
+            const doc = decodeMsgpack(a, m.msg.data) catch continue;
+            const events: []const Value = if (doc == .array) doc.array.items else &.{doc};
+            for (events) |ev| {
+                if (ev != .object) continue;
+                const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
+                if (self.states.get(table) == null) continue;
+                offered.* += 1;
+                var outcome: Outcome = .applied;
+                const one = One{ .client = self, .a = a, .table = table, .ev = ev, .stream = m.metadata.stream, .seq = seq, .outcome = &outcome };
+                self.st.transaction(one, One.apply) catch |err| {
+                    refused += 1;
+                    std.debug.print("{s}: event at seq {d} refused alone ({s}: {s}) — dropped\n", .{ table, seq, @errorName(err), self.st.errMsg() });
+                    continue;
+                };
+                switch (outcome) {
+                    .applied => {
+                        applied += 1;
+                        if (report_a) |ra_| if (changed_map) |cm| {
+                            if (!cm.contains(table)) cm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
+                        };
+                    },
+                    .held => held += 1,
+                    .refused => refused += 1,
+                }
+            }
+            if (seq > max_seq.*) max_seq.* = seq;
+        }
+        const Pos = struct {
+            client: *SyncClient,
+            stream: []const u8,
+            seq: u64,
+            fn apply(cx: @This(), _: *storage.Storage) !void {
+                try cx.client.persistSeq(cx.stream, cx.seq);
+            }
+        };
+        try self.st.transaction(Pos{ .client = self, .stream = stream, .seq = max_seq.* }, Pos.apply);
+        std.debug.print("{s}: isolated replay of {d} message(s): {d} applied, {d} held, {d} refused\n", .{ stream, messages.len, applied, held, refused });
     }
 
     // ─── live tailing (§10bh): the host-driven poll ─────────────────────────
@@ -2792,15 +2901,7 @@ pub const SyncClient = struct {
         // NOTES reread): a lagging clock could stamp under a row this replica had
         // already seen, the exact case the floor exists to prevent. A fixed buffer, not
         // an arena dupe, for the same reason as `last_version`.
-        if (st.version_col) |vc| if (data.object.get(vc)) |sv| if (sv == .string) {
-            const wire = try core.pgTsToWire(taa, sv.string);
-            const norm = try core.normalizeVersion(taa, wire);
-            const floor = core.maxVersion(self.seen_floor, norm);
-            if (floor.ptr != self.seen_floor.ptr and floor.len <= self.seen_floor_buf.len) {
-                @memcpy(self.seen_floor_buf[0..floor.len], floor);
-                self.seen_floor = self.seen_floor_buf[0..floor.len];
-            }
-        };
+        try self.feedFloor(taa, st, data);
 
         // A hard DELETE (tables without a tombstone column) and a soft delete (an
         // update that SETS the tombstone, §7.5) end the same way here: the row goes.
@@ -2830,6 +2931,173 @@ pub const SyncClient = struct {
         };
         // §10do: a row arriving may be the winner a held edit waits for.
         if (self.rebase.count() > 0) self.rebase_due = true;
+    }
+
+    /// §10q: the HLC floor, fed from every arriving row's version column — observed
+    /// remote versions, never our own stamps. Per event, on both apply paths.
+    fn feedFloor(self: *SyncClient, a: std.mem.Allocator, st: TableState, data: Value) !void {
+        if (data != .object) return;
+        if (st.version_col) |vc| if (data.object.get(vc)) |sv| if (sv == .string) {
+            const wire = try core.pgTsToWire(a, sv.string);
+            const norm = try core.normalizeVersion(a, wire);
+            const floor = core.maxVersion(self.seen_floor, norm);
+            if (floor.ptr != self.seen_floor.ptr and floor.len <= self.seen_floor_buf.len) {
+                @memcpy(self.seen_floor_buf[0..floor.len], floor);
+                self.seen_floor = self.seen_floor_buf[0..floor.len];
+            }
+        };
+    }
+
+    /// §10hg: a CDC batch on DuckDB, planned. Row-at-a-time upserts exhaust DuckDB's memory
+    /// (an in-transaction UPDATE keeps an undo copy per column vector: ~39k of them hit the
+    /// limit, §10hf), so a `bulk` segment of `core.planCdcBulk` goes the way the chain does
+    /// on this engine — appended into a temp table, then ONE set-based upsert, no version
+    /// guard (the stream's order is the truth; a key repeated in the segment keeps its LAST
+    /// row, since DuckDB refuses to update one row twice in a statement). `single`s take
+    /// `applyEvent`; a refused one aborts the batch for the isolated replay.
+    fn applyBatchPlanned(self: *SyncClient, cx: anytype, st_: *storage.Storage) !void {
+        const a = cx.a;
+        const Ev = struct { table: []const u8, ev: Value, seq: u64, stream: []const u8 };
+        var evs: std.ArrayListUnmanaged(Ev) = .empty;
+        var tables_v: std.json.ObjectMap = .empty;
+        var events_v = std.json.Array.init(a);
+        for (cx.messages) |m| {
+            const seq = m.metadata.sequence.stream;
+            const doc = decodeMsgpack(a, m.msg.data) catch continue;
+            const items: []const Value = if (doc == .array) doc.array.items else &.{doc};
+            for (items) |ev| {
+                if (ev != .object) continue;
+                const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else continue) else continue;
+                const st = self.states.get(table) orelse continue;
+                if (tables_v.get(table) == null) {
+                    var tv: std.json.ObjectMap = .empty;
+                    var cols = std.json.Array.init(a);
+                    for (st.cols) |cn| try cols.append(.{ .string = cn });
+                    var pk = std.json.Array.init(a);
+                    for (st.pk) |cn| try pk.append(.{ .string = cn });
+                    try tv.put(a, "columns", .{ .array = cols });
+                    try tv.put(a, "pkCols", .{ .array = pk });
+                    try tv.put(a, "tombstoneColumn", if (st.tombstone_col) |tc| Value{ .string = tc } else .null);
+                    // The gate's anchor on this batch's stream (the planner takes one; libzb
+                    // keeps one per stream): the highest seq a chain of this table was cut at.
+                    var gate: u64 = 0;
+                    for (st.anchors.items) |an| if (std.mem.eql(u8, an.stream, m.metadata.stream) and an.seq > gate) {
+                        gate = an.seq;
+                    };
+                    if (gate > 0) {
+                        var av: std.json.ObjectMap = .empty;
+                        try av.put(a, "seedSeq", .{ .integer = @intCast(gate) });
+                        try av.put(a, "seedStream", .{ .string = m.metadata.stream });
+                        try tv.put(a, "anchor", .{ .object = av });
+                    }
+                    // Bytes (PostGIS) stay row by row, as on SQLite.
+                    if (st.geom_cols.len > 0) {
+                        var bc = std.json.Array.init(a);
+                        for (st.geom_cols) |cn| try bc.append(.{ .string = cn });
+                        try tv.put(a, "blobCols", .{ .array = bc });
+                    }
+                    try tables_v.put(a, table, .{ .object = tv });
+                }
+                // The engine's value shaping (vectors as text) before the rows are cut.
+                var ev_m = ev;
+                if (ev_m.object.getPtr("data")) |dp| try self.pgArrayFixup(a, st, dp);
+                var pv: std.json.ObjectMap = .empty;
+                try pv.put(a, "table", .{ .string = table });
+                try pv.put(a, "operation", ev_m.object.get("operation") orelse .null);
+                try pv.put(a, "data", ev_m.object.get("data") orelse .null);
+                try pv.put(a, "seq", .{ .integer = @intCast(seq) });
+                try pv.put(a, "stream", .{ .string = m.metadata.stream });
+                try pv.put(a, "lsn", ev_m.object.get("lsn") orelse .null);
+                try events_v.append(.{ .object = pv });
+                try evs.append(a, .{ .table = table, .ev = ev_m, .seq = seq, .stream = m.metadata.stream });
+            }
+            if (seq > cx.max_seq.*) cx.max_seq.* = seq;
+        }
+        const segments = try core.planCdcBulk(a, "duckdb", .{ .object = tables_v }, .{ .array = events_v });
+        var bulked: usize = 0;
+        var statements: usize = 0;
+        var singles: usize = 0;
+        for (segments.array.items) |seg| {
+            const kind = seg.object.get("kind").?.string;
+            if (std.mem.eql(u8, kind, "drop")) {
+                cx.offered.* += 1;
+                continue;
+            }
+            if (std.mem.eql(u8, kind, "single")) {
+                const i: usize = @intCast(seg.object.get("event").?.integer);
+                const e = evs.items[i];
+                cx.offered.* += 1;
+                singles += 1;
+                var applied_here = true;
+                self.applyEvent(e.table, e.ev, e.stream, e.seq) catch |err| switch (err) {
+                    error.FkHeld => {
+                        applied_here = false;
+                        try holdEvent(st_, a, e.table, e.ev, "missing-parent");
+                    },
+                    error.SchemaBehind => {
+                        applied_here = false;
+                        try holdEvent(st_, a, e.table, e.ev, "unknown-column");
+                    },
+                    else => |err2| {
+                        std.debug.print("{s}: event at seq {d} aborted the batch: {s} — duckdb: {s}\n", .{ e.table, e.seq, @errorName(err2), st_.errMsg() });
+                        return err2;
+                    },
+                };
+                if (applied_here) if (cx.report_a) |ra_| if (cx.changed_map) |cm| {
+                    if (!cm.contains(e.table)) cm.put(ra_, ra_.dupe(u8, e.table) catch e.table, {}) catch {};
+                };
+                continue;
+            }
+            // bulk
+            const table = seg.object.get("table").?.string;
+            const st = self.states.get(table).?;
+            const cols = try core.strArrPub(a, seg.object.get("cols").?.array);
+            const rows_v = seg.object.get("rows").?.array.items;
+            const ev_idx = seg.object.get("events").?.array.items;
+            // Keys de-duplicated: the last occurrence's row stays, in the first's slot.
+            var pk_idx = try a.alloc(usize, st.pk.len);
+            for (st.pk, 0..) |pc, k| {
+                pk_idx[k] = for (cols, 0..) |cn, ci| {
+                    if (std.mem.eql(u8, cn, pc)) break ci;
+                } else return error.ChainObjectMalformed;
+            }
+            var slot: std.StringArrayHashMapUnmanaged(usize) = .empty;
+            var rows: std.ArrayListUnmanaged([]const storage.Value) = .empty;
+            for (rows_v) |rv| {
+                const cells = rv.array.items;
+                var key: std.ArrayListUnmanaged(u8) = .empty;
+                for (pk_idx) |ci| {
+                    try key.appendSlice(a, try core.valueToString(a, cells[ci]));
+                    try key.append(a, 0x1f);
+                }
+                const params = try a.alloc(storage.Value, cols.len);
+                for (params, 0..) |*p, ci| p.* = if (ci < cells.len) try jsonToStorage(a, cells[ci]) else .null;
+                if (slot.get(key.items)) |at| {
+                    rows.items[at] = params;
+                } else {
+                    try slot.put(a, key.items, rows.items.len);
+                    try rows.append(a, params);
+                }
+            }
+            const col_list = try core.quotedJoin(a, cols);
+            try st_.execSimple(try std.fmt.allocPrint(a, "CREATE OR REPLACE TEMP TABLE _zbz_copy AS SELECT {s} FROM {s} LIMIT 0", .{ col_list, table }));
+            try st_.dkAppend("_zbz_copy", rows.items);
+            try st_.execSimple(try core.pgUpsertFromCopySql(a, table, cols, st.pk, null));
+            try st_.execSimple("DROP TABLE _zbz_copy");
+            statements += 1;
+            bulked += ev_idx.len;
+            for (ev_idx) |iv| {
+                const e = evs.items[@intCast(iv.integer)];
+                cx.offered.* += 1;
+                if (e.ev.object.get("data")) |dv| try self.feedFloor(a, st, dv);
+            }
+            if (cx.report_a) |ra_| if (cx.changed_map) |cm| {
+                if (!cm.contains(table)) cm.put(ra_, ra_.dupe(u8, table) catch table, {}) catch {};
+            };
+            if (self.rebase.count() > 0) self.rebase_due = true;
+        }
+        if (bulked > 0 or singles > 0) self.bulk_stats.add(bulked, statements, singles);
+        if (cx.max_seq.* > cx.last) try self.persistSeq(cx.stream, cx.max_seq.*);
     }
 
     /// An UPDATE for a row that is HERE is applied as an UPDATE (core.planUpdate —

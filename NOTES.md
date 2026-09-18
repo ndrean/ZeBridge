@@ -13965,3 +13965,96 @@ a quarter of the thread, the durability trade above); a single-pass msgpack → 
 one prepared statement per (table, column set) bound row by row, no `planUpsert` string
 built and hashed per event, no probe for a whole-tuple UPDATE (part of the 32%). Together
 perhaps 1.5×; the chain's ~90k stays out of reach for random-key CDC on this table.
+
+## 10hf. DuckDB under the firehose: the limit is structural (2026-09-18)
+
+The same harness on libzb's DuckDB engine (`-Dduckdb=true`, `ZB_CLIENT_ENGINE=duckdb`, a
+new knob of `firehose_tls.py`). Three findings, one fix, one open item.
+
+**1. A declared dimension is not a promise.** The harness declared `matrix integer[]` and
+loaded `ARRAY[[i,1],[2,3]]`, which PostgreSQL accepts: `attndims` is informational. The
+descriptor said `integer[]`, DuckDB typed the column `INTEGER[]`, and the first CDC row
+failed — `Could not convert string '[0,1]' to INT32`. SQLite never cared (text). A DuckDB
+replica needs the declaration to match the data; the harness now declares `integer[][]`.
+Not fixed in the engine: the only mapping that survives any data is JSON, and §10fl chose
+typed lists on purpose.
+
+**2. One bad row lost the whole batch.** On DuckDB a failed statement aborts the transaction
+("Current transaction is aborted"), every later event failed too, and `applyBatch` printed
+"not applied" for each and ACKED the batch — 86,887 of 1,800,000 rows at the end, 60
+batches wrong. Fixed: on DuckDB a refused event aborts the batch at once (the engine's
+text is printed), and when the immediate-checks retry is refused as well, a third pass
+applies ONE TRANSACTION PER EVENT — `applyBatchIsolated`, the TS client's design — so only
+the bad event is lost, and said. Measured: every event of the refused batches landed
+(37,960 + 42,796 applied, 0 refused).
+
+**3. The limit.** With the declaration fixed, the batch path still failed — at seq 90 of
+the stream, `Out of Memory Error: failed to allocate data of size 4.0 KiB (12.7 GiB/12.7
+GiB used)`. About 39,000 row-at-a-time upserts in one transaction exhausted DuckDB's
+memory limit (80% of a 16 GiB machine): an in-transaction UPDATE keeps an undo copy per
+column VECTOR (2,048 values), so a random single-row update on a 14-column table costs
+hundreds of kilobytes until COMMIT. The isolated replay then applied everything, at 80–95
+rows/s — a DuckDB commit is a heavy thing. So: **DuckDB cannot take CDC one row at a time
+under load.** That is not a tuning problem; it is what a columnar, vectorized store is.
+
+**What would work** is the path the chain already takes on DuckDB (§10fl): rows appended
+into a temp table, then ONE `INSERT … SELECT … ON CONFLICT DO UPDATE` — a set-based upsert
+costs one operation per row group, not per row. That is the bulk CDC apply of §10hc for
+libzb, and on DuckDB it is not an optimisation but the only way: `planCdcBulk`'s segments
+into the appender, keys de-duplicated to their last occurrence first (DuckDB refuses to
+update the same row twice in one command), singles through `applyEvent`. Not built today.
+
+**Open:** the empty chain's seed ends with `re-seed after epoch move: PrepareFailed` on
+DuckDB — a prepared statement the engine refused, not yet named; the table exists and CDC
+follows regardless.
+
+**The harness lesson**, for the third time this week: `sample` on a pid found with
+`pgrep -f` sampled a zsh, because the waiter's own command line matched. Match the
+interpreter, not the script name.
+
+## 10hg. DuckDB takes CDC in bulk, and converges (2026-09-18)
+
+§10hf's conclusion, built: on DuckDB a CDC batch is planned (`core.planCdcBulk`, DuckDB now
+a bulk-capable engine in both cores and the fixture), and every `bulk` segment goes the way
+the chain does on this engine — rows appended into `_zbz_copy`, one `INSERT … SELECT … ON
+CONFLICT DO UPDATE`, no version guard, a key repeated in the segment reduced to its LAST row
+first (DuckDB refuses to update one row twice in a statement). `single`s take `applyEvent`;
+a refused one aborts the batch for the isolated replay. SQLite keeps its per-row path
+(§10hd measured it faster there).
+
+**Two more DuckDB defects on the way, both fixed.** The 60 s run at 60k did not converge:
+1,545,633 of 1,800,000 rows, 17 batches wrong — not the bulk statements (2.1M events in 50
+of them, clean) but eleven gaps, and every re-seed ending in `PrepareFailed`. Named once the
+print carried the engine's text: `Catalog Error: Table with name _zbz_generations does not
+exist`. DuckDB RAISES on `pragma_table_info` of a missing table where SQLite answers no
+rows, so on a fresh DuckDB replica `ensureGenerations`'s `try` ended the whole bookkeeping
+setup before the CREATE, and no seed could ever record a watermark. One `catch &.{}`. The
+other, §10hf's harness declaration (`integer[][]`), stays a rule: a DuckDB replica needs
+declared array dimensions to match the data.
+
+**Measured**, 60 s loads, libzb on DuckDB (`ZB_CLIENT_ENGINE=duckdb`):
+
+| load | applied through the load | caught up after the load ended | gaps healed | batches wrong |
+| --- | --- | --- | --- | --- |
+| 60k events/s | 17,844 inserts/s (~36k events/s) | 39 s | 28 | **0** of 60 |
+| 100k events/s | 23,500 inserts/s | 62 s | 23 | **0** of 60 |
+
+So DuckDB stays live to about 36k events/s of this load and converges above it, through the
+chain: the scratch stream's 256 MiB window prunes under a lagging client, libzb takes the
+gap, and the boot chain (g1, cut before the load, 0 rows) does not cover it — the hole stays
+open, the batch unacked, until the producer's next cut does. Every run ended equal to
+PostgreSQL. For comparison, libzb on SQLite applies ~24,000 inserts/s at both rates and
+converges 65 s after a 100k load (§10he).
+
+**Where the DuckDB thread goes** (`sample`, 20 s in the 60k load, 15,548 samples in the
+client thread): 34% inside DuckDB statements — the set-based upsert and the DDL around it —
+and 16% in the appender; the planner 0.3%, the decode 1.4%. DuckDB's own top frames are FSST
+string decompression and bit-unpacking: a columnar store re-reading the segments it
+updates. The rest is the fetch and the gap handling. Nothing in libzb's code is the cost
+here; the engine's update path is.
+
+**Left open:** on DuckDB a table with a PostGIS column still takes the per-row path (the
+planner's `blobCols` rule exists for SQLite's `json_each`), which is the path that ran out
+of memory — the appender binds blobs, so DuckDB should not pass `blobCols` at all; one line,
+to do with the fuel-price tables (a point per station). And the 28 gaps say a DuckDB
+follower on a firehose wants a wider stream window or a faster cadence, a deployment knob.
