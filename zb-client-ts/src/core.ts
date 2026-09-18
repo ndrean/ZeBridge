@@ -654,7 +654,9 @@ export function planCdcBulk(
     if (t.unseeded) return single('unseeded');
     if (t.anchor && seedGateDrops(ev, t.anchor)) { out.push({ kind: 'drop', event: i, why: 'gate' }); return; }
     if (engine !== 'sqlite' && engine !== 'duckdb') return single('engine');
-    if (t.blobCols?.length) return single('blob-table');
+    // JSON has no bytes, so a BLOB column keeps SQLite's json_each path per row; DuckDB's
+    // appender binds bytes, so there it is not a reason (§10hi).
+    if (engine === 'sqlite' && t.blobCols?.length) return single('blob-table');
     if (ev.operation === 'DELETE') return single('delete');
     if (tombstoned(t.tombstoneColumn ?? null, data)) return single('tombstone');
     if (ev.operation !== 'INSERT' && ev.operation !== 'UPDATE') return single('operation');
@@ -663,7 +665,7 @@ export function planCdcBulk(
     if (planKeyChange(ev.table, t.pkCols, data)) return single('key-change');
     if (!t.pkCols.length) return single('keyless');
     if (t.pkCols.some((c) => data[c] === undefined || data[c] === null)) return single('incomplete-key');
-    if (keys.some((k) => isBytes(data[k]))) return single('bytes');
+    if (engine === 'sqlite' && keys.some((k) => isBytes(data[k]))) return single('bytes');
     if (ev.operation === 'UPDATE' && !sameSet(keys, t.columns)) return single('partial-update');
     let g = open.get(ev.table);
     if (g && !sameSet(g.cols, keys)) { close(ev.table); g = undefined; }

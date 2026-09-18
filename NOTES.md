@@ -14117,3 +14117,25 @@ the per-row path (the planner's `blobCols` rule was written for SQLite's `json_e
 appender binds blobs, so DuckDB should not pass `blobCols` — a day's 50 station rows never
 noticed, a firehose would. And the feed's real refresh, several times a day, would be the
 next thing to replay once two snapshots exist.
+
+## 10hi. Two leftovers of §10hh: the blob rule on DuckDB, and a "bug" that was zsh (2026-09-18)
+
+**The blob rule.** `planCdcBulk` sent a table with a BLOB column down the per-row path
+because SQLite's `json_each` has no bytes — and on DuckDB the per-row path is the one that
+runs out of memory (§10hf). The stations table has a PostGIS point, so on DuckDB it was
+going row by row. DuckDB's appender binds bytes, so the rule now holds on SQLite only, in
+both cores and the fixture. Day six of the fuel feed on DuckDB: drained, no batch refused,
+equal to PostgreSQL. And the question §10gz's tile-service plan left open is answered on the
+replica file: DuckDB spatial's `ST_GeomFromWKB(geom)` reads the bridge's EWKB as it is, SRID
+flag included (`0101000020E6100000…` → `POINT (4.079 48.283)`); `ST_GeomFromHEXEWKB(hex(geom))`
+too. Nothing to strip.
+
+**The silent first call was not libzb's.** `zb sync --once` "applied nothing on its first
+call after a load, four times" — in a zsh loop that did `set -- $spec` on `"sqlite /path"`.
+zsh does not word-split an unquoted variable, so `$1` was the whole string and `$2` empty:
+`zb` got a bogus engine and an empty `--db`, printed its usage line to stderr, and my filter
+swallowed it. Called properly, the first run right after a load drains and applies at once
+— and on SQLite it shows the hold path at work on the loader's parent-first order: "batch
+refused as a unit (FOREIGN KEY constraint failed) … fk held: 49, applied on retry: 49".
+Lesson for the harness notes beside §10ha: in zsh, split with `${=var}` or an array, and
+never filter a command's stderr before reading its exit code.

@@ -1402,7 +1402,7 @@
    ]
   }
  ],
- "_cdcBulk": "§10gp, the bulk CDC apply. Which events of one batch may share ONE upsert (cdcBulkSql: chainBulkSql with NO version guard — two updates of a row in one PostgreSQL transaction carry the same version; the stream's order is the truth and SQLite applies json_each's rows in order, the last occurrence of a key winning: measured on 3.53.4) and which take the per-event path, named. `tables[t].columns` is the replica table's OWN column list (the reverted probe experiment judged a whole payload against the descriptor and lost 28 of 60 batches). A `bulk` segment's `events` are the batch indexes it stands for: the shell still feeds the HLC floor, confirms echoes and notifies per event, and on a failed statement applies those events one at a time. Tables interleave (one transaction, FK checks deferred); within a table the order is the stream's, so a per-event event of the same table closes its run first. The rows keep the wire's JSON shapes; json_extract binds them as chainRowParams does. How a shell EXECUTES a bulk segment is its own measured choice: zb-client-ts binds one prepared per-row upsert per row (faster than the json_each statement on better-sqlite3, NOTES §10hd) and commits up to 20,000 events per transaction; the json_each text stays pinned as `sql`. DuckDB is bulk-capable too (§10hg): libzb executes a segment through the appender into a temp table and ONE set-based upsert, keys de-duplicated to their last occurrence first — row-at-a-time upserts exhaust DuckDB's memory; the `sql` text is SQLite's and a DuckDB shell ignores it.",
+ "_cdcBulk": "§10gp, the bulk CDC apply. Which events of one batch may share ONE upsert (cdcBulkSql: chainBulkSql with NO version guard — two updates of a row in one PostgreSQL transaction carry the same version; the stream's order is the truth and SQLite applies json_each's rows in order, the last occurrence of a key winning: measured on 3.53.4) and which take the per-event path, named. `tables[t].columns` is the replica table's OWN column list (the reverted probe experiment judged a whole payload against the descriptor and lost 28 of 60 batches). A `bulk` segment's `events` are the batch indexes it stands for: the shell still feeds the HLC floor, confirms echoes and notifies per event, and on a failed statement applies those events one at a time. Tables interleave (one transaction, FK checks deferred); within a table the order is the stream's, so a per-event event of the same table closes its run first. The rows keep the wire's JSON shapes; json_extract binds them as chainRowParams does. How a shell EXECUTES a bulk segment is its own measured choice: zb-client-ts binds one prepared per-row upsert per row (faster than the json_each statement on better-sqlite3, NOTES §10hd) and commits up to 20,000 events per transaction; the json_each text stays pinned as `sql`. DuckDB is bulk-capable too (§10hg): libzb executes a segment through the appender into a temp table and ONE set-based upsert, keys de-duplicated to their last occurrence first — row-at-a-time upserts exhaust DuckDB's memory; the `sql` text is SQLite's and a DuckDB shell ignores it. A BLOB column disqualifies on SQLite only (json_each has no bytes); DuckDB's appender binds bytes, so a PostGIS table is bulked there (§10hi).",
  "cdcBulk": [
   {
    "name": "two INSERTs and a whole-tuple UPDATE of one key share one statement; the key's last occurrence is its last row",
@@ -2773,6 +2773,55 @@
      "events": [
       0,
       1
+     ]
+    }
+   ]
+  },
+  {
+   "name": "a table with a BLOB column is bulked on DuckDB: the appender binds bytes (§10hi)",
+   "engine": "duckdb",
+   "tables": {
+    "pics": {
+     "columns": [
+      "id",
+      "pic"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": null,
+     "blobCols": [
+      "pic"
+     ]
+    }
+   },
+   "events": [
+    {
+     "table": "pics",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "pic": null
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "pics",
+     "cols": [
+      "id",
+      "pic"
+     ],
+     "sql": "INSERT INTO pics (\"id\", \"pic\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"pic\" = excluded.\"pic\"",
+     "rows": [
+      [
+       1,
+       null
+      ]
+     ],
+     "events": [
+      0
      ]
     }
    ]

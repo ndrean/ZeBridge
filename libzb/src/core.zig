@@ -774,7 +774,8 @@ pub fn planCdcBulk(a: std.mem.Allocator, engine: []const u8, tables: Value, even
                 continue;
             };
             if (!std.mem.eql(u8, engine, "sqlite") and !std.mem.eql(u8, engine, "duckdb")) break :blk "engine";
-            if (t.object.get("blobCols")) |bc| if (bc == .array and bc.array.items.len > 0) break :blk "blob-table";
+            const sqlite = std.mem.eql(u8, engine, "sqlite");
+            if (sqlite) if (t.object.get("blobCols")) |bc| if (bc == .array and bc.array.items.len > 0) break :blk "blob-table";
             const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
             if (std.mem.eql(u8, op, "DELETE")) break :blk "delete";
             const tomb: ?[]const u8 = if (t.object.get("tombstoneColumn")) |v| (if (v == .string) v.string else null) else null;
@@ -797,7 +798,7 @@ pub fn planCdcBulk(a: std.mem.Allocator, engine: []const u8, tables: Value, even
                 const v = data.object.get(c) orelse .null;
                 if (v == .null) break :blk "incomplete-key";
             }
-            for (keys.items) |k| if (isBinMarker(data.object.get(k).?)) break :blk "bytes";
+            if (sqlite) for (keys.items) |k| if (isBinMarker(data.object.get(k).?)) break :blk "bytes";
             if (std.mem.eql(u8, op, "UPDATE") and !sameSet(keys.items, columns)) break :blk "partial-update";
             // Eligible: join this table's open run, or open one for this column set.
             if (open.getPtr(table)) |g| if (!sameSet(g.cols, keys.items)) try Closer.close(a, &out, &open, table);
