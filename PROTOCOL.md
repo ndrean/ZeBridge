@@ -503,7 +503,7 @@ engines make it a consumer-side rule with no wire change:
 * a deferred violation surfacing at COMMIT means the batch was cut between a child and its parent: widen the batch (pull more messages) and retry, rather than treating it as data corruption.
 
 The simplest correct choice remains not declaring foreign keys on the replica at all — the source database already enforces them, and a replica's job is to converge
-on what the source accepted. The reference clients do declare them (the descriptor carries `foreign_keys`, §3): each apply transaction defers the check to COMMIT, and a child whose parent has not arrived is parked durably in `_zebridge_inbox` and retried after later batches (§7.1).
+on what the source accepted. The reference clients do declare them (the descriptor carries `foreign_keys`, §3): each apply transaction defers the check to COMMIT, and a child whose parent has not arrived is parked durably in `_zebridge_inbox` and retried after later batches (§7.1). libzb's DuckDB engine is the exception: a DuckDB replica carries no foreign-key constraints at all, because DuckDB can neither defer a check to COMMIT nor relax it for a seed, and a seed's chains are cut per table at different times; its rows converge to PostgreSQL's, where the constraint holds.
 
 ### Event payload
 

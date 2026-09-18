@@ -526,7 +526,13 @@ pub const SyncClient = struct {
         var names: std.ArrayList([]const u8) = .empty;
         for (cols_v.array.items) |c| try names.append(a, c.object.get("name").?.string);
         const empty_arr = Value{ .array = std.json.Array.init(a) };
-        const fks = val.object.get("foreign_keys") orelse empty_arr;
+        // §10hh: a DuckDB replica carries NO foreign keys. DuckDB can neither defer a check
+        // to COMMIT (PROTOCOL §4's rule for a batch) nor switch it off for a seed, and a
+        // seed's chains are cut per table at different times — measured: a prices chain
+        // still holding rows of a station the newer stations chain had tombstoned, the
+        // whole seed refused, the tail then landing a day's rows on an empty table. The
+        // rows converge to PostgreSQL's, which holds the constraint for everyone.
+        const fks = if (st.engine == .duckdb) empty_arr else (val.object.get("foreign_keys") orelse empty_arr);
         const idx = val.object.get("indexes") orelse empty_arr;
         const renamed = val.object.get("renamed") orelse Value{ .object = .empty };
 
@@ -2574,18 +2580,21 @@ pub const SyncClient = struct {
             stream: []const u8,
             seq: u64,
             outcome: *Outcome,
+            fn apply(cx: @This(), _: *storage.Storage) !void {
+                // A hold is written OUTSIDE this transaction: on DuckDB the refused
+                // statement has already aborted it, and an INSERT into the inbox here
+                // would fail too — measured as 50 parent tombstones "refused alone" while
+                // the engine kept reporting the FOREIGN KEY text (§10hh).
+                try cx.client.applyEvent(cx.table, cx.ev, cx.stream, cx.seq);
+            }
+        };
+        const Hold = struct {
+            a: std.mem.Allocator,
+            table: []const u8,
+            ev: Value,
+            reason: []const u8,
             fn apply(cx: @This(), st_: *storage.Storage) !void {
-                cx.client.applyEvent(cx.table, cx.ev, cx.stream, cx.seq) catch |err| switch (err) {
-                    error.FkHeld => {
-                        cx.outcome.* = .held;
-                        try holdEvent(st_, cx.a, cx.table, cx.ev, "missing-parent");
-                    },
-                    error.SchemaBehind => {
-                        cx.outcome.* = .held;
-                        try holdEvent(st_, cx.a, cx.table, cx.ev, "unknown-column");
-                    },
-                    else => return err,
-                };
+                try holdEvent(st_, cx.a, cx.table, cx.ev, cx.reason);
             }
         };
         var applied: usize = 0;
@@ -2603,9 +2612,25 @@ pub const SyncClient = struct {
                 var outcome: Outcome = .applied;
                 const one = One{ .client = self, .a = a, .table = table, .ev = ev, .stream = m.metadata.stream, .seq = seq, .outcome = &outcome };
                 self.st.transaction(one, One.apply) catch |err| {
-                    refused += 1;
-                    std.debug.print("{s}: event at seq {d} refused alone ({s}: {s}) — dropped\n", .{ table, seq, @errorName(err), self.st.errMsg() });
-                    continue;
+                    const reason: ?[]const u8 = switch (err) {
+                        error.FkHeld => "missing-parent",
+                        error.SchemaBehind => "unknown-column",
+                        else => null,
+                    };
+                    if (reason) |why| {
+                        // Rolled back above; held durably in its own transaction, retried
+                        // after the batch like every held event (§10dg).
+                        self.st.transaction(Hold{ .a = a, .table = table, .ev = ev, .reason = why }, Hold.apply) catch |e2| {
+                            refused += 1;
+                            std.debug.print("{s}: event at seq {d} could not be held ({s}: {s}) — dropped\n", .{ table, seq, @errorName(e2), self.st.errMsg() });
+                            continue;
+                        };
+                        outcome = .held;
+                    } else {
+                        refused += 1;
+                        std.debug.print("{s}: event at seq {d} refused alone ({s}: {s}) — dropped\n", .{ table, seq, @errorName(err), self.st.errMsg() });
+                        continue;
+                    }
                 };
                 switch (outcome) {
                     .applied => {
@@ -2910,7 +2935,7 @@ pub const SyncClient = struct {
                 // A parent's DELETE ahead of its children's (a cascade split across
                 // batches) is HELD like a child ahead of its parent, and lands on retry.
                 _ = self.stepExec(taa, stp) catch |err| {
-                    if (err == storage.Error.StepFailed and std.mem.indexOf(u8, self.st.errMsg(), "FOREIGN KEY") != null) return error.FkHeld;
+                    if (err == storage.Error.StepFailed and self.fkRefused()) return error.FkHeld;
                     return err;
                 };
             }
@@ -2922,15 +2947,21 @@ pub const SyncClient = struct {
         if (try core.planKeyChange(taa, table, st.pk, data)) |kc| _ = try self.stepExec(taa, kc);
         const up = try self.updateOrUpsert(taa, table, st, op, data);
         _ = self.stepExec(taa, up) catch |err| {
-            if (err == storage.Error.StepFailed and
-                std.mem.indexOf(u8, self.st.errMsg(), "FOREIGN KEY") != null)
-            {
-                return error.FkHeld;
-            }
+            if (err == storage.Error.StepFailed and self.fkRefused()) return error.FkHeld;
             return err;
         };
         // §10do: a row arriving may be the winner a held edit waits for.
         if (self.rebase.count() > 0) self.rebase_due = true;
+    }
+
+    /// §10hh: did the last statement fail on a FOREIGN KEY? Each engine says it in its own
+    /// words — SQLite "FOREIGN KEY constraint failed", DuckDB "Violates foreign key
+    /// constraint because key … is still referenced", PostgreSQL "violates foreign key
+    /// constraint". Matching SQLite's capitals alone let DuckDB DROP a parent's tombstone
+    /// that arrived ahead of its children's (measured: 50 closed stations kept, §10hh);
+    /// recognised, it is HELD and lands on the retry, as §10dg designed.
+    fn fkRefused(self: *SyncClient) bool {
+        return std.ascii.indexOfIgnoreCase(self.st.errMsg(), "foreign key") != null;
     }
 
     /// §10q: the HLC floor, fed from every arriving row's version column — observed

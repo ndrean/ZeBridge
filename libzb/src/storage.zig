@@ -276,16 +276,17 @@ pub const Storage = struct {
     /// `PRAGMA journal_mode` returns one short text cell, which this covers. A
     /// statement that returns more than fits is a misuse of execSimple — use `query`.
     pub fn execSimple(self: *Storage, sql: []const u8) Error!void {
-        // A stack buffer first (the SQLite path allocates little); the PostgreSQL path
-        // rewrites the statement and may not fit — an arena then.
-        var buf: [256]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buf);
-        _ = self.query(fba.allocator(), sql, &.{}) catch |err| {
-            if (err != Error.OutOfMemory) return err;
-            var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-            defer arena.deinit();
-            _ = try self.query(arena.allocator(), sql, &.{});
-        };
+        // ⚠️ One execution, ever. This used to try a 256-byte stack buffer first and, on
+        // OutOfMemory, run the statement AGAIN through an arena — but the buffer can run
+        // out while the RESULT is read, after the statement executed, and the retry then
+        // executed it a second time. Measured on DuckDB (§10hh): a seed's
+        // `INSERT … SELECT FROM _zbz_copy` just under 256 bytes ran twice and the second
+        // run raised a duplicate key on every composite-key table; the firehose's longer
+        // statements ran out of buffer BEFORE executing and never showed it. An arena over
+        // malloc costs one allocation per statement and cannot re-execute anything.
+        var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer arena.deinit();
+        _ = try self.query(arena.allocator(), sql, &.{});
     }
 
     /// Prepare, bind, step. Rows (and their text/blob contents) are allocated
@@ -524,6 +525,8 @@ pub const Storage = struct {
         const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
         if (std.ascii.startsWithIgnoreCase(trimmed, "PRAGMA")) return .{ .columns = &.{}, .rows = try a.alloc(Row, 0) };
         const zsql: [:0]const u8 = if (std.ascii.eqlIgnoreCase(trimmed, "BEGIN IMMEDIATE")) "BEGIN TRANSACTION" else try a.dupeZ(u8, trimmed);
+        // ZB_DEBUG_SQL=1 prints every DuckDB statement — how §10hh's double execution was seen.
+        if (std.c.getenv("ZB_DEBUG_SQL") != null) std.debug.print("SQL[{d}] {s}\n", .{ params.len, zsql[0..@min(zsql.len, 300)] });
         // A statement without parameters runs as a plain query: DDL in particular —
         // a prepared `CREATE OR REPLACE … AS SELECT` executed but left the old table
         // in place (measured: the appender then saw the old column count), and a

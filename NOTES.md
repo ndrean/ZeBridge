@@ -14058,3 +14058,62 @@ planner's `blobCols` rule exists for SQLite's `json_each`), which is the path th
 of memory — the appender binds blobs, so DuckDB should not pass `blobCols` at all; one line,
 to do with the fuel-price tables (a point per station). And the 28 gaps say a DuckDB
 follower on a firehose wants a wider stream window or a faster cadence, a deployment knob.
+
+## 10hh. A real dataset on three replicas: the fuel-price feed, normalized (2026-09-18)
+
+The owner's ask after §10hg: not a flat firehose table but data as it comes — the French
+fuel-price feed (`examples/08-map/prix-des-carburants-…csv`, 9,800 stations, 47 columns), a
+FULL snapshot every day. `examples/08-map/load_fuel.py` stages the file and upserts it
+into three tables — `fuel_stations` (a PostGIS point, two jsonb columns), `fuel_prices`
+(station → fuel, a composite key and a foreign key) and `fuel_outages` (the same shape) —
+each with `updated_at` as version and `deleted_at` as tombstone, touching only rows whose
+values differ (`IS DISTINCT FROM`), soft-deleting what left the snapshot. Loading the same
+file twice moves nothing; `--perturb 0.1` moves a tenth of the prices, `--close 50` closes
+fifty stations with their prices and outages. A first load: 9,800 / 31,136 / 23,889 rows;
+a simulated day: ~3,000 price updates, 50 station tombstones, ~150 price and ~130 outage
+tombstones — the diff, and exactly what CDC carries. `fuel_check.py` compares each replica
+with PostgreSQL's live rows: count, a checksum, a second one, per table.
+
+**Result:** four simulated days, three replicas — zb-client-ts following live, libzb into
+SQLite and libzb into DuckDB in `zb sync --once` mode — all equal to PostgreSQL at the end
+of each day, closures included. Between the first load and that sentence, five defects,
+three of them in libzb and two of them not DuckDB's at all:
+
+1. **`execSimple` executed a statement TWICE.** It tried a 256-byte stack buffer first and,
+   on OutOfMemory, ran the statement again through an arena — but the buffer can run out
+   while the RESULT is read, after the statement executed. A seed's `INSERT … SELECT FROM
+   _zbz_copy` just under 256 bytes ran twice on DuckDB and the second run raised a duplicate
+   key on every composite-key table; the firehose's longer statements ran out of buffer
+   BEFORE executing and never showed it; on SQLite the pattern was only ever saved by
+   idempotent statements. Found with `ZB_DEBUG_SQL=1` (kept), which printed every DuckDB
+   statement and showed the CREATE and the INSERT each printed twice. One execution now,
+   over an arena on malloc.
+2. **A foreign-key refusal was recognized in SQLite's words only** (`FOREIGN KEY`, capitals).
+   DuckDB says `Violates foreign key constraint because key … is still referenced`, so a
+   parent's tombstone arriving ahead of its children's — the loader's own order — was
+   dropped instead of HELD (§10dg): 50 closed stations kept. `fkRefused` matches any engine's
+   wording.
+3. **A hold written inside a poisoned transaction.** On DuckDB the refused statement has
+   aborted the transaction, so the inbox INSERT that holds the event failed too, and DuckDB
+   kept reporting the original error text — 50 "refused alone". The isolated replay now
+   rolls back first and holds the event in its own transaction: 24 held, 0 refused, all
+   landed on the retry.
+4. **A DuckDB replica carries no foreign keys now.** A seed's chains are cut per table at
+   different times: the prices chain still held rows of a station the newer stations chain
+   had tombstoned. SQLite seeds with `foreign_keys` OFF and reports the survivors (§10dg's
+   cross-chain skew); DuckDB can neither defer a check to COMMIT (PROTOCOL §4's rule) nor
+   switch it off, so the whole prices seed was refused and the tail then landed a day's rows
+   on an empty table. The rows converge to PostgreSQL's, which holds the constraint for
+   everyone; the DuckDB DDL simply omits the clause. PROTOCOL §4 says so.
+5. **`fuel_check.py`'s own arithmetic**: SQLite's `price * 1000` on a REAL truncated 2448.999
+   to 2448 for 101 rows; `ROUND` first, on every engine.
+
+Also seen, not chased: `zb sync --once` called back-to-back from one shell right after a
+load printed nothing and applied nothing on its first call, every time; a second call
+drained and applied everything. The live follower saw the same events within seconds.
+
+**Open** for this dataset: the stations table has a PostGIS column, so on DuckDB it takes
+the per-row path (the planner's `blobCols` rule was written for SQLite's `json_each`); the
+appender binds blobs, so DuckDB should not pass `blobCols` — a day's 50 station rows never
+noticed, a firehose would. And the feed's real refresh, several times a day, would be the
+next thing to replay once two snapshots exist.
