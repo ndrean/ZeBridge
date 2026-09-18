@@ -1,8 +1,9 @@
 //! `bridge --init-nats`: the whole NATS identity stack, generated — no nsc (§10ch).
 //!
 //! The friction it removes: to run ZeBridge under operator mode you need an operator,
-//! an account carrying two SCOPED signing keys (the client template with
-//! `{{tag(tenant)}}` / `{{name()}}` substitutions, and the service key), a bridge user
+//! an account carrying three SCOPED signing keys (the client template with
+//! `{{tag(tenant)}}` / `{{name()}}` substitutions, the responder template — a service
+//! that answers queries and never writes, §10hk — and the service key), a bridge user
 //! under the service scope, creds files, and a server conf with the resolver preload.
 //! That was `nsc add operator` / `nsc add account` / a 90-line bootstrap script — a
 //! wall for anyone who just wants to try the bridge.
@@ -77,7 +78,15 @@ fn writeFile(io: std.Io, path: []const u8, bytes: []const u8, force: bool) !void
 /// The scoped CLIENT template's allow lists, from the topology — the single grant
 /// block every principal inherits (jwt-bootstrap.sh's list, ported; see PROTOCOL §7.4b
 /// for why mutation verdicts are DIRECT.GET and never a consumer).
-fn clientAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) !struct { pub_json: []u8, sub_json: []u8 } {
+/// The two edge roles (§10hk). They share the read side — the streams, the KV buckets,
+/// the seed objects, the acks, the JetStream API replies on the inbox. A client adds its
+/// write side: mutations under its own name, its heartbeat key, asking its tenant's
+/// services. A responder adds the answering side — subscribing `query.<tenant>.<name>`
+/// for its tenants and publishing replies to any inbox — and nothing of the write side:
+/// a service that answers from a replica cannot write to PostgreSQL through the bridge.
+const Role = enum { client, responder };
+
+fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Role) !struct { pub_json: []u8, sub_json: []u8 } {
     const cdc_pre = topo.cdc_stream_prefix; // "CDC_"
     const cdc_pub = topo.cdc_stream_public; // "CDC_PUBLIC"
     const kv_schemas = topo.kv_schemas;
@@ -99,7 +108,7 @@ fn clientAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) !struc
         }
     };
 
-    try P.add(&pubs, a, "{s}.{{{{name()}}}}.>", .{subj_mut});
+    if (role == .client) try P.add(&pubs, a, "{s}.{{{{name()}}}}.>", .{subj_mut});
     try P.add(&pubs, a, "$JS.API.INFO", .{});
     inline for (.{ "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT" }) |op| {
         // tenant stream, public stream, the two KV backers — CREATE also bare (no filter)
@@ -134,16 +143,26 @@ fn clientAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) !struc
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.KV_{s}.$KV.{s}.{{{{name()}}}}", .{ kv_tenants, kv_tenants });
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{{{{tag(tenant)}}}}.>", .{obj_pre});
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{s}.>", .{ obj_pre, open });
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{subj_ack});
-    // §10dc: the fleet heartbeat — a client may write ONLY its own key.
-    try P.add(&pubs, a, "$KV.{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}", .{kv_live});
-    try P.add(&pubs, a, "$KV.{s}.{s}.{{{{name()}}}}", .{ kv_live, open });
     try P.add(&pubs, a, "$JS.ACK.>", .{});
-    // §10hj: a client may ASK its tenant's services (request/reply; the inbox is `_INBOX.>` below).
-    try P.add(&pubs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
-    try P.add(&pubs, a, "{s}.{s}.>", .{ subj_query, open });
-
-    try P.add(&subs, a, "{s}.{{{{name()}}}}.>", .{subj_ack});
+    switch (role) {
+        .client => {
+            try P.add(&pubs, a, "$JS.API.DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{subj_ack});
+            // §10dc: the fleet heartbeat — a client may write ONLY its own key.
+            try P.add(&pubs, a, "$KV.{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}", .{kv_live});
+            try P.add(&pubs, a, "$KV.{s}.{s}.{{{{name()}}}}", .{ kv_live, open });
+            // §10hj: a client may ASK its tenant's services (request/reply; the inbox is `_INBOX.>` below).
+            try P.add(&pubs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
+            try P.add(&pubs, a, "{s}.{s}.>", .{ subj_query, open });
+            try P.add(&subs, a, "{s}.{{{{name()}}}}.>", .{subj_ack});
+        },
+        .responder => {
+            // §10hk: a responder ANSWERS its tenants' queries — the reply goes to the
+            // asker's inbox, whichever it is.
+            try P.add(&pubs, a, "_INBOX.>", .{});
+            try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
+            try P.add(&subs, a, "{s}.{s}.>", .{ subj_query, open });
+        },
+    }
     try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_cdc});
     try P.add(&subs, a, "{s}.{s}.>", .{ subj_cdc, open });
     try P.add(&subs, a, "$KV.{s}.>", .{kv_schemas});
@@ -307,6 +326,7 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
     const acct_kp = genKey(io, .account) catch return 1;
     const sk_client = genKey(io, .account) catch return 1; // signing keys are account-type
     const sk_service = genKey(io, .account) catch return 1;
+    const sk_responder = genKey(io, .account) catch return 1; // §10hk: mints the services that answer
     const bridge_user = genKey(io, .user) catch return 1;
 
     var op_seed_kp = nats.nkeys.SeedKeyPair.fromSeed(op_kp.seed()) catch return 1;
@@ -318,35 +338,32 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
     //    first live boot of a generated conf died with "Can't start JetStream: …
     //    system account not setup" — JetStream's internal subscriptions live on the
     //    system account, so operator mode without one is a server that cannot start.
-    const op_claims = std.fmt.allocPrint(a,
-        "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZeBridgeOp\",\"sub\":\"{s}\"," ++
-            "\"nats\":{{\"system_account\":\"{s}\",\"type\":\"operator\",\"version\":2}}}}",
-        .{ now, op_kp.public(), op_kp.public(), sys_kp.public() }) catch return 1;
+    const op_claims = std.fmt.allocPrint(a, "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZeBridgeOp\",\"sub\":\"{s}\"," ++
+        "\"nats\":{{\"system_account\":\"{s}\",\"type\":\"operator\",\"version\":2}}}}", .{ now, op_kp.public(), op_kp.public(), sys_kp.public() }) catch return 1;
     const op_jwt = jwt_mint.signClaims(a, &op_seed_kp, op_claims, "__JTI__") catch return 1;
 
     // ── the SYS account: minimal, and deliberately WITHOUT JetStream limits — the
     //    system account may not use JetStream, and nothing ever connects to it here.
-    const sys_claims = std.fmt.allocPrint(a,
-        "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"SYS\",\"sub\":\"{s}\",\"nats\":{{" ++
-            "\"limits\":{{\"subs\":-1,\"data\":-1,\"payload\":-1,\"imports\":-1,\"exports\":-1,\"wildcards\":true,\"conn\":-1,\"leaf\":-1}}," ++
-            "\"default_permissions\":{{\"pub\":{{}},\"sub\":{{}}}},\"authorization\":{{}},\"type\":\"account\",\"version\":2}}}}",
-        .{ now, op_kp.public(), sys_kp.public() }) catch return 1;
+    const sys_claims = std.fmt.allocPrint(a, "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"SYS\",\"sub\":\"{s}\",\"nats\":{{" ++
+        "\"limits\":{{\"subs\":-1,\"data\":-1,\"payload\":-1,\"imports\":-1,\"exports\":-1,\"wildcards\":true,\"conn\":-1,\"leaf\":-1}}," ++
+        "\"default_permissions\":{{\"pub\":{{}},\"sub\":{{}}}},\"authorization\":{{}},\"type\":\"account\",\"version\":2}}}}", .{ now, op_kp.public(), sys_kp.public() }) catch return 1;
     const sys_jwt = jwt_mint.signClaims(a, &op_seed_kp, sys_claims, "__JTI__") catch return 1;
 
-    // ── account JWT: JetStream unlimited + the two SCOPED signing keys ──────────
-    const allows = clientAllows(a, &topo) catch return 1;
-    const acct_claims = std.fmt.allocPrint(a,
-        "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZEBRIDGE\",\"sub\":\"{s}\",\"nats\":{{" ++
-            "\"limits\":{{\"subs\":-1,\"data\":-1,\"payload\":-1,\"imports\":-1,\"exports\":-1,\"wildcards\":true," ++
-            "\"conn\":-1,\"leaf\":-1,\"mem_storage\":-1,\"disk_storage\":-1,\"streams\":-1,\"consumer\":-1," ++
-            "\"max_ack_pending\":-1,\"mem_max_stream_bytes\":-1,\"disk_max_stream_bytes\":-1}}," ++
-            "\"signing_keys\":[" ++
-            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"client\",\"template\":{{" ++
-            "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
-            "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"service\",\"template\":{{" ++
-            "\"pub\":{{\"allow\":[\"\\u003e\"]}},\"sub\":{{\"allow\":[\"\\u003e\"]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}]," ++
-            "\"default_permissions\":{{\"pub\":{{}},\"sub\":{{}}}},\"authorization\":{{}},\"type\":\"account\",\"version\":2}}}}",
-        .{ now, op_kp.public(), acct_kp.public(), sk_client.public(), allows.pub_json, allows.sub_json, sk_service.public() }) catch return 1;
+    // ── account JWT: JetStream unlimited + the three SCOPED signing keys ────────
+    const allows = roleAllows(a, &topo, .client) catch return 1;
+    const answers = roleAllows(a, &topo, .responder) catch return 1;
+    const acct_claims = std.fmt.allocPrint(a, "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZEBRIDGE\",\"sub\":\"{s}\",\"nats\":{{" ++
+        "\"limits\":{{\"subs\":-1,\"data\":-1,\"payload\":-1,\"imports\":-1,\"exports\":-1,\"wildcards\":true," ++
+        "\"conn\":-1,\"leaf\":-1,\"mem_storage\":-1,\"disk_storage\":-1,\"streams\":-1,\"consumer\":-1," ++
+        "\"max_ack_pending\":-1,\"mem_max_stream_bytes\":-1,\"disk_max_stream_bytes\":-1}}," ++
+        "\"signing_keys\":[" ++
+        "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"client\",\"template\":{{" ++
+        "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
+        "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"responder\",\"template\":{{" ++
+        "\"pub\":{{\"allow\":[{s}]}},\"sub\":{{\"allow\":[{s}]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}," ++
+        "{{\"kind\":\"user_scope\",\"key\":\"{s}\",\"role\":\"service\",\"template\":{{" ++
+        "\"pub\":{{\"allow\":[\"\\u003e\"]}},\"sub\":{{\"allow\":[\"\\u003e\"]}},\"subs\":-1,\"data\":-1,\"payload\":-1}},\"description\":\"\"}}]," ++
+        "\"default_permissions\":{{\"pub\":{{}},\"sub\":{{}}}},\"authorization\":{{}},\"type\":\"account\",\"version\":2}}}}", .{ now, op_kp.public(), acct_kp.public(), sk_client.public(), allows.pub_json, allows.sub_json, sk_responder.public(), answers.pub_json, answers.sub_json, sk_service.public() }) catch return 1;
     const acct_jwt = jwt_mint.signClaims(a, &op_seed_kp, acct_claims, "__JTI__") catch return 1;
 
     // ── the bridge user: a scoped user under the SERVICE key ────────────────────
@@ -404,12 +421,19 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
         \\ZB_ACCOUNT_PUB={s}
         \\ENROLL_JWT_TTL_SECONDS=86400
         \\
+        \\# Responders (§10hk): services that answer `query.<tenant>.<name>` from a replica.
+        \\# This seed is the account's SCOPED responder signing key — a user it mints reads
+        \\# like a client and answers, never writes. Not read by the bridge; mint with
+        \\#   scripts/native/mint_responder.py --seed "$ZB_RESPONDER_SEED" --account "$ZB_ACCOUNT_PUB" \\
+        \\#     --name pois --tenant kilo > pois.creds
+        \\ZB_RESPONDER_SEED={s}
+        \\
         \\# Operator seed — NOT read by the bridge. Keep it offline; it signs accounts.
         \\# ZB_OPERATOR_SEED={s}
         \\# Account identity seed — same: offline. Signs nothing day-to-day.
         \\# ZB_ACCOUNT_SEED={s}
         \\
-    , .{ nats_port, dir_abs, sk_client.seed(), acct_kp.public(), op_kp.seed(), acct_kp.seed() }) catch return 1;
+    , .{ nats_port, dir_abs, sk_client.seed(), acct_kp.public(), sk_responder.seed(), op_kp.seed(), acct_kp.seed() }) catch return 1;
 
     const creds_dir = std.fs.path.join(a, &.{ dir, "creds" }) catch return 1;
     std.Io.Dir.cwd().createDirPath(io, creds_dir) catch return 1;
@@ -422,9 +446,9 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
 
     out(
         \\✅ operator stack generated — no nsc involved:
-        \\   {s}/nats-server.conf   operator + ZEBRIDGE account (2 scoped signing keys), resolver preload
+        \\   {s}/nats-server.conf   operator + ZEBRIDGE account (3 scoped signing keys: client, responder, service), resolver preload
         \\   {s}/creds/bridge.creds the bridge's identity (service scope)
-        \\   {s}/.env.bridge        NATS_CREDS + ZB_SIGNING_SEED wired for /enroll
+        \\   {s}/.env.bridge        NATS_CREDS + ZB_SIGNING_SEED wired for /enroll, ZB_RESPONDER_SEED for services
         \\   Client onboarding is now ONLY the enrollment flow: invite row → GET /enroll →
         \\   creds. Nobody needs to understand accounts or claims.
         \\   Start:  nats-server -c {s}/nats-server.conf

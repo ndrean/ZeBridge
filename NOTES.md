@@ -14304,3 +14304,36 @@ the replica itself, no container. It installs and declares the right functions o
 three platforms, and all three builds (osx_arm64, linux_arm64, linux_amd64, checked on
 the tiles the container built) answer `extension built without Valhalla support`. A work
 in progress by its own README; the container stays, the shape is noted.
+
+## 10hk. The responder principal: a service answers, it never writes (2026-09-18)
+
+The POI service ran on `bridge.creds` — the trusted writer's `>` on everything — because
+no credential shape fit a service that follows a replica and answers queries. Now one
+does. The account carries a third scoped signing key, role `responder`, in both stacks
+(`bridge --init-nats --mode operator` and `jwt-bootstrap.sh`); its template is the
+client's read side — the streams, the KV buckets, the seed objects, the acks, the
+JetStream replies on its inbox — plus `subscribe query.{{tag(tenant)}}.>` and
+`query._default.>`, plus `publish _INBOX.>` for the replies. Absent from it: mutations
+under its name, the heartbeat key, asking, another tenant's anything. The dev user is
+`pois`, tagged `tenant:kilo`; the service defaults to it.
+
+Measured with the server enforcing the refreshed account JWT. `pois` is refused
+`mutation.pois.osm_pois`, `$KV.live.kilo.pois`, `mutation_ack.pois.>`, `query.acme.>`,
+`cdc.acme.>`, and publishing `query.kilo.pois_near` (it answers, it does not ask);
+`omar`, a client, is refused subscribing `query.kilo.>` and `query._default.>` and
+publishing to another inbox. Under the new identity the service seeds the four tables
+(osm_pois 2.1M rows in 20 s) and answers as before: E10 in 91 ms, a road route in 55 ms,
+a four-stop tour by road in 655 ms. A tag holding two tenants expands to both — a probe
+user tagged kilo and acme read `cdc.kilo.>` and `cdc.acme.>` and was refused
+`cdc.globex.>` — which jwt_mint.zig documented and nobody had measured.
+
+The stack the bridge generates has no nsc, so `scripts/native/mint_responder.py` mints
+the same JWT `src/jwt_mint.zig` does (jti = base32(sha256) of the claims, ed25519-nkey
+over `header.claims`, `tenant:` tags) from `ZB_RESPONDER_SEED`, now written to
+`.env.bridge` beside the operator seed. Proven the only way that counts: a user minted
+by the script with the dev responder seed connected, was granted kilo and acme, refused
+globex and a mutation.
+
+Left: the per-principal inbox. Every client still subscribes `_INBOX.>`, so a client can
+read another's replies; the grant `_INBOX.{{name()}}.>` needs the clients to use a
+prefix, and nats.zig hardcodes `_INBOX.` (§10fs).

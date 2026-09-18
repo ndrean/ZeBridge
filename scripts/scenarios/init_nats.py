@@ -4,7 +4,7 @@
     scripts/scenarios/run.py live -k init_nats     (boots its own server on shifted ports)
 
 Dev mode: an OPEN server conf and a matching .env.bridge, no JWT in sight — the
-ten-second path. Operator mode: operator + SYS + ZEBRIDGE accounts, two scoped signing
+ten-second path. Operator mode: operator + SYS + ZEBRIDGE accounts, three scoped signing
 keys, the bridge's creds, enrollment wired — all minted by the bridge itself, no nsc.
 The proof is not "files exist": a real nats-server boots from the generated conf, the
 generated creds pass a full JetStream round trip, and a credless connection is refused.

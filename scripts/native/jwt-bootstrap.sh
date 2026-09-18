@@ -99,6 +99,65 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-sub "_INBOX.>" >/dev/null
 echo "client signing key:  $SK_CLIENT"
 
+# ── the RESPONDER signing key: services that ANSWER `query.<tenant>.<name>` (§10hk) ──
+# The client's read side (streams, KV buckets, seed objects, acks, its own JetStream
+# replies on the inbox) + subscribing the query subjects of its tenants + publishing
+# replies to any inbox. NOT granted: mutations, the heartbeat key, asking. A service
+# that answers from a replica cannot write to PostgreSQL through the bridge.
+SK_RESPONDER=$(nsc edit account ZEBRIDGE --sk generate 2>&1 | grep -o 'A[A-Z0-9]\{55\}' | tail -1)
+nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
+    --allow-pub "\$JS.API.INFO" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_PUBLIC" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.CDC_PUBLIC.>" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_schemas" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_schemas.>" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_generations" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.KV_generations.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.CDC_{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.CDC_PUBLIC.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.KV_schemas.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.KV_generations.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.CDC_{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.CDC_PUBLIC.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.KV_schemas.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.KV_generations.>" \
+    --allow-pub "\$JS.API.STREAM.INFO.CDC_{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.STREAM.INFO.CDC_PUBLIC" \
+    --allow-pub "\$JS.API.STREAM.INFO.KV_schemas" \
+    --allow-pub "\$JS.API.STREAM.INFO.KV_generations" \
+    --allow-pub "\$JS.API.STREAM.INFO.KV_tenants" \
+    --allow-pub "\$JS.API.STREAM.MSG.GET.KV_schemas" \
+    --allow-pub "\$JS.API.DIRECT.GET.KV_schemas.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.KV_generations.\$KV.generations.{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.KV_generations.\$KV.generations._default.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.KV_tenants.\$KV.tenants.{{name()}}" \
+    --allow-pub "\$JS.API.STREAM.INFO.OBJ_gen-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.DIRECT.GET.OBJ_gen-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.STREAM.MSG.GET.OBJ_gen-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.STREAM.INFO.OBJ_gen-_default" \
+    --allow-pub "\$JS.API.DIRECT.GET.OBJ_gen-_default.>" \
+    --allow-pub "\$JS.API.STREAM.MSG.GET.OBJ_gen-_default" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-_default" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-_default.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-_default.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
+    --allow-pub "\$JS.ACK.>" \
+    --allow-pub "_INBOX.>" \
+    --allow-sub "query.{{tag(tenant)}}.>" \
+    --allow-sub "query._default.>" \
+    --allow-sub "cdc.{{tag(tenant)}}.>" \
+    --allow-sub "cdc._default.>" \
+    --allow-sub "\$KV.schemas.>" \
+    --allow-sub "\$KV.generations.>" \
+    --allow-sub "_INBOX.>" >/dev/null
+echo "responder signing key: $SK_RESPONDER"
+
 # ── users: one mint per principal — THIS is the whole onboarding now ─────────
 nsc add user --account ZEBRIDGE --name bridge -K "$SK_SERVICE" 2>/dev/null || echo "bridge user exists"
 for spec in alice:acme bob:globex mary:globex nina:tango omar:kilo; do
@@ -108,6 +167,8 @@ done
 # guest: a principal with NO tenant mapping — follows public tables only (§10dl).
 # The web consumer's account picker shows what "no mapping" looks like.
 nsc add user --account ZEBRIDGE --name guest -K "$SK_CLIENT" 2>/dev/null || echo "guest exists"
+# pois: the POI service (examples/08-map/poi_service.py), a responder for kilo and the open tenant.
+nsc add user --account ZEBRIDGE --name pois -K "$SK_RESPONDER" --tag "tenant:kilo" 2>/dev/null || echo "pois exists"
 
 # ── the auditor: zbdoctor's own principal, read-only by construction ────────
 #
@@ -137,7 +198,7 @@ nsc add user --account ZEBRIDGE --name zbdoctor \
     --allow-pub "\$JS.API.DIRECT.GET.>" \
     --allow-sub "_INBOX.>" 2>/dev/null || echo "zbdoctor exists"
 
-for u in bridge alice bob mary nina omar guest zbdoctor; do
+for u in bridge alice bob mary nina omar guest pois zbdoctor; do
   nsc generate creds --account ZEBRIDGE --name "$u" > "$CREDS/$u.creds"
 done
 chmod 600 "$CREDS"/*.creds

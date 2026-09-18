@@ -2,7 +2,7 @@
 """The POI service: a DuckDB replica of all of France, answering "what is around me"
 over NATS request/reply — PostgreSQL never sees a query (NOTES §10hj).
 
-    examples/08-map/poi_service.py                    # bridge.creds, engine duckdb, queue group "pois"
+    examples/08-map/poi_service.py                    # pois.creds (a RESPONDER principal, §10hk), engine duckdb, queue group "pois"
     ZB_DB=/tmp/pois.duckdb examples/08-map/poi_service.py --tenants kilo,_default
 
 One process, two halves on one libzb card (DuckDB allows one writer per file):
@@ -385,8 +385,10 @@ def main():
     global VALHALLA
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
-    ap.add_argument("--creds", default=str(ROOT / "scripts" / "native" / "creds" / "bridge.creds"))
-    ap.add_argument("--principal", default="bridge")
+    # §10hk: a responder principal — reads like a client, answers, cannot write. Minted by
+    # jwt-bootstrap.sh (nsc) or scripts/native/mint_responder.py; tagged with the tenants it serves.
+    ap.add_argument("--creds", default=str(ROOT / "scripts" / "native" / "creds" / "pois.creds"))
+    ap.add_argument("--principal", default="pois")
     ap.add_argument("--db", default=os.environ.get("ZB_DB", "/tmp/pois-service.duckdb"))
     ap.add_argument("--engine", default="duckdb")
     ap.add_argument("--tenants", default="kilo,_default")

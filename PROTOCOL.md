@@ -176,7 +176,9 @@ flowchart TD
 ### `query.<tenant>.<name>` is request/reply, not a stream
 
 A client may publish to `query.<tenant>.<name>` for its own tenant and the open one; a
-service answers on the client's inbox. Nothing is stored: no stream, no consumer, no
+service holding a **responder** credential (SECURITY §1.6) — tagged with the tenants it
+serves, granted the query subjects of those tenants and the open one, and replies to any
+inbox — answers on the client's inbox. Nothing is stored: no stream, no consumer, no
 position. The bridge is not involved beyond rendering the grant and serving the name in
 the grammar. What a service answers is its own contract — the reference service
 (`examples/08-map/poi_service.py`) takes named queries with parameters, never SQL, and

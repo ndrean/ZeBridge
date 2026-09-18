@@ -392,6 +392,16 @@ Two credential shapes, on purpose:
 | --- | --- | --- |
 | the bridge | nkey, seed passed on the command line, in no env file | `publish: >`, `subscribe: >` — it is the trusted writer and already holds replication rights |
 | a client | user/password today, JWT next | allow-listed to its own subtree |
+| a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants and `publish: _INBOX.>` for the replies — no mutations, no heartbeat key, no asking |
+
+**A responder answers, it never writes.** A service that answers `query.<tenant>.<name>`
+from a replica (PROTOCOL §2) holds a responder credential, not the bridge's: it follows
+the same streams a client follows, subscribes the query subjects of the tenants in its
+tags, and publishes to inboxes. The write side is absent from its template, so a
+compromised service cannot reach PostgreSQL through the bridge, and a client credential
+is refused a `query.>` subscription, so nobody can pose as a service. Both are measured
+(NOTES §10hk). Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
+bridge generated, by `scripts/native/mint_responder.py` from `ZB_RESPONDER_SEED`.
 
 **The transport.** The bridge dials `nats://` (plain TCP) or `tls://`. With `tls://` it
 verifies the server certificate against `NATS_TLS_CA`, or the system trust store when that
