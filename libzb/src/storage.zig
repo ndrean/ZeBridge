@@ -104,6 +104,15 @@ pub const Storage = struct {
         // The handle is acquired; a failing pragma below must not leak it.
         errdefer _ = c.sqlite3_close(self.db);
         self.execSimple("PRAGMA journal_mode = WAL;") catch {};
+        // §10he: measured on the firehose replica, 35% of the CDC thread sat in COMMIT —
+        // 27% in the automatic WAL checkpoint (an fsync of the main file every 1,000 WAL
+        // pages, plus the page copy) and 8% in the commit's own fsync (`synchronous`
+        // defaults to FULL). NORMAL in WAL mode keeps the file consistent through a crash
+        // and may lose the last transactions, which a replica re-fetches from the stream
+        // (the position rides the same transaction as the rows); ten thousand pages
+        // between checkpoints bounds the WAL at ~40 MB.
+        self.execSimple("PRAGMA synchronous = NORMAL;") catch {};
+        self.execSimple("PRAGMA wal_autocheckpoint = 10000;") catch {};
         try self.execSimple("PRAGMA foreign_keys = ON;");
         return self;
     }

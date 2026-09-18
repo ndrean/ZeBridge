@@ -9,6 +9,12 @@ import type { Exec, StorageFactory } from './storage.ts';
 export const nodeStorage: StorageFactory = (dbName) => {
   const db = new Database(dbName);
   db.pragma('journal_mode = WAL');
+  // §10he: the commit's fsync and the automatic checkpoint every 1,000 WAL pages were a
+  // third of libzb's CDC thread on the firehose replica; the same defaults apply here.
+  // NORMAL in WAL mode stays consistent through a crash and may lose the last
+  // transactions, which a replica re-fetches from the stream.
+  db.pragma('synchronous = NORMAL');
+  db.pragma('wal_autocheckpoint = 10000');
   // better-sqlite3 already defaults this ON, which is exactly why it is spelled
   // out: an invariant that holds by a dependency's default is one upgrade away
   // from not holding, and the browser adapter had the opposite default.

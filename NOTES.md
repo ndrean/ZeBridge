@@ -13918,3 +13918,50 @@ small — measure at 60k and 100k before building anything.
 Under the new defaults, the seven `owns` scenarios that drive zb-client-ts — migrate_both,
 column_flood, rekey_two_parents, rekey_offline, tombstone_children, revoke_midseed,
 write_stale — are green (7/7, the scenarios' venv, §10ha).
+
+## 10he. libzb under the firehose: where its thread goes, and what moves it (2026-09-18)
+
+Measured before building, as §10hd asked. libzb through the harness (`--client-at 5`, 60 s
+loads), ReleaseFast: at 60k events/s 23,447 rows/s applied through the load, caught up
+72.8 s, 0 gaps; at 100k 23,094 rows/s, caught up 125.0 s (65 s after the load), 0 gaps,
+3,000,000 rows right. Its ceiling is ~24,000 inserts/s applied — ~48k events/s of this
+load — and it lags above that without falling off a 60 s stream.
+
+**Where the client thread goes** (macOS `sample` of the harness process, 20 s inside the
+100k load, 16,989 samples in the client thread):
+
+| | share |
+| --- | --- |
+| `applyEvent` — plan the SQL per event, probe, bind, step | 32% |
+| decode — msgpack → payload map → JSON value tree, an arena per event | ~25% |
+| COMMIT: the automatic WAL checkpoint (`fsync` of the main file every 1,000 WAL pages + the page copy) | 17% |
+| COMMIT: the WAL frames and the commit's own `fsync` (`synchronous` defaults to FULL) | 6% |
+
+**Pragmas, measured.** `synchronous = NORMAL` + `wal_autocheckpoint = 10000` in both storage
+layers: libzb 60k 23,356 rows/s (was 23,447), 100k 23,863 (was 23,094); zb-client-ts 100k
+27,435 (was 29,406), caught up 128.0 s (was 121.7). Noise, both ways. The post-change sample
+explains it: the checkpoint's share ROSE to 26% — ten times fewer checkpoints, each ten
+times larger, the same bytes. A random row rewritten is a 4 KB page written to the WAL and
+again into the main file; the cost is the bytes, not the syscall count. On a copy of the
+replica, per-row upserts, 172,000 rows, checkpoints inside the wall time:
+
+| | rows/s |
+| --- | --- |
+| page 4096, FULL, checkpoint every 1,000 pages (the defaults) | 25,300 |
+| page 4096, NORMAL, 1,000 | 25,900 |
+| page 4096, NORMAL, 10,000 | **34,300** |
+| page 1024, NORMAL, 1,000 / 10,000 | 28,200 / 34,800 |
+| page 4096, **OFF**, 1,000 | **68,300** |
+
+So the interval is worth a third when the row's CPU is small, the page size nothing, and
+the `fsync` is the whole I/O story: `synchronous = OFF` (no fsync at all) is 2.7× — at the
+price that a power loss mid-checkpoint can corrupt the file, which a replica could meet with
+a `quick_check` at open and a re-seed. A product decision, not taken here. The two pragmas
+stay as set: standard for a WAL replica, the commit's fsync gone, no cost measured.
+
+**What would move libzb**, in order of expected gain, none built: `synchronous = OFF` (up to
+a quarter of the thread, the durability trade above); a single-pass msgpack → JSON decode
+(today two trees per message, ~half of the 25%); the planner's segments for its own sake —
+one prepared statement per (table, column set) bound row by row, no `planUpsert` string
+built and hashed per event, no probe for a whole-tuple UPDATE (part of the 32%). Together
+perhaps 1.5×; the chain's ~90k stays out of reach for random-key CDC on this table.
