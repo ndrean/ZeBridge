@@ -1402,6 +1402,1317 @@
    ]
   }
  ],
+ "_cdcBulk": "§10gp, the bulk CDC apply. Which events of one batch may share ONE upsert (cdcBulkSql: chainBulkSql with NO version guard — two updates of a row in one PostgreSQL transaction carry the same version; the stream's order is the truth and SQLite applies json_each's rows in order, the last occurrence of a key winning: measured on 3.53.4) and which take the per-event path, named. `tables[t].columns` is the replica table's OWN column list (the reverted probe experiment judged a whole payload against the descriptor and lost 28 of 60 batches). A `bulk` segment's `events` are the batch indexes it stands for: the shell still feeds the HLC floor, confirms echoes and notifies per event, and on a failed statement applies those events one at a time. Tables interleave (one transaction, FK checks deferred); within a table the order is the stream's, so a per-event event of the same table closes its run first. The rows keep the wire's JSON shapes; json_extract binds them as chainRowParams does. How a shell EXECUTES a bulk segment is its own measured choice: zb-client-ts binds one prepared per-row upsert per row (faster than the json_each statement on better-sqlite3, NOTES §10hd) and commits up to 20,000 events per transaction; the json_each text stays pinned as `sql`.",
+ "cdcBulk": [
+  {
+   "name": "two INSERTs and a whole-tuple UPDATE of one key share one statement; the key's last occurrence is its last row",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at",
+     "anchor": {
+      "seedSeq": 10,
+      "seedStream": "CDC_PUBLIC"
+     }
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 11,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "2026-09-18T10:00:00.000000Z"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 12,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 2,
+      "name": "b",
+      "age": 20,
+      "deleted_at": null,
+      "updated_at": "2026-09-18T10:00:00.000000Z"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "UPDATE",
+     "seq": 13,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 1,
+      "name": "c",
+      "age": 30,
+      "deleted_at": null,
+      "updated_at": "2026-09-18T10:00:01.000000Z"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       1,
+       "a",
+       10,
+       null,
+       "2026-09-18T10:00:00.000000Z"
+      ],
+      [
+       2,
+       "b",
+       20,
+       null,
+       "2026-09-18T10:00:00.000000Z"
+      ],
+      [
+       1,
+       "c",
+       30,
+       null,
+       "2026-09-18T10:00:01.000000Z"
+      ]
+     ],
+     "events": [
+      0,
+      1,
+      2
+     ]
+    }
+   ]
+  },
+  {
+   "name": "a partial UPDATE keeps the probe-then-UPDATE path and closes the run before it (§7: the upsert's INSERT arm fails NOT NULL on a partial payload)",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at"
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "UPDATE",
+     "data": {
+      "id": 1,
+      "age": 11,
+      "updated_at": "t2"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "id": 3,
+      "name": "c",
+      "age": 30,
+      "deleted_at": null,
+      "updated_at": "t3"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       1,
+       "a",
+       10,
+       null,
+       "t1"
+      ]
+     ],
+     "events": [
+      0
+     ]
+    },
+    {
+     "kind": "single",
+     "event": 1,
+     "why": "partial-update"
+    },
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       3,
+       "c",
+       30,
+       null,
+       "t3"
+      ]
+     ],
+     "events": [
+      2
+     ]
+    }
+   ]
+  },
+  {
+   "name": "a DELETE of the same table closes the run: the order within a table is the stream's",
+   "engine": "sqlite",
+   "tables": {
+    "orders": {
+     "columns": [
+      "id",
+      "user_id",
+      "total"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": null
+    }
+   },
+   "events": [
+    {
+     "table": "orders",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "user_id": 7,
+      "total": 5
+     }
+    },
+    {
+     "table": "orders",
+     "operation": "DELETE",
+     "data": {
+      "id": 1
+     }
+    },
+    {
+     "table": "orders",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "user_id": 7,
+      "total": 6
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "orders",
+     "cols": [
+      "id",
+      "user_id",
+      "total"
+     ],
+     "sql": "INSERT INTO orders (\"id\", \"user_id\", \"total\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"user_id\" = excluded.\"user_id\", \"total\" = excluded.\"total\"",
+     "rows": [
+      [
+       1,
+       7,
+       5
+      ]
+     ],
+     "events": [
+      0
+     ]
+    },
+    {
+     "kind": "single",
+     "event": 1,
+     "why": "delete"
+    },
+    {
+     "kind": "bulk",
+     "table": "orders",
+     "cols": [
+      "id",
+      "user_id",
+      "total"
+     ],
+     "sql": "INSERT INTO orders (\"id\", \"user_id\", \"total\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"user_id\" = excluded.\"user_id\", \"total\" = excluded.\"total\"",
+     "rows": [
+      [
+       1,
+       7,
+       6
+      ]
+     ],
+     "events": [
+      2
+     ]
+    }
+   ]
+  },
+  {
+   "name": "an UPDATE that SETS the tombstone is the delete (PROTOCOL §7.5), never bulked",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at"
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "UPDATE",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": "2026-09-18T10:00:02.000000Z",
+      "updated_at": "t2"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "tombstone"
+    }
+   ]
+  },
+  {
+   "name": "tables interleave: one statement per table; another table's DELETE does not split this table's run (one transaction, FK checks deferred)",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at"
+    },
+    "orders": {
+     "columns": [
+      "id",
+      "user_id",
+      "total"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": null
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    },
+    {
+     "table": "orders",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "user_id": 1,
+      "total": 5
+     }
+    },
+    {
+     "table": "orders",
+     "operation": "DELETE",
+     "data": {
+      "id": 9
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "id": 2,
+      "name": "b",
+      "age": 20,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "orders",
+     "cols": [
+      "id",
+      "user_id",
+      "total"
+     ],
+     "sql": "INSERT INTO orders (\"id\", \"user_id\", \"total\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"user_id\" = excluded.\"user_id\", \"total\" = excluded.\"total\"",
+     "rows": [
+      [
+       1,
+       1,
+       5
+      ]
+     ],
+     "events": [
+      1
+     ]
+    },
+    {
+     "kind": "single",
+     "event": 2,
+     "why": "delete"
+    },
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       1,
+       "a",
+       10,
+       null,
+       "t1"
+      ],
+      [
+       2,
+       "b",
+       20,
+       null,
+       "t1"
+      ]
+     ],
+     "events": [
+      0,
+      3
+     ]
+    }
+   ]
+  },
+  {
+   "name": "a gated event (seq <= the seed's cutoff on its stream) drops and splits nothing",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at",
+     "anchor": {
+      "seedSeq": 10,
+      "seedStream": "CDC_PUBLIC"
+     }
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 11,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 10,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 2,
+      "name": "b",
+      "age": 20,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 12,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 3,
+      "name": "c",
+      "age": 30,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "drop",
+     "event": 1,
+     "why": "gate"
+    },
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       1,
+       "a",
+       10,
+       null,
+       "t1"
+      ],
+      [
+       3,
+       "c",
+       30,
+       null,
+       "t1"
+      ]
+     ],
+     "events": [
+      0,
+      2
+     ]
+    }
+   ]
+  },
+  {
+   "name": "another stream is not gated by this anchor",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at",
+     "anchor": {
+      "seedSeq": 10,
+      "seedStream": "CDC_PUBLIC"
+     }
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 5,
+     "stream": "CDC_globex",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       1,
+       "a",
+       10,
+       null,
+       "t1"
+      ]
+     ],
+     "events": [
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "a key change (old.* differs) takes the per-event path: delete the old key, then upsert",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at"
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "UPDATE",
+     "data": {
+      "old.id": 1,
+      "id": 9,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "key-change"
+    }
+   ]
+  },
+  {
+   "name": "old.* on an unchanged key is ignored; the statement's columns are the payload's own",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at"
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "UPDATE",
+     "data": {
+      "old.id": 1,
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       1,
+       "a",
+       10,
+       null,
+       "t1"
+      ]
+     ],
+     "events": [
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "an unknown column is the schema hold, never an upsert into the wrong shape",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at"
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1",
+      "nick": "x"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "unknown-column"
+    }
+   ]
+  },
+  {
+   "name": "an unseeded table holds every event (§10et) — before the gate, which the late seed applies on replay",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at",
+     "unseeded": true,
+     "anchor": {
+      "seedSeq": 10,
+      "seedStream": "CDC_PUBLIC"
+     }
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 11,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "seq": 3,
+     "stream": "CDC_PUBLIC",
+     "data": {
+      "id": 2,
+      "name": "b",
+      "age": 20,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "unseeded"
+    },
+    {
+     "kind": "single",
+     "event": 1,
+     "why": "unseeded"
+    }
+   ]
+  },
+  {
+   "name": "a PostgreSQL engine has no json_each: per event, with its value shaping",
+   "engine": "postgres",
+   "tables": {
+    "orders": {
+     "columns": [
+      "id",
+      "user_id",
+      "total"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": null
+    }
+   },
+   "events": [
+    {
+     "table": "orders",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "user_id": 1,
+      "total": 5
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "engine"
+    }
+   ]
+  },
+  {
+   "name": "a table with a BLOB column stays row by row (JSON has no bytes), as the chain does",
+   "engine": "sqlite",
+   "tables": {
+    "pics": {
+     "columns": [
+      "id",
+      "pic"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": null,
+     "blobCols": [
+      "pic"
+     ]
+    }
+   },
+   "events": [
+    {
+     "table": "pics",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "pic": null
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "blob-table"
+    }
+   ]
+  },
+  {
+   "name": "a keyless table and an incomplete composite key have no conflict target to bulk on",
+   "engine": "sqlite",
+   "tables": {
+    "log": {
+     "columns": [
+      "ts",
+      "msg"
+     ],
+     "pkCols": [],
+     "tombstoneColumn": null
+    },
+    "pair": {
+     "columns": [
+      "a",
+      "b",
+      "v"
+     ],
+     "pkCols": [
+      "a",
+      "b"
+     ],
+     "tombstoneColumn": null
+    }
+   },
+   "events": [
+    {
+     "table": "log",
+     "operation": "INSERT",
+     "data": {
+      "ts": 1,
+      "msg": "m"
+     }
+    },
+    {
+     "table": "pair",
+     "operation": "INSERT",
+     "data": {
+      "a": 1,
+      "b": null,
+      "v": "x"
+     }
+    },
+    {
+     "table": "pair",
+     "operation": "UPDATE",
+     "data": {
+      "a": 1,
+      "b": 2,
+      "v": "y"
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "keyless"
+    },
+    {
+     "kind": "single",
+     "event": 1,
+     "why": "incomplete-key"
+    },
+    {
+     "kind": "bulk",
+     "table": "pair",
+     "cols": [
+      "a",
+      "b",
+      "v"
+     ],
+     "sql": "INSERT INTO pair (\"a\", \"b\", \"v\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?) WHERE true ON CONFLICT(\"a\", \"b\") DO UPDATE SET \"v\" = excluded.\"v\"",
+     "rows": [
+      [
+       1,
+       2,
+       "y"
+      ]
+     ],
+     "events": [
+      2
+     ]
+    }
+   ]
+  },
+  {
+   "name": "an all-key table gets DO NOTHING (a redelivered insert converges, §7.1)",
+   "engine": "sqlite",
+   "tables": {
+    "tags": {
+     "columns": [
+      "id"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": null
+    }
+   },
+   "events": [
+    {
+     "table": "tags",
+     "operation": "INSERT",
+     "data": {
+      "id": 1
+     }
+    },
+    {
+     "table": "tags",
+     "operation": "INSERT",
+     "data": {
+      "id": 2
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "tags",
+     "cols": [
+      "id"
+     ],
+     "sql": "INSERT INTO tags (\"id\") SELECT json_extract(value, '$[0]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO NOTHING",
+     "rows": [
+      [
+       1
+      ],
+      [
+       2
+      ]
+     ],
+     "events": [
+      0,
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "name": "two column sets of one table are two statements, in stream order",
+   "engine": "sqlite",
+   "tables": {
+    "users": {
+     "columns": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": "deleted_at"
+    }
+   },
+   "events": [
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "id": 1,
+      "name": "a",
+      "age": 10,
+      "deleted_at": null,
+      "updated_at": "t1"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "id": 2,
+      "name": "b"
+     }
+    },
+    {
+     "table": "users",
+     "operation": "INSERT",
+     "data": {
+      "name": "c",
+      "id": 3
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name",
+      "age",
+      "deleted_at",
+      "updated_at"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\", \"age\", \"deleted_at\", \"updated_at\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\", \"age\" = excluded.\"age\", \"deleted_at\" = excluded.\"deleted_at\", \"updated_at\" = excluded.\"updated_at\"",
+     "rows": [
+      [
+       1,
+       "a",
+       10,
+       null,
+       "t1"
+      ]
+     ],
+     "events": [
+      0
+     ]
+    },
+    {
+     "kind": "bulk",
+     "table": "users",
+     "cols": [
+      "id",
+      "name"
+     ],
+     "sql": "INSERT INTO users (\"id\", \"name\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?) WHERE true ON CONFLICT(\"id\") DO UPDATE SET \"name\" = excluded.\"name\"",
+     "rows": [
+      [
+       2,
+       "b"
+      ],
+      [
+       3,
+       "c"
+      ]
+     ],
+     "events": [
+      1,
+      2
+     ]
+    }
+   ]
+  },
+  {
+   "name": "not followed, no data, optimistic, an unknown operation: never bulked",
+   "engine": "sqlite",
+   "tables": {
+    "orders": {
+     "columns": [
+      "id",
+      "user_id",
+      "total"
+     ],
+     "pkCols": [
+      "id"
+     ],
+     "tombstoneColumn": null
+    }
+   },
+   "events": [
+    {
+     "table": "ghost",
+     "operation": "INSERT",
+     "data": {
+      "id": 1
+     }
+    },
+    {
+     "table": "orders",
+     "operation": "INSERT"
+    },
+    {
+     "table": "orders",
+     "operation": "INSERT",
+     "optimistic": true,
+     "data": {
+      "id": 1,
+      "user_id": 1,
+      "total": 5
+     }
+    },
+    {
+     "table": "orders",
+     "operation": "TRUNCATE",
+     "data": {
+      "id": 1,
+      "user_id": 1,
+      "total": 5
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "single",
+     "event": 0,
+     "why": "not-followed"
+    },
+    {
+     "kind": "drop",
+     "event": 1,
+     "why": "no-data"
+    },
+    {
+     "kind": "single",
+     "event": 2,
+     "why": "optimistic"
+    },
+    {
+     "kind": "single",
+     "event": 3,
+     "why": "operation"
+    }
+   ]
+  },
+  {
+   "name": "a whole-tuple UPDATE on a composite key joins; its values keep the wire's JSON shapes (json_extract binds them as the chain's chainRowParams do)",
+   "engine": "sqlite",
+   "tables": {
+    "pair": {
+     "columns": [
+      "a",
+      "b",
+      "v",
+      "meta",
+      "flag"
+     ],
+     "pkCols": [
+      "a",
+      "b"
+     ],
+     "tombstoneColumn": null
+    }
+   },
+   "events": [
+    {
+     "table": "pair",
+     "operation": "UPDATE",
+     "data": {
+      "a": 1,
+      "b": 2,
+      "v": "y",
+      "meta": {
+       "k": [
+        1,
+        2
+       ]
+      },
+      "flag": true
+     }
+    },
+    {
+     "table": "pair",
+     "operation": "INSERT",
+     "data": {
+      "a": 1,
+      "b": 3,
+      "v": null,
+      "meta": null,
+      "flag": false
+     }
+    }
+   ],
+   "segments": [
+    {
+     "kind": "bulk",
+     "table": "pair",
+     "cols": [
+      "a",
+      "b",
+      "v",
+      "meta",
+      "flag"
+     ],
+     "sql": "INSERT INTO pair (\"a\", \"b\", \"v\", \"meta\", \"flag\") SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'), json_extract(value, '$[4]') FROM json_each(?) WHERE true ON CONFLICT(\"a\", \"b\") DO UPDATE SET \"v\" = excluded.\"v\", \"meta\" = excluded.\"meta\", \"flag\" = excluded.\"flag\"",
+     "rows": [
+      [
+       1,
+       2,
+       "y",
+       {
+        "k": [
+         1,
+         2
+        ]
+       },
+       true
+      ],
+      [
+       1,
+       3,
+       null,
+       null,
+       false
+      ]
+     ],
+     "events": [
+      0,
+      1
+     ]
+    }
+   ]
+  }
+ ],
  "columnDdl": [
   {
    "name": "single-column pk is inline PRIMARY KEY and NOT NULL",

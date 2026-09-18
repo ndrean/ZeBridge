@@ -1079,9 +1079,11 @@ lag on the stream is not. That is the contract — not "keeps up".
 
 What decides whether even the chain converges is one ratio: the client's **bulk apply rate
 against the rate of distinct rows changed** per window. Measured on the reference clients:
-a chain object applies at ~90,000 rows/s; CDC one event at a time at 19,000 (TypeScript) to
-34,000 (libzb) rows/s; a single client stays live up to ~40,000 (TypeScript) / ~60,000
-(libzb) events/s. At 100,000 events/s the producer's cuts carried ~65,000 distinct rows/s,
+a chain object applies at ~90,000 rows/s (sorted inserts into an empty table); CDC upserts
+on a 1.2M-row replica land ~24,000 rows/s with one message per transaction and ~59,000
+with fifty, which is why both clients commit up to 20,000 events per transaction; a single
+client stays live up to ~60,000 events/s (TypeScript and libzb alike). At 100,000 events/s
+the producer's cuts carried ~65,000 distinct rows/s,
 so the chain converged while the stream could not; an insert-only load at that rate would
 be 100,000 distinct rows/s and nothing would.
 

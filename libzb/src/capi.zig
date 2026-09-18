@@ -190,6 +190,12 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
         if (try core.planDelete(a, table, pk, data)) |v| return try core.valueToString(a, v);
         return "null";
     }
+    if (eq(u8, name, "cdcBulk")) {
+        const engine = args.object.get("engine").?.string;
+        const tables = args.object.get("tables") orelse .null;
+        const events = args.object.get("events") orelse .null;
+        return try core.valueToString(a, try core.planCdcBulk(a, engine, tables, events));
+    }
     if (eq(u8, name, "chainUpsert")) {
         const table = args.object.get("table").?.string;
         const cols = try strArrField(a, args, "cols");

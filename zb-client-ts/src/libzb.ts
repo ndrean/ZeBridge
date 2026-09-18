@@ -38,6 +38,7 @@ import { heartbeatPayload,
   normalizeVersion, maxVersion, hlcVersion,
   fkTextDiffers, viewSteps, indexSyncPlan, outboxWatermarkGate,
   isBytes, pgArrayValues, pgArrayLiteral, sortRowsByKey, chainBulkSql, vecColsOf, pgVectorValues, vecLiteral, strictMissing,
+  planCdcBulk, type CdcBulkTable, cdcValue,
 } from './core.ts';
 import type { VecCol } from './core.ts';
 import type { PlanStep } from './core.ts';
@@ -93,6 +94,18 @@ export interface ZeBridgeConfig {
   /// §10fb: rows per transaction when a chain step seeds a table (default 50 000;
   /// 0 = one transaction for the step). Bounds memory and how long the lock is held.
   seedChunkRows?: number;
+  /// §10hc: apply a CDC batch through `core.planCdcBulk` — one statement per run of
+  /// eligible events, the per-event path for the rest (default true; false = every
+  /// event through `applyEvent`, the A/B for a measurement).
+  bulkCdc?: boolean;
+  /// §10hd: how a `bulk` segment is executed on SQLite. `rows` (default) binds one
+  /// prepared VALUES upsert per row — measured faster than the multi-row
+  /// `INSERT … SELECT FROM json_each` (`json_each`), which SQLite materializes first.
+  bulkStatement?: 'rows' | 'json_each';
+  /// §10hd: events per CDC transaction (default 20 000; the 200 ms timer and the
+  /// last-in-flight rule still bound latency). One commit per 430-event message
+  /// applied 24k rows/s on the firehose replica; fifty messages per commit, 59k.
+  cdcBatchEvents?: number;
   durable?: boolean;
   engine?: 'sqlite' | 'pglite';
   /// The two seams (NOTES §10). Defaults are the browser: sqlocal/OPFS storage
@@ -295,6 +308,8 @@ export class ZeBridge {
   /// CDC events' version column, chain cutoff_version. newVersion() stamps
   /// strictly above it, so a slow clock cannot lose to a row already seen.
   private hlcFloor = '';
+  /// §10hc: what the bulk CDC path did so far — events bulked / through applyEvent, statements, fallbacks.
+  bulkStats = { bulked: 0, single: 0, statements: 0, fallbacks: 0 };
 
   private outboxInitPromise: Promise<void>;
   private resolveOutboxInit!: () => void;
@@ -1661,14 +1676,7 @@ export class ZeBridge {
     // by a seed), pinned executable in fixtures/core-fixtures.json.
     if (!seed && seedGateDrops(ev, state)) return;
 
-    // Feed the HLC floor (§10q) from every arriving row's version column —
-    // observed remote versions, never our own optimistic stamps.
-    if (!ev.optimistic && state.versionColumn) {
-      const seen = ev.data?.[state.versionColumn];
-      if (typeof seen === 'string') {
-        this.hlcFloor = maxVersion(this.hlcFloor, normalizeVersion(pgTsToWire(seen)));
-      }
-    }
+    this.feedFloor(state, ev);
 
     // PROTOCOL §7.5, decided by core.tombstoned: an INSERT/UPDATE that carries the
     // tombstone set is the delete — the reap that follows is never forwarded, so this
@@ -1751,41 +1759,117 @@ export class ZeBridge {
       await this.pruneInboxKey(exec, table, state.pkCols, ev.data);
     }
 
-    // The echo is the success signal: the CDC row that carries OUR stamp pops the
-    // outbox entry. §10dt: it must be our stamp, not merely our key — a queued
-    // offline write met another client's row on the same key arriving in the
-    // reconnect catch-up, was "confirmed" by it, and was dropped unsent (or, when the
-    // flush won the race, judged stale with no outbox row left to rebase from).
-    if (!ev.optimistic && state.pkCols.length && this.pendingWrites.size) {
-      const echoedKey = state.pkCols.map((c) => String(ev.data?.[c])).join('|');
-      const echoedVersion = state.versionColumn ? normalizeVersion(String(ev.data?.[state.versionColumn] ?? '')) : null;
-      for (const [msgId, w] of this.pendingWrites) {
-        if (w.table !== table || String(w.id) !== echoedKey) continue;
-        if (w.version && echoedVersion && normalizeVersion(w.version) !== echoedVersion) continue; // someone else's row on our key
-        this.pendingWrites.delete(msgId);
-        void this.outboxDrop(msgId);
-        this.appendLog(table, `confirmed by CDC echo after ${Date.now() - w.at}ms`, 'CONFIRMED');
+    await this.afterApplied(table, state, ev, exec);
+  }
+
+  /// §10q: the HLC floor, fed from every arriving row's version column — observed
+  /// remote versions, never our own optimistic stamps. Per event, on both apply paths.
+  private feedFloor(state: TableState, ev: any) {
+    if (!ev.optimistic && state.versionColumn) {
+      const seen = ev.data?.[state.versionColumn];
+      if (typeof seen === 'string') {
+        this.hlcFloor = maxVersion(this.hlcFloor, normalizeVersion(pgTsToWire(seen)));
       }
     }
+  }
+
+  /// What follows a row's landing, whichever statement landed it: the echo pops the
+  /// outbox entry, a held edit may have its winner, the global position advances.
+  private async afterApplied(table: string, state: TableState, ev: any, exec: Exec) {
+    this.confirmEcho(table, state, ev);
     // §10do: a row arriving may be the winner a held edit waits for.
     if (!ev.optimistic && this.rebase.size) this.scheduleRebase();
+    if (!ev.optimistic) await this.advanceGlobal(exec, ev.lsn ?? 0, ev.stream ?? '', ev.seq ?? 0);
+  }
 
-    const stream: string = ev.stream ?? '';
+  /// The echo is the success signal: the CDC row that carries OUR stamp pops the
+  /// outbox entry. §10dt: it must be our stamp, not merely our key — a queued
+  /// offline write met another client's row on the same key arriving in the
+  /// reconnect catch-up, was "confirmed" by it, and was dropped unsent (or, when the
+  /// flush won the race, judged stale with no outbox row left to rebase from).
+  private confirmEcho(table: string, state: TableState, ev: any) {
+    if (ev.optimistic || !state.pkCols.length || !this.pendingWrites.size) return;
+    const echoedKey = state.pkCols.map((c) => String(ev.data?.[c])).join('|');
+    const echoedVersion = state.versionColumn ? normalizeVersion(String(ev.data?.[state.versionColumn] ?? '')) : null;
+    for (const [msgId, w] of this.pendingWrites) {
+      if (w.table !== table || String(w.id) !== echoedKey) continue;
+      if (w.version && echoedVersion && normalizeVersion(w.version) !== echoedVersion) continue; // someone else's row on our key
+      this.pendingWrites.delete(msgId);
+      void this.outboxDrop(msgId);
+      this.appendLog(table, `confirmed by CDC echo after ${Date.now() - w.at}ms`, 'CONFIRMED');
+    }
+  }
+
+  /// The global lsn and the stream's seq, persisted when either moves forward. Once
+  /// per event on the per-event path; once per statement, with the maxima, on the
+  /// bulk path — the same monotonic result.
+  private async advanceGlobal(exec: Exec, lsn: number, stream: string, seq: number) {
     const streamSeq = stream ? (this.globalSyncState.seq[stream] ?? 0) : 0;
-    if (!ev.optimistic && ((ev.lsn ?? 0) > this.globalSyncState.lsn || (ev.seq ?? 0) > streamSeq)) {
-      this.globalSyncState.lsn = Math.max(this.globalSyncState.lsn, ev.lsn ?? 0);
-      if (stream) this.globalSyncState.seq[stream] = Math.max(streamSeq, ev.seq ?? 0);
-      try {
-        await exec(`UPDATE _zebridge_sync SET global_last_lsn = ? WHERE id = 1`, this.globalSyncState.lsn);
-        if (stream) {
-          await exec(
-            `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
-             ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
-            stream, this.globalSyncState.seq[stream],
-          );
+    if (!(lsn > this.globalSyncState.lsn || seq > streamSeq)) return;
+    this.globalSyncState.lsn = Math.max(this.globalSyncState.lsn, lsn);
+    if (stream) this.globalSyncState.seq[stream] = Math.max(streamSeq, seq);
+    try {
+      await exec(`UPDATE _zebridge_sync SET global_last_lsn = ? WHERE id = 1`, this.globalSyncState.lsn);
+      if (stream) {
+        await exec(
+          `INSERT INTO _zebridge_stream_seq (stream, last_seq) VALUES (?, ?)
+           ON CONFLICT(stream) DO UPDATE SET last_seq = excluded.last_seq`,
+          stream, this.globalSyncState.seq[stream],
+        );
+      }
+    } catch (e) {
+      this.appendLog('SQLITE', `Failed to update sync state: ${e}`, 'ERROR');
+    }
+  }
+
+  /// §10hc: a CDC batch through the planner — `core.planCdcBulk` cuts it into
+  /// segments; a `bulk` one is ONE json_each upsert for a run of eligible events, a
+  /// `single` takes `applyEvent`, a `drop` is gated. A bulk statement that fails is
+  /// replayed event by event through `applyEvent` (a hold or a bad row costs a retry,
+  /// never a silent drop) and counted as a fallback. The per-event duties — HLC floor,
+  /// echo, rebase — still run for every bulked event; the position advances once per
+  /// statement with the maxima.
+  private async applyBatchPlanned(toApply: { table: string; ev: any }[], exec: Exec) {
+    const tables: Record<string, CdcBulkTable> = {};
+    for (const { table } of toApply) {
+      if (tables[table]) continue;
+      const st = this.syncedTables.get(table);
+      if (st) tables[table] = { columns: st.columns, pkCols: st.pkCols, tombstoneColumn: st.tombstoneColumn, unseeded: st.unseeded, anchor: st, blobCols: st.blobCols };
+    }
+    const segments = planCdcBulk(this.dialect.name, tables, toApply.map(({ table, ev }) =>
+      ({ table, operation: ev?.operation, data: ev?.data, seq: ev?.seq, stream: ev?.stream, lsn: ev?.lsn, optimistic: ev?.optimistic })));
+    for (const seg of segments) {
+      if (seg.kind === 'single') {
+        this.bulkStats.single++;
+        await this.applyEvent(toApply[seg.event].table, toApply[seg.event].ev, exec);
+      } else if (seg.kind === 'bulk') {
+        const state = this.syncedTables.get(seg.table)!;
+        try {
+          if (this.config.bulkStatement === 'json_each') {
+            await exec(seg.sql, JSON.stringify(seg.rows));
+          } else {
+            // One prepared statement, one row per call: the segment already proved every
+            // row whole-tuple and known-column, so no probe and no per-event decision.
+            const sql = chainUpsertSql(seg.table, seg.cols, state.pkCols, null);
+            for (const row of seg.rows) await exec(sql, ...row.map(cdcValue));
+          }
+        } catch (err) {
+          this.bulkStats.fallbacks++;
+          this.appendLog('CDC', `bulk upsert of ${seg.rows.length} row(s) on ${seg.table} failed: ${err} — applying them one at a time`, 'WARNING');
+          for (const i of seg.events) await this.applyEvent(toApply[i].table, toApply[i].ev, exec);
+          continue;
         }
-      } catch (e) {
-        this.appendLog('SQLITE', `Failed to update sync state: ${e}`, 'ERROR');
+        this.bulkStats.statements++;
+        this.bulkStats.bulked += seg.events.length;
+        let lsn = 0, seq = 0, stream = '';
+        for (const i of seg.events) {
+          const ev = toApply[i].ev;
+          this.feedFloor(state, ev);
+          this.confirmEcho(seg.table, state, ev);
+          lsn = Math.max(lsn, ev.lsn ?? 0); seq = Math.max(seq, ev.seq ?? 0); stream = ev.stream ?? stream;
+        }
+        if (this.rebase.size) this.scheduleRebase();
+        await this.advanceGlobal(exec, lsn, stream, seq);
       }
     }
   }
@@ -2602,7 +2686,7 @@ export class ZeBridge {
           // Batched into ONE transaction per flush: N autocommits each pay OPFS
           // commit/fsync, one transaction of N pays it once. Messages are acked only
           // after their batch's transaction committed.
-          const BATCH_SIZE = 100;
+          const BATCH_SIZE = this.config.cdcBatchEvents ?? 20_000;
           const BATCH_MS = 200;
           let batch: { table: string; ev: any }[] = [];
           let batchMsgs: any[] = [];
@@ -2621,8 +2705,10 @@ export class ZeBridge {
                 // this batch's COMMIT, so a child arriving before its parent inside
                 // one batch cannot fail the apply.
                 await this.dialect.deferForeignKeys(txExec);
-                for (const { table, ev } of toApply) {
-                  await this.applyEvent(table, ev, txExec);
+                if (this.config.bulkCdc === false) {
+                  for (const { table, ev } of toApply) await this.applyEvent(table, ev, txExec);
+                } else {
+                  await this.applyBatchPlanned(toApply, txExec);
                 }
               });
               for (const { table, ev } of toApply) this.triggerChange(table, ev);
@@ -2695,12 +2781,12 @@ export class ZeBridge {
             lastSeen = msg.seq;
             processedSinceStart++;
             if (processedSinceStart % progressEvery === 0) {
-              this.appendLog('SYS', `${streamName} catch-up: ${processedSinceStart} messages processed so far, at seq ${msg.seq}`, 'INFO');
+              this.appendLog('SYS', `${streamName} catch-up: ${processedSinceStart} messages processed so far, at seq ${msg.seq}; bulk ${this.bulkStats.bulked} events in ${this.bulkStats.statements} statements, ${this.bulkStats.single} per event, ${this.bulkStats.fallbacks} fallbacks`, 'INFO');
             }
             if (!caughtUpLogged && curPending != null && processedSinceStart >= curPending) {
               caughtUpLogged = true;
               const totalMs = Math.round(performance.now() - setupStart);
-              this.appendLog('SYS', `${streamName} caught up (${processedSinceStart} messages, ${totalMs}ms total since consumer setup started) — now live`, 'INFO');
+              this.appendLog('SYS', `${streamName} caught up (${processedSinceStart} messages, ${totalMs}ms total since consumer setup started) — now live; bulk ${this.bulkStats.bulked} events in ${this.bulkStats.statements} statements, ${this.bulkStats.single} per event, ${this.bulkStats.fallbacks} fallbacks`, 'INFO');
             }
             let decoded: any;
             try {

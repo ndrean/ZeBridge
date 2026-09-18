@@ -62,6 +62,7 @@ import {
   columnDdl, fkClausesFor, createTableSteps, rebuildSteps, diffColumns,
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
+  planCdcBulk,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
@@ -149,6 +150,10 @@ for (const c of fx.chainUpsert) {
 for (const c of fx.chainRowParams) {
   test(`chainRowParams: ${c.name}`, () =>
     assert.deepEqual(chainRowParams(c.row), c.params));
+}
+for (const c of fx.cdcBulk) {
+  test(`cdcBulk: ${c.name}`, () =>
+    assert.deepEqual(planCdcBulk(c.engine, c.tables, c.events), c.segments));
 }
 
 for (const c of fx.columnDdl) {

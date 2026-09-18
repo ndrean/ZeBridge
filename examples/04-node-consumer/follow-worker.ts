@@ -16,6 +16,9 @@ const creds = credsPath && existsSync(credsPath) ? readFileSync(credsPath, 'utf8
 const zb = new ZeBridge({
   natsUrl: process.env.NATS_URL ?? 'nats://127.0.0.1:4222',
   principal: process.env.ZB_PRINCIPAL ?? 'follower',
+  bulkCdc: process.env.ZB_BULK_CDC !== '0',
+  bulkStatement: process.env.ZB_BULK_STMT === 'json_each' ? 'json_each' : 'rows',
+  cdcBatchEvents: process.env.ZB_BATCH_EVENTS ? Number(process.env.ZB_BATCH_EVENTS) : undefined,
   creds,
   heartbeatMs: 0,
   durable: true,

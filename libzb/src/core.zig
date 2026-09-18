@@ -667,6 +667,165 @@ pub fn chainUpsertSql(a: std.mem.Allocator, table: []const u8, cols: []const []c
     return sql.items;
 }
 
+/// core.ts cdcBulkSql: the chain's `json_each` upsert with NO version guard (§10gp —
+/// two updates of one row in one PostgreSQL transaction carry the same version; the
+/// stream's order is the truth, and SQLite applies the SELECT's rows in order, so the
+/// last occurrence of a key wins). Pinned in fixtures/cdcBulk.
+pub fn cdcBulkSql(a: std.mem.Allocator, table: []const u8, cols: []const []const u8, pk: []const []const u8) ![]const u8 {
+    var picks: std.ArrayList(u8) = .empty;
+    for (cols, 0..) |_, i| {
+        if (i > 0) try picks.appendSlice(a, ", ");
+        try picks.appendSlice(a, try std.fmt.allocPrint(a, "json_extract(value, '$[{d}]')", .{i}));
+    }
+    var sets: std.ArrayList(u8) = .empty;
+    var first = true;
+    for (cols) |c| {
+        if (containsStr(pk, c)) continue;
+        if (!first) try sets.appendSlice(a, ", ");
+        first = false;
+        try sets.appendSlice(a, try std.fmt.allocPrint(a, "\"{s}\" = excluded.\"{s}\"", .{ c, c }));
+    }
+    var sql: std.ArrayList(u8) = .empty;
+    try sql.appendSlice(a, try std.fmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM json_each(?) WHERE true", .{
+        table, try quotedJoin(a, cols), picks.items,
+    }));
+    const conflict = try quotedJoin(a, pk);
+    if (sets.items.len > 0) {
+        try sql.appendSlice(a, try std.fmt.allocPrint(a, " ON CONFLICT({s}) DO UPDATE SET {s}", .{ conflict, sets.items }));
+    } else {
+        try sql.appendSlice(a, try std.fmt.allocPrint(a, " ON CONFLICT({s}) DO NOTHING", .{conflict}));
+    }
+    return sql.items;
+}
+
+fn sameSet(x: []const []const u8, y: []const []const u8) bool {
+    if (x.len != y.len) return false;
+    for (x) |s| if (!containsStr(y, s)) return false;
+    return true;
+}
+
+fn boolField(v: Value, key: []const u8) bool {
+    if (v != .object) return false;
+    const f = v.object.get(key) orelse return false;
+    return f == .bool and f.bool;
+}
+
+fn segment(a: std.mem.Allocator, kind: []const u8, event: usize, why: []const u8) !Value {
+    var obj: std.json.ObjectMap = .empty;
+    try obj.put(a, "kind", .{ .string = kind });
+    try obj.put(a, "event", .{ .integer = @intCast(event) });
+    try obj.put(a, "why", .{ .string = why });
+    return .{ .object = obj };
+}
+
+/// core.ts planCdcBulk: which events of one CDC batch share ONE `cdcBulkSql`
+/// statement and which take the per-event path (`single`, named) or are dropped
+/// (`drop`: gated, or no data). Per table, a run of eligible events with one column
+/// set is a `bulk` segment; a per-event event of the SAME table closes its run first
+/// (the order within a table is the stream's), other tables' events do not (one
+/// transaction, FK checks deferred). `tables[t].columns` is the replica table's own
+/// column list. Pinned in fixtures/cdcBulk; the rules are the TS core's, in order.
+pub fn planCdcBulk(a: std.mem.Allocator, engine: []const u8, tables: Value, events: Value) !Value {
+    const Group = struct {
+        table: []const u8,
+        cols: []const []const u8,
+        sql: []const u8,
+        rows: std.json.Array,
+        events: std.json.Array,
+    };
+    var out = std.json.Array.init(a);
+    var open: std.StringArrayHashMapUnmanaged(Group) = .empty;
+    const Closer = struct {
+        fn close(a_: std.mem.Allocator, out_: *std.json.Array, open_: *std.StringArrayHashMapUnmanaged(Group), table: []const u8) !void {
+            const g = open_.get(table) orelse return;
+            _ = open_.orderedRemove(table);
+            var cols = std.json.Array.init(a_);
+            for (g.cols) |c| try cols.append(.{ .string = c });
+            var obj: std.json.ObjectMap = .empty;
+            try obj.put(a_, "kind", .{ .string = "bulk" });
+            try obj.put(a_, "table", .{ .string = g.table });
+            try obj.put(a_, "cols", .{ .array = cols });
+            try obj.put(a_, "sql", .{ .string = g.sql });
+            try obj.put(a_, "rows", .{ .array = g.rows });
+            try obj.put(a_, "events", .{ .array = g.events });
+            try out_.append(.{ .object = obj });
+        }
+    };
+    const evs: []const Value = if (events == .array) events.array.items else &.{};
+    for (evs, 0..) |ev, i| {
+        if (ev != .object) continue;
+        const table = if (ev.object.get("table")) |v| (if (v == .string) v.string else "") else "";
+        const t: Value = if (tables == .object) (tables.object.get(table) orelse .null) else .null;
+        if (t != .object) {
+            try out.append(try segment(a, "single", i, "not-followed"));
+            continue;
+        }
+        const data = ev.object.get("data") orelse .null;
+        if (data != .object) {
+            try out.append(try segment(a, "drop", i, "no-data"));
+            continue;
+        }
+        // Every `single` closes this table's run first: the order within a table is the stream's.
+        const why: ?[]const u8 = blk: {
+            if (boolField(ev, "optimistic")) break :blk "optimistic";
+            if (boolField(t, "unseeded")) break :blk "unseeded";
+            if (t.object.get("anchor")) |anchor| if (anchor == .object and seedGateDrops(ev, anchor)) {
+                try out.append(try segment(a, "drop", i, "gate"));
+                continue;
+            };
+            if (!std.mem.eql(u8, engine, "sqlite")) break :blk "engine";
+            if (t.object.get("blobCols")) |bc| if (bc == .array and bc.array.items.len > 0) break :blk "blob-table";
+            const op = if (ev.object.get("operation")) |v| (if (v == .string) v.string else "") else "";
+            if (std.mem.eql(u8, op, "DELETE")) break :blk "delete";
+            const tomb: ?[]const u8 = if (t.object.get("tombstoneColumn")) |v| (if (v == .string) v.string else null) else null;
+            if (tombstoned(tomb, data)) break :blk "tombstone";
+            if (!std.mem.eql(u8, op, "INSERT") and !std.mem.eql(u8, op, "UPDATE")) break :blk "operation";
+            const cols_v: Value = t.object.get("columns") orelse .null;
+            const pk_v: Value = t.object.get("pkCols") orelse .null;
+            const columns: []const []const u8 = if (cols_v == .array) try strArr(a, cols_v.array) else &.{};
+            const pk: []const []const u8 = if (pk_v == .array) try strArr(a, pk_v.array) else &.{};
+            var keys: std.ArrayList([]const u8) = .empty;
+            var it = data.object.iterator();
+            while (it.next()) |e| {
+                if (std.mem.startsWith(u8, e.key_ptr.*, "old.")) continue;
+                try keys.append(a, e.key_ptr.*);
+            }
+            for (keys.items) |k| if (!containsStr(columns, k)) break :blk "unknown-column";
+            if ((try planKeyChange(a, table, pk, data)) != null) break :blk "key-change";
+            if (pk.len == 0) break :blk "keyless";
+            for (pk) |c| {
+                const v = data.object.get(c) orelse .null;
+                if (v == .null) break :blk "incomplete-key";
+            }
+            for (keys.items) |k| if (isBinMarker(data.object.get(k).?)) break :blk "bytes";
+            if (std.mem.eql(u8, op, "UPDATE") and !sameSet(keys.items, columns)) break :blk "partial-update";
+            // Eligible: join this table's open run, or open one for this column set.
+            if (open.getPtr(table)) |g| if (!sameSet(g.cols, keys.items)) try Closer.close(a, &out, &open, table);
+            if (open.getPtr(table) == null) {
+                try open.put(a, table, .{
+                    .table = table,
+                    .cols = keys.items,
+                    .sql = try cdcBulkSql(a, table, keys.items, pk),
+                    .rows = std.json.Array.init(a),
+                    .events = std.json.Array.init(a),
+                });
+            }
+            const g = open.getPtr(table).?;
+            var row = std.json.Array.init(a);
+            for (g.cols) |c| try row.append(data.object.get(c) orelse .null);
+            try g.rows.append(.{ .array = row });
+            try g.events.append(.{ .integer = @intCast(i) });
+            break :blk null;
+        };
+        if (why) |w| {
+            try Closer.close(a, &out, &open, table);
+            try out.append(try segment(a, "single", i, w));
+        }
+    }
+    while (open.count() > 0) try Closer.close(a, &out, &open, open.keys()[0]);
+    return .{ .array = out };
+}
+
 /// core.ts chainRowParams: objects -> compact JSON, strings -> pgTsToWire.
 pub fn chainRowParams(a: std.mem.Allocator, row: std.json.Array) !Value {
     var out = std.json.Array.init(a);

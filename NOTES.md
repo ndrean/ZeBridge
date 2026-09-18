@@ -13760,6 +13760,10 @@ hold that never released when the winner had arrived before the write; `write_st
 pinned to a flush that no longer sends; `column_flood`'s republished descriptor
 deduplicated against the boot one; `revoke_midseed`'s dead pid). Their fixes are §10hb.
 
+* **The scenarios' Python is `scripts/scenarios/.venv/bin/python3`.** The system `python3`
+  has no `msgpack`: every scenario that imports `zb.py` dies in 0.1 s with a traceback in
+  its log, and the runner reports seven reds that look like a client regression (2026-09-18).
+
 ## 10hb. The six reds, each real, each fixed (2026-09-18)
 
 What §10ha's replay left: five owns reds and one live red. Every one was a defect —
@@ -13822,3 +13826,95 @@ Confirmed on the committed state, 2026-09-18: the whole battery green for the fi
 — offline 8/8, live 30/30 (collist now among them), owns 41/41 — ReleaseFast builds,
 restored publication, the checklist of §10ha followed to the letter.
 
+
+## 10hc. The CDC bulk apply, step one: the rule is pinned before a shell runs it (2026-09-18)
+
+§10gp left the clients' bulk CDC apply parked with a design and a warning: the SQL is
+easy, the six decisions `applyEvent` makes before it writes are where a bulk path
+diverges in silence. So the first step is the rule, not the statement — `planCdcBulk` in
+both cores, pinned by `fixtures/cdcBulk` (18 cases), green in the TS runner (202/202),
+the Python runner against libzb and the libzb unit tests.
+
+What the rule says. A batch is cut into segments in execution order. A run of eligible
+events of one table with one column set is ONE `json_each` upsert, the chain's
+`chainBulkSql` WITHOUT the version guard: two updates of a row inside one PostgreSQL
+transaction carry the same version, a guard would drop the second, and the stream's
+order is the truth. Measured on SQLite 3.53.4 before writing a line: a key written three
+times in one statement ends with the third row, even when that row's stamp is OLDER —
+sequential application, exactly. Eligible means: a followed, seeded table on SQLite with
+no BLOB column; a CDC INSERT or UPDATE that is not a tombstone, not a key change, carries
+a complete key and only known columns — and an UPDATE only when it carries EVERY column
+of the replica table, because a partial payload fails the upsert's INSERT arm on NOT NULL
+before the conflict resolves (the reason `planUpdate` exists). Everything else is a
+`single`, named with the decision that sent it there (`delete`, `tombstone`, `key-change`,
+`partial-update`, `unknown-column`, `unseeded`, `engine`, `blob-table`, …), and a gated
+event is a `drop`. A `single` of the same table closes that table's run first; another
+table's does not (one transaction, FK checks deferred, so tables interleave).
+
+Two things the fixture's note carries for the shells. `columns` is the replica table's
+OWN list, the one the shell recorded after the migration — §10gp's reverted experiment
+judged "whole payload" against the descriptor and lost 28 of 60 batches. And a `bulk`
+segment names the batch indexes it stands for, so the shell still feeds the HLC floor,
+confirms echoes and notifies per event, and when the statement fails applies those
+events one at a time: a bad row costs a retry, never a silent drop.
+
+Found on the way: the Python runner never forwarded the `strict` flag of the two STRICT
+DDL cases (§10fi), so libzb's port failed them for want of an input — 194/196 for as
+long as those cases existed. Forwarded; 196/196. Next: the TS shell, measured at 40k and
+60k with the per-batch comparison, then libzb.
+
+## 10hd. The bulk CDC apply, step two: wired into zb-client-ts, and what the measurement actually said (2026-09-18)
+
+The TS shell now plans every CDC batch with `planCdcBulk` (§10hc): a `bulk` segment lands
+without the probe or any per-event decision, a `single` goes through `applyEvent`, a failed
+segment is replayed event by event and counted. Every firehose run applied 100% of its
+events through segments — 0 per event, 0 fallbacks — and ended equal to PostgreSQL. Then
+the numbers said the plan's premise was wrong, twice.
+
+**First A/B, same day, same load, the old 100-event batch cap.** 40k events/s: per-event
+18,936 rows/s and caught up 71.7 s; the json_each segment 16,826 and 76.9 s. 60k: 11 gaps
+against 12. No gain at either rate. A CPU profile of the follower (`--cpu-prof`): 81% of its
+time inside SQLite's own execution, the planner 3%, msgpack 5%. The statement ran; SQLite
+was the cost.
+
+**On a copy of the replica** (1.2M rows, random UUID text keys, 347 MB), 86,000 random
+upserts, better-sqlite3:
+
+| shape | rows/s |
+| --- | --- |
+| `json_each` multi-row upsert, one 430-row message per transaction | 16,000 |
+| prepared per-row upsert, same | **24,000** |
+| the same two on new rows (INSERT) | 20,000 / 27,000 |
+| upsert from a staging table (no JSON parsing) | 18,000 |
+| page cache 2 MB → 128 MB, rows sorted by key | ±7%, nothing |
+| prepared per-row, 10 messages per transaction | 31,000 |
+| prepared per-row, **50 messages per transaction** | **59,000** |
+
+So the multi-row `INSERT … SELECT … ON CONFLICT` is slower than a prepared VALUES upsert on
+SQLite — it materializes the SELECT first — and the chain's ~90,000 rows/s (§10fc) comes
+from sorted inserts into an empty table, not from the statement's shape. The lever is the
+transaction size: the batch cap counted 100 EVENTS and a firehose message carries ~430, so
+every message committed alone.
+
+**Second series, `cdcBatchEvents` 20,000, segments as prepared per-row upserts
+(`bulkStatement: 'rows'`, the default).** 60k: the per-event path with the big transactions
+alone, 1 gap, 83.1 s; the segments on top, **0 gaps, 71.8 s**, 3.46M events in 411
+statements (about 20 messages per commit once the client was behind). 100k (`--rate
+50000`): **0 gaps, 3,000,000 rows right**, the client lagged during the load and drained
+57 s after it, applying ~29,000 inserts/s through the load — ~59,000 events/s sustained.
+zb-client-ts now stays live where libzb does.
+
+**The metric's ceiling.** `apply_rows_s` is the replica's GROWTH, and the load inserts
+`--rate` rows a second: at `--rate 20000` no client can show more than ~20,000. Every 40k
+run today read 21,400–21,800 rows/s and 71.7 s whatever the path — load-bound, the client at
+the head of the stream, each message flushed alone by the last-in-flight rule. §10gp's
+"19,391 rows/s at 40k" was the same bound, not a client rate. The runs that measure a client
+are the ones where it falls behind: 60k and 100k.
+
+libzb next, with this in hand: its fetch is already 100 messages per transaction (~43,000
+events under a firehose) and its probe costs ~1.5% on this shape, so the expected gain is
+small — measure at 60k and 100k before building anything.
+
+Under the new defaults, the seven `owns` scenarios that drive zb-client-ts — migrate_both,
+column_flood, rekey_two_parents, rekey_offline, tombstone_children, revoke_midseed,
+write_stale — are green (7/7, the scenarios' venv, §10ha).

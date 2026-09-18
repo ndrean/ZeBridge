@@ -562,6 +562,121 @@ export function chainBulkSql(
 export const chainRowParams = (row: any[]): any[] =>
   row.map((v) => (isBytes(v) ? v : v !== null && typeof v === 'object' ? JSON.stringify(v) : pgTsToWire(v)));
 
+// ─── the CDC bulk planner (§10gp, the plan's "bulk CDC apply") ──────────────
+//
+// A batch of CDC events is applied one statement per event; a chain chunk is one
+// statement per chunk (`chainBulkSql`), and runs ~3–5× faster. This planner says
+// which events of a batch may share ONE upsert and which must take the per-event
+// path — the six decisions `applyEvent` makes before it writes, as a pure rule the
+// two shells implement identically. Pinned in fixtures/cdcBulk.
+
+export type CdcBulkTable = {
+  /// The replica table's OWN columns — what the shell recorded after the migration,
+  /// never the descriptor's list on its own (§10gp: the reverted probe experiment
+  /// judged "whole payload" against the descriptor and lost 28 of 60 batches).
+  columns: string[];
+  pkCols: string[];
+  tombstoneColumn?: string | null;
+  /// Waiting for its chain: every event holds (§10et), none is bulked.
+  unseeded?: boolean;
+  /// The seed gate's anchor; absent → nothing is gated.
+  anchor?: SeedAnchor;
+  /// JSON has no bytes: a table with a BLOB column takes the per-event path, as the
+  /// chain does.
+  blobCols?: string[];
+};
+export type CdcBulkEvent = {
+  table: string;
+  operation: string;
+  data?: Record<string, any> | null;
+  seq?: number;
+  stream?: string;
+  lsn?: number;
+  optimistic?: boolean;
+};
+export type CdcSegment =
+  /// ONE statement for `rows` (in `cols` order, the shell binds `JSON.stringify(rows)`);
+  /// `events` are the batch indexes it stands for, so the shell can still feed the HLC
+  /// floor, confirm echoes and notify per event. On failure the shell applies those
+  /// events one at a time — a bad row costs a retry, never a silent drop.
+  | { kind: 'bulk'; table: string; cols: string[]; sql: string; rows: any[][]; events: number[] }
+  /// The per-event path, with the decision that sent it there.
+  | { kind: 'single'; event: number; why: string }
+  /// Already contained in the seed (`seedGateDrops`), or nothing to apply.
+  | { kind: 'drop'; event: number; why: string };
+
+/// The CDC bulk upsert: `chainBulkSql` WITHOUT the version guard. Two updates of one
+/// row inside a single PostgreSQL transaction carry the same version, and a guard
+/// would drop the second; the stream's order is the truth, and SQLite applies the
+/// SELECT's rows in order, so the last occurrence of a key wins — exactly sequential
+/// application (measured on 3.53: a key written three times ends with the third row,
+/// even when its stamp is OLDER).
+export function cdcBulkSql(table: string, cols: string[], pkCols: string[]): string {
+  return chainBulkSql(table, cols, pkCols, null);
+}
+
+const sameSet = (a: readonly string[], b: readonly string[]): boolean =>
+  a.length === b.length && a.every((x) => b.includes(x));
+
+/// Segments in execution order. A table's run of eligible events with one column set
+/// is one segment; a per-event event of the SAME table closes its run first (the
+/// order within a table is the stream's), events of other tables do not (the batch is
+/// one transaction with FK checks deferred, so tables may interleave). A gated event
+/// closes nothing: dropping it is a no-op wherever it falls.
+///
+/// Eligible: a followed, seeded table on SQLite with no BLOB column; a CDC (not
+/// optimistic) INSERT or UPDATE that is not a tombstone, not a key change, carries a
+/// complete key and only known columns — and an UPDATE only when it carries EVERY
+/// column of the table: a partial UPDATE on an existing row fails the upsert's INSERT
+/// arm on NOT NULL before the conflict resolves (`planUpdate`'s reason to exist), so it
+/// keeps the probe-then-UPDATE path. Everything else is `single`, named.
+export function planCdcBulk(
+  engine: string,
+  tables: Record<string, CdcBulkTable>,
+  events: readonly CdcBulkEvent[],
+): CdcSegment[] {
+  const out: CdcSegment[] = [];
+  const open = new Map<string, { table: string; cols: string[]; sql: string; rows: any[][]; events: number[] }>();
+  const close = (table: string) => {
+    const g = open.get(table);
+    if (!g) return;
+    open.delete(table);
+    out.push({ kind: 'bulk', ...g });
+  };
+  events.forEach((ev, i) => {
+    const t = tables[ev.table];
+    const single = (why: string) => { close(ev.table); out.push({ kind: 'single', event: i, why }); };
+    if (!t) { out.push({ kind: 'single', event: i, why: 'not-followed' }); return; }
+    const data = ev.data;
+    if (!data || typeof data !== 'object') { out.push({ kind: 'drop', event: i, why: 'no-data' }); return; }
+    if (ev.optimistic) return single('optimistic');
+    if (t.unseeded) return single('unseeded');
+    if (t.anchor && seedGateDrops(ev, t.anchor)) { out.push({ kind: 'drop', event: i, why: 'gate' }); return; }
+    if (engine !== 'sqlite') return single('engine');
+    if (t.blobCols?.length) return single('blob-table');
+    if (ev.operation === 'DELETE') return single('delete');
+    if (tombstoned(t.tombstoneColumn ?? null, data)) return single('tombstone');
+    if (ev.operation !== 'INSERT' && ev.operation !== 'UPDATE') return single('operation');
+    const keys = Object.keys(data).filter((k) => !k.startsWith('old.'));
+    if (keys.some((k) => !t.columns.includes(k))) return single('unknown-column');
+    if (planKeyChange(ev.table, t.pkCols, data)) return single('key-change');
+    if (!t.pkCols.length) return single('keyless');
+    if (t.pkCols.some((c) => data[c] === undefined || data[c] === null)) return single('incomplete-key');
+    if (keys.some((k) => isBytes(data[k]))) return single('bytes');
+    if (ev.operation === 'UPDATE' && !sameSet(keys, t.columns)) return single('partial-update');
+    let g = open.get(ev.table);
+    if (g && !sameSet(g.cols, keys)) { close(ev.table); g = undefined; }
+    if (!g) {
+      g = { table: ev.table, cols: keys, sql: cdcBulkSql(ev.table, keys, t.pkCols), rows: [], events: [] };
+      open.set(ev.table, g);
+    }
+    g.rows.push(g.cols.map((c) => data[c]));
+    g.events.push(i);
+  });
+  for (const table of [...open.keys()]) close(table);
+  return out;
+}
+
 // ─── the schema migration planner (§10s increment 2b — finding 9's home) ────
 //
 // Everything applySchema DECIDES, as pure functions over data the shell
