@@ -14250,3 +14250,57 @@ corridor idea over the second dataset. Measured from the phone: SP95 within 3 km
 centre, 2 stations, 1.990 € the cheapest at 2.7 km, 96 ms round trip; Gazole around Rezé, 5
 stations from 2.250 €, 105 ms; the 6-stop centre tour found no SP95 within 1.5 km of a leg,
 which is true. Two datasets, one replica, three questions, zero reads on the source.
+
+**Flutter asking on move, the same day.** The map (`examples/08-map/flutter`) is design B
+now: `ondemandTables: ['osm_pois']`, no cells, no ring, no join or leave. On every move —
+debounced 350 ms, one ask in flight, the radius half the visible diagonal capped at 2 km,
+nothing asked below zoom 13 — it requests `query._default.pois_near`, ingests the answer
+with the viewport's box as the scope when the answer is complete, and draws the points it
+holds inside the viewport from SQLite. Add (a PostGIS point built in Dart, 25 bytes as the
+`$bin` marker), rename and erase are `mutate`s on the same table. The worker isolate gained
+`request` and `ingest`, the FFI card the two bindings. `flutter analyze` clean, the macOS
+debug build green; the app's exact path — the `omar` creds, the open tenant's subject —
+proven with `poi_phone.py --principal omar --tenant _default` in 83 ms, because the
+`mapper` principal of the cell design was revoked with its grid and stays so.
+
+**The tiles' door, the same day.** The map's PMTiles file (France at zoom 14, 3.4 GB, built
+with Planetiler) sits in an R2 bucket; the app reads it by HTTP range requests. The
+`r2.dev` address is a development door — uncached, rate-limited — and the S3 endpoint wants
+signed requests, so `examples/08-map/worker` is a Cloudflare Worker with the bucket as a
+BINDING: no credentials anywhere, GET/HEAD by range, ETag, a day of edge cache keyed by
+URL and range, CORS. Four versions to get it right, each caught by a measurement:
+`Content-Range` ending in `undefined` (R2's range object varies in shape — parse the
+request's own header); a 206 on a plain HEAD (a range applied when none was asked); the
+Cache API storing no 206 (store as 200, serve as 206); and the one that hid longest — the
+cache key with the range after `#`, which the runtime treats loosely, so concurrent range
+requests could be answered with ANOTHER range's cached body: the reader's "Unexpected
+Content-Length: 14415 expected 142446", reproduced with eight parallel curls (1 of 8 wrong)
+and the app's own reader headlessly (`tool/tiles_probe.dart`, 2 of 10). The key now carries
+the range in the query string, AND a hit is served only if its stored `Content-Range` is
+exactly the range asked for — a wrong entry is a miss, whatever the key. `X-Worker` says
+what runs. Verified on version 4: 0 of 8 parallel ranges wrong, 10 of 10 tiles, 78–649 ms.
+
+Two more things the map taught. The layer's default raster mode renders each tile to an
+image for Flutter's image cache and those jobs were cancelled while the view moved (tiles
+stopped after the first view); vector mode paints the tiles itself and overzooms the
+archive's zoom-14 tiles at 15 natively. And Planetiler's default profile writes the
+OpenMapTiles schema (16 layers) while the app styled it with Protomaps's theme, whose layer
+names overlap on water alone — rivers sketched, nothing else; the renderer's own
+OpenMapTiles theme on the `openmaptiles` source draws the rest. The screen also redraws
+debounced now: a refresh per pan event rebuilt the map subtree dozens of times a second.
+
+Roads, at last. Valhalla runs as a container beside the dev stack (OrbStack, not Docker
+Desktop — the first attempt ran on Desktop and died with it when it was quit; the
+`docker` context is `orbstack`), Pays de la Loire built in two minutes. The service asks
+it: `route` (points → the road polyline, km, minutes; 171 points for Nantes centre to the
+Île de Nantes, 57 ms round trip) and the tour now orders its stops by the road-distance
+matrix (`/sources_to_targets`) and draws the way by `/route`: six stops, 2.2 km, 6 min,
+554 ms, the corridor measured along the road, not the chord. Without Valhalla the tour
+says `road_error` and falls back to straight lines; `route` answers an error, never a
+chord. In the app, a directions button and two taps draw the road.
+
+The `valhalla_routing` DuckDB community extension was the obvious question — routing in
+the replica itself, no container. It installs and declares the right functions on all
+three platforms, and all three builds (osx_arm64, linux_arm64, linux_amd64, checked on
+the tiles the container built) answer `extension built without Valhalla support`. A work
+in progress by its own README; the container stays, the shape is noted.

@@ -45,6 +45,16 @@ typedef zb_client_poll_C = ffi.Pointer<Utf8> Function(
 typedef zb_client_poll_Dart = ffi.Pointer<Utf8> Function(
     int handle, int wait_ms);
 
+typedef zb_client_request_C = ffi.Pointer<Utf8> Function(
+    ffi.Uint64 handle, ffi.Pointer<Utf8> subject, ffi.Pointer<Utf8> payload_json, ffi.Uint64 timeout_ms);
+typedef zb_client_request_Dart = ffi.Pointer<Utf8> Function(
+    int handle, ffi.Pointer<Utf8> subject, ffi.Pointer<Utf8> payload_json, int timeout_ms);
+
+typedef zb_client_ingest_C = ffi.Pointer<Utf8> Function(
+    ffi.Uint64 handle, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> answer_json, ffi.Pointer<Utf8> scope_json);
+typedef zb_client_ingest_Dart = ffi.Pointer<Utf8> Function(
+    int handle, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> answer_json, ffi.Pointer<Utf8> scope_json);
+
 typedef zb_free_C = ffi.Void Function(ffi.Pointer<Utf8> p);
 typedef zb_free_Dart = void Function(ffi.Pointer<Utf8> p);
 
@@ -97,6 +107,8 @@ class ZeBridge {
   static late zb_client_tenant_Dart _join;
   static late zb_client_tenant_Dart _leave;
   static late zb_client_poll_Dart _poll;
+  static late zb_client_request_Dart _request;
+  static late zb_client_ingest_Dart _ingest;
   static late zb_free_Dart _free;
 
   static void init() {
@@ -131,6 +143,10 @@ class ZeBridge {
         'zb_client_leave');
     _poll = _lib.lookupFunction<zb_client_poll_C, zb_client_poll_Dart>(
         'zb_client_poll');
+    _request = _lib.lookupFunction<zb_client_request_C, zb_client_request_Dart>(
+        'zb_client_request');
+    _ingest = _lib.lookupFunction<zb_client_ingest_C, zb_client_ingest_Dart>(
+        'zb_client_ingest');
     _free = _lib.lookupFunction<zb_free_C, zb_free_Dart>('zb_free');
   }
 
@@ -234,6 +250,39 @@ class ZeBridge {
   /// §10fn: follow one more tenant (its chains seed into the same tables, its
   /// stream joins the tail at the next poll). The JWT decides whether the broker
   /// allows it. Returns the memberships followed now.
+  /// §10hj: ask a service on `query.<tenant>.<name>`; its reply, decoded.
+  Map<String, dynamic> request(String subject, Map<String, dynamic> payload, int timeoutMs) {
+    final subjectC = subject.toNativeUtf8();
+    final payloadC = jsonEncode(payload).toNativeUtf8();
+    final resPtr = _request(_handle, subjectC, payloadC, timeoutMs);
+    malloc.free(subjectC);
+    malloc.free(payloadC);
+    if (resPtr == ffi.nullptr) throw Exception('request failed');
+    final resStr = resPtr.toDartString();
+    _free(resPtr);
+    final decoded = jsonDecode(resStr);
+    if (decoded is Map && decoded.containsKey('error')) throw Exception(_reason(decoded));
+    return Map<String, dynamic>.from(decoded as Map);
+  }
+
+  /// §10hj: keep an answer ({"columns","rows"}) in an on-demand table; `scope` names the
+  /// area the answer is complete for (rows held there and absent from it are deleted).
+  int ingest(String table, Map<String, dynamic> answer, Map<String, dynamic>? scope) {
+    final tableC = table.toNativeUtf8();
+    final answerC = jsonEncode({'columns': answer['columns'], 'rows': answer['rows']}).toNativeUtf8();
+    final scopeC = (scope == null ? '' : jsonEncode(scope)).toNativeUtf8();
+    final resPtr = _ingest(_handle, tableC, answerC, scopeC);
+    malloc.free(tableC);
+    malloc.free(answerC);
+    malloc.free(scopeC);
+    if (resPtr == ffi.nullptr) throw Exception('ingest failed');
+    final resStr = resPtr.toDartString();
+    _free(resPtr);
+    final decoded = jsonDecode(resStr);
+    if (decoded is Map && decoded.containsKey('error')) throw Exception(_reason(decoded));
+    return (decoded['applied'] as num).toInt();
+  }
+
   List<String> join(String tenant) => _membership(_join, tenant);
 
   /// Stop following a tenant: its rows, watermarks and tail go.

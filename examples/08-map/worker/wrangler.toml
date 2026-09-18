@@ -1,7 +1,7 @@
 # The tiles' door: a Worker in front of the R2 bucket `ze-map` (NOTES §10hj).
 # No credentials anywhere — the bucket is a BINDING, granted at deploy time by the
 # account that owns both. Deploy: `npx wrangler deploy` (wrangler asks you to log in once).
-name = "ze-map-tiles"
+name = "ze-map-worker"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 

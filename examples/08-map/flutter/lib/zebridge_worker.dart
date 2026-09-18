@@ -121,6 +121,14 @@ class ZeBridgeWorker {
   Future<List<String>> leave(String tenant) async =>
       List<String>.from(await _call<dynamic>('leave', {'tenant': tenant}) as List);
 
+  /// §10hj: ask a service (request/reply on the card's connection) — served between polls.
+  Future<Map<String, dynamic>> request(String subject, Map<String, dynamic> payload, {int timeoutMs = 5000}) async =>
+      Map<String, dynamic>.from(await _call<dynamic>('request', {'subject': subject, 'payload': payload, 'timeoutMs': timeoutMs}) as Map);
+
+  /// §10hj: keep an answer in an on-demand table; returns the rows applied.
+  Future<int> ingest(String table, Map<String, dynamic> answer, [Map<String, dynamic>? scope]) async =>
+      (await _call<dynamic>('ingest', {'table': table, 'answer': answer, 'scope': scope}) as num).toInt();
+
   /// Stop polling while the app is in the background; nothing touches the broker.
   void pause() => _toWorker.send({'op': 'pause'});
 
@@ -194,6 +202,13 @@ Future<void> _workerMain(_Boot boot) async {
           break;
         case 'flush':
           reply(zb.flush(m['waitMs'] as int));
+          break;
+        case 'request':
+          reply(zb.request(m['subject'] as String, Map<String, dynamic>.from(m['payload'] as Map), m['timeoutMs'] as int));
+          break;
+        case 'ingest':
+          reply(zb.ingest(m['table'] as String, Map<String, dynamic>.from(m['answer'] as Map),
+              m['scope'] == null ? null : Map<String, dynamic>.from(m['scope'] as Map)));
           break;
         case 'join':
           reply(zb.join(m['tenant'] as String));

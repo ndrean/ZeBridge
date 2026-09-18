@@ -30,6 +30,7 @@ def main():
     ap.add_argument("--twice", action="store_true")
     ap.add_argument("--edit", action="store_true", help="the edit story: add a POI here, rename it, remove it — asking the service after each")
     ap.add_argument("--tour", type=int, default=0, help="pick this many named POIs the phone holds and ask the service for the shortest round trip through them, with what lies along the way")
+    ap.add_argument("--route", default="", help="lat,lng of a destination: the road from --at, by Valhalla through the service")
     ap.add_argument("--fuel", default="", help="a fuel (SP95, Gazole, E10, SP98, E85, GPLc): the cheapest stations within 3 km, and the cheapest along the tour")
     a = ap.parse_args()
     lat, lng = (float(x) for x in a.at.split(","))
@@ -87,6 +88,8 @@ def main():
             fuel_story(lib, take, h, a, lat, lng)
         if a.tour:
             tour_story(lib, take, h, a, lat, lng)
+        if a.route:
+            route_story(lib, take, h, a, lat, lng)
     finally:
         lib.zb_client_close(h)
 
@@ -173,6 +176,18 @@ def fuel_story(lib, take, h, a, lat, lng):
         print(f"    {float(row[c.index('price')]):.3f} €  {str(row[c.index('address')])[:30]:30} {str(row[c.index('city')])[:18]:18} {float(row[c.index('m')]):>6.0f} m" + (f"  ({row[c.index('outage')]} outage)" if row[c.index('outage')] else ""))
 
 
+def route_story(lib, take, h, a, lat, lng):
+    """Two points → the road between them, from Valhalla through the service (never straight lines)."""
+    to_lat, to_lng = (float(x) for x in a.route.split(","))
+    q = {"points": [{"lat": lat, "lng": lng}, {"lat": to_lat, "lng": to_lng}], "costing": "auto"}
+    t0 = time.time()
+    ans = take(lib.zb_client_request(h, f"query.{a.tenant}.route".encode(), json.dumps(q).encode(), 15000))
+    dt = (time.time() - t0) * 1000
+    if "error" in ans:
+        sys.exit(f"route: {ans}")
+    print(f"route {lat:.4f},{lng:.4f} → {to_lat:.4f},{to_lng:.4f}: {ans['km']} km, {ans['min']} min by road, {len(ans['polyline'])} points — {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
+
+
 def tour_story(lib, take, h, a, lat, lng):
     """The voyageur de commerce, from the phone: stops it already holds, the service's answer."""
     import random
@@ -186,7 +201,8 @@ def tour_story(lib, take, h, a, lat, lng):
     dt = (time.time() - t0) * 1000
     if "error" in ans:
         sys.exit(f"tour: {ans}")
-    print(f"tour through {len(picks)} stops: {ans['total_m']} m round trip, {len(ans['legs'])} legs, {ans['along']['count']} POIs within 60 m of the way — {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
+    how = f"by road, {ans['by_road']['min']} min, {len(ans['polyline'])} points" if ans.get("by_road") else f"straight lines ({ans.get('road_error') or 'roads off'})"
+    print(f"tour through {len(picks)} stops: {ans['total_m']} m round trip {how}, {len(ans['legs'])} legs, {ans['along']['count']} POIs within 60 m of the way — {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
     for leg in ans["legs"]:
         print(f"    {str(leg['from'])[:34]:34} → {str(leg['to'])[:34]:34} {leg['m']:>6} m")
     if ans.get("fuel"):

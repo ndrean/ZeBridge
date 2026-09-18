@@ -1,56 +1,32 @@
-# ZeMap — one screen, one table, one tenant
+# ZeMap — the phone holds what it asked for
 
-A Flutter map of Nantes whose markers are the rows of a `pois` table in PostgreSQL.
+A Flutter map of France: the vector tiles from an R2 bucket, the OpenStreetMap points
+of interest around the viewport as markers, editable. NOTES §10hj, design B.
 
-The table reaches the app through the bridge and libzb; the app never creates it.
+`osm_pois` (2.1 million points, `examples/08-map/load_pois.py`) is an **on-demand**
+table on the phone: libzb creates it from the descriptor, nothing seeds it and nothing
+is tailed. On every move the map asks the POI service — `examples/08-map/poi_service.py`,
+a DuckDB replica of all of France answering `query._default.pois_near` from its own copy,
+PostgreSQL never asked — for the points around the centre (the radius follows the zoom,
+at most 2 km; below zoom 13 the map stops asking and draws what it holds), keeps the
+answer in its SQLite through the same version-guarded upsert a seed uses, and draws
+from the local table. Offline, every area visited is still there.
 
-Tap "+" then the map to add a point, tap a marker to edit its note or erase it. Every device of the tenant sees the change on its next poll, and a row inserted straight into PostgreSQL shows up the same way.
+Tap "+" then the map to add a point, tap a marker to rename or erase it. Each is a
+`mutate` on the local table: optimistic at once, sent to the bridge, judged upstream (the
+verdict lands in the status line's next poll), and the service's replica has it before
+the next ask. An erase sets `deleted_at` on the master (the delete guard) and every
+replica drops the row. A new point carries its PostGIS bytes (`ewkbPoint` in main.dart).
 
-## The table
+Needs, besides the dev stack: `osm_pois` loaded and enabled writable (`load_pois.py
+--create`, then `--enable` and `zebridge_enable(... writable => true)`), the POI service
+running (`scripts/scenarios/.venv/bin/python3 examples/08-map/poi_service.py`), libzb
+built with `-Dduckdb=true` for the service (the app itself needs only SQLite), and the
+`omar` creds of the dev stack. The `mapper` principal of the earlier cell design was
+revoked with its grid, and a revoked principal stays revoked.
 
-Created on the master and enabled for the bridge, nothing else:
-
-```sql
-CREATE TABLE public.pois (
-  uid uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  lat double precision NOT NULL,
-  lng double precision NOT NULL,
-  note text,
-  tenant_id text NOT NULL,
-  inserted_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  deleted_at timestamptz
-);
-
-SELECT * FROM public.zebridge_enable(
-  'public.pois'::regclass,
-  tenant_col => 'tenant_id', writable => true, version_col => 'updated_at',
-  tombstone_col => 'deleted_at',
-  publication => 'my_pub',
-  dry_run => false
-);
-```
-
-An erase sets `deleted_at` on the master (the tombstone) and every replica drops the row: the local table never holds an erased point.
-
-## Cells: the map cut into tenants
-
-The map is cut into geohash-5 cells, about 5 km a side at this latitude, and every
-cell is an ordinary tenant named `c_<geohash>`. A POI belongs to the cell of its
-coordinates. `examples/08-map/provision.py` makes a principal, `mapper`, a member of
-the 5×5 grid around Nantes, enrols it once, and writes its creds; with `--seed` it
-adds a few POIs, each in its cell. Restart the bridge once after it, so every cell has
-its CDC stream.
-
-The app follows only the 3×3 ring around the centre of the view. As you pan, it leaves
-the cells that fell out of the ring and joins the ones that came in, through libzb's
-join and leave: a join seeds the cell's rows into the local `pois` table, a leave
-deletes them. The grid is drawn on the map, the followed ring in teal. A tap to add a
-POI outside the ring is refused, since its echo would never come back.
-
-The reach is fixed at enrolment: the JWT carries one tag per cell, and a join outside
-them is refused by the broker. Growing the grid means provisioning the new cells and
-re-enrolling.
+`examples/08-map/poi_phone.py` is the same phone in Python — `--edit`, `--tour`, `--fuel`
+— and the first thing to run when the app shows nothing.
 
 ## Threading
 
@@ -111,3 +87,16 @@ From the /data folder:
 ```sh
 rclone copy france.pmtiles r2:ze-map/ -P
 ```
+
+## When tiles do not load
+
+`tool/tiles_probe.dart` opens the archive through a URL with the app's own reader and
+fetches tiles across France, in and out of the first view:
+
+```sh
+dart run tool/tiles_probe.dart https://ze-map-worker.ze-map.workers.dev/france.pmtiles
+```
+
+Ten tiles in 180–590 ms each means the door and the reader are fine and the problem is in
+the screen — the one time it happened, a redraw on every pan event was starving the tile
+layer, hence the debounce in `onPositionChanged`.

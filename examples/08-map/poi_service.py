@@ -16,7 +16,10 @@ Named queries only — the SQL lives here, the client sends parameters:
     → {"columns": [...], "rows": [[...], ...], "count": n, "complete": bool, "ms": t}
   fuel_near  {"lat", "lng", "radius_m": 3000, "fuel": "SP95", "sort": "price", "limit": 20}
     → the stations selling that fuel within the radius, cheapest first, today's price
-  tour       {"stops": [osm_id, ...], "closed": true, "along_m": 80, "fuel": "SP95", "fuel_m": 1500}
+  tour       {"stops": [osm_id, ...], "closed": true, "along_m": 80, "fuel": "SP95", "fuel_m": 1500, "roads": true}
+    → by road when Valhalla answers (the matrix orders, /route draws), straight lines otherwise
+  route      {"points": [{"lat","lng"}, …], "costing": "auto"}
+    → the road between the points: polyline, km, minutes, legs (Valhalla; an error without it)
     → the shortest round trip through the stops (exact to 9, 2-opt beyond, straight lines
       until Valhalla), its legs and polyline, and the POIs within along_m of the route
       as an answer a phone keeps like any other
@@ -25,7 +28,7 @@ A bounding box on (lat, lng) over the replica's index, then the haversine distan
 order and cut at the radius. Every libzb call is serialized through one lock: the card
 is not made for two threads.
 """
-import argparse, asyncio, ctypes, json, math, os, pathlib, sys, threading, time
+import argparse, asyncio, ctypes, json, math, os, pathlib, sys, threading, time, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
@@ -107,14 +110,14 @@ def haversine(a, b) -> float:
     return 2 * 6371000 * math.asin(math.sqrt(h))
 
 
-def tsp_order(points: list, closed: bool) -> list:
+def tsp_order(points: list, closed: bool, matrix: list | None = None) -> list:
     """The voyageur de commerce over a handful of stops: exact for up to 9 (every permutation
     of the stops after the first), nearest-neighbour then 2-opt beyond. Straight-line
     distances — a road network (Valhalla) is the planned replacement of `haversine` here."""
     n = len(points)
     if n <= 2:
         return list(range(n))
-    d = [[haversine(points[i], points[j]) for j in range(n)] for i in range(n)]
+    d = matrix if matrix is not None else [[haversine(points[i], points[j]) for j in range(n)] for i in range(n)]
 
     def length(order):
         t = sum(d[order[k]][order[k + 1]] for k in range(len(order) - 1))
@@ -177,15 +180,38 @@ def tour(card: Card, q: dict) -> dict:
         else:
             stops.append({"osm_id": None, "name": x.get("name"), "lat": float(x["lat"]), "lng": float(x["lng"])})
     closed = bool(q.get("closed", True))
-    order = tsp_order([(s["lat"], s["lng"]) for s in stops], closed)
+    pts = [(s["lat"], s["lng"]) for s in stops]
+    roads = None
+    if q.get("roads", True):
+        # By road when Valhalla answers: the matrix orders the stops, /route draws the way.
+        try:
+            roads = road_matrix(pts, q.get("costing", "auto"))
+        except Exception as e:
+            roads = None
+            road_error = str(e)[:100]
+    order = tsp_order(pts, closed, matrix=roads)
     seq = [stops[i] for i in order]
     path = seq + ([seq[0]] if closed else [])
     legs = [{"from": path[k]["name"] or path[k]["osm_id"], "to": path[k + 1]["name"] or path[k + 1]["osm_id"],
              "m": round(haversine((path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])))} for k in range(len(path) - 1)]
+    polyline = [[p["lat"], p["lng"]] for p in path]
+    by_road = None
+    if roads is not None:
+        try:
+            rr = road_route([(p["lat"], p["lng"]) for p in path], q.get("costing", "auto"))
+            polyline = rr["polyline"]
+            for k, leg in enumerate(rr["legs"]):
+                if k < len(legs):
+                    legs[k]["m"] = round(leg["km"] * 1000); legs[k]["min"] = leg["min"]
+            by_road = {"km": rr["km"], "min": rr["min"]}
+        except Exception as e:
+            road_error = str(e)[:100]
     along_m = float(q.get("along_m", 80))
     along = {"columns": [], "rows": [], "count": 0}
+    # The corridor follows the way as drawn: the road polyline when there is one.
+    way = [{"lat": a, "lng": b} for a, b in polyline]
     if along_m > 0:
-        lats, lngs = [s["lat"] for s in path], [s["lng"] for s in path]
+        lats, lngs = [s["lat"] for s in way], [s["lng"] for s in way]
         dlat = along_m / 111_320.0
         dlng = along_m / (111_320.0 * max(0.1, math.cos(math.radians(sum(lats) / len(lats)))))
         kinds = [k for k in q.get("along_kinds", []) if k in KINDS]
@@ -197,7 +223,7 @@ def tour(card: Card, q: dict) -> dict:
             li, lo = cols.index("lat"), cols.index("lng")
             stop_ids = {s["osm_id"] for s in stops}
             near = [row for row in r["rows"] if row[0] not in stop_ids and
-                    min(seg_distance_m((row[li], row[lo]), (path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])) for k in range(len(path) - 1)) <= along_m]
+                    min(seg_distance_m((row[li], row[lo]), (way[k]["lat"], way[k]["lng"]), (way[k + 1]["lat"], way[k + 1]["lng"])) for k in range(len(way) - 1)) <= along_m]
             near = near[: int(q.get("along_limit", 300))]
             along = {"columns": cols, "rows": near, "count": len(near)}
     fuel = q.get("fuel")
@@ -224,7 +250,7 @@ def tour(card: Card, q: dict) -> dict:
             "fuel": cheapest,
             "stops": [{"name": s["name"], "lat": s["lat"], "lng": s["lng"]} for s in seq],
             "legs": legs, "total_m": sum(l["m"] for l in legs), "closed": closed,
-            "polyline": [[p["lat"], p["lng"]] for p in path], "along": along,
+            "polyline": polyline, "by_road": by_road, "road_error": locals().get("road_error"), "along": along,
             "ms": round((time.time() - t0) * 1000, 1)}
 
 
@@ -261,7 +287,71 @@ def fuel_near(card: Card, q: dict) -> dict:
     return {"fuel": fuel, "columns": r["columns"], "rows": r["rows"], "count": len(r["rows"]), "ms": round((time.time() - t0) * 1000, 1)}
 
 
-QUERIES = {"pois_near": pois_near, "tour": tour, "fuel_near": fuel_near}
+# ── roads: Valhalla (examples/08-map/valhalla) ──────────────────────────────────────
+
+VALHALLA = os.environ.get("VALHALLA_URL", "http://localhost:8002")
+
+
+def valhalla(path: str, body: dict, timeout=10.0) -> dict:
+    req = urllib.request.Request(f"{VALHALLA}{path}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def decode_polyline6(s: str) -> list:
+    """Valhalla's shape: Google's polyline encoding at precision 6 → [[lat, lng], …]."""
+    out, i, lat, lng = [], 0, 0, 0
+    while i < len(s):
+        for which in (0, 1):
+            shift = result = 0
+            while True:
+                b = ord(s[i]) - 63; i += 1
+                result |= (b & 0x1f) << shift; shift += 5
+                if b < 0x20: break
+            d = ~(result >> 1) if result & 1 else result >> 1
+            if which == 0: lat += d
+            else: lng += d
+        out.append([lat / 1e6, lng / 1e6])
+    return out
+
+
+def road_route(points: list, costing="auto") -> dict:
+    """Two or more points → the road between them: polyline, km, minutes, per-leg km."""
+    r = valhalla("/route", {"locations": [{"lat": p[0], "lon": p[1]} for p in points], "costing": costing, "units": "kilometers"})
+    trip = r["trip"]
+    poly = []
+    legs = []
+    for leg in trip["legs"]:
+        pts = decode_polyline6(leg["shape"])
+        poly += pts if not poly else pts[1:]
+        legs.append({"km": round(leg["summary"]["length"], 2), "min": round(leg["summary"]["time"] / 60, 1)})
+    return {"polyline": poly, "km": round(trip["summary"]["length"], 2), "min": round(trip["summary"]["time"] / 60, 1), "legs": legs}
+
+
+def road_matrix(points: list, costing="auto") -> list:
+    """The distance matrix between the points, in km, from /sources_to_targets."""
+    locs = [{"lat": p[0], "lon": p[1]} for p in points]
+    r = valhalla("/sources_to_targets", {"sources": locs, "targets": locs, "costing": costing, "units": "kilometers"})
+    return [[cell["distance"] if cell.get("distance") is not None else 1e9 for cell in row] for row in r["sources_to_targets"]]
+
+
+def route(card: Card, q: dict) -> dict:
+    """{"points": [{"lat","lng"}, …], "costing": "auto"|"bicycle"|"pedestrian"} → the road
+    between them, in order: polyline, km, minutes, legs. Straight lines never: without
+    Valhalla the answer says so."""
+    t0 = time.time()
+    pts = [(float(p["lat"]), float(p["lng"])) for p in q.get("points", [])]
+    if len(pts) < 2:
+        return {"error": "at least two points"}
+    try:
+        r = road_route(pts, q.get("costing", "auto"))
+    except Exception as e:
+        return {"error": f"valhalla unreachable or refused: {str(e)[:120]}", "valhalla": VALHALLA}
+    r["ms"] = round((time.time() - t0) * 1000, 1)
+    return r
+
+
+QUERIES = {"pois_near": pois_near, "tour": tour, "fuel_near": fuel_near, "route": route}
 
 
 async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str):
@@ -292,6 +382,7 @@ async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str
 
 
 def main():
+    global VALHALLA
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     ap.add_argument("--creds", default=str(ROOT / "scripts" / "native" / "creds" / "bridge.creds"))
@@ -300,7 +391,9 @@ def main():
     ap.add_argument("--engine", default="duckdb")
     ap.add_argument("--tenants", default="kilo,_default")
     ap.add_argument("--queue", default="pois")
+    ap.add_argument("--valhalla", default=VALHALLA, help="the routing engine (examples/08-map/valhalla); the tour and route go by road when it answers")
     a = ap.parse_args()
+    VALHALLA = a.valhalla.rstrip("/")
     lib = load_lib()
     card = Card(lib, {"url": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db, "engine": a.engine,
                       "tables": TABLES, "clientId": "poi-service", "heartbeatMs": 0, "seedStreaming": True})

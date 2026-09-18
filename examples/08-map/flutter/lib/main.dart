@@ -1,29 +1,26 @@
-/// ZeMap — one screen: a vector map of Nantes, the `pois` table as markers.
+/// ZeMap — one screen: France's vector tiles from R2, the OpenStreetMap points of
+/// interest around the viewport as markers, editable (NOTES §10hj, design B).
 ///
-/// The table lives in PostgreSQL and reaches the phone through the bridge; libzb
-/// creates the local replica from the descriptor, so the app never runs a CREATE
-/// TABLE. Tap "+", then the map, to add a point; tap a marker to edit its note or
-/// erase it. An erase is a tombstone upstream (`deleted_at` is set, the master keeps
-/// the row); every replica applies it as a delete, so the local table never holds a
-/// tombstoned row and the marker query needs no filter.
-///
-/// Cells (NOTES §10fo): the map is cut into geohash-5 cells and every cell is a
-/// tenant, `c_<geohash>`; a POI belongs to the cell of its coordinates. The `mapper`
-/// principal is enrolled into a 5×5 grid of them (examples/08-map/provision.py) and
-/// the phone FOLLOWS only the 3×3 ring around the viewport: as you pan, cells are
-/// joined and left through libzb (`zb_client_join`/`zb_client_leave`) — their rows
-/// seed in and out of the same local table. The ring is drawn so you can see it.
+/// The phone holds what it asked for. `osm_pois` is an ON-DEMAND table: libzb creates it
+/// from the descriptor, nothing seeds it and nothing is tailed — on every move the map
+/// asks the POI service (`query._default.pois_near`, a DuckDB replica of all of France
+/// answering from its own copy, PostgreSQL never asked) for the points around the
+/// centre, keeps the answer in its SQLite through the version-guarded upsert, and draws
+/// from the local table. Offline, every area visited is still there. An edit (add, rename,
+/// erase) is a `mutate` on that same local table: optimistic at once, sent to the
+/// bridge, judged upstream, and the service's replica has it before the next ask.
 ///
 /// Threading: the libzb handle is NOT thread-safe (one thread drives one client), so
-/// every call on it — sync, the blocking poll loop, query, mutate, flush, close — runs
-/// on ONE long-lived worker isolate (`zebridge_worker.dart`, the 05-mobile design).
-/// The UI isolate only sends messages. `Isolate.run` per poll would put the poll on a
-/// fresh thread while the UI thread still called query/mutate on the same handle: two
-/// threads on one handle, exactly what the contract forbids.
+/// every call on it — sync, the blocking poll loop, query, mutate, request, ingest,
+/// flush, close — runs on ONE long-lived worker isolate (`zebridge_worker.dart`). The
+/// UI isolate only sends messages.
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -31,6 +28,8 @@ import 'geohash.dart';
 import 'package:pmtiles/pmtiles.dart';
 import 'package:vector_map_tiles/vector_map_tiles.dart';
 import 'package:vector_map_tiles_pmtiles/vector_map_tiles_pmtiles.dart';
+import 'package:vector_tile_renderer/vector_tile_renderer.dart'
+    show ProvidedThemes;
 
 import 'zebridge.dart' show PollReport;
 import 'zebridge_worker.dart';
@@ -38,12 +37,20 @@ import 'zebridge_worker.dart';
 // Dev copy: the repository paths, like 05-mobile. A shipped app bundles the creds it
 // enrolled and the pmtiles it downloaded.
 const _repo = '/Users/nevendrean/code/zig/ZeBridge';
-const _credsPath = '$_repo/scripts/native/creds/mapper.creds';
+// `omar`, a demo principal of the dev stack (its tenant is `kilo`); the `mapper` of the
+// cell design was revoked with its grid, and a revoked principal stays revoked.
+const _credsPath = '$_repo/scripts/native/creds/omar.creds';
 const _pmtilesPath = '$_repo/examples/08-map/flutter/test_region.pmtiles';
-/// France at zoom 14 (3.4 GB) on Cloudflare R2: read through HTTP range requests, so
-/// only the tiles in view travel. The local extract is the offline fallback.
-const _pmtilesUrl = 'https://pub-4f6882e07ada4c5299238a846f397030.r2.dev/france.pmtiles';
-final _dbPath = '${Directory.systemTemp.path}/zb-flutter-map-mapper.sqlite3';
+
+/// France at zoom 14 (3.4 GB) on Cloudflare R2, behind the Worker in ../worker: read
+/// through HTTP range requests, so only the tiles in view travel, cached at the edge.
+/// The local extract is the offline fallback.
+const _pmtilesUrl = 'https://ze-map-worker.ze-map.workers.dev/france.pmtiles';
+final _dbPath = '${Directory.systemTemp.path}/zb-flutter-map-omar.sqlite3';
+
+/// The tenant the POI service answers for (it serves `_default` and `kilo`).
+const _queryTenant = '_default';
+const _table = 'osm_pois';
 
 void main() => runApp(const ZeMapApp());
 
@@ -53,7 +60,9 @@ class ZeMapApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'ZeMap',
-        theme: ThemeData(colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal), useMaterial3: true),
+        theme: ThemeData(
+            colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+            useMaterial3: true),
         home: const MapScreen(),
       );
 }
@@ -72,14 +81,38 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   List<Map<String, dynamic>> pois = const [];
   bool addingMode = false;
   VectorTileLayer? vectorLayer;
-  /// The cells the phone may follow (the JWT's tags), the ones it follows now, and
-  /// the ring the viewport asks for; a move is applied once the previous one landed.
-  Set<String> enrolled = const {};
-  Set<String> following = const {};
-  Set<String> wanted = const {};
-  bool moving = false;
-  Timer? ringDebounce;
+  _CountingTiles? tiles;
+
+  /// The viewport last asked for; a move is asked once the previous ask landed.
+  LatLng? wantedCentre;
+  double wantedRadius = 0;
+  bool asking = false;
+  Timer? askDebounce;
+  Timer? refreshDebounce;
+  int held = 0;
+
+  /// The fuel switch: null is off; a fuel asks the service for the stations around the
+  /// centre after each move and draws them as price tags. An overlay from the service's
+  /// replica, not a local table — prices move several times a day.
+  String? fuel;
+  List<Map<String, dynamic>> stations = const [];
+
+  /// Route mode: two taps, then the service asks Valhalla for the road between them.
+  bool routeMode = false;
+  final routePoints = <LatLng>[];
+  List<LatLng> routeLine = const [];
+  String routeInfo = '';
   final mapController = MapController();
+
+  Map<String, dynamic>? get _cheapest {
+    Map<String, dynamic>? best;
+    for (final st in stations) {
+      if (st['outage'] != null) continue;
+      if (best == null || double.parse(_price(st)) < double.parse(_price(best)))
+        best = st;
+    }
+    return best;
+  }
 
   @override
   void initState() {
@@ -104,15 +137,38 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   Future<void> _initTiles() async {
     try {
-      final archive = await PmTilesArchive.from(_pmtilesUrl).catchError((Object e) {
-        debugPrint('pmtiles: $_pmtilesUrl unreachable ($e) — the local extract instead');
+      final archive =
+          await PmTilesArchive.from(_pmtilesUrl).catchError((Object e) {
+        debugPrint(
+            'pmtiles: $_pmtilesUrl unreachable ($e) — the local extract instead');
         return PmTilesArchive.fromFile(File(_pmtilesPath));
       });
       if (!mounted) return;
+      // The counters redraw the status line at most twice a second: a rebuild per tile
+      // request would itself disturb the tiles' loading.
+      Timer? tick;
+      tiles =
+          _CountingTiles(PmTilesVectorTileProvider.fromArchive(archive), () {
+        tick ??= Timer(const Duration(milliseconds: 500), () {
+          tick = null;
+          if (mounted) setState(() {});
+        });
+      });
       setState(() {
+        // The archive is Planetiler's default profile: the OpenMapTiles schema (16 layers:
+        // water, transportation, building, place, …). A theme names its source and its
+        // layers; Protomaps's theme drew only the water layer the two schemas share.
         vectorLayer = VectorTileLayer(
-          theme: ProtomapsThemes.lightV4(),
-          tileProviders: TileProviders({'protomaps': PmTilesVectorTileProvider.fromArchive(archive)}),
+          theme: ProvidedThemes.lightTheme(),
+          tileProviders: TileProviders({'openmaptiles': tiles!}),
+          // Vector mode paints the tiles itself. The default raster mode renders each
+          // tile to an image for Flutter's image cache, and those render jobs were
+          // cancelled as the view moved ("CancellationException … IMAGE RESOURCE
+          // SERVICE"): tiles beyond the first view never finished. Vector mode also
+          // overzooms the archive's zoom-14 tiles at 15 without a substitution step.
+          layerMode: VectorTileLayerMode.vector,
+          showTileDebugInfo:
+              false, // true draws each tile's id: what the layer asks for as you pan
         );
       });
     } catch (e) {
@@ -126,8 +182,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         'url': 'nats://127.0.0.1:4222',
         'credsPath': _credsPath,
         'dbPath': _dbPath,
-        'principal': 'mapper',
-        'tables': ['pois'],
+        'principal': 'omar',
+        'ondemandTables': [_table],
         'clientId': 'flutter-map',
       });
       if (!mounted) {
@@ -135,110 +191,211 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         return;
       }
       zb = worker;
-      enrolled = worker.tenants.where((t) => t.startsWith('c_')).map((t) => t.substring(2)).toSet();
-      following = Set.of(enrolled);
-      setState(() => status = 'enrolled in ${enrolled.length} cells');
-      // The first sync followed every enrolled cell; keep only the ring.
-      _wantRing(const LatLng(47.22, -1.585));
+      setState(() => status = 'connected as ${worker.tenant}');
+      // What the phone already holds is on screen before the first answer arrives.
       await _refresh();
-      // One report per poll that changed something; re-read when pois moved.
+      _wantArea(mapController.camera);
+      // An edit's verdict changed the table: redraw.
       reportsSub = worker.reports.listen((r) {
         if (r.error != null) {
-          setState(() => status = 'offline: ${r.error}');
+          setState(() =>
+              status = 'offline: ${r.error} — showing what the phone holds');
           return;
         }
-        // A cell whose stream went dark (retired upstream, or no longer granted):
-        // stop asking for it. libzb already keeps serving the other cells.
-        final dark = r.unreadable.where((t) => t.startsWith('c_')).map((t) => t.substring(2)).toSet();
-        if (dark.isNotEmpty) {
-          enrolled = enrolled.difference(dark);
-          wanted = wanted.difference(dark);
-          _applyRing();
-          setState(() => status = 'cell(s) ${dark.join(', ')} unreadable — dropped from the ring');
-        }
-        if (r.changedTables.contains('pois') || r.seeded.contains('pois')) _refresh();
+        if (r.changedTables.contains(_table)) _refresh();
       });
     } catch (e) {
-      if (mounted) setState(() => status = 'not connected: $e');
+      if (mounted)
+        setState(
+            () => status = 'not connected: $e — showing what the phone holds');
     }
   }
 
-  /// The replica is what the screen shows; libzb already dropped what was erased.
+  /// The replica is what the screen shows: the points held inside the viewport.
   Future<void> _refresh() async {
     final w = zb;
     if (w == null) return;
     try {
-      final rows = await w.query('SELECT uid, lat, lng, note, tenant_id FROM pois ORDER BY inserted_at');
+      final b = mapController.camera.visibleBounds;
+      final rows = await w.query(
+        'SELECT osm_id, lat, lng, name, coalesce(amenity, shop, tourism, man_made) AS kind FROM $_table '
+        'WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? LIMIT 3000',
+        [b.south, b.north, b.west, b.east],
+      );
+      final all = await w.query('SELECT count(*) AS n FROM $_table');
       if (!mounted) return;
       setState(() {
         pois = rows;
-        status = 'ring ${following.length} of ${enrolled.length} cells · ${rows.length} POI(s)';
+        held = (all.first['n'] as num).toInt();
       });
     } catch (e) {
       if (mounted) setState(() => status = 'query: $e');
     }
   }
 
-  /// The viewport moved: the ring around its centre is what the phone should
-  /// follow. Debounced — a pan is many events — and applied one move at a time.
-  void _wantRing(LatLng centre) {
-    wanted = ring(centre).intersection(enrolled);
-    ringDebounce?.cancel();
-    ringDebounce = Timer(const Duration(milliseconds: 400), _applyRing);
+  /// The viewport moved: ask for what is around its centre. Debounced — a pan is many
+  /// events — and one ask at a time; the radius follows the zoom (half the diagonal,
+  /// at most 2 km). Below zoom 13 the service would answer thousands of points a
+  /// screen cannot show, so the map stops asking and draws what it holds.
+  void _wantArea(MapCamera camera) {
+    if (camera.zoom < 13) {
+      wantedCentre = null;
+      return;
+    }
+    final b = camera.visibleBounds;
+    final half =
+        const Distance().as(LengthUnit.Meter, b.southWest, b.northEast) / 2;
+    wantedCentre = camera.center;
+    wantedRadius = min(2000.0, max(150.0, half));
+    askDebounce?.cancel();
+    askDebounce = Timer(const Duration(milliseconds: 350), _ask);
   }
 
-  Future<void> _applyRing() async {
+  Future<void> _ask() async {
     final w = zb;
-    if (w == null || moving) return;
-    final toJoin = wanted.difference(following).toList()..sort();
-    final toLeave = following.difference(wanted).toList()..sort();
-    if (toJoin.isEmpty && toLeave.isEmpty) return;
-    moving = true;
+    final at = wantedCentre;
+    if (w == null || at == null || asking) return;
+    asking = true;
+    final radius = wantedRadius;
+    final t0 = DateTime.now();
     try {
-      for (final c in toLeave) {
-        await w.leave('c_$c');
-        following = Set.of(following)..remove(c);
+      final ans = await w.request('query.$_queryTenant.pois_near', {
+        'lat': at.latitude,
+        'lng': at.longitude,
+        'radius_m': radius,
+        'limit': 2000
+      });
+      // The scope — "what I hold in this box and the answer lacks is gone" — only when
+      // the answer is complete; one cut by the limit says nothing about the rest.
+      final dlat = radius / 111320.0;
+      final dlng = radius / (111320.0 * max(0.1, cos(at.latitude * pi / 180)));
+      final scope = ans['complete'] == true
+          ? {
+              'where': 'lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?',
+              'params': [
+                at.latitude - dlat,
+                at.latitude + dlat,
+                at.longitude - dlng,
+                at.longitude + dlng
+              ],
+            }
+          : null;
+      final applied = await w.ingest(_table, ans, scope);
+      final ms = DateTime.now().difference(t0).inMilliseconds;
+      if (mounted) {
+        setState(() => status =
+            '${ans['count']} POI(s) within ${radius.round()} m in $ms ms · $applied kept');
       }
-      for (final c in toJoin) {
-        // A join seeds the cell's chain before it answers: the rows are there when
-        // the refresh below runs.
-        await w.join('c_$c');
-        following = Set.of(following)..add(c);
+      await _refresh();
+      await _askFuel(at);
+    } catch (e) {
+      if (mounted)
+        setState(() => status = 'ask: $e — showing what the phone holds');
+    } finally {
+      asking = false;
+    }
+    // The viewport may have moved on while this ask was in flight.
+    final again = wantedCentre;
+    if (again != null && again != at) _ask();
+  }
+
+  /// The stations selling the chosen fuel within 3 km of the centre, nearest first — the
+  /// service joins its fuel tables (load_fuel.py) in DuckDB; PostgreSQL is never asked.
+  Future<void> _askFuel(LatLng at) async {
+    final w = zb;
+    final f = fuel;
+    if (w == null || f == null) {
+      if (stations.isNotEmpty && mounted) setState(() => stations = const []);
+      return;
+    }
+    try {
+      final ans = await w.request('query.$_queryTenant.fuel_near', {
+        'lat': at.latitude,
+        'lng': at.longitude,
+        'radius_m': 3000,
+        'fuel': f,
+        'sort': 'distance',
+        'limit': 40
+      });
+      final cols = List<String>.from(ans['columns'] as List);
+      final rows = (ans['rows'] as List).map((r) {
+        final row = r as List;
+        return {for (var i = 0; i < cols.length; i++) cols[i]: row[i]};
+      }).toList();
+      if (mounted) {
+        setState(() {
+          stations = rows;
+          status =
+              '${rows.length} station(s) selling $f within 3 km in ${ans['ms']} ms';
+        });
       }
     } catch (e) {
-      if (mounted) setState(() => status = 'ring: $e');
-    } finally {
-      moving = false;
+      if (mounted) setState(() => status = 'fuel: $e');
     }
-    await _refresh();
-    // The viewport may have moved on while this move landed.
-    if (wanted.difference(following).isNotEmpty || following.difference(wanted).isNotEmpty) _applyRing();
+  }
+
+  /// Route mode: the first tap is the start, the second the end; the service answers
+  /// with the road between them from Valhalla (examples/08-map/valhalla). A third tap
+  /// starts over.
+  Future<void> _routeTap(LatLng at) async {
+    final w = zb;
+    if (w == null) return;
+    if (routePoints.length >= 2) {
+      routePoints.clear();
+      routeLine = const [];
+    }
+    setState(() => routePoints.add(at));
+    if (routePoints.length < 2) {
+      setState(() => routeInfo = 'tap the destination');
+      return;
+    }
+    final t0 = DateTime.now();
+    try {
+      final ans = await w.request(
+          'query.$_queryTenant.route',
+          {
+            'points': [
+              for (final p in routePoints)
+                {'lat': p.latitude, 'lng': p.longitude}
+            ],
+            'costing': 'auto'
+          },
+          timeoutMs: 15000);
+      final line = [
+        for (final pt in ans['polyline'] as List)
+          LatLng((pt[0] as num).toDouble(), (pt[1] as num).toDouble())
+      ];
+      final ms = DateTime.now().difference(t0).inMilliseconds;
+      if (mounted) {
+        setState(() {
+          routeLine = line;
+          routeInfo = '${ans['km']} km, ${ans['min']} min by road · $ms ms';
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => routeInfo = 'route: $e');
+    }
   }
 
   Future<void> _addPoi(LatLng at) async {
     final w = zb;
     if (w == null) return;
     setState(() => addingMode = false);
-    // A POI belongs to the cell of its coordinates — a tenant this phone must follow,
-    // or its echo would never come back to the screen.
-    final cell = geohash(at.latitude, at.longitude);
-    if (!following.contains(cell)) {
-      setState(() => status = 'cell $cell is outside the ring — pan there first');
-      return;
-    }
-    final uid = newUuid();
-    final now = DateTime.now().toUtc().toIso8601String();
+    // A client-minted id: negative, never an OpenStreetMap one. An INSERT's values are
+    // the WHOLE row, key included (the bridge builds the statement from them); `geom`
+    // is PostGIS's own bytes, as libzb's bytes marker.
+    final osmId = -DateTime.now().millisecondsSinceEpoch;
     try {
-      // Optimistic: the row lands in the replica at once and is sent; the bridge
-      // stamps the version (LEAST of ours and now) and the echo settles it.
-      await w.mutate('pois', 'INSERT', {'uid': uid}, {
-        'uid': uid,
+      await w.mutate(_table, 'INSERT', {
+        'osm_id': osmId
+      }, {
+        'osm_id': osmId,
+        'cell': geohash(at.latitude, at.longitude),
+        'amenity': 'cafe',
+        'name': 'New POI',
         'lat': at.latitude,
         'lng': at.longitude,
-        'note': 'New POI',
-        'tenant_id': 'c_$cell',
-        'inserted_at': now,
-        'updated_at': now,
+        'geom': {r'$bin': ewkbPoint(at.longitude, at.latitude)},
       });
       await _refresh();
     } catch (e) {
@@ -249,18 +406,21 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   Future<void> _editPoi(Map<String, dynamic> poi) async {
     final w = zb;
     if (w == null) return;
-    var note = (poi['note'] as String?) ?? '';
+    var name = (poi['name'] as String?) ?? '';
     final action = await showModalBottomSheet<String>(
       context: context,
       builder: (ctx) => Padding(
-        padding: EdgeInsets.fromLTRB(16, 16, 16, 16 + MediaQuery.of(ctx).viewInsets.bottom),
+        padding: EdgeInsets.fromLTRB(
+            16, 16, 16, 16 + MediaQuery.of(ctx).viewInsets.bottom),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            Text('${poi['kind'] ?? 'poi'} · osm ${poi['osm_id']}',
+                style: Theme.of(ctx).textTheme.bodySmall),
             TextField(
-              controller: TextEditingController(text: note),
-              onChanged: (v) => note = v,
-              decoration: const InputDecoration(labelText: 'Note'),
+              controller: TextEditingController(text: name),
+              onChanged: (v) => name = v,
+              decoration: const InputDecoration(labelText: 'Name'),
               autofocus: true,
             ),
             const SizedBox(height: 16),
@@ -273,7 +433,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                   label: const Text('Erase'),
                 ),
                 const SizedBox(width: 8),
-                FilledButton(onPressed: () => Navigator.pop(ctx, 'save'), child: const Text('Save')),
+                FilledButton(
+                    onPressed: () => Navigator.pop(ctx, 'save'),
+                    child: const Text('Save')),
               ],
             ),
           ],
@@ -283,10 +445,11 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     if (action == null) return;
     try {
       if (action == 'erase') {
-        // Locally a delete; upstream the bridge sets deleted_at (the tombstone).
-        await w.mutate('pois', 'DELETE', {'uid': poi['uid']});
+        // Locally a delete; upstream the delete guard sets deleted_at (the tombstone).
+        await w.mutate(_table, 'DELETE', {'osm_id': poi['osm_id']});
       } else {
-        await w.mutate('pois', 'UPDATE', {'uid': poi['uid']}, {'note': note});
+        await w.mutate(
+            _table, 'UPDATE', {'osm_id': poi['osm_id']}, {'name': name});
       }
       await _refresh();
     } catch (e) {
@@ -297,7 +460,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    ringDebounce?.cancel();
+    askDebounce?.cancel();
+    refreshDebounce?.cancel();
     reportsSub?.cancel();
     zb?.close();
     super.dispose();
@@ -308,77 +472,241 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     return Scaffold(
       appBar: AppBar(
         title: const Text('ZeMap'),
+        actions: [
+          IconButton(
+            tooltip: 'Route between two taps (Valhalla)',
+            icon: Icon(Icons.directions,
+                color: routeMode ? Colors.lightBlueAccent : null),
+            onPressed: zb == null
+                ? null
+                : () => setState(() {
+                      routeMode = !routeMode;
+                      if (!routeMode) {
+                        routePoints.clear();
+                        routeLine = const [];
+                        routeInfo = '';
+                      } else {
+                        addingMode = false;
+                        routeInfo = 'tap the start';
+                      }
+                    }),
+          ),
+          PopupMenuButton<String>(
+            tooltip: 'Fuel prices nearby',
+            icon: Icon(Icons.local_gas_station,
+                color: fuel == null ? null : Colors.amber),
+            initialValue: fuel ?? '',
+            onSelected: (v) {
+              setState(() => fuel = v.isEmpty ? null : v);
+              final at = wantedCentre ?? mapController.camera.center;
+              _askFuel(at);
+            },
+            itemBuilder: (_) => [
+              const PopupMenuItem(value: '', child: Text('Off')),
+              for (final f in const [
+                'SP95',
+                'SP98',
+                'E10',
+                'E85',
+                'Gazole',
+                'GPLc'
+              ])
+                PopupMenuItem(value: f, child: Text(f)),
+            ],
+          ),
+        ],
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(20),
-          child: Padding(padding: const EdgeInsets.only(bottom: 4), child: Text(status, style: const TextStyle(fontSize: 12))),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Text(
+                routeMode
+                    ? 'route: $routeInfo'
+                    : '$status · $held held · tiles ${tiles?.requested ?? 0} asked / ${tiles?.served ?? 0} served / ${tiles?.failed ?? 0} failed',
+                style: const TextStyle(fontSize: 12)),
+          ),
         ),
       ),
       body: FlutterMap(
         mapController: mapController,
         options: MapOptions(
-          initialCenter: const LatLng(47.22, -1.585), // Nantes
-          initialZoom: 13,
+          initialCenter: const LatLng(47.2184, -1.5536), // Nantes
+          initialZoom: 15,
           onTap: (_, at) {
-            if (addingMode) _addPoi(at);
+            if (addingMode) {
+              _addPoi(at);
+            } else if (routeMode) {
+              _routeTap(at);
+            }
           },
-          onPositionChanged: (camera, _) => _wantRing(camera.center),
+          // A pan is many events. The ask is debounced, and so is the redraw: a refresh
+          // per event rebuilt the whole map subtree dozens of times a second and the
+          // tile layer never got to load (measured: tiles stopped after the first view).
+          onPositionChanged: (camera, _) {
+            _wantArea(camera);
+            refreshDebounce?.cancel();
+            refreshDebounce =
+                Timer(const Duration(milliseconds: 250), _refresh);
+          },
         ),
         children: [
           if (vectorLayer != null)
             vectorLayer!
           else
-            TileLayer(urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png', userAgentPackageName: 'zemap'),
-          // The cells: enrolled ones faint, the followed ring stronger.
-          PolygonLayer(
-            polygons: [
-              for (final c in enrolled)
-                Polygon(
-                  points: _corners(cellBox(c)),
-                  color: following.contains(c) ? Colors.teal.withValues(alpha: 0.10) : Colors.transparent,
-                  borderColor: following.contains(c) ? Colors.teal : Colors.grey.withValues(alpha: 0.5),
-                  borderStrokeWidth: following.contains(c) ? 1.5 : 0.7,
-                ),
-            ],
-          ),
-          MarkerLayer(
-            markers: [
-              for (final poi in pois)
-                Marker(
-                  point: LatLng((poi['lat'] as num).toDouble(), (poi['lng'] as num).toDouble()),
-                  width: 40,
-                  height: 40,
-                  alignment: Alignment.topCenter,
-                  child: Tooltip(
-                    message: (poi['note'] as String?) ?? '',
-                    child: GestureDetector(
-                      onTap: () => _editPoi(poi),
-                      child: const Icon(Icons.location_pin, color: Colors.red, size: 40),
+            TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                userAgentPackageName: 'zemap'),
+          if (routeLine.isNotEmpty)
+            PolylineLayer(polylines: [
+              Polyline(
+                  points: routeLine,
+                  color: Colors.blue.shade700,
+                  strokeWidth: 5)
+            ]),
+          if (routePoints.isNotEmpty)
+            MarkerLayer(
+              markers: [
+                for (final (i, p) in routePoints.indexed)
+                  Marker(
+                    point: p,
+                    width: 34,
+                    height: 34,
+                    alignment: Alignment.topCenter,
+                    child: Icon(i == 0 ? Icons.trip_origin : Icons.flag,
+                        color: Colors.blue.shade900, size: 30),
+                  ),
+              ],
+            ),
+          // One layer at a time: the fuel switch on shows the price tags and hides the POIs,
+          // off shows the POIs — the phone still holds both.
+          if (fuel != null && stations.isNotEmpty)
+            MarkerLayer(
+              markers: [
+                for (final st in stations)
+                  Marker(
+                    point: LatLng((st['lat'] as num).toDouble(),
+                        (st['lng'] as num).toDouble()),
+                    width: 64,
+                    height: 26,
+                    child: Tooltip(
+                      message:
+                          '${st['address'] ?? ''}, ${st['city'] ?? ''} · ${((st['m'] as num?) ?? 0).round()} m'
+                          '${st['outage'] != null ? ' · ${st['outage']} outage' : ''}',
+                      child: Container(
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: st == _cheapest
+                              ? Colors.green.shade700
+                              : (st['outage'] != null
+                                  ? Colors.grey
+                                  : Colors.amber.shade800),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(color: Colors.white, width: 1.5),
+                        ),
+                        child: Text(
+                          '${_price(st)} €',
+                          style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold),
+                        ),
+                      ),
                     ),
                   ),
-                ),
-            ],
-          ),
+              ],
+            ),
+          if (fuel == null)
+            MarkerLayer(
+              markers: [
+                for (final poi in pois)
+                  Marker(
+                    point: LatLng((poi['lat'] as num).toDouble(),
+                        (poi['lng'] as num).toDouble()),
+                    width: 28,
+                    height: 28,
+                    alignment: Alignment.topCenter,
+                    child: Tooltip(
+                      message:
+                          '${poi['name'] ?? ''}${poi['name'] == null ? '' : ' · '}${poi['kind'] ?? ''}',
+                      child: GestureDetector(
+                        onTap: () => _editPoi(poi),
+                        child: Icon(
+                          Icons.location_pin,
+                          color: (poi['osm_id'] as num) < 0
+                              ? Colors.deepOrange
+                              : (poi['name'] == null
+                                  ? Colors.grey
+                                  : Colors.red),
+                          size: 28,
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
         ],
       ),
       floatingActionButton: FloatingActionButton(
         backgroundColor: addingMode ? Colors.red : Colors.teal,
-        onPressed: zb == null ? null : () => setState(() => addingMode = !addingMode),
-        child: Icon(addingMode ? Icons.close : Icons.add_location_alt, color: Colors.white),
+        onPressed:
+            zb == null ? null : () => setState(() => addingMode = !addingMode),
+        child: Icon(addingMode ? Icons.close : Icons.add_location_alt,
+            color: Colors.white),
       ),
     );
   }
 }
 
-List<LatLng> _corners(CellBox b) =>
-    [LatLng(b.south, b.west), LatLng(b.south, b.east), LatLng(b.north, b.east), LatLng(b.north, b.west)];
+/// The price of a station row, whatever DuckDB's decimal came through as.
+String _price(Map<String, dynamic> st) {
+  final v = st['price'];
+  final d = v is num ? v.toDouble() : double.tryParse('$v') ?? 0;
+  return d.toStringAsFixed(3);
+}
 
-/// A random UUID v4 (the table's key is `uuid`): 122 random bits, version and variant
-/// nibbles set, no package needed.
-String newUuid() {
-  final rnd = Random.secure();
-  final b = List<int>.generate(16, (_) => rnd.nextInt(256));
-  b[6] = (b[6] & 0x0f) | 0x40;
-  b[8] = (b[8] & 0x3f) | 0x80;
-  final h = b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
-  return '${h.substring(0, 8)}-${h.substring(8, 12)}-${h.substring(12, 16)}-${h.substring(16, 20)}-${h.substring(20)}';
+/// PostGIS's bytes for a point with an SRID — extended WKB, little endian: byte order,
+/// type with the SRID flag, the SRID, x (longitude), y (latitude) — as base64 for libzb's
+/// `$bin` marker. 25 bytes, the same the bridge sends back.
+String ewkbPoint(double lng, double lat, {int srid = 4326}) {
+  final b = ByteData(25);
+  b.setUint8(0, 1);
+  b.setUint32(1, 0x20000001, Endian.little);
+  b.setUint32(5, srid, Endian.little);
+  b.setFloat64(9, lng, Endian.little);
+  b.setFloat64(17, lat, Endian.little);
+  return base64Encode(b.buffer.asUint8List());
+}
+
+/// The tile provider, counted: what the layer asks for, what came back, what failed —
+/// on the status line and in the console. Diagnostics for "tiles stop after the first
+/// view"; harmless to keep.
+class _CountingTiles extends VectorTileProvider {
+  _CountingTiles(this.inner, this.onChange);
+  final VectorTileProvider inner;
+  final void Function() onChange;
+  int requested = 0, served = 0, failed = 0;
+
+  @override
+  int get maximumZoom => inner.maximumZoom;
+  @override
+  int get minimumZoom => inner.minimumZoom;
+  @override
+  TileProviderType get type => inner.type;
+
+  @override
+  Future<Uint8List> provide(TileIdentity tile) async {
+    requested++;
+    onChange();
+    try {
+      final bytes = await inner.provide(tile);
+      served++;
+      return bytes;
+    } catch (e) {
+      failed++;
+      debugPrint('tile z${tile.z}/${tile.x}/${tile.y} failed: $e');
+      rethrow;
+    } finally {
+      onChange();
+    }
+  }
 }
