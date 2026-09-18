@@ -89,6 +89,8 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
     --allow-pub "\$JS.ACK.>" \
     --allow-pub "\$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>" \
+    --allow-pub "query.{{tag(tenant)}}.>" \
+    --allow-pub "query._default.>" \
     --allow-sub "mutation_ack.{{name()}}.>" \
     --allow-sub "cdc.{{tag(tenant)}}.>" \
     --allow-sub "cdc._default.>" \

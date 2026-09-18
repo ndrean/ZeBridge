@@ -89,6 +89,7 @@ fn clientAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) !struc
     const subj_cdc = topo.subject_cdc_prefix; // "cdc"
     const subj_mut = topo.subject_mutations_prefix; // "mutation"
     const subj_ack = topo.mutation_ack_prefix; // "mutation_ack"
+    const subj_query = topo.query_prefix; // "query" (§10hj: a service answers, a client asks)
 
     var pubs: std.ArrayList([]u8) = .empty;
     var subs: std.ArrayList([]u8) = .empty;
@@ -138,6 +139,9 @@ fn clientAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology) !struc
     try P.add(&pubs, a, "$KV.{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}", .{kv_live});
     try P.add(&pubs, a, "$KV.{s}.{s}.{{{{name()}}}}", .{ kv_live, open });
     try P.add(&pubs, a, "$JS.ACK.>", .{});
+    // §10hj: a client may ASK its tenant's services (request/reply; the inbox is `_INBOX.>` below).
+    try P.add(&pubs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
+    try P.add(&pubs, a, "{s}.{s}.>", .{ subj_query, open });
 
     try P.add(&subs, a, "{s}.{{{{name()}}}}.>", .{subj_ack});
     try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_cdc});

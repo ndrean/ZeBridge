@@ -34,6 +34,7 @@ row a rule is named.
 | contract | libzb | zb-client-ts | source |
 | --- | --- | --- | --- |
 | seed gate by stream seq, never by LSN | ✓ | ✓ | §10i, fixture |
+| on-demand tables: schema followed, nothing seeded or tailed, rows from `request` + `ingest` | ✓ | — not built | §10hj |
 | seeding scoped to gapped streams, shared route included | ✓ | ✓ | §10n, §10bq, fixture |
 | a chain older than the replica's position is refused | ✓ | ✓ | §10n, fixture |
 | seed with foreign keys off, on again after | ✓ | ✓ | §10cp |

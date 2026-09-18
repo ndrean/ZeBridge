@@ -15,7 +15,9 @@
     "mutation_error_prefix": "mutation_error",
     "mutation_error_pattern": "mutation_error.{[table]s}",
     "mutation_ack_prefix": "mutation_ack",
-    "mutation_ack_pattern": "mutation_ack.{[principal]s}.{[msg_id]s}"
+    "mutation_ack_pattern": "mutation_ack.{[principal]s}.{[msg_id]s}",
+    "query_prefix": "query",
+    "query_pattern": "query.{[tenant]s}.{[name]s}"
   },
   "kv": {
     "schemas": "schemas",

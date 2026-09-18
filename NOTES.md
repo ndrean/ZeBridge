@@ -14139,3 +14139,77 @@ swallowed it. Called properly, the first run right after a load drains and appli
 refused as a unit (FOREIGN KEY constraint failed) … fk held: 49, applied on retry: 49".
 Lesson for the harness notes beside §10ha: in zsh, split with `${=var}` or an array, and
 never filter a command's stderr before reading its exit code.
+
+## 10hj. Design B: the phone holds what it asked for — the POI service (2026-09-18)
+
+The map's data, settled with the owner: R2 serves the vector tiles; the phone holds the
+POIs it has asked for, as a local table, offline once fetched; the whole of France lives in
+a service replica that answers "what is around me". Not option A (a stream per cell), not
+option B of §10fp (a family stream) — a third shape, cheaper than both, and the phone
+stays local-first. The pieces:
+
+**The data.** `examples/08-map/load_pois.py`: the HOT OpenStreetMap export of France — 2.1M
+points, GeoJSON one feature per line, 447 bytes each of which ~120 are content — streamed
+once into `osm_pois` (osm_id, the four tag columns, names, hours, address, a PostGIS point
+AND `lat`/`lng` as numbers: a phone's SQLite has no spatial functions, a bounding box is a
+B-tree), the geohash-5 `cell` kept for later, `updated_at`/`deleted_at` as everywhere; the
+diff upsert of `load_fuel.py`. 2,105,592 points in 44 s; 248 MB heap, 412 MB with indexes;
+34,196 cells, the biggest 26,709 points. Published as ONE public table.
+
+**The grant.** `grammar.json` gains the `query` family — `query.<tenant>.<name>` — and the
+client role may publish there (`bridge --init-nats` and `jwt-bootstrap.sh` both render it;
+the dev account's signing key was edited in place and the server reloaded, no creds
+re-minted). A service answers on the requester's `_INBOX`, which every client already
+subscribes. The bridge neither publishes nor subscribes: it renders the grant and serves
+the name; `topology.zig` reads the two keys as optional so an older grammar keeps working.
+
+**libzb.** Three additions, ~150 lines. `ondemandTables`: a table followed for its schema
+— the local table is created from the descriptor like any — but seeded by nobody and
+tailed by nobody: it contributes no stream route, the seed loop and the unseeded check skip
+it. `zb_client_request(h, subject, payload, timeout_ms)`: one request/reply on the card's
+own connection, the reply verbatim. `zb_client_ingest(h, table, answer, scope)`: an answer
+in the chain object's shape (`{"columns","rows"}`) through `chainUpsertSql` — the
+version-guarded upsert, so a fresher row wins and an unconfirmed local edit is not
+overwritten — and, with a `scope` (`{"where": "lat BETWEEN ? …", "params": […]}`), the
+rows the phone holds inside that area which the answer did not carry are deleted: gone
+upstream. The scope is the phone's claim that the answer was complete; an answer cut by a
+limit must not carry one (the service says `complete`, the phone passes the scope only
+then — the first version deleted real points past a limit of 2,000).
+
+**The service.** `examples/08-map/poi_service.py`: one process, the libzb DuckDB card
+following `osm_pois` (the bulk CDC path of §10hg) polled from a thread, and a nats-py
+queue-group responder on `query.<tenant>.pois_near` — named queries only, the SQL lives
+in the service, the client sends parameters: a bounding box on (lat, lng), the haversine
+to order and cut at the radius, the answer as columns and rows with `geom` as libzb's
+`$bin` marker (the phone's table declares it NOT NULL). Every libzb call behind one lock,
+and the poll's wait short (100 ms): the first version held the lock a whole second and a
+query waited behind it (841 ms, then 53).
+
+**Measured**, `examples/08-map/poi_phone.py` (libzb through ctypes, `ondemandTables`):
+
+| ask | answer | round trip | in the service |
+| --- | --- | --- | --- |
+| Nantes centre, 600 m, limit 2,000 | 2,000 rows, cut | 126 ms first, 59 ms again | 119 / 53 ms |
+| Paris centre, 2 km, shops only | 2,000 rows, cut | 71 ms | 61 ms |
+| Nantes centre, 250 m | 516 rows, complete | 100 ms | 98 ms |
+
+Then the loop that is the point: a `UPDATE` renaming a pharmacy and a soft-delete of a
+waste basket in PostgreSQL — the service's replica applied both within seconds (`cdc: 2
+applied`, `cdc: 1 applied`), the phone's next ask brought 515 rows, the renamed pharmacy
+and no basket. PostgreSQL served one write and zero reads.
+
+**Seeding the service** is the one number to keep an eye on: the 2.1M-row chain applied in
+17.5 s (fetch, inflate, decode, append), but my own accident — `--enable --limit 1` treated
+one point as the whole snapshot and soft-deleted 2,105,591, and the full reload revived
+them — left 4.2M events on the stream, and the new service drained the revival's 5,100
+messages through the bulk path in ~12 minutes (~3k rows/s: every event an UPDATE of a wide
+row on a 2.1M-row DuckDB table). The producer handled the accident by itself: a delta of
+2,105,591 rows, "a full is cheaper", a background full attached. The loader now refuses a
+`--limit` on a table that holds more live points than the sample.
+
+**Open**, in order: edits from the phone — the on-demand table is local, so `mutate` works
+the day `osm_pois` is enabled writable, no write-only mode needed after all; the tour
+query and Valhalla for road distances; Flutter asking on move; a `service` principal
+instead of `bridge.creds` for the responder; zb-client-ts has no on-demand mode
+(CLIENTS.md); the request's inbox is `_INBOX.>` for every client, a per-principal inbox
+would be tighter.

@@ -95,7 +95,9 @@ and LWW columns, is not in this file: that lives in `zebridge_catalogue` (§8).
     "mutation_error_prefix": "mutation_error",
     "mutation_error_pattern": "mutation_error.{[table]s}",
     "mutation_ack_prefix": "mutation_ack",
-    "mutation_ack_pattern": "mutation_ack.{[principal]s}.{[msg_id]s}"
+    "mutation_ack_pattern": "mutation_ack.{[principal]s}.{[msg_id]s}",
+    "query_prefix": "query",
+    "query_pattern": "query.{[tenant]s}.{[name]s}"
   },
   "kv": {
     "schemas": "schemas",
@@ -170,6 +172,16 @@ flowchart TD
 | `CDC_PUBLIC`, `CDC_<tenant>` | **streams** | bridge → client | Ordered, replayable, time-bounded. Changes are *events*: public tables on `CDC_PUBLIC`, a tenant's tables on its own stream (§4). |
 | `generations` + `gen-<tenant>` | **KV + object store** | bridge → client | The seed source (§6): one chain manifest per `<tenant>.<table>`, objects chunked by the store itself — a seed is *state*, built on a cadence, never served per request. |
 | `MUTATIONS` | **stream** | client → bridge → client | Edge writes (§7), the verdicts answering them (`mutation_ack.>`), and the dead-letter copies of refused writes (`mutation_error.<table>`) for the operator. |
+
+### `query.<tenant>.<name>` is request/reply, not a stream
+
+A client may publish to `query.<tenant>.<name>` for its own tenant and the open one; a
+service answers on the client's inbox. Nothing is stored: no stream, no consumer, no
+position. The bridge is not involved beyond rendering the grant and serving the name in
+the grammar. What a service answers is its own contract — the reference service
+(`examples/08-map/poi_service.py`) takes named queries with parameters, never SQL, and
+answers rows in the chain object's shape (`columns`, `rows`), which a client keeps in an
+on-demand table with the same version-guarded upsert a chain uses.
 
 ### `MUTATIONS` carries both directions
 

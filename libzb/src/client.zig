@@ -55,6 +55,12 @@ pub const Options = struct {
     /// moments, so no order can fully protect a child chain), re-enables them
     /// after, and reports surviving violations loudly.
     tables: []const []const u8,
+    /// §10hj: tables held ON DEMAND — the schema arrives like any table's and the local
+    /// table is created from it, but nothing seeds it and no stream is tailed for it.
+    /// Rows come only as answers to the host's own `request`s, applied through `ingest`
+    /// (the chain's version-guarded upsert), and a `mutate` on it goes the normal way.
+    /// The phone's "what is around me" table: it holds what it asked for.
+    ondemand: []const []const u8 = &.{},
     /// This replica's identity, and it must be STABLE across restarts: it is the
     /// tiebreak value the bridge stores and the prefix of every msg_id, so a client
     /// that changes it loses idempotency on anything still unconfirmed.
@@ -480,6 +486,12 @@ pub const SyncClient = struct {
     }
 
     /// §10fn: the routes of a table under the current membership. Client arena.
+    /// §10hj: an on-demand table — schema yes, seed and tail no.
+    fn isOnDemand(self: *SyncClient, table: []const u8) bool {
+        for (self.opts.ondemand) |t| if (std.mem.eql(u8, t, table)) return true;
+        return false;
+    }
+
     fn routesFor(self: *SyncClient, tenant_col: ?[]const u8) ![]const []const u8 {
         const ca = self.aa();
         if (tenant_col == null) return try ca.dupe([]const u8, &.{self.cdc_public});
@@ -973,7 +985,7 @@ pub const SyncClient = struct {
         const ca = self.aa();
         // The OPEN tenant's rows ride the public stream (`cdc.<open>.>` is one of its
         // subjects); a principal mapped to it must not look for a `CDC_<open>` stream.
-        const routes = try self.routesFor(tenant_col);
+        const routes: []const []const u8 = if (self.isOnDemand(table)) &.{} else try self.routesFor(tenant_col);
         const shared_route: ?[]const u8 = if (tenant_col != null) self.cdc_public else null;
         const fresh: TableState = .{
             .pk = try dupeStrings(ca, pk),
@@ -1205,6 +1217,7 @@ pub const SyncClient = struct {
         // stream "gapped" for ever, and every sibling re-seeded on every poll.
         var blocked: std.StringArrayHashMapUnmanaged(void) = .empty;
         for (self.opts.tables) |table| {
+            if (self.isOnDemand(table)) continue; // §10hj: never seeded from a chain
             const st = self.states.get(table) orelse continue;
             const shared_gapped = if (st.shared_route) |sr| gapped.contains(sr) else false;
             var covered = false;
@@ -1246,6 +1259,7 @@ pub const SyncClient = struct {
         // next poll asks again. Unseeded is not synced (the TS rule), and a poll loop
         // that never re-asks would follow CDC on an empty table forever.
         outer: for (self.opts.tables) |table| {
+            if (self.isOnDemand(table)) continue; // §10hj: unseeded by design, not a gap
             const st = self.states.get(table) orelse continue;
             for (self.tenantsFor(st)) |tenant| {
                 if (self.dark.contains(try self.routeFor(a, tenant))) continue;
@@ -3148,6 +3162,87 @@ pub const SyncClient = struct {
         return core.planUpsert(a, table, st.pk, data);
     }
 
+    // ── §10hj: ask a service, keep its answer ───────────────────────────────
+
+    /// One request/reply on the card's own connection: `subject` is a query subject the
+    /// principal may publish to (`query.<tenant>.<name>`), `payload` the question, the
+    /// reply's bytes come back allocated from `a` — JSON by convention, but bytes here.
+    pub fn request(self: *SyncClient, a: std.mem.Allocator, subject: []const u8, payload: []const u8, timeout_ms: u64) ![]u8 {
+        const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@max(1, timeout_ms))), .clock = .awake } };
+        const msg = try self.t.conn.request(subject, payload, t);
+        defer msg.deinit();
+        return try a.dupe(u8, msg.data);
+    }
+
+    /// A service's answer into a table, `{"columns":[…],"rows":[[…],…]}` — the chain
+    /// object's own shape — through the chain's version-guarded upsert (a fresher row
+    /// wins, an unconfirmed local edit is not overwritten). `scope` names the area the
+    /// answer is authoritative for: rows of the table inside it that the answer did not
+    /// carry are gone upstream and are deleted here (`{"where": "lat BETWEEN ? AND ? …",
+    /// "params": […]}`); null keeps every local row. Returns rows applied.
+    pub fn ingest(self: *SyncClient, a: std.mem.Allocator, table: []const u8, answer: Value, scope: ?Value) !usize {
+        const st = self.states.get(table) orelse return error.UnknownTable;
+        if (answer != .object) return error.Malformed;
+        const cols = try core.strArrPub(a, (answer.object.get("columns") orelse return error.Malformed).array);
+        const rows = (answer.object.get("rows") orelse return error.Malformed).array.items;
+        for (cols) |cn| {
+            const known = for (st.cols) |c| {
+                if (std.mem.eql(u8, c, cn)) break true;
+            } else false;
+            if (!known) return error.SchemaBehind;
+        }
+        const vcol: ?[]const u8 = if (st.version_col) |vc| (for (cols) |cn| {
+            if (std.mem.eql(u8, cn, vc)) break vc;
+        } else null) else null;
+        const Ctx = struct {
+            client: *SyncClient,
+            a: std.mem.Allocator,
+            table: []const u8,
+            st: TableState,
+            cols: []const []const u8,
+            rows: []const Value,
+            vcol: ?[]const u8,
+            scope: ?Value,
+            applied: *usize,
+            fn apply(cx: @This(), st_: *storage.Storage) !void {
+                // The engine's text is gone once the wrapper rolls back: say it here.
+                errdefer std.debug.print("ingest {s}: refused — {s}\n", .{ cx.table, st_.errMsg() });
+                const sql = try core.chainUpsertSql(cx.a, cx.table, cx.cols, cx.st.pk, cx.vcol);
+                var keys_seen: std.ArrayListUnmanaged(storage.Value) = .empty;
+                const pk_idx: ?usize = if (cx.st.pk.len == 1) (for (cx.cols, 0..) |cn, i| {
+                    if (std.mem.eql(u8, cn, cx.st.pk[0])) break i;
+                } else null) else null;
+                for (cx.rows) |rv| {
+                    if (rv != .array) continue;
+                    const cells = rv.array.items;
+                    const params = try cx.a.alloc(storage.Value, cx.cols.len);
+                    for (params, 0..) |*p, i| p.* = if (i < cells.len) try chainCellToStorage(cx.a, cells[i]) else .null;
+                    _ = try st_.query(cx.a, sql, params);
+                    if (pk_idx) |pi| if (pi < params.len) try keys_seen.append(cx.a, params[pi]);
+                    cx.applied.* += 1;
+                }
+                // The scope: what the answer did not carry inside it is gone.
+                if (cx.scope) |sc| if (sc == .object) if (sc.object.get("where")) |w| if (w == .string) if (pk_idx != null) {
+                    try st_.execSimple("CREATE TEMP TABLE IF NOT EXISTS _zbz_seen (k)");
+                    try st_.execSimple("DELETE FROM _zbz_seen");
+                    for (keys_seen.items) |k| _ = try st_.query(cx.a, "INSERT INTO _zbz_seen (k) VALUES (?)", &.{k});
+                    const pv = sc.object.get("params") orelse Value.null;
+                    const n: usize = if (pv == .array) pv.array.items.len else 0;
+                    const params = try cx.a.alloc(storage.Value, n);
+                    if (pv == .array) for (pv.array.items, 0..) |v, i| {
+                        params[i] = try jsonToStorage(cx.a, v);
+                    };
+                    const del = try std.fmt.allocPrint(cx.a, "DELETE FROM {s} WHERE ({s}) AND \"{s}\" NOT IN (SELECT k FROM _zbz_seen)", .{ cx.table, w.string, cx.st.pk[0] });
+                    _ = try st_.query(cx.a, del, params);
+                    try st_.execSimple("DELETE FROM _zbz_seen");
+                };
+            }
+        };
+        var applied: usize = 0;
+        try self.st.transaction(Ctx{ .client = self, .a = a, .table = table, .st = st, .cols = cols, .rows = rows, .vcol = vcol, .scope = scope, .applied = &applied }, Ctx.apply);
+        return applied;
+    }
+
     // ── the write path (PROTOCOL.md §7.1) ───────────────────────────────────
 
     /// The outbox: what makes this a queue rather than a log. An entry leaves only on
@@ -3900,7 +3995,7 @@ pub const SyncClient = struct {
         while (it.next()) |e| {
             const st = e.value_ptr;
             if (st.tenant_col == null) continue;
-            st.routes = try self.routesFor(st.tenant_col);
+            st.routes = if (self.isOnDemand(e.key_ptr.*)) &.{} else try self.routesFor(st.tenant_col);
         }
     }
 

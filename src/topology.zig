@@ -106,6 +106,11 @@ pub const Topology = struct {
     /// already governs `mutation.alice.>`.
     mutation_ack_prefix: []const u8,
     mutation_ack_pattern: []const u8,
+    /// §10hj: the request/reply family a SERVICE answers on — `query.<tenant>.<name>`. The
+    /// bridge neither publishes nor subscribes here; it renders the grant (a client may
+    /// publish to its tenant's queries) and serves the name in the grammar.
+    query_prefix: []const u8,
+    query_pattern: []const u8,
 
     // ─── KV buckets ─────────────────────────────────────────────────────────────
     kv_schemas: []const u8,
@@ -182,6 +187,8 @@ pub const Topology = struct {
         .mutation_error_pattern = "mutation_error.{[table]s}",
         .mutation_ack_prefix = "mutation_ack",
         .mutation_ack_pattern = "mutation_ack.{[principal]s}.{[msg_id]s}",
+        .query_prefix = "query",
+        .query_pattern = "query.{[tenant]s}.{[name]s}",
         .kv_schemas = "schemas",
         .kv_tenants = "tenants",
         .kv_live = "live",
@@ -284,6 +291,9 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.mutation_error_pattern = try str(a, subjects, "subjects", "mutation_error_pattern", diag);
     t.mutation_ack_prefix = try str(a, subjects, "subjects", "mutation_ack_prefix", diag);
     t.mutation_ack_pattern = try str(a, subjects, "subjects", "mutation_ack_pattern", diag);
+    // Optional: a grammar from before §10hj has no query family and keeps the default.
+    t.query_prefix = strOr(a, subjects, "query_prefix", "query") catch "query";
+    t.query_pattern = strOr(a, subjects, "query_pattern", "query.{[tenant]s}.{[name]s}") catch "query.{[tenant]s}.{[name]s}";
 
 
 
@@ -364,6 +374,15 @@ fn section(root: std.json.ObjectMap, name: []const u8, diag: ?*Diagnostic) !std.
 
 /// Read one key, naming both the section and the key when it is absent — the message is
 /// the whole reason this is not `orelse return error.MissingKey`.
+/// A key that may be absent: the default then, duplicated like a present one.
+fn strOr(a: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8, default: []const u8) ![]const u8 {
+    const v = obj.get(key) orelse return try a.dupe(u8, default);
+    return switch (v) {
+        .string => |x| try a.dupe(u8, x),
+        else => try a.dupe(u8, default),
+    };
+}
+
 fn str(
     a: std.mem.Allocator,
     obj: std.json.ObjectMap,

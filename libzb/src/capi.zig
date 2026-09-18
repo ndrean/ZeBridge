@@ -20,10 +20,15 @@
 //!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
 //!                          const char* key_json, const char* values_json);   // {"msgId":…}
 //!   char* zb_client_flush(uint64_t h, uint64_t wait_ms);           // {"sent":n,"settled":n}
+//!   char* zb_client_request(uint64_t h, const char* subject, const char* payload_json, uint64_t timeout_ms);
+//!                                                                    // §10hj: ask a service on `query.<tenant>.<name>`; its reply verbatim
+//!   char* zb_client_ingest(uint64_t h, const char* table, const char* answer_json, const char* scope_json);
+//!                                                                    // §10hj: keep an answer ({"columns","rows"}) in an on-demand table → {"applied":n}
 //!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"unreadable":[…]?} — live tail, blocks ≤ wait_ms
 //!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
 //!   char* zb_client_leave(uint64_t h, const char* tenant);         // {"tenants":[…]} — drop one: its rows, watermarks, tail
 //! `opts_json`: url, credsPath, dbPath, principal, tables (array, parents first),
+//! ondemandTables (§10hj: schema yes, seed and tail no — filled by `zb_client_ingest`),
 //! clientId (stable across restarts — it is the msg_id prefix), grammarHash
 //! (optional: the hash the host received from /enroll or GET /grammar; a mismatch
 //! refuses to open). The grammar itself is compiled in — `zb_grammar_hash()` says
@@ -438,6 +443,21 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         filled += 1;
     };
 
+    // §10hj: on-demand tables — followed for their schema, seeded and tailed by nobody,
+    // filled by the host's own requests. Part of `tables` for the schema walk.
+    const odv = o.object.get("ondemandTables");
+    const nod: usize = if (odv != null and odv.? == .array) odv.?.array.items.len else 0;
+    const ondemand = try a.alloc([]const u8, nod);
+    if (nod > 0) for (odv.?.array.items, 0..) |v, i| {
+        ondemand[i] = try a.dupe(u8, if (v == .string) v.string else "");
+    };
+    const all_tables = if (nod == 0) tables else blk: {
+        const all = try a.alloc([]const u8, ntab + nod);
+        @memcpy(all[0..ntab], tables);
+        @memcpy(all[ntab..], ondemand);
+        break :blk all;
+    };
+
     const box = try a.create(ClientBox);
     errdefer a.destroy(box);
 
@@ -454,7 +474,8 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .db_url = if (db_url) |u| u.ptr else null,
             .engine = engine,
             .principal = principal,
-            .tables = tables,
+            .tables = all_tables,
+            .ondemand = ondemand,
             .client_id = client_id,
         }),
         .url = url,
@@ -711,6 +732,44 @@ export fn zb_client_poll(handle: u64, wait_ms: u64) ?[*:0]u8 {
         if (b.c.authError()) |auth_err| return errJson(@errorName(auth_err));
         return errJson(@errorName(err));
     };
+    return dupeZ(out);
+}
+
+/// §10hj: one request/reply on the card's connection. `subject` a query subject the
+/// principal may publish to (`query.<tenant>.<name>`), `payload_json` the question;
+/// the service's reply comes back verbatim (JSON by convention), or {"error":…}.
+export fn zb_client_request(handle: u64, subject: ?[*:0]const u8, payload_json: ?[*:0]const u8, timeout_ms: u64) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const subj = std.mem.span(subject orelse return null);
+    const payload = if (payload_json) |p| std.mem.span(p) else "";
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const out = b.c.request(arena.allocator(), subj, payload, timeout_ms) catch |err| return errJson(@errorName(err));
+    return dupeZ(out);
+}
+
+/// §10hj: a service's answer into an on-demand table — `answer_json` is
+/// `{"columns":[…],"rows":[[…],…]}`, `scope_json` optional `{"where": "<sql over the
+/// table's columns, ? params>", "params": […]}`: the area the answer is authoritative
+/// for, whose local rows the answer did not carry are deleted. {"applied": n}.
+export fn zb_client_ingest(handle: u64, table: ?[*:0]const u8, answer_json: ?[*:0]const u8, scope_json: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const tbl = std.mem.span(table orelse return null);
+    const ans = std.mem.span(answer_json orelse return null);
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const answer = (std.json.parseFromSlice(Value, a, ans, .{}) catch return errJson("MalformedAnswer")).value;
+    const scope: ?Value = if (scope_json) |sj| blk: {
+        const s = std.mem.span(sj);
+        if (s.len == 0) break :blk null;
+        break :blk (std.json.parseFromSlice(Value, a, s, .{}) catch return errJson("MalformedScope")).value;
+    } else null;
+    const n = b.c.ingest(a, tbl, answer, scope) catch |err| return switch (err) {
+        error.PrepareFailed, error.BindFailed, error.StepFailed => errJsonDetail(@errorName(err), b.c.st.errMsg()),
+        else => errJson(@errorName(err)),
+    };
+    const out = std.fmt.allocPrint(a, "{{\"applied\":{d}}}", .{n}) catch return errJson("OutOfMemory");
     return dupeZ(out);
 }
 
