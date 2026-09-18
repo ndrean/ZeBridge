@@ -18,6 +18,7 @@
 //!   char* zb_client_query(uint64_t h, const char* sql, const char* params_json);
 //!                                                                  // {"columns":[…],"rows":[[…],…]} — read-only connection
 //!   char* zb_client_mutate(uint64_t h, const char* table, const char* op,
+//!       // key_json addresses the row; an INSERT's values_json carries the WHOLE row, key included (the bridge builds it from data)
 //!                          const char* key_json, const char* values_json);   // {"msgId":…}
 //!   char* zb_client_flush(uint64_t h, uint64_t wait_ms);           // {"sent":n,"settled":n}
 //!   char* zb_client_request(uint64_t h, const char* subject, const char* payload_json, uint64_t timeout_ms);

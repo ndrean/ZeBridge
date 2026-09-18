@@ -14213,3 +14213,15 @@ query and Valhalla for road distances; Flutter asking on move; a `service` princ
 instead of `bridge.creds` for the responder; zb-client-ts has no on-demand mode
 (CLIENTS.md); the request's inbox is `_INBOX.>` for every client, a per-principal inbox
 would be tighter.
+
+**Edits, the same day.** `zebridge_enable('public.osm_pois', writable => true, …)`: the
+grants, the version guard, the delete guard (a DELETE becomes a tombstone), the width guard;
+the running bridge lifted the table's refusal through the WAL, no restart. `poi_phone.py
+--edit`: INSERT a café at the phone's position with a real PostGIS point (EWKB, little
+endian, SRID flag, as libzb's `$bin`), rename it, delete it — each a `mutate` on the
+on-demand table, flushed, its verdict back in ~255 ms, and the service's replica answering
+the next ask with the café, then the new name, then nothing; the phone holds nothing of it
+at the end. One convention learned the hard way, now in capi.zig's header: an INSERT's
+`values` are the WHOLE row, key included — the bridge builds the statement from `data`, the
+key alone addresses UPDATE and DELETE — so the first attempt was refused with `osm_id` null.
+No write-only mode was needed: the on-demand table is local, `mutate` is `mutate`.
