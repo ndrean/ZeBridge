@@ -44,6 +44,19 @@ dropped, seeded afresh. A table is never left stuck in its old shape.
   seeded at, refuse a manifest whose epoch is below the descriptor's, and refuse a
   chain object naming a column they lack — then wait for the producer's next full.
 
+**Where the epoch comes from.** The column is created with the catalogue itself, at
+`bridge-init`. A table's value is born the moment `zebridge_enable` first writes its
+row: the insert does not name the column, so the table starts at 0. From there it only
+ever goes up — `zebridge_reseed` by hand, the DDL trigger, or the bridge lifting a
+suspension that dropped events.
+
+Re-running `zebridge_enable` on a table that already has a row updates its rules and
+leaves the epoch untouched. Deliberately: changing a version column or a tenant column
+is no reason for every replica to re-seed, and an epoch that went backwards would be
+worse than pointless — a replica holding a higher one would never again see a
+descriptor above its own, so the re-seed rule would stop firing for that table for
+good. Only the comparison means anything; the number itself never does.
+
 ## The re-key recipe
 
 One transaction, then re-run the enable:

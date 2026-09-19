@@ -1921,6 +1921,16 @@ BEGIN
                'psql gets an ordinary ERROR. No-op on tables without unbounded columns.', tbl::text);
 
     -- ── THE CATALOGUE ROW: the declaration itself, atomically with the guards ──
+    --
+    -- ⚠️ `seed_epoch` is absent from the column list AND from the DO UPDATE SET, and
+    -- that absence is the invariant, not an oversight (§10df, MIGRATIONS.md). A
+    -- re-enable declares the table's RULES; it must not re-seed every replica. The
+    -- INSERT lets the DEFAULT 0 stand; the UPDATE leaves whatever zebridge_reseed(),
+    -- the DDL trigger or a suspension lift put there. Setting it here would re-seed
+    -- the world on every re-run, and could LOWER it — after which a replica holding a
+    -- higher epoch never sees a descriptor above its own again, and the re-seed rule
+    -- is dead for that table. The value is a monotone counter: only the comparison
+    -- with the replica's stored epoch means anything.
     IF NOT dry_run THEN
         EXECUTE format(
             'INSERT INTO public.zebridge_catalogue (tbl, tenant_col, public_reason, version_col, tombstone_col, tiebreak_col, generations) '
