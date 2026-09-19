@@ -528,6 +528,9 @@ export class ZeBridge {
           : { user: this.config.principal, pass: this.config.password }),
         reconnect: true,
         maxReconnectAttempts: -1,
+        // §10hm: this principal's own inbox space, so a `_INBOX.<principal>.>`
+        // grant covers every reply, watcher and pull this client opens.
+        inboxPrefix: `_INBOX.${this.config.principal}`,
       });
 
       this.emitStatus('connected');

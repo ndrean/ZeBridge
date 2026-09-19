@@ -95,7 +95,10 @@ def creds_for(who: str) -> str:
 
 async def connect_as(who: str):
     """Connect as one named principal, confined exactly as a real client is."""
-    return await nats.connect(nats_server(), user_credentials=creds_for(who))
+    # §10hm: its own inbox space, the same one libzb and the TS client use, so a
+    # scenario is confined by the `_INBOX.<principal>.>` grant like a real client.
+    return await nats.connect(nats_server(), user_credentials=creds_for(who),
+                              inbox_prefix=f"_INBOX.{who}".encode())
 
 
 def tenant_of(who: str) -> str:
@@ -176,7 +179,8 @@ async def connect():
     if creds:
         if not pathlib.Path(creds).exists():
             sys.exit(f"NATS_CREDS={creds} does not exist")
-        return await nats.connect(nats_server(), user_credentials=creds)
+        who = pathlib.Path(creds).stem  # <principal>.creds — §10hm, its own inbox space
+        return await nats.connect(nats_server(), user_credentials=creds, inbox_prefix=f"_INBOX.{who}".encode())
     if "@" in NATS_URL.split("://", 1)[-1]:
         return await nats.connect(NATS_URL)
     if not NKEY_SEED:

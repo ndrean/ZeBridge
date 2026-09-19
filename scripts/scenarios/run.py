@@ -71,6 +71,7 @@ GROUPS = {
         "reaps":         ("bridge", "sweeper reaps never reach clients"),
         "tenant_kv":     ("bridge", "$KV.tenants exact-key grants"),
         "crosstenant":   ("client", "cross-tenant reach (expected to find the known hole)"),
+        "inbox_sniff":   ("client", "the reply inbox as a read boundary (§10hm): a principal is refused the shared `_INBOX.>` and another principal's subtree, keeps its own, and a JetStream reply still reaches it under the narrowed grant"),
         "dyntenant":     ("bridge", "tenant born at runtime"),
         "invalidate":    ("bridge", "the caches that must notice DDL"),
         "keys":          ("client", "database-allocated keys refused on the write path"),

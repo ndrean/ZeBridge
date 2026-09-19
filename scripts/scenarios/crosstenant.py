@@ -75,7 +75,8 @@ async def main():
         sys.exit(f"'{who}' IS in tenant '{VICTIM}' — pick a victim tenant this principal is not mapped to")
 
     # connected as the CLIENT, with its creds — as the bridge every probe below is allowed
-    nc = await nats.connect(zb.nats_server(), user_credentials=zb.creds_for(who), error_cb=on_error)
+    nc = await nats.connect(zb.nats_server(), user_credentials=zb.creds_for(who), error_cb=on_error,
+                            inbox_prefix=f"_INBOX.{who}".encode())  # §10hm: its own inbox space
     js = nc.jetstream()
     subject = f"{zb.TOPOLOGY['subjects']['cdc_prefix']}.{VICTIM}.>"
 

@@ -144,16 +144,18 @@ fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Ro
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{{{{tag(tenant)}}}}.>", .{obj_pre});
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{s}.>", .{ obj_pre, open });
     try P.add(&pubs, a, "$JS.ACK.>", .{});
+    // Its own verdict marker, both roles: the revocation check at connect reads
+    // `mutation_ack.<name>.revoked` (§10hl) — a responder is a principal too.
+    try P.add(&pubs, a, "$JS.API.DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{subj_ack});
     switch (role) {
         .client => {
-            try P.add(&pubs, a, "$JS.API.DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{subj_ack});
             // §10dc: the fleet heartbeat — a client may write ONLY its own key.
             try P.add(&pubs, a, "$KV.{s}.{{{{tag(tenant)}}}}.{{{{name()}}}}", .{kv_live});
             try P.add(&pubs, a, "$KV.{s}.{s}.{{{{name()}}}}", .{ kv_live, open });
-            // §10hj: a client may ASK its tenant's services (request/reply; the inbox is `_INBOX.>` below).
+            // §10hj: a client may ASK its tenant's services (request/reply; the reply lands on
+            // its own inbox, granted below).
             try P.add(&pubs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
             try P.add(&pubs, a, "{s}.{s}.>", .{ subj_query, open });
-            try P.add(&subs, a, "{s}.{{{{name()}}}}.>", .{subj_ack});
         },
         .responder => {
             // §10hk: a responder ANSWERS its tenants' queries — the reply goes to the
@@ -163,11 +165,18 @@ fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Ro
             try P.add(&subs, a, "{s}.{s}.>", .{ subj_query, open });
         },
     }
+    // Its own verdict subject, both roles: libzb subscribes it at connect, before it knows
+    // whether it will ever write; a responder's never carries anything (§10hl).
+    try P.add(&subs, a, "{s}.{{{{name()}}}}.>", .{subj_ack});
     try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_cdc});
     try P.add(&subs, a, "{s}.{s}.>", .{ subj_cdc, open });
     try P.add(&subs, a, "$KV.{s}.>", .{kv_schemas});
     try P.add(&subs, a, "$KV.{s}.>", .{kv_gens});
-    try P.add(&subs, a, "_INBOX.>", .{});
+    // §10hm: its OWN inbox, not the shared one. JetStream delivers pulled messages,
+    // KV answers and object chunks to the reader's inbox, so `_INBOX.>` let any
+    // principal read what every other one received (measured, §10fs). Every client
+    // here sets its inbox prefix to `_INBOX.<principal>` to stay inside this grant.
+    try P.add(&subs, a, "_INBOX.{{{{name()}}}}.>", .{});
 
     return .{ .pub_json = try joinJson(a, pubs.items), .sub_json = try joinJson(a, subs.items) };
 }

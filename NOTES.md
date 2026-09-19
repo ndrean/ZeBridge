@@ -14337,3 +14337,115 @@ globex and a mutation.
 Left: the per-principal inbox. Every client still subscribes `_INBOX.>`, so a client can
 read another's replies; the grant `_INBOX.{{name()}}.>` needs the clients to use a
 prefix, and nats.zig hardcodes `_INBOX.` (§10fs).
+
+## 10hl. A region answers its own phones: the leaf node, measured (2026-09-19)
+
+The claim behind "a DuckDB responder per region": a phone connected to a regional
+nats-server gets its answer from the responder on that server, and the hub never sees
+the request. Measured with a second nats-server as a LEAF of the dev hub, in a container
+on OrbStack (`examples/08-map/leaf/leaf.sh`): operator mode with the hub's own operator
+and account JWTs, so a phone's creds are verified at the edge; no JetStream; one remote
+into the hub's new leaf port, entered with an account credential minted under the
+service key. The hub's conf gained `leafnodes { port: 7422 }` — a reload does not open
+it, a restart does. Every answer now carries `answered_by`, the instance's `--label`,
+and `leaf/who_answers.py` tallies fifty asks:
+
+| phone connected to | responders up | answered by | median |
+|---|---|---|---|
+| leaf | both | leaf, 50 of 50 | 136 ms |
+| hub | both | hub, 50 of 50 | 133 ms |
+| leaf | hub only | hub, 50 of 50, across the link | 133 ms |
+| leaf | both again | leaf, 50 of 50 | 133 ms |
+
+Queue-group locality does exactly what the claim needs: a request is served on the
+server it was published on when a member is there, crosses the link only when none is,
+and comes back the moment one returns. The link itself costs nothing measurable at
+localhost; the round trip is the DuckDB query.
+
+**What does not cross the link: JetStream.** A responder on the leaf needs its replica,
+and libzb feeds it through the JetStream API. From a client on the leaf every `$JS.API`
+request gets no responder — the hub's `$JS.API.>` interest IS delivered to the leaf, the
+request goes up, nothing answers. Five shapes tried, each measured:
+
+* the system account joined through a second remote: the hub logs "Extending JetStream
+  domain" and the answer is the same no responder;
+* JetStream enabled on the leaf without a domain: the leaf's own empty JetStream answers
+  ("stream not found") and the log says a standalone server cannot extend a domain;
+* the leaf with `extension_hint: will_extend`: an observer of the hub's meta group —
+  account info shows the hub's 21 streams, and every operation answers "JetStream system
+  temporarily unavailable": a STANDALONE hub has no meta leader to find;
+* the hub as a cluster of one (`cluster { name, port, routes = [itself] }`): the meta
+  group wants two peers and never elects; and a store written standalone is invisible
+  under a cluster — jsz counts 21 streams, the API finds none, the hub's own service got
+  "stream not found". Restored from the backup;
+* the hub with a JetStream domain and the account mapping `$JS.API.> → $JS.hub.API.>`:
+  permissions are checked on the MAPPED subject, so every narrow grant stops matching,
+  and the bridge itself (whose grant is `>`) got no responder on the hub. Restored.
+
+So today the responder on the leaf keeps two connections: `--url` the hub for its
+replica, `--serve-url` the leaf for the answers — that is the measurement above. What
+it does not cover is a phone on the leaf that follows its own chains, which needs the
+JetStream API through the link. The shape NATS supports for that is a real hub cluster
+with the leaf as `will_extend` observer, or a domain on the hub with the clients using
+its prefix and the grants carrying it; both are a deployment decision, neither is a day.
+A leaf's link credential is a service-key user (the link carries every principal's
+traffic, so its grant is the union); narrowing it is open.
+
+One correction to §10hk: at connect libzb subscribes `mutation_ack.<principal>.>` and
+reads `mutation_ack.<principal>.revoked` from MUTATIONS — before it knows whether it will
+ever write, and because a principal can be revoked whatever its role. A responder
+without those two grants logs a permission violation on every connect. Both templates
+grant them now; a responder's verdict subject never carries anything.
+
+## 10hm. The reply inbox becomes a read boundary (2026-09-19)
+
+§10fs found it and left it: a client may subscribe to `_INBOX.>`, JetStream delivers
+pulled messages, KV answers and object chunks to the reader's inbox, and the subject ACL
+is never consulted for that delivery — so one principal reads what every other one
+receives. Measured again today before touching anything, a client credential subscribed
+to `_INBOX.>` capturing the pull deliveries of the bridge and of both POI services.
+
+The fix is the obvious one and it needed a library change first. The grant is
+`_INBOX.<principal>.>`; a client can only live inside it if it generates its inboxes
+there, and nats.zig hardcoded `_INBOX.` in two files. That is now a connection option
+(`nats.zig-patch/NATS_ZIG_NOTES.md` entry 13), the same option nats.go, nats.js and
+nats-py have carried for years — nats.js documents it as "useful for clients with limited
+subject permissions", which is this sentence.
+
+Both halves landed together, because either alone breaks the stack: the grant without the
+clients means no reply ever arrives, the clients without the grant changes nothing.
+
+* **The grant.** `roleAllows` renders `_INBOX.{{name()}}.>` for the client and responder
+  templates; `jwt-bootstrap.sh` the same. The responder keeps `publish _INBOX.>` — it
+  answers on the asker's inbox, whichever that is, and publishing into an inbox is not
+  reading it. `zbdoctor` keeps the wide subscription: it is an operator credential minted
+  under the account identity key, like the bridge's `>`.
+* **The clients.** libzb passes `_INBOX.<principal>` from the principal it already
+  carries; zb-client-ts passes `inboxPrefix` the same way; the scenarios' shared helpers,
+  the two that dial on their own, the POI service, the leaf tally and the two web-consumer
+  probes all do it explicitly. A client that forgot would not fail loudly — it would time
+  out — which is why the scenario checks the generated subject, not only the refusal.
+
+Measured after the reload:
+
+| probe | result |
+|---|---|
+| `omar` subscribes `_INBOX.>` | refused |
+| `omar` subscribes `_INBOX.alice.>` | refused |
+| `omar` subscribes `_INBOX.omar.>` | allowed |
+| the inbox libzb generates | `_INBOX.omar.<nuid>` |
+| a JetStream reply under the narrowed grant | arrives |
+
+`scripts/scenarios/inbox_sniff.py` is those five, in the `client` group. The stack on top
+of them: both POI services reconnected with zero violations, the phone probe seeded and
+asked and routed (E10 in 97 ms, the road in 139 ms), the leaf still answered 20 of 20
+locally, and the Node consumer seeded twenty tables from chain objects — every one of
+those reads is an inbox delivery. `crosstenant.py`, `tenant_kv.py` and `probe.py` pass.
+
+Two things seen and not chased. The TypeScript client cannot read the `osm_pois` chain
+object (95 MB, 730 chunks): it stops at 18 chunks with the object unreadable, while libzb
+reads the same object and seeds 2.1M rows — the push-versus-pull difference §10fh solved
+on the Zig side, not yet on the TypeScript one. And a principal name longer than 57 bytes
+would push its prefix past the library's 64-byte bound and be refused at connect, which
+is a loud failure rather than a silent shared inbox, and the right way round.
+

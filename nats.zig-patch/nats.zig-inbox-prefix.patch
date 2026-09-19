@@ -1,0 +1,321 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index 8371af1..3bff17b 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -427,6 +427,20 @@ pub const ConnectionOptions = struct {
+     /// a configured seed takes precedence.
+     nkey_sign_cb: ?*const fn (nonce: []const u8) anyerror![64]u8 = null,
+ 
++    /// Prefix for the inboxes this client generates — the reply subject of a
++    /// request, and the delivery subject of a KV watcher, an object-store read
++    /// or a pull consumer. Without its trailing dot; the dot is added.
++    ///
++    /// The default is every NATS client's `_INBOX`, and every client on an
++    /// account then listens under one shared prefix, so a permission narrow
++    /// enough to isolate replies cannot be written. A deployment that grants
++    /// `_INBOX.<principal>.>` per principal sets this to `_INBOX.<principal>`
++    /// and its replies stay inside that grant. Same option as nats.go's
++    /// `CustomInboxPrefix`, nats.js's `inboxPrefix` and nats-py's
++    /// `inbox_prefix`. Validated at connect: non-empty, no wildcard, no
++    /// whitespace, no trailing dot, at most `inbox.max_prefix_len` bytes.
++    inbox_prefix: []const u8 = inbox.default_prefix,
++
+     /// TLS configuration. When set, every connection is upgraded to TLS
+     /// after the plaintext INFO (or before it, with `handshake_first`).
+     /// A `tls://` server URL enables TLS with default options even when
+@@ -555,7 +569,7 @@ pub const Connection = struct {
+             .pending_buffer = WriteBuffer.init(allocator, io, .{ .max_size = options.reconnect.reconnect_buf_size }),
+             .write_buffer = WriteBuffer.init(allocator, io, .{ .max_size = options.write_buffer_limit, .soft_limit = true }),
+             .subscriptions = std.AutoHashMap(u64, *Subscription).init(allocator),
+-            .response_manager = ResponseManager.init(allocator, io),
++            .response_manager = ResponseManager.init(allocator, io, options.inbox_prefix),
+             .parser = Parser.init(allocator, io),
+             .scratch = std.heap.ArenaAllocator.init(allocator),
+             .ping_time = io_util.now(io),
+@@ -661,6 +675,10 @@ pub const Connection = struct {
+ 
+         try io_util.ensureAwakeClock(self.io);
+ 
++        // An inbox prefix that is not a usable subject would otherwise surface
++        // as a silent permissions violation on the first reply.
++        try inbox.validatePrefix(self.options.inbox_prefix);
++
+         // Fail fast at the API boundary when TLS is requested but was
+         // compiled out; tls:// URLs are additionally checked per attempt
+         // in runConnection.
+@@ -1323,6 +1341,14 @@ pub const Connection = struct {
+         return self.requestMsg(&msg, timeout);
+     }
+ 
++    /// A fresh inbox subject under this connection's prefix:
++    /// `<inbox_prefix>.<22-char-nuid>`. Every inbox this library generates goes
++    /// through here, so a narrowed prefix covers replies, KV watchers,
++    /// object-store reads and pull consumers alike. The caller owns the result.
++    pub fn newInbox(self: *Self, allocator: Allocator) ![]u8 {
++        return inbox.newInboxWithPrefix(allocator, self.options.inbox_prefix);
++    }
++
+     pub fn requestMsg(self: *Self, msg: *Message, timeout: Io.Timeout) !*Message {
+         if (self.options.trace) {
+             log.debug("Sending request message to {s} with timeout {any}", .{ msg.subject, timeout });
+diff --git a/src/inbox.zig b/src/inbox.zig
+index e95d278..2de835e 100644
+--- a/src/inbox.zig
++++ b/src/inbox.zig
+@@ -14,15 +14,72 @@
+ const std = @import("std");
+ const nuid = @import("nuid.zig");
+ 
++/// Default inbox prefix used by NATS clients, without its trailing dot.
++pub const default_prefix = "_INBOX";
++
++/// Longest accepted prefix. The response manager holds its reply prefix in an
++/// inline buffer sized from this, so a custom prefix stays bounded instead of
++/// turning that buffer into an allocation.
++pub const max_prefix_len = 64;
++
+ /// Default inbox prefix used by NATS clients
+-const INBOX_PREFIX = "_INBOX.";
++const INBOX_PREFIX = default_prefix ++ ".";
++
++/// A prefix has to work as the leading tokens of a subject: non-empty, no
++/// wildcard, no whitespace, no trailing dot (the dot is added here), and short
++/// enough for the inline buffer. The rules nats.go's CustomInboxPrefix applies,
++/// plus the length bound this implementation needs.
++pub fn validatePrefix(prefix: []const u8) error{InvalidInboxPrefix}!void {
++    if (prefix.len == 0 or prefix.len > max_prefix_len) return error.InvalidInboxPrefix;
++    if (prefix[prefix.len - 1] == '.') return error.InvalidInboxPrefix;
++    for (prefix) |c| switch (c) {
++        '*', '>', ' ', '\t', '\r', '\n' => return error.InvalidInboxPrefix,
++        else => {},
++    };
++}
+ 
+ /// Generate a unique inbox subject for request/reply pattern
+ /// Format: _INBOX.<22-char-nuid>
+ pub fn newInbox(allocator: std.mem.Allocator) ![]u8 {
++    return newInboxWithPrefix(allocator, default_prefix);
++}
++
++/// The same under a caller-chosen prefix: `<prefix>.<22-char-nuid>`. A
++/// connection's own prefix is reached through `Connection.newInbox`, which is
++/// what everything inside this library uses — a client granted only
++/// `_INBOX.<name>.>` must not generate a reply subject outside it.
++pub fn newInboxWithPrefix(allocator: std.mem.Allocator, prefix: []const u8) ![]u8 {
+     var nuid_buf: [nuid.NUID_TOTAL_LEN]u8 = undefined;
+     nuid.next(&nuid_buf);
+-    return try std.fmt.allocPrint(allocator, "{s}{s}", .{ INBOX_PREFIX, nuid_buf });
++    return try std.fmt.allocPrint(allocator, "{s}.{s}", .{ prefix, nuid_buf });
++}
++
++test "a custom prefix replaces the default, and the default is unchanged" {
++    const allocator = std.testing.allocator;
++
++    const default_inbox = try newInbox(allocator);
++    defer allocator.free(default_inbox);
++    try std.testing.expect(std.mem.startsWith(u8, default_inbox, "_INBOX."));
++
++    const scoped = try newInboxWithPrefix(allocator, "_INBOX.alice");
++    defer allocator.free(scoped);
++    try std.testing.expect(std.mem.startsWith(u8, scoped, "_INBOX.alice."));
++    // One nuid past the prefix and its dot, nothing else.
++    try std.testing.expectEqual("_INBOX.alice.".len + nuid.NUID_TOTAL_LEN, scoped.len);
++}
++
++test "a prefix has to be usable as a subject" {
++    try validatePrefix("_INBOX");
++    try validatePrefix("_INBOX.alice");
++    try validatePrefix("replies.eu-west");
++    try validatePrefix("x" ** max_prefix_len);
++
++    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix(""));
++    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX."));
++    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX.>"));
++    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX.*"));
++    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("_INBOX alice"));
++    try std.testing.expectError(error.InvalidInboxPrefix, validatePrefix("x" ** (max_prefix_len + 1)));
+ }
+ 
+ test "inbox generation" {
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 3e92e01..5d382c6 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -1643,7 +1643,7 @@ pub const JetStream = struct {
+         // Prepare consumer config, generating deliver_subject if needed
+         var config = options.config orelse ConsumerConfig{};
+         const generated_deliver_subject = if (config.deliver_subject == null)
+-            try inbox.newInbox(self.nc.allocator)
++            try self.nc.newInbox(self.nc.allocator)
+         else
+             null;
+         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
+@@ -1706,7 +1706,7 @@ pub const JetStream = struct {
+ 
+         // Generate deliver_subject if not provided in the config
+         const generated_deliver_subject = if (config.deliver_subject == null)
+-            try inbox.newInbox(self.nc.allocator)
++            try self.nc.newInbox(self.nc.allocator)
+         else
+             null;
+         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
+@@ -1760,7 +1760,7 @@ pub const JetStream = struct {
+ 
+         // Generate deliver_subject if not provided in the config
+         const generated_deliver_subject = if (config.deliver_subject == null)
+-            try inbox.newInbox(self.nc.allocator)
++            try self.nc.newInbox(self.nc.allocator)
+         else
+             null;
+         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
+@@ -1818,7 +1818,7 @@ pub const JetStream = struct {
+ 
+         // Generate deliver_subject if not provided in the config
+         const generated_deliver_subject = if (config.deliver_subject == null)
+-            try inbox.newInbox(self.nc.allocator)
++            try self.nc.newInbox(self.nc.allocator)
+         else
+             null;
+         errdefer if (generated_deliver_subject) |ds| self.nc.allocator.free(ds);
+@@ -1854,7 +1854,7 @@ pub const JetStream = struct {
+     /// Create a pull subscription for the specified stream
+     /// One inbox for several pull consumers — see `PullInbox`.
+     pub fn pullInbox(self: JetStream) !*PullInbox {
+-        const inbox_base = try inbox.newInbox(self.nc.allocator);
++        const inbox_base = try self.nc.newInbox(self.nc.allocator);
+         defer self.nc.allocator.free(inbox_base);
+         const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
+         errdefer self.nc.allocator.free(inbox_prefix);
+@@ -1916,7 +1916,7 @@ pub const JetStream = struct {
+         }
+ 
+         // Generate unique inbox prefix for this pull subscription
+-        const inbox_base = try inbox.newInbox(self.nc.allocator);
++        const inbox_base = try self.nc.newInbox(self.nc.allocator);
+         defer self.nc.allocator.free(inbox_base);
+ 
+         const inbox_prefix = try std.fmt.allocPrint(self.nc.allocator, "{s}.", .{inbox_base});
+diff --git a/src/jetstream_kv.zig b/src/jetstream_kv.zig
+index 2902242..30ca218 100644
+--- a/src/jetstream_kv.zig
++++ b/src/jetstream_kv.zig
+@@ -203,7 +203,7 @@ pub const KVWatcher = struct {
+     pub fn init(kv: *KV, subjects: []const []const u8, options: WatchOptions) !Self {
+         const allocator = kv.js.nc.allocator;
+ 
+-        const inbox = try newInbox(allocator);
++        const inbox = try kv.js.nc.newInbox(allocator);
+         defer allocator.free(inbox);
+ 
+         const consumer_config = ConsumerConfig{
+diff --git a/src/jetstream_objstore.zig b/src/jetstream_objstore.zig
+index c37ff29..5e8d0a0 100644
+--- a/src/jetstream_objstore.zig
++++ b/src/jetstream_objstore.zig
+@@ -572,7 +572,7 @@ pub const ObjectStore = struct {
+         const chunk_subject = try self.getChunkSubject(obj_info.nuid);
+         defer self.allocator.free(chunk_subject);
+ 
+-        const inbox = try newInbox(self.allocator);
++        const inbox = try self.js.nc.newInbox(self.allocator);
+         defer self.allocator.free(inbox);
+ 
+         const consumer_config = ConsumerConfig{
+@@ -735,7 +735,7 @@ pub const ObjectStore = struct {
+         const meta_filter = try std.fmt.allocPrint(self.allocator, "{s}>", .{self.meta_subject_prefix});
+         defer self.allocator.free(meta_filter);
+ 
+-        const inbox = try newInbox(self.allocator);
++        const inbox = try self.js.nc.newInbox(self.allocator);
+         defer self.allocator.free(inbox);
+ 
+         const consumer_config = ConsumerConfig{
+diff --git a/src/response_manager.zig b/src/response_manager.zig
+index cccf6df..2ac3823 100644
+--- a/src/response_manager.zig
++++ b/src/response_manager.zig
+@@ -44,15 +44,19 @@ pub const RequestHandle = struct {
+     rid: u64,
+ };
+ 
+-const INBOX_BASE_PREFIX = "_INBOX.";
+-const INBOX_BASE_PREFIX_LEN = INBOX_BASE_PREFIX.len;
+-
+-const INBOX_PREFIX_LEN = INBOX_BASE_PREFIX_LEN + nuid.NUID_TOTAL_LEN + 1; // "_INBOX.{22-char-nuid}." = 7 + 22 + 1 = 30
++// "<prefix>.{22-char-nuid}." at its longest. The reply prefix lives in an
++// inline buffer, so the prefix is bounded by inbox.max_prefix_len rather than
++// allocated; the default "_INBOX" uses 30 of these bytes.
++const INBOX_PREFIX_LEN = inbox.max_prefix_len + 1 + nuid.NUID_TOTAL_LEN + 1;
+ 
+ pub const ResponseManager = struct {
+     allocator: Allocator,
+     io: Io,
+ 
++    /// The connection's inbox prefix, without its trailing dot. Borrowed from
++    /// ConnectionOptions, which the caller keeps alive, like `name` and `user`.
++    inbox_prefix: []const u8 = inbox.default_prefix,
++
+     resp_sub_prefix_buf: [INBOX_PREFIX_LEN]u8 = undefined,
+     resp_sub_prefix: []u8 = &.{},
+ 
+@@ -73,10 +77,11 @@ pub const ResponseManager = struct {
+     // Request ID generation state (simple counter)
+     rid_counter: u64 = 0,
+ 
+-    pub fn init(allocator: Allocator, io: Io) ResponseManager {
++    pub fn init(allocator: Allocator, io: Io, inbox_prefix: []const u8) ResponseManager {
+         return ResponseManager{
+             .allocator = allocator,
+             .io = io,
++            .inbox_prefix = inbox_prefix,
+         };
+     }
+ 
+@@ -147,7 +152,10 @@ pub const ResponseManager = struct {
+         // Create an unique identifier for the response manager
+         var nuid_buf: [nuid.NUID_TOTAL_LEN]u8 = undefined;
+         nuid.next(&nuid_buf);
+-        self.resp_sub_prefix = std.fmt.bufPrint(&self.resp_sub_prefix_buf, "_INBOX.{s}.", .{&nuid_buf}) catch unreachable;
++        // Connection.connect validates the prefix against inbox.max_prefix_len,
++        // so the buffer fits; a ResponseManager built by hand with a longer one
++        // is told, rather than panicking.
++        self.resp_sub_prefix = std.fmt.bufPrint(&self.resp_sub_prefix_buf, "{s}.{s}.", .{ self.inbox_prefix, &nuid_buf }) catch return error.InvalidInboxPrefix;
+ 
+         // Create wildcard subscription using a temporary buffer
+         var subject_buf: [INBOX_PREFIX_LEN + 1]u8 = undefined;
+@@ -448,7 +456,7 @@ test "response manager basic functionality" {
+     const testing = std.testing;
+     const allocator = testing.allocator;
+ 
+-    var manager = ResponseManager.init(allocator, std.testing.io);
++    var manager = ResponseManager.init(allocator, std.testing.io, inbox.default_prefix);
+     defer manager.deinit();
+ 
+     // Test that we can create request handles with different rids
+@@ -467,7 +475,7 @@ test "request handle timeout functionality" {
+     const testing = std.testing;
+     const allocator = testing.allocator;
+ 
+-    var manager = ResponseManager.init(allocator, std.testing.io);
++    var manager = ResponseManager.init(allocator, std.testing.io, inbox.default_prefix);
+     defer manager.deinit();
+ 
+     const handle = try manager.createRequest();
+@@ -487,7 +495,7 @@ test "multi-response request creation and timeout" {
+     const testing = std.testing;
+     const allocator = testing.allocator;
+ 
+-    var manager = ResponseManager.init(allocator, std.testing.io);
++    var manager = ResponseManager.init(allocator, std.testing.io, inbox.default_prefix);
+     defer manager.deinit();
+ 
+     // Test that we can create multi-response request handles
+@@ -517,7 +525,7 @@ test "multi-response returns collected messages when manager closes" {
+     };
+ 
+     const io = std.testing.io;
+-    var manager = ResponseManager.init(std.testing.allocator, io);
++    var manager = ResponseManager.init(std.testing.allocator, io, inbox.default_prefix);
+     defer manager.deinit();
+ 
+     const handle = try manager.createMultiRequest();

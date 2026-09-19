@@ -332,7 +332,14 @@ pub const SyncClient = struct {
 
         // An empty credsPath is "no creds" (an anonymous server), not a file named "": the
         // C ABI defaults the field to "" and nats.zig opened it — FileNotFound at open.
-        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null });
+        // §10hm: this principal's own inbox space. A deployment granting
+        // `_INBOX.<principal>.>` isolates replies with it; under the wider
+        // `_INBOX.>` grant it costs nothing and changes nothing.
+        const inbox_prefix = if (opts.principal.len > 0)
+            try std.fmt.allocPrint(self.aa(), "_INBOX.{s}", .{opts.principal})
+        else
+            "_INBOX";
+        self.t = try transport.Transport.connect(a, .{ .url = opts.url, .creds_path = if (opts.creds_path.len > 0) opts.creds_path else null, .inbox_prefix = inbox_prefix });
         errdefer self.t.deinit();
 
         return self;

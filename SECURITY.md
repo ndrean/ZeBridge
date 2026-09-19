@@ -391,7 +391,7 @@ Two credential shapes, on purpose:
 | | credential | permissions |
 | --- | --- | --- |
 | the bridge | nkey, seed passed on the command line, in no env file | `publish: >`, `subscribe: >` — it is the trusted writer and already holds replication rights |
-| a client | user/password today, JWT next | allow-listed to its own subtree |
+| a client | user/password today, JWT next | allow-listed to its own subtree, **its reply inbox included** (`_INBOX.<principal>.>`) |
 | a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants and `publish: _INBOX.>` for the replies — no mutations, no heartbeat key, no asking |
 
 **A responder answers, it never writes.** A service that answers `query.<tenant>.<name>`
@@ -402,6 +402,22 @@ compromised service cannot reach PostgreSQL through the bridge, and a client cre
 is refused a `query.>` subscription, so nobody can pose as a service. Both are measured
 (NOTES §10hk). Minted by `scripts/native/jwt-bootstrap.sh` (nsc) or, in the stack the
 bridge generated, by `scripts/native/mint_responder.py` from `ZB_RESPONDER_SEED`.
+
+**The reply inbox is a read boundary.** JetStream does not deliver a pulled message, a
+KV answer or an object chunk on the subject the reader filtered on: it delivers to the
+reader's **inbox**, and the subject allow-list is never consulted for that delivery. So
+while every principal shared the default `_INBOX.` space, a credential that could
+subscribe to `_INBOX.>` could read what every other principal was being handed — measured
+on the dev stack, a client credential capturing the bridge's own pull deliveries. Each
+principal is therefore granted `_INBOX.{{name()}}.>` and nothing wider, and every client
+sets its inbox prefix to `_INBOX.<principal>` so its own replies land inside that grant
+(libzb, zb-client-ts, the scenario helpers, the reference services). A client that keeps
+the default prefix does not leak — it stops receiving, loudly.
+
+✅ `scripts/scenarios/inbox_sniff.py` — the shared space refused, another principal's
+subtree refused, its own kept, and a JetStream reply still arriving. ⚠️ `zbdoctor` keeps
+the wide subscription: it is an operator credential, in the same class as the bridge's
+`>`, not a client.
 
 **The transport.** The bridge dials `nats://` (plain TCP) or `tls://`. With `tls://` it
 verifies the server certificate against `NATS_TLS_CA`, or the system trust store when that

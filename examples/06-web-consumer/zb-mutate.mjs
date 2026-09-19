@@ -65,6 +65,8 @@ const nc = await wsconnect({
   servers: process.env.ZB_WS ?? 'ws://localhost:8080',
   user: PRINCIPAL,
   pass: PASSWORD,
+  // §10hm: this principal's own inbox space, like the client library.
+  inboxPrefix: `_INBOX.${PRINCIPAL}`,
 });
 
 let verdict = null;

@@ -8,6 +8,7 @@ lifecycle lesson learned in one is not silently missing from the other.
 | language | Zig core + shell, C ABI | TypeScript core + shell |
 | hosts | Python, Node (ctypes/FFI), Flutter (Dart FFI) | browser, Node |
 | local engine | SQLite (a file), PostgreSQL (`dbUrl`, §10fd; seeds through COPY, §10fe), or DuckDB (`engine: "duckdb"`, §10fl; built in with `-Dduckdb=true`; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
+| reply inbox | `_INBOX.<principal>` (§10hm), from the `inbox_prefix` connection option — replies, KV watchers, object reads and pull consumers all land there, inside the principal's `_INBOX.<principal>.>` grant | the same, through nats.js's `inboxPrefix` |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
 | tables followed | the explicit `tables` list | every key in the `schemas` bucket, or the `tables` list when given (§10fb) |
 | tenants followed | every membership in `$KV.tenants.<principal>` (a set, §10fn): one chain per tenant into one table, one CDC stream per tenant, watermarks per (table, tenant); `zb_client_join`/`zb_client_leave` at runtime; a join the credentials cannot read is refused, and a stream that becomes unreadable is set aside alone and named in the poll report (`unreadable`, §10fq) | the FIRST membership only, with a warning when there are more (parity queued) |

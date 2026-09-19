@@ -28,7 +28,7 @@ A bounding box on (lat, lng) over the replica's index, then the haversine distan
 order and cut at the radius. Every libzb call is serialized through one lock: the card
 is not made for two threads.
 """
-import argparse, asyncio, ctypes, json, math, os, pathlib, sys, threading, time, urllib.request
+import argparse, asyncio, ctypes, json, math, os, pathlib, socket, sys, threading, time, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
@@ -354,9 +354,12 @@ def route(card: Card, q: dict) -> dict:
 QUERIES = {"pois_near": pois_near, "tour": tour, "fuel_near": fuel_near, "route": route}
 
 
-async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str):
+async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str, label: str, principal: str):
     import nats
-    nc = await nats.connect(url, user_credentials=creds, name="poi-service")
+    # §10hm: the responder's own inbox space — its replica's pulls and KV reads land
+    # under `_INBOX.<principal>`, which is what its grant covers.
+    nc = await nats.connect(url, user_credentials=creds, name=f"poi-service {label}",
+                            inbox_prefix=f"_INBOX.{principal}".encode())
     served = 0
 
     async def handler(msg):
@@ -368,6 +371,7 @@ async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str
             ans = fn(card, q) if fn else {"error": f"unknown query {name!r}", "known": sorted(QUERIES)}
         except Exception as e:  # a bad parameter is the client's problem, not the service's
             ans = {"error": f"{type(e).__name__}: {e}"}
+        ans["answered_by"] = label  # §10hl: which instance answered — the leaf test counts these
         await msg.respond(json.dumps(ans, default=str).encode())
         served += 1
         if served % 100 == 1:
@@ -393,6 +397,8 @@ def main():
     ap.add_argument("--engine", default="duckdb")
     ap.add_argument("--tenants", default="kilo,_default")
     ap.add_argument("--queue", default="pois")
+    ap.add_argument("--label", default=f"{socket.gethostname()}:{os.getpid()}", help="the instance's name in every answer (answered_by)")
+    ap.add_argument("--serve-url", default=None, help="§10hl: answer on THIS server (a regional leaf) while the replica follows --url (the hub); default: the same")
     ap.add_argument("--valhalla", default=VALHALLA, help="the routing engine (examples/08-map/valhalla); the tour and route go by road when it answers")
     a = ap.parse_args()
     VALHALLA = a.valhalla.rstrip("/")
@@ -414,7 +420,7 @@ def main():
                 time.sleep(2)
 
     threading.Thread(target=follow, daemon=True).start()
-    asyncio.run(serve(card, a.url, a.creds, [t.strip() for t in a.tenants.split(",") if t.strip()], a.queue))
+    asyncio.run(serve(card, a.serve_url or a.url, a.creds, [t.strip() for t in a.tenants.split(",") if t.strip()], a.queue, a.label, a.principal))
 
 
 if __name__ == "__main__":

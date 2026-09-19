@@ -96,7 +96,7 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-sub "cdc._default.>" \
     --allow-sub "\$KV.schemas.>" \
     --allow-sub "\$KV.generations.>" \
-    --allow-sub "_INBOX.>" >/dev/null
+    --allow-sub "_INBOX.{{name()}}.>" >/dev/null
 echo "client signing key:  $SK_CLIENT"
 
 # ── the RESPONDER signing key: services that ANSWER `query.<tenant>.<name>` (§10hk) ──
@@ -148,14 +148,16 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
     --allow-pub "\$JS.ACK.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>" \
     --allow-pub "_INBOX.>" \
     --allow-sub "query.{{tag(tenant)}}.>" \
     --allow-sub "query._default.>" \
+    --allow-sub "mutation_ack.{{name()}}.>" \
     --allow-sub "cdc.{{tag(tenant)}}.>" \
     --allow-sub "cdc._default.>" \
     --allow-sub "\$KV.schemas.>" \
     --allow-sub "\$KV.generations.>" \
-    --allow-sub "_INBOX.>" >/dev/null
+    --allow-sub "_INBOX.{{name()}}.>" >/dev/null
 echo "responder signing key: $SK_RESPONDER"
 
 # ── users: one mint per principal — THIS is the whole onboarding now ─────────

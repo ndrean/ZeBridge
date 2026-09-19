@@ -91,7 +91,8 @@ async def _silent_error(_e):
 
 async def connect_as(principal: str) -> nats.NATS:
     """`zb.connect_as`, plus the silent error callback: same creds file, same server."""
-    return await nats.connect(zb.nats_server(), user_credentials=zb.creds_for(principal), error_cb=_silent_error)
+    return await nats.connect(zb.nats_server(), user_credentials=zb.creds_for(principal), error_cb=_silent_error,
+                              inbox_prefix=f"_INBOX.{principal}".encode())  # §10hm
 
 
 async def own_key(nc: nats.NATS, key: str):

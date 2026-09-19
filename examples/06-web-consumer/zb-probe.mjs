@@ -26,7 +26,9 @@ const step = async (name, fn) => {
   catch (e) { console.log(`FAIL  ${name}: ${e.message}`); }
 };
 
-const nc = await wsconnect({ servers: 'ws://localhost:18080', user: 'alice', pass: 's3cret' });
+// §10hm: the same inbox prefix the client library uses — a probe of the allow-list
+// has to ask for the subjects a real client asks for.
+const nc = await wsconnect({ servers: 'ws://localhost:18080', user: 'alice', pass: 's3cret', inboxPrefix: '_INBOX.alice' });
 console.log('connected');
 const js = jetstream(nc);
 let jsm;

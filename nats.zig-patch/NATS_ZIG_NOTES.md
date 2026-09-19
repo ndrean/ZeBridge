@@ -528,3 +528,79 @@ nonblock path), nats.zig passes none — and in the probe the server issued no t
 so check `nats-server` before building on it. Go's TLS server implements no 0-RTT.
 
 ---
+
+## 13. The inbox prefix is now the caller's choice (2026-09-19)
+
+**How it appeared**
+
+A read boundary that could not be drawn. JetStream does not deliver a pulled message, a
+KV answer or an object chunk on the subject the reader filtered on — it delivers to the
+reader's **inbox**, and the subject ACL is never consulted for it. Every NATS client
+generates inboxes under one shared `_INBOX.`, so every principal on an account listens in
+the same space. Measured again on the dev stack while writing this, with a plain client
+credential subscribed to `_INBOX.>`:
+
+```
+_INBOX.8YR56W4T5TBBWKEN1IK4C4.147640x0      # another principal's pull deliveries
+_INBOX.U8XIEDIS07ZC1BCLU2KT6V.147632x0      # and another's
+_INBOX.M7BDIF0FBG61D08SDGXW1N.31298
+```
+
+The fix is one grant per principal, `_INBOX.<name>.>`. The library could not be a client
+of it: `_INBOX.` was a constant in `inbox.zig` and again in `response_manager.zig`, where
+it also sized an inline buffer at compile time.
+
+Not an opinion, an omission: nats.go has `CustomInboxPrefix` (validated: non-empty, no
+wildcard, no trailing dot), nats.js has `inboxPrefix` — its own documentation says
+"useful for clients with limited subject permissions" — and nats-py has `inbox_prefix`.
+nats.zig was the outlier.
+
+**Change** (`nats.zig-inbox-prefix.patch`, 15 hunks, 6 files)
+
+`src/inbox.zig` — `default_prefix` ("_INBOX", no dot), `max_prefix_len` (64),
+`validatePrefix` with nats.go's rules plus the length bound, and
+`newInboxWithPrefix(allocator, prefix)`. `newInbox(allocator)` keeps its signature and
+its output.
+
+`src/connection.zig` — `ConnectionOptions.inbox_prefix`, borrowed like `name` and `user`
+rather than duplicated; validated once in `connect()`, so a bad prefix is an error at the
+API boundary instead of a silent permissions violation on the first reply; and
+`Connection.newInbox(allocator)`, the nats.go shape, which everything inside the library
+now calls.
+
+`src/response_manager.zig` — the reply prefix is built from the connection's prefix. The
+inline buffer stays inline: its size comes from `max_prefix_len` instead of the literal,
+so a custom prefix is bounded rather than allocated (the default uses 30 of those bytes).
+The `bufPrint` that could not fail before now returns `error.InvalidInboxPrefix` rather
+than `unreachable`, for a manager built by hand.
+
+`src/jetstream.zig`, `src/jetstream_kv.zig`, `src/jetstream_objstore.zig` — the four
+generated consumer delivery subjects, the two `PullInbox` bases, the KV watcher and the
+two object-store reads go through `Connection.newInbox`. That is what makes the option
+cover more than request/reply.
+
+**Verified**
+
+```bash
+cd nats.zig && zig build test-unit         # 134/134 (2 new), 17 consecutive runs
+git -C nats.zig apply -R … && apply …      # the patch reverses and re-applies cleanly
+```
+
+Live, against the dev stack, with the `requestor` example temporarily pointed at it (the
+file was restored afterwards):
+
+| prefix | reply subject on the wire |
+|---|---|
+| default | `_INBOX.O2EZJ87992JNROFX1DMEA2.0` |
+| `_INBOX.zbprobe` | `_INBOX.zbprobe.36N9KD6RM95JQR47OKXJDB.0` |
+
+Both replies arrived. ZeBridge adopted it the same day: every client sets
+`_INBOX.<principal>` and the account's client and responder templates grant
+`_INBOX.{{name()}}.>` instead of `_INBOX.>` (NOTES §10hm).
+
+One run of the 134 failed immediately after the edit, before any of the 17 that followed,
+and the failing test was not captured. Recorded rather than hidden; the suite has a known
+timing test that flaked once under load in entry 12.
+
+---
+

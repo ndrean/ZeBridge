@@ -14,6 +14,11 @@ pub const ConnectOptions = struct {
     creds_path: ?[]const u8 = null,
     user: ?[]const u8 = null,
     password: ?[]const u8 = null,
+    /// §10hm: the prefix of every inbox this connection generates — reply subjects,
+    /// KV watchers, object reads, pull consumers. `_INBOX.<principal>` keeps them
+    /// inside a `_INBOX.<principal>.>` grant; the library's default `_INBOX` is one
+    /// space every principal listens in.
+    inbox_prefix: []const u8 = "_INBOX",
 };
 
 /// §10fh: a chain object read through a PULL consumer, a few chunks at a time — the
@@ -166,6 +171,7 @@ pub const Transport = struct {
             .user_creds = opts.creds_path,
             .user = opts.user,
             .password = opts.password,
+            .inbox_prefix = opts.inbox_prefix,
             .reconnect = .{ .allow_reconnect = true },
         });
         errdefer self.conn.deinit();
