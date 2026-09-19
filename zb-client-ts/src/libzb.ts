@@ -30,7 +30,7 @@ import { sqliteDialect, type Dialect } from './dialect.ts';
 import { v7 as uuidv7 } from 'uuid';
 import { heartbeatPayload,
   seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica as coreFullPredates,
-  scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire,
+  scopeSeeding, advancePosition, foreignKeyFailureKind, lsnToNumber, pgTsToWire, tableSet,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgEngineValues, chainUpsertSql, chainRowParams,
   type SqlStep,
   fkClausesFor, createTableSteps, rebuildSteps, diffColumns, keyShape, typeShape, retypedColumns, isReadOnlySql,
@@ -90,7 +90,15 @@ export interface ZeBridgeConfig {
   /// §10fb: follow only these tables. Default: every table the schemas bucket names
   /// (a job that wants one table of a tenant with a big one should say so — libzb
   /// takes the same list).
-  tables?: string[];
+  /// §10hn: the tables to seed and tail — a list, or '*' for every published table.
+  /// Absent, nothing is followed (and the log says so): a client declares what it
+  /// holds, or says '*'. The same rule as libzb's `tables`; core.tableSet decides.
+  tables?: string[] | '*';
+  /// §10hn (libzb §10hj): tables held ON DEMAND — the schema arrives and the local
+  /// table is created, nothing seeds it, no stream is tailed for it; rows come only
+  /// through `ingest` answering this client's own `request`s. A table in both lists
+  /// is on-demand.
+  ondemandTables?: string[];
   /// §10fb: rows per transaction when a chain step seeds a table (default 50 000;
   /// 0 = one transaction for the step). Bounds memory and how long the lock is held.
   seedChunkRows?: number;
@@ -113,6 +121,18 @@ export interface ZeBridgeConfig {
   /// (`zb-client-ts/node`); any other host brings its own pair.
   storage?: StorageFactory;
   connect?: (opts: any) => Promise<TransportConnection>;
+}
+
+/// `{"$bin": "<base64>"}` → bytes; anything else as it is. The marker a JSON answer
+/// uses for a byte column (PROTOCOL §2), decoded before the chain upsert.
+function binMarker(v: any): any {
+  if (v && typeof v === 'object' && !Array.isArray(v) && typeof v.$bin === 'string' && Object.keys(v).length === 1) {
+    const bin = atob(v.$bin);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  return v;
 }
 
 export type TableState = {
@@ -269,6 +289,10 @@ export class ZeBridge {
   private dialect!: Dialect;
 
   private syncedTables = new Map<string, TableState>();
+  /// §10hn: the on-demand tables (deduplicated); cdcFilters, the seed planner and the
+  /// epoch re-seed all skip these.
+  private ondemandSet = new Set<string>();
+  private warnedNoTables = false;
   /// §10go: how long to wait before re-opening a tail on a stream whose gap could not be
   /// healed (no chain past the hole yet). Doubles while it stays blocked, cleared once healed.
   private gapBackoffMs = 0;
@@ -416,6 +440,66 @@ export class ZeBridge {
     const payload = mutationPayload(op, key, values, version, this.clientIdValue);
     await this.rawMutation(table, op, id, version, payload);
     return { version };
+  }
+
+  /// §10hn (libzb §10hj): ask a service — request/reply on a subject this principal may
+  /// publish to (`query.<tenant>.<name>`), the answer as parsed JSON. No stream, no
+  /// position: what a service answers is its own contract.
+  public async request(subject: string, payload: unknown, timeoutMs = 5_000): Promise<any> {
+    if (!this.nc) throw new Error('not connected');
+    const m = await this.nc.request(subject, new TextEncoder().encode(JSON.stringify(payload ?? {})), { timeout: timeoutMs });
+    return JSON.parse(new TextDecoder().decode(m.data));
+  }
+
+  /// §10hn (libzb §10hj): keep an answer in a table this client holds — rows in the
+  /// chain object's shape (`columns`, `rows`), applied through the chain's
+  /// version-guarded upsert so a stale answer never overwrites a newer row. With a
+  /// `scope`, the rows of the table inside the scope's WHERE that the answer did not
+  /// carry are deleted: the area the answer is complete for. Returns the rows applied.
+  public async ingest(
+    table: string,
+    answer: { columns: string[]; rows: any[][] },
+    scope?: { where: string; params?: any[] } | null,
+  ): Promise<number> {
+    await this.initializeStorage();
+    const state = this.syncedTables.get(table);
+    if (!state) throw new Error(`table ${table} is not held`);
+    const cols = answer.columns ?? [];
+    const rows = answer.rows ?? [];
+    for (const c of cols) if (!state.columns.includes(c)) throw new Error(`schema behind: ${table} has no column ${c}`);
+    const vcol = state.versionColumn && cols.includes(state.versionColumn) ? state.versionColumn : null;
+    const q = chainUpsertSql(table, cols, state.pkCols, vcol);
+    const pkIdx = state.pkCols.length === 1 ? cols.indexOf(state.pkCols[0]) : -1;
+    const arrIdx = this.dialect.name === 'postgres' ? (state.arrayCols ?? []).map((c) => cols.indexOf(c)).filter((i) => i >= 0) : [];
+    const vecIdx = this.dialect.name === 'postgres' ? (state.vecCols ?? []).map((vc) => ({ i: cols.indexOf(vc.name), vc })).filter((x) => x.i >= 0) : [];
+    let applied = 0;
+    const seen: any[] = [];
+    await this.transaction(async (txExec) => {
+      for (const row of rows) {
+        if (!Array.isArray(row)) continue;
+        // A service answers in JSON, which has no bytes: a cell `{"$bin": "<base64>"}`
+        // is a byte string (PROTOCOL §2; libzb's ingest reads the same marker).
+        const params = chainRowParams(row.map(binMarker));
+        for (const i of arrIdx) {
+          const v = params[i];
+          if (typeof v === 'string' && v.startsWith('[')) { try { params[i] = pgArrayLiteral(JSON.parse(v)); } catch { /* not JSON: as is */ } }
+        }
+        for (const { i, vc } of vecIdx) if (isBytes(params[i])) params[i] = vecLiteral(vc.kind, params[i], vc.bits);
+        await txExec(q, ...params);
+        if (pkIdx >= 0) seen.push(params[pkIdx]);
+        applied++;
+      }
+      // The scope: what the answer did not carry inside it is gone.
+      if (scope?.where && pkIdx >= 0) {
+        await txExec(`CREATE TEMP TABLE IF NOT EXISTS _zbz_seen (k${this.dialect.name === 'postgres' ? ' text' : ''})`);
+        await txExec(`DELETE FROM _zbz_seen`);
+        for (const k of seen) await txExec(`INSERT INTO _zbz_seen (k) VALUES (?)`, k);
+        await txExec(`DELETE FROM ${table} WHERE (${scope.where}) AND "${state.pkCols[0]}" NOT IN (SELECT k FROM _zbz_seen)`, ...(scope.params ?? []));
+        await txExec(`DELETE FROM _zbz_seen`);
+      }
+    });
+    this.triggerChange(table);
+    return applied;
   }
 
   public onChange(table: string, cb: (ev?: any) => void): () => void {
@@ -977,9 +1061,21 @@ export class ZeBridge {
               const isLastOfInitialReplay = !initialized && (!entry || entry.delta === 0);
               try {
                 if (!entry || !entry.key) continue;
-                // §10fb: a table not in the caller's list is never created, seeded or
-                // followed — its descriptor, tombstone and suspension are all skipped.
-                if (this.config.tables?.length && !this.config.tables.includes(entry.key)) continue;
+                // §10fb/§10hn: a table outside the declared set is never created, seeded
+                // or followed — its descriptor, tombstone and suspension are all skipped.
+                // The set is core.tableSet's: `tables` (a list or '*') plus `ondemandTables`.
+                {
+                  const ts = tableSet(this.config.tables, this.config.ondemandTables, [entry.key]);
+                  this.ondemandSet = new Set(ts.ondemand);
+                  const held = ts.follow.includes(entry.key) || ts.ondemand.includes(entry.key);
+                  if (!held) {
+                    if (!this.config.tables && !this.config.ondemandTables?.length && !this.warnedNoTables) {
+                      this.warnedNoTables = true;
+                      this.appendLog('SCHEMA', `no tables declared — following nothing; pass tables: '*' to follow every published table, or a list`, 'WARNING');
+                    }
+                    continue;
+                  }
+                }
 
                 if (entry.operation === 'DEL' || entry.operation === 'PURGE') {
                   await this.dropLocalTable(entry.key, 'KV key removed');
@@ -1357,6 +1453,7 @@ export class ZeBridge {
   /// zebridge_reseed() ran upstream. Forget the watermark, so the table seeds a fresh
   /// full (now, if connected; else at the next connect's gap check).
   private async reseedIfEpochMoved(table: string, epoch: number) {
+    if (this.ondemandSet.has(table)) return; // §10hn: unseeded by design
     try {
       const r = await this.run(`SELECT seed_epoch FROM _zebridge_generations WHERE tbl = ?`, table);
       if (!r?.length) return;
@@ -1906,6 +2003,7 @@ export class ZeBridge {
     const open = this.config.grammar.open_tenant || '_default';
     const out = new Set<string>();
     for (const [table, st] of this.syncedTables) {
+      if (this.ondemandSet.has(table)) continue; // §10hn: nothing is tailed for it
       if (!st.tenantColumn) {
         if (!cfg || streamName === cfg.public) out.add(`${prefix}.${table}.>`);
         continue;
@@ -1966,15 +2064,31 @@ export class ZeBridge {
     const c = await js.consumers.get(`OBJ_${bucket}`, { filter_subjects: [`$O.${bucket}.C.${info.nuid}`] });
     const parts: Uint8Array[] = [];
     let got = 0;
-    const iter = await c.fetch({ max_messages: info.chunks, expires: 30_000 });
-    for await (const m of iter) {
-      parts.push(m.data); got += m.data.length;
-      if (parts.length >= info.chunks) break;
+    // §10hn: a BOUNDED pull per request, never the whole object. One request for all
+    // 730 chunks of a 95 MB object had the server write 95 MB at once; while this
+    // process was applying rows through a synchronous driver the socket went
+    // undrained, the server's per-connection pending passed its 64 MB limit and it
+    // cut the connection as a slow consumer ("Slow Consumer Detected: MaxPending of
+    // 67108864 Exceeded", twice, once per attempt — 24 then 18 chunks arrived). libzb
+    // reads a few chunks per pull (§10fh) and never trips it; so does this now: at
+    // most 8 MiB in flight per request, the loop asking again until the last chunk.
+    while (parts.length < info.chunks) {
+      const remaining = info.chunks - parts.length;
+      // nats.js takes ONE bound per request, count or bytes. Count: a chunk is at most
+      // 128 KiB, so 64 of them is the 8 MiB; a byte bound sized from the payload refused
+      // full chunks, whose wire size counts the headers too ("exceeds maxbytes").
+      const iter = await c.fetch({ max_messages: Math.min(remaining, 64), expires: 30_000 });
+      let inThis = 0;
+      for await (const m of iter) {
+        parts.push(m.data); got += m.data.length; inThis++;
+        if (parts.length >= info.chunks) break;
+      }
+      // Stopped, not abandoned: an open fetch keeps its subscription until `expires`,
+      // and `close()` drains every subscription — eleven seeds left `close()` waiting
+      // most of a minute each (measured: a fifteen-minute hang-up on the wall).
+      try { (iter as any).stop(); } catch { /* already ended */ }
+      if (inThis === 0) break; // the request expired empty: the chunks are not there
     }
-    // Stopped, not abandoned: an open fetch keeps its subscription until `expires`,
-    // and `close()` drains every subscription — eleven seeds left `close()` waiting
-    // most of a minute each (measured: a fifteen-minute hang-up on the wall).
-    try { (iter as any).stop(); } catch { /* already ended */ }
     if (parts.length !== info.chunks || got !== info.size) {
       throw new Error(`object ${name}: ${parts.length}/${info.chunks} chunks, ${got}/${info.size} bytes`);
     }
@@ -2403,6 +2517,7 @@ export class ZeBridge {
       } catch { /* fresh replica */ }
       const tableRoutes: Record<string, { route: string; sharedRoute?: string; seeded: boolean }> = {};
       for (const table of this.syncedTables.keys()) {
+        if (this.ondemandSet.has(table)) continue; // §10hn: never seeded from a chain
         // Same null as above: a tenant-scoped table this principal cannot route is
         // left out of the seeding decision entirely rather than routed to a stream
         // name built from an empty token.

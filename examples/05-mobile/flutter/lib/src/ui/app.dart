@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 import '../data/zebridge_worker.dart';
 
 class ZeBridgeApp extends StatelessWidget {
-  const ZeBridgeApp({Key? key}) : super(key: key);
+  const ZeBridgeApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -23,7 +23,7 @@ class ZeBridgeApp extends StatelessWidget {
 }
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({Key? key}) : super(key: key);
+  const HomeScreen({super.key});
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -86,14 +86,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // transport), and the operator-mode broker takes a creds file, nothing else.
       // Dev copy: the file straight from the repository, like the library path.
       final worker = await ZeBridgeWorker.spawn({
-        "url": "nats://127.0.0.1:4222",
-        "credsPath":
-            "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/alice.creds",
-        // a writable place: a GUI app's working directory is not one
-        "dbPath": "${Directory.systemTemp.path}/zb-flutter-alice.sqlite3",
-        "principal": "alice",
-        "tables": ["counter_public", "counter_tenant", "app_users", "app_orders"],
-        "clientId": "flutter-client"
+        "natsUrl": "nats://127.0.0.1:4222",
+        "credsPath": "/Users/nevendrean/code/zig/ZeBridge/scripts/native/creds/bob.creds",
+        "dbPath": "${Directory.systemTemp.path}/zb-flutter-bob.sqlite3",
+        "principal": "bob",
+        "tables": ["test_types", "counter_public", "counter_tenant", "app_users", "app_orders"],
+        "seedStreaming": true,
       });
       if (!mounted) {
         await worker.close();
@@ -410,7 +408,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                         return ListTile(
                           title: Text('${o['item']} x ${o['count']}'),
                           subtitle: Text(
-                              '$u ${o['note'] != null ? " · " + o['note'] : ""}'),
+                              '$u${o['note'] != null ? ' · ${o['note']}' : ''}'),
                         );
                       },
                     )

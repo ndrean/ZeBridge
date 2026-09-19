@@ -403,7 +403,7 @@ def main():
     a = ap.parse_args()
     VALHALLA = a.valhalla.rstrip("/")
     lib = load_lib()
-    card = Card(lib, {"url": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db, "engine": a.engine,
+    card = Card(lib, {"natsUrl": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db, "engine": a.engine,
                       "tables": TABLES, "clientId": "poi-service", "heartbeatMs": 0, "seedStreaming": True})
     t0 = time.time()
     s = card.sync()

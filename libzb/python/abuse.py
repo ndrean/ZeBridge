@@ -37,7 +37,7 @@ def check(name, cond):
 # anyway — it is the one that used to leak the database handle.
 def opts(db):
     return json.dumps({
-        "url": "nats://127.0.0.1:1",           # nothing listening, on purpose
+        "natsUrl": "nats://127.0.0.1:1",           # nothing listening, on purpose
         "credsPath": "/nonexistent.creds",
         "dbPath": db,
         "principal": "abuse",

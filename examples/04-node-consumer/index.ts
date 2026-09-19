@@ -32,6 +32,8 @@ const zb = new ZeBridge({
   principal: PRINCIPAL,
   creds: CREDS,
   heartbeatMs: Number(process.env.ZB_HEARTBEAT_MS ?? 30_000), // PROTOCOL §9
+  // §10hn: every published table, said out loud — nothing is followed by default.
+  tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : '*',
   durable: true,
   // ── the two seams ──
   storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: '/tmp' }) : nodeStorage,

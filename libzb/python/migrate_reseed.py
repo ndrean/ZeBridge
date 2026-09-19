@@ -32,7 +32,7 @@ def check(label, cond):
 db = "/tmp/zb-migrate-reseed.sqlite3"; rm_sqlite(db)
 uid = str(uuid.uuid4())
 h = lib.zb_client_open(json.dumps({
-    "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
+    "natsUrl": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-migrate-reseed",
     "tables": ["users", "test_types"], "heartbeatMs": 0}).encode())
 try:

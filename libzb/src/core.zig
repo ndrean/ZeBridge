@@ -1261,6 +1261,51 @@ pub fn rebuildSteps(a: std.mem.Allocator, table: []const u8, cols: std.json.Arra
 /// core.ts isReadOnlySql (§10di). libzb enforces read-only `query` with a READONLY
 /// SQLite connection; this is the same rule as a pure function, so the fixtures pin
 /// one meaning of "reads" for both clients.
+/// §10hn: which tables a client holds, and how — the ONE rule both clients follow
+/// (core.ts `tableSet`, fixtures `tableSet`). `tables` is a list, or every published
+/// table when `all` is set (`keys` is the schemas bucket's key list, consulted only
+/// then); `ondemand` is held for its schema alone — no seed, no tail. Absent both:
+/// nothing. A name in both is on-demand. Deduplicated; a declared name the bucket does
+/// not know yet is kept.
+pub const TableSet = struct { follow: []const []const u8, ondemand: []const []const u8 };
+
+pub fn tableSet(a: std.mem.Allocator, all: bool, tables: []const []const u8, ondemand: []const []const u8, keys: []const []const u8) !TableSet {
+    var od: std.ArrayListUnmanaged([]const u8) = .empty;
+    for (ondemand) |t| {
+        if (t.len == 0 or contains(od.items, t)) continue;
+        try od.append(a, t);
+    }
+    var follow: std.ArrayListUnmanaged([]const u8) = .empty;
+    const src = if (all) keys else tables;
+    for (src) |t| {
+        if (t.len == 0 or contains(od.items, t) or contains(follow.items, t)) continue;
+        try follow.append(a, t);
+    }
+    return .{ .follow = try follow.toOwnedSlice(a), .ondemand = try od.toOwnedSlice(a) };
+}
+
+fn contains(list: []const []const u8, t: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, t)) return true;
+    return false;
+}
+
+fn writeStrArr(a: std.mem.Allocator, out: *std.ArrayList(u8), items: []const []const u8) !void {
+    try out.append(a, '[');
+    for (items, 0..) |s, i| {
+        if (i > 0) try out.append(a, ',');
+        try writeJsonString(a, out, s);
+    }
+    try out.append(a, ']');
+}
+
+pub fn writeTableSet(a: std.mem.Allocator, out: *std.ArrayList(u8), ts: TableSet) !void {
+    try out.appendSlice(a, "{\"follow\":");
+    try writeStrArr(a, out, ts.follow);
+    try out.appendSlice(a, ",\"ondemand\":");
+    try writeStrArr(a, out, ts.ondemand);
+    try out.append(a, '}');
+}
+
 pub fn isReadOnlySql(sql: []const u8) bool {
     var buf: [4096]u8 = undefined;
     if (sql.len > buf.len) return false;

@@ -10,8 +10,32 @@ lifecycle lesson learned in one is not silently missing from the other.
 | local engine | SQLite (a file), PostgreSQL (`dbUrl`, §10fd; seeds through COPY, §10fe), or DuckDB (`engine: "duckdb"`, §10fl; built in with `-Dduckdb=true`; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
 | reply inbox | `_INBOX.<principal>` (§10hm), from the `inbox_prefix` connection option — replies, KV watchers, object reads and pull consumers all land there, inside the principal's `_INBOX.<principal>.>` grant | the same, through nats.js's `inboxPrefix` |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
-| tables followed | the explicit `tables` list | every key in the `schemas` bucket, or the `tables` list when given (§10fb) |
+| tables followed | **one rule, both clients (§10hn, `core.tableSet`, fixtures `tableSet`)**: `tables` is a list, or `"*"` for every published table; `ondemandTables` are held for their schema only, never seeded or tailed (§10hj), rows through `ingest`; a name in both is on-demand; absent both, nothing is followed — and the TS client says so in its log | the same |
 | tenants followed | every membership in `$KV.tenants.<principal>` (a set, §10fn): one chain per tenant into one table, one CDC stream per tenant, watermarks per (table, tenant); `zb_client_join`/`zb_client_leave` at runtime; a join the credentials cannot read is refused, and a stream that becomes unreadable is set aside alone and named in the poll report (`unreadable`, §10fq) | the FIRST membership only, with a warning when there are more (parity queued) |
+
+## The configuration keys, side by side
+
+The same idea carries the same name; where the two cannot share one, the difference is
+in kind, not spelling.
+
+| key | libzb (`opts_json`) | zb-client-ts (`ZeBridgeConfig`) |
+| --- | --- | --- |
+| `natsUrl` | ✅ | ✅ |
+| the credential | `credsPath`, a file the library reads | `creds`, the file's CONTENT — a browser has no file to point at |
+| `principal` | ✅ | ✅ (also the inbox prefix on both, §10hm) |
+| `password` | — (creds only) | ✅ dev shape, user/password |
+| `grammarHash` | ✅ refuses to open on a mismatch | ✅ |
+| `grammar` / `bridgeUrl` | — (compiled in) | ✅ the grammar object, or the bridge to fetch it from |
+| `tables`, `ondemandTables` | ✅ list or `"*"` | ✅ the same rule (§10hn) |
+| the replica | `dbPath` (SQLite or DuckDB file), `dbUrl` (PostgreSQL) | `storage` factory; `engine` `sqlite` \| `pglite` |
+| `engine` | `sqlite` \| `duckdb`; `dbUrl` implies postgres | `sqlite` \| `pglite` |
+| `clientId` | ✅ stable across restarts, the msg_id prefix and tiebreak value | — generated per instance (`c-<random>`): the tiebreak value changes on every restart, the outbox's stored msg_ids do not |
+| `heartbeatMs` | ✅ (0 = off) | ✅ |
+| `seedChunkRows` | ✅ | ✅ |
+| `seedStreaming`, `seedStreamingAboveBytes` | ✅ §10fh, the phone's bounded seed | — (the whole object is read; §10hn bounds the read to 8 MiB per pull) |
+| `bulkCdc`, `bulkStatement`, `cdcBatchEvents` | — (the DuckDB path is always bulk, SQLite per event; §10hg) | ✅ §10gp knobs |
+| `durable` | — (host-driven) | ✅ durable consumers |
+| `transport`, `connect`, `zstdDecompress` | — (linked) | ✅ the seams |
 
 ## Pinned by fixtures — identical by construction
 

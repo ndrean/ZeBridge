@@ -36,7 +36,7 @@ class Replica:
         lib.zb_client_close.argtypes = [ctypes.c_uint64]
         for name, args in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
             f = getattr(lib, "zb_client_" + name); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + args
-        opts = {"url": NATS_URL, "credsPath": CREDS, "dbPath": DB, "principal": PRINCIPAL, "clientId": "duckdb-job", "tables": TABLES, "heartbeatMs": 0}
+        opts = {"natsUrl": NATS_URL, "credsPath": CREDS, "dbPath": DB, "principal": PRINCIPAL, "clientId": "duckdb-job", "tables": TABLES, "heartbeatMs": 0}
         self.h = lib.zb_client_open(json.dumps(opts).encode())
         if not self.h: sys.exit("libzb open failed (NATS_URL, creds, library path?)")
 

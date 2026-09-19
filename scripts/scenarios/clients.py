@@ -35,7 +35,7 @@ class Lib:
             f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + a
         lib.zb_client_wipe.restype, lib.zb_client_wipe.argtypes = ctypes.c_int, [ctypes.c_uint64]
         self.h = lib.zb_client_open(json.dumps({
-            "url": zb.nats_server(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
+            "natsUrl": zb.nats_server(), "credsPath": str(creds) if creds else zb.creds_for(principal), "dbPath": db,
             "principal": principal, "clientId": client_id, "tables": list(tables), "heartbeatMs": 0,
             **({"dbUrl": db_url} if db_url else {}), **({"seedStreaming": True} if seed_streaming else {}),
             **({"seedChunkRows": seed_chunk_rows} if seed_chunk_rows is not None else {}),

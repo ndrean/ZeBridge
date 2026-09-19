@@ -45,7 +45,7 @@ pg(f"CREATE TABLE public.{PROBE} (uid uuid PRIMARY KEY, txt text, updated_at tim
    f"publication => '{pub}', dry_run => false)")
 time.sleep(2)  # the descriptor for the newborn reaches $KV.schemas
 h = lib.zb_client_open(json.dumps({
-    "url": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
+    "natsUrl": os.environ.get("NATS_URL", "nats://127.0.0.1:4222"), "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-migrate-poll",
     "tables": ["users", "test_types", PROBE], "heartbeatMs": 0}).encode())
 try:

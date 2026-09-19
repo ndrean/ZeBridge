@@ -297,7 +297,7 @@ def client_check(cli: list, url: str, run_dir: pathlib.Path, load_end: float, wa
 
     threading.Thread(target=sample_file, daemon=True).start()
     t0 = time.time()
-    h = lib.zb_client_open(json.dumps({"url": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0, "engine": engine,
+    h = lib.zb_client_open(json.dumps({"natsUrl": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0, "engine": engine,
                                        "clientId": "firehose-check", "principal": "firehose", "seedStreaming": True}).encode())
     if not h:
         return {"error": "open failed"}

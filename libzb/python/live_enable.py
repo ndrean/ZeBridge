@@ -57,7 +57,7 @@ DBS = []
 def open_client(tables, tag):
     db = f"/tmp/zb-live-{tag}.sqlite3"
     rm_sqlite(db); DBS.append(db)
-    h = lib.zb_client_open(json.dumps({"url": NATS_URL, "credsPath": creds("omar"), "dbPath": db, "principal": "omar", "clientId": "py-live-" + tag, "tables": tables}).encode())
+    h = lib.zb_client_open(json.dumps({"natsUrl": NATS_URL, "credsPath": creds("omar"), "dbPath": db, "principal": "omar", "clientId": "py-live-" + tag, "tables": tables}).encode())
     if not h:
         sys.exit(f"open failed for client '{tag}' (is the native stack up?)")
     return h

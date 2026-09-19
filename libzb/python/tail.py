@@ -31,7 +31,7 @@ def q(h, sql, params=()):
 db = "/tmp/zb-tail.sqlite3"
 rm_sqlite(db)
 h = lib.zb_client_open(json.dumps({
-    "url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
+    "natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar",
     "clientId": "py-tail", "tables": ["users", "salaries", "test_types"]}).encode())
 ok = True

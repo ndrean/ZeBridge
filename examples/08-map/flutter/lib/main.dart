@@ -14,13 +14,15 @@
 /// every call on it — sync, the blocking poll loop, query, mutate, request, ingest,
 /// flush, close — runs on ONE long-lived worker isolate (`zebridge_worker.dart`). The
 /// UI isolate only sends messages.
+library;
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show debugPrint;
+// import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -109,8 +111,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     Map<String, dynamic>? best;
     for (final st in stations) {
       if (st['outage'] != null) continue;
-      if (best == null || double.parse(_price(st)) < double.parse(_price(best)))
+      if (best == null ||
+          double.parse(_price(st)) < double.parse(_price(best))) {
         best = st;
+      }
     }
     return best;
   }
@@ -180,7 +184,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   Future<void> _initZeBridge() async {
     try {
       final worker = await ZeBridgeWorker.spawn({
-        'url': 'nats://127.0.0.1:4222',
+        'natsUrl': 'nats://127.0.0.1:4222',
         'credsPath': _credsPath,
         'dbPath': _dbPath,
         'principal': 'omar',
@@ -206,9 +210,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         if (r.changedTables.contains(_table)) _refresh();
       });
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         setState(
             () => status = 'not connected: $e — showing what the phone holds');
+      }
     }
   }
 
@@ -293,8 +298,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       await _refresh();
       await _askFuel(at);
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         setState(() => status = 'ask: $e — showing what the phone holds');
+      }
     } finally {
       asking = false;
     }

@@ -79,7 +79,7 @@ class Client:
     def __init__(self, lib, url: str, db: pathlib.Path, name: str):
         self.lib, self.db, self.name = lib, db, name
         self.h = lib.zb_client_open(json.dumps({
-            "url": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0,
+            "natsUrl": url, "dbPath": str(db), "tables": [TABLE], "heartbeatMs": 0,
             "clientId": name, "principal": "incremental", "seedStreaming": True,
         }).encode())
         if not self.h:

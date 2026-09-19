@@ -70,7 +70,7 @@ def main() -> int:
 
     db = "/tmp/zb-grammar-served.sqlite3"
     _env.rm_sqlite(db)
-    opts = {"url": zb.nats_server(), "credsPath": zb.creds_for("omar"), "dbPath": db,
+    opts = {"natsUrl": zb.nats_server(), "credsPath": zb.creds_for("omar"), "dbPath": db,
             "principal": "omar", "clientId": "py-grammar-served", "tables": ["users"]}
     h = lib.zb_client_open(json.dumps({**opts, "grammarHash": served_hash}).encode())
     if not h:

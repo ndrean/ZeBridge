@@ -110,7 +110,7 @@ async def main():
                 zb.bad("no fleet monitor in the probe"); return 1
 
             h = lib.zb_client_open(json.dumps({
-                "url": zb.nats_server(), "credsPath": zb.creds_for(WHO),
+                "natsUrl": zb.nats_server(), "credsPath": zb.creds_for(WHO),
                 "dbPath": db,
                 "principal": WHO, "clientId": "py-fleet", "tables": ["users", TABLE],
                 "heartbeatMs": 1000}).encode())

@@ -63,7 +63,7 @@ import {
   fkTextDiffers, viewSteps, indexSyncPlan,
   planKeyChange, planUpsert, planUpdate, planExists, planDelete, pgArrayLiteral, chainUpsertSql, chainRowParams,
   planCdcBulk,
-  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding,
+  seedGateDrops, tombstoned, planFromManifest, fullPredatesReplica, scopeSeeding, tableSet,
   advancePosition, foreignKeyFailureKind, pgTsToWire, lsnToNumber,
   outboxWatermarkGate,
   heartbeatPayload,
@@ -169,6 +169,9 @@ for (const c of fx.createTable) {
 for (const c of fx.rebuildSteps) {
   test(`rebuildSteps: ${c.name}`, () =>
     assert.deepEqual(rebuildSteps(c.table, c.cols, c.pkCols, c.fks, c.existing, c.strict ? { strict: true } : {}), c.steps));
+}
+for (const c of fx.tableSet) {
+  test(`tableSet: ${c.name}`, () => assert.deepEqual(tableSet(c.tables ?? null, c.ondemand ?? null, c.keys ?? []), c.want));
 }
 for (const c of fx.readOnlySql) {
   test(`readOnlySql: ${c.name}`, () => assert.equal(isReadOnlySql(c.sql), c.allowed));

@@ -108,6 +108,8 @@ const zb = new ZeBridge({
   principal: PRINCIPAL,
   password: PASSWORD,
   creds: CREDS,
+  // §10hn: every published table, said out loud — nothing is followed by default.
+  tables: '*',
   durable: DURABLE,
   engine: ENGINE,
 });

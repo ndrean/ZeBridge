@@ -124,7 +124,7 @@ async def run() -> int:
             if not br.wait_for_log("Replication started successfully", timeout=40):
                 zb.bad("probe bridge did not start"); return 1
             h = lib.zb_client_open(json.dumps({
-                "url": zb.nats_server(), "credsPath": zb.creds_for(PRINCIPAL),
+                "natsUrl": zb.nats_server(), "credsPath": zb.creds_for(PRINCIPAL),
                 "dbPath": db,
                 "principal": PRINCIPAL, "clientId": "py-txn-kill", "tables": [TABLE]}).encode())
             if not h:

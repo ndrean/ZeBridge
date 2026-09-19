@@ -221,6 +221,19 @@ pub const Transport = struct {
         return try a.dupe(u8, entry.value);
     }
 
+    /// §10hn: every key of a KV bucket, `a`-owned — the schemas bucket, for a client
+    /// that follows every published table (`tables: "*"`). nats.zig lists through a
+    /// headers-only watch; the grant every client holds covers it.
+    pub fn kvKeys(self: *Transport, a: std.mem.Allocator, bucket: []const u8) ![]const []const u8 {
+        var kv = try self.js.kvBucket(bucket);
+        defer kv.deinit();
+        var res = try kv.keys();
+        defer res.deinit();
+        const out = try a.alloc([]const u8, res.value.len);
+        for (res.value, 0..) |k, i| out[i] = try a.dupe(u8, k);
+        return out;
+    }
+
     /// Object store get: the whole object, `a`-owned. The store chunks at
     /// 128 KiB — no NATS max_payload limit applies to a seed (§10n).
     pub fn objectGetBytes(self: *Transport, a: std.mem.Allocator, bucket: []const u8, name: []const u8) ![]u8 {
@@ -286,4 +299,3 @@ test "live: creds connect, schema KV, chain manifest, chain object" {
     const is_zstd = blob.len >= 4 and b0 == 0x28 and blob[1] == 0xb5 and blob[2] == 0x2f and blob[3] == 0xfd;
     try std.testing.expect(is_map or is_zstd);
 }
-

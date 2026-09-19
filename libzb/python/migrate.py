@@ -30,7 +30,7 @@ def check(label, cond):
 
 db = "/tmp/zb-migrate.sqlite3"
 rm_sqlite(db)
-h = lib.zb_client_open(json.dumps({"url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
+h = lib.zb_client_open(json.dumps({"natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-migrate", "tables": ["users", "salaries", "test_types"]}).encode())
 uid = str(uuid.uuid4())
 try:

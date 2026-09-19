@@ -109,7 +109,7 @@ async def run() -> int:
 
     host_py = pathlib.Path(os.environ.get("TMPDIR", "/tmp")) / "zb_client_kill_host.py"
     host_py.write_text(HOST)
-    cfg = json.dumps({"url": zb.nats_server(), "credsPath": zb.creds_for(PRINCIPAL),
+    cfg = json.dumps({"natsUrl": zb.nats_server(), "credsPath": zb.creds_for(PRINCIPAL),
                       "dbPath": str(DB),
                       "principal": PRINCIPAL, "clientId": "py-client-kill", "tables": [TABLE]})
 

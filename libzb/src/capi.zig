@@ -28,8 +28,10 @@
 //!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"unreadable":[…]?} — live tail, blocks ≤ wait_ms
 //!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
 //!   char* zb_client_leave(uint64_t h, const char* tenant);         // {"tenants":[…]} — drop one: its rows, watermarks, tail
-//! `opts_json`: url, credsPath, dbPath, principal, tables (array, parents first),
-//! ondemandTables (§10hj: schema yes, seed and tail no — filled by `zb_client_ingest`),
+//! `opts_json`: natsUrl, credsPath, dbPath, principal, tables (array, parents first — or
+//! the string "*": every published table, §10hn; absent: nothing is followed),
+//! ondemandTables (§10hj: schema yes, seed and tail no — filled by `zb_client_ingest`;
+//! a name in both lists is on-demand),
 //! clientId (stable across restarts — it is the msg_id prefix), grammarHash
 //! (optional: the hash the host received from /enroll or GET /grammar; a mismatch
 //! refuses to open). The grammar itself is compiled in — `zb_grammar_hash()` says
@@ -255,6 +257,16 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
     if (eq(u8, name, "rebuildSteps")) {
         return try core.valueToString(a, try core.rebuildSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array, try strArrField(a, args, "existing"), boolField(args, "strict")));
     }
+    if (eq(u8, name, "tableSet")) {
+        const tv = args.object.get("tables") orelse .null;
+        const all = tv == .string and eq(u8, tv.string, "*");
+        const tables: []const []const u8 = if (tv == .array) try core.strArrPub(a, tv.array) else &.{};
+        const ov = args.object.get("ondemand") orelse .null;
+        const ondemand: []const []const u8 = if (ov == .array) try core.strArrPub(a, ov.array) else &.{};
+        const keys = try strArrField(a, args, "keys");
+        try core.writeTableSet(a, &out, try core.tableSet(a, all, tables, ondemand, keys));
+        return out.items;
+    }
     if (eq(u8, name, "readOnlySql")) {
         return if (core.isReadOnlySql(args.object.get("sql").?.string)) "true" else "false";
     }
@@ -335,6 +347,8 @@ const ClientBox = struct {
     principal: [:0]u8,
     client_id: [:0]u8,
     tables: []const []const u8,
+    ondemand: []const []const u8,
+    all_tables: []const []const u8,
 
     fn destroy(self: *ClientBox, a: std.mem.Allocator) void {
         self.c.deinit();
@@ -346,6 +360,9 @@ const ClientBox = struct {
         a.free(self.client_id);
         for (self.tables) |t| a.free(t);
         a.free(self.tables);
+        for (self.ondemand) |t| a.free(t);
+        a.free(self.ondemand);
+        a.free(self.all_tables);
         a.destroy(self);
     }
 };
@@ -387,7 +404,8 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
 
     // One acquire per statement, its errdefer on the next line — and here they FIRE,
     // because this function returns an error union.
-    const url = try a.dupeZ(u8, str.get(o, "url", "nats://127.0.0.1:4222"));
+    // §10hn: `natsUrl`, the one name both clients share.
+    const url = try a.dupeZ(u8, str.get(o, "natsUrl", "nats://127.0.0.1:4222"));
     errdefer a.free(url);
     const creds = try a.dupeZ(u8, str.get(o, "credsPath", ""));
     errdefer a.free(creds);
@@ -430,34 +448,43 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         const f = o.object.get("seedStreamingAboveBytes") orelse break :blk 8 * 1024 * 1024;
         break :blk if (f == .integer and f.integer >= 0) @intCast(f.integer) else 8 * 1024 * 1024;
     };
-    // The tables, parents first, each its own allocation so the box can free them.
-    const tv = o.object.get("tables");
-    const ntab: usize = if (tv != null and tv.? == .array) tv.?.array.items.len else 0;
-    const tables = try a.alloc([]const u8, ntab);
+    // §10hn: which tables this client holds — core.tableSet, the rule both clients
+    // share. `tables` is a list (parents first) or "*", every published table;
+    // `ondemandTables` are held for their schema only (§10hj); a name in both is
+    // on-demand; names are deduplicated. Each survivor is its own allocation so the
+    // box can free it; the intermediates live in a scratch arena.
+    var sa = std.heap.ArenaAllocator.init(a);
+    defer sa.deinit();
+    const ta = sa.allocator();
+    const tv = o.object.get("tables") orelse Value.null;
+    const follow_all = tv == .string and std.mem.eql(u8, tv.string, "*");
+    const odv = o.object.get("ondemandTables") orelse Value.null;
+    const set = try core.tableSet(ta, false, if (tv == .array) try core.strArrPub(ta, tv.array) else &.{}, if (odv == .array) try core.strArrPub(ta, odv.array) else &.{}, &.{});
+    const tables = try a.alloc([]const u8, set.follow.len);
     var filled: usize = 0;
     errdefer {
         for (tables[0..filled]) |t| a.free(t);
         a.free(tables);
     }
-    if (ntab > 0) for (tv.?.array.items) |v| {
-        tables[filled] = try a.dupe(u8, if (v == .string) v.string else "");
+    for (set.follow) |t| {
+        tables[filled] = try a.dupe(u8, t);
         filled += 1;
-    };
-
-    // §10hj: on-demand tables — followed for their schema, seeded and tailed by nobody,
-    // filled by the host's own requests. Part of `tables` for the schema walk.
-    const odv = o.object.get("ondemandTables");
-    const nod: usize = if (odv != null and odv.? == .array) odv.?.array.items.len else 0;
-    const ondemand = try a.alloc([]const u8, nod);
-    if (nod > 0) for (odv.?.array.items, 0..) |v, i| {
-        ondemand[i] = try a.dupe(u8, if (v == .string) v.string else "");
-    };
-    const all_tables = if (nod == 0) tables else blk: {
-        const all = try a.alloc([]const u8, ntab + nod);
-        @memcpy(all[0..ntab], tables);
-        @memcpy(all[ntab..], ondemand);
-        break :blk all;
-    };
+    }
+    const ondemand = try a.alloc([]const u8, set.ondemand.len);
+    var od_filled: usize = 0;
+    errdefer {
+        for (ondemand[0..od_filled]) |t| a.free(t);
+        a.free(ondemand);
+    }
+    for (set.ondemand) |t| {
+        ondemand[od_filled] = try a.dupe(u8, t);
+        od_filled += 1;
+    }
+    // The union drives the schema walk; `ondemand` alone decides seed and tail.
+    const all_tables = try a.alloc([]const u8, tables.len + ondemand.len);
+    errdefer a.free(all_tables);
+    @memcpy(all_tables[0..tables.len], tables);
+    @memcpy(all_tables[tables.len..], ondemand);
 
     const box = try a.create(ClientBox);
     errdefer a.destroy(box);
@@ -476,6 +503,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .engine = engine,
             .principal = principal,
             .tables = all_tables,
+            .follow_all = follow_all,
             .ondemand = ondemand,
             .client_id = client_id,
         }),
@@ -486,6 +514,8 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .principal = principal,
         .client_id = client_id,
         .tables = tables,
+        .ondemand = ondemand,
+        .all_tables = all_tables,
     };
     return box;
 }

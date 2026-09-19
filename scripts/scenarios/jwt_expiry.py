@@ -114,7 +114,7 @@ def main() -> int:
             # ── 3. inside the TTL: a normal client ───────────────────────────
             _env.rm_sqlite(db)
             h = lib.zb_client_open(json.dumps({
-                "url": zb.nats_server(), "credsPath": str(creds_path),
+                "natsUrl": zb.nats_server(), "credsPath": str(creds_path),
                 "grammarHash": payload["grammar_hash"],   # §10dq: the check, not the bytes
                 "dbPath": db, "principal": PRINCIPAL, "clientId": "py-jwt-expiry",
                 "tables": ["test_types"]}).encode())

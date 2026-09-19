@@ -39,6 +39,7 @@ async function runClient(c: (typeof SPEC)[number], stagger: number): Promise<voi
     principal: c.principal,
     creds: readFileSync(`${REPO}scripts/native/creds/${c.principal}.creds`, 'utf8'),
     grammar: GRAMMAR,
+    tables: '*', // §10hn: every published table, said out loud
     storage: c.engine === 'pglite'
       ? makePgliteStorage({ persist: true, dataDir: c.db })
       : (_: string) => nodeStorage(c.db),

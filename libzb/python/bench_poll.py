@@ -32,7 +32,7 @@ def pg(sql):
 
 db = "/tmp/zb-bench-poll.sqlite3"
 rm_sqlite(db)
-h = lib.zb_client_open(json.dumps({"url": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
+h = lib.zb_client_open(json.dumps({"natsUrl": "nats://127.0.0.1:4222", "credsPath": creds("omar"),
     "dbPath": db, "principal": "omar", "clientId": "py-bench",
     "tables": ["users", "salaries", "test_types"]}).encode())
 uid = str(uuid.uuid4())

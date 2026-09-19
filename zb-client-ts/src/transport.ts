@@ -15,6 +15,8 @@ export interface TransportConnection {
   close(): Promise<void>;
   status(): AsyncIterable<unknown>;
   subscribe(subject: string): AsyncIterable<any>;
+  /// §10hn: request/reply — the on-demand `request` (a `query.<tenant>.<name>` ask).
+  request(subject: string, data: Uint8Array, opts?: { timeout?: number }): Promise<{ data: Uint8Array }>;
   rtt(): Promise<number>;
 }
 

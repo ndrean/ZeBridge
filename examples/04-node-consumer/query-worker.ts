@@ -30,7 +30,7 @@ const zb = new ZeBridge({
   creds: readFileSync(process.env.ZB_CREDS ?? `${REPO}scripts/native/creds/${PRINCIPAL}.creds`, 'utf8'),
   heartbeatMs: 0,
   durable: true,
-  tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : undefined,
+  tables: process.env.ZB_TABLES ? process.env.ZB_TABLES.split(',').map((t) => t.trim()).filter(Boolean) : '*', // §10hn
   storage: ENGINE === 'pglite' ? makePgliteStorage({ persist: true, dataDir: DB }) : (_: string) => nodeStorage(DB),
   connect: nodeConnect,
 });

@@ -37,7 +37,7 @@ db = "/tmp/zb-index-card.sqlite3"
 rm_sqlite(db)
 
 h = lib.zb_client_open(json.dumps({
-    "url": "nats://127.0.0.1:4222",
+    "natsUrl": "nats://127.0.0.1:4222",
     "credsPath": creds("omar"),
     "dbPath": db,
     "principal": "omar",

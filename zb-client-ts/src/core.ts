@@ -808,6 +808,31 @@ export function diffColumns(
 
 const WRITE_WORDS = /\b(insert|update|delete|replace|drop|alter|create|attach|detach|vacuum|reindex|truncate)\b/;
 
+/// §10hn: which tables a client holds, and how — the ONE rule both clients follow.
+///
+///   tables      the tables to seed and tail: a list, or '*' for every published table
+///   ondemand    the tables held for their schema only — no seed, no tail; rows arrive
+///               only through `ingest` answering the client's own requests
+///   keys        every published table (the schemas bucket's keys) — consulted for '*'
+///
+/// The result's `follow` is what gets seeded and tailed, `ondemand` what does not.
+/// Absent both: nothing is held — a client declares what it wants, or says '*'. A
+/// table in both lists is on-demand: on-demand wins. Names are deduplicated, and a
+/// declared name the bucket does not know yet is kept (its schema may arrive later).
+export function tableSet(
+  tables: string[] | '*' | null | undefined,
+  ondemand: string[] | null | undefined,
+  keys: readonly string[],
+): { follow: string[]; ondemand: string[] } {
+  const od: string[] = [];
+  for (const t of ondemand ?? []) if (t && !od.includes(t)) od.push(t);
+  const odSet = new Set(od);
+  const follow: string[] = [];
+  const src: readonly string[] = tables === '*' ? keys : (tables ?? []);
+  for (const t of src) if (t && !odSet.has(t) && !follow.includes(t)) follow.push(t);
+  return { follow, ondemand: od };
+}
+
 export function isReadOnlySql(sql: string): boolean {
   let s = sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
   s = s.replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""').toLowerCase().trim();

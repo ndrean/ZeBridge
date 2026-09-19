@@ -55,6 +55,11 @@ pub const Options = struct {
     /// moments, so no order can fully protect a child chain), re-enables them
     /// after, and reports surviving violations loudly.
     tables: []const []const u8,
+    /// §10hn: follow EVERY published table — the schemas bucket's keys, re-read on each
+    /// sync, new keys joining live. `tables` is then ignored except as the on-demand
+    /// list's complement. Convenient and dangerous in equal measure: a DBA enabling a
+    /// table changes what this replica downloads, with no deploy on this side.
+    follow_all: bool = false,
     /// §10hj: tables held ON DEMAND — the schema arrives like any table's and the local
     /// table is created from it, but nothing seeds it and no stream is tailed for it.
     /// Rows come only as answers to the host's own `request`s, applied through `ingest`
@@ -220,6 +225,10 @@ pub const SyncClient = struct {
     /// as "in the chain" — replica 1 row, PostgreSQL 13.
     restarted: std.StringHashMapUnmanaged(void) = .empty,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
+    /// §10hn: the tables this replica holds — `opts.tables` (the declared union) or,
+    /// with `follow_all`, the schemas bucket's keys as last listed; arena-owned, grows
+    /// only when a new key appears.
+    followed: []const []const u8 = &.{},
     /// §10do: UPDATEs judged `stale` whose columns may still be rebased onto the
     /// winning row, keyed by msg_id; strings live in the client arena (rare, small).
     rebase: std.StringArrayHashMapUnmanaged(Rebase) = .empty,
@@ -305,6 +314,7 @@ pub const SyncClient = struct {
             .st = undefined,
             .ro = undefined,
             .opts = opts,
+            .followed = opts.tables,
         };
         errdefer self.arena.deinit();
 
@@ -878,7 +888,8 @@ pub const SyncClient = struct {
         var sa = std.heap.ArenaAllocator.init(self.a);
         defer sa.deinit();
         const a = sa.allocator();
-        for (self.opts.tables) |table| {
+        if (self.opts.follow_all) try self.refreshFollowed(a);
+        for (self.followed) |table| {
             const bytes = (try self.t.kvGet(a, self.kv_schemas, table)) orelse {
                 std.debug.print("schema missing for {s}\n", .{table});
                 continue;
@@ -1062,6 +1073,32 @@ pub const SyncClient = struct {
         std.debug.print("{s}: dropped locally — the table was dropped upstream\n", .{table});
     }
 
+    /// §10hn: `tables: "*"` — the followed set is the schemas bucket's key list, plus
+    /// the on-demand names. Only NEW keys are added, into the client-lifetime arena, so a
+    /// sync with nothing new allocates nothing that outlives it.
+    fn refreshFollowed(self: *SyncClient, a: std.mem.Allocator) !void {
+        const keys = self.t.kvKeys(a, self.kv_schemas) catch |err| {
+            std.debug.print("schemas: keys not listed ({s}) — following what is known\n", .{@errorName(err)});
+            return;
+        };
+        for (keys) |k| try self.follow(k);
+    }
+
+    fn follows(self: *SyncClient, table: []const u8) bool {
+        for (self.followed) |t| if (std.mem.eql(u8, t, table)) return true;
+        return false;
+    }
+
+    /// Add one table to the followed set (no-op when present), arena-owned.
+    fn follow(self: *SyncClient, table: []const u8) !void {
+        if (table.len == 0 or self.follows(table)) return;
+        const ca = self.aa();
+        const grown = try ca.alloc([]const u8, self.followed.len + 1);
+        @memcpy(grown[0..self.followed.len], self.followed);
+        grown[self.followed.len] = try ca.dupe(u8, table);
+        self.followed = grown;
+    }
+
     /// Drain the schemas watch: every descriptor that changed since the last poll,
     /// applied through the same path `sync()` uses. Non-blocking (1 ms). Opens the
     /// watch on first use — after the grammar named the bucket.
@@ -1081,10 +1118,9 @@ pub const SyncClient = struct {
                 else => return err,
             }) orelse break;
             defer entry.deinit();
-            const mine = for (self.opts.tables) |tb| {
-                if (std.mem.eql(u8, tb, entry.key)) break true;
-            } else false;
-            if (!mine or entry.isDeleted()) continue;
+            // §10hn: with `follow_all` a key never seen before joins the set right here.
+            if (self.opts.follow_all and !entry.isDeleted()) try self.follow(entry.key);
+            if (!self.follows(entry.key) or entry.isDeleted()) continue;
             const val = std.json.parseFromSliceLeaky(Value, a, entry.value, .{}) catch continue;
             const key = try a.dupe(u8, entry.key);
             self.applyDescriptor(a, key, val) catch |err| {
@@ -1223,7 +1259,7 @@ pub const SyncClient = struct {
         // whole pass (`reseed_pending`), so one tenant with no chain yet kept the shared
         // stream "gapped" for ever, and every sibling re-seeded on every poll.
         var blocked: std.StringArrayHashMapUnmanaged(void) = .empty;
-        for (self.opts.tables) |table| {
+        for (self.followed) |table| {
             if (self.isOnDemand(table)) continue; // §10hj: never seeded from a chain
             const st = self.states.get(table) orelse continue;
             const shared_gapped = if (st.shared_route) |sr| gapped.contains(sr) else false;
@@ -1265,7 +1301,7 @@ pub const SyncClient = struct {
         // the replica or the re-seed, a shape the replica lacks, a failed step — the
         // next poll asks again. Unseeded is not synced (the TS rule), and a poll loop
         // that never re-asks would follow CDC on an empty table forever.
-        outer: for (self.opts.tables) |table| {
+        outer: for (self.followed) |table| {
             if (self.isOnDemand(table)) continue; // §10hj: unseeded by design, not a gap
             const st = self.states.get(table) orelse continue;
             for (self.tenantsFor(st)) |tenant| {

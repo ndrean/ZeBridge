@@ -14442,10 +14442,76 @@ asked and routed (E10 in 97 ms, the road in 139 ms), the leaf still answered 20 
 locally, and the Node consumer seeded twenty tables from chain objects — every one of
 those reads is an inbox delivery. `crosstenant.py`, `tenant_kv.py` and `probe.py` pass.
 
-Two things seen and not chased. The TypeScript client cannot read the `osm_pois` chain
-object (95 MB, 730 chunks): it stops at 18 chunks with the object unreadable, while libzb
-reads the same object and seeds 2.1M rows — the push-versus-pull difference §10fh solved
-on the Zig side, not yet on the TypeScript one. And a principal name longer than 57 bytes
-would push its prefix past the library's 64-byte bound and be refused at connect, which
-is a loud failure rather than a silent shared inbox, and the right way round.
+Two things seen. A principal name longer than 57 bytes would push its prefix past the
+library's 64-byte bound and be refused at connect — a loud failure rather than a silent
+shared inbox, the right way round.
+
+And a failure explained after a first wrong guess. During that Node consumer run
+`osm_pois` failed with `chain object osm_pois-g3-full unreadable: 18/730 chunks`, and the
+first explanation written here — that the TypeScript client cannot read a 95 MB object
+where libzb can — was FALSE: all 730 chunk messages are present in the bucket, and the
+same libraries as the same principal read the whole object in isolation, 730 of 730,
+95,636,578 bytes, 53 ms. The server's log had the cause all along: `Slow Consumer
+Detected: MaxPending of 67108864 Exceeded`, twice, once per attempt (24 then 18 chunks
+arrived). The reader asked for all 730 chunks in ONE pull request, the server wrote
+95 MB at once, the process was applying tens of thousands of rows through a synchronous
+SQLite driver and did not drain the socket, and the server cut the connection at its
+64 MB per-connection limit. libzb pulls a few chunks at a time (§10fh) and never trips
+it; the TypeScript reader does the same now — 64 chunks (8 MiB) per request, looping
+(§10hn), after two wrong turns worth a line each: nats.js takes one bound per request,
+count or bytes, never both; and a byte bound sized from the payload refuses a full
+chunk, whose wire size counts its headers ("message size exceeds maxbytes"). With the
+count bound the same Node consumer seeded all twenty tables, `osm_pois` from chain g13
+with its 2,105,597 rows, and the hub logged no slow consumer. Not an inbox matter: eighteen chunks did arrive through the narrowed inbox, and nineteen
+other tables seeded from the same bucket in the same run.
+
+## 10hn. One rule for which tables a client holds, on both clients (2026-09-19)
+
+The two clients disagreed on the one question a client is asked first. libzb followed
+exactly its `tables` list and nothing without one; zb-client-ts followed every key of
+the schemas bucket when the list was absent. The Node example, declaring nothing, seeded
+the 2.1M points the map holds on demand — and would seed whatever a DBA enables next,
+with no deploy on its side. The map's on-demand shape (§10hj) existed on libzb only.
+
+The rule, once, in both cores (`core.tableSet`, fixtures `tableSet`, 10 cases):
+
+* `tables` is a list, or `"*"`: every published table, the schemas bucket's keys,
+  new ones joining live. The star is automatic and dangerous in equal measure; it has to
+  be written.
+* `ondemandTables` are held for their schema — the local table exists — and nothing
+  seeds or tails them; rows come only through `ingest` answering the client's own
+  `request`. A name in both lists is on-demand: on-demand wins.
+* Absent both, nothing is held. A client declares what it wants or says `"*"`; the
+  TypeScript client logs it when it follows nothing, since the old default was silent.
+* Deduplicated; a declared name the bucket does not know yet is kept.
+
+libzb gained `follow_all` and a resolved `followed` set: the bucket's keys listed on each
+sync (`kvKeys`, a headers-only watch under the grant every client holds), new keys
+joining from the schema watch, the four loops over the declared list now over the
+resolved one. The C ABI parses `"*"`, runs both lists through `tableSet`, and frees what
+it duplicated. zb-client-ts gained the same two keys, the on-demand set that
+`cdcFilters`, the seed planner and the epoch re-seed skip, and the pair the map needs:
+`request` on the connection seam and `ingest` — the chain's version-guarded upsert
+through `chainRowParams`, the scope's deletion through a temp table, `triggerChange` at
+the end. Six Node consumers and the web consumer say `tables: '*'` out loud.
+
+Measured on the dev hub. libzb, `tables: "*"` with `osm_pois` on demand: 21 tables held
+and 20 seeded in 2.1 s (fuel_prices 49,191 chain rows, 31,136 live), `osm_pois` created
+and empty; the star also met eleven tombstoned or column-less schema keys and skipped
+each aloud. zb-client-ts, `ondemandTables: ['osm_pois']` and no `tables`: one table held,
+a `request` answered 500 points in 73 ms, `ingest` kept 500, a complete answer of 10 with
+the area as scope left exactly 10 — the scope's deletion — and the PostGIS point arrived
+as a 25-byte blob through the `{"$bin"}` marker. Conformance 208 of 208 on the Zig side,
+214 of 214 on the TypeScript side; libzb 28 of 30 with 2 skipped, as before.
+
+The configuration keys were compared while at it (CLIENTS.md, a table). Same name where
+the idea is the same; the one spelling left is `url` against `natsUrl`, and the rest
+differ in kind: a creds PATH against the creds CONTENT (a browser has no file), a
+database path against a storage factory, `duckdb` against `pglite`. That one spelling
+went too: libzb reads `natsUrl` and nothing else, and every host in the repository —
+scenarios, Python tools, both Flutter apps, the README's example — was renamed in one
+pass rather than teaching the library two names for one thing. One gap is more than
+spelling: the TypeScript client generates its `clientId` per instance, so its tiebreak
+value changes on every restart, where libzb's is stable by contract. The outbox's stored
+msg_ids do not depend on it; the tiebreak column does. Recorded, not fixed.
 

@@ -50,7 +50,7 @@ def main():
         finally:
             lib.zb_free(ptr)
 
-    h = lib.zb_client_open(json.dumps({"url": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db,
+    h = lib.zb_client_open(json.dumps({"natsUrl": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db,
                                        "ondemandTables": [TABLE], "clientId": "poi-phone", "heartbeatMs": 0}).encode())
     if not h:
         sys.exit("open failed")

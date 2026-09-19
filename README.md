@@ -6,7 +6,7 @@
 
 **What is it?**: ZeBridge is a bidirectional single PostgreSQL-to-local-database synchronization layer for offline-first applications. PostgreSQL remains authoritative; consumers optimistically mutate local state and eventually converge with PostgreSQL through durable, replayable change distribution. It uses NATS/JetSteam to solve the distribution problem.
 
-A two-pillar architecture where consumers build upon the client library.
+ZeBridge has a two-pillar architecture where you run a daemon between your Postgres master server and a NATS server, and where consumers build upon the client library.
 
 ```mermaid
 flowchart LR
@@ -25,8 +25,8 @@ flowchart LR
 
     subgraph Edge["Consumer"]
         Lib(("libzb"))
-        SQL[("Local")]
-        App["mobile<br>browser<br>service"]
+        SQL[("SQLite<br>PGlite/PG<br>DuckDB")]
+        App["mobile<br>browser<br>microVM"]
         Lib <-->SQL
         Lib <-->App
 
@@ -37,21 +37,21 @@ flowchart LR
     style NATS fill:#10b981,stroke:#059669,color:#000
 ```
 
-**Local_DB supported flavours**: standard SQLite, PGlite or PostgreSQL, DuckDB.
+**Local_DB supported flavours**: standard `SQLite`, `PGlite` or `PostgreSQL` and `DuckDB`.
 
 **How does it work?**: The bridge architecture is split into two core components: a daemon and a client library that makes syncing a breeze.
 
 * the daemon `ZeBridge` (ZB): a Zig executable that connects to PostgreSQL (PG) and to NATS/JetStream (NATS). It streams schemas, seeds by chunks and sends PG changes onto NATS. It applies writes coming back from the consumer to the primary database.
 This is a lightweight process that can be started / stopped gracefully on the fly.
 * a client library: it abstracts all the NATS connection and the storage into local database. The consumer gets offline-first by default with an optimistic write. When the connection is on, the final result comes back naturally, echoed. No retry, almost nothing to do.
-The API of the library is tiny and comes in two flavours: a TypeScript library `zb-client-ts` and a native dynamic Zig library `libzb` with a  C ABI  FFI-compatible.
-The `TS` library uses a push model for reactivity whilst the Zig C ABI library uses a pull model because the host owns the library and polls on every tick. 
+The API of the library is tiny and comes in two flavours: a TypeScript library `zb-client-ts` and a native C-ABI dynamic Zig library `libzb` FFI-compatible.
+The `TS` library uses a push model for reactivity whilst the C ABI library uses a pull model because the host owns the library and polls on every tick. 
 
 **Consumers**: The client library can be integrated across a wide range of runtime environments.
 
 * Mobile Native Apps: Utilizing native SQLite with file system storage.
 * Browsers and Webapps: Leveraging OPFS support for SQLite-WASM or PGlite.
-* Backend Services /  micro-VM: For example, a warm micro-VM  with DuckDB following Postgres. One command to send and it runs analytics that responds via NATS. Zero cost for PostgreSQL.
+* Backend Services /  micro-VM: For example, a warm micro-VM  with DuckDB following Postgres. A  subscribed client runs one command and the micro-VM runs analytics against data stored in Postgres without reaching Postgres, and responds back via NATS. Zero cost for PostgreSQL.
 
 **Design**: This tool is built to keep synchronized replicas of a large volume of small to medium consumers via the NATS message broker with small to medium Postgres databases.
 The daemon is engineered to be light (~4 MB executable), fast, secure, stateless with near instant startup.
@@ -59,6 +59,7 @@ The daemon is engineered to be light (~4 MB executable), fast, secure, stateless
 * **Performance**: On a machine with colocated Postgres, ZeBridge and NATS, you can expect to push sustained rates of 50-150.000 req/s into NATS, ready to be consumed. You can expect a sustained rate of 5-20k mut/s writes back to Postgres,  boundary scoped.
 The consumer's local database ingress/egress for events depends a lot upon your device. Values around 15 +/- 5 k evt/s can be reached.
 The client library can seed at rates around 150-200.000 rows/s, and  it applies auto-streaming by chunks for large tables as we target constrained hosts.
+The prefered topology is NATS over TLS instead of terminating TLS at a reverse-proxy. Every client can join NATS over TLS and NATS and Zebridge communicate over TLS too.
 Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 * **Multiple instances**: run several instances of ZeBridge on the same Postgres publication, each with its own slot (and port). This enables you to follow large slow moving tables independently from small tables with heavy changes and optimize memory usage.
 * **Mobile-First Synchronization**: to optimize mobile bandwidth and reliability, we use a delta-chain process with aggressive compression for seeding and reseeding, and streaming when needed. This mitigates the need for long, expensive unitary CDC catchups.
@@ -69,7 +70,7 @@ Trust is earned. Test first. See [SPEED_TEST.md](#speed_test.md)
 * **Schema translation**: the replicas are built using schemas transcriptions. For PGlite, it is a native transcription. For SQLite, schemas are STRICT.
 * **PostGIS and pgvector ready**: support of`PostGIS` (binary EWKB as BLOB) and `pgvector` types out of the box.
 * **anti-client flood**: writes per client can be controlled in rate and backlog size, designed to evict new messages that could overflow the NATS buffer.
-* **replicas**: besides SQLite and PGlite/Postgres, the columnar database DuckDB can mirror Postgres (reads only).
+* **replicas**: besides SQLite and PGlite/Postgres, the columnar in-process database DuckDB can sync with Postgres to add analytical capabilities to the clients.
   
 **Opinionated**: Because our goal is to sync Postgres databases locally with strict predictability by preventing unexpected concurrent writes, we have a few rules that we stamped 💡 _good practices_: strict memory boundaries, safety enforced by tenant, enrollment by tenant and JWT, enforced schemas, foreign key cascade mitigation, conflict resolution via last-writer-win (LWW) enforced in the schema, table suspension, and controlled local writes propagation.
 
@@ -224,7 +225,7 @@ graph TD
     classDef internal fill:#dfd,stroke:#333,stroke-width:1px;
     classDef secure fill:#fdd,stroke:#333,stroke-width:1px;
     classDef telemetry fill:#fff2cc,stroke:#d6b656,stroke-width:1px;
-    classDef bridge fill:##bdf3ff,stroke:#ac0100,stroke-with:2px;
+    classDef bridge fill:#bdf3ff,stroke:#ac0100,stroke-with:2px;
     classDef maybe_external fill:#dfd,stroke:#333,stroke-width:2px,stroke-dasharray: 5 5;
 
     %% External Clients
@@ -241,12 +242,12 @@ graph TD
 
     %% External Connections to Cloudflare
     %%CF <==> |:8080 browser| NATS
-    MicroVM <==> |TLS| NATS
     MicroVM <==>LocalDuckDB
     %%PG -->|hot standby| PGREP
-    UserBrowser <==>|WSS| NATS
+    UserBrowser <==>|WSS| CF
     UserBrowser <==>LocalPGlite
     UserMobile <==> |TLS| NATS
+    MicroVM <==> |TLS| NATS
     UserMobile <==>LocalSQLite
     %%UserBrowser --> CF
     %%UserMobile --> CF
@@ -290,12 +291,13 @@ graph TD
     %%PG ==>|R|Bridge
     PG <==> Bridge
     Bridge <==>|Pub Sub  <br> TCP:4222| NATS
+    Sweeper -->PG
     
     %% HAProxy Internal Layer 7 Routing
     %%HA <==>|wss://localhost:8080| NATS
 
     %% Telemetry Data Flow
-    Prom -.-> |remote_writer| HA
+    %%Prom -.-> |remote_writer| Grafana
     Prom -.->|Scrapes:7777| NatsExp
     Prom -.->|Scrapes<br>:27434/metrics| Bridge
     NatsExp -.->|Monitors| NATS
@@ -303,19 +305,95 @@ graph TD
 <!-- </details> -->
 <br>
 
-You can test on a VPS with for example 6-vCPU, 24 GB RAM and 200GB NVMe SSD, and run comfortably the following stack: 
+```mermaid
+graph TD
+    classDef external fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef proxy fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef internal fill:#dfd,stroke:#333,stroke-width:1px;
+    classDef secure fill:#fdd,stroke:#333,stroke-width:1px;
+    classDef telemetry fill:#fff2cc,stroke:#d6b656,stroke-width:1px;
+    classDef daemon fill:#bdf3ff,stroke:#ac0100,stroke-width:2px;
 
-* a master `PostgreSQL`,
+    subgraph Mobile
+      UserMobile([mobile<br>--- libzb ---]):::external
+      LocalSQLite[(local<br>SQLite)]:::secure
+      UserMobile <==> LocalSQLite
+    end
+
+    subgraph Micro-VM
+      VM([micro-VM<br>--- libzb ---]):::external
+      LocalDuckDB[(local<br>DuckDB)]:::secure
+      VM <==> LocalDuckDB
+    end
+
+    subgraph Browser
+      B([Browser<br>---zb-client---]):::external
+      LocalLite[(PGlite<br>SQLite)]:::secure
+      B<==> LocalLite
+    end
+
+
+    CF(["wss://ws.dom.com -> :8080<br><br>https://bridge.dom.com"]):::proxy
+    CF@{ shape: cloud }
+    Grafana([Grafana <br>Cloud]):::telemetry
+    Grafana@{ shape: cloud }
+
+    subgraph VPS [Your VPS]
+        direction TB
+        HA([HAProxy<br>:443]):::proxy
+        NATS[NATS Server<br>TLS :4222<br>WSS :8080]:::internal
+        NATS@{ shape: data-store }
+        Bridge[[ZeBridge<br>:27434]]:::daemon
+        Sweeper[[Sweeper]]:::daemon
+        NatsExp([NATS<br>exporter<br>:7777]):::telemetry
+        PG[(Postgres<br>primary<br>:5432)]:::secure
+        Prom[(Prometheus)]:::telemetry
+    end
+
+    VM <==> |tls| NATS
+    B <==> |wss| CF
+    B <-.-> |https<br>bridge/enroll| CF
+    UserMobile <==>|tls :4222, <br>DNS only| NATS
+    CF <==>HA
+    CF <==>|Origin Rule <br>:8080| NATS
+    UserMobile -.->|https <br>bridge/enroll| CF
+    HA <-.->|http<br>/enroll, <br>/status| Bridge
+    Prom -.->|http<br>scrapes| NatsExp
+    NatsExp -.->|tcp:8222| NATS
+    NATS <==>|tls:4222| Bridge
+    PG <==> |tcp| Bridge
+    Sweeper --> |tcp| PG
+    Prom -.->|http<br>scrapes <br>/metrics| Bridge
+    Prom -.->|outbound| Grafana
+```
+
+**Routing**: given a domain 'dom.com', we use the subdomains 'nats', 'ws' and 'bridge' with the following routes:
+
+The Cloudlfare reverse-proxy routes https://bridge.dom.com → vps:443 (orange proxy, Long term CF certs).
+Cloudflare routes wss://ws.dom.com → vps:8080.
+NATS traffic is tls://nats.dom.com, joined directly (topology 2) and has its own LetsEncrypt ceritifactes, that can apply for both ws.dom.com->vps:8080 or nats.dom.com->tls:4222.
+
+
+|     client  |   address  |  route    |
+|    --  |   --  |  --    |
+| phone, native (libzb)  | tls://nats.dom.com:4222       | DNS only, straight to nat-servernats-server  |
+| browser        | wss://ws.dom.com, port 443 at Cloudflare | Cloudflare, then an Origin Rule to nats-server's websocket on 8080 |
+| anyone         | https://bridge.dom.com        | Cloudflare, then HAProxy on 443, then the bridge on 127.0.0.1:27434   |
+| Prometheus on the VPS | remote_write, outbound              | straight to Grafana Cloud, no inboud rule     |
+
+You can test on a VPS or bare metal with for example 6-vCPU, 24 GB RAM and 200GB NVMe SSD, and run comfortably the following stack: 
+
+* a master `PostgreSQL` (colocated in this example to communicate over plain TCP, but a remote on an EC2 instance over TLS is possible),
 * a `NATS` server and his companion `NATS-exporter` for telemetry,
 * a daemon `ZeBridge` on one publication, one slot
-* a TSDB `Prometheus` (scraping telemetry from ZeBridge and NATS-exporter and pushing to a cloud `Grafana`),
+* a TSDB `Prometheus` (scraping telemetry from ZeBridge and NATS-exporter, and pushing to a cloud `Grafana`),
 * the reverse-proxy `HAProxy` for TLS termination of the internal ZeBridge endpoint '/enroll', and let Prometheus push to a Grafana cloud,
 
 This can serve the following clients:
 
-* browsers with a local `PGlite` replica connects over WSS (via Cloudflare) to NATS,
-* mobiles with its native `SQLite` replica connects (via eg Cloudflare) to NATS over TLS,
-* a warm micro-VM with a `DuckDB` replica connects (via eg Cloudflare) to NATS over TLS.
+* browsers with a local `PGlite` (or `SQLite`) replica that connects over WSS to NATS,
+* mobiles with thier native in-process `SQLite` replica that connects to NATS over TLS,
+* a warm micro-VM with an in-process `DuckDB` replica for fast analytics that connects to NATS over TLS.
 
 ## The daemon
 
@@ -1198,7 +1276,7 @@ The Flutter example does exactly this (`examples/05-mobile/flutter/lib/src/data/
 ```dart
 // UI side: the worker owns the handle; every call is a message with an answer.
 final zb = await ZeBridgeWorker.spawn({
-  "url": "nats://127.0.0.1:4222",       // plain NATS over TCP: libzb has no websocket
+  "natsUrl": "nats://127.0.0.1:4222",       // plain NATS over TCP: libzb has no websocket
   "credsPath": "/path/to/alice.creds",  // the operator-mode broker takes nothing else
   "dbPath": "/a/writable/place/zb.sqlite3",
   "principal": "alice",
@@ -1871,6 +1949,7 @@ PGPASSWORD=s3cret psql -h localhost -U admin -d my_db -p 5432 \
   | step | status | detail |
   | -- | -- | -- |
   | width guard | would | zebridge_install_width_guard('users') — a row the change feed cannot carry is refused at write time: edge writes get a rejected verdict (SQLSTATE 23514), psql gets an ordinary ERROR. No-op on tables without unbounded columns. |
+  | version index | would | CREATE INDEX users_zb_version ON users (updated_at) — a delta then reads the rows since the last cut instead of the whole table. Costs: the build blocks writes on the table (on a large live table, run CREATE INDEX CONCURRENTLY on updated_at first and this step finds it), and updates that change updated_at are no longer HOT, so each update also writes every index. |
   | catalogue | would | zebridge_catalogue[users]: tenant_col=NULL(public) version_col=updated_at tombstone=- tiebreak=- generations=t — the bridge reads this at boot (env rules become overrides) and the generation producer per tick |
   | publication | already | my_pub already carries users |
   | T3 bridge | LIVE | nothing to do — the catalogue row this wrote reaches a running bridge through the WAL; it reconciles CDC_PUBLIC's subject filter, lifts the table's refusal and publishes its schema on the spot (NOTES §10bj). A bridge started later reads the same row at boot. |
@@ -1949,7 +2028,6 @@ Depending on the size of the published tables you wish to track, the maximum row
 
 **CDC**: The `RING_BUFFER_COUNT` is designed to buffer the received events during potential NATS jitters or outages. Its count depends naturally upon the emitting rate.
 The `BASE_BUF` is the max payload size, capped at 1MB.
-  | version index | would | CREATE INDEX users_zb_version ON users (updated_at) — a delta then reads the rows since the last cut instead of the whole table. Costs: the build blocks writes on the table (on a large live table, run CREATE INDEX CONCURRENTLY on updated_at first and this step finds it), and updates that change updated_at are no longer HOT, so each update also writes every index. |
 The `MAX_COLUMNS` is the maximum number of possible columns per table. Unset (the normal case), it is **auto-detected at boot** from the widest table in the publication, rounded up for migration headroom — not a fixed compile-time guess. Set it explicitly only to override that.
 
 ➡ It caps the event size, suspends a table and drives the total memory used.

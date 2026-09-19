@@ -18,6 +18,9 @@
 /// and `resume()` restarts it — `poll` then catches up on everything missed and
 /// `flush` sends what was written meanwhile. The outbox is what makes the pause
 /// harmless; iOS suspends the process anyway, Android and desktop do not.
+
+library;
+
 import 'dart:async';
 import 'dart:isolate';
 
@@ -28,8 +31,10 @@ class ZeBridgeWorker {
 
   final SendPort _toWorker;
   final ReceivePort _fromWorker;
+
   /// The first membership (sorted), or the open tenant.
   final String tenant;
+
   /// Every membership resolved at connect (§10fn); `join`/`leave` move it from here on.
   final List<String> tenants;
 
@@ -64,7 +69,8 @@ class ZeBridgeWorker {
           if (!ready.isCompleted) ready.completeError(Exception(m['error']));
           break;
         case 'report':
-          worker._reports.add(PollReport.fromJson(m['report'] as Map<String, dynamic>));
+          worker._reports
+              .add(PollReport.fromJson(m['report'] as Map<String, dynamic>));
           break;
         case 'reply':
           final c = worker._pending.remove(m['id'] as int);
@@ -78,9 +84,13 @@ class ZeBridgeWorker {
       }
     });
 
-    await Isolate.spawn(_workerMain, _Boot(fromWorker.sendPort, options, pollWaitMs));
+    await Isolate.spawn(
+        _workerMain, _Boot(fromWorker.sendPort, options, pollWaitMs));
     final info = await ready.future;
-    worker = ZeBridgeWorker._(toWorker!, fromWorker, (info['tenant'] as String?) ?? '—',
+    worker = ZeBridgeWorker._(
+        toWorker!,
+        fromWorker,
+        (info['tenant'] as String?) ?? '—',
         List<String>.from((info['tenants'] as List?) ?? const []));
     // keep the subscription alive with the worker
     worker._sub = sub;
@@ -99,35 +109,50 @@ class ZeBridgeWorker {
   }
 
   /// Reads against the replica: any SQL, answered as a list of maps.
-  Future<List<Map<String, dynamic>>> query(String sql, [List<dynamic> params = const []]) async {
+  Future<List<Map<String, dynamic>>> query(String sql,
+      [List<dynamic> params = const []]) async {
     final rows = await _call<dynamic>('query', {'sql': sql, 'params': params});
-    return (rows as List).map((r) => Map<String, dynamic>.from(r as Map)).toList();
+    return (rows as List)
+        .map((r) => Map<String, dynamic>.from(r as Map))
+        .toList();
   }
 
   /// The blessed write path: optimistic locally, sent at once, judged upstream.
   Future<void> mutate(String table, String op, Map<String, dynamic> key,
-      [Map<String, dynamic>? values]) =>
-      _call<dynamic>('mutate', {'table': table, 'mop': op, 'key': key, 'values': values});
+          [Map<String, dynamic>? values]) =>
+      _call<dynamic>(
+          'mutate', {'table': table, 'mop': op, 'key': key, 'values': values});
 
   /// Send the outbox and collect verdicts (the loop does this after every poll; call
   /// it yourself to wait for a verdict).
   Future<Map<String, dynamic>> flush(int waitMs) async =>
-      Map<String, dynamic>.from(await _call<dynamic>('flush', {'waitMs': waitMs}) as Map);
+      Map<String, dynamic>.from(
+          await _call<dynamic>('flush', {'waitMs': waitMs}) as Map);
 
   /// §10fn: follow one more tenant / drop one. Served between polls like the rest;
   /// a join seeds the tenant's chains before it answers, so it takes a moment.
-  Future<List<String>> join(String tenant) async =>
-      List<String>.from(await _call<dynamic>('join', {'tenant': tenant}) as List);
-  Future<List<String>> leave(String tenant) async =>
-      List<String>.from(await _call<dynamic>('leave', {'tenant': tenant}) as List);
+  Future<List<String>> join(String tenant) async => List<String>.from(
+      await _call<dynamic>('join', {'tenant': tenant}) as List);
+  Future<List<String>> leave(String tenant) async => List<String>.from(
+      await _call<dynamic>('leave', {'tenant': tenant}) as List);
 
   /// §10hj: ask a service (request/reply on the card's connection) — served between polls.
-  Future<Map<String, dynamic>> request(String subject, Map<String, dynamic> payload, {int timeoutMs = 5000}) async =>
-      Map<String, dynamic>.from(await _call<dynamic>('request', {'subject': subject, 'payload': payload, 'timeoutMs': timeoutMs}) as Map);
+  Future<Map<String, dynamic>> request(
+          String subject, Map<String, dynamic> payload,
+          {int timeoutMs = 5000}) async =>
+      Map<String, dynamic>.from(await _call<dynamic>('request', {
+        'subject': subject,
+        'payload': payload,
+        'timeoutMs': timeoutMs
+      }) as Map);
 
   /// §10hj: keep an answer in an on-demand table; returns the rows applied.
-  Future<int> ingest(String table, Map<String, dynamic> answer, [Map<String, dynamic>? scope]) async =>
-      (await _call<dynamic>('ingest', {'table': table, 'answer': answer, 'scope': scope}) as num).toInt();
+  Future<int> ingest(String table, Map<String, dynamic> answer,
+          [Map<String, dynamic>? scope]) async =>
+      (await _call<dynamic>(
+                  'ingest', {'table': table, 'answer': answer, 'scope': scope})
+              as num)
+          .toInt();
 
   /// Stop polling while the app is in the background; nothing touches the broker.
   void pause() => _toWorker.send({'op': 'pause'});
@@ -166,7 +191,11 @@ Future<void> _workerMain(_Boot boot) async {
     ZeBridge.init();
     zb = ZeBridge(boot.options);
     final info = zb.sync();
-    toUi.send({'type': 'ready', 'tenant': info['tenant'], 'tenants': info['tenants']});
+    toUi.send({
+      'type': 'ready',
+      'tenant': info['tenant'],
+      'tenants': info['tenants']
+    });
   } catch (e) {
     toUi.send({'type': 'fatal', 'error': e.toString()});
     commands.close();
@@ -185,18 +214,27 @@ Future<void> _workerMain(_Boot boot) async {
     void reply(dynamic result) {
       if (id != null) toUi.send({'type': 'reply', 'id': id, 'result': result});
     }
+
     void fail(Object e) {
-      if (id != null) toUi.send({'type': 'reply', 'id': id, 'error': e.toString()});
+      if (id != null) {
+        toUi.send({'type': 'reply', 'id': id, 'error': e.toString()});
+      }
     }
+
     try {
       switch (op) {
         case 'query':
-          reply(zb.query(m['sql'] as String, List<dynamic>.from(m['params'] as List? ?? const [])));
+          reply(zb.query(m['sql'] as String,
+              List<dynamic>.from(m['params'] as List? ?? const [])));
           break;
         case 'mutate':
-          zb.mutate(m['table'] as String, m['mop'] as String,
+          zb.mutate(
+              m['table'] as String,
+              m['mop'] as String,
               Map<String, dynamic>.from(m['key'] as Map),
-              m['values'] == null ? null : Map<String, dynamic>.from(m['values'] as Map));
+              m['values'] == null
+                  ? null
+                  : Map<String, dynamic>.from(m['values'] as Map));
           // sent at once: the report of the echo follows on a later poll
           reply(null);
           break;
@@ -204,11 +242,18 @@ Future<void> _workerMain(_Boot boot) async {
           reply(zb.flush(m['waitMs'] as int));
           break;
         case 'request':
-          reply(zb.request(m['subject'] as String, Map<String, dynamic>.from(m['payload'] as Map), m['timeoutMs'] as int));
+          reply(zb.request(
+              m['subject'] as String,
+              Map<String, dynamic>.from(m['payload'] as Map),
+              m['timeoutMs'] as int));
           break;
         case 'ingest':
-          reply(zb.ingest(m['table'] as String, Map<String, dynamic>.from(m['answer'] as Map),
-              m['scope'] == null ? null : Map<String, dynamic>.from(m['scope'] as Map)));
+          reply(zb.ingest(
+              m['table'] as String,
+              Map<String, dynamic>.from(m['answer'] as Map),
+              m['scope'] == null
+                  ? null
+                  : Map<String, dynamic>.from(m['scope'] as Map)));
           break;
         case 'join':
           reply(zb.join(m['tenant'] as String));
@@ -241,7 +286,9 @@ Future<void> _workerMain(_Boot boot) async {
     }
     try {
       final report = zb.poll(boot.pollWaitMs);
-      if (report.changedTables.isNotEmpty || report.seeded.isNotEmpty || report.unreadable.isNotEmpty) {
+      if (report.changedTables.isNotEmpty ||
+          report.seeded.isNotEmpty ||
+          report.unreadable.isNotEmpty) {
         toUi.send({
           'type': 'report',
           'report': {
@@ -256,7 +303,16 @@ Future<void> _workerMain(_Boot boot) async {
       zb.flush(0);
     } catch (e) {
       // the connection is gone, or the principal was revoked: say so, back off
-      toUi.send({'type': 'report', 'report': {'applied': 0, 'settled': 0, 'changed_tables': <String>[], 'seeded': <String>[], 'error': e.toString()}});
+      toUi.send({
+        'type': 'report',
+        'report': {
+          'applied': 0,
+          'settled': 0,
+          'changed_tables': <String>[],
+          'seeded': <String>[],
+          'error': e.toString()
+        }
+      });
       await Future.delayed(const Duration(seconds: 1));
     }
     // Yield: the command port's listener runs here, between two polls.
