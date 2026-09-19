@@ -90,3 +90,7 @@ zb-client-ts/zebridge_*.sqlite3-*
 /node_modules/
 
 examples/08-map/**/.env*
+examples/08-map/flutter/data/
+# Python bytecode, anywhere (the three per-directory rules above are covered by this one)
+__pycache__/
+*.pyc
