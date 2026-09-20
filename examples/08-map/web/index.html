@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ZeMap in a browser — fuel and the shared route</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+      :root { color-scheme: light dark; font: 14px/1.45 system-ui, sans-serif; }
+      body { margin: 0; display: grid; grid-template-rows: auto 1fr auto; height: 100dvh; }
+      header { display: flex; gap: 12px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #8884; flex-wrap: wrap; }
+      header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+      #map { width: 100%; height: 100%; }
+      footer { padding: 6px 12px; border-top: 1px solid #8884; font-size: 12px; opacity: .85; white-space: pre-wrap; }
+      .tag { background: #1f6feb; color: #fff; border-radius: 10px; padding: 1px 7px; font-size: 11px; }
+      .price { background: #fff; border: 1px solid #0003; border-radius: 6px; padding: 0 4px; font-weight: 600; white-space: nowrap; box-shadow: 0 1px 2px #0003; }
+      .price.cheap { background: #1a7f37; color: #fff; border-color: #1a7f37; }
+      .price.out { background: #ddd; color: #555; }
+      button, select { font: inherit; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>ZeMap <span class="tag" id="who">connecting…</span></h1>
+      <label>fuel
+        <select id="fuel">
+          <option value="">off</option>
+          <option>SP95</option><option>SP98</option><option>E10</option>
+          <option>E85</option><option>Gazole</option><option>GPLc</option>
+        </select>
+      </label>
+      <button id="routeMode">route: off</button>
+      <span id="routeInfo"></span>
+    </header>
+    <div id="map"></div>
+    <footer id="status">starting…</footer>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

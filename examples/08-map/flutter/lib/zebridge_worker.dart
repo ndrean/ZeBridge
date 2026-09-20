@@ -147,6 +147,12 @@ class ZeBridgeWorker {
       }) as Map);
 
   /// §10hj: keep an answer in an on-demand table; returns the rows applied.
+  /// §10ho: a core function of the library, by name — `mergeRegisters` for the route.
+  Future<Map<String, dynamic>> call(
+          String fn, Map<String, dynamic> args) async =>
+      Map<String, dynamic>.from(
+          await _call<dynamic>('call', {'fn': fn, 'args': args}) as Map);
+
   Future<int> ingest(String table, Map<String, dynamic> answer,
           [Map<String, dynamic>? scope]) async =>
       (await _call<dynamic>(
@@ -246,6 +252,10 @@ Future<void> _workerMain(_Boot boot) async {
               m['subject'] as String,
               Map<String, dynamic>.from(m['payload'] as Map),
               m['timeoutMs'] as int));
+          break;
+        case 'call':
+          reply(ZeBridge.call(
+              m['fn'] as String, Map<String, dynamic>.from(m['args'] as Map)));
           break;
         case 'ingest':
           reply(zb.ingest(

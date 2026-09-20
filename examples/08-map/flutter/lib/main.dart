@@ -100,11 +100,23 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   String? fuel;
   List<Map<String, dynamic>> stations = const [];
 
-  /// Route mode: two taps, then the service asks Valhalla for the road between them.
+  /// Route mode (§10ho): the ONE shared route, edited by two people at once. The row
+  /// `routes.doc` is a map of registers — `start` and `end`, each with the writer's
+  /// stamp and name; a tap writes this phone's register merged into the document it
+  /// last saw (the library's `mergeRegisters`, through `zb_call`), and the pins are
+  /// drawn from the DOCUMENT as CDC delivers it, never from the tap itself. So what is
+  /// on screen is what the row holds, whoever moved it last.
   bool routeMode = false;
-  final routePoints = <LatLng>[];
+  Map<String, dynamic> routeDoc = {};
+  final routeMine = <String,
+      dynamic>{}; // this phone's own registers, shipped whole on every write
+  int routeRounds = 0;
+  String routeNext = 'start';
+  List<MapEntry<String, LatLng>> routePoints = const [];
   List<LatLng> routeLine = const [];
   String routeInfo = '';
+  static const _routeId = '11111111-1111-4111-8111-111111111111';
+  static const _routeWriter = 'phone-omar';
   final mapController = MapController();
 
   Map<String, dynamic>? get _cheapest {
@@ -189,6 +201,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         'dbPath': _dbPath,
         'principal': 'omar',
         'ondemandTables': [_table],
+        'tables': [
+          'routes'
+        ], // §10ho: the shared route, seeded and tailed like any row
         'clientId': 'flutter-map',
       });
       if (!mounted) {
@@ -208,6 +223,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
           return;
         }
         if (r.changedTables.contains(_table)) _refresh();
+        if (r.changedTables.contains('routes')) _onRouteChanged();
       });
     } catch (e) {
       if (mounted) {
@@ -345,29 +361,105 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     }
   }
 
-  /// Route mode: the first tap is the start, the second the end; the service answers
-  /// with the road between them from Valhalla (examples/08-map/valhalla). A third tap
-  /// starts over.
-  Future<void> _routeTap(LatLng at) async {
+  /// A stamp every editor orders the same way: RFC 3339 UTC with SIX fractional
+  /// digits — Dart prints three when the microseconds are zero, and "…123Z" would sort
+  /// AFTER "…123456Z".
+  static String _stampNow() {
+    final s = DateTime.now().toUtc().toIso8601String();
+    final dot = s.indexOf('.');
+    final frac = s.substring(dot + 1, s.length - 1);
+    return '${s.substring(0, dot + 1)}${frac.padRight(6, '0')}Z';
+  }
+
+  /// The document as the local row holds it, and the pins from it.
+  Future<void> _readRoute() async {
     final w = zb;
     if (w == null) return;
-    if (routePoints.length >= 2) {
-      routePoints.clear();
-      routeLine = const [];
+    final rows = await w
+        .query('SELECT doc, last_writer FROM routes WHERE id = ?', [_routeId]);
+    if (rows.isEmpty) return;
+    final raw = rows.first['doc'];
+    final doc = raw is String
+        ? (jsonDecode(raw) as Map<String, dynamic>)
+        : Map<String, dynamic>.from(raw as Map? ?? {});
+    final pins = <MapEntry<String, LatLng>>[];
+    for (final key in const ['start', 'end']) {
+      final v = doc[key]?['v'];
+      if (v is Map && v['lat'] is num && v['lng'] is num) {
+        pins.add(MapEntry(
+            key,
+            LatLng(
+                (v['lat'] as num).toDouble(), (v['lng'] as num).toDouble())));
+      }
     }
-    setState(() => routePoints.add(at));
-    if (routePoints.length < 2) {
-      setState(() => routeInfo = 'tap the destination');
-      return;
+    final writers = [
+      for (final k in const ['start', 'end'])
+        if (doc[k] != null) '$k by ${doc[k]['w']}'
+    ].join(', ');
+    if (mounted) {
+      setState(() {
+        routeDoc = doc;
+        routePoints = pins;
+        routeInfo = pins.length < 2
+            ? (pins.isEmpty ? 'tap the start' : 'tap the end · $writers')
+            : writers;
+      });
     }
+    if (pins.length == 2) await _askRoad(pins[0].value, pins[1].value);
+  }
+
+  /// This phone's registers merged into the document it last saw — the union, whole.
+  Future<void> _writeRoute() async {
+    final w = zb;
+    if (w == null) return;
+    final merged =
+        await w.call('mergeRegisters', {'a': routeDoc, 'b': routeMine});
+    await w.mutate('routes', 'UPDATE', {'id': _routeId}, {'doc': merged});
+  }
+
+  /// The row moved (mine or someone else's): redraw from it, then reconcile — write the
+  /// union again while what is observed does not contain what this phone wrote (§10cr).
+  Future<void> _onRouteChanged() async {
+    await _readRoute();
+    final w = zb;
+    if (w == null || routeMine.isEmpty) return;
+    final merged =
+        await w.call('mergeRegisters', {'a': routeDoc, 'b': routeMine});
+    if (jsonEncode(merged) != jsonEncode(routeDoc) && routeRounds < 10) {
+      routeRounds += 1;
+      await _writeRoute();
+    }
+  }
+
+  /// A tap sets the next register — start, then end, then start again — as this
+  /// phone's move, and writes. The pin appears when the row comes back.
+  Future<void> _routeTap(LatLng at) async {
+    if (zb == null) return;
+    routeMine[routeNext] = {
+      'v': {'lat': at.latitude, 'lng': at.longitude},
+      't': _stampNow(),
+      'w': _routeWriter,
+    };
+    routeNext = routeNext == 'start' ? 'end' : 'start';
+    setState(() => routeInfo = 'moving…');
+    try {
+      await _writeRoute();
+    } catch (e) {
+      if (mounted) setState(() => routeInfo = 'route: $e');
+    }
+  }
+
+  Future<void> _askRoad(LatLng from, LatLng to) async {
+    final w = zb;
+    if (w == null) return;
     final t0 = DateTime.now();
     try {
       final ans = await w.request(
           'query.$_queryTenant.route',
           {
             'points': [
-              for (final p in routePoints)
-                {'lat': p.latitude, 'lng': p.longitude}
+              {'lat': from.latitude, 'lng': from.longitude},
+              {'lat': to.latitude, 'lng': to.longitude}
             ],
             'costing': 'auto'
           },
@@ -380,7 +472,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       if (mounted) {
         setState(() {
           routeLine = line;
-          routeInfo = '${ans['km']} km, ${ans['min']} min by road · $ms ms';
+          routeInfo =
+              '${ans['km']} km, ${ans['min']} min by road · $ms ms · $routeInfo';
         });
       }
     } catch (e) {
@@ -493,12 +586,12 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                 : () => setState(() {
                       routeMode = !routeMode;
                       if (!routeMode) {
-                        routePoints.clear();
                         routeLine = const [];
                         routeInfo = '';
                       } else {
                         addingMode = false;
-                        routeInfo = 'tap the start';
+                        routeInfo = 'loading the shared route…';
+                        _readRoute();
                       }
                     }),
           ),
@@ -574,17 +667,19 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                   color: Colors.blue.shade700,
                   strokeWidth: 5)
             ]),
-          if (routePoints.isNotEmpty)
+          if (routeMode && routePoints.isNotEmpty)
             MarkerLayer(
               markers: [
-                for (final (i, p) in routePoints.indexed)
+                for (final e in routePoints)
                   Marker(
-                    point: p,
+                    point: e.value,
                     width: 34,
                     height: 34,
                     alignment: Alignment.topCenter,
-                    child: Icon(i == 0 ? Icons.trip_origin : Icons.flag,
-                        color: Colors.blue.shade900, size: 30),
+                    child: Icon(
+                        e.key == 'start' ? Icons.trip_origin : Icons.flag,
+                        color: Colors.blue.shade900,
+                        size: 30),
                   ),
               ],
             ),

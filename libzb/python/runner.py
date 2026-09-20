@@ -76,6 +76,7 @@ SECTIONS = {
     "fkClauses":       (lambda c: {"fks": c["fks"]},                                 lambda c: c["text"]),
     "createTable":     (lambda c: {"table": c["table"], "cols": c["cols"], "pkCols": c["pkCols"], "fks": c["fks"], "strict": c.get("strict", False)}, lambda c: c["steps"]),
     "rebuildSteps":    (lambda c: {"table": c["table"], "cols": c["cols"], "pkCols": c["pkCols"], "fks": c["fks"], "existing": c["existing"], "strict": c.get("strict", False)}, lambda c: c["steps"]),
+    "mergeRegisters":  (lambda c: {"a": c["a"], "b": c["b"]},                       lambda c: c["want"]),
     "tableSet":        (lambda c: {"tables": c.get("tables"), "ondemand": c.get("ondemand"), "keys": c.get("keys", [])}, lambda c: c["want"]),
     "readOnlySql":     (lambda c: {"sql": c["sql"]},                                lambda c: c["allowed"]),
     "shape":           (lambda c: {"pkCols": c["pkCols"], "cols": c["cols"]},      lambda c: {"key": c["key"], "types": c["types"]}),

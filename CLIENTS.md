@@ -8,6 +8,8 @@ lifecycle lesson learned in one is not silently missing from the other.
 | language | Zig core + shell, C ABI | TypeScript core + shell |
 | hosts | Python, Node (ctypes/FFI), Flutter (Dart FFI) | browser, Node |
 | local engine | SQLite (a file), PostgreSQL (`dbUrl`, §10fd; seeds through COPY, §10fe), or DuckDB (`engine: "duckdb"`, §10fl; built in with `-Dduckdb=true`; seeds through the appender; the micro-VM worker's analytical replica, a file DuckDB itself opens once libzb closes it) | SQLite (sqlocal, better-sqlite3), PGlite |
+| cooperative documents | `mergeRegisters` through `zb_call` (COOPERATIVE_EDITING.md) | `mergeRegisters`, imported |
+| on-demand answers | `zb_client_request` + `zb_client_ingest` (§10hj) | `request` + `ingest` (§10hn) |
 | reply inbox | `_INBOX.<principal>` (§10hm), from the `inbox_prefix` connection option — replies, KV watchers, object reads and pull consumers all land there, inside the principal's `_INBOX.<principal>.>` grant | the same, through nats.js's `inboxPrefix` |
 | loop | host-driven: `sync`, `poll`, `flush` | self-driven: `connect()` runs it |
 | tables followed | **one rule, both clients (§10hn, `core.tableSet`, fixtures `tableSet`)**: `tables` is a list, or `"*"` for every published table; `ondemandTables` are held for their schema only, never seeded or tailed (§10hj), rows through `ingest`; a name in both is on-demand; absent both, nothing is followed — and the TS client says so in its log | the same |

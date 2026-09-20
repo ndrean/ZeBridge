@@ -25,6 +25,18 @@ built with `-Dduckdb=true` for the service (the app itself needs only SQLite), a
 `omar` creds of the dev stack. The `mapper` principal of the earlier cell design was
 revoked with its grid, and a revoked principal stays revoked.
 
+**One route, two editors** (NOTES §10ho). The directions button enters route mode; a tap
+sets the start, the next the end, and both pins are drawn from the row `routes.doc` as CDC
+delivers it, not from the tap. That row is a jsonb map of registers — `start` and `end`,
+each with its writer's stamp and name — over a plain LWW row: the phone writes its own
+registers merged into the document it last saw (`mergeRegisters`, the library's own rule
+through `zb_call`), and reconciles until the row contains what it wrote. Open the web
+consumer (`examples/06-web-consumer`, its "One route, two editors" panel) as another
+principal and move the end while the phone moves the start: both land. Move the same end
+on both: the later stamp wins on every replica, and the loser's pin jumps. The table comes
+from `examples/08-map/load_routes.py --create`; `scripts/scenarios/route_crdt.py` is the
+same war between two libzb clients, asserted.
+
 `examples/08-map/poi_phone.py` is the same phone in Python — `--edit`, `--tour`, `--fuel`
 — and the first thing to run when the app shows nothing.
 

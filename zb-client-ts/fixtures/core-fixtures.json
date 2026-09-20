@@ -4578,5 +4578,298 @@
         "ondemand": []
       }
     }
+  ],
+  "_mergeRegisters": "§10ho, the cooperative document over LWW. A jsonb map of registers {key: {v, t, w}}, merged per key: higher (t, w) wins, every key survives (§10cr's map-of-LWW-registers, measured: blind replace loses a key, the union loses none). Commutative, associative, idempotent; the row race under it stays plain LWW.",
+  "mergeRegisters": [
+    {
+      "name": "empty with anything is anything",
+      "a": {},
+      "b": {
+        "start": {
+          "v": {
+            "lat": 47.2,
+            "lng": -1.5
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "phone"
+        }
+      },
+      "want": {
+        "start": {
+          "v": {
+            "lat": 47.2,
+            "lng": -1.5
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "phone"
+        }
+      }
+    },
+    {
+      "name": "disjoint keys: both survive (two users move different ends)",
+      "a": {
+        "start": {
+          "v": {
+            "lat": 47.2,
+            "lng": -1.5
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "phone"
+        }
+      },
+      "b": {
+        "end": {
+          "v": {
+            "lat": 47.21,
+            "lng": -1.55
+          },
+          "t": "2026-09-19T10:00:01.000000Z",
+          "w": "browser"
+        }
+      },
+      "want": {
+        "start": {
+          "v": {
+            "lat": 47.2,
+            "lng": -1.5
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "phone"
+        },
+        "end": {
+          "v": {
+            "lat": 47.21,
+            "lng": -1.55
+          },
+          "t": "2026-09-19T10:00:01.000000Z",
+          "w": "browser"
+        }
+      }
+    },
+    {
+      "name": "same key: the later stamp wins",
+      "a": {
+        "end": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "phone"
+        }
+      },
+      "b": {
+        "end": {
+          "v": {
+            "lat": 2,
+            "lng": 2
+          },
+          "t": "2026-09-19T10:00:05.000000Z",
+          "w": "browser"
+        }
+      },
+      "want": {
+        "end": {
+          "v": {
+            "lat": 2,
+            "lng": 2
+          },
+          "t": "2026-09-19T10:00:05.000000Z",
+          "w": "browser"
+        }
+      }
+    },
+    {
+      "name": "same key: the later stamp wins whichever side carries it",
+      "a": {
+        "end": {
+          "v": {
+            "lat": 2,
+            "lng": 2
+          },
+          "t": "2026-09-19T10:00:05.000000Z",
+          "w": "browser"
+        }
+      },
+      "b": {
+        "end": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "phone"
+        }
+      },
+      "want": {
+        "end": {
+          "v": {
+            "lat": 2,
+            "lng": 2
+          },
+          "t": "2026-09-19T10:00:05.000000Z",
+          "w": "browser"
+        }
+      }
+    },
+    {
+      "name": "equal stamps: the writer breaks the tie, the same way on both sides",
+      "a": {
+        "end": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "a-phone"
+        }
+      },
+      "b": {
+        "end": {
+          "v": {
+            "lat": 2,
+            "lng": 2
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "b-browser"
+        }
+      },
+      "want": {
+        "end": {
+          "v": {
+            "lat": 2,
+            "lng": 2
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "b-browser"
+        }
+      }
+    },
+    {
+      "name": "idempotent: merging a doc with itself changes nothing",
+      "a": {
+        "start": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "p"
+        }
+      },
+      "b": {
+        "start": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "p"
+        }
+      },
+      "want": {
+        "start": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "p"
+        }
+      }
+    },
+    {
+      "name": "a value without a stamp is the oldest",
+      "a": {
+        "start": {
+          "v": "legacy"
+        }
+      },
+      "b": {
+        "start": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "p"
+        }
+      },
+      "want": {
+        "start": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "p"
+        }
+      }
+    },
+    {
+      "name": "three keys from two sides, one contested",
+      "a": {
+        "start": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "p"
+        },
+        "end": {
+          "v": {
+            "lat": 5,
+            "lng": 5
+          },
+          "t": "2026-09-19T10:00:09.000000Z",
+          "w": "p"
+        }
+      },
+      "b": {
+        "end": {
+          "v": {
+            "lat": 6,
+            "lng": 6
+          },
+          "t": "2026-09-19T10:00:03.000000Z",
+          "w": "b"
+        },
+        "via": {
+          "v": {
+            "lat": 3,
+            "lng": 3
+          },
+          "t": "2026-09-19T10:00:02.000000Z",
+          "w": "b"
+        }
+      },
+      "want": {
+        "start": {
+          "v": {
+            "lat": 1,
+            "lng": 1
+          },
+          "t": "2026-09-19T10:00:00.000000Z",
+          "w": "p"
+        },
+        "end": {
+          "v": {
+            "lat": 5,
+            "lng": 5
+          },
+          "t": "2026-09-19T10:00:09.000000Z",
+          "w": "p"
+        },
+        "via": {
+          "v": {
+            "lat": 3,
+            "lng": 3
+          },
+          "t": "2026-09-19T10:00:02.000000Z",
+          "w": "b"
+        }
+      }
+    }
   ]
 }

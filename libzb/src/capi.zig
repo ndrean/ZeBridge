@@ -257,6 +257,9 @@ fn dispatch(a: std.mem.Allocator, name: []const u8, args: Value) ![]const u8 {
     if (eq(u8, name, "rebuildSteps")) {
         return try core.valueToString(a, try core.rebuildSteps(a, args.object.get("table").?.string, args.object.get("cols").?.array, try strArrField(a, args, "pkCols"), args.object.get("fks").?.array, try strArrField(a, args, "existing"), boolField(args, "strict")));
     }
+    if (eq(u8, name, "mergeRegisters")) {
+        return try core.valueToString(a, try core.mergeRegisters(a, args.object.get("a") orelse .null, args.object.get("b") orelse .null));
+    }
     if (eq(u8, name, "tableSet")) {
         const tv = args.object.get("tables") orelse .null;
         const all = tv == .string and eq(u8, tv.string, "*");

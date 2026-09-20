@@ -8,6 +8,7 @@
 /// Nothing on this page teaches silently.
 
 import { ZeBridge, credsFileText, principalFromCreds } from '../../../zb-client-ts';
+import { mergeRegisters } from 'zb-client-ts';
 import { nkeys } from '@nats-io/nats-core';
 import { createSignal, onCleanup, For, Show } from 'solid-js';
 
@@ -228,6 +229,7 @@ export default function App() {
   /// `changed` names the tables that moved since the last refresh; empty means "all"
   /// (boot, a schema event, a status change).
   const refresh = async (changed: string[] = []) => {
+    if (!changed.length || changed.includes('routes')) void readRoute();
     const all = changed.length === 0;
     const touched = (t: string) => all || changed.includes(t);
     setTables(zb.tableNames().sort());
@@ -287,6 +289,42 @@ export default function App() {
     const tc = zb.tableState(table)?.tombstoneColumn;
     return ev.operation === 'DELETE' || (tc != null && ev.data?.[tc] != null);
   };
+  // ── the shared route (§10ho): a jsonb map of registers over a plain LWW row ──
+  const ROUTE_ID = '11111111-1111-4111-8111-111111111111';
+  const [routeDoc, setRouteDoc] = createSignal<Record<string, any>>({});
+  const [routeMeta, setRouteMeta] = createSignal<{ version: string; writer: string }>({ version: '', writer: '' });
+  const [routeInputs, setRouteInputs] = createSignal<Record<string, { lat: string; lng: string }>>({ start: { lat: '47.2184', lng: '-1.5536' }, end: { lat: '47.2076', lng: '-1.5497' } });
+  const routeMine: Record<string, any> = {};   // this editor's own registers — shipped whole on every write
+  let routeRounds = 0;
+  const parseDoc = (raw: any) => { try { return typeof raw === 'string' ? JSON.parse(raw) : (raw ?? {}); } catch { return {}; } };
+  const readRoute = async () => {
+    try {
+      const r = (await zb.query(`SELECT doc, updated_at, last_writer FROM routes WHERE id = ?`, ROUTE_ID))[0];
+      if (!r) return;
+      setRouteDoc(parseDoc(r.doc));
+      setRouteMeta({ version: String(r.updated_at ?? ''), writer: String(r.last_writer ?? '') });
+    } catch { /* not held yet */ }
+  };
+  const writeRoute = async () => {
+    const doc = mergeRegisters(routeDoc() as any, routeMine as any);
+    await zb.mutate('routes', 'UPDATE', { id: ROUTE_ID }, { doc });
+  };
+  const moveRoute = async (key: 'start' | 'end') => {
+    const inp = routeInputs()[key];
+    const lat = parseFloat(inp.lat), lng = parseFloat(inp.lng);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+    routeMine[key] = { v: { lat, lng }, t: new Date().toISOString().replace('Z', '000Z'), w: `browser-${PRINCIPAL}` };
+    await writeRoute();
+  };
+  zb.onChange('routes', () => {
+    void (async () => {
+      await readRoute();
+      // Reconcile: observed ⊇ mine, or write the union again (bounded) — §10cr's stopping rule.
+      const merged = mergeRegisters(routeDoc() as any, routeMine as any);
+      if (JSON.stringify(merged) !== JSON.stringify(routeDoc()) && routeRounds < 10) { routeRounds += 1; await writeRoute(); }
+    })();
+  });
+
   zb.onChange('counter_public', (ev) => {
     if (!ev) { void refresh(['counter_public']); return; }
     if (ev.data.uid !== counterUid('counter_public')) return;
@@ -612,6 +650,33 @@ export default function App() {
               <Events block="counter_tenant" />
             </div>
           </div>
+        </section>
+
+        {/* ── the shared route ── */}
+        <section>
+          <h2>One route, two editors</h2>
+          <p class="claim">
+            The phone (libzb) and this page (zb-client-ts) edit <code>routes.doc</code>, one jsonb row: a map of registers,
+            <code>start</code> and <code>end</code>, each stamped with its writer's time and name. The row underneath is plain
+            LWW — the row race decides who must merge — and the registers decide which value survives: move the start here
+            while the phone moves the end, and both land. Move the same end on both, and the later stamp wins, on every replica.
+          </p>
+          <Show when={has('routes')} fallback={<p class="muted">not replicated here yet</p>}>
+            <div class="form">
+              <For each={['start', 'end'] as const}>{(key) => (
+                <label>{key}
+                  <input value={routeInputs()[key].lat} onInput={(e) => setRouteInputs((p) => ({ ...p, [key]: { ...p[key], lat: e.currentTarget.value } }))} placeholder="lat" />
+                  <input value={routeInputs()[key].lng} onInput={(e) => setRouteInputs((p) => ({ ...p, [key]: { ...p[key], lng: e.currentTarget.value } }))} placeholder="lng" />
+                  <button onClick={() => void moveRoute(key)}>move {key}</button>
+                  <span class="meta">
+                    {routeDoc()[key] ? `${routeDoc()[key].v?.lat}, ${routeDoc()[key].v?.lng} · by ${routeDoc()[key].w} at ${String(routeDoc()[key].t).slice(11, 23)}` : 'unset'}
+                  </span>
+                </label>
+              )}</For>
+            </div>
+            <p class="meta">row version {shortVersion(routeMeta().version || '—')} · last writer {routeMeta().writer || '—'}</p>
+            <Events block="routes" />
+          </Show>
         </section>
 
         {/* ── users ⟶ orders ── */}

@@ -833,6 +833,23 @@ export function tableSet(
   return { follow, ondemand: od };
 }
 
+/// §10ho: a map of LWW registers, merged. A register is `{v, t, w}`: a value, the
+/// writer's stamp (RFC 3339 UTC, string-ordered), the writer. Per key the higher (t, w)
+/// wins, so every key either side ever wrote survives; equal stamps break on the writer.
+/// Commutative, associative, idempotent — the union only gains, which is why a writer
+/// that ships all of its own registers on every write converges (crdt.py, §10cr). The
+/// row underneath stays plain LWW: the row race decides who must merge, this decides
+/// which value survives. Not a register (no `t`) is treated as the oldest.
+export type Register = { v: unknown; t?: string; w?: string };
+export function mergeRegisters(a: Record<string, Register>, b: Record<string, Register>): Record<string, Register> {
+  const out: Record<string, Register> = { ...a };
+  for (const [k, reg] of Object.entries(b ?? {})) {
+    const cur = out[k];
+    if (!cur || (reg.t ?? '') > (cur.t ?? '') || ((reg.t ?? '') === (cur.t ?? '') && (reg.w ?? '') > (cur.w ?? ''))) out[k] = reg;
+  }
+  return out;
+}
+
 export function isReadOnlySql(sql: string): boolean {
   let s = sql.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n]*/g, ' ');
   s = s.replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""').toLowerCase().trim();

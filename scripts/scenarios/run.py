@@ -71,6 +71,7 @@ GROUPS = {
         "reaps":         ("bridge", "sweeper reaps never reach clients"),
         "tenant_kv":     ("bridge", "$KV.tenants exact-key grants"),
         "crosstenant":   ("client", "cross-tenant reach (expected to find the known hole)"),
+        "route_crdt":    ("client", "two editors, one route, no lost move (§10ho): two libzb clients of two tenants edit one jsonb map of registers at once — every move survives, the contested key holds the (t, w) winner, both replicas equal PostgreSQL, the reconcile is bounded; the merge is the library's (zb_call mergeRegisters)"),
         "inbox_sniff":   ("client", "the reply inbox as a read boundary (§10hm): a principal is refused the shared `_INBOX.>` and another principal's subtree, keeps its own, and a JetStream reply still reaches it under the narrowed grant"),
         "dyntenant":     ("bridge", "tenant born at runtime"),
         "invalidate":    ("bridge", "the caches that must notice DDL"),

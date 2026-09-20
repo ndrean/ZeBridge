@@ -14515,3 +14515,46 @@ spelling: the TypeScript client generates its `clientId` per instance, so its ti
 value changes on every restart, where libzb's is stable by contract. The outbox's stored
 msg_ids do not depend on it; the tiebreak column does. Recorded, not fixed.
 
+## 10ho. One route, two editors: the cooperative document over LWW (2026-09-19)
+
+§10cr settled the principle on a scratch column: row-level LWW converges and still
+loses an intent when two writers replace a whole document; a map of LWW registers, each
+writer shipping the union of its own on every write and reconciling until what it
+observes contains what it wrote, loses none — and the sync layer needs nothing for it.
+This is that principle on the map's own table, in the two client libraries, with the
+merge living in the cores rather than in each app. The contract — what the table must
+be, what the document must look like, what the loop must do, and what this does not
+promise — is COOPERATIVE_EDITING.md; this section is how it came to be.
+
+The table: `routes`, public and writable, one demo row, `doc jsonb` holding
+`{"start": {v, t, w}, "end": {v, t, w}}` — a value, the writer's stamp, the writer. The
+rule: `core.mergeRegisters` in both cores (fixtures `mergeRegisters`, 8 cases — disjoint
+keys both survive, the later stamp wins whichever side carries it, equal stamps break on
+the writer, idempotent, a value without a stamp is the oldest). The phone reaches it
+through `zb_call("mergeRegisters")`, the browser imports it: two apps, one
+implementation, pinned by the same fixture file. The row underneath is a row like any
+other — `updated_at` its version, `last_writer` its tiebreak — and the bridge, the
+producer and the chain never learn a register exists.
+
+Measured (`route_crdt.py`, client group): two libzb clients, omar of kilo and alice of
+acme, six rounds of one moving the start while the other moves the end without waiting
+for echoes, then both moving the same end, then reconciling. Every move survived:
+PostgreSQL's document holds omar's last start and the contested end holds the (t, w)
+winner; both replicas equal PostgreSQL; settled in 8 + 7 writes for 14 moves, 10.5 s end
+to end with the polls' waits. The row-level LWW lost nothing because nothing was ever
+replaced — only merged.
+
+In the apps: the phone's route mode writes its two taps as registers and draws the pins
+from the DOCUMENT, not from the taps, so what it shows is what the row holds; the road
+is re-asked when the document moves. The web consumer's panel moves either end by
+coordinates and shows each register's writer and stamp beside the row's version and
+last writer. Move the start on the phone and the end in the browser: both land. Move the
+same end on both: the later stamp wins, everywhere, and the loser sees its pin jump.
+
+Not a CRDT library, on purpose. Yjs and its kind carry a sequence type in an opaque
+state, with their own update log and persistence — for two points a hammer, and for
+this project a contradiction: PostgreSQL owns the truth and the table stays a table.
+The one shape that would earn a sequence type is the tour's list of stops edited
+concurrently, and even that is a list of registers with fractional positions in the
+same jsonb. LWW and the registers are one rule at two grain sizes.
+

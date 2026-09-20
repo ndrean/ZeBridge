@@ -1306,6 +1306,43 @@ pub fn writeTableSet(a: std.mem.Allocator, out: *std.ArrayList(u8), ts: TableSet
     try out.append(a, '}');
 }
 
+/// §10ho: a map of LWW registers, merged — core.ts `mergeRegisters`, fixtures
+/// `mergeRegisters`. A register is `{v, t, w}`; per key the higher (t, w) wins, string
+/// order on both; a value without `t` is the oldest. Both documents are JSON objects;
+/// the result is a fresh object in `a`, keys in `a`'s order then `b`'s new ones.
+pub fn mergeRegisters(a: std.mem.Allocator, doc_a: Value, doc_b: Value) !Value {
+    var out: std.json.ObjectMap = .empty;
+    if (doc_a == .object) {
+        var it = doc_a.object.iterator();
+        while (it.next()) |e| try out.put(a, e.key_ptr.*, e.value_ptr.*);
+    }
+    if (doc_b == .object) {
+        var it = doc_b.object.iterator();
+        while (it.next()) |e| {
+            const cur = out.get(e.key_ptr.*);
+            if (cur == null or registerWins(e.value_ptr.*, cur.?)) try out.put(a, e.key_ptr.*, e.value_ptr.*);
+        }
+    }
+    return .{ .object = out };
+}
+
+fn registerField(reg: Value, key: []const u8) []const u8 {
+    if (reg != .object) return "";
+    const f = reg.object.get(key) orelse return "";
+    return if (f == .string) f.string else "";
+}
+
+/// `b` beats `a` when its (t, w) is strictly higher.
+fn registerWins(b: Value, a: Value) bool {
+    const tb = registerField(b, "t");
+    const ta = registerField(a, "t");
+    return switch (std.mem.order(u8, tb, ta)) {
+        .gt => true,
+        .lt => false,
+        .eq => std.mem.order(u8, registerField(b, "w"), registerField(a, "w")) == .gt,
+    };
+}
+
 pub fn isReadOnlySql(sql: []const u8) bool {
     var buf: [4096]u8 = undefined;
     if (sql.len > buf.len) return false;

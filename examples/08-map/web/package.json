@@ -1,0 +1,28 @@
+{
+  "name": "zemap-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27",
+    "@msgpack/msgpack": "^3.0.0-beta.1",
+    "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/kv": "^3.4.0",
+    "@nats-io/nats-core": "^3.4.0",
+    "@nats-io/obj": "3.4.0",
+    "leaflet": "^1.9.4",
+    "sqlocal": "^0.18.0",
+    "uuid": "^14.0.1",
+    "zb-client-ts": "link:../../../zb-client-ts"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.12",
+    "typescript": "^5.7.2",
+    "vite": "^8.2.0"
+  }
+}

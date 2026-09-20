@@ -37,23 +37,35 @@ typedef ZbClientTenantDart = ffi.Pointer<Utf8> Function(
 
 typedef ZbClientFlushC = ffi.Pointer<Utf8> Function(
     ffi.Uint64 handle, ffi.Uint64 waitMs);
-typedef ZbClientFlushDart = ffi.Pointer<Utf8> Function(
-    int handle, int waitMs);
+typedef ZbClientFlushDart = ffi.Pointer<Utf8> Function(int handle, int waitMs);
 
 typedef ZbClientPollC = ffi.Pointer<Utf8> Function(
     ffi.Uint64 handle, ffi.Uint64 waitMs);
-typedef ZbClientPollDart = ffi.Pointer<Utf8> Function(
-    int handle, int waitMs);
+typedef ZbClientPollDart = ffi.Pointer<Utf8> Function(int handle, int waitMs);
 
 typedef ZbClientRequestC = ffi.Pointer<Utf8> Function(
-    ffi.Uint64 handle, ffi.Pointer<Utf8> subject, ffi.Pointer<Utf8> payloadJson, ffi.Uint64 timeoutMs);
-typedef ZbClientRequestDart = ffi.Pointer<Utf8> Function(
-    int handle, ffi.Pointer<Utf8> subject, ffi.Pointer<Utf8> payloadJson, int timeoutMs);
+    ffi.Uint64 handle,
+    ffi.Pointer<Utf8> subject,
+    ffi.Pointer<Utf8> payloadJson,
+    ffi.Uint64 timeoutMs);
+typedef ZbClientRequestDart = ffi.Pointer<Utf8> Function(int handle,
+    ffi.Pointer<Utf8> subject, ffi.Pointer<Utf8> payloadJson, int timeoutMs);
 
 typedef ZbClientIngestC = ffi.Pointer<Utf8> Function(
-    ffi.Uint64 handle, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> answerJson, ffi.Pointer<Utf8> scopeJson);
+    ffi.Uint64 handle,
+    ffi.Pointer<Utf8> table,
+    ffi.Pointer<Utf8> answerJson,
+    ffi.Pointer<Utf8> scopeJson);
 typedef ZbClientIngestDart = ffi.Pointer<Utf8> Function(
-    int handle, ffi.Pointer<Utf8> table, ffi.Pointer<Utf8> answerJson, ffi.Pointer<Utf8> scopeJson);
+    int handle,
+    ffi.Pointer<Utf8> table,
+    ffi.Pointer<Utf8> answerJson,
+    ffi.Pointer<Utf8> scopeJson);
+
+typedef ZbCallC = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8> fn, ffi.Pointer<Utf8> argsJson);
+typedef ZbCallDart = ffi.Pointer<Utf8> Function(
+    ffi.Pointer<Utf8> fn, ffi.Pointer<Utf8> argsJson);
 
 typedef ZbFreeC = ffi.Void Function(ffi.Pointer<Utf8> p);
 typedef ZbFreeDart = void Function(ffi.Pointer<Utf8> p);
@@ -63,9 +75,11 @@ class PollReport {
   final int settled;
   final List<String> changedTables;
   final List<String> seeded;
+
   /// §10fq: tenants whose streams cannot be read right now (deleted, or denied) —
   /// set aside by libzb and retried with backoff; the others keep being served.
   final List<String> unreadable;
+
   /// Set by the worker when a poll itself failed (connection gone, principal
   /// revoked): the loop backs off and says why; the lists are then empty.
   final String? error;
@@ -109,6 +123,7 @@ class ZeBridge {
   static late ZbClientPollDart _poll;
   static late ZbClientRequestDart _request;
   static late ZbClientIngestDart _ingest;
+  static late ZbCallDart _callFn;
   static late ZbFreeDart _free;
 
   static void init() {
@@ -125,24 +140,25 @@ class ZeBridge {
 
     _lib = ffi.DynamicLibrary.open(libPath);
 
-    _open = _lib.lookupFunction<ZbClientOpenC, ZbClientOpenDart>(
-        'zb_client_open');
-    _close = _lib.lookupFunction<ZbClientCloseC, ZbClientCloseDart>(
-        'zb_client_close');
-    _sync = _lib.lookupFunction<ZbClientSyncC, ZbClientSyncDart>(
-        'zb_client_sync');
-    _query = _lib.lookupFunction<ZbClientQueryC, ZbClientQueryDart>(
-        'zb_client_query');
+    _open =
+        _lib.lookupFunction<ZbClientOpenC, ZbClientOpenDart>('zb_client_open');
+    _close = _lib
+        .lookupFunction<ZbClientCloseC, ZbClientCloseDart>('zb_client_close');
+    _sync =
+        _lib.lookupFunction<ZbClientSyncC, ZbClientSyncDart>('zb_client_sync');
+    _query = _lib
+        .lookupFunction<ZbClientQueryC, ZbClientQueryDart>('zb_client_query');
     _mutate = _lib.lookupFunction<ZbClientMutateC, ZbClientMutateDart>(
         'zb_client_mutate');
-    _flush = _lib.lookupFunction<ZbClientFlushC, ZbClientFlushDart>(
-        'zb_client_flush');
-    _join = _lib.lookupFunction<ZbClientTenantC, ZbClientTenantDart>(
-        'zb_client_join');
-    _leave = _lib.lookupFunction<ZbClientTenantC, ZbClientTenantDart>(
-        'zb_client_leave');
-    _poll = _lib.lookupFunction<ZbClientPollC, ZbClientPollDart>(
-        'zb_client_poll');
+    _flush = _lib
+        .lookupFunction<ZbClientFlushC, ZbClientFlushDart>('zb_client_flush');
+    _join = _lib
+        .lookupFunction<ZbClientTenantC, ZbClientTenantDart>('zb_client_join');
+    _leave = _lib
+        .lookupFunction<ZbClientTenantC, ZbClientTenantDart>('zb_client_leave');
+    _poll =
+        _lib.lookupFunction<ZbClientPollC, ZbClientPollDart>('zb_client_poll');
+    _callFn = _lib.lookupFunction<ZbCallC, ZbCallDart>('zb_call');
     _request = _lib.lookupFunction<ZbClientRequestC, ZbClientRequestDart>(
         'zb_client_request');
     _ingest = _lib.lookupFunction<ZbClientIngestC, ZbClientIngestDart>(
@@ -251,7 +267,8 @@ class ZeBridge {
   /// stream joins the tail at the next poll). The JWT decides whether the broker
   /// allows it. Returns the memberships followed now.
   /// §10hj: ask a service on `query.<tenant>.<name>`; its reply, decoded.
-  Map<String, dynamic> request(String subject, Map<String, dynamic> payload, int timeoutMs) {
+  Map<String, dynamic> request(
+      String subject, Map<String, dynamic> payload, int timeoutMs) {
     final subjectC = subject.toNativeUtf8();
     final payloadC = jsonEncode(payload).toNativeUtf8();
     final resPtr = _request(_handle, subjectC, payloadC, timeoutMs);
@@ -261,15 +278,38 @@ class ZeBridge {
     final resStr = resPtr.toDartString();
     _free(resPtr);
     final decoded = jsonDecode(resStr);
-    if (decoded is Map && decoded.containsKey('error')) throw Exception(_reason(decoded));
+    if (decoded is Map && decoded.containsKey('error')) {
+      throw Exception(_reason(decoded));
+    }
+    return Map<String, dynamic>.from(decoded as Map);
+  }
+
+  /// §10ho: one of the library's CORE functions, by name, on JSON — `mergeRegisters`
+  /// for the shared route. Handle-free: the same rule the fixtures pin, not a Dart copy.
+  static Map<String, dynamic> call(String fn, Map<String, dynamic> args) {
+    final fnC = fn.toNativeUtf8();
+    final argsC = jsonEncode(args).toNativeUtf8();
+    final resPtr = _callFn(fnC, argsC);
+    malloc.free(fnC);
+    malloc.free(argsC);
+    if (resPtr == ffi.nullptr) throw Exception('call failed');
+    final resStr = resPtr.toDartString();
+    _free(resPtr);
+    final decoded = jsonDecode(resStr);
+    if (decoded is Map && decoded.containsKey('error')) {
+      throw Exception(_reason(decoded));
+    }
     return Map<String, dynamic>.from(decoded as Map);
   }
 
   /// §10hj: keep an answer ({"columns","rows"}) in an on-demand table; `scope` names the
   /// area the answer is complete for (rows held there and absent from it are deleted).
-  int ingest(String table, Map<String, dynamic> answer, Map<String, dynamic>? scope) {
+  int ingest(
+      String table, Map<String, dynamic> answer, Map<String, dynamic>? scope) {
     final tableC = table.toNativeUtf8();
-    final answerC = jsonEncode({'columns': answer['columns'], 'rows': answer['rows']}).toNativeUtf8();
+    final answerC =
+        jsonEncode({'columns': answer['columns'], 'rows': answer['rows']})
+            .toNativeUtf8();
     final scopeC = (scope == null ? '' : jsonEncode(scope)).toNativeUtf8();
     final resPtr = _ingest(_handle, tableC, answerC, scopeC);
     malloc.free(tableC);
@@ -279,7 +319,9 @@ class ZeBridge {
     final resStr = resPtr.toDartString();
     _free(resPtr);
     final decoded = jsonDecode(resStr);
-    if (decoded is Map && decoded.containsKey('error')) throw Exception(_reason(decoded));
+    if (decoded is Map && decoded.containsKey('error')) {
+      throw Exception(_reason(decoded));
+    }
     return (decoded['applied'] as num).toInt();
   }
 
