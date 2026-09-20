@@ -260,6 +260,19 @@ pub const Transport = struct {
     }
 
     /// Core subscription (the verdict channel `mutation_ack.<principal>.>`).
+    /// §10hp: a QUEUE subscription the caller drains itself. The async form would
+    /// deliver on the reader's thread, which a host-driven client does not own; this
+    /// one is emptied by `poll`, like everything else libzb does.
+    pub fn queueSubscribeSync(self: *Transport, subject: []const u8, queue: []const u8) !*nats.Subscription {
+        return self.conn.queueSubscribeSync(subject, queue);
+    }
+
+    /// A CORE publish, not JetStream: a reply goes to the asker's inbox, where no
+    /// stream is listening and no ack is coming.
+    pub fn publishCore(self: *Transport, subject: []const u8, data: []const u8) !void {
+        try self.conn.publish(subject, data);
+    }
+
     pub fn subscribeSync(self: *Transport, subject: []const u8) !*nats.Subscription {
         return self.conn.subscribeSync(subject);
     }

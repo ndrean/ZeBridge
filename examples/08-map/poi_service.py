@@ -5,11 +5,17 @@ over NATS request/reply — PostgreSQL never sees a query (NOTES §10hj).
     examples/08-map/poi_service.py                    # pois.creds (a RESPONDER principal, §10hk), engine duckdb, queue group "pois"
     ZB_DB=/tmp/pois.duckdb examples/08-map/poi_service.py --tenants kilo,_default
 
-One process, two halves on one libzb card (DuckDB allows one writer per file):
-  * the replica: libzb follows `osm_pois` (a public table, 2.1M rows) — the seed from
-    the chain, then CDC in bulk (§10hg) — polled from a thread;
-  * the responder: nats-py, a queue-group subscription on `query.<tenant>.pois_near` for
-    every tenant served; instances scale by starting another process.
+ONE process, ONE connection, ONE loop (§10hp). libzb both follows `osm_pois` (a public
+table, 2.1M rows — the seed from the chain, then CDC in bulk, §10hg) AND answers the
+questions: `zb_client_serve` subscribes `query.<tenant>.<name>` in a queue group on the
+client's own socket, `poll` hands over what arrived, `zb_client_reply` answers on the
+asker's inbox. Instances scale by starting another process; the queue group makes the
+server pick one.
+
+This replaced a second NATS connection (nats-py) and a background thread, whose only
+real cost was a LOCK: the card is not made for two threads, so a poll and a question
+took turns. There is no lock here, and no `--serve-url`: one connection cannot answer
+somewhere else than it listens.
 
 Named queries only — the SQL lives here, the client sends parameters:
   pois_near  {"lat": 47.21, "lng": -1.55, "radius_m": 800, "kinds": ["amenity"], "limit": 500}
@@ -28,7 +34,7 @@ A bounding box on (lat, lng) over the replica's index, then the haversine distan
 order and cut at the radius. Every libzb call is serialized through one lock: the card
 is not made for two threads.
 """
-import argparse, asyncio, ctypes, json, math, os, pathlib, socket, sys, threading, time, urllib.request
+import argparse, ctypes, json, math, os, pathlib, socket, sys, time, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
@@ -44,14 +50,17 @@ def load_lib():
     lib.zb_free.argtypes = [ctypes.c_void_p]
     lib.zb_client_open.restype, lib.zb_client_open.argtypes = ctypes.c_uint64, [ctypes.c_char_p]
     lib.zb_client_close.argtypes = [ctypes.c_uint64]
-    for n, extra in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p])):
+    for n, extra in (("sync", []), ("poll", [ctypes.c_uint64]), ("query", [ctypes.c_char_p, ctypes.c_char_p]),
+                     ("serve", [ctypes.c_char_p]), ("reply", [ctypes.c_uint64, ctypes.c_char_p])):
         f = getattr(lib, "zb_client_" + n); f.restype = ctypes.c_void_p; f.argtypes = [ctypes.c_uint64] + extra
     return lib
 
 
 class Card:
+    """The libzb client. One thread drives it — §10hp removed the lock with the thread."""
+
     def __init__(self, lib, opts: dict):
-        self.lib, self.lock = lib, threading.Lock()
+        self.lib = lib
         self.h = lib.zb_client_open(json.dumps(opts).encode())
         if not self.h:
             sys.exit("libzb: open failed")
@@ -63,16 +72,19 @@ class Card:
             self.lib.zb_free(ptr)
 
     def sync(self):
-        with self.lock:
-            return self.take(self.lib.zb_client_sync(self.h))
+        return self.take(self.lib.zb_client_sync(self.h))
 
     def poll(self, wait_ms=1000):
-        with self.lock:
-            return self.take(self.lib.zb_client_poll(self.h, wait_ms))
+        return self.take(self.lib.zb_client_poll(self.h, wait_ms))
 
     def query(self, sql, params=()):
-        with self.lock:
-            return self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
+        return self.take(self.lib.zb_client_query(self.h, sql.encode(), json.dumps(list(params)).encode()))
+
+    def serve(self, tenants, queries, queue):
+        return self.take(self.lib.zb_client_serve(self.h, json.dumps({"tenants": tenants, "queries": queries, "queue": queue}).encode()))
+
+    def reply(self, req_id, answer):
+        return self.take(self.lib.zb_client_reply(self.h, req_id, json.dumps(answer, default=str).encode()))
 
 
 def pois_near(card: Card, q: dict) -> dict:
@@ -354,35 +366,35 @@ def route(card: Card, q: dict) -> dict:
 QUERIES = {"pois_near": pois_near, "tour": tour, "fuel_near": fuel_near, "route": route}
 
 
-async def serve(card: Card, url: str, creds: str, tenants: list[str], queue: str, label: str, principal: str):
-    import nats
-    # §10hm: the responder's own inbox space — its replica's pulls and KV reads land
-    # under `_INBOX.<principal>`, which is what its grant covers.
-    nc = await nats.connect(url, user_credentials=creds, name=f"poi-service {label}",
-                            inbox_prefix=f"_INBOX.{principal}".encode())
+def serve(card: Card, tenants: list[str], queue: str, label: str) -> None:
+    """The whole service: subscribe, then one loop. A poll returns the CDC it applied AND
+    the questions that arrived; each is answered from this same replica, on this same
+    connection. The wait is short because it bounds how long a question can sit unseen."""
+    r = card.serve(tenants, sorted(QUERIES), queue)
+    if "error" in r:
+        sys.exit(f"serve refused: {r['error']}")
+    print(f"answering {sorted(QUERIES)} for tenants {tenants} in queue group {queue!r} "
+          f"({r['serving']} subject(s), one connection)", flush=True)
     served = 0
-
-    async def handler(msg):
-        nonlocal served
-        name = msg.subject.rsplit(".", 1)[-1]
-        fn = QUERIES.get(name)
-        try:
-            q = json.loads(msg.data or b"{}")
-            ans = fn(card, q) if fn else {"error": f"unknown query {name!r}", "known": sorted(QUERIES)}
-        except Exception as e:  # a bad parameter is the client's problem, not the service's
-            ans = {"error": f"{type(e).__name__}: {e}"}
-        ans["answered_by"] = label  # §10hl: which instance answered — the leaf test counts these
-        await msg.respond(json.dumps(ans, default=str).encode())
-        served += 1
-        if served % 100 == 1:
-            print(f"served {served} (last: {name}, {ans.get('count', '?')} rows, {ans.get('ms', '?')} ms)", flush=True)
-
-    for t in tenants:
-        for name in QUERIES:
-            await nc.subscribe(f"query.{t}.{name}", queue=queue, cb=handler)
-    print(f"answering {sorted(QUERIES)} for tenants {tenants} in queue group {queue!r}", flush=True)
     while True:
-        await asyncio.sleep(3600)
+        rep = card.poll(100)
+        if rep.get("error"):
+            print(f"poll: {rep['error']}", flush=True)
+            time.sleep(2)
+            continue
+        if rep.get("applied"):
+            print(f"cdc: {rep['applied']} applied", flush=True)
+        for q in rep.get("requests", []):
+            fn = QUERIES.get(q["name"])
+            try:
+                ans = fn(card, q.get("payload") or {}) if fn else {"error": f"unknown query {q['name']!r}", "known": sorted(QUERIES)}
+            except Exception as e:  # a bad parameter is the asker's problem, not the service's
+                ans = {"error": f"{type(e).__name__}: {e}"}
+            ans["answered_by"] = label  # §10hl: which instance answered — the leaf test counts these
+            card.reply(q["id"], ans)
+            served += 1
+            if served % 100 == 1:
+                print(f"served {served} (last: {q['name']}, {ans.get('count', '?')} rows, {ans.get('ms', '?')} ms)", flush=True)
 
 
 def main():
@@ -398,7 +410,6 @@ def main():
     ap.add_argument("--tenants", default="kilo,_default")
     ap.add_argument("--queue", default="pois")
     ap.add_argument("--label", default=f"{socket.gethostname()}:{os.getpid()}", help="the instance's name in every answer (answered_by)")
-    ap.add_argument("--serve-url", default=None, help="§10hl: answer on THIS server (a regional leaf) while the replica follows --url (the hub); default: the same")
     ap.add_argument("--valhalla", default=VALHALLA, help="the routing engine (examples/08-map/valhalla); the tour and route go by road when it answers")
     a = ap.parse_args()
     VALHALLA = a.valhalla.rstrip("/")
@@ -409,18 +420,7 @@ def main():
     s = card.sync()
     print(f"replica: {json.dumps(s)[:200]} in {time.time() - t0:.1f} s", flush=True)
 
-    def follow():
-        # A short wait: the lock is held for the whole poll, and a query waits behind it.
-        while True:
-            r = card.poll(100)
-            if r.get("applied"):
-                print(f"cdc: {r['applied']} applied", flush=True)
-            if r.get("error"):
-                print(f"poll: {r['error']}", flush=True)
-                time.sleep(2)
-
-    threading.Thread(target=follow, daemon=True).start()
-    asyncio.run(serve(card, a.serve_url or a.url, a.creds, [t.strip() for t in a.tenants.split(",") if t.strip()], a.queue, a.label, a.principal))
+    serve(card, [t.strip() for t in a.tenants.split(",") if t.strip()], a.queue, a.label)
 
 
 if __name__ == "__main__":

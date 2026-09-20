@@ -442,6 +442,49 @@ export class ZeBridge {
     return { version };
   }
 
+  /// §10hp: BE a service. Answer `query.<tenant>.<name>` for these tenants, in one
+  /// queue group, on this client's own connection — the same verb libzb has, in this
+  /// library's idiom: the handlers are yours, the subscribing, the dispatch, the reply
+  /// and the error envelope are the library's.
+  ///
+  /// A handler receives the asker's parsed payload and returns the answer, which is
+  /// sent as JSON. Throwing is allowed: the asker gets `{"error": …}` rather than a
+  /// timeout, which is the difference between a service that says no and one that
+  /// looks dead. Returns how many subjects this client now answers.
+  public async serve(opts: {
+    tenants: string[];
+    handlers: Record<string, (payload: any) => unknown | Promise<unknown>>;
+    queue?: string;
+  }): Promise<number> {
+    if (!this.nc) throw new Error('not connected');
+    const prefix = this.config.grammar?.subjects?.query_prefix ?? 'query';
+    const queue = opts.queue ?? 'zb';
+    let n = 0;
+    for (const tenant of opts.tenants) {
+      for (const [name, fn] of Object.entries(opts.handlers)) {
+        const subject = `${prefix}.${tenant}.${name}`;
+        const sub = this.nc.subscribe(subject, { queue });
+        n += 1;
+        void (async () => {
+          for await (const m of sub as AsyncIterable<any>) {
+            if (!m.reply) continue;   // nobody is waiting: nothing to answer
+            let answer: unknown;
+            try {
+              const raw = new TextDecoder().decode(m.data);
+              answer = await fn(raw ? JSON.parse(raw) : {});
+            } catch (e) {
+              answer = { error: `${(e as Error)?.name ?? 'Error'}: ${(e as Error)?.message ?? e}` };
+            }
+            try { m.respond(new TextEncoder().encode(JSON.stringify(answer))); }
+            catch (e) { this.appendLog('SYS', `${subject}: reply failed: ${e}`, 'ERROR'); }
+          }
+        })();
+      }
+    }
+    this.appendLog('SYS', `serving ${Object.keys(opts.handlers).sort().join(', ')} for ${opts.tenants.join(', ')} in queue group '${queue}' (${n} subject(s))`, 'INFO');
+    return n;
+  }
+
   /// §10hn (libzb §10hj): ask a service — request/reply on a subject this principal may
   /// publish to (`query.<tenant>.<name>`), the answer as parsed JSON. No stream, no
   /// position: what a service answers is its own contract.

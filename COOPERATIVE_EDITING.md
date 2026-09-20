@@ -208,3 +208,4 @@ It writes only the LOCAL replica; nothing reaches PostgreSQL.
 | `mutate` | this client's write request | yes, judged there, echoed back |
 | `ingest` | a service's answer into a local table | no |
 | `mergeRegisters` | a pure function on two documents | no, it touches no table at all |
+| `serve` / `reply` | this client ANSWERS questions about its replica (§10hp) | no |

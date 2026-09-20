@@ -3,9 +3,10 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Consumer #2 — a Node microservice on the same core as the browser (NOTES §10)",
+  "description": "Consumer #2 \u2014 a Node microservice on the same core as the browser (NOTES \u00a710)",
   "scripts": {
-    "start": "node --experimental-strip-types index.ts"
+    "start": "node --experimental-strip-types index.ts",
+    "serve": "node --experimental-strip-types serve-worker.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "0.5.8",

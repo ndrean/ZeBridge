@@ -171,6 +171,8 @@ pub const SyncClient = struct {
     cdc_prefix: []const u8 = undefined, // cdc_streams.tenant_prefix — the CDC_<tenant> STREAM prefix
     /// subjects.cdc_prefix — the SUBJECT token (`cdc`), for the consumer's filters.
     subject_cdc_prefix: []const u8 = undefined,
+    /// subjects.query_prefix — `query`, the family a responder answers on (§10hp).
+    subject_query_prefix: []const u8 = "query",
     cdc_public: []const u8 = undefined, // cdc_streams.public
     kv_schemas: []const u8 = undefined, // kv.schemas
     kv_tenants: []const u8 = undefined, // kv.tenants
@@ -225,6 +227,14 @@ pub const SyncClient = struct {
     /// as "in the chain" — replica 1 row, PostgreSQL 13.
     restarted: std.StringHashMapUnmanaged(void) = .empty,
     states: std.StringArrayHashMapUnmanaged(TableState) = .empty,
+    /// §10hp: this client SERVES — the queue subscriptions it drains in `poll`, and the
+    /// requests it has handed the host but not yet answered. A responder is a client
+    /// that answers questions about its own replica; nothing else changes.
+    serve_subs: []*@import("nats").Subscription = &.{},
+    serve_queue: []const u8 = "",
+    pending: std.ArrayListUnmanaged(Pending) = .empty,
+    next_request_id: u64 = 1,
+
     /// §10hn: the tables this replica holds — `opts.tables` (the declared union) or,
     /// with `follow_all`, the schemas bucket's keys as last listed; arena-owned, grows
     /// only when a new key appears.
@@ -395,6 +405,13 @@ pub const SyncClient = struct {
             sub.deinit();
             self.verdicts = null;
         }
+        // §10hp: the serve subscriptions, and the inboxes of questions never answered.
+        // nats.zig panics on a connection destroyed with a live subscription, which is
+        // how this was found the first time it was written.
+        for (self.serve_subs) |sub| sub.deinit();
+        self.serve_subs = &.{};
+        for (self.pending.items) |p| self.a.free(p.reply_subject);
+        self.pending.deinit(self.a);
         self.dropTails();
         self.t.deinit();
     }
@@ -430,6 +447,7 @@ pub const SyncClient = struct {
         self.cdc_prefix = try grammarString(root, &.{ "cdc_streams", "tenant_prefix" });
         self.cdc_public = try grammarString(root, &.{ "cdc_streams", "public" });
         self.subject_cdc_prefix = grammarString(root, &.{ "subjects", "cdc_prefix" }) catch "cdc";
+        self.subject_query_prefix = grammarString(root, &.{ "subjects", "query_prefix" }) catch "query";
         self.kv_schemas = try grammarString(root, &.{ "kv", "schemas" });
         self.kv_tenants = try grammarString(root, &.{ "kv", "tenants" });
         self.kv_live = grammarString(root, &.{ "kv", "live" }) catch "live";
@@ -2801,6 +2819,22 @@ pub const SyncClient = struct {
         t.sub = fresh;
     }
 
+    /// A request taken off a queue subscription and handed to the host: the id the host
+    /// answers with, and the inbox to answer on. Both live in the client's allocator
+    /// until `reply` (or `deinit`) frees them — a poll's arena is gone by then.
+    const Pending = struct {
+        id: u64,
+        reply_subject: []const u8,
+    };
+
+    /// One question for the host, as `poll` reports it.
+    pub const Request = struct {
+        id: u64,
+        tenant: []const u8,
+        name: []const u8,
+        payload: []const u8,
+    };
+
     pub const PollReport = struct {
         applied: usize,
         settled: usize,
@@ -2809,6 +2843,10 @@ pub const SyncClient = struct {
         /// §10fq: tenants whose streams are set aside (unreadable now, retried with
         /// backoff). A host that followed them by choice may `leave` them.
         unreadable: []const []const u8 = &.{},
+        /// §10hp: questions that arrived on this client's `serve` subscriptions. Each
+        /// must be answered with `reply(id, …)`; an unanswered one leaves its asker
+        /// waiting out its own timeout.
+        requests: []const Request = &.{},
     };
 
     /// One turn of the host's loop: wait up to `wait_ms` for CDC on the persistent
@@ -2823,7 +2861,84 @@ pub const SyncClient = struct {
         return self.t.conn.lastAuthError();
     }
 
+    /// §10hp: answer `query.<tenant>.<name>` for these tenants, in ONE queue group.
+    /// Idempotent per call in the sense that it ADDS: calling it twice subscribes
+    /// twice. Returns how many subjects this client now answers.
+    ///
+    /// A responder is a client that answers questions about its own replica. It needs
+    /// no second connection and no thread of its own: the questions arrive on this
+    /// client's socket and are handed to the host by `poll`, like everything else.
+    pub fn serve(self: *SyncClient, tenants: []const []const u8, names: []const []const u8, queue: []const u8) !usize {
+        const ca = self.aa();
+        var subs: std.ArrayListUnmanaged(*@import("nats").Subscription) = .empty;
+        try subs.appendSlice(ca, self.serve_subs);
+        for (tenants) |tenant| {
+            for (names) |name| {
+                const subject = try std.fmt.allocPrint(ca, "{s}.{s}.{s}", .{ self.subject_query_prefix, tenant, name });
+                try subs.append(ca, try self.t.queueSubscribeSync(subject, queue));
+            }
+        }
+        self.serve_queue = try ca.dupe(u8, queue);
+        self.serve_subs = try subs.toOwnedSlice(ca);
+        return self.serve_subs.len;
+    }
+
+    /// Take what is waiting on the serve subscriptions, without blocking. Each becomes
+    /// a `Request` for the host and a `Pending` here, holding the inbox to answer on.
+    fn drainServe(self: *SyncClient, report_a: std.mem.Allocator, out: *std.ArrayListUnmanaged(Request)) !void {
+        const now: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(0), .clock = .awake } };
+        for (self.serve_subs) |sub| {
+            while (true) {
+                const msg = sub.nextMsgTimeout(now) catch break;
+                defer msg.deinit();
+                // No reply subject: nobody is waiting, so there is nothing to answer.
+                const reply_subject = msg.reply orelse continue;
+                const dot = std.mem.lastIndexOfScalar(u8, msg.subject, '.') orelse continue;
+                const head = msg.subject[0..dot];
+                const tenant_dot = std.mem.lastIndexOfScalar(u8, head, '.') orelse continue;
+                const id = self.next_request_id;
+                self.next_request_id += 1;
+                try self.pending.append(self.a, .{ .id = id, .reply_subject = try self.a.dupe(u8, reply_subject) });
+                try out.append(report_a, .{
+                    .id = id,
+                    .tenant = try report_a.dupe(u8, head[tenant_dot + 1 ..]),
+                    .name = try report_a.dupe(u8, msg.subject[dot + 1 ..]),
+                    .payload = try report_a.dupe(u8, msg.data),
+                });
+            }
+        }
+    }
+
+    /// §10hp: the answer to one request, on the asker's inbox. A core publish: no
+    /// stream, no ack, no position. An id answered twice, or never seen, is an error.
+    pub fn reply(self: *SyncClient, id: u64, answer: []const u8) !void {
+        for (self.pending.items, 0..) |p, i| {
+            if (p.id != id) continue;
+            defer {
+                self.a.free(p.reply_subject);
+                _ = self.pending.orderedRemove(i);
+            }
+            try self.t.publishCore(p.reply_subject, answer);
+            return;
+        }
+        return error.UnknownRequest;
+    }
+
+    /// The host's loop body. With `serve` subscriptions the questions are drained
+    /// BEFORE the CDC wait and again after it, so `wait_ms` bounds how long a question
+    /// can sit unseen: a responder polls with a short wait.
     pub fn poll(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
+        var requests: std.ArrayListUnmanaged(Request) = .empty;
+        if (self.serve_subs.len > 0) try self.drainServe(report_a, &requests);
+        var r = try self.pollInner(report_a, wait_ms);
+        if (self.serve_subs.len > 0) {
+            try self.drainServe(report_a, &requests);
+            r.requests = requests.items;
+        }
+        return r;
+    }
+
+    fn pollInner(self: *SyncClient, report_a: std.mem.Allocator, wait_ms: u64) !PollReport {
         try self.refuseIfRevoked();
 
         var changed_map: std.StringArrayHashMapUnmanaged(void) = .empty;

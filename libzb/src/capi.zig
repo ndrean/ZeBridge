@@ -25,7 +25,9 @@
 //!                                                                    // §10hj: ask a service on `query.<tenant>.<name>`; its reply verbatim
 //!   char* zb_client_ingest(uint64_t h, const char* table, const char* answer_json, const char* scope_json);
 //!                                                                    // §10hj: keep an answer ({"columns","rows"}) in an on-demand table → {"applied":n}
-//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"unreadable":[…]?} — live tail, blocks ≤ wait_ms
+//!   char* zb_client_poll(uint64_t h, uint64_t wait_ms);            // {"applied":n,"settled":n,…,"requests":[…]?,"unreadable":[…]?} — live tail, blocks ≤ wait_ms
+//!   char* zb_client_serve(uint64_t h, const char* opts_json);      // §10hp: answer query.<tenant>.<name> in a queue group → {"serving":n}
+//!   char* zb_client_reply(uint64_t h, uint64_t id, const char* answer_json);  // §10hp: answer one request from poll
 //!   char* zb_client_join(uint64_t h, const char* tenant);          // {"tenants":[…]} — follow one more tenant (§10fn)
 //!   char* zb_client_leave(uint64_t h, const char* tenant);         // {"tenants":[…]} — drop one: its rows, watermarks, tail
 //! `opts_json`: natsUrl, credsPath, dbPath, principal, tables (array, parents first — or
@@ -741,6 +743,25 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     for (r.seeded) |t| try seeded.append(.{ .string = t });
     try out.put(a, "seeded", .{ .array = seeded });
 
+    // §10hp: the questions this client was asked, when it serves any. Each must be
+    // answered with `zb_client_reply(h, id, answer_json)`.
+    if (r.requests.len > 0) {
+        var reqs = std.json.Array.init(a);
+        for (r.requests) |q| {
+            var one: std.json.ObjectMap = .empty;
+            try one.put(a, "id", .{ .integer = @intCast(q.id) });
+            try one.put(a, "tenant", .{ .string = q.tenant });
+            try one.put(a, "name", .{ .string = q.name });
+            // The payload is the asker's JSON, parsed here so the host gets an object
+            // rather than a string it must parse again; unparseable payloads arrive as
+            // null and the host answers an error, which is the asker's problem.
+            const parsed = std.json.parseFromSlice(Value, a, if (q.payload.len > 0) q.payload else "null", .{}) catch null;
+            try one.put(a, "payload", if (parsed) |p| p.value else .null);
+            try reqs.append(.{ .object = one });
+        }
+        try out.put(a, "requests", .{ .array = reqs });
+    }
+
     // §10fq: tenants whose streams are set aside — present only when there are some.
     if (r.unreadable.len > 0) {
         var unreadable = std.json.Array.init(a);
@@ -749,6 +770,43 @@ fn pollJson(a: std.mem.Allocator, b: *ClientBox, wait_ms: u64) ![]const u8 {
     }
 
     return try core.valueToString(a, .{ .object = out });
+}
+
+/// §10hp: answer `query.<tenant>.<name>` on this client's own connection, in a queue
+/// group. `opts_json`: {"tenants": ["kilo","_default"], "queries": ["fuel_near", …],
+/// "queue": "pois"}. Returns {"serving": n}, the number of subjects answered.
+///
+/// The questions arrive in `zb_client_poll`'s report as `requests`; each is answered
+/// with `zb_client_reply`. No second connection, no thread, no lock: a responder is a
+/// client that answers questions about its own replica.
+export fn zb_client_serve(handle: u64, opts_json: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const text = std.mem.span(opts_json orelse return errJson("NoOptions"));
+    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = std.json.parseFromSlice(Value, a, text, .{}) catch return errJson("BadJson");
+    const o = parsed.value;
+    if (o != .object) return errJson("NotAnObject");
+    const tenants = strArrField(a, o, "tenants") catch return errJson("OutOfMemory");
+    const names = strArrField(a, o, "queries") catch return errJson("OutOfMemory");
+    if (tenants.len == 0 or names.len == 0) return errJson("NothingToServe");
+    const qv = o.object.get("queue") orelse Value.null;
+    const queue = if (qv == .string and qv.string.len > 0) qv.string else "zb";
+    const n = b.c.serve(tenants, names, queue) catch |err| return errJson(@errorName(err));
+    const out = std.fmt.allocPrint(a, "{{\"serving\":{d}}}", .{n}) catch return errJson("OutOfMemory");
+    return dupeZ(out);
+}
+
+/// §10hp: the answer to one question from `poll`'s `requests`, on the asker's inbox.
+/// `answer_json` is sent as it stands. Returns {"replied":<id>}.
+export fn zb_client_reply(handle: u64, id: u64, answer_json: ?[*:0]const u8) ?[*:0]u8 {
+    const b = lookup(handle) orelse return errJson("UnknownHandle");
+    const answer = std.mem.span(answer_json orelse return errJson("NoAnswer"));
+    b.c.reply(id, answer) catch |err| return errJson(@errorName(err));
+    var buf: [64]u8 = undefined;
+    const out = std.fmt.bufPrint(&buf, "{{\"replied\":{d}}}", .{id}) catch return errJson("OutOfMemory");
+    return dupeZ(out);
 }
 
 /// The host's loop body: `while (running) poll(h, 1000)`. Returns as soon as a CDC

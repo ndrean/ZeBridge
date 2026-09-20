@@ -14,7 +14,9 @@ import { Objm } from '@nats-io/obj';
 export interface TransportConnection {
   close(): Promise<void>;
   status(): AsyncIterable<unknown>;
-  subscribe(subject: string): AsyncIterable<any>;
+  /// `opts.queue` puts this subscription in a QUEUE GROUP: one member of the group
+  /// gets each message, which is how a responder scales and fails over (§10hp).
+  subscribe(subject: string, opts?: { queue?: string }): AsyncIterable<any>;
   /// §10hn: request/reply — the on-demand `request` (a `query.<tenant>.<name>` ask).
   request(subject: string, data: Uint8Array, opts?: { timeout?: number }): Promise<{ data: Uint8Array }>;
   rtt(): Promise<number>;

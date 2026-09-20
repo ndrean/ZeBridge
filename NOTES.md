@@ -14558,3 +14558,47 @@ The one shape that would earn a sequence type is the tour's list of stops edited
 concurrently, and even that is a list of registers with fractional positions in the
 same jsonb. LWW and the registers are one rule at two grain sizes.
 
+## 10hp. `serve`: a responder is a client that answers (2026-09-20)
+
+The POI service was an application doing what a library should: a second NATS
+connection (nats-py) beside libzb's, a background thread polling the replica, and a
+LOCK between them because the card is not made for two threads. That lock set the
+service's shape — the poll waited 100 ms and not a second, so a question would not sit
+behind it — and it was the reason the plan carried "a Zig verb instead of a Python
+script" as an open box. The verb is here, in both libraries, and the second connection,
+the thread and the lock are gone.
+
+**libzb**, host-driven as everything else is: `zb_client_serve(h, {"tenants": […],
+"queries": […], "queue": "pois"})` subscribes `query.<tenant>.<name>` for the product of
+the two lists, in one queue group, on the client's OWN connection. The questions arrive
+in `zb_client_poll`'s report as `requests` — id, tenant, name, and the asker's payload
+parsed — and each is answered with `zb_client_reply(h, id, answer_json)`, a core publish
+to the inbox the library kept. The subscription is drained before the CDC wait and again
+after it, so `wait_ms` bounds how long a question can sit unseen: a responder polls with
+a short wait, which is what the service always did. nats.zig had `queueSubscribeSync`
+already; no patch was needed.
+
+**zb-client-ts**, self-driven as everything else is: `serve({tenants, handlers, queue})`
+where a handler takes the parsed payload and returns the answer. The library subscribes,
+dispatches, encodes and replies. A handler that THROWS answers `{"error": …}` rather
+than letting the asker time out, which is the difference between a service that says no
+and one that looks dead.
+
+The example service lost 40 lines and gained a loop that reads like the protocol: poll,
+answer what came, repeat. `examples/04-node-consumer/serve-worker.ts` is the same
+responder in the other library, which is what made the parity provable.
+
+Measured (`serve.py`, client group, 8 checks): one libzb responder and one
+zb-client-ts responder in ONE queue group, both answering `count` from their own
+replica. Every answer equalled PostgreSQL; the twenty asks were shared 11 to 9, which is
+the queue group doing what a region needs; the throwing handler answered an error; and a
+CLIENT credential was refused the query subscription, so nobody poses as a service
+(§10hk). The map's own service, rewired, still answers E10 in ~95 ms and a four-stop
+tour with its corridor.
+
+One bug, found the good way. The first `serve` created subscriptions that `deinit`
+never released, and nats.zig panics on a connection destroyed with a live subscription:
+"call sub.deinit() on every subscription before destroying its connection". The guard
+named the defect before a leak could hide it. Released now, with the inboxes of any
+question never answered.
+
