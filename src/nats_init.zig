@@ -99,6 +99,7 @@ fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Ro
     const subj_mut = topo.subject_mutations_prefix; // "mutation"
     const subj_ack = topo.mutation_ack_prefix; // "mutation_ack"
     const subj_query = topo.query_prefix; // "query" (§10hj: a service answers, a client asks)
+    const res_pre = topo.results_bucket_prefix; // "res-" (§10hq: answers too large for one message)
 
     var pubs: std.ArrayList([]u8) = .empty;
     var subs: std.ArrayList([]u8) = .empty;
@@ -143,6 +144,16 @@ fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Ro
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.KV_{s}.$KV.{s}.{{{{name()}}}}", .{ kv_tenants, kv_tenants });
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{{{{tag(tenant)}}}}.>", .{obj_pre});
     try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{s}.>", .{ obj_pre, open });
+    // §10hq: the ANSWER bucket of a tenant. A client READS it: an answer too large for
+    // one message names an object, and the library fetches it so the host never sees the
+    // difference. A responder also CREATES and WRITES it, below.
+    inline for (.{ "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "STREAM.MSG.GET" }) |op| {
+        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{{{{tag(tenant)}}}}", .{ op, res_pre });
+        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ op, res_pre });
+        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{s}", .{ op, res_pre, open });
+        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{s}.>", .{ op, res_pre, open });
+    }
+
     try P.add(&pubs, a, "$JS.ACK.>", .{});
     // Its own verdict marker, both roles: the revocation check at connect reads
     // `mutation_ack.<name>.revoked` (§10hl) — a responder is a principal too.
@@ -161,6 +172,12 @@ fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Ro
             // §10hk: a responder ANSWERS its tenants' queries — the reply goes to the
             // asker's inbox, whichever it is.
             try P.add(&pubs, a, "_INBOX.>", .{});
+            // §10hq: and it WRITES the answers too large to send inline — creating the
+            // tenant's answer bucket on first use, then publishing the object's chunks.
+            try P.add(&pubs, a, "$JS.API.STREAM.CREATE.OBJ_{s}{{{{tag(tenant)}}}}", .{res_pre});
+            try P.add(&pubs, a, "$JS.API.STREAM.CREATE.OBJ_{s}{s}", .{ res_pre, open });
+            try P.add(&pubs, a, "$O.{s}{{{{tag(tenant)}}}}.>", .{res_pre});
+            try P.add(&pubs, a, "$O.{s}{s}.>", .{ res_pre, open });
             try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
             try P.add(&subs, a, "{s}.{s}.>", .{ subj_query, open });
         },

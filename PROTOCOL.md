@@ -175,6 +175,13 @@ flowchart TD
 
 ### `query.<tenant>.<name>` is request/reply, not a stream
 
+An answer too large for one message (`results.inline_max_bytes`, 256 KB) is written to
+the asking tenant's object store `res-<tenant>` and the reply is
+`{"zb_object": {"bucket", "name", "bytes"}}` naming it; the asking library fetches it and
+hands the host the answer, so a host never sees which way an answer travelled. The bucket
+is created on first use with `results.max_age_seconds` (600), so answers expire on their
+own and nobody sweeps them.
+
 A client may publish to `query.<tenant>.<name>` for its own tenant and the open one; a
 service holding a **responder** credential (SECURITY §1.6) — tagged with the tenants it
 serves, granted the query subjects of those tenants and the open one, and replies to any

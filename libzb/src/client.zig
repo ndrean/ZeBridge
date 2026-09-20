@@ -173,6 +173,11 @@ pub const SyncClient = struct {
     subject_cdc_prefix: []const u8 = undefined,
     /// subjects.query_prefix — `query`, the family a responder answers on (§10hp).
     subject_query_prefix: []const u8 = "query",
+    /// §10hq: answers too large for one message. The bucket is `<prefix><tenant>`, an
+    /// answer above `inline_max` becomes an object there, and it lives `max_age`.
+    results_bucket_prefix: []const u8 = "res-",
+    results_inline_max: usize = 262_144,
+    results_max_age_ns: u64 = 600 * std.time.ns_per_s,
     cdc_public: []const u8 = undefined, // cdc_streams.public
     kv_schemas: []const u8 = undefined, // kv.schemas
     kv_tenants: []const u8 = undefined, // kv.tenants
@@ -410,7 +415,10 @@ pub const SyncClient = struct {
         // how this was found the first time it was written.
         for (self.serve_subs) |sub| sub.deinit();
         self.serve_subs = &.{};
-        for (self.pending.items) |p| self.a.free(p.reply_subject);
+        for (self.pending.items) |p| {
+            self.a.free(p.reply_subject);
+            self.a.free(p.tenant);
+        }
         self.pending.deinit(self.a);
         self.dropTails();
         self.t.deinit();
@@ -448,6 +456,15 @@ pub const SyncClient = struct {
         self.cdc_public = try grammarString(root, &.{ "cdc_streams", "public" });
         self.subject_cdc_prefix = grammarString(root, &.{ "subjects", "cdc_prefix" }) catch "cdc";
         self.subject_query_prefix = grammarString(root, &.{ "subjects", "query_prefix" }) catch "query";
+        self.results_bucket_prefix = grammarString(root, &.{ "results", "bucket_prefix" }) catch "res-";
+        if (root.object.get("results")) |rv| if (rv == .object) {
+            if (rv.object.get("inline_max_bytes")) |v| if (v == .integer and v.integer > 0) {
+                self.results_inline_max = @intCast(v.integer);
+            };
+            if (rv.object.get("max_age_seconds")) |v| if (v == .integer and v.integer >= 0) {
+                self.results_max_age_ns = @as(u64, @intCast(v.integer)) * std.time.ns_per_s;
+            };
+        };
         self.kv_schemas = try grammarString(root, &.{ "kv", "schemas" });
         self.kv_tenants = try grammarString(root, &.{ "kv", "tenants" });
         self.kv_live = grammarString(root, &.{ "kv", "live" }) catch "live";
@@ -2825,6 +2842,9 @@ pub const SyncClient = struct {
     const Pending = struct {
         id: u64,
         reply_subject: []const u8,
+        /// §10hq: which tenant asked — an answer too large for one message goes to
+        /// THAT tenant's bucket, which is the only one its asker may read.
+        tenant: []const u8,
     };
 
     /// One question for the host, as `poll` reports it.
@@ -2898,7 +2918,11 @@ pub const SyncClient = struct {
                 const tenant_dot = std.mem.lastIndexOfScalar(u8, head, '.') orelse continue;
                 const id = self.next_request_id;
                 self.next_request_id += 1;
-                try self.pending.append(self.a, .{ .id = id, .reply_subject = try self.a.dupe(u8, reply_subject) });
+                try self.pending.append(self.a, .{
+                    .id = id,
+                    .reply_subject = try self.a.dupe(u8, reply_subject),
+                    .tenant = try self.a.dupe(u8, head[tenant_dot + 1 ..]),
+                });
                 try out.append(report_a, .{
                     .id = id,
                     .tenant = try report_a.dupe(u8, head[tenant_dot + 1 ..]),
@@ -2916,9 +2940,32 @@ pub const SyncClient = struct {
             if (p.id != id) continue;
             defer {
                 self.a.free(p.reply_subject);
+                self.a.free(p.tenant);
                 _ = self.pending.orderedRemove(i);
             }
-            try self.t.publishCore(p.reply_subject, answer);
+            // §10hq: an answer that fits goes as it is. One that does not becomes an
+            // OBJECT in the asking tenant's bucket, and the reply is a small envelope
+            // naming it — which the asking library resolves, so the host never sees the
+            // difference. NATS caps a message near a megabyte; a service that answers
+            // rows cannot promise to stay under it.
+            if (answer.len <= self.results_inline_max) {
+                try self.t.publishCore(p.reply_subject, answer);
+                return;
+            }
+            var sa = std.heap.ArenaAllocator.init(self.a);
+            defer sa.deinit();
+            const a = sa.allocator();
+            const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.results_bucket_prefix, p.tenant });
+            // Unique-enough per process: pid, a monotonic counter and the request id
+            // (std.crypto.random wants an Io in 0.16; libc is already linked). The
+            // object lives minutes and is read once.
+            const Ctr = struct {
+                var n = std.atomic.Value(u32).init(0);
+            };
+            const name = try std.fmt.allocPrint(a, "ans-{d}-{d}-{d}", .{ std.c.getpid(), Ctr.n.fetchAdd(1, .monotonic), id });
+            try self.t.objectPutBytes(bucket, name, answer, self.results_max_age_ns);
+            const envelope = try std.fmt.allocPrint(a, "{{\"zb_object\":{{\"bucket\":\"{s}\",\"name\":\"{s}\",\"bytes\":{d}}}}}", .{ bucket, name, answer.len });
+            try self.t.publishCore(p.reply_subject, envelope);
             return;
         }
         return error.UnknownRequest;
@@ -3329,7 +3376,29 @@ pub const SyncClient = struct {
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@max(1, timeout_ms))), .clock = .awake } };
         const msg = try self.t.conn.request(subject, payload, t);
         defer msg.deinit();
+        // §10hq: an answer too large for one message arrives as a small envelope naming
+        // an object; read it and hand back the answer itself. The host asked a question
+        // and gets an answer, whichever way it travelled.
+        if (try self.objectEnvelope(a, msg.data)) |fetched| return fetched;
         return try a.dupe(u8, msg.data);
+    }
+
+    /// `{"zb_object":{"bucket","name","bytes"}}` → the object's bytes; null when the
+    /// reply is an ordinary answer. Anything malformed is treated as an ordinary
+    /// answer: a service is free to send a body that happens to have one of these keys.
+    fn objectEnvelope(self: *SyncClient, a: std.mem.Allocator, body: []const u8) !?[]u8 {
+        if (body.len == 0 or body[0] != '{') return null;
+        if (std.mem.indexOf(u8, body, "\"zb_object\"") == null) return null;
+        var sa = std.heap.ArenaAllocator.init(self.a);
+        defer sa.deinit();
+        const parsed = std.json.parseFromSlice(Value, sa.allocator(), body, .{}) catch return null;
+        if (parsed.value != .object) return null;
+        const env = parsed.value.object.get("zb_object") orelse return null;
+        if (env != .object) return null;
+        const bucket = env.object.get("bucket") orelse return null;
+        const name = env.object.get("name") orelse return null;
+        if (bucket != .string or name != .string) return null;
+        return try self.t.objectGetBytes(a, bucket.string, name.string);
     }
 
     /// A service's answer into a table, `{"columns":[…],"rows":[[…],…]}` — the chain

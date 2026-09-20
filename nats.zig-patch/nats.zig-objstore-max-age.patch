@@ -1,0 +1,43 @@
+diff --git a/src/jetstream_objstore.zig b/src/jetstream_objstore.zig
+index c37ff29..3e0555e 100644
+--- a/src/jetstream_objstore.zig
++++ b/src/jetstream_objstore.zig
+@@ -166,6 +166,12 @@ pub const ObjectStoreConfig = struct {
+     compression: bool = false,
+     /// Chunk size
+     chunk_size: u32 = DEFAULT_CHUNK_SIZE,
++    /// How long an object lives, in NANOSECONDS; 0 keeps it for ever (the default, and
++    /// what every store created before this got). It is the backing stream's `max_age`,
++    /// which the store's own config had no way to set — so a bucket of TRANSIENT
++    /// objects (an answer too large for one message, a cache) had to be swept by hand.
++    /// nats.go spells it `TTL` on ObjectStoreConfig.
++    max_age_ns: u64 = 0,
+ };
+ 
+ /// ObjectResult provides streaming access to object data with integrated reading capabilities
+@@ -572,7 +578,7 @@ pub const ObjectStore = struct {
+         const chunk_subject = try self.getChunkSubject(obj_info.nuid);
+         defer self.allocator.free(chunk_subject);
+ 
+-        const inbox = try newInbox(self.allocator);
++        const inbox = try self.js.nc.newInbox(self.allocator);
+         defer self.allocator.free(inbox);
+ 
+         const consumer_config = ConsumerConfig{
+@@ -735,7 +741,7 @@ pub const ObjectStore = struct {
+         const meta_filter = try std.fmt.allocPrint(self.allocator, "{s}>", .{self.meta_subject_prefix});
+         defer self.allocator.free(meta_filter);
+ 
+-        const inbox = try newInbox(self.allocator);
++        const inbox = try self.js.nc.newInbox(self.allocator);
+         defer self.allocator.free(inbox);
+ 
+         const consumer_config = ConsumerConfig{
+@@ -862,6 +868,7 @@ pub const ObjectStoreManager = struct {
+             .compression = if (config.compression) .s2 else .none,
+             .num_replicas = config.replicas,
+             .discard = .new,
++            .max_age = config.max_age_ns,
+             .allow_direct = true,
+             .allow_rollup_hdrs = true,
+         };

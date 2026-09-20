@@ -243,6 +243,22 @@ pub const Transport = struct {
         return try a.dupe(u8, res.value);
     }
 
+    /// §10hq: write one object into a bucket that may not exist yet. The bucket is
+    /// created with `max_age_ns` so the answers in it expire on their own: nobody
+    /// sweeps a result store. Creating a bucket that exists is not an error here —
+    /// the create is attempted once and its refusal ignored, which is cheaper than a
+    /// STREAM.INFO on every large answer.
+    pub fn objectPutBytes(self: *Transport, bucket: []const u8, name: []const u8, data: []const u8, max_age_ns: u64) !void {
+        var mgr = self.js.objectStoreManager();
+        if (mgr.createStore(.{ .store_name = bucket, .max_age_ns = max_age_ns, .description = "ZeBridge answers (§10hq)" })) |store| {
+            var s = store;
+            s.deinit();
+        } else |_| {}
+        const os = try self.objectStore(bucket);
+        var res = try os.putBytes(name, data);
+        res.deinit();
+    }
+
     /// JetStream publish; `msg_id` is the idempotency key (the envelope's).
     pub fn publish(self: *Transport, subject: []const u8, data: []const u8, msg_id: ?[]const u8) !void {
         var res = try self.js.publish(subject, data, .{ .msg_id = msg_id });

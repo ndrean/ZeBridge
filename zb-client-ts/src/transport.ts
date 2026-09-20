@@ -41,6 +41,9 @@ export interface Transport {
   jetstreamManager(nc: any): Promise<any>;
   kv(nc: any, bucket: string, opts?: Record<string, unknown>): Promise<any>;
   objectStore(nc: any, bucket: string): Promise<any>;
+  /// §10hq: the answer bucket of a tenant, created on first use with a `max_age` so
+  /// the answers in it expire on their own. Opening an existing one is not an error.
+  objectStoreCreate(nc: any, bucket: string, opts: { max_age_ns: number }): Promise<any>;
   deliverPolicy: typeof DELIVER_POLICY;
 }
 
@@ -52,5 +55,6 @@ export const natsTransport: Transport = {
   jetstreamManager: (nc) => jetstreamManager(nc),
   kv: (nc, bucket, opts) => new Kvm(nc).open(bucket, opts as any),
   objectStore: (nc, bucket) => new Objm(nc).open(bucket),
+  objectStoreCreate: (nc, bucket, opts) => new Objm(nc).create(bucket, { max_age: opts.max_age_ns, description: 'ZeBridge answers (§10hq)' } as any),
   deliverPolicy: DELIVER_POLICY,
 };

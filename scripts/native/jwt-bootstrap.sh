@@ -87,6 +87,21 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_CLIENT" --role client \
     --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
+    # §10hq: the answer bucket of a tenant — an answer too large for one message.
+    --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-_default" \
+    --allow-pub "\$JS.API.DIRECT.GET.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.OBJ_res-_default.>" \
+    --allow-pub "\$JS.API.STREAM.MSG.GET.OBJ_res-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.STREAM.MSG.GET.OBJ_res-_default" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-_default" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-_default.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_res-_default.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_res-_default.>" \
     --allow-pub "\$JS.ACK.>" \
     --allow-pub "\$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>" \
     --allow-pub "query.{{tag(tenant)}}.>" \
@@ -147,6 +162,25 @@ nsc edit signing-key --account ZEBRIDGE --sk "$SK_RESPONDER" --role responder \
     --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_gen-_default.>" \
     --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_gen-_default.>" \
+    # §10hq: the answer bucket of a tenant — an answer too large for one message.
+    --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.STREAM.INFO.OBJ_res-_default" \
+    --allow-pub "\$JS.API.DIRECT.GET.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.DIRECT.GET.OBJ_res-_default.>" \
+    --allow-pub "\$JS.API.STREAM.MSG.GET.OBJ_res-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.STREAM.MSG.GET.OBJ_res-_default" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-_default" \
+    --allow-pub "\$JS.API.CONSUMER.CREATE.OBJ_res-_default.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.INFO.OBJ_res-_default.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_res-{{tag(tenant)}}.>" \
+    --allow-pub "\$JS.API.CONSUMER.MSG.NEXT.OBJ_res-_default.>" \
+    --allow-pub "\$JS.API.STREAM.CREATE.OBJ_res-{{tag(tenant)}}" \
+    --allow-pub "\$JS.API.STREAM.CREATE.OBJ_res-_default" \
+    --allow-pub "\$O.res-{{tag(tenant)}}.>" \
+    --allow-pub "\$O.res-_default.>" \
     --allow-pub "\$JS.ACK.>" \
     --allow-pub "\$JS.API.DIRECT.GET.MUTATIONS.mutation_ack.{{name()}}.>" \
     --allow-pub "_INBOX.>" \

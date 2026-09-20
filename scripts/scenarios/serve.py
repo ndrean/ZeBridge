@@ -16,7 +16,11 @@ each KIND at once, in ONE queue group, and asks them.
   D  a handler that throws answers an ERROR, not a timeout: a service that says no is
      not a service that looks dead;
   E  the role boundary holds: a CLIENT credential may ask but may NOT subscribe a query
-     subject, so nobody can pose as a service (§10hk).
+     subject, so nobody can pose as a service (§10hk);
+  F  an answer too large for one NATS message (§10hq) travels as an OBJECT in the asking
+     tenant's bucket and arrives WHOLE, both ways round: a libzb responder answering a
+     zb-client-ts asker, and the reverse. A raw NATS client sees the envelope, which is
+     what proves the object path was taken rather than a big message squeezing through.
 
 Usage:  scripts/scenarios/.venv/bin/python scripts/scenarios/serve.py
 """
@@ -51,7 +55,7 @@ class ZigResponder:
         if not self.h:
             sys.exit("libzb open failed")
         self.take(lib.zb_client_sync(self.h))
-        r = self.take(lib.zb_client_serve(self.h, json.dumps({"tenants": [TENANT], "queries": ["count"], "queue": QUEUE}).encode()))
+        r = self.take(lib.zb_client_serve(self.h, json.dumps({"tenants": [TENANT], "queries": ["count", "zigbig"], "queue": QUEUE}).encode()))
         if "error" in r:
             sys.exit(f"libzb serve refused: {r['error']}")
         self.serving = r["serving"]
@@ -68,9 +72,14 @@ class ZigResponder:
         rep = self.take(self.lib.zb_client_poll(self.h, wait_ms))
         for q in rep.get("requests", []):
             t0 = time.time()
-            rows = self.take(self.lib.zb_client_query(self.h, f"SELECT count(*) AS n FROM {TABLE}".encode(), b"[]"))
-            n = rows["rows"][0][0] if rows.get("rows") else None
-            ans = {"table": TABLE, "count": n, "ms": round((time.time() - t0) * 1000, 1), "answered_by": self.label}
+            if q["name"] == "zigbig":
+                # §10hq: deliberately past one message — the library turns it into an object.
+                n = int((q.get("payload") or {}).get("rows", 20000))
+                ans = {"rows": [[i, f"row {i} " + "x" * 40] for i in range(n)], "count": n, "answered_by": self.label}
+            else:
+                rows = self.take(self.lib.zb_client_query(self.h, f"SELECT count(*) AS n FROM {TABLE}".encode(), b"[]"))
+                ans = {"table": TABLE, "count": rows["rows"][0][0] if rows.get("rows") else None, "answered_by": self.label}
+            ans["ms"] = round((time.time() - t0) * 1000, 1)
             self.take(self.lib.zb_client_reply(self.h, q["id"], json.dumps(ans).encode()))
             self.answered += 1
 
@@ -94,10 +103,10 @@ async def main() -> int:
     zb.ok(f"libzb serves {zig.serving} subject(s) in queue group {QUEUE!r} on its own connection")
 
     # The zb-client-ts responder, as a separate process — the other library, same group.
-    env = dict(os.environ, ZB_LABEL="ts", ZB_TABLES=TABLE, ZB_QUEUE=QUEUE, ZB_TENANTS=TENANT,
-               ZB_DB=str(tmp / "ts.sqlite3"), NATS_URL=zb.nats_server())
+    env_ts = dict(os.environ, ZB_LABEL="ts", ZB_TABLES=TABLE, ZB_QUEUE=QUEUE, ZB_TENANTS=TENANT,
+                  ZB_DB=str(tmp / "ts.sqlite3"), NATS_URL=zb.nats_server())
     ts = subprocess.Popen(["pnpm", "serve"], cwd=REPO / "examples" / "04-node-consumer",
-                          env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                          env=env_ts, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         deadline = time.time() + 60
         while time.time() < deadline:
@@ -178,6 +187,66 @@ async def main() -> int:
             zb.ok("a client credential may ASK but may not SUBSCRIBE a query subject — nobody poses as a service")
         else:
             zb.bad("a client credential subscribed a query subject")
+            failed += 1
+
+        # ── F. an answer too large for one message ──────────────────────────
+        BIG = 20000
+        # F1: a RAW NATS client sees the envelope — the object path was taken
+        fut = asyncio.create_task(ask(nc, "zigbig", {"rows": BIG}, timeout=20))
+        for _ in range(400):
+            if fut.done():
+                break
+            zig.turn(20)
+            await asyncio.sleep(0)
+        raw = await asyncio.wait_for(fut, timeout=20)
+        env = raw.get("zb_object") if isinstance(raw, dict) else None
+        if env and env.get("bucket") == f"res-{TENANT}" and env.get("bytes", 0) > 262_144:
+            zb.ok(f"a raw client sees the ENVELOPE: {env['bytes']:,} bytes in {env['bucket']} — past one message, so it went as an object")
+        else:
+            zb.bad(f"the large answer did not travel as an object: {str(raw)[:120]}")
+            failed += 1
+
+        # F2: zb-client-ts ASKS the libzb responder and resolves it whole
+        # An asker is a CLIENT principal: a responder may answer and may not ask (§10hk).
+        ask_env = dict(env_ts, ZB_PRINCIPAL="omar", ZB_ASK="zigbig", ZB_ASK_PAYLOAD=json.dumps({"rows": BIG}),
+                       ZB_DB=str(tmp / "ts-ask.sqlite3"))
+        asker = subprocess.Popen(["pnpm", "serve"], cwd=REPO / "examples" / "04-node-consumer",
+                                 env=ask_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        line, deadline = "", time.time() + 90
+        while time.time() < deadline:
+            zig.turn(20)                      # the libzb responder must be driven meanwhile
+            if asker.poll() is not None and not line:
+                break
+            import select
+            if select.select([asker.stdout], [], [], 0.05)[0]:
+                got = asker.stdout.readline()
+                if got.startswith("ASKED "):
+                    line = got[len("ASKED "):].strip()
+                    break
+        asker.terminate()
+        try:
+            got = json.loads(line) if line else {}
+        except Exception:
+            got = {}
+        if got.get("rows") == BIG and got.get("envelope_resolved"):
+            zb.ok(f"zb-client-ts resolved a libzb responder's large answer whole: {got['rows']:,} rows in {got.get('ms')} ms")
+        else:
+            zb.bad(f"the TS asker did not resolve the large answer: {line[:140] or '(no line)'}")
+            failed += 1
+
+        # F3: the bucket expires on its own — nobody sweeps a result store
+        js = nc.jetstream()
+        try:
+            si = await js.stream_info(f"OBJ_res-{TENANT}")
+            # nats-py reports max_age in SECONDS (it converts the wire's nanoseconds).
+            age_s = float(si.config.max_age or 0)
+            if age_s > 0:
+                zb.ok(f"the answer bucket expires on its own: OBJ_res-{TENANT} max_age {age_s:.0f} s")
+            else:
+                zb.bad(f"OBJ_res-{TENANT} has no max_age — answers would accumulate for ever")
+                failed += 1
+        except Exception as e:
+            zb.bad(f"the answer bucket is missing: {type(e).__name__}")
             failed += 1
 
         await nc.close()

@@ -392,7 +392,7 @@ Two credential shapes, on purpose:
 | --- | --- | --- |
 | the bridge | nkey, seed passed on the command line, in no env file | `publish: >`, `subscribe: >` — it is the trusted writer and already holds replication rights |
 | a client | user/password today, JWT next | allow-listed to its own subtree, **its reply inbox included** (`_INBOX.<principal>.>`) |
-| a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants and `publish: _INBOX.>` for the replies — no mutations, no heartbeat key, no asking |
+| a responder | JWT under the account's **responder** signing key, tagged with the tenants it serves | a client's read side, plus `subscribe: query.<tenant>.>` for its tenants, `publish: _INBOX.>` for the replies, and create/write on `OBJ_res-<tenant>` for answers too large to send inline (§10hq) — no mutations, no heartbeat key, no asking |
 
 **A responder answers, it never writes.** A service that answers `query.<tenant>.<name>`
 from a replica (PROTOCOL §2) holds a responder credential, not the bridge's: it follows

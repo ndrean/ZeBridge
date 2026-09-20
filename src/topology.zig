@@ -110,6 +110,12 @@ pub const Topology = struct {
     /// bridge neither publishes nor subscribes here; it renders the grant (a client may
     /// publish to its tenant's queries) and serves the name in the grammar.
     query_prefix: []const u8,
+    /// §10hq: answers too large for one message. `results.bucket_prefix` + the tenant is
+    /// the object store they go to; `inline_max_bytes` is the size above which an answer
+    /// becomes an object instead of a reply body; `max_age_seconds` is how long it lives.
+    results_bucket_prefix: []const u8,
+    results_inline_max_bytes: u64,
+    results_max_age_seconds: u64,
     query_pattern: []const u8,
 
     // ─── KV buckets ─────────────────────────────────────────────────────────────
@@ -188,6 +194,9 @@ pub const Topology = struct {
         .mutation_ack_prefix = "mutation_ack",
         .mutation_ack_pattern = "mutation_ack.{[principal]s}.{[msg_id]s}",
         .query_prefix = "query",
+        .results_bucket_prefix = "res-",
+        .results_inline_max_bytes = 262_144,
+        .results_max_age_seconds = 600,
         .query_pattern = "query.{[tenant]s}.{[name]s}",
         .kv_schemas = "schemas",
         .kv_tenants = "tenants",
@@ -218,7 +227,6 @@ pub fn loadEmbedded(allocator: std.mem.Allocator) !Owned {
 }
 
 fn parseBytes(allocator: std.mem.Allocator, bytes: []const u8) !Owned {
-
     var diag: Diagnostic = .{};
     return parse(allocator, bytes, &diag) catch |err| {
         log.err("🔴 embedded grammar: {s} at \"{s}\".\"{s}\" — the build embedded a malformed grammar.json", .{ @errorName(err), diag.context, diag.detail });
@@ -293,9 +301,21 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8, diag: ?*Diagnostic
     t.mutation_ack_pattern = try str(a, subjects, "subjects", "mutation_ack_pattern", diag);
     // Optional: a grammar from before §10hj has no query family and keeps the default.
     t.query_prefix = strOr(a, subjects, "query_prefix", "query") catch "query";
+    t.results_bucket_prefix = "res-";
+    t.results_inline_max_bytes = 262_144;
+    t.results_max_age_seconds = 600;
+    // §10hq: optional — a grammar written before large answers has no `results` block,
+    // and every value here has a default that matches the one shipped.
+    if (root.get("results")) |rv| if (rv == .object) {
+        t.results_bucket_prefix = strOr(a, rv.object, "bucket_prefix", "res-") catch "res-";
+        if (rv.object.get("inline_max_bytes")) |v| if (v == .integer and v.integer > 0) {
+            t.results_inline_max_bytes = @intCast(v.integer);
+        };
+        if (rv.object.get("max_age_seconds")) |v| if (v == .integer and v.integer >= 0) {
+            t.results_max_age_seconds = @intCast(v.integer);
+        };
+    };
     t.query_pattern = strOr(a, subjects, "query_pattern", "query.{[tenant]s}.{[name]s}") catch "query.{[tenant]s}.{[name]s}";
-
-
 
     t.kv_schemas = try str(a, kv, "kv", "schemas", diag);
     t.kv_tenants = try str(a, kv, "kv", "tenants", diag);

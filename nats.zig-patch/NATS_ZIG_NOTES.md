@@ -604,3 +604,33 @@ timing test that flaked once under load in entry 12.
 
 ---
 
+## 14. An object store can expire its objects (2026-09-20)
+
+**How it appeared**
+
+An answer too large for one NATS message goes to an object store and the asker reads it
+(ZeBridge §10hq). Such a store holds TRANSIENT objects: read once, then rubbish. The
+backing stream already has `max_age` — `ObjectStoreConfig` had no way to set it, so
+`createStore` sent a stream with no age at all and the only way to bound the bucket was
+`max_bytes` or a sweeper of one's own.
+
+**Change** (`nats.zig-objstore-max-age.patch`, 2 hunks, 1 file)
+
+`src/jetstream_objstore.zig` — `max_age_ns: u64 = 0` on `ObjectStoreConfig`, passed to
+the stream config `createStore` already builds. Zero keeps an object for ever, which is
+what every store created before this got, so nothing changes unless asked. nats.go
+spells the same thing `TTL` on its ObjectStoreConfig.
+
+**Verified**
+
+```bash
+cd nats.zig && zig build test-unit          # 134/134
+git -C nats.zig apply -R … && apply …       # the patch reverses and re-applies cleanly
+```
+
+Live: ZeBridge's responders create `res-<tenant>` with 600 s and the server reports it —
+`OBJ_res-_default max_age 600 s` in `scripts/scenarios/serve.py`, alongside a 1.24 MB
+answer that travelled as an object and arrived whole in both client libraries.
+
+---
+

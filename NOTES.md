@@ -14602,3 +14602,48 @@ never released, and nats.zig panics on a connection destroyed with a live subscr
 named the defect before a leak could hide it. Released now, with the inboxes of any
 question never answered.
 
+## 10hq. An answer too large for one message (2026-09-20)
+
+`serve` (§10hp) made a responder a client that answers. It could not answer much: NATS
+caps a message near a megabyte, and a service that returns rows cannot promise to stay
+under it. The shape was designed in the analytics plan and is now built, in both
+libraries, invisibly to the host.
+
+The grammar gained a `results` block — `bucket_prefix` (`res-`), `inline_max_bytes`
+(256 KB), `max_age_seconds` (600) — optional, so a grammar written before it reads with
+those defaults. An answer that fits goes as it is. One that does not is written as an
+OBJECT in the ASKING tenant's store, `res-<tenant>`, and what travels is
+`{"zb_object": {"bucket", "name", "bytes"}}`. The asking library recognises that
+envelope, fetches the object and hands back the answer. `request` returns an answer
+either way; nothing in a host changes.
+
+Three decisions worth keeping:
+
+* **The asking tenant's bucket, not the responder's.** The asker must be able to READ
+  it, and a client's grants are written against its own tenants. A responder tagged for
+  several tenants writes into whichever asked, which is why `poll`'s pending entry
+  remembers the tenant of each question.
+* **The bucket expires on its own.** It is created on first use with `max_age`, so a
+  result store needs no sweeper. nats.zig's `ObjectStoreConfig` had no way to set that
+  and now does (patch ledger 14) — the stream config underneath always could.
+* **Create, ignore the refusal, put.** A create on an existing bucket is an error that
+  costs nothing to discard, and it is cheaper than a STREAM.INFO before every large
+  answer.
+
+The grants moved with it: both roles READ `OBJ_res-<tenant>` (a client must fetch what it
+was handed), and the responder role also CREATEs the bucket and publishes `$O.res-….>`.
+In both stacks, and applied to the dev account.
+
+Measured (`serve.py`, 11 checks now): a 1,237,840-byte answer — past one message —
+travelled as an object; a RAW NATS client sees the envelope, which is what proves the
+object path rather than a large message squeezing through; zb-client-ts resolved a libzb
+responder's large answer whole, 20,000 rows in 24 ms; libzb resolved a zb-client-ts
+responder's, 20,000 rows in 44 ms; and the server reports `OBJ_res-_default max_age
+600 s`. Both directions, both libraries, one shape.
+
+Two things the run taught. An asker is a CLIENT principal and a responder may not ask, so
+the TypeScript worker's ask mode refuses to serve and says why — the role boundary caught
+the first version, which tried to do both as `pois`. And nats-py reports `max_age` in
+seconds while the wire carries nanoseconds, which made the first bucket check pass while
+printing zero.
+

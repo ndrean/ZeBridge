@@ -29,6 +29,28 @@ const zb = new ZeBridge({
 
 await zb.connect();
 
+// §10hq: `ZB_ASK=<name>` turns this into an ASKER for one question, printing what came
+// back — used by `scripts/scenarios/serve.py` to prove that THIS library resolves an
+// answer that travelled as an object, not only that it can send one.
+//
+// ⚠️ An asker is a CLIENT principal, never the responder one: a responder may answer
+// and may NOT ask (§10hk), so `ZB_PRINCIPAL=omar ZB_ASK=…` is the shape. It does not
+// serve at all — it asks once and leaves.
+if (process.env.ZB_ASK) {
+  const payload = JSON.parse(process.env.ZB_ASK_PAYLOAD ?? '{}');
+  const t0 = performance.now();
+  const ans: any = await zb.request(`query.${TENANTS[0]}.${process.env.ZB_ASK}`, payload, 20_000);
+  console.log(`ASKED ${JSON.stringify({
+    rows: Array.isArray(ans?.rows) ? ans.rows.length : null,
+    count: ans?.count ?? null,
+    answered_by: ans?.answered_by ?? null,
+    envelope_resolved: !('zb_object' in (ans ?? {})),
+    ms: Math.round(performance.now() - t0),
+  })}`);
+  await zb.close();
+  process.exit(0);
+}
+
 await zb.serve({
   tenants: TENANTS,
   queue: process.env.ZB_QUEUE ?? 'demo',
@@ -45,9 +67,16 @@ await zb.serve({
     echo: (q: any) => ({ echo: q, answered_by: LABEL }),
     /// Deliberately throws: the asker must get an error, not a timeout.
     boom: () => { throw new Error('boom, on purpose'); },
+    /// §10hq: an answer deliberately too large for one message. It becomes an object in
+    /// the asking tenant's bucket, and the asker sees an ordinary answer.
+    big: (q: any) => {
+      const n = Number(q?.rows ?? 20000);
+      return { rows: Array.from({ length: n }, (_, i) => [i, `row ${i} ${'x'.repeat(40)}`]), count: n, answered_by: LABEL };
+    },
   },
 });
 
 console.log(`serving as ${PRINCIPAL} (${LABEL}), tables ${TABLES.join(',')}`);
+
 process.on('SIGTERM', () => { void zb.close().then(() => process.exit(0)); });
 await new Promise(() => {});

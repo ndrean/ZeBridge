@@ -475,8 +475,10 @@ export class ZeBridge {
             } catch (e) {
               answer = { error: `${(e as Error)?.name ?? 'Error'}: ${(e as Error)?.message ?? e}` };
             }
-            try { m.respond(new TextEncoder().encode(JSON.stringify(answer))); }
-            catch (e) { this.appendLog('SYS', `${subject}: reply failed: ${e}`, 'ERROR'); }
+            try {
+              const body = new TextEncoder().encode(JSON.stringify(answer));
+              m.respond(await this.answerBody(tenant, body));
+            } catch (e) { this.appendLog('SYS', `${subject}: reply failed: ${e}`, 'ERROR'); }
           }
         })();
       }
@@ -485,13 +487,47 @@ export class ZeBridge {
     return n;
   }
 
+  /// §10hq: an answer that fits goes as it is; one that does not becomes an OBJECT in
+  /// the asking tenant's bucket, and what travels is a small envelope naming it. NATS
+  /// caps a message near a megabyte, and a service that answers rows cannot promise to
+  /// stay under it. The asking library resolves the envelope, so the host never sees
+  /// the difference.
+  private async answerBody(tenant: string, body: Uint8Array): Promise<Uint8Array> {
+    const results = this.config.grammar?.results ?? {};
+    const inlineMax: number = results.inline_max_bytes ?? 262_144;
+    if (body.length <= inlineMax) return body;
+    const bucket = `${results.bucket_prefix ?? 'res-'}${tenant}`;
+    const maxAgeNs = (results.max_age_seconds ?? 600) * 1_000_000_000;
+    let os: any;
+    try { os = await this.transport.objectStoreCreate(this.nc!, bucket, { max_age_ns: maxAgeNs }); }
+    catch { os = await this.transport.objectStore(this.nc!, bucket); }
+    const name = `ans-${this.clientIdValue}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    await os.putBlob({ name }, body);
+    return new TextEncoder().encode(JSON.stringify({ zb_object: { bucket, name, bytes: body.length } }));
+  }
+
+  /// §10hq: `{"zb_object":{bucket,name,bytes}}` → the object's bytes, parsed; anything
+  /// else → null, so a service may legitimately answer a body with such a key.
+  private async resolveAnswer(body: Uint8Array): Promise<any | null> {
+    let parsed: any;
+    try { parsed = JSON.parse(new TextDecoder().decode(body)); } catch { return null; }
+    const env = parsed?.zb_object;
+    if (!env?.bucket || !env?.name) return null;
+    const os = await this.transport.objectStore(this.nc!, env.bucket);
+    const blob = await this.objectBlob(os, env.bucket, env.name);
+    if (!blob) throw new Error(`answer object ${env.name} is gone from ${env.bucket} (expired?)`);
+    return JSON.parse(new TextDecoder().decode(blob));
+  }
+
   /// §10hn (libzb §10hj): ask a service — request/reply on a subject this principal may
   /// publish to (`query.<tenant>.<name>`), the answer as parsed JSON. No stream, no
   /// position: what a service answers is its own contract.
   public async request(subject: string, payload: unknown, timeoutMs = 5_000): Promise<any> {
     if (!this.nc) throw new Error('not connected');
     const m = await this.nc.request(subject, new TextEncoder().encode(JSON.stringify(payload ?? {})), { timeout: timeoutMs });
-    return JSON.parse(new TextDecoder().decode(m.data));
+    // §10hq: an answer too large for one message arrives as an envelope naming an object.
+    const large = await this.resolveAnswer(m.data);
+    return large ?? JSON.parse(new TextDecoder().decode(m.data));
   }
 
   /// §10hn (libzb §10hj): keep an answer in a table this client holds — rows in the
