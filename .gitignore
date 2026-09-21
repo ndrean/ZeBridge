@@ -91,6 +91,9 @@ zb-client-ts/zebridge_*.sqlite3-*
 
 examples/08-map/**/.env*
 examples/08-map/flutter/data/
+# The map's raw datasets: downloaded, large, and rebuilt by their loaders (§10hr).
+examples/08-map/poi-ocm.json
+
 # Python bytecode, anywhere (the three per-directory rules above are covered by this one)
 __pycache__/
 *.pyc

@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""A phone, shaped in Python: libzb with `osm_pois` ON DEMAND (NOTES §10hj).
+"""A phone, shaped in Python: libzb with `charge_points` ON DEMAND (§10hj, §10hr).
 
     examples/08-map/poi_phone.py --at 47.2184,-1.5536 --radius 600
 
 The table is created from its descriptor but nothing seeds it and nothing is tailed:
-the phone asks the service (`zb_client_request` on `query.<tenant>.pois_near`), keeps
+the phone asks the service (`zb_client_request` on `query.<tenant>.chargers_near`), keeps
 the answer (`zb_client_ingest`, the chain's version-guarded upsert, with the asked
 bounding box as the scope so what left that area is deleted locally), and reads its own
 SQLite. Offline, it has every area it visited. Prints what it asked, what it got, what it
 holds — and, with `--twice`, asks again to show the second answer changes only what moved.
 """
-import argparse, base64, ctypes, json, math, os, pathlib, struct, sys, time
+import argparse, base64, ctypes, json, math, os, pathlib, struct, sys, time, uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
-TABLE = "osm_pois"
+TABLE = "charge_points"
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--at", default="47.2184,-1.5536", help="lat,lng (default: Nantes)")
     ap.add_argument("--radius", type=float, default=600.0)
-    ap.add_argument("--kinds", default="", help="comma list of amenity,shop,tourism,man_made")
+    ap.add_argument("--min-kw", type=float, default=0.0, help="only chargers at least this fast (43 kW is the rapid band)")
     ap.add_argument("--tenant", default="kilo")
     ap.add_argument("--principal", default="omar")
     ap.add_argument("--creds", default=str(ROOT / "scripts" / "native" / "creds" / "omar.creds"))
@@ -60,14 +60,14 @@ def main():
         rounds = 2 if a.twice else 1
         for r in range(rounds):
             q = {"lat": lat, "lng": lng, "radius_m": a.radius, "limit": 2000}
-            if a.kinds:
-                q["kinds"] = a.kinds.split(",")
+            if a.min_kw:
+                q["min_kw"] = a.min_kw
             t0 = time.time()
-            ans = take(lib.zb_client_request(h, f"query.{a.tenant}.pois_near".encode(), json.dumps(q).encode(), 5000))
+            ans = take(lib.zb_client_request(h, f"query.{a.tenant}.chargers_near".encode(), json.dumps(q).encode(), 5000))
             dt = (time.time() - t0) * 1000
             if "error" in ans:
                 sys.exit(f"request: {ans}")
-            print(f"asked pois_near {a.at} r={a.radius:.0f} m → {ans['count']} rows{'' if ans.get('complete') else ' (cut by the limit)'} in {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
+            print(f"asked chargers_near {a.at} r={a.radius:.0f} m → {ans['count']} rows{'' if ans.get('complete') else ' (cut by the limit)'} in {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
             dlat = a.radius / 111_320.0
             dlng = a.radius / (111_320.0 * max(0.1, math.cos(math.radians(lat))))
             # The scope — "what I hold in this box and the answer lacks is gone" — only when the
@@ -75,9 +75,9 @@ def main():
             scope = {"where": "lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?", "params": [lat - dlat, lat + dlat, lng - dlng, lng + dlng]} if ans.get("complete") else None
             ing = take(lib.zb_client_ingest(h, TABLE.encode(), json.dumps({"columns": ans["columns"], "rows": ans["rows"]}).encode(), json.dumps(scope).encode() if scope else b""))
             print(f"ingest: {ing}")
-            held = take(lib.zb_client_query(h, f"SELECT count(*), count(name) FROM {TABLE}".encode(), b"[]"))
-            print(f"the phone holds {held['rows'][0][0]} POIs, {held['rows'][0][1]} named")
-            sample = take(lib.zb_client_query(h, f"SELECT name, coalesce(amenity, shop, tourism, man_made) AS what FROM {TABLE} WHERE name IS NOT NULL ORDER BY osm_id LIMIT 5".encode(), b"[]"))
+            held = take(lib.zb_client_query(h, f"SELECT count(*), count(*) FILTER (WHERE max_power_kw >= 43) FROM {TABLE}".encode(), b"[]"))
+            print(f"the phone holds {held['rows'][0][0]} charge point(s), {held['rows'][0][1]} rapid")
+            sample = take(lib.zb_client_query(h, f"SELECT title, coalesce(max_power_kw, 0) AS kw, coalesce(points, 0) AS pts FROM {TABLE} ORDER BY kw DESC, title LIMIT 5".encode(), b"[]"))
             for row in sample["rows"]:
                 print("   ", row)
             if r == 0 and rounds > 1:
@@ -97,22 +97,6 @@ def main():
 B32 = "0123456789bcdefghjkmnpqrstuvwxyz"
 
 
-def geohash(lat, lng, precision=5):
-    lat_r, lng_r = [-90.0, 90.0], [-180.0, 180.0]
-    out, bits, ch, even = "", 0, 0, True
-    while len(out) < precision:
-        r, v = (lng_r, lng) if even else (lat_r, lat)
-        mid = (r[0] + r[1]) / 2
-        if v >= mid:
-            ch = ch * 2 + 1; r[0] = mid
-        else:
-            ch = ch * 2; r[1] = mid
-        even = not even; bits += 1
-        if bits == 5:
-            out += B32[ch]; bits = ch = 0
-    return out
-
-
 def ewkb_point(lng, lat, srid=4326) -> str:
     """The bytes PostGIS speaks for a point with an SRID, little-endian, as libzb's $bin (base64)."""
     return base64.b64encode(struct.pack("<BIIdd", 1, 0x20000001, srid, lng, lat)).decode()
@@ -123,7 +107,7 @@ def edit_story(lib, take, h, a, lat, lng):
     checked by asking the service (its DuckDB replica follows CDC) and by the phone's own row."""
     def ask(radius=60.0):
         q = {"lat": lat, "lng": lng, "radius_m": radius, "limit": 2000}
-        ans = take(lib.zb_client_request(h, f"query.{a.tenant}.pois_near".encode(), json.dumps(q).encode(), 5000))
+        ans = take(lib.zb_client_request(h, f"query.{a.tenant}.chargers_near".encode(), json.dumps(q).encode(), 5000))
         if "error" in ans:
             sys.exit(f"request: {ans}")
         return ans
@@ -134,28 +118,31 @@ def edit_story(lib, take, h, a, lat, lng):
         print(f"  {what}: flushed {fl} in {(time.time() - t0) * 1000:.0f} ms")
         time.sleep(1.5)  # the service's replica applies the CDC echo
 
-    def in_answer(ans, osm_id):
-        i = ans["columns"].index("osm_id"); j = ans["columns"].index("name")
-        return next((row[j] for row in ans["rows"] if row[i] == osm_id), None)
+    def in_answer(ans, key):
+        i = ans["columns"].index("id"); j = ans["columns"].index("title")
+        return next((row[j] for row in ans["rows"] if row[i] == key), None)
 
-    osm_id = -int(time.time())  # a client-minted id: negative, never an OSM one
-    print(f"edit story at {lat},{lng} (osm_id {osm_id})")
+    # §10hr: the key is a uuid the CLIENT mints. The feed's own integer (`ocm_id`) is a
+    # column beside it, left null here: this charge point is not OpenChargeMap's.
+    key = str(uuid.uuid4())
+    print(f"edit story at {lat},{lng} (id {key})")
     # An INSERT's values are the whole row, the key included: the bridge builds the statement
     # from `data` (the key alone addresses UPDATE and DELETE). `geom` as PostGIS's own bytes.
-    values = {"osm_id": osm_id, "cell": geohash(lat, lng), "amenity": "cafe", "name": "Café ZeBridge", "lat": lat, "lng": lng, "geom": {"$bin": ewkb_point(lng, lat)}}
-    m = take(lib.zb_client_mutate(h, "osm_pois".encode(), b"INSERT", json.dumps({"osm_id": osm_id}).encode(), json.dumps(values).encode()))
+    values = {"id": key, "title": "Borne ZeBridge", "lat": lat, "lng": lng, "max_power_kw": 22, "points": 2,
+              "status_type_id": 50, "usage_type_id": 1, "geom": {"$bin": ewkb_point(lng, lat)}}
+    m = take(lib.zb_client_mutate(h, TABLE.encode(), b"INSERT", json.dumps({"id": key}).encode(), json.dumps(values).encode()))
     print(f"  INSERT → {m}")
     flush_and_wait("insert")
-    print(f"  the service sees: {in_answer(ask(), osm_id)!r}")
-    m = take(lib.zb_client_mutate(h, "osm_pois".encode(), b"UPDATE", json.dumps({"osm_id": osm_id}).encode(), json.dumps({"name": "Café ZeBridge (renamed)"}).encode()))
+    print(f"  the service sees: {in_answer(ask(), key)!r}")
+    m = take(lib.zb_client_mutate(h, TABLE.encode(), b"UPDATE", json.dumps({"id": key}).encode(), json.dumps({"title": "Borne ZeBridge (renamed)"}).encode()))
     print(f"  UPDATE → {m}")
     flush_and_wait("rename")
-    print(f"  the service sees: {in_answer(ask(), osm_id)!r}")
-    m = take(lib.zb_client_mutate(h, "osm_pois".encode(), b"DELETE", json.dumps({"osm_id": osm_id}).encode(), b""))
+    print(f"  the service sees: {in_answer(ask(), key)!r}")
+    m = take(lib.zb_client_mutate(h, TABLE.encode(), b"DELETE", json.dumps({"id": key}).encode(), b""))
     print(f"  DELETE → {m}")
     flush_and_wait("remove")
-    print(f"  the service sees: {in_answer(ask(), osm_id)!r}")
-    local = take(lib.zb_client_query(h, "SELECT count(*) FROM osm_pois WHERE osm_id = ?".encode(), json.dumps([osm_id]).encode()))
+    print(f"  the service sees: {in_answer(ask(), key)!r}")
+    local = take(lib.zb_client_query(h, f"SELECT count(*) FROM {TABLE} WHERE id = ?".encode(), json.dumps([key]).encode()))
     print(f"  the phone holds it: {bool(local['rows'][0][0])}")
 
 
@@ -191,7 +178,7 @@ def route_story(lib, take, h, a, lat, lng):
 def tour_story(lib, take, h, a, lat, lng):
     """The voyageur de commerce, from the phone: stops it already holds, the service's answer."""
     import random
-    rows = take(lib.zb_client_query(h, "SELECT osm_id, name FROM osm_pois WHERE name IS NOT NULL AND amenity IS NOT NULL".encode(), b"[]"))["rows"]
+    rows = take(lib.zb_client_query(h, f"SELECT id, title FROM {TABLE} WHERE title IS NOT NULL".encode(), b"[]"))["rows"]
     picks = random.Random(int(lat * 1e4)).sample(rows, min(a.tour, len(rows)))
     q = {"stops": [r[0] for r in picks], "closed": True, "along_m": 60, "along_limit": 200}
     if a.fuel:
@@ -211,9 +198,9 @@ def tour_story(lib, take, h, a, lat, lng):
         for row in f["rows"][:3]:
             print(f"    {float(row[c.index('price')]):.3f} €  {str(row[c.index('address')])[:30]:30} {str(row[c.index('city')])[:18]:18} detour {row[c.index('detour_m')]:>5} m" + (f"  ({row[c.index('outage')]} outage)" if row[c.index('outage')] else ""))
     if ans["along"]["count"]:
-        ing = take(lib.zb_client_ingest(h, "osm_pois".encode(), json.dumps({"columns": ans["along"]["columns"], "rows": ans["along"]["rows"]}).encode(), b""))
+        ing = take(lib.zb_client_ingest(h, TABLE.encode(), json.dumps({"columns": ans["along"]["columns"], "rows": ans["along"]["rows"]}).encode(), b""))
         print(f"  kept what lies along the way: {ing}")
-        ni = ans["along"]["columns"].index("name"); ki = ans["along"]["columns"].index("amenity")
+        ni = ans["along"]["columns"].index("title"); ki = ans["along"]["columns"].index("max_power_kw")
         names = [f"{r[ni]} ({r[ki] or 'poi'})" for r in ans["along"]["rows"] if r[ni]][:6]
         print("   ", "; ".join(names))
 

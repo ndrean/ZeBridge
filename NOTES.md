@@ -14647,3 +14647,53 @@ the first version, which tried to do both as `pois`. And nats-py reports `max_ag
 seconds while the wire carries nanoseconds, which made the first bucket check pass while
 printing zero.
 
+## 10hr. A dataset worth looking at: charge points, not everything (2026-09-21)
+
+The map ran on the HOT OpenStreetMap export: 2.1 million points of France, every
+pharmacy, bench, bar and bicycle stand. It proved the machinery — on-demand tables,
+asking on move, the corridor, edits — and it looked like noise, because it is. The
+owner replaced it with OpenChargeMap: 272,598 points worldwide in a 405 MB JSON,
+16,173 of them France by `AddressInfo.CountryID = 80`.
+
+One KIND of thing, and every row carries something worth showing: what it is called,
+how fast it charges, how many cars at once, whether it works. `load_chargers.py` is
+`load_pois.py`'s shape — read once, filter, COPY to a staging table, one upsert that
+touches only rows whose values differ, tombstone what the export no longer has — over
+`charge_points`: the address flattened out of `AddressInfo`, and the connections
+summarised as how many, the fastest in kW, and the highest level.
+
+**The key is the export's UUID, not its integer ID.** The integer is beside it,
+`ocm_id`, unique. A client that adds a charge point mints a uuid (SECURITY §1.3); it
+could not mint a bigint without risking someone else's, and the write path refuses a
+database-allocated key by design (`keys.py`). A row this phone added is one whose
+`ocm_id` is null, which is also how the map colours it.
+
+The three reference codes are kept as numbers. Two earn their place, and the second was
+checked against the export rather than assumed: `status_type_id` 50 is operational
+(15,897 of 16,173), and `level_id` bands the power — level 1 medians 2 kW, level 2
+medians 22 kW, level 3 medians 50 kW with a tenth percentile of 43, which is exactly
+OpenChargeMap's documented rapid threshold. So "rapid" in this map means
+`max_power_kw >= 43`, and 4,158 of France's points are.
+
+What moved with it: the service's `pois_near` became `chargers_near`, with `min_kw` and
+`operational` filters; the tour's stops and its corridor are charge points too, which is
+the question a driver actually has — where could I stop on the way. The phone probe and
+the Flutter app followed, the app gaining a rapid-only switch and markers that colour by
+power, by service and by who added them.
+
+Measured, after a rebuild of nothing: the loader read 272,598 points in 6 s and applied
+16,173 in under a second; the service's replica seeded them in 156 ms; an ask within
+3 km answers 9 points in 3.5 ms, one within 20 km for rapid only answers 47 in 3.9 ms;
+the edit story — add, rename, remove — is accepted, echoed and seen by the service as
+before; a tour through 5 rapid chargers around Nantes is 32 km.
+
+One consequence worth knowing. The answers are now SMALL: 3.5 KB for a neighbourhood,
+17.8 KB for 47 rapid chargers over 20 km, where the POI export sent half a megabyte for
+2,000 points and crossed §10hq's inline limit on an ordinary pan. The large-answer path
+is no longer exercised by the map by accident — `serve.py` exercises it on purpose.
+
+`osm_pois` is still loaded and still published. Nothing uses it now; a client that
+follows every table still seeds its 2.1 million rows. Retiring it is one `DROP TABLE`,
+and the DDL trigger tombstones the schema so every replica drops it — the owner's call,
+not made here.
+

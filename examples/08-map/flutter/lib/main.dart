@@ -1,9 +1,9 @@
 /// ZeMap — one screen: France's vector tiles from R2, the OpenStreetMap points of
 /// interest around the viewport as markers, editable (NOTES §10hj, design B).
 ///
-/// The phone holds what it asked for. `osm_pois` is an ON-DEMAND table: libzb creates it
+/// The phone holds what it asked for. `charge_points` is an ON-DEMAND table: libzb creates it
 /// from the descriptor, nothing seeds it and nothing is tailed — on every move the map
-/// asks the POI service (`query._default.pois_near`, a DuckDB replica of all of France
+/// asks the map service (`query._default.chargers_near`, a DuckDB replica of all of France
 /// answering from its own copy, PostgreSQL never asked) for the points around the
 /// centre, keeps the answer in its SQLite through the version-guarded upsert, and draws
 /// from the local table. Offline, every area visited is still there. An edit (add, rename,
@@ -26,7 +26,6 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
-import 'geohash.dart';
 import 'package:pmtiles/pmtiles.dart';
 import 'package:vector_map_tiles/vector_map_tiles.dart';
 import 'package:vector_map_tiles_pmtiles/vector_map_tiles_pmtiles.dart';
@@ -52,7 +51,7 @@ final _dbPath = '${Directory.systemTemp.path}/zb-flutter-map-omar.sqlite3';
 
 /// The tenant the POI service answers for (it serves `_default` and `kilo`).
 const _queryTenant = '_default';
-const _table = 'osm_pois';
+const _table = 'charge_points';
 
 void main() => runApp(const ZeMapApp());
 
@@ -97,6 +96,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   /// The fuel switch: null is off; a fuel asks the service for the stations around the
   /// centre after each move and draws them as price tags. An overlay from the service's
   /// replica, not a local table — prices move several times a day.
+  /// §10hr: show only the rapid chargers (≥43 kW), the question a driver has.
+  bool rapidOnly = false;
   String? fuel;
   List<Map<String, dynamic>> stations = const [];
 
@@ -234,13 +235,23 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   }
 
   /// The replica is what the screen shows: the points held inside the viewport.
+  /// A v4 uuid from Dart's own random: the key of a charge point this phone adds.
+  static String _uuidV4() {
+    final r = Random.secure();
+    final b = List<int>.generate(16, (_) => r.nextInt(256));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    final h = b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+    return '${h.substring(0, 8)}-${h.substring(8, 12)}-${h.substring(12, 16)}-${h.substring(16, 20)}-${h.substring(20)}';
+  }
+
   Future<void> _refresh() async {
     final w = zb;
     if (w == null) return;
     try {
       final b = mapController.camera.visibleBounds;
       final rows = await w.query(
-        'SELECT osm_id, lat, lng, name, coalesce(amenity, shop, tourism, man_made) AS kind FROM $_table '
+        'SELECT id, lat, lng, title, max_power_kw, points, status_type_id, ocm_id FROM $_table '
         'WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? LIMIT 3000',
         [b.south, b.north, b.west, b.east],
       );
@@ -284,10 +295,11 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     final radius = wantedRadius;
     final t0 = DateTime.now();
     try {
-      final ans = await w.request('query.$_queryTenant.pois_near', {
+      final ans = await w.request('query.$_queryTenant.chargers_near', {
         'lat': at.latitude,
         'lng': at.longitude,
         'radius_m': radius,
+        if (rapidOnly) 'min_kw': 43,
         'limit': 2000
       });
       // The scope — "what I hold in this box and the answer lacks is gone" — only when
@@ -485,20 +497,23 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     final w = zb;
     if (w == null) return;
     setState(() => addingMode = false);
-    // A client-minted id: negative, never an OpenStreetMap one. An INSERT's values are
-    // the WHOLE row, key included (the bridge builds the statement from them); `geom`
-    // is PostGIS's own bytes, as libzb's bytes marker.
-    final osmId = -DateTime.now().millisecondsSinceEpoch;
+    // §10hr: the key is a uuid this phone mints; `ocm_id` stays null, since this
+    // charge point is not OpenChargeMap's. An INSERT's values are the WHOLE row, key
+    // included (the bridge builds the statement from them); `geom` is PostGIS's own
+    // bytes, as libzb's bytes marker.
+    final id = _uuidV4();
     try {
       await w.mutate(_table, 'INSERT', {
-        'osm_id': osmId
+        'id': id
       }, {
-        'osm_id': osmId,
-        'cell': geohash(at.latitude, at.longitude),
-        'amenity': 'cafe',
-        'name': 'New POI',
+        'id': id,
+        'title': 'Nouvelle borne',
         'lat': at.latitude,
         'lng': at.longitude,
+        'max_power_kw': 22,
+        'points': 2,
+        'status_type_id': 50,
+        'usage_type_id': 1,
         'geom': {r'$bin': ewkbPoint(at.longitude, at.latitude)},
       });
       await _refresh();
@@ -510,7 +525,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   Future<void> _editPoi(Map<String, dynamic> poi) async {
     final w = zb;
     if (w == null) return;
-    var name = (poi['name'] as String?) ?? '';
+    var name = (poi['title'] as String?) ?? '';
     final action = await showModalBottomSheet<String>(
       context: context,
       builder: (ctx) => Padding(
@@ -519,7 +534,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('${poi['kind'] ?? 'poi'} · osm ${poi['osm_id']}',
+            Text(
+                '${poi['max_power_kw'] ?? '?'} kW · ${poi['points'] ?? '?'} point(s)',
                 style: Theme.of(ctx).textTheme.bodySmall),
             TextField(
               controller: TextEditingController(text: name),
@@ -550,10 +566,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     try {
       if (action == 'erase') {
         // Locally a delete; upstream the delete guard sets deleted_at (the tombstone).
-        await w.mutate(_table, 'DELETE', {'osm_id': poi['osm_id']});
+        await w.mutate(_table, 'DELETE', {'id': poi['id']});
       } else {
-        await w.mutate(
-            _table, 'UPDATE', {'osm_id': poi['osm_id']}, {'name': name});
+        await w.mutate(_table, 'UPDATE', {'id': poi['id']}, {'title': name});
       }
       await _refresh();
     } catch (e) {
@@ -577,6 +592,17 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('ZeMap'),
         actions: [
+          IconButton(
+            tooltip: 'Rapid chargers only (≥43 kW)',
+            icon:
+                Icon(Icons.bolt, color: rapidOnly ? Colors.greenAccent : null),
+            onPressed: zb == null
+                ? null
+                : () {
+                    setState(() => rapidOnly = !rapidOnly);
+                    _wantArea(mapController.camera);
+                  },
+          ),
           IconButton(
             tooltip: 'Route between two taps (Valhalla)',
             icon: Icon(Icons.directions,
@@ -732,18 +758,23 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                     height: 28,
                     alignment: Alignment.topCenter,
                     child: Tooltip(
-                      message:
-                          '${poi['name'] ?? ''}${poi['name'] == null ? '' : ' · '}${poi['kind'] ?? ''}',
+                      message: '${poi['title'] ?? ''} · '
+                          '${poi['max_power_kw'] ?? '?'} kW · ${poi['points'] ?? '?'} pt'
+                          '${poi['status_type_id'] == 50 ? '' : ' · out of service'}',
                       child: GestureDetector(
                         onTap: () => _editPoi(poi),
+                        // Green for rapid (≥43 kW), grey for out of service, orange
+                        // for one this phone added, blue otherwise.
                         child: Icon(
-                          Icons.location_pin,
-                          color: (poi['osm_id'] as num) < 0
+                          Icons.ev_station,
+                          color: poi['ocm_id'] == null
                               ? Colors.deepOrange
-                              : (poi['name'] == null
+                              : (poi['status_type_id'] != 50
                                   ? Colors.grey
-                                  : Colors.red),
-                          size: 28,
+                                  : ((poi['max_power_kw'] as num?) ?? 0) >= 43
+                                      ? Colors.green.shade700
+                                      : Colors.blue.shade700),
+                          size: 26,
                         ),
                       ),
                     ),

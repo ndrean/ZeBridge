@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""The POI service: a DuckDB replica of all of France, answering "what is around me"
+"""The map service: a DuckDB replica of all of France, answering "what is around me"
 over NATS request/reply — PostgreSQL never sees a query (NOTES §10hj).
+
+The dataset is OpenChargeMap's charge points (§10hr, `load_chargers.py`), not the HOT
+OpenStreetMap export it replaced: one KIND of thing, each row worth showing.
 
     examples/08-map/poi_service.py                    # pois.creds (a RESPONDER principal, §10hk), engine duckdb, queue group "pois"
     ZB_DB=/tmp/pois.duckdb examples/08-map/poi_service.py --tenants kilo,_default
 
-ONE process, ONE connection, ONE loop (§10hp). libzb both follows `osm_pois` (a public
-table, 2.1M rows — the seed from the chain, then CDC in bulk, §10hg) AND answers the
+ONE process, ONE connection, ONE loop (§10hp). libzb both follows `charge_points` (a
+public table, 16,173 rows — §10hr, the seed from the chain, then CDC) AND answers the
 questions: `zb_client_serve` subscribes `query.<tenant>.<name>` in a queue group on the
 client's own socket, `poll` hands over what arrived, `zb_client_reply` answers on the
 asker's inbox. Instances scale by starting another process; the queue group makes the
@@ -18,11 +21,11 @@ took turns. There is no lock here, and no `--serve-url`: one connection cannot a
 somewhere else than it listens.
 
 Named queries only — the SQL lives here, the client sends parameters:
-  pois_near  {"lat": 47.21, "lng": -1.55, "radius_m": 800, "kinds": ["amenity"], "limit": 500}
+  chargers_near {"lat": 47.21, "lng": -1.55, "radius_m": 800, "min_kw": 0, "operational": true, "limit": 500}
     → {"columns": [...], "rows": [[...], ...], "count": n, "complete": bool, "ms": t}
   fuel_near  {"lat", "lng", "radius_m": 3000, "fuel": "SP95", "sort": "price", "limit": 20}
     → the stations selling that fuel within the radius, cheapest first, today's price
-  tour       {"stops": [osm_id, ...], "closed": true, "along_m": 80, "fuel": "SP95", "fuel_m": 1500, "roads": true}
+  tour       {"stops": [id, ...], "closed": true, "along_m": 80, "along_min_kw": 0, "fuel": "SP95", "fuel_m": 1500, "roads": true}
     → by road when Valhalla answers (the matrix orders, /route draws), straight lines otherwise
   route      {"points": [{"lat","lng"}, …], "costing": "auto"}
     → the road between the points: polyline, km, minutes, legs (Valhalla; an error without it)
@@ -38,11 +41,15 @@ import argparse, ctypes, json, math, os, pathlib, socket, sys, time, urllib.requ
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
-TABLE = "osm_pois"
+TABLE = "charge_points"
 # The replica follows the fuel feed too (load_fuel.py): parents first.
 TABLES = ["fuel_stations", "fuel_prices", "fuel_outages", TABLE]
+# §10hr: what a charge point answer carries. `geom` travels as libzb's bytes marker.
+CP_COLS = ["id", "ocm_id", "title", "address", "town", "postcode", "lat", "lng", "geom",
+           "operator_id", "usage_type_id", "usage_cost", "status_type_id", "points",
+           "connections", "max_power_kw", "level_id", "plugs", "phone", "url",
+           "access_comments", "comments", "verified_at", "updated_at"]
 FUELS = ("Gazole", "SP95", "SP98", "E10", "E85", "GPLc")
-KINDS = ("amenity", "shop", "tourism", "man_made")
 
 
 def load_lib():
@@ -87,24 +94,27 @@ class Card:
         return self.take(self.lib.zb_client_reply(self.h, req_id, json.dumps(answer, default=str).encode()))
 
 
-def pois_near(card: Card, q: dict) -> dict:
+def chargers_near(card: Card, q: dict) -> dict:
+    """{"lat", "lng", "radius_m": 1000, "min_kw": 0, "operational": true, "limit": 500}
+    → the charge points around a position, nearest first, in the chain object's shape so
+      a phone keeps them with `ingest`. `min_kw` asks for the fast ones only (43 kW is
+      OpenChargeMap's rapid band); `operational` drops what the feed says is broken."""
     lat, lng = float(q["lat"]), float(q["lng"])
     radius = float(q.get("radius_m", 1000))
     limit = int(q.get("limit", 500))
-    kinds = [k for k in q.get("kinds", []) if k in KINDS]
+    min_kw = float(q.get("min_kw", 0) or 0)
     dlat = radius / 111_320.0
     dlng = radius / (111_320.0 * max(0.1, math.cos(math.radians(lat))))
     where = "lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?"
     params = [lat - dlat, lat + dlat, lng - dlng, lng + dlng]
-    if kinds:
-        where += " AND (" + " OR ".join(f"{k} IS NOT NULL" for k in kinds) + ")"
+    if min_kw > 0:
+        where += f" AND max_power_kw >= {min_kw}"
+    if q.get("operational", False):
+        where += " AND status_type_id = 50"
     # haversine, metres; ordered nearest first, cut at the radius
     dist = (f"2 * 6371000 * asin(sqrt(pow(sin(radians(lat - ({lat})) / 2), 2) + "
             f"cos(radians({lat})) * cos(radians(lat)) * pow(sin(radians(lng - ({lng})) / 2), 2)))")
-    cols = ["osm_id", "cell", "amenity", "shop", "tourism", "man_made", "name", "name_en", "name_fr", "opening_hours",
-            "beds", "rooms", "addr_full", "addr_housenumber", "addr_street", "addr_city", "source", "lat", "lng", "geom", "updated_at"]
-    # `geom` travels as libzb's bytes marker ({"$bin": …}) — the phone's table declares it NOT NULL.
-    sql = (f"SELECT {', '.join(cols)} FROM {TABLE} WHERE {where} AND {dist} <= {radius} "
+    sql = (f"SELECT {', '.join(CP_COLS)} FROM {TABLE} WHERE {where} AND {dist} <= {radius} "
            f"ORDER BY {dist} LIMIT {limit}")
     t0 = time.time()
     r = card.query(sql, params)
@@ -176,21 +186,21 @@ def tour(card: Card, q: dict) -> dict:
     if len(raw) < 2:
         return {"error": "at least two stops"}
     stops = []
-    ids = [x for x in raw if isinstance(x, int)]
+    ids = [x for x in raw if isinstance(x, str)]   # §10hr: the key is a uuid
     by_id = {}
     if ids:
-        r = card.query(f"SELECT osm_id, name, lat, lng FROM {TABLE} WHERE osm_id IN ({', '.join('?' * len(ids))})", ids)
+        r = card.query(f"SELECT id, title, lat, lng FROM {TABLE} WHERE id IN ({', '.join('?' * len(ids))})", ids)
         if "error" in r:
             return {"error": r["error"]}
         by_id = {row[0]: row for row in r["rows"]}
     for x in raw:
-        if isinstance(x, int):
+        if isinstance(x, str):
             if x not in by_id:
                 return {"error": f"unknown stop {x}"}
             _, name, lat, lng = by_id[x]
-            stops.append({"osm_id": x, "name": name, "lat": lat, "lng": lng})
+            stops.append({"id": x, "name": name, "lat": lat, "lng": lng})
         else:
-            stops.append({"osm_id": None, "name": x.get("name"), "lat": float(x["lat"]), "lng": float(x["lng"])})
+            stops.append({"id": None, "name": x.get("name"), "lat": float(x["lat"]), "lng": float(x["lng"])})
     closed = bool(q.get("closed", True))
     pts = [(s["lat"], s["lng"]) for s in stops]
     roads = None
@@ -204,7 +214,7 @@ def tour(card: Card, q: dict) -> dict:
     order = tsp_order(pts, closed, matrix=roads)
     seq = [stops[i] for i in order]
     path = seq + ([seq[0]] if closed else [])
-    legs = [{"from": path[k]["name"] or path[k]["osm_id"], "to": path[k + 1]["name"] or path[k + 1]["osm_id"],
+    legs = [{"from": path[k]["name"] or path[k]["id"], "to": path[k + 1]["name"] or path[k + 1]["id"],
              "m": round(haversine((path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])))} for k in range(len(path) - 1)]
     polyline = [[p["lat"], p["lng"]] for p in path]
     by_road = None
@@ -226,14 +236,15 @@ def tour(card: Card, q: dict) -> dict:
         lats, lngs = [s["lat"] for s in way], [s["lng"] for s in way]
         dlat = along_m / 111_320.0
         dlng = along_m / (111_320.0 * max(0.1, math.cos(math.radians(sum(lats) / len(lats)))))
-        kinds = [k for k in q.get("along_kinds", []) if k in KINDS]
-        where = "lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?" + (" AND (" + " OR ".join(f"{k} IS NOT NULL" for k in kinds) + ")" if kinds else "")
-        cols = ["osm_id", "cell", "amenity", "shop", "tourism", "man_made", "name", "name_en", "name_fr", "opening_hours",
-                "beds", "rooms", "addr_full", "addr_housenumber", "addr_street", "addr_city", "source", "lat", "lng", "geom", "updated_at"]
+        # §10hr: what lies along the way is a charge point too — the corridor is where
+        # you could actually stop, which is the question a driver has.
+        min_kw = float(q.get("along_min_kw", 0) or 0)
+        where = "lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?" + (f" AND max_power_kw >= {min_kw}" if min_kw > 0 else "")
+        cols = CP_COLS
         r = card.query(f"SELECT {', '.join(cols)} FROM {TABLE} WHERE {where} LIMIT 20000", [min(lats) - dlat, max(lats) + dlat, min(lngs) - dlng, max(lngs) + dlng])
         if "error" not in r:
             li, lo = cols.index("lat"), cols.index("lng")
-            stop_ids = {s["osm_id"] for s in stops}
+            stop_ids = {s["id"] for s in stops}
             near = [row for row in r["rows"] if row[0] not in stop_ids and
                     min(seg_distance_m((row[li], row[lo]), (way[k]["lat"], way[k]["lng"]), (way[k + 1]["lat"], way[k + 1]["lng"])) for k in range(len(way) - 1)) <= along_m]
             near = near[: int(q.get("along_limit", 300))]
@@ -258,7 +269,7 @@ def tour(card: Card, q: dict) -> dict:
                     near.append((row[pi], detour, row))
             near.sort(key=lambda x: (x[0], x[1]))
             cheapest = {"fuel": fuel, "columns": c + ["detour_m"], "rows": [row + [round(d)] for _, d, row in near[:5]], "count": len(near)}
-    return {"order": [s["osm_id"] if s["osm_id"] is not None else [s["lat"], s["lng"]] for s in seq],
+    return {"order": [s["id"] if s["id"] is not None else [s["lat"], s["lng"]] for s in seq],
             "fuel": cheapest,
             "stops": [{"name": s["name"], "lat": s["lat"], "lng": s["lng"]} for s in seq],
             "legs": legs, "total_m": sum(l["m"] for l in legs), "closed": closed,
@@ -363,7 +374,7 @@ def route(card: Card, q: dict) -> dict:
     return r
 
 
-QUERIES = {"pois_near": pois_near, "tour": tour, "fuel_near": fuel_near, "route": route}
+QUERIES = {"chargers_near": chargers_near, "tour": tour, "fuel_near": fuel_near, "route": route}
 
 
 def serve(card: Card, tenants: list[str], queue: str, label: str) -> None:

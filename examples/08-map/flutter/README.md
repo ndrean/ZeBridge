@@ -3,23 +3,28 @@
 A Flutter map of France: the vector tiles from an R2 bucket, the OpenStreetMap points
 of interest around the viewport as markers, editable. NOTES §10hj, design B.
 
-`osm_pois` (2.1 million points, `examples/08-map/load_pois.py`) is an **on-demand**
-table on the phone: libzb creates it from the descriptor, nothing seeds it and nothing
-is tailed. On every move the map asks the POI service — `examples/08-map/poi_service.py`,
-a DuckDB replica of all of France answering `query._default.pois_near` from its own copy,
-PostgreSQL never asked — for the points around the centre (the radius follows the zoom,
+`charge_points` (16,173 OpenChargeMap points of France, `examples/08-map/load_chargers.py`
+— §10hr) is an **on-demand** table on the phone: libzb creates it from the descriptor,
+nothing seeds it and nothing is tailed. On every move the map asks the map service —
+`examples/08-map/poi_service.py`, a DuckDB replica of all of France answering
+`query._default.chargers_near` from its own copy, PostgreSQL never asked — for the points
+around the centre (the radius follows the zoom,
 at most 5 km, the 2,000 nearest; below zoom 10 the map stops asking and draws what it holds), keeps the
 answer in its SQLite through the same version-guarded upsert a seed uses, and draws
 from the local table. Offline, every area visited is still there.
 
-Tap "+" then the map to add a point, tap a marker to rename or erase it. Each is a
+The markers colour by what they are: green for rapid (≥43 kW), blue for the rest, grey
+for out of service, orange for one this phone added. The bolt button asks for the rapid
+ones only.
+
+Tap "+" then the map to add a charge point, tap a marker to rename or erase it. Each is a
 `mutate` on the local table: optimistic at once, sent to the bridge, judged upstream (the
 verdict lands in the status line's next poll), and the service's replica has it before
 the next ask. An erase sets `deleted_at` on the master (the delete guard) and every
 replica drops the row. A new point carries its PostGIS bytes (`ewkbPoint` in main.dart).
 
-Needs, besides the dev stack: `osm_pois` loaded and enabled writable (`load_pois.py
---create`, then `--enable` and `zebridge_enable(... writable => true)`), the POI service
+Needs, besides the dev stack: `charge_points` loaded (`load_chargers.py --create`, which
+publishes it public and writable), the map service
 running (`scripts/scenarios/.venv/bin/python3 examples/08-map/poi_service.py`), libzb
 built with `-Dduckdb=true` for the service (the app itself needs only SQLite), and the
 `omar` creds of the dev stack. The `mapper` principal of the earlier cell design was
