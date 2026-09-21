@@ -154,7 +154,14 @@ pub const Storage = struct {
     /// test). One connection; the card's read-only handle comes from
     /// `openDuckdbShared` on the same database.
     pub fn openDuckdb(path: [*:0]const u8) Error!Storage {
-        if (!build_options.duckdb) return Error.OpenFailed;
+        if (!build_options.duckdb) {
+            // §10hw: this build has no DuckDB. Saying so is the difference between a
+            // five-minute fix and an afternoon: the default is `-Dduckdb=false`, so a
+            // plain `zig build` silently produces a library that cannot open the
+            // engine a host asks for by name.
+            std.debug.print("engine 'duckdb' asked for, but this libzb was built without it — rebuild with `-Dduckdb=true`\n", .{});
+            return Error.OpenFailed;
+        }
         var db: dk.duckdb_database = null;
         if (dk.duckdb_open(path, &db) != dk.DuckDBSuccess) return Error.OpenFailed;
         var con: dk.duckdb_connection = null;
@@ -173,7 +180,14 @@ pub const Storage = struct {
 
     /// A second connection on `primary`'s database (the card's query handle).
     pub fn openDuckdbShared(primary: *Storage) Error!Storage {
-        if (!build_options.duckdb) return Error.OpenFailed;
+        if (!build_options.duckdb) {
+            // §10hw: this build has no DuckDB. Saying so is the difference between a
+            // five-minute fix and an afternoon: the default is `-Dduckdb=false`, so a
+            // plain `zig build` silently produces a library that cannot open the
+            // engine a host asks for by name.
+            std.debug.print("engine 'duckdb' asked for, but this libzb was built without it — rebuild with `-Dduckdb=true`\n", .{});
+            return Error.OpenFailed;
+        }
         const db: dk.duckdb_database = @ptrCast(@alignCast(primary.dk_db orelse return Error.OpenFailed));
         var con: dk.duckdb_connection = null;
         if (dk.duckdb_connect(db, &con) != dk.DuckDBSuccess) return Error.OpenFailed;

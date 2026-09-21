@@ -508,7 +508,7 @@ export class ZeBridge {
 
   /// §10hq: `{"zb_object":{bucket,name,bytes}}` → the object's bytes, parsed; anything
   /// else → null, so a service may legitimately answer a body with such a key.
-  private async resolveAnswer(body: Uint8Array): Promise<any | null> {
+  private async resolveAnswer(body: Uint8Array): Promise<{ value: any; bytes: number } | null> {
     let parsed: any;
     try { parsed = JSON.parse(new TextDecoder().decode(body)); } catch { return null; }
     const env = parsed?.zb_object;
@@ -516,7 +516,7 @@ export class ZeBridge {
     const os = await this.transport.objectStore(this.nc!, env.bucket);
     const blob = await this.objectBlob(os, env.bucket, env.name);
     if (!blob) throw new Error(`answer object ${env.name} is gone from ${env.bucket} (expired?)`);
-    return JSON.parse(new TextDecoder().decode(blob));
+    return { value: JSON.parse(new TextDecoder().decode(blob)), bytes: blob.length };
   }
 
   /// §10hn (libzb §10hj): ask a service — request/reply on a subject this principal may
@@ -524,10 +524,26 @@ export class ZeBridge {
   /// position: what a service answers is its own contract.
   public async request(subject: string, payload: unknown, timeoutMs = 5_000): Promise<any> {
     if (!this.nc) throw new Error('not connected');
+    const t0 = Date.now();
     const m = await this.nc.request(subject, new TextEncoder().encode(JSON.stringify(payload ?? {})), { timeout: timeoutMs });
+    const wire_ms = Date.now() - t0;
     // §10hq: an answer too large for one message arrives as an envelope naming an object.
+    const t1 = Date.now();
     const large = await this.resolveAnswer(m.data);
-    return large ?? JSON.parse(new TextDecoder().decode(m.data));
+    const fetch_ms = large ? Date.now() - t1 : 0;
+    const value = large ? large.value : JSON.parse(new TextDecoder().decode(m.data));
+    // §10hu: say HOW the answer travelled, on the same clock either way. libzb splices
+    // the identical block (`spliceTransport`), so a host reads one shape from either
+    // library and can price the object fetch instead of guessing at it.
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      value.zb_transport = {
+        via: large ? 'object' : 'inline',
+        bytes: large ? large.bytes : m.data.length,
+        wire_ms,
+        fetch_ms,
+      };
+    }
+    return value;
   }
 
   /// §10hn (libzb §10hj): keep an answer in a table this client holds — rows in the
@@ -1219,6 +1235,15 @@ export class ZeBridge {
   /// would only answer row_deleted (or worse, land on an unrelated table that later
   /// reuses the name). Discard them LOUDLY: a silent queue that drains into a void
   /// is exactly what the outbox exists to prevent.
+  /// §10hn: an on-demand table is never seeded from a chain — the seed loop skips it —
+  /// so a message promising a fresh full describes work that will never happen, and it
+  /// reads as a fault. libzb says the same thing at the same three outcomes (§10hj).
+  private reseedNote(table: string): string {
+    return this.ondemandSet.has(table)
+      ? 'on demand, so no chain seed; rows arrive as query answers'
+      : 'watermark dropped, re-seeding from a fresh full';
+  }
+
   private async discardOutbox(table: string, why: string) {
     try {
       const q = await this.run(`SELECT count(*) AS k FROM _zebridge_outbox WHERE tbl = ?`, table);
@@ -1356,7 +1381,7 @@ export class ZeBridge {
         await this.discardOutbox(table, 'emptied');
         await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
         emptied = true;
-        this.appendLog('SCHEMA', `${table}: rows could not be carried through the rebuild (${carryErr}) — rebuilt EMPTY, watermark dropped, re-seeding from a fresh full`, 'REKEY');
+        this.appendLog('SCHEMA', `${table}: rows could not be carried through the rebuild (${carryErr}) — rebuilt EMPTY, ${this.reseedNote(table)}`, 'REKEY');
       } finally {
         try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ }
       }
@@ -1378,7 +1403,7 @@ export class ZeBridge {
         if (rekey) {
           try { await this.dialect.setForeignKeys(this.run, true); } catch { /* engine without it */ }
           await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
-          this.appendLog('SCHEMA', `${table}: key shape changed (${keyBefore} → ${keyNow}) — rebuilt EMPTY, watermark dropped, re-seeding from a fresh full`, 'REKEY');
+          this.appendLog('SCHEMA', `${table}: key shape changed (${keyBefore} → ${keyNow}) — rebuilt EMPTY, ${this.reseedNote(table)}`, 'REKEY');
         } else {
           // A table that did not exist cannot be seeded, whatever a watermark left
           // behind by a kill says (§10dj): forget it, so the seed happens.
@@ -1539,7 +1564,7 @@ export class ZeBridge {
       const stored = Number(r[0].seed_epoch ?? 0);
       if (stored >= epoch) return;
       await this.run(`DELETE FROM _zebridge_generations WHERE tbl = ?`, table);
-      this.appendLog('SYS', `${table}: seed epoch ${stored} → ${epoch} (zebridge_reseed) — watermark dropped, re-seeding from a fresh full`, 'RESEED');
+      this.appendLog('SYS', `${table}: seed epoch ${stored} → ${epoch} (zebridge_reseed) — ${this.reseedNote(table)}`, 'RESEED');
       this.kickReseed(table);
     } catch { /* no watermark yet */ }
   }

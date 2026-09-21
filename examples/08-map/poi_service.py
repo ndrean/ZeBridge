@@ -29,6 +29,11 @@ Named queries only — the SQL lives here, the client sends parameters:
     → by road when Valhalla answers (the matrix orders, /route draws), straight lines otherwise
   route      {"points": [{"lat","lng"}, …], "costing": "auto"}
     → the road between the points: polyline, km, minutes, legs (Valhalla; an error without it)
+  along_route {"points": [{"lat","lng"}, …], "corridor_m": 5000, "min_kw": 0, "fuel": "SP95", "limit": 500}
+    → the road, plus the charge points and stations within `corridor_m` of it, in TRAVEL
+      order. A disc around a centre cannot say "along the way": its edge is wherever the
+      row limit ran out, so it moves with local density (§10hx). A corridor's edge is the
+      road, so the same route answers the same thing every time.
     → the shortest round trip through the stops (exact to 9, 2-opt beyond, straight lines
       until Valhalla), its legs and polyline, and the POIs within along_m of the route
       as an answer a phone keeps like any other
@@ -374,7 +379,163 @@ def route(card: Card, q: dict) -> dict:
     return r
 
 
-QUERIES = {"chargers_near": chargers_near, "tour": tour, "fuel_near": fuel_near, "route": route}
+def _num(x):
+    """A replica value as a number. DuckDB returns numerics as text through libzb's
+    JSON, and a distance that arrives as a string is a distance the host has to parse
+    before it can sort by it."""
+    if x is None:
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def densify(shape: list, step: float) -> tuple:
+    """The polyline as anchors EXACTLY `step` metres apart, each carrying how far along
+    the road it sits.
+
+    ⚠️ §10hx: this INTERPOLATES inside a segment; it does not subsample the vertices.
+    Keeping "every vertex at least `step` from the last kept" bounds the spacing from
+    BELOW and not from above, so the spacing ends up being whatever Valhalla's shape
+    happens to be. Two anchors `d` apart cover only sqrt(W² - (d/2)²) of the half-width
+    midway between them, and at d >= 2W they cover NOTHING: the corridor breaks in two.
+    Measured on a synthetic motorway with vertices 15 km apart, a 2 km and a 5 km
+    corridor both collapsed to zero width. Real shapes here have a median segment of
+    39 m and a maximum of 1,130 m, so it only narrowed — a bug that hides behind
+    someone else's data density is exactly the one to remove.
+
+    With the spacing pinned at `step`, the corridor holds sqrt(1 - (step/2W)²) of its
+    full half-width everywhere; at the default step = W/2 that is 96.8%."""
+    out = [(shape[0][0], shape[0][1], 0.0)]
+    carry = 0.0   # metres since the last anchor
+    along = 0.0   # metres from the start of the route
+    for i in range(len(shape) - 1):
+        a, b = shape[i], shape[i + 1]
+        d = haversine(a, b)
+        if d <= 0:
+            continue
+        t = step - carry
+        while t <= d:
+            f = t / d
+            out.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, along + t))
+            t += step
+        carry = (carry + d) % step
+        along += d
+    # The tail after the last whole step has no anchor of its own, so the corridor
+    # narrows over the final stretch — measured: 950 m unanchored on a 74.95 km route.
+    # The destination is exactly where someone looks for a charger, so anchor it.
+    if out[-1][2] < along:
+        out.append((shape[-1][0], shape[-1][1], along))
+    return out, along
+
+
+# One anchor is a row in a VALUES list and a pass over the candidates; past this many the
+# step widens instead, so a 900 km route with a 200 m corridor degrades in accuracy
+# rather than in the shape of the SQL.
+MAX_ANCHORS = 4000
+
+
+def _corridor_sql(inner: str, id_col: str, cols: str, anchors: list, width: float, limit: int) -> str:
+    """`inner` (the bbox-filtered candidates) narrowed to what lies within `width` of the
+    road, ordered by how far along the road it sits — travel order, not distance from
+    the line. `arg_min` carries the winning anchor's distance-along out of the same
+    aggregate that finds the nearest one."""
+    vals = ",".join(f"({a[0]!r},{a[1]!r},{a[2]!r})" for a in anchors)
+    dist = ("2 * 6371000 * asin(sqrt(pow(sin(radians(b.lat - a.alat) / 2), 2) + "
+            "cos(radians(a.alat)) * cos(radians(b.lat)) * pow(sin(radians(b.lng - a.alng) / 2), 2)))")
+    return (f"WITH anchor(alat, alng, am) AS (VALUES {vals}), box AS ({inner}), "
+            f"near AS (SELECT b.{id_col} AS _id, min({dist}) AS m, arg_min(a.am, {dist}) AS along_m "
+            f"         FROM box b, anchor a GROUP BY b.{id_col} HAVING m <= {width}) "
+            f"SELECT {cols}, n.m, n.along_m FROM box b JOIN near n ON n._id = b.{id_col} "
+            f"ORDER BY n.along_m LIMIT {limit}")
+
+
+def along_route(card: Card, q: dict) -> dict:
+    """{"points": [{"lat","lng"}, …], "costing": "auto", "corridor_m": 5000,
+        "min_kw": 0, "operational": false, "fuel": "SP95"|null, "limit": 500}
+    → the road between the points, plus the charge points and the fuel stations within
+      `corridor_m` of it, in TRAVEL order.
+
+    The disc that `chargers_near` draws cannot express "along the way": its edge is
+    wherever the row limit ran out, so it moves with local density and a pan gives a
+    different set (§10hx). A corridor's edge is the road, so the same route answers the
+    same thing every time.
+
+    `chargers.columns` is exactly CP_COLS, the chain object's shape, so the answer goes
+    straight into an on-demand `charge_points` through `ingest`. The two distances live
+    beside it in `charger_positions`, row for row, rather than as extra columns that
+    would not fit the table.
+
+    ⚠️ No scope is returned. The corridor is not a box, and the box around it holds rows
+    a phone legitimately fetched for other views; sweeping it would throw them away."""
+    t0 = time.time()
+    pts = [(float(p["lat"]), float(p["lng"])) for p in q.get("points", [])]
+    if len(pts) < 2:
+        return {"error": "at least two points"}
+    width = max(100.0, float(q.get("corridor_m", 5000)))
+    limit = int(q.get("limit", 500))
+    fuel = q.get("fuel") or None
+    if fuel is not None and fuel not in FUELS:
+        return {"error": f"unknown fuel {fuel!r}", "known": list(FUELS)}
+    try:
+        road = road_route(pts, q.get("costing", "auto"))
+    except Exception as e:
+        return {"error": f"valhalla unreachable or refused: {str(e)[:120]}", "valhalla": VALHALLA}
+    shape = road["polyline"]
+    step = width / 2
+    anchors, length = densify(shape, step)
+    if len(anchors) > MAX_ANCHORS:
+        step = length / MAX_ANCHORS
+        anchors, length = densify(shape, step)
+    # The corridor's worst half-width, as a fraction: the dip midway between anchors.
+    held = math.sqrt(max(0.0, 1 - (step / (2 * width)) ** 2))
+
+    lats = [p[0] for p in shape]
+    lngs = [p[1] for p in shape]
+    pad_lat = width / 111_320.0
+    pad_lng = width / (111_320.0 * max(0.1, math.cos(math.radians(sum(lats) / len(lats)))))
+    def bbox(pfx: str = "") -> str:
+        return (f"{pfx}lat BETWEEN {min(lats) - pad_lat} AND {max(lats) + pad_lat} "
+                f"AND {pfx}lng BETWEEN {min(lngs) - pad_lng} AND {max(lngs) + pad_lng}")
+
+    where = bbox()
+    min_kw = float(q.get("min_kw", 0) or 0)
+    if min_kw > 0:
+        where += f" AND max_power_kw >= {min_kw}"
+    if q.get("operational", False):
+        where += " AND status_type_id = 50"
+    inner = f"SELECT {', '.join(CP_COLS)} FROM {TABLE} WHERE {where}"
+    r = card.query(_corridor_sql(inner, "id", ", ".join(f"b.{c}" for c in CP_COLS), anchors, width, limit), [])
+    if "error" in r:
+        return {"error": r["error"]}
+    n = len(CP_COLS)
+    chargers = {"columns": CP_COLS, "rows": [row[:n] for row in r["rows"]],
+                "count": len(r["rows"]), "complete": len(r["rows"]) < limit}
+    # ⚠️ The DuckDB engine hands numbers back as TEXT, so these two arrive as "1234.5".
+    # A distance a host has to parse before it can sort by it is not a distance.
+    positions = [[_num(row[n]), _num(row[n + 1])] for row in r["rows"]]
+
+    stations = None
+    if fuel is not None:
+        sbox = (f"SELECT s.id, s.city, s.address, s.road_type, s.lat, s.lng, p.price, p.price_at, o.kind AS outage "
+                f"FROM fuel_stations s JOIN fuel_prices p ON p.station_id = s.id AND p.fuel = '{fuel}' "
+                f"LEFT JOIN fuel_outages o ON o.station_id = s.id AND o.fuel = '{fuel}' "
+                f"WHERE {bbox('s.')}")
+        fr = card.query(_corridor_sql(sbox, "id", "b.*", anchors, width, limit), [])
+        if "error" in fr:
+            return {"error": fr["error"]}
+        # the same two trailing columns, as numbers
+        srows = [row[:-2] + [_num(row[-2]), _num(row[-1])] for row in fr["rows"]]
+        stations = {"fuel": fuel, "columns": fr["columns"], "rows": srows, "count": len(srows)}
+
+    return {"route": road, "corridor_m": width, "anchors": len(anchors),
+            "anchor_step_m": round(step, 1), "width_held": round(held, 4),
+            "chargers": chargers, "charger_positions": positions, "stations": stations,
+            "ms": round((time.time() - t0) * 1000, 1)}
+
+
+QUERIES = {"chargers_near": chargers_near, "tour": tour, "fuel_near": fuel_near, "route": route, "along_route": along_route}
 
 
 def serve(card: Card, tenants: list[str], queue: str, label: str) -> None:

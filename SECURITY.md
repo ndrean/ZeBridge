@@ -266,18 +266,25 @@ ALTER EVENT TRIGGER zebridge_timestamp_guard_t DISABLE;  -- migrate, then ENABLE
    partitioning by tenant gives the same locality permanently.
 4. **Check preflight at the next boot.** It reports grants that the schema cannot honour,
    version columns that are naive, and tenant columns outside the replica identity.
-5. **Restart the bridge.** There is nothing to transcribe: the `zebridge_enable(...)`
-   migration already wrote the table's `zebridge_catalogue` row (tenant column or public
-   reason, version/tombstone/tiebreak columns), and the bridge reads the catalogue once at
-   boot — it will not see the new table until it restarts. (`SYNC_RULES`/`TENANT_RULES`
-   remain as optional per-table env overrides for emergencies; production leaves them
-   unset.)
+5. **No restart.** There is nothing to transcribe: the `zebridge_enable(...)` migration
+   already wrote the table's `zebridge_catalogue` row (tenant column or public reason,
+   version/tombstone/tiebreak columns), and `zebridge_catalogue` rides the publication —
+   so a running bridge sees that row arrive and reloads the catalogue at the
+   transaction's COMMIT. ✅ Measured: a table enabled against a bridge that was never
+   restarted went from unbound to routed in one transaction.
+   (`SYNC_RULES`/`TENANT_RULES` remain as optional per-table env overrides for
+   emergencies; production leaves them unset.)
 6. **NATS: nothing by hand.** A tenant-scoped table is already covered by the tenant's
    existing `cdc.<tenant>.>` grant. A public table gets its own named subject
-   (`cdc.<table>.>`), not a wildcard — and the restart in step 5 is what binds it: at boot
-   the bridge sets `CDC_PUBLIC`'s subject list authoritatively from the catalogue's public
-   tables. The seeding side needs nothing extra: the producer derives its table set from
-   the publication and writes public tables under the open tenant's manifests.
+   (`cdc.<table>.>`), not a wildcard — and the catalogue reload of step 5 is what binds
+   it: the bridge sets `CDC_PUBLIC`'s subject list authoritatively from the catalogue's
+   public tables, at boot and again at every catalogue commit. ✅ Measured on one bridge
+   process: 11 subjects → 12 on `zebridge_enable`, back to 11 when the catalogue row was
+   deleted. A `DROP TABLE` alone does NOT unbind the subject; the catalogue row outlives
+   the table on purpose, and deleting it is what clears the subject (MIGRATIONS.md,
+   "Swapping one dataset for another"). The seeding side needs nothing extra: the
+   producer derives its table set from the publication and writes public tables under
+   the open tenant's manifests.
 
 ### 1.4b One bridge, one NATS, one table each — and columns are all or nothing
 

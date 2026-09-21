@@ -998,8 +998,12 @@ pub const SyncClient = struct {
             },
             else => return err,
         };
-        if (outcome != .unchanged) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
-        if (outcome == .rekeyed or outcome == .emptied or outcome == .created) {
+        // One line per event, not two: the branch below says everything the short
+        // form says and then what follows from it, so the short form is for the
+        // outcomes that branch does not cover (an ALTER that kept the rows).
+        const watermark_dropped = outcome == .rekeyed or outcome == .emptied or outcome == .created;
+        if (outcome != .unchanged and !watermark_dropped) std.debug.print("{s}: {s}\n", .{ table, @tagName(outcome) });
+        if (watermark_dropped) {
             // §10dg: the rows are gone (with the old key, or because the rebuild could
             // not carry them); so is everything that referred to them — the watermark
             // (the next gap check seeds a fresh full) and the events held for the
@@ -1010,8 +1014,18 @@ pub const SyncClient = struct {
             // this loop, and a table with no bookkeeping has no watermark to drop.
             _ = self.st.query(a, "DELETE FROM _zbz_generations WHERE tbl = ?", &.{.{ .text = table }}) catch {};
             pruneInboxDropped(&self.st, a, table) catch {};
-            self.reseed_pending = true;
-            std.debug.print("{s}: {s} — watermark dropped, re-seeding from a fresh full\n", .{ table, @tagName(outcome) });
+            if (outcome != .created) discardOutbox(&self.st, a, table, @tagName(outcome)) catch {};
+            // §10hj: an ON-DEMAND table is never seeded from a chain — both loops in
+            // `gapAndSeed` skip it — so promising a fresh full here describes work that
+            // will never happen, and it was read as a fault. Say what is true instead,
+            // and leave `reseed_pending` alone: a pass raised for a table that cannot
+            // seed is a wasted pass, and every table that DOES need one raises it.
+            if (self.isOnDemand(table)) {
+                std.debug.print("{s}: {s} — on demand, so no chain seed; rows arrive as query answers\n", .{ table, @tagName(outcome) });
+            } else {
+                self.reseed_pending = true;
+                std.debug.print("{s}: {s} — watermark dropped, re-seeding from a fresh full\n", .{ table, @tagName(outcome) });
+            }
         }
 
         const pk = try jsonStrList(a, val.object.get("pk_columns"));
@@ -1102,6 +1116,7 @@ pub const SyncClient = struct {
     /// if they were live.
     fn dropLocalTable(self: *SyncClient, a: std.mem.Allocator, table: []const u8) !void {
         pruneInboxDropped(&self.st, a, table) catch {};
+        discardOutbox(&self.st, a, table, "dropped") catch {};
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP VIEW IF EXISTS \"{s}_view\";", .{table}));
         try execSql(&self.st, a, try std.fmt.allocPrint(a, "DROP TABLE IF EXISTS \"{s}\";", .{table}));
         _ = self.states.orderedRemove(table);
@@ -3374,13 +3389,46 @@ pub const SyncClient = struct {
     /// reply's bytes come back allocated from `a` — JSON by convention, but bytes here.
     pub fn request(self: *SyncClient, a: std.mem.Allocator, subject: []const u8, payload: []const u8, timeout_ms: u64) ![]u8 {
         const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(@max(1, timeout_ms))), .clock = .awake } };
+        const t0 = msNow();
         const msg = try self.t.conn.request(subject, payload, t);
         defer msg.deinit();
+        const wire_ms = msNow() - t0;
         // §10hq: an answer too large for one message arrives as a small envelope naming
         // an object; read it and hand back the answer itself. The host asked a question
         // and gets an answer, whichever way it travelled.
-        if (try self.objectEnvelope(a, msg.data)) |fetched| return fetched;
-        return try a.dupe(u8, msg.data);
+        // §10hu: …and is TOLD which way, on the same clock either way. Without this a
+        // host times the two paths differently and reads the difference as the cost of
+        // the data rather than the cost of the fetch.
+        if (try self.objectEnvelope(a, msg.data)) |fetched| {
+            const fetch_ms = msNow() - t0 - wire_ms;
+            return try spliceTransport(a, fetched, "object", fetched.len, wire_ms, fetch_ms);
+        }
+        return try spliceTransport(a, msg.data, "inline", msg.data.len, wire_ms, 0);
+    }
+
+    /// How the answer travelled, spliced into the answer itself as `zb_transport`:
+    /// `via` ("inline" or "object"), `bytes` (the answer's own size, not the reply's),
+    /// `wire_ms` (ask → reply) and `fetch_ms` (0 inline, the object read otherwise).
+    /// ⚠️ TEXTUAL, not parse-then-reprint: re-serialising a megabyte to add four
+    /// numbers would cost more than the fetch it reports and spoil the measurement.
+    /// A body that is not a JSON object travels unchanged — a service may answer with
+    /// anything, and this must never corrupt it.
+    fn spliceTransport(a: std.mem.Allocator, body: []const u8, via: []const u8, bytes: usize, wire_ms: i64, fetch_ms: i64) ![]u8 {
+        if (body.len == 0 or body[0] != '{') return try a.dupe(u8, body);
+        const head = try std.fmt.allocPrint(a, "{{\"zb_transport\":{{\"via\":\"{s}\",\"bytes\":{d},\"wire_ms\":{d},\"fetch_ms\":{d}}}", .{ via, bytes, wire_ms, fetch_ms });
+        // `{}` takes no comma; `{"a":1}` does.
+        var i: usize = 1;
+        while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+        const empty = i >= body.len or body[i] == '}';
+        const out = try a.alloc(u8, head.len + @as(usize, if (empty) 0 else 1) + (body.len - 1));
+        @memcpy(out[0..head.len], head);
+        var n = head.len;
+        if (!empty) {
+            out[n] = ',';
+            n += 1;
+        }
+        @memcpy(out[n..][0 .. body.len - 1], body[1..]);
+        return out;
     }
 
     /// `{"zb_object":{"bucket","name","bytes"}}` → the object's bytes; null when the
@@ -4402,6 +4450,19 @@ pub fn pruneInboxDropped(st: *storage.Storage, a: std.mem.Allocator, table: []co
     _ = try st.query(a, "DELETE FROM _zbz_inbox WHERE tbl = ?", &.{.{ .text = table }});
 }
 
+/// Queued writes for a dropped or re-keyed table can never apply: the server would
+/// answer `row_deleted` at best, and at worst land on an unrelated table that later
+/// reuses the name. Discard them LOUDLY — a silent queue draining into a void is
+/// exactly what an outbox exists to prevent. The TS client's `discardOutbox`; this
+/// is the libzb half, which was missing (§10hs).
+pub fn discardOutbox(st: *storage.Storage, a: std.mem.Allocator, table: []const u8, why: []const u8) !void {
+    const q = try st.query(a, "SELECT count(*) FROM _zebridge_outbox WHERE tbl = ?", &.{.{ .text = table }});
+    const k: i64 = if (q.len > 0 and q[0][0] == .integer) q[0][0].integer else 0;
+    if (k == 0) return;
+    _ = try st.query(a, "DELETE FROM _zebridge_outbox WHERE tbl = ?", &.{.{ .text = table }});
+    std.debug.print("{s}: {d} queued write(s) discarded — the table was {s} — surface this to the user\n", .{ table, k, why });
+}
+
 test "inbox: a held event survives closing the database, and a seed past it prunes it" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -4438,6 +4499,64 @@ test "inbox: a held event survives closing the database, and a seed past it prun
     try pruneInboxDropped(&st, aa_, "child");
     rows = try st.query(aa_, "SELECT id FROM _zbz_inbox", &.{});
     try std.testing.expectEqual(@as(usize, 0), rows.len);
+}
+
+test "spliceTransport: the answer keeps its shape, whatever it is" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // An ordinary answer: the marker goes first, the body follows intact.
+    const got = try SyncClient.spliceTransport(a, "{\"count\":3}", "inline", 11, 7, 0);
+    try std.testing.expectEqualStrings("{\"zb_transport\":{\"via\":\"inline\",\"bytes\":11,\"wire_ms\":7,\"fetch_ms\":0},\"count\":3}", got);
+    // It must still parse, and both halves must be readable.
+    const v = (try std.json.parseFromSlice(Value, a, got, .{})).value;
+    try std.testing.expectEqual(@as(i64, 3), v.object.get("count").?.integer);
+    try std.testing.expectEqualStrings("inline", v.object.get("zb_transport").?.object.get("via").?.string);
+    // An empty object takes no comma.
+    const e = try SyncClient.spliceTransport(a, "{}", "object", 900, 1, 24);
+    try std.testing.expectEqualStrings("{\"zb_transport\":{\"via\":\"object\",\"bytes\":900,\"wire_ms\":1,\"fetch_ms\":24}}", e);
+    _ = try std.json.parseFromSlice(Value, a, e, .{});
+    // `{ }` — whitespace before the brace is still empty.
+    const w = try SyncClient.spliceTransport(a, "{  }", "inline", 4, 0, 0);
+    _ = try std.json.parseFromSlice(Value, a, w, .{});
+    // Not an object: a service may answer with anything, and it travels UNCHANGED.
+    try std.testing.expectEqualStrings("[1,2]", try SyncClient.spliceTransport(a, "[1,2]", "inline", 5, 0, 0));
+    try std.testing.expectEqualStrings("\"hi\"", try SyncClient.spliceTransport(a, "\"hi\"", "inline", 4, 0, 0));
+    try std.testing.expectEqualStrings("", try SyncClient.spliceTransport(a, "", "inline", 0, 0, 0));
+}
+
+test "outbox: a dropped or re-keyed table takes its queued writes with it" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa_ = arena.allocator();
+    const path = "/tmp/zb-outbox-drop-test.sqlite3";
+    for ([_][]const u8{ path, path ++ "-wal", path ++ "-shm" }) |f| std.Io.Dir.cwd().deleteFile(std.testing.io, f) catch {};
+    var st = try storage.Storage.open(path);
+    defer st.close();
+    try execDdl(&st,
+        \\CREATE TABLE IF NOT EXISTS _zebridge_outbox (
+        \\  msg_id TEXT PRIMARY KEY, subject TEXT NOT NULL, payload TEXT NOT NULL,
+        \\  tbl TEXT NOT NULL, row_id TEXT NOT NULL, before TEXT,
+        \\  created_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0
+        \\)
+    );
+    const ins = "INSERT INTO _zebridge_outbox (msg_id, subject, payload, tbl, row_id, created_at) VALUES (?, 'sub', '{}', ?, 'r1', 1)";
+    _ = try st.query(aa_, ins, &.{ .{ .text = "m1" }, .{ .text = "gone" } });
+    _ = try st.query(aa_, ins, &.{ .{ .text = "m2" }, .{ .text = "gone" } });
+    _ = try st.query(aa_, ins, &.{ .{ .text = "m3" }, .{ .text = "stays" } });
+    // The dropped table's writes go; another table's are untouched — a discard is
+    // scoped to one table, never a queue-wide flush.
+    try discardOutbox(&st, aa_, "gone", "dropped");
+    const rows = try st.query(aa_, "SELECT msg_id, tbl FROM _zebridge_outbox", &.{});
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("stays", rows[0][1].text);
+    // Idempotent: a second drop of the same table is silent, not an error.
+    try discardOutbox(&st, aa_, "gone", "dropped");
+    // A client that never wrote has no outbox at all; the caller's `catch {}` covers
+    // it, and the function itself must not pretend the table exists.
+    try execDdl(&st, "DROP TABLE _zebridge_outbox");
+    try std.testing.expectError(error.StepFailed, discardOutbox(&st, aa_, "gone", "dropped"));
 }
 
 test "grammar: a missing key fails naming its path, never a silent default" {

@@ -271,13 +271,17 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   /// The viewport moved: ask for what is around its centre. Debounced — a pan is many
   /// events — and one ask at a time. The radius is half the visible diagonal, at most
-  /// 5 km for the POIs (the answer is the 2,000 nearest anyway: zoomed out, a disc
-  /// around the centre, never the whole screen) and 20 km for the stations, which are
-  /// sparse. Below zoom 10 (a département on screen) the map stops asking and draws
-  /// what it holds.
+  /// 150 km for the chargers and 20 km for the stations, which are sparse. Below zoom
+  /// 10 (a département on screen) the map stops asking and draws what it holds.
+  ///
+  /// §10hu: the charger cap was 5 km, which kept every answer inline and made the
+  /// large-answer path unreachable from the app. Measured before raising it, from
+  /// Nantes with this same limit of 2,000: an 814 KB answer costs about 5 ms more at
+  /// the median than a 6.9 KB one, because the object fetch is 2 ms and the
+  /// responder's 100 ms poll wait dominates both. The cap was buying nothing and it
+  /// hid the mechanism the demo exists to show. `limit` still bounds the answer:
+  /// zoomed out this is the 2,000 nearest, a disc around the centre.
   void _wantArea(MapCamera camera) {
-    // Off: nothing is asked for, the way the fuel switch asks for nothing when it is off.
-    if (chargers == null) return;
     if (camera.zoom < 10) {
       wantedCentre = null;
       return;
@@ -285,18 +289,56 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     final b = camera.visibleBounds;
     final half =
         const Distance().as(LengthUnit.Meter, b.southWest, b.northEast) / 2;
+    // §10hv: the geometry is recorded BEFORE any switch is consulted. It used to be
+    // computed after an early return on the charger switch, so with chargers off the
+    // fuel radius kept its initial 3 km however far out the map was zoomed.
     wantedCentre = camera.center;
-    wantedRadius = min(5000.0, max(150.0, half));
+    wantedRadius = min(150000.0, max(150.0, half));
     wantedFuelRadius = min(20000.0, max(3000.0, half));
+    // Both off: the viewport is up to date and there is simply nothing to ask for.
+    if (chargers == null && fuel == null) return;
     askDebounce?.cancel();
-    askDebounce = Timer(const Duration(milliseconds: 350), _ask);
+    askDebounce = Timer(const Duration(milliseconds: 350), _askArea);
   }
 
-  Future<void> _ask() async {
-    final w = zb;
+  /// §10hv: one debounce, two INDEPENDENT asks — the browser's shape, where `moveend`
+  /// tests each switch on its own. The fuel ask used to be the last statement inside
+  /// the charger ask's `try`, so fuel went stale whenever chargers were switched off
+  /// or a charger request failed. Each ask reports its own failure and neither can
+  /// cancel the other.
+  Future<void> _askArea() async {
     final at = wantedCentre;
-    if (w == null || at == null || asking) return;
+    if (zb == null || at == null || asking) return;
     asking = true;
+    try {
+      if (chargers != null) await _ask(at);
+      if (fuel != null) await _askFuel(at);
+    } finally {
+      asking = false;
+    }
+    // The viewport may have moved on while this was in flight.
+    final again = wantedCentre;
+    if (again != null && again != at) _askArea();
+  }
+
+  /// §10hu: how the answer travelled, the SAME way for every dataset. Both libraries
+  /// splice `zb_transport` into every answer, so fuel and chargers are read on one
+  /// clock: `wire` is ask→reply (it carries the responder's poll wait, which dominates
+  /// everything else), `fetch` is the object read and is 0 when the answer came
+  /// inline, `db` is the service's own query time.
+  String _transport(Map ans) {
+    final t = ans['zb_transport'] as Map?;
+    if (t == null) return 'db ${ans['ms']} ms';
+    final kb = ((t['bytes'] as num) / 1024).toStringAsFixed(1);
+    final via = t['via'] == 'object'
+        ? 'object $kb KB · fetch ${t['fetch_ms']} ms'
+        : 'inline $kb KB';
+    return '$via · wire ${t['wire_ms']} ms · db ${ans['ms']} ms';
+  }
+
+  Future<void> _ask(LatLng at) async {
+    final w = zb;
+    if (w == null) return;
     final radius = wantedRadius;
     final t0 = DateTime.now();
     try {
@@ -322,24 +364,22 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               ],
             }
           : null;
+      final tIngest = DateTime.now();
       final applied = await w.ingest(_table, ans, scope);
+      final ingestMs = DateTime.now().difference(tIngest).inMilliseconds;
       final ms = DateTime.now().difference(t0).inMilliseconds;
       if (mounted) {
         setState(() => status =
-            '${ans['count']} POI(s) within ${radius.round()} m in $ms ms · $applied kept');
+            '${ans['count']} charger(s) within ${(radius / 1000).toStringAsFixed(0)} km · '
+            '${_transport(ans)} · ingest $ingestMs ms · $applied kept · $ms ms total');
       }
       await _refresh();
-      await _askFuel(at);
     } catch (e) {
+      // Caught HERE, not by the caller: the fuel ask that follows must still run.
       if (mounted) {
-        setState(() => status = 'ask: $e — showing what the phone holds');
+        setState(() => status = 'chargers: $e — showing what the phone holds');
       }
-    } finally {
-      asking = false;
     }
-    // The viewport may have moved on while this ask was in flight.
-    final again = wantedCentre;
-    if (again != null && again != at) _ask();
   }
 
   /// The stations selling the chosen fuel around the centre, nearest first — the
@@ -370,7 +410,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         setState(() {
           stations = rows;
           status =
-              '${rows.length} station(s) selling $f within ${(radius / 1000).toStringAsFixed(0)} km in ${ans['ms']} ms';
+              '${rows.length} station(s) selling $f within ${(radius / 1000).toStringAsFixed(0)} km · '
+              '${_transport(ans)}';
         });
       }
     } catch (e) {
@@ -644,8 +685,13 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             initialValue: fuel ?? '',
             onSelected: (v) {
               setState(() => fuel = v.isEmpty ? null : v);
-              final at = wantedCentre ?? mapController.camera.center;
-              _askFuel(at);
+              if (fuel == null) {
+                setState(() => stations = const []);
+                return;
+              }
+              // §10hv: through the pan handler, so the radius is the CURRENT
+              // viewport's rather than whatever a previous charger pan left behind.
+              _wantArea(mapController.camera);
             },
             itemBuilder: (_) => [
               const PopupMenuItem(value: '', child: Text('Off')),

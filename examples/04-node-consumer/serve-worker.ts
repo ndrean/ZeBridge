@@ -45,6 +45,8 @@ if (process.env.ZB_ASK) {
     count: ans?.count ?? null,
     answered_by: ans?.answered_by ?? null,
     envelope_resolved: !('zb_object' in (ans ?? {})),
+    // §10hu: how it travelled, from the library rather than from a guess.
+    transport: ans?.zb_transport ?? null,
     ms: Math.round(performance.now() - t0),
   })}`);
   await zb.close();

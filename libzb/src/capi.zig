@@ -377,7 +377,13 @@ const ClientBox = struct {
 /// the day a host needs to distinguish "bad credentials" from "no broker".
 export fn zb_client_open(opts_json: ?[*:0]const u8) u64 {
     const text = std.mem.span(opts_json orelse return 0);
-    const box = openBox(std.heap.c_allocator, text) catch return 0;
+    // §10hw: the doc above promised the reason was logged; it was swallowed. A bare 0
+    // with no line is the worst failure this ABI can produce, because the host has
+    // nothing at all to search for.
+    const box = openBox(std.heap.c_allocator, text) catch |err| {
+        std.debug.print("zb_client_open failed: {s}\n", .{@errorName(err)});
+        return 0;
+    };
     const h = clients.insert(box);
     if (h == 0) box.destroy(std.heap.c_allocator); // table full: do not leak it
     return h;

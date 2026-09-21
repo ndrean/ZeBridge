@@ -1344,8 +1344,17 @@ fn registerWins(b: Value, a: Value) bool {
 }
 
 pub fn isReadOnlySql(sql: []const u8) bool {
-    var buf: [4096]u8 = undefined;
-    if (sql.len > buf.len) return false;
+    // §10hy: the normalised form is never LONGER than the input (comments shrink to a
+    // space, a string literal to its two quotes, everything else is 1:1), so the input
+    // length bounds it. This used to be a fixed 4 KiB buffer with
+    // `if (sql.len > buf.len) return false;` on top, which refused a perfectly
+    // read-only query for being long and blamed it for writing. core.ts has no such
+    // limit, so the two clients disagreed about the same SQL — found by a corridor
+    // query whose anchor list pushed it past 4 KiB.
+    var stack: [4096]u8 = undefined;
+    const heap: ?[]u8 = if (sql.len > stack.len) std.heap.page_allocator.alloc(u8, sql.len) catch return false else null;
+    defer if (heap) |h| std.heap.page_allocator.free(h);
+    const buf: []u8 = heap orelse stack[0..];
     // blank block comments, line comments and string literals in one pass
     var n: usize = 0;
     var i: usize = 0;

@@ -14699,7 +14699,19 @@ makes every replica drop its copy. The next boot swept the chain — "'_default'
 left the publication — chain swept; a table reborn under this name starts at g1" — and
 said nothing else about it. Its catalogue row survives the drop, deliberately: the
 declaration outlives the table, so a table reborn under the same name is the same
-declaration, and the publication (not the catalogue) is what the boot follows.
+declaration. That has one consequence worth knowing, and correcting an earlier reading
+of it here: the publication drives the boot's TABLE list, but `CDC_PUBLIC`'s SUBJECT
+list comes from the catalogue's public rows, so `cdc.osm_pois.>` stayed bound to the
+stream after the table was gone. Deleting the catalogue row clears it, and — checked
+properly rather than inferred — it clears it LIVE. `reconcileCdcStreams` has two call
+sites, not one: the boot path and `LiveCatalogue.reload`, which runs at the COMMIT of
+any transaction that touched `zebridge_catalogue`. Measured on a throwaway table against
+one bridge process: 11 subjects, 12 after `zebridge_enable`, still 12 after `DROP TABLE`
+(the row outlives the table), 11 again after deleting the row. SECURITY §1.4 said a
+restart was what bound a new public table; it was stale, and is now corrected. The
+prune also left one object behind, `osm_pois-g3-dict`, the generation's dictionary,
+referenced by nothing. Both are one line to clear, and both are now in MIGRATIONS.md's
+swapping-a-dataset playbook, which is where someone doing this next will look.
 
 **The switch, in both interfaces.** The charge points got the shape the fuel prices
 already had: a menu whose off position asks for nothing. Off, all, 22 kW and up, rapid
@@ -14712,4 +14724,311 @@ phone already holds without deleting it. The scope is sent only when the switch 
 "all": an answer filtered by power is not complete for its area, and deleting on it
 would throw away the slow chargers held there. Measured in the browser: 11 points at
 all, 4 at rapid, none off, 10 ms in the service.
+
+## §10hs — the outbox a dropped table left behind (libzb)
+
+Writing the dataset-swap playbook in MIGRATIONS.md meant claiming what a client does
+with writes it has queued for a table that is dropped upstream. The claim was checked
+rather than asserted, and it was only half true.
+
+The TypeScript client has `discardOutbox(table, why)` and calls it at three sites:
+`dropLocalTable` ("dropped"), the re-key branch ("re-keyed"), and the rebuild that
+could not carry its rows ("emptied"). It counts the rows, deletes them for that table
+only, and logs a WARNING that says to surface it to the user.
+
+libzb had the inbox half — `pruneInboxDropped`, which discards events HELD for the
+table — at both of the matching sites, and nothing for `_zebridge_outbox`. So a phone
+that had made an edit while offline, whose table was then dropped, kept that entry in
+its outbox forever: an entry leaves the outbox only on a definitive verdict, and a
+subject no table answers produces no verdict at all. It would be retried at every
+flush, silently, for the life of the database file.
+
+Fixed by giving libzb the same function at the same sites (`.created` excluded — a
+table that never existed locally has nothing queued). The test that came with it pins
+the two properties that matter: the discard is SCOPED (another table's entries stay),
+and it is idempotent. A client that has never written has no `_zebridge_outbox` at all,
+so the function errors rather than pretending, and every call site wraps it in `catch {}`
+the way the inbox prune already was.
+
+The lesson is the reason the playbook was worth writing: the two clients had diverged in
+a place no test covered, and only stating the behaviour in prose exposed it.
+
+## §10ht — a log line that promised work it could never do
+
+The Flutter map printed this on launch, and it read as a fault:
+
+    charge_points: created
+    charge_points: created — watermark dropped, re-seeding from a fresh full
+    routes: seeded 1 row(s) from chain g22 (_default) — ...
+
+No seed line for `charge_points` ever followed, because none ever could: the app lists
+it in `ondemandTables`, and BOTH loops in `gapAndSeed` skip an on-demand table by
+design (§10hj, §10hn). The chain was healthy the whole time — full at g3, two deltas,
+the g1 dictionary — and the responder answered a query near Nantes centre with four
+chargers. Nothing was wrong except the sentence.
+
+Two defects in one place, both now fixed:
+
+- **The promise.** `applySchema` printed "watermark dropped, re-seeding from a fresh
+  full" before consulting `isOnDemand`. An on-demand table now gets "on demand, so no
+  chain seed; rows arrive as query answers", which is what actually happens.
+- **The duplicate.** The short `{table}: {outcome}` line and the long one were printed
+  for the same event by adjacent branches. The short form is now for the outcomes the
+  long branch does not cover — an ALTER that kept its rows.
+
+A third thing came out of it: `reseed_pending` was being raised for on-demand tables
+too. Harmless (both loops skip them) but a wasted pass, and it is no longer raised —
+every table that genuinely needs a seed raises the flag itself.
+
+zb-client-ts never had the bug on the CREATED path ("created (first sight)" promises
+nothing), but its two re-key messages and its seed-epoch message carried the same false
+promise. All three now go through one `reseedNote(table)` helper, so the two libraries
+say the same thing at the same three outcomes.
+
+Proved by opening a libzb client with the app's exact options against a fresh database:
+`charge_points` is created with 0 rows and the truthful line, `routes` seeds its 1 row
+from g22, and no duplicate line appears. 28 Zig tests and 222 TS tests pass.
+
+The lesson is narrow and worth keeping: a log line that describes intent rather than
+outcome will eventually be read by someone debugging, and a promise the code cannot
+keep costs more than silence would have.
+
+## §10hu — one clock, or the number means nothing
+
+The map showed fuel answering in 1–15 ms and chargers in 250–300 ms, and the obvious
+reading — charge points are expensive — was wrong in every part.
+
+The two numbers were not measuring the same thing. The fuel line printed the SERVICE's
+own query time, taken around `card.query` inside `fuel_near`. The charger line started a
+stopwatch before the request and stopped it after `ingest` had written the rows into the
+local table. One number was a DuckDB query; the other was a round trip plus a local
+write. Asked directly, service side, the two datasets are 3.9 ms and 7.0 ms.
+
+So both libraries now say how every answer travelled. `request` splices a `zb_transport`
+block into the answer: `via` ("inline" or "object"), `bytes` (the ANSWER's size, not the
+reply's), `wire_ms` (ask → reply) and `fetch_ms` (the object read, 0 inline). libzb
+splices it TEXTUALLY (`spliceTransport`) rather than parsing and reprinting — re-serialising
+a megabyte to add four numbers would cost more than the fetch it reports. zb-client-ts sets
+the same four fields on the object it already parsed. A body that is not a JSON object
+travels unchanged in both.
+
+With one clock, from Nantes, `limit` 2000, five asks per row:
+
+| radius | via | rows | answer bytes | wire (med) | fetch (med) | service (med) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5 km | inline | 18 | 6,883 | 111 ms | 0 ms | 9.0 ms |
+| 50 km | inline | 306 | 114,239 | 120 ms | 0 ms | 15.6 ms |
+| 100 km | object | 914 | 360,547 | 122 ms | 2 ms | 17.8 ms |
+| 300 km | object | 2,000 | 813,821 | 126 ms | 2 ms | 22.0 ms |
+
+Two findings, and the second is the one that matters.
+
+**The object path is nearly free.** 814 KB resolves in 2 ms through libzb and 4 ms
+through zb-client-ts. Going from 6.9 KB to 814 KB — 118× the payload — costs about 5 ms
+at the median. The inline/object threshold is 262,144 bytes, crossed between 50 and 100 km
+here; the object lands in the ASKING tenant's bucket (`res-kilo`), which expires after
+600 s.
+
+**The responder's poll wait dominates everything.** Subtracting the service time from
+`wire_ms` left a FLAT ~104 ms at every size — a constant is never a data cost. It is
+`card.poll(100)` in the serve loop: a question arriving just after a poll begins waits
+out the rest of that window. Asking at random phases instead of back-to-back gives the
+true distribution — small answers 23–116 ms, large ones 36–128 ms — a ~93 ms spread
+that is the poll window, and medians 5 ms apart that are the data. Nothing about charge
+points is slow.
+
+Both apps now print the same fields for both datasets, so the comparison can no longer
+be made by accident. The charger radius cap went from 5 km to 150 km in the phone and
+from 20 km to 150 km in the browser: at the old caps every answer stayed inline and the
+large-answer path was unreachable from the UI, and the table above is why that cap was
+buying nothing.
+
+The lesson generalises past this demo: a latency number without its boundary is not a
+measurement. Two of them side by side, taken at different boundaries, is worse than
+having neither, because it invites a conclusion about the data when the difference was
+in the stopwatch.
+
+## §10hv — one dataset riding on another's success
+
+Panning the phone did not refresh the fuel stations. The browser, same service, same
+queries, refreshed them fine. The difference was entirely in how each client wired its
+viewport to its two asks.
+
+The browser's `moveend` is a dispatcher: it tests each switch on its own and fires two
+independent asks. The phone's `_wantArea` was a single path with an early return, and
+three things hung off that shape:
+
+1. **The pan handler exited on the CHARGER switch before scheduling anything.** Its own
+   comment said it was honouring the fuel switch; the variable it read was `chargers`.
+   With charge points off, a pan scheduled no work at all and fuel never refreshed.
+2. **The fuel ask was the last statement inside the charger ask's `try`.** It ran only
+   if the charger request AND its local ingest both succeeded. A charger failure landed
+   in a `catch` that did not ask for fuel, so the previous screen's stations silently
+   stood.
+3. **The fuel radius was only ever computed inside that handler.** When the handler
+   returned early the radius kept its initial 3 km however far out the map was zoomed.
+   Measured at Nantes centre: 3 km answers 2 stations, 20 km answers 17. The bug was
+   visible as missing pins, not as an error.
+
+Now the geometry is recorded before any switch is consulted, the handler schedules when
+EITHER switch is on, and one debounce calls `_askArea`, which awaits each ask in turn
+with each owning its own `try`. Neither dataset can cancel or stale the other. The
+in-flight guard moved up to `_askArea`, so it still bounds one area ask at a time, and
+the "viewport moved while we were asking" retry moved with it. Picking a fuel now goes
+through the same handler, so its radius is the current viewport's rather than whatever
+a previous charger pan left behind; picking Off clears the stations directly.
+
+The lesson is about the shape, not the bug: chaining a second ask onto the end of the
+first reads as sequencing, but it also makes one feature's freshness depend on another
+feature being switched on and working. Two independent things want two independent
+branches, which is what the browser had and what made the divergence visible at all.
+
+## §10hw — a plain `zig build` silently removed an engine
+
+Rebuilding libzb through today's fixes, I used `zig build -Doptimize=ReleaseFast`. The
+DuckDB engine is behind `-Dduckdb=true`, which defaults to FALSE, so every rebuild
+produced a dylib with no DuckDB in it. `otool -L` showed no `libduckdb`, and
+`nm` found no DuckDB symbols.
+
+The map service survived only because it had loaded the dylib at 08:44, before the
+first rebuild. Its next restart would have failed to open `/tmp/pois-service.duckdb`,
+and the failure would have said NOTHING: `zb_client_open` returned a bare 0.
+
+Two lines made it diagnosable, and both were latent long before today:
+
+- `Storage.openDuckdb` and `openDuckdbShared` returned `Error.OpenFailed` for a build
+  without the engine — the same error a corrupt file gives. They now name the cause and
+  the flag that fixes it.
+- `zb_client_open`'s doc comment claimed "the reason is logged rather than returned".
+  It was not logged; the `catch return 0` swallowed it. It now prints the error name.
+  A bare 0 with no line is the worst thing this ABI can produce, because the host has
+  nothing to search for.
+
+The flag is documented in CLIENTS.md, README.md and two example READMEs. Being
+documented did not help, because the failure did not mention it. **Build the service's
+libzb with `zig build -Doptimize=ReleaseFast -Dduckdb=true`** — the plain form is the
+phone build, where a 50 MB analytics library has no business being.
+
+## §10hx — a disc around the centre is the wrong shape for a road
+
+Panning and zooming produced "different clusters" of charge points, which looked like a
+caching fault and is not one. Two separate mechanisms, neither of them the radius cap:
+
+**The row limit binds before the radius does.** From Nantes, `limit` 2000 cuts the
+answer at 166.7 km whatever radius is asked for, and `complete` goes false at that
+point. Measured: 50 km gives 306 rows complete, 150 km gives 1,620 complete, 300 km and
+600 km both give 2,000 rows reaching 166.7 km, incomplete. The visible edge of a cluster
+is where the LIMIT ran out, not where the radius ended, so it moves with local density.
+
+**The phone accumulates.** `ingest` deletes local rows only inside the scope box, and
+only when the answer is complete. Everything fetched for a previous viewport stays.
+Measured on one client after four asks: 2,000 rows spanning 166.7 km, while a single
+5 km ask returns 18. Zoomed out, what is drawn is the history of where the map has
+been. That is the on-demand contract working as designed, and it is also exactly what
+looks wrong.
+
+Neither matters for the actual goal, which is fuel and chargers ALONG A ROUTE. A disc
+around a centre cannot express that. A corridor can, and it needs no spatial extension:
+turn the Valhalla polyline into anchors, prefilter by the route's bounding box, then
+keep rows whose distance to the nearest anchor is within the width.
+
+⚠️ **The first prototype SUBSAMPLED the polyline — kept a vertex only when it was at
+least half a width from the last one kept — and that is wrong.** It bounds the anchor
+spacing from BELOW and not from above, so the spacing is whatever the input vertices
+happen to be. Two anchors `d` apart cover only `sqrt(W² - (d/2)²)` of the half-width
+midway between them, and at `d >= 2W` they cover nothing: the corridor breaks in two.
+The owner spotted this before it was measured. On a synthetic motorway with vertices
+15 km apart, a 2 km and a 5 km corridor both collapse to ZERO width between anchors.
+
+Real Valhalla shapes hide it: Nantes to Angers and Nantes to Le Mans both have a median
+segment of 39 m and a maximum of 1,130 m, so the corridor only narrowed rather than
+broke — 1,716 m of 2,000 m at the worst point. A correctness bug that depends on the
+density of someone else's polyline is not one to leave in.
+
+The fix is to DENSIFY rather than subsample: walk each segment and interpolate a point
+every `step` metres inside it, so the spacing is bounded by construction whatever the
+vertices do. With `step = W/2` the same synthetic 15 km route holds 96.8% of full width.
+Re-measured on the real road, on the service's own DuckDB replica, 92.39 km and 1,948
+shape points:
+
+| corridor | anchors | widest gap | width held | along the road | time |
+| --- | --- | --- | --- | --- | --- |
+| 2 km | 159 | 1,416 m | 93.5% | 65 | 12 ms |
+| 5 km | 68 | 1,921 m | 98.1% | 132 | 5 ms |
+| 10 km | 34 | 3,427 m | 98.5% | 208 | 4 ms |
+
+The 2 km row found 65 points where the subsampling version found 62: the three it missed
+were in the scalloped dips. The residual gap comes from thinning the densified list at
+`step/2`, which lets a gap reach `1.5 × step`; emitting only at exact multiples of the
+step, ignoring the original vertices except as interpolation guides, makes the spacing
+exactly `step` and the held width exactly 96.8%. Exact point-to-SEGMENT distance would
+remove the approximation altogether at the cost of a heavier SQL expression.
+
+A cross join of a few hundred candidates against a few dozen anchors is nothing to
+DuckDB, and the answer is bounded by the road rather than by a limit, so it is stable:
+the same route gives the same set every time, which is what the disc could never do.
+
+## §10hy — a read-only query refused for being long
+
+The first `along_route` call came back `ReadOnlyQuery`, from a query that only reads.
+`core.isReadOnlySql` in libzb opened with:
+
+    var buf: [4096]u8 = undefined;
+    if (sql.len > buf.len) return false;
+
+A corridor query carries its anchors as a VALUES list, so a 2 km corridor over 92 km of
+road pushed the statement past 4 KiB and it was refused — and refused with a name that
+accuses it of writing. `core.ts` has no such limit, so the two clients disagreed about
+the same SQL, which is exactly the divergence this pair of implementations exists to
+avoid.
+
+The normalised form is never longer than the input (a comment shrinks to a space, a
+string literal to its two quotes, everything else is 1:1), so the input length bounds
+it. The stack buffer stays for the common case and anything larger allocates. Two cases
+went into the SHARED fixtures rather than into one client's tests: a 6,773-character
+read-only query is allowed, and the same statement with a `DELETE` spliced in is still
+refused, so length can never become an excuse. Both clients now agree on all 20
+readOnlySql fixtures.
+
+## §10hz — `along_route`, the corridor as a named query
+
+Built on the service (§10hx's prototype, corrected). One ask carries the stops, a
+corridor width, an optional minimum power and an optional fuel; the answer carries the
+road, the charge points and the stations within the corridor, in TRAVEL order.
+
+Three decisions worth keeping:
+
+**Anchors are densified, never subsampled.** `densify` walks the polyline and emits a
+point every `step` metres by interpolating INSIDE a segment, so the spacing is pinned
+whatever Valhalla's vertices do, and the corridor holds `sqrt(1 - (step/2W)²)` of its
+width everywhere — 96.8% at the default `step = W/2`. The destination is anchored
+explicitly: the tail after the last whole step would otherwise go unanchored, measured
+at 950 m on a 74.95 km route, and the destination is exactly where someone looks for a
+charger. Anchors are capped at 4,000; past that the step widens, so a very long route
+with a very narrow corridor loses accuracy rather than changing shape.
+
+**Travel order comes out of the same aggregate that finds the nearest anchor.**
+`arg_min(a.am, dist)` carries the winning anchor's distance-along beside `min(dist)`,
+so one pass gives both "how far from the road" and "how far along it". Ordering by
+distance from the line would be useless for a journey.
+
+**`chargers` is exactly CP_COLS.** The block drops straight into an on-demand
+`charge_points` through `ingest`; the two distances live beside it in
+`charger_positions`, row for row, rather than as extra columns the table has no room
+for. No scope is returned: a corridor is not a box, and sweeping the box around it
+would throw away rows a phone legitimately holds for other views.
+
+Measured, Nantes to Angers, 92.39 km:
+
+| corridor | anchors | chargers | stations | service | wire |
+| --- | --- | --- | --- | --- | --- |
+| 2 km | 94 | 65 | 3 | 218 ms | inline 75 KB |
+| 5 km | 38 | 133 | 15 | 75 ms | inline 106 KB |
+| 10 km | 20 | 208 | — | 79 ms | inline 134 KB |
+
+And where it gets big, the large-answer path takes over with no special handling:
+Nantes to Le Mans at 20 km wide is 377 chargers and 192 stations in a 286 KB object
+fetched in 3 ms; a three-stop 282.93 km route at 25 km wide is 359 KB fetched in 1 ms.
+Travel order held on every one, and the refusals are named: fewer than two points, an
+unknown fuel, a point off the graph.
 

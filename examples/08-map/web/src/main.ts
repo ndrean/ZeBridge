@@ -31,6 +31,18 @@ const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as
 const statusEl = el<HTMLElement>('status');
 const say = (s: string) => { statusEl.textContent = s; };
 
+/// §10hu: how the answer travelled, the same way for every dataset. The library
+/// splices `zb_transport` into every answer, so fuel and chargers are read on one
+/// clock. `wire` is ask to reply and carries the responder's poll wait, which
+/// dominates; `fetch` is the object read, 0 when the answer came inline.
+const transport = (ans: any): string => {
+  const t = ans?.zb_transport;
+  if (!t) return `db ${ans?.ms} ms`;
+  const kb = (t.bytes / 1024).toFixed(1);
+  const via = t.via === 'object' ? `object ${kb} KB · fetch ${t.fetch_ms} ms` : `inline ${kb} KB`;
+  return `${via} · wire ${t.wire_ms} ms · db ${ans.ms} ms`;
+};
+
 const creds = await fetch(`/creds/${PRINCIPAL}.creds`).then((r) => (r.ok ? r.text() : undefined));
 if (!creds) say(`no creds for ${PRINCIPAL} — is public/creds pointing at scripts/native/creds?`);
 
@@ -70,7 +82,9 @@ async function askChargers() {
   const minKw = Number(chargerSelect.value);
   const c = map.getCenter();
   const b = map.getBounds();
-  const radius = Math.min(20000, Math.max(500, map.distance(b.getSouthWest(), b.getNorthEast()) / 2));
+  // §10hu: 150 km, not 20 km — at 20 km every answer stayed inline and the
+  // large-answer path was unreachable from the browser too. `limit` still bounds it.
+  const radius = Math.min(150000, Math.max(500, map.distance(b.getSouthWest(), b.getNorthEast()) / 2));
   const t0 = performance.now();
   try {
     const ans = await zb.request(`query.${TENANT}.chargers_near`, {
@@ -85,7 +99,7 @@ async function askChargers() {
     const kept = await zb.ingest('charge_points', ans, minKw > 0 ? null : scope);
     const ms = Math.round(performance.now() - t0);
     await drawChargers();
-    say(`${ans.count} charge point(s) within ${(radius / 1000).toFixed(1)} km — ${ans.ms} ms in the service, ${ms} ms round trip, ${kept} kept`);
+    say(`${ans.count} charge point(s) within ${(radius / 1000).toFixed(1)} km · ${transport(ans)} · ${ms} ms total · ${kept} kept`);
   } catch (e) {
     say(`chargers: ${e} — is the map service running?`);
   } finally {
@@ -149,7 +163,7 @@ async function askFuel() {
         .bindTooltip(`${at(r, 'address') ?? ''} ${at(r, 'city') ?? ''} · ${Math.round(Number(at(r, 'm')))} m${out ? ` · ${out} outage` : ''}`)
         .addTo(fuelLayer);
     }
-    say(`${rows.length} station(s) selling ${fuel} within ${(radius / 1000).toFixed(0)} km — ${ans.ms} ms in the service, ${Math.round(performance.now() - t0)} ms round trip`);
+    say(`${rows.length} station(s) selling ${fuel} within ${(radius / 1000).toFixed(0)} km · ${transport(ans)} · ${Math.round(performance.now() - t0)} ms total`);
   } catch (e) {
     say(`fuel: ${e} — is the POI service running?`);
   } finally {
