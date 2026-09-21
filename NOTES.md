@@ -14692,8 +14692,24 @@ One consequence worth knowing. The answers are now SMALL: 3.5 KB for a neighbour
 2,000 points and crossed §10hq's inline limit on an ordinary pan. The large-answer path
 is no longer exercised by the map by accident — `serve.py` exercises it on purpose.
 
-`osm_pois` is still loaded and still published. Nothing uses it now; a client that
-follows every table still seeds its 2.1 million rows. Retiring it is one `DROP TABLE`,
-and the DDL trigger tombstones the schema so every replica drops it — the owner's call,
-not made here.
+`osm_pois` was dropped the same day, on the owner's word. One `DROP TABLE`, and the
+bridge did the rest in one line of its log: "drop prune for 'osm_pois': 2 stream
+purge(s), 7 chain object(s), 1 KV key(s)", then the tombstone `{"dropped": true}` that
+makes every replica drop its copy. The next boot swept the chain — "'_default'/'osm_pois'
+left the publication — chain swept; a table reborn under this name starts at g1" — and
+said nothing else about it. Its catalogue row survives the drop, deliberately: the
+declaration outlives the table, so a table reborn under the same name is the same
+declaration, and the publication (not the catalogue) is what the boot follows.
+
+**The switch, in both interfaces.** The charge points got the shape the fuel prices
+already had: a menu whose off position asks for nothing. Off, all, 22 kW and up, rapid
+at 43, ultra at 150. In the Flutter app it replaced a bolt toggle that could only say
+rapid or not; in the browser it came with the on-demand table itself, which the
+TypeScript client could not hold until §10hn. Two things the switch does that a filter
+on the drawing would not: the ask carries `min_kw`, so a narrow switch moves less over
+the wire, and the local read carries it too, so turning the switch up hides what the
+phone already holds without deleting it. The scope is sent only when the switch is at
+"all": an answer filtered by power is not complete for its area, and deleting on it
+would throw away the slow chargers held there. Measured in the browser: 11 points at
+all, 4 at rapid, none off, 10 ms in the service.
 

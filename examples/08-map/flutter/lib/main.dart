@@ -96,8 +96,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   /// The fuel switch: null is off; a fuel asks the service for the stations around the
   /// centre after each move and draws them as price tags. An overlay from the service's
   /// replica, not a local table — prices move several times a day.
-  /// §10hr: show only the rapid chargers (≥43 kW), the question a driver has.
-  bool rapidOnly = false;
+  /// §10hr: the charge-point switch, the same shape as the fuel one. Null is off — the
+  /// map asks for nothing and draws nothing, keeping what it already holds; a value is
+  /// the minimum power in kW, 0 meaning every charger. 43 is the rapid band.
+  double? chargers = 0;
   String? fuel;
   List<Map<String, dynamic>> stations = const [];
 
@@ -252,8 +254,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       final b = mapController.camera.visibleBounds;
       final rows = await w.query(
         'SELECT id, lat, lng, title, max_power_kw, points, status_type_id, ocm_id FROM $_table '
-        'WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? LIMIT 3000',
-        [b.south, b.north, b.west, b.east],
+        'WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? '
+        'AND coalesce(max_power_kw, 0) >= ? LIMIT 3000',
+        [b.south, b.north, b.west, b.east, chargers ?? 0],
       );
       final all = await w.query('SELECT count(*) AS n FROM $_table');
       if (!mounted) return;
@@ -273,6 +276,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   /// sparse. Below zoom 10 (a département on screen) the map stops asking and draws
   /// what it holds.
   void _wantArea(MapCamera camera) {
+    // Off: nothing is asked for, the way the fuel switch asks for nothing when it is off.
+    if (chargers == null) return;
     if (camera.zoom < 10) {
       wantedCentre = null;
       return;
@@ -299,7 +304,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         'lat': at.latitude,
         'lng': at.longitude,
         'radius_m': radius,
-        if (rapidOnly) 'min_kw': 43,
+        if ((chargers ?? 0) > 0) 'min_kw': chargers,
         'limit': 2000
       });
       // The scope — "what I hold in this box and the answer lacks is gone" — only when
@@ -592,16 +597,27 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       appBar: AppBar(
         title: const Text('ZeMap'),
         actions: [
-          IconButton(
-            tooltip: 'Rapid chargers only (≥43 kW)',
-            icon:
-                Icon(Icons.bolt, color: rapidOnly ? Colors.greenAccent : null),
-            onPressed: zb == null
-                ? null
-                : () {
-                    setState(() => rapidOnly = !rapidOnly);
-                    _wantArea(mapController.camera);
-                  },
+          PopupMenuButton<String>(
+            tooltip: 'Charge points',
+            icon: Icon(Icons.ev_station,
+                color: chargers == null ? null : Colors.greenAccent),
+            onSelected: (v) {
+              setState(() => chargers = v.isEmpty ? null : double.parse(v));
+              if (chargers == null) {
+                setState(() => status =
+                    'charge points off — the phone keeps what it holds');
+              } else {
+                _wantArea(mapController.camera);
+              }
+              _refresh();
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: '', child: Text('Off')),
+              PopupMenuItem(value: '0', child: Text('All charge points')),
+              PopupMenuItem(value: '22', child: Text('22 kW and up')),
+              PopupMenuItem(value: '43', child: Text('Rapid — 43 kW and up')),
+              PopupMenuItem(value: '150', child: Text('Ultra — 150 kW and up')),
+            ],
           ),
           IconButton(
             tooltip: 'Route between two taps (Valhalla)',
@@ -747,7 +763,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                   ),
               ],
             ),
-          if (fuel == null)
+          if (fuel == null && chargers != null)
             MarkerLayer(
               markers: [
                 for (final poi in pois)

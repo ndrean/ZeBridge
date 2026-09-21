@@ -1,8 +1,9 @@
 # ZeMap in a browser — the fuel prices and the shared route
 
-The two features of the map example that need no local dataset, in a browser, on the
-same client library the phone runs (`zb-client-ts` here, libzb there). It exists to be
-the SECOND editor: open it beside the Flutter app and move the route from both.
+The map example's features in a browser, on the same client library the phone runs
+(`zb-client-ts` here, libzb there): the charge points, the fuel prices and the shared
+route. It exists to be the SECOND editor: open it beside the Flutter app and move the
+route from both.
 
     pnpm install --ignore-workspace     # the repo's pnpm-workspace.yaml lists no packages
     pnpm dev                            # http://localhost:5174/?principal=alice
@@ -10,6 +11,14 @@ the SECOND editor: open it beside the Flutter app and move the route from both.
 `?principal=` picks the credential (`alice` by default, `omar` is the phone's). The
 page talks only to its own origin: Vite proxies the NATS websocket at `/nats` and
 serves `public/creds`, a symlink to `scripts/native/creds`.
+
+**The charge points are an ASK the browser KEEPS.** `charge_points` is an on-demand
+table here too: the schema arrives, the local table is created, nothing seeds it, and
+what each ask answers is kept with `ingest` under the same version-guarded upsert a seed
+uses. The switch chooses the minimum power — all, 22, rapid at 43, ultra at 150 — and
+off asks for nothing while keeping what is already held. The markers are drawn from the
+LOCAL table, never from the answer, so what is on screen is what this browser holds.
+Measured: 11 points within 3.9 km, 10 ms in the service, 81 ms round trip.
 
 **The fuel prices are an ASK.** `request('query.<tenant>.fuel_near')` reaches the POI
 service, which answers from its DuckDB replica of all of France; PostgreSQL is never

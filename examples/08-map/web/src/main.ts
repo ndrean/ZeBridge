@@ -3,6 +3,10 @@
 ///
 /// Two features, two mechanisms, deliberately:
 ///
+///   * the CHARGE POINTS are an ASK the browser KEEPS — `charge_points` is an on-demand
+///     table here too (§10hn, §10hr): the schema arrives, the local table is created,
+///     nothing seeds it, and `ingest` keeps what each ask answered. The switch chooses
+///     the minimum power, off asks for nothing.
 ///   * the FUEL prices are an ASK — `request('query.<tenant>.fuel_near')` to the POI
 ///     service, answered from its DuckDB replica of all of France. Nothing is stored
 ///     here: no table, no stream, no position. The page holds an answer for as long as
@@ -34,8 +38,10 @@ const zb = new ZeBridge({
   natsUrl: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/nats`,
   principal: PRINCIPAL,
   creds,
-  // §10hn: said out loud. The route is a replicated row; the fuel needs no table.
+  // §10hn: said out loud. The route is a replicated row; the charge points are held on
+  // demand; the fuel needs no table at all.
   tables: ['routes'],
+  ondemandTables: ['charge_points'],
 });
 (window as any).zb = zb;
 
@@ -51,7 +57,63 @@ L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   crossOrigin: '',
 }).addTo(map);
 const fuelLayer = L.layerGroup().addTo(map);
+const chargerLayer = L.layerGroup().addTo(map);
 const routeLayer = L.layerGroup().addTo(map);
+
+// ── charge points: an ask the browser KEEPS ───────────────────────────────────
+const chargerSelect = el<HTMLSelectElement>('chargers');
+let askingChargers = false;
+
+async function askChargers() {
+  if (chargerSelect.value === '' || askingChargers) { if (chargerSelect.value === '') chargerLayer.clearLayers(); return; }
+  askingChargers = true;
+  const minKw = Number(chargerSelect.value);
+  const c = map.getCenter();
+  const b = map.getBounds();
+  const radius = Math.min(20000, Math.max(500, map.distance(b.getSouthWest(), b.getNorthEast()) / 2));
+  const t0 = performance.now();
+  try {
+    const ans = await zb.request(`query.${TENANT}.chargers_near`, {
+      lat: c.lat, lng: c.lng, radius_m: Math.round(radius), ...(minKw > 0 ? { min_kw: minKw } : {}), limit: 2000,
+    }, 15000);
+    // The scope — "what I hold in this box and the answer lacks is gone" — only when the
+    // answer is complete; one cut by the limit says nothing about the rest.
+    const dlat = radius / 111320, dlng = radius / (111320 * Math.max(0.1, Math.cos(c.lat * Math.PI / 180)));
+    const scope = ans.complete === true
+      ? { where: 'lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?', params: [c.lat - dlat, c.lat + dlat, c.lng - dlng, c.lng + dlng] }
+      : null;
+    const kept = await zb.ingest('charge_points', ans, minKw > 0 ? null : scope);
+    const ms = Math.round(performance.now() - t0);
+    await drawChargers();
+    say(`${ans.count} charge point(s) within ${(radius / 1000).toFixed(1)} km — ${ans.ms} ms in the service, ${ms} ms round trip, ${kept} kept`);
+  } catch (e) {
+    say(`chargers: ${e} — is the map service running?`);
+  } finally {
+    askingChargers = false;
+  }
+}
+
+/// Drawn from the LOCAL table, never from the answer: what is on screen is what this
+/// browser holds, which is also what it would show with the network gone.
+async function drawChargers() {
+  chargerLayer.clearLayers();
+  if (chargerSelect.value === '') return;
+  const minKw = Number(chargerSelect.value);
+  const b = map.getBounds();
+  const rows = await zb.query(
+    `SELECT id, lat, lng, title, max_power_kw, points, status_type_id, ocm_id FROM charge_points
+      WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? AND coalesce(max_power_kw, 0) >= ? LIMIT 3000`,
+    b.getSouth(), b.getNorth(), b.getWest(), b.getEast(), minKw);
+  for (const r of rows) {
+    const kw = Number(r.max_power_kw ?? 0);
+    const colour = r.ocm_id == null ? '#d9480f' : r.status_type_id !== 50 ? '#999' : kw >= 43 ? '#1a7f37' : '#1f6feb';
+    L.circleMarker([r.lat, r.lng], { radius: 6, color: colour, fillColor: colour, fillOpacity: 0.85, weight: 1 })
+      .bindTooltip(`${r.title} · ${r.max_power_kw ?? '?'} kW · ${r.points ?? '?'} pt${r.status_type_id !== 50 ? ' · out of service' : ''}`)
+      .addTo(chargerLayer);
+  }
+}
+
+chargerSelect.addEventListener('change', () => { void askChargers(); });
 
 // ── fuel: an ask, answered from the service's replica ──────────────────────────
 const fuelSelect = el<HTMLSelectElement>('fuel');
@@ -95,7 +157,10 @@ async function askFuel() {
   }
 }
 fuelSelect.addEventListener('change', () => void askFuel());
-map.on('moveend', () => { if (fuelSelect.value) void askFuel(); });
+map.on('moveend', () => {
+  if (fuelSelect.value) void askFuel();
+  if (chargerSelect.value !== '') void askChargers();
+});
 
 // ── the shared route: a row, edited by two people ──────────────────────────────
 const routeButton = el<HTMLButtonElement>('routeMode');
@@ -175,8 +240,9 @@ zb.onStatus?.((s: string) => { el<HTMLElement>('who').textContent = `${PRINCIPAL
 try {
   await zb.connect();
   el<HTMLElement>('who').textContent = `${PRINCIPAL} · ${zb.tenant ?? '—'}`;
-  say('connected — pick a fuel, or turn the route on and click twice');
+  say('connected — the charge points are on; pick a fuel, or turn the route on and click twice');
   await readRoute();
+  await askChargers();
 } catch (e) {
   say(`connect: ${e}`);
 }
