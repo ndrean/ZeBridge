@@ -4,7 +4,7 @@
 /// `routes` row two clients edit at once, converging through `mergeRegisters` (§10ho).
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import MapLibreGL, { Camera, CircleLayer, LineLayer, MapView, MarkerView, ShapeSource } from '@maplibre/maplibre-react-native';
+import MapLibreGL, { Camera, CircleLayer, LineLayer, MapView, MarkerView, PointAnnotation, ShapeSource } from '@maplibre/maplibre-react-native';
 import { mergeRegisters } from 'zb-client-ts';
 import { makeClient, PRINCIPAL, TENANT } from './src/client';
 
@@ -48,7 +48,7 @@ const collection = (rows: Row[]): any => ({
         id: String(r.id),
         kw: Number(r.max_power_kw ?? 0),
         dead: r.status_type_id != null && r.status_type_id !== 50 ? 1 : 0,
-        price: r.price != null ? Number(r.price).toFixed(3) : '',
+        price: Number.isFinite(Number(r.price)) ? Number(r.price) : -1,
       },
       geometry: { type: 'Point', coordinates: [Number(r.lng), Number(r.lat)] },
     })),
@@ -221,6 +221,14 @@ export default function App() {
     try { await writeRoute(); } catch (e) { setStatus(`route: ${e}`); }
   };
 
+  /// The cheapest and dearest in the ANSWER, so the ramp always spans what is on
+  /// screen rather than some absolute scale. Equal values would make a degenerate ramp,
+  /// so the pair is nudged apart.
+  const prices = stations.map((r) => Number(r.price)).filter((n) => Number.isFinite(n));
+  const priceRange: [number, number] = prices.length
+    ? [Math.min(...prices), Math.max(...prices) + (Math.min(...prices) === Math.max(...prices) ? 0.001 : 0)]
+    : [0, 1];
+
   const pins = (['start', 'end'] as const)
     .map((k) => ({ k, v: routeDoc[k]?.v }))
     .filter((p) => typeof p.v?.lat === 'number') as { k: 'start' | 'end'; v: any }[];
@@ -280,23 +288,31 @@ export default function App() {
               setPicked(stations.find((r) => String(r.id) === id) ?? null);
             }}
           >
-            <CircleLayer id="stations-dot" style={{ circleRadius: 9, circleColor: '#b45309', circleStrokeWidth: 1, circleStrokeColor: '#ffffff' }} />
+            {/* §10il: the price as COLOUR, green cheapest to red dearest, because text
+                on this map is not available. A `SymbolLayer` needs a `glyphs` URL the
+                style has none of, and a font server is a dependency this demo has spent
+                the day removing. The view-based badges were worse: `MarkerView` drew a
+                subset, and `PointAnnotation` rasterises its child before the text has
+                laid out, so every badge came out an empty box — twice, with a fixed size
+                and without. The exact figure is one tap away in the card. */}
+            <CircleLayer
+              id="stations-dot"
+              style={{
+                circleRadius: 9,
+                // A dark ring: the price ramp runs through the same green the rapid
+                // chargers use, and the two layers must not be confused for each other.
+                circleStrokeWidth: 3,
+                circleStrokeColor: '#111827',
+                circleColor: [
+                  'interpolate', ['linear'], ['get', 'price'],
+                  priceRange[0], '#1a7f37',
+                  (priceRange[0] + priceRange[1]) / 2, '#b45309',
+                  priceRange[1], '#b91c1c',
+                ] as any,
+              }}
+            />
           </ShapeSource>
         )}
-
-        {/* §10il: the PRICE as a view per station, which is the one place MarkerView is
-            right — `limit: 40` bounds them, where the chargers run to thousands. Drawing
-            text in a layer instead needs a `glyphs` URL in the style, and this style has
-            none: MapLibre answered "Failed to load glyph range 0-255 for font stack Open
-            Sans Regular: unsupported URL". A font server is an external dependency this
-            demo has spent the day removing. */}
-        {stations.map((r) => (
-          <MarkerView key={`p-${r.id}`} coordinate={[Number(r.lng), Number(r.lat)]} anchor={{ x: 0.5, y: -0.2 }}>
-            <Pressable hitSlop={6} onPress={() => setPicked(r)}>
-              <View style={styles.price}><Text style={styles.priceText}>{Number(r.price).toFixed(3)}</Text></View>
-            </Pressable>
-          </MarkerView>
-        ))}
 
         {routeMode && pins.map((p) => (
           <MarkerView key={`r-${p.k}`} coordinate={[p.v.lng, p.v.lat]}>
@@ -330,7 +346,8 @@ export default function App() {
           <Text style={styles.cardBody}>
             {picked.max_power_kw != null
               ? `${picked.max_power_kw} kW · ${picked.points ?? '?'} point(s)${picked.status_type_id !== 50 ? ' · out of service' : ''}`
-              : `${picked.price} € · ${Math.round(Number(picked.m ?? 0))} m${picked.outage ? ` · ${picked.outage} outage` : ''}`}
+              : `${picked.price} € · ${Math.round(Number(picked.m ?? 0))} m${picked.outage ? ` · ${picked.outage} outage` : ''}` +
+                (Number(picked.price) === priceRange[0] ? ' · cheapest in view' : '')}
           </Text>
         </View>
       )}
@@ -349,8 +366,8 @@ const styles = StyleSheet.create({
   routePin: { width: 26, height: 26, borderRadius: 13, backgroundColor: '#fff', borderWidth: 3, borderColor: '#1f6feb', alignItems: 'center', justifyContent: 'center' },
   routePinHeld: { width: 34, height: 34, borderRadius: 17, borderWidth: 5 },
   routePinText: { color: '#1f6feb', fontWeight: 'bold', fontSize: 12 },
-  price: { backgroundColor: '#b45309', paddingHorizontal: 5, paddingVertical: 2, borderRadius: 4, borderWidth: 1, borderColor: '#fff' },
-  priceText: { color: '#fff', fontSize: 10, fontWeight: 'bold' },
+  price: { width: 52, height: 18, backgroundColor: '#b45309', borderRadius: 4, borderWidth: 1, borderColor: '#fff', alignItems: 'center', justifyContent: 'center' },
+  priceText: { color: '#fff', fontSize: 10, fontWeight: 'bold', lineHeight: 12, includeFontPadding: false, textAlign: 'center' },
   controls: { position: 'absolute', top: 60, left: 8, flexDirection: 'row', gap: 6 },
   btn: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 7, borderRadius: 6 },
   btnOn: { backgroundColor: '#1f6feb' },
