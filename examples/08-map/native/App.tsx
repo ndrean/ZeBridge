@@ -67,6 +67,7 @@ const metres = (a: [number, number], b: [number, number]) => {
 export default function App() {
   const zb = useRef<ReturnType<typeof makeClient> | null>(null);
   const map = useRef<any>(null);
+  const cam = useRef<any>(null);
   /// §10ik: every ask carries a ticket. A pan fires many region events, their answers
   /// come back out of order, and an older one landing last would draw the area you just
   /// left — "markers appear briefly and some other pop in, nothing centred". Only the
@@ -211,6 +212,17 @@ export default function App() {
     return metres(at, [s.lng, s.lat]) <= metres(at, [e.lng, e.lat]) ? 'start' : 'end';
   };
 
+  /// One zoom level per press. `onRegionDidChange` fires when the camera settles, so
+  /// the debounced ask follows on its own — no need to ask here.
+  const zoomBy = async (d: number) => {
+    const m = map.current;
+    if (!m || !cam.current) return;
+    try {
+      const z = await m.getZoom();
+      cam.current.zoomTo(Math.min(18, Math.max(3, z + d)), 250);
+    } catch { /* the map is not ready yet */ }
+  };
+
   const onMapPress = async (f: any) => {
     if (!routeMode) { setPicked(null); return; }
     const [lng, lat] = f?.geometry?.coordinates ?? [];
@@ -238,7 +250,7 @@ export default function App() {
       <MapView ref={map} style={styles.fill} mapStyle={STYLE as any} onPress={onMapPress}
         onDidFinishLoadingMap={() => setMapReady(true)}
         onRegionDidChange={() => { setMapReady(true); scheduleAsk(); }}>
-        <Camera defaultSettings={{ centerCoordinate: NANTES, zoomLevel: 11 }} />
+        <Camera ref={cam} defaultSettings={{ centerCoordinate: NANTES, zoomLevel: 11 }} />
 
         {pins.length === 2 && (
           <ShapeSource
@@ -325,6 +337,19 @@ export default function App() {
         ))}
       </MapView>
 
+      {/* §10im: explicit zoom. A pinch works on a device but on the SIMULATOR it is
+          option-drag, which is awkward enough that the map read as unzoomable. The
+          buttons also make the radius easy to exercise: each step roughly halves or
+          doubles what the next ask covers. */}
+      <View style={styles.zoom}>
+        <Pressable style={styles.zoomBtn} onPress={() => void zoomBy(+1)}>
+          <Text style={styles.zoomText}>+</Text>
+        </Pressable>
+        <Pressable style={styles.zoomBtn} onPress={() => void zoomBy(-1)}>
+          <Text style={styles.zoomText}>−</Text>
+        </Pressable>
+      </View>
+
       <View style={styles.controls}>
         <Pressable style={[styles.btn, minKw !== null && styles.btnOn]}
           onPress={() => setMinKw(minKw === null ? 0 : minKw === 0 ? 43 : minKw === 43 ? 150 : null)}>
@@ -369,6 +394,9 @@ const styles = StyleSheet.create({
   price: { width: 52, height: 18, backgroundColor: '#b45309', borderRadius: 4, borderWidth: 1, borderColor: '#fff', alignItems: 'center', justifyContent: 'center' },
   priceText: { color: '#fff', fontSize: 10, fontWeight: 'bold', lineHeight: 12, includeFontPadding: false, textAlign: 'center' },
   controls: { position: 'absolute', top: 60, left: 8, flexDirection: 'row', gap: 6 },
+  zoom: { position: 'absolute', right: 8, top: 120, gap: 6 },
+  zoomBtn: { width: 40, height: 40, borderRadius: 6, backgroundColor: 'rgba(0,0,0,0.65)', alignItems: 'center', justifyContent: 'center' },
+  zoomText: { color: '#fff', fontSize: 22, fontWeight: '700', lineHeight: 26 },
   btn: { backgroundColor: 'rgba(0,0,0,0.6)', paddingHorizontal: 10, paddingVertical: 7, borderRadius: 6 },
   btnOn: { backgroundColor: '#1f6feb' },
   btnText: { color: '#fff', fontSize: 12, fontWeight: '600' },
