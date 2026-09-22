@@ -15673,6 +15673,38 @@ Opt-in for now: the default build is untouched, still links all four system libr
 and still passes its tests. The vendored desktop build passes them too and links neither
 sqlite nor zstd.
 
+### What it actually costs
+
+⚠️ The 22 MB archive is NOT the price. A static archive holds every object file with its
+symbols, unstripped, and the linker pulls only what the app references. Dylib to dylib is
+the honest comparison:
+
+| build | size |
+| --- | --- |
+| dynamic, system libraries | 2,256,848 |
+| dynamic, vendored | 4,066,288 |
+| static archive | 22,469,624 |
+
+So sqlite and zstd cost about **1.8 MB**, not twenty. The real app cost is lower again,
+since the linker drops unreferenced sqlite features and an archived build is stripped.
+
+Which build for which host — the line is not phone versus server, it is whether you
+control what is installed:
+
+| host | build |
+| --- | --- |
+| Swift on iOS, Kotlin on Android | vendored, static |
+| Flutter on a phone | vendored, static |
+| Flutter or Python on a desktop | either; system libraries are fine |
+| a service on a server you control | system libraries, since you install them |
+| React Native | neither — the TypeScript client |
+
+⚠️ **`-Dvendor` does not imply `-Dduckdb`.** Measuring these sizes left a vendored dylib
+with no DuckDB where the map service expects one — the same trap as §10hw, one flag
+further along. The service survived only because it had already loaded the previous
+library into memory. Build the service's copy as
+`zig build -Doptimize=ReleaseFast -Dduckdb=true`.
+
 What this unlocks is the OTHER half of §10ih: a native Swift or Kotlin app, or Flutter on
 a phone, can now embed libzb. React Native did not need it, which is exactly why that
 path shipped first.
