@@ -26,6 +26,12 @@ export const expoStorage: StorageFactory = (dbName: string): Storage => {
         // The same pragmas the Node adapter sets, and for the same reasons: WAL for
         // concurrent readers, NORMAL because a replica re-fetches what a crash loses,
         // and foreign_keys spelled out rather than inherited from a default.
+        // §10ik: FIRST, before anything can take a lock. Without it SQLite waits for a
+        // held write lock FOREVER, and a lock left by a process killed mid-seed turns
+        // the next launch into a silent hang — `connect()` never resolving, nothing
+        // logged, indistinguishable from a network problem. Five seconds then an error
+        // is always better than waiting for ever.
+        await db.execAsync('PRAGMA busy_timeout = 5000');
         await db.execAsync('PRAGMA journal_mode = WAL');
         await db.execAsync('PRAGMA synchronous = NORMAL');
         await db.execAsync('PRAGMA foreign_keys = ON');

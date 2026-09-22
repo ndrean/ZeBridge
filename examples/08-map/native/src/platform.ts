@@ -14,23 +14,22 @@ if (!g.crypto) g.crypto = {};
 if (!g.crypto.randomUUID) g.crypto.randomUUID = () => Crypto.randomUUID();
 if (!g.crypto.subtle) {
   g.crypto.subtle = {
+    /// ⚠️ §10ik: this MUST hash BYTES. The first version converted the buffer to a
+    /// latin1 string and called `digestStringAsync`, which encodes its input as UTF-8 —
+    /// so every byte above 0x7F became two, and the hash was of different data. It is
+    /// used to verify chain objects, so the symptom was
+    ///
+    ///     routes: chain object routes-g42-full unreadable: digest mismatch
+    ///
+    /// repeated for ever: the seed retried, failed the check, waited for the producer,
+    /// retried. `connect()` never resolved and nothing was thrown — the app simply sat
+    /// on "connecting…". A wrong hash of binary data is silent by construction, which
+    /// is why it cost so much to find.
+    ///
+    /// `Crypto.digest` takes a BufferSource and returns the real digest.
     digest: async (alg: string, data: BufferSource) => {
       if (String(alg).toUpperCase() !== 'SHA-256') throw new Error(`unsupported digest ${alg}`);
-      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer);
-      // Chunked, not spread: `String.fromCharCode(...bytes)` blows the argument limit on
-      // anything large, and the grammar this hashes is several kilobytes.
-      let latin1 = '';
-      for (let i = 0; i < bytes.length; i += 4096) {
-        latin1 += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 4096)));
-      }
-      const hex = await Crypto.digestStringAsync(
-        Crypto.CryptoDigestAlgorithm.SHA256,
-        latin1,
-        { encoding: Crypto.CryptoEncoding.HEX },
-      );
-      const out = new Uint8Array(hex.length / 2);
-      for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-      return out.buffer;
+      return await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, data);
     },
   };
 }

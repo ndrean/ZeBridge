@@ -15434,3 +15434,44 @@ Also learnt: a dev-client app launched with `simctl launch` gets no bundler URL 
 "No script URL provided"; it has to be opened through its
 `<scheme>://expo-development-client/?url=…` deep link.
 
+## §10ik — a wrong hash of binary data is silent
+
+The phone app sat on "connecting…" for ever. No error, no timeout, nothing thrown. It
+cost several wrong diagnoses before the library's OWN log said it in one line:
+
+    routes: chain object routes-g42-full unreadable: digest mismatch
+      (DfIvybfOWpjvqHWmhh9KcM9SbkchVQIqt-TG-AfHnu0 vs o2tXGFYivajg7FhN3UyeBuE3gPNzWbJtgtbuYsGEJ5Q)
+
+React Native has no WebCrypto, so `src/platform.ts` shims `crypto.subtle.digest` —
+which the client uses to verify every chain object. The first shim converted the buffer
+to a latin1 string and called expo-crypto's `digestStringAsync`, which encodes its input
+as **UTF-8**. Every byte above 0x7F became two, so the hash was of different data and
+could never match. `Crypto.digest` takes a BufferSource and was the right call all along.
+
+**The failure mode is the lesson.** A wrong hash of binary data throws nothing and logs
+nothing: the seed simply judged the object unreadable, concluded the chain was not ready,
+waited 90 s for the producer, retried, and failed identically — for ever. `connect()`
+never resolved. Every layer above saw a promise that had not settled yet.
+
+Three wrong theories on the way, each plausible and each costing a round trip:
+
+1. **A deadlock in the adapter's transaction queue.** It serialises, so one unreturned
+   promise would wedge every later call silently. Instrumented it: 35 transactions
+   opened, 35 closed. Not it.
+2. **A wedged database from runs killed mid-seed.** Uninstalling the app (which takes its
+   SQLite with it) appeared to fix it once. It did not — that run was reading a STALE
+   BUNDLE. A `busy_timeout` went in anyway, because SQLite waiting for a lock for ever
+   is a real hazard and five seconds then an error is always better.
+3. **The bundle itself.** Log lines appeared that no source file could produce any more —
+   the giveaway that the running code was not the code on disk. Clearing Metro's cache,
+   the Expo cache and the app took that variable off the table.
+
+What actually worked: `tables: []` bisected transport from seed in one step, and then
+`onLog` — the library's host-facing log hook — named the failure immediately. **That
+should have been the first move, not the fifth.** Instrumenting my own adapter only ever
+showed healthy statements happening around the problem.
+
+Fixed and verified: "Seeded routes from generation chain g43 (1 row(s))", "All required
+tables seeded successfully", both CDC consumers attached, and the map opens with
+77 chargers drawn before any pan.
+

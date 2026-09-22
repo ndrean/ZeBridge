@@ -43,7 +43,17 @@ const metres = (a: [number, number], b: [number, number]) => {
 export default function App() {
   const zb = useRef<ReturnType<typeof makeClient> | null>(null);
   const map = useRef<any>(null);
-  const asking = useRef(false);
+  /// §10ik: every ask carries a ticket. A pan fires many region events, their answers
+  /// come back out of order, and an older one landing last would draw the area you just
+  /// left — "markers appear briefly and some other pop in, nothing centred". Only the
+  /// newest ticket may touch state.
+  const seq = useRef(0);
+  const panTimer = useRef<number | null>(null);
+  const [connected, setConnected] = useState(false);
+  /// ⚠️ And the first ask must WAIT for this. `getVisibleBounds()` on a map that has not
+  /// laid out yet answers a degenerate box, so the radius clamped to its 150 m floor and
+  /// the map opened empty even though the toggle said the chargers were on.
+  const [mapReady, setMapReady] = useState(false);
   const [status, setStatus] = useState('connecting…');
   const [chargers, setChargers] = useState<Row[]>([]);
   const [stations, setStations] = useState<Row[]>([]);
@@ -64,9 +74,13 @@ export default function App() {
     (async () => {
       try {
         const c = makeClient();
+        // The library's own progress, surfaced through its `onLog` hook — subscribed
+        // BEFORE connect, because everything interesting happens inside it.
+        c.onLog((topic, data, level) => console.log(`[zb ${level}] ${topic}: ${typeof data === 'string' ? data : JSON.stringify(data)}`));
         await c.connect();
         if (!live) return;
         zb.current = c;
+        setConnected(true);
         setStatus('connected');
         // The row moved — mine or another editor's. Redraw from what the ROW holds.
         // COALESCED: a seed's backlog fired this 185 times and produced 183 identical
@@ -79,7 +93,6 @@ export default function App() {
           }, 120) as unknown as number;
         });
         await readRoute();
-        await ask();
       } catch (e) {
         if (live) setStatus(`connect: ${e}`);
       }
@@ -110,8 +123,10 @@ export default function App() {
   const ask = useCallback(async () => {
     const c = zb.current;
     const m = map.current;
-    if (!c || !m || asking.current) return;
-    asking.current = true;
+    if (!c || !m) return;
+    // NOT a re-entrancy guard. Refusing to start while one is in flight drops the LAST
+    // viewport — the one the finger stopped on — which is the only one that matters.
+    const mine = ++seq.current;
     try {
       const centre: [number, number] = await m.getCenter();
       const b = await m.getVisibleBounds();          // [[east, north], [west, south]]
@@ -123,25 +138,36 @@ export default function App() {
           lat: centre[1], lng: centre[0], radius_m: Math.round(radius),
           ...(minKw > 0 ? { min_kw: minKw } : {}), limit: 2000,
         }, 20000);
+        if (mine !== seq.current) return;   // a newer ask overtook this one
         setChargers(asMaps(ans));
         const t = ans.zb_transport ?? {};
-        setStatus(`${ans.count} charger(s) in ${(radius / 1000).toFixed(0)} km · ${t.via} ${t.bytes} B · wire ${t.wire_ms} ms · db ${ans.ms} ms · ${Date.now() - t0} ms`);
-      } else setChargers([]);
+        if (mine === seq.current) setStatus(`${ans.count} charger(s) in ${(radius / 1000).toFixed(0)} km · ${t.via} ${t.bytes} B · wire ${t.wire_ms} ms · db ${ans.ms} ms · ${Date.now() - t0} ms`);
+      } else if (mine === seq.current) setChargers([]);
       if (fuel !== null) {
         const radius = Math.min(20000, Math.max(3000, half));
         const ans: any = await c.request(`query.${TENANT}.fuel_near`, {
           lat: centre[1], lng: centre[0], radius_m: Math.round(radius), fuel, sort: 'distance', limit: 40,
         }, 20000);
+        if (mine !== seq.current) return;
         setStations(asMaps(ans));
-      } else setStations([]);
+      } else if (mine === seq.current) setStations([]);
     } catch (e) {
-      setStatus(`ask: ${e}`);
-    } finally {
-      asking.current = false;
+      if (mine === seq.current) setStatus(`ask: ${e}`);
     }
   }, [minKw, fuel]);
 
-  useEffect(() => { void ask(); }, [minKw, fuel]);
+  /// A pan is many region events; ask once, when it settles. 350 ms is the Flutter
+  /// app's debounce, so all three clients ask at the same cadence.
+  const scheduleAsk = useCallback(() => {
+    if (panTimer.current) clearTimeout(panTimer.current);
+    panTimer.current = setTimeout(() => {
+      panTimer.current = null;
+      void ask();
+    }, 350) as unknown as number;
+  }, [ask]);
+
+  // The first ask needs BOTH halves: a connected client and a laid-out map.
+  useEffect(() => { if (connected && mapReady) void ask(); }, [connected, mapReady, minKw, fuel]);
 
   /// §10if: the held end, or the nearest — never an alternating turn.
   const target = (at: [number, number]): 'start' | 'end' => {
@@ -168,7 +194,9 @@ export default function App() {
 
   return (
     <View style={styles.fill}>
-      <MapView ref={map} style={styles.fill} mapStyle={STYLE as any} onPress={onMapPress} onRegionDidChange={() => void ask()}>
+      <MapView ref={map} style={styles.fill} mapStyle={STYLE as any} onPress={onMapPress}
+        onDidFinishLoadingMap={() => setMapReady(true)}
+        onRegionDidChange={scheduleAsk}>
         <Camera defaultSettings={{ centerCoordinate: NANTES, zoomLevel: 11 }} />
 
         {pins.length === 2 && (
