@@ -1,0 +1,7 @@
+node_modules/
+.expo/
+dist/
+# `expo prebuild` GENERATES these from app.json — they are build output, not source.
+ios/
+android/
+*.log

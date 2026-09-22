@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "ZeMap",
+    "slug": "zemap",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "zemap",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": { "supportsTablet": true, "bundleIdentifier": "dev.zebridge.zemap" },
+    "android": { "package": "dev.zebridge.zemap" },
+    "plugins": [
+      "expo-router",
+      "@maplibre/maplibre-react-native"
+    ],
+    "experiments": { "typedRoutes": true }
+  }
+}

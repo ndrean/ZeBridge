@@ -15299,3 +15299,49 @@ toolchain is, and every framework meets the same wall. zb-client-ts is the way a
 for a phone: it connects over NATS WebSocket and its storage is a pluggable factory with
 three implementations already, the Node one 109 lines and the browser one 24.
 
+## §10ih — the phone, through the other client
+
+libzb cannot be built for a phone yet (§10ig): three system libraries, and neither the
+iOS SDK nor the Android NDK ships zstd. The way around it was never a different UI
+framework — every one of them meets the same C toolchain — but the OTHER client, which
+needs no native build at all.
+
+`examples/08-map/native` is the map on Expo + React Native + MapLibre, talking to the
+same service with the same queries and sharing the same route row as the Flutter app and
+the browser. What it needed:
+
+| gap | filled by | size |
+| --- | --- | --- |
+| SQLite | `expo-sqlite` behind the library's `Storage` contract | 90 lines |
+| `crypto.randomUUID`, `subtle.digest` | `expo-crypto` | a shim |
+| `crypto.getRandomValues` | `react-native-get-random-values` | an import |
+| zstd | `fzstd`, as the `zstdDecompress` option | one function |
+
+**The zstd one would have been a wall and was not.** The library's last-resort
+decompressor is a WebAssembly module, and React Native's engine cannot run WebAssembly.
+It never gets there: `zstdDecompress` is a config option, checked before the WASM import.
+That seam is why this client survives hosts the Zig one cannot — every awkward dependency
+is a parameter rather than an import. `fzstd` is pure JS and does PLAIN frames only,
+which is enough here: the `routes` chain carries no dictionary (`full.dict` null, objects
+a few hundred bytes), and `charge_points`, whose chain does use one, is on-demand and
+never seeded.
+
+One real gap in the library, found by writing the adapter: `Exec`, `Storage` and
+`StorageFactory` were not importable from outside the package. `node.ts` reached them
+with a relative path because it lives inside; anything else had none. `zb-client-ts/storage`
+now exports the contract an adapter must implement.
+
+Also worth recording for the next host: React Native lacks `TextEncoder`/`TextDecoder`
+too, which Expo's runtime provides but a bare React Native project does not.
+
+The app itself follows §10ic — the markers are the ANSWER, never stored — and draws
+OpenStreetMap raster, the same as the browser, so there is no map account and no API key
+anywhere. Apple's MapKit is free in a native iOS app and Google's needs a billing-enabled
+key; `react-native-maps` would have used one on each platform, which is two renderers and
+two sets of terms from one codebase. MapLibre is one renderer on both and can read the R2
+vector archive the Flutter app already uses.
+
+Not yet run on a simulator: MapLibre is native, so this needs an `expo prebuild` and a
+development build rather than Expo Go. Typechecks clean, and the client's 224 tests still
+pass with the new export.
+
