@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@babel/runtime':
+        specifier: ^7.25.0
+        version: 7.29.7
       '@maplibre/maplibre-react-native':
         specifier: ^10.0.0
         version: 10.4.2(@expo/config-plugins@9.0.17(supports-color@8.1.1))(@types/geojson@7946.0.16)(@types/react@18.3.31)(react-native@0.76.9(@babel/core@7.29.7(supports-color@8.1.1))(@babel/preset-env@7.29.7(@babel/core@7.29.7(supports-color@8.1.1))(supports-color@8.1.1))(@types/react@18.3.31)(react@18.3.1)(supports-color@8.1.1))(react@18.3.1)

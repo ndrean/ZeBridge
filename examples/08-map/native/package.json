@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@babel/runtime": "^7.25.0",
     "@maplibre/maplibre-react-native": "^10.0.0",
     "@msgpack/msgpack": "^3.0.0-beta.1",
     "@nats-io/jetstream": "^3.4.0",
