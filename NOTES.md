@@ -15541,3 +15541,42 @@ mechanism.** A bounded handful of rich, interactive views is what `MarkerView` i
 cloud of plain points belongs in a layer, and crossing that line silently loses markers
 rather than failing.
 
+## §10io — Android, from the same bundle
+
+The same app on the Android emulator, answering from the same service:
+
+    77 charger(s) in 12 km · inline 29110 B · wire 124 ms · db 88.3 ms · 176 ms
+
+Markers, the shared route line, the toggles and the zoom buttons all drawn. Nothing in
+the app changed for it — everything that was hard had already been solved in JavaScript
+(the storage adapter, the digest shim, the decompressor, the layer rendering), and none
+of it is platform-specific.
+
+Two platform facts, one in code and one in the toolchain.
+
+**The host address, resolved at RUN time.** The iOS simulator shares the Mac's network
+stack, so `127.0.0.1` IS the Mac. The Android emulator sits behind its own NAT and
+reserves `10.0.2.2` for the host; `127.0.0.1` there is the emulator, which answers
+nothing. `Platform.OS` decides, rather than the environment, because `EXPO_PUBLIC_*` is
+inlined when Metro builds — a variable would force a separate bundler per platform. That
+bit immediately: the first Android launch failed with "Failed to connect to
+/127.0.0.1:8080" because the bundler had been started with the iOS address, which
+overrode the platform default. Metro now runs with no NATS URL at all and each platform
+picks its own.
+
+**JDK 17.** Gradle refused the build with `Unsupported class file major version 69` —
+major version minus 44 is the Java release, so 69 is Java 25. Every JDK on this machine
+was 25, including Android Studio's bundled one. React Native 0.76 wants 17. Installed
+keg-only through Homebrew, so it sits BESIDE the existing Java rather than replacing it
+and nothing on the default PATH changed; the build gets it through `JAVA_HOME`.
+
+That is the Android counterpart of §10ii, and the same shape: a toolchain that moved
+ahead of the framework on a machine kept current. There, clang 21 broke fmt; here,
+Java 25 broke Gradle.
+
+    export ANDROID_HOME="$HOME/Library/Android/sdk"
+    export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+    npx expo run:android
+
+The build took 3m 59s the first time, 300 tasks.
+
