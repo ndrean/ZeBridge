@@ -4,7 +4,7 @@
 /// `routes` row two clients edit at once, converging through `mergeRegisters` (§10ho).
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import MapLibreGL, { Camera, CircleLayer, LineLayer, MapView, MarkerView, ShapeSource, SymbolLayer } from '@maplibre/maplibre-react-native';
+import MapLibreGL, { Camera, CircleLayer, LineLayer, MapView, MarkerView, ShapeSource } from '@maplibre/maplibre-react-native';
 import { mergeRegisters } from 'zb-client-ts';
 import { makeClient, PRINCIPAL, TENANT } from './src/client';
 
@@ -281,12 +281,22 @@ export default function App() {
             }}
           >
             <CircleLayer id="stations-dot" style={{ circleRadius: 9, circleColor: '#b45309', circleStrokeWidth: 1, circleStrokeColor: '#ffffff' }} />
-            <SymbolLayer
-              id="stations-price"
-              style={{ textField: ['get', 'price'] as any, textSize: 9, textColor: '#ffffff', textAllowOverlap: true, textOffset: [0, 1.4] }}
-            />
           </ShapeSource>
         )}
+
+        {/* §10il: the PRICE as a view per station, which is the one place MarkerView is
+            right — `limit: 40` bounds them, where the chargers run to thousands. Drawing
+            text in a layer instead needs a `glyphs` URL in the style, and this style has
+            none: MapLibre answered "Failed to load glyph range 0-255 for font stack Open
+            Sans Regular: unsupported URL". A font server is an external dependency this
+            demo has spent the day removing. */}
+        {stations.map((r) => (
+          <MarkerView key={`p-${r.id}`} coordinate={[Number(r.lng), Number(r.lat)]} anchor={{ x: 0.5, y: -0.2 }}>
+            <Pressable hitSlop={6} onPress={() => setPicked(r)}>
+              <View style={styles.price}><Text style={styles.priceText}>{Number(r.price).toFixed(3)}</Text></View>
+            </Pressable>
+          </MarkerView>
+        ))}
 
         {routeMode && pins.map((p) => (
           <MarkerView key={`r-${p.k}`} coordinate={[p.v.lng, p.v.lat]}>
