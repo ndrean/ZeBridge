@@ -15475,3 +15475,33 @@ Fixed and verified: "Seeded routes from generation chain g43 (1 row(s))", "All r
 tables seeded successfully", both CDC consumers attached, and the map opens with
 77 chargers drawn before any pan.
 
+## §10il — MarkerView drew some of the markers
+
+Two complaints, one root each.
+
+**"Not all the expected charger markers appear."** The app drew each point as a
+`MarkerView`, which mounts a REACT VIEW per marker. The library's own documentation says
+not to: *"If you have static view consider using PointAnnotation or SymbolLayer they'll
+offer much better performance"*. With dozens on screen it silently drew a subset — the
+status line said 77 and the map showed fewer, which is why comparing against the browser
+is what exposed it. The browser never had the problem because Leaflet's circle markers
+are canvas primitives, not DOM-per-point.
+
+Now one `ShapeSource` holding a GeoJSON FeatureCollection with a `CircleLayer` over it,
+which is the same shape as the browser's. Colour comes from a style expression rather
+than JavaScript per row — grey when the feed says out of service, green at 43 kW and
+above, blue otherwise — and the out-of-service greys appeared immediately, having been
+among the ones silently dropped. Selection moved to the source's `onPress`, which hands
+back the tapped feature. Fuel is the same, with a `SymbolLayer` for the price.
+
+**"When I load, it is still empty."** Waiting for `onDidFinishLoadingMap` was not enough:
+the event fires before the viewport is necessarily usable, and `getVisibleBounds()` then
+answers a DEGENERATE box. Half of nothing is nothing, so the radius clamped to its 150 m
+floor, the ask found nothing in 150 m, and the map opened empty while the toggle
+correctly said the chargers were on. The bounds are now checked as well as the event:
+under a kilometre across is the map not ready, so it waits 250 ms and asks again. Either
+signal also marks the map ready, rather than trusting one event to fire.
+
+The lesson is the same in both halves: treating a rendering API as a list of components,
+and a viewport as available the moment its container mounts. Neither holds.
+

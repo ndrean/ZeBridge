@@ -4,7 +4,7 @@
 /// `routes` row two clients edit at once, converging through `mergeRegisters` (§10ho).
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
-import MapLibreGL, { Camera, LineLayer, MapView, MarkerView, ShapeSource } from '@maplibre/maplibre-react-native';
+import MapLibreGL, { Camera, CircleLayer, LineLayer, MapView, MarkerView, ShapeSource, SymbolLayer } from '@maplibre/maplibre-react-native';
 import { mergeRegisters } from 'zb-client-ts';
 import { makeClient, PRINCIPAL, TENANT } from './src/client';
 
@@ -29,6 +29,30 @@ const asMaps = (ans: any): Row[] => {
   return (ans?.rows ?? []).map((r: any[]) => Object.fromEntries(cols.map((c, i) => [c, r[i]])));
 };
 const stamp = () => new Date().toISOString().replace('Z', '000Z');
+
+/// §10il: rows as ONE GeoJSON collection for the map to draw in a single layer.
+///
+/// ⚠️ `MarkerView` was the wrong tool and cost us markers. It mounts a React view per
+/// point, and the library's own docs say so: "If you have static view consider using
+/// PointAnnotation or SymbolLayer they'll offer much better performance". With dozens
+/// on screen it silently drew only some of them — the answer said 77 and the map showed
+/// a fraction, which is exactly what the browser's canvas circles never do.
+const collection = (rows: Row[]): any => ({
+  type: 'FeatureCollection',
+  features: rows
+    .filter((r) => Number.isFinite(Number(r.lng)) && Number.isFinite(Number(r.lat)))
+    .map((r) => ({
+      type: 'Feature',
+      id: String(r.id),
+      properties: {
+        id: String(r.id),
+        kw: Number(r.max_power_kw ?? 0),
+        dead: r.status_type_id != null && r.status_type_id !== 50 ? 1 : 0,
+        price: r.price != null ? Number(r.price).toFixed(3) : '',
+      },
+      geometry: { type: 'Point', coordinates: [Number(r.lng), Number(r.lat)] },
+    })),
+});
 
 /// Metres between two points. The radius each ask uses is half the visible diagonal,
 /// exactly as the other two clients compute it — so the same viewport asks for the same
@@ -131,6 +155,15 @@ export default function App() {
       const centre: [number, number] = await m.getCenter();
       const b = await m.getVisibleBounds();          // [[east, north], [west, south]]
       const half = metres(b[0] as [number, number], b[1] as [number, number]) / 2;
+      // ⚠️ §10il: a map that has not finished laying out answers a DEGENERATE box, and
+      // the radius then clamps to its 150 m floor — an ask that finds nothing and a map
+      // that opens empty while the toggle says the chargers are on. Waiting for
+      // `onDidFinishLoadingMap` was not enough on its own, so the bounds are checked
+      // too: anything under a kilometre across at these zooms is the map not ready.
+      if (!Number.isFinite(half) || half < 500) {
+        setTimeout(() => void ask(), 250);
+        return;
+      }
       const t0 = Date.now();
       if (minKw !== null) {
         const radius = Math.min(150000, Math.max(150, half));
@@ -196,7 +229,7 @@ export default function App() {
     <View style={styles.fill}>
       <MapView ref={map} style={styles.fill} mapStyle={STYLE as any} onPress={onMapPress}
         onDidFinishLoadingMap={() => setMapReady(true)}
-        onRegionDidChange={scheduleAsk}>
+        onRegionDidChange={() => { setMapReady(true); scheduleAsk(); }}>
         <Camera defaultSettings={{ centerCoordinate: NANTES, zoomLevel: 11 }} />
 
         {pins.length === 2 && (
@@ -210,22 +243,50 @@ export default function App() {
           </ShapeSource>
         )}
 
-        {chargers.map((r) => (
-          <MarkerView key={String(r.id)} coordinate={[Number(r.lng), Number(r.lat)]}>
-            <Pressable hitSlop={10} onPress={() => setPicked(r)}>
-              <View style={[styles.pin, Number(r.max_power_kw ?? 0) >= 43 ? styles.rapid : styles.slow,
-                picked?.id === r.id && styles.pinPicked]} />
-            </Pressable>
-          </MarkerView>
-        ))}
+        {chargers.length > 0 && (
+          <ShapeSource
+            id="chargers"
+            shape={collection(chargers)}
+            onPress={(e: any) => {
+              const id = e?.features?.[0]?.properties?.id;
+              setPicked(chargers.find((r) => String(r.id) === id) ?? null);
+            }}
+          >
+            {/* Colour by power, grey when the feed says it is out of service — the same
+                rule the other two clients paint by. */}
+            <CircleLayer
+              id="chargers-dot"
+              style={{
+                circleRadius: 6,
+                circleStrokeWidth: 1,
+                circleStrokeColor: '#ffffff',
+                circleColor: [
+                  'case',
+                  ['==', ['get', 'dead'], 1], '#999999',
+                  ['>=', ['get', 'kw'], 43], '#1a7f37',
+                  '#1f6feb',
+                ] as any,
+              }}
+            />
+          </ShapeSource>
+        )}
 
-        {stations.map((r) => (
-          <MarkerView key={`f-${r.id}`} coordinate={[Number(r.lng), Number(r.lat)]}>
-            <Pressable hitSlop={6} onPress={() => setPicked(r)}>
-              <View style={styles.price}><Text style={styles.priceText}>{Number(r.price).toFixed(3)}</Text></View>
-            </Pressable>
-          </MarkerView>
-        ))}
+        {stations.length > 0 && (
+          <ShapeSource
+            id="stations"
+            shape={collection(stations)}
+            onPress={(e: any) => {
+              const id = e?.features?.[0]?.properties?.id;
+              setPicked(stations.find((r) => String(r.id) === id) ?? null);
+            }}
+          >
+            <CircleLayer id="stations-dot" style={{ circleRadius: 9, circleColor: '#b45309', circleStrokeWidth: 1, circleStrokeColor: '#ffffff' }} />
+            <SymbolLayer
+              id="stations-price"
+              style={{ textField: ['get', 'price'] as any, textSize: 9, textColor: '#ffffff', textAllowOverlap: true, textOffset: [0, 1.4] }}
+            />
+          </ShapeSource>
+        )}
 
         {routeMode && pins.map((p) => (
           <MarkerView key={`r-${p.k}`} coordinate={[p.v.lng, p.v.lat]}>
