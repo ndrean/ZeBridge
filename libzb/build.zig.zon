@@ -11,6 +11,14 @@
             .url = "https://github.com/zigcc/zig-msgpack/archive/main.tar.gz",
             .hash = "zig_msgpack-0.0.14-evvueL5SBQACmim6j6klQ9wWIIG_UxGlPvVYdiNy0KT8",
         },
+        .sqlite = .{
+            .url = "https://sqlite.org/2025/sqlite-amalgamation-3490100.zip",
+            .hash = "N-V-__8AABOipwB_ROwW0ffosJ3Cc7xoq4Vr6yMzlaQ57vCP",
+        },
+        .zstd = .{
+            .url = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+            .hash = "N-V-__8AAPZ7fwBg4JoCzM_0o2A8wxH2hsUUeiU1iuZv53L5",
+        },
     },
     .paths = .{
         "build.zig",

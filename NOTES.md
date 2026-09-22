@@ -15632,3 +15632,48 @@ even when the table does not: when a chain's cut point is about to be pruned off
 shared stream, the repair is an EMPTY delta with a fresh cut point rather than a full,
 which would rewrite 1.5 MB because someone else's writes moved the stream (§10ej).
 
+## §10iq — sqlite and zstd, vendored
+
+`-Dvendor=true` compiles both from PINNED sources instead of linking the host's. That is
+what §10ig ran out of road on: neither the iOS SDK nor the Android NDK ships zstd, and
+linking the system sqlite on Android is discouraged.
+
+    zig fetch --save=sqlite https://sqlite.org/2025/sqlite-amalgamation-3490100.zip
+    zig fetch --save=zstd   https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+
+Hash-pinned in `build.zig.zon`, so nothing large enters the repository and Zig compiles
+them for whatever target is asked for. The sources are NAMED, not globbed: a build should
+not depend on what happens to be in a directory. `dictBuilder` is deliberately absent —
+libzb LOADS dictionaries but never trains one; training is the bridge's job, in its own
+binary.
+
+**It cross-compiles.** A 22 MB arm64 static archive for the iOS simulator, with
+`sqlite3_open`, `ZSTD_decompress` and all sixteen `zb_client_*` entry points defined in
+it and no system library anywhere:
+
+    zig build lib -Doptimize=ReleaseFast -Dvendor=true -Dlibpq=false \
+      -Dtarget=aarch64-ios-simulator --sysroot "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+
+Four things had to be learnt, each one error at a time:
+
+1. **The C sources need their own libc.** `--sysroot` reaches the Zig compilation but not
+   `addCSourceFile`, so zstd failed on `'string.h' file not found` with the sysroot
+   already given. The module needs `<sysroot>/usr/include` explicitly.
+2. **And the libc to LINK against**, or it stops at `unable to find libSystem system
+   library`. ⚠️ That path must be RELATIVE — Zig prepends the sysroot itself, and passing
+   the absolute one produced `<sdk>/<sdk>/usr/lib`.
+3. **`zig build lib`, a new step.** The default also builds `zb`, `zb-demo` and
+   `zb-soak`: developer tools that make no sense on a phone.
+4. **STATIC when cross-compiling.** A shared library pulls Zig's stack-trace machinery,
+   which wants `__dyld_get_image_header_containing_address` — a symbol the iOS simulator
+   SDK does not export. iOS links archives or frameworks anyway. Native builds still get
+   the dylib that Python's ctypes and Dart's ffi load.
+
+Opt-in for now: the default build is untouched, still links all four system libraries
+and still passes its tests. The vendored desktop build passes them too and links neither
+sqlite nor zstd.
+
+What this unlocks is the OTHER half of §10ih: a native Swift or Kotlin app, or Flutter on
+a phone, can now embed libzb. React Native did not need it, which is exactly why that
+path shipped first.
+

@@ -14,6 +14,19 @@ pub fn build(b: *std.Build) void {
         "/usr";
     const sqlite_prefix = b.option([]const u8, "sqlite-prefix", "System SQLite prefix") orelse default_sqlite;
 
+    // §10iq: VENDORED sqlite and zstd, compiled from pinned sources by Zig itself
+    // instead of linked from the host. Two reasons, one of them measured the hard way:
+    //
+    //   * a PHONE cannot use the host's copies. Neither the iOS SDK nor the Android NDK
+    //     ships zstd at all, and linking the system sqlite on Android is discouraged —
+    //     which is as far as §10ig got before running out of libraries to find.
+    //   * the host's copies are a silent coupling. A plain `zig build` once produced a
+    //     dylib with no DuckDB in it and said nothing (§10hw); the same shape of
+    //     surprise applies to a Homebrew upgrade moving sqlite under a running project.
+    //
+    // Opt-in for now, so nothing that works today changes: `-Dvendor=true`.
+    const vendor = b.option(bool, "vendor", "Compile sqlite and zstd from pinned sources instead of linking the host's") orelse false;
+
     // §10ig: the PostgreSQL replica engine (§10fd) as a build-time switch, like
     // DuckDB's but ON by default — every desktop build has had it and nothing should
     // change for them. It exists for the phone: libpq-fe.h is not in the iOS SDK and
@@ -27,11 +40,20 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "include" }) });
     // libzstd for DICTIONARY frames (§10x): std.compress.zstd parses a dictionary
     // id but cannot use one; plain frames still decode through std.
     const zstd_prefix: []const u8 = if (builtin.os.tag == .macos) "/opt/homebrew/opt/zstd" else "/usr";
-    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
+    // §10iq: the HEADERS come from the pinned sources when vendoring, so translate-c
+    // reads the same sqlite3.h and zstd.h that will actually be compiled in.
+    const sqlite_dep = if (vendor) b.dependency("sqlite", .{}) else null;
+    const zstd_dep = if (vendor) b.dependency("zstd", .{}) else null;
+    if (vendor) {
+        translate_c.addIncludePath(sqlite_dep.?.path("."));
+        translate_c.addIncludePath(zstd_dep.?.path("lib"));
+    } else {
+        translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "include" }) });
+        translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
+    }
     // libpq for the PostgreSQL replica engine (§10fd): a client's storage may be a
     // PostgreSQL server instead of a SQLite file — the micro-VM case.
     //
@@ -64,6 +86,97 @@ pub fn build(b: *std.Build) void {
         break :blk tc.createModule();
     } else b.createModule(.{ .root_source_file = b.path("src/duckdb_stub.zig"), .target = target, .optimize = optimize });
 
+    // §10iq: the vendored C, added to whichever module links it. One function so the
+    // four modules cannot drift — that drift is exactly what let a plain `zig build`
+    // silently drop DuckDB (§10hw).
+    //
+    // zstd's own build is a set of directories, not a single file: `common` is shared,
+    // `compress` and `decompress` are what libzb calls into. `dictBuilder` is NOT here
+    // — libzb loads dictionaries (ZSTD_*_loadDictionary) but never TRAINS one; that is
+    // the bridge's job, in its own binary.
+    // §10iq: zstd's sources, NAMED rather than globbed — a build should not depend on
+    // what happens to be in a directory, and iterating one at configure time needs a
+    // filesystem handle this Zig version does not hand out here.
+    //
+    // `dictBuilder` is deliberately absent: libzb LOADS dictionaries
+    // (ZSTD_*_loadDictionary) but never trains one. Training is the bridge's job, in
+    // its own binary.
+    const zstd_srcs = [_][]const u8{
+        "lib/common/debug.c",         "lib/common/entropy_common.c",
+        "lib/common/error_private.c", "lib/common/fse_decompress.c",
+        "lib/common/pool.c",          "lib/common/threading.c",
+        "lib/common/xxhash.c",        "lib/common/zstd_common.c",
+        "lib/compress/fse_compress.c","lib/compress/hist.c",
+        "lib/compress/huf_compress.c","lib/compress/zstd_compress.c",
+        "lib/compress/zstd_compress_literals.c",
+        "lib/compress/zstd_compress_sequences.c",
+        "lib/compress/zstd_compress_superblock.c",
+        "lib/compress/zstd_double_fast.c",
+        "lib/compress/zstd_fast.c",   "lib/compress/zstd_lazy.c",
+        "lib/compress/zstd_ldm.c",    "lib/compress/zstd_opt.c",
+        "lib/compress/zstd_preSplit.c",
+        "lib/compress/zstdmt_compress.c",
+        "lib/decompress/huf_decompress.c",
+        "lib/decompress/zstd_ddict.c",
+        "lib/decompress/zstd_decompress.c",
+        "lib/decompress/zstd_decompress_block.c",
+    };
+
+    // The vendored C, added to whichever module links it. One function so the four
+    // modules cannot drift — that drift is exactly what let a plain `zig build`
+    // silently drop DuckDB (§10hw).
+    const addVendored = struct {
+        fn f(
+            bb: *std.Build,
+            m: *std.Build.Module,
+            sq: ?*std.Build.Dependency,
+            zs: ?*std.Build.Dependency,
+            srcs: []const []const u8,
+        ) void {
+            const sqd = sq orelse return;
+            const zsd = zs.?;
+            // ⚠️ §10iq: C sources need a libc to compile against, and a CROSS target
+            // has none until it is told. `--sysroot $(xcrun --sdk iphonesimulator
+            // --show-sdk-path)` is how the iOS SDK arrives; without this line the
+            // vendored zstd fails on `'string.h' file not found` even though the
+            // sysroot was given, because that flag reaches the Zig compilation and not
+            // these C files.
+            if (bb.sysroot) |sr| {
+                m.addSystemIncludePath(.{ .cwd_relative = bb.pathJoin(&.{ sr, "usr", "include" }) });
+                // …and the libc to LINK against. Headers alone get as far as
+                // "unable to find libSystem system library".
+                //
+                // ⚠️ RELATIVE to the sysroot, which Zig prepends itself: passing the
+                // absolute path produced `<sdk>/<sdk>/usr/lib` and found nothing.
+                m.addLibraryPath(.{ .cwd_relative = "/usr/lib" });
+            }
+            m.addIncludePath(sqd.path("."));
+            m.addCSourceFile(.{
+                .file = sqd.path("sqlite3.c"),
+                // The amalgamation compiles bare by default; these are what libzb's
+                // storage actually relies on.
+                .flags = &.{
+                    "-DSQLITE_ENABLE_COLUMN_METADATA=1",
+                    "-DSQLITE_THREADSAFE=1",
+                    "-DSQLITE_DQS=0",
+                    "-DSQLITE_OMIT_LOAD_EXTENSION=1",
+                    "-DSQLITE_USE_ALLOCA=1",
+                },
+            });
+            m.addIncludePath(zsd.path("lib"));
+            m.addIncludePath(zsd.path("lib/common"));
+            for (srcs) |src| {
+                m.addCSourceFile(.{
+                    .file = zsd.path(src),
+                    // ⚠️ No assembly: zstd's .S file is x86-64 only and would break
+                    // every arm64 target, which is every target that matters here.
+                    .flags = &.{ "-DZSTD_DISABLE_ASM=1", "-DXXH_NAMESPACE=ZSTD_" },
+                });
+            }
+            m.link_libc = true;
+        }
+    }.f;
+
     const nats_dep = b.dependency("nats", .{ .target = target, .optimize = optimize });
     const msgpack_dep = b.dependency("zig_msgpack", .{ .target = target, .optimize = optimize });
 
@@ -77,10 +190,15 @@ pub fn build(b: *std.Build) void {
     mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     mod.addImport("nats", nats_dep.module("nats"));
     mod.addImport("msgpack", msgpack_dep.module("msgpack"));
-    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
-    mod.linkSystemLibrary("sqlite3", .{});
-    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
-    mod.linkSystemLibrary("zstd", .{});
+    // §10iq: vendored, or the host's — never both.
+    if (vendor) {
+        addVendored(b, mod, sqlite_dep, zstd_dep, &zstd_srcs);
+    } else {
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+        mod.linkSystemLibrary("sqlite3", .{});
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+        mod.linkSystemLibrary("zstd", .{});
+    }
     if (with_libpq) {
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
         mod.linkSystemLibrary("pq", .{});
@@ -95,12 +213,28 @@ pub fn build(b: *std.Build) void {
 
     // The C-ABI shared library: one JSON dispatch entrypoint (zb_call) +
     // zb_free. Hosts: Python (ctypes), and later Dart/Swift/Kotlin/.NET FFI.
+    // §10iq: STATIC when cross-compiling, dynamic otherwise. A phone links libzb INTO
+    // the app — iOS ships static archives or frameworks, not loose dylibs — and a
+    // shared library additionally pulls Zig's stack-trace machinery, which wants
+    // `__dyld_get_image_header_containing_address`: a symbol the iOS simulator SDK does
+    // not export. The desktop hosts (Python ctypes, Dart ffi) need the dynamic one, and
+    // a native build still gets it.
+    const cross = b.graph.host.result.os.tag != target.result.os.tag;
     const lib = b.addLibrary(.{
         .name = "zbcore",
         .root_module = mod,
-        .linkage = .dynamic,
+        .linkage = if (cross) .static else .dynamic,
     });
     b.installArtifact(lib);
+
+    // §10iq: `zig build lib` — the LIBRARY on its own. The default step also builds
+    // `zb`, `zb-demo` and `zb-soak`, which are developer tools that make no sense on a
+    // phone and drag in Zig's stack-trace machinery; cross-compiling them to
+    // aarch64-ios-simulator fails on `undefined symbol:
+    // __dyld_get_image_header_containing_address` long after the library itself is
+    // fine. A host embedding libzb wants this step.
+    const lib_step = b.step("lib", "Build ONLY libzbcore (what a phone or a host embeds)");
+    lib_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
 
     // The orchestration demo (consumer #4): the loop against the live stack.
     const demo_mod = b.createModule(.{
@@ -113,10 +247,15 @@ pub fn build(b: *std.Build) void {
     demo_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     demo_mod.addImport("nats", nats_dep.module("nats"));
     demo_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
-    demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
-    demo_mod.linkSystemLibrary("sqlite3", .{});
-    demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
-    demo_mod.linkSystemLibrary("zstd", .{});
+    // §10iq: vendored, or the host's — never both.
+    if (vendor) {
+        addVendored(b, demo_mod, sqlite_dep, zstd_dep, &zstd_srcs);
+    } else {
+        demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+        demo_mod.linkSystemLibrary("sqlite3", .{});
+        demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+        demo_mod.linkSystemLibrary("zstd", .{});
+    }
     if (with_libpq) {
         demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
         demo_mod.linkSystemLibrary("pq", .{});
@@ -143,10 +282,15 @@ pub fn build(b: *std.Build) void {
     soak_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     soak_mod.addImport("nats", nats_dep.module("nats"));
     soak_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
-    soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
-    soak_mod.linkSystemLibrary("sqlite3", .{});
-    soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
-    soak_mod.linkSystemLibrary("zstd", .{});
+    // §10iq: vendored, or the host's — never both.
+    if (vendor) {
+        addVendored(b, soak_mod, sqlite_dep, zstd_dep, &zstd_srcs);
+    } else {
+        soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+        soak_mod.linkSystemLibrary("sqlite3", .{});
+        soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+        soak_mod.linkSystemLibrary("zstd", .{});
+    }
     if (with_libpq) {
         soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
         soak_mod.linkSystemLibrary("pq", .{});
@@ -170,10 +314,15 @@ pub fn build(b: *std.Build) void {
     zb_mod.addAnonymousImport("grammar", .{ .root_source_file = b.path("../src/grammar.json") });
     zb_mod.addImport("nats", nats_dep.module("nats"));
     zb_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
-    zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
-    zb_mod.linkSystemLibrary("sqlite3", .{});
-    zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
-    zb_mod.linkSystemLibrary("zstd", .{});
+    // §10iq: vendored, or the host's — never both.
+    if (vendor) {
+        addVendored(b, zb_mod, sqlite_dep, zstd_dep, &zstd_srcs);
+    } else {
+        zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
+        zb_mod.linkSystemLibrary("sqlite3", .{});
+        zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
+        zb_mod.linkSystemLibrary("zstd", .{});
+    }
     if (with_libpq) {
         zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
         zb_mod.linkSystemLibrary("pq", .{});
