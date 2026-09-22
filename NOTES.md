@@ -15345,3 +15345,42 @@ Not yet run on a simulator: MapLibre is native, so this needs an `expo prebuild`
 development build rather than Expo Go. Typechecks clean, and the client's 224 tests still
 pass with the new export.
 
+## §10ii — fmt, consteval, and a macro with no guard
+
+The first `expo run:ios` died five times in `fmt/format-inl.h` before reaching any of
+our code:
+
+    call to consteval function 'fmt::basic_format_string<...>' is not a constant expression
+
+Apple clang 21 (Xcode 26.6 here) tightened how it validates C++20 `consteval`, and the
+`FMT_STRING(...)` pattern in fmt 11.0.2 no longer satisfies it. React Native 0.76.9
+bundles exactly that fmt through RCT-Folly, so it is not our dependency and not one we
+can choose.
+
+**The obvious fix does not work, and the reason is worth knowing.** Setting
+`FMT_USE_CONSTEVAL=0` through `GCC_PREPROCESSOR_DEFINITIONS` reached the compiler — 178
+occurrences in the generated Pods project — and changed nothing, because `fmt/base.h`
+defines the macro through an unguarded `#if / #elif / #else` chain. There is no
+`#ifndef FMT_USE_CONSTEVAL` around it, so the header's own value always wins over
+anything `-D` passes. A macro that cannot be overridden from outside is not a knob,
+however much it looks like one.
+
+So the patch edits the header: the two arms that resolve to 1 now resolve to 0, which is
+what every other arm in that chain already says for a compiler whose consteval fmt
+cannot use. It has to run AFTER CocoaPods fetches the pod, which means `post_install` and
+not the plugin's own file-writing step — a plugin's dangerous mod runs during prebuild,
+before `pod install` has downloaded anything.
+
+Two shapes had to be learnt on the way:
+
+- `expo prebuild` REGENERATES the Podfile from app.json, so a hand edit survives exactly
+  until the next prebuild. The fix belongs in a config plugin.
+- A Podfile may have exactly ONE `post_install`; CocoaPods refuses a second with
+  "Specifying multiple `post_install` hooks is unsupported". React Native's template
+  already has one, so the plugin injects INTO it rather than appending its own.
+
+⚠️ Transitional. React Native >= 0.83.9 / Expo SDK 56 bundle fmt 12.1.0 and build
+cleanly on this toolchain. `plugins/with-fmt-consteval.js` should be deleted at that
+upgrade, and it says so at the top. The plugin raises rather than silently doing nothing
+if `base.h` stops matching, so a future fmt cannot leave it quietly ineffective.
+
