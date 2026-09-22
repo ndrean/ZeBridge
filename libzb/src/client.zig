@@ -2963,13 +2963,18 @@ pub const SyncClient = struct {
             // naming it — which the asking library resolves, so the host never sees the
             // difference. NATS caps a message near a megabyte; a service that answers
             // rows cannot promise to stay under it.
-            if (answer.len <= self.results_inline_max) {
-                try self.t.publishCore(p.reply_subject, answer);
-                return;
-            }
             var sa = std.heap.ArenaAllocator.init(self.a);
             defer sa.deinit();
             const a = sa.allocator();
+            // §10ip: compressed FIRST, so the inline-or-object decision is made on what
+            // actually travels. An answer is JSON or a zstd frame and nothing else, and
+            // JSON never begins 0x28 — so the asking side needs no flag, just the magic
+            // bytes it already checks for chain objects.
+            const body = compressAnswer(a, answer) catch answer;
+            if (body.len <= self.results_inline_max) {
+                try self.t.publishCore(p.reply_subject, body);
+                return;
+            }
             const bucket = try std.fmt.allocPrint(a, "{s}{s}", .{ self.results_bucket_prefix, p.tenant });
             // Unique-enough per process: pid, a monotonic counter and the request id
             // (std.crypto.random wants an Io in 0.16; libc is already linked). The
@@ -2978,8 +2983,8 @@ pub const SyncClient = struct {
                 var n = std.atomic.Value(u32).init(0);
             };
             const name = try std.fmt.allocPrint(a, "ans-{d}-{d}-{d}", .{ std.c.getpid(), Ctr.n.fetchAdd(1, .monotonic), id });
-            try self.t.objectPutBytes(bucket, name, answer, self.results_max_age_ns);
-            const envelope = try std.fmt.allocPrint(a, "{{\"zb_object\":{{\"bucket\":\"{s}\",\"name\":\"{s}\",\"bytes\":{d}}}}}", .{ bucket, name, answer.len });
+            try self.t.objectPutBytes(bucket, name, body, self.results_max_age_ns);
+            const envelope = try std.fmt.allocPrint(a, "{{\"zb_object\":{{\"bucket\":\"{s}\",\"name\":\"{s}\",\"bytes\":{d}}}}}", .{ bucket, name, body.len });
             try self.t.publishCore(p.reply_subject, envelope);
             return;
         }
@@ -3401,9 +3406,13 @@ pub const SyncClient = struct {
         // the data rather than the cost of the fetch.
         if (try self.objectEnvelope(a, msg.data)) |fetched| {
             const fetch_ms = msNow() - t0 - wire_ms;
-            return try spliceTransport(a, fetched, "object", fetched.len, wire_ms, fetch_ms);
+            // §10ip: `maybeZstd` returns its input untouched when the bytes are not a
+            // frame, so an uncompressed answer costs one magic-byte check.
+            const body = try maybeZstd(a, fetched, null);
+            return try spliceTransport(a, body, "object", fetched.len, wire_ms, fetch_ms);
         }
-        return try spliceTransport(a, msg.data, "inline", msg.data.len, wire_ms, 0);
+        const body = try maybeZstd(a, msg.data, null);
+        return try spliceTransport(a, body, "inline", msg.data.len, wire_ms, 0);
     }
 
     /// How the answer travelled, spliced into the answer itself as `zb_transport`:
@@ -4617,6 +4626,26 @@ fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
 }
 
 /// Chain objects may be zstd frames (§10w) — sniffed by the standard 4-byte magic.
+/// §10ip: one-shot zstd for the QUERY channel. No dictionary — an answer is a one-off,
+/// there is no era to train against, and a plain frame is what every client can read
+/// (React Native's pure-JS decompressor does plain frames only).
+///
+/// Returns the INPUT unchanged when compression does not pay, so a tiny answer is never
+/// made bigger. The caller decides inline-or-object on what comes back, which is the
+/// point: measured on this stack, answers compress about 4x, so a 621 KB answer becomes
+/// 163 KB and travels INLINE instead of becoming an object — the whole write-object,
+/// reply-envelope, fetch-object round trip disappears.
+fn compressAnswer(a: std.mem.Allocator, b: []const u8) ![]const u8 {
+    // Below a few hundred bytes a frame header is most of the result.
+    if (b.len < 512) return b;
+    const bound = C.ZSTD_compressBound(b.len);
+    const buf = try a.alloc(u8, bound);
+    const n = C.ZSTD_compress(buf.ptr, buf.len, b.ptr, b.len, 3);
+    if (C.ZSTD_isError(n) != 0) return b; // never fail an answer over compression
+    if (n >= b.len) return b;             // incompressible: send it as it is
+    return buf[0..n];
+}
+
 fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8 {
     if (b.len < 4 or b[0] != 0x28 or b[1] != 0xb5 or b[2] != 0x2f or b[3] != 0xfd) return b;
     // §10ez: a frame that states its content size is inflated in one call — a 102 MB

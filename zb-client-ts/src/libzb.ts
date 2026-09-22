@@ -72,6 +72,11 @@ export interface ZeBridgeConfig {
   /// web consumer passes fzstd's decompress). Absent where needed, seeding
   /// fails LOUDLY naming the fix — never by feeding zstd bytes to msgpack.
   zstdDecompress?: (b: Uint8Array, dict?: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+  /// §10ip: compress a query ANSWER before it travels. Optional and only used when this
+  /// client SERVES: a host that cannot compress simply answers uncompressed, and every
+  /// asking client reads both. Node needs nothing here — `node:zlib` has zstd and is
+  /// used automatically.
+  zstdCompress?: (b: Uint8Array) => Uint8Array | Promise<Uint8Array>;
   /// Operator/JWT mode: the CONTENT of a .creds file (user JWT + nkey seed).
   /// When set it wins over user/password — the JWT carries the permissions
   /// (scoped signing key), so no server conf names this principal at all.
@@ -492,9 +497,13 @@ export class ZeBridge {
   /// caps a message near a megabyte, and a service that answers rows cannot promise to
   /// stay under it. The asking library resolves the envelope, so the host never sees
   /// the difference.
-  private async answerBody(tenant: string, body: Uint8Array): Promise<Uint8Array> {
+  private async answerBody(tenant: string, raw: Uint8Array): Promise<Uint8Array> {
     const results = this.config.grammar?.results ?? {};
     const inlineMax: number = results.inline_max_bytes ?? 262_144;
+    // §10ip: compressed FIRST, so inline-or-object is decided on what travels. Measured
+    // on this stack answers compress about 4x, which drops a 621 KB answer to 163 KB —
+    // under the limit, so it goes inline and the whole object round trip disappears.
+    const body = await this.compressAnswer(raw);
     if (body.length <= inlineMax) return body;
     const bucket = `${results.bucket_prefix ?? 'res-'}${tenant}`;
     const maxAgeNs = (results.max_age_seconds ?? 600) * 1_000_000_000;
@@ -504,6 +513,33 @@ export class ZeBridge {
     const name = `ans-${this.clientIdValue}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     await os.putBlob({ name }, body);
     return new TextEncoder().encode(JSON.stringify({ zb_object: { bucket, name, bytes: body.length } }));
+  }
+
+  /// The answer as it should travel: a zstd frame when this host can make one, the
+  /// bytes untouched otherwise. Never fails an answer over compression, and never
+  /// returns something LARGER than it was given.
+  ///
+  /// No dictionary: an answer is a one-off with no era to train against, and a plain
+  /// frame is what every client can read — React Native's pure-JS decompressor does
+  /// plain frames only.
+  private async compressAnswer(b: Uint8Array): Promise<Uint8Array> {
+    if (b.length < 512) return b;           // a frame header would be most of it
+    try {
+      let out: Uint8Array | null = null;
+      if (this.config.zstdCompress) {
+        out = await this.config.zstdCompress(b);
+      } else {
+        const proc = (globalThis as any).process;
+        if (proc?.versions?.node) {
+          const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
+          const zlib = await dynImport('node:zlib');
+          if (typeof zlib.zstdCompressSync === 'function') out = new Uint8Array(zlib.zstdCompressSync(b));
+        }
+      }
+      return out && out.length < b.length ? out : b;
+    } catch {
+      return b;   // a host without a compressor answers uncompressed; every asker reads both
+    }
   }
 
   /// §10hq: `{"zb_object":{bucket,name,bytes}}` → the object's bytes, parsed; anything
@@ -516,7 +552,9 @@ export class ZeBridge {
     const os = await this.transport.objectStore(this.nc!, env.bucket);
     const blob = await this.objectBlob(os, env.bucket, env.name);
     if (!blob) throw new Error(`answer object ${env.name} is gone from ${env.bucket} (expired?)`);
-    return { value: JSON.parse(new TextDecoder().decode(blob)), bytes: blob.length };
+    // §10ip: `maybeZstd` hands back its input untouched when the bytes are not a frame.
+    const inflated = await this.maybeZstd(blob);
+    return { value: JSON.parse(new TextDecoder().decode(inflated)), bytes: blob.length };
   }
 
   /// §10hn (libzb §10hj): ask a service — request/reply on a subject this principal may
@@ -531,7 +569,7 @@ export class ZeBridge {
     const t1 = Date.now();
     const large = await this.resolveAnswer(m.data);
     const fetch_ms = large ? Date.now() - t1 : 0;
-    const value = large ? large.value : JSON.parse(new TextDecoder().decode(m.data));
+    const value = large ? large.value : JSON.parse(new TextDecoder().decode(await this.maybeZstd(m.data)));
     // §10hu: say HOW the answer travelled, on the same clock either way. libzb splices
     // the identical block (`spliceTransport`), so a host reads one shape from either
     // library and can price the object fetch instead of guessing at it.

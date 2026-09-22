@@ -15580,3 +15580,55 @@ Java 25 broke Gradle.
 
 The build took 3m 59s the first time, 300 tasks.
 
+## §10ip — zstd on the query channel
+
+The chain has been compressed all along; the QUERY channel was not. Answers are
+column-oriented JSON with the same 24 field names on every row, so they compress about
+4x — and the interesting consequence is not bandwidth, it is the inline threshold.
+
+Measured on the live stack, before and after:
+
+| radius | rows | before | after |
+| --- | --- | --- | --- |
+| 5 km | 18 | 6,884 inline | 2,588 inline |
+| 20 km | 116 | 43,467 inline | 13,148 inline |
+| 150 km | 1,620 | 661,824 **object** | 162,133 **inline** |
+| 300 km | 2,000 | 813,821 **object** | 200,600 **inline** |
+
+**The object path is no longer reached for any of these.** A 2,000-row answer used to
+be written to the results bucket, replied to with an envelope, fetched back and then
+parsed; now it is one message. The write-object, reply-envelope, fetch-object round trip
+disappears for everything under about 1 MB of JSON.
+
+The design has no protocol field, because it does not need one. An answer is JSON or a
+zstd frame, and JSON never begins `0x28`. Both libraries already checked those magic
+bytes for chain objects, and `maybeZstd` hands back its input untouched when they do not
+match — so an uncompressed answer costs one comparison and old and new clients
+interoperate in both directions.
+
+No dictionary, deliberately: an answer is a one-off with no era to train against, and a
+plain frame is what EVERY client can read — React Native's pure-JS decompressor does
+plain frames only (§10ij).
+
+Compression never fails an answer. Below 512 bytes it is skipped (a frame header would
+be most of the result), a compressed result that is not smaller is discarded, and any
+error returns the original bytes. libzb always compresses, since it links zstd;
+zb-client-ts uses the host's `zstdCompress` if given, else Node's `zlib.zstdCompressSync`
+automatically, else answers uncompressed — a browser or React Native responder simply
+does not compress, and every asker reads both.
+
+### Was the chain's FULL already compressed?
+
+Yes, and without a dictionary — checked rather than assumed, after I had loosely implied
+otherwise earlier:
+
+    charge_points-g27-full: 4,674,095 bytes -> 1,592,692 on the wire = 2.9x, dict: None
+
+The dictionary is trained FROM the full's own bytes when the full is written, so the full
+cannot use it; only that era's deltas can. For `charge_points` those deltas are ~289 B
+each and there are three, against a 112 KB dictionary — poor value for a static table,
+and exactly right for a busy one. The deltas exist at all because the CDC stream moves
+even when the table does not: when a chain's cut point is about to be pruned off the
+shared stream, the repair is an EMPTY delta with a fresh cut point rather than a full,
+which would rewrite 1.5 MB because someone else's writes moved the stream (§10ej).
+
