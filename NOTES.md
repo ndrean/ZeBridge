@@ -15252,3 +15252,50 @@ Which is the property that made holding an end safe to add: the two editors are 
 different keys, and even when they are not, the register with the later stamp wins and
 both orders agree.
 
+## §10ig — libpq becomes a switch
+
+Trying to build libzb for the iOS simulator failed on `libpq-fe.h:24: 'stdio.h' not
+found`. libpq is a PostgreSQL CLIENT library, it is not in the iOS SDK, and one header
+file pulled sqlite, zstd and libpq into a single translated `c` module — so a build that
+can never open a PostgreSQL replica still had to find a PostgreSQL client library in
+order to compile at all.
+
+`-Dlibpq` now exists, shaped like `-Dduckdb` but **on by default**: every desktop build
+has had the engine and nothing changes for them. Off, the module is built from
+`src/sqlite_includes_nopq.h` (sqlite and zstd only) and the four modules skip linking
+`pq`.
+
+Only five functions touch libpq — `pgExec`, `pgCopy`, `openPostgres`, `clearStmtCache`
+and one arm of `close` — so the gating is five guards, and `openPostgres` names the flag
+the way the DuckDB guard does rather than returning a bare `OpenFailed`.
+
+One thing the DuckDB switch never needed: the connection handle is a struct FIELD, and a
+field cannot sit behind an `if` the way a statement can. Its TYPE carries the switch
+instead — `pg: if (build_options.libpq) ?*c.PGconn else ?*anyopaque` — because without
+libpq there is no `c.PGconn` to name. Every path that would dereference it is gated, so
+the placeholder is never read.
+
+Verified both ways: the default build links libpq and DuckDB as before, `-Dlibpq=false`
+builds and its tests pass, and the resulting dylib links neither.
+
+It moved iOS forward by exactly one step. The libpq error is gone; two remain, and they
+are the harder half:
+
+    unable to find dynamic system library 'sqlite3'
+    unable to find dynamic system library 'zstd'
+
+SQLite is a path problem — the iOS SDK ships `libsqlite3.tbd`. zstd is real work: the SDK
+does not ship it, the Android NDK does not either, and the chain needs it for dictionary
+frames (`std.compress.zstd` reads a dictionary id but cannot use one). The general fix is
+to stop depending on SYSTEM libraries at all and vendor the SQLite amalgamation and the
+zstd sources, so Zig compiles them for whatever target is asked for. That would also
+remove the Homebrew coupling that silently dropped the DuckDB engine in §10hw.
+
+⚠️ Worth recording plainly: **no mobile build of libzb has ever existed in this
+repository.** Both Flutter apps' loaders handle macOS and Linux and throw on anything
+else; the `android/` and `ios/` folders are `flutter create` scaffolding and there are no
+built artefacts for either. The cross-platform framework was never the obstacle — a C
+toolchain is, and every framework meets the same wall. zb-client-ts is the way around it
+for a phone: it connects over NATS WebSocket and its storage is a pluggable factory with
+three implementations already, the Node one 109 lines and the browser one 24.
+

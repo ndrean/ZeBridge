@@ -69,7 +69,10 @@ pub const Storage = struct {
     db: *c.sqlite3 = undefined,
     mutex: SpinLock = .{},
     // ── PostgreSQL ──
-    pg: ?*c.PGconn = null,
+    // §10ig: a struct FIELD cannot sit behind an `if` the way a statement can, so the
+    // TYPE carries the switch. Without libpq there is no `c.PGconn` to name, and every
+    // path that would dereference this one is gated, so the placeholder is never read.
+    pg: if (build_options.libpq) ?*c.PGconn else ?*anyopaque = null,
     /// translated SQL → the server-side prepared statement's name.
     pg_stmts: std.StringHashMapUnmanaged([:0]const u8) = .empty,
     pg_next: usize = 0,
@@ -135,6 +138,13 @@ pub const Storage = struct {
     /// second connection the C card's `query` uses — enforced by the server, as the
     /// SQLite one is by the open flag.
     pub fn openPostgres(url: [*:0]const u8, read_only: bool) Error!Storage {
+        if (!build_options.libpq) {
+            // §10ig: this build has no PostgreSQL engine. Say which flag brings it
+            // back, the way the DuckDB guard does — a bare OpenFailed is the same
+            // error a corrupt file gives.
+            std.debug.print("engine 'postgres' asked for, but this libzb was built without it — rebuild with `-Dlibpq=true`\n", .{});
+            return Error.OpenFailed;
+        }
         const conn = c.PQconnectdb(url) orelse return Error.OpenFailed;
         if (c.PQstatus(conn) != c.CONNECTION_OK) {
             c.PQfinish(conn);
@@ -198,7 +208,9 @@ pub const Storage = struct {
         self.clearStmtCache();
         switch (self.engine) {
             .sqlite => _ = c.sqlite3_close(self.db),
-            .postgres => if (self.pg) |conn| c.PQfinish(conn),
+            .postgres => if (build_options.libpq) {
+                if (self.pg) |conn| c.PQfinish(conn);
+            },
             .duckdb => if (build_options.duckdb) {
                 if (self.dk_con) |cp| {
                     var con: dk.duckdb_connection = @ptrCast(@alignCast(cp));
@@ -218,7 +230,7 @@ pub const Storage = struct {
     /// statement fails forever after — clearing is cheap certainty. On PostgreSQL
     /// the server-side statements are deallocated the same way.
     pub fn clearStmtCache(self: *Storage) void {
-        if (self.engine == .postgres) {
+        if (build_options.libpq and self.engine == .postgres) {
             var pit = self.pg_stmts.iterator();
             while (pit.next()) |e| {
                 std.heap.c_allocator.free(e.key_ptr.*);
@@ -417,6 +429,8 @@ pub const Storage = struct {
     /// the integers, the floats, bytea; everything else — numeric included, by the
     /// contract — as text. A PRAGMA is SQLite's business and answers nothing here.
     fn pgExec(self: *Storage, a: std.mem.Allocator, sql: []const u8, params: []const Value, want_names: bool) Error!Named {
+        // Unreachable without the engine: nothing can have opened a postgres Storage.
+        if (!build_options.libpq) return Error.OpenFailed;
         const conn = self.pg orelse return Error.ExecFailed;
         const trimmed = std.mem.trim(u8, sql, " \t\r\n;");
         if (std.ascii.startsWithIgnoreCase(trimmed, "PRAGMA")) return .{ .columns = &.{}, .rows = try a.alloc(Row, 0) };
@@ -647,6 +661,7 @@ pub const Storage = struct {
 
     /// §10fe: COPY FROM STDIN — the statement, then the rows as one text buffer.
     pub fn pgCopy(self: *Storage, copy_sql: [:0]const u8, data: []const u8) Error!void {
+        if (!build_options.libpq) return Error.OpenFailed;
         const conn = self.pg orelse return Error.ExecFailed;
         const start = c.PQexec(conn, copy_sql.ptr);
         const st0 = c.PQresultStatus(start);

@@ -14,8 +14,15 @@ pub fn build(b: *std.Build) void {
         "/usr";
     const sqlite_prefix = b.option([]const u8, "sqlite-prefix", "System SQLite prefix") orelse default_sqlite;
 
+    // §10ig: the PostgreSQL replica engine (§10fd) as a build-time switch, like
+    // DuckDB's but ON by default — every desktop build has had it and nothing should
+    // change for them. It exists for the phone: libpq-fe.h is not in the iOS SDK and
+    // drags a hosted libc through translate-c, so a build that can never open a
+    // PostgreSQL replica still had to find a PostgreSQL client library to compile.
+    const with_libpq = b.option(bool, "libpq", "Build the PostgreSQL storage engine (needs libpq)") orelse true;
+
     const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/sqlite_includes.h"),
+        .root_source_file = b.path(if (with_libpq) "src/sqlite_includes.h" else "src/sqlite_includes_nopq.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -27,10 +34,13 @@ pub fn build(b: *std.Build) void {
     translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "include" }) });
     // libpq for the PostgreSQL replica engine (§10fd): a client's storage may be a
     // PostgreSQL server instead of a SQLite file — the micro-VM case.
+    //
     const pq_prefix: []const u8 = b.option([]const u8, "libpq-prefix", "System libpq prefix") orelse
         (if (builtin.os.tag == .macos) "/opt/homebrew/opt/libpq" else "/usr");
-    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include" }) });
-    translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include", "postgresql" }) });
+    if (with_libpq) {
+        translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include" }) });
+        translate_c.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "include", "postgresql" }) });
+    }
     const c_mod = translate_c.createModule();
 
     // §10fl: the DuckDB engine, a build-time switch. Off by default and always off
@@ -42,6 +52,7 @@ pub fn build(b: *std.Build) void {
         (if (builtin.os.tag == .macos) "/opt/homebrew/opt/duckdb" else "/usr/local");
     const build_opts = b.addOptions();
     build_opts.addOption(bool, "duckdb", with_duckdb);
+    build_opts.addOption(bool, "libpq", with_libpq);
     const duckdb_mod: *std.Build.Module = if (with_duckdb) blk: {
         const tc = b.addTranslateC(.{
             .root_source_file = b.path("src/duckdb_includes.h"),
@@ -70,8 +81,10 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("sqlite3", .{});
     mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
     mod.linkSystemLibrary("zstd", .{});
-    mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-    mod.linkSystemLibrary("pq", .{});
+    if (with_libpq) {
+        mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+        mod.linkSystemLibrary("pq", .{});
+    }
     mod.link_libc = true;
     mod.addImport("duckdb", duckdb_mod);
     mod.addOptions("build_options", build_opts);
@@ -104,8 +117,10 @@ pub fn build(b: *std.Build) void {
     demo_mod.linkSystemLibrary("sqlite3", .{});
     demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
     demo_mod.linkSystemLibrary("zstd", .{});
-    demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-    demo_mod.linkSystemLibrary("pq", .{});
+    if (with_libpq) {
+        demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+        demo_mod.linkSystemLibrary("pq", .{});
+    }
     demo_mod.link_libc = true;
     demo_mod.addImport("duckdb", duckdb_mod);
     demo_mod.addOptions("build_options", build_opts);
@@ -132,8 +147,10 @@ pub fn build(b: *std.Build) void {
     soak_mod.linkSystemLibrary("sqlite3", .{});
     soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
     soak_mod.linkSystemLibrary("zstd", .{});
-    soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-    soak_mod.linkSystemLibrary("pq", .{});
+    if (with_libpq) {
+        soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+        soak_mod.linkSystemLibrary("pq", .{});
+    }
     soak_mod.link_libc = true;
     soak_mod.addImport("duckdb", duckdb_mod);
     soak_mod.addOptions("build_options", build_opts);
@@ -157,8 +174,10 @@ pub fn build(b: *std.Build) void {
     zb_mod.linkSystemLibrary("sqlite3", .{});
     zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ zstd_prefix, "lib" }) });
     zb_mod.linkSystemLibrary("zstd", .{});
-    zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
-    zb_mod.linkSystemLibrary("pq", .{});
+    if (with_libpq) {
+        zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ pq_prefix, "lib" }) });
+        zb_mod.linkSystemLibrary("pq", .{});
+    }
     zb_mod.link_libc = true;
     zb_mod.addImport("duckdb", duckdb_mod);
     zb_mod.addOptions("build_options", build_opts);
