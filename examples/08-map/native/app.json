@@ -15,13 +15,9 @@
       "package": "dev.zebridge.zemap"
     },
     "plugins": [
-      "expo-router",
       "@maplibre/maplibre-react-native",
       "expo-sqlite",
       "./plugins/with-fmt-consteval"
-    ],
-    "experiments": {
-      "typedRoutes": true
-    }
+    ]
   }
 }

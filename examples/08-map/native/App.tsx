@@ -5,7 +5,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import MapLibreGL, { Camera, MapView, MarkerView, ShapeSource, LineLayer } from '@maplibre/maplibre-react-native';
-import { makeClient, TENANT } from '@/client';
+import { makeClient, TENANT } from './src/client';
 
 MapLibreGL.setAccessToken(null);
 
