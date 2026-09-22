@@ -126,7 +126,10 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   final routeMine = <String,
       dynamic>{}; // this phone's own registers, shipped whole on every write
   int routeRounds = 0;
-  String routeNext = 'start';
+  /// §10if: which end a tap moves. Null means the old behaviour — alternate start, end,
+  /// start — which is the only thing either client had and which cannot move ONE end
+  /// twice in a row. Tap a pin to take hold of it; tap it again to let go.
+  String? routeSelected;
   List<MapEntry<String, LatLng>> routePoints = const [];
   List<LatLng> routeLine = const [];
   String routeInfo = '';
@@ -470,12 +473,20 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       setState(() {
         routeDoc = doc;
         routePoints = pins;
-        routeInfo = pins.length < 2
-            ? (pins.isEmpty ? 'tap the start' : 'tap the end · $writers')
-            : writers;
+        routeInfo = routeSelected != null
+            ? 'holding $routeSelected — tap to move it, tap the other pin to switch · $writers'
+            : pins.length < 2
+                ? (pins.isEmpty ? 'tap the start' : 'tap the end · $writers')
+                : 'tap near an end to take hold of it · $writers';
       });
     }
-    if (pins.length == 2) await _askRoad(pins[0].value, pins[1].value);
+      // §10ie: the line between the two pins, straight. Valhalla drew it by road
+      // until it was dropped; it cost a 4 GB extract and a container per region and
+      // said nothing about replication, tenancy or a phone that can write. The browser
+      // always drew this line, and the two clients now agree.
+      setState(() => routeLine = pins.length == 2
+          ? [pins[0].value, pins[1].value]
+          : const []);
   }
 
   /// This phone's registers merged into the document it last saw — the union, whole.
@@ -501,67 +512,44 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     }
   }
 
-  /// A tap sets the next register — start, then end, then start again — as this
-  /// phone's move, and writes. The pin appears when the row comes back.
+  /// §10if: which end a tap moves. There is NO alternating any more.
+  ///
+  ///   * nothing placed yet  → the tap places `start`
+  ///   * only `start` placed → it places `end`
+  ///   * both placed         → the HELD end, or the NEAREST one, which it then holds
+  ///
+  /// The last rule is what makes "move this one, then move it again" work without a
+  /// separate select step: the first tap near an end grabs it, every tap after that
+  /// moves the same end until another is tapped. Alternating made moving `start` twice
+  /// in a row impossible, which is not what anyone wants from two draggable points.
+  String _routeTarget(LatLng at) {
+    if (routeSelected != null) return routeSelected!;
+    final placed = {for (final e in routePoints) e.key: e.value};
+    if (!placed.containsKey('start')) return 'start';
+    if (!placed.containsKey('end')) return 'end';
+    const d = Distance();
+    return d.as(LengthUnit.Meter, at, placed['start']!) <=
+            d.as(LengthUnit.Meter, at, placed['end']!)
+        ? 'start'
+        : 'end';
+  }
+
+  /// A tap moves one end as this phone's move. The pin appears when the row comes back.
   Future<void> _routeTap(LatLng at) async {
     if (zb == null) return;
-    routeMine[routeNext] = {
+    final which = _routeTarget(at);
+    routeMine[which] = {
       'v': {'lat': at.latitude, 'lng': at.longitude},
       't': _stampNow(),
       'w': _routeWriter,
     };
-    routeNext = routeNext == 'start' ? 'end' : 'start';
+    // Whatever the tap moved is now the held end, so the next tap moves it too.
+    routeSelected = which;
     setState(() => routeInfo = 'moving…');
     try {
       await _writeRoute();
     } catch (e) {
       if (mounted) setState(() => routeInfo = 'route: $e');
-    }
-  }
-
-  Future<void> _askRoad(LatLng from, LatLng to) async {
-    final w = zb;
-    if (w == null) return;
-    final t0 = DateTime.now();
-    try {
-      final ans = await w.request(
-          'query.$_queryTenant.route',
-          {
-            'points': [
-              {'lat': from.latitude, 'lng': from.longitude},
-              {'lat': to.latitude, 'lng': to.longitude}
-            ],
-            'costing': 'auto'
-          },
-          timeoutMs: 15000);
-      // §10ia: a service answers a refusal as DATA, not as an exception. Reaching for
-      // `polyline` first turns "no suitable edges near location" into a cast error on
-      // null and throws away the one sentence that says what to do about it.
-      if (ans['error'] != null) {
-        if (mounted) {
-          setState(() {
-            routeLine = const [];
-            routeInfo = '${ans['error']}';
-          });
-        }
-        return;
-      }
-      final line = [
-        for (final pt in ans['polyline'] as List)
-          LatLng((pt[0] as num).toDouble(), (pt[1] as num).toDouble())
-      ];
-      final ms = DateTime.now().difference(t0).inMilliseconds;
-      if (mounted) {
-        setState(() {
-          routeLine = line;
-          routeInfo =
-              '${ans['km']} km, ${ans['min']} min by road · $ms ms · $routeInfo';
-        });
-      }
-    } catch (e) {
-      // Reaching the service failed, which is a different thing from the service
-      // saying no.
-      if (mounted) setState(() => routeInfo = 'road service unreachable: $e');
     }
   }
 
@@ -710,7 +698,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             ],
           ),
           IconButton(
-            tooltip: 'Route between two taps (Valhalla)',
+            tooltip: 'Route between two taps (shared, straight line)',
             icon: Icon(Icons.directions,
                 color: routeMode ? Colors.lightBlueAccent : null),
             onPressed: zb == null
@@ -720,6 +708,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                       if (!routeMode) {
                         routeLine = const [];
                         routeInfo = '';
+                        routeSelected = null;
                       } else {
                         addingMode = false;
                         routeInfo = 'loading the shared route…';
@@ -799,10 +788,13 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                 userAgentPackageName: 'zemap'),
           if (routeLine.isNotEmpty)
             PolylineLayer(polylines: [
+              // Dashed on purpose: it is the straight line between the pins, not a
+              // road, and a solid stroke would claim otherwise (§10ie).
               Polyline(
                   points: routeLine,
                   color: Colors.blue.shade700,
-                  strokeWidth: 5)
+                  strokeWidth: 4,
+                  pattern: StrokePattern.dashed(segments: const [6, 6]))
             ]),
           if (routeMode && routePoints.isNotEmpty)
             MarkerLayer(
@@ -810,13 +802,29 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
                 for (final e in routePoints)
                   Marker(
                     point: e.value,
-                    width: 34,
-                    height: 34,
+                    width: 44,
+                    height: 44,
                     alignment: Alignment.topCenter,
-                    child: Icon(
-                        e.key == 'start' ? Icons.trip_origin : Icons.flag,
-                        color: Colors.blue.shade900,
-                        size: 30),
+                    // The marker takes the tap so the map's own handler does not also
+                    // fire: tapping a pin SELECTS it, it never places a new one.
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(() => routeSelected =
+                          routeSelected == e.key ? null : e.key),
+                      child: Container(
+                        decoration: routeSelected == e.key
+                            ? BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Colors.white70,
+                                border: Border.all(
+                                    color: Colors.blue.shade900, width: 3))
+                            : null,
+                        child: Icon(
+                            e.key == 'start' ? Icons.trip_origin : Icons.flag,
+                            color: Colors.blue.shade900,
+                            size: 30),
+                      ),
+                    ),
                   ),
               ],
             ),

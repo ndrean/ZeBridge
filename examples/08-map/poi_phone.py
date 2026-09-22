@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--twice", action="store_true")
     ap.add_argument("--edit", action="store_true", help="the edit story: add a POI here, rename it, remove it — asking the service after each")
     ap.add_argument("--tour", type=int, default=0, help="pick this many named POIs the phone holds and ask the service for the shortest round trip through them, with what lies along the way")
-    ap.add_argument("--route", default="", help="lat,lng of a destination: the road from --at, by Valhalla through the service")
+    ap.add_argument("--route", default="", help="lat,lng of a destination: the corridor from --at, through the service")
     ap.add_argument("--fuel", default="", help="a fuel (SP95, Gazole, E10, SP98, E85, GPLc): the cheapest stations within 3 km, and the cheapest along the tour")
     a = ap.parse_args()
     lat, lng = (float(x) for x in a.at.split(","))
@@ -164,15 +164,23 @@ def fuel_story(lib, take, h, a, lat, lng):
 
 
 def route_story(lib, take, h, a, lat, lng):
-    """Two points → the road between them, from Valhalla through the service (never straight lines)."""
+    """Two points → the way between them and what lies along it. §10ie: the `route`
+    query went with Valhalla; `along_route` is what remains and is the interesting one,
+    because the corridor is the question a driver actually has."""
     to_lat, to_lng = (float(x) for x in a.route.split(","))
-    q = {"points": [{"lat": lat, "lng": lng}, {"lat": to_lat, "lng": to_lng}], "costing": "auto"}
+    q = {"points": [{"lat": lat, "lng": lng}, {"lat": to_lat, "lng": to_lng}],
+         "corridor_m": 5000, "fuel": a.fuel, "limit": 500}
     t0 = time.time()
-    ans = take(lib.zb_client_request(h, f"query.{a.tenant}.route".encode(), json.dumps(q).encode(), 15000))
+    ans = take(lib.zb_client_request(h, f"query.{a.tenant}.along_route".encode(), json.dumps(q).encode(), 20000))
     dt = (time.time() - t0) * 1000
     if "error" in ans:
-        sys.exit(f"route: {ans}")
-    print(f"route {lat:.4f},{lng:.4f} → {to_lat:.4f},{to_lng:.4f}: {ans['km']} km, {ans['min']} min by road, {len(ans['polyline'])} points — {dt:.0f} ms round trip ({ans['ms']} ms in the service)")
+        sys.exit(f"along_route: {ans}")
+    tr = ans.get("zb_transport") or {}
+    st = ans.get("stations") or {"count": 0}
+    print(f"along_route {lat:.4f},{lng:.4f} → {to_lat:.4f},{to_lng:.4f}: {ans['route']['km']} km straight, "
+          f"{ans['anchors']} anchors, corridor {ans['corridor_m']/1000:.0f} km")
+    print(f"    {ans['chargers']['count']} charge point(s) and {st['count']} station(s) along it — "
+          f"{dt:.0f} ms round trip ({ans['ms']} ms in the service, {tr.get('via')} {tr.get('bytes')} bytes)")
 
 
 def tour_story(lib, take, h, a, lat, lng):

@@ -25,24 +25,26 @@ Named queries only — the SQL lives here, the client sends parameters:
     → {"columns": [...], "rows": [[...], ...], "count": n, "complete": bool, "ms": t}
   fuel_near  {"lat", "lng", "radius_m": 3000, "fuel": "SP95", "sort": "price", "limit": 20}
     → the stations selling that fuel within the radius, cheapest first, today's price
-  tour       {"stops": [id, ...], "closed": true, "along_m": 80, "along_min_kw": 0, "fuel": "SP95", "fuel_m": 1500, "roads": true}
-    → by road when Valhalla answers (the matrix orders, /route draws), straight lines otherwise
-  route      {"points": [{"lat","lng"}, …], "costing": "auto"}
-    → the road between the points: polyline, km, minutes, legs (Valhalla; an error without it)
+  tour       {"stops": [id, ...], "closed": true, "along_m": 80, "along_min_kw": 0, "fuel": "SP95", "fuel_m": 1500}
+    → the shortest round trip through the stops (exact to 9, nearest-neighbour then 2-opt
+      beyond), its legs and polyline, and the charge points within along_m of the way
   along_route {"points": [{"lat","lng"}, …], "corridor_m": 5000, "min_kw": 0, "fuel": "SP95", "limit": 500}
-    → the road, plus the charge points and stations within `corridor_m` of it, in TRAVEL
-      order. A disc around a centre cannot say "along the way": its edge is wherever the
-      row limit ran out, so it moves with local density (§10hx). A corridor's edge is the
-      road, so the same route answers the same thing every time.
-    → the shortest round trip through the stops (exact to 9, 2-opt beyond, straight lines
-      until Valhalla), its legs and polyline, and the POIs within along_m of the route
-      as an answer a phone keeps like any other
+    → the way through the points, plus the charge points and stations within `corridor_m`
+      of it, in TRAVEL order. A disc around a centre cannot say "along the way": its edge
+      is wherever the row limit ran out, so it moves with local density (§10hx). A
+      corridor's edge is the way, so the same route answers the same thing every time.
+
+§10ie: the lines are STRAIGHT. Valhalla drew them by road until it was dropped — a 4 GB
+extract, a 10 GB graph and a container per region, for something that said nothing about
+replication, tenancy or a phone that can write. Measured before removing it, Nantes to
+Angers: the road is 15% longer and its 5 km corridor holds 133 charge points against the
+straight line's 113, differing by 36 found and 16 phantom.
 The answer is the chain object's shape, so a phone applies it with `zb_client_ingest`.
 A bounding box on (lat, lng) over the replica's index, then the haversine distance to
 order and cut at the radius. Every libzb call is serialized through one lock: the card
 is not made for two threads.
 """
-import argparse, ctypes, json, math, os, pathlib, socket, sys, time, urllib.error, urllib.request
+import argparse, ctypes, json, math, os, pathlib, socket, sys, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
@@ -140,7 +142,7 @@ def haversine(a, b) -> float:
 def tsp_order(points: list, closed: bool, matrix: list | None = None) -> list:
     """The voyageur de commerce over a handful of stops: exact for up to 9 (every permutation
     of the stops after the first), nearest-neighbour then 2-opt beyond. Straight-line
-    distances — a road network (Valhalla) is the planned replacement of `haversine` here."""
+    distances — straight-line, since §10ie dropped the road engine."""
     n = len(points)
     if n <= 2:
         return list(range(n))
@@ -208,31 +210,15 @@ def tour(card: Card, q: dict) -> dict:
             stops.append({"id": None, "name": x.get("name"), "lat": float(x["lat"]), "lng": float(x["lng"])})
     closed = bool(q.get("closed", True))
     pts = [(s["lat"], s["lng"]) for s in stops]
-    roads = None
-    if q.get("roads", True):
-        # By road when Valhalla answers: the matrix orders the stops, /route draws the way.
-        try:
-            roads = road_matrix(pts, q.get("costing", "auto"))
-        except Exception as e:
-            roads = None
-            road_error = str(e)[:100]
-    order = tsp_order(pts, closed, matrix=roads)
+    # §10ie: straight lines. The matrix that used to order these stops by road is gone
+    # with Valhalla; `tsp_order` falls back to its own distances, which is what it did
+    # whenever the engine was unreachable anyway.
+    order = tsp_order(pts, closed, matrix=None)
     seq = [stops[i] for i in order]
     path = seq + ([seq[0]] if closed else [])
     legs = [{"from": path[k]["name"] or path[k]["id"], "to": path[k + 1]["name"] or path[k + 1]["id"],
              "m": round(haversine((path[k]["lat"], path[k]["lng"]), (path[k + 1]["lat"], path[k + 1]["lng"])))} for k in range(len(path) - 1)]
     polyline = [[p["lat"], p["lng"]] for p in path]
-    by_road = None
-    if roads is not None:
-        try:
-            rr = road_route([(p["lat"], p["lng"]) for p in path], q.get("costing", "auto"))
-            polyline = rr["polyline"]
-            for k, leg in enumerate(rr["legs"]):
-                if k < len(legs):
-                    legs[k]["m"] = round(leg["km"] * 1000); legs[k]["min"] = leg["min"]
-            by_road = {"km": rr["km"], "min": rr["min"]}
-        except Exception as e:
-            road_error = str(e)[:100]
     along_m = float(q.get("along_m", 80))
     along = {"columns": [], "rows": [], "count": 0}
     # The corridor follows the way as drawn: the road polyline when there is one.
@@ -278,7 +264,7 @@ def tour(card: Card, q: dict) -> dict:
             "fuel": cheapest,
             "stops": [{"name": s["name"], "lat": s["lat"], "lng": s["lng"]} for s in seq],
             "legs": legs, "total_m": sum(l["m"] for l in legs), "closed": closed,
-            "polyline": polyline, "by_road": by_road, "road_error": locals().get("road_error"), "along": along,
+            "polyline": polyline, "straight": True, "along": along,
             "ms": round((time.time() - t0) * 1000, 1)}
 
 
@@ -315,104 +301,26 @@ def fuel_near(card: Card, q: dict) -> dict:
     return {"fuel": fuel, "columns": r["columns"], "rows": r["rows"], "count": len(r["rows"]), "ms": round((time.time() - t0) * 1000, 1)}
 
 
-# ── roads: Valhalla (examples/08-map/valhalla) ──────────────────────────────────────
 
-VALHALLA = os.environ.get("VALHALLA_URL", "http://localhost:8002")
-
-
-def _refused(e) -> dict:
-    """Valhalla said no. Its own words, plus the one fact that explains most of them:
-    the graph covers only the extract it was built from (examples/08-map/valhalla), so a
-    point outside that region — or in the sea, or on no road at all — has no edges to
-    start from. `error_code` 171 is exactly that case."""
-    return {"error": f"no route: {e.reason}", "valhalla_error_code": e.code,
-            "valhalla": VALHALLA,
-            "hint": "both points must sit on a road inside the routing graph's extract"}
+# ── the way between points ──────────────────────────────────────────────────────────
 
 
-class ValhallaRefused(Exception):
-    """Valhalla ANSWERED, and said no. A different thing from not answering at all, and
-    the two need different words: one means "your points are wrong", the other means
-    "the container is down"."""
+def straight_way(points: list) -> dict:
+    """The way through the points as the crow flies: the points ARE the polyline.
 
-    def __init__(self, reason: str, code=None):
-        super().__init__(reason)
-        self.reason = reason
-        self.code = code
-
-
-def valhalla(path: str, body: dict, timeout=10.0) -> dict:
-    req = urllib.request.Request(f"{VALHALLA}{path}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        # ⚠️ `str(HTTPError)` is "HTTP Error 400: Bad Request" and nothing more. Valhalla's
-        # own reason — "No suitable edges near location", error_code 171 — is in the BODY,
-        # and it is the only part that tells anyone what to do about it.
-        reason, code = f"HTTP {e.code}", None
-        try:
-            d = json.loads(e.read())
-            reason = d.get("error") or reason
-            code = d.get("error_code")
-        except Exception:
-            pass
-        raise ValhallaRefused(reason, code) from None
-
-
-def decode_polyline6(s: str) -> list:
-    """Valhalla's shape: Google's polyline encoding at precision 6 → [[lat, lng], …]."""
-    out, i, lat, lng = [], 0, 0, 0
-    while i < len(s):
-        for which in (0, 1):
-            shift = result = 0
-            while True:
-                b = ord(s[i]) - 63; i += 1
-                result |= (b & 0x1f) << shift; shift += 5
-                if b < 0x20: break
-            d = ~(result >> 1) if result & 1 else result >> 1
-            if which == 0: lat += d
-            else: lng += d
-        out.append([lat / 1e6, lng / 1e6])
-    return out
-
-
-def road_route(points: list, costing="auto") -> dict:
-    """Two or more points → the road between them: polyline, km, minutes, per-leg km."""
-    r = valhalla("/route", {"locations": [{"lat": p[0], "lon": p[1]} for p in points], "costing": costing, "units": "kilometers"})
-    trip = r["trip"]
-    poly = []
-    legs = []
-    for leg in trip["legs"]:
-        pts = decode_polyline6(leg["shape"])
-        poly += pts if not poly else pts[1:]
-        legs.append({"km": round(leg["summary"]["length"], 2), "min": round(leg["summary"]["time"] / 60, 1)})
-    return {"polyline": poly, "km": round(trip["summary"]["length"], 2), "min": round(trip["summary"]["time"] / 60, 1), "legs": legs}
-
-
-def road_matrix(points: list, costing="auto") -> list:
-    """The distance matrix between the points, in km, from /sources_to_targets."""
-    locs = [{"lat": p[0], "lon": p[1]} for p in points]
-    r = valhalla("/sources_to_targets", {"sources": locs, "targets": locs, "costing": costing, "units": "kilometers"})
-    return [[cell["distance"] if cell.get("distance") is not None else 1e9 for cell in row] for row in r["sources_to_targets"]]
-
-
-def route(card: Card, q: dict) -> dict:
-    """{"points": [{"lat","lng"}, …], "costing": "auto"|"bicycle"|"pedestrian"} → the road
-    between them, in order: polyline, km, minutes, legs. Straight lines never: without
-    Valhalla the answer says so."""
-    t0 = time.time()
-    pts = [(float(p["lat"]), float(p["lng"])) for p in q.get("points", [])]
-    if len(pts) < 2:
-        return {"error": "at least two points"}
-    try:
-        r = road_route(pts, q.get("costing", "auto"))
-    except ValhallaRefused as e:
-        return _refused(e)
-    except Exception as e:
-        return {"error": f"valhalla unreachable: {str(e)[:120]}", "valhalla": VALHALLA}
-    r["ms"] = round((time.time() - t0) * 1000, 1)
-    return r
+    §10ie: this replaced Valhalla, which used to draw it by road. A routing engine is a
+    4 GB extract, a 10 GB graph and a container per region, and it contributed nothing
+    to what this demo is about — replication, tenancy, and a phone that can write. What
+    it bought, measured on Nantes to Angers: a line 15% longer (92.4 km against 80.0)
+    and a 5 km corridor holding 133 charge points against 113, differing by 36 found and
+    16 phantom. Real for a driver, nothing for the architecture. `along_route` and `tour`
+    take the straight line and say so; the corridor machinery never cared where the
+    polyline came from.
+    """
+    legs = [{"km": round(haversine(points[k], points[k + 1]) / 1000, 2)} for k in range(len(points) - 1)]
+    return {"polyline": [[p[0], p[1]] for p in points],
+            "km": round(sum(leg["km"] for leg in legs), 2),
+            "legs": legs, "straight": True}
 
 
 def _num(x):
@@ -514,12 +422,7 @@ def along_route(card: Card, q: dict) -> dict:
     fuel = q.get("fuel") or None
     if fuel is not None and fuel not in FUELS:
         return {"error": f"unknown fuel {fuel!r}", "known": list(FUELS)}
-    try:
-        road = road_route(pts, q.get("costing", "auto"))
-    except ValhallaRefused as e:
-        return _refused(e)
-    except Exception as e:
-        return {"error": f"valhalla unreachable: {str(e)[:120]}", "valhalla": VALHALLA}
+    road = straight_way(pts)
     shape = road["polyline"]
     step = width / 2
     anchors, length = densify(shape, step)
@@ -573,7 +476,7 @@ def along_route(card: Card, q: dict) -> dict:
             "ms": round((time.time() - t0) * 1000, 1)}
 
 
-QUERIES = {"chargers_near": chargers_near, "tour": tour, "fuel_near": fuel_near, "route": route, "along_route": along_route}
+QUERIES = {"chargers_near": chargers_near, "tour": tour, "fuel_near": fuel_near, "along_route": along_route}
 
 
 def serve(card: Card, tenants: list[str], queue: str, label: str) -> None:
@@ -608,7 +511,6 @@ def serve(card: Card, tenants: list[str], queue: str, label: str) -> None:
 
 
 def main():
-    global VALHALLA
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--url", default=os.environ.get("NATS_URL", "nats://127.0.0.1:4222"))
     # §10hk: a responder principal — reads like a client, answers, cannot write. Minted by
@@ -620,9 +522,7 @@ def main():
     ap.add_argument("--tenants", default="kilo,_default")
     ap.add_argument("--queue", default="pois")
     ap.add_argument("--label", default=f"{socket.gethostname()}:{os.getpid()}", help="the instance's name in every answer (answered_by)")
-    ap.add_argument("--valhalla", default=VALHALLA, help="the routing engine (examples/08-map/valhalla); the tour and route go by road when it answers")
     a = ap.parse_args()
-    VALHALLA = a.valhalla.rstrip("/")
     lib = load_lib()
     card = Card(lib, {"natsUrl": a.url, "credsPath": a.creds, "principal": a.principal, "dbPath": a.db, "engine": a.engine,
                       "tables": TABLES, "clientId": "poi-service", "heartbeatMs": 0, "seedStreaming": True})

@@ -15164,3 +15164,91 @@ drew from a persisted table, where refusing to ask was harmless because somethin
 already there. Nothing marked it as depending on that, so it stayed correct-looking
 through the change that made it wrong.
 
+## §10ie — Valhalla dropped
+
+The phone drew a road between the two route pins; the browser drew a dashed straight
+line and never asked. Same shared document, two renderings. Asked which way to converge,
+the owner chose to remove the routing engine rather than teach the browser to use it.
+
+The reasoning, in their words earlier: "nice but does not bring much, only complication".
+The cost was a 372 MB extract and a 277 MB graph per region, 4 GB and about 10 GB for
+France, and a container to keep alive — which vanished on its own once during this
+session. Against that it contributed nothing to what the demo is about: replication,
+tenancy, and a phone that can write.
+
+Measured before removing it, Nantes to Angers:
+
+| | road | straight |
+| --- | --- | --- |
+| distance | 92.39 km | 80.02 km |
+| charge points in a 5 km corridor | 133 | 113 |
+| found by both | 97 | 97 |
+| only this one finds | 36 | 16 |
+
+So the straight line gets about three quarters of it right and offers 16 points nobody
+would drive past. Real for a driver, nothing for the architecture.
+
+What went: the `route` query, `valhalla()`, `ValhallaRefused`, `_refused`,
+`road_route`, `road_matrix`, `decode_polyline6`, the `--valhalla` flag, the `urllib`
+imports, the tour's road matrix and road polyline, and `examples/08-map/valhalla/README.md`.
+The container was removed; its 909 MB of extract and tiles stays on disk under
+`custom_files/`, still git-ignored, for the owner to reclaim.
+
+What stayed: everything that mattered. `straight_way` returns the points as the polyline
+and marks the answer `straight: true`. `along_route` is unchanged apart from where its
+shape comes from — the densify, anchor and distance machinery never cared whether the
+polyline came from a routing engine or from two taps, which was the argument for
+removing the dependency rather than the feature. The phone now draws the same dashed
+straight line the browser always drew, dashed on purpose so nothing claims to be a road.
+
+Verified with no container running at all: chargers 18 points in 5.2 ms, fuel 17
+stations in 4.3 ms, `along_route` 113 chargers along 80.02 km in 8.3 ms with travel
+order intact and the corridor holding 96.8% of its width, `tour` 3 stops over 18,803 m.
+`along_route` got FASTER, 75 ms to 17 ms, because the service no longer waits on an
+HTTP call to another process before it can query anything.
+
+## §10if — holding an end, instead of taking turns
+
+Neither client could move one end of the route twice in a row. Both had the same rule:
+a click or tap sets the NEXT register and alternates, start then end then start. The
+browser's own button said so — "click to move start, then end". So nudging the start
+three times meant clicking six times and putting the end back twice.
+
+Alternating is GONE from both, not merely overridable — keeping it as the fallback still
+left the phone alternating in practice, which is what the owner saw. One rule now, the
+same in Dart and TypeScript:
+
+|  state | a tap on the map moves |
+| --- | --- |
+| nothing placed | `start` |
+| only `start` placed | `end` |
+| both placed, one held | the held one |
+| both placed, none held | the NEAREST, which it then holds |
+
+The last two rows are the point. Whatever a tap moves becomes the held end, so the next
+tap moves the same one — "move this, then move it again" needs no separate select step,
+and holding an end NEVER switches to the other however close the tap lands. Tapping a pin
+holds it explicitly, tapping it again lets go. The held pin is drawn larger with a
+thicker ring and the status line names it. Checked against the table above, six cases,
+both implementations reading the same document.
+
+The browser gets drag as well, which is free there: a `circleMarker` is not draggable, so
+the pin's `mousedown` disables map dragging and follows `mousemove` until `mouseup`, then
+writes the final position. One `moveEnd(key, latlng)` is the only thing that writes, so a
+click and a drag take the same path. The phone keeps tap-to-hold: true drag in flutter_map
+needs either a plugin or hand-rolled screen-to-LatLng conversion, and it buys nothing a
+tap does not on a touch screen.
+
+Nothing changed underneath. Each move is still this client's own register with its own
+stamp and writer, still written as the union merged into the document it last saw.
+Checked on the merge itself — the phone holding `start` through three consecutive moves
+while the browser holds `end` through two:
+
+    phone then browser: start 49.1 by phone, end 49.2 by browser
+    browser then phone: start 49.1 by phone, end 49.2 by browser
+    commutative: True   idempotent: True
+
+Which is the property that made holding an end safe to add: the two editors are writing
+different keys, and even when they are not, the register with the later stamp wins and
+both orders agree.
+

@@ -188,7 +188,9 @@ const routeInfo = el<HTMLElement>('routeInfo');
 let routeMode = false;
 let routeDoc: Record<string, any> = {};
 const routeMine: Record<string, any> = {};   // this browser's own registers, shipped whole
-let routeNext: 'start' | 'end' = 'start';
+/// §10if: which end a click moves. Null means the old behaviour — alternate start, end,
+/// start — which cannot move ONE end twice in a row. Click a pin to take hold of it.
+let routeSelected: 'start' | 'end' | null = null;
 let routeRounds = 0;
 
 /// The stamp every editor orders the same way: RFC 3339 UTC, six fractional digits.
@@ -212,13 +214,42 @@ function drawRoute(lastWriter = '') {
     if (typeof v?.lat !== 'number' || typeof v?.lng !== 'number') continue;
     const here = L.latLng(v.lat, v.lng);
     pins.push(here);
-    L.circleMarker(here, { radius: 8, color: '#1f6feb', fillColor: key === 'start' ? '#fff' : '#1f6feb', fillOpacity: 1 })
+    const held = routeSelected === key;
+    const m = L.circleMarker(here, {
+      radius: held ? 11 : 8,
+      color: '#1f6feb',
+      weight: held ? 4 : 3,
+      fillColor: key === 'start' ? '#fff' : '#1f6feb',
+      fillOpacity: 1,
+    })
       .bindTooltip(`${key} · by ${routeDoc[key].w} at ${String(routeDoc[key].t).slice(11, 23)}`, { permanent: false })
       .addTo(routeLayer);
+    // Clicking a pin SELECTS it and must not also place one: the map's own handler
+    // would otherwise fire for the same click.
+    m.on('click', (e: L.LeafletMouseEvent) => {
+      L.DomEvent.stopPropagation(e);
+      routeSelected = routeSelected === key ? null : key;
+      drawRoute(lastWriter);
+    });
+    // And dragging it moves that end directly — a circleMarker is not draggable, so the
+    // drag is done by hand on the map's pointer events while the pin is held.
+    m.on('mousedown', (e: L.LeafletMouseEvent) => {
+      L.DomEvent.stopPropagation(e);
+      routeSelected = key;
+      map.dragging.disable();
+      const move = (ev: L.LeafletMouseEvent) => { m.setLatLng(ev.latlng); };
+      const up = (ev: L.LeafletMouseEvent) => {
+        map.off('mousemove', move); map.off('mouseup', up);
+        map.dragging.enable();
+        moveEnd(key, ev.latlng);
+      };
+      map.on('mousemove', move); map.on('mouseup', up);
+    });
   }
   if (pins.length === 2) L.polyline(pins, { color: '#1f6feb', weight: 4, dashArray: '6 6' }).addTo(routeLayer);
   const who = ['start', 'end'].filter((k) => routeDoc[k]).map((k) => `${k} by ${routeDoc[k].w}`).join(', ');
-  routeInfo.textContent = routeMode ? `${who || 'tap the map'}${lastWriter ? ` · row by ${lastWriter}` : ''}` : '';
+  const holding = routeSelected ? `holding ${routeSelected} — click to move it, click the other pin to switch · ` : '';
+  routeInfo.textContent = routeMode ? `${holding}${who || 'click the map'}${lastWriter ? ` · row by ${lastWriter}` : ''}` : '';
 }
 
 async function writeRoute() {
@@ -226,18 +257,42 @@ async function writeRoute() {
   await zb.mutate('routes', 'UPDATE', { id: ROUTE_ID }, { doc: merged });
 }
 
+/// One end moved, by a click on the map or by a drag of the pin. Draw nothing here: the
+/// pins come from the ROW, so what is on screen is what the row holds — including the
+/// other editor's moves.
+function moveEnd(key: 'start' | 'end', at: L.LatLng) {
+  routeMine[key] = { v: { lat: at.lat, lng: at.lng }, t: stamp(), w: writer };
+  void writeRoute().catch((err) => say(`route: ${err}`));
+}
+
+/// §10if: which end a click moves. There is NO alternating any more.
+///
+///   * nothing placed yet  -> the click places `start`
+///   * only `start` placed -> it places `end`
+///   * both placed         -> the HELD end, or the NEAREST one, which it then holds
+///
+/// The last rule is what makes "move this one, then move it again" work without a
+/// separate select step. Alternating made moving `start` twice in a row impossible.
+function routeTarget(at: L.LatLng): 'start' | 'end' {
+  if (routeSelected) return routeSelected;
+  const s = routeDoc.start?.v, e = routeDoc.end?.v;
+  if (!s || typeof s.lat !== 'number') return 'start';
+  if (!e || typeof e.lat !== 'number') return 'end';
+  return map.distance(at, L.latLng(s.lat, s.lng)) <= map.distance(at, L.latLng(e.lat, e.lng))
+    ? 'start' : 'end';
+}
+
 map.on('click', (e: L.LeafletMouseEvent) => {
   if (!routeMode) return;
-  routeMine[routeNext] = { v: { lat: e.latlng.lat, lng: e.latlng.lng }, t: stamp(), w: writer };
-  routeNext = routeNext === 'start' ? 'end' : 'start';
-  // Draw nothing yet: the pins come from the ROW, so what is on screen is what the
-  // row holds — including the other editor's moves.
-  void writeRoute().catch((err) => say(`route: ${err}`));
+  const which = routeTarget(e.latlng);
+  routeSelected = which;   // whatever the click moved is now held
+  moveEnd(which, e.latlng);
 });
 
 routeButton.addEventListener('click', () => {
   routeMode = !routeMode;
-  routeButton.textContent = `route: ${routeMode ? 'on — click to move start, then end' : 'off'}`;
+  if (!routeMode) routeSelected = null;
+  routeButton.textContent = `route: ${routeMode ? 'on — click near an end to hold it, or drag it' : 'off'}`;
   drawRoute();
 });
 
