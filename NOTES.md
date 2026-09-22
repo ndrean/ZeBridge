@@ -15384,3 +15384,53 @@ cleanly on this toolchain. `plugins/with-fmt-consteval.js` should be deleted at 
 upgrade, and it says so at the top. The plugin raises rather than silently doing nothing
 if `base.h` stops matching, so a future fmt cannot leave it quietly ineffective.
 
+## §10ij — it runs on a phone
+
+`examples/08-map/native` is on the iOS simulator, drawing MapLibre tiles and answering
+from the service over NATS WebSocket. The status line, live on screen:
+
+    108 charger(s) · inline 40548 B · wire 64 ms · db 9.6 ms · 120 ms total
+
+That is §10hu's transport block on a phone, and §10ic's rule holding: the markers are the
+ANSWER, nothing is stored, a pan re-asks and draws what came back. No Zig was compiled.
+
+Getting from "Build Succeeded" to a bundle took four fixes, and only ONE was a package
+genuinely missing. Worth recording because none of them were in code we wrote.
+
+**pnpm's strict layout versus React Native's flat assumption.** `Unable to resolve
+"@babel/runtime/helpers/interopRequireDefault"`. RN's toolchain expects a flat
+`node_modules`; pnpm hides transitive packages on purpose. `node-linker=hoisted` is the
+supported shape — and the `.npmrc` alone was IGNORED, it took
+`--config.node-linker=hoisted` on the command line (20 top-level entries before, 523
+after). `pnpm add @babel/runtime` also resolved 8.0.5, a major ahead of what RN's Babel
+preset emits helpers for; pinned to ^7.
+
+**An undeclared dependency.** expo-router 4.0.22 requires `query-string` and does not
+declare it — it resolves under npm only because something else in the tree happens to
+provide it. pnpm did not cause that bug, it revealed it. The app has ONE screen, so the
+router went rather than the missing package being papered over, taking expo-linking,
+expo-constants and two navigation packages with it.
+
+**`unstable_enablePackageExports` — the one that cost the most and taught the most.**
+`Unable to resolve "@nats-io/nats-core"` while the package sat in both node_modules
+trees. It declares no `main` and no `module`, only an `exports` map, and Metro does not
+read `exports` by default at this version. So it found no entry point and reported the
+module as MISSING rather than as unreadable — two different failures with one message,
+which sent me chasing symlinks and resolution paths twice before looking at the manifest.
+Vite reads export maps, which is exactly why the browser app has never hit it. The
+control was sitting there the whole time.
+
+**A stub for `node:` builtins.** `@nats-io/obj` picks its SHA-256 backend at RUN time:
+the default is pure JS and browser-safe, and only `setSha256Backend("native")` reaches
+for `node:crypto` — through a dynamic import Metro resolves STATICALLY, so an
+unreachable branch broke the bundle. The stub THROWS rather than returning a no-op: a
+silent empty digest would have surfaced much later as a corrupt large answer.
+
+Two of the four were bundlers analysing code that never executes. A library supporting
+several runtimes fails on the strictest bundler rather than the weakest, and the message
+names the wrong culprit.
+
+Also learnt: a dev-client app launched with `simctl launch` gets no bundler URL and shows
+"No script URL provided"; it has to be opened through its
+`<scheme>://expo-development-client/?url=…` deep link.
+
