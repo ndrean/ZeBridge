@@ -42,7 +42,7 @@ A bounding box on (lat, lng) over the replica's index, then the haversine distan
 order and cut at the radius. Every libzb call is serialized through one lock: the card
 is not made for two threads.
 """
-import argparse, ctypes, json, math, os, pathlib, socket, sys, time, urllib.request
+import argparse, ctypes, json, math, os, pathlib, socket, sys, time, urllib.error, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LIB = ROOT / "libzb" / "zig-out" / "lib" / ("libzbcore.dylib" if sys.platform == "darwin" else "libzbcore.so")
@@ -320,10 +320,44 @@ def fuel_near(card: Card, q: dict) -> dict:
 VALHALLA = os.environ.get("VALHALLA_URL", "http://localhost:8002")
 
 
+def _refused(e) -> dict:
+    """Valhalla said no. Its own words, plus the one fact that explains most of them:
+    the graph covers only the extract it was built from (examples/08-map/valhalla), so a
+    point outside that region — or in the sea, or on no road at all — has no edges to
+    start from. `error_code` 171 is exactly that case."""
+    return {"error": f"no route: {e.reason}", "valhalla_error_code": e.code,
+            "valhalla": VALHALLA,
+            "hint": "both points must sit on a road inside the routing graph's extract"}
+
+
+class ValhallaRefused(Exception):
+    """Valhalla ANSWERED, and said no. A different thing from not answering at all, and
+    the two need different words: one means "your points are wrong", the other means
+    "the container is down"."""
+
+    def __init__(self, reason: str, code=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.code = code
+
+
 def valhalla(path: str, body: dict, timeout=10.0) -> dict:
     req = urllib.request.Request(f"{VALHALLA}{path}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # ⚠️ `str(HTTPError)` is "HTTP Error 400: Bad Request" and nothing more. Valhalla's
+        # own reason — "No suitable edges near location", error_code 171 — is in the BODY,
+        # and it is the only part that tells anyone what to do about it.
+        reason, code = f"HTTP {e.code}", None
+        try:
+            d = json.loads(e.read())
+            reason = d.get("error") or reason
+            code = d.get("error_code")
+        except Exception:
+            pass
+        raise ValhallaRefused(reason, code) from None
 
 
 def decode_polyline6(s: str) -> list:
@@ -373,8 +407,10 @@ def route(card: Card, q: dict) -> dict:
         return {"error": "at least two points"}
     try:
         r = road_route(pts, q.get("costing", "auto"))
+    except ValhallaRefused as e:
+        return _refused(e)
     except Exception as e:
-        return {"error": f"valhalla unreachable or refused: {str(e)[:120]}", "valhalla": VALHALLA}
+        return {"error": f"valhalla unreachable: {str(e)[:120]}", "valhalla": VALHALLA}
     r["ms"] = round((time.time() - t0) * 1000, 1)
     return r
 
@@ -480,8 +516,10 @@ def along_route(card: Card, q: dict) -> dict:
         return {"error": f"unknown fuel {fuel!r}", "known": list(FUELS)}
     try:
         road = road_route(pts, q.get("costing", "auto"))
+    except ValhallaRefused as e:
+        return _refused(e)
     except Exception as e:
-        return {"error": f"valhalla unreachable or refused: {str(e)[:120]}", "valhalla": VALHALLA}
+        return {"error": f"valhalla unreachable: {str(e)[:120]}", "valhalla": VALHALLA}
     shape = road["polyline"]
     step = width / 2
     anchors, length = densify(shape, step)

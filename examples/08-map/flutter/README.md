@@ -53,9 +53,9 @@ same war between two libzb clients, asserted.
 
 ## Run
 
-The dev stack (PostgreSQL, nats-server, the bridge on `my_pub`/`my_slot`), the library built with `zig build -Doptimize=ReleaseFast` in `libzb/`, the paths at the top of `lib/main.dart` (alice's creds, the pmtiles file), then `flutter run -d macos`.
+The dev stack (PostgreSQL, nats-server, the bridge on `my_pub`/`my_slot`), the library built with `zig build -Doptimize=ReleaseFast -Dduckdb=true` in `libzb/` (the map service needs the DuckDB engine; the plain build silently omits it), the creds path at the top of `lib/main.dart`, then `flutter run -d macos`.
 
-The vector tiles come from `test_region.pmtiles` with the Protomaps light theme (the source is named `protomaps`); without the file the map falls back to OSM raster tiles.
+The vector tiles come from `france.pmtiles` on R2, through the Worker in `../worker`, read by HTTP range request so only the tiles in view travel. That is the ONE source. A local `test_region.pmtiles` used to stand behind it as a fallback and has been removed: a second archive that nobody refreshes draws a different map and says nothing about it. When the archive is unreachable the map shows plain OSM raster tiles and the status line says why.
 
 API keys, if any, live in `.env*` files, which git ignores.
 

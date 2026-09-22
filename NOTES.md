@@ -15032,3 +15032,135 @@ fetched in 3 ms; a three-stop 282.93 km route at 25 km wide is 359 KB fetched in
 Travel order held on every one, and the refusals are named: fewer than two points, an
 unknown fuel, a point off the graph.
 
+## §10ia — "unreachable or refused" was two different problems
+
+The phone reported a failed route as `route Exception: unreachable or refused`, which
+names neither the cause nor anything to do about it. Two bugs stacked.
+
+**The service conflated them.** `route` and `along_route` both caught bare `Exception`
+and answered "valhalla unreachable or refused". A container that is down and a container
+that is refusing THIS request need different words: one is an operator's problem, the
+other is a tap in the wrong place.
+
+**Python threw the reason away.** Valhalla answers a bad point with HTTP 400 and a body
+of `{"error_code":171,"error":"No suitable edges near location"}`. `urllib` raises
+`HTTPError`, whose `str()` is "HTTP Error 400: Bad Request" and nothing else. The one
+sentence worth reading is in the body, which the exception discards unless the body is
+read off the error object.
+
+`valhalla()` now reads it and raises `ValhallaRefused(reason, code)`; one `_refused`
+helper words the answer so the two queries cannot drift. A refusal answers
+`no route: No suitable edges near location` with the code and a hint; only a genuine
+connection failure says `valhalla unreachable`.
+
+**The app turned data into an exception.** It reached for `ans['polyline'] as List`
+before checking for an `error` key, so a refusal became a cast-on-null error and the
+reason was lost a second time. A service answering "no" is DATA; only failing to reach
+it is an exception. The app now checks first, clears the drawn road, and shows the
+service's own sentence.
+
+Coverage, measured from Nantes against the Pays de la Loire tiles: Nantes, Angers, Le
+Mans, La Roche-sur-Yon, Laval, Rennes and Tours route; Poitiers and Bordeaux have no
+edges. Rennes and Tours are outside the region and still work, because the extract keeps
+the roads crossing its boundary. That is now in the valhalla README, where someone
+hitting error 171 will look.
+
+## §10ib — the tile fallback removed
+
+`_initTiles` read the France archive from R2 and, on any failure, quietly opened a local
+`test_region.pmtiles` instead — 84 MB left over from the first attempt at rendering. The
+owner asked for it gone, and the reasoning is worth keeping: a second archive that nobody
+refreshes draws a DIFFERENT map and says nothing about it, so a viewer reads a stale
+regional extract as the live national one. A map that does not draw is easier to trust
+than one that draws the wrong thing.
+
+R2 is now the one source. The archive answers range requests (HTTP 206, 3,453,344,939
+bytes, first 16 KB in 149 ms), so only the tiles in view travel. When it is unreachable
+the app still shows plain OSM raster tiles, because a grey void helps nobody, but it now
+SAYS so in the status line rather than only in the debug console: the raster map is a
+different map, and a viewer who is not told will read it as the vector one.
+
+The 84 MB file was deleted. It was git-ignored and untracked, so nothing in the
+repository referred to it; the README's run instructions named it and now name the R2
+archive. That README also learned the `-Dduckdb=true` flag (§10hw), since it was telling
+people to build libzb the plain way.
+
+## §10ic — the map draws the answer, not the history
+
+Zoomed out, the map showed clusters that had nothing to do with the viewport. The cause
+was `ingest`: every charge point answer was kept in a local on-demand table, and the
+markers were drawn from THAT. So what appeared was the union of everywhere the client
+had been. Measured earlier: one client held 2,000 rows spanning 167 km while a single
+5 km ask returns 18. The scope sweep only cleaned the current box, and only when the
+answer was complete, so anything fetched for another viewport stayed for ever.
+
+The fuel stations never had the problem, because they were never given an ingest path.
+Each answer replaces the in-memory list and the map draws that. The fix was therefore
+not to invent anything: make the chargers behave the way the stations already did. Both
+apps now hold the last answer in memory, filter it by viewport and minimum power in
+Dart and TypeScript rather than in SQL, and draw it.
+
+Measured on a client running the new flow, three asks of growing radius:
+
+| ask | answer | drawn | local table |
+| --- | --- | --- | --- |
+| 5 km | 18 | 18 | 0 rows |
+| 50 km | 306 | 306 | 0 rows |
+| 150 km | 1,620 | 1,620 | 0 rows |
+
+What is on screen is what was just asked for, so panning back shows the same thing as
+arriving the first time.
+
+`charge_points` stays DECLARED on-demand, because `mutate` needs the descriptor — it
+fails with `UnknownTable` otherwise — but not rows. A mutation still writes its
+optimistic row locally before queueing the outbox entry, so the table now holds exactly
+what this client WROTE and nothing it merely looked at. That is a better sentence than
+the one it replaces, and it is the local-first claim the demo can actually defend: not
+"every area you visited is still here", which needed tiles and a routing graph it does
+not have, but "your edit survives, converges, and is yours".
+
+Both apps keep an edit visible until an answer carries it back: the write reaches
+PostgreSQL, the replica follows it, the next ask returns it, and until then the row sits
+in the in-memory list the markers read. The large-answer path is untouched — over
+262,144 bytes the answer still travels as an object in the asking tenant's bucket with
+its 600-second life, and both datasets use it identically.
+
+## §10id — a zoom floor that survived the thing it existed for
+
+The browser reached 150 km, 1,707 points and a 664 KB object. The phone stopped at
+55 km, 132 KB inline, and stopped re-querying when panned. Same library, same service,
+same query.
+
+The difference was a `camera.zoom < 10` guard in the phone's pan handler, which cleared
+`wantedCentre` and returned. The browser never had one. Two consequences, and the second
+was created by §10ic:
+
+- **It bit before the radius cap ever could.** On a phone-sized window zoom 10 is about
+  55 km of half-diagonal, so the 150 km cap raised in §10hu was unreachable. The
+  browser's larger window plus no floor is exactly why it got there and the phone did
+  not.
+- **It blanked the map.** The floor's reason was that below zoom 10 "the map stops asking
+  and draws what it holds". Since §10ic it holds nothing, so the floor drew an empty
+  screen and refused to refill it on a pan. A guard whose justification was deleted two
+  entries earlier.
+
+Removed. The radius cap and `limit` are the bounds; a third one that silently empties the
+screen is not. Measured after, from Nantes, `limit` 2000 — the phone now reaches what the
+browser reaches, and crosses into the large-answer path between 55 and 89 km:
+
+| radius | points | bytes | via | wire | fetch |
+| --- | --- | --- | --- | --- | --- |
+| 55 km | 365 | 136,867 | inline | 96 ms | 0 ms |
+| 89 km | 765 | 299,337 | object | 127 ms | 2 ms |
+| 110 km | 1,061 | 423,592 | object | 124 ms | 2 ms |
+| 150 km | 1,620 | 661,824 | object | 128 ms | 3 ms |
+
+The owner's browser reported 781 points at 89 km and 1,707 at 150 km from a slightly
+different centre, and 297 KB and 664 KB: the same curve. The phone's "inline ~132 KB"
+was the floor's boundary, not a cap of its own.
+
+The lesson is about guards outliving their reasons. This one was written when the map
+drew from a persisted table, where refusing to ask was harmless because something was
+already there. Nothing marked it as depending on that, so it stayed correct-looking
+through the change that made it wrong.
+

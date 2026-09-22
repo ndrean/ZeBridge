@@ -1,16 +1,15 @@
 /// ZeMap in a browser: the fuel prices and the shared route, on the same client
 /// library the phone uses (NOTES §10hj, §10ho).
 ///
-/// Two features, two mechanisms, deliberately:
+/// Two mechanisms, deliberately — and §10ic collapsed the first two into one:
 ///
-///   * the CHARGE POINTS are an ASK the browser KEEPS — `charge_points` is an on-demand
-///     table here too (§10hn, §10hr): the schema arrives, the local table is created,
-///     nothing seeds it, and `ingest` keeps what each ask answered. The switch chooses
-///     the minimum power, off asks for nothing.
-///   * the FUEL prices are an ASK — `request('query.<tenant>.fuel_near')` to the POI
-///     service, answered from its DuckDB replica of all of France. Nothing is stored
-///     here: no table, no stream, no position. The page holds an answer for as long as
-///     it draws it.
+///   * the CHARGE POINTS and the FUEL prices are both an ASK —
+///     `request('query.<tenant>.<name>')` to the POI service, answered from its DuckDB
+///     replica of all of France. Nothing is stored here: no table, no stream, no
+///     position. The page holds an answer for as long as it draws it. The chargers used
+///     to be kept with `ingest`, and that made the map draw the union of everywhere this
+///     browser had been rather than what was in view. `charge_points` stays declared
+///     on-demand so the descriptor is there, but nothing is written to it.
 ///   * the shared ROUTE is a ROW — `routes.doc`, a jsonb map of registers, replicated
 ///     into this browser's OPFS SQLite like any table, written with `mutate`. Two
 ///     editors converge because each ships the union of its own registers merged into
@@ -90,16 +89,14 @@ async function askChargers() {
     const ans = await zb.request(`query.${TENANT}.chargers_near`, {
       lat: c.lat, lng: c.lng, radius_m: Math.round(radius), ...(minKw > 0 ? { min_kw: minKw } : {}), limit: 2000,
     }, 15000);
-    // The scope — "what I hold in this box and the answer lacks is gone" — only when the
-    // answer is complete; one cut by the limit says nothing about the rest.
-    const dlat = radius / 111320, dlng = radius / (111320 * Math.max(0.1, Math.cos(c.lat * Math.PI / 180)));
-    const scope = ans.complete === true
-      ? { where: 'lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?', params: [c.lat - dlat, c.lat + dlat, c.lng - dlng, c.lng + dlng] }
-      : null;
-    const kept = await zb.ingest('charge_points', ans, minKw > 0 ? null : scope);
+    // §10ic: NOT ingested. The answer IS the layer. Persisting it made the map draw the
+    // union of everywhere this browser had been rather than what was in view, so a
+    // zoom-out showed clusters from earlier pans. The stations were never ingested and
+    // never had the problem; the chargers now work the same way.
+    chargerRows = asMaps(ans);
     const ms = Math.round(performance.now() - t0);
-    await drawChargers();
-    say(`${ans.count} charge point(s) within ${(radius / 1000).toFixed(1)} km · ${transport(ans)} · ${ms} ms total · ${kept} kept`);
+    drawChargers();
+    say(`${ans.count} charge point(s) within ${(radius / 1000).toFixed(1)} km · ${transport(ans)} · ${ms} ms total`);
   } catch (e) {
     say(`chargers: ${e} — is the map service running?`);
   } finally {
@@ -107,17 +104,26 @@ async function askChargers() {
   }
 }
 
-/// Drawn from the LOCAL table, never from the answer: what is on screen is what this
-/// browser holds, which is also what it would show with the network gone.
-async function drawChargers() {
+/// The last answer, unfiltered. Not a local table (§10ic).
+let chargerRows: any[] = [];
+
+/// An answer's `columns`/`rows` as objects, the shape the markers read.
+const asMaps = (ans: any): any[] => {
+  const cols: string[] = ans.columns ?? [];
+  return (ans.rows ?? []).map((r: any[]) => Object.fromEntries(cols.map((c, i) => [c, r[i]])));
+};
+
+/// Drawn from the ANSWER, narrowed to what is on screen and above the chosen power.
+/// No SQL and no round trip: a filter over the rows the last ask returned.
+function drawChargers() {
   chargerLayer.clearLayers();
   if (chargerSelect.value === '') return;
   const minKw = Number(chargerSelect.value);
   const b = map.getBounds();
-  const rows = await zb.query(
-    `SELECT id, lat, lng, title, max_power_kw, points, status_type_id, ocm_id FROM charge_points
-      WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? AND coalesce(max_power_kw, 0) >= ? LIMIT 3000`,
-    b.getSouth(), b.getNorth(), b.getWest(), b.getEast(), minKw);
+  const rows = chargerRows.filter((r) =>
+    r.lat >= b.getSouth() && r.lat <= b.getNorth() &&
+    r.lng >= b.getWest() && r.lng <= b.getEast() &&
+    Number(r.max_power_kw ?? 0) >= minKw);
   for (const r of rows) {
     const kw = Number(r.max_power_kw ?? 0);
     const colour = r.ocm_id == null ? '#d9480f' : r.status_type_id !== 50 ? '#999' : kw >= 43 ? '#1a7f37' : '#1f6feb';

@@ -32,8 +32,22 @@ is 372 MB).
     curl -s http://localhost:8002/route --data '{"locations":[{"lat":47.2184,"lon":-1.5536},{"lat":47.2076,"lon":-1.5497}],"costing":"auto","units":"kilometers"}' \
       | python3 -c 'import json,sys; r=json.load(sys.stdin)["trip"]; print(r["summary"]["length"], "km,", round(r["summary"]["time"]/60), "min")'
 
-Nantes centre to the Île de Nantes, a couple of kilometres, a few minutes. A point
-outside the extract answers `No path could be found` — the graph's edge, not a fault.
+Nantes centre to the Île de Nantes, a couple of kilometres, a few minutes.
+
+## Where it can route
+
+The graph is only as wide as the extract, plus whatever Geofabrik's regional file carries
+across its border. Measured from Nantes against the Pays de la Loire tiles:
+
+    routable   Nantes · Angers · Le Mans · La Roche-sur-Yon · Laval · Rennes · Tours
+    no edges   Poitiers · Bordeaux
+
+Rennes and Tours sit outside the region and still route, because the extract keeps the
+roads that cross its boundary. Beyond that, Valhalla answers HTTP 400 with
+`{"error_code":171,"error":"No suitable edges near location"}` — the graph's edge, not a
+fault, and the same answer a point in the sea or off any road gets. The service turns
+that into `no route: No suitable edges near location` with the code and a hint; it says
+`valhalla unreachable` only when the container really is not answering (§10ia).
 
 ## Not the DuckDB extension, for now
 

@@ -1,14 +1,18 @@
-/// ZeMap — one screen: France's vector tiles from R2, the OpenStreetMap points of
-/// interest around the viewport as markers, editable (NOTES §10hj, design B).
+/// ZeMap — one screen: France's vector tiles from R2, the charge points around the
+/// viewport as markers, editable (NOTES §10hj, design B).
 ///
-/// The phone holds what it asked for. `charge_points` is an ON-DEMAND table: libzb creates it
-/// from the descriptor, nothing seeds it and nothing is tailed — on every move the map
-/// asks the map service (`query._default.chargers_near`, a DuckDB replica of all of France
-/// answering from its own copy, PostgreSQL never asked) for the points around the
-/// centre, keeps the answer in its SQLite through the version-guarded upsert, and draws
-/// from the local table. Offline, every area visited is still there. An edit (add, rename,
-/// erase) is a `mutate` on that same local table: optimistic at once, sent to the
-/// bridge, judged upstream, and the service's replica has it before the next ask.
+/// §10ic: the phone holds what it WROTE, not what it looked at. On every move the map
+/// asks the map service (`query._default.chargers_near`, a DuckDB replica of all of
+/// France answering from its own copy, PostgreSQL never asked) and draws THAT answer.
+/// Nothing is ingested: a persisted answer made the map show the union of everywhere
+/// this phone had been rather than what was in view, and a zoom-out drew clusters from
+/// earlier pans. The stations were never ingested and never had the problem; the
+/// chargers now work the same way.
+///
+/// `charge_points` stays declared ON-DEMAND because a mutation needs the descriptor,
+/// not rows. An edit (add, rename, erase) is a `mutate`: optimistic at once, sent to the
+/// bridge, judged upstream, and the service's replica has it before the next ask. The
+/// optimistic row is the only charge point this phone stores, which is the whole point.
 ///
 /// Threading: the libzb handle is NOT thread-safe (one thread drives one client), so
 /// every call on it — sync, the blocking poll loop, query, mutate, request, ingest,
@@ -36,16 +40,19 @@ import 'zebridge.dart' show PollReport;
 import 'zebridge_worker.dart';
 
 // Dev copy: the repository paths, like 05-mobile. A shipped app bundles the creds it
-// enrolled and the pmtiles it downloaded.
+// enrolled.
 const _repo = '/Users/nevendrean/code/zig/ZeBridge';
 // `omar`, a demo principal of the dev stack (its tenant is `kilo`); the `mapper` of the
 // cell design was revoked with its grid, and a revoked principal stays revoked.
 const _credsPath = '$_repo/scripts/native/creds/omar.creds';
-const _pmtilesPath = '$_repo/examples/08-map/flutter/test_region.pmtiles';
 
 /// France at zoom 14 (3.4 GB) on Cloudflare R2, behind the Worker in ../worker: read
 /// through HTTP range requests, so only the tiles in view travel, cached at the edge.
-/// The local extract is the offline fallback.
+///
+/// The ONE source. A local `test_region.pmtiles` used to stand behind it, from the first
+/// attempt at rendering, and it was deleted: a second archive that nobody refreshes
+/// answers with a different map and says nothing about it, which is worse than a map
+/// that does not draw. If the archive is unreachable the status line says so.
 const _pmtilesUrl = 'https://ze-map-worker.ze-map.workers.dev/france.pmtiles';
 final _dbPath = '${Directory.systemTemp.path}/zb-flutter-map-omar.sqlite3';
 
@@ -91,6 +98,11 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
   bool asking = false;
   Timer? askDebounce;
   Timer? refreshDebounce;
+  /// §10ic: the LAST ANSWER, unfiltered — not a local table. Persisting the markers
+  /// made the map draw the union of everywhere the phone had been rather than what was
+  /// in view, so a zoom-out showed clusters from earlier pans. The stations never had
+  /// this problem because they were never ingested; the chargers now work the same way.
+  List<Map<String, dynamic>> chargerRows = const [];
   int held = 0;
 
   /// The fuel switch: null is off; a fuel asks the service for the stations around the
@@ -157,12 +169,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
 
   Future<void> _initTiles() async {
     try {
-      final archive =
-          await PmTilesArchive.from(_pmtilesUrl).catchError((Object e) {
-        debugPrint(
-            'pmtiles: $_pmtilesUrl unreachable ($e) — the local extract instead');
-        return PmTilesArchive.fromFile(File(_pmtilesPath));
-      });
+      final archive = await PmTilesArchive.from(_pmtilesUrl);
       if (!mounted) return;
       // The counters redraw the status line at most twice a second: a rebuild per tile
       // request would itself disturb the tiles' loading.
@@ -192,7 +199,13 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         );
       });
     } catch (e) {
-      debugPrint('pmtiles: $e (falling back to OSM raster tiles)');
+      // Said out loud, not only to the debug console: the map that draws instead is a
+      // DIFFERENT map, and a viewer who is not told will read it as the vector one.
+      debugPrint('pmtiles: $_pmtilesUrl unreachable ($e)');
+      if (mounted) {
+        setState(() => status =
+            'vector tiles unreachable — plain OSM raster instead ($e)');
+      }
     }
   }
 
@@ -225,7 +238,8 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
               status = 'offline: ${r.error} — showing what the phone holds');
           return;
         }
-        if (r.changedTables.contains(_table)) _refresh();
+        // §10ic: the markers come from the answer, so a change to the local table is
+        // this phone's own optimistic write, already merged into `chargerRows`.
         if (r.changedTables.contains('routes')) _onRouteChanged();
       });
     } catch (e) {
@@ -236,7 +250,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     }
   }
 
-  /// The replica is what the screen shows: the points held inside the viewport.
+  /// The answer is what the screen shows: its points, inside the viewport.
   /// A v4 uuid from Dart's own random: the key of a charge point this phone adds.
   static String _uuidV4() {
     final r = Random.secure();
@@ -247,45 +261,56 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
     return '${h.substring(0, 8)}-${h.substring(8, 12)}-${h.substring(12, 16)}-${h.substring(16, 20)}-${h.substring(20)}';
   }
 
+  /// The answer, narrowed to what is on screen and above the chosen power. No SQL and
+  /// no round trip: this is a filter over the rows the last ask returned.
   Future<void> _refresh() async {
-    final w = zb;
-    if (w == null) return;
-    try {
-      final b = mapController.camera.visibleBounds;
-      final rows = await w.query(
-        'SELECT id, lat, lng, title, max_power_kw, points, status_type_id, ocm_id FROM $_table '
-        'WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? '
-        'AND coalesce(max_power_kw, 0) >= ? LIMIT 3000',
-        [b.south, b.north, b.west, b.east, chargers ?? 0],
-      );
-      final all = await w.query('SELECT count(*) AS n FROM $_table');
-      if (!mounted) return;
-      setState(() {
-        pois = rows;
-        held = (all.first['n'] as num).toInt();
-      });
-    } catch (e) {
-      if (mounted) setState(() => status = 'query: $e');
-    }
+    if (!mounted) return;
+    final b = mapController.camera.visibleBounds;
+    final min = chargers ?? 0;
+    final shown = [
+      for (final r in chargerRows)
+        if (r['lat'] is num && r['lng'] is num)
+          if ((r['lat'] as num) >= b.south &&
+              (r['lat'] as num) <= b.north &&
+              (r['lng'] as num) >= b.west &&
+              (r['lng'] as num) <= b.east &&
+              ((r['max_power_kw'] as num?) ?? 0) >= min)
+            r
+    ];
+    setState(() {
+      pois = shown;
+      held = chargerRows.length;
+    });
+  }
+
+  /// The answer's `columns`/`rows` as maps, the shape the markers read.
+  List<Map<String, dynamic>> _asMaps(Map ans) {
+    final cols = List<String>.from(ans['columns'] as List);
+    return [
+      for (final r in (ans['rows'] as List))
+        {for (var i = 0; i < cols.length; i++) cols[i]: (r as List)[i]}
+    ];
   }
 
   /// The viewport moved: ask for what is around its centre. Debounced — a pan is many
   /// events — and one ask at a time. The radius is half the visible diagonal, at most
-  /// 150 km for the chargers and 20 km for the stations, which are sparse. Below zoom
-  /// 10 (a département on screen) the map stops asking and draws what it holds.
+  /// 150 km for the chargers and 20 km for the stations, which are sparse.
   ///
   /// §10hu: the charger cap was 5 km, which kept every answer inline and made the
   /// large-answer path unreachable from the app. Measured before raising it, from
   /// Nantes with this same limit of 2,000: an 814 KB answer costs about 5 ms more at
   /// the median than a 6.9 KB one, because the object fetch is 2 ms and the
-  /// responder's 100 ms poll wait dominates both. The cap was buying nothing and it
-  /// hid the mechanism the demo exists to show. `limit` still bounds the answer:
+  /// responder's 100 ms poll wait dominates both. `limit` still bounds the answer:
   /// zoomed out this is the 2,000 nearest, a disc around the centre.
+  ///
+  /// §10id: there was a `zoom < 10` floor here that cleared `wantedCentre` and asked
+  /// for nothing, on the reasoning that the map would "draw what it holds". Since
+  /// §10ic it holds nothing, so the floor drew an EMPTY map and stopped re-asking on a
+  /// pan — and it bit before the 150 km cap ever could, because on a phone-sized window
+  /// zoom 10 is only about 55 km of half-diagonal. The browser never had the floor,
+  /// which is exactly why it reached 150 km and the phone did not. The radius cap and
+  /// `limit` are the bounds; a third one that silently blanks the screen is not.
   void _wantArea(MapCamera camera) {
-    if (camera.zoom < 10) {
-      wantedCentre = null;
-      return;
-    }
     final b = camera.visibleBounds;
     final half =
         const Distance().as(LengthUnit.Meter, b.southWest, b.northEast) / 2;
@@ -349,29 +374,16 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         if ((chargers ?? 0) > 0) 'min_kw': chargers,
         'limit': 2000
       });
-      // The scope — "what I hold in this box and the answer lacks is gone" — only when
-      // the answer is complete; one cut by the limit says nothing about the rest.
-      final dlat = radius / 111320.0;
-      final dlng = radius / (111320.0 * max(0.1, cos(at.latitude * pi / 180)));
-      final scope = ans['complete'] == true
-          ? {
-              'where': 'lat BETWEEN ? AND ? AND lng BETWEEN ? AND ?',
-              'params': [
-                at.latitude - dlat,
-                at.latitude + dlat,
-                at.longitude - dlng,
-                at.longitude + dlng
-              ],
-            }
-          : null;
-      final tIngest = DateTime.now();
-      final applied = await w.ingest(_table, ans, scope);
-      final ingestMs = DateTime.now().difference(tIngest).inMilliseconds;
+      // §10ic: NOT ingested. The answer IS the layer — what the map draws is what was
+      // just asked for, so panning back shows the same thing as panning there the first
+      // time. The local table keeps only what this phone WROTE (the optimistic row a
+      // mutation leaves), which is the one thing worth holding.
+      chargerRows = _asMaps(ans);
       final ms = DateTime.now().difference(t0).inMilliseconds;
       if (mounted) {
         setState(() => status =
             '${ans['count']} charger(s) within ${(radius / 1000).toStringAsFixed(0)} km · '
-            '${_transport(ans)} · ingest $ingestMs ms · $applied kept · $ms ms total');
+            '${_transport(ans)} · $ms ms total');
       }
       await _refresh();
     } catch (e) {
@@ -522,6 +534,18 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             'costing': 'auto'
           },
           timeoutMs: 15000);
+      // §10ia: a service answers a refusal as DATA, not as an exception. Reaching for
+      // `polyline` first turns "no suitable edges near location" into a cast error on
+      // null and throws away the one sentence that says what to do about it.
+      if (ans['error'] != null) {
+        if (mounted) {
+          setState(() {
+            routeLine = const [];
+            routeInfo = '${ans['error']}';
+          });
+        }
+        return;
+      }
       final line = [
         for (final pt in ans['polyline'] as List)
           LatLng((pt[0] as num).toDouble(), (pt[1] as num).toDouble())
@@ -535,7 +559,9 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         });
       }
     } catch (e) {
-      if (mounted) setState(() => routeInfo = 'route: $e');
+      // Reaching the service failed, which is a different thing from the service
+      // saying no.
+      if (mounted) setState(() => routeInfo = 'road service unreachable: $e');
     }
   }
 
@@ -562,6 +588,21 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
         'usage_type_id': 1,
         'geom': {r'$bin': ewkbPoint(at.longitude, at.latitude)},
       });
+      // The answer that carries it back is a round trip away: the write reaches
+      // PostgreSQL, the replica follows it, the next ask returns it. Show it now.
+      chargerRows = [
+        ...chargerRows,
+        {
+          'id': id,
+          'lat': at.latitude,
+          'lng': at.longitude,
+          'title': 'Nouvelle borne',
+          'max_power_kw': 22,
+          'points': 2,
+          'status_type_id': 50,
+          'ocm_id': null,
+        }
+      ];
       await _refresh();
     } catch (e) {
       if (mounted) setState(() => status = 'insert: $e');
@@ -613,8 +654,16 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
       if (action == 'erase') {
         // Locally a delete; upstream the delete guard sets deleted_at (the tombstone).
         await w.mutate(_table, 'DELETE', {'id': poi['id']});
+        chargerRows = [
+          for (final r in chargerRows)
+            if (r['id'] != poi['id']) r
+        ];
       } else {
         await w.mutate(_table, 'UPDATE', {'id': poi['id']}, {'title': name});
+        chargerRows = [
+          for (final r in chargerRows)
+            if (r['id'] == poi['id']) {...r, 'title': name} else r
+        ];
       }
       await _refresh();
     } catch (e) {
@@ -714,7 +763,7 @@ class _MapScreenState extends State<MapScreen> with WidgetsBindingObserver {
             child: Text(
                 routeMode
                     ? 'route: $routeInfo'
-                    : '$status · $held held · tiles ${tiles?.requested ?? 0} asked / ${tiles?.served ?? 0} served / ${tiles?.failed ?? 0} failed',
+                    : '$status · $held in the answer · tiles ${tiles?.requested ?? 0} asked / ${tiles?.served ?? 0} served / ${tiles?.failed ?? 0} failed',
                 style: const TextStyle(fontSize: 12)),
           ),
         ),
