@@ -1,16 +1,27 @@
 /// The client, wired for a phone. Everything platform-shaped is a parameter: the
 /// storage, the decompressor, the connection. Nothing here is a fork of the library.
 import './platform';
+import { Platform } from 'react-native';
 import { ZeBridge } from 'zb-client-ts';
 import { expoStorage } from './expo-storage';
 import { zstd } from './platform';
 
-/// ⚠️ A phone is not the dev machine. `127.0.0.1` reaches the host from the iOS
-/// simulator but NOT from a device or the Android emulator, which needs the host's LAN
-/// address (the Android emulator's alias for the host is 10.0.2.2). And it is `ws://`,
-/// not `nats://`: this client speaks NATS over WebSocket, so the server needs its
-/// websocket block enabled.
-export const NATS_URL = process.env.EXPO_PUBLIC_NATS_URL ?? 'ws://127.0.0.1:8080';
+/// ⚠️ A phone is not the dev machine, and the two emulators disagree about how to reach
+/// it. The iOS simulator shares the host's network stack, so `127.0.0.1` IS the Mac. The
+/// Android emulator runs behind its own NAT and reserves `10.0.2.2` as the alias for the
+/// host — `127.0.0.1` there is the emulator itself, which answers nothing.
+///
+/// §10io: resolved at RUN time rather than through the environment, so ONE bundle serves
+/// both. `EXPO_PUBLIC_*` is inlined when Metro builds, so a variable would mean a
+/// separate bundler per platform.
+///
+/// A real device on the same network needs the Mac's LAN address instead; set
+/// `EXPO_PUBLIC_NATS_URL` for that case.
+///
+/// And it is `ws://`, not `nats://`: this client speaks NATS over WebSocket, so the
+/// server needs its websocket block (scripts/native/nats-server-jwt.conf, port 8080).
+const HOST = Platform.OS === 'android' ? '10.0.2.2' : '127.0.0.1';
+export const NATS_URL = process.env.EXPO_PUBLIC_NATS_URL ?? `ws://${HOST}:8080`;
 export const PRINCIPAL = process.env.EXPO_PUBLIC_PRINCIPAL ?? 'omar';
 export const TENANT = process.env.EXPO_PUBLIC_TENANT ?? '_default';
 
