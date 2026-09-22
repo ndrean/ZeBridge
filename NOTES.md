@@ -15709,3 +15709,54 @@ What this unlocks is the OTHER half of §10ih: a native Swift or Kotlin app, or 
 a phone, can now embed libzb. React Native did not need it, which is exactly why that
 path shipped first.
 
+## §10ir — which artefact for which host
+
+`-Dvendor=true` now cross-compiles for BOTH phones. The linkage default follows each
+platform's own convention rather than a blanket "static when cross-compiling":
+
+| host | artefact | why |
+| --- | --- | --- |
+| iOS (Swift) | static `.a` | apps link archives or frameworks IN; a shared build also wants `__dyld_get_image_header_containing_address`, which the simulator SDK does not export |
+| Android (Kotlin) | static `.a` | shared LOOKS native there, but Zig cannot synthesise Android's libc and stops at "unable to provide libc"; the app's own JNI shim is the `.so` and libzb links into it |
+| desktop (Python, Dart, Flutter) | shared `.dylib` | ctypes and dart:ffi LOAD a library |
+
+    # iOS
+    zig build lib -Doptimize=ReleaseFast -Dvendor=true -Dlibpq=false \
+      -Dtarget=aarch64-ios-simulator \
+      --sysroot "$(xcrun --sdk iphonesimulator --show-sdk-path)"
+
+    # Android
+    NDK=$(ls -d ~/Library/Android/sdk/ndk/* | tail -1)
+    zig build lib -Doptimize=ReleaseFast -Dvendor=true -Dlibpq=false \
+      -Dtarget=aarch64-linux-android \
+      --sysroot "$NDK/toolchains/llvm/prebuilt/darwin-x86_64/sysroot"
+
+Two lessons, each learnt twice — once per platform:
+
+1. **C sources need their own headers.** `--sysroot` reaches the Zig compilation but not
+   `addCSourceFile`, so sqlite and zstd fail on `'stdio.h' file not found` with the
+   sysroot already given. ⚠️ Android splits them further: portable headers in
+   `usr/include`, the architecture's own in `usr/include/<triple>`, and missing the
+   second gives `'asm/types.h' file not found` AFTER stdio.h was found.
+2. **Library paths must be RELATIVE.** Zig prepends the sysroot itself; the absolute form
+   produced `<sysroot>/<sysroot>/usr/lib` on both platforms.
+
+### What each host actually needs
+
+The Flutter DESKTOP app needs neither libpq nor DuckDB — it stores in SQLite. They are in
+its library only because ONE dylib serves both the app and the map service, and the
+service needs DuckDB. Built for the app alone it depends on nothing at all:
+
+| build | size | system libraries |
+| --- | --- | --- |
+| app only, vendored, no libpq | 4,062,960 | none |
+| shared with the service | 4,125,824 | libpq, DuckDB |
+
+63 KB apart — the libpq client glue. DuckDB adds nothing to the library, being linked
+rather than embedded, so its 47 MB lands on whoever runs the service.
+
+⚠️ And the archive is not a cost. Identical code, same platform: 22,645,800 as an archive
+against 4,062,960 linked. Object files keep every symbol and relocation, nothing is
+dead-stripped, and the linker pulls only the members an app references. Compare linked
+artefacts with linked artefacts, never an archive against a shared library.
+

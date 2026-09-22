@@ -101,6 +101,12 @@ pub fn build(b: *std.Build) void {
     // `dictBuilder` is deliberately absent: libzb LOADS dictionaries
     // (ZSTD_*_loadDictionary) but never trains one. Training is the bridge's job, in
     // its own binary.
+    const android_api = b.option([]const u8, "android-api", "Android API level whose libc a shared build links (NDK sysroot)") orelse "29";
+    const arch_include: ?[]const u8 = if (target.result.abi == .android or target.result.abi == .androideabi)
+        target.result.linuxTriple(b.allocator) catch null
+    else
+        null;
+
     const zstd_srcs = [_][]const u8{
         "lib/common/debug.c",         "lib/common/entropy_common.c",
         "lib/common/error_private.c", "lib/common/fse_decompress.c",
@@ -132,6 +138,8 @@ pub fn build(b: *std.Build) void {
             sq: ?*std.Build.Dependency,
             zs: ?*std.Build.Dependency,
             srcs: []const []const u8,
+            arch_inc: ?[]const u8,
+            api: []const u8,
         ) void {
             const sqd = sq orelse return;
             const zsd = zs.?;
@@ -143,6 +151,20 @@ pub fn build(b: *std.Build) void {
             // these C files.
             if (bb.sysroot) |sr| {
                 m.addSystemIncludePath(.{ .cwd_relative = bb.pathJoin(&.{ sr, "usr", "include" }) });
+                // ⚠️ Android's NDK sysroot splits its headers: the portable ones live in
+                // usr/include, the architecture's own (asm/types.h and friends) in
+                // usr/include/<triple>. Without this, sqlite and zstd find stdio.h and
+                // then fail on 'asm/types.h file not found'.
+                if (arch_inc) |ai| {
+                    m.addSystemIncludePath(.{ .cwd_relative = bb.pathJoin(&.{ sr, "usr", "include", ai }) });
+                    // ⚠️ And Android's libc to LINK a shared object against, which lives
+                    // under an API-LEVEL directory: usr/lib/<triple>/<api>. Without it a
+                    // dynamic build stops at "unable to provide libc for target
+                    // aarch64-linux-android"; a static one never needed it.
+                    // `-Dandroid-api` chooses the level (21 is the NDK's oldest).
+                    // RELATIVE: Zig prepends the sysroot itself (the same trap as the iOS path).
+                    m.addLibraryPath(.{ .cwd_relative = bb.pathJoin(&.{ "/usr", "lib", ai, api }) });
+                }
                 // …and the libc to LINK against. Headers alone get as far as
                 // "unable to find libSystem system library".
                 //
@@ -192,7 +214,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
-        addVendored(b, mod, sqlite_dep, zstd_dep, &zstd_srcs);
+        addVendored(b, mod, sqlite_dep, zstd_dep, &zstd_srcs, arch_include, android_api);
     } else {
         mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
         mod.linkSystemLibrary("sqlite3", .{});
@@ -219,11 +241,31 @@ pub fn build(b: *std.Build) void {
     // `__dyld_get_image_header_containing_address`: a symbol the iOS simulator SDK does
     // not export. The desktop hosts (Python ctypes, Dart ffi) need the dynamic one, and
     // a native build still gets it.
-    const cross = b.graph.host.result.os.tag != target.result.os.tag;
+    // §10ir: an ARCHIVE or a shared library. The default follows the platform's own
+    // convention rather than a blanket rule for cross builds:
+    //
+    //   * iOS links archives or frameworks INTO the app, and a shared build additionally
+    //     drags Zig's stack-trace machinery, which wants
+    //     `__dyld_get_image_header_containing_address` — not exported by the simulator SDK.
+    //   * ANDROID ships `.so` files under jniLibs, so dynamic looks like the native
+    //     shape — but Zig cannot synthesise Android's libc for a shared build and stops
+    //     at "unable to provide libc for target aarch64-linux-android". A library path
+    //     is not enough; that needs a `--libc` paths file describing the NDK. The static
+    //     archive builds today and is the normal way in anyway: the app's own JNI shim
+    //     is the `.so`, and libzb links INTO it.
+    //   * a desktop host (Python ctypes, dart:ffi) loads a dylib.
+    //
+    // ⚠️ An archive is ~5.6x the shared library for identical code (22.6 MB against
+    // 4.06 MB) and that is NOT its cost: object files keep every symbol and relocation,
+    // nothing is dead-stripped, and the linker pulls only the members an app references.
+    // Compare linked artefacts, never an archive against a shared library.
+    const default_static = target.result.os.tag == .ios or
+        target.result.abi == .android or target.result.abi == .androideabi;
+    const static = b.option(bool, "static", "Build a static archive instead of a shared library") orelse default_static;
     const lib = b.addLibrary(.{
         .name = "zbcore",
         .root_module = mod,
-        .linkage = if (cross) .static else .dynamic,
+        .linkage = if (static) .static else .dynamic,
     });
     b.installArtifact(lib);
 
@@ -249,7 +291,7 @@ pub fn build(b: *std.Build) void {
     demo_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
-        addVendored(b, demo_mod, sqlite_dep, zstd_dep, &zstd_srcs);
+        addVendored(b, demo_mod, sqlite_dep, zstd_dep, &zstd_srcs, arch_include, android_api);
     } else {
         demo_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
         demo_mod.linkSystemLibrary("sqlite3", .{});
@@ -284,7 +326,7 @@ pub fn build(b: *std.Build) void {
     soak_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
-        addVendored(b, soak_mod, sqlite_dep, zstd_dep, &zstd_srcs);
+        addVendored(b, soak_mod, sqlite_dep, zstd_dep, &zstd_srcs, arch_include, android_api);
     } else {
         soak_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
         soak_mod.linkSystemLibrary("sqlite3", .{});
@@ -316,7 +358,7 @@ pub fn build(b: *std.Build) void {
     zb_mod.addImport("msgpack", msgpack_dep.module("msgpack"));
     // §10iq: vendored, or the host's — never both.
     if (vendor) {
-        addVendored(b, zb_mod, sqlite_dep, zstd_dep, &zstd_srcs);
+        addVendored(b, zb_mod, sqlite_dep, zstd_dep, &zstd_srcs, arch_include, android_api);
     } else {
         zb_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ sqlite_prefix, "lib" }) });
         zb_mod.linkSystemLibrary("sqlite3", .{});
