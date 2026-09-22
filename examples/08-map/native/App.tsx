@@ -56,6 +56,7 @@ export default function App() {
   /// becomes held, so the same end moves as many times in a row as you like.
   const [held, setHeld] = useState<'start' | 'end' | null>(null);
   const mine = useRef<Record<string, any>>({});
+  const routeReadPending = useRef<number | null>(null);
   const writer = `phone-${PRINCIPAL}`;
 
   useEffect(() => {
@@ -68,7 +69,15 @@ export default function App() {
         zb.current = c;
         setStatus('connected');
         // The row moved — mine or another editor's. Redraw from what the ROW holds.
-        c.onChange('routes', () => void readRoute());
+        // COALESCED: a seed's backlog fired this 185 times and produced 183 identical
+        // queries. One read per burst is the same answer for a fraction of the work.
+        c.onChange('routes', () => {
+          if (routeReadPending.current) return;
+          routeReadPending.current = setTimeout(() => {
+            routeReadPending.current = null;
+            void readRoute();
+          }, 120) as unknown as number;
+        });
         await readRoute();
         await ask();
       } catch (e) {
