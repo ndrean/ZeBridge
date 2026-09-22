@@ -15505,3 +15505,39 @@ signal also marks the map ready, rather than trusting one event to fire.
 The lesson is the same in both halves: treating a rendering API as a list of components,
 and a viewport as available the moment its container mounts. Neither holds.
 
+## §10in — a view per point failed three times; the map never did
+
+The React Native map went through the same bug three times, in three costumes, and the
+owner found each one by comparing against the browser.
+
+| what | symptom | cause |
+| --- | --- | --- |
+| charger markers | the count said 77, the map drew fewer | `MarkerView`, a React view per point |
+| fuel price badges | "some appear, but not all"; then empty orange boxes | `MarkerView`, then `PointAnnotation` rasterising before its text laid out |
+| route ends | "the route appears but I cannot move the edges" | `MarkerView` + `Pressable` never receiving the tap |
+
+The last one is the clearest evidence, because everything AROUND it provably worked. The
+log shows the phone's own mutation going out and coming back `"status":"accepted"`, and
+the owner confirmed that moving an end in the BROWSER renders perfectly on the phone. So
+the row, the merge, the change feed and the drawing were all fine. Only the phone's own
+input was lost, in a `Pressable` inside a marker that was not reliably there.
+
+Everything is a layer now: `ShapeSource` + `CircleLayer`, with `onPress` on the source
+and a 44×44 hitbox for the route ends. A layer cannot half-draw and its press cannot be
+missed. Style expressions carry what JavaScript used to — power and out-of-service for
+the chargers, the price ramp for the stations, held-or-not for the route ends.
+
+The one thing a layer cannot do is TEXT, because that needs a `glyphs` URL this style has
+none of (§10il). So nothing is lettered: the route's start is the hollow circle and the
+end is filled, the held one wears a fat ring, and the fuel price is a colour with the
+figure a tap away. Legible at a glance, and arguably better than an A, a B and forty
+tiny numbers.
+
+Also in this pass: zoom buttons (§10im). A pinch works on a device but on the SIMULATOR
+it is option-drag, awkward enough that the map read as unzoomable and it came up twice.
+
+The general lesson for any map client: **the number of things you draw decides the
+mechanism.** A bounded handful of rich, interactive views is what `MarkerView` is for; a
+cloud of plain points belongs in a layer, and crossing that line silently loses markers
+rather than failing.
+

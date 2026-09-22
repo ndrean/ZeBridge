@@ -326,15 +326,44 @@ export default function App() {
           </ShapeSource>
         )}
 
-        {routeMode && pins.map((p) => (
-          <MarkerView key={`r-${p.k}`} coordinate={[p.v.lng, p.v.lat]}>
-            <Pressable hitSlop={12} onPress={() => setHeld(held === p.k ? null : p.k)}>
-              <View style={[styles.routePin, held === p.k && styles.routePinHeld]}>
-                <Text style={styles.routePinText}>{p.k === 'start' ? 'A' : 'B'}</Text>
-              </View>
-            </Pressable>
-          </MarkerView>
-        ))}
+        {/* §10in: the route ends, drawn by the MAP. They were `MarkerView`s with a
+            `Pressable` inside, which is the third time that shape has failed today —
+            the write path was provably fine (the log shows the mutation accepted and
+            the browser's own move arriving) but the pins could not be taken hold of.
+            A layer cannot half-draw and its `onPress` cannot be missed.
+
+            No letters on them, because text needs glyphs this style has none of
+            (§10il). START is the hollow one, END is filled, and whichever is HELD wears
+            a fat ring — which is more legible at a glance than an A and a B anyway. */}
+        {routeMode && pins.length > 0 && (
+          <ShapeSource
+            id="route-ends"
+            hitbox={{ width: 44, height: 44 }}
+            shape={{
+              type: 'FeatureCollection',
+              features: pins.map((p) => ({
+                type: 'Feature',
+                id: p.k,
+                properties: { which: p.k, held: held === p.k ? 1 : 0, start: p.k === 'start' ? 1 : 0 },
+                geometry: { type: 'Point', coordinates: [p.v.lng, p.v.lat] },
+              })),
+            } as any}
+            onPress={(e: any) => {
+              const which = e?.features?.[0]?.properties?.which;
+              if (which === 'start' || which === 'end') setHeld(held === which ? null : which);
+            }}
+          >
+            <CircleLayer
+              id="route-ends-dot"
+              style={{
+                circleRadius: ['case', ['==', ['get', 'held'], 1], 13, 9] as any,
+                circleColor: ['case', ['==', ['get', 'start'], 1], '#ffffff', '#1f6feb'] as any,
+                circleStrokeColor: '#1f6feb',
+                circleStrokeWidth: ['case', ['==', ['get', 'held'], 1], 6, 3] as any,
+              }}
+            />
+          </ShapeSource>
+        )}
       </MapView>
 
       {/* §10im: explicit zoom. A pinch works on a device but on the SIMULATOR it is
