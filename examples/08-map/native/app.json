@@ -7,12 +7,20 @@
     "scheme": "zemap",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
-    "ios": { "supportsTablet": true, "bundleIdentifier": "dev.zebridge.zemap" },
-    "android": { "package": "dev.zebridge.zemap" },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "dev.zebridge.zemap"
+    },
+    "android": {
+      "package": "dev.zebridge.zemap"
+    },
     "plugins": [
       "expo-router",
-      "@maplibre/maplibre-react-native"
+      "@maplibre/maplibre-react-native",
+      "expo-sqlite"
     ],
-    "experiments": { "typedRoutes": true }
+    "experiments": {
+      "typedRoutes": true
+    }
   }
 }
