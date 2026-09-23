@@ -15844,3 +15844,62 @@ diff(upstream + series, working tree), so a patch can never again carry another'
 The working tree itself did not change; the ledger has the mapping (NATS_ZIG_NOTES §17)
 and the two orphan fixes (§16). Lesson in one line: a reversible-looking patch set is not
 a reproducible one; only rebuilding from the base and comparing proves anything. Every one of the seventeen states compiles and passes `test-unit` (132 → 134 → 135); the first cut did not, which is how a second anachronism was found.
+
+## §10iu — T1 on a real remote leaf: what it costs, and what this setup cannot measure (2026-09-23)
+
+A leaf on an OVH VPS (54.37.13.184, ~22 ms from the laptop), the dev hub reached through an
+SSH reverse tunnel (`ssh -N -R 7422:127.0.0.1:7422`), the hub given `domain: hub`. The leaf:
+the hub's operator, system account and resolver preload verbatim, **no `jetstream` block**,
+websocket on 8080, and
+
+    leafnodes { remotes = [ { url: "nats-leaf://127.0.0.1:7422",
+                              account: "<ZEBRIDGE account public key>",
+                              credentials: "/etc/nats/leaf-nantes.creds" } ] }
+
+Confirmed by the leaf's own log: `JetStream using domains: local "", remote "hub"`.
+
+Three things had to be fixed to get there, all small and all recorded because each cost a
+restart: the credentials file was `root:root 600` and nats-server runs as `debian`; the
+remote needs `account:` in operator mode or the server refuses to start; and the hub
+advertised its LAN address, so the leaf dropped the tunnelled link and retried
+`192.168.1.11:7422` — `leafnodes { no_advertise: true }` on the hub fixes it.
+
+**Measured**, one probe process holding a warm connection (the `nats` CLI's per-process
+startup is ±20 ms and swamps this):
+
+| | hub, loopback | through the VPS leaf |
+| --- | --- | --- |
+| core RTT | 0–1 ms | 19–21 ms |
+| account info | 0.4 ms | 41.2 ms |
+| stream info | 0.5 ms | 39.9 ms |
+| consumer create (2 calls) | 4 ms | 84.7 ms |
+| one-message pull | 1.9 ms | 41.4 ms |
+
+41 ms is exactly 2 × RTT: the tunnel sends every call laptop → VPS → laptop. Put the client
+in the leaf's region and it is **one** hop — so a JetStream call through a T1 leaf costs one
+region↔hub round trip, the same as connecting to the hub directly. T1 buys the local
+handshake, local core pub/sub and connection offload at the hub; it does not buy faster
+reads. Now measured rather than assumed.
+
+**What T2 would and would not change.** Live CDC delivery is ~11 ms one-way here and a
+mirror does not improve it — the mirror receives from the hub over the same WAN. Writes are
+unchanged: Postgres judges them at the hub. What a mirror removes is every ROUND TRIP —
+consumer setup (44 ms), KV and manifest reads (22 ms each), and the chain fetch.
+
+**The chain fetch is the deciding number and this topology cannot measure it.** Every byte
+from the hub crosses one SSH channel, and a single SSH/TCP stream at 22 ms RTT is
+window-bound: 1.59 MB took 742 ms by `scp` in both directions, while three parallel streams
+moved 5.8 MB/s aggregate (1.9 MB/s each) — per-stream, not a network cap. The 252 ms
+(browser client through the leaf) and 490 ms (`nats object get` on the VPS) for the same
+1.59 MB base are that window, not NATS. No care fixes it while the hub sits behind a tunnel;
+the number falls out of the first real deployment, where the hub has a datacentre uplink.
+
+**So T2 stays unbuilt** until a deployed hub gives the seeding figure. The decision reduces
+to one question: how often does a client re-seed or set up consumers, against a 22 ms
+round trip and an unmeasured download.
+
+Also done here: the leaf's monitoring port was `http_port: 8222`, world-readable — `/varz`
+and `/connz` answered a plain `curl` from the internet with server identity, leafnode count
+and the connection list. It is `http: localhost:8222` now. Two scanners (Cloudflare and
+Azure egress ranges, neither this laptop) had already probed the open websocket port within
+five minutes of the leaf starting; the box has no firewall installed at all.
