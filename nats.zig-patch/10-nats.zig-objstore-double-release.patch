@@ -49,17 +49,10 @@ index 701561d..c37ff29 100644
          return Result(ObjectInfo){
              .arena = arena,
 diff --git a/src/root.zig b/src/root.zig
-index 8e99099..c6017f5 100644
+index fc337a6..c6017f5 100644
 --- a/src/root.zig
 +++ b/src/root.zig
-@@ -52,11 +52,15 @@ pub const JetStreamSubscription = @import("jetstream.zig").JetStreamSubscription
- pub const PullSubscription = @import("jetstream.zig").PullSubscription;
- pub const FetchRequest = @import("jetstream.zig").FetchRequest;
- pub const MessageBatch = @import("jetstream.zig").MessageBatch;
-+pub const PullInbox = @import("jetstream.zig").PullInbox;
-+pub const MultiBatch = @import("jetstream.zig").MultiBatch;
- 
- // JetStream KV types
+@@ -59,6 +59,8 @@ pub const MultiBatch = @import("jetstream.zig").MultiBatch;
  pub const KV = @import("jetstream_kv.zig").KV;
  pub const KVManager = @import("jetstream_kv.zig").KVManager;
  pub const KVEntry = @import("jetstream_kv.zig").KVEntry;

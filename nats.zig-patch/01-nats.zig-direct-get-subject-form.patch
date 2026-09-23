@@ -1,0 +1,39 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 24a555c..cdbff7d 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -1108,6 +1108,34 @@ pub const JetStream = struct {
+         if (options.next_by_subj) |subject| try validation.validateSubject(subject);
+         log.debug("getMsgDirect: Stream name validation passed", .{});
+ 
++        // LOCAL FIX (see NOTES.md): a last-by-subject lookup with no other
++        // options uses the ADR-31 SUBJECT form — DIRECT.GET.<stream>.<subject>
++        // with an empty body. Identical semantics to the JSON form, but it
++        // works under least-privilege grants that scope direct gets PER KEY;
++        // ZeBridge's tenant-scoped KV/object grants deliberately cover only
++        // this form (a bucket-level grant on KV_generations would hand every
++        // tenant every manifest).
++        if (options.last_by_subj != null and options.seq == null and options.next_by_subj == null) {
++            const subj_form = try std.fmt.allocPrint(self.nc.allocator, "DIRECT.GET.{s}.{s}", .{ stream_name, options.last_by_subj.? });
++            defer self.nc.allocator.free(subj_form);
++            const resp = try self.sendRequest(subj_form, "");
++            errdefer resp.deinit();
++            if (resp.status_code == STATUS_NOT_FOUND) {
++                return error.MessageNotFound;
++            } else if (resp.status_code == STATUS_TIMEOUT) {
++                return error.BadRequest;
++            } else if (resp.status_code == 413) {
++                return error.TooManySubjects;
++            }
++            if (resp.headerGet("Nats-Subject")) |nats_subject| {
++                try resp.setSubject(nats_subject, false);
++            }
++            if (resp.headerGet("Nats-Sequence")) |nats_seq_str| {
++                resp.seq = std.fmt.parseInt(u64, nats_seq_str, 10) catch 0;
++            }
++            return resp;
++        }
++
+         // Build the subject for the direct get API call
+         const subject = try std.fmt.allocPrint(self.nc.allocator, "DIRECT.GET.{s}", .{stream_name});
+         defer self.nc.allocator.free(subject);

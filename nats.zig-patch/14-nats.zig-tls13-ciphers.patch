@@ -1,5 +1,5 @@
 diff --git a/src/connection.zig b/src/connection.zig
-index 89ff6ca..8371af1 100644
+index d4e4738..8371af1 100644
 --- a/src/connection.zig
 +++ b/src/connection.zig
 @@ -337,6 +337,18 @@ const TlsRuntime = struct {
@@ -32,7 +32,7 @@ index 89ff6ca..8371af1 100644
  };
  
  pub const ConnectionOptions = struct {
-@@ -1967,6 +2017,11 @@ pub const Connection = struct {
+@@ -2001,6 +2017,11 @@ pub const Connection = struct {
          var hs = tls.nonblock.Client.init(.{
              .host = rt.host,
              .root_ca = bundle,

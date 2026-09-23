@@ -1,5 +1,5 @@
 diff --git a/src/jetstream.zig b/src/jetstream.zig
-index 786bacd..f10aaad 100644
+index 32dc37d..c6445a8 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
 @@ -414,6 +414,10 @@ pub const PullSubscription = struct {
@@ -53,7 +53,7 @@ index 786bacd..f10aaad 100644
  
                  if (raw_msg.status_code == STATUS_NOT_FOUND) {
                      // No messages available
-@@ -1309,6 +1333,8 @@ pub const JetStream = struct {
+@@ -1346,6 +1370,8 @@ pub const JetStream = struct {
          else
              return error.StreamOrSubjectRequired;
  
@@ -62,7 +62,7 @@ index 786bacd..f10aaad 100644
          defer if (options.stream == null and subject != null) self.nc.allocator.free(stream_name);
  
          // Prepare consumer config, generating deliver_subject if needed
-@@ -1532,7 +1558,16 @@ pub const JetStream = struct {
+@@ -1569,7 +1595,16 @@ pub const JetStream = struct {
          else
              return error.StreamOrSubjectRequired;
  
@@ -80,7 +80,7 @@ index 786bacd..f10aaad 100644
  
          // Create or get consumer (pull consumers require a name)
          var consumer_info = try self.getOrCreateConsumer(stream_name, subject, durable, options.config, true, null);
-@@ -1565,6 +1600,7 @@ pub const JetStream = struct {
+@@ -1602,6 +1637,7 @@ pub const JetStream = struct {
          pull_subscription.* = PullSubscription{
              .js = self,
              .stream_name = stream_name,

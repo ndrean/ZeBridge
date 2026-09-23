@@ -3,10 +3,17 @@
 Fixes made while migrating my app onto this library.
 Each entry: what broke, how it showed up, what changed. Upstream candidates unless noted.
 
-Since 2026-09-10 this ledger and the twelve `nats.zig-*.patch` files live together in
-`nats.zig-patch/`; the submodule itself stays at the upstream commit the parent records,
-with the patches applied in its working tree. To re-apply one from the repository root:
-`git -C nats.zig apply ../nats.zig-patch/<name>.patch`.
+The submodule stays at the upstream commit the parent records (`d4cd40d`); the changes
+live in its working tree and, since 2026-09-23, as an **ordered series** of seventeen
+patches here, `01-…` to `17-…`, each the exact diff between two consecutive states. They
+apply in numeric order and only in that order. Two scripts keep it honest:
+
+    nats.zig-patch/check-series.sh          upstream + series == working tree, or say where not
+    nats.zig-patch/new-patch.sh <topic>     cut the next patch as diff(upstream + series, working tree)
+
+Never cut a patch from `git -C nats.zig diff` with hunks filtered by hand — §17 is what
+that produced. Entry numbers below are chronological and are not the series numbers;
+the table in §17 maps one onto the other.
 
 ---
 
@@ -666,4 +673,97 @@ got the hub's answer; with `.domain = "other"` the server returned `503` with
 `Nats-Subject: $JS.other.API.STREAM.INFO.KV_tenants`.
 
 ---
+
+## 16. The two fixes from before the ledger (2026-08-27, ledgered 2026-09-23)
+
+Found by the regeneration in §17: two changes in the working tree that no patch carried
+and no entry here described. Both are in the submodule's old in-tree `NOTES.md` (untracked,
+from before this ledger moved to `nats.zig-patch/`), and both say "LOCAL FIX (see
+NOTES.md)" at the code. Ledgered here from that file; the patches are the series' first two.
+
+**`01-nats.zig-direct-get-subject-form.patch`** — `getMsgDirect` published every
+request to the bucket-level API (`$JS.API.DIRECT.GET.<stream>`) with a JSON body. For a
+`last_by_subj`-only lookup it uses the ADR-31 subject form — `DIRECT.GET.<stream>.<subject>`
+with an empty body — and keeps the JSON form for `seq` and `next_by_subj`. The two forms
+are identical for last-by-subject, but only the subject form works under grants that scope
+direct gets PER KEY, which is what makes ZeBridge's tenant-scoped KV and object grants
+possible at all. Measured 2026-08-27 against a live JWT-mode server: `KV.get` and the
+object store's meta lookups failed with a Permissions Violation under client credentials
+before, pass after.
+
+**`02-nats.zig-consumer-create-named.patch`** — a consumer with a name went through the
+legacy `CONSUMER.DURABLE.CREATE.<stream>.<name>`; it now uses the modern
+`CONSUMER.CREATE.<stream>.<name>[.<filter>]` (server ≥ 2.9) whenever `name` or
+`durable_name` is set. Least-privilege grants cover the modern form and typically not the
+legacy one, and under JWT auth an unauthorised API publish is dropped, so the failure was a
+bare `Timeout`. Measured the same day: durable pull consumers timed out under client
+credentials before, create cleanly after.
+
+---
+
+## 17. The patches regenerated as an ordered series (2026-09-23)
+
+**How it appeared**
+
+Asked whether the patches were up to date, the honest check was run for the first time:
+does clean upstream `d4cd40d` plus the patch files rebuild the working tree? It does not,
+in any order. 7 of 15 never applied to clean upstream; unwinding from the working tree
+freed 10 and left 5 interlocked (`inbox-prefix`, `shared-pull-inbox`, `connection`,
+`quiet-deliberate-close`, `stale-408`); 14 pairs of patches carried each other's lines
+(cut from a full `git diff` with hunks filtered by hand, as the workflow note warned);
+the `tests/jetstream_pull_test.zig` change (+163, the fetch-contract tests of entry 7)
+was in no patch; two fixes were in no patch and no entry (§16). `apply -R --check` had
+passed for 13 of 15 all along — it passes for a patch whose lines a later patch also
+carries, so it never proved anything.
+
+**Change** (every patch file replaced; the working tree untouched)
+
+The 83 zero-context hunks of the full working-tree diff were attributed to a topic by
+their changed lines (twelve read by hand; two hunks staged, because a later topic rewrote
+a line an earlier one added: `nextSubject` — `shared-pull-inbox`, then `jetstream-domain`
+— and `inbox_base` — `shared-pull-inbox`, then `inbox-prefix`); seventeen states were
+rebuilt from upstream by cumulative hunk subsets; each patch is the exact diff between two
+consecutive states. Chronological order:
+
+| series | ledger | topic |
+| --- | --- | --- |
+| 01 | §16 | direct-get-subject-form (2026-08-27) |
+| 02 | §16 | consumer-create-named (2026-08-27) |
+| 03 | §1 | jetstream-stale-408 |
+| 04 | §2 | connection (UNSUB on a closed connection) |
+| 05 | §7 | fetch-early-return-503 — now carries its tests |
+| 06 | §7 | consumer-inactive-threshold |
+| 07 | §3, §7 | shared-pull-inbox |
+| 08 | §5 | quiet-deliberate-close |
+| 09 | §6 | auth-verdict |
+| 10 | §8 | objstore-double-release |
+| 11 | §9 | quiet-routine-connect |
+| 12 | §10 | jetstream-error-level |
+| 13 | §11 | pull-next-delivered |
+| 14 | §12 | tls13-ciphers |
+| 15 | §13 | inbox-prefix |
+| 16 | §14 | objstore-max-age |
+| 17 | §15 | jetstream-domain |
+
+Hunk and file counts quoted in older entries describe the old files; the series' own
+counts are in each file. `check-series.sh` and `new-patch.sh` are the workflow from here.
+
+**Verified**
+
+```bash
+nats.zig-patch/check-series.sh
+# ✅ 17 patches: upstream d4cd40d + series == working tree (src, tests)
+nats.zig-patch/new-patch.sh probe
+# nothing to cut: the working tree equals upstream + the series
+```
+
+Every intermediate state compiles and passes its unit tests — `zig build test-unit` after
+each patch in turn: 132/132 through 14, 134/134 at 15 (inbox-prefix adds two), 135/135 at
+17 (domain adds one). The first cut did not: states 07–14 failed on `self.nc.newInbox`,
+which `inbox-prefix` introduces at 15 — the old `shared-pull-inbox.patch` had been re-cut
+after inbox-prefix and carried the newer line; staging `inbox_base` fixed it, and that is
+the kind of anachronism only a per-state build catches. One unit test is flaky: it failed
+once in ~4–6 runs, at a different state each time and on the unchanged final tree too, so
+it is not the series; six further runs passed and it never printed its name. Recorded, not
+hidden.
 

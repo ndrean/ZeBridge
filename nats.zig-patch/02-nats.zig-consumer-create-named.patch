@@ -1,0 +1,28 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index cdbff7d..32dc37d 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -929,10 +929,19 @@ pub const JetStream = struct {
+         if (config.durable_name) |n| try validation.validateConsumerName(n);
+ 
+         log.info("adding consumer", .{});
+-        const subject = if (config.durable_name) |durable_name|
+-            try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.DURABLE.CREATE.{s}.{s}", .{ stream_name, durable_name })
+-        else
+-            try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}", .{stream_name});
++        // LOCAL FIX (see NOTES.md): a NAMED consumer uses the modern
++        // CONSUMER.CREATE.<stream>.<name>[.<filter>] endpoint (server >= 2.9)
++        // instead of the legacy CONSUMER.DURABLE.CREATE API. Least-privilege
++        // grant sets cover the modern form (`CONSUMER.CREATE.<stream>` and
++        // `CONSUMER.CREATE.<stream>.>`); the legacy subject is typically not
++        // granted, and an unauthorized publish surfaces as a bare Timeout.
++        const named: ?[]const u8 = config.name orelse config.durable_name;
++        const subject = if (named) |n| blk: {
++            if (config.filter_subject) |filt| {
++                break :blk try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}.{s}.{s}", .{ stream_name, n, filt });
++            }
++            break :blk try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}.{s}", .{ stream_name, n });
++        } else try std.fmt.allocPrint(self.nc.allocator, "CONSUMER.CREATE.{s}", .{stream_name});
+         defer self.nc.allocator.free(subject);
+ 
+         // Create request payload

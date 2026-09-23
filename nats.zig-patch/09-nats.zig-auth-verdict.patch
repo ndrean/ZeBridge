@@ -1,0 +1,51 @@
+diff --git a/src/connection.zig b/src/connection.zig
+index 310c2b8..0ebcd09 100644
+--- a/src/connection.zig
++++ b/src/connection.zig
+@@ -432,6 +432,10 @@ pub const Connection = struct {
+     options: ConnectionOptions,
+ 
+     status: ConnectionStatus = .initialized,
++    /// Set when the connection gave up because the server rejected the credentials
++    /// twice (expired/revoked/violation). Readable after close so callers can turn
++    /// "ConnectionClosed" into an actionable auth verdict.
++    final_auth_error: ?anyerror = null,
+     status_cond: xsync.Condition = .init,
+     /// Latched when the first NATS handshake and restoration complete, so
+     /// connect() cannot miss a short-lived `.connected` state if the socket
+@@ -793,6 +797,11 @@ pub const Connection = struct {
+     /// does not join manager_task: a callback may itself be running in that
+     /// task (or in a reader task the manager is joining). deinit() is the
+     /// synchronous join-and-destroy boundary.
++    /// The auth error that terminally closed this connection, if any.
++    pub fn lastAuthError(self: *Self) ?anyerror {
++        return self.final_auth_error;
++    }
++
+     pub fn close(self: *Self) void {
+         var callback: @TypeOf(self.options.callbacks.closed_cb) = null;
+         defer if (callback) |cb| cb(self);
+@@ -1705,6 +1714,10 @@ pub const Connection = struct {
+             if (isAuthError(err)) {
+                 if (server.last_auth_error) |last| {
+                     if (last == err) {
++                        // Remember WHY before giving up: a caller that later finds the
++                        // connection closed can name the cause ("authentication
++                        // expired — re-enroll") instead of a generic ConnectionClosed.
++                        self.final_auth_error = err;
+                         self.mutex.unlock(self.io);
+                         log.err("Same authentication error twice from {s}, giving up: {}", .{ server.parsed_url.full_url, err });
+                         return error.ShouldClose;
+@@ -2490,6 +2503,12 @@ pub const Connection = struct {
+ 
+         log.err("Server protocol error: {} - {s}", .{ protocol_err, err_msg });
+ 
++        // Record an auth verdict the moment the server states it — a mid-session
++        // expiry/revocation arrives here on the live socket, not through the reconnect
++        // handshake, so a caller that later sees the closed connection can still name
++        // the cause (§10cj: JWT expired → re-enroll, not a bare "ConnectionClosed").
++        if (isAuthError(protocol_err)) self.final_auth_error = protocol_err;
++
+         // Handle handshake failure
+         if (self.handshake_state.isWaiting()) {
+             // Propagate specific protocol errors to client

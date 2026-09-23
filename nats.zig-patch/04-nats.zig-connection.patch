@@ -1,8 +1,8 @@
 diff --git a/src/connection.zig b/src/connection.zig
-index cd4f9c1..5129a44 100644
+index 89ff6ca..2e8090f 100644
 --- a/src/connection.zig
 +++ b/src/connection.zig
-@@ -911,15 +911,24 @@ pub const Connection = struct {
+@@ -1196,15 +1196,24 @@ pub const Connection = struct {
          // Try to send UNSUB command. Even if it fails internally,
          // processMsg will keep sending UNSUB commands once
          // it receives a message with unknown sid.

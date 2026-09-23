@@ -1,11 +1,8 @@
-The JetStream API error line drops to debug: the caller receives a typed error and
-decides whether it is an incident — a bucket that exists on a create, a consumer not
-found on a look-before-create, are answers. NATS_ZIG_NOTES.md entry 10.
-
 diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 9c196cd..afbd69d 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -905,7 +905,11 @@
+@@ -905,7 +905,11 @@ pub const JetStream = struct {
          }) catch return;
  
          const info = response.@"error";

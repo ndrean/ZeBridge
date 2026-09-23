@@ -1,11 +1,8 @@
-PullSubscription.nextDelivered: read a data message a parked pull request still delivers,
-without issuing a new request — what a clean stop of a pull consumer needs.
-NATS_ZIG_NOTES.md entry 11.
-
 diff --git a/src/jetstream.zig b/src/jetstream.zig
+index afbd69d..3e92e01 100644
 --- a/src/jetstream.zig
 +++ b/src/jetstream.zig
-@@ -468,6 +468,33 @@
+@@ -468,6 +468,33 @@ pub const PullSubscription = struct {
      }
  
      /// Fetch a batch of messages from the pull consumer

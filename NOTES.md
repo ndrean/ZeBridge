@@ -15823,3 +15823,24 @@ The `account:` key is not optional in operator mode — without it the leaf refu
 
 The hub's `-DV` trace shows what crossed the link: `LMSG $JS.hub.API.INFO` ×2 and `LMSG $JS.hub.API.STREAM.INFO.KV_tenants`. The plain-prefix requests never reached the hub — the link denies `$JS.API.>` once a domain is set, which is the documented isolation rule and exactly the §10hl symptom, now explained: the client spoke the one prefix the link drops.
 With the domain carried by the client and named in the grants, nothing is mapped and nothing is extended.
+
+## §10it — the nats.zig patches, regenerated as a series (2026-09-23)
+
+Asked whether the nats.zig patches were up to date, the check that means it was run for
+the first time: clean upstream `d4cd40d` (what the parent records) plus the patch files
+must rebuild the submodule's working tree. It did not, in any order — 7 of 15 never
+applied to clean upstream, 5 were interlocked, 14 pairs carried each other's lines, the
+fetch-contract tests (+163 in `tests/`) were in no patch, and two 2026-08-27 fixes were
+in no patch and no ledger entry. `apply -R --check`, the workflow's verification, had
+passed for 13 of them the whole time: it passes for a patch whose lines a later patch
+also carries.
+
+Replaced by an ordered series of seventeen, each the exact diff between two consecutive
+states rebuilt from upstream by cumulative hunk subsets (83 hunks attributed by their
+changed lines, twelve read by hand, two staged where a later topic rewrote an earlier
+one's line). `nats.zig-patch/check-series.sh` proves it — upstream + series == working
+tree, `src` and `tests`, byte for byte — and `new-patch.sh <topic>` cuts the next one as
+diff(upstream + series, working tree), so a patch can never again carry another's lines.
+The working tree itself did not change; the ledger has the mapping (NATS_ZIG_NOTES §17)
+and the two orphan fixes (§16). Lesson in one line: a reversible-looking patch set is not
+a reproducible one; only rebuilding from the base and comparing proves anything. Every one of the seventeen states compiles and passes `test-unit` (132 → 134 → 135); the first cut did not, which is how a second anachronism was found.
