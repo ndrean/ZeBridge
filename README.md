@@ -139,7 +139,7 @@ ZeBridge supports restricting the columns in a publication. Currently, this will
 * [Overview](#overview)
   * [Two pillars](#two-pillars)
   * [The backend and the frontend in short](#the-backend-and-the-front-end-in-short)
-  * [Example of a deployed system](#example-of-a-deployed-system)
+  * [Architecture Example](#architecture-example)
 * [The daemon](#the-daemon)
   * [Catching up: the chain and the stream](#catching-up-the-chain-and-the-stream)
   * [Schemas & Migrations](#schemas--migrations)
@@ -248,118 +248,87 @@ shims, while libzb was still learning to cross-compile.
 *  **Frontend**: the dev builds on top of the library, `libzb` or `zb-client`. He will interact only with the storage, no NATS incantations.
    *  he sets up the `ZeBrdige()` class with the storage / database flavour (SQLite, PGlite, DuckDB) and the domain to reach NATS,
 
-### Example of a deployed system
+### Architecture Example
 
-<!-- <details><summary>The diagram</summary> -->
+**Server-side connections**:
 
 ```mermaid
 
 graph TD
-    %% Styling and Definitions
     classDef external fill:#f9f,stroke:#333,stroke-width:2px;
     classDef proxy fill:#bbf,stroke:#333,stroke-width:2px;
     classDef internal fill:#dfd,stroke:#333,stroke-width:1px;
     classDef secure fill:#fdd,stroke:#333,stroke-width:1px;
     classDef telemetry fill:#fff2cc,stroke:#d6b656,stroke-width:1px;
-    classDef bridge fill:#bdf3ff,stroke:#ac0100,stroke-with:2px;
+    classDef bridge fill:#bdf3ff,stroke:#ac0100,stroke-width:2px;
     classDef maybe_external fill:#dfd,stroke:#333,stroke-width:2px,stroke-dasharray: 5 5;
 
-    %% External Clients
-    MicroVM([micro-VM<br> --- libzb ---]):::external
-    UserBrowser([browser <br> ---zb-client ---]):::external
-    UserMobile([Mobile <br> --- libzb --- ]):::external
+    subgraph Edge [Cloudflare]
+      CF([https://bridge.mydom.com:443]):::proxy
+      CF@{ shape: cloud}
+    end
 
-    LocalDuckDB[(DuckDB)]:::secure
-    LocalSQLite[(SQLite)]:::secure
-    LocalPGlite[(PGlite)]:::secure
+    subgraph Obs [Observability, off-box]
+      Grafana([Grafana Cloud]):::telemetry
+      Grafana@{ shape: cloud}
+    end
 
-    Grafana([Grafana]):::telemetry
-    Grafana@{ shape: cloud}
+    subgraph VPS-2 [Opt VPS-2]
+      PGREP[(Postgres<br>READ Replica)]:::secure
+    end
 
-    %% External Connections to Cloudflare
-    %%CF <==> |:8080 browser| NATS
-    MicroVM <==>LocalDuckDB
-    %%PG -->|hot standby| PGREP
-    UserBrowser <==>|WSS| CF
-    UserBrowser <==>LocalPGlite
-    UserMobile <==> |TLS| NATS
-    MicroVM <==> |TLS| NATS
-    UserMobile <==>LocalSQLite
-    %%UserBrowser --> CF
-    %%UserMobile --> CF
-    %%MicroVM --> CF
-
-
-    %% Cloudflare Edge
-    %% subgraph Cloudflare_Network  [Cloudflare Edge Proxy]
-        CF([https://my-domain]):::proxy
-        CF@{ shape: cloud}
-    %% end 
-    %%subgraph VPS-2 [Optional VPS-2]
-      %%PGREP[(Postgres<br>Replica <br>hot_standby = on)]:::secure
-    %%end
 
     %% VPS Boundary
     subgraph VPS [Your VPS Server]
         direction TB
         
-        HA([HAProxy<br>:8443]):::proxy
+        HA([HAProxy<br>:443]):::proxy
         %% Internal Apps
-        Prom[(Prometheus<br> :9090)]:::telemetry
+        Prom[(Prometheus<br>http:9090)]:::telemetry
         NatsExp([NATS Exporter<br>:7777]):::telemetry
-        Bridge[[ZeBridge-1<br> :27434]]:::bridge
+        Bridge[[ZeBridge-1<br> http:27434]]:::bridge
         Bridge@{shape: st-rect}
-        PG[(Postgres<br>Primary <br> :5432)]:::secure
-        NATS[NATS Server<br> TPC :4222 <br> wss :8080]:::internal
+        PG[(Postgres<br>Primary)]:::secure
+        NATS[NATS Server<br> tcp:4222 <br> wss:8080]:::internal
         NATS@{shape: data-store}
         
-        %% Telemetry & Monitoring Stack
-        HA -.->|:27434/enroll| Bridge
+        %% TLS termination for the bridge's HTTP surface
+        HA -.->|http:27434/enroll| Bridge
         
         Sweeper[[Sweeper]]:::bridge
     end
 
-
-    %% Cloudflare to HAProxy Subdomain Routing
-    CF <==> HA
-
-    %% Internal Component Dependencies
-    %%PG ==>|R|Bridge
-    PG <==> Bridge
-    Bridge <==>|Pub Sub  <br> TCP:4222| NATS
+    PG -.->|hot standby='on'| PGREP
+    CF <==> |https :443| HA
+    Prom ==> |outbound<br>remote_write| Grafana
+    PGREP -.->|tls:5433| Bridge
+    PG <==> |tcp:5432| Bridge
+    Bridge <==>|tls:4222| NATS
     Sweeper -->PG
-    
-    %% HAProxy Internal Layer 7 Routing
-    %%HA <==>|wss://localhost:8080| NATS
-
-    %% Telemetry Data Flow
-    %%Prom -.-> |remote_writer| Grafana
-    Prom -.->|Scrapes:7777| NatsExp
-    Prom -.->|Scrapes<br>:27434/metrics| Bridge
+    Prom -.->|http:7777| NatsExp
+    Prom -.->|http:27434/metrics| Bridge
     NatsExp -.->|Monitors| NATS
 ```
-<!-- </details> -->
+
+<br>
+
+**Client side connection**:
 <br>
 
 ```mermaid
 graph TD
     classDef external fill:#f9f,stroke:#333,stroke-width:2px;
-    classDef proxy fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef orange-proxy fill:#FFAC1C,stroke:#333,stroke-width:2px;
+    classDef grey-proxy fill:#D3D3D3,stroke:#333,stroke-width:2px;
     classDef internal fill:#dfd,stroke:#333,stroke-width:1px;
     classDef secure fill:#fdd,stroke:#333,stroke-width:1px;
     classDef telemetry fill:#fff2cc,stroke:#d6b656,stroke-width:1px;
     classDef daemon fill:#bdf3ff,stroke:#ac0100,stroke-width:2px;
 
     subgraph Mobile
-      UserMobile([mobile<br>--- libzb ---]):::external
+      UserMobile([mobile<br>React Native<br>--- zb-client ---]):::external
       LocalSQLite[(local<br>SQLite)]:::secure
-      UserMobile <==> LocalSQLite
-    end
-
-    subgraph Micro-VM
-      VM([micro-VM<br>--- libzb ---]):::external
-      LocalDuckDB[(local<br>DuckDB)]:::secure
-      VM <==> LocalDuckDB
+      LocalSQLite <==>  UserMobile
     end
 
     subgraph Browser
@@ -368,54 +337,51 @@ graph TD
       B<==> LocalLite
     end
 
-
-    CF(["wss://ws.dom.com -> :8080<br><br>https://bridge.dom.com"]):::proxy
-    CF@{ shape: cloud }
-    Grafana([Grafana <br>Cloud]):::telemetry
-    Grafana@{ shape: cloud }
-
-    subgraph VPS [Your VPS]
-        direction TB
-        HA([HAProxy<br>:443]):::proxy
-        NATS[NATS Server<br>TLS :4222<br>WSS :8080]:::internal
-        NATS@{ shape: data-store }
-        Bridge[[ZeBridge<br>:27434]]:::daemon
-        Sweeper[[Sweeper]]:::daemon
-        NatsExp([NATS<br>exporter<br>:7777]):::telemetry
-        PG[(Postgres<br>primary<br>:5432)]:::secure
-        Prom[(Prometheus)]:::telemetry
+    subgraph Spatial Service
+      VM([micro-VM<br>--- libzb ---]):::external
+      LocalDuckDB[(local<br>DuckDB)]:::secure
+      VM <==> LocalDuckDB
     end
 
-    VM <==> |tls| NATS
-    B <==> |wss| CF
-    B <-.-> |https<br>bridge/enroll| CF
-    UserMobile <==>|tls :4222, <br>DNS only| NATS
-    CF <==>HA
-    CF <==>|Origin Rule <br>:8080| NATS
-    UserMobile -.->|https <br>bridge/enroll| CF
-    HA <-.->|http<br>/enroll, <br>/status| Bridge
-    Prom -.->|http<br>scrapes| NatsExp
-    NatsExp -.->|tcp:8222| NATS
-    NATS <==>|tls:4222| Bridge
-    PG <==> |tcp| Bridge
-    Sweeper --> |tcp| PG
-    Prom -.->|http<br>scrapes <br>/metrics| Bridge
-    Prom -.->|outbound| Grafana
+    CF(["https://bridge.mydom.com/enroll"]):::orange-proxy
+    CF@{ shape: cloud }
+    CFWS(["ws.mydom.com :443<br>ORIGIN RULE → :8080"]):::orange-proxy
+    CFWS@{ shape: cloud }
+    CFNATS(["DNS only<br>nats.mydom.com"]):::grey-proxy
+    CFNATS@{ shape: cloud }
+
+    
+
+    subgraph VPS [NATS server or leaf node]
+        NATS[NATS<br>TLS :4222<br>WSS :8080]:::internal
+        NATS@{ shape: data-store }
+    end
+
+    CF <-.-> |https| B
+    CF <-.->|https| UserMobile
+    B <==> |wss://ws.mydom.com| CFWS
+    UserMobile <==>|wss://ws.mydom.com| CFWS
+    CFWS <==>|wss :8080| NATS
+    VM <==> |tls://nats.mydom.com:4222| CFNATS
+    CFNATS -.->|A record| NATS
 ```
 
-**Routing**: given a domain 'dom.com', we use the subdomains 'nats', 'ws' and 'bridge' with the following routes:
+**Routing**: given a domain 'mydom.com', we use the subdomains 'nats', 'ws' and 'bridge' with the following routes:
 
-The Cloudlfare reverse-proxy routes https://bridge.dom.com → vps:443 (orange proxy, Long term CF certs).
-Cloudflare routes wss://ws.dom.com → vps:8080.
-NATS traffic is tls://nats.dom.com, joined directly (topology 2) and has its own LetsEncrypt ceritifactes, that can apply for both ws.dom.com->vps:8080 or nats.dom.com->tls:4222.
+* Cloudflare **orange** proxies <https://bridge.mydom.com> on :443 (long-term CF certs) to HAProxy, which terminates TLS and forwards to the bridge on 127.0.0.1:27434.
+* Cloudflare **orange** proxies <wss://ws.mydom.com> on :443, and an Origin Rule rewrites the destination port to :8080. 8080 is on Cloudflare's plain-HTTP port list, so a secure websocket cannot open on it directly — it has to arrive on an HTTPS port (443, 2053, 2083, 2087, 2096, 8443) and be redirected at the edge.
+* Cloudflare **grey** (DNS only) resolves nats.mydom.com; the connection is joined directly, and NATS presents its own publicly-trusted certificate on tls:4222. A Cloudflare origin certificate will not do here, because phones connect without Cloudflare in between.
 
+**Why the two websocket-facing ports go through Cloudflare.** It is not for caching or inspection — Cloudflare caches no websocket frame, and the WAF only sees the opening HTTP 101 upgrade. It is for the firewall rule that becomes possible once it does: **443 and 8080 accept only Cloudflare's published ranges**, so neither port answers a scan or a flood, even though the grey nats.mydom.com record makes the origin address public. Only 4222 is open to the world, because `libzb` clients join it directly. The proxy also supplies the certificate on 8080, where a Cloudflare origin certificate is enough.
+
+The cost is that Cloudflare closes a proxied websocket after about 100 seconds with no traffic in either direction. `nats-server.conf.template` answers that server-side with `ping_interval: 45s` on the websocket block, so the server keeps the socket warm and no client needs configuring.
 
 |     client  |   address  |  route    |
 |    --  |   --  |  --    |
-| phone, native (libzb)  | tls://nats.dom.com:4222       | DNS only, straight to nat-servernats-server  |
-| browser        | wss://ws.dom.com, port 443 at Cloudflare | Cloudflare, then an Origin Rule to nats-server's websocket on 8080 |
-| anyone         | https://bridge.dom.com        | Cloudflare, then HAProxy on 443, then the bridge on 127.0.0.1:27434   |
-| Prometheus on the VPS | remote_write, outbound              | straight to Grafana Cloud, no inboud rule     |
+| native (libzb)  | <tls://nats.mydom.com:4222>       | Cloudflare **DNS only**, straight to nats-server  |
+| TS client        | <wss://ws.mydom.com>, port 443 at Cloudflare | Cloudflare, then an **Origin Rule** to nats-server's websocket on 8080 |
+| any         | <https://bridge.mydom.com>, port 443 at Cloudflare        | Cloudflare, then HAProxy on 443, then http to the bridge on 127.0.0.1:27434   |
+| Prometheus on the VPS | remote_write, outbound              | straight to Grafana Cloud, no inbound rule     |
 
 You can test on a VPS or bare metal with for example 6-vCPU, 24 GB RAM and 200GB NVMe SSD, and run comfortably the following stack: 
 
@@ -428,7 +394,7 @@ You can test on a VPS or bare metal with for example 6-vCPU, 24 GB RAM and 200GB
 This can serve the following clients:
 
 * browsers with a local `PGlite` (or `SQLite`) replica that connects over WSS to NATS,
-* mobiles with thier native in-process `SQLite` replica that connects to NATS over TLS,
+* mobiles with their native in-process `SQLite` replica that connects to NATS over TLS,
 * a warm micro-VM with an in-process `DuckDB` replica for fast analytics that connects to NATS over TLS.
 
 ## The daemon
@@ -1838,7 +1804,7 @@ For example, when all three run on host, during a spike (800 k writes/s), CPU us
 
 The strong setup puts **Postgres + zebridge + nats-server + Prometheus scrapper + nats-exporter + bridge_sweeper + HAProxy** together behind one boundary, one domain. Consumers connect directly to NATS via WSS and the reverse proxy fronts Prometheus (for a cloud Grafana) and ZeBridge's HTTP surface over TLS — for the consumer **JWT enrollment dance** (`/enroll`) — with a domain and whatever auth you put in front.
 
-The bridge holds no certificates of its own, and HAProxy should terminate the SSL (or sligtly less secure, the DNS Cloudflare).
+The bridge holds no certificates of its own, and HAProxy should terminate the SSL (or slightly less secure, Cloudflare's own certificate).
 
 
 ### Docker compose setup
