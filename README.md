@@ -188,6 +188,42 @@ The library abstracts away the complex choreography required to manage NATS stre
 
 The client library shrinks this orchestration down to a few primitives: `connect()`, `close()`, `newVersion()`, `query()`, `mutate()` and `onChange()`.
 
+### Which library, and which artifact
+
+Two independent questions. **Which library** depends on whether the host can link C.
+**Which artifact** depends on how that host expects to receive it.
+
+| host | library | artifact | needs installed |
+| -- | -- | -- | -- |
+| Flutter desktop | libzb, vendored | `.dylib` / `.so` | nothing |
+| a service in Python, Go, Rust, Zig… | libzb, vendored | `.dylib` / `.so` | only its own engine, if it uses one |
+| React Native (iOS **and** Android) | zb-client-ts | — | nothing native |
+| browser, Node, Electron, Deno, Bun | zb-client-ts | — | nothing |
+| native Swift on iOS | libzb, vendored | **static** `.a` | nothing |
+| native Kotlin on Android | libzb, vendored | **static** `.a`, linked into your JNI `.so` | nothing |
+
+The dividing line is not phone versus server — it is **whether you control what is
+installed**. On your own server, linking the system sqlite and zstd is fine and keeps the
+binary smaller. On a phone nothing is installed, so everything travels inside the app:
+
+    zig build -Doptimize=ReleaseFast -Dvendor=true      # sqlite + zstd compiled IN
+
+`-Dvendor` compiles both from sources pinned by hash in `build.zig.zon`, so a build does
+not depend on what a package manager happens to have installed, and cross-compiles for
+whatever target is asked for. It costs about 1.8 MB.
+
+Both phones take the **static** archive, for different reasons: iOS links archives or
+frameworks into the app, and on Android your own JNI shim is the `.so` with libzb linked
+into it. See `examples/08-map/native/README.md` for the exact commands, and NOTES §10ir.
+
+⚠️ Do not compare an archive against a shared library — 22 MB of `.a` is 4 MB once
+linked, for identical code. Object files keep every symbol, nothing is dead-stripped, and
+the linker pulls only what an app references.
+
+JavaScript hosts need no native build at all. That is why the React Native app in
+`examples/08-map/native` runs on both phones with one storage adapter and three small
+shims, while libzb was still learning to cross-compile.
+
 ### The complete setup steps at a glance
 
 * **Postgres**:
