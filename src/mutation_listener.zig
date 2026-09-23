@@ -607,7 +607,7 @@ pub const MutationListener = struct {
             return;
         };
 
-        var js = nats.JetStream.init(conn_nats, .{});
+        var js = nats.JetStream.init(conn_nats, .{ .domain = self.endpoint.js_domain });
 
         // `.stream` given explicitly rather than derived from the subject: grammar.json
         // names it, and the lookup path allocates a name the subscription then owns (see

@@ -22,7 +22,7 @@
 /// read-only connection is not available here the way `libzebridge` native has one).
 
 import { natsTransport } from './transport.ts';
-import type { Transport, TransportConnection } from './transport.ts';
+import type { Transport, TransportConnection, JetStreamOpts } from './transport.ts';
 import { decode, encode } from '@msgpack/msgpack';
 import type { Storage, StorageFactory, Exec as StorageExec } from './storage.ts';
 
@@ -86,6 +86,12 @@ export interface ZeBridgeConfig {
   /// this library is built for another protocol than the bridge it is pointed at.
   /// Unset skips the check (a bridge that could not be reached is not a mismatch).
   grammarHash?: string;
+  /// The JetStream domain the deployment's grants name — from the /enroll payload's
+  /// `js_domain` beside the JWT. Unset speaks to the server's own JetStream; a name
+  /// addresses `$JS.<name>.API.`, which is how a client on a leaf node reaches the
+  /// hub's. The wrong value is not detectable at connect: every API call simply gets
+  /// no responder, so it fails at the first request.
+  jsDomain?: string;
   /// The bridge's HTTP url to fetch the grammar hash automatically.
   bridgeUrl?: string;
   /** @internal The compiled-in grammar (§10dq). Not a consumer input: any value passed here is replaced. */
@@ -287,6 +293,12 @@ export class ZeBridge {
   public sql: StorageExec = async () => { throw new Error('Not connected'); };
   public transaction: Storage['transaction'] = async () => { throw new Error('Not connected'); };
   public deleteDatabaseFile: Storage['deleteDatabaseFile'] = async () => { throw new Error('Not connected'); };
+
+  /// The JetStream options every transport factory receives: the domain, when the
+  /// deployment has one (`config.jsDomain`), else nothing — the seam's default.
+  private jsOpts(): JetStreamOpts | undefined {
+    return this.config.jsDomain ? { domain: this.config.jsDomain } : undefined;
+  }
 
   private nc: TransportConnection | null = null;
   private storage!: Storage;
@@ -508,8 +520,8 @@ export class ZeBridge {
     const bucket = `${results.bucket_prefix ?? 'res-'}${tenant}`;
     const maxAgeNs = (results.max_age_seconds ?? 600) * 1_000_000_000;
     let os: any;
-    try { os = await this.transport.objectStoreCreate(this.nc!, bucket, { max_age_ns: maxAgeNs }); }
-    catch { os = await this.transport.objectStore(this.nc!, bucket); }
+    try { os = await this.transport.objectStoreCreate(this.nc!, bucket, { max_age_ns: maxAgeNs }, this.jsOpts()); }
+    catch { os = await this.transport.objectStore(this.nc!, bucket, this.jsOpts()); }
     const name = `ans-${this.clientIdValue}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     await os.putBlob({ name }, body);
     return new TextEncoder().encode(JSON.stringify({ zb_object: { bucket, name, bytes: body.length } }));
@@ -549,7 +561,7 @@ export class ZeBridge {
     try { parsed = JSON.parse(new TextDecoder().decode(body)); } catch { return null; }
     const env = parsed?.zb_object;
     if (!env?.bucket || !env?.name) return null;
-    const os = await this.transport.objectStore(this.nc!, env.bucket);
+    const os = await this.transport.objectStore(this.nc!, env.bucket, this.jsOpts());
     const blob = await this.objectBlob(os, env.bucket, env.name);
     if (!blob) throw new Error(`answer object ${env.name} is gone from ${env.bucket} (expired?)`);
     // §10ip: `maybeZstd` hands back its input untouched when the bytes are not a frame.
@@ -1178,7 +1190,7 @@ export class ZeBridge {
     if (!this.nc) return;
     try {
       return (async () => {
-        const watch = await watchBucket(this.transport.jetstream(this.nc!), this.config.grammar.kv.schemas);
+        const watch = await watchBucket(this.transport.jetstream(this.nc!, this.jsOpts()), this.config.grammar.kv.schemas);
         this.appendLog('SCHEMA', `Watching KV bucket "${this.config.grammar.kv.schemas}" for all tables...`, 'WATCH');
 
         return new Promise<void>((resolve) => {
@@ -2202,7 +2214,7 @@ export class ZeBridge {
     const info = await os.info(name);
     if (!info || info.deleted) return null;
     if (!info.chunks || !info.size) return new Uint8Array(0);
-    const js = this.transport.jetstream(this.nc!);
+    const js = this.transport.jetstream(this.nc!, this.jsOpts());
     const c = await js.consumers.get(`OBJ_${bucket}`, { filter_subjects: [`$O.${bucket}.C.${info.nuid}`] });
     const parts: Uint8Array[] = [];
     let got = 0;
@@ -2295,7 +2307,7 @@ export class ZeBridge {
     try {
       // allow_direct must be explicit: the KV open never asks the server, and the
       // grant covers ONLY the per-key Direct Get path (measured — App.tsx history).
-      const kv = await this.transport.kv(this.nc, this.config.grammar.kv.tenants, { allow_direct: true });
+      const kv = await this.transport.kv(this.nc, this.config.grammar.kv.tenants, { allow_direct: true }, this.jsOpts());
       const entry = await kv.get(this.config.principal);
       // A purged mapping (§10ce: `bridge --revoke`) leaves a DEL marker with an empty
       // value — that is "no mapping", not a tenant named "".
@@ -2366,7 +2378,7 @@ export class ZeBridge {
     const key = `${tenantForTable}.${table}`;
     const readManifest = async (): Promise<any | null> => {
       try {
-        const kv = await this.transport.kv(this.nc!, GEN.kv, { allow_direct: true });
+        const kv = await this.transport.kv(this.nc!, GEN.kv, { allow_direct: true }, this.jsOpts());
         const entry = await kv.get(key);
         // A swept chain (§10dg) leaves a DEL marker with an empty value: no manifest.
         if (!entry || entry.operation !== 'PUT' || !entry.value?.length) return null;
@@ -2395,7 +2407,7 @@ export class ZeBridge {
     let gateSeq = typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 ? manifest.cutoff_seq : 0;
     if (typeof manifest.cutoff_seq === 'number' && manifest.cutoff_seq > 0 && manifest.cdc_stream) {
       try {
-        const jsm = await this.transport.jetstreamManager(this.nc!);
+        const jsm = await this.transport.jetstreamManager(this.nc!, this.jsOpts());
         const info = await jsm.streams.info(manifest.cdc_stream);
         const st = info.state;
         const first = st.first_seq;
@@ -2423,7 +2435,7 @@ export class ZeBridge {
     }
 
     let os: any;
-    try { os = await this.transport.objectStore(this.nc, manifest.bucket); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
+    try { os = await this.transport.objectStore(this.nc, manifest.bucket, this.jsOpts()); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
     // §10x: a delta names the dictionary it was compressed with. Fetched once
     // per era from the same bucket, kept in memory AND in _zebridge_dicts so a
     // reconnect does not re-download it; immutable by name, so never stale.
@@ -2608,8 +2620,8 @@ export class ZeBridge {
     let js: ReturnType<typeof this.transport.jetstream>;
     let jsm: Awaited<ReturnType<typeof this.transport.jetstreamManager>>;
     try {
-      js = this.transport.jetstream(this.nc);
-      jsm = await this.transport.jetstreamManager(this.nc);
+      js = this.transport.jetstream(this.nc, this.jsOpts());
+      jsm = await this.transport.jetstreamManager(this.nc, this.jsOpts());
     } catch (e) {
       this.appendLog('SYS', `subscribeStreams: connection unavailable (${e}) — the next reconnect retries`, 'WARNING');
       return;
@@ -3134,7 +3146,7 @@ export class ZeBridge {
     if (!this.nc || !rows.length) return settled;
     const stream = this.config.grammar.streams?.mutations ?? 'MUTATIONS';
     let jsm: any;
-    try { jsm = await this.transport.jetstreamManager(this.nc); } catch { return settled; }
+    try { jsm = await this.transport.jetstreamManager(this.nc, this.jsOpts()); } catch { return settled; }
     // ⚠️ The DIRECT form only. `jsm.streams.getMessage` is the legacy
     // `$JS.API.STREAM.MSG.GET.<stream>` request, which the client JWT does not grant
     // (and must not: it is not scopable per key). Without `jsm.direct` there is
@@ -3367,7 +3379,7 @@ export class ZeBridge {
     // JetStream publish, not core: the PubAck proves durability (not application —
     // the verdict/echo decide that), and `duplicate: true` is a success.
     try {
-      const ack = await this.transport.jetstream(this.nc).publish(subject, encode(payload), { headers: h });
+      const ack = await this.transport.jetstream(this.nc, this.jsOpts()).publish(subject, encode(payload), { headers: h });
       this.appendLog(subject, { ...payload, _ack: { seq: ack.seq, duplicate: ack.duplicate } }, 'MUTATION OUT');
     } catch (err) {
       this.appendLog(subject, `not accepted by JetStream: ${err}`, 'ERROR');
@@ -3434,7 +3446,7 @@ export class ZeBridge {
         const h = this.transport.headers();
         h.set('Nats-Msg-Id', r.msg_id);
         this.pendingWrites.set(r.msg_id, { table: r.tbl, id: r.row_id, at: Date.now(), version: outboxVersionOf(r) });
-        const ack = await this.transport.jetstream(this.nc).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
+        const ack = await this.transport.jetstream(this.nc, this.jsOpts()).publish(r.subject, encode(JSON.parse(r.payload)), { headers: h });
         this.appendLog('OUTBOX', `replayed ${r.msg_id} (seq ${ack.seq}${ack.duplicate ? ', duplicate — already landed' : ''})`, 'INFO');
       } catch (err) {
         this.appendLog('OUTBOX', `replay of ${r.msg_id} failed, kept for next connection: ${err}`, 'ERROR');
@@ -3457,7 +3469,7 @@ export class ZeBridge {
     const subject = `$KV.${bucket}.${tenant}.${this.config.principal}`;
     try {
       const payload = heartbeatPayload(this.config.principal, tenant, Date.now(), this.globalSyncState.seq);
-      await this.transport.jetstream(this.nc).publish(subject, new TextEncoder().encode(payload));
+      await this.transport.jetstream(this.nc, this.jsOpts()).publish(subject, new TextEncoder().encode(payload));
     } catch (err) {
       this.appendLog('SYS', `heartbeat not accepted (${subject}): ${err}`, 'WARNING');
     }

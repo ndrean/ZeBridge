@@ -1,0 +1,69 @@
+diff --git a/src/jetstream.zig b/src/jetstream.zig
+index 5d382c6..52dc083 100644
+--- a/src/jetstream.zig
++++ b/src/jetstream.zig
+@@ -464,7 +464,7 @@ pub const PullSubscription = struct {
+ 
+     /// The pull API subject for this consumer, allocated from `a`.
+     fn nextSubject(self: *PullSubscription, a: std.mem.Allocator) ![]u8 {
+-        return std.fmt.allocPrint(a, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.stream_name, self.consumer_name });
++        return self.js.apiSubject(a, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
+     }
+ 
+     /// Fetch a batch of messages from the pull consumer
+@@ -524,7 +524,7 @@ pub const PullSubscription = struct {
+         defer self.js.nc.allocator.free(request_json);
+ 
+         // Build the full API subject
+-        const api_subject = try std.fmt.allocPrint(self.js.nc.allocator, "{s}CONSUMER.MSG.NEXT.{s}.{s}", .{ default_api_prefix, self.stream_name, self.consumer_name });
++        const api_subject = try self.js.apiSubject(self.js.nc.allocator, "CONSUMER.MSG.NEXT.{s}.{s}", .{ self.stream_name, self.consumer_name });
+         defer self.js.nc.allocator.free(api_subject);
+ 
+         // Send the pull request with reply subject
+@@ -900,7 +900,10 @@ pub const PullSubscribeOptions = struct {
+ 
+ pub const JetStreamOptions = struct {
+     request_timeout: Io.Timeout = default_request_timeout,
+-    // Add options here
++    /// The JetStream domain to address. Null speaks to the server's own JetStream at
++    /// `$JS.API.`; a name speaks to that domain at `$JS.<domain>.API.` — what a client
++    /// on a leaf node uses to reach the hub's JetStream (nats.go's `nats.Domain`).
++    domain: ?[]const u8 = null,
+ };
+ 
+ pub const JetStream = struct {
+@@ -914,8 +917,16 @@ pub const JetStream = struct {
+         };
+     }
+ 
++    /// An API subject under this context's prefix: `$JS.API.<tail>`, or
++    /// `$JS.<domain>.API.<tail>` when a domain is set. Every request the context
++    /// sends is built here, so the domain is decided in one place.
++    pub fn apiSubject(self: JetStream, a: std.mem.Allocator, comptime tail_fmt: []const u8, args: anytype) ![]u8 {
++        if (self.opts.domain) |d| return std.fmt.allocPrint(a, "$JS.{s}.API." ++ tail_fmt, .{d} ++ args);
++        return std.fmt.allocPrint(a, default_api_prefix ++ tail_fmt, args);
++    }
++
+     fn sendRequest(self: JetStream, subject: []const u8, payload: []const u8) !*Message {
+-        const full_subject = try std.fmt.allocPrint(self.nc.allocator, "{s}{s}", .{ default_api_prefix, subject });
++        const full_subject = try self.apiSubject(self.nc.allocator, "{s}", .{subject});
+         defer self.nc.allocator.free(full_subject);
+ 
+         return try self.nc.request(full_subject, payload, self.opts.request_timeout);
+@@ -2055,3 +2066,16 @@ pub const JetStream = struct {
+         return jetstream_objstore.ObjectStoreManager.init(self);
+     }
+ };
++
++test "apiSubject: no domain is $JS.API., a domain is $JS.<domain>.API." {
++    const a = std.testing.allocator;
++    const plain = JetStream{ .nc = undefined, .opts = .{} };
++    const s1 = try plain.apiSubject(a, "CONSUMER.MSG.NEXT.{s}.{s}", .{ "CDC_kilo", "c1" });
++    defer a.free(s1);
++    try std.testing.expectEqualStrings("$JS.API.CONSUMER.MSG.NEXT.CDC_kilo.c1", s1);
++
++    const hub = JetStream{ .nc = undefined, .opts = .{ .domain = "hub" } };
++    const s2 = try hub.apiSubject(a, "{s}", .{"INFO"});
++    defer a.free(s2);
++    try std.testing.expectEqualStrings("$JS.hub.API.INFO", s2);
++}

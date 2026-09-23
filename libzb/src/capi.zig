@@ -36,8 +36,9 @@
 //! a name in both lists is on-demand),
 //! clientId (stable across restarts — it is the msg_id prefix), grammarHash
 //! (optional: the hash the host received from /enroll or GET /grammar; a mismatch
-//! refuses to open). The grammar itself is compiled in — `zb_grammar_hash()` says
-//! which (§10dq).
+//! refuses to open), jsDomain (optional: the /enroll payload's `js_domain` — the
+//! JetStream domain the grants name, when JetStream is reached across a leaf link).
+//! The grammar itself is compiled in — `zb_grammar_hash()` says which (§10dq).
 //!
 //! `fn` names a fixture section of core-fixtures.json; `args_json` is that
 //! case's input fields verbatim; the return value is the expected output as
@@ -348,6 +349,7 @@ const ClientBox = struct {
     url: [:0]u8,
     creds: [:0]u8,
     grammar_hash: ?[]u8,
+    js_domain: ?[]u8,
     db: [:0]u8,
     principal: [:0]u8,
     client_id: [:0]u8,
@@ -360,6 +362,7 @@ const ClientBox = struct {
         a.free(self.url);
         a.free(self.creds);
         if (self.grammar_hash) |g| a.free(g);
+        if (self.js_domain) |d| a.free(d);
         a.free(self.db);
         a.free(self.principal);
         a.free(self.client_id);
@@ -424,6 +427,11 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
     const gh_raw = str.get(o, "grammarHash", "");
     const grammar_hash: ?[]u8 = if (gh_raw.len > 0) try a.dupe(u8, gh_raw) else null;
     errdefer if (grammar_hash) |g| a.free(g);
+    // "jsDomain": the /enroll payload's `js_domain`, when the deployment reaches
+    // JetStream across a leaf link. Empty = the server's own JetStream.
+    const jd_raw = str.get(o, "jsDomain", "");
+    const js_domain: ?[]u8 = if (jd_raw.len > 0) try a.dupe(u8, jd_raw) else null;
+    errdefer if (js_domain) |d| a.free(d);
     const db = try a.dupeZ(u8, str.get(o, "dbPath", "zb.sqlite3"));
     errdefer a.free(db);
     // dbUrl (§10fd): a PostgreSQL replica instead of the SQLite file.
@@ -505,6 +513,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
             .url = url,
             .creds_path = creds,
             .grammar_hash = grammar_hash,
+            .js_domain = js_domain,
             .heartbeat_ms = heartbeat_ms,
             .seed_chunk_rows = seed_chunk_rows,
             .seed_streaming = seed_streaming,
@@ -521,6 +530,7 @@ fn openBox(a: std.mem.Allocator, text: []const u8) !*ClientBox {
         .url = url,
         .creds = creds,
         .grammar_hash = grammar_hash,
+        .js_domain = js_domain,
         .db = db,
         .principal = principal,
         .client_id = client_id,

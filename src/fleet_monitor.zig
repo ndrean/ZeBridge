@@ -235,7 +235,7 @@ pub const FleetMonitor = struct {
         defer conn.deinit();
         const url = try self.endpoint.dialUrl(a);
         try conn.connect(url);
-        const js = conn.jetstream(.{});
+        const js = conn.jetstream(.{ .domain = self.endpoint.js_domain });
 
         var kv = try self.openLive(js);
         defer kv.deinit();

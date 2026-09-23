@@ -313,7 +313,7 @@ pub const GenerationProducer = struct {
         defer conn_nats.deinit();
         const url = try self.endpoint.dialUrl(alloc);
         try conn_nats.connect(url);
-        var js = conn_nats.jetstream(.{});
+        var js = conn_nats.jetstream(.{ .domain = self.endpoint.js_domain });
 
         const StreamRead = struct { first: u64, last: u64, rate: f64, fill: f64, to_cap_s: f64, max_age_s: f64 };
         var reads: std.StringArrayHashMapUnmanaged(StreamRead) = .empty;
@@ -427,7 +427,7 @@ pub const GenerationProducer = struct {
         defer cs.close();
         const pgc = cs.pgc;
         const bkc = cs.bkc;
-        var js = cs.conn_nats.jetstream(.{});
+        var js = cs.conn_nats.jetstream(.{ .domain = self.endpoint.js_domain });
 
         // ── derive the pair list: the publication IS the list ────────────────
         // Minus internals (zebridge_is_internal_table — one predicate, every door),
@@ -669,7 +669,7 @@ pub const GenerationProducer = struct {
     /// IN FLIGHT, not of all its builds (the tick's arena used to hold every one of
     /// them until the tick ended).
     fn workLoop(self: *GenerationProducer, cs: *Conns, jobs: []const Job, next: *std.atomic.Value(usize)) void {
-        var js = cs.conn_nats.jetstream(.{});
+        var js = cs.conn_nats.jetstream(.{ .domain = self.endpoint.js_domain });
         while (true) {
             const i = next.fetchAdd(1, .acq_rel);
             if (i >= jobs.len or self.should_stop.load(.acquire)) return;
@@ -2056,7 +2056,7 @@ pub const GenerationProducer = struct {
         defer cs.close();
         const pgc = cs.pgc;
         const bkc = cs.bkc;
-        var js = cs.conn_nats.jetstream(.{});
+        var js = cs.conn_nats.jetstream(.{ .domain = self.endpoint.js_domain });
         const table = j.table;
         const tenant = j.tenant;
         const table_z = try alloc.dupeZ(u8, table);

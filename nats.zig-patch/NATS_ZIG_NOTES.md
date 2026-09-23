@@ -634,3 +634,36 @@ answer that travelled as an object and arrived whole in both client libraries.
 
 ---
 
+## 15. The JetStream domain is now the caller's choice (2026-09-23)
+
+**How it appeared**
+
+A client on a NATS leaf node reaches the hub's JetStream only under `$JS.<domain>.API.`
+(ZeBridge §10hl: every `$JS.API` request from a leaf gets NoResponders). `JetStream` built
+every API subject from a `const default_api_prefix = "$JS.API."` at three sites —
+`sendRequest`, and the pull consumer's `CONSUMER.MSG.NEXT` in `nextSubject` and `fetch` —
+so a caller had no way to say which JetStream it meant. nats.go spells this `nats.Domain`,
+nats.js `{ domain }` on `jetstream()`/`jetstreamManager()`.
+
+**Change** (`nats.zig-jetstream-domain.patch`, 5 hunks, 1 file)
+
+`src/jetstream.zig` — `domain: ?[]const u8 = null` on `JetStreamOptions`; a public
+`JetStream.apiSubject(a, tail_fmt, args)` that renders `$JS.API.<tail>` or
+`$JS.<domain>.API.<tail>`; the three sites call it. KV and object stores need nothing:
+their `$KV.` and `$O.` subjects are data, not API, and their API calls already go through
+`sendRequest`. Null keeps every existing caller on the plain prefix. One unit test.
+
+**Verified**
+
+```bash
+cd nats.zig && zig build test-unit          # 135/135 (+1)
+git -C nats.zig apply -R --check …          # reverses cleanly
+```
+
+Live, ZeBridge §10is: against a server with `jetstream { domain: hub }` and `-DV`, a
+`JetStream` with `.domain = "hub"` published `PUB $JS.hub.API.STREAM.INFO.KV_tenants` and
+got the hub's answer; with `.domain = "other"` the server returned `503` with
+`Nats-Subject: $JS.other.API.STREAM.INFO.KV_tenants`.
+
+---
+

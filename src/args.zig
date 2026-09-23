@@ -17,6 +17,7 @@ const usage =
     \\  --gen-nkey      Mint the bridge<->NATS nkey pair (seed to stdout, once)
     \\  --diagnose      Pre-run doctor: report everything boot would decide, write nothing
     \\  --init-nats [dev|operator]  Generate the whole NATS stack, no nsc (--force overwrites)
+    \\      [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
     \\  --revoke <principal>  Revoke: mapping + unused invites, three-clock narration.
     \\  --view-slots    Every replication slot on the server: active, pid, LSNs, retained WAL
     \\  --view-slot <slot>  The same for one slot
@@ -45,6 +46,8 @@ const usage =
     \\  NATS_TLS_CERT, NATS_TLS_KEY  with tls://: a client certificate, both or neither (mTLS)
     \\  NATS_TLS_SERVER_NAME  with tls://: the name the server certificate must carry, when
     \\                        it differs from the dialed host (a public name, dialed on 127.0.0.1)
+    \\  NATS_JS_DOMAIN        the JetStream domain to address, when JetStream is reached across
+    \\                        a leaf link (API subjects, grants and /enroll all carry it)
     \\  BASE_BUF              log2 of per-event data buffer (10-20 by default)
     \\  BASE_BUF_MAX          Raise BASE_BUF's ceiling past 20 (to at most 24), for a
     \\                        deployment that has also raised NATS's own max_payload.
@@ -534,6 +537,16 @@ pub const Args = struct {
         runtime_config.nats_tls_cert = init.minimal.environ.getPosix("NATS_TLS_CERT");
         runtime_config.nats_tls_key = init.minimal.environ.getPosix("NATS_TLS_KEY");
         runtime_config.nats_tls_server_name = init.minimal.environ.getPosix("NATS_TLS_SERVER_NAME");
+        runtime_config.nats_js_domain = blk: {
+            const v = init.minimal.environ.getPosix("NATS_JS_DOMAIN") orelse break :blk null;
+            // A subject token: no dots, no spaces, no wildcards. Anything else renders
+            // grants and API subjects nobody can match.
+            for (v) |ch| if (ch == '.' or ch == ' ' or ch == '*' or ch == '>') {
+                log.err("NATS_JS_DOMAIN='{s}' is not a subject token (no '.', ' ', '*', '>')", .{v});
+                return error.InvalidConfig;
+            };
+            break :blk if (v.len == 0) null else v;
+        };
         if ((runtime_config.nats_tls_cert == null) != (runtime_config.nats_tls_key == null)) {
             log.err("NATS_TLS_CERT and NATS_TLS_KEY go together: set both or neither", .{});
             return error.InvalidConfig;

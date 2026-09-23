@@ -30,12 +30,14 @@ const Args = struct {
     max_wait_s: u64 = 600,
     poll_ms: u64 = 500,
     client_id: []const u8 = "zb-cli",
+    /// The JetStream domain, when the deployment reaches JetStream across a leaf link.
+    js_domain: ?[]const u8 = null,
 };
 
 fn usage() void {
     std.debug.print(
         \\usage: zb sync --creds <file> --principal <name> --tables <a,b> [--db <path>] [--engine sqlite|duckdb]
-        \\               [--db-url postgres://…] [--url nats://…] [--once] [--stream] [--max-wait-s N] [--poll-ms N]
+        \\               [--db-url postgres://…] [--url nats://…] [--js-domain NAME] [--once] [--stream] [--max-wait-s N] [--poll-ms N]
         \\
     , .{});
 }
@@ -66,7 +68,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else {
             i += 1;
             const v = next.?;
-            if (std.mem.eql(u8, arg, "--url")) args.url = v else if (std.mem.eql(u8, arg, "--creds")) args.creds = v else if (std.mem.eql(u8, arg, "--principal")) args.principal = v else if (std.mem.eql(u8, arg, "--tables")) args.tables = v else if (std.mem.eql(u8, arg, "--db")) args.db = try a.dupeZ(u8, v) else if (std.mem.eql(u8, arg, "--db-url")) args.db_url = try a.dupeZ(u8, v) else if (std.mem.eql(u8, arg, "--client-id")) args.client_id = v else if (std.mem.eql(u8, arg, "--engine")) {
+            if (std.mem.eql(u8, arg, "--url")) args.url = v else if (std.mem.eql(u8, arg, "--creds")) args.creds = v else if (std.mem.eql(u8, arg, "--principal")) args.principal = v else if (std.mem.eql(u8, arg, "--tables")) args.tables = v else if (std.mem.eql(u8, arg, "--db")) args.db = try a.dupeZ(u8, v) else if (std.mem.eql(u8, arg, "--db-url")) args.db_url = try a.dupeZ(u8, v) else if (std.mem.eql(u8, arg, "--client-id")) args.client_id = v else if (std.mem.eql(u8, arg, "--js-domain")) args.js_domain = v else if (std.mem.eql(u8, arg, "--engine")) {
                 args.engine = if (std.mem.eql(u8, v, "duckdb")) .duckdb else if (std.mem.eql(u8, v, "sqlite")) .sqlite else {
                     std.debug.print("--engine: sqlite or duckdb (postgres is --db-url)\n", .{});
                     return 2;
@@ -95,6 +97,7 @@ pub fn main(init: std.process.Init) !u8 {
         .principal = args.principal,
         .tables = tables.items,
         .client_id = args.client_id,
+        .js_domain = args.js_domain,
         .heartbeat_ms = 0,
         .seed_streaming = args.stream,
     });

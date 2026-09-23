@@ -73,6 +73,19 @@ before any socket carries the wrong names. A bridge that cannot be reached is no
 mismatch: the client opens on its own copy, since NATS holds everything a provisioned
 replica needs.
 
+**A JetStream domain is deployment, not grammar.** When JetStream is reached across a
+leaf link, every API subject moves from `$JS.API.` to `$JS.<domain>.API.`. The domain is
+not in `grammar.json`: it is a topology choice, and a grammar bound to one would make the
+client packages deployment-specific. It travels beside the credentials instead. The bridge
+reads `NATS_JS_DOMAIN`; `--init-nats --js-domain <name>` writes the same name into the
+server conf (`jetstream { domain }`), the grants (every `$JS.<name>.API.…` allow) and
+`.env.bridge`; and the `/enroll` payload carries it as `js_domain`, absent when the
+deployment has none. A client passes it as `jsDomain` (zb-client-ts, and libzb's open
+options) and every request it makes — streams, consumers, KV, object stores — goes under
+that prefix. A wrong domain is not a mismatch the client can detect at connect: the
+first request simply finds no responder (`503`, `Nats-Subject: $JS.<wrong>.API.…`), the
+same symptom as a missing grant.
+
 The grammar carries only the static wire names — `streams`, `subjects`, `kv`,
 `cdc_streams`, `open_tenant`, `generations`. Which tables replicate, and their tenancy
 and LWW columns, is not in this file: that lives in `zebridge_catalogue` (§8).

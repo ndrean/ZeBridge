@@ -448,7 +448,10 @@ purge, `mutation_ack.bob.>`, forging a verdict) are manual, recorded in NOTES §
 
 ⚠️ **JetStream denials surface as client timeouts, not errors.** The server drops the
 denied `$JS.API.…` publish and the caller waits out its own deadline. A too-narrow
-allow-list looks like a hung broker.
+allow-list looks like a hung broker. A wrong JetStream domain looks the same: a client
+asking `$JS.<other>.API.…` on a hub whose domain is `hub` gets a `503` with the subject
+in `Nats-Subject`, and nothing else — check `NATS_JS_DOMAIN` and the `js_domain` the
+client was enrolled with before suspecting the allow-list.
 
 ⚠️ **A password in a browser bundle is enforced, not secret.** It authenticates the bundle,
 not the person. That is why JWT is the endpoint (§2.4).

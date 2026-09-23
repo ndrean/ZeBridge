@@ -11,6 +11,10 @@ import { Objm } from '@nats-io/obj';
 
 /// What the core-shell needs from a live connection — the dial may return any
 /// object honouring this shape (structural, like the storage Exec).
+export interface JetStreamOpts {
+  domain?: string;
+}
+
 export interface TransportConnection {
   close(): Promise<void>;
   status(): AsyncIterable<unknown>;
@@ -37,13 +41,17 @@ export interface Transport {
   connect(opts: Record<string, unknown>): Promise<any>;
   credsAuthenticator(creds: Uint8Array): unknown;
   headers(): any;
-  jetstream(nc: any): any;
-  jetstreamManager(nc: any): Promise<any>;
-  kv(nc: any, bucket: string, opts?: Record<string, unknown>): Promise<any>;
-  objectStore(nc: any, bucket: string): Promise<any>;
+  /// `js.domain`: the JetStream domain to address — `$JS.<domain>.API.` instead of
+  /// `$JS.API.` — when JetStream is reached across a leaf link. Absent is the
+  /// server's own JetStream. Every factory takes it, since every one of them talks
+  /// to the API (a KV or object store is a stream underneath).
+  jetstream(nc: any, js?: JetStreamOpts): any;
+  jetstreamManager(nc: any, js?: JetStreamOpts): Promise<any>;
+  kv(nc: any, bucket: string, opts?: Record<string, unknown>, js?: JetStreamOpts): Promise<any>;
+  objectStore(nc: any, bucket: string, js?: JetStreamOpts): Promise<any>;
   /// §10hq: the answer bucket of a tenant, created on first use with a `max_age` so
   /// the answers in it expire on their own. Opening an existing one is not an error.
-  objectStoreCreate(nc: any, bucket: string, opts: { max_age_ns: number }): Promise<any>;
+  objectStoreCreate(nc: any, bucket: string, opts: { max_age_ns: number }, js?: JetStreamOpts): Promise<any>;
   deliverPolicy: typeof DELIVER_POLICY;
 }
 
@@ -51,10 +59,12 @@ export const natsTransport: Transport = {
   connect: (opts) => wsconnect(opts as any),
   credsAuthenticator: (creds) => credsAuthenticator(creds),
   headers: () => headers(),
-  jetstream: (nc) => jetstream(nc),
-  jetstreamManager: (nc) => jetstreamManager(nc),
-  kv: (nc, bucket, opts) => new Kvm(nc).open(bucket, opts as any),
-  objectStore: (nc, bucket) => new Objm(nc).open(bucket),
-  objectStoreCreate: (nc, bucket, opts) => new Objm(nc).create(bucket, { max_age: opts.max_age_ns, description: 'ZeBridge answers (§10hq)' } as any),
+  jetstream: (nc, js) => jetstream(nc, js),
+  jetstreamManager: (nc, js) => jetstreamManager(nc, js),
+  // Kvm and Objm take a connection OR a JetStream client; handing them the client
+  // built with the domain is how the domain reaches the bucket's own API calls.
+  kv: (nc, bucket, opts, js) => new Kvm(jetstream(nc, js)).open(bucket, opts as any),
+  objectStore: (nc, bucket, js) => new Objm(jetstream(nc, js)).open(bucket),
+  objectStoreCreate: (nc, bucket, opts, js) => new Objm(jetstream(nc, js)).create(bucket, { max_age: opts.max_age_ns, description: 'ZeBridge answers (§10hq)' } as any),
   deliverPolicy: DELIVER_POLICY,
 };

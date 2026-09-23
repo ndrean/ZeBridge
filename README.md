@@ -453,6 +453,7 @@ We have added tools in Postgres to diagnose tables as:
 SELECT * FROM zebridge_enable('public.orders', tenant_col => 'tenant_id', writable => true, version_col => 'updated_at', tombstone_col => 'deleted_at', publication => 'my_pub', dry_run => false);
 ```
 This reports every rule before touching anything, and `bridge --diagnose` checks a whole database, the cascade rule included. See [diagnose](#diagnose).
+A leaf topology gives the hub's JetStream a **domain**; the bridge, the grants and both client libraries carry it as one setting (`NATS_JS_DOMAIN`, `--init-nats --js-domain`, `jsDomain`), and a client learns it from `/enroll`. See PROTOCOL §1.
 * **Suspension**: 🚦 When a table stops meeting a rule while the bridge runs, the bridge **suspends** it and keeps everything else flowing. Fix the table and most suspensions lift by themselves; two cases need a restart, [Suspended tables](#suspended-tables) and [Restart rules](#restart-rules).
 * **Soft-delete Cascade Transaction Mitigation with Sweeper**: when consumers apply _soft-deletion_ this can lead to bloated databases. Soft deletion is enforced by using a `tombstone` column in the schema.
 The client library always applies a local HARD DELETE, but a _soft delete_ (via the `tombstone` timestampz) is sent to Postgres. ZeBridge solves the Postgres bloat with a companion garbage collector, the `bridge_sweeper` daemon which runs with a WRITER privilege.
@@ -760,6 +761,7 @@ SELECT slot_name, active,
  zb_probe  | f      | 1289 MB
  my_slot   | t      | 56 bytes
 ```
+      [--js-domain NAME]      …for a JetStream reached across a leaf link (conf, grants, env)
 
 💡 Drop one if unused:
 
@@ -2117,6 +2119,7 @@ jetstream {
     max_file_store: 10GB
 }
 
+* `NATS_JS_DOMAIN` — optional: the JetStream domain, when JetStream is reached across a leaf link. The bridge then addresses `$JS.<domain>.API.`, and `/enroll` hands the name to every client as `js_domain` (they pass it as `jsDomain`). Generate the matching server conf and grants with `--init-nats operator --js-domain <name>`.
 accounts {
   BRIDGE: {
     jetstream: {

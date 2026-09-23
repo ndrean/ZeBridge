@@ -19,6 +19,10 @@ pub const ConnectOptions = struct {
     /// inside a `_INBOX.<principal>.>` grant; the library's default `_INBOX` is one
     /// space every principal listens in.
     inbox_prefix: []const u8 = "_INBOX",
+    /// The JetStream domain to address — `$JS.<domain>.API.` instead of `$JS.API.` —
+    /// when JetStream is reached across a leaf link. The /enroll payload's `js_domain`
+    /// says whether the deployment has one; null is the server's own JetStream.
+    js_domain: ?[]const u8 = null,
 };
 
 /// §10fh: a chain object read through a PULL consumer, a few chunks at a time — the
@@ -176,7 +180,7 @@ pub const Transport = struct {
         });
         errdefer self.conn.deinit();
         try self.conn.connect(opts.url);
-        self.js = self.conn.jetstream(.{});
+        self.js = self.conn.jetstream(.{ .domain = opts.js_domain });
         return self;
     }
 

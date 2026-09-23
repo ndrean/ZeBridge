@@ -84,6 +84,10 @@ pub const Server = struct {
         /// (found by jwt_expiry.py, 2026-09-04 — the minted exp was 86400 s under a
         /// requested 5).
         ttl_seconds: i64,
+        /// The JetStream domain the grants were minted for (NATS_JS_DOMAIN). Handed to
+        /// the client in the payload as `js_domain`, so it addresses the same API the
+        /// grants name; absent when the deployment has none.
+        js_domain: ?[]const u8 = null,
     };
 
     pub fn init(
@@ -476,7 +480,10 @@ pub const Server = struct {
         // bootstraps from nothing but a URL and an invite code, no file to copy.
         var ghash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(topology_mod.embedded_json, &ghash, .{});
-        const body = try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\",\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, topology_mod.embedded_json });
+        const body = if (ctx.js_domain) |d|
+            try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\",\"js_domain\":\"{s}\",\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, d, topology_mod.embedded_json })
+        else
+            try std.fmt.allocPrint(self.allocator, "{{\"jwt\":\"{s}\",\"principal\":\"{s}\",\"grammar_hash\":\"{x}\",\"grammar\":{s}}}\n", .{ jwt, principal, &ghash, topology_mod.embedded_json });
         defer self.allocator.free(body);
         log.info("🎟️ enrolled '{s}' (tenant '{s}', {d} membership(s) tagged) — JWT minted, mapping registered", .{ principal, tenant, tenants.len });
         try req.respond(body, .{ .status = .ok, .extra_headers = cors });

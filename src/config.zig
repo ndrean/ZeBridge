@@ -90,6 +90,11 @@ pub const Nats = struct {
         /// the dialed host differs (a certificate for nats.my-domain.com, dialed on
         /// 127.0.0.1).
         tls_server_name: ?[]const u8 = null,
+        /// NATS_JS_DOMAIN: the JetStream domain to address, null = the server's own
+        /// (`$JS.API.`). Set when the bridge or its clients reach JetStream across a
+        /// leaf link: every API subject becomes `$JS.<domain>.API.`, the grants
+        /// `--init-nats` mints say the same, and /enroll hands the name to clients.
+        js_domain: ?[]const u8 = null,
 
         pub const ParseError = error{ MissingScheme, BadPort };
 
@@ -143,6 +148,7 @@ pub const Nats = struct {
             out.tls_cert = rc.nats_tls_cert;
             out.tls_key = rc.nats_tls_key;
             out.tls_server_name = rc.nats_tls_server_name;
+            out.js_domain = rc.nats_js_domain;
             return out;
         }
 
@@ -783,6 +789,7 @@ pub const RuntimeConfig = struct {
     nats_tls_cert: ?[]const u8 = null, // NATS_TLS_CERT, client certificate (mTLS)
     nats_tls_key: ?[]const u8 = null, // NATS_TLS_KEY
     nats_tls_server_name: ?[]const u8 = null, // NATS_TLS_SERVER_NAME, when the dialed host differs
+    nats_js_domain: ?[]const u8 = null, // NATS_JS_DOMAIN, a JetStream domain reached across a leaf link
 
     // Batch settings
     batch_max_events: usize,

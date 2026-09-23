@@ -166,7 +166,7 @@ pub const Publisher = struct {
         try conn.connect(url);
 
         self.conn = conn;
-        self.js = nats.JetStream.init(conn, .{});
+        self.js = nats.JetStream.init(conn, .{ .domain = self.config.endpoint.js_domain });
 
         log.info("🟢 Connected to NATS at {s}:{d}", .{ ep.host, ep.port });
         log.info("✅ JetStream context acquired", .{});

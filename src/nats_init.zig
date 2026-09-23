@@ -86,7 +86,36 @@ fn writeFile(io: std.Io, path: []const u8, bytes: []const u8, force: bool) !void
 /// a service that answers from a replica cannot write to PostgreSQL through the bridge.
 const Role = enum { client, responder };
 
-fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Role) !struct { pub_json: []u8, sub_json: []u8 } {
+/// The JetStream API prefix for a domain: none is the server's own `$JS.API.`; a name
+/// is `$JS.<name>.API.` — what a client on a leaf node dials to reach the hub's
+/// JetStream. The running bridge builds the same subjects from NATS_JS_DOMAIN
+/// (`JetStreamOptions.domain`), and /enroll hands the name to every client.
+fn jsApiPrefix(a: std.mem.Allocator, domain: ?[]const u8) ![]const u8 {
+    const d = domain orelse return "$JS.API.";
+    return std.fmt.allocPrint(a, "$JS.{s}.API.", .{d});
+}
+
+test "roleAllows names the API under the domain's prefix, or the plain one" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const owned = try topology_mod.loadEmbedded(aa);
+    const plain = try roleAllows(aa, &owned.topology, .client, try jsApiPrefix(aa, null));
+    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "\"$JS.API.INFO\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.pub_json, "$JS.hub.") == null);
+    const hub = try roleAllows(aa, &owned.topology, .responder, try jsApiPrefix(aa, "hub"));
+    try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "\"$JS.hub.API.INFO\"") != null);
+    // Nothing under the plain prefix survives: a grant there would let a client
+    // talk to the wrong JetStream.
+    try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "$JS.API.") == null);
+    // The ack subjects carry the domain too, and `$JS.ACK.>` still covers them.
+    try std.testing.expect(std.mem.indexOf(u8, hub.pub_json, "\"$JS.ACK.>\"") != null);
+}
+
+/// `js_api` is the JetStream API prefix the grants name — `$JS.API.` or, with a
+/// domain, `$JS.<domain>.API.` (see `jsApiPrefix`): a client reaches JetStream only
+/// through subjects under it, so the grants and the deployment must agree.
+fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Role, js_api: []const u8) !struct { pub_json: []u8, sub_json: []u8 } {
     const cdc_pre = topo.cdc_stream_prefix; // "CDC_"
     const cdc_pub = topo.cdc_stream_public; // "CDC_PUBLIC"
     const kv_schemas = topo.kv_schemas;
@@ -110,54 +139,54 @@ fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Ro
     };
 
     if (role == .client) try P.add(&pubs, a, "{s}.{{{{name()}}}}.>", .{subj_mut});
-    try P.add(&pubs, a, "$JS.API.INFO", .{});
+    try P.add(&pubs, a, "{s}INFO", .{js_api});
     inline for (.{ "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT" }) |op| {
         // tenant stream, public stream, the two KV backers — CREATE also bare (no filter)
         if (std.mem.eql(u8, op, "CONSUMER.CREATE")) {
-            try P.add(&pubs, a, "$JS.API.{s}.{s}{{{{tag(tenant)}}}}", .{ op, cdc_pre });
-            try P.add(&pubs, a, "$JS.API.{s}.{s}", .{ op, cdc_pub });
-            try P.add(&pubs, a, "$JS.API.{s}.KV_{s}", .{ op, kv_schemas });
-            try P.add(&pubs, a, "$JS.API.{s}.KV_{s}", .{ op, kv_gens });
-            try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{{{{tag(tenant)}}}}", .{ op, obj_pre });
-            try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{s}", .{ op, obj_pre, open });
+            try P.add(&pubs, a, "{s}{s}.{s}{{{{tag(tenant)}}}}", .{ js_api, op, cdc_pre });
+            try P.add(&pubs, a, "{s}{s}.{s}", .{ js_api, op, cdc_pub });
+            try P.add(&pubs, a, "{s}{s}.KV_{s}", .{ js_api, op, kv_schemas });
+            try P.add(&pubs, a, "{s}{s}.KV_{s}", .{ js_api, op, kv_gens });
+            try P.add(&pubs, a, "{s}{s}.OBJ_{s}{{{{tag(tenant)}}}}", .{ js_api, op, obj_pre });
+            try P.add(&pubs, a, "{s}{s}.OBJ_{s}{s}", .{ js_api, op, obj_pre, open });
         }
-        try P.add(&pubs, a, "$JS.API.{s}.{s}{{{{tag(tenant)}}}}.>", .{ op, cdc_pre });
-        try P.add(&pubs, a, "$JS.API.{s}.{s}.>", .{ op, cdc_pub });
-        try P.add(&pubs, a, "$JS.API.{s}.KV_{s}.>", .{ op, kv_schemas });
-        try P.add(&pubs, a, "$JS.API.{s}.KV_{s}.>", .{ op, kv_gens });
-        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ op, obj_pre });
-        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{s}.>", .{ op, obj_pre, open });
+        try P.add(&pubs, a, "{s}{s}.{s}{{{{tag(tenant)}}}}.>", .{ js_api, op, cdc_pre });
+        try P.add(&pubs, a, "{s}{s}.{s}.>", .{ js_api, op, cdc_pub });
+        try P.add(&pubs, a, "{s}{s}.KV_{s}.>", .{ js_api, op, kv_schemas });
+        try P.add(&pubs, a, "{s}{s}.KV_{s}.>", .{ js_api, op, kv_gens });
+        try P.add(&pubs, a, "{s}{s}.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ js_api, op, obj_pre });
+        try P.add(&pubs, a, "{s}{s}.OBJ_{s}{s}.>", .{ js_api, op, obj_pre, open });
     }
-    try P.add(&pubs, a, "$JS.API.STREAM.INFO.{s}{{{{tag(tenant)}}}}", .{cdc_pre});
-    try P.add(&pubs, a, "$JS.API.STREAM.INFO.{s}", .{cdc_pub});
-    try P.add(&pubs, a, "$JS.API.STREAM.INFO.KV_{s}", .{kv_schemas});
-    try P.add(&pubs, a, "$JS.API.STREAM.INFO.KV_{s}", .{kv_gens});
-    try P.add(&pubs, a, "$JS.API.STREAM.INFO.KV_{s}", .{kv_tenants});
-    try P.add(&pubs, a, "$JS.API.STREAM.INFO.OBJ_{s}{{{{tag(tenant)}}}}", .{obj_pre});
-    try P.add(&pubs, a, "$JS.API.STREAM.INFO.OBJ_{s}{s}", .{ obj_pre, open });
-    try P.add(&pubs, a, "$JS.API.STREAM.MSG.GET.KV_{s}", .{kv_schemas});
-    try P.add(&pubs, a, "$JS.API.STREAM.MSG.GET.OBJ_{s}{{{{tag(tenant)}}}}", .{obj_pre});
-    try P.add(&pubs, a, "$JS.API.STREAM.MSG.GET.OBJ_{s}{s}", .{ obj_pre, open });
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.KV_{s}.>", .{kv_schemas});
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.KV_{s}.$KV.{s}.{{{{tag(tenant)}}}}.>", .{ kv_gens, kv_gens });
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.KV_{s}.$KV.{s}.{s}.>", .{ kv_gens, kv_gens, open });
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.KV_{s}.$KV.{s}.{{{{name()}}}}", .{ kv_tenants, kv_tenants });
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{{{{tag(tenant)}}}}.>", .{obj_pre});
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.OBJ_{s}{s}.>", .{ obj_pre, open });
+    try P.add(&pubs, a, "{s}STREAM.INFO.{s}{{{{tag(tenant)}}}}", .{ js_api, cdc_pre });
+    try P.add(&pubs, a, "{s}STREAM.INFO.{s}", .{ js_api, cdc_pub });
+    try P.add(&pubs, a, "{s}STREAM.INFO.KV_{s}", .{ js_api, kv_schemas });
+    try P.add(&pubs, a, "{s}STREAM.INFO.KV_{s}", .{ js_api, kv_gens });
+    try P.add(&pubs, a, "{s}STREAM.INFO.KV_{s}", .{ js_api, kv_tenants });
+    try P.add(&pubs, a, "{s}STREAM.INFO.OBJ_{s}{{{{tag(tenant)}}}}", .{ js_api, obj_pre });
+    try P.add(&pubs, a, "{s}STREAM.INFO.OBJ_{s}{s}", .{ js_api, obj_pre, open });
+    try P.add(&pubs, a, "{s}STREAM.MSG.GET.KV_{s}", .{ js_api, kv_schemas });
+    try P.add(&pubs, a, "{s}STREAM.MSG.GET.OBJ_{s}{{{{tag(tenant)}}}}", .{ js_api, obj_pre });
+    try P.add(&pubs, a, "{s}STREAM.MSG.GET.OBJ_{s}{s}", .{ js_api, obj_pre, open });
+    try P.add(&pubs, a, "{s}DIRECT.GET.KV_{s}.>", .{ js_api, kv_schemas });
+    try P.add(&pubs, a, "{s}DIRECT.GET.KV_{s}.$KV.{s}.{{{{tag(tenant)}}}}.>", .{ js_api, kv_gens, kv_gens });
+    try P.add(&pubs, a, "{s}DIRECT.GET.KV_{s}.$KV.{s}.{s}.>", .{ js_api, kv_gens, kv_gens, open });
+    try P.add(&pubs, a, "{s}DIRECT.GET.KV_{s}.$KV.{s}.{{{{name()}}}}", .{ js_api, kv_tenants, kv_tenants });
+    try P.add(&pubs, a, "{s}DIRECT.GET.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ js_api, obj_pre });
+    try P.add(&pubs, a, "{s}DIRECT.GET.OBJ_{s}{s}.>", .{ js_api, obj_pre, open });
     // §10hq: the ANSWER bucket of a tenant. A client READS it: an answer too large for
     // one message names an object, and the library fetches it so the host never sees the
     // difference. A responder also CREATES and WRITES it, below.
     inline for (.{ "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "STREAM.MSG.GET" }) |op| {
-        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{{{{tag(tenant)}}}}", .{ op, res_pre });
-        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ op, res_pre });
-        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{s}", .{ op, res_pre, open });
-        try P.add(&pubs, a, "$JS.API.{s}.OBJ_{s}{s}.>", .{ op, res_pre, open });
+        try P.add(&pubs, a, "{s}{s}.OBJ_{s}{{{{tag(tenant)}}}}", .{ js_api, op, res_pre });
+        try P.add(&pubs, a, "{s}{s}.OBJ_{s}{{{{tag(tenant)}}}}.>", .{ js_api, op, res_pre });
+        try P.add(&pubs, a, "{s}{s}.OBJ_{s}{s}", .{ js_api, op, res_pre, open });
+        try P.add(&pubs, a, "{s}{s}.OBJ_{s}{s}.>", .{ js_api, op, res_pre, open });
     }
 
     try P.add(&pubs, a, "$JS.ACK.>", .{});
     // Its own verdict marker, both roles: the revocation check at connect reads
     // `mutation_ack.<name>.revoked` (§10hl) — a responder is a principal too.
-    try P.add(&pubs, a, "$JS.API.DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{subj_ack});
+    try P.add(&pubs, a, "{s}DIRECT.GET.MUTATIONS.{s}.{{{{name()}}}}.>", .{ js_api, subj_ack });
     switch (role) {
         .client => {
             // §10dc: the fleet heartbeat — a client may write ONLY its own key.
@@ -174,8 +203,8 @@ fn roleAllows(a: std.mem.Allocator, topo: *const topology_mod.Topology, role: Ro
             try P.add(&pubs, a, "_INBOX.>", .{});
             // §10hq: and it WRITES the answers too large to send inline — creating the
             // tenant's answer bucket on first use, then publishing the object's chunks.
-            try P.add(&pubs, a, "$JS.API.STREAM.CREATE.OBJ_{s}{{{{tag(tenant)}}}}", .{res_pre});
-            try P.add(&pubs, a, "$JS.API.STREAM.CREATE.OBJ_{s}{s}", .{ res_pre, open });
+            try P.add(&pubs, a, "{s}STREAM.CREATE.OBJ_{s}{{{{tag(tenant)}}}}", .{ js_api, res_pre });
+            try P.add(&pubs, a, "{s}STREAM.CREATE.OBJ_{s}{s}", .{ js_api, res_pre, open });
             try P.add(&pubs, a, "$O.{s}{{{{tag(tenant)}}}}.>", .{res_pre});
             try P.add(&pubs, a, "$O.{s}{s}.>", .{ res_pre, open });
             try P.add(&subs, a, "{s}.{{{{tag(tenant)}}}}.>", .{subj_query});
@@ -240,6 +269,10 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
     //    two generated files, which are plain text and theirs.
     var mode: Mode = .dev;
     var force = false;
+    // `--js-domain NAME`: the deployment reaches JetStream across a leaf link. The
+    // server conf declares the domain, the grants name `$JS.<NAME>.API.`, and
+    // .env.bridge carries NATS_JS_DOMAIN so the bridge and /enroll say the same.
+    var js_domain: ?[]const u8 = null;
     {
         var it = init.minimal.args.iterate();
         _ = it.next();
@@ -247,6 +280,11 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
             if (std.mem.eql(u8, arg, "--init-nats")) continue;
             if (std.mem.eql(u8, arg, "--force")) {
                 force = true;
+            } else if (std.mem.eql(u8, arg, "--js-domain")) {
+                const v = it.next() orelse return usageErr("--js-domain needs a name");
+                for (v) |ch| if (ch == '.' or ch == ' ' or ch == '*' or ch == '>') return usageErr("--js-domain must be one subject token (no '.', ' ', '*', '>')");
+                if (v.len == 0) return usageErr("--js-domain needs a name");
+                js_domain = v;
             } else if (std.meta.stringToEnum(Mode, arg)) |m| {
                 mode = m;
             } else return usageErr("unknown argument");
@@ -268,8 +306,8 @@ pub fn run(io: std.Io, init: *const std.process.Init) u8 {
     const dir_abs = std.Io.Dir.cwd().realPathFileAlloc(io, dir, a) catch return 1;
 
     return switch (mode) {
-        .dev => runDev(a, io, dir, dir_abs, force, nats_port, ws_port, http_port),
-        .operator => runOperator(a, io, dir, dir_abs, force, nats_port, ws_port, http_port),
+        .dev => runDev(a, io, dir, dir_abs, force, nats_port, ws_port, http_port, js_domain),
+        .operator => runOperator(a, io, dir, dir_abs, force, nats_port, ws_port, http_port, js_domain),
     };
 }
 
@@ -278,11 +316,29 @@ fn usageErr(msg: []const u8) u8 {
     return 1;
 }
 
-fn runDev(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8, force: bool, nats_port: u32, ws_port: u32, http_port: u32) u8 {
+/// What `--js-domain` renders: the conf's `domain:` line inside `jetstream {}`, and the
+/// env's `NATS_JS_DOMAIN=` beside `NATS_URL`. Without the flag the conf line is empty and
+/// the env carries the commented hint, so a generated stack reads the same either way.
+const DomainLines = struct { conf: []const u8, env: []const u8 };
+fn domainLines(a: std.mem.Allocator, js_domain: ?[]const u8) !DomainLines {
+    const d = js_domain orelse return .{
+        .conf = "",
+        .env = "# NATS_JS_DOMAIN=            # set when JetStream is reached across a leaf link (--js-domain)",
+    };
+    return .{
+        .conf = try std.fmt.allocPrint(a, "  domain: {s}\n", .{d}),
+        .env = try std.fmt.allocPrint(a, "NATS_JS_DOMAIN={s}", .{d}),
+    };
+}
+
+fn runDev(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8, force: bool, nats_port: u32, ws_port: u32, http_port: u32, js_domain: ?[]const u8) u8 {
     // The nkey is generated even though the open server ignores it: the SAME
     // .env.bridge then survives the upgrade to operator mode with only the conf
     // swapped — the seed is already in place for the server to authorize.
     const bridge_kp = genKey(io, .user) catch return 1;
+    const lines = domainLines(a, js_domain) catch return 1;
+    const domain_line = lines.conf;
+    const env_line = lines.env;
 
     const conf = std.fmt.allocPrint(a,
         \\# Generated by `bridge --init-nats --mode dev` — DEV ONLY.
@@ -299,15 +355,16 @@ fn runDev(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8
         \\}}
         \\jetstream {{
         \\  store_dir: "{s}/nats-data"
-        \\}}
+        \\{s}}}
         \\
-    , .{ nats_port, http_port, ws_port, dir_abs }) catch return 1;
+    , .{ nats_port, http_port, ws_port, dir_abs, domain_line }) catch return 1;
 
     const env = std.fmt.allocPrint(a,
         \\# Generated by `bridge --init-nats --mode dev` — DEV ONLY (open NATS, no JWT).
         \\DATABASE_READER_URL=postgres://bridge_reader:reader_password_changeme@127.0.0.1:5432/postgres
         \\DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
         \\NATS_URL=nats://127.0.0.1:{d}
+        \\{s}
         \\BRIDGE_CDC_SLOT=zb_slot
         \\BRIDGE_CDC_PUBLICATION=zb_pub
         \\BRIDGE_PORT=9090
@@ -322,7 +379,7 @@ fn runDev(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8
         \\# which is the bridge's documented behaviour for a missing seed. Operator mode
         \\# fills it in.
         \\
-    , .{ nats_port, bridge_kp.public(), bridge_kp.seed() }) catch return 1;
+    , .{ nats_port, env_line, bridge_kp.public(), bridge_kp.seed() }) catch return 1;
 
     const conf_path = std.fs.path.join(a, &.{ dir, "nats-server.conf" }) catch return 1;
     const env_path = std.fs.path.join(a, &.{ dir, ".env.bridge" }) catch return 1;
@@ -339,12 +396,15 @@ fn runDev(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8
     return 0;
 }
 
-fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8, force: bool, nats_port: u32, ws_port: u32, http_port: u32) u8 {
+fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []const u8, force: bool, nats_port: u32, ws_port: u32, http_port: u32, js_domain: ?[]const u8) u8 {
     // ── the topology: BUILT IN (§10ci) — the grants and the running bridge mint
     //    from the same embedded grammar, so they cannot disagree, and this command
     //    needs no file present anywhere.
     const owned = topology_mod.loadEmbedded(a) catch return 1;
     const topo: topology_mod.Topology = owned.topology;
+    const lines = domainLines(a, js_domain) catch return 1;
+    const domain_line = lines.conf;
+    const env_line = lines.env;
 
     // ── every key, generated here ───────────────────────────────────────────────
     const op_kp = genKey(io, .operator) catch return 1;
@@ -376,8 +436,9 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
     const sys_jwt = jwt_mint.signClaims(a, &op_seed_kp, sys_claims, "__JTI__") catch return 1;
 
     // ── account JWT: JetStream unlimited + the three SCOPED signing keys ────────
-    const allows = roleAllows(a, &topo, .client) catch return 1;
-    const answers = roleAllows(a, &topo, .responder) catch return 1;
+    const js_api = jsApiPrefix(a, js_domain) catch return 1;
+    const allows = roleAllows(a, &topo, .client, js_api) catch return 1;
+    const answers = roleAllows(a, &topo, .responder, js_api) catch return 1;
     const acct_claims = std.fmt.allocPrint(a, "{{\"jti\":\"__JTI__\",\"iat\":{d},\"iss\":\"{s}\",\"name\":\"ZEBRIDGE\",\"sub\":\"{s}\",\"nats\":{{" ++
         "\"limits\":{{\"subs\":-1,\"data\":-1,\"payload\":-1,\"imports\":-1,\"exports\":-1,\"wildcards\":true," ++
         "\"conn\":-1,\"leaf\":-1,\"mem_storage\":-1,\"disk_storage\":-1,\"streams\":-1,\"consumer\":-1," ++
@@ -425,9 +486,9 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
         \\}}
         \\jetstream {{
         \\  store_dir: "{s}/nats-data"
-        \\}}
+        \\{s}}}
         \\
-    , .{ op_jwt, sys_kp.public(), sys_kp.public(), sys_jwt, acct_kp.public(), acct_jwt, nats_port, http_port, ws_port, dir_abs }) catch return 1;
+    , .{ op_jwt, sys_kp.public(), sys_kp.public(), sys_jwt, acct_kp.public(), acct_jwt, nats_port, http_port, ws_port, dir_abs, domain_line }) catch return 1;
 
     const env = std.fmt.allocPrint(a,
         \\# Generated by `bridge --init-nats --mode operator` — the full JWT stack.
@@ -435,6 +496,7 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
         \\DATABASE_WRITER_URL=postgres://bridge_writer:writer_password_changeme@127.0.0.1:5432/postgres
         \\NATS_URL=nats://127.0.0.1:{d}
         \\NATS_CREDS={s}/creds/bridge.creds
+        \\{s}
         \\BRIDGE_CDC_SLOT=zb_slot
         \\BRIDGE_CDC_PUBLICATION=zb_pub
         \\BRIDGE_PORT=9090
@@ -459,7 +521,7 @@ fn runOperator(a: std.mem.Allocator, io: std.Io, dir: []const u8, dir_abs: []con
         \\# Account identity seed — same: offline. Signs nothing day-to-day.
         \\# ZB_ACCOUNT_SEED={s}
         \\
-    , .{ nats_port, dir_abs, sk_client.seed(), acct_kp.public(), sk_responder.seed(), op_kp.seed(), acct_kp.seed() }) catch return 1;
+    , .{ nats_port, dir_abs, env_line, sk_client.seed(), acct_kp.public(), sk_responder.seed(), op_kp.seed(), acct_kp.seed() }) catch return 1;
 
     const creds_dir = std.fs.path.join(a, &.{ dir, "creds" }) catch return 1;
     std.Io.Dir.cwd().createDirPath(io, creds_dir) catch return 1;
