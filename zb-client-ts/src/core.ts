@@ -24,8 +24,8 @@ export type SeedAnchor = {
 
 export type CoreEvent = { lsn?: number; seq?: number; stream?: string };
 
-export type ManifestDelta = { object: string; cutoff: string; prev_cutoff: string; gen: number; dict?: string };
-export type ManifestCheckpoint = { object: string; gen: number; lower?: string; cutoff: string; dict?: string };
+export type ManifestDelta = { object: string; cutoff: string; prev_cutoff: string; gen: number };
+export type ManifestCheckpoint = { object: string; gen: number; lower?: string; cutoff: string };
 export type ChainManifest = {
   gen: number;
   /// The whole table. `base` is the incremental chain's name for it; `full` is the same
@@ -47,12 +47,10 @@ export type ChainManifest = {
   /// carries an absence — only the base does (PROTOCOL §7.5).
   gc_watermark?: string;
 };
-/// `dict` names the dictionary object a delta was compressed with (§10x) —
-/// carried through so the applier fetches it before decoding.
 /// A checkpoint applies exactly as a delta does (version-guarded upserts, tombstones
 /// delete by key); only the base wipes and reloads, which is why it keeps the name the
 /// clients already act on.
-export type PlanStep = { name: string; kind: 'full' | 'delta' | 'checkpoint'; dict?: string };
+export type PlanStep = { name: string; kind: 'full' | 'delta' | 'checkpoint' };
 
 // ─── the seed gate (findings 7 and 10) ───────────────────────────────────────
 
@@ -94,8 +92,8 @@ export function planFromManifest(man: ChainManifest, watermark: string | null): 
   const deltas: ManifestDelta[] = man.deltas ?? [];
   const checkpoints: ManifestCheckpoint[] = man.checkpoints ?? [];
   const base = man.base ?? man.full ?? null;
-  const step = (d: ManifestDelta): PlanStep => ({ name: d.object, kind: 'delta', ...(d.dict ? { dict: d.dict } : {}) });
-  const ckptStep = (c: ManifestCheckpoint): PlanStep => ({ name: c.object, kind: 'checkpoint', ...(c.dict ? { dict: c.dict } : {}) });
+  const step = (d: ManifestDelta): PlanStep => ({ name: d.object, kind: 'delta' });
+  const ckptStep = (c: ManifestCheckpoint): PlanStep => ({ name: c.object, kind: 'checkpoint' });
   const applicable = watermark ? deltas.filter((d) => d.cutoff > watermark) : deltas;
 
   // The base, then everything the base does not already carry. One path, three callers.

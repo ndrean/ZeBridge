@@ -16288,3 +16288,114 @@ the page's own `count(DISTINCT uid)` over 3M rows holding the single connection.
 guard did its job; a host that runs a heavy query on the replica's only connection
 should expect it.
 
+## §10iy — the dictionary is gone: plain zstd, level 3, every object (2026-09-24)
+
+The phone forced the question. `examples/06-large-table/react-native` seeded the 3M-row
+base on the iPhone 17 simulator in 338.6 s (9,022 rows/s — Hermes has no JIT, so the JS
+side runs ~4× slower than Chrome's 156 s; the staged path itself behaved as on Node),
+and then died on the chain's second step: `test_types-g2-delta unreadable: zstd
+dictionary frames need a native decompressor; fzstd does plain frames only`. Deltas
+were dictionary frames by design (§10x: trained from the base, kept while it fit,
+§10ea), and React Native's only zstd is fzstd, which cannot read them. 08-map/native had
+named this wall for `charge_points` and dodged it because that table is on-demand.
+
+**Measured before deciding.** The real `test_types` full (668 MB of msgpack), slices
+compressed with and without its trained dictionary, `zstd -3`:
+
+| input | plain | with dictionary | gain |
+| --- | --- | --- | --- |
+| 4 KB | 1,057 B | 497 B | 53% |
+| 64 KB | 9,964 B | 9,615 B | 4% |
+| 1 MB | 141,926 B | 138,913 B | 3% |
+| 16 MB | 2.33 MB | 2.28 MB | 3% |
+
+The dictionary earns its keep on inputs of a few KB — a handful of rows — where the
+absolute saving is a few hundred bytes; from 64 KB up zstd finds the repetition by
+itself. The producer's probe (§10ea) measured row-sized samples, 12–37% across the
+catalogue, which is why the logs made it look valuable: it measured a granularity that
+never ships. A per-table `dictionary` flag in `zebridge_enable` was the first idea;
+the numbers say the whole feature is a 3% one. So it is gone, from everywhere:
+
+* producer: step 3b (the probe, keep/retrain, `trainDict`, the `-dict` upload), the
+  manifest's `dict` field, the sampler that fed the corpus (a byte counter now); every
+  object — full, delta, checkpoint — is one plain frame at level 3 through the same
+  streamed cctx;
+* schema: `dict`, `dict_object`, `dict_ratio`, `full_dict_object`, `ckpt_dict_object`
+  dropped, the reader's column-level `UPDATE` grant narrowed to what is left;
+* libzb: the dictionary cache, `ZSTD_decompress_usingDict`, `StreamInflate`'s dict;
+* zb-client-ts: `dictCache`, `_zebridge_dicts` (dropped at migrate), `zstdDecompress`
+  and `zstdDecompressStream` lose their `dict` argument, `zstdStreamDictionaries` is
+  no more, `PlanStep.dict` is gone from core and the fixture;
+* the four hosts' fzstd hooks lose their "plain frames only" throws — there is nothing
+  else to decode now; chain_audit, chain_kill, firehose_tls and genproducer likewise.
+
+**The clean break.** The migration retires every era that carried a dictionary (all of
+them), and the producer's generation counter now spans retired rows too — `max(gen)`
+over the whole table, not the newest live row — so the fresh chain never re-names an
+object a client may still be reading during the grace. Restarted: `globex/test_types`
+cut g3, a plain full, 668,373,474 → 103,298,358 bytes (15%) in 4.4 s; the manifest is
+g4 (full + delta, no `dict` anywhere); the audit decodes it plain. The bridge also
+bumped `test_types`' seed epoch to 35 at boot (the producer's sweep of an all-retired
+table asks `zebridge_reseed`), so every client of that table re-seeds once — the price
+of the break, paid in the dev stack. The buckets held 24 orphaned `-dict` objects from
+eras of 2026-09-08 that nothing referenced; removed by hand, and `pruneChain` names the
+kind so any old bucket's go with their rows.
+
+Seen on the phone during the switch, not chased: while the old objects were pruned
+under a running seed, the app logged `finalizeAsync … not an error` and `no such
+table: temp._zb_seed_stage` from expo-sqlite — an interrupted stream, a dropped stage,
+a retry; the in-process state stayed wedged (50k rows for minutes) until the app was
+relaunched. Relaunched, the fresh g4 full ran clean: 3,055,002 rows, seed 363.9 s
+(8,395 rows/s), connect → usable 371.4 s, replica 1.04 GB, exact, `Seeded test_types
+from generation chain g4`. The chain audit on g4: full 3,055,002 cell-exact, delta 0
+rows, no dictionary anywhere. Android (emulator, API 36) the same afternoon: seed
+475.1 s (6,431 rows/s), connect → usable 592.1 s, exact — once Metro resolved the
+library's `import('js-sha256')` from the app's node_modules: from zb-client-ts's own it
+had produced a relative path outside the project root that Android's bundle refused
+and iOS had happened to load (`metro.config.js`, both React Native apps).
+
+**The first real phone.** An iPhone 12 (A14, iOS 26.6), personal-team signed
+(WWDR G3 intermediate was missing from the login keychain — the certificate read as
+invalid until it was added), Developer Mode, Metro over Wi-Fi with
+`EXPO_PUBLIC_NATS_URL=ws://192.168.1.11:8080`: all 3,055,002 rows, 1.04 GB, **725 s to
+usable** — and it slowed as it went, 1M at 200 s, 1.5M at 283 s, 2M at 440 s. A JS
+loop holding one core for ten minutes is the thermal case on a handset. That number is
+the JS client's; the native one on the same phone is next (libzb cross-compiles to
+`aarch64-ios` with `-Dvendor=true -Dlibpq=false` — only the three developer executables
+fail to link there, on a dyld symbol iOS does not export).
+
+**The native number, same phone.** `examples/06-large-table/flutter`: libzb as a
+static library in the Flutter Runner (`tool/build-libzb-ios.sh` — both slices, repacked
+with Apple's libtool because Zig's archiver writes members Apple's ld rejects as "not
+8-byte aligned" and with mode 000, one xcframework; `-force_load`, `STRIP_STYLE =
+non-global` + `-exported_symbol "_zb_*"` since a release build strips an app's globals
+and dlsym then finds nothing; `NSLocalNetworkUsageDescription`, without which iOS
+refuses the LAN silently and `zb_client_connect` returns 0; libzb itself gained
+`bundle_compiler_rt` — Xcode's ld wanted `roundq` — and a trace-free panic on iOS).
+Simulator: **30.2 s**, 1.02 GB, exact.
+
+The phone's first run said "usable in 15.8 s" with **0 rows** — `zb_client_sync` had
+returned after a seed that failed, on stderr nobody could see. With the console attached
+(`devicectl device process launch --console`): `nats: Error in reader loop:
+error.ConnectionResetByPeer`, `test_types: seeding failed: Timeout`, three times over;
+nats-server's `connz` named it — `Slow Consumer (Pending Bytes)`, ~75 MB sent in ~10 s,
+67 MB pending on the phone's connection. Caught live: 59 pull requests in a few seconds,
+513 chunks delivered, 42 MB pending, `in_bytes` 2.9 KB. nats.zig's `fetch` returns 1 ms
+after its FIRST message (§13's latency contract, right for a CDC tail); over Wi-Fi the
+eight chunks of a batch do not land within a millisecond, so `ObjectPull` got one, asked
+for eight more while seven were still in flight, and the requests outran the reader
+until the server cut it. Loopback never shows it — the batch always arrives inside the
+window there — which is why 30 s on the simulator and every Mac measurement hid a
+reader that could not cross a real network. nats.zig patch 18 (`fetch-idle-after-first`,
+NATS_ZIG_NOTES §18): the idle window is a per-subscription field; `ObjectPull` sets it to
+its fetch timeout and waits for the batch. After it: one connection, 802 chunks,
+103,308,853 bytes, **pending 0** throughout.
+
+**iPhone 12, libzb: 70.8 s** (62.9 s on a rerun), 3,055,002 rows, 1.02 GB, exact — against 725 s for
+zb-client-ts on the same phone, **10×**. The phone was never the limit; the JS runtime
+was. That, not a faster JS pipeline, is the answer for a phone that has to seed a big
+table — and the argument for finishing libzb's `seeding` report so the C hosts get the
+bar the TS hosts have.
+
+Pending from this: the client's retry-from-scratch on a deterministic step error
+(it re-downloaded 3M rows before excluding the table); a device run; Android.

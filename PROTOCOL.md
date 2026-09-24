@@ -957,7 +957,6 @@ carried, and repetition is free — every row is a version-guarded upsert or a d
 | --- | --- | --- |
 | **Manifest** | `generations` KV, key `<tenant>.<table>` | One small JSON document naming the chain: the base, the checkpoints, the deltas, the cutoff. Last-value-per-key makes discovery one read. |
 | **Objects** | `gen-<tenant>` object store | The payloads: MessagePack rows in a **zstd frame** — detected by the standard 4-byte magic (`28 B5 2F FD`), never by a manifest field, so a manifest referencing objects from both eras stays readable and no object is ever rewritten. Chunked by the object store itself (128 KB): no NATS `max_payload` limit applies to a seed. |
-| **Dictionaries** | `gen-<tenant>`, `T-gN-dict` | A zstd dictionary trained on samples of the base, named by the checkpoints and deltas compressed with it (`dict`). It is deleted only when no generation row still references it. |
 
 ⚠️ **Every level is written as a stream** — COPY reads, MessagePack encodes, zstd
 compresses and the object store uploads, all at once, so the producer never holds a whole
@@ -985,15 +984,15 @@ client can tell "empty" from "not built yet".
   "full": { "gen": 370, "object": "orders-g370-full", "cutoff": "2026-09-17 06:02:10.880+00" },
   "checkpoints": [
     { "gen": 395, "object": "orders-g395-ckpt", "lower": "2026-09-17 06:02:10.880+00",
-      "cutoff": "2026-09-17 06:32:11.004+00", "dict": "orders-g370-dict" },
+      "cutoff": "2026-09-17 06:32:11.004+00" },
     { "gen": 409, "object": "orders-g409-ckpt", "lower": "2026-09-17 06:32:11.004+00",
-      "cutoff": "2026-09-17 07:02:12.550+00", "dict": "orders-g370-dict" }
+      "cutoff": "2026-09-17 07:02:12.550+00" }
   ],
   "deltas": [
     { "gen": 411, "object": "orders-g411-delta", "prev_cutoff": "2026-09-17 07:02:12.550+00",
-      "cutoff": "2026-09-17 07:29:50.700+00", "dict": "orders-g370-dict" },
+      "cutoff": "2026-09-17 07:29:50.700+00" },
     { "gen": 412, "object": "orders-g412-delta", "prev_cutoff": "2026-09-17 07:29:50.700+00",
-      "cutoff": "2026-09-17 07:44:51.201+00", "dict": "orders-g370-dict" }
+      "cutoff": "2026-09-17 07:44:51.201+00" }
   ]
 }
 ```
@@ -1003,8 +1002,8 @@ client can tell "empty" from "not built yet".
 | `gen` | the chain number of the newest generation |
 | `seed_epoch` | the catalogue's `seed_epoch` this chain was built under — a client whose descriptor says more waits for the next build |
 | `full` | the base: `object`, the `gen` it is attached to, and its `cutoff` |
-| `checkpoints` | the checkpoints **above the base**, oldest first: `object`, `gen`, `lower` (where its window starts), `cutoff` (where it ends), and `dict` |
-| `deltas` | the deltas, oldest first: `object`, `gen`, `prev_cutoff`, `cutoff`, and `dict` |
+| `checkpoints` | the checkpoints **above the base**, oldest first: `object`, `gen`, `lower` (where its window starts), `cutoff` (where it ends) |
+| `deltas` | the deltas, oldest first: `object`, `gen`, `prev_cutoff`, `cutoff` |
 | `cutoff_version` | the row-timestamp watermark of the newest cut |
 | `cutoff_lsn` | its lsn |
 | `gc_watermark` | the sweeper's floor: nothing soft-deleted before this is still guaranteed to exist (§7.5). It travels in the manifest because a returning client's own copy of the watermark row is as old as the client — the first planning rule needs the current one. |
@@ -1485,10 +1484,10 @@ Two things follow, and they are the whole reason this section is long:
 
 #### Client bookkeeping tables
 
-Six tables — a client has to track its resume position (two axes: a global LSN and a
+Five tables — a client has to track its resume position (two axes: a global LSN and a
 per-stream sequence, §5), its seed watermarks, the events it is holding for a missing
-parent, its own unconfirmed writes, and the dictionaries its chains were compressed
-with — and none of that is something to invent per implementation. All share the
+parent, and its own unconfirmed writes — and none of that is something to invent per
+implementation. All share the
 `_zebridge_` prefix so none can ever collide with a genuinely replicated table of the
 same name, and all belong in one init path, run before the connection opens — a resume
 or a flush racing their own creation is a bug class with no reason to exist. The DDL
@@ -1535,10 +1534,6 @@ CREATE TABLE _zebridge_inbox (      -- the FK hold (§4): a child whose parent h
   attempts INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE _zebridge_dicts (      -- zstd dictionaries named by chain objects (§6),
-  name  TEXT PRIMARY KEY,           -- fetched once, immutable by name
-  bytes BLOB NOT NULL
-);
 ```
 
 `global_last_lsn`/`last_seq` are what make a reconnect a resume rather than a reseed
@@ -2279,7 +2274,7 @@ line above it, so the two directions answer each other.
 | `zebridge_install_width_guard(regclass)` / `zebridge_rebudget_width_guard(regclass)` | functions | the per-table `BEFORE INSERT OR UPDATE` trigger refusing a row wider than the deployment's budget, and the cheap re-derivation of its body | the ingress check sees only edge writes; this one sees every writer |
 | `zebridge_widest_row(regclass)` / `zebridge_oversized_defaults()` | functions | preflight's two width probes: the widest stored row, and a column `DEFAULT` that would break the budget on first insert | a `BASE_BUF` lowered below stored data is named at boot, not at 3am (§9) |
 | `zebridge_timestamp_guard` | event trigger | refuses a `CREATE`/`ALTER TABLE` that introduces `timestamp without time zone` in `public` | §7.2's wire format and §7.3's clamp need an absolute instant |
-| `zebridge_generations` | table | the generation producer's memory: one row per built generation of a (tenant, table) — cutoffs, `has_full`, the dictionary, and the row count and delete count at the cutoff | the skip test compares against it; deletes on a tombstone-less table are seen only through those two counts |
+| `zebridge_generations` | table | the generation producer's memory: one row per built generation of a (tenant, table) — cutoffs, `has_full`, and the row count and delete count at the cutoff | the skip test compares against it; deletes on a tombstone-less table are seen only through those two counts |
 | `zb_reader_all` / `zb_tenant_write` | RLS policies | the reader's scope (everything when `zb.tenant` is unset, one tenant plus the open tenant when set) and the writer's (the row's tenant must match the one derived from `zb.principal`, fail-closed) | the two ends of the tenant boundary, on the same GUCs the bridge sets |
 | `zebridge_remove_write_guards(regclass)` | function | takes them off again | ⚠️ needed more often than it looks — with the delete guard on, only the sweeper can physically delete |
 | `zebridge_bump_version()` / `zebridge_soft_delete()` | trigger functions | the guards themselves | attached per table, never globally; the column names must match that table's catalogue row |

@@ -71,7 +71,7 @@ export interface ZeBridgeConfig {
   /// via node:zlib automatically; a BROWSER host must supply this hook (the
   /// web consumer passes fzstd's decompress). Absent where needed, seeding
   /// fails LOUDLY naming the fix — never by feeding zstd bytes to msgpack.
-  zstdDecompress?: (b: Uint8Array, dict?: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+  zstdDecompress?: (b: Uint8Array) => Uint8Array | Promise<Uint8Array>;
   /// §10ip: compress a query ANSWER before it travels. Optional and only used when this
   /// client SERVES: a host that cannot compress simply answers uncompressed, and every
   /// asking client reads both. Node needs nothing here — `node:zlib` has zstd and is
@@ -124,13 +124,11 @@ export interface ZeBridgeConfig {
   /// least this many bytes (default 8 MiB); below it the buffered path is cheaper.
   seedStreamingAbove?: number;
   /// §10ix: a STREAMING inflate — chunks in, inflated bytes out, as they flow. Node
-  /// needs nothing: node:zlib's zstd Transform, dictionaries included. Any other host
-  /// that wants `seedStreaming` supplies one; React Native's is fzstd's `Decompress`,
-  /// which does plain frames only — a full is one (the dictionary is trained FROM it),
-  /// so the object that matters streams, and dictionary steps (the deltas, small) take
-  /// the buffered path unless `zstdStreamDictionaries` says the hook handles them.
-  zstdDecompressStream?: (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array) => AsyncIterable<Uint8Array>;
-  zstdStreamDictionaries?: boolean;
+  /// needs nothing (node:zlib's zstd Transform); any other host that wants
+  /// `seedStreaming` supplies one — a browser's and React Native's is fzstd's
+  /// `Decompress`. Every chain object is a plain frame (the per-era dictionary went on
+  /// 2026-09-24, NOTES §10iy), so a plain-frames decoder covers the whole chain.
+  zstdDecompressStream?: (chunks: AsyncIterable<Uint8Array>) => AsyncIterable<Uint8Array>;
   /// §10hc: apply a CDC batch through `core.planCdcBulk` — one statement per run of
   /// eligible events, the per-event path for the rest (default true; false = every
   /// event through `applyEvent`, the A/B for a measurement).
@@ -389,7 +387,6 @@ export class ZeBridge {
   private clientIdValue = `c-${crypto.randomUUID().slice(0, 8)}`;
   private readonly transport: Transport;
   private lastVersion = '';
-  private dictCache = new Map<string, Uint8Array>();
   /// The HLC floor (§10q): the newest version this client has OBSERVED —
   /// CDC events' version column, chain cutoff_version. newVersion() stamps
   /// strictly above it, so a slow clock cannot lose to a row already seen.
@@ -576,9 +573,7 @@ export class ZeBridge {
   /// bytes untouched otherwise. Never fails an answer over compression, and never
   /// returns something LARGER than it was given.
   ///
-  /// No dictionary: an answer is a one-off with no era to train against, and a plain
-  /// frame is what every client can read — React Native's pure-JS decompressor does
-  /// plain frames only.
+  /// A plain frame, like every chain object since 2026-09-24 — what every client reads.
   private async compressAnswer(b: Uint8Array): Promise<Uint8Array> {
     if (b.length < 512) return b;           // a frame header would be most of it
     try {
@@ -1008,7 +1003,8 @@ export class ZeBridge {
     // §10dg: the shape this replica BUILT each table with (core.keyShape/typeShape) —
     // the record a re-key or a re-type is detected against.
     await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_shape (tbl TEXT PRIMARY KEY, key_shape TEXT NOT NULL, type_shape TEXT NOT NULL)`);
-    await this.run(`CREATE TABLE IF NOT EXISTS _zebridge_dicts (name TEXT PRIMARY KEY, bytes ${this.dialect.blobType} NOT NULL)`); // §10x dictionary cache
+    // The dictionary cache of chains cut before 2026-09-24 (NOTES §10iy): gone with them.
+    try { await this.run(`DROP TABLE IF EXISTS _zebridge_dicts`); } catch { /* a replica that never had it */ }
     await this.createOutboxTable();
     this.resolveOutboxInit();
     await this.run(this.dialect.insertIgnore('_zebridge_sync', ['id', 'global_last_lsn', 'global_last_seq'], ['id']), 1, 0, 0);
@@ -2318,20 +2314,16 @@ export class ZeBridge {
   /// §10ix: the streaming read of one plan step, or null for the buffered path —
   /// streaming off, object under `seedStreamingAbove`, a host that is not Node (the
   /// inflate is node:zlib's Transform), or a custom one-shot `zstdDecompress` hook.
-  private async chainStepStream(os: any, bucket: string, step: PlanStep, dictFor: (n: string) => Promise<Uint8Array>, table: string):
+  private async chainStepStream(os: any, bucket: string, step: PlanStep, table: string):
     Promise<{ columns: string[]; nrows: number; rows: AsyncIterable<any[]>; tail: () => Promise<Record<string, any>> } | null> {
     if (!this.config.seedStreaming) return null;
     const hook = this.config.zstdDecompressStream;
     if (!hook && !(globalThis as any).process?.versions?.node) return null;
-    // A dictionary step streams only when the inflater handles dictionaries: Node's
-    // does; a supplied hook says so itself.
-    if (step.dict && hook && this.config.zstdStreamDictionaries !== true) return null;
     let src: { info: any; chunks: AsyncIterable<Uint8Array> } | null;
     try { src = await this.objectChunkStream(os, bucket, step.name); }
     catch (e) { this.appendLog('SYS', `${table}: chain object ${step.name} unreadable: ${e}`, 'ERROR'); return null; }
     if (!src || src.info.size < (this.config.seedStreamingAbove ?? 8 * 1024 * 1024)) return null;
-    const dict = step.dict ? await dictFor(step.dict) : undefined;
-    const doc = await this.chainDocStream(await this.zstdChunkStream(src.chunks, dict));
+    const doc = await this.chainDocStream(await this.zstdChunkStream(src.chunks));
     if (!doc) { this.appendLog('SYS', `${table}: chain object ${step.name} is not a chain document — buffered path`, 'WARN'); return null; }
     return doc;
   }
@@ -2376,8 +2368,11 @@ export class ZeBridge {
   /// js-sha256 (pure, 11 KB) anywhere else: Web Crypto's `digest` takes one buffer, and a
   /// streamed object is never one buffer.
   private async streamingSha256(): Promise<{ update(c: Uint8Array): void; base64(): string }> {
-    const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
     if ((globalThis as any).process?.versions?.node) {
+      // Inside the Node branch, like the other three: Hermes (React Native) cannot
+      // compile `new Function` and threw `SyntaxError: Invalid expression encountered`
+      // at the first streamed seed on a phone (2026-09-24), before any hashing.
+      const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
       const h = (await dynImport('node:crypto')).createHash('sha256');
       return { update: (c) => h.update(c), base64: () => h.digest('base64') };
     }
@@ -2389,22 +2384,22 @@ export class ZeBridge {
     };
   }
 
-  /// §10ix: inflate a chunk stream as it flows — node:zlib's zstd Transform, with the
-  /// step's dictionary when it has one. The first chunk is sniffed for the frame magic
+  /// §10ix: inflate a chunk stream as it flows — node:zlib's zstd Transform, or the
+  /// host's hook. The first chunk is sniffed for the frame magic
   /// (§10w): an object that is not zstd passes through untouched. Written into the
   /// Transform by hand rather than `pipe`d, so a source error (a digest mismatch after
   /// the last chunk) destroys the output and the reader sees it, instead of an end.
-  private async zstdChunkStream(chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): Promise<AsyncIterable<Uint8Array>> {
+  private async zstdChunkStream(chunks: AsyncIterable<Uint8Array>): Promise<AsyncIterable<Uint8Array>> {
     const it = chunks[Symbol.asyncIterator]();
     const first = await it.next();
     if (first.done) return (async function* () {})();
     const head = first.value;
     const rest = (async function* () { yield head; for (;;) { const r = await it.next(); if (r.done) return; yield r.value; } })();
     if (!(head.length >= 4 && head[0] === 0x28 && head[1] === 0xb5 && head[2] === 0x2f && head[3] === 0xfd)) return rest;
-    if (this.config.zstdDecompressStream) return this.config.zstdDecompressStream(rest, dict);
+    if (this.config.zstdDecompressStream) return this.config.zstdDecompressStream(rest);
     const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
     const [zlib, events] = await Promise.all([dynImport('node:zlib'), dynImport('node:events')]);
-    const out = zlib.createZstdDecompress(dict ? { dictionary: dict } : undefined);
+    const out = zlib.createZstdDecompress();
     void (async () => {
       try {
         for await (const c of rest) { if (!out.write(c)) await events.once(out, 'drain'); }
@@ -2455,16 +2450,16 @@ export class ZeBridge {
     return { columns: head.columns, nrows, rows, tail };
   }
 
-  private async maybeZstd(b: Uint8Array, dict?: Uint8Array): Promise<Uint8Array> {
+  private async maybeZstd(b: Uint8Array): Promise<Uint8Array> {
     if (b.length < 4 || b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return b;
-    if (this.config.zstdDecompress) return await this.config.zstdDecompress(b, dict);
+    if (this.config.zstdDecompress) return await this.config.zstdDecompress(b);
     // Node default, written so a BROWSER tsconfig/bundler never sees the node
     // module: globalThis probe + Function-constructed dynamic import.
     const proc = (globalThis as any).process;
     if (proc?.versions?.node) {
       const dynImport = new Function('m', 'return import(m)') as (m: string) => Promise<any>;
       const zlib = await dynImport('node:zlib');
-      return new Uint8Array(zlib.zstdDecompressSync(b, dict ? { dictionary: dict } : undefined));
+      return new Uint8Array(zlib.zstdDecompressSync(b));
     }
     // Browser default
     const g = globalThis as any;
@@ -2482,9 +2477,7 @@ export class ZeBridge {
     const limit = 2 ** 31;
     for (let heap = Math.max(1 << 20, b.length * 8); ; heap *= 2) {
       try {
-        if (!dict) return mod.decompress(b, { defaultHeapSize: heap });
-        const dctx = mod.createDCtx();
-        try { return mod.decompressUsingDict(dctx, b, dict, { defaultHeapSize: heap }); } finally { mod.freeDCtx?.(dctx); }
+        return mod.decompress(b, { defaultHeapSize: heap });
       } catch (e) {
         if (heap * 2 > limit) throw e;
       }
@@ -2633,28 +2626,11 @@ export class ZeBridge {
 
     let os: any;
     try { os = await this.transport.objectStore(this.nc, manifest.bucket, this.jsOpts()); } catch (e) { this.appendLog('SYS', `${table}: chain bucket ${manifest.bucket} unreachable: ${e}`, 'ERROR'); return false; }
-    // §10x: a delta names the dictionary it was compressed with. Fetched once
-    // per era from the same bucket, kept in memory AND in _zebridge_dicts so a
-    // reconnect does not re-download it; immutable by name, so never stale.
-    const dictFor = async (name: string): Promise<Uint8Array> => {
-      const cached = this.dictCache.get(name);
-      if (cached) return cached;
-      try {
-        const rows = await this.run(`SELECT bytes FROM _zebridge_dicts WHERE name = ?`, name);
-        if (rows?.[0]?.bytes) { const d = new Uint8Array(rows[0].bytes); this.dictCache.set(name, d); return d; }
-      } catch { /* table absent on an older replica — fetch below */ }
-      const d = await this.objectBlob(os, manifest.bucket, name);
-      if (!d) throw new Error(`dictionary ${name} missing from ${manifest.bucket}`);
-      this.dictCache.set(name, d);
-      try { await this.run(this.dialect.insertReplace('_zebridge_dicts', ['name', 'bytes'], ['name']), name, d); } catch { /* best effort */ }
-      return d;
-    };
-    const fetchDoc = async (name: string, dictName?: string): Promise<any | null> => {
+    const fetchDoc = async (name: string): Promise<any | null> => {
       try {
         let blob = await this.objectBlob(os, manifest.bucket, name);
         if (!blob) return null;
-        const dict = dictName ? await dictFor(dictName) : undefined;
-        blob = await this.maybeZstd(blob, dict); // §10w: sniffed by magic, mixed chains fine
+        blob = await this.maybeZstd(blob); // §10w: sniffed by magic, mixed chains fine
         return decode(blob) as any; // objects are msgpack
       } catch (e) { this.appendLog('SYS', `${table}: chain object ${name} unreadable: ${e}`, 'ERROR'); return null; }
     };
@@ -2674,8 +2650,8 @@ export class ZeBridge {
       for (const step of plan) {
         // §10ix: a large step streams; anything else, or any host that cannot stream,
         // takes the buffered path. Both apply through the same `applyWindow` below.
-        const stream = await this.chainStepStream(os, manifest.bucket, step, dictFor, table);
-        const doc = stream ? null : await fetchDoc(step.name, step.dict);
+        const stream = await this.chainStepStream(os, manifest.bucket, step, table);
+        const doc = stream ? null : await fetchDoc(step.name);
         if (!stream && !doc) return null; // pruned under us — caller re-reads
         const cols: string[] = (stream ? stream.columns : doc.columns) ?? [];
         if (!cols.length || !cols.every((c) => state.columns.includes(c))) {
@@ -2863,20 +2839,6 @@ export class ZeBridge {
       applied = await applyPlan(plan);
       if (applied === null) return false;
     }
-
-    // §10el: the dictionary cache is bounded by the chain. `_zebridge_dicts` kept every
-    // dictionary this replica ever fetched — one per training era per table, never
-    // pruned, while the producer prunes its own once no kept generation references
-    // them. What this table's manifest still names stays; the rest goes.
-    try {
-      const keep = new Set<string>((manifest.deltas ?? []).map((d: any) => d.dict).filter(Boolean));
-      const rows: any[] = (await this.run(`SELECT name FROM _zebridge_dicts WHERE name LIKE ?`, `${table}-g%-dict`)) ?? [];
-      for (const r of rows) {
-        if (keep.has(r.name)) continue;
-        await this.run(`DELETE FROM _zebridge_dicts WHERE name = ?`, r.name);
-        this.dictCache.delete(r.name);
-      }
-    } catch { /* best effort — the cache is a cache */ }
 
     state.lsn = lsnToNumber(manifest.cutoff_lsn);
     state.seedLsn = state.lsn; // the ONE place the legacy data gate may anchor to (finding 10)

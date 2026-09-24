@@ -26,10 +26,8 @@ const PRINCIPAL = _qs.get('principal') ?? 'bob';
 const TABLE = _qs.get('table') ?? 'test_types';
 const CREDS = await fetch(`/creds/${PRINCIPAL}.creds`).then((r) => (r.ok ? r.text() : undefined)).catch(() => undefined);
 
-/// fzstd inflates plain frames chunk by chunk; the base of a chain is one. Dictionary
-/// frames (deltas) stay on the buffered path — `zstdStreamDictionaries: false`.
-const zstdStream = (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): AsyncIterable<Uint8Array> => {
-  if (dict) throw new Error('fzstd streams plain frames only');
+/// fzstd inflates plain frames chunk by chunk — and every chain object is one.
+const zstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
   return (async function* () {
     const out: Uint8Array[] = [];
     const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });
@@ -53,7 +51,6 @@ const zb = new ZeBridge({
   engine: 'sqlite',
   seedStreaming: true,
   zstdDecompressStream: zstdStream,
-  zstdStreamDictionaries: false,
 });
 
 /// A console handle for probing the replica (`zb.query('PRAGMA journal_mode')`) —

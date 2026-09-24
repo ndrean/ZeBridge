@@ -103,14 +103,12 @@ const CREDS = await (async () => {
 /// are, not what the URL guessed.
 const EFFECTIVE_PRINCIPAL = (CREDS && principalFromCreds(CREDS)) || PRINCIPAL;
 
-/// §10ix: streaming zstd for the seed. fzstd inflates plain frames chunk by chunk
-/// (the same hook as the React Native example); dictionary frames (deltas) stay on
-/// the buffered path because `zstdStreamDictionaries` is false. The browser storage
-/// spills TEMP to OPFS (browser-storage.ts), so a big base takes the staged path —
-/// 3M rows in 156 s in Chrome (06-large-table) — hence the progress bar under the
-/// phases row.
-const zstdStream = (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): AsyncIterable<Uint8Array> => {
-  if (dict) throw new Error('fzstd streams plain frames only');
+/// §10ix: streaming zstd for the seed. fzstd inflates plain frames chunk by chunk (the
+/// same hook as the React Native example), and every chain object is one. The browser
+/// storage spills TEMP to OPFS (browser-storage.ts), so a big base takes the staged
+/// path — 3M rows in 156 s in Chrome (06-large-table) — hence the progress bar under
+/// the phases row.
+const zstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
   return (async function* () {
     const out: Uint8Array[] = [];
     const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });
@@ -141,7 +139,6 @@ const zb = new ZeBridge({
   // path — the four demo tables do; only a big base streams.
   seedStreaming: true,
   zstdDecompressStream: zstdStream,
-  zstdStreamDictionaries: false,
 });
 
 // Console handle for inspecting the local replica directly — the database lives in

@@ -763,14 +763,12 @@ pub const GenerationProducer = struct {
         return try out.toOwnedSlice(payload_alloc);
     }
 
-    /// What a full's upload left behind: the counts for the bookkeeping and the logs,
-    /// and a bounded sample of its msgpack bytes for the dictionary (§10x).
+    /// What a full's upload left behind: the counts for the bookkeeping and the logs.
     const FullObject = struct {
         rows: usize,
         widest: usize,
         raw_bytes: u64,
         z_bytes: u64,
-        corpus: Corpus,
         streamed: bool,
     };
 
@@ -795,10 +793,6 @@ pub const GenerationProducer = struct {
         kind: []const u8,
         /// A delta's window opener; null for a full or a checkpoint.
         prev_cutoff: ?[]const u8,
-        /// §10gx: the era's dictionary, loaded into the compressor. A delta and a
-        /// checkpoint are compressed WITH it — the manifest names it and the client
-        /// fetches it — while a full trains one from its own bytes and takes none here.
-        dict: ?[]const u8,
     ) !FullObject {
         const expect: usize = blk: {
             const sql = try utils.allocPrintZ(alloc, "SELECT count(*) FROM ({s}) AS q", .{select_sql});
@@ -809,15 +803,18 @@ pub const GenerationProducer = struct {
         streamed: {
             var cr = CopyReader.init(alloc, pgc, select_sql) catch break :streamed;
             defer cr.deinit();
-            var sampler = try Sampler.init(alloc, 8 * 1024 * 1024);
+            // Plain zstd, level 3, for every kind of object — a full, a delta and a
+            // checkpoint alike. There was a per-era dictionary here until 2026-09-24;
+            // measured on the 668 MB test_types full, it gained 53% on 4 KB inputs and 3%
+            // from 64 KB up, for a training pass, three columns, an object per era and a
+            // client capability a phone did not have (NOTES §10iy).
             const cctx = c.ZSTD_createCCtx() orelse return error.ZstdCompressFailed;
             defer _ = c.ZSTD_freeCCtx(cctx);
             if (c.ZSTD_isError(c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, 3)) != 0) return error.ZstdCompressFailed;
-            if (dict) |d| if (c.ZSTD_isError(c.ZSTD_CCtx_loadDictionary(cctx, d.ptr, d.len)) != 0) return error.ZstdCompressFailed;
-            var fs: FullStream = .{ .cr = &cr, .oa = payload_alloc, .cctx = cctx, .sampler = &sampler, .expect_rows = expect, .gen = gen, .kind = kind, .cutoff = cutoff, .prev_cutoff = prev_cutoff, .vcol = vcol };
+            var fs: FullStream = .{ .cr = &cr, .oa = payload_alloc, .cctx = cctx, .expect_rows = expect, .gen = gen, .kind = kind, .cutoff = cutoff, .prev_cutoff = prev_cutoff, .vcol = vcol };
             defer fs.raw.deinit(payload_alloc);
             _ = try docHead(&fs.raw, payload_alloc, cr.names, prev_cutoff != null, @intCast(expect));
-            sampler.feed(fs.raw.items);
+            fs.seen += fs.raw.items.len;
             var info = store.put(.{ .name = name, .opts = .{ .max_chunk_size = store.chunk_size } }, &fs) catch |err| {
                 // `put` removed the chunks it had published; the COPY is drained either way.
                 cr.finish(err) catch {};
@@ -829,7 +826,7 @@ pub const GenerationProducer = struct {
                 store.delete(name) catch {};
                 return err;
             };
-            return .{ .rows = cr.nrows, .widest = cr.widest, .raw_bytes = sampler.seen, .z_bytes = info.value.size, .corpus = try sampler.corpus(alloc), .streamed = true };
+            return .{ .rows = cr.nrows, .widest = cr.widest, .raw_bytes = fs.seen, .z_bytes = info.value.size, .streamed = true };
         }
         const res = try queryOne(pgc, select_sql, &.{});
         defer c.PQclear(res);
@@ -837,10 +834,10 @@ pub const GenerationProducer = struct {
         var widest: usize = 0;
         const payload = try encodeContent(alloc, payload_alloc, res, gen, kind, cutoff, prev_cutoff, vcol, &rows, &widest);
         defer payload_alloc.free(payload);
-        const z = if (dict) |d| try compressZstdDict(alloc, payload, d, 3) else try compressZstd(alloc, payload, 3);
+        const z = try compressZstd(alloc, payload, 3);
         var r = try store.putBytes(name, z);
         r.deinit();
-        return .{ .rows = rows, .widest = widest, .raw_bytes = payload.len, .z_bytes = z.len, .corpus = try strideCorpus(alloc, payload, 8 * 1024 * 1024), .streamed = false };
+        return .{ .rows = rows, .widest = widest, .raw_bytes = payload.len, .z_bytes = z.len, .streamed = false };
     }
 
     /// msgpack `{columns, rows, gen, kind, cutoff, prev_cutoff?}` from a text-mode result.
@@ -946,7 +943,9 @@ pub const GenerationProducer = struct {
             const ng: usize = @intCast(c.PQntuples(rows));
             for (0..ng) |k| {
                 const g = std.mem.span(c.PQgetvalue(rows, @intCast(k), 0));
-                for ([_][]const u8{ "delta", "full", "dict" }) |kind| {
+                // "dict": eras cut before 2026-09-24 left a dictionary object per full;
+                // named here so a sweep of an old bucket takes them too.
+                for ([_][]const u8{ "delta", "full", "ckpt", "dict" }) |kind| {
                     const name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
                     store.delete(name) catch |err| {
                         if (err != error.ObjectNotFound) log.warn("🧬 sweep: could not delete {s}: {}", .{ name, err });
@@ -1108,7 +1107,16 @@ pub const GenerationProducer = struct {
             unchanged_by_version = std.mem.eql(u8, std.mem.span(c.PQgetvalue(res, 0, 0)), "f");
         }
 
-        const gen = last_gen + 1;
+        // The next number counts EVERY row, retired ones included: a retired row's
+        // objects stay in the bucket for the grace (§10gq), and a chain restarted above
+        // an all-retired table (the dictionary's removal retired every era, 2026-09-24)
+        // must not name — and overwrite — an object a client may still be reading.
+        const gen: i64 = blk: {
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
+            const res = try queryOne(bkc, "SELECT COALESCE(max(gen), 0) FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2", &params);
+            defer c.PQclear(res);
+            break :blk (std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res, 0, 0)), 10) catch 0) + 1;
+        };
         // A full at gen 1 (nothing to delta against, and the chain needs its jump-in
         // point), then refreshed BEFORE the last one can age out of the kept window
         // (gen > N − depth): rebuild at distance depth − 1 keeps it always inside.
@@ -1567,7 +1575,7 @@ pub const GenerationProducer = struct {
         // §10eo: where a build's time goes, one line per generation — the number that
         // decides whether the producer's per-row cost is the query, the encode, the
         // compression or the upload, before anyone parallelises the wrong stage.
-        var ph: struct { query: i64 = 0, full: i64 = 0, train: i64 = 0, zstd: i64 = 0, upload: i64 = 0 } = .{};
+        var ph: struct { query: i64 = 0, full: i64 = 0, zstd: i64 = 0, upload: i64 = 0 } = .{};
         if (build_full) {
             // §10ek: a full carries LIVE rows only. Every client applies a full as a wipe
             // and a reload inside one transaction, so a row absent from it is gone on the
@@ -1580,90 +1588,14 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
             const t_f = utils.unixMillis();
-            full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null, null);
+            full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null);
             ph.full += utils.unixMillis() - t_f;
             full_rows = full_obj.?.rows;
             widest_row = @max(widest_row, full_obj.?.widest);
         }
-        // ── 3b. the dictionary (§10x): a chain member, trained ONLY at a full ──
-        // build from the full's own msgpack bytes. The producer's memory is PG:
-        // the dictionary persists on the full's bookkeeping row and is read back
-        // from THERE for the era's deltas — never from NATS. No training state
-        // crosses eras: the next full trains a fresh one.
-        var dict_bytes: ?[]u8 = null;
-        var dict_name: ?[]const u8 = null;
-        var dict_kept = false;
-        var dict_ratio: ?i64 = null; // percent, on row-sized samples: the dictionary's own baseline
-        const t_d = utils.unixMillis();
-        if (build_full) {
-            if (full_obj) |fo| {
-                // §10ea: the previous era's dictionary is KEPT while it still compresses
-                // row-sized samples of this full the way it did when it was fresh — within
-                // 10 points of the ratio recorded at its training. Drift is measured
-                // against the dictionary's OWN past, not against "no dictionary": rows
-                // that compress well on their own (the wasp's) made the latter test
-                // retrain on a seven-point difference. Training is the expensive step;
-                // immutable by name, a kept dictionary is simply named by the new era's
-                // deltas. A shape change forces a full, and a drifted one is retrained.
-                //
-                // The probe compresses samples ONE BY ONE and sums: a dictionary earns its
-                // keep on small inputs (a row, a few-KB delta), where zstd has no window to
-                // find repetition in. A single contiguous megabyte finds it by itself and
-                // made the dictionary look useless — retrained at every full for a whole
-                // afternoon before this was measured.
-                const probe = try probeFrom(alloc, fo.corpus, 128 * 1024);
-                const params_p = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-                // ⚠️ The dictionary's NAME is the row's `dict_object`, never rebuilt from
-                // the row's gen: a full that KEPT a dictionary stores the bytes under its
-                // own gen with the older name, and rebuilding "g<gen>-dict" from that row
-                // named an object nobody uploaded — every delta of two eras pointed at
-                // a phantom, and every fresh client failed to seed (§10ed).
-                const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                    "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params_p);
-                defer c.PQclear(res_p);
-                if (c.PQntuples(res_p) > 0 and probe.sizes.len > 0 and c.PQgetlength(res_p, 0, 3) > 0) {
-                    const old = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_p, 0, 1)));
-                    const old_gen = std.mem.span(c.PQgetvalue(res_p, 0, 0));
-                    const old_name = std.mem.span(c.PQgetvalue(res_p, 0, 3));
-                    const baseline: ?i64 = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res_p, 0, 2)), 10) catch null;
-                    const now_pct = try probeRatio(alloc, probe, old);
-                    // No baseline (a dictionary from before this column): a quarter smaller
-                    // than no dictionary is the fallback test.
-                    const keep = if (baseline) |b| now_pct <= b + 10 else blk: {
-                        const without = try probeRatio(alloc, probe, null);
-                        break :blk now_pct * 4 <= without * 3;
-                    };
-                    if (keep) {
-                        dict_bytes = old;
-                        dict_name = try alloc.dupe(u8, old_name);
-                        dict_kept = true;
-                        dict_ratio = baseline orelse now_pct;
-                        log.info("📖 '{s}'/'{s}': g{d} keeps {s} — {d} row-sized samples compress to {d}% (its baseline {d}%)", .{ tenant, table, gen, dict_name.?, probe.sizes.len, now_pct, dict_ratio.? });
-                    } else {
-                        log.info("📖 '{s}'/'{s}': g{d} retrains — {s} compresses {d} row-sized samples to {d}% against its baseline {s}%: it drifted", .{ tenant, table, gen, old_gen, probe.sizes.len, now_pct, if (baseline) |b| try std.fmt.allocPrint(alloc, "{d}", .{b}) else "(none)" });
-                    }
-                }
-                if (dict_bytes == null) if (try trainDict(alloc, fo.corpus, fo.raw_bytes)) |d| {
-                    dict_bytes = d;
-                    dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen });
-                    dict_ratio = if (probe.sizes.len > 0) try probeRatio(alloc, probe, d) else null;
-                };
-            }
-        } else if (build_delta) {
-            const params_d = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-            // The name is the row's `dict_object` (see the probe above, §10ed).
-            const res_d = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &params_d);
-            defer c.PQclear(res_d);
-            if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 2) > 0) {
-                dict_bytes = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
-                dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_d, 0, 2)));
-            }
-        }
-        ph.train = utils.unixMillis() - t_d;
 
         // §10gx: the delta streams too — COPY straight through the compressor into the
-        // object store, with the era's dictionary loaded first. It was the last artifact
+        // object store. It was the last artifact
         // built whole in memory: three copies of it overlapped at the peak (the buffer
         // doubling as it grew, the `compressBound` destination, and the tick's arena),
         // which is where the gigabytes at 100k events a second came from (§10gj).
@@ -1673,7 +1605,7 @@ pub const GenerationProducer = struct {
             const sql = try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" >= {s}", .{ cols_sel, table, vcol, lower_bound.? });
             const delta_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, gen });
             const t_q = utils.unixMillis();
-            delta_obj = try putChainObject(alloc, self.allocator, pgc, &store, delta_name, sql, gen, cutoff_version, vcol, "delta", last_cutoff, dict_bytes);
+            delta_obj = try putChainObject(alloc, self.allocator, pgc, &store, delta_name, sql, gen, cutoff_version, vcol, "delta", last_cutoff);
             delta_rows = delta_obj.?.rows;
             widest_row = @max(widest_row, delta_obj.?.widest);
             ph.query += utils.unixMillis() - t_q;
@@ -1712,7 +1644,7 @@ pub const GenerationProducer = struct {
             else
                 try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
             const t_f = utils.unixMillis();
-            full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null, null);
+            full_obj = try putChainObject(alloc, self.allocator, pgc, &store, full_name, sql, gen, cutoff_version, vcol, "full", null);
             ph.full += utils.unixMillis() - t_f;
             full_rows = full_obj.?.rows;
             widest_row = @max(widest_row, full_obj.?.widest);
@@ -1744,13 +1676,8 @@ pub const GenerationProducer = struct {
         if (full_obj) |fo| {
             log.info("🗜️ '{s}'/'{s}': g{d} full {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, fo.raw_bytes, fo.z_bytes, fo.z_bytes * 100 / @max(fo.raw_bytes, 1), if (fo.streamed) " [streamed]" else "" });
         }
-        if (build_full and !dict_kept) if (dict_bytes) |d| {
-            var r = try store.putBytes(dict_name.?, d);
-            r.deinit();
-            log.info("📖 '{s}'/'{s}': g{d} dictionary {d} bytes trained from a bounded sample of the full", .{ tenant, table, gen, d.len });
-        };
         if (delta_obj) |d| {
-            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}{s}", .{ tenant, table, gen, d.raw_bytes, d.z_bytes, d.z_bytes * 100 / @max(d.raw_bytes, 1), if (dict_bytes != null) " [dict]" else "", if (d.streamed) " [streamed]" else "" });
+            log.info("🗜️ '{s}'/'{s}': g{d} delta {d} -> {d} bytes ({d}%){s}", .{ tenant, table, gen, d.raw_bytes, d.z_bytes, d.z_bytes * 100 / @max(d.raw_bytes, 1), if (d.streamed) " [streamed]" else "" });
         }
 
         // ── 5. the chain manifest, swapped last ──────────────────────────────
@@ -1764,7 +1691,7 @@ pub const GenerationProducer = struct {
         {
             const keep_from = try utils.allocPrintZ(alloc, "{d}", .{keepFrom(gen, self.chain_depth, if (build_full) gen else last_full_gen)});
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, keep_from.ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full, COALESCE(dict_object, '') " ++
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), has_full " ++
                 "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 AND retired_at IS NULL ORDER BY gen", &params);
             defer c.PQclear(res);
             const n: usize = @intCast(c.PQntuples(res));
@@ -1778,9 +1705,7 @@ pub const GenerationProducer = struct {
                     full_cutoff_m = try alloc.dupe(u8, cutoff);
                 }
                 if (prev.len > 0) {
-                    const dref = std.mem.span(c.PQgetvalue(res, @intCast(i), 4));
-                    const dict_frag = if (dref.len > 0) try std.fmt.allocPrint(alloc, ",\"dict\":\"{s}\"", .{dref}) else "";
-                    const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{s},\"object\":\"{s}-g{s}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"{s}}}", .{ if (deltas_json.items.len > 0) "," else "", g, table, g, prev, cutoff, dict_frag });
+                    const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{s},\"object\":\"{s}-g{s}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"}}", .{ if (deltas_json.items.len > 0) "," else "", g, table, g, prev, cutoff });
                     try deltas_json.appendSlice(alloc, frag);
                 }
             }
@@ -1790,8 +1715,7 @@ pub const GenerationProducer = struct {
             full_cutoff_m = cutoff_version;
         }
         if (build_delta) {
-            const dict_frag = if (dict_name) |dn| try std.fmt.allocPrint(alloc, ",\"dict\":\"{s}\"", .{dn}) else "";
-            const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{d},\"object\":\"{s}-g{d}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"{s}}}", .{ if (deltas_json.items.len > 0) "," else "", gen, table, gen, last_cutoff.?, cutoff_version, dict_frag });
+            const frag = try std.fmt.allocPrint(alloc, "{s}{{\"gen\":{d},\"object\":\"{s}-g{d}-delta\",\"prev_cutoff\":\"{s}\",\"cutoff\":\"{s}\"}}", .{ if (deltas_json.items.len > 0) "," else "", gen, table, gen, last_cutoff.?, cutoff_version });
             try deltas_json.appendSlice(alloc, frag);
         }
 
@@ -1828,8 +1752,6 @@ pub const GenerationProducer = struct {
             const lsn_z = try alloc.dupeZ(u8, lsn);
             const cut_z = try alloc.dupeZ(u8, cutoff_version);
             const prev_z: ?[*:0]const u8 = if (last_cutoff) |p| (try alloc.dupeZ(u8, p)).ptr else null;
-            const dict_hex_z: ?[*:0]const u8 = if (build_full) (if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null) else null;
-            const dict_obj_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
             const count_z: ?[*:0]const u8 = if (row_count_now) |n| (try utils.allocPrintZ(alloc, "{d}", .{n})).ptr else null;
             const floor_z: ?[*:0]const u8 = if (floor_now) |f| (try alloc.dupeZ(u8, f)).ptr else null;
             const filenode_z: ?[*:0]const u8 = if (filenode_now.len > 0) (try alloc.dupeZ(u8, filenode_now)).ptr else null;
@@ -1839,11 +1761,9 @@ pub const GenerationProducer = struct {
             const epoch_z = try utils.allocPrintZ(alloc, "{d}", .{cat_epoch});
             const shape_z = try alloc.dupeZ(u8, col_shape);
             const relid_z: ?[*:0]const u8 = if (cur_relid.len > 0) (try alloc.dupeZ(u8, cur_relid)).ptr else null;
-            const ratio_z: ?[*:0]const u8 = if (build_full) (if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null) else null;
-            const full_dict_z: ?[*:0]const u8 = if (build_full) dict_obj_z else null;
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", dict_hex_z, dict_obj_z, count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, ratio_z, full_dict_z, floor_z, filenode_z, obj_bytes_z };
-            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, dict, dict_object, row_count, del_count, seed_epoch, col_shape, relid, dict_ratio, full_dict_object, open_xact_floor, filenode, obj_bytes) " ++
-                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, decode($8, 'hex'), $9, $10::bigint, $11::bigint, $12::integer, $13, $14::oid, $15::smallint, $16, $17::timestamptz, $18::oid, $19::bigint) " ++
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_str.ptr, cut_z.ptr, lsn_z.ptr, prev_z, if (build_full) "t" else "f", count_z, del_z.ptr, epoch_z.ptr, shape_z.ptr, relid_z, floor_z, filenode_z, obj_bytes_z };
+            const res = try queryOne(bkc, "INSERT INTO public.zebridge_generations (tenant, tbl, gen, cutoff_version, cutoff_lsn, prev_cutoff, has_full, row_count, del_count, seed_epoch, col_shape, relid, open_xact_floor, filenode, obj_bytes) " ++
+                "VALUES ($1, $2, $3, $4::timestamptz, $5::pg_lsn, $6::timestamptz, $7::boolean, $8::bigint, $9::bigint, $10::integer, $11, $12::oid, $13::timestamptz, $14::oid, $15::bigint) " ++
                 "ON CONFLICT (tenant, tbl, gen) DO NOTHING", &params);
             c.PQclear(res);
         }
@@ -1865,7 +1785,7 @@ pub const GenerationProducer = struct {
         });
         // §10gx: both artifacts are one streamed phase now — COPY, encode, zstd and the
         // upload happen together, so there is nothing left to time apart.
-        log.info("🧬   phases: full (count+copy+encode+zstd+upload) {d} ms, delta (count+copy+encode+zstd+upload) {d} ms, dictionary {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.full, ph.query, ph.train, full_rows, delta_rows });
+        log.info("🧬   phases: full (count+copy+encode+zstd+upload) {d} ms, delta (count+copy+encode+zstd+upload) {d} ms — {d} full row(s), {d} delta row(s)", .{ ph.full, ph.query, full_rows, delta_rows });
         if (delta_obj) |d| log.debug("🧬   delta: {d} row(s), {d} bytes", .{ delta_rows, d.raw_bytes });
         if (full_obj) |fo| log.debug("🧬   full:  {d} row(s), {d} bytes", .{ full_rows, fo.raw_bytes });
 
@@ -2189,23 +2109,6 @@ pub const GenerationProducer = struct {
             try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\" WHERE \"{s}\" IS NULL", .{ cols_sel, table, j.tcol })
         else
             try utils.allocPrintZ(alloc, "SELECT {s} FROM \"{s}\"", .{ cols_sel, table });
-        // §10gx: a checkpoint compresses with the era's dictionary, so it has to be in
-        // hand BEFORE the stream starts — the compressor takes it at the first byte. Until
-        // this, the manifest named a dictionary the object had not been compressed with:
-        // harmless to a reader (zstd ignores a dictionary a frame does not reference) but
-        // a lie, and the compression it promised never happened. A full trains its own
-        // from the bytes it writes, so it takes none here.
-        var lane_dict: ?[]const u8 = null;
-        var lane_dict_name: ?[]const u8 = null;
-        if (j.kind == .checkpoint) {
-            const res_d = try queryOne(bkc, "SELECT encode(dict, 'hex'), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
-            defer c.PQclear(res_d);
-            if (c.PQntuples(res_d) > 0 and c.PQgetlength(res_d, 0, 1) > 0) {
-                lane_dict = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_d, 0, 0)));
-                lane_dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_d, 0, 1)));
-            }
-        }
         var full_rows: usize = 0;
         // §10gi: written to the store while COPY reads, inside the snapshot.
         const bucket = try std.fmt.allocPrint(alloc, "{s}{s}", .{ self.topo.generation_bucket_prefix, tenant });
@@ -2213,61 +2116,13 @@ pub const GenerationProducer = struct {
         var store = try osm.openStore(bucket);
         defer store.deinit();
         const t_q = utils.unixMillis();
-        const fo = try putChainObject(alloc, self.allocator, pgc, &store, obj_name, sql, gen_l, cutoff_l, j.vcol, kind_str, null, lane_dict);
+        const fo = try putChainObject(alloc, self.allocator, pgc, &store, obj_name, sql, gen_l, cutoff_l, j.vcol, kind_str, null);
         full_rows = fo.rows;
         const query_ms = utils.unixMillis() - t_q;
         {
             const res = try queryOne(pgc, "COMMIT", &.{});
             c.PQclear(res);
         }
-
-        // ── the dictionary: kept while it still fits, else trained (§10x, §10ea) ──
-        const t_d = utils.unixMillis();
-        var dict_bytes: ?[]u8 = null;
-        var dict_name: ?[]const u8 = null;
-        var dict_kept = false;
-        var dict_ratio: ?i64 = null;
-        if (j.kind == .checkpoint) {
-            // §10x: the era's dictionary, fetched above and already in the object's frame.
-            // It is KEPT, never retrained: training belongs to the base.
-            dict_bytes = if (lane_dict) |d| @constCast(d) else null;
-            dict_name = lane_dict_name;
-            dict_kept = true;
-        } else {
-            const probe = try probeFrom(alloc, fo.corpus, 128 * 1024);
-            const res_p = try queryOne(bkc, "SELECT gen, encode(dict, 'hex'), coalesce(dict_ratio::text, ''), coalesce(full_dict_object, dict_object, '') FROM public.zebridge_generations " ++
-                "WHERE tenant=$1 AND tbl=$2 AND has_full AND dict IS NOT NULL AND retired_at IS NULL ORDER BY gen DESC LIMIT 1", &pair);
-            defer c.PQclear(res_p);
-            if (c.PQntuples(res_p) > 0 and probe.sizes.len > 0 and c.PQgetlength(res_p, 0, 3) > 0) {
-                const old = try hexDecode(alloc, std.mem.span(c.PQgetvalue(res_p, 0, 1)));
-                const baseline: ?i64 = std.fmt.parseInt(i64, std.mem.span(c.PQgetvalue(res_p, 0, 2)), 10) catch null;
-                const now_pct = try probeRatio(alloc, probe, old);
-                const keep = if (baseline) |bl| now_pct <= bl + 10 else blk: {
-                    const without = try probeRatio(alloc, probe, null);
-                    break :blk now_pct * 4 <= without * 3;
-                };
-                if (keep) {
-                    dict_bytes = old;
-                    dict_name = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res_p, 0, 3)));
-                    dict_kept = true;
-                    dict_ratio = baseline orelse now_pct;
-                }
-            }
-            if (dict_bytes == null) if (try trainDict(alloc, fo.corpus, fo.raw_bytes)) |d| {
-                dict_bytes = d;
-                dict_name = try std.fmt.allocPrint(alloc, "{s}-g{d}-dict", .{ table, gen_l });
-                dict_ratio = if (probe.sizes.len > 0) try probeRatio(alloc, probe, d) else null;
-            };
-        }
-        const train_ms = utils.unixMillis() - t_d;
-
-        // ── the dictionary object ─────────────────────────────────────────────
-        const t_u = utils.unixMillis();
-        if (!dict_kept) if (dict_bytes) |d| {
-            var r = try store.putBytes(dict_name.?, d);
-            r.deinit();
-        };
-        const upload_ms = utils.unixMillis() - t_u;
 
         // ── attach, under the gate: still the same chain? ─────────────────────
         self.pairAcquire(tenant, table);
@@ -2295,24 +2150,19 @@ pub const GenerationProducer = struct {
         if (!same_chain) {
             log.info("🧬 '{s}'/'{s}': background {s} for g{d} discarded — the chain moved while it built (newest g{d}, full g{d}, g{d} kept: {})", .{ tenant, table, kind_str, gen_l, newest.gen, newest.full, gen_l, newest.l_exists });
             store.delete(obj_name) catch {};
-            if (!dict_kept) if (dict_name) |dn| store.delete(dn) catch {};
             return;
         }
         if (j.kind == .checkpoint) {
             const lower_z = try alloc.dupeZ(u8, ckpt_lower);
-            const dict_name_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
             const bytes_z = try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes});
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, lower_z.ptr, dict_name_z, bytes_z.ptr };
-            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_lower = $4::timestamptz, ckpt_dict_object = $5, obj_bytes = $6::bigint " ++
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, lower_z.ptr, bytes_z.ptr };
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_checkpoint = true, ckpt_lower = $4::timestamptz, obj_bytes = $5::bigint " ++
                 "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
             c.PQclear(res);
         } else {
-            const dict_hex_z: ?[*:0]const u8 = if (dict_bytes) |d| (try hexEncodeZ(alloc, d)).ptr else null;
-            const dict_name_z: ?[*:0]const u8 = if (dict_name) |dn| (try alloc.dupeZ(u8, dn)).ptr else null;
-            const ratio_z: ?[*:0]const u8 = if (dict_ratio) |r| (try utils.allocPrintZ(alloc, "{d}", .{r})).ptr else null;
             const bytes_z = try utils.allocPrintZ(alloc, "{d}", .{fo.z_bytes});
-            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, dict_hex_z, dict_name_z, ratio_z, bytes_z.ptr };
-            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_full = true, dict = decode($4, 'hex'), full_dict_object = $5, dict_ratio = $6::smallint, obj_bytes = $7::bigint " ++
+            const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_l_z.ptr, bytes_z.ptr };
+            const res = try queryOne(bkc, "UPDATE public.zebridge_generations SET has_full = true, obj_bytes = $4::bigint " ++
                 "WHERE tenant=$1 AND tbl=$2 AND gen=$3", &params);
             c.PQclear(res);
         }
@@ -2333,7 +2183,7 @@ pub const GenerationProducer = struct {
         var deltas: std.json.Array = .init(alloc);
         {
             const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, (try utils.allocPrintZ(alloc, "{d}", .{keep_from})).ptr };
-            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, ''), COALESCE(dict_object, '') " ++
+            const res = try queryOne(bkc, "SELECT gen, cutoff_version::text, COALESCE(prev_cutoff::text, '') " ++
                 "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND gen > $3 AND retired_at IS NULL ORDER BY gen", &params);
             defer c.PQclear(res);
             for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
@@ -2345,8 +2195,6 @@ pub const GenerationProducer = struct {
                 try d.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-delta", .{ table, g }) });
                 try d.put(alloc, "prev_cutoff", .{ .string = try alloc.dupe(u8, prev) });
                 try d.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
-                const dref = std.mem.span(c.PQgetvalue(res, @intCast(i), 3));
-                if (dref.len > 0) try d.put(alloc, "dict", .{ .string = try alloc.dupe(u8, dref) });
                 try deltas.append(.{ .object = d });
             }
         }
@@ -2369,10 +2217,9 @@ pub const GenerationProducer = struct {
 
         const total_ms = utils.unixMillis() - started_ms;
         self.recordFullBuild(tenant, table, total_ms);
-        log.info("🧬 '{s}'/'{s}': background {s} attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: build (count+copy+encode+zstd+upload) {d}, dictionary {d}{s}, dictionary upload {d}; deltas kept cutting meanwhile{s}", .{
+        log.info("🧬 '{s}'/'{s}': background {s} attached to g{d} (newest g{d}) — {d} row(s), {d} -> {d} bytes{s} in {d} ms: build (count+copy+encode+zstd+upload) {d}; deltas kept cutting meanwhile{s}", .{
             tenant, table, kind_str,                        gen_l,           newest.gen, full_rows, fo.raw_bytes, fo.z_bytes,
-            if (fo.streamed) " [streamed]" else "",     total_ms,        query_ms,   train_ms,
-            if (dict_kept) " (kept)" else "",           upload_ms,
+            if (fo.streamed) " [streamed]" else "",     total_ms,        query_ms,
             if (j.kind == .checkpoint) " (window opens at its predecessor's cutoff)" else "",
         });
     }
@@ -2697,79 +2544,6 @@ fn docTail(out: *mp.List, a: std.mem.Allocator, gen: i64, kind: []const u8, cuto
     }
 }
 
-/// Samples of a document, contiguous in one buffer (zdict wants that).
-const Corpus = struct { buf: []u8, sizes: []usize };
-
-/// §10gi: `strideCorpus` for a document seen once, front to back, whose length is not
-/// known in advance. It keeps 2 KiB windows at every `stride`-th window position;
-/// when the buffer is full, every other sample goes and the stride doubles. The
-/// samples stay evenly spaced over what was seen, between half and all of the buffer.
-const Sampler = struct {
-    const sample_len: usize = 2048;
-    buf: []u8,
-    cap: usize,
-    count: usize = 0,
-    stride: u64 = 1,
-    seen: u64 = 0,
-
-    fn init(alloc: std.mem.Allocator, max_bytes: usize) !Sampler {
-        const cap = @max(2, (max_bytes / sample_len) & ~@as(usize, 1));
-        return .{ .buf = try alloc.alloc(u8, cap * sample_len), .cap = cap };
-    }
-
-    fn feed(self: *Sampler, bytes: []const u8) void {
-        var off = self.seen;
-        var rest = bytes;
-        self.seen += bytes.len;
-        while (rest.len > 0) {
-            const w_start = self.count * self.stride * sample_len;
-            const w_end = w_start + sample_len;
-            if (off + rest.len <= w_start) return;
-            if (off < w_start) {
-                rest = rest[@intCast(w_start - off)..];
-                off = w_start;
-            }
-            const take: usize = @intCast(@min(rest.len, w_end - off));
-            @memcpy(self.buf[self.count * sample_len + @as(usize, @intCast(off - w_start)) ..][0..take], rest[0..take]);
-            off += take;
-            rest = rest[take..];
-            if (off == w_end) {
-                self.count += 1;
-                if (self.count == self.cap) {
-                    // Keep the even samples: window positions 0, 2·stride, 4·stride…
-                    for (0..self.cap / 2) |i| {
-                        if (i == 0) continue;
-                        @memcpy(self.buf[i * sample_len ..][0..sample_len], self.buf[2 * i * sample_len ..][0..sample_len]);
-                    }
-                    self.count = self.cap / 2;
-                    self.stride *= 2;
-                }
-            }
-        }
-    }
-
-    fn corpus(self: *const Sampler, alloc: std.mem.Allocator) !Corpus {
-        const sizes = try alloc.alloc(usize, self.count);
-        @memset(sizes, sample_len);
-        return .{ .buf = self.buf[0 .. self.count * sample_len], .sizes = sizes };
-    }
-};
-
-/// Up to `max_bytes` of a corpus's samples, evenly spread: the dictionary probe's
-/// row-sized samples, taken from the training corpus.
-fn probeFrom(alloc: std.mem.Allocator, corpus: Corpus, max_bytes: usize) !Corpus {
-    const sample_len = Sampler.sample_len;
-    const want = @min(corpus.sizes.len, max_bytes / sample_len);
-    const buf = try alloc.alloc(u8, want * sample_len);
-    const sizes = try alloc.alloc(usize, want);
-    const stride = if (want > 0) corpus.sizes.len / want else 1;
-    for (0..want) |i| {
-        @memcpy(buf[i * sample_len ..][0..sample_len], corpus.buf[i * stride * sample_len ..][0..sample_len]);
-        sizes[i] = sample_len;
-    }
-    return .{ .buf = buf, .sizes = sizes };
-}
-
 /// §10gi: a full, written to the object store as it is read. Rows come from COPY in
 /// batches of about 256 KiB of msgpack, go through one zstd stream, and leave as
 /// object chunks: the bridge holds one batch, the compressor's window and one chunk,
@@ -2788,7 +2562,8 @@ fn FullStreamOf(comptime Source: type) type {
     cr: *Source,
     oa: std.mem.Allocator,
     cctx: *c.ZSTD_CCtx,
-    sampler: *Sampler,
+    /// Raw msgpack bytes seen — the document's size, for the logs and the ratio.
+    seen: u64 = 0,
     raw: mp.List = .empty,
     raw_off: usize = 0,
     expect_rows: usize,
@@ -2829,7 +2604,7 @@ fn FullStreamOf(comptime Source: type) type {
                 while (self.raw.items.len < batch) {
                     const start = self.raw.items.len;
                     const more = try self.cr.next(&self.raw, self.oa);
-                    self.sampler.feed(self.raw.items[start..]);
+                    self.seen += self.raw.items.len - start;
                     if (more) continue;
                     // The count was read in the same snapshot: a difference is a bug,
                     // and the object would carry a wrong row count.
@@ -2839,7 +2614,7 @@ fn FullStreamOf(comptime Source: type) type {
                     }
                     const tail = self.raw.items.len;
                     try docTail(&self.raw, self.oa, self.gen, self.kind, self.cutoff, self.vcol, self.prev_cutoff);
-                    self.sampler.feed(self.raw.items[tail..]);
+                    self.seen += self.raw.items.len - tail;
                     self.copy_done = true;
                     break;
                 }
@@ -2865,83 +2640,11 @@ fn compressZstd(alloc: std.mem.Allocator, src: []const u8, level: c_int) ![]u8 {
     return dst[0..n];
 }
 
-/// §10x: train a zstd dictionary from one full's msgpack bytes, split into
-/// delta-sized samples (2 KiB — the unit a dictionary will actually compress).
-/// Null when the full is too small to learn from: dictionaries earn nothing
-/// there, and zdict refuses tiny corpora anyway.
-/// A bounded corpus: up to `max_bytes` of 2 KiB samples spread EVENLY over the full,
-/// contiguous in one buffer (zdict wants that). Sampling instead of the whole full
-/// keeps training — and the compression probe below — flat in CPU and memory
-/// whatever the table's size; zstd's own guidance is ~100× the dictionary as corpus,
-/// which 8 MiB is for a 112 KiB dictionary (§10ea).
-fn strideCorpus(alloc: std.mem.Allocator, full: []const u8, max_bytes: usize) !Corpus {
-    const sample_len: usize = 2048;
-    const available = full.len / sample_len;
-    const want = @min(available, max_bytes / sample_len);
-    const buf = try alloc.alloc(u8, want * sample_len);
-    const sizes = try alloc.alloc(usize, want);
-    const stride = if (want > 0) available / want else 1;
-    for (0..want) |i| {
-        const off = i * stride * sample_len;
-        @memcpy(buf[i * sample_len ..][0..sample_len], full[off..][0..sample_len]);
-        sizes[i] = sample_len;
-    }
-    return .{ .buf = buf, .sizes = sizes };
-}
-
-/// Percent the row-sized samples compress to, one by one, with `dict` (or without).
-fn probeRatio(alloc: std.mem.Allocator, probe: anytype, dict: ?[]const u8) !i64 {
-    var total: usize = 0;
-    var off: usize = 0;
-    for (probe.sizes) |sz| {
-        const sample = probe.buf[off .. off + sz];
-        total += if (dict) |d| (try compressZstdDict(alloc, sample, d, 3)).len else (try compressZstd(alloc, sample, 3)).len;
-        off += sz;
-    }
-    return @intCast(total * 100 / @max(probe.buf.len, 1));
-}
-
-/// `corpus` is up to 8 MiB of 2 KiB samples of a document of `doc_len` bytes.
-fn trainDict(alloc: std.mem.Allocator, corpus: Corpus, doc_len: u64) !?[]u8 {
-    if (doc_len < 16 * 1024 or corpus.sizes.len < 8) return null;
-    const nsamples = corpus.sizes.len;
-    const cap: usize = @max(@as(usize, 1024), @min(@as(usize, 112 * 1024), corpus.buf.len / 4));
-    const dict = try alloc.alloc(u8, cap);
-    const n = c.ZDICT_trainFromBuffer(dict.ptr, cap, corpus.buf.ptr, corpus.sizes.ptr, @intCast(nsamples));
-    if (c.ZDICT_isError(n) != 0) {
-        log.warn("📖 dictionary training failed: {s}", .{std.mem.span(c.ZDICT_getErrorName(n))});
-        return null;
-    }
-    return dict[0..n];
-}
-
-fn compressZstdDict(alloc: std.mem.Allocator, src: []const u8, dict: []const u8, level: c_int) ![]u8 {
-    const cctx = c.ZSTD_createCCtx() orelse return error.ZstdCompressFailed;
-    defer _ = c.ZSTD_freeCCtx(cctx);
-    const bound = c.ZSTD_compressBound(src.len);
-    const dst = try alloc.alloc(u8, bound);
-    const n = c.ZSTD_compress_usingDict(cctx, dst.ptr, bound, src.ptr, src.len, dict.ptr, dict.len, level);
-    if (c.ZSTD_isError(n) != 0) return error.ZstdCompressFailed;
-    return dst[0..n];
-}
-
-fn hexEncodeZ(alloc: std.mem.Allocator, bytes: []const u8) ![:0]u8 {
-    const out = try alloc.allocSentinel(u8, bytes.len * 2, 0);
-    for (bytes, 0..) |b, i| utils.byteToHex(out[i * 2 .. i * 2 + 2], b);
-    return out;
-}
-
-fn hexDecode(alloc: std.mem.Allocator, hex: []const u8) ![]u8 {
-    const out = try alloc.alloc(u8, hex.len / 2);
-    for (out, 0..) |*b, i| b.* = try std.fmt.parseInt(u8, hex[i * 2 .. i * 2 + 2], 16);
-    return out;
-}
 
 
 
 /// Prunes a chain's generations at or below `keep_from`: PostgreSQL rows first (the
-/// authority), then their objects, then dictionaries no remaining row names — as the
-/// delta's dictionary (`dict_object`) or as a full's (`full_dict_object`, §10gf).
+/// authority), then their objects.
 /// §10gq: retire, then delete. A generation at or below the kept window leaves the
 /// manifest AT ONCE — no new client can plan from it — but its objects stay for
 /// `grace_s`, because a client may be READING them: a seed of a 17M-row full takes about
@@ -3008,38 +2711,19 @@ fn pruneChain(alloc: std.mem.Allocator, bkc: *c.PGconn, store: anytype, tenant_z
         "AND (retired_at < now() - ($3 || ' seconds')::interval " ++
         "     OR retired_at NOT IN (SELECT DISTINCT retired_at FROM public.zebridge_generations " ++
         "                           WHERE tenant=$1 AND tbl=$2 AND retired_at IS NOT NULL ORDER BY retired_at DESC LIMIT $4)) " ++
-        "RETURNING gen, COALESCE(dict_object, ''), COALESCE(full_dict_object, '')", &params);
+        "RETURNING gen", &params);
     defer c.PQclear(res);
     const pruned: usize = @intCast(c.PQntuples(res));
     if (pruned == 0) return;
-    const ref_params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr };
-    const still_ref = try GenerationProducer.queryOnePub(bkc, "SELECT DISTINCT d FROM (SELECT dict_object AS d FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 " ++
-        "UNION SELECT full_dict_object FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2) s WHERE d IS NOT NULL", &ref_params);
-    defer c.PQclear(still_ref);
-    const nref: usize = @intCast(c.PQntuples(still_ref));
     for (0..pruned) |i| {
         const g = std.mem.span(c.PQgetvalue(res, @intCast(i), 0));
         // §10gu: "ckpt" among them — a pruned checkpoint's object was left in the store
-        // for ever, since only the delta and the full were ever named here.
-        for ([_][]const u8{ "delta", "full", "ckpt" }) |kind| {
+        // for ever, since only the delta and the full were ever named here. "dict": the
+        // dictionary object eras cut before 2026-09-24 kept per full — gone with its row.
+        for ([_][]const u8{ "delta", "full", "ckpt", "dict" }) |kind| {
             const old_name = try std.fmt.allocPrint(alloc, "{s}-g{s}-{s}", .{ table, g, kind });
             store.delete(old_name) catch |err| {
                 if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned object {s}: {}", .{ old_name, err });
-            };
-        }
-        const names = [_][]const u8{
-            try std.fmt.allocPrint(alloc, "{s}-g{s}-dict", .{ table, g }),
-            std.mem.span(c.PQgetvalue(res, @intCast(i), 1)),
-            std.mem.span(c.PQgetvalue(res, @intCast(i), 2)),
-        };
-        for (names) |dict_old| {
-            if (dict_old.len == 0) continue;
-            var referenced = false;
-            for (0..nref) |k| {
-                if (std.mem.eql(u8, std.mem.span(c.PQgetvalue(still_ref, @intCast(k), 0)), dict_old)) referenced = true;
-            }
-            if (!referenced) store.delete(dict_old) catch |err| {
-                if (err != error.ObjectNotFound) log.warn("🧬 could not delete pruned dictionary {s}: {}", .{ dict_old, err });
             };
         }
     }
@@ -3052,7 +2736,7 @@ fn checkpointsJson(alloc: std.mem.Allocator, bkc: *c.PGconn, table: []const u8, 
     var out: std.json.Array = .init(alloc);
     const gen_z = try utils.allocPrintZ(alloc, "{d}", .{full_gen});
     const params = [_]?[*:0]const u8{ tenant_z.ptr, table_z.ptr, gen_z.ptr };
-    const res = GenerationProducer.queryOnePub(bkc, "SELECT gen, cutoff_version::text, COALESCE(ckpt_lower::text, ''), COALESCE(ckpt_dict_object, '') " ++
+    const res = GenerationProducer.queryOnePub(bkc, "SELECT gen, cutoff_version::text, COALESCE(ckpt_lower::text, '') " ++
         "FROM public.zebridge_generations WHERE tenant=$1 AND tbl=$2 AND has_checkpoint AND retired_at IS NULL AND gen > $3 ORDER BY gen", &params) catch return out;
     defer c.PQclear(res);
     for (0..@as(usize, @intCast(c.PQntuples(res)))) |i| {
@@ -3062,8 +2746,6 @@ fn checkpointsJson(alloc: std.mem.Allocator, bkc: *c.PGconn, table: []const u8, 
         try ck.put(alloc, "object", .{ .string = try std.fmt.allocPrint(alloc, "{s}-g{d}-ckpt", .{ table, g }) });
         try ck.put(alloc, "lower", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 2))) });
         try ck.put(alloc, "cutoff", .{ .string = try alloc.dupe(u8, std.mem.span(c.PQgetvalue(res, @intCast(i), 1))) });
-        const dref = std.mem.span(c.PQgetvalue(res, @intCast(i), 3));
-        if (dref.len > 0) try ck.put(alloc, "dict", .{ .string = try alloc.dupe(u8, dref) });
         try out.append(.{ .object = ck });
     }
     return out;
@@ -3144,43 +2826,6 @@ test "keepFrom: the last depth, stretched back to the newest full (§10ge)" {
     try std.testing.expectEqual(@as(i64, 0), keepFrom(8, 6, 1));
 }
 
-test "Sampler: evenly spaced 2 KiB windows of a stream of unknown length (§10gi)" {
-    const a = std.testing.allocator;
-    const sl = Sampler.sample_len;
-    for ([_]usize{ 3, 7, 40, 1000 }) |nwin| {
-        // Every window starts with its own index, so a sample names where it came from.
-        const doc = try a.alloc(u8, nwin * sl + 1234);
-        defer a.free(doc);
-        for (doc, 0..) |*b, i| b.* = @truncate(i *% 31);
-        for (0..nwin) |k| std.mem.writeInt(u32, doc[k * sl ..][0..4], @intCast(k), .little);
-        var s = try Sampler.init(a, 16 * sl); // 16 samples at most
-        defer a.free(s.buf);
-        // Fed in uneven pieces, the way COPY batches arrive.
-        var off: usize = 0;
-        var step: usize = 1;
-        while (off < doc.len) : (step = (step * 7 + 13) % 5000 + 1) {
-            const n = @min(step, doc.len - off);
-            s.feed(doc[off..][0..n]);
-            off += n;
-        }
-        try std.testing.expectEqual(@as(u64, doc.len), s.seen);
-        if (nwin <= 16) try std.testing.expectEqual(@as(u64, 1), s.stride);
-        try std.testing.expect(s.count <= 16 and (nwin < 8 or s.count >= 8));
-        // Every complete window at a multiple of the stride, and nothing else.
-        try std.testing.expectEqual((nwin + s.stride - 1) / s.stride, s.count);
-        for (0..s.count) |j| {
-            const k = j * s.stride;
-            try std.testing.expectEqualSlices(u8, doc[k * sl ..][0..sl], s.buf[j * sl ..][0..sl]);
-        }
-        const corp = try s.corpus(a);
-        defer a.free(corp.sizes);
-        const probe = try probeFrom(a, corp, 4 * sl);
-        defer a.free(probe.buf);
-        defer a.free(probe.sizes);
-        try std.testing.expectEqual(@min(s.count, 4), probe.sizes.len);
-    }
-}
-
 test "FullStreamOf: one zstd frame with no content size, the document intact, in chunk-sized reads (§10gi)" {
     const a = std.testing.allocator;
     const Rows = struct {
@@ -3201,16 +2846,13 @@ test "FullStreamOf: one zstd frame with no content size, the document intact, in
     };
     const total = 50_000;
     var rows: Rows = .{ .total = total };
-    var s = try Sampler.init(a, 64 * Sampler.sample_len);
-    defer a.free(s.buf);
     const cctx = c.ZSTD_createCCtx().?;
     defer _ = c.ZSTD_freeCCtx(cctx);
     _ = c.ZSTD_CCtx_setParameter(cctx, c.ZSTD_c_compressionLevel, 3);
-    var fs: FullStreamOf(Rows) = .{ .cr = &rows, .oa = a, .cctx = cctx, .sampler = &s, .expect_rows = total, .gen = 7, .cutoff = "2026-09-15 00:00:00+00", .vcol = "updated_at" };
+    var fs: FullStreamOf(Rows) = .{ .cr = &rows, .oa = a, .cctx = cctx, .expect_rows = total, .gen = 7, .cutoff = "2026-09-15 00:00:00+00", .vcol = "updated_at" };
     defer fs.raw.deinit(a);
     const names = [_][]const u8{ "id", "note" };
     _ = try docHead(&fs.raw, a, &names, false, total);
-    s.feed(fs.raw.items);
 
     var z: std.ArrayListUnmanaged(u8) = .empty;
     defer z.deinit(a);
@@ -3233,7 +2875,7 @@ test "FullStreamOf: one zstd frame with no content size, the document intact, in
     var zs: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
     _ = try zs.reader.streamRemaining(&out.writer);
     const doc = out.written();
-    try std.testing.expectEqual(s.seen, doc.len);
+    try std.testing.expectEqual(fs.seen, doc.len);
     // {columns, rows: array32(total) …, gen, kind, cutoff, version_column}
     try std.testing.expectEqual(@as(u8, 0x86), doc[0]);
     const rows_at = std.mem.indexOf(u8, doc, "\xa4rows").? + 5;

@@ -70,17 +70,13 @@ def manifest() -> dict | None:
 
 
 def manifest_refs(man: dict) -> set:
-    """Every object name the manifest points at: the full, each delta, and their dicts."""
+    """Every object name the manifest points at: the full and each delta."""
     refs = set()
     if man.get("full", {}).get("object"):
         refs.add(man["full"]["object"])
-    if man.get("full", {}).get("dict"):
-        refs.add(man["full"]["dict"])
     for d in man.get("deltas") or []:
         if d.get("object"):
             refs.add(d["object"])
-        if d.get("dict"):
-            refs.add(d["dict"])
     return refs
 
 
@@ -95,7 +91,7 @@ def check_invariants(label: str) -> list:
             problems.append(f"{label}: the manifest (g{man.get('gen')}) names {len(dangling)} object(s) that do "
                             f"NOT exist: {sorted(dangling)[:3]} — every fresh client fails to seed")
     rows = zb.psql(
-        f"SELECT gen || ' ' || has_full || ' ' || coalesce(dict_object,'-') "
+        f"SELECT gen || ' ' || has_full "
         f"FROM public.zebridge_generations WHERE tenant = '{TENANT}' AND tbl = '{TABLE}' ORDER BY gen")
     present = objects_in_bucket()
     for line in [r for r in rows.splitlines() if r.strip()]:

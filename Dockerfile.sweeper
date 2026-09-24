@@ -7,7 +7,7 @@ FROM ${BASE_IMAGE} AS builder
 # postgresql-dev provides libpq-fe.h and zstd-dev provides zstd.h/zdict.h, both
 # of which the translate-c step in build.zig needs at build time (src/c_includes.h).
 # ⚠️ zstd is not optional: the generation producer compresses every chain object
-# and trains the per-table dictionary through libzstd (NOTES §10w/§10x).
+# through libzstd (NOTES §10w).
 RUN apk add --no-cache \
     curl \
     xz \
@@ -49,7 +49,7 @@ FROM ${BASE_IMAGE}
 
 # Runtime dependencies (dynamically linked)
 # libpq pulls in libssl3/libcrypto3 transitively on Alpine; zstd-libs carries
-# libzstd.so for the chain compressor + dictionary trainer.
+# libzstd.so for the chain compressor.
 RUN apk add --no-cache \
     libpq \
     ca-certificates

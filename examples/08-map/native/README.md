@@ -24,10 +24,9 @@ three small shims. The framework was never the obstacle; a C toolchain is.
 ⚠️ The zstd one would have been a wall. The library's last-resort decompressor is a
 WebAssembly module and React Native's engine cannot run WebAssembly — but it is a config
 option, so supplying one means the WASM import is never reached. `fzstd` is pure
-JavaScript and handles PLAIN frames only. The `routes` chain this app follows carries no
-dictionary (checked: `full.dict` is null, objects a few hundred bytes). A table whose
-chain uses one would need a native zstd module — `charge_points` does, and this app never
-seeds it, because it is on-demand.
+JavaScript and handles plain frames — which every chain object is since the per-era
+dictionary was removed (NOTES §10iy; until then a delta was a dictionary frame and this
+app could only follow tables whose chains had none).
 
 ## Run it
 

@@ -375,11 +375,10 @@ def verify_chain(cli: list, tmp: pathlib.Path, load_end: float, wait_s: int = 15
             cache[name] = path.read_bytes()
         return cache[name]
 
-    def decode(name: str, dict_name: str | None):
+    def decode(name: str):
         data = fetch(name)
         if data[:4] == b"\x28\xb5\x2f\xfd":
-            dctx = zstandard.ZstdDecompressor(dict_data=zstandard.ZstdCompressionDict(fetch(dict_name))) if dict_name else zstandard.ZstdDecompressor()
-            data = dctx.stream_reader(data).read()
+            data = zstandard.ZstdDecompressor().stream_reader(data).read()
         return msgpack.unpackb(data, raw=False, strict_map_key=False)
 
     def apply(replica: dict, doc: dict, full: bool):
@@ -409,18 +408,18 @@ def verify_chain(cli: list, tmp: pathlib.Path, load_end: float, wait_s: int = 15
     result = {"manifest_gen": man["gen"], "full_gen": man["full"]["gen"], "deltas": [d["gen"] for d in man["deltas"]], "pg_rows": len(pg)}
     try:
         fresh: dict = {}
-        apply(fresh, decode(man["full"]["object"], None), True)
+        apply(fresh, decode(man["full"]["object"]), True)
         for d in man["deltas"]:
             if d["gen"] > man["full"]["gen"]:
-                apply(fresh, decode(d["object"], d.get("dict")), False)
+                apply(fresh, decode(d["object"]), False)
         result["fresh"] = compare(fresh)
         if man["deltas"]:
             # A replica already on the chain applies deltas it may partly hold: replaying
             # every kept delta, those below the full included, on the fresh replica must
-            # change nothing (version-guarded, and every dictionary must still decode).
+            # change nothing (version-guarded).
             again = dict(fresh)
             for d in man["deltas"]:
-                apply(again, decode(d["object"], d.get("dict")), False)
+                apply(again, decode(d["object"]), False)
             result["replay_all_deltas"] = compare(again)
     except Exception as e:
         result["error"] = str(e)[:300]

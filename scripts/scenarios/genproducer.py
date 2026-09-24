@@ -25,11 +25,10 @@ The 5s clamp margin means a write can echo into one extra build on the following
 tick (a duplicate delta, absorbed by the guarded upsert — never a gap), so checks
 are structural (bounds, kinds, windows), never tick-counting.
 
-Chain objects on the wire are msgpack under zstd (NOTES §10w/§10x): fulls a plain
-frame, deltas compressed against the era's dictionary — a `<table>-g<N>-dict` object
-the manifest names per delta. So every object read here is checked for the zstd
-magic first and decoded through `zstd` (the CLI, or the `zstandard` module) with the
-dictionary the manifest points at; a raw-msgpack or JSON object would be a regression.
+Chain objects on the wire are msgpack under zstd (NOTES §10w), plain frames — the
+per-era dictionary went on 2026-09-24 (NOTES §10iy). So every object read here is
+checked for the zstd magic first and decoded through `zstd` (the CLI, or the
+`zstandard` module); a raw-msgpack or JSON object would be a regression.
 
 Usage:  python scripts/scenarios/genproducer.py   (⚠️ owns the only bridge)
 Needs the probe-bridge env (`set -a && . ./.env.bridge && set +a`, NATS_CREDS) plus
@@ -61,36 +60,31 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 PROBE_EMAIL = "probe@zb"   # the row seeded when the fixture is empty; removed in finally
 
 
-def zstd_decode(data: bytes, dictionary: bytes | None = None) -> bytes:
+def zstd_decode(data: bytes) -> bytes:
     """One zstd frame → bytes, through the `zstandard` module or the `zstd` CLI."""
     try:
         import zstandard  # type: ignore
-        d = zstandard.ZstdCompressionDict(dictionary) if dictionary else None
-        return zstandard.ZstdDecompressor(dict_data=d).decompress(data, max_output_size=1 << 30)
+        return zstandard.ZstdDecompressor().decompress(data, max_output_size=1 << 30)
     except ImportError:
         pass
     if not shutil.which("zstd"):
         sys.exit("chain objects are zstd frames: install the `zstd` CLI or `pip install zstandard`")
     with tempfile.TemporaryDirectory() as tmp:
         args = ["zstd", "-d", "-c", "-q"]
-        if dictionary:
-            dpath = f"{tmp}/dict"
-            open(dpath, "wb").write(dictionary)
-            args += ["-D", dpath]
         r = subprocess.run(args, input=data, capture_output=True)
         if r.returncode != 0:
             raise ValueError(f"zstd: {r.stderr.decode(errors='replace').strip()}")
         return r.stdout
 
 
-def decode_chain(body: bytes | None, dictionary: bytes | None = None):
+def decode_chain(body: bytes | None):
     """A chain object → its document, insisting on the wire shape: zstd outside,
     msgpack inside. Returns None for a missing object; raises on the wrong shape."""
     if body is None:
         return None
     if not body.startswith(ZSTD_MAGIC):
         raise ValueError(f"chain object is not a zstd frame (starts {body[:4]!r})")
-    return msgpack.unpackb(zstd_decode(body, dictionary), raw=False, strict_map_key=False)
+    return msgpack.unpackb(zstd_decode(body), raw=False, strict_map_key=False)
 
 
 def gens(live_only: bool = True):
@@ -165,12 +159,8 @@ async def main():
         return json.loads((await kv.get(KEY)).value)
 
     async def delta_doc(entry):
-        """A manifest delta entry → its decoded document, through the dictionary the
-        entry names (deltas are compressed against the era's dict; a full is not)."""
-        dictionary = await obj_get(entry["dict"]) if entry.get("dict") else None
-        if entry.get("dict") and dictionary is None:
-            raise ValueError(f"manifest names dictionary {entry['dict']} but the store has none")
-        return decode_chain(await obj_get(entry["object"]), dictionary)
+        """A manifest delta entry → its decoded document."""
+        return decode_chain(await obj_get(entry["object"]))
 
     def chain_ok(man):
         """Continuity + client walk, structurally: bounds meet, full reaches head."""
@@ -209,7 +199,7 @@ async def main():
             man = await manifest()
             body = await obj_get(f"{TABLE}-g1-full")
             try:
-                doc = decode_chain(body)          # a full: zstd, no dictionary
+                doc = decode_chain(body)
             except ValueError as e:
                 zb.bad(f"g1 full is not zstd-wrapped msgpack: {e}")
                 failed += 1

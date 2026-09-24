@@ -3,8 +3,8 @@
 
 Every other check of the chain goes THROUGH a client — a replica diffed against the
 table, counts, the object's SHA-256. This one opens the objects themselves: the
-manifest from the KV bucket, the full and every delta it names, decompressed with
-the dictionary the manifest names, msgpack-decoded, and every cell compared with
+manifest from the KV bucket, the full and every delta it names, decompressed,
+msgpack-decoded, and every cell compared with
 PostgreSQL rendered in the wire's own shapes (ISO `Z` timestamps, numeric text with
 its scale, PostgreSQL's array and jsonb text, real booleans).
 
@@ -112,13 +112,8 @@ def fetch_object(bucket, name, into):
     return path.read_bytes()
 
 
-def inflate(blob, dict_bytes):
+def inflate(blob):
     if not blob.startswith(ZSTD_MAGIC): return blob
-    if dict_bytes:
-        try:
-            return zstandard.ZstdDecompressor(dict_data=zstandard.ZstdCompressionDict(dict_bytes)).decompress(blob, max_output_size=1 << 31)
-        except zstandard.ZstdError:
-            pass
     return zstandard.ZstdDecompressor().decompress(blob, max_output_size=1 << 31)
 
 
@@ -332,14 +327,13 @@ def main():
 
     ls = zb.nats_cli("object", "ls", bucket)
     names = [l.split("│")[1].strip() for l in ls.stdout.splitlines() if "│" in l and f"{a.table}-g" in l]
-    referenced = {m["full"]["object"]} | {d["object"] for d in m["deltas"]} | {d["dict"] for d in m["deltas"] if d.get("dict")}
+    referenced = {m["full"]["object"]} | {d["object"] for d in m["deltas"]}
     kinds = {}
     for n in names: kinds[n.rsplit("-", 1)[1]] = kinds.get(n.rsplit("-", 1)[1], 0) + 1
     orphans = [n for n in names if n not in referenced]
     print(f"  · bucket holds {len(names)} object(s) of {a.table}: {kinds}; {len(referenced)} referenced by the manifest, {len(orphans)} unreferenced" + (f" (e.g. {', '.join(orphans[:4])})" if orphans else ""))
 
     into = pathlib.Path(tempfile.mkdtemp(prefix="zb_chain_audit_"))
-    dicts = {}
     ok = True
     rep = None if a.no_replay else Replica(list(cols_udt), pk, m["version_column"])
     full_gen = m["full"]["gen"]
@@ -348,16 +342,12 @@ def main():
         if a.only in ("full", "all"): objects.append(("full", m["full"]))
         if a.only in ("deltas", "all"): objects += [("delta", d) for d in m["deltas"]]
         for kind, o in objects:
-            dn = o.get("dict")
-            if dn and dn not in dicts:
-                db = fetch_object(bucket, dn, into)
-                dicts[dn] = inflate(db, None) if db else None
             t0 = time.monotonic()
             blob = fetch_object(bucket, o["object"], into)
             if blob is None: ok = False; continue
             fetch_ms = int((time.monotonic() - t0) * 1000); t0 = time.monotonic()
-            doc = msgpack.unpackb(inflate(blob, dicts.get(dn)), raw=False)
-            print(f"  · {o['object']}: {len(blob)} bytes in the store (fetched in {fetch_ms} ms), dictionary {dn or '(none)'}, {len(doc['rows'])} row(s) decoded in {int((time.monotonic() - t0) * 1000)} ms", flush=True)
+            doc = msgpack.unpackb(inflate(blob), raw=False)
+            print(f"  · {o['object']}: {len(blob)} bytes in the store (fetched in {fetch_ms} ms), {len(doc['rows'])} row(s) decoded in {int((time.monotonic() - t0) * 1000)} ms", flush=True)
             assert doc["kind"] == kind and doc["gen"] == o["gen"], (doc["kind"], doc["gen"], o)
             ok &= audit_object(kind, o["gen"], doc, cols_udt, pk, a.tenant, tenant_col, tcol, ins_col, a.table)
             # The replay applies the full and the deltas AFTER it, in order — a client's path.

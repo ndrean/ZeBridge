@@ -215,8 +215,6 @@ pub const SyncClient = struct {
     /// `join`/`leave` at runtime. Tenant-scoped tables seed one chain per entry and
     /// read one `CDC_<tenant>` stream per entry. Client arena.
     tenants: []const []const u8 = &.{},
-    /// §10x dictionaries by object name — immutable, so the cache cannot go stale.
-    dicts: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// §10el: when each pending write was last sent by THIS process (unix ms). A
     /// `flush` used to run the reconnect pass — one direct get for the verdict, then
     /// a replay — over every pending entry, including a write sent a millisecond
@@ -1726,8 +1724,8 @@ pub const SyncClient = struct {
 
     fn applyChain(self: *SyncClient, table: []const u8, tenant: []const u8) !void {
         // Per-call: a seed can be megabytes, and it is dead the moment it is applied.
-        // Only two things leave this arena — the dictionary cache and `seed_stream` —
-        // and both are duped into the client arena explicitly below.
+        // Only `seed_stream` leaves this arena, duped into the client arena explicitly
+        // below.
         var ca = std.heap.ArenaAllocator.init(self.a);
         defer ca.deinit();
         const a = ca.allocator();
@@ -1838,23 +1836,9 @@ pub const SyncClient = struct {
                 defer pull.deinit();
                 break :blk try pull.readAll(step_a);
             } else try self.t.objectGetBytes(step_a, bucket, step.object.get("name").?.string);
-            // §10x: a delta names the dictionary it was compressed with; fetch it
-            // once per era from the same bucket and keep it (immutable by name, so
-            // client-lifetime is the RIGHT arena here — the one place in this fn).
-            var dict: ?[]const u8 = null;
-            if (step.object.get("dict")) |dv| if (dv == .string) {
-                if (self.dicts.get(dv.string)) |d| {
-                    dict = d;
-                } else {
-                    const la = self.aa();
-                    const d = try self.t.objectGetBytes(la, bucket, dv.string);
-                    try self.dicts.put(la, try la.dupe(u8, dv.string), d);
-                    dict = d;
-                }
-            };
             ph[0] += msNow() - t_ph;
             t_ph = msNow();
-            const blob = try maybeZstd(step_a, raw, dict); // §10w: magic-sniffed, mixed chains fine
+            const blob = try maybeZstd(step_a, raw); // §10w: magic-sniffed, mixed chains fine
             ph[1] += msNow() - t_ph;
             t_ph = msNow();
             // §10fa: the document is walked, not decoded. Its keys in the producer's
@@ -1958,20 +1942,8 @@ pub const SyncClient = struct {
     /// Returns the rows applied.
     fn applyStepStreaming(self: *SyncClient, step_a: std.mem.Allocator, table: []const u8, tenant: []const u8, st: *TableState, man: Value, step: Value, pull: *transport.ObjectPull, is_full: bool, ph: *[4]i64) !usize {
         const name = step.object.get("name").?.string;
-        const bucket = try std.fmt.allocPrint(step_a, "{s}{s}", .{ self.gen_bucket_prefix, tenant });
-        var dict: ?[]const u8 = null;
-        if (step.object.get("dict")) |dv| if (dv == .string) {
-            if (self.dicts.get(dv.string)) |d| {
-                dict = d;
-            } else {
-                const la = self.aa();
-                const d = try self.t.objectGetBytes(la, bucket, dv.string);
-                try self.dicts.put(la, try la.dupe(u8, dv.string), d);
-                dict = d;
-            }
-        };
         const res = pull;
-        var zs = try StreamInflate.init(self.a, res, dict);
+        var zs = try StreamInflate.init(self.a, res);
         defer zs.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.a);
         defer scratch.deinit();
@@ -3414,10 +3386,10 @@ pub const SyncClient = struct {
             const fetch_ms = msNow() - t0 - wire_ms;
             // §10ip: `maybeZstd` returns its input untouched when the bytes are not a
             // frame, so an uncompressed answer costs one magic-byte check.
-            const body = try maybeZstd(a, fetched, null);
+            const body = try maybeZstd(a, fetched);
             return try spliceTransport(a, body, "object", fetched.len, wire_ms, fetch_ms);
         }
-        const body = try maybeZstd(a, msg.data, null);
+        const body = try maybeZstd(a, msg.data);
         return try spliceTransport(a, body, "inline", msg.data.len, wire_ms, 0);
     }
 
@@ -4632,9 +4604,8 @@ fn jsonStrList(a: std.mem.Allocator, v: ?Value) ![]const []const u8 {
 }
 
 /// Chain objects may be zstd frames (§10w) — sniffed by the standard 4-byte magic.
-/// §10ip: one-shot zstd for the QUERY channel. No dictionary — an answer is a one-off,
-/// there is no era to train against, and a plain frame is what every client can read
-/// (React Native's pure-JS decompressor does plain frames only).
+/// §10ip: one-shot zstd for the QUERY channel — a plain frame, like every chain object
+/// (the per-era dictionary went on 2026-09-24, NOTES §10iy).
 ///
 /// Returns the INPUT unchanged when compression does not pay, so a tiny answer is never
 /// made bigger. The caller decides inline-or-object on what comes back, which is the
@@ -4652,7 +4623,7 @@ fn compressAnswer(a: std.mem.Allocator, b: []const u8) ![]const u8 {
     return buf[0..n];
 }
 
-fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8 {
+fn maybeZstd(a: std.mem.Allocator, b: []const u8) ![]const u8 {
     if (b.len < 4 or b[0] != 0x28 or b[1] != 0xb5 or b[2] != 0x2f or b[3] != 0xfd) return b;
     // §10ez: a frame that states its content size is inflated in one call — a 102 MB
     // full took 4.2 s through std.compress.zstd and a fraction of that here.
@@ -4662,11 +4633,7 @@ fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8
     const size = C.ZSTD_getFrameContentSize(b.ptr, b.len);
     if (size != unknown and size != unknown - 1) {
         const out = try a.alloc(u8, @intCast(size));
-        const n = if (dict) |d| blk: {
-            const dctx = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
-            defer _ = C.ZSTD_freeDCtx(dctx);
-            break :blk C.ZSTD_decompress_usingDict(dctx, out.ptr, out.len, b.ptr, b.len, d.ptr, d.len);
-        } else C.ZSTD_decompress(out.ptr, out.len, b.ptr, b.len);
+        const n = C.ZSTD_decompress(out.ptr, out.len, b.ptr, b.len);
         if (C.ZSTD_isError(n) != 0) return error.ZstdDecompressFailed;
         return out[0..n];
     }
@@ -4675,7 +4642,6 @@ fn maybeZstd(a: std.mem.Allocator, b: []const u8, dict: ?[]const u8) ![]const u8
     // output grown as it fills.
     const dctx = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
     defer _ = C.ZSTD_freeDCtx(dctx);
-    if (dict) |d| if (C.ZSTD_isError(C.ZSTD_DCtx_loadDictionary(dctx, d.ptr, d.len)) != 0) return error.ZstdDecompressFailed;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(a);
     try out.ensureTotalCapacity(a, @max(b.len * 4, 64 * 1024));
@@ -4973,7 +4939,6 @@ const StreamInflate = struct {
     res: *transport.ObjectPull,
     a: std.mem.Allocator,
     dctx: ?*C.ZSTD_DCtx = null,
-    dict: ?[]const u8,
     in_buf: []u8,
     in: C.ZSTD_inBuffer,
     sniffed: bool = false,
@@ -4986,9 +4951,9 @@ const StreamInflate = struct {
     const in_size: usize = 128 * 1024;
     const window_step: usize = 4 * 1024 * 1024;
 
-    fn init(a: std.mem.Allocator, res: *transport.ObjectPull, dict: ?[]const u8) !StreamInflate {
+    fn init(a: std.mem.Allocator, res: *transport.ObjectPull) !StreamInflate {
         const in_buf = try a.alloc(u8, in_size);
-        return .{ .res = res, .a = a, .dict = dict, .in_buf = in_buf, .in = .{ .src = in_buf.ptr, .size = 0, .pos = 0 } };
+        return .{ .res = res, .a = a, .in_buf = in_buf, .in = .{ .src = in_buf.ptr, .size = 0, .pos = 0 } };
     }
 
     fn deinit(self: *StreamInflate) void {
@@ -5035,7 +5000,6 @@ const StreamInflate = struct {
             if (!self.plain) {
                 const d = C.ZSTD_createDCtx() orelse return error.ZstdDecompressFailed;
                 self.dctx = d;
-                if (self.dict) |dict| if (C.ZSTD_isError(C.ZSTD_DCtx_loadDictionary(d, dict.ptr, dict.len)) != 0) return error.ZstdDecompressFailed;
             }
         }
         const before = self.window.items.len;
@@ -5461,18 +5425,16 @@ test "migrateTable: a suspension descriptor is an error, never a panic" {
     try std.testing.expectError(error.SchemaUnusable, SyncClient.migrateTable(&st, arena.allocator(), "t", junk));
 }
 
-test "maybeZstd: a frame without its content size inflates, with and without a dictionary (§10gi)" {
+test "maybeZstd: a frame without its content size inflates (§10gi)" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const aa = arena.allocator();
     const doc = try aa.alloc(u8, 3 * 1024 * 1024 + 17);
     for (doc, 0..) |*b, i| b.* = "chain rows repeat, a little"[i % 27] ^ @as(u8, @truncate(i / 4096));
-    const dict = "chain rows repeat, a little" ** 64;
-    for ([_]?[]const u8{ null, dict }) |d| {
+    {
         const cctx = C.ZSTD_createCCtx().?;
         defer _ = C.ZSTD_freeCCtx(cctx);
-        if (d) |dd| try std.testing.expect(C.ZSTD_isError(C.ZSTD_CCtx_loadDictionary(cctx, dd.ptr, dd.len)) == 0);
         // Streamed in small pieces, like the producer's full: no size in the header.
         var z: std.ArrayListUnmanaged(u8) = .empty;
         // (A first call with ZSTD_e_end and all the input would state the size.)
@@ -5495,8 +5457,8 @@ test "maybeZstd: a frame without its content size inflates, with and without a d
         }
         const unknown: c_ulonglong = std.math.maxInt(c_ulonglong);
         try std.testing.expectEqual(unknown, C.ZSTD_getFrameContentSize(z.items.ptr, z.items.len));
-        try std.testing.expectEqualSlices(u8, doc, try maybeZstd(aa, z.items, d));
+        try std.testing.expectEqualSlices(u8, doc, try maybeZstd(aa, z.items));
         // Truncated: an error, never a short document.
-        try std.testing.expectError(error.ZstdDecompressFailed, maybeZstd(aa, z.items[0 .. z.items.len - 9], d));
+        try std.testing.expectError(error.ZstdDecompressFailed, maybeZstd(aa, z.items[0 .. z.items.len - 9]));
     }
 }

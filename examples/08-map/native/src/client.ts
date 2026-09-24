@@ -44,9 +44,8 @@ export function makeClient() {
     zstdDecompress: zstd,
     // §10ix: seed large tables as they arrive. The phone has a real filesystem, so
     // expo-storage says `spillsTemp` and a full is STAGED — fast and bounded in RAM,
-    // at ~3× the table on disk while it runs. Deltas (dictionary frames) stay buffered.
+    // at ~3× the table on disk while it runs.
     seedStreaming: true,
     zstdDecompressStream: zstdStream,
-    zstdStreamDictionaries: false,
   });
 }

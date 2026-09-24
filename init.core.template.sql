@@ -673,20 +673,27 @@ CREATE TABLE IF NOT EXISTS public.zebridge_generations (
     relid          oid,
     PRIMARY KEY (tenant, tbl, gen)
 );
--- §10x: the compression dictionary is a chain member. `dict` holds the trained
--- dictionary on the row that carried the full (the producer's memory — read back
--- from HERE for the era's deltas, never from NATS); `dict_object` names the
--- dictionary object this row's payload was compressed with (NULL = plain zstd).
-ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict bytea;
-ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_object text;
--- §10ea: the ratio (percent) the dictionary achieved on row-sized samples when it was
--- fresh — its own baseline. At the next full the same probe against the SAME
--- dictionary says whether the data drifted (kept while within 10 points of it).
-ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS dict_ratio smallint;
--- §10gf: the dictionary a full on this row trained or kept — the one the deltas AFTER it
--- compress with. A background full attaches to an existing delta row, whose own
--- `dict_object` names the dictionary its delta was compressed with and must not change.
-ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS full_dict_object text;
+-- 2026-09-24: the per-era compression dictionary is gone (NOTES §10iy). Measured on the
+-- 668 MB test_types full: 53% smaller at 4 KB, 3% from 64 KB up — for a training pass,
+-- five columns here, an object per era, and a decoder a phone did not have. Every
+-- object is plain zstd, level 3. The eras cut with a dictionary are retired here in one
+-- go, so the next cut is a plain full (numbered above every row, retired included);
+-- their objects leave with the retirement grace, the dictionary objects among them.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'zebridge_generations' AND column_name = 'dict_object') THEN
+        UPDATE public.zebridge_generations SET retired_at = now()
+         WHERE retired_at IS NULL AND (tenant, tbl) IN (
+               SELECT tenant, tbl FROM public.zebridge_generations
+                WHERE dict_object IS NOT NULL OR full_dict_object IS NOT NULL OR ckpt_dict_object IS NOT NULL);
+    END IF;
+END $$;
+ALTER TABLE public.zebridge_generations
+    DROP COLUMN IF EXISTS dict,
+    DROP COLUMN IF EXISTS dict_object,
+    DROP COLUMN IF EXISTS dict_ratio,
+    DROP COLUMN IF EXISTS full_dict_object,
+    DROP COLUMN IF EXISTS ckpt_dict_object;
 -- §10gl: the lower bound of the NEXT delta. `now()` is a transaction's start, so a row
 -- committed after this cut can carry a version older than the cutoff; it came from a
 -- transaction already open when the cut was read. The floor is the start of the oldest
@@ -699,7 +706,6 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS open_xact_floor
 -- the previous checkpoint's cutoff, or the base's.
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS has_checkpoint boolean NOT NULL DEFAULT false;
 ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_lower timestamptz;
-ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS ckpt_dict_object text;
 -- §10gw: the compressed size of the full or checkpoint attached to this row. The base is
 -- rebuilt when the checkpoints since it outweigh it — a client applying them would
 -- otherwise pay more than a reload — and that comparison needs both sides on the record.
@@ -733,11 +739,11 @@ ALTER TABLE public.zebridge_generations ADD COLUMN IF NOT EXISTS del_count bigin
 -- writes it. The grant is INSERT + DELETE (pruning) on THIS table only; no UPDATE of the
 -- history, so a cut is append-only by privilege, not by convention.
 GRANT SELECT, INSERT, DELETE ON public.zebridge_generations TO ${POSTGRES_READER_USER};
--- §10gf: the one column-level UPDATE — the four columns that say a generation also carries
--- a full and which dictionary goes with it. The background full lane attaches a full to an
--- existing generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the
--- counts, the epoch, the shape) stays unwritable once inserted.
-GRANT UPDATE (has_full, dict, full_dict_object, dict_ratio, retired_at, has_checkpoint, ckpt_lower, ckpt_dict_object, obj_bytes) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
+-- §10gf: the one column-level UPDATE — the columns that say a generation also carries a
+-- full or a checkpoint, and its retirement. The background lane attaches to an existing
+-- generation's row; the cut itself (cutoff_version, cutoff_lsn, prev_cutoff, the counts,
+-- the epoch, the shape) stays unwritable once inserted.
+GRANT UPDATE (has_full, retired_at, has_checkpoint, ckpt_lower, obj_bytes) ON public.zebridge_generations TO ${POSTGRES_READER_USER};
 
 -- §10gl: the start of the oldest transaction open in this database, for the generation
 -- producer's delta floor. pg_stat_activity hides other roles' sessions from the reader

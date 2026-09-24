@@ -34,30 +34,20 @@ if (!g.crypto.subtle) {
   };
 }
 
-/// ⚠️ The one that would have been a wall. Chain objects may arrive as zstd frames, and
-/// the library's LAST-RESORT decompressor is a WebAssembly module — which React Native's
+/// ⚠️ The one that would have been a wall. Chain objects arrive as zstd frames, and the
+/// library's LAST-RESORT decompressor is a WebAssembly module — which React Native's
 /// engine cannot run. It never gets that far, because `zstdDecompress` is a config
-/// option: supply one and the WASM import is never reached.
-///
-/// fzstd is pure JavaScript and handles plain frames. It does NOT do DICTIONARY frames.
-/// Measured on this stack: the `routes` chain this app follows carries no dictionary and
-/// its objects are a few hundred bytes. A table whose chain does use one (the charge
-/// points do, `charge_points-g1-dict`) would need a native zstd module — and this app
-/// never seeds that table, because it is on-demand.
-export const zstd = (b: Uint8Array, dict?: Uint8Array) => {
-  if (dict) throw new Error('zstd dictionary frames need a native decompressor; fzstd does plain frames only');
-  return zstdDecompress(b);
-};
+/// option: supply one and the WASM import is never reached. fzstd is pure JavaScript
+/// and does plain frames — which every chain object is, since the per-era dictionary
+/// went on 2026-09-24 (NOTES §10iy; until then a delta was a dictionary frame and
+/// needed a native decoder here).
+export const zstd = (b: Uint8Array) => zstdDecompress(b);
 
 /// §10ix: the same decoder, STREAMING — what lets a phone seed a large table without
 /// holding it. fzstd's `Decompress` takes chunks as they arrive and hands back inflated
 /// bytes block by block; the client decodes rows out of those and applies them in
-/// windows, so the table is never whole in memory (measured in Node with this exact
-/// pipeline, NOTES §10ix). Plain frames only, like `zstd` above: a FULL is one (the
-/// dictionary is trained from it), and dictionary steps stay on the buffered path
-/// because client.ts sets `zstdStreamDictionaries: false`.
-export const zstdStream = (chunks: AsyncIterable<Uint8Array>, dict?: Uint8Array): AsyncIterable<Uint8Array> => {
-  if (dict) throw new Error('fzstd streams plain frames only');
+/// windows, so the table is never whole in memory (measured, NOTES §10ix).
+export const zstdStream = (chunks: AsyncIterable<Uint8Array>): AsyncIterable<Uint8Array> => {
   return (async function* () {
     const out: Uint8Array[] = [];
     const d = new Decompress((chunk: Uint8Array) => { out.push(chunk); });

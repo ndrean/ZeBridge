@@ -1012,16 +1012,13 @@ fn checkpointStep(a: std.mem.Allocator, ck: Value) !Value {
     var step: std.json.ObjectMap = .empty;
     try step.put(a, "name", .{ .string = getStr(ck, "object") orelse "" });
     try step.put(a, "kind", .{ .string = "checkpoint" });
-    if (getStr(ck, "dict")) |dn| try step.put(a, "dict", .{ .string = dn });
     return .{ .object = step };
 }
 
-/// A delta step carries its dictionary name when the manifest names one (§10x).
 fn deltaStep(a: std.mem.Allocator, d: Value) !Value {
     var step: std.json.ObjectMap = .empty;
     try step.put(a, "name", .{ .string = getStr(d, "object") orelse "" });
     try step.put(a, "kind", .{ .string = "delta" });
-    if (getStr(d, "dict")) |dn| try step.put(a, "dict", .{ .string = dn });
     return .{ .object = step };
 }
 

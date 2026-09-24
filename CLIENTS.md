@@ -115,7 +115,6 @@ row a rule is named.
 | a principal with no tenant mapping (revoked, never enrolled) | tenant-scoped tables skipped audibly, public followed | same; a purged mapping's DEL marker reads as none | §10dl |
 | tenant revoked while connected | next connect | next connect | |
 | inbox pruning | ✓ (`_zbz_inbox`, pruned at the seed's lsn) | ✓ | |
-| chain dictionary cache | per process | persisted (`_zebridge_dicts`) | §10x |
 | zstd chain objects | built in | Node built in; browser needs `zstdDecompress` | §10w |
 | a chain step's apply | a msgpack cursor, rows sorted by key, transactions of `seedChunkRows` (50,000), bound straight from the payload, a 128 MB page cache while the seed lasts; 3 M rows in 11 s | the same sort, chunks and page cache (§10fb) over the decoded document; on SQLite a chunk is one statement through `json_each` (§10fc), row by row for a table with a BLOB and on PGlite; 3 M rows in 26 s | §10ez, §10fa, §10fb, §10fc |
 | a `rate_limited` verdict (`failed`, `retry_after_ms`) | kept in the outbox, flushes held until the time has passed; counted as `rate_limited` on the flush report | kept, flushes held the same way | §10fk |
