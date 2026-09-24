@@ -658,6 +658,12 @@ test "the test fixture matches the repository's own grammar.json" {
         // deliberately carries none so unit tests default to no untenanted table being
         // CDC-routable via `public_tables` either.
         if (comptime std.mem.eql(u8, f.name, "public_tables")) continue;
-        try testing.expectEqualStrings(@field(fixture, f.name), @field(real, f.name));
+        // §10hq added a numeric field (the inline answer ceiling); a name compares as
+        // a string, anything else as a value.
+        if (comptime f.type == []const u8) {
+            try testing.expectEqualStrings(@field(fixture, f.name), @field(real, f.name));
+        } else {
+            try testing.expectEqual(@field(fixture, f.name), @field(real, f.name));
+        }
     }
 }

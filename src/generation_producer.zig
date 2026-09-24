@@ -2853,6 +2853,7 @@ test "FullStreamOf: one zstd frame with no content size, the document intact, in
     defer fs.raw.deinit(a);
     const names = [_][]const u8{ "id", "note" };
     _ = try docHead(&fs.raw, a, &names, false, total);
+    fs.seen += fs.raw.items.len; // the head, as putChainObject counts it
 
     var z: std.ArrayListUnmanaged(u8) = .empty;
     defer z.deinit(a);
