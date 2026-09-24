@@ -15903,3 +15903,65 @@ and `/connz` answered a plain `curl` from the internet with server identity, lea
 and the connection list. It is `http: localhost:8222` now. Two scanners (Cloudflare and
 Azure egress ranges, neither this laptop) had already probed the open websocket port within
 five minutes of the leaf starting; the box has no firewall installed at all.
+
+## §10iv — one vocabulary for both client libraries (2026-09-24)
+
+The owner's objection, and it was right: *"Both libraries must behave and name things in
+a very similar way. Otherwise no one will buy this, as no one is willing to learn a new
+DSL, nor will LLMs understand how this is built."* The audit that followed: of 21 C
+exports and ~30 zb-client-ts members, **seven names agreed** — `close` `query` `mutate`
+`ingest` `request` `serve` `wipe`. The rest had drifted or existed on one side only.
+
+The C ABI now follows zb-client-ts's names, since those read better and the TS surface is
+the one an app author meets first.
+
+| | zb-client-ts | libzb |
+| --- | --- | --- |
+| make the enrolment keypair | `createUser()` | `zb_create_user()` |
+| assemble the `.creds` | `credsFileText(jwt, seed)` | `zb_creds_file_text(jwt, seed)` |
+| start | `new ZeBridge(cfg)` + `connect()` | `zb_client_connect()` ⟵ `zb_client_open` |
+| send the outbox | `flushOutbox()` | `zb_client_flush_outbox()` ⟵ `zb_client_flush` |
+| was I banned | `revoked` | `zb_client_revoked(h)` — 1 / 0 / −1 |
+
+Three differences remain and all three are the C ABI, not a choice: `zb_free` (no GC),
+`zb_abi_version`, and `zb_client_poll` where TS has `onChange` (a C ABI cannot take a
+closure, so the host drives the loop). The C ABI is 24 symbols with one name each: the
+deprecated forwards lasted about an hour, until the owner pointed out that with all four
+`examples/05-mobile` bindings migrated, nothing outside the repo linked them — a
+deprecation shim is a function of who depends on you, and here the answer was nobody.
+
+**What the gap actually was.** Until now only TS could generate an nkey pair
+(`@nats-io/nkeys`, in the tree via `nats-core`). `nats.nkeys` is internal to nats.zig, so
+Swift, Kotlin and Flutter — the three hosts libzb exists for — could not enrol at all;
+they could only read a `.creds` someone else had made. Enrolment is now the same three
+steps everywhere: generate a pair, trade the public half at
+`GET /enroll?code=…&user_pubkey=…` for a JWT, assemble the creds. The seed never leaves
+the device. The HTTP call stays with the host, which has its own stack and receives the
+invite through its own channel.
+
+**Two things the audit corrected, both mine:**
+
+- **`zb_client_live` is not TS's `revoked`.** It returns `clients.liveCount()` — open
+  handles in this process, the leak check `abuse.py` asserts on. I had it queued for
+  rename, which would have inverted a counter into a security flag silently. It stays,
+  and `zb_client_revoked` is the real analogue: `SyncClient.revoked` existed all along
+  (§10dm), only the C accessor was missing, so a Swift or Flutter host was disconnected
+  and could not learn why. A revoked client looks exactly like a quiet one.
+- **The two `.creds` writers disagreed.** TS emitted a minimal variant; the bridge wrote
+  the conventional `nsc` layout with the `NKEYs are sensitive` block. TS now matches,
+  verified byte-identical to `zb_creds_file_text` (388 bytes for the same input). One
+  cosmetic delta survives: `nsc` ends with a trailing blank line, all three ZeBridge
+  writers with one newline. No parser looks at it. `zb_creds_file_text` also refuses a
+  seed that is not `S`-prefixed — swapped arguments otherwise build a plausible file that
+  fails much later at connect, with an opaque auth error.
+
+40 call sites migrated across `libzb/python`, `scripts/scenarios` and the examples.
+`@nats-io/nkeys` is a declared dependency of zb-client-ts now, not an accidental
+transitive one. Verified: libzb 28 pass / 3 skip, zb-client-ts typecheck clean and
+224/224, `abuse.py` green, `zb_client_revoked` exercised live (−1 unknown, 0 connected,
+−1 after close). `examples/05-mobile/flutter/lib/src/data/zebridge.dart` was left to the
+owner: their Dart-lint refactor and the two renamed lookup strings share every hunk.
+
+**Still divergent, and a bigger job than naming:** TS has no `join` / `leave` / `sync` /
+`mutate_at`; the C ABI has no callback registration nor `newVersion` / `tableState` /
+`syncState` / `tableNames`. Those are feature gaps, not vocabulary.
