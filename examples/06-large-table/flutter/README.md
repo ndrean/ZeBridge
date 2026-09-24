@@ -54,6 +54,19 @@ What `ios/Flutter/*.xcconfig` carries, and why (each was a failed link or launch
   build did not (`dlsym … symbol not found`);
 * `DEVELOPMENT_TEAM`: a personal Apple team signs the device build.
 
+## Android
+
+    tool/build-libzb-android.sh    # zig build lib for aarch64-linux-android, then the NDK's clang links the archive into libzbcore.so
+    flutter build apk --release --target-platform android-arm64 --dart-define=ZB_NATS_URL=nats://192.168.1.11:4222
+    adb install build/app/outputs/flutter-apk/app-release.apk
+
+Zig cannot synthesise Android's libc (NOTES §10ir), so libzb is built as a static
+archive — position-independent on Android targets, `libzb/build.zig` — and the NDK's
+`clang --shared -Wl,--whole-archive` makes the `.so` dart:ffi loads from
+`android/app/src/main/jniLibs/arm64-v8a/` (git-ignored). The manifest declares
+`INTERNET`. Built and packaged on 2026-09-24; not yet run on a phone — the one at hand
+enforces a 24-hour wait before it accepts a new debugging computer.
+
 And in `ios/Runner/Info.plist`, `NSLocalNetworkUsageDescription`: without it iOS
 refuses connections to LAN addresses silently — `zb_client_connect` returned 0 with no
 other symptom. libzb's side: `bundle_compiler_rt` (Xcode's ld found `roundq`

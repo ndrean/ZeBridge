@@ -203,6 +203,11 @@ pub fn build(b: *std.Build) void {
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/capi.zig"),
+        // §10ir: Android links the archive into a shared library with the NDK's clang
+        // (Zig cannot synthesise bionic), and that needs position-independent objects —
+        // the vendored C included: "relocation R_AARCH64_ABS64 cannot be used against
+        // local symbol; recompile with -fPIC" (2026-09-24).
+        .pic = if (target.result.abi == .android or target.result.abi == .androideabi) true else null,
         .target = target,
         .optimize = optimize,
     });

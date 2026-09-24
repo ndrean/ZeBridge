@@ -94,6 +94,11 @@ class ZeBridge {
       // process's own. Built with `zig build lib -Dtarget=aarch64-ios -Dvendor=true
       // -Dlibpq=false` — sqlite and zstd vendored, no libpq (NOTES §10iq/§10iy).
       _lib = ffi.DynamicLibrary.process();
+    } else if (Platform.isAndroid) {
+      // android/app/src/main/jniLibs/arm64-v8a/libzbcore.so: libzb's static archive
+      // linked into a shared library by the NDK's clang (tool/build-libzb-android.sh)
+      // — Zig cannot synthesise Android's libc, §10ir.
+      _lib = ffi.DynamicLibrary.open('libzbcore.so');
     } else if (Platform.isMacOS) {
       _lib = ffi.DynamicLibrary.open(
           '/Users/nevendrean/code/zig/ZeBridge/libzb/zig-out/lib/libzbcore.dylib');

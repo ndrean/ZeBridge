@@ -48,3 +48,4 @@ app.*.map.json
 .widget_preview/
 assets/creds/
 ios/libzb/*.xcframework
+android/app/src/main/jniLibs/
